@@ -1,0 +1,21 @@
+# Browser Automation Task Prompts
+
+# Permit Search Task
+permit_search:
+  description: "Navigate to Hillsborough County Building Permit search and download records"
+  task_template: |
+    Navigate to the Hillsborough County Building Permit search:
+    
+    1. Go to {url}
+    2. Look for a search form or filter section
+    3. Find date filter fields named start date and end date
+    4. Set the START date to: {start_date}
+    5. Set the END date to: {end_date}
+    6. Click the Search button to run the search
+    7. Wait for results to load (there should be a table or grid of permits)
+    8. Look for an Export, Download, or similar button to download the results
+    9. Click the download button to export the data (prefer CSV or Excel format)
+    10. Wait at least {wait_time} seconds for the download to complete
+    11. Close any dialogs or popups that appear
+    
+    Do not navigate away or open new tabs. If you encounter a CAPTCHA or authentication, report it.

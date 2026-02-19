@@ -1,0 +1,37 @@
+# Browser Automation Task Prompts for Tax Delinquent Reports
+
+# Tax delinquent report download task
+tax_delinquent_download:
+  description: "Navigate to Hillsborough County tax reports and download delinquent accounts"
+  task_template: |
+    1. Open https://county-taxes.net/hillsborough/reports/real-estate
+    2. Use the top dropdown to select 'Public - Delinquent Report'.
+    3. In the filters, set Account Status to '{account_status}'.
+    4. Set Tax Year to '{tax_year}'.
+    5. Run the search (View Report). Wait for the data grid to load completely.
+    6. Use the page's Download/Export control to export the results, preferring CSV (Excel is fine).
+    7. Confirm the download has started, then wait at least 30 seconds before finishing.
+    8. Do not navigate away or open new tabs.
+
+# Firecrawl extraction prompt for individual parcels
+parcel_extraction:
+  description: "Extract structured tax delinquency data from parcel detail page"
+  prompt_template: |
+    The page shows tax account details for account number {account_number}.
+    Look the whole page and find out the total amount due and how many years are delinquent (unpaid).
+    Focus on finding the most recent and relevant information.
+    There is no dedicated field for years delinquent. So you need to look at account history 
+    and other available data to find the years that have unpaid taxes, then count them to determine the years delinquent.
+
+  schema:
+    type: "object"
+    properties:
+      total_amount_due:
+        type: "string"
+        description: "The total amount due in dollars (e.g., '1234.56'). Look for 'Total amount due' or 'Balance Due'."
+      years_delinquent:
+        type: "number"
+        description: "Count of distinct years with UNPAID status in the account history"
+    required:
+      - "total_amount_due"
+      - "years_delinquent"

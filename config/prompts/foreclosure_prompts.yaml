@@ -1,0 +1,16 @@
+# Browser Automation Task Prompts for Foreclosure Auctions
+
+# Foreclosure auction calendar scraping task
+auction_scrape:
+  description: "Navigate to RealForeclose auction calendar and extract all case details"
+  task_template: |
+    1. Open {preview_url}
+    2. Wait for the auction calendar table to fully load.
+    3. For EACH auction row in the table, click on the case number link to open the detail page.
+    4. On the detail page, extract ALL fields including Status, Plaintiff, Defendant, Property Address, Judgment Amount, Opening Bid, and most importantly the 'raw' field/column if present.
+    5. After extracting details, return to the calendar and repeat for the next case.
+    6. Continue until ALL cases have been processed.
+    7. Compile all auction data (case number, status, plaintiff, defendant, property address, raw data, judgment amount, opening bid, etc.) into a structured format.
+    8. Save the complete dataset as a CSV file to: {dest_file}
+    9. Ensure all auctions with any status are included in the export.
+    10. Once saved, wait a few seconds to confirm the file is written.

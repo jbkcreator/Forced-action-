@@ -1,0 +1,53 @@
+# Browser Automation Task Prompts for Lien/Judgment Documents
+
+# Document search task
+document_search:
+  description: "Navigate to Hillsborough County Clerk document search and download specific document types"
+  task_template: |
+    Navigate to the Hillsborough County Clerk document search and download {doc_type}:
+
+    1. Go to {url}
+    2. On the left side, look for "Search Type" or similar section
+    3. Select "Document Type" from the search type options
+    4. In the search form that appears, find the document type field
+    5. Select or enter "{doc_type_code}" as the document type
+    6. Find the date range fields (likely labeled "Filed From" / "Filed To" or similar)
+    7. Set the FROM/START date to: {start_date_str}
+    8. Set the TO/END date to: {end_date_str}
+    9. Click the Search button to run the search
+    10. Wait for results to load - there should be a table/grid of records
+    11. Scroll down if needed to see all results and find the export button
+    12. If you see an error message: "Results exceeded the limit of 6000, please narrow your search criteria", Try reducing the lookback_days by 10 and re run. 
+    12. Look for "Export to Spreadsheet" or "Export" button
+    13. Click the export button to download the data
+    14. Wait at least {wait_after_download} seconds for the download to complete
+    15. Close any dialogs or popups that appear
+
+    Do not navigate away or open new tabs. If you encounter issues, describe what you see.
+
+# Document type configurations
+document_types:
+  LIEN:
+    code: "LIEN"
+    name: "General Liens"
+    lookback_days: 30
+  LNCORPTX:
+    code: "LNCORPTX"
+    name: "Corp Tax Liens"
+    lookback_days: 30
+  JUD:
+    code: "JUD"
+    name: "Judgments"
+    lookback_days: 30
+  CCJ:
+    code: "CCJ"
+    name: "Certified Judgments"
+    lookback_days: 30
+  D:
+    code: "D"
+    name: "Deeds"
+    lookback_days: 30
+  TAXDEED:
+    code: "TAXDEED"
+    name: "Tax Deeds"
+    lookback_days: 30

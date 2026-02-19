@@ -1,0 +1,13 @@
+# Browser Automation Task Prompts for Code Enforcement Violations
+
+# Violation search and export task
+violation_export:
+  description: "Navigate to Hillsborough County Accela enforcement portal and export violation records"
+  task_template: |
+    1. Open {url}
+    2. If the Search Applications / General Search form is not already visible, click the 'Search Applications' button once to open it; otherwise leave it alone.
+    3. Set Start Date year to 2025 and End Date to today's date ({today_date}).
+    4. Click Search to run the query and wait for the results grid to finish loading.
+    5. Use the page's download/export control to export the entire result set (CSV preferred, Excel acceptable).
+    6. Once the download starts, wait at least 30 seconds before finishing.
+    7. Avoid refreshing the page or opening new tabs.
