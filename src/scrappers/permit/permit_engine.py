@@ -28,6 +28,17 @@ import pandas as pd
 from browser_use import Agent, ChatAnthropic
 
 from config.settings import settings
+from config.constants import (
+	BROWSER_MODEL,
+	BROWSER_TEMPERATURE,
+	RAW_PERMIT_DIR,
+	PROCESSED_DATA_DIR,
+	PERMIT_SEARCH_URL,
+	DOWNLOAD_FILE_PATTERNS,
+	TEMP_DOWNLOADS_DIR,
+	DOWNLOAD_WAIT_PERMIT,
+	BROWSER_DOWNLOAD_TEMP_PATTERN,
+)
 from src.utils.logger import setup_logging, get_logger
 from src.utils.prompt_loader import get_prompt
 
@@ -37,20 +48,15 @@ logger = get_logger(__name__)
 
 # Model + agent configuration
 llm = ChatAnthropic(
-	model="claude-sonnet-4-5-20250929",
+	model=BROWSER_MODEL,
 	timeout=150,
 	api_key=settings.anthropic_api_key.get_secret_value(),
-	temperature=0,
+	temperature=BROWSER_TEMPERATURE,
 )
 
-# Configuration
-PERMIT_URL = "https://aca-prod.accela.com/HCFL/Cap/CapHome.aspx?module=Building"
-RAW_DIR = Path("data/raw/permit")
-PROCESSED_DIR = Path("data/processed")
-DOWNLOAD_PATTERNS = ("*.csv", "*.xls", "*.xlsx", "*.zip")
-
-RAW_DIR.mkdir(parents=True, exist_ok=True)
-PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+# Ensure directories exist
+RAW_PERMIT_DIR.mkdir(parents=True, exist_ok=True)
+PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _locate_download(start_time: float) -> Optional[Path]:
@@ -76,7 +82,7 @@ def _locate_download(start_time: float) -> Optional[Path]:
 		paths = []
 		if not folder.exists():
 			return paths
-		for pattern in DOWNLOAD_PATTERNS:
+		for pattern in DOWNLOAD_FILE_PATTERNS:
 			for candidate in folder.glob(pattern):
 				try:
 					if candidate.stat().st_mtime >= start_time:
@@ -86,8 +92,8 @@ def _locate_download(start_time: float) -> Optional[Path]:
 					continue
 		return paths
 	
-	candidates = recent_candidates(RAW_DIR)
-	logger.debug(f"Found {len(candidates)} candidate files in {RAW_DIR}")
+	candidates = recent_candidates(RAW_PERMIT_DIR)
+	logger.debug(f"Found {len(candidates)} candidate files in {RAW_PERMIT_DIR}")
 	
 	# Check browser-use temp directories
 	temp_base = Path("C:/tmp")
@@ -135,9 +141,9 @@ async def download_permits(
 	"""
 	
 	try:
-		RAW_DIR.mkdir(parents=True, exist_ok=True)
+		RAW_PERMIT_DIR.mkdir(parents=True, exist_ok=True)
 		
-		save_dir = os.path.abspath(str(RAW_DIR))
+		save_dir = os.path.abspath(str(RAW_PERMIT_DIR))
 		start_time = time.time()
 		
 		# Calculate date range
@@ -155,7 +161,7 @@ async def download_permits(
 			task = get_prompt(
 				"permit_prompts.yaml",
 				"permit_search.task_template",
-				url=PERMIT_URL,
+				url=PERMIT_SEARCH_URL,
 				start_date=start_date_str,
 				end_date=end_date_str,
 				wait_time=wait_after_download
@@ -199,10 +205,10 @@ async def download_permits(
 			logger.error("Could not detect the downloaded file after automation completed")
 			return None
 		
-		# If file is in temp directory, move it to RAW_DIR
-		if not downloaded_file.is_relative_to(RAW_DIR):
+		# If file is in temp directory, move it to RAW_PERMIT_DIR
+		if not downloaded_file.is_relative_to(RAW_PERMIT_DIR):
 			final_filename = f"hillsborough_permits_{start_date.strftime('%Y%m%d')}_{today.strftime('%Y%m%d')}{downloaded_file.suffix}"
-			dest_file = RAW_DIR / final_filename
+			dest_file = RAW_PERMIT_DIR / final_filename
 			
 			logger.info(f"Moving download from temp directory to: {dest_file}")
 			shutil.move(str(downloaded_file), str(dest_file))
@@ -320,10 +326,10 @@ def save_processed_permits(df: pd.DataFrame, output_filename: str = "permit_data
 		>>> print(f"Saved to: {output_path}")
 	"""
 	try:
-		PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-		logger.debug(f"Ensured processed directory exists: {PROCESSED_DIR}")
+		PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
+		logger.debug(f"Ensured processed directory exists: {PROCESSED_DATA_DIR}")
 		
-		output_path = PROCESSED_DIR / output_filename
+		output_path = PROCESSED_DATA_DIR / output_filename
 		
 		df.to_csv(output_path, index=False)
 		logger.info(f"Saved {len(df)} permit records to: {output_path}")

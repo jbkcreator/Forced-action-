@@ -23,16 +23,21 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
+from config.constants import (
+	PROBATE_FILINGS_URL,
+	RAW_PROBATE_DIR,
+	PROCESSED_DATA_DIR,
+	HILLSCLERK_BASE_URL,
+	PROBATE_FILING_PATTERN,
+	DEFAULT_USER_AGENT,
+	REQUEST_TIMEOUT_DEFAULT,
+	REQUEST_TIMEOUT_LONG,
+)
 from src.utils.logger import setup_logging, get_logger
 
 # Initialize logging
 setup_logging()
 logger = get_logger(__name__)
-
-# Configuration
-PROBATE_BASE_URL = "https://publicrec.hillsclerk.com/Probate/dailyfilings/"
-DOWNLOAD_DIR = Path("data/raw/probate")
-PROCESSED_DIR = Path("data/processed")
 
 
 def download_latest_probate_filing() -> Path:
@@ -55,20 +60,20 @@ def download_latest_probate_filing() -> Path:
 		>>> csv_path = download_latest_probate_filing()
 		>>> print(f"Downloaded to: {csv_path}")
 	"""
-	logger.info(f"Fetching probate filings list from: {PROBATE_BASE_URL}")
+	logger.info(f"Fetching probate filings list from: {PROBATE_FILINGS_URL}")
 	
 	try:
 		# Ensure download directory exists
-		DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-		logger.debug(f"Ensured download directory exists: {DOWNLOAD_DIR}")
+		RAW_PROBATE_DIR.mkdir(parents=True, exist_ok=True)
+		logger.debug(f"Ensured download directory exists: {RAW_PROBATE_DIR}")
 		
 		# Fetch the directory listing page
 		response = requests.get(
-			PROBATE_BASE_URL,
+			PROBATE_FILINGS_URL,
 			headers={
-				"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+				"User-Agent": DEFAULT_USER_AGENT
 			},
-			timeout=30,
+			timeout=REQUEST_TIMEOUT_DEFAULT,
 		)
 		response.raise_for_status()
 		logger.debug(f"Successfully fetched directory listing (status code: {response.status_code})")
@@ -101,7 +106,7 @@ def download_latest_probate_filing() -> Path:
 		logger.info(f"Found {len(file_links)} probate filing files")
 		
 		# Extract dates from filenames and find the latest
-		date_pattern = re.compile(r"ProbateFiling_(\d{8})\.csv")
+		date_pattern = re.compile(PROBATE_FILING_PATTERN)
 		files_with_dates = []
 		
 		for file_link in file_links:
@@ -132,21 +137,21 @@ def download_latest_probate_filing() -> Path:
 	try:
 		# Construct full URL
 		if latest_file.startswith("/"):
-			download_url = f"https://publicrec.hillsclerk.com{latest_file}"
+			download_url = f"{HILLSCLERK_BASE_URL}{latest_file}"
 		else:
-			download_url = f"{PROBATE_BASE_URL.rstrip('/')}/{latest_file}"
+			download_url = f"{PROBATE_FILINGS_URL.rstrip('/')}/{latest_file}"
 		
 		# Download the file
 		filename = Path(latest_file).name
-		output_path = DOWNLOAD_DIR / filename
+		output_path = RAW_PROBATE_DIR / filename
 		
 		logger.info(f"Downloading probate file from: {download_url}")
 		file_response = requests.get(
 			download_url,
 			headers={
-				"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+				"User-Agent": DEFAULT_USER_AGENT
 			},
-			timeout=60,
+			timeout=REQUEST_TIMEOUT_LONG,
 		)
 		file_response.raise_for_status()
 		
@@ -247,10 +252,10 @@ def save_processed_probate(df: pd.DataFrame, output_filename: str = "probate_lea
 		>>> print(f"Saved to: {output_path}")
 	"""
 	try:
-		PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
-		logger.debug(f"Ensured processed directory exists: {PROCESSED_DIR}")
+		PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
+		logger.debug(f"Ensured processed directory exists: {PROCESSED_DATA_DIR}")
 		
-		output_path = PROCESSED_DIR / output_filename
+		output_path = PROCESSED_DATA_DIR / output_filename
 		
 		df.to_csv(output_path, index=False)
 		logger.info(f"Saved {len(df)} records to: {output_path}")

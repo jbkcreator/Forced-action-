@@ -27,6 +27,18 @@ from typing import Optional
 from browser_use import Agent, ChatAnthropic
 
 from config.settings import settings
+from config.constants import (
+	REALFORECLOSE_BASE_URL,
+	AUCTION_DATE_FORMAT,
+	RAW_FORECLOSURE_DIR,
+	PROCESSED_DATA_DIR,
+	DOWNLOAD_FILE_PATTERNS,
+	TEMP_DOWNLOADS_DIR,
+	BROWSER_DOWNLOAD_TEMP_PATTERN,
+	BROWSER_MODEL,
+	BROWSER_TEMPERATURE,
+	OUTPUT_SEPARATOR,
+)
 from src.utils.logger import setup_logging, get_logger
 from src.utils.prompt_loader import get_prompt
 
@@ -34,23 +46,16 @@ from src.utils.prompt_loader import get_prompt
 setup_logging()
 logger = get_logger(__name__)
 
-# RealForeclose configuration
-REALFORECLOSE_BASE_URL = "https://www.hillsborough.realforeclose.com/index.cfm"
-AUCTION_DATE_FORMAT = "%m/%d/%Y"
-SAVE_DIR = Path("data/raw/foreclosures")
-PROCESSED_DIR = Path("data/processed")
-DOWNLOAD_PATTERNS = ("*.csv", "*.json", "*.xls", "*.xlsx")
-
 # LLM configuration for browser automation
 llm = ChatAnthropic(
-    model="claude-sonnet-4-5-20250929",
+    model=BROWSER_MODEL,
     timeout=180,
     api_key=settings.anthropic_api_key.get_secret_value(),
-    temperature=0,
+    temperature=BROWSER_TEMPERATURE,
 )
 
-SAVE_DIR.mkdir(parents=True, exist_ok=True)
-PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+RAW_FORECLOSURE_DIR.mkdir(parents=True, exist_ok=True)
+PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def build_preview_url(auction_date: dt.date) -> str:
@@ -95,7 +100,7 @@ def _locate_recent_download(start_time: float) -> Optional[Path]:
         found = []
         if not folder.exists():
             return found
-        for pattern in DOWNLOAD_PATTERNS:
+        for pattern in DOWNLOAD_FILE_PATTERNS:
             for candidate in folder.glob(pattern):
                 try:
                     if candidate.stat().st_mtime >= start_time:
@@ -105,13 +110,13 @@ def _locate_recent_download(start_time: float) -> Optional[Path]:
                     continue
         return found
     
-    candidates = scan(PROCESSED_DIR)
-    candidates.extend(scan(SAVE_DIR))
+    candidates = scan(PROCESSED_DATA_DIR)
+    candidates.extend(scan(RAW_FORECLOSURE_DIR))
     logger.debug(f"Found {len(candidates)} candidate files in data directories")
     
-    temp_base = Path("C:/tmp")
+    temp_base = TEMP_DOWNLOADS_DIR
     if temp_base.exists():
-        for download_dir in temp_base.glob("browser-use-downloads-*"):
+        for download_dir in temp_base.glob(BROWSER_DOWNLOAD_TEMP_PATTERN):
             temp_candidates = scan(download_dir)
             candidates.extend(temp_candidates)
             logger.debug(f"Found {len(temp_candidates)} candidate files in {download_dir}")
@@ -160,7 +165,7 @@ async def scrape_realforeclose_calendar(
         start_time = time.time()
         preview_url = build_preview_url(auction_date)
         iso_date = auction_date.strftime("%Y-%m-%d")
-        dest_file = PROCESSED_DIR / f"hillsborough_realforeclose_{auction_date:%Y%m%d}.csv"
+        dest_file = PROCESSED_DATA_DIR / f"hillsborough_realforeclose_{auction_date:%Y%m%d}.csv"
         
         # Load task prompt from YAML configuration
         try:
@@ -184,7 +189,7 @@ async def scrape_realforeclose_calendar(
             max_steps=50,
             browser_context_config={
                 "headless": True,
-                "save_downloads_path": str(PROCESSED_DIR.resolve()),
+                "save_downloads_path": str(PROCESSED_DATA_DIR.resolve()),
             },
         )
         

@@ -332,6 +332,113 @@ def process_lien_data(file_path: Path) -> pd.DataFrame:
 		raise
 
 
+def categorize_and_split_data(combined_df: pd.DataFrame) -> dict:
+	"""
+	Applies business logic to categorize and organize documents into 3 files:
+	- all_liens.csv: All lien types (General Liens split by keywords, Corp Tax Liens)
+	- all_deeds.csv: All deed transfers (Deeds, Tax Deeds)
+	- all_judgments.csv: All judgments (Judgments, Certified Judgments)
+	
+	Categorization Rules for General Liens:
+		- HOA LIENS (HL): Association/HOA/Condo keywords
+		- TAMPA CODE LIENS (TCL): City of Tampa in grantor/grantee
+		- COUNTY CODE LIENS (CCL): Hillsborough County in grantor/grantee
+		- TAX LIENS (TL): IRS/revenue keywords or Corp Tax Liens
+		- MECHANICS LIENS (ML): Default for other General Liens
+	
+	Args:
+		combined_df: DataFrame containing all raw document records
+		
+	Returns:
+		dict: Dictionary mapping file names to record counts
+		
+	Example:
+		>>> file_counts = categorize_and_split_data(combined_df)
+		>>> print(f"Liens: {file_counts['all_liens.csv']} records")
+	"""
+	logger.info("Categorizing documents into liens, deeds, and judgments...")
+	
+	# Keyword patterns for General Liens categorization
+	hoa_keywords = ['ASSOCIATION', 'HOA', 'CONDO', 'COMMUNITY', 'VILLAGE', 'TOWNHOME', 'PROPERTY OWNERS']
+	irs_keywords = ['UNITED STATES', 'INTERNAL REVENUE', 'STATE OF FLORIDA', 'DEPARTMENT OF REVENUE']
+	
+	def categorize_record(row):
+		"""Categorize each record and update document_type."""
+		doc_type = row.get('document_type', '')
+		
+		# Merge Corp Tax Liens into Tax Liens
+		if doc_type == "Corp Tax Liens":
+			return "TAX LIENS (TL)"
+		
+		# Split General Liens based on Grantor/Grantee keywords
+		if doc_type == "General Liens":
+			grantor = str(row.get('Grantor', '')).upper()
+			grantee = str(row.get('Grantee', '')).upper()
+			
+			if any(k in grantor or k in grantee for k in hoa_keywords):
+				return "HOA LIENS (HL)"
+			if 'CITY OF TAMPA' in grantee or 'CITY OF TAMPA' in grantor:
+				return "TAMPA CODE LIENS (TCL)"
+			if 'HILLSBOROUGH COUNTY' in grantee or 'HILLSBOROUGH COUNTY' in grantor:
+				return "COUNTY CODE LIENS (CCL)"
+			if any(k in grantor or k in grantee for k in irs_keywords):
+				return "TAX LIENS (TL)"
+			
+			# Default for General Liens not matching above patterns
+			return "MECHANICS LIENS (ML)"
+		
+		# Keep other document types as-is
+		return doc_type
+	
+	# Apply the categorization logic
+	combined_df['document_type'] = combined_df.apply(categorize_record, axis=1)
+	
+	# Define file groupings
+	lien_types = ["HOA LIENS (HL)", "TAMPA CODE LIENS (TCL)", "COUNTY CODE LIENS (CCL)", 
+	              "TAX LIENS (TL)", "MECHANICS LIENS (ML)"]
+	deed_types = ["Deeds", "Tax Deeds"]
+	judgment_types = ["Judgments", "Certified Judgments"]
+	
+	# Save to 3 separate files
+	PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+	file_counts = {}
+	
+	# Save liens
+	liens_df = combined_df[combined_df['document_type'].isin(lien_types)]
+	if not liens_df.empty:
+		liens_path = PROCESSED_DIR / "all_liens.csv"
+		liens_df.to_csv(liens_path, index=False)
+		file_counts['all_liens.csv'] = len(liens_df)
+		logger.info(f"Saved {len(liens_df)} lien records to {liens_path.name}")
+		for doc_type in liens_df['document_type'].unique():
+			count = len(liens_df[liens_df['document_type'] == doc_type])
+			logger.info(f"  - {doc_type}: {count} records")
+	
+	# Save deeds
+	deeds_df = combined_df[combined_df['document_type'].isin(deed_types)]
+	if not deeds_df.empty:
+		deeds_path = PROCESSED_DIR / "all_deeds.csv"
+		deeds_df.to_csv(deeds_path, index=False)
+		file_counts['all_deeds.csv'] = len(deeds_df)
+		logger.info(f"Saved {len(deeds_df)} deed records to {deeds_path.name}")
+		for doc_type in deeds_df['document_type'].unique():
+			count = len(deeds_df[deeds_df['document_type'] == doc_type])
+			logger.info(f"  - {doc_type}: {count} records")
+	
+	# Save judgments
+	judgments_df = combined_df[combined_df['document_type'].isin(judgment_types)]
+	if not judgments_df.empty:
+		judgments_path = PROCESSED_DIR / "all_judgments.csv"
+		judgments_df.to_csv(judgments_path, index=False)
+		file_counts['all_judgments.csv'] = len(judgments_df)
+		logger.info(f"Saved {len(judgments_df)} judgment records to {judgments_path.name}")
+		for doc_type in judgments_df['document_type'].unique():
+			count = len(judgments_df[judgments_df['document_type'] == doc_type])
+			logger.info(f"  - {doc_type}: {count} records")
+	
+	return file_counts
+
+
 def save_processed_liens(df: pd.DataFrame, output_filename: str = "lien_data.csv") -> Path:
 	"""
 	Save processed lien/judgment data to the output directory.
@@ -454,18 +561,30 @@ async def run_lien_pipeline(lookback_days: int = 30, run_all: bool = False):
 				logger.error("No data was successfully downloaded and processed from any document type")
 				return
 			
-			# Combine all dataframes
+			# Combine all raw dataframes
 			combined_df = pd.concat(all_dataframes, ignore_index=True)
 			
-			# Save combined data
-			output_path = save_processed_liens(combined_df, "all_liens_judgments.csv")
+			# Categorize, split, and save to distinct Source files
+			category_counts = categorize_and_split_data(combined_df)
+			
+			# Delete the raw source files now that processing is complete
+			logger.info("Cleaning up raw download directory...")
+			for raw_file in RAW_DIR.glob("*"):
+				if raw_file.is_file():
+					try:
+						raw_file.unlink()
+						logger.debug(f"Deleted raw file: {raw_file.name}")
+					except Exception as e:
+						logger.warning(f"Could not delete raw file {raw_file.name}: {e}")
 			
 			logger.info("=" * 60)
 			logger.info("LIEN & JUDGMENT PIPELINE COMPLETE")
 			logger.info("=" * 60)
 			logger.info(f"Successful downloads: {successful_downloads}/6")
 			logger.info(f"Total records processed: {len(combined_df)}")
-			logger.info(f"Output file location: {output_path}")
+			logger.info("Final Breakdown by Source:")
+			for category, count in category_counts.items():
+				logger.info(f"  - {category}: {count} records")
 			
 		else:
 			# Run document types sequentially to save API credits
@@ -511,16 +630,30 @@ async def run_lien_pipeline(lookback_days: int = 30, run_all: bool = False):
 				logger.error("No data was successfully downloaded and processed from any document type")
 				return
 			
-			# Combine all dataframes
+			# Combine all raw dataframes
 			combined_df = pd.concat(all_dataframes, ignore_index=True)
 			
-			# Save combined data
-			output_path = save_processed_liens(combined_df, "all_liens_judgments.csv")
+			# Categorize, split, and save to distinct Source files
+			category_counts = categorize_and_split_data(combined_df)
+			
+			# Delete the raw source files now that processing is complete
+			logger.info("Cleaning up raw download directory...")
+			for raw_file in RAW_DIR.glob("*"):
+				if raw_file.is_file():
+					try:
+						raw_file.unlink()
+						logger.debug(f"Deleted raw file: {raw_file.name}")
+					except Exception as e:
+						logger.warning(f"Could not delete raw file {raw_file.name}: {e}")
 			
 			logger.info("=" * 60)
 			logger.info("LIEN & JUDGMENT PIPELINE COMPLETE")
 			logger.info("=" * 60)
-		logger.info(f"Successful downloads: {successful_downloads}/6")
+			logger.info(f"Successful downloads: {successful_downloads}/6")
+			logger.info(f"Total records processed: {len(combined_df)}")
+			logger.info("Final Breakdown by Source:")
+			for category, count in category_counts.items():
+				logger.info(f"  - {category}: {count} records")
 	except Exception as e:
 		logger.error(f"Lien pipeline failed with error: {e}")
 		logger.debug(traceback.format_exc())

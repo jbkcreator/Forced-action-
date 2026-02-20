@@ -26,6 +26,13 @@ from typing import Optional
 from browser_use import Agent, ChatAnthropic
 
 from config.settings import settings
+from config.constants import (
+	REFERENCE_DATA_DIR,
+	DOWNLOAD_FILE_PATTERNS,
+	VIOLATION_SEARCH_URL,
+	TEMP_DOWNLOADS_DIR,
+	BROWSER_DOWNLOAD_TEMP_PATTERN,
+)
 from src.utils.logger import setup_logging, get_logger
 from src.utils.prompt_loader import get_prompt
 
@@ -39,13 +46,6 @@ llm = ChatAnthropic(
 	timeout=180,
 	api_key=settings.anthropic_api_key.get_secret_value(),
 	temperature=0,
-)
-
-# Configuration
-DOWNLOAD_DIR = Path("data/reference")
-DOWNLOAD_PATTERNS = ("*.csv", "*.xls", "*.xlsx")
-ACCELA_URL = (
-	"https://aca-prod.accela.com/HCFL/Cap/CapHome.aspx?module=Enforcement&TabName=Enforcement"
 )
 
 
@@ -72,7 +72,7 @@ def _recent_download(start_time: float) -> Optional[Path]:
 		found = []
 		if not folder.exists():
 			return found
-		for pattern in DOWNLOAD_PATTERNS:
+		for pattern in DOWNLOAD_FILE_PATTERNS:
 			for candidate in folder.glob(pattern):
 				try:
 					if candidate.stat().st_mtime >= start_time:
@@ -82,12 +82,12 @@ def _recent_download(start_time: float) -> Optional[Path]:
 					continue
 		return found
 	
-	candidates = scan(DOWNLOAD_DIR)
-	logger.debug(f"Found {len(candidates)} candidate files in {DOWNLOAD_DIR}")
+	candidates = scan(REFERENCE_DATA_DIR)
+	logger.debug(f"Found {len(candidates)} candidate files in {REFERENCE_DATA_DIR}")
 	
-	temp_base = Path("C:/tmp")
+	temp_base = TEMP_DOWNLOADS_DIR
 	if temp_base.exists():
-		for download_dir in temp_base.glob("browser-use-downloads-*"):
+		for download_dir in temp_base.glob(BROWSER_DOWNLOAD_TEMP_PATTERN):
 			temp_candidates = scan(download_dir)
 			candidates.extend(temp_candidates)
 			logger.debug(f"Found {len(temp_candidates)} candidate files in {download_dir}")
@@ -126,8 +126,8 @@ async def download_violation_report(wait_after_download: int = 30) -> bool:
 	"""
 	
 	try:
-		DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-		logger.debug(f"Ensured download directory exists: {DOWNLOAD_DIR}")
+		REFERENCE_DATA_DIR.mkdir(parents=True, exist_ok=True)
+		logger.debug(f"Ensured download directory exists: {REFERENCE_DATA_DIR}")
 		
 		start_time = time.time()
 		dest_stub = "hcfl_code_enforcement_violations"
@@ -139,7 +139,7 @@ async def download_violation_report(wait_after_download: int = 30) -> bool:
 			instructions = get_prompt(
 				"violation_prompts.yaml",
 				"violation_export.task_template",
-				url=ACCELA_URL,
+				url=VIOLATION_SEARCH_URL,
 				today_date=today
 			)
 		except Exception as e:
@@ -147,7 +147,7 @@ async def download_violation_report(wait_after_download: int = 30) -> bool:
 			raise
 		
 		logger.info("Launching browser agent to download code enforcement violation report")
-		logger.debug(f"Download directory: {DOWNLOAD_DIR}")
+		logger.debug(f"Download directory: {REFERENCE_DATA_DIR}")
 		
 		agent = Agent(
 			task=instructions,
@@ -155,7 +155,7 @@ async def download_violation_report(wait_after_download: int = 30) -> bool:
 			max_steps=15,
 			browser_context_config={
 				"headless": True,
-				"save_downloads_path": str(DOWNLOAD_DIR.resolve()),
+				"save_downloads_path": str(REFERENCE_DATA_DIR.resolve()),
 			},
 		)
 		
@@ -183,7 +183,7 @@ async def download_violation_report(wait_after_download: int = 30) -> bool:
 		
 		# Rename and move file to final location
 		final_ext = downloaded.suffix.lower() or ".csv"
-		dest_file = DOWNLOAD_DIR / f"{dest_stub}{final_ext}"
+		dest_file = REFERENCE_DATA_DIR / f"{dest_stub}{final_ext}"
 		
 		if dest_file.exists():
 			logger.debug(f"Removing existing file: {dest_file}")

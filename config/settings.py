@@ -17,6 +17,7 @@ class AppSettings(BaseSettings):
 
 	anthropic_api_key: SecretStr = Field(..., env="ANTHROPIC_API_KEY")
 	firecrawl_api_key: SecretStr = Field(..., env="FIRECRAWL_API_KEY")
+	court_listener_api_key: SecretStr = Field(..., env="COURT_LISTENER_API_KEY")
 
 
 @lru_cache
