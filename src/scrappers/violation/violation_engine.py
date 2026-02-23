@@ -4,34 +4,31 @@ Code Enforcement Violations Data Collection Pipeline
 This module automates the download of code enforcement violation records from the
 Hillsborough County Accela enforcement portal. It uses browser automation via
 browser_use and Claude Sonnet 4.5 to navigate the portal, apply filters, and
-export violation data.
+extract violation data.
 
 The pipeline performs the following steps:
     1. Launches a browser agent to navigate the Accela enforcement portal
-    2. Applies date filters (2025 start year to current date)
-    3. Searches for and exports all violation records
-    4. Saves the downloaded file with a standardized filename
+    2. Applies date filters (last 1 day - yesterday to today)
+    3. Searches for and extracts all violation records
+    4. Saves the violation data as CSV with standardized filename
+    5. Violations are mapped to properties using address matching
 
 Author: Distressed Property Intelligence Platform
 """
 
+import argparse
 import asyncio
-import os
-import shutil
-import time
 import traceback
-from pathlib import Path
-from typing import Optional
+from datetime import datetime, timedelta
+
+import pandas as pd
 
 from browser_use import Agent, ChatAnthropic
 
 from config.settings import settings
 from config.constants import (
 	REFERENCE_DATA_DIR,
-	DOWNLOAD_FILE_PATTERNS,
 	VIOLATION_SEARCH_URL,
-	TEMP_DOWNLOADS_DIR,
-	BROWSER_DOWNLOAD_TEMP_PATTERN,
 )
 from src.utils.logger import setup_logging, get_logger
 from src.utils.prompt_loader import get_prompt
@@ -49,113 +46,61 @@ llm = ChatAnthropic(
 )
 
 
-def _recent_download(start_time: float) -> Optional[Path]:
+async def scrape_violations_with_browser_use(start_date: str = None, end_date: str = None) -> bool:
 	"""
-	Locate the most recently downloaded file after the specified start time.
+	Use browser-use Agent to scrape violation records directly from HTML table.
 	
-	This function searches both the configured download directory and browser-use
-	temporary directories for files matching download patterns that were created
-	after the specified timestamp.
+	This approach uses browser automation to navigate the portal, search for violations,
+	and extract data. The agent returns data in pipe-delimited format, which we then
+	parse and save as CSV in Python. This is more reliable than depending on file
+	attachments or downloads.
 	
 	Args:
-		start_time: Unix timestamp representing when the download started
-		
+		start_date: Start date in YYYY-MM-DD format (default: yesterday)
+		end_date: End date in YYYY-MM-DD format (default: today)
+	
 	Returns:
-		Optional[Path]: Path to the most recently modified downloaded file, or None if not found
-		
-	Note:
-		Searches for files matching patterns: *.csv, *.xls, *.xlsx
+		bool: True if scraping succeeded and file was saved, False otherwise
 	"""
-	
-	def scan(folder: Path):
-		"""Find files in folder that match download patterns and were created after start_time."""
-		found = []
-		if not folder.exists():
-			return found
-		for pattern in DOWNLOAD_FILE_PATTERNS:
-			for candidate in folder.glob(pattern):
-				try:
-					if candidate.stat().st_mtime >= start_time:
-						found.append(candidate)
-				except FileNotFoundError:
-					logger.debug(f"File disappeared during check: {candidate}")
-					continue
-		return found
-	
-	candidates = scan(REFERENCE_DATA_DIR)
-	logger.debug(f"Found {len(candidates)} candidate files in {REFERENCE_DATA_DIR}")
-	
-	temp_base = TEMP_DOWNLOADS_DIR
-	if temp_base.exists():
-		for download_dir in temp_base.glob(BROWSER_DOWNLOAD_TEMP_PATTERN):
-			temp_candidates = scan(download_dir)
-			candidates.extend(temp_candidates)
-			logger.debug(f"Found {len(temp_candidates)} candidate files in {download_dir}")
-	
-	if not candidates:
-		logger.warning("No recent download files found")
-		return None
-	
-	# Return the most recently modified file
-	most_recent = max(candidates, key=lambda path: path.stat().st_mtime)
-	logger.debug(f"Selected most recent file: {most_recent}")
-	return most_recent
-
-
-async def download_violation_report(wait_after_download: int = 30) -> bool:
-	"""
-	Automate the Accela portal to download code enforcement violation records.
-	
-	This function launches a browser agent powered by Claude Sonnet 4.5 to navigate
-	the Hillsborough County Accela enforcement portal, set date filters, and export
-	violation records to a CSV or Excel file.
-	
-	Args:
-		wait_after_download: Seconds to wait for download to complete after export (default: 30)
-		
-	Returns:
-		bool: True if download and file processing succeeded, False otherwise
-		
-	Raises:
-		Exception: Logs and returns False on browser automation or file operation failures
-		
-	Example:
-		>>> success = await download_violation_report(wait_after_download=40)
-		>>> if success:
-		...     print("Violation report downloaded successfully")
-	"""
-	
 	try:
-		REFERENCE_DATA_DIR.mkdir(parents=True, exist_ok=True)
-		logger.debug(f"Ensured download directory exists: {REFERENCE_DATA_DIR}")
+		# Parse dates or use defaults
+		if end_date:
+			end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+		else:
+			end_dt = datetime.now()
+			
+		if start_date:
+			start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+		else:
+			start_dt = end_dt - timedelta(days=1)
 		
-		start_time = time.time()
-		dest_stub = "hcfl_code_enforcement_violations"
+		today_str = end_dt.strftime("%m/%d/%Y")
+		start_date_str = start_dt.strftime("%m/%d/%Y")
 		
-		today = time.strftime("%m/%d/%Y")
+		logger.info(f"Using browser-use to scrape violations from {start_date_str} to {today_str}")
+		logger.info("Agent will extract table data and return as text - we'll build CSV in Python")
 		
-		# Load task prompt from YAML configuration
+		# Load task instructions from YAML configuration
 		try:
-			instructions = get_prompt(
+			task_instructions = get_prompt(
 				"violation_prompts.yaml",
-				"violation_export.task_template",
+				"violation_browser_use_scrape.task_template",
 				url=VIOLATION_SEARCH_URL,
-				today_date=today
+				today_date=today_str,
+				start_date=start_date_str
 			)
 		except Exception as e:
 			logger.error(f"Failed to load prompt from YAML: {e}")
 			raise
-		
-		logger.info("Launching browser agent to download code enforcement violation report")
-		logger.debug(f"Download directory: {REFERENCE_DATA_DIR}")
+
+		logger.info("Launching browser agent to scrape violation table...")
 		
 		agent = Agent(
-			task=instructions,
+			task=task_instructions,
 			llm=llm,
-			max_steps=15,
+			max_steps=30,
 			browser_context_config={
-				"headless": True,
-				"save_downloads_path": str(REFERENCE_DATA_DIR.resolve()),
+				"headless": False,
 			},
 		)
 		
@@ -163,54 +108,130 @@ async def download_violation_report(wait_after_download: int = 30) -> bool:
 			history = await agent.run()
 			
 			if not history.is_done():
-				logger.warning("Agent could not finish the Accela workflow within 15 steps")
-				logger.warning("Browser may be unresponsive. Check logs.")
+				logger.warning("Agent could not finish within 30 steps")
 				return False
 			
-			logger.info("Agent workflow completed. Waiting for download to finalize...")
-			await asyncio.sleep(wait_after_download)
+			logger.info("Agent workflow completed successfully")
+			
+			# Get the final result from the agent
+			final_result = history.final_result()
+			
+			if not final_result:
+				logger.error("No result returned from browser agent")
+				return False
+			
+			result_str = str(final_result)
+			logger.info(f"Agent returned result of length {len(result_str)} characters")
+			logger.debug(f"First 500 chars: {result_str[:500]}")
+			
+			# Parse the pipe-delimited data
+			all_violations = []
+			lines = result_str.strip().split('\n')
+			
+			# Find the header line (should contain column names with | separators)
+			header_idx = -1
+			header_columns = []
+			for idx, line in enumerate(lines):
+				if '|' in line and any(col in line for col in ['Record Number', 'Status', 'Date']):
+					header_columns = [col.strip() for col in line.split('|')]
+					header_idx = idx
+					logger.info(f"Found header at line {idx}: {header_columns}")
+					break
+			
+			if header_idx == -1:
+				logger.error("Could not find pipe-delimited header in agent result")
+				logger.error(f"Result content: {result_str[:1000]}")
+				return False
+			
+			# Parse data rows
+			for line in lines[header_idx + 1:]:
+				line = line.strip()
+				if not line or '|' not in line:
+					continue
+				
+				values = [val.strip() for val in line.split('|')]
+				
+				# Only process if we have enough values
+				if len(values) >= len(header_columns):
+					row_dict = {}
+					for i, col in enumerate(header_columns):
+						if i < len(values):
+							row_dict[col] = values[i]
+					all_violations.append(row_dict)
+			
+			if not all_violations:
+				logger.error("No violation records parsed from agent result")
+				logger.error(f"Parsed {len(lines)} lines, header at {header_idx}")
+				return False
+			
+			logger.info(f"Successfully parsed {len(all_violations)} violation records")
+			
+			# Convert to DataFrame and save as CSV
+			df = pd.DataFrame(all_violations)
+			
+			# Ensure directory exists
+			REFERENCE_DATA_DIR.mkdir(parents=True, exist_ok=True)
+			dest_file = REFERENCE_DATA_DIR / "hcfl_code_enforcement_violations.csv"
+			
+			df.to_csv(dest_file, index=False)
+			size_mb = dest_file.stat().st_size / (1024 ** 2)
+			logger.info(f"Violation report saved to {dest_file} ({size_mb:.2f} MB)")
+			logger.info(f"Columns: {df.columns.tolist()}")
+			logger.info(f"Sample of first row: {dict(df.iloc[0]) if len(df) > 0 else 'N/A'}")
+			
+			return True
 			
 		except Exception as e:
 			logger.error(f"Browser agent execution failed: {e}")
 			logger.debug(traceback.format_exc())
 			return False
-		
-		# Look for downloaded file
-		downloaded = _recent_download(start_time)
-		if not downloaded or not downloaded.exists():
-			logger.error("Could not locate the downloaded violation report")
-			return False
-		
-		# Rename and move file to final location
-		final_ext = downloaded.suffix.lower() or ".csv"
-		dest_file = REFERENCE_DATA_DIR / f"{dest_stub}{final_ext}"
-		
-		if dest_file.exists():
-			logger.debug(f"Removing existing file: {dest_file}")
-			dest_file.unlink()
-		
-		logger.info(f"Moving downloaded file: {downloaded} -> {dest_file}")
-		shutil.move(str(downloaded), str(dest_file))
-		
-		size_mb = dest_file.stat().st_size / (1024 ** 2)
-		logger.info(f"Violation report saved to {dest_file} ({size_mb:.1f} MB)")
-		
-		# Clean up temp directory
-		temp_dir = downloaded.parent
-		if temp_dir.exists() and temp_dir.name.startswith("browser-use-downloads-"):
-			try:
-				shutil.rmtree(temp_dir)
-				logger.debug(f"Cleaned up temp directory: {temp_dir}")
-			except Exception as exc:
-				logger.warning(f"Failed to clean temp directory {temp_dir}: {exc}")
-		
-		return True
-		
+			
 	except Exception as e:
-		logger.error(f"Error during violation report download: {e}")
+		logger.error(f"Browser-use scraping failed: {e}")
 		logger.debug(traceback.format_exc())
 		return False
 
 
 if __name__ == "__main__":
-	asyncio.run(download_violation_report())
+	# Parse command-line arguments
+	parser = argparse.ArgumentParser(description="Scrape code enforcement violations from Hillsborough County portal")
+	parser.add_argument(
+		"--start-date",
+		type=str,
+		help="Start date in YYYY-MM-DD format (default: yesterday). Example: 2026-01-03"
+	)
+	parser.add_argument(
+		"--end-date",
+		type=str,
+		help="End date in YYYY-MM-DD format (default: today). Example: 2026-01-04"
+	)
+	args = parser.parse_args()
+
+	logger.info("=" * 60)
+	logger.info("Violation Scraping Pipeline Starting")
+	logger.info("=" * 60)
+	
+	if args.start_date or args.end_date:
+		logger.info(f"\nCustom date range specified:")
+		logger.info(f"  Start: {args.start_date or 'yesterday'}")
+		logger.info(f"  End: {args.end_date or 'today'}")
+	
+	logger.info("\nAttempting browser-use table scraping...")
+	logger.info("Extracting violation data directly from HTML table")
+	success = asyncio.run(scrape_violations_with_browser_use(
+		start_date=args.start_date,
+		end_date=args.end_date
+	))
+	
+	if success:
+		logger.info("=" * 60)
+		logger.info("✓ Pipeline completed successfully!")
+		logger.info("=" * 60)
+	else:
+		logger.error("=" * 60)
+		logger.error("✗ Violation report download/scraping failed")
+		logger.error("=" * 60)
+
+
+
+

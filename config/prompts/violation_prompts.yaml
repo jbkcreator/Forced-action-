@@ -1,13 +1,57 @@
 # Browser Automation Task Prompts for Code Enforcement Violations
 
-# Violation search and export task
+# Violation search and export task - BROWSER-USE TABLE SCRAPING (Primary Method)
+violation_browser_use_scrape:
+  description: "Navigate to Hillsborough County Accela enforcement portal and extract violation records as pipe-delimited text"
+  task_template: |
+    Navigate to the Hillsborough County Code Enforcement portal and extract violation records.
+
+    URL: {url}
+
+    Steps:
+    1. Navigate to the URL
+    2. Wait for the page to load (2 seconds)
+    3. If "Search Applications" form is not visible, click the button to show it
+    4. Fill in the Start Date field with: {start_date}
+    5. Fill in the End Date field with: {today_date}
+    6. Click the Search button
+    7. Wait for results to load (5 seconds)
+    8. Extract ALL data from the results table including these columns:
+       - Date
+       - Record Number
+       - Record Type
+       - Description
+       - Project Name
+       - Related Records
+       - Status
+       - Address (or Short Notes field if it contains addresses)
+    9. If pagination exists, click through ALL pages and extract data from each page
+    10. Return the data in this exact format:
+       Date|Record Number|Record Type|Description|Project Name|Related Records|Status|Address
+       02/23/2026|HC-WE-26-000669|Water Enforcement Proactive|Watering on a restricted day|Watering on a restricted day|0|In Review|10064 Dolphin Gull Cir, Thonotosassa FL 33592
+       (one row per line with pipe | separators)
+
+    IMPORTANT:
+    - Do NOT use any export or download buttons (they are broken)
+    - Extract data directly by reading the HTML table
+    - Make sure BOTH date fields are filled correctly before clicking Search
+    - Extract every single row from every page
+    - Return ALL rows in pipe-delimited format with the header row first
+
+# Violation search and export task - LEGACY EXPORT METHOD (Fallback)
 violation_export:
-  description: "Navigate to Hillsborough County Accela enforcement portal and export violation records"
+  description: "Navigate to Hillsborough County Accela enforcement portal and export violation records using export button"
   task_template: |
     1. Open {url}
     2. If the Search Applications / General Search form is not already visible, click the 'Search Applications' button once to open it; otherwise leave it alone.
-    3. Set Start Date year to 2025 and End Date to today's date ({today_date}).
+    3. Set Start Date to {start_date} and End Date to today's date ({today_date}).
     4. Click Search to run the query and wait for the results grid to finish loading.
-    5. Use the page's download/export control to export the entire result set (CSV preferred, Excel acceptable).
-    6. Once the download starts, wait at least 30 seconds before finishing.
-    7. Avoid refreshing the page or opening new tabs.
+    5. Once the results table is visible and fully loaded, extract ALL data from the table including:
+       - Record Number
+       - Status
+       - Address
+       - Opened Date
+       - Any other visible columns
+    6. Save the extracted table data to a CSV file.
+    7. If there are multiple pages of results, paginate through all pages and collect all records.
+    8. Do NOT use the broken export button - scrape the table directly from the HTML.
