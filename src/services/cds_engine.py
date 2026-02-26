@@ -757,3 +757,48 @@ class CDSCalculator:
             DistressScore.property_id == property_id,
             cast(DistressScore.score_date, Date) == today_date
         ).first()
+
+
+def main():
+    """
+    Entry point for cron execution.
+    Scores all properties with violations and saves results to the database.
+    """
+    import sys
+    from src.utils.logger import setup_logging, get_logger
+    from src.core.database import get_db_context
+
+    setup_logging()
+    log = get_logger(__name__)
+
+    log.info("=" * 60)
+    log.info("CDS Scoring Engine — Daily Run")
+    log.info(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    log.info("=" * 60)
+
+    try:
+        with get_db_context() as session:
+            calculator = CDSCalculator(session)
+            scores = calculator.score_all_properties_with_violations(save_to_db=True)
+
+        total = len(scores)
+        qualified = sum(1 for s in scores if s['qualified'])
+
+        log.info("=" * 60)
+        log.info("CDS SCORING COMPLETE")
+        log.info(f"  Properties scored:  {total}")
+        log.info(f"  Qualified (≥70):    {qualified}")
+        log.info(f"  Not qualified:      {total - qualified}")
+        if total:
+            avg = sum(s['total_score'] for s in scores) / total
+            log.info(f"  Average score:      {avg:.1f}")
+        log.info(f"Finished: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        log.info("=" * 60)
+
+    except Exception as e:
+        log.error(f"CDS scoring failed: {e}", exc_info=True)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
