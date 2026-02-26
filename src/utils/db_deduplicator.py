@@ -34,7 +34,7 @@ DEDUP_CONFIG: Dict[str, tuple] = {
     # LegalProceeding uses polymorphic pattern with record_type discriminator
     'probate': (LegalProceeding, 'case_number', 'Case Number'),
     'evictions': (LegalProceeding, 'case_number', 'Case Number'),
-    'bankruptcy': (LegalProceeding, 'case_number', 'Case Number'),
+    'bankruptcy': (LegalProceeding, 'case_number', 'Docket Number'),
 }
 
 

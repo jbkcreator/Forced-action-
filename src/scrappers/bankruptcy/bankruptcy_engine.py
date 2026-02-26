@@ -36,6 +36,7 @@ from src.core.database import get_db_context
 from src.loaders.legal_proceedings import BankruptcyLoader
 from src.utils.logger import setup_logging, get_logger
 from src.utils.csv_deduplicator import deduplicate_csv, get_unique_keys_for_type
+from src.utils.db_deduplicator import filter_new_records
 
 # Initialize logging
 setup_logging()
@@ -149,12 +150,11 @@ def filter_tampa_bankruptcies(dockets: List[Dict[str, Any]]) -> List[Dict[str, A
 			
 			# Create cleaned record
 			cleaned_record = {
-				'case_name': clean_name,
-				'raw_case_name': raw_name,
-				'docket_number': docket_num,
-				'date_filed': docket.get('date_filed', ''),
-				'case_type': case_type,
-				'court': docket.get('court', ''),
+				'Docket Number': docket_num,
+				'Lead Name': clean_name,
+				'Date Filed': docket.get('date_filed', ''),
+				'Case Type': case_type,
+				'Court ID': docket.get('court', ''),
 				'docket_id': docket.get('id', ''),
 				'date_terminated': docket.get('date_terminated', ''),
 				'nature_of_suit': docket.get('nature_of_suit', ''),
