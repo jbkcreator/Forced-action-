@@ -31,12 +31,29 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
-from browser_use import Agent, ChatAnthropic
+from browser_use import Agent, ChatAnthropic, Browser
 from firecrawl import FirecrawlApp
 
 from config.settings import settings
+from config.constants import (
+	DEFAULT_TAX_YEAR,
+	DEFAULT_ACCOUNT_STATUS,
+	MIN_YEARS_DELINQUENT,
+	RAW_TAX_DELINQUENCIES_DIR,
+	PROCESSED_DATA_DIR,
+	REFERENCE_DATA_DIR,
+	DOWNLOAD_FILE_PATTERNS,
+	PARCEL_LOOKUP_URL,
+	REQUEST_DELAY_RANGE,
+	TEMP_DOWNLOADS_DIR,
+	BROWSER_DOWNLOAD_TEMP_PATTERN,
+)
+from src.core.database import get_db_context
+from src.core.models import TaxDelinquency
+from src.loaders.tax import TaxDelinquencyLoader
 from src.utils.logger import setup_logging, get_logger
 from src.utils.prompt_loader import get_prompt, get_config
+from src.utils.csv_deduplicator import deduplicate_csv, get_unique_keys_for_type
 
 # Initialize logging
 setup_logging()
@@ -50,17 +67,9 @@ llm = ChatAnthropic(
 	temperature=0,
 )
 
-# Configuration
-DOWNLOAD_DIR = Path("data/reference")
-PROCESSED_DIR = Path("data/processed")
-DEFAULT_TAX_YEAR = 2026
-DEFAULT_ACCOUNT_STATUS = "Unpaid"
-DOWNLOAD_PATTERNS = ("*.csv", "*.xls", "*.xlsx")
-PARCEL_BASE_URL = "https://hillsborough.county-taxes.com/public/real_estate/parcels"
-MIN_YEARS_DELINQUENT = 2
-REQUEST_DELAY_RANGE = (2.0, 4.0)  # Delay between accounts for SNIPER phase
-
-PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+# Ensure directories exist
+RAW_TAX_DELINQUENCIES_DIR.mkdir(parents=True, exist_ok=True)
+PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _locate_download(start_time: float) -> Optional[Path]:
@@ -86,7 +95,7 @@ def _locate_download(start_time: float) -> Optional[Path]:
 		paths = []
 		if not folder.exists():
 			return paths
-		for pattern in DOWNLOAD_PATTERNS:
+		for pattern in DOWNLOAD_FILE_PATTERNS:
 			for candidate in folder.glob(pattern):
 				try:
 					if candidate.stat().st_mtime >= start_time:
@@ -96,12 +105,12 @@ def _locate_download(start_time: float) -> Optional[Path]:
 					continue
 		return paths
 	
-	candidates = recent_candidates(DOWNLOAD_DIR)
-	logger.debug(f"Found {len(candidates)} candidate files in {DOWNLOAD_DIR}")
+	candidates = recent_candidates(REFERENCE_DATA_DIR)
+	logger.debug(f"Found {len(candidates)} candidate files in {REFERENCE_DATA_DIR}")
 	
-	temp_base = Path("C:/tmp")
+	temp_base = TEMP_DOWNLOADS_DIR
 	if temp_base.exists():
-		for download_dir in temp_base.glob("browser-use-downloads-*"):
+		for download_dir in temp_base.glob(BROWSER_DOWNLOAD_TEMP_PATTERN):
 			temp_candidates = recent_candidates(download_dir)
 			candidates.extend(temp_candidates)
 			logger.debug(f"Found {len(temp_candidates)} candidate files in {download_dir}")
@@ -114,6 +123,35 @@ def _locate_download(start_time: float) -> Optional[Path]:
 	most_recent = max(candidates, key=lambda path: path.stat().st_mtime)
 	logger.debug(f"Selected most recent file: {most_recent}")
 	return most_recent
+
+
+def _get_existing_tax_records(tax_year: int) -> set:
+	"""
+	Query database for existing tax delinquency account numbers for given year.
+	
+	Args:
+		tax_year: Tax year to check
+		
+	Returns:
+		set: Set of existing account numbers (with 'A' prefix) for O(1) lookup
+	"""
+	logger.info(f"Querying database for existing tax records (year {tax_year})...")
+	
+	try:
+		with get_db_context() as session:
+			# Query for account numbers (folio with 'A' prefix)
+			results = session.query(TaxDelinquency.account_number).filter(
+				TaxDelinquency.tax_year == tax_year
+			).distinct().all()
+			
+			existing = {row[0] for row in results if row[0]}
+			logger.info(f"Found {len(existing):,} existing tax records in database for {tax_year}")
+			return existing
+			
+	except Exception as e:
+		logger.error(f"Failed to query existing tax records: {e}")
+		logger.debug(traceback.format_exc())
+		return set()
 
 
 async def download_tax_delinquent_report(
@@ -142,10 +180,10 @@ async def download_tax_delinquent_report(
 	"""
 	
 	try:
-		DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-		logger.debug(f"Ensured download directory exists: {DOWNLOAD_DIR}")
+		REFERENCE_DATA_DIR.mkdir(parents=True, exist_ok=True)
+		logger.debug(f"Ensured download directory exists: {REFERENCE_DATA_DIR}")
 		
-		save_dir = os.path.abspath(str(DOWNLOAD_DIR))
+		save_dir = os.path.abspath(str(REFERENCE_DATA_DIR))
 		dest_stub = f"hillsborough_tax_delinquent_{tax_year}"
 		start_time = time.time()
 		
@@ -164,13 +202,26 @@ async def download_tax_delinquent_report(
 		logger.info(f"[RADAR] Launching browser agent to download tax delinquent report")
 		logger.info(f"[RADAR] Tax year: {tax_year}, Status: {account_status}")
 		
+		# Configure browser for headless server environment
+		browser = Browser(
+			headless=True,
+			disable_security=True,
+			args=[
+				'--no-sandbox',
+				'--disable-setuid-sandbox',
+				'--disable-dev-shm-usage',
+				'--disable-gpu',
+				'--no-first-run',
+				'--no-zygote',
+				'--single-process',
+				'--disable-blink-features=AutomationControlled',
+			]
+		)
+		
 		agent = Agent(
 			task=task,
 			llm=llm,
-			browser_context_config={
-				"headless": True,
-				"save_downloads_path": save_dir,
-			},
+			browser=browser,
 		)
 		
 		try:
@@ -197,7 +248,7 @@ async def download_tax_delinquent_report(
 		
 		# Rename and move file to final location
 		final_ext = downloaded_file.suffix.lower() or ".csv"
-		dest_file = DOWNLOAD_DIR / f"{dest_stub}{final_ext}"
+		dest_file = RAW_TAX_DELINQUENCIES_DIR / f"{dest_stub}{final_ext}"
 		
 		if dest_file.exists():
 			logger.debug(f"Removing existing file: {dest_file}")
@@ -297,7 +348,7 @@ async def _scrape_parcel_with_firecrawl(firecrawl_client: FirecrawlApp, account_
 		don't raise exceptions to allow batch processing to continue.
 	"""
 
-	url = f"{PARCEL_BASE_URL}/{account_number}"
+	url = f"{PARCEL_LOOKUP_URL}/{account_number}"
 	result = {
 		"account_number": account_number,
 		"total_amount_due": None,
@@ -487,11 +538,11 @@ async def run_radar_sniper_pipeline(
 				return False
 
 		# Locate the CSV file (either just downloaded or existing)
-		bulk_csv_path = DOWNLOAD_DIR / f"hillsborough_tax_delinquent_{tax_year}.csv"
+		bulk_csv_path = REFERENCE_DATA_DIR / f"hillsborough_tax_delinquent_{tax_year}.csv"
 		if not bulk_csv_path.exists():
 			# Try alternate extensions
 			for ext in [".xls", ".xlsx"]:
-				alt_path = DOWNLOAD_DIR / f"hillsborough_tax_delinquent_{tax_year}{ext}"
+				alt_path = REFERENCE_DATA_DIR / f"hillsborough_tax_delinquent_{tax_year}{ext}"
 				if alt_path.exists():
 					bulk_csv_path = alt_path
 					logger.debug(f"Found alternate file: {bulk_csv_path}")
@@ -562,17 +613,69 @@ async def run_radar_sniper_pipeline(
 			logger.warning("No distressed accounts found matching criteria")
 			return False
 
-		# PHASE 4: SNIPER - Enrich with live scraped data
-		logger.info(f"[SNIPER] Enriching {len(df_distressed)} distressed accounts")
-		df_enriched = await _sniper_enrich_accounts(df_distressed, max_accounts=max_sniper_accounts)
+		# PHASE 3.5: Check DB for existing records (deduplicate BEFORE Firecrawl)
+		logger.info("=" * 80)
+		logger.info("DB DEDUPLICATION: Checking for existing records")
+		logger.info("=" * 80)
+		
+		existing_accounts = _get_existing_tax_records(tax_year)
+		
+		# Filter out accounts that already exist in DB
+		account_col = "Account Number"
+		initial_count = len(df_distressed)
+		
+		if existing_accounts:
+			df_new_only = df_distressed[~df_distressed[account_col].isin(existing_accounts)].copy()
+			logger.info(f"Filtered {initial_count - len(df_new_only):,} existing records")
+			logger.info(f"NEW records to enrich: {len(df_new_only):,}")
+		else:
+			df_new_only = df_distressed
+			logger.info(f"No existing records found, all {len(df_new_only):,} are new")
+		
+		if df_new_only.empty:
+			logger.info("✓ All records already exist in database - nothing to enrich")
+			return True
 
-		# PHASE 5: Save final output
-		final_output = PROCESSED_DIR / "final_weekly_distress_leads.csv"
-		df_enriched.to_csv(final_output, index=False)
+		# PHASE 4: SNIPER - Enrich ONLY NEW accounts with Firecrawl (cost optimization!)
+		logger.info(f"[SNIPER] Enriching {len(df_new_only)} NEW accounts (skipped {len(existing_accounts)} existing)")
+		df_enriched = await _sniper_enrich_accounts(df_new_only, max_accounts=max_sniper_accounts)
 
-		file_size_kb = final_output.stat().st_size / 1024
-		logger.info(f"Final distress leads saved to {final_output} ({file_size_kb:.1f} KB)")
-		logger.info(f"Total accounts processed: {len(df_enriched)}")
+		# PHASE 5: Save final output with deduplication
+		temp_dir = PROCESSED_DATA_DIR / "temp"
+		temp_dir.mkdir(parents=True, exist_ok=True)
+		temp_file = temp_dir / "tax_temp.csv"
+		
+		df_enriched.to_csv(temp_file, index=False)
+		logger.info(f"Saved {len(df_enriched)} records to temporary file: {temp_file}")
+		
+		# Deduplicate against existing CSVs
+		try:
+			from datetime import datetime
+			unique_keys = get_unique_keys_for_type('tax')
+			today = datetime.now().strftime('%Y%m%d')
+			final_output = deduplicate_csv(
+				new_csv_path=temp_file,
+				destination_dir=PROCESSED_DATA_DIR,
+				unique_key_columns=unique_keys,
+				output_filename=f"tax_deliquencies_{today}.csv",
+				keep_original=False  # Remove temp file after deduplication
+			)
+			
+			file_size_kb = final_output.stat().st_size / 1024
+			logger.info(f"Tax delinquency leads saved to {final_output} ({file_size_kb:.1f} KB)")
+			logger.info(f"Total accounts processed: {len(pd.read_csv(final_output))}")
+			
+		except Exception as e:
+			logger.error(f"Deduplication failed: {e}")
+			logger.debug(traceback.format_exc())
+			# Fallback: save without deduplication (old behavior)
+			logger.warning("Falling back to non-deduplicated save")
+			final_output = PROCESSED_DATA_DIR / "final_weekly_distress_leads.csv"
+			df_enriched.to_csv(final_output, index=False)
+			file_size_kb = final_output.stat().st_size / 1024
+			logger.info(f"Final distress leads saved to {final_output} ({file_size_kb:.1f} KB)")
+			logger.info(f"Total accounts processed: {len(df_enriched)}")
+			temp_file.unlink(missing_ok=True)
 
 		return True
 		
@@ -643,6 +746,8 @@ if __name__ == "__main__":
 		help="Skip download phase and use existing CSV file for SNIPER phase"
 	)
 	
+	from src.utils.scraper_db_helper import add_load_to_db_arg, load_scraped_data_to_db
+	add_load_to_db_arg(parser)
 	args = parser.parse_args()
 	
 	try:
@@ -663,8 +768,31 @@ if __name__ == "__main__":
 					skip_download=args.skip_download,
 				)
 			)
-			
+		
 		logger.info("Tax Delinquent Engine completed successfully")
+		
+		# Load to database if requested
+		if args.load_to_db:
+			# Find the most recent tax delinquency CSV
+			new_dir = RAW_TAX_DELINQUENCIES_DIR / "new"
+			csv_files = sorted(new_dir.glob("tax_deliquencies*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+			if csv_files:
+				csv_to_load = csv_files[0]
+				logger.info(f"Loading to database: {csv_to_load}")
+				
+				# Load to DB
+				load_scraped_data_to_db('tax', csv_to_load, destination_dir=RAW_TAX_DELINQUENCIES_DIR)
+				
+				# Delete CSV after successful DB load (DB is single source of truth)
+				try:
+					csv_to_load.unlink()
+					logger.info(f"✓ Cleaned up CSV file: {csv_to_load.name}")
+				except Exception as e:
+					logger.warning(f"Could not delete CSV {csv_to_load}: {e}")
+			else:
+				logger.error("No tax delinquency CSV file found to load")
+				import sys
+				sys.exit(1)
 		
 	except KeyboardInterrupt:
 		logger.warning("Pipeline interrupted by user")

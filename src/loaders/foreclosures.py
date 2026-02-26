@@ -60,15 +60,24 @@ class ForeclosureLoader(BaseLoader):
             
             if property_record:
                 try:
+                    # Handle NaN values
+                    plaintiff_val = row.get('Plaintiff')
+                    if pd.isna(plaintiff_val):
+                        plaintiff_val = None
+                    
+                    # Parse auction date from "Auction Start Date/Time"
+                    auction_date_val = None
+                    if pd.notna(row.get('Auction Start Date/Time')):
+                        auction_date_val = self.parse_date(row.get('Auction Start Date/Time'))
+                    
                     foreclosure_record = Foreclosure(
                         property_id=property_record.id,
                         case_number=case_number,
-                        plaintiff=row.get('Plaintiff'),
-                        defendant=row.get('Defendant'),
-                        filing_date=self.parse_date(row.get('Filing Date')),
-                        case_status=row.get('Case Status'),
+                        plaintiff=plaintiff_val,
+                        filing_date=None,  # Not in CSV
+                        lis_pendens_date=None,  # Not in CSV
                         judgment_amount=self.parse_amount(row.get('Judgment Amount')),
-                        auction_date=self.parse_date(row.get('Auction Date')),
+                        auction_date=auction_date_val,
                     )
                     
                     self.session.add(foreclosure_record)

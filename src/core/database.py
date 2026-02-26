@@ -6,7 +6,7 @@ Provides utilities for database initialization and session handling.
 from contextlib import contextmanager
 from typing import Generator
 
-from sqlalchemy import create_engine, event, Engine
+from sqlalchemy import create_engine, event, Engine, text
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.pool import Pool
 
@@ -214,7 +214,7 @@ def check_connection() -> bool:
     try:
         with db.session_scope() as session:
             # Execute a simple query to test connection
-            session.execute("SELECT 1")
+            session.execute(text("SELECT 1"))
         return True
     except Exception as e:
         print(f"Database connection failed: {e}")
@@ -227,7 +227,7 @@ def get_table_counts() -> dict:
     Useful for debugging and monitoring.
     """
     from src.core.models import (
-        Property, Owner, Financial, CodeViolation, LegalAndLien,
+        Property, Owner, Financial, CodeViolation, LegalAndLien, Deed, LegalProceeding,
         TaxDelinquency, Foreclosure, BuildingPermit, Incident, DistressScore
     )
 
@@ -238,6 +238,8 @@ def get_table_counts() -> dict:
         counts['financials'] = session.query(Financial).count()
         counts['code_violations'] = session.query(CodeViolation).count()
         counts['legal_and_liens'] = session.query(LegalAndLien).count()
+        counts['deeds'] = session.query(Deed).count()
+        counts['legal_proceedings'] = session.query(LegalProceeding).count()
         counts['tax_delinquencies'] = session.query(TaxDelinquency).count()
         counts['foreclosures'] = session.query(Foreclosure).count()
         counts['building_permits'] = session.query(BuildingPermit).count()
@@ -245,3 +247,8 @@ def get_table_counts() -> dict:
         counts['distress_scores'] = session.query(DistressScore).count()
 
     return counts
+
+
+if __name__ == "__main__":
+
+    print(get_table_counts())

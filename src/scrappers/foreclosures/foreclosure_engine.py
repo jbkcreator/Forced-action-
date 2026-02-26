@@ -24,7 +24,7 @@ import traceback
 from pathlib import Path
 from typing import Optional
 
-from browser_use import Agent, ChatAnthropic
+from browser_use import Agent, ChatAnthropic, Browser
 
 from config.settings import settings
 from config.constants import (
@@ -39,8 +39,11 @@ from config.constants import (
 	BROWSER_TEMPERATURE,
 	OUTPUT_SEPARATOR,
 )
+from src.core.database import get_db_context
+from src.loaders.foreclosures import ForeclosureLoader
 from src.utils.logger import setup_logging, get_logger
 from src.utils.prompt_loader import get_prompt
+from src.utils.db_deduplicator import filter_new_records
 
 # Initialize logging
 setup_logging()
@@ -165,7 +168,11 @@ async def scrape_realforeclose_calendar(
         start_time = time.time()
         preview_url = build_preview_url(auction_date)
         iso_date = auction_date.strftime("%Y-%m-%d")
-        dest_file = PROCESSED_DATA_DIR / f"hillsborough_realforeclose_{auction_date:%Y%m%d}.csv"
+        
+        # Agent will save to temp file first
+        temp_dir = RAW_FORECLOSURE_DIR / "temp"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        temp_file = temp_dir / f"foreclosures_temp_{auction_date:%Y%m%d}.csv"
         
         # Load task prompt from YAML configuration
         try:
@@ -173,7 +180,7 @@ async def scrape_realforeclose_calendar(
                 "foreclosure_prompts.yaml",
                 "auction_scrape.task_template",
                 preview_url=preview_url,
-                dest_file=str(dest_file.resolve())
+                dest_file=str(temp_file.resolve())
             )
         except Exception as e:
             logger.error(f"Failed to load prompt from YAML: {e}")
@@ -181,16 +188,29 @@ async def scrape_realforeclose_calendar(
         
         logger.info(f"Launching browser agent to scrape: {preview_url}")
         logger.info(f"Target auction date: {iso_date}")
-        logger.debug(f"Output destination: {dest_file}")
+        logger.debug(f"Temp output destination: {temp_file}")
+        
+        # Configure browser for headless server environment
+        browser = Browser(
+            headless=True,
+            disable_security=True,
+            args=[
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+                '--no-first-run',
+                '--no-zygote',
+                '--single-process',
+                '--disable-blink-features=AutomationControlled',
+            ]
+        )
         
         agent = Agent(
             task=task_instructions,
             llm=llm,
             max_steps=50,
-            browser_context_config={
-                "headless": True,
-                "save_downloads_path": str(PROCESSED_DATA_DIR.resolve()),
-            },
+            browser=browser,
         )
         
         try:
@@ -210,20 +230,66 @@ async def scrape_realforeclose_calendar(
             return None
         
         # Check if the expected file exists
-        if dest_file.exists():
-            file_size_kb = dest_file.stat().st_size / 1024
-            logger.info(f"Auction data saved to {dest_file} ({file_size_kb:.1f} KB)")
-            return dest_file
-        
-        # Fallback: look for any recent download
-        logger.debug("Expected file not found, searching for alternative downloads")
-        downloaded = _locate_recent_download(start_time)
-        if downloaded and downloaded.exists():
+        if temp_file.exists():
+            file_size_kb = temp_file.stat().st_size / 1024
+            logger.info(f"Temp auction data saved to {temp_file} ({file_size_kb:.1f} KB)")
+            
+            # Read CSV and check DB for existing foreclosures
+            try:
+                import pandas as pd
+                df = pd.read_csv(temp_file)
+                
+                logger.info("=" * 60)
+                logger.info("DB DEDUPLICATION: Checking for existing foreclosures")
+                logger.info("=" * 60)
+                
+                initial_count = len(df)
+                df_new = filter_new_records(df, 'foreclosures')
+                
+                if df_new.empty:
+                    logger.info("✓ All foreclosures already exist in database - nothing new")
+                    temp_file.unlink()
+                    return None
+                
+                # Save only NEW foreclosures
+                new_dir = RAW_FORECLOSURE_DIR / "new"
+                new_dir.mkdir(parents=True, exist_ok=True)
+                dated_filename = f"foreclosures_new_{auction_date:%Y%m%d}.csv"
+                final_file = new_dir / dated_filename
+                
+                df_new.to_csv(final_file, index=False)
+                size_mb = final_file.stat().st_size / (1024 ** 2)
+                logger.info(f"Saved {len(df_new)} NEW foreclosures to {final_file} ({size_mb:.2f} MB)")
+                logger.info(f"Filtered {initial_count - len(df_new)} existing records")
+                
+                temp_file.unlink()  # Clean up temp file
+                return final_file
+                
+            except Exception as e:
+                logger.error(f"DB deduplication failed: {e}")
+                logger.debug(traceback.format_exc())
+                # Fallback: return temp file
+                return temp_file
             logger.info(f"Found alternative download: {downloaded}")
-            if downloaded != dest_file:
+            
+            # Try to deduplicate the alternative download
+            try:
+                unique_keys = get_unique_keys_for_type('foreclosures')
+                dated_filename = f"foreclosures_{auction_date:%Y%m%d}.csv"
+                deduplicated_file = deduplicate_csv(
+                    new_csv_path=downloaded,
+                    destination_dir=RAW_FORECLOSURE_DIR,
+                    unique_key_columns=unique_keys,
+                    output_filename=dated_filename,
+                    keep_original=True  # Keep the original download
+                )
+                return deduplicated_file
+            except Exception as e:
+                logger.error(f"Deduplication of alternative download failed: {e}")
+                # Just copy the file as-is
+                dest_file = RAW_FORECLOSURE_DIR / f"foreclosures_{auction_date:%Y%m%d}.csv"
                 shutil.copy(str(downloaded), str(dest_file))
-                logger.info(f"Copied to {dest_file}")
-            return dest_file
+                return dest_file
         
         logger.error("Could not locate the scraped data file")
         return None
@@ -290,11 +356,16 @@ def main():
         default=10,
         help="Seconds to wait after agent completes scraping.",
     )
+    parser.add_argument(
+        "--load-to-db",
+        action="store_true",
+        help="Automatically load scraped data into database after scraping"
+    )
+    
     args = parser.parse_args()
     
     try:
         auction_date = _parse_auction_date(args.date)
-        logger.info(f"Starting foreclosure auction scraper for date: {auction_date.strftime('%Y-%m-%d')}")
         
         result_file = asyncio.run(
             scrape_realforeclose_calendar(
@@ -310,10 +381,49 @@ def main():
         logger.info(f"Foreclosure auction data collected for {auction_date.strftime('%Y-%m-%d')}")
         logger.info(f"Output file: {result_file}")
         
+        # Load to database if requested
+        if args.load_to_db:
+            logger.info("\n" + "=" * 60)
+            logger.info("Loading foreclosures into database...")
+            logger.info("=" * 60)
+            
+            try:
+                with get_db_context() as session:
+                    loader = ForeclosureLoader(session)
+                    matched, unmatched, skipped = loader.load_from_csv(
+                        str(result_file),
+                        skip_duplicates=True
+                    )
+                    session.commit()
+                    
+                    logger.info(f"\n{'='*60}")
+                    logger.info(f"DATABASE LOAD SUMMARY")
+                    logger.info(f"{'='*60}")
+                    logger.info(f"  Matched:   {matched:>6}")
+                    logger.info(f"  Unmatched: {unmatched:>6}")
+                    logger.info(f"  Skipped:   {skipped:>6}")
+                    total = matched + unmatched + skipped
+                    match_rate = (matched / total * 100) if total > 0 else 0
+                    logger.info(f"  Match Rate: {match_rate:>5.1f}%")
+                    logger.info(f"{'='*60}\n")
+                    
+                    logger.info("✓ Database load completed!")
+                    
+                    # Delete CSV after successful DB insertion (DB is single source of truth)
+                    try:
+                        result_file.unlink()
+                        logger.info(f"✓ Cleaned up CSV file: {result_file.name}")
+                    except Exception as e:
+                        logger.warning(f"Could not delete CSV {result_file}: {e}")
+            except Exception as e:
+                logger.error(f"Failed to load data to database: {e}")
+                logger.debug(traceback.format_exc())
+        else:
+            logger.info("\nSkipping database load (use --load-to-db flag to enable)")
+            
     except Exception as e:
-        logger.error(f"Foreclosure scraping failed: {e}")
+        logger.error(f"Error in main execution: {e}")
         logger.debug(traceback.format_exc())
-        raise
 
 
 if __name__ == "__main__":

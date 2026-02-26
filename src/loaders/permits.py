@@ -25,11 +25,13 @@ class BuildingPermitLoader(BaseLoader):
         Load permits from DataFrame.
         
         Args:
-            df: DataFrame with columns: Record Number, Address, Status, etc.
+            df: DataFrame with columns: Date, Record Number, Record Type, Address, Status, Expiration Date
             skip_duplicates: Skip existing records
             
         Returns:
             Tuple of (matched, unmatched, skipped)
+            
+        Note: BuildingPermit model has: permit_number, permit_type, issue_date, expire_date, status
         """
         logger.info(f"Loading {len(df)} building permits")
         
@@ -56,15 +58,22 @@ class BuildingPermitLoader(BaseLoader):
             
             if property_record:
                 try:
+                    # Handle NaN values
+                    permit_type_val = row.get('Record Type')
+                    if pd.isna(permit_type_val):
+                        permit_type_val = None
+                    
+                    status_val = row.get('Status')
+                    if pd.isna(status_val):
+                        status_val = None
+                    
                     permit_record = BuildingPermit(
                         property_id=property_record.id,
                         permit_number=record_number,
-                        permit_type=row.get('Type'),
-                        description=row.get('Description'),
-                        status=row.get('Status'),
-                        issue_date=self.parse_date(row.get('Issue Date')),
-                        finaled_date=self.parse_date(row.get('Finaled Date')),
-                        valuation=self.parse_amount(row.get('Valuation')),
+                        permit_type=permit_type_val,
+                        status=status_val,
+                        issue_date=self.parse_date(row.get('Date')),
+                        expire_date=self.parse_date(row.get('Expiration Date'))
                     )
                     
                     self.session.add(permit_record)

@@ -7,6 +7,7 @@ and pipelines. Constants are organized by category for easy maintenance and refe
 Author: Distressed Property Intelligence Platform
 """
 
+import tempfile
 from pathlib import Path
 
 # =============================================================================
@@ -23,12 +24,18 @@ DEBUG_DATA_DIR = DATA_DIR / "debug"
 # Scraper-specific raw data directories
 RAW_EVICTIONS_DIR = RAW_DATA_DIR / "evictions"
 RAW_PROBATE_DIR = RAW_DATA_DIR / "probate"
-RAW_PERMIT_DIR = RAW_DATA_DIR / "permit"
-RAW_LIEN_DIR = RAW_DATA_DIR / "lien"
+RAW_PERMIT_DIR = RAW_DATA_DIR / "permits"
+RAW_LIEN_DIR = RAW_DATA_DIR / "liens"
 RAW_FORECLOSURE_DIR = RAW_DATA_DIR / "foreclosures"
+RAW_VIOLATIONS_DIR = RAW_DATA_DIR / "violations"
+RAW_BANKRUPTCY_DIR = RAW_DATA_DIR / "bankruptcy"
+RAW_TAX_DELINQUENCIES_DIR = RAW_DATA_DIR / "tax_delinquencies"
+RAW_MASTER_DIR = RAW_DATA_DIR / "master"
+RAW_JUDGMENTS_DIR = RAW_DATA_DIR / "judgments"
+RAW_DEEDS_DIR = RAW_DATA_DIR / "deeds"
 
-# Temporary download directory for browser-use
-TEMP_DOWNLOADS_DIR = Path("C:/tmp")
+# Temporary download directory for browser-use (cross-platform)
+TEMP_DOWNLOADS_DIR = Path(tempfile.gettempdir())
 
 # =============================================================================
 # PUBLIC RECORDS URLS - Hillsborough County Clerk

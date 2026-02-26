@@ -19,7 +19,9 @@ class DeedLoader(BaseLoader):
     def load_from_dataframe(
         self,
         df: pd.DataFrame,
-        skip_duplicates: bool = True
+        skip_duplicates: bool = True,
+        sample_mode: bool = False,
+        sample_size: int = 10
     ) -> Tuple[int, int, int]:
         """
         Load deeds from DataFrame.
@@ -27,11 +29,19 @@ class DeedLoader(BaseLoader):
         Args:
             df: DataFrame with columns: Instrument, Grantor, Grantee, etc.
             skip_duplicates: Skip existing records
+            sample_mode: If True, only load first N records for testing
+            sample_size: Number of records to load when sample_mode=True
             
         Returns:
             Tuple of (matched, unmatched, skipped)
         """
-        logger.info(f"Loading {len(df)} deeds")
+        # Apply sampling if requested
+        if sample_mode:
+            original_count = len(df)
+            df = df.head(sample_size)
+            logger.info(f"🧪 SAMPLE MODE: Loading {len(df)} deeds (out of {original_count} total)")
+        else:
+            logger.info(f"Loading {len(df)} deeds")
         
         matched = 0
         unmatched = 0
@@ -67,19 +77,48 @@ class DeedLoader(BaseLoader):
             
             if property_record:
                 try:
+                    # Handle NaN values
+                    grantor_val = row.get('Grantor')
+                    if pd.isna(grantor_val):
+                        grantor_val = None
+                    
+                    grantee_val = row.get('Grantee')
+                    if pd.isna(grantee_val):
+                        grantee_val = None
+                    
+                    deed_type_val = row.get('DocType')
+                    if pd.isna(deed_type_val):
+                        deed_type_val = None
+                    
+                    book_type_val = row.get('BookType')
+                    if pd.isna(book_type_val):
+                        book_type_val = None
+                    
+                    book_number_val = row.get('BookNum')
+                    if pd.isna(book_number_val):
+                        book_number_val = None
+                    
+                    page_number_val = row.get('PageNum')
+                    if pd.isna(page_number_val):
+                        page_number_val = None
+                    
+                    legal_desc_val = row.get('Legal')
+                    if pd.isna(legal_desc_val):
+                        legal_desc_val = None
+                    
                     deed_record = Deed(
                         property_id=property_record.id,
                         instrument_number=instrument,
-                        grantor=row.get('Grantor'),
-                        grantee=row.get('Grantee'),
+                        grantor=grantor_val,
+                        grantee=grantee_val,
                         record_date=self.parse_date(row.get('RecordDate')),
-                        sale_price=self.parse_amount(row.get('Consideration')),
-                        deed_type=row.get('Deed Type'),
-                        doc_type=row.get('Doc Type'),
-                        book_type=row.get('BookType'),
-                        book_number=row.get('Book'),
-                        page_number=row.get('Page'),
-                        legal_description=row.get('Legal'),
+                        sale_price=self.parse_amount(row.get('SalesPrice')),
+                        deed_type=deed_type_val,
+                        doc_type=None,  # Not in this CSV format
+                        book_type=book_type_val,
+                        book_number=book_number_val,
+                        page_number=page_number_val,
+                        legal_description=legal_desc_val
                     )
                     
                     self.session.add(deed_record)

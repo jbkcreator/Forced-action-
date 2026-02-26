@@ -41,7 +41,7 @@ class ViolationLoader(BaseLoader):
             record_number = str(row['Record Number']).strip()
             
             # Check for duplicates
-            if skip_duplicates and self.check_duplicate(CodeViolation, {'case_number': record_number}):
+            if skip_duplicates and self.check_duplicate(CodeViolation, {'record_number': record_number}):
                 logger.debug(f"Skipping duplicate violation: {record_number}")
                 skipped += 1
                 continue
@@ -56,15 +56,36 @@ class ViolationLoader(BaseLoader):
             
             if property_record:
                 try:
+                    # Map CSV columns to database fields:
+                    # CSV 'Record Number' → record_number
+                    # CSV 'Record Type' → violation_type  
+                    # CSV 'Description' → description
+                    # CSV 'Date' → opened_date
+                    # CSV 'Status' → status
+                    
+                    # Handle NaN values from pandas - convert to None
+                    description_val = row.get('Description')
+                    if pd.isna(description_val):
+                        description_val = None
+                    
+                    violation_type_val = row.get('Record Type')
+                    if pd.isna(violation_type_val):
+                        violation_type_val = None
+                    
+                    status_val = row.get('Status')
+                    if pd.isna(status_val):
+                        status_val = None
+                    
                     violation_record = CodeViolation(
                         property_id=property_record.id,
-                        case_number=record_number,
-                        violation_type=row.get('Violation Type'),
-                        description=row.get('Description'),
-                        status=row.get('Status'),
-                        opened_date=self.parse_date(row.get('Opened Date')),
-                        closed_date=self.parse_date(row.get('Closed Date')),
-                        severity=row.get('Severity'),
+                        record_number=record_number,
+                        violation_type=violation_type_val,
+                        description=description_val,
+                        opened_date=self.parse_date(row.get('Date')),
+                        status=status_val,
+                        severity_tier=None,
+                        fine_amount=None,
+                        is_lien=False,
                     )
                     
                     self.session.add(violation_record)

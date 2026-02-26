@@ -28,11 +28,14 @@ from config.constants import (
 	COURTLISTENER_API_URL,
 	COURT_CODE_FLORIDA_MIDDLE_BANKRUPTCY,
 	TAMPA_DIVISION_PREFIX,
-	PROCESSED_DATA_DIR,
+	RAW_BANKRUPTCY_DIR,
 	API_USER_AGENT,
 	REQUEST_TIMEOUT_DEFAULT,
 )
+from src.core.database import get_db_context
+from src.loaders.legal_proceedings import BankruptcyLoader
 from src.utils.logger import setup_logging, get_logger
+from src.utils.csv_deduplicator import deduplicate_csv, get_unique_keys_for_type
 
 # Initialize logging
 setup_logging()
@@ -174,17 +177,18 @@ def save_bankruptcy_leads(
 	output_filename: str = "tampa_bankruptcy_leads.csv"
 ) -> Optional[Path]:
 	"""
-	Save processed bankruptcy leads to the output directory.
+	Save bankruptcy leads to a CSV file with deduplication.
 	
-	This function creates the processed data directory if it doesn't exist and
-	saves the bankruptcy leads as a CSV file with the specified filename.
+	This function creates the processed data directory if it doesn't exist,
+	deduplicates against existing CSV files, and saves the bankruptcy leads
+	as a CSV file with the specified filename.
 	
 	Args:
 		leads: List of dictionaries containing bankruptcy lead data
 		output_filename: Name for the output CSV file (default: "tampa_bankruptcy_leads.csv")
 		
 	Returns:
-		Path: Path object pointing to the saved CSV file, or None if no data
+		Path: Path object pointing to the saved deduplicated CSV file, or None if no data
 		
 	Raises:
 		IOError: If the file cannot be written to disk
@@ -199,26 +203,45 @@ def save_bankruptcy_leads(
 		return None
 	
 	try:
-		PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
-		logger.debug(f"Ensured processed directory exists: {PROCESSED_DATA_DIR}")
+		RAW_BANKRUPTCY_DIR.mkdir(parents=True, exist_ok=True)
+		logger.debug(f"Ensured bankruptcy directory exists: {RAW_BANKRUPTCY_DIR}")
 		
-		# Convert to DataFrame for easier CSV writing
+		# Convert to DataFrame
 		df = pd.DataFrame(leads)
 		
-		output_path = PROCESSED_DATA_DIR / output_filename
+		# Check DB for existing bankruptcy cases (deduplicate BEFORE CSV save)
+		logger.info("=" * 60)
+		logger.info("DB DEDUPLICATION: Checking for existing bankruptcies")
+		logger.info("=" * 60)
 		
-		df.to_csv(output_path, index=False)
-		logger.info(f"Saved {len(leads)} bankruptcy leads to: {output_path}")
+		initial_count = len(df)
+		df_new = filter_new_records(df, 'bankruptcy', record_type='Bankruptcy')
 		
-		return output_path
+		if df_new.empty:
+			logger.info("✓ All bankruptcies already exist in database - nothing new")
+			return None
+		
+		# Save only NEW bankruptcies
+		new_dir = RAW_BANKRUPTCY_DIR / "new"
+		new_dir.mkdir(parents=True, exist_ok=True)
+		final_file = new_dir / output_filename
+		
+		df_new.to_csv(final_file, index=False)
+		logger.info(f"Saved {len(df_new)} NEW bankruptcies to {final_file}")
+		logger.info(f"Filtered {initial_count - len(df_new)} existing records")
+		
+		return final_file
 		
 	except PermissionError as e:
-		logger.error(f"Permission denied when writing to {output_path}: {e}")
+		logger.error(f"Permission denied when writing to {output_filename}: {e}")
 		raise
 	except IOError as e:
 		logger.error(f"I/O error occurred while writing file: {e}")
 		raise
 	except Exception as e:
+		logger.error(f"Unexpected error saving bankruptcy data: {e}")
+		logger.debug(traceback.format_exc())
+		raise
 		logger.error(f"Unexpected error saving bankruptcy leads: {e}")
 		raise
 
@@ -319,9 +342,40 @@ if __name__ == "__main__":
 		help="Number of days to look back for filings (default: 1)",
 	)
 	
+	from src.utils.scraper_db_helper import add_load_to_db_arg
+	add_load_to_db_arg(parser)
+	
 	args = parser.parse_args()
 	
 	success = run_bankruptcy_pipeline(lookback_days=args.lookback)
+	
+	# Load to database if requested and scraping was successful
+	if success and args.load_to_db:
+		try:
+			from src.utils.scraper_db_helper import load_scraped_data_to_db
+			# Find the most recent bankruptcy CSV in new/ subdirectory
+			new_dir = RAW_BANKRUPTCY_DIR / "new"
+			csv_files = sorted(new_dir.glob("tampa_bankruptcy_leads*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+			if csv_files:
+				csv_to_load = csv_files[0]
+				logger.info(f"Loading to database: {csv_to_load}")
+				load_scraped_data_to_db('bankruptcy', csv_to_load, destination_dir=RAW_BANKRUPTCY_DIR)
+				
+				# Delete CSV after successful DB load
+				try:
+					csv_to_load.unlink()
+					logger.info(f"✓ Cleaned up CSV file: {csv_to_load.name}")
+				except Exception as e:
+					logger.warning(f"Could not delete CSV {csv_to_load}: {e}")
+			else:
+				logger.error("No bankruptcy CSV file found to load")
+				sys.exit(1)
+		except Exception as e:
+			logger.error(f"Failed to load data to database: {e}")
+			sys.exit(1)
+	elif args.load_to_db:
+		logger.warning("Skipping database load due to scraping failure")
+	
 	sys.exit(0 if success else 1)
 
 

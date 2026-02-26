@@ -1,31 +1,28 @@
 """
 Building Permit Data Collection Pipeline
 
-This module automates the download and processing of building permit records from
+This module automates the collection of building permit records from
 the Hillsborough County Accela system. It uses browser automation via browser_use
-and Claude Sonnet 4.5 to navigate the permit search interface, apply date filters,
-and export permit data.
+and Claude Sonnet 4.5 to navigate the permit search interface, extract table data
+directly from the HTML, and process permit records.
 
 The pipeline performs the following steps:
     1. Launches a browser agent with Claude Sonnet 4.5 to navigate the Accela permit portal
     2. Applies date range filters based on lookback period
-    3. Exports and downloads permit records (CSV/Excel format)
-    4. Processes and saves the data to the processed data directory
+    3. Extracts permit data directly from HTML table as pipe-delimited text
+    4. Parses and saves the data to the processed data directory with deduplication
 
 Author: Distressed Property Intelligence Platform
 """
 
 import asyncio
-import os
-import shutil
-import time
 import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
-from browser_use import Agent, ChatAnthropic
+from browser_use import Agent, ChatAnthropic, Browser
 
 from config.settings import settings
 from config.constants import (
@@ -34,13 +31,12 @@ from config.constants import (
 	RAW_PERMIT_DIR,
 	PROCESSED_DATA_DIR,
 	PERMIT_SEARCH_URL,
-	DOWNLOAD_FILE_PATTERNS,
-	TEMP_DOWNLOADS_DIR,
-	DOWNLOAD_WAIT_PERMIT,
-	BROWSER_DOWNLOAD_TEMP_PATTERN,
 )
+from src.core.database import get_db_context
+from src.loaders.permits import BuildingPermitLoader
 from src.utils.logger import setup_logging, get_logger
 from src.utils.prompt_loader import get_prompt
+from src.utils.db_deduplicator import filter_new_records
 
 # Initialize logging
 setup_logging()
@@ -59,302 +55,227 @@ RAW_PERMIT_DIR.mkdir(parents=True, exist_ok=True)
 PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _locate_download(start_time: float) -> Optional[Path]:
+async def scrape_permits_with_browser_use(lookback_days: int = 365) -> Optional[Path]:
 	"""
-	Search for recently downloaded files in configured directories.
+	AI-led table extraction method for permit records.
 	
-	This function searches both the raw data directory and browser-use temporary
-	directories for files matching download patterns that were created after the
-	specified start time.
+	This method extracts permit data directly from the HTML table by having the
+	AI agent read and return the table contents as pipe-delimited text. More reliable
+	than file downloads since it doesn't depend on export buttons.
 	
 	Args:
-		start_time: Unix timestamp representing when the download started
-		
+		lookback_days: Number of days to look back from today (default: 365)
+	
 	Returns:
-		Optional[Path]: Path to the most recently modified downloaded file, or None if not found
-		
-	Note:
-		Searches for files matching patterns: *.csv, *.xls, *.xlsx, *.zip
+		Optional[Path]: Path to saved CSV file if successful, None otherwise
 	"""
-	
-	def recent_candidates(folder: Path):
-		"""Find files in folder that match download patterns and were created after start_time."""
-		paths = []
-		if not folder.exists():
-			return paths
-		for pattern in DOWNLOAD_FILE_PATTERNS:
-			for candidate in folder.glob(pattern):
-				try:
-					if candidate.stat().st_mtime >= start_time:
-						paths.append(candidate)
-				except FileNotFoundError:
-					logger.debug(f"File disappeared during check: {candidate}")
-					continue
-		return paths
-	
-	candidates = recent_candidates(RAW_PERMIT_DIR)
-	logger.debug(f"Found {len(candidates)} candidate files in {RAW_PERMIT_DIR}")
-	
-	# Check browser-use temp directories
-	temp_base = Path("C:/tmp")
-	if temp_base.exists():
-		for download_dir in temp_base.glob("browser-use-downloads-*"):
-			temp_candidates = recent_candidates(download_dir)
-			candidates.extend(temp_candidates)
-			logger.debug(f"Found {len(temp_candidates)} candidate files in {download_dir}")
-	
-	if not candidates:
-		logger.warning("No recent download files found")
-		return None
-	
-	# Return the most recently modified file
-	most_recent = max(candidates, key=lambda path: path.stat().st_mtime)
-	logger.debug(f"Selected most recent file: {most_recent}")
-	return most_recent
-
-
-async def download_permits(
-	lookback_days: int = 365,
-	wait_after_download: int = 40,
-) -> Optional[Path]:
-	"""
-	Automate browser to download permit records from the Accela portal.
-	
-	This function launches a browser agent powered by Claude Sonnet 4.5 to navigate
-	the Hillsborough County Accela permit search portal, apply date range filters,
-	and download permit records.
-	
-	Args:
-		lookback_days: Number of days to look back from today for permit records (default: 365)
-		wait_after_download: Seconds to wait for download to complete after export (default: 40)
-		
-	Returns:
-		Optional[Path]: Path to the downloaded file if successful, None otherwise
-		
-	Raises:
-		Exception: Logs and returns None on browser automation failures
-		
-	Example:
-		>>> file_path = await download_permits(lookback_days=180)
-		>>> if file_path:
-		...     print(f"Downloaded to: {file_path}")
-	"""
-	
 	try:
-		RAW_PERMIT_DIR.mkdir(parents=True, exist_ok=True)
-		
-		save_dir = os.path.abspath(str(RAW_PERMIT_DIR))
-		start_time = time.time()
-		
 		# Calculate date range
 		today = datetime.now()
 		start_date = today - timedelta(days=lookback_days)
 		
-		# Format dates for the form (MM/DD/YYYY format)
-		start_date_str = start_date.strftime("%m/%d/%Y")
 		end_date_str = today.strftime("%m/%d/%Y")
+		start_date_str = start_date.strftime("%m/%d/%Y")
 		
-		logger.info(f"Fetching permits from {start_date_str} to {end_date_str} ({lookback_days} days)")
+		logger.info(f"Using browser-use to scrape permits from {start_date_str} to {end_date_str}")
+		logger.info("Agent will extract table data and return as text - we'll build CSV in Python")
 		
-		# Load task prompt from YAML configuration
+		# Load task instructions from YAML configuration
 		try:
-			task = get_prompt(
+			task_instructions = get_prompt(
 				"permit_prompts.yaml",
 				"permit_search.task_template",
 				url=PERMIT_SEARCH_URL,
-				start_date=start_date_str,
 				end_date=end_date_str,
-				wait_time=wait_after_download
+				start_date=start_date_str
 			)
 		except Exception as e:
 			logger.error(f"Failed to load prompt from YAML: {e}")
 			raise
+
+		logger.info("Launching browser agent to scrape permit table...")
 		
-		logger.info("Launching browser agent to download permits")
-		logger.debug(f"Download directory: {save_dir}")
+		# Configure browser for headless server environment
+		browser = Browser(
+			headless=True,
+			disable_security=True,
+			args=[
+				'--no-sandbox',
+				'--disable-setuid-sandbox',
+				'--disable-dev-shm-usage',
+				'--disable-gpu',
+				'--no-first-run',
+				'--no-zygote',
+				'--single-process',
+				'--disable-blink-features=AutomationControlled',
+			]
+		)
 		
 		agent = Agent(
-			task=task,
+			task=task_instructions,
 			llm=llm,
-			browser_context_config={
-				"headless": False,  # Set to True for production
-				"save_downloads_path": save_dir,
-			},
-			max_actions_per_step=10,
+			max_steps=75,  # Increased to handle pagination through many pages
+			browser=browser,
 		)
 		
 		try:
-			history = await agent.run(max_steps=25)
+			history = await agent.run()
 			
-			if not history.is_done():
-				logger.warning("Agent could not finish the workflow within step limit. Check browser logs.")
+			# Check completion status
+			completed = history.is_done()
+			if not completed:
+				# history.history is a list property, not a method
+				try:
+					step_count = len(history.history) if hasattr(history, 'history') else "unknown"
+				except Exception:
+					step_count = "unknown"
+				logger.warning(f"Agent did not complete all steps (stopped at step {step_count})")
+				logger.warning("Will attempt to parse any data that was collected")
+			else:
+				logger.info("Agent workflow completed successfully")
+			
+			# Get the final result from the agent
+			final_result = history.final_result()
+			
+			if not final_result:
+				logger.error("No result returned from browser agent")
+				logger.error("This usually means the agent crashed before returning data")
 				return None
 			
-			logger.info("Agent workflow completed. Waiting for download to finalize...")
-			await asyncio.sleep(wait_after_download)
+			result_str = str(final_result)
+			logger.info(f"Agent returned result of length {len(result_str)} characters")
+			
+			# Log if we got partial data
+			if not completed:
+				logger.info("Processing partial data from incomplete run")
+			
+			logger.debug(f"First 1000 chars: {result_str[:1000]}")
+			
+			# Parse the pipe-delimited data
+			all_permits = []
+			lines = result_str.strip().split('\n')
+			
+			# Find the header line
+			header_idx = -1
+			header_columns = []
+			
+			# Look for the header line
+			for idx, line in enumerate(lines):
+				if '|' in line and any(col in line for col in ['Record Number', 'Status', 'Date']):
+					header_columns = [col.strip() for col in line.split('|')]
+					header_idx = idx
+					logger.info(f"Found header at line {idx}: {header_columns}")
+					break
+			
+			if header_idx == -1:
+				logger.error("Could not find pipe-delimited header in agent result")
+				logger.error(f"Result content (first 2000 chars): {result_str[:2000]}")
+				logger.warning("Will try to parse anyway looking for any pipe-delimited data")
+				return None
+			
+			# Parse ALL data rows after the header
+			records_found = 0
+			for line_num, line in enumerate(lines[header_idx + 1:], start=header_idx + 1):
+				line = line.strip()
+				if not line or '|' not in line:
+					continue
+				
+				# Skip separator lines (like |------|------|)
+				if line.replace('|', '').replace('-', '').strip() == '':
+					continue
+				
+				values = [val.strip() for val in line.split('|')]
+				
+				# Only process if we have enough values
+				if len(values) >= len(header_columns):
+					row_dict = {}
+					for i, col in enumerate(header_columns):
+						if i < len(values):
+							row_dict[col] = values[i]
+					all_permits.append(row_dict)
+					records_found += 1
+					
+					# Log progress every 10 records
+					if records_found % 10 == 0:
+						logger.info(f"Parsed {records_found} records so far...")
+			
+			logger.info(f"Finished parsing. Total records found: {records_found}")
+			
+			if not all_permits:
+				logger.error("No permit records parsed from agent result")
+				logger.error(f"Parsed {len(lines)} lines, header at {header_idx}")
+				return None
+			
+			# Warn if incomplete run but we got some data
+			if not completed and records_found > 0:
+				logger.warning("=" * 60)
+				logger.warning("PARTIAL DATA EXTRACTED")
+				logger.warning("=" * 60)
+				logger.warning(f"Agent stopped early but collected {records_found} records")
+				logger.warning("This data will be saved, but you may want to re-run after fixing the issue")
+				logger.warning("(e.g., adding API credits, increasing timeouts, etc.)")
+			
+			logger.info(f"Successfully parsed {len(all_permits)} permit records")
+			
+			# Convert to DataFrame
+			df = pd.DataFrame(all_permits)
+			
+			# Save to temporary file first
+			# Check DB for existing permits (deduplicate BEFORE CSV save)
+			logger.info("=" * 60)
+			logger.info("DB DEDUPLICATION: Checking for existing permits")
+			logger.info("=" * 60)
+			
+			initial_count = len(df)
+			df_new = filter_new_records(df, 'permits')
+			
+			if df_new.empty:
+				logger.info("✓ All permits already exist in database - nothing new to load")
+				return True  # Success, but no new records
+			
+			# Save only NEW permits to temporary CSV
+			new_dir = RAW_PERMIT_DIR / "new"
+			new_dir.mkdir(parents=True, exist_ok=True)
+			
+			today = datetime.now().strftime("%Y%m%d")
+			temp_file = new_dir / f"building_permits_new_{today}.csv"
+			
+			df_new.to_csv(temp_file, index=False)
+			size_mb = temp_file.stat().st_size / (1024 ** 2)
+			logger.info(f"Saved {len(df_new)} NEW permits to {temp_file} ({size_mb:.2f} MB)")
+			logger.info(f"Filtered {initial_count - len(df_new)} existing records")
+			
+			return temp_file
 			
 		except Exception as e:
 			logger.error(f"Browser agent execution failed: {e}")
 			logger.debug(traceback.format_exc())
-			return None
-		
-		# Look for downloaded file
-		downloaded_file = _locate_download(start_time)
-		
-		if not downloaded_file or not downloaded_file.exists():
-			logger.error("Could not detect the downloaded file after automation completed")
-			return None
-		
-		# If file is in temp directory, move it to RAW_PERMIT_DIR
-		if not downloaded_file.is_relative_to(RAW_PERMIT_DIR):
-			final_filename = f"hillsborough_permits_{start_date.strftime('%Y%m%d')}_{today.strftime('%Y%m%d')}{downloaded_file.suffix}"
-			dest_file = RAW_PERMIT_DIR / final_filename
 			
-			logger.info(f"Moving download from temp directory to: {dest_file}")
-			shutil.move(str(downloaded_file), str(dest_file))
-			downloaded_file = dest_file
+			# Check for common failure reasons
+			error_str = str(e).lower()
+			if "credit balance" in error_str or "too low" in error_str:
+				logger.error("=" * 60)
+				logger.error("ANTHROPIC API CREDITS EXHAUSTED")
+				logger.error("=" * 60)
+				logger.error("Add credits at: https://console.anthropic.com/settings/billing")
+				logger.error("The agent may have collected partial data before running out of credits.")
 			
-			# Clean up temp directory
-			temp_dir = downloaded_file.parent
-			if temp_dir.name.startswith("browser-use-downloads-"):
-				try:
-					shutil.rmtree(temp_dir)
-					logger.debug(f"Cleaned up temp directory: {temp_dir}")
-				except Exception as e:
-					logger.warning(f"Could not clean temp directory: {e}")
-		
-		file_size_kb = downloaded_file.stat().st_size / 1024
-		logger.info(f"Downloaded file: {downloaded_file} (Size: {file_size_kb:.2f} KB)")
-		
-		return downloaded_file
-		
+			return None
+			
 	except Exception as e:
-		logger.error(f"Error during permit download: {e}")
+		logger.error(f"Browser-use scraping failed: {e}")
 		logger.debug(traceback.format_exc())
 		return None
-
-
-def process_permit_data(file_path: Path) -> pd.DataFrame:
-	"""
-	Load and process the permit data file with multi-format and multi-encoding support.
-	
-	This function handles both CSV and Excel file formats, attempting multiple character
-	encodings for CSV files to ensure compatibility with various source data formats.
-	
-	Args:
-		file_path: Path object pointing to the permit data file (CSV, XLS, or XLSX)
-		
-	Returns:
-		pd.DataFrame: Loaded and parsed permit records as a DataFrame
-		
-	Raises:
-		ValueError: If the file type is unsupported or cannot be read with standard encodings
-		FileNotFoundError: If the specified file does not exist
-		pd.errors.ParserError: If the file structure is invalid
-		
-	Example:
-		>>> df = process_permit_data(Path("data/raw/permit/permits_20260101_20260131.csv"))
-		>>> print(f"Loaded {len(df)} permit records")
-	"""
-	logger.info(f"Loading permit data from: {file_path}")
-	
-	if not file_path.exists():
-		logger.error(f"Permit data file not found: {file_path}")
-		raise FileNotFoundError(f"Permit data file not found: {file_path}")
-	
-	df = None
-	
-	try:
-		# Handle different file types
-		if file_path.suffix.lower() == ".csv":
-			# Try multiple encodings for CSV files
-			encodings_to_try = ["utf-8", "latin1", "cp1252"]
-			
-			for encoding in encodings_to_try:
-				try:
-					df = pd.read_csv(file_path, encoding=encoding)
-					logger.info(f"Successfully loaded CSV with {encoding} encoding")
-					break
-				except (UnicodeDecodeError, pd.errors.ParserError) as e:
-					logger.debug(f"Failed to load with {encoding} encoding: {e}")
-					continue
-			
-			if df is None:
-				error_msg = f"Could not read CSV with any standard encoding: {file_path}"
-				logger.error(error_msg)
-				raise ValueError(error_msg)
-		
-		elif file_path.suffix.lower() in [".xls", ".xlsx"]:
-			df = pd.read_excel(file_path)
-			logger.info("Successfully loaded Excel file")
-		
-		else:
-			error_msg = f"Unsupported file type: {file_path.suffix}"
-			logger.error(error_msg)
-			raise ValueError(error_msg)
-		
-		logger.info(f"Loaded {len(df)} permit records")
-		logger.debug(f"DataFrame columns: {list(df.columns)}")
-		
-		return df
-		
-	except Exception as e:
-		logger.error(f"Error processing permit data: {e}")
-		raise
-
-
-def save_processed_permits(df: pd.DataFrame, output_filename: str = "permit_data.csv") -> Path:
-	"""
-	Save processed permit data to the output directory.
-	
-	This function creates the processed data directory if it doesn't exist and
-	saves the DataFrame as a CSV file with the specified filename.
-	
-	Args:
-		df: DataFrame containing processed permit records
-		output_filename: Name for the output CSV file (default: "permit_data.csv")
-		
-	Returns:
-		Path: Path object pointing to the saved CSV file
-		
-	Raises:
-		IOError: If the file cannot be written to disk
-		PermissionError: If there are insufficient permissions to write the file
-		
-	Example:
-		>>> output_path = save_processed_permits(df, "hillsborough_permits_2026.csv")
-		>>> print(f"Saved to: {output_path}")
-	"""
-	try:
-		PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
-		logger.debug(f"Ensured processed directory exists: {PROCESSED_DATA_DIR}")
-		
-		output_path = PROCESSED_DATA_DIR / output_filename
-		
-		df.to_csv(output_path, index=False)
-		logger.info(f"Saved {len(df)} permit records to: {output_path}")
-		
-		return output_path
-		
-	except PermissionError as e:
-		logger.error(f"Permission error while saving file: {e}")
-		raise
-	except IOError as e:
-		logger.error(f"I/O error while saving file: {e}")
-		raise
-	except Exception as e:
-		logger.error(f"Unexpected error while saving processed data: {e}")
-		raise
 
 
 async def run_permit_pipeline(lookback_days: int = 365):
 	"""
 	Execute the complete permit data collection pipeline.
 	
-	This function orchestrates the entire workflow:
-		1. Downloads permit data using browser automation
-		2. Processes and loads the downloaded data
-		3. Saves the processed data to the output directory
+	This function orchestrates the entire workflow using direct table extraction:
+		1. Scrapes permit data directly from HTML table via browser agent
+		2. Parses the pipe-delimited text response
+		3. Saves the processed data with deduplication
 	
 	The function includes comprehensive error handling and logging at each step.
 	
@@ -367,34 +288,25 @@ async def run_permit_pipeline(lookback_days: int = 365):
 		
 	Example:
 		>>> await run_permit_pipeline(lookback_days=180)
-		# Logs progress and saves processed permits to data/processed/
+		# Logs progress and saves processed permits to data/raw/permits/
 	"""
 	logger.info("=" * 60)
 	logger.info("HILLSBOROUGH COUNTY BUILDING PERMITS - DATA COLLECTION")
 	logger.info("=" * 60)
 	
 	try:
-		# Step 1: Download permit data
-		logger.info("Step 1: Downloading permit data via browser automation")
-		file_path = await download_permits(lookback_days=lookback_days)
+		# Scrape permits using direct table extraction
+		logger.info(f"Scraping permits from last {lookback_days} days via browser automation")
+		file_path = await scrape_permits_with_browser_use(lookback_days=lookback_days)
 		
 		if not file_path:
-			logger.error("Download failed. Aborting pipeline.")
+			logger.error("Scraping failed. Aborting pipeline.")
 			return
-		
-		# Step 2: Process the data
-		logger.info("Step 2: Processing permit data")
-		df = process_permit_data(file_path)
-		
-		# Step 3: Save processed data
-		logger.info("Step 3: Saving processed data")
-		output_path = save_processed_permits(df)
 		
 		logger.info("=" * 60)
 		logger.info("PERMIT PIPELINE COMPLETE")
 		logger.info("=" * 60)
-		logger.info(f"Total records processed: {len(df)}")
-		logger.info(f"Output file location: {output_path}")
+		logger.info(f"Output file location: {file_path}")
 		
 	except Exception as e:
 		logger.error(f"Permit pipeline failed with error: {e}")
@@ -404,14 +316,46 @@ async def run_permit_pipeline(lookback_days: int = 365):
 
 if __name__ == "__main__":
 	import sys
+	import argparse
+	from src.utils.scraper_db_helper import load_scraped_data_to_db, add_load_to_db_arg
 	
-	# Allow command-line override of lookback days
-	lookback_days = 365
-	if len(sys.argv) > 1:
-		try:
-			lookback_days = int(sys.argv[1])
-			logger.info(f"Using command-line lookback period: {lookback_days} days")
-		except ValueError:
-			logger.warning(f"Invalid lookback days: {sys.argv[1]}, using default: 365")
+	parser = argparse.ArgumentParser(description="Scrape Hillsborough County building permits")
+	parser.add_argument(
+		"--lookback",
+		type=int,
+		default=365,
+		help="Number of days to look back for permits (default: 365)"
+	)
+	add_load_to_db_arg(parser)
+	args = parser.parse_args()
 	
-	asyncio.run(run_permit_pipeline(lookback_days=lookback_days))
+	try:
+		asyncio.run(run_permit_pipeline(lookback_days=args.lookback))
+		
+		# Load to database if requested
+		if args.load_to_db:
+			# Find the most recent permit CSV in new/ subdirectory
+			new_dir = RAW_PERMIT_DIR / "new"
+			csv_files = sorted(new_dir.glob("building_permits*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+			if csv_files:
+				csv_to_load = csv_files[0]
+				logger.info(f"Loading to database: {csv_to_load}")
+				
+				# Load to DB
+				load_scraped_data_to_db('permits', csv_to_load, destination_dir=RAW_PERMIT_DIR)
+				
+				# Delete CSV after successful DB load (DB is single source of truth)
+				try:
+					csv_to_load.unlink()
+					logger.info(f"✓ Cleaned up CSV file: {csv_to_load.name}")
+				except Exception as e:
+					logger.warning(f"Could not delete CSV {csv_to_load}: {e}")
+			else:
+				logger.error("No permit CSV file found to load")
+				sys.exit(1)
+		
+		sys.exit(0)
+		
+	except Exception as e:
+		logger.error(f"Pipeline failed: {e}")
+		sys.exit(1)

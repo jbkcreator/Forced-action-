@@ -38,7 +38,10 @@ from config.constants import (
 	OUTPUT_DATE_FORMAT,
 	OUTPUT_SEPARATOR,
 )
+from src.core.database import get_db_context
+from src.loaders.legal_proceedings import EvictionLoader
 from src.utils.logger import setup_logging, get_logger
+from src.utils.csv_deduplicator import deduplicate_csv, get_unique_keys_for_type
 
 # Initialize logging
 setup_logging()
@@ -288,17 +291,18 @@ def filter_evictions(df: pd.DataFrame) -> pd.DataFrame:
 
 def save_processed_evictions(df: pd.DataFrame, output_filename: str = "eviction_leads.csv") -> Path:
 	"""
-	Save processed eviction data to the output directory.
+	Save processed eviction data to the output directory with deduplication.
 	
-	This function creates the processed data directory if it doesn't exist and
-	saves the DataFrame as a CSV file with the specified filename.
+	This function creates the processed data directory if it doesn't exist,
+	deduplicates against existing CSV files, and saves the DataFrame as a CSV
+	file with the specified filename.
 	
 	Args:
 		df: DataFrame containing processed eviction records
 		output_filename: Name for the output CSV file (default: "eviction_leads.csv")
 		
 	Returns:
-		Path: Path object pointing to the saved CSV file
+		Path: Path object pointing to the saved deduplicated CSV file
 		
 	Raises:
 		IOError: If the file cannot be written to disk
@@ -309,18 +313,34 @@ def save_processed_evictions(df: pd.DataFrame, output_filename: str = "eviction_
 		>>> print(f"Saved to: {output_path}")
 	"""
 	try:
-		PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
-		logger.debug(f"Ensured processed directory exists: {PROCESSED_DATA_DIR}")
+		RAW_EVICTIONS_DIR.mkdir(parents=True, exist_ok=True)
+		logger.debug(f"Ensured evictions directory exists: {RAW_EVICTIONS_DIR}")
 		
-		output_path = PROCESSED_DATA_DIR / output_filename
+		# Check DB for existing eviction cases (deduplicate BEFORE CSV save)
+		logger.info("=" * 60)
+		logger.info("DB DEDUPLICATION: Checking for existing evictions")
+		logger.info("=" * 60)
 		
-		df.to_csv(output_path, index=False)
-		logger.info(f"Saved {len(df)} eviction records to: {output_path}")
+		initial_count = len(df)
+		df_new = filter_new_records(df, 'evictions', record_type='Eviction')
 		
-		return output_path
+		if df_new.empty:
+			logger.info("✓ All evictions already exist in database - nothing new")
+			return None
+		
+		# Save only NEW evictions
+		new_dir = RAW_EVICTIONS_DIR / "new"
+		new_dir.mkdir(parents=True, exist_ok=True)
+		final_file = new_dir / output_filename
+		
+		df_new.to_csv(final_file, index=False)
+		logger.info(f"Saved {len(df_new)} NEW evictions to {final_file}")
+		logger.info(f"Filtered {initial_count - len(df_new)} existing records")
+		
+		return final_file
 		
 	except PermissionError as e:
-		logger.error(f"Permission denied when writing to {output_path}: {e}")
+		logger.error(f"Permission denied when writing file: {e}")
 		raise
 	except IOError as e:
 		logger.error(f"I/O error occurred while writing file: {e}")
@@ -401,11 +421,47 @@ if __name__ == "__main__":
 	This script can be run directly to execute the complete pipeline:
 	    python -m src.scrappers.evictions.evictions_engine
 	    
+	With database loading:
+	    python -m src.scrappers.evictions.evictions_engine --load-to-db
+	    
 	Exit codes:
 	    0: Pipeline completed successfully
 	    1: Pipeline failed or no eviction data found
 	"""
 	import sys
+	import argparse
+	from src.utils.scraper_db_helper import load_scraped_data_to_db, add_load_to_db_arg
+	
+	parser = argparse.ArgumentParser(description="Scrape Hillsborough County eviction filings")
+	add_load_to_db_arg(parser)
+	args = parser.parse_args()
 	
 	success = run_eviction_pipeline()
+	
+	# Load to database if requested and scraping was successful
+	if success and args.load_to_db:
+		try:
+			# Find the most recent eviction CSV in new/ subdirectory
+			new_dir = RAW_EVICTIONS_DIR / "new"
+			csv_files = sorted(new_dir.glob("eviction_leads_*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+			if csv_files:
+				csv_to_load = csv_files[0]
+				logger.info(f"Loading to database: {csv_to_load}")
+				load_scraped_data_to_db('evictions', csv_to_load, destination_dir=RAW_EVICTIONS_DIR)
+				
+				# Delete CSV after successful DB load
+				try:
+					csv_to_load.unlink()
+					logger.info(f"✓ Cleaned up CSV file: {csv_to_load.name}")
+				except Exception as e:
+					logger.warning(f"Could not delete CSV {csv_to_load}: {e}")
+			else:
+				logger.error("No eviction CSV file found to load")
+				sys.exit(1)
+		except Exception as e:
+			logger.error(f"Failed to load data to database: {e}")
+			sys.exit(1)
+	elif args.load_to_db:
+		logger.warning("Skipping database load due to scraping failure")
+	
 	sys.exit(0 if success else 1)

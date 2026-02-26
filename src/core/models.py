@@ -81,6 +81,8 @@ class Property(Base):
     financial: Mapped[Optional["Financial"]] = relationship("Financial", back_populates="property", uselist=False, cascade="all, delete-orphan")
     code_violations: Mapped[List["CodeViolation"]] = relationship("CodeViolation", back_populates="property", cascade="all, delete-orphan")
     legal_and_liens: Mapped[List["LegalAndLien"]] = relationship("LegalAndLien", back_populates="property", cascade="all, delete-orphan")
+    deeds: Mapped[List["Deed"]] = relationship("Deed", back_populates="property", cascade="all, delete-orphan")
+    legal_proceedings: Mapped[List["LegalProceeding"]] = relationship("LegalProceeding", back_populates="property", cascade="all, delete-orphan")
     tax_delinquencies: Mapped[List["TaxDelinquency"]] = relationship("TaxDelinquency", back_populates="property", cascade="all, delete-orphan")
     foreclosures: Mapped[List["Foreclosure"]] = relationship("Foreclosure", back_populates="property", cascade="all, delete-orphan")
     building_permits: Mapped[List["BuildingPermit"]] = relationship("BuildingPermit", back_populates="property", cascade="all, delete-orphan")
@@ -253,8 +255,8 @@ class CodeViolation(Base):
 
 class LegalAndLien(Base):
     """
-    Polymorphic table for various legal and lien records.
-    Handles Probate, Eviction, HOA, Bankruptcy, etc.
+    Liens and Judgments table for legal claims against properties.
+    Handles CCL, TCL, Mechanics Liens, Tax Liens, HOA Liens, Judgments, etc.
     One-to-many relationship with Property.
     """
     __tablename__ = "legal_and_liens"
@@ -268,13 +270,22 @@ class LegalAndLien(Base):
     # Discriminator for polymorphic behavior
     record_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
 
-    # Common Fields
+    # Lien/Judgment Fields
     filing_date: Mapped[Optional[datetime]] = mapped_column(Date)
     amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
-    associated_party: Mapped[Optional[str]] = mapped_column(String(255))
-
-    # Flexible metadata bucket for type-specific fields
-    meta_data: Mapped[Optional[dict]] = mapped_column(JSONB)
+    creditor: Mapped[Optional[str]] = mapped_column(String(255))  # Who filed the lien/judgment
+    debtor: Mapped[Optional[str]] = mapped_column(String(255))  # Property owner
+    
+    # Document reference fields
+    instrument_number: Mapped[Optional[str]] = mapped_column(String(50), unique=True)
+    book_type: Mapped[Optional[str]] = mapped_column(String(50))
+    book_number: Mapped[Optional[str]] = mapped_column(String(50))
+    page_number: Mapped[Optional[str]] = mapped_column(String(50))
+    
+    # Additional metadata
+    document_type: Mapped[Optional[str]] = mapped_column(String(100))  # CCL, TCL, ML, TL, HL, Judgment
+    legal_description: Mapped[Optional[str]] = mapped_column(Text)
+    meta_data: Mapped[Optional[dict]] = mapped_column(JSONB)  # Additional type-specific fields
 
     # Relationship
     property: Mapped["Property"] = relationship("Property", back_populates="legal_and_liens")
@@ -283,12 +294,111 @@ class LegalAndLien(Base):
     __table_args__ = (
         Index("idx_legal_record_type", "record_type"),
         Index("idx_legal_filing_date", "filing_date"),
+        Index("idx_legal_instrument", "instrument_number"),
         Index("idx_legal_meta_data", "meta_data", postgresql_using="gin"),
-        CheckConstraint("record_type IN ('Probate', 'Eviction', 'HOA', 'Bankruptcy', 'Judgment', 'Other')", name="check_record_type"),
+        CheckConstraint("record_type IN ('Lien', 'Judgment')", name="check_lien_record_type"),
     )
 
     def __repr__(self):
         return f"<LegalAndLien(id={self.id}, record_type='{self.record_type}', amount={self.amount})>"
+
+
+class Deed(Base):
+    """
+    Property ownership transfer records (Deeds, Tax Deeds).
+    Tracks all sales and transfers of property ownership.
+    One-to-many relationship with Property.
+    """
+    __tablename__ = "deeds"
+
+    # Primary Key
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+
+    # Foreign Key
+    property_id: Mapped[int] = mapped_column(ForeignKey("properties.id"), nullable=False, index=True)
+
+    # Document reference
+    instrument_number: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
+    
+    # Transfer parties
+    grantor: Mapped[Optional[str]] = mapped_column(String(255))  # Seller
+    grantee: Mapped[Optional[str]] = mapped_column(String(255))  # Buyer
+    
+    # Transaction details
+    record_date: Mapped[Optional[datetime]] = mapped_column(Date)
+    sale_price: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
+    deed_type: Mapped[Optional[str]] = mapped_column(String(100))  # Deed, Tax Deed, Warranty Deed, etc.
+    
+    # Document reference fields
+    doc_type: Mapped[Optional[str]] = mapped_column(String(100))
+    book_type: Mapped[Optional[str]] = mapped_column(String(50))
+    book_number: Mapped[Optional[str]] = mapped_column(String(50))
+    page_number: Mapped[Optional[str]] = mapped_column(String(50))
+    
+    # Legal description
+    legal_description: Mapped[Optional[str]] = mapped_column(Text)
+
+    # Relationship
+    property: Mapped["Property"] = relationship("Property", back_populates="deeds")
+
+    # Indexes
+    __table_args__ = (
+        Index("idx_deed_record_date", "record_date"),
+        Index("idx_deed_instrument", "instrument_number"),
+        Index("idx_deed_grantor", "grantor"),
+        Index("idx_deed_grantee", "grantee"),
+    )
+
+    def __repr__(self):
+        return f"<Deed(id={self.id}, instrument='{self.instrument_number}', sale_price={self.sale_price})>"
+
+
+class LegalProceeding(Base):
+    """
+    Legal proceedings table for probate, evictions, and bankruptcy cases.
+    Handles formal court proceedings affecting properties.
+    One-to-many relationship with Property.
+    """
+    __tablename__ = "legal_proceedings"
+
+    # Primary Key
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+
+    # Foreign Key
+    property_id: Mapped[int] = mapped_column(ForeignKey("properties.id"), nullable=False, index=True)
+
+    # Discriminator for polymorphic behavior
+    record_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+
+    # Case information
+    case_number: Mapped[Optional[str]] = mapped_column(String(100), unique=True)
+    filing_date: Mapped[Optional[datetime]] = mapped_column(Date)
+    case_status: Mapped[Optional[str]] = mapped_column(String(100))
+    
+    # Parties involved
+    associated_party: Mapped[Optional[str]] = mapped_column(String(255))  # Decedent name, tenant name, debtor name
+    secondary_party: Mapped[Optional[str]] = mapped_column(String(255))  # Petitioner, landlord, etc.
+    
+    # Financial details (if applicable)
+    amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
+    
+    # Flexible metadata bucket for type-specific fields
+    meta_data: Mapped[Optional[dict]] = mapped_column(JSONB)
+
+    # Relationship
+    property: Mapped["Property"] = relationship("Property", back_populates="legal_proceedings")
+
+    # Indexes
+    __table_args__ = (
+        Index("idx_proceeding_record_type", "record_type"),
+        Index("idx_proceeding_filing_date", "filing_date"),
+        Index("idx_proceeding_case_number", "case_number"),
+        Index("idx_proceeding_meta_data", "meta_data", postgresql_using="gin"),
+        CheckConstraint("record_type IN ('Probate', 'Eviction', 'Bankruptcy')", name="check_proceeding_record_type"),
+    )
+
+    def __repr__(self):
+        return f"<LegalProceeding(id={self.id}, record_type='{self.record_type}', case_number='{self.case_number}')>"
 
 
 class TaxDelinquency(Base):

@@ -1,21 +1,42 @@
-# Browser Automation Task Prompts
+# Browser Automation Task Prompts for Building Permits
 
-# Permit Search Task
+# Permit search and extract task - TABLE SCRAPING METHOD
 permit_search:
-  description: "Navigate to Hillsborough County Building Permit search and download records"
+  description: "Navigate to Hillsborough County Accela permit portal and extract permit records as pipe-delimited text"
   task_template: |
-    Navigate to the Hillsborough County Building Permit search:
-    
-    1. Go to {url}
-    2. Look for a search form or filter section
-    3. Find date filter fields named start date and end date
-    4. Set the START date to: {start_date}
-    5. Set the END date to: {end_date}
-    6. Click the Search button to run the search
-    7. Wait for results to load (there should be a table or grid of permits)
-    8. Look for an Export, Download, or similar button to download the results
-    9. Click the download button to export the data (prefer CSV or Excel format)
-    10. Wait at least {wait_time} seconds for the download to complete
-    11. Close any dialogs or popups that appear
-    
-    Do not navigate away or open new tabs. If you encounter a CAPTCHA or authentication, report it.
+    Navigate to the Hillsborough County Building Permit portal and extract permit records.
+
+    URL: {url}
+
+    Steps:
+    1. Navigate to the URL
+    2. Wait for the page to load (2 seconds)
+    3. If "Search Applications" form is not visible, click the button to show it
+    4. Fill in the Start Date field with: {start_date}
+    5. Fill in the End Date field with: {end_date}
+    6. Click the Search button
+    7. Wait for results to load (5 seconds)
+    8. Extract ALL data from the results table including these columns:
+       - Date
+       - Record Number
+       - Record Type
+       - Description
+       - Project Name
+       - Related Records
+       - Status
+       - Address
+    9. For pagination: If there are more than 3 pages, extract only the first 3 pages. If there are 3 or fewer pages, extract all pages.
+    10. Return the data in this exact format:
+       Date|Record Number|Record Type|Description|Project Name|Related Records|Status|Address
+       02/23/2026|BLD2026-00123|Building Permit|New Construction|Residential Addition|(empty)|Issued|1234 Main St, Tampa FL 33602
+       (one row per line with pipe | separators)
+
+    CRITICAL REQUIREMENTS:
+    - Do NOT use any export or download buttons (they are broken)
+    - Extract data directly by reading the HTML table on each page
+    - Make sure BOTH date fields are filled correctly before clicking Search
+    - Extract EVERY SINGLE ROW from EVERY PAGE (up to 3 pages if more than 3 exist)
+    - Do NOT save to files - return ALL data directly in your final response
+    - Your final response MUST contain ALL records in pipe-delimited format
+    - Include the header row first, then all data rows
+    - Count the records as you go and verify the total matches the "Showing X-Y of Z" display

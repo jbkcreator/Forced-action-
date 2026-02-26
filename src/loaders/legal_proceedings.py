@@ -19,7 +19,9 @@ class ProbateLoader(BaseLoader):
     def load_from_dataframe(
         self,
         df: pd.DataFrame,
-        skip_duplicates: bool = True
+        skip_duplicates: bool = True,
+        sample_mode: bool = False,
+        sample_size: int = 10
     ) -> Tuple[int, int, int]:
         """
         Load probate cases from DataFrame.
@@ -27,11 +29,19 @@ class ProbateLoader(BaseLoader):
         Args:
             df: DataFrame with columns: CaseNumber, PartyAddress, FilingDate, etc.
             skip_duplicates: Skip existing records
+            sample_mode: If True, only load first N rows for testing (includes multiple rows per case)
+            sample_size: Number of rows to load when sample_mode=True
             
         Returns:
             Tuple of (matched, unmatched, skipped)
         """
-        logger.info(f"Loading probate cases from {len(df)} rows")
+        # Apply sampling if requested
+        if sample_mode:
+            original_count = len(df)
+            df = df.head(sample_size)
+            logger.info(f"🧪 SAMPLE MODE: Loading {len(df)} probate rows (out of {original_count} total)")
+        else:
+            logger.info(f"Loading probate cases from {len(df)} rows")
         
         # Group by case number (multiple rows per case)
         grouped = df.groupby('CaseNumber')
@@ -106,7 +116,9 @@ class EvictionLoader(BaseLoader):
     def load_from_dataframe(
         self,
         df: pd.DataFrame,
-        skip_duplicates: bool = True
+        skip_duplicates: bool = True,
+        sample_mode: bool = False,
+        sample_size: int = 20
     ) -> Tuple[int, int, int]:
         """
         Load evictions from DataFrame.
@@ -114,11 +126,19 @@ class EvictionLoader(BaseLoader):
         Args:
             df: DataFrame with columns: CaseNumber, PartyAddress, FilingDate, etc.
             skip_duplicates: Skip existing records
+            sample_mode: If True, only load first N rows for testing (includes multiple rows per case)
+            sample_size: Number of rows to load when sample_mode=True
             
         Returns:
             Tuple of (matched, unmatched, skipped)
         """
-        logger.info(f"Loading evictions from {len(df)} rows")
+        # Apply sampling if requested
+        if sample_mode:
+            original_count = len(df)
+            df = df.head(sample_size)
+            logger.info(f"🧪 SAMPLE MODE: Loading {len(df)} eviction rows (out of {original_count} total)")
+        else:
+            logger.info(f"Loading evictions from {len(df)} rows")
         
         # Group by case number (plaintiff + defendant rows)
         grouped = df.groupby('CaseNumber')
@@ -151,17 +171,33 @@ class EvictionLoader(BaseLoader):
                     plaintiff_name = group[group['PartyType'] == 'Plaintiff']['LastName/CompanyName'].iloc[0] if not group[group['PartyType'] == 'Plaintiff'].empty else None
                     defendant_name = f"{defendant_row.get('FirstName', '')} {defendant_row.get('MiddleName', '')} {defendant_row.get('LastName/CompanyName', '')}".strip()
                     
+                    # Handle NaN values
+                    case_status_val = defendant_row.get('Title')
+                    if pd.isna(case_status_val):
+                        case_status_val = None
+                    
+                    case_type_val = defendant_row.get('CaseTypeDescription')
+                    if pd.isna(case_type_val):
+                        case_type_val = None
+                    
+                    party_address_val = defendant_row.get('PartyAddress')
+                    if pd.isna(party_address_val):
+                        party_address_val = None
+                    
+                    if pd.isna(plaintiff_name):
+                        plaintiff_name = None
+                    
                     eviction_record = LegalProceeding(
                         property_id=property_record.id,
                         record_type='Eviction',
                         case_number=case_number,
                         filing_date=self.parse_date(defendant_row.get('FilingDate')),
-                        case_status=defendant_row.get('Title'),
+                        case_status=case_status_val,
                         associated_party=defendant_name,
                         secondary_party=plaintiff_name,
                         meta_data={
-                            'case_type': defendant_row.get('CaseTypeDescription'),
-                            'party_address': defendant_row.get('PartyAddress')
+                            'case_type': case_type_val,
+                            'party_address': party_address_val
                         }
                     )
                     
@@ -225,16 +261,33 @@ class BankruptcyLoader(BaseLoader):
             
             if property_record:
                 try:
+                    # Handle NaN values
+                    lead_name_val = row.get('Lead Name')
+                    if pd.isna(lead_name_val):
+                        lead_name_val = None
+                    
+                    case_type_val = row.get('Case Type')
+                    if pd.isna(case_type_val):
+                        case_type_val = None
+                    
+                    division_val = row.get('Division')
+                    if pd.isna(division_val):
+                        division_val = None
+                    
+                    court_id_val = row.get('Court ID')
+                    if pd.isna(court_id_val):
+                        court_id_val = None
+                    
                     bankruptcy_record = LegalProceeding(
                         property_id=property_record.id,
                         record_type='Bankruptcy',
                         case_number=docket_number,
                         filing_date=self.parse_date(row.get('Date Filed')),
-                        associated_party=row.get('Lead Name'),
+                        associated_party=lead_name_val,
                         meta_data={
-                            'case_type': row.get('Case Type'),
-                            'division': row.get('Division'),
-                            'court_id': row.get('Court ID')
+                            'case_type': case_type_val,
+                            'division': division_val,
+                            'court_id': court_id_val
                         }
                     )
                     

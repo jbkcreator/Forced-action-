@@ -40,37 +40,64 @@ class TaxDelinquencyLoader(BaseLoader):
         for _, row in df.iterrows():
             account_number = str(row['Account Number']).strip()
             
-            # Check for duplicates
-            if skip_duplicates and self.check_duplicate(TaxDelinquency, {'account_number': account_number}):
-                logger.debug(f"Skipping duplicate tax record: {account_number}")
-                skipped += 1
-                continue
+            # Strip the "A" prefix if present (tax CSV uses "A0000100000", database uses "0000010000")
+            parcel_id = account_number.lstrip('A')
             
             # Match by parcel ID (account number)
-            property_record = self.find_property_by_parcel_id(account_number)
+            property_record = self.find_property_by_parcel_id(parcel_id)
             
-            if property_record:
-                try:
-                    tax_record = TaxDelinquency(
-                        property_id=property_record.id,
-                        account_number=account_number,
-                        tax_year=int(row['Tax Yr']) if pd.notna(row.get('Tax Yr')) else None,
-                        delinquent_amount=self.parse_amount(row.get('total_amount_due')),
-                        years_delinquent=int(row['years_delinquent_scraped']) if pd.notna(row.get('years_delinquent_scraped')) else None,
-                        payment_plan_status=row.get('payment_plan_status'),
-                        account_status=row.get('Account Status'),
-                        cert_status=row.get('Cert Status'),
-                        deed_status=row.get('Deed Status'),
-                    )
-                    
-                    self.session.add(tax_record)
-                    matched += 1
-                    
-                except Exception as e:
-                    logger.error(f"Error inserting tax record for {account_number}: {e}")
-                    unmatched += 1
-            else:
-                logger.warning(f"No property match for parcel: {account_number}")
+            if not property_record:
+                logger.warning(f"No property match for parcel: {account_number} (searched as: {parcel_id})")
+                unmatched += 1
+                continue
+            
+            # Check for duplicates - check if this property already has a tax record for this year
+            tax_year = int(row['Tax Yr']) if pd.notna(row.get('Tax Yr')) else None
+            if skip_duplicates and tax_year:
+                existing = self.session.query(TaxDelinquency).filter(
+                    TaxDelinquency.property_id == property_record.id,
+                    TaxDelinquency.tax_year == tax_year
+                ).first()
+                if existing:
+                    logger.debug(f"Skipping duplicate tax record: {account_number} for year {tax_year}")
+                    skipped += 1
+                    continue
+            
+            try:
+                # Parse years delinquent
+                years_delinquent_val = row.get('years_delinquent_scraped')
+                if pd.notna(years_delinquent_val):
+                    years_delinquent_val = int(years_delinquent_val)
+                else:
+                    years_delinquent_val = None
+                
+                # Combine cert and deed status into certificate_data
+                cert_status = row.get('Cert Status', '')
+                deed_status = row.get('Deed Status', '')
+                certificate_data = None
+                if pd.notna(cert_status) or pd.notna(deed_status):
+                    parts = []
+                    if pd.notna(cert_status) and cert_status != '-- None --':
+                        parts.append(f"Cert: {cert_status}")
+                    if pd.notna(deed_status) and deed_status != '-- None --':
+                        parts.append(f"Deed: {deed_status}")
+                    if parts:
+                        certificate_data = ", ".join(parts)
+                
+                tax_record = TaxDelinquency(
+                    property_id=property_record.id,
+                    tax_year=tax_year,
+                    years_delinquent=years_delinquent_val,
+                    total_amount_due=self.parse_amount(row.get('total_amount_due')),
+                    certificate_data=certificate_data,
+                    deed_app_date=None,  # Not in CSV
+                )
+                
+                self.session.add(tax_record)
+                matched += 1
+                
+            except Exception as e:
+                logger.error(f"Error inserting tax record for {account_number}: {e}")
                 unmatched += 1
         
         logger.info(f"Tax delinquencies: {matched} matched, {unmatched} unmatched, {skipped} skipped")
