@@ -80,11 +80,13 @@ class ForeclosureLoader(BaseLoader):
                         auction_date=auction_date_val,
                     )
                     
-                    self.session.add(foreclosure_record)
-                    matched += 1
-                    
+                    if self.safe_add(foreclosure_record):
+                        matched += 1
+                    else:
+                        unmatched += 1
+
                 except Exception as e:
-                    logger.error(f"Error inserting foreclosure {case_number}: {e}")
+                    logger.error(f"Error building foreclosure {case_number}: {e}")
                     unmatched += 1
             else:
                 logger.warning(f"No property match for foreclosure: {case_number}")

@@ -1,5 +1,6 @@
 # Core dependencies
 anthropic>=0.79.0
+playwright>=1.40.0
 beautifulsoup4>=4.14.3
 browser-use>=0.11.9
 firecrawl-py>=4.15.1

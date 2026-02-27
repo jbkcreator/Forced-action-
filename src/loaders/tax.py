@@ -93,11 +93,13 @@ class TaxDelinquencyLoader(BaseLoader):
                     deed_app_date=None,  # Not in CSV
                 )
                 
-                self.session.add(tax_record)
-                matched += 1
-                
+                if self.safe_add(tax_record):
+                    matched += 1
+                else:
+                    unmatched += 1
+
             except Exception as e:
-                logger.error(f"Error inserting tax record for {account_number}: {e}")
+                logger.error(f"Error building tax record for {account_number}: {e}")
                 unmatched += 1
         
         logger.info(f"Tax delinquencies: {matched} matched, {unmatched} unmatched, {skipped} skipped")

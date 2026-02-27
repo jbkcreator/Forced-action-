@@ -121,11 +121,13 @@ class DeedLoader(BaseLoader):
                         legal_description=legal_desc_val
                     )
                     
-                    self.session.add(deed_record)
-                    matched += 1
-                    
+                    if self.safe_add(deed_record):
+                        matched += 1
+                    else:
+                        unmatched += 1
+
                 except Exception as e:
-                    logger.error(f"Error inserting deed {instrument}: {e}")
+                    logger.error(f"Error building deed {instrument}: {e}")
                     unmatched += 1
             else:
                 logger.debug(f"No property match for deed: {instrument} (Grantor: {row.get('Grantor')})")

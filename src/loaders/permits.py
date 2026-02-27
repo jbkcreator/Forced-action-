@@ -76,11 +76,13 @@ class BuildingPermitLoader(BaseLoader):
                         expire_date=self.parse_date(row.get('Expiration Date'))
                     )
                     
-                    self.session.add(permit_record)
-                    matched += 1
-                    
+                    if self.safe_add(permit_record):
+                        matched += 1
+                    else:
+                        unmatched += 1
+
                 except Exception as e:
-                    logger.error(f"Error inserting permit {record_number}: {e}")
+                    logger.error(f"Error building permit {record_number}: {e}")
                     unmatched += 1
             else:
                 logger.warning(f"No property match for permit: {record_number} at {row.get('Address')}")

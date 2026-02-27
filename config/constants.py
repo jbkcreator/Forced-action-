@@ -21,6 +21,12 @@ PROCESSED_DATA_DIR = DATA_DIR / "processed"
 REFERENCE_DATA_DIR = DATA_DIR / "reference"
 DEBUG_DATA_DIR = DATA_DIR / "debug"
 
+# Type-specific processed directories (lien engine produces 3 separate document types
+# that must be stored in isolated folders to prevent cross-type deduplication errors)
+PROCESSED_LIENS_DIR = PROCESSED_DATA_DIR / "liens"
+PROCESSED_DEEDS_DIR = PROCESSED_DATA_DIR / "deeds"
+PROCESSED_JUDGMENTS_DIR = PROCESSED_DATA_DIR / "judgments"
+
 # Scraper-specific raw data directories
 RAW_EVICTIONS_DIR = RAW_DATA_DIR / "evictions"
 RAW_PROBATE_DIR = RAW_DATA_DIR / "probate"

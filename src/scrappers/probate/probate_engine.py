@@ -37,6 +37,7 @@ from src.core.database import get_db_context
 from src.loaders.legal_proceedings import ProbateLoader
 from src.utils.logger import setup_logging, get_logger
 from src.utils.csv_deduplicator import deduplicate_csv, get_unique_keys_for_type
+from src.utils.db_deduplicator import filter_new_records
 
 # Initialize logging
 setup_logging()
@@ -353,18 +354,12 @@ if __name__ == "__main__":
 		if args.load_to_db:
 			# Find the most recent probate CSV in new/ subdirectory
 			new_dir = RAW_PROBATE_DIR / "new"
-			csv_files = sorted(new_dir.glob("probate_leads*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+			csv_files = sorted(new_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
 			if csv_files:
 				csv_to_load = csv_files[0]
 				logger.info(f"Loading to database: {csv_to_load}")
 				load_scraped_data_to_db('probate', csv_to_load, destination_dir=RAW_PROBATE_DIR)
 				
-				# Delete CSV after successful DB load
-				try:
-					csv_to_load.unlink()
-					logger.info(f"✓ Cleaned up CSV file: {csv_to_load.name}")
-				except Exception as e:
-					logger.warning(f"Could not delete CSV {csv_to_load}: {e}")
 			else:
 				logger.error("No probate CSV file found to load")
 				sys.exit(1)

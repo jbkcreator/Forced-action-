@@ -25,7 +25,7 @@ violation_browser_use_scrape:
        - Related Records
        - Status
        - Address (or Short Notes field if it contains addresses)
-    9. For pagination: If there are more than 3 pages, extract only the first 3 pages. If there are 3 or fewer pages, extract all pages.
+    9. For pagination: Extract ALL pages — do not stop until every page of results has been processed.
     10. Return the data in this exact format:
        Date|Record Number|Record Type|Description|Project Name|Related Records|Status|Address
        02/23/2026|HC-WE-26-000669|Water Enforcement Proactive|Watering on a restricted day|Watering on a restricted day|0|In Review|10064 Dolphin Gull Cir, Thonotosassa FL 33592

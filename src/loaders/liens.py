@@ -130,11 +130,13 @@ class LienLoader(BaseLoader):
                         legal_description=legal_desc_val,
                     )
                     
-                    self.session.add(lien_record)
-                    matched += 1
-                    
+                    if self.safe_add(lien_record):
+                        matched += 1
+                    else:
+                        unmatched += 1
+
                 except Exception as e:
-                    logger.error(f"Error inserting lien {instrument}: {e}")
+                    logger.error(f"Error building lien {instrument}: {e}")
                     unmatched += 1
             else:
                 logger.debug(f"No property match for lien: {instrument} (Grantor: {row.get('Grantor')})")

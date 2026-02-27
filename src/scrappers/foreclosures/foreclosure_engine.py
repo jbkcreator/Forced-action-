@@ -409,12 +409,6 @@ def main():
                     
                     logger.info("✓ Database load completed!")
                     
-                    # Delete CSV after successful DB insertion (DB is single source of truth)
-                    try:
-                        result_file.unlink()
-                        logger.info(f"✓ Cleaned up CSV file: {result_file.name}")
-                    except Exception as e:
-                        logger.warning(f"Could not delete CSV {result_file}: {e}")
             except Exception as e:
                 logger.error(f"Failed to load data to database: {e}")
                 logger.debug(traceback.format_exc())

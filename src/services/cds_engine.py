@@ -583,18 +583,29 @@ class CDSCalculator:
         }
         
         if existing_score:
-            # UPDATE existing record (avoid duplicate)
+            # UPDATE existing record for today (avoid intra-day duplicates)
             existing_score.score_date = datetime.now()
             existing_score.final_cds_score = total_score
             existing_score.lead_tier = lead_tier
             existing_score.urgency_level = urgency_level
             existing_score.qualified = score_data['qualified']
             existing_score.factor_scores = factor_scores
-            
+
             logger.debug(f"Updated CDS score for property {score_data['parcel_id']}: {total_score} ({lead_tier})")
             return existing_score
         else:
-            # CREATE new record
+            # Check the most recent score ever recorded for this property.
+            # Only create a new record if the score has actually changed — this
+            # prevents accumulating identical rows across days when nothing changes.
+            latest_score = self.session.query(DistressScore).filter(
+                DistressScore.property_id == property_id
+            ).order_by(DistressScore.score_date.desc()).first()
+
+            if latest_score and float(latest_score.final_cds_score) == float(total_score):
+                logger.debug(f"Score unchanged for property {score_data['parcel_id']}: {total_score} — skipping")
+                return None
+
+            # Score changed (or no prior score exists) — record the change
             distress_score = DistressScore(
                 property_id=property_id,
                 score_date=datetime.now(),
@@ -604,11 +615,9 @@ class CDSCalculator:
                 qualified=score_data['qualified'],
                 factor_scores=factor_scores
             )
-            
+
             self.session.add(distress_score)
-            
             logger.debug(f"Created CDS score for property {score_data['parcel_id']}: {total_score} ({lead_tier})")
-            
             return distress_score
     
     def score_all_properties_with_violations(self, save_to_db: bool = False) -> List[Dict]:
@@ -631,29 +640,38 @@ class CDSCalculator:
             joinedload(Property.owner),
             joinedload(Property.financial)
         ).join(Property.code_violations).distinct().all()
-        
+
         logger.info(f"Found {len(properties)} properties with violations")
         
         # Calculate scores
         scores = []
+        saved_count = 0
+        unchanged_count = 0
         for property in properties:
             try:
                 score_result = self.calculate_property_score(property)
                 scores.append(score_result)
-                
+
                 # Save to database if requested
                 if save_to_db:
-                    self.save_score_to_database(score_result)
-                    
+                    result = self.save_score_to_database(score_result)
+                    if result is None:
+                        unchanged_count += 1
+                    else:
+                        saved_count += 1
+
             except Exception as e:
                 logger.error(f"Error scoring property {property.parcel_id}: {e}")
                 continue
-        
+
         # Commit all saved scores
         if save_to_db:
             try:
                 self.session.commit()
-                logger.info(f"Saved {len(scores)} CDS scores to database")
+                logger.info(
+                    f"CDS scoring complete — {saved_count} saved (score changed), "
+                    f"{unchanged_count} skipped (score unchanged)"
+                )
             except Exception as e:
                 logger.error(f"Error committing scores to database: {e}")
                 self.session.rollback()

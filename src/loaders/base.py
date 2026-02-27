@@ -462,6 +462,25 @@ class BaseLoader(ABC):
     # DUPLICATE CHECKING
     # ========================================================================
     
+    def safe_add(self, record: Any) -> bool:
+        """
+        Add a record to the session using a savepoint so that a DB constraint
+        violation (UniqueViolation, etc.) on one row does NOT abort the whole
+        transaction.  All other rows that succeeded remain staged for the final
+        session.commit() called by the engine.
+
+        Returns True if the record was staged successfully, False if it was
+        rejected by the database (error is logged at WARNING level).
+        """
+        try:
+            with self.session.begin_nested():   # creates a SAVEPOINT
+                self.session.add(record)
+                self.session.flush()            # send INSERT to DB now
+            return True
+        except Exception as e:
+            logger.warning(f"Skipped record — DB rejected it: {e}")
+            return False
+
     def check_duplicate(
         self,
         model: Any,

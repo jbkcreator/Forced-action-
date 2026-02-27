@@ -355,18 +355,11 @@ if __name__ == "__main__":
 			from src.utils.scraper_db_helper import load_scraped_data_to_db
 			# Find the most recent bankruptcy CSV in new/ subdirectory
 			new_dir = RAW_BANKRUPTCY_DIR / "new"
-			csv_files = sorted(new_dir.glob("tampa_bankruptcy_leads*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+			csv_files = sorted(new_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
 			if csv_files:
 				csv_to_load = csv_files[0]
 				logger.info(f"Loading to database: {csv_to_load}")
 				load_scraped_data_to_db('bankruptcy', csv_to_load, destination_dir=RAW_BANKRUPTCY_DIR)
-				
-				# Delete CSV after successful DB load
-				try:
-					csv_to_load.unlink()
-					logger.info(f"✓ Cleaned up CSV file: {csv_to_load.name}")
-				except Exception as e:
-					logger.warning(f"Could not delete CSV {csv_to_load}: {e}")
 			else:
 				logger.error("No bankruptcy CSV file found to load")
 				sys.exit(1)

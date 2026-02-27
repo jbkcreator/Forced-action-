@@ -775,20 +775,13 @@ if __name__ == "__main__":
 		if args.load_to_db:
 			# Find the most recent tax delinquency CSV
 			new_dir = RAW_TAX_DELINQUENCIES_DIR / "new"
-			csv_files = sorted(new_dir.glob("tax_deliquencies*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+			csv_files = sorted(new_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
 			if csv_files:
 				csv_to_load = csv_files[0]
 				logger.info(f"Loading to database: {csv_to_load}")
 				
 				# Load to DB
 				load_scraped_data_to_db('tax', csv_to_load, destination_dir=RAW_TAX_DELINQUENCIES_DIR)
-				
-				# Delete CSV after successful DB load (DB is single source of truth)
-				try:
-					csv_to_load.unlink()
-					logger.info(f"✓ Cleaned up CSV file: {csv_to_load.name}")
-				except Exception as e:
-					logger.warning(f"Could not delete CSV {csv_to_load}: {e}")
 			else:
 				logger.error("No tax delinquency CSV file found to load")
 				import sys

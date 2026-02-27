@@ -25,7 +25,7 @@ permit_search:
        - Related Records
        - Status
        - Address
-    9. For pagination: If there are more than 3 pages, extract only the first 3 pages. If there are 3 or fewer pages, extract all pages.
+    9. For pagination: Extract ALL pages — do not stop until every page of results has been processed.
     10. Return the data in this exact format:
        Date|Record Number|Record Type|Description|Project Name|Related Records|Status|Address
        02/23/2026|BLD2026-00123|Building Permit|New Construction|Residential Addition|(empty)|Issued|1234 Main St, Tampa FL 33602
@@ -35,7 +35,7 @@ permit_search:
     - Do NOT use any export or download buttons (they are broken)
     - Extract data directly by reading the HTML table on each page
     - Make sure BOTH date fields are filled correctly before clicking Search
-    - Extract EVERY SINGLE ROW from EVERY PAGE (up to 3 pages if more than 3 exist)
+    - Extract EVERY SINGLE ROW from EVERY PAGE - do not stop until all pages are processed
     - Do NOT save to files - return ALL data directly in your final response
     - Your final response MUST contain ALL records in pipe-delimited format
     - Include the header row first, then all data rows

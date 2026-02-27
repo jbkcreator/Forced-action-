@@ -31,8 +31,17 @@ class ViolationLoader(BaseLoader):
         Returns:
             Tuple of (matched, unmatched, skipped)
         """
+        # Drop intra-batch duplicates by record_number before processing.
+        # The DB check_duplicate only queries committed rows, so two rows with
+        # the same record_number in the same batch would both pass and cause a
+        # UniqueViolation at commit time.
+        before = len(df)
+        df = df.drop_duplicates(subset=['Record Number'], keep='first')
+        if len(df) < before:
+            logger.warning(f"Dropped {before - len(df)} duplicate Record Number(s) within batch")
+
         logger.info(f"Loading {len(df)} violations")
-        
+
         matched = 0
         unmatched = 0
         skipped = 0
@@ -88,11 +97,13 @@ class ViolationLoader(BaseLoader):
                         is_lien=False,
                     )
                     
-                    self.session.add(violation_record)
-                    matched += 1
-                    
+                    if self.safe_add(violation_record):
+                        matched += 1
+                    else:
+                        unmatched += 1
+
                 except Exception as e:
-                    logger.error(f"Error inserting violation {record_number}: {e}")
+                    logger.error(f"Error building violation {record_number}: {e}")
                     unmatched += 1
             else:
                 logger.warning(f"No property match for violation: {record_number} at {row.get('Address')}")
