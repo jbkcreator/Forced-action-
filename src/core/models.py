@@ -120,7 +120,7 @@ class Owner(Base):
     property_id: Mapped[int] = mapped_column(ForeignKey("properties.id"), unique=True, nullable=False, index=True)
 
     # Owner Information
-    owner_name: Mapped[Optional[str]] = mapped_column(String(255))
+    owner_name: Mapped[Optional[str]] = mapped_column(Text)
     mailing_address: Mapped[Optional[str]] = mapped_column(String(255))
     owner_type: Mapped[Optional[str]] = mapped_column(String(50))
     ownership_years: Mapped[Optional[float]] = mapped_column(Numeric(5, 2))
@@ -273,8 +273,8 @@ class LegalAndLien(Base):
     # Lien/Judgment Fields
     filing_date: Mapped[Optional[datetime]] = mapped_column(Date)
     amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
-    creditor: Mapped[Optional[str]] = mapped_column(String(255))  # Who filed the lien/judgment
-    debtor: Mapped[Optional[str]] = mapped_column(String(255))  # Property owner
+    creditor: Mapped[Optional[str]] = mapped_column(Text)  # Who filed the lien/judgment
+    debtor: Mapped[Optional[str]] = mapped_column(Text)  # Property owner
     
     # Document reference fields
     instrument_number: Mapped[Optional[str]] = mapped_column(String(50), unique=True)
@@ -321,8 +321,8 @@ class Deed(Base):
     instrument_number: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
     
     # Transfer parties
-    grantor: Mapped[Optional[str]] = mapped_column(String(255))  # Seller
-    grantee: Mapped[Optional[str]] = mapped_column(String(255))  # Buyer
+    grantor: Mapped[Optional[str]] = mapped_column(Text)  # Seller
+    grantee: Mapped[Optional[str]] = mapped_column(Text)  # Buyer
     
     # Transaction details
     record_date: Mapped[Optional[datetime]] = mapped_column(Date)
@@ -376,8 +376,8 @@ class LegalProceeding(Base):
     case_status: Mapped[Optional[str]] = mapped_column(String(100))
     
     # Parties involved
-    associated_party: Mapped[Optional[str]] = mapped_column(String(255))  # Decedent name, tenant name, debtor name
-    secondary_party: Mapped[Optional[str]] = mapped_column(String(255))  # Petitioner, landlord, etc.
+    associated_party: Mapped[Optional[str]] = mapped_column(Text)  # Decedent name, tenant name, debtor name
+    secondary_party: Mapped[Optional[str]] = mapped_column(Text)  # Petitioner, landlord, etc.
     
     # Financial details (if applicable)
     amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
@@ -450,7 +450,7 @@ class Foreclosure(Base):
 
     # Foreclosure Information
     case_number: Mapped[str] = mapped_column(String(100), unique=True, nullable=False, index=True)
-    plaintiff: Mapped[Optional[str]] = mapped_column(String(255))
+    plaintiff: Mapped[Optional[str]] = mapped_column(Text)
     filing_date: Mapped[Optional[datetime]] = mapped_column(Date)
     lis_pendens_date: Mapped[Optional[datetime]] = mapped_column(Date)
     judgment_amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
