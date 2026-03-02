@@ -279,7 +279,8 @@ async def scrape_violations_with_playwright(
 			await browser.close()
 
 	if not all_rows:
-		raise RuntimeError("Playwright extracted 0 records — portal may be down or selectors changed")
+		logger.info("[Playwright] 0 records found — no violations in this date range")
+		return None
 
 	# Normalize column names
 	COLUMN_ALIASES = {

@@ -37,11 +37,12 @@ class BaseLoader(ABC):
     def __init__(self, session: Session):
         """
         Initialize loader with database session.
-        
+
         Args:
             session: SQLAlchemy database session
         """
         self.session = session
+        self._affected_property_ids: set = set()
     
     # ========================================================================
     # ABSTRACT METHODS (must be implemented by subclasses)
@@ -476,10 +477,21 @@ class BaseLoader(ABC):
             with self.session.begin_nested():   # creates a SAVEPOINT
                 self.session.add(record)
                 self.session.flush()            # send INSERT to DB now
+            # Track affected property IDs for ingestion-time rescoring
+            pid = getattr(record, "property_id", None)
+            if pid is not None:
+                self._affected_property_ids.add(pid)
             return True
         except Exception as e:
             logger.warning(f"Skipped record — DB rejected it: {e}")
             return False
+
+    def get_affected_property_ids(self) -> list:
+        """
+        Return the list of property IDs that were added/updated during this
+        loader run. Used by scraper_db_helper to trigger targeted rescoring.
+        """
+        return list(self._affected_property_ids)
 
     def check_duplicate(
         self,

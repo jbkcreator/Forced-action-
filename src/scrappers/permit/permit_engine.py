@@ -274,7 +274,8 @@ async def scrape_permits_with_playwright(
 			await browser.close()
 
 	if not all_rows:
-		raise RuntimeError("Playwright extracted 0 records — portal may be down or selectors changed")
+		logger.info("[Playwright] 0 records found — no permits in this date range")
+		return None
 
 	# Normalize column names
 	COLUMN_ALIASES = {
@@ -664,8 +665,8 @@ if __name__ == "__main__":
 				# Load to DB
 				load_scraped_data_to_db('permits', csv_to_load, destination_dir=RAW_PERMIT_DIR)
 			else:
-				logger.error("No permit CSV file found to load")
-				sys.exit(1)
+				logger.warning("No new permit records to load — nothing new today")
+				sys.exit(0)
 		
 		sys.exit(0)
 		

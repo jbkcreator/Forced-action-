@@ -143,20 +143,187 @@ async def _safe_close_browser(browser: Optional[Browser]):
         except Exception as e:
             logger.debug(f"Non-critical cleanup error (ignored): {e}")
 
+async def _playwright_download_document(
+    doc_type: str,
+    start_date_str: str,
+    end_date_str: str,
+) -> Optional[Path]:
+    """
+    Download all county records for a date range — no DocType filter.
+    The county export ignores DocType filters anyway; filtering is done in Python after download.
+
+    Flow:
+        1. Navigate to the public access URL
+        2. Click the "Document Type" search-type link
+        3. Wait for the search form (no option selected — all types returned)
+        4. Fill date range via JS and submit
+        5. If results exceed 6000 → raise OverflowError (caller handles day-by-day retry)
+        6. Download via Export button
+    """
+    from playwright.async_api import async_playwright
+
+    logger.info(f"[Playwright][{doc_type}] Searching {start_date_str} → {end_date_str}")
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+        )
+        context = await browser.new_context(accept_downloads=True)
+        page = await context.new_page()
+        try:
+            # 1. Navigate
+            await page.goto(HILLSCLERK_PUBLIC_ACCESS_URL, wait_until="domcontentloaded", timeout=30_000)
+
+            # 2. Click "Document Type" search-type link
+            await page.click('div[id="ORI-Document Type"]')
+
+            # 3. Wait for search form — no DocType selection, all types will be returned
+            await page.wait_for_selector('#OBKey__1285_1', state='attached', timeout=15_000)
+
+            # 4. Fill date range via JS (chosen dropdown may be open and intercept pointer events)
+            await page.evaluate(
+                """([startDate, endDate]) => {
+                    const setField = (id, val) => {
+                        const el = document.querySelector(id);
+                        if (!el) return;
+                        el.value = val;
+                        el.dispatchEvent(new Event('input',  {bubbles: true}));
+                        el.dispatchEvent(new Event('change', {bubbles: true}));
+                    };
+                    setField('#OBKey__1634_1', startDate);
+                    setField('#OBKey__1634_2', endDate);
+                }""",
+                [start_date_str, end_date_str],
+            )
+            logger.info(f"[Playwright][{doc_type}] Dates set: {start_date_str} → {end_date_str}")
+
+            # 5. Submit search via JS
+            await page.evaluate("document.querySelector('#sub').click()")
+            logger.info(f"[Playwright][{doc_type}] Search submitted, waiting for results...")
+
+            # 6. Wait for result indicators
+            await page.wait_for_selector(
+                '.jsgrid-pager, .alert-danger, #exportResults',
+                timeout=30_000,
+            )
+
+            # 7. Check for error alerts
+            error_el = await page.query_selector('.alert-danger')
+            if error_el:
+                error_text = (await error_el.inner_text()).strip()
+                if 'exceeded the limit' in error_text:
+                    raise OverflowError(f"[Playwright][{doc_type}] Results exceeded 6000 — needs day-by-day split")
+                if 'No results found' in error_text:
+                    logger.info(f"[Playwright][{doc_type}] No results found")
+                    return None
+
+            # 8. Check export button
+            export_btn = page.locator('#exportResults')
+            if not await export_btn.is_visible():
+                logger.warning(f"[Playwright][{doc_type}] Export button not visible, retrying search...")
+                await page.evaluate("document.querySelector('#sub').click()")
+                await page.wait_for_timeout(5_000)
+                if not await export_btn.is_visible():
+                    raise RuntimeError(f"[Playwright][{doc_type}] Export button not visible after retry")
+
+            # 9. Log result count
+            pager_el = await page.query_selector('.jsgrid-pager')
+            if pager_el:
+                logger.info(f"[Playwright][{doc_type}] {(await pager_el.inner_text()).strip()}")
+
+            # 10. Download
+            logger.info(f"[Playwright][{doc_type}] Downloading...")
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            safe_name = doc_type.lower().replace(" ", "_").replace("/", "_")
+            dest_path = RAW_LIEN_DIR / f"{safe_name}_{ts}.csv"
+            async with page.expect_download(timeout=60_000) as dl_info:
+                await export_btn.click()
+            download = await dl_info.value
+            await download.save_as(str(dest_path))
+            size_kb = dest_path.stat().st_size / 1024
+            logger.info(f"[Playwright][{doc_type}] Saved to {dest_path} ({size_kb:.1f} KB)")
+            return dest_path
+
+        finally:
+            await context.close()
+            await browser.close()
+
+
+async def _playwright_download_combined(lookback_days: int = 3) -> Optional[pd.DataFrame]:
+    """
+    Single combined download: one Playwright session covers the full lookback window.
+    If the result count hits 6000, falls back to day-by-day downloads and merges them.
+    Returns a deduplicated DataFrame of all records, or None if nothing was found.
+    """
+    today = datetime.now()
+    start_date = today - timedelta(days=lookback_days)
+    start_str = start_date.strftime("%m/%d/%Y")
+    end_str   = today.strftime("%m/%d/%Y")
+
+    try:
+        path = await _playwright_download_document("Combined", start_str, end_str)
+        if path is None:
+            return None
+        df = process_lien_data(path)
+        logger.info(f"[Combined] Downloaded {len(df)} records ({start_str} → {end_str})")
+        return df
+
+    except OverflowError:
+        # >6000 results — split into individual days and merge
+        logger.warning(f"[Combined] 6000 limit hit for {lookback_days}-day window — switching to day-by-day")
+        frames = []
+        for offset in range(lookback_days + 1):
+            day = today - timedelta(days=offset)
+            day_str = day.strftime("%m/%d/%Y")
+            logger.info(f"[Combined] Fetching single day: {day_str}")
+            try:
+                path = await _playwright_download_document(f"Combined-{day_str}", day_str, day_str)
+                if path is not None:
+                    frames.append(process_lien_data(path))
+            except OverflowError:
+                logger.error(f"[Combined] Single day {day_str} still >6000 — skipping")
+            except Exception as e:
+                logger.warning(f"[Combined] Day {day_str} failed: {e}")
+
+        if not frames:
+            return None
+        combined = pd.concat(frames, ignore_index=True)
+        combined = combined.drop_duplicates(subset=['Instrument'], keep='first')
+        logger.info(f"[Combined] Day-by-day merge: {len(combined)} unique records")
+        return combined
+
+
 async def download_document_by_type(
     doc_type: str,
     doc_type_code: str,
     lookback_days: int = 1,
     wait_after_download: int = 40,
+    option_value: str = "",
 ) -> Optional[Path]:
     """
-    Automate browser to download specific document type from Hillsborough County Clerk.
-    
-    This function launches a browser agent powered by Claude Sonnet 4.5 to navigate
-    the county clerk's public access system, search for a specific document type within
-    a date range, and download the results.
+    Download a specific document type from Hillsborough County Clerk.
+
+    Tries Playwright first (deterministic, no AI credits). Falls back to the
+    browser-use AI agent if Playwright fails.
     """
-    
+    # ── Playwright (primary) ──────────────────────────────────────────────────
+    if option_value:
+        logger.info(f"\n[{doc_type}] Attempting Playwright scraper (primary)...")
+        try:
+            result = await _playwright_download_document(doc_type, option_value, lookback_days)
+            if result is not None:
+                logger.info(f"[{doc_type}] Playwright scraper succeeded")
+                return result
+            # result is None → no records found (not an error); propagate None
+            return None
+        except Exception as e:
+            logger.warning(f"[{doc_type}] Playwright scraper failed: {e}")
+            logger.info(f"[{doc_type}] Falling back to browser-use AI scraper...")
+
+    # ── AI fallback ───────────────────────────────────────────────────────────
+    logger.info(f"[{doc_type}] Running browser-use AI scraper...")
+
     try:
         RAW_LIEN_DIR.mkdir(parents=True, exist_ok=True)
         
@@ -341,42 +508,55 @@ def process_lien_data(file_path: Path) -> pd.DataFrame:
 
 def categorize_and_split_data(combined_df: pd.DataFrame) -> dict:
     """
-    Applies business logic to categorize and organize documents into 3 files.
+    Route records to liens/deeds/judgments using the actual county DocType column.
+    The county export returns all document types regardless of any search filter,
+    so we filter here in Python using the DocType value from the CSV.
     """
     logger.info("Categorizing documents into liens, deeds, and judgments...")
-    
+
     hoa_keywords = ['ASSOCIATION', 'HOA', 'CONDO', 'COMMUNITY', 'VILLAGE', 'TOWNHOME', 'PROPERTY OWNERS']
     irs_keywords = ['UNITED STATES', 'INTERNAL REVENUE', 'STATE OF FLORIDA', 'DEPARTMENT OF REVENUE']
-    
+
+    # DocType values the county puts in exported CSVs
+    DEED_DOCTYPES     = {'(D) DEED', '(TAXDEED) TAX DEED', '(DPL) DEED PLAT'}
+    JUDGMENT_DOCTYPES = {'(JUD) JUDGMENT', '(CCJ) CERTIFIED COPY OF A COURT JUDGMENT'}
+    LIEN_DOCTYPES     = {'(LN) LIEN', '(LNCORPTX) CORP TAX LIEN FOR STATE OF FLORIDA'}
+
     def categorize_record(row):
-        doc_type = row.get('document_type', '')
-        
-        if doc_type == "Corp Tax Liens":
-            return "TAX LIENS (TL)"
-        
-        if doc_type == "General Liens":
+        doc_type = str(row.get('DocType', '') or '').strip()
+
+        if doc_type in DEED_DOCTYPES:
+            return 'Deeds'
+
+        if doc_type in JUDGMENT_DOCTYPES:
+            return doc_type  # preserve original for downstream logging
+
+        if doc_type in LIEN_DOCTYPES:
             grantor = str(row.get('Grantor', '')).upper()
             grantee = str(row.get('Grantee', '')).upper()
-            
+            if doc_type == '(LNCORPTX) CORP TAX LIEN FOR STATE OF FLORIDA':
+                return 'TAX LIENS (TL)'
             if any(k in grantor or k in grantee for k in hoa_keywords):
-                return "HOA LIENS (HL)"
+                return 'HOA LIENS (HL)'
             if 'CITY OF TAMPA' in grantee or 'CITY OF TAMPA' in grantor:
-                return "TAMPA CODE LIENS (TCL)"
+                return 'TAMPA CODE LIENS (TCL)'
             if 'HILLSBOROUGH COUNTY' in grantee or 'HILLSBOROUGH COUNTY' in grantor:
-                return "COUNTY CODE LIENS (CCL)"
+                return 'COUNTY CODE LIENS (CCL)'
             if any(k in grantor or k in grantee for k in irs_keywords):
-                return "TAX LIENS (TL)"
-            
-            return "MECHANICS LIENS (ML)"
-        
-        return doc_type
-    
+                return 'TAX LIENS (TL)'
+            return 'MECHANICS LIENS (ML)'
+
+        return 'SKIP'  # everything else (mortgages, court papers, orders…) discarded
+
     combined_df['document_type'] = combined_df.apply(categorize_record, axis=1)
-    
-    lien_types = ["HOA LIENS (HL)", "TAMPA CODE LIENS (TCL)", "COUNTY CODE LIENS (CCL)", 
-                  "TAX LIENS (TL)", "MECHANICS LIENS (ML)"]
-    deed_types = ["Deeds", "Tax Deeds"]
-    judgment_types = ["Judgments", "Certified Judgments"]
+
+    lien_types     = ['HOA LIENS (HL)', 'TAMPA CODE LIENS (TCL)', 'COUNTY CODE LIENS (CCL)',
+                      'TAX LIENS (TL)', 'MECHANICS LIENS (ML)']
+    deed_types     = ['Deeds']
+    judgment_types = ['(JUD) JUDGMENT', '(CCJ) CERTIFIED COPY OF A COURT JUDGMENT']
+
+    skipped = (combined_df['document_type'] == 'SKIP').sum()
+    logger.info(f"Categorization: {len(combined_df) - skipped} kept, {skipped} discarded (non-relevant DocTypes)")
     
     PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
     temp_dir = PROCESSED_DATA_DIR / "temp"
@@ -537,25 +717,63 @@ async def run_lien_pipeline(lookback_days: int = 1, run_all: bool = False, mode:
     logger.info("HILLSBOROUGH COUNTY LIEN & JUDGMENT RECORDS - DATA COLLECTION")
     logger.info("=" * 60)
     
+    # County export ignores the DocType filter — every download returns all record types.
+    # Map doc_code → the DocType value(s) that appear in the exported CSV's DocType column.
+    # After download, rows not matching are dropped before any further processing.
+    DOC_TYPE_FILTER = {
+        "D":    ["(D) DEED"],
+        "JUD":  ["(JUD) JUDGMENT"],
+        "CCJ":  ["(CCJ) CERTIFIED COPY OF A COURT JUDGMENT"],
+        "LIEN": ["(LN) LIEN"],
+    }
+
+    # (name, code, option_value)  — option_value is the exact HTML <option> value for Playwright
     MODE_CONFIGS = {
-        'liens':     [("General Liens", "LIEN")],
-        'deeds':     [("Deeds", "D")],
-        'judgments': [("Judgments", "JUD"), ("Certified Judgments", "CCJ")],
-        'all':       [("General Liens", "LIEN"), ("Judgments", "JUD"),
-                      ("Certified Judgments", "CCJ"), ("Deeds", "D")],
+        'liens':     [("General Liens",       "LIEN",     "(LN) LIEN")],
+        'deeds':     [("Deeds",               "D",        "(D) DEED")],
+        'judgments': [("Judgments",           "JUD",      "(JUD) JUDGMENT"),
+                      ("Certified Judgments", "CCJ",      "(CCJ) CERTIFIED COPY OF A COURT JUDGMENT")],
+        'all':       [("General Liens",       "LIEN",     "(LN) LIEN"),
+                      ("Judgments",           "JUD",      "(JUD) JUDGMENT"),
+                      ("Certified Judgments", "CCJ",      "(CCJ) CERTIFIED COPY OF A COURT JUDGMENT"),
+                      ("Deeds",               "D",        "(D) DEED")],
     }
     doc_configs = MODE_CONFIGS.get(mode, MODE_CONFIGS['all'])
     logger.info(f"Mode: {mode.upper()} - running {len(doc_configs)} document type(s): "
-                f"{', '.join(n for n, _ in doc_configs)}")
+                f"{', '.join(n for n, _, __ in doc_configs)}")
 
     try:
+        if mode == 'combined':
+            logger.info("Execution mode: COMBINED — single Playwright download, Python-side DocType routing")
+            combined_df = await _playwright_download_combined(lookback_days)
+            if combined_df is None:
+                logger.error("Combined download returned no data — check county site or date range")
+                return
+            category_counts = categorize_and_split_data(combined_df)
+            logger.info("Cleaning up raw download directory...")
+            for raw_file in RAW_LIEN_DIR.glob("*"):
+                if raw_file.is_file():
+                    try:
+                        raw_file.unlink()
+                        logger.debug(f"Deleted raw file: {raw_file.name}")
+                    except Exception as e:
+                        logger.warning(f"Could not delete raw file {raw_file.name}: {e}")
+            logger.info("=" * 60)
+            logger.info("COMBINED LIEN/DEED/JUDGMENT PIPELINE COMPLETE")
+            logger.info("=" * 60)
+            logger.info(f"Total records downloaded: {len(combined_df)}")
+            logger.info("Breakdown by category:")
+            for category, count in category_counts.items():
+                logger.info(f"  - {category}: {count} records")
+            return
+
         if run_all:
             logger.info(f"Execution mode: PARALLEL ({len(doc_configs)} document types concurrently)")
             logger.warning("Parallel mode uses multiple API credits")
 
             tasks = [
-                download_document_by_type(doc_name, doc_code, lookback_days)
-                for doc_name, doc_code in doc_configs
+                download_document_by_type(doc_name, doc_code, lookback_days, option_value=opt_val)
+                for doc_name, doc_code, opt_val in doc_configs
             ]
 
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -577,6 +795,13 @@ async def run_lien_pipeline(lookback_days: int = 1, run_all: bool = False, mode:
                 logger.info(f"Processing {doc_name} data...")
                 try:
                     df = process_lien_data(result)
+                    # County export ignores the DocType filter — drop rows that don't match
+                    doc_code = doc_configs[idx][1]
+                    allowed = DOC_TYPE_FILTER.get(doc_code)
+                    if allowed and 'DocType' in df.columns:
+                        before = len(df)
+                        df = df[df['DocType'].isin(allowed)]
+                        logger.info(f"{doc_name} DocType filter: {before} → {len(df)} records (kept {allowed})")
                     df["document_type"] = doc_name
                     all_dataframes.append(df)
                     successful_downloads += 1
@@ -617,12 +842,12 @@ async def run_lien_pipeline(lookback_days: int = 1, run_all: bool = False, mode:
             all_dataframes = []
             successful_downloads = 0
 
-            for idx, (doc_name, doc_code) in enumerate(doc_configs, start=1):
+            for idx, (doc_name, doc_code, opt_val) in enumerate(doc_configs, start=1):
                 logger.info("=" * 60)
                 logger.info(f"[{idx}/{len(doc_configs)}] Starting document type: {doc_name}")
                 logger.info("=" * 60)
-                
-                result = await download_document_by_type(doc_name, doc_code, lookback_days)
+
+                result = await download_document_by_type(doc_name, doc_code, lookback_days, option_value=opt_val)
                 
                 if result is None:
                     logger.warning(f"{doc_name} download failed, continuing to next document type")
@@ -631,6 +856,12 @@ async def run_lien_pipeline(lookback_days: int = 1, run_all: bool = False, mode:
                 logger.info(f"Processing {doc_name} data...")
                 try:
                     df = process_lien_data(result)
+                    # County export ignores the DocType filter — drop rows that don't match
+                    allowed = DOC_TYPE_FILTER.get(doc_code)
+                    if allowed and 'DocType' in df.columns:
+                        before = len(df)
+                        df = df[df['DocType'].isin(allowed)]
+                        logger.info(f"{doc_name} DocType filter: {before} → {len(df)} records (kept {allowed})")
                     df["document_type"] = doc_name
                     all_dataframes.append(df)
                     successful_downloads += 1
@@ -683,9 +914,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--mode",
-        choices=["liens", "deeds", "judgments", "all"],
-        default="all",
-        help="Which document types to scrape: liens, deeds, judgments, or all (default: all)"
+        choices=["liens", "deeds", "judgments", "all", "combined"],
+        default="combined",
+        help="Which document types to scrape: liens, deeds, judgments, all, or combined (default: combined — single download, Python-side routing)"
     )
     parser.add_argument(
         "--all",
@@ -702,12 +933,14 @@ if __name__ == "__main__":
         'deeds':     (PROCESSED_DEEDS_DIR,     'deeds'),
         'judgments': (PROCESSED_JUDGMENTS_DIR, 'judgments'),
     }
+    # Modes that populate all three output directories
+    MULTI_OUTPUT_MODES = {'all', 'combined'}
 
     try:
         asyncio.run(run_lien_pipeline(lookback_days=args.lookback, run_all=args.all, mode=args.mode))
 
         if args.load_to_db:
-            load_modes = list(MODE_DIR_MAP.keys()) if args.mode == 'all' else [args.mode]
+            load_modes = list(MODE_DIR_MAP.keys()) if args.mode in MULTI_OUTPUT_MODES else [args.mode]
             any_loaded = False
             for load_mode in load_modes:
                 type_dir, data_type = MODE_DIR_MAP[load_mode]
@@ -721,8 +954,8 @@ if __name__ == "__main__":
                 else:
                     logger.warning(f"No {load_mode} CSV found in {new_dir}, skipping")
             if not any_loaded:
-                logger.error("No CSV files found to load for any requested type")
-                sys.exit(1)
+                logger.warning("No new records to load for any requested type - nothing new today")
+                sys.exit(0)
 
         sys.exit(0)
 

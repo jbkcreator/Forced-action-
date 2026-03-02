@@ -80,18 +80,18 @@ def load_scraped_data_to_db(
         with get_db_context() as session:
             loader_class = LOADER_MAP[data_type]
             loader = loader_class(session)
-            
+
             loader_kwargs = {'skip_duplicates': skip_duplicates}
             if sample_mode:
                 loader_kwargs['sample_mode'] = True
                 logger.info("🧪 SAMPLE MODE enabled")
-            
+
             matched, unmatched, skipped = loader.load_from_csv(
                 str(csv_path),
                 **loader_kwargs
             )
             session.commit()
-            
+
             # Print summary
             logger.info(f"\n{'='*60}")
             logger.info(f"DATABASE LOAD SUMMARY - {data_type.upper()}")
@@ -99,14 +99,14 @@ def load_scraped_data_to_db(
             logger.info(f"  Matched:   {matched:>6}")
             logger.info(f"  Unmatched: {unmatched:>6}")
             logger.info(f"  Skipped:   {skipped:>6}")
-            
+
             total = matched + unmatched + skipped
             match_rate = (matched / total * 100) if total > 0 else 0
             logger.info(f"  Match Rate: {match_rate:>5.1f}%")
             logger.info(f"{'='*60}\n")
-            
+
             logger.info("✓ Database load completed!")
-            
+
             # Rotate CSV archives after successful DB insertion
             if destination_dir:
                 logger.info("\nRotating CSV archives...")
@@ -116,7 +116,24 @@ def load_scraped_data_to_db(
                     logger.warning("⚠ CSV archive rotation failed (non-critical)")
             else:
                 logger.debug("Skipping CSV rotation (destination_dir not provided)")
-            
+
+            # Ingestion-time rescoring: rescore only the properties touched by
+            # this scraper run so scores are always up-to-date in real time.
+            affected_ids = loader.get_affected_property_ids()
+            if affected_ids:
+                logger.info(f"Triggering CDS rescore for {len(affected_ids)} affected properties...")
+                try:
+                    from src.services.cds_engine import MultiVerticalScorer
+                    with get_db_context() as score_session:
+                        scorer = MultiVerticalScorer(score_session)
+                        scorer.score_properties_by_ids(affected_ids, save_to_db=True)
+                        score_session.commit()
+                    logger.info("✓ CDS rescore completed")
+                except Exception as score_err:
+                    logger.warning(f"⚠ CDS rescore failed (non-critical): {score_err}")
+            else:
+                logger.debug("No matched properties to rescore")
+
             return matched, unmatched, skipped
             
     except Exception as e:

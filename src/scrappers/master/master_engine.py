@@ -9,7 +9,7 @@ import traceback
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import List, Dict, Set
+from typing import List, Dict, Set, Optional
 
 import pandas as pd
 from dbfread import DBF
@@ -159,8 +159,61 @@ def _dbf_chunk_reader(file_path: Path, chunk_size: int):
 	logger.info(f"Completed processing {total_rows:,} rows from DBF file")
 
 
-async def download_parcel_master():
-	"""Download the PARCEL_SPREADSHEET.xls file using browser automation."""
+async def _playwright_download_parcel_master() -> Optional[Path]:
+	"""
+	Primary Playwright scraper — deterministic, no AI credits consumed.
+
+	Finds the PARCEL_SPREADSHEET.xls link by text, clicks it (triggers __doPostBack),
+	and captures the download stream. save_as() blocks until the full 536 MB file
+	is written to disk.
+	"""
+	from playwright.async_api import async_playwright
+
+	save_dir = Path("data/reference")
+	save_dir.mkdir(parents=True, exist_ok=True)
+	dest_file = save_dir / "PARCEL_SPREADSHEET.xls"
+
+	logger.info("[Playwright] Navigating to https://downloads.hcpafl.org/")
+
+	async with async_playwright() as pw:
+		browser = await pw.chromium.launch(
+			headless=True,
+			args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+		)
+		context = await browser.new_context(accept_downloads=True)
+		page = await context.new_page()
+		try:
+			await page.goto("https://downloads.hcpafl.org/", wait_until="domcontentloaded", timeout=30_000)
+
+			# Find link by text — row selector: tr.rgRow a containing "PARCEL_SPREADSHEET.xls"
+			link = page.locator('tr.rgRow a', has_text="PARCEL_SPREADSHEET.xls")
+			await link.wait_for(timeout=15_000)
+			logger.info("[Playwright] Found PARCEL_SPREADSHEET.xls link — starting download...")
+
+			# expect_download waits for the download to START (60s timeout is enough)
+			# save_as() then blocks until the full 536 MB file is written
+			async with page.expect_download(timeout=60_000) as dl_info:
+				await link.click()
+			download = await dl_info.value
+
+			logger.info("[Playwright] Download stream captured — writing 536 MB file (this will take several minutes)...")
+			await download.save_as(str(dest_file))
+
+			size_mb = dest_file.stat().st_size / (1024 ** 2)
+			logger.info(f"[Playwright] Saved {size_mb:.1f} MB → {dest_file}")
+
+			if size_mb < 100:
+				raise RuntimeError(f"[Playwright] File too small ({size_mb:.1f} MB) — download likely incomplete")
+
+			return dest_file
+
+		finally:
+			await context.close()
+			await browser.close()
+
+
+async def _ai_download_parcel_master() -> Optional[Path]:
+	"""AI browser-use fallback for downloading PARCEL_SPREADSHEET.xls."""
 	save_dir = os.path.abspath("data/reference/")
 	os.makedirs(save_dir, exist_ok=True)
 
@@ -172,9 +225,8 @@ async def download_parcel_master():
 		"Do NOT click again, do NOT try to verify in downloads tab - just wait 60 seconds after clicking and then finish."
 	)
 
-	print("[*] Launching browser agent to download PARCEL_SPREADSHEET.xls...")
+	logger.info("[AI] Launching browser agent to download PARCEL_SPREADSHEET.xls...")
 
-	# Configure browser for headless server environment
 	browser = Browser(
 		headless=True,
 		disable_security=True,
@@ -190,88 +242,90 @@ async def download_parcel_master():
 		]
 	)
 
-	agent = Agent(
-		task=task,
-		llm=llm,
-		browser=browser,
-	)
-
+	agent = Agent(task=task, llm=llm, browser=browser)
 	history = await agent.run()
-	
+
 	if not history.is_done():
-		print("[!] Agent was unable to complete the task. Check logs.")
-		return False
-	
-	print("[+] Download initiated. Checking for completed file...")
-	
-	# Agent already waited 60 seconds, just give a small buffer
+		logger.error("[AI] Agent was unable to complete the task")
+		return None
+
+	logger.info("[AI] Download initiated. Checking for completed file...")
 	await asyncio.sleep(5)
-	
-	# Search for the downloaded file in browser-use temp directories
+
 	downloaded_file = None
 	from config.constants import TEMP_DOWNLOADS_DIR
 	temp_base = TEMP_DOWNLOADS_DIR
-	
+
 	if temp_base.exists():
 		for download_dir in temp_base.glob("browser-use-downloads-*"):
-			# Look for completed XLS file (not .crdownload)
 			for xls_file in download_dir.glob("*[Pp][Aa][Rr][Cc][Ee][Ll]*.[Xx][Ll][Ss]"):
 				if not xls_file.name.endswith('.crdownload'):
 					downloaded_file = xls_file
-					print(f"[*] Found file: {xls_file}")
+					logger.info(f"[AI] Found file: {xls_file}")
 					break
 			if downloaded_file:
 				break
-	
+
 	if not downloaded_file or not downloaded_file.exists():
-		print(f"[!] Could not locate completed download file")
-		return False
-	
-	print(f"[*] Verifying file size...")
-	
-	# Quick check - file should be ~536 MB
-	final_size_mb = downloaded_file.stat().st_size / (1024**2)
-	
+		logger.error("[AI] Could not locate completed download file")
+		return None
+
+	final_size_mb = downloaded_file.stat().st_size / (1024 ** 2)
+
 	if final_size_mb < 100:
-		print(f"[!] WARNING: File size ({final_size_mb:.1f} MB) seems incomplete.")
-		print(f"[*] Waiting 30 more seconds for download to finish...")
-		
-		# Wait and monitor for completion
+		logger.warning(f"[AI] File size ({final_size_mb:.1f} MB) seems incomplete — waiting up to 30s more...")
 		start_time = time.time()
 		while time.time() - start_time < 30:
 			try:
-				current_size_mb = downloaded_file.stat().st_size / (1024**2)
+				current_size_mb = downloaded_file.stat().st_size / (1024 ** 2)
 				if current_size_mb >= 500:
-					print(f"[+] Download complete: {current_size_mb:.1f} MB")
+					logger.info(f"[AI] Download complete: {current_size_mb:.1f} MB")
 					final_size_mb = current_size_mb
 					break
-				print(f"[*] Progress: {current_size_mb:.1f} MB")
+				logger.info(f"[AI] Progress: {current_size_mb:.1f} MB")
 				time.sleep(3)
 			except Exception as e:
-				print(f"[!] Error: {e}")
+				logger.warning(f"[AI] Size check error: {e}")
 				time.sleep(3)
-		
-		final_size_mb = downloaded_file.stat().st_size / (1024**2)
+
+		final_size_mb = downloaded_file.stat().st_size / (1024 ** 2)
 		if final_size_mb < 100:
-			print(f"[!] ERROR: Download incomplete at {final_size_mb:.1f} MB")
-			return False
-	
-	# Move to final destination
+			logger.error(f"[AI] Download incomplete at {final_size_mb:.1f} MB")
+			return None
+
 	dest_file = Path(save_dir) / "PARCEL_SPREADSHEET.xls"
-	print(f"[*] Moving file to {dest_file}")
+	logger.info(f"[AI] Moving file to {dest_file}")
 	shutil.move(str(downloaded_file), str(dest_file))
-	
-	# Clean up temp directory
+
 	try:
 		temp_dir = downloaded_file.parent
 		if temp_dir.exists() and temp_dir.name.startswith("browser-use-downloads-"):
 			shutil.rmtree(str(temp_dir))
-			print(f"[*] Cleaned up temp directory: {temp_dir}")
 	except Exception as e:
-		print(f"[!] Warning: Could not clean up temp dir: {e}")
-	
-	print(f"[+] Success! File saved to {dest_file} ({final_size_mb:.1f} MB)")
+		logger.warning(f"[AI] Could not clean up temp dir: {e}")
+
+	logger.info(f"[AI] Success! Saved to {dest_file} ({final_size_mb:.1f} MB)")
 	return dest_file
+
+
+async def download_parcel_master() -> Optional[Path]:
+	"""
+	Download PARCEL_SPREADSHEET.xls from https://downloads.hcpafl.org/
+
+	Tries Playwright first (deterministic). Falls back to browser-use AI agent
+	if Playwright fails.
+	"""
+	logger.info("\nAttempting Playwright download (primary method)...")
+	try:
+		result = await _playwright_download_parcel_master()
+		if result:
+			logger.info("Playwright download succeeded")
+			return result
+	except Exception as e:
+		logger.warning(f"Playwright download failed: {e}")
+		logger.info("Falling back to browser-use AI downloader...")
+
+	return await _ai_download_parcel_master()
 
 
 def convert_xls_to_csv(xls_path: Path, output_dir: Path) -> Path:

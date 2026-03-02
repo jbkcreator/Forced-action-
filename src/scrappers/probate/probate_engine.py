@@ -265,6 +265,10 @@ def save_processed_probate(df: pd.DataFrame, output_filename: str = "probate_lea
 		logger.info("DB DEDUPLICATION: Checking for existing probate cases")
 		logger.info("=" * 60)
 		
+		# Normalize column name: CSV uses 'CaseNumber' but deduplicator expects 'Case Number'
+		if 'CaseNumber' in df.columns and 'Case Number' not in df.columns:
+			df = df.rename(columns={'CaseNumber': 'Case Number'})
+
 		initial_count = len(df)
 		df_new = filter_new_records(df, 'probate', record_type='Probate')
 		
@@ -361,8 +365,8 @@ if __name__ == "__main__":
 				load_scraped_data_to_db('probate', csv_to_load, destination_dir=RAW_PROBATE_DIR)
 				
 			else:
-				logger.error("No probate CSV file found to load")
-				sys.exit(1)
+				logger.warning("No new probate records to load - nothing new today")
+				sys.exit(0)
 		
 		sys.exit(0)
 		

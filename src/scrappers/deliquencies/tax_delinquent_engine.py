@@ -154,40 +154,105 @@ def _get_existing_tax_records(tax_year: int) -> set:
 		return set()
 
 
-async def download_tax_delinquent_report(
+async def _playwright_download_tax_delinquent(
+	tax_year: int = DEFAULT_TAX_YEAR,
+) -> bool:
+	"""
+	Primary Playwright scraper for tax delinquent bulk report download.
+	Deterministic, no AI credits consumed.
+
+	Flow:
+		1. Navigate to the county tax reports portal
+		2. Search for "Public - Delinquent Report" in the shared-report filter
+		3. Select the matching report from the dropdown
+		4. Enter the current tax year
+		5. Click Search and wait for results
+		6. Click the CSV download button
+	"""
+	from playwright.async_api import async_playwright
+
+	TAX_REPORT_URL = "https://county-taxes.net/hillsborough/reports/real-estate"
+	REFERENCE_DATA_DIR.mkdir(parents=True, exist_ok=True)
+	dest_path = REFERENCE_DATA_DIR / f"hillsborough_tax_delinquent_{tax_year}.csv"
+
+	logger.info(f"[Playwright][RADAR] Downloading tax delinquent report for {tax_year}")
+
+	async with async_playwright() as pw:
+		browser = await pw.chromium.launch(
+			headless=True,
+			args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+		)
+		context = await browser.new_context(accept_downloads=True)
+		page = await context.new_page()
+		try:
+			# 1. Navigate — wait for networkidle so all JS initializes
+			await page.goto(TAX_REPORT_URL, wait_until="domcontentloaded", timeout=30_000)
+			await page.wait_for_load_state('networkidle', timeout=20_000)
+
+			# 2. Type report name into the shared-report search filter
+			await page.wait_for_selector('#selected-report-filter', state='attached', timeout=15_000)
+			await page.click('#selected-report-filter')
+			await page.type('#selected-report-filter', 'Public - Delinquent Report', delay=50)
+			logger.info("[Playwright][RADAR] Typed report search: 'Public - Delinquent Report'")
+
+			# 3. Wait for dropdown menu and click the matching item
+			menu = page.locator('#selected-report-filter-menu')
+			await menu.wait_for(state='visible', timeout=10_000)
+			item = menu.locator('li, a, div').filter(has_text='Public - Delinquent Report').first
+			await item.wait_for(state='visible', timeout=8_000)
+			await item.click()
+			logger.info("[Playwright][RADAR] Selected 'Public - Delinquent Report'")
+
+			# 4. Fill tax year field
+			await page.wait_for_selector('#tax_year', timeout=10_000)
+			await page.click('#tax_year', click_count=3)
+			await page.type('#tax_year', str(tax_year))
+			logger.info(f"[Playwright][RADAR] Set tax year: {tax_year}")
+
+			# 5. Click Search
+			await page.click('#run-search')
+			logger.info("[Playwright][RADAR] Search submitted, waiting for results...")
+
+			# 6. Wait for results — networkidle covers the AJAX result load
+			await page.wait_for_load_state('networkidle', timeout=60_000)
+			logger.info("[Playwright][RADAR] Results loaded")
+
+			# 7. Click CSV download button and capture file
+			async with page.expect_download(timeout=120_000) as dl_info:
+				await page.evaluate('download_options("csv")')
+			download = await dl_info.value
+
+			if dest_path.exists():
+				dest_path.unlink()
+			await download.save_as(str(dest_path))
+
+			size_mb = dest_path.stat().st_size / (1024 ** 2)
+			logger.info(f"[Playwright][RADAR] Saved {dest_path.name} ({size_mb:.1f} MB)")
+			return True
+
+		except Exception as e:
+			logger.warning(f"[Playwright][RADAR] Playwright download failed: {e}")
+			raise
+		finally:
+			await context.close()
+			await browser.close()
+
+
+async def _ai_download_tax_delinquent(
 	tax_year: int = DEFAULT_TAX_YEAR,
 	account_status: str = DEFAULT_ACCOUNT_STATUS,
 	wait_after_download: int = 30,
 ) -> bool:
 	"""
-	RADAR PHASE: Download bulk tax delinquent report using browser automation.
-	
-	This function launches a browser agent to navigate the county tax reports portal,
-	apply filters for delinquent accounts, and download the complete dataset.
-	
-	Args:
-		tax_year: Tax year to query (default: 2026)
-		account_status: Account status filter (default: "Unpaid")
-		wait_after_download: Seconds to wait for download to complete (default: 30)
-		
-	Returns:
-		bool: True if download succeeded, False otherwise
-		
-	Example:
-		>>> success = await download_tax_delinquent_report(tax_year=2026, account_status="Unpaid")
-		>>> if success:
-		...     print("Download complete")
+	AI browser-use fallback for tax delinquent report download.
 	"""
-	
 	try:
 		REFERENCE_DATA_DIR.mkdir(parents=True, exist_ok=True)
-		logger.debug(f"Ensured download directory exists: {REFERENCE_DATA_DIR}")
-		
+
 		save_dir = os.path.abspath(str(REFERENCE_DATA_DIR))
 		dest_stub = f"hillsborough_tax_delinquent_{tax_year}"
 		start_time = time.time()
-		
-		# Load task prompt from YAML configuration
+
 		try:
 			task = get_prompt(
 				"tax_delinquent_prompts.yaml",
@@ -196,13 +261,12 @@ async def download_tax_delinquent_report(
 				tax_year=tax_year
 			)
 		except Exception as e:
-			logger.error(f"Failed to load prompt from YAML: {e}")
+			logger.error(f"[AI][RADAR] Failed to load prompt from YAML: {e}")
 			raise
-		
-		logger.info(f"[RADAR] Launching browser agent to download tax delinquent report")
-		logger.info(f"[RADAR] Tax year: {tax_year}, Status: {account_status}")
-		
-		# Configure browser for headless server environment
+
+		logger.info(f"[AI][RADAR] Launching browser agent to download tax delinquent report")
+		logger.info(f"[AI][RADAR] Tax year: {tax_year}, Status: {account_status}")
+
 		browser = Browser(
 			headless=True,
 			disable_security=True,
@@ -217,64 +281,88 @@ async def download_tax_delinquent_report(
 				'--disable-blink-features=AutomationControlled',
 			]
 		)
-		
-		agent = Agent(
-			task=task,
-			llm=llm,
-			browser=browser,
-		)
-		
+
+		agent = Agent(task=task, llm=llm, browser=browser)
+
 		try:
 			history = await agent.run()
-			
 			if not history.is_done():
-				logger.warning("[RADAR] Agent could not finish the workflow within step limit")
+				logger.warning("[AI][RADAR] Agent could not finish within step limit")
 				return False
-			
-			logger.info("[RADAR] Agent workflow completed. Waiting for download to finalize...")
+			logger.info("[AI][RADAR] Agent completed. Waiting for download to finalize...")
 			await asyncio.sleep(wait_after_download)
-			
 		except Exception as e:
-			logger.error(f"[RADAR] Browser agent execution failed: {e}")
+			logger.error(f"[AI][RADAR] Browser agent execution failed: {e}")
 			logger.debug(traceback.format_exc())
 			return False
-		
-		# Locate the downloaded file
+
 		downloaded_file = _locate_download(start_time)
-		
 		if not downloaded_file or not downloaded_file.exists():
-			logger.error("[RADAR] Could not detect the downloaded report")
+			logger.error("[AI][RADAR] Could not detect the downloaded report")
 			return False
-		
-		# Rename and move file to final location
+
 		final_ext = downloaded_file.suffix.lower() or ".csv"
 		dest_file = RAW_TAX_DELINQUENCIES_DIR / f"{dest_stub}{final_ext}"
-		
 		if dest_file.exists():
-			logger.debug(f"Removing existing file: {dest_file}")
 			dest_file.unlink()
-		
-		logger.info(f"[RADAR] Moving downloaded file: {downloaded_file} -> {dest_file}")
+
+		logger.info(f"[AI][RADAR] Moving {downloaded_file} → {dest_file}")
 		shutil.move(str(downloaded_file), str(dest_file))
-		
+
 		file_size_mb = dest_file.stat().st_size / (1024 ** 2)
-		logger.info(f"[RADAR] Tax delinquent report saved to {dest_file} ({file_size_mb:.1f} MB)")
-		
-		# Clean up temp directory
+		logger.info(f"[AI][RADAR] Report saved to {dest_file} ({file_size_mb:.1f} MB)")
+
 		temp_dir = downloaded_file.parent
 		if temp_dir.exists() and temp_dir.name.startswith("browser-use-downloads-"):
 			try:
 				shutil.rmtree(temp_dir)
-				logger.debug(f"[RADAR] Cleaned up temp directory: {temp_dir}")
 			except Exception as exc:
-				logger.warning(f"[RADAR] Could not clean temp directory {temp_dir}: {exc}")
-		
+				logger.warning(f"[AI][RADAR] Could not clean temp dir {temp_dir}: {exc}")
+
 		return True
-		
+
 	except Exception as e:
-		logger.error(f"[RADAR] Error during tax delinquent report download: {e}")
+		logger.error(f"[AI][RADAR] Error during download: {e}")
 		logger.debug(traceback.format_exc())
 		return False
+
+
+async def download_tax_delinquent_report(
+	tax_year: int = DEFAULT_TAX_YEAR,
+	account_status: str = DEFAULT_ACCOUNT_STATUS,
+	wait_after_download: int = 30,
+) -> bool:
+	"""
+	RADAR PHASE: Download bulk tax delinquent report.
+
+	Tries Playwright first (deterministic, no AI credits). Falls back to the
+	browser-use AI agent if Playwright fails.
+
+	Args:
+		tax_year: Tax year to query (default: 2026)
+		account_status: Account status filter (default: "Unpaid")
+		wait_after_download: Seconds to wait after AI agent finishes (AI path only)
+
+	Returns:
+		bool: True if download succeeded, False otherwise
+	"""
+	# ── Playwright (primary) ──────────────────────────────────────────────────
+	logger.info("[RADAR] Attempting Playwright download (primary)...")
+	try:
+		success = await _playwright_download_tax_delinquent(tax_year=tax_year)
+		if success:
+			logger.info("[RADAR] Playwright download succeeded")
+			return True
+	except Exception as e:
+		logger.warning(f"[RADAR] Playwright download failed: {e}")
+		logger.info("[RADAR] Falling back to browser-use AI downloader...")
+
+	# ── AI fallback ───────────────────────────────────────────────────────────
+	return await _ai_download_tax_delinquent(
+		tax_year=tax_year,
+		account_status=account_status,
+		wait_after_download=wait_after_download,
+	)
 
 
 def _filter_distressed_accounts(df: pd.DataFrame, min_years: int = MIN_YEARS_DELINQUENT) -> pd.DataFrame:

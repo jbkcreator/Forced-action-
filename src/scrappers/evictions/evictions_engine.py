@@ -42,6 +42,7 @@ from src.core.database import get_db_context
 from src.loaders.legal_proceedings import EvictionLoader
 from src.utils.logger import setup_logging, get_logger
 from src.utils.csv_deduplicator import deduplicate_csv, get_unique_keys_for_type
+from src.utils.db_deduplicator import filter_new_records
 
 # Initialize logging
 setup_logging()
