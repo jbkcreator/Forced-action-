@@ -52,6 +52,10 @@ class ProbateLoader(BaseLoader):
         Returns:
             Tuple of (matched, unmatched, skipped)
         """
+        # Normalize column names: some CSVs use "Case Number" instead of "CaseNumber"
+        if 'Case Number' in df.columns and 'CaseNumber' not in df.columns:
+            df = df.rename(columns={'Case Number': 'CaseNumber'})
+
         # Apply sampling if requested
         if sample_mode:
             original_count = len(df)
@@ -93,21 +97,38 @@ class ProbateLoader(BaseLoader):
                     property_record, score = match_result
                     logger.info(f"Matched probate by address (score: {score}%): {case_number}")
 
-            # Fallback to owner name
+            # Fallback to owner name — try multiple permutations
             if not property_record:
                 last_name = _none_if_nan(decedent_row.get('LastName/CompanyName'))
                 if last_name:
-                    full_name = " ".join(
-                        [str(_none_if_nan(decedent_row.get('FirstName')) or "").strip(),
-                         str(_none_if_nan(decedent_row.get('MiddleName')) or "").strip(),
-                         str(last_name).strip()]
-                    ).strip()
+                    first = str(_none_if_nan(decedent_row.get('FirstName')) or "").strip()
+                    middle = str(_none_if_nan(decedent_row.get('MiddleName')) or "").strip()
+                    last = str(last_name).strip()
+
+                    full_name = " ".join([first, middle, last]).strip()
                     full_name = " ".join(full_name.split())
+
+                    # Build variants: full → first+last → last only → hyphen parts
+                    name_variants: list = []
                     if full_name:
-                        match_result = self.find_property_by_owner_name(full_name)
+                        name_variants.append(full_name)
+                    if first and last:
+                        first_last = f"{first} {last}"
+                        if first_last != full_name:
+                            name_variants.append(first_last)
+                    if len(last) > 4:
+                        name_variants.append(last)
+                    if '-' in last:
+                        for part in last.split('-'):
+                            if len(part) > 4 and first:
+                                name_variants.append(f"{first} {part}")
+
+                    for variant in name_variants:
+                        match_result = self.find_property_by_owner_name(variant)
                         if match_result:
                             property_record, score = match_result
-                            logger.info(f"Matched probate by name (score: {score}%): {case_number}")
+                            logger.info(f"Matched probate by name '{variant}' (score: {score}%): {case_number}")
+                            break
 
             if property_record:
                 try:
@@ -317,15 +338,47 @@ class BankruptcyLoader(BaseLoader):
                 skipped += 1
                 continue
 
-            # Match by owner name (only option available)
+            # Match by owner name (only option available — no address in CourtListener API)
+            # Try multiple name permutations to handle:
+            #   - Middle names/initials adding noise ("Nicole Mary-Nell Montgomery")
+            #   - Hyphenated compound last names ("Reina-Perez")
+            #   - Property appraiser LAST FIRST vs filing FIRST LAST
             property_record = None
             lead_name_val = _none_if_nan(row.get('Lead Name'))
 
             if lead_name_val:
-                match_result = self.find_property_by_owner_name(str(lead_name_val))
-                if match_result:
-                    property_record, score = match_result
-                    logger.info(f"Matched bankruptcy by name (score: {score}%): {docket_number}")
+                name_str = str(lead_name_val).strip()
+                name_parts = name_str.split()
+
+                # Build a set of name variants to try (deduplicated, order matters)
+                name_variants: list = [name_str]
+
+                if len(name_parts) >= 2:
+                    # First + Last only (strips middle name/initial noise)
+                    first_last = f"{name_parts[0]} {name_parts[-1]}"
+                    if first_last != name_str:
+                        name_variants.append(first_last)
+
+                    # Last name alone (catches compound/hyphenated last names that
+                    # the property appraiser may store without the first name prefix)
+                    last_only = name_parts[-1]
+                    if len(last_only) > 4:   # skip short last names — too many false positives
+                        name_variants.append(last_only)
+
+                    # Handle hyphenated last names: try each component separately
+                    if '-' in name_parts[-1]:
+                        for part in name_parts[-1].split('-'):
+                            if len(part) > 4:
+                                name_variants.append(f"{name_parts[0]} {part}")
+
+                for variant in name_variants:
+                    match_result = self.find_property_by_owner_name(variant)
+                    if match_result:
+                        property_record, score = match_result
+                        logger.info(
+                            f"Matched bankruptcy by name '{variant}' (score: {score}%): {docket_number}"
+                        )
+                        break
 
             if property_record:
                 try:

@@ -21,7 +21,7 @@ from src.loaders import (
     BankruptcyLoader,
     TaxDelinquencyLoader,
 )
-from src.utils.csv_deduplicator import rotate_csv_archives
+from datetime import date as date_type
 
 logger = logging.getLogger(__name__)
 
@@ -107,15 +107,12 @@ def load_scraped_data_to_db(
 
             logger.info("✓ Database load completed!")
 
-            # Rotate CSV archives after successful DB insertion
-            if destination_dir:
-                logger.info("\nRotating CSV archives...")
-                if rotate_csv_archives(destination_dir):
-                    logger.info("✓ CSV archives rotated successfully")
-                else:
-                    logger.warning("⚠ CSV archive rotation failed (non-critical)")
-            else:
-                logger.debug("Skipping CSV rotation (destination_dir not provided)")
+            # Delete CSV after successful DB insertion; keep it on error for debugging
+            try:
+                csv_path.unlink()
+                logger.info(f"✓ CSV deleted after successful DB insertion: {csv_path.name}")
+            except Exception as e:
+                logger.warning(f"⚠ Could not delete CSV (non-critical): {e}")
 
             # Ingestion-time rescoring: rescore only the properties touched by
             # this scraper run so scores are always up-to-date in real time.
@@ -141,6 +138,68 @@ def load_scraped_data_to_db(
         import traceback
         logger.debug(traceback.format_exc())
         raise
+
+
+def get_daily_scrape_counts(target_date=None):
+    """
+    Return a dict of {table_name: record_count} for records scraped on target_date.
+
+    Uses the date_added field on each signal table. Defaults to today if not specified.
+
+    Args:
+        target_date: datetime.date or None (defaults to today)
+
+    Returns:
+        dict with table names as keys, counts as values, plus '_total' and '_date' keys.
+
+    Example:
+        >>> counts = get_daily_scrape_counts()
+        >>> print(counts)
+        {'code_violations': 45, 'deeds': 120, ..., '_total': 389, '_date': '2026-03-03'}
+    """
+    from src.core.models import (
+        CodeViolation, LegalAndLien, Deed, LegalProceeding,
+        TaxDelinquency, Foreclosure, BuildingPermit, Incident,
+    )
+
+    if target_date is None:
+        target_date = date_type.today()
+
+    TABLE_MODELS = {
+        'code_violations':  CodeViolation,
+        'legal_and_liens':  LegalAndLien,
+        'deeds':            Deed,
+        'legal_proceedings': LegalProceeding,
+        'tax_delinquencies': TaxDelinquency,
+        'foreclosures':     Foreclosure,
+        'building_permits': BuildingPermit,
+        'incidents':        Incident,
+    }
+
+    with get_db_context() as session:
+        counts = {}
+        for table_name, model in TABLE_MODELS.items():
+            counts[table_name] = session.query(model).filter(
+                model.date_added == target_date
+            ).count()
+
+    counts['_total'] = sum(v for k, v in counts.items() if not k.startswith('_'))
+    counts['_date'] = str(target_date)
+    return counts
+
+
+def print_daily_scrape_report(target_date=None):
+    """Print a formatted daily scrape count report to the log."""
+    counts = get_daily_scrape_counts(target_date)
+    logger.info("=" * 50)
+    logger.info(f"DAILY SCRAPE COUNTS — {counts['_date']}")
+    logger.info("=" * 50)
+    for table, count in counts.items():
+        if not table.startswith('_'):
+            logger.info(f"  {table:<20} {count:>6}")
+    logger.info("-" * 50)
+    logger.info(f"  {'TOTAL':<20} {counts['_total']:>6}")
+    logger.info("=" * 50)
 
 
 def add_load_to_db_arg(parser):

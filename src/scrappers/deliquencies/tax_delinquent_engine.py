@@ -186,25 +186,25 @@ async def _playwright_download_tax_delinquent(
 		page = await context.new_page()
 		try:
 			# 1. Navigate — wait for networkidle so all JS initializes
-			await page.goto(TAX_REPORT_URL, wait_until="domcontentloaded", timeout=30_000)
-			await page.wait_for_load_state('networkidle', timeout=20_000)
+			await page.goto(TAX_REPORT_URL, wait_until="domcontentloaded", timeout=60_000)
+			await page.wait_for_load_state('networkidle', timeout=60_000)
 
 			# 2. Type report name into the shared-report search filter
-			await page.wait_for_selector('#selected-report-filter', state='attached', timeout=15_000)
+			await page.wait_for_selector('#selected-report-filter', state='attached', timeout=25_000)
 			await page.click('#selected-report-filter')
 			await page.type('#selected-report-filter', 'Public - Delinquent Report', delay=50)
 			logger.info("[Playwright][RADAR] Typed report search: 'Public - Delinquent Report'")
 
 			# 3. Wait for dropdown menu and click the matching item
 			menu = page.locator('#selected-report-filter-menu')
-			await menu.wait_for(state='visible', timeout=10_000)
+			await menu.wait_for(state='visible', timeout=20_000)
 			item = menu.locator('li, a, div').filter(has_text='Public - Delinquent Report').first
-			await item.wait_for(state='visible', timeout=8_000)
+			await item.wait_for(state='visible', timeout=15_000)
 			await item.click()
 			logger.info("[Playwright][RADAR] Selected 'Public - Delinquent Report'")
 
 			# 4. Fill tax year field
-			await page.wait_for_selector('#tax_year', timeout=10_000)
+			await page.wait_for_selector('#tax_year', timeout=20_000)
 			await page.click('#tax_year', click_count=3)
 			await page.type('#tax_year', str(tax_year))
 			logger.info(f"[Playwright][RADAR] Set tax year: {tax_year}")
@@ -346,18 +346,29 @@ async def download_tax_delinquent_report(
 	Returns:
 		bool: True if download succeeded, False otherwise
 	"""
-	# ── Playwright (primary) ──────────────────────────────────────────────────
+	# ── Playwright (primary, with retries) ────────────────────────────────────
 	logger.info("[RADAR] Attempting Playwright download (primary)...")
-	try:
-		success = await _playwright_download_tax_delinquent(tax_year=tax_year)
-		if success:
-			logger.info("[RADAR] Playwright download succeeded")
-			return True
-	except Exception as e:
-		logger.warning(f"[RADAR] Playwright download failed: {e}")
-		logger.info("[RADAR] Falling back to browser-use AI downloader...")
+	MAX_PLAYWRIGHT_RETRIES = 5
+	playwright_error = None
+	for attempt in range(1, MAX_PLAYWRIGHT_RETRIES + 1):
+		try:
+			success = await _playwright_download_tax_delinquent(tax_year=tax_year)
+			if success:
+				logger.info("[RADAR] Playwright download succeeded")
+				return True
+			playwright_error = RuntimeError("Playwright returned False unexpectedly")
+		except Exception as e:
+			playwright_error = e
+			if attempt < MAX_PLAYWRIGHT_RETRIES:
+				logger.warning(f"[RADAR] Playwright attempt {attempt}/{MAX_PLAYWRIGHT_RETRIES} failed: {e} — retrying in 5s...")
+				await asyncio.sleep(5)
+				continue
+			logger.warning(f"[RADAR] All {MAX_PLAYWRIGHT_RETRIES} Playwright retries failed")
+			break
 
-	# ── AI fallback ───────────────────────────────────────────────────────────
+	logger.info("[RADAR] Falling back to browser-use AI downloader...")
+
+	# ── AI fallback (only reached when all Playwright retries fail with errors) ──
 	return await _ai_download_tax_delinquent(
 		tax_year=tax_year,
 		account_status=account_status,

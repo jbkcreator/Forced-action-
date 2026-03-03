@@ -48,284 +48,335 @@ llm = ChatAnthropic(
 	api_key=settings.anthropic_api_key.get_secret_value(),
 	temperature=0,
 )
-
-
 async def scrape_violations_with_playwright(
-	start_date: str = None,
-	end_date: str = None,
-	headless: bool = True,
-	debug: bool = False,
+    start_date: str = None,
+    end_date: str = None,
+    headless: bool = True,
+    debug: bool = False,
 ):
-	"""
-	Primary Playwright scraper — deterministic, no AI credits consumed.
+    """
+    Primary Playwright scraper — deterministic, no AI credits consumed.
 
-	Navigates the Accela enforcement portal, fills date filters, then tries the
-	"Download results" button to get all records in one shot. Falls back to
-	page-by-page table scraping if the download fails.
-	Raises on any failure so the caller can fall back to browser_use.
+    Navigates the Accela enforcement portal, fills date filters, then scrapes
+    page-by-page by clicking Next until Next becomes disabled (span), without
+    relying on visible page numbers (no "..." handling needed).
 
-	Args:
-		start_date: Start date in YYYY-MM-DD format (default: yesterday)
-		end_date:   End date in YYYY-MM-DD format (default: today)
-		headless:   Run browser headlessly (default True). Set False with xvfb-run.
-		debug:      Save screenshots + HTML dumps to data/debug/playwright/ at each step.
-	"""
-	from playwright.async_api import async_playwright
+    Args:
+        start_date: Start date in YYYY-MM-DD format (default: yesterday)
+        end_date:   End date in YYYY-MM-DD format (default: today)
+        headless:   Run browser headlessly (default True). Set False with xvfb-run.
+        debug:      Save screenshots + HTML dumps to data/debug/playwright/ at each step.
 
-	if end_date:
-		end_dt = datetime.strptime(end_date, "%Y-%m-%d")
-	else:
-		end_dt = datetime.now()
-	if start_date:
-		start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-	else:
-		start_dt = end_dt - timedelta(days=1)
+    Returns:
+        - None if no rows
+        - True if nothing new after DB dedupe
+        - (csv_path, ) on success (kept compatible with your current return usage)
+    """
+    from playwright.async_api import async_playwright
+    import pandas as pd
+    from pathlib import Path
+    from datetime import datetime, timedelta
 
-	end_date_str   = end_dt.strftime("%m/%d/%Y")
-	start_date_str = start_dt.strftime("%m/%d/%Y")
+    if end_date:
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    else:
+        end_dt = datetime.now()
+    if start_date:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    else:
+        start_dt = end_dt - timedelta(days=1)
 
-	logger.info(f"[Playwright] Scraping violations {start_date_str} → {end_date_str}")
+    end_date_str = end_dt.strftime("%m/%d/%Y")
+    start_date_str = start_dt.strftime("%m/%d/%Y")
 
-	# Exact element IDs from the Accela portal HTML
-	START_DATE_ID  = "ctl00_PlaceHolderMain_generalSearchForm_txtGSStartDate"
-	END_DATE_ID    = "ctl00_PlaceHolderMain_generalSearchForm_txtGSEndDate"
-	SEARCH_BTN_ID  = "ctl00_PlaceHolderMain_btnNewSearch"
+    logger.info(f"[Playwright] Scraping violations {start_date_str} → {end_date_str}")
 
-	debug_dir = Path("data/debug/playwright/violations")
-	if debug:
-		debug_dir.mkdir(parents=True, exist_ok=True)
-		logger.info(f"[Playwright][DEBUG] Screenshots/HTML saved to {debug_dir.resolve()}")
+    # Exact element IDs from the Accela portal HTML
+    START_DATE_ID = "ctl00_PlaceHolderMain_generalSearchForm_txtGSStartDate"
+    END_DATE_ID = "ctl00_PlaceHolderMain_generalSearchForm_txtGSEndDate"
+    SEARCH_BTN_ID = "ctl00_PlaceHolderMain_btnNewSearch"
 
-	async def snap(page, name):
-		if not debug:
-			return
-		await page.screenshot(path=str(debug_dir / f"{name}.png"), full_page=True)
-		(debug_dir / f"{name}.html").write_text(await page.content(), encoding="utf-8")
-		logger.info(f"[Playwright][DEBUG] Saved {name}.png + {name}.html")
+    debug_dir = Path("data/debug/playwright/violations")
+    if debug:
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"[Playwright][DEBUG] Screenshots/HTML saved to {debug_dir.resolve()}")
 
-	async def js_fill_date(page, input_id: str, value: str):
-		"""Set a masked date input value and fire all events the portal listens to."""
-		await page.evaluate(
-			'''([id, val]) => {
-				const el = document.getElementById(id);
-				if (!el) throw new Error("Input #" + id + " not found");
-				el.value = val;
-				el.dispatchEvent(new Event("focus",  {bubbles: true}));
-				el.dispatchEvent(new Event("input",  {bubbles: true}));
-				el.dispatchEvent(new Event("change", {bubbles: true}));
-				el.dispatchEvent(new Event("blur",   {bubbles: true}));
-			}''',
-			[input_id, value],
-		)
+    async def snap(page, name):
+        if not debug:
+            return
+        await page.screenshot(path=str(debug_dir / f"{name}.png"), full_page=True)
+        (debug_dir / f"{name}.html").write_text(await page.content(), encoding="utf-8")
+        logger.info(f"[Playwright][DEBUG] Saved {name}.png + {name}.html")
 
-	all_rows = []
+    async def js_fill_date(page, input_id: str, value: str):
+        """Set a masked date input value and fire all events the portal listens to."""
+        await page.evaluate(
+            '''([id, val]) => {
+                const el = document.getElementById(id);
+                if (!el) throw new Error("Input #" + id + " not found");
+                el.value = val;
+                el.dispatchEvent(new Event("focus",  {bubbles: true}));
+                el.dispatchEvent(new Event("input",  {bubbles: true}));
+                el.dispatchEvent(new Event("change", {bubbles: true}));
+                el.dispatchEvent(new Event("blur",   {bubbles: true}));
+            }''',
+            [input_id, value],
+        )
 
-	async with async_playwright() as pw:
-		browser = await pw.chromium.launch(
-			headless=headless,
-			args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--no-zygote', '--single-process'],
-		)
-		ctx = await browser.new_context(
-			viewport={'width': 1280, 'height': 900},
-			accept_downloads=True,
-		)
-		page = await ctx.new_page()
+    all_rows = []
 
-		try:
-			# 1. Load the portal
-			await page.goto(VIOLATION_SEARCH_URL, wait_until='domcontentloaded', timeout=30000)
-			await page.wait_for_timeout(2000)
-			await snap(page, "01_page_loaded")
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=headless,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--no-zygote",
+                "--single-process",
+            ],
+        )
+        ctx = await browser.new_context(
+            viewport={"width": 1280, "height": 900},
+            accept_downloads=True,
+        )
+        page = await ctx.new_page()
 
-			# 2. Expand search form if collapsed (Accela hides it on first load)
-			try:
-				toggle = page.locator('a:has-text("Search Applications")').first
-				if await toggle.is_visible(timeout=3000):
-					await toggle.click()
-					await page.wait_for_timeout(1500)
-					await snap(page, "02_form_expanded")
-			except Exception:
-				pass  # Already visible
+        try:
+            # 1. Load the portal
+            await page.goto(VIOLATION_SEARCH_URL, wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(2000)
+            await snap(page, "01_page_loaded")
 
-			# 3. Fill start date using exact known ID
-			await page.wait_for_selector(f'#{START_DATE_ID}', timeout=10000)
-			await js_fill_date(page, START_DATE_ID, start_date_str)
-			logger.info(f"[Playwright] Start date set: {start_date_str}")
+            # 2. Expand search form if collapsed (Accela hides it on first load)
+            try:
+                toggle = page.locator('a:has-text("Search Applications")').first
+                if await toggle.is_visible(timeout=5000):
+                    await toggle.click()
+                    await page.wait_for_timeout(1500)
+                    await snap(page, "02_form_expanded")
+            except Exception:
+                pass  # Already visible
 
-			# 4. Fill end date
-			await js_fill_date(page, END_DATE_ID, end_date_str)
-			logger.info(f"[Playwright] End date set: {end_date_str}")
-			await snap(page, "03_dates_filled")
+            # 3. Fill start date using exact known ID
+            await page.wait_for_selector(f"#{START_DATE_ID}", timeout=20000)
+            await js_fill_date(page, START_DATE_ID, start_date_str)
+            logger.info(f"[Playwright] Start date set: {start_date_str}")
 
-			# 5. Submit search using exact known button ID — use expect_navigation so
-			#    we wait for the full ASP.NET PostBack to complete before continuing.
-			try:
-				async with page.expect_navigation(timeout=30000):
-					await page.evaluate(f'''() => {{
-						const btn = document.getElementById("{SEARCH_BTN_ID}");
-						if (!btn) throw new Error("Search button #{SEARCH_BTN_ID} not found");
-						btn.click();
-					}}''')
-			except Exception:
-				# Fallback: just wait for networkidle if no navigation event fires
-				await page.wait_for_load_state('networkidle', timeout=30000)
-			await snap(page, "04_search_results")
-			logger.info("[Playwright] Search submitted")
+            # 4. Fill end date
+            await js_fill_date(page, END_DATE_ID, end_date_str)
+            logger.info(f"[Playwright] End date set: {end_date_str}")
+            await snap(page, "03_dates_filled")
 
-			# 6a. Wait for results table to actually render before doing anything else.
-			#     Accela UpdatePanel can take a second or two after the PostBack completes.
-			try:
-				await page.wait_for_selector(
-					'tr.ACA_TabRow_Odd, tr.ACA_TabRow_Even',
-					timeout=20000,
-				)
-				logger.info("[Playwright] Results table detected")
-			except Exception:
-				logger.warning("[Playwright] Timed out waiting for results rows — page may have no results")
+            # 5. Submit search — wait for ASP.NET PostBack (navigation may or may not fire)
+            try:
+                async with page.expect_navigation(timeout=45000):
+                    await page.evaluate(
+                        f'''() => {{
+                            const btn = document.getElementById("{SEARCH_BTN_ID}");
+                            if (!btn) throw new Error("Search button #{SEARCH_BTN_ID} not found");
+                            btn.click();
+                        }}'''
+                    )
+            except Exception:
+                await page.wait_for_load_state("networkidle", timeout=60000)
 
-			# 6b. Scrape table page by page — violations must be scraped directly,
-			#     the download export does not include all fields we need.
-			page_num = 1
+            await snap(page, "04_search_results")
+            logger.info("[Playwright] Search submitted")
 
-			# Get total page count from the table's pagecount attribute so we know
-			# exactly when to stop (avoids relying solely on pagination link presence).
-			total_pages = await page.evaluate('''() => {
-				const tbl = document.querySelector("table[pagecount]");
-				return tbl ? parseInt(tbl.getAttribute("pagecount")) || 0 : 0;
-			}''')
-			if total_pages:
-				logger.info(f"[Playwright] Total pages to scrape: {total_pages}")
+            # 6a. Wait for results table to render (UpdatePanel can delay after postback)
+            try:
+                await page.wait_for_selector("tr.ACA_TabRow_Odd, tr.ACA_TabRow_Even", timeout=30000)
+                logger.info("[Playwright] Results table detected")
+            except Exception:
+                logger.warning("[Playwright] Timed out waiting for results rows — page may have no results")
 
-			while True:
-				logger.info(f"[Playwright] Scraping page {page_num}...")
-				await snap(page, f"page_{page_num:02d}")
+            # 6b. Pagination: click Next until it becomes disabled (span).
+            visited_pages = set()
 
-				rows = await page.evaluate('''() => {
-					const result = [];
-					// Find the results table via its data rows
-					const dataRow = document.querySelector("tr.ACA_TabRow_Odd, tr.ACA_TabRow_Even");
-					if (!dataRow) return result;
-					const table = dataRow.closest("table");
-					if (!table) return result;
+            async def get_selected_page_num() -> str:
+                """Authoritative current page: <span class='SelectedPageButton'>14</span>"""
+                return await page.evaluate(
+                    '''() => {
+                        const el = document.querySelector("span.SelectedPageButton");
+                        return el ? el.textContent.trim() : "";
+                    }'''
+                )
 
-					// Build header list — ACA_Hide th has no visible text; label it Address
-					const ths = table.querySelectorAll("th");
-					const headers = Array.from(ths).map(th =>
-						th.classList.contains("ACA_Hide") ? "Address" : th.innerText.trim()
-					);
+            async def next_is_clickable() -> bool:
+                """
+                Next is clickable when it's an <a>. When disabled, it renders as <span>.
+                We search pagination 'PrevNext' cells and check if Next cell has an <a>.
+                """
+                return await page.evaluate(
+                    '''() => {
+                        const tds = Array.from(document.querySelectorAll("td.aca_pagination_PrevNext"));
+                        const nextTd = tds.find(td => td.textContent.includes("Next"));
+                        if (!nextTd) return false;
+                        return !!nextTd.querySelector("a");
+                    }'''
+                )
 
-					const dataRows = table.querySelectorAll("tr.ACA_TabRow_Odd, tr.ACA_TabRow_Even");
-					for (const row of dataRows) {
-						const cells = row.querySelectorAll("td");
-						const obj = {};
-						cells.forEach((td, i) => {
-							const key = headers[i];
-							if (key) obj[key] = td.innerText.trim();
-						});
-						result.push(obj);
-					}
-					return result;
-				}''')
+            async def click_next():
+                """Click the Next link using DOM click (works best with UpdatePanel)."""
+                await page.evaluate(
+                    '''() => {
+                        const tds = Array.from(document.querySelectorAll("td.aca_pagination_PrevNext"));
+                        const nextTd = tds.find(td => td.textContent.includes("Next"));
+                        const a = nextTd ? nextTd.querySelector("a") : null;
+                        if (!a) throw new Error("Next link not found/clickable");
+                        a.click();
+                    }'''
+                )
 
-				if rows:
-					all_rows.extend(rows)
-					logger.info(f"[Playwright] Page {page_num}: {len(rows)} rows (total: {len(all_rows)})")
-				else:
-					logger.info(f"[Playwright] Page {page_num}: no rows — done")
-					await snap(page, f"page_{page_num:02d}_empty")
-					break
+            while True:
+                # Read current page number
+                current_page = await get_selected_page_num()
+                if not current_page:
+                    logger.warning("[Playwright] SelectedPageButton missing — stopping pagination.")
+                    break
 
-				# Stop if we've hit the last page per the pagecount attribute
-				if total_pages and page_num >= total_pages:
-					logger.info(f"[Playwright] All {total_pages} pages scraped")
-					break
+                # Prevent duplicates / loops
+                if current_page in visited_pages:
+                    logger.warning(f"[Playwright] Page {current_page} already visited — stopping to avoid duplicates.")
+                    break
+                visited_pages.add(current_page)
 
-				# "Next >" link lives in .aca_pagination_PrevNext a.
-				# IMPORTANT: once past page 1, "< Prev" is also an <a> inside
-				# aca_pagination_PrevNext — so we must filter by text "Next" to
-				# avoid accidentally clicking "< Prev" and going backwards.
-				next_locator = page.locator(".aca_pagination_PrevNext a").filter(has_text="Next")
-				if not await next_locator.is_visible(timeout=3000):
-					logger.info("[Playwright] No 'Next >' link — last page reached")
-					break
+                logger.info(f"[Playwright] Scraping page {current_page}...")
+                if current_page.isdigit():
+                    await snap(page, f"page_{int(current_page):02d}")
+                else:
+                    await snap(page, f"page_{current_page}")
 
-				# Use Playwright native click — more reliable than JS a.click()
-				# because it waits for the element to be actionable first.
-				try:
-					async with page.expect_navigation(timeout=20000):
-						await next_locator.click()
-				except Exception:
-					# UpdatePanel pagination doesn't fire a full navigation;
-					# fall back to waiting for networkidle.
-					await page.wait_for_load_state('networkidle', timeout=30000)
+                # Extract rows on current page
+                rows = await page.evaluate(
+                    '''() => {
+                        const result = [];
+                        const dataRow = document.querySelector("tr.ACA_TabRow_Odd, tr.ACA_TabRow_Even");
+                        if (!dataRow) return result;
+                        const table = dataRow.closest("table");
+                        if (!table) return result;
 
-				# SelectedPageButton (span.SelectedPageButton) is confirmed present
-				# in the portal HTML.  Use arg= keyword so Playwright passes the
-				# value correctly into the JS function.
-				try:
-					await page.wait_for_function(
-						'(n) => { const el = document.querySelector("span.SelectedPageButton"); return el && parseInt(el.textContent.trim()) === n; }',
-						arg=page_num + 1,
-						timeout=15000,
-					)
-				except Exception:
-					logger.warning(f"[Playwright] SelectedPageButton didn't advance to {page_num + 1} — stopping")
-					break
-				page_num += 1
+                        const ths = table.querySelectorAll("th");
+                        const headers = Array.from(ths).map(th =>
+                            th.classList.contains("ACA_Hide") ? "Address" : th.innerText.trim()
+                        );
 
-			logger.info(f"[Playwright] Total records extracted: {len(all_rows)}")
+                        const dataRows = table.querySelectorAll("tr.ACA_TabRow_Odd, tr.ACA_TabRow_Even");
+                        for (const row of dataRows) {
+                            const cells = row.querySelectorAll("td");
+                            const obj = {};
+                            cells.forEach((td, i) => {
+                                const key = headers[i];
+                                if (key) obj[key] = td.innerText.trim();
+                            });
+                            result.push(obj);
+                        }
+                        return result;
+                    }'''
+                )
 
-		finally:
-			await browser.close()
+                if rows:
+                    all_rows.extend(rows)
+                    logger.info(
+                        f"[Playwright] Page {current_page}: scraped {len(rows)} rows (total: {len(all_rows)})"
+                    )
+                else:
+                    logger.info(f"[Playwright] Page {current_page}: no rows found — stopping.")
+                    await snap(page, f"page_{current_page}_empty")
+                    break
 
-	if not all_rows:
-		logger.info("[Playwright] 0 records found — no violations in this date range")
-		return None
+                # Stop if Next is disabled
+                if not await next_is_clickable():
+                    logger.info("[Playwright] Next is not clickable — last page reached.")
+                    break
 
-	# Normalize column names
-	COLUMN_ALIASES = {
-		'Date':            ['Date', 'Filed Date', 'Opened Date', 'Application Date'],
-		'Record Number':   ['Record Number', 'Application Number', 'Record #'],
-		'Record Type':     ['Record Type', 'Application Type', 'Type'],
-		'Description':     ['Description', 'Desc'],
-		'Project Name':    ['Project Name', 'Project'],
-		'Related Records': ['Related Records', 'Related'],
-		'Status':          ['Status', 'Application Status'],
-		'Short Notes':     ['Short Notes', 'Notes', 'Short Note'],
-		'Address':         ['Address', 'Location', 'Parcel Address'],
-	}
-	normalized = []
-	for row in all_rows:
-		norm_row = {}
-		for target_col, aliases in COLUMN_ALIASES.items():
-			for alias in aliases:
-				if alias in row:
-					norm_row[target_col] = row[alias]
-					break
-			if target_col not in norm_row:
-				norm_row[target_col] = ''
-		normalized.append(norm_row)
+                # Click Next and wait for actual page change (SelectedPageButton + table refresh)
+                old_page = current_page
+                old_first_row = await page.evaluate(
+                    '''() => {
+                        const row = document.querySelector("tr.ACA_TabRow_Odd, tr.ACA_TabRow_Even");
+                        return row ? row.innerText.trim() : "";
+                    }'''
+                )
 
-	df = pd.DataFrame(normalized)
+                await click_next()
 
-	logger.info("DB DEDUPLICATION: Checking for existing violations")
-	initial_count = len(df)
-	df_new = filter_new_records(df, 'violations')
+                # Wait until selected page number changes
+                await page.wait_for_function(
+                    '''(oldVal) => {
+                        const el = document.querySelector("span.SelectedPageButton");
+                        return el && el.textContent.trim() !== oldVal;
+                    }''',
+                    arg=old_page,
+                    timeout=45000,
+                )
 
-	if df_new.empty:
-		logger.info("All violations already exist in database — nothing new to load")
-		return True
+                # Wait until table changes (guards against scraping old DOM)
+                await page.wait_for_function(
+                    '''(oldText) => {
+                        const row = document.querySelector("tr.ACA_TabRow_Odd, tr.ACA_TabRow_Even");
+                        const now = row ? row.innerText.trim() : "";
+                        return now && now !== oldText;
+                    }''',
+                    arg=old_first_row,
+                    timeout=45000,
+                )
 
-	new_dir = RAW_VIOLATIONS_DIR / "new"
-	new_dir.mkdir(parents=True, exist_ok=True)
-	today_str = datetime.now().strftime("%Y%m%d")
-	csv_path = new_dir / f"violations_new_{today_str}.csv"
-	df_new.to_csv(csv_path, index=False)
-	size_mb = csv_path.stat().st_size / (1024 ** 2)
-	logger.info(f"[Playwright] Saved {len(df_new)} new violations to {csv_path} ({size_mb:.2f} MB)")
-	logger.info(f"[Playwright] Filtered {initial_count - len(df_new)} already-existing records")
-	return csv_path
+            logger.info(f"[Playwright] Total records extracted: {len(all_rows)}")
 
+        finally:
+            await browser.close()
+
+    if not all_rows:
+        logger.info("[Playwright] 0 records found — no violations in this date range")
+        return None
+
+    # Normalize column names
+    COLUMN_ALIASES = {
+        "Date": ["Date", "Filed Date", "Opened Date", "Application Date"],
+        "Record Number": ["Record Number", "Application Number", "Record #"],
+        "Record Type": ["Record Type", "Application Type", "Type"],
+        "Description": ["Description", "Desc"],
+        "Project Name": ["Project Name", "Project"],
+        "Related Records": ["Related Records", "Related"],
+        "Status": ["Status", "Application Status"],
+        "Short Notes": ["Short Notes", "Notes", "Short Note"],
+        "Address": ["Address", "Location", "Parcel Address"],
+    }
+
+    normalized = []
+    for row in all_rows:
+        norm_row = {}
+        for target_col, aliases in COLUMN_ALIASES.items():
+            for alias in aliases:
+                if alias in row:
+                    norm_row[target_col] = row[alias]
+                    break
+            if target_col not in norm_row:
+                norm_row[target_col] = ""
+        normalized.append(norm_row)
+
+    df = pd.DataFrame(normalized)
+
+    logger.info("DB DEDUPLICATION: Checking for existing violations")
+    initial_count = len(df)
+    df_new = filter_new_records(df, "violations")
+
+    if df_new.empty:
+        logger.info("All violations already exist in database — nothing new to load")
+        return True
+
+    new_dir = RAW_VIOLATIONS_DIR / "new"
+    new_dir.mkdir(parents=True, exist_ok=True)
+    today_str = datetime.now().strftime("%Y%m%d")
+    csv_path = new_dir / f"violations_new_{today_str}.csv"
+    df_new.to_csv(csv_path, index=False)
+    size_mb = csv_path.stat().st_size / (1024 ** 2)
+    logger.info(f"[Playwright] Saved {len(df_new)} new violations to {csv_path} ({size_mb:.2f} MB)")
+    logger.info(f"[Playwright] Filtered {initial_count - len(df_new)} already-existing records")
+
+    return csv_path
 
 async def scrape_violations_with_browser_use(start_date: str = None, end_date: str = None) -> bool:
 	"""
@@ -545,23 +596,46 @@ async def main(args):
 		logger.info("[DEBUG] Screenshot/HTML dumps enabled → data/debug/playwright/violations/")
 
 	csv_file = None
+	MAX_PLAYWRIGHT_RETRIES = 5
 
 	if scraper in ("auto", "playwright"):
 		logger.info("\nAttempting Playwright scraping (primary method)...")
-		try:
-			csv_file = await scrape_violations_with_playwright(
-				start_date=args.start_date,
-				end_date=args.end_date,
-				headless=headless,
-				debug=args.debug,
-			)
-			logger.info("Playwright scraping succeeded")
-		except Exception as e:
-			if scraper == "playwright":
-				raise  # no fallback when explicitly requested
-			logger.warning(f"Playwright scraping failed: {e}")
+		playwright_error = None
+		for attempt in range(1, MAX_PLAYWRIGHT_RETRIES + 1):
+			try:
+				csv_file = await scrape_violations_with_playwright(
+					start_date=args.start_date,
+					end_date=args.end_date,
+					headless=headless,
+					debug=args.debug,
+				)
+				if csv_file is None:
+					# No results from site — retry (could be temporary)
+					if attempt < MAX_PLAYWRIGHT_RETRIES:
+						logger.warning(f"[Playwright] No results (attempt {attempt}/{MAX_PLAYWRIGHT_RETRIES}) — retrying in 5s...")
+						await asyncio.sleep(5)
+						continue
+					logger.info(f"[Playwright] No results after {MAX_PLAYWRIGHT_RETRIES} attempts — no violations in date range")
+					playwright_error = None
+					break
+				# Success (csv_path or True — all already in DB)
+				logger.info("Playwright scraping succeeded")
+				playwright_error = None
+				break
+			except Exception as e:
+				if scraper == "playwright":
+					raise  # no fallback when explicitly requested
+				playwright_error = e
+				if attempt < MAX_PLAYWRIGHT_RETRIES:
+					logger.warning(f"[Playwright] Attempt {attempt}/{MAX_PLAYWRIGHT_RETRIES} failed: {e} — retrying in 5s...")
+					await asyncio.sleep(5)
+					continue
+				logger.warning(f"[Playwright] All {MAX_PLAYWRIGHT_RETRIES} retries failed with errors")
+
+		# Only fall back to AI if Playwright failed with an actual error (not no-results)
+		if playwright_error is not None and scraper == "auto":
 			logger.warning("Falling back to browser-use AI method...")
-			scraper = "ai"  # drop into AI branch below
+			scraper = "ai"
 
 	if scraper == "ai" and csv_file is None:
 		logger.info("Running browser-use AI scraper...")
@@ -602,7 +676,14 @@ async def main(args):
 					logger.info(f"{'='*60}\n")
 					
 					logger.info("✓ Database load completed!")
-					
+
+					# Delete CSV after successful insertion; keep on error for debugging
+					try:
+						Path(str(csv_file)).unlink()
+						logger.info("✓ CSV deleted after successful DB insertion")
+					except Exception as del_err:
+						logger.warning(f"⚠ Could not delete CSV (non-critical): {del_err}")
+
 			except Exception as e:
 				logger.error(f"Failed to load data to database: {e}")
 				logger.debug(traceback.format_exc())

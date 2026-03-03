@@ -183,16 +183,16 @@ async def _playwright_download_parcel_master() -> Optional[Path]:
 		context = await browser.new_context(accept_downloads=True)
 		page = await context.new_page()
 		try:
-			await page.goto("https://downloads.hcpafl.org/", wait_until="domcontentloaded", timeout=30_000)
+			await page.goto("https://downloads.hcpafl.org/", wait_until="domcontentloaded", timeout=60_000)
 
 			# Find link by text — row selector: tr.rgRow a containing "PARCEL_SPREADSHEET.xls"
 			link = page.locator('tr.rgRow a', has_text="PARCEL_SPREADSHEET.xls")
-			await link.wait_for(timeout=15_000)
+			await link.wait_for(timeout=30_000)
 			logger.info("[Playwright] Found PARCEL_SPREADSHEET.xls link — starting download...")
 
-			# expect_download waits for the download to START (60s timeout is enough)
+			# expect_download waits for the download to START
 			# save_as() then blocks until the full 536 MB file is written
-			async with page.expect_download(timeout=60_000) as dl_info:
+			async with page.expect_download(timeout=90_000) as dl_info:
 				await link.click()
 			download = await dl_info.value
 
@@ -316,15 +316,24 @@ async def download_parcel_master() -> Optional[Path]:
 	if Playwright fails.
 	"""
 	logger.info("\nAttempting Playwright download (primary method)...")
-	try:
-		result = await _playwright_download_parcel_master()
-		if result:
-			logger.info("Playwright download succeeded")
-			return result
-	except Exception as e:
-		logger.warning(f"Playwright download failed: {e}")
-		logger.info("Falling back to browser-use AI downloader...")
+	MAX_PLAYWRIGHT_RETRIES = 5
+	playwright_error = None
+	for attempt in range(1, MAX_PLAYWRIGHT_RETRIES + 1):
+		try:
+			result = await _playwright_download_parcel_master()
+			if result:
+				logger.info("Playwright download succeeded")
+				return result
+		except Exception as e:
+			playwright_error = e
+			if attempt < MAX_PLAYWRIGHT_RETRIES:
+				logger.warning(f"[Playwright] Attempt {attempt}/{MAX_PLAYWRIGHT_RETRIES} failed: {e} — retrying in 5s...")
+				await asyncio.sleep(5)
+				continue
+			logger.warning(f"[Playwright] All {MAX_PLAYWRIGHT_RETRIES} retries failed")
+			break
 
+	logger.info("Falling back to browser-use AI downloader...")
 	return await _ai_download_parcel_master()
 
 

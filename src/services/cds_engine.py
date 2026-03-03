@@ -46,6 +46,8 @@ import sys
 from datetime import datetime, date
 from typing import Dict, List, Optional
 
+from src.services.ghl_webhook import push_lead_to_ghl
+
 from sqlalchemy.orm import Session, joinedload
 
 from src.core.models import (
@@ -63,14 +65,22 @@ from src.core.models import (
 )
 from config.scoring import (
     ABSENTEE_BONUS,
+    AGE_DECAY_1Y,
+    AGE_DECAY_2Y,
     CONTACT_EMAIL_BONUS,
     CONTACT_PHONE_BONUS,
-    EQUITY_BONUS_HIGH,
-    EQUITY_BONUS_MID,
+    DAYS_OPEN_MODIFIERS,
+    EQUITY_BONUS_BY_VERTICAL,
     EQUITY_HIGH_THRESH,
     EQUITY_MID_THRESH,
-    EQUITY_VERTICALS,
     LEAD_TIER_THRESHOLDS,
+    PERSISTENCE_ESCALATION_KEYWORDS,
+    PERSISTENCE_RESOLVED_KEYWORDS,
+    PERSISTENCE_SCOPE_BONUSES,
+    PERSISTENCE_STATUS_ACTIVE,
+    PERSISTENCE_STATUS_ESCALATED,
+    PERSISTENCE_STATUS_RESOLVED,
+    PRIOR_VIOLATIONS_MODIFIERS,
     RECENCY_BONUSES,
     ROUTING_THRESHOLDS,
     SCORE_CAP,
@@ -122,9 +132,14 @@ class MultiVerticalScorer:
         """
         signals: List[Dict] = []
 
-        # 1. Code violations
+        # 1. Code violations — pass fine_amount and opened_date for modifier calculations
         for v in (prop.code_violations or []):
-            signals.append({"type": "code_violations", "date": v.opened_date, "amount": None})
+            signals.append({
+                "type":        "code_violations",
+                "date":        v.opened_date,
+                "amount":      float(v.fine_amount) if v.fine_amount is not None else None,
+                "opened_date": v.opened_date,   # used for days-open modifier
+            })
 
         # 2. Legal and Liens (liens + judgments)
         for lien in (prop.legal_and_liens or []):
@@ -176,6 +191,100 @@ class MultiVerticalScorer:
                 return bonus
         return 0
 
+    def _age_decay(self, sig_date) -> int:
+        """Return a negative modifier for stale signals (older than 1 year)."""
+        if not sig_date:
+            return 0
+        if isinstance(sig_date, datetime):
+            sig_date = sig_date.date()
+        days_old = (date.today() - sig_date).days
+        if days_old > 730:
+            return AGE_DECAY_2Y
+        if days_old > 365:
+            return AGE_DECAY_1Y
+        return 0
+
+    def _days_open_modifier(self, opened_date) -> int:
+        """Return the days-open modifier for a code violation."""
+        if not opened_date:
+            return 0
+        if isinstance(opened_date, datetime):
+            opened_date = opened_date.date()
+        days_open = (date.today() - opened_date).days
+        for max_days, modifier in DAYS_OPEN_MODIFIERS:
+            if max_days is None or days_open <= max_days:
+                return modifier
+        return 0
+
+    def _persistence_modifier(self, persistence_data: Dict) -> int:
+        """
+        Violation Persistence Score — proxy for owner inaction, replacing fine_amount.
+
+        fine_amount is not captured from Accela so this uses two available fields:
+
+        Component A — Status escalation (max +12):
+            Derived from the 'status' of the property's most-recent open violation.
+            Escalated  ("hearing", "abatement", "order", "lien" …): +12
+            Active     (open/issued, not yet resolved):               +6
+            Resolved   ("complied", "closed", "withdrawn" …):         0
+
+        Component B — Violation type diversity (max +8):
+            Count of distinct violation_type values across ALL violations.
+            1 type  → +0   (single-issue, may be a one-time event)
+            2 types → +4   (multi-issue — broader neglect)
+            3+ types → +8  (chronic multi-domain neglect)
+
+        Total max: 20 — same cap as former fine_mod for score stability.
+        Only fires when code_violations is the primary signal for the vertical.
+        """
+        if not persistence_data:
+            return 0
+
+        # Component A: status-based escalation
+        status = (persistence_data.get("latest_status") or "").lower()
+        if any(kw in status for kw in PERSISTENCE_ESCALATION_KEYWORDS):
+            status_score = PERSISTENCE_STATUS_ESCALATED
+        elif any(kw in status for kw in PERSISTENCE_RESOLVED_KEYWORDS):
+            status_score = PERSISTENCE_STATUS_RESOLVED
+        elif status:                              # any non-empty, non-resolved status
+            status_score = PERSISTENCE_STATUS_ACTIVE
+        else:
+            status_score = 0
+
+        # Component B: violation type diversity across the property
+        distinct_types = persistence_data.get("distinct_types", 0)
+        scope_score = 0
+        for max_count, bonus in PERSISTENCE_SCOPE_BONUSES:
+            if max_count is None or distinct_types <= max_count:
+                scope_score = bonus
+                break
+
+        return status_score + scope_score
+
+    def _prior_violations_modifier(self, violation_count: int) -> int:
+        """Return the prior violations count modifier."""
+        for max_count, modifier in PRIOR_VIOLATIONS_MODIFIERS:
+            if max_count is None or violation_count <= max_count:
+                return modifier
+        return 0
+
+        # ── Routing Gate Helper ───────────────────────────────────────────────────
+
+    def _is_within_window(self, sig_date) -> bool:
+        """
+        Check if a signal date falls within the STACKING_WINDOW_DAYS.
+        Used by the 2-signal minimum routing gate.
+        """
+        if not sig_date:
+            return False
+            
+        # Convert datetime to date if necessary
+        if isinstance(sig_date, datetime):
+            sig_date = sig_date.date()
+            
+        days_old = (date.today() - sig_date).days
+        return days_old <= STACKING_WINDOW_DAYS
+
     # ── Per-vertical scorer ────────────────────────────────────────────────────
 
     def _score_vertical(
@@ -184,22 +293,31 @@ class MultiVerticalScorer:
         signals: List[Dict],
         owner: Optional[Owner],
         financial: Optional[Financial],
+        violation_count: int = 0,
+        persistence_data: Optional[Dict] = None,
     ) -> Dict:
         """
         Score a single vertical per spec. Returns a result dict.
 
         Formula:
-          primary_score  = base_weight[best_signal] + recency_bonus(best_signal_date)
-          stacking_bonus = min((signals_within_60_days - 1) * 20, 40)
-          final_score    = min(100, primary_score + stacking_bonus + absentee + contact + equity)
+          primary_score    = base_weight[best_signal] + recency_bonus - age_decay
+          days_open_mod    = days-open modifier  (code_violations primary only)
+          persistence_mod  = persistence score   (code_violations primary only)
+                             replaces fine_amount — uses Accela status + type diversity
+          prior_viol_mod   = prior violations count modifier (any code_violation signal)
+          stacking_bonus   = min((signals_within_window - 1) * 20, 40)
+          final_score      = min(100, primary_score + days_open_mod + persistence_mod
+                                 + prior_viol_mod + stacking_bonus
+                                 + absentee + contact + equity)
 
-        Equity bonus applies to wholesalers and fix_flip only.
+        Equity bonus applies to all verticals with per-vertical rates.
         """
         weights = VERTICAL_WEIGHTS[vertical]
         today   = date.today()
 
-        # Group by signal type — each type counts once, using its most recent date.
-        latest_by_type: Dict[str, object] = {}
+        # Group by signal type — each type counts once, using its most recent signal.
+        # For code_violations keep the most recent opened_date + associated fine_amount.
+        latest_by_type: Dict[str, Dict] = {}
         for sig in signals:
             sig_type = sig["type"]
             if sig_type not in weights:
@@ -208,34 +326,44 @@ class MultiVerticalScorer:
             if isinstance(d, datetime):
                 d = d.date()
             existing = latest_by_type.get(sig_type)
-            if existing is None or (d and (existing is None or d > existing)):
-                latest_by_type[sig_type] = d
+            if existing is None or (d and (existing["date"] is None or d > existing["date"])):
+                latest_by_type[sig_type] = {
+                    "date":        d,
+                    "opened_date": sig.get("opened_date"),
+                    "fine_amount": sig.get("amount") if sig_type == "code_violations" else None,
+                }
 
         if not latest_by_type:
             return {
-                "score":             0.0,
-                "primary_signal":    None,
-                "primary_score":     0.0,
-                "stacking_bonus":    0,
-                "signals_within_60": 0,
-                "signals":           {},
-                "absentee_bonus":    0,
-                "contact_bonus":     0,
-                "equity_bonus":      0,
+                "score":                 0.0,
+                "primary_signal":        None,
+                "primary_score":         0.0,
+                "stacking_bonus":        0,
+                "signals_within_window": 0,
+                "signals":               {},
+                "absentee_bonus":        0,
+                "contact_bonus":         0,
+                "equity_bonus":          0,
+                "days_open_mod":         0,
+                "persistence_mod":       0,
+                "prior_viol_mod":        0,
             }
 
-        # Build per-signal components and find the primary (highest base + recency)
+        # Build per-signal components — apply age decay to each
         signal_components: Dict[str, Dict] = {}
         best_type  = None
-        best_total = -1
-        for sig_type, sig_date in latest_by_type.items():
+        best_total = -999
+        for sig_type, sig_info in latest_by_type.items():
+            sig_date = sig_info["date"]
             base    = weights[sig_type]
             recency = self._recency_bonus(sig_date)
-            total   = base + recency
+            decay   = self._age_decay(sig_date)
+            total   = base + recency + decay   # decay is negative
             signal_components[sig_type] = {
-                "base":    base,
-                "recency": recency,
-                "total":   total,
+                "base":      base,
+                "recency":   recency,
+                "age_decay": decay,
+                "total":     total,
             }
             if total > best_total:
                 best_total = total
@@ -243,13 +371,26 @@ class MultiVerticalScorer:
 
         primary_score = float(best_total)
 
-        # Stacking: count distinct signal types with a date within 60 days
-        signals_within_60 = sum(
-            1 for sig_date in latest_by_type.values()
-            if sig_date and (today - sig_date).days <= STACKING_WINDOW_DAYS
+        # Code violation extra modifiers — applied only when code_violations is primary
+        days_open_mod   = 0
+        persistence_mod = 0
+        if best_type == "code_violations":
+            viol_info     = latest_by_type["code_violations"]
+            days_open_mod = self._days_open_modifier(viol_info.get("opened_date"))
+            persistence_mod = self._persistence_modifier(persistence_data or {})
+
+        # Prior violations modifier — applies whenever any code_violation signal is present
+        prior_viol_mod = 0
+        if "code_violations" in latest_by_type and violation_count > 0:
+            prior_viol_mod = self._prior_violations_modifier(violation_count)
+
+        # Stacking: count distinct signal types with a date within the window
+        signals_within_window = sum(
+            1 for si in latest_by_type.values()
+            if si["date"] and (today - si["date"]).days <= STACKING_WINDOW_DAYS
         )
         stacking_bonus = min(
-            max(0, signals_within_60 - 1) * STACKING_BONUS_PER_SIGNAL,
+            max(0, signals_within_window - 1) * STACKING_BONUS_PER_SIGNAL,
             STACKING_BONUS_CAP,
         )
 
@@ -265,65 +406,91 @@ class MultiVerticalScorer:
             if owner.email_1 or owner.email_2:
                 contact_bonus += CONTACT_EMAIL_BONUS
 
-        # Equity bonus — wholesalers and fix_flip ONLY per spec
+        # Equity bonus — all verticals, per-vertical rate
         equity_bonus = 0
-        if vertical in EQUITY_VERTICALS and financial and financial.equity_pct is not None:
+        rate = EQUITY_BONUS_BY_VERTICAL.get(vertical, 0)
+        if rate and financial and financial.equity_pct is not None:
             eq = float(financial.equity_pct)
             if eq > EQUITY_HIGH_THRESH:
-                equity_bonus = EQUITY_BONUS_HIGH
+                equity_bonus = rate
             elif eq > EQUITY_MID_THRESH:
-                equity_bonus = EQUITY_BONUS_MID
+                equity_bonus = rate // 2
 
         final_score = min(
-            primary_score + stacking_bonus + absentee_bonus + contact_bonus + equity_bonus,
+            primary_score + days_open_mod + persistence_mod + prior_viol_mod
+            + stacking_bonus + absentee_bonus + contact_bonus + equity_bonus,
             float(SCORE_CAP),
         )
 
         logger.debug(
             f"    [{vertical}] primary={best_type}({primary_score:.0f})"
-            f" stack=+{stacking_bonus}({signals_within_60} signals/60d)"
+            f" days_open=+{days_open_mod} persistence=+{persistence_mod}"
+            f" prior_viol=+{prior_viol_mod}"
+            f" stack=+{stacking_bonus}({signals_within_window} sigs/{STACKING_WINDOW_DAYS}d)"
             f" absentee=+{absentee_bonus} contact=+{contact_bonus} equity=+{equity_bonus}"
             f" → {final_score:.1f}"
         )
 
         return {
-            "score":             final_score,
-            "primary_signal":    best_type,
-            "primary_score":     primary_score,
-            "stacking_bonus":    stacking_bonus,
-            "signals_within_60": signals_within_60,
-            "signals":           signal_components,
-            "absentee_bonus":    absentee_bonus,
-            "contact_bonus":     contact_bonus,
-            "equity_bonus":      equity_bonus,
+            "score":                 final_score,
+            "primary_signal":        best_type,
+            "primary_score":         primary_score,
+            "stacking_bonus":        stacking_bonus,
+            "signals_within_window": signals_within_window,
+            "signals":               signal_components,
+            "absentee_bonus":        absentee_bonus,
+            "contact_bonus":         contact_bonus,
+            "equity_bonus":          equity_bonus,
+            "days_open_mod":         days_open_mod,
+            "persistence_mod":       persistence_mod,
+            "prior_viol_mod":        prior_viol_mod,
         }
 
     # ── Score a single property ────────────────────────────────────────────────
 
     def score_property(self, prop: Property) -> Dict:
         """
-        Score a property across all 6 verticals.
-
-        Returns a score dict with:
-            property_id, parcel_id, address, owner_name,
-            final_cds_score, vertical_scores, urgency_level, lead_tier,
-            qualified, signal_count, distress_types, factor_scores
+        Score a property across all 6 verticals with a 2-signal routing gate. 
         """
         signals = self._collect_signals(prop)
         owner = prop.owner
         financial = prop.financial
+        violations = prop.code_violations or []
+        violation_count = len(violations)
+
+        # Persistence data: derived from all violations for this property.
+        # Used by _persistence_modifier() when code_violations is the primary signal.
+        #   latest_status  — Accela status field of most-recently-opened violation
+        #                    (proxy for owner engagement / city escalation level)
+        #   distinct_types — count of unique violation_type values across all violations
+        #                    (proxy for breadth of neglect)
+        if violations:
+            latest_viol = max(violations, key=lambda v: v.opened_date or date.min)
+            persistence_data: Dict = {
+                "latest_status":  latest_viol.status,
+                "distinct_types": len({v.violation_type for v in violations if v.violation_type}),
+            }
+        else:
+            persistence_data = {}
 
         vertical_results = {
-            v: self._score_vertical(v, signals, owner, financial)
+            v: self._score_vertical(v, signals, owner, financial, violation_count, persistence_data)
             for v in VERTICAL_WEIGHTS
         }
         vertical_scores = {v: r["score"] for v, r in vertical_results.items()}
 
         final_score = max(vertical_scores.values()) if any(vertical_scores.values()) else 0.0
+        
+        # Calculate distinct signal types within the window for the routing gate 
+        distinct_signals_count = len({s["type"] for s in signals if self._is_within_window(s["date"])})
 
-        # Routing / urgency
+        # Routing / urgency with Option C gate 
         if final_score >= ROUTING_THRESHOLDS["immediate"]:
-            urgency = "Immediate"
+            # GATE: Require 2+ distinct signals for Immediate SMS 
+            if distinct_signals_count >= 2:
+                urgency = "Immediate"
+            else:
+                urgency = "High"  # Cap at Daily if only 1 signal type exists 
         elif final_score >= ROUTING_THRESHOLDS["daily"]:
             urgency = "High"
         elif final_score >= ROUTING_THRESHOLDS["weekly"]:
@@ -351,11 +518,20 @@ class MultiVerticalScorer:
                 f"signals={len(signals)} [{', '.join(sig_types)}]"
             )
 
+        # Collect owner contact info for CRM push
+        owner_phone = None
+        owner_email = None
+        if owner:
+            owner_phone = owner.phone_1 or owner.phone_2 or owner.phone_3 or None
+            owner_email = owner.email_1 or owner.email_2 or None
+
         return {
             "property_id":     prop.id,
             "parcel_id":       prop.parcel_id,
             "address":         prop.address,
             "owner_name":      owner.owner_name if owner else None,
+            "owner_phone":     owner_phone,
+            "owner_email":     owner_email,
             "final_cds_score": round(final_score, 2),
             "vertical_scores": {k: round(v, 2) for k, v in vertical_scores.items()},
             "urgency_level":   urgency,
@@ -396,16 +572,19 @@ class MultiVerticalScorer:
         vertical_breakdown = {}
         for v, result in vertical_results.items():
             vertical_breakdown[v] = {
-                "final_score":       round(result["score"], 2),
-                "primary_signal":    result["primary_signal"],
-                "primary_score":     round(result["primary_score"], 2),
-                "stacking_bonus":    result["stacking_bonus"],
-                "signals_within_60": result["signals_within_60"],
-                "signals":           result["signals"],   # {type: {base, recency, total}}
+                "final_score":           round(result["score"], 2),
+                "primary_signal":        result["primary_signal"],
+                "primary_score":         round(result["primary_score"], 2),
+                "stacking_bonus":        result["stacking_bonus"],
+                "signals_within_window": result["signals_within_window"],
+                "signals":               result["signals"],   # {type: {base, recency, age_decay, total}}
                 "bonuses": {
-                    "absentee": result["absentee_bonus"],
-                    "contact":  result["contact_bonus"],
-                    "equity":   result["equity_bonus"],
+                    "absentee":     result["absentee_bonus"],
+                    "contact":      result["contact_bonus"],
+                    "equity":       result["equity_bonus"],
+                    "days_open":    result["days_open_mod"],
+                    "persistence":  result["persistence_mod"],
+                    "prior_viol":   result["prior_viol_mod"],
                 },
             }
 
@@ -456,6 +635,10 @@ class MultiVerticalScorer:
             existing.vertical_scores = vertical_json
             existing.distress_types  = distress_list
             logger.debug(f"Updated score for property {score_data['parcel_id']}: {final_score} ({lead_tier})")
+            try:
+                push_lead_to_ghl(score_data)
+            except Exception as ghl_err:
+                logger.warning(f"[GHL] push failed (non-critical): {ghl_err}")
             return existing
 
         # Check most recent score to avoid accumulating identical rows
@@ -480,6 +663,10 @@ class MultiVerticalScorer:
         )
         self.session.add(record)
         logger.debug(f"Created score for property {score_data['parcel_id']}: {final_score} ({lead_tier})")
+        try:
+            push_lead_to_ghl(score_data)
+        except Exception as ghl_err:
+            logger.warning(f"[GHL] push failed (non-critical): {ghl_err}")
         return record
 
     # ── Batch scoring ──────────────────────────────────────────────────────────

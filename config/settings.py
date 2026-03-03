@@ -2,6 +2,8 @@
 
 from functools import lru_cache
 
+from typing import Optional
+
 from pydantic import AnyUrl, Field, SecretStr, PostgresDsn
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -19,6 +21,15 @@ class AppSettings(BaseSettings):
 	anthropic_api_key: SecretStr = Field(..., env="ANTHROPIC_API_KEY")
 	firecrawl_api_key: SecretStr = Field(..., env="FIRECRAWL_API_KEY")
 	court_listener_api_key: SecretStr = Field(..., env="COURT_LISTENER_API_KEY")
+
+	# GoHighLevel CRM integration (optional — feature disabled if not set)
+	ghl_api_key: Optional[SecretStr] = Field(default=None, env="GHL_API_KEY")
+	ghl_location_id: Optional[str] = Field(default=None, env="GHL_LOCATION_ID")
+	ghl_pipeline_id: Optional[str] = Field(default=None, env="GHL_PIPELINE_ID")
+	# Stage IDs within the GHL pipeline (map to urgency levels)
+	ghl_stage_immediate: Optional[str] = Field(default=None, env="GHL_STAGE_IMMEDIATE")
+	ghl_stage_high: Optional[str] = Field(default=None, env="GHL_STAGE_HIGH")
+	ghl_stage_medium: Optional[str] = Field(default=None, env="GHL_STAGE_MEDIUM")
 
 	# Database Configuration
 	database_url: str = Field(

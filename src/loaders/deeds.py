@@ -60,15 +60,25 @@ class DeedLoader(BaseLoader):
                     skipped += 1
                     continue
             
-            # Match by grantor (seller) name
+            # Match property — try legal description first (most accurate),
+            # then fall back to owner name (Grantor → Grantee).
             property_record = None
-            if pd.notna(row.get('Grantor')):
+
+            # Strategy A: Legal description (lot/block/subdivision → parcel)
+            if pd.notna(row.get('Legal')):
+                match_result = self.find_property_by_legal_description(row['Legal'])
+                if match_result:
+                    property_record, score = match_result
+                    logger.info(f"Matched deed by legal desc (score: {score}%): {instrument}")
+
+            # Strategy B: Grantor (seller) name
+            if not property_record and pd.notna(row.get('Grantor')):
                 match_result = self.find_property_by_owner_name(row['Grantor'])
                 if match_result:
                     property_record, score = match_result
                     logger.info(f"Matched deed by grantor (score: {score}%): {instrument}")
-            
-            # Fallback: Try matching by grantee (buyer) name
+
+            # Strategy C: Grantee (buyer) name
             if not property_record and pd.notna(row.get('Grantee')):
                 match_result = self.find_property_by_owner_name(row['Grantee'])
                 if match_result:

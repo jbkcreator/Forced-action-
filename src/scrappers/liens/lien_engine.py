@@ -173,13 +173,13 @@ async def _playwright_download_document(
         page = await context.new_page()
         try:
             # 1. Navigate
-            await page.goto(HILLSCLERK_PUBLIC_ACCESS_URL, wait_until="domcontentloaded", timeout=30_000)
+            await page.goto(HILLSCLERK_PUBLIC_ACCESS_URL, wait_until="domcontentloaded", timeout=60_000)
 
             # 2. Click "Document Type" search-type link
             await page.click('div[id="ORI-Document Type"]')
 
             # 3. Wait for search form — no DocType selection, all types will be returned
-            await page.wait_for_selector('#OBKey__1285_1', state='attached', timeout=15_000)
+            await page.wait_for_selector('#OBKey__1285_1', state='attached', timeout=25_000)
 
             # 4. Fill date range via JS (chosen dropdown may be open and intercept pointer events)
             await page.evaluate(
@@ -205,7 +205,7 @@ async def _playwright_download_document(
             # 6. Wait for result indicators
             await page.wait_for_selector(
                 '.jsgrid-pager, .alert-danger, #exportResults',
-                timeout=30_000,
+                timeout=45_000,
             )
 
             # 7. Check for error alerts
@@ -237,7 +237,7 @@ async def _playwright_download_document(
             ts = datetime.now().strftime('%Y%m%d_%H%M%S')
             safe_name = doc_type.lower().replace(" ", "_").replace("/", "_")
             dest_path = RAW_LIEN_DIR / f"{safe_name}_{ts}.csv"
-            async with page.expect_download(timeout=60_000) as dl_info:
+            async with page.expect_download(timeout=90_000) as dl_info:
                 await export_btn.click()
             download = await dl_info.value
             await download.save_as(str(dest_path))
@@ -250,95 +250,126 @@ async def _playwright_download_document(
             await browser.close()
 
 
-async def _playwright_download_combined(lookback_days: int = 3) -> Optional[pd.DataFrame]:
+async def _playwright_download_combined(start_str: str, end_str: str) -> Optional[pd.DataFrame]:
     """
-    Single combined download: one Playwright session covers the full lookback window.
+    Single combined download: one Playwright session covers the full date range.
+    Retries up to 5 times on error or no-results (temporary site issue).
     If the result count hits 6000, falls back to day-by-day downloads and merges them.
-    Returns a deduplicated DataFrame of all records, or None if nothing was found.
+    Returns a DataFrame of all records, or None if nothing was found.
     """
-    today = datetime.now()
-    start_date = today - timedelta(days=lookback_days)
-    start_str = start_date.strftime("%m/%d/%Y")
-    end_str   = today.strftime("%m/%d/%Y")
+    MAX_RETRIES = 5
+    overflow = False
 
-    try:
-        path = await _playwright_download_document("Combined", start_str, end_str)
-        if path is None:
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            path = await _playwright_download_document("Combined", start_str, end_str)
+            if path is None:
+                # No results from site — could be temporary; retry before giving up
+                if attempt < MAX_RETRIES:
+                    logger.warning(f"[Combined] No results (attempt {attempt}/{MAX_RETRIES}) — retrying in 5s...")
+                    await asyncio.sleep(5)
+                    continue
+                logger.info(f"[Combined] No results after {MAX_RETRIES} attempts — none in this date range")
+                return None
+            df = process_lien_data(path)
+            logger.info(f"[Combined] Downloaded {len(df)} records ({start_str} → {end_str})")
+            return df
+        except OverflowError:
+            # >6000 results — day-by-day fallback (handled below, no retry needed)
+            overflow = True
+            break
+        except Exception as e:
+            if attempt < MAX_RETRIES:
+                logger.warning(f"[Combined] Attempt {attempt}/{MAX_RETRIES} failed: {e} — retrying in 5s...")
+                await asyncio.sleep(5)
+                continue
+            logger.error(f"[Combined] All {MAX_RETRIES} retries exhausted: {e}")
             return None
-        df = process_lien_data(path)
-        logger.info(f"[Combined] Downloaded {len(df)} records ({start_str} → {end_str})")
-        return df
 
-    except OverflowError:
-        # >6000 results — split into individual days and merge
-        logger.warning(f"[Combined] 6000 limit hit for {lookback_days}-day window — switching to day-by-day")
-        frames = []
-        for offset in range(lookback_days + 1):
-            day = today - timedelta(days=offset)
-            day_str = day.strftime("%m/%d/%Y")
-            logger.info(f"[Combined] Fetching single day: {day_str}")
-            try:
-                path = await _playwright_download_document(f"Combined-{day_str}", day_str, day_str)
-                if path is not None:
-                    frames.append(process_lien_data(path))
-            except OverflowError:
-                logger.error(f"[Combined] Single day {day_str} still >6000 — skipping")
-            except Exception as e:
-                logger.warning(f"[Combined] Day {day_str} failed: {e}")
+    if not overflow:
+        return None
 
-        if not frames:
-            return None
-        combined = pd.concat(frames, ignore_index=True)
-        combined = combined.drop_duplicates(subset=['Instrument'], keep='first')
-        logger.info(f"[Combined] Day-by-day merge: {len(combined)} unique records")
-        return combined
+    # >6000 results — split into individual days and merge
+    logger.warning(f"[Combined] 6000 limit hit — switching to day-by-day")
+    start_dt = datetime.strptime(start_str, "%m/%d/%Y")
+    end_dt   = datetime.strptime(end_str,   "%m/%d/%Y")
+    total_days = (end_dt - start_dt).days
+    frames = []
+    for offset in range(total_days + 1):
+        day = start_dt + timedelta(days=offset)
+        day_str = day.strftime("%m/%d/%Y")
+        logger.info(f"[Combined] Fetching single day: {day_str}")
+        try:
+            path = await _playwright_download_document(f"Combined-{day_str}", day_str, day_str)
+            if path is not None:
+                frames.append(process_lien_data(path))
+        except OverflowError:
+            logger.error(f"[Combined] Single day {day_str} still >6000 — skipping")
+        except Exception as e:
+            logger.warning(f"[Combined] Day {day_str} failed: {e}")
+
+    if not frames:
+        return None
+    combined = pd.concat(frames, ignore_index=True)
+    combined = combined.drop_duplicates(subset=['Instrument'], keep='first')
+    logger.info(f"[Combined] Day-by-day merge: {len(combined)} unique records")
+    return combined
 
 
 async def download_document_by_type(
     doc_type: str,
     doc_type_code: str,
-    lookback_days: int = 1,
+    start_date_str: str,
+    end_date_str: str,
     wait_after_download: int = 40,
     option_value: str = "",
 ) -> Optional[Path]:
     """
     Download a specific document type from Hillsborough County Clerk.
 
-    Tries Playwright first (deterministic, no AI credits). Falls back to the
-    browser-use AI agent if Playwright fails.
+    Tries Playwright first (deterministic, no AI credits). Retries up to 5 times on
+    error or no-results. Falls back to the browser-use AI agent only if all Playwright
+    retries fail with an actual error (not no-results).
     """
-    # ── Playwright (primary) ──────────────────────────────────────────────────
+    # ── Playwright (primary, with retries) ────────────────────────────────────
     if option_value:
         logger.info(f"\n[{doc_type}] Attempting Playwright scraper (primary)...")
-        try:
-            result = await _playwright_download_document(doc_type, option_value, lookback_days)
-            if result is not None:
+        MAX_RETRIES = 5
+        playwright_error = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                result = await _playwright_download_document(doc_type, start_date_str, end_date_str)
+                if result is None:
+                    # No results — retry (could be temporary)
+                    if attempt < MAX_RETRIES:
+                        logger.warning(f"[{doc_type}] No results (attempt {attempt}/{MAX_RETRIES}) — retrying in 5s...")
+                        await asyncio.sleep(5)
+                        continue
+                    logger.info(f"[{doc_type}] No results after {MAX_RETRIES} attempts — none in date range")
+                    return None
                 logger.info(f"[{doc_type}] Playwright scraper succeeded")
                 return result
-            # result is None → no records found (not an error); propagate None
-            return None
-        except Exception as e:
-            logger.warning(f"[{doc_type}] Playwright scraper failed: {e}")
-            logger.info(f"[{doc_type}] Falling back to browser-use AI scraper...")
+            except Exception as e:
+                playwright_error = e
+                if attempt < MAX_RETRIES:
+                    logger.warning(f"[{doc_type}] Playwright attempt {attempt}/{MAX_RETRIES} failed: {e} — retrying in 5s...")
+                    await asyncio.sleep(5)
+                    continue
+                logger.warning(f"[{doc_type}] All Playwright retries failed: {e}")
+        if playwright_error is None:
+            return None  # no-results after all retries
+        logger.info(f"[{doc_type}] Falling back to browser-use AI scraper...")
 
-    # ── AI fallback ───────────────────────────────────────────────────────────
+    # ── AI fallback (only reached on error, not on no-results) ────────────────
     logger.info(f"[{doc_type}] Running browser-use AI scraper...")
 
     try:
         RAW_LIEN_DIR.mkdir(parents=True, exist_ok=True)
-        
+
         save_dir = os.path.abspath(str(RAW_LIEN_DIR))
         start_time = time.time()
-        
-        # Calculate date range
-        today = datetime.now()
-        start_date = today - timedelta(days=lookback_days)
-        
-        # Format dates for the form (MM/DD/YYYY format)
-        start_date_str = start_date.strftime("%m/%d/%Y")
-        end_date_str = today.strftime("%m/%d/%Y")
-        
-        logger.info(f"[{doc_type}] Fetching records from {start_date_str} to {end_date_str} ({lookback_days} days)")
+
+        logger.info(f"[{doc_type}] Fetching records from {start_date_str} to {end_date_str}")
         
         # Load task prompt from YAML configuration
         try:
@@ -414,8 +445,10 @@ async def download_document_by_type(
                 return None
             
             # Create safe filename from doc_type
+            start_dt_parsed = datetime.strptime(start_date_str, "%m/%d/%Y")
+            end_dt_parsed   = datetime.strptime(end_date_str,   "%m/%d/%Y")
             safe_doc_name = doc_type.lower().replace(" ", "_").replace("/", "_")
-            final_filename = f"{safe_doc_name}_{start_date.strftime('%Y%m%d')}_{today.strftime('%Y%m%d')}{downloaded_file.suffix}"
+            final_filename = f"{safe_doc_name}_{start_dt_parsed.strftime('%Y%m%d')}_{end_dt_parsed.strftime('%Y%m%d')}{downloaded_file.suffix}"
             dest_file = RAW_LIEN_DIR / final_filename
             
             # Move/Rename file to final destination
@@ -444,7 +477,8 @@ async def download_document_by_type(
 
 
 async def download_lien_records(
-    lookback_days: int = 1,
+    start_date_str: str,
+    end_date_str: str,
     wait_after_download: int = 40,
 ) -> Optional[Path]:
     """
@@ -453,7 +487,8 @@ async def download_lien_records(
     return await download_document_by_type(
         doc_type="General Liens",
         doc_type_code="LIEN",
-        lookback_days=lookback_days,
+        start_date_str=start_date_str,
+        end_date_str=end_date_str,
         wait_after_download=wait_after_download,
     )
 
@@ -559,90 +594,45 @@ def categorize_and_split_data(combined_df: pd.DataFrame) -> dict:
     logger.info(f"Categorization: {len(combined_df) - skipped} kept, {skipped} discarded (non-relevant DocTypes)")
     
     PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    temp_dir = PROCESSED_DATA_DIR / "temp"
-    temp_dir.mkdir(parents=True, exist_ok=True)
     file_counts = {}
     
-    # Save liens with deduplication — isolated to PROCESSED_LIENS_DIR
+    today_str = datetime.now().strftime('%Y%m%d')
+
+    # Save liens — isolated to PROCESSED_LIENS_DIR/new/
     liens_df = combined_df[combined_df['document_type'].isin(lien_types)]
     if not liens_df.empty:
-        temp_file = temp_dir / "liens_temp.csv"
-        liens_df.to_csv(temp_file, index=False)
-        try:
-            unique_keys = get_unique_keys_for_type('liens')
-            today = datetime.now().strftime('%Y%m%d')
-            liens_path = deduplicate_csv(
-                new_csv_path=temp_file,
-                destination_dir=PROCESSED_LIENS_DIR,
-                unique_key_columns=unique_keys,
-                output_filename=f"all_liens_{today}.csv",
-                keep_original=False
-            )
-            file_counts[liens_path.name] = len(pd.read_csv(liens_path))
-            logger.info(f"Saved {file_counts[liens_path.name]} lien records to {liens_path.name}")
-        except Exception as e:
-            logger.error(f"Lien deduplication failed: {e}, saving without deduplication")
-            liens_path = PROCESSED_LIENS_DIR / "all_liens.csv"
-            liens_df.to_csv(liens_path, index=False)
-            file_counts['all_liens.csv'] = len(liens_df)
-            logger.info(f"Saved {len(liens_df)} lien records to {liens_path.name}")
-
+        new_dir = PROCESSED_LIENS_DIR / "new"
+        new_dir.mkdir(parents=True, exist_ok=True)
+        liens_path = new_dir / f"all_liens_{today_str}.csv"
+        liens_df.to_csv(liens_path, index=False)
+        file_counts[liens_path.name] = len(liens_df)
+        logger.info(f"Saved {len(liens_df)} lien records to {liens_path.name}")
         for doc_type in liens_df['document_type'].unique():
             count = len(liens_df[liens_df['document_type'] == doc_type])
             logger.info(f"  - {doc_type}: {count} records")
 
-    # Save deeds with deduplication — isolated to PROCESSED_DEEDS_DIR
+    # Save deeds — isolated to PROCESSED_DEEDS_DIR/new/
     deeds_df = combined_df[combined_df['document_type'].isin(deed_types)]
     if not deeds_df.empty:
-        temp_file = temp_dir / "deeds_temp.csv"
-        deeds_df.to_csv(temp_file, index=False)
-        try:
-            unique_keys = get_unique_keys_for_type('deeds')
-            today = datetime.now().strftime('%Y%m%d')
-            deeds_path = deduplicate_csv(
-                new_csv_path=temp_file,
-                destination_dir=PROCESSED_DEEDS_DIR,
-                unique_key_columns=unique_keys,
-                output_filename=f"all_deeds_{today}.csv",
-                keep_original=False
-            )
-            file_counts[deeds_path.name] = len(pd.read_csv(deeds_path))
-            logger.info(f"Saved {file_counts[deeds_path.name]} deed records to {deeds_path.name}")
-        except Exception as e:
-            logger.error(f"Deed deduplication failed: {e}, saving without deduplication")
-            deeds_path = PROCESSED_DEEDS_DIR / "all_deeds.csv"
-            deeds_df.to_csv(deeds_path, index=False)
-            file_counts['all_deeds.csv'] = len(deeds_df)
-            logger.info(f"Saved {len(deeds_df)} deed records to {deeds_path.name}")
-
+        new_dir = PROCESSED_DEEDS_DIR / "new"
+        new_dir.mkdir(parents=True, exist_ok=True)
+        deeds_path = new_dir / f"all_deeds_{today_str}.csv"
+        deeds_df.to_csv(deeds_path, index=False)
+        file_counts[deeds_path.name] = len(deeds_df)
+        logger.info(f"Saved {len(deeds_df)} deed records to {deeds_path.name}")
         for doc_type in deeds_df['document_type'].unique():
             count = len(deeds_df[deeds_df['document_type'] == doc_type])
             logger.info(f"  - {doc_type}: {count} records")
 
-    # Save judgments with deduplication — isolated to PROCESSED_JUDGMENTS_DIR
+    # Save judgments — isolated to PROCESSED_JUDGMENTS_DIR/new/
     judgments_df = combined_df[combined_df['document_type'].isin(judgment_types)]
     if not judgments_df.empty:
-        temp_file = temp_dir / "judgments_temp.csv"
-        judgments_df.to_csv(temp_file, index=False)
-        try:
-            unique_keys = get_unique_keys_for_type('judgments')
-            today = datetime.now().strftime('%Y%m%d')
-            judgments_path = deduplicate_csv(
-                new_csv_path=temp_file,
-                destination_dir=PROCESSED_JUDGMENTS_DIR,
-                unique_key_columns=unique_keys,
-                output_filename=f"all_judgments_{today}.csv",
-                keep_original=False
-            )
-            file_counts[judgments_path.name] = len(pd.read_csv(judgments_path))
-            logger.info(f"Saved {file_counts[judgments_path.name]} judgment records to {judgments_path.name}")
-        except Exception as e:
-            logger.error(f"Judgment deduplication failed: {e}, saving without deduplication")
-            judgments_path = PROCESSED_JUDGMENTS_DIR / "all_judgments.csv"
-            judgments_df.to_csv(judgments_path, index=False)
-            file_counts['all_judgments.csv'] = len(judgments_df)
-            logger.info(f"Saved {len(judgments_df)} judgment records to {judgments_path.name}")
-
+        new_dir = PROCESSED_JUDGMENTS_DIR / "new"
+        new_dir.mkdir(parents=True, exist_ok=True)
+        judgments_path = new_dir / f"all_judgments_{today_str}.csv"
+        judgments_df.to_csv(judgments_path, index=False)
+        file_counts[judgments_path.name] = len(judgments_df)
+        logger.info(f"Saved {len(judgments_df)} judgment records to {judgments_path.name}")
         for doc_type in judgments_df['document_type'].unique():
             count = len(judgments_df[judgments_df['document_type'] == doc_type])
             logger.info(f"  - {doc_type}: {count} records")
@@ -709,14 +699,22 @@ def save_processed_liens(df: pd.DataFrame, output_filename: str = "lien_data.csv
         raise
 
 
-async def run_lien_pipeline(lookback_days: int = 1, run_all: bool = False, mode: str = 'all'):
+async def run_lien_pipeline(start_date: str = None, end_date: str = None, run_all: bool = False, mode: str = 'all'):
     """
     Execute the lien and judgment data collection pipeline.
     """
     logger.info("=" * 60)
     logger.info("HILLSBOROUGH COUNTY LIEN & JUDGMENT RECORDS - DATA COLLECTION")
     logger.info("=" * 60)
-    
+
+    # Compute date range (YYYY-MM-DD → MM/DD/YYYY for site forms)
+    _today = datetime.now()
+    _end_dt   = datetime.strptime(end_date,   "%Y-%m-%d") if end_date   else _today
+    _start_dt = datetime.strptime(start_date, "%Y-%m-%d") if start_date else (_end_dt - timedelta(days=3))
+    start_str = _start_dt.strftime("%m/%d/%Y")
+    end_str   = _end_dt.strftime("%m/%d/%Y")
+    logger.info(f"Date range: {start_str} → {end_str}")
+
     # County export ignores the DocType filter — every download returns all record types.
     # Map doc_code → the DocType value(s) that appear in the exported CSV's DocType column.
     # After download, rows not matching are dropped before any further processing.
@@ -745,7 +743,7 @@ async def run_lien_pipeline(lookback_days: int = 1, run_all: bool = False, mode:
     try:
         if mode == 'combined':
             logger.info("Execution mode: COMBINED — single Playwright download, Python-side DocType routing")
-            combined_df = await _playwright_download_combined(lookback_days)
+            combined_df = await _playwright_download_combined(start_str, end_str)
             if combined_df is None:
                 logger.error("Combined download returned no data — check county site or date range")
                 return
@@ -772,7 +770,7 @@ async def run_lien_pipeline(lookback_days: int = 1, run_all: bool = False, mode:
             logger.warning("Parallel mode uses multiple API credits")
 
             tasks = [
-                download_document_by_type(doc_name, doc_code, lookback_days, option_value=opt_val)
+                download_document_by_type(doc_name, doc_code, start_str, end_str, option_value=opt_val)
                 for doc_name, doc_code, opt_val in doc_configs
             ]
 
@@ -847,7 +845,7 @@ async def run_lien_pipeline(lookback_days: int = 1, run_all: bool = False, mode:
                 logger.info(f"[{idx}/{len(doc_configs)}] Starting document type: {doc_name}")
                 logger.info("=" * 60)
 
-                result = await download_document_by_type(doc_name, doc_code, lookback_days, option_value=opt_val)
+                result = await download_document_by_type(doc_name, doc_code, start_str, end_str, option_value=opt_val)
                 
                 if result is None:
                     logger.warning(f"{doc_name} download failed, continuing to next document type")
@@ -907,10 +905,16 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description="Scrape Hillsborough County liens, deeds, and judgments")
     parser.add_argument(
-        "--lookback",
-        type=int,
-        default=1,
-        help="Number of days to look back (default: 1)"
+        "--start-date",
+        type=str,
+        default=None,
+        help="Start date in YYYY-MM-DD format (default: 3 days ago). Example: 2026-02-28"
+    )
+    parser.add_argument(
+        "--end-date",
+        type=str,
+        default=None,
+        help="End date in YYYY-MM-DD format (default: today). Example: 2026-03-03"
     )
     parser.add_argument(
         "--mode",
@@ -937,7 +941,7 @@ if __name__ == "__main__":
     MULTI_OUTPUT_MODES = {'all', 'combined'}
 
     try:
-        asyncio.run(run_lien_pipeline(lookback_days=args.lookback, run_all=args.all, mode=args.mode))
+        asyncio.run(run_lien_pipeline(start_date=args.start_date, end_date=args.end_date, run_all=args.all, mode=args.mode))
 
         if args.load_to_db:
             load_modes = list(MODE_DIR_MAP.keys()) if args.mode in MULTI_OUTPUT_MODES else [args.mode]

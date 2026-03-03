@@ -314,149 +314,286 @@ class BaseLoader(ABC):
         threshold: int = 85
     ) -> Optional[Tuple[Property, int]]:
         """
-        Find property by indexed database lookup with exact match.
-        
-        Uses same normalization as CSV matching for consistency.
-        
+        Find property by address using three escalating strategies.
+
+        Strategy 1 — SQL ILIKE on house-number prefix (indexed, fast).
+                     Narrows the table to properties sharing the same street
+                     number, then exact-compares normalized forms in Python.
+        Strategy 2 — pg_trgm similarity() on properties.address (DB-side,
+                     uses GIN trigram index).  Wrapped in begin_nested()
+                     savepoint so a ProgrammingError when pg_trgm is not yet
+                     installed does not abort the outer transaction.
+        Strategy 3 — rapidfuzz partial_ratio on the pg_trgm candidates (or
+                     on the ILIKE candidates when Strategy 2 is unavailable)
+                     to pick the best-scoring result above the threshold.
+
         Args:
-            address: Address to search for
-            threshold: Minimum similarity score (0-100) - kept for compatibility
-            
+            address:   Raw address string from the scraper output.
+            threshold: Minimum rapidfuzz score to accept (0-100).
+
         Returns:
-            Tuple of (Property, score) or None
+            Tuple of (Property, score) or None.
         """
         if pd.isna(address) or not address:
             return None
-        
+
         normalized_search = self.normalize_address(address)
         if not normalized_search:
             return None
-        
-        # Strategy 1: Direct string matching using normalized address
-        # Query all properties and normalize their addresses (could be optimized with a computed column)
-        properties = self.session.query(Property).filter(
-            Property.address.isnot(None)
-        ).all()
-        
-        for prop in properties:
+
+        # ── Strategy 1: SQL ILIKE on house number prefix ─────────────────
+        # Extract the leading house number so we only pull a small slice of
+        # the table rather than scanning all 522 k rows in Python.
+        house_number = normalized_search.split()[0] if normalized_search.split() else ""
+        candidates: list = []
+
+        if house_number and house_number.isdigit():
+            ilike_rows = (
+                self.session.query(Property)
+                .filter(Property.address.ilike(f"{house_number} %"))
+                .all()
+            )
+            for prop in ilike_rows:
+                if not prop.address:
+                    continue
+                normalized_prop = self.normalize_address(prop.address)
+                if normalized_prop == normalized_search:
+                    return prop, 100   # exact match — done
+                if normalized_prop:
+                    candidates.append((prop, normalized_prop))
+
+        # ── Strategy 2: pg_trgm full-table similarity ────────────────────
+        trgm_props: list = []
+        try:
+            from sqlalchemy import func as sqlfunc
+            with self.session.begin_nested():   # savepoint — protects outer tx
+                trgm_props = (
+                    self.session.query(Property)
+                    .filter(
+                        Property.address.isnot(None),
+                        sqlfunc.similarity(Property.address, address) >= 0.3,
+                    )
+                    .order_by(sqlfunc.similarity(Property.address, address).desc())
+                    .limit(15)
+                    .all()
+                )
+        except Exception:
+            # pg_trgm not installed — savepoint rolled back, outer tx survives
+            trgm_props = []
+
+        for prop in trgm_props:
             if not prop.address:
                 continue
-            
             normalized_prop = self.normalize_address(prop.address)
-            
-            # Exact match after normalization
-            if normalized_search == normalized_prop:
-                return prop, 100
-        
-        # Strategy 2: Fuzzy match fallback if no exact match
-        # Only check first 1000 properties to avoid performance issues
-        best_match = None
+            if normalized_prop and (prop.id, normalized_prop) not in {(p.id, n) for p, n in candidates}:
+                candidates.append((prop, normalized_prop))
+
+        # ── Strategy 3: rapidfuzz score on all candidates ────────────────
+        best_match: Optional[Property] = None
         best_score = 0
-        
-        check_limit = min(1000, len(properties))
-        for i, prop in enumerate(properties[:check_limit]):
-            if not prop.address:
-                continue
-            
-            normalized_prop = self.normalize_address(prop.address)
-            if not normalized_prop:
-                continue
-            
-            score = fuzz.ratio(normalized_search, normalized_prop)
-            
+
+        for prop, normalized_prop in candidates:
+            score = fuzz.token_sort_ratio(normalized_search, normalized_prop)
             if score > best_score:
                 best_score = score
                 best_match = prop
-        
+
         if best_score >= threshold:
             return best_match, best_score
-        
+
         return None
     
+    def find_property_by_legal_description(
+        self,
+        legal_text: str,
+        threshold: int = 70,
+    ) -> Optional[Tuple[Property, int]]:
+        """
+        Find property by parsing the legal description from a county recorder record.
+
+        Strategy:
+          1. Extract lot number, block number, and subdivision name from the
+             incoming text using regex.
+          2. Build a multi-ILIKE query against properties.legal_description
+             using the extracted tokens (GIN trigram index makes this fast).
+          3. Score each candidate with token_sort_ratio and return the best
+             match above the threshold.
+
+        This is the highest-confidence matching method for liens, deeds, and
+        judgments — legal descriptions uniquely identify a parcel and do not
+        vary in format the way owner names do.
+
+        Args:
+            legal_text: The 'Legal' field value from the county recorder CSV.
+            threshold:  Minimum rapidfuzz score to accept (0-100).
+
+        Returns:
+            Tuple of (Property, score) or None.
+        """
+        if not legal_text or pd.isna(legal_text):
+            return None
+
+        legal = str(legal_text).upper().strip()
+        if not legal:
+            return None
+
+        # ── Parse key tokens ────────────────────────────────────────────────
+        lot_match   = re.search(r'\bLOT\s+(\d+\w*)\b', legal)
+        block_match = re.search(r'\bB(?:LOCK|LK)\s+(\d+\w*)\b', legal)
+
+        # Subdivision = text before the first structural keyword
+        subd_raw = re.split(r'\b(?:LOT|BLK|BLOCK|SEC|SECTION|UNIT|TRACT)\b', legal)[0].strip()
+        # Keep only words longer than 3 chars (skip filler like "OF", "THE")
+        subd_words = [w for w in subd_raw.split() if len(w) > 3][:4]
+
+        if not lot_match and not subd_words:
+            return None  # Not enough info to narrow down
+
+        # ── Build ILIKE filters ──────────────────────────────────────────────
+        from sqlalchemy import and_
+
+        filters = [Property.legal_description.isnot(None)]
+
+        if lot_match:
+            filters.append(Property.legal_description.ilike(f'%LOT {lot_match.group(1)}%'))
+        if block_match:
+            filters.append(Property.legal_description.ilike(f'%{block_match.group(0)}%'))
+        for word in subd_words:
+            filters.append(Property.legal_description.ilike(f'%{word}%'))
+
+        candidates = (
+            self.session.query(Property)
+            .filter(and_(*filters))
+            .limit(10)
+            .all()
+        )
+
+        if not candidates:
+            return None
+
+        # ── Score candidates ────────────────────────────────────────────────
+        best_match = None
+        best_score = 0
+        for prop in candidates:
+            if not prop.legal_description:
+                continue
+            score = fuzz.token_sort_ratio(legal, prop.legal_description.upper())
+            if score > best_score:
+                best_score = score
+                best_match = prop
+
+        if best_score >= threshold:
+            return best_match, best_score
+
+        return None
+
     def find_property_by_owner_name(
         self,
         owner_name: str,
         threshold: int = 75
     ) -> Optional[Tuple[Property, int]]:
         """
-        Find property by indexed owner name lookup with fuzzy fallback.
-        
-        Uses efficient database queries with indexes before falling back
-        to fuzzy matching on a limited result set.
-        
+        Find property by owner name with three escalating strategies.
+
+        Strategy 1 — Exact ilike (uses index, instant).
+        Strategy 2 — LIKE pattern match on first+last parts, tried in both
+                     word orders (handles property-appraiser "LAST FIRST" vs
+                     recorder "FIRST LAST" format difference), fuzzy-scored
+                     on up to 50 candidates.
+        Strategy 3 — pg_trgm full-table similarity search (DB-side, uses GIN
+                     trigram index, covers all 500k+ owners efficiently).
+                     Falls back gracefully if pg_trgm is not installed.
+
         Args:
-            owner_name: Owner name to search for
-            threshold: Minimum similarity score (0-100)
-            
+            owner_name: Raw owner/grantor name from the source record.
+            threshold:  Minimum rapidfuzz score to accept (0-100).
+
         Returns:
-            Tuple of (Property, score) or None
+            Tuple of (Property, score) or None.
         """
         if pd.isna(owner_name) or not owner_name:
             return None
-        
+
         normalized_search = self.normalize_owner_name(owner_name)
         if not normalized_search:
             return None
-        
-        # Strategy 1: Exact match (fastest - uses index)
+
+        # ── Strategy 1: Exact case-insensitive match ─────────────────────
         exact_owner = self.session.query(Owner).filter(
             Owner.owner_name.ilike(normalized_search)
         ).first()
-        
         if exact_owner:
             return exact_owner.property, 100
-        
-        # Strategy 2: Partial match with LIKE (uses index)
-        # Try matching on first and last name parts
+
+        # ── Strategy 2: LIKE pattern + fuzzy (both word orders) ──────────
         search_parts = normalized_search.split()
-        if len(search_parts) >= 2:
-            # Match on first and last name
-            name_pattern = f"%{search_parts[0]}%{search_parts[-1]}%"
-            partial_matches = self.session.query(Owner).filter(
-                Owner.owner_name.ilike(name_pattern)
-            ).limit(50).all()
-            
-            if partial_matches:
-                best_match = None
-                best_score = 0
-                
-                for owner in partial_matches:
-                    if not owner.owner_name:
-                        continue
-                    
-                    normalized_owner = self.normalize_owner_name(owner.owner_name)
-                    # Use token_sort_ratio for word order independence
-                    score = fuzz.token_sort_ratio(normalized_search, normalized_owner)
-                    
-                    if score > best_score:
-                        best_score = score
-                        best_match = owner.property
-                
-                if best_score >= threshold:
-                    return best_match, best_score
-        
-        # Strategy 3: Last resort - check first 100 owners only
-        # This avoids loading all 530k owners into memory
-        owners = self.session.query(Owner).limit(100).all()
-        
-        best_match = None
+        best_match: Optional[Property] = None
         best_score = 0
-        
-        for owner in owners:
+
+        if len(search_parts) >= 2:
+            # Try both "FIRST ... LAST" and "LAST ... FIRST" patterns
+            # because property appraiser stores LAST FIRST, recorder stores FIRST LAST
+            patterns = [
+                f"%{search_parts[0]}%{search_parts[-1]}%",   # original order
+                f"%{search_parts[-1]}%{search_parts[0]}%",   # reversed order
+            ]
+            seen_ids: set = set()
+            candidates = []
+            for pattern in patterns:
+                rows = self.session.query(Owner).filter(
+                    Owner.owner_name.ilike(pattern)
+                ).limit(50).all()
+                for r in rows:
+                    if r.id not in seen_ids:
+                        seen_ids.add(r.id)
+                        candidates.append(r)
+
+            for owner in candidates:
+                if not owner.owner_name:
+                    continue
+                normalized_owner = self.normalize_owner_name(owner.owner_name)
+                score = fuzz.token_sort_ratio(normalized_search, normalized_owner)
+                if score > best_score:
+                    best_score = score
+                    best_match = owner.property
+
+            if best_score >= threshold:
+                return best_match, best_score
+
+        # ── Strategy 3: pg_trgm full-table similarity (replaces 100-row cap) ─
+        # Uses GIN trigram index — DB-side scan, no Python loop over 500k rows.
+        # IMPORTANT: wrapped in begin_nested() (savepoint) so that a ProgrammingError
+        # from similarity() when pg_trgm is not installed rolls back only the savepoint
+        # and leaves the outer transaction alive. A bare try/except is NOT enough —
+        # psycopg2 aborts the entire transaction on any SQL error, so subsequent queries
+        # (e.g. duplicate checks for the next record) would fail with InFailedSqlTransaction.
+        trgm_owners = []
+        try:
+            from sqlalchemy import func as sqlfunc
+            with self.session.begin_nested():   # savepoint
+                trgm_owners = (
+                    self.session.query(Owner)
+                    .filter(sqlfunc.similarity(Owner.owner_name, normalized_search) >= 0.35)
+                    .order_by(sqlfunc.similarity(Owner.owner_name, normalized_search).desc())
+                    .limit(10)
+                    .all()
+                )
+        except Exception:
+            # pg_trgm not installed — savepoint rolled back, outer transaction intact
+            trgm_owners = []
+
+        for owner in trgm_owners:
             if not owner.owner_name:
                 continue
-            
             normalized_owner = self.normalize_owner_name(owner.owner_name)
-            # Use token_sort_ratio for word order independence
             score = fuzz.token_sort_ratio(normalized_search, normalized_owner)
-            
             if score > best_score:
                 best_score = score
                 best_match = owner.property
-        
+
         if best_score >= threshold:
             return best_match, best_score
-        
+
         return None
     
     # ========================================================================

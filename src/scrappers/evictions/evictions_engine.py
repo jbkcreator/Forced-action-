@@ -25,6 +25,8 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
+from src.utils.http_helpers import requests_get_with_retry
+
 from config.constants import (
 	CIVIL_FILINGS_URL,
 	RAW_EVICTIONS_DIR,
@@ -77,14 +79,11 @@ def download_latest_civil_filing() -> Path:
 		logger.debug(f"Ensured download directory exists: {RAW_EVICTIONS_DIR}")
 		
 		# Fetch the directory listing page
-		response = requests.get(
+		response = requests_get_with_retry(
 			CIVIL_FILINGS_URL,
-			headers={
-				"User-Agent": DEFAULT_USER_AGENT
-			},
+			headers={"User-Agent": DEFAULT_USER_AGENT},
 			timeout=REQUEST_TIMEOUT_DEFAULT,
 		)
-		response.raise_for_status()
 		logger.debug(f"Successfully fetched directory listing (status code: {response.status_code})")
 		
 	except requests.Timeout as e:
@@ -155,14 +154,11 @@ def download_latest_civil_filing() -> Path:
 		output_path = RAW_EVICTIONS_DIR / filename
 		
 		logger.info(f"Downloading civil filing from: {download_url}")
-		file_response = requests.get(
+		file_response = requests_get_with_retry(
 			download_url,
-			headers={
-				"User-Agent": DEFAULT_USER_AGENT
-			},
+			headers={"User-Agent": DEFAULT_USER_AGENT},
 			timeout=REQUEST_TIMEOUT_LONG,
 		)
-		file_response.raise_for_status()
 		
 		# Save to disk
 		output_path.write_bytes(file_response.content)

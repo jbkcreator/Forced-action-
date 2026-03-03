@@ -212,12 +212,12 @@ async def scrape_foreclosures_with_playwright(
 		)
 		page = await browser.new_page()
 		try:
-			await page.goto(preview_url, wait_until="domcontentloaded", timeout=30_000)
+			await page.goto(preview_url, wait_until="domcontentloaded", timeout=60_000)
 
 			# Give JS time to render the auction container
 			try:
 				await page.wait_for_selector(
-					"#BID_WINDOW_CONTAINER", state="attached", timeout=20_000
+					"#BID_WINDOW_CONTAINER", state="attached", timeout=30_000
 				)
 			except Exception:
 				# Container absent → no auctions scheduled for this date
@@ -393,20 +393,29 @@ async def scrape_realforeclose_calendar(
 	"""
 	csv_file = None
 	playwright_succeeded = False  # True = Playwright ran cleanly (even if no records)
+	MAX_PLAYWRIGHT_RETRIES = 5
 
 	if scraper in ("auto", "playwright"):
 		logger.info("\nAttempting Playwright scraping (primary method)...")
-		try:
-			csv_file = await scrape_foreclosures_with_playwright(auction_date)
-			playwright_succeeded = True
-			logger.info("Playwright scraping succeeded")
-		except Exception as e:
-			if scraper == "playwright":
-				raise
-			logger.warning(f"Playwright scraping failed: {e}")
-			logger.info("Falling back to browser-use AI scraper...")
+		playwright_error = None
+		for attempt in range(1, MAX_PLAYWRIGHT_RETRIES + 1):
+			try:
+				csv_file = await scrape_foreclosures_with_playwright(auction_date)
+				playwright_succeeded = True
+				logger.info("Playwright scraping succeeded")
+				playwright_error = None
+				break
+			except Exception as e:
+				if scraper == "playwright":
+					raise
+				playwright_error = e
+				if attempt < MAX_PLAYWRIGHT_RETRIES:
+					logger.warning(f"[Playwright] Attempt {attempt}/{MAX_PLAYWRIGHT_RETRIES} failed: {e} — retrying in 5s...")
+					await asyncio.sleep(5)
+					continue
+				logger.warning(f"[Playwright] All {MAX_PLAYWRIGHT_RETRIES} retries failed")
 
-	# Only fall back to AI if Playwright raised (didn't complete cleanly)
+	# Only fall back to AI if Playwright raised on every attempt (didn't complete cleanly)
 	if scraper == "ai" or (scraper == "auto" and not playwright_succeeded):
 		logger.info("Running browser-use AI scraper...")
 		csv_file = await _scrape_with_ai(auction_date, wait_after_scrape)

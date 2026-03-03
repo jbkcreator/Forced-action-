@@ -3,7 +3,7 @@ Database models for Distressed Property Intelligence Platform.
 Implements the Hub-and-Spoke architecture with properties as the central hub.
 """
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import List, Optional
 
 from sqlalchemy import (
@@ -238,6 +238,10 @@ class CodeViolation(Base):
     fine_amount: Mapped[Optional[float]] = mapped_column(Numeric(10, 2))
     is_lien: Mapped[Optional[bool]] = mapped_column(Boolean, default=False)
 
+    # Load tracking & multi-county
+    date_added: Mapped[Optional[date]] = mapped_column(Date, default=date.today, index=True)
+    county_id: Mapped[Optional[str]] = mapped_column(String(50), default='hillsborough', index=True)
+
     # Relationship
     property: Mapped["Property"] = relationship("Property", back_populates="code_violations")
 
@@ -286,6 +290,10 @@ class LegalAndLien(Base):
     document_type: Mapped[Optional[str]] = mapped_column(String(100))  # CCL, TCL, ML, TL, HL, Judgment
     legal_description: Mapped[Optional[str]] = mapped_column(Text)
     meta_data: Mapped[Optional[dict]] = mapped_column(JSONB)  # Additional type-specific fields
+
+    # Load tracking & multi-county
+    date_added: Mapped[Optional[date]] = mapped_column(Date, default=date.today, index=True)
+    county_id: Mapped[Optional[str]] = mapped_column(String(50), default='hillsborough', index=True)
 
     # Relationship
     property: Mapped["Property"] = relationship("Property", back_populates="legal_and_liens")
@@ -338,6 +346,10 @@ class Deed(Base):
     # Legal description
     legal_description: Mapped[Optional[str]] = mapped_column(Text)
 
+    # Load tracking & multi-county
+    date_added: Mapped[Optional[date]] = mapped_column(Date, default=date.today, index=True)
+    county_id: Mapped[Optional[str]] = mapped_column(String(50), default='hillsborough', index=True)
+
     # Relationship
     property: Mapped["Property"] = relationship("Property", back_populates="deeds")
 
@@ -385,6 +397,10 @@ class LegalProceeding(Base):
     # Flexible metadata bucket for type-specific fields
     meta_data: Mapped[Optional[dict]] = mapped_column(JSONB)
 
+    # Load tracking & multi-county
+    date_added: Mapped[Optional[date]] = mapped_column(Date, default=date.today, index=True)
+    county_id: Mapped[Optional[str]] = mapped_column(String(50), default='hillsborough', index=True)
+
     # Relationship
     property: Mapped["Property"] = relationship("Property", back_populates="legal_proceedings")
 
@@ -421,6 +437,10 @@ class TaxDelinquency(Base):
     certificate_data: Mapped[Optional[str]] = mapped_column(String(255))
     deed_app_date: Mapped[Optional[datetime]] = mapped_column(Date)
 
+    # Load tracking & multi-county
+    date_added: Mapped[Optional[date]] = mapped_column(Date, default=date.today, index=True)
+    county_id: Mapped[Optional[str]] = mapped_column(String(50), default='hillsborough', index=True)
+
     # Relationship
     property: Mapped["Property"] = relationship("Property", back_populates="tax_delinquencies")
 
@@ -456,6 +476,10 @@ class Foreclosure(Base):
     judgment_amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
     auction_date: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
+    # Load tracking & multi-county
+    date_added: Mapped[Optional[date]] = mapped_column(Date, default=date.today, index=True)
+    county_id: Mapped[Optional[str]] = mapped_column(String(50), default='hillsborough', index=True)
+
     # Relationship
     property: Mapped["Property"] = relationship("Property", back_populates="foreclosures")
 
@@ -489,6 +513,10 @@ class BuildingPermit(Base):
     issue_date: Mapped[Optional[datetime]] = mapped_column(Date)
     expire_date: Mapped[Optional[datetime]] = mapped_column(Date)
     status: Mapped[Optional[str]] = mapped_column(String(50))
+
+    # Load tracking & multi-county
+    date_added: Mapped[Optional[date]] = mapped_column(Date, default=date.today, index=True)
+    county_id: Mapped[Optional[str]] = mapped_column(String(50), default='hillsborough', index=True)
 
     # Relationship
     property: Mapped["Property"] = relationship("Property", back_populates="building_permits")
@@ -524,6 +552,10 @@ class Incident(Base):
     crime_types: Mapped[Optional[dict]] = mapped_column(JSONB)
     problem_prop_flag: Mapped[Optional[bool]] = mapped_column(Boolean, default=False)
 
+    # Load tracking & multi-county
+    date_added: Mapped[Optional[date]] = mapped_column(Date, default=date.today, index=True)
+    county_id: Mapped[Optional[str]] = mapped_column(String(50), default='hillsborough', index=True)
+
     # Relationship
     property: Mapped["Property"] = relationship("Property", back_populates="incidents")
 
@@ -557,6 +589,7 @@ class DistressScore(Base):
 
     # Foreign Key
     property_id: Mapped[int] = mapped_column(ForeignKey("properties.id"), nullable=False, index=True)
+    vertical_scores: Mapped[Optional[dict]] = mapped_column(JSONB)
 
     # Scoring Information
     score_date: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)

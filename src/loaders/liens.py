@@ -69,9 +69,19 @@ class LienLoader(BaseLoader):
                 skipped += 1
                 continue
             
-            # Match by owner name (Grantor)
+            # Match property — try legal description first (most accurate),
+            # then fall back to owner name (Grantor).
             property_record = None
-            if pd.notna(row.get('Grantor')):
+
+            # Strategy A: Legal description (lot/block/subdivision → parcel)
+            if pd.notna(row.get('Legal')):
+                match_result = self.find_property_by_legal_description(row['Legal'])
+                if match_result:
+                    property_record, score = match_result
+                    logger.info(f"Matched lien by legal desc (score: {score}%): {instrument}")
+
+            # Strategy B: Owner name (Grantor)
+            if not property_record and pd.notna(row.get('Grantor')):
                 match_result = self.find_property_by_owner_name(row['Grantor'])
                 if match_result:
                     property_record, score = match_result

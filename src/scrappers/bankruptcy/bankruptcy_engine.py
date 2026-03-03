@@ -24,6 +24,7 @@ import pandas as pd
 import requests
 
 from config.settings import settings
+from src.utils.http_helpers import requests_get_with_retry
 from config.constants import (
 	COURTLISTENER_API_URL,
 	COURT_CODE_FLORIDA_MIDDLE_BANKRUPTCY,
@@ -82,13 +83,12 @@ def fetch_bankruptcy_filings(lookback_days: int = 1) -> List[Dict[str, Any]]:
 	}
 	
 	try:
-		response = requests.get(
+		response = requests_get_with_retry(
 			COURTLISTENER_API_URL,
 			params=params,
 			headers=headers,
 			timeout=REQUEST_TIMEOUT_DEFAULT,
 		)
-		response.raise_for_status()
 		logger.debug(f"Successfully fetched API response (status code: {response.status_code})")
 		
 	except requests.Timeout as e:

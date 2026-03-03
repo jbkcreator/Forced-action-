@@ -131,9 +131,9 @@ OUTPUT_DATE_FORMAT = "%Y%m%d"
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 API_USER_AGENT = "DistressedPropertyApp/1.0"
 
-REQUEST_TIMEOUT_DEFAULT = 30  # seconds
-REQUEST_TIMEOUT_LONG = 60  # seconds
-REQUEST_TIMEOUT_EXTENDED = 180  # seconds
+REQUEST_TIMEOUT_DEFAULT = 60   # seconds
+REQUEST_TIMEOUT_LONG = 120     # seconds
+REQUEST_TIMEOUT_EXTENDED = 300 # seconds
 
 # =============================================================================
 # BROWSER AUTOMATION CONFIGURATION

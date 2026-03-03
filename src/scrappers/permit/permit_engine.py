@@ -142,14 +142,14 @@ async def scrape_permits_with_playwright(
 
 		try:
 			# 1. Load the portal
-			await page.goto(PERMIT_SEARCH_URL, wait_until='domcontentloaded', timeout=30000)
+			await page.goto(PERMIT_SEARCH_URL, wait_until='domcontentloaded', timeout=60000)
 			await page.wait_for_timeout(2000)
 			await snap(page, "01_page_loaded")
 
 			# 2. Expand search form if collapsed
 			try:
 				toggle = page.locator('a:has-text("Search Applications")').first
-				if await toggle.is_visible(timeout=3000):
+				if await toggle.is_visible(timeout=5000):
 					await toggle.click()
 					await page.wait_for_timeout(1500)
 					await snap(page, "02_form_expanded")
@@ -157,7 +157,7 @@ async def scrape_permits_with_playwright(
 				pass  # Already visible
 
 			# 3. Fill start date using exact known ID
-			await page.wait_for_selector(f'#{START_DATE_ID}', timeout=10000)
+			await page.wait_for_selector(f'#{START_DATE_ID}', timeout=20000)
 			await js_fill_date(page, START_DATE_ID, start_date_str)
 			logger.info(f"[Playwright] Start date set: {start_date_str}")
 
@@ -172,14 +172,14 @@ async def scrape_permits_with_playwright(
 				if (!btn) throw new Error("Search button #{SEARCH_BTN_ID} not found");
 				btn.click();
 			}}''')
-			await page.wait_for_load_state('networkidle', timeout=30000)
+			await page.wait_for_load_state('networkidle', timeout=60000)
 			await snap(page, "04_search_results")
 			logger.info("[Playwright] Search submitted")
 
 			# 6. Try "Download results" button — fetches ALL records in one shot
 			downloaded = False
 			try:
-				async with page.expect_download(timeout=30000) as dl_info:
+				async with page.expect_download(timeout=60000) as dl_info:
 					await page.evaluate(f'''() => {{
 						const btn = document.getElementById("{DOWNLOAD_BTN_ID}");
 						if (!btn) throw new Error("Download button not found");
@@ -265,7 +265,7 @@ async def scrape_permits_with_playwright(
 						logger.info("[Playwright] Last page reached")
 						break
 
-					await page.wait_for_load_state('networkidle', timeout=30000)
+					await page.wait_for_load_state('networkidle', timeout=60000)
 					page_num += 1
 
 			logger.info(f"[Playwright] Total records extracted: {len(all_rows)}")
@@ -567,19 +567,41 @@ async def run_permit_pipeline(
 	try:
 		file_path = None
 		active_scraper = scraper
+		MAX_PLAYWRIGHT_RETRIES = 5
 
 		if active_scraper in ("auto", "playwright"):
 			logger.info("Scraping permits via Playwright (primary method)")
-			try:
-				file_path = await scrape_permits_with_playwright(
-					start_date=start_date, end_date=end_date,
-					headless=headless, debug=debug,
-				)
-				logger.info("Playwright scraping succeeded")
-			except Exception as e:
-				if active_scraper == "playwright":
-					raise
-				logger.warning(f"Playwright scraping failed: {e}")
+			playwright_error = None
+			for attempt in range(1, MAX_PLAYWRIGHT_RETRIES + 1):
+				try:
+					file_path = await scrape_permits_with_playwright(
+						start_date=start_date, end_date=end_date,
+						headless=headless, debug=debug,
+					)
+					if file_path is None:
+						# No results from site — retry (could be temporary)
+						if attempt < MAX_PLAYWRIGHT_RETRIES:
+							logger.warning(f"[Playwright] No results (attempt {attempt}/{MAX_PLAYWRIGHT_RETRIES}) — retrying in 5s...")
+							await asyncio.sleep(5)
+							continue
+						logger.info(f"[Playwright] No results after {MAX_PLAYWRIGHT_RETRIES} attempts — no permits in date range")
+						playwright_error = None
+						break
+					logger.info("Playwright scraping succeeded")
+					playwright_error = None
+					break
+				except Exception as e:
+					if active_scraper == "playwright":
+						raise
+					playwright_error = e
+					if attempt < MAX_PLAYWRIGHT_RETRIES:
+						logger.warning(f"[Playwright] Attempt {attempt}/{MAX_PLAYWRIGHT_RETRIES} failed: {e} — retrying in 5s...")
+						await asyncio.sleep(5)
+						continue
+					logger.warning(f"[Playwright] All {MAX_PLAYWRIGHT_RETRIES} retries failed with errors")
+
+			# Only fall back to AI if Playwright failed with an actual error (not no-results)
+			if playwright_error is not None and active_scraper == "auto":
 				logger.warning("Falling back to browser-use AI method...")
 				active_scraper = "ai"
 
