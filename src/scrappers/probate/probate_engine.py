@@ -28,7 +28,6 @@ from src.utils.http_helpers import requests_get_with_retry
 from config.constants import (
 	PROBATE_FILINGS_URL,
 	RAW_PROBATE_DIR,
-	PROCESSED_DATA_DIR,
 	HILLSCLERK_BASE_URL,
 	PROBATE_FILING_PATTERN,
 	DEFAULT_USER_AGENT,
@@ -46,7 +45,7 @@ setup_logging()
 logger = get_logger(__name__)
 
 
-def download_latest_probate_filing() -> Path:
+def download_latest_probate_filing(target_date: str = None) -> Path:
 	"""
 	Download the latest probate filing CSV from Hillsborough County Clerk.
 	
@@ -127,11 +126,18 @@ def download_latest_probate_filing() -> Path:
 			logger.error("No valid dated probate files found")
 			raise ValueError("No valid dated probate files found")
 		
-		# Sort by date and get the latest
+		# Pick target date if specified, otherwise latest
 		files_with_dates.sort(key=lambda x: x[0], reverse=True)
-		latest_date, latest_file = files_with_dates[0]
+		if target_date:
+			target_dt = datetime.strptime(target_date.replace("-", ""), "%Y%m%d")
+			match = [(d, f) for d, f in files_with_dates if d.date() == target_dt.date()]
+			if not match:
+				raise ValueError(f"No probate filing found for date: {target_date}")
+			latest_date, latest_file = match[0]
+		else:
+			latest_date, latest_file = files_with_dates[0]
 		
-		logger.info(f"Latest probate filing: {latest_file} (Date: {latest_date.strftime('%Y-%m-%d')})")
+		logger.info(f"Selected probate filing: {latest_file} (Date: {latest_date.strftime('%Y-%m-%d')})")
 		
 	except Exception as e:
 		logger.error(f"Error parsing HTML or extracting file information: {e}")
@@ -290,7 +296,7 @@ def save_processed_probate(df: pd.DataFrame, output_filename: str = "probate_lea
 		raise
 
 
-def run_probate_pipeline():
+def run_probate_pipeline(target_date: str = None):
 	"""
 	Execute the complete probate data collection pipeline.
 	
@@ -316,7 +322,7 @@ def run_probate_pipeline():
 	try:
 		# Step 1: Download latest probate filing
 		logger.info("Step 1: Downloading latest probate filing")
-		csv_path = download_latest_probate_filing()
+		csv_path = download_latest_probate_filing(target_date=target_date)
 		
 		# Step 2: Process the data
 		logger.info("Step 2: Processing probate data")
@@ -344,11 +350,12 @@ if __name__ == "__main__":
 	from src.utils.scraper_db_helper import load_scraped_data_to_db, add_load_to_db_arg
 	
 	parser = argparse.ArgumentParser(description="Scrape Hillsborough County probate filings")
+	parser.add_argument("--date", type=str, default=None, help="Target date YYYY-MM-DD (default: latest)")
 	add_load_to_db_arg(parser)
 	args = parser.parse_args()
 	
 	try:
-		run_probate_pipeline()
+		run_probate_pipeline(target_date=args.date)
 		
 		# Load to database if requested
 		if args.load_to_db:

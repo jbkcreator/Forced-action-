@@ -81,7 +81,18 @@ class LienLoader(BaseLoader):
                     logger.info(f"Matched lien by legal desc (score: {score}%): {instrument}")
 
             # Strategy B: Owner name (Grantor)
-            if not property_record and pd.notna(row.get('Grantor')):
+            # For IRS Tax Liens (TL), Grantor = "UNITED STATES OF AMERICA" (the filer),
+            # so the property owner is in Grantee instead — try that first for TL.
+            doc_type_str = str(row.get('document_type', ''))
+            is_tax_lien = 'TAX LIEN' in doc_type_str.upper()
+
+            if not property_record and is_tax_lien and pd.notna(row.get('Grantee')):
+                match_result = self.find_property_by_owner_name(row['Grantee'])
+                if match_result:
+                    property_record, score = match_result
+                    logger.info(f"Matched tax lien by grantee/owner name (score: {score}%): {instrument}")
+
+            if not property_record and not is_tax_lien and pd.notna(row.get('Grantor')):
                 match_result = self.find_property_by_owner_name(row['Grantor'])
                 if match_result:
                     property_record, score = match_result
@@ -90,20 +101,23 @@ class LienLoader(BaseLoader):
             if property_record:
                 try:
                     # Determine record type
-                    doc_type = str(row.get('document_type', ''))
-                    if 'JUDGMENT' in doc_type.upper() or 'CERTIFIED' in doc_type.upper():
+                    if 'JUDGMENT' in doc_type_str.upper() or 'CERTIFIED' in doc_type_str.upper():
                         record_type = 'Judgment'
                     else:
                         record_type = 'Lien'
                     
                     # Handle NaN values - convert to None
-                    creditor_val = row.get('Grantee')
-                    if pd.isna(creditor_val):
-                        creditor_val = None
-                    
-                    debtor_val = row.get('Grantor')
-                    if pd.isna(debtor_val):
-                        debtor_val = None
+                    # For IRS tax liens: Grantor=IRS, Grantee=property owner
+                    # Swap creditor/debtor so debtor always = property owner
+                    if is_tax_lien:
+                        creditor_val = 'INTERNAL REVENUE SERVICE'
+                        debtor_raw = row.get('Grantee')
+                    else:
+                        creditor_raw = row.get('Grantee')
+                        creditor_val = None if pd.isna(creditor_raw) else creditor_raw
+                        debtor_raw = row.get('Grantor')
+
+                    debtor_val = None if pd.isna(debtor_raw) else debtor_raw
                     
                     book_type_val = row.get('BookType')
                     if pd.isna(book_type_val):

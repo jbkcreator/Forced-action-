@@ -30,7 +30,6 @@ from src.utils.http_helpers import requests_get_with_retry
 from config.constants import (
 	CIVIL_FILINGS_URL,
 	RAW_EVICTIONS_DIR,
-	PROCESSED_DATA_DIR,
 	HILLSCLERK_BASE_URL,
 	EVICTION_CASE_PATTERNS,
 	CIVIL_FILING_PATTERN,
@@ -40,10 +39,7 @@ from config.constants import (
 	OUTPUT_DATE_FORMAT,
 	OUTPUT_SEPARATOR,
 )
-from src.core.database import get_db_context
-from src.loaders.legal_proceedings import EvictionLoader
 from src.utils.logger import setup_logging, get_logger
-from src.utils.csv_deduplicator import deduplicate_csv, get_unique_keys_for_type
 from src.utils.db_deduplicator import filter_new_records
 
 # Initialize logging
@@ -51,7 +47,7 @@ setup_logging()
 logger = get_logger(__name__)
 
 
-def download_latest_civil_filing() -> Path:
+def download_latest_civil_filing(target_date: str = None) -> Path:
 	"""
 	Download the latest civil filing CSV from Hillsborough County Clerk.
 	
@@ -134,7 +130,14 @@ def download_latest_civil_filing() -> Path:
 		
 		# Sort by date and get the latest
 		files_with_dates.sort(key=lambda x: x[0], reverse=True)
-		latest_date, latest_file = files_with_dates[0]
+		if target_date:
+			target_dt = datetime.strptime(target_date.replace("-", ""), "%Y%m%d")
+			match = [(d, f) for d, f in files_with_dates if d.date() == target_dt.date()]
+			if not match:
+				raise ValueError(f"No civil filing found for date: {target_date}")
+			latest_date, latest_file = match[0]
+		else:
+			latest_date, latest_file = files_with_dates[0]
 		
 		logger.info(f"Latest civil filing: {latest_file} (Date: {latest_date.strftime('%Y-%m-%d')})")
 		
@@ -347,7 +350,7 @@ def save_processed_evictions(df: pd.DataFrame, output_filename: str = "eviction_
 		raise
 
 
-def run_eviction_pipeline() -> bool:
+def run_eviction_pipeline(target_date: str = None) -> bool:
 	"""
 	Execute the complete eviction data collection pipeline.
 	
@@ -372,7 +375,7 @@ def run_eviction_pipeline() -> bool:
 		
 		# Step 1: Download latest civil filing
 		logger.info("\n[STEP 1/4] Downloading latest civil filing...")
-		csv_path = download_latest_civil_filing()
+		csv_path = download_latest_civil_filing(target_date=target_date)
 		
 		# Step 2: Load and process the data
 		logger.info("\n[STEP 2/4] Loading and processing civil filing data...")
@@ -430,10 +433,11 @@ if __name__ == "__main__":
 	from src.utils.scraper_db_helper import load_scraped_data_to_db, add_load_to_db_arg
 	
 	parser = argparse.ArgumentParser(description="Scrape Hillsborough County eviction filings")
+	parser.add_argument("--date", type=str, default=None, help="Target date YYYY-MM-DD (default: latest)")
 	add_load_to_db_arg(parser)
 	args = parser.parse_args()
 	
-	success = run_eviction_pipeline()
+	success = run_eviction_pipeline(target_date=args.date)
 	
 	# Load to database if requested and scraping was successful
 	if success and args.load_to_db:

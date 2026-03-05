@@ -21,6 +21,7 @@ GHL API v2 reference:
 """
 
 import logging
+import time
 from typing import Dict, List, Optional
 
 import requests
@@ -36,8 +37,24 @@ _GHL_HEADERS_BASE = {
     "Content-Type": "application/json",
 }
 
-# Minimum score to push a lead to GHL (anything below this is Low — not routed)
-_MIN_SCORE_TO_PUSH = ROUTING_THRESHOLDS["daily"]  # 60
+# Minimum score to push a lead to GHL — Medium stage is configured so include it
+_MIN_SCORE_TO_PUSH = ROUTING_THRESHOLDS["weekly"]  # 40
+
+
+def _ghl_request(method: str, url: str, **kwargs) -> requests.Response:
+    """
+    Wrapper around requests that retries on 429 with exponential backoff.
+    Adds a 0.5s base delay between every call to stay under rate limits.
+    """
+    time.sleep(0.5)  # baseline throttle — ~2 req/s sustained
+    for attempt in range(4):
+        resp = requests.request(method, url, **kwargs)
+        if resp.status_code != 429:
+            return resp
+        wait = 2 ** attempt  # 1s, 2s, 4s, 8s
+        logger.debug(f"[GHL] 429 rate limit — retrying in {wait}s (attempt {attempt + 1})")
+        time.sleep(wait)
+    return resp  # return last response after exhausting retries
 
 
 def _is_configured() -> bool:
@@ -50,13 +67,9 @@ def _is_configured() -> bool:
 
 def _headers() -> Dict[str, str]:
     return {
-        **_GHL_BASE_HEADERS,
+        **_GHL_HEADERS_BASE,
         "Authorization": f"Bearer {settings.ghl_api_key.get_secret_value()}",
     }
-
-
-# Fix forward reference — define after _GHL_HEADERS_BASE
-_GHL_BASE_HEADERS = _GHL_HEADERS_BASE
 
 
 def _stage_id_for_urgency(urgency: str) -> Optional[str]:
@@ -88,7 +101,7 @@ def _find_contact_by_phone(phone: str) -> Optional[str]:
     Returns the contact ID if found, None otherwise.
     """
     try:
-        resp = requests.get(
+        resp = _ghl_request("GET",
             f"{_GHL_BASE}/contacts/search",
             headers=_headers(),
             params={
@@ -115,6 +128,7 @@ def _upsert_contact(score_data: Dict) -> Optional[str]:
     email = score_data.get("owner_email")
     owner_name = score_data.get("owner_name") or ""
     address = score_data.get("address") or ""
+    summaries = score_data.get("signal_summaries") or {}
 
     name_parts = owner_name.strip().split(None, 1)
     first_name = name_parts[0] if name_parts else "Unknown"
@@ -125,14 +139,49 @@ def _upsert_contact(score_data: Dict) -> Optional[str]:
         "firstName":   first_name,
         "lastName":    last_name,
         "address1":    address,
+        "city":        score_data.get("city") or "",
+        "state":       score_data.get("state") or "",
+        "postalCode":  score_data.get("zip") or "",
         "customFields": [
-            {"id": "parcel_id",       "value": str(score_data.get("parcel_id") or "")},
-            {"id": "cds_score",       "value": str(score_data.get("final_cds_score") or 0)},
-            {"id": "lead_tier",       "value": score_data.get("lead_tier") or ""},
-            {"id": "urgency_level",   "value": score_data.get("urgency_level") or ""},
-            {"id": "best_vertical",   "value": _best_vertical(score_data)},
-            {"id": "top_signals",     "value": ", ".join(_top_signals(score_data))},
-            {"id": "signal_count",    "value": str(score_data.get("signal_count") or 0)},
+            {"id": "CyqT2fZ2VS9hANAKqDFB", "value": str(score_data.get("parcel_id") or "")},
+            {"id": "eApA0zTDLatkrEjiRsSj", "value": str(score_data.get("final_cds_score") or 0)},
+            {"id": "x2gdIlD8v1mMTt1kZKEI", "value": score_data.get("lead_tier") or ""},
+            {"id": "3AHU9KWEyXaDNKFy3azC", "value": score_data.get("urgency_level") or ""},
+            {"id": "QrohTQclVzyGNdeX31K9", "value": _best_vertical(score_data)},
+            {"id": "9biCuTixgCWZ6HZcemig", "value": ", ".join(_top_signals(score_data))},
+            {"id": "minc73GThMkfiTp6cXCv", "value": str(score_data.get("signal_count") or 0)},
+            # Signal summaries
+            {"id": "MqgcANWDFOsUsXVuFCxD", "value": summaries.get("code_violations_summary", "")},
+            {"id": "8uWDAuGPpoJJ4bJKSPqL", "value": summaries.get("judgment_summary", "")},
+            {"id": "LkW0sJXPscLl9nAofohO", "value": summaries.get("mechanics_lien_summary", "")},
+            {"id": "WYyLBiBNJRG2EW1XYWW7", "value": summaries.get("tax_lien_summary", "")},
+            {"id": "V7pfFTlC2ffDpFTo8rvz", "value": summaries.get("hoa_lien_summary", "")},
+            {"id": "6ZcnH00wLVaE0xJ9ko3Z", "value": summaries.get("code_lien_summary", "")},
+            {"id": "bgoi3sr6OZYjkXqPC0AB", "value": summaries.get("foreclosure_summary", "")},
+            {"id": "wuaaHejZ0gvnhEy5EFHf", "value": summaries.get("tax_delinquency_summary", "")},
+            {"id": "ietB3MZl1MFXx3O9zRlP", "value": summaries.get("probate_summary", "")},
+            {"id": "X7GUuVaObzf5sLNMEbNO", "value": summaries.get("eviction_summary", "")},
+            {"id": "LGeIFWXCBS8Ztcj9wqog", "value": summaries.get("bankruptcy_summary", "")},
+            {"id": "RHVGRnEhuFdS6rhygOkq", "value": summaries.get("deed_summary", "")},
+            {"id": "oJiNVlnJYVQAjpFQ1YG8", "value": summaries.get("permit_summary", "")},
+            # Owner details
+            {"id": "LIr3EBZZUGkqVppjzDNx", "value": score_data.get("owner_type") or ""},
+            {"id": "F4O3QfIeQPbJ6leRjBGY", "value": score_data.get("absentee_status") or ""},
+            {"id": "cGlyUQqIfYgW0r2qjnhE", "value": score_data.get("mailing_address") or ""},
+            {"id": "BSa356i4zEcbC7Yv3pYj", "value": str(score_data.get("ownership_years") or "")},
+            # Financial
+            {"id": "BxALCQ89P4O37wnfsrtj", "value": f"${score_data['assessed_value_mkt']:,.0f}" if score_data.get("assessed_value_mkt") else ""},
+            {"id": "LsLyMSDr1ihsWx5Avv1S", "value": "Yes" if score_data.get("homestead_exempt") else "No"},
+            {"id": "MJMsPyM1AKTUTAf0ZTKF", "value": f"${score_data['est_equity']:,.0f}" if score_data.get("est_equity") else ""},
+            {"id": "AjqzIAyBeWuXahL5KPZl", "value": f"{score_data['equity_pct']:.1f}%" if score_data.get("equity_pct") else ""},
+            {"id": "wKZ3Wr7Mewgk6yyUKJ9P", "value": f"${score_data['last_sale_price']:,.0f}" if score_data.get("last_sale_price") else ""},
+            {"id": "F4oNtv1KtWjXj2Kr88pg", "value": score_data.get("last_sale_date") or ""},
+            # Property specs
+            {"id": "yeAsHE59UYVJ4vlM9QAP", "value": str(int(score_data["sq_ft"])) if score_data.get("sq_ft") else ""},
+            {"id": "aIL1zpBaFesqbgPHGrNq", "value": str(score_data.get("beds") or "")},
+            {"id": "E0ukBkLgpb9WRarktAzN", "value": str(score_data.get("baths") or "")},
+            {"id": "TvsOZjBAtpftOZWtxUFQ", "value": str(score_data.get("year_built") or "")},
+            {"id": "U4AVIb21Q1ScMTEKtZuD", "value": f"{score_data['lot_size']:.2f} acres" if score_data.get("lot_size") else ""},
         ],
         "tags": [
             f"cds-{score_data.get('lead_tier', '').lower().replace(' ', '-')}",
@@ -145,19 +194,23 @@ def _upsert_contact(score_data: Dict) -> Optional[str]:
     if email:
         payload["email"] = email
 
-    # Check if contact already exists
-    existing_id = _find_contact_by_phone(phone) if phone else None
+    # Dedup priority: 1) stored GHL contact ID on property, 2) phone search
+    existing_id = score_data.get("ghl_contact_id") or (
+        _find_contact_by_phone(phone) if phone else None
+    )
 
     try:
         if existing_id:
-            resp = requests.put(
+            # PUT does not accept locationId
+            put_payload = {k: v for k, v in payload.items() if k != "locationId"}
+            resp = _ghl_request("PUT",
                 f"{_GHL_BASE}/contacts/{existing_id}",
                 headers=_headers(),
-                json=payload,
+                json=put_payload,
                 timeout=10,
             )
         else:
-            resp = requests.post(
+            resp = _ghl_request("POST",
                 f"{_GHL_BASE}/contacts/",
                 headers=_headers(),
                 json=payload,
@@ -171,9 +224,27 @@ def _upsert_contact(score_data: Dict) -> Optional[str]:
         return None
 
 
+def _find_opportunity_for_contact(contact_id: str) -> Optional[str]:
+    """Return existing opportunity ID for a contact, or None."""
+    try:
+        resp = _ghl_request("GET",
+            f"{_GHL_BASE}/opportunities/search",
+            headers=_headers(),
+            params={"location_id": settings.ghl_location_id, "contact_id": contact_id},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            opps = resp.json().get("opportunities", [])
+            if opps:
+                return opps[0].get("id")
+    except Exception as e:
+        logger.debug(f"[GHL] opportunity search failed: {e}")
+    return None
+
+
 def _upsert_opportunity(contact_id: str, score_data: Dict) -> bool:
     """
-    Create a GHL pipeline opportunity linked to the contact.
+    Create or update a GHL pipeline opportunity linked to the contact.
     Returns True on success.
     """
     if not settings.ghl_pipeline_id:
@@ -197,31 +268,37 @@ def _upsert_opportunity(contact_id: str, score_data: Dict) -> bool:
     )
 
     payload = {
-        "pipelineId":  settings.ghl_pipeline_id,
-        "locationId":  settings.ghl_location_id,
-        "name":        title,
+        "pipelineId":      settings.ghl_pipeline_id,
+        "locationId":      settings.ghl_location_id,
+        "name":            title,
         "pipelineStageId": stage_id,
-        "contactId":   contact_id,
-        "monetaryValue": score_data.get("final_cds_score") or 0,
-        "customFields": [
-            {"id": "parcel_id",     "value": str(parcel_id or "")},
-            {"id": "cds_score",     "value": str(score_data.get("final_cds_score") or 0)},
-            {"id": "top_signals",   "value": ", ".join(_top_signals(score_data))},
-            {"id": "signal_count",  "value": str(score_data.get("signal_count") or 0)},
-        ],
+        "contactId":       contact_id,
+        "monetaryValue":   score_data.get("final_cds_score") or 0,
+        "status":          "open",
     }
 
     try:
-        resp = requests.post(
-            f"{_GHL_BASE}/opportunities/",
-            headers=_headers(),
-            json=payload,
-            timeout=10,
-        )
+        existing_opp_id = _find_opportunity_for_contact(contact_id)
+        if existing_opp_id:
+            # PUT does not accept locationId or contactId
+            put_payload = {k: v for k, v in payload.items() if k not in ("locationId", "contactId")}
+            resp = _ghl_request("PUT",
+                f"{_GHL_BASE}/opportunities/{existing_opp_id}",
+                headers=_headers(),
+                json=put_payload,
+                timeout=10,
+            )
+        else:
+            resp = _ghl_request("POST",
+                f"{_GHL_BASE}/opportunities/",
+                headers=_headers(),
+                json=payload,
+                timeout=10,
+            )
         resp.raise_for_status()
         return True
     except Exception as e:
-        logger.warning(f"[GHL] opportunity creation failed for {parcel_id}: {e}")
+        logger.warning(f"[GHL] opportunity upsert failed for {parcel_id}: {e}")
         return False
 
 
@@ -261,6 +338,22 @@ def push_lead_to_ghl(score_data: Dict) -> bool:
     if not contact_id:
         logger.warning(f"[GHL] Failed to upsert contact for {parcel_id} — opportunity skipped")
         return False
+
+    # Persist GHL contact ID back to property so future rescores update not duplicate
+    if contact_id and contact_id != score_data.get("ghl_contact_id"):
+        try:
+            from src.core.database import get_db_session
+            from src.core.models import Property
+            from datetime import datetime, timezone
+            with get_db_session() as db:
+                prop = db.query(Property).filter(Property.id == score_data.get("property_id")).first()
+                if prop:
+                    prop.gohighlevel_contact_id = contact_id
+                    prop.sync_status = "synced"
+                    prop.last_crm_sync = datetime.now(timezone.utc)
+                    db.commit()
+        except Exception as e:
+            logger.debug(f"[GHL] Failed to save contact_id to property: {e}")
 
     ok = _upsert_opportunity(contact_id, score_data)
     if ok:

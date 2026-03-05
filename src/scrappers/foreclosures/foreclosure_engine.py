@@ -32,12 +32,8 @@ from config.constants import (
 	AUCTION_DATE_FORMAT,
 	RAW_FORECLOSURE_DIR,
 	PROCESSED_DATA_DIR,
-	DOWNLOAD_FILE_PATTERNS,
-	TEMP_DOWNLOADS_DIR,
-	BROWSER_DOWNLOAD_TEMP_PATTERN,
 	BROWSER_MODEL,
 	BROWSER_TEMPERATURE,
-	OUTPUT_SEPARATOR,
 )
 from src.core.database import get_db_context
 from src.loaders.foreclosures import ForeclosureLoader

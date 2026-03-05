@@ -3,7 +3,7 @@ Database seed script for creating test/sample data.
 Useful for development and testing.
 """
 
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 import random
 
 from src.core.database import db, init_database
@@ -140,7 +140,7 @@ def seed_sample_properties(num_properties: int = 10):
             base_score = random.uniform(40, 90)
             score = DistressScore(
                 property=prop,
-                score_date=datetime.utcnow(),
+                score_date=datetime.now(timezone.utc),
                 final_cds_score=base_score,
                 lead_tier=(
                     "Ultra Platinum"

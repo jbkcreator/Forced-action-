@@ -43,7 +43,7 @@ BuildingPermit  → building_permits
 
 import logging
 import sys
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from typing import Dict, List, Optional
 
 from src.services.ghl_webhook import push_lead_to_ghl
@@ -51,17 +51,10 @@ from src.services.ghl_webhook import push_lead_to_ghl
 from sqlalchemy.orm import Session, joinedload
 
 from src.core.models import (
-    BuildingPermit,
-    CodeViolation,
-    Deed,
     DistressScore,
-    Foreclosure,
-    LegalAndLien,
-    LegalProceeding,
     Owner,
     Financial,
     Property,
-    TaxDelinquency,
 )
 from config.scoring import (
     ABSENTEE_BONUS,
@@ -529,9 +522,32 @@ class MultiVerticalScorer:
             "property_id":     prop.id,
             "parcel_id":       prop.parcel_id,
             "address":         prop.address,
+            "city":            prop.city,
+            "state":           prop.state,
+            "zip":             prop.zip,
+            # Property specs
+            "sq_ft":           float(prop.sq_ft) if prop.sq_ft else None,
+            "beds":            prop.beds,
+            "baths":           prop.baths,
+            "year_built":      prop.year_built,
+            "lot_size":        float(prop.lot_size) if prop.lot_size else None,
+            # Owner
+            "ghl_contact_id":  prop.gohighlevel_contact_id,
             "owner_name":      owner.owner_name if owner else None,
+            "owner_type":      owner.owner_type if owner else None,
+            "absentee_status": owner.absentee_status if owner else None,
+            "mailing_address": owner.mailing_address if owner else None,
+            "ownership_years": owner.ownership_years if owner else None,
             "owner_phone":     owner_phone,
             "owner_email":     owner_email,
+            # Financial
+            "assessed_value_mkt": float(financial.assessed_value_mkt) if financial and financial.assessed_value_mkt else None,
+            "homestead_exempt":   financial.homestead_exempt if financial else None,
+            "est_equity":         float(financial.est_equity) if financial and financial.est_equity else None,
+            "equity_pct":         float(financial.equity_pct) if financial and financial.equity_pct else None,
+            "last_sale_price":    float(financial.last_sale_price) if financial and financial.last_sale_price else None,
+            "last_sale_date":     str(financial.last_sale_date) if financial and financial.last_sale_date else None,
+            # Scoring
             "final_cds_score": round(final_score, 2),
             "vertical_scores": {k: round(v, 2) for k, v in vertical_scores.items()},
             "urgency_level":   urgency,
@@ -540,7 +556,151 @@ class MultiVerticalScorer:
             "signal_count":    len(signals),
             "distress_types":  list({s["type"] for s in signals}),
             "factor_scores":   self._build_factor_scores(signals, vertical_results),
+            "signal_summaries": self._build_signal_summaries(prop),
         }
+
+    def _build_signal_summaries(self, prop: "Property") -> Dict[str, str]:
+        """Build one-liner summary strings per signal type for CRM display."""
+        summaries: Dict[str, str] = {}
+
+        violations = prop.code_violations or []
+        if violations:
+            open_count = sum(1 for v in violations if (v.status or "").lower() == "open")
+            types = sorted({v.violation_type for v in violations if v.violation_type})
+            latest = max((v.opened_date for v in violations if v.opened_date), default=None)
+            parts = [f"{len(violations)} violation(s)"]
+            if open_count:
+                parts.append(f"{open_count} open")
+            if types:
+                parts.append(", ".join(types[:2]))
+            if latest:
+                parts.append(str(latest))
+            summaries["code_violations_summary"] = " — ".join(parts)
+
+        all_legal = prop.legal_and_liens or []
+
+        # Judgments
+        judgments = [r for r in all_legal if r.record_type == "Judgment"]
+        if judgments:
+            total = sum(float(r.amount) for r in judgments if r.amount)
+            latest = max((r.filing_date for r in judgments if r.filing_date), default=None)
+            parts = [f"{len(judgments)} judgment(s)"]
+            if total:
+                parts.append(f"${total:,.0f} total")
+            if latest:
+                parts.append(str(latest))
+            summaries["judgment_summary"] = " — ".join(parts)
+
+        # Mechanics liens
+        def _lien_subtype(records, doc_keywords):
+            return [r for r in records if r.record_type == "Lien" and
+                    any(k in (r.document_type or "") for k in doc_keywords)]
+
+        mechanics = _lien_subtype(all_legal, ["MECHANICS", "ML"])
+        if mechanics:
+            total = sum(float(r.amount) for r in mechanics if r.amount)
+            latest = max((r.filing_date for r in mechanics if r.filing_date), default=None)
+            parts = [f"{len(mechanics)} mechanics lien(s)"]
+            if total:
+                parts.append(f"${total:,.0f} total")
+            if latest:
+                parts.append(str(latest))
+            summaries["mechanics_lien_summary"] = " — ".join(parts)
+
+        tax_liens = _lien_subtype(all_legal, ["TAX LIEN", "TL"])
+        if tax_liens:
+            total = sum(float(r.amount) for r in tax_liens if r.amount)
+            latest = max((r.filing_date for r in tax_liens if r.filing_date), default=None)
+            parts = [f"{len(tax_liens)} tax lien(s)"]
+            if total:
+                parts.append(f"${total:,.0f} total")
+            if latest:
+                parts.append(str(latest))
+            summaries["tax_lien_summary"] = " — ".join(parts)
+
+        hoa_liens = _lien_subtype(all_legal, ["HOA", "HL"])
+        if hoa_liens:
+            total = sum(float(r.amount) for r in hoa_liens if r.amount)
+            latest = max((r.filing_date for r in hoa_liens if r.filing_date), default=None)
+            parts = [f"{len(hoa_liens)} HOA lien(s)"]
+            if total:
+                parts.append(f"${total:,.0f} total")
+            if latest:
+                parts.append(str(latest))
+            summaries["hoa_lien_summary"] = " — ".join(parts)
+
+        code_liens = _lien_subtype(all_legal, ["CODE LIEN", "TCL", "CCL"])
+        if code_liens:
+            total = sum(float(r.amount) for r in code_liens if r.amount)
+            latest = max((r.filing_date for r in code_liens if r.filing_date), default=None)
+            parts = [f"{len(code_liens)} code lien(s)"]
+            if total:
+                parts.append(f"${total:,.0f} total")
+            if latest:
+                parts.append(str(latest))
+            summaries["code_lien_summary"] = " — ".join(parts)
+
+        foreclosures = prop.foreclosures or []
+        if foreclosures:
+            fc = foreclosures[0]
+            parts = [f"{len(foreclosures)} foreclosure(s)"]
+            if fc.plaintiff:
+                parts.append(fc.plaintiff)
+            if fc.judgment_amount:
+                parts.append(f"${float(fc.judgment_amount):,.0f} judgment")
+            if fc.auction_date:
+                parts.append(f"auction {fc.auction_date}")
+            summaries["foreclosure_summary"] = " — ".join(parts)
+
+        taxes = prop.tax_delinquencies or []
+        if taxes:
+            total = sum(float(t.total_amount_due) for t in taxes if t.total_amount_due)
+            max_years = max((t.years_delinquent for t in taxes if t.years_delinquent), default=None)
+            parts = [f"{len(taxes)} tax record(s)"]
+            if total:
+                parts.append(f"${total:,.0f} due")
+            if max_years:
+                parts.append(f"{max_years}yr delinquent")
+            summaries["tax_delinquency_summary"] = " — ".join(parts)
+
+        proceedings = prop.legal_proceedings or []
+        for ptype, key in [("Probate", "probate_summary"), ("Eviction", "eviction_summary"), ("Bankruptcy", "bankruptcy_summary")]:
+            group = [p for p in proceedings if p.record_type == ptype]
+            if group:
+                latest = max((p.filing_date for p in group if p.filing_date), default=None)
+                parts = [f"{len(group)} {ptype.lower()}(s)"]
+                if latest:
+                    parts.append(str(latest))
+                # Include case status/party from first record
+                first = group[0]
+                if first.associated_party:
+                    parts.append(first.associated_party)
+                summaries[key] = " — ".join(parts)
+
+        deeds = prop.deeds or []
+        if deeds:
+            d = deeds[0]
+            parts = [f"{len(deeds)} deed(s)"]
+            if d.deed_type:
+                parts.append(d.deed_type)
+            if d.sale_price:
+                parts.append(f"${float(d.sale_price):,.0f}")
+            if d.record_date:
+                parts.append(str(d.record_date))
+            summaries["deed_summary"] = " — ".join(parts)
+
+        permits = prop.building_permits or []
+        if permits:
+            ptypes = sorted({p.permit_type for p in permits if p.permit_type})
+            latest = max((p.issue_date for p in permits if p.issue_date), default=None)
+            parts = [f"{len(permits)} permit(s)"]
+            if ptypes:
+                parts.append(ptypes[0])
+            if latest:
+                parts.append(str(latest))
+            summaries["permit_summary"] = " — ".join(parts)
+
+        return summaries
 
     def _build_factor_scores(self, signals: List[Dict], vertical_results: Dict) -> Dict:
         """
@@ -626,7 +786,8 @@ class MultiVerticalScorer:
             ).first()
 
         if existing:
-            existing.score_date      = datetime.utcnow()
+            score_changed = float(existing.final_cds_score or 0) != float(final_score)
+            existing.score_date      = datetime.now(timezone.utc)
             existing.final_cds_score = final_score
             existing.lead_tier       = lead_tier
             existing.urgency_level   = urgency
@@ -635,10 +796,13 @@ class MultiVerticalScorer:
             existing.vertical_scores = vertical_json
             existing.distress_types  = distress_list
             logger.debug(f"Updated score for property {score_data['parcel_id']}: {final_score} ({lead_tier})")
-            try:
-                push_lead_to_ghl(score_data)
-            except Exception as ghl_err:
-                logger.warning(f"[GHL] push failed (non-critical): {ghl_err}")
+            # Only push to GHL if score changed or contact not yet synced
+            is_new_contact = not score_data.get("ghl_contact_id")
+            if score_changed or is_new_contact:
+                try:
+                    push_lead_to_ghl(score_data)
+                except Exception as ghl_err:
+                    logger.warning(f"[GHL] push failed (non-critical): {ghl_err}")
             return existing
 
         # Check most recent score to avoid accumulating identical rows
@@ -652,7 +816,7 @@ class MultiVerticalScorer:
 
         record = DistressScore(
             property_id=property_id,
-            score_date=datetime.utcnow(),
+            score_date=datetime.now(timezone.utc),
             final_cds_score=final_score,
             lead_tier=lead_tier,
             urgency_level=urgency,

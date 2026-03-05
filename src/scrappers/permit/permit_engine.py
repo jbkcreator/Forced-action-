@@ -32,8 +32,6 @@ from config.constants import (
 	PROCESSED_DATA_DIR,
 	PERMIT_SEARCH_URL,
 )
-from src.core.database import get_db_context
-from src.loaders.permits import BuildingPermitLoader
 from src.utils.logger import setup_logging, get_logger
 from src.utils.prompt_loader import get_prompt
 from src.utils.db_deduplicator import filter_new_records
@@ -211,9 +209,60 @@ async def scrape_permits_with_playwright(
 
 			# 7. Fallback: page-by-page table scraping
 			if not downloaded:
-				page_num = 1
+				# Wait for results table to render
+				try:
+					await page.wait_for_selector("tr.ACA_TabRow_Odd, tr.ACA_TabRow_Even", timeout=30000)
+					logger.info("[Playwright] Results table detected")
+				except Exception:
+					logger.warning("[Playwright] Timed out waiting for results rows \u2014 page may have no results")
+
+				visited_pages = set()
+
+				async def get_selected_page_num() -> str:
+					return await page.evaluate(
+						'''() => {
+							const el = document.querySelector("span.SelectedPageButton");
+							return el ? el.textContent.trim() : "";
+						}'''
+					)
+
+				async def next_is_clickable() -> bool:
+					return await page.evaluate(
+						'''() => {
+							const tds = Array.from(document.querySelectorAll("td.aca_pagination_PrevNext"));
+							const nextTd = tds.find(td => td.textContent.includes("Next"));
+							if (!nextTd) return false;
+							return !!nextTd.querySelector("a");
+						}'''
+					)
+
+				async def click_next():
+					await page.evaluate(
+						'''() => {
+							const tds = Array.from(document.querySelectorAll("td.aca_pagination_PrevNext"));
+							const nextTd = tds.find(td => td.textContent.includes("Next"));
+							const a = nextTd ? nextTd.querySelector("a") : null;
+							if (!a) throw new Error("Next link not found/clickable");
+							a.click();
+						}'''
+					)
+
 				while True:
-					logger.info(f"[Playwright] Scraping page {page_num}...")
+					current_page = await get_selected_page_num()
+					if not current_page:
+						logger.warning("[Playwright] SelectedPageButton missing \u2014 stopping pagination.")
+						break
+
+					if current_page in visited_pages:
+						logger.warning(f"[Playwright] Page {current_page} already visited \u2014 stopping to avoid loop.")
+						break
+					visited_pages.add(current_page)
+
+					logger.info(f"[Playwright] Scraping page {current_page}...")
+					if current_page.isdigit():
+						await snap(page, f"page_{int(current_page):02d}")
+					else:
+						await snap(page, f"page_{current_page}")
 
 					rows = await page.evaluate('''() => {
 						const result = [];
@@ -242,31 +291,44 @@ async def scrape_permits_with_playwright(
 
 					if rows:
 						all_rows.extend(rows)
-						logger.info(f"[Playwright] Page {page_num}: {len(rows)} rows (total: {len(all_rows)})")
+						logger.info(f"[Playwright] Page {current_page}: {len(rows)} rows (total: {len(all_rows)})")
 					else:
-						logger.info(f"[Playwright] Page {page_num}: no rows — done")
-						await snap(page, f"page_{page_num:02d}_empty")
+						logger.info(f"[Playwright] Page {current_page}: no rows \u2014 stopping.")
+						await snap(page, f"page_{current_page}_empty")
 						break
 
-					# Click the next numbered page link
-					has_next = await page.evaluate('''() => {
-						const sel = document.querySelector("span.SelectedPageButton");
-						if (!sel) return false;
-						const cur = parseInt(sel.textContent.trim());
-						for (const a of document.querySelectorAll(".aca_pagination_td a")) {
-							if (parseInt(a.textContent.trim()) === cur + 1) {
-								a.click();
-								return true;
-							}
-						}
-						return false;
-					}''')
-					if not has_next:
-						logger.info("[Playwright] Last page reached")
+					if not await next_is_clickable():
+						logger.info("[Playwright] Next is not clickable \u2014 last page reached.")
 						break
 
-					await page.wait_for_load_state('networkidle', timeout=60000)
-					page_num += 1
+					old_page = current_page
+					old_first_row = await page.evaluate(
+						'''() => {
+							const row = document.querySelector("tr.ACA_TabRow_Odd, tr.ACA_TabRow_Even");
+							return row ? row.innerText.trim() : "";
+						}'''
+					)
+
+					await click_next()
+
+					await page.wait_for_function(
+						'''(oldVal) => {
+							const el = document.querySelector("span.SelectedPageButton");
+							return el && el.textContent.trim() !== oldVal;
+						}''',
+						arg=old_page,
+						timeout=45000,
+					)
+
+					await page.wait_for_function(
+						'''(oldText) => {
+							const row = document.querySelector("tr.ACA_TabRow_Odd, tr.ACA_TabRow_Even");
+							const now = row ? row.innerText.trim() : "";
+							return now && now !== oldText;
+						}''',
+						arg=old_first_row,
+						timeout=45000,
+					)
 
 			logger.info(f"[Playwright] Total records extracted: {len(all_rows)}")
 

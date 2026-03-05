@@ -240,15 +240,28 @@ class MasterPropertyLoader(BaseLoader):
                 
                 # Determine absentee status by comparing addresses
                 absentee_status = self._determine_absentee_status(
-                    property_address=address,
+                    property_address=site_addr,
                     mailing_address=mailing_addr
                 )
                 
+                # Classify owner type from name
+                name_upper = owner_name_clean.upper()
+                if any(kw in name_upper for kw in ['LLC', 'LLP', 'PLLC']):
+                    owner_type = 'LLC'
+                elif any(kw in name_upper for kw in [' INC', ' CORP', ' LTD', ' CO ']):
+                    owner_type = 'Corporate'
+                elif any(kw in name_upper for kw in ['TRUST', 'TRUSTEE']):
+                    owner_type = 'Trust'
+                elif 'ESTATE' in name_upper:
+                    owner_type = 'Estate'
+                else:
+                    owner_type = 'Individual'
+
                 owner_record = Owner(
                     property=property_record,
                     owner_name=owner_name_clean,
                     mailing_address=mailing_addr,
-                    owner_type='Individual',
+                    owner_type=owner_type,
                     absentee_status=absentee_status,
                 )
                 

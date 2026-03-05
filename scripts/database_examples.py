@@ -3,7 +3,7 @@ Example usage of the database models and queries.
 This script demonstrates how to interact with the database.
 """
 
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 
 from src.core.database import db, init_database, check_connection, get_table_counts
 from src.core.models import (
@@ -139,7 +139,7 @@ def example_3_calculate_distress_score():
         # Create a distress score
         score = DistressScore(
             property=prop,
-            score_date=datetime.utcnow(),
+            score_date=datetime.now(timezone.utc),
             final_cds_score=72.5,
             lead_tier="Gold",
             distress_types=["Code", "Tax", "HOA"],

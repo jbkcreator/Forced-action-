@@ -6,7 +6,7 @@ formatters:
     format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     datefmt: '%Y-%m-%d %H:%M:%S'
   detailed:
-    format: '%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
+    format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     datefmt: '%Y-%m-%d %H:%M:%S'
 
 handlers:
@@ -18,7 +18,7 @@ handlers:
 
   file:
     class: logging.handlers.RotatingFileHandler
-    level: DEBUG
+    level: WARNING
     formatter: detailed
     filename: logs/app.log
     maxBytes: 10485760  # 10MB
@@ -36,7 +36,7 @@ handlers:
 
   cds_file:
     class: logging.handlers.RotatingFileHandler
-    level: DEBUG
+    level: WARNING
     formatter: detailed
     filename: logs/cds_engine.log
     maxBytes: 10485760  # 10MB
@@ -45,42 +45,12 @@ handlers:
 
 loggers:
   src.services.cds_engine:
-    level: DEBUG
+    level: INFO
     handlers: [console, cds_file, error_file]
     propagate: false
 
-  scrappers:
-    level: DEBUG
-    handlers: [console, file, error_file]
-    propagate: false
-  
-  scrappers.probate:
-    level: DEBUG
-    handlers: [console, file, error_file]
-    propagate: false
-  
-  scrappers.permit:
-    level: DEBUG
-    handlers: [console, file, error_file]
-    propagate: false
-  
-  scrappers.lien:
-    level: DEBUG
-    handlers: [console, file, error_file]
-    propagate: false
-  
-  scrappers.tax_delinquent:
-    level: DEBUG
-    handlers: [console, file, error_file]
-    propagate: false
-  
-  scrappers.foreclosure:
-    level: DEBUG
-    handlers: [console, file, error_file]
-    propagate: false
-  
-  scrappers.violation:
-    level: DEBUG
+  src:
+    level: INFO
     handlers: [console, file, error_file]
     propagate: false
 

@@ -172,9 +172,11 @@ class BaseLoader(ABC):
         addr = addr.split(',')[0].strip()
         
         # Remove common city names that might be embedded at the end
-        cities = ['tampa', 'riverview', 'valrico', 'gibsonton', 'lithia', 
+        cities = ['tampa', 'riverview', 'valrico', 'gibsonton', 'lithia',
                   'brandon', 'seffner', 'plant city', 'sun city center',
-                  'thonotosassa', 'odessa', 'lutz', 'wesley chapel']
+                  'thonotosassa', 'odessa', 'lutz', 'wesley chapel',
+                  'ruskin', 'wimauma', 'apollo beach', 'dover', 'balm',
+                  'sydney', 'mango', 'citrus park', 'new tampa']
         
         for city in cities:
             # Remove city name if it appears at the end
@@ -392,7 +394,13 @@ class BaseLoader(ABC):
         best_match: Optional[Property] = None
         best_score = 0
 
+        search_number = normalized_search.split()[0] if normalized_search.split() else ""
         for prop, normalized_prop in candidates:
+            # Reject if house numbers differ — avoids wrong-number fuzzy matches
+            # (e.g. "6710 Hartford" matching "6716 Hartford" at score 92)
+            prop_number = normalized_prop.split()[0] if normalized_prop.split() else ""
+            if search_number and prop_number and search_number != prop_number:
+                continue
             score = fuzz.token_sort_ratio(normalized_search, normalized_prop)
             if score > best_score:
                 best_score = score

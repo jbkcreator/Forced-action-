@@ -3,7 +3,7 @@ Database models for Distressed Property Intelligence Platform.
 Implements the Hub-and-Spoke architecture with properties as the central hub.
 """
 
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import List, Optional
 
 from sqlalchemy import (
@@ -73,8 +73,8 @@ class Property(Base):
     last_crm_sync: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
     # Audit Timestamps
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
     # Relationships (1:1 and 1:Many)
     owner: Mapped[Optional["Owner"]] = relationship("Owner", back_populates="property", uselist=False, cascade="all, delete-orphan")
@@ -592,7 +592,7 @@ class DistressScore(Base):
     vertical_scores: Mapped[Optional[dict]] = mapped_column(JSONB)
 
     # Scoring Information
-    score_date: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    score_date: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     final_cds_score: Mapped[Optional[float]] = mapped_column(Numeric(5, 2))
     lead_tier: Mapped[Optional[str]] = mapped_column(String(50))
     distress_types: Mapped[Optional[dict]] = mapped_column(JSONB)

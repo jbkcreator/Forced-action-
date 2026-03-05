@@ -249,6 +249,32 @@ class EvictionLoader(BaseLoader):
                     property_record, score = match_result
                     logger.info(f"Matched eviction by address (score: {score}%): {case_number}")
 
+            # Fallback: try defendant name (tenant), then plaintiff name (landlord/owner)
+            # Plaintiff is more likely to match since they own the property
+            if not property_record and 'PartyType' in group.columns and 'LastName/CompanyName' in group.columns:
+                for party_type in ('Plaintiff', 'Defendant'):
+                    party_rows = group[group['PartyType'] == party_type]
+                    if party_rows.empty:
+                        continue
+                    prow = party_rows.iloc[0]
+                    first = str(_none_if_nan(prow.get('FirstName')) or '').strip()
+                    last = str(_none_if_nan(prow.get('LastName/CompanyName')) or '').strip()
+                    if not last:
+                        continue
+                    name_variants = []
+                    if first:
+                        name_variants.append(f"{first} {last}")
+                    if len(last) > 4:
+                        name_variants.append(last)
+                    for variant in name_variants:
+                        match_result = self.find_property_by_owner_name(variant)
+                        if match_result:
+                            property_record, score = match_result
+                            logger.info(f"Matched eviction by {party_type.lower()} name '{variant}' (score: {score}%): {case_number}")
+                            break
+                    if property_record:
+                        break
+
             if property_record:
                 try:
                     # Plaintiff and defendant names
