@@ -110,9 +110,11 @@ loader = LienLoader(session)
 matched, unmatched, skipped = loader.load_from_csv("data/raw/liens/all_liens_judgments.csv")
 ```
 
-**Match Method:** Owner name fuzzy matching (75% threshold)  
-**Expected Columns:** Instrument, Grantor, Grantee, RecordDate, document_type, etc.  
+**Match Method:** Legal description → owner name fuzzy matching (75% threshold)
+**IRS Tax Liens (TL):** Grantor = IRS (filer), so matches by Grantee (property owner) instead
+**Expected Columns:** Instrument, Grantor, Grantee, Legal, RecordDate, document_type, etc.
 **Record Types:** Automatically determines 'Lien' or 'Judgment' based on document_type
+**creditor/debtor storage:** For TL records, creditor = 'INTERNAL REVENUE SERVICE', debtor = owner name
 
 ---
 
@@ -157,9 +159,9 @@ loader = EvictionLoader(session)
 matched, unmatched, skipped = loader.load_from_csv("data/raw/evictions/eviction_leads.csv")
 ```
 
-**Match Method:** Address fuzzy matching (defendant address)  
-**Expected Columns:** CaseNumber, PartyAddress, FilingDate, PartyType, FirstName, LastName/CompanyName, etc.  
-**Note:** Groups rows by CaseNumber (plaintiff + defendant)
+**Match Method:** Address fuzzy matching (defendant address) → fallback to plaintiff name → defendant name
+**Expected Columns:** CaseNumber, PartyAddress, FilingDate, PartyType, FirstName, LastName/CompanyName, etc.
+**Note:** Groups rows by CaseNumber (plaintiff + defendant). Plaintiff name tried first in fallback since landlords own the property.
 
 ---
 
@@ -241,10 +243,15 @@ loader.parse_date("02/24/2026")                    # → datetime(2026, 2, 24)
 # Exact parcel ID match (100% accuracy)
 property = loader.find_property_by_parcel_id("A0000100000")
 
-# Fuzzy address match (85% threshold)
+# Fuzzy address match (85% threshold, 3-strategy: house# ILIKE → pg_trgm → rapidfuzz)
+# Rejects candidates where house number differs to prevent wrong-address false positives
+# City suffix normalization covers all Hillsborough cities (Tampa, Ruskin, Wimauma, etc.)
 property, score = loader.find_property_by_address("123 Main St, Tampa, FL")
 
-# Fuzzy owner name match (75% threshold)
+# Legal description match (70% threshold, lot/block/subdivision parsing)
+property, score = loader.find_property_by_legal_description("LOT 5 BLK 3 NORMA PARK SUBD")
+
+# Fuzzy owner name match (75% threshold, 3-strategy: exact ILIKE → LIKE both word orders → pg_trgm)
 property, score = loader.find_property_by_owner_name("John Smith")
 ```
 
@@ -411,7 +418,9 @@ $env:PYTHONPATH = "."  # PowerShell
 ### Low Match Rates
 - **Address Matching:** Check address normalization with `loader.normalize_address()`
 - **Name Matching:** Check name normalization with `loader.normalize_owner_name()`
-- **Thresholds:** Adjust in loader code (default: 85% address, 75% name)
+- **Thresholds:** Adjust in loader code (default: 85% address, 75% name, 70% legal description)
+- **IRS Tax Liens:** Match rate improved — uses Grantee (owner) not Grantor (IRS) for TL document types
+- **Permits/Violations:** Address-only matching; apt/commercial addresses won't match single-family DB
 
 ### Duplicate Errors
 - Use `skip_duplicates=True` (default) to skip existing records

@@ -169,6 +169,7 @@ async def _playwright_download_tax_delinquent(
 		6. Click the CSV download button
 	"""
 	from playwright.async_api import async_playwright
+	from playwright_stealth import Stealth
 
 	TAX_REPORT_URL = "https://county-taxes.net/hillsborough/reports/real-estate"
 	REFERENCE_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -177,46 +178,82 @@ async def _playwright_download_tax_delinquent(
 	logger.info(f"[Playwright][RADAR] Downloading tax delinquent report for {tax_year}")
 
 	async with async_playwright() as pw:
+		from src.utils.http_helpers import get_playwright_proxy
 		browser = await pw.chromium.launch(
 			headless=True,
+			proxy=get_playwright_proxy(),
 			args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
 		)
-		context = await browser.new_context(accept_downloads=True)
+		context = await browser.new_context(
+			accept_downloads=True,
+			user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+			viewport={"width": 1920, "height": 1080},
+			extra_http_headers={
+				"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+				"Accept-Language": "en-US,en;q=0.9",
+				"Accept-Encoding": "gzip, deflate, br",
+				"sec-ch-ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+				"sec-ch-ua-mobile": "?0",
+				"sec-ch-ua-platform": '"Windows"',
+				"Upgrade-Insecure-Requests": "1",
+			},
+		)
 		page = await context.new_page()
+		await Stealth().apply_stealth_async(page)
 		try:
-			# 1. Navigate — wait for networkidle so all JS initializes
-			await page.goto(TAX_REPORT_URL, wait_until="domcontentloaded", timeout=60_000)
-			await page.wait_for_load_state('networkidle', timeout=60_000)
+			# 1. Navigate and wait for SPA to fully render
+			await page.goto(TAX_REPORT_URL, wait_until="domcontentloaded", timeout=120_000)
+			await page.wait_for_selector('#selected-report-filter', state='attached', timeout=90_000)
+			logger.info("[Playwright][RADAR] Page loaded, SPA ready")
 
-			# 2. Type report name into the shared-report search filter
-			await page.wait_for_selector('#selected-report-filter', state='attached', timeout=25_000)
-			await page.click('#selected-report-filter')
-			await page.type('#selected-report-filter', 'Public - Delinquent Report', delay=50)
-			logger.info("[Playwright][RADAR] Typed report search: 'Public - Delinquent Report'")
+			# 2. Select report via JS — set hidden #selected_report value (id=2470) and
+			#    update the visible text input, then fire the onchange to load filter fields.
+			#    This bypasses the flaky mousedown/blur race on the dropdown.
+			await page.evaluate("""() => {
+				const hidden = document.getElementById('selected_report');
+				const filter = document.getElementById('selected-report-filter');
+				if (!hidden || !filter) throw new Error('Report selector elements not found');
+				hidden.value = '2470';
+				filter.value = 'Public - Delinquent Report';
+				hidden.dispatchEvent(new Event('change', {bubbles: true}));
+			}""")
+			logger.info("[Playwright][RADAR] Set report to 'Public - Delinquent Report' (id=2470)")
 
-			# 3. Wait for dropdown menu and click the matching item
-			menu = page.locator('#selected-report-filter-menu')
-			await menu.wait_for(state='visible', timeout=20_000)
-			item = menu.locator('li, a, div').filter(has_text='Public - Delinquent Report').first
-			await item.wait_for(state='visible', timeout=15_000)
-			await item.click()
-			logger.info("[Playwright][RADAR] Selected 'Public - Delinquent Report'")
+			# 3. Wait for filter fields to render after report selection
+			await page.wait_for_selector('#tax_year', state='attached', timeout=20_000)
+			await page.wait_for_timeout(1_000)
 
-			# 4. Fill tax year field
-			await page.wait_for_selector('#tax_year', timeout=20_000)
-			await page.click('#tax_year', click_count=3)
-			await page.type('#tax_year', str(tax_year))
+			# 4. Fill tax year
+			await page.evaluate(f"""() => {{
+				const el = document.getElementById('tax_year');
+				if (el) {{ el.value = '{tax_year}'; el.dispatchEvent(new Event('change', {{bubbles: true}})); }}
+			}}""")
 			logger.info(f"[Playwright][RADAR] Set tax year: {tax_year}")
 
-			# 5. Click Search
-			await page.click('#run-search')
-			logger.info("[Playwright][RADAR] Search submitted, waiting for results...")
+			# 5. Set Account Status if the filter exists
+			await page.evaluate("""() => {
+				const el = document.getElementById('account_status') || document.querySelector('select[name="account_status"]');
+				if (el) {
+					el.value = 'Unpaid';
+					el.dispatchEvent(new Event('change', {bubbles: true}));
+				}
+			}""")
 
-			# 6. Wait for results — networkidle covers the AJAX result load
-			await page.wait_for_load_state('networkidle', timeout=60_000)
+			await page.wait_for_timeout(500)
+
+			# 6. Run search via the page's own view_report() function
+			await page.evaluate("view_report()")
+			logger.info("[Playwright][RADAR] Search submitted via view_report(), waiting for results...")
+
+			# 7. Wait for results table to appear (SPA populates a tbody with data rows)
+			await page.wait_for_selector(
+				'table tbody tr td, #report-results tr td',
+				state='attached',
+				timeout=90_000,
+			)
 			logger.info("[Playwright][RADAR] Results loaded")
 
-			# 7. Click CSV download button and capture file
+			# 8. Click CSV download button and capture file
 			async with page.expect_download(timeout=120_000) as dl_info:
 				await page.evaluate('download_options("csv")')
 			download = await dl_info.value
@@ -266,9 +303,12 @@ async def _ai_download_tax_delinquent(
 		logger.info(f"[AI][RADAR] Launching browser agent to download tax delinquent report")
 		logger.info(f"[AI][RADAR] Tax year: {tax_year}, Status: {account_status}")
 
+		from src.utils.http_helpers import get_browser_use_proxy
 		browser = Browser(
 			headless=True,
 			disable_security=True,
+			proxy=get_browser_use_proxy(),
+			user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
 			args=[
 				'--no-sandbox',
 				'--disable-setuid-sandbox',
@@ -278,6 +318,7 @@ async def _ai_download_tax_delinquent(
 				'--no-zygote',
 				'--single-process',
 				'--disable-blink-features=AutomationControlled',
+				'--window-size=1920,1080',
 			]
 		)
 
@@ -301,7 +342,9 @@ async def _ai_download_tax_delinquent(
 			return False
 
 		final_ext = downloaded_file.suffix.lower() or ".csv"
-		dest_file = RAW_TAX_DELINQUENCIES_DIR / f"{dest_stub}{final_ext}"
+		# Save to REFERENCE_DATA_DIR so run_radar_sniper_pipeline can find it
+		REFERENCE_DATA_DIR.mkdir(parents=True, exist_ok=True)
+		dest_file = REFERENCE_DATA_DIR / f"{dest_stub}{final_ext}"
 		if dest_file.exists():
 			dest_file.unlink()
 
@@ -330,6 +373,7 @@ async def download_tax_delinquent_report(
 	tax_year: int = DEFAULT_TAX_YEAR,
 	account_status: str = DEFAULT_ACCOUNT_STATUS,
 	wait_after_download: int = 30,
+	scraper: str = "auto",
 ) -> bool:
 	"""
 	RADAR PHASE: Download bulk tax delinquent report.
@@ -346,28 +390,31 @@ async def download_tax_delinquent_report(
 		bool: True if download succeeded, False otherwise
 	"""
 	# ── Playwright (primary, with retries) ────────────────────────────────────
-	logger.info("[RADAR] Attempting Playwright download (primary)...")
-	MAX_PLAYWRIGHT_RETRIES = 5
-	playwright_error = None
-	for attempt in range(1, MAX_PLAYWRIGHT_RETRIES + 1):
-		try:
-			success = await _playwright_download_tax_delinquent(tax_year=tax_year)
-			if success:
-				logger.info("[RADAR] Playwright download succeeded")
-				return True
-			playwright_error = RuntimeError("Playwright returned False unexpectedly")
-		except Exception as e:
-			playwright_error = e
-			if attempt < MAX_PLAYWRIGHT_RETRIES:
-				logger.warning(f"[RADAR] Playwright attempt {attempt}/{MAX_PLAYWRIGHT_RETRIES} failed: {e} — retrying in 5s...")
-				await asyncio.sleep(5)
-				continue
-			logger.warning(f"[RADAR] All {MAX_PLAYWRIGHT_RETRIES} Playwright retries failed")
-			break
+	if scraper in ("auto", "playwright"):
+		logger.info("[RADAR] Attempting Playwright download (primary)...")
+		MAX_PLAYWRIGHT_RETRIES = 5
+		playwright_error = None
+		for attempt in range(1, MAX_PLAYWRIGHT_RETRIES + 1):
+			try:
+				success = await _playwright_download_tax_delinquent(tax_year=tax_year)
+				if success:
+					logger.info("[RADAR] Playwright download succeeded")
+					return True
+				playwright_error = RuntimeError("Playwright returned False unexpectedly")
+			except Exception as e:
+				playwright_error = e
+				if attempt < MAX_PLAYWRIGHT_RETRIES:
+					logger.warning(f"[RADAR] Playwright attempt {attempt}/{MAX_PLAYWRIGHT_RETRIES} failed: {e} — retrying in 5s...")
+					await asyncio.sleep(5)
+					continue
+				logger.warning(f"[RADAR] All {MAX_PLAYWRIGHT_RETRIES} Playwright retries failed")
+				break
+		if scraper == "playwright":
+			return False
 
-	logger.info("[RADAR] Falling back to browser-use AI downloader...")
+	logger.info("[RADAR] Running browser-use AI downloader...")
 
-	# ── AI fallback (only reached when all Playwright retries fail with errors) ──
+	# ── AI (direct or fallback) ────────────────────────────────────────────────
 	return await _ai_download_tax_delinquent(
 		tax_year=tax_year,
 		account_status=account_status,
@@ -843,6 +890,12 @@ if __name__ == "__main__":
 		action="store_true",
 		help="Skip download phase and use existing CSV file for SNIPER phase"
 	)
+	parser.add_argument(
+		"--scraper",
+		choices=["auto", "playwright", "ai"],
+		default="auto",
+		help="Which scraper to use: auto (playwright → AI fallback), playwright only, ai only (default: auto)",
+	)
 	
 	from src.utils.scraper_db_helper import add_load_to_db_arg, load_scraped_data_to_db
 	add_load_to_db_arg(parser)
@@ -854,7 +907,8 @@ if __name__ == "__main__":
 		if args.mode == "download-only":
 			asyncio.run(download_tax_delinquent_report(
 				tax_year=args.tax_year,
-				account_status=args.status
+				account_status=args.status,
+				scraper=args.scraper,
 			))
 		else:
 			asyncio.run(
@@ -871,14 +925,16 @@ if __name__ == "__main__":
 		
 		# Load to database if requested
 		if args.load_to_db:
-			# Find the most recent tax delinquency CSV
+			# Find most recent CSV — check new/ subdir, then raw dir, then reference dir
 			new_dir = RAW_TAX_DELINQUENCIES_DIR / "new"
-			csv_files = sorted(new_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+			csv_files = sorted(new_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True) if new_dir.exists() else []
+			if not csv_files:
+				csv_files = sorted(RAW_TAX_DELINQUENCIES_DIR.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+			if not csv_files:
+				csv_files = sorted(REFERENCE_DATA_DIR.glob("hillsborough_tax_delinquent_*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
 			if csv_files:
 				csv_to_load = csv_files[0]
 				logger.info(f"Loading to database: {csv_to_load}")
-				
-				# Load to DB
 				load_scraped_data_to_db('tax', csv_to_load, destination_dir=RAW_TAX_DELINQUENCIES_DIR)
 			else:
 				logger.error("No tax delinquency CSV file found to load")

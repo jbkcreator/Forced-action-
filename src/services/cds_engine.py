@@ -48,6 +48,9 @@ from typing import Dict, List, Optional
 
 from src.services.ghl_webhook import push_lead_to_ghl
 
+# Set to False via --no-ghl CLI flag to suppress GHL pushes during bulk runs
+_GHL_PUSH_ENABLED = True
+
 from sqlalchemy.orm import Session, joinedload
 
 from src.core.models import (
@@ -798,7 +801,7 @@ class MultiVerticalScorer:
             logger.debug(f"Updated score for property {score_data['parcel_id']}: {final_score} ({lead_tier})")
             # Only push to GHL if score changed or contact not yet synced
             is_new_contact = not score_data.get("ghl_contact_id")
-            if score_changed or is_new_contact:
+            if _GHL_PUSH_ENABLED and (score_changed or is_new_contact):
                 try:
                     push_lead_to_ghl(score_data)
                 except Exception as ghl_err:
@@ -827,10 +830,11 @@ class MultiVerticalScorer:
         )
         self.session.add(record)
         logger.debug(f"Created score for property {score_data['parcel_id']}: {final_score} ({lead_tier})")
-        try:
-            push_lead_to_ghl(score_data)
-        except Exception as ghl_err:
-            logger.warning(f"[GHL] push failed (non-critical): {ghl_err}")
+        if _GHL_PUSH_ENABLED:
+            try:
+                push_lead_to_ghl(score_data)
+            except Exception as ghl_err:
+                logger.warning(f"[GHL] push failed (non-critical): {ghl_err}")
         return record
 
     # ── Batch scoring ──────────────────────────────────────────────────────────
@@ -975,7 +979,17 @@ def main():
         metavar="ID",
         help="Rescore a single property by database ID",
     )
+    parser.add_argument(
+        "--no-ghl",
+        action="store_true",
+        help="Skip GHL CRM push (useful for bulk rescores to avoid rate limits)",
+    )
     args = parser.parse_args()
+
+    if args.no_ghl:
+        import src.services.cds_engine as _self
+        _self._GHL_PUSH_ENABLED = False
+        log.info("[GHL] Push disabled via --no-ghl flag")
 
     property_ids = None
     if args.property_id:

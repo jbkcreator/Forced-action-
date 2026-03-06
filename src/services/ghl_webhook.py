@@ -216,6 +216,28 @@ def _upsert_contact(score_data: Dict) -> Optional[str]:
                 json=payload,
                 timeout=10,
             )
+            # GHL returns 400 with meta.contactId when duplicate prevention is on —
+            # extract the existing contact ID and retry as a PUT
+            if resp.status_code == 400:
+                try:
+                    dup_id = resp.json().get("meta", {}).get("contactId")
+                except Exception:
+                    dup_id = None
+                if dup_id:
+                    logger.debug(f"[GHL] duplicate contact detected ({dup_id}), retrying as PUT")
+                    put_payload = {k: v for k, v in payload.items() if k != "locationId"}
+                    resp = _ghl_request("PUT",
+                        f"{_GHL_BASE}/contacts/{dup_id}",
+                        headers=_headers(),
+                        json=put_payload,
+                        timeout=10,
+                    )
+                    existing_id = dup_id
+        if not resp.ok:
+            logger.warning(
+                f"[GHL] contact upsert HTTP {resp.status_code} for {score_data.get('parcel_id')}: "
+                f"{resp.text[:500]}"
+            )
         resp.raise_for_status()
         contact = resp.json().get("contact", {})
         return contact.get("id") or existing_id

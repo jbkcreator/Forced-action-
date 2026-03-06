@@ -22,6 +22,10 @@ class AppSettings(BaseSettings):
 	firecrawl_api_key: SecretStr = Field(..., env="FIRECRAWL_API_KEY")
 	court_listener_api_key: SecretStr = Field(..., env="COURT_LISTENER_API_KEY")
 
+	# Oxylabs proxy (optional — used by foreclosure + tax delinquency scrapers)
+	oxylabs_username: Optional[str] = Field(default=None, env="OXYLABS_USERNAME")
+	oxylabs_password: Optional[SecretStr] = Field(default=None, env="OXYLABS_PASSWORD")
+
 	# GoHighLevel CRM integration (optional — feature disabled if not set)
 	ghl_api_key: Optional[SecretStr] = Field(default=None, env="GHL_API_KEY")
 	ghl_location_id: Optional[str] = Field(default=None, env="GHL_LOCATION_ID")

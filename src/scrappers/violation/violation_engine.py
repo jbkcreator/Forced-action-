@@ -663,7 +663,7 @@ async def main(args):
 						skip_duplicates=True
 					)
 					session.commit()
-					
+
 					logger.info(f"\n{'='*60}")
 					logger.info(f"DATABASE LOAD SUMMARY")
 					logger.info(f"{'='*60}")
@@ -674,8 +674,23 @@ async def main(args):
 					match_rate = (matched / total * 100) if total > 0 else 0
 					logger.info(f"  Match Rate: {match_rate:>5.1f}%")
 					logger.info(f"{'='*60}\n")
-					
+
 					logger.info("✓ Database load completed!")
+
+					# Rescore affected properties immediately
+					affected_ids = loader.get_affected_property_ids()
+					if affected_ids:
+						logger.info(f"Triggering CDS rescore for {len(affected_ids)} affected properties...")
+						try:
+							from src.services.cds_engine import MultiVerticalScorer
+							from src.core.database import get_db_context
+							with get_db_context() as score_session:
+								scorer = MultiVerticalScorer(score_session)
+								scorer.score_properties_by_ids(affected_ids, save_to_db=True)
+								score_session.commit()
+							logger.info("✓ CDS rescore completed")
+						except Exception as score_err:
+							logger.warning(f"⚠ CDS rescore failed (non-critical): {score_err}")
 
 					# Delete CSV after successful insertion; keep on error for debugging
 					try:

@@ -98,6 +98,88 @@ def _save_new_foreclosures(df: pd.DataFrame, auction_date: dt.date) -> Optional[
 	return final_file
 
 
+# ── Party enrichment (shared by Playwright + AI paths) ───────────────────────
+
+async def enrich_parties(df: "pd.DataFrame") -> "pd.DataFrame":
+	"""
+	For each row with a Case Detail URL, navigate to the Hillsborough Clerk
+	detail page and extract plaintiff/defendant party names.
+	Runs in a fresh Playwright browser session.
+	"""
+	import pandas as pd
+	from playwright.async_api import async_playwright
+	from playwright_stealth import Stealth
+
+	urls = df.get('Case Detail URL', pd.Series(dtype=str)).fillna('')
+	has_urls = urls.str.strip().astype(bool)
+	if not has_urls.any():
+		logger.info("[Party] No Case Detail URLs — skipping party enrichment")
+		return df
+
+	df['Plaintiff'] = ''
+	df['Defendant'] = ''
+
+	logger.info(f"[Party] Fetching party names for {has_urls.sum()} auctions...")
+	async with async_playwright() as pw:
+		from src.utils.http_helpers import get_playwright_proxy
+		browser = await pw.chromium.launch(
+			headless=True,
+			proxy=get_playwright_proxy(),
+			args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+		)
+		context = await browser.new_context(
+			user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+			viewport={"width": 1920, "height": 1080},
+		)
+		page = await context.new_page()
+		await Stealth().apply_stealth_async(page)
+		try:
+			for idx, row in df[has_urls].iterrows():
+				parties = await _fetch_parties_from_detail(page, row['Case Detail URL'])
+				df.at[idx, 'Plaintiff'] = parties['plaintiff']
+				df.at[idx, 'Defendant'] = parties['defendant']
+		finally:
+			await context.close()
+			await browser.close()
+
+	logger.info("[Party] Party enrichment complete")
+	return df
+
+
+# ── Party detail scraper ─────────────────────────────────────────────────────
+
+async def _fetch_parties_from_detail(page, detail_url: str) -> dict:
+	"""
+	Navigate to the Hillsborough Clerk detail page and extract party names
+	from the #obpa-grid table (ORI - Person Type / Name columns).
+
+	Returns dict with keys: plaintiff, defendant, all_parties (list of dicts)
+	"""
+	try:
+		await page.goto(detail_url, wait_until="domcontentloaded", timeout=30_000)
+		await page.wait_for_selector('#obpa-grid tbody tr', state='attached', timeout=15_000)
+
+		rows = await page.query_selector_all('#obpa-grid tbody tr')
+		parties = []
+		for row in rows:
+			cells = await row.query_selector_all('td')
+			if len(cells) < 3:
+				continue
+			party_type = (await cells[1].inner_text()).strip()
+			name = (await cells[2].inner_text()).strip()
+			if name and name != '\xa0':
+				parties.append({'party_type': party_type, 'name': name})
+
+		plaintiff = next((p['name'] for p in parties if 'PARTY 1' in p['party_type'].upper()), '')
+		defendants = [p['name'] for p in parties if 'PARTY 1' not in p['party_type'].upper()]
+		defendant = '; '.join(defendants)
+
+		return {'plaintiff': plaintiff, 'defendant': defendant, 'all_parties': parties}
+	except Exception as e:
+		logger.warning(f"[Playwright] Failed to fetch parties from {detail_url}: {e}")
+		return {'plaintiff': '', 'defendant': '', 'all_parties': []}
+
+
 # ── Playwright scraper ────────────────────────────────────────────────────────
 
 async def _extract_auction_item_playwright(item) -> Optional[dict]:
@@ -126,6 +208,7 @@ async def _extract_auction_item_playwright(item) -> Optional[dict]:
 		rows = item.locator('.ad_tab tr')
 		row_count = await rows.count()
 		address_parts = []
+		record['Case Detail URL'] = ''
 
 		for i in range(row_count):
 			row = rows.nth(i)
@@ -136,10 +219,14 @@ async def _extract_auction_item_playwright(item) -> Optional[dict]:
 			lbl = (await lbl_el.inner_text()).strip().rstrip(':')
 			dta = (await dta_el.inner_text()).strip()
 
-			if lbl == 'Auction Type':
-				record['Auction Type'] = dta
-			elif lbl == 'Case #':
+			# Extract Case Detail URL from the anchor inside AD_DTA
+			if lbl == 'Case #':
 				record['Case Number'] = dta
+				link_el = dta_el.locator('a')
+				if await link_el.count():
+					record['Case Detail URL'] = await link_el.get_attribute('href') or ''
+			elif lbl == 'Auction Type':
+				record['Auction Type'] = dta
 			elif lbl == 'Final Judgment Amount':
 				record['Judgment Amount'] = dta
 			elif lbl == 'Parcel ID':
@@ -181,6 +268,7 @@ async def scrape_foreclosures_with_playwright(
 		RuntimeError: If no auction items are found (page empty or selectors changed).
 	"""
 	from playwright.async_api import async_playwright
+	from playwright_stealth import Stealth
 
 	preview_url = build_preview_url(auction_date)
 	logger.info(f"[Playwright] Scraping foreclosures for {auction_date}: {preview_url}")
@@ -197,8 +285,10 @@ async def scrape_foreclosures_with_playwright(
 			logger.info(f"[Playwright][DEBUG] Saved {name}.png + {name}.html")
 
 	async with async_playwright() as pw:
+		from src.utils.http_helpers import get_playwright_proxy
 		browser = await pw.chromium.launch(
 			headless=True,
+			proxy=get_playwright_proxy(),
 			args=[
 				'--no-sandbox',
 				'--disable-setuid-sandbox',
@@ -206,9 +296,23 @@ async def scrape_foreclosures_with_playwright(
 				'--disable-gpu',
 			],
 		)
-		page = await browser.new_page()
+		context = await browser.new_context(
+			user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+			viewport={"width": 1920, "height": 1080},
+			extra_http_headers={
+				"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+				"Accept-Language": "en-US,en;q=0.9",
+				"Accept-Encoding": "gzip, deflate, br",
+				"sec-ch-ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+				"sec-ch-ua-mobile": "?0",
+				"sec-ch-ua-platform": '"Windows"',
+				"Upgrade-Insecure-Requests": "1",
+			},
+		)
+		page = await context.new_page()
+		await Stealth().apply_stealth_async(page)
 		try:
-			await page.goto(preview_url, wait_until="domcontentloaded", timeout=60_000)
+			await page.goto(preview_url, wait_until="commit", timeout=120_000)
 
 			# Give JS time to render the auction container
 			try:
@@ -270,6 +374,7 @@ async def scrape_foreclosures_with_playwright(
 			await save_debug(page, "99_done")
 
 		finally:
+			await context.close()
 			await browser.close()
 
 	if not all_records:
@@ -279,6 +384,7 @@ async def scrape_foreclosures_with_playwright(
 
 	logger.info(f"[Playwright] Extracted {len(all_records)} total auction records")
 	df = pd.DataFrame(all_records)
+	df = await enrich_parties(df)
 	return _save_new_foreclosures(df, auction_date)
 
 
@@ -289,24 +395,18 @@ async def _scrape_with_ai(
 	wait_after_scrape: int = 10,
 ) -> Optional[Path]:
 	"""
-	AI browser-use fallback scraper. Used when Playwright fails or explicitly requested.
+	AI browser-use fallback scraper. Returns data via agent final_result() as JSON.
 	"""
-	import time
+	import json
 
-	start_time = time.time()
 	preview_url = build_preview_url(auction_date)
 	iso_date = auction_date.strftime("%Y-%m-%d")
-
-	temp_dir = RAW_FORECLOSURE_DIR / "temp"
-	temp_dir.mkdir(parents=True, exist_ok=True)
-	temp_file = temp_dir / f"foreclosures_temp_{auction_date:%Y%m%d}.csv"
 
 	try:
 		task_instructions = get_prompt(
 			"foreclosure_prompts.yaml",
 			"auction_scrape.task_template",
 			preview_url=preview_url,
-			dest_file=str(temp_file.resolve()),
 		)
 	except Exception as e:
 		logger.error(f"[AI] Failed to load prompt from YAML: {e}")
@@ -314,9 +414,12 @@ async def _scrape_with_ai(
 
 	logger.info(f"[AI] Launching browser agent for {iso_date}: {preview_url}")
 
+	from src.utils.http_helpers import get_browser_use_proxy
 	browser = Browser(
 		headless=True,
 		disable_security=True,
+		proxy=get_browser_use_proxy(),
+		user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
 		args=[
 			'--no-sandbox',
 			'--disable-setuid-sandbox',
@@ -326,6 +429,7 @@ async def _scrape_with_ai(
 			'--no-zygote',
 			'--single-process',
 			'--disable-blink-features=AutomationControlled',
+			'--window-size=1920,1080',
 		],
 	)
 
@@ -343,30 +447,51 @@ async def _scrape_with_ai(
 			logger.warning("[AI] Agent could not complete within 50 steps")
 			return None
 
-		logger.info("[AI] Agent workflow completed. Waiting for file write...")
-		await asyncio.sleep(wait_after_scrape)
-
 	except Exception as e:
 		logger.error(f"[AI] Browser agent execution failed: {e}")
 		logger.debug(traceback.format_exc())
 		return None
 
-	if not temp_file.exists():
-		logger.error("[AI] Could not locate the scraped data file")
-		return None
-
-	file_size_kb = temp_file.stat().st_size / 1024
-	logger.info(f"[AI] Temp file saved: {temp_file} ({file_size_kb:.1f} KB)")
-
+	# Parse JSON from agent's final result
 	try:
-		df = pd.read_csv(temp_file)
-		result = _save_new_foreclosures(df, auction_date)
-		temp_file.unlink()
-		return result
+		final = history.final_result()
+		if not final:
+			# Fallback: check extracted_content
+			contents = history.extracted_content()
+			final = contents[-1] if contents else None
+		if not final:
+			logger.error("[AI] Agent returned no result")
+			return None
+
+		# Extract JSON — agent may wrap it in text
+		json_start = final.find('{')
+		json_end = final.rfind('}') + 1
+		if json_start == -1 or json_end == 0:
+			logger.error(f"[AI] No JSON found in agent result: {final[:200]}")
+			return None
+
+		data = json.loads(final[json_start:json_end])
+		auctions = data.get('auctions', [])
+		if not auctions:
+			logger.warning("[AI] Agent returned empty auctions list")
+			return None
+
+		logger.info(f"[AI] Agent extracted {len(auctions)} auction records")
+		df = pd.DataFrame(auctions).rename(columns={
+			'case_number': 'Case Number',
+			'status': 'Status',
+			'property_address': 'Property Address',
+			'opening_bid': 'Opening Bid',
+			'judgment_amount': 'Judgment Amount',
+			'case_detail_url': 'Case Detail URL',
+		})
+		df = await enrich_parties(df)
+		return _save_new_foreclosures(df, auction_date)
+
 	except Exception as e:
-		logger.error(f"[AI] Post-processing failed: {e}")
+		logger.error(f"[AI] Failed to parse agent result: {e}")
 		logger.debug(traceback.format_exc())
-		return temp_file
+		return None
 
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
@@ -511,6 +636,21 @@ def main():
 					logger.info(f"  Match Rate: {match_rate:>5.1f}%")
 					logger.info(f"{'='*60}\n")
 					logger.info("✓ Database load completed!")
+
+					# Rescore affected properties immediately
+					affected_ids = loader.get_affected_property_ids()
+					if affected_ids:
+						logger.info(f"Triggering CDS rescore for {len(affected_ids)} affected properties...")
+						try:
+							from src.services.cds_engine import MultiVerticalScorer
+							from src.core.database import get_db_context as _get_db
+							with _get_db() as score_session:
+								scorer = MultiVerticalScorer(score_session)
+								scorer.score_properties_by_ids(affected_ids, save_to_db=True)
+								score_session.commit()
+							logger.info("✓ CDS rescore completed")
+						except Exception as score_err:
+							logger.warning(f"⚠ CDS rescore failed (non-critical): {score_err}")
 
 			except Exception as e:
 				logger.error(f"Failed to load data to database: {e}")

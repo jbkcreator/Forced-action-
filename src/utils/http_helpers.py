@@ -4,10 +4,54 @@ HTTP request helpers with built-in retry logic.
 
 import logging
 import time
+from typing import Optional
 
 import requests
 
 logger = logging.getLogger(__name__)
+
+
+def get_playwright_proxy() -> Optional[dict]:
+    """
+    Return a Playwright proxy config dict if OXYLABS_PROXY_URL is set in .env.
+    Returns None if not configured (scrapers run without proxy).
+
+    Usage in playwright:
+        browser = await pw.chromium.launch(proxy=get_playwright_proxy(), ...)
+    """
+    from config.settings import settings
+    if not settings.oxylabs_username or not settings.oxylabs_password:
+        logger.info("[Proxy] OXYLABS_USERNAME/PASSWORD not set — running without proxy")
+        return None
+    username = settings.oxylabs_username
+    password = settings.oxylabs_password.get_secret_value()
+    logger.info(f"[Proxy] Using proxy: ...@pr.oxylabs.io:7777 (user: {username})")
+    # Playwright takes server + credentials separately
+    return {
+        "server": "http://pr.oxylabs.io:7777",
+        "username": username,
+        "password": password,
+    }
+
+
+def get_browser_use_proxy():
+    """
+    Return a browser_use ProxySettings if OXYLABS_PROXY_URL is set in .env.
+    Returns None if not configured.
+
+    Usage in browser_use:
+        browser = Browser(proxy=get_browser_use_proxy(), ...)
+    """
+    from config.settings import settings
+    if not settings.oxylabs_username or not settings.oxylabs_password:
+        return None
+    from browser_use.browser.profile import ProxySettings
+    return ProxySettings(
+        server="http://pr.oxylabs.io:7777",
+        username=settings.oxylabs_username,
+        password=settings.oxylabs_password.get_secret_value(),
+    )
+
 
 # Retry on network-level failures and server errors; never retry on client errors (4xx)
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}

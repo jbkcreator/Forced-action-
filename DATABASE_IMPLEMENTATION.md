@@ -8,15 +8,16 @@ This project uses **SQLAlchemy 2.0** as the ORM (Object-Relational Mapper) with 
 
 ```
 properties (Central Hub)
-    ├── owners (1:1)
+    ├── owners (1:1)               — owner_type: Individual/LLC/Corporate/Trust/Estate
     ├── financials (1:1)
     ├── code_violations (1:Many)
-    ├── legal_and_liens (1:Many, Polymorphic)
+    ├── legal_and_liens (1:Many)   — record_type: Lien/Judgment; document_type: ML/HL/CCL/TL/JUD/CCJ
+    ├── deeds (1:Many)
+    ├── legal_proceedings (1:Many) — record_type: Probate/Eviction/Bankruptcy
     ├── tax_delinquencies (1:Many)
     ├── foreclosures (1:Many)
     ├── building_permits (1:Many)
-    ├── incidents (1:Many)
-    └── distress_scores (1:Many)
+    └── distress_scores (1:Many)   — vertical_scores JSONB, urgency_level, lead_tier
 ```
 
 ## Setup
@@ -218,16 +219,17 @@ with db.session_scope() as session:
 ### 1. Models (`src/core/models.py`)
 
 Contains all SQLAlchemy ORM models:
-- `Property` - Central hub table
-- `Owner` - Owner information (1:1)
-- `Financial` - Financial data (1:1)
-- `CodeViolation` - Code violations (1:Many)
-- `LegalAndLien` - Polymorphic liens/legal issues (1:Many)
-- `TaxDelinquency` - Tax delinquencies (1:Many)
+- `Property` - Central hub table (522k+ Hillsborough parcels)
+- `Owner` - Owner information (1:1) — owner_type auto-classified from name patterns
+- `Financial` - Assessed value, equity, sale history (1:1)
+- `CodeViolation` - Code enforcement violations (1:Many)
+- `LegalAndLien` - Liens and judgments (1:Many) — document_type: ML/HL/CCL/TL/JUD/CCJ
+- `Deed` - Property ownership transfers (1:Many)
+- `LegalProceeding` - Probate/Eviction/Bankruptcy cases (1:Many)
+- `TaxDelinquency` - Tax delinquency records (1:Many)
 - `Foreclosure` - Foreclosure cases (1:Many)
 - `BuildingPermit` - Building permits (1:Many)
-- `Incident` - Police/fire incidents (1:Many)
-- `DistressScore` - CDS scoring results (1:Many)
+- `DistressScore` - CDS scoring results with vertical_scores JSONB (1:Many)
 
 ### 2. Database Management (`src/core/database.py`)
 
@@ -374,11 +376,16 @@ print(counts)
 # Enable SQL echo
 # In .env file:
 DB_ECHO=true
-
-# Or programmatically
-from config.settings import settings
-settings.db_echo = True
 ```
+
+### Logging
+
+Log files are in `logs/`. File handlers write **WARNING and above only** — full INFO output goes to console/cron logs only.
+
+- `logs/app.log` — warnings/errors from all src modules
+- `logs/errors.log` — errors only
+- `logs/cds_engine.log` — warnings/errors from scoring engine
+- `logs/cron/<engine>.log` — full INFO output captured by cron runner (per scraper)
 
 ## Performance Tips
 

@@ -2,15 +2,21 @@
 
 # Foreclosure auction calendar scraping task
 auction_scrape:
-  description: "Navigate to RealForeclose auction calendar and extract all case details"
+  description: "Navigate to RealForeclose auction calendar and extract listing-level data only"
   task_template: |
     1. Open {preview_url}
     2. Wait for the auction calendar table to fully load.
-    3. For EACH auction row in the table, click on the case number link to open the detail page.
-    4. On the detail page, extract ALL fields including Status, Plaintiff, Defendant, Property Address, Judgment Amount, Opening Bid, and most importantly the 'raw' field/column if present.
-    5. After extracting details, return to the calendar and repeat for the next case.
-    6. Continue until ALL cases have been processed.
-    7. Compile all auction data (case number, status, plaintiff, defendant, property address, raw data, judgment amount, opening bid, etc.) into a structured format.
-    8. Save the complete dataset as a CSV file to: {dest_file}
-    9. Ensure all auctions with any status are included in the export.
-    10. Once saved, wait a few seconds to confirm the file is written.
+    3. Extract the following fields directly from the calendar listing for EACH auction row (do NOT click into detail pages):
+       - case_number
+       - status
+       - property_address
+       - opening_bid
+       - judgment_amount
+       - case_detail_url: look for a <td> with class "AD_DTA" containing an <a> tag — extract the full href attribute value
+    4. Collect all rows across all sections (Waiting, Running, Closed/Canceled) and across all pages if pagination exists.
+    5. When done, call done() with a JSON string in this exact format:
+       {{"auctions": [{{"case_number": "...", "status": "...", "property_address": "...", "opening_bid": "...", "judgment_amount": "...", "case_detail_url": "..."}}]}}
+    6. Do NOT write any files. Return ALL data in the done() text field as JSON.
+
+    NB: Only scrape the given URL. Do not navigate to detail pages, do not search other websites.
+    Handle any captchas or anti-bot measures by waiting and retrying.
