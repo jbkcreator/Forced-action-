@@ -95,9 +95,9 @@ def _best_vertical(score_data: Dict) -> str:
     return max(vs, key=vs.get)
 
 
-def _find_contact_by_phone(phone: str) -> Optional[str]:
+def _find_contact_by_parcel(parcel_id: str) -> Optional[str]:
     """
-    Search GHL for an existing contact by phone number.
+    Search GHL for an existing contact by parcel ID (custom field tag search).
     Returns the contact ID if found, None otherwise.
     """
     try:
@@ -106,16 +106,19 @@ def _find_contact_by_phone(phone: str) -> Optional[str]:
             headers=_headers(),
             params={
                 "locationId": settings.ghl_location_id,
-                "query": phone,
+                "query": parcel_id,
             },
             timeout=10,
         )
         resp.raise_for_status()
         contacts = resp.json().get("contacts", [])
-        if contacts:
-            return contacts[0]["id"]
+        # Match only contacts whose parcel custom field matches exactly
+        for c in contacts:
+            for cf in c.get("customFields", []):
+                if cf.get("value") == parcel_id:
+                    return c["id"]
     except Exception as e:
-        logger.debug(f"[GHL] contact search failed: {e}")
+        logger.debug(f"[GHL] contact search by parcel failed: {e}")
     return None
 
 
@@ -194,9 +197,11 @@ def _upsert_contact(score_data: Dict) -> Optional[str]:
     if email:
         payload["email"] = email
 
-    # Dedup priority: 1) stored GHL contact ID on property, 2) phone search
+    # Dedup priority: 1) stored GHL contact ID on property, 2) parcel ID search
+    # Phone-based dedup skipped — <1% of properties have phone data
+    parcel_id = score_data.get("parcel_id") or ""
     existing_id = score_data.get("ghl_contact_id") or (
-        _find_contact_by_phone(phone) if phone else None
+        _find_contact_by_parcel(parcel_id) if parcel_id else None
     )
 
     try:

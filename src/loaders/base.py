@@ -155,6 +155,14 @@ class BaseLoader(ABC):
             ' place': ' pl',
             ' way': ' wy',
             'florida': 'fl',
+            ' north ': ' n ',
+            ' south ': ' s ',
+            ' east ': ' e ',
+            ' west ': ' w ',
+            ' northwest ': ' nw ',
+            ' northeast ': ' ne ',
+            ' southwest ': ' sw ',
+            ' southeast ': ' se ',
         }
         
         for old, new in replacements.items():

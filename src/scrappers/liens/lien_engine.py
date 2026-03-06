@@ -561,6 +561,11 @@ def categorize_and_split_data(combined_df: pd.DataFrame) -> dict:
             return 'Deeds'
 
         if doc_type in JUDGMENT_DOCTYPES:
+            # Judgments filed by City of Tampa are code enforcement liens, not civil judgments
+            grantor = str(row.get('Grantor', '')).upper()
+            grantee = str(row.get('Grantee', '')).upper()
+            if 'CITY OF TAMPA' in grantor or 'CITY OF TAMPA' in grantee:
+                return 'TAMPA CODE LIENS (TCL)'
             return doc_type  # preserve original for downstream logging
 
         if doc_type in LIEN_DOCTYPES:

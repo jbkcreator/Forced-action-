@@ -5,9 +5,6 @@ formatters:
   standard:
     format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     datefmt: '%Y-%m-%d %H:%M:%S'
-  detailed:
-    format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    datefmt: '%Y-%m-%d %H:%M:%S'
 
 handlers:
   console:
@@ -16,44 +13,17 @@ handlers:
     formatter: standard
     stream: ext://sys.stdout
 
-  file:
-    class: logging.handlers.RotatingFileHandler
-    level: WARNING
-    formatter: detailed
-    filename: logs/app.log
-    maxBytes: 10485760  # 10MB
-    backupCount: 5
-    encoding: utf8
-
-  error_file:
-    class: logging.handlers.RotatingFileHandler
-    level: ERROR
-    formatter: detailed
-    filename: logs/errors.log
-    maxBytes: 10485760  # 10MB
-    backupCount: 5
-    encoding: utf8
-
-  cds_file:
-    class: logging.handlers.RotatingFileHandler
-    level: WARNING
-    formatter: detailed
-    filename: logs/cds_engine.log
-    maxBytes: 10485760  # 10MB
-    backupCount: 5
-    encoding: utf8
-
 loggers:
   src.services.cds_engine:
     level: INFO
-    handlers: [console, cds_file, error_file]
+    handlers: [console]
     propagate: false
 
   src:
     level: INFO
-    handlers: [console, file, error_file]
+    handlers: [console]
     propagate: false
 
 root:
   level: INFO
-  handlers: [console, file]
+  handlers: [console]
