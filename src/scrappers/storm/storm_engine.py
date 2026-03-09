@@ -1,0 +1,183 @@
+"""
+Storm Damage Zones — M1-F Scraper #2
+
+Fetches active storm damage alerts from the NOAA/NWS API and matches
+affected ZIP codes against properties in the DB. Creates Incident records
+(incident_type='storm_damage') for all matched properties.
+
+Data source: NWS CAP alerts API (public, no key required)
+    https://api.weather.gov/alerts/active
+
+Entry point:
+    scrape_storm_damage(county_id, date_range)
+"""
+
+import logging
+from datetime import date
+from typing import Optional, Tuple, List, Dict
+
+import requests
+
+from src.core.database import get_db_context
+from src.core.models import Property, Incident
+from src.utils.county_config import get_county
+from sqlalchemy import select, and_
+
+logger = logging.getLogger(__name__)
+
+_NWS_ALERTS_URL = "https://api.weather.gov/alerts/active"
+
+# NWS event types that indicate storm/wind/hail damage relevant to roofing
+STORM_EVENT_TYPES = [
+    "Tornado Warning",
+    "Tornado Watch",
+    "Severe Thunderstorm Warning",
+    "Severe Thunderstorm Watch",
+    "Hurricane Warning",
+    "Hurricane Watch",
+    "Tropical Storm Warning",
+    "Tropical Storm Watch",
+    "High Wind Warning",
+    "Wind Advisory",
+    "Special Weather Statement",
+    "Flash Flood Warning",
+    "Flood Warning",
+]
+
+
+def _fetch_nws_alerts(state: str = "FL") -> List[Dict]:
+    """Fetch active NWS alerts for a state."""
+    try:
+        resp = requests.get(
+            _NWS_ALERTS_URL,
+            params={"area": state, "status": "actual", "message_type": "alert"},
+            headers={"User-Agent": "ForcedAction/1.0 (distressed-property-intelligence)"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json().get("features", [])
+    except Exception as e:
+        logger.warning(f"[storm] NWS API fetch failed: {e}")
+        return []
+
+
+def _extract_affected_zips(alert: Dict) -> List[str]:
+    """Extract ZIP codes from NWS alert geometry or affected zones description."""
+    zips = []
+    props = alert.get("properties", {})
+
+    # Try geocode/UGC zones — NWS provides FIPS-level county codes
+    # Try to parse ZIPs from the description text
+    description = props.get("description", "") or ""
+    import re
+    found_zips = re.findall(r"\b(3[3-4]\d{3})\b", description)  # FL ZIPs 33xxx-34xxx
+    zips.extend(found_zips)
+
+    return list(set(zips))
+
+
+def scrape_storm_damage(
+    county_id: str = "hillsborough",
+    date_range: Optional[Tuple[date, date]] = None,  # noqa: ARG001 — interface consistency
+) -> int:
+    """
+    Fetch active NWS storm alerts and create Incident records for all
+    properties in affected ZIP codes.
+
+    Args:
+        county_id:   County to process.
+        date_range:  Unused for live API (always fetches current active alerts).
+                     Accepted for interface consistency.
+
+    Returns:
+        Number of new Incident records created.
+    """
+    try:
+        config = get_county(county_id)
+    except KeyError:
+        logger.error(f"[storm] Unknown county_id: {county_id}")
+        return 0
+
+    state = config.get("state", "FL")
+    zip_prefixes = config.get("zip_prefixes", [])
+
+    logger.info(f"[storm] Fetching NWS alerts for {county_id} ({state})")
+
+    alerts = _fetch_nws_alerts(state)
+    logger.info(f"[storm] {len(alerts)} active alerts fetched")
+
+    # Collect all ZIPs mentioned across storm alerts
+    affected_zips: set = set()
+    storm_date = date.today()
+
+    for alert in alerts:
+        props = alert.get("properties", {})
+        event = props.get("event", "")
+        if not any(event_type in event for event_type in STORM_EVENT_TYPES):
+            continue
+
+        alert_zips = _extract_affected_zips(alert)
+        # Filter to county ZIP prefixes
+        county_zips = [
+            z for z in alert_zips
+            if any(z.startswith(pfx) for pfx in zip_prefixes)
+        ]
+        affected_zips.update(county_zips)
+
+        logger.info(f"[storm] Alert: '{event}' — {len(county_zips)} county ZIPs affected")
+
+    if not affected_zips:
+        logger.info(f"[storm] No storm alerts affecting {county_id} ZIPs")
+        return 0
+
+    logger.info(f"[storm] Affected ZIPs in {county_id}: {sorted(affected_zips)}")
+
+    created = 0
+    with get_db_context() as db:
+        # Find all properties in affected ZIPs
+        properties = db.execute(
+            select(Property).where(
+                and_(
+                    Property.county_id == county_id,
+                    Property.zip.in_(affected_zips),
+                )
+            )
+        ).scalars().all()
+
+        logger.info(f"[storm] {len(properties)} properties in affected ZIPs")
+
+        for prop in properties:
+            # Skip if already recorded today
+            existing = db.execute(
+                select(Incident).where(
+                    and_(
+                        Incident.property_id == prop.id,
+                        Incident.incident_type == "storm_damage",
+                        Incident.incident_date == storm_date,
+                    )
+                )
+            ).scalars().first()
+
+            if existing:
+                continue
+
+            incident = Incident(
+                property_id=prop.id,
+                incident_type="storm_damage",
+                incident_date=storm_date,
+                county_id=county_id,
+            )
+            db.add(incident)
+            created += 1
+
+        db.commit()
+
+    logger.info(f"[storm] Created {created} storm damage Incident records")
+    return created
+
+
+if __name__ == "__main__":
+    import sys
+    county = sys.argv[1] if len(sys.argv) > 1 else "hillsborough"
+    n = scrape_storm_damage(county_id=county)
+    print(f"Done — {n} storm damage incidents created")

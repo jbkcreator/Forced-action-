@@ -16,10 +16,11 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    UniqueConstraint,
     CheckConstraint,
     Index,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import DeclarativeBase, relationship, Mapped, mapped_column
 
 
@@ -67,6 +68,9 @@ class Property(Base):
     # Legal Information
     legal_description: Mapped[Optional[str]] = mapped_column(Text)
 
+    # Multi-county
+    county_id: Mapped[Optional[str]] = mapped_column(String(50), default='hillsborough', index=True)
+
     # CRM Integration
     gohighlevel_contact_id: Mapped[Optional[str]] = mapped_column(String(100), unique=True)
     sync_status: Mapped[Optional[str]] = mapped_column(String(20), default="pending")
@@ -94,6 +98,7 @@ class Property(Base):
         Index("idx_property_address", "address"),
         Index("idx_property_city_state", "city", "state"),
         Index("idx_property_zip", "zip"),
+        Index("idx_property_county_id", "county_id"),
         Index("idx_property_sync_status", "sync_status"),
         CheckConstraint("sync_status IN ('pending', 'synced', 'error')", name="check_sync_status"),
     )
@@ -140,6 +145,9 @@ class Owner(Base):
     credit_score_tier: Mapped[Optional[str]] = mapped_column(String(50))
     skip_trace_success: Mapped[Optional[bool]] = mapped_column(Boolean, default=False)
 
+    # Multi-county
+    county_id: Mapped[Optional[str]] = mapped_column(String(50), default='hillsborough', index=True)
+
     # Relationship
     property: Mapped["Property"] = relationship("Property", back_populates="owner")
 
@@ -148,6 +156,7 @@ class Owner(Base):
         Index("idx_owner_name", "owner_name"),
         Index("idx_owner_type", "owner_type"),
         Index("idx_absentee_status", "absentee_status"),
+        Index("idx_owner_county_id", "county_id"),
         CheckConstraint("owner_type IN ('Individual', 'LLC', 'Trust', 'Estate', 'Corporate')", name="check_owner_type"),
         CheckConstraint("absentee_status IN ('In-County', 'Out-of-County', 'Out-of-State')", name="check_absentee_status"),
     )
@@ -198,6 +207,9 @@ class Financial(Base):
     est_repair_cost: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
     arv: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
 
+    # Multi-county
+    county_id: Mapped[Optional[str]] = mapped_column(String(50), default='hillsborough', index=True)
+
     # Relationship
     property: Mapped["Property"] = relationship("Property", back_populates="financial")
 
@@ -205,6 +217,7 @@ class Financial(Base):
     __table_args__ = (
         Index("idx_financial_assessed_value", "assessed_value_mkt"),
         Index("idx_financial_equity_pct", "equity_pct"),
+        Index("idx_financial_county_id", "county_id"),
     )
 
     def __repr__(self):
@@ -565,7 +578,11 @@ class Incident(Base):
         Index("idx_incident_date", "incident_date"),
         Index("idx_incident_problem_flag", "problem_prop_flag"),
         Index("idx_incident_crime_types", "crime_types", postgresql_using="gin"),
-        CheckConstraint("incident_type IN ('Arrest', 'Police Dispatch', 'Fire')", name="check_incident_type"),
+        CheckConstraint(
+            "incident_type IN ('Arrest', 'Police Dispatch', 'Fire', "
+            "'roofing_permit', 'storm_damage', 'flood_damage', 'insurance_claim')",
+            name="check_incident_type",
+        ),
     )
 
     def __repr__(self):
@@ -601,6 +618,9 @@ class DistressScore(Base):
     factor_scores: Mapped[Optional[dict]] = mapped_column(JSONB)
     qualified: Mapped[Optional[bool]] = mapped_column(Boolean, default=False)
 
+    # Multi-county
+    county_id: Mapped[Optional[str]] = mapped_column(String(50), default='hillsborough', index=True)
+
     # Relationship
     property: Mapped["Property"] = relationship("Property", back_populates="distress_scores")
 
@@ -610,6 +630,7 @@ class DistressScore(Base):
         Index("idx_score_final_cds", "final_cds_score"),
         Index("idx_score_lead_tier", "lead_tier"),
         Index("idx_score_qualified", "qualified"),
+        Index("idx_score_county_id", "county_id"),
         Index("idx_score_distress_types", "distress_types", postgresql_using="gin"),
         CheckConstraint("urgency_level IN ('Immediate', 'High', 'Medium', 'Low')", name="check_urgency_level"),
         CheckConstraint("lead_tier IN ('Ultra Platinum', 'Platinum', 'Gold', 'Silver', 'Bronze')", name="check_lead_tier"),
@@ -617,3 +638,176 @@ class DistressScore(Base):
 
     def __repr__(self):
         return f"<DistressScore(id={self.id}, property_id={self.property_id}, score={self.final_cds_score}, tier='{self.lead_tier}')>"
+
+
+# ============================================================================
+# 5. M1 — SUBSCRIBER & REVENUE TABLES
+# ============================================================================
+
+class FoundingSubscriberCount(Base):
+    """
+    Tracks founding subscriber count per tier/vertical/county.
+    Used for atomic checkout price selection and live countdown on landing page.
+    """
+    __tablename__ = "founding_subscriber_counts"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    tier: Mapped[str] = mapped_column(String(20), nullable=False)          # starter | pro | dominator
+    vertical: Mapped[str] = mapped_column(String(50), nullable=False)      # roofing | remediation | investor
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc)
+    )
+
+    __table_args__ = (
+        UniqueConstraint("tier", "vertical", "county_id", name="uq_founding_tier_vertical_county"),
+        Index("idx_founding_county_id", "county_id"),
+        CheckConstraint("tier IN ('starter', 'pro', 'dominator')", name="check_founding_tier"),
+    )
+
+    def __repr__(self):
+        return f"<FoundingSubscriberCount(tier='{self.tier}', vertical='{self.vertical}', county='{self.county_id}', count={self.count})>"
+
+
+class Subscriber(Base):
+    """
+    Paid subscriber record. Founding rate is locked at checkout and never overwritten.
+    """
+    __tablename__ = "subscribers"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+
+    # Stripe identifiers
+    stripe_customer_id: Mapped[str] = mapped_column(String(100), unique=True, nullable=False, index=True)
+    stripe_subscription_id: Mapped[Optional[str]] = mapped_column(String(100), unique=True, index=True)
+
+    # Plan details
+    tier: Mapped[str] = mapped_column(String(20), nullable=False)          # starter | pro | dominator
+    vertical: Mapped[str] = mapped_column(String(50), nullable=False)      # roofing | remediation | investor
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False)
+
+    # Founding rate lock — set at checkout, never overwritten
+    founding_member: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    founding_price_id: Mapped[Optional[str]] = mapped_column(String(100))  # Stripe price_id locked at checkout
+    rate_locked_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    # Subscription state
+    status: Mapped[str] = mapped_column(String(20), default='active', nullable=False)  # active | grace | churned | cancelled
+    billing_date: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    grace_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    # GHL integration
+    ghl_contact_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)
+    ghl_stage: Mapped[Optional[int]] = mapped_column(Integer)              # 5 = paid, 7 = churned
+
+    # Event Feed access
+    event_feed_uuid: Mapped[Optional[str]] = mapped_column(String(36), unique=True, index=True)
+
+    # Contact
+    email: Mapped[Optional[str]] = mapped_column(String(255), index=True)
+    name: Mapped[Optional[str]] = mapped_column(String(255))
+
+    # Audit
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc)
+    )
+
+    __table_args__ = (
+        Index("idx_subscriber_county_id", "county_id"),
+        Index("idx_subscriber_status", "status"),
+        Index("idx_subscriber_vertical", "vertical"),
+        CheckConstraint("tier IN ('starter', 'pro', 'dominator')", name="check_subscriber_tier"),
+        CheckConstraint("status IN ('active', 'grace', 'churned', 'cancelled')", name="check_subscriber_status"),
+    )
+
+    def __repr__(self):
+        return f"<Subscriber(id={self.id}, email='{self.email}', tier='{self.tier}', founding={self.founding_member})>"
+
+
+class ZipTerritory(Base):
+    """
+    ZIP code exclusivity per vertical per county.
+    One subscriber holds a ZIP per vertical at a time.
+    """
+    __tablename__ = "zip_territories"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+
+    zip_code: Mapped[str] = mapped_column(String(10), nullable=False)
+    vertical: Mapped[str] = mapped_column(String(50), nullable=False)
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False)
+
+    # Ownership
+    subscriber_id: Mapped[Optional[int]] = mapped_column(ForeignKey("subscribers.id"), nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(20), default='available', nullable=False)  # available | locked | grace
+
+    # Timing
+    locked_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    grace_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    # Waitlist — array of emails waiting for this ZIP to open
+    waitlist_emails: Mapped[Optional[list]] = mapped_column(ARRAY(String(255)), default=list)
+
+    # Audit
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc)
+    )
+
+    subscriber: Mapped[Optional["Subscriber"]] = relationship("Subscriber")
+
+    __table_args__ = (
+        UniqueConstraint("zip_code", "vertical", "county_id", name="uq_zip_vertical_county"),
+        Index("idx_zip_territory_status", "status"),
+        Index("idx_zip_territory_county_id", "county_id"),
+        CheckConstraint("status IN ('available', 'locked', 'grace')", name="check_zip_status"),
+    )
+
+    def __repr__(self):
+        return f"<ZipTerritory(zip='{self.zip_code}', vertical='{self.vertical}', status='{self.status}')>"
+
+
+class EnrichedContact(Base):
+    """
+    Skip-traced contact data from BatchSkipTracing (primary) and IDI (fallback).
+    Linked to a property. Pushed to GHL on creation.
+    """
+    __tablename__ = "enriched_contacts"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    property_id: Mapped[int] = mapped_column(ForeignKey("properties.id"), nullable=False, index=True)
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+
+    # Skip-trace results
+    mobile_phone: Mapped[Optional[str]] = mapped_column(String(20))
+    landline: Mapped[Optional[str]] = mapped_column(String(20))
+    email: Mapped[Optional[str]] = mapped_column(String(255))
+    mailing_address: Mapped[Optional[str]] = mapped_column(String(255))
+    llc_owner_name: Mapped[Optional[str]] = mapped_column(String(255))
+    relative_contacts: Mapped[Optional[dict]] = mapped_column(JSONB)  # relative contact chain
+
+    # Source tracking
+    source: Mapped[str] = mapped_column(String(50), nullable=False)   # batch_skip_tracing | idi
+    match_success: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    # GHL sync
+    ghl_contact_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)
+    ghl_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    # Audit
+    enriched_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    property: Mapped["Property"] = relationship("Property")
+
+    __table_args__ = (
+        Index("idx_enriched_match_success", "match_success"),
+        Index("idx_enriched_source", "source"),
+        CheckConstraint("source IN ('batch_skip_tracing', 'idi')", name="check_enriched_source"),
+    )
+
+    def __repr__(self):
+        return f"<EnrichedContact(id={self.id}, property_id={self.property_id}, source='{self.source}', match={self.match_success})>"

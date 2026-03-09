@@ -1,0 +1,24 @@
+{
+  "hillsborough": {
+    "name": "Hillsborough County",
+    "state": "FL",
+    "fips": "12057",
+    "zip_prefixes": ["335", "336", "337"],
+    "portals": {
+      "clerk_base_url": "https://publicrec.hillsclerk.com",
+      "clerk_public_access_url": "https://publicaccess.hillsclerk.com/oripublicaccess/",
+      "civil_filings_url": "https://publicrec.hillsclerk.com/Civil/dailyfilings/",
+      "probate_filings_url": "https://publicrec.hillsclerk.com/Probate/dailyfilings/",
+      "accela_base_url": "https://aca-prod.accela.com/HCFL",
+      "permit_search_url": "https://aca-prod.accela.com/HCFL/Cap/CapHome.aspx?module=Building",
+      "violation_search_url": "https://aca-prod.accela.com/HCFL/Cap/CapHome.aspx?module=Enforcement&TabName=Enforcement",
+      "realforeclose_base_url": "https://www.hillsborough.realforeclose.com/index.cfm",
+      "tax_collector_base_url": "https://hillsborough.county-taxes.com",
+      "tax_report_url": "https://county-taxes.net/hillsborough/reports/real-estate",
+      "parcel_lookup_url": "https://hillsborough.county-taxes.com/public/real_estate/parcels",
+      "master_data_url": "https://downloads.hcpafl.org/"
+    },
+    "credentials_ref": "HILLSBOROUGH_PORTAL_USER",
+    "file_prefix": "hillsborough"
+  }
+}

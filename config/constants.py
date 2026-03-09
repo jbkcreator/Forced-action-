@@ -44,35 +44,28 @@ RAW_DEEDS_DIR = RAW_DATA_DIR / "deeds"
 TEMP_DOWNLOADS_DIR = Path(tempfile.gettempdir())
 
 # =============================================================================
-# PUBLIC RECORDS URLS - Hillsborough County Clerk
+# PORTAL URLS — loaded from config/counties.json via county_config utility.
+#
+# Use get_portal(county_id, key) in scraper functions instead of these
+# module-level constants. The constants below are kept only for modules
+# that have not yet been refactored to accept county_id.
 # =============================================================================
 
-# Base domain
-HILLSCLERK_BASE_URL = "https://publicrec.hillsclerk.com"
-HILLSCLERK_PUBLIC_ACCESS_URL = "https://publicaccess.hillsclerk.com/oripublicaccess/"
+from src.utils.county_config import get_county as _get_county
 
-# Daily filings
-CIVIL_FILINGS_URL = f"{HILLSCLERK_BASE_URL}/Civil/dailyfilings/"
-PROBATE_FILINGS_URL = f"{HILLSCLERK_BASE_URL}/Probate/dailyfilings/"
+_hc = _get_county("hillsborough")["portals"]
 
-# =============================================================================
-# ACCELA PORTAL URLS - Hillsborough County
-# =============================================================================
-
-ACCELA_BASE_URL = "https://aca-prod.accela.com/HCFL"
-PERMIT_SEARCH_URL = f"{ACCELA_BASE_URL}/Cap/CapHome.aspx?module=Building"
-VIOLATION_SEARCH_URL = (
-    f"{ACCELA_BASE_URL}/Cap/CapHome.aspx?module=Enforcement&TabName=Enforcement"
-)
-
-# =============================================================================
-# FORECLOSURE & TAX URLS
-# =============================================================================
-
-REALFORECLOSE_BASE_URL = "https://www.hillsborough.realforeclose.com/index.cfm"
-TAX_COLLECTOR_BASE_URL = "https://hillsborough.county-taxes.com"
-PARCEL_LOOKUP_URL = f"{TAX_COLLECTOR_BASE_URL}/public/real_estate/parcels"
-MASTER_DATA_URL = "https://downloads.hcpafl.org/"
+HILLSCLERK_BASE_URL          = _hc["clerk_base_url"]
+HILLSCLERK_PUBLIC_ACCESS_URL = _hc["clerk_public_access_url"]
+CIVIL_FILINGS_URL            = _hc["civil_filings_url"]
+PROBATE_FILINGS_URL          = _hc["probate_filings_url"]
+ACCELA_BASE_URL              = _hc["accela_base_url"]
+PERMIT_SEARCH_URL            = _hc["permit_search_url"]
+VIOLATION_SEARCH_URL         = _hc["violation_search_url"]
+REALFORECLOSE_BASE_URL       = _hc["realforeclose_base_url"]
+TAX_COLLECTOR_BASE_URL       = _hc["tax_collector_base_url"]
+PARCEL_LOOKUP_URL            = _hc["parcel_lookup_url"]
+MASTER_DATA_URL              = _hc["master_data_url"]
 
 # =============================================================================
 # COURT LISTENER API - Federal Bankruptcy Court

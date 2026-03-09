@@ -128,7 +128,8 @@ class MasterPropertyLoader(BaseLoader):
         self,
         df: pd.DataFrame,
         skip_duplicates: bool = True,
-        batch_size: int = 1000
+        batch_size: int = 1000,
+        county_id: str = 'hillsborough',
     ) -> Tuple[int, int, int]:
         """
         Load master properties from DataFrame with validation.
@@ -209,13 +210,16 @@ class MasterPropertyLoader(BaseLoader):
                 legal_desc = ' '.join(legal_parts) if legal_parts else None
                 
                 # Create property
+                from src.utils.county_config import get_county as _gc
+                _county_cfg = _gc(county_id)
                 property_record = Property(
                     parcel_id=parcel_id,
                     address=site_addr,
                     city=site_city,
-                    state='FL',
+                    state=_county_cfg.get("state", "FL"),
                     zip=site_zip,
-                    jurisdiction='Hillsborough',
+                    jurisdiction=_county_cfg["name"],
+                    county_id=county_id,
                     property_type=prop_type,
                     legal_description=legal_desc,
                     lot_size=self.parse_amount(row.get('ACREAGE')),

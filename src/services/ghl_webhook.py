@@ -386,3 +386,95 @@ def push_lead_to_ghl(score_data: Dict) -> bool:
     if ok:
         logger.info(f"[GHL] Lead pushed successfully: {parcel_id}")
     return ok
+
+
+# ---------------------------------------------------------------------------
+# M1 — Subscriber pipeline (stages 5 + 7)
+# ---------------------------------------------------------------------------
+
+def push_subscriber_to_ghl(subscriber, stage: Optional[int], tags: Optional[List[str]] = None) -> bool:
+    """
+    Create or update a GHL contact for a subscriber and optionally move them
+    to a pipeline stage and/or apply tags.
+
+    stage=5 → Paid Subscriber (GHL_STAGE_PAID_SUBSCRIBER)
+    stage=7 → Churned (GHL_STAGE_CHURNED)
+    stage=None → tag-only update (e.g. payment_failed)
+    """
+    if not _is_configured():
+        return False
+
+    from config.settings import settings as _s
+
+    # ── Upsert contact ────────────────────────────────────────────────────
+    contact_payload: Dict = {
+        "locationId": _s.ghl_location_id,
+        "email": subscriber.email or "",
+        "name": subscriber.name or "",
+        "tags": tags or [],
+    }
+
+    contact_id = subscriber.ghl_contact_id
+
+    if contact_id:
+        put_payload = {k: v for k, v in contact_payload.items() if k != "locationId"}
+        resp = _ghl_request(
+            "PUT",
+            f"{_GHL_BASE}/contacts/{contact_id}",
+            headers=_headers(),
+            json=put_payload,
+        )
+        if resp.status_code not in (200, 201):
+            logger.error(f"[GHL] Contact update failed {resp.status_code}: {resp.text[:200]}")
+            return False
+    else:
+        resp = _ghl_request(
+            "POST",
+            f"{_GHL_BASE}/contacts/",
+            headers=_headers(),
+            json=contact_payload,
+        )
+        if resp.status_code not in (200, 201):
+            logger.error(f"[GHL] Contact create failed {resp.status_code}: {resp.text[:200]}")
+            return False
+        contact_id = resp.json().get("contact", {}).get("id")
+        if contact_id:
+            subscriber.ghl_contact_id = contact_id
+
+    if not contact_id:
+        logger.error("[GHL] No contact_id after upsert")
+        return False
+
+    # ── Move to pipeline stage ────────────────────────────────────────────
+    if stage is not None:
+        stage_id_map = {
+            5: _s.ghl_stage_paid_subscriber,
+            7: _s.ghl_stage_churned,
+        }
+        stage_id = stage_id_map.get(stage)
+
+        if stage_id and _s.ghl_pipeline_id:
+            opp_payload = {
+                "pipelineId": _s.ghl_pipeline_id,
+                "locationId": _s.ghl_location_id,
+                "pipelineStageId": stage_id,
+                "contactId": contact_id,
+                "name": f"Subscriber — {subscriber.tier} / {subscriber.vertical}",
+                "status": "open" if stage == 5 else "lost",
+                "monetaryValue": {
+                    "starter": 600, "pro": 1100, "dominator": 2000
+                }.get(subscriber.tier, 0),
+            }
+            opp_resp = _ghl_request(
+                "POST",
+                f"{_GHL_BASE}/opportunities/",
+                headers=_headers(),
+                json=opp_payload,
+            )
+            if opp_resp.status_code not in (200, 201):
+                logger.warning(
+                    f"[GHL] Opportunity upsert failed {opp_resp.status_code}: {opp_resp.text[:200]}"
+                )
+
+    logger.info(f"[GHL] Subscriber pushed: contact={contact_id} stage={stage} tags={tags}")
+    return True
