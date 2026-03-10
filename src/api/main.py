@@ -30,13 +30,14 @@ from src.core.models import FoundingSubscriberCount, ZipTerritory, Subscriber, P
 from src.services.stripe_webhooks import handle_webhook
 from src.services.stripe_service import get_price_id_for_checkout
 from config.settings import get_settings
+from config.scoring import VERTICAL_WEIGHTS
 
 logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent.parent / "static"
 
 VALID_TIERS = {"starter", "pro", "dominator"}
-VALID_VERTICALS = {"roofing", "remediation", "investor"}
+VALID_VERTICALS = set(VERTICAL_WEIGHTS.keys())
 
 app = FastAPI(title="Forced Action API", version="1.0.0")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

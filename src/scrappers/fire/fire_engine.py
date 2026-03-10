@@ -198,11 +198,13 @@ def scrape_fire_incidents(
 
 
 if __name__ == "__main__":
-    import sys
+    import argparse
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
-    county = sys.argv[1] if len(sys.argv) > 1 else "hillsborough"
-    n = scrape_fire_incidents(county_id=county)
+    parser = argparse.ArgumentParser(description="Scrape fire incidents")
+    parser.add_argument("--county-id", dest="county_id", default="hillsborough", help="County identifier (default: hillsborough)")
+    args = parser.parse_args()
+    n = scrape_fire_incidents(county_id=args.county_id)
     print(f"Done — {n} fire incidents created")

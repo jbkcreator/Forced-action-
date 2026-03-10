@@ -28,9 +28,7 @@ from bs4 import BeautifulSoup
 from src.utils.http_helpers import requests_get_with_retry
 
 from config.constants import (
-	CIVIL_FILINGS_URL,
 	RAW_EVICTIONS_DIR,
-	HILLSCLERK_BASE_URL,
 	EVICTION_CASE_PATTERNS,
 	CIVIL_FILING_PATTERN,
 	DEFAULT_USER_AGENT,
@@ -39,6 +37,7 @@ from config.constants import (
 	OUTPUT_DATE_FORMAT,
 	OUTPUT_SEPARATOR,
 )
+from src.utils.county_config import get_county as _get_county
 from src.utils.logger import setup_logging, get_logger
 from src.utils.db_deduplicator import filter_new_records
 
@@ -47,7 +46,7 @@ setup_logging()
 logger = get_logger(__name__)
 
 
-def download_latest_civil_filing(target_date: str = None) -> Path:
+def download_latest_civil_filing(target_date: str = None, county_id: str = "hillsborough") -> Path:
 	"""
 	Download the latest civil filing CSV from Hillsborough County Clerk.
 	
@@ -67,16 +66,20 @@ def download_latest_civil_filing(target_date: str = None) -> Path:
 		>>> csv_path = download_latest_civil_filing()
 		>>> print(f"Downloaded to: {csv_path}")
 	"""
-	logger.info(f"Fetching civil filings list from: {CIVIL_FILINGS_URL}")
-	
+	_county = _get_county(county_id)
+	_civil_filings_url = _county["portals"]["civil_filings_url"]
+	_clerk_base_url = _county["portals"]["clerk_base_url"]
+
+	logger.info(f"Fetching civil filings list from: {_civil_filings_url}")
+
 	try:
 		# Ensure download directory exists
 		RAW_EVICTIONS_DIR.mkdir(parents=True, exist_ok=True)
 		logger.debug(f"Ensured download directory exists: {RAW_EVICTIONS_DIR}")
-		
+
 		# Fetch the directory listing page
 		response = requests_get_with_retry(
-			CIVIL_FILINGS_URL,
+			_civil_filings_url,
 			headers={"User-Agent": DEFAULT_USER_AGENT},
 			timeout=REQUEST_TIMEOUT_DEFAULT,
 		)
@@ -148,9 +151,9 @@ def download_latest_civil_filing(target_date: str = None) -> Path:
 	try:
 		# Construct full URL
 		if latest_file.startswith("/"):
-			download_url = f"{HILLSCLERK_BASE_URL}{latest_file}"
+			download_url = f"{_clerk_base_url}{latest_file}"
 		else:
-			download_url = f"{CIVIL_FILINGS_URL.rstrip('/')}/{latest_file}"
+			download_url = f"{_civil_filings_url.rstrip('/')}/{latest_file}"
 		
 		# Download the file
 		filename = Path(latest_file).name
@@ -350,7 +353,7 @@ def save_processed_evictions(df: pd.DataFrame, output_filename: str = "eviction_
 		raise
 
 
-def run_eviction_pipeline(target_date: str = None) -> bool:
+def run_eviction_pipeline(target_date: str = None, county_id: str = "hillsborough") -> bool:
 	"""
 	Execute the complete eviction data collection pipeline.
 	
@@ -375,7 +378,7 @@ def run_eviction_pipeline(target_date: str = None) -> bool:
 		
 		# Step 1: Download latest civil filing
 		logger.info("\n[STEP 1/4] Downloading latest civil filing...")
-		csv_path = download_latest_civil_filing(target_date=target_date)
+		csv_path = download_latest_civil_filing(target_date=target_date, county_id=county_id)
 		
 		# Step 2: Load and process the data
 		logger.info("\n[STEP 2/4] Loading and processing civil filing data...")
@@ -432,12 +435,13 @@ if __name__ == "__main__":
 	import argparse
 	from src.utils.scraper_db_helper import load_scraped_data_to_db, add_load_to_db_arg
 	
-	parser = argparse.ArgumentParser(description="Scrape Hillsborough County eviction filings")
+	parser = argparse.ArgumentParser(description="Scrape county eviction filings")
 	parser.add_argument("--date", type=str, default=None, help="Target date YYYY-MM-DD (default: latest)")
+	parser.add_argument("--county-id", dest="county_id", default="hillsborough", help="County identifier (default: hillsborough)")
 	add_load_to_db_arg(parser)
 	args = parser.parse_args()
-	
-	success = run_eviction_pipeline(target_date=args.date)
+
+	success = run_eviction_pipeline(target_date=args.date, county_id=args.county_id)
 	
 	# Load to database if requested and scraping was successful
 	if success and args.load_to_db:

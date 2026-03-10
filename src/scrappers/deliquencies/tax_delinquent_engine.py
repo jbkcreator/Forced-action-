@@ -47,6 +47,7 @@ from config.constants import (
 	TEMP_DOWNLOADS_DIR,
 	BROWSER_DOWNLOAD_TEMP_PATTERN,
 )
+from src.utils.county_config import get_county as _get_county
 from src.core.database import get_db_context
 from src.core.models import TaxDelinquency
 from src.utils.logger import setup_logging, get_logger
@@ -154,6 +155,7 @@ def _get_existing_tax_records(tax_year: int) -> set:
 
 async def _playwright_download_tax_delinquent(
 	tax_year: int = DEFAULT_TAX_YEAR,
+	county_id: str = "hillsborough",
 ) -> bool:
 	"""
 	Primary Playwright scraper for tax delinquent bulk report download.
@@ -170,9 +172,11 @@ async def _playwright_download_tax_delinquent(
 	from playwright.async_api import async_playwright
 	from playwright_stealth import Stealth
 
-	TAX_REPORT_URL = "https://county-taxes.net/hillsborough/reports/real-estate"
+	_county = _get_county(county_id)
+	TAX_REPORT_URL = _county["portals"]["tax_report_url"]
+	_file_prefix = _county["file_prefix"]
 	REFERENCE_DATA_DIR.mkdir(parents=True, exist_ok=True)
-	dest_path = REFERENCE_DATA_DIR / f"hillsborough_tax_delinquent_{tax_year}.csv"
+	dest_path = REFERENCE_DATA_DIR / f"{_file_prefix}_tax_delinquent_{tax_year}.csv"
 
 	logger.info(f"[Playwright][RADAR] Downloading tax delinquent report for {tax_year}")
 
@@ -277,6 +281,7 @@ async def _ai_download_tax_delinquent(
 	tax_year: int = DEFAULT_TAX_YEAR,
 	account_status: str = DEFAULT_ACCOUNT_STATUS,
 	wait_after_download: int = 30,
+	county_id: str = "hillsborough",
 ) -> bool:
 	"""
 	AI browser-use fallback for tax delinquent report download.
@@ -284,8 +289,9 @@ async def _ai_download_tax_delinquent(
 	try:
 		REFERENCE_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+		_file_prefix = _get_county(county_id)["file_prefix"]
 		save_dir = os.path.abspath(str(REFERENCE_DATA_DIR))
-		dest_stub = f"hillsborough_tax_delinquent_{tax_year}"
+		dest_stub = f"{_file_prefix}_tax_delinquent_{tax_year}"
 		start_time = time.time()
 
 		try:
@@ -386,6 +392,7 @@ async def download_tax_delinquent_report(
 	account_status: str = DEFAULT_ACCOUNT_STATUS,
 	wait_after_download: int = 30,
 	scraper: str = "auto",
+	county_id: str = "hillsborough",
 ) -> bool:
 	"""
 	RADAR PHASE: Download bulk tax delinquent report.
@@ -408,7 +415,7 @@ async def download_tax_delinquent_report(
 		playwright_error = None
 		for attempt in range(1, MAX_PLAYWRIGHT_RETRIES + 1):
 			try:
-				success = await _playwright_download_tax_delinquent(tax_year=tax_year)
+				success = await _playwright_download_tax_delinquent(tax_year=tax_year, county_id=county_id)
 				if success:
 					logger.info("[RADAR] Playwright download succeeded")
 					return True
@@ -431,6 +438,7 @@ async def download_tax_delinquent_report(
 		tax_year=tax_year,
 		account_status=account_status,
 		wait_after_download=wait_after_download,
+		county_id=county_id,
 	)
 
 
@@ -653,6 +661,7 @@ async def run_radar_sniper_pipeline(
 	min_years_delinquent: int = MIN_YEARS_DELINQUENT,
 	max_sniper_accounts: int = 100,
 	skip_download: bool = False,
+	county_id: str = "hillsborough",
 ) -> bool:
 	"""
 	Execute the full Radar & Sniper pipeline for tax delinquent lead generation.
@@ -688,18 +697,19 @@ async def run_radar_sniper_pipeline(
 			logger.info("Skipping download phase (using existing CSV)")
 		else:
 			logger.info("[RADAR] Starting bulk download phase")
-			success = await download_tax_delinquent_report(tax_year=tax_year, account_status=account_status)
+			success = await download_tax_delinquent_report(tax_year=tax_year, account_status=account_status, county_id=county_id)
 
 			if not success:
 				logger.error("[RADAR] Phase failed. Aborting pipeline")
 				return False
 
 		# Locate the CSV file (either just downloaded or existing)
-		bulk_csv_path = REFERENCE_DATA_DIR / f"hillsborough_tax_delinquent_{tax_year}.csv"
+		_file_prefix = _get_county(county_id)["file_prefix"]
+		bulk_csv_path = REFERENCE_DATA_DIR / f"{_file_prefix}_tax_delinquent_{tax_year}.csv"
 		if not bulk_csv_path.exists():
 			# Try alternate extensions
 			for ext in [".xls", ".xlsx"]:
-				alt_path = REFERENCE_DATA_DIR / f"hillsborough_tax_delinquent_{tax_year}{ext}"
+				alt_path = REFERENCE_DATA_DIR / f"{_file_prefix}_tax_delinquent_{tax_year}{ext}"
 				if alt_path.exists():
 					bulk_csv_path = alt_path
 					logger.debug(f"Found alternate file: {bulk_csv_path}")
@@ -908,19 +918,26 @@ if __name__ == "__main__":
 		default="auto",
 		help="Which scraper to use: auto (playwright → AI fallback), playwright only, ai only (default: auto)",
 	)
-	
+	parser.add_argument(
+		"--county-id",
+		dest="county_id",
+		default="hillsborough",
+		help="County identifier (default: hillsborough)",
+	)
+
 	from src.utils.scraper_db_helper import add_load_to_db_arg, load_scraped_data_to_db
 	add_load_to_db_arg(parser)
 	args = parser.parse_args()
-	
+
 	try:
 		logger.info(f"Starting Tax Delinquent Engine in {args.mode} mode")
-		
+
 		if args.mode == "download-only":
 			asyncio.run(download_tax_delinquent_report(
 				tax_year=args.tax_year,
 				account_status=args.status,
 				scraper=args.scraper,
+				county_id=args.county_id,
 			))
 		else:
 			asyncio.run(
@@ -930,20 +947,22 @@ if __name__ == "__main__":
 					min_years_delinquent=args.min_years,
 					max_sniper_accounts=args.max_sniper,
 					skip_download=args.skip_download,
+					county_id=args.county_id,
 				)
 			)
-		
+
 		logger.info("Tax Delinquent Engine completed successfully")
-		
+
 		# Load to database if requested
 		if args.load_to_db:
+			_file_prefix = _get_county(args.county_id)["file_prefix"]
 			# Find most recent CSV — check new/ subdir, then raw dir, then reference dir
 			new_dir = RAW_TAX_DELINQUENCIES_DIR / "new"
 			csv_files = sorted(new_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True) if new_dir.exists() else []
 			if not csv_files:
 				csv_files = sorted(RAW_TAX_DELINQUENCIES_DIR.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
 			if not csv_files:
-				csv_files = sorted(REFERENCE_DATA_DIR.glob("hillsborough_tax_delinquent_*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+				csv_files = sorted(REFERENCE_DATA_DIR.glob(f"{_file_prefix}_tax_delinquent_*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
 			if csv_files:
 				csv_to_load = csv_files[0]
 				logger.info(f"Loading to database: {csv_to_load}")

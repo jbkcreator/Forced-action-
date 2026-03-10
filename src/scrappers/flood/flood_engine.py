@@ -176,11 +176,13 @@ def scrape_flood_damage(
 
 
 if __name__ == "__main__":
-    import sys
+    import argparse
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
-    county = sys.argv[1] if len(sys.argv) > 1 else "hillsborough"
-    n = scrape_flood_damage(county_id=county)
+    parser = argparse.ArgumentParser(description="Scrape flood damage incidents")
+    parser.add_argument("--county-id", dest="county_id", default="hillsborough", help="County identifier (default: hillsborough)")
+    args = parser.parse_args()
+    n = scrape_flood_damage(county_id=args.county_id)
     print(f"Done — {n} flood damage incidents created")
