@@ -43,18 +43,18 @@ FLOOD_NWS_EVENTS = [
 
 def _fetch_fema_declarations(state: str, county_fips: str, start_date: date) -> List[Dict]:
     """Fetch FEMA flood disaster declarations for a state/county since start_date."""
+    url = (
+        f"{_FEMA_DISASTERS_URL}"
+        f"?$filter=state eq '{state}' and fipsCountyCode eq '{county_fips}'"
+        f" and incidentType eq 'Flood' and declarationDate ge '{start_date.isoformat()}'"
+        f"&$orderby=declarationDate desc&$top=50&$format=json"
+    )
     try:
-        url = (
-            f"{_FEMA_DISASTERS_URL}"
-            f"?$filter=state eq '{state}' and fipsCountyCode eq '{county_fips}'"
-            f" and incidentType eq 'Flood' and declarationDate ge '{start_date.isoformat()}'"
-            f"&$orderby=declarationDate desc&$top=50&$format=json"
-        )
         resp = requests.get(url, headers={"Accept": "application/json"}, timeout=15)
         resp.raise_for_status()
         return resp.json().get("DisasterDeclarationsSummaries", [])
     except Exception as e:
-        logger.warning(f"[flood] FEMA disasters API failed: {e}")
+        logger.warning("[flood] FEMA disasters API failed: %s", e, exc_info=True)
         return []
 
 
@@ -79,7 +79,7 @@ def _fetch_nws_flood_alerts(state: str) -> List[str]:
             zips = re.findall(r"\b(3[3-4]\d{3})\b", description)
             affected_zips.update(zips)
     except Exception as e:
-        logger.warning(f"[flood] NWS alerts fetch failed: {e}")
+        logger.warning("[flood] NWS alerts fetch failed: %s", e, exc_info=True)
     return list(affected_zips)
 
 
@@ -109,30 +109,24 @@ def scrape_flood_damage(
     else:
         start_date, end_date = date_range
 
-    logger.info(f"[flood] Fetching flood data for {county_id} {start_date} → {end_date}")
-
     # Source 1: FEMA disaster declarations (county-level)
     county_fips = fips[2:] if len(fips) >= 5 else fips
     fema_declarations = _fetch_fema_declarations(state, county_fips, start_date)
     has_fema_flood = len(fema_declarations) > 0
-    if has_fema_flood:
-        logger.info(f"[flood] {len(fema_declarations)} FEMA flood declarations found")
 
     # Source 2: NWS active flood alerts → affected ZIPs
     nws_zips = _fetch_nws_flood_alerts(state)
     county_zips = [z for z in nws_zips if any(z.startswith(p) for p in zip_prefixes)]
-    logger.info(f"[flood] NWS flood-affected ZIPs in {county_id}: {county_zips}")
 
     if not has_fema_flood and not county_zips:
-        logger.info(f"[flood] No flood events for {county_id}")
+        logger.info("[flood] %s: no active flood events — 0 incidents", county_id)
         return 0
 
     created = 0
+    skipped_duplicate = 0
     flood_date = date.today()
 
     with get_db_context() as db:
-        # If FEMA county-level declaration → flag all properties in county
-        # If NWS ZIP-level → flag properties in those ZIPs only
         if has_fema_flood:
             properties = db.execute(
                 select(Property).where(Property.county_id == county_id)
@@ -147,8 +141,6 @@ def scrape_flood_damage(
                 )
             ).scalars().all()
 
-        logger.info(f"[flood] {len(properties)} properties to process")
-
         for prop in properties:
             existing = db.execute(
                 select(Incident).where(
@@ -161,6 +153,7 @@ def scrape_flood_damage(
             ).scalars().first()
 
             if existing:
+                skipped_duplicate += 1
                 continue
 
             incident = Incident(
@@ -174,12 +167,20 @@ def scrape_flood_damage(
 
         db.commit()
 
-    logger.info(f"[flood] Created {created} flood damage Incident records")
+    logger.info(
+        "[flood] %s: created=%d duplicate=%d strategy=%s",
+        county_id, created, skipped_duplicate,
+        "fema_county_wide" if has_fema_flood else f"nws_zips({len(county_zips)})",
+    )
     return created
 
 
 if __name__ == "__main__":
     import sys
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
     county = sys.argv[1] if len(sys.argv) > 1 else "hillsborough"
     n = scrape_flood_damage(county_id=county)
     print(f"Done — {n} flood damage incidents created")

@@ -57,7 +57,7 @@ def _fetch_nws_alerts(state: str = "FL") -> List[Dict]:
         resp.raise_for_status()
         return resp.json().get("features", [])
     except Exception as e:
-        logger.warning(f"[storm] NWS API fetch failed: {e}")
+        logger.warning("[storm] NWS API fetch failed: %s", e, exc_info=True)
         return []
 
 
@@ -95,18 +95,14 @@ def scrape_storm_damage(
     try:
         config = get_county(county_id)
     except KeyError:
-        logger.error(f"[storm] Unknown county_id: {county_id}")
+        logger.error("[storm] Unknown county_id: %s", county_id)
         return 0
 
     state = config.get("state", "FL")
     zip_prefixes = config.get("zip_prefixes", [])
 
-    logger.info(f"[storm] Fetching NWS alerts for {county_id} ({state})")
-
     alerts = _fetch_nws_alerts(state)
-    logger.info(f"[storm] {len(alerts)} active alerts fetched")
 
-    # Collect all ZIPs mentioned across storm alerts
     affected_zips: set = set()
     storm_date = date.today()
 
@@ -117,24 +113,19 @@ def scrape_storm_damage(
             continue
 
         alert_zips = _extract_affected_zips(alert)
-        # Filter to county ZIP prefixes
         county_zips = [
             z for z in alert_zips
             if any(z.startswith(pfx) for pfx in zip_prefixes)
         ]
         affected_zips.update(county_zips)
 
-        logger.info(f"[storm] Alert: '{event}' — {len(county_zips)} county ZIPs affected")
-
     if not affected_zips:
-        logger.info(f"[storm] No storm alerts affecting {county_id} ZIPs")
+        logger.info("[storm] %s: no active storm alerts — 0 incidents", county_id)
         return 0
 
-    logger.info(f"[storm] Affected ZIPs in {county_id}: {sorted(affected_zips)}")
-
     created = 0
+    skipped_duplicate = 0
     with get_db_context() as db:
-        # Find all properties in affected ZIPs
         properties = db.execute(
             select(Property).where(
                 and_(
@@ -144,10 +135,7 @@ def scrape_storm_damage(
             )
         ).scalars().all()
 
-        logger.info(f"[storm] {len(properties)} properties in affected ZIPs")
-
         for prop in properties:
-            # Skip if already recorded today
             existing = db.execute(
                 select(Incident).where(
                     and_(
@@ -159,6 +147,7 @@ def scrape_storm_damage(
             ).scalars().first()
 
             if existing:
+                skipped_duplicate += 1
                 continue
 
             incident = Incident(
@@ -172,12 +161,19 @@ def scrape_storm_damage(
 
         db.commit()
 
-    logger.info(f"[storm] Created {created} storm damage Incident records")
+    logger.info(
+        "[storm] %s: created=%d duplicate=%d zips_affected=%d",
+        county_id, created, skipped_duplicate, len(affected_zips),
+    )
     return created
 
 
 if __name__ == "__main__":
     import sys
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
     county = sys.argv[1] if len(sys.argv) > 1 else "hillsborough"
     n = scrape_storm_damage(county_id=county)
     print(f"Done — {n} storm damage incidents created")

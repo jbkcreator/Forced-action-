@@ -56,18 +56,19 @@ async def _scrape_fire_portal_playwright(
 
     records = []
     config = get_county(county_id)
-    # Fire portal URL — use county config if available, else default
-    portal_url = config.get("portals", {}).get(
-        "fire_incidents_url", _FIRE_PORTAL_URL
-    )
+    portal_url = config.get("portals", {}).get("fire_incidents_url", _FIRE_PORTAL_URL)
 
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             page = await browser.new_page()
-            await page.goto(portal_url, timeout=30000)
 
-            # Fill date range if the portal has filters
+            resp = await page.goto(portal_url, timeout=30000)
+            if resp and resp.status >= 400:
+                logger.warning("[fire] Portal returned HTTP %d — %s", resp.status, portal_url)
+                await browser.close()
+                return []
+
             try:
                 await page.fill('input[name*="start"], input[id*="start"]',
                                 start_date.strftime("%m/%d/%Y"))
@@ -78,7 +79,6 @@ async def _scrape_fire_portal_playwright(
             except Exception:
                 pass  # portal may not have date filters; scrape current page
 
-            # Extract table rows
             rows = await page.query_selector_all("table tr")
             for row in rows[1:]:  # skip header
                 cells = await row.query_selector_all("td")
@@ -96,7 +96,7 @@ async def _scrape_fire_portal_playwright(
 
             await browser.close()
     except Exception as e:
-        logger.warning(f"[fire] Playwright scrape failed: {e}")
+        logger.warning("[fire] Playwright scrape failed: %s", e, exc_info=True)
 
     return records
 
@@ -148,22 +148,19 @@ def scrape_fire_incidents(
     else:
         start_date, end_date = date_range
 
-    logger.info(
-        f"[fire] Scraping fire incidents for {county_id} "
-        f"{start_date} → {end_date}"
-    )
-
     raw_records = asyncio.run(
         _scrape_fire_portal_playwright(start_date, end_date, county_id)
     )
-    logger.info(f"[fire] {len(raw_records)} fire incidents fetched from portal")
 
     created = 0
+    skipped_no_match = 0
+    skipped_duplicate = 0
+
     with get_db_context() as db:
         for rec in raw_records:
             property_id = _match_property(db, rec["address"], county_id)
             if not property_id:
-                logger.debug(f"[fire] No property match for: {rec['address']}")
+                skipped_no_match += 1
                 continue
 
             incident_date = rec.get("incident_date") or date.today()
@@ -179,6 +176,7 @@ def scrape_fire_incidents(
             ).scalar_one_or_none()
 
             if existing:
+                skipped_duplicate += 1
                 continue
 
             incident = Incident(
@@ -192,12 +190,19 @@ def scrape_fire_incidents(
 
         db.commit()
 
-    logger.info(f"[fire] Created {created} new Fire Incident records")
+    logger.info(
+        "[fire] %s %s→%s: created=%d no_match=%d duplicate=%d",
+        county_id, start_date, end_date, created, skipped_no_match, skipped_duplicate,
+    )
     return created
 
 
 if __name__ == "__main__":
     import sys
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
     county = sys.argv[1] if len(sys.argv) > 1 else "hillsborough"
     n = scrape_fire_incidents(county_id=county)
     print(f"Done — {n} fire incidents created")

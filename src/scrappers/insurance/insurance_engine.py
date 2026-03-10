@@ -60,19 +60,19 @@ def _fetch_fema_ia_registrants(state: str, start_date: date) -> List[Dict]:
     Fetch FEMA Housing Assistance Owners records for a state (grouped by ZIP).
     These represent homeowners who received FEMA disaster housing assistance.
     """
+    # Build query string manually — requests.params URL-encodes $ which breaks FEMA API
+    url = (
+        f"{_FEMA_IA_URL}"
+        f"?$filter=state eq '{state}'"
+        f"&$select=zipCode,county,city,totalDamage,repairReplaceAmount,validRegistrations"
+        f"&$top=1000&$format=json"
+    )
     try:
-        # Build query string manually — requests.params URL-encodes $ which breaks FEMA API
-        url = (
-            f"{_FEMA_IA_URL}"
-            f"?$filter=state eq '{state}'"
-            f"&$select=zipCode,county,city,totalDamage,repairReplaceAmount,validRegistrations"
-            f"&$top=1000&$format=json"
-        )
         resp = requests.get(url, headers={"Accept": "application/json"}, timeout=20)
         resp.raise_for_status()
         return resp.json().get("HousingAssistanceOwners", [])
     except Exception as e:
-        logger.warning(f"[insurance] FEMA IA API failed: {e}")
+        logger.warning("[insurance] FEMA IA API failed: %s", e, exc_info=True)
         return []
 
 
@@ -116,19 +116,19 @@ def scrape_insurance_claims(
     else:
         start_date, end_date = date_range
 
-    logger.info(
-        f"[insurance] Collecting insurance claims for {county_id} "
-        f"{start_date} → {end_date}"
-    )
-
     created = 0
+    skipped_duplicate = 0
+    skipped_no_property = 0
 
     with get_db_context() as db:
         # ── Source 1: adjuster permits from existing permit table ──────────
         insurance_permits = _get_insurance_permits(db, county_id, start_date, end_date)
-        logger.info(f"[insurance] {len(insurance_permits)} adjuster permits found")
 
         for permit in insurance_permits:
+            if not permit.property_id:
+                skipped_no_property += 1
+                continue
+
             existing = db.execute(
                 select(Incident).where(
                     and_(
@@ -140,6 +140,7 @@ def scrape_insurance_claims(
             ).scalars().first()
 
             if existing:
+                skipped_duplicate += 1
                 continue
 
             db.add(Incident(
@@ -154,9 +155,7 @@ def scrape_insurance_claims(
 
         # ── Source 2: FEMA IA registrants → match by ZIP ──────────────────
         fema_registrants = _fetch_fema_ia_registrants(state, start_date)
-        logger.info(f"[insurance] {len(fema_registrants)} FEMA IA registrants fetched")
 
-        # Group by ZIP for bulk property lookup
         affected_zips = set()
         for reg in fema_registrants:
             z = str(reg.get("zipCode", "")).zfill(5)
@@ -173,12 +172,9 @@ def scrape_insurance_claims(
                 )
             ).scalars().all()
 
-            logger.info(
-                f"[insurance] {len(properties)} properties in FEMA IA ZIPs: "
-                f"{sorted(affected_zips)}"
-            )
-
             claim_date = date.today()
+            fema_created = 0
+            fema_skipped = 0
             for prop in properties:
                 existing = db.execute(
                     select(Incident).where(
@@ -191,6 +187,7 @@ def scrape_insurance_claims(
                 ).scalars().first()
 
                 if existing:
+                    fema_skipped += 1
                     continue
 
                 db.add(Incident(
@@ -199,16 +196,45 @@ def scrape_insurance_claims(
                     incident_date=claim_date,
                     county_id=county_id,
                 ))
+                fema_created += 1
                 created += 1
 
             db.commit()
 
-    logger.info(f"[insurance] Created {created} insurance claim Incident records")
+            if skipped_no_property:
+                logger.warning(
+                    "[insurance] %d permits had no property_id and were skipped",
+                    skipped_no_property,
+                )
+
+            logger.info(
+                "[insurance] %s %s→%s: created=%d duplicate=%d "
+                "(permits=%d fema_zips=%d fema_props=%d)",
+                county_id, start_date, end_date, created, skipped_duplicate + fema_skipped,
+                len(insurance_permits), len(affected_zips), len(properties),
+            )
+        else:
+            if skipped_no_property:
+                logger.warning(
+                    "[insurance] %d permits had no property_id and were skipped",
+                    skipped_no_property,
+                )
+            logger.info(
+                "[insurance] %s %s→%s: created=%d duplicate=%d "
+                "(permits=%d fema_zips=0)",
+                county_id, start_date, end_date, created, skipped_duplicate,
+                len(insurance_permits),
+            )
+
     return created
 
 
 if __name__ == "__main__":
     import sys
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
     county = sys.argv[1] if len(sys.argv) > 1 else "hillsborough"
     n = scrape_insurance_claims(county_id=county)
     print(f"Done — {n} insurance claim incidents created")

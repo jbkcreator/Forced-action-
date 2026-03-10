@@ -63,12 +63,9 @@ def scrape_roofing_permits(
     else:
         start_date, end_date = date_range
 
-    logger.info(
-        f"[roofing_permits] Classifying roofing permits for {county_id} "
-        f"{start_date} → {end_date}"
-    )
-
     created = 0
+    skipped_no_property = 0
+    skipped_duplicate = 0
 
     with get_db_context() as db:
         permits = db.execute(
@@ -83,10 +80,11 @@ def scrape_roofing_permits(
             )
         ).scalars().all()
 
-        logger.info(f"[roofing_permits] Found {len(permits)} roofing permits to classify")
-
         for permit in permits:
-            # Skip if an Incident for this permit already exists
+            if not permit.property_id:
+                skipped_no_property += 1
+                continue
+
             existing = db.execute(
                 select(Incident).where(
                     and_(
@@ -98,6 +96,7 @@ def scrape_roofing_permits(
             ).scalars().first()
 
             if existing:
+                skipped_duplicate += 1
                 continue
 
             incident = Incident(
@@ -111,12 +110,25 @@ def scrape_roofing_permits(
 
         db.commit()
 
-    logger.info(f"[roofing_permits] Created {created} new Incident records")
+    if skipped_no_property:
+        logger.warning(
+            "[roofing_permits] %d permits had no property_id and were skipped",
+            skipped_no_property,
+        )
+
+    logger.info(
+        "[roofing_permits] %s %s→%s: created=%d duplicate=%d no_property=%d",
+        county_id, start_date, end_date, created, skipped_duplicate, skipped_no_property,
+    )
     return created
 
 
 if __name__ == "__main__":
     import sys
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
     county = sys.argv[1] if len(sys.argv) > 1 else "hillsborough"
     n = scrape_roofing_permits(county_id=county)
     print(f"Done — {n} new roofing permit incidents created")
