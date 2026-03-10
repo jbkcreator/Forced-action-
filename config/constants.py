@@ -161,3 +161,43 @@ LIEN_DOCUMENT_TYPES = {
     "D": "Deeds",
     "TAXDEED": "Tax Deeds",
 }
+
+# =============================================================================
+# COUNTY CONFIG
+# Central registry of all per-county configuration.
+# Add a new county here — scrapers, loaders, and API pick it up automatically.
+# =============================================================================
+
+COUNTY_CONFIG = {
+    "hillsborough": {
+        "display_name": "Hillsborough County",
+        "state": "FL",
+        "urls": {
+            "permit":       PERMIT_SEARCH_URL,
+            "violation":    VIOLATION_SEARCH_URL,
+            "probate":      PROBATE_FILINGS_URL,
+            "civil":        CIVIL_FILINGS_URL,
+            "foreclosure":  REALFORECLOSE_BASE_URL,
+            "tax":          TAX_COLLECTOR_BASE_URL,
+            "parcel":       PARCEL_LOOKUP_URL,
+            "master":       MASTER_DATA_URL,
+            "clerk_base":   HILLSCLERK_BASE_URL,
+            "clerk_access": HILLSCLERK_PUBLIC_ACCESS_URL,
+        },
+        "court": {
+            "bankruptcy_code": COURT_CODE_FLORIDA_MIDDLE_BANKRUPTCY,
+            "division_prefix": TAMPA_DIVISION_PREFIX,
+        },
+        "accela_code": "HCFL",
+    },
+}
+
+
+def get_county_config(county_id: str) -> dict:
+    """Return config for a county, raising clearly if unknown."""
+    if county_id not in COUNTY_CONFIG:
+        raise ValueError(
+            f"Unknown county '{county_id}'. "
+            f"Supported: {list(COUNTY_CONFIG.keys())}"
+        )
+    return COUNTY_CONFIG[county_id]

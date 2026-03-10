@@ -51,6 +51,7 @@ from src.services.ghl_webhook import push_lead_to_ghl
 # Set to False via --no-ghl CLI flag to suppress GHL pushes during bulk runs
 _GHL_PUSH_ENABLED = True
 
+from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session, joinedload
 
 from src.core.models import (
@@ -104,6 +105,13 @@ _PROCEEDING_TYPE_TO_SIGNAL: Dict[str, str] = {
     "Bankruptcy": "bankruptcy",
 }
 
+# Guard against empty VERTICAL_WEIGHTS misconfiguration at import time
+if not VERTICAL_WEIGHTS:
+    raise RuntimeError(
+        "VERTICAL_WEIGHTS is empty — check config/scoring.py. "
+        "At least one vertical must be configured."
+    )
+
 
 class MultiVerticalScorer:
     """
@@ -144,7 +152,10 @@ class MultiVerticalScorer:
             else:
                 sig_type = _DOCUMENT_TYPE_TO_SIGNAL.get(lien.document_type or "")
                 if not sig_type:
-                    logger.debug(f"Unknown LegalAndLien document_type: '{lien.document_type}' — skipping")
+                    logger.debug(
+                        "Unknown LegalAndLien document_type: '%s' on property %s — skipping",
+                        lien.document_type, prop.parcel_id,
+                    )
                     continue
             signals.append({"type": sig_type, "date": lien.filing_date, "amount": lien.amount})
 
@@ -264,7 +275,7 @@ class MultiVerticalScorer:
                 return modifier
         return 0
 
-        # ── Routing Gate Helper ───────────────────────────────────────────────────
+    # ── Routing Gate Helper ───────────────────────────────────────────────────
 
     def _is_within_window(self, sig_date) -> bool:
         """
@@ -273,11 +284,11 @@ class MultiVerticalScorer:
         """
         if not sig_date:
             return False
-            
-        # Convert datetime to date if necessary
+
+        # Normalise datetime → date
         if isinstance(sig_date, datetime):
             sig_date = sig_date.date()
-            
+
         days_old = (date.today() - sig_date).days
         return days_old <= STACKING_WINDOW_DAYS
 
@@ -308,8 +319,14 @@ class MultiVerticalScorer:
 
         Equity bonus applies to all verticals with per-vertical rates.
         """
-        weights = VERTICAL_WEIGHTS[vertical]
-        today   = date.today()
+        weights = VERTICAL_WEIGHTS.get(vertical)
+        if weights is None:
+            raise KeyError(
+                f"Vertical '{vertical}' not found in VERTICAL_WEIGHTS. "
+                f"Available: {list(VERTICAL_WEIGHTS.keys())}"
+            )
+
+        today = date.today()
 
         # Group by signal type — each type counts once, using its most recent signal.
         # For code_violations keep the most recent opened_date + associated fine_amount.
@@ -406,11 +423,17 @@ class MultiVerticalScorer:
         equity_bonus = 0
         rate = EQUITY_BONUS_BY_VERTICAL.get(vertical, 0)
         if rate and financial and financial.equity_pct is not None:
-            eq = float(financial.equity_pct)
-            if eq > EQUITY_HIGH_THRESH:
-                equity_bonus = rate
-            elif eq > EQUITY_MID_THRESH:
-                equity_bonus = rate // 2
+            try:
+                eq = float(financial.equity_pct)
+                if eq > EQUITY_HIGH_THRESH:
+                    equity_bonus = rate
+                elif eq > EQUITY_MID_THRESH:
+                    equity_bonus = rate // 2
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Could not parse equity_pct '%s' for vertical %s — equity bonus skipped",
+                    financial.equity_pct, vertical,
+                )
 
         final_score = min(
             primary_score + days_open_mod + persistence_mod + prior_viol_mod
@@ -419,12 +442,13 @@ class MultiVerticalScorer:
         )
 
         logger.debug(
-            f"    [{vertical}] primary={best_type}({primary_score:.0f})"
-            f" days_open=+{days_open_mod} persistence=+{persistence_mod}"
-            f" prior_viol=+{prior_viol_mod}"
-            f" stack=+{stacking_bonus}({signals_within_window} sigs/{STACKING_WINDOW_DAYS}d)"
-            f" absentee=+{absentee_bonus} contact=+{contact_bonus} equity=+{equity_bonus}"
-            f" → {final_score:.1f}"
+            "    [%s] primary=%s(%.0f) days_open=+%d persistence=+%d prior_viol=+%d"
+            " stack=+%d(%d sigs/%dd) absentee=+%d contact=+%d equity=+%d → %.1f",
+            vertical, best_type, primary_score,
+            days_open_mod, persistence_mod, prior_viol_mod,
+            stacking_bonus, signals_within_window, STACKING_WINDOW_DAYS,
+            absentee_bonus, contact_bonus, equity_bonus,
+            final_score,
         )
 
         return {
@@ -446,7 +470,7 @@ class MultiVerticalScorer:
 
     def score_property(self, prop: Property) -> Dict:
         """
-        Score a property across all 6 verticals with a 2-signal routing gate. 
+        Score a property across all 6 verticals with a 2-signal routing gate.
         """
         signals = self._collect_signals(prop)
         owner = prop.owner
@@ -455,13 +479,15 @@ class MultiVerticalScorer:
         violation_count = len(violations)
 
         # Persistence data: derived from all violations for this property.
-        # Used by _persistence_modifier() when code_violations is the primary signal.
-        #   latest_status  — Accela status field of most-recently-opened violation
-        #                    (proxy for owner engagement / city escalation level)
-        #   distinct_types — count of unique violation_type values across all violations
-        #                    (proxy for breadth of neglect)
         if violations:
-            latest_viol = max(violations, key=lambda v: v.opened_date or date.min)
+            # Normalise opened_date to date for comparison — guard mixed date/datetime types
+            def _to_date(v):
+                d = v.opened_date
+                if isinstance(d, datetime):
+                    return d.date()
+                return d or date.min
+
+            latest_viol = max(violations, key=_to_date)
             persistence_data: Dict = {
                 "latest_status":  latest_viol.status,
                 "distinct_types": len({v.violation_type for v in violations if v.violation_type}),
@@ -475,18 +501,17 @@ class MultiVerticalScorer:
         }
         vertical_scores = {v: r["score"] for v, r in vertical_results.items()}
 
-        final_score = max(vertical_scores.values()) if any(vertical_scores.values()) else 0.0
-        
-        # Calculate distinct signal types within the window for the routing gate 
+        # Guard: if no verticals produced any score, default to 0.0
+        score_values = [s for s in vertical_scores.values() if s]
+        final_score = max(score_values) if score_values else 0.0
+
+        # Calculate distinct signal types within the window for the routing gate
         distinct_signals_count = len({s["type"] for s in signals if self._is_within_window(s["date"])})
 
-        # Routing / urgency with Option C gate 
+        # Routing / urgency with Option C gate
         if final_score >= ROUTING_THRESHOLDS["immediate"]:
-            # GATE: Require 2+ distinct signals for Immediate SMS 
-            if distinct_signals_count >= 2:
-                urgency = "Immediate"
-            else:
-                urgency = "High"  # Cap at Daily if only 1 signal type exists 
+            # GATE: Require 2+ distinct signals for Immediate SMS
+            urgency = "Immediate" if distinct_signals_count >= 2 else "High"
         elif final_score >= ROUTING_THRESHOLDS["daily"]:
             urgency = "High"
         elif final_score >= ROUTING_THRESHOLDS["weekly"]:
@@ -509,9 +534,10 @@ class MultiVerticalScorer:
             best_v = max(vertical_scores, key=vertical_scores.get)
             sig_types = sorted({s["type"] for s in signals})
             logger.debug(
-                f"  {prop.parcel_id} | score={final_score:.0f} | {lead_tier} | {urgency} | "
-                f"best={best_v}({vertical_scores[best_v]:.0f}) | "
-                f"signals={len(signals)} [{', '.join(sig_types)}]"
+                "  %s | score=%.0f | %s | %s | best=%s(%.0f) | signals=%d [%s]",
+                prop.parcel_id, final_score, lead_tier, urgency,
+                best_v, vertical_scores[best_v],
+                len(signals), ", ".join(sig_types),
             )
 
         # Collect owner contact info for CRM push
@@ -712,7 +738,7 @@ class MultiVerticalScorer:
         Stored structure:
           signals[]           — all raw signal occurrences with recency info
           vertical_breakdown  — per-vertical: signal_score%, bonuses, and per-signal
-                                base/recency/total contributions
+                                 base/recency/total contributions
         """
         today = date.today()
 
@@ -767,6 +793,7 @@ class MultiVerticalScorer:
         - Otherwise → create new record.
 
         Returns the DistressScore record, or None if skipped (unchanged).
+        Raises SQLAlchemyError on DB failure — caller must handle rollback.
         """
         from sqlalchemy import cast, Date as SADate
 
@@ -789,7 +816,13 @@ class MultiVerticalScorer:
             ).first()
 
         if existing:
-            score_changed = float(existing.final_cds_score or 0) != float(final_score)
+            # Guard against NULL stored in DB column
+            try:
+                prev_score = float(existing.final_cds_score) if existing.final_cds_score is not None else 0.0
+            except (TypeError, ValueError):
+                prev_score = 0.0
+
+            score_changed = prev_score != float(final_score)
             existing.score_date      = datetime.now(timezone.utc)
             existing.final_cds_score = final_score
             existing.lead_tier       = lead_tier
@@ -798,14 +831,20 @@ class MultiVerticalScorer:
             existing.factor_scores   = factor_json
             existing.vertical_scores = vertical_json
             existing.distress_types  = distress_list
-            logger.debug(f"Updated score for property {score_data['parcel_id']}: {final_score} ({lead_tier})")
-            # Only push to GHL if score changed or contact not yet synced
+            logger.debug(
+                "Updated score for property %s: %.2f (%s)",
+                score_data.get("parcel_id"), final_score, lead_tier,
+            )
             is_new_contact = not score_data.get("ghl_contact_id")
             if _GHL_PUSH_ENABLED and (score_changed or is_new_contact):
                 try:
                     push_lead_to_ghl(score_data)
-                except Exception as ghl_err:
-                    logger.warning(f"[GHL] push failed (non-critical): {ghl_err}")
+                except Exception:
+                    logger.warning(
+                        "[GHL] push failed for property %s score=%.2f tier=%s",
+                        score_data.get("parcel_id"), final_score, lead_tier,
+                        exc_info=True,
+                    )
             return existing
 
         # Check most recent score to avoid accumulating identical rows
@@ -813,8 +852,16 @@ class MultiVerticalScorer:
             DistressScore.property_id == property_id,
         ).order_by(DistressScore.score_date.desc()).first()
 
-        if latest and float(latest.final_cds_score) == float(final_score):
-            logger.debug(f"Score unchanged for property {score_data['parcel_id']}: {final_score} — skipping")
+        try:
+            latest_score = float(latest.final_cds_score) if latest and latest.final_cds_score is not None else None
+        except (TypeError, ValueError):
+            latest_score = None
+
+        if latest_score is not None and latest_score == float(final_score):
+            logger.debug(
+                "Score unchanged for property %s: %.2f — skipping",
+                score_data.get("parcel_id"), final_score,
+            )
             return None
 
         record = DistressScore(
@@ -829,32 +876,49 @@ class MultiVerticalScorer:
             distress_types=distress_list,
         )
         self.session.add(record)
-        logger.debug(f"Created score for property {score_data['parcel_id']}: {final_score} ({lead_tier})")
+        # Flush to get the DB-assigned primary key before pushing to GHL
+        self.session.flush()
+
+        logger.debug(
+            "Created score for property %s: %.2f (%s)",
+            score_data.get("parcel_id"), final_score, lead_tier,
+        )
         if _GHL_PUSH_ENABLED:
             try:
                 push_lead_to_ghl(score_data)
-            except Exception as ghl_err:
-                logger.warning(f"[GHL] push failed (non-critical): {ghl_err}")
+            except Exception:
+                logger.warning(
+                    "[GHL] push failed for property %s score=%.2f tier=%s",
+                    score_data.get("parcel_id"), final_score, lead_tier,
+                    exc_info=True,
+                )
         return record
 
     # ── Batch scoring ──────────────────────────────────────────────────────────
 
     def _load_properties(self, property_ids: Optional[List[int]] = None) -> List[Property]:
         """Load properties with all signal relationships eager-loaded."""
-        q = self.session.query(Property).options(
-            joinedload(Property.owner),
-            joinedload(Property.financial),
-            joinedload(Property.code_violations),
-            joinedload(Property.legal_and_liens),
-            joinedload(Property.deeds),
-            joinedload(Property.legal_proceedings),
-            joinedload(Property.tax_delinquencies),
-            joinedload(Property.foreclosures),
-            joinedload(Property.building_permits),
-        )
-        if property_ids:
-            q = q.filter(Property.id.in_(property_ids))
-        return q.all()
+        try:
+            q = self.session.query(Property).options(
+                joinedload(Property.owner),
+                joinedload(Property.financial),
+                joinedload(Property.code_violations),
+                joinedload(Property.legal_and_liens),
+                joinedload(Property.deeds),
+                joinedload(Property.legal_proceedings),
+                joinedload(Property.tax_delinquencies),
+                joinedload(Property.foreclosures),
+                joinedload(Property.building_permits),
+            )
+            if property_ids:
+                q = q.filter(Property.id.in_(property_ids))
+            return q.all()
+        except OperationalError as exc:
+            logger.error(
+                "Database error loading properties for scoring (ids=%s): %s",
+                property_ids, exc, exc_info=True,
+            )
+            raise
 
     def score_all_properties(
         self,
@@ -869,17 +933,18 @@ class MultiVerticalScorer:
             property_ids: If provided, only rescore these property IDs.
 
         Returns:
-            List of score dicts (one per property).
+            List of score dicts for successfully scored properties.
         """
         label = f"{len(property_ids)} properties" if property_ids else "all properties"
-        logger.info(f"Loading {label} for scoring...")
+        logger.info("Loading %s for scoring...", label)
         properties = self._load_properties(property_ids)
-        logger.info(f"Scoring {len(properties)} properties across 6 verticals...")
+        logger.info("Scoring %d properties across 6 verticals...", len(properties))
 
         scores: List[Dict] = []
-        saved_count = 0
+        saved_count    = 0
         unchanged_count = 0
         no_signal_count = 0
+        failed_count   = 0
 
         for prop in properties:
             try:
@@ -897,15 +962,37 @@ class MultiVerticalScorer:
                     else:
                         saved_count += 1
 
-            except Exception as e:
-                logger.error(f"Error scoring property {prop.id} ({prop.parcel_id}): {e}")
+            except SQLAlchemyError as exc:
+                # DB error mid-batch: roll back the failed unit so the session
+                # stays usable for subsequent properties.
+                failed_count += 1
+                logger.error(
+                    "Database error scoring property %s (%s) — rolling back and continuing",
+                    prop.id, prop.parcel_id, exc_info=True,
+                )
+                try:
+                    self.session.rollback()
+                except Exception:
+                    logger.error("Rollback failed after DB error on property %s", prop.id, exc_info=True)
+
+            except Exception as exc:
+                failed_count += 1
+                logger.error(
+                    "Unexpected error scoring property %s (%s): %s",
+                    prop.id, prop.parcel_id, exc, exc_info=True,
+                )
 
         if save_to_db:
             logger.info(
-                f"Scoring complete — {saved_count} saved, "
-                f"{unchanged_count} unchanged, "
-                f"{no_signal_count} no signals"
+                "Scoring complete — %d saved, %d unchanged, %d no signals, %d failed",
+                saved_count, unchanged_count, no_signal_count, failed_count,
             )
+            if failed_count:
+                logger.warning(
+                    "%d properties failed to score — check logs above for details",
+                    failed_count,
+                )
+
         return scores
 
     def score_properties_by_ids(self, property_ids: List[int], save_to_db: bool = True) -> List[Dict]:
@@ -919,34 +1006,50 @@ class MultiVerticalScorer:
 
     def get_saved_qualified_scores(self, min_score: float = ROUTING_THRESHOLDS["weekly"]):
         """Return saved DistressScore records at or above min_score, ordered by score desc."""
-        return self.session.query(DistressScore).options(
-            joinedload(DistressScore.property).joinedload(Property.owner),
-            joinedload(DistressScore.property).joinedload(Property.financial),
-        ).filter(
-            DistressScore.final_cds_score >= min_score
-        ).order_by(DistressScore.final_cds_score.desc()).all()
+        try:
+            return self.session.query(DistressScore).options(
+                joinedload(DistressScore.property).joinedload(Property.owner),
+                joinedload(DistressScore.property).joinedload(Property.financial),
+            ).filter(
+                DistressScore.final_cds_score >= min_score
+            ).order_by(DistressScore.final_cds_score.desc()).all()
+        except OperationalError:
+            logger.error("Database error in get_saved_qualified_scores", exc_info=True)
+            raise
 
     def get_saved_scores_by_lead_tier(self, lead_tier: str):
         """Return saved DistressScore records matching a lead tier."""
-        return self.session.query(DistressScore).options(
-            joinedload(DistressScore.property).joinedload(Property.owner),
-        ).filter(
-            DistressScore.lead_tier == lead_tier
-        ).order_by(DistressScore.final_cds_score.desc()).all()
+        try:
+            return self.session.query(DistressScore).options(
+                joinedload(DistressScore.property).joinedload(Property.owner),
+            ).filter(
+                DistressScore.lead_tier == lead_tier
+            ).order_by(DistressScore.final_cds_score.desc()).all()
+        except OperationalError:
+            logger.error("Database error in get_saved_scores_by_lead_tier(tier=%s)", lead_tier, exc_info=True)
+            raise
 
     def get_latest_score_for_property(self, property_id: int) -> Optional[DistressScore]:
         """Get the most recent DistressScore record for a property."""
-        return self.session.query(DistressScore).filter(
-            DistressScore.property_id == property_id,
-        ).order_by(DistressScore.score_date.desc()).first()
+        try:
+            return self.session.query(DistressScore).filter(
+                DistressScore.property_id == property_id,
+            ).order_by(DistressScore.score_date.desc()).first()
+        except OperationalError:
+            logger.error("Database error in get_latest_score_for_property(id=%s)", property_id, exc_info=True)
+            raise
 
     def get_todays_score_for_property(self, property_id: int) -> Optional[DistressScore]:
         """Get today's DistressScore for a property (if it exists)."""
         from sqlalchemy import cast, Date as SADate
-        return self.session.query(DistressScore).filter(
-            DistressScore.property_id == property_id,
-            cast(DistressScore.score_date, SADate) == date.today(),
-        ).first()
+        try:
+            return self.session.query(DistressScore).filter(
+                DistressScore.property_id == property_id,
+                cast(DistressScore.score_date, SADate) == date.today(),
+            ).first()
+        except OperationalError:
+            logger.error("Database error in get_todays_score_for_property(id=%s)", property_id, exc_info=True)
+            raise
 
 
 # ── CLI entry point ────────────────────────────────────────────────────────────
@@ -959,6 +1062,12 @@ def main():
         python -m src.services.cds_engine                      # daily run (all properties)
         python -m src.services.cds_engine --rescore-all        # rescore all after weight change
         python -m src.services.cds_engine --property-id 12345  # rescore single property
+
+    Exit codes:
+        0 — success
+        1 — database / infrastructure error (retryable)
+        2 — configuration error (do not retry — fix config first)
+        3 — unhandled / unexpected error
     """
     import argparse
     from src.utils.logger import setup_logging, get_logger
@@ -1003,9 +1112,12 @@ def main():
 
     log.info("=" * 60)
     log.info("CDS Multi-Vertical Scoring Engine")
-    log.info(f"Mode:    {run_label}")
-    log.info(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    log.info("Mode:    %s", run_label)
+    log.info("Started: %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     log.info("=" * 60)
+
+    interrupted = False
+    scores = []
 
     try:
         with get_db_context() as session:
@@ -1013,90 +1125,107 @@ def main():
             scores = scorer.score_all_properties(save_to_db=True, property_ids=property_ids)
             session.commit()
 
-        from collections import Counter
+    except KeyboardInterrupt:
+        interrupted = True
+        log.warning("Interrupted by operator — partial results may have been committed")
+        # Fall through to stats output so the operator sees what ran before interrupt
 
-        total = len(scores)
-        with_signals = [s for s in scores if s["signal_count"] > 0]
-        qualified = sum(1 for s in with_signals if s["qualified"])
-
-        log.info("=" * 60)
-        log.info("CDS SCORING COMPLETE")
-        log.info(f"  Properties loaded:   {total:>7,}")
-        log.info(f"  With signals:        {len(with_signals):>7,}")
-        log.info(f"  No signals (skipped):{total - len(with_signals):>7,}")
-        log.info(f"  Qualified (≥{ROUTING_THRESHOLDS['weekly']}):       {qualified:>7,}")
-
-        if with_signals:
-            scores_only = [s["final_cds_score"] for s in with_signals]
-            avg = sum(scores_only) / len(scores_only)
-            top = max(scores_only)
-            log.info(f"  Avg score:           {avg:>7.1f}")
-            log.info(f"  Top score:           {top:>7.1f}")
-
-            # ── Lead tier distribution ────────────────────────────────────────
-            log.info("")
-            log.info("LEAD TIER DISTRIBUTION:")
-            tier_counts = Counter(s["lead_tier"] for s in with_signals)
-            for tier in ["Ultra Platinum", "Platinum", "Gold", "Silver", "Bronze"]:
-                bar = "█" * min(30, tier_counts.get(tier, 0))
-                log.info(f"  {tier:<15} {tier_counts.get(tier, 0):>5}  {bar}")
-
-            # ── Urgency distribution ──────────────────────────────────────────
-            log.info("")
-            log.info("URGENCY / ROUTING DISTRIBUTION:")
-            urgency_counts = Counter(s["urgency_level"] for s in with_signals)
-            for urgency, label in [
-                ("Immediate", f"SMS  (≥{ROUTING_THRESHOLDS['immediate']})"),
-                ("High",      f"Email(≥{ROUTING_THRESHOLDS['daily']})"),
-                ("Medium",    f"Digest(≥{ROUTING_THRESHOLDS['weekly']})"),
-                ("Low",       "Not routed"),
-            ]:
-                count = urgency_counts.get(urgency, 0)
-                log.info(f"  {urgency:<10} {label:<18} {count:>5}")
-
-            # ── Vertical driving max score ────────────────────────────────────
-            log.info("")
-            log.info("TOP VERTICAL (driving final_cds_score):")
-            top_v_counts = Counter(
-                max(s["vertical_scores"], key=s["vertical_scores"].get)
-                for s in with_signals
-            )
-            for v, count in top_v_counts.most_common():
-                bar = "█" * min(30, count)
-                log.info(f"  {v:<20} {count:>5}  {bar}")
-
-            # ── Signal type frequency ─────────────────────────────────────────
-            log.info("")
-            log.info("SIGNAL TYPE FREQUENCY (properties carrying each type):")
-            sig_counts = Counter(t for s in with_signals for t in s["distress_types"])
-            for sig_type, count in sig_counts.most_common():
-                bar = "█" * min(30, count)
-                log.info(f"  {sig_type:<25} {count:>5}  {bar}")
-
-            # ── Top 10 scored properties ──────────────────────────────────────
-            log.info("")
-            log.info("TOP 10 SCORED PROPERTIES:")
-            log.info(f"  {'Parcel':<20} {'Score':>6} {'Tier':<15} {'Urgency':<10} {'Best Vertical':<20} {'Signals'}")
-            log.info(f"  {'-'*20} {'-'*6} {'-'*15} {'-'*10} {'-'*20} {'-'*7}")
-            for s in sorted(with_signals, key=lambda x: x["final_cds_score"], reverse=True)[:10]:
-                best_v = max(s["vertical_scores"], key=s["vertical_scores"].get)
-                best_v_score = s["vertical_scores"][best_v]
-                log.info(
-                    f"  {(s['parcel_id'] or 'N/A'):<20} "
-                    f"{s['final_cds_score']:>6.1f} "
-                    f"{s['lead_tier']:<15} "
-                    f"{s['urgency_level']:<10} "
-                    f"{best_v}({best_v_score:.0f}) "
-                    f"  [{s['signal_count']} signals]"
-                )
-
-        log.info("")
-        log.info(f"Finished: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        log.info("=" * 60)
-
-    except Exception as e:
-        log.error(f"CDS scoring failed: {e}", exc_info=True)
+    except (OperationalError, SQLAlchemyError) as exc:
+        log.error("Database error — scoring aborted: %s", exc, exc_info=True)
         sys.exit(1)
+
+    except (KeyError, ValueError, RuntimeError) as exc:
+        log.error("Configuration error — scoring aborted: %s", exc, exc_info=True)
+        sys.exit(2)
+
+    except Exception as exc:
+        log.error("Unexpected error — scoring aborted: %s", exc, exc_info=True)
+        sys.exit(3)
+
+    # ── Stats output ──────────────────────────────────────────────────────────
+    from collections import Counter
+
+    total = len(scores)
+    with_signals = [s for s in scores if s["signal_count"] > 0]
+    qualified = sum(1 for s in with_signals if s["qualified"])
+
+    log.info("=" * 60)
+    log.info("CDS SCORING COMPLETE%s", " (INTERRUPTED)" if interrupted else "")
+    log.info("  Properties loaded:   %7d", total)
+    log.info("  With signals:        %7d", len(with_signals))
+    log.info("  No signals (skipped):%7d", total - len(with_signals))
+    log.info("  Qualified (≥%s):       %7d", ROUTING_THRESHOLDS["weekly"], qualified)
+
+    if with_signals:
+        scores_only = [s["final_cds_score"] for s in with_signals]
+        avg = sum(scores_only) / len(scores_only)
+        top = max(scores_only)
+        log.info("  Avg score:           %7.1f", avg)
+        log.info("  Top score:           %7.1f", top)
+
+        # ── Lead tier distribution ────────────────────────────────────────
+        log.info("")
+        log.info("LEAD TIER DISTRIBUTION:")
+        tier_counts = Counter(s["lead_tier"] for s in with_signals)
+        for tier in ["Ultra Platinum", "Platinum", "Gold", "Silver", "Bronze"]:
+            bar = "█" * min(30, tier_counts.get(tier, 0))
+            log.info("  %-15s %5d  %s", tier, tier_counts.get(tier, 0), bar)
+
+        # ── Urgency distribution ──────────────────────────────────────────
+        log.info("")
+        log.info("URGENCY / ROUTING DISTRIBUTION:")
+        urgency_counts = Counter(s["urgency_level"] for s in with_signals)
+        for urgency, label in [
+            ("Immediate", f"SMS  (≥{ROUTING_THRESHOLDS['immediate']})"),
+            ("High",      f"Email(≥{ROUTING_THRESHOLDS['daily']})"),
+            ("Medium",    f"Digest(≥{ROUTING_THRESHOLDS['weekly']})"),
+            ("Low",       "Not routed"),
+        ]:
+            log.info("  %-10s %-18s %5d", urgency, label, urgency_counts.get(urgency, 0))
+
+        # ── Vertical driving max score ────────────────────────────────────
+        log.info("")
+        log.info("TOP VERTICAL (driving final_cds_score):")
+        top_v_counts = Counter(
+            max(s["vertical_scores"], key=s["vertical_scores"].get)
+            for s in with_signals
+        )
+        for v, count in top_v_counts.most_common():
+            bar = "█" * min(30, count)
+            log.info("  %-20s %5d  %s", v, count, bar)
+
+        # ── Signal type frequency ─────────────────────────────────────────
+        log.info("")
+        log.info("SIGNAL TYPE FREQUENCY (properties carrying each type):")
+        sig_counts = Counter(t for s in with_signals for t in s["distress_types"])
+        for sig_type, count in sig_counts.most_common():
+            bar = "█" * min(30, count)
+            log.info("  %-25s %5d  %s", sig_type, count, bar)
+
+        # ── Top 10 scored properties ──────────────────────────────────────
+        log.info("")
+        log.info("TOP 10 SCORED PROPERTIES:")
+        log.info("  %-20s %6s %-15s %-10s %-20s %s", "Parcel", "Score", "Tier", "Urgency", "Best Vertical", "Signals")
+        log.info("  %s %s %s %s %s %s", "-"*20, "-"*6, "-"*15, "-"*10, "-"*20, "-"*7)
+        for s in sorted(with_signals, key=lambda x: x["final_cds_score"], reverse=True)[:10]:
+            best_v = max(s["vertical_scores"], key=s["vertical_scores"].get)
+            best_v_score = s["vertical_scores"][best_v]
+            log.info(
+                "  %-20s %6.1f %-15s %-10s %s(%.0f)  [%d signals]",
+                s.get("parcel_id") or "N/A",
+                s["final_cds_score"],
+                s["lead_tier"],
+                s["urgency_level"],
+                best_v, best_v_score,
+                s["signal_count"],
+            )
+
+    log.info("")
+    log.info("Finished: %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    log.info("=" * 60)
+
+    if interrupted:
+        sys.exit(130)  # conventional exit code for SIGINT
 
 
 if __name__ == "__main__":

@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Forced Action — Real-Time Property Intelligence</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://js.stripe.com/v3/"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+    * { font-family: 'Inter', sans-serif; }
+    .gradient-bg { background: linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #0f172a 100%); }
+    .card-glow { box-shadow: 0 0 40px rgba(251, 191, 36, 0.08); }
+    .founding-pulse { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .6; } }
+    .zip-available { border-color: #22c55e; background: rgba(34,197,94,0.08); }
+    .zip-taken { border-color: #ef4444; background: rgba(239,68,68,0.08); }
+    .zip-grace { border-color: #f59e0b; background: rgba(245,158,11,0.08); }
+    .vertical-btn { transition: all 0.2s; }
+    .vertical-btn.active { background: rgba(251,191,36,0.15); border-color: rgba(251,191,36,0.6); color: #fbbf24; }
+    /* Stripe embedded checkout modal */
+    #checkout-modal { display:none; position:fixed; inset:0; z-index:9999; background:rgba(0,0,0,0.75); align-items:center; justify-content:center; }
+    #checkout-modal.open { display:flex; }
+    #checkout-container { background:#0f172a; border:1px solid rgba(255,255,255,0.1); border-radius:1rem; padding:1.5rem; width:100%; max-width:520px; max-height:90vh; overflow-y:auto; position:relative; }
+    #checkout-close { position:absolute; top:1rem; right:1rem; background:transparent; border:none; color:#94a3b8; font-size:1.5rem; cursor:pointer; line-height:1; }
+    /* Sample leads card */
+    .lead-card { background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.08); border-radius:1rem; padding:1rem 1.25rem; }
+    .score-badge { display:inline-flex; align-items:center; gap:0.25rem; font-size:0.7rem; font-weight:700; padding:0.2rem 0.5rem; border-radius:999px; }
+    .score-platinum { background:rgba(168,85,247,0.2); color:#c084fc; border:1px solid rgba(168,85,247,0.3); }
+    .score-gold { background:rgba(251,191,36,0.15); color:#fbbf24; border:1px solid rgba(251,191,36,0.25); }
+    .score-silver { background:rgba(148,163,184,0.15); color:#94a3b8; border:1px solid rgba(148,163,184,0.2); }
+  </style>
+</head>
+<body class="gradient-bg min-h-screen text-white">
+
+  <!-- NAV -->
+  <nav class="border-b border-white/10 px-6 py-4">
+    <div class="max-w-6xl mx-auto flex items-center justify-between">
+      <span class="text-xl font-bold tracking-tight">Forced <span class="text-yellow-400">Action</span></span>
+      <span class="text-sm text-slate-400">Hillsborough County · Property Intelligence</span>
+    </div>
+  </nav>
+
+  <!-- HERO -->
+  <section class="max-w-6xl mx-auto px-6 pt-20 pb-12 text-center">
+    <div class="inline-flex items-center gap-2 bg-yellow-400/10 border border-yellow-400/30 rounded-full px-4 py-1.5 text-yellow-400 text-sm font-medium mb-6">
+      <span class="w-2 h-2 bg-yellow-400 rounded-full founding-pulse"></span>
+      Founding Member Pricing — Limited Spots
+    </div>
+
+    <h1 class="text-5xl md:text-6xl font-extrabold leading-tight mb-6">
+      Real-Time Property Leads<br/>
+      <span class="text-yellow-400">Before Your Competition Sees Them</span>
+    </h1>
+
+    <p class="text-xl text-slate-300 max-w-2xl mx-auto mb-10">
+      Every storm, permit, eviction, and insurance claim in Hillsborough County — scored, ranked, and delivered to your exclusive territory before anyone else gets them.
+    </p>
+
+    <!-- VERTICAL SELECTOR -->
+    <div class="flex flex-wrap justify-center gap-3 mb-10">
+      <button onclick="setVertical('roofing')"        id="btn-roofing"        class="vertical-btn active border border-white/20 rounded-full px-5 py-2 text-sm font-medium text-slate-300">🏠 Roofing</button>
+      <button onclick="setVertical('remediation')"    id="btn-remediation"    class="vertical-btn border border-white/20 rounded-full px-5 py-2 text-sm font-medium text-slate-300">💧 Remediation</button>
+      <button onclick="setVertical('public_adjusters')" id="btn-public_adjusters" class="vertical-btn border border-white/20 rounded-full px-5 py-2 text-sm font-medium text-slate-300">📋 Public Adjusters</button>
+      <button onclick="setVertical('wholesalers')"    id="btn-wholesalers"    class="vertical-btn border border-white/20 rounded-full px-5 py-2 text-sm font-medium text-slate-300">🏢 Wholesalers</button>
+      <button onclick="setVertical('fix_flip')"       id="btn-fix_flip"       class="vertical-btn border border-white/20 rounded-full px-5 py-2 text-sm font-medium text-slate-300">🔨 Fix & Flip</button>
+      <button onclick="setVertical('attorneys')"      id="btn-attorneys"      class="vertical-btn border border-white/20 rounded-full px-5 py-2 text-sm font-medium text-slate-300">⚖️ Attorneys</button>
+    </div>
+
+    <!-- FOUNDING COUNTER -->
+    <div class="inline-flex flex-col items-center gap-1 bg-yellow-400/5 border border-yellow-400/20 rounded-2xl px-8 py-5 mb-12">
+      <span class="text-slate-400 text-sm uppercase tracking-widest"><span id="vertical-label">Roofing</span> — Founding Spots Remaining</span>
+      <div class="flex items-baseline gap-2">
+        <span id="spots-remaining" class="text-6xl font-extrabold text-yellow-400">—</span>
+        <span class="text-2xl text-slate-400 font-medium">/ <span id="spots-total">30</span></span>
+      </div>
+      <span class="text-slate-500 text-xs mt-1">Founding rate locked forever — price increases when spots fill</span>
+    </div>
+  </section>
+
+  <!-- HOW IT WORKS -->
+  <section class="max-w-6xl mx-auto px-6 py-12">
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+      <div class="bg-white/5 border border-white/10 rounded-2xl p-6">
+        <div class="text-3xl mb-3">⚡</div>
+        <h3 class="font-bold text-lg mb-2">Real-Time Intelligence</h3>
+        <p class="text-slate-400 text-sm">Storm events, permits, insurance claims, and flood declarations scraped daily and scored within hours.</p>
+      </div>
+      <div class="bg-white/5 border border-white/10 rounded-2xl p-6">
+        <div class="text-3xl mb-3">📍</div>
+        <h3 class="font-bold text-lg mb-2">Exclusive ZIP Territories</h3>
+        <p class="text-slate-400 text-sm">Lock your ZIP codes. No other contractor in your vertical and territory gets the same leads. First come, first served.</p>
+      </div>
+      <div class="bg-white/5 border border-white/10 rounded-2xl p-6">
+        <div class="text-3xl mb-3">🏆</div>
+        <h3 class="font-bold text-lg mb-2">CDS Scored & Ranked</h3>
+        <p class="text-slate-400 text-sm">Every property scored from 0–100 across 6 distress signals. Ultra Platinum leads delivered first, always.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ZIP CHECKER -->
+  <section class="max-w-6xl mx-auto px-6 py-12">
+    <div class="bg-white/5 border border-white/10 rounded-2xl p-8 max-w-xl mx-auto">
+      <h2 class="text-2xl font-bold mb-2 text-center">Check Your ZIP Territory</h2>
+      <p class="text-slate-400 text-sm text-center mb-6">See if your target ZIP is still available for <span id="zip-vertical-label" class="text-yellow-400">Roofing</span></p>
+      <div class="flex gap-3">
+        <input
+          id="zip-input"
+          type="text"
+          maxlength="5"
+          placeholder="Enter ZIP code"
+          class="flex-1 bg-white/10 border border-white/20 rounded-xl px-4 py-3 text-white placeholder-slate-500 focus:outline-none focus:border-yellow-400/50 transition"
+        />
+        <button
+          onclick="checkZip()"
+          class="bg-yellow-400 hover:bg-yellow-300 text-black font-semibold px-5 py-3 rounded-xl transition"
+        >
+          Check
+        </button>
+      </div>
+      <div id="zip-result" class="mt-4 hidden rounded-xl border px-4 py-3 text-sm font-medium"></div>
+    </div>
+  </section>
+
+  <!-- SAMPLE LEADS SECTION (shown after ZIP check for available/grace ZIPs) -->
+  <section id="sample-leads-section" class="hidden max-w-6xl mx-auto px-6 pb-4">
+    <div class="max-w-xl mx-auto">
+      <h3 class="text-lg font-bold mb-1 text-center">Sample Leads from ZIP <span id="sample-zip-label"></span></h3>
+      <p class="text-slate-400 text-sm text-center mb-5">Real scored properties — phone numbers unlocked when you subscribe</p>
+      <div id="sample-leads-list" class="space-y-3"></div>
+    </div>
+  </section>
+
+  <!-- WAITLIST SECTION (shown when ZIP is taken) -->
+  <section id="waitlist-section" class="hidden max-w-6xl mx-auto px-6 pb-4">
+    <div class="bg-white/5 border border-white/10 rounded-2xl p-6 max-w-xl mx-auto">
+      <h3 class="text-lg font-bold mb-1 text-center">Get Notified When This ZIP Opens</h3>
+      <p class="text-slate-400 text-sm text-center mb-5">Join the waitlist — we'll email you the moment this territory becomes available.</p>
+      <div class="space-y-3">
+        <input id="waitlist-name" type="text" placeholder="Your name" class="w-full bg-white/10 border border-white/20 rounded-xl px-4 py-3 text-white placeholder-slate-500 focus:outline-none focus:border-yellow-400/50 transition" />
+        <input id="waitlist-email" type="email" placeholder="Your email" class="w-full bg-white/10 border border-white/20 rounded-xl px-4 py-3 text-white placeholder-slate-500 focus:outline-none focus:border-yellow-400/50 transition" />
+        <button onclick="submitWaitlist()" class="w-full bg-yellow-400 hover:bg-yellow-300 text-black font-bold py-3 rounded-xl transition">Join Waitlist</button>
+      </div>
+      <p id="waitlist-msg" class="hidden mt-3 text-sm text-center text-green-400"></p>
+    </div>
+  </section>
+
+  <!-- PRICING -->
+  <section class="max-w-6xl mx-auto px-6 py-12">
+    <h2 class="text-3xl font-bold text-center mb-3">Choose Your Plan</h2>
+    <p class="text-slate-400 text-center mb-10">Founding pricing locked forever. Cancel anytime.</p>
+
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+
+      <!-- STARTER -->
+      <div class="bg-white/5 border border-white/10 rounded-2xl p-7 card-glow flex flex-col">
+        <div class="mb-4">
+          <span class="text-xs font-semibold uppercase tracking-widest text-slate-400">Starter — 1 ZIP</span>
+          <div class="flex items-baseline gap-2 mt-2">
+            <span class="text-4xl font-extrabold" id="price-starter">—</span>
+            <span class="text-slate-400">/mo</span>
+            <span class="text-sm text-slate-500 line-through" id="price-crossout-starter"></span>
+          </div>
+          <p class="text-xs text-yellow-400 mt-1" id="founding-badge-starter"></p>
+          <p class="text-xs text-slate-500 mt-0.5" id="spots-per-tier-starter"></p>
+        </div>
+        <ul class="space-y-2 text-sm text-slate-300 mb-6 flex-1">
+          <li>✓ 1 ZIP territory</li>
+          <li>✓ Daily lead feed</li>
+          <li>✓ CDS scoring</li>
+          <li>✓ All event types</li>
+          <li>✓ Rate locked forever</li>
+        </ul>
+        <button
+          onclick="checkout('starter')"
+          class="w-full bg-yellow-400 hover:bg-yellow-300 text-black font-bold py-3 rounded-xl transition"
+        >
+          Claim Founding Rate
+        </button>
+      </div>
+
+      <!-- PRO -->
+      <div class="bg-white/5 border border-yellow-400/40 rounded-2xl p-7 card-glow flex flex-col relative">
+        <div class="absolute -top-3 left-1/2 -translate-x-1/2 bg-yellow-400 text-black text-xs font-bold px-4 py-1 rounded-full">Most Popular</div>
+        <div class="mb-4">
+          <span class="text-xs font-semibold uppercase tracking-widest text-slate-400">Pro — 3 ZIPs</span>
+          <div class="flex items-baseline gap-2 mt-2">
+            <span class="text-4xl font-extrabold" id="price-pro">—</span>
+            <span class="text-slate-400">/mo</span>
+            <span class="text-sm text-slate-500 line-through" id="price-crossout-pro"></span>
+          </div>
+          <p class="text-xs text-yellow-400 mt-1" id="founding-badge-pro"></p>
+          <p class="text-xs text-slate-500 mt-0.5" id="spots-per-tier-pro"></p>
+        </div>
+        <ul class="space-y-2 text-sm text-slate-300 mb-6 flex-1">
+          <li>✓ 3 ZIP territories</li>
+          <li>✓ Priority lead delivery</li>
+          <li>✓ Skip-traced phone numbers</li>
+          <li>✓ All event types</li>
+          <li>✓ Rate locked forever</li>
+        </ul>
+        <button
+          onclick="checkout('pro')"
+          class="w-full bg-yellow-400 hover:bg-yellow-300 text-black font-bold py-3 rounded-xl transition"
+        >
+          Claim Founding Rate
+        </button>
+      </div>
+
+      <!-- DOMINATOR -->
+      <div class="bg-white/5 border border-white/10 rounded-2xl p-7 card-glow flex flex-col">
+        <div class="mb-4">
+          <span class="text-xs font-semibold uppercase tracking-widest text-slate-400">Dominator — 10 ZIPs</span>
+          <div class="flex items-baseline gap-2 mt-2">
+            <span class="text-4xl font-extrabold" id="price-dominator">—</span>
+            <span class="text-slate-400">/mo</span>
+            <span class="text-sm text-slate-500 line-through" id="price-crossout-dominator"></span>
+          </div>
+          <p class="text-xs text-yellow-400 mt-1" id="founding-badge-dominator"></p>
+          <p class="text-xs text-slate-500 mt-0.5" id="spots-per-tier-dominator"></p>
+        </div>
+        <ul class="space-y-2 text-sm text-slate-300 mb-6 flex-1">
+          <li>✓ Unlimited ZIPs in county</li>
+          <li>✓ First-access lead delivery</li>
+          <li>✓ Skip-traced phone numbers</li>
+          <li>✓ Dedicated account manager</li>
+          <li>✓ Rate locked forever</li>
+        </ul>
+        <button
+          onclick="checkout('dominator')"
+          class="w-full bg-yellow-400 hover:bg-yellow-300 text-black font-bold py-3 rounded-xl transition"
+        >
+          Claim Founding Rate
+        </button>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- STRIPE EMBEDDED CHECKOUT MODAL -->
+  <div id="checkout-modal">
+    <div id="checkout-container">
+      <button id="checkout-close" onclick="closeCheckout()" aria-label="Close">&#x2715;</button>
+      <div id="stripe-checkout-mount"></div>
+    </div>
+  </div>
+
+  <!-- FOOTER -->
+  <footer class="border-t border-white/10 mt-16 px-6 py-8 text-center text-slate-500 text-sm">
+    <p>Forced Action · Hillsborough County, FL · Real-Time Property Intelligence</p>
+    <p class="mt-1">Questions? <a href="mailto:support@forcedaction.io" class="text-slate-400 hover:text-white transition">support@forcedaction.io</a></p>
+  </footer>
+
+  <script>
+    const API_BASE = '';
+    const STRIPE_PK = 'pk_test_51T8ynpLRyRP2f1Px9hSyqHYwgYde3irITn8JDHF7r3Sw79jISrq110s2jsNUhWJdkghZUdKLDRxSUcoiFD483r5A00lYHd6dLn';
+
+    const PRICES = {
+      starter:   { founding: 600,  regular: 800,  future: 1100 },
+      pro:       { founding: 1100, regular: 1500, future: 1900 },
+      dominator: { founding: 2000, regular: 2800, future: 3500 },
+    };
+
+    const VERTICAL_LABELS = {
+      roofing:         'Roofing',
+      remediation:     'Remediation',
+      public_adjusters:'Public Adjusters',
+      wholesalers:     'Wholesalers',
+      fix_flip:        'Fix & Flip',
+      attorneys:       'Attorneys',
+    };
+
+    let selectedVertical = 'roofing';
+
+    const stripe = Stripe(STRIPE_PK);
+
+    // ── Vertical selector ────────────────────────────────────────
+    function setVertical(v) {
+      selectedVertical = v;
+
+      // Update button active states
+      Object.keys(VERTICAL_LABELS).forEach(key => {
+        const btn = document.getElementById(`btn-${key}`);
+        if (btn) btn.classList.toggle('active', key === v);
+      });
+
+      // Update labels
+      const label = VERTICAL_LABELS[v];
+      document.getElementById('vertical-label').textContent = label;
+      document.getElementById('zip-vertical-label').textContent = label;
+
+      // Reload founding spots for selected vertical
+      loadFoundingSpots();
+
+      // Clear ZIP result since vertical changed
+      const zipResult = document.getElementById('zip-result');
+      zipResult.classList.add('hidden');
+    }
+
+    // ── Load founding spots ──────────────────────────────────────
+    async function loadFoundingSpots() {
+      try {
+        // Fetch per-tier counts in parallel
+        const [starterData, proData, dominatorData] = await Promise.all(
+          ['starter', 'pro', 'dominator'].map(tier =>
+            fetch(`${API_BASE}/api/founding-spots?tier=${tier}&vertical=${selectedVertical}&county_id=hillsborough`)
+              .then(r => r.json())
+          )
+        );
+
+        const tierData = { starter: starterData, pro: proData, dominator: dominatorData };
+
+        // Hero banner — fetch total across all tiers for selected vertical
+        const summaryRes = await fetch(`${API_BASE}/api/founding-summary?vertical=${selectedVertical}&county_id=hillsborough`);
+        const summary = await summaryRes.json();
+        const spotsEl = document.getElementById('spots-remaining');
+        spotsEl.textContent = summary.total_remaining;
+        document.getElementById('spots-total').textContent = summary.total_cap;
+        spotsEl.className = `text-6xl font-extrabold ${summary.founding_available ? 'text-yellow-400' : 'text-slate-400'}`;
+
+        // Update each pricing card independently
+        ['starter', 'pro', 'dominator'].forEach(tier => {
+          const data = tierData[tier];
+          const price = data.founding_available ? PRICES[tier].founding : PRICES[tier].regular;
+          const crossedOut = data.founding_available ? PRICES[tier].regular : PRICES[tier].future;
+
+          document.getElementById(`price-${tier}`).textContent = `$${price.toLocaleString()}`;
+          document.getElementById(`price-crossout-${tier}`).textContent = `$${crossedOut.toLocaleString()}/mo`;
+          document.getElementById(`spots-per-tier-${tier}`).textContent =
+            data.founding_available
+              ? `${data.founding_remaining} founding spot${data.founding_remaining !== 1 ? 's' : ''} remaining`
+              : 'Founding spots sold out';
+
+          const badge = document.getElementById(`founding-badge-${tier}`);
+          if (data.founding_available) {
+            badge.textContent = `★ Save $${(PRICES[tier].regular - PRICES[tier].founding).toLocaleString()}/mo forever`;
+            badge.className = 'text-xs text-yellow-400 mt-1';
+          } else {
+            badge.textContent = 'Regular pricing';
+            badge.className = 'text-xs text-slate-400 mt-1';
+          }
+        });
+
+        // Refresh every 30s
+        setTimeout(loadFoundingSpots, 30000);
+      } catch (e) {
+        console.error('Failed to load founding spots', e);
+      }
+    }
+
+    // ── ZIP checker ──────────────────────────────────────────────
+    let lastCheckedZip = '';
+
+    async function checkZip() {
+      const zip = document.getElementById('zip-input').value.trim();
+      const result = document.getElementById('zip-result');
+
+      // Hide downstream sections
+      document.getElementById('sample-leads-section').classList.add('hidden');
+      document.getElementById('waitlist-section').classList.add('hidden');
+
+      if (!/^\d{5}$/.test(zip)) {
+        result.className = 'mt-4 rounded-xl border px-4 py-3 text-sm font-medium border-white/20 bg-white/5';
+        result.textContent = 'Please enter a valid 5-digit ZIP code.';
+        result.classList.remove('hidden');
+        return;
+      }
+
+      result.textContent = 'Checking...';
+      result.className = 'mt-4 rounded-xl border px-4 py-3 text-sm font-medium border-white/20 bg-white/5';
+      result.classList.remove('hidden');
+
+      try {
+        const res = await fetch(`${API_BASE}/api/zip-check?zip_code=${zip}&vertical=${selectedVertical}&county_id=hillsborough`);
+        const data = await res.json();
+        const label = VERTICAL_LABELS[selectedVertical];
+        lastCheckedZip = zip;
+
+        if (data.status === 'invalid') {
+          result.className = 'mt-4 rounded-xl border px-4 py-3 text-sm font-medium border-white/20 bg-white/5';
+          result.textContent = `✗ ZIP ${zip} is not in our Hillsborough County service area.`;
+        } else if (data.status === 'available') {
+          result.className = 'mt-4 rounded-xl border px-4 py-3 text-sm font-medium zip-available';
+          result.textContent = `✓ ZIP ${zip} is available for ${label} — lock it in when you subscribe.`;
+          showSampleLeads(zip);
+        } else if (data.status === 'grace') {
+          result.className = 'mt-4 rounded-xl border px-4 py-3 text-sm font-medium zip-grace';
+          result.textContent = `⏳ ZIP ${zip} is opening soon for ${label} — subscribe now to claim it.`;
+          showSampleLeads(zip);
+        } else {
+          result.className = 'mt-4 rounded-xl border px-4 py-3 text-sm font-medium zip-taken';
+          result.textContent = `✗ ZIP ${zip} is taken for ${label} by another subscriber.`;
+          const ws = document.getElementById('waitlist-section');
+          document.getElementById('waitlist-msg').classList.add('hidden');
+          ws.classList.remove('hidden');
+          setTimeout(() => ws.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50);
+        }
+      } catch (e) {
+        result.textContent = 'Error checking ZIP. Please try again.';
+      }
+    }
+
+    // ── Sample leads ─────────────────────────────────────────────
+    async function showSampleLeads(zip) {
+      const section = document.getElementById('sample-leads-section');
+      const list = document.getElementById('sample-leads-list');
+      document.getElementById('sample-zip-label').textContent = zip;
+      list.innerHTML = '<p class="text-slate-400 text-sm text-center">Loading sample leads…</p>';
+      section.classList.remove('hidden');
+      setTimeout(() => section.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50);
+
+      try {
+        const res = await fetch(`${API_BASE}/api/sample-leads?zip_code=${zip}&vertical=${selectedVertical}&county_id=hillsborough`);
+        const data = await res.json();
+
+        if (!data.leads || data.leads.length === 0) {
+          list.innerHTML = '<p class="text-slate-400 text-sm text-center">No scored leads found for this ZIP yet — new data arrives nightly.</p>';
+          return;
+        }
+
+        const tierClass = t => t === 'ultra_platinum' || t === 'platinum' ? 'score-platinum' : t === 'gold' ? 'score-gold' : 'score-silver';
+        const tierLabel = t => t ? t.replace(/_/g,' ').replace(/\b\w/g, c=>c.toUpperCase()) : 'Scored';
+
+        list.innerHTML = data.leads.map(l => `
+          <div class="lead-card">
+            <div class="flex items-start justify-between gap-4">
+              <div class="flex-1 min-w-0">
+                <p class="font-semibold text-white text-sm truncate">${l.address}</p>
+                <p class="text-slate-400 text-xs mt-0.5">${l.city}, FL ${l.zip} · ${l.year_built ? 'Built ' + l.year_built : ''} · ${l.sq_ft ? l.sq_ft.toLocaleString() + ' sqft' : ''}</p>
+                ${l.latest_incident ? `<p class="text-yellow-400 text-xs mt-1">⚡ ${l.latest_incident.replace(/_/g,' ')}${l.latest_incident_date ? ' — ' + l.latest_incident_date.slice(0,10) : ''}</p>` : ''}
+                ${l.distress_types && l.distress_types.length ? `<p class="text-slate-500 text-xs mt-1">${l.distress_types.join(' · ')}</p>` : ''}
+              </div>
+              <div class="flex flex-col items-end gap-1 shrink-0">
+                <span class="score-badge ${tierClass(l.lead_tier)}">${tierLabel(l.lead_tier)}</span>
+                <span class="text-xs text-slate-400">Score: <span class="text-white font-medium">${l.vertical_score !== null && l.vertical_score !== undefined ? Math.round(l.vertical_score) : l.cds_score !== null ? Math.round(l.cds_score) : '—'}</span></span>
+              </div>
+            </div>
+            <div class="mt-2 pt-2 border-t border-white/5 flex items-center justify-between">
+              <span class="text-xs text-slate-500">📞 Phone: <span class="font-mono text-slate-400">${l.phone}</span></span>
+              <span class="text-xs text-yellow-400 font-medium">Unlock with subscription →</span>
+            </div>
+          </div>
+        `).join('');
+      } catch (e) {
+        list.innerHTML = '<p class="text-slate-400 text-sm text-center">Could not load sample leads.</p>';
+      }
+    }
+
+    // ── Waitlist ──────────────────────────────────────────────────
+    async function submitWaitlist() {
+      const name = document.getElementById('waitlist-name').value.trim();
+      const email = document.getElementById('waitlist-email').value.trim();
+      const msg = document.getElementById('waitlist-msg');
+
+      if (!name || !email) {
+        msg.textContent = 'Please enter your name and email.';
+        msg.className = 'mt-3 text-sm text-center text-red-400';
+        msg.classList.remove('hidden');
+        return;
+      }
+
+      try {
+        const res = await fetch(`${API_BASE}/api/waitlist`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ zip_code: lastCheckedZip, vertical: selectedVertical, county_id: 'hillsborough', name, email }),
+        });
+        if (!res.ok) throw new Error('failed');
+        msg.textContent = `✓ You're on the waitlist for ZIP ${lastCheckedZip}. We'll email you when it opens.`;
+        msg.className = 'mt-3 text-sm text-center text-green-400';
+        msg.classList.remove('hidden');
+        document.getElementById('waitlist-name').value = '';
+        document.getElementById('waitlist-email').value = '';
+      } catch (e) {
+        msg.textContent = 'Could not join waitlist. Please try again.';
+        msg.className = 'mt-3 text-sm text-center text-red-400';
+        msg.classList.remove('hidden');
+      }
+    }
+
+    document.getElementById('zip-input').addEventListener('keydown', e => {
+      if (e.key === 'Enter') checkZip();
+    });
+
+    // ── Stripe Embedded Checkout ─────────────────────────────────
+    let embeddedCheckout = null;
+
+    async function checkout(tier) {
+      const modal = document.getElementById('checkout-modal');
+      const mount = document.getElementById('stripe-checkout-mount');
+      mount.innerHTML = '<p class="text-slate-400 text-sm text-center py-8">Loading checkout…</p>';
+      modal.classList.add('open');
+
+      try {
+        const res = await fetch(`${API_BASE}/api/checkout`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tier, vertical: selectedVertical, county_id: 'hillsborough' }),
+        });
+
+        if (!res.ok) {
+          const err = await res.json();
+          mount.innerHTML = `<p class="text-red-400 text-sm text-center py-8">${err.detail || 'Checkout failed. Please try again.'}</p>`;
+          return;
+        }
+
+        const { client_secret } = await res.json();
+        embeddedCheckout = await stripe.initEmbeddedCheckout({
+          clientSecret: client_secret,
+          onComplete() {
+            closeCheckout();
+            window.location.href = '/success';
+          },
+        });
+        mount.innerHTML = '';
+        embeddedCheckout.mount('#stripe-checkout-mount');
+      } catch (e) {
+        mount.innerHTML = '<p class="text-red-400 text-sm text-center py-8">Could not load checkout. Please try again.</p>';
+      }
+    }
+
+    function closeCheckout() {
+      document.getElementById('checkout-modal').classList.remove('open');
+      if (embeddedCheckout) {
+        embeddedCheckout.destroy();
+        embeddedCheckout = null;
+      }
+      document.getElementById('stripe-checkout-mount').innerHTML = '';
+    }
+
+    // Close modal on backdrop click
+    document.getElementById('checkout-modal').addEventListener('click', e => {
+      if (e.target === document.getElementById('checkout-modal')) closeCheckout();
+    });
+
+    // ── Init ─────────────────────────────────────────────────────
+    loadFoundingSpots();
+  </script>
+
+</body>
+</html>

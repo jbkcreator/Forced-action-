@@ -34,14 +34,16 @@ class BaseLoader(ABC):
     - CSV/DataFrame loading
     """
     
-    def __init__(self, session: Session):
+    def __init__(self, session: Session, county_id: str = "hillsborough"):
         """
         Initialize loader with database session.
 
         Args:
             session: SQLAlchemy database session
+            county_id: County slug from COUNTY_CONFIG (default: hillsborough)
         """
         self.session = session
+        self.county_id = county_id
         self._affected_property_ids: set = set()
     
     # ========================================================================
@@ -315,7 +317,8 @@ class BaseLoader(ABC):
             return None
         
         return self.session.query(Property).filter_by(
-            parcel_id=str(parcel_id).strip()
+            parcel_id=str(parcel_id).strip(),
+            county_id=self.county_id,
         ).first()
     
     def find_property_by_address(
@@ -360,7 +363,10 @@ class BaseLoader(ABC):
         if house_number and house_number.isdigit():
             ilike_rows = (
                 self.session.query(Property)
-                .filter(Property.address.ilike(f"{house_number} %"))
+                .filter(
+                    Property.address.ilike(f"{house_number} %"),
+                    Property.county_id == self.county_id,
+                )
                 .all()
             )
             for prop in ilike_rows:
@@ -381,6 +387,7 @@ class BaseLoader(ABC):
                     self.session.query(Property)
                     .filter(
                         Property.address.isnot(None),
+                        Property.county_id == self.county_id,
                         sqlfunc.similarity(Property.address, address) >= 0.3,
                     )
                     .order_by(sqlfunc.similarity(Property.address, address).desc())
@@ -477,6 +484,7 @@ class BaseLoader(ABC):
         for word in subd_words:
             filters.append(Property.legal_description.ilike(f'%{word}%'))
 
+        filters.append(Property.county_id == self.county_id)
         candidates = (
             self.session.query(Property)
             .filter(and_(*filters))

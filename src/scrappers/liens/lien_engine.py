@@ -45,6 +45,7 @@ from config.constants import (
     TEMP_DOWNLOADS_DIR,
     BROWSER_DOWNLOAD_TEMP_PATTERN,
     HILLSCLERK_PUBLIC_ACCESS_URL,
+    get_county_config,
 )
 from src.utils.logger import setup_logging, get_logger
 from src.utils.prompt_loader import get_prompt
@@ -144,6 +145,7 @@ async def _playwright_download_document(
     doc_type: str,
     start_date_str: str,
     end_date_str: str,
+    clerk_access_url: str = HILLSCLERK_PUBLIC_ACCESS_URL,
 ) -> Optional[Path]:
     """
     Download all county records for a date range — no DocType filter.
@@ -170,7 +172,7 @@ async def _playwright_download_document(
         page = await context.new_page()
         try:
             # 1. Navigate
-            await page.goto(HILLSCLERK_PUBLIC_ACCESS_URL, wait_until="domcontentloaded", timeout=60_000)
+            await page.goto(clerk_access_url, wait_until="domcontentloaded", timeout=60_000)
 
             # 2. Click "Document Type" search-type link
             await page.click('div[id="ORI-Document Type"]')
@@ -247,7 +249,7 @@ async def _playwright_download_document(
             await browser.close()
 
 
-async def _playwright_download_combined(start_str: str, end_str: str) -> Optional[pd.DataFrame]:
+async def _playwright_download_combined(start_str: str, end_str: str, clerk_access_url: str = HILLSCLERK_PUBLIC_ACCESS_URL) -> Optional[pd.DataFrame]:
     """
     Single combined download: one Playwright session covers the full date range.
     Retries up to 5 times on error or no-results (temporary site issue).
@@ -259,7 +261,7 @@ async def _playwright_download_combined(start_str: str, end_str: str) -> Optiona
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            path = await _playwright_download_document("Combined", start_str, end_str)
+            path = await _playwright_download_document("Combined", start_str, end_str, clerk_access_url=clerk_access_url)
             if path is None:
                 # No results from site — could be temporary; retry before giving up
                 if attempt < MAX_RETRIES:
@@ -297,7 +299,7 @@ async def _playwright_download_combined(start_str: str, end_str: str) -> Optiona
         day_str = day.strftime("%m/%d/%Y")
         logger.info(f"[Combined] Fetching single day: {day_str}")
         try:
-            path = await _playwright_download_document(f"Combined-{day_str}", day_str, day_str)
+            path = await _playwright_download_document(f"Combined-{day_str}", day_str, day_str, clerk_access_url=clerk_access_url)
             if path is not None:
                 frames.append(process_lien_data(path))
         except OverflowError:
@@ -320,6 +322,7 @@ async def download_document_by_type(
     end_date_str: str,
     wait_after_download: int = 40,
     option_value: str = "",
+    clerk_access_url: str = HILLSCLERK_PUBLIC_ACCESS_URL,
 ) -> Optional[Path]:
     """
     Download a specific document type from Hillsborough County Clerk.
@@ -335,7 +338,7 @@ async def download_document_by_type(
         playwright_error = None
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                result = await _playwright_download_document(doc_type, start_date_str, end_date_str)
+                result = await _playwright_download_document(doc_type, start_date_str, end_date_str, clerk_access_url=clerk_access_url)
                 if result is None:
                     # No results — retry (could be temporary)
                     if attempt < MAX_RETRIES:
@@ -374,7 +377,7 @@ async def download_document_by_type(
                 "lien_prompts.yaml",
                 "document_search.task_template",
                 doc_type=doc_type,
-                url=HILLSCLERK_PUBLIC_ACCESS_URL,
+                url=clerk_access_url,
                 doc_type_code=doc_type_code,
                 start_date_str=start_date_str,
                 end_date_str=end_date_str,
@@ -701,12 +704,15 @@ def save_processed_liens(df: pd.DataFrame, output_filename: str = "lien_data.csv
         raise
 
 
-async def run_lien_pipeline(start_date: str = None, end_date: str = None, run_all: bool = False, mode: str = 'all'):
+async def run_lien_pipeline(start_date: str = None, end_date: str = None, run_all: bool = False, mode: str = 'all', county_id: str = "hillsborough"):
     """
     Execute the lien and judgment data collection pipeline.
     """
+    county_cfg = get_county_config(county_id)
+    clerk_access_url = county_cfg["urls"]["clerk_access"]
+
     logger.info("=" * 60)
-    logger.info("HILLSBOROUGH COUNTY LIEN & JUDGMENT RECORDS - DATA COLLECTION")
+    logger.info(f"{county_cfg['display_name'].upper()} LIEN & JUDGMENT RECORDS - DATA COLLECTION")
     logger.info("=" * 60)
 
     # Compute date range (YYYY-MM-DD → MM/DD/YYYY for site forms)
@@ -745,7 +751,7 @@ async def run_lien_pipeline(start_date: str = None, end_date: str = None, run_al
     try:
         if mode == 'combined':
             logger.info("Execution mode: COMBINED — single Playwright download, Python-side DocType routing")
-            combined_df = await _playwright_download_combined(start_str, end_str)
+            combined_df = await _playwright_download_combined(start_str, end_str, clerk_access_url=clerk_access_url)
             if combined_df is None:
                 logger.error("Combined download returned no data — check county site or date range")
                 return
@@ -930,6 +936,12 @@ if __name__ == "__main__":
         help="Run selected document types in parallel (faster but uses more API credits)"
     )
     add_load_to_db_arg(parser)
+    parser.add_argument(
+        "--county-id",
+        dest="county_id",
+        default="hillsborough",
+        help="County identifier (default: hillsborough)",
+    )
 
     args = parser.parse_args()
 
@@ -943,7 +955,7 @@ if __name__ == "__main__":
     MULTI_OUTPUT_MODES = {'all', 'combined'}
 
     try:
-        asyncio.run(run_lien_pipeline(start_date=args.start_date, end_date=args.end_date, run_all=args.all, mode=args.mode))
+        asyncio.run(run_lien_pipeline(start_date=args.start_date, end_date=args.end_date, run_all=args.all, mode=args.mode, county_id=args.county_id))
 
         if args.load_to_db:
             load_modes = list(MODE_DIR_MAP.keys()) if args.mode in MULTI_OUTPUT_MODES else [args.mode]

@@ -53,6 +53,13 @@ class AppSettings(BaseSettings):
 	stripe_price_lead_pack: Optional[str] = Field(default=None, env="STRIPE_PRICE_LEAD_PACK")
 	stripe_price_hot_lead_unlock: Optional[str] = Field(default=None, env="STRIPE_PRICE_HOT_LEAD_UNLOCK")
 
+	# Application base URL — used for Stripe return/success URLs
+	app_base_url: str = Field(
+		default="http://localhost:8000",
+		env="APP_BASE_URL",
+		description="Public base URL of this app (e.g. https://app.forcedaction.io)",
+	)
+
 	# Contact enrichment (M1)
 	batch_skip_tracing_api_key: Optional[SecretStr] = Field(default=None, env="BATCH_SKIP_TRACING_API_KEY")
 	idi_api_key: Optional[SecretStr] = Field(default=None, env="IDI_API_KEY")

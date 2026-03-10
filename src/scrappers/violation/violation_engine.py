@@ -683,7 +683,6 @@ async def main(args):
 						logger.info(f"Triggering CDS rescore for {len(affected_ids)} affected properties...")
 						try:
 							from src.services.cds_engine import MultiVerticalScorer
-							from src.core.database import get_db_context
 							with get_db_context() as score_session:
 								scorer = MultiVerticalScorer(score_session)
 								scorer.score_properties_by_ids(affected_ids, save_to_db=True)

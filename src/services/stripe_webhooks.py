@@ -18,6 +18,7 @@ from typing import Optional
 
 import stripe
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from config.settings import settings
@@ -31,7 +32,8 @@ from src.services.ghl_webhook import push_subscriber_to_ghl
 logger = logging.getLogger(__name__)
 
 
-def _stripe() -> bool:
+def _init_stripe() -> bool:
+    """Initialise Stripe API key. Returns False if not configured."""
     key = settings.stripe_secret_key
     if not key:
         logger.debug("STRIPE_SECRET_KEY not set — webhooks disabled")
@@ -44,29 +46,31 @@ def handle_webhook(raw_body: bytes, sig_header: str, db: Session) -> tuple[bool,
     """
     Verify and dispatch a Stripe webhook event.
 
-    Returns (success, message) — your route should return HTTP 200 on success,
-    400 on verification failure, and 200 (with logged error) on handler failure
-    so Stripe doesn't retry indefinitely.
+    Returns (success, message).
+    - Raises ValueError on signature verification failure (caller should return 400).
+    - Returns (True, "Handler error (logged): ...") on handler failure so Stripe
+      doesn't retry indefinitely for application-level errors.
+    - Raises SQLAlchemyError on DB infrastructure failure (caller should return 503).
     """
-    if not _stripe():
+    if not _init_stripe():
         return False, "Stripe not configured"
 
     secret = settings.stripe_webhook_secret
     if not secret:
-        return False, "STRIPE_WEBHOOK_SECRET not set"
+        raise ValueError("STRIPE_WEBHOOK_SECRET not set")
 
     try:
         event = stripe.Webhook.construct_event(
             raw_body, sig_header, secret.get_secret_value()
         )
-    except stripe.error.SignatureVerificationError as e:
-        logger.warning(f"Stripe webhook signature invalid: {e}")
-        return False, "Invalid signature"
+    except stripe.error.SignatureVerificationError as exc:
+        logger.warning("Stripe webhook signature invalid: %s", exc)
+        raise ValueError("Invalid signature") from exc
 
     event_type = event["type"]
     data = event["data"]["object"]
 
-    logger.info(f"Stripe webhook received: {event_type} id={event['id']}")
+    logger.info("Stripe webhook received: %s id=%s", event_type, event["id"])
 
     handlers = {
         "checkout.session.completed":    _on_checkout_completed,
@@ -78,17 +82,23 @@ def handle_webhook(raw_body: bytes, sig_header: str, db: Session) -> tuple[bool,
 
     handler = handlers.get(event_type)
     if handler is None:
-        logger.debug(f"Unhandled event type: {event_type}")
+        logger.debug("Unhandled Stripe event type: %s", event_type)
         return True, "Ignored"
 
     try:
         handler(data, db)
         db.commit()
         return True, "OK"
-    except Exception as e:
+    except (OperationalError, SQLAlchemyError):
         db.rollback()
-        logger.exception(f"Error handling {event_type}: {e}")
-        return True, f"Handler error (logged): {e}"  # 200 so Stripe doesn't retry
+        # Re-raise DB errors — let the caller return 503 so Stripe retries
+        logger.error("Database error handling %s — will retry", event_type, exc_info=True)
+        raise
+    except Exception as exc:
+        db.rollback()
+        logger.error("Error handling %s: %s", event_type, exc, exc_info=True)
+        # Return 200 so Stripe doesn't retry for application-level errors
+        return True, f"Handler error (logged): {exc}"
 
 
 # ---------------------------------------------------------------------------
@@ -111,13 +121,15 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
     is_founding = meta.get("is_founding") == "True"
     founding_price_id = meta.get("founding_price_id") or None
 
-    stripe_customer_id    = session.get("customer")
+    stripe_customer_id     = session.get("customer")
     stripe_subscription_id = session.get("subscription")
-    customer_email        = session.get("customer_details", {}).get("email")
-    customer_name         = session.get("customer_details", {}).get("name")
+    customer_email         = session.get("customer_details", {}).get("email")
+    customer_name          = session.get("customer_details", {}).get("name")
 
     if not all([tier, vertical, county_id, stripe_customer_id]):
-        logger.error(f"checkout.session.completed missing required metadata: {meta}")
+        logger.error(
+            "checkout.session.completed missing required metadata — skipping. meta=%s", meta
+        )
         return
 
     now = datetime.now(timezone.utc)
@@ -138,8 +150,9 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
             row.count += 1
             if row.count == 10:
                 logger.info(
-                    f"FOUNDING LIMIT REACHED: tier={tier} vertical={vertical} county={county_id} "
-                    f"— landing page will now show regular price"
+                    "FOUNDING LIMIT REACHED: tier=%s vertical=%s county=%s"
+                    " — landing page will now show regular price",
+                    tier, vertical, county_id,
                 )
 
     # ── Create or update Subscriber ────────────────────────────────────────
@@ -176,7 +189,14 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
             subscriber.founding_price_id = founding_price_id
             subscriber.rate_locked_at = now
 
-    db.flush()  # get subscriber.id
+    db.flush()  # get subscriber.id before ZIP territory inserts
+
+    if not subscriber.id:
+        logger.warning(
+            "checkout.session.completed: subscriber.id is None after flush for customer %s"
+            " — ZIP locking may fail if DB did not assign PK",
+            stripe_customer_id,
+        )
 
     # ── Lock ZIP territories (same transaction) ────────────────────────────
     for zip_code in zip_codes:
@@ -205,20 +225,25 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
             territory.grace_expires_at = None
         else:
             logger.warning(
-                f"ZIP {zip_code}/{vertical}/{county_id} already locked by "
-                f"subscriber {territory.subscriber_id} — skipping"
+                "ZIP %s/%s/%s already locked by subscriber %s — skipping",
+                zip_code, vertical, county_id, territory.subscriber_id,
             )
 
     # ── Push to GHL stage 5 ────────────────────────────────────────────────
     try:
         push_subscriber_to_ghl(subscriber, stage=5)
-    except Exception as e:
-        logger.error(f"GHL push failed for subscriber {subscriber.id}: {e}")
+    except Exception:
+        logger.error(
+            "GHL push failed for subscriber %s — continuing without CRM sync",
+            subscriber.id,
+            exc_info=True,
+        )
 
     logger.info(
-        f"checkout.session.completed: subscriber={subscriber.id} "
-        f"tier={tier} vertical={vertical} founding={is_founding} "
-        f"zips={zip_codes} feed_uuid={subscriber.event_feed_uuid}"
+        "checkout.session.completed: subscriber=%s tier=%s vertical=%s"
+        " founding=%s zips=%s feed_uuid=%s",
+        subscriber.id, tier, vertical, is_founding,
+        zip_codes, subscriber.event_feed_uuid,
     )
 
 
@@ -229,6 +254,7 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
 def _on_payment_succeeded(invoice: dict, db: Session) -> None:
     stripe_customer_id = invoice.get("customer")
     if not stripe_customer_id:
+        logger.warning("invoice.payment_succeeded: no customer ID in payload")
         return
 
     subscriber = db.execute(
@@ -236,14 +262,25 @@ def _on_payment_succeeded(invoice: dict, db: Session) -> None:
     ).scalar_one_or_none()
 
     if subscriber is None:
-        logger.warning(f"invoice.payment_succeeded: no subscriber for customer {stripe_customer_id}")
+        logger.warning(
+            "invoice.payment_succeeded: no subscriber for customer %s", stripe_customer_id
+        )
         return
 
-    period_end = invoice.get("lines", {}).get("data", [{}])[0].get("period", {}).get("end")
-    if period_end:
-        subscriber.billing_date = datetime.fromtimestamp(period_end, tz=timezone.utc)
+    try:
+        period_end = invoice.get("lines", {}).get("data", [{}])[0].get("period", {}).get("end")
+        if period_end:
+            subscriber.billing_date = datetime.fromtimestamp(period_end, tz=timezone.utc)
+    except (IndexError, TypeError, KeyError) as exc:
+        logger.warning(
+            "invoice.payment_succeeded: could not parse period.end for customer %s: %s",
+            stripe_customer_id, exc,
+        )
 
-    logger.info(f"invoice.payment_succeeded: subscriber={subscriber.id} billing_date={subscriber.billing_date}")
+    logger.info(
+        "invoice.payment_succeeded: subscriber=%s billing_date=%s",
+        subscriber.id, subscriber.billing_date,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +290,7 @@ def _on_payment_succeeded(invoice: dict, db: Session) -> None:
 def _on_payment_failed(invoice: dict, db: Session) -> None:
     stripe_customer_id = invoice.get("customer")
     if not stripe_customer_id:
+        logger.warning("invoice.payment_failed: no customer ID in payload")
         return
 
     subscriber = db.execute(
@@ -260,15 +298,23 @@ def _on_payment_failed(invoice: dict, db: Session) -> None:
     ).scalar_one_or_none()
 
     if subscriber is None:
-        logger.warning(f"invoice.payment_failed: no subscriber for customer {stripe_customer_id}")
+        logger.warning(
+            "invoice.payment_failed: no subscriber for customer %s", stripe_customer_id
+        )
         return
 
     try:
         push_subscriber_to_ghl(subscriber, stage=None, tags=["payment_failed"])
-    except Exception as e:
-        logger.error(f"GHL payment-failed tag push error: {e}")
+    except Exception:
+        logger.error(
+            "GHL payment-failed tag push error for subscriber %s",
+            subscriber.id,
+            exc_info=True,
+        )
 
-    logger.info(f"invoice.payment_failed: subscriber={subscriber.id} — GHL retry sequence queued")
+    logger.info(
+        "invoice.payment_failed: subscriber=%s — GHL retry sequence queued", subscriber.id
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +324,7 @@ def _on_payment_failed(invoice: dict, db: Session) -> None:
 def _on_subscription_updated(subscription: dict, db: Session) -> None:
     stripe_customer_id = subscription.get("customer")
     if not stripe_customer_id:
+        logger.warning("subscription.updated: no customer ID in payload")
         return
 
     subscriber = db.execute(
@@ -285,7 +332,9 @@ def _on_subscription_updated(subscription: dict, db: Session) -> None:
     ).scalar_one_or_none()
 
     if subscriber is None:
-        logger.warning(f"subscription.updated: no subscriber for customer {stripe_customer_id}")
+        logger.warning(
+            "subscription.updated: no subscriber for customer %s", stripe_customer_id
+        )
         return
 
     stripe_status = subscription.get("status")
@@ -302,8 +351,8 @@ def _on_subscription_updated(subscription: dict, db: Session) -> None:
     subscriber.stripe_subscription_id = subscription.get("id", subscriber.stripe_subscription_id)
 
     logger.info(
-        f"subscription.updated: subscriber={subscriber.id} "
-        f"stripe_status={stripe_status} → local_status={new_status}"
+        "subscription.updated: subscriber=%s stripe_status=%s → local_status=%s",
+        subscriber.id, stripe_status, new_status,
     )
 
 
@@ -321,6 +370,7 @@ def _on_subscription_deleted(subscription: dict, db: Session) -> None:
     """
     stripe_customer_id = subscription.get("customer")
     if not stripe_customer_id:
+        logger.warning("subscription.deleted: no customer ID in payload")
         return
 
     subscriber = db.execute(
@@ -328,7 +378,9 @@ def _on_subscription_deleted(subscription: dict, db: Session) -> None:
     ).scalar_one_or_none()
 
     if subscriber is None:
-        logger.warning(f"subscription.deleted: no subscriber for customer {stripe_customer_id}")
+        logger.warning(
+            "subscription.deleted: no subscriber for customer %s", stripe_customer_id
+        )
         return
 
     now = datetime.now(timezone.utc)
@@ -354,11 +406,16 @@ def _on_subscription_deleted(subscription: dict, db: Session) -> None:
 
     try:
         push_subscriber_to_ghl(subscriber, stage=7, tags=[churn_tag])
-    except Exception as e:
-        logger.error(f"GHL stage 7 push failed for subscriber {subscriber.id}: {e}")
+    except Exception:
+        logger.error(
+            "GHL stage 7 push failed for subscriber %s",
+            subscriber.id,
+            exc_info=True,
+        )
 
     logger.info(
-        f"subscription.deleted: subscriber={subscriber.id} "
-        f"founding={subscriber.founding_member} tag={churn_tag} "
-        f"grace_expires={grace_expires.isoformat()} zips_in_grace={len(territories)}"
+        "subscription.deleted: subscriber=%s founding=%s tag=%s"
+        " grace_expires=%s zips_in_grace=%d",
+        subscriber.id, subscriber.founding_member, churn_tag,
+        grace_expires.isoformat(), len(territories),
     )

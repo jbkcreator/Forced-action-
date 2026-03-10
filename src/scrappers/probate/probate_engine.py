@@ -33,6 +33,7 @@ from config.constants import (
 	DEFAULT_USER_AGENT,
 	REQUEST_TIMEOUT_DEFAULT,
 	REQUEST_TIMEOUT_LONG,
+	get_county_config,
 )
 from src.core.database import get_db_context
 from src.loaders.legal_proceedings import ProbateLoader
@@ -45,7 +46,7 @@ setup_logging()
 logger = get_logger(__name__)
 
 
-def download_latest_probate_filing(target_date: str = None) -> Path:
+def download_latest_probate_filing(target_date: str = None, county_id: str = "hillsborough") -> Path:
 	"""
 	Download the latest probate filing CSV from Hillsborough County Clerk.
 	
@@ -65,16 +66,20 @@ def download_latest_probate_filing(target_date: str = None) -> Path:
 		>>> csv_path = download_latest_probate_filing()
 		>>> print(f"Downloaded to: {csv_path}")
 	"""
-	logger.info(f"Fetching probate filings list from: {PROBATE_FILINGS_URL}")
-	
+	county_cfg = get_county_config(county_id)
+	probate_url = county_cfg["urls"]["probate"]
+	clerk_base_url = county_cfg["urls"]["clerk_base"]
+
+	logger.info(f"Fetching probate filings list from: {probate_url}")
+
 	try:
 		# Ensure download directory exists
 		RAW_PROBATE_DIR.mkdir(parents=True, exist_ok=True)
 		logger.debug(f"Ensured download directory exists: {RAW_PROBATE_DIR}")
-		
+
 		# Fetch the directory listing page
 		response = requests_get_with_retry(
-			PROBATE_FILINGS_URL,
+			probate_url,
 			headers={"User-Agent": DEFAULT_USER_AGENT},
 			timeout=REQUEST_TIMEOUT_DEFAULT,
 		)
@@ -146,9 +151,9 @@ def download_latest_probate_filing(target_date: str = None) -> Path:
 	try:
 		# Construct full URL
 		if latest_file.startswith("/"):
-			download_url = f"{HILLSCLERK_BASE_URL}{latest_file}"
+			download_url = f"{clerk_base_url}{latest_file}"
 		else:
-			download_url = f"{PROBATE_FILINGS_URL.rstrip('/')}/{latest_file}"
+			download_url = f"{probate_url.rstrip('/')}/{latest_file}"
 		
 		# Download the file
 		filename = Path(latest_file).name
@@ -296,7 +301,7 @@ def save_processed_probate(df: pd.DataFrame, output_filename: str = "probate_lea
 		raise
 
 
-def run_probate_pipeline(target_date: str = None):
+def run_probate_pipeline(target_date: str = None, county_id: str = "hillsborough"):
 	"""
 	Execute the complete probate data collection pipeline.
 	
@@ -315,14 +320,15 @@ def run_probate_pipeline(target_date: str = None):
 		>>> run_probate_pipeline()
 		# Logs progress and saves processed probate leads to data/processed/
 	"""
+	county_cfg = get_county_config(county_id)
 	logger.info("=" * 60)
-	logger.info("HILLSBOROUGH COUNTY PROBATE FILINGS - DATA COLLECTION")
+	logger.info(f"{county_cfg['display_name'].upper()} PROBATE FILINGS - DATA COLLECTION")
 	logger.info("=" * 60)
-	
+
 	try:
 		# Step 1: Download latest probate filing
 		logger.info("Step 1: Downloading latest probate filing")
-		csv_path = download_latest_probate_filing(target_date=target_date)
+		csv_path = download_latest_probate_filing(target_date=target_date, county_id=county_id)
 		
 		# Step 2: Process the data
 		logger.info("Step 2: Processing probate data")
@@ -351,11 +357,12 @@ if __name__ == "__main__":
 	
 	parser = argparse.ArgumentParser(description="Scrape Hillsborough County probate filings")
 	parser.add_argument("--date", type=str, default=None, help="Target date YYYY-MM-DD (default: latest)")
+	parser.add_argument("--county-id", dest="county_id", default="hillsborough", help="County identifier (default: hillsborough)")
 	add_load_to_db_arg(parser)
 	args = parser.parse_args()
-	
+
 	try:
-		run_probate_pipeline(target_date=args.date)
+		run_probate_pipeline(target_date=args.date, county_id=args.county_id)
 		
 		# Load to database if requested
 		if args.load_to_db:

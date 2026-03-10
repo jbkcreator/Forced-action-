@@ -31,6 +31,7 @@ from config.constants import (
 	RAW_PERMIT_DIR,
 	PROCESSED_DATA_DIR,
 	PERMIT_SEARCH_URL,
+	get_county_config,
 )
 from src.utils.logger import setup_logging, get_logger
 from src.utils.prompt_loader import get_prompt
@@ -58,6 +59,7 @@ async def scrape_permits_with_playwright(
 	end_date: str = None,
 	headless: bool = True,
 	debug: bool = False,
+	permit_url: str = PERMIT_SEARCH_URL,
 ) -> Optional[Path]:
 	"""
 	Primary Playwright scraper — deterministic, no AI credits consumed.
@@ -140,7 +142,7 @@ async def scrape_permits_with_playwright(
 
 		try:
 			# 1. Load the portal
-			await page.goto(PERMIT_SEARCH_URL, wait_until='domcontentloaded', timeout=60000)
+			await page.goto(permit_url, wait_until='domcontentloaded', timeout=60000)
 			await page.wait_for_timeout(2000)
 			await snap(page, "01_page_loaded")
 
@@ -387,6 +389,7 @@ async def scrape_permits_with_playwright(
 async def scrape_permits_with_browser_use(
 	start_date: str = None,
 	end_date: str = None,
+	permit_url: str = PERMIT_SEARCH_URL,
 ) -> Optional[Path]:
 	"""
 	AI-led table extraction method for permit records (fallback).
@@ -419,7 +422,7 @@ async def scrape_permits_with_browser_use(
 			task_instructions = get_prompt(
 				"permit_prompts.yaml",
 				"permit_search.task_template",
-				url=PERMIT_SEARCH_URL,
+				url=permit_url,
 				end_date=end_date_str,
 				start_date=start_date_str
 			)
@@ -608,6 +611,7 @@ async def run_permit_pipeline(
 	scraper: str = "auto",
 	headless: bool = True,
 	debug: bool = False,
+	county_id: str = "hillsborough",
 ):
 	"""
 	Execute the complete permit data collection pipeline.
@@ -622,8 +626,11 @@ async def run_permit_pipeline(
 	Raises:
 		Exception: Re-raises any exceptions after logging
 	"""
+	county_cfg = get_county_config(county_id)
+	permit_url = county_cfg["urls"]["permit"]
+
 	logger.info("=" * 60)
-	logger.info("HILLSBOROUGH COUNTY BUILDING PERMITS - DATA COLLECTION")
+	logger.info(f"{county_cfg['display_name'].upper()} BUILDING PERMITS - DATA COLLECTION")
 	logger.info("=" * 60)
 
 	try:
@@ -639,6 +646,7 @@ async def run_permit_pipeline(
 					file_path = await scrape_permits_with_playwright(
 						start_date=start_date, end_date=end_date,
 						headless=headless, debug=debug,
+						permit_url=permit_url,
 					)
 					if file_path is None:
 						# No results from site — retry (could be temporary)
@@ -671,6 +679,7 @@ async def run_permit_pipeline(
 			logger.info("Running browser-use AI scraper...")
 			file_path = await scrape_permits_with_browser_use(
 				start_date=start_date, end_date=end_date,
+				permit_url=permit_url,
 			)
 
 		if not file_path:
@@ -721,6 +730,12 @@ if __name__ == "__main__":
 		action="store_true",
 		help="Open a real browser window (requires: xvfb-run -a python -m ...)"
 	)
+	parser.add_argument(
+		"--county-id",
+		dest="county_id",
+		default="hillsborough",
+		help="County identifier (default: hillsborough)",
+	)
 	args = parser.parse_args()
 
 	if args.headful:
@@ -735,6 +750,7 @@ if __name__ == "__main__":
 			scraper=args.scraper,
 			headless=not args.headful,
 			debug=args.debug,
+			county_id=args.county_id,
 		))
 		
 		# Load to database if requested

@@ -25,6 +25,7 @@ import time
 from typing import Dict, List, Optional
 
 import requests
+from requests.exceptions import ConnectionError, Timeout, RequestException
 
 from config.settings import settings
 from config.scoring import ROUTING_THRESHOLDS
@@ -36,6 +37,7 @@ _GHL_HEADERS_BASE = {
     "Version": "2021-07-28",
     "Content-Type": "application/json",
 }
+_DEFAULT_TIMEOUT = 15  # seconds
 
 # Minimum score to push a lead to GHL — Medium stage is configured so include it
 _MIN_SCORE_TO_PUSH = ROUTING_THRESHOLDS["weekly"]  # 40
@@ -45,24 +47,49 @@ def _ghl_request(method: str, url: str, **kwargs) -> requests.Response:
     """
     Wrapper around requests that retries on 429 with exponential backoff.
     Adds a 0.5s base delay between every call to stay under rate limits.
+
+    Always sets a timeout — never hangs indefinitely.
+    Raises RequestException if all retries are exhausted due to network errors.
     """
+    kwargs.setdefault("timeout", _DEFAULT_TIMEOUT)
     time.sleep(0.5)  # baseline throttle — ~2 req/s sustained
+
+    last_exc: Optional[Exception] = None
+    resp: Optional[requests.Response] = None
+
     for attempt in range(4):
-        resp = requests.request(method, url, **kwargs)
+        try:
+            resp = requests.request(method, url, **kwargs)
+        except (ConnectionError, Timeout) as exc:
+            last_exc = exc
+            wait = 2 ** attempt
+            logger.warning(
+                "[GHL] Network error on %s %s (attempt %d/4) — retrying in %ds: %s",
+                method, url, attempt + 1, wait, exc,
+            )
+            time.sleep(wait)
+            continue
+
         if resp.status_code != 429:
             return resp
+
         wait = 2 ** attempt  # 1s, 2s, 4s, 8s
-        logger.debug(f"[GHL] 429 rate limit — retrying in {wait}s (attempt {attempt + 1})")
+        logger.debug("[GHL] 429 rate limit — retrying in %ds (attempt %d/4)", wait, attempt + 1)
         time.sleep(wait)
-    return resp  # return last response after exhausting retries
+
+    # Exhausted retries
+    if last_exc:
+        raise RequestException(
+            f"GHL request failed after 4 attempts: {method} {url}"
+        ) from last_exc
+
+    # resp is the last 429 response after retry exhaustion
+    return resp
 
 
 def _is_configured() -> bool:
     """Return True only if the minimum required GHL env vars are present."""
-    return bool(
-        settings.ghl_api_key is not None
-        and settings.ghl_location_id
-    )
+    return bool(settings.ghl_api_key is not None and settings.ghl_location_id)
 
 
 def _headers() -> Dict[str, str]:
@@ -101,24 +128,25 @@ def _find_contact_by_parcel(parcel_id: str) -> Optional[str]:
     Returns the contact ID if found, None otherwise.
     """
     try:
-        resp = _ghl_request("GET",
+        resp = _ghl_request(
+            "GET",
             f"{_GHL_BASE}/contacts/search",
             headers=_headers(),
             params={
                 "locationId": settings.ghl_location_id,
                 "query": parcel_id,
             },
-            timeout=10,
         )
         resp.raise_for_status()
         contacts = resp.json().get("contacts", [])
-        # Match only contacts whose parcel custom field matches exactly
         for c in contacts:
             for cf in c.get("customFields", []):
                 if cf.get("value") == parcel_id:
                     return c["id"]
-    except Exception as e:
-        logger.debug(f"[GHL] contact search by parcel failed: {e}")
+    except RequestException as exc:
+        logger.debug("[GHL] contact search by parcel failed (network): %s", exc)
+    except Exception:
+        logger.debug("[GHL] contact search by parcel failed", exc_info=True)
     return None
 
 
@@ -198,7 +226,6 @@ def _upsert_contact(score_data: Dict) -> Optional[str]:
         payload["email"] = email
 
     # Dedup priority: 1) stored GHL contact ID on property, 2) parcel ID search
-    # Phone-based dedup skipped — <1% of properties have phone data
     parcel_id = score_data.get("parcel_id") or ""
     existing_id = score_data.get("ghl_contact_id") or (
         _find_contact_by_parcel(parcel_id) if parcel_id else None
@@ -206,66 +233,78 @@ def _upsert_contact(score_data: Dict) -> Optional[str]:
 
     try:
         if existing_id:
-            # PUT does not accept locationId
             put_payload = {k: v for k, v in payload.items() if k != "locationId"}
-            resp = _ghl_request("PUT",
+            resp = _ghl_request(
+                "PUT",
                 f"{_GHL_BASE}/contacts/{existing_id}",
                 headers=_headers(),
                 json=put_payload,
-                timeout=10,
             )
         else:
-            resp = _ghl_request("POST",
+            resp = _ghl_request(
+                "POST",
                 f"{_GHL_BASE}/contacts/",
                 headers=_headers(),
                 json=payload,
-                timeout=10,
             )
-            # GHL returns 400 with meta.contactId when duplicate prevention is on —
-            # extract the existing contact ID and retry as a PUT
+            # GHL returns 400 with meta.contactId when duplicate prevention is on
             if resp.status_code == 400:
                 try:
                     dup_id = resp.json().get("meta", {}).get("contactId")
                 except Exception:
                     dup_id = None
                 if dup_id:
-                    logger.debug(f"[GHL] duplicate contact detected ({dup_id}), retrying as PUT")
+                    logger.debug("[GHL] duplicate contact detected (%s), retrying as PUT", dup_id)
                     put_payload = {k: v for k, v in payload.items() if k != "locationId"}
-                    resp = _ghl_request("PUT",
+                    resp = _ghl_request(
+                        "PUT",
                         f"{_GHL_BASE}/contacts/{dup_id}",
                         headers=_headers(),
                         json=put_payload,
-                        timeout=10,
                     )
                     existing_id = dup_id
+
         if not resp.ok:
             logger.warning(
-                f"[GHL] contact upsert HTTP {resp.status_code} for {score_data.get('parcel_id')}: "
-                f"{resp.text[:500]}"
+                "[GHL] contact upsert HTTP %d for %s: %s",
+                resp.status_code, score_data.get("parcel_id"), resp.text[:500],
             )
         resp.raise_for_status()
         contact = resp.json().get("contact", {})
         return contact.get("id") or existing_id
-    except Exception as e:
-        logger.warning(f"[GHL] contact upsert failed for {score_data.get('parcel_id')}: {e}")
+
+    except RequestException as exc:
+        logger.warning(
+            "[GHL] contact upsert network error for %s: %s",
+            score_data.get("parcel_id"), exc,
+        )
+        return None
+    except Exception:
+        logger.warning(
+            "[GHL] contact upsert failed for %s",
+            score_data.get("parcel_id"),
+            exc_info=True,
+        )
         return None
 
 
 def _find_opportunity_for_contact(contact_id: str) -> Optional[str]:
     """Return existing opportunity ID for a contact, or None."""
     try:
-        resp = _ghl_request("GET",
+        resp = _ghl_request(
+            "GET",
             f"{_GHL_BASE}/opportunities/search",
             headers=_headers(),
             params={"location_id": settings.ghl_location_id, "contact_id": contact_id},
-            timeout=10,
         )
-        if resp.status_code == 200:
-            opps = resp.json().get("opportunities", [])
-            if opps:
-                return opps[0].get("id")
-    except Exception as e:
-        logger.debug(f"[GHL] opportunity search failed: {e}")
+        resp.raise_for_status()
+        opps = resp.json().get("opportunities", [])
+        if opps:
+            return opps[0].get("id")
+    except RequestException as exc:
+        logger.debug("[GHL] opportunity search network error: %s", exc)
+    except Exception:
+        logger.debug("[GHL] opportunity search failed", exc_info=True)
     return None
 
 
@@ -281,8 +320,8 @@ def _upsert_opportunity(contact_id: str, score_data: Dict) -> bool:
     stage_id = _stage_id_for_urgency(score_data.get("urgency_level", ""))
     if not stage_id:
         logger.debug(
-            f"[GHL] No stage configured for urgency '{score_data.get('urgency_level')}'"
-            " — skipping opportunity"
+            "[GHL] No stage configured for urgency '%s' — skipping opportunity",
+            score_data.get("urgency_level"),
         )
         return False
 
@@ -307,25 +346,28 @@ def _upsert_opportunity(contact_id: str, score_data: Dict) -> bool:
     try:
         existing_opp_id = _find_opportunity_for_contact(contact_id)
         if existing_opp_id:
-            # PUT does not accept locationId or contactId
             put_payload = {k: v for k, v in payload.items() if k not in ("locationId", "contactId")}
-            resp = _ghl_request("PUT",
+            resp = _ghl_request(
+                "PUT",
                 f"{_GHL_BASE}/opportunities/{existing_opp_id}",
                 headers=_headers(),
                 json=put_payload,
-                timeout=10,
             )
         else:
-            resp = _ghl_request("POST",
+            resp = _ghl_request(
+                "POST",
                 f"{_GHL_BASE}/opportunities/",
                 headers=_headers(),
                 json=payload,
-                timeout=10,
             )
         resp.raise_for_status()
         return True
-    except Exception as e:
-        logger.warning(f"[GHL] opportunity upsert failed for {parcel_id}: {e}")
+
+    except RequestException as exc:
+        logger.warning("[GHL] opportunity upsert network error for %s: %s", parcel_id, exc)
+        return False
+    except Exception:
+        logger.warning("[GHL] opportunity upsert failed for %s", parcel_id, exc_info=True)
         return False
 
 
@@ -336,16 +378,9 @@ def push_lead_to_ghl(score_data: Dict) -> bool:
     Called automatically from cds_engine.save_score_to_database() for every
     lead that scores at or above the daily routing threshold (60).
 
-    Args:
-        score_data: The dict returned by MultiVerticalScorer.score_property().
-                    Must contain: property_id, parcel_id, address, owner_name,
-                    final_cds_score, lead_tier, urgency_level, vertical_scores,
-                    distress_types, signal_count.
-                    Optional: owner_phone, owner_email (enriched from Owner model).
-
-    Returns:
-        True if both contact upsert and opportunity creation succeeded.
-        False (silently) if GHL is not configured or any step fails.
+    Returns True if both contact upsert and opportunity creation succeeded.
+    Returns False (silently) if GHL is not configured or score is below threshold.
+    Raises nothing — all errors are logged internally.
     """
     if not _is_configured():
         logger.debug("[GHL] Not configured — skipping CRM push")
@@ -357,34 +392,40 @@ def push_lead_to_ghl(score_data: Dict) -> bool:
 
     parcel_id = score_data.get("parcel_id")
     logger.info(
-        f"[GHL] Pushing lead: {parcel_id} | score={final_score} "
-        f"| {score_data.get('lead_tier')} | {score_data.get('urgency_level')}"
+        "[GHL] Pushing lead: %s | score=%s | %s | %s",
+        parcel_id, final_score, score_data.get("lead_tier"), score_data.get("urgency_level"),
     )
 
     contact_id = _upsert_contact(score_data)
     if not contact_id:
-        logger.warning(f"[GHL] Failed to upsert contact for {parcel_id} — opportunity skipped")
+        logger.warning("[GHL] Failed to upsert contact for %s — opportunity skipped", parcel_id)
         return False
 
-    # Persist GHL contact ID back to property so future rescores update not duplicate
-    if contact_id and contact_id != score_data.get("ghl_contact_id"):
+    # Persist GHL contact ID back to property so future rescores update, not duplicate
+    if contact_id != score_data.get("ghl_contact_id"):
         try:
             from src.core.database import get_db_session
             from src.core.models import Property
             from datetime import datetime, timezone
             with get_db_session() as db:
-                prop = db.query(Property).filter(Property.id == score_data.get("property_id")).first()
+                prop = db.query(Property).filter(
+                    Property.id == score_data.get("property_id")
+                ).first()
                 if prop:
                     prop.gohighlevel_contact_id = contact_id
                     prop.sync_status = "synced"
                     prop.last_crm_sync = datetime.now(timezone.utc)
                     db.commit()
-        except Exception as e:
-            logger.debug(f"[GHL] Failed to save contact_id to property: {e}")
+        except Exception:
+            logger.warning(
+                "[GHL] Failed to save contact_id back to property %s",
+                score_data.get("parcel_id"),
+                exc_info=True,
+            )
 
     ok = _upsert_opportunity(contact_id, score_data)
     if ok:
-        logger.info(f"[GHL] Lead pushed successfully: {parcel_id}")
+        logger.info("[GHL] Lead pushed successfully: %s", parcel_id)
     return ok
 
 
@@ -400,15 +441,15 @@ def push_subscriber_to_ghl(subscriber, stage: Optional[int], tags: Optional[List
     stage=5 → Paid Subscriber (GHL_STAGE_PAID_SUBSCRIBER)
     stage=7 → Churned (GHL_STAGE_CHURNED)
     stage=None → tag-only update (e.g. payment_failed)
+
+    Returns True on success, False on any failure.
+    Raises nothing — all errors are logged internally.
     """
     if not _is_configured():
         return False
 
-    from config.settings import settings as _s
-
-    # ── Upsert contact ────────────────────────────────────────────────────
     contact_payload: Dict = {
-        "locationId": _s.ghl_location_id,
+        "locationId": settings.ghl_location_id,
         "email": subscriber.email or "",
         "name": subscriber.name or "",
         "tags": tags or [],
@@ -416,65 +457,96 @@ def push_subscriber_to_ghl(subscriber, stage: Optional[int], tags: Optional[List
 
     contact_id = subscriber.ghl_contact_id
 
-    if contact_id:
-        put_payload = {k: v for k, v in contact_payload.items() if k != "locationId"}
-        resp = _ghl_request(
-            "PUT",
-            f"{_GHL_BASE}/contacts/{contact_id}",
-            headers=_headers(),
-            json=put_payload,
-        )
-        if resp.status_code not in (200, 201):
-            logger.error(f"[GHL] Contact update failed {resp.status_code}: {resp.text[:200]}")
-            return False
-    else:
-        resp = _ghl_request(
-            "POST",
-            f"{_GHL_BASE}/contacts/",
-            headers=_headers(),
-            json=contact_payload,
-        )
-        if resp.status_code not in (200, 201):
-            logger.error(f"[GHL] Contact create failed {resp.status_code}: {resp.text[:200]}")
-            return False
-        contact_id = resp.json().get("contact", {}).get("id")
+    try:
         if contact_id:
-            subscriber.ghl_contact_id = contact_id
+            put_payload = {k: v for k, v in contact_payload.items() if k != "locationId"}
+            resp = _ghl_request(
+                "PUT",
+                f"{_GHL_BASE}/contacts/{contact_id}",
+                headers=_headers(),
+                json=put_payload,
+            )
+        else:
+            resp = _ghl_request(
+                "POST",
+                f"{_GHL_BASE}/contacts/",
+                headers=_headers(),
+                json=contact_payload,
+            )
+            contact_id = resp.json().get("contact", {}).get("id")
+            if contact_id:
+                subscriber.ghl_contact_id = contact_id
+
+        if not resp.ok:
+            logger.error(
+                "[GHL] Subscriber contact upsert failed %d: %s",
+                resp.status_code, resp.text[:200],
+            )
+            return False
+
+    except RequestException as exc:
+        logger.error(
+            "[GHL] Network error upserting subscriber contact (id=%s): %s",
+            getattr(subscriber, "id", "?"), exc,
+        )
+        return False
+    except Exception:
+        logger.error(
+            "[GHL] Unexpected error upserting subscriber contact (id=%s)",
+            getattr(subscriber, "id", "?"),
+            exc_info=True,
+        )
+        return False
 
     if not contact_id:
-        logger.error("[GHL] No contact_id after upsert")
+        logger.error(
+            "[GHL] No contact_id after subscriber upsert (id=%s)",
+            getattr(subscriber, "id", "?"),
+        )
         return False
 
     # ── Move to pipeline stage ────────────────────────────────────────────
     if stage is not None:
         stage_id_map = {
-            5: _s.ghl_stage_paid_subscriber,
-            7: _s.ghl_stage_churned,
+            5: settings.ghl_stage_paid_subscriber,
+            7: settings.ghl_stage_churned,
         }
         stage_id = stage_id_map.get(stage)
 
-        if stage_id and _s.ghl_pipeline_id:
+        if stage_id and settings.ghl_pipeline_id:
             opp_payload = {
-                "pipelineId": _s.ghl_pipeline_id,
-                "locationId": _s.ghl_location_id,
+                "pipelineId":      settings.ghl_pipeline_id,
+                "locationId":      settings.ghl_location_id,
                 "pipelineStageId": stage_id,
-                "contactId": contact_id,
-                "name": f"Subscriber — {subscriber.tier} / {subscriber.vertical}",
-                "status": "open" if stage == 5 else "lost",
-                "monetaryValue": {
-                    "starter": 600, "pro": 1100, "dominator": 2000
-                }.get(subscriber.tier, 0),
+                "contactId":       contact_id,
+                "name":            f"Subscriber — {subscriber.tier} / {subscriber.vertical}",
+                "status":          "open" if stage == 5 else "lost",
+                "monetaryValue":   {"starter": 600, "pro": 1100, "dominator": 2000}.get(
+                    subscriber.tier, 0
+                ),
             }
-            opp_resp = _ghl_request(
-                "POST",
-                f"{_GHL_BASE}/opportunities/",
-                headers=_headers(),
-                json=opp_payload,
-            )
-            if opp_resp.status_code not in (200, 201):
+            try:
+                opp_resp = _ghl_request(
+                    "POST",
+                    f"{_GHL_BASE}/opportunities/",
+                    headers=_headers(),
+                    json=opp_payload,
+                )
+                opp_resp.raise_for_status()
+            except RequestException as exc:
                 logger.warning(
-                    f"[GHL] Opportunity upsert failed {opp_resp.status_code}: {opp_resp.text[:200]}"
+                    "[GHL] Network error creating subscriber opportunity (stage=%s): %s",
+                    stage, exc,
+                )
+            except Exception:
+                logger.warning(
+                    "[GHL] Failed to create subscriber opportunity (stage=%s)",
+                    stage,
+                    exc_info=True,
                 )
 
-    logger.info(f"[GHL] Subscriber pushed: contact={contact_id} stage={stage} tags={tags}")
+    logger.info(
+        "[GHL] Subscriber pushed: contact=%s stage=%s tags=%s",
+        contact_id, stage, tags,
+    )
     return True

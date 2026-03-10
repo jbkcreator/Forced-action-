@@ -18,11 +18,12 @@ Founding rate is selected atomically at checkout and locked forever.
 """
 
 import logging
-import uuid
+import time
 from typing import Optional
 
 import stripe
-from sqlalchemy import select, text
+from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from config.settings import settings
@@ -94,7 +95,15 @@ def get_price_id_for_checkout(
     Returns (price_id, is_founding).
 
     Must be called inside an active DB transaction.
+    Raises ValueError for unknown tier or missing price config.
+    Raises OperationalError on DB failure (propagated to caller).
     """
+    prices = _price_ids()
+    if tier not in prices:
+        raise ValueError(
+            f"Unknown tier '{tier}'. Valid tiers: {list(prices.keys())}"
+        )
+
     # Lock the row for this tier/vertical/county
     stmt = (
         select(FoundingSubscriberCount)
@@ -105,7 +114,14 @@ def get_price_id_for_checkout(
         )
         .with_for_update()
     )
-    row = db.execute(stmt).scalar_one_or_none()
+    try:
+        row = db.execute(stmt).scalar_one_or_none()
+    except OperationalError:
+        logger.error(
+            "DB error reading founding count for tier=%s vertical=%s county=%s",
+            tier, vertical, county_id, exc_info=True,
+        )
+        raise
 
     if row is None:
         # First ever subscriber for this combo — create the row
@@ -116,11 +132,18 @@ def get_price_id_for_checkout(
             count=0,
         )
         db.add(row)
-        db.flush()
+        try:
+            db.flush()
+        except OperationalError:
+            logger.error(
+                "DB error creating founding count row for tier=%s vertical=%s county=%s",
+                tier, vertical, county_id, exc_info=True,
+            )
+            raise
 
     is_founding = row.count < FOUNDING_LIMIT
     price_key = "founding" if is_founding else "regular"
-    price_id = _price_ids()[tier][price_key]
+    price_id = prices[tier][price_key]
 
     if not price_id:
         raise ValueError(
@@ -129,8 +152,8 @@ def get_price_id_for_checkout(
         )
 
     logger.info(
-        f"Checkout price selected: tier={tier} vertical={vertical} county={county_id} "
-        f"founding={is_founding} count={row.count}/{FOUNDING_LIMIT}"
+        "Checkout price selected: tier=%s vertical=%s county=%s founding=%s count=%d/%d",
+        tier, vertical, county_id, is_founding, row.count, FOUNDING_LIMIT,
     )
     return price_id, is_founding
 
@@ -150,38 +173,57 @@ def create_subscription_checkout(
 
     Atomically selects founding vs regular price inside this call.
     Returns the session dict with url and session_id.
+    Raises RuntimeError if Stripe is not configured.
+    Raises ValueError for config/price issues.
+    Raises stripe.error.StripeError on Stripe API failure.
     """
     if not _init_stripe():
         raise RuntimeError("Stripe not configured")
 
     price_id, is_founding = get_price_id_for_checkout(db, tier, vertical, county_id)
 
-    session = stripe.checkout.Session.create(
-        mode="subscription",
-        payment_method_types=["card"],
-        customer_email=customer_email,
-        line_items=[{"price": price_id, "quantity": 1}],
-        success_url=success_url,
-        cancel_url=cancel_url,
-        metadata={
-            "tier": tier,
-            "vertical": vertical,
-            "county_id": county_id,
-            "zip_codes": ",".join(zip_codes),
-            "is_founding": str(is_founding),
-            "founding_price_id": price_id if is_founding else "",
-        },
-        subscription_data={
-            "metadata": {
+    try:
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            payment_method_types=["card"],
+            customer_email=customer_email,
+            line_items=[{"price": price_id, "quantity": 1}],
+            success_url=success_url,
+            cancel_url=cancel_url,
+            metadata={
                 "tier": tier,
                 "vertical": vertical,
                 "county_id": county_id,
+                "zip_codes": ",".join(zip_codes),
                 "is_founding": str(is_founding),
-            }
-        },
-    )
+                "founding_price_id": price_id if is_founding else "",
+            },
+            subscription_data={
+                "metadata": {
+                    "tier": tier,
+                    "vertical": vertical,
+                    "county_id": county_id,
+                    "is_founding": str(is_founding),
+                }
+            },
+        )
+    except stripe.error.InvalidRequestError as exc:
+        logger.warning("Stripe invalid request creating subscription checkout: %s", exc)
+        raise
+    except stripe.error.AuthenticationError:
+        logger.error("Stripe authentication failed — check STRIPE_SECRET_KEY", exc_info=True)
+        raise
+    except stripe.error.RateLimitError:
+        logger.warning("Stripe rate limit hit creating subscription checkout")
+        raise
+    except stripe.error.StripeError:
+        logger.error("Stripe error creating subscription checkout", exc_info=True)
+        raise
 
-    logger.info(f"Stripe checkout session created: {session.id} tier={tier} founding={is_founding}")
+    logger.info(
+        "Stripe checkout session created: %s tier=%s founding=%s",
+        session.id, tier, is_founding,
+    )
     return {
         "session_id": session.id,
         "url": session.url,
@@ -198,6 +240,9 @@ def create_lead_pack_checkout(
 ) -> dict:
     """
     One-time $99 lead pack — 5 leads, 72hr exclusivity, 15min delivery.
+    Raises RuntimeError if Stripe is not configured.
+    Raises ValueError if STRIPE_PRICE_LEAD_PACK is not set.
+    Raises stripe.error.StripeError on Stripe API failure.
     """
     if not _init_stripe():
         raise RuntimeError("Stripe not configured")
@@ -206,18 +251,31 @@ def create_lead_pack_checkout(
     if not price_lead_pack:
         raise ValueError("STRIPE_PRICE_LEAD_PACK not set in env")
 
-    session = stripe.checkout.Session.create(
-        mode="payment",
-        payment_method_types=["card"],
-        customer=subscriber_stripe_customer_id,
-        line_items=[{"price": price_lead_pack, "quantity": 1}],
-        success_url=success_url,
-        cancel_url=cancel_url,
-        metadata={
-            "product": "lead_pack",
-            "zip_code": zip_code,
-        },
-    )
+    try:
+        session = stripe.checkout.Session.create(
+            mode="payment",
+            payment_method_types=["card"],
+            customer=subscriber_stripe_customer_id,
+            line_items=[{"price": price_lead_pack, "quantity": 1}],
+            success_url=success_url,
+            cancel_url=cancel_url,
+            metadata={
+                "product": "lead_pack",
+                "zip_code": zip_code,
+            },
+        )
+    except stripe.error.InvalidRequestError as exc:
+        logger.warning(
+            "Stripe invalid request creating lead pack checkout for customer %s: %s",
+            subscriber_stripe_customer_id, exc,
+        )
+        raise
+    except stripe.error.StripeError:
+        logger.error(
+            "Stripe error creating lead pack checkout for customer %s",
+            subscriber_stripe_customer_id, exc_info=True,
+        )
+        raise
 
     return {"session_id": session.id, "url": session.url}
 
@@ -231,6 +289,9 @@ def create_hot_lead_unlock_link(
     Dynamic one-time Stripe payment link for hot lead unlock.
     $150 standard. Drops to $99 if unlock rate is low (reduced=True).
     Expires 48hr after creation.
+    Raises RuntimeError if Stripe is not configured.
+    Raises ValueError if required price env vars are not set.
+    Raises stripe.error.StripeError on Stripe API failure.
     """
     if not _init_stripe():
         raise RuntimeError("Stripe not configured")
@@ -239,23 +300,39 @@ def create_hot_lead_unlock_link(
     if not price_hot_lead_unlock:
         raise ValueError("STRIPE_PRICE_HOT_LEAD_UNLOCK not set in env")
 
+    if reduced and not settings.stripe_price_lead_pack:
+        raise ValueError("STRIPE_PRICE_LEAD_PACK not set in env (required for reduced rate)")
+
     # Use lead pack price ($99) as the reduced rate
     price = settings.stripe_price_lead_pack if reduced else price_hot_lead_unlock
 
-    session = stripe.checkout.Session.create(
-        mode="payment",
-        payment_method_types=["card"],
-        customer=subscriber_stripe_customer_id,
-        line_items=[{"price": price, "quantity": 1}],
-        success_url=f"https://app.forcedaction.io/leads/{lead_id}?unlocked=true",
-        cancel_url=f"https://app.forcedaction.io/leads/{lead_id}",
-        expires_at=int(__import__("time").time()) + 48 * 3600,  # 48hr expiry
-        metadata={
-            "product": "hot_lead_unlock",
-            "lead_id": lead_id,
-            "reduced_rate": str(reduced),
-        },
-    )
+    try:
+        session = stripe.checkout.Session.create(
+            mode="payment",
+            payment_method_types=["card"],
+            customer=subscriber_stripe_customer_id,
+            line_items=[{"price": price, "quantity": 1}],
+            success_url=f"{settings.app_base_url}/leads/{lead_id}?unlocked=true",
+            cancel_url=f"{settings.app_base_url}/leads/{lead_id}",
+            expires_at=int(time.time()) + 48 * 3600,  # 48hr expiry
+            metadata={
+                "product": "hot_lead_unlock",
+                "lead_id": lead_id,
+                "reduced_rate": str(reduced),
+            },
+        )
+    except stripe.error.InvalidRequestError as exc:
+        logger.warning(
+            "Stripe invalid request creating hot lead unlock for lead %s: %s",
+            lead_id, exc,
+        )
+        raise
+    except stripe.error.StripeError:
+        logger.error(
+            "Stripe error creating hot lead unlock for lead %s",
+            lead_id, exc_info=True,
+        )
+        raise
 
     return {"session_id": session.id, "url": session.url}
 
@@ -269,14 +346,22 @@ def get_founding_spots_remaining(
     """
     Returns how many founding spots remain for a tier/vertical/county.
     Used by the landing page /api/founding-spots endpoint.
+    Raises OperationalError on DB failure (propagated to caller).
     """
-    row = db.execute(
-        select(FoundingSubscriberCount).where(
-            FoundingSubscriberCount.tier == tier,
-            FoundingSubscriberCount.vertical == vertical,
-            FoundingSubscriberCount.county_id == county_id,
+    try:
+        row = db.execute(
+            select(FoundingSubscriberCount).where(
+                FoundingSubscriberCount.tier == tier,
+                FoundingSubscriberCount.vertical == vertical,
+                FoundingSubscriberCount.county_id == county_id,
+            )
+        ).scalar_one_or_none()
+    except OperationalError:
+        logger.error(
+            "DB error reading founding spots for tier=%s vertical=%s county=%s",
+            tier, vertical, county_id, exc_info=True,
         )
-    ).scalar_one_or_none()
+        raise
 
     if row is None:
         return FOUNDING_LIMIT

@@ -34,6 +34,7 @@ from config.constants import (
 	PROCESSED_DATA_DIR,
 	BROWSER_MODEL,
 	BROWSER_TEMPERATURE,
+	get_county_config,
 )
 from src.core.database import get_db_context
 from src.loaders.foreclosures import ForeclosureLoader
@@ -57,7 +58,7 @@ RAW_FORECLOSURE_DIR.mkdir(parents=True, exist_ok=True)
 PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def build_preview_url(auction_date: dt.date) -> str:
+def build_preview_url(auction_date: dt.date, base_url: str = REALFORECLOSE_BASE_URL) -> str:
 	"""
 	Build the RealForeclose calendar preview URL for a given auction date.
 
@@ -66,7 +67,7 @@ def build_preview_url(auction_date: dt.date) -> str:
 		'https://www.hillsborough.realforeclose.com/index.cfm?zaction=AUCTION&Zmethod=PREVIEW&AUCTIONDATE=02/19/2026'
 	"""
 	date_str = auction_date.strftime(AUCTION_DATE_FORMAT)
-	return f"{REALFORECLOSE_BASE_URL}?zaction=AUCTION&Zmethod=PREVIEW&AUCTIONDATE={date_str}"
+	return f"{base_url}?zaction=AUCTION&Zmethod=PREVIEW&AUCTIONDATE={date_str}"
 
 
 def _save_new_foreclosures(df: pd.DataFrame, auction_date: dt.date) -> Optional[Path]:
@@ -250,6 +251,7 @@ async def _extract_auction_item_playwright(item) -> Optional[dict]:
 async def scrape_foreclosures_with_playwright(
 	auction_date: dt.date,
 	debug: bool = False,
+	foreclosure_base_url: str = REALFORECLOSE_BASE_URL,
 ) -> Optional[Path]:
 	"""
 	Primary Playwright scraper — deterministic, no AI credits consumed.
@@ -270,7 +272,7 @@ async def scrape_foreclosures_with_playwright(
 	from playwright.async_api import async_playwright
 	from playwright_stealth import Stealth
 
-	preview_url = build_preview_url(auction_date)
+	preview_url = build_preview_url(auction_date, base_url=foreclosure_base_url)
 	logger.info(f"[Playwright] Scraping foreclosures for {auction_date}: {preview_url}")
 
 	debug_dir = Path("data/debug/playwright/foreclosures")
@@ -393,13 +395,14 @@ async def scrape_foreclosures_with_playwright(
 async def _scrape_with_ai(
 	auction_date: dt.date,
 	wait_after_scrape: int = 10,
+	foreclosure_base_url: str = REALFORECLOSE_BASE_URL,
 ) -> Optional[Path]:
 	"""
 	AI browser-use fallback scraper. Returns data via agent final_result() as JSON.
 	"""
 	import json
 
-	preview_url = build_preview_url(auction_date)
+	preview_url = build_preview_url(auction_date, base_url=foreclosure_base_url)
 	iso_date = auction_date.strftime("%Y-%m-%d")
 
 	try:
@@ -500,6 +503,7 @@ async def scrape_realforeclose_calendar(
 	auction_date: dt.date,
 	wait_after_scrape: int = 10,
 	scraper: str = "auto",
+	county_id: str = "hillsborough",
 ) -> Optional[Path]:
 	"""
 	Scrape RealForeclose auction calendar for a given date.
@@ -512,6 +516,9 @@ async def scrape_realforeclose_calendar(
 	Returns:
 		Path to deduplicated CSV of new records, or None if nothing new.
 	"""
+	county_cfg = get_county_config(county_id)
+	foreclosure_base_url = county_cfg["urls"]["foreclosure"]
+
 	csv_file = None
 	playwright_succeeded = False  # True = Playwright ran cleanly (even if no records)
 	MAX_PLAYWRIGHT_RETRIES = 5
@@ -521,7 +528,7 @@ async def scrape_realforeclose_calendar(
 		playwright_error = None
 		for attempt in range(1, MAX_PLAYWRIGHT_RETRIES + 1):
 			try:
-				csv_file = await scrape_foreclosures_with_playwright(auction_date)
+				csv_file = await scrape_foreclosures_with_playwright(auction_date, foreclosure_base_url=foreclosure_base_url)
 				playwright_succeeded = True
 				logger.info("Playwright scraping succeeded")
 				playwright_error = None
@@ -539,7 +546,7 @@ async def scrape_realforeclose_calendar(
 	# Only fall back to AI if Playwright raised on every attempt (didn't complete cleanly)
 	if scraper == "ai" or (scraper == "auto" and not playwright_succeeded):
 		logger.info("Running browser-use AI scraper...")
-		csv_file = await _scrape_with_ai(auction_date, wait_after_scrape)
+		csv_file = await _scrape_with_ai(auction_date, wait_after_scrape, foreclosure_base_url=foreclosure_base_url)
 
 	return csv_file
 
@@ -587,6 +594,12 @@ def main():
 		action="store_true",
 		help="Automatically load scraped data into database after scraping",
 	)
+	parser.add_argument(
+		"--county-id",
+		dest="county_id",
+		default="hillsborough",
+		help="County identifier (default: hillsborough)",
+	)
 
 	args = parser.parse_args()
 
@@ -601,6 +614,7 @@ def main():
 				auction_date=auction_date,
 				wait_after_scrape=args.wait,
 				scraper=args.scraper,
+				county_id=args.county_id,
 			)
 		)
 

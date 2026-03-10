@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>You're In — Forced Action</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+    * { font-family: 'Inter', sans-serif; }
+    .gradient-bg { background: linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #0f172a 100%); }
+    .checkmark { animation: pop 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards; }
+    @keyframes pop { 0% { transform: scale(0); opacity: 0; } 100% { transform: scale(1); opacity: 1; } }
+  </style>
+</head>
+<body class="gradient-bg min-h-screen text-white flex flex-col">
+
+  <!-- NAV -->
+  <nav class="border-b border-white/10 px-6 py-4">
+    <div class="max-w-6xl mx-auto flex items-center justify-between">
+      <span class="text-xl font-bold tracking-tight">Forced <span class="text-yellow-400">Action</span></span>
+      <span class="text-sm text-slate-400">Hillsborough County · Property Intelligence</span>
+    </div>
+  </nav>
+
+  <!-- MAIN -->
+  <main class="flex-1 flex items-center justify-center px-6 py-20">
+    <div class="max-w-lg w-full text-center">
+
+      <!-- Check icon -->
+      <div class="checkmark inline-flex items-center justify-center w-24 h-24 rounded-full bg-yellow-400/10 border-2 border-yellow-400 mb-8">
+        <svg class="w-12 h-12 text-yellow-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 13l4 4L19 7"/>
+        </svg>
+      </div>
+
+      <h1 class="text-4xl font-extrabold mb-4">You're In.</h1>
+      <p class="text-xl text-slate-300 mb-8">
+        Your founding rate is locked and your territory is reserved.<br/>
+        Your Event Feed is being set up now.
+      </p>
+
+      <!-- What happens next -->
+      <div class="bg-white/5 border border-white/10 rounded-2xl p-6 text-left mb-8 space-y-4">
+        <h2 class="font-bold text-lg text-center mb-4">What happens next</h2>
+
+        <div class="flex gap-4 items-start">
+          <span class="w-7 h-7 rounded-full bg-yellow-400/20 border border-yellow-400/40 text-yellow-400 text-xs font-bold flex items-center justify-center shrink-0 mt-0.5">1</span>
+          <div>
+            <p class="font-medium text-white">Check your email</p>
+            <p class="text-slate-400 text-sm mt-0.5">Your private Event Feed link will arrive within a few minutes. Keep it safe — it's your unique access link.</p>
+          </div>
+        </div>
+
+        <div class="flex gap-4 items-start">
+          <span class="w-7 h-7 rounded-full bg-yellow-400/20 border border-yellow-400/40 text-yellow-400 text-xs font-bold flex items-center justify-center shrink-0 mt-0.5">2</span>
+          <div>
+            <p class="font-medium text-white">First leads within 15 minutes</p>
+            <p class="text-slate-400 text-sm mt-0.5">Your feed will populate with scored, ranked leads from your locked ZIP territories almost immediately.</p>
+          </div>
+        </div>
+
+        <div class="flex gap-4 items-start">
+          <span class="w-7 h-7 rounded-full bg-yellow-400/20 border border-yellow-400/40 text-yellow-400 text-xs font-bold flex items-center justify-center shrink-0 mt-0.5">3</span>
+          <div>
+            <p class="font-medium text-white">New leads every morning</p>
+            <p class="text-slate-400 text-sm mt-0.5">Fresh intelligence scraped nightly — permits, storm events, insurance claims — delivered to your feed by 7 AM daily.</p>
+          </div>
+        </div>
+      </div>
+
+      <p class="text-slate-500 text-sm">
+        Questions? <a href="mailto:support@forcedaction.io" class="text-slate-400 hover:text-white transition">support@forcedaction.io</a>
+      </p>
+
+    </div>
+  </main>
+
+</body>
+</html>
