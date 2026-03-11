@@ -62,14 +62,19 @@ async def _download_calls_csv(portal_url: str = _FIRE_PORTAL_URL) -> Optional[Pa
     temp_dir = RAW_FIRE_DIR / "temp"
     temp_dir.mkdir(parents=True, exist_ok=True)
 
+    from src.utils.http_helpers import get_playwright_proxy
+
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
+            browser = await p.chromium.launch(
+                headless=True,
+                proxy=get_playwright_proxy(),
+            )
             context = await browser.new_context(accept_downloads=True)
             page = await context.new_page()
 
             logger.info("[fire] Navigating to %s", portal_url)
-            await page.goto(portal_url, timeout=30000, wait_until="networkidle")
+            await page.goto(portal_url, timeout=60000, wait_until="networkidle")
 
             # ── Step 1: set the Dojo Select widget value to "csv" ──────────────
             logger.info("[fire] Setting export type to CSV via Dojo widget")
@@ -91,7 +96,7 @@ async def _download_calls_csv(portal_url: str = _FIRE_PORTAL_URL) -> Optional[Pa
 
             # ── Step 2: click "Export Mapped Calls Only" and capture download ──
             logger.info("[fire] Clicking 'Export Mapped Calls Only'")
-            async with page.expect_download(timeout=60000) as dl_info:
+            async with page.expect_download(timeout=120000) as dl_info:
                 await page.click('#dijit_form_Button_3_label')
 
             download = await dl_info.value
@@ -119,20 +124,19 @@ def _filter_fire_rows(raw_csv: Path) -> Path:
     df = pd.read_csv(raw_csv, dtype=str).fillna("")
     logger.info("[fire] Raw CSV: %d rows, columns: %s", len(df), list(df.columns))
 
-    mask = df["Incident Type"].str.lower().apply(
-        lambda t: any(kw in t for kw in FIRE_INCIDENT_TYPES)
-    )
+    mask = df["Category"].str.lower().str.contains("fire", na=False)
     df_fire = df[mask].copy()
     logger.info("[fire] Fire rows: %d / %d total", len(df_fire), len(df))
 
-    filtered_path = raw_csv.parent / raw_csv.name.replace("_temp", "_fire_temp")
+    filtered_path = raw_csv.parent / f"{raw_csv.stem}_fire_filtered.csv"
     df_fire.to_csv(filtered_path, index=False)
 
-    # Remove the unfiltered raw file
-    try:
-        raw_csv.unlink()
-    except Exception:
-        pass
+    # Remove the unfiltered raw file (only if it's a different path)
+    if raw_csv != filtered_path:
+        try:
+            raw_csv.unlink()
+        except Exception:
+            pass
 
     return filtered_path
 

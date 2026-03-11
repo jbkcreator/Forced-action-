@@ -172,21 +172,24 @@ def scrape_insurance_claims(
                 )
             ).scalars().all()
 
+            # Pre-fetch all property IDs that already have a FEMA insurance_claim
+            # to avoid N+1 queries. FEMA data is cumulative so dedup on property+type only.
+            existing_ids = set(
+                r[0] for r in db.execute(
+                    select(Incident.property_id).where(
+                        and_(
+                            Incident.incident_type == "insurance_claim",
+                            Incident.county_id == county_id,
+                        )
+                    ).distinct()
+                ).fetchall()
+            )
+
             claim_date = date.today()
             fema_created = 0
             fema_skipped = 0
             for prop in properties:
-                existing = db.execute(
-                    select(Incident).where(
-                        and_(
-                            Incident.property_id == prop.id,
-                            Incident.incident_type == "insurance_claim",
-                            Incident.incident_date == claim_date,
-                        )
-                    )
-                ).scalars().first()
-
-                if existing:
+                if prop.id in existing_ids:
                     fema_skipped += 1
                     continue
 

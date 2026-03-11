@@ -289,6 +289,7 @@ class BaseLoader(ABC):
             '%m/%d/%Y %H:%M:%S %p',
             '%Y-%m-%d %H:%M:%S',
             '%m/%d/%Y %I:%M %p',
+            '%Y-%m-%d %I:%M %p',
         ]
         
         for fmt in date_formats:
