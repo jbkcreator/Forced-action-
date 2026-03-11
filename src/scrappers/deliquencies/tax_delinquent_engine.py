@@ -184,7 +184,6 @@ async def _playwright_download_tax_delinquent(
 		from src.utils.http_helpers import get_playwright_proxy
 		browser = await pw.chromium.launch(
 			headless=True,
-			proxy=get_playwright_proxy(),
 			args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
 		)
 		context = await browser.new_context(
@@ -312,7 +311,6 @@ async def _ai_download_tax_delinquent(
 		browser = Browser(
 			headless=True,
 			disable_security=True,
-			proxy=get_browser_use_proxy(),
 			user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
 			args=[
 				'--no-sandbox',
@@ -320,8 +318,6 @@ async def _ai_download_tax_delinquent(
 				'--disable-dev-shm-usage',
 				'--disable-gpu',
 				'--no-first-run',
-				'--no-zygote',
-				'--single-process',
 				'--disable-blink-features=AutomationControlled',
 				'--window-size=1920,1080',
 			]
