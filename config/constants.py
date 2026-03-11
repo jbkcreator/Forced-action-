@@ -39,6 +39,7 @@ RAW_TAX_DELINQUENCIES_DIR = RAW_DATA_DIR / "tax_delinquencies"
 RAW_MASTER_DIR = RAW_DATA_DIR / "master"
 RAW_JUDGMENTS_DIR = RAW_DATA_DIR / "judgments"
 RAW_DEEDS_DIR = RAW_DATA_DIR / "deeds"
+RAW_FIRE_DIR = RAW_DATA_DIR / "fire"
 
 # Temporary download directory for browser-use (cross-platform)
 TEMP_DOWNLOADS_DIR = Path(tempfile.gettempdir())

@@ -1,31 +1,36 @@
 """
-Fire Incident Reports — M1-F Scraper #3
+Fire / Calls-for-Service Scraper — HCSO GIS Portal
 
-Scrapes fire incident data from the Hillsborough County Fire Rescue
-public portal using Playwright. Creates Incident records (type='Fire')
-on matched properties.
+Downloads the current "Calls for Service" CSV from the Hillsborough County
+Sheriff's Office public GIS portal.  Fire-related rows are filtered after
+download using FIRE_INCIDENT_TYPES keywords.
 
-Portal: https://www.hcflgov.net/fire/incidents  (public, no login)
-Fallback: NFIRS public data download if portal is unavailable.
+Portal: https://gis.hcso.tampa.fl.us/publicgis/callsforservice/
+Export: Dojo Select → CSV  →  "Export Mapped Calls Only" button
 
 Entry point:
     scrape_fire_incidents(county_id, date_range)
 """
 
 import logging
-import re
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Optional, Tuple, List, Dict
 
+from config.constants import RAW_FIRE_DIR
 from src.core.database import get_db_context
 from src.core.models import Property, Incident
 from src.utils.county_config import get_county
+from src.utils.csv_deduplicator import deduplicate_csv, rotate_csv_archives
 from sqlalchemy import select, and_
 
 logger = logging.getLogger(__name__)
 
-# Hillsborough Fire Rescue public incident search portal
-_FIRE_PORTAL_URL = "https://www.hcflgov.net/fire/incidents"
+# HCSO Calls-for-Service public GIS portal
+_FIRE_PORTAL_URL = "https://gis.hcso.tampa.fl.us/publicgis/callsforservice/"
+
+# Dedup unique key — Report Number uniquely identifies each call
+_FIRE_DEDUP_KEY = ["Report Number"]
 
 # Fire incident type keywords to include (exclude medical, traffic)
 FIRE_INCIDENT_TYPES = [
@@ -39,74 +44,134 @@ FIRE_INCIDENT_TYPES = [
 ]
 
 
-async def _scrape_fire_portal_playwright(
-    start_date: date,
-    end_date: date,
-    county_id: str,
-) -> List[Dict]:
+async def _download_calls_csv(portal_url: str = _FIRE_PORTAL_URL) -> Optional[Path]:
     """
-    Playwright scraper for Hillsborough Fire Rescue incident portal.
-    Returns list of dicts with keys: address, incident_type, incident_date.
+    Opens the HCSO Calls-for-Service portal, sets the export dropdown to CSV,
+    clicks "Export Mapped Calls Only", and saves the raw file to a temp location
+    inside RAW_FIRE_DIR before deduplication.
+
+    Returns the Path to the raw downloaded CSV, or None on failure.
     """
     try:
         from playwright.async_api import async_playwright
     except ImportError:
-        logger.error("[fire] playwright not installed — run: pip install playwright")
-        return []
+        logger.error("[fire] playwright not installed — run: pip install playwright && playwright install chromium")
+        return None
 
-    records = []
-    config = get_county(county_id)
-    portal_url = config.get("portals", {}).get("fire_incidents_url", _FIRE_PORTAL_URL)
+    # Save raw download to temp/ inside the fire data dir
+    temp_dir = RAW_FIRE_DIR / "temp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
+            context = await browser.new_context(accept_downloads=True)
+            page = await context.new_page()
 
-            resp = await page.goto(portal_url, timeout=30000)
-            if resp and resp.status >= 400:
-                logger.warning("[fire] Portal returned HTTP %d — %s", resp.status, portal_url)
-                await browser.close()
-                return []
+            logger.info("[fire] Navigating to %s", portal_url)
+            await page.goto(portal_url, timeout=30000, wait_until="networkidle")
 
-            try:
-                await page.fill('input[name*="start"], input[id*="start"]',
-                                start_date.strftime("%m/%d/%Y"))
-                await page.fill('input[name*="end"], input[id*="end"]',
-                                end_date.strftime("%m/%d/%Y"))
-                await page.click('button[type="submit"], input[type="submit"]')
-                await page.wait_for_load_state("networkidle", timeout=15000)
-            except Exception:
-                pass  # portal may not have date filters; scrape current page
+            # ── Step 1: set the Dojo Select widget value to "csv" ──────────────
+            logger.info("[fire] Setting export type to CSV via Dojo widget")
+            await page.evaluate("""
+                () => {
+                    const widget = dijit.byId('dijit_form_Select_2');
+                    if (widget) {
+                        widget.set('value', 'csv');
+                    } else {
+                        const node = document.querySelector('#dijit_form_Select_2 input[type=hidden]');
+                        if (node) node.value = 'csv';
+                        const label = document.querySelector('#dijit_form_Select_2 .dijitSelectLabel');
+                        if (label) label.textContent = 'CSV';
+                    }
+                }
+            """)
 
-            rows = await page.query_selector_all("table tr")
-            for row in rows[1:]:  # skip header
-                cells = await row.query_selector_all("td")
-                if len(cells) < 3:
-                    continue
-                texts = [await c.inner_text() for c in cells]
-                incident_type = texts[1].strip().lower() if len(texts) > 1 else ""
-                if not any(kw in incident_type for kw in FIRE_INCIDENT_TYPES):
-                    continue
-                records.append({
-                    "address": texts[0].strip(),
-                    "incident_type": texts[1].strip(),
-                    "incident_date": _parse_date(texts[2].strip()),
-                })
+            await page.wait_for_timeout(500)
+
+            # ── Step 2: click "Export Mapped Calls Only" and capture download ──
+            logger.info("[fire] Clicking 'Export Mapped Calls Only'")
+            async with page.expect_download(timeout=60000) as dl_info:
+                await page.click('#dijit_form_Button_3_label')
+
+            download = await dl_info.value
+            save_path = temp_dir / (download.suggested_filename or "calls_for_service_temp.csv")
+            await download.save_as(str(save_path))
+            logger.info("[fire] Downloaded CSV → %s (%d bytes)", save_path, save_path.stat().st_size)
 
             await browser.close()
-    except Exception as e:
-        logger.warning("[fire] Playwright scrape failed: %s", e, exc_info=True)
+            return save_path
 
-    return records
+    except Exception as e:
+        logger.error("[fire] CSV download failed: %s", e, exc_info=True)
+        return None
+
+
+def _filter_fire_rows(raw_csv: Path) -> Path:
+    """
+    Read the raw downloaded CSV, keep only fire-related rows, and write a
+    filtered CSV back to temp/ for dedup processing.
+
+    Returns path to the filtered CSV.
+    """
+    import pandas as pd
+
+    df = pd.read_csv(raw_csv, dtype=str).fillna("")
+    logger.info("[fire] Raw CSV: %d rows, columns: %s", len(df), list(df.columns))
+
+    mask = df["Incident Type"].str.lower().apply(
+        lambda t: any(kw in t for kw in FIRE_INCIDENT_TYPES)
+    )
+    df_fire = df[mask].copy()
+    logger.info("[fire] Fire rows: %d / %d total", len(df_fire), len(df))
+
+    filtered_path = raw_csv.parent / raw_csv.name.replace("_temp", "_fire_temp")
+    df_fire.to_csv(filtered_path, index=False)
+
+    # Remove the unfiltered raw file
+    try:
+        raw_csv.unlink()
+    except Exception:
+        pass
+
+    return filtered_path
+
+
+async def _scrape_fire_portal_playwright(
+    start_date: date,
+    end_date: date,
+    county_id: str,
+) -> Optional[Path]:
+    """
+    Download → filter → deduplicate the Calls-for-Service CSV.
+    Returns the deduplicated CSV path in RAW_FIRE_DIR/new/, or None on failure.
+    """
+    config = get_county(county_id)
+    portal_url = config.get("portals", {}).get("fire_incidents_url", _FIRE_PORTAL_URL)
+
+    raw_csv = await _download_calls_csv(portal_url)
+    if not raw_csv:
+        return None
+
+    fire_csv = _filter_fire_rows(raw_csv)
+
+    today = date.today().strftime("%Y%m%d")
+    deduped_path = deduplicate_csv(
+        new_csv_path=fire_csv,
+        destination_dir=RAW_FIRE_DIR,
+        unique_key_columns=_FIRE_DEDUP_KEY,
+        output_filename=f"fire_calls_{today}.csv",
+        keep_original=False,
+    )
+    return deduped_path
 
 
 def _parse_date(date_str: str) -> Optional[date]:
     """Parse common date formats from portal."""
-    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m-%d-%Y"):
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m-%d-%Y", "%m/%d/%Y %H:%M:%S"):
         try:
             from datetime import datetime
-            return datetime.strptime(date_str, fmt).date()
+            return datetime.strptime(date_str.split()[0], fmt.split()[0]).date()
         except ValueError:
             continue
     return date.today()
@@ -131,11 +196,13 @@ def scrape_fire_incidents(
     date_range: Optional[Tuple[date, date]] = None,
 ) -> int:
     """
-    Scrape fire incidents from the county portal and create Incident records.
+    Scrape fire incidents from the HCSO Calls-for-Service portal and create
+    Incident records.  Follows the standard CSV dedup/rotation pattern.
 
     Args:
         county_id:  County to process.
-        date_range: (start_date, end_date). Defaults to last 7 days.
+        date_range: Unused (portal exports current mapped calls only); kept for
+                    interface compatibility.
 
     Returns:
         Number of new Incident records created.
@@ -148,35 +215,31 @@ def scrape_fire_incidents(
     else:
         start_date, end_date = date_range
 
-    raw_records = asyncio.run(
+    deduped_csv = asyncio.run(
         _scrape_fire_portal_playwright(start_date, end_date, county_id)
     )
 
+    if not deduped_csv or not deduped_csv.exists():
+        logger.warning("[fire] No deduplicated CSV produced — nothing to load")
+        return 0
+
+    import pandas as pd
+    df = pd.read_csv(deduped_csv, dtype=str).fillna("")
+    logger.info("[fire] Loading %d new fire records to DB", len(df))
+
     created = 0
     skipped_no_match = 0
-    skipped_duplicate = 0
 
     with get_db_context() as db:
-        for rec in raw_records:
-            property_id = _match_property(db, rec["address"], county_id)
+        for _, row in df.iterrows():
+            address = row.get("Address", "").strip()
+            incident_type = row.get("Incident Type", "Fire").strip()
+            date_str = row.get("Incident Start Date", "").strip()
+            incident_date = _parse_date(date_str) if date_str else date.today()
+
+            property_id = _match_property(db, address, county_id)
             if not property_id:
                 skipped_no_match += 1
-                continue
-
-            incident_date = rec.get("incident_date") or date.today()
-
-            existing = db.execute(
-                select(Incident).where(
-                    and_(
-                        Incident.property_id == property_id,
-                        Incident.incident_type == "Fire",
-                        Incident.incident_date == incident_date,
-                    )
-                )
-            ).scalar_one_or_none()
-
-            if existing:
-                skipped_duplicate += 1
                 continue
 
             incident = Incident(
@@ -191,9 +254,13 @@ def scrape_fire_incidents(
         db.commit()
 
     logger.info(
-        "[fire] %s %s→%s: created=%d no_match=%d duplicate=%d",
-        county_id, start_date, end_date, created, skipped_no_match, skipped_duplicate,
+        "[fire] %s: created=%d no_match=%d",
+        county_id, created, skipped_no_match,
     )
+
+    # Rotate CSV archives after successful DB load
+    rotate_csv_archives(RAW_FIRE_DIR)
+
     return created
 
 
@@ -204,7 +271,7 @@ if __name__ == "__main__":
         format="%(asctime)s %(levelname)s %(message)s",
     )
     parser = argparse.ArgumentParser(description="Scrape fire incidents")
-    parser.add_argument("--county-id", dest="county_id", default="hillsborough", help="County identifier (default: hillsborough)")
+    parser.add_argument("--county-id", dest="county_id", default="hillsborough")
     args = parser.parse_args()
     n = scrape_fire_incidents(county_id=args.county_id)
     print(f"Done — {n} fire incidents created")

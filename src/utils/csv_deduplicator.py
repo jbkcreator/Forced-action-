@@ -33,6 +33,7 @@ UNIQUE_KEY_MAP = {
     'bankruptcy': ['Docket Number'],
     'tax': ['Account Number'],
     'deeds': ['Instrument'],
+    'fire': ['Report Number'],
 }
 
 # Raw source file patterns to exclude from deduplication checks
