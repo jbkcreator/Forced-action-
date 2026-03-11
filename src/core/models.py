@@ -811,3 +811,147 @@ class EnrichedContact(Base):
 
     def __repr__(self):
         return f"<EnrichedContact(id={self.id}, property_id={self.property_id}, source='{self.source}', match={self.match_success})>"
+
+
+# ============================================================================
+# 6. OPERATIONAL TELEMETRY
+# ============================================================================
+
+class ScraperRunStats(Base):
+    """
+    Daily scraper run statistics per source type.
+
+    One row per (run_date, source_type, county_id).
+    All lien subtypes are broken out individually rather than grouped
+    under a single 'liens' bucket, giving per-type visibility.
+
+    source_type values:
+      Liens       → 'lien_tcl', 'lien_ccl', 'lien_hoa', 'lien_ml', 'lien_tl'
+      Judgments   → 'judgments'
+      Deeds       → 'deeds'
+      Evictions   → 'evictions'
+      Probate     → 'probate'
+      Bankruptcy  → 'bankruptcy'
+      Violations  → 'violations'
+      Foreclosures→ 'foreclosures'
+      Permits     → 'permits'
+      Tax Deliq.  → 'tax_delinquencies'
+      Roofing     → 'roofing_permits'
+      Storm       → 'storm_damage'
+      Flood       → 'flood_damage'
+      Insurance   → 'insurance_claims'
+      Fire        → 'fire_incidents'
+    """
+    __tablename__ = "scraper_run_stats"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+
+    # Identity
+    run_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    source_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False, default='hillsborough', index=True)
+
+    # Core counts
+    total_scraped: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    matched: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    unmatched: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    skipped: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    scored: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    # Run metadata
+    run_success: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    error_message: Mapped[Optional[str]] = mapped_column(Text)
+    duration_seconds: Mapped[Optional[float]] = mapped_column(Numeric(10, 2))
+
+    # Audit
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("run_date", "source_type", "county_id", name="uq_scraper_run_stats"),
+        Index("idx_run_stats_date_source", "run_date", "source_type"),
+        CheckConstraint(
+            "source_type IN ("
+            "'lien_tcl', 'lien_ccl', 'lien_hoa', 'lien_ml', 'lien_tl',"
+            "'judgments', 'deeds', 'evictions', 'probate', 'bankruptcy',"
+            "'violations', 'foreclosures', 'permits', 'tax_delinquencies',"
+            "'roofing_permits', 'storm_damage', 'flood_damage', 'insurance_claims', 'fire_incidents'"
+            ")",
+            name="check_run_stats_source_type",
+        ),
+    )
+
+    def __repr__(self):
+        return (
+            f"<ScraperRunStats(date={self.run_date}, source='{self.source_type}', "
+            f"scraped={self.total_scraped}, matched={self.matched})>"
+        )
+
+
+class PlatformDailyStats(Base):
+    """
+    Platform-level daily health metrics — one row per (run_date, county_id).
+
+    Aggregates across all scrapers and CDS runs to give a single daily summary:
+      - signals_*       : totals rolled up from scraper_run_stats at write time
+      - properties_*    : CDS engine throughput for this run
+      - leads_*         : new / updated / qualified counts from distress_scores
+      - tier_*          : count of properties at each tier after today's run
+
+    Written by the CDS engine at the end of each score_all_properties batch.
+    Uses upsert (ON CONFLICT DO UPDATE) so partial/retry runs accumulate safely.
+    """
+    __tablename__ = "platform_daily_stats"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+
+    # Identity
+    run_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False, default='hillsborough', index=True)
+
+    # ── Signal pipeline (rolled up from scraper_run_stats) ────────────────────
+    signals_scraped: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    signals_matched: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    signals_skipped: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    # ── CDS scoring ───────────────────────────────────────────────────────────
+    properties_scored: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    properties_with_signals: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    score_runs_total: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    # ── Lead output ───────────────────────────────────────────────────────────
+    leads_new: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    leads_updated: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    leads_unchanged: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    leads_qualified: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    leads_upgraded: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    # ── Tier snapshot (properties at each tier in today's batch) ─────────────
+    tier_ultra_platinum: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    tier_platinum: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    tier_gold: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    tier_silver: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    tier_bronze: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    # Audit
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint("run_date", "county_id", name="uq_platform_daily_stats"),
+        Index("idx_platform_stats_date", "run_date"),
+    )
+
+    def __repr__(self):
+        return (
+            f"<PlatformDailyStats(date={self.run_date}, scored={self.properties_scored}, "
+            f"leads_new={self.leads_new}, qualified={self.leads_qualified})>"
+        )

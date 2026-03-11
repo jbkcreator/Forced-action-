@@ -37,6 +37,8 @@ class AppSettings(BaseSettings):
 	# M1 subscriber pipeline stages
 	ghl_stage_paid_subscriber: Optional[str] = Field(default=None, env="GHL_STAGE_PAID_SUBSCRIBER")   # stage 5
 	ghl_stage_churned: Optional[str] = Field(default=None, env="GHL_STAGE_CHURNED")                   # stage 7
+	# Set to false to disable all GHL pushes (e.g. bulk rescores)
+	ghl_push_enabled: bool = Field(default=True, env="GHL_PUSH_ENABLED")
 
 	# Stripe (M1)
 	stripe_secret_key: Optional[SecretStr] = Field(default=None, env="STRIPE_SECRET_KEY")

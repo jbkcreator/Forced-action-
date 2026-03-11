@@ -55,17 +55,26 @@ class LienLoader(BaseLoader):
                 logger.info(f"No document_type column, using first {len(df)} records")
         
         logger.info(f"Loading {len(df)} liens/judgments")
-        
+
         matched = 0
         unmatched = 0
         skipped = 0
-        
+
+        # Per-document_type counts exposed for scraper_run_stats telemetry
+        # Structure: { document_type_label: {total, matched, unmatched, skipped} }
+        self.stats_by_doc_type: dict = {}
+
         for _, row in df.iterrows():
             instrument = str(row['Instrument']).strip()
-            
+            _doc_type_label = str(row.get('document_type', 'UNKNOWN')).strip()
+            if _doc_type_label not in self.stats_by_doc_type:
+                self.stats_by_doc_type[_doc_type_label] = {'total': 0, 'matched': 0, 'unmatched': 0, 'skipped': 0}
+            self.stats_by_doc_type[_doc_type_label]['total'] += 1
+
             # Check for duplicates
             if skip_duplicates and self.check_duplicate(LegalAndLien, {'instrument_number': instrument}):
                 logger.debug(f"Skipping duplicate lien: {instrument}")
+                self.stats_by_doc_type[_doc_type_label]['skipped'] += 1
                 skipped += 1
                 continue
             
@@ -156,15 +165,19 @@ class LienLoader(BaseLoader):
                     
                     if self.safe_add(lien_record):
                         matched += 1
+                        self.stats_by_doc_type[_doc_type_label]['matched'] += 1
                     else:
                         unmatched += 1
+                        self.stats_by_doc_type[_doc_type_label]['unmatched'] += 1
 
                 except Exception as e:
                     logger.error(f"Error building lien {instrument}: {e}")
                     unmatched += 1
+                    self.stats_by_doc_type[_doc_type_label]['unmatched'] += 1
             else:
                 logger.debug(f"No property match for lien: {instrument} (Grantor: {row.get('Grantor')})")
                 unmatched += 1
+                self.stats_by_doc_type[_doc_type_label]['unmatched'] += 1
         
         logger.info(f"Liens/Judgments: {matched} matched, {unmatched} unmatched, {skipped} skipped")
         return matched, unmatched, skipped

@@ -43,13 +43,15 @@ BuildingPermit  → building_permits
 
 import logging
 import sys
+from collections import Counter
 from datetime import datetime, date, timezone
 from typing import Dict, List, Optional
 
 from src.services.ghl_webhook import push_lead_to_ghl
+from config.settings import settings
 
-# Set to False via --no-ghl CLI flag to suppress GHL pushes during bulk runs
-_GHL_PUSH_ENABLED = True
+# Can be overridden at runtime via --no-ghl CLI flag; default comes from GHL_PUSH_ENABLED env var
+_GHL_PUSH_ENABLED: bool = settings.ghl_push_enabled
 
 from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session, joinedload
@@ -59,6 +61,8 @@ from src.core.models import (
     Owner,
     Financial,
     Property,
+    PlatformDailyStats,
+    ScraperRunStats,
 )
 from config.scoring import (
     ABSENTEE_BONUS,
@@ -784,7 +788,7 @@ class MultiVerticalScorer:
 
     # ── Database persistence ───────────────────────────────────────────────────
 
-    def save_score_to_database(self, score_data: Dict, upsert: bool = True) -> Optional[DistressScore]:
+    def save_score_to_database(self, score_data: Dict, upsert: bool = True):
         """
         UPSERT a DistressScore record.
 
@@ -792,7 +796,10 @@ class MultiVerticalScorer:
         - If not, check the most recent score; if unchanged → skip.
         - Otherwise → create new record.
 
-        Returns the DistressScore record, or None if skipped (unchanged).
+        Returns a tuple (record_or_None, status) where status is one of:
+            'new'       — first-ever score for this property today
+            'updated'   — existing today's record was refreshed
+            'unchanged' — score identical to last recorded; skipped
         Raises SQLAlchemyError on DB failure — caller must handle rollback.
         """
         from sqlalchemy import cast, Date as SADate
@@ -822,6 +829,7 @@ class MultiVerticalScorer:
             except (TypeError, ValueError):
                 prev_score = 0.0
 
+            prev_tier = existing.lead_tier
             score_changed = prev_score != float(final_score)
             existing.score_date      = datetime.now(timezone.utc)
             existing.final_cds_score = final_score
@@ -845,7 +853,13 @@ class MultiVerticalScorer:
                         score_data.get("parcel_id"), final_score, lead_tier,
                         exc_info=True,
                     )
-            return existing
+            # Detect tier upgrade for stats (tiers ordered best→worst)
+            _TIER_ORDER = ["Ultra Platinum", "Platinum", "Gold", "Silver", "Bronze"]
+            upgraded = (
+                prev_tier in _TIER_ORDER and lead_tier in _TIER_ORDER
+                and _TIER_ORDER.index(lead_tier) < _TIER_ORDER.index(prev_tier)
+            )
+            return existing, 'updated', upgraded
 
         # Check most recent score to avoid accumulating identical rows
         latest = self.session.query(DistressScore).filter(
@@ -862,7 +876,7 @@ class MultiVerticalScorer:
                 "Score unchanged for property %s: %.2f — skipping",
                 score_data.get("parcel_id"), final_score,
             )
-            return None
+            return None, 'unchanged', False
 
         record = DistressScore(
             property_id=property_id,
@@ -892,7 +906,7 @@ class MultiVerticalScorer:
                     score_data.get("parcel_id"), final_score, lead_tier,
                     exc_info=True,
                 )
-        return record
+        return record, 'new', False
 
     # ── Batch scoring ──────────────────────────────────────────────────────────
 
@@ -941,10 +955,14 @@ class MultiVerticalScorer:
         logger.info("Scoring %d properties across 6 verticals...", len(properties))
 
         scores: List[Dict] = []
-        saved_count    = 0
+        new_count       = 0
+        updated_count   = 0
         unchanged_count = 0
+        upgraded_count  = 0
         no_signal_count = 0
-        failed_count   = 0
+        failed_count    = 0
+        qualified_count = 0
+        tier_counts: Counter = Counter()
 
         for prop in properties:
             try:
@@ -956,11 +974,18 @@ class MultiVerticalScorer:
                     continue
 
                 if save_to_db:
-                    result = self.save_score_to_database(score_data)
-                    if result is None:
-                        unchanged_count += 1
+                    _record, status, upgraded = self.save_score_to_database(score_data)
+                    if status == 'new':
+                        new_count += 1
+                    elif status == 'updated':
+                        updated_count += 1
                     else:
-                        saved_count += 1
+                        unchanged_count += 1
+                    if upgraded:
+                        upgraded_count += 1
+                    if score_data.get("qualified"):
+                        qualified_count += 1
+                    tier_counts[score_data["lead_tier"]] += 1
 
             except SQLAlchemyError as exc:
                 # DB error mid-batch: roll back the failed unit so the session
@@ -984,16 +1009,114 @@ class MultiVerticalScorer:
 
         if save_to_db:
             logger.info(
-                "Scoring complete — %d saved, %d unchanged, %d no signals, %d failed",
-                saved_count, unchanged_count, no_signal_count, failed_count,
+                "Scoring complete — %d new, %d updated, %d unchanged, %d no signals, %d failed",
+                new_count, updated_count, unchanged_count, no_signal_count, failed_count,
             )
             if failed_count:
                 logger.warning(
                     "%d properties failed to score — check logs above for details",
                     failed_count,
                 )
+            # Persist platform-level daily stats
+            try:
+                self._record_platform_stats(
+                    properties_scored=len(scores),
+                    properties_with_signals=len(scores) - no_signal_count,
+                    score_runs_total=new_count + updated_count + unchanged_count,
+                    leads_new=new_count,
+                    leads_updated=updated_count,
+                    leads_unchanged=unchanged_count,
+                    leads_qualified=qualified_count,
+                    leads_upgraded=upgraded_count,
+                    tier_counts=tier_counts,
+                )
+            except Exception as stats_err:
+                logger.warning("⚠ Could not record platform daily stats (non-critical): %s", stats_err)
 
         return scores
+
+    def _record_platform_stats(
+        self,
+        properties_scored: int,
+        properties_with_signals: int,
+        score_runs_total: int,
+        leads_new: int,
+        leads_updated: int,
+        leads_unchanged: int,
+        leads_qualified: int,
+        leads_upgraded: int,
+        tier_counts: "Counter",
+        county_id: str = 'hillsborough',
+    ) -> None:
+        """
+        Upsert a row in platform_daily_stats for today.
+
+        Signal totals (signals_scraped/matched/skipped) are pulled live from
+        scraper_run_stats for today so they reflect all scrapers that have run,
+        regardless of whether they ran before or after the CDS engine.
+        """
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+        from sqlalchemy import func
+
+        today = date.today()
+
+        # Roll up signal counts from scraper_run_stats for today
+        signal_row = self.session.query(
+            func.coalesce(func.sum(ScraperRunStats.total_scraped), 0).label('scraped'),
+            func.coalesce(func.sum(ScraperRunStats.matched), 0).label('matched'),
+            func.coalesce(func.sum(ScraperRunStats.skipped), 0).label('skipped'),
+        ).filter(
+            ScraperRunStats.run_date == today,
+            ScraperRunStats.county_id == county_id,
+        ).one()
+
+        stmt = pg_insert(PlatformDailyStats).values(
+            run_date=today,
+            county_id=county_id,
+            signals_scraped=int(signal_row.scraped),
+            signals_matched=int(signal_row.matched),
+            signals_skipped=int(signal_row.skipped),
+            properties_scored=properties_scored,
+            properties_with_signals=properties_with_signals,
+            score_runs_total=score_runs_total,
+            leads_new=leads_new,
+            leads_updated=leads_updated,
+            leads_unchanged=leads_unchanged,
+            leads_qualified=leads_qualified,
+            leads_upgraded=leads_upgraded,
+            tier_ultra_platinum=tier_counts.get('Ultra Platinum', 0),
+            tier_platinum=tier_counts.get('Platinum', 0),
+            tier_gold=tier_counts.get('Gold', 0),
+            tier_silver=tier_counts.get('Silver', 0),
+            tier_bronze=tier_counts.get('Bronze', 0),
+        ).on_conflict_do_update(
+            constraint='uq_platform_daily_stats',
+            set_=dict(
+                signals_scraped=int(signal_row.scraped),
+                signals_matched=int(signal_row.matched),
+                signals_skipped=int(signal_row.skipped),
+                properties_scored=properties_scored,
+                properties_with_signals=properties_with_signals,
+                score_runs_total=score_runs_total,
+                leads_new=leads_new,
+                leads_updated=leads_updated,
+                leads_unchanged=leads_unchanged,
+                leads_qualified=leads_qualified,
+                leads_upgraded=leads_upgraded,
+                tier_ultra_platinum=tier_counts.get('Ultra Platinum', 0),
+                tier_platinum=tier_counts.get('Platinum', 0),
+                tier_gold=tier_counts.get('Gold', 0),
+                tier_silver=tier_counts.get('Silver', 0),
+                tier_bronze=tier_counts.get('Bronze', 0),
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+        self.session.execute(stmt)
+        self.session.flush()
+        logger.info(
+            "✓ Platform daily stats recorded: scored=%d new=%d updated=%d qualified=%d upgraded=%d",
+            properties_scored, leads_new, leads_updated, leads_qualified, leads_upgraded,
+        )
 
     def score_properties_by_ids(self, property_ids: List[int], save_to_db: bool = True) -> List[Dict]:
         """
@@ -1096,8 +1219,8 @@ def main():
     args = parser.parse_args()
 
     if args.no_ghl:
-        import src.services.cds_engine as _self
-        _self._GHL_PUSH_ENABLED = False
+        global _GHL_PUSH_ENABLED
+        _GHL_PUSH_ENABLED = False
         log.info("[GHL] Push disabled via --no-ghl flag")
 
     property_ids = None
@@ -1143,8 +1266,6 @@ def main():
         sys.exit(3)
 
     # ── Stats output ──────────────────────────────────────────────────────────
-    from collections import Counter
-
     total = len(scores)
     with_signals = [s for s in scores if s["signal_count"] > 0]
     qualified = sum(1 for s in with_signals if s["qualified"])
