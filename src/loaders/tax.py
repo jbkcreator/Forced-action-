@@ -48,6 +48,11 @@ class TaxDelinquencyLoader(BaseLoader):
             
             if not property_record:
                 logger.warning(f"No property match for parcel: {account_number} (searched as: {parcel_id})")
+                self.quarantine_unmatched(
+                    source_type="tax_delinquencies",
+                    raw_row=row.to_dict() if hasattr(row, 'to_dict') else dict(row),
+                    instrument_number=str(account_number),
+                )
                 unmatched += 1
                 continue
             

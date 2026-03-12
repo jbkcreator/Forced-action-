@@ -90,6 +90,13 @@ class ForeclosureLoader(BaseLoader):
                     unmatched += 1
             else:
                 logger.warning(f"No property match for foreclosure: {case_number}")
+                self.quarantine_unmatched(
+                    source_type="foreclosures",
+                    raw_row=row.to_dict() if hasattr(row, 'to_dict') else dict(row),
+                    instrument_number=str(case_number),
+                    grantor=str(row.get('Plaintiff', '')),
+                    address_string=str(row.get('Property Address', '')),
+                )
                 unmatched += 1
         
         logger.info(f"Foreclosures: {matched} matched, {unmatched} unmatched, {skipped} skipped")

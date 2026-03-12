@@ -107,6 +107,12 @@ class ViolationLoader(BaseLoader):
                     unmatched += 1
             else:
                 logger.warning(f"No property match for violation: {record_number} at {row.get('Address')}")
+                self.quarantine_unmatched(
+                    source_type="violations",
+                    raw_row=row.to_dict() if hasattr(row, 'to_dict') else dict(row),
+                    address_string=str(row.get('Address', '')),
+                    instrument_number=str(record_number),
+                )
                 unmatched += 1
         
         logger.info(f"Violations: {matched} matched, {unmatched} unmatched, {skipped} skipped")

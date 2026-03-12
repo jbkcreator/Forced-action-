@@ -533,6 +533,12 @@ class MultiVerticalScorer:
         # Qualified = eligible for any routing tier
         qualified = final_score >= ROUTING_THRESHOLDS["weekly"]
 
+        # Tax delinquency alone is a cumulative snapshot, not a fresh distress event.
+        # Require at least one corroborating signal before qualifying as a lead.
+        if qualified and set(s["type"] for s in signals) == {"tax_delinquencies"}:
+            qualified = False
+            lead_tier = "Bronze"
+
         # Compact per-property debug line
         if signals:
             best_v = max(vertical_scores, key=vertical_scores.get)

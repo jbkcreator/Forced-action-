@@ -648,6 +648,52 @@ class BaseLoader(ABC):
             logger.warning(f"Skipped record — DB rejected it: {e}")
             return False
 
+    def quarantine_unmatched(
+        self,
+        source_type: str,
+        raw_row: dict,
+        county_id: str = "hillsborough",
+        instrument_number: str = None,
+        grantor: str = None,
+        address_string: str = None,
+    ) -> None:
+        """
+        Store an unmatched record in the staging table instead of silently discarding it.
+        Records can be re-matched later when the master parcel is refreshed.
+        """
+        from src.core.models import UnmatchedRecord
+        from datetime import datetime, timezone
+
+        # Sanitize raw_row — convert non-serializable values to strings
+        import math
+        safe_raw = {}
+        for k, v in raw_row.items():
+            if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                safe_raw[k] = None
+            else:
+                try:
+                    import json
+                    json.dumps(v)
+                    safe_raw[k] = v
+                except (TypeError, ValueError):
+                    safe_raw[k] = str(v)
+
+        record = UnmatchedRecord(
+            source_type=source_type,
+            county_id=county_id,
+            raw_data=safe_raw,
+            instrument_number=str(instrument_number) if instrument_number else None,
+            grantor=str(grantor)[:500] if grantor else None,
+            address_string=str(address_string)[:500] if address_string else None,
+            match_status="unmatched",
+            match_attempted_at=datetime.now(timezone.utc),
+        )
+        try:
+            with self.session.begin_nested():
+                self.session.add(record)
+        except Exception as e:
+            logger.warning("Could not quarantine unmatched record (source=%s): %s", source_type, e)
+
     def get_affected_property_ids(self) -> list:
         """
         Return the list of property IDs that were added/updated during this

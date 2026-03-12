@@ -141,6 +141,13 @@ class DeedLoader(BaseLoader):
                     unmatched += 1
             else:
                 logger.debug(f"No property match for deed: {instrument} (Grantor: {row.get('Grantor')})")
+                self.quarantine_unmatched(
+                    source_type="deeds",
+                    raw_row=row.to_dict() if hasattr(row, 'to_dict') else dict(row),
+                    county_id=self.county_id,
+                    instrument_number=instrument,
+                    grantor=row.get('Grantor'),
+                )
                 unmatched += 1
         
         logger.info(f"Deeds: {matched} matched, {unmatched} unmatched, {skipped} skipped")

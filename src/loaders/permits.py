@@ -86,6 +86,12 @@ class BuildingPermitLoader(BaseLoader):
                     unmatched += 1
             else:
                 logger.warning(f"No property match for permit: {record_number} at {row.get('Address')}")
+                self.quarantine_unmatched(
+                    source_type="permits",
+                    raw_row=row.to_dict() if hasattr(row, 'to_dict') else dict(row),
+                    address_string=str(row.get('Address', '')),
+                    instrument_number=str(record_number),
+                )
                 unmatched += 1
         
         logger.info(f"Building Permits: {matched} matched, {unmatched} unmatched, {skipped} skipped")

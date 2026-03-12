@@ -19,6 +19,7 @@ from sqlalchemy import (
     UniqueConstraint,
     CheckConstraint,
     Index,
+    func,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import DeclarativeBase, relationship, Mapped, mapped_column
@@ -955,3 +956,30 @@ class PlatformDailyStats(Base):
             f"<PlatformDailyStats(date={self.run_date}, scored={self.properties_scored}, "
             f"leads_new={self.leads_new}, qualified={self.leads_qualified})>"
         )
+
+
+# ============================================================================
+# 7. UNMATCHED RECORDS STAGING
+# ============================================================================
+
+class UnmatchedRecord(Base):
+    __tablename__ = "unmatched_records"
+
+    id                  = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source_type         = mapped_column(String(50), nullable=False, index=True)   # liens, deeds, evictions, probate, etc.
+    county_id           = mapped_column(String(50), nullable=False, default="hillsborough", index=True)
+    raw_data            = mapped_column(JSONB, nullable=False)                     # full CSV row as dict
+    instrument_number   = mapped_column(String(100), nullable=True, index=True)
+    grantor             = mapped_column(Text, nullable=True)
+    address_string      = mapped_column(Text, nullable=True)
+    match_status        = mapped_column(String(20), nullable=False, default="unmatched", index=True)  # unmatched | matched | skipped
+    match_attempted_at  = mapped_column(DateTime(timezone=True), nullable=True)
+    matched_property_id = mapped_column(Integer, ForeignKey("properties.id"), nullable=True)
+    date_added          = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("ix_unmatched_source_status", "source_type", "match_status"),
+    )
+
+    def __repr__(self):
+        return f"<UnmatchedRecord(id={self.id}, source='{self.source_type}', status='{self.match_status}')>"

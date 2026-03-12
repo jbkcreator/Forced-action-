@@ -176,6 +176,13 @@ class LienLoader(BaseLoader):
                     self.stats_by_doc_type[_doc_type_label]['unmatched'] += 1
             else:
                 logger.debug(f"No property match for lien: {instrument} (Grantor: {row.get('Grantor')})")
+                self.quarantine_unmatched(
+                    source_type="liens",
+                    raw_row=row.to_dict() if hasattr(row, 'to_dict') else dict(row),
+                    county_id=self.county_id,
+                    instrument_number=instrument,
+                    grantor=row.get('Grantor'),
+                )
                 unmatched += 1
                 self.stats_by_doc_type[_doc_type_label]['unmatched'] += 1
         

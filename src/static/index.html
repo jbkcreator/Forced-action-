@@ -487,6 +487,12 @@
     let embeddedCheckout = null;
 
     async function checkout(tier) {
+      if (!lastCheckedZip) {
+        alert('Please check a ZIP code above before subscribing — your ZIP determines which leads you receive.');
+        document.getElementById('zip-input').focus();
+        return;
+      }
+
       const modal = document.getElementById('checkout-modal');
       const mount = document.getElementById('stripe-checkout-mount');
       mount.innerHTML = '<p class="text-slate-400 text-sm text-center py-8">Loading checkout…</p>';
@@ -496,7 +502,7 @@
         const res = await fetch(`${API_BASE}/api/checkout`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ tier, vertical: selectedVertical, county_id: 'hillsborough' }),
+          body: JSON.stringify({ tier, vertical: selectedVertical, county_id: 'hillsborough', zip_codes: [lastCheckedZip] }),
         });
 
         if (!res.ok) {

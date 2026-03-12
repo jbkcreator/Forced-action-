@@ -180,6 +180,12 @@ class ProbateLoader(BaseLoader):
                     unmatched += 1
             else:
                 logger.debug(f"No property match for probate case: {case_number}")
+                self.quarantine_unmatched(
+                    source_type="probate",
+                    raw_row=decedent_row.to_dict() if hasattr(decedent_row, 'to_dict') else dict(decedent_row),
+                    county_id=self.county_id,
+                    address_string=str(party_address_val) if party_address_val else None,
+                )
                 unmatched += 1
 
         logger.info(f"Probate: {matched} matched, {unmatched} unmatched, {skipped} skipped")
@@ -322,6 +328,12 @@ class EvictionLoader(BaseLoader):
                 logger.warning(
                     f"No property match for eviction: {case_number} at {defendant_row.get('PartyAddress')}"
                 )
+                self.quarantine_unmatched(
+                    source_type="evictions",
+                    raw_row=defendant_row.to_dict() if hasattr(defendant_row, 'to_dict') else dict(defendant_row),
+                    county_id=self.county_id,
+                    address_string=str(party_address_val) if party_address_val else None,
+                )
                 unmatched += 1
 
         logger.info(f"Evictions: {matched} matched, {unmatched} unmatched, {skipped} skipped")
@@ -437,6 +449,12 @@ class BankruptcyLoader(BaseLoader):
                     unmatched += 1
             else:
                 logger.debug(f"No property match for bankruptcy: {docket_number} (Name: {row.get('Lead Name')})")
+                self.quarantine_unmatched(
+                    source_type="bankruptcies",
+                    raw_row=row.to_dict() if hasattr(row, 'to_dict') else dict(row),
+                    county_id=self.county_id,
+                    grantor=str(lead_name_val) if lead_name_val else None,
+                )
                 unmatched += 1
 
         logger.info(f"Bankruptcy: {matched} matched, {unmatched} unmatched, {skipped} skipped")

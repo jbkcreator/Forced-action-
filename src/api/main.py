@@ -91,6 +91,7 @@ class CheckoutRequest(BaseModel):
     tier: str        # starter | pro | dominator
     vertical: str    # roofing | remediation | investor
     county_id: str   # hillsborough
+    zip_codes: list[str] = []  # ZIP territories to lock on purchase
 
     @field_validator("tier")
     @classmethod
@@ -114,6 +115,13 @@ class CheckoutRequest(BaseModel):
         v = v.lower().strip()
         if not v:
             raise ValueError("county_id is required")
+        return v
+
+    @field_validator("zip_codes")
+    @classmethod
+    def validate_zip_codes(cls, v: list) -> list:
+        if not v:
+            raise ValueError("At least one ZIP code must be selected before checkout")
         return v
 
 
@@ -146,6 +154,7 @@ def create_checkout(payload: CheckoutRequest, db: Session = Depends(get_db)):
                 "vertical": payload.vertical,
                 "county_id": payload.county_id,
                 "is_founding": str(is_founding),
+                "zip_codes": ",".join(payload.zip_codes),
             },
             return_url=f"{_s.app_base_url}/success?session_id={{CHECKOUT_SESSION_ID}}",
         )
