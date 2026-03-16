@@ -601,6 +601,7 @@ async def main(args):
 	if scraper in ("auto", "playwright"):
 		logger.info("\nAttempting Playwright scraping (primary method)...")
 		playwright_error = None
+		playwright_no_results = False
 		for attempt in range(1, MAX_PLAYWRIGHT_RETRIES + 1):
 			try:
 				csv_file = await scrape_violations_with_playwright(
@@ -615,8 +616,8 @@ async def main(args):
 						logger.warning(f"[Playwright] No results (attempt {attempt}/{MAX_PLAYWRIGHT_RETRIES}) — retrying in 5s...")
 						await asyncio.sleep(5)
 						continue
-					logger.info(f"[Playwright] No results after {MAX_PLAYWRIGHT_RETRIES} attempts — no violations in date range")
-					playwright_error = None
+					logger.warning(f"[Playwright] No results after {MAX_PLAYWRIGHT_RETRIES} attempts — triggering AI fallback")
+					playwright_no_results = True
 					break
 				# Success (csv_path or True — all already in DB)
 				logger.info("Playwright scraping succeeded")
@@ -632,8 +633,8 @@ async def main(args):
 					continue
 				logger.warning(f"[Playwright] All {MAX_PLAYWRIGHT_RETRIES} retries failed with errors")
 
-		# Only fall back to AI if Playwright failed with an actual error (not no-results)
-		if playwright_error is not None and scraper == "auto":
+		# Fall back to AI if Playwright errored OR returned no results after all retries
+		if (playwright_error is not None or playwright_no_results) and scraper == "auto":
 			logger.warning("Falling back to browser-use AI method...")
 			scraper = "ai"
 
@@ -690,6 +691,21 @@ async def main(args):
 							logger.info("✓ CDS rescore completed")
 						except Exception as score_err:
 							logger.warning(f"⚠ CDS rescore failed (non-critical): {score_err}")
+
+
+					# Record stats
+					try:
+						from src.utils.scraper_db_helper import record_scraper_stats
+						record_scraper_stats(
+							source_type='violations',
+							total_scraped=total,
+							matched=matched,
+							unmatched=unmatched,
+							skipped=skipped,
+							scored=len(affected_ids) if affected_ids else 0,
+						)
+					except Exception as stats_err:
+						logger.warning(f"⚠ Could not record scraper stats (non-critical): {stats_err}")
 
 					# Delete CSV after successful insertion; keep on error for debugging
 					try:

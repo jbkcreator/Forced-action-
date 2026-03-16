@@ -67,6 +67,15 @@ class LienLoader(BaseLoader):
         for _, row in df.iterrows():
             instrument = str(row['Instrument']).strip()
             _doc_type_label = str(row.get('document_type', 'UNKNOWN')).strip()
+
+            # LP (Lis Pendens) rows are handled by LisPendensLoader — skip here
+            # to avoid creating spurious LegalAndLien records.
+            _doc_upper = _doc_type_label.upper()
+            if 'LIS PENDENS' in _doc_upper or '(LP)' in _doc_upper:
+                logger.debug(f"Skipping LP row (handled by LisPendensLoader): {instrument}")
+                skipped += 1
+                continue
+
             if _doc_type_label not in self.stats_by_doc_type:
                 self.stats_by_doc_type[_doc_type_label] = {'total': 0, 'matched': 0, 'unmatched': 0, 'skipped': 0}
             self.stats_by_doc_type[_doc_type_label]['total'] += 1

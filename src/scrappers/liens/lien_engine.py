@@ -336,6 +336,7 @@ async def download_document_by_type(
         logger.info(f"\n[{doc_type}] Attempting Playwright scraper (primary)...")
         MAX_RETRIES = 5
         playwright_error = None
+        playwright_no_results = False
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 result = await _playwright_download_document(doc_type, start_date_str, end_date_str, clerk_access_url=clerk_access_url)
@@ -345,8 +346,9 @@ async def download_document_by_type(
                         logger.warning(f"[{doc_type}] No results (attempt {attempt}/{MAX_RETRIES}) — retrying in 5s...")
                         await asyncio.sleep(5)
                         continue
-                    logger.info(f"[{doc_type}] No results after {MAX_RETRIES} attempts — none in date range")
-                    return None
+                    logger.warning(f"[{doc_type}] No results after {MAX_RETRIES} attempts — triggering AI fallback")
+                    playwright_no_results = True
+                    break
                 logger.info(f"[{doc_type}] Playwright scraper succeeded")
                 return result
             except Exception as e:
@@ -356,8 +358,8 @@ async def download_document_by_type(
                     await asyncio.sleep(5)
                     continue
                 logger.warning(f"[{doc_type}] All Playwright retries failed: {e}")
-        if playwright_error is None:
-            return None  # no-results after all retries
+        if playwright_error is None and not playwright_no_results:
+            return None  # no-results that were confirmed by the site
         logger.info(f"[{doc_type}] Falling back to browser-use AI scraper...")
 
     # ── AI fallback (only reached on error, not on no-results) ────────────────

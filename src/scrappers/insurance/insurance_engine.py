@@ -229,6 +229,17 @@ def scrape_insurance_claims(
                 len(insurance_permits),
             )
 
+    try:
+        from src.utils.scraper_db_helper import record_scraper_stats
+        record_scraper_stats(
+            source_type='insurance_claims',
+            total_scraped=created + skipped_duplicate,
+            matched=created,
+            unmatched=0,
+            skipped=skipped_duplicate,
+        )
+    except Exception as stats_err:
+        logger.warning("⚠ Could not record scraper stats (non-critical): %s", stats_err)
     return created
 
 

@@ -22,6 +22,7 @@ from src.loaders import (
     BuildingPermitLoader,
     BankruptcyLoader,
     TaxDelinquencyLoader,
+    LisPendensLoader,
 )
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,7 @@ DATA_TYPE_TO_SOURCE = {
     'permits':      'permits',
     'bankruptcy':   'bankruptcy',
     'tax':          'tax_delinquencies',
+    'lis_pendens':  'lis_pendens',
 }
 
 
@@ -56,6 +58,7 @@ LOADER_MAP = {
     'foreclosures': ForeclosureLoader,
     'liens': LienLoader,
     'judgments': LienLoader,
+    'lis_pendens': LisPendensLoader,
     'deeds': DeedLoader,
     'evictions': EvictionLoader,
     'probate': ProbateLoader,
@@ -204,6 +207,33 @@ def load_scraped_data_to_db(
 
             logger.info("✓ Database load completed!")
 
+            # ── Lis pendens second pass (liens CSV only) ───────────────
+            # The same Clerk CSV contains LP (Lis Pendens) document types.
+            # LienLoader skips them; run LisPendensLoader on the same file
+            # before it is deleted so early foreclosure signals are captured.
+            lp_stats = {'matched': 0, 'unmatched': 0, 'skipped': 0}
+            if data_type == 'liens' and csv_path.exists():
+                try:
+                    with get_db_context() as lp_session:
+                        lp_loader = LisPendensLoader(lp_session)
+                        lp_m, lp_u, lp_s = lp_loader.load_from_csv(
+                            str(csv_path),
+                            skip_duplicates=skip_duplicates,
+                        )
+                        lp_session.commit()
+                        lp_stats = {'matched': lp_m, 'unmatched': lp_u, 'skipped': lp_s}
+                        lp_total = lp_m + lp_u + lp_s
+                        logger.info(
+                            f"Lis Pendens pass: {lp_m} matched, "
+                            f"{lp_u} unmatched, {lp_s} skipped "
+                            f"(of {lp_total} LP records in CSV)"
+                        )
+                        # Merge affected IDs so the rescore step below covers LP matches
+                        for pid in lp_loader.get_affected_property_ids():
+                            loader._affected_property_ids.add(pid)
+                except Exception as lp_err:
+                    logger.warning(f"⚠ LisPendensLoader second pass failed (non-critical): {lp_err}")
+
             # Delete CSV after successful DB insertion; keep it on error for debugging
             try:
                 csv_path.unlink()
@@ -258,6 +288,18 @@ def load_scraped_data_to_db(
                         unmatched=unmatched,
                         skipped=skipped,
                         scored=scored,
+                        duration_seconds=duration,
+                    )
+                # Record lis pendens stats separately
+                lp_total = lp_stats['matched'] + lp_stats['unmatched'] + lp_stats['skipped']
+                if lp_total > 0:
+                    record_scraper_stats(
+                        source_type='lis_pendens',
+                        total_scraped=lp_total,
+                        matched=lp_stats['matched'],
+                        unmatched=lp_stats['unmatched'],
+                        skipped=lp_stats['skipped'],
+                        scored=0,
                         duration_seconds=duration,
                     )
             else:

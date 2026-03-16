@@ -120,6 +120,17 @@ def scrape_roofing_permits(
         "[roofing_permits] %s %s→%s: created=%d duplicate=%d no_property=%d",
         county_id, start_date, end_date, created, skipped_duplicate, skipped_no_property,
     )
+    try:
+        from src.utils.scraper_db_helper import record_scraper_stats
+        record_scraper_stats(
+            source_type='roofing_permits',
+            total_scraped=created + skipped_duplicate + skipped_no_property,
+            matched=created,
+            unmatched=skipped_no_property,
+            skipped=skipped_duplicate,
+        )
+    except Exception as stats_err:
+        logger.warning("⚠ Could not record scraper stats (non-critical): %s", stats_err)
     return created
 
 

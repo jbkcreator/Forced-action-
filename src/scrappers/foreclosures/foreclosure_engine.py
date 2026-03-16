@@ -543,8 +543,8 @@ async def scrape_realforeclose_calendar(
 					continue
 				logger.warning(f"[Playwright] All {MAX_PLAYWRIGHT_RETRIES} retries failed")
 
-	# Only fall back to AI if Playwright raised on every attempt (didn't complete cleanly)
-	if scraper == "ai" or (scraper == "auto" and not playwright_succeeded):
+	# Fall back to AI if Playwright errored OR returned no records (csv_file is None)
+	if scraper == "ai" or (scraper == "auto" and (not playwright_succeeded or csv_file is None)):
 		logger.info("Running browser-use AI scraper...")
 		csv_file = await _scrape_with_ai(auction_date, wait_after_scrape, foreclosure_base_url=foreclosure_base_url)
 
@@ -665,6 +665,20 @@ def main():
 							logger.info("✓ CDS rescore completed")
 						except Exception as score_err:
 							logger.warning(f"⚠ CDS rescore failed (non-critical): {score_err}")
+
+				# Record stats
+				try:
+					from src.utils.scraper_db_helper import record_scraper_stats
+					record_scraper_stats(
+						source_type='foreclosures',
+						total_scraped=total,
+						matched=matched,
+						unmatched=unmatched,
+						skipped=skipped,
+						scored=len(affected_ids) if affected_ids else 0,
+					)
+				except Exception as stats_err:
+					logger.warning(f"⚠ Could not record scraper stats (non-critical): {stats_err}")
 
 			except Exception as e:
 				logger.error(f"Failed to load data to database: {e}")

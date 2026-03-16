@@ -641,6 +641,7 @@ async def run_permit_pipeline(
 		if active_scraper in ("auto", "playwright"):
 			logger.info("Scraping permits via Playwright (primary method)")
 			playwright_error = None
+			playwright_no_results = False
 			for attempt in range(1, MAX_PLAYWRIGHT_RETRIES + 1):
 				try:
 					file_path = await scrape_permits_with_playwright(
@@ -654,8 +655,8 @@ async def run_permit_pipeline(
 							logger.warning(f"[Playwright] No results (attempt {attempt}/{MAX_PLAYWRIGHT_RETRIES}) — retrying in 5s...")
 							await asyncio.sleep(5)
 							continue
-						logger.info(f"[Playwright] No results after {MAX_PLAYWRIGHT_RETRIES} attempts — no permits in date range")
-						playwright_error = None
+						logger.warning(f"[Playwright] No results after {MAX_PLAYWRIGHT_RETRIES} attempts — triggering AI fallback")
+						playwright_no_results = True
 						break
 					logger.info("Playwright scraping succeeded")
 					playwright_error = None
@@ -670,8 +671,8 @@ async def run_permit_pipeline(
 						continue
 					logger.warning(f"[Playwright] All {MAX_PLAYWRIGHT_RETRIES} retries failed with errors")
 
-			# Only fall back to AI if Playwright failed with an actual error (not no-results)
-			if playwright_error is not None and active_scraper == "auto":
+			# Fall back to AI if Playwright errored OR returned no results after all retries
+			if (playwright_error is not None or playwright_no_results) and active_scraper == "auto":
 				logger.warning("Falling back to browser-use AI method...")
 				active_scraper = "ai"
 

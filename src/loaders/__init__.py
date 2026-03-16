@@ -25,6 +25,7 @@ from src.loaders.legal_proceedings import ProbateLoader, EvictionLoader, Bankrup
 from src.loaders.tax import TaxDelinquencyLoader
 from src.loaders.foreclosures import ForeclosureLoader
 from src.loaders.permits import BuildingPermitLoader
+from src.loaders.lis_pendens import LisPendensLoader
 
 __all__ = [
     'BaseLoader',
@@ -38,4 +39,5 @@ __all__ = [
     'TaxDelinquencyLoader',
     'ForeclosureLoader',
     'BuildingPermitLoader',
+    'LisPendensLoader',
 ]

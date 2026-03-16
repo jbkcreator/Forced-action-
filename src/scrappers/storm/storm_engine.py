@@ -165,6 +165,17 @@ def scrape_storm_damage(
         "[storm] %s: created=%d duplicate=%d zips_affected=%d",
         county_id, created, skipped_duplicate, len(affected_zips),
     )
+    try:
+        from src.utils.scraper_db_helper import record_scraper_stats
+        record_scraper_stats(
+            source_type='storm_damage',
+            total_scraped=created + skipped_duplicate,
+            matched=created,
+            unmatched=0,
+            skipped=skipped_duplicate,
+        )
+    except Exception as stats_err:
+        logger.warning("⚠ Could not record scraper stats (non-critical): %s", stats_err)
     return created
 
 

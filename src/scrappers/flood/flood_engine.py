@@ -172,6 +172,17 @@ def scrape_flood_damage(
         county_id, created, skipped_duplicate,
         "fema_county_wide" if has_fema_flood else f"nws_zips({len(county_zips)})",
     )
+    try:
+        from src.utils.scraper_db_helper import record_scraper_stats
+        record_scraper_stats(
+            source_type='flood_damage',
+            total_scraped=created + skipped_duplicate,
+            matched=created,
+            unmatched=0,
+            skipped=skipped_duplicate,
+        )
+    except Exception as stats_err:
+        logger.warning("⚠ Could not record scraper stats (non-critical): %s", stats_err)
     return created
 
 

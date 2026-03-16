@@ -265,6 +265,17 @@ def scrape_fire_incidents(
     # Rotate CSV archives after successful DB load
     rotate_csv_archives(RAW_FIRE_DIR)
 
+    try:
+        from src.utils.scraper_db_helper import record_scraper_stats
+        record_scraper_stats(
+            source_type='fire_incidents',
+            total_scraped=created + skipped_no_match,
+            matched=created,
+            unmatched=skipped_no_match,
+            skipped=0,
+        )
+    except Exception as stats_err:
+        logger.warning("⚠ Could not record scraper stats (non-critical): %s", stats_err)
     return created
 
 
