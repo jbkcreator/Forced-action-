@@ -30,6 +30,7 @@ from config.settings import settings
 from config.constants import (
 	RAW_VIOLATIONS_DIR,
 	VIOLATION_SEARCH_URL,
+	get_county_config,
 )
 from src.utils.logger import setup_logging, get_logger
 from src.utils.prompt_loader import get_prompt
@@ -53,6 +54,7 @@ async def scrape_violations_with_playwright(
     end_date: str = None,
     headless: bool = True,
     debug: bool = False,
+    violation_url: str = VIOLATION_SEARCH_URL,
 ):
     """
     Primary Playwright scraper — deterministic, no AI credits consumed.
@@ -144,7 +146,7 @@ async def scrape_violations_with_playwright(
 
         try:
             # 1. Load the portal
-            await page.goto(VIOLATION_SEARCH_URL, wait_until="domcontentloaded", timeout=60000)
+            await page.goto(violation_url, wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_timeout(2000)
             await snap(page, "01_page_loaded")
 
@@ -378,7 +380,7 @@ async def scrape_violations_with_playwright(
 
     return csv_path
 
-async def scrape_violations_with_browser_use(start_date: str = None, end_date: str = None) -> bool:
+async def scrape_violations_with_browser_use(start_date: str = None, end_date: str = None, violation_url: str = VIOLATION_SEARCH_URL) -> bool:
 	"""
 	Full AI-led extraction (FALLBACK method).
 	
@@ -415,7 +417,7 @@ async def scrape_violations_with_browser_use(start_date: str = None, end_date: s
 			task_instructions = get_prompt(
 				"violation_prompts.yaml",
 				"violation_browser_use_scrape.task_template",
-				url=VIOLATION_SEARCH_URL,
+				url=violation_url,
 				end_date=end_date_str,
 				start_date=start_date_str
 			)
@@ -579,10 +581,14 @@ async def scrape_violations_with_browser_use(start_date: str = None, end_date: s
 
 async def main(args):
 	"""Main execution function for violation scraping."""
+	county_id = args.county_id
+	county_cfg = get_county_config(county_id)
+	violation_url = county_cfg["urls"]["violation"]
+
 	logger.info("=" * 60)
-	logger.info("Violation Scraping Pipeline Starting")
+	logger.info(f"{county_cfg['display_name'].upper()} CODE VIOLATIONS - DATA COLLECTION")
 	logger.info("=" * 60)
-	
+
 	if args.start_date or args.end_date:
 		logger.info(f"\nCustom date range specified:")
 		logger.info(f"  Start: {args.start_date or 'yesterday'}")
@@ -609,6 +615,7 @@ async def main(args):
 					end_date=args.end_date,
 					headless=headless,
 					debug=args.debug,
+					violation_url=violation_url,
 				)
 				if csv_file is None:
 					# No results from site — retry (could be temporary)
@@ -642,7 +649,8 @@ async def main(args):
 		logger.info("Running browser-use AI scraper...")
 		csv_file = await scrape_violations_with_browser_use(
 			start_date=args.start_date,
-			end_date=args.end_date
+			end_date=args.end_date,
+			violation_url=violation_url,
 		)
 	
 	if csv_file:
@@ -727,7 +735,7 @@ async def main(args):
 
 if __name__ == "__main__":
 	# Parse command-line arguments
-	parser = argparse.ArgumentParser(description="Scrape code enforcement violations from Hillsborough County portal")
+	parser = argparse.ArgumentParser(description="Scrape code enforcement violations from county portal")
 	parser.add_argument(
 		"--start-date",
 		type=str,
@@ -758,6 +766,12 @@ if __name__ == "__main__":
 		"--headful",
 		action="store_true",
 		help="Open a real browser window (requires: xvfb-run -a python -m ...)"
+	)
+	parser.add_argument(
+		"--county-id",
+		dest="county_id",
+		default="hillsborough",
+		help="County identifier (default: hillsborough)",
 	)
 	args = parser.parse_args()
 

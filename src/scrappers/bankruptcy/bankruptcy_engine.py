@@ -32,6 +32,7 @@ from config.constants import (
 	RAW_BANKRUPTCY_DIR,
 	API_USER_AGENT,
 	REQUEST_TIMEOUT_DEFAULT,
+	get_county_config,
 )
 from src.utils.logger import setup_logging, get_logger
 from src.utils.db_deduplicator import filter_new_records
@@ -41,7 +42,7 @@ setup_logging()
 logger = get_logger(__name__)
 
 
-def fetch_bankruptcy_filings(lookback_days: int = 1) -> List[Dict[str, Any]]:
+def fetch_bankruptcy_filings(lookback_days: int = 1, court_code: str = COURT_CODE_FLORIDA_MIDDLE_BANKRUPTCY) -> List[Dict[str, Any]]:
 	"""
 	Fetch bankruptcy filings from CourtListener API.
 	
@@ -70,7 +71,7 @@ def fetch_bankruptcy_filings(lookback_days: int = 1) -> List[Dict[str, Any]]:
 	
 	# Construct API URL with query parameters
 	params = {
-		"court": COURT_CODE_FLORIDA_MIDDLE_BANKRUPTCY,
+		"court": court_code,
 		"date_filed__gte": start_date,
 	}
 	
@@ -113,7 +114,7 @@ def fetch_bankruptcy_filings(lookback_days: int = 1) -> List[Dict[str, Any]]:
 		raise
 
 
-def filter_tampa_bankruptcies(dockets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def filter_tampa_bankruptcies(dockets: List[Dict[str, Any]], division_prefix: str = TAMPA_DIVISION_PREFIX) -> List[Dict[str, Any]]:
 	"""
 	Filter bankruptcy dockets for Tampa Division cases only.
 	
@@ -140,7 +141,7 @@ def filter_tampa_bankruptcies(dockets: List[Dict[str, Any]]) -> List[Dict[str, A
 		docket_num = docket.get('docket_number', '')
 		
 		# Filter for Bankruptcy ('bk') AND Tampa Division ('8:')
-		if case_type == 'bk' and docket_num.startswith(TAMPA_DIVISION_PREFIX):
+		if case_type == 'bk' and docket_num.startswith(division_prefix):
 			# Clean the case name by removing common prefixes
 			raw_name = docket.get('case_name', '')
 			clean_name = raw_name.replace("In re: ", "").strip()
@@ -243,7 +244,7 @@ def save_bankruptcy_leads(
 		raise
 
 
-def run_bankruptcy_pipeline(lookback_days: int = 1) -> bool:
+def run_bankruptcy_pipeline(lookback_days: int = 1, county_id: str = "hillsborough") -> bool:
 	"""
 	Execute the complete bankruptcy data collection pipeline.
 	
@@ -264,21 +265,26 @@ def run_bankruptcy_pipeline(lookback_days: int = 1) -> bool:
 		>>>     print("Bankruptcy pipeline completed successfully")
 	"""
 	try:
+		county_cfg = get_county_config(county_id)
+		court_cfg = county_cfg.get("court", {})
+		court_code = court_cfg.get("bankruptcy_code", COURT_CODE_FLORIDA_MIDDLE_BANKRUPTCY)
+		division_prefix = court_cfg.get("division_prefix", TAMPA_DIVISION_PREFIX)
+
 		logger.info("=" * 80)
-		logger.info("STARTING BANKRUPTCY DATA COLLECTION PIPELINE")
+		logger.info(f"STARTING BANKRUPTCY DATA COLLECTION PIPELINE ({county_cfg['display_name'].upper()})")
 		logger.info("=" * 80)
-		
+
 		# Step 1: Fetch bankruptcy filings from API
 		logger.info(f"\n[STEP 1/3] Fetching bankruptcy filings (lookback: {lookback_days} days)...")
-		dockets = fetch_bankruptcy_filings(lookback_days=lookback_days)
-		
+		dockets = fetch_bankruptcy_filings(lookback_days=lookback_days, court_code=court_code)
+
 		if not dockets:
 			logger.warning("No bankruptcy filings found in the specified date range")
 			return False
-		
-		# Step 2: Filter for Tampa cases
-		logger.info("\n[STEP 2/3] Filtering for Tampa Division bankruptcy cases...")
-		tampa_leads = filter_tampa_bankruptcies(dockets)
+
+		# Step 2: Filter for division cases
+		logger.info(f"\n[STEP 2/3] Filtering for division '{division_prefix}' bankruptcy cases...")
+		tampa_leads = filter_tampa_bankruptcies(dockets, division_prefix=division_prefix)
 		
 		if not tampa_leads:
 			logger.warning("No Tampa bankruptcy cases found - pipeline completed but no data to save")
@@ -330,7 +336,7 @@ if __name__ == "__main__":
 	import argparse
 	
 	parser = argparse.ArgumentParser(
-		description="Fetch Tampa bankruptcy filings from CourtListener API"
+		description="Fetch bankruptcy filings from CourtListener API"
 	)
 	parser.add_argument(
 		"--lookback",
@@ -338,13 +344,19 @@ if __name__ == "__main__":
 		default=1,
 		help="Number of days to look back for filings (default: 1)",
 	)
-	
+	parser.add_argument(
+		"--county-id",
+		dest="county_id",
+		default="hillsborough",
+		help="County identifier (default: hillsborough)",
+	)
+
 	from src.utils.scraper_db_helper import add_load_to_db_arg
 	add_load_to_db_arg(parser)
-	
+
 	args = parser.parse_args()
-	
-	success = run_bankruptcy_pipeline(lookback_days=args.lookback)
+
+	success = run_bankruptcy_pipeline(lookback_days=args.lookback, county_id=args.county_id)
 	
 	# Load to database if requested and scraping was successful
 	if success and args.load_to_db:

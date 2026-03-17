@@ -484,7 +484,7 @@ def _filter_distressed_accounts(df: pd.DataFrame, min_years: int = MIN_YEARS_DEL
 	return df_filtered
 
 
-async def _scrape_parcel_with_firecrawl(firecrawl_client: FirecrawlApp, account_number: str) -> dict:
+async def _scrape_parcel_with_firecrawl(firecrawl_client: FirecrawlApp, account_number: str, parcel_lookup_url: str = PARCEL_LOOKUP_URL) -> dict:
 	"""
 	SNIPER PHASE: Extract structured tax delinquent data using Firecrawl API.
 	
@@ -509,7 +509,7 @@ async def _scrape_parcel_with_firecrawl(firecrawl_client: FirecrawlApp, account_
 		don't raise exceptions to allow batch processing to continue.
 	"""
 
-	url = f"{PARCEL_LOOKUP_URL}/{account_number}"
+	url = f"{parcel_lookup_url}/{account_number}"
 	result = {
 		"account_number": account_number,
 		"total_amount_due": None,
@@ -573,7 +573,7 @@ async def _scrape_parcel_with_firecrawl(firecrawl_client: FirecrawlApp, account_
 	return result
 
 
-async def _sniper_enrich_accounts(df: pd.DataFrame, max_accounts: int = 100) -> pd.DataFrame:
+async def _sniper_enrich_accounts(df: pd.DataFrame, max_accounts: int = 100, parcel_lookup_url: str = PARCEL_LOOKUP_URL) -> pd.DataFrame:
 	"""
 	SNIPER PHASE: Enrich high-priority accounts using Firecrawl extraction.
 	
@@ -621,7 +621,7 @@ async def _sniper_enrich_accounts(df: pd.DataFrame, max_accounts: int = 100) -> 
 
 			logger.info(f"[SNIPER] [{idx + 1}/{len(df)}] Extracting account: {account_number}")
 
-			details = await _scrape_parcel_with_firecrawl(firecrawl_client, str(account_number))
+			details = await _scrape_parcel_with_firecrawl(firecrawl_client, str(account_number), parcel_lookup_url=parcel_lookup_url)
 
 			# Merge scraped data
 			enriched_row = row.to_dict()
@@ -801,7 +801,8 @@ async def run_radar_sniper_pipeline(
 
 		# PHASE 4: SNIPER - Enrich ONLY NEW accounts with Firecrawl (cost optimization!)
 		logger.info(f"[SNIPER] Enriching {len(df_new_only)} NEW accounts (skipped {len(existing_accounts)} existing)")
-		df_enriched = await _sniper_enrich_accounts(df_new_only, max_accounts=max_sniper_accounts)
+		_parcel_url = _get_county(county_id)["portals"]["parcel_lookup_url"]
+		df_enriched = await _sniper_enrich_accounts(df_new_only, max_accounts=max_sniper_accounts, parcel_lookup_url=_parcel_url)
 
 		# PHASE 5: Save final output with deduplication
 		temp_dir = PROCESSED_DATA_DIR / "temp"

@@ -26,9 +26,7 @@ from bs4 import BeautifulSoup
 from src.utils.http_helpers import requests_get_with_retry
 
 from config.constants import (
-	PROBATE_FILINGS_URL,
 	RAW_PROBATE_DIR,
-	HILLSCLERK_BASE_URL,
 	PROBATE_FILING_PATTERN,
 	DEFAULT_USER_AGENT,
 	REQUEST_TIMEOUT_DEFAULT,

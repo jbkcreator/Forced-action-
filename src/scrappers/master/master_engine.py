@@ -24,6 +24,7 @@ from src.core.database import get_db_context
 from src.core.models import Property
 from src.loaders.master import MasterPropertyLoader
 from src.utils.logger import setup_logging, get_logger
+from src.utils.county_config import get_county as _get_county
 
 # Initialize logging
 setup_logging()
@@ -159,7 +160,7 @@ def _dbf_chunk_reader(file_path: Path, chunk_size: int):
 	logger.info(f"Completed processing {total_rows:,} rows from DBF file")
 
 
-async def _playwright_download_parcel_master() -> Optional[Path]:
+async def _playwright_download_parcel_master(master_data_url: str = "https://downloads.hcpafl.org/") -> Optional[Path]:
 	"""
 	Primary Playwright scraper — deterministic, no AI credits consumed.
 
@@ -173,7 +174,7 @@ async def _playwright_download_parcel_master() -> Optional[Path]:
 	save_dir.mkdir(parents=True, exist_ok=True)
 	dest_file = save_dir / "PARCEL_SPREADSHEET.xls"
 
-	logger.info("[Playwright] Navigating to https://downloads.hcpafl.org/")
+	logger.info(f"[Playwright] Navigating to {master_data_url}")
 
 	async with async_playwright() as pw:
 		browser = await pw.chromium.launch(
@@ -183,7 +184,7 @@ async def _playwright_download_parcel_master() -> Optional[Path]:
 		context = await browser.new_context(accept_downloads=True)
 		page = await context.new_page()
 		try:
-			await page.goto("https://downloads.hcpafl.org/", wait_until="domcontentloaded", timeout=60_000)
+			await page.goto(master_data_url, wait_until="domcontentloaded", timeout=60_000)
 
 			# Find link by text — row selector: tr.rgRow a containing "PARCEL_SPREADSHEET.xls"
 			link = page.locator('tr.rgRow a', has_text="PARCEL_SPREADSHEET.xls")
@@ -212,13 +213,13 @@ async def _playwright_download_parcel_master() -> Optional[Path]:
 			await browser.close()
 
 
-async def _ai_download_parcel_master() -> Optional[Path]:
+async def _ai_download_parcel_master(master_data_url: str = "https://downloads.hcpafl.org/") -> Optional[Path]:
 	"""AI browser-use fallback for downloading PARCEL_SPREADSHEET.xls."""
 	save_dir = os.path.abspath("data/reference/")
 	os.makedirs(save_dir, exist_ok=True)
 
 	task = (
-		"Go to https://downloads.hcpafl.org/ "
+		f"Go to {master_data_url} "
 		"Find and click on 'PARCEL_SPREADSHEET.xls' (536 MB file) to start the download. "
 		"IMPORTANT: The click action will timeout after 15 seconds - this is NORMAL for large file downloads. "
 		"After clicking, wait exactly 60 seconds for the background download to complete. "
@@ -308,19 +309,19 @@ async def _ai_download_parcel_master() -> Optional[Path]:
 	return dest_file
 
 
-async def download_parcel_master() -> Optional[Path]:
+async def download_parcel_master(master_data_url: str = "https://downloads.hcpafl.org/") -> Optional[Path]:
 	"""
-	Download PARCEL_SPREADSHEET.xls from https://downloads.hcpafl.org/
+	Download PARCEL_SPREADSHEET.xls from the county's master data portal.
 
 	Tries Playwright first (deterministic). Falls back to browser-use AI agent
 	if Playwright fails.
 	"""
-	logger.info("\nAttempting Playwright download (primary method)...")
+	logger.info(f"\nAttempting Playwright download from {master_data_url} (primary method)...")
 	MAX_PLAYWRIGHT_RETRIES = 5
 	playwright_error = None
 	for attempt in range(1, MAX_PLAYWRIGHT_RETRIES + 1):
 		try:
-			result = await _playwright_download_parcel_master()
+			result = await _playwright_download_parcel_master(master_data_url=master_data_url)
 			if result:
 				logger.info("Playwright download succeeded")
 				return result
@@ -334,7 +335,7 @@ async def download_parcel_master() -> Optional[Path]:
 			break
 
 	logger.info("Falling back to browser-use AI downloader...")
-	return await _ai_download_parcel_master()
+	return await _ai_download_parcel_master(master_data_url=master_data_url)
 
 
 def convert_xls_to_csv(xls_path: Path, output_dir: Path) -> Path:
@@ -569,27 +570,35 @@ def cleanup_staging(staging_dir: Path):
 	logger.info(f"✓ Cleaned up {len(files)} file(s) from staging")
 
 
-async def run_master_pipeline(skip_download: bool = False, skip_convert: bool = False, load_to_db: bool = False):
+async def run_master_pipeline(skip_download: bool = False, skip_convert: bool = False, load_to_db: bool = False, county_id: str = "hillsborough"):
 	"""
 	Run the complete master property data pipeline.
-	
+
 	Args:
 		skip_download: Skip download phase (use existing XLS)
 		skip_convert: Skip conversion phase (use existing CSV)
 		load_to_db: Load data to database after deduplication
+		county_id: County identifier (default: hillsborough)
 	"""
 	try:
+		county = _get_county(county_id)
+		master_data_url = county["portals"]["master_data_url"]
+
+		logger.info("=" * 80)
+		logger.info(f"MASTER PROPERTY PIPELINE — {county['name'].upper()}")
+		logger.info("=" * 80)
+
 		# Setup paths
 		reference_dir = Path("data/reference")
 		new_dir = Path("data/raw/master/new")
 		old_dir = Path("data/raw/master/old")
-		
+
 		xls_file = reference_dir / "PARCEL_SPREADSHEET.xls"
-		
+
 		# Phase 1: Download
 		if not skip_download:
 			logger.info("Starting PHASE 1: Download")
-			downloaded_file = await download_parcel_master()
+			downloaded_file = await download_parcel_master(master_data_url=master_data_url)
 			if not downloaded_file:
 				logger.error("Download failed")
 				return
@@ -672,12 +681,19 @@ if __name__ == "__main__":
 		action='store_true',
 		help='Load deduplicated data to database'
 	)
-	
+	parser.add_argument(
+		'--county-id',
+		dest='county_id',
+		default='hillsborough',
+		help='County identifier (default: hillsborough)',
+	)
+
 	args = parser.parse_args()
-	
+
 	asyncio.run(run_master_pipeline(
 		skip_download=args.skip_download,
 		skip_convert=args.skip_convert,
-		load_to_db=args.load_to_db
+		load_to_db=args.load_to_db,
+		county_id=args.county_id,
 	))
 

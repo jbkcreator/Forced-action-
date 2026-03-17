@@ -193,6 +193,7 @@ def enrich_llc_owners(
     limit: int = 500,
     dry_run: bool = False,
     urgency_tiers: list = None,
+    county_id: str = "hillsborough",
 ) -> dict:
     """
     Query LLC-named owners of high-priority scored leads with no phone/email,
@@ -230,6 +231,7 @@ def enrich_llc_owners(
             Owner.phone_1.is_(None),
             Owner.owner_name.isnot(None),
             DistressScore.urgency_level.in_(urgency_tiers),
+            Property.county_id == county_id,
         )
         .order_by(desc(DistressScore.final_cds_score))
         .limit(limit)
@@ -307,6 +309,7 @@ def run_sunbiz_pipeline(
     dry_run: bool = False,
     rescore: bool = False,
     urgency_tiers: list = None,
+    county_id: str = "hillsborough",
 ):
     """
     Run the full Sunbiz enrichment pipeline.
@@ -329,7 +332,7 @@ def run_sunbiz_pipeline(
 
     with get_db_context() as session:
         stats = enrich_llc_owners(
-            session, limit=limit, dry_run=dry_run, urgency_tiers=urgency_tiers
+            session, limit=limit, dry_run=dry_run, urgency_tiers=urgency_tiers, county_id=county_id
         )
 
     logger.info("=" * 60)
@@ -397,6 +400,12 @@ if __name__ == "__main__":
         choices=["Immediate", "High", "Medium", "Low"],
         help="Urgency tiers to target (default: Immediate High)",
     )
+    parser.add_argument(
+        "--county-id",
+        dest="county_id",
+        default="hillsborough",
+        help="County identifier (default: hillsborough)",
+    )
     args = parser.parse_args()
 
     run_sunbiz_pipeline(
@@ -404,4 +413,5 @@ if __name__ == "__main__":
         dry_run=args.dry_run,
         rescore=args.rescore,
         urgency_tiers=args.tiers,
+        county_id=args.county_id,
     )

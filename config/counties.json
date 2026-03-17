@@ -18,6 +18,10 @@
       "parcel_lookup_url": "https://hillsborough.county-taxes.com/public/real_estate/parcels",
       "master_data_url": "https://downloads.hcpafl.org/"
     },
+    "court": {
+      "bankruptcy_code": "flmb",
+      "division_prefix": "8:"
+    },
     "credentials_ref": "HILLSBOROUGH_PORTAL_USER",
     "file_prefix": "hillsborough"
   }
