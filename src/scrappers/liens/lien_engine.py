@@ -558,12 +558,16 @@ def categorize_and_split_data(combined_df: pd.DataFrame) -> dict:
     DEED_DOCTYPES     = {'(D) DEED', '(TAXDEED) TAX DEED', '(DPL) DEED PLAT'}
     JUDGMENT_DOCTYPES = {'(JUD) JUDGMENT', '(CCJ) CERTIFIED COPY OF A COURT JUDGMENT'}
     LIEN_DOCTYPES     = {'(LN) LIEN', '(LNCORPTX) CORP TAX LIEN FOR STATE OF FLORIDA'}
+    LP_DOCTYPES       = {'(LP) LIS PENDENS', 'LIS PENDENS'}
 
     def categorize_record(row):
         doc_type = str(row.get('DocType', '') or '').strip()
 
         if doc_type in DEED_DOCTYPES:
             return 'Deeds'
+
+        if doc_type in LP_DOCTYPES or 'LIS PENDENS' in doc_type.upper():
+            return 'LIS PENDENS'
 
         if doc_type in JUDGMENT_DOCTYPES:
             # Judgments filed by City of Tampa are code enforcement liens, not civil judgments
@@ -593,7 +597,7 @@ def categorize_and_split_data(combined_df: pd.DataFrame) -> dict:
     combined_df['document_type'] = combined_df.apply(categorize_record, axis=1)
 
     lien_types     = ['HOA LIENS (HL)', 'TAMPA CODE LIENS (TCL)', 'COUNTY CODE LIENS (CCL)',
-                      'TAX LIENS (TL)', 'MECHANICS LIENS (ML)']
+                      'TAX LIENS (TL)', 'MECHANICS LIENS (ML)', 'LIS PENDENS']
     deed_types     = ['Deeds']
     judgment_types = ['(JUD) JUDGMENT', '(CCJ) CERTIFIED COPY OF A COURT JUDGMENT']
 

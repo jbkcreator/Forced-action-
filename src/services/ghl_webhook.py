@@ -218,6 +218,7 @@ def _upsert_contact(score_data: Dict) -> Optional[str]:
             f"cds-{score_data.get('lead_tier', '').lower().replace(' ', '-')}",
             f"vertical-{_best_vertical(score_data)}",
             "distressed-property",
+            *( ["synthflow-suppress"] if score_data.get("lead_tier") == "Silver" else ["synthflow-eligible"] ),
         ],
     }
     if phone:

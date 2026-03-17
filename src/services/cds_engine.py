@@ -877,7 +877,8 @@ class MultiVerticalScorer:
         except (TypeError, ValueError):
             latest_score = None
 
-        if latest_score is not None and latest_score == float(final_score):
+        latest_tier = latest.lead_tier if latest else None
+        if latest_score is not None and latest_score == float(final_score) and latest_tier == lead_tier:
             logger.debug(
                 "Score unchanged for property %s: %.2f — skipping",
                 score_data.get("parcel_id"), final_score,

@@ -59,7 +59,7 @@ def scrape_roofing_permits(
     """
     if date_range is None:
         end_date = date.today()
-        start_date = end_date - timedelta(days=30)
+        start_date = end_date - timedelta(days=1)
     else:
         start_date, end_date = date_range
 
