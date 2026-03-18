@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 _FEMA_DISASTERS_URL = "https://www.fema.gov/api/open/v2/DisasterDeclarationsSummaries"
 _FEMA_NFIP_URL = "https://www.fema.gov/api/open/v1/nfipPolicies"
 _NWS_ALERTS_URL = "https://api.weather.gov/alerts/active"
+_NWS_ZONE_URL = "https://api.weather.gov/alerts/active/zone/{zone_id}"
 
 FLOOD_NWS_EVENTS = [
     "Flash Flood Warning",
@@ -45,8 +46,8 @@ def _fetch_fema_declarations(state: str, county_fips: str, start_date: date) -> 
     """Fetch FEMA flood disaster declarations for a state/county since start_date."""
     url = (
         f"{_FEMA_DISASTERS_URL}"
-        f"?$filter=state eq '{state}' and fipsCountyCode eq '{county_fips}'"
-        f" and incidentType eq 'Flood' and declarationDate ge '{start_date.isoformat()}'"
+        f"?$filter=state eq '{state}'"
+        f" and declarationDate ge '{start_date.isoformat()}'"
         f"&$orderby=declarationDate desc&$top=50&$format=json"
     )
     try:
@@ -58,8 +59,33 @@ def _fetch_fema_declarations(state: str, county_fips: str, start_date: date) -> 
         return []
 
 
+def _fetch_nws_flood_alerts_by_zones(zone_ids: List[str]) -> List[str]:
+    """Fetch active NWS flood alerts for specific zone IDs and return affected ZIP codes."""
+    import re
+    affected_zips = set()
+    for zone_id in zone_ids:
+        try:
+            resp = requests.get(
+                _NWS_ZONE_URL.format(zone_id=zone_id),
+                headers={"User-Agent": "ForcedAction/1.0", "Accept": "application/geo+json"},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            for feature in resp.json().get("features", []):
+                props = feature.get("properties", {})
+                event = props.get("event", "")
+                if not any(e in event for e in FLOOD_NWS_EVENTS):
+                    continue
+                description = props.get("description", "") or ""
+                zips = re.findall(r"\b(3[3-4]\d{3})\b", description)
+                affected_zips.update(zips)
+        except Exception as e:
+            logger.warning("[flood] NWS zone fetch failed for %s: %s", zone_id, e)
+    return list(affected_zips)
+
+
 def _fetch_nws_flood_alerts(state: str) -> List[str]:
-    """Fetch active NWS flood alerts and return affected ZIP codes."""
+    """Fetch active NWS flood alerts for a state (fallback when no zone IDs configured)."""
     import re
     affected_zips = set()
     try:
@@ -102,6 +128,7 @@ def scrape_flood_damage(
     fips = config.get("fips", "")
     state = config.get("state", "FL")
     zip_prefixes = config.get("zip_prefixes", [])
+    nws_zones = config.get("nws_zones", [])
 
     if date_range is None:
         end_date = date.today()
@@ -109,17 +136,34 @@ def scrape_flood_damage(
     else:
         start_date, end_date = date_range
 
-    # Source 1: FEMA disaster declarations (county-level)
+    # Source 1: FEMA disaster declarations — fetch state-wide then filter by county FIPS
     county_fips = fips[2:] if len(fips) >= 5 else fips
-    fema_declarations = _fetch_fema_declarations(state, county_fips, start_date)
+    all_declarations = _fetch_fema_declarations(state, county_fips, start_date)
+    _FLOOD_INCIDENT_TYPES = {"Flood", "Hurricane", "Coastal Storm", "Severe Storm", "Typhoon"}
+    fema_declarations = [
+        d for d in all_declarations
+        if str(d.get("fipsCountyCode", "")).zfill(3) == county_fips.zfill(3)
+        and d.get("incidentType") in _FLOOD_INCIDENT_TYPES
+    ]
     has_fema_flood = len(fema_declarations) > 0
+    logger.info("[flood] %s: FEMA state-wide=%d county_flood=%d", county_id, len(all_declarations), len(fema_declarations))
 
-    # Source 2: NWS active flood alerts → affected ZIPs
-    nws_zips = _fetch_nws_flood_alerts(state)
-    county_zips = [z for z in nws_zips if any(z.startswith(p) for p in zip_prefixes)]
+    # Source 2: NWS active flood alerts → affected ZIPs (zone-based or state fallback)
+    if nws_zones:
+        logger.info("[flood] %s: fetching alerts via %d zone(s): %s", county_id, len(nws_zones), nws_zones)
+        nws_zips = _fetch_nws_flood_alerts_by_zones(nws_zones)
+        county_zips = nws_zips  # zone fetch is already county-scoped
+    else:
+        nws_zips = _fetch_nws_flood_alerts(state)
+        county_zips = [z for z in nws_zips if any(z.startswith(p) for p in zip_prefixes)]
 
     if not has_fema_flood and not county_zips:
         logger.info("[flood] %s: no active flood events — 0 incidents", county_id)
+        try:
+            from src.utils.scraper_db_helper import record_scraper_stats
+            record_scraper_stats(source_type='flood_damage', total_scraped=0, matched=0, unmatched=0, skipped=0)
+        except Exception:
+            pass
         return 0
 
     created = 0

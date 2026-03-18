@@ -201,9 +201,12 @@ class BaseLoader(ABC):
         if parts and parts[-1].replace('-', '').isdigit():
             addr = ' '.join(parts[:-1])
         
-        # Remove unit/apt/lot indicators and numbers
-        addr = re.sub(r'\s+(apt|unit|lot|ste|suite|#)\s*\d+', '', addr)
-        
+        # Remove unit/apt/lot/building indicators with numeric or letter designators
+        # Handles: "Apt 4", "Unit B", "Ste 101", "#4A", "Bldg 3", "Fl 2"
+        addr = re.sub(r'\s+(apt|unit|lot|ste|suite|bldg|building|fl|floor|#)\s*[\w-]+', '', addr, flags=re.IGNORECASE)
+        # Remove trailing standalone hash+designator: "123 Main St #4"
+        addr = re.sub(r'\s+#[\w-]+$', '', addr)
+
         return addr.strip()
     
     @staticmethod
@@ -325,7 +328,8 @@ class BaseLoader(ABC):
     def find_property_by_address(
         self,
         address: str,
-        threshold: int = 85
+        threshold: int = 85,
+        zip_code: Optional[str] = None,
     ) -> Optional[Tuple[Property, int]]:
         """
         Find property by address using three escalating strategies.
@@ -344,6 +348,9 @@ class BaseLoader(ABC):
         Args:
             address:   Raw address string from the scraper output.
             threshold: Minimum rapidfuzz score to accept (0-100).
+            zip_code:  Optional ZIP to pre-filter candidates in both strategies.
+                       When provided, narrows the search to matching ZIP only —
+                       safe to pass whenever the source record contains a ZIP.
 
         Returns:
             Tuple of (Property, score) or None.
@@ -362,12 +369,15 @@ class BaseLoader(ABC):
         candidates: list = []
 
         if house_number and house_number.isdigit():
+            ilike_filters = [
+                Property.address.ilike(f"{house_number} %"),
+                Property.county_id == self.county_id,
+            ]
+            if zip_code:
+                ilike_filters.append(Property.zip == zip_code)
             ilike_rows = (
                 self.session.query(Property)
-                .filter(
-                    Property.address.ilike(f"{house_number} %"),
-                    Property.county_id == self.county_id,
-                )
+                .filter(*ilike_filters)
                 .all()
             )
             for prop in ilike_rows:
@@ -384,13 +394,16 @@ class BaseLoader(ABC):
         try:
             from sqlalchemy import func as sqlfunc
             with self.session.begin_nested():   # savepoint — protects outer tx
+                trgm_filters = [
+                    Property.address.isnot(None),
+                    Property.county_id == self.county_id,
+                    sqlfunc.similarity(Property.address, address) >= 0.3,
+                ]
+                if zip_code:
+                    trgm_filters.append(Property.zip == zip_code)
                 trgm_props = (
                     self.session.query(Property)
-                    .filter(
-                        Property.address.isnot(None),
-                        Property.county_id == self.county_id,
-                        sqlfunc.similarity(Property.address, address) >= 0.3,
-                    )
+                    .filter(*trgm_filters)
                     .order_by(sqlfunc.similarity(Property.address, address).desc())
                     .limit(15)
                     .all()

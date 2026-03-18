@@ -53,6 +53,10 @@ from config.settings import settings
 # Can be overridden at runtime via --no-ghl CLI flag; default comes from GHL_PUSH_ENABLED env var
 _GHL_PUSH_ENABLED: bool = settings.ghl_push_enabled
 
+# GHL batching — push leads in chunks with a pause between batches to stay under rate limits
+_GHL_BATCH_SIZE: int = 25   # leads per batch
+_GHL_BATCH_DELAY: float = 3.0  # seconds between batches
+
 from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session, joinedload
 
@@ -128,6 +132,36 @@ class MultiVerticalScorer:
 
     def __init__(self, session: Session):
         self.session = session
+        self._ghl_push_queue: List[Dict] = []
+
+    # ── GHL batch flush ───────────────────────────────────────────────────────
+
+    def _flush_ghl_queue(self) -> None:
+        """Push queued leads to GHL in batches to avoid rate-limit spikes."""
+        import time
+        queue = self._ghl_push_queue
+        if not queue:
+            return
+        total = len(queue)
+        pushed = failed = 0
+        logger.info("[GHL] Flushing %d queued leads in batches of %d", total, _GHL_BATCH_SIZE)
+        for i in range(0, total, _GHL_BATCH_SIZE):
+            batch = queue[i: i + _GHL_BATCH_SIZE]
+            for score_data in batch:
+                try:
+                    push_lead_to_ghl(score_data)
+                    pushed += 1
+                except Exception:
+                    failed += 1
+                    logger.warning(
+                        "[GHL] push failed for property %s",
+                        score_data.get("parcel_id"), exc_info=True,
+                    )
+            if i + _GHL_BATCH_SIZE < total:
+                logger.debug("[GHL] batch %d/%d done — sleeping %.1fs", i // _GHL_BATCH_SIZE + 1, -(-total // _GHL_BATCH_SIZE), _GHL_BATCH_DELAY)
+                time.sleep(_GHL_BATCH_DELAY)
+        logger.info("[GHL] Flush complete — pushed=%d failed=%d", pushed, failed)
+        self._ghl_push_queue.clear()
 
     # ── Signal collection ─────────────────────────────────────────────────────
 
@@ -185,6 +219,12 @@ class MultiVerticalScorer:
         # 7. Building permits
         for bp in (prop.building_permits or []):
             signals.append({"type": "building_permits", "date": bp.issue_date, "amount": None})
+
+        # 8. Incidents (insurance_claim, fire, storm_damage, flood_damage)
+        _INCIDENT_SIGNAL_TYPES = {"insurance_claim", "Fire", "storm_damage", "flood_damage"}
+        for inc in (prop.incidents or []):
+            if inc.incident_type in _INCIDENT_SIGNAL_TYPES:
+                signals.append({"type": inc.incident_type, "date": inc.incident_date, "amount": None})
 
         return signals
 
@@ -851,14 +891,7 @@ class MultiVerticalScorer:
             )
             is_new_contact = not score_data.get("ghl_contact_id")
             if _GHL_PUSH_ENABLED and (score_changed or is_new_contact):
-                try:
-                    push_lead_to_ghl(score_data)
-                except Exception:
-                    logger.warning(
-                        "[GHL] push failed for property %s score=%.2f tier=%s",
-                        score_data.get("parcel_id"), final_score, lead_tier,
-                        exc_info=True,
-                    )
+                self._ghl_push_queue.append(score_data)
             # Detect tier upgrade for stats (tiers ordered best→worst)
             _TIER_ORDER = ["Ultra Platinum", "Platinum", "Gold", "Silver", "Bronze"]
             upgraded = (
@@ -905,14 +938,7 @@ class MultiVerticalScorer:
             score_data.get("parcel_id"), final_score, lead_tier,
         )
         if _GHL_PUSH_ENABLED:
-            try:
-                push_lead_to_ghl(score_data)
-            except Exception:
-                logger.warning(
-                    "[GHL] push failed for property %s score=%.2f tier=%s",
-                    score_data.get("parcel_id"), final_score, lead_tier,
-                    exc_info=True,
-                )
+            self._ghl_push_queue.append(score_data)
         return record, 'new', False
 
     # ── Batch scoring ──────────────────────────────────────────────────────────
@@ -1024,6 +1050,10 @@ class MultiVerticalScorer:
                     "%d properties failed to score — check logs above for details",
                     failed_count,
                 )
+            # Flush GHL push queue in batches
+            if _GHL_PUSH_ENABLED:
+                self._flush_ghl_queue()
+
             # Persist platform-level daily stats
             try:
                 self._record_platform_stats(

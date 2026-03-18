@@ -43,6 +43,10 @@ VERTICAL_WEIGHTS = {
         "hoa_liens": 55,
         "evictions": 45,         # Adjusted [cite: 109]
         "mechanics_liens": 55,
+        "insurance_claim": 10,   # Stacking only
+        "Fire": 10,              # Stacking only
+        "storm_damage": 10,      # Stacking only
+        "flood_damage": 10,      # Stacking only
         "tampa_code_liens": 35,
         "county_code_liens": 30,
         "building_permits": 20,
@@ -59,6 +63,10 @@ VERTICAL_WEIGHTS = {
         "hoa_liens": 50,         # Adjusted [cite: 109]
         "deed_transfers": 45,    # Adjusted [cite: 109]
         "evictions": 40,         # Adjusted [cite: 109]
+        "insurance_claim": 10,   # Stacking only
+        "Fire": 10,              # Stacking only
+        "storm_damage": 10,      # Stacking only
+        "flood_damage": 10,      # Stacking only
         "tampa_code_liens": 45,
         "code_violations": 50,
         "building_permits": 45,
@@ -66,6 +74,10 @@ VERTICAL_WEIGHTS = {
     },
     "restoration": {
         "code_violations": 90,   # Kept high for this vertical [cite: 109]
+        "insurance_claim": 10,   # Stacking only
+        "Fire": 10,              # Stacking only
+        "storm_damage": 10,      # Stacking only
+        "flood_damage": 10,      # Stacking only
         "tampa_code_liens": 75,  # Adjusted [cite: 109]
         "building_permits": 60,  # Adjusted [cite: 109]
         "evictions": 65,
@@ -82,6 +94,10 @@ VERTICAL_WEIGHTS = {
     },
     "roofing": {
         "building_permits": 65,  # Lowered from 95 [cite: 109]
+        "insurance_claim": 10,   # Stacking only
+        "Fire": 10,              # Stacking only
+        "storm_damage": 10,      # Stacking only
+        "flood_damage": 10,      # Stacking only
         "code_violations": 68,   # Lowered from 90 [cite: 109]
         "tampa_code_liens": 65,  # Lowered from 80 [cite: 109]
         "mechanics_liens": 60,   # Adjusted [cite: 109]
@@ -98,6 +114,10 @@ VERTICAL_WEIGHTS = {
     },
     "public_adjusters": {        # Activated Vertical
         "code_violations": 85,
+        "insurance_claim": 10,   # Stacking only
+        "Fire": 10,              # Stacking only
+        "storm_damage": 10,      # Stacking only
+        "flood_damage": 10,      # Stacking only
         "tampa_code_liens": 70,  # Adjusted from 80
         "building_permits": 55,  # Adjusted [cite: 109]
         "hoa_liens": 50,         # Adjusted from 55
@@ -122,6 +142,10 @@ VERTICAL_WEIGHTS = {
         "mechanics_liens": 50,   # Adjusted [cite: 109]
         "tax_delinquencies": 50, # Adjusted [cite: 109]
         "probate": 40,           # Adjusted [cite: 109]
+        "insurance_claim": 10,   # Stacking only
+        "Fire": 10,              # Stacking only
+        "storm_damage": 10,      # Stacking only
+        "flood_damage": 10,      # Stacking only
         "code_violations": 30,
         "building_permits": 20,
         "evictions": 25,

@@ -26,6 +26,7 @@ from sqlalchemy import select, and_
 logger = logging.getLogger(__name__)
 
 _NWS_ALERTS_URL = "https://api.weather.gov/alerts/active"
+_NWS_ZONE_URL = "https://api.weather.gov/alerts/active/zone/{zone_id}"
 
 # NWS event types that indicate storm/wind/hail damage relevant to roofing
 STORM_EVENT_TYPES = [
@@ -45,8 +46,26 @@ STORM_EVENT_TYPES = [
 ]
 
 
+def _fetch_nws_alerts_by_zones(zone_ids: List[str]) -> List[Dict]:
+    """Fetch active NWS alerts for a list of NWS zone IDs (preferred — precise)."""
+    features = []
+    for zone_id in zone_ids:
+        try:
+            resp = requests.get(
+                _NWS_ZONE_URL.format(zone_id=zone_id),
+                headers={"User-Agent": "ForcedAction/1.0 (distressed-property-intelligence)",
+                         "Accept": "application/geo+json"},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            features.extend(resp.json().get("features", []))
+        except Exception as e:
+            logger.warning("[storm] NWS zone fetch failed for %s: %s", zone_id, e)
+    return features
+
+
 def _fetch_nws_alerts(state: str = "FL") -> List[Dict]:
-    """Fetch active NWS alerts for a state."""
+    """Fetch active NWS alerts for a state (fallback when no zone IDs configured)."""
     try:
         resp = requests.get(
             _NWS_ALERTS_URL,
@@ -100,8 +119,14 @@ def scrape_storm_damage(
 
     state = config.get("state", "FL")
     zip_prefixes = config.get("zip_prefixes", [])
+    nws_zones = config.get("nws_zones", [])
 
-    alerts = _fetch_nws_alerts(state)
+    if nws_zones:
+        logger.info("[storm] %s: fetching alerts via %d zone(s): %s", county_id, len(nws_zones), nws_zones)
+        alerts = _fetch_nws_alerts_by_zones(nws_zones)
+    else:
+        logger.info("[storm] %s: no nws_zones configured, falling back to state-level fetch", county_id)
+        alerts = _fetch_nws_alerts(state)
 
     affected_zips: set = set()
     storm_date = date.today()
@@ -121,6 +146,11 @@ def scrape_storm_damage(
 
     if not affected_zips:
         logger.info("[storm] %s: no active storm alerts — 0 incidents", county_id)
+        try:
+            from src.utils.scraper_db_helper import record_scraper_stats
+            record_scraper_stats(source_type='storm_damage', total_scraped=0, matched=0, unmatched=0, skipped=0)
+        except Exception:
+            pass
         return 0
 
     created = 0

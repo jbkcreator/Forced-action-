@@ -22,6 +22,7 @@
       "bankruptcy_code": "flmb",
       "division_prefix": "8:"
     },
+    "nws_zones": ["FLC057", "FLZ151", "FLZ251"],
     "credentials_ref": "HILLSBOROUGH_PORTAL_USER",
     "file_prefix": "hillsborough"
   }

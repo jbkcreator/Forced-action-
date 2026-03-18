@@ -3,6 +3,7 @@ Building permit loader.
 """
 
 import logging
+import re
 from typing import Tuple
 
 import pandas as pd
@@ -48,10 +49,13 @@ class BuildingPermitLoader(BaseLoader):
                 skipped += 1
                 continue
             
-            # Match by address
+            # Match by address — extract ZIP from raw address if present
             property_record = None
             if pd.notna(row.get('Address')):
-                match_result = self.find_property_by_address(row['Address'])
+                raw_address = str(row['Address'])
+                zip_match = re.search(r'\b(\d{5})\b', raw_address)
+                zip_code = zip_match.group(1) if zip_match else None
+                match_result = self.find_property_by_address(raw_address, zip_code=zip_code)
                 if match_result:
                     property_record, score = match_result
                     logger.info(f"Matched permit by address (score: {score}%): {record_number}")
