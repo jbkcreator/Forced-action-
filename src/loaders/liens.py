@@ -101,20 +101,24 @@ class LienLoader(BaseLoader):
             # Strategy B: Owner name (Grantor)
             # For IRS Tax Liens (TL), Grantor = "UNITED STATES OF AMERICA" (the filer),
             # so the property owner is in Grantee instead — try that first for TL.
+            # TCL/CCL have no Legal description from the county export and use generic
+            # personal names as Grantor — raise threshold to 90% to avoid false matches.
             doc_type_str = str(row.get('document_type', ''))
             is_tax_lien = 'TAX LIEN' in doc_type_str.upper()
+            is_code_lien = 'TCL' in doc_type_str.upper() or 'CCL' in doc_type_str.upper()
+            name_threshold = 90 if is_code_lien else 75
 
             if not property_record and is_tax_lien and pd.notna(row.get('Grantee')):
-                match_result = self.find_property_by_owner_name(row['Grantee'])
+                match_result = self.find_property_by_owner_name(row['Grantee'], threshold=name_threshold)
                 if match_result:
                     property_record, score = match_result
                     logger.info(f"Matched tax lien by grantee/owner name (score: {score}%): {instrument}")
 
             if not property_record and not is_tax_lien and pd.notna(row.get('Grantor')):
-                match_result = self.find_property_by_owner_name(row['Grantor'])
+                match_result = self.find_property_by_owner_name(row['Grantor'], threshold=name_threshold)
                 if match_result:
                     property_record, score = match_result
-                    logger.info(f"Matched lien by name (score: {score}%): {instrument}")
+                    logger.info(f"Matched lien by name (score: {score}%, threshold: {name_threshold}%): {instrument}")
             
             if property_record:
                 try:
