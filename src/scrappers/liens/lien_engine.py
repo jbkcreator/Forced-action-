@@ -724,7 +724,7 @@ async def run_lien_pipeline(start_date: str = None, end_date: str = None, run_al
     # Compute date range (YYYY-MM-DD → MM/DD/YYYY for site forms)
     _today = datetime.now()
     _end_dt   = datetime.strptime(end_date,   "%Y-%m-%d") if end_date   else _today
-    _start_dt = datetime.strptime(start_date, "%Y-%m-%d") if start_date else (_end_dt - timedelta(days=3))
+    _start_dt = datetime.strptime(start_date, "%Y-%m-%d") if start_date else _end_dt
     start_str = _start_dt.strftime("%m/%d/%Y")
     end_str   = _end_dt.strftime("%m/%d/%Y")
     logger.info(f"Date range: {start_str} → {end_str}")

@@ -765,10 +765,10 @@ class BaseLoader(ABC):
             return current_best, 'llm_verified'
         else:
             logger.info(
-                "[LLM] Rejected borderline match (confidence=%s, score=%d%%, record_type=%s): %s",
+                "[LLM] Could not improve match (confidence=%s, score=%d%%, record_type=%s): %s — keeping original",
                 llm_result.confidence, match_score, record_type, llm_result.reason,
             )
-            return None, None  # caller quarantines
+            return current_best, 'owner_name'  # LLM couldn't find better — keep original match
 
     # ========================================================================
     # DUPLICATE CHECKING
