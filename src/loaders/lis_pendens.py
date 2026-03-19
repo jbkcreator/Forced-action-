@@ -103,7 +103,7 @@ class LisPendensLoader(BaseLoader):
                 # Skip multi-party grantee strings (defendant list with bullets/commas)
                 # — they're not suitable for name matching
                 if len(grantee) < 120 and grantee.count(',') <= 2:
-                    match_result = self.find_property_by_owner_name(grantee)
+                    match_result = self.find_property_by_owner_name(grantee, threshold=75)
                     if match_result:
                         property_record, score = match_result
                         logger.info(f"Matched LP by grantee (score: {score}%): {instrument}")

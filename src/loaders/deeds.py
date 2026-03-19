@@ -75,7 +75,7 @@ class DeedLoader(BaseLoader):
 
             # Strategy B: Grantor (seller) name
             if not property_record and pd.notna(row.get('Grantor')):
-                match_result = self.find_property_by_owner_name(row['Grantor'])
+                match_result = self.find_property_by_owner_name(row['Grantor'], threshold=75)
                 if match_result:
                     property_record, score = match_result
                     logger.info(f"Matched deed by grantor (score: {score}%): {instrument}")
@@ -87,7 +87,7 @@ class DeedLoader(BaseLoader):
 
             # Strategy C: Grantee (buyer) name
             if not property_record and pd.notna(row.get('Grantee')):
-                match_result = self.find_property_by_owner_name(row['Grantee'])
+                match_result = self.find_property_by_owner_name(row['Grantee'], threshold=75)
                 if match_result:
                     property_record, score = match_result
                     logger.info(f"Matched deed by grantee (score: {score}%): {instrument}")
