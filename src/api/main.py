@@ -154,6 +154,7 @@ def create_checkout(payload: CheckoutRequest, db: Session = Depends(get_db)):
                 "vertical": payload.vertical,
                 "county_id": payload.county_id,
                 "is_founding": str(is_founding),
+                "founding_price_id": price_id if is_founding else "",
                 "zip_codes": ",".join(payload.zip_codes),
             },
             return_url=f"{_s.app_base_url}/success?session_id={{CHECKOUT_SESSION_ID}}",
