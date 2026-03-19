@@ -69,9 +69,29 @@
         </div>
       </div>
 
+      <!-- Dashboard link (populated from URL param ?feed_uuid=...) -->
+      <div id="dashboard-link-wrap" class="hidden mb-6">
+        <a id="dashboard-link" href="#"
+          class="inline-block bg-yellow-400 text-slate-900 font-bold px-6 py-3 rounded-xl hover:bg-yellow-300 transition text-sm">
+          Access your lead feed →
+        </a>
+      </div>
+
       <p class="text-slate-500 text-sm">
         Questions? <a href="mailto:support@forcedaction.io" class="text-slate-400 hover:text-white transition">support@forcedaction.io</a>
       </p>
+
+      <script>
+        // Populate dashboard link from URL param if present
+        const params = new URLSearchParams(location.search);
+        const uuid = params.get('feed_uuid');
+        if (uuid) {
+          const wrap = document.getElementById('dashboard-link-wrap');
+          const link = document.getElementById('dashboard-link');
+          link.href = `/dashboard/${uuid}`;
+          wrap.classList.remove('hidden');
+        }
+      </script>
 
     </div>
   </main>

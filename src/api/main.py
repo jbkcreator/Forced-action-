@@ -26,7 +26,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select, and_, desc, func
 
 from src.core.database import get_db_context
-from src.core.models import FoundingSubscriberCount, ZipTerritory, Subscriber, Property, DistressScore, Incident
+from src.core.models import FoundingSubscriberCount, ZipTerritory, Subscriber, Property, DistressScore, Incident, LeadPackPurchase
 from src.services.stripe_webhooks import handle_webhook
 from src.services.stripe_service import get_price_id_for_checkout
 from config.settings import get_settings
@@ -200,6 +200,65 @@ def create_checkout(payload: CheckoutRequest, db: Session = Depends(get_db)):
 @app.get("/success", include_in_schema=False)
 def success_page():
     return FileResponse(str(STATIC_DIR / "success.html"))
+
+
+# ---------------------------------------------------------------------------
+# GET /dashboard/{feed_uuid} — Subscriber dashboard (leads + cancel modal)
+# ---------------------------------------------------------------------------
+
+@app.get("/dashboard/{feed_uuid}", include_in_schema=False)
+def dashboard_page(feed_uuid: str):
+    return FileResponse(str(STATIC_DIR / "dashboard.html"))
+
+
+# ---------------------------------------------------------------------------
+# POST /api/portal-session — Create Stripe billing portal session
+# ---------------------------------------------------------------------------
+
+class PortalSessionRequest(BaseModel):
+    feed_uuid: str
+
+
+@app.post("/api/portal-session")
+def create_portal_session(req: PortalSessionRequest, db: Session = Depends(get_db)):
+    """Create a Stripe billing portal session so subscribers can update card / cancel."""
+    settings = get_settings()
+    if not settings.stripe_secret_key:
+        raise HTTPException(status_code=503, detail="Billing portal not configured")
+
+    subscriber = db.execute(
+        select(Subscriber).where(Subscriber.event_feed_uuid == req.feed_uuid)
+    ).scalar_one_or_none()
+
+    if not subscriber or not subscriber.stripe_customer_id:
+        raise HTTPException(status_code=404, detail="Subscriber not found")
+
+    stripe.api_key = settings.stripe_secret_key.get_secret_value()
+    try:
+        session = stripe.billing_portal.Session.create(
+            customer=subscriber.stripe_customer_id,
+            return_url=f"{settings.app_base_url}/dashboard/{req.feed_uuid}",
+        )
+        return {"url": session.url}
+    except stripe.StripeError as exc:
+        logger.error("Stripe portal session error for subscriber %s: %s", subscriber.id, exc)
+        raise HTTPException(status_code=502, detail="Could not create billing portal session")
+
+
+# ---------------------------------------------------------------------------
+# POST /api/log-event — Client-side event logger (cancel confirm / abort)
+# ---------------------------------------------------------------------------
+
+class LogEventRequest(BaseModel):
+    event: str      # e.g. "cancel_confirm", "cancel_abort"
+    feed_uuid: str
+
+
+@app.post("/api/log-event")
+def log_client_event(req: LogEventRequest):
+    """Log a subscriber UI event (cancel modal clicks) for audit trail."""
+    logger.info("CLIENT EVENT: event=%s feed_uuid=%s", req.event, req.feed_uuid)
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
@@ -579,6 +638,7 @@ def event_feed(
             "vertical": subscriber.vertical,
             "county_id": subscriber.county_id,
             "locked_zips": list(locked_zips),
+            "founding_member": subscriber.founding_member,
         },
         "total": total,
         "page": page,
@@ -763,3 +823,72 @@ def sample_leads(
         })
 
     return {"zip_code": zip_code, "vertical": vertical, "leads": leads}
+
+
+# ---------------------------------------------------------------------------
+# GET /api/lead-pack/{purchase_id} — Retrieve lead pack delivery (fallback)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/lead-pack/{purchase_id}")
+def lead_pack_detail(purchase_id: int, db: Session = Depends(get_db)):
+    """
+    Return the 5 leads for a given lead pack purchase.
+    Authenticated by purchase_id (secret by obscurity — no subscriber login needed for MVP).
+    Used as a fallback if the delivery email is not received.
+    """
+    try:
+        purchase = db.execute(
+            select(LeadPackPurchase).where(LeadPackPurchase.id == purchase_id)
+        ).scalar_one_or_none()
+    except OperationalError:
+        logger.error("DB error fetching lead pack %s", purchase_id, exc_info=True)
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
+
+    if not purchase:
+        raise HTTPException(status_code=404, detail={"error": "not_found", "message": "Lead pack not found"})
+
+    if not purchase.lead_ids:
+        return {
+            "purchase_id": purchase_id,
+            "status": purchase.status,
+            "leads": [],
+        }
+
+    try:
+        score_col = DistressScore.vertical_scores[purchase.vertical].as_float()
+        rows = db.execute(
+            select(Property, DistressScore)
+            .join(DistressScore, DistressScore.property_id == Property.id)
+            .where(Property.id.in_(purchase.lead_ids))
+            .order_by(desc(score_col))
+        ).all()
+    except OperationalError:
+        logger.error("DB error fetching leads for pack %s", purchase_id, exc_info=True)
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
+
+    leads = []
+    for prop, score in rows:
+        leads.append({
+            "property_id": prop.id,
+            "address": prop.address,
+            "city": prop.city,
+            "state": prop.state,
+            "zip": prop.zip,
+            "property_type": prop.property_type,
+            "year_built": prop.year_built,
+            "sq_ft": prop.sq_ft,
+            "cds_score": float(score.final_cds_score) if score.final_cds_score else None,
+            "vertical_score": score.vertical_scores.get(purchase.vertical) if score.vertical_scores else None,
+            "lead_tier": score.lead_tier,
+            "distress_types": score.distress_types,
+        })
+
+    return {
+        "purchase_id": purchase_id,
+        "zip_code": purchase.zip_code,
+        "vertical": purchase.vertical,
+        "status": purchase.status,
+        "purchased_at": purchase.purchased_at.isoformat() if purchase.purchased_at else None,
+        "exclusive_until": purchase.exclusive_until.isoformat() if purchase.exclusive_until else None,
+        "leads": leads,
+    }

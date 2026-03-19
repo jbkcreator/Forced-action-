@@ -195,6 +195,17 @@ STACKING_WINDOW_DAYS      = 90   # Expanded from 60 during DB build-up phase; re
 STACKING_BONUS_PER_SIGNAL = 20
 STACKING_BONUS_CAP        = 40
 
+# ── Stacking-only signals ─────────────────────────────────────────────────────
+# These signals cannot act as the PRIMARY scoring signal on their own.
+# A property carrying ONLY these signal types is not scored (returns 0).
+# They contribute only as stacking bonuses when a primary signal is also present.
+STACKING_ONLY_SIGNALS = {
+    "insurance_claim",
+    "fire",
+    "storm_damage",
+    "flood_damage",
+}
+
 # ── Age decay ─────────────────────────────────────────────────────────────────
 # Applied as a negative modifier to signals that are stale.
 # Penalises old records even if their base weight is high (may be settled/resolved).

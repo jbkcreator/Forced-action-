@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 
 class DeedLoader(BaseLoader):
     """Loader for property deeds (ownership transfers)."""
+
+    _LLM_MAX_CALLS = 30
     
     def load_from_dataframe(
         self,
@@ -77,6 +79,11 @@ class DeedLoader(BaseLoader):
                 if match_result:
                     property_record, score = match_result
                     logger.info(f"Matched deed by grantor (score: {score}%): {instrument}")
+                    property_record, _ = self._apply_llm_verification(
+                        raw_row=row.to_dict() if hasattr(row, 'to_dict') else dict(row),
+                        current_best=property_record, match_score=score,
+                        record_type='deed', match_field='Grantor',
+                    )
 
             # Strategy C: Grantee (buyer) name
             if not property_record and pd.notna(row.get('Grantee')):
@@ -84,6 +91,11 @@ class DeedLoader(BaseLoader):
                 if match_result:
                     property_record, score = match_result
                     logger.info(f"Matched deed by grantee (score: {score}%): {instrument}")
+                    property_record, _ = self._apply_llm_verification(
+                        raw_row=row.to_dict() if hasattr(row, 'to_dict') else dict(row),
+                        current_best=property_record, match_score=score,
+                        record_type='deed', match_field='Grantee',
+                    )
             
             if property_record:
                 try:

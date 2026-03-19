@@ -66,8 +66,17 @@ class AppSettings(BaseSettings):
 	batch_skip_tracing_api_key: Optional[SecretStr] = Field(default=None, env="BATCH_SKIP_TRACING_API_KEY")
 	idi_api_key: Optional[SecretStr] = Field(default=None, env="IDI_API_KEY")
 
+	# SMTP (used by welcome email, payment receipts, grace period alerts)
+	smtp_host: Optional[str] = Field(default=None, env="SMTP_HOST")
+	smtp_port: int = Field(default=587, env="SMTP_PORT")
+	smtp_user: Optional[str] = Field(default=None, env="SMTP_USER")
+	smtp_pass: Optional[SecretStr] = Field(default=None, env="SMTP_PASS")
+	email_from: Optional[str] = Field(default=None, env="EMAIL_FROM")  # falls back to smtp_user if not set
+	alert_email: Optional[str] = Field(default=None, env="ALERT_EMAIL")  # ops alert recipient
+
 	# Alerting
 	alert_sms_number: Optional[str] = Field(default=None, env="ALERT_SMS_NUMBER")  # SMS target for match-rate alerts
+	alert_sms_carrier: Optional[str] = Field(default=None, env="ALERT_SMS_CARRIER")  # e.g. tmomail.net, vtext.com
 
 	# Database Configuration
 	database_url: str = Field(

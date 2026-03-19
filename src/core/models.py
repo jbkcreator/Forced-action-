@@ -101,7 +101,7 @@ class Property(Base):
         Index("idx_property_zip", "zip"),
         Index("idx_property_county_id", "county_id"),
         Index("idx_property_sync_status", "sync_status"),
-        CheckConstraint("sync_status IN ('pending', 'synced', 'error')", name="check_sync_status"),
+        CheckConstraint("sync_status IN ('pending', 'pending_sync', 'synced', 'sync_failed', 'error')", name="check_sync_status"),
     )
 
     def __repr__(self):
@@ -305,6 +305,10 @@ class LegalAndLien(Base):
     legal_description: Mapped[Optional[str]] = mapped_column(Text)
     meta_data: Mapped[Optional[dict]] = mapped_column(JSONB)  # Additional type-specific fields
 
+    # Match provenance — populated by the loader at insert time
+    match_confidence: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    match_method: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)  # legal_desc | owner_name | llm_verified | address | manual
+
     # Load tracking & multi-county
     date_added: Mapped[Optional[date]] = mapped_column(Date, default=date.today, index=True)
     county_id: Mapped[Optional[str]] = mapped_column(String(50), default='hillsborough', index=True)
@@ -318,7 +322,12 @@ class LegalAndLien(Base):
         Index("idx_legal_filing_date", "filing_date"),
         Index("idx_legal_instrument", "instrument_number"),
         Index("idx_legal_meta_data", "meta_data", postgresql_using="gin"),
+        Index("idx_legal_match_method", "match_method"),
         CheckConstraint("record_type IN ('Lien', 'Judgment')", name="check_lien_record_type"),
+        CheckConstraint(
+            "match_method IN ('legal_desc', 'owner_name', 'llm_verified', 'address', 'manual')",
+            name="check_legal_match_method",
+        ),
     )
 
     def __repr__(self):
@@ -458,11 +467,12 @@ class TaxDelinquency(Base):
     # Relationship
     property: Mapped["Property"] = relationship("Property", back_populates="tax_delinquencies")
 
-    # Indexes
+    # Indexes and constraints
     __table_args__ = (
         Index("idx_tax_year", "tax_year"),
         Index("idx_tax_years_delinquent", "years_delinquent"),
         Index("idx_tax_deed_app_date", "deed_app_date"),
+        UniqueConstraint("property_id", "tax_year", name="uq_tax_delinquency_property_year"),
     )
 
     def __repr__(self):
@@ -693,6 +703,7 @@ class Subscriber(Base):
     founding_member: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     founding_price_id: Mapped[Optional[str]] = mapped_column(String(100))  # Stripe price_id locked at checkout
     rate_locked_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    escalated_at: Mapped[Optional[datetime]] = mapped_column(DateTime)     # set when 6-month founding rate expires
 
     # Subscription state
     status: Mapped[str] = mapped_column(String(20), default='active', nullable=False)  # active | grace | churned | cancelled
@@ -983,3 +994,68 @@ class UnmatchedRecord(Base):
 
     def __repr__(self):
         return f"<UnmatchedRecord(id={self.id}, source='{self.source_type}', status='{self.match_status}')>"
+
+
+# ============================================================================
+# 8. LEAD PACK PURCHASES
+# ============================================================================
+
+class LeadPackPurchase(Base):
+    """
+    Tracks $99 lead pack purchases (5 leads, 72-hour exclusivity).
+
+    When a subscriber purchases a lead pack, the top 5 scored properties
+    for their ZIP+vertical are selected, locked for 72 hours exclusively
+    to that subscriber, and delivered via email immediately.
+    """
+    __tablename__ = "lead_pack_purchases"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+
+    # Subscriber who purchased
+    subscriber_id: Mapped[int] = mapped_column(
+        ForeignKey("subscribers.id"), nullable=False, index=True
+    )
+
+    # Purchase scope
+    zip_code: Mapped[str] = mapped_column(String(10), nullable=False)
+    vertical: Mapped[str] = mapped_column(String(50), nullable=False)
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False, default="hillsborough")
+
+    # Stripe reference (unique — prevents double-processing a webhook)
+    stripe_payment_intent_id: Mapped[str] = mapped_column(
+        String(100), unique=True, nullable=False, index=True
+    )
+
+    # Lifecycle
+    status: Mapped[str] = mapped_column(
+        String(20), default="pending", nullable=False
+    )  # pending | delivered | expired
+
+    # Timestamps
+    purchased_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    exclusive_until: Mapped[Optional[datetime]] = mapped_column(DateTime)  # purchased_at + 72h
+
+    # The 5 selected property IDs (set at purchase time)
+    lead_ids: Mapped[Optional[list]] = mapped_column(ARRAY(Integer))
+
+    # Relationship
+    subscriber: Mapped["Subscriber"] = relationship("Subscriber")
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'delivered', 'expired')",
+            name="check_lead_pack_status",
+        ),
+        Index("idx_lead_pack_zip_vertical", "zip_code", "vertical"),
+        Index("idx_lead_pack_exclusive_until", "exclusive_until"),
+    )
+
+    def __repr__(self):
+        return (
+            f"<LeadPackPurchase(id={self.id}, subscriber_id={self.subscriber_id}, "
+            f"zip={self.zip_code}, status={self.status})>"
+        )

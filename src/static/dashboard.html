@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Your Leads — Forced Action</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+    * { font-family: 'Inter', sans-serif; }
+    .gradient-bg { background: linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #0f172a 100%); }
+
+    /* Cancel modal */
+    #cancel-modal {
+      display: none;
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.7);
+      z-index: 50;
+      align-items: center;
+      justify-content: center;
+    }
+    #cancel-modal.open { display: flex; }
+  </style>
+</head>
+<body class="gradient-bg min-h-screen text-white">
+
+  <!-- NAV -->
+  <nav class="border-b border-white/10 px-6 py-4">
+    <div class="max-w-6xl mx-auto flex items-center justify-between">
+      <span class="text-xl font-bold tracking-tight">Forced <span class="text-yellow-400">Action</span></span>
+      <div class="flex items-center gap-4">
+        <span id="founding-badge" class="hidden text-xs font-semibold bg-yellow-400/10 border border-yellow-400/40 text-yellow-400 px-3 py-1 rounded-full">
+          Founding Member — Rate Locked Forever
+        </span>
+        <button onclick="openCancelModal()" class="text-sm text-slate-400 hover:text-white transition">
+          Manage Subscription
+        </button>
+      </div>
+    </div>
+  </nav>
+
+  <!-- MAIN -->
+  <main class="max-w-6xl mx-auto px-6 py-10">
+
+    <!-- Subscriber info bar -->
+    <div id="sub-info" class="hidden mb-8 flex flex-wrap gap-3 text-sm">
+      <span id="sub-tier" class="bg-white/5 border border-white/10 rounded-full px-3 py-1 text-slate-300"></span>
+      <span id="sub-vertical" class="bg-white/5 border border-white/10 rounded-full px-3 py-1 text-slate-300"></span>
+      <span id="sub-zips" class="bg-white/5 border border-white/10 rounded-full px-3 py-1 text-slate-300"></span>
+    </div>
+
+    <!-- Lead count -->
+    <div class="flex items-center justify-between mb-6">
+      <h1 class="text-2xl font-extrabold">Your Lead Feed</h1>
+      <span id="lead-count" class="text-slate-400 text-sm"></span>
+    </div>
+
+    <!-- Lead list -->
+    <div id="lead-list" class="space-y-4"></div>
+
+    <!-- Pagination -->
+    <div id="pagination" class="hidden mt-8 flex gap-3 justify-center">
+      <button id="prev-btn" onclick="loadPage(currentPage - 1)"
+        class="px-4 py-2 rounded-lg bg-white/5 border border-white/10 text-sm hover:bg-white/10 disabled:opacity-40">
+        ← Previous
+      </button>
+      <span id="page-info" class="text-slate-400 text-sm self-center"></span>
+      <button id="next-btn" onclick="loadPage(currentPage + 1)"
+        class="px-4 py-2 rounded-lg bg-white/5 border border-white/10 text-sm hover:bg-white/10 disabled:opacity-40">
+        Next →
+      </button>
+    </div>
+
+    <!-- Error state -->
+    <div id="error-state" class="hidden text-center py-20 text-slate-400">
+      <p class="text-lg mb-2">Unable to load your feed.</p>
+      <p class="text-sm">If this persists, contact <a href="mailto:support@forcedaction.io" class="underline">support@forcedaction.io</a></p>
+    </div>
+
+    <!-- Empty state -->
+    <div id="empty-state" class="hidden text-center py-20">
+      <p class="text-slate-400 text-lg mb-2">No leads yet.</p>
+      <p class="text-slate-500 text-sm">Your feed populates as new distress signals are scraped nightly. Check back tomorrow morning.</p>
+    </div>
+
+  </main>
+
+
+  <!-- ===== CANCELLATION FORFEIT MODAL ===== -->
+  <div id="cancel-modal">
+    <div class="bg-slate-900 border border-white/10 rounded-2xl p-8 max-w-md w-full mx-4 shadow-2xl">
+      <h2 class="text-xl font-bold mb-4">Are you sure you want to cancel?</h2>
+      <p class="text-slate-300 text-sm leading-relaxed mb-6">
+        Cancelling forfeits your Founding Member rate lock permanently.
+        If you resubscribe, you will pay the current regular price.
+        There are no refunds for the current billing period.
+      </p>
+      <div class="flex flex-col gap-3">
+        <button
+          onclick="confirmCancel()"
+          class="w-full py-3 rounded-xl bg-red-600 hover:bg-red-500 text-white font-semibold transition">
+          Yes, cancel my subscription
+        </button>
+        <button
+          onclick="abortCancel()"
+          class="w-full py-3 rounded-xl bg-white/5 border border-white/10 hover:bg-white/10 text-slate-300 font-medium transition">
+          Keep my subscription
+        </button>
+      </div>
+    </div>
+  </div>
+
+
+  <script>
+    // ── State ────────────────────────────────────────────────────────────
+    const feedUUID = location.pathname.split('/dashboard/')[1];
+    let currentPage = 1;
+    let totalPages = 1;
+
+    // ── Boot ─────────────────────────────────────────────────────────────
+    loadPage(1);
+
+    // ── Feed loader ───────────────────────────────────────────────────────
+    async function loadPage(page) {
+      currentPage = page;
+      try {
+        const res = await fetch(`/api/feed/${feedUUID}?page=${page}&page_size=25`);
+        if (!res.ok) { showError(); return; }
+        const data = await res.json();
+        renderFeed(data);
+      } catch (e) {
+        showError();
+      }
+    }
+
+    function renderFeed(data) {
+      const sub = data.subscriber || {};
+      totalPages = data.pages || 1;
+
+      // Founding badge
+      if (sub.founding_member) {
+        document.getElementById('founding-badge').classList.remove('hidden');
+      }
+
+      // Sub info bar
+      const infoEl = document.getElementById('sub-info');
+      infoEl.classList.remove('hidden');
+      document.getElementById('sub-tier').textContent = `${capitalize(sub.tier || '')} Plan`;
+      document.getElementById('sub-vertical').textContent = capitalize(sub.vertical || '');
+      const zips = (sub.locked_zips || []).join(', ');
+      document.getElementById('sub-zips').textContent = zips ? `ZIPs: ${zips}` : 'No locked ZIPs';
+
+      // Lead count
+      document.getElementById('lead-count').textContent =
+        `${data.total} lead${data.total !== 1 ? 's' : ''} · Page ${currentPage} of ${totalPages}`;
+
+      // Lead list
+      const list = document.getElementById('lead-list');
+      if (!data.leads || data.leads.length === 0) {
+        list.innerHTML = '';
+        document.getElementById('empty-state').classList.remove('hidden');
+        document.getElementById('pagination').classList.add('hidden');
+        return;
+      }
+      document.getElementById('empty-state').classList.add('hidden');
+      list.innerHTML = data.leads.map(lead => renderLeadCard(lead)).join('');
+
+      // Pagination
+      const pag = document.getElementById('pagination');
+      if (totalPages > 1) {
+        pag.classList.remove('hidden');
+        document.getElementById('page-info').textContent = `${currentPage} / ${totalPages}`;
+        document.getElementById('prev-btn').disabled = currentPage <= 1;
+        document.getElementById('next-btn').disabled = currentPage >= totalPages;
+      } else {
+        pag.classList.add('hidden');
+      }
+    }
+
+    function renderLeadCard(lead) {
+      const tier = lead.lead_tier || '';
+      const tierColor = tier === 'Ultra Platinum' ? 'text-purple-400' :
+                        tier === 'Platinum' ? 'text-yellow-400' :
+                        tier === 'Gold' ? 'text-amber-400' : 'text-slate-400';
+      const distress = (lead.distress_types || []).join(' · ') || 'Multiple signals';
+
+      return `
+        <div class="bg-white/5 border border-white/10 rounded-2xl p-5 hover:bg-white/8 transition">
+          <div class="flex items-start justify-between gap-4 flex-wrap">
+            <div>
+              <p class="font-semibold text-white">${esc(lead.address)}</p>
+              <p class="text-slate-400 text-sm">${esc(lead.city)}, ${esc(lead.state)} ${esc(lead.zip)}</p>
+            </div>
+            <div class="text-right shrink-0">
+              <p class="text-2xl font-extrabold">${Math.round(lead.cds_score || 0)}</p>
+              <p class="${tierColor} text-xs font-semibold">${esc(tier)}</p>
+            </div>
+          </div>
+          <div class="mt-3 flex flex-wrap gap-2">
+            ${(lead.distress_types || []).map(d =>
+              `<span class="text-xs bg-white/5 border border-white/10 rounded-full px-2 py-0.5 text-slate-300">${esc(d)}</span>`
+            ).join('')}
+          </div>
+          ${lead.incidents && lead.incidents.length ? `
+            <p class="mt-3 text-xs text-slate-500">
+              Latest: ${esc(lead.incidents[0].type)} — ${esc(lead.incidents[0].date)}
+            </p>` : ''}
+        </div>`;
+    }
+
+    function showError() {
+      document.getElementById('lead-list').innerHTML = '';
+      document.getElementById('error-state').classList.remove('hidden');
+      document.getElementById('pagination').classList.add('hidden');
+    }
+
+    // ── Cancel modal ──────────────────────────────────────────────────────
+    function openCancelModal() {
+      document.getElementById('cancel-modal').classList.add('open');
+    }
+
+    async function confirmCancel() {
+      // Log the click first
+      await logEvent('cancel_confirm');
+      // Get Stripe portal URL
+      try {
+        const res = await fetch('/api/portal-session', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ feed_uuid: feedUUID }),
+        });
+        if (res.ok) {
+          const { url } = await res.json();
+          window.location.href = url;
+        } else {
+          alert('Unable to open the billing portal. Please email support@forcedaction.io');
+        }
+      } catch (e) {
+        alert('Unable to open the billing portal. Please email support@forcedaction.io');
+      }
+    }
+
+    async function abortCancel() {
+      await logEvent('cancel_abort');
+      document.getElementById('cancel-modal').classList.remove('open');
+    }
+
+    async function logEvent(event) {
+      try {
+        await fetch('/api/log-event', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ event, feed_uuid: feedUUID }),
+        });
+      } catch (_) {}  // fire-and-forget — don't block UI
+    }
+
+    // Close modal on backdrop click
+    document.getElementById('cancel-modal').addEventListener('click', function(e) {
+      if (e.target === this) abortCancel();
+    });
+
+    // ── Utilities ────────────────────────────────────────────────────────
+    function capitalize(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : ''; }
+    function esc(s) {
+      return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+  </script>
+
+</body>
+</html>

@@ -33,6 +33,8 @@ def _safe_str(value) -> Optional[str]:
 class ProbateLoader(BaseLoader):
     """Loader for probate court cases."""
 
+    _LLM_MAX_CALLS = 20
+
     def load_from_dataframe(
         self,
         df: pd.DataFrame,
@@ -108,7 +110,8 @@ class ProbateLoader(BaseLoader):
                     full_name = " ".join([first, middle, last]).strip()
                     full_name = " ".join(full_name.split())
 
-                    # Build variants: full → first+last → last only → hyphen parts
+                    # Build variants: full → first+last → hyphen parts
+                    # (bare surname removed — too many false positives on common last names)
                     name_variants: list = []
                     if full_name:
                         name_variants.append(full_name)
@@ -116,8 +119,6 @@ class ProbateLoader(BaseLoader):
                         first_last = f"{first} {last}"
                         if first_last != full_name:
                             name_variants.append(first_last)
-                    if len(last) > 4:
-                        name_variants.append(last)
                     if '-' in last:
                         for part in last.split('-'):
                             if len(part) > 4 and first:
@@ -128,6 +129,11 @@ class ProbateLoader(BaseLoader):
                         if match_result:
                             property_record, score = match_result
                             logger.info(f"Matched probate by name '{variant}' (score: {score}%): {case_number}")
+                            property_record, _ = self._apply_llm_verification(
+                                raw_row=decedent_row.to_dict() if hasattr(decedent_row, 'to_dict') else dict(decedent_row),
+                                current_best=property_record, match_score=score,
+                                record_type='probate', match_field='LastName/CompanyName',
+                            )
                             break
 
             if property_record:
@@ -195,6 +201,8 @@ class ProbateLoader(BaseLoader):
 class EvictionLoader(BaseLoader):
     """Loader for eviction court cases."""
 
+    _LLM_MAX_CALLS = 20
+
     def load_from_dataframe(
         self,
         df: pd.DataFrame,
@@ -255,31 +263,31 @@ class EvictionLoader(BaseLoader):
                     property_record, score = match_result
                     logger.info(f"Matched eviction by address (score: {score}%): {case_number}")
 
-            # Fallback: try defendant name (tenant), then plaintiff name (landlord/owner)
-            # Plaintiff is more likely to match since they own the property
+            # Fallback: try plaintiff name (landlord/property owner)
+            # Defendant = tenant — never use tenant name for property matching
             if not property_record and 'PartyType' in group.columns and 'LastName/CompanyName' in group.columns:
-                for party_type in ('Plaintiff', 'Defendant'):
-                    party_rows = group[group['PartyType'] == party_type]
-                    if party_rows.empty:
-                        continue
-                    prow = party_rows.iloc[0]
+                plaintiff_rows = group[group['PartyType'] == 'Plaintiff']
+                if not plaintiff_rows.empty:
+                    prow = plaintiff_rows.iloc[0]
                     first = str(_none_if_nan(prow.get('FirstName')) or '').strip()
                     last = str(_none_if_nan(prow.get('LastName/CompanyName')) or '').strip()
-                    if not last:
-                        continue
-                    name_variants = []
-                    if first:
-                        name_variants.append(f"{first} {last}")
-                    if len(last) > 4:
-                        name_variants.append(last)
-                    for variant in name_variants:
-                        match_result = self.find_property_by_owner_name(variant)
-                        if match_result:
-                            property_record, score = match_result
-                            logger.info(f"Matched eviction by {party_type.lower()} name '{variant}' (score: {score}%): {case_number}")
-                            break
-                    if property_record:
-                        break
+                    if last:
+                        name_variants = []
+                        if first:
+                            name_variants.append(f"{first} {last}")
+                        else:
+                            name_variants.append(last)
+                        for variant in name_variants:
+                            match_result = self.find_property_by_owner_name(variant)
+                            if match_result:
+                                property_record, score = match_result
+                                logger.info(f"Matched eviction by plaintiff name '{variant}' (score: {score}%): {case_number}")
+                                property_record, _ = self._apply_llm_verification(
+                                    raw_row=prow.to_dict() if hasattr(prow, 'to_dict') else dict(prow),
+                                    current_best=property_record, match_score=score,
+                                    record_type='eviction', match_field='Plaintiff',
+                                )
+                                break
 
             if property_record:
                 try:
@@ -343,6 +351,8 @@ class EvictionLoader(BaseLoader):
 class BankruptcyLoader(BaseLoader):
     """Loader for bankruptcy court cases."""
 
+    _LLM_MAX_CALLS = 15
+
     def load_from_dataframe(
         self,
         df: pd.DataFrame,
@@ -397,13 +407,8 @@ class BankruptcyLoader(BaseLoader):
                     if first_last != name_str:
                         name_variants.append(first_last)
 
-                    # Last name alone (catches compound/hyphenated last names that
-                    # the property appraiser may store without the first name prefix)
-                    last_only = name_parts[-1]
-                    if len(last_only) > 4:   # skip short last names — too many false positives
-                        name_variants.append(last_only)
-
                     # Handle hyphenated last names: try each component separately
+                    # (bare surname removed — too many false positives on common last names)
                     if '-' in name_parts[-1]:
                         for part in name_parts[-1].split('-'):
                             if len(part) > 4:
@@ -415,6 +420,11 @@ class BankruptcyLoader(BaseLoader):
                         property_record, score = match_result
                         logger.info(
                             f"Matched bankruptcy by name '{variant}' (score: {score}%): {docket_number}"
+                        )
+                        property_record, _ = self._apply_llm_verification(
+                            raw_row=row.to_dict() if hasattr(row, 'to_dict') else dict(row),
+                            current_best=property_record, match_score=score,
+                            record_type='bankruptcy', match_field='Lead Name',
                         )
                         break
 

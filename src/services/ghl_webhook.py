@@ -372,24 +372,24 @@ def _upsert_opportunity(contact_id: str, score_data: Dict) -> bool:
         return False
 
 
-def push_lead_to_ghl(score_data: Dict) -> bool:
+def push_lead_to_ghl(score_data: Dict) -> Optional[str]:
     """
     Push a scored lead to GHL CRM.
 
-    Called automatically from cds_engine.save_score_to_database() for every
-    lead that scores at or above the daily routing threshold (60).
+    Called from src/tasks/ghl_sync.py for every pending_sync lead.
 
-    Returns True if both contact upsert and opportunity creation succeeded.
-    Returns False (silently) if GHL is not configured or score is below threshold.
+    Returns the GHL contact_id string on success (truthy), or None on failure/skip.
+    The caller (ghl_sync) is responsible for persisting contact_id back to the
+    Property row in a batch commit — this function is purely API I/O.
     Raises nothing — all errors are logged internally.
     """
     if not _is_configured():
         logger.debug("[GHL] Not configured — skipping CRM push")
-        return False
+        return None
 
     final_score = score_data.get("final_cds_score", 0)
     if final_score < _MIN_SCORE_TO_PUSH:
-        return False
+        return None
 
     parcel_id = score_data.get("parcel_id")
     logger.info(
@@ -400,34 +400,17 @@ def push_lead_to_ghl(score_data: Dict) -> bool:
     contact_id = _upsert_contact(score_data)
     if not contact_id:
         logger.warning("[GHL] Failed to upsert contact for %s — opportunity skipped", parcel_id)
-        return False
+        return None
 
-    # Persist GHL contact ID back to property so future rescores update, not duplicate
-    if contact_id != score_data.get("ghl_contact_id"):
-        try:
-            from src.core.database import get_db_session
-            from src.core.models import Property
-            from datetime import datetime, timezone
-            with get_db_session() as db:
-                prop = db.query(Property).filter(
-                    Property.id == score_data.get("property_id")
-                ).first()
-                if prop:
-                    prop.gohighlevel_contact_id = contact_id
-                    prop.sync_status = "synced"
-                    prop.last_crm_sync = datetime.now(timezone.utc)
-                    db.commit()
-        except Exception:
-            logger.warning(
-                "[GHL] Failed to save contact_id back to property %s",
-                score_data.get("parcel_id"),
-                exc_info=True,
-            )
+    # NOTE: the DB write (gohighlevel_contact_id / sync_status / last_crm_sync) has been
+    # removed from this function. Previously it opened a separate session and committed
+    # an individual UPDATE per lead — with thousands of leads this created thousands of
+    # long-lived transactions on the properties table that blocked all scraper sessions.
+    # The DB write is now handled in bulk by src/tasks/ghl_sync.py (100 rows per commit).
 
-    ok = _upsert_opportunity(contact_id, score_data)
-    if ok:
-        logger.info("[GHL] Lead pushed successfully: %s", parcel_id)
-    return ok
+    _upsert_opportunity(contact_id, score_data)
+    logger.info("[GHL] Lead pushed successfully: %s", parcel_id)
+    return contact_id
 
 
 # ---------------------------------------------------------------------------

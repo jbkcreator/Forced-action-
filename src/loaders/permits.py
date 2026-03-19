@@ -53,9 +53,12 @@ class BuildingPermitLoader(BaseLoader):
             property_record = None
             if pd.notna(row.get('Address')):
                 raw_address = str(row['Address'])
-                zip_match = re.search(r'\b(\d{5})\b', raw_address)
+                # Match zip after state abbreviation to avoid capturing 5-digit house numbers
+                zip_match = re.search(r'\bFL\s+(\d{5})\b', raw_address, re.IGNORECASE)
+                if not zip_match:
+                    zip_match = re.search(r',\s*(\d{5})(?:-\d{4})?\s*$', raw_address)
                 zip_code = zip_match.group(1) if zip_match else None
-                match_result = self.find_property_by_address(raw_address, zip_code=zip_code)
+                match_result = self.find_property_by_address(raw_address, zip_code=zip_code, strict_house_number=False)
                 if match_result:
                     property_record, score = match_result
                     logger.info(f"Matched permit by address (score: {score}%): {record_number}")

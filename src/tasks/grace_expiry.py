@@ -20,9 +20,7 @@ Both steps run inside a single transaction so a crash mid-way is safe to retry.
 """
 
 import logging
-import smtplib
 from datetime import datetime, timezone
-from email.mime.text import MIMEText
 from typing import List
 
 from sqlalchemy import select
@@ -30,6 +28,7 @@ from sqlalchemy.orm import Session
 
 from src.core.database import get_db_context
 from src.core.models import Subscriber, ZipTerritory
+from src.services.email import send_email
 
 logger = logging.getLogger(__name__)
 
@@ -41,43 +40,23 @@ logger = logging.getLogger(__name__)
 def _send_waitlist_email(zip_code: str, vertical: str, county_id: str, emails: List[str]) -> None:
     """
     Send a simple availability notification to each waitlisted email.
-    Requires SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS / EMAIL_FROM in env.
+    Requires SMTP settings in AppSettings (SMTP_HOST / SMTP_USER / SMTP_PASS).
     Silently skips if any setting is missing.
     """
-    import os
-    host = os.getenv("SMTP_HOST")
-    port = int(os.getenv("SMTP_PORT", "587"))
-    user = os.getenv("SMTP_USER")
-    password = os.getenv("SMTP_PASS")
-    from_addr = os.getenv("EMAIL_FROM", user)
-
-    if not all([host, user, password]):
-        logger.debug("SMTP not configured — skipping waitlist emails")
-        return
-
+    from config.settings import get_settings
+    settings = get_settings()
     subject = f"ZIP {zip_code} is now available — {vertical.title()} | Forced Action"
     body = (
         f"Good news!\n\n"
         f"ZIP code {zip_code} ({vertical.title()} — {county_id}) has just become available "
         f"on Forced Action.\n\n"
         f"Lock it now before someone else does:\n"
-        f"https://app.forcedaction.io/subscribe?zip={zip_code}&vertical={vertical}&county={county_id}\n\n"
+        f"{settings.app_base_url}/?zip={zip_code}&vertical={vertical}&county={county_id}\n\n"
         f"— Forced Action Team"
     )
 
     for addr in emails:
-        try:
-            msg = MIMEText(body)
-            msg["Subject"] = subject
-            msg["From"] = from_addr
-            msg["To"] = addr
-            with smtplib.SMTP(host, port, timeout=10) as server:
-                server.starttls()
-                server.login(user, password)
-                server.sendmail(from_addr, [addr], msg.as_string())
-            logger.info(f"Waitlist email sent → {addr} for ZIP {zip_code}/{vertical}")
-        except Exception as e:
-            logger.error(f"Failed to send waitlist email to {addr}: {e}")
+        send_email(to=addr, subject=subject, body_text=body)
 
 
 # ---------------------------------------------------------------------------

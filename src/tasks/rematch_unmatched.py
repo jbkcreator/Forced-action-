@@ -65,9 +65,13 @@ def rematch_unmatched(
 
                 property_record = None
 
-                # Try legal description first, then grantor name
+                # Try legal description first, then owner name.
+                # For code liens and tax liens the owner may be in Grantee rather than
+                # Grantor — apply the same filer-keyword detection used in LienLoader
+                # so re-matched records follow the same fixed logic as new records.
                 legal = raw.get("Legal") or raw.get("legal_description")
-                grantor = record.grantor or raw.get("Grantor") or raw.get("grantor")
+                grantor_val = record.grantor or raw.get("Grantor") or raw.get("grantor")
+                grantee_val = raw.get("Grantee") or raw.get("grantee")
 
                 loader = lien_loader  # default — has both matching strategies
                 if record.source_type == "deeds":
@@ -75,13 +79,29 @@ def rematch_unmatched(
                 elif record.source_type in ("evictions", "probate", "bankruptcies"):
                     loader = lp_loader
 
+                # Determine which name field to use based on lien type
+                doc_type_str = str(raw.get('document_type', '')).upper()
+                is_tax_lien  = 'TAX LIEN' in doc_type_str
+                is_code_lien = 'TCL' in doc_type_str or 'CCL' in doc_type_str
+                _FILER_KEYWORDS = {'CITY OF TAMPA', 'HILLSBOROUGH COUNTY'}
+
+                if is_tax_lien:
+                    name_to_try = grantee_val
+                elif is_code_lien:
+                    grantor_is_filer = grantor_val and any(
+                        kw in str(grantor_val).upper() for kw in _FILER_KEYWORDS
+                    )
+                    name_to_try = grantee_val if grantor_is_filer else grantor_val
+                else:
+                    name_to_try = grantor_val
+
                 if legal:
                     result = loader.find_property_by_legal_description(str(legal))
                     if result:
                         property_record, _ = result
 
-                if not property_record and grantor:
-                    result = loader.find_property_by_owner_name(str(grantor))
+                if not property_record and name_to_try:
+                    result = loader.find_property_by_owner_name(str(name_to_try))
                     if result:
                         property_record, _ = result
 

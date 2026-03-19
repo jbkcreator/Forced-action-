@@ -515,7 +515,6 @@
         embeddedCheckout = await stripe.initEmbeddedCheckout({
           clientSecret: client_secret,
           onComplete() {
-            closeCheckout();
             window.location.href = '/success';
           },
         });

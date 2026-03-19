@@ -46,6 +46,8 @@ class LisPendensLoader(BaseLoader):
     filters internally for LP document types only.
     """
 
+    _LLM_MAX_CALLS = 20
+
     def load_from_dataframe(
         self,
         df: pd.DataFrame,
@@ -105,6 +107,11 @@ class LisPendensLoader(BaseLoader):
                     if match_result:
                         property_record, score = match_result
                         logger.info(f"Matched LP by grantee (score: {score}%): {instrument}")
+                        property_record, _ = self._apply_llm_verification(
+                            raw_row=row.to_dict() if hasattr(row, 'to_dict') else dict(row),
+                            current_best=property_record, match_score=score,
+                            record_type='lis_pendens', match_field='Grantee',
+                        )
 
             if property_record:
                 try:

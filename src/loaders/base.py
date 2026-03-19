@@ -26,14 +26,19 @@ logger = logging.getLogger(__name__)
 class BaseLoader(ABC):
     """
     Abstract base class for all data loaders.
-    
+
     Provides:
     - Normalization utilities
     - Fuzzy matching functions
+    - LLM-assisted borderline match verification
     - Duplicate checking
     - CSV/DataFrame loading
     """
-    
+
+    # Per-loader LLM call budget (calls per scraper run).
+    # Subclasses override this to set their own cap.
+    _LLM_MAX_CALLS: int = 20
+
     def __init__(self, session: Session, county_id: str = "hillsborough"):
         """
         Initialize loader with database session.
@@ -45,6 +50,8 @@ class BaseLoader(ABC):
         self.session = session
         self.county_id = county_id
         self._affected_property_ids: set = set()
+        from src.loaders.llm_matcher import LLMPropertyMatcher
+        self._llm_matcher = LLMPropertyMatcher(max_calls=self._LLM_MAX_CALLS)
     
     # ========================================================================
     # ABSTRACT METHODS (must be implemented by subclasses)
@@ -193,19 +200,21 @@ class BaseLoader(ABC):
             if addr.endswith(' ' + city):
                 addr = addr[:-len(city)].strip()
         
+        # Remove unit/apt/lot/building indicators with numeric or letter designators
+        # Must run BEFORE trailing-digit strip so "Unit 109" is removed as a unit
+        # designator (not as a zip code). Handles: "Apt 4", "Unit B", "Ste 101",
+        # "#4A", "Bldg 3", "Fl 2", "Unit 109".
+        addr = re.sub(r'\s+(apt|unit|lot|ste|suite|bldg|building|fl|floor|#)\s*[\w-]+', '', addr, flags=re.IGNORECASE)
+        # Remove trailing standalone hash+designator: "123 Main St #4"
+        addr = re.sub(r'\s+#[\w-]+$', '', addr)
+
         # Remove trailing state/zip patterns
         addr = addr.split(' fl ')[0].strip()
-        
+
         # Remove numeric-only zip codes at the end
         parts = addr.split()
         if parts and parts[-1].replace('-', '').isdigit():
             addr = ' '.join(parts[:-1])
-        
-        # Remove unit/apt/lot/building indicators with numeric or letter designators
-        # Handles: "Apt 4", "Unit B", "Ste 101", "#4A", "Bldg 3", "Fl 2"
-        addr = re.sub(r'\s+(apt|unit|lot|ste|suite|bldg|building|fl|floor|#)\s*[\w-]+', '', addr, flags=re.IGNORECASE)
-        # Remove trailing standalone hash+designator: "123 Main St #4"
-        addr = re.sub(r'\s+#[\w-]+$', '', addr)
 
         return addr.strip()
     
@@ -330,6 +339,7 @@ class BaseLoader(ABC):
         address: str,
         threshold: int = 85,
         zip_code: Optional[str] = None,
+        strict_house_number: bool = True,
     ) -> Optional[Tuple[Property, int]]:
         """
         Find property by address using three escalating strategies.
@@ -427,8 +437,10 @@ class BaseLoader(ABC):
         for prop, normalized_prop in candidates:
             # Reject if house numbers differ — avoids wrong-number fuzzy matches
             # (e.g. "6710 Hartford" matching "6716 Hartford" at score 92)
+            # Disabled for permits: permit addresses often omit or abbreviate
+            # the house number differently (e.g. unit numbers, lot references).
             prop_number = normalized_prop.split()[0] if normalized_prop.split() else ""
-            if search_number and prop_number and search_number != prop_number:
+            if strict_house_number and search_number and prop_number and search_number != prop_number:
                 continue
             score = fuzz.token_sort_ratio(normalized_search, normalized_prop)
             if score > best_score:
@@ -492,9 +504,12 @@ class BaseLoader(ABC):
         filters = [Property.legal_description.isnot(None)]
 
         if lot_match:
-            filters.append(Property.legal_description.ilike(f'%LOT {lot_match.group(1)}%'))
+            # Use word-boundary regex (~*) instead of ILIKE to prevent LOT 1 matching LOT 10-19
+            lot_num = lot_match.group(1)
+            filters.append(Property.legal_description.op('~*')(rf'\mLOT {lot_num}\M'))
         if block_match:
-            filters.append(Property.legal_description.ilike(f'%{block_match.group(0)}%'))
+            blk_text = block_match.group(0)  # e.g. "BLK 3" or "BLOCK 3"
+            filters.append(Property.legal_description.op('~*')(rf'\m{blk_text}\M'))
         for word in subd_words:
             filters.append(Property.legal_description.ilike(f'%{word}%'))
 
@@ -528,7 +543,7 @@ class BaseLoader(ABC):
     def find_property_by_owner_name(
         self,
         owner_name: str,
-        threshold: int = 75
+        threshold: int = 80
     ) -> Optional[Tuple[Property, int]]:
         """
         Find property by owner name with three escalating strategies.
@@ -635,9 +650,130 @@ class BaseLoader(ABC):
         return None
     
     # ========================================================================
+    # LLM VERIFICATION HELPERS
+    # ========================================================================
+
+    def _get_top_owner_candidates_base(self, owner_name: str, limit: int = 3) -> list:
+        """
+        Re-query pg_trgm for the top-N owner candidates by similarity score.
+        Returns Property objects for use as LLM context candidates.
+        Returns an empty list if pg_trgm is unavailable or the name is empty.
+        """
+        from sqlalchemy import func as sqlfunc
+
+        normalized = self.normalize_owner_name(owner_name)
+        if not normalized:
+            return []
+
+        try:
+            with self.session.begin_nested():
+                owners = (
+                    self.session.query(Owner)
+                    .filter(sqlfunc.similarity(Owner.owner_name, normalized) >= 0.3)
+                    .order_by(sqlfunc.similarity(Owner.owner_name, normalized).desc())
+                    .limit(limit)
+                    .all()
+                )
+                return [o.property for o in owners if o.property]
+        except Exception:
+            return []
+
+    def _apply_llm_verification(
+        self,
+        raw_row: dict,
+        current_best,
+        match_score: int,
+        record_type: str,
+        match_field: str,
+        force: bool = False,
+    ) -> tuple:
+        """
+        Optionally run LLM verification on a borderline name match.
+
+        Decision logic:
+        - score >= HIGH_CONFIDENCE and not force  → accept as-is (no LLM)
+        - score < LLM_SCORE_FLOOR and not force   → return unchanged (caller quarantines)
+        - budget exhausted                        → log warning, return unchanged
+        - otherwise                               → call LLM; accept or quarantine based on result
+
+        Args:
+            raw_row:      Full source row dict for LLM context.
+            current_best: Property object from name matching (may be None).
+            match_score:  Rapidfuzz score (0-100).
+            record_type:  Key into RECORD_TYPE_CONTEXT in llm_matcher.py.
+            match_field:  CSV column whose value was matched (for LLM prompt context).
+            force:        If True, bypass the HIGH_CONFIDENCE skip (for suspicious strategies).
+
+        Returns:
+            (property_record_or_None, match_method_str_or_None)
+            match_method is 'owner_name' (unchanged), 'llm_verified', or None (quarantine).
+        """
+        from src.loaders.llm_matcher import HIGH_CONFIDENCE, LLM_SCORE_FLOOR
+
+        if current_best is None:
+            return None, None
+
+        # High confidence — no LLM needed
+        if match_score >= HIGH_CONFIDENCE and not force:
+            return current_best, 'owner_name'
+
+        # Below floor — cannot rescue with LLM; caller will quarantine
+        if match_score < LLM_SCORE_FLOOR and not force:
+            return current_best, 'owner_name'
+
+        # Budget exhausted — log and pass through (don't quarantine just because LLM is out)
+        if self._llm_matcher.budget_exhausted:
+            logger.warning(
+                "[LLM] Budget exhausted — skipping verification for %s match "
+                "(score=%d%%, record_type=%s). Accepting match as-is.",
+                match_field, match_score, record_type,
+            )
+            return current_best, 'owner_name'
+
+        # Run LLM verification
+        owner_name_val = (
+            raw_row.get(match_field) or raw_row.get('owner_name') or
+            raw_row.get('Lead Name') or raw_row.get('LastName/CompanyName') or ''
+        )
+        top_candidates = self._get_top_owner_candidates_base(str(owner_name_val), limit=3)
+
+        llm_result = self._llm_matcher.verify_match(
+            raw_row=raw_row,
+            candidates=top_candidates,
+            current_best=current_best,
+            current_score=match_score,
+            record_type=record_type,
+            match_field=match_field,
+        )
+
+        if llm_result.matched and llm_result.confidence in ('high', 'medium'):
+            # LLM may have selected a different candidate — resolve it
+            if llm_result.property_id and llm_result.property_id != current_best.id:
+                override = self.session.get(Property, llm_result.property_id)
+                if override:
+                    logger.info(
+                        "[LLM] Overrode name match to property_id=%d "
+                        "(confidence=%s, record_type=%s): %s",
+                        llm_result.property_id, llm_result.confidence,
+                        record_type, llm_result.reason,
+                    )
+                    return override, 'llm_verified'
+            logger.info(
+                "[LLM] Verified match (confidence=%s, score=%d%%, record_type=%s): %s",
+                llm_result.confidence, match_score, record_type, llm_result.reason,
+            )
+            return current_best, 'llm_verified'
+        else:
+            logger.info(
+                "[LLM] Rejected borderline match (confidence=%s, score=%d%%, record_type=%s): %s",
+                llm_result.confidence, match_score, record_type, llm_result.reason,
+            )
+            return None, None  # caller quarantines
+
+    # ========================================================================
     # DUPLICATE CHECKING
     # ========================================================================
-    
+
     def safe_add(self, record: Any) -> bool:
         """
         Add a record to the session using a savepoint so that a DB constraint

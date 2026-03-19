@@ -17,13 +17,17 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import stripe
-from sqlalchemy import select
+from sqlalchemy import select, and_, desc, func
+from sqlalchemy.dialects.postgresql import array
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from config.settings import settings
 from src.core.models import (
     FoundingSubscriberCount,
+    LeadPackPurchase,
+    Property,
+    DistressScore,
     Subscriber,
     ZipTerritory,
 )
@@ -78,6 +82,7 @@ def handle_webhook(raw_body: bytes, sig_header: str, db: Session) -> tuple[bool,
         "invoice.payment_failed":        _on_payment_failed,
         "customer.subscription.updated": _on_subscription_updated,
         "customer.subscription.deleted": _on_subscription_deleted,
+        "payment_intent.succeeded":      _on_lead_pack_payment,
     }
 
     handler = handlers.get(event_type)
@@ -282,6 +287,33 @@ def _on_payment_succeeded(invoice: dict, db: Session) -> None:
         subscriber.id, subscriber.billing_date,
     )
 
+    # Send payment receipt email
+    if subscriber.email:
+        from src.services.email import send_email
+        from config.settings import get_settings
+        settings = get_settings()
+        billing_str = (
+            subscriber.billing_date.strftime("%B %d, %Y")
+            if subscriber.billing_date else "N/A"
+        )
+        feed_url = (
+            f"{settings.app_base_url}/dashboard/{subscriber.event_feed_uuid}"
+            if subscriber.event_feed_uuid else settings.app_base_url
+        )
+        send_email(
+            to=subscriber.email,
+            subject=f"Payment confirmed — Forced Action {subscriber.tier.title()}",
+            body_text=(
+                f"Hi {subscriber.name or 'there'},\n\n"
+                f"Your payment has been processed successfully.\n\n"
+                f"Plan: {subscriber.tier.title()} / {subscriber.vertical.title()}\n"
+                f"Next billing date: {billing_str}\n\n"
+                f"Access your lead feed:\n{feed_url}\n\n"
+                f"Questions? support@forcedaction.io\n\n"
+                f"— Forced Action Team"
+            ),
+        )
+
 
 # ---------------------------------------------------------------------------
 # 3. invoice.payment_failed
@@ -315,6 +347,30 @@ def _on_payment_failed(invoice: dict, db: Session) -> None:
     logger.info(
         "invoice.payment_failed: subscriber=%s — GHL retry sequence queued", subscriber.id
     )
+
+    # Send payment failure alert email
+    if subscriber.email:
+        from src.services.email import send_email
+        from config.settings import get_settings
+        settings = get_settings()
+        portal_url = settings.app_base_url  # placeholder — portal session created on demand
+        send_email(
+            to=subscriber.email,
+            subject="Action required — payment failed for your Forced Action subscription",
+            body_text=(
+                f"Hi {subscriber.name or 'there'},\n\n"
+                f"We were unable to process your payment for your Forced Action "
+                f"{subscriber.tier.title()} subscription.\n\n"
+                f"To keep your ZIP territories locked and avoid losing your founding rate, "
+                f"please update your payment method as soon as possible.\n\n"
+                f"Update your card:\n{settings.app_base_url}/dashboard/"
+                f"{subscriber.event_feed_uuid or ''}\n\n"
+                f"If payment is not resolved within 48 hours, your subscription will enter "
+                f"a grace period and your territories may be released.\n\n"
+                f"Questions? support@forcedaction.io\n\n"
+                f"— Forced Action Team"
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -418,4 +474,183 @@ def _on_subscription_deleted(subscription: dict, db: Session) -> None:
         " grace_expires=%s zips_in_grace=%d",
         subscriber.id, subscriber.founding_member, churn_tag,
         grace_expires.isoformat(), len(territories),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 6. payment_intent.succeeded — lead pack purchases
+# ---------------------------------------------------------------------------
+
+def _on_lead_pack_payment(payment_intent: dict, db: Session) -> None:
+    """
+    Handle $99 lead pack purchases.
+
+    Expected metadata on the PaymentIntent:
+        product    = "lead_pack"
+        feed_uuid  = subscriber's event_feed_uuid
+        zip_code   = target ZIP
+        vertical   = e.g. "roofing"
+        county_id  = e.g. "hillsborough"
+    """
+    meta = payment_intent.get("metadata", {})
+    if meta.get("product") != "lead_pack":
+        # Not a lead pack payment — silently ignore
+        return
+
+    stripe_payment_intent_id = payment_intent.get("id")
+    feed_uuid  = meta.get("feed_uuid")
+    zip_code   = meta.get("zip_code")
+    vertical   = meta.get("vertical")
+    county_id  = meta.get("county_id", "hillsborough")
+
+    if not all([stripe_payment_intent_id, feed_uuid, zip_code, vertical]):
+        logger.error(
+            "[LeadPack] payment_intent.succeeded missing required metadata: %s", meta
+        )
+        return
+
+    # Idempotency — skip if already processed
+    existing = db.execute(
+        select(LeadPackPurchase).where(
+            LeadPackPurchase.stripe_payment_intent_id == stripe_payment_intent_id
+        )
+    ).scalar_one_or_none()
+    if existing:
+        logger.info(
+            "[LeadPack] Already processed payment_intent %s — skipping", stripe_payment_intent_id
+        )
+        return
+
+    # Find subscriber
+    subscriber = db.execute(
+        select(Subscriber).where(Subscriber.event_feed_uuid == feed_uuid)
+    ).scalar_one_or_none()
+    if subscriber is None:
+        logger.error("[LeadPack] No subscriber for feed_uuid %s", feed_uuid)
+        return
+
+    now = datetime.now(timezone.utc)
+
+    # Create purchase record
+    purchase = LeadPackPurchase(
+        subscriber_id=subscriber.id,
+        zip_code=zip_code,
+        vertical=vertical,
+        county_id=county_id,
+        stripe_payment_intent_id=stripe_payment_intent_id,
+        status="pending",
+        purchased_at=now,
+        exclusive_until=now + timedelta(hours=72),
+    )
+    db.add(purchase)
+    db.flush()  # get purchase.id before exclusivity query
+
+    # Exclude property_ids already under active exclusivity for this ZIP+vertical
+    active_exclusive_ids = _get_exclusive_property_ids(db, zip_code, vertical, now, exclude_purchase_id=purchase.id)
+
+    # Select top 5 scored properties not already exclusively held
+    try:
+        score_col = DistressScore.vertical_scores[vertical].as_float()
+    except KeyError:
+        logger.error("[LeadPack] Unknown vertical '%s' for purchase %s", vertical, purchase.id)
+        purchase.status = "expired"
+        return
+
+    lead_filter = [
+        Property.zip == zip_code,
+        Property.county_id == county_id,
+        DistressScore.qualified == True,  # noqa: E712
+    ]
+    if active_exclusive_ids:
+        lead_filter.append(~Property.id.in_(active_exclusive_ids))
+
+    top_leads = db.execute(
+        select(Property, DistressScore)
+        .join(DistressScore, DistressScore.property_id == Property.id)
+        .where(and_(*lead_filter))
+        .order_by(desc(score_col))
+        .limit(5)
+    ).all()
+
+    purchase.lead_ids = [prop.id for prop, _ in top_leads]
+    purchase.status = "delivered"
+    purchase.delivered_at = now
+
+    logger.info(
+        "[LeadPack] Delivered purchase %s — %d leads for %s/%s/%s to subscriber %s",
+        purchase.id, len(top_leads), zip_code, vertical, county_id, subscriber.id,
+    )
+
+    if subscriber.email:
+        _send_lead_pack_email(subscriber, purchase, top_leads)
+
+
+def _get_exclusive_property_ids(
+    db: Session,
+    zip_code: str,
+    vertical: str,
+    now: datetime,
+    exclude_purchase_id: Optional[int] = None,
+) -> list[int]:
+    """Return property_ids currently under active exclusivity for a ZIP+vertical."""
+    q = select(LeadPackPurchase).where(
+        LeadPackPurchase.zip_code == zip_code,
+        LeadPackPurchase.vertical == vertical,
+        LeadPackPurchase.exclusive_until > now,
+        LeadPackPurchase.lead_ids != None,  # noqa: E711
+    )
+    if exclude_purchase_id is not None:
+        q = q.where(LeadPackPurchase.id != exclude_purchase_id)
+
+    active_purchases = db.execute(q).scalars().all()
+    exclusive_ids: list[int] = []
+    for p in active_purchases:
+        if p.lead_ids:
+            exclusive_ids.extend(p.lead_ids)
+    return exclusive_ids
+
+
+def _send_lead_pack_email(
+    subscriber: "Subscriber",
+    purchase: LeadPackPurchase,
+    top_leads: list,
+) -> None:
+    """Send lead pack delivery email with the 5 selected properties."""
+    from src.services.email import send_email
+    from config.settings import get_settings
+    _settings = get_settings()
+
+    exclusive_until_str = (
+        purchase.exclusive_until.strftime("%B %d, %Y at %I:%M %p UTC")
+        if purchase.exclusive_until else "72 hours from purchase"
+    )
+
+    lead_lines = []
+    for i, (prop, score) in enumerate(top_leads, start=1):
+        v_score = score.vertical_scores.get(subscriber.vertical) if score.vertical_scores else None
+        score_str = f"{v_score:.1f}" if v_score is not None else "N/A"
+        lead_lines.append(
+            f"{i}. {prop.address}, {prop.city}, FL {prop.zip}\n"
+            f"   Score: {score_str}  |  Tier: {score.lead_tier or 'N/A'}"
+            f"  |  Type: {', '.join(score.distress_types or []) or 'N/A'}\n"
+        )
+
+    dashboard_url = (
+        f"{_settings.app_base_url}/api/lead-pack/{purchase.id}"
+        if _settings.app_base_url else ""
+    )
+
+    send_email(
+        to=subscriber.email,
+        subject="Your Forced Action Lead Pack — 5 Exclusive Leads",
+        body_text=(
+            f"Hi {subscriber.name or 'there'},\n\n"
+            f"Your lead pack purchase is confirmed. Here are your 5 exclusive leads "
+            f"for ZIP {purchase.zip_code} ({purchase.vertical.title()}):\n\n"
+            + "\n".join(lead_lines) +
+            f"\nThese leads are exclusively yours until {exclusive_until_str}.\n\n"
+            f"View full lead details:\n{dashboard_url}\n\n"
+            f"Questions? support@forcedaction.io\n\n"
+            f"— Forced Action Team"
+        ),
     )

@@ -91,6 +91,7 @@ from config.scoring import (
     SCORE_CAP,
     STACKING_BONUS_CAP,
     STACKING_BONUS_PER_SIGNAL,
+    STACKING_ONLY_SIGNALS,
     STACKING_WINDOW_DAYS,
     VERTICAL_WEIGHTS,
 )
@@ -137,30 +138,36 @@ class MultiVerticalScorer:
     # ── GHL batch flush ───────────────────────────────────────────────────────
 
     def _flush_ghl_queue(self) -> None:
-        """Push queued leads to GHL in batches to avoid rate-limit spikes."""
-        import time
+        """
+        Mark queued leads for async GHL sync by setting sync_status='pending_sync'.
+
+        Previously this called push_lead_to_ghl() synchronously for every lead,
+        which caused two compounding problems:
+          1. Thousands of sequential GHL API calls (4 calls × 0.5s each per lead)
+             blocked the process for hours after scoring finished.
+          2. Each contact write opened a separate DB session and committed an
+             individual UPDATE on the properties table — creating thousands of
+             long-running transactions that blocked all other scrapers.
+
+        Now the flush is a single batch SQL UPDATE (milliseconds). The actual
+        GHL API calls are handled by src/tasks/ghl_sync.py, which runs as a
+        separate process after scraping completes and commits DB writes in
+        batches of 100.
+        """
         queue = self._ghl_push_queue
         if not queue:
             return
-        total = len(queue)
-        pushed = failed = 0
-        logger.info("[GHL] Flushing %d queued leads in batches of %d", total, _GHL_BATCH_SIZE)
-        for i in range(0, total, _GHL_BATCH_SIZE):
-            batch = queue[i: i + _GHL_BATCH_SIZE]
-            for score_data in batch:
-                try:
-                    push_lead_to_ghl(score_data)
-                    pushed += 1
-                except Exception:
-                    failed += 1
-                    logger.warning(
-                        "[GHL] push failed for property %s",
-                        score_data.get("parcel_id"), exc_info=True,
-                    )
-            if i + _GHL_BATCH_SIZE < total:
-                logger.debug("[GHL] batch %d/%d done — sleeping %.1fs", i // _GHL_BATCH_SIZE + 1, -(-total // _GHL_BATCH_SIZE), _GHL_BATCH_DELAY)
-                time.sleep(_GHL_BATCH_DELAY)
-        logger.info("[GHL] Flush complete — pushed=%d failed=%d", pushed, failed)
+
+        property_ids = [sd["property_id"] for sd in queue if sd.get("property_id")]
+        if property_ids:
+            self.session.query(Property).filter(
+                Property.id.in_(property_ids)
+            ).update({"sync_status": "pending_sync"}, synchronize_session=False)
+            logger.info(
+                "[GHL] Marked %d properties as pending_sync for async push "
+                "(run `python -m src.tasks.ghl_sync` to flush to CRM)",
+                len(property_ids),
+            )
         self._ghl_push_queue.clear()
 
     # ── Signal collection ─────────────────────────────────────────────────────
@@ -406,7 +413,30 @@ class MultiVerticalScorer:
                 "prior_viol_mod":        0,
             }
 
-        # Build per-signal components — apply age decay to each
+        # Guard: if ALL signals are stacking-only, this property cannot be scored.
+        # Stacking-only signals (insurance_claim, fire, storm_damage, flood_damage)
+        # require a primary signal to be present before they contribute.
+        primary_signal_types = set(latest_by_type.keys()) - STACKING_ONLY_SIGNALS
+        if not primary_signal_types:
+            return {
+                "score":                 0.0,
+                "primary_signal":        None,
+                "primary_score":         0.0,
+                "stacking_bonus":        0,
+                "signals_within_window": 0,
+                "signals":               {},
+                "absentee_bonus":        0,
+                "contact_bonus":         0,
+                "equity_bonus":          0,
+                "days_open_mod":         0,
+                "persistence_mod":       0,
+                "prior_viol_mod":        0,
+            }
+
+        # Build per-signal components — apply age decay to each.
+        # Stacking-only signals (incidents) are computed for the component map
+        # but are EXCLUDED from primary (best_type) selection — they can never
+        # be the primary signal even if their recency-boosted score is higher.
         signal_components: Dict[str, Dict] = {}
         best_type  = None
         best_total = -999
@@ -422,7 +452,8 @@ class MultiVerticalScorer:
                 "age_decay": decay,
                 "total":     total,
             }
-            if total > best_total:
+            # Only non-stacking-only signals compete for primary
+            if sig_type not in STACKING_ONLY_SIGNALS and total > best_total:
                 best_total = total
                 best_type  = sig_type
 
@@ -441,7 +472,9 @@ class MultiVerticalScorer:
         if "code_violations" in latest_by_type and violation_count > 0:
             prior_viol_mod = self._prior_violations_modifier(violation_count)
 
-        # Stacking: count distinct signal types with a date within the window
+        # Stacking: count ALL distinct signal types within the window.
+        # Incidents count toward stacking bonus once a primary signal is confirmed
+        # present (the guard above ensures we never reach here without one).
         signals_within_window = sum(
             1 for si in latest_by_type.values()
             if si["date"] and (today - si["date"]).days <= STACKING_WINDOW_DAYS
@@ -1002,7 +1035,7 @@ class MultiVerticalScorer:
                 score_data = self.score_property(prop)
                 scores.append(score_data)
 
-                if score_data["signal_count"] == 0:
+                if score_data["signal_count"] == 0 or score_data["final_cds_score"] == 0:
                     no_signal_count += 1
                     continue
 
@@ -1304,7 +1337,7 @@ def main():
 
     # ── Stats output ──────────────────────────────────────────────────────────
     total = len(scores)
-    with_signals = [s for s in scores if s["signal_count"] > 0]
+    with_signals = [s for s in scores if s["signal_count"] > 0 and s["final_cds_score"] > 0]
     qualified = sum(1 for s in with_signals if s["qualified"])
 
     log.info("=" * 60)
