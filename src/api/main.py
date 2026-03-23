@@ -892,3 +892,132 @@ def lead_pack_detail(purchase_id: int, db: Session = Depends(get_db)):
         "exclusive_until": purchase.exclusive_until.isoformat() if purchase.exclusive_until else None,
         "leads": leads,
     }
+
+
+# ---------------------------------------------------------------------------
+# GET /api/synthflow/lead-count — Live lead count for Synthflow agent script
+# ---------------------------------------------------------------------------
+
+@app.get("/api/synthflow/lead-count")
+def synthflow_lead_count(
+    zip_code: str,
+    vertical: str = "roofing",
+    county_id: str = "hillsborough",
+):
+    """
+    Called by the Synthflow AI agent mid-call to fill the [X] placeholder.
+    Returns qualified lead count + top signal type for the given ZIP/vertical.
+
+    Example: GET /api/synthflow/lead-count?zip_code=33601&vertical=roofing
+    Response: {"count": 8, "top_signal": "insurance_claims", "zip_available": true}
+    """
+    if not _ZIP_RE.match(zip_code):
+        raise HTTPException(status_code=400, detail={"error": "invalid_zip"})
+    if vertical not in VALID_VERTICALS:
+        raise HTTPException(status_code=400, detail={"error": "invalid_vertical"})
+
+    from src.services.synthflow_service import get_live_lead_count
+    try:
+        result = get_live_lead_count(zip_code=zip_code, vertical=vertical, county_id=county_id)
+    except Exception:
+        logger.error("synthflow lead-count error", exc_info=True)
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable"})
+
+    return {
+        "zip_code": zip_code,
+        "vertical": vertical,
+        **result,
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /webhooks/synthflow — Post-call outcome from Synthflow / Finetuner.ai
+# ---------------------------------------------------------------------------
+
+class SynthflowWebhookPayload(BaseModel):
+    """
+    Flexible model — Synthflow and Finetuner.ai use slightly different field
+    names. All outcome-critical fields are optional with sensible defaults so
+    the handler degrades gracefully if a field is missing.
+    """
+    # Call identity
+    call_id: Optional[str] = None
+
+    # Prospect phone — Synthflow sends 'to', Finetuner sends 'prospect_phone'
+    to: Optional[str] = None
+    prospect_phone: Optional[str] = None
+
+    # Outcome — agent sets this via a variable during the call
+    outcome: Optional[str] = None          # sample_requested | demo_requested | not_interested | voicemail | no_answer | completed
+    call_status: Optional[str] = None      # Synthflow native: completed | no_answer | voicemail | failed
+
+    # Variables captured by the agent during the call
+    zip_code: Optional[str] = None
+    vertical: Optional[str] = "roofing"
+    prospect_name: Optional[str] = None
+    notes: Optional[str] = None
+
+    # Synthflow also sends these at top level
+    duration: Optional[int] = None
+    recording_url: Optional[str] = None
+
+    @property
+    def phone(self) -> Optional[str]:
+        return self.prospect_phone or self.to
+
+    @property
+    def resolved_outcome(self) -> str:
+        """Map Synthflow native call_status to our outcome taxonomy if needed."""
+        if self.outcome:
+            return self.outcome
+        status_map = {
+            "no_answer": "no_answer",
+            "voicemail": "voicemail",
+            "failed":    "no_answer",
+            "completed": "completed",
+        }
+        return status_map.get(self.call_status or "", "completed")
+
+
+@app.post("/webhooks/synthflow", status_code=200)
+async def synthflow_webhook(payload: SynthflowWebhookPayload):
+    """
+    Receives post-call events from Synthflow / Finetuner.ai.
+
+    On each call end:
+      1. Resolves the prospect's phone number
+      2. Looks up or creates the GHL contact
+      3. Applies outcome tags that trigger GHL automations:
+           sample_leads_requested → GHL sends SMS with 3 blurred sample leads
+           demo_requested         → GHL sends Calendly link SMS
+           not_interested         → removes from active sequences
+
+    Configure in Synthflow/Finetuner as the post-call webhook URL:
+        https://your-domain.com/webhooks/synthflow
+    """
+    phone = payload.phone
+    if not phone:
+        logger.warning("[Synthflow webhook] received payload with no phone number")
+        return {"status": "ignored", "reason": "no phone"}
+
+    from src.services.synthflow_service import process_call_outcome
+    try:
+        result = process_call_outcome(
+            prospect_phone=phone,
+            outcome=payload.resolved_outcome,
+            vertical=payload.vertical or "roofing",
+            zip_code=payload.zip_code or "",
+            prospect_name=payload.prospect_name or "",
+            notes=payload.notes or "",
+        )
+    except Exception:
+        logger.error("[Synthflow webhook] processing error for %s", phone, exc_info=True)
+        # Always return 200 to Synthflow — retries on non-200 flood the queue
+        return {"status": "error", "reason": "internal"}
+
+    logger.info(
+        "[Synthflow webhook] call_id=%s phone=%s outcome=%s contact=%s tags=%s",
+        payload.call_id, phone, payload.resolved_outcome,
+        result.get("contact_id"), result.get("tags_applied"),
+    )
+    return {"status": "ok", **result}
