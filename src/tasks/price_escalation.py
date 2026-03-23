@@ -120,21 +120,152 @@ def run_price_escalation(dry_run: bool = False) -> dict:
                         f"{settings.app_base_url}/dashboard/{subscriber.event_feed_uuid}"
                         if subscriber.event_feed_uuid else settings.app_base_url
                     )
+                    name = subscriber.name or "there"
+                    tier = (subscriber.tier or "starter").title()
+
+                    # Extract human-readable prices from Stripe subscription
+                    try:
+                        old_amount = sub["items"]["data"][0]["price"]["unit_amount"]
+                        founding_rate_str = f"${old_amount / 100:,.0f}/mo"
+                    except (KeyError, IndexError, TypeError):
+                        founding_rate_str = "founding rate"
+
+                    try:
+                        new_price = stripe.Price.retrieve(regular_price_id)
+                        regular_rate_str = f"${new_price['unit_amount'] / 100:,.0f}/mo"
+                    except Exception:
+                        regular_rate_str = "regular rate"
+
+                    body_html = f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/></head>
+<body style="margin:0;padding:0;background:#0f172a;font-family:Inter,Arial,sans-serif;color:#e2e8f0;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f172a;padding:40px 0;">
+    <tr><td align="center">
+      <table width="560" cellpadding="0" cellspacing="0"
+             style="background:#1e293b;border:1px solid rgba(255,255,255,0.08);border-radius:16px;overflow:hidden;max-width:560px;width:100%;">
+
+        <!-- Header -->
+        <tr>
+          <td style="padding:32px 40px 24px;border-bottom:1px solid rgba(255,255,255,0.08);">
+            <p style="margin:0;font-size:22px;font-weight:800;color:#ffffff;">
+              Forced <span style="color:#fbbf24;">Action</span>
+            </p>
+          </td>
+        </tr>
+
+        <!-- Info banner -->
+        <tr>
+          <td style="padding:0;">
+            <table width="100%" cellpadding="0" cellspacing="0"
+                   style="background:rgba(251,191,36,0.12);border-bottom:1px solid rgba(251,191,36,0.25);">
+              <tr>
+                <td style="padding:14px 40px;font-size:14px;font-weight:700;color:#fbbf24;text-align:center;">
+                  Pricing update effective next billing cycle
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+
+        <!-- Body -->
+        <tr>
+          <td style="padding:32px 40px;">
+            <h1 style="margin:0 0 8px;font-size:26px;font-weight:800;color:#ffffff;">
+              Update to your subscription
+            </h1>
+            <p style="margin:0 0 24px;color:#94a3b8;font-size:15px;">
+              Hi {name}, thank you for being a founding member. Your 6-month founding
+              rate lock period has now ended, and your <strong style="color:#ffffff;">{tier}</strong>
+              plan will transition to its regular pricing starting with your next billing cycle.
+            </p>
+
+            <!-- What's changing card -->
+            <table width="100%" cellpadding="0" cellspacing="0"
+                   style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);
+                          border-radius:12px;padding:20px 24px;margin-bottom:24px;">
+              <tr>
+                <td>
+                  <p style="margin:0 0 14px;font-size:14px;font-weight:700;color:#ffffff;">
+                    What&rsquo;s changing
+                  </p>
+                  <table width="100%" cellpadding="0" cellspacing="0">
+                    <tr>
+                      <td style="font-size:13px;color:#94a3b8;padding:0 0 8px;">Founding rate</td>
+                      <td style="font-size:13px;color:#94a3b8;padding:0 0 8px;text-align:right;">
+                        <span style="text-decoration:line-through;">{founding_rate_str}</span>
+                      </td>
+                    </tr>
+                    <tr>
+                      <td style="font-size:14px;font-weight:700;color:#ffffff;padding:0;">Regular rate</td>
+                      <td style="font-size:14px;font-weight:700;color:#fbbf24;padding:0;text-align:right;">
+                        {regular_rate_str}
+                      </td>
+                    </tr>
+                  </table>
+                </td>
+              </tr>
+            </table>
+
+            <p style="margin:0 0 24px;color:#94a3b8;font-size:14px;">
+              Your ZIP territories and lead access remain completely unchanged &mdash;
+              only the subscription price is updating.
+            </p>
+
+            <!-- CTA -->
+            <table cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
+              <tr>
+                <td style="background:#fbbf24;border-radius:8px;">
+                  <a href="{dashboard_url}"
+                     style="display:inline-block;padding:14px 28px;color:#0f172a;font-size:15px;
+                            font-weight:700;text-decoration:none;">
+                    Access Your Lead Feed &rarr;
+                  </a>
+                </td>
+              </tr>
+            </table>
+
+            <p style="margin:0;font-size:13px;color:#64748b;">
+              Questions? Reply to this email or reach us at
+              <a href="mailto:support@forcedaction.io" style="color:#fbbf24;text-decoration:none;">
+                support@forcedaction.io
+              </a>
+            </p>
+          </td>
+        </tr>
+
+        <!-- Footer -->
+        <tr>
+          <td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.08);
+                     font-size:12px;color:#475569;text-align:center;">
+            Forced Action &mdash; Hillsborough County Property Intelligence
+          </td>
+        </tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>"""
+
                     send_email(
                         to=subscriber.email,
                         subject="Update to your Forced Action subscription",
                         body_text=(
-                            f"Hi {subscriber.name or 'there'},\n\n"
+                            f"Hi {name},\n\n"
                             f"Your 6-month founding rate lock has now expired. "
                             f"Your subscription will automatically renew at the current "
-                            f"{subscriber.tier.title()} plan rate starting with your next "
+                            f"{tier} plan rate starting with your next "
                             f"billing cycle.\n\n"
+                            f"What's changing:\n"
+                            f"  Founding rate: {founding_rate_str} (ended)\n"
+                            f"  Regular rate:  {regular_rate_str}\n\n"
                             f"Your ZIP territories and lead access remain unchanged — "
                             f"only the price updates.\n\n"
                             f"Access your lead feed:\n{dashboard_url}\n\n"
                             f"Questions? support@forcedaction.io\n\n"
                             f"— Forced Action Team"
                         ),
+                        body_html=body_html,
                     )
 
             except stripe.StripeError as exc:

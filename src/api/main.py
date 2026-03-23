@@ -20,7 +20,7 @@ from fastapi import FastAPI, Header, HTTPException, Request, Depends, Query
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, field_validator, EmailStr
+from pydantic import BaseModel, field_validator, model_validator, EmailStr
 from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from sqlalchemy import select, and_, desc, func
@@ -124,9 +124,18 @@ class CheckoutRequest(BaseModel):
             raise ValueError("At least one ZIP code must be selected before checkout")
         return v
 
+    @model_validator(mode="after")
+    def validate_zip_count(self) -> "CheckoutRequest":
+        limits = {"starter": 1, "pro": 3, "dominator": 10}
+        limit = limits.get(self.tier)
+        if limit and len(self.zip_codes) != limit:
+            raise ValueError(f"{self.tier.title()} plan requires exactly {limit} ZIP code{'s' if limit > 1 else ''}.")
+        return self
+
 
 @app.post("/api/checkout")
 def create_checkout(payload: CheckoutRequest, db: Session = Depends(get_db)):
+
     _s = get_settings()
     stripe.api_key = _s.stripe_secret_key.get_secret_value()
 
@@ -639,6 +648,7 @@ def event_feed(
             "county_id": subscriber.county_id,
             "locked_zips": list(locked_zips),
             "founding_member": subscriber.founding_member,
+            "status": subscriber.status,
         },
         "total": total,
         "page": page,
@@ -826,8 +836,136 @@ def sample_leads(
 
 
 # ---------------------------------------------------------------------------
+# POST /api/lead-pack/checkout — Create PaymentIntent for a lead pack purchase
+# ---------------------------------------------------------------------------
+
+class LeadPackCheckoutRequest(BaseModel):
+    feed_uuid: str
+    zip_code: str
+    vertical: str
+    county_id: str = "hillsborough"
+
+
+@app.post("/api/lead-pack/checkout")
+def lead_pack_checkout(payload: LeadPackCheckoutRequest, db: Session = Depends(get_db)):
+    """
+    Create a Stripe PaymentIntent for a $99 lead pack.
+    Returns { client_secret, publishable_key, amount, currency }.
+    """
+    _s = get_settings()
+
+    if not _s.stripe_secret_key:
+        raise HTTPException(status_code=503, detail={"error": "payment_unavailable", "message": "Payment not configured"})
+
+    # Validate subscriber
+    try:
+        subscriber = db.execute(
+            select(Subscriber).where(Subscriber.event_feed_uuid == payload.feed_uuid)
+        ).scalar_one_or_none()
+    except OperationalError:
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
+
+    if not subscriber or subscriber.status not in ("active", "grace"):
+        raise HTTPException(status_code=403, detail={"error": "unauthorized", "message": "Active subscription required"})
+
+    if payload.vertical not in VALID_VERTICALS:
+        raise HTTPException(status_code=400, detail={"error": "invalid_vertical", "message": f"Unknown vertical '{payload.vertical}'"})
+
+    # Reject if subscriber already owns this ZIP — they get those leads free
+    owned = db.execute(
+        select(ZipTerritory).where(
+            ZipTerritory.subscriber_id == subscriber.id,
+            ZipTerritory.zip_code == payload.zip_code,
+            ZipTerritory.vertical == payload.vertical,
+            ZipTerritory.status.in_(["locked", "grace"]),
+        )
+    ).scalar_one_or_none()
+    if owned:
+        raise HTTPException(status_code=400, detail={"error": "zip_already_owned", "message": "You already receive leads for this ZIP in your feed."})
+
+    # Look up price amount from Stripe
+    stripe.api_key = _s.stripe_secret_key.get_secret_value()
+    price_id = _s.stripe_price_lead_pack
+    if not price_id:
+        raise HTTPException(status_code=503, detail={"error": "price_not_configured", "message": "Lead pack price not configured"})
+
+    try:
+        price = stripe.Price.retrieve(price_id)
+        amount = price["unit_amount"]
+        currency = price["currency"]
+    except stripe.StripeError as exc:
+        logger.error("Stripe error retrieving lead pack price: %s", exc)
+        raise HTTPException(status_code=502, detail={"error": "payment_unavailable", "message": "Could not retrieve price"})
+
+    try:
+        intent = stripe.PaymentIntent.create(
+            amount=amount,
+            currency=currency,
+            metadata={
+                "product":   "lead_pack",
+                "feed_uuid": payload.feed_uuid,
+                "zip_code":  payload.zip_code,
+                "vertical":  payload.vertical,
+                "county_id": payload.county_id,
+            },
+            description=f"Lead Pack — {payload.zip_code} / {payload.vertical}",
+        )
+    except stripe.StripeError as exc:
+        logger.error("Stripe error creating lead pack PaymentIntent: %s", exc)
+        raise HTTPException(status_code=502, detail={"error": "payment_unavailable", "message": "Could not create payment"})
+
+    return {
+        "client_secret":    intent["client_secret"],
+        "publishable_key":  _s.stripe_publishable_key,
+        "amount":           amount,
+        "currency":         currency,
+    }
+
+
+# ---------------------------------------------------------------------------
 # GET /api/lead-pack/{purchase_id} — Retrieve lead pack delivery (fallback)
 # ---------------------------------------------------------------------------
+
+@app.get("/api/lead-pack-history/{feed_uuid}")
+def lead_pack_history(feed_uuid: str, db: Session = Depends(get_db)):
+    """Return all lead pack purchases for a subscriber."""
+    try:
+        subscriber = db.execute(
+            select(Subscriber).where(Subscriber.event_feed_uuid == feed_uuid)
+        ).scalar_one_or_none()
+    except OperationalError:
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable"})
+
+    if not subscriber:
+        raise HTTPException(status_code=404, detail={"error": "not_found"})
+
+    try:
+        purchases = db.execute(
+            select(LeadPackPurchase)
+            .where(LeadPackPurchase.subscriber_id == subscriber.id)
+            .order_by(desc(LeadPackPurchase.purchased_at))
+        ).scalars().all()
+    except OperationalError:
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable"})
+
+    from datetime import datetime as _dt, timezone as _tz
+    now = _dt.now(_tz.utc)
+    return {
+        "purchases": [
+            {
+                "id":              p.id,
+                "zip_code":        p.zip_code,
+                "vertical":        p.vertical,
+                "status":          p.status,
+                "purchased_at":    p.purchased_at.isoformat() if p.purchased_at else None,
+                "exclusive_until": p.exclusive_until.isoformat() if p.exclusive_until else None,
+                "exclusive_active": bool(p.exclusive_until and p.exclusive_until.replace(tzinfo=_tz.utc) > now),
+                "lead_count":      len(p.lead_ids) if p.lead_ids else 0,
+            }
+            for p in purchases
+        ]
+    }
+
 
 @app.get("/api/lead-pack/{purchase_id}")
 def lead_pack_detail(purchase_id: int, db: Session = Depends(get_db)):

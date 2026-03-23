@@ -316,6 +316,60 @@ class BaseLoader(ABC):
     # PROPERTY MATCHING UTILITIES
     # ========================================================================
     
+    @staticmethod
+    def extract_parcel_ids_from_text(text: str) -> list:
+        """
+        Extract Florida-style parcel IDs from free text (e.g. legal descriptions).
+
+        Recognises two formats:
+        - Hyphenated: 29-30-27-0000-00000-0001 (6 groups of digits separated by hyphens)
+        - Compact:    293027000000000001       (18 contiguous digits, same structure)
+
+        Also looks for IDs preceded by keywords like PARCEL, FOLIO, PCN, PIN.
+
+        Returns a list of candidate parcel IDs in hyphenated canonical form
+        (matching the typical properties.parcel_id storage format), with any
+        duplicates removed but order preserved.
+        """
+        if not text or pd.isna(text):
+            return []
+
+        text = str(text).upper().strip()
+        candidates: list = []
+        seen: set = set()
+
+        # Pattern 1: Hyphenated — SS-TT-RR-SSSS-SSSSS-SSSS (6 hyphen-separated groups)
+        for m in re.finditer(r'\b(\d{1,2}-\d{1,2}-\d{1,2}-\d{4}-\d{4,5}-\d{4})\b', text):
+            pid = m.group(1)
+            if pid not in seen:
+                seen.add(pid)
+                candidates.append(pid)
+
+        # Pattern 2: Compact 18-digit string (no hyphens)
+        # Convert to hyphenated form: XX-XX-XX-XXXX-XXXXX-XXXX
+        for m in re.finditer(r'\b(\d{18})\b', text):
+            digits = m.group(1)
+            pid = f"{digits[0:2]}-{digits[2:4]}-{digits[4:6]}-{digits[6:10]}-{digits[10:15]}-{digits[15:18]}"
+            if pid not in seen:
+                seen.add(pid)
+                candidates.append(pid)
+
+        # Pattern 3: Keyword-preceded ID (PARCEL, FOLIO, PCN, PIN followed by digits/hyphens)
+        for m in re.finditer(r'\b(?:PARCEL|FOLIO|PCN|PIN)[:\s#]*(\d[\d-]{10,})', text):
+            raw = m.group(1).strip('-')
+            # If already hyphenated and looks valid, take as-is
+            if '-' in raw and raw not in seen:
+                seen.add(raw)
+                candidates.append(raw)
+            # If compact digits, try to format
+            elif '-' not in raw and len(raw) == 18 and raw not in seen:
+                pid = f"{raw[0:2]}-{raw[2:4]}-{raw[4:6]}-{raw[6:10]}-{raw[10:15]}-{raw[15:18]}"
+                if pid not in seen:
+                    seen.add(pid)
+                    candidates.append(pid)
+
+        return candidates
+
     def find_property_by_parcel_id(self, parcel_id: str) -> Optional[Property]:
         """
         Find property by exact parcel ID match.

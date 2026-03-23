@@ -510,21 +510,31 @@ def push_subscriber_to_ghl(subscriber, stage: Optional[int], tags: Optional[List
                 ),
             }
             try:
-                opp_resp = _ghl_request(
-                    "POST",
-                    f"{_GHL_BASE}/opportunities/",
-                    headers=_headers(),
-                    json=opp_payload,
-                )
+                existing_opp_id = _find_opportunity_for_contact(contact_id)
+                if existing_opp_id:
+                    put_payload = {k: v for k, v in opp_payload.items() if k not in ("locationId", "contactId")}
+                    opp_resp = _ghl_request(
+                        "PUT",
+                        f"{_GHL_BASE}/opportunities/{existing_opp_id}",
+                        headers=_headers(),
+                        json=put_payload,
+                    )
+                else:
+                    opp_resp = _ghl_request(
+                        "POST",
+                        f"{_GHL_BASE}/opportunities/",
+                        headers=_headers(),
+                        json=opp_payload,
+                    )
                 opp_resp.raise_for_status()
             except RequestException as exc:
                 logger.warning(
-                    "[GHL] Network error creating subscriber opportunity (stage=%s): %s",
+                    "[GHL] Network error upserting subscriber opportunity (stage=%s): %s",
                     stage, exc,
                 )
             except Exception:
                 logger.warning(
-                    "[GHL] Failed to create subscriber opportunity (stage=%s)",
+                    "[GHL] Failed to upsert subscriber opportunity (stage=%s)",
                     stage,
                     exc_info=True,
                 )

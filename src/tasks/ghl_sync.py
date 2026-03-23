@@ -136,50 +136,71 @@ def run_ghl_sync(
         pending_db_updates: list = []
 
         for prop in properties:
-            contact_id = None
-            last_exc = None
+            try:
+                contact_id = None
+                last_exc = None
 
-            # Retry loop — up to _PUSH_MAX_RETRIES attempts for transient failures
-            for attempt in range(_PUSH_MAX_RETRIES):
-                try:
-                    score_data = scorer.score_property(prop)
-                    contact_id = push_lead_to_ghl(score_data)
-                    last_exc = None
-                    break  # success
-                except Exception as exc:
-                    last_exc = exc
-                    if attempt < _PUSH_MAX_RETRIES - 1:
-                        wait = 2 ** attempt
-                        logger.warning(
-                            "[GHL Sync] Attempt %d/%d failed for %s — retrying in %ds: %s",
-                            attempt + 1, _PUSH_MAX_RETRIES, prop.parcel_id, wait, exc,
-                        )
-                        time.sleep(wait)
+                # Retry loop — up to _PUSH_MAX_RETRIES attempts for transient failures
+                for attempt in range(_PUSH_MAX_RETRIES):
+                    try:
+                        score_data = scorer.score_property(prop)
+                        contact_id = push_lead_to_ghl(score_data)
+                        last_exc = None
+                        break  # success
+                    except Exception as exc:
+                        last_exc = exc
+                        if attempt < _PUSH_MAX_RETRIES - 1:
+                            wait = 2 ** attempt
+                            logger.warning(
+                                "[GHL Sync] Attempt %d/%d failed for %s — retrying in %ds: %s",
+                                attempt + 1, _PUSH_MAX_RETRIES, prop.parcel_id, wait, exc,
+                            )
+                            time.sleep(wait)
 
-            if last_exc is not None:
+                if last_exc is not None:
+                    logger.error(
+                        "[GHL Sync] All %d attempts failed for property %s (%s): %s",
+                        _PUSH_MAX_RETRIES, prop.id, prop.parcel_id, last_exc,
+                    )
+                    stats["failed"] += 1
+                    pending_db_updates.append((prop.id, prop.gohighlevel_contact_id, "sync_failed"))
+                elif not contact_id:
+                    # Below score threshold — mark synced so it doesn't re-loop
+                    logger.debug("[GHL Sync] Skipped (below threshold): %s", prop.parcel_id)
+                    stats["skipped"] += 1
+                    pending_db_updates.append((prop.id, prop.gohighlevel_contact_id, "synced"))
+                else:
+                    stats["pushed"] += 1
+                    pending_db_updates.append((prop.id, contact_id, "synced"))
+
+            except Exception as exc:
+                # Catch-all: never let a single property kill the entire sync run
                 logger.error(
-                    "[GHL Sync] All %d attempts failed for property %s (%s): %s",
-                    _PUSH_MAX_RETRIES, prop.id, prop.parcel_id, last_exc, exc_info=True,
+                    "[GHL Sync] Unexpected error for property %s (%s) — skipping: %s",
+                    prop.id, prop.parcel_id, exc,
                 )
                 stats["failed"] += 1
-                pending_db_updates.append((prop.id, prop.gohighlevel_contact_id, "sync_failed"))
-            elif not contact_id:
-                # Below score threshold — mark synced so it doesn't re-loop
-                logger.debug("[GHL Sync] Skipped (below threshold): %s", prop.parcel_id)
-                stats["skipped"] += 1
-                pending_db_updates.append((prop.id, prop.gohighlevel_contact_id, "synced"))
-            else:
-                stats["pushed"] += 1
-                pending_db_updates.append((prop.id, contact_id, "synced"))
+                try:
+                    pending_db_updates.append((prop.id, prop.gohighlevel_contact_id, "sync_failed"))
+                except Exception:
+                    pass  # property object may be in a bad state — just move on
 
             # Commit in batches to keep transaction duration short
             if len(pending_db_updates) >= _DB_BATCH_SIZE:
-                _batch_update(session, pending_db_updates)
+                try:
+                    _batch_update(session, pending_db_updates)
+                except Exception as exc:
+                    logger.error("[GHL Sync] Batch commit failed: %s — rolling back", exc)
+                    session.rollback()
                 pending_db_updates.clear()
 
         # Final partial batch
         if pending_db_updates:
-            _batch_update(session, pending_db_updates)
+            try:
+                _batch_update(session, pending_db_updates)
+            except Exception as exc:
+                logger.error("[GHL Sync] Final batch commit failed: %s — rolling back", exc)
+                session.rollback()
 
     logger.info(
         "[GHL Sync] Complete — pushed=%d failed=%d skipped=%d / total=%d",
@@ -194,15 +215,43 @@ def _batch_update(session, updates: list) -> None:
 
     Each call commits one transaction covering up to _DB_BATCH_SIZE rows —
     far cheaper than the old pattern of one transaction per lead.
+
+    Handles duplicate gohighlevel_contact_id gracefully — when GHL returns
+    the same contact ID for multiple properties (e.g. same owner, multiple
+    parcels), we store the contact_id on the first property and mark the
+    rest as synced without the contact_id to avoid unique constraint violations.
     """
     now = datetime.now(timezone.utc)
     for prop_id, contact_id, sync_status in updates:
-        values = {"sync_status": sync_status, "last_crm_sync": now}
+        values = {"sync_status": sync_status, "last_crm_sync": now, "updated_at": now}
         if contact_id:
-            values["gohighlevel_contact_id"] = contact_id
-        session.query(Property).filter(Property.id == prop_id).update(
-            values, synchronize_session=False
-        )
+            # Check if another property already holds this GHL contact ID
+            existing = session.query(Property.id).filter(
+                Property.gohighlevel_contact_id == contact_id,
+                Property.id != prop_id,
+            ).first()
+            if existing:
+                logger.info(
+                    "[GHL Sync] Contact %s already linked to property %d — "
+                    "skipping contact_id for property %d (same owner, multiple parcels)",
+                    contact_id, existing[0], prop_id,
+                )
+            else:
+                values["gohighlevel_contact_id"] = contact_id
+        try:
+            session.query(Property).filter(Property.id == prop_id).update(
+                values, synchronize_session=False
+            )
+        except Exception as exc:
+            session.rollback()
+            logger.warning(
+                "[GHL Sync] Update failed for property %d: %s — marking synced without contact_id",
+                prop_id, exc,
+            )
+            session.query(Property).filter(Property.id == prop_id).update(
+                {"sync_status": sync_status, "last_crm_sync": now, "updated_at": now},
+                synchronize_session=False,
+            )
     session.commit()
     logger.debug("[GHL Sync] Batch committed %d property updates", len(updates))
 

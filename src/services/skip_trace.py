@@ -15,6 +15,7 @@ Usage:
   python -m src.services.skip_trace --limit 10 --dry-run
   python -m src.services.skip_trace --limit 100 --tier Gold
   python -m src.services.skip_trace --limit 500
+  python -m src.services.skip_trace --limit 50 --vertical roofing
 """
 
 import time
