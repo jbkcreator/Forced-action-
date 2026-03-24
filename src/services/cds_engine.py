@@ -669,6 +669,7 @@ class MultiVerticalScorer:
             "distress_types":  list({s["type"] for s in signals}),
             "factor_scores":   self._build_factor_scores(signals, vertical_results),
             "signal_summaries": self._build_signal_summaries(prop),
+            "est_job_value":   self._estimate_job_value(prop, signals),
         }
 
     def _build_signal_summaries(self, prop: "Property") -> Dict[str, str]:
@@ -813,6 +814,17 @@ class MultiVerticalScorer:
             summaries["permit_summary"] = " — ".join(parts)
 
         return summaries
+
+    def _estimate_job_value(self, prop: "Property", signals: List[Dict]) -> Dict:
+        """Estimate job value using signal types and property specs."""
+        try:
+            from src.services.job_estimator import estimate_job_value
+            distress_types = list({s["type"] for s in signals})
+            # Use the highest-scoring vertical for this property
+            return estimate_job_value(prop, distress_types)
+        except Exception:
+            logger.debug("Job value estimation failed for property %s", prop.id, exc_info=True)
+            return {"low": 0, "high": 0, "display": "N/A", "method": "error"}
 
     def _build_factor_scores(self, signals: List[Dict], vertical_results: Dict) -> Dict:
         """
@@ -1282,6 +1294,11 @@ def main():
         help="Rescore a single property by database ID",
     )
     parser.add_argument(
+        "--rescore-new-signals",
+        action="store_true",
+        help="Only rescore properties with new signal data since their last score",
+    )
+    parser.add_argument(
         "--no-ghl",
         action="store_true",
         help="Skip GHL CRM push (useful for bulk rescores to avoid rate limits)",
@@ -1296,9 +1313,42 @@ def main():
     property_ids = None
     if args.property_id:
         property_ids = [args.property_id]
+    elif args.rescore_new_signals:
+        # Find properties with new signals since last score, or never scored
+        log.info("Querying properties with new signals since last score...")
+        with get_db_context() as _sess:
+            from sqlalchemy import text as sa_text
+            new_signal_ids = _sess.execute(sa_text("""
+                SELECT DISTINCT p.id FROM properties p
+                LEFT JOIN distress_scores ds ON ds.property_id = p.id
+                WHERE ds.id IS NULL  -- never scored
+                   OR EXISTS (
+                    SELECT 1 FROM foreclosures f WHERE f.property_id = p.id AND f.created_at > ds.score_date
+                  ) OR EXISTS (
+                    SELECT 1 FROM tax_delinquencies t WHERE t.property_id = p.id AND t.created_at > ds.score_date
+                  ) OR EXISTS (
+                    SELECT 1 FROM code_violations v WHERE v.property_id = p.id AND v.created_at > ds.score_date
+                  ) OR EXISTS (
+                    SELECT 1 FROM legal_and_liens l WHERE l.property_id = p.id AND l.created_at > ds.score_date
+                  ) OR EXISTS (
+                    SELECT 1 FROM building_permits bp WHERE bp.property_id = p.id AND bp.created_at > ds.score_date
+                  ) OR EXISTS (
+                    SELECT 1 FROM legal_proceedings lp WHERE lp.property_id = p.id AND lp.created_at > ds.score_date
+                  ) OR EXISTS (
+                    SELECT 1 FROM incidents i WHERE i.property_id = p.id AND i.created_at > ds.score_date
+                  ) OR EXISTS (
+                    SELECT 1 FROM deeds d WHERE d.property_id = p.id AND d.created_at > ds.score_date
+                  )
+            """)).fetchall()
+            property_ids = [row[0] for row in new_signal_ids]
+        log.info("Found %d properties with new signals to rescore", len(property_ids))
+        if not property_ids:
+            log.info("No properties need rescoring — all up to date")
+            sys.exit(0)
 
     run_label = (
         f"property {args.property_id}" if args.property_id
+        else f"{len(property_ids)} properties (new signals)" if args.rescore_new_signals
         else "all properties (rescore)" if args.rescore_all
         else "daily run (all properties)"
     )

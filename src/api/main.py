@@ -637,6 +637,7 @@ def event_feed(
             "lead_tier": score.lead_tier,
             "urgency": score.urgency_level,
             "distress_types": score.distress_types,
+            "est_job_value": _estimate_lead_job_value(prop, score),
             "incidents": incidents_by_prop.get(prop.id, []),
         })
 
@@ -656,6 +657,16 @@ def event_feed(
         "pages": -(-total // page_size),  # ceiling division
         "leads": leads,
     }
+
+
+def _estimate_lead_job_value(prop, score) -> dict:
+    """Compute job value estimate for a feed lead."""
+    try:
+        from src.services.job_estimator import estimate_job_value
+        distress_types = score.distress_types or []
+        return estimate_job_value(prop, distress_types)
+    except Exception:
+        return {"low": 0, "high": 0, "display": "N/A", "method": "error"}
 
 
 # ---------------------------------------------------------------------------
@@ -1030,6 +1041,43 @@ def lead_pack_detail(purchase_id: int, db: Session = Depends(get_db)):
         "exclusive_until": purchase.exclusive_until.isoformat() if purchase.exclusive_until else None,
         "leads": leads,
     }
+
+
+# ---------------------------------------------------------------------------
+# POST /api/hot-lead-unlock — Create Stripe checkout for hot lead unlock
+# ---------------------------------------------------------------------------
+
+class HotLeadUnlockRequest(BaseModel):
+    feed_uuid: str
+    lead_id: str
+    reduced: bool = False
+
+@app.post("/api/hot-lead-unlock")
+def hot_lead_unlock(payload: HotLeadUnlockRequest, db: Session = Depends(get_db)):
+    """Create a one-time Stripe Checkout Session ($150 or $99 reduced) for hot lead unlock."""
+    subscriber = db.execute(
+        select(Subscriber).where(Subscriber.event_feed_uuid == payload.feed_uuid)
+    ).scalar_one_or_none()
+    if not subscriber:
+        raise HTTPException(status_code=404, detail="Subscriber not found")
+    if subscriber.status not in ("active", "grace"):
+        raise HTTPException(status_code=403, detail="Active subscription required")
+    if not subscriber.stripe_customer_id:
+        raise HTTPException(status_code=400, detail="No Stripe customer linked")
+
+    from src.services.stripe_service import create_hot_lead_unlock_link
+    try:
+        result = create_hot_lead_unlock_link(
+            subscriber_stripe_customer_id=subscriber.stripe_customer_id,
+            lead_id=payload.lead_id,
+            reduced=payload.reduced,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    return {"checkout_url": result["url"]}
 
 
 # ---------------------------------------------------------------------------

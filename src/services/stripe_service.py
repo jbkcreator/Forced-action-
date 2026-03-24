@@ -31,7 +31,10 @@ from src.core.models import FoundingSubscriberCount
 
 logger = logging.getLogger(__name__)
 
-FOUNDING_LIMIT = 10  # founding rate available for first 10 subscribers per tier/vertical/county
+def _founding_limit() -> int:
+    """Read from env (FOUNDING_SPOT_LIMIT) — changeable without redeploy."""
+    from config.settings import get_settings
+    return get_settings().founding_spot_limit
 
 # ---------------------------------------------------------------------------
 # Stripe price IDs — loaded from env. Set these after creating products in
@@ -141,7 +144,7 @@ def get_price_id_for_checkout(
             )
             raise
 
-    is_founding = row.count < FOUNDING_LIMIT
+    is_founding = row.count < _founding_limit()
     price_key = "founding" if is_founding else "regular"
     price_id = prices[tier][price_key]
 
@@ -153,7 +156,7 @@ def get_price_id_for_checkout(
 
     logger.info(
         "Checkout price selected: tier=%s vertical=%s county=%s founding=%s count=%d/%d",
-        tier, vertical, county_id, is_founding, row.count, FOUNDING_LIMIT,
+        tier, vertical, county_id, is_founding, row.count, _founding_limit(),
     )
     return price_id, is_founding
 
@@ -364,6 +367,6 @@ def get_founding_spots_remaining(
         raise
 
     if row is None:
-        return FOUNDING_LIMIT
+        return _founding_limit()
 
-    return max(0, FOUNDING_LIMIT - row.count)
+    return max(0, _founding_limit() - row.count)

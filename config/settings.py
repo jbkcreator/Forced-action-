@@ -55,6 +55,9 @@ class AppSettings(BaseSettings):
 	stripe_price_lead_pack: Optional[str] = Field(default=None, env="STRIPE_PRICE_LEAD_PACK")
 	stripe_price_hot_lead_unlock: Optional[str] = Field(default=None, env="STRIPE_PRICE_HOT_LEAD_UNLOCK")
 
+	# Founding subscriber spot limit (default 10, changeable without redeploy)
+	founding_spot_limit: int = Field(default=10, env="FOUNDING_SPOT_LIMIT")
+
 	# Application base URL — used for Stripe return/success URLs
 	app_base_url: str = Field(
 		default="http://localhost:8000",

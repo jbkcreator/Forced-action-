@@ -152,6 +152,7 @@ def _parse_result(person: dict) -> dict:
 def run_skip_trace(
     limit: int = 100,
     tier_filter: Optional[str] = None,
+    vertical: Optional[str] = None,
     dry_run: bool = False,
     county_id: str = "hillsborough",
 ) -> dict:
@@ -196,7 +197,7 @@ def run_skip_trace(
         )
 
         # Subquery: join back to get lead_tier on that latest date
-        ds_current = (
+        ds_q = (
             session.query(DistressScore.property_id, DistressScore.lead_tier)
             .join(
                 ds_latest,
@@ -204,8 +205,16 @@ def run_skip_trace(
                 & (DistressScore.score_date == ds_latest.c.max_date),
             )
             .filter(DistressScore.lead_tier.in_(tier_values))
-            .subquery()
         )
+
+        # Optional vertical filter — only enrich owners scoring > 0 for this vertical
+        if vertical:
+            ds_q = ds_q.filter(
+                text(f"(vertical_scores->>:vert)::float > 0").bindparams(vert=vertical)
+            )
+            logger.info("Vertical filter: %s", vertical)
+
+        ds_current = ds_q.subquery()
 
         rows = (
             session.query(Owner, Property)
@@ -223,7 +232,7 @@ def run_skip_trace(
         logger.info("No candidates found — all high-priority owners already have contact info.")
         return stats
 
-    logger.info(f"Found {len(rows)} owners to skip-trace (limit={limit}, tiers={tier_values})")
+    logger.info(f"Found {len(rows)} owners to skip-trace (limit={limit}, tiers={tier_values}, vertical={vertical or 'all'})")
     stats["total"] = len(rows)
 
     if dry_run:
@@ -369,6 +378,8 @@ if __name__ == "__main__":
     parser.add_argument("--tier", type=str, default=None,
                         choices=["Ultra Platinum", "Platinum", "Gold"],
                         help="Filter by lead tier (default: all Gold+)")
+    parser.add_argument("--vertical", type=str, default=None,
+                        help="Filter by vertical (e.g. roofing, remediation, investor)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Build payloads but do NOT call API or write to DB")
     parser.add_argument("--county-id", dest="county_id", default="hillsborough")
@@ -378,6 +389,7 @@ if __name__ == "__main__":
         stats = run_skip_trace(
             limit=args.limit,
             tier_filter=args.tier,
+            vertical=args.vertical,
             dry_run=args.dry_run,
             county_id=args.county_id,
         )

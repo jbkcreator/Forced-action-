@@ -268,15 +268,19 @@ def load_scraped_data_to_db(
                 # using per-document_type counts captured by the loader.
                 lien_counts = getattr(loader, 'stats_by_doc_type', {})
                 if lien_counts:
-                    for doc_type_label, counts in lien_counts.items():
+                    total_lien_matched = sum(c.get('matched', 0) for c in lien_counts.values())
+                for doc_type_label, counts in lien_counts.items():
                         src = LIEN_DOCTYPE_TO_SOURCE.get(doc_type_label, 'lien_ml')
+                        # Distribute scored count proportionally across subtypes
+                        subtype_matched = counts.get('matched', 0)
+                        subtype_scored = round(scored * subtype_matched / total_lien_matched) if total_lien_matched else 0
                         record_scraper_stats(
                             source_type=src,
                             total_scraped=counts.get('total', 0),
-                            matched=counts.get('matched', 0),
+                            matched=subtype_matched,
                             unmatched=counts.get('unmatched', 0),
                             skipped=counts.get('skipped', 0),
-                            scored=0,
+                            scored=subtype_scored,
                             duration_seconds=duration,
                         )
                 else:
@@ -299,7 +303,7 @@ def load_scraped_data_to_db(
                         matched=lp_stats['matched'],
                         unmatched=lp_stats['unmatched'],
                         skipped=lp_stats['skipped'],
-                        scored=0,
+                        scored=lp_stats['matched'],  # all matched LP records trigger a rescore
                         duration_seconds=duration,
                     )
             else:

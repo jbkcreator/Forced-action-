@@ -128,6 +128,7 @@ def scrape_roofing_permits(
             matched=created,
             unmatched=skipped_no_property,
             skipped=skipped_duplicate,
+            scored=created,
         )
     except Exception as stats_err:
         logger.warning("⚠ Could not record scraper stats (non-critical): %s", stats_err)
