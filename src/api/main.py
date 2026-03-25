@@ -6,7 +6,9 @@ Endpoints:
     GET  /api/founding-spots       — Founding countdown for landing page
     GET  /api/zip-check            — ZIP availability checker for landing page
     POST /api/checkout             — Create Stripe checkout session
-    GET  /api/feed/{uuid}          — Event Feed for subscribers (paginated leads)
+    GET  /api/feed/{uuid}          — Event Feed for subscribers (paginated leads, sort, search, filter)
+    GET  /api/feed/{uuid}/stats    — Aggregate stats for the subscriber's feed
+    POST /api/resend-confirmation  — Re-send welcome/confirmation email by feed_uuid
     GET  /                         — Landing page
 """
 
@@ -23,7 +25,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator, model_validator, EmailStr
 from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
-from sqlalchemy import select, and_, desc, func
+from sqlalchemy import select, and_, or_, desc, func, cast, Date
 
 from src.core.database import get_db_context
 from src.core.models import FoundingSubscriberCount, ZipTerritory, Subscriber, Property, DistressScore, Incident, LeadPackPurchase
@@ -529,13 +531,18 @@ def zip_check(
 # GET /api/feed/{uuid}
 # ---------------------------------------------------------------------------
 
+_VALID_SORTS = {"score_desc", "newest", "value_desc"}
+
+
 @app.get("/api/feed/{feed_uuid}")
 def event_feed(
     feed_uuid: str,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=25, ge=1, le=100),
+    sort: str = Query(default="score_desc"),
     min_score: Optional[float] = Query(default=None, ge=0.0, le=100.0),
     incident_type: Optional[str] = Query(default=None),
+    search: Optional[str] = Query(default=None, max_length=100),
     db: Session = Depends(get_db),
 ):
     """
@@ -603,11 +610,33 @@ def event_feed(
     if min_score is not None:
         filters.append(score_col >= min_score)
 
+    # Filter leads whose distress_types JSONB array contains the requested type
+    if incident_type:
+        filters.append(DistressScore.distress_types.contains([incident_type]))
+
+    # Full-text search across address, city, ZIP
+    if search:
+        term = f"%{search.strip()}%"
+        filters.append(or_(
+            Property.address.ilike(term),
+            Property.city.ilike(term),
+            Property.zip.ilike(term),
+        ))
+
+    # Sort order
+    _sort = sort if sort in _VALID_SORTS else "score_desc"
+    if _sort == "newest":
+        order_col = desc(DistressScore.score_date)
+    elif _sort == "value_desc":
+        order_col = desc(DistressScore.final_cds_score)  # CDS as value proxy until job estimator is query-able
+    else:
+        order_col = desc(score_col)
+
     base_query = (
         select(Property, DistressScore)
         .join(DistressScore, DistressScore.property_id == Property.id)
         .where(and_(*filters))
-        .order_by(desc(score_col))
+        .order_by(order_col)
     )
 
     # 4. Total count
@@ -626,12 +655,8 @@ def event_feed(
     property_ids = [prop.id for prop, _ in rows]
 
     try:
-        incident_filter = [Incident.property_id.in_(property_ids)]
-        if incident_type:
-            incident_filter.append(Incident.incident_type == incident_type)
-
         incidents_raw = db.execute(
-            select(Incident).where(and_(*incident_filter))
+            select(Incident).where(Incident.property_id.in_(property_ids))
         ).scalars().all()
     except OperationalError:
         logger.error("DB error fetching incidents for feed", exc_info=True)
@@ -684,6 +709,123 @@ def event_feed(
         "pages": -(-total // page_size),  # ceiling division
         "leads": leads,
     }
+
+
+# ---------------------------------------------------------------------------
+# GET /api/feed/{uuid}/stats
+# ---------------------------------------------------------------------------
+
+@app.get("/api/feed/{feed_uuid}/stats")
+def feed_stats(feed_uuid: str, db: Session = Depends(get_db)):
+    """Aggregate stats for the subscriber's feed: totals, new today, tier breakdown."""
+    from datetime import date, timezone, datetime as _dt
+
+    try:
+        subscriber = db.execute(
+            select(Subscriber).where(Subscriber.event_feed_uuid == feed_uuid)
+        ).scalar_one_or_none()
+    except OperationalError:
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
+
+    if not subscriber:
+        raise HTTPException(status_code=404, detail={"error": "not_found", "message": "Feed not found"})
+
+    if subscriber.status not in ("active", "grace"):
+        raise HTTPException(status_code=403, detail={"error": "subscription_inactive", "message": "Subscription is not active"})
+
+    try:
+        locked_zips = db.execute(
+            select(ZipTerritory.zip_code).where(
+                and_(
+                    ZipTerritory.subscriber_id == subscriber.id,
+                    ZipTerritory.status.in_(["locked", "grace"]),
+                )
+            )
+        ).scalars().all()
+    except OperationalError:
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
+
+    if not locked_zips:
+        return {"total_leads": 0, "new_today": 0, "tier_distribution": {}, "last_updated": None}
+
+    base_filter = [
+        Property.zip.in_(locked_zips),
+        Property.county_id == subscriber.county_id,
+        DistressScore.qualified == True,
+    ]
+
+    try:
+        base_q = (
+            select(DistressScore)
+            .join(Property, Property.id == DistressScore.property_id)
+            .where(and_(*base_filter))
+        )
+
+        total = db.execute(select(func.count()).select_from(base_q.subquery())).scalar()
+
+        today_start = _dt.combine(date.today(), _dt.min.time())
+        new_today = db.execute(
+            select(func.count()).select_from(
+                base_q.where(DistressScore.score_date >= today_start).subquery()
+            )
+        ).scalar()
+
+        tier_rows = db.execute(
+            select(DistressScore.lead_tier, func.count().label("cnt"))
+            .join(Property, Property.id == DistressScore.property_id)
+            .where(and_(*base_filter))
+            .group_by(DistressScore.lead_tier)
+        ).all()
+        tier_distribution = {row.lead_tier: row.cnt for row in tier_rows if row.lead_tier}
+
+        last_updated_row = db.execute(
+            select(func.max(DistressScore.score_date))
+            .join(Property, Property.id == DistressScore.property_id)
+            .where(and_(*base_filter))
+        ).scalar()
+    except OperationalError:
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
+
+    return {
+        "total_leads": total,
+        "new_today": new_today,
+        "tier_distribution": tier_distribution,
+        "last_updated": last_updated_row.isoformat() if last_updated_row else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /api/resend-confirmation
+# ---------------------------------------------------------------------------
+
+class ResendConfirmationRequest(BaseModel):
+    feed_uuid: str
+
+
+@app.post("/api/resend-confirmation")
+def resend_confirmation(payload: ResendConfirmationRequest, db: Session = Depends(get_db)):
+    """Re-send the welcome/confirmation email for a subscriber by feed_uuid."""
+    try:
+        subscriber = db.execute(
+            select(Subscriber).where(Subscriber.event_feed_uuid == payload.feed_uuid)
+        ).scalar_one_or_none()
+    except OperationalError:
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
+
+    if not subscriber:
+        raise HTTPException(status_code=404, detail={"error": "not_found", "message": "Feed not found"})
+
+    if not subscriber.email:
+        raise HTTPException(status_code=422, detail={"error": "no_email", "message": "No email address on record"})
+
+    try:
+        from src.services.stripe_webhooks import _send_welcome_email
+        _send_welcome_email(subscriber)
+    except Exception:
+        logger.error("Failed to resend confirmation for feed %s", payload.feed_uuid, exc_info=True)
+        raise HTTPException(status_code=500, detail={"error": "send_failed", "message": "Failed to send email"})
+
+    return {"ok": True}
 
 
 def _estimate_lead_job_value(prop, score) -> dict:
