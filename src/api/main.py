@@ -35,6 +35,7 @@ from config.scoring import VERTICAL_WEIGHTS
 logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent.parent / "static"
+REACT_DIST = Path(__file__).parent.parent.parent.parent / "forced-action-ui" / "dist"
 
 VALID_TIERS = {"starter", "pro", "dominator"}
 VALID_VERTICALS = set(VERTICAL_WEIGHTS.keys())
@@ -42,9 +43,14 @@ VALID_VERTICALS = set(VERTICAL_WEIGHTS.keys())
 app = FastAPI(title="Forced Action API", version="1.0.0")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
+# Mount React build assets (JS/CSS chunks) if the dist directory exists
+if REACT_DIST.is_dir() and (REACT_DIST / "assets").is_dir():
+    app.mount("/assets", StaticFiles(directory=str(REACT_DIST / "assets")), name="react-assets")
+
 
 # ---------------------------------------------------------------------------
 # Global exception handlers
+
 # ---------------------------------------------------------------------------
 
 @app.exception_handler(SQLAlchemyError)
@@ -75,11 +81,14 @@ def get_db():
 
 
 # ---------------------------------------------------------------------------
-# GET / — Landing page
+# GET / — Landing page (React SPA or static HTML fallback)
 # ---------------------------------------------------------------------------
 
 @app.get("/", include_in_schema=False)
 def landing_page():
+    react_index = REACT_DIST / "index.html"
+    if react_index.is_file():
+        return FileResponse(str(react_index))
     return FileResponse(str(STATIC_DIR / "index.html"))
 
 
@@ -203,21 +212,39 @@ def create_checkout(payload: CheckoutRequest, db: Session = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
-# GET /success — Post-checkout confirmation page
+# GET /success — Post-checkout confirmation page (React SPA)
 # ---------------------------------------------------------------------------
 
 @app.get("/success", include_in_schema=False)
 def success_page():
+    react_index = REACT_DIST / "index.html"
+    if react_index.is_file():
+        return FileResponse(str(react_index))
     return FileResponse(str(STATIC_DIR / "success.html"))
 
 
 # ---------------------------------------------------------------------------
-# GET /dashboard/{feed_uuid} — Subscriber dashboard (leads + cancel modal)
+# GET /dashboard/{feed_uuid} — Subscriber dashboard (React SPA)
 # ---------------------------------------------------------------------------
 
 @app.get("/dashboard/{feed_uuid}", include_in_schema=False)
 def dashboard_page(feed_uuid: str):
+    react_index = REACT_DIST / "index.html"
+    if react_index.is_file():
+        return FileResponse(str(react_index))
     return FileResponse(str(STATIC_DIR / "dashboard.html"))
+
+
+# ---------------------------------------------------------------------------
+# GET /email-previews — Email template previews (React SPA)
+# ---------------------------------------------------------------------------
+
+@app.get("/email-previews", include_in_schema=False)
+def email_previews_page():
+    react_index = REACT_DIST / "index.html"
+    if react_index.is_file():
+        return FileResponse(str(react_index))
+    return FileResponse(str(STATIC_DIR / "email-previews.html"))
 
 
 # ---------------------------------------------------------------------------
