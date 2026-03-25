@@ -254,16 +254,17 @@ def run_skip_trace(
         index_map = []  # parallel list: index_map[i] = (owner, prop) for payloads[i]
 
         for owner, prop in batch:
-            if not prop.address:
+            if not prop.address or not prop.zip:
                 stats["no_address"] += 1
+                logger.debug(f"Skipping property_id={prop.id} — missing address or ZIP")
                 continue
 
             payload_entry = {
                 "propertyAddress": {
-                    "street": prop.address or "",
-                    "city": prop.city or "Tampa",
-                    "state": prop.state or "FL",
-                    "zip": prop.zip or "",
+                    "street": prop.address,
+                    "city":   prop.city  or "Tampa",
+                    "state":  prop.state or "FL",
+                    "zip":    prop.zip,
                 }
             }
 
