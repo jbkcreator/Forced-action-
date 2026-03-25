@@ -236,7 +236,12 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
 
     # ── Push to GHL stage 5 ────────────────────────────────────────────────
     try:
-        push_subscriber_to_ghl(subscriber, stage=5)
+        push_subscriber_to_ghl(
+            subscriber,
+            stage=5,
+            zip_codes=list(zip_codes),
+            is_founding=is_founding,
+        )
     except Exception:
         logger.error(
             "GHL push failed for subscriber %s — continuing without CRM sync",

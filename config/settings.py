@@ -39,6 +39,11 @@ class AppSettings(BaseSettings):
 	ghl_stage_churned: Optional[str] = Field(default=None, env="GHL_STAGE_CHURNED")                   # stage 7
 	# Set to false to disable all GHL pushes (e.g. bulk rescores)
 	ghl_push_enabled: bool = Field(default=True, env="GHL_PUSH_ENABLED")
+	# Subscriber-context custom field IDs (create in GHL → Settings → Custom Fields, then add IDs here)
+	ghl_cf_fa_tier: Optional[str] = Field(default=None, env="GHL_CF_FA_TIER")
+	ghl_cf_fa_zip: Optional[str] = Field(default=None, env="GHL_CF_FA_ZIP")
+	ghl_cf_fa_founding: Optional[str] = Field(default=None, env="GHL_CF_FA_FOUNDING")
+	ghl_cf_fa_dashboard_url: Optional[str] = Field(default=None, env="GHL_CF_FA_DASHBOARD_URL")
 
 	# Stripe (M1)
 	stripe_secret_key: Optional[SecretStr] = Field(default=None, env="STRIPE_SECRET_KEY")

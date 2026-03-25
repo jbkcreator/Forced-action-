@@ -361,9 +361,10 @@ def founding_summary(
             detail={"error": "invalid_vertical", "message": f"vertical must be one of: {sorted(VALID_VERTICALS)}"},
         )
 
-    FOUNDING_CAP = 10
+    settings = get_settings()
+    FOUNDING_CAP = settings.founding_spot_limit
     TIERS = ["starter", "pro", "dominator"]
-    TOTAL_CAP = FOUNDING_CAP * len(TIERS)  # 30
+    TOTAL_CAP = FOUNDING_CAP * len(TIERS)
 
     try:
         rows = db.execute(
@@ -415,7 +416,8 @@ def founding_spots(
             detail={"error": "invalid_vertical", "message": f"vertical must be one of: {sorted(VALID_VERTICALS)}"},
         )
 
-    FOUNDING_CAP = 10
+    settings = get_settings()
+    FOUNDING_CAP = settings.founding_spot_limit
 
     try:
         row = db.execute(

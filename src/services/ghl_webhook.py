@@ -417,7 +417,13 @@ def push_lead_to_ghl(score_data: Dict) -> Optional[str]:
 # M1 — Subscriber pipeline (stages 5 + 7)
 # ---------------------------------------------------------------------------
 
-def push_subscriber_to_ghl(subscriber, stage: Optional[int], tags: Optional[List[str]] = None) -> bool:
+def push_subscriber_to_ghl(
+    subscriber,
+    stage: Optional[int],
+    tags: Optional[List[str]] = None,
+    zip_codes: Optional[List[str]] = None,
+    is_founding: bool = False,
+) -> bool:
     """
     Create or update a GHL contact for a subscriber and optionally move them
     to a pipeline stage and/or apply tags.
@@ -426,11 +432,29 @@ def push_subscriber_to_ghl(subscriber, stage: Optional[int], tags: Optional[List
     stage=7 → Churned (GHL_STAGE_CHURNED)
     stage=None → tag-only update (e.g. payment_failed)
 
+    zip_codes and is_founding are used to populate subscriber-context custom fields
+    (fa_tier, fa_zip, fa_founding, fa_dashboard_url) when their GHL field IDs are configured.
+
     Returns True on success, False on any failure.
     Raises nothing — all errors are logged internally.
     """
     if not _is_configured():
         return False
+
+    # Build subscriber custom fields if GHL field IDs are configured
+    subscriber_custom_fields = []
+    base_url = settings.app_base_url.rstrip("/")
+    dashboard_url = f"{base_url}/dashboard/{subscriber.event_feed_uuid}" if subscriber.event_feed_uuid else ""
+
+    cf_map = [
+        (settings.ghl_cf_fa_tier,          getattr(subscriber, "tier", "") or ""),
+        (settings.ghl_cf_fa_zip,            ",".join(zip_codes) if zip_codes else ""),
+        (settings.ghl_cf_fa_founding,       "true" if is_founding else "false"),
+        (settings.ghl_cf_fa_dashboard_url,  dashboard_url),
+    ]
+    for field_id, value in cf_map:
+        if field_id:
+            subscriber_custom_fields.append({"id": field_id, "value": str(value)})
 
     contact_payload: Dict = {
         "locationId": settings.ghl_location_id,
@@ -438,6 +462,8 @@ def push_subscriber_to_ghl(subscriber, stage: Optional[int], tags: Optional[List
         "name": subscriber.name or "",
         "tags": tags or [],
     }
+    if subscriber_custom_fields:
+        contact_payload["customFields"] = subscriber_custom_fields
 
     contact_id = subscriber.ghl_contact_id
 

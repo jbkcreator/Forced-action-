@@ -191,7 +191,7 @@ EQUITY_VERTICALS   = {"wholesalers", "fix_flip", "attorneys", "roofing", "restor
 # Same parcel, 2+ distinct signal types within STACKING_WINDOW_DAYS.
 # +20 per additional signal beyond the primary, capped at +40.
 
-STACKING_WINDOW_DAYS      = 90   # Expanded from 60 during DB build-up phase; revert to 60 after 90 days of live data
+STACKING_WINDOW_DAYS      = 180  # Approved 2026-03-25: expanded from 90 to capture wider stacking signal window
 STACKING_BONUS_PER_SIGNAL = 20
 STACKING_BONUS_CAP        = 40
 
