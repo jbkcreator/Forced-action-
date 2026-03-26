@@ -2,6 +2,7 @@
 Forced Action — FastAPI application.
 
 Endpoints:
+    GET  /health                   — Health check (UptimeRobot / load balancer)
     POST /webhooks/stripe          — Stripe event receiver
     GET  /api/founding-spots       — Founding countdown for landing page
     GET  /api/zip-check            — ZIP availability checker for landing page
@@ -80,6 +81,19 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 def get_db():
     with get_db_context() as db:
         yield db
+
+
+# ---------------------------------------------------------------------------
+# GET /health — Uptime check
+# ---------------------------------------------------------------------------
+
+@app.get("/health", include_in_schema=False)
+def health_check(db: Session = Depends(get_db)):
+    try:
+        db.execute(select(1))
+    except Exception:
+        raise HTTPException(status_code=503, detail="db_unavailable")
+    return {"status": "ok"}
 
 
 # ---------------------------------------------------------------------------

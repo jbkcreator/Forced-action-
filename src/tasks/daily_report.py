@@ -1,7 +1,7 @@
 """
 Daily operations report — CSV export.
 
-Queries scraper_run_stats and platform_daily_stats for a given date
+Queries scraper_run_stats, platform_daily_stats, and distress_scores for a given date
 and writes a structured CSV to reports/daily/report_YYYY-MM-DD.csv.
 Files older than 7 days are automatically pruned.
 
@@ -18,11 +18,14 @@ import argparse
 import csv
 import logging
 import sys
+from collections import defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+from sqlalchemy import func, text
+
 from src.core.database import get_db_context
-from src.core.models import PlatformDailyStats, ScraperRunStats
+from src.core.models import DistressScore, PlatformDailyStats, ScraperRunStats
 from src.utils.logger import setup_logging
 
 setup_logging()
@@ -30,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 REPORTS_DIR = Path("reports/daily")
 RETENTION_DAYS = 7
+TIER_HISTORY_DAYS = 7  # How many days to show in the tier-by-day table
 
 # Display order for scraper rows
 SCRAPER_ORDER = [
@@ -54,33 +58,35 @@ SCRAPER_ORDER = [
     "fire_incidents",
 ]
 
+# Vertical → buyer bucket mapping for lead type breakdown
+VERTICAL_BUCKETS = {
+    "roofing":          "Roofing",
+    "restoration":      "Remediation",
+    "wholesalers":      "Wholesale / Investor",
+    "fix_flip":         "Wholesale / Investor",
+    "public_adjusters": "Wholesale / Investor",
+    "attorneys":        "Wholesale / Investor",
+}
 
-def build_report(run_date: date, county_id: str) -> dict:
-    with get_db_context() as session:
-        scraper_rows = (
-            session.query(ScraperRunStats)
-            .filter(
-                ScraperRunStats.run_date == run_date,
-                ScraperRunStats.county_id == county_id,
-            )
-            .all()
-        )
-        platform_row = (
-            session.query(PlatformDailyStats)
-            .filter(
-                PlatformDailyStats.run_date == run_date,
-                PlatformDailyStats.county_id == county_id,
-            )
-            .first()
-        )
+GOLD_PLUS_TIERS = {"Ultra Platinum", "Platinum", "Gold"}
 
+
+# ---------------------------------------------------------------------------
+# Data builders
+# ---------------------------------------------------------------------------
+
+def _build_scraper_section(session, run_date: date, county_id: str):
+    scraper_rows = (
+        session.query(ScraperRunStats)
+        .filter(ScraperRunStats.run_date == run_date, ScraperRunStats.county_id == county_id)
+        .all()
+    )
     scraper_by_type = {r.source_type: r for r in scraper_rows}
     ordered = [t for t in SCRAPER_ORDER if t in scraper_by_type]
     extras = sorted(t for t in scraper_by_type if t not in SCRAPER_ORDER)
 
     scraper_data = []
-    total_scraped = 0
-    total_matched = 0
+    total_scraped = total_matched = 0
     errors = []
 
     for source_type in ordered + extras:
@@ -88,64 +94,168 @@ def build_report(run_date: date, county_id: str) -> dict:
         total_scraped += row.total_scraped
         total_matched += row.matched
         scraper_data.append({
-            "label": source_type.replace("_", " ").title(),
-            "scraped": row.total_scraped,
-            "matched": row.matched if row.total_scraped > 0 else None,
-            "unmatched": row.unmatched if row.total_scraped > 0 else None,
-            "ok": row.run_success,
-            "error": row.error_message,
+            "label":    source_type.replace("_", " ").title(),
+            "scraped":  row.total_scraped,
+            "matched":  row.matched   if row.total_scraped > 0 else None,
+            "unmatched":row.unmatched if row.total_scraped > 0 else None,
+            "ok":       row.run_success,
+            "error":    row.error_message,
         })
         if not row.run_success:
             errors.append(f"{source_type}: {row.error_message or 'unknown error'}")
 
-    # Scrapers expected but with no DB row at all
     for source_type in SCRAPER_ORDER:
         if source_type not in scraper_by_type:
             scraper_data.append({
                 "label": source_type.replace("_", " ").title(),
-                "scraped": 0,
-                "matched": None,
-                "unmatched": None,
-                "ok": None,
-                "error": "No run recorded",
+                "scraped": 0, "matched": None, "unmatched": None,
+                "ok": None, "error": "No run recorded",
             })
 
     match_pct = (total_matched / total_scraped * 100) if total_scraped else 0.0
+    return scraper_data, total_scraped, total_matched, match_pct, errors
 
+
+def _build_scoring_section(session, run_date: date, county_id: str, errors: list):
+    platform_row = (
+        session.query(PlatformDailyStats)
+        .filter(PlatformDailyStats.run_date == run_date, PlatformDailyStats.county_id == county_id)
+        .first()
+    )
     if platform_row:
         scoring = {
-            "properties_scored": platform_row.properties_scored,
-            "properties_with_signals": platform_row.properties_with_signals,
-            "leads_new": platform_row.leads_new,
-            "leads_updated": platform_row.leads_updated,
-            "leads_unchanged": platform_row.leads_unchanged,
-            "leads_upgraded": platform_row.leads_upgraded,
+            "properties_scored":        platform_row.properties_scored,
+            "properties_with_signals":  platform_row.properties_with_signals,
+            "leads_new":                platform_row.leads_new,
+            "leads_updated":            platform_row.leads_updated,
+            "leads_unchanged":          platform_row.leads_unchanged,
+            "leads_upgraded":           platform_row.leads_upgraded,
         }
         tiers = {
             "Ultra Platinum": platform_row.tier_ultra_platinum,
-            "Platinum": platform_row.tier_platinum,
-            "Gold": platform_row.tier_gold,
-            "Silver": platform_row.tier_silver,
-            "Bronze": platform_row.tier_bronze,
+            "Platinum":       platform_row.tier_platinum,
+            "Gold":           platform_row.tier_gold,
+            "Silver":         platform_row.tier_silver,
+            "Bronze":         platform_row.tier_bronze,
         }
     else:
         scoring = {k: 0 for k in ("properties_scored", "properties_with_signals",
                                    "leads_new", "leads_updated", "leads_unchanged", "leads_upgraded")}
         tiers = {"Ultra Platinum": 0, "Platinum": 0, "Gold": 0, "Silver": 0, "Bronze": 0}
         errors.append("platform_daily_stats: no row found for this date")
+    return scoring, tiers
+
+
+def _build_tier_history(session, run_date: date, county_id: str) -> list:
+    """Gold+ counts per day for the last TIER_HISTORY_DAYS days."""
+    since = run_date - timedelta(days=TIER_HISTORY_DAYS - 1)
+    rows = (
+        session.query(
+            func.date(DistressScore.score_date).label("day"),
+            DistressScore.lead_tier,
+            func.count().label("cnt"),
+        )
+        .filter(
+            func.date(DistressScore.score_date) >= since,
+            func.date(DistressScore.score_date) <= run_date,
+            DistressScore.lead_tier.in_(GOLD_PLUS_TIERS),
+            DistressScore.county_id == county_id,
+        )
+        .group_by(func.date(DistressScore.score_date), DistressScore.lead_tier)
+        .all()
+    )
+
+    data = defaultdict(lambda: {"Ultra Platinum": 0, "Platinum": 0, "Gold": 0})
+    for day, tier, cnt in rows:
+        data[day][tier] = cnt
+
+    history = []
+    for day in sorted(data.keys(), reverse=True):
+        up = data[day]["Ultra Platinum"]
+        pl = data[day]["Platinum"]
+        go = data[day]["Gold"]
+        history.append({
+            "date":          str(day),
+            "ultra_platinum": up,
+            "platinum":       pl,
+            "gold":           go,
+            "total":          up + pl + go,
+        })
+    return history
+
+
+def _build_vertical_breakdown(session, run_date: date, county_id: str) -> dict:
+    """
+    For today's Gold+ leads, determine primary vertical per lead
+    (highest vertical_score wins) then map to Roofing / Remediation / Wholesale+Investor.
+    """
+    rows = (
+        session.query(DistressScore)
+        .filter(
+            func.date(DistressScore.score_date) == run_date,
+            DistressScore.lead_tier.in_(GOLD_PLUS_TIERS),
+            DistressScore.county_id == county_id,
+        )
+        .all()
+    )
+
+    bucket_counts = defaultdict(int)
+    unclassified = 0
+
+    for r in rows:
+        vs = r.vertical_scores or {}
+        if not vs:
+            unclassified += 1
+            continue
+        best = max(vs, key=lambda k: vs.get(k, 0))
+        bucket = VERTICAL_BUCKETS.get(best)
+        if bucket:
+            bucket_counts[bucket] += 1
+        else:
+            unclassified += 1
+
+    total = sum(bucket_counts.values()) + unclassified
+    result = {}
+    for bucket in ["Roofing", "Remediation", "Wholesale / Investor"]:
+        cnt = bucket_counts.get(bucket, 0)
+        pct = (cnt / total * 100) if total else 0.0
+        result[bucket] = {"count": cnt, "pct": pct}
+    if unclassified:
+        result["Other / Unclassified"] = {"count": unclassified, "pct": (unclassified / total * 100) if total else 0.0}
+
+    result["_total"] = total
+    return result
+
+
+def build_report(run_date: date, county_id: str) -> dict:
+    errors = []
+    with get_db_context() as session:
+        scraper_data, total_scraped, total_matched, match_pct, scraper_errors = \
+            _build_scraper_section(session, run_date, county_id)
+        errors.extend(scraper_errors)
+
+        scoring, tiers = _build_scoring_section(session, run_date, county_id, errors)
+        tier_history   = _build_tier_history(session, run_date, county_id)
+        vertical_breakdown = _build_vertical_breakdown(session, run_date, county_id)
 
     return {
-        "run_date": run_date,
-        "county_id": county_id,
-        "total_scraped": total_scraped,
-        "total_matched": total_matched,
-        "match_pct": match_pct,
-        "scraper_data": scraper_data,
-        "scoring": scoring,
-        "tiers": tiers,
-        "errors": errors,
+        "run_date":           run_date,
+        "county_id":          county_id,
+        "total_scraped":      total_scraped,
+        "total_matched":      total_matched,
+        "match_pct":          match_pct,
+        "scraper_data":       scraper_data,
+        "scoring":            scoring,
+        "tiers":              tiers,
+        "tier_history":       tier_history,
+        "vertical_breakdown": vertical_breakdown,
+        "errors":             errors,
     }
 
+
+# ---------------------------------------------------------------------------
+# CSV writer
+# ---------------------------------------------------------------------------
 
 def write_csv(report: dict, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -158,7 +268,7 @@ def write_csv(report: dict, path: Path) -> None:
                     f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}"])
         w.writerow([])
 
-        # Scraper Ingest
+        # ── Section 1: Scraper Ingest ─────────────────────────────────────
         w.writerow(["SCRAPER INGEST"])
         w.writerow([f"Total: {report['total_scraped']:,} scraped | "
                     f"{report['total_matched']:,} matched ({report['match_pct']:.1f}%)"])
@@ -168,12 +278,12 @@ def write_csv(report: dict, path: Path) -> None:
             w.writerow([
                 row["label"],
                 row["scraped"],
-                row["matched"] if row["matched"] is not None else "—",
+                row["matched"]   if row["matched"]   is not None else "—",
                 row["unmatched"] if row["unmatched"] is not None else "—",
             ])
         w.writerow([])
 
-        # Scoring
+        # ── Section 2: Scoring Summary ────────────────────────────────────
         w.writerow(["SCORING"])
         w.writerow([f"Total Properties Scored: {report['scoring']['properties_scored']:,}"])
         w.writerow([])
@@ -188,14 +298,38 @@ def write_csv(report: dict, path: Path) -> None:
             w.writerow([label, f"{report['scoring'][key]:,}"])
         w.writerow([])
 
-        # Tier Breakdown
+        # ── Section 3: Tier Breakdown (today) ─────────────────────────────
         w.writerow(["TIER BREAKDOWN"])
         w.writerow(["Tier", "Count"])
         for tier, count in report["tiers"].items():
             w.writerow([tier, f"{count:,}"])
         w.writerow([])
 
-        # Alerts
+        # ── Section 4: Tier-by-Day Table (Gold+ — last 7 days) ───────────
+        w.writerow([f"GOLD+ TREND (last {TIER_HISTORY_DAYS} days)"])
+        w.writerow(["Date", "Ultra Platinum", "Platinum", "Gold", "Total Gold+"])
+        for row in report["tier_history"]:
+            w.writerow([
+                row["date"],
+                f"{row['ultra_platinum']:,}",
+                f"{row['platinum']:,}",
+                f"{row['gold']:,}",
+                f"{row['total']:,}",
+            ])
+        w.writerow([])
+
+        # ── Section 5: Lead Type Breakdown by Vertical ────────────────────
+        vb = report["vertical_breakdown"]
+        total_vb = vb.pop("_total", 0)
+        w.writerow(["LEAD TYPE BREAKDOWN (Gold+ by Vertical)"])
+        w.writerow([f"Total Gold+ leads: {total_vb:,}"])
+        w.writerow([])
+        w.writerow(["Vertical", "Leads", "% of Gold+"])
+        for bucket, stats in vb.items():
+            w.writerow([bucket, f"{stats['count']:,}", f"{stats['pct']:.1f}%"])
+        w.writerow([])
+
+        # ── Section 6: Alerts ─────────────────────────────────────────────
         w.writerow(["ALERTS"])
         if report["errors"]:
             for err in report["errors"]:
@@ -203,6 +337,10 @@ def write_csv(report: dict, path: Path) -> None:
         else:
             w.writerow(["No errors or alerts."])
 
+
+# ---------------------------------------------------------------------------
+# Pruning + entry point
+# ---------------------------------------------------------------------------
 
 def prune_old_reports(directory: Path) -> int:
     cutoff = datetime.now() - timedelta(days=RETENTION_DAYS)
@@ -221,7 +359,7 @@ def generate_report(run_date: date, county_id: str) -> Path:
 
     output_path = REPORTS_DIR / f"report_{run_date}.csv"
     write_csv(report, output_path)
-    logger.info(f"[daily_report] Written → {output_path}")
+    logger.info(f"[daily_report] Written to {output_path}")
 
     deleted = prune_old_reports(REPORTS_DIR)
     if deleted:
@@ -229,13 +367,15 @@ def generate_report(run_date: date, county_id: str) -> Path:
 
     s = report["scoring"]
     t = report["tiers"]
+    vb = report["vertical_breakdown"]
     print(
         f"\nForced Action Daily Report — {run_date}\n"
-        f"  Ingest : {report['total_scraped']:,} scraped | {report['total_matched']:,} matched ({report['match_pct']:.1f}%)\n"
-        f"  Leads  : {s['leads_new']:,} new | {s['leads_updated']:,} updated | {s['leads_unchanged']:,} unchanged\n"
-        f"  Tiers  : Ultra Platinum {t['Ultra Platinum']:,} | Platinum {t['Platinum']:,} | Gold {t['Gold']:,}\n"
-        f"  Alerts : {len(report['errors'])} error(s)\n"
-        f"  Saved  → {output_path}\n"
+        f"  Ingest  : {report['total_scraped']:,} scraped | {report['total_matched']:,} matched ({report['match_pct']:.1f}%)\n"
+        f"  Leads   : {s['leads_new']:,} new | {s['leads_updated']:,} updated | {s['leads_unchanged']:,} unchanged\n"
+        f"  Gold+   : Ultra Plat {t['Ultra Platinum']:,} | Plat {t['Platinum']:,} | Gold {t['Gold']:,}\n"
+        f"  Verticals: " + " | ".join(f"{b} {d['count']:,}" for b, d in vb.items()) + "\n"
+        f"  Alerts  : {len(report['errors'])} error(s)\n"
+        f"  Saved   : {output_path}\n"
     )
     for err in report["errors"]:
         print(f"  WARNING: {err}")
