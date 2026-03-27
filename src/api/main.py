@@ -15,9 +15,12 @@ Endpoints:
 
 import logging
 import re
+import time
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+import requests as _requests
 import stripe
 from fastapi import FastAPI, Header, HTTPException, Request, Depends, Query
 from fastapi.exception_handlers import http_exception_handler
@@ -29,7 +32,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select, and_, or_, desc, func, cast, Date
 
 from src.core.database import get_db_context
-from src.core.models import FoundingSubscriberCount, ZipTerritory, Subscriber, Property, DistressScore, Incident, LeadPackPurchase
+from src.core.models import FoundingSubscriberCount, ZipTerritory, Subscriber, Property, DistressScore, Incident, LeadPackPurchase, ScraperRunStats, EnrichedContact
 from src.services.stripe_webhooks import handle_webhook
 from src.services.stripe_service import get_price_id_for_checkout
 from config.settings import get_settings
@@ -84,16 +87,257 @@ def get_db():
 
 
 # ---------------------------------------------------------------------------
-# GET /health — Uptime check
+# GET /health — Fast uptime check (UptimeRobot / load balancer)
+# GET /health/detailed — Full ops health check (Stripe, GHL, scrapers, enrichment)
 # ---------------------------------------------------------------------------
 
 @app.get("/health", include_in_schema=False)
 def health_check(db: Session = Depends(get_db)):
+    """Fast check: DB connectivity only. Used by UptimeRobot and load balancers."""
     try:
         db.execute(select(1))
     except Exception:
         raise HTTPException(status_code=503, detail="db_unavailable")
     return {"status": "ok"}
+
+
+@app.get("/health/detailed", include_in_schema=False)
+def health_check_detailed(db: Session = Depends(get_db)):
+    """
+    Full ops health check. Returns status for every integrated subsystem.
+
+    Response shape:
+      {
+        "status": "ok" | "degraded" | "critical",
+        "checks": {
+          "database":      {"status": "ok"|"error", "detail": ...},
+          "stripe":        {"status": "ok"|"unconfigured"|"error", "detail": ...},
+          "ghl":           {"status": "ok"|"unconfigured"|"error", "detail": ...},
+          "smtp":          {"status": "ok"|"unconfigured"},
+          "enrichment":    {"status": "ok"|"unconfigured"|"stale", "last_run": ..., "detail": ...},
+          "scrapers":      {"status": "ok"|"stale"|"failures", "last_run": ..., "failed": [...]},
+          "scoring":       {"status": "ok"|"stale", "last_scored": ..., "scored_properties": ...},
+          "config":        {"status": "ok"|"warnings", "missing_optional": [...]},
+        },
+        "checked_at": "<ISO timestamp>"
+      }
+
+    HTTP 200 for ok/degraded (non-critical issues), 503 only for critical (DB down).
+    """
+    settings = get_settings()
+    checks = {}
+    overall = "ok"
+    checked_at = datetime.now(timezone.utc).isoformat()
+
+    # ── 1. Database ────────────────────────────────────────────────────────
+    try:
+        db.execute(select(1))
+        checks["database"] = {"status": "ok"}
+    except Exception as e:
+        checks["database"] = {"status": "error", "detail": str(e)}
+        # DB down is always critical — return 503 immediately
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "critical",
+                "checks": checks,
+                "checked_at": checked_at,
+            },
+        )
+
+    # ── 2. Stripe API ──────────────────────────────────────────────────────
+    if not settings.stripe_secret_key:
+        checks["stripe"] = {"status": "unconfigured"}
+        overall = "degraded"
+    else:
+        try:
+            stripe.api_key = settings.stripe_secret_key.get_secret_value()
+            # Lightweight call — just fetch account balance
+            stripe.Balance.retrieve()
+            checks["stripe"] = {"status": "ok"}
+        except stripe.error.AuthenticationError:
+            checks["stripe"] = {"status": "error", "detail": "invalid_api_key"}
+            overall = "degraded"
+        except stripe.error.StripeError as e:
+            checks["stripe"] = {"status": "error", "detail": str(e)}
+            overall = "degraded"
+        except Exception as e:
+            checks["stripe"] = {"status": "error", "detail": str(e)}
+            overall = "degraded"
+
+    # ── 3. GoHighLevel API ─────────────────────────────────────────────────
+    if not settings.ghl_api_key or not settings.ghl_location_id:
+        checks["ghl"] = {"status": "unconfigured"}
+        overall = "degraded"
+    else:
+        try:
+            t0 = time.monotonic()
+            resp = _requests.get(
+                f"https://services.leadconnectorhq.com/locations/{settings.ghl_location_id}",
+                headers={
+                    "Authorization": f"Bearer {settings.ghl_api_key.get_secret_value()}",
+                    "Version": "2021-07-28",
+                },
+                timeout=8,
+            )
+            latency_ms = round((time.monotonic() - t0) * 1000)
+            if resp.status_code == 200:
+                checks["ghl"] = {"status": "ok", "latency_ms": latency_ms}
+            elif resp.status_code == 401:
+                checks["ghl"] = {"status": "error", "detail": "invalid_api_key"}
+                overall = "degraded"
+            else:
+                checks["ghl"] = {"status": "error", "detail": f"http_{resp.status_code}"}
+                overall = "degraded"
+        except _requests.exceptions.Timeout:
+            checks["ghl"] = {"status": "error", "detail": "timeout"}
+            overall = "degraded"
+        except Exception as e:
+            checks["ghl"] = {"status": "error", "detail": str(e)}
+            overall = "degraded"
+
+    # ── 4. SMTP / Email ────────────────────────────────────────────────────
+    if settings.smtp_host and settings.smtp_user:
+        checks["smtp"] = {
+            "status": "ok",
+            "host": settings.smtp_host,
+            "alert_email": settings.alert_email or "not_set",
+        }
+    else:
+        checks["smtp"] = {"status": "unconfigured"}
+        # SMTP unconfigured is a warning, not degraded — alerts won't fire
+
+    # ── 5. Enrichment pipeline ─────────────────────────────────────────────
+    if not settings.batch_skip_tracing_api_key:
+        checks["enrichment"] = {"status": "unconfigured", "detail": "BATCH_SKIP_TRACING_API_KEY not set"}
+        overall = "degraded"
+    else:
+        try:
+            last_enriched = db.execute(
+                select(func.max(EnrichedContact.enriched_at))
+            ).scalar()
+
+            if last_enriched is None:
+                checks["enrichment"] = {"status": "ok", "last_run": None, "detail": "no_runs_yet"}
+            else:
+                last_enriched_utc = last_enriched.replace(tzinfo=timezone.utc) if last_enriched.tzinfo is None else last_enriched
+                hours_ago = (datetime.now(timezone.utc) - last_enriched_utc).total_seconds() / 3600
+                status = "ok" if hours_ago < 26 else "stale"  # stale if >26h (missed daily run)
+                if status == "stale":
+                    overall = "degraded"
+                checks["enrichment"] = {
+                    "status": status,
+                    "last_run": last_enriched_utc.isoformat(),
+                    "hours_ago": round(hours_ago, 1),
+                    "idi_configured": bool(settings.idi_api_key),
+                }
+        except Exception as e:
+            checks["enrichment"] = {"status": "error", "detail": str(e)}
+            overall = "degraded"
+
+    # ── 6. Scraper pipeline ────────────────────────────────────────────────
+    try:
+        cutoff = date.today() - timedelta(days=2)
+
+        last_run_date = db.execute(
+            select(func.max(ScraperRunStats.run_date))
+            .where(ScraperRunStats.run_success == True)    # noqa: E712
+        ).scalar()
+
+        failed_scrapers = db.execute(
+            select(ScraperRunStats.source_type, ScraperRunStats.error_message, ScraperRunStats.run_date)
+            .where(
+                ScraperRunStats.run_success == False,      # noqa: E712
+                ScraperRunStats.run_date >= cutoff,
+            )
+            .order_by(ScraperRunStats.run_date.desc())
+        ).all()
+
+        if last_run_date is None:
+            scraper_status = "ok"
+            scraper_detail = {"last_run": None, "detail": "no_runs_recorded_yet"}
+        else:
+            days_ago = (date.today() - last_run_date).days
+            scraper_status = "ok" if days_ago <= 1 else "stale"
+            if scraper_status == "stale":
+                overall = "degraded"
+            scraper_detail = {
+                "last_run": last_run_date.isoformat(),
+                "days_ago": days_ago,
+            }
+
+        if failed_scrapers:
+            scraper_status = "failures"
+            overall = "degraded"
+            scraper_detail["failed"] = [
+                {"source": r.source_type, "date": r.run_date.isoformat(), "error": r.error_message}
+                for r in failed_scrapers
+            ]
+
+        checks["scrapers"] = {"status": scraper_status, **scraper_detail}
+
+    except Exception as e:
+        checks["scrapers"] = {"status": "error", "detail": str(e)}
+        overall = "degraded"
+
+    # ── 7. Scoring pipeline ────────────────────────────────────────────────
+    try:
+        last_scored = db.execute(
+            select(func.max(DistressScore.score_date))
+        ).scalar()
+
+        scored_count = db.execute(
+            select(func.count(DistressScore.id.distinct()))
+            .where(DistressScore.score_date == last_scored)
+        ).scalar() if last_scored else 0
+
+        if last_scored is None:
+            checks["scoring"] = {"status": "ok", "last_scored": None, "detail": "no_scores_yet"}
+        else:
+            days_ago = (date.today() - last_scored).days
+            scoring_status = "ok" if days_ago <= 1 else "stale"
+            if scoring_status == "stale":
+                overall = "degraded"
+            checks["scoring"] = {
+                "status": scoring_status,
+                "last_scored": last_scored.isoformat(),
+                "days_ago": days_ago,
+                "scored_today": scored_count,
+            }
+    except Exception as e:
+        checks["scoring"] = {"status": "error", "detail": str(e)}
+        overall = "degraded"
+
+    # ── 8. Config completeness ─────────────────────────────────────────────
+    missing_optional = []
+    if not settings.ghl_api_key:
+        missing_optional.append("GHL_API_KEY")
+    if not settings.stripe_secret_key:
+        missing_optional.append("STRIPE_SECRET_KEY")
+    if not settings.batch_skip_tracing_api_key:
+        missing_optional.append("BATCH_SKIP_TRACING_API_KEY")
+    if not settings.idi_api_key:
+        missing_optional.append("IDI_API_KEY")
+    if not settings.smtp_host:
+        missing_optional.append("SMTP_HOST")
+    if not settings.alert_email:
+        missing_optional.append("ALERT_EMAIL")
+    if not settings.oxylabs_username:
+        missing_optional.append("OXYLABS_USERNAME")
+
+    checks["config"] = {
+        "status": "warnings" if missing_optional else "ok",
+        "missing_optional": missing_optional,
+    }
+
+    return JSONResponse(
+        status_code=200,  # 200 even for degraded; only DB-down returns 503
+        content={
+            "status": overall,
+            "checks": checks,
+            "checked_at": checked_at,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
