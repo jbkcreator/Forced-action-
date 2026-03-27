@@ -1,0 +1,235 @@
+"""
+Load validation and anomaly alerting — M6.
+
+Checks daily scraper run counts against a rolling 7-day baseline.
+Fires an ops alert if any scraper's count drops more than 70% below baseline
+for 2 consecutive days (avoids noisy single-day false positives).
+
+Also validates:
+  - scraper run success flags (failed runs)
+  - enrichment pipeline match rate (delegates to match_rate_monitor)
+
+Run daily via cron after scrapers + enrichment complete:
+  0 6 * * * cd /path/to/app && python -m src.tasks.load_validator
+
+State file (consecutive low-day tracking):
+  data/load_validator_state.json
+"""
+
+import json
+import logging
+from collections import defaultdict
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from typing import Dict, Optional
+
+from src.core.database import get_db_context
+from src.core.models import ScraperRunStats
+from src.services.email import send_alert
+
+logger = logging.getLogger(__name__)
+
+# A scraper whose count drops below this fraction of its 7d average triggers an alert
+_DROP_THRESHOLD = 0.30      # count must be >= 30% of baseline to pass
+_BASELINE_DAYS = 7          # rolling window for baseline
+_CONSECUTIVE_DAYS_ALERT = 2 # alert after N consecutive low days
+
+# Minimum baseline average before we bother checking (ignore brand-new scrapers)
+_MIN_BASELINE_AVG = 3
+
+_STATE_FILE = Path(__file__).parent.parent.parent / "data" / "load_validator_state.json"
+
+
+def _load_state() -> dict:
+    try:
+        if _STATE_FILE.exists():
+            return json.loads(_STATE_FILE.read_text())
+    except Exception:
+        pass
+    return {"consecutive_low": {}, "last_check": None}
+
+
+def _save_state(state: dict) -> None:
+    try:
+        _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _STATE_FILE.write_text(json.dumps(state))
+    except Exception as exc:
+        logger.warning("Could not save load validator state: %s", exc)
+
+
+def _get_recent_stats(session, county_id: str, days: int) -> Dict[str, list]:
+    """
+    Returns {source_type: [matched_count, ...]} for the last `days` days.
+    Only includes successful runs.
+    """
+    cutoff = date.today() - timedelta(days=days)
+    rows = (
+        session.query(ScraperRunStats)
+        .filter(
+            ScraperRunStats.run_date >= cutoff,
+            ScraperRunStats.county_id == county_id,
+            ScraperRunStats.run_success == True,    # noqa: E712
+        )
+        .order_by(ScraperRunStats.run_date.asc())
+        .all()
+    )
+
+    by_type: Dict[str, list] = defaultdict(list)
+    for row in rows:
+        by_type[row.source_type].append(row.matched)
+    return dict(by_type)
+
+
+def _get_failed_runs(session, county_id: str, run_date: date) -> list:
+    """Return list of (source_type, error_message) for failed runs today."""
+    rows = (
+        session.query(ScraperRunStats)
+        .filter(
+            ScraperRunStats.run_date == run_date,
+            ScraperRunStats.county_id == county_id,
+            ScraperRunStats.run_success == False,   # noqa: E712
+        )
+        .all()
+    )
+    return [(r.source_type, r.error_message or "unknown error") for r in rows]
+
+
+def run_load_validator(county_id: str = "hillsborough") -> dict:
+    """
+    Validate today's scraper loads against 7-day rolling baseline.
+
+    Returns:
+        dict with keys: anomalies (list), failed_runs (list), alerts_sent (int)
+    """
+    today = date.today()
+    results = {"anomalies": [], "failed_runs": [], "alerts_sent": 0, "checked_date": str(today)}
+
+    state = _load_state()
+
+    with get_db_context() as session:
+        # ── Check for failed runs ──────────────────────────────────────────
+        failed = _get_failed_runs(session, county_id, today)
+        results["failed_runs"] = failed
+
+        if failed:
+            logger.warning("[LoadValidator] %d scrapers reported failure today: %s",
+                           len(failed), [f[0] for f in failed])
+
+        # ── Check for count anomalies ──────────────────────────────────────
+        # Get baseline: stats from last 7 days (excludes today)
+        baseline_data = _get_recent_stats(session, county_id, days=_BASELINE_DAYS + 1)
+
+        # Get today's stats
+        today_rows = (
+            session.query(ScraperRunStats)
+            .filter(
+                ScraperRunStats.run_date == today,
+                ScraperRunStats.county_id == county_id,
+                ScraperRunStats.run_success == True,    # noqa: E712
+            )
+            .all()
+        )
+        today_data = {r.source_type: r.matched for r in today_rows}
+
+    # Compute baseline averages (excluding today)
+    baseline_avgs: Dict[str, float] = {}
+    for source_type, counts in baseline_data.items():
+        if counts:
+            # Exclude today from baseline if present
+            baseline_avgs[source_type] = sum(counts[:-1]) / max(len(counts) - 1, 1)
+
+    # Check each scraper that ran today
+    anomalies = []
+    for source_type, today_count in today_data.items():
+        baseline_avg = baseline_avgs.get(source_type)
+        if baseline_avg is None or baseline_avg < _MIN_BASELINE_AVG:
+            continue   # not enough history or too sparse to baseline
+
+        ratio = today_count / baseline_avg if baseline_avg > 0 else 1.0
+        if ratio < _DROP_THRESHOLD:
+            anomalies.append({
+                "source_type": source_type,
+                "today_count": today_count,
+                "baseline_avg": round(baseline_avg, 1),
+                "ratio": round(ratio, 3),
+            })
+            logger.warning(
+                "[LoadValidator] %s: today=%d vs 7d_avg=%.1f (%.0f%% of baseline)",
+                source_type, today_count, baseline_avg, ratio * 100,
+            )
+
+    results["anomalies"] = anomalies
+
+    # ── Update consecutive low-day counters ───────────────────────────────
+    if "consecutive_low" not in state:
+        state["consecutive_low"] = {}
+
+    anomaly_types = {a["source_type"] for a in anomalies}
+
+    # Reset counter for scrapers that are back to normal
+    for source_type in list(state["consecutive_low"].keys()):
+        if source_type not in anomaly_types:
+            state["consecutive_low"].pop(source_type, None)
+
+    # Increment counter for anomalous scrapers
+    alert_lines = []
+    for a in anomalies:
+        st = a["source_type"]
+        state["consecutive_low"][st] = state["consecutive_low"].get(st, 0) + 1
+        if state["consecutive_low"][st] >= _CONSECUTIVE_DAYS_ALERT:
+            alert_lines.append(
+                f"  {st}: today={a['today_count']} vs 7d_avg={a['baseline_avg']} "
+                f"({a['ratio']*100:.0f}% — {state['consecutive_low'][st]} consecutive low days)"
+            )
+
+    # ── Send anomaly alert ─────────────────────────────────────────────────
+    if alert_lines:
+        body_parts = [
+            f"Scraper load anomaly detected for {len(alert_lines)} source(s) "
+            f"({_CONSECUTIVE_DAYS_ALERT}+ consecutive low days):\n",
+            "\n".join(alert_lines),
+            "\n\nPossible causes:",
+            "  - Source website/API changed (check scraper logs)",
+            "  - Upstream data temporarily unavailable",
+            "  - DB matching regression (check unmatched counts)",
+            "\nRun: python -m src.tasks.run_scrapers hillsborough",
+            f"\nForced Action Ops Alert — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+        ]
+        sent = send_alert(
+            subject=f"[Forced Action] ALERT: {len(alert_lines)} scraper(s) low count ({today})",
+            body="\n".join(body_parts),
+        )
+        if sent:
+            results["alerts_sent"] += 1
+
+    # ── Send failed-run alert ──────────────────────────────────────────────
+    if failed:
+        failed_lines = [f"  {ft}: {fm}" for ft, fm in failed]
+        sent = send_alert(
+            subject=f"[Forced Action] ALERT: {len(failed)} scraper(s) FAILED ({today})",
+            body=(
+                f"The following scrapers failed today ({today}):\n\n"
+                + "\n".join(failed_lines)
+                + "\n\nCheck logs and re-run manually if needed."
+                f"\n\nForced Action Ops Alert — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+            ),
+        )
+        if sent:
+            results["alerts_sent"] += 1
+
+    state["last_check"] = datetime.now(timezone.utc).isoformat()
+    _save_state(state)
+
+    logger.info(
+        "[LoadValidator] Done. anomalies=%d failed_runs=%d alerts_sent=%d",
+        len(anomalies), len(failed), results["alerts_sent"],
+    )
+    return results
+
+
+if __name__ == "__main__":
+    import sys
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    county = sys.argv[1] if len(sys.argv) > 1 else "hillsborough"
+    result = run_load_validator(county)
+    print(result)

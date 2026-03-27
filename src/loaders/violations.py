@@ -3,7 +3,7 @@ Code violation loader.
 """
 
 import logging
-from typing import Tuple
+from typing import Optional, Tuple
 
 import pandas as pd
 
@@ -11,6 +11,108 @@ from src.loaders.base import BaseLoader
 from src.core.models import CodeViolation
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Severity classifier
+# ---------------------------------------------------------------------------
+# Priority order: Critical → Major → Minor.
+# Rules are evaluated top-to-bottom; first match wins.
+# Fields used: violation_type, description, fine_amount, is_lien, status.
+
+_CRITICAL_TYPE_KEYWORDS = [
+    "structural condemnation",
+    "condemnation",
+    "unsafe structure",
+    "demolition order",
+    "imminent danger",
+    "emergency order",
+    "fire damage",
+    "flood damage",
+]
+
+_CRITICAL_DESC_KEYWORDS = [
+    "unsafe",
+    "condemned",
+    "imminent",
+    "emergency",
+    "structural failure",
+    "collapse",
+    "uninhabitable",
+]
+
+_MAJOR_TYPE_KEYWORDS = [
+    "citizen board",
+    "enforcement complaint",
+    "water enforcement complaint",
+    "housing inspection",
+    "generalized housing",
+    "illegal",
+    "unpermitted",
+    "zoning violation",
+    "commercial enforcement",
+]
+
+_MAJOR_DESC_KEYWORDS = [
+    "unpermitted",
+    "illegal",
+    "sewage",
+    "raw waste",
+    "hazardous",
+    "mold",
+    "infestation",
+    "electrical",
+    "plumbing",
+    "no permit",
+]
+
+
+def classify_severity(
+    violation_type: Optional[str],
+    description: Optional[str],
+    fine_amount: Optional[float],
+    is_lien: Optional[bool],
+    status: Optional[str],
+) -> str:
+    """
+    Classify a code violation into Critical / Major / Minor.
+
+    Rules (first match wins):
+      Critical — structural/condemnation types, unsafe/collapse keywords in
+                 description, lien with fine ≥ $5,000, or status indicates
+                 condemned/emergency.
+      Major    — complaint-driven or board-referred types, hazardous material
+                 keywords, lien with fine ≥ $1,000, or status is escalated.
+      Minor    — everything else (proactive inspections, routine notices).
+    """
+    vtype = (violation_type or "").lower().strip()
+    desc = (description or "").lower().strip()
+    status_lower = (status or "").lower().strip()
+    fine = fine_amount or 0.0
+    lien = bool(is_lien)
+
+    # --- Critical ---
+    if any(kw in vtype for kw in _CRITICAL_TYPE_KEYWORDS):
+        return "Critical"
+    if any(kw in desc for kw in _CRITICAL_DESC_KEYWORDS):
+        return "Critical"
+    if lien and fine >= 5000:
+        return "Critical"
+    if any(word in status_lower for word in ("condemned", "emergency", "imminent")):
+        return "Critical"
+
+    # --- Major ---
+    if any(kw in vtype for kw in _MAJOR_TYPE_KEYWORDS):
+        return "Major"
+    if any(kw in desc for kw in _MAJOR_DESC_KEYWORDS):
+        return "Major"
+    if lien and fine >= 1000:
+        return "Major"
+    if any(word in status_lower for word in ("hearing", "board", "escalated", "non-compliant")):
+        return "Major"
+
+    # --- Minor (default) ---
+    return "Minor"
 
 
 class ViolationLoader(BaseLoader):
@@ -85,6 +187,27 @@ class ViolationLoader(BaseLoader):
                     if pd.isna(status_val):
                         status_val = None
                     
+                    fine_amount_val = None
+                    raw_fine = row.get('Fine Amount')
+                    if raw_fine is not None and not (isinstance(raw_fine, float) and pd.isna(raw_fine)):
+                        try:
+                            fine_amount_val = float(str(raw_fine).replace('$', '').replace(',', '').strip())
+                        except (ValueError, TypeError):
+                            fine_amount_val = None
+
+                    is_lien_val = False
+                    raw_lien = row.get('Is Lien')
+                    if raw_lien is not None and not (isinstance(raw_lien, float) and pd.isna(raw_lien)):
+                        is_lien_val = str(raw_lien).strip().lower() in ('true', 'yes', '1')
+
+                    severity = classify_severity(
+                        violation_type=violation_type_val,
+                        description=description_val,
+                        fine_amount=fine_amount_val,
+                        is_lien=is_lien_val,
+                        status=status_val,
+                    )
+
                     violation_record = CodeViolation(
                         property_id=property_record.id,
                         record_number=record_number,
@@ -92,9 +215,9 @@ class ViolationLoader(BaseLoader):
                         description=description_val,
                         opened_date=self.parse_date(row.get('Date')),
                         status=status_val,
-                        severity_tier=None,
-                        fine_amount=None,
-                        is_lien=False,
+                        severity_tier=severity,
+                        fine_amount=fine_amount_val,
+                        is_lien=is_lien_val,
                     )
                     
                     if self.safe_add(violation_record):

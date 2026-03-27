@@ -29,6 +29,7 @@ from sqlalchemy import text
 from config.settings import get_settings
 from src.core.database import get_db_context
 from src.core.models import Owner, Property, EnrichedContact, DistressScore
+from src.services.email import send_alert
 from src.utils.logger import setup_logging, get_logger
 
 setup_logging()
@@ -277,8 +278,23 @@ def run_skip_trace(
         try:
             results = _call_batch_data(payloads, api_key_val)
         except Exception as e:
-            logger.error(f"BatchData API error on batch {batch_num}: {e}")
+            err_msg = str(e)
+            logger.error(f"BatchData API error on batch {batch_num}: {err_msg}")
             stats["failed"] += len(payloads)
+
+            # Alert on credential/billing failures — these won't self-heal
+            if "402" in err_msg or "401" in err_msg:
+                send_alert(
+                    subject="[Forced Action] BatchData API CREDENTIAL ERROR",
+                    body=(
+                        f"Skip-trace enrichment halted: {err_msg}\n\n"
+                        f"Action required:\n"
+                        f"  1. Check BATCH_SKIP_TRACING_API_KEY in .env\n"
+                        f"  2. Verify credits at app.batchdata.com\n"
+                        f"  3. Run: python -m src.services.skip_trace --dry-run --limit 5\n\n"
+                        f"Forced Action Ops Alert — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+                    ),
+                )
             break
 
         # --- 3. Persist results ---
