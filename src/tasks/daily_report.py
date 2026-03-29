@@ -26,7 +26,9 @@ from sqlalchemy import func
 
 from src.core.database import get_db_context
 from src.core.models import (
-    DistressScore, PlatformDailyStats, ScraperRunStats,
+    BuildingPermit, CodeViolation, Deed, DistressScore, Foreclosure,
+    Incident, LegalAndLien, LegalProceeding, PlatformDailyStats,
+    ScraperRunStats, TaxDelinquency,
 )
 from src.utils.logger import setup_logging
 
@@ -71,6 +73,30 @@ VERTICAL_BUCKETS = {
 }
 
 GOLD_PLUS_TIERS = {"Ultra Platinum", "Platinum", "Gold"}
+
+# Maps scraper source_type → (Model, date_field, optional filter)
+# Used to compute newest record age per scraper.
+_FRESHNESS_MAP = {
+    "permits":          (BuildingPermit,    BuildingPermit.date_added,    None),
+    "roofing_permits":  (BuildingPermit,    BuildingPermit.date_added,    None),
+    "violations":       (CodeViolation,     CodeViolation.date_added,     None),
+    "deeds":            (Deed,              Deed.date_added,              None),
+    "foreclosures":     (Foreclosure,       Foreclosure.date_added,       None),
+    "tax_delinquencies":(TaxDelinquency,    TaxDelinquency.date_added,    None),
+    "insurance_claims": (Incident,          Incident.date_added,          ("incident_type", "insurance_claim")),
+    "fire_incidents":   (Incident,          Incident.date_added,          ("incident_type", "Fire")),
+    "storm_damage":     (Incident,          Incident.date_added,          ("incident_type", "storm_damage")),
+    "flood_damage":     (Incident,          Incident.date_added,          ("incident_type", "flood_damage")),
+    "probate":          (LegalProceeding,   LegalProceeding.date_added,   ("record_type", "Probate")),
+    "evictions":        (LegalProceeding,   LegalProceeding.date_added,   ("record_type", "Eviction")),
+    "bankruptcy":       (LegalProceeding,   LegalProceeding.date_added,   ("record_type", "Bankruptcy")),
+    "judgments":        (LegalAndLien,      LegalAndLien.date_added,      ("record_type", "Judgment")),
+    "lien_ml":          (LegalAndLien,      LegalAndLien.date_added,      None),
+    "lien_tcl":         (LegalAndLien,      LegalAndLien.date_added,      None),
+    "lien_hoa":         (LegalAndLien,      LegalAndLien.date_added,      None),
+    "lien_ccl":         (LegalAndLien,      LegalAndLien.date_added,      None),
+    "lien_tl":          (LegalAndLien,      LegalAndLien.date_added,      None),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +211,37 @@ def _build_tier_history(session, run_date: date, county_id: str) -> list:
     return history
 
 
+def _build_signal_freshness(session, county_id: str) -> dict:
+    """Return newest record age (days) per scraper source_type.
+
+    Queries max(date_added) from the source table for each known scraper.
+    Returns {source_type: days_old} — None if no records exist.
+    """
+    today = date.today()
+    freshness = {}
+
+    for source_type, (model, date_col, filter_pair) in _FRESHNESS_MAP.items():
+        try:
+            q = session.query(func.max(date_col)).filter(
+                getattr(model, "county_id", None) == county_id
+                if hasattr(model, "county_id") else True
+            )
+            if filter_pair:
+                field, value = filter_pair
+                q = q.filter(getattr(model, field) == value)
+            newest = q.scalar()
+            if newest is None:
+                freshness[source_type] = None
+            else:
+                if hasattr(newest, "date"):
+                    newest = newest.date()
+                freshness[source_type] = (today - newest).days
+        except Exception:
+            freshness[source_type] = None
+
+    return freshness
+
+
 def _build_vertical_breakdown(session, run_date: date, county_id: str) -> dict:
     """
     For today's Gold+ leads, determine primary vertical per lead
@@ -237,6 +294,7 @@ def build_report(run_date: date, county_id: str) -> dict:
 
         scoring, tiers     = _build_scoring_section(session, run_date, county_id, errors)
         vertical_breakdown = _build_vertical_breakdown(session, run_date, county_id)
+        signal_freshness   = _build_signal_freshness(session, county_id)
 
     return {
         "run_date":           run_date,
@@ -248,6 +306,7 @@ def build_report(run_date: date, county_id: str) -> dict:
         "scoring":            scoring,
         "tiers":              tiers,
         "vertical_breakdown": vertical_breakdown,
+        "signal_freshness":   signal_freshness,
         "errors":             errors,
     }
 
@@ -314,7 +373,20 @@ def write_csv(report: dict, path: Path) -> None:
             w.writerow([bucket, f"{stats['count']:,}", f"{stats['pct']:.1f}%"])
         w.writerow([])
 
-        # ── Section 5: Alerts ─────────────────────────────────────────────
+        # ── Section 5: Signal Freshness ───────────────────────────────────
+        w.writerow(["SIGNAL FRESHNESS (newest record age per source)"])
+        w.writerow(["Source", "Newest Record Age"])
+        sf = report.get("signal_freshness", {})
+        for source_type in SCRAPER_ORDER:
+            days = sf.get(source_type)
+            label = source_type.replace("_", " ").title()
+            if days is None:
+                w.writerow([label, "No records"])
+            else:
+                w.writerow([label, f"{days} day(s) old"])
+        w.writerow([])
+
+        # ── Section 6: Alerts ─────────────────────────────────────────────
         w.writerow(["ALERTS"])
         if report["errors"]:
             for err in report["errors"]:

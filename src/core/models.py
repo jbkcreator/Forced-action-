@@ -538,6 +538,9 @@ class BuildingPermit(Base):
     expire_date: Mapped[Optional[datetime]] = mapped_column(Date)
     status: Mapped[Optional[str]] = mapped_column(String(50))
 
+    # Enforcement flag — True for stop work orders, after-the-fact, failed/expired/revoked/suspended
+    is_enforcement_permit: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+
     # Load tracking & multi-county
     date_added: Mapped[Optional[date]] = mapped_column(Date, default=date.today, index=True)
     county_id: Mapped[Optional[str]] = mapped_column(String(50), default='hillsborough', index=True)

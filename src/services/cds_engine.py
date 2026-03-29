@@ -223,9 +223,10 @@ class MultiVerticalScorer:
         for fc in (prop.foreclosures or []):
             signals.append({"type": "foreclosures", "date": fc.filing_date, "amount": fc.judgment_amount})
 
-        # 7. Building permits
+        # 7. Building permits — enforcement permits get their own higher-weighted signal type
         for bp in (prop.building_permits or []):
-            signals.append({"type": "building_permits", "date": bp.issue_date, "amount": None})
+            sig_type = "enforcement_permit" if bp.is_enforcement_permit else "building_permits"
+            signals.append({"type": sig_type, "date": bp.issue_date, "amount": None})
 
         # 8. Incidents (insurance_claim, fire, storm_damage, flood_damage)
         _INCIDENT_SIGNAL_TYPES = {"insurance_claim", "Fire", "storm_damage", "flood_damage"}
@@ -577,6 +578,21 @@ class MultiVerticalScorer:
             for v in VERTICAL_WEIGHTS
         }
         vertical_scores = {v: r["score"] for v, r in vertical_results.items()}
+
+        # Cross-sell suppression: if the property already has a routine roofing permit
+        # (is_enforcement_permit=False), the owner is actively fixing the roof and is
+        # NOT a roofing lead. Zero out roofing vertical score.
+        # Enforcement roofing permits (stop work, after-the-fact, etc.) still score positively.
+        _routine_roofing = any(
+            not bp.is_enforcement_permit
+            and bp.permit_type
+            and "roof" in bp.permit_type.lower()
+            for bp in (prop.building_permits or [])
+        )
+        if _routine_roofing:
+            vertical_scores["roofing"] = 0.0
+            if "roofing" in vertical_results:
+                vertical_results["roofing"]["score"] = 0.0
 
         # Guard: if no verticals produced any score, default to 0.0
         score_values = [s for s in vertical_scores.values() if s]

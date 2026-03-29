@@ -222,7 +222,10 @@ def health_check_detailed(db: Session = Depends(get_db)):
             else:
                 last_enriched_utc = last_enriched.replace(tzinfo=timezone.utc) if last_enriched.tzinfo is None else last_enriched
                 hours_ago = (datetime.now(timezone.utc) - last_enriched_utc).total_seconds() / 3600
-                status = "ok" if hours_ago < 26 else "stale"  # stale if >26h (missed daily run)
+                # Allow up to 72h on Sat/Sun/Mon — enrichment only runs weekdays
+                _off_cycle = date.today().weekday() in (0, 5, 6)
+                stale_threshold = 72 if _off_cycle else 26
+                status = "ok" if hours_ago < stale_threshold else "stale"
                 if status == "stale":
                     overall = "degraded"
                 checks["enrichment"] = {
@@ -258,7 +261,10 @@ def health_check_detailed(db: Session = Depends(get_db)):
             scraper_detail = {"last_run": None, "detail": "no_runs_recorded_yet"}
         else:
             days_ago = (date.today() - last_run_date).days
-            scraper_status = "ok" if days_ago <= 1 else "stale"
+            # Allow 3 days on Sat/Sun/Mon — scrapers only run weekdays
+            _off_cycle = date.today().weekday() in (0, 5, 6)
+            stale_days = 3 if _off_cycle else 1
+            scraper_status = "ok" if days_ago <= stale_days else "stale"
             if scraper_status == "stale":
                 overall = "degraded"
             scraper_detail = {
@@ -295,7 +301,10 @@ def health_check_detailed(db: Session = Depends(get_db)):
             checks["scoring"] = {"status": "ok", "last_scored": None, "detail": "no_scores_yet"}
         else:
             days_ago = (date.today() - last_scored).days
-            scoring_status = "ok" if days_ago <= 1 else "stale"
+            # Allow 3 days on Sat/Sun/Mon — scoring only runs weekdays
+            _off_cycle = date.today().weekday() in (0, 5, 6)
+            stale_days = 3 if _off_cycle else 1
+            scoring_status = "ok" if days_ago <= stale_days else "stale"
             if scoring_status == "stale":
                 overall = "degraded"
             checks["scoring"] = {

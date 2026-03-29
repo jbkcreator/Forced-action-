@@ -4,12 +4,40 @@ Building permit loader.
 
 import logging
 import re
+from datetime import date
 from typing import Tuple
 
 import pandas as pd
 
 from src.loaders.base import BaseLoader
 from src.core.models import BuildingPermit
+
+# Keywords in permit_type or status that indicate an enforcement permit
+_ENFORCEMENT_TYPE_KEYWORDS = frozenset({
+    "stop work", "after-the-fact", "after the fact", "after fact",
+})
+_ENFORCEMENT_STATUS_KEYWORDS = frozenset({
+    "stop work", "revoked", "suspended", "failed inspection", "failed",
+})
+_EXPIRED_ENFORCEMENT_DAYS = 180  # permits expired > 6 months are enforcement signals
+
+
+def _is_enforcement(permit_type: str | None, status: str | None, expire_date) -> bool:
+    """Return True if this permit qualifies as an enforcement permit."""
+    pt = (permit_type or "").lower()
+    st = (status or "").lower()
+
+    if any(kw in pt for kw in _ENFORCEMENT_TYPE_KEYWORDS):
+        return True
+    if any(kw in st for kw in _ENFORCEMENT_STATUS_KEYWORDS):
+        return True
+
+    # Expired > 6 months
+    if expire_date and isinstance(expire_date, date):
+        if (date.today() - expire_date).days > _EXPIRED_ENFORCEMENT_DAYS:
+            return True
+
+    return False
 
 logger = logging.getLogger(__name__)
 
@@ -74,13 +102,17 @@ class BuildingPermitLoader(BaseLoader):
                     if pd.isna(status_val):
                         status_val = None
                     
+                    parsed_expire = self.parse_date(row.get('Expiration Date'))
+                    enforcement = _is_enforcement(permit_type_val, status_val, parsed_expire)
+
                     permit_record = BuildingPermit(
                         property_id=property_record.id,
                         permit_number=record_number,
                         permit_type=permit_type_val,
                         status=status_val,
                         issue_date=self.parse_date(row.get('Date')),
-                        expire_date=self.parse_date(row.get('Expiration Date'))
+                        expire_date=parsed_expire,
+                        is_enforcement_permit=enforcement,
                     )
                     
                     if self.safe_add(permit_record):

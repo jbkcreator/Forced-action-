@@ -50,6 +50,7 @@ VERTICAL_WEIGHTS = {
         "tampa_code_liens": 35,
         "county_code_liens": 30,
         "building_permits": 20,
+        "enforcement_permit": 50,  # Stop work/after-the-fact/failed/expired/revoked
         "code_violations": 35,
     },
     "fix_flip": {
@@ -70,6 +71,7 @@ VERTICAL_WEIGHTS = {
         "tampa_code_liens": 45,
         "code_violations": 50,
         "building_permits": 45,
+        "enforcement_permit": 60,  # Stop work/after-the-fact/failed/expired/revoked
         "county_code_liens": 20,
     },
     "restoration": {
@@ -80,6 +82,7 @@ VERTICAL_WEIGHTS = {
         "flood_damage": 10,      # Stacking only
         "tampa_code_liens": 75,  # Adjusted [cite: 109]
         "building_permits": 60,  # Adjusted [cite: 109]
+        "enforcement_permit": 75,  # Stop work/after-the-fact/failed/expired/revoked
         "evictions": 65,
         "hoa_liens": 50,
         "mechanics_liens": 55,
@@ -94,6 +97,7 @@ VERTICAL_WEIGHTS = {
     },
     "roofing": {
         "building_permits": 65,  # Lowered from 95 [cite: 109]
+        "enforcement_permit": 80,  # Stop work/after-the-fact/failed/expired/revoked — 2-3x routine
         "insurance_claim": 10,   # Stacking only
         "Fire": 10,              # Stacking only
         "storm_damage": 10,      # Stacking only
@@ -120,6 +124,7 @@ VERTICAL_WEIGHTS = {
         "flood_damage": 10,      # Stacking only
         "tampa_code_liens": 70,  # Adjusted from 80
         "building_permits": 55,  # Adjusted [cite: 109]
+        "enforcement_permit": 70,  # Stop work/after-the-fact/failed/expired/revoked
         "hoa_liens": 50,         # Adjusted from 55
         "mechanics_liens": 50,   # Adjusted from 60
         "evictions": 50,
@@ -148,6 +153,7 @@ VERTICAL_WEIGHTS = {
         "flood_damage": 10,      # Stacking only
         "code_violations": 30,
         "building_permits": 20,
+        "enforcement_permit": 40,  # Stop work/after-the-fact/failed/expired/revoked
         "evictions": 25,
         "deed_transfers": 25,
         "county_code_liens": 20,

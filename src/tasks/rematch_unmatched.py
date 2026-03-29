@@ -105,6 +105,19 @@ def rematch_unmatched(
                     if result:
                         property_record, _ = result
 
+                # For lis_pendens and deeds: also try address matching at 80% threshold
+                # (vs the default 85%) to recover records that narrowly missed on address.
+                if not property_record and record.source_type in ("lis_pendens", "deeds"):
+                    address_candidate = (
+                        raw.get("Address") or raw.get("address") or record.address_string
+                    )
+                    if address_candidate and len(str(address_candidate).strip()) > 5:
+                        result = loader.find_property_by_address(
+                            str(address_candidate), threshold=80
+                        )
+                        if result:
+                            property_record, _ = result
+
                 if property_record:
                     record.match_status = "matched"
                     record.matched_property_id = property_record.id
