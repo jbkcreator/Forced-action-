@@ -215,9 +215,10 @@ class MultiVerticalScorer:
                 continue
             signals.append({"type": sig_type, "date": proc.filing_date, "amount": proc.amount})
 
-        # 5. Tax delinquencies
+        # 5. Tax delinquencies — use deed_app_date if available, fall back to date_added
         for tax in (prop.tax_delinquencies or []):
-            signals.append({"type": "tax_delinquencies", "date": tax.deed_app_date, "amount": tax.total_amount_due})
+            sig_date = tax.deed_app_date or tax.date_added
+            signals.append({"type": "tax_delinquencies", "date": sig_date, "amount": tax.total_amount_due})
 
         # 6. Foreclosures
         for fc in (prop.foreclosures or []):
