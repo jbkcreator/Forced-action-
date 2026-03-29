@@ -13,14 +13,8 @@ to tag existing enforcement permits:
 
     UPDATE building_permits SET is_enforcement_permit = TRUE
     WHERE
-        LOWER(status) LIKE '%stop work%'
-        OR LOWER(status) LIKE '%revoked%'
-        OR LOWER(status) LIKE '%suspended%'
-        OR LOWER(status) LIKE '%failed%'
-        OR LOWER(permit_type) LIKE '%stop work%'
-        OR LOWER(permit_type) LIKE '%after-the-fact%'
-        OR LOWER(permit_type) LIKE '%after fact%'
-        OR (expire_date IS NOT NULL AND expire_date < CURRENT_DATE - INTERVAL '180 days');
+        permit_type LIKE '%Code Compliance Case%'
+        OR status IN ('Withdrawn', 'Cancel');
 """
 from typing import Sequence, Union
 

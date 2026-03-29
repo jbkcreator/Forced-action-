@@ -12,30 +12,25 @@ import pandas as pd
 from src.loaders.base import BaseLoader
 from src.core.models import BuildingPermit
 
-# Keywords in permit_type or status that indicate an enforcement permit
+# Hillsborough County permit_type substrings that indicate an enforcement permit
 _ENFORCEMENT_TYPE_KEYWORDS = frozenset({
-    "stop work", "after-the-fact", "after the fact", "after fact",
+    "code compliance case",
 })
-_ENFORCEMENT_STATUS_KEYWORDS = frozenset({
-    "stop work", "revoked", "suspended", "failed inspection", "failed",
+# Status values that indicate enforcement (exact match, case-insensitive)
+_ENFORCEMENT_STATUS_VALUES = frozenset({
+    "withdrawn", "cancel",
 })
-_EXPIRED_ENFORCEMENT_DAYS = 180  # permits expired > 6 months are enforcement signals
 
 
 def _is_enforcement(permit_type: str | None, status: str | None, expire_date) -> bool:
     """Return True if this permit qualifies as an enforcement permit."""
     pt = (permit_type or "").lower()
-    st = (status or "").lower()
+    st = (status or "").lower().strip()
 
     if any(kw in pt for kw in _ENFORCEMENT_TYPE_KEYWORDS):
         return True
-    if any(kw in st for kw in _ENFORCEMENT_STATUS_KEYWORDS):
+    if st in _ENFORCEMENT_STATUS_VALUES:
         return True
-
-    # Expired > 6 months
-    if expire_date and isinstance(expire_date, date):
-        if (date.today() - expire_date).days > _EXPIRED_ENFORCEMENT_DAYS:
-            return True
 
     return False
 
