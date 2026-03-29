@@ -11,7 +11,7 @@ Usage:
     python -m src.tasks.daily_report --county hillsborough
 
 Cron (after CDS engine completes, e.g. 4 AM):
-    0 4 * * * cd /path/to/app && python -m src.tasks.daily_report >> logs/daily_report.log 2>&1
+    0 4 * * 1-5 cd /path/to/app && python -m src.tasks.daily_report >> logs/daily_report.log 2>&1
 """
 
 import argparse
@@ -22,10 +22,12 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import func, text
+from sqlalchemy import func
 
 from src.core.database import get_db_context
-from src.core.models import DistressScore, PlatformDailyStats, ScraperRunStats
+from src.core.models import (
+    DistressScore, PlatformDailyStats, ScraperRunStats,
+)
 from src.utils.logger import setup_logging
 
 setup_logging()
@@ -129,7 +131,6 @@ def _build_scoring_section(session, run_date: date, county_id: str, errors: list
             "leads_new":                platform_row.leads_new,
             "leads_updated":            platform_row.leads_updated,
             "leads_unchanged":          platform_row.leads_unchanged,
-            "leads_upgraded":           platform_row.leads_upgraded,
         }
         tiers = {
             "Ultra Platinum": platform_row.tier_ultra_platinum,
@@ -140,7 +141,7 @@ def _build_scoring_section(session, run_date: date, county_id: str, errors: list
         }
     else:
         scoring = {k: 0 for k in ("properties_scored", "properties_with_signals",
-                                   "leads_new", "leads_updated", "leads_unchanged", "leads_upgraded")}
+                                   "leads_new", "leads_updated", "leads_unchanged")}
         tiers = {"Ultra Platinum": 0, "Platinum": 0, "Gold": 0, "Silver": 0, "Bronze": 0}
         errors.append("platform_daily_stats: no row found for this date")
     return scoring, tiers
@@ -234,8 +235,7 @@ def build_report(run_date: date, county_id: str) -> dict:
             _build_scraper_section(session, run_date, county_id)
         errors.extend(scraper_errors)
 
-        scoring, tiers = _build_scoring_section(session, run_date, county_id, errors)
-        tier_history   = _build_tier_history(session, run_date, county_id)
+        scoring, tiers     = _build_scoring_section(session, run_date, county_id, errors)
         vertical_breakdown = _build_vertical_breakdown(session, run_date, county_id)
 
     return {
@@ -247,7 +247,6 @@ def build_report(run_date: date, county_id: str) -> dict:
         "scraper_data":       scraper_data,
         "scoring":            scoring,
         "tiers":              tiers,
-        "tier_history":       tier_history,
         "vertical_breakdown": vertical_breakdown,
         "errors":             errors,
     }
@@ -268,7 +267,7 @@ def write_csv(report: dict, path: Path) -> None:
                     f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}"])
         w.writerow([])
 
-        # ── Section 1: Scraper Ingest ─────────────────────────────────────
+        # ── Section 1: Scraper Ingest (today) ────────────────────────────
         w.writerow(["SCRAPER INGEST"])
         w.writerow([f"Total: {report['total_scraped']:,} scraped | "
                     f"{report['total_matched']:,} matched ({report['match_pct']:.1f}%)"])
@@ -293,7 +292,6 @@ def write_csv(report: dict, path: Path) -> None:
             ("leads_new",               "Leads new today"),
             ("leads_updated",           "Leads updated"),
             ("leads_unchanged",         "Leads unchanged"),
-            ("leads_upgraded",          "Leads upgraded"),
         ]:
             w.writerow([label, f"{report['scoring'][key]:,}"])
         w.writerow([])
@@ -305,20 +303,7 @@ def write_csv(report: dict, path: Path) -> None:
             w.writerow([tier, f"{count:,}"])
         w.writerow([])
 
-        # ── Section 4: Tier-by-Day Table (Gold+ — last 7 days) ───────────
-        w.writerow([f"GOLD+ TREND (last {TIER_HISTORY_DAYS} days)"])
-        w.writerow(["Date", "Ultra Platinum", "Platinum", "Gold", "Total Gold+"])
-        for row in report["tier_history"]:
-            w.writerow([
-                row["date"],
-                f"{row['ultra_platinum']:,}",
-                f"{row['platinum']:,}",
-                f"{row['gold']:,}",
-                f"{row['total']:,}",
-            ])
-        w.writerow([])
-
-        # ── Section 5: Lead Type Breakdown by Vertical ────────────────────
+        # ── Section 4: Lead Type Breakdown by Vertical ────────────────────
         vb = report["vertical_breakdown"]
         total_vb = vb.pop("_total", 0)
         w.writerow(["LEAD TYPE BREAKDOWN (Gold+ by Vertical)"])
@@ -329,7 +314,7 @@ def write_csv(report: dict, path: Path) -> None:
             w.writerow([bucket, f"{stats['count']:,}", f"{stats['pct']:.1f}%"])
         w.writerow([])
 
-        # ── Section 6: Alerts ─────────────────────────────────────────────
+        # ── Section 5: Alerts ─────────────────────────────────────────────
         w.writerow(["ALERTS"])
         if report["errors"]:
             for err in report["errors"]:

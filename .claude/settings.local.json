@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest tests/test_m4_unit.py tests/test_m5_unit.py tests/test_m6_unit.py -v --tb=short)",
+      "Bash(python -m pytest tests/ -v --tb=short)",
+      "Bash(python -m pytest tests/test_m1_unit.py tests/test_county_config.py -v --tb=short)",
+      "Bash(python -m pytest tests/test_m1_unit.py -q --tb=short)",
+      "Bash(.venv/Scripts/python.exe -m pytest tests/test_m1_unit.py -q --tb=short)",
+      "Bash(python -m pytest tests/test_m1_unit.py --tb=short)",
+      "Bash(python -m pytest tests/test_m1_unit.py -v)",
+      "Bash(findstr /C:\"PASSED\" /C:\"FAILED\" /C:\"passed\" /C:\"failed\")",
+      "Bash(python scripts/vertical_analysis.py)"
+    ]
+  }
+}
