@@ -3,6 +3,7 @@ Master property loader - inserts properties with owners and financials.
 """
 
 import logging
+from datetime import date
 from typing import Tuple, Optional
 import re
 
@@ -212,6 +213,17 @@ class MasterPropertyLoader(BaseLoader):
                 # Create property
                 from src.utils.county_config import get_county as _gc
                 _county_cfg = _gc(county_id)
+                # Year built — try common HCPA column names
+                yr_raw = row.get('YR_BLT') or row.get('YEAR_BUILT') or row.get('YR_BUILT')
+                year_built = None
+                if pd.notna(yr_raw):
+                    try:
+                        y = int(float(yr_raw))
+                        if 1800 <= y <= date.today().year:
+                            year_built = y
+                    except (ValueError, TypeError):
+                        pass
+
                 property_record = Property(
                     parcel_id=parcel_id,
                     address=site_addr,
@@ -223,7 +235,7 @@ class MasterPropertyLoader(BaseLoader):
                     property_type=prop_type,
                     legal_description=legal_desc,
                     lot_size=self.parse_amount(row.get('ACREAGE')),
-                    year_built=None,
+                    year_built=year_built,
                     beds=beds,
                     baths=baths,
                     sq_ft=self.parse_amount(row.get('HEAT_AR')),
@@ -269,11 +281,21 @@ class MasterPropertyLoader(BaseLoader):
                     absentee_status=absentee_status,
                 )
                 
+                # Last sale — try common HCPA column names
+                sale_date = self.parse_date(
+                    row.get('SALE1_DATE') or row.get('SALE_DATE') or row.get('SALESDATE')
+                )
+                sale_price = self.parse_amount(
+                    row.get('SALE1_PRC') or row.get('SALE_PRC') or row.get('SALESPRICE')
+                )
+
                 # Create financial
                 financial_record = Financial(
                     property=property_record,
                     assessed_value_mkt=self.parse_amount(row.get('ASD_VAL')),
                     assessed_value_tax=self.parse_amount(row.get('TAX_VAL')),
+                    last_sale_date=sale_date,
+                    last_sale_price=sale_price,
                     annual_tax_amount=None,
                 )
                 
