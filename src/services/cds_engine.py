@@ -78,6 +78,9 @@ from config.scoring import (
     EQUITY_BONUS_BY_VERTICAL,
     EQUITY_HIGH_THRESH,
     EQUITY_MID_THRESH,
+    HCPA_AGE_YEARS,
+    HCPA_LONG_TERM_YEARS,
+    HCPA_PASSIVE_WEIGHTS,
     LEAD_TIER_THRESHOLDS,
     PERSISTENCE_ESCALATION_KEYWORDS,
     PERSISTENCE_RESOLVED_KEYWORDS,
@@ -594,6 +597,40 @@ class MultiVerticalScorer:
             vertical_scores["roofing"] = 0.0
             if "roofing" in vertical_results:
                 vertical_results["roofing"]["score"] = 0.0
+
+        # HCPA passive signal bonuses — boost verticals that already have a primary signal.
+        # These never act as primary signals; they only add weight when a vertical is already scored.
+        today_year = date.today().year
+        _hcpa_passive: List[str] = []
+
+        if prop.year_built and prop.year_built < (today_year - HCPA_AGE_YEARS):
+            _hcpa_passive.append("property_age_30plus")
+
+        fin = prop.financial
+        if fin and fin.last_sale_date:
+            _sale_date = fin.last_sale_date
+            if isinstance(_sale_date, datetime):
+                _sale_date = _sale_date.date()
+            if (date.today() - _sale_date).days > HCPA_LONG_TERM_YEARS * 365:
+                _hcpa_passive.append("long_term_owner")
+
+        if fin and fin.value_change_yoy is not None:
+            try:
+                if float(fin.value_change_yoy) < 0:
+                    _hcpa_passive.append("declining_value")
+            except (TypeError, ValueError):
+                pass
+
+        for passive_sig in _hcpa_passive:
+            per_vertical = HCPA_PASSIVE_WEIGHTS.get(passive_sig, {})
+            for v, bonus in per_vertical.items():
+                if vertical_scores.get(v, 0.0) > 0.0:
+                    vertical_scores[v] = min(float(SCORE_CAP), vertical_scores[v] + bonus)
+                    if v in vertical_results:
+                        vertical_results[v]["score"] = vertical_scores[v]
+
+        if _hcpa_passive:
+            logger.debug("  HCPA passive signals: %s", _hcpa_passive)
 
         # Guard: if no verticals produced any score, default to 0.0
         score_values = [s for s in vertical_scores.values() if s]

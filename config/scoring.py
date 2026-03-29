@@ -314,3 +314,43 @@ LEAD_TIER_THRESHOLDS = [
 
 # ── Score cap ─────────────────────────────────────────────────────────────────
 SCORE_CAP = 100
+
+# ── HCPA passive signal weights ───────────────────────────────────────────────
+# Derived from Property.year_built, Financial.last_sale_date, Financial.value_change_yoy.
+# Act as stacking boosters — they add weight only when a primary signal is already present.
+# Thresholds:
+#   property_age_30plus  → year_built < (current_year - 30)  — aging structure likely needs work
+#   long_term_owner      → last_sale_date older than 10 years — owner may be motivated to exit
+#   declining_value      → value_change_yoy < 0              — assessed value dropping YoY
+
+HCPA_PASSIVE_WEIGHTS = {
+    "property_age_30plus": {
+        "roofing":          20,
+        "restoration":      18,
+        "fix_flip":         12,
+        "wholesalers":      10,
+        "public_adjusters":  8,
+        "attorneys":         5,
+    },
+    "long_term_owner": {
+        "wholesalers":      18,
+        "fix_flip":         15,
+        "attorneys":        12,
+        "restoration":       8,
+        "roofing":           5,
+        "public_adjusters":  5,
+    },
+    "declining_value": {
+        "wholesalers":      15,
+        "fix_flip":         12,
+        "attorneys":        10,
+        "restoration":       8,
+        "roofing":           5,
+        "public_adjusters":  5,
+    },
+}
+
+# Year threshold for property_age_30plus signal (years old)
+HCPA_AGE_YEARS = 30
+# Year threshold for long_term_owner signal (years since last sale)
+HCPA_LONG_TERM_YEARS = 10
