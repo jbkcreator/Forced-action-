@@ -41,7 +41,7 @@ from config.scoring import VERTICAL_WEIGHTS
 logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent.parent / "static"
-REACT_DIST = Path(__file__).parent.parent.parent.parent / "forced-action-ui" / "dist"
+REACT_DIST = Path(__file__).parent.parent.parent.parent / "Forced-action-ui" / "dist"
 
 VALID_TIERS = {"starter", "pro", "dominator"}
 VALID_VERTICALS = set(VERTICAL_WEIGHTS.keys())

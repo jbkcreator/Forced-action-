@@ -9,3 +9,5 @@ data/
 *.txt
 *.status
 reports/
+nginx.conf
+forced-action.service
