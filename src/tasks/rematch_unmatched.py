@@ -58,7 +58,18 @@ def rematch_unmatched(
         deed_loader = DeedLoader(db)
         lp_loader = EvictionLoader(db)  # all LP loaders share the same base matching logic
 
-        for record in records:
+        BATCH_SIZE = 500
+        LOG_INTERVAL = 25
+        for i, record in enumerate(records):
+            if i % LOG_INTERVAL == 0:
+                logger.info(
+                    "Progress: %d/%d processed — matched=%d still_unmatched=%d errors=%d",
+                    i, len(records), stats["matched"], stats["still_unmatched"], stats["errors"],
+                )
+            if i > 0 and i % BATCH_SIZE == 0:
+                db.commit()
+                logger.info("Committed batch at record %d", i)
+
             try:
                 record.match_attempted_at = datetime.now(timezone.utc)
                 raw = record.raw_data or {}

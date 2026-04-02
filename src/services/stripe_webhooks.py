@@ -253,6 +253,16 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
     if subscriber.email:
         _send_welcome_email(subscriber)
 
+    # ── Immediate first-leads delivery (eliminates 13-hour silence) ───────
+    if subscriber.email and zip_codes:
+        try:
+            _send_first_leads_email(subscriber, zip_codes, db)
+        except Exception:
+            logger.error(
+                "First leads email failed for subscriber %s — non-critical",
+                subscriber.id, exc_info=True,
+            )
+
     logger.info(
         "checkout.session.completed: subscriber=%s tier=%s vertical=%s"
         " founding=%s zips=%s feed_uuid=%s",
@@ -421,6 +431,30 @@ def _send_welcome_email(subscriber: "Subscriber") -> None:
     )
 
     logger.info("Welcome email sent → %s (subscriber=%s)", subscriber.email, subscriber.id)
+
+
+def _send_first_leads_email(subscriber, zip_codes: list, db) -> None:
+    """
+    Immediately after checkout, deliver the top 10 existing leads in the
+    subscriber's territory so there's no silence between payment and first value.
+    Runs in the same webhook request — failure is caught and logged, never fatal.
+    """
+    from src.tasks.subscriber_email import query_top_leads, send_subscriber_lead_email
+
+    leads = query_top_leads(db, subscriber, zip_codes, limit=10)
+    if not leads:
+        logger.info(
+            "No existing leads to deliver immediately for subscriber %s (zips=%s) — skipping first-leads email",
+            subscriber.id, zip_codes,
+        )
+        return
+
+    send_subscriber_lead_email(
+        subscriber,
+        leads,
+        subject_prefix="Here are your first leads",
+        zip_codes=zip_codes,
+    )
 
 
 # ---------------------------------------------------------------------------

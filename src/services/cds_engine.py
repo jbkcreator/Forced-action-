@@ -933,7 +933,7 @@ class MultiVerticalScorer:
 
     # ── Database persistence ───────────────────────────────────────────────────
 
-    def save_score_to_database(self, score_data: Dict, upsert: bool = True):
+    def save_score_to_database(self, score_data: Dict, upsert: bool = True, scoring_run_id: Optional[int] = None):
         """
         UPSERT a DistressScore record.
 
@@ -984,6 +984,7 @@ class MultiVerticalScorer:
             existing.factor_scores   = factor_json
             existing.vertical_scores = vertical_json
             existing.distress_types  = distress_list
+            existing.scoring_run_id  = scoring_run_id
             logger.debug(
                 "Updated score for property %s: %.2f (%s)",
                 score_data.get("parcel_id"), final_score, lead_tier,
@@ -1027,6 +1028,7 @@ class MultiVerticalScorer:
             factor_scores=factor_json,
             vertical_scores=vertical_json,
             distress_types=distress_list,
+            scoring_run_id=scoring_run_id,
         )
         self.session.add(record)
         # Flush to get the DB-assigned primary key before pushing to GHL
@@ -1081,6 +1083,9 @@ class MultiVerticalScorer:
         Returns:
             List of score dicts for successfully scored properties.
         """
+        scoring_run_id = int(datetime.now(timezone.utc).timestamp())
+        logger.info("Scoring run ID: %d", scoring_run_id)
+
         label = f"{len(property_ids)} properties" if property_ids else "all properties"
         logger.info("Loading %s for scoring...", label)
         properties = self._load_properties(property_ids)
@@ -1106,7 +1111,7 @@ class MultiVerticalScorer:
                     continue
 
                 if save_to_db:
-                    _record, status, upgraded = self.save_score_to_database(score_data)
+                    _record, status, upgraded = self.save_score_to_database(score_data, scoring_run_id=scoring_run_id)
                     if status == 'new':
                         new_count += 1
                     elif status == 'updated':

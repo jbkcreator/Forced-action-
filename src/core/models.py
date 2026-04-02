@@ -635,6 +635,9 @@ class DistressScore(Base):
     # Multi-county
     county_id: Mapped[Optional[str]] = mapped_column(String(50), default='hillsborough', index=True)
 
+    # Scoring batch identifier — int(UTC epoch) set at start of score_all_properties()
+    scoring_run_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
     # Relationship
     property: Mapped["Property"] = relationship("Property", back_populates="distress_scores")
 
@@ -646,6 +649,7 @@ class DistressScore(Base):
         Index("idx_score_qualified", "qualified"),
         Index("idx_score_county_id", "county_id"),
         Index("idx_score_distress_types", "distress_types", postgresql_using="gin"),
+        Index("idx_score_scoring_run_id", "scoring_run_id"),
         CheckConstraint("urgency_level IN ('Immediate', 'High', 'Medium', 'Low')", name="check_urgency_level"),
         CheckConstraint("lead_tier IN ('Ultra Platinum', 'Platinum', 'Gold', 'Silver', 'Bronze')", name="check_lead_tier"),
     )
@@ -784,6 +788,30 @@ class ZipTerritory(Base):
 
     def __repr__(self):
         return f"<ZipTerritory(zip='{self.zip_code}', vertical='{self.vertical}', status='{self.status}')>"
+
+
+class SentLead(Base):
+    """
+    Tracks which property leads have been emailed to which subscriber.
+    Used for 7-day duplicate suppression in the daily lead email.
+    ON CONFLICT DO UPDATE refreshes sent_at so the window slides forward on resend.
+    """
+    __tablename__ = "sent_leads"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(ForeignKey("subscribers.id"), nullable=False)
+    property_id: Mapped[int] = mapped_column(ForeignKey("properties.id"), nullable=False)
+    sent_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("subscriber_id", "property_id", name="uq_sent_lead"),
+        Index("idx_sent_lead_subscriber_sent_at", "subscriber_id", "sent_at"),
+    )
+
+    def __repr__(self):
+        return f"<SentLead(subscriber_id={self.subscriber_id}, property_id={self.property_id})>"
 
 
 class EnrichedContact(Base):
@@ -993,6 +1021,12 @@ class UnmatchedRecord(Base):
 
     __table_args__ = (
         Index("ix_unmatched_source_status", "source_type", "match_status"),
+        Index(
+            "uq_unmatched_instrument_source_county",
+            "instrument_number", "source_type", "county_id",
+            unique=True,
+            postgresql_where="instrument_number IS NOT NULL",
+        ),
     )
 
     def __repr__(self):

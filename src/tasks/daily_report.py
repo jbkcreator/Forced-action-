@@ -62,14 +62,14 @@ SCRAPER_ORDER = [
     "fire_incidents",
 ]
 
-# Vertical → buyer bucket mapping for lead type breakdown
-VERTICAL_BUCKETS = {
+# Display order and labels for all 6 verticals
+VERTICAL_DISPLAY = {
     "roofing":          "Roofing",
-    "restoration":      "Remediation",
-    "wholesalers":      "Wholesale / Investor",
-    "fix_flip":         "Wholesale / Investor",
-    "public_adjusters": "Wholesale / Investor",
-    "attorneys":        "Wholesale / Investor",
+    "restoration":      "Restoration / Remediation",
+    "wholesalers":      "Wholesalers",
+    "fix_flip":         "Fix & Flip",
+    "public_adjusters": "Public Adjusters",
+    "attorneys":        "Attorneys",
 }
 
 GOLD_PLUS_TIERS = {"Ultra Platinum", "Platinum", "Gold"}
@@ -245,7 +245,7 @@ def _build_signal_freshness(session, county_id: str) -> dict:
 def _build_vertical_breakdown(session, run_date: date, county_id: str) -> dict:
     """
     For today's Gold+ leads, determine primary vertical per lead
-    (highest vertical_score wins) then map to Roofing / Remediation / Wholesale+Investor.
+    (highest vertical_score wins) and report all 6 verticals individually.
     """
     rows = (
         session.query(DistressScore)
@@ -257,7 +257,7 @@ def _build_vertical_breakdown(session, run_date: date, county_id: str) -> dict:
         .all()
     )
 
-    bucket_counts = defaultdict(int)
+    vertical_counts = defaultdict(int)
     unclassified = 0
 
     for r in rows:
@@ -266,18 +266,17 @@ def _build_vertical_breakdown(session, run_date: date, county_id: str) -> dict:
             unclassified += 1
             continue
         best = max(vs, key=lambda k: vs.get(k, 0))
-        bucket = VERTICAL_BUCKETS.get(best)
-        if bucket:
-            bucket_counts[bucket] += 1
+        if best in VERTICAL_DISPLAY:
+            vertical_counts[best] += 1
         else:
             unclassified += 1
 
-    total = sum(bucket_counts.values()) + unclassified
+    total = sum(vertical_counts.values()) + unclassified
     result = {}
-    for bucket in ["Roofing", "Remediation", "Wholesale / Investor"]:
-        cnt = bucket_counts.get(bucket, 0)
+    for key, label in VERTICAL_DISPLAY.items():
+        cnt = vertical_counts.get(key, 0)
         pct = (cnt / total * 100) if total else 0.0
-        result[bucket] = {"count": cnt, "pct": pct}
+        result[label] = {"count": cnt, "pct": pct}
     if unclassified:
         result["Other / Unclassified"] = {"count": unclassified, "pct": (unclassified / total * 100) if total else 0.0}
 
@@ -365,7 +364,7 @@ def write_csv(report: dict, path: Path) -> None:
         # ── Section 4: Lead Type Breakdown by Vertical ────────────────────
         vb = report["vertical_breakdown"]
         total_vb = vb.pop("_total", 0)
-        w.writerow(["LEAD TYPE BREAKDOWN (Gold+ by Vertical)"])
+        w.writerow(["LEAD TYPE BREAKDOWN — Gold+ by Vertical (6 verticals)"])
         w.writerow([f"Total Gold+ leads: {total_vb:,}"])
         w.writerow([])
         w.writerow(["Vertical", "Leads", "% of Gold+"])

@@ -52,7 +52,8 @@ def get_live_lead_count(zip_code: str, vertical: str, county_id: str = "hillsbor
         }
     """
     from src.core.database import get_db_context
-    from src.core.models import Property, DistressScore, ZipTerritory
+    from src.core.models import Property, DistressScore, ZipTerritory, FoundingSubscriberCount
+    from src.services.stripe_service import _founding_limit
     from sqlalchemy import select, func, and_, desc
 
     with get_db_context() as session:
@@ -106,10 +107,22 @@ def get_live_lead_count(zip_code: str, vertical: str, county_id: str = "hillsbor
         ).scalar_one_or_none()
         zip_available = (territory is None or territory.status == "available")
 
+        # Founding spots remaining — total across all tiers for this vertical/county
+        founding_rows = session.execute(
+            select(func.sum(FoundingSubscriberCount.count)).where(
+                FoundingSubscriberCount.vertical == vertical,
+                FoundingSubscriberCount.county_id == county_id,
+            )
+        ).scalar() or 0
+        tiers = ["starter", "pro", "dominator"]
+        total_founding_cap = _founding_limit() * len(tiers)
+        founding_spots_remaining = max(0, total_founding_cap - founding_rows)
+
     return {
         "count": count,
         "top_signal": top_signal,
         "zip_available": zip_available,
+        "founding_spots_remaining": founding_spots_remaining,
     }
 
 
