@@ -26,7 +26,7 @@ from fastapi import FastAPI, Header, HTTPException, Request, Depends, Query
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, field_validator, model_validator, EmailStr
+from pydantic import BaseModel, Field, field_validator, model_validator, EmailStr
 from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from sqlalchemy import select, and_, or_, desc, func, cast, Date
