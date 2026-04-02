@@ -228,10 +228,9 @@ def process_call_outcome(
     """
     Called by POST /webhooks/synthflow after each Synthflow call completes.
 
-    Looks up the prospect in GHL by phone, applies outcome tags, and creates
-    a contact if none exists.  The tags trigger GHL workflows:
-      - sample_leads_requested → GHL automation sends SMS with 3 sample leads
-      - demo_requested         → GHL automation sends Calendly SMS
+    Looks up the prospect in GHL by phone, applies outcome tags, creates
+    a contact if none exists, and — for sample_requested outcomes — sends
+    the sample leads SMS directly without needing a GHL workflow.
 
     Args:
         prospect_phone: The number that was called (E.164 or 10-digit).
@@ -243,7 +242,8 @@ def process_call_outcome(
         notes:          Short summary / transcript snippet (optional).
 
     Returns:
-        {"contact_id": str | None, "tags_applied": list, "created": bool}
+        {"contact_id": str | None, "tags_applied": list, "created": bool,
+         "sms_sent": bool | None}
     """
     tags = _OUTCOME_TAGS.get(outcome, ["synthflow-called"])
     if vertical:
@@ -273,8 +273,29 @@ def process_call_outcome(
             contact_id, outcome, tags,
         )
 
+    # For sample_requested: send the leads SMS directly — no GHL workflow needed
+    sms_sent = None
+    if outcome == "sample_requested" and contact_id and zip_code:
+        try:
+            from src.services.sample_leads_sms import send_sample_leads
+            result = send_sample_leads(
+                contact_id=contact_id,
+                zip_code=zip_code,
+                vertical=vertical or "roofing",
+                prospect_name=prospect_name,
+            )
+            sms_sent = result.get("sent", False)
+            logger.info(
+                "[Synthflow] sample leads SMS sent=%s leads=%d contact=%s",
+                sms_sent, result.get("lead_count", 0), contact_id,
+            )
+        except Exception as exc:
+            logger.error("[Synthflow] sample leads SMS failed for %s: %s", contact_id, exc)
+            sms_sent = False
+
     return {
         "contact_id": contact_id,
         "tags_applied": tags,
         "created": created,
+        "sms_sent": sms_sent,
     }

@@ -1645,3 +1645,71 @@ async def synthflow_webhook(payload: SynthflowWebhookPayload):
         result.get("contact_id"), result.get("tags_applied"),
     )
     return {"status": "ok", **result}
+
+
+# ---------------------------------------------------------------------------
+# POST /webhooks/ghl/sample-leads — GHL workflow webhook for sample lead SMS
+# ---------------------------------------------------------------------------
+
+class GHLSampleLeadsPayload(BaseModel):
+    """
+    Payload sent by the GHL workflow when the sample_leads_requested tag fires.
+    GHL custom webhooks send contact data as top-level fields.
+    """
+    contact_id:     Optional[str] = Field(default=None, alias="contactId")
+    phone:          Optional[str] = None
+    zip_code:       Optional[str] = Field(default=None, alias="zipCode")
+    vertical:       Optional[str] = None
+    first_name:     Optional[str] = Field(default=None, alias="firstName")
+    last_name:      Optional[str] = Field(default=None, alias="lastName")
+
+    model_config = {"populate_by_name": True}
+
+    @property
+    def prospect_name(self) -> str:
+        parts = [self.first_name or "", self.last_name or ""]
+        return " ".join(p for p in parts if p).strip()
+
+
+@app.post("/webhooks/ghl/sample-leads", status_code=200)
+async def ghl_sample_leads_webhook(payload: GHLSampleLeadsPayload):
+    """
+    Triggered by a GHL workflow when contact tag sample_leads_requested is applied.
+    Queries top 3 Gold+ leads for the prospect's ZIP/vertical and sends them via SMS.
+
+    Configure in GHL workflow:
+        Trigger: Tag added = sample_leads_requested
+        Action: Custom Webhook → POST https://forcedactionleads.com/webhooks/ghl/sample-leads
+        Body: { "contactId": "{{contact.id}}", "phone": "{{contact.phone}}",
+                "zipCode": "{{contact.postalCode}}", "vertical": "{{contact.tags}}",
+                "firstName": "{{contact.firstName}}", "lastName": "{{contact.lastName}}" }
+    """
+    if not payload.contact_id:
+        logger.warning("[GHL sample-leads] Missing contact_id — skipping")
+        return {"status": "skipped", "reason": "no_contact_id"}
+
+    zip_code = (payload.zip_code or "").strip()
+    vertical = (payload.vertical or "roofing").strip().lower()
+
+    if not zip_code:
+        logger.warning("[GHL sample-leads] No zip_code for contact %s — skipping", payload.contact_id)
+        return {"status": "skipped", "reason": "no_zip_code"}
+
+    try:
+        from src.services.sample_leads_sms import send_sample_leads
+        result = send_sample_leads(
+            contact_id=payload.contact_id,
+            zip_code=zip_code,
+            vertical=vertical,
+            prospect_name=payload.prospect_name,
+        )
+    except Exception:
+        logger.error("[GHL sample-leads] Error for contact %s", payload.contact_id, exc_info=True)
+        return {"status": "error"}
+
+    logger.info(
+        "[GHL sample-leads] contact=%s zip=%s vertical=%s sent=%s leads=%d",
+        payload.contact_id, zip_code, vertical,
+        result.get("sent"), result.get("lead_count"),
+    )
+    return {"status": "ok", **result}
