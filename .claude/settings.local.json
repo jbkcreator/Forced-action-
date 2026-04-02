@@ -9,7 +9,13 @@
       "Bash(python -m pytest tests/test_m1_unit.py --tb=short)",
       "Bash(python -m pytest tests/test_m1_unit.py -v)",
       "Bash(findstr /C:\"PASSED\" /C:\"FAILED\" /C:\"passed\" /C:\"failed\")",
-      "Bash(python scripts/vertical_analysis.py)"
+      "Bash(python scripts/vertical_analysis.py)",
+      "Bash(grep -r leads_new C:UsersAmalCodebasesFAForced-action-src --include=*.py)",
+      "Bash(grep -r \"scrape_tax_delinquent\\\\|tax_delinquent_engine\\\\|run_radar_sniper\" /c/Users/Amal/Codebases/FA/Forced-action- --include=*.py)",
+      "Bash(python -c \"from src.tasks.subscriber_email import run_daily_emails, query_top_leads, send_subscriber_lead_email; print\\(''subscriber_email OK''\\)\")",
+      "Bash(python -c \"from src.services.stripe_webhooks import handle_webhook; print\\(''stripe_webhooks OK''\\)\")",
+      "Bash(python -c \"from src.core.models import SentLead, DistressScore; print\\('SentLead OK'\\); print\\('scoring_run_id:', hasattr\\(DistressScore, 'scoring_run_id'\\)\\)\")",
+      "Bash(python -c \"from src.api.main import app; print\\('OK'\\)\")"
     ]
   }
 }

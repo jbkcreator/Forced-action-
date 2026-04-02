@@ -1603,6 +1603,24 @@ class SynthflowWebhookPayload(BaseModel):
         return status_map.get(self.call_status or "", "completed")
 
 
+@app.get("/webhooks/synthflow/sample-leads-text")
+def synthflow_sample_leads_text(
+    zip_code: str,
+    vertical: str = "roofing",
+):
+    """
+    Called by fine-tuner.ai during a call when the prospect says YES to sample leads.
+    Returns a formatted SMS message string — agent maps it into the Send SMS action.
+
+    Example: GET /webhooks/synthflow/sample-leads-text?zip_code=33612&vertical=roofing
+    Returns: { "message": "Forced Action — Roofing leads in 33612:\n1. 123 Main St..." }
+    """
+    from src.services.sample_leads_sms import get_sample_leads, format_sms_body
+    leads = get_sample_leads(zip_code=zip_code, vertical=vertical)
+    message = format_sms_body(leads, zip_code=zip_code, vertical=vertical)
+    return {"message": message, "lead_count": len(leads)}
+
+
 @app.post("/webhooks/synthflow", status_code=200)
 async def synthflow_webhook(payload: SynthflowWebhookPayload):
     """

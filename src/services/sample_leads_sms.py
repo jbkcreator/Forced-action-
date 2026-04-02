@@ -18,6 +18,7 @@ from sqlalchemy import select, desc, and_
 
 from src.core.database import get_db_context
 from src.core.models import DistressScore, Owner, Property
+from config.settings import get_settings
 from src.services.ghl_webhook import _ghl_request, _headers, _is_configured, _GHL_BASE
 
 logger = logging.getLogger(__name__)
@@ -136,20 +137,22 @@ def send_ghl_sms(contact_id: str, message: str) -> bool:
         return False
 
     try:
+        settings = get_settings()
         resp = _ghl_request(
             "POST",
             f"{_GHL_BASE}/conversations/messages",
             headers=_headers(),
             json={
-                "type":      "SMS",
-                "contactId": contact_id,
-                "message":   message,
+                "type":       "SMS",
+                "contactId":  contact_id,
+                "locationId": settings.ghl_location_id,
+                "message":    message,
             },
         )
         if not resp.ok:
             logger.warning(
                 "[SampleLeads] GHL SMS failed HTTP %d for contact %s: %s",
-                resp.status_code, contact_id, resp.text[:300],
+                resp.status_code, contact_id, resp.text[:500],
             )
             return False
 

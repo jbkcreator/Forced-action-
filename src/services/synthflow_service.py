@@ -273,8 +273,9 @@ def process_call_outcome(
             contact_id, outcome, tags,
         )
 
-    # For sample_requested: send the leads SMS directly — no GHL workflow needed
+    # Fire SMS directly for outcomes that need immediate follow-up — no GHL workflow needed
     sms_sent = None
+
     if outcome == "sample_requested" and contact_id and zip_code:
         try:
             from src.services.sample_leads_sms import send_sample_leads
@@ -291,6 +292,28 @@ def process_call_outcome(
             )
         except Exception as exc:
             logger.error("[Synthflow] sample leads SMS failed for %s: %s", contact_id, exc)
+            sms_sent = False
+
+    elif outcome == "demo_requested" and contact_id:
+        try:
+            from config.settings import get_settings
+            from src.services.sample_leads_sms import send_ghl_sms
+            calendly_url = get_settings().demo_calendly_url
+            if calendly_url:
+                name = prospect_name.split()[0] if prospect_name else "there"
+                message = (
+                    f"Hi {name}, here's the link to book your 15-minute demo with Josh:\n\n"
+                    f"{calendly_url}\n\n"
+                    f"No commitment — he'll pull up live leads in your ZIP while you're on the phone.\n\n"
+                    f"Reply STOP to opt out."
+                )
+                sms_sent = send_ghl_sms(contact_id=contact_id, message=message)
+                logger.info("[Synthflow] demo SMS sent=%s contact=%s", sms_sent, contact_id)
+            else:
+                logger.warning("[Synthflow] DEMO_CALENDLY_URL not set — skipping demo SMS")
+                sms_sent = False
+        except Exception as exc:
+            logger.error("[Synthflow] demo SMS failed for %s: %s", contact_id, exc)
             sms_sent = False
 
     return {

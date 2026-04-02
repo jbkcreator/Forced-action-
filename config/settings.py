@@ -63,6 +63,9 @@ class AppSettings(BaseSettings):
 	# Founding subscriber spot limit (default 10, changeable without redeploy)
 	founding_spot_limit: int = Field(default=10, env="FOUNDING_SPOT_LIMIT")
 
+	# Demo booking link — sent via SMS when prospect requests a demo on the call
+	demo_calendly_url: Optional[str] = Field(default=None, env="DEMO_CALENDLY_URL")
+
 	# Application base URL — used for Stripe return/success URLs
 	app_base_url: str = Field(
 		default="http://localhost:8000",
