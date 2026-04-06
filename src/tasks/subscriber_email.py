@@ -119,19 +119,28 @@ def query_top_leads(
     # Freshness: only include leads scored within LEAD_FRESHNESS_DAYS
     cutoff_freshness = datetime.now(timezone.utc) - timedelta(days=LEAD_FRESHNESS_DAYS)
 
+    from config.settings import get_settings
+    _settings = get_settings()
+
+    filters = [
+        Property.zip.in_(zip_codes),
+        Property.county_id == subscriber.county_id,
+        DistressScore.lead_tier.in_(GOLD_PLUS_TIERS),
+        DistressScore.qualified == True,
+        score_col > 0,
+        DistressScore.score_date >= cutoff_freshness,
+        ~Property.id.in_(recently_sent_subq),
+    ]
+
+    # Production only: exclude leads with no owner phone number
+    if not _settings.debug:
+        filters.append(Owner.phone.isnot(None))
+
     rows = db.execute(
         select(Property, DistressScore, Owner)
         .join(DistressScore, DistressScore.property_id == Property.id)
         .outerjoin(Owner, Owner.property_id == Property.id)
-        .where(and_(
-            Property.zip.in_(zip_codes),
-            Property.county_id == subscriber.county_id,
-            DistressScore.lead_tier.in_(GOLD_PLUS_TIERS),
-            DistressScore.qualified == True,
-            score_col > 0,
-            DistressScore.score_date >= cutoff_freshness,
-            ~Property.id.in_(recently_sent_subq),
-        ))
+        .where(and_(*filters))
         .order_by(desc(score_col))
         .limit(limit)
     ).all()
