@@ -15,12 +15,15 @@ class AppSettings(BaseSettings):
 		env_file=".env",
 		env_file_encoding="utf-8",
 		case_sensitive=False,
+		extra="ignore",
 	)
 
 	# API Keys
 	anthropic_api_key: SecretStr = Field(..., env="ANTHROPIC_API_KEY")
 	firecrawl_api_key: SecretStr = Field(..., env="FIRECRAWL_API_KEY")
 	court_listener_api_key: SecretStr = Field(..., env="COURT_LISTENER_API_KEY")
+
+	debug: bool = Field(default=True, env="DEBUG")
 
 
 	# Oxylabs proxy (optional — used by foreclosure + tax delinquency scrapers)
