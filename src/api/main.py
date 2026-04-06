@@ -598,8 +598,13 @@ async def stripe_webhook(
                 status_code=503,
                 detail={"error": "service_unavailable", "message": "Database temporarily unavailable"},
             )
-        except Exception:
+        except Exception as exc:
             logger.error("Unhandled webhook handler error", exc_info=True)
+            from src.services.email import send_alert
+            send_alert(
+                "[FA] Stripe webhook error",
+                f"Unhandled exception in /webhooks/stripe:\n\n{exc}",
+            )
             raise HTTPException(
                 status_code=500,
                 detail={"error": "internal_server_error", "message": "Webhook processing failed"},

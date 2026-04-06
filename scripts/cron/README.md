@@ -15,6 +15,9 @@ All times UTC. Add to the app-user's crontab on the production server (`crontab 
 # Match rate monitor — 9 AM daily
 0 9 * * *      cd /opt/forced-action && python -m src.tasks.match_rate_monitor
 
+# Ops health check — 9:30 AM daily (after scoring + match rate monitor)
+30 9 * * *     cd /opt/forced-action && python -m src.tasks.health_check      >> /var/log/fa-health.log 2>&1
+
 # Unmatched record rematch — Sunday 3:30 AM UTC (before Monday scrapers)
 30 3 * * 0     cd /opt/forced-action && python -m src.tasks.rematch_unmatched
 
