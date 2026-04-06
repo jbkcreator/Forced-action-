@@ -182,8 +182,11 @@ async def _playwright_download_tax_delinquent(
 
 	async with async_playwright() as pw:
 		from src.utils.http_helpers import get_playwright_proxy
+		proxy = get_playwright_proxy()
+		logger.info("[Playwright][RADAR] Proxy: %s", "Oxylabs enabled" if proxy else "NO PROXY — running direct")
 		browser = await pw.chromium.launch(
 			headless=True,
+			proxy=proxy,
 			args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
 		)
 		context = await browser.new_context(
@@ -308,9 +311,12 @@ async def _ai_download_tax_delinquent(
 		logger.info(f"[AI][RADAR] Tax year: {tax_year}, Status: {account_status}")
 
 		from src.utils.http_helpers import get_browser_use_proxy
+		proxy = get_browser_use_proxy()
+		logger.info("[AI][RADAR] Proxy: %s", "Oxylabs enabled" if proxy else "NO PROXY — running direct")
 		browser = Browser(
 			headless=True,
 			disable_security=True,
+			proxy=proxy,
 			user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
 			args=[
 				'--no-sandbox',
