@@ -71,7 +71,27 @@ def send_email(
 
     except Exception as exc:
         logger.error("Failed to send email to %s (%s): %s", to, subject, exc)
+        # Fire ops alert — but only if this isn't already an alert email (avoid loops)
+        if settings.alert_email and to != settings.alert_email:
+            try:
+                _send_raw_alert(settings, f"[FA] SES send failure — {subject}", str(exc))
+            except Exception:
+                pass
         return False
+
+
+def _send_raw_alert(settings, subject: str, body: str) -> None:
+    """Minimal direct SMTP send for SES failure alerts — avoids calling send_email() recursively."""
+    if not all([settings.smtp_host, settings.smtp_user, settings.smtp_pass, settings.alert_email]):
+        return
+    msg = MIMEText(body, "plain")
+    msg["Subject"] = subject
+    msg["From"] = settings.smtp_user
+    msg["To"] = settings.alert_email
+    with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=10) as srv:
+        srv.starttls()
+        srv.login(settings.smtp_user, settings.smtp_pass.get_secret_value())
+        srv.sendmail(settings.smtp_user, [settings.alert_email], msg.as_string())
 
 
 def send_alert(subject: str, body: str) -> bool:
