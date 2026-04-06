@@ -1567,9 +1567,13 @@ class SynthflowWebhookPayload(BaseModel):
     # Call identity
     call_id: Optional[str] = None
 
-    # Prospect phone — Synthflow sends 'to', Finetuner sends 'prospect_phone'
+    # Prospect phone — various field names across providers
     to: Optional[str] = None
     prospect_phone: Optional[str] = None
+    phone_number: Optional[str] = None
+    phone: Optional[str] = None
+    caller_phone: Optional[str] = None
+    contact_phone: Optional[str] = None
 
     # Outcome — agent sets this via a variable during the call
     outcome: Optional[str] = None          # sample_requested | demo_requested | not_interested | voicemail | no_answer | completed
@@ -1586,8 +1590,8 @@ class SynthflowWebhookPayload(BaseModel):
     recording_url: Optional[str] = None
 
     @property
-    def phone(self) -> Optional[str]:
-        return self.prospect_phone or self.to
+    def resolved_phone(self) -> Optional[str]:
+        return self.prospect_phone or self.phone_number or self.to or self.phone or self.caller_phone or self.contact_phone
 
     @property
     def resolved_outcome(self) -> str:
@@ -1637,7 +1641,7 @@ async def synthflow_webhook(payload: SynthflowWebhookPayload):
     Configure in Synthflow/Finetuner as the post-call webhook URL:
         https://your-domain.com/webhooks/synthflow
     """
-    phone = payload.phone
+    phone = payload.resolved_phone
     if not phone:
         logger.warning("[Synthflow webhook] received payload with no phone number")
         return {"status": "ignored", "reason": "no phone"}
