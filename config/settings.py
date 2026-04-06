@@ -22,6 +22,7 @@ class AppSettings(BaseSettings):
 	firecrawl_api_key: SecretStr = Field(..., env="FIRECRAWL_API_KEY")
 	court_listener_api_key: SecretStr = Field(..., env="COURT_LISTENER_API_KEY")
 
+
 	# Oxylabs proxy (optional — used by foreclosure + tax delinquency scrapers)
 	oxylabs_username: Optional[str] = Field(default=None, env="OXYLABS_USERNAME")
 	oxylabs_password: Optional[SecretStr] = Field(default=None, env="OXYLABS_PASSWORD")
@@ -88,6 +89,15 @@ class AppSettings(BaseSettings):
 	# Alerting
 	alert_sms_number: Optional[str] = Field(default=None, env="ALERT_SMS_NUMBER")  # SMS target for match-rate alerts
 	alert_sms_carrier: Optional[str] = Field(default=None, env="ALERT_SMS_CARRIER")  # e.g. tmomail.net, vtext.com
+
+	# DB Backup — S3
+	backup_s3_bucket: Optional[str] = Field(default=None, env="BACKUP_S3_BUCKET")
+	backup_s3_prefix: str = Field(default="db-backups", env="BACKUP_S3_PREFIX")
+	backup_s3_region: str = Field(default="us-east-1", env="BACKUP_S3_REGION")
+	backup_aws_access_key_id: Optional[str] = Field(default=None, env="BACKUP_AWS_ACCESS_KEY_ID")
+	backup_aws_secret_access_key: Optional[SecretStr] = Field(default=None, env="BACKUP_AWS_SECRET_ACCESS_KEY")
+	backup_retention_daily: int = Field(default=7, env="BACKUP_RETENTION_DAILY")
+	backup_retention_weekly: int = Field(default=4, env="BACKUP_RETENTION_WEEKLY")
 
 	# Database Configuration
 	database_url: str = Field(

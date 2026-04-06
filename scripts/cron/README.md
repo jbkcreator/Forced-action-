@@ -17,4 +17,8 @@ All times UTC. Add to the app-user's crontab on the production server (`crontab 
 
 # Unmatched record rematch — Sunday 3:30 AM UTC (before Monday scrapers)
 30 3 * * 0     cd /opt/forced-action && python -m src.tasks.rematch_unmatched
+
+# DB backup — daily 1 AM UTC (before scrapers), weekly on Sunday
+0 1 * * *      cd /opt/forced-action && python scripts/backup_db.py          >> /var/log/fa-backup.log 2>&1
+0 1 * * 0      cd /opt/forced-action && python scripts/backup_db.py --weekly >> /var/log/fa-backup.log 2>&1
 ```
