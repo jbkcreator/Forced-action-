@@ -22,13 +22,13 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import func
+from sqlalchemy import func, text
 
 from src.core.database import get_db_context
 from src.core.models import (
     BuildingPermit, CodeViolation, Deed, DistressScore, Foreclosure,
     Incident, LegalAndLien, LegalProceeding, PlatformDailyStats,
-    ScraperRunStats, TaxDelinquency,
+    Property, ScraperRunStats, TaxDelinquency,
 )
 from src.utils.logger import setup_logging
 
@@ -284,6 +284,140 @@ def _build_vertical_breakdown(session, run_date: date, county_id: str) -> dict:
     return result
 
 
+def _build_vertical_tier_crosstab(session, run_date: date, county_id: str) -> dict:
+    """
+    Gold+ by vertical × tier with new-today count.
+    Returns {vertical_label: {tier: {count, new_today}}}.
+    new_today = Gold+ today that were NOT Gold+ yesterday.
+    """
+    yesterday = run_date - timedelta(days=1)
+
+    def _fetch(d):
+        rows = (
+            session.query(DistressScore)
+            .filter(
+                func.date(DistressScore.score_date) == d,
+                DistressScore.lead_tier.in_(GOLD_PLUS_TIERS),
+                DistressScore.county_id == county_id,
+            )
+            .all()
+        )
+        result = {}
+        for r in rows:
+            vs = r.vertical_scores or {}
+            if not vs:
+                continue
+            best = max(vs, key=lambda k: vs.get(k, 0))
+            if best in VERTICAL_DISPLAY:
+                result[r.property_id] = (best, r.lead_tier)
+        return result
+
+    today_map = _fetch(run_date)
+    yesterday_ids = set(_fetch(yesterday).keys())
+
+    # Aggregate: {vertical: {tier: {count, new_today}}}
+    agg = defaultdict(lambda: defaultdict(lambda: {"count": 0, "new_today": 0}))
+    for pid, (vertical, tier) in today_map.items():
+        agg[vertical][tier]["count"] += 1
+        if pid not in yesterday_ids:
+            agg[vertical][tier]["new_today"] += 1
+
+    result = {}
+    for key, label in VERTICAL_DISPLAY.items():
+        result[label] = {}
+        for tier in ("Ultra Platinum", "Platinum", "Gold"):
+            result[label][tier] = agg[key].get(tier, {"count": 0, "new_today": 0})
+    return result
+
+
+def _build_zip_breakdown(session, run_date: date, county_id: str, top_n: int = 20) -> list:
+    """
+    Top ZIPs by Gold+ lead count today.
+    Returns list of {zip, ultra_platinum, platinum, gold, total}.
+    """
+    rows = (
+        session.query(
+            Property.zip,
+            DistressScore.lead_tier,
+            func.count().label("cnt"),
+        )
+        .join(Property, Property.id == DistressScore.property_id)
+        .filter(
+            func.date(DistressScore.score_date) == run_date,
+            DistressScore.lead_tier.in_(GOLD_PLUS_TIERS),
+            DistressScore.county_id == county_id,
+            Property.zip.isnot(None),
+        )
+        .group_by(Property.zip, DistressScore.lead_tier)
+        .all()
+    )
+
+    zip_data = defaultdict(lambda: {"Ultra Platinum": 0, "Platinum": 0, "Gold": 0})
+    for zip_code, tier, cnt in rows:
+        zip_data[zip_code][tier] = cnt
+
+    result = []
+    for zip_code, tiers in zip_data.items():
+        total = sum(tiers.values())
+        result.append({
+            "zip":           zip_code,
+            "ultra_platinum": tiers["Ultra Platinum"],
+            "platinum":       tiers["Platinum"],
+            "gold":           tiers["Gold"],
+            "total":          total,
+        })
+
+    result.sort(key=lambda x: x["total"], reverse=True)
+    return result[:top_n]
+
+
+def _build_signal_composition(session, run_date: date, county_id: str) -> dict:
+    """
+    Top signals driving Gold+ scores per vertical today.
+    Uses jsonb_array_elements_text on distress_types.
+    Returns {vertical_label: [(signal, count), ...]}.
+    """
+    sql = text("""
+        SELECT
+            ds.vertical_scores,
+            jsonb_array_elements_text(ds.distress_types) AS signal,
+            COUNT(*) AS cnt
+        FROM distress_scores ds
+        WHERE
+            DATE(ds.score_date) = :run_date
+            AND ds.lead_tier = ANY(:tiers)
+            AND ds.county_id = :county_id
+            AND ds.distress_types IS NOT NULL
+            AND ds.distress_types != 'null'::jsonb
+        GROUP BY ds.vertical_scores, signal
+    """)
+
+    try:
+        rows = session.execute(sql, {
+            "run_date": run_date,
+            "tiers":    list(GOLD_PLUS_TIERS),
+            "county_id": county_id,
+        }).fetchall()
+    except Exception:
+        return {}
+
+    # Map best vertical → signal counts
+    vertical_signals = defaultdict(lambda: defaultdict(int))
+    for vs_json, signal, cnt in rows:
+        if not vs_json:
+            continue
+        best = max(vs_json, key=lambda k: vs_json.get(k, 0))
+        if best in VERTICAL_DISPLAY:
+            vertical_signals[best][signal] += cnt
+
+    result = {}
+    for key, label in VERTICAL_DISPLAY.items():
+        signals = vertical_signals.get(key, {})
+        top = sorted(signals.items(), key=lambda x: x[1], reverse=True)[:5]
+        result[label] = top
+    return result
+
+
 def build_report(run_date: date, county_id: str) -> dict:
     errors = []
     with get_db_context() as session:
@@ -291,22 +425,28 @@ def build_report(run_date: date, county_id: str) -> dict:
             _build_scraper_section(session, run_date, county_id)
         errors.extend(scraper_errors)
 
-        scoring, tiers     = _build_scoring_section(session, run_date, county_id, errors)
-        vertical_breakdown = _build_vertical_breakdown(session, run_date, county_id)
-        signal_freshness   = _build_signal_freshness(session, county_id)
+        scoring, tiers          = _build_scoring_section(session, run_date, county_id, errors)
+        vertical_breakdown      = _build_vertical_breakdown(session, run_date, county_id)
+        signal_freshness        = _build_signal_freshness(session, county_id)
+        vertical_tier_crosstab  = _build_vertical_tier_crosstab(session, run_date, county_id)
+        zip_breakdown           = _build_zip_breakdown(session, run_date, county_id)
+        signal_composition      = _build_signal_composition(session, run_date, county_id)
 
     return {
-        "run_date":           run_date,
-        "county_id":          county_id,
-        "total_scraped":      total_scraped,
-        "total_matched":      total_matched,
-        "match_pct":          match_pct,
-        "scraper_data":       scraper_data,
-        "scoring":            scoring,
-        "tiers":              tiers,
-        "vertical_breakdown": vertical_breakdown,
-        "signal_freshness":   signal_freshness,
-        "errors":             errors,
+        "run_date":              run_date,
+        "county_id":             county_id,
+        "total_scraped":         total_scraped,
+        "total_matched":         total_matched,
+        "match_pct":             match_pct,
+        "scraper_data":          scraper_data,
+        "scoring":               scoring,
+        "tiers":                 tiers,
+        "vertical_breakdown":    vertical_breakdown,
+        "signal_freshness":      signal_freshness,
+        "vertical_tier_crosstab": vertical_tier_crosstab,
+        "zip_breakdown":         zip_breakdown,
+        "signal_composition":    signal_composition,
+        "errors":                errors,
     }
 
 
@@ -372,7 +512,34 @@ def write_csv(report: dict, path: Path) -> None:
             w.writerow([bucket, f"{stats['count']:,}", f"{stats['pct']:.1f}%"])
         w.writerow([])
 
-        # ── Section 5: Signal Freshness ───────────────────────────────────
+        # ── Section 5: Gold+ by Vertical × Tier (cross-tab) ─────────────
+        w.writerow(["GOLD+ BY VERTICAL × TIER"])
+        w.writerow(["Vertical", "Tier", "Count", "New Today"])
+        for vertical_label, tiers_data in report["vertical_tier_crosstab"].items():
+            for tier in ("Ultra Platinum", "Platinum", "Gold"):
+                d = tiers_data.get(tier, {"count": 0, "new_today": 0})
+                if d["count"] > 0:
+                    w.writerow([vertical_label, tier, d["count"], d["new_today"]])
+        w.writerow([])
+
+        # ── Section 6: ZIP-Level Gold+ Breakdown ─────────────────────────
+        w.writerow(["ZIP-LEVEL GOLD+ BREAKDOWN (top 20)"])
+        w.writerow(["ZIP", "Ultra Platinum", "Platinum", "Gold", "Total"])
+        for z in report["zip_breakdown"]:
+            w.writerow([z["zip"], z["ultra_platinum"], z["platinum"], z["gold"], z["total"]])
+        w.writerow([])
+
+        # ── Section 7: Signal Composition by Vertical ────────────────────
+        w.writerow(["SIGNAL COMPOSITION — Top 5 signals driving Gold+ per vertical"])
+        w.writerow(["Vertical", "Signal", "Count"])
+        for vertical_label, signals in report["signal_composition"].items():
+            for signal, cnt in signals:
+                w.writerow([vertical_label, signal, cnt])
+            if not signals:
+                w.writerow([vertical_label, "No data", ""])
+        w.writerow([])
+
+        # ── Section 9: Signal Freshness ───────────────────────────────────
         w.writerow(["SIGNAL FRESHNESS (newest record age per source)"])
         w.writerow(["Source", "Newest Record Age"])
         sf = report.get("signal_freshness", {})
@@ -385,7 +552,7 @@ def write_csv(report: dict, path: Path) -> None:
                 w.writerow([label, f"{days} day(s) old"])
         w.writerow([])
 
-        # ── Section 6: Alerts ─────────────────────────────────────────────
+        # ── Section 10: Alerts ────────────────────────────────────────────
         w.writerow(["ALERTS"])
         if report["errors"]:
             for err in report["errors"]:
