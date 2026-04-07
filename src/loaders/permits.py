@@ -17,8 +17,14 @@ _ENFORCEMENT_TYPE_KEYWORDS = frozenset({
     "code compliance case",
 })
 # Status values that indicate enforcement (exact match, case-insensitive)
+# "awaiting client reply" = owner not responding, work stalled — strong distress signal
 _ENFORCEMENT_STATUS_VALUES = frozenset({
-    "withdrawn", "cancel",
+    "withdrawn", "cancel", "awaiting client reply",
+})
+
+# Status values that indicate completed work — not a lead, skip entirely
+_SKIP_STATUS_VALUES = frozenset({
+    "complete",
 })
 
 
@@ -72,6 +78,13 @@ class BuildingPermitLoader(BaseLoader):
                 skipped += 1
                 continue
             
+            # Skip completed permits — work is done, not a distress signal
+            raw_status = str(row.get('Status') or "").lower().strip()
+            if raw_status in _SKIP_STATUS_VALUES:
+                logger.debug(f"Skipping completed permit: {record_number}")
+                skipped += 1
+                continue
+
             # Match by address — extract ZIP from raw address if present
             property_record = None
             if pd.notna(row.get('Address')):
