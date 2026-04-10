@@ -93,6 +93,9 @@ class AppSettings(BaseSettings):
 	alert_sms_number: Optional[str] = Field(default=None, env="ALERT_SMS_NUMBER")  # SMS target for match-rate alerts
 	alert_sms_carrier: Optional[str] = Field(default=None, env="ALERT_SMS_CARRIER")  # e.g. tmomail.net, vtext.com
 
+	# UptimeRobot (optional — used by scripts/setup_uptimerobot.py to create monitors)
+	uptimerobot_api_key: Optional[SecretStr] = Field(default=None, env="UPTIMEROBOT_API_KEY")
+
 	# DB Backup — S3
 	backup_s3_bucket: Optional[str] = Field(default=None, env="BACKUP_S3_BUCKET")
 	backup_s3_prefix: str = Field(default="db-backups", env="BACKUP_S3_PREFIX")

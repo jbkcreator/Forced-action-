@@ -18,8 +18,9 @@ _ENFORCEMENT_TYPE_KEYWORDS = frozenset({
 })
 # Status values that indicate enforcement (exact match, case-insensitive)
 # "awaiting client reply" = owner not responding, work stalled — strong distress signal
+# "expired" / "revoked" = permit lapsed without completion — owner stalled or non-compliant
 _ENFORCEMENT_STATUS_VALUES = frozenset({
-    "withdrawn", "cancel", "awaiting client reply",
+    "withdrawn", "cancel", "awaiting client reply", "expired", "revoked",
 })
 
 # Status values that indicate completed work — not a lead, skip entirely

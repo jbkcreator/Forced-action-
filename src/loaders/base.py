@@ -153,6 +153,8 @@ class BaseLoader(ABC):
         
         # Standardize common abbreviations to match database format
         replacements = {
+            # Must come before shorter patterns to avoid partial replacement
+            'state road': 'sr',       # "W State Road 60" → "W SR 60"
             ' street': ' st',
             ' drive': ' dr',
             ' road': ' rd',
@@ -162,6 +164,10 @@ class BaseLoader(ABC):
             ' boulevard': ' blvd',
             ' court': ' ct',
             ' place': ' pl',
+            ' terrace': ' ter',
+            ' trail': ' trl',
+            ' highway': ' hwy',
+            ' parkway': ' pkwy',
             ' way': ' wy',
             'florida': 'fl',
             ' north ': ' n ',
@@ -187,19 +193,7 @@ class BaseLoader(ABC):
         
         # Split by comma and take first part (street only)
         addr = addr.split(',')[0].strip()
-        
-        # Remove common city names that might be embedded at the end
-        cities = ['tampa', 'riverview', 'valrico', 'gibsonton', 'lithia',
-                  'brandon', 'seffner', 'plant city', 'sun city center',
-                  'thonotosassa', 'odessa', 'lutz', 'wesley chapel',
-                  'ruskin', 'wimauma', 'apollo beach', 'dover', 'balm',
-                  'sydney', 'mango', 'citrus park', 'new tampa']
-        
-        for city in cities:
-            # Remove city name if it appears at the end
-            if addr.endswith(' ' + city):
-                addr = addr[:-len(city)].strip()
-        
+
         # Remove unit/apt/lot/building indicators with numeric or letter designators
         # Must run BEFORE trailing-digit strip so "Unit 109" is removed as a unit
         # designator (not as a zip code). Handles: "Apt 4", "Unit B", "Ste 101",
@@ -211,10 +205,23 @@ class BaseLoader(ABC):
         # Remove trailing state/zip patterns
         addr = addr.split(' fl ')[0].strip()
 
-        # Remove numeric-only zip codes at the end
+        # Remove numeric-only zip codes at the end — must run BEFORE city removal so
+        # that "5017 LOWELL RD TAMPA 33624" strips the zip first, leaving "5017 LOWELL RD TAMPA",
+        # then city removal correctly strips the trailing city name.
         parts = addr.split()
         if parts and parts[-1].replace('-', '').isdigit():
             addr = ' '.join(parts[:-1])
+
+        # Remove common city names that might be embedded at the end
+        cities = ['tampa', 'riverview', 'valrico', 'gibsonton', 'lithia',
+                  'brandon', 'seffner', 'plant city', 'sun city center',
+                  'thonotosassa', 'odessa', 'lutz', 'wesley chapel',
+                  'ruskin', 'wimauma', 'apollo beach', 'dover', 'balm',
+                  'sydney', 'mango', 'citrus park', 'new tampa']
+
+        for city in cities:
+            if addr.endswith(' ' + city):
+                addr = addr[:-len(city)].strip()
 
         return addr.strip()
     

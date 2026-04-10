@@ -66,6 +66,9 @@ class ForeclosureLoader(BaseLoader):
 
                     judgment_amount_val = self.parse_amount(row.get('Judgment Amount'))
 
+                    case_status_raw = row.get('Auction Status')
+                    case_status_val = str(case_status_raw).strip() if pd.notna(case_status_raw) else None
+
                     # ── Upsert logic ──────────────────────────────────────────
                     # Case 1: exact case_number already exists → skip (true dup)
                     existing_exact = (
@@ -83,6 +86,8 @@ class ForeclosureLoader(BaseLoader):
                             existing_exact.auction_date = auction_date_val
                         if judgment_amount_val and existing_exact.judgment_amount is None:
                             existing_exact.judgment_amount = judgment_amount_val
+                        if case_status_val:
+                            existing_exact.case_status = case_status_val
                         self.session.flush()
                         matched += 1
                         continue
@@ -104,6 +109,7 @@ class ForeclosureLoader(BaseLoader):
                                 existing_lp.case_number = case_number
                                 existing_lp.auction_date = auction_date_val
                                 existing_lp.judgment_amount = judgment_amount_val
+                                existing_lp.case_status = case_status_val
                                 # Only set plaintiff if not already captured from LP record
                                 if plaintiff_val and existing_lp.plaintiff is None:
                                     existing_lp.plaintiff = plaintiff_val
@@ -129,6 +135,7 @@ class ForeclosureLoader(BaseLoader):
                         lis_pendens_date=None,  # Will be filled by LisPendensLoader
                         judgment_amount=judgment_amount_val,
                         auction_date=auction_date_val,
+                        case_status=case_status_val,
                         county_id=self.county_id,
                     )
 

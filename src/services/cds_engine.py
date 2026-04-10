@@ -44,7 +44,7 @@ BuildingPermit  → building_permits
 import logging
 import sys
 from collections import Counter
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timedelta, timezone
 from typing import Dict, List, Optional
 
 from src.services.ghl_webhook import push_lead_to_ghl
@@ -92,6 +92,7 @@ from config.scoring import (
     RECENCY_BONUSES,
     ROUTING_THRESHOLDS,
     SCORE_CAP,
+    SIGNAL_HARD_CUTOFF_DAYS,
     STACKING_BONUS_CAP,
     STACKING_BONUS_PER_SIGNAL,
     STACKING_ONLY_SIGNALS,
@@ -184,8 +185,12 @@ class MultiVerticalScorer:
         """
         signals: List[Dict] = []
 
-        # 1. Code violations — pass fine_amount and opened_date for modifier calculations
+        # 1. Code violations — skip resolved/closed violations (no longer active distress).
+        #    Resolved status values are defined in PERSISTENCE_RESOLVED_KEYWORDS.
+        #    Violations with no status are kept (unknown = assume active).
         for v in (prop.code_violations or []):
+            if v.status and any(kw in v.status.lower() for kw in PERSISTENCE_RESOLVED_KEYWORDS):
+                continue
             signals.append({
                 "type":        "code_violations",
                 "date":        v.opened_date,
@@ -207,8 +212,10 @@ class MultiVerticalScorer:
                     continue
             signals.append({"type": sig_type, "date": lien.filing_date, "amount": lien.amount})
 
-        # 3. Deed transfers
+        # 3. Deed transfers — skip nominal/intra-family transfers (< $1,000)
         for deed in (prop.deeds or []):
+            if deed.sale_price is not None and deed.sale_price < 1000:
+                continue
             signals.append({"type": "deed_transfers", "date": deed.record_date, "amount": deed.sale_price})
 
         # 4. Legal proceedings (probate / eviction / bankruptcy)
@@ -216,19 +223,34 @@ class MultiVerticalScorer:
             sig_type = _PROCEEDING_TYPE_TO_SIGNAL.get(proc.record_type)
             if not sig_type:
                 continue
+            # Skip "Wills on Deposit" — not an active estate proceeding
+            if sig_type == "probate" and proc.case_status and "wills on deposit" in proc.case_status.lower():
+                continue
             signals.append({"type": sig_type, "date": proc.filing_date, "amount": proc.amount})
 
-        # 5. Tax delinquencies — use deed_app_date if available, fall back to date_added
+        # 5. Tax delinquencies — skip null rows (scraper placeholder with no real data)
         for tax in (prop.tax_delinquencies or []):
+            if tax.total_amount_due is None and tax.years_delinquent is None:
+                continue
             sig_date = tax.deed_app_date or tax.date_added
             signals.append({"type": "tax_delinquencies", "date": sig_date, "amount": tax.total_amount_due})
 
-        # 6. Foreclosures
+        # 6. Foreclosures — use lis_pendens_date as fallback when filing_date is absent
+        #    (LP-only rows created by lis_pendens loader have filing_date=None)
         for fc in (prop.foreclosures or []):
-            signals.append({"type": "foreclosures", "date": fc.filing_date, "amount": fc.judgment_amount})
+            sig_date = fc.filing_date or fc.lis_pendens_date
+            signals.append({"type": "foreclosures", "date": sig_date, "amount": fc.judgment_amount})
 
-        # 7. Building permits — enforcement permits get their own higher-weighted signal type
+        # 7. Building permits — enforcement permits get their own higher-weighted signal type.
+        #    Skip non-enforcement permits whose work is already complete (no ongoing distress).
+        _CLOSED_PERMIT_STATUSES = {"issued", "final", "finaled", "closed", "completed"}
         for bp in (prop.building_permits or []):
+            if (
+                not bp.is_enforcement_permit
+                and bp.status
+                and bp.status.strip().lower() in _CLOSED_PERMIT_STATUSES
+            ):
+                continue
             sig_type = "enforcement_permit" if bp.is_enforcement_permit else "building_permits"
             signals.append({"type": sig_type, "date": bp.issue_date, "amount": None})
 
@@ -237,6 +259,16 @@ class MultiVerticalScorer:
         for inc in (prop.incidents or []):
             if inc.incident_type in _INCIDENT_SIGNAL_TYPES:
                 signals.append({"type": inc.incident_type, "date": inc.incident_date, "amount": None})
+
+        # Hard expiry: drop signals whose date is known and older than SIGNAL_HARD_CUTOFF_DAYS.
+        # Signals without a date are kept — we cannot determine their age.
+        # This prevents resolved/abandoned records from keeping a property in Gold+ indefinitely.
+        _cutoff = date.today() - timedelta(days=SIGNAL_HARD_CUTOFF_DAYS)
+        signals = [
+            s for s in signals
+            if s["date"] is None
+            or (s["date"].date() if isinstance(s["date"], datetime) else s["date"]) >= _cutoff
+        ]
 
         return signals
 

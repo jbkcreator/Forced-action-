@@ -133,8 +133,8 @@ def health_check_detailed(db: Session = Depends(get_db)):
     try:
         db.execute(select(1))
         checks["database"] = {"status": "ok"}
-    except Exception as e:
-        checks["database"] = {"status": "error", "detail": str(e)}
+    except Exception:
+        checks["database"] = {"status": "error"}
         # DB down is always critical — return 503 immediately
         return JSONResponse(
             status_code=503,
@@ -158,11 +158,11 @@ def health_check_detailed(db: Session = Depends(get_db)):
         except stripe.error.AuthenticationError:
             checks["stripe"] = {"status": "error", "detail": "invalid_api_key"}
             overall = "degraded"
-        except stripe.error.StripeError as e:
-            checks["stripe"] = {"status": "error", "detail": str(e)}
+        except stripe.error.StripeError:
+            checks["stripe"] = {"status": "error", "detail": "stripe_api_error"}
             overall = "degraded"
-        except Exception as e:
-            checks["stripe"] = {"status": "error", "detail": str(e)}
+        except Exception:
+            checks["stripe"] = {"status": "error", "detail": "unreachable"}
             overall = "degraded"
 
     # ── 3. GoHighLevel API ─────────────────────────────────────────────────
@@ -192,8 +192,8 @@ def health_check_detailed(db: Session = Depends(get_db)):
         except _requests.exceptions.Timeout:
             checks["ghl"] = {"status": "error", "detail": "timeout"}
             overall = "degraded"
-        except Exception as e:
-            checks["ghl"] = {"status": "error", "detail": str(e)}
+        except Exception:
+            checks["ghl"] = {"status": "error", "detail": "unreachable"}
             overall = "degraded"
 
     # ── 4. SMTP / Email ────────────────────────────────────────────────────
@@ -234,8 +234,8 @@ def health_check_detailed(db: Session = Depends(get_db)):
                     "hours_ago": round(hours_ago, 1),
                     "idi_configured": bool(settings.idi_api_key),
                 }
-        except Exception as e:
-            checks["enrichment"] = {"status": "error", "detail": str(e)}
+        except Exception:
+            checks["enrichment"] = {"status": "error"}
             overall = "degraded"
 
     # ── 6. Scraper pipeline ────────────────────────────────────────────────
@@ -276,14 +276,34 @@ def health_check_detailed(db: Session = Depends(get_db)):
             scraper_status = "failures"
             overall = "degraded"
             scraper_detail["failed"] = [
-                {"source": r.source_type, "date": r.run_date.isoformat(), "error": r.error_message}
+                {"source": r.source_type, "date": r.run_date.isoformat()}
                 for r in failed_scrapers
             ]
 
+        # Zero-row check — scraper ran and succeeded but returned nothing (silent data gap)
+        zero_row_scrapers = db.execute(
+            select(ScraperRunStats.source_type, ScraperRunStats.run_date)
+            .where(
+                ScraperRunStats.run_success == True,       # noqa: E712
+                ScraperRunStats.total_scraped == 0,
+                ScraperRunStats.run_date >= cutoff,
+            )
+            .order_by(ScraperRunStats.run_date.desc())
+        ).all()
+
+        if zero_row_scrapers:
+            scraper_detail["zero_rows"] = [
+                {"source": r.source_type, "date": r.run_date.isoformat()}
+                for r in zero_row_scrapers
+            ]
+            if scraper_status == "ok":
+                scraper_status = "zero_rows"
+            overall = "degraded"
+
         checks["scrapers"] = {"status": scraper_status, **scraper_detail}
 
-    except Exception as e:
-        checks["scrapers"] = {"status": "error", "detail": str(e)}
+    except Exception:
+        checks["scrapers"] = {"status": "error"}
         overall = "degraded"
 
     # ── 7. Scoring pipeline ────────────────────────────────────────────────
@@ -300,7 +320,9 @@ def health_check_detailed(db: Session = Depends(get_db)):
         if last_scored is None:
             checks["scoring"] = {"status": "ok", "last_scored": None, "detail": "no_scores_yet"}
         else:
-            days_ago = (date.today() - last_scored).days
+            # score_date may be datetime or date depending on DB driver — normalise to date
+            last_scored_date = last_scored.date() if isinstance(last_scored, datetime) else last_scored
+            days_ago = (date.today() - last_scored_date).days
             # Allow 3 days on Sat/Sun/Mon — scoring only runs weekdays
             _off_cycle = date.today().weekday() in (0, 5, 6)
             stale_days = 3 if _off_cycle else 1
@@ -309,12 +331,12 @@ def health_check_detailed(db: Session = Depends(get_db)):
                 overall = "degraded"
             checks["scoring"] = {
                 "status": scoring_status,
-                "last_scored": last_scored.isoformat(),
+                "last_scored": last_scored_date.isoformat(),
                 "days_ago": days_ago,
                 "scored_today": scored_count,
             }
-    except Exception as e:
-        checks["scoring"] = {"status": "error", "detail": str(e)}
+    except Exception:
+        checks["scoring"] = {"status": "error"}
         overall = "degraded"
 
     # ── 8. Config completeness ─────────────────────────────────────────────

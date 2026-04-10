@@ -221,10 +221,15 @@ def run_skip_trace(
             session.query(Owner, Property)
             .join(Property, Owner.property_id == Property.id)
             .join(ds_current, ds_current.c.property_id == Property.id)
+            .join(
+                ds_latest,
+                ds_latest.c.property_id == Property.id,
+            )
             .filter(Owner.phone_1.is_(None))
             .filter(Owner.email_1.is_(None))
             .filter(Owner.skip_trace_success.is_not(True))
             .filter(Owner.county_id == county_id)
+            .order_by(ds_latest.c.max_date.desc())   # freshest leads first
             .limit(limit)
             .all()
         )

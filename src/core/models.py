@@ -499,6 +499,7 @@ class Foreclosure(Base):
     lis_pendens_date: Mapped[Optional[datetime]] = mapped_column(Date)
     judgment_amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
     auction_date: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    case_status: Mapped[Optional[str]] = mapped_column(String(100))
 
     # Load tracking & multi-county
     date_added: Mapped[Optional[date]] = mapped_column(Date, default=date.today, index=True)
@@ -512,6 +513,7 @@ class Foreclosure(Base):
         Index("idx_foreclosure_filing_date", "filing_date"),
         Index("idx_foreclosure_auction_date", "auction_date"),
         Index("idx_foreclosure_plaintiff", "plaintiff"),
+        Index("idx_foreclosure_case_status", "case_status"),
     )
 
     def __repr__(self):

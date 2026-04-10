@@ -17,13 +17,14 @@ import logging
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import select, desc, and_
+from sqlalchemy import select, desc, and_, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from src.core.database import get_db_context
 from src.core.models import (
-    DistressScore, Owner, Property, ScraperRunStats, SentLead, Subscriber, ZipTerritory,
+    BuildingPermit, Deed, DistressScore, Owner, Property, ScraperRunStats, SentLead,
+    Subscriber, ZipTerritory,
 )
 from src.services.email import send_alert, send_email
 from src.utils.logger import setup_logging
@@ -42,8 +43,39 @@ TIER_LEAD_LIMIT = {
 }
 DEFAULT_LEAD_LIMIT = 10
 
-SENT_LEAD_DEDUP_DAYS = 7   # suppress re-sending same property within this window
-LEAD_FRESHNESS_DAYS  = 14  # only include leads scored within this many days
+LEAD_FRESHNESS_DAYS = 14  # only include leads scored within this many days
+
+
+def _stale_sent_property_ids(db: Session, subscriber_id: int) -> list[int]:
+    """
+    Return property IDs that were sent to this subscriber AND have no new distress
+    signals loaded since the send date.  These are excluded from the next email.
+
+    A property becomes eligible again only when a new signal record is added to any
+    source table (building_permits, code_violations, legal_and_liens, foreclosures,
+    legal_proceedings, tax_delinquencies, incidents, deeds) after the last send_at.
+    This ensures subscribers only see leads where something materially changed —
+    never the same stale lead repeated week after week.
+    """
+    rows = db.execute(
+        text("""
+            SELECT sl.property_id
+            FROM sent_leads sl
+            WHERE sl.subscriber_id = :sub_id
+              AND NOT (
+                  EXISTS (SELECT 1 FROM building_permits    WHERE property_id = sl.property_id AND date_added > sl.sent_at)
+                  OR EXISTS (SELECT 1 FROM code_violations  WHERE property_id = sl.property_id AND date_added > sl.sent_at)
+                  OR EXISTS (SELECT 1 FROM legal_and_liens  WHERE property_id = sl.property_id AND date_added > sl.sent_at)
+                  OR EXISTS (SELECT 1 FROM foreclosures     WHERE property_id = sl.property_id AND date_added > sl.sent_at)
+                  OR EXISTS (SELECT 1 FROM legal_proceedings WHERE property_id = sl.property_id AND date_added > sl.sent_at)
+                  OR EXISTS (SELECT 1 FROM tax_delinquencies WHERE property_id = sl.property_id AND date_added > sl.sent_at)
+                  OR EXISTS (SELECT 1 FROM incidents        WHERE property_id = sl.property_id AND date_added > sl.sent_at)
+                  OR EXISTS (SELECT 1 FROM deeds            WHERE property_id = sl.property_id AND date_added > sl.sent_at)
+              )
+        """),
+        {"sub_id": subscriber_id},
+    ).scalars().all()
+    return list(rows)
 
 # Human-readable distress signal labels
 _SIGNAL_LABELS = {
@@ -108,13 +140,10 @@ def query_top_leads(
         logger.error("Unknown vertical '%s' on subscriber %s", vertical, subscriber.id)
         return []
 
-    # Dedup: exclude properties already sent to this subscriber within the window
-    cutoff_dedup = datetime.now(timezone.utc) - timedelta(days=SENT_LEAD_DEDUP_DAYS)
-    recently_sent_subq = (
-        select(SentLead.property_id)
-        .where(SentLead.subscriber_id == subscriber.id, SentLead.sent_at >= cutoff_dedup)
-        .scalar_subquery()
-    )
+    # Dedup: exclude properties already sent to this subscriber where no new signal
+    # has been added since the send.  Properties with new signals are eligible again —
+    # something materially changed for the owner since we last told the subscriber.
+    stale_sent_ids = _stale_sent_property_ids(db, subscriber.id)
 
     # Freshness: only include leads scored within LEAD_FRESHNESS_DAYS
     cutoff_freshness = datetime.now(timezone.utc) - timedelta(days=LEAD_FRESHNESS_DAYS)
@@ -129,8 +158,29 @@ def query_top_leads(
         DistressScore.qualified == True,
         score_col > 0,
         DistressScore.score_date >= cutoff_freshness,
-        ~Property.id.in_(recently_sent_subq),
     ]
+    if stale_sent_ids:
+        filters.append(~Property.id.in_(stale_sent_ids))
+
+    # Dead lead filter: skip properties sold in the last 60 days.
+    # A recent deed transfer means the property changed hands — the new owner
+    # is not a motivated seller and outreach is wasted.
+    dead_sale_cutoff = date.today() - timedelta(days=60)
+    recent_sold_subq = select(Deed.property_id).where(
+        Deed.record_date >= dead_sale_cutoff
+    ).scalar_subquery()
+    filters.append(~Property.id.in_(recent_sold_subq))
+
+    # Owner-occupied suppression for wholesalers: in-county individuals are
+    # almost certainly homeowners living in the property — not absentee/investor
+    # targets. LLCs, Trusts, and out-of-county owners are kept regardless.
+    if vertical == "wholesalers":
+        filters.append(
+            ~and_(
+                Owner.absentee_status == "In-County",
+                Owner.owner_type == "Individual",
+            )
+        )
 
     # Production only: exclude leads with no owner phone number
     if not _settings.debug:
@@ -164,11 +214,46 @@ def query_top_leads(
             "lead_tier":      score.lead_tier or "Gold",
             "urgency":        score.urgency_level or "",
             "signals":        signal_labels,
+            "distress_types": signals,
             "owner_name":     owner.owner_name if owner else None,
+            "owner_type":     owner.owner_type if owner else None,
             "phone":          (owner.phone_1 or owner.phone_2 or owner.phone_3) if owner else None,
             "email":          (owner.email_1 or owner.email_2) if owner else None,
-            "absentee":       (owner.absentee_status == "absentee") if owner else False,
+            "absentee":       (owner.absentee_status in ("Out-of-County", "Out-of-State")) if owner else False,
+            "permit_status":  None,
+            "permit_type_str": None,
         })
+
+    # Bulk-fetch permit details for any lead whose signals include a permit signal.
+    # Shows subscribers the actual permit type/status so they can qualify the lead.
+    permit_prop_ids = [
+        l["property_id"] for l in leads
+        if any(s in ("building_permits", "enforcement_permit") for s in l["distress_types"])
+    ]
+    if permit_prop_ids:
+        permit_rows = db.execute(
+            select(
+                BuildingPermit.property_id,
+                BuildingPermit.status,
+                BuildingPermit.permit_type,
+                BuildingPermit.is_enforcement_permit,
+            )
+            .where(BuildingPermit.property_id.in_(permit_prop_ids))
+            .order_by(
+                BuildingPermit.property_id,
+                BuildingPermit.is_enforcement_permit.desc(),  # enforcement first
+                BuildingPermit.issue_date.desc(),
+            )
+        ).all()
+        # Keep only the most relevant permit per property (first = enforcement or most recent)
+        permit_map: dict[int, tuple[str | None, str | None]] = {}
+        for pid, status, ptype, _ in permit_rows:
+            if pid not in permit_map:
+                permit_map[pid] = (status, ptype)
+
+        for lead in leads:
+            if lead["property_id"] in permit_map:
+                lead["permit_status"], lead["permit_type_str"] = permit_map[lead["property_id"]]
 
     return leads
 
@@ -184,6 +269,22 @@ def _tier_badge_html(tier: str) -> str:
         f'background:{s["bg"]};border:1px solid {s["border"]};'
         f'color:{s["color"]};font-size:11px;font-weight:700;'
         f'letter-spacing:0.5px;text-transform:uppercase;">{tier}</span>'
+    )
+
+
+def _permit_detail_html(lead: dict) -> str:
+    """Return a small inline permit detail line if this lead has permit signal data."""
+    pstatus = lead.get("permit_status")
+    ptype   = lead.get("permit_type_str")
+    if not pstatus and not ptype:
+        return ""
+    parts = []
+    if ptype:
+        parts.append(ptype)
+    if pstatus:
+        parts.append(f"Status: {pstatus}")
+    return (
+        f'<br/><span style="font-size:11px;color:#64748b;">Permit: {" · ".join(parts)}</span>'
     )
 
 
@@ -203,7 +304,12 @@ def _lead_card_html(lead: dict, n: int) -> str:
             ' <span style="color:#f87171;font-size:11px;">(absentee)</span>'
             if lead["absentee"] else ""
         )
-        owner_line += f'<p style="margin:0 0 4px;font-size:13px;color:#e2e8f0;">{lead["owner_name"]}{absentee_tag}</p>'
+        owner_type = lead.get("owner_type") or ""
+        owner_type_tag = (
+            f' <span style="color:#7dd3fc;font-size:11px;">({owner_type})</span>'
+            if owner_type and owner_type != "Individual" else ""
+        )
+        owner_line += f'<p style="margin:0 0 4px;font-size:13px;color:#e2e8f0;">{lead["owner_name"]}{absentee_tag}{owner_type_tag}</p>'
     if lead["phone"]:
         owner_line += f'<p style="margin:0 0 4px;font-size:13px;color:#94a3b8;">{lead["phone"]}</p>'
     if lead["email"]:
@@ -250,6 +356,7 @@ def _lead_card_html(lead: dict, n: int) -> str:
                     padding:6px 10px;background:rgba(255,255,255,0.04);
                     border-radius:6px;border-left:3px solid #fbbf24;">
             {signals}
+            {_permit_detail_html(lead)}
           </p>
 
           <!-- Row 5: owner contact -->
@@ -492,7 +599,8 @@ def _check_scraper_health(db: Session) -> bool:
 def _upsert_sent_leads(db: Session, subscriber_id: int, property_ids: list[int]) -> None:
     """
     Bulk-upsert SentLead rows for a just-delivered email.
-    ON CONFLICT DO UPDATE refreshes sent_at so the 7-day window slides forward on resend.
+    ON CONFLICT DO UPDATE refreshes sent_at to now, so _stale_sent_property_ids will
+    look for signals added AFTER this send — not after the original first send.
     """
     if not property_ids:
         return

@@ -242,26 +242,44 @@ def _build_signal_freshness(session, county_id: str) -> dict:
     return freshness
 
 
+def _current_gold_plus_inventory(session, run_date: date, county_id: str):
+    """
+    Return the most-recent DistressScore row per property as of run_date,
+    restricted to Gold+ tiers.  Each row: (property_id, lead_tier, vertical_scores, score_day).
+
+    DISTINCT ON picks the latest score regardless of tier; the outer WHERE then
+    keeps only properties that are currently Gold+.  This correctly handles
+    properties that were once Gold+ but have since dropped below — they are
+    excluded because their most-recent score is no longer Gold+.
+    """
+    return session.execute(
+        text("""
+            SELECT property_id, lead_tier, vertical_scores, date(score_date) AS score_day
+            FROM (
+                SELECT DISTINCT ON (property_id)
+                    property_id, lead_tier, vertical_scores, score_date
+                FROM distress_scores
+                WHERE county_id = :county_id
+                  AND date(score_date) <= :run_date
+                ORDER BY property_id, score_date DESC
+            ) latest
+            WHERE lead_tier = ANY(:tiers)
+        """),
+        {"county_id": county_id, "run_date": run_date, "tiers": list(GOLD_PLUS_TIERS)},
+    ).fetchall()
+
+
 def _build_vertical_breakdown(session, run_date: date, county_id: str) -> dict:
     """
-    For today's Gold+ leads, determine primary vertical per lead
-    (highest vertical_score wins) and report all 6 verticals individually.
+    Current Gold+ leads by primary vertical (highest vertical_score wins).
+    Uses the full Gold+ inventory as of run_date, not just today's scored batch.
     """
-    rows = (
-        session.query(DistressScore)
-        .filter(
-            func.date(DistressScore.score_date) == run_date,
-            DistressScore.lead_tier.in_(GOLD_PLUS_TIERS),
-            DistressScore.county_id == county_id,
-        )
-        .all()
-    )
+    rows = _current_gold_plus_inventory(session, run_date, county_id)
 
     vertical_counts = defaultdict(int)
     unclassified = 0
 
-    for r in rows:
-        vs = r.vertical_scores or {}
+    for _pid, _tier, vs, _score_day in rows:
         if not vs:
             unclassified += 1
             continue
@@ -288,38 +306,55 @@ def _build_vertical_tier_crosstab(session, run_date: date, county_id: str) -> di
     """
     Gold+ by vertical × tier with new-today count.
     Returns {vertical_label: {tier: {count, new_today}}}.
-    new_today = Gold+ today that were NOT Gold+ yesterday.
+
+    Total    = all properties whose most-recent score as of run_date is Gold+.
+    New today = subset that entered Gold+ on run_date: their score was written
+                today AND their previous score (before run_date) was below Gold+
+                (or they have no prior score at all).
+
+    This fixes the previous artifact where filtering by date(score_date) = today
+    only captured the day's scored batch — which on normal days is a tiny slice
+    of the full inventory, making ~99% of leads appear "new".
     """
-    yesterday = run_date - timedelta(days=1)
+    # ── Full current Gold+ inventory as of run_date ───────────────────────────
+    rows = _current_gold_plus_inventory(session, run_date, county_id)
 
-    def _fetch(d):
-        rows = (
-            session.query(DistressScore)
-            .filter(
-                func.date(DistressScore.score_date) == d,
-                DistressScore.lead_tier.in_(GOLD_PLUS_TIERS),
-                DistressScore.county_id == county_id,
-            )
-            .all()
-        )
-        result = {}
-        for r in rows:
-            vs = r.vertical_scores or {}
-            if not vs:
-                continue
-            best = max(vs, key=lambda k: vs.get(k, 0))
-            if best in VERTICAL_DISPLAY:
-                result[r.property_id] = (best, r.lead_tier)
-        return result
+    current_map: dict = {}
+    for pid, tier, vs, score_day in rows:
+        if not vs:
+            continue
+        best = max(vs, key=lambda k: vs.get(k, 0))
+        if best in VERTICAL_DISPLAY:
+            if isinstance(score_day, str):
+                score_day = date.fromisoformat(score_day)
+            current_map[pid] = (best, tier, score_day)
 
-    today_map = _fetch(run_date)
-    yesterday_ids = set(_fetch(yesterday).keys())
+    # ── Properties whose latest score was written today ───────────────────────
+    # These are the only candidates for "new today" — a stable Gold+ property
+    # that hasn't been rescored today cannot have entered Gold+ today.
+    entered_today = {pid for pid, (_, _, sd) in current_map.items() if sd == run_date}
 
-    # Aggregate: {vertical: {tier: {count, new_today}}}
+    # Among those, exclude any that were already Gold+ before run_date.
+    prior_gold_plus_ids: set = set()
+    if entered_today:
+        prior_rows = session.execute(
+            text("""
+                SELECT DISTINCT ON (property_id) property_id, lead_tier
+                FROM distress_scores
+                WHERE property_id = ANY(:pids)
+                  AND date(score_date) < :run_date
+                  AND county_id = :county_id
+                ORDER BY property_id, score_date DESC
+            """),
+            {"pids": list(entered_today), "run_date": run_date, "county_id": county_id},
+        ).fetchall()
+        prior_gold_plus_ids = {row[0] for row in prior_rows if row[1] in GOLD_PLUS_TIERS}
+
+    # ── Aggregate: {vertical: {tier: {count, new_today}}} ────────────────────
     agg = defaultdict(lambda: defaultdict(lambda: {"count": 0, "new_today": 0}))
-    for pid, (vertical, tier) in today_map.items():
+    for pid, (vertical, tier, score_day) in current_map.items():
         agg[vertical][tier]["count"] += 1
-        if pid not in yesterday_ids:
+        if pid in entered_today and pid not in prior_gold_plus_ids:
             agg[vertical][tier]["new_today"] += 1
 
     result = {}
@@ -332,25 +367,27 @@ def _build_vertical_tier_crosstab(session, run_date: date, county_id: str) -> di
 
 def _build_zip_breakdown(session, run_date: date, county_id: str, top_n: int = 20) -> list:
     """
-    Top ZIPs by Gold+ lead count today.
-    Returns list of {zip, ultra_platinum, platinum, gold, total}.
+    Top ZIPs by current Gold+ lead count as of run_date.
+    Uses the full Gold+ inventory, not just today's scored batch.
     """
-    rows = (
-        session.query(
-            Property.zip,
-            DistressScore.lead_tier,
-            func.count().label("cnt"),
-        )
-        .join(Property, Property.id == DistressScore.property_id)
-        .filter(
-            func.date(DistressScore.score_date) == run_date,
-            DistressScore.lead_tier.in_(GOLD_PLUS_TIERS),
-            DistressScore.county_id == county_id,
-            Property.zip.isnot(None),
-        )
-        .group_by(Property.zip, DistressScore.lead_tier)
-        .all()
-    )
+    rows = session.execute(
+        text("""
+            SELECT p.zip, latest.lead_tier, COUNT(*) AS cnt
+            FROM (
+                SELECT DISTINCT ON (ds.property_id)
+                    ds.property_id, ds.lead_tier
+                FROM distress_scores ds
+                WHERE ds.county_id = :county_id
+                  AND date(ds.score_date) <= :run_date
+                ORDER BY ds.property_id, ds.score_date DESC
+            ) latest
+            JOIN properties p ON p.id = latest.property_id
+            WHERE latest.lead_tier = ANY(:tiers)
+              AND p.zip IS NOT NULL
+            GROUP BY p.zip, latest.lead_tier
+        """),
+        {"county_id": county_id, "run_date": run_date, "tiers": list(GOLD_PLUS_TIERS)},
+    ).fetchall()
 
     zip_data = defaultdict(lambda: {"Ultra Platinum": 0, "Platinum": 0, "Gold": 0})
     for zip_code, tier, cnt in rows:
@@ -369,6 +406,88 @@ def _build_zip_breakdown(session, run_date: date, county_id: str, top_n: int = 2
 
     result.sort(key=lambda x: x["total"], reverse=True)
     return result[:top_n]
+
+
+def _build_gold_delta(session, run_date: date, county_id: str) -> dict:
+    """
+    Compare today's Gold+ count to the 7-day average, broken down by vertical and ZIP.
+
+    Returns:
+        {
+          "by_vertical": {vertical_label: {"today": int, "avg_7d": float, "delta": float}},
+          "by_zip":      {zip: {"today": int, "avg_7d": float, "delta": float}},
+        }
+    """
+    since = run_date - timedelta(days=7)
+
+    # ── Pull last 7 days of Gold+ scores (excluding today) ───────────────────
+    hist_rows = (
+        session.query(
+            func.date(DistressScore.score_date).label("day"),
+            Property.zip,
+            DistressScore.vertical_scores,
+        )
+        .join(Property, Property.id == DistressScore.property_id)
+        .filter(
+            func.date(DistressScore.score_date) > since,
+            func.date(DistressScore.score_date) < run_date,
+            DistressScore.lead_tier.in_(GOLD_PLUS_TIERS),
+            DistressScore.county_id == county_id,
+        )
+        .all()
+    )
+
+    # ── Pull today's Gold+ scores ─────────────────────────────────────────────
+    today_rows = (
+        session.query(Property.zip, DistressScore.vertical_scores)
+        .join(Property, Property.id == DistressScore.property_id)
+        .filter(
+            func.date(DistressScore.score_date) == run_date,
+            DistressScore.lead_tier.in_(GOLD_PLUS_TIERS),
+            DistressScore.county_id == county_id,
+        )
+        .all()
+    )
+
+    # ── Aggregate ─────────────────────────────────────────────────────────────
+    # by_vertical: {vertical_key: {day: count}}
+    from collections import defaultdict
+    vert_hist  = defaultdict(lambda: defaultdict(int))
+    zip_hist   = defaultdict(lambda: defaultdict(int))
+
+    for day, zip_code, vs in hist_rows:
+        if vs:
+            best = max(vs, key=lambda k: vs.get(k, 0))
+            if best in VERTICAL_DISPLAY:
+                vert_hist[best][str(day)] += 1
+        if zip_code:
+            zip_hist[zip_code][str(day)] += 1
+
+    vert_today = defaultdict(int)
+    zip_today  = defaultdict(int)
+
+    for zip_code, vs in today_rows:
+        if vs:
+            best = max(vs, key=lambda k: vs.get(k, 0))
+            if best in VERTICAL_DISPLAY:
+                vert_today[best] += 1
+        if zip_code:
+            zip_today[zip_code] += 1
+
+    def _delta_row(today_val: int, hist: dict) -> dict:
+        days_with_data = len(hist)
+        avg = sum(hist.values()) / days_with_data if days_with_data else 0.0
+        return {"today": today_val, "avg_7d": round(avg, 1), "delta": round(today_val - avg, 1)}
+
+    by_vertical = {}
+    for key, label in VERTICAL_DISPLAY.items():
+        by_vertical[label] = _delta_row(vert_today[key], vert_hist[key])
+
+    # Only report ZIPs that appear in today or history
+    all_zips = set(zip_today.keys()) | set(zip_hist.keys())
+    by_zip = {z: _delta_row(zip_today[z], zip_hist[z]) for z in sorted(all_zips)}
+
+    return {"by_vertical": by_vertical, "by_zip": by_zip}
 
 
 def _build_signal_composition(session, run_date: date, county_id: str) -> dict:
@@ -431,6 +550,7 @@ def build_report(run_date: date, county_id: str) -> dict:
         vertical_tier_crosstab  = _build_vertical_tier_crosstab(session, run_date, county_id)
         zip_breakdown           = _build_zip_breakdown(session, run_date, county_id)
         signal_composition      = _build_signal_composition(session, run_date, county_id)
+        gold_delta              = _build_gold_delta(session, run_date, county_id)
 
     return {
         "run_date":              run_date,
@@ -446,6 +566,7 @@ def build_report(run_date: date, county_id: str) -> dict:
         "vertical_tier_crosstab": vertical_tier_crosstab,
         "zip_breakdown":         zip_breakdown,
         "signal_composition":    signal_composition,
+        "gold_delta":            gold_delta,
         "errors":                errors,
     }
 
@@ -537,6 +658,20 @@ def write_csv(report: dict, path: Path) -> None:
                 w.writerow([vertical_label, signal, cnt])
             if not signals:
                 w.writerow([vertical_label, "No data", ""])
+        w.writerow([])
+
+        # ── Section 8b: Gold+ Today vs 7-Day Average ─────────────────────
+        gd = report.get("gold_delta", {})
+        w.writerow(["GOLD+ TODAY vs 7-DAY AVERAGE"])
+        w.writerow(["Vertical", "Today", "7-Day Avg", "Delta"])
+        for label, d in gd.get("by_vertical", {}).items():
+            delta_str = f"+{d['delta']}" if d["delta"] >= 0 else str(d["delta"])
+            w.writerow([label, d["today"], d["avg_7d"], delta_str])
+        w.writerow([])
+        w.writerow(["ZIP", "Today", "7-Day Avg", "Delta"])
+        for zip_code, d in gd.get("by_zip", {}).items():
+            delta_str = f"+{d['delta']}" if d["delta"] >= 0 else str(d["delta"])
+            w.writerow([zip_code, d["today"], d["avg_7d"], delta_str])
         w.writerow([])
 
         # ── Section 9: Signal Freshness ───────────────────────────────────

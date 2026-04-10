@@ -81,7 +81,7 @@ VERTICAL_WEIGHTS = {
         "storm_damage": 10,      # Stacking only
         "flood_damage": 10,      # Stacking only
         "tampa_code_liens": 75,  # Adjusted [cite: 109]
-        "building_permits": 60,  # Adjusted [cite: 109]
+        "building_permits": 10,  # Stacking only — active permit = contractor on job, not a distress signal
         "enforcement_permit": 75,  # Stop work/after-the-fact/failed/expired/revoked
         "evictions": 65,
         "hoa_liens": 50,
@@ -96,8 +96,8 @@ VERTICAL_WEIGHTS = {
         "county_code_liens": 15,
     },
     "roofing": {
-        "building_permits": 65,  # Lowered from 95 [cite: 109]
-        "enforcement_permit": 80,  # Stop work/after-the-fact/failed/expired/revoked — 2-3x routine
+        "building_permits": 10,  # Stacking only — active permit = contractor on job, not a lead signal
+        "enforcement_permit": 80,  # Stop work/after-the-fact/failed/expired/revoked — real distress
         "insurance_claim": 10,   # Stacking only
         "Fire": 10,              # Stacking only
         "storm_damage": 10,      # Stacking only
@@ -199,7 +199,7 @@ EQUITY_VERTICALS   = {"wholesalers", "fix_flip", "attorneys", "roofing", "restor
 
 STACKING_WINDOW_DAYS      = 180  # Approved 2026-03-25: expanded from 90 to capture wider stacking signal window
 STACKING_BONUS_PER_SIGNAL = 20
-STACKING_BONUS_CAP        = 40
+STACKING_BONUS_CAP        = 60
 
 # ── Stacking-only signals ─────────────────────────────────────────────────────
 # These signals cannot act as the PRIMARY scoring signal on their own.
@@ -210,6 +210,11 @@ STACKING_ONLY_SIGNALS = {
     "fire",
     "storm_damage",
     "flood_damage",
+    # building_permits (non-enforcement) = contractor on job or active work permit.
+    # Not a distress signal on its own — only adds value when stacked with a primary
+    # signal (lien, judgment, foreclosure, etc.). Enforcement permits remain a separate
+    # high-weight signal type and are NOT stacking-only.
+    "building_permits",
 }
 
 # ── Age decay ─────────────────────────────────────────────────────────────────
@@ -218,6 +223,7 @@ STACKING_ONLY_SIGNALS = {
 
 AGE_DECAY_1Y = -10   # 366–730 days old
 AGE_DECAY_2Y = -20   # >730 days old
+SIGNAL_HARD_CUTOFF_DAYS = 730  # Signals with a known date older than this are excluded from scoring entirely
 
 # ── Days-open modifier (code_violations only) ─────────────────────────────────
 # Measures how long a violation has been open with no resolution.
@@ -296,7 +302,7 @@ EQUITY_BONUS_BY_VERTICAL = {
 
 ROUTING_THRESHOLDS = {
     "immediate": 80,   # Real-time SMS within 15 minutes
-    "daily":     60,   # Daily morning briefing email
+    "daily":     57,   # Daily morning briefing email — aligned with Gold cutoff
     "weekly":    40,   # Weekly digest only
     # below weekly threshold → urgency_level = "Low", not routed
 }
@@ -307,7 +313,7 @@ ROUTING_THRESHOLDS = {
 LEAD_TIER_THRESHOLDS = [
     (90, "Ultra Platinum"),
     (80, "Platinum"),
-    (60, "Gold"),
+    (57, "Gold"),
     (40, "Silver"),
     (0,  "Bronze"),
 ]
