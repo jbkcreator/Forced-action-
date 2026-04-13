@@ -96,6 +96,8 @@ from config.scoring import (
     STACKING_BONUS_CAP,
     STACKING_BONUS_PER_SIGNAL,
     STACKING_ONLY_SIGNALS,
+    OWNER_OCCUPIED_EXCLUSION_VERTICALS,
+    DEAD_LEAD_DEED_DAYS,
     STACKING_WINDOW_DAYS,
     VERTICAL_WEIGHTS,
 )
@@ -269,6 +271,18 @@ class MultiVerticalScorer:
             if s["date"] is None
             or (s["date"].date() if isinstance(s["date"], datetime) else s["date"]) >= _cutoff
         ]
+
+        # Dead lead gate: if a recent arm's-length deed exists, this property just sold.
+        # Suppress all signals — distress context belongs to the old owner.
+        _deed_cutoff = date.today() - timedelta(days=DEAD_LEAD_DEED_DAYS)
+        _has_recent_deed = any(
+            s["type"] == "deed_transfers"
+            and s["date"] is not None
+            and (s["date"].date() if isinstance(s["date"], datetime) else s["date"]) >= _deed_cutoff
+            for s in signals
+        )
+        if _has_recent_deed:
+            return []
 
         return signals
 
@@ -629,6 +643,22 @@ class MultiVerticalScorer:
             vertical_scores["roofing"] = 0.0
             if "roofing" in vertical_results:
                 vertical_results["roofing"]["score"] = 0.0
+
+        # Owner-occupied suppression: zero out investment verticals if the owner
+        # lives at the property (mailing_address == property address).
+        # Contractor verticals (restoration, roofing, public_adjusters) are unaffected —
+        # homeowners are valid leads for contractors.
+        _owner_occupied = (
+            owner is not None
+            and owner.mailing_address is not None
+            and prop.address is not None
+            and owner.mailing_address.strip().lower() == prop.address.strip().lower()
+        )
+        if _owner_occupied:
+            for v in OWNER_OCCUPIED_EXCLUSION_VERTICALS:
+                vertical_scores[v] = 0.0
+                if v in vertical_results:
+                    vertical_results[v]["score"] = 0.0
 
         # HCPA passive signal bonuses — boost verticals that already have a primary signal.
         # These never act as primary signals; they only add weight when a vertical is already scored.

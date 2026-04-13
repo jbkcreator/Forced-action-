@@ -362,7 +362,7 @@ def health_check_detailed(db: Session = Depends(get_db)):
     }
 
     return JSONResponse(
-        status_code=200,  # 200 even for degraded; only DB-down returns 503
+        status_code=200 if overall == "ok" else 503,
         content={
             "status": overall,
             "checks": checks,

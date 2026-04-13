@@ -360,3 +360,19 @@ HCPA_PASSIVE_WEIGHTS = {
 HCPA_AGE_YEARS = 30
 # Year threshold for long_term_owner signal (years since last sale)
 HCPA_LONG_TERM_YEARS = 10
+
+# ── Owner-occupied suppression ────────────────────────────────────────────────
+# For investment verticals, an owner living at the property is not a motivated seller.
+# Zero out these verticals if mailing_address == property address.
+# Restoration/roofing/public_adjusters are intentionally excluded — homeowners
+# are valid leads for contractors (they need the work done, not to sell).
+OWNER_OCCUPIED_EXCLUSION_VERTICALS = frozenset({
+    "wholesalers",
+    "fix_flip",
+    "attorneys",
+})
+
+# ── Dead lead gate — recent deed transfer ─────────────────────────────────────
+# A property sold within this window is off-market. Distress signals belong to
+# the previous owner. Return no signals so the property scores 0 and exits routing.
+DEAD_LEAD_DEED_DAYS = 45
