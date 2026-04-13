@@ -39,6 +39,7 @@ def run_enrichment_pipeline(
     batchdata_limit: int = _DEFAULT_BATCHDATA_LIMIT,
     idi_limit: int = _DEFAULT_IDI_LIMIT,
     skip_idi: bool = False,
+    today_only: bool = True,
 ) -> dict:
     """
     Run the full enrichment pipeline for a county.
@@ -54,13 +55,14 @@ def run_enrichment_pipeline(
     }
 
     # ── Stage 1: BatchSkipTracing ──────────────────────────────────────────
-    logger.info("[Enrichment] Stage 1: BatchSkipTracing (limit=%d, county=%s)",
-                batchdata_limit, county_id)
+    logger.info("[Enrichment] Stage 1: BatchSkipTracing (limit=%d, county=%s, today_only=%s)",
+                batchdata_limit, county_id, today_only)
     try:
         from src.services.skip_trace import run_skip_trace
         bd_stats = run_skip_trace(
             limit=batchdata_limit,
             county_id=county_id,
+            today_only=today_only,
         )
         results["batchdata"] = bd_stats
         logger.info(
@@ -143,6 +145,8 @@ if __name__ == "__main__":
                         help="Max BatchData misses for IDI stage (default: 100)")
     parser.add_argument("--skip-idi", action="store_true",
                         help="Skip IDI fallback stage")
+    parser.add_argument("--all-leads", dest="all_leads", action="store_true",
+                        help="Skip-trace all un-traced Gold+ leads, not just today's (use with caution)")
     args = parser.parse_args()
 
     try:
@@ -151,6 +155,7 @@ if __name__ == "__main__":
             batchdata_limit=args.limit,
             idi_limit=args.idi_limit,
             skip_idi=args.skip_idi,
+            today_only=not args.all_leads,
         )
         print(f"  BatchData enriched : {stats['batchdata'].get('success', 0)}")
         print(f"  IDI enriched       : {stats['idi'].get('success', 0)}")

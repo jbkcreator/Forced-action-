@@ -20,7 +20,7 @@ Usage:
 
 import time
 import traceback
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Optional
 
 import requests
@@ -156,15 +156,18 @@ def run_skip_trace(
     vertical: Optional[str] = None,
     dry_run: bool = False,
     county_id: str = "hillsborough",
+    today_only: bool = False,
 ) -> dict:
     """
     Enrich owner contacts for high-priority leads with no contact info.
 
     Args:
-        limit: Max number of owners to process in this run.
+        limit:      Max number of owners to process in this run.
         tier_filter: Filter by lead tier (e.g. 'Gold', 'Platinum'). None = all tiers ≥ Gold.
-        dry_run: If True, build payloads and print but do NOT call API or write DB.
-        county_id: County to process.
+        dry_run:    If True, build payloads and print but do NOT call API or write DB.
+        county_id:  County to process.
+        today_only: If True, only process leads whose latest score was recorded today.
+                    Use this for daily cron runs to avoid spending credits on stale leads.
 
     Returns:
         Stats dict with total/success/failed/skipped counts.
@@ -207,6 +210,14 @@ def run_skip_trace(
             )
             .filter(DistressScore.lead_tier.in_(tier_values))
         )
+
+        # today_only: restrict to leads scored today — prevents spending credits on stale leads
+        if today_only:
+            from sqlalchemy import cast as sa_cast, Date as SADate
+            ds_q = ds_q.filter(
+                sa_cast(DistressScore.score_date, SADate) == date.today()
+            )
+            logger.info("today_only mode: restricting skip trace to leads scored on %s", date.today())
 
         # Optional vertical filter — only enrich owners scoring > 0 for this vertical
         if vertical:
@@ -405,6 +416,8 @@ if __name__ == "__main__":
     parser.add_argument("--dry-run", action="store_true",
                         help="Build payloads but do NOT call API or write to DB")
     parser.add_argument("--county-id", dest="county_id", default="hillsborough")
+    parser.add_argument("--today-only", dest="today_only", action="store_true",
+                        help="Only skip-trace leads scored today (safe for daily cron)")
     args = parser.parse_args()
 
     try:
@@ -414,6 +427,7 @@ if __name__ == "__main__":
             vertical=args.vertical,
             dry_run=args.dry_run,
             county_id=args.county_id,
+            today_only=args.today_only,
         )
         sys.exit(0)
     except Exception as e:
