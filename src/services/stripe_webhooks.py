@@ -29,6 +29,7 @@ from src.core.models import (
     Property,
     DistressScore,
     Subscriber,
+    StripeWebhookEvent,
     ZipTerritory,
 )
 from src.services.ghl_webhook import push_subscriber_to_ghl
@@ -72,9 +73,21 @@ def handle_webhook(raw_body: bytes, sig_header: str, db: Session) -> tuple[bool,
         raise ValueError("Invalid signature") from exc
 
     event_type = event["type"]
+    event_id   = event["id"]
     data = event["data"]["object"]
 
-    logger.info("Stripe webhook received: %s id=%s", event_type, event["id"])
+    logger.info("Stripe webhook received: %s id=%s", event_type, event_id)
+
+    # ── Idempotency guard ─────────────────────────────────────────────────────
+    # Insert the event_id before processing. If the unique constraint fires,
+    # this event was already handled — return immediately without side effects.
+    try:
+        db.add(StripeWebhookEvent(event_id=event_id, event_type=event_type))
+        db.flush()
+    except Exception:
+        db.rollback()
+        logger.info("Stripe event %s already processed — skipping", event_id)
+        return True, "Already processed"
 
     handlers = {
         "checkout.session.completed":    _on_checkout_completed,
@@ -467,6 +480,17 @@ def _on_payment_succeeded(invoice: dict, db: Session) -> None:
         logger.warning("invoice.payment_succeeded: no customer ID in payload")
         return
 
+    # Skip payment receipt on initial checkout — checkout.session.completed already
+    # sent the welcome email and first-leads email for that payment.
+    billing_reason = invoice.get("billing_reason")
+    if billing_reason == "subscription_create":
+        logger.info(
+            "invoice.payment_succeeded: skipping receipt email for subscription_create"
+            " (handled by checkout.session.completed) customer=%s",
+            stripe_customer_id,
+        )
+        # Still update billing_date below — just no email.
+
     subscriber = db.execute(
         select(Subscriber).where(Subscriber.stripe_customer_id == stripe_customer_id)
     ).scalar_one_or_none()
@@ -492,8 +516,8 @@ def _on_payment_succeeded(invoice: dict, db: Session) -> None:
         subscriber.id, subscriber.billing_date,
     )
 
-    # Send payment receipt email
-    if subscriber.email:
+    # Send payment receipt email only for renewals, not initial signup
+    if subscriber.email and billing_reason != "subscription_create":
         from src.services.email import send_email
         from config.settings import get_settings
         settings = get_settings()

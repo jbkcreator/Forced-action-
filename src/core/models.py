@@ -1098,3 +1098,30 @@ class LeadPackPurchase(Base):
             f"<LeadPackPurchase(id={self.id}, subscriber_id={self.subscriber_id}, "
             f"zip={self.zip_code}, status={self.status})>"
         )
+
+
+class StripeWebhookEvent(Base):
+    """
+    Idempotency guard for Stripe webhook events.
+
+    Before processing any event, the handler inserts a row here keyed on the
+    Stripe event ID.  The unique constraint on event_id means a second attempt
+    to insert the same event raises IntegrityError — which the handler catches
+    and treats as "already processed, skip".
+
+    This prevents duplicate email sends caused by:
+      - Multiple stripe listen processes forwarding the same event
+      - Stripe retrying an event after a transient error
+      - Multiple uvicorn workers receiving the same request concurrently
+    """
+    __tablename__ = "stripe_webhook_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    event_id: Mapped[str] = mapped_column(String(100), unique=True, nullable=False, index=True)
+    event_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    processed_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    def __repr__(self):
+        return f"<StripeWebhookEvent(event_id={self.event_id}, type={self.event_type})>"
