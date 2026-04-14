@@ -372,6 +372,62 @@ def _upsert_opportunity(contact_id: str, score_data: Dict) -> bool:
         return False
 
 
+def delete_contact(contact_id: str) -> bool:
+    """
+    Delete a GHL contact and its associated opportunities by contact ID.
+
+    Used during rescore cleanup to remove contacts that no longer qualify
+    under the updated scoring algorithm.
+
+    Returns True on success, False on any failure.
+    Raises nothing — all errors are logged internally.
+    """
+    if not _is_configured():
+        logger.debug("[GHL] Not configured — skipping contact deletion")
+        return False
+
+    # Delete opportunity first (GHL does not cascade-delete on contact removal)
+    try:
+        opp_id = _find_opportunity_for_contact(contact_id)
+        if opp_id:
+            opp_resp = _ghl_request(
+                "DELETE",
+                f"{_GHL_BASE}/opportunities/{opp_id}",
+                headers=_headers(),
+            )
+            if not opp_resp.ok:
+                logger.warning(
+                    "[GHL] Opportunity delete HTTP %d for contact %s: %s",
+                    opp_resp.status_code, contact_id, opp_resp.text[:200],
+                )
+    except Exception:
+        logger.warning(
+            "[GHL] Failed to delete opportunity for contact %s", contact_id, exc_info=True
+        )
+
+    # Delete the contact
+    try:
+        resp = _ghl_request(
+            "DELETE",
+            f"{_GHL_BASE}/contacts/{contact_id}",
+            headers=_headers(),
+        )
+        if resp.status_code in (200, 204):
+            logger.info("[GHL] Contact deleted: %s", contact_id)
+            return True
+        logger.warning(
+            "[GHL] Contact delete HTTP %d for %s: %s",
+            resp.status_code, contact_id, resp.text[:200],
+        )
+        return False
+    except RequestException as exc:
+        logger.warning("[GHL] Network error deleting contact %s: %s", contact_id, exc)
+        return False
+    except Exception:
+        logger.warning("[GHL] Unexpected error deleting contact %s", contact_id, exc_info=True)
+        return False
+
+
 def push_lead_to_ghl(score_data: Dict) -> Optional[str]:
     """
     Push a scored lead to GHL CRM.

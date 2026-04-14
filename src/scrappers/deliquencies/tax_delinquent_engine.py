@@ -49,7 +49,7 @@ from config.constants import (
 )
 from src.utils.county_config import get_county as _get_county
 from src.core.database import get_db_context
-from src.core.models import TaxDelinquency
+from src.core.models import TaxDelinquency, Property
 from src.utils.logger import setup_logging, get_logger
 from src.utils.prompt_loader import get_prompt, get_config
 from src.utils.csv_deduplicator import deduplicate_csv, get_unique_keys_for_type
@@ -138,12 +138,18 @@ def _get_existing_tax_records(tax_year: int) -> set:
 	
 	try:
 		with get_db_context() as session:
-			# Query for account numbers (folio with 'A' prefix)
-			results = session.query(TaxDelinquency.account_number).filter(
-				TaxDelinquency.tax_year == tax_year
-			).distinct().all()
-			
-			existing = {row[0] for row in results if row[0]}
+			# Join TaxDelinquency → Property to recover parcel_ids, then reconstruct
+			# account numbers (parcel_id with 'A' prefix) for O(1) dedup lookup.
+			# TaxDelinquency has no account_number column — the unique constraint is
+			# (property_id, tax_year); parcel_id lives on the Property row.
+			results = (
+				session.query(Property.parcel_id)
+				.join(TaxDelinquency, TaxDelinquency.property_id == Property.id)
+				.filter(TaxDelinquency.tax_year == tax_year)
+				.distinct()
+				.all()
+			)
+			existing = {'A' + row[0] for row in results if row[0]}
 			logger.info(f"Found {len(existing):,} existing tax records in database for {tax_year}")
 			return existing
 			

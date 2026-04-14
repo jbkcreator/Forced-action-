@@ -308,13 +308,9 @@ def _build_vertical_tier_crosstab(session, run_date: date, county_id: str) -> di
     Returns {vertical_label: {tier: {count, new_today}}}.
 
     Total    = all properties whose most-recent score as of run_date is Gold+.
-    New today = subset that entered Gold+ on run_date: their score was written
-                today AND their previous score (before run_date) was below Gold+
-                (or they have no prior score at all).
-
-    This fixes the previous artifact where filtering by date(score_date) = today
-    only captured the day's scored batch — which on normal days is a tiny slice
-    of the full inventory, making ~99% of leads appear "new".
+    New today = subset whose most recent score was written on run_date.
+                This matches the feed stats API definition of Gold+ leads
+                whose distress score was added that day.
     """
     # ── Full current Gold+ inventory as of run_date ───────────────────────────
     rows = _current_gold_plus_inventory(session, run_date, county_id)
@@ -330,31 +326,13 @@ def _build_vertical_tier_crosstab(session, run_date: date, county_id: str) -> di
             current_map[pid] = (best, tier, score_day)
 
     # ── Properties whose latest score was written today ───────────────────────
-    # These are the only candidates for "new today" — a stable Gold+ property
-    # that hasn't been rescored today cannot have entered Gold+ today.
     entered_today = {pid for pid, (_, _, sd) in current_map.items() if sd == run_date}
-
-    # Among those, exclude any that were already Gold+ before run_date.
-    prior_gold_plus_ids: set = set()
-    if entered_today:
-        prior_rows = session.execute(
-            text("""
-                SELECT DISTINCT ON (property_id) property_id, lead_tier
-                FROM distress_scores
-                WHERE property_id = ANY(:pids)
-                  AND date(score_date) < :run_date
-                  AND county_id = :county_id
-                ORDER BY property_id, score_date DESC
-            """),
-            {"pids": list(entered_today), "run_date": run_date, "county_id": county_id},
-        ).fetchall()
-        prior_gold_plus_ids = {row[0] for row in prior_rows if row[1] in GOLD_PLUS_TIERS}
 
     # ── Aggregate: {vertical: {tier: {count, new_today}}} ────────────────────
     agg = defaultdict(lambda: defaultdict(lambda: {"count": 0, "new_today": 0}))
     for pid, (vertical, tier, score_day) in current_map.items():
         agg[vertical][tier]["count"] += 1
-        if pid in entered_today and pid not in prior_gold_plus_ids:
+        if pid in entered_today:
             agg[vertical][tier]["new_today"] += 1
 
     result = {}

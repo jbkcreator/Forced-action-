@@ -1119,6 +1119,7 @@ class MultiVerticalScorer:
                 joinedload(Property.tax_delinquencies),
                 joinedload(Property.foreclosures),
                 joinedload(Property.building_permits),
+                joinedload(Property.incidents),
             )
             if property_ids:
                 q = q.filter(Property.id.in_(property_ids))
@@ -1163,28 +1164,34 @@ class MultiVerticalScorer:
         qualified_count = 0
         tier_counts: Counter = Counter()
 
-        for prop in properties:
+        # Prevent attribute expiry after intermediate batch commits so that the
+        # already-loaded Property objects remain accessible across commit boundaries.
+        self.session.expire_on_commit = False
+
+        _SCORE_BATCH_SIZE = 1000  # commit frequency — keeps session identity map small
+        _total = len(properties)
+
+        for i, prop in enumerate(properties):
             try:
                 score_data = self.score_property(prop)
                 scores.append(score_data)
 
                 if score_data["signal_count"] == 0 or score_data["final_cds_score"] == 0:
                     no_signal_count += 1
-                    continue
-
-                if save_to_db:
-                    _record, status, upgraded = self.save_score_to_database(score_data, scoring_run_id=scoring_run_id)
-                    if status == 'new':
-                        new_count += 1
-                    elif status == 'updated':
-                        updated_count += 1
-                    else:
-                        unchanged_count += 1
-                    if upgraded:
-                        upgraded_count += 1
-                    if score_data.get("qualified"):
-                        qualified_count += 1
-                    tier_counts[score_data["lead_tier"]] += 1
+                else:
+                    if save_to_db:
+                        _record, status, upgraded = self.save_score_to_database(score_data, scoring_run_id=scoring_run_id)
+                        if status == 'new':
+                            new_count += 1
+                        elif status == 'updated':
+                            updated_count += 1
+                        else:
+                            unchanged_count += 1
+                        if upgraded:
+                            upgraded_count += 1
+                        if score_data.get("qualified"):
+                            qualified_count += 1
+                        tier_counts[score_data["lead_tier"]] += 1
 
             except SQLAlchemyError as exc:
                 # DB error mid-batch: roll back the failed unit so the session
@@ -1205,6 +1212,18 @@ class MultiVerticalScorer:
                     "Unexpected error scoring property %s (%s): %s",
                     prop.id, prop.parcel_id, exc, exc_info=True,
                 )
+
+            # Periodic batch commit — prevents the session identity map from growing
+            # unboundedly across 500k+ properties and keeps flush() calls fast.
+            if save_to_db and i > 0 and i % _SCORE_BATCH_SIZE == 0:
+                try:
+                    self.session.commit()
+                    logger.info(
+                        "Scoring progress: %d/%d (%.1f%%) — new=%d updated=%d no_signal=%d",
+                        i, _total, i / _total * 100, new_count, updated_count, no_signal_count,
+                    )
+                except SQLAlchemyError as batch_exc:
+                    logger.error("Batch commit failed at property %d: %s", i, batch_exc, exc_info=True)
 
         if save_to_db:
             logger.info(

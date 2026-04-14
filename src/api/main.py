@@ -1011,6 +1011,9 @@ def event_feed(
 # GET /api/feed/{uuid}/stats
 # ---------------------------------------------------------------------------
 
+_RESCORE_FLAG = Path(__file__).resolve().parent.parent.parent / "data" / "rescore_in_progress.flag"
+
+
 @app.get("/api/feed/{feed_uuid}/stats")
 def feed_stats(feed_uuid: str, db: Session = Depends(get_db)):
     """Aggregate stats for the subscriber's feed: totals, new today, tier breakdown."""
@@ -1061,7 +1064,7 @@ def feed_stats(feed_uuid: str, db: Session = Depends(get_db)):
 
         today_start = _dt.combine(date.today(), _dt.min.time())
         new_today = db.execute(
-            select(func.count()).select_from(
+            select(func.count(func.distinct(DistressScore.property_id))).select_from(
                 base_q.where(DistressScore.score_date >= today_start).subquery()
             )
         ).scalar()
@@ -1082,11 +1085,18 @@ def feed_stats(feed_uuid: str, db: Session = Depends(get_db)):
     except OperationalError:
         raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
 
+    rescore_notice = (
+        "Lead pool is being refreshed with improved scoring. "
+        "Counts will be lower than usual during this window and will update within the hour."
+        if _RESCORE_FLAG.exists() else None
+    )
+
     return {
         "total_leads": total,
         "new_today": new_today,
         "tier_distribution": tier_distribution,
         "last_updated": last_updated_row.isoformat() if last_updated_row else None,
+        "rescore_notice": rescore_notice,
     }
 
 

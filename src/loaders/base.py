@@ -134,8 +134,9 @@ class BaseLoader(ABC):
         addr = str(addr).lower().strip()
         
         # Filter out invalid addresses
-        invalid_patterns = ['not provided', 'landlord/tenant', 'progress residential', 
-                           'right of wy', 'processed', 'row at', 'intersection',
+        invalid_patterns = ['not provided', 'landlord/tenant', 'progress residential',
+                           'right of way', 'right of wy', 'right-of-way',
+                           'processed', 'row at', 'intersection',
                            'final', 'piles at', 'accumulations', 'county facility']
         for pattern in invalid_patterns:
             if pattern in addr:
