@@ -160,7 +160,7 @@ class ViolationLoader(BaseLoader):
             # Match by address
             property_record = None
             if pd.notna(row.get('Address')):
-                match_result = self.find_property_by_address(row['Address'])
+                match_result = self.find_property_by_address(row['Address'], threshold=80)
                 if match_result:
                     property_record, score = match_result
                     logger.info(f"Matched violation by address (score: {score}%): {record_number}")

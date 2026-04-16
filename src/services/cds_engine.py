@@ -188,11 +188,17 @@ class MultiVerticalScorer:
         signals: List[Dict] = []
 
         # 1. Code violations — skip resolved/closed violations (no longer active distress).
-        #    Resolved status values are defined in PERSISTENCE_RESOLVED_KEYWORDS.
-        #    Violations with no status are kept (unknown = assume active).
+        #    PERSISTENCE_RESOLVED_KEYWORDS covers most cases; the supplemental set below
+        #    catches statuses whose wording doesn't substring-match any keyword
+        #    (e.g. "In Compliance" ≠ "complied", "No Violation" has no keyword match).
+        _SUPPLEMENTAL_RESOLVED = frozenset({"no violation", "compliance"})
         for v in (prop.code_violations or []):
-            if v.status and any(kw in v.status.lower() for kw in PERSISTENCE_RESOLVED_KEYWORDS):
-                continue
+            if v.status:
+                s = v.status.lower()
+                if any(kw in s for kw in PERSISTENCE_RESOLVED_KEYWORDS):
+                    continue
+                if any(kw in s for kw in _SUPPLEMENTAL_RESOLVED):
+                    continue
             signals.append({
                 "type":        "code_violations",
                 "date":        v.opened_date,
@@ -228,6 +234,18 @@ class MultiVerticalScorer:
             # Skip "Wills on Deposit" — not an active estate proceeding
             if sig_type == "probate" and proc.case_status and "wills on deposit" in proc.case_status.lower():
                 continue
+            # Eviction direction check: only score as distress when the property
+            # OWNER is the defendant (being evicted from their own home).
+            # Landlord-vs-tenant filings (owner evicting a tenant) are routine
+            # property management — not an owner-in-distress signal.
+            if sig_type == "evictions" and proc.associated_party:
+                owner = prop.owner
+                if owner and owner.owner_name:
+                    def _tokens(s: str):
+                        import re
+                        return {t for t in re.sub(r"[^a-z\s]", "", s.lower()).split() if len(t) > 2}
+                    if not (_tokens(proc.associated_party) & _tokens(owner.owner_name)):
+                        continue  # defendant is a tenant, not the property owner
             signals.append({"type": sig_type, "date": proc.filing_date, "amount": proc.amount})
 
         # 5. Tax delinquencies — skip null rows (scraper placeholder with no real data)
