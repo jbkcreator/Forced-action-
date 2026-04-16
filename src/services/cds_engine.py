@@ -290,18 +290,6 @@ class MultiVerticalScorer:
             or (s["date"].date() if isinstance(s["date"], datetime) else s["date"]) >= _cutoff
         ]
 
-        # Dead lead gate: if a recent arm's-length deed exists, this property just sold.
-        # Suppress all signals — distress context belongs to the old owner.
-        _deed_cutoff = date.today() - timedelta(days=DEAD_LEAD_DEED_DAYS)
-        _has_recent_deed = any(
-            s["type"] == "deed_transfers"
-            and s["date"] is not None
-            and (s["date"].date() if isinstance(s["date"], datetime) else s["date"]) >= _deed_cutoff
-            for s in signals
-        )
-        if _has_recent_deed:
-            return []
-
         return signals
 
     # ── Recency bonus ─────────────────────────────────────────────────────────
@@ -661,6 +649,23 @@ class MultiVerticalScorer:
             vertical_scores["roofing"] = 0.0
             if "roofing" in vertical_results:
                 vertical_results["roofing"]["score"] = 0.0
+
+        # Dead lead gate (per-vertical): a property sold within DEAD_LEAD_DEED_DAYS is
+        # off-market for investment verticals — the new owner won't resell immediately.
+        # Contractor verticals (roofing, restoration, public_adjusters) are unaffected —
+        # the new owner may still need physical work done on the property.
+        _deed_cutoff = date.today() - timedelta(days=DEAD_LEAD_DEED_DAYS)
+        _has_recent_deed = any(
+            s["type"] == "deed_transfers"
+            and s["date"] is not None
+            and (s["date"].date() if isinstance(s["date"], datetime) else s["date"]) >= _deed_cutoff
+            for s in signals
+        )
+        if _has_recent_deed:
+            for v in OWNER_OCCUPIED_EXCLUSION_VERTICALS:
+                vertical_scores[v] = 0.0
+                if v in vertical_results:
+                    vertical_results[v]["score"] = 0.0
 
         # Owner-occupied suppression: zero out investment verticals if the owner
         # lives at the property (mailing_address == property address).

@@ -526,7 +526,7 @@ def build_report(run_date: date, county_id: str) -> dict:
         vertical_breakdown      = _build_vertical_breakdown(session, run_date, county_id)
         signal_freshness        = _build_signal_freshness(session, county_id)
         vertical_tier_crosstab  = _build_vertical_tier_crosstab(session, run_date, county_id)
-        zip_breakdown           = _build_zip_breakdown(session, run_date, county_id)
+        zip_breakdown           = _build_zip_breakdown(session, run_date, county_id, top_n=10)
         signal_composition      = _build_signal_composition(session, run_date, county_id)
         gold_delta              = _build_gold_delta(session, run_date, county_id)
 
@@ -600,29 +600,45 @@ def write_csv(report: dict, path: Path) -> None:
             w.writerow([tier, f"{count:,}"])
         w.writerow([])
 
-        # ── Section 4: Lead Type Breakdown by Vertical ────────────────────
+        # ── Section 4: Gold+ Vertical Summary (headline numbers) ─────────
         vb = report["vertical_breakdown"]
         total_vb = vb.pop("_total", 0)
-        w.writerow(["LEAD TYPE BREAKDOWN — Gold+ by Vertical (6 verticals)"])
+        crosstab = report["vertical_tier_crosstab"]
+        w.writerow(["GOLD+ VERTICAL SUMMARY"])
         w.writerow([f"Total Gold+ leads: {total_vb:,}"])
         w.writerow([])
-        w.writerow(["Vertical", "Leads", "% of Gold+"])
-        for bucket, stats in vb.items():
-            w.writerow([bucket, f"{stats['count']:,}", f"{stats['pct']:.1f}%"])
+        w.writerow(["Vertical", "Total Gold+", "New Today", "% of Gold+"])
+        for key, label in VERTICAL_DISPLAY.items():
+            stats    = vb.get(label, {"count": 0, "pct": 0.0})
+            tiers_d  = crosstab.get(label, {})
+            new_today = sum(
+                tiers_d.get(t, {}).get("new_today", 0)
+                for t in ("Ultra Platinum", "Platinum", "Gold")
+            )
+            w.writerow([label, f"{stats['count']:,}", new_today, f"{stats['pct']:.1f}%"])
+        if "Other / Unclassified" in vb:
+            s = vb["Other / Unclassified"]
+            w.writerow(["Other / Unclassified", f"{s['count']:,}", "", f"{s['pct']:.1f}%"])
         w.writerow([])
 
         # ── Section 5: Gold+ by Vertical × Tier (cross-tab) ─────────────
         w.writerow(["GOLD+ BY VERTICAL × TIER"])
         w.writerow(["Vertical", "Tier", "Count", "New Today"])
         for vertical_label, tiers_data in report["vertical_tier_crosstab"].items():
+            vert_total = 0
+            vert_new   = 0
             for tier in ("Ultra Platinum", "Platinum", "Gold"):
                 d = tiers_data.get(tier, {"count": 0, "new_today": 0})
                 if d["count"] > 0:
                     w.writerow([vertical_label, tier, d["count"], d["new_today"]])
+                vert_total += d["count"]
+                vert_new   += d["new_today"]
+            if vert_total > 0:
+                w.writerow([vertical_label, "TOTAL", vert_total, vert_new])
         w.writerow([])
 
         # ── Section 6: ZIP-Level Gold+ Breakdown ─────────────────────────
-        w.writerow(["ZIP-LEVEL GOLD+ BREAKDOWN (top 20)"])
+        w.writerow(["ZIP-LEVEL GOLD+ BREAKDOWN (top 10)"])
         w.writerow(["ZIP", "Ultra Platinum", "Platinum", "Gold", "Total"])
         for z in report["zip_breakdown"]:
             w.writerow([z["zip"], z["ultra_platinum"], z["platinum"], z["gold"], z["total"]])
