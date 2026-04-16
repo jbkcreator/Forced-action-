@@ -91,10 +91,11 @@ def rematch_unmatched(
                     loader = lp_loader
 
                 # Determine which name field to use based on lien type
-                doc_type_str = str(raw.get('document_type', '')).upper()
-                is_tax_lien  = 'TAX LIEN' in doc_type_str
-                is_code_lien = 'TCL' in doc_type_str or 'CCL' in doc_type_str
-                _FILER_KEYWORDS = {'CITY OF TAMPA', 'HILLSBOROUGH COUNTY'}
+                doc_type_str     = str(raw.get('document_type', '')).upper()
+                is_tax_lien      = 'TAX LIEN' in doc_type_str
+                is_code_lien     = 'TCL' in doc_type_str or 'CCL' in doc_type_str
+                is_mechanics_lien = 'ML' in doc_type_str or 'MECHANIC' in doc_type_str
+                _FILER_KEYWORDS  = {'CITY OF TAMPA', 'HILLSBOROUGH COUNTY'}
 
                 if is_tax_lien:
                     name_to_try = grantee_val
@@ -103,6 +104,9 @@ def rematch_unmatched(
                         kw in str(grantor_val).upper() for kw in _FILER_KEYWORDS
                     )
                     name_to_try = grantee_val if grantor_is_filer else grantor_val
+                elif is_mechanics_lien:
+                    # Grantor = contractor (creditor), Grantee = property owner
+                    name_to_try = grantee_val
                 else:
                     name_to_try = grantor_val
 
@@ -116,11 +120,11 @@ def rematch_unmatched(
                     if result:
                         property_record, _ = result
 
-                # For lis_pendens, deeds, violations and permits: also try address matching
-                # at 80% threshold (vs the default 85%) to recover records that narrowly
-                # missed on address.  Violations/permits have no legal-description or
-                # owner-name fallback so address is their only matching path.
-                if not property_record and record.source_type in ("lis_pendens", "deeds", "violations", "permits"):
+                # Address fallback for source types where address is the primary or only
+                # matching path.  Uses 80% threshold (vs loader default 85%) to recover
+                # records that narrowly missed.  strict_house_number stays True (default)
+                # so a lower threshold cannot match a different street number.
+                if not property_record and record.source_type in ("lis_pendens", "deeds", "violations", "permits", "evictions"):
                     address_candidate = (
                         raw.get("Address") or raw.get("address") or record.address_string
                     )

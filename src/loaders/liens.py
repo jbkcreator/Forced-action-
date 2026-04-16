@@ -272,27 +272,31 @@ class LienLoader(BaseLoader):
                         )
 
             elif not property_record and not is_tax_lien and not is_code_lien:
-                # For mechanics/judgment liens: Grantor is usually the property owner (debtor),
-                # but for hospital debt liens and bank judgment liens Grantor = creditor/filer
-                # and the property owner is in Grantee.
-                # Strategy: try Grantor first; if no match, fall back to Grantee.
-                if pd.notna(row.get('Grantor')):
-                    match_result = self.find_property_by_owner_name(row['Grantor'], threshold=name_threshold)
-                    if match_result:
-                        property_record, score = match_result
-                        match_method = 'owner_name'
-                        match_score = score
-                        match_field = 'Grantor'
-                        logger.info(f"Matched lien by grantor name (score: {score}%, threshold: {name_threshold}%): {instrument}")
+                # Mechanics Liens (ML): Grantor = contractor/creditor, Grantee = property owner.
+                # Try Grantee first so we match against the actual owner, not the contractor.
+                # All other liens (judgment, HOA, etc.): Grantor = debtor/owner — try Grantor first.
+                is_mechanics_lien = 'ML' in doc_type_str or 'MECHANIC' in doc_type_str
+                first_field, second_field = (
+                    ('Grantee', 'Grantor') if is_mechanics_lien else ('Grantor', 'Grantee')
+                )
 
-                if not property_record and pd.notna(row.get('Grantee')):
-                    match_result = self.find_property_by_owner_name(row['Grantee'], threshold=name_threshold)
+                if pd.notna(row.get(first_field)):
+                    match_result = self.find_property_by_owner_name(row[first_field], threshold=name_threshold)
                     if match_result:
                         property_record, score = match_result
                         match_method = 'owner_name'
                         match_score = score
-                        match_field = 'Grantee'
-                        logger.info(f"Matched lien by grantee name (score: {score}%, threshold: {name_threshold}%): {instrument}")
+                        match_field = first_field
+                        logger.info(f"Matched lien by {first_field.lower()} name (score: {score}%, threshold: {name_threshold}%): {instrument}")
+
+                if not property_record and pd.notna(row.get(second_field)):
+                    match_result = self.find_property_by_owner_name(row[second_field], threshold=name_threshold)
+                    if match_result:
+                        property_record, score = match_result
+                        match_method = 'owner_name'
+                        match_score = score
+                        match_field = second_field
+                        logger.info(f"Matched lien by {second_field.lower()} name (score: {score}%, threshold: {name_threshold}%): {instrument}")
 
             # LLM verification — applied to all name-matched liens in the borderline
             # score range (80-94%), with record-type context so Claude understands
