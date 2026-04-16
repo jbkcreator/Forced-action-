@@ -19,6 +19,9 @@ pyyaml>=6.0.3
 requests>=2.32.5
 rapidfuzz>=3.10.0
 
+# JWT (admin upload layer)
+python-jose[cryptography]>=3.3.0
+
 # File format readers
 dbfread>=2.0.7
 xlrd>=2.0.1

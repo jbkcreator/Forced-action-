@@ -24,6 +24,7 @@ import requests as _requests
 import stripe
 from fastapi import FastAPI, Header, HTTPException, Request, Depends, Query
 from fastapi.exception_handlers import http_exception_handler
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator, model_validator, EmailStr
@@ -47,7 +48,17 @@ VALID_TIERS = {"starter", "pro", "dominator"}
 VALID_VERTICALS = set(VERTICAL_WEIGHTS.keys())
 
 app = FastAPI(title="Forced Action API", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+from src.api.admin_router import router as admin_router  # noqa: E402
+app.include_router(admin_router)
 
 # Mount React build assets (JS/CSS chunks) if the dist directory exists
 if REACT_DIST.is_dir() and (REACT_DIST / "assets").is_dir():
@@ -536,6 +547,14 @@ def email_previews_page():
     if react_index.is_file():
         return FileResponse(str(react_index))
     return FileResponse(str(STATIC_DIR / "email-previews.html"))
+
+
+@app.get("/admin", include_in_schema=False)
+def admin_page():
+    react_index = REACT_DIST / "index.html"
+    if react_index.is_file():
+        return FileResponse(str(react_index))
+    raise HTTPException(status_code=503, detail="Admin UI not built — run npm run build in Forced-action-ui/")
 
 
 # ---------------------------------------------------------------------------

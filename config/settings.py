@@ -96,6 +96,11 @@ class AppSettings(BaseSettings):
 	# UptimeRobot (optional — used by scripts/setup_uptimerobot.py to create monitors)
 	uptimerobot_api_key: Optional[SecretStr] = Field(default=None, env="UPTIMEROBOT_API_KEY")
 
+	# Admin upload layer
+	admin_username: str = Field(default="admin", env="ADMIN_USERNAME")
+	admin_password: Optional[SecretStr] = Field(default=None, env="ADMIN_PASSWORD")
+	admin_jwt_secret: Optional[SecretStr] = Field(default=None, env="ADMIN_JWT_SECRET")
+
 	# DB Backup — S3
 	backup_s3_bucket: Optional[str] = Field(default=None, env="BACKUP_S3_BUCKET")
 	backup_s3_prefix: str = Field(default="db-backups", env="BACKUP_S3_PREFIX")

@@ -661,6 +661,18 @@ class MultiVerticalScorer:
             and (s["date"].date() if isinstance(s["date"], datetime) else s["date"]) >= _deed_cutoff
             for s in signals
         )
+        # Fallback: check raw deeds directly — catches two bypass cases:
+        #   1. Nominal-price transfers (sale_price < $1,000) excluded from signals as
+        #      non-arm's-length but still represent a recent ownership change.
+        #   2. Deeds with record_date=None in the signal dict (date check fails silently).
+        if not _has_recent_deed and prop.deeds:
+            for _deed in prop.deeds:
+                if _deed.record_date is None:
+                    continue
+                _rd = _deed.record_date.date() if isinstance(_deed.record_date, datetime) else _deed.record_date
+                if _rd >= _deed_cutoff:
+                    _has_recent_deed = True
+                    break
         if _has_recent_deed:
             for v in OWNER_OCCUPIED_EXCLUSION_VERTICALS:
                 vertical_scores[v] = 0.0
