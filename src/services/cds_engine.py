@@ -1311,25 +1311,30 @@ class MultiVerticalScorer:
             tier_gold=tier_counts.get('Gold', 0),
             tier_silver=tier_counts.get('Silver', 0),
             tier_bronze=tier_counts.get('Bronze', 0),
-        ).on_conflict_do_update(
+        )
+        # Scoring counters must accumulate across multiple ingestion-time scoring
+        # runs per day (each scraper triggers score_properties_by_ids independently).
+        # Signal totals are overwritten because they're already rolled up live from
+        # scraper_run_stats and reflect the full-day picture on each call.
+        stmt = stmt.on_conflict_do_update(
             constraint='uq_platform_daily_stats',
             set_=dict(
                 signals_scraped=int(signal_row.scraped),
                 signals_matched=int(signal_row.matched),
                 signals_skipped=int(signal_row.skipped),
-                properties_scored=properties_scored,
-                properties_with_signals=properties_with_signals,
-                score_runs_total=score_runs_total,
-                leads_new=leads_new,
-                leads_updated=leads_updated,
-                leads_unchanged=leads_unchanged,
-                leads_qualified=leads_qualified,
-                leads_upgraded=leads_upgraded,
-                tier_ultra_platinum=tier_counts.get('Ultra Platinum', 0),
-                tier_platinum=tier_counts.get('Platinum', 0),
-                tier_gold=tier_counts.get('Gold', 0),
-                tier_silver=tier_counts.get('Silver', 0),
-                tier_bronze=tier_counts.get('Bronze', 0),
+                properties_scored=PlatformDailyStats.properties_scored + stmt.excluded.properties_scored,
+                properties_with_signals=PlatformDailyStats.properties_with_signals + stmt.excluded.properties_with_signals,
+                score_runs_total=PlatformDailyStats.score_runs_total + stmt.excluded.score_runs_total,
+                leads_new=PlatformDailyStats.leads_new + stmt.excluded.leads_new,
+                leads_updated=PlatformDailyStats.leads_updated + stmt.excluded.leads_updated,
+                leads_unchanged=PlatformDailyStats.leads_unchanged + stmt.excluded.leads_unchanged,
+                leads_qualified=PlatformDailyStats.leads_qualified + stmt.excluded.leads_qualified,
+                leads_upgraded=PlatformDailyStats.leads_upgraded + stmt.excluded.leads_upgraded,
+                tier_ultra_platinum=PlatformDailyStats.tier_ultra_platinum + stmt.excluded.tier_ultra_platinum,
+                tier_platinum=PlatformDailyStats.tier_platinum + stmt.excluded.tier_platinum,
+                tier_gold=PlatformDailyStats.tier_gold + stmt.excluded.tier_gold,
+                tier_silver=PlatformDailyStats.tier_silver + stmt.excluded.tier_silver,
+                tier_bronze=PlatformDailyStats.tier_bronze + stmt.excluded.tier_bronze,
                 updated_at=datetime.now(timezone.utc),
             )
         )
