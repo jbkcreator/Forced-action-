@@ -39,9 +39,9 @@ logger = logging.getLogger(__name__)
 
 def _init_stripe() -> bool:
     """Initialise Stripe API key. Returns False if not configured."""
-    key = settings.stripe_secret_key
+    key = settings.active_stripe_secret_key
     if not key:
-        logger.debug("STRIPE_SECRET_KEY not set — webhooks disabled")
+        logger.debug("Stripe secret key not set — webhooks disabled")
         return False
     stripe.api_key = key.get_secret_value()
     return True
@@ -60,9 +60,9 @@ def handle_webhook(raw_body: bytes, sig_header: str, db: Session) -> tuple[bool,
     if not _init_stripe():
         return False, "Stripe not configured"
 
-    secret = settings.stripe_webhook_secret
+    secret = settings.active_stripe_webhook_secret
     if not secret:
-        raise ValueError("STRIPE_WEBHOOK_SECRET not set")
+        raise ValueError("Stripe webhook secret not set")
 
     try:
         event = stripe.Webhook.construct_event(

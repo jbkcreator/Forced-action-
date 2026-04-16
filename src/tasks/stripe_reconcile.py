@@ -29,10 +29,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(level
 
 def _init_stripe() -> bool:
     try:
-        key = settings.stripe_secret_key.get_secret_value()
-        if not key:
+        secret = settings.active_stripe_secret_key
+        if not secret:
             return False
-        stripe.api_key = key
+        stripe.api_key = secret.get_secret_value()
         return True
     except Exception:
         return False

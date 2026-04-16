@@ -157,12 +157,12 @@ def health_check_detailed(db: Session = Depends(get_db)):
         )
 
     # ── 2. Stripe API ──────────────────────────────────────────────────────
-    if not settings.stripe_secret_key:
+    if not settings.active_stripe_secret_key:
         checks["stripe"] = {"status": "unconfigured"}
         overall = "degraded"
     else:
         try:
-            stripe.api_key = settings.stripe_secret_key.get_secret_value()
+            stripe.api_key = settings.active_stripe_secret_key.get_secret_value()
             # Lightweight call — just fetch account balance
             stripe.Balance.retrieve()
             checks["stripe"] = {"status": "ok"}
@@ -354,8 +354,8 @@ def health_check_detailed(db: Session = Depends(get_db)):
     missing_optional = []
     if not settings.ghl_api_key:
         missing_optional.append("GHL_API_KEY")
-    if not settings.stripe_secret_key:
-        missing_optional.append("STRIPE_SECRET_KEY")
+    if not settings.active_stripe_secret_key:
+        missing_optional.append("STRIPE_SECRET_KEY" if not settings.stripe_test_mode else "STRIPE_TEST_SECRET_KEY")
     if not settings.batch_skip_tracing_api_key:
         missing_optional.append("BATCH_SKIP_TRACING_API_KEY")
     if not settings.idi_api_key:
@@ -448,7 +448,7 @@ class CheckoutRequest(BaseModel):
 def create_checkout(payload: CheckoutRequest, db: Session = Depends(get_db)):
 
     _s = get_settings()
-    stripe.api_key = _s.stripe_secret_key.get_secret_value()
+    stripe.api_key = _s.active_stripe_secret_key.get_secret_value()
 
     try:
         price_id, is_founding = get_price_id_for_checkout(db, payload.tier, payload.vertical, payload.county_id)
@@ -569,7 +569,7 @@ class PortalSessionRequest(BaseModel):
 def create_portal_session(req: PortalSessionRequest, db: Session = Depends(get_db)):
     """Create a Stripe billing portal session so subscribers can update card / cancel."""
     settings = get_settings()
-    if not settings.stripe_secret_key:
+    if not settings.active_stripe_secret_key:
         raise HTTPException(status_code=503, detail="Billing portal not configured")
 
     subscriber = db.execute(
@@ -579,7 +579,7 @@ def create_portal_session(req: PortalSessionRequest, db: Session = Depends(get_d
     if not subscriber or not subscriber.stripe_customer_id:
         raise HTTPException(status_code=404, detail="Subscriber not found")
 
-    stripe.api_key = settings.stripe_secret_key.get_secret_value()
+    stripe.api_key = settings.active_stripe_secret_key.get_secret_value()
     try:
         session = stripe.billing_portal.Session.create(
             customer=subscriber.stripe_customer_id,
@@ -1359,7 +1359,7 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, db: Session = Depends(g
     """
     _s = get_settings()
 
-    if not _s.stripe_secret_key:
+    if not _s.active_stripe_secret_key:
         raise HTTPException(status_code=503, detail={"error": "payment_unavailable", "message": "Payment not configured"})
 
     # Validate subscriber
@@ -1389,8 +1389,8 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, db: Session = Depends(g
         raise HTTPException(status_code=400, detail={"error": "zip_already_owned", "message": "You already receive leads for this ZIP in your feed."})
 
     # Look up price amount from Stripe
-    stripe.api_key = _s.stripe_secret_key.get_secret_value()
-    price_id = _s.stripe_price_lead_pack
+    stripe.api_key = _s.active_stripe_secret_key.get_secret_value()
+    price_id = _s.active_stripe_price("lead_pack")
     if not price_id:
         raise HTTPException(status_code=503, detail={"error": "price_not_configured", "message": "Lead pack price not configured"})
 
@@ -1421,7 +1421,7 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, db: Session = Depends(g
 
     return {
         "client_secret":    intent["client_secret"],
-        "publishable_key":  _s.stripe_publishable_key,
+        "publishable_key":  _s.active_stripe_publishable_key,
         "amount":           amount,
         "currency":         currency,
     }

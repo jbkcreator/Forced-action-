@@ -49,12 +49,20 @@ class AppSettings(BaseSettings):
 	ghl_cf_fa_founding: Optional[str] = Field(default=None, env="GHL_CF_FA_FOUNDING")
 	ghl_cf_fa_dashboard_url: Optional[str] = Field(default=None, env="GHL_CF_FA_DASHBOARD_URL")
 
-	# Stripe (M1)
+	# Stripe — set STRIPE_TEST_MODE=true to use test credentials/prices instead of live
+	stripe_test_mode: bool = Field(default=False, env="STRIPE_TEST_MODE")
+
+	# Live credentials
 	stripe_secret_key: Optional[SecretStr] = Field(default=None, env="STRIPE_SECRET_KEY")
 	stripe_webhook_secret: Optional[SecretStr] = Field(default=None, env="STRIPE_WEBHOOK_SECRET")
 	stripe_publishable_key: Optional[str] = Field(default=None, env="STRIPE_PUBLISHABLE_KEY")
 
-	# Stripe price IDs
+	# Test credentials
+	stripe_test_secret_key: Optional[SecretStr] = Field(default=None, env="STRIPE_TEST_SECRET_KEY")
+	stripe_test_webhook_secret: Optional[SecretStr] = Field(default=None, env="STRIPE_TEST_WEBHOOK_SECRET")
+	stripe_test_publishable_key: Optional[str] = Field(default=None, env="STRIPE_TEST_PUBLISHABLE_KEY")
+
+	# Live price IDs
 	stripe_price_starter_founding: Optional[str] = Field(default=None, env="STRIPE_PRICE_STARTER_FOUNDING")
 	stripe_price_starter_regular: Optional[str] = Field(default=None, env="STRIPE_PRICE_STARTER_REGULAR")
 	stripe_price_pro_founding: Optional[str] = Field(default=None, env="STRIPE_PRICE_PRO_FOUNDING")
@@ -63,6 +71,37 @@ class AppSettings(BaseSettings):
 	stripe_price_dominator_regular: Optional[str] = Field(default=None, env="STRIPE_PRICE_DOMINATOR_REGULAR")
 	stripe_price_lead_pack: Optional[str] = Field(default=None, env="STRIPE_PRICE_LEAD_PACK")
 	stripe_price_hot_lead_unlock: Optional[str] = Field(default=None, env="STRIPE_PRICE_HOT_LEAD_UNLOCK")
+
+	# Test price IDs
+	stripe_test_price_starter_founding: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_STARTER_FOUNDING")
+	stripe_test_price_starter_regular: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_STARTER_REGULAR")
+	stripe_test_price_pro_founding: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_PRO_FOUNDING")
+	stripe_test_price_pro_regular: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_PRO_REGULAR")
+	stripe_test_price_dominator_founding: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_DOMINATOR_FOUNDING")
+	stripe_test_price_dominator_regular: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_DOMINATOR_REGULAR")
+	stripe_test_price_lead_pack: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_LEAD_PACK")
+	stripe_test_price_hot_lead_unlock: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_HOT_LEAD_UNLOCK")
+
+	# ── Mode-aware helpers ────────────────────────────────────────────────────
+	# Use these everywhere instead of accessing live/test fields directly.
+
+	@property
+	def active_stripe_secret_key(self) -> Optional[SecretStr]:
+		return self.stripe_test_secret_key if self.stripe_test_mode else self.stripe_secret_key
+
+	@property
+	def active_stripe_webhook_secret(self) -> Optional[SecretStr]:
+		return self.stripe_test_webhook_secret if self.stripe_test_mode else self.stripe_webhook_secret
+
+	@property
+	def active_stripe_publishable_key(self) -> Optional[str]:
+		return self.stripe_test_publishable_key if self.stripe_test_mode else self.stripe_publishable_key
+
+	def active_stripe_price(self, name: str) -> Optional[str]:
+		"""Return the mode-aware price ID for a given price name (e.g. 'lead_pack', 'starter_founding')."""
+		if self.stripe_test_mode:
+			return getattr(self, f"stripe_test_price_{name}", None)
+		return getattr(self, f"stripe_price_{name}", None)
 
 	# Founding subscriber spot limit (default 10, changeable without redeploy)
 	founding_spot_limit: int = Field(default=10, env="FOUNDING_SPOT_LIMIT")

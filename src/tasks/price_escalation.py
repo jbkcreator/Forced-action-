@@ -48,11 +48,11 @@ def run_price_escalation(dry_run: bool = False) -> dict:
     settings = get_settings()
     stats = {"checked": 0, "eligible": 0, "escalated": 0, "failed": 0, "dry_run": dry_run}
 
-    if not settings.stripe_secret_key:
-        logger.warning("[PriceEscalation] STRIPE_SECRET_KEY not set — cannot escalate")
+    if not settings.active_stripe_secret_key:
+        logger.warning("[PriceEscalation] Stripe secret key not set — cannot escalate")
         return stats
 
-    stripe.api_key = settings.stripe_secret_key.get_secret_value()
+    stripe.api_key = settings.active_stripe_secret_key.get_secret_value()
     cutoff = datetime.now(timezone.utc) - _SIX_MONTHS
 
     with get_db_context() as db:

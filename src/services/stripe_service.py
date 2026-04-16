@@ -61,25 +61,25 @@ def _price_ids():
     """Read price IDs from settings at call time (not at import time)."""
     return {
         "starter": {
-            "founding": settings.stripe_price_starter_founding,
-            "regular":  settings.stripe_price_starter_regular,
+            "founding": settings.active_stripe_price("starter_founding"),
+            "regular":  settings.active_stripe_price("starter_regular"),
         },
         "pro": {
-            "founding": settings.stripe_price_pro_founding,
-            "regular":  settings.stripe_price_pro_regular,
+            "founding": settings.active_stripe_price("pro_founding"),
+            "regular":  settings.active_stripe_price("pro_regular"),
         },
         "dominator": {
-            "founding": settings.stripe_price_dominator_founding,
-            "regular":  settings.stripe_price_dominator_regular,
+            "founding": settings.active_stripe_price("dominator_founding"),
+            "regular":  settings.active_stripe_price("dominator_regular"),
         },
     }
 
 
 def _init_stripe() -> bool:
     """Set Stripe API key. Returns False if not configured."""
-    key = settings.stripe_secret_key
+    key = settings.active_stripe_secret_key
     if not key:
-        logger.debug("STRIPE_SECRET_KEY not set — Stripe disabled")
+        logger.debug("Stripe secret key not set — Stripe disabled")
         return False
     stripe.api_key = key.get_secret_value()
     return True
@@ -299,7 +299,7 @@ def create_hot_lead_unlock_link(
     if not _init_stripe():
         raise RuntimeError("Stripe not configured")
 
-    price_hot_lead_unlock = settings.stripe_price_hot_lead_unlock
+    price_hot_lead_unlock = settings.active_stripe_price("hot_lead_unlock")
     if not price_hot_lead_unlock:
         raise ValueError("STRIPE_PRICE_HOT_LEAD_UNLOCK not set in env")
 
