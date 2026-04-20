@@ -127,6 +127,7 @@ class AppSettings(BaseSettings):
 	smtp_pass: Optional[SecretStr] = Field(default=None, env="SMTP_PASS")
 	email_from: Optional[str] = Field(default=None, env="EMAIL_FROM")  # falls back to smtp_user if not set
 	alert_email: Optional[str] = Field(default=None, env="ALERT_EMAIL")  # ops alert recipient
+	report_recipients: Optional[str] = Field(default=None, env="REPORT_RECIPIENTS")  # comma-separated emails for daily/weekly reports
 
 	# Alerting
 	alert_sms_number: Optional[str] = Field(default=None, env="ALERT_SMS_NUMBER")  # SMS target for match-rate alerts

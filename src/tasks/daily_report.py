@@ -726,6 +726,13 @@ def generate_report(run_date: date, county_id: str) -> Path:
     if deleted:
         logger.info(f"[daily_report] Pruned {deleted} old report(s)")
 
+    # Email report to stakeholders
+    try:
+        from src.tasks.report_emailer import send_daily_report
+        send_daily_report(report)
+    except Exception as exc:
+        logger.error(f"[daily_report] Failed to send email report: {exc}")
+
     s = report["scoring"]
     t = report["tiers"]
     vb = report["vertical_breakdown"]

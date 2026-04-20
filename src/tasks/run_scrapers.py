@@ -112,8 +112,10 @@ def _run_liens(county_id: str, run_date: date) -> int:
 
 
 def _run_evictions(county_id: str, run_date: date) -> int:
-    """Evictions: HTTP CSV download → EvictionLoader → DB."""
-    from src.scrappers.evictions.evictions_engine import download_latest_civil_filing
+    """Evictions: HTTP CSV download → filter evictions → EvictionLoader → DB."""
+    from src.scrappers.evictions.evictions_engine import (
+        download_latest_civil_filing, process_civil_data, filter_evictions,
+    )
     from src.loaders.legal_proceedings import EvictionLoader
     from src.core.database import get_db_context
 
@@ -122,8 +124,12 @@ def _run_evictions(county_id: str, run_date: date) -> int:
     )
     if not csv_path:
         return 0
+    civil_df = process_civil_data(csv_path)
+    evictions_df = filter_evictions(civil_df)
+    if evictions_df.empty:
+        return 0
     with get_db_context() as session:
-        matched, _, _ = EvictionLoader(session, county_id=county_id).load_from_csv(str(csv_path))
+        matched, _, _ = EvictionLoader(session, county_id=county_id).load_from_dataframe(evictions_df)
     return matched
 
 

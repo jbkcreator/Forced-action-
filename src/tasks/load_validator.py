@@ -5,6 +5,10 @@ Checks daily scraper run counts against a rolling 7-day baseline.
 Fires an ops alert if any scraper's count drops more than 70% below baseline
 for 2 consecutive days (avoids noisy single-day false positives).
 
+Zero-record runs (total_scraped == 0 on a successful run) fire an immediate
+single-day alert — no consecutive-day grace period — because a scraper that
+ran without errors but produced nothing is always actionable.
+
 Also validates:
   - scraper run success flags (failed runs)
   - enrichment pipeline match rate (delegates to match_rate_monitor)
@@ -76,7 +80,7 @@ def _get_recent_stats(session, county_id: str, days: int) -> Dict[str, list]:
 
     by_type: Dict[str, list] = defaultdict(list)
     for row in rows:
-        by_type[row.source_type].append(row.matched)
+        by_type[row.source_type].append(row.total_scraped)
     return dict(by_type)
 
 
@@ -102,7 +106,7 @@ def run_load_validator(county_id: str = "hillsborough") -> dict:
         dict with keys: anomalies (list), failed_runs (list), alerts_sent (int)
     """
     today = date.today()
-    results = {"anomalies": [], "failed_runs": [], "alerts_sent": 0, "checked_date": str(today)}
+    results = {"anomalies": [], "zero_record_scrapers": [], "failed_runs": [], "alerts_sent": 0, "checked_date": str(today)}
 
     state = _load_state()
 
@@ -129,7 +133,7 @@ def run_load_validator(county_id: str = "hillsborough") -> dict:
             )
             .all()
         )
-        today_data = {r.source_type: r.matched for r in today_rows}
+        today_data = {r.source_type: r.total_scraped for r in today_rows}
 
     # Compute baseline averages (excluding today)
     baseline_avgs: Dict[str, float] = {}
@@ -138,9 +142,48 @@ def run_load_validator(county_id: str = "hillsborough") -> dict:
             # Exclude today from baseline if present
             baseline_avgs[source_type] = sum(counts[:-1]) / max(len(counts) - 1, 1)
 
-    # Check each scraper that ran today
+    # ── Zero-record immediate alert ───────────────────────────────────────
+    # A successful run that returned 0 records is always suspicious — alert
+    # immediately (no 2-day wait) when there is enough baseline to expect data.
+    zero_record_lines = []
+    for source_type, today_count in today_data.items():
+        baseline_avg = baseline_avgs.get(source_type)
+        if today_count == 0 and baseline_avg is not None and baseline_avg >= _MIN_BASELINE_AVG:
+            zero_record_lines.append(
+                f"  {source_type}: 0 records today (7d_avg={baseline_avg:.1f})"
+            )
+            logger.warning(
+                "[LoadValidator] %s: ZERO records today (7d_avg=%.1f) — immediate alert",
+                source_type, baseline_avg,
+            )
+
+    if zero_record_lines:
+        sent = send_alert(
+            subject=f"[Forced Action] ALERT: {len(zero_record_lines)} scraper(s) returned ZERO records ({today})",
+            body=(
+                f"The following scraper(s) ran successfully but loaded 0 records today ({today}):\n\n"
+                + "\n".join(zero_record_lines)
+                + "\n\nPossible causes:\n"
+                "  - Source website changed structure or returned empty results\n"
+                "  - Scraper ran before new data was published (timing issue)\n"
+                "  - Authentication/session expired silently\n"
+                "\nRun: python -m src.tasks.run_scrapers hillsborough\n"
+                f"\nForced Action Ops Alert — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+            ),
+        )
+        if sent:
+            results["alerts_sent"] += 1
+
+    results["zero_record_scrapers"] = [
+        line.strip().split(":")[0] for line in zero_record_lines
+    ]
+
+    # ── Check for count anomalies (< 30% of 7-day baseline) ──────────────
+    # Skip scrapers already caught by the zero-record check above.
     anomalies = []
     for source_type, today_count in today_data.items():
+        if today_count == 0:
+            continue  # handled by zero-record check above
         baseline_avg = baseline_avgs.get(source_type)
         if baseline_avg is None or baseline_avg < _MIN_BASELINE_AVG:
             continue   # not enough history or too sparse to baseline
