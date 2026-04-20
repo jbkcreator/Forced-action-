@@ -634,6 +634,43 @@ def run_daily_emails(dry_run: bool = False, feed_uuid: Optional[str] = None) -> 
             query = query.where(Subscriber.event_feed_uuid == feed_uuid)
         subscribers = db.execute(query).scalars().all()
 
+        # ── Duplicate safety net ───────────────────────────────────────────
+        # The DB partial unique index + upsert logic should prevent duplicates,
+        # but this catches any that slip through (direct SQL inserts, migration
+        # bugs, etc.).  Deduplicates the send loop and fires an ops alert so
+        # the underlying cause can be investigated.
+        seen_keys: set[tuple] = set()
+        deduped: list[Subscriber] = []
+        for s in subscribers:
+            key = (s.email.lower().strip() if s.email else None, s.vertical, s.county_id)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            deduped.append(s)
+
+        if len(deduped) < len(subscribers):
+            n_dupes = len(subscribers) - len(deduped)
+            logger.error(
+                "Duplicate active/grace subscribers detected before send loop — %d duplicate(s) skipped. "
+                "Investigate how they bypassed the unique index.",
+                n_dupes,
+            )
+            send_alert(
+                subject=f"[Forced Action] ALERT: {n_dupes} duplicate subscriber(s) detected before email send",
+                body=(
+                    f"{n_dupes} active/grace subscriber row(s) share a (email, vertical, county_id) key "
+                    f"with another active row.\n\n"
+                    f"Only the first occurrence per key was emailed. Duplicates were skipped.\n\n"
+                    f"This should not happen — the DB partial unique index (uq_subscriber_email_vertical_active) "
+                    f"enforces uniqueness. Investigate how these rows were created:\n\n"
+                    f"  SELECT lower(email), vertical, county_id, count(*), array_agg(id)\n"
+                    f"  FROM subscribers\n"
+                    f"  WHERE status IN ('active','grace')\n"
+                    f"  GROUP BY 1,2,3 HAVING count(*) > 1;\n"
+                ),
+            )
+        subscribers = deduped
+
         for sub in subscribers:
             stats["subscribers"] += 1
 

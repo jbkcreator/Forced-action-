@@ -403,6 +403,15 @@ class CheckoutRequest(BaseModel):
     vertical: str    # roofing | remediation | investor
     county_id: str   # hillsborough
     zip_codes: list[str] = []  # ZIP territories to lock on purchase
+    email: str       # collected before checkout — used to block duplicate subscriptions
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, v: str) -> str:
+        v = v.lower().strip()
+        if not v or "@" not in v or "." not in v.split("@")[-1]:
+            raise ValueError("A valid email address is required")
+        return v
 
     @field_validator("tier")
     @classmethod
@@ -464,6 +473,33 @@ def create_checkout(payload: CheckoutRequest, db: Session = Depends(get_db)):
             detail={"error": "price_not_configured", "message": f"No price configured for tier '{payload.tier}'"},
         )
 
+    # Block duplicate subscriptions — check before creating Stripe session so the
+    # user is never charged twice.  Email is normalised by the request validator.
+    try:
+        existing_sub = db.execute(
+            select(Subscriber).where(
+                Subscriber.email == payload.email,
+                Subscriber.vertical == payload.vertical,
+                Subscriber.county_id == payload.county_id,
+                Subscriber.status.in_(["active", "grace"]),
+            )
+        ).scalar_one_or_none()
+    except OperationalError:
+        logger.error("DB error checking existing subscriber at checkout", exc_info=True)
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
+
+    if existing_sub:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "already_subscribed",
+                "message": (
+                    f"{payload.email} already has an active {payload.vertical.replace('_', ' ').title()} "
+                    "subscription. Log in to manage your existing subscription."
+                ),
+            },
+        )
+
     # Validate ZIP availability before taking payment.
     # Without this check a subscriber can pay, the webhook fires, and any ZIPs that
     # were locked between zip-check and payment completion are silently dropped —
@@ -498,6 +534,7 @@ def create_checkout(payload: CheckoutRequest, db: Session = Depends(get_db)):
         session = stripe.checkout.Session.create(
             mode="subscription",
             ui_mode="embedded",
+            customer_email=payload.email,   # pre-fills email in Stripe form
             line_items=[{"price": price_id, "quantity": 1}],
             metadata={
                 "tier": payload.tier,
