@@ -71,6 +71,22 @@ class AppSettings(BaseSettings):
 	stripe_price_dominator_regular: Optional[str] = Field(default=None, env="STRIPE_PRICE_DOMINATOR_REGULAR")
 	stripe_price_lead_pack: Optional[str] = Field(default=None, env="STRIPE_PRICE_LEAD_PACK")
 	stripe_price_hot_lead_unlock: Optional[str] = Field(default=None, env="STRIPE_PRICE_HOT_LEAD_UNLOCK")
+	# 2B: Wallet tiers
+	stripe_price_wallet_starter: Optional[str] = Field(default=None, env="STRIPE_PRICE_WALLET_STARTER")
+	stripe_price_wallet_growth: Optional[str] = Field(default=None, env="STRIPE_PRICE_WALLET_GROWTH")
+	stripe_price_wallet_power: Optional[str] = Field(default=None, env="STRIPE_PRICE_WALLET_POWER")
+	# 2B: New subscription tiers
+	stripe_price_data_only: Optional[str] = Field(default=None, env="STRIPE_PRICE_DATA_ONLY")
+	stripe_price_autopilot_lite: Optional[str] = Field(default=None, env="STRIPE_PRICE_AUTOPILOT_LITE")
+	stripe_price_autopilot_pro: Optional[str] = Field(default=None, env="STRIPE_PRICE_AUTOPILOT_PRO")
+	stripe_price_annual_lock: Optional[str] = Field(default=None, env="STRIPE_PRICE_ANNUAL_LOCK")
+	stripe_price_auto_mode: Optional[str] = Field(default=None, env="STRIPE_PRICE_AUTO_MODE")
+	stripe_price_partner: Optional[str] = Field(default=None, env="STRIPE_PRICE_PARTNER")
+	# 2B: Bundles
+	stripe_price_bundle_weekend: Optional[str] = Field(default=None, env="STRIPE_PRICE_BUNDLE_WEEKEND")
+	stripe_price_bundle_storm: Optional[str] = Field(default=None, env="STRIPE_PRICE_BUNDLE_STORM")
+	stripe_price_bundle_zip_booster: Optional[str] = Field(default=None, env="STRIPE_PRICE_BUNDLE_ZIP_BOOSTER")
+	stripe_price_bundle_monthly_reload: Optional[str] = Field(default=None, env="STRIPE_PRICE_BUNDLE_MONTHLY_RELOAD")
 
 	# Test price IDs
 	stripe_test_price_starter_founding: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_STARTER_FOUNDING")
@@ -81,6 +97,20 @@ class AppSettings(BaseSettings):
 	stripe_test_price_dominator_regular: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_DOMINATOR_REGULAR")
 	stripe_test_price_lead_pack: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_LEAD_PACK")
 	stripe_test_price_hot_lead_unlock: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_HOT_LEAD_UNLOCK")
+	# 2B test prices
+	stripe_test_price_wallet_starter: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_WALLET_STARTER")
+	stripe_test_price_wallet_growth: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_WALLET_GROWTH")
+	stripe_test_price_wallet_power: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_WALLET_POWER")
+	stripe_test_price_data_only: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_DATA_ONLY")
+	stripe_test_price_autopilot_lite: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_AUTOPILOT_LITE")
+	stripe_test_price_autopilot_pro: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_AUTOPILOT_PRO")
+	stripe_test_price_annual_lock: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_ANNUAL_LOCK")
+	stripe_test_price_auto_mode: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_AUTO_MODE")
+	stripe_test_price_partner: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_PARTNER")
+	stripe_test_price_bundle_weekend: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_BUNDLE_WEEKEND")
+	stripe_test_price_bundle_storm: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_BUNDLE_STORM")
+	stripe_test_price_bundle_zip_booster: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_BUNDLE_ZIP_BOOSTER")
+	stripe_test_price_bundle_monthly_reload: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_BUNDLE_MONTHLY_RELOAD")
 
 	# ── Mode-aware helpers ────────────────────────────────────────────────────
 	# Use these everywhere instead of accessing live/test fields directly.

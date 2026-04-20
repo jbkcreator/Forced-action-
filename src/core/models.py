@@ -730,6 +730,12 @@ class Subscriber(Base):
     email: Mapped[Optional[str]] = mapped_column(String(255), index=True)
     name: Mapped[Optional[str]] = mapped_column(String(255))
 
+    # ── 2B: Saved card + wallet + referral ────────────────────────────
+    has_saved_card: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    stripe_payment_method_id: Mapped[Optional[str]] = mapped_column(String(100))
+    referral_code: Mapped[Optional[str]] = mapped_column(String(20), unique=True, index=True)
+    auto_mode_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
     # Audit
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(
@@ -741,8 +747,14 @@ class Subscriber(Base):
         Index("idx_subscriber_county_id", "county_id"),
         Index("idx_subscriber_status", "status"),
         Index("idx_subscriber_vertical", "vertical"),
-        CheckConstraint("tier IN ('starter', 'pro', 'dominator')", name="check_subscriber_tier"),
-        CheckConstraint("status IN ('active', 'grace', 'churned', 'cancelled')", name="check_subscriber_status"),
+        CheckConstraint(
+            "tier IN ('free', 'starter', 'pro', 'dominator', 'data_only', 'autopilot_lite', 'autopilot_pro', 'partner')",
+            name="check_subscriber_tier",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'grace', 'churned', 'cancelled', 'paused')",
+            name="check_subscriber_status",
+        ),
     )
 
     def __repr__(self):
@@ -1125,3 +1137,248 @@ class StripeWebhookEvent(Base):
 
     def __repr__(self):
         return f"<StripeWebhookEvent(event_id={self.event_id}, type={self.event_type})>"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 2B Models
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class WalletBalance(Base):
+    """Credit wallet balance per subscriber. One row per subscriber."""
+    __tablename__ = "wallet_balances"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=False, unique=True, index=True)
+    wallet_tier: Mapped[str] = mapped_column(String(20), nullable=False)  # starter_wallet / growth / power
+    credits_remaining: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    credits_used_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    auto_reload_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    last_reload_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc)
+    )
+
+    subscriber = relationship("Subscriber", backref="wallet")
+
+    __table_args__ = (
+        CheckConstraint("wallet_tier IN ('starter_wallet', 'growth', 'power')", name="check_wallet_tier"),
+    )
+
+    def __repr__(self):
+        return f"<WalletBalance(subscriber={self.subscriber_id}, tier={self.wallet_tier}, credits={self.credits_remaining})>"
+
+
+class WalletTransaction(Base):
+    """Individual credit transaction (debit, credit, reload, bonus, refund)."""
+    __tablename__ = "wallet_transactions"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=False, index=True)
+    wallet_id: Mapped[int] = mapped_column(Integer, ForeignKey("wallet_balances.id"), nullable=False, index=True)
+    txn_type: Mapped[str] = mapped_column(String(20), nullable=False)  # credit/debit/reload/bonus/refund
+    amount: Mapped[int] = mapped_column(Integer, nullable=False)       # positive = added, negative = spent
+    balance_after: Mapped[int] = mapped_column(Integer, nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(String(255))
+    stripe_charge_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    wallet = relationship("WalletBalance", backref="transactions")
+
+    __table_args__ = (
+        CheckConstraint("txn_type IN ('credit', 'debit', 'reload', 'bonus', 'refund')", name="check_txn_type"),
+        Index("idx_wallet_txn_sub_created", "subscriber_id", "created_at"),
+    )
+
+    def __repr__(self):
+        return f"<WalletTransaction(id={self.id}, type={self.txn_type}, amount={self.amount})>"
+
+
+class UserSegment(Base):
+    """Behavioral segment classification per subscriber (1:1)."""
+    __tablename__ = "user_segments"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=False, unique=True, index=True)
+    segment: Mapped[str] = mapped_column(String(30), nullable=False)  # 8 buckets
+    revenue_signal_score: Mapped[Optional[int]] = mapped_column(Integer, default=0)  # 0–100
+    last_classified_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    classification_reason: Mapped[Optional[str]] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc)
+    )
+
+    subscriber = relationship("Subscriber", backref="segment")
+
+    __table_args__ = (
+        CheckConstraint(
+            "segment IN ('new', 'browsing', 'engaged', 'wallet_active', 'high_intent', 'lock_candidate', 'at_risk', 'churned')",
+            name="check_user_segment",
+        ),
+    )
+
+    def __repr__(self):
+        return f"<UserSegment(subscriber={self.subscriber_id}, segment={self.segment}, score={self.revenue_signal_score})>"
+
+
+class MessageOutcome(Base):
+    """
+    Tracks every outbound message (SMS, email, voice) and its conversion attribution.
+    Ground truth for all Cora learning — must log from Day 1.
+    """
+    __tablename__ = "message_outcomes"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("subscribers.id"), index=True)
+    message_type: Mapped[str] = mapped_column(String(20), nullable=False)  # sms/email/voice
+    template_id: Mapped[Optional[str]] = mapped_column(String(100))
+    variant_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)  # A/B test variant
+    channel: Mapped[Optional[str]] = mapped_column(String(50))  # twilio/ses/synthflow
+    sent_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    opened_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    clicked_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    replied_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    conversion_type: Mapped[Optional[str]] = mapped_column(String(30))  # unlock/wallet/lock/annual/none
+    conversion_within_4h: Mapped[bool] = mapped_column(Boolean, default=False)
+    conversion_within_24h: Mapped[bool] = mapped_column(Boolean, default=False)
+    conversion_within_48h: Mapped[bool] = mapped_column(Boolean, default=False)
+    revenue_attributed: Mapped[Optional[float]] = mapped_column(Numeric(10, 2))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        CheckConstraint("message_type IN ('sms', 'email', 'voice')", name="check_message_type"),
+        Index("idx_msg_outcome_sub_sent", "subscriber_id", "sent_at"),
+    )
+
+    def __repr__(self):
+        return f"<MessageOutcome(id={self.id}, type={self.message_type}, conversion={self.conversion_type})>"
+
+
+class DealOutcome(Base):
+    """
+    Tracks confirmed deals reported by subscribers. Feeds revenue signal score,
+    annual push triggers, and attribution.
+    """
+    __tablename__ = "deal_outcomes"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=False, index=True)
+    property_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("properties.id"), index=True)
+    deal_size_bucket: Mapped[Optional[str]] = mapped_column(String(20))  # 5_10k/10_25k/25k_plus/skip
+    deal_amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
+    deal_date: Mapped[Optional[date]] = mapped_column(Date)
+    lead_source: Mapped[Optional[str]] = mapped_column(String(50))  # which signal drove the lead
+    days_to_close: Mapped[Optional[int]] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        CheckConstraint(
+            "deal_size_bucket IN ('5_10k', '10_25k', '25k_plus', 'skip')",
+            name="check_deal_size_bucket",
+        ),
+        Index("idx_deal_outcome_sub_date", "subscriber_id", "deal_date"),
+    )
+
+    def __repr__(self):
+        return f"<DealOutcome(id={self.id}, subscriber={self.subscriber_id}, bucket={self.deal_size_bucket})>"
+
+
+class LearningCard(Base):
+    """
+    Weekly Cora learning summary. Sunday midnight LangGraph job writes one card
+    per type. Cora reads the most recent cards at the start of every decision tree.
+    """
+    __tablename__ = "learning_cards"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    card_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    card_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    summary_text: Mapped[str] = mapped_column(Text, nullable=False)
+    data_json: Mapped[Optional[dict]] = mapped_column(JSONB)        # raw metrics
+    action_taken: Mapped[Optional[str]] = mapped_column(String(255))  # what Cora did
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        CheckConstraint(
+            "card_type IN ('message_perf', 'deal_pattern', 'ab_result', 'churn_signal', 'pricing_test', 'general')",
+            name="check_card_type",
+        ),
+        UniqueConstraint("card_date", "card_type", name="uq_learning_card_date_type"),
+    )
+
+    def __repr__(self):
+        return f"<LearningCard(date={self.card_date}, type={self.card_type})>"
+
+
+class ReferralEvent(Base):
+    """
+    Referral chain tracking. One row per referral attempt.
+    Milestone escalation: 1 ref = 5 credits, 3 refs = free month, 5 refs = lock upgrade.
+    """
+    __tablename__ = "referral_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    referrer_subscriber_id: Mapped[int] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=False, index=True)
+    referee_subscriber_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("subscribers.id"), index=True)
+    referral_code: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    reward_type: Mapped[Optional[str]] = mapped_column(String(30))   # credits/free_month/lock_upgrade
+    reward_value: Mapped[Optional[str]] = mapped_column(String(50))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'confirmed', 'rewarded', 'expired')",
+            name="check_referral_status",
+        ),
+        Index("idx_referral_referrer_status", "referrer_subscriber_id", "status"),
+    )
+
+    def __repr__(self):
+        return f"<ReferralEvent(referrer={self.referrer_subscriber_id}, status={self.status})>"
+
+
+class AbTest(Base):
+    """A/B test definition. Cora creates and manages tests within guardrail bounds."""
+    __tablename__ = "ab_tests"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    test_name: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
+    segment: Mapped[Optional[str]] = mapped_column(String(30))  # target user segment
+    variant_a: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    variant_b: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    traffic_pct: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    winner: Mapped[Optional[str]] = mapped_column(String(10))  # 'a' / 'b'
+
+    __table_args__ = (
+        CheckConstraint("status IN ('active', 'completed', 'rolled_back')", name="check_ab_test_status"),
+        CheckConstraint("traffic_pct BETWEEN 1 AND 100", name="check_ab_traffic_pct"),
+    )
+
+    def __repr__(self):
+        return f"<AbTest(name={self.test_name}, status={self.status})>"
+
+
+class AbAssignment(Base):
+    """Individual subscriber assignment to an A/B test variant."""
+    __tablename__ = "ab_assignments"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    test_id: Mapped[int] = mapped_column(Integer, ForeignKey("ab_tests.id"), nullable=False, index=True)
+    subscriber_id: Mapped[int] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=False, index=True)
+    variant: Mapped[str] = mapped_column(String(10), nullable=False)  # 'a' or 'b'
+    outcome: Mapped[Optional[str]] = mapped_column(String(30))  # converted/ignored/bounced
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    test = relationship("AbTest", backref="assignments")
+
+    __table_args__ = (
+        UniqueConstraint("test_id", "subscriber_id", name="uq_ab_assignment"),
+    )
