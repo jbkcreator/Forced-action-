@@ -238,12 +238,17 @@ class MultiVerticalScorer:
             # OWNER is the defendant (being evicted from their own home).
             # Landlord-vs-tenant filings (owner evicting a tenant) are routine
             # property management — not an owner-in-distress signal.
-            if sig_type == "evictions" and proc.associated_party:
+            if sig_type == "evictions":
                 owner = prop.owner
                 if owner and owner.owner_name:
                     def _tokens(s: str):
                         import re
                         return {t for t in re.sub(r"[^a-z\s]", "", s.lower()).split() if len(t) > 2}
+                    # No party info → direction unknown → skip to avoid false positives.
+                    # (previously null associated_party bypassed this check entirely,
+                    # causing all null-party evictions to score as owner-distress.)
+                    if not proc.associated_party:
+                        continue
                     if not (_tokens(proc.associated_party) & _tokens(owner.owner_name)):
                         continue  # defendant is a tenant, not the property owner
             signals.append({"type": sig_type, "date": proc.filing_date, "amount": proc.amount})
@@ -1347,29 +1352,39 @@ class MultiVerticalScorer:
             tier_silver=tier_counts.get('Silver', 0),
             tier_bronze=tier_counts.get('Bronze', 0),
         )
-        # Scoring counters must accumulate across multiple ingestion-time scoring
-        # runs per day (each scraper triggers score_properties_by_ids independently).
-        # Signal totals are overwritten because they're already rolled up live from
-        # scraper_run_stats and reflect the full-day picture on each call.
+        # ON CONFLICT rules:
+        #   ACCUMULATE  — leads_new, leads_updated, leads_qualified, leads_upgraded:
+        #     these are events. Each scraper-triggered scoring run (score_properties_by_ids)
+        #     may add genuinely new/updated leads during the day; we want the daily total.
+        #   OVERWRITE   — everything else:
+        #     tier counts and properties_scored are snapshots of the current pool.
+        #     A --rescore-all run re-evaluates all 523k properties; accumulating that
+        #     across 3 runs would show 1.57M "scored" and 3× inflated tier counts.
+        #     The latest run is always the most accurate picture.
         stmt = stmt.on_conflict_do_update(
             constraint='uq_platform_daily_stats',
             set_=dict(
+                # Signal totals — always overwrite (rolled up from scraper_run_stats)
                 signals_scraped=int(signal_row.scraped),
                 signals_matched=int(signal_row.matched),
                 signals_skipped=int(signal_row.skipped),
-                properties_scored=PlatformDailyStats.properties_scored + stmt.excluded.properties_scored,
-                properties_with_signals=PlatformDailyStats.properties_with_signals + stmt.excluded.properties_with_signals,
+                # Snapshot counters — overwrite with latest run
+                properties_scored=stmt.excluded.properties_scored,
+                properties_with_signals=stmt.excluded.properties_with_signals,
+                leads_unchanged=stmt.excluded.leads_unchanged,
+                # Run counter — accumulate
                 score_runs_total=PlatformDailyStats.score_runs_total + stmt.excluded.score_runs_total,
+                # Event counters — accumulate across scraper-triggered runs
                 leads_new=PlatformDailyStats.leads_new + stmt.excluded.leads_new,
                 leads_updated=PlatformDailyStats.leads_updated + stmt.excluded.leads_updated,
-                leads_unchanged=PlatformDailyStats.leads_unchanged + stmt.excluded.leads_unchanged,
                 leads_qualified=PlatformDailyStats.leads_qualified + stmt.excluded.leads_qualified,
                 leads_upgraded=PlatformDailyStats.leads_upgraded + stmt.excluded.leads_upgraded,
-                tier_ultra_platinum=PlatformDailyStats.tier_ultra_platinum + stmt.excluded.tier_ultra_platinum,
-                tier_platinum=PlatformDailyStats.tier_platinum + stmt.excluded.tier_platinum,
-                tier_gold=PlatformDailyStats.tier_gold + stmt.excluded.tier_gold,
-                tier_silver=PlatformDailyStats.tier_silver + stmt.excluded.tier_silver,
-                tier_bronze=PlatformDailyStats.tier_bronze + stmt.excluded.tier_bronze,
+                # Tier counts — overwrite (snapshot of current pool, not a running total)
+                tier_ultra_platinum=stmt.excluded.tier_ultra_platinum,
+                tier_platinum=stmt.excluded.tier_platinum,
+                tier_gold=stmt.excluded.tier_gold,
+                tier_silver=stmt.excluded.tier_silver,
+                tier_bronze=stmt.excluded.tier_bronze,
                 updated_at=datetime.now(timezone.utc),
             )
         )

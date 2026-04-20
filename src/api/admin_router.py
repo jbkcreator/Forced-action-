@@ -170,15 +170,15 @@ def upload_tax_delinquency(
     )
 
     loader = TaxDelinquencyLoader(db, county_id=county_id)
-    matched, unmatched, skipped = loader.load_from_dataframe(df)
+    matched, updated, unmatched = loader.load_from_dataframe(df)
 
     logger.info(
-        "[Admin] Upload complete: matched=%d unmatched=%d skipped=%d",
-        matched, unmatched, skipped,
+        "[Admin] Upload complete: inserted=%d updated=%d unmatched=%d",
+        matched, updated, unmatched,
     )
     return {
         "matched": matched,
+        "updated": updated,
         "unmatched": unmatched,
-        "skipped": skipped,
         "total_rows": total_rows,
     }

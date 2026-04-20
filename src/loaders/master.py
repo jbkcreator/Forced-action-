@@ -25,14 +25,16 @@ class MasterPropertyLoader(BaseLoader):
             return None
         
         s = str(value).strip()
-        # ZIP must be numeric or numeric with dash (5 digits or 5+4)
+        # ZIP must be numeric or numeric with dash (5 digits or 5+4).
+        # Always store only the 5-digit base — ZIP+4 suffix is discarded so that
+        # territory exclusivity queries group correctly (33613-1371 → 33613).
         if re.match(r'^\d{5}(-\d{4})?$', s):
-            return s[:10]  # Max 10 chars
-        
-        # If it looks like a ZIP at the start, extract it
+            return s[:5]
+
+        # If it looks like a ZIP at the start, extract and truncate
         match = re.match(r'^(\d{5}(-\d{4})?)', s)
         if match:
-            return match.group(1)[:10]
+            return match.group(1)[:5]
         
         return None
     

@@ -473,11 +473,12 @@
       <h2 class="text-xl font-bold mb-1" id="zip-collector-title">Select Your ZIP Territories</h2>
       <p class="text-slate-400 text-sm mb-5" id="zip-collector-subtitle"></p>
       <div id="zip-collector-list" class="space-y-2 mb-4"></div>
-      <div class="flex gap-2 mb-5">
+      <div class="flex gap-2 mb-2">
         <input id="zip-collector-input" type="text" maxlength="5" placeholder="Add ZIP code"
           class="flex-1 bg-white/[0.06] border border-white/[0.1] rounded-xl px-4 py-2.5 text-white placeholder-slate-500 focus:outline-none focus:border-yellow-400/40 text-sm"/>
-        <button onclick="addZipToCollector()" class="px-4 py-2.5 bg-white/[0.08] border border-white/[0.1] hover:bg-white/[0.14] rounded-xl text-sm font-medium transition">Add</button>
+        <button id="zip-collector-add-btn" onclick="addZipToCollector()" class="px-4 py-2.5 bg-white/[0.08] border border-white/[0.1] hover:bg-white/[0.14] rounded-xl text-sm font-medium transition">Add</button>
       </div>
+      <p id="zip-collector-feedback" class="text-xs mb-4 min-h-[1.25rem]"></p>
       <button onclick="proceedToCheckout()" id="zip-collector-proceed"
         class="btn-primary w-full bg-yellow-400 hover:bg-yellow-300 text-black font-bold py-3 rounded-xl transition">
         Continue to Payment
@@ -794,6 +795,8 @@
       document.getElementById('zip-collector-subtitle').textContent =
         `Your ${tier.charAt(0).toUpperCase()+tier.slice(1)} plan includes ${limit} exclusive ZIP territories. Add ${limit} ZIPs to continue.`;
       document.getElementById('zip-collector-modal').style.display = 'flex';
+      document.getElementById('zip-collector-feedback').textContent = '';
+      document.getElementById('zip-collector-feedback').className = 'text-xs mb-4 min-h-[1.25rem]';
       renderCollectorList();
     }
 
@@ -804,7 +807,7 @@
         ? '<p class="text-slate-500 text-sm">No ZIPs added yet.</p>'
         : collectorZips.map((z, i) => `
             <div class="flex items-center justify-between bg-white/5 border border-white/10 rounded-xl px-4 py-2.5">
-              <span class="text-sm font-medium">ZIP ${z}</span>
+              <span class="text-sm font-medium"><span style="color:#4ade80;margin-right:6px;">&#10003;</span>ZIP ${z}</span>
               <button onclick="removeZip(${i})" class="text-slate-500 hover:text-red-400 text-xs transition">Remove</button>
             </div>`).join('');
 
@@ -819,20 +822,69 @@
         : `Add ${limit - collectorZips.length} more ZIP${limit - collectorZips.length !== 1 ? 's' : ''} to continue`;
     }
 
-    function addZipToCollector() {
-      const input = document.getElementById('zip-collector-input');
-      const zip = input.value.trim();
-      const limit = TIER_ZIP_LIMITS[collectorTier];
-      if (!/^\d{5}$/.test(zip)) { alert('Enter a valid 5-digit ZIP.'); return; }
-      if (collectorZips.includes(zip)) { alert('ZIP already added.'); return; }
-      if (collectorZips.length >= limit) { alert(`You can only select ${limit} ZIPs for the ${collectorTier} plan.`); return; }
-      collectorZips.push(zip);
-      input.value = '';
-      renderCollectorList();
+    async function addZipToCollector() {
+      const input   = document.getElementById('zip-collector-input');
+      const feedback = document.getElementById('zip-collector-feedback');
+      const addBtn  = document.getElementById('zip-collector-add-btn');
+      const zip     = input.value.trim();
+      const limit   = TIER_ZIP_LIMITS[collectorTier];
+
+      feedback.textContent = '';
+      feedback.className   = 'text-xs mb-4 min-h-[1.25rem]';
+
+      if (!/^\d{5}$/.test(zip)) {
+        feedback.textContent = 'Enter a valid 5-digit ZIP code.';
+        feedback.className  += ' text-red-400';
+        return;
+      }
+      if (collectorZips.includes(zip)) {
+        feedback.textContent = `ZIP ${zip} is already in your list.`;
+        feedback.className  += ' text-yellow-400';
+        return;
+      }
+      if (collectorZips.length >= limit) {
+        feedback.textContent = `You can only select ${limit} ZIP${limit !== 1 ? 's' : ''} for the ${collectorTier} plan.`;
+        feedback.className  += ' text-red-400';
+        return;
+      }
+
+      // Check availability before adding
+      addBtn.disabled     = true;
+      addBtn.textContent  = 'Checking…';
+      try {
+        const res  = await fetch(`${API_BASE}/api/zip-check?zip_code=${zip}&vertical=${selectedVertical}&county_id=hillsborough`);
+        const data = await res.json();
+
+        if (data.status === 'available') {
+          collectorZips.push(zip);
+          input.value          = '';
+          feedback.textContent = `✓ ZIP ${zip} is available.`;
+          feedback.className  += ' text-green-400';
+          renderCollectorList();
+        } else if (data.status === 'taken') {
+          feedback.textContent = `✗ ZIP ${zip} is already locked by another subscriber. Please choose a different ZIP.`;
+          feedback.className  += ' text-red-400';
+        } else if (data.status === 'grace') {
+          feedback.textContent = `ZIP ${zip} is opening soon (in grace period). Please choose a different ZIP.`;
+          feedback.className  += ' text-yellow-400';
+        } else {
+          feedback.textContent = `ZIP ${zip} is not in the Hillsborough County service area.`;
+          feedback.className  += ' text-red-400';
+        }
+      } catch (e) {
+        feedback.textContent = 'Could not check availability — please try again.';
+        feedback.className  += ' text-red-400';
+      } finally {
+        addBtn.disabled    = false;
+        addBtn.textContent = 'Add';
+      }
     }
 
     function removeZip(idx) {
       collectorZips.splice(idx, 1);
+      const fb = document.getElementById('zip-collector-feedback');
+      fb.textContent = '';
+      fb.className = 'text-xs mb-4 min-h-[1.25rem]';
       renderCollectorList();
     }
 

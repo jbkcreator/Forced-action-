@@ -464,6 +464,36 @@ def create_checkout(payload: CheckoutRequest, db: Session = Depends(get_db)):
             detail={"error": "price_not_configured", "message": f"No price configured for tier '{payload.tier}'"},
         )
 
+    # Validate ZIP availability before taking payment.
+    # Without this check a subscriber can pay, the webhook fires, and any ZIPs that
+    # were locked between zip-check and payment completion are silently dropped —
+    # leaving them with fewer territories than they paid for.
+    try:
+        taken_zips = db.execute(
+            select(ZipTerritory.zip_code).where(
+                ZipTerritory.zip_code.in_(payload.zip_codes),
+                ZipTerritory.vertical == payload.vertical,
+                ZipTerritory.county_id == payload.county_id,
+                ZipTerritory.status == "locked",
+            )
+        ).scalars().all()
+    except OperationalError:
+        logger.error("DB error checking ZIP availability at checkout", exc_info=True)
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
+
+    if taken_zips:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "zips_unavailable",
+                "message": (
+                    f"ZIP code(s) {', '.join(sorted(taken_zips))} are no longer available. "
+                    "Please go back and select different ZIP codes."
+                ),
+                "unavailable_zips": sorted(taken_zips),
+            },
+        )
+
     try:
         session = stripe.checkout.Session.create(
             mode="subscription",

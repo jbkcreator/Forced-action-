@@ -12,6 +12,7 @@ Entry point: handle_webhook(raw_body, sig_header) — call this from your web fr
 """
 
 import logging
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -78,6 +79,21 @@ def handle_webhook(raw_body: bytes, sig_header: str, db: Session) -> tuple[bool,
 
     logger.info("Stripe webhook received: %s id=%s", event_type, event_id)
 
+    # ── Stale event guard (checkout only) ────────────────────────────────────
+    # Stripe can replay checkout.session.completed hours or days later on retry.
+    # A stale replay re-runs the full subscriber creation path and is the primary
+    # cause of duplicate subscriber rows.  Return 200 so Stripe stops retrying,
+    # but skip all processing.  Invoice events are legitimately delayed (dunning),
+    # so we only guard checkout here.
+    if event_type == "checkout.session.completed":
+        age_seconds = time.time() - event.get("created", 0)
+        if age_seconds > 86400:
+            logger.warning(
+                "Stale checkout.session.completed event %s (age=%ds) — skipping to prevent duplicate subscriber",
+                event_id, int(age_seconds),
+            )
+            return True, "Stale event skipped"
+
     # ── Idempotency guard ─────────────────────────────────────────────────────
     # Insert the event_id before processing. If the unique constraint fires,
     # this event was already handled — return immediately without side effects.
@@ -141,7 +157,9 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
 
     stripe_customer_id     = session.get("customer")
     stripe_subscription_id = session.get("subscription")
-    customer_email         = session.get("customer_details", {}).get("email")
+    # Normalize email immediately — prevents case-variant duplicates (Fix 1)
+    _raw_email             = session.get("customer_details", {}).get("email") or ""
+    customer_email         = _raw_email.lower().strip() or None
     customer_name          = session.get("customer_details", {}).get("name")
 
     if not all([tier, vertical, county_id, stripe_customer_id]):
@@ -164,21 +182,53 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
             .with_for_update()
         ).scalar_one_or_none()
 
-        if row:
-            row.count += 1
-            if row.count == 10:
-                logger.info(
-                    "FOUNDING LIMIT REACHED: tier=%s vertical=%s county=%s"
-                    " — landing page will now show regular price",
-                    tier, vertical, county_id,
-                )
+        if row is None:
+            row = FoundingSubscriberCount(
+                tier=tier,
+                vertical=vertical,
+                county_id=county_id,
+                count=0,
+            )
+            db.add(row)
+            db.flush()
+        row.count += 1
+        if row.count == settings.founding_spot_limit:
+            logger.info(
+                "FOUNDING LIMIT REACHED: tier=%s vertical=%s county=%s"
+                " — landing page will now show regular price",
+                tier, vertical, county_id,
+            )
 
-    # ── Create or update Subscriber ────────────────────────────────────────
+    # ── Create or update Subscriber (two-stage lookup) ────────────────────
+    # Stage 1: look up by stripe_customer_id (returning customer, plan change)
     subscriber = db.execute(
         select(Subscriber).where(Subscriber.stripe_customer_id == stripe_customer_id)
     ).scalar_one_or_none()
 
+    # Stage 2: if not found by Stripe ID, look for an existing active/grace row
+    # with the same normalised email + vertical + county.  This catches the case
+    # where the same person checks out again (stale replay, duplicate browser tab,
+    # re-subscribe after cancel before the DB constraint was in place).
+    is_new_subscriber = False
+    if subscriber is None and customer_email:
+        subscriber = db.execute(
+            select(Subscriber).where(
+                Subscriber.email == customer_email,
+                Subscriber.vertical == vertical,
+                Subscriber.county_id == county_id,
+                Subscriber.status.in_(["active", "grace"]),
+            )
+        ).scalar_one_or_none()
+        if subscriber is not None:
+            logger.warning(
+                "checkout.session.completed: duplicate detected — email=%s vertical=%s county=%s"
+                " already has subscriber id=%s — merging onto existing row, skipping welcome email",
+                customer_email, vertical, county_id, subscriber.id,
+            )
+
     if subscriber is None:
+        # Genuinely new subscriber
+        is_new_subscriber = True
         subscriber = Subscriber(
             stripe_customer_id=stripe_customer_id,
             stripe_subscription_id=stripe_subscription_id,
@@ -196,16 +246,17 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
         )
         db.add(subscriber)
     else:
-        # Existing customer upgrading — never overwrite founding_price_id
+        # Existing row (by Stripe ID or by email match) — update billing fields only.
+        # Never overwrite founding_price_id, event_feed_uuid, or rate_locked_at.
+        subscriber.stripe_customer_id     = stripe_customer_id
         subscriber.stripe_subscription_id = stripe_subscription_id
-        subscriber.tier = tier
-        subscriber.vertical = vertical
-        subscriber.status = "active"
+        subscriber.tier    = tier
+        subscriber.status  = "active"
         subscriber.ghl_stage = 5
         if is_founding and not subscriber.founding_member:
-            subscriber.founding_member = True
-            subscriber.founding_price_id = founding_price_id
-            subscriber.rate_locked_at = now
+            subscriber.founding_member    = True
+            subscriber.founding_price_id  = founding_price_id
+            subscriber.rate_locked_at     = now
 
     db.flush()  # get subscriber.id before ZIP territory inserts
 
@@ -262,19 +313,20 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
             exc_info=True,
         )
 
-    # ── Welcome email with Event Feed UUID ────────────────────────────────
-    if subscriber.email:
-        _send_welcome_email(subscriber)
+    # ── Welcome email + first leads (new subscribers only) ────────────────
+    # Skipped when we merged onto an existing row — subscriber is already onboarded.
+    if is_new_subscriber:
+        if subscriber.email:
+            _send_welcome_email(subscriber)
 
-    # ── Immediate first-leads delivery (eliminates 13-hour silence) ───────
-    if subscriber.email and zip_codes:
-        try:
-            _send_first_leads_email(subscriber, zip_codes, db)
-        except Exception:
-            logger.error(
-                "First leads email failed for subscriber %s — non-critical",
-                subscriber.id, exc_info=True,
-            )
+        if subscriber.email and zip_codes:
+            try:
+                _send_first_leads_email(subscriber, zip_codes, db)
+            except Exception:
+                logger.error(
+                    "First leads email failed for subscriber %s — non-critical",
+                    subscriber.id, exc_info=True,
+                )
 
     logger.info(
         "checkout.session.completed: subscriber=%s tier=%s vertical=%s"

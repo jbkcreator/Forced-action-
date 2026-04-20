@@ -350,7 +350,7 @@ def _build_zip_breakdown(session, run_date: date, county_id: str, top_n: int = 2
     """
     rows = session.execute(
         text("""
-            SELECT p.zip, latest.lead_tier, COUNT(*) AS cnt
+            SELECT LEFT(p.zip, 5) AS zip, latest.lead_tier, COUNT(*) AS cnt
             FROM (
                 SELECT DISTINCT ON (ds.property_id)
                     ds.property_id, ds.lead_tier
@@ -362,7 +362,7 @@ def _build_zip_breakdown(session, run_date: date, county_id: str, top_n: int = 2
             JOIN properties p ON p.id = latest.property_id
             WHERE latest.lead_tier = ANY(:tiers)
               AND p.zip IS NOT NULL
-            GROUP BY p.zip, latest.lead_tier
+            GROUP BY LEFT(p.zip, 5), latest.lead_tier
         """),
         {"county_id": county_id, "run_date": run_date, "tiers": list(GOLD_PLUS_TIERS)},
     ).fetchall()
@@ -470,48 +470,57 @@ def _build_gold_delta(session, run_date: date, county_id: str) -> dict:
 
 def _build_signal_composition(session, run_date: date, county_id: str) -> dict:
     """
-    Top signals driving Gold+ scores per vertical today.
-    Uses jsonb_array_elements_text on distress_types.
-    Returns {vertical_label: [(signal, count), ...]}.
+    Primary signal distribution across the standing Gold+ pool.
+
+    Previously queried distress_types for scores written *today only*, which
+    returned near-zero counts on days when major scrapers didn't run.  Now uses
+    the standing pool (latest score per property as of run_date) and extracts the
+    true primary signal from factor_scores JSONB — the same field the scoring
+    engine uses internally to decide which signal drove each vertical score.
+
+    Returns {vertical_label: [(signal_type, count), ...]} top-10 per vertical.
     """
     sql = text("""
-        SELECT
-            ds.vertical_scores,
-            jsonb_array_elements_text(ds.distress_types) AS signal,
-            COUNT(*) AS cnt
-        FROM distress_scores ds
-        WHERE
-            DATE(ds.score_date) = :run_date
-            AND ds.lead_tier = ANY(:tiers)
-            AND ds.county_id = :county_id
-            AND ds.distress_types IS NOT NULL
-            AND ds.distress_types != 'null'::jsonb
-        GROUP BY ds.vertical_scores, signal
+        SELECT lead_tier, vertical_scores, factor_scores
+        FROM (
+            SELECT DISTINCT ON (property_id)
+                property_id, lead_tier, vertical_scores, factor_scores
+            FROM distress_scores
+            WHERE county_id = :county_id
+              AND date(score_date) <= :run_date
+            ORDER BY property_id, score_date DESC
+        ) latest
+        WHERE lead_tier = ANY(:tiers)
+          AND factor_scores IS NOT NULL
     """)
 
     try:
         rows = session.execute(sql, {
-            "run_date": run_date,
-            "tiers":    list(GOLD_PLUS_TIERS),
             "county_id": county_id,
+            "run_date":  run_date,
+            "tiers":     list(GOLD_PLUS_TIERS),
         }).fetchall()
     except Exception:
         return {}
 
-    # Map best vertical → signal counts
-    vertical_signals = defaultdict(lambda: defaultdict(int))
-    for vs_json, signal, cnt in rows:
-        if not vs_json:
+    from collections import Counter
+    vertical_signals: dict = {key: Counter() for key in VERTICAL_DISPLAY}
+
+    for _tier, vs_json, fs_json in rows:
+        if not vs_json or not fs_json:
             continue
+        # Best vertical for this property (highest vertical score)
         best = max(vs_json, key=lambda k: vs_json.get(k, 0))
-        if best in VERTICAL_DISPLAY:
-            vertical_signals[best][signal] += cnt
+        if best not in VERTICAL_DISPLAY:
+            continue
+        vb = fs_json.get("vertical_breakdown", {})
+        primary = vb.get(best, {}).get("primary_signal")
+        if primary:
+            vertical_signals[best][primary] += 1
 
     result = {}
     for key, label in VERTICAL_DISPLAY.items():
-        signals = vertical_signals.get(key, {})
-        top = sorted(signals.items(), key=lambda x: x[1], reverse=True)[:5]
-        result[label] = top
+        result[label] = vertical_signals[key].most_common(10)
     return result
 
 

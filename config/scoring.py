@@ -311,8 +311,8 @@ ROUTING_THRESHOLDS = {
 # Maps final_cds_score ranges to DistressScore.lead_tier values.
 
 LEAD_TIER_THRESHOLDS = [
-    (90, "Ultra Platinum"),
-    (80, "Platinum"),
+    (95, "Ultra Platinum"),   # raised from 90 — base weights of 90/85 made UP too accessible
+    (83, "Platinum"),          # raised from 80 — wider 83–94 band is defensible at price
     (57, "Gold"),
     (40, "Silver"),
     (0,  "Bronze"),
