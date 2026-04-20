@@ -30,7 +30,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator, model_validator, EmailStr
 from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
-from sqlalchemy import select, and_, or_, desc, func, cast, Date
+from sqlalchemy import select, and_, or_, desc, func, cast, text, Date
 
 from src.core.database import get_db_context
 from src.core.models import FoundingSubscriberCount, ZipTerritory, Subscriber, Property, DistressScore, Incident, LeadPackPurchase, ScraperRunStats, EnrichedContact
@@ -906,6 +906,113 @@ def zip_check(
         "vertical": vertical,
         "status": "taken",
         "message": "This ZIP is locked by another subscriber",
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /api/zip-availability — bulk ZIP availability for a vertical/county
+# ---------------------------------------------------------------------------
+
+@app.get("/api/zip-availability")
+def zip_availability(
+    vertical: str = "roofing",
+    county_id: str = "hillsborough",
+    db: Session = Depends(get_db),
+):
+    """
+    Returns all ZIPs in a county with their availability status for a given vertical.
+    Used by the ZIP selector UI to show a pickable grid instead of manual entry.
+
+    Response: { zips: [ { zip_code, status, property_count, lead_count } ] }
+    """
+    if vertical not in VALID_VERTICALS:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_vertical", "message": f"vertical must be one of: {sorted(VALID_VERTICALS)}"},
+        )
+
+    try:
+        # All distinct ZIPs with property counts
+        zip_rows = db.execute(
+            text("""
+                SELECT p.zip, COUNT(*) AS prop_count
+                FROM properties p
+                WHERE p.county_id = :county_id
+                  AND p.zip IS NOT NULL
+                  AND LENGTH(p.zip) = 5
+                GROUP BY p.zip
+                ORDER BY p.zip
+            """),
+            {"county_id": county_id},
+        ).fetchall()
+    except OperationalError:
+        logger.error("DB error in zip-availability (properties)", exc_info=True)
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable"})
+
+    if not zip_rows:
+        return {"vertical": vertical, "county_id": county_id, "zips": []}
+
+    all_zips = [r[0] for r in zip_rows]
+    prop_counts = {r[0]: r[1] for r in zip_rows}
+
+    # Locked/grace territories for this vertical
+    try:
+        territory_rows = db.execute(
+            select(ZipTerritory.zip_code, ZipTerritory.status).where(
+                ZipTerritory.zip_code.in_(all_zips),
+                ZipTerritory.vertical == vertical,
+                ZipTerritory.county_id == county_id,
+                ZipTerritory.status.in_(["locked", "grace"]),
+            )
+        ).fetchall()
+    except OperationalError:
+        logger.error("DB error in zip-availability (territories)", exc_info=True)
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable"})
+
+    taken_map = {r[0]: r[1] for r in territory_rows}  # zip -> "locked" | "grace"
+
+    # Gold+ lead counts per ZIP (latest scores)
+    try:
+        lead_rows = db.execute(
+            text("""
+                SELECT p.zip, COUNT(*) AS lead_count
+                FROM properties p
+                JOIN distress_scores ds ON ds.property_id = p.id
+                WHERE p.county_id = :county_id
+                  AND p.zip IS NOT NULL
+                  AND LENGTH(p.zip) = 5
+                  AND ds.lead_tier IN ('Ultra Platinum', 'Platinum', 'Gold')
+                  AND ds.qualified = true
+                GROUP BY p.zip
+            """),
+            {"county_id": county_id},
+        ).fetchall()
+    except OperationalError:
+        lead_rows = []
+
+    lead_counts = {r[0]: r[1] for r in lead_rows}
+
+    result = []
+    for zip_code in all_zips:
+        status = taken_map.get(zip_code)
+        if status == "locked":
+            availability = "taken"
+        elif status == "grace":
+            availability = "grace"
+        else:
+            availability = "available"
+
+        result.append({
+            "zip_code": zip_code,
+            "status": availability,
+            "property_count": prop_counts.get(zip_code, 0),
+            "lead_count": lead_counts.get(zip_code, 0),
+        })
+
+    return {
+        "vertical": vertical,
+        "county_id": county_id,
+        "zips": result,
     }
 
 
