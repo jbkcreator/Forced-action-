@@ -589,15 +589,19 @@ def write_csv(report: dict, path: Path) -> None:
         w.writerow([])
 
         # ── Section 2: Scoring Summary ────────────────────────────────────
-        w.writerow(["SCORING"])
+        # NOTE: "Leads scored/updated" counts come from the CDS scoring engine
+        # which rescores ALL properties against ALL existing signals in the DB —
+        # not just today's scraped records. A low scrape count + high score count
+        # is normal: it means existing signals produced new/changed scores.
+        w.writerow(["SCORING (full rescore of all properties — not limited to today's scrapes)"])
         w.writerow([f"Total Properties Scored: {report['scoring']['properties_scored']:,}"])
         w.writerow([])
         w.writerow(["Metric", "Count"])
         for key, label in [
             ("properties_with_signals", "Properties w/ signals"),
-            ("leads_new",               "Leads new today"),
-            ("leads_updated",           "Leads updated"),
-            ("leads_unchanged",         "Leads unchanged"),
+            ("leads_new",               "Scores new/changed today"),
+            ("leads_updated",           "Scores updated"),
+            ("leads_unchanged",         "Scores unchanged"),
         ]:
             w.writerow([label, f"{report['scoring'][key]:,}"])
         w.writerow([])
