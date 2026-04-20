@@ -271,17 +271,22 @@ def run_skip_trace(
         index_map = []  # parallel list: index_map[i] = (owner, prop) for payloads[i]
 
         for owner, prop in batch:
-            if not prop.address or not prop.zip:
+            street = (prop.address or "").strip()
+            city   = (prop.city or "Tampa").strip()
+            state  = (prop.state or "FL").strip()
+            zip_code = (prop.zip or "").strip()[:5]  # always 5-digit
+
+            if not street or not zip_code:
                 stats["no_address"] += 1
                 logger.debug(f"Skipping property_id={prop.id} — missing address or ZIP")
                 continue
 
             payload_entry = {
                 "propertyAddress": {
-                    "street": prop.address,
-                    "city":   prop.city  or "Tampa",
-                    "state":  prop.state or "FL",
-                    "zip":    prop.zip,
+                    "street": street,
+                    "city":   city,
+                    "state":  state,
+                    "zip":    zip_code,
                 }
             }
 
@@ -296,22 +301,41 @@ def run_skip_trace(
         except Exception as e:
             err_msg = str(e)
             logger.error(f"BatchData API error on batch {batch_num}: {err_msg}")
-            stats["failed"] += len(payloads)
 
-            # Alert on credential/billing failures — these won't self-heal
-            if "402" in err_msg or "401" in err_msg:
-                send_alert(
-                    subject="[Forced Action] BatchData API CREDENTIAL ERROR",
-                    body=(
-                        f"Skip-trace enrichment halted: {err_msg}\n\n"
-                        f"Action required:\n"
-                        f"  1. Check BATCH_SKIP_TRACING_API_KEY in .env\n"
-                        f"  2. Verify credits at app.batchdata.com\n"
-                        f"  3. Run: python -m src.services.skip_trace --dry-run --limit 5\n\n"
-                        f"Forced Action Ops Alert — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
-                    ),
-                )
-            break
+            # On 400: retry each record individually to isolate the bad payload
+            if "400" in err_msg and len(payloads) > 1:
+                logger.info("Retrying batch %d as individual requests to isolate bad record...", batch_num)
+                results = []
+                for i, single_payload in enumerate(payloads):
+                    owner, prop = index_map[i]
+                    try:
+                        single_result = _call_batch_data([single_payload], api_key_val)
+                        results.extend(single_result)
+                    except Exception as single_err:
+                        logger.error(
+                            f"  payload[{i}] property_id={prop.id} FAILED: {single_err} | "
+                            f"address='{single_payload['propertyAddress']['street']}'"
+                        )
+                        results.append({})  # placeholder so index alignment stays correct
+                        stats["failed"] += 1
+                # Fall through to persist whatever individual calls succeeded
+            else:
+                stats["failed"] += len(payloads)
+
+                # Alert on credential/billing failures — these won't self-heal
+                if "402" in err_msg or "401" in err_msg:
+                    send_alert(
+                        subject="[Forced Action] BatchData API CREDENTIAL ERROR",
+                        body=(
+                            f"Skip-trace enrichment halted: {err_msg}\n\n"
+                            f"Action required:\n"
+                            f"  1. Check BATCH_SKIP_TRACING_API_KEY in .env\n"
+                            f"  2. Verify credits at app.batchdata.com\n"
+                            f"  3. Run: python -m src.services.skip_trace --dry-run --limit 5\n\n"
+                            f"Forced Action Ops Alert — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+                        ),
+                    )
+                break
 
         # --- 3. Persist results ---
         with get_db_context() as session:
