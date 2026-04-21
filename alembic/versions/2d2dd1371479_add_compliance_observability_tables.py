@@ -1,7 +1,7 @@
 """add_compliance_observability_tables
 
 Revision ID: 2d2dd1371479
-Revises: n4o5p6q7r8s9
+Revises: o5p6q7r8s9t0
 Create Date: 2026-04-21 12:05:06.333289
 
 """
@@ -13,7 +13,7 @@ from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
 revision: str = '2d2dd1371479'
-down_revision: Union[str, Sequence[str], None] = 'n4o5p6q7r8s9'
+down_revision: Union[str, Sequence[str], None] = 'o5p6q7r8s9t0'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

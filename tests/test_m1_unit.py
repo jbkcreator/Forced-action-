@@ -349,9 +349,12 @@ class TestOnSubscriptionDeleted:
         assert subscriber.ghl_stage == 7
         assert subscriber.grace_expires_at is not None
 
+    @patch("config.settings.get_settings")
     @patch("src.services.stripe_webhooks.push_subscriber_to_ghl")
-    def test_grace_expires_in_48_hours(self, mock_ghl):
+    def test_grace_expires_in_48_hours(self, mock_ghl, mock_get_settings):
         from src.services.stripe_webhooks import _on_subscription_deleted
+
+        mock_get_settings.return_value.grace_period_hours = 48.0
 
         subscriber = _make_subscriber(status="active")
         db = MagicMock()
