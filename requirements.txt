@@ -26,6 +26,9 @@ python-jose[cryptography]>=3.3.0
 dbfread>=2.0.7
 xlrd>=2.0.1
 
+# SMS (Twilio)
+twilio>=9.0.0
+
 # Database dependencies
 sqlalchemy>=2.0.0
 psycopg2-binary>=2.9.9

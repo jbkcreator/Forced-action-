@@ -1421,3 +1421,80 @@ class AbAssignment(Base):
     __table_args__ = (
         UniqueConstraint("test_id", "subscriber_id", name="uq_ab_assignment"),
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Compliance & Observability Models
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class SmsOptOut(Base):
+    """
+    TCPA suppression list. Any number in this table must never receive outbound SMS.
+    Populated by inbound STOP/UNSUBSCRIBE/QUIT/CANCEL/END keywords via Twilio webhook.
+    Pre-send gate in sms_compliance.can_send() checks this table (Redis in 2B-2).
+    """
+    __tablename__ = "sms_opt_outs"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    phone: Mapped[str] = mapped_column(String(20), nullable=False, unique=True, index=True)
+    keyword_used: Mapped[Optional[str]] = mapped_column(String(20))   # STOP / UNSUBSCRIBE / etc.
+    source: Mapped[str] = mapped_column(String(30), nullable=False, default="twilio_inbound")  # twilio_inbound/manual/import
+    opted_out_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+    def __repr__(self):
+        return f"<SmsOptOut(phone={self.phone}, keyword={self.keyword_used})>"
+
+
+class SmsDeadLetter(Base):
+    """
+    Dead-letter queue for SMS events that failed delivery, hit opt-out, or errored.
+    Admin reviews and resolves manually via /admin/dlq endpoint.
+    """
+    __tablename__ = "sms_dead_letters"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    phone: Mapped[Optional[str]] = mapped_column(String(20), index=True)
+    reason: Mapped[str] = mapped_column(String(50), nullable=False)   # opt_out/delivery_failed/error/unresolvable
+    payload: Mapped[Optional[dict]] = mapped_column(JSONB)            # original message body + metadata
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    reviewed_by: Mapped[Optional[str]] = mapped_column(String(100))
+
+    __table_args__ = (
+        CheckConstraint(
+            "reason IN ('opt_out', 'delivery_failed', 'error', 'unresolvable')",
+            name="check_dlq_reason",
+        ),
+        Index("idx_dlq_reviewed", "reviewed_at"),
+    )
+
+    def __repr__(self):
+        return f"<SmsDeadLetter(id={self.id}, phone={self.phone}, reason={self.reason})>"
+
+
+class ApiUsageLog(Base):
+    """
+    Per-call cost tracking for Claude, Twilio, and Stripe API usage.
+    Feeds cost-reduction decisions (Haiku routing) and vendor cost dashboards.
+    """
+    __tablename__ = "api_usage_logs"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    service: Mapped[str] = mapped_column(String(20), nullable=False)      # claude/twilio/stripe
+    model: Mapped[Optional[str]] = mapped_column(String(60))              # haiku/sonnet/opus (Claude only)
+    input_tokens: Mapped[Optional[int]] = mapped_column(Integer)
+    output_tokens: Mapped[Optional[int]] = mapped_column(Integer)
+    cost_usd: Mapped[Optional[float]] = mapped_column(Numeric(10, 6))
+    task_type: Mapped[Optional[str]] = mapped_column(String(60))          # sms_copy/classification/conversational_close/etc.
+    subscriber_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("subscribers.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        CheckConstraint("service IN ('claude', 'twilio', 'stripe')", name="check_api_service"),
+        Index("idx_api_usage_service_created", "service", "created_at"),
+        Index("idx_api_usage_task_created", "task_type", "created_at"),
+    )
+
+    def __repr__(self):
+        return f"<ApiUsageLog(service={self.service}, model={self.model}, cost=${self.cost_usd})>"
