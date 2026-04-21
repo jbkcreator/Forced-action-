@@ -106,6 +106,9 @@ class AppSettings(BaseSettings):
 	# Founding subscriber spot limit (default 10, changeable without redeploy)
 	founding_spot_limit: int = Field(default=10, env="FOUNDING_SPOT_LIMIT")
 
+	# Grace period after cancellation — default 48hr, set lower for testing (e.g. GRACE_PERIOD_HOURS=0.017 ≈ 1 min)
+	grace_period_hours: float = Field(default=48.0, env="GRACE_PERIOD_HOURS")
+
 	# Demo booking link — sent via SMS when prospect requests a demo on the call
 	demo_calendly_url: Optional[str] = Field(default=None, env="DEMO_CALENDLY_URL")
 

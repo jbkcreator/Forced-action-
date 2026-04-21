@@ -998,8 +998,9 @@ def _on_subscription_deleted(subscription: dict, db: Session) -> None:
         )
         return
 
+    from config.settings import get_settings
     now = datetime.now(timezone.utc)
-    grace_expires = now + timedelta(hours=48)
+    grace_expires = now + timedelta(hours=get_settings().grace_period_hours)
 
     subscriber.status = "grace"
     subscriber.grace_expires_at = grace_expires
