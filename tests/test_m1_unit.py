@@ -100,11 +100,16 @@ class TestGetPriceIdForCheckout:
         from src.services.stripe_service import get_price_id_for_checkout
         return get_price_id_for_checkout(db, tier, vertical, county_id)
 
+    def _mock_prices(self, mock_settings, founding="price_founding_123", regular="price_regular_456"):
+        """Wire mock_settings.active_stripe_price() to return correct IDs by name."""
+        price_map = {"starter_founding": founding, "starter_regular": regular}
+        mock_settings.active_stripe_price.side_effect = lambda name: price_map.get(name)
+
+    @patch("src.services.stripe_service._founding_limit", return_value=10)
     @patch("src.services.stripe_service.settings")
-    def test_founding_when_count_is_zero(self, mock_settings):
+    def test_founding_when_count_is_zero(self, mock_settings, _limit):
         """count=0 → founding price, is_founding=True"""
-        mock_settings.stripe_price_starter_founding = "price_founding_123"
-        mock_settings.stripe_price_starter_regular  = "price_regular_456"
+        self._mock_prices(mock_settings)
 
         from src.services.stripe_service import get_price_id_for_checkout
         row = _make_founding_count(count=0)
@@ -116,11 +121,11 @@ class TestGetPriceIdForCheckout:
         assert is_founding is True
         assert price_id == "price_founding_123"
 
+    @patch("src.services.stripe_service._founding_limit", return_value=10)
     @patch("src.services.stripe_service.settings")
-    def test_founding_when_count_is_9(self, mock_settings):
+    def test_founding_when_count_is_9(self, mock_settings, _limit):
         """count=9 → last founding spot, is_founding=True"""
-        mock_settings.stripe_price_starter_founding = "price_founding_123"
-        mock_settings.stripe_price_starter_regular  = "price_regular_456"
+        self._mock_prices(mock_settings)
 
         from src.services.stripe_service import get_price_id_for_checkout
         row = _make_founding_count(count=9)
@@ -132,11 +137,11 @@ class TestGetPriceIdForCheckout:
         assert is_founding is True
         assert price_id == "price_founding_123"
 
+    @patch("src.services.stripe_service._founding_limit", return_value=10)
     @patch("src.services.stripe_service.settings")
-    def test_regular_when_count_is_10(self, mock_settings):
+    def test_regular_when_count_is_10(self, mock_settings, _limit):
         """count=10 → founding slots full, is_founding=False"""
-        mock_settings.stripe_price_starter_founding = "price_founding_123"
-        mock_settings.stripe_price_starter_regular  = "price_regular_456"
+        self._mock_prices(mock_settings)
 
         from src.services.stripe_service import get_price_id_for_checkout
         row = _make_founding_count(count=10)
@@ -148,11 +153,11 @@ class TestGetPriceIdForCheckout:
         assert is_founding is False
         assert price_id == "price_regular_456"
 
+    @patch("src.services.stripe_service._founding_limit", return_value=10)
     @patch("src.services.stripe_service.settings")
-    def test_creates_row_when_none_exists(self, mock_settings):
+    def test_creates_row_when_none_exists(self, mock_settings, _limit):
         """No existing row → creates FoundingSubscriberCount with count=0"""
-        mock_settings.stripe_price_starter_founding = "price_founding_123"
-        mock_settings.stripe_price_starter_regular  = "price_regular_456"
+        self._mock_prices(mock_settings)
 
         from src.services.stripe_service import get_price_id_for_checkout
         db = MagicMock()
@@ -164,11 +169,11 @@ class TestGetPriceIdForCheckout:
         db.add.assert_called_once()
         db.flush.assert_called_once()
 
+    @patch("src.services.stripe_service._founding_limit", return_value=10)
     @patch("src.services.stripe_service.settings")
-    def test_raises_when_price_id_not_configured(self, mock_settings):
+    def test_raises_when_price_id_not_configured(self, mock_settings, _limit):
         """Missing price_id → ValueError"""
-        mock_settings.stripe_price_starter_founding = None
-        mock_settings.stripe_price_starter_regular  = None
+        self._mock_prices(mock_settings, founding=None, regular=None)
 
         from src.services.stripe_service import get_price_id_for_checkout
         row = _make_founding_count(count=0)
@@ -185,10 +190,11 @@ class TestGetPriceIdForCheckout:
 
 class TestOnCheckoutCompleted:
 
-    def _session_data(self, is_founding=True, zip_codes="33601,33602"):
+    def _session_data(self, is_founding=True, zip_codes="33601,33602", payment_status="paid"):
         return {
             "customer": "cus_test",
             "subscription": "sub_test",
+            "payment_status": payment_status,
             "customer_details": {"email": "buyer@example.com", "name": "Jane Buyer"},
             "metadata": {
                 "tier": "starter",
@@ -222,10 +228,11 @@ class TestOnCheckoutCompleted:
         subscriber = _make_subscriber()
 
         db = MagicMock()
-        # First execute → founding count, second → subscriber lookup, rest → territories
+        # founding count → subscriber by stripe_id → subscriber by email → territory × 2
         db.execute.return_value.scalar_one_or_none.side_effect = [
             founding_row,  # founding count row
-            None,          # no existing subscriber → create new
+            None,          # no existing subscriber by stripe_customer_id
+            None,          # no existing subscriber by email → create new
             None,          # territory 1 → create new
             None,          # territory 2 → create new
         ]
@@ -254,9 +261,11 @@ class TestOnCheckoutCompleted:
         subscriber = _make_subscriber(id=99)
 
         db = MagicMock()
+        # founding row → subscriber by stripe_id → subscriber by email → territory
         db.execute.return_value.scalar_one_or_none.side_effect = [
             None,        # no founding row
-            None,        # no existing subscriber
+            None,        # no existing subscriber by stripe_customer_id
+            None,        # no existing subscriber by email → create new
             territory,   # existing available territory
         ]
 
@@ -289,6 +298,32 @@ class TestOnCheckoutCompleted:
 
         db.add.assert_not_called()
         mock_ghl.assert_not_called()
+
+    @patch("src.services.stripe_webhooks.push_subscriber_to_ghl")
+    def test_failed_payment_creates_churned_subscriber(self, mock_ghl):
+        """payment_status='unpaid' → churned subscriber at GHL stage 7, no ZIP lock."""
+        from src.services.stripe_webhooks import _on_checkout_completed
+
+        db = MagicMock()
+        db.execute.return_value.scalar_one_or_none.return_value = None
+
+        _on_checkout_completed(self._session_data(payment_status="unpaid"), db)
+
+        db.add.assert_called_once()
+        db.flush.assert_called()
+
+        added_obj = db.add.call_args[0][0]
+        assert added_obj.status == "churned"
+        assert added_obj.ghl_stage == 7
+        assert added_obj.founding_member is False
+
+        mock_ghl.assert_called_once()
+        call_args = mock_ghl.call_args
+        assert call_args[1].get("stage") == 7 or call_args[0][1] == 7
+        tags = call_args[1].get("tags") or (call_args[0][2] if len(call_args[0]) > 2 else [])
+        assert "checkout_payment_failed" in tags
+
+        assert db.add.call_count == 1  # no territory rows
 
 
 # ---------------------------------------------------------------------------

@@ -168,7 +168,48 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
         )
         return
 
+    # Stripe fires checkout.session.completed even when initial payment fails
+    # (subscription lands in 'incomplete' state, payment_status = 'unpaid').
+    # On failure: create a churned record so we can follow up, but skip founding
+    # count increment and ZIP locking (they haven't paid).
+    payment_status = session.get("payment_status")
+    payment_failed = payment_status == "unpaid"
+
     now = datetime.now(timezone.utc)
+
+    if payment_failed:
+        logger.warning(
+            "checkout.session.completed payment_status=%s — creating churned subscriber. customer=%s",
+            payment_status, stripe_customer_id,
+        )
+        churned = Subscriber(
+            stripe_customer_id=stripe_customer_id,
+            stripe_subscription_id=stripe_subscription_id,
+            tier=tier,
+            vertical=vertical,
+            county_id=county_id,
+            founding_member=False,
+            status="churned",
+            event_feed_uuid=str(uuid.uuid4()),
+            email=customer_email,
+            name=customer_name,
+            ghl_stage=7,
+        )
+        db.add(churned)
+        db.flush()
+        try:
+            push_subscriber_to_ghl(churned, stage=7, tags=["checkout_payment_failed"])
+        except Exception:
+            logger.error(
+                "GHL stage 7 push failed for churned checkout subscriber %s",
+                churned.id,
+                exc_info=True,
+            )
+        logger.info(
+            "checkout.session.completed (payment_failed): churned subscriber=%s customer=%s",
+            churned.id, stripe_customer_id,
+        )
+        return
 
     # ── Increment founding count ───────────────────────────────────────────
     if is_founding:
