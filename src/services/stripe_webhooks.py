@@ -172,8 +172,34 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
     # (subscription lands in 'incomplete' state, payment_status = 'unpaid').
     # On failure: create a churned record so we can follow up, but skip founding
     # count increment and ZIP locking (they haven't paid).
+    #
+    # payment_status is the primary signal. For embedded checkout (ui_mode='embedded')
+    # it can arrive as None even on failure, so we also inspect the subscription
+    # status directly when the field is missing or ambiguous.
     payment_status = session.get("payment_status")
-    payment_failed = payment_status == "unpaid"
+    logger.info(
+        "checkout.session.completed: customer=%s payment_status=%r subscription=%s",
+        stripe_customer_id, payment_status, stripe_subscription_id,
+    )
+
+    payment_failed = False
+    if payment_status == "unpaid":
+        payment_failed = True
+    elif payment_status != "paid" and stripe_subscription_id:
+        # payment_status absent or unexpected — ask Stripe directly
+        try:
+            sub = stripe.Subscription.retrieve(stripe_subscription_id)
+            if sub.get("status") in ("incomplete", "incomplete_expired", "past_due", "unpaid"):
+                payment_failed = True
+                logger.info(
+                    "checkout.session.completed: subscription %s status=%s → treating as payment_failed",
+                    stripe_subscription_id, sub.get("status"),
+                )
+        except Exception:
+            logger.warning(
+                "checkout.session.completed: could not retrieve subscription %s — assuming paid",
+                stripe_subscription_id, exc_info=True,
+            )
 
     now = datetime.now(timezone.utc)
 

@@ -325,6 +325,47 @@ class TestOnCheckoutCompleted:
 
         assert db.add.call_count == 1  # no territory rows
 
+    @patch("src.services.stripe_webhooks.stripe.Subscription.retrieve")
+    @patch("src.services.stripe_webhooks.push_subscriber_to_ghl")
+    def test_embedded_checkout_missing_payment_status_checks_subscription(self, mock_ghl, mock_retrieve):
+        """payment_status=None (embedded checkout) → subscription lookup → churned if incomplete."""
+        from src.services.stripe_webhooks import _on_checkout_completed
+
+        mock_retrieve.return_value = {"status": "incomplete"}
+        db = MagicMock()
+        db.execute.return_value.scalar_one_or_none.return_value = None
+
+        # payment_status omitted — simulates embedded checkout failure
+        session = self._session_data(payment_status="paid")
+        del session["payment_status"]
+        _on_checkout_completed(session, db)
+
+        mock_retrieve.assert_called_once_with("sub_test")
+        added_obj = db.add.call_args[0][0]
+        assert added_obj.status == "churned"
+        assert added_obj.ghl_stage == 7
+
+    @patch("src.services.stripe_webhooks.stripe.Subscription.retrieve")
+    @patch("src.services.stripe_webhooks.push_subscriber_to_ghl")
+    def test_embedded_checkout_active_subscription_not_churned(self, mock_ghl, mock_retrieve):
+        """payment_status=None but subscription active → normal active subscriber."""
+        from src.services.stripe_webhooks import _on_checkout_completed
+
+        mock_retrieve.return_value = {"status": "active"}
+        db = MagicMock()
+        db.execute.return_value.scalar_one_or_none.return_value = None
+
+        session = self._session_data(payment_status="paid")
+        del session["payment_status"]
+        _on_checkout_completed(session, db)
+
+        # call_args_list[0] = FoundingSubscriberCount, [1] = Subscriber
+        subscriber_obj = next(
+            obj for (obj,), _ in db.add.call_args_list
+            if hasattr(obj, "status")
+        )
+        assert subscriber_obj.status == "active"
+
 
 # ---------------------------------------------------------------------------
 # 3. stripe_webhooks — _on_subscription_deleted
