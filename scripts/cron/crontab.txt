@@ -89,7 +89,7 @@ PROJECT=/root/Forced-action-
 # Enriches today's Gold+ leads with phone/email via BatchData (+ IDI fallback)
 # Runs after CDS scoring so today's new leads are enriched before GHL sync picks them up.
 # --today-only: only process leads scored in the current run (safe, avoids re-processing history)
-30 7 * * 1-5 $PROJECT/scripts/cron/run.sh src.tasks.run_enrichment hillsborough --limit 500 --today-only
+30 7 * * 1-5 $PROJECT/scripts/cron/run.sh src.tasks.run_enrichment hillsborough --limit 500
 
 # ── GHL CRM SYNC ─────────────────────────────────────────────
 # GHL CRM Sync               — 08:00 AM UTC / 04:00 AM EDT / 01:30 PM IST (after CDS scoring completes)
