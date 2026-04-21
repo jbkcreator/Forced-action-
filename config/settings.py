@@ -159,6 +159,23 @@ class AppSettings(BaseSettings):
 	alert_email: Optional[str] = Field(default=None, env="ALERT_EMAIL")  # ops alert recipient
 	report_recipients: Optional[str] = Field(default=None, env="REPORT_RECIPIENTS")  # comma-separated emails for daily/weekly reports
 
+	# Twilio (SMS outbound — required for all Cora messaging)
+	twilio_account_sid: Optional[str] = Field(default=None, env="TWILIO_ACCOUNT_SID")
+	twilio_auth_token: Optional[SecretStr] = Field(default=None, env="TWILIO_AUTH_TOKEN")
+	twilio_from_number: Optional[str] = Field(default=None, env="TWILIO_FROM_NUMBER")  # E.164 format: +1XXXXXXXXXX
+	twilio_enabled: bool = Field(default=False, env="TWILIO_ENABLED")  # master kill-switch
+
+	# Claude model routing (update model IDs here without touching code)
+	claude_haiku_model: str = Field(default="claude-haiku-4-5-20251001", env="CLAUDE_HAIKU_MODEL")
+	claude_sonnet_model: str = Field(default="claude-sonnet-4-6", env="CLAUDE_SONNET_MODEL")
+	claude_opus_model: str = Field(default="claude-opus-4-7", env="CLAUDE_OPUS_MODEL")
+
+	# Redis (placeholder — provisioned in 2B-2; leave blank locally)
+	redis_url: Optional[str] = Field(default=None, env="REDIS_URL")  # e.g. redis://localhost:6379/0
+
+	# Revenue Pulse — founder SMS recipient
+	founder_phone: Optional[str] = Field(default=None, env="FOUNDER_PHONE")  # E.164 format
+
 	# Alerting
 	alert_sms_number: Optional[str] = Field(default=None, env="ALERT_SMS_NUMBER")  # SMS target for match-rate alerts
 	alert_sms_carrier: Optional[str] = Field(default=None, env="ALERT_SMS_CARRIER")  # e.g. tmomail.net, vtext.com
