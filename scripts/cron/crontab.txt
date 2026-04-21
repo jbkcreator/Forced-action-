@@ -1,0 +1,115 @@
+# === BEGIN FORCED-ACTION-PLATFORM ===
+# ============================================================
+# Distressed Property Intelligence Platform — Crontab
+# Install with: bash scripts/cron/install_cron.sh
+#
+# Schedule overview:
+#   Master Parcel    → Quarterly  (1st of Jan, Apr, Jul, Oct @ 01:00 AM UTC)
+#   Most scrapers    → Daily (staggered 04:00–06:25 AM UTC / 12:00–2:25 AM EDT / 09:30–11:55 AM IST)
+#   Tax Delinquency  → Weekly Monday @ 06:00 AM UTC (02:00 AM EDT / 11:30 AM IST)
+#   CDS Scoring      → Daily @ 07:00 AM UTC (03:00 AM EDT / 12:30 PM IST)
+#   GHL CRM Sync     → Daily @ 08:00 AM UTC (04:00 AM EDT / 01:30 PM IST)
+#   Skip Tracing     → Daily @ 07:30 AM UTC (03:30 AM EDT / 01:00 PM IST) — after CDS, before GHL
+#   Daily Report     → Daily @ 09:30 AM UTC (05:30 AM EDT / 03:00 PM IST) — after all other jobs
+#
+# Date overlap strategy:
+#   Liens/Deeds/Judgments use --start-date 1 day ago (single combined job).
+#   DB deduplication handles any overlap (same record → upsert/skip).
+#
+# Last master run: 2026-02-26 (done manually)
+# Next master run: 2026-04-01
+# ============================================================
+
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+PROJECT=/root/Forced-action-
+
+# ── QUARTERLY ────────────────────────────────────────────────
+# Master Parcel Data (1st of Jan, Apr, Jul, Oct at 01:00 AM UTC)
+0 1 1 1,4,7,10 * $PROJECT/scripts/cron/run.sh src.scrappers.master.master_engine --load-to-db
+
+# ── DAILY ────────────────────────────────────────────────────
+
+# 1. Code Violations         — 04:00 AM UTC / 12:00 AM EDT / 09:30 AM IST
+0 4 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.violation.violation_engine --load-to-db
+
+# 2. Bankruptcy Filings      — 04:15 AM UTC / 12:15 AM EDT / 09:45 AM IST
+15 4 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.bankruptcy.bankruptcy_engine --lookback 1 --load-to-db
+
+# 3. Eviction Filings        — 04:30 AM UTC / 12:30 AM EDT / 10:00 AM IST
+30 4 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.evictions.evictions_engine --load-to-db
+
+# 4. Probate Filings         — 04:45 AM UTC / 12:45 AM EDT / 10:15 AM IST
+45 4 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.probate.probate_engine --load-to-db
+
+# 5. Liens + Deeds + Judgments — 05:00 AM UTC / 01:00 AM EDT / 10:30 AM IST
+#    Replaces the previous 3 separate scraper jobs (liens/deeds/judgments)
+0 5 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.liens.lien_engine --mode combined --start-date $(date -d "1 day ago" +\%Y-\%m-\%d) --load-to-db
+
+# 8. Building Permits        — 05:45 AM UTC / 01:45 AM EDT / 11:15 AM IST
+45 5 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.permit.permit_engine --load-to-db
+
+# 9. Tax Delinquencies       — 06:00 AM UTC / 02:00 AM EDT / 11:30 AM IST — every Monday (weekly)
+0 6 * * 1 $PROJECT/scripts/cron/run.sh src.scrappers.deliquencies.tax_delinquent_engine --mode download-only --load-to-db --scraper ai
+
+# 10. Foreclosure Auctions   — 06:15 AM UTC / 02:15 AM EDT / 11:45 AM IST
+15 6 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.foreclosures.foreclosure_engine --date $(date +\%Y-\%m-\%d) --load-to-db --scraper ai
+
+# 11. Roofing Permits (classify from building_permits) — 06:17 AM UTC / 02:17 AM EDT / 11:47 AM IST
+17 6 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.roofing_permits.roofing_permit_engine
+
+# 12. Storm Damage (NWS alerts) — 06:19 AM UTC / 02:19 AM EDT / 11:49 AM IST
+19 6 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.storm.storm_engine
+
+# 13. Flood Damage (FEMA + NWS) — 06:21 AM UTC / 02:21 AM EDT / 11:51 AM IST
+21 6 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.flood.flood_engine
+
+# 14. Insurance Claims (FEMA IA + adjuster permits) — 06:23 AM UTC / 02:23 AM EDT / 11:53 AM IST
+23 6 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.insurance.insurance_engine
+
+# 15. Fire Incidents — 06:25 AM UTC / 02:25 AM EDT / 11:55 AM IST
+25 6 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.fire.fire_engine
+
+# 16. Load Validator — 06:30 AM UTC / 02:30 AM EDT / 12:00 PM IST (after all scrapers complete)
+30 6 * * 1-5 $PROJECT/scripts/cron/run.sh src.tasks.load_validator
+
+# ── PLATFORM TASKS ───────────────────────────────────────────
+# Grace Expiry (ZIP territories + subscribers) — every 15 min
+*/15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.grace_expiry
+
+# ── CDS SCORING ──────────────────────────────────────────────
+# CDS Scoring Engine         — 07:00 AM UTC / 03:00 AM EDT / 12:30 PM IST (after all scrapers complete)
+0 7 * * 1-5 $PROJECT/scripts/cron/run.sh src.services.cds_engine
+
+# ── STRIPE RECONCILIATION ────────────────────────────────────
+# Daily reconciliation — catch any subscribers who paid but weren't activated
+15 7 * * 1-5 $PROJECT/scripts/cron/run.sh src.tasks.stripe_reconcile
+
+# ── SKIP TRACING / CONTACT ENRICHMENT ────────────────────────
+# Enriches today's Gold+ leads with phone/email via BatchData (+ IDI fallback)
+# Runs after CDS scoring so today's new leads are enriched before GHL sync picks them up.
+# --today-only: only process leads scored in the current run (safe, avoids re-processing history)
+30 7 * * 1-5 $PROJECT/scripts/cron/run.sh src.tasks.run_enrichment hillsborough --limit 500 --today-only
+
+# ── GHL CRM SYNC ─────────────────────────────────────────────
+# GHL CRM Sync               — 08:00 AM UTC / 04:00 AM EDT / 01:30 PM IST (after CDS scoring completes)
+# Picks up pending_sync properties and pushes to GoHighLevel in batches.
+# Decoupled from scoring so GHL API latency never blocks scraper sessions.
+0 8 * * 1-5 $PROJECT/scripts/cron/run.sh src.tasks.ghl_sync
+
+# ── WEEKLY REPORT ────────────────────────────────────────────
+# Weekly Report — Monday @ 09:00 AM UTC / 05:00 AM EDT / 02:30 PM IST (after GHL sync)
+0 9 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.weekly_report
+
+# ── DAILY REPORT ─────────────────────────────────────────────
+# Daily Ops Report — 09:30 AM UTC / 05:30 AM EDT / 03:00 PM IST (after all other jobs complete)
+# Writes reports/daily/report_YYYY-MM-DD.csv with scraper health + scoring summary
+30 9 * * 1-5 $PROJECT/scripts/cron/run.sh src.tasks.daily_report
+
+# ── HEALTH CHECK — every 4 hours (logs to separate file for monitoring)
+0 2,6,10,14,18,22 * * * cd /opt/forced-action && python -m src.tasks.health_check >> /var/log/fa-health.log 2>&1
+
+# Unmatched record rematch — Sunday 03:30 AM UTC
+30 3 * * 0 $PROJECT/scripts/cron/run.sh src.tasks.rematch_unmatched
+
+# === END FORCED-ACTION-PLATFORM ===

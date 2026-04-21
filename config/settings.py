@@ -109,6 +109,9 @@ class AppSettings(BaseSettings):
 	# Grace period after cancellation — default 48hr, set lower for testing (e.g. GRACE_PERIOD_HOURS=0.017 ≈ 1 min)
 	grace_period_hours: float = Field(default=48.0, env="GRACE_PERIOD_HOURS")
 
+	# Alert deduplication — suppress repeat alerts for the same failure within this window
+	alert_cooldown_hours: float = Field(default=4.0, env="ALERT_COOLDOWN_HOURS")
+
 	# Demo booking link — sent via SMS when prospect requests a demo on the call
 	demo_calendly_url: Optional[str] = Field(default=None, env="DEMO_CALENDLY_URL")
 

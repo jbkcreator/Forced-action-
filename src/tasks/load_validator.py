@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from src.core.database import get_db_context
-from src.core.models import ScraperRunStats
+from src.core.models import ScraperAlertLog, ScraperRunStats
 from src.services.email import send_alert
 
 logger = logging.getLogger(__name__)
@@ -42,6 +42,44 @@ _CONSECUTIVE_DAYS_ALERT = 2 # alert after N consecutive low days
 _MIN_BASELINE_AVG = 3
 
 _STATE_FILE = Path(__file__).parent.parent.parent / "data" / "load_validator_state.json"
+
+
+def _was_recently_alerted(source_type: str, county_id: str, alert_type: str) -> bool:
+    """Return True if an alert of this type was already sent within ALERT_COOLDOWN_HOURS."""
+    from config.settings import get_settings
+    cooldown = timedelta(hours=get_settings().alert_cooldown_hours)
+    cutoff = datetime.now(timezone.utc) - cooldown
+    try:
+        with get_db_context() as session:
+            row = (
+                session.query(ScraperAlertLog)
+                .filter(
+                    ScraperAlertLog.source_type == source_type,
+                    ScraperAlertLog.county_id == county_id,
+                    ScraperAlertLog.alert_type == alert_type,
+                    ScraperAlertLog.alerted_at >= cutoff,
+                )
+                .first()
+            )
+            return row is not None
+    except Exception as exc:
+        logger.warning("[LoadValidator] Cooldown check failed — not suppressing: %s", exc)
+        return False
+
+
+def _record_alert_sent(source_type: str, county_id: str, alert_type: str) -> None:
+    """Write a row to scraper_alert_log after successfully sending an alert."""
+    try:
+        with get_db_context() as session:
+            session.add(ScraperAlertLog(
+                source_type=source_type,
+                county_id=county_id,
+                alert_type=alert_type,
+                alerted_at=datetime.now(timezone.utc),
+            ))
+            session.commit()
+    except Exception as exc:
+        logger.warning("[LoadValidator] Could not record alert log: %s", exc)
 
 
 def _load_state() -> dict:
@@ -85,7 +123,12 @@ def _get_recent_stats(session, county_id: str, days: int) -> Dict[str, list]:
 
 
 def _get_failed_runs(session, county_id: str, run_date: date) -> list:
-    """Return list of (source_type, error_message) for failed runs today."""
+    """
+    Return list of (source_type, error_message) for real scraper failures today.
+
+    Excludes 'no_data' rows — those are legitimate empty-filing days, not errors.
+    NULL error_type rows (pre-migration) are treated as 'scraper_error' for safety.
+    """
     rows = (
         session.query(ScraperRunStats)
         .filter(
@@ -95,7 +138,11 @@ def _get_failed_runs(session, county_id: str, run_date: date) -> list:
         )
         .all()
     )
-    return [(r.source_type, r.error_message or "unknown error") for r in rows]
+    return [
+        (r.source_type, r.error_message or "unknown error")
+        for r in rows
+        if r.error_type != 'no_data'  # NULL treated as scraper_error (backward compat)
+    ]
 
 
 def run_load_validator(county_id: str = "hillsborough") -> dict:
@@ -158,21 +205,25 @@ def run_load_validator(county_id: str = "hillsborough") -> dict:
             )
 
     if zero_record_lines:
-        sent = send_alert(
-            subject=f"[Forced Action] ALERT: {len(zero_record_lines)} scraper(s) returned ZERO records ({today})",
-            body=(
-                f"The following scraper(s) ran successfully but loaded 0 records today ({today}):\n\n"
-                + "\n".join(zero_record_lines)
-                + "\n\nPossible causes:\n"
-                "  - Source website changed structure or returned empty results\n"
-                "  - Scraper ran before new data was published (timing issue)\n"
-                "  - Authentication/session expired silently\n"
-                "\nRun: python -m src.tasks.run_scrapers hillsborough\n"
-                f"\nForced Action Ops Alert — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
-            ),
-        )
-        if sent:
-            results["alerts_sent"] += 1
+        if _was_recently_alerted('_batch', county_id, 'zero_records'):
+            logger.info("[LoadValidator] Zero-record alert suppressed — already sent within cooldown")
+        else:
+            sent = send_alert(
+                subject=f"[Forced Action] ALERT: {len(zero_record_lines)} scraper(s) returned ZERO records ({today})",
+                body=(
+                    f"The following scraper(s) ran successfully but loaded 0 records today ({today}):\n\n"
+                    + "\n".join(zero_record_lines)
+                    + "\n\nPossible causes:\n"
+                    "  - Source website changed structure or returned empty results\n"
+                    "  - Scraper ran before new data was published (timing issue)\n"
+                    "  - Authentication/session expired silently\n"
+                    "\nRun: python -m src.tasks.run_scrapers hillsborough\n"
+                    f"\nForced Action Ops Alert — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+                ),
+            )
+            if sent:
+                results["alerts_sent"] += 1
+                _record_alert_sent('_batch', county_id, 'zero_records')
 
     results["zero_record_scrapers"] = [
         line.strip().split(":")[0] for line in zero_record_lines
@@ -227,38 +278,48 @@ def run_load_validator(county_id: str = "hillsborough") -> dict:
 
     # ── Send anomaly alert ─────────────────────────────────────────────────
     if alert_lines:
-        body_parts = [
-            f"Scraper load anomaly detected for {len(alert_lines)} source(s) "
-            f"({_CONSECUTIVE_DAYS_ALERT}+ consecutive low days):\n",
-            "\n".join(alert_lines),
-            "\n\nPossible causes:",
-            "  - Source website/API changed (check scraper logs)",
-            "  - Upstream data temporarily unavailable",
-            "  - DB matching regression (check unmatched counts)",
-            "\nRun: python -m src.tasks.run_scrapers hillsborough",
-            f"\nForced Action Ops Alert — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
-        ]
-        sent = send_alert(
-            subject=f"[Forced Action] ALERT: {len(alert_lines)} scraper(s) low count ({today})",
-            body="\n".join(body_parts),
-        )
-        if sent:
-            results["alerts_sent"] += 1
+        if _was_recently_alerted('_batch', county_id, 'low_count'):
+            logger.info("[LoadValidator] Low-count alert suppressed — already sent within cooldown")
+        else:
+            body_parts = [
+                f"Scraper load anomaly detected for {len(alert_lines)} source(s) "
+                f"({_CONSECUTIVE_DAYS_ALERT}+ consecutive low days):\n",
+                "\n".join(alert_lines),
+                "\n\nPossible causes:",
+                "  - Source website/API changed (check scraper logs)",
+                "  - Upstream data temporarily unavailable",
+                "  - DB matching regression (check unmatched counts)",
+                "\nRun: python -m src.tasks.run_scrapers hillsborough",
+                f"\nForced Action Ops Alert — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+            ]
+            sent = send_alert(
+                subject=f"[Forced Action] ALERT: {len(alert_lines)} scraper(s) low count ({today})",
+                body="\n".join(body_parts),
+            )
+            if sent:
+                results["alerts_sent"] += 1
+                _record_alert_sent('_batch', county_id, 'low_count')
 
     # ── Send failed-run alert ──────────────────────────────────────────────
+    # Only real errors (scraper_error) reach here — no_data rows are filtered
+    # out by _get_failed_runs(). Suppressed if already alerted within cooldown.
     if failed:
-        failed_lines = [f"  {ft}: {fm}" for ft, fm in failed]
-        sent = send_alert(
-            subject=f"[Forced Action] ALERT: {len(failed)} scraper(s) FAILED ({today})",
-            body=(
-                f"The following scrapers failed today ({today}):\n\n"
-                + "\n".join(failed_lines)
-                + "\n\nCheck logs and re-run manually if needed."
-                f"\n\nForced Action Ops Alert — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
-            ),
-        )
-        if sent:
-            results["alerts_sent"] += 1
+        if _was_recently_alerted('_batch', county_id, 'scraper_error'):
+            logger.info("[LoadValidator] Failed-run alert suppressed — already sent within cooldown")
+        else:
+            failed_lines = [f"  {ft}: {fm}" for ft, fm in failed]
+            sent = send_alert(
+                subject=f"[Forced Action] ALERT: {len(failed)} scraper(s) FAILED ({today})",
+                body=(
+                    f"The following scrapers failed today ({today}):\n\n"
+                    + "\n".join(failed_lines)
+                    + "\n\nCheck logs and re-run manually if needed."
+                    f"\n\nForced Action Ops Alert — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+                ),
+            )
+            if sent:
+                results["alerts_sent"] += 1
+                _record_alert_sent('_batch', county_id, 'scraper_error')
 
     state["last_check"] = datetime.now(timezone.utc).isoformat()
     _save_state(state)

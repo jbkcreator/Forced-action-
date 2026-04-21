@@ -548,7 +548,14 @@ def _check_scraper_health(db: Session) -> bool:
     Sends an ops alert if any runs failed or are missing.
     Returns True (healthy) or False (stale/failed).
     Advisory only — never blocks email delivery.
+
+    Suppresses the failed-run alert if load_validator already sent a
+    'scraper_error' alert within ALERT_COOLDOWN_HOURS — avoids duplicate emails
+    for the same failures from two independent cron jobs.
     """
+    from src.core.models import ScraperAlertLog
+    from config.settings import get_settings
+
     yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).date()
     try:
         rows = db.execute(
@@ -571,10 +578,33 @@ def _check_scraper_health(db: Session) -> bool:
         return False
 
     ran_sources = {r.source_type for r in rows}
-    failed = [r for r in rows if not r.run_success]
+    # Exclude no_data rows from failure count — those are expected empty days, not errors
+    failed = [r for r in rows if not r.run_success and r.error_type != 'no_data']
     missing = _HEALTH_CHECK_SOURCES - ran_sources
 
     if failed or missing:
+        # Suppress if load_validator already alerted for the same scraper failures
+        cooldown = timedelta(hours=get_settings().alert_cooldown_hours)
+        cutoff = datetime.now(timezone.utc) - cooldown
+        try:
+            recent_alert = db.execute(
+                select(ScraperAlertLog).where(
+                    ScraperAlertLog.source_type == '_batch',
+                    ScraperAlertLog.county_id == 'hillsborough',
+                    ScraperAlertLog.alert_type == 'scraper_error',
+                    ScraperAlertLog.alerted_at >= cutoff,
+                )
+            ).scalar_one_or_none()
+        except Exception:
+            recent_alert = None
+
+        if recent_alert:
+            logger.info(
+                "Health check: scraper failures already alerted by load_validator "
+                "within cooldown — suppressing duplicate email"
+            )
+            return False
+
         lines = (
             [f"  {r.source_type}: {r.error_message or 'run_success=False'}" for r in failed]
             + [f"  {s}: no row found" for s in sorted(missing)]
@@ -587,6 +617,18 @@ def _check_scraper_health(db: Session) -> bool:
                 + "\n\nLead emails will proceed. Verify data freshness."
             ),
         )
+        # Log this alert so future calls within cooldown are suppressed
+        try:
+            db.add(ScraperAlertLog(
+                source_type='_batch',
+                county_id='hillsborough',
+                alert_type='health_check',
+                alerted_at=datetime.now(timezone.utc),
+            ))
+            db.flush()
+        except Exception as exc:
+            logger.warning("Could not write health check alert log: %s", exc)
+
         logger.warning(
             "Scraper health issues for %s: %d failed, %d missing",
             yesterday, len(failed), len(missing),

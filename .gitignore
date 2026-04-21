@@ -4,9 +4,7 @@ __pycache__
 *.pyo
 .venv
 *.log
-*.sh
 data/
-*.txt
 *.status
 reports/
 nginx.conf

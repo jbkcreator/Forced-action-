@@ -905,6 +905,7 @@ class ScraperRunStats(Base):
 
     # Run metadata
     run_success: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    error_type: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     error_message: Mapped[Optional[str]] = mapped_column(Text)
     duration_seconds: Mapped[Optional[float]] = mapped_column(Numeric(10, 2))
 
@@ -931,6 +932,44 @@ class ScraperRunStats(Base):
         return (
             f"<ScraperRunStats(date={self.run_date}, source='{self.source_type}', "
             f"scraped={self.total_scraped}, matched={self.matched})>"
+        )
+
+
+class ScraperAlertLog(Base):
+    """
+    Deduplication log for scraper ops alerts.
+
+    Before sending any alert, load_validator and subscriber_email check this
+    table for a recent row matching (source_type, county_id, alert_type).
+    If one exists within ALERT_COOLDOWN_HOURS, the alert is suppressed.
+    After sending, a row is written here.
+
+    alert_type values:
+      'scraper_error'  — scraper raised a non-no-data exception
+      'zero_records'   — scraper succeeded but returned 0 records vs baseline
+      'low_count'      — scraper count dropped >70% below 7-day baseline
+      'health_check'   — subscriber_email health check detected stale/failed data
+    """
+    __tablename__ = "scraper_alert_log"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    source_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False, default="hillsborough")
+    alert_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    alerted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        Index("idx_scraper_alert_log_lookup", "source_type", "county_id", "alert_type", "alerted_at"),
+    )
+
+    def __repr__(self):
+        return (
+            f"<ScraperAlertLog(type='{self.alert_type}', source='{self.source_type}', "
+            f"at={self.alerted_at})>"
         )
 
 

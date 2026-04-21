@@ -76,6 +76,7 @@ def record_scraper_stats(
     skipped: int,
     scored: int = 0,
     run_success: bool = True,
+    error_type: Optional[str] = None,
     error_message: Optional[str] = None,
     duration_seconds: Optional[float] = None,
     run_date=None,
@@ -93,6 +94,8 @@ def record_scraper_stats(
         matched/unmatched/skipped: Loader output counts.
         scored: Number of properties rescored by CDS after this load.
         run_success: False if the run errored out.
+        error_type: 'none' | 'no_data' | 'scraper_error'. None defaults to 'none'
+            on success or 'scraper_error' on failure when not explicitly set.
         error_message: Short error description on failure.
         duration_seconds: Wall-clock seconds for the load+rescore step.
         run_date: datetime.date; defaults to today.
@@ -103,6 +106,10 @@ def record_scraper_stats(
 
     if run_date is None:
         run_date = date_type.today()
+
+    # Derive error_type when not explicitly provided
+    if error_type is None:
+        error_type = 'none' if run_success else 'scraper_error'
 
     try:
         with get_db_context() as session:
@@ -116,6 +123,7 @@ def record_scraper_stats(
                 skipped=skipped,
                 scored=scored,
                 run_success=run_success,
+                error_type=error_type,
                 error_message=error_message,
                 duration_seconds=duration_seconds,
             ).on_conflict_do_update(
@@ -127,6 +135,7 @@ def record_scraper_stats(
                     skipped=skipped,
                     scored=scored,
                     run_success=run_success,
+                    error_type=error_type,
                     error_message=error_message,
                     duration_seconds=duration_seconds,
                 )
@@ -322,7 +331,9 @@ def load_scraped_data_to_db(
             return matched, unmatched, skipped
 
     except Exception as e:
+        from src.utils.scraper_exceptions import ScraperNoDataError
         duration = round(time.monotonic() - t_start, 2)
+        exc_error_type = 'no_data' if isinstance(e, ScraperNoDataError) else 'scraper_error'
         # Record the failure in stats (non-critical — don't let it mask original error)
         source_type_key = DATA_TYPE_TO_SOURCE.get(data_type)
         if source_type_key:
@@ -334,6 +345,7 @@ def load_scraped_data_to_db(
                 skipped=0,
                 scored=0,
                 run_success=False,
+                error_type=exc_error_type,
                 error_message=str(e)[:500],
                 duration_seconds=duration,
             )

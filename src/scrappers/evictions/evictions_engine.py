@@ -137,7 +137,8 @@ def download_latest_civil_filing(target_date: str = None, county_id: str = "hill
 			target_dt = datetime.strptime(target_date.replace("-", ""), "%Y%m%d")
 			match = [(d, f) for d, f in files_with_dates if d.date() == target_dt.date()]
 			if not match:
-				raise ValueError(f"No civil filing found for date: {target_date}")
+				from src.utils.scraper_exceptions import ScraperNoDataError
+				raise ScraperNoDataError(f"No civil filing found for date: {target_date}")
 			latest_date, latest_file = match[0]
 		else:
 			latest_date, latest_file = files_with_dates[0]
