@@ -581,6 +581,54 @@ def create_checkout(payload: CheckoutRequest, db: Session = Depends(get_db)):
 
 
 # ---------------------------------------------------------------------------
+# GET /api/checkout-status — Payment verification for the success page
+# ---------------------------------------------------------------------------
+
+@app.get("/api/checkout-status")
+def checkout_status(session_id: str, db: Session = Depends(get_db)):
+    """
+    Called by success.html after embedded checkout redirects to /success.
+    Returns the actual payment outcome so the page can show the right state
+    instead of always celebrating.
+
+    Returns:
+        payment_status: "paid" | "unpaid" | "pending"
+        feed_uuid: subscriber's event feed UUID if payment succeeded
+        tier: subscription tier
+    """
+    from src.services.stripe_webhooks import _init_stripe
+    if not _init_stripe():
+        raise HTTPException(status_code=503, detail="Stripe not configured")
+
+    try:
+        session = stripe.checkout.Session.retrieve(session_id)
+    except stripe.error.InvalidRequestError:
+        raise HTTPException(status_code=404, detail="Session not found")
+    except stripe.error.StripeError as exc:
+        logger.error("checkout-status: Stripe error retrieving session %s: %s", session_id, exc)
+        raise HTTPException(status_code=502, detail="Stripe unavailable")
+
+    payment_status = session.get("payment_status")  # "paid" | "unpaid" | "no_payment_required"
+    stripe_customer_id = session.get("customer")
+
+    # For subscriptions that are still processing (incomplete but not yet failed)
+    # tell the frontend to keep polling briefly.
+    if payment_status not in ("paid", "unpaid", "no_payment_required"):
+        return {"payment_status": "pending", "feed_uuid": None, "tier": None}
+
+    feed_uuid = None
+    tier = session.get("metadata", {}).get("tier")
+
+    if payment_status == "paid" and stripe_customer_id:
+        sub = db.execute(
+            select(Subscriber).where(Subscriber.stripe_customer_id == stripe_customer_id)
+        ).scalar_one_or_none()
+        if sub:
+            feed_uuid = sub.event_feed_uuid
+
+    return {"payment_status": payment_status, "feed_uuid": feed_uuid, "tier": tier}
+
+
 # GET /success — Post-checkout confirmation page (React SPA)
 # ---------------------------------------------------------------------------
 
