@@ -111,7 +111,7 @@ def handle_webhook(raw_body: bytes, sig_header: str, db: Session) -> tuple[bool,
         "invoice.payment_failed":        _on_payment_failed,
         "customer.subscription.updated": _on_subscription_updated,
         "customer.subscription.deleted": _on_subscription_deleted,
-        "payment_intent.succeeded":      _on_lead_pack_payment,
+        "payment_intent.succeeded":      _on_payment_intent_succeeded,
     }
 
     handler = handlers.get(event_type)
@@ -1199,7 +1199,88 @@ def _on_subscription_deleted(subscription: dict, db: Session) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 6. payment_intent.succeeded — lead pack purchases
+# 6. payment_intent.succeeded — router (lead pack + default card save + bundles)
+# ---------------------------------------------------------------------------
+
+def _on_payment_intent_succeeded(payment_intent: dict, db: Session) -> None:
+    """Route payment_intent.succeeded to the appropriate sub-handler."""
+    meta = payment_intent.get("metadata", {})
+    product = meta.get("product")
+
+    if product == "lead_pack":
+        _on_lead_pack_payment(payment_intent, db)
+        return
+
+    if product == "bundle":
+        _on_bundle_payment(payment_intent, db)
+        return
+
+    # Default: check for card save (setup_future_usage=off_session)
+    _on_card_saved(payment_intent, db)
+
+
+def _on_card_saved(payment_intent: dict, db: Session) -> None:
+    customer_id = payment_intent.get("customer")
+    pm_id = payment_intent.get("payment_method")
+    setup_future = payment_intent.get("setup_future_usage")
+    if not all([customer_id, pm_id, setup_future == "off_session"]):
+        return
+
+    subscriber = db.execute(
+        select(Subscriber).where(Subscriber.stripe_customer_id == customer_id)
+    ).scalar_one_or_none()
+    if not subscriber or subscriber.has_saved_card:
+        return
+
+    subscriber.has_saved_card = True
+    subscriber.stripe_payment_method_id = pm_id
+
+    from src.core.redis_client import rset
+    rset(f"saved_card_window:{subscriber.id}", "1", ttl_seconds=600)
+
+    logger.info("Default card saved for subscriber=%s pm=%s", subscriber.id, pm_id)
+
+
+def _on_bundle_payment(payment_intent: dict, db: Session) -> None:
+    from src.core.models import BundlePurchase
+    meta = payment_intent.get("metadata", {})
+    pi_id = payment_intent.get("id")
+    bundle_type = meta.get("bundle_type")
+    subscriber_id_str = meta.get("subscriber_id")
+    zip_code = meta.get("zip_code")
+    vertical = meta.get("vertical")
+
+    if not all([pi_id, bundle_type, subscriber_id_str]):
+        logger.error("[Bundle] payment_intent.succeeded missing metadata: %s", meta)
+        return
+
+    # Idempotency
+    existing = db.execute(
+        select(BundlePurchase).where(BundlePurchase.stripe_payment_intent_id == pi_id)
+    ).scalar_one_or_none()
+    if existing:
+        logger.info("[Bundle] Already processed PI %s — skipping", pi_id)
+        return
+
+    subscriber_id = int(subscriber_id_str)
+    purchase = BundlePurchase(
+        subscriber_id=subscriber_id,
+        bundle_type=bundle_type,
+        stripe_payment_intent_id=pi_id,
+        status="pending",
+        zip_code=zip_code,
+        vertical=vertical,
+    )
+    db.add(purchase)
+    db.flush()
+
+    from src.services.bundle_engine import deliver
+    deliver(purchase.id, db)
+    logger.info("[Bundle] Delivered purchase=%d type=%s subscriber=%d", purchase.id, bundle_type, subscriber_id)
+
+
+# ---------------------------------------------------------------------------
+# 6b. payment_intent.succeeded — lead pack purchases (kept for internal use)
 # ---------------------------------------------------------------------------
 
 def _on_lead_pack_payment(payment_intent: dict, db: Session) -> None:

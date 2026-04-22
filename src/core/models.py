@@ -736,6 +736,8 @@ class Subscriber(Base):
     referral_code: Mapped[Optional[str]] = mapped_column(String(20), unique=True, index=True)
     auto_mode_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
+    bundle_purchases = relationship("BundlePurchase", back_populates="subscriber")
+
     # Audit
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(
@@ -1498,3 +1500,39 @@ class ApiUsageLog(Base):
 
     def __repr__(self):
         return f"<ApiUsageLog(service={self.service}, model={self.model}, cost=${self.cost_usd})>"
+
+
+class BundlePurchase(Base):
+    """One-time bundle purchase (weekend/storm/zip_booster/monthly_reload)."""
+    __tablename__ = "bundle_purchases"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=False, index=True)
+    bundle_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    stripe_payment_intent_id: Mapped[str] = mapped_column(String(100), unique=True, index=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    zip_code: Mapped[Optional[str]] = mapped_column(String(10))
+    vertical: Mapped[Optional[str]] = mapped_column(String(50))
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False, default="hillsborough")
+    credits_awarded: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    lead_ids: Mapped[Optional[list]] = mapped_column(ARRAY(Integer))
+    purchased_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    subscriber = relationship("Subscriber", back_populates="bundle_purchases")
+
+    __table_args__ = (
+        CheckConstraint(
+            "bundle_type IN ('weekend', 'storm', 'zip_booster', 'monthly_reload')",
+            name="check_bundle_type",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'active', 'expired', 'cancelled')",
+            name="check_bundle_status",
+        ),
+        Index("idx_bundle_purchase_subscriber", "subscriber_id"),
+        Index("idx_bundle_type_status", "bundle_type", "status"),
+    )
+
+    def __repr__(self):
+        return f"<BundlePurchase(id={self.id}, type={self.bundle_type}, status={self.status})>"

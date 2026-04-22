@@ -2013,3 +2013,128 @@ async def ghl_sample_leads_webhook(payload: GHLSampleLeadsPayload):
         result.get("sent"), result.get("lead_count"),
     )
     return {"status": "ok", **result}
+
+
+# ── Phase 2B: Twilio inbound SMS ──────────────────────────────────────────────
+
+def _twiml_ok() -> str:
+    return '<?xml version="1.0" encoding="UTF-8"?><Response></Response>'
+
+
+@app.post("/webhooks/twilio/inbound")
+async def twilio_inbound(request: Request, db: Session = Depends(get_db)):
+    """
+    Twilio inbound SMS webhook.
+    Routes STOP keywords to sms_compliance, then product commands to sms_commands.
+    """
+    from src.services.sms_compliance import handle_inbound, send_sms
+    from src.services import sms_commands
+    from fastapi.responses import Response
+
+    form = await request.form()
+    from_number = form.get("From", "")
+    body = form.get("Body", "")
+
+    # Validate Twilio signature
+    settings_obj = get_settings()
+    if settings_obj.twilio_auth_token:
+        try:
+            from twilio.request_validator import RequestValidator
+            validator = RequestValidator(settings_obj.twilio_auth_token.get_secret_value())
+            url = str(request.url)
+            signature = request.headers.get("X-Twilio-Signature", "")
+            form_dict = dict(form)
+            if not validator.validate(url, form_dict, signature):
+                logger.warning("Invalid Twilio signature from %s", from_number)
+                raise HTTPException(status_code=403, detail="Invalid signature")
+        except ImportError:
+            pass  # twilio not installed in some envs
+
+    # STOP / compliance handling
+    twiml_reply = handle_inbound(from_number, body, db)
+    if twiml_reply:
+        return Response(content=twiml_reply, media_type="application/xml")
+
+    # Product command routing
+    command = sms_commands.parse(body)
+    if command:
+        reply = sms_commands.dispatch(from_number, command, db)
+        if reply:
+            send_sms(from_number, reply, db)
+
+    return Response(content=_twiml_ok(), media_type="application/xml")
+
+
+# ── Phase 2B: Deal-size capture ────────────────────────────────────────────────
+
+class DealCaptureRequest(BaseModel):
+    feed_uuid: str
+    property_id: int
+    deal_size_bucket: str  # 5_10k | 10_25k | 25k_plus | skip
+    deal_amount: Optional[float] = None
+    days_to_close: Optional[int] = None
+
+
+@app.post("/api/deal-capture", status_code=201)
+def deal_capture(payload: DealCaptureRequest, db: Session = Depends(get_db)):
+    """Record a deal outcome reported by a subscriber."""
+    from src.core.models import DealOutcome
+
+    sub = db.execute(
+        select(Subscriber).where(Subscriber.event_feed_uuid == payload.feed_uuid)
+    ).scalar_one_or_none()
+    if not sub:
+        raise HTTPException(status_code=403, detail="Invalid feed_uuid")
+
+    valid_buckets = {"5_10k", "10_25k", "25k_plus", "skip"}
+    if payload.deal_size_bucket not in valid_buckets:
+        raise HTTPException(status_code=422, detail=f"deal_size_bucket must be one of {valid_buckets}")
+
+    outcome = DealOutcome(
+        subscriber_id=sub.id,
+        property_id=payload.property_id,
+        deal_size_bucket=payload.deal_size_bucket,
+        deal_amount=payload.deal_amount,
+        deal_date=date.today(),
+        days_to_close=payload.days_to_close,
+    )
+    db.add(outcome)
+    db.flush()
+    return {"ok": True, "deal_id": outcome.id}
+
+
+# ── Phase 2B: NWS weather alert webhook ───────────────────────────────────────
+
+@app.post("/webhooks/nws/alert")
+async def nws_alert(request: Request, db: Session = Depends(get_db)):
+    """Receive NWS CAP alert and activate storm packs in affected ZIPs."""
+    from src.services import nws_webhook
+    payload = await request.json()
+    result = nws_webhook.process_alert(payload, db)
+    return result
+
+
+# ── Phase 2B: Admin DLQ review ────────────────────────────────────────────────
+
+@app.get("/admin/dlq")
+def admin_dlq(limit: int = 50, db: Session = Depends(get_db)):
+    """Return unreviewed SMS dead-letter queue items for admin review."""
+    from src.core.models import SmsDeadLetter
+    rows = db.execute(
+        select(SmsDeadLetter)
+        .where(SmsDeadLetter.reviewed_at.is_(None))
+        .order_by(SmsDeadLetter.created_at.desc())
+        .limit(limit)
+    ).scalars().all()
+    return {
+        "count": len(rows),
+        "items": [
+            {
+                "id": r.id,
+                "phone": r.phone,
+                "reason": r.reason,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ],
+    }
