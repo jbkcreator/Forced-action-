@@ -571,7 +571,7 @@ def _check_scraper_health(db: Session) -> bool:
             body=(
                 f"No ScraperRunStats rows found for {yesterday}.\n"
                 f"Scrapers may not have run. Lead emails will proceed with potentially stale data.\n\n"
-                f"Check: python -m src.tasks.run_scrapers hillsborough"
+                f"Check individual scraper logs in logs/cron/ and re-run failing modules."
             ),
         )
         logger.warning("No scraper run stats for %s — alerting ops", yesterday)

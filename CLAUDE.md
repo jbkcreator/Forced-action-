@@ -12,10 +12,7 @@ AI-powered distressed property intelligence platform for Hillsborough County, Fl
 # API server
 uvicorn src.api.main:app --reload --port 8000
 
-# Run all daily scrapers
-python -m src.tasks.run_scrapers hillsborough
-
-# Run a single scraper
+# Run a single scraper (individual scrapers are scheduled via scripts/cron/crontab.txt)
 python -m src.scrappers.foreclosures.foreclosure_engine
 
 # Rescore all properties

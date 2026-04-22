@@ -217,7 +217,7 @@ def run_load_validator(county_id: str = "hillsborough") -> dict:
                     "  - Source website changed structure or returned empty results\n"
                     "  - Scraper ran before new data was published (timing issue)\n"
                     "  - Authentication/session expired silently\n"
-                    "\nRun: python -m src.tasks.run_scrapers hillsborough\n"
+                    "\nCheck individual scraper logs in logs/cron/ and re-run failing modules.\n"
                     f"\nForced Action Ops Alert — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
                 ),
             )
@@ -289,7 +289,7 @@ def run_load_validator(county_id: str = "hillsborough") -> dict:
                 "  - Source website/API changed (check scraper logs)",
                 "  - Upstream data temporarily unavailable",
                 "  - DB matching regression (check unmatched counts)",
-                "\nRun: python -m src.tasks.run_scrapers hillsborough",
+                "\nCheck individual scraper logs in logs/cron/ and re-run failing modules.",
                 f"\nForced Action Ops Alert — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
             ]
             sent = send_alert(

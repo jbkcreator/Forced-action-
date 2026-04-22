@@ -3,8 +3,10 @@
 All times UTC. Add to the app-user's crontab on the production server (`crontab -e`).
 
 ```
-# Scrapers — 2 AM daily
-0 2 * * *      cd /opt/forced-action && python -m src.tasks.run_scrapers hillsborough
+# Individual scrapers are scheduled in scripts/cron/crontab.txt (see that file
+# for the canonical daily schedule). The removed run_scrapers.py orchestrator
+# used to run all scrapers at 2 AM — that role is now served by the individual
+# cron lines in crontab.txt.
 
 # CDS Scoring — 7 AM daily (after scrapers)
 0 7 * * *      cd /opt/forced-action && python -m src.services.cds_engine --rescore-all
