@@ -91,3 +91,8 @@ def rdelete(key: str) -> None:
         client.delete(key)
     except Exception as exc:
         logger.warning("Redis rdelete failed for %s: %s", key, exc)
+
+
+def get_redis():
+    """Return the raw Redis client (or None if unavailable). Use redis_available() guard first."""
+    return _get_client()

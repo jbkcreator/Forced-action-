@@ -2138,3 +2138,111 @@ def admin_dlq(limit: int = 50, db: Session = Depends(get_db)):
             for r in rows
         ],
     }
+
+
+# ── Phase 2B: Proof Moment — GET /api/proof-leads ────────────────────────────
+
+@app.get("/api/proof-leads")
+def proof_leads(
+    vertical: str = "roofing",
+    county_id: str = "hillsborough",
+    db: Session = Depends(get_db),
+):
+    """
+    Return 1 fully revealed + 2 blurred leads for the signup proof moment.
+    Requires no auth — used immediately after free account creation.
+    """
+    from src.services.proof_moment import get_proof_leads
+    if vertical not in VALID_VERTICALS:
+        raise HTTPException(status_code=400, detail=f"Invalid vertical. Must be one of: {sorted(VALID_VERTICALS)}")
+    return get_proof_leads(vertical=vertical, county_id=county_id, db=db)
+
+
+# ── Phase 2B: Monetization Wall ───────────────────────────────────────────────
+
+class WallSessionRequest(BaseModel):
+    subscriber_id: int
+    session_id: str
+    vertical: str = "roofing"
+    county_id: str = "hillsborough"
+
+
+@app.post("/api/wall/session", status_code=201)
+def create_wall_session(req: WallSessionRequest, db: Session = Depends(get_db)):
+    """Create a monetization wall session for a new subscriber."""
+    from src.services.monetization_wall import create_session, get_roi_frame
+    state = create_session(req.subscriber_id, req.session_id)
+    roi = get_roi_frame(req.vertical, req.county_id, db)
+    return {"session": state, "roi_frame": roi}
+
+
+@app.get("/api/wall/{session_id}")
+def get_wall_session(session_id: str):
+    """Poll wall session state (converted flag + countdown expiry)."""
+    from src.services.monetization_wall import get_session_state
+    state = get_session_state(session_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
+    return state
+
+
+# ── Phase 2B: Payment Sheet — POST /api/payment-intent ───────────────────────
+
+class PaymentIntentRequest(BaseModel):
+    feed_uuid: str
+    amount_cents: int = Field(..., gt=0, le=100000)  # max $1,000
+    description: str
+    save_card: bool = False
+    metadata: Optional[dict] = None
+
+
+@app.post("/api/payment-intent", status_code=201)
+def create_payment_intent_endpoint(
+    req: PaymentIntentRequest, db: Session = Depends(get_db)
+):
+    """Create a Stripe PaymentIntent for the Payment Sheet SDK."""
+    from src.services.payment_sheet import create_payment_intent
+
+    sub = db.execute(
+        select(Subscriber).where(Subscriber.event_feed_uuid == req.feed_uuid)
+    ).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=403, detail="Invalid feed_uuid")
+
+    try:
+        result = create_payment_intent(
+            subscriber_id=sub.id,
+            amount_cents=req.amount_cents,
+            description=req.description,
+            save_card=req.save_card,
+            db=db,
+            metadata=req.metadata,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    return result
+
+
+# ── Phase 2B: Missed-Call Voice Webhook ──────────────────────────────────────
+
+@app.post("/webhooks/twilio/voice", include_in_schema=False)
+async def twilio_voice_webhook(request: Request, db: Session = Depends(get_db)):
+    """
+    Twilio Programmable Voice webhook for missed/answered calls.
+    Auto-creates a free account and sends welcome SMS with dashboard link.
+    """
+    form = await request.form()
+    from_number = form.get("From", "")
+    if not from_number:
+        logger.warning("[Voice] Inbound call with no From number")
+        return Response(
+            content='<?xml version="1.0"?><Response><Hangup/></Response>',
+            media_type="application/xml",
+        )
+
+    from src.services.signup_engine import handle_missed_call
+    twiml = handle_missed_call(from_number=from_number, db=db)
+    return Response(content=twiml, media_type="application/xml")

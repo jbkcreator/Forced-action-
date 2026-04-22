@@ -1536,3 +1536,36 @@ class BundlePurchase(Base):
 
     def __repr__(self):
         return f"<BundlePurchase(id={self.id}, type={self.bundle_type}, status={self.status})>"
+
+
+class SmsOptIn(Base):
+    """
+    TCPA double opt-in records. Tracks explicit consent via "Reply YES" flow.
+    Required before sending proactive outbound SMS to any number.
+    Pre-send gate: sms_compliance.has_opted_in() checks this table.
+    """
+    __tablename__ = "sms_opt_ins"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    phone: Mapped[str] = mapped_column(String(20), nullable=False, unique=True, index=True)
+    subscriber_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("subscribers.id"), nullable=True, index=True
+    )
+    keyword_used: Mapped[Optional[str]] = mapped_column(String(20))     # YES / START / JOIN
+    source: Mapped[str] = mapped_column(String(30), nullable=False, default="double_opt_in")
+    opt_in_message: Mapped[Optional[str]] = mapped_column(Text)         # consent prompt text (TCPA record)
+    opted_in_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    ip_address: Mapped[Optional[str]] = mapped_column(String(50))       # web opt-in source IP
+
+    __table_args__ = (
+        CheckConstraint(
+            "source IN ('double_opt_in', 'manual', 'import', 'widget')",
+            name="check_opt_in_source",
+        ),
+        Index("idx_sms_opt_in_subscriber", "subscriber_id"),
+    )
+
+    def __repr__(self):
+        return f"<SmsOptIn(phone={self.phone}, source={self.source}, at={self.opted_in_at})>"
