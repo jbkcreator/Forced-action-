@@ -1,0 +1,6 @@
+# Static fallback body used when kill-switch is YELLOW for FOMO.
+# No Claude call — we ship this verbatim.
+version: 1
+body: |
+  {first_name}, another contractor just acted on a Gold lead in your area.
+  Open the link to see what's still available. [link]

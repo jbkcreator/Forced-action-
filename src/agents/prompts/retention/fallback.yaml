@@ -1,0 +1,4 @@
+version: 1
+body: |
+  {first_name}, your {tier} plan is still active. Tap to see this week's leads
+  and deals. [link]

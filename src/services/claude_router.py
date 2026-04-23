@@ -120,6 +120,72 @@ def call_claude(
     return text
 
 
+def call_claude_with_usage(
+    task_type: str,
+    messages: list[dict],
+    system: Optional[str] = None,
+    cache_system: bool = False,
+    max_tokens: int = 1024,
+    subscriber_id: Optional[int] = None,
+    db: Optional[Session] = None,
+) -> dict:
+    """
+    Same as call_claude() but returns a dict that includes token counts and
+    cost alongside the text. Used by Cora graphs that need to track
+    per-decision budget consumption.
+
+    Returns:
+        {
+            'text':         str,
+            'model':        'haiku' | 'sonnet' | 'opus',
+            'input_tokens': int,
+            'output_tokens': int,
+            'cost_usd':     float,
+        }
+    """
+    model_tier = _TASK_ROUTING.get(task_type, "sonnet")
+    model_id = _model_id(model_tier)
+
+    client = Anthropic(api_key=settings.anthropic_api_key.get_secret_value())
+
+    kwargs: dict = {
+        "model": model_id,
+        "max_tokens": max_tokens,
+        "messages": messages,
+    }
+
+    if system:
+        if cache_system:
+            kwargs["system"] = [
+                {
+                    "type": "text",
+                    "text": system,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
+        else:
+            kwargs["system"] = system
+
+    response = client.messages.create(**kwargs)
+
+    text = _extract_text(response)
+    _log_usage(response, model_tier, task_type, subscriber_id, db)
+
+    usage = getattr(response, "usage", None)
+    input_tokens = getattr(usage, "input_tokens", 0) if usage else 0
+    output_tokens = getattr(usage, "output_tokens", 0) if usage else 0
+    costs = _COST_TABLE.get(model_tier, _COST_TABLE["sonnet"])
+    cost_usd = (input_tokens * costs["input"] + output_tokens * costs["output"]) / 1_000_000
+
+    return {
+        "text": text,
+        "model": model_tier,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cost_usd": cost_usd,
+    }
+
+
 def call_claude_batch(
     task_type: str,
     requests: list[dict],

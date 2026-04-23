@@ -9,3 +9,4 @@ data/
 reports/
 nginx.conf
 forced-action.service
+docs/

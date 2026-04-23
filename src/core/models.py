@@ -1569,3 +1569,43 @@ class SmsOptIn(Base):
 
     def __repr__(self):
         return f"<SmsOptIn(phone={self.phone}, source={self.source}, at={self.opted_in_at})>"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Agents — Cora LangGraph Audit Log
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class AgentDecision(Base):
+    """
+    One row per Cora graph decision. Separate from message_outcomes (which is
+    outcome-focused). This is the "why did Cora do X for user Y" audit table —
+    the first stop for any operational question about autonomous behaviour.
+    """
+    __tablename__ = "agent_decisions"
+
+    decision_id: Mapped[str] = mapped_column(String(36), primary_key=True)   # UUID
+    graph_name: Mapped[str] = mapped_column(String(60), nullable=False, index=True)
+    subscriber_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("subscribers.id"), nullable=True, index=True
+    )
+    event_type: Mapped[Optional[str]] = mapped_column(String(60), index=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False, index=True
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    terminal_status: Mapped[Optional[str]] = mapped_column(String(20))   # completed | aborted | escalated | failed
+    tokens_used: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    cost_usd: Mapped[float] = mapped_column(Numeric(10, 6), default=0, nullable=False)
+    summary: Mapped[Optional[dict]] = mapped_column(JSONB)
+
+    __table_args__ = (
+        CheckConstraint(
+            "terminal_status IS NULL OR terminal_status IN ('completed', 'aborted', 'escalated', 'failed')",
+            name="check_agent_terminal_status",
+        ),
+        Index("idx_agent_decisions_graph_started", "graph_name", "started_at"),
+    )
+
+    def __repr__(self):
+        return f"<AgentDecision(id={self.decision_id[:8]}, graph={self.graph_name}, status={self.terminal_status})>"
