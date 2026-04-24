@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import uuid
 from pathlib import Path
@@ -32,8 +31,25 @@ if str(_ROOT) not in sys.path:
 
 import requests
 
+from config.settings import get_settings
 
-BASE_URL = os.environ.get("APP_BASE_URL", "http://localhost:8000")
+
+def _base_url() -> str:
+	"""Resolved base URL from settings (APP_BASE_URL env → AppSettings.app_base_url)."""
+	return (get_settings().app_base_url or "http://localhost:8000").rstrip("/")
+
+
+def _admin_creds() -> tuple[str, str]:
+	"""Return (username, password) from AppSettings. Raises if password missing."""
+	s = get_settings()
+	username = s.admin_username or "admin"
+	pwd_secret = s.admin_password
+	password = pwd_secret.get_secret_value() if pwd_secret else None
+	if not password:
+		raise RuntimeError(
+			"admin_password not set — fill ADMIN_PASSWORD in /etc/forced-action/env"
+		)
+	return username, password
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -41,12 +57,15 @@ BASE_URL = os.environ.get("APP_BASE_URL", "http://localhost:8000")
 # ──────────────────────────────────────────────────────────────────────────────
 
 def login(username: Optional[str] = None, password: Optional[str] = None) -> str:
-	"""Exchange admin creds for a bearer token. Pulls from env if not passed."""
-	u = username or os.environ.get("ADMIN_USERNAME", "admin")
-	p = password or os.environ.get("ADMIN_PASSWORD")
-	if not p:
-		raise RuntimeError("ADMIN_PASSWORD not set in env and not passed explicitly")
-	r = requests.post(f"{BASE_URL}/api/admin/login",
+	"""
+	Exchange admin creds for a bearer token. Reads from settings.py by default;
+	explicit args still override so you can impersonate a different admin in
+	a REPL session without touching env.
+	"""
+	default_user, default_pwd = _admin_creds()
+	u = username or default_user
+	p = password or default_pwd
+	r = requests.post(f"{_base_url()}/api/admin/login",
 					  json={"username": u, "password": p}, timeout=10)
 	r.raise_for_status()
 	token = r.json()["access_token"]
@@ -139,7 +158,7 @@ def dispatch_event(
 	}
 	if decision_id:
 		body["decision_id"] = decision_id
-	r = requests.post(f"{BASE_URL}/api/admin/sandbox/dispatch-event",
+	r = requests.post(f"{_base_url()}/api/admin/sandbox/dispatch-event",
 					  headers=_headers(token), json=body, timeout=30)
 	r.raise_for_status()
 	result = r.json()
@@ -203,7 +222,7 @@ def read_outbox(
 		params["subscriber_id"] = subscriber_id
 	if campaign:
 		params["campaign"] = campaign
-	r = requests.get(f"{BASE_URL}/api/admin/sandbox/outbox",
+	r = requests.get(f"{_base_url()}/api/admin/sandbox/outbox",
 					 headers=_headers(token), params=params, timeout=10)
 	r.raise_for_status()
 	return r.json()
@@ -225,7 +244,7 @@ def print_outbox(token: str, subscriber_id: int) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def simulate_inbound_sms(token: str, from_number: str, body: str) -> Dict[str, Any]:
-	r = requests.post(f"{BASE_URL}/api/admin/sandbox/simulate-inbound",
+	r = requests.post(f"{_base_url()}/api/admin/sandbox/simulate-inbound",
 					  headers=_headers(token),
 					  json={"from_number": from_number, "body": body}, timeout=10)
 	r.raise_for_status()
@@ -235,7 +254,7 @@ def simulate_inbound_sms(token: str, from_number: str, body: str) -> Dict[str, A
 
 
 def simulate_storm(token: str, event_name: str = "Severe Thunderstorm Warning") -> Dict[str, Any]:
-	r = requests.post(f"{BASE_URL}/api/admin/sandbox/simulate-nws-alert",
+	r = requests.post(f"{_base_url()}/api/admin/sandbox/simulate-nws-alert",
 					  headers=_headers(token),
 					  json={"properties": {"event": event_name,
 										    "areaDesc": "Hillsborough, FL"}},

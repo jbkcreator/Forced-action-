@@ -2,30 +2,34 @@
 Stage 1 smoke test — run on the server to verify infrastructure is up.
 
 Checks (each prints OK/FAIL with a short reason):
-  1. Postgres reachable + query works
-  2. Redis reachable (real, local)
+  1. Postgres reachable + query works + Phase 2B schema tables exist
+  2. Redis reachable (real, local) — round-trip set/get
   3. FastAPI /  endpoint responds
-  4. Agents supervisor is running (checkpoint migration ran)
+  4. Agents checkpoint store tables exist (migration ran)
   5. Admin JWT issues successfully
-  6. Sandbox dispatch-event endpoint accepts a known event type
-  7. Supervisor can route an event end-to-end (fires FOMO for a fake subscriber)
+  6. Sandbox mode is enabled (TWILIO_SANDBOX=true or REDIS_SANDBOX=true)
+  7. Sandbox dispatch-event endpoint accepts a known event type
 
 Exits 0 if all pass, non-zero on first failure.
 
-Usage:
-	# Set these first — same values as /etc/forced-action/env
-	export ADMIN_USERNAME=admin
-	export ADMIN_PASSWORD=...
-	export APP_BASE_URL=http://localhost:8000
+Config source:
+  This script reads config from the same place the API + agents processes
+  read from — config.settings.AppSettings. That means it uses the env file
+  you configured at /etc/forced-action/env (or your local .env) through
+  the unified settings layer, no ad-hoc env-var setting required.
 
-	python scripts/stage1/smoke_test.py
+Usage:
+	# on the server, from /opt/forced-action
+	sudo -u forcedaction -E .venv/bin/python scripts/stage1/smoke_test.py
+
+Override config for a one-off run:
+	# each setting can still be overridden via env for quick debugging
+	APP_BASE_URL=http://127.0.0.1:8000 .venv/bin/python scripts/stage1/smoke_test.py
 """
 
 from __future__ import annotations
 
-import os
 import sys
-import time
 import uuid
 from pathlib import Path
 
@@ -37,9 +41,14 @@ if str(_ROOT) not in sys.path:
 import requests
 from sqlalchemy import text
 
+from config.settings import get_settings
 from src.core.database import db as _db_mgr
-from src.core.redis_client import redis_available, reset_client_cache
+from src.core.redis_client import redis_available, reset_client_cache, rget, rset, get_redis
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Pretty-printers
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _pass(name: str, detail: str = "") -> None:
 	print(f"  OK    {name}" + (f"  [{detail}]" if detail else ""))
@@ -50,13 +59,63 @@ def _fail(name: str, detail: str) -> None:
 	sys.exit(1)
 
 
+def _section(title: str) -> None:
+	print(f"\n[{title}]")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Config resolution
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _resolve_config():
+	"""
+	Return a flat dict of the values this script needs, pulled from the
+	shared AppSettings instance. Fail loudly if any required value is
+	missing or still carries a REDACTED placeholder.
+	"""
+	settings = get_settings()
+
+	base_url = (settings.app_base_url or "").rstrip("/")
+	if not base_url:
+		_fail("config", "app_base_url is empty — check APP_BASE_URL in env")
+
+	admin_username = settings.admin_username
+	if not admin_username:
+		_fail("config", "admin_username is empty — check ADMIN_USERNAME in env")
+
+	pwd_secret = settings.admin_password
+	admin_password = pwd_secret.get_secret_value() if pwd_secret else None
+	if not admin_password or "REDACTED" in admin_password:
+		_fail("config", "admin_password is unset or still REDACTED — fill it in /etc/forced-action/env")
+
+	if not settings.twilio_sandbox and not settings.redis_sandbox:
+		_fail(
+			"config",
+			"sandbox mode off — set TWILIO_SANDBOX=true (and/or REDIS_SANDBOX=true) in env",
+		)
+
+	return {
+		"base_url": base_url,
+		"admin_username": admin_username,
+		"admin_password": admin_password,
+		"twilio_sandbox": settings.twilio_sandbox,
+		"redis_sandbox": settings.redis_sandbox,
+		"redis_url": settings.redis_url,
+		"database_url": settings.database_url,
+	}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Individual checks
+# ──────────────────────────────────────────────────────────────────────────────
+
 def check_postgres() -> None:
 	try:
 		with _db_mgr.session_scope() as s:
 			result = s.execute(text("SELECT 1")).scalar()
 			if result != 1:
 				_fail("postgres", f"unexpected SELECT 1 result: {result!r}")
-		# Sanity on the agents schema
+
 		with _db_mgr.session_scope() as s:
 			count = s.execute(text(
 				"SELECT count(*) FROM information_schema.tables "
@@ -64,23 +123,30 @@ def check_postgres() -> None:
 			)).scalar()
 			if count < 3:
 				_fail("postgres schema", f"expected 3 core tables, found {count}")
-		_pass("postgres")
+		_pass("postgres", "3 core tables present")
 	except Exception as exc:
 		_fail("postgres", str(exc))
 
 
-def check_redis() -> None:
-	# Force re-read of config (Stage 1 uses real local Redis)
+def check_redis(cfg: dict) -> None:
+	# settings-driven sandbox flag means the lazy singleton picks the right
+	# client; we still reset the cache in case the earlier check polluted it.
 	reset_client_cache()
 	if not redis_available():
-		_fail("redis", "redis_available() returned False — check REDIS_URL and local service")
-	from src.core.redis_client import rset, rget
+		_fail(
+			"redis",
+			"redis_available() returned False — check REDIS_URL (and REDIS_SANDBOX if intended)",
+		)
+
 	key = f"smoke:test:{uuid.uuid4().hex[:6]}"
 	if not rset(key, "hello", ttl_seconds=60):
 		_fail("redis rset", "rset returned False")
 	if rget(key) != "hello":
 		_fail("redis rget", "round-trip value mismatch")
-	_pass("redis", "local, round-trip ok")
+
+	# Make it clear whether we're on real Redis or fakeredis
+	detail = "fakeredis (sandbox)" if cfg["redis_sandbox"] else f"live at {cfg['redis_url']}"
+	_pass("redis", detail)
 
 
 def check_fastapi(base_url: str) -> None:
@@ -90,7 +156,7 @@ def check_fastapi(base_url: str) -> None:
 		_fail("fastapi", f"connection error: {exc}")
 	if r.status_code != 200:
 		_fail("fastapi", f"GET / returned {r.status_code}")
-	_pass("fastapi", "200 OK")
+	_pass("fastapi", "GET / returned 200")
 
 
 def check_checkpoint_store() -> None:
@@ -103,22 +169,18 @@ def check_checkpoint_store() -> None:
 			if count < 2:
 				_fail(
 					"agents checkpoint store",
-					"checkpoint tables missing — run `python -m scripts.run_agents --migrate` first",
+					"checkpoint tables missing — run `.venv/bin/python -m scripts.run_agents --migrate`",
 				)
 		_pass("agents checkpoint store")
 	except Exception as exc:
 		_fail("agents checkpoint store", str(exc))
 
 
-def check_admin_login(base_url: str) -> str:
-	u = os.environ.get("ADMIN_USERNAME") or "admin"
-	p = os.environ.get("ADMIN_PASSWORD")
-	if not p:
-		_fail("admin login", "ADMIN_PASSWORD env not set")
+def check_admin_login(cfg: dict) -> str:
 	try:
 		r = requests.post(
-			f"{base_url}/api/admin/login",
-			json={"username": u, "password": p},
+			f"{cfg['base_url']}/api/admin/login",
+			json={"username": cfg["admin_username"], "password": cfg["admin_password"]},
 			timeout=5,
 		)
 	except Exception as exc:
@@ -128,34 +190,39 @@ def check_admin_login(base_url: str) -> str:
 	token = r.json().get("access_token")
 	if not token:
 		_fail("admin login", "no access_token in response")
-	_pass("admin login")
+	_pass("admin login", f"user={cfg['admin_username']}")
 	return token
 
 
-def check_sandbox_enabled(base_url: str, token: str) -> None:
+def check_sandbox_enabled(cfg: dict, token: str) -> None:
 	r = requests.get(
-		f"{base_url}/api/admin/sandbox/outbox?limit=1",
+		f"{cfg['base_url']}/api/admin/sandbox/outbox?limit=1",
 		headers={"Authorization": f"Bearer {token}"},
 		timeout=5,
 	)
 	if r.status_code == 503:
 		_fail(
 			"sandbox mode",
-			"sandbox endpoints report disabled — set TWILIO_SANDBOX=true in env",
+			"endpoints report disabled at runtime — settings.twilio_sandbox / redis_sandbox must be true",
 		)
 	if r.status_code != 200:
 		_fail("sandbox outbox", f"{r.status_code} {r.text[:200]}")
-	_pass("sandbox mode", "outbox endpoint reachable")
+	active = []
+	if cfg["twilio_sandbox"]:
+		active.append("twilio")
+	if cfg["redis_sandbox"]:
+		active.append("redis")
+	_pass("sandbox mode", f"active: {'+'.join(active)}")
 
 
-def check_dispatch_endpoint(base_url: str, token: str) -> None:
-	# We do not want to create real subscribers. Use subscriber_id=None + a
-	# bogus event_type so the supervisor drops cleanly with a 200 response.
+def check_dispatch_endpoint(cfg: dict, token: str) -> None:
+	# Use subscriber_id=None + bogus event_type so the supervisor drops cleanly
+	# and returns 200. We're testing the *endpoint wiring*, not a real graph.
 	r = requests.post(
-		f"{base_url}/api/admin/sandbox/dispatch-event",
+		f"{cfg['base_url']}/api/admin/sandbox/dispatch-event",
 		headers={"Authorization": f"Bearer {token}"},
 		json={
-			"event_type": "bogus_smoke_event_type",
+			"event_type": "smoke_test_unknown_event",
 			"subscriber_id": None,
 			"payload": {},
 		},
@@ -169,24 +236,29 @@ def check_dispatch_endpoint(base_url: str, token: str) -> None:
 			"dispatch-event routing",
 			f"expected 'dropped_unknown_event', got {body.get('outcome')!r}",
 		)
-	_pass("dispatch-event", "supervisor drop path works")
+	_pass("dispatch-event", "supervisor drop path verified")
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────────────────────
 
 def main() -> int:
-	base_url = os.environ.get("APP_BASE_URL", "http://localhost:8000")
+	cfg = _resolve_config()
 
-	print(f"Stage 1 smoke test — target: {base_url}\n")
+	print(f"Stage 1 smoke test — target: {cfg['base_url']}")
+	print(f"  sandbox_twilio={cfg['twilio_sandbox']}  sandbox_redis={cfg['redis_sandbox']}")
 
-	print("[infrastructure]")
+	_section("infrastructure")
 	check_postgres()
-	check_redis()
-	check_fastapi(base_url)
+	check_redis(cfg)
+	check_fastapi(cfg["base_url"])
 	check_checkpoint_store()
 
-	print("\n[admin + sandbox]")
-	token = check_admin_login(base_url)
-	check_sandbox_enabled(base_url, token)
-	check_dispatch_endpoint(base_url, token)
+	_section("admin + sandbox")
+	token = check_admin_login(cfg)
+	check_sandbox_enabled(cfg, token)
+	check_dispatch_endpoint(cfg, token)
 
 	print("\nAll checks passed. Stage 1 infrastructure is ready for narratives.")
 	return 0
