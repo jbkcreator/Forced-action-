@@ -4,6 +4,13 @@ Redis client — lazy singleton with graceful degradation.
 Not available locally. All callers must guard with redis_available() or
 accept None / fallback behavior when Redis is not configured.
 
+Sandbox mode:
+    When settings.redis_sandbox is True (REDIS_SANDBOX=true in env), this
+    module returns a fakeredis client instead of connecting to a real Redis
+    server. Full semantics (TTLs, sorted sets, pub/sub) — but in-memory.
+    Scenario tests use this to exercise wall sessions, urgency windows,
+    lead holds, etc. without requiring real Redis.
+
 Usage:
     from src.core.redis_client import rget, rset, rincr, rdelete, redis_available
 
@@ -27,6 +34,20 @@ def _get_client():
     if _init_attempted:
         return _redis
     _init_attempted = True
+
+    # Sandbox mode takes precedence: always return a fakeredis client.
+    # Scenario tests set REDIS_SANDBOX=true at startup.
+    if getattr(settings, "redis_sandbox", False):
+        try:
+            import fakeredis
+            _redis = fakeredis.FakeRedis(decode_responses=True)
+            logger.info("Redis SANDBOX: using fakeredis in-memory client")
+            return _redis
+        except Exception as exc:
+            logger.warning("fakeredis unavailable (%s) — falling back to no-Redis path", exc)
+            _redis = None
+            return None
+
     url = settings.redis_url
     if not url:
         return None
@@ -40,6 +61,21 @@ def _get_client():
         logger.warning("Redis unavailable (%s) — falling back to Postgres counters", exc)
         _redis = None
     return _redis
+
+
+def reset_client_cache() -> None:
+    """
+    Clear the cached client and initialization flag. Used by scenario
+    fixtures that toggle REDIS_SANDBOX mid-test; production never calls this.
+    """
+    global _redis, _init_attempted
+    if _redis is not None:
+        try:
+            _redis.close()
+        except Exception:
+            pass
+    _redis = None
+    _init_attempted = False
 
 
 def redis_available() -> bool:

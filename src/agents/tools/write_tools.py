@@ -133,6 +133,9 @@ def send_sms(
 			db=s,
 			subscriber_id=subscriber_id,
 			task_type=campaign,
+			campaign=campaign,
+			variant_id=variant_id,
+			decision_id=decision_id,
 		)
 		if not ok:
 			return {

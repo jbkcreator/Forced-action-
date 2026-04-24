@@ -215,11 +215,40 @@ def _wave1_schedule_wave2(state: AbandonmentState) -> AbandonmentState:
 	For priority-list code completion we record the intent in state only
 	(the event-ingestion layer will own the Redis/Postgres write when wired).
 	"""
+	# Always call _finalize_audit regardless of terminal status, so early
+	# aborts still produce an agent_decisions row.
+	_finalize_audit(state, GRAPH_WAVE1)
+
 	if state.get("terminal_status") != "completed":
 		return {}
 
 	from datetime import datetime, timezone
 	return {"wave2_scheduled_at": datetime.now(timezone.utc).isoformat()}
+
+
+def _finalize_audit(state: AbandonmentState, graph_name: str) -> None:
+	"""
+	Write an agent_decisions row when the graph aborted before reaching
+	compose_and_send. No-op if compose_and_send already logged (i.e. sent).
+	"""
+	from src.agents.tools.write_tools import log_decision
+
+	final_status = state.get("terminal_status") or "completed"
+	if final_status == "completed" and state.get("sent"):
+		return
+	try:
+		log_decision(
+			decision_id=state["decision_id"],
+			graph_name=graph_name,
+			subscriber_id=state.get("subscriber_id"),
+			event_type=state.get("event_type"),
+			terminal_status=final_status,
+			tokens_used=int(state.get("tokens_used", 0) or 0),
+			cost_usd=float(state.get("cost_usd", 0.0) or 0.0),
+			summary={"failure_reason": state.get("failure_reason"), "early_abort": True},
+		)
+	except Exception:
+		pass
 
 
 def build_wave1_graph() -> StateGraph:
@@ -337,6 +366,11 @@ def _wave2_compose_and_send(state: AbandonmentState) -> AbandonmentState:
 	}
 
 
+def _wave2_finalize(state: AbandonmentState) -> AbandonmentState:
+	_finalize_audit(state, GRAPH_WAVE2)
+	return {}
+
+
 def build_wave2_graph() -> StateGraph:
 	g = StateGraph(AbandonmentState)
 	g.add_node("load_profile", _node_load_profile)
@@ -344,13 +378,15 @@ def build_wave2_graph() -> StateGraph:
 	g.add_node("hierarchy_check", _node_hierarchy_check)
 	g.add_node("build_context", _wave2_build_context)
 	g.add_node("compose_and_send", _wave2_compose_and_send)
+	g.add_node("finalize", _wave2_finalize)
 
 	g.add_edge(START, "load_profile")
 	g.add_edge("load_profile", "check_converted")
 	g.add_edge("check_converted", "hierarchy_check")
 	g.add_edge("hierarchy_check", "build_context")
 	g.add_edge("build_context", "compose_and_send")
-	g.add_edge("compose_and_send", END)
+	g.add_edge("compose_and_send", "finalize")
+	g.add_edge("finalize", END)
 	return g
 
 

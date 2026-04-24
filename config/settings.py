@@ -171,6 +171,11 @@ class AppSettings(BaseSettings):
 	twilio_from_number: Optional[str] = Field(default=None, env="TWILIO_FROM_NUMBER")  # E.164 format: +1XXXXXXXXXX
 	twilio_enabled: bool = Field(default=False, env="TWILIO_ENABLED")  # master kill-switch
 
+	# Sandbox flags — when set, outbound/integration side effects are captured to
+	# local tables instead of calling real services. Used for scenario tests.
+	twilio_sandbox: bool = Field(default=False, env="TWILIO_SANDBOX")
+	redis_sandbox: bool = Field(default=False, env="REDIS_SANDBOX")
+
 	# Claude model routing (update model IDs here without touching code)
 	claude_haiku_model: str = Field(default="claude-haiku-4-5-20251001", env="CLAUDE_HAIKU_MODEL")
 	claude_sonnet_model: str = Field(default="claude-sonnet-4-6", env="CLAUDE_SONNET_MODEL")

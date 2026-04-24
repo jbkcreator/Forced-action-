@@ -236,6 +236,29 @@ def _node_compose_and_send(state: RetentionState) -> RetentionState:
 
 
 def _node_finalize(state: RetentionState) -> RetentionState:
+	from src.agents.tools.write_tools import log_decision
+
+	final_status = state.get("terminal_status") or "completed"
+
+	# If compose_and_send did not run (early abort), we still owe an audit row.
+	# compose_and_send writes its own log_decision on the happy path; here we
+	# only write when the graph aborted before reaching compose_and_send.
+	if final_status != "completed" or not state.get("sent"):
+		try:
+			log_decision(
+				decision_id=state["decision_id"],
+				graph_name=GRAPH_NAME,
+				subscriber_id=state.get("subscriber_id"),
+				event_type=state.get("event_type"),
+				terminal_status=final_status,
+				tokens_used=int(state.get("tokens_used", 0) or 0),
+				cost_usd=float(state.get("cost_usd", 0.0) or 0.0),
+				summary={"failure_reason": state.get("failure_reason"), "early_abort": True},
+			)
+		except Exception:
+			# Audit logging must never mask the original outcome.
+			pass
+
 	if not state.get("terminal_status"):
 		return {"terminal_status": "completed"}
 	return {}

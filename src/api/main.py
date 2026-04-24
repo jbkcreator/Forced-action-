@@ -60,6 +60,9 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 from src.api.admin_router import router as admin_router  # noqa: E402
 app.include_router(admin_router)
 
+from src.api.sandbox_router import router as sandbox_router  # noqa: E402
+app.include_router(sandbox_router)
+
 # Mount React build assets (JS/CSS chunks) if the dist directory exists
 if REACT_DIST.is_dir() and (REACT_DIST / "assets").is_dir():
     app.mount("/assets", StaticFiles(directory=str(REACT_DIST / "assets")), name="react-assets")
@@ -1233,12 +1236,16 @@ def event_feed(
     return {
         "feed_uuid": feed_uuid,
         "subscriber": {
+            "id": subscriber.id,
             "tier": subscriber.tier,
             "vertical": subscriber.vertical,
             "county_id": subscriber.county_id,
             "locked_zips": list(locked_zips),
             "founding_member": subscriber.founding_member,
             "status": subscriber.status,
+            "has_saved_card": subscriber.has_saved_card,
+            "auto_mode_enabled": subscriber.auto_mode_enabled,
+            "created_at": subscriber.created_at.isoformat() if subscriber.created_at else None,
         },
         "total": total,
         "page": page,
@@ -2137,6 +2144,35 @@ def admin_dlq(limit: int = 50, db: Session = Depends(get_db)):
             }
             for r in rows
         ],
+    }
+
+
+# ── Phase 2B: Live ZIP activity — GET /api/zip-activity ──────────────────────
+
+@app.get("/api/zip-activity")
+def zip_activity(zip_code: str, vertical: Optional[str] = None):
+    """
+    Return live urgency signal for a ZIP — viewer count + recent message
+    volume. Powers the FOMO indicator on SampleLeads / dashboard feed.
+
+    Read-only, no auth required (public signal, like the ZIP checker).
+    Redis-degrades cleanly: returns active_viewers=0 when Redis is down.
+    """
+    if not _ZIP_RE.match(zip_code):
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_zip", "message": "ZIP code must be exactly 5 digits"},
+        )
+    if vertical is not None and vertical not in VALID_VERTICALS:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_vertical", "message": f"vertical must be one of: {sorted(VALID_VERTICALS)}"},
+        )
+    from src.services.urgency_engine import get_active_count
+    return {
+        "zip_code": zip_code,
+        "vertical": vertical,
+        "active_viewers": get_active_count(zip_code),
     }
 
 

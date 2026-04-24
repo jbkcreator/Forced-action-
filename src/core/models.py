@@ -1609,3 +1609,48 @@ class AgentDecision(Base):
 
     def __repr__(self):
         return f"<AgentDecision(id={self.decision_id[:8]}, graph={self.graph_name}, status={self.terminal_status})>"
+
+
+class SandboxOutbox(Base):
+    """
+    Capture table for would-be outbound messages during scenario tests.
+
+    When TWILIO_SANDBOX or SYNTHFLOW_SANDBOX is true, the outbound services
+    write one row here instead of (or alongside) the dry-run log. Developers
+    inspect these rows via /admin/sandbox/outbox to verify message bodies,
+    compliance outcomes, and graph-produced copy.
+
+    Production with TWILIO_ENABLED=true and TWILIO_SANDBOX=false leaves this
+    table empty.
+    """
+    __tablename__ = "sandbox_outbox"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    channel: Mapped[str] = mapped_column(String(20), nullable=False)        # sms | voice | email
+    to_number: Mapped[Optional[str]] = mapped_column(String(64))            # E.164 or email
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    campaign: Mapped[Optional[str]] = mapped_column(String(100), index=True)
+    variant_id: Mapped[Optional[str]] = mapped_column(String(100))
+    subscriber_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("subscribers.id"), nullable=True, index=True
+    )
+    decision_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+    compliance_allowed: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    compliance_reason: Mapped[Optional[str]] = mapped_column(String(60))
+    would_have_delivered: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    sandbox_flag: Mapped[str] = mapped_column(String(40), nullable=False, default="twilio_sandbox")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "channel IN ('sms', 'voice', 'email')",
+            name="check_sandbox_outbox_channel",
+        ),
+        Index("idx_sandbox_outbox_sub_created", "subscriber_id", "created_at"),
+        Index("idx_sandbox_outbox_campaign_created", "campaign", "created_at"),
+    )
+
+    def __repr__(self):
+        return f"<SandboxOutbox(id={self.id}, channel={self.channel}, to={self.to_number}, campaign={self.campaign})>"

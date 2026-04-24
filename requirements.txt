@@ -42,3 +42,6 @@ langgraph>=1.1.0
 langgraph-checkpoint-postgres>=3.0.0
 psycopg[binary]>=3.2.0
 langsmith>=0.7.0
+
+# Sandbox — in-memory Redis shim for scenario tests
+fakeredis>=2.24

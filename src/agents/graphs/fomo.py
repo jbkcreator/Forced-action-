@@ -223,7 +223,28 @@ def _node_compose_and_send(state: FOMOState) -> FOMOState:
 
 
 def _node_finalize(state: FOMOState) -> FOMOState:
-	# Default terminal status if still unset (should never happen, defensive).
+	from src.agents.tools.write_tools import log_decision
+
+	final_status = state.get("terminal_status") or "completed"
+
+	# Early-abort audit: compose_and_send writes its own log on the happy path;
+	# if the graph never reached compose_and_send (e.g. ZIP already locked) we
+	# still owe an agent_decisions row here.
+	if final_status != "completed" or not state.get("sent"):
+		try:
+			log_decision(
+				decision_id=state["decision_id"],
+				graph_name=GRAPH_NAME,
+				subscriber_id=state.get("subscriber_id"),
+				event_type=state.get("event_type"),
+				terminal_status=final_status,
+				tokens_used=int(state.get("tokens_used", 0) or 0),
+				cost_usd=float(state.get("cost_usd", 0.0) or 0.0),
+				summary={"failure_reason": state.get("failure_reason"), "early_abort": True},
+			)
+		except Exception:
+			pass
+
 	if not state.get("terminal_status"):
 		return {"terminal_status": "completed"}
 	return {}

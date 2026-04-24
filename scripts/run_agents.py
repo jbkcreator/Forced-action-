@@ -63,11 +63,16 @@ def main(argv: list[str] | None = None) -> int:
 		metavar="SUBSCRIBER_ID",
 		help="Run the hello-world graph against the given subscriber ID",
 	)
+	parser.add_argument(
+		"--serve",
+		action="store_true",
+		help="Start the supervisor with all enabled event listeners and block until SIGTERM",
+	)
 
 	args = parser.parse_args(argv)
 	_configure_logging()
 
-	if not any([args.migrate, args.hello_world is not None]):
+	if not any([args.migrate, args.hello_world is not None, args.serve]):
 		parser.print_help()
 		return 2
 
@@ -78,6 +83,11 @@ def main(argv: list[str] | None = None) -> int:
 
 	if args.hello_world is not None:
 		return cmd_hello_world(args.hello_world)
+
+	if args.serve:
+		from src.agents.events.ingestion import run_forever
+		run_forever()
+		return 0
 
 	return 0
 
