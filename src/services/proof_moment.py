@@ -48,7 +48,16 @@ def get_proof_leads(vertical: str, county_id: str, db: Session) -> dict:
 
     for i, (prop, score) in enumerate(top):
         v_score = score.vertical_scores.get(vertical) if score.vertical_scores else None
-        distress = list(score.distress_types.keys()) if score.distress_types else []
+        # distress_types is declared JSONB dict in models.py but production rows
+        # sometimes carry a list (legacy scoring output). Tolerate both so the
+        # proof moment endpoint doesn't crash on real data.
+        dt = score.distress_types
+        if isinstance(dt, dict):
+            distress = list(dt.keys())
+        elif isinstance(dt, list):
+            distress = list(dt)
+        else:
+            distress = []
 
         lead: dict = {
             "property_id": prop.id,
