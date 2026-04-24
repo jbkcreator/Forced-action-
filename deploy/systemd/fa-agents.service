@@ -1,0 +1,28 @@
+[Unit]
+Description=Forced Action — Cora agents supervisor
+After=network-online.target postgresql.service redis-server.service fa-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=forcedaction
+Group=forcedaction
+WorkingDirectory=/opt/forced-action
+EnvironmentFile=/etc/forced-action/env
+ExecStartPre=/opt/forced-action/.venv/bin/python -m scripts.run_agents --migrate
+ExecStart=/opt/forced-action/.venv/bin/python -m scripts.run_agents --serve
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fa-agents
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/forced-action /var/log/forced-action
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
