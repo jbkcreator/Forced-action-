@@ -74,6 +74,90 @@ def create_free_account(
     return sub
 
 
+def create_free_account_by_email(
+	email: str,
+	db: Session,
+	vertical: str = "roofing",
+	county_id: str = "hillsborough",
+	name: Optional[str] = None,
+	referral_code: Optional[str] = None,
+) -> Subscriber:
+	"""
+	Create (or re-use) a free-tier Subscriber keyed by email.
+
+	Creates a real Stripe customer so subsequent Payment Sheet charges can
+	set `setup_future_usage=off_session` against it. Idempotent on email —
+	a re-visit returns the existing subscriber row, not a duplicate.
+	"""
+	from sqlalchemy import select
+
+	email = email.strip().lower()
+
+	# Deduplicate by email — return existing free subscriber if found.
+	existing = db.execute(
+		select(Subscriber).where(Subscriber.email == email)
+	).scalar_one_or_none()
+	if existing:
+		logger.info("free account re-used for email=%s → subscriber=%d", email, existing.id)
+		return existing
+
+	# Create a real Stripe customer so we can attach PaymentMethods later.
+	stripe_customer_id = _create_stripe_customer(email, name)
+
+	now = datetime.now(timezone.utc)
+	sub = Subscriber(
+		stripe_customer_id=stripe_customer_id,
+		tier="free",
+		vertical=vertical,
+		county_id=county_id,
+		email=email,
+		name=name,
+		founding_member=False,
+		status="active",
+		event_feed_uuid=str(uuid.uuid4()),
+		referral_code=f"REF{uuid.uuid4().hex[:5].upper()}",
+		created_at=now,
+		updated_at=now,
+	)
+	db.add(sub)
+	db.flush()
+
+	logger.info("Free account created by email: subscriber=%d email=%s", sub.id, email)
+
+	if referral_code:
+		try:
+			from src.services.referral_engine import process_signup
+			process_signup(sub.id, referral_code, db)
+		except Exception as exc:
+			logger.warning("Referral processing failed for subscriber %d: %s", sub.id, exc)
+
+	return sub
+
+
+def _create_stripe_customer(email: str, name: Optional[str]) -> str:
+	"""
+	Create a Stripe customer, returning its ID. Falls back to a placeholder
+	if Stripe is misconfigured so free signup never hard-fails over it — the
+	placeholder blocks later Payment Sheet flows until a real customer is
+	attached, but the subscriber row still gets created.
+	"""
+	try:
+		import stripe
+		key = settings.active_stripe_secret_key
+		if key is None:
+			return f"free_{uuid.uuid4().hex[:12]}"
+		stripe.api_key = key.get_secret_value()
+		customer = stripe.Customer.create(
+			email=email,
+			name=name,
+			metadata={"fa_source": "free_signup_email"},
+		)
+		return customer.id
+	except Exception as exc:
+		logger.warning("Stripe customer create failed for %s: %s — using placeholder", email, exc)
+		return f"free_{uuid.uuid4().hex[:12]}"
+
+
 def handle_missed_call(from_number: str, db: Session) -> str:
     """
     Process an inbound missed/answered call from Twilio Voice.

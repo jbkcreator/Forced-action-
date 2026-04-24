@@ -1172,21 +1172,52 @@ def event_feed(
     else:
         order_col = desc(score_col)
 
+    # Dedupe to latest DistressScore row per property. `distress_scores` is
+    # 1-to-many with `properties` (scoring runs accumulate history) so a
+    # naive join returns duplicates. We pick MAX(score_date) per property,
+    # then join back to the full row. Safety net: also dedupe in Python on
+    # the rare chance two rows share the same score_date.
+    latest_score_subq = (
+        select(
+            DistressScore.property_id.label("prop_id"),
+            func.max(DistressScore.score_date).label("max_date"),
+        )
+        .group_by(DistressScore.property_id)
+        .subquery()
+    )
+
     base_query = (
         select(Property, DistressScore)
         .join(DistressScore, DistressScore.property_id == Property.id)
+        .join(
+            latest_score_subq,
+            and_(
+                latest_score_subq.c.prop_id == DistressScore.property_id,
+                latest_score_subq.c.max_date == DistressScore.score_date,
+            ),
+        )
         .where(and_(*filters))
         .order_by(order_col)
     )
 
-    # 4. Total count
+    # 4. Total count — run over the deduped base_query so the pager is correct
     try:
         count_q = select(func.count()).select_from(base_query.subquery())
         total = db.execute(count_q).scalar()
 
-        # 5. Paginate
+        # 5. Paginate. Fetch slightly more than page_size so score_date ties
+        # don't leave us short after the Python-level dedupe.
         offset = (page - 1) * page_size
-        rows = db.execute(base_query.offset(offset).limit(page_size)).all()
+        raw_rows = db.execute(base_query.offset(offset).limit(page_size + 10)).all()
+        seen_ids = set()
+        rows = []
+        for prop, score in raw_rows:
+            if prop.id in seen_ids:
+                continue
+            seen_ids.add(prop.id)
+            rows.append((prop, score))
+            if len(rows) >= page_size:
+                break
     except OperationalError:
         logger.error("DB error fetching leads for feed", exc_info=True)
         raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
@@ -2192,6 +2223,64 @@ def proof_leads(
     if vertical not in VALID_VERTICALS:
         raise HTTPException(status_code=400, detail=f"Invalid vertical. Must be one of: {sorted(VALID_VERTICALS)}")
     return get_proof_leads(vertical=vertical, county_id=county_id, db=db)
+
+
+# ── Phase 2B: Free signup — POST /api/free-signup ────────────────────────────
+
+class FreeSignupRequest(BaseModel):
+    email: str
+    vertical: str = "roofing"
+    county_id: str = "hillsborough"
+    name: Optional[str] = None
+    referral_code: Optional[str] = None
+
+    @field_validator("email")
+    @classmethod
+    def _validate_email(cls, v: str) -> str:
+        v = (v or "").strip().lower()
+        if not v or "@" not in v or "." not in v.split("@")[-1]:
+            raise ValueError("A valid email is required")
+        return v
+
+
+@app.post("/api/free-signup", status_code=201)
+def free_signup(req: FreeSignupRequest, db: Session = Depends(get_db)):
+    """
+    Create (or re-use) a free-tier Subscriber keyed by email.
+
+    Powers the landing-page unlock flow: landing visitor enters email →
+    this endpoint creates the free Subscriber + real Stripe customer →
+    returns the feed_uuid the frontend needs for /api/payment-intent.
+
+    Idempotent on email — re-visiting with the same email returns the
+    existing subscriber's feed_uuid without creating duplicates.
+    """
+    if req.vertical not in VALID_VERTICALS:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_vertical", "message": f"Must be one of: {sorted(VALID_VERTICALS)}"},
+        )
+
+    from src.services.signup_engine import create_free_account_by_email
+
+    sub = create_free_account_by_email(
+        email=req.email,
+        db=db,
+        vertical=req.vertical,
+        county_id=req.county_id,
+        name=req.name,
+        referral_code=req.referral_code,
+    )
+
+    return {
+        "subscriber_id": sub.id,
+        "feed_uuid": sub.event_feed_uuid,
+        "tier": sub.tier,
+        "status": sub.status,
+        "email": sub.email,
+        "vertical": sub.vertical,
+        "county_id": sub.county_id,
+    }
 
 
 # ── Phase 2B: Monetization Wall ───────────────────────────────────────────────

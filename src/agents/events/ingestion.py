@@ -147,7 +147,9 @@ def listen_redis(
 
 def run_forever() -> None:
 	"""
-	Start every enabled listener in its own daemon thread and block on SIGTERM.
+	Start every enabled listener in its own daemon thread and block until a
+	stop signal arrives. Exits cleanly on SIGINT (Ctrl+C) / SIGTERM, and on
+	Windows also on SIGBREAK (Ctrl+Break).
 
 	Threads:
 	  - Postgres LISTEN   (if AGENTS_EVENT_SOURCE_POSTGRES=true)
@@ -186,14 +188,29 @@ def run_forever() -> None:
 		logger.info("supervisor: received stop signal; draining")
 		stop_event.set()
 
+	# SIGINT works on all platforms. SIGTERM / SIGBREAK are best-effort.
 	signal.signal(signal.SIGINT, _stop)
-	try:
-		signal.signal(signal.SIGTERM, _stop)
-	except (AttributeError, ValueError):
-		# SIGTERM is not always available on Windows.
-		pass
+	for sig_name in ("SIGTERM", "SIGBREAK"):
+		sig = getattr(signal, sig_name, None)
+		if sig is not None:
+			try:
+				signal.signal(sig, _stop)
+			except (ValueError, OSError):
+				pass
 
 	logger.info("supervisor: running (%d listeners)", len(threads))
+
+	# Block the main thread on stop_event, polling so SIGINT on Windows
+	# (where signal delivery to a blocked thread can be delayed) has a
+	# chance to run. 0.5s is tight enough that Ctrl+C feels responsive.
+	try:
+		while not stop_event.is_set():
+			stop_event.wait(timeout=0.5)
+	except KeyboardInterrupt:
+		stop_event.set()
+
+	# Give listeners a short drain window, then let daemon threads die with
+	# the process. Never block the main thread indefinitely on a listener.
 	for t in threads:
-		t.join()
+		t.join(timeout=5.0)
 	logger.info("supervisor: shutdown complete")

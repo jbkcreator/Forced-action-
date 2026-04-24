@@ -1205,7 +1205,7 @@ def _on_subscription_deleted(subscription: dict, db: Session) -> None:
 def _on_payment_intent_succeeded(payment_intent: dict, db: Session) -> None:
     """Route payment_intent.succeeded to the appropriate sub-handler."""
     meta = payment_intent.get("metadata", {})
-    product = meta.get("product")
+    product = meta.get("product") or meta.get("kind")   # tolerate both keys
 
     if product == "lead_pack":
         _on_lead_pack_payment(payment_intent, db)
@@ -1215,8 +1215,179 @@ def _on_payment_intent_succeeded(payment_intent: dict, db: Session) -> None:
         _on_bundle_payment(payment_intent, db)
         return
 
+    if product == "lead_unlock":
+        _on_lead_unlock_payment(payment_intent, db)
+        # Fall through to card-save so the unlock also triggers the saved-card flow
     # Default: check for card save (setup_future_usage=off_session)
     _on_card_saved(payment_intent, db)
+
+
+def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
+    """
+    Handle a single-lead $2.50–$7 unlock purchase.
+
+    Looks up the subscriber by Stripe customer id, looks up the property by
+    metadata.property_id, and emails the full lead details (address, owner
+    name, enriched contact if available). Logs a SentLead row so the
+    unlock is auditable from the subscriber's dashboard.
+    """
+    from src.core.models import Property, Owner, DistressScore, EnrichedContact, Subscriber, SentLead
+
+    meta = payment_intent.get("metadata", {}) or {}
+    property_id_raw = meta.get("property_id")
+    customer_id = payment_intent.get("customer")
+
+    if not property_id_raw or not customer_id:
+        logger.warning(
+            "lead_unlock payment missing property_id or customer: pi=%s",
+            payment_intent.get("id"),
+        )
+        return
+
+    try:
+        property_id = int(property_id_raw)
+    except (TypeError, ValueError):
+        logger.warning("lead_unlock payment non-int property_id=%r", property_id_raw)
+        return
+
+    subscriber = db.execute(
+        select(Subscriber).where(Subscriber.stripe_customer_id == customer_id)
+    ).scalar_one_or_none()
+    if not subscriber:
+        logger.warning("lead_unlock: no subscriber for customer=%s", customer_id)
+        return
+
+    prop = db.get(Property, property_id)
+    if not prop:
+        logger.warning("lead_unlock: property %s not found", property_id)
+        return
+
+    # Latest score for this property
+    score = db.execute(
+        select(DistressScore)
+        .where(DistressScore.property_id == property_id)
+        .order_by(DistressScore.score_date.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+    owner = db.execute(
+        select(Owner).where(Owner.property_id == property_id).limit(1)
+    ).scalar_one_or_none()
+
+    enriched = db.execute(
+        select(EnrichedContact).where(
+            EnrichedContact.property_id == property_id,
+            EnrichedContact.match_success == True,  # noqa: E712
+        ).limit(1)
+    ).scalar_one_or_none()
+
+    # Audit row — SentLead marks this lead as delivered to this subscriber
+    try:
+        existing_sent = db.execute(
+            select(SentLead).where(
+                SentLead.subscriber_id == subscriber.id,
+                SentLead.property_id == property_id,
+            )
+        ).scalar_one_or_none()
+        if not existing_sent:
+            db.add(SentLead(
+                subscriber_id=subscriber.id,
+                property_id=property_id,
+                source="lead_unlock_payment",
+            ))
+    except Exception as exc:
+        logger.warning("lead_unlock: SentLead insert failed: %s", exc)
+
+    # Send the email with full lead details
+    try:
+        _send_lead_unlock_email(subscriber, prop, score, owner, enriched)
+    except Exception as exc:
+        logger.error("lead_unlock: email send failed: %s", exc, exc_info=True)
+
+    logger.info(
+        "lead_unlock complete: subscriber=%s property=%s pi=%s",
+        subscriber.id, property_id, payment_intent.get("id"),
+    )
+
+
+def _send_lead_unlock_email(subscriber, prop, score, owner, enriched) -> None:
+    """Send a single-lead confirmation + details email after $4 unlock."""
+    from src.services.email import send_email
+    from config.settings import get_settings
+
+    _settings = get_settings()
+    if not subscriber.email:
+        logger.info("lead_unlock: subscriber %s has no email — skipping send", subscriber.id)
+        return
+
+    tier = (score.lead_tier if score else None) or "Scored"
+    vertical = subscriber.vertical or "roofing"
+    v_score = None
+    if score and score.vertical_scores:
+        v_score = score.vertical_scores.get(vertical)
+    score_str = f"{v_score:.1f}" if v_score is not None else (
+        f"{float(score.final_cds_score):.1f}" if score and score.final_cds_score else "N/A"
+    )
+    distress = ", ".join(score.distress_types or []) if score and score.distress_types else "—"
+    owner_name = (owner.owner_name if owner and owner.owner_name else "Not on public record")
+    phone = (enriched.mobile_phone if enriched and enriched.mobile_phone else "—")
+    email_addr = (enriched.email if enriched and enriched.email else "—")
+
+    dashboard_url = (
+        f"{_settings.app_base_url}/dashboard/{subscriber.event_feed_uuid}"
+        if _settings.app_base_url and subscriber.event_feed_uuid else ""
+    )
+
+    subject = f"Your unlocked lead: {prop.address or 'Property #' + str(prop.id)}"
+
+    text_body = (
+        f"You unlocked a Forced Action lead.\n\n"
+        f"Address:      {prop.address or '—'}\n"
+        f"City/State:   {(prop.city or '—')}, {(prop.state or 'FL')} {prop.zip or ''}\n"
+        f"Owner:        {owner_name}\n"
+        f"Tier:         {tier}   (Score: {score_str})\n"
+        f"Distress:     {distress}\n"
+        f"Phone:        {phone}\n"
+        f"Email:        {email_addr}\n\n"
+        f"Dashboard: {dashboard_url}\n\n"
+        "Card saved — next unlock is one tap.\n"
+    )
+
+    html_body = f"""<!DOCTYPE html>
+<html><body style="margin:0;padding:0;background:#0f172a;font-family:Inter,Arial,sans-serif;color:#e2e8f0;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f172a;padding:40px 0;">
+    <tr><td align="center">
+      <table width="560" cellpadding="0" cellspacing="0" style="background:#111827;border:1px solid rgba(255,255,255,0.08);border-radius:14px;padding:28px;">
+        <tr><td>
+          <h2 style="margin:0 0 4px;color:#fbbf24;font-size:22px;">Lead unlocked</h2>
+          <p style="margin:0 0 18px;color:#94a3b8;font-size:13px;">Card saved — next unlock is one tap.</p>
+          <table width="100%" cellpadding="0" cellspacing="0"
+                 style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);
+                        border-left:4px solid #fbbf24;border-radius:10px;padding:18px 20px;">
+            <tr><td>
+              <p style="margin:0 0 6px;font-size:16px;font-weight:700;color:#ffffff;">{prop.address or '—'}</p>
+              <p style="margin:0 0 10px;font-size:13px;color:#94a3b8;">{(prop.city or '—')}, {(prop.state or 'FL')} {prop.zip or ''}</p>
+              <p style="margin:0 0 4px;font-size:13px;color:#e2e8f0;"><b>Owner:</b> {owner_name}</p>
+              <p style="margin:0 0 4px;font-size:13px;color:#e2e8f0;"><b>Tier:</b> <span style="color:#fbbf24;">{tier}</span>  &middot; <b>Score:</b> {score_str}</p>
+              <p style="margin:0 0 4px;font-size:13px;color:#e2e8f0;"><b>Distress:</b> {distress}</p>
+              <p style="margin:0 0 4px;font-size:13px;color:#e2e8f0;"><b>Phone:</b> {phone}</p>
+              <p style="margin:0;font-size:13px;color:#e2e8f0;"><b>Email:</b> {email_addr}</p>
+            </td></tr>
+          </table>
+          {('<p style="margin:24px 0 0;text-align:center;"><a href="' + dashboard_url + '" style="background:#fbbf24;color:#0f172a;padding:12px 22px;border-radius:8px;text-decoration:none;font-weight:700;">Open your dashboard</a></p>') if dashboard_url else ''}
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body></html>"""
+
+    send_email(
+        to=subscriber.email,
+        subject=subject,
+        body_text=text_body,
+        body_html=html_body,
+    )
+    logger.info("lead_unlock email sent → %s (property=%s)", subscriber.email, prop.id)
 
 
 def _on_card_saved(payment_intent: dict, db: Session) -> None:

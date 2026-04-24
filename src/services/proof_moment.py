@@ -72,6 +72,17 @@ def get_proof_leads(vertical: str, county_id: str, db: Session) -> dict:
             "urgency_level": score.urgency_level,
         }
 
+        # Address + owner name are public-record — return unblurred for every
+        # lead. Phone/email (skip-trace enrichment) stay behind the paywall.
+        from src.core.models import Owner
+        owner_row = db.execute(
+            select(Owner).where(Owner.property_id == prop.id).limit(1)
+        ).scalar_one_or_none()
+        lead["owner_name"] = (
+            owner_row.owner_name if owner_row and getattr(owner_row, "owner_name", None)
+            else None
+        )
+
         if i == 0:
             # Full reveal — fetch enriched contact if available
             enriched = db.execute(
@@ -92,7 +103,8 @@ def get_proof_leads(vertical: str, county_id: str, db: Session) -> dict:
             )
             result["revealed"] = lead
         else:
-            lead["address"] = _blur_address(prop.address)
+            # Address + owner name visible; contact (phone/email) hidden
+            # until the user pays to unlock.
             lead["contact"] = None
             result["blurred"].append(lead)
 

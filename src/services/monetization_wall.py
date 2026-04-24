@@ -66,10 +66,33 @@ _DEFAULT_ROI = {
 }
 
 
+def _safe_redis_op(op_name: str, fn):
+    """
+    Run a Redis operation. On any error (TimeoutError, ConnectionError, etc.)
+    log a warning and return None. Prevents a dropped Redis connection from
+    500'ing endpoints that call into this module.
+    """
+    if not redis_available():
+        return None
+    try:
+        return fn(get_redis())
+    except Exception as exc:
+        logger.warning("monetization_wall: %s failed: %s", op_name, exc)
+        # Invalidate the cached client so the next call re-tests connectivity.
+        try:
+            from src.core.redis_client import reset_client_cache
+            reset_client_cache()
+        except Exception:
+            pass
+        return None
+
+
 def create_session(subscriber_id: int, session_id: str) -> dict:
     """
     Start tracking a monetization wall session.
     Returns the session state dict (also stored in Redis when available).
+    Redis failures are logged but do not propagate — the dict is always
+    returned so the caller (API endpoint) always gets a usable response.
     """
     now = datetime.now(timezone.utc)
     state = {
@@ -79,32 +102,38 @@ def create_session(subscriber_id: int, session_id: str) -> dict:
         "countdown_expires": (now + timedelta(seconds=_COUNTDOWN_SEC)).isoformat(),
         "converted": False,
     }
-    if redis_available():
-        get_redis().setex(f"mwall:{session_id}", _WALL_TTL, json.dumps(state))
+    _safe_redis_op(
+        "create_session.setex",
+        lambda r: r.setex(f"mwall:{session_id}", _WALL_TTL, json.dumps(state)),
+    )
     return state
 
 
 def get_session_state(session_id: str) -> Optional[dict]:
-    """Return current session state, or None if expired/missing."""
-    if not redis_available():
+    """Return current session state, or None if expired/missing/Redis-down."""
+    raw = _safe_redis_op("get_session_state.get", lambda r: r.get(f"mwall:{session_id}"))
+    if not raw:
         return None
-    raw = get_redis().get(f"mwall:{session_id}")
-    return json.loads(raw) if raw else None
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 def mark_converted(session_id: str) -> None:
-    """Flag the session as converted (payment received)."""
-    if not redis_available():
-        return
-    r = get_redis()
+    """Flag the session as converted (payment received). No-op on Redis failure."""
     key = f"mwall:{session_id}"
-    raw = r.get(key)
-    if not raw:
-        return
-    state = json.loads(raw)
-    state["converted"] = True
-    state["converted_at"] = datetime.now(timezone.utc).isoformat()
-    r.setex(key, max(r.ttl(key), 300), json.dumps(state))
+
+    def _op(r):
+        raw = r.get(key)
+        if not raw:
+            return
+        state = json.loads(raw)
+        state["converted"] = True
+        state["converted_at"] = datetime.now(timezone.utc).isoformat()
+        r.setex(key, max(r.ttl(key), 300), json.dumps(state))
+
+    _safe_redis_op("mark_converted", _op)
 
 
 def is_active(session_id: str) -> bool:
@@ -116,19 +145,40 @@ def get_roi_frame(vertical: str, county_id: str, db: Session) -> dict:
     """
     Return ROI framing data for the monetization wall.
     Augments static copy with a live qualified-lead count for credibility.
+
+    The live count is:
+      - UNIQUE properties (a property re-scored on multiple runs counts once)
+      - filtered to this vertical (only properties whose CDS engine output
+        has a non-zero score for the requested vertical qualify as e.g.
+        "qualified roofing leads")
+      - county-scoped
     """
     frame = _ROI_FRAMES.get(vertical, _DEFAULT_ROI).copy()
 
     try:
         from src.core.models import DistressScore, Property
-        live_count = db.execute(
-            select(func.count(Property.id))
+
+        # `vertical_scores` is a JSONB dict like {"roofing": 72, "investor": 15}.
+        # We filter on `...[vertical] > 0` so properties with no signal for
+        # this vertical are excluded — otherwise an investor-signal-only
+        # property would be counted as a "qualified roofing lead".
+        try:
+            v_score = DistressScore.vertical_scores[vertical].as_float()
+        except (KeyError, TypeError):
+            v_score = None
+
+        query = (
+            select(func.count(func.distinct(Property.id)))
             .join(DistressScore, DistressScore.property_id == Property.id)
             .where(
                 Property.county_id == county_id,
                 DistressScore.qualified == True,  # noqa: E712
             )
-        ).scalar_one_or_none() or 0
+        )
+        if v_score is not None:
+            query = query.where(v_score > 0)
+
+        live_count = db.execute(query).scalar_one_or_none() or 0
         frame["live_lead_count"] = live_count
     except Exception as exc:
         logger.warning("ROI frame live count failed: %s", exc)
