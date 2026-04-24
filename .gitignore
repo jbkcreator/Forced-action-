@@ -10,3 +10,4 @@ reports/
 nginx.conf
 forced-action.service
 docs/
+fa-agents.service

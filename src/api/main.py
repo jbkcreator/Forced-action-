@@ -22,7 +22,7 @@ from typing import Optional
 
 import requests as _requests
 import stripe
-from fastapi import FastAPI, Header, HTTPException, Request, Depends, Query
+from fastapi import FastAPI, Header, HTTPException, Request, Depends, Query, Response
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
@@ -2046,7 +2046,7 @@ async def twilio_inbound(request: Request, db: Session = Depends(get_db)):
     settings_obj = get_settings()
     if settings_obj.twilio_auth_token:
         try:
-            from twilio.request_validator import RequestValidator
+            from twilio.request_validator import RequestValidator  # type: ignore
             validator = RequestValidator(settings_obj.twilio_auth_token.get_secret_value())
             url = str(request.url)
             signature = request.headers.get("X-Twilio-Signature", "")
