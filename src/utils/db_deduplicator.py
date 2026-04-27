@@ -35,6 +35,7 @@ DEDUP_CONFIG: Dict[str, tuple] = {
     'probate': (LegalProceeding, 'case_number', 'Case Number'),
     'evictions': (LegalProceeding, 'case_number', 'Case Number'),
     'bankruptcy': (LegalProceeding, 'case_number', 'Docket Number'),
+    'divorce': (LegalProceeding, 'case_number', 'Case Number'),
 }
 
 

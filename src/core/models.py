@@ -433,7 +433,7 @@ class LegalProceeding(Base):
         Index("idx_proceeding_filing_date", "filing_date"),
         Index("idx_proceeding_case_number", "case_number"),
         Index("idx_proceeding_meta_data", "meta_data", postgresql_using="gin"),
-        CheckConstraint("record_type IN ('Probate', 'Eviction', 'Bankruptcy')", name="check_proceeding_record_type"),
+        CheckConstraint("record_type IN ('Probate', 'Eviction', 'Bankruptcy', 'Divorce')", name="check_proceeding_record_type"),
     )
 
     def __repr__(self):

@@ -21,7 +21,7 @@ from src.loaders.master import MasterPropertyLoader
 from src.loaders.violations import ViolationLoader
 from src.loaders.liens import LienLoader
 from src.loaders.deeds import DeedLoader
-from src.loaders.legal_proceedings import ProbateLoader, EvictionLoader, BankruptcyLoader
+from src.loaders.legal_proceedings import ProbateLoader, EvictionLoader, BankruptcyLoader, DivorceLoader
 from src.loaders.tax import TaxDelinquencyLoader
 from src.loaders.foreclosures import ForeclosureLoader
 from src.loaders.permits import BuildingPermitLoader
@@ -36,6 +36,7 @@ __all__ = [
     'ProbateLoader',
     'EvictionLoader',
     'BankruptcyLoader',
+    'DivorceLoader',
     'TaxDelinquencyLoader',
     'ForeclosureLoader',
     'BuildingPermitLoader',

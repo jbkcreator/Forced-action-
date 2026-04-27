@@ -40,6 +40,7 @@ RAW_MASTER_DIR = RAW_DATA_DIR / "master"
 RAW_JUDGMENTS_DIR = RAW_DATA_DIR / "judgments"
 RAW_DEEDS_DIR = RAW_DATA_DIR / "deeds"
 RAW_FIRE_DIR = RAW_DATA_DIR / "fire"
+RAW_DIVORCE_DIR = RAW_DATA_DIR / "divorce"
 
 # Temporary download directory for browser-use (cross-platform)
 TEMP_DOWNLOADS_DIR = Path(tempfile.gettempdir())
@@ -99,6 +100,14 @@ EVICTION_CASE_PATTERNS = [
     "LT Residential Eviction",
     "LT Commercial Eviction",
     "Eviction",
+]
+
+DIVORCE_CASE_PATTERNS = [
+    "DR Dissolution of Marriage",
+    "DR Dissolution",
+    "Dissolution of Marriage",
+    "Domestic Relations",
+    "Family Law",
 ]
 
 # =============================================================================

@@ -40,7 +40,8 @@ VERTICAL_WEIGHTS = {
         "bankruptcy": 55,        # Adjusted [cite: 109]
         "deed_transfers": 50,    # Adjusted [cite: 109]
         "irs_tax_liens": 55,     # Adjusted [cite: 109]
-        "hoa_liens": 55,
+        "hoa_liens": 68,         # Boosted: unpaid dues = financial distress = motivated seller
+        "divorce_filings": 60,   # Couple splitting = motivated to sell quickly
         "evictions": 45,         # Adjusted [cite: 109]
         "mechanics_liens": 55,
         "insurance_claim": 10,   # Stacking only
@@ -61,7 +62,8 @@ VERTICAL_WEIGHTS = {
         "irs_tax_liens": 50,     # Adjusted [cite: 109]
         "probate": 55,           # Adjusted [cite: 109]
         "mechanics_liens": 60,   # Adjusted [cite: 109]
-        "hoa_liens": 50,         # Adjusted [cite: 109]
+        "hoa_liens": 65,         # Boosted: financial distress = motivated to sell
+        "divorce_filings": 55,   # Motivated seller, property often priced to move
         "deed_transfers": 45,    # Adjusted [cite: 109]
         "evictions": 40,         # Adjusted [cite: 109]
         "insurance_claim": 10,   # Stacking only
@@ -85,6 +87,7 @@ VERTICAL_WEIGHTS = {
         "enforcement_permit": 75,  # Stop work/after-the-fact/failed/expired/revoked
         "evictions": 65,
         "hoa_liens": 50,
+        "divorce_filings": 25,
         "mechanics_liens": 55,
         "probate": 20,
         "deed_transfers": 20,
@@ -106,6 +109,7 @@ VERTICAL_WEIGHTS = {
         "tampa_code_liens": 65,  # Lowered from 80 [cite: 109]
         "mechanics_liens": 60,   # Adjusted [cite: 109]
         "hoa_liens": 60,
+        "divorce_filings": 20,
         "evictions": 55,         # Adjusted [cite: 109]
         "probate": 20,
         "foreclosures": 30,
@@ -126,6 +130,7 @@ VERTICAL_WEIGHTS = {
         "building_permits": 55,  # Adjusted [cite: 109]
         "enforcement_permit": 70,  # Stop work/after-the-fact/failed/expired/revoked
         "hoa_liens": 50,         # Adjusted from 55
+        "divorce_filings": 20,
         "mechanics_liens": 50,   # Adjusted from 60
         "evictions": 50,
         "probate": 25,
@@ -140,10 +145,11 @@ VERTICAL_WEIGHTS = {
     "attorneys": {
         "judgment_liens": 72,    # Lowered from 98 [cite: 109]
         "irs_tax_liens": 70,     # Lowered from 95 [cite: 109]
+        "divorce_filings": 65,   # Property settlements, title disputes = direct attorney work
         "foreclosures": 55,      # Adjusted [cite: 109]
         "bankruptcy": 55,        # Adjusted [cite: 109]
         "tampa_code_liens": 40,  # Adjusted [cite: 109]
-        "hoa_liens": 65,         # Adjusted [cite: 109]
+        "hoa_liens": 70,         # Boosted: HOA litigation is common attorney engagement
         "mechanics_liens": 50,   # Adjusted [cite: 109]
         "tax_delinquencies": 50, # Adjusted [cite: 109]
         "probate": 40,           # Adjusted [cite: 109]

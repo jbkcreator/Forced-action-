@@ -470,3 +470,180 @@ class BankruptcyLoader(BaseLoader):
         logger.info(f"Bankruptcy: {matched} matched, {unmatched} unmatched, {skipped} skipped")
         logger.warning("Bankruptcy match rate is low (name-only matching). Consider adding address enrichment.")
         return matched, unmatched, skipped
+
+
+class DivorceLoader(BaseLoader):
+    """
+    Loader for dissolution-of-marriage / domestic-relations court cases.
+
+    Uses the same civil filing CSV format as evictions. Party types are
+    Petitioner (person filing) and Respondent — tries petitioner address first,
+    then respondent address, then name-based fallback.
+    """
+
+    _LLM_MAX_CALLS = 20
+
+    def load_from_dataframe(
+        self,
+        df: pd.DataFrame,
+        skip_duplicates: bool = True,
+        sample_mode: bool = False,
+        sample_size: int = 20,
+    ) -> Tuple[int, int, int]:
+        """
+        Load dissolution/divorce cases from DataFrame.
+
+        Args:
+            df: DataFrame from civil filing CSV (already filtered to DR case types)
+            skip_duplicates: Skip existing records
+            sample_mode/sample_size: Test subsets
+
+        Returns:
+            Tuple of (matched, unmatched, skipped)
+        """
+        if sample_mode:
+            original_count = len(df)
+            df = df.head(sample_size)
+            logger.info(f"[DivorceLoader] SAMPLE MODE: {len(df)} rows (of {original_count})")
+        else:
+            logger.info(f"[DivorceLoader] Loading divorce cases from {len(df)} rows")
+
+        # Normalize column name
+        if "CaseNumber" in df.columns and "Case Number" not in df.columns:
+            df = df.rename(columns={"CaseNumber": "Case Number"})
+
+        grouped = df.groupby("Case Number") if "Case Number" in df.columns else df.groupby("CaseNumber")
+
+        matched = 0
+        unmatched = 0
+        skipped = 0
+
+        for case_number, group in grouped:
+            case_number = _safe_str(case_number) or str(case_number).strip()
+
+            if skip_duplicates and self.check_duplicate(LegalProceeding, {"case_number": case_number}):
+                logger.debug(f"[DivorceLoader] Skipping duplicate: {case_number}")
+                skipped += 1
+                continue
+
+            # Prefer petitioner row (more likely to have property address)
+            petitioner_row = None
+            respondent_row = None
+            if "PartyType" in group.columns:
+                pet_rows = group[group["PartyType"].str.contains("Petitioner", case=False, na=False)]
+                res_rows = group[group["PartyType"].str.contains("Respondent", case=False, na=False)]
+                petitioner_row = pet_rows.iloc[0] if not pet_rows.empty else group.iloc[0]
+                respondent_row = res_rows.iloc[0] if not res_rows.empty else None
+            else:
+                petitioner_row = group.iloc[0]
+
+            property_record = None
+            primary_row = petitioner_row
+
+            # Try petitioner address
+            party_address_val = _none_if_nan(primary_row.get("PartyAddress"))
+            if party_address_val:
+                match_result = self.find_property_by_address(str(party_address_val))
+                if match_result:
+                    property_record, score = match_result
+                    logger.info(f"[DivorceLoader] Matched by petitioner address (score: {score}%): {case_number}")
+
+            # Try respondent address
+            if not property_record and respondent_row is not None:
+                res_addr = _none_if_nan(respondent_row.get("PartyAddress"))
+                if res_addr:
+                    match_result = self.find_property_by_address(str(res_addr))
+                    if match_result:
+                        property_record, score = match_result
+                        logger.info(f"[DivorceLoader] Matched by respondent address (score: {score}%): {case_number}")
+
+            # Fallback: petitioner name
+            if not property_record:
+                first = str(_none_if_nan(primary_row.get("FirstName")) or "").strip()
+                last = str(_none_if_nan(primary_row.get("LastName/CompanyName")) or "").strip()
+                if last:
+                    variants = []
+                    if first:
+                        variants.append(f"{first} {last}")
+                    else:
+                        variants.append(last)
+                    if "-" in last:
+                        for part in last.split("-"):
+                            if len(part) > 4 and first:
+                                variants.append(f"{first} {part}")
+                    for variant in variants:
+                        match_result = self.find_property_by_owner_name(variant)
+                        if match_result:
+                            property_record, score = match_result
+                            logger.info(
+                                f"[DivorceLoader] Matched by petitioner name '{variant}' "
+                                f"(score: {score}%): {case_number}"
+                            )
+                            property_record, _ = self._apply_llm_verification(
+                                raw_row=primary_row.to_dict() if hasattr(primary_row, "to_dict") else dict(primary_row),
+                                current_best=property_record,
+                                match_score=score,
+                                record_type="divorce",
+                                match_field="LastName/CompanyName",
+                            )
+                            break
+
+            if property_record:
+                try:
+                    first = _none_if_nan(primary_row.get("FirstName")) or ""
+                    middle = _none_if_nan(primary_row.get("MiddleName")) or ""
+                    last = _none_if_nan(primary_row.get("LastName/CompanyName")) or ""
+                    petitioner_name = " ".join(
+                        [str(first).strip(), str(middle).strip(), str(last).strip()]
+                    ).strip()
+                    petitioner_name = " ".join(petitioner_name.split()) or None
+
+                    respondent_name = None
+                    if respondent_row is not None and "LastName/CompanyName" in group.columns:
+                        r_last = _none_if_nan(respondent_row.get("LastName/CompanyName"))
+                        r_first = _none_if_nan(respondent_row.get("FirstName")) or ""
+                        if r_last:
+                            respondent_name = " ".join([str(r_first).strip(), str(r_last).strip()]).strip()
+                            respondent_name = " ".join(respondent_name.split()) or None
+
+                    case_status_val = _none_if_nan(primary_row.get("Title"))
+                    case_type_val = _none_if_nan(primary_row.get("CaseTypeDescription"))
+                    addr_used = _none_if_nan(primary_row.get("PartyAddress"))
+
+                    divorce_record = LegalProceeding(
+                        property_id=property_record.id,
+                        record_type="Divorce",
+                        case_number=case_number,
+                        filing_date=self.parse_date(primary_row.get("FilingDate")),
+                        case_status=case_status_val,
+                        associated_party=petitioner_name,
+                        secondary_party=respondent_name,
+                        meta_data={
+                            "case_type": case_type_val,
+                            "party_address": addr_used,
+                        },
+                    )
+
+                    if self.safe_add(divorce_record):
+                        matched += 1
+                    else:
+                        unmatched += 1
+
+                except Exception as exc:
+                    logger.error(f"[DivorceLoader] Error building case {case_number}: {exc}")
+                    unmatched += 1
+            else:
+                logger.debug(
+                    f"[DivorceLoader] No property match for case: {case_number} "
+                    f"at {primary_row.get('PartyAddress')}"
+                )
+                self.quarantine_unmatched(
+                    source_type="divorce_filings",
+                    raw_row=primary_row.to_dict() if hasattr(primary_row, "to_dict") else dict(primary_row),
+                    county_id=self.county_id,
+                    address_string=str(party_address_val) if party_address_val else None,
+                )
+                unmatched += 1
+
+        logger.info(f"[DivorceLoader] {matched} matched, {unmatched} unmatched, {skipped} skipped")
+        return matched, unmatched, skipped

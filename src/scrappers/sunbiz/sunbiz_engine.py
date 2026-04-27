@@ -366,6 +366,21 @@ def run_sunbiz_pipeline(
         except Exception as e:
             logger.warning(f"[Sunbiz] Rescore failed (non-critical): {e}")
 
+    if not dry_run:
+        try:
+            from src.utils.scraper_db_helper import record_scraper_stats
+            record_scraper_stats(
+                source_type="sunbiz",
+                total_scraped=stats["processed"],
+                matched=stats["enriched"],
+                unmatched=stats["skipped"] + stats["failed"],
+                skipped=0,
+                run_success=True,
+                county_id=county_id,
+            )
+        except Exception as _se:
+            logger.warning("[Sunbiz] Could not record scraper stats: %s", _se)
+
     return stats
 
 

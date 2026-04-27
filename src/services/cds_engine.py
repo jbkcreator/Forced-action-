@@ -118,6 +118,7 @@ _PROCEEDING_TYPE_TO_SIGNAL: Dict[str, str] = {
     "Probate":    "probate",
     "Eviction":   "evictions",
     "Bankruptcy": "bankruptcy",
+    "Divorce":    "divorce_filings",
 }
 
 # Guard against empty VERTICAL_WEIGHTS misconfiguration at import time

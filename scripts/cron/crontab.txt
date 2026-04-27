@@ -42,6 +42,10 @@ PROJECT=/root/Forced-action-
 # 4. Probate Filings         — 04:45 AM UTC / 12:45 AM EDT / 10:15 AM IST
 45 4 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.probate.probate_engine --load-to-db
 
+# 4b. Divorce / Dissolution Filings — 04:47 AM UTC / 12:47 AM EDT / 10:17 AM IST
+#     Filters civil dailyfilings for DR (domestic relations) case types
+47 4 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.divorce.divorce_engine --load-to-db
+
 # 5. Liens + Deeds + Judgments — 05:00 AM UTC / 01:00 AM EDT / 10:30 AM IST
 #    Replaces the previous 3 separate scraper jobs (liens/deeds/judgments)
 0 5 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.liens.lien_engine --mode combined --start-date $(date -d "1 day ago" +\%Y-\%m-\%d) --load-to-db
@@ -97,6 +101,10 @@ PROJECT=/root/Forced-action-
 # Runs after CDS scoring so today's new leads are enriched before GHL sync picks them up.
 # --today-only: only process leads scored in the current run (safe, avoids re-processing history)
 30 7 * * 1-5 $PROJECT/scripts/cron/run.sh src.tasks.run_enrichment hillsborough --limit 500
+
+# SunBiz LLC Contact Enrichment — 07:40 AM UTC / 03:40 AM EDT / 01:10 PM IST
+# Searches FL SOS Sunbiz for registered-agent contacts of LLC-owned Gold+ leads
+40 7 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.sunbiz.sunbiz_engine
 
 # ── GHL CRM SYNC ─────────────────────────────────────────────
 # GHL CRM Sync               — 08:00 AM UTC / 04:00 AM EDT / 01:30 PM IST (after CDS scoring completes)

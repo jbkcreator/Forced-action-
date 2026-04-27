@@ -23,6 +23,7 @@ from src.loaders import (
     BankruptcyLoader,
     TaxDelinquencyLoader,
     LisPendensLoader,
+    DivorceLoader,
 )
 
 logger = logging.getLogger(__name__)
@@ -40,31 +41,33 @@ LIEN_DOCTYPE_TO_SOURCE = {
 # Maps the data_type key used by load_scraped_data_to_db → source_type stored in scraper_run_stats.
 # 'liens' is handled specially (split by document_type).  'judgments' maps to its own key.
 DATA_TYPE_TO_SOURCE = {
-    'violations':   'violations',
-    'foreclosures': 'foreclosures',
-    'judgments':    'judgments',
-    'deeds':        'deeds',
-    'evictions':    'evictions',
-    'probate':      'probate',
-    'permits':      'permits',
-    'bankruptcy':   'bankruptcy',
-    'tax':          'tax_delinquencies',
-    'lis_pendens':  'lis_pendens',
+    'violations':       'violations',
+    'foreclosures':     'foreclosures',
+    'judgments':        'judgments',
+    'deeds':            'deeds',
+    'evictions':        'evictions',
+    'probate':          'probate',
+    'permits':          'permits',
+    'bankruptcy':       'bankruptcy',
+    'tax':              'tax_delinquencies',
+    'lis_pendens':      'lis_pendens',
+    'divorce_filings':  'divorce_filings',
 }
 
 
 LOADER_MAP = {
-    'violations': ViolationLoader,
-    'foreclosures': ForeclosureLoader,
-    'liens': LienLoader,
-    'judgments': LienLoader,
-    'lis_pendens': LisPendensLoader,
-    'deeds': DeedLoader,
-    'evictions': EvictionLoader,
-    'probate': ProbateLoader,
-    'permits': BuildingPermitLoader,
-    'bankruptcy': BankruptcyLoader,
-    'tax': TaxDelinquencyLoader,
+    'violations':       ViolationLoader,
+    'foreclosures':     ForeclosureLoader,
+    'liens':            LienLoader,
+    'judgments':        LienLoader,
+    'lis_pendens':      LisPendensLoader,
+    'deeds':            DeedLoader,
+    'evictions':        EvictionLoader,
+    'probate':          ProbateLoader,
+    'permits':          BuildingPermitLoader,
+    'bankruptcy':       BankruptcyLoader,
+    'tax':              TaxDelinquencyLoader,
+    'divorce_filings':  DivorceLoader,
 }
 
 

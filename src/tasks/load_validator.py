@@ -50,6 +50,7 @@ REQUIRED_DAILY_SCRAPERS: list = [
     'bankruptcy',
     'evictions',
     'probate',
+    'divorce_filings',
     'foreclosures',
     'permits',
     'lien_tcl',
