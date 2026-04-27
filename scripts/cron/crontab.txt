@@ -73,6 +73,10 @@ PROJECT=/root/Forced-action-
 # 16. Load Validator — 06:30 AM UTC / 02:30 AM EDT / 12:00 PM IST (after all scrapers complete)
 30 6 * * 1-5 $PROJECT/scripts/cron/run.sh src.tasks.load_validator
 
+# 17. Lead Quality Monitor — 07:35 AM UTC (after CDS scoring at 07:00, skip tracing at 07:30)
+#     Snapshots leads sent ~30 days ago; computes Gold+ false-positive rate.
+35 7 * * 1-5 $PROJECT/scripts/cron/run.sh src.tasks.lead_quality_monitor hillsborough
+
 # ── PLATFORM TASKS ───────────────────────────────────────────
 # Grace Expiry (ZIP territories + subscribers) — every 15 min
 */15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.grace_expiry

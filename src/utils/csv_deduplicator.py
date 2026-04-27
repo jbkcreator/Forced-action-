@@ -31,7 +31,7 @@ UNIQUE_KEY_MAP = {
     'probate': ['CaseNumber'],
     'permits': ['Record Number'],
     'bankruptcy': ['Docket Number'],
-    'tax': ['Account Number'],
+    'tax': ['Account Number', 'Tax Yr'],
     'deeds': ['Instrument'],
     'fire': ['Report Number'],
 }

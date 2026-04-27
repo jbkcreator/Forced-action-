@@ -828,6 +828,61 @@ class SentLead(Base):
         return f"<SentLead(subscriber_id={self.subscriber_id}, property_id={self.property_id})>"
 
 
+class LeadQualitySnapshot(Base):
+    """
+    30-day post-send snapshot for each Gold+ lead delivered to a subscriber.
+    Used to compute false-positive rate: leads that looked distressed at send
+    time but were already sold or had resolved signals.
+
+    Populated by src/tasks/lead_quality_monitor.py, which runs daily after scoring.
+    One row per (property_id, subscriber_id, sent_at) — unique constraint prevents
+    double-snapshotting if the task re-runs.
+    """
+    __tablename__ = "lead_quality_snapshots"
+
+    id            = Column(Integer, primary_key=True, autoincrement=True)
+    property_id   = Column(Integer, ForeignKey("properties.id"), nullable=False, index=True)
+    subscriber_id = Column(Integer, ForeignKey("subscribers.id"), nullable=False, index=True)
+    county_id     = Column(String(50), nullable=False, default="hillsborough")
+
+    sent_at     = Column(DateTime(timezone=True), nullable=False)
+    snapshot_at = Column(DateTime(timezone=True), nullable=False)
+
+    # Score state at send time (looked up from DistressScore history by score_date)
+    score_at_send   = Column(Numeric(5, 2), nullable=True)
+    tier_at_send    = Column(String(20), nullable=True)
+    signals_at_send = Column(JSONB, nullable=True)  # distress_types list at send time
+
+    # Score state at snapshot time (current)
+    score_at_snapshot = Column(Numeric(5, 2), nullable=True)
+    tier_at_snapshot  = Column(String(20), nullable=True)
+    still_gold_plus   = Column(Boolean, nullable=False)
+
+    # False-positive indicators (non-exclusive — both can be True)
+    has_deed_transfer    = Column(Boolean, nullable=False, default=False)
+    has_resolved_signals = Column(Boolean, nullable=False, default=False)
+
+    # Single outcome classification (priority order: sold > resolved > decayed > active)
+    # 'active'   — still Gold+, no deed, no resolved signals  (true positive)
+    # 'decayed'  — no longer Gold+ but not sold/resolved      (borderline)
+    # 'sold'     — deed transfer recorded within 30d of send  (false positive)
+    # 'resolved' — primary code violations now closed/resolved (false positive)
+    outcome = Column(String(20), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("property_id", "subscriber_id", "sent_at",
+                         name="uq_lead_quality_snapshot"),
+        Index("idx_lqs_snapshot_at", "snapshot_at"),
+        Index("idx_lqs_outcome", "outcome"),
+    )
+
+    def __repr__(self):
+        return (
+            f"<LeadQualitySnapshot(property_id={self.property_id}, "
+            f"outcome='{self.outcome}', sent_at={self.sent_at.date()})>"
+        )
+
+
 class EnrichedContact(Base):
     """
     Skip-traced contact data from BatchSkipTracing (primary) and IDI (fallback).

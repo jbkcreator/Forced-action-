@@ -321,12 +321,11 @@ async def _ai_download_tax_delinquent(
 			logger.error(f"[AI][RADAR] Failed to load prompt from YAML: {e}")
 			raise
 
-		logger.info(f"[AI][RADAR] Launching browser agent to download tax delinquent report")
-		logger.info(f"[AI][RADAR] Tax year: {tax_year}, Status: {account_status}")
+		logger.warning("[AI][RADAR] Launching browser agent — tax_year=%s status=%s (may take 10-30 min)", tax_year, account_status)
 
 		from src.utils.http_helpers import get_browser_use_proxy
 		proxy = get_browser_use_proxy()
-		logger.info("[AI][RADAR] Proxy: %s", "Oxylabs enabled" if proxy else "NO PROXY — running direct")
+		logger.warning("[AI][RADAR] Proxy: %s", "Oxylabs enabled" if proxy else "NO PROXY — running direct")
 		browser = Browser(
 			headless=True,
 			disable_security=True,
@@ -350,7 +349,7 @@ async def _ai_download_tax_delinquent(
 			if not history.is_done():
 				logger.warning("[AI][RADAR] Agent could not finish within step limit")
 				return False
-			logger.info("[AI][RADAR] Agent completed. Waiting for download to finalize...")
+			logger.warning("[AI][RADAR] Agent completed. Waiting %ds for download to finalize...", wait_after_download)
 			await asyncio.sleep(wait_after_download)
 		except Exception as e:
 			logger.error(f"[AI][RADAR] Browser agent execution failed: {e}")
@@ -639,6 +638,8 @@ async def _sniper_enrich_accounts(df: pd.DataFrame, max_accounts: int = 100, par
 				skipped += 1
 				continue
 
+			if (idx + 1) % 10 == 0 or idx == 0:
+				logger.warning("[SNIPER] Progress: %d/%d accounts enriched", idx + 1, len(df))
 			logger.info(f"[SNIPER] [{idx + 1}/{len(df)}] Extracting account: {account_number}")
 
 			details = await _scrape_parcel_with_firecrawl(firecrawl_client, str(account_number), parcel_lookup_url=parcel_lookup_url)
@@ -816,7 +817,7 @@ async def run_radar_sniper_pipeline(
 			logger.info(f"No existing records found, all {len(df_new_only):,} are new")
 		
 		if df_new_only.empty:
-			logger.info("✓ All records already exist in database - nothing to enrich")
+			logger.warning("[RADAR] All %d distressed records already exist in DB for tax_year=%s — skipping SNIPER", initial_count, tax_year)
 			return True
 
 		# PHASE 4: SNIPER - Enrich ONLY NEW accounts with Firecrawl (cost optimization!)
