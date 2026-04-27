@@ -49,8 +49,11 @@ PROJECT=/root/Forced-action-
 # 8. Building Permits        — 05:45 AM UTC / 01:45 AM EDT / 11:15 AM IST
 45 5 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.permit.permit_engine --load-to-db
 
-# 9. Tax Delinquencies       — 06:00 AM UTC / 02:00 AM EDT / 11:30 AM IST — every Monday (weekly)
-0 6 * * 1 $PROJECT/scripts/cron/run.sh src.scrappers.deliquencies.tax_delinquent_engine --mode download-only --load-to-db --scraper ai
+# 9. Tax Delinquencies — DISABLED. County portal is blocking the scraper.
+#    Data is now loaded exclusively via the admin upload layer:
+#      POST /api/admin/upload/tax-delinquency  (auth: admin JWT)
+#    Freshness is auto-tracked via TaxDelinquency.date_added on every upload.
+# 0 6 * * 1 $PROJECT/scripts/cron/run.sh src.scrappers.deliquencies.tax_delinquent_engine --mode download-only --load-to-db --scraper ai
 
 # 10. Foreclosure Auctions   — 06:15 AM UTC / 02:15 AM EDT / 11:45 AM IST
 15 6 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.foreclosures.foreclosure_engine --date $(date +\%Y-\%m-\%d) --load-to-db --scraper ai
@@ -104,6 +107,10 @@ PROJECT=/root/Forced-action-
 # ── WEEKLY REPORT ────────────────────────────────────────────
 # Weekly Report — Monday @ 09:00 AM UTC / 05:00 AM EDT / 02:30 PM IST (after GHL sync)
 0 9 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.weekly_report
+
+# Weekly One-Pager (executive summary + 2-week trend remediation)
+# Monday @ 09:30 AM UTC — runs after weekly_report so it can pick up fresh data
+30 9 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.weekly_one_pager hillsborough
 
 # ── DAILY REPORT ─────────────────────────────────────────────
 # Daily Ops Report — 09:30 AM UTC / 05:30 AM EDT / 03:00 PM IST (after all other jobs complete)

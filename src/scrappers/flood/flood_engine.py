@@ -26,7 +26,7 @@ from sqlalchemy import select, and_
 logger = logging.getLogger(__name__)
 
 _FEMA_DISASTERS_URL = "https://www.fema.gov/api/open/v2/DisasterDeclarationsSummaries"
-_FEMA_NFIP_URL = "https://www.fema.gov/api/open/v1/nfipPolicies"
+_FEMA_NFIP_CLAIMS_URL = "https://www.fema.gov/api/open/v2/FimaNfipClaims"
 _NWS_ALERTS_URL = "https://api.weather.gov/alerts/active"
 _NWS_ZONE_URL = "https://api.weather.gov/alerts/active/zone/{zone_id}"
 
@@ -57,6 +57,37 @@ def _fetch_fema_declarations(state: str, county_fips: str, start_date: date) -> 
     except Exception as e:
         logger.warning("[flood] FEMA disasters API failed: %s", e, exc_info=True)
         return []
+
+
+def _fetch_nfip_claims(state: str, county_fips: str, start_date: date) -> List[str]:
+    """
+    Fetch FEMA NFIP paid flood-claim records for a state/county since start_date.
+    Returns list of ZIP codes with at least one claim in the window.
+
+    NFIP claims data is historical (paid claims, often months behind real-time).
+    Useful for catching flood events that didn't trigger an active NWS alert
+    or a federal disaster declaration but still produced insurable damage.
+    """
+    county_fips_padded = county_fips.zfill(3)
+    url = (
+        f"{_FEMA_NFIP_CLAIMS_URL}"
+        f"?$filter=state eq '{state}'"
+        f" and countyCode eq '{county_fips_padded}'"
+        f" and dateOfLoss ge '{start_date.isoformat()}'"
+        f"&$select=reportedZipCode,dateOfLoss"
+        f"&$top=1000&$format=json"
+    )
+    affected_zips = set()
+    try:
+        resp = requests.get(url, headers={"Accept": "application/json"}, timeout=20)
+        resp.raise_for_status()
+        for claim in resp.json().get("FimaNfipClaims", []):
+            zip_code = claim.get("reportedZipCode")
+            if zip_code:
+                affected_zips.add(str(zip_code)[:5])
+    except Exception as e:
+        logger.warning("[flood] FEMA NFIP claims API failed: %s", e)
+    return list(affected_zips)
 
 
 def _fetch_nws_flood_alerts_by_zones(zone_ids: List[str]) -> List[str]:
@@ -152,10 +183,19 @@ def scrape_flood_damage(
     if nws_zones:
         logger.info("[flood] %s: fetching alerts via %d zone(s): %s", county_id, len(nws_zones), nws_zones)
         nws_zips = _fetch_nws_flood_alerts_by_zones(nws_zones)
-        county_zips = nws_zips  # zone fetch is already county-scoped
+        county_zips = set(nws_zips)  # zone fetch is already county-scoped
     else:
         nws_zips = _fetch_nws_flood_alerts(state)
-        county_zips = [z for z in nws_zips if any(z.startswith(p) for p in zip_prefixes)]
+        county_zips = {z for z in nws_zips if any(z.startswith(p) for p in zip_prefixes)}
+
+    # Source 3: FEMA NFIP paid claims (historical flood damage in window)
+    nfip_zips = _fetch_nfip_claims(state, county_fips, start_date)
+    nfip_county_zips = {z for z in nfip_zips if any(z.startswith(p) for p in zip_prefixes)}
+    county_zips.update(nfip_county_zips)
+    logger.info("[flood] %s: NFIP claim ZIPs in county=%d (total scraped=%d)",
+                county_id, len(nfip_county_zips), len(nfip_zips))
+
+    county_zips = list(county_zips)
 
     if not has_fema_flood and not county_zips:
         logger.info("[flood] %s: no active flood events — 0 incidents", county_id)

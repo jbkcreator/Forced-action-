@@ -3,6 +3,7 @@ Tax delinquency loader.
 """
 
 import logging
+from datetime import date
 from typing import Tuple
 
 import pandas as pd
@@ -102,7 +103,12 @@ class TaxDelinquencyLoader(BaseLoader):
             existing_id = existing_map.get(key) if skip_duplicates else None
 
             if existing_id:
-                # UPSERT — refresh non-null enrichment fields on the existing row
+                # UPSERT — refresh non-null enrichment fields on the existing row.
+                # Always touch date_added so freshness reporting reflects this load,
+                # even when the underlying enrichment fields were already correct.
+                # This matters because tax_delinquencies is loaded via admin upload
+                # (the scraper is disabled — county portal blocked) and freshness
+                # is computed as max(date_added) in daily_report.py.
                 td_row = self.session.query(TaxDelinquency).get(existing_id)
                 if td_row:
                     changed = False
@@ -115,11 +121,11 @@ class TaxDelinquencyLoader(BaseLoader):
                     if certificate_data and td_row.certificate_data != certificate_data:
                         td_row.certificate_data = certificate_data
                         changed = True
+                    td_row.date_added = date.today()
+                    self.session.flush()
                     if changed:
-                        self.session.flush()
                         updated += 1
                         logger.debug("Updated tax record for %s year %s", account_number, tax_year)
-                    # If nothing changed, count as neither matched nor updated (silent skip)
             else:
                 # INSERT new record
                 try:

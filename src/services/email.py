@@ -94,29 +94,41 @@ def _send_raw_alert(settings, subject: str, body: str) -> None:
         srv.sendmail(settings.smtp_user, [settings.alert_email], msg.as_string())
 
 
-def send_alert(subject: str, body: str) -> bool:
+def send_alert(
+    subject: str,
+    body: str,
+    html_body: Optional[str] = None,
+    to: Optional[str] = None,
+) -> bool:
     """
-    Send an ops alert email to ALERT_EMAIL.
+    Send an ops alert email. By default targets ALERT_EMAIL; pass `to` to
+    override (used by reports that go to a different recipient list).
+
     Also sends an SMS via email-to-SMS gateway if ALERT_SMS_NUMBER +
-    ALERT_SMS_CARRIER are both configured.
+    ALERT_SMS_CARRIER are both configured (SMS path always uses plain text).
 
     Returns True if at least one channel succeeded.
     """
     settings = get_settings()
     sent = False
 
-    # Email alert
-    if settings.alert_email:
-        sent = send_email(to=settings.alert_email, subject=subject, body_text=body) or sent
+    # Email alert — to overrides default ALERT_EMAIL when provided
+    recipient = to or settings.alert_email
+    if recipient:
+        sent = send_email(
+            to=recipient,
+            subject=subject,
+            body_text=body,
+            body_html=html_body,
+        ) or sent
 
     # SMS via email-to-SMS gateway (no Twilio needed)
     if settings.alert_sms_number and settings.alert_sms_carrier:
         sms_addr = f"{settings.alert_sms_number}@{settings.alert_sms_carrier}"
-        # SMS body: keep to 160 chars
         sms_body = body[:160]
         sent = send_email(to=sms_addr, subject=subject[:40], body_text=sms_body) or sent
 
     if not sent:
-        logger.warning("Alert could not be sent (no ALERT_EMAIL or SMTP). Subject: %s", subject)
+        logger.warning("Alert could not be sent (no recipient or SMTP). Subject: %s", subject)
 
     return sent

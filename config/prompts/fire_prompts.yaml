@@ -1,0 +1,43 @@
+# Browser-use task prompt for HCSO Calls-for-Service portal
+# Used by src/scrappers/fire/fire_engine.py — replaces brittle Dojo-widget
+# Playwright selectors with an LLM-driven agent that adapts to UI changes.
+
+fire_calls_download:
+  description: "Navigate to HCSO Calls-for-Service portal and download mapped calls as CSV"
+  task_template: |
+    Go to {portal_url}
+
+    GOAL: Download the "Mapped Calls" data as a CSV file.
+
+    IMPORTANT RULES — read before acting:
+    - After every click, WAIT at least 2 seconds before doing anything else.
+    - Never click the same button twice in rapid succession. If a click does not
+      visibly change the page within 5 seconds, wait another 3 seconds and check
+      page state before retrying.
+    - Never reload the page.
+    - Do NOT change any map filters, zoom, or date controls. Use whatever the
+      page already shows.
+
+    STEPS:
+    1. Wait 5 seconds for the page and the map to fully load.
+
+    2. Find the export-format dropdown. It is usually labelled "Export Format",
+       "Format", or shows the current format (e.g. "Shapefile" or "KML").
+       It is typically near the bottom of the page or in a side panel
+       alongside an "Export Mapped Calls Only" button.
+       Click the dropdown to open the option list.
+       Wait 2 seconds.
+
+    3. From the dropdown options, select "CSV" (Comma-Separated Values).
+       Wait 2 seconds and confirm the dropdown now shows "CSV".
+
+    4. Click the "Export Mapped Calls Only" button (or whichever button performs
+       the export — it may also be labelled "Export", "Download CSV", or similar).
+       Click it ONCE.
+       Wait 30 seconds for the download to complete.
+
+    5. If the download did not start within 30 seconds, click the export button
+       ONE more time and wait another 30 seconds.
+
+    6. Call done() with a message confirming the download completed, or
+       describing the error if it failed.

@@ -2,29 +2,48 @@
 Fire / Calls-for-Service Scraper — HCSO GIS Portal
 
 Downloads the current "Calls for Service" CSV from the Hillsborough County
-Sheriff's Office public GIS portal.  Fire-related rows are filtered after
+Sheriff's Office public GIS portal. Fire-related rows are filtered after
 download using FIRE_INCIDENT_TYPES keywords.
 
 Portal: https://gis.hcso.tampa.fl.us/publicgis/callsforservice/
 Export: Dojo Select → CSV  →  "Export Mapped Calls Only" button
+
+Primary download path uses a browser-use AI agent instead of Playwright +
+hardcoded Dojo widget IDs. The portal's widget IDs change with every Dojo
+build, so deterministic selectors break. The AI agent reads the page and
+adapts. A pure-Playwright fallback remains for when AI is unavailable.
 
 Entry point:
     scrape_fire_incidents(county_id, date_range)
 """
 
 import logging
+import shutil
+import time
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict
 
-from config.constants import RAW_FIRE_DIR
+from browser_use import Agent, Browser, ChatAnthropic
+
+from config.constants import RAW_FIRE_DIR, TEMP_DOWNLOADS_DIR, BROWSER_DOWNLOAD_TEMP_PATTERN
+from config.settings import settings
 from src.core.database import get_db_context
 from src.core.models import Property, Incident
 from src.utils.county_config import get_county
 from src.utils.csv_deduplicator import deduplicate_csv, rotate_csv_archives
+from src.utils.prompt_loader import get_prompt
 from sqlalchemy import select, and_
 
 logger = logging.getLogger(__name__)
+
+# Shared LLM client for the AI download agent
+_llm = ChatAnthropic(
+    model="claude-sonnet-4-5-20250929",
+    timeout=150,
+    api_key=settings.anthropic_api_key.get_secret_value(),
+    temperature=0,
+)
 
 # HCSO Calls-for-Service public GIS portal
 _FIRE_PORTAL_URL = "https://gis.hcso.tampa.fl.us/publicgis/callsforservice/"
@@ -42,6 +61,106 @@ FIRE_INCIDENT_TYPES = [
     "wildland fire",
     "vehicle fire",
 ]
+
+
+def _locate_recent_download(start_time: float) -> Optional[Path]:
+    """
+    Search both the project temp dir and the browser-use download dir for a
+    .csv that appeared after start_time. Returns the most recently modified one.
+    """
+    candidates: list[Path] = []
+    search_dirs = [RAW_FIRE_DIR / "temp"]
+    if TEMP_DOWNLOADS_DIR.exists():
+        search_dirs.extend(TEMP_DOWNLOADS_DIR.glob(BROWSER_DOWNLOAD_TEMP_PATTERN))
+
+    for folder in search_dirs:
+        if not folder.exists():
+            continue
+        for path in folder.glob("*.csv"):
+            try:
+                if path.stat().st_mtime >= start_time:
+                    candidates.append(path)
+            except FileNotFoundError:
+                continue
+
+    if not candidates:
+        logger.warning("[fire] No CSV found post-download. Searched: %s", [str(d) for d in search_dirs])
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+async def _download_calls_csv_ai(portal_url: str = _FIRE_PORTAL_URL) -> Optional[Path]:
+    """
+    Browser-use AI agent that navigates the HCSO portal, picks CSV from the
+    export dropdown, clicks the export button, and waits for the download.
+
+    Resilient to Dojo widget ID changes — the LLM reads the page and adapts.
+    """
+    temp_dir = RAW_FIRE_DIR / "temp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    start_time = time.time()
+
+    try:
+        task = get_prompt(
+            "fire_prompts.yaml",
+            "fire_calls_download.task_template",
+            portal_url=portal_url,
+        )
+    except Exception as e:
+        logger.error("[fire][AI] Failed to load YAML prompt: %s", e)
+        return None
+
+    from src.utils.http_helpers import get_browser_use_proxy
+    proxy = get_browser_use_proxy()
+    logger.warning("[fire][AI] Launching browser-use agent — proxy: %s",
+                   "Oxylabs enabled" if proxy else "NO PROXY — direct")
+
+    browser = Browser(
+        headless=True,
+        disable_security=True,
+        proxy=proxy,
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        ),
+        args=[
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--no-first-run",
+            "--disable-blink-features=AutomationControlled",
+            "--window-size=1920,1080",
+        ],
+    )
+
+    agent = Agent(task=task, llm=_llm, browser=browser)
+    try:
+        history = await agent.run()
+        if not history.is_done():
+            logger.warning("[fire][AI] Agent could not finish within step limit")
+            return None
+        logger.warning("[fire][AI] Agent completed, waiting 15s for download to finalize")
+        import asyncio
+        await asyncio.sleep(15)
+    except Exception as e:
+        logger.error("[fire][AI] Agent execution failed: %s", e, exc_info=True)
+        return None
+
+    downloaded = _locate_recent_download(start_time)
+    if not downloaded:
+        return None
+
+    # Move to our temp dir so the rest of the pipeline finds it predictably
+    final_path = temp_dir / (downloaded.name if downloaded.parent != temp_dir else downloaded.name)
+    if downloaded.parent != temp_dir:
+        try:
+            shutil.move(str(downloaded), str(final_path))
+        except Exception as e:
+            logger.warning("[fire][AI] Could not move downloaded file: %s", e)
+            final_path = downloaded
+    logger.warning("[fire][AI] Download captured: %s (%d bytes)", final_path, final_path.stat().st_size)
+    return final_path
 
 
 async def _download_calls_csv(portal_url: str = _FIRE_PORTAL_URL) -> Optional[Path]:
@@ -153,7 +272,11 @@ async def _scrape_fire_portal_playwright(
     config = get_county(county_id)
     portal_url = config.get("portals", {}).get("fire_incidents_url", _FIRE_PORTAL_URL)
 
-    raw_csv = await _download_calls_csv(portal_url)
+    # Primary: browser-use AI agent (adapts to Dojo widget ID changes)
+    raw_csv = await _download_calls_csv_ai(portal_url)
+    if not raw_csv:
+        logger.warning("[fire] AI download failed — falling back to Playwright")
+        raw_csv = await _download_calls_csv(portal_url)
     if not raw_csv:
         return None
 

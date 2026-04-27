@@ -57,10 +57,11 @@ REQUIRED_DAILY_SCRAPERS: list = [
     'lien_hoa',
     'lien_ml',
 ]
-# source_types required only on specific weekday (0=Monday … 6=Sunday)
-REQUIRED_WEEKLY_SCRAPERS: dict = {
-    0: ['tax_delinquencies'],  # Monday only
-}
+# source_types required only on specific weekday (0=Monday … 6=Sunday).
+# tax_delinquencies removed — county portal is blocked, data is loaded via the
+# admin upload layer instead. Freshness is monitored via daily_report's
+# max(TaxDelinquency.date_added) check, not via scraper_run_stats.
+REQUIRED_WEEKLY_SCRAPERS: dict = {}
 
 
 def _was_recently_alerted(source_type: str, county_id: str, alert_type: str) -> bool:
