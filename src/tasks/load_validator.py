@@ -43,6 +43,25 @@ _MIN_BASELINE_AVG = 3
 
 _STATE_FILE = Path(__file__).parent.parent.parent / "data" / "load_validator_state.json"
 
+# Scrapers that MUST produce a stats row on weekdays. Alert immediately if absent.
+# These are keyed to scraper_run_stats.source_type values.
+REQUIRED_DAILY_SCRAPERS: list = [
+    'violations',
+    'bankruptcy',
+    'evictions',
+    'probate',
+    'foreclosures',
+    'permits',
+    'lien_tcl',
+    'lien_ccl',
+    'lien_hoa',
+    'lien_ml',
+]
+# source_types required only on specific weekday (0=Monday … 6=Sunday)
+REQUIRED_WEEKLY_SCRAPERS: dict = {
+    0: ['tax_delinquencies'],  # Monday only
+}
+
 
 def _was_recently_alerted(source_type: str, county_id: str, alert_type: str) -> bool:
     """Return True if an alert of this type was already sent within ALERT_COOLDOWN_HOURS."""
@@ -145,6 +164,33 @@ def _get_failed_runs(session, county_id: str, run_date: date) -> list:
     ]
 
 
+def _get_missing_scrapers(session, county_id: str, today: date) -> list:
+    """
+    Return source_types from REQUIRED_DAILY_SCRAPERS (and today's REQUIRED_WEEKLY_SCRAPERS)
+    that have no stats row for today. Skips entirely on weekends for daily scrapers.
+    """
+    weekday = today.weekday()  # 0=Mon … 6=Sun
+    is_weekend = weekday >= 5
+
+    required = set()
+    if not is_weekend:
+        required.update(REQUIRED_DAILY_SCRAPERS)
+    weekly = REQUIRED_WEEKLY_SCRAPERS.get(weekday, [])
+    required.update(weekly)
+
+    if not required:
+        return []
+
+    ran_today = {
+        row[0]
+        for row in session.query(ScraperRunStats.source_type).filter(
+            ScraperRunStats.run_date == today,
+            ScraperRunStats.county_id == county_id,
+        ).all()
+    }
+    return sorted(required - ran_today)
+
+
 def run_load_validator(county_id: str = "hillsborough") -> dict:
     """
     Validate today's scraper loads against 7-day rolling baseline.
@@ -153,7 +199,7 @@ def run_load_validator(county_id: str = "hillsborough") -> dict:
         dict with keys: anomalies (list), failed_runs (list), alerts_sent (int)
     """
     today = date.today()
-    results = {"anomalies": [], "zero_record_scrapers": [], "failed_runs": [], "alerts_sent": 0, "checked_date": str(today)}
+    results = {"anomalies": [], "zero_record_scrapers": [], "failed_runs": [], "missing_scrapers": [], "alerts_sent": 0, "checked_date": str(today)}
 
     state = _load_state()
 
@@ -165,6 +211,34 @@ def run_load_validator(county_id: str = "hillsborough") -> dict:
         if failed:
             logger.warning("[LoadValidator] %d scrapers reported failure today: %s",
                            len(failed), [f[0] for f in failed])
+
+        # ── Check for missing required scrapers ────────────────────────────
+        # Alert if a required scraper produced no stats row at all today
+        # (distinct from zero-record or failure — it simply never ran).
+        missing = _get_missing_scrapers(session, county_id, today)
+        results["missing_scrapers"] = missing
+
+        if missing:
+            logger.warning("[LoadValidator] Required scrapers did not run today: %s", missing)
+            if not _was_recently_alerted('_batch', county_id, 'missing_scraper'):
+                sent = send_alert(
+                    subject=f"[Forced Action] ALERT: {len(missing)} required scraper(s) did not run ({today})",
+                    body=(
+                        f"The following scrapers are required to run today but produced no stats row "
+                        f"in scraper_run_stats ({today}):\n\n"
+                        + "\n".join(f"  - {s}" for s in missing)
+                        + "\n\nPossible causes:\n"
+                        "  - Cron job did not fire (check crontab and cron logs)\n"
+                        "  - Scraper exited before recording stats (check scraper logs)\n"
+                        "  - Server was down or out of memory during the scheduled window\n"
+                        f"\nForced Action Ops Alert — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+                    ),
+                )
+                if sent:
+                    results["alerts_sent"] = results.get("alerts_sent", 0) + 1
+                    _record_alert_sent('_batch', county_id, 'missing_scraper')
+            else:
+                logger.info("[LoadValidator] Missing-scraper alert suppressed — already sent within cooldown")
 
         # ── Check for count anomalies ──────────────────────────────────────
         # Get baseline: stats from last 7 days (excludes today)
@@ -325,8 +399,8 @@ def run_load_validator(county_id: str = "hillsborough") -> dict:
     _save_state(state)
 
     logger.info(
-        "[LoadValidator] Done. anomalies=%d failed_runs=%d alerts_sent=%d",
-        len(anomalies), len(failed), results["alerts_sent"],
+        "[LoadValidator] Done. anomalies=%d failed_runs=%d missing=%d alerts_sent=%d",
+        len(anomalies), len(failed), len(results["missing_scrapers"]), results["alerts_sent"],
     )
     return results
 

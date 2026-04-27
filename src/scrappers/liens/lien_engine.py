@@ -915,7 +915,7 @@ async def run_lien_pipeline(start_date: str = None, end_date: str = None, run_al
 if __name__ == "__main__":
     import sys
     import argparse
-    from src.utils.scraper_db_helper import load_scraped_data_to_db, add_load_to_db_arg
+    from src.utils.scraper_db_helper import load_scraped_data_to_db, add_load_to_db_arg, record_scraper_stats
     
     parser = argparse.ArgumentParser(description="Scrape Hillsborough County liens, deeds, and judgments")
     parser.add_argument(
@@ -960,6 +960,7 @@ if __name__ == "__main__":
     # Modes that populate all three output directories
     MULTI_OUTPUT_MODES = {'all', 'combined'}
 
+    _t0 = time.monotonic()
     try:
         asyncio.run(run_lien_pipeline(start_date=args.start_date, end_date=args.end_date, run_all=args.all, mode=args.mode, county_id=args.county_id))
 
@@ -979,10 +980,26 @@ if __name__ == "__main__":
                     logger.warning(f"No {load_mode} CSV found in {new_dir}, skipping")
             if not any_loaded:
                 logger.warning("No new records to load for any requested type - nothing new today")
+                # Record no-data stat so load_validator sees the run
+                try:
+                    record_scraper_stats(source_type='lien_ml', total_scraped=0, matched=0, unmatched=0, skipped=0, run_success=True, error_type='no_data', duration_seconds=round(time.monotonic() - _t0, 2), county_id=args.county_id)
+                except Exception as _se:
+                    logger.warning("Could not record scraper stats: %s", _se)
                 sys.exit(0)
+        else:
+            # Dry run — pipeline ran but no DB load; record a basic success stat.
+            # load_scraped_data_to_db will upsert with full counts when next --load-to-db runs.
+            try:
+                record_scraper_stats(source_type='lien_ml', total_scraped=0, matched=0, unmatched=0, skipped=0, run_success=True, duration_seconds=round(time.monotonic() - _t0, 2), county_id=args.county_id)
+            except Exception as _se:
+                logger.warning("Could not record scraper stats: %s", _se)
 
         sys.exit(0)
 
     except Exception as e:
         logger.error(f"Pipeline failed: {e}")
+        try:
+            record_scraper_stats(source_type='lien_ml', total_scraped=0, matched=0, unmatched=0, skipped=0, run_success=False, error_message=str(e)[:500], duration_seconds=round(time.monotonic() - _t0, 2), county_id=args.county_id)
+        except Exception as _se:
+            logger.warning("Could not record scraper stats: %s", _se)
         sys.exit(1)

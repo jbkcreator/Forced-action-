@@ -542,7 +542,7 @@ _HEALTH_CHECK_SOURCES = frozenset({
 })
 
 
-def _check_scraper_health(db: Session) -> bool:
+def _check_scraper_health(db: Session, county_id: str = "hillsborough") -> bool:
     """
     Check whether yesterday's scraper runs completed successfully.
     Sends an ops alert if any runs failed or are missing.
@@ -590,7 +590,7 @@ def _check_scraper_health(db: Session) -> bool:
             recent_alert = db.execute(
                 select(ScraperAlertLog).where(
                     ScraperAlertLog.source_type == '_batch',
-                    ScraperAlertLog.county_id == 'hillsborough',
+                    ScraperAlertLog.county_id == county_id,
                     ScraperAlertLog.alert_type == 'scraper_error',
                     ScraperAlertLog.alerted_at >= cutoff,
                 )
@@ -621,7 +621,7 @@ def _check_scraper_health(db: Session) -> bool:
         try:
             db.add(ScraperAlertLog(
                 source_type='_batch',
-                county_id='hillsborough',
+                county_id=county_id,
                 alert_type='health_check',
                 alerted_at=datetime.now(timezone.utc),
             ))

@@ -16,6 +16,7 @@ Author: Distressed Property Intelligence Platform
 """
 
 import asyncio
+import time
 import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -701,7 +702,7 @@ async def run_permit_pipeline(
 if __name__ == "__main__":
 	import sys
 	import argparse
-	from src.utils.scraper_db_helper import load_scraped_data_to_db, add_load_to_db_arg
+	from src.utils.scraper_db_helper import load_scraped_data_to_db, add_load_to_db_arg, record_scraper_stats
 	
 	parser = argparse.ArgumentParser(description="Scrape Hillsborough County building permits")
 	parser.add_argument(
@@ -744,6 +745,7 @@ if __name__ == "__main__":
 	if args.debug:
 		logger.info("[DEBUG] Screenshot/HTML dumps enabled → data/debug/playwright/permits/")
 
+	_t0 = time.monotonic()
 	try:
 		asyncio.run(run_permit_pipeline(
 			start_date=args.start_date,
@@ -753,24 +755,33 @@ if __name__ == "__main__":
 			debug=args.debug,
 			county_id=args.county_id,
 		))
-		
-		# Load to database if requested
+
 		if args.load_to_db:
-			# Find the most recent permit CSV in new/ subdirectory
 			new_dir = RAW_PERMIT_DIR / "new"
 			csv_files = sorted(new_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
 			if csv_files:
 				csv_to_load = csv_files[0]
 				logger.info(f"Loading to database: {csv_to_load}")
-				
-				# Load to DB
 				load_scraped_data_to_db('permits', csv_to_load, destination_dir=RAW_PERMIT_DIR)
 			else:
 				logger.warning("No new permit records to load — nothing new today")
+				try:
+					record_scraper_stats(source_type='permits', total_scraped=0, matched=0, unmatched=0, skipped=0, run_success=True, error_type='no_data', duration_seconds=round(time.monotonic() - _t0, 2), county_id=args.county_id)
+				except Exception as _se:
+					logger.warning("Could not record scraper stats: %s", _se)
 				sys.exit(0)
-		
+		else:
+			try:
+				record_scraper_stats(source_type='permits', total_scraped=0, matched=0, unmatched=0, skipped=0, run_success=True, duration_seconds=round(time.monotonic() - _t0, 2), county_id=args.county_id)
+			except Exception as _se:
+				logger.warning("Could not record scraper stats: %s", _se)
+
 		sys.exit(0)
-		
+
 	except Exception as e:
 		logger.error(f"Pipeline failed: {e}")
+		try:
+			record_scraper_stats(source_type='permits', total_scraped=0, matched=0, unmatched=0, skipped=0, run_success=False, error_message=str(e)[:500], duration_seconds=round(time.monotonic() - _t0, 2), county_id=args.county_id)
+		except Exception as _se:
+			logger.warning("Could not record scraper stats: %s", _se)
 		sys.exit(1)

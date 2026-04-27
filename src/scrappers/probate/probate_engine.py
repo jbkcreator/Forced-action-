@@ -15,6 +15,7 @@ Author: Distressed Property Intelligence Platform
 """
 
 import re
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -300,25 +301,19 @@ def save_processed_probate(df: pd.DataFrame, output_filename: str = "probate_lea
 		raise
 
 
-def run_probate_pipeline(target_date: str = None, county_id: str = "hillsborough"):
+def run_probate_pipeline(target_date: str = None, county_id: str = "hillsborough") -> bool:
 	"""
 	Execute the complete probate data collection pipeline.
-	
+
 	This function orchestrates the entire workflow:
 		1. Downloads the latest probate filing CSV
 		2. Processes and loads the data
 		3. Saves the processed data to the output directory
-	
-	The function includes comprehensive error handling and logging at each step.
-	
-	Raises:
-		Exception: Re-raises any exceptions that occur during pipeline execution
-		           after logging the error details
-		
-	Example:
-		>>> run_probate_pipeline()
-		# Logs progress and saves processed probate leads to data/processed/
+
+	Returns:
+		bool: True if the pipeline executed successfully, False otherwise.
 	"""
+	t0 = time.monotonic()
 	county_cfg = get_county_config(county_id)
 	logger.info("=" * 60)
 	logger.info(f"{county_cfg['display_name'].upper()} PROBATE FILINGS - DATA COLLECTION")
@@ -328,25 +323,38 @@ def run_probate_pipeline(target_date: str = None, county_id: str = "hillsborough
 		# Step 1: Download latest probate filing
 		logger.info("Step 1: Downloading latest probate filing")
 		csv_path = download_latest_probate_filing(target_date=target_date, county_id=county_id)
-		
+
 		# Step 2: Process the data
 		logger.info("Step 2: Processing probate data")
 		df = process_probate_data(csv_path)
-		
+
 		# Step 3: Save processed data
 		logger.info("Step 3: Saving processed data")
 		output_path = save_processed_probate(df)
-		
+
 		logger.info("=" * 60)
 		logger.info("PROBATE PIPELINE COMPLETE")
 		logger.info("=" * 60)
 		logger.info(f"Total records processed: {len(df)}")
 		logger.info(f"Output file location: {output_path}")
-		
+
+		try:
+			from src.utils.scraper_db_helper import record_scraper_stats
+			record_scraper_stats(source_type='probate', total_scraped=len(df), matched=0, unmatched=0, skipped=0, run_success=True, duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id)
+		except Exception as _se:
+			logger.warning("Could not record scraper stats: %s", _se)
+
+		return True
+
 	except Exception as e:
 		logger.error(f"Probate pipeline failed with error: {e}")
 		logger.debug(traceback.format_exc())
-		raise
+		try:
+			from src.utils.scraper_db_helper import record_scraper_stats
+			record_scraper_stats(source_type='probate', total_scraped=0, matched=0, unmatched=0, skipped=0, run_success=False, error_message=str(e)[:500], duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id)
+		except Exception as _se:
+			logger.warning("Could not record scraper stats: %s", _se)
+		return False
 
 
 if __name__ == "__main__":
@@ -360,25 +368,22 @@ if __name__ == "__main__":
 	add_load_to_db_arg(parser)
 	args = parser.parse_args()
 
-	try:
-		run_probate_pipeline(target_date=args.date, county_id=args.county_id)
-		
-		# Load to database if requested
-		if args.load_to_db:
-			# Find the most recent probate CSV in new/ subdirectory
+	success = run_probate_pipeline(target_date=args.date, county_id=args.county_id)
+
+	if success and args.load_to_db:
+		try:
 			new_dir = RAW_PROBATE_DIR / "new"
 			csv_files = sorted(new_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
 			if csv_files:
 				csv_to_load = csv_files[0]
 				logger.info(f"Loading to database: {csv_to_load}")
 				load_scraped_data_to_db('probate', csv_to_load, destination_dir=RAW_PROBATE_DIR)
-				
 			else:
 				logger.warning("No new probate records to load - nothing new today")
-				sys.exit(0)
-		
-		sys.exit(0)
-		
-	except Exception as e:
-		logger.error(f"Pipeline failed: {e}")
-		sys.exit(1)
+		except Exception as e:
+			logger.error(f"Failed to load data to database: {e}")
+			sys.exit(1)
+	elif args.load_to_db:
+		logger.warning("Skipping database load due to scraping failure")
+
+	sys.exit(0 if success else 1)

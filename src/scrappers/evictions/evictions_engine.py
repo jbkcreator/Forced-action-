@@ -17,6 +17,7 @@ Author: Distressed Property Intelligence Platform
 """
 
 import re
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -357,57 +358,68 @@ def save_processed_evictions(df: pd.DataFrame, output_filename: str = "eviction_
 def run_eviction_pipeline(target_date: str = None, county_id: str = "hillsborough") -> bool:
 	"""
 	Execute the complete eviction data collection pipeline.
-	
+
 	This function orchestrates the entire workflow:
 	    1. Downloads the latest civil filing CSV
 	    2. Loads and processes the data
 	    3. Filters for eviction cases only
 	    4. Saves the filtered results
-	
+
 	Returns:
 		bool: True if the pipeline executed successfully, False otherwise
-		
+
 	Example:
 		>>> success = run_eviction_pipeline()
 		>>> if success:
 		>>>     print("Eviction pipeline completed successfully")
 	"""
+	t0 = time.monotonic()
 	try:
 		logger.info(OUTPUT_SEPARATOR)
 		logger.info("STARTING EVICTION DATA COLLECTION PIPELINE")
 		logger.info(OUTPUT_SEPARATOR)
-		
+
 		# Step 1: Download latest civil filing
 		logger.info("\n[STEP 1/4] Downloading latest civil filing...")
 		csv_path = download_latest_civil_filing(target_date=target_date, county_id=county_id)
-		
+
 		# Step 2: Load and process the data
 		logger.info("\n[STEP 2/4] Loading and processing civil filing data...")
 		civil_df = process_civil_data(csv_path)
-		
+
 		# Step 3: Filter for evictions
 		logger.info("\n[STEP 3/4] Filtering for eviction cases...")
 		evictions_df = filter_evictions(civil_df)
-		
+
 		if len(evictions_df) == 0:
 			logger.warning("No eviction cases found - pipeline completed but no data to save")
+			try:
+				from src.utils.scraper_db_helper import record_scraper_stats
+				record_scraper_stats(source_type='evictions', total_scraped=0, matched=0, unmatched=0, skipped=0, run_success=True, error_type='no_data', duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id)
+			except Exception as _se:
+				logger.warning("Could not record scraper stats: %s", _se)
 			return False
-		
+
 		# Step 4: Save processed evictions
 		logger.info("\n[STEP 4/4] Saving processed eviction data...")
-		# Generate filename with today's date
 		today = datetime.now().strftime(OUTPUT_DATE_FORMAT)
 		output_filename = f"eviction_leads_{today}.csv"
 		output_path = save_processed_evictions(evictions_df, output_filename)
-		
+
 		logger.info(OUTPUT_SEPARATOR)
 		logger.info("EVICTION PIPELINE COMPLETED SUCCESSFULLY")
 		logger.info(f"Output file: {output_path}")
 		logger.info(f"Total eviction records: {len(evictions_df)}")
 		logger.info(OUTPUT_SEPARATOR)
-		
+
+		try:
+			from src.utils.scraper_db_helper import record_scraper_stats
+			record_scraper_stats(source_type='evictions', total_scraped=len(evictions_df), matched=0, unmatched=0, skipped=0, run_success=True, duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id)
+		except Exception as _se:
+			logger.warning("Could not record scraper stats: %s", _se)
+
 		return True
-		
+
 	except Exception as e:
 		logger.error(OUTPUT_SEPARATOR)
 		logger.error("EVICTION PIPELINE FAILED")
@@ -415,6 +427,11 @@ def run_eviction_pipeline(target_date: str = None, county_id: str = "hillsboroug
 		logger.error("Traceback:")
 		logger.error(traceback.format_exc())
 		logger.error(OUTPUT_SEPARATOR)
+		try:
+			from src.utils.scraper_db_helper import record_scraper_stats
+			record_scraper_stats(source_type='evictions', total_scraped=0, matched=0, unmatched=0, skipped=0, run_success=False, error_message=str(e)[:500], duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id)
+		except Exception as _se:
+			logger.warning("Could not record scraper stats: %s", _se)
 		return False
 
 

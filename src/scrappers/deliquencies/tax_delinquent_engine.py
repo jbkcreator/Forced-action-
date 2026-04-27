@@ -115,7 +115,15 @@ def _locate_download(start_time: float) -> Optional[Path]:
 			logger.debug(f"Found {len(temp_candidates)} candidate files in {download_dir}")
 	
 	if not candidates:
-		logger.warning("No recent download files found")
+		searched = [str(REFERENCE_DATA_DIR)]
+		if TEMP_DOWNLOADS_DIR.exists():
+			searched += [str(d) for d in TEMP_DOWNLOADS_DIR.glob(BROWSER_DOWNLOAD_TEMP_PATTERN)]
+		logger.warning(
+			"[RADAR] Download not found. start_time=%.1fs ago. Searched %d location(s): %s",
+			time.time() - start_time,
+			len(searched),
+			searched,
+		)
 		return None
 	
 	# Return the most recently modified file
@@ -934,10 +942,12 @@ if __name__ == "__main__":
 		help="County identifier (default: hillsborough)",
 	)
 
-	from src.utils.scraper_db_helper import add_load_to_db_arg, load_scraped_data_to_db
+	from src.utils.scraper_db_helper import add_load_to_db_arg, load_scraped_data_to_db, record_scraper_stats
 	add_load_to_db_arg(parser)
 	args = parser.parse_args()
 
+	import sys
+	_t0 = time.monotonic()
 	try:
 		logger.info(f"Starting Tax Delinquent Engine in {args.mode} mode")
 
@@ -965,7 +975,6 @@ if __name__ == "__main__":
 		# Load to database if requested
 		if args.load_to_db:
 			_file_prefix = _get_county(args.county_id)["file_prefix"]
-			# Find most recent CSV — check new/ subdir, then raw dir, then reference dir
 			new_dir = RAW_TAX_DELINQUENCIES_DIR / "new"
 			csv_files = sorted(new_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True) if new_dir.exists() else []
 			if not csv_files:
@@ -978,12 +987,27 @@ if __name__ == "__main__":
 				load_scraped_data_to_db('tax', csv_to_load, destination_dir=RAW_TAX_DELINQUENCIES_DIR)
 			else:
 				logger.error("No tax delinquency CSV file found to load")
-				import sys
+				try:
+					record_scraper_stats(source_type='tax_delinquencies', total_scraped=0, matched=0, unmatched=0, skipped=0, run_success=False, error_message='No CSV found after pipeline success', duration_seconds=round(time.monotonic() - _t0, 2), county_id=args.county_id)
+				except Exception as _se:
+					logger.warning("Could not record scraper stats: %s", _se)
 				sys.exit(1)
-		
+		else:
+			# Dry-run: pipeline completed, record basic success so load_validator sees the run.
+			try:
+				record_scraper_stats(source_type='tax_delinquencies', total_scraped=0, matched=0, unmatched=0, skipped=0, run_success=True, duration_seconds=round(time.monotonic() - _t0, 2), county_id=args.county_id)
+			except Exception as _se:
+				logger.warning("Could not record scraper stats: %s", _se)
+
 	except KeyboardInterrupt:
 		logger.warning("Pipeline interrupted by user")
+		sys.exit(0)
 	except Exception as e:
 		logger.error(f"Pipeline failed: {e}")
 		logger.debug(traceback.format_exc())
+		try:
+			record_scraper_stats(source_type='tax_delinquencies', total_scraped=0, matched=0, unmatched=0, skipped=0, run_success=False, error_message=str(e)[:500], duration_seconds=round(time.monotonic() - _t0, 2), county_id=args.county_id)
+		except Exception as _se:
+			logger.warning("Could not record scraper stats: %s", _se)
+		sys.exit(1)
 

@@ -15,6 +15,7 @@ The pipeline performs the following steps:
 Author: Distressed Property Intelligence Platform
 """
 
+import time
 import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -247,23 +248,24 @@ def save_bankruptcy_leads(
 def run_bankruptcy_pipeline(lookback_days: int = 1, county_id: str = "hillsborough") -> bool:
 	"""
 	Execute the complete bankruptcy data collection pipeline.
-	
+
 	This function orchestrates the entire workflow:
 	    1. Fetches bankruptcy filings from CourtListener API
 	    2. Filters for Tampa Division cases only
 	    3. Saves the filtered results to CSV
-	
+
 	Args:
 		lookback_days: Number of days to look back for filings (default: 1)
-	
+
 	Returns:
 		bool: True if the pipeline executed successfully, False otherwise
-		
+
 	Example:
 		>>> success = run_bankruptcy_pipeline(lookback_days=7)
 		>>> if success:
 		>>>     print("Bankruptcy pipeline completed successfully")
 	"""
+	t0 = time.monotonic()
 	try:
 		county_cfg = get_county_config(county_id)
 		court_cfg = county_cfg.get("court", {})
@@ -280,34 +282,57 @@ def run_bankruptcy_pipeline(lookback_days: int = 1, county_id: str = "hillsborou
 
 		if not dockets:
 			logger.warning("No bankruptcy filings found in the specified date range")
+			try:
+				from src.utils.scraper_db_helper import record_scraper_stats
+				record_scraper_stats(source_type='bankruptcy', total_scraped=0, matched=0, unmatched=0, skipped=0, run_success=True, error_type='no_data', duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id)
+			except Exception as _se:
+				logger.warning("Could not record scraper stats: %s", _se)
 			return False
 
 		# Step 2: Filter for division cases
 		logger.info(f"\n[STEP 2/3] Filtering for division '{division_prefix}' bankruptcy cases...")
 		tampa_leads = filter_tampa_bankruptcies(dockets, division_prefix=division_prefix)
-		
+
 		if not tampa_leads:
 			logger.warning("No Tampa bankruptcy cases found - pipeline completed but no data to save")
+			try:
+				from src.utils.scraper_db_helper import record_scraper_stats
+				record_scraper_stats(source_type='bankruptcy', total_scraped=0, matched=0, unmatched=0, skipped=0, run_success=True, error_type='no_data', duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id)
+			except Exception as _se:
+				logger.warning("Could not record scraper stats: %s", _se)
 			return False
-		
+
 		# Step 3: Save processed leads
 		logger.info("\n[STEP 3/3] Saving processed bankruptcy leads...")
 		today = datetime.now().strftime("%Y%m%d")
 		output_filename = f"tampa_bankruptcy_leads_{today}.csv"
 		output_path = save_bankruptcy_leads(tampa_leads, output_filename)
-		
+
 		if not output_path:
 			logger.error("Failed to save bankruptcy leads")
+			try:
+				from src.utils.scraper_db_helper import record_scraper_stats
+				record_scraper_stats(source_type='bankruptcy', total_scraped=len(tampa_leads), matched=0, unmatched=0, skipped=0, run_success=False, error_message='Failed to save bankruptcy leads CSV', duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id)
+			except Exception as _se:
+				logger.warning("Could not record scraper stats: %s", _se)
 			return False
-		
+
 		logger.info("=" * 80)
 		logger.info("BANKRUPTCY PIPELINE COMPLETED SUCCESSFULLY")
 		logger.info(f"Output file: {output_path}")
 		logger.info(f"Total Tampa bankruptcy leads: {len(tampa_leads)}")
 		logger.info("=" * 80)
-		
+
+		# Record scraper stats (load_scraped_data_to_db will upsert with matched/unmatched
+		# when --load-to-db is used; this covers the dry-run path).
+		try:
+			from src.utils.scraper_db_helper import record_scraper_stats
+			record_scraper_stats(source_type='bankruptcy', total_scraped=len(tampa_leads), matched=0, unmatched=0, skipped=0, run_success=True, duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id)
+		except Exception as _se:
+			logger.warning("Could not record scraper stats: %s", _se)
+
 		return True
-		
+
 	except Exception as e:
 		logger.error("=" * 80)
 		logger.error("BANKRUPTCY PIPELINE FAILED")
@@ -315,6 +340,11 @@ def run_bankruptcy_pipeline(lookback_days: int = 1, county_id: str = "hillsborou
 		logger.error("Traceback:")
 		logger.error(traceback.format_exc())
 		logger.error("=" * 80)
+		try:
+			from src.utils.scraper_db_helper import record_scraper_stats
+			record_scraper_stats(source_type='bankruptcy', total_scraped=0, matched=0, unmatched=0, skipped=0, run_success=False, error_message=str(e)[:500], duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id)
+		except Exception as _se:
+			logger.warning("Could not record scraper stats: %s", _se)
 		return False
 
 
