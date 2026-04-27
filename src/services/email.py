@@ -11,10 +11,14 @@ Configure via environment variables (loaded into AppSettings):
 """
 
 import logging
+import mimetypes
 import smtplib
+from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Optional
+from email import encoders
+from pathlib import Path
+from typing import List, Optional, Union
 
 from config.settings import get_settings
 
@@ -26,15 +30,19 @@ def send_email(
     subject: str,
     body_text: str,
     body_html: Optional[str] = None,
+    attachments: Optional[List[Union[str, Path]]] = None,
 ) -> bool:
     """
     Send a transactional email via SMTP.
 
     Args:
-        to:        Recipient address.
-        subject:   Email subject line.
-        body_text: Plain-text body (always sent).
-        body_html: Optional HTML alternative body.
+        to:          Recipient address.
+        subject:     Email subject line.
+        body_text:   Plain-text body (always sent).
+        body_html:   Optional HTML alternative body.
+        attachments: Optional list of file paths to attach. Missing files are
+                     skipped with a warning so a single bad path doesn't block
+                     the whole send.
 
     Returns:
         True  — email accepted by SMTP server.
@@ -50,7 +58,36 @@ def send_email(
     password = settings.smtp_pass.get_secret_value()
 
     try:
-        if body_html:
+        # Use mixed multipart whenever attachments are present; alternative
+        # body lives nested inside.
+        if attachments:
+            msg = MIMEMultipart("mixed")
+            if body_html:
+                alt = MIMEMultipart("alternative")
+                alt.attach(MIMEText(body_text, "plain"))
+                alt.attach(MIMEText(body_html, "html"))
+                msg.attach(alt)
+            else:
+                msg.attach(MIMEText(body_text, "plain"))
+
+            for att in attachments:
+                path = Path(att)
+                if not path.exists() or not path.is_file():
+                    logger.warning("Skipping missing attachment: %s", path)
+                    continue
+                ctype, encoding = mimetypes.guess_type(str(path))
+                if ctype is None or encoding is not None:
+                    ctype = "application/octet-stream"
+                maintype, subtype = ctype.split("/", 1)
+                part = MIMEBase(maintype, subtype)
+                part.set_payload(path.read_bytes())
+                encoders.encode_base64(part)
+                part.add_header(
+                    "Content-Disposition",
+                    f'attachment; filename="{path.name}"',
+                )
+                msg.attach(part)
+        elif body_html:
             msg = MIMEMultipart("alternative")
             msg.attach(MIMEText(body_text, "plain"))
             msg.attach(MIMEText(body_html, "html"))
@@ -99,13 +136,15 @@ def send_alert(
     body: str,
     html_body: Optional[str] = None,
     to: Optional[str] = None,
+    attachments: Optional[List[Union[str, Path]]] = None,
 ) -> bool:
     """
     Send an ops alert email. By default targets ALERT_EMAIL; pass `to` to
     override (used by reports that go to a different recipient list).
 
     Also sends an SMS via email-to-SMS gateway if ALERT_SMS_NUMBER +
-    ALERT_SMS_CARRIER are both configured (SMS path always uses plain text).
+    ALERT_SMS_CARRIER are both configured (SMS path always uses plain text;
+    attachments are intentionally not forwarded to the SMS path).
 
     Returns True if at least one channel succeeded.
     """
@@ -120,6 +159,7 @@ def send_alert(
             subject=subject,
             body_text=body,
             body_html=html_body,
+            attachments=attachments,
         ) or sent
 
     # SMS via email-to-SMS gateway (no Twilio needed)

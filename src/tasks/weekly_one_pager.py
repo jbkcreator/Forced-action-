@@ -426,7 +426,8 @@ def _render_html(weeks: Dict[str, dict], freshness: dict, coverage: dict,
             f"<div style='margin:16px 0; padding:12px 14px; background:#fef2f2; "
             f"border-left:4px solid #b91c1c; color:#7f1d1d;'>"
             f"<b>{len(trends)} metric(s) trending down 2 weeks.</b> "
-            f"Remediation actions in <code>{remediation_path}</code>.</div>"
+            f"Remediation actions for each metric are in the attached "
+            f"<code>{today.isoformat()}.md</code>.</div>"
         )
     else:
         parts.append(
@@ -581,8 +582,8 @@ def _render_text(weeks: Dict[str, dict], today: date, county_id: str,
         "",
     ])
     if trends:
-        lines.append(f"!! {len(trends)} metric(s) trending down 2 weeks — see "
-                     f"reports/remediation/{today.isoformat()}.md")
+        lines.append(f"!! {len(trends)} metric(s) trending down 2 weeks — "
+                     f"see attached {today.isoformat()}.md")
     else:
         lines.append("All KPIs stable.")
     return "\n".join(lines)
@@ -638,10 +639,30 @@ def run_weekly_one_pager(county_id: str = "hillsborough", dry_run: bool = False)
     else:
         # Single recipient or comma-separated list — send to each
         recipients = [r.strip() for r in recipient.split(",") if r.strip()]
+        attachments = [remediation_path] if remediation_path else None
         sent = False
         for r in recipients:
-            ok = send_alert(subject=subject, body=text, html_body=html, to=r)
+            ok = send_alert(
+                subject=subject,
+                body=text,
+                html_body=html,
+                to=r,
+                attachments=attachments,
+            )
             sent = ok or sent
+
+        # Clean up the remediation file after a successful send. The action
+        # text is already attached to the email and the metric values are
+        # captured in the email body — keeping the file around just creates
+        # uncertainty about whether it's been actioned.
+        if sent and remediation_path and remediation_path.exists():
+            try:
+                remediation_path.unlink()
+                logger.warning("[OnePager] Remediation file deleted after send: %s",
+                               remediation_path)
+            except OSError as exc:
+                logger.warning("[OnePager] Could not delete remediation file %s: %s",
+                               remediation_path, exc)
 
     return {
         "date": str(today),

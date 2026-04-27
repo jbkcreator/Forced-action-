@@ -18,11 +18,17 @@ Entry point:
 """
 
 import logging
+import os
 import shutil
 import time
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict
+
+
+def _is_headless() -> bool:
+    """Headless by default in production. Set FIRE_HEADLESS=false locally to watch."""
+    return os.environ.get("FIRE_HEADLESS", "true").lower() not in ("false", "0", "no")
 
 from browser_use import Agent, Browser, ChatAnthropic
 
@@ -65,14 +71,46 @@ FIRE_INCIDENT_TYPES = [
 
 def _locate_recent_download(start_time: float) -> Optional[Path]:
     """
-    Search both the project temp dir and the browser-use download dir for a
-    .csv that appeared after start_time. Returns the most recently modified one.
-    """
-    candidates: list[Path] = []
-    search_dirs = [RAW_FIRE_DIR / "temp"]
-    if TEMP_DOWNLOADS_DIR.exists():
-        search_dirs.extend(TEMP_DOWNLOADS_DIR.glob(BROWSER_DOWNLOAD_TEMP_PATTERN))
+    Search all known browser-use download locations for a .csv that appeared
+    after start_time. Browser-use creates a per-session subdir matching
+    `browser-use-downloads-<hash>` under whichever temp root the OS exposes —
+    on Windows that can be `%LOCALAPPDATA%\\Temp` OR `C:\\tmp` depending on
+    how Python's tempfile module resolved it. We check both, plus POSIX `/tmp`
+    and the project-local fire temp dir.
 
+    Returns the newest matching CSV, or None.
+    """
+    import tempfile
+
+    parent_roots: list[Path] = [
+        Path(tempfile.gettempdir()),
+        Path(r"C:\tmp"),
+        Path("/tmp"),
+    ]
+    if TEMP_DOWNLOADS_DIR.exists():
+        parent_roots.append(TEMP_DOWNLOADS_DIR.parent)
+
+    # De-dupe (resolve() collapses Win32 short paths, env-substituted paths etc.)
+    seen: set = set()
+    unique_roots: list[Path] = []
+    for root in parent_roots:
+        try:
+            resolved = root.resolve()
+        except (OSError, RuntimeError):
+            continue
+        if resolved in seen or not resolved.exists():
+            continue
+        seen.add(resolved)
+        unique_roots.append(resolved)
+
+    search_dirs: list[Path] = [RAW_FIRE_DIR / "temp"]
+    for root in unique_roots:
+        try:
+            search_dirs.extend(root.glob(BROWSER_DOWNLOAD_TEMP_PATTERN))
+        except OSError:
+            continue
+
+    candidates: list[Path] = []
     for folder in search_dirs:
         if not folder.exists():
             continue
@@ -84,7 +122,8 @@ def _locate_recent_download(start_time: float) -> Optional[Path]:
                 continue
 
     if not candidates:
-        logger.warning("[fire] No CSV found post-download. Searched: %s", [str(d) for d in search_dirs])
+        logger.warning("[fire] No CSV found post-download. Searched: %s",
+                       [str(d) for d in search_dirs])
         return None
     return max(candidates, key=lambda p: p.stat().st_mtime)
 
@@ -116,7 +155,7 @@ async def _download_calls_csv_ai(portal_url: str = _FIRE_PORTAL_URL) -> Optional
                    "Oxylabs enabled" if proxy else "NO PROXY — direct")
 
     browser = Browser(
-        headless=True,
+        headless=_is_headless(),
         disable_security=True,
         proxy=proxy,
         user_agent=(
@@ -186,7 +225,7 @@ async def _download_calls_csv(portal_url: str = _FIRE_PORTAL_URL) -> Optional[Pa
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(
-                headless=True,
+                headless=_is_headless(),
                 proxy=get_playwright_proxy(),
             )
             context = await browser.new_context(accept_downloads=True)
