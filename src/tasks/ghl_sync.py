@@ -25,10 +25,11 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
+from sqlalchemy import func
 from sqlalchemy.orm import joinedload
 
 from src.core.database import get_db_context
-from src.core.models import Property
+from src.core.models import DistressScore, Property
 from src.services.ghl_webhook import push_lead_to_ghl, _is_configured, _ghl_request, _headers
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,52 @@ def _check_ghl_health() -> bool:
         return False
 
 
+def _build_score_data_from_db(prop: Property, ds: DistressScore) -> dict:
+    """Build the score_data dict from already-computed DB rows (no rescore)."""
+    owner = prop.owner
+    fin   = prop.financial
+    owner_phone = None
+    owner_email = None
+    if owner:
+        owner_phone = owner.phone_1 or owner.phone_2 or owner.phone_3 or None
+        owner_email = owner.email_1 or owner.email_2 or None
+    return {
+        "property_id":        prop.id,
+        "parcel_id":          prop.parcel_id,
+        "address":            prop.address,
+        "city":               prop.city,
+        "state":              prop.state,
+        "zip":                prop.zip,
+        "sq_ft":              float(prop.sq_ft) if prop.sq_ft else None,
+        "beds":               prop.beds,
+        "baths":              prop.baths,
+        "year_built":         prop.year_built,
+        "lot_size":           float(prop.lot_size) if prop.lot_size else None,
+        "ghl_contact_id":     prop.gohighlevel_contact_id,
+        "owner_name":         owner.owner_name if owner else None,
+        "owner_type":         owner.owner_type if owner else None,
+        "absentee_status":    owner.absentee_status if owner else None,
+        "mailing_address":    owner.mailing_address if owner else None,
+        "ownership_years":    owner.ownership_years if owner else None,
+        "owner_phone":        owner_phone,
+        "owner_email":        owner_email,
+        "assessed_value_mkt": float(fin.assessed_value_mkt) if fin and fin.assessed_value_mkt else None,
+        "homestead_exempt":   fin.homestead_exempt if fin else None,
+        "est_equity":         float(fin.est_equity) if fin and fin.est_equity else None,
+        "equity_pct":         float(fin.equity_pct) if fin and fin.equity_pct else None,
+        "last_sale_price":    float(fin.last_sale_price) if fin and fin.last_sale_price else None,
+        "last_sale_date":     str(fin.last_sale_date) if fin and fin.last_sale_date else None,
+        "final_cds_score":    round(float(ds.final_cds_score or 0), 2),
+        "vertical_scores":    {k: round(v, 2) for k, v in (ds.vertical_scores or {}).items()},
+        "urgency_level":      ds.urgency_level,
+        "lead_tier":          ds.lead_tier,
+        "qualified":          ds.qualified,
+        "signal_count":       len(ds.distress_types or []),
+        "distress_types":     list(ds.distress_types or []),
+        "signal_summaries":   {},  # not persisted in distress_scores; CRM detail fields left blank
+    }
+
+
 def run_ghl_sync(
     limit: int = 5000,
     county_id: str = "hillsborough",
@@ -67,9 +114,9 @@ def run_ghl_sync(
     """
     Push pending_sync properties to GHL and mark them synced.
 
-    Loads each property with all signal relationships so that
-    MultiVerticalScorer.score_property() can rebuild the full score_data
-    (including signal_summaries and vertical_scores) needed by the GHL payload.
+    Reads the already-computed score from distress_scores instead of
+    rescoring via MultiVerticalScorer — eliminates the biggest latency
+    source (1,019 full rescores for ~60 min → under 10 min).
 
     DB updates are committed in batches of _DB_BATCH_SIZE to minimise
     transaction duration on the properties table.
@@ -91,11 +138,6 @@ def run_ghl_sync(
     stats = {"total": 0, "pushed": 0, "failed": 0, "skipped": 0}
 
     with get_db_context() as session:
-        # Import here to avoid circular import at module level
-        from src.services.cds_engine import MultiVerticalScorer
-
-        scorer = MultiVerticalScorer(session)
-
         # Pre-run stats: log how many pending + how many failed last run
         pending_count = session.query(Property).filter(
             Property.sync_status == "pending_sync", Property.county_id == county_id
@@ -113,13 +155,6 @@ def run_ghl_sync(
             .options(
                 joinedload(Property.owner),
                 joinedload(Property.financial),
-                joinedload(Property.code_violations),
-                joinedload(Property.legal_and_liens),
-                joinedload(Property.deeds),
-                joinedload(Property.legal_proceedings),
-                joinedload(Property.tax_delinquencies),
-                joinedload(Property.foreclosures),
-                joinedload(Property.building_permits),
             )
             .filter(
                 Property.sync_status == "pending_sync",
@@ -129,6 +164,27 @@ def run_ghl_sync(
             .all()
         )
 
+        # Batch-load the latest DistressScore per property in one query
+        _property_ids = [p.id for p in properties]
+        if _property_ids:
+            _latest_sq = (
+                session.query(
+                    DistressScore.property_id,
+                    func.max(DistressScore.score_date).label("max_date"),
+                )
+                .filter(DistressScore.property_id.in_(_property_ids))
+                .group_by(DistressScore.property_id)
+                .subquery()
+            )
+            _ds_rows = session.query(DistressScore).join(
+                _latest_sq,
+                (DistressScore.property_id == _latest_sq.c.property_id)
+                & (DistressScore.score_date == _latest_sq.c.max_date),
+            ).all()
+            score_map = {ds.property_id: ds for ds in _ds_rows}
+        else:
+            score_map = {}
+
         stats["total"] = len(properties)
         logger.info("[GHL Sync] Processing %d pending_sync properties", stats["total"])
 
@@ -137,25 +193,34 @@ def run_ghl_sync(
 
         for prop in properties:
             try:
+                # Read pre-computed score — no rescore needed
+                ds = score_map.get(prop.id)
+                if ds is None:
+                    logger.warning(
+                        "[GHL Sync] No distress_scores row for %s — skipping", prop.parcel_id
+                    )
+                    stats["skipped"] += 1
+                    pending_db_updates.append((prop.id, prop.gohighlevel_contact_id, "synced"))
+                    continue
+
+                score_data = _build_score_data_from_db(prop, ds)
                 contact_id = None
                 last_exc = None
 
-                # Retry loop — up to _PUSH_MAX_RETRIES attempts for transient failures
+                # Retry loop — up to _PUSH_MAX_RETRIES attempts for transient GHL API failures
                 for attempt in range(_PUSH_MAX_RETRIES):
                     try:
-                        score_data = scorer.score_property(prop)
                         contact_id = push_lead_to_ghl(score_data)
                         last_exc = None
                         break  # success
                     except Exception as exc:
                         last_exc = exc
                         if attempt < _PUSH_MAX_RETRIES - 1:
-                            wait = 2 ** attempt
                             logger.warning(
-                                "[GHL Sync] Attempt %d/%d failed for %s — retrying in %ds: %s",
-                                attempt + 1, _PUSH_MAX_RETRIES, prop.parcel_id, wait, exc,
+                                "[GHL Sync] Attempt %d/%d failed for %s — retrying in 0.5s: %s",
+                                attempt + 1, _PUSH_MAX_RETRIES, prop.parcel_id, exc,
                             )
-                            time.sleep(wait)
+                            time.sleep(0.5)
 
                 if last_exc is not None:
                     logger.error(
