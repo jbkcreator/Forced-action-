@@ -7,6 +7,7 @@ and pipelines. Constants are organized by category for easy maintenance and refe
 Author: Distressed Property Intelligence Platform
 """
 
+import json as _json
 import tempfile
 from pathlib import Path
 
@@ -174,40 +175,60 @@ LIEN_DOCUMENT_TYPES = {
 
 # =============================================================================
 # COUNTY CONFIG
-# Central registry of all per-county configuration.
-# Add a new county here — scrapers, loaders, and API pick it up automatically.
+# Backed by config/counties.json — add a new county there, not here.
+# Dormant counties (status=dormant) are excluded from COUNTY_CONFIG and will
+# raise ValueError from get_county_config() until they are activated.
 # =============================================================================
 
-COUNTY_CONFIG = {
-    "hillsborough": {
-        "display_name": "Hillsborough County",
-        "state": "FL",
-        "urls": {
-            "permit":       PERMIT_SEARCH_URL,
-            "violation":    VIOLATION_SEARCH_URL,
-            "probate":      PROBATE_FILINGS_URL,
-            "civil":        CIVIL_FILINGS_URL,
-            "foreclosure":  REALFORECLOSE_BASE_URL,
-            "tax":          TAX_COLLECTOR_BASE_URL,
-            "parcel":       PARCEL_LOOKUP_URL,
-            "master":       MASTER_DATA_URL,
-            "clerk_base":   HILLSCLERK_BASE_URL,
-            "clerk_access": HILLSCLERK_PUBLIC_ACCESS_URL,
-        },
-        "court": {
-            "bankruptcy_code": COURT_CODE_FLORIDA_MIDDLE_BANKRUPTCY,
-            "division_prefix": TAMPA_DIVISION_PREFIX,
-        },
-        "accela_code": "HCFL",
-    },
+_COUNTIES_JSON = Path(__file__).parent / "counties.json"
+
+# Maps counties.json portals keys → short url keys expected by scrapers
+_PORTAL_KEY_MAP = {
+    "permit_search_url":        "permit",
+    "violation_search_url":     "violation",
+    "probate_filings_url":      "probate",
+    "civil_filings_url":        "civil",
+    "realforeclose_base_url":   "foreclosure",
+    "tax_collector_base_url":   "tax",
+    "parcel_lookup_url":        "parcel",
+    "master_data_url":          "master",
+    "clerk_base_url":           "clerk_base",
+    "clerk_public_access_url":  "clerk_access",
 }
 
 
+def _build_county_config() -> dict:
+    with open(_COUNTIES_JSON, "r", encoding="utf-8") as _f:
+        _data = _json.load(_f)
+    result = {}
+    for _cid, _c in _data.items():
+        if _c.get("status") == "dormant":
+            continue
+        _portals = _c.get("portals", {})
+        result[_cid] = {
+            "display_name": _c.get("name", _cid),
+            "state":        _c.get("state", ""),
+            "urls":         {s: _portals.get(l, "") for l, s in _PORTAL_KEY_MAP.items()},
+            "court":        _c.get("court", {}),
+            "accela_code":  "",
+        }
+    return result
+
+
+COUNTY_CONFIG = _build_county_config()
+
+
 def get_county_config(county_id: str) -> dict:
-    """Return config for a county, raising clearly if unknown."""
-    if county_id not in COUNTY_CONFIG:
+    """Return scrapers-facing config for a county. Raises ValueError if unknown or dormant."""
+    if county_id in COUNTY_CONFIG:
+        return COUNTY_CONFIG[county_id]
+    with open(_COUNTIES_JSON, "r", encoding="utf-8") as _f:
+        _all = _json.load(_f)
+    if county_id in _all and _all[county_id].get("status") == "dormant":
         raise ValueError(
-            f"Unknown county '{county_id}'. "
-            f"Supported: {list(COUNTY_CONFIG.keys())}"
+            f"County '{county_id}' is dormant — portal URLs not yet configured."
         )
-    return COUNTY_CONFIG[county_id]
+    raise ValueError(
+        f"Unknown county '{county_id}'. "
+        f"Supported: {list(COUNTY_CONFIG.keys())}"
+    )

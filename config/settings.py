@@ -29,6 +29,7 @@ class AppSettings(BaseSettings):
 	# Oxylabs proxy (optional — used by foreclosure + tax delinquency scrapers)
 	oxylabs_username: Optional[str] = Field(default=None, env="OXYLABS_USERNAME")
 	oxylabs_password: Optional[SecretStr] = Field(default=None, env="OXYLABS_PASSWORD")
+	oxylabs_rotate: bool = Field(default=False, env="OXYLABS_ROTATE")
 
 	# GoHighLevel CRM integration (optional — feature disabled if not set)
 	ghl_api_key: Optional[SecretStr] = Field(default=None, env="GHL_API_KEY")

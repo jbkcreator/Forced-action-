@@ -38,6 +38,11 @@ class TestCountyConfig:
     def test_unknown_county_raises_value_error(self):
         from config.constants import get_county_config
         with pytest.raises(ValueError, match="Unknown county"):
+            get_county_config("miami_dade")
+
+    def test_dormant_county_raises_value_error(self):
+        from config.constants import get_county_config
+        with pytest.raises(ValueError, match="dormant"):
             get_county_config("pinellas")
 
     def test_unknown_county_lists_supported(self):

@@ -23,6 +23,7 @@
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 PROJECT=/root/Forced-action-
+COUNTY_ID=hillsborough
 
 # ── QUARTERLY ────────────────────────────────────────────────
 # Master Parcel Data (1st of Jan, Apr, Jul, Oct at 01:00 AM UTC)
@@ -31,27 +32,27 @@ PROJECT=/root/Forced-action-
 # ── DAILY ────────────────────────────────────────────────────
 
 # 1. Code Violations         — 04:00 AM UTC / 12:00 AM EDT / 09:30 AM IST
-0 4 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.violation.violation_engine --load-to-db
+0 4 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.violation.violation_engine --load-to-db --county-id $COUNTY_ID
 
 # 2. Bankruptcy Filings      — 04:15 AM UTC / 12:15 AM EDT / 09:45 AM IST
-15 4 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.bankruptcy.bankruptcy_engine --lookback 1 --load-to-db
+15 4 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.bankruptcy.bankruptcy_engine --lookback 1 --load-to-db --county-id $COUNTY_ID
 
 # 3. Eviction Filings        — 04:30 AM UTC / 12:30 AM EDT / 10:00 AM IST
-30 4 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.evictions.evictions_engine --load-to-db
+30 4 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.evictions.evictions_engine --load-to-db --county-id $COUNTY_ID
 
 # 4. Probate Filings         — 04:45 AM UTC / 12:45 AM EDT / 10:15 AM IST
-45 4 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.probate.probate_engine --load-to-db
+45 4 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.probate.probate_engine --load-to-db --county-id $COUNTY_ID
 
 # 4b. Divorce / Dissolution Filings — 04:47 AM UTC / 12:47 AM EDT / 10:17 AM IST
 #     Filters civil dailyfilings for DR (domestic relations) case types
-47 4 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.divorce.divorce_engine --load-to-db
+47 4 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.divorce.divorce_engine --load-to-db --county-id $COUNTY_ID
 
 # 5. Liens + Deeds + Judgments — 05:00 AM UTC / 01:00 AM EDT / 10:30 AM IST
 #    Replaces the previous 3 separate scraper jobs (liens/deeds/judgments)
-0 5 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.liens.lien_engine --mode combined --start-date $(date -d "1 day ago" +\%Y-\%m-\%d) --load-to-db
+0 5 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.liens.lien_engine --mode combined --start-date $(date -d "1 day ago" +\%Y-\%m-\%d) --load-to-db --county-id $COUNTY_ID
 
 # 8. Building Permits        — 05:45 AM UTC / 01:45 AM EDT / 11:15 AM IST
-45 5 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.permit.permit_engine --load-to-db
+45 5 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.permit.permit_engine --load-to-db --county-id $COUNTY_ID
 
 # 9. Tax Delinquencies — DISABLED. County portal is blocking the scraper.
 #    Data is now loaded exclusively via the admin upload layer:
@@ -60,29 +61,29 @@ PROJECT=/root/Forced-action-
 # 0 6 * * 1 $PROJECT/scripts/cron/run.sh src.scrappers.deliquencies.tax_delinquent_engine --mode download-only --load-to-db --scraper ai
 
 # 10. Foreclosure Auctions   — 06:15 AM UTC / 02:15 AM EDT / 11:45 AM IST
-15 6 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.foreclosures.foreclosure_engine --date $(date +\%Y-\%m-\%d) --load-to-db --scraper ai
+15 6 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.foreclosures.foreclosure_engine --date $(date +\%Y-\%m-\%d) --load-to-db --scraper ai --county-id $COUNTY_ID
 
 # 11. Roofing Permits (classify from building_permits) — 06:17 AM UTC / 02:17 AM EDT / 11:47 AM IST
-17 6 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.roofing_permits.roofing_permit_engine
+17 6 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.roofing_permits.roofing_permit_engine --county-id $COUNTY_ID
 
 # 12. Storm Damage (NWS alerts) — 06:19 AM UTC / 02:19 AM EDT / 11:49 AM IST
-19 6 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.storm.storm_engine
+19 6 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.storm.storm_engine --county-id $COUNTY_ID
 
 # 13. Flood Damage (FEMA + NWS) — 06:21 AM UTC / 02:21 AM EDT / 11:51 AM IST
-21 6 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.flood.flood_engine
+21 6 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.flood.flood_engine --county-id $COUNTY_ID
 
 # 14. Insurance Claims (FEMA IA + adjuster permits) — 06:23 AM UTC / 02:23 AM EDT / 11:53 AM IST
-23 6 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.insurance.insurance_engine
+23 6 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.insurance.insurance_engine --county-id $COUNTY_ID
 
 # 15. Fire Incidents — 06:25 AM UTC / 02:25 AM EDT / 11:55 AM IST
-25 6 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.fire.fire_engine
+25 6 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.fire.fire_engine --county-id $COUNTY_ID
 
 # 16. Load Validator — 06:30 AM UTC / 02:30 AM EDT / 12:00 PM IST (after all scrapers complete)
 30 6 * * 1-5 $PROJECT/scripts/cron/run.sh src.tasks.load_validator
 
 # 17. Lead Quality Monitor — 07:35 AM UTC (after CDS scoring at 07:00, skip tracing at 07:30)
 #     Snapshots leads sent ~30 days ago; computes Gold+ false-positive rate.
-35 7 * * 1-5 $PROJECT/scripts/cron/run.sh src.tasks.lead_quality_monitor hillsborough
+35 7 * * 1-5 $PROJECT/scripts/cron/run.sh src.tasks.lead_quality_monitor $COUNTY_ID
 
 # ── PLATFORM TASKS ───────────────────────────────────────────
 # Grace Expiry (ZIP territories + subscribers) — every 15 min
@@ -100,11 +101,11 @@ PROJECT=/root/Forced-action-
 # Enriches today's Gold+ leads with phone/email via BatchData (+ IDI fallback)
 # Runs after CDS scoring so today's new leads are enriched before GHL sync picks them up.
 # --today-only: only process leads scored in the current run (safe, avoids re-processing history)
-30 7 * * 1-5 $PROJECT/scripts/cron/run.sh src.tasks.run_enrichment hillsborough --limit 500
+30 7 * * 1-5 $PROJECT/scripts/cron/run.sh src.tasks.run_enrichment $COUNTY_ID --limit 500
 
 # SunBiz LLC Contact Enrichment — 07:40 AM UTC / 03:40 AM EDT / 01:10 PM IST
 # Searches FL SOS Sunbiz for registered-agent contacts of LLC-owned Gold+ leads
-40 7 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.sunbiz.sunbiz_engine
+40 7 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.sunbiz.sunbiz_engine --county-id $COUNTY_ID
 
 # ── GHL CRM SYNC ─────────────────────────────────────────────
 # GHL CRM Sync               — 08:00 AM UTC / 04:00 AM EDT / 01:30 PM IST (after CDS scoring completes)
@@ -118,7 +119,7 @@ PROJECT=/root/Forced-action-
 
 # Weekly One-Pager (executive summary + 2-week trend remediation)
 # Monday @ 09:30 AM UTC — runs after weekly_report so it can pick up fresh data
-30 9 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.weekly_one_pager hillsborough
+30 9 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.weekly_one_pager $COUNTY_ID
 
 # ── DAILY REPORT ─────────────────────────────────────────────
 # Daily Ops Report — 09:30 AM UTC / 05:30 AM EDT / 03:00 PM IST (after all other jobs complete)

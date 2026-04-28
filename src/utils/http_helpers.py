@@ -5,6 +5,7 @@ HTTP request helpers with built-in retry logic.
 import logging
 import time
 from typing import Optional
+from uuid import uuid4
 
 import requests
 
@@ -24,9 +25,10 @@ def get_playwright_proxy() -> Optional[dict]:
         logger.info("[Proxy] OXYLABS_USERNAME/PASSWORD not set — running without proxy")
         return None
     username = settings.oxylabs_username
+    if settings.oxylabs_rotate:
+        username = f"{username}-sessid-{uuid4().hex[:8]}"
     password = settings.oxylabs_password.get_secret_value()
     logger.info(f"[Proxy] Using proxy: ...@pr.oxylabs.io:7777 (user: {username})")
-    # Playwright takes server + credentials separately
     return {
         "server": "http://pr.oxylabs.io:7777",
         "username": username,
@@ -45,10 +47,13 @@ def get_browser_use_proxy():
     from config.settings import settings
     if not settings.oxylabs_username or not settings.oxylabs_password:
         return None
+    username = settings.oxylabs_username
+    if settings.oxylabs_rotate:
+        username = f"{username}-sessid-{uuid4().hex[:8]}"
     from browser_use.browser.profile import ProxySettings
     return ProxySettings(
         server="http://pr.oxylabs.io:7777",
-        username=settings.oxylabs_username,
+        username=username,
         password=settings.oxylabs_password.get_secret_value(),
     )
 

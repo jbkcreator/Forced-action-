@@ -12,6 +12,7 @@ VENV_PYTHON="$PROJECT_DIR/.venv/bin/python"
 LOG_DIR="$PROJECT_DIR/logs/cron"
 STATUS_DIR="$LOG_DIR/status"
 ALERT_EMAIL="root"
+COUNTY_ID="${COUNTY_ID:-hillsborough}"
 
 MAX_ATTEMPTS=3
 RETRY_DELAYS=(0 900 1800)   # seconds before attempt 1, 2, 3 (0 = no pre-delay)
@@ -25,6 +26,18 @@ if [[ "$1" == *"tax_delinquent_engine"* ]]; then
 fi
 
 mkdir -p "$LOG_DIR" "$STATUS_DIR"
+
+# Block execution for counties that are not yet active
+_COUNTY_STATUS=$(python3 -c "
+import json, sys
+with open('$PROJECT_DIR/config/counties.json') as f:
+    data = json.load(f)
+print(data.get('$COUNTY_ID', {}).get('status', 'active'))
+" 2>/dev/null || echo 'active')
+if [ "$_COUNTY_STATUS" = "dormant" ]; then
+    echo "INFO: County '$COUNTY_ID' is dormant — skipping run $(date '+%Y-%m-%d %H:%M:%S')" >> "$LOG_DIR/dormant.log"
+    exit 0
+fi
 
 
 MODULE="$1"

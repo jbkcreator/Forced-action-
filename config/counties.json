@@ -25,5 +25,53 @@
     "nws_zones": ["FLC057", "FLZ151", "FLZ251"],
     "credentials_ref": "HILLSBOROUGH_PORTAL_USER",
     "file_prefix": "hillsborough"
+  },
+
+  "pinellas": {
+    "name": "Pinellas County",
+    "state": "FL",
+    "fips": "12103",
+    "status": "dormant",
+    "zip_prefixes": ["337", "346"],
+    "portals": {},
+    "court": {"bankruptcy_code": "flmb", "division_prefix": "8:"},
+    "nws_zones": ["FLC103"],
+    "file_prefix": "pinellas"
+  },
+
+  "pasco": {
+    "name": "Pasco County",
+    "state": "FL",
+    "fips": "12101",
+    "status": "dormant",
+    "zip_prefixes": ["346"],
+    "portals": {},
+    "court": {"bankruptcy_code": "flmb", "division_prefix": "8:"},
+    "nws_zones": ["FLC101"],
+    "file_prefix": "pasco"
+  },
+
+  "polk": {
+    "name": "Polk County",
+    "state": "FL",
+    "fips": "12105",
+    "status": "dormant",
+    "zip_prefixes": ["338"],
+    "portals": {},
+    "court": {"bankruptcy_code": "flmb", "division_prefix": "8:"},
+    "nws_zones": ["FLC105"],
+    "file_prefix": "polk"
+  },
+
+  "manatee": {
+    "name": "Manatee County",
+    "state": "FL",
+    "fips": "12081",
+    "status": "dormant",
+    "zip_prefixes": ["342"],
+    "portals": {},
+    "court": {"bankruptcy_code": "flmb", "division_prefix": "8:"},
+    "nws_zones": ["FLC081"],
+    "file_prefix": "manatee"
   }
 }
