@@ -1947,74 +1947,165 @@ def synthflow_lead_count(
 
 class SynthflowWebhookPayload(BaseModel):
     """
-    Flexible model — Synthflow and Finetuner.ai use slightly different field
-    names. All outcome-critical fields are optional with sensible defaults so
-    the handler degrades gracefully if a field is missing.
+    Models the Finetuner.ai post-call webhook envelope (also accepts the older
+    flat Synthflow shape for backward compatibility).
 
-    Finetuner.ai wraps agent-captured variables (outcome, zip_code, etc.)
-    inside a nested "variables" object rather than at the top level. The
-    _vars property merges both so callers always get the resolved value.
+    Finetuner.ai sends:
+      {
+        "status": "completed" | "failed" | "no-answer" | ...
+        "lead":   { "name": "...", "phone_number": "...", "prompt_variables": {...} },
+        "call":   { "status": "...", "end_call_reason": "...", "call_id": "...",
+                    "duration": 113, "recording_url": "...", "transcript": "...", ... },
+        "executed_actions":    { ... },
+        "analysis":            { "goal": "true|partial|false", "call_summary_feedback": "...", ... },
+        "metadata":            { ... },
+        "collected_variables": { "<name>": { "value": ..., "collected": true } }
+      }
+
+    All outcome-critical fields are optional so the handler degrades gracefully
+    when a field is missing.
     """
-    # Call identity
-    call_id: Optional[str] = None
+    # ── Finetuner.ai envelope ─────────────────────────────────────────────────
+    status: Optional[str] = None              # top-level call disposition
+    error_message: Optional[str] = None
+    lead: Optional[dict] = None               # { name, phone_number, prompt_variables }
+    call: Optional[dict] = None               # { status, end_call_reason, call_id, duration, ... }
+    executed_actions: Optional[dict] = None
+    analysis: Optional[dict] = None
+    metadata: Optional[dict] = None
+    collected_variables: Optional[dict] = None  # { <name>: { value, collected } }
 
-    # Prospect phone — various field names across providers
+    # ── Legacy/flat Synthflow shape (kept for backward compat) ────────────────
+    call_id: Optional[str] = None
     to: Optional[str] = None
-    to_number: Optional[str] = None        # some integrations use to_number
+    to_number: Optional[str] = None
     prospect_phone: Optional[str] = None
     phone_number: Optional[str] = None
     phone: Optional[str] = None
     caller_phone: Optional[str] = None
     contact_phone: Optional[str] = None
-
-    # Outcome — agent sets this via a variable during the call
-    outcome: Optional[str] = None          # sample_requested | demo_requested | not_interested | voicemail | no_answer | completed
-    call_status: Optional[str] = None      # Synthflow native: completed | no_answer | voicemail | failed
-    status: Optional[str] = None           # Finetuner.ai uses "status" instead of "call_status"
-
-    # Variables captured by the agent during the call (top-level, plain Synthflow)
+    outcome: Optional[str] = None
+    call_status: Optional[str] = None
     zip_code: Optional[str] = None
     vertical: Optional[str] = None
     prospect_name: Optional[str] = None
     notes: Optional[str] = None
-
-    # Synthflow also sends these at top level
     duration: Optional[int] = None
     recording_url: Optional[str] = None
-
-    # Finetuner.ai nests agent-set variables here
     variables: Optional[dict] = None
-    call_variables: Optional[dict] = None  # alternate key used by some integrations
+    call_variables: Optional[dict] = None
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    @property
+    def _flat_collected(self) -> dict:
+        """
+        Flatten `collected_variables` (Finetuner.ai shape) into a plain dict.
+        Each entry is `{ "value": X, "collected": bool }` — pull the value out
+        and ignore non-collected slots.
+        """
+        out: dict = {}
+        for key, slot in (self.collected_variables or {}).items():
+            if isinstance(slot, dict):
+                if slot.get("collected") and slot.get("value") is not None:
+                    out[key] = slot.get("value")
+            else:
+                out[key] = slot
+        return out
+
+    @property
+    def _flat_executed(self) -> dict:
+        """
+        Pull return_values out of executed_actions[*].return_value so we can
+        access values from extract_info_* actions by their identifier.
+        """
+        out: dict = {}
+        for action in (self.executed_actions or {}).values():
+            if not isinstance(action, dict):
+                continue
+            rv = action.get("return_value")
+            if isinstance(rv, dict):
+                for k, v in rv.items():
+                    if v is not None:
+                        # normalize key: "zip code" → "zip_code"
+                        out[k.replace(" ", "_").lower()] = v
+        return out
 
     @property
     def _vars(self) -> dict:
-        """Merged view of all nested variable containers."""
-        return {**(self.call_variables or {}), **(self.variables or {})}
+        """
+        Merged variable view across every container Finetuner/Synthflow uses:
+          1. legacy `call_variables`
+          2. legacy `variables`
+          3. Finetuner `collected_variables` (after flattening)
+          4. extract_info_* return_values from executed_actions
+          5. `lead.prompt_variables`
+        Later sources win on conflict.
+        """
+        prompt_vars = (self.lead or {}).get("prompt_variables") or {}
+        return {
+            **(self.call_variables or {}),
+            **(self.variables or {}),
+            **self._flat_collected,
+            **self._flat_executed,
+            **(prompt_vars if isinstance(prompt_vars, dict) else {}),
+        }
 
     @property
     def resolved_phone(self) -> Optional[str]:
         v = self._vars
+        lead = self.lead or {}
+        call = self.call or {}
         return (
-            self.prospect_phone or self.phone_number
-            or self.to or self.to_number
+            self.prospect_phone or self.phone_number or self.to or self.to_number
             or self.phone or self.caller_phone or self.contact_phone
+            or lead.get("phone_number") or lead.get("phone")
+            or call.get("to") or call.get("to_number") or call.get("phone_number")
             or v.get("prospect_phone") or v.get("phone_number")
             or v.get("to") or v.get("phone")
         )
 
     @property
+    def resolved_call_id(self) -> Optional[str]:
+        return self.call_id or (self.call or {}).get("call_id")
+
+    @property
     def resolved_outcome(self) -> str:
-        """Map Synthflow/Finetuner.ai call status to our outcome taxonomy."""
+        """
+        Map Finetuner/Synthflow call disposition to our outcome taxonomy.
+        Priority: agent-set `outcome` variable → end_call_reason → call.status → top-level status.
+        """
         outcome = self.outcome or self._vars.get("outcome")
         if outcome:
             return outcome
+
+        call = self.call or {}
+        end_reason = (call.get("end_call_reason") or "").lower()
+        if end_reason == "voicemail_message_left":
+            return "voicemail"
+        if end_reason == "voicemail":
+            return "no_answer"
+        if end_reason == "human_pick_up_cut_off":
+            return "no_answer"
+
         status_map = {
-            "no_answer": "no_answer",
-            "voicemail": "voicemail",
-            "failed":    "no_answer",
-            "completed": "completed",
+            "no_answer":        "no_answer",
+            "no-answer":        "no_answer",
+            "busy":             "no_answer",
+            "voicemail":        "voicemail",
+            "hangup_on_voicemail":   "no_answer",
+            "left_voicemail":   "voicemail",
+            "failed":           "no_answer",
+            "completed":        "completed",
         }
-        cs = self.call_status or self.status or self._vars.get("call_status") or self._vars.get("status") or ""
+        cs = (
+            self.call_status
+            or call.get("status")
+            or self.status
+            or self._vars.get("call_status")
+            or self._vars.get("status")
+            or ""
+        ).lower()
         return status_map.get(cs, "completed")
 
 
@@ -2063,23 +2154,28 @@ async def synthflow_webhook(request: Request):
     # Dump full payload to /tmp for guaranteed inspection — syslog often truncates
     # long lines or drops them entirely.  Filename is timestamped so each call
     # produces its own file you can `cat`.
+    import sys
     try:
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
         dump_path = f"/tmp/synthflow_payload_{ts}.json"
         with open(dump_path, "w", encoding="utf-8") as f:
             json.dump(raw_json, f, indent=2, default=str)
-        logger.info("[Synthflow webhook] DUMPED full payload → %s (size=%d bytes)", dump_path, len(raw_body))
+        # print → stderr bypasses logger/handler config, lands in systemd journal directly
+        print(f"[Synthflow webhook] DUMPED full payload -> {dump_path} (size={len(raw_body)} bytes)", file=sys.stderr, flush=True)
     except Exception as dump_exc:
-        logger.warning("[Synthflow webhook] could not dump payload: %s", dump_exc)
+        print(f"[Synthflow webhook] could not dump payload: {dump_exc}", file=sys.stderr, flush=True)
 
-    logger.info(
-        "[Synthflow webhook] RAW headers=%s",
-        {k: v for k, v in request.headers.items() if k.lower() in {"content-type", "user-agent", "x-finetuner-signature", "x-synthflow-signature"}},
+    print(
+        f"[Synthflow webhook] RAW headers="
+        f"{ {k: v for k, v in request.headers.items() if k.lower() in {'content-type', 'user-agent'} } }",
+        file=sys.stderr, flush=True,
     )
-    # Also log inline in chunks as a backup
+    # Inline body via print so it bypasses logger filtering and rate-limit
     full_body = json.dumps(raw_json, indent=2, default=str)
+    print(f"[Synthflow webhook] BODY_START len={len(full_body)}", file=sys.stderr, flush=True)
     for i in range(0, len(full_body), 1500):
-        logger.info("[Synthflow webhook] BODY[%d:%d] %s", i, i + 1500, full_body[i:i + 1500])
+        print(f"[Synthflow webhook] BODY[{i}:{i+1500}] {full_body[i:i+1500]}", file=sys.stderr, flush=True)
+    print("[Synthflow webhook] BODY_END", file=sys.stderr, flush=True)
 
     try:
         payload = SynthflowWebhookPayload(**raw_json)
@@ -2096,14 +2192,15 @@ async def synthflow_webhook(request: Request):
         return {"status": "ignored", "reason": "no phone"}
 
     v = payload._vars
+    lead = payload.lead or {}
     from src.services.synthflow_service import process_call_outcome
     try:
         result = process_call_outcome(
             prospect_phone=phone,
             outcome=payload.resolved_outcome,
             vertical=payload.vertical or v.get("vertical") or "roofing",
-            zip_code=payload.zip_code or v.get("zip_code") or "",
-            prospect_name=payload.prospect_name or v.get("prospect_name") or "",
+            zip_code=payload.zip_code or v.get("zip_code") or v.get("zip") or "",
+            prospect_name=payload.prospect_name or v.get("prospect_name") or lead.get("name") or "",
             notes=payload.notes or v.get("notes") or "",
         )
     except Exception:
@@ -2113,7 +2210,7 @@ async def synthflow_webhook(request: Request):
 
     logger.info(
         "[Synthflow webhook] call_id=%s phone=%s outcome=%s contact=%s tags=%s",
-        payload.call_id, phone, payload.resolved_outcome,
+        payload.resolved_call_id, phone, payload.resolved_outcome,
         result.get("contact_id"), result.get("tags_applied"),
     )
     return {"status": "ok", **result}
