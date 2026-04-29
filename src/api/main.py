@@ -1697,15 +1697,17 @@ def sample_leads(
             "email": owner_email if is_unlocked else None,
         })
 
-    # Register this visitor as an active viewer of this ZIP so the FOMO
-    # counter on the landing page reflects real concurrent traffic.
+    # Register this visitor as an active viewer and return the live count
+    # in the same response so the frontend has it immediately (no race).
+    active_viewers = 0
     try:
-        from src.services.urgency_engine import _increment_zip_counter
+        from src.services.urgency_engine import _increment_zip_counter, get_active_count
         _increment_zip_counter(zip_code, ttl_seconds=1200)  # 20-min active window
+        active_viewers = get_active_count(zip_code)
     except Exception:
         pass  # never block the response over a Redis counter
 
-    return {"zip_code": zip_code, "vertical": vertical, "leads": leads}
+    return {"zip_code": zip_code, "vertical": vertical, "leads": leads, "active_viewers": active_viewers}
 
 
 # ---------------------------------------------------------------------------
