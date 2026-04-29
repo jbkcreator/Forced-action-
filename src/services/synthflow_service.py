@@ -316,6 +316,19 @@ def process_call_outcome(
             logger.error("[Synthflow] demo SMS failed for %s: %s", contact_id, exc)
             sms_sent = False
 
+    # Log the call to message_outcomes so the anomaly monitor can query it
+    try:
+        from src.core.database import get_db_context
+        from src.core.models import MessageOutcome
+        with get_db_context() as _session:
+            _session.add(MessageOutcome(
+                message_type="voice",
+                channel="synthflow",
+                template_id=outcome,
+            ))
+    except Exception as _exc:
+        logger.warning("[Synthflow] failed to log call to message_outcomes: %s", _exc)
+
     return {
         "contact_id": contact_id,
         "tags_applied": tags,

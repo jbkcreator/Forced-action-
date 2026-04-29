@@ -89,6 +89,9 @@ COUNTY_ID=hillsborough
 # Grace Expiry (ZIP territories + subscribers) — every 15 min
 */15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.grace_expiry
 
+# Cora anomaly check — volume + no-answer rate monitor — every 15 min
+*/15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.cora_anomaly_check
+
 # ── CDS SCORING ──────────────────────────────────────────────
 # CDS Scoring Engine         — 07:00 AM UTC / 03:00 AM EDT / 12:30 PM IST (after all scrapers complete)
 0 7 * * 1-5 $PROJECT/scripts/cron/run.sh src.services.cds_engine
