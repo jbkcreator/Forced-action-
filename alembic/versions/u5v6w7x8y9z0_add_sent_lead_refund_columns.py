@@ -3,16 +3,16 @@
 Adds refund tracking columns to `sent_leads` so admin can issue and log
 Stripe refunds for $4 lead-unlock purchases directly from the admin panel.
 
-Revision ID: u5v6w7x8y9z0
-Revises:     t4u5v6w7x8y9
+Revision ID: fa002_refund_cols
+Revises:     fa001_sentleads_source
 Create Date: 2026-04-29
 """
 
 import sqlalchemy as sa
 from alembic import op
 
-revision = "u5v6w7x8y9z0"
-down_revision = "t4u5v6w7x8y9"
+revision = "fa002_refund_cols"
+down_revision = "fa001_sentleads_source"
 branch_labels = None
 depends_on = None
 

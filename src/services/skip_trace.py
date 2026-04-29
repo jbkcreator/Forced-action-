@@ -92,7 +92,28 @@ def _parse_result(person: dict) -> dict:
     # Phones — prefer reachable Mobile first, then any Mobile, then Land Line
     phones = person.get("phoneNumbers") or []
     mobile_phone = None
+    mobile_meta: Optional[dict] = None
     landline = None
+    landline_meta: Optional[dict] = None
+
+    def _meta(ph: dict) -> dict:
+        ptype_raw = (ph.get("type") or "").lower()
+        if "mobile" in ptype_raw or "wireless" in ptype_raw or "cell" in ptype_raw:
+            line_type = "mobile"
+        elif "voip" in ptype_raw:
+            line_type = "voip"
+        elif "land" in ptype_raw:
+            line_type = "landline"
+        else:
+            line_type = ptype_raw or "unknown"
+        return {
+            "type":      line_type,
+            "carrier":   ph.get("carrier"),
+            "score":     int(ph.get("score") or 0),
+            "reachable": bool(ph.get("reachable")),
+            "tested":    bool(ph.get("tested")),
+            "source":    "batch_data",
+        }
 
     # Sort by score descending so best numbers come first
     phones_sorted = sorted(phones, key=lambda p: int(p.get("score", 0) or 0), reverse=True)
@@ -103,11 +124,16 @@ def _parse_result(person: dict) -> dict:
             continue
         if "mobile" in ptype and not mobile_phone:
             mobile_phone = number
+            mobile_meta = _meta(ph)
         elif "land" in ptype and not landline:
             landline = number
+            landline_meta = _meta(ph)
     # fallback: use first number regardless of type
     if not mobile_phone and not landline and phones_sorted:
-        mobile_phone = str(phones_sorted[0].get("number", "")).strip() or None
+        first = phones_sorted[0]
+        mobile_phone = str(first.get("number", "")).strip() or None
+        if mobile_phone:
+            mobile_meta = _meta(first)
 
     # Email
     emails = person.get("emails") or []
@@ -137,7 +163,9 @@ def _parse_result(person: dict) -> dict:
 
     return {
         "mobile_phone": mobile_phone,
+        "mobile_meta": mobile_meta,
         "landline": landline,
+        "landline_meta": landline_meta,
         "email": email,
         "mailing_address": mailing_address,
         "llc_owner_name": llc_owner_name,
@@ -380,15 +408,30 @@ def run_skip_trace(
                     )
                     session.add(ec)
 
-                    # Update Owner contact fields
+                    # Update Owner contact fields + phone metadata
+                    meta_for_phone_1 = None
                     if parsed["mobile_phone"]:
                         owner.phone_1 = parsed["mobile_phone"]
+                        meta_for_phone_1 = parsed.get("mobile_meta")
                     elif parsed["landline"]:
                         owner.phone_1 = parsed["landline"]
+                        meta_for_phone_1 = parsed.get("landline_meta")
                     if parsed["email"]:
                         owner.email_1 = parsed["email"]
                     if parsed["match_success"]:
                         owner.skip_trace_success = True
+
+                    if meta_for_phone_1:
+                        existing_meta = dict(owner.phone_metadata or {})
+                        existing_meta["phone_1"] = meta_for_phone_1
+                        # Keep landline_meta against phone_2 only if we already have a different number there
+                        if (
+                            parsed.get("landline_meta")
+                            and parsed["mobile_phone"]
+                            and owner.phone_2 == parsed["landline"]
+                        ):
+                            existing_meta["phone_2"] = parsed["landline_meta"]
+                        owner.phone_metadata = existing_meta
 
                     if parsed["match_success"]:
                         stats["success"] += 1

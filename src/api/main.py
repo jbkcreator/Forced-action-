@@ -1265,7 +1265,7 @@ def event_feed(
     leads = []
     for prop, score, owner in rows:
         is_unlocked = prop.id in unlocked_ids
-        owner_phone = (owner.phone_1 or owner.phone_2 or owner.phone_3) if owner else None
+        owner_phone, owner_phone_quality = _resolve_phone_with_quality(owner)
         owner_email = (owner.email_1 or owner.email_2) if owner else None
         leads.append({
             "property_id": prop.id,
@@ -1289,6 +1289,7 @@ def event_feed(
             "unlocked": is_unlocked,
             "owner_name": owner.owner_name if (owner and is_unlocked) else None,
             "phone": owner_phone if is_unlocked else None,
+            "phone_quality": owner_phone_quality if is_unlocked else None,
             "email": owner_email if is_unlocked else None,
         })
 
@@ -1439,6 +1440,33 @@ def resend_confirmation(payload: ResendConfirmationRequest, db: Session = Depend
         raise HTTPException(status_code=500, detail={"error": "send_failed", "message": "Failed to send email"})
 
     return {"ok": True}
+
+
+def _resolve_phone_with_quality(owner) -> tuple[Optional[str], Optional[dict]]:
+    """
+    Pick the best phone number to display for an owner and return its
+    skip-trace metadata alongside it.
+
+    Iterates phone_1 → phone_2 → phone_3, picking the first non-empty number.
+    Returns (number, metadata) where metadata is the matching slot from
+    `owner.phone_metadata` if present, else None.
+
+    Metadata shape (when present):
+        { "type": "mobile|landline|voip|unknown",
+          "carrier": str | None,
+          "score": int 0-100,
+          "reachable": bool,
+          "tested": bool,
+          "source": "batch_data" | "idi" | "twilio_lookup" }
+    """
+    if not owner:
+        return (None, None)
+    meta_map = owner.phone_metadata or {}
+    for slot in ("phone_1", "phone_2", "phone_3"):
+        number = getattr(owner, slot, None)
+        if number:
+            return (number, meta_map.get(slot))
+    return (None, None)
 
 
 def _estimate_lead_job_value(prop, score) -> dict:
@@ -1646,7 +1674,7 @@ def sample_leads(
             inc = None  # non-fatal — degrade gracefully
 
         is_unlocked = prop.id in unlocked_ids
-        owner_phone = (owner.phone_1 or owner.phone_2 or owner.phone_3) if owner else None
+        owner_phone, owner_phone_quality = _resolve_phone_with_quality(owner)
         owner_email = (owner.email_1 or owner.email_2) if owner else None
 
         leads.append({
@@ -1665,6 +1693,7 @@ def sample_leads(
             "unlocked": is_unlocked,
             "owner_name": owner.owner_name if (owner and is_unlocked) else None,
             "phone": owner_phone if is_unlocked else "•••-•••-••••",
+            "phone_quality": owner_phone_quality if is_unlocked else None,
             "email": owner_email if is_unlocked else None,
         })
 
@@ -2143,39 +2172,11 @@ async def synthflow_webhook(request: Request):
     Configure in Synthflow/Finetuner as the post-call webhook URL:
         https://your-domain.com/webhooks/synthflow
     """
-    # Log raw body + headers so we can see exactly what Finetuner.ai is sending.
-    # Critical for debugging field-name mismatches (no phone resolved, missing zip, etc.)
     raw_body = await request.body()
     try:
         raw_json = json.loads(raw_body.decode("utf-8") or "{}")
     except Exception:
         raw_json = {"_unparseable": raw_body.decode("utf-8", errors="replace")[:2000]}
-
-    # Dump full payload to /tmp for guaranteed inspection — syslog often truncates
-    # long lines or drops them entirely.  Filename is timestamped so each call
-    # produces its own file you can `cat`.
-    import sys
-    try:
-        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-        dump_path = f"/tmp/synthflow_payload_{ts}.json"
-        with open(dump_path, "w", encoding="utf-8") as f:
-            json.dump(raw_json, f, indent=2, default=str)
-        # print → stderr bypasses logger/handler config, lands in systemd journal directly
-        print(f"[Synthflow webhook] DUMPED full payload -> {dump_path} (size={len(raw_body)} bytes)", file=sys.stderr, flush=True)
-    except Exception as dump_exc:
-        print(f"[Synthflow webhook] could not dump payload: {dump_exc}", file=sys.stderr, flush=True)
-
-    print(
-        f"[Synthflow webhook] RAW headers="
-        f"{ {k: v for k, v in request.headers.items() if k.lower() in {'content-type', 'user-agent'} } }",
-        file=sys.stderr, flush=True,
-    )
-    # Inline body via print so it bypasses logger filtering and rate-limit
-    full_body = json.dumps(raw_json, indent=2, default=str)
-    print(f"[Synthflow webhook] BODY_START len={len(full_body)}", file=sys.stderr, flush=True)
-    for i in range(0, len(full_body), 1500):
-        print(f"[Synthflow webhook] BODY[{i}:{i+1500}] {full_body[i:i+1500]}", file=sys.stderr, flush=True)
-    print("[Synthflow webhook] BODY_END", file=sys.stderr, flush=True)
 
     try:
         payload = SynthflowWebhookPayload(**raw_json)

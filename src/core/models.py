@@ -140,6 +140,12 @@ class Owner(Base):
     email_2: Mapped[Optional[str]] = mapped_column(String(255))
     linkedin_url: Mapped[Optional[str]] = mapped_column(String(255))
 
+    # Per-phone metadata from skip-trace providers (BatchData, IDI, Twilio Lookup).
+    # Keyed by slot ("phone_1" / "phone_2" / "phone_3") with shape:
+    #   { "type": "mobile|landline|voip", "carrier": str, "score": int 0-100,
+    #     "reachable": bool, "source": "batch_data|idi|twilio_lookup" }
+    phone_metadata: Mapped[Optional[dict]] = mapped_column(JSONB)
+
     # Owner Intelligence (API Gap)
     employer_name: Mapped[Optional[str]] = mapped_column(String(255))
     estimated_income: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
@@ -158,6 +164,7 @@ class Owner(Base):
         Index("idx_owner_type", "owner_type"),
         Index("idx_absentee_status", "absentee_status"),
         Index("idx_owner_county_id", "county_id"),
+        Index("idx_owner_phone_metadata", "phone_metadata", postgresql_using="gin"),
         CheckConstraint("owner_type IN ('Individual', 'LLC', 'Trust', 'Estate', 'Corporate')", name="check_owner_type"),
         CheckConstraint("absentee_status IN ('In-County', 'Out-of-County', 'Out-of-State')", name="check_absentee_status"),
     )
