@@ -13,6 +13,7 @@ Endpoints:
     GET  /                         — Landing page
 """
 
+import json
 import logging
 import re
 import time
@@ -33,7 +34,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select, and_, or_, desc, func, cast, text, Date
 
 from src.core.database import get_db_context
-from src.core.models import FoundingSubscriberCount, ZipTerritory, Subscriber, Property, DistressScore, Incident, LeadPackPurchase, ScraperRunStats, EnrichedContact
+from src.core.models import FoundingSubscriberCount, ZipTerritory, Subscriber, Property, DistressScore, Incident, LeadPackPurchase, ScraperRunStats, EnrichedContact, Owner, SentLead
 from src.services.stripe_webhooks import handle_webhook
 from src.services.stripe_service import get_price_id_for_checkout
 from config.settings import get_settings
@@ -41,7 +42,6 @@ from config.scoring import VERTICAL_WEIGHTS
 
 logger = logging.getLogger(__name__)
 
-STATIC_DIR = Path(__file__).parent.parent / "static"
 REACT_DIST = Path(__file__).parent.parent.parent.parent / "Forced-action-ui" / "dist"
 
 VALID_TIERS = {"starter", "pro", "dominator"}
@@ -55,8 +55,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-
 from src.api.admin_router import router as admin_router  # noqa: E402
 app.include_router(admin_router)
 
@@ -376,7 +374,7 @@ def health_check_detailed(db: Session = Depends(get_db)):
     }
 
     return JSONResponse(
-        status_code=200 if overall == "ok" else 503,
+        status_code=503 if overall == "critical" else 200,
         content={
             "status": overall,
             "checks": checks,
@@ -384,7 +382,7 @@ def health_check_detailed(db: Session = Depends(get_db)):
         },
     )
 
-
+\
 # ---------------------------------------------------------------------------
 # GET / — Landing page (React SPA or static HTML fallback)
 # ---------------------------------------------------------------------------
@@ -394,7 +392,7 @@ def landing_page():
     react_index = REACT_DIST / "index.html"
     if react_index.is_file():
         return FileResponse(str(react_index))
-    return FileResponse(str(STATIC_DIR / "index.html"))
+    raise HTTPException(status_code=503, detail="UI not built — run npm run build in Forced-action-ui/")
 
 
 # ---------------------------------------------------------------------------
@@ -640,7 +638,7 @@ def success_page():
     react_index = REACT_DIST / "index.html"
     if react_index.is_file():
         return FileResponse(str(react_index))
-    return FileResponse(str(STATIC_DIR / "success.html"))
+    raise HTTPException(status_code=503, detail="UI not built — run npm run build in Forced-action-ui/")
 
 
 # ---------------------------------------------------------------------------
@@ -652,7 +650,7 @@ def dashboard_page(feed_uuid: str):
     react_index = REACT_DIST / "index.html"
     if react_index.is_file():
         return FileResponse(str(react_index))
-    return FileResponse(str(STATIC_DIR / "dashboard.html"))
+    raise HTTPException(status_code=503, detail="UI not built — run npm run build in Forced-action-ui/")
 
 
 # ---------------------------------------------------------------------------
@@ -664,7 +662,7 @@ def email_previews_page():
     react_index = REACT_DIST / "index.html"
     if react_index.is_file():
         return FileResponse(str(react_index))
-    return FileResponse(str(STATIC_DIR / "email-previews.html"))
+    raise HTTPException(status_code=503, detail="UI not built — run npm run build in Forced-action-ui/")
 
 
 @app.get("/admin", include_in_schema=False)
@@ -1163,14 +1161,21 @@ def event_feed(
             Property.zip.ilike(term),
         ))
 
+    # Production: require owner phone or email. Always sort phone-bearing
+    # leads first; the contact filter only narrows what's eligible.
+    from src.utils.lead_filters import has_contact_filter, phone_priority_order
+    contact_clause = has_contact_filter(get_settings())
+    if contact_clause is not None:
+        filters.append(contact_clause)
+
     # Sort order
     _sort = sort if sort in _VALID_SORTS else "score_desc"
     if _sort == "newest":
-        order_col = desc(DistressScore.score_date)
+        order_cols = [desc(DistressScore.score_date)]
     elif _sort == "value_desc":
-        order_col = desc(DistressScore.final_cds_score)  # CDS as value proxy until job estimator is query-able
+        order_cols = [desc(DistressScore.final_cds_score)]
     else:
-        order_col = desc(score_col)
+        order_cols = phone_priority_order(score_col)
 
     # Dedupe to latest DistressScore row per property. `distress_scores` is
     # 1-to-many with `properties` (scoring runs accumulate history) so a
@@ -1187,7 +1192,7 @@ def event_feed(
     )
 
     base_query = (
-        select(Property, DistressScore)
+        select(Property, DistressScore, Owner)
         .join(DistressScore, DistressScore.property_id == Property.id)
         .join(
             latest_score_subq,
@@ -1196,8 +1201,9 @@ def event_feed(
                 latest_score_subq.c.max_date == DistressScore.score_date,
             ),
         )
+        .outerjoin(Owner, Owner.property_id == Property.id)
         .where(and_(*filters))
-        .order_by(order_col)
+        .order_by(*order_cols)
     )
 
     # 4. Total count — run over the deduped base_query so the pager is correct
@@ -1211,11 +1217,11 @@ def event_feed(
         raw_rows = db.execute(base_query.offset(offset).limit(page_size + 10)).all()
         seen_ids = set()
         rows = []
-        for prop, score in raw_rows:
+        for prop, score, owner in raw_rows:
             if prop.id in seen_ids:
                 continue
             seen_ids.add(prop.id)
-            rows.append((prop, score))
+            rows.append((prop, score, owner))
             if len(rows) >= page_size:
                 break
     except OperationalError:
@@ -1223,7 +1229,7 @@ def event_feed(
         raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
 
     # 6. Fetch incidents for returned properties in one query
-    property_ids = [prop.id for prop, _ in rows]
+    property_ids = [prop.id for prop, _, _ in rows]
 
     try:
         incidents_raw = db.execute(
@@ -1232,6 +1238,21 @@ def event_feed(
     except OperationalError:
         logger.error("DB error fetching incidents for feed", exc_info=True)
         raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
+
+    # Resolve which properties this subscriber has unlocked (paid or email-delivered)
+    unlocked_ids: set[int] = set()
+    if property_ids:
+        try:
+            unlocked_rows = db.execute(
+                select(SentLead.property_id).where(
+                    SentLead.subscriber_id == subscriber.id,
+                    SentLead.property_id.in_(property_ids),
+                )
+            ).scalars().all()
+            unlocked_ids = set(unlocked_rows)
+        except OperationalError:
+            logger.error("DB error fetching unlocks for feed", exc_info=True)
+            # Non-fatal — render leads as locked rather than 503
 
     incidents_by_prop: dict = {}
     for inc in incidents_raw:
@@ -1242,7 +1263,10 @@ def event_feed(
 
     # 7. Build response
     leads = []
-    for prop, score in rows:
+    for prop, score, owner in rows:
+        is_unlocked = prop.id in unlocked_ids
+        owner_phone = (owner.phone_1 or owner.phone_2 or owner.phone_3) if owner else None
+        owner_email = (owner.email_1 or owner.email_2) if owner else None
         leads.append({
             "property_id": prop.id,
             "parcel_id": prop.parcel_id,
@@ -1262,6 +1286,10 @@ def event_feed(
             "distress_types": score.distress_types,
             "est_job_value": _estimate_lead_job_value(prop, score),
             "incidents": incidents_by_prop.get(prop.id, []),
+            "unlocked": is_unlocked,
+            "owner_name": owner.owner_name if (owner and is_unlocked) else None,
+            "phone": owner_phone if is_unlocked else None,
+            "email": owner_email if is_unlocked else None,
         })
 
     return {
@@ -1527,11 +1555,14 @@ def sample_leads(
     zip_code: str,
     vertical: str = "roofing",
     county_id: str = "hillsborough",
+    feed_uuid: Optional[str] = Query(default=None),
     db: Session = Depends(get_db),
 ):
     """
-    Returns up to 3 real top-scored properties from a ZIP, with phone blurred.
-    Used by the landing page to show sample leads after ZIP check.
+    Returns up to 3 real top-scored properties from a ZIP. Phone blurred for
+    anonymous visitors; when feed_uuid is supplied and the subscriber has a
+    SentLead row for a property (e.g. via the $4 unlock), that lead's contact
+    is unblurred and unlocked=true is returned.
     """
     if not _ZIP_RE.match(zip_code):
         raise HTTPException(
@@ -1552,26 +1583,58 @@ def sample_leads(
             detail={"error": "invalid_vertical", "message": f"vertical must be one of: {sorted(VALID_VERTICALS)}"},
         )
 
+    # Resolve the viewing subscriber (if any) so we can mark unlocked leads
+    viewing_subscriber: Optional[Subscriber] = None
+    if feed_uuid:
+        try:
+            viewing_subscriber = db.execute(
+                select(Subscriber).where(Subscriber.event_feed_uuid == feed_uuid)
+            ).scalar_one_or_none()
+        except OperationalError:
+            logger.error("DB error resolving feed_uuid for sample leads", exc_info=True)
+            viewing_subscriber = None
+
+    from src.utils.lead_filters import has_contact_filter, phone_priority_order
+    contact_clause = has_contact_filter(get_settings())
+
+    filters = [
+        Property.zip == zip_code,
+        Property.county_id == county_id,
+        DistressScore.qualified == True,
+    ]
+    if contact_clause is not None:
+        filters.append(contact_clause)
+
     try:
         rows = db.execute(
-            select(Property, DistressScore)
+            select(Property, DistressScore, Owner)
             .join(DistressScore, DistressScore.property_id == Property.id)
-            .where(
-                and_(
-                    Property.zip == zip_code,
-                    Property.county_id == county_id,
-                    DistressScore.qualified == True,
-                )
-            )
-            .order_by(desc(score_col))
+            .outerjoin(Owner, Owner.property_id == Property.id)
+            .where(and_(*filters))
+            .order_by(*phone_priority_order(score_col))
             .limit(3)
         ).all()
     except OperationalError:
         logger.error("DB error fetching sample leads", exc_info=True)
         raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
 
+    # Resolve unlocked property IDs for this subscriber
+    unlocked_ids: set[int] = set()
+    if viewing_subscriber and rows:
+        property_ids = [prop.id for prop, _, _ in rows]
+        try:
+            unlocked_rows = db.execute(
+                select(SentLead.property_id).where(
+                    SentLead.subscriber_id == viewing_subscriber.id,
+                    SentLead.property_id.in_(property_ids),
+                )
+            ).scalars().all()
+            unlocked_ids = set(unlocked_rows)
+        except OperationalError:
+            logger.error("DB error fetching unlocks for sample leads", exc_info=True)
+
     leads = []
-    for prop, score in rows:
+    for prop, score, owner in rows:
         try:
             inc = db.execute(
                 select(Incident)
@@ -1582,7 +1645,12 @@ def sample_leads(
         except OperationalError:
             inc = None  # non-fatal — degrade gracefully
 
+        is_unlocked = prop.id in unlocked_ids
+        owner_phone = (owner.phone_1 or owner.phone_2 or owner.phone_3) if owner else None
+        owner_email = (owner.email_1 or owner.email_2) if owner else None
+
         leads.append({
+            "property_id": prop.id,
             "address": prop.address,
             "city": prop.city,
             "zip": prop.zip,
@@ -1594,7 +1662,10 @@ def sample_leads(
             "distress_types": score.distress_types,
             "latest_incident": inc.incident_type if inc else None,
             "latest_incident_date": inc.incident_date.isoformat() if inc and inc.incident_date else None,
-            "phone": "•••-•••-••••",  # blurred
+            "unlocked": is_unlocked,
+            "owner_name": owner.owner_name if (owner and is_unlocked) else None,
+            "phone": owner_phone if is_unlocked else "•••-•••-••••",
+            "email": owner_email if is_unlocked else None,
         })
 
     return {"zip_code": zip_code, "vertical": vertical, "leads": leads}
@@ -1879,12 +1950,17 @@ class SynthflowWebhookPayload(BaseModel):
     Flexible model — Synthflow and Finetuner.ai use slightly different field
     names. All outcome-critical fields are optional with sensible defaults so
     the handler degrades gracefully if a field is missing.
+
+    Finetuner.ai wraps agent-captured variables (outcome, zip_code, etc.)
+    inside a nested "variables" object rather than at the top level. The
+    _vars property merges both so callers always get the resolved value.
     """
     # Call identity
     call_id: Optional[str] = None
 
     # Prospect phone — various field names across providers
     to: Optional[str] = None
+    to_number: Optional[str] = None        # some integrations use to_number
     prospect_phone: Optional[str] = None
     phone_number: Optional[str] = None
     phone: Optional[str] = None
@@ -1894,10 +1970,11 @@ class SynthflowWebhookPayload(BaseModel):
     # Outcome — agent sets this via a variable during the call
     outcome: Optional[str] = None          # sample_requested | demo_requested | not_interested | voicemail | no_answer | completed
     call_status: Optional[str] = None      # Synthflow native: completed | no_answer | voicemail | failed
+    status: Optional[str] = None           # Finetuner.ai uses "status" instead of "call_status"
 
-    # Variables captured by the agent during the call
+    # Variables captured by the agent during the call (top-level, plain Synthflow)
     zip_code: Optional[str] = None
-    vertical: Optional[str] = "roofing"
+    vertical: Optional[str] = None
     prospect_name: Optional[str] = None
     notes: Optional[str] = None
 
@@ -1905,22 +1982,40 @@ class SynthflowWebhookPayload(BaseModel):
     duration: Optional[int] = None
     recording_url: Optional[str] = None
 
+    # Finetuner.ai nests agent-set variables here
+    variables: Optional[dict] = None
+    call_variables: Optional[dict] = None  # alternate key used by some integrations
+
+    @property
+    def _vars(self) -> dict:
+        """Merged view of all nested variable containers."""
+        return {**(self.call_variables or {}), **(self.variables or {})}
+
     @property
     def resolved_phone(self) -> Optional[str]:
-        return self.prospect_phone or self.phone_number or self.to or self.phone or self.caller_phone or self.contact_phone
+        v = self._vars
+        return (
+            self.prospect_phone or self.phone_number
+            or self.to or self.to_number
+            or self.phone or self.caller_phone or self.contact_phone
+            or v.get("prospect_phone") or v.get("phone_number")
+            or v.get("to") or v.get("phone")
+        )
 
     @property
     def resolved_outcome(self) -> str:
-        """Map Synthflow native call_status to our outcome taxonomy if needed."""
-        if self.outcome:
-            return self.outcome
+        """Map Synthflow/Finetuner.ai call status to our outcome taxonomy."""
+        outcome = self.outcome or self._vars.get("outcome")
+        if outcome:
+            return outcome
         status_map = {
             "no_answer": "no_answer",
             "voicemail": "voicemail",
             "failed":    "no_answer",
             "completed": "completed",
         }
-        return status_map.get(self.call_status or "", "completed")
+        cs = self.call_status or self.status or self._vars.get("call_status") or self._vars.get("status") or ""
+        return status_map.get(cs, "completed")
 
 
 @app.get("/webhooks/synthflow/sample-leads-text")
@@ -1942,7 +2037,7 @@ def synthflow_sample_leads_text(
 
 
 @app.post("/webhooks/synthflow", status_code=200)
-async def synthflow_webhook(payload: SynthflowWebhookPayload):
+async def synthflow_webhook(request: Request):
     """
     Receives post-call events from Synthflow / Finetuner.ai.
 
@@ -1957,20 +2052,43 @@ async def synthflow_webhook(payload: SynthflowWebhookPayload):
     Configure in Synthflow/Finetuner as the post-call webhook URL:
         https://your-domain.com/webhooks/synthflow
     """
+    # Log raw body + headers so we can see exactly what Finetuner.ai is sending.
+    # Critical for debugging field-name mismatches (no phone resolved, missing zip, etc.)
+    raw_body = await request.body()
+    try:
+        raw_json = json.loads(raw_body.decode("utf-8") or "{}")
+    except Exception:
+        raw_json = {"_unparseable": raw_body.decode("utf-8", errors="replace")[:500]}
+    logger.info(
+        "[Synthflow webhook] RAW headers=%s body=%s",
+        {k: v for k, v in request.headers.items() if k.lower() in {"content-type", "user-agent", "x-finetuner-signature", "x-synthflow-signature"}},
+        json.dumps(raw_json, default=str)[:2000],
+    )
+
+    try:
+        payload = SynthflowWebhookPayload(**raw_json)
+    except Exception as exc:
+        logger.error("[Synthflow webhook] payload validation failed: %s — keys=%s", exc, list(raw_json.keys()))
+        return {"status": "error", "reason": "invalid_payload"}
+
     phone = payload.resolved_phone
     if not phone:
-        logger.warning("[Synthflow webhook] received payload with no phone number")
+        logger.warning(
+            "[Synthflow webhook] no phone resolved — top_level_keys=%s var_keys=%s",
+            list(raw_json.keys()), list(payload._vars.keys()),
+        )
         return {"status": "ignored", "reason": "no phone"}
 
+    v = payload._vars
     from src.services.synthflow_service import process_call_outcome
     try:
         result = process_call_outcome(
             prospect_phone=phone,
             outcome=payload.resolved_outcome,
-            vertical=payload.vertical or "roofing",
-            zip_code=payload.zip_code or "",
-            prospect_name=payload.prospect_name or "",
-            notes=payload.notes or "",
+            vertical=payload.vertical or v.get("vertical") or "roofing",
+            zip_code=payload.zip_code or v.get("zip_code") or "",
+            prospect_name=payload.prospect_name or v.get("prospect_name") or "",
+            notes=payload.notes or v.get("notes") or "",
         )
     except Exception:
         logger.error("[Synthflow webhook] processing error for %s", phone, exc_info=True)
@@ -2213,6 +2331,7 @@ def zip_activity(zip_code: str, vertical: Optional[str] = None):
 def proof_leads(
     vertical: str = "roofing",
     county_id: str = "hillsborough",
+    feed_uuid: Optional[str] = Query(default=None),
     db: Session = Depends(get_db),
 ):
     """
@@ -2222,7 +2341,7 @@ def proof_leads(
     from src.services.proof_moment import get_proof_leads
     if vertical not in VALID_VERTICALS:
         raise HTTPException(status_code=400, detail=f"Invalid vertical. Must be one of: {sorted(VALID_VERTICALS)}")
-    return get_proof_leads(vertical=vertical, county_id=county_id, db=db)
+    return get_proof_leads(vertical=vertical, county_id=county_id, db=db, feed_uuid=feed_uuid)
 
 
 # ── Phase 2B: Free signup — POST /api/free-signup ────────────────────────────

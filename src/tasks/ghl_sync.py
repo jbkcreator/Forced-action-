@@ -108,7 +108,11 @@ def run_ghl_sync(
             pending_count, failed_count,
         )
 
-        properties = (
+        from config.settings import get_settings as _gs
+        from src.utils.lead_filters import has_contact_filter
+        contact_clause = has_contact_filter(_gs())
+
+        prop_q = (
             session.query(Property)
             .options(
                 joinedload(Property.owner),
@@ -125,9 +129,13 @@ def run_ghl_sync(
                 Property.sync_status == "pending_sync",
                 Property.county_id == county_id,
             )
-            .limit(limit)
-            .all()
         )
+        if contact_clause is not None:
+            # has_contact_filter returns a clause referencing Owner columns; wrap in
+            # Property.owner.has(...) so it traverses the relationship in production mode
+            prop_q = prop_q.filter(Property.owner.has(contact_clause))
+
+        properties = prop_q.limit(limit).all()
 
         stats["total"] = len(properties)
         logger.info("[GHL Sync] Processing %d pending_sync properties", stats["total"])

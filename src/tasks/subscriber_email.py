@@ -182,16 +182,20 @@ def query_top_leads(
             )
         )
 
-    # Production only: exclude leads with no owner phone number
-    if not _settings.debug:
-        filters.append(Owner.phone.isnot(None))
+    # Production only: exclude leads with no owner phone or email.
+    # Always sort phone-bearing leads to the top — debug mode keeps contactless
+    # leads visible (sorted last) for testing.
+    from src.utils.lead_filters import has_contact_filter, phone_priority_order
+    contact_clause = has_contact_filter(_settings)
+    if contact_clause is not None:
+        filters.append(contact_clause)
 
     rows = db.execute(
         select(Property, DistressScore, Owner)
         .join(DistressScore, DistressScore.property_id == Property.id)
         .outerjoin(Owner, Owner.property_id == Property.id)
         .where(and_(*filters))
-        .order_by(desc(score_col))
+        .order_by(*phone_priority_order(score_col))
         .limit(limit)
     ).all()
 

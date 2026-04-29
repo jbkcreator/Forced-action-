@@ -20,7 +20,7 @@ from typing import Optional
 import stripe
 from sqlalchemy import select, and_, desc, func
 from sqlalchemy.dialects.postgresql import array
-from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from config.settings import settings
@@ -1294,8 +1294,11 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
                 subscriber_id=subscriber.id,
                 property_id=property_id,
                 source="lead_unlock_payment",
+                stripe_payment_intent_id=payment_intent.get("id"),
             ))
-    except Exception as exc:
+        elif existing_sent and not existing_sent.stripe_payment_intent_id:
+            existing_sent.stripe_payment_intent_id = payment_intent.get("id")
+    except (IntegrityError, OperationalError) as exc:
         logger.warning("lead_unlock: SentLead insert failed: %s", exc)
 
     # Send the email with full lead details
@@ -1529,6 +1532,8 @@ def _on_lead_pack_payment(payment_intent: dict, db: Session) -> None:
         purchase.status = "expired"
         return
 
+    from src.core.models import Owner
+    from src.utils.lead_filters import has_contact_filter, phone_priority_order
     lead_filter = [
         Property.zip == zip_code,
         Property.county_id == county_id,
@@ -1536,12 +1541,16 @@ def _on_lead_pack_payment(payment_intent: dict, db: Session) -> None:
     ]
     if active_exclusive_ids:
         lead_filter.append(~Property.id.in_(active_exclusive_ids))
+    contact_clause = has_contact_filter(settings)
+    if contact_clause is not None:
+        lead_filter.append(contact_clause)
 
     top_leads = db.execute(
         select(Property, DistressScore)
         .join(DistressScore, DistressScore.property_id == Property.id)
+        .outerjoin(Owner, Owner.property_id == Property.id)
         .where(and_(*lead_filter))
-        .order_by(desc(score_col))
+        .order_by(*phone_priority_order(score_col))
         .limit(5)
     ).all()
 

@@ -820,10 +820,18 @@ class SentLead(Base):
     sent_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
     )
+    source: Mapped[Optional[str]] = mapped_column(String(40), default="daily_email")
+
+    # Refund tracking (populated for lead_unlock_payment rows only)
+    stripe_payment_intent_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
+    refunded_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    refund_reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    stripe_refund_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
 
     __table_args__ = (
         UniqueConstraint("subscriber_id", "property_id", name="uq_sent_lead"),
         Index("idx_sent_lead_subscriber_sent_at", "subscriber_id", "sent_at"),
+        Index("idx_sent_leads_source", "source"),
     )
 
     def __repr__(self):
