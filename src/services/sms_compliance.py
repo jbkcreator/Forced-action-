@@ -20,6 +20,7 @@ In 2B-2 this will be fronted by a Redis SET for sub-millisecond pre-send checks.
 import logging
 from datetime import datetime, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -42,6 +43,34 @@ _OPT_OUT_REPLY = (
     "You have been unsubscribed and will receive no further messages from Forced Action. "
     "Reply START to re-subscribe."
 )
+
+
+# TCPA quiet hours: 8am–9pm recipient local time
+_QUIET_START = 21   # 9pm (exclusive upper bound)
+_QUIET_END   = 8    # 8am (inclusive lower bound)
+
+# Area code → IANA timezone. All current FL area codes are Eastern.
+# Extend this dict when the platform expands to other states.
+_AREA_CODE_TZ: dict[str, str] = {
+    ac: "America/New_York" for ac in [
+        "239", "305", "321", "352", "386", "407", "561", "727",
+        "754", "772", "786", "813", "850", "863", "904", "941", "954",
+    ]
+}
+
+
+def _recipient_tz(phone: str) -> ZoneInfo:
+    digits = "".join(c for c in (phone or "") if c.isdigit())
+    if digits.startswith("1"):
+        digits = digits[1:]
+    tz_name = _AREA_CODE_TZ.get(digits[:3], "America/New_York")
+    return ZoneInfo(tz_name)
+
+
+def is_quiet_hours(phone: str) -> bool:
+    """Return True if current local time for this number is outside 8am–9pm (TCPA)."""
+    hour = datetime.now(_recipient_tz(phone)).hour
+    return hour < _QUIET_END or hour >= _QUIET_START
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -164,6 +193,18 @@ def send_sms(
             db=db, to=to, body=body, subscriber_id=subscriber_id,
             campaign=campaign_label, variant_id=variant_id, decision_id=decision_id,
             compliance_allowed=False, compliance_reason="opt_out",
+            would_have_delivered=False,
+        )
+        return False
+
+    # 1b. TCPA quiet hours — no SMS before 8am or after 9pm recipient local time
+    if is_quiet_hours(to):
+        logger.info("SMS suppressed (quiet hours): to=%s", to)
+        add_to_dead_letter(to, "quiet_hours", {"body": body[:160]}, db)
+        _capture_sandbox_attempt(
+            db=db, to=to, body=body, subscriber_id=subscriber_id,
+            campaign=campaign_label, variant_id=variant_id, decision_id=decision_id,
+            compliance_allowed=False, compliance_reason="quiet_hours",
             would_have_delivered=False,
         )
         return False
