@@ -2577,6 +2577,25 @@ def create_payment_intent_endpoint(
     if sub is None:
         raise HTTPException(status_code=403, detail="Invalid feed_uuid")
 
+    # Acquire a 20-min lead hold for lead_unlock purchases to prevent double-selling
+    if req.metadata and req.metadata.get("product") == "lead_unlock":
+        try:
+            property_id = int(req.metadata["property_id"])
+            from src.services.lead_hold import hold as acquire_hold
+            hold_result = acquire_hold(property_id, sub.id)
+            if not hold_result.get("held"):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "lead_held",
+                        "message": "This lead is currently being purchased by another subscriber. Try again in a few minutes.",
+                    },
+                )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.warning("[PaymentIntent] lead hold check failed (non-blocking): %s", exc)
+
     try:
         result = create_payment_intent(
             subscriber_id=sub.id,
