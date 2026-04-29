@@ -20,7 +20,7 @@ from typing import Optional
 import stripe
 from sqlalchemy import select, and_, desc, func
 from sqlalchemy.dialects.postgresql import array
-from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from config.settings import settings
@@ -111,7 +111,7 @@ def handle_webhook(raw_body: bytes, sig_header: str, db: Session) -> tuple[bool,
         "invoice.payment_failed":        _on_payment_failed,
         "customer.subscription.updated": _on_subscription_updated,
         "customer.subscription.deleted": _on_subscription_deleted,
-        "payment_intent.succeeded":      _on_lead_pack_payment,
+        "payment_intent.succeeded":      _on_payment_intent_succeeded,
     }
 
     handler = handlers.get(event_type)
@@ -1199,7 +1199,262 @@ def _on_subscription_deleted(subscription: dict, db: Session) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 6. payment_intent.succeeded — lead pack purchases
+# 6. payment_intent.succeeded — router (lead pack + default card save + bundles)
+# ---------------------------------------------------------------------------
+
+def _on_payment_intent_succeeded(payment_intent: dict, db: Session) -> None:
+    """Route payment_intent.succeeded to the appropriate sub-handler."""
+    meta = payment_intent.get("metadata", {})
+    product = meta.get("product") or meta.get("kind")   # tolerate both keys
+
+    if product == "lead_pack":
+        _on_lead_pack_payment(payment_intent, db)
+        return
+
+    if product == "bundle":
+        _on_bundle_payment(payment_intent, db)
+        return
+
+    if product == "lead_unlock":
+        _on_lead_unlock_payment(payment_intent, db)
+        # Fall through to card-save so the unlock also triggers the saved-card flow
+    # Default: check for card save (setup_future_usage=off_session)
+    _on_card_saved(payment_intent, db)
+
+
+def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
+    """
+    Handle a single-lead $2.50–$7 unlock purchase.
+
+    Looks up the subscriber by Stripe customer id, looks up the property by
+    metadata.property_id, and emails the full lead details (address, owner
+    name, enriched contact if available). Logs a SentLead row so the
+    unlock is auditable from the subscriber's dashboard.
+    """
+    from src.core.models import Property, Owner, DistressScore, EnrichedContact, Subscriber, SentLead
+
+    meta = payment_intent.get("metadata", {}) or {}
+    property_id_raw = meta.get("property_id")
+    customer_id = payment_intent.get("customer")
+
+    if not property_id_raw or not customer_id:
+        logger.warning(
+            "lead_unlock payment missing property_id or customer: pi=%s",
+            payment_intent.get("id"),
+        )
+        return
+
+    try:
+        property_id = int(property_id_raw)
+    except (TypeError, ValueError):
+        logger.warning("lead_unlock payment non-int property_id=%r", property_id_raw)
+        return
+
+    subscriber = db.execute(
+        select(Subscriber).where(Subscriber.stripe_customer_id == customer_id)
+    ).scalar_one_or_none()
+    if not subscriber:
+        logger.warning("lead_unlock: no subscriber for customer=%s", customer_id)
+        return
+
+    prop = db.get(Property, property_id)
+    if not prop:
+        logger.warning("lead_unlock: property %s not found", property_id)
+        return
+
+    # Latest score for this property
+    score = db.execute(
+        select(DistressScore)
+        .where(DistressScore.property_id == property_id)
+        .order_by(DistressScore.score_date.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+    owner = db.execute(
+        select(Owner).where(Owner.property_id == property_id).limit(1)
+    ).scalar_one_or_none()
+
+    enriched = db.execute(
+        select(EnrichedContact).where(
+            EnrichedContact.property_id == property_id,
+            EnrichedContact.match_success == True,  # noqa: E712
+        ).limit(1)
+    ).scalar_one_or_none()
+
+    # Audit row — SentLead marks this lead as delivered to this subscriber
+    try:
+        existing_sent = db.execute(
+            select(SentLead).where(
+                SentLead.subscriber_id == subscriber.id,
+                SentLead.property_id == property_id,
+            )
+        ).scalar_one_or_none()
+        if not existing_sent:
+            db.add(SentLead(
+                subscriber_id=subscriber.id,
+                property_id=property_id,
+                source="lead_unlock_payment",
+                stripe_payment_intent_id=payment_intent.get("id"),
+            ))
+        elif existing_sent and not existing_sent.stripe_payment_intent_id:
+            existing_sent.stripe_payment_intent_id = payment_intent.get("id")
+    except (IntegrityError, OperationalError) as exc:
+        logger.warning("lead_unlock: SentLead insert failed: %s", exc)
+
+    # Send the email with full lead details
+    try:
+        _send_lead_unlock_email(subscriber, prop, score, owner, enriched)
+    except Exception as exc:
+        logger.error("lead_unlock: email send failed: %s", exc, exc_info=True)
+
+    logger.info(
+        "lead_unlock complete: subscriber=%s property=%s pi=%s",
+        subscriber.id, property_id, payment_intent.get("id"),
+    )
+
+
+def _send_lead_unlock_email(subscriber, prop, score, owner, enriched) -> None:
+    """Send a single-lead confirmation + details email after $4 unlock."""
+    from src.services.email import send_email
+    from config.settings import get_settings
+
+    _settings = get_settings()
+    if not subscriber.email:
+        logger.info("lead_unlock: subscriber %s has no email — skipping send", subscriber.id)
+        return
+
+    tier = (score.lead_tier if score else None) or "Scored"
+    vertical = subscriber.vertical or "roofing"
+    v_score = None
+    if score and score.vertical_scores:
+        v_score = score.vertical_scores.get(vertical)
+    score_str = f"{v_score:.1f}" if v_score is not None else (
+        f"{float(score.final_cds_score):.1f}" if score and score.final_cds_score else "N/A"
+    )
+    distress = ", ".join(score.distress_types or []) if score and score.distress_types else "—"
+    owner_name = (owner.owner_name if owner and owner.owner_name else "Not on public record")
+    phone = (enriched.mobile_phone if enriched and enriched.mobile_phone else "—")
+    email_addr = (enriched.email if enriched and enriched.email else "—")
+
+    dashboard_url = (
+        f"{_settings.app_base_url}/dashboard/{subscriber.event_feed_uuid}"
+        if _settings.app_base_url and subscriber.event_feed_uuid else ""
+    )
+
+    subject = f"Your unlocked lead: {prop.address or 'Property #' + str(prop.id)}"
+
+    text_body = (
+        f"You unlocked a Forced Action lead.\n\n"
+        f"Address:      {prop.address or '—'}\n"
+        f"City/State:   {(prop.city or '—')}, {(prop.state or 'FL')} {prop.zip or ''}\n"
+        f"Owner:        {owner_name}\n"
+        f"Tier:         {tier}   (Score: {score_str})\n"
+        f"Distress:     {distress}\n"
+        f"Phone:        {phone}\n"
+        f"Email:        {email_addr}\n\n"
+        f"Dashboard: {dashboard_url}\n\n"
+        "Card saved — next unlock is one tap.\n"
+    )
+
+    html_body = f"""<!DOCTYPE html>
+<html><body style="margin:0;padding:0;background:#0f172a;font-family:Inter,Arial,sans-serif;color:#e2e8f0;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f172a;padding:40px 0;">
+    <tr><td align="center">
+      <table width="560" cellpadding="0" cellspacing="0" style="background:#111827;border:1px solid rgba(255,255,255,0.08);border-radius:14px;padding:28px;">
+        <tr><td>
+          <h2 style="margin:0 0 4px;color:#fbbf24;font-size:22px;">Lead unlocked</h2>
+          <p style="margin:0 0 18px;color:#94a3b8;font-size:13px;">Card saved — next unlock is one tap.</p>
+          <table width="100%" cellpadding="0" cellspacing="0"
+                 style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);
+                        border-left:4px solid #fbbf24;border-radius:10px;padding:18px 20px;">
+            <tr><td>
+              <p style="margin:0 0 6px;font-size:16px;font-weight:700;color:#ffffff;">{prop.address or '—'}</p>
+              <p style="margin:0 0 10px;font-size:13px;color:#94a3b8;">{(prop.city or '—')}, {(prop.state or 'FL')} {prop.zip or ''}</p>
+              <p style="margin:0 0 4px;font-size:13px;color:#e2e8f0;"><b>Owner:</b> {owner_name}</p>
+              <p style="margin:0 0 4px;font-size:13px;color:#e2e8f0;"><b>Tier:</b> <span style="color:#fbbf24;">{tier}</span>  &middot; <b>Score:</b> {score_str}</p>
+              <p style="margin:0 0 4px;font-size:13px;color:#e2e8f0;"><b>Distress:</b> {distress}</p>
+              <p style="margin:0 0 4px;font-size:13px;color:#e2e8f0;"><b>Phone:</b> {phone}</p>
+              <p style="margin:0;font-size:13px;color:#e2e8f0;"><b>Email:</b> {email_addr}</p>
+            </td></tr>
+          </table>
+          {('<p style="margin:24px 0 0;text-align:center;"><a href="' + dashboard_url + '" style="background:#fbbf24;color:#0f172a;padding:12px 22px;border-radius:8px;text-decoration:none;font-weight:700;">Open your dashboard</a></p>') if dashboard_url else ''}
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body></html>"""
+
+    send_email(
+        to=subscriber.email,
+        subject=subject,
+        body_text=text_body,
+        body_html=html_body,
+    )
+    logger.info("lead_unlock email sent → %s (property=%s)", subscriber.email, prop.id)
+
+
+def _on_card_saved(payment_intent: dict, db: Session) -> None:
+    customer_id = payment_intent.get("customer")
+    pm_id = payment_intent.get("payment_method")
+    setup_future = payment_intent.get("setup_future_usage")
+    if not all([customer_id, pm_id, setup_future == "off_session"]):
+        return
+
+    subscriber = db.execute(
+        select(Subscriber).where(Subscriber.stripe_customer_id == customer_id)
+    ).scalar_one_or_none()
+    if not subscriber or subscriber.has_saved_card:
+        return
+
+    subscriber.has_saved_card = True
+    subscriber.stripe_payment_method_id = pm_id
+
+    from src.core.redis_client import rset
+    rset(f"saved_card_window:{subscriber.id}", "1", ttl_seconds=600)
+
+    logger.info("Default card saved for subscriber=%s pm=%s", subscriber.id, pm_id)
+
+
+def _on_bundle_payment(payment_intent: dict, db: Session) -> None:
+    from src.core.models import BundlePurchase
+    meta = payment_intent.get("metadata", {})
+    pi_id = payment_intent.get("id")
+    bundle_type = meta.get("bundle_type")
+    subscriber_id_str = meta.get("subscriber_id")
+    zip_code = meta.get("zip_code")
+    vertical = meta.get("vertical")
+
+    if not all([pi_id, bundle_type, subscriber_id_str]):
+        logger.error("[Bundle] payment_intent.succeeded missing metadata: %s", meta)
+        return
+
+    # Idempotency
+    existing = db.execute(
+        select(BundlePurchase).where(BundlePurchase.stripe_payment_intent_id == pi_id)
+    ).scalar_one_or_none()
+    if existing:
+        logger.info("[Bundle] Already processed PI %s — skipping", pi_id)
+        return
+
+    subscriber_id = int(subscriber_id_str)
+    purchase = BundlePurchase(
+        subscriber_id=subscriber_id,
+        bundle_type=bundle_type,
+        stripe_payment_intent_id=pi_id,
+        status="pending",
+        zip_code=zip_code,
+        vertical=vertical,
+    )
+    db.add(purchase)
+    db.flush()
+
+    from src.services.bundle_engine import deliver
+    deliver(purchase.id, db)
+    logger.info("[Bundle] Delivered purchase=%d type=%s subscriber=%d", purchase.id, bundle_type, subscriber_id)
+
+
+# ---------------------------------------------------------------------------
+# 6b. payment_intent.succeeded — lead pack purchases (kept for internal use)
 # ---------------------------------------------------------------------------
 
 def _on_lead_pack_payment(payment_intent: dict, db: Session) -> None:
@@ -1277,6 +1532,8 @@ def _on_lead_pack_payment(payment_intent: dict, db: Session) -> None:
         purchase.status = "expired"
         return
 
+    from src.core.models import Owner
+    from src.utils.lead_filters import has_contact_filter, phone_priority_order
     lead_filter = [
         Property.zip == zip_code,
         Property.county_id == county_id,
@@ -1284,12 +1541,16 @@ def _on_lead_pack_payment(payment_intent: dict, db: Session) -> None:
     ]
     if active_exclusive_ids:
         lead_filter.append(~Property.id.in_(active_exclusive_ids))
+    contact_clause = has_contact_filter(settings)
+    if contact_clause is not None:
+        lead_filter.append(contact_clause)
 
     top_leads = db.execute(
         select(Property, DistressScore)
         .join(DistressScore, DistressScore.property_id == Property.id)
+        .outerjoin(Owner, Owner.property_id == Property.id)
         .where(and_(*lead_filter))
-        .order_by(desc(score_col))
+        .order_by(*phone_priority_order(score_col))
         .limit(5)
     ).all()
 

@@ -1,0 +1,4 @@
+version: 1
+body: |
+  {first_name}, your preview leads are still available — tap to unlock before
+  the window closes. [link]

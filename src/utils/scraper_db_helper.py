@@ -281,7 +281,7 @@ def load_scraped_data_to_db(
                 lien_counts = getattr(loader, 'stats_by_doc_type', {})
                 if lien_counts:
                     total_lien_matched = sum(c.get('matched', 0) for c in lien_counts.values())
-                for doc_type_label, counts in lien_counts.items():
+                    for doc_type_label, counts in lien_counts.items():
                         src = LIEN_DOCTYPE_TO_SOURCE.get(doc_type_label, 'lien_ml')
                         # Distribute scored count proportionally across subtypes
                         subtype_matched = counts.get('matched', 0)
@@ -295,6 +295,22 @@ def load_scraped_data_to_db(
                             scored=subtype_scored,
                             duration_seconds=duration,
                         )
+                    # Write no_data rows for expected subtypes absent from today's combined download
+                    # so load_validator always sees a row for every subtype (e.g. lien_tcl on days
+                    # with zero Tampa Code Liens in the county portal export).
+                    seen_sources = {LIEN_DOCTYPE_TO_SOURCE.get(lbl) for lbl in lien_counts}
+                    for src in LIEN_DOCTYPE_TO_SOURCE.values():
+                        if src not in seen_sources:
+                            record_scraper_stats(
+                                source_type=src,
+                                total_scraped=0,
+                                matched=0,
+                                unmatched=0,
+                                skipped=0,
+                                scored=0,
+                                error_type='no_data',
+                                duration_seconds=duration,
+                            )
                 else:
                     # Loader doesn't expose per-type breakdown; record aggregate under a generic key
                     record_scraper_stats(

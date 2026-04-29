@@ -736,6 +736,8 @@ class Subscriber(Base):
     referral_code: Mapped[Optional[str]] = mapped_column(String(20), unique=True, index=True)
     auto_mode_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
+    bundle_purchases = relationship("BundlePurchase", back_populates="subscriber")
+
     # Audit
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(
@@ -818,10 +820,18 @@ class SentLead(Base):
     sent_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
     )
+    source: Mapped[Optional[str]] = mapped_column(String(40), default="daily_email")
+
+    # Refund tracking (populated for lead_unlock_payment rows only)
+    stripe_payment_intent_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
+    refunded_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    refund_reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    stripe_refund_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
 
     __table_args__ = (
         UniqueConstraint("subscriber_id", "property_id", name="uq_sent_lead"),
         Index("idx_sent_lead_subscriber_sent_at", "subscriber_id", "sent_at"),
+        Index("idx_sent_leads_source", "source"),
     )
 
     def __repr__(self):
@@ -1553,3 +1563,157 @@ class ApiUsageLog(Base):
 
     def __repr__(self):
         return f"<ApiUsageLog(service={self.service}, model={self.model}, cost=${self.cost_usd})>"
+
+
+class BundlePurchase(Base):
+    """One-time bundle purchase (weekend/storm/zip_booster/monthly_reload)."""
+    __tablename__ = "bundle_purchases"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=False, index=True)
+    bundle_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    stripe_payment_intent_id: Mapped[str] = mapped_column(String(100), unique=True, index=True, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    zip_code: Mapped[Optional[str]] = mapped_column(String(10))
+    vertical: Mapped[Optional[str]] = mapped_column(String(50))
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False, default="hillsborough")
+    credits_awarded: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    lead_ids: Mapped[Optional[list]] = mapped_column(ARRAY(Integer))
+    purchased_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    subscriber = relationship("Subscriber", back_populates="bundle_purchases")
+
+    __table_args__ = (
+        CheckConstraint(
+            "bundle_type IN ('weekend', 'storm', 'zip_booster', 'monthly_reload')",
+            name="check_bundle_type",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'active', 'expired', 'cancelled')",
+            name="check_bundle_status",
+        ),
+        Index("idx_bundle_purchase_subscriber", "subscriber_id"),
+        Index("idx_bundle_type_status", "bundle_type", "status"),
+    )
+
+    def __repr__(self):
+        return f"<BundlePurchase(id={self.id}, type={self.bundle_type}, status={self.status})>"
+
+
+class SmsOptIn(Base):
+    """
+    TCPA double opt-in records. Tracks explicit consent via "Reply YES" flow.
+    Required before sending proactive outbound SMS to any number.
+    Pre-send gate: sms_compliance.has_opted_in() checks this table.
+    """
+    __tablename__ = "sms_opt_ins"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    phone: Mapped[str] = mapped_column(String(20), nullable=False, unique=True, index=True)
+    subscriber_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("subscribers.id"), nullable=True, index=True
+    )
+    keyword_used: Mapped[Optional[str]] = mapped_column(String(20))     # YES / START / JOIN
+    source: Mapped[str] = mapped_column(String(30), nullable=False, default="double_opt_in")
+    opt_in_message: Mapped[Optional[str]] = mapped_column(Text)         # consent prompt text (TCPA record)
+    opted_in_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    ip_address: Mapped[Optional[str]] = mapped_column(String(50))       # web opt-in source IP
+
+    __table_args__ = (
+        CheckConstraint(
+            "source IN ('double_opt_in', 'manual', 'import', 'widget')",
+            name="check_opt_in_source",
+        ),
+        Index("idx_sms_opt_in_subscriber", "subscriber_id"),
+    )
+
+    def __repr__(self):
+        return f"<SmsOptIn(phone={self.phone}, source={self.source}, at={self.opted_in_at})>"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Agents — Cora LangGraph Audit Log
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class AgentDecision(Base):
+    """
+    One row per Cora graph decision. Separate from message_outcomes (which is
+    outcome-focused). This is the "why did Cora do X for user Y" audit table —
+    the first stop for any operational question about autonomous behaviour.
+    """
+    __tablename__ = "agent_decisions"
+
+    decision_id: Mapped[str] = mapped_column(String(36), primary_key=True)   # UUID
+    graph_name: Mapped[str] = mapped_column(String(60), nullable=False, index=True)
+    subscriber_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("subscribers.id"), nullable=True, index=True
+    )
+    event_type: Mapped[Optional[str]] = mapped_column(String(60), index=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False, index=True
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    terminal_status: Mapped[Optional[str]] = mapped_column(String(20))   # completed | aborted | escalated | failed
+    tokens_used: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    cost_usd: Mapped[float] = mapped_column(Numeric(10, 6), default=0, nullable=False)
+    summary: Mapped[Optional[dict]] = mapped_column(JSONB)
+
+    __table_args__ = (
+        CheckConstraint(
+            "terminal_status IS NULL OR terminal_status IN ('completed', 'aborted', 'escalated', 'failed')",
+            name="check_agent_terminal_status",
+        ),
+        Index("idx_agent_decisions_graph_started", "graph_name", "started_at"),
+    )
+
+    def __repr__(self):
+        return f"<AgentDecision(id={self.decision_id[:8]}, graph={self.graph_name}, status={self.terminal_status})>"
+
+
+class SandboxOutbox(Base):
+    """
+    Capture table for would-be outbound messages during scenario tests.
+
+    When TWILIO_SANDBOX or SYNTHFLOW_SANDBOX is true, the outbound services
+    write one row here instead of (or alongside) the dry-run log. Developers
+    inspect these rows via /admin/sandbox/outbox to verify message bodies,
+    compliance outcomes, and graph-produced copy.
+
+    Production with TWILIO_ENABLED=true and TWILIO_SANDBOX=false leaves this
+    table empty.
+    """
+    __tablename__ = "sandbox_outbox"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    channel: Mapped[str] = mapped_column(String(20), nullable=False)        # sms | voice | email
+    to_number: Mapped[Optional[str]] = mapped_column(String(64))            # E.164 or email
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    campaign: Mapped[Optional[str]] = mapped_column(String(100), index=True)
+    variant_id: Mapped[Optional[str]] = mapped_column(String(100))
+    subscriber_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("subscribers.id"), nullable=True, index=True
+    )
+    decision_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+    compliance_allowed: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    compliance_reason: Mapped[Optional[str]] = mapped_column(String(60))
+    would_have_delivered: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    sandbox_flag: Mapped[str] = mapped_column(String(40), nullable=False, default="twilio_sandbox")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "channel IN ('sms', 'voice', 'email')",
+            name="check_sandbox_outbox_channel",
+        ),
+        Index("idx_sandbox_outbox_sub_created", "subscriber_id", "created_at"),
+        Index("idx_sandbox_outbox_campaign_created", "campaign", "created_at"),
+    )
+
+    def __repr__(self):
+        return f"<SandboxOutbox(id={self.id}, channel={self.channel}, to={self.to_number}, campaign={self.campaign})>"

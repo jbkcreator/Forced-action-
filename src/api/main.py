@@ -13,6 +13,7 @@ Endpoints:
     GET  /                         — Landing page
 """
 
+import json
 import logging
 import re
 import time
@@ -22,7 +23,7 @@ from typing import Optional
 
 import requests as _requests
 import stripe
-from fastapi import FastAPI, Header, HTTPException, Request, Depends, Query
+from fastapi import FastAPI, Header, HTTPException, Request, Depends, Query, Response
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
@@ -33,7 +34,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select, and_, or_, desc, func, cast, text, Date
 
 from src.core.database import get_db_context
-from src.core.models import FoundingSubscriberCount, ZipTerritory, Subscriber, Property, DistressScore, Incident, LeadPackPurchase, ScraperRunStats, EnrichedContact
+from src.core.models import FoundingSubscriberCount, ZipTerritory, Subscriber, Property, DistressScore, Incident, LeadPackPurchase, ScraperRunStats, EnrichedContact, Owner, SentLead
 from src.services.stripe_webhooks import handle_webhook
 from src.services.stripe_service import get_price_id_for_checkout
 from config.settings import get_settings
@@ -41,7 +42,6 @@ from config.scoring import VERTICAL_WEIGHTS
 
 logger = logging.getLogger(__name__)
 
-STATIC_DIR = Path(__file__).parent.parent / "static"
 REACT_DIST = Path(__file__).parent.parent.parent.parent / "Forced-action-ui" / "dist"
 
 VALID_TIERS = {"starter", "pro", "dominator"}
@@ -55,10 +55,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-
 from src.api.admin_router import router as admin_router  # noqa: E402
 app.include_router(admin_router)
+
+from src.api.sandbox_router import router as sandbox_router  # noqa: E402
+app.include_router(sandbox_router)
 
 # Mount React build assets (JS/CSS chunks) if the dist directory exists
 if REACT_DIST.is_dir() and (REACT_DIST / "assets").is_dir():
@@ -373,7 +374,7 @@ def health_check_detailed(db: Session = Depends(get_db)):
     }
 
     return JSONResponse(
-        status_code=200 if overall == "ok" else 503,
+        status_code=503 if overall == "critical" else 200,
         content={
             "status": overall,
             "checks": checks,
@@ -381,7 +382,7 @@ def health_check_detailed(db: Session = Depends(get_db)):
         },
     )
 
-
+\
 # ---------------------------------------------------------------------------
 # GET / — Landing page (React SPA or static HTML fallback)
 # ---------------------------------------------------------------------------
@@ -391,7 +392,7 @@ def landing_page():
     react_index = REACT_DIST / "index.html"
     if react_index.is_file():
         return FileResponse(str(react_index))
-    return FileResponse(str(STATIC_DIR / "index.html"))
+    raise HTTPException(status_code=503, detail="UI not built — run npm run build in Forced-action-ui/")
 
 
 # ---------------------------------------------------------------------------
@@ -637,7 +638,7 @@ def success_page():
     react_index = REACT_DIST / "index.html"
     if react_index.is_file():
         return FileResponse(str(react_index))
-    return FileResponse(str(STATIC_DIR / "success.html"))
+    raise HTTPException(status_code=503, detail="UI not built — run npm run build in Forced-action-ui/")
 
 
 # ---------------------------------------------------------------------------
@@ -649,7 +650,7 @@ def dashboard_page(feed_uuid: str):
     react_index = REACT_DIST / "index.html"
     if react_index.is_file():
         return FileResponse(str(react_index))
-    return FileResponse(str(STATIC_DIR / "dashboard.html"))
+    raise HTTPException(status_code=503, detail="UI not built — run npm run build in Forced-action-ui/")
 
 
 # ---------------------------------------------------------------------------
@@ -661,7 +662,7 @@ def email_previews_page():
     react_index = REACT_DIST / "index.html"
     if react_index.is_file():
         return FileResponse(str(react_index))
-    return FileResponse(str(STATIC_DIR / "email-previews.html"))
+    raise HTTPException(status_code=503, detail="UI not built — run npm run build in Forced-action-ui/")
 
 
 @app.get("/admin", include_in_schema=False)
@@ -1160,36 +1161,75 @@ def event_feed(
             Property.zip.ilike(term),
         ))
 
+    # Production: require owner phone or email. Always sort phone-bearing
+    # leads first; the contact filter only narrows what's eligible.
+    from src.utils.lead_filters import has_contact_filter, phone_priority_order
+    contact_clause = has_contact_filter(get_settings())
+    if contact_clause is not None:
+        filters.append(contact_clause)
+
     # Sort order
     _sort = sort if sort in _VALID_SORTS else "score_desc"
     if _sort == "newest":
-        order_col = desc(DistressScore.score_date)
+        order_cols = [desc(DistressScore.score_date)]
     elif _sort == "value_desc":
-        order_col = desc(DistressScore.final_cds_score)  # CDS as value proxy until job estimator is query-able
+        order_cols = [desc(DistressScore.final_cds_score)]
     else:
-        order_col = desc(score_col)
+        order_cols = phone_priority_order(score_col)
 
-    base_query = (
-        select(Property, DistressScore)
-        .join(DistressScore, DistressScore.property_id == Property.id)
-        .where(and_(*filters))
-        .order_by(order_col)
+    # Dedupe to latest DistressScore row per property. `distress_scores` is
+    # 1-to-many with `properties` (scoring runs accumulate history) so a
+    # naive join returns duplicates. We pick MAX(score_date) per property,
+    # then join back to the full row. Safety net: also dedupe in Python on
+    # the rare chance two rows share the same score_date.
+    latest_score_subq = (
+        select(
+            DistressScore.property_id.label("prop_id"),
+            func.max(DistressScore.score_date).label("max_date"),
+        )
+        .group_by(DistressScore.property_id)
+        .subquery()
     )
 
-    # 4. Total count
+    base_query = (
+        select(Property, DistressScore, Owner)
+        .join(DistressScore, DistressScore.property_id == Property.id)
+        .join(
+            latest_score_subq,
+            and_(
+                latest_score_subq.c.prop_id == DistressScore.property_id,
+                latest_score_subq.c.max_date == DistressScore.score_date,
+            ),
+        )
+        .outerjoin(Owner, Owner.property_id == Property.id)
+        .where(and_(*filters))
+        .order_by(*order_cols)
+    )
+
+    # 4. Total count — run over the deduped base_query so the pager is correct
     try:
         count_q = select(func.count()).select_from(base_query.subquery())
         total = db.execute(count_q).scalar()
 
-        # 5. Paginate
+        # 5. Paginate. Fetch slightly more than page_size so score_date ties
+        # don't leave us short after the Python-level dedupe.
         offset = (page - 1) * page_size
-        rows = db.execute(base_query.offset(offset).limit(page_size)).all()
+        raw_rows = db.execute(base_query.offset(offset).limit(page_size + 10)).all()
+        seen_ids = set()
+        rows = []
+        for prop, score, owner in raw_rows:
+            if prop.id in seen_ids:
+                continue
+            seen_ids.add(prop.id)
+            rows.append((prop, score, owner))
+            if len(rows) >= page_size:
+                break
     except OperationalError:
         logger.error("DB error fetching leads for feed", exc_info=True)
         raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
 
     # 6. Fetch incidents for returned properties in one query
-    property_ids = [prop.id for prop, _ in rows]
+    property_ids = [prop.id for prop, _, _ in rows]
 
     try:
         incidents_raw = db.execute(
@@ -1198,6 +1238,21 @@ def event_feed(
     except OperationalError:
         logger.error("DB error fetching incidents for feed", exc_info=True)
         raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
+
+    # Resolve which properties this subscriber has unlocked (paid or email-delivered)
+    unlocked_ids: set[int] = set()
+    if property_ids:
+        try:
+            unlocked_rows = db.execute(
+                select(SentLead.property_id).where(
+                    SentLead.subscriber_id == subscriber.id,
+                    SentLead.property_id.in_(property_ids),
+                )
+            ).scalars().all()
+            unlocked_ids = set(unlocked_rows)
+        except OperationalError:
+            logger.error("DB error fetching unlocks for feed", exc_info=True)
+            # Non-fatal — render leads as locked rather than 503
 
     incidents_by_prop: dict = {}
     for inc in incidents_raw:
@@ -1208,7 +1263,10 @@ def event_feed(
 
     # 7. Build response
     leads = []
-    for prop, score in rows:
+    for prop, score, owner in rows:
+        is_unlocked = prop.id in unlocked_ids
+        owner_phone = (owner.phone_1 or owner.phone_2 or owner.phone_3) if owner else None
+        owner_email = (owner.email_1 or owner.email_2) if owner else None
         leads.append({
             "property_id": prop.id,
             "parcel_id": prop.parcel_id,
@@ -1228,17 +1286,25 @@ def event_feed(
             "distress_types": score.distress_types,
             "est_job_value": _estimate_lead_job_value(prop, score),
             "incidents": incidents_by_prop.get(prop.id, []),
+            "unlocked": is_unlocked,
+            "owner_name": owner.owner_name if (owner and is_unlocked) else None,
+            "phone": owner_phone if is_unlocked else None,
+            "email": owner_email if is_unlocked else None,
         })
 
     return {
         "feed_uuid": feed_uuid,
         "subscriber": {
+            "id": subscriber.id,
             "tier": subscriber.tier,
             "vertical": subscriber.vertical,
             "county_id": subscriber.county_id,
             "locked_zips": list(locked_zips),
             "founding_member": subscriber.founding_member,
             "status": subscriber.status,
+            "has_saved_card": subscriber.has_saved_card,
+            "auto_mode_enabled": subscriber.auto_mode_enabled,
+            "created_at": subscriber.created_at.isoformat() if subscriber.created_at else None,
         },
         "total": total,
         "page": page,
@@ -1489,11 +1555,14 @@ def sample_leads(
     zip_code: str,
     vertical: str = "roofing",
     county_id: str = "hillsborough",
+    feed_uuid: Optional[str] = Query(default=None),
     db: Session = Depends(get_db),
 ):
     """
-    Returns up to 3 real top-scored properties from a ZIP, with phone blurred.
-    Used by the landing page to show sample leads after ZIP check.
+    Returns up to 3 real top-scored properties from a ZIP. Phone blurred for
+    anonymous visitors; when feed_uuid is supplied and the subscriber has a
+    SentLead row for a property (e.g. via the $4 unlock), that lead's contact
+    is unblurred and unlocked=true is returned.
     """
     if not _ZIP_RE.match(zip_code):
         raise HTTPException(
@@ -1514,26 +1583,58 @@ def sample_leads(
             detail={"error": "invalid_vertical", "message": f"vertical must be one of: {sorted(VALID_VERTICALS)}"},
         )
 
+    # Resolve the viewing subscriber (if any) so we can mark unlocked leads
+    viewing_subscriber: Optional[Subscriber] = None
+    if feed_uuid:
+        try:
+            viewing_subscriber = db.execute(
+                select(Subscriber).where(Subscriber.event_feed_uuid == feed_uuid)
+            ).scalar_one_or_none()
+        except OperationalError:
+            logger.error("DB error resolving feed_uuid for sample leads", exc_info=True)
+            viewing_subscriber = None
+
+    from src.utils.lead_filters import has_contact_filter, phone_priority_order
+    contact_clause = has_contact_filter(get_settings())
+
+    filters = [
+        Property.zip == zip_code,
+        Property.county_id == county_id,
+        DistressScore.qualified == True,
+    ]
+    if contact_clause is not None:
+        filters.append(contact_clause)
+
     try:
         rows = db.execute(
-            select(Property, DistressScore)
+            select(Property, DistressScore, Owner)
             .join(DistressScore, DistressScore.property_id == Property.id)
-            .where(
-                and_(
-                    Property.zip == zip_code,
-                    Property.county_id == county_id,
-                    DistressScore.qualified == True,
-                )
-            )
-            .order_by(desc(score_col))
+            .outerjoin(Owner, Owner.property_id == Property.id)
+            .where(and_(*filters))
+            .order_by(*phone_priority_order(score_col))
             .limit(3)
         ).all()
     except OperationalError:
         logger.error("DB error fetching sample leads", exc_info=True)
         raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
 
+    # Resolve unlocked property IDs for this subscriber
+    unlocked_ids: set[int] = set()
+    if viewing_subscriber and rows:
+        property_ids = [prop.id for prop, _, _ in rows]
+        try:
+            unlocked_rows = db.execute(
+                select(SentLead.property_id).where(
+                    SentLead.subscriber_id == viewing_subscriber.id,
+                    SentLead.property_id.in_(property_ids),
+                )
+            ).scalars().all()
+            unlocked_ids = set(unlocked_rows)
+        except OperationalError:
+            logger.error("DB error fetching unlocks for sample leads", exc_info=True)
+
     leads = []
-    for prop, score in rows:
+    for prop, score, owner in rows:
         try:
             inc = db.execute(
                 select(Incident)
@@ -1544,7 +1645,12 @@ def sample_leads(
         except OperationalError:
             inc = None  # non-fatal — degrade gracefully
 
+        is_unlocked = prop.id in unlocked_ids
+        owner_phone = (owner.phone_1 or owner.phone_2 or owner.phone_3) if owner else None
+        owner_email = (owner.email_1 or owner.email_2) if owner else None
+
         leads.append({
+            "property_id": prop.id,
             "address": prop.address,
             "city": prop.city,
             "zip": prop.zip,
@@ -1556,7 +1662,10 @@ def sample_leads(
             "distress_types": score.distress_types,
             "latest_incident": inc.incident_type if inc else None,
             "latest_incident_date": inc.incident_date.isoformat() if inc and inc.incident_date else None,
-            "phone": "•••-•••-••••",  # blurred
+            "unlocked": is_unlocked,
+            "owner_name": owner.owner_name if (owner and is_unlocked) else None,
+            "phone": owner_phone if is_unlocked else "•••-•••-••••",
+            "email": owner_email if is_unlocked else None,
         })
 
     return {"zip_code": zip_code, "vertical": vertical, "leads": leads}
@@ -1841,12 +1950,17 @@ class SynthflowWebhookPayload(BaseModel):
     Flexible model — Synthflow and Finetuner.ai use slightly different field
     names. All outcome-critical fields are optional with sensible defaults so
     the handler degrades gracefully if a field is missing.
+
+    Finetuner.ai wraps agent-captured variables (outcome, zip_code, etc.)
+    inside a nested "variables" object rather than at the top level. The
+    _vars property merges both so callers always get the resolved value.
     """
     # Call identity
     call_id: Optional[str] = None
 
     # Prospect phone — various field names across providers
     to: Optional[str] = None
+    to_number: Optional[str] = None        # some integrations use to_number
     prospect_phone: Optional[str] = None
     phone_number: Optional[str] = None
     phone: Optional[str] = None
@@ -1856,10 +1970,11 @@ class SynthflowWebhookPayload(BaseModel):
     # Outcome — agent sets this via a variable during the call
     outcome: Optional[str] = None          # sample_requested | demo_requested | not_interested | voicemail | no_answer | completed
     call_status: Optional[str] = None      # Synthflow native: completed | no_answer | voicemail | failed
+    status: Optional[str] = None           # Finetuner.ai uses "status" instead of "call_status"
 
-    # Variables captured by the agent during the call
+    # Variables captured by the agent during the call (top-level, plain Synthflow)
     zip_code: Optional[str] = None
-    vertical: Optional[str] = "roofing"
+    vertical: Optional[str] = None
     prospect_name: Optional[str] = None
     notes: Optional[str] = None
 
@@ -1867,22 +1982,40 @@ class SynthflowWebhookPayload(BaseModel):
     duration: Optional[int] = None
     recording_url: Optional[str] = None
 
+    # Finetuner.ai nests agent-set variables here
+    variables: Optional[dict] = None
+    call_variables: Optional[dict] = None  # alternate key used by some integrations
+
+    @property
+    def _vars(self) -> dict:
+        """Merged view of all nested variable containers."""
+        return {**(self.call_variables or {}), **(self.variables or {})}
+
     @property
     def resolved_phone(self) -> Optional[str]:
-        return self.prospect_phone or self.phone_number or self.to or self.phone or self.caller_phone or self.contact_phone
+        v = self._vars
+        return (
+            self.prospect_phone or self.phone_number
+            or self.to or self.to_number
+            or self.phone or self.caller_phone or self.contact_phone
+            or v.get("prospect_phone") or v.get("phone_number")
+            or v.get("to") or v.get("phone")
+        )
 
     @property
     def resolved_outcome(self) -> str:
-        """Map Synthflow native call_status to our outcome taxonomy if needed."""
-        if self.outcome:
-            return self.outcome
+        """Map Synthflow/Finetuner.ai call status to our outcome taxonomy."""
+        outcome = self.outcome or self._vars.get("outcome")
+        if outcome:
+            return outcome
         status_map = {
             "no_answer": "no_answer",
             "voicemail": "voicemail",
             "failed":    "no_answer",
             "completed": "completed",
         }
-        return status_map.get(self.call_status or "", "completed")
+        cs = self.call_status or self.status or self._vars.get("call_status") or self._vars.get("status") or ""
+        return status_map.get(cs, "completed")
 
 
 @app.get("/webhooks/synthflow/sample-leads-text")
@@ -1904,7 +2037,7 @@ def synthflow_sample_leads_text(
 
 
 @app.post("/webhooks/synthflow", status_code=200)
-async def synthflow_webhook(payload: SynthflowWebhookPayload):
+async def synthflow_webhook(request: Request):
     """
     Receives post-call events from Synthflow / Finetuner.ai.
 
@@ -1919,20 +2052,43 @@ async def synthflow_webhook(payload: SynthflowWebhookPayload):
     Configure in Synthflow/Finetuner as the post-call webhook URL:
         https://your-domain.com/webhooks/synthflow
     """
+    # Log raw body + headers so we can see exactly what Finetuner.ai is sending.
+    # Critical for debugging field-name mismatches (no phone resolved, missing zip, etc.)
+    raw_body = await request.body()
+    try:
+        raw_json = json.loads(raw_body.decode("utf-8") or "{}")
+    except Exception:
+        raw_json = {"_unparseable": raw_body.decode("utf-8", errors="replace")[:500]}
+    logger.info(
+        "[Synthflow webhook] RAW headers=%s body=%s",
+        {k: v for k, v in request.headers.items() if k.lower() in {"content-type", "user-agent", "x-finetuner-signature", "x-synthflow-signature"}},
+        json.dumps(raw_json, default=str)[:2000],
+    )
+
+    try:
+        payload = SynthflowWebhookPayload(**raw_json)
+    except Exception as exc:
+        logger.error("[Synthflow webhook] payload validation failed: %s — keys=%s", exc, list(raw_json.keys()))
+        return {"status": "error", "reason": "invalid_payload"}
+
     phone = payload.resolved_phone
     if not phone:
-        logger.warning("[Synthflow webhook] received payload with no phone number")
+        logger.warning(
+            "[Synthflow webhook] no phone resolved — top_level_keys=%s var_keys=%s",
+            list(raw_json.keys()), list(payload._vars.keys()),
+        )
         return {"status": "ignored", "reason": "no phone"}
 
+    v = payload._vars
     from src.services.synthflow_service import process_call_outcome
     try:
         result = process_call_outcome(
             prospect_phone=phone,
             outcome=payload.resolved_outcome,
-            vertical=payload.vertical or "roofing",
-            zip_code=payload.zip_code or "",
-            prospect_name=payload.prospect_name or "",
-            notes=payload.notes or "",
+            vertical=payload.vertical or v.get("vertical") or "roofing",
+            zip_code=payload.zip_code or v.get("zip_code") or "",
+            prospect_name=payload.prospect_name or v.get("prospect_name") or "",
+            notes=payload.notes or v.get("notes") or "",
         )
     except Exception:
         logger.error("[Synthflow webhook] processing error for %s", phone, exc_info=True)
@@ -2013,3 +2169,324 @@ async def ghl_sample_leads_webhook(payload: GHLSampleLeadsPayload):
         result.get("sent"), result.get("lead_count"),
     )
     return {"status": "ok", **result}
+
+
+# ── Phase 2B: Twilio inbound SMS ──────────────────────────────────────────────
+
+def _twiml_ok() -> str:
+    return '<?xml version="1.0" encoding="UTF-8"?><Response></Response>'
+
+
+@app.post("/webhooks/twilio/inbound")
+async def twilio_inbound(request: Request, db: Session = Depends(get_db)):
+    """
+    Twilio inbound SMS webhook.
+    Routes STOP keywords to sms_compliance, then product commands to sms_commands.
+    """
+    from src.services.sms_compliance import handle_inbound, send_sms
+    from src.services import sms_commands
+    from fastapi.responses import Response
+
+    form = await request.form()
+    from_number = form.get("From", "")
+    body = form.get("Body", "")
+
+    # Validate Twilio signature
+    settings_obj = get_settings()
+    if settings_obj.twilio_auth_token:
+        try:
+            from twilio.request_validator import RequestValidator  # type: ignore
+            validator = RequestValidator(settings_obj.twilio_auth_token.get_secret_value())
+            url = str(request.url)
+            signature = request.headers.get("X-Twilio-Signature", "")
+            form_dict = dict(form)
+            if not validator.validate(url, form_dict, signature):
+                logger.warning("Invalid Twilio signature from %s", from_number)
+                raise HTTPException(status_code=403, detail="Invalid signature")
+        except ImportError:
+            pass  # twilio not installed in some envs
+
+    # STOP / compliance handling
+    twiml_reply = handle_inbound(from_number, body, db)
+    if twiml_reply:
+        return Response(content=twiml_reply, media_type="application/xml")
+
+    # Product command routing
+    command = sms_commands.parse(body)
+    if command:
+        reply = sms_commands.dispatch(from_number, command, db)
+        if reply:
+            send_sms(from_number, reply, db)
+
+    return Response(content=_twiml_ok(), media_type="application/xml")
+
+
+# ── Phase 2B: Deal-size capture ────────────────────────────────────────────────
+
+class DealCaptureRequest(BaseModel):
+    feed_uuid: str
+    property_id: int
+    deal_size_bucket: str  # 5_10k | 10_25k | 25k_plus | skip
+    deal_amount: Optional[float] = None
+    days_to_close: Optional[int] = None
+
+
+@app.post("/api/deal-capture", status_code=201)
+def deal_capture(payload: DealCaptureRequest, db: Session = Depends(get_db)):
+    """Record a deal outcome reported by a subscriber."""
+    from src.core.models import DealOutcome
+
+    sub = db.execute(
+        select(Subscriber).where(Subscriber.event_feed_uuid == payload.feed_uuid)
+    ).scalar_one_or_none()
+    if not sub:
+        raise HTTPException(status_code=403, detail="Invalid feed_uuid")
+
+    valid_buckets = {"5_10k", "10_25k", "25k_plus", "skip"}
+    if payload.deal_size_bucket not in valid_buckets:
+        raise HTTPException(status_code=422, detail=f"deal_size_bucket must be one of {valid_buckets}")
+
+    outcome = DealOutcome(
+        subscriber_id=sub.id,
+        property_id=payload.property_id,
+        deal_size_bucket=payload.deal_size_bucket,
+        deal_amount=payload.deal_amount,
+        deal_date=date.today(),
+        days_to_close=payload.days_to_close,
+    )
+    db.add(outcome)
+    db.flush()
+    return {"ok": True, "deal_id": outcome.id}
+
+
+# ── Phase 2B: NWS weather alert webhook ───────────────────────────────────────
+
+@app.post("/webhooks/nws/alert")
+async def nws_alert(request: Request, db: Session = Depends(get_db)):
+    """Receive NWS CAP alert and activate storm packs in affected ZIPs."""
+    from src.services import nws_webhook
+    payload = await request.json()
+    result = nws_webhook.process_alert(payload, db)
+    return result
+
+
+# ── Phase 2B: Admin DLQ review ────────────────────────────────────────────────
+
+@app.get("/admin/dlq")
+def admin_dlq(limit: int = 50, db: Session = Depends(get_db)):
+    """Return unreviewed SMS dead-letter queue items for admin review."""
+    from src.core.models import SmsDeadLetter
+    rows = db.execute(
+        select(SmsDeadLetter)
+        .where(SmsDeadLetter.reviewed_at.is_(None))
+        .order_by(SmsDeadLetter.created_at.desc())
+        .limit(limit)
+    ).scalars().all()
+    return {
+        "count": len(rows),
+        "items": [
+            {
+                "id": r.id,
+                "phone": r.phone,
+                "reason": r.reason,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ],
+    }
+
+
+# ── Phase 2B: Live ZIP activity — GET /api/zip-activity ──────────────────────
+
+@app.get("/api/zip-activity")
+def zip_activity(zip_code: str, vertical: Optional[str] = None):
+    """
+    Return live urgency signal for a ZIP — viewer count + recent message
+    volume. Powers the FOMO indicator on SampleLeads / dashboard feed.
+
+    Read-only, no auth required (public signal, like the ZIP checker).
+    Redis-degrades cleanly: returns active_viewers=0 when Redis is down.
+    """
+    if not _ZIP_RE.match(zip_code):
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_zip", "message": "ZIP code must be exactly 5 digits"},
+        )
+    if vertical is not None and vertical not in VALID_VERTICALS:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_vertical", "message": f"vertical must be one of: {sorted(VALID_VERTICALS)}"},
+        )
+    from src.services.urgency_engine import get_active_count
+    return {
+        "zip_code": zip_code,
+        "vertical": vertical,
+        "active_viewers": get_active_count(zip_code),
+    }
+
+
+# ── Phase 2B: Proof Moment — GET /api/proof-leads ────────────────────────────
+
+@app.get("/api/proof-leads")
+def proof_leads(
+    vertical: str = "roofing",
+    county_id: str = "hillsborough",
+    feed_uuid: Optional[str] = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    """
+    Return 1 fully revealed + 2 blurred leads for the signup proof moment.
+    Requires no auth — used immediately after free account creation.
+    """
+    from src.services.proof_moment import get_proof_leads
+    if vertical not in VALID_VERTICALS:
+        raise HTTPException(status_code=400, detail=f"Invalid vertical. Must be one of: {sorted(VALID_VERTICALS)}")
+    return get_proof_leads(vertical=vertical, county_id=county_id, db=db, feed_uuid=feed_uuid)
+
+
+# ── Phase 2B: Free signup — POST /api/free-signup ────────────────────────────
+
+class FreeSignupRequest(BaseModel):
+    email: str
+    vertical: str = "roofing"
+    county_id: str = "hillsborough"
+    name: Optional[str] = None
+    referral_code: Optional[str] = None
+
+    @field_validator("email")
+    @classmethod
+    def _validate_email(cls, v: str) -> str:
+        v = (v or "").strip().lower()
+        if not v or "@" not in v or "." not in v.split("@")[-1]:
+            raise ValueError("A valid email is required")
+        return v
+
+
+@app.post("/api/free-signup", status_code=201)
+def free_signup(req: FreeSignupRequest, db: Session = Depends(get_db)):
+    """
+    Create (or re-use) a free-tier Subscriber keyed by email.
+
+    Powers the landing-page unlock flow: landing visitor enters email →
+    this endpoint creates the free Subscriber + real Stripe customer →
+    returns the feed_uuid the frontend needs for /api/payment-intent.
+
+    Idempotent on email — re-visiting with the same email returns the
+    existing subscriber's feed_uuid without creating duplicates.
+    """
+    if req.vertical not in VALID_VERTICALS:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_vertical", "message": f"Must be one of: {sorted(VALID_VERTICALS)}"},
+        )
+
+    from src.services.signup_engine import create_free_account_by_email
+
+    sub = create_free_account_by_email(
+        email=req.email,
+        db=db,
+        vertical=req.vertical,
+        county_id=req.county_id,
+        name=req.name,
+        referral_code=req.referral_code,
+    )
+
+    return {
+        "subscriber_id": sub.id,
+        "feed_uuid": sub.event_feed_uuid,
+        "tier": sub.tier,
+        "status": sub.status,
+        "email": sub.email,
+        "vertical": sub.vertical,
+        "county_id": sub.county_id,
+    }
+
+
+# ── Phase 2B: Monetization Wall ───────────────────────────────────────────────
+
+class WallSessionRequest(BaseModel):
+    subscriber_id: int
+    session_id: str
+    vertical: str = "roofing"
+    county_id: str = "hillsborough"
+
+
+@app.post("/api/wall/session", status_code=201)
+def create_wall_session(req: WallSessionRequest, db: Session = Depends(get_db)):
+    """Create a monetization wall session for a new subscriber."""
+    from src.services.monetization_wall import create_session, get_roi_frame
+    state = create_session(req.subscriber_id, req.session_id)
+    roi = get_roi_frame(req.vertical, req.county_id, db)
+    return {"session": state, "roi_frame": roi}
+
+
+@app.get("/api/wall/{session_id}")
+def get_wall_session(session_id: str):
+    """Poll wall session state (converted flag + countdown expiry)."""
+    from src.services.monetization_wall import get_session_state
+    state = get_session_state(session_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
+    return state
+
+
+# ── Phase 2B: Payment Sheet — POST /api/payment-intent ───────────────────────
+
+class PaymentIntentRequest(BaseModel):
+    feed_uuid: str
+    amount_cents: int = Field(..., gt=0, le=100000)  # max $1,000
+    description: str
+    save_card: bool = False
+    metadata: Optional[dict] = None
+
+
+@app.post("/api/payment-intent", status_code=201)
+def create_payment_intent_endpoint(
+    req: PaymentIntentRequest, db: Session = Depends(get_db)
+):
+    """Create a Stripe PaymentIntent for the Payment Sheet SDK."""
+    from src.services.payment_sheet import create_payment_intent
+
+    sub = db.execute(
+        select(Subscriber).where(Subscriber.event_feed_uuid == req.feed_uuid)
+    ).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=403, detail="Invalid feed_uuid")
+
+    try:
+        result = create_payment_intent(
+            subscriber_id=sub.id,
+            amount_cents=req.amount_cents,
+            description=req.description,
+            save_card=req.save_card,
+            db=db,
+            metadata=req.metadata,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+    return result
+
+
+# ── Phase 2B: Missed-Call Voice Webhook ──────────────────────────────────────
+
+@app.post("/webhooks/twilio/voice", include_in_schema=False)
+async def twilio_voice_webhook(request: Request, db: Session = Depends(get_db)):
+    """
+    Twilio Programmable Voice webhook for missed/answered calls.
+    Auto-creates a free account and sends welcome SMS with dashboard link.
+    """
+    form = await request.form()
+    from_number = form.get("From", "")
+    if not from_number:
+        logger.warning("[Voice] Inbound call with no From number")
+        return Response(
+            content='<?xml version="1.0"?><Response><Hangup/></Response>',
+            media_type="application/xml",
+        )
+
+    from src.services.signup_engine import handle_missed_call
+    twiml = handle_missed_call(from_number=from_number, db=db)
+    return Response(content=twiml, media_type="application/xml")

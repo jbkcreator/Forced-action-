@@ -340,6 +340,65 @@ def create_hot_lead_unlock_link(
     return {"session_id": session.id, "url": session.url}
 
 
+def switch_subscription_plan(
+    subscription_id: str,
+    new_price_id: str,
+    prorate: bool = True,
+) -> dict:
+    """
+    Switch an existing Stripe subscription to a new price (annual lock, data-only, etc.).
+
+    Uses proration by default so the subscriber is charged/credited the difference
+    immediately. Set prorate=False for end-of-period switches.
+
+    Returns the updated Stripe subscription object dict.
+    Raises RuntimeError if Stripe is not configured.
+    Raises stripe.error.StripeError on API failure.
+    """
+    if not _init_stripe():
+        raise RuntimeError("Stripe not configured")
+
+    try:
+        subscription = stripe.Subscription.retrieve(subscription_id)
+    except stripe.error.InvalidRequestError as exc:
+        logger.error("switch_subscription_plan: subscription %s not found: %s", subscription_id, exc)
+        raise
+
+    # Find the current subscription item ID
+    items = subscription.get("items", {}).get("data", [])
+    if not items:
+        raise ValueError(f"Subscription {subscription_id} has no items")
+
+    item_id = items[0]["id"]
+
+    proration_behavior = "create_prorations" if prorate else "none"
+
+    try:
+        updated = stripe.Subscription.modify(
+            subscription_id,
+            items=[{"id": item_id, "price": new_price_id}],
+            proration_behavior=proration_behavior,
+        )
+    except stripe.error.InvalidRequestError as exc:
+        logger.error(
+            "switch_subscription_plan: invalid request for %s → %s: %s",
+            subscription_id, new_price_id, exc,
+        )
+        raise
+    except stripe.error.StripeError:
+        logger.error(
+            "switch_subscription_plan: Stripe error for %s → %s",
+            subscription_id, new_price_id, exc_info=True,
+        )
+        raise
+
+    logger.info(
+        "Subscription %s switched to price %s (prorate=%s)",
+        subscription_id, new_price_id, prorate,
+    )
+    return dict(updated)
+
+
 def get_founding_spots_remaining(
     db: Session,
     tier: str,
