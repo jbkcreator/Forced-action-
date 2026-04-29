@@ -2058,12 +2058,15 @@ async def synthflow_webhook(request: Request):
     try:
         raw_json = json.loads(raw_body.decode("utf-8") or "{}")
     except Exception:
-        raw_json = {"_unparseable": raw_body.decode("utf-8", errors="replace")[:500]}
+        raw_json = {"_unparseable": raw_body.decode("utf-8", errors="replace")[:2000]}
     logger.info(
-        "[Synthflow webhook] RAW headers=%s body=%s",
+        "[Synthflow webhook] RAW headers=%s",
         {k: v for k, v in request.headers.items() if k.lower() in {"content-type", "user-agent", "x-finetuner-signature", "x-synthflow-signature"}},
-        json.dumps(raw_json, default=str)[:2000],
     )
+    # Pretty-print full payload in chunks so syslog doesn't drop long lines
+    full_body = json.dumps(raw_json, indent=2, default=str)
+    for i in range(0, len(full_body), 3000):
+        logger.info("[Synthflow webhook] BODY[%d:%d] %s", i, i + 3000, full_body[i:i + 3000])
 
     try:
         payload = SynthflowWebhookPayload(**raw_json)
