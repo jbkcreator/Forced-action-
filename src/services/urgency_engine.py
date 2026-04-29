@@ -86,7 +86,7 @@ def _increment_zip_counter(zip_code: str, ttl_seconds: int) -> None:
         key = f"urgency_zips:{zip_code}"
         client.zadd(key, {str(now_ts): now_ts})
         client.expire(key, ttl_seconds)
-        # Prune expired entries
-        client.zremrangebyscore(key, "-inf", now_ts)
+        # Prune entries older than the window
+        client.zremrangebyscore(key, "-inf", now_ts - ttl_seconds)
     except Exception as exc:
         logger.debug("urgency_zips increment failed: %s", exc)
