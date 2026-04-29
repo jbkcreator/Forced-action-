@@ -2059,14 +2059,27 @@ async def synthflow_webhook(request: Request):
         raw_json = json.loads(raw_body.decode("utf-8") or "{}")
     except Exception:
         raw_json = {"_unparseable": raw_body.decode("utf-8", errors="replace")[:2000]}
+
+    # Dump full payload to /tmp for guaranteed inspection — syslog often truncates
+    # long lines or drops them entirely.  Filename is timestamped so each call
+    # produces its own file you can `cat`.
+    try:
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        dump_path = f"/tmp/synthflow_payload_{ts}.json"
+        with open(dump_path, "w", encoding="utf-8") as f:
+            json.dump(raw_json, f, indent=2, default=str)
+        logger.info("[Synthflow webhook] DUMPED full payload → %s (size=%d bytes)", dump_path, len(raw_body))
+    except Exception as dump_exc:
+        logger.warning("[Synthflow webhook] could not dump payload: %s", dump_exc)
+
     logger.info(
         "[Synthflow webhook] RAW headers=%s",
         {k: v for k, v in request.headers.items() if k.lower() in {"content-type", "user-agent", "x-finetuner-signature", "x-synthflow-signature"}},
     )
-    # Pretty-print full payload in chunks so syslog doesn't drop long lines
+    # Also log inline in chunks as a backup
     full_body = json.dumps(raw_json, indent=2, default=str)
-    for i in range(0, len(full_body), 3000):
-        logger.info("[Synthflow webhook] BODY[%d:%d] %s", i, i + 3000, full_body[i:i + 3000])
+    for i in range(0, len(full_body), 1500):
+        logger.info("[Synthflow webhook] BODY[%d:%d] %s", i, i + 1500, full_body[i:i + 1500])
 
     try:
         payload = SynthflowWebhookPayload(**raw_json)
