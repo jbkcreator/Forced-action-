@@ -1215,6 +1215,10 @@ def _on_payment_intent_succeeded(payment_intent: dict, db: Session) -> None:
         _on_bundle_payment(payment_intent, db)
         return
 
+    if product == "premium":
+        _on_premium_payment(payment_intent, db)
+        return
+
     if product == "lead_unlock":
         _on_lead_unlock_payment(payment_intent, db)
         # Fall through to card-save so the unlock also triggers the saved-card flow
@@ -1423,6 +1427,7 @@ def _on_bundle_payment(payment_intent: dict, db: Session) -> None:
     subscriber_id_str = meta.get("subscriber_id")
     zip_code = meta.get("zip_code")
     vertical = meta.get("vertical")
+    ab_variant = meta.get("ab_variant") or None  # Stage 5: optional 'a'/'b'
 
     if not all([pi_id, bundle_type, subscriber_id_str]):
         logger.error("[Bundle] payment_intent.succeeded missing metadata: %s", meta)
@@ -1444,6 +1449,7 @@ def _on_bundle_payment(payment_intent: dict, db: Session) -> None:
         status="pending",
         zip_code=zip_code,
         vertical=vertical,
+        ab_variant=ab_variant if ab_variant in ("a", "b") else None,
     )
     db.add(purchase)
     db.flush()
@@ -1451,6 +1457,90 @@ def _on_bundle_payment(payment_intent: dict, db: Session) -> None:
     from src.services.bundle_engine import deliver
     deliver(purchase.id, db)
     logger.info("[Bundle] Delivered purchase=%d type=%s subscriber=%d", purchase.id, bundle_type, subscriber_id)
+
+    # Stage 5: record A/B conversion if a variant was assigned
+    if ab_variant in ("a", "b"):
+        try:
+            from src.services.ab_engine import record_outcome
+            test_name = f"bundle_{bundle_type}_pricing"
+            record_outcome(subscriber_id, test_name, "converted", db)
+        except Exception as exc:
+            logger.warning("[Bundle] A/B record_outcome failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# 6c. payment_intent.succeeded — Stage 5 premium credit SKUs
+# ---------------------------------------------------------------------------
+
+def _on_premium_payment(payment_intent: dict, db: Session) -> None:
+    """
+    Handle cash-paid premium SKU purchases (report / brief / transfer / byol).
+
+    Expected metadata on the PaymentIntent:
+        product         = "premium"
+        sku             = report | brief | transfer | byol
+        subscriber_id   = numeric Subscriber.id
+        property_id     = optional, required for report/brief/transfer
+        target_address  = optional, required for byol
+    """
+    from src.core.models import PremiumPurchase
+    from src.services.premium_engine import record_card_purchase, fulfill
+
+    meta = payment_intent.get("metadata", {}) or {}
+    pi_id = payment_intent.get("id")
+    sku = meta.get("sku")
+    subscriber_id_str = meta.get("subscriber_id")
+
+    if not all([pi_id, sku, subscriber_id_str]):
+        logger.error("[Premium] payment_intent missing metadata: pi=%s meta=%s", pi_id, meta)
+        return
+
+    # Idempotency
+    existing = db.execute(
+        select(PremiumPurchase).where(PremiumPurchase.stripe_payment_intent_id == pi_id)
+    ).scalar_one_or_none()
+    if existing:
+        logger.info("[Premium] Already processed PI %s — skipping", pi_id)
+        return
+
+    try:
+        subscriber_id = int(subscriber_id_str)
+    except (TypeError, ValueError):
+        logger.error("[Premium] non-int subscriber_id=%r", subscriber_id_str)
+        return
+
+    property_id_raw = meta.get("property_id")
+    property_id: Optional[int] = None
+    if property_id_raw:
+        try:
+            property_id = int(property_id_raw)
+        except (TypeError, ValueError):
+            logger.warning("[Premium] non-int property_id=%r", property_id_raw)
+
+    target_address = meta.get("target_address")
+    amount_cents = payment_intent.get("amount_received") or payment_intent.get("amount")
+
+    purchase = record_card_purchase(
+        subscriber_id=subscriber_id,
+        sku=sku,
+        stripe_payment_intent_id=pi_id,
+        db=db,
+        property_id=property_id,
+        target_address=target_address,
+        amount_cents=amount_cents,
+    )
+
+    try:
+        fulfill(purchase.id, db)
+    except Exception as exc:
+        # fulfillment errors don't fail the webhook — purchase row is already
+        # persisted with status='failed' and ops can re-run fulfillment.
+        logger.error("[Premium] fulfillment failed for purchase=%d: %s", purchase.id, exc)
+
+    logger.info(
+        "[Premium] Purchase recorded: id=%d sku=%s subscriber=%d pi=%s",
+        purchase.id, sku, subscriber_id, pi_id,
+    )
 
 
 # ---------------------------------------------------------------------------

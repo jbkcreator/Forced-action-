@@ -135,4 +135,27 @@ COUNTY_ID=hillsborough
 # Unmatched record rematch — Sunday 03:30 AM UTC
 30 3 * * 0 $PROJECT/scripts/cron/run.sh src.tasks.rematch_unmatched
 
+# ── STAGE 5: BUNDLES + AUTOPILOT + ANNUAL ───────────────────────────────────
+# Bundle dispatcher — every hour, contextually offers Weekend / Storm /
+# ZIP Booster / Monthly Reload bundles to wallet subscribers (with A/B pricing)
+0 * * * * $PROJECT/scripts/cron/run.sh src.tasks.bundle_dispatcher
+
+# Auto Mode follow-up — every 30 min, fires VM drop on Auto Mode SMS that
+# went 24h+ without a reply (tags GHL contact for Synthflow workflow).
+*/30 * * * * $PROJECT/scripts/cron/run.sh src.tasks.auto_mode_followup
+
+# Annual push — daily 14:00 UTC (≈ 9-10am ET). Covers all triggers:
+# charter_day_7, day_10_14, two_deals, spend_250, deal_win_10k, auto_switch_day_60.
+# Big-deal-win path also fires inline from /api/deal-capture for instant conversion.
+0 14 * * * $PROJECT/scripts/cron/run.sh src.tasks.annual_push
+
+# AutoPilot Pro upsell — daily 09:15 UTC. Finds Lite subscribers with 30+ days
+# tenure and 30-day close rate >=15%; sends one-tap upgrade offer (14-day cooldown).
+15 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.ap_pro_upsell
+
+# Weekly referral leaderboard — Monday 09:00 UTC. Aggregates last 7 days of
+# confirmed referrals per (county, vertical); written to data/leaderboards/
+# and injected into the 09:30 weekly one-pager + served by /api/leaderboard.
+0 9 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.leaderboard
+
 # === END FORCED-ACTION-PLATFORM ===

@@ -12,11 +12,20 @@ Triggers (ANY fires the push):
   - deal_win_10k:       Single deal reported at $10K+
   - auto_switch_day_60: Day 60 — automated annual offer
 
-Cron: 0 8 * * * (8 AM UTC, after scoring)
+Stage 5 changes:
+  - 30-day duplicate-offer suppression via MessageOutcome lookback.
+  - Each push now writes a MessageOutcome(template_id='annual_offer_<trigger>')
+    so the suppression check + Cora attribution have ground truth.
+  - The deal-capture path imports `_push_annual_offer` directly to fire
+    the deal_win_10k trigger inline (no daily-cron lag for big deals).
+  - The 60-day auto-switch trigger runs the same `run_annual_push` loop;
+    the cron just calls it daily.
+
+Cron: 0 14 * * * (14:00 UTC == 9-10am ET — friendly outbound window)
 """
 import logging
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import func, select
@@ -25,7 +34,10 @@ from sqlalchemy.orm import Session
 from config.revenue_ladder import ANNUAL_PLAN
 from config.settings import settings
 from src.core.database import get_db_context
-from src.core.models import DealOutcome, Subscriber, WalletTransaction
+from src.core.models import DealOutcome, MessageOutcome, Subscriber, WalletTransaction
+
+
+_OFFER_SUPPRESSION_DAYS = 30   # don't re-offer annual within 30 days
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +75,18 @@ def _check_triggers(sub: Subscriber, db: Session) -> list[str]:
     """Return list of trigger names that apply to this subscriber (may be empty)."""
     if sub.tier == "annual_lock":
         return []   # already annual
+
+    # Stage 5: 30-day suppression — skip if we already offered annual recently.
+    cutoff = datetime.now(timezone.utc) - timedelta(days=_OFFER_SUPPRESSION_DAYS)
+    recent_offer = db.execute(
+        select(MessageOutcome.id).where(
+            MessageOutcome.subscriber_id == sub.id,
+            MessageOutcome.template_id.like("annual_offer_%"),
+            MessageOutcome.sent_at >= cutoff,
+        ).limit(1)
+    ).scalar_one_or_none()
+    if recent_offer:
+        return []
 
     now = datetime.now(timezone.utc)
     created = sub.created_at
@@ -112,9 +136,13 @@ def _check_triggers(sub: Subscriber, db: Session) -> list[str]:
 
 
 def _push_annual_offer(sub: Subscriber, trigger: str, db: Session) -> bool:
-    """Send annual offer. Returns True if dispatched successfully."""
+    """Send annual offer. Returns True if dispatched successfully.
+
+    Stage 5: also writes a MessageOutcome row (template_id='annual_offer_<trigger>')
+    so the 30-day suppression guard + Cora attribution have ground truth.
+    """
     if not sub.email:
-        logger.debug("No email for subscriber %d — annual push skipped", sub.id)
+        logger.debug("No email for subscriber %d - annual push skipped", sub.id)
         return False
 
     annual_cents = ANNUAL_PLAN["price_cents"]
@@ -127,21 +155,41 @@ def _push_annual_offer(sub: Subscriber, trigger: str, db: Session) -> bool:
         if sub.event_feed_uuid
         else settings.app_base_url
     )
+    accept_url = f"{settings.app_base_url}/api/annual/accept?feed_uuid={sub.event_feed_uuid}" if sub.event_feed_uuid else feed_url
+
+    subject_by_trigger = {
+        "deal_win_10k":       "You just closed a deal - lock the year, save 2 months",
+        "auto_switch_day_60": "Your 60-day mark - lock the year, save 2 months",
+    }
+    subject = subject_by_trigger.get(trigger, "Save 2 months - lock your territory for a full year")
 
     try:
         from src.services.email import send_email
         send_email(
             to=sub.email,
-            subject="Save 2 months — lock your territory for a full year",
+            subject=subject,
             body_text=(
                 f"Hi {sub.name or 'there'},\n\n"
                 f"Lock in your Forced Action territory for a full year at just "
-                f"{annual_str}/yr ({monthly_str}/mo effective — 2 months free).\n\n"
+                f"{annual_str}/yr ({monthly_str}/mo effective - 2 months free).\n\n"
                 f"This rate is available now. Visit your dashboard to upgrade:\n{feed_url}\n\n"
-                f"Or reply to this email and we'll take care of it.\n\n"
-                f"— Forced Action Team"
+                f"One-tap accept: {accept_url}\n\n"
+                f"- Forced Action Team"
             ),
         )
+        # Stage 5: log MessageOutcome so the 30-day suppression guard works
+        try:
+            db.add(MessageOutcome(
+                subscriber_id=sub.id,
+                message_type="email",
+                template_id=f"annual_offer_{trigger}",
+                channel="ses",
+                sent_at=datetime.now(timezone.utc),
+            ))
+            db.flush()
+        except Exception as exc:
+            logger.warning("[AnnualPush] MessageOutcome log failed for sub=%d: %s", sub.id, exc)
+
         logger.info(
             "[AnnualPush] Offer sent: subscriber=%d trigger=%s", sub.id, trigger
         )

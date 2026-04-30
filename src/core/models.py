@@ -1586,6 +1586,7 @@ class BundlePurchase(Base):
     county_id: Mapped[str] = mapped_column(String(50), nullable=False, default="hillsborough")
     credits_awarded: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     lead_ids: Mapped[Optional[list]] = mapped_column(ARRAY(Integer))
+    ab_variant: Mapped[Optional[str]] = mapped_column(String(8))   # Stage 5: 'a' / 'b' / NULL
     purchased_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
@@ -1606,6 +1607,71 @@ class BundlePurchase(Base):
 
     def __repr__(self):
         return f"<BundlePurchase(id={self.id}, type={self.bundle_type}, status={self.status})>"
+
+
+class ReferralTeam(Base):
+    """
+    Stage 5 — referral team mechanic.
+
+    When a referrer accumulates 3 confirmed referrals where every member is
+    in the same county AND vertical, a ReferralTeam row is created and all
+    three members get a Shared ZIP View (lead density across their union of
+    locked ZIPs — density only, no PII shared between members).
+    """
+    __tablename__ = "referral_teams"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    lead_subscriber_id: Mapped[int] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=False, index=True)
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    vertical: Mapped[str] = mapped_column(String(50), nullable=False)
+    member_subscriber_ids: Mapped[list] = mapped_column(ARRAY(Integer), nullable=False)
+    shared_zips: Mapped[Optional[list]] = mapped_column(ARRAY(String(10)))
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")  # active | broken
+    unlocked_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("status IN ('active', 'broken')", name="check_referral_team_status"),
+        Index("idx_referral_team_county_vertical", "county_id", "vertical"),
+    )
+
+    def __repr__(self):
+        return f"<ReferralTeam(id={self.id}, lead={self.lead_subscriber_id}, members={self.member_subscriber_ids})>"
+
+
+class PremiumPurchase(Base):
+    """
+    Stage 5: Premium credit SKU purchase (report / brief / transfer / byol).
+
+    Either paid via wallet credits (`paid_via='credits'`, no Stripe row) or
+    cash via Stripe Checkout / PaymentIntent (`paid_via='card'`,
+    `stripe_payment_intent_id` set). Fulfillment artifact (PDF, skip-trace
+    record id, etc.) is referenced via `output_ref`.
+    """
+    __tablename__ = "premium_purchases"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=False, index=True)
+    sku: Mapped[str] = mapped_column(String(30), nullable=False)             # report|brief|transfer|byol
+    paid_via: Mapped[str] = mapped_column(String(10), nullable=False)        # credits|card
+    amount_cents: Mapped[Optional[int]] = mapped_column(Integer)             # null for credit purchases
+    credits_spent: Mapped[Optional[int]] = mapped_column(Integer)            # null for cash purchases
+    stripe_payment_intent_id: Mapped[Optional[str]] = mapped_column(String(100), unique=True, index=True)
+    property_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("properties.id"), index=True)
+    target_address: Mapped[Optional[str]] = mapped_column(String(255))       # for BYOL when no property_id
+    output_ref: Mapped[Optional[str]] = mapped_column(String(255))           # path to PDF / FK to enriched_contacts.id
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")  # pending|delivered|failed
+    purchased_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    __table_args__ = (
+        CheckConstraint("sku IN ('report', 'brief', 'transfer', 'byol')", name="check_premium_sku"),
+        CheckConstraint("paid_via IN ('credits', 'card')", name="check_premium_paid_via"),
+        CheckConstraint("status IN ('pending', 'delivered', 'failed')", name="check_premium_status"),
+        Index("idx_premium_purchase_sub_sku", "subscriber_id", "sku"),
+    )
+
+    def __repr__(self):
+        return f"<PremiumPurchase(id={self.id}, sku={self.sku}, paid_via={self.paid_via}, status={self.status})>"
 
 
 class SmsOptIn(Base):

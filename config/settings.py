@@ -88,6 +88,11 @@ class AppSettings(BaseSettings):
 	stripe_price_bundle_storm: Optional[str] = Field(default=None, env="STRIPE_PRICE_BUNDLE_STORM")
 	stripe_price_bundle_zip_booster: Optional[str] = Field(default=None, env="STRIPE_PRICE_BUNDLE_ZIP_BOOSTER")
 	stripe_price_bundle_monthly_reload: Optional[str] = Field(default=None, env="STRIPE_PRICE_BUNDLE_MONTHLY_RELOAD")
+	# Stage 5: Premium credits (cash retail prices — credits path uses CREDIT_COSTS)
+	stripe_price_premium_report: Optional[str] = Field(default=None, env="STRIPE_PRICE_PREMIUM_REPORT")
+	stripe_price_premium_brief: Optional[str] = Field(default=None, env="STRIPE_PRICE_PREMIUM_BRIEF")
+	stripe_price_premium_transfer: Optional[str] = Field(default=None, env="STRIPE_PRICE_PREMIUM_TRANSFER")
+	stripe_price_premium_byol: Optional[str] = Field(default=None, env="STRIPE_PRICE_PREMIUM_BYOL")
 
 	# Test price IDs
 	stripe_test_price_starter_founding: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_STARTER_FOUNDING")
@@ -112,6 +117,11 @@ class AppSettings(BaseSettings):
 	stripe_test_price_bundle_storm: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_BUNDLE_STORM")
 	stripe_test_price_bundle_zip_booster: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_BUNDLE_ZIP_BOOSTER")
 	stripe_test_price_bundle_monthly_reload: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_BUNDLE_MONTHLY_RELOAD")
+	# Stage 5: Premium credits — test prices
+	stripe_test_price_premium_report: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_PREMIUM_REPORT")
+	stripe_test_price_premium_brief: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_PREMIUM_BRIEF")
+	stripe_test_price_premium_transfer: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_PREMIUM_TRANSFER")
+	stripe_test_price_premium_byol: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_PREMIUM_BYOL")
 
 	# ── Mode-aware helpers ────────────────────────────────────────────────────
 	# Use these everywhere instead of accessing live/test fields directly.

@@ -45,3 +45,6 @@ langsmith>=0.7.0
 
 # Sandbox — in-memory Redis shim for scenario tests
 fakeredis>=2.24
+
+# Image generation (Stage 5: deal-win graphic, social proof wall)
+Pillow>=10.0.0
