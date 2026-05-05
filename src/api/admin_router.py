@@ -31,7 +31,15 @@ from sqlalchemy.orm import Session
 
 from config.settings import settings
 from src.core.database import get_db_context
-from src.core.models import DistressScore, Owner, Property, SentLead, Subscriber
+from src.core.models import (
+    DistressScore,
+    EnrichmentUsageLog,
+    Owner,
+    PremiumPurchase,
+    Property,
+    SentLead,
+    Subscriber,
+)
 from src.loaders.tax import TaxDelinquencyLoader
 
 logger = logging.getLogger(__name__)
@@ -441,3 +449,110 @@ def synthflow_config(_admin: dict = Depends(get_current_admin)):
         })
 
     return {"agents": agents, "campaigns": campaigns, "prompts": prompts}
+
+
+# ---------------------------------------------------------------------------
+# GET /api/admin/stats/sku-margin — Premium SKU revenue / cost / margin
+# ---------------------------------------------------------------------------
+
+# Retail prices in cents — must mirror config.revenue_ladder.PREMIUM_CREDITS.
+_SKU_RETAIL_CENTS = {"report": 700, "brief": 1200, "transfer": 6500, "byol": 500}
+_PREMIUM_SKUS = ["report", "brief", "transfer", "byol"]
+_WINDOW_DAYS = {"7d": 7, "30d": 30, "90d": 90}
+
+
+@router.get("/stats/sku-margin")
+def sku_margin_stats(
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """Per-SKU revenue / cost / margin / refund / dispute summary across
+    rolling 7-day, 30-day, and 90-day windows.
+
+    Cost is the sum of EnrichmentUsageLog.cost_cents joined to PremiumPurchase
+    via property_id within the window. For SKUs that don't trigger an
+    enrichment lookup (report, brief — artifact-only today), cost stays at 0
+    and gross margin is 100% minus Stripe processing.
+    """
+    now = datetime.now(timezone.utc)
+    out = {"as_of": now.isoformat(), "windows": {}}
+
+    for window_key, days in _WINDOW_DAYS.items():
+        cutoff = now - timedelta(days=days)
+        per_sku = {}
+        for sku in _PREMIUM_SKUS:
+            # Counts by paid_via
+            counts = db.execute(
+                select(
+                    PremiumPurchase.paid_via,
+                    PremiumPurchase.status,
+                    func.count().label("n"),
+                    func.coalesce(func.sum(PremiumPurchase.amount_cents), 0).label("amount_cents"),
+                )
+                .where(
+                    PremiumPurchase.sku == sku,
+                    PremiumPurchase.purchased_at >= cutoff,
+                )
+                .group_by(PremiumPurchase.paid_via, PremiumPurchase.status)
+            ).all()
+
+            total = 0
+            delivered = 0
+            refunded = 0
+            disputed = 0
+            failed = 0
+            gross_revenue_cents = 0
+            for r in counts:
+                total += r.n
+                if r.status == "delivered":
+                    delivered += r.n
+                    gross_revenue_cents += int(r.amount_cents or 0) if r.paid_via == "card" else 0
+                elif r.status == "refunded":
+                    refunded += r.n
+                elif r.status == "disputed":
+                    disputed += r.n
+                elif r.status == "failed":
+                    failed += r.n
+
+            # Cost — sum of enrichment usage logs joined by property_id, within window
+            cost_cents = db.execute(
+                select(func.coalesce(func.sum(EnrichmentUsageLog.cost_cents), 0))
+                .select_from(EnrichmentUsageLog)
+                .join(
+                    PremiumPurchase,
+                    PremiumPurchase.property_id == EnrichmentUsageLog.property_id,
+                )
+                .where(
+                    PremiumPurchase.sku == sku,
+                    PremiumPurchase.purchased_at >= cutoff,
+                    EnrichmentUsageLog.created_at >= cutoff,
+                )
+            ).scalar() or 0
+
+            margin_pct = None
+            if gross_revenue_cents > 0:
+                margin_pct = round(
+                    100.0 * (gross_revenue_cents - cost_cents) / gross_revenue_cents, 1
+                )
+
+            refund_rate = round(100.0 * refunded / total, 1) if total else 0.0
+            dispute_rate = round(100.0 * disputed / total, 1) if total else 0.0
+
+            per_sku[sku] = {
+                "label": sku,
+                "retail_cents": _SKU_RETAIL_CENTS.get(sku, 0),
+                "total_purchases": total,
+                "delivered": delivered,
+                "refunded": refunded,
+                "disputed": disputed,
+                "failed": failed,
+                "gross_revenue_cents": gross_revenue_cents,
+                "cost_cents": int(cost_cents or 0),
+                "margin_cents": gross_revenue_cents - int(cost_cents or 0),
+                "margin_pct": margin_pct,
+                "refund_rate_pct": refund_rate,
+                "dispute_rate_pct": dispute_rate,
+            }
+        out["windows"][window_key] = per_sku
+
+    return out

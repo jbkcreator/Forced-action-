@@ -39,9 +39,16 @@ _TOP_N = 5
 
 
 def _handle(sub: Subscriber) -> str:
-    """First name + last initial. Falls back to 'Member <id>' if no name."""
+    """First name + last initial. Falls back to a generic anonymous handle.
+
+    Phase A.2 (2026-05-04): the previous fallback was f"Member {sub.id}", which
+    leaked the numeric subscriber id into the public leaderboard JSON. We now
+    return "Anonymous Member" for nameless subscribers — the leaderboard
+    builder skips them entirely (see build()), so this string should not
+    actually appear in production output.
+    """
     if not sub.name:
-        return f"Member {sub.id}"
+        return "Anonymous Member"
     parts = sub.name.strip().split()
     first = parts[0]
     last_initial = (parts[1][0] if len(parts) > 1 else "").upper()
@@ -102,7 +109,14 @@ def build(db: Session, today: Optional[date] = None) -> dict:
         sub = by_id.get(sub_id)
         if not sub:
             continue
+        # Phase A.2 (2026-05-04): skip nameless subscribers — without a name
+        # we can only produce an anonymous handle, which is no use to the
+        # subscriber and exposes nothing to readers. Cleaner to drop them.
+        if not sub.name:
+            continue
         cohorts[(sub.county_id, sub.vertical)].append({
+            # Phase A.2: subscriber_id is kept on the in-DB / on-disk snapshot
+            # for ops use but stripped from the public response.
             "subscriber_id": sub.id,
             "handle": _handle(sub),
             "refs_this_week": int(refs_week),

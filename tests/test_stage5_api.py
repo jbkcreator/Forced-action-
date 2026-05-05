@@ -109,6 +109,87 @@ class TestProofWallEndpoint:
         # FastAPI Query(le=200) → 422
         assert resp.status_code == 422
 
+    def test_proof_wall_item_shape_is_locked(self, client, fresh_db):
+        """fa008+ (2026-05-04): item payload must contain ONLY the 7 documented
+        public fields. A new field accidentally added on the server side is the
+        most likely PII regression vector — this test catches it."""
+        from datetime import date
+        from src.core.models import DealOutcome, Subscriber
+        uid = uuid.uuid4().hex[:8]
+        sub = Subscriber(
+            stripe_customer_id=f"cus_pwshape_{uid}", tier="starter",
+            vertical="roofing", county_id="hillsborough",
+            event_feed_uuid=f"pwshape-{uid}",
+            name="Shape Test", email=f"shape-{uid}@example.com",
+        )
+        fresh_db.add(sub)
+        fresh_db.flush()
+        deal = DealOutcome(
+            subscriber_id=sub.id,
+            deal_size_bucket="10_25k",
+            deal_amount=18000,
+            deal_date=date.today(),
+        )
+        fresh_db.add(deal)
+        fresh_db.commit()
+        try:
+            resp = client.get("/api/proof-wall?limit=200")
+            assert resp.status_code == 200
+            items = resp.json()["items"]
+            match = [i for i in items if i.get("deal_outcome_id") == deal.id]
+            assert len(match) == 1
+            keys = set(match[0].keys())
+            assert keys == {
+                "deal_outcome_id", "deal_size_bucket", "label",
+                "vertical", "county_id", "days_ago", "graphic_url",
+            }, f"unexpected keys leaked: {keys}"
+        finally:
+            fresh_db.delete(deal)
+            fresh_db.delete(sub)
+            fresh_db.commit()
+
+    def test_proof_wall_does_not_leak_pii(self, client, fresh_db):
+        """End-to-end deanonymization probe: seed a known-PII subscriber + deal,
+        hit the public endpoint, assert raw response body contains none of the
+        PII tokens. This is the journalist / competitor test."""
+        from datetime import date
+        from src.core.models import DealOutcome, Subscriber
+        uid = uuid.uuid4().hex[:8]
+        # Use distinct, unlikely-to-collide tokens so a regex match is unambiguous.
+        secret_name = f"DistinctName_PIIProbe_{uid}"
+        secret_email = f"probe_{uid}@piiprobe.test"
+        secret_amount = 42137  # not a bucket boundary, not a likely test value
+        sub = Subscriber(
+            stripe_customer_id=f"cus_pwleak_{uid}", tier="starter",
+            vertical="roofing", county_id="hillsborough",
+            event_feed_uuid=f"pwleak-{uid}",
+            name=secret_name, email=secret_email,
+        )
+        fresh_db.add(sub)
+        fresh_db.flush()
+        deal = DealOutcome(
+            subscriber_id=sub.id,
+            deal_size_bucket="25k_plus",
+            deal_amount=secret_amount,
+            deal_date=date.today(),
+        )
+        fresh_db.add(deal)
+        fresh_db.commit()
+        try:
+            resp = client.get("/api/proof-wall?limit=200")
+            assert resp.status_code == 200
+            raw = resp.text
+            # PII guarantees — none of these tokens may appear in the public response.
+            assert secret_name not in raw, "subscriber name leaked"
+            assert secret_email not in raw, "subscriber email leaked"
+            assert str(secret_amount) not in raw, "exact deal amount leaked"
+            assert sub.stripe_customer_id not in raw, "stripe customer id leaked"
+            assert sub.event_feed_uuid not in raw, "feed_uuid leaked"
+        finally:
+            fresh_db.delete(deal)
+            fresh_db.delete(sub)
+            fresh_db.commit()
+
 
 class TestWinGraphicEndpoint:
     def test_unknown_id_returns_404(self, client):

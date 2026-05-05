@@ -366,6 +366,7 @@ def run_skip_trace(
                 break
 
         # --- 3. Persist results ---
+        from src.services.enrichment_log import log_usage as _log_enrichment
         with get_db_context() as session:
             for i, result in enumerate(results):
                 if i >= len(index_map):
@@ -390,7 +391,19 @@ def run_skip_trace(
 
                     if existing:
                         stats["already_traced"] += 1
+                        # Already enriched once — skip the cost log to avoid
+                        # double-counting (we billed when the original ran).
                         continue
+
+                    # Cost log — one row per BatchData lookup, success or fail.
+                    # fa005 (2026-05-04). Best-effort; failures don't break flow.
+                    _log_enrichment(
+                        db=session,
+                        vendor="batchdata",
+                        purpose="batch_skip_trace",
+                        success=parsed["match_success"],
+                        property_id=owner.property_id,
+                    )
 
                     # Save EnrichedContact
                     ec = EnrichedContact(

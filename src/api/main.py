@@ -1020,13 +1020,21 @@ def zip_availability(
 
     taken_map = {r[0]: r[1] for r in territory_rows}  # zip -> "locked" | "grace"
 
-    # Gold+ lead counts per ZIP (latest scores)
+    # Gold+ lead counts per ZIP (deduped to latest score per property).
+    # Without the latest-score subquery every historical scoring run is counted,
+    # inflating counts by ~3-4x (one row per scoring run per property).
     try:
         lead_rows = db.execute(
             text("""
                 SELECT p.zip, COUNT(*) AS lead_count
                 FROM properties p
                 JOIN distress_scores ds ON ds.property_id = p.id
+                JOIN (
+                    SELECT property_id, MAX(score_date) AS max_date
+                    FROM distress_scores
+                    GROUP BY property_id
+                ) latest ON latest.property_id = ds.property_id
+                        AND latest.max_date = ds.score_date
                 WHERE p.county_id = :county_id
                   AND p.zip IS NOT NULL
                   AND LENGTH(p.zip) = 5
@@ -1368,7 +1376,10 @@ def feed_stats(feed_uuid: str, db: Session = Depends(get_db)):
             .where(and_(*base_filter))
         )
 
-        total = db.execute(select(func.count()).select_from(base_q.subquery())).scalar()
+        total = db.execute(
+            select(func.count(func.distinct(DistressScore.property_id)))
+            .select_from(base_q.subquery())
+        ).scalar()
 
         today_start = _dt.combine(date.today(), _dt.min.time())
         new_today = db.execute(
@@ -2458,6 +2469,21 @@ def annual_accept(payload: AnnualAcceptRequest, db: Session = Depends(get_db)):
     if not sub.stripe_subscription_id:
         raise HTTPException(status_code=400, detail="Subscriber has no active subscription")
 
+    # Pre-flight: refuse to call Stripe when the account is in a billing-broken
+    # state. The user must clear it (update card / end pause) before retry.
+    from src.services.stripe_service import can_switch_subscription
+    ok_status, reason = can_switch_subscription(sub)
+    if not ok_status:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "billing_status_blocked",
+                "current_status": reason,
+                "message": "Update your payment method first, then retry.",
+                "billing_portal_url": "/api/portal-session",
+            },
+        )
+
     from src.tasks.annual_push import switch_to_annual
     ok = switch_to_annual(sub.id, db)
     if not ok:
@@ -2504,13 +2530,26 @@ def upgrade(req: UpgradeRequest, db: Session = Depends(get_db)):
     if not sub.stripe_subscription_id:
         raise HTTPException(status_code=400, detail="Subscriber has no active subscription")
 
+    # Pre-flight: same status guard as /api/annual/accept.
+    from src.services.stripe_service import can_switch_subscription, switch_subscription_plan
+    ok_status, reason = can_switch_subscription(sub)
+    if not ok_status:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "billing_status_blocked",
+                "current_status": reason,
+                "message": "Update your payment method first, then retry.",
+                "billing_portal_url": "/api/portal-session",
+            },
+        )
+
     settings = get_settings()
     price_name = _UPGRADE_PRICE_NAME[req.tier]
     new_price_id = settings.active_stripe_price(price_name)
     if not new_price_id:
         raise HTTPException(status_code=503, detail=f"Stripe price not configured for {req.tier}")
 
-    from src.services.stripe_service import switch_subscription_plan
     try:
         switch_subscription_plan(sub.stripe_subscription_id, new_price_id, prorate=True)
     except Exception as exc:
@@ -2600,13 +2639,30 @@ def team_view(feed_uuid: str, db: Session = Depends(get_db)):
 
 @app.get("/api/leaderboard")
 def leaderboard_endpoint(
+    request: Request,
+    response: Response,
     county_id: Optional[str] = None,
     vertical: Optional[str] = None,
 ):
     """Public weekly leaderboard. Filter by county_id and/or vertical.
-    Reads the latest snapshot written by `src.tasks.leaderboard`."""
+    Reads the latest snapshot written by `src.tasks.leaderboard`.
+
+    Phase A.2 (2026-05-04) hardening:
+      - Per-IP rate limit: 60 req/min/IP (compresses casual scraping while
+        still allowing dashboards to poll every 30s without tripping).
+      - subscriber_id stripped from the public response — kept only on the
+        on-disk snapshot for ops. Public consumers see handle + rank + counts
+        + badge.
+      - Cache-Control: public, max-age=3600. Snapshot only refreshes Monday,
+        so a 1-hour CDN / browser cache is safe and absorbs scraper traffic.
+    """
+    from src.services.rate_limit import enforce_or_429
+    enforce_or_429(request, scope="leaderboard", limit=60, window_seconds=60)
+
     from src.tasks.leaderboard import latest_snapshot
     snap = latest_snapshot()
+    response.headers["Cache-Control"] = "public, max-age=3600"
+
     if not snap:
         return {"as_of": None, "leaderboards": []}
     boards = snap.get("leaderboards", [])
@@ -2614,7 +2670,16 @@ def leaderboard_endpoint(
         boards = [b for b in boards if b["county_id"] == county_id]
     if vertical:
         boards = [b for b in boards if b["vertical"] == vertical]
-    return {"as_of": snap.get("as_of"), "leaderboards": boards}
+
+    # Strip subscriber_id from every leaderboard row before sending — the
+    # snapshot file keeps it for ops, but the public API must not.
+    public_boards = []
+    for b in boards:
+        rows = [{k: v for k, v in row.items() if k != "subscriber_id"}
+                for row in b.get("leaderboard", [])]
+        public_boards.append({**b, "leaderboard": rows})
+
+    return {"as_of": snap.get("as_of"), "leaderboards": public_boards}
 
 
 # ── Phase 2B: NWS weather alert webhook ───────────────────────────────────────
@@ -2788,6 +2853,74 @@ def get_wall_session(session_id: str):
     return state
 
 
+# ── Stage 5+: Wallet Topup — POST /api/wallet/topup ───────────────────────────
+
+# Whitelisted topup amounts (cents) → credits granted on webhook fulfillment.
+# Aligns with wallet tier pricing so a "20 credits for $25" topup matches the
+# implicit per-credit price of starter wallet ($49/20cr ≈ $2.45/cr).
+WALLET_TOPUP_PACKAGES = {
+    2500:  10,    # $25  → 10 credits
+    5000:  22,    # $50  → 22 credits (10% bonus)
+    10000: 48,    # $100 → 48 credits (20% bonus)
+}
+
+
+class WalletTopupRequest(BaseModel):
+    feed_uuid: str
+    amount_cents: int = Field(..., description="Must match a key in WALLET_TOPUP_PACKAGES")
+
+
+@app.post("/api/wallet/topup", status_code=201)
+def wallet_topup_endpoint(
+    req: WalletTopupRequest, db: Session = Depends(get_db)
+):
+    """One-tap wallet top-up. Returns Stripe PaymentIntent client_secret for
+    the Payment Sheet. Webhook (_on_wallet_topup_payment) credits the wallet
+    on payment_intent.succeeded.
+
+    Amount must match a whitelisted package — prevents arbitrary-amount
+    submissions from the client.
+    """
+    if req.amount_cents not in WALLET_TOPUP_PACKAGES:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "invalid_topup_amount",
+                "allowed_amounts_cents": sorted(WALLET_TOPUP_PACKAGES.keys()),
+            },
+        )
+
+    sub = db.execute(
+        select(Subscriber).where(Subscriber.event_feed_uuid == req.feed_uuid)
+    ).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=403, detail="Invalid feed_uuid")
+    if sub.status == "disputed":
+        raise HTTPException(
+            status_code=403,
+            detail="Account on hold for review. Email support@forcedaction.io.",
+        )
+
+    credits = WALLET_TOPUP_PACKAGES[req.amount_cents]
+    from src.services.payment_sheet import create_payment_intent as _create_pi
+    try:
+        result = _create_pi(
+            subscriber_id=sub.id,
+            amount_cents=req.amount_cents,
+            description=f"Wallet top-up — {credits} credits",
+            save_card=True,
+            db=db,
+            metadata={
+                "product": "wallet_topup",
+                "amount_cents": str(req.amount_cents),
+                "credits": str(credits),
+            },
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    return {**result, "credits": credits}
+
+
 # ── Phase 2B: Payment Sheet — POST /api/payment-intent ───────────────────────
 
 class PaymentIntentRequest(BaseModel):
@@ -2892,6 +3025,13 @@ def premium_purchase_endpoint(
     if sub is None:
         raise HTTPException(status_code=403, detail="Invalid feed_uuid")
 
+    # Block subscribers flagged after repeated disputes (fa004, 2026-05-04)
+    if sub.status == "disputed":
+        raise HTTPException(
+            status_code=403,
+            detail="Account on hold for review. Email support@forcedaction.io.",
+        )
+
     cfg = PREMIUM_CREDITS[req.sku]
 
     # SKU-specific argument validation
@@ -2899,6 +3039,30 @@ def premium_purchase_endpoint(
         raise HTTPException(status_code=400, detail=f"{req.sku} requires property_id")
     if req.sku == "byol" and not req.target_address:
         raise HTTPException(status_code=400, detail="byol requires target_address")
+
+    # Per-subscriber rate cap on the highest-ticket SKU. Prevents burst-and-
+    # dispute attacks on Transfer ($65/26cr).
+    if req.sku == "transfer":
+        from src.core.models import PremiumPurchase
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        recent_transfers = db.execute(
+            select(func.count()).select_from(PremiumPurchase).where(
+                PremiumPurchase.subscriber_id == sub.id,
+                PremiumPurchase.sku == "transfer",
+                PremiumPurchase.purchased_at >= cutoff,
+                # Don't count refunded/disputed against the cap (those are losses, not abuse)
+                PremiumPurchase.status.notin_(["refunded", "disputed", "failed"]),
+            )
+        ).scalar() or 0
+        if recent_transfers >= 3:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "error": "transfer_daily_cap_reached",
+                    "message": "Maximum 3 skip-trace transfers per 24 hours.",
+                    "retry_after_hours": 24,
+                },
+            )
 
     if req.payment_mode == "credits":
         from src.services import wallet_engine

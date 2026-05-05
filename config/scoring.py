@@ -77,14 +77,14 @@ VERTICAL_WEIGHTS = {
         "county_code_liens": 20,
     },
     "restoration": {
-        "code_violations": 90,   # Kept high for this vertical [cite: 109]
+        "code_violations": 75,   # 2026-05-04: was 90 — single signal at 90 + recency 25 auto-saturated cap at 100
         "insurance_claim": 10,   # Stacking only
         "Fire": 10,              # Stacking only
         "storm_damage": 10,      # Stacking only
         "flood_damage": 10,      # Stacking only
-        "tampa_code_liens": 75,  # Adjusted [cite: 109]
+        "tampa_code_liens": 65,  # 2026-05-04: was 75 — same saturation problem
         "building_permits": 10,  # Stacking only — active permit = contractor on job, not a distress signal
-        "enforcement_permit": 75,  # Stop work/after-the-fact/failed/expired/revoked
+        "enforcement_permit": 65,  # 2026-05-04: was 75 — same saturation problem
         "evictions": 65,
         "hoa_liens": 50,
         "divorce_filings": 25,
@@ -100,13 +100,13 @@ VERTICAL_WEIGHTS = {
     },
     "roofing": {
         "building_permits": 10,  # Stacking only — active permit = contractor on job, not a lead signal
-        "enforcement_permit": 80,  # Stop work/after-the-fact/failed/expired/revoked — real distress
+        "enforcement_permit": 70,  # 2026-05-04: was 80 — was hitting cap when stacked with universal bonuses
         "insurance_claim": 10,   # Stacking only
         "Fire": 10,              # Stacking only
         "storm_damage": 10,      # Stacking only
         "flood_damage": 10,      # Stacking only
-        "code_violations": 68,   # Lowered from 90 [cite: 109]
-        "tampa_code_liens": 65,  # Lowered from 80 [cite: 109]
+        "code_violations": 58,   # 2026-05-04: was 68 — code_violations also drives restoration/PA, multi-vertical correlation
+        "tampa_code_liens": 55,  # 2026-05-04: was 65 — same multi-vertical correlation
         "mechanics_liens": 60,   # Adjusted [cite: 109]
         "hoa_liens": 60,
         "divorce_filings": 20,
@@ -121,14 +121,14 @@ VERTICAL_WEIGHTS = {
         "deed_transfers": 20,
     },
     "public_adjusters": {        # Activated Vertical
-        "code_violations": 85,
-        "insurance_claim": 10,   # Stacking only
+        "code_violations": 70,   # 2026-05-04: was 85 — base + recency was capping; same signal also fires restoration/roofing
+        "insurance_claim": 72,   # 2026-05-04: promoted from stacking-only (was 10) — PA primary signal; Restoration owns code_violations
         "Fire": 10,              # Stacking only
         "storm_damage": 10,      # Stacking only
         "flood_damage": 10,      # Stacking only
-        "tampa_code_liens": 70,  # Adjusted from 80
+        "tampa_code_liens": 60,  # 2026-05-04: was 70 — same saturation problem
         "building_permits": 55,  # Adjusted [cite: 109]
-        "enforcement_permit": 70,  # Stop work/after-the-fact/failed/expired/revoked
+        "enforcement_permit": 60,  # 2026-05-04: was 70 — same saturation problem
         "hoa_liens": 50,         # Adjusted from 55
         "divorce_filings": 20,
         "mechanics_liens": 50,   # Adjusted from 60
@@ -172,9 +172,9 @@ VERTICAL_WEIGHTS = {
 # Signal date used: filing_date / opened_date / issue_date / record_date.
 
 RECENCY_BONUSES = [
-    (7,   25),   # under 7 days old:   +25
-    (14,  15),   # 7-14 days old:      +15
-    (30,   5),   # 14-30 days old:     +5
+    (7,   15),   # 2026-05-04: was 25 — combined with high base weights this auto-saturated the cap
+    (14,  10),   # 2026-05-04: was 15
+    (30,   5),   # 14-30 days old:     +5  (unchanged)
     (None, 0),   # over 30 days old:   +0
 ]
 
@@ -205,14 +205,16 @@ EQUITY_VERTICALS   = {"wholesalers", "fix_flip", "attorneys", "roofing", "restor
 
 STACKING_WINDOW_DAYS      = 180  # Approved 2026-03-25: expanded from 90 to capture wider stacking signal window
 STACKING_BONUS_PER_SIGNAL = 20
-STACKING_BONUS_CAP        = 60
+STACKING_BONUS_CAP        = 40   # 2026-05-04: was 60 — restored to match docstring intent (+20 per extra signal, max +40)
 
 # ── Stacking-only signals ─────────────────────────────────────────────────────
 # These signals cannot act as the PRIMARY scoring signal on their own.
 # A property carrying ONLY these signal types is not scored (returns 0).
 # They contribute only as stacking bonuses when a primary signal is also present.
 STACKING_ONLY_SIGNALS = {
-    "insurance_claim",
+    # insurance_claim removed 2026-05-04: promoted to PA primary signal (weight 72).
+    # Keeps weight 10 in all other verticals — below Gold threshold, so won't surface
+    # standalone leads there. PA now has a unique primary separate from Restoration.
     "fire",
     "storm_damage",
     "flood_damage",
@@ -307,9 +309,9 @@ EQUITY_BONUS_BY_VERTICAL = {
 # Based on final_cds_score (= max across all 6 verticals).
 
 ROUTING_THRESHOLDS = {
-    "immediate": 80,   # Real-time SMS within 15 minutes
-    "daily":     57,   # Daily morning briefing email — aligned with Gold cutoff
-    "weekly":    40,   # Weekly digest only
+    "immediate": 78,   # 2026-05-04: was 80 — aligned with new Platinum floor
+    "daily":     55,   # 2026-05-04: was 57 — aligned with new Gold cutoff
+    "weekly":    40,   # Weekly digest only (unchanged — matches Silver floor)
     # below weekly threshold → urgency_level = "Low", not routed
 }
 
@@ -317,9 +319,9 @@ ROUTING_THRESHOLDS = {
 # Maps final_cds_score ranges to DistressScore.lead_tier values.
 
 LEAD_TIER_THRESHOLDS = [
-    (95, "Ultra Platinum"),   # raised from 90 — base weights of 90/85 made UP too accessible
-    (83, "Platinum"),          # raised from 80 — wider 83–94 band is defensible at price
-    (57, "Gold"),
+    (92, "Ultra Platinum"),   # 2026-05-04: was 95 — top base weights lowered, cap rarely reached now, so threshold also drops
+    (78, "Platinum"),          # 2026-05-04: was 83 — keeps proportional band shape
+    (55, "Gold"),              # 2026-05-04: was 57 — small alignment with daily-routing cutoff
     (40, "Silver"),
     (0,  "Bronze"),
 ]

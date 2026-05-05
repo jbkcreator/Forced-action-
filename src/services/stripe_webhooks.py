@@ -112,6 +112,9 @@ def handle_webhook(raw_body: bytes, sig_header: str, db: Session) -> tuple[bool,
         "customer.subscription.updated": _on_subscription_updated,
         "customer.subscription.deleted": _on_subscription_deleted,
         "payment_intent.succeeded":      _on_payment_intent_succeeded,
+        "charge.refunded":                _on_charge_refunded,
+        "charge.dispute.created":         _on_dispute_created,
+        "charge.dispute.funds_withdrawn": _on_dispute_funds_withdrawn,
     }
 
     handler = handlers.get(event_type)
@@ -394,6 +397,27 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
                     "First leads email failed for subscriber %s — non-critical",
                     subscriber.id, exc_info=True,
                 )
+
+    # ── Referral confirmation (Phase A.1, 2026-05-04) ────────────────────
+    # The referee just made their first paid purchase — flip any pending
+    # ReferralEvent to confirmed and credit the referrer. Idempotent:
+    # confirm_purchase only matches pending rows, so a duplicate webhook
+    # delivery is a no-op. Best-effort — referral failures must not break
+    # the checkout flow.
+    try:
+        from src.services.referral_engine import confirm_purchase, reward_referrer
+        event = confirm_purchase(subscriber.id, db)
+        if event is not None:
+            reward_referrer(event.id, db)
+            logger.info(
+                "[Referral] confirmed + rewarded: referee=%d event=%d",
+                subscriber.id, event.id,
+            )
+    except Exception:
+        logger.error(
+            "[Referral] confirm/reward failed for subscriber %d — non-fatal",
+            subscriber.id, exc_info=True,
+        )
 
     logger.info(
         "checkout.session.completed: subscriber=%s tier=%s vertical=%s"
@@ -1219,6 +1243,10 @@ def _on_payment_intent_succeeded(payment_intent: dict, db: Session) -> None:
         _on_premium_payment(payment_intent, db)
         return
 
+    if product == "wallet_topup":
+        _on_wallet_topup_payment(payment_intent, db)
+        return
+
     if product == "lead_unlock":
         _on_lead_unlock_payment(payment_intent, db)
         # Fall through to card-save so the unlock also triggers the saved-card flow
@@ -1540,6 +1568,286 @@ def _on_premium_payment(payment_intent: dict, db: Session) -> None:
     logger.info(
         "[Premium] Purchase recorded: id=%d sku=%s subscriber=%d pi=%s",
         purchase.id, sku, subscriber_id, pi_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 6e. payment_intent.succeeded — wallet top-ups (Stage 5+, fa004 2026-05-04)
+# ---------------------------------------------------------------------------
+
+def _on_wallet_topup_payment(payment_intent: dict, db: Session) -> None:
+    """Credit the subscriber's wallet for a successful wallet top-up.
+
+    Idempotent on the PaymentIntent id — replayed events become a no-op
+    via the (subscriber_id, stripe_charge_id) duplicate check on
+    WalletTransaction.
+    """
+    from src.core.models import Subscriber, WalletTransaction
+    from src.services import wallet_engine
+
+    meta = payment_intent.get("metadata", {}) or {}
+    pi_id = payment_intent.get("id")
+    subscriber_id_str = meta.get("subscriber_id")
+    credits_str = meta.get("credits")
+    amount_cents_str = meta.get("amount_cents")
+
+    if not all([pi_id, subscriber_id_str, credits_str]):
+        logger.error("[WalletTopup] missing metadata: pi=%s meta=%s", pi_id, meta)
+        return
+
+    try:
+        subscriber_id = int(subscriber_id_str)
+        credits = int(credits_str)
+    except (TypeError, ValueError):
+        logger.error("[WalletTopup] non-int metadata: %s", meta)
+        return
+
+    sub = db.get(Subscriber, subscriber_id)
+    if sub is None:
+        logger.error("[WalletTopup] subscriber=%d not found", subscriber_id)
+        return
+
+    # Secondary idempotency — protect against StripeWebhookEvent table being
+    # truncated. WalletTransaction.stripe_charge_id is the dedup key.
+    existing = db.execute(
+        select(WalletTransaction).where(
+            WalletTransaction.subscriber_id == subscriber_id,
+            WalletTransaction.stripe_charge_id == pi_id,
+        )
+    ).scalar_one_or_none()
+    if existing:
+        logger.info("[WalletTopup] already credited PI %s — skipping", pi_id)
+        return
+
+    wallet_engine.credit(
+        subscriber_id=subscriber_id,
+        amount=credits,
+        description=f"wallet_topup:{amount_cents_str}cents",
+        db=db,
+        stripe_charge_id=pi_id,
+    )
+    logger.info(
+        "[WalletTopup] subscriber=%d credited=%d cents=%s pi=%s",
+        subscriber_id, credits, amount_cents_str, pi_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 6d. charge.refunded — refund clawback (Stage 5+, fa004 2026-05-04)
+# ---------------------------------------------------------------------------
+
+# SKUs whose fulfillment surrenders data that can't be unsent. Refunding the
+# card payment does NOT credit-back the wallet for these; we log the loss.
+_DATA_SURRENDERED_SKUS = {"transfer", "byol"}
+
+
+def _resolve_premium_purchase_from_charge(charge: dict, db: Session):
+    """Look up a PremiumPurchase by the charge's payment_intent or charge id.
+
+    Stripe sends `charge.refunded` and `charge.dispute.*` events whose object
+    is a Charge. We persisted the PaymentIntent ID on the original purchase,
+    not the Charge ID — so prefer payment_intent first, fall back to
+    stripe_charge_id (set by record_card_purchase or by this handler).
+    """
+    from src.core.models import PremiumPurchase
+    pi_id = charge.get("payment_intent")
+    charge_id = charge.get("id")
+    purchase = None
+    if pi_id:
+        purchase = db.execute(
+            select(PremiumPurchase)
+            .where(PremiumPurchase.stripe_payment_intent_id == pi_id)
+            .with_for_update()
+        ).scalar_one_or_none()
+    if purchase is None and charge_id:
+        purchase = db.execute(
+            select(PremiumPurchase)
+            .where(PremiumPurchase.stripe_charge_id == charge_id)
+            .with_for_update()
+        ).scalar_one_or_none()
+    return purchase
+
+
+def _send_founder_alert(message: str) -> None:
+    """Founder SMS alert via the existing Revenue Pulse SMS path. Best-effort."""
+    try:
+        from src.tasks.revenue_pulse import _send_sms
+        _send_sms(message[:320])
+    except Exception as exc:
+        logger.error("Founder alert failed: %s", exc)
+
+
+def _on_charge_refunded(charge: dict, db: Session) -> None:
+    """charge.refunded — flip purchase status, optionally clawback credits.
+
+    Policy:
+      - Card-paid purchases: status → refunded, log refund_amount_cents.
+      - Credit-paid purchases of artifact SKUs (report/brief): credit-back the
+        wallet via wallet_engine.refund_credits() so the user isn't double-charged.
+      - Credit-paid purchases of data-surrendered SKUs (transfer/byol): no
+        credit clawback — the underlying cost (BatchData lookup) was paid and
+        the data can't be unsent. Log the loss; ops can manually adjust.
+    """
+    from src.core.models import PremiumPurchase
+    purchase = _resolve_premium_purchase_from_charge(charge, db)
+    if purchase is None:
+        # Not one of our premium charges (could be a wallet topup, lead pack, etc.)
+        # Future: extend to handle those if/when their refund handlers land.
+        logger.debug("[Refund] no PremiumPurchase for charge=%s", charge.get("id"))
+        return
+
+    if purchase.status == "refunded":
+        logger.info("[Refund] purchase %d already refunded — skipping", purchase.id)
+        return
+
+    refund_amount = charge.get("amount_refunded") or charge.get("amount") or 0
+    refunds = (charge.get("refunds", {}) or {}).get("data") or [{}]
+    reason = (refunds[0].get("reason") if refunds else None) or "unspecified"
+
+    purchase.status = "refunded"
+    purchase.refunded_at = datetime.now(timezone.utc)
+    purchase.refund_reason = reason[:100]
+    purchase.refund_amount_cents = refund_amount
+    if not purchase.stripe_charge_id and charge.get("id"):
+        purchase.stripe_charge_id = charge["id"]
+    db.flush()
+
+    if purchase.paid_via == "credits" and purchase.sku not in _DATA_SURRENDERED_SKUS:
+        from src.services import wallet_engine
+        wallet_engine.refund_credits(
+            subscriber_id=purchase.subscriber_id,
+            amount=purchase.credits_spent or 0,
+            description=f"refund_clawback:{purchase.sku}:{purchase.id}",
+            db=db,
+            stripe_charge_id=charge.get("id"),
+        )
+        logger.info(
+            "[Refund] credit clawback: purchase=%d sku=%s credits=%d",
+            purchase.id, purchase.sku, purchase.credits_spent or 0,
+        )
+    elif purchase.paid_via == "credits":
+        logger.warning(
+            "[Refund] data-surrendered SKU not credit-clawed: purchase=%d sku=%s",
+            purchase.id, purchase.sku,
+        )
+
+    _send_founder_alert(
+        f"REFUND: {purchase.sku} ${(refund_amount or 0) / 100:.0f} sub={purchase.subscriber_id} "
+        f"purchase={purchase.id} reason={reason}"
+    )
+    logger.info(
+        "[Refund] purchase=%d sku=%s amount_cents=%d reason=%s",
+        purchase.id, purchase.sku, refund_amount, reason,
+    )
+
+
+def _on_dispute_created(dispute: dict, db: Session) -> None:
+    """charge.dispute.created — set status='disputed', bump subscriber counter.
+
+    Funds aren't withdrawn yet, but the dispute itself is the trust signal.
+    Two disputes in 90 days flips the subscriber to status='disputed' which
+    blocks future premium purchases at the API layer.
+    """
+    from src.core.models import PremiumPurchase
+    charge = dispute.get("charge")
+    # Stripe wraps the charge id when expanded, or sends the id as a string
+    if isinstance(charge, dict):
+        charge_obj = charge
+    else:
+        # fall back to a stub so the resolver can match by charge id
+        charge_obj = {"id": charge, "payment_intent": dispute.get("payment_intent")}
+
+    purchase = _resolve_premium_purchase_from_charge(charge_obj, db)
+    if purchase is None:
+        logger.debug("[Dispute] no PremiumPurchase for charge=%s", charge_obj.get("id"))
+        return
+
+    reason = dispute.get("reason") or "unknown"
+    purchase.status = "disputed"
+    purchase.disputed_at = datetime.now(timezone.utc)
+    purchase.dispute_reason = reason[:100]
+    if not purchase.stripe_charge_id and charge_obj.get("id"):
+        purchase.stripe_charge_id = charge_obj["id"]
+
+    # Bump subscriber-level counter and check the 2-in-90-day flip
+    sub = db.execute(
+        select(Subscriber).where(Subscriber.id == purchase.subscriber_id).with_for_update()
+    ).scalar_one_or_none()
+    if sub:
+        sub.disputed_count = (sub.disputed_count or 0) + 1
+        sub.disputed_at = datetime.now(timezone.utc)
+        # Flip to 'disputed' status if 2+ disputes in 90 days
+        cutoff = datetime.now(timezone.utc) - timedelta(days=90)
+        recent = db.execute(
+            select(func.count()).select_from(PremiumPurchase).where(
+                PremiumPurchase.subscriber_id == sub.id,
+                PremiumPurchase.disputed_at.isnot(None),
+                PremiumPurchase.disputed_at >= cutoff,
+            )
+        ).scalar() or 0
+        if recent >= 2 and sub.status not in ("churned", "cancelled"):
+            sub.status = "disputed"
+            logger.warning(
+                "[Dispute] subscriber=%d flipped to status=disputed (%d disputes in 90d)",
+                sub.id, recent,
+            )
+    db.flush()
+
+    _send_founder_alert(
+        f"DISPUTE: {purchase.sku} sub={purchase.subscriber_id} "
+        f"purchase={purchase.id} reason={reason}"
+    )
+    logger.info(
+        "[Dispute] purchase=%d sku=%s reason=%s",
+        purchase.id, purchase.sku, reason,
+    )
+
+
+def _on_dispute_funds_withdrawn(dispute: dict, db: Session) -> None:
+    """charge.dispute.funds_withdrawn — funds actually pulled by the bank.
+
+    This is the realised-loss event. We treat it like a refund for the
+    purpose of credit clawback (artifact SKUs only) and update the running
+    refund_amount_cents on the purchase. Status stays 'disputed' so ops can
+    distinguish a chargeback from a friendly refund.
+    """
+    from src.core.models import PremiumPurchase
+    charge = dispute.get("charge")
+    if isinstance(charge, dict):
+        charge_obj = charge
+    else:
+        charge_obj = {"id": charge, "payment_intent": dispute.get("payment_intent")}
+
+    purchase = _resolve_premium_purchase_from_charge(charge_obj, db)
+    if purchase is None:
+        logger.debug(
+            "[DisputeFunds] no PremiumPurchase for charge=%s", charge_obj.get("id"),
+        )
+        return
+
+    amount = dispute.get("amount") or 0
+    purchase.refund_amount_cents = amount
+    if not purchase.refunded_at:
+        purchase.refunded_at = datetime.now(timezone.utc)
+    db.flush()
+
+    if purchase.paid_via == "credits" and purchase.sku not in _DATA_SURRENDERED_SKUS:
+        from src.services import wallet_engine
+        wallet_engine.refund_credits(
+            subscriber_id=purchase.subscriber_id,
+            amount=purchase.credits_spent or 0,
+            description=f"dispute_clawback:{purchase.sku}:{purchase.id}",
+            db=db,
+            stripe_charge_id=charge_obj.get("id"),
+        )
+
+    _send_founder_alert(
+        f"CHARGEBACK: {purchase.sku} ${amount / 100:.0f} sub={purchase.subscriber_id} "
+        f"purchase={purchase.id}"
+    )
+    logger.warning(
+        "[DisputeFunds] purchase=%d sku=%s amount_cents=%d",
+        purchase.id, purchase.sku, amount,
     )
 
 

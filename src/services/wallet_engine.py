@@ -1,5 +1,12 @@
 """
 Wallet engine — credit balance management, enrollment, auto-reload, bonuses.
+
+Concurrency notes (2026-05-04):
+  Every function that mutates `WalletBalance.credits_remaining` reads the row
+  with `with_for_update()` so concurrent debits/credits/auto-reloads serialize
+  on the row-level lock. A Postgres CHECK constraint on the column
+  (credits_nonneg) is the belt-and-braces guard: even if a future code path
+  forgets the lock, the DB rejects negative balances.
 """
 
 import logging
@@ -23,10 +30,27 @@ from src.core.models import Subscriber, WalletBalance, WalletTransaction
 logger = logging.getLogger(__name__)
 
 
-def get_or_create_wallet(subscriber_id: int, db: Session) -> WalletBalance:
-    wallet = db.execute(
-        select(WalletBalance).where(WalletBalance.subscriber_id == subscriber_id)
+def _select_wallet_for_update(subscriber_id: int, db: Session) -> Optional[WalletBalance]:
+    """Read the wallet row with a row-level lock so concurrent mutators serialize."""
+    return db.execute(
+        select(WalletBalance)
+        .where(WalletBalance.subscriber_id == subscriber_id)
+        .with_for_update()
     ).scalar_one_or_none()
+
+
+def get_or_create_wallet(subscriber_id: int, db: Session, lock: bool = False) -> WalletBalance:
+    """Return the wallet row, creating it if missing.
+
+    Pass lock=True from any caller that intends to mutate `credits_remaining`
+    so the row is locked from the moment we read it.
+    """
+    if lock:
+        wallet = _select_wallet_for_update(subscriber_id, db)
+    else:
+        wallet = db.execute(
+            select(WalletBalance).where(WalletBalance.subscriber_id == subscriber_id)
+        ).scalar_one_or_none()
     if wallet is None:
         wallet = WalletBalance(
             subscriber_id=subscriber_id,
@@ -36,10 +60,15 @@ def get_or_create_wallet(subscriber_id: int, db: Session) -> WalletBalance:
         )
         db.add(wallet)
         db.flush()
+        # Re-fetch with the lock held so the caller's mutation is serialized
+        # against any racing creator that lost the unique-constraint contest.
+        if lock:
+            wallet = _select_wallet_for_update(subscriber_id, db) or wallet
     return wallet
 
 
 def get_balance(subscriber_id: int, db: Session) -> int:
+    """Read-only balance — no lock."""
     wallet = db.execute(
         select(WalletBalance).where(WalletBalance.subscriber_id == subscriber_id)
     ).scalar_one_or_none()
@@ -47,8 +76,13 @@ def get_balance(subscriber_id: int, db: Session) -> int:
 
 
 def debit(subscriber_id: int, action: str, db: Session, description: str = "") -> bool:
+    """Atomic debit. Returns False if the wallet has insufficient credits.
+
+    Holds a row-level lock for the duration so concurrent debits cannot both
+    pass the balance check on the same wallet.
+    """
     cost = CREDIT_COSTS.get(action, 1)
-    wallet = get_or_create_wallet(subscriber_id, db)
+    wallet = get_or_create_wallet(subscriber_id, db, lock=True)
     if wallet.credits_remaining < cost:
         return False
     wallet.credits_remaining -= cost
@@ -75,12 +109,41 @@ def credit(
     db: Session,
     stripe_charge_id: Optional[str] = None,
 ) -> WalletTransaction:
-    wallet = get_or_create_wallet(subscriber_id, db)
+    """Atomic credit add. Locks the wallet row."""
+    wallet = get_or_create_wallet(subscriber_id, db, lock=True)
     wallet.credits_remaining += amount
     txn = WalletTransaction(
         subscriber_id=subscriber_id,
         wallet_id=wallet.id,
         txn_type="credit",
+        amount=amount,
+        balance_after=wallet.credits_remaining,
+        description=description,
+        stripe_charge_id=stripe_charge_id,
+    )
+    db.add(txn)
+    db.flush()
+    return txn
+
+
+def refund_credits(
+    subscriber_id: int,
+    amount: int,
+    description: str,
+    db: Session,
+    stripe_charge_id: Optional[str] = None,
+) -> WalletTransaction:
+    """Refund credits to the wallet (e.g. clawback of a refunded purchase).
+
+    Distinct txn_type='refund' so the audit trail separates customer-facing
+    refunds from organic credits/reloads.
+    """
+    wallet = get_or_create_wallet(subscriber_id, db, lock=True)
+    wallet.credits_remaining += amount
+    txn = WalletTransaction(
+        subscriber_id=subscriber_id,
+        wallet_id=wallet.id,
+        txn_type="refund",
         amount=amount,
         balance_after=wallet.credits_remaining,
         description=description,
@@ -134,9 +197,7 @@ def check_enrollment_triggers(subscriber_id: int, db: Session) -> Optional[str]:
 
 
 def enroll(subscriber_id: int, tier: str, db: Session) -> WalletBalance:
-    existing = db.execute(
-        select(WalletBalance).where(WalletBalance.subscriber_id == subscriber_id)
-    ).scalar_one_or_none()
+    existing = _select_wallet_for_update(subscriber_id, db)
     tier_config = WALLET_TIERS.get(tier, WALLET_TIERS["starter_wallet"])
     if existing:
         existing.wallet_tier = tier
@@ -154,6 +215,7 @@ def enroll(subscriber_id: int, tier: str, db: Session) -> WalletBalance:
 
 
 def check_auto_reload(wallet: WalletBalance, db: Session) -> bool:
+    """Auto-reload runs inside the same lock the caller holds (debit() does)."""
     if not wallet.auto_reload_enabled:
         return False
     sub = db.get(Subscriber, wallet.subscriber_id)
@@ -207,7 +269,7 @@ def add_bonus(subscriber_id: int, amount: int, reason: str, db: Session) -> Wall
     # Enforce guardrail: max 10 bonus credits per event
     guardrail = get_guardrail("credit_bonus_max")
     capped = min(amount, guardrail.get("max_credits", 10))
-    wallet = get_or_create_wallet(subscriber_id, db)
+    wallet = get_or_create_wallet(subscriber_id, db, lock=True)
     wallet.credits_remaining += capped
     txn = WalletTransaction(
         subscriber_id=subscriber_id,

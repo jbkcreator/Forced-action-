@@ -158,4 +158,14 @@ COUNTY_ID=hillsborough
 # and injected into the 09:30 weekly one-pager + served by /api/leaderboard.
 0 9 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.leaderboard
 
+# Stripe webhook event retention — Sunday 04:00 UTC. Deletes
+# StripeWebhookEvent rows older than 90 days (Stripe retries cap at 30 days,
+# so 90d is generous belt-and-braces).
+0 4 * * 0 $PROJECT/scripts/cron/run.sh src.tasks.stripe_event_retention
+
+# A/B auto-rollback monitor — daily 09:00 UTC. Walks active AbTests,
+# retires losing variants past 200 sends with >2σ deficit, fires founder
+# SMS + writes a learning_card row.
+0 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.ab_rollback_check
+
 # === END FORCED-ACTION-PLATFORM ===

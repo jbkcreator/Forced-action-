@@ -49,13 +49,23 @@ _OPT_OUT_REPLY = (
 _QUIET_START = 21   # 9pm (exclusive upper bound)
 _QUIET_END   = 8    # 8am (inclusive lower bound)
 
-# Area code → IANA timezone. All current FL area codes are Eastern.
+# Area code → IANA timezone. Most FL area codes are Eastern.
+#
+# Panhandle exception: 850 spans both ET (Tallahassee) and CST (Pensacola).
+# We map it to America/Chicago because the safe direction is to OVER-suppress
+# (treat ET-side 850 numbers as if they were CST → quiet hours start an hour
+# earlier than necessary). Mapping to ET would UNDER-suppress for CST numbers
+# and risk a TCPA violation between 8pm and 9pm CST.
+#
 # Extend this dict when the platform expands to other states.
 _AREA_CODE_TZ: dict[str, str] = {
-    ac: "America/New_York" for ac in [
-        "239", "305", "321", "352", "386", "407", "561", "727",
-        "754", "772", "786", "813", "850", "863", "904", "941", "954",
-    ]
+    "850": "America/Chicago",   # Panhandle (CST + ET) — conservative CST mapping
+    **{
+        ac: "America/New_York" for ac in [
+            "239", "305", "321", "352", "386", "407", "561", "727",
+            "754", "772", "786", "813", "863", "904", "941", "954",
+        ]
+    },
 }
 
 

@@ -204,13 +204,26 @@ def switch_to_annual(subscriber_id: int, db: Session) -> bool:
     Switch a subscriber's Stripe subscription from monthly to annual.
     Called after subscriber accepts the annual offer.
     Returns True on success.
+
+    Refuses to call Stripe when the subscriber is in a billing-broken state
+    (grace / churned / cancelled / paused / disputed). The /api/annual/accept
+    endpoint maps the False return to a 409 with billing-portal url so the
+    user fixes their card before retrying.
     """
-    from src.services.stripe_service import switch_subscription_plan
+    from src.services.stripe_service import can_switch_subscription, switch_subscription_plan
 
     sub = db.get(Subscriber, subscriber_id)
     if not sub or not sub.stripe_subscription_id:
         logger.error(
             "switch_to_annual: subscriber %d has no active subscription", subscriber_id
+        )
+        return False
+
+    ok, reason = can_switch_subscription(sub)
+    if not ok:
+        logger.warning(
+            "switch_to_annual: subscriber=%d blocked by status=%s",
+            subscriber_id, reason,
         )
         return False
 

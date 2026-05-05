@@ -743,6 +743,10 @@ class Subscriber(Base):
     referral_code: Mapped[Optional[str]] = mapped_column(String(20), unique=True, index=True)
     auto_mode_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
+    # ── Stage 5+: dispute / fraud tracking (added 2026-05-04, fa004) ──
+    disputed_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    disputed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
     bundle_purchases = relationship("BundlePurchase", back_populates="subscriber")
 
     # Audit
@@ -761,7 +765,7 @@ class Subscriber(Base):
             name="check_subscriber_tier",
         ),
         CheckConstraint(
-            "status IN ('active', 'grace', 'churned', 'cancelled', 'paused')",
+            "status IN ('active', 'grace', 'churned', 'cancelled', 'paused', 'disputed')",
             name="check_subscriber_status",
         ),
     )
@@ -1659,19 +1663,64 @@ class PremiumPurchase(Base):
     property_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("properties.id"), index=True)
     target_address: Mapped[Optional[str]] = mapped_column(String(255))       # for BYOL when no property_id
     output_ref: Mapped[Optional[str]] = mapped_column(String(255))           # path to PDF / FK to enriched_contacts.id
-    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")  # pending|delivered|failed
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")  # pending|delivered|failed|refunded|disputed
     purchased_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    # ── Refund / dispute audit (fa004, 2026-05-04) ──────────────────
+    refunded_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    refund_reason: Mapped[Optional[str]] = mapped_column(String(100))
+    refund_amount_cents: Mapped[Optional[int]] = mapped_column(Integer)
+    disputed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    dispute_reason: Mapped[Optional[str]] = mapped_column(String(100))
+    stripe_charge_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)
 
     __table_args__ = (
         CheckConstraint("sku IN ('report', 'brief', 'transfer', 'byol')", name="check_premium_sku"),
         CheckConstraint("paid_via IN ('credits', 'card')", name="check_premium_paid_via"),
-        CheckConstraint("status IN ('pending', 'delivered', 'failed')", name="check_premium_status"),
+        CheckConstraint(
+            "status IN ('pending', 'delivered', 'failed', 'refunded', 'disputed')",
+            name="check_premium_status",
+        ),
         Index("idx_premium_purchase_sub_sku", "subscriber_id", "sku"),
     )
 
     def __repr__(self):
         return f"<PremiumPurchase(id={self.id}, sku={self.sku}, paid_via={self.paid_via}, status={self.status})>"
+
+
+class EnrichmentUsageLog(Base):
+    """
+    Per-call cost log for third-party enrichment vendors (BatchData skip-trace,
+    future Twilio Lookup, etc.).
+
+    Drives the per-SKU margin dashboard and the daily Revenue Pulse line for
+    each enrichment-backed product (lead unlock, BYOL, Transfer, batch run).
+    Append-only — one row per vendor lookup, success or failure.
+
+    Added 2026-05-04 (fa004).
+    """
+    __tablename__ = "enrichment_usage_logs"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    vendor: Mapped[str] = mapped_column(String(30), nullable=False)              # batchdata | twilio_lookup | ...
+    purpose: Mapped[str] = mapped_column(String(40), nullable=False)             # premium_transfer | premium_byol | lead_unlock | batch_skip_trace
+    subscriber_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("subscribers.id"), index=True)
+    property_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("properties.id"), index=True)
+    target_address: Mapped[Optional[str]] = mapped_column(String(255))
+    cost_cents: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    success: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    error: Mapped[Optional[str]] = mapped_column(String(255))
+    request_ref: Mapped[Optional[str]] = mapped_column(String(100))               # vendor request id, batch id, etc.
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+
+    __table_args__ = (
+        Index("idx_enrichment_purpose_created", "purpose", "created_at"),
+        Index("idx_enrichment_vendor_created", "vendor", "created_at"),
+    )
+
+    def __repr__(self):
+        return f"<EnrichmentUsageLog(vendor={self.vendor}, purpose={self.purpose}, cost_cents={self.cost_cents})>"
 
 
 class SmsOptIn(Base):
