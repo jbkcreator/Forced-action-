@@ -3157,3 +3157,17 @@ async def twilio_voice_webhook(request: Request, db: Session = Depends(get_db)):
     from src.services.signup_engine import handle_missed_call
     twiml = handle_missed_call(from_number=from_number, db=db)
     return Response(content=twiml, media_type="application/xml")
+
+
+# ---------------------------------------------------------------------------
+# SPA catch-all — must be LAST so it never shadows /api/* or /webhooks/*
+# Handles any client-side route (e.g. /dashboard/:uuid/settings, /proof-wall)
+# that the browser requests directly on reload or deep-link.
+# ---------------------------------------------------------------------------
+
+@app.get("/{full_path:path}", include_in_schema=False)
+def spa_fallback(full_path: str):
+    react_index = REACT_DIST / "index.html"
+    if react_index.is_file():
+        return FileResponse(str(react_index))
+    raise HTTPException(status_code=503, detail="UI not built — run npm run build in Forced-action-ui/")

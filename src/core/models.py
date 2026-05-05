@@ -761,7 +761,7 @@ class Subscriber(Base):
         Index("idx_subscriber_status", "status"),
         Index("idx_subscriber_vertical", "vertical"),
         CheckConstraint(
-            "tier IN ('free', 'starter', 'pro', 'dominator', 'data_only', 'autopilot_lite', 'autopilot_pro', 'partner')",
+            "tier IN ('free', 'starter', 'pro', 'dominator', 'data_only', 'autopilot_lite', 'autopilot_pro', 'partner', 'annual_lock')",
             name="check_subscriber_tier",
         ),
         CheckConstraint(
