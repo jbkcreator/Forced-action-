@@ -225,6 +225,13 @@ STACKING_ONLY_SIGNALS = {
     "building_permits",
 }
 
+# Minimum vertical weight for a signal to count toward the stacking bonus.
+# Signals with weight below this threshold are low-context filler (e.g. insurance_claim
+# at weight 10 in roofing/restoration) and should not inflate the stacking count.
+# insurance_claim at weight 72 in public_adjusters still qualifies — PA is the only
+# vertical where it acts as a primary distress signal.
+STACKING_MIN_WEIGHT = 30
+
 # ── Age decay ─────────────────────────────────────────────────────────────────
 # Applied as a negative modifier to signals that are stale.
 # Penalises old records even if their base weight is high (may be settled/resolved).

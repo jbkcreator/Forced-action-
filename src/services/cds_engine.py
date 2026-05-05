@@ -98,6 +98,7 @@ from config.scoring import (
     STACKING_ONLY_SIGNALS,
     OWNER_OCCUPIED_EXCLUSION_VERTICALS,
     DEAD_LEAD_DEED_DAYS,
+    STACKING_MIN_WEIGHT,
     STACKING_WINDOW_DAYS,
     VERTICAL_WEIGHTS,
 )
@@ -535,12 +536,17 @@ class MultiVerticalScorer:
         if "code_violations" in latest_by_type and violation_count > 0:
             prior_viol_mod = self._prior_violations_modifier(violation_count)
 
-        # Stacking: count ALL distinct signal types within the window.
-        # Incidents count toward stacking bonus once a primary signal is confirmed
-        # present (the guard above ensures we never reach here without one).
+        # Stacking: count only signals that are meaningful for this vertical.
+        # Exclude stacking-only types (building_permits, fire, storm/flood) — they
+        # are context signals, not independent distress events, and must not inflate
+        # the stacking count. Also exclude low-weight filler signals (weight < 30,
+        # e.g. insurance_claim at 10 in roofing/restoration) — they represent
+        # tangential correlation, not genuine co-occurring distress.
         signals_within_window = sum(
-            1 for si in latest_by_type.values()
-            if si["date"] and (today - si["date"]).days <= STACKING_WINDOW_DAYS
+            1 for sig_type, si in latest_by_type.items()
+            if sig_type not in STACKING_ONLY_SIGNALS
+            and weights.get(sig_type, 0) >= STACKING_MIN_WEIGHT
+            and si["date"] and (today - si["date"]).days <= STACKING_WINDOW_DAYS
         )
         stacking_bonus = min(
             max(0, signals_within_window - 1) * STACKING_BONUS_PER_SIGNAL,

@@ -43,6 +43,11 @@ PRODUCTS = [
     {"key": "bundle_storm",         "name": "Bundle: Storm Pack",       "amount": 3900,   "recurring": None},      # $39, NWS-activated
     {"key": "bundle_zip_booster",   "name": "Bundle: ZIP Booster",      "amount": 2900,   "recurring": None},      # $29, 10 extra leads in ZIP for 48h
     {"key": "bundle_monthly_reload","name": "Bundle: Monthly Reload",   "amount": 8900,   "recurring": "month"},   # $89/mo, 30 recurring credits
+    # ── Phase 2B premium credit SKUs ─────────────────────────────────────────
+    {"key": "premium_report",       "name": "Premium: Property Report", "amount": 700,    "recurring": None},      # $7,  3 credits
+    {"key": "premium_brief",        "name": "Premium: Lead Brief",      "amount": 1200,   "recurring": None},      # $12, 5 credits
+    {"key": "premium_transfer",     "name": "Premium: Skip-Trace Transfer", "amount": 6500, "recurring": None},    # $65, 26 credits
+    {"key": "premium_byol",         "name": "Premium: BYOL Skip-Trace", "amount": 500,    "recurring": None},      # $5,  2 credits
 ]
 
 
@@ -82,10 +87,25 @@ def seed():
     print(f"Creating {len(PRODUCTS)} products + prices in the TEST account.\n")
 
     results = {}
+    skipped = 0
     for item in PRODUCTS:
         lookup_key = f"fa_{item['key']}"
         price_label = _fmt_price(item["amount"], item["recurring"])
 
+        # Check if a price with this lookup_key already exists — skip if so.
+        try:
+            existing = stripe.Price.list(lookup_keys=[lookup_key], limit=1)
+            if existing.data:
+                price = existing.data[0]
+                results[item["key"]] = {"price_id": price.id, "label": price_label}
+                print(f"  SKIP  {item['key']:30s}  {price_label:>12s}  {price.id}  (already exists)")
+                skipped += 1
+                continue
+        except stripe.error.StripeError as e:
+            print(f"  FAIL  {item['key']:30s}  {price_label:>12s}  lookup error: {e}")
+            continue
+
+        # Create product then price.
         try:
             prod = stripe.Product.create(
                 name=item["name"],
@@ -100,7 +120,6 @@ def seed():
             "currency": "usd",
             "product": prod.id,
             "lookup_key": lookup_key,
-            "transfer_lookup_key": True,
         }
         if item["recurring"]:
             price_params["recurring"] = {"interval": item["recurring"]}
@@ -112,7 +131,8 @@ def seed():
         except stripe.error.StripeError as e:
             print(f"  FAIL  {item['key']:30s}  {price_label:>12s}  price error: {e}")
 
-    print(f"\nCreated {len(results)} of {len(PRODUCTS)} price objects.\n")
+    created = len(results) - skipped
+    print(f"\nCreated {created} new, skipped {skipped} existing, out of {len(PRODUCTS)} total.\n")
     print("# ─── Add to your .env file ───────────────────────────────────────────")
     print("# (comments precede the KEY=value line — inline '# ...' comments are")
     print("#  NOT stripped by pydantic-settings and become part of the value.)")
