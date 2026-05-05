@@ -11,3 +11,5 @@ nginx.conf
 forced-action.service
 docs/
 fa-agents.service
+src/static/
+scripts/cron/
