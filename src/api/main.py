@@ -1301,6 +1301,11 @@ def event_feed(
             "email": owner_email if is_unlocked else None,
         })
 
+    from src.core.models import WalletBalance as _WalletBalance
+    wallet = db.execute(
+        select(_WalletBalance).where(_WalletBalance.subscriber_id == subscriber.id)
+    ).scalar_one_or_none()
+
     return {
         "feed_uuid": feed_uuid,
         "subscriber": {
@@ -1314,6 +1319,8 @@ def event_feed(
             "has_saved_card": subscriber.has_saved_card,
             "auto_mode_enabled": subscriber.auto_mode_enabled,
             "created_at": subscriber.created_at.isoformat() if subscriber.created_at else None,
+            "wallet_balance": wallet.credits_remaining if wallet else None,
+            "wallet_tier": wallet.wallet_tier if wallet else None,
         },
         "total": total,
         "page": page,
