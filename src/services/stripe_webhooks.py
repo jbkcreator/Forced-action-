@@ -398,6 +398,22 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
                     subscriber.id, exc_info=True,
                 )
 
+    # ── Partner tier: provision multi-ZIP access ──────────────────────────
+    # When a subscriber upgrades to the partner tier via checkout, we need to
+    # lock all their chosen ZIPs and create the PartnerSubscription audit row.
+    # The ZIP locking loop above already handles individual ZIPs; this call
+    # sets the tier and creates the PartnerSubscription record.
+    if tier == "partner" and zip_codes:
+        try:
+            from src.services.partner_tier import provision_partner_access
+            provision_partner_access(db, subscriber.id, zip_codes, vertical, county_id)
+        except Exception:
+            logger.error(
+                "partner provision failed for subscriber %s — non-fatal, tier already set",
+                subscriber.id,
+                exc_info=True,
+            )
+
     # ── Referral confirmation (Phase A.1, 2026-05-04) ────────────────────
     # The referee just made their first paid purchase — flip any pending
     # ReferralEvent to confirmed and credit the referrer. Idempotent:

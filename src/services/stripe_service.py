@@ -72,6 +72,10 @@ def _price_ids():
             "founding": settings.active_stripe_price("dominator_founding"),
             "regular":  settings.active_stripe_price("dominator_regular"),
         },
+        "partner": {
+            "founding": settings.active_stripe_price("partner"),
+            "regular":  settings.active_stripe_price("partner"),
+        },
     }
 
 
@@ -106,6 +110,15 @@ def get_price_id_for_checkout(
         raise ValueError(
             f"Unknown tier '{tier}'. Valid tiers: {list(prices.keys())}"
         )
+
+    # Partner is a flat-rate tier — no founding mechanic, skip the founding count table
+    # (check_founding_tier constraint blocks inserting 'partner' into that table)
+    if tier == "partner":
+        price_id = prices["partner"]["regular"]
+        if not price_id:
+            raise ValueError("Stripe price_id not configured for partner. Set STRIPE_PRICE_PARTNER in env.")
+        logger.info("Checkout price selected: tier=partner vertical=%s county=%s (flat rate)", vertical, county_id)
+        return price_id, False
 
     # Lock the row for this tier/vertical/county
     stmt = (

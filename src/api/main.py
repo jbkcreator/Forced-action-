@@ -1109,6 +1109,34 @@ def event_feed(
     if not subscriber:
         raise HTTPException(status_code=404, detail={"error": "not_found", "message": "Feed not found"})
 
+    if subscriber.status == "paused":
+        return {
+            "feed_uuid": feed_uuid,
+            "subscriber": {
+                "id": subscriber.id,
+                "tier": subscriber.tier,
+                "vertical": subscriber.vertical,
+                "county_id": subscriber.county_id,
+                "locked_zips": [],
+                "founding_member": subscriber.founding_member,
+                "status": "paused",
+                "has_saved_card": subscriber.has_saved_card,
+                "auto_mode_enabled": subscriber.auto_mode_enabled,
+                "created_at": subscriber.created_at.isoformat() if subscriber.created_at else None,
+                "wallet_balance": None,
+                "wallet_tier": None,
+                "ap_lite_eligible": False,
+                "manual_actions_this_week": 0,
+                "paused_at": subscriber.paused_at.isoformat() if subscriber.paused_at else None,
+                "pause_resume_at": subscriber.pause_resume_at.isoformat() if subscriber.pause_resume_at else None,
+            },
+            "total": 0,
+            "page": page,
+            "page_size": page_size,
+            "pages": 0,
+            "leads": [],
+        }
+
     if subscriber.status not in ("active", "grace"):
         raise HTTPException(status_code=403, detail={"error": "subscription_inactive", "message": "Subscription is not active"})
 
@@ -2640,6 +2668,7 @@ def territory_map(
     from src.core.models import ZipTerritory, Property as _Prop, DistressScore as _DS
     from src.core.redis_client import redis_available, rget, rset
     from src.services.urgency_engine import get_active_count
+    from src.utils.zip_centroids import get_zip_centroid
 
     cache_key = f"territory_map:{county_id}:{vertical}"
     if redis_available():
@@ -2670,11 +2699,14 @@ def territory_map(
         except Exception:
             pass
 
+        centroid = get_zip_centroid(zt.zip_code)
         entry: dict = {
             "zip": zt.zip_code,
             "status": zt.status,
             "active_viewers": active_viewers,
             "lead_count": lead_count,
+            "lat": centroid[0] if centroid else None,
+            "lon": centroid[1] if centroid else None,
         }
         if zt.status == "grace" and zt.grace_expires_at:
             entry["grace_expires_at"] = zt.grace_expires_at.isoformat()
@@ -3364,9 +3396,9 @@ def partner_checkout(req: PartnerCheckoutRequest, db: Session = Depends(get_db))
     eligible, reason = is_eligible(sub)
     if not eligible:
         raise HTTPException(status_code=403, detail={"error": "not_eligible", "message": reason})
-    ok, err, locked = validate_zip_selection(db, req.zip_codes, req.vertical, sub.county_id or "fl_hillsborough")
-    if not ok:
-        raise HTTPException(status_code=409, detail={"error": "zips_already_locked", "message": err, "zips": locked})
+    zip_check = validate_zip_selection(db, req.zip_codes, req.vertical, sub.county_id or "fl_hillsborough")
+    if not zip_check["ok"]:
+        raise HTTPException(status_code=409, detail={"error": zip_check.get("reason"), "message": zip_check.get("reason"), "zips": zip_check.get("zips", [])})
     from src.services.stripe_service import create_subscription_checkout
     from config.settings import get_settings
     _s = get_settings()
