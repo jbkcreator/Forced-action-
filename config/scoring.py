@@ -122,7 +122,7 @@ VERTICAL_WEIGHTS = {
     },
     "public_adjusters": {        # Activated Vertical
         "code_violations": 70,   # 2026-05-04: was 85 — base + recency was capping; same signal also fires restoration/roofing
-        "insurance_claim": 72,   # 2026-05-04: promoted from stacking-only (was 10) — PA primary signal; Restoration owns code_violations
+        "insurance_claim": 10,   # Stacking only — reverted 2026-05-06 (was 72, caused 38k FEMA claims to auto-qualify)
         "Fire": 10,              # Stacking only
         "storm_damage": 10,      # Stacking only
         "flood_damage": 10,      # Stacking only
@@ -212,9 +212,12 @@ STACKING_BONUS_CAP        = 40   # 2026-05-04: was 60 — restored to match docs
 # A property carrying ONLY these signal types is not scored (returns 0).
 # They contribute only as stacking bonuses when a primary signal is also present.
 STACKING_ONLY_SIGNALS = {
-    # insurance_claim removed 2026-05-04: promoted to PA primary signal (weight 72).
-    # Keeps weight 10 in all other verticals — below Gold threshold, so won't surface
-    # standalone leads there. PA now has a unique primary separate from Restoration.
+    # insurance_claim reverted 2026-05-06: weight 72 as PA primary caused 38k FEMA
+    # hurricane-season claims to auto-qualify (base 72 + HCPA passive 18 = 90 from
+    # one old signal). FEMA data is bulk/historical — not a fresh distress event.
+    # Stays at weight 10 in all verticals → below STACKING_MIN_WEIGHT, no stacking
+    # contribution either. PA primary is now enforcement_permit(60)/code_violations(70).
+    "insurance_claim",
     "fire",
     "storm_damage",
     "flood_damage",
