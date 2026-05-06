@@ -41,9 +41,16 @@ def _make_sub(
     return sub
 
 
-def _make_db(deal_count=0, total_debits=0, big_deal=None):
+def _make_db(deal_count=0, total_debits=0, big_deal=None, recent_offer=None):
+    """Build a mock DB whose .execute() returns the right value for each
+    consecutive query in `_check_triggers` order:
+      1. recent annual_offer_* MessageOutcome (Stage 5 30-day suppression)
+      2. confirmed deal count
+      3. total debit amount
+      4. $10K+ deal id (or None)
+    """
     db = MagicMock()
-    results = [deal_count, total_debits, big_deal]
+    results = [recent_offer, deal_count, total_debits, big_deal]
     call_count = [0]
 
     def side_effect(stmt):
@@ -137,6 +144,14 @@ class TestCheckTriggersUnit:
         db = _make_db(deal_count=2, total_debits=100, big_deal=None)
         triggers = _check_triggers(sub, db)
         assert len(triggers) >= 2
+
+    # Stage 5 — 30-day duplicate-offer suppression
+    def test_recent_offer_suppresses_all_triggers(self):
+        sub = _make_sub(founding=True, account_age_days=7)
+        # recent_offer non-None means a MessageOutcome was found in last 30d
+        db = _make_db(deal_count=2, total_debits=100, big_deal=999, recent_offer=42)
+        triggers = _check_triggers(sub, db)
+        assert triggers == []
 
 
 # ============================================================================

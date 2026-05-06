@@ -213,6 +213,56 @@ BUNDLES = {
 }
 
 
+# ── Bundle Contextual Triggers — Stage 5 ─────────────────────────────────────
+# Rules for when bundle_dispatcher proactively offers each bundle. Each rule is
+# evaluated hourly; matching wallet subscribers receive an SMS with a deep link.
+# Margin floor = 60% (cora_guardrails.bundle_pricing). A/B variants are bounded
+# by ±25% of base price (also in cora_guardrails). Each bundle has its own
+# A/B test name so retire/promote works independently.
+
+BUNDLE_TRIGGERS = {
+    "weekend": {
+        "schedule": "fri_after_4pm_local",     # bundle_dispatcher gates on this
+        "audience": "wallet_active",           # any subscriber with a wallet row
+        "ab_test_name": "bundle_weekend_pricing",
+        "cooldown_hours": 168,                  # 1 offer/wk
+    },
+    "storm": {
+        "schedule": "on_nws_alert",            # only when an active NWS alert exists
+        "audience": "wallet_active_in_affected_county",
+        "ab_test_name": "bundle_storm_pricing",
+        "cooldown_hours": 72,                   # 1 offer per storm window
+    },
+    "zip_booster": {
+        "schedule": "hourly",                   # candidates re-checked hourly
+        "audience": "wallet_5plus_leads_same_zip_7d",
+        "ab_test_name": "bundle_zip_booster_pricing",
+        "cooldown_hours": 168,                  # 1 offer/wk per subscriber
+    },
+    "monthly_reload": {
+        "schedule": "hourly",                   # candidates re-checked hourly
+        "audience": "wallet_low_balance_no_auto_reload",
+        "ab_test_name": "bundle_monthly_reload_pricing",
+        "cooldown_hours": 24,                   # at most 1 offer per day
+    },
+}
+
+
+def bundle_pricing_within_guardrail(bundle_type: str, candidate_cents: int) -> bool:
+    """
+    Returns True if `candidate_cents` is inside ±25% of the bundle's base
+    price (per cora_guardrails.bundle_pricing). Used by ab_engine when
+    seeding pricing variants — variants outside the band are rejected.
+    """
+    base = BUNDLES.get(bundle_type, {}).get("price_cents")
+    if not base:
+        return False
+    # ±25% guardrail
+    low = int(base * 0.75)
+    high = int(base * 1.25)
+    return low <= candidate_cents <= high
+
+
 # ── Annual Plan ──────────────────────────────────────────────────────────────
 
 ANNUAL_PLAN = {
@@ -266,4 +316,51 @@ CREDIT_COSTS = {
     "brief":           5,
     "transfer":        26,
     "byol":            2,
+}
+
+
+# ── AutoPilot Pro Upsell — Stage 5 ───────────────────────────────────────────
+
+AP_PRO_UPSELL = {
+    "min_days_on_lite": 30,        # subscriber must be on AP Lite for 30+ days
+    "close_rate_threshold": 0.15,  # >=15% of delivered leads convert to deals
+    "offer_cooldown_days": 14,     # at most one offer every 2 weeks
+}
+
+
+# ── Premium Credits — Stage 5 ────────────────────────────────────────────────
+# On-demand SKUs purchasable with credits OR cash. Cash purchase skips the
+# wallet entirely; credit purchase debits via wallet_engine.debit().
+# CREDIT_COSTS above is the source of truth for credit cost; this table maps
+# the same SKU to retail price + Stripe price env var name.
+
+PREMIUM_CREDITS = {
+    "report": {
+        "label": "Property Report",
+        "credits_cost": 3,
+        "retail_price_cents": 700,        # $7
+        "stripe_price_env": "stripe_price_premium_report",
+        "description": "Full distress + ownership + financial dossier on one parcel.",
+    },
+    "brief": {
+        "label": "Lead Brief",
+        "credits_cost": 5,
+        "retail_price_cents": 1200,       # $12
+        "stripe_price_env": "stripe_price_premium_brief",
+        "description": "Investor-grade lead brief with talking points + comps.",
+    },
+    "transfer": {
+        "label": "Skip-Trace Transfer",
+        "credits_cost": 26,
+        "retail_price_cents": 6500,       # $65
+        "stripe_price_env": "stripe_price_premium_transfer",
+        "description": "Full skip-trace transfer with mobile/landline/email + relatives.",
+    },
+    "byol": {
+        "label": "BYOL Skip-Trace",
+        "credits_cost": 2,
+        "retail_price_cents": 500,        # $5
+        "stripe_price_env": "stripe_price_premium_byol",
+        "description": "Bring-your-own-lead skip-trace on any address you supply.",
+    },
 }

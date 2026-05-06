@@ -1020,13 +1020,21 @@ def zip_availability(
 
     taken_map = {r[0]: r[1] for r in territory_rows}  # zip -> "locked" | "grace"
 
-    # Gold+ lead counts per ZIP (latest scores)
+    # Gold+ lead counts per ZIP (deduped to latest score per property).
+    # Without the latest-score subquery every historical scoring run is counted,
+    # inflating counts by ~3-4x (one row per scoring run per property).
     try:
         lead_rows = db.execute(
             text("""
                 SELECT p.zip, COUNT(*) AS lead_count
                 FROM properties p
                 JOIN distress_scores ds ON ds.property_id = p.id
+                JOIN (
+                    SELECT property_id, MAX(score_date) AS max_date
+                    FROM distress_scores
+                    GROUP BY property_id
+                ) latest ON latest.property_id = ds.property_id
+                        AND latest.max_date = ds.score_date
                 WHERE p.county_id = :county_id
                   AND p.zip IS NOT NULL
                   AND LENGTH(p.zip) = 5
@@ -1293,6 +1301,11 @@ def event_feed(
             "email": owner_email if is_unlocked else None,
         })
 
+    from src.core.models import WalletBalance as _WalletBalance
+    wallet = db.execute(
+        select(_WalletBalance).where(_WalletBalance.subscriber_id == subscriber.id)
+    ).scalar_one_or_none()
+
     return {
         "feed_uuid": feed_uuid,
         "subscriber": {
@@ -1306,6 +1319,8 @@ def event_feed(
             "has_saved_card": subscriber.has_saved_card,
             "auto_mode_enabled": subscriber.auto_mode_enabled,
             "created_at": subscriber.created_at.isoformat() if subscriber.created_at else None,
+            "wallet_balance": wallet.credits_remaining if wallet else None,
+            "wallet_tier": wallet.wallet_tier if wallet else None,
         },
         "total": total,
         "page": page,
@@ -1368,7 +1383,10 @@ def feed_stats(feed_uuid: str, db: Session = Depends(get_db)):
             .where(and_(*base_filter))
         )
 
-        total = db.execute(select(func.count()).select_from(base_q.subquery())).scalar()
+        total = db.execute(
+            select(func.count(func.distinct(DistressScore.property_id)))
+            .select_from(base_q.subquery())
+        ).scalar()
 
         today_start = _dt.combine(date.today(), _dt.min.time())
         new_today = db.execute(
@@ -2357,7 +2375,11 @@ class DealCaptureRequest(BaseModel):
 
 @app.post("/api/deal-capture", status_code=201)
 def deal_capture(payload: DealCaptureRequest, db: Session = Depends(get_db)):
-    """Record a deal outcome reported by a subscriber."""
+    """Record a deal outcome reported by a subscriber.
+
+    Stage 5: also generates the deal-win graphic and (for $10K+ deals)
+    fires the annual-at-deal-win push.
+    """
     from src.core.models import DealOutcome
 
     sub = db.execute(
@@ -2380,7 +2402,291 @@ def deal_capture(payload: DealCaptureRequest, db: Session = Depends(get_db)):
     )
     db.add(outcome)
     db.flush()
-    return {"ok": True, "deal_id": outcome.id}
+
+    graphic_url: Optional[str] = None
+    annual_offered = False
+
+    # Stage 5: generate graphic (idempotent, fails-soft)
+    if payload.deal_size_bucket != "skip":
+        try:
+            from src.services.win_graphic import generate as gen_graphic
+            path = gen_graphic(outcome.id, db)
+            if path:
+                graphic_url = f"/api/win-graphic/{outcome.id}"
+        except Exception as exc:
+            logger.warning("[DealCapture] win graphic gen failed: %s", exc)
+
+    # Stage 5: annual-at-deal-win trigger for $10K+ deals
+    is_big = (payload.deal_amount and payload.deal_amount >= 10000) \
+        or payload.deal_size_bucket in ("10_25k", "25k_plus")
+    if is_big:
+        try:
+            from src.tasks.annual_push import _push_annual_offer  # noqa: F401
+            # We use the existing push helper which sends the email annual offer.
+            # SMS-side push will land once Subscriber.phone column is added.
+            from src.tasks.annual_push import _push_annual_offer
+            if _push_annual_offer(sub, "deal_win_10k", db):
+                annual_offered = True
+        except Exception as exc:
+            logger.warning("[DealCapture] annual push failed: %s", exc)
+
+    return {
+        "ok": True,
+        "deal_id": outcome.id,
+        "graphic_url": graphic_url,
+        "annual_offered": annual_offered,
+    }
+
+
+# Stage 5: serve the generated win-graphic PNG by deal id
+@app.get("/api/win-graphic/{deal_outcome_id}")
+def win_graphic_endpoint(deal_outcome_id: int, db: Session = Depends(get_db)):
+    """Stream the generated win graphic PNG. Generates on demand if missing."""
+    from src.services.win_graphic import generate as gen_graphic, output_path
+    path = output_path(deal_outcome_id)
+    if not path.exists():
+        path = gen_graphic(deal_outcome_id, db)
+    if not path or not Path(path).exists():
+        raise HTTPException(status_code=404, detail="Win graphic not available")
+    return FileResponse(str(path), media_type="image/png")
+
+
+# Stage 5: anonymized social proof wall — recent wins powering the landing page
+@app.get("/api/proof-wall")
+def proof_wall(limit: int = Query(50, ge=1, le=200), db: Session = Depends(get_db)):
+    from src.services.win_graphic import proof_wall_payload
+    return {"items": proof_wall_payload(db, limit=limit)}
+
+
+# ── Stage 5: Annual lock acceptance (deal-win + Day-60 path) ─────────────────
+
+class AnnualAcceptRequest(BaseModel):
+    feed_uuid: str
+
+
+@app.post("/api/annual/accept")
+def annual_accept(payload: AnnualAcceptRequest, db: Session = Depends(get_db)):
+    """One-tap acceptance of the annual lock offer. Switches the subscriber's
+    Stripe subscription to the annual price with proration."""
+    sub = db.execute(
+        select(Subscriber).where(Subscriber.event_feed_uuid == payload.feed_uuid)
+    ).scalar_one_or_none()
+    if not sub:
+        raise HTTPException(status_code=403, detail="Invalid feed_uuid")
+    if not sub.stripe_subscription_id:
+        raise HTTPException(status_code=400, detail="Subscriber has no active subscription")
+
+    # Pre-flight: refuse to call Stripe when the account is in a billing-broken
+    # state. The user must clear it (update card / end pause) before retry.
+    from src.services.stripe_service import can_switch_subscription
+    ok_status, reason = can_switch_subscription(sub)
+    if not ok_status:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "billing_status_blocked",
+                "current_status": reason,
+                "message": "Update your payment method first, then retry.",
+                "billing_portal_url": "/api/portal-session",
+            },
+        )
+
+    from src.tasks.annual_push import switch_to_annual
+    ok = switch_to_annual(sub.id, db)
+    if not ok:
+        raise HTTPException(status_code=502, detail="Annual switch failed - try again or contact support")
+    return {"ok": True, "subscriber_id": sub.id, "tier": "annual_lock"}
+
+
+@app.get("/api/annual/accept", include_in_schema=False)
+def annual_accept_get(feed_uuid: str, db: Session = Depends(get_db)):
+    """GET-friendly variant so the link in the offer email can be tapped directly."""
+    return annual_accept(AnnualAcceptRequest(feed_uuid=feed_uuid), db)
+
+
+# ── Stage 5: Tier upgrade (AutoPilot Pro path) ───────────────────────────────
+
+class UpgradeRequest(BaseModel):
+    feed_uuid: str
+    tier: str
+
+    @field_validator("tier")
+    @classmethod
+    def _valid(cls, v: str) -> str:
+        if v not in {"autopilot_lite", "autopilot_pro", "data_only", "partner"}:
+            raise ValueError("Unsupported tier for /api/upgrade")
+        return v
+
+
+_UPGRADE_PRICE_NAME = {
+    "autopilot_lite": "autopilot_lite",
+    "autopilot_pro":  "autopilot_pro",
+    "data_only":      "data_only",
+    "partner":        "partner",
+}
+
+
+@app.post("/api/upgrade")
+def upgrade(req: UpgradeRequest, db: Session = Depends(get_db)):
+    """Switch a subscriber's Stripe subscription to a different tier."""
+    sub = db.execute(
+        select(Subscriber).where(Subscriber.event_feed_uuid == req.feed_uuid)
+    ).scalar_one_or_none()
+    if not sub:
+        raise HTTPException(status_code=403, detail="Invalid feed_uuid")
+    if not sub.stripe_subscription_id:
+        raise HTTPException(status_code=400, detail="Subscriber has no active subscription")
+
+    # Pre-flight: same status guard as /api/annual/accept.
+    from src.services.stripe_service import can_switch_subscription, switch_subscription_plan
+    ok_status, reason = can_switch_subscription(sub)
+    if not ok_status:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "billing_status_blocked",
+                "current_status": reason,
+                "message": "Update your payment method first, then retry.",
+                "billing_portal_url": "/api/portal-session",
+            },
+        )
+
+    settings = get_settings()
+    price_name = _UPGRADE_PRICE_NAME[req.tier]
+    new_price_id = settings.active_stripe_price(price_name)
+    if not new_price_id:
+        raise HTTPException(status_code=503, detail=f"Stripe price not configured for {req.tier}")
+
+    try:
+        switch_subscription_plan(sub.stripe_subscription_id, new_price_id, prorate=True)
+    except Exception as exc:
+        logger.error("[Upgrade] switch failed sub=%d tier=%s: %s", sub.id, req.tier, exc)
+        raise HTTPException(status_code=502, detail="Plan switch failed")
+
+    sub.tier = req.tier
+    db.flush()
+
+    # Tag the GHL contact so workflows pick up the new tier (e.g. AP Pro 5-touch)
+    try:
+        if sub.ghl_contact_id:
+            from src.services.synthflow_service import _apply_tags_to_contact
+            _apply_tags_to_contact(sub.ghl_contact_id, [req.tier])
+    except Exception as exc:
+        logger.warning("[Upgrade] GHL tag failed for sub=%d: %s", sub.id, exc)
+
+    return {"ok": True, "subscriber_id": sub.id, "tier": req.tier}
+
+
+@app.get("/api/upgrade", include_in_schema=False)
+def upgrade_get(feed_uuid: str, tier: str, db: Session = Depends(get_db)):
+    """GET-friendly upgrade so the link in the upsell email can be tapped directly."""
+    return upgrade(UpgradeRequest(feed_uuid=feed_uuid, tier=tier), db)
+
+
+# ── Stage 5: Referral team view + weekly leaderboard ─────────────────────────
+
+@app.get("/api/feed/{feed_uuid}/team-view")
+def team_view(feed_uuid: str, db: Session = Depends(get_db)):
+    """
+    Shared ZIP density view for a referral team. Returns lead density only —
+    no PII or lead detail crosses team-member boundaries.
+    """
+    from src.core.models import ReferralTeam, DistressScore as _DS, Property as _P
+
+    sub = db.execute(
+        select(Subscriber).where(Subscriber.event_feed_uuid == feed_uuid)
+    ).scalar_one_or_none()
+    if not sub:
+        raise HTTPException(status_code=403, detail="Invalid feed_uuid")
+
+    # Find an active team this subscriber is in
+    team = db.execute(
+        select(ReferralTeam).where(
+            ReferralTeam.member_subscriber_ids.any(sub.id),
+            ReferralTeam.status == "active",
+        ).limit(1)
+    ).scalar_one_or_none()
+    if not team:
+        return {"unlocked": False, "shared_zips": [], "density": []}
+
+    zips = team.shared_zips or []
+    if not zips:
+        return {
+            "unlocked": True,
+            "team_id": team.id,
+            "shared_zips": [],
+            "density": [],
+        }
+
+    # Per-ZIP qualified-lead count for this team's vertical
+    score_col = _DS.vertical_scores[team.vertical].as_float()
+    rows = db.execute(
+        select(_P.zip, func.count())
+        .join(_DS, _DS.property_id == _P.id)
+        .where(
+            _P.zip.in_(zips),
+            _P.county_id == team.county_id,
+            _DS.qualified == True,   # noqa: E712
+            score_col >= 40,
+        )
+        .group_by(_P.zip)
+    ).all()
+    density = [{"zip": z, "leads": int(c)} for z, c in rows]
+    density.sort(key=lambda r: r["leads"], reverse=True)
+
+    return {
+        "unlocked": True,
+        "team_id": team.id,
+        "county_id": team.county_id,
+        "vertical": team.vertical,
+        "shared_zips": zips,
+        "density": density,
+    }
+
+
+@app.get("/api/leaderboard")
+def leaderboard_endpoint(
+    request: Request,
+    response: Response,
+    county_id: Optional[str] = None,
+    vertical: Optional[str] = None,
+):
+    """Public weekly leaderboard. Filter by county_id and/or vertical.
+    Reads the latest snapshot written by `src.tasks.leaderboard`.
+
+    Phase A.2 (2026-05-04) hardening:
+      - Per-IP rate limit: 60 req/min/IP (compresses casual scraping while
+        still allowing dashboards to poll every 30s without tripping).
+      - subscriber_id stripped from the public response — kept only on the
+        on-disk snapshot for ops. Public consumers see handle + rank + counts
+        + badge.
+      - Cache-Control: public, max-age=3600. Snapshot only refreshes Monday,
+        so a 1-hour CDN / browser cache is safe and absorbs scraper traffic.
+    """
+    from src.services.rate_limit import enforce_or_429
+    enforce_or_429(request, scope="leaderboard", limit=60, window_seconds=60)
+
+    from src.tasks.leaderboard import latest_snapshot
+    snap = latest_snapshot()
+    response.headers["Cache-Control"] = "public, max-age=3600"
+
+    if not snap:
+        return {"as_of": None, "leaderboards": []}
+    boards = snap.get("leaderboards", [])
+    if county_id:
+        boards = [b for b in boards if b["county_id"] == county_id]
+    if vertical:
+        boards = [b for b in boards if b["vertical"] == vertical]
+
+    # Strip subscriber_id from every leaderboard row before sending — the
+    # snapshot file keeps it for ops, but the public API must not.
+    public_boards = []
+    for b in boards:
+        rows = [{k: v for k, v in row.items() if k != "subscriber_id"}
+                for row in b.get("leaderboard", [])]
+        public_boards.append({**b, "leaderboard": rows})
+
+    return {"as_of": snap.get("as_of"), "leaderboards": public_boards}
 
 
 # ── Phase 2B: NWS weather alert webhook ───────────────────────────────────────
@@ -2554,6 +2860,74 @@ def get_wall_session(session_id: str):
     return state
 
 
+# ── Stage 5+: Wallet Topup — POST /api/wallet/topup ───────────────────────────
+
+# Whitelisted topup amounts (cents) → credits granted on webhook fulfillment.
+# Aligns with wallet tier pricing so a "20 credits for $25" topup matches the
+# implicit per-credit price of starter wallet ($49/20cr ≈ $2.45/cr).
+WALLET_TOPUP_PACKAGES = {
+    2500:  10,    # $25  → 10 credits
+    5000:  22,    # $50  → 22 credits (10% bonus)
+    10000: 48,    # $100 → 48 credits (20% bonus)
+}
+
+
+class WalletTopupRequest(BaseModel):
+    feed_uuid: str
+    amount_cents: int = Field(..., description="Must match a key in WALLET_TOPUP_PACKAGES")
+
+
+@app.post("/api/wallet/topup", status_code=201)
+def wallet_topup_endpoint(
+    req: WalletTopupRequest, db: Session = Depends(get_db)
+):
+    """One-tap wallet top-up. Returns Stripe PaymentIntent client_secret for
+    the Payment Sheet. Webhook (_on_wallet_topup_payment) credits the wallet
+    on payment_intent.succeeded.
+
+    Amount must match a whitelisted package — prevents arbitrary-amount
+    submissions from the client.
+    """
+    if req.amount_cents not in WALLET_TOPUP_PACKAGES:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "invalid_topup_amount",
+                "allowed_amounts_cents": sorted(WALLET_TOPUP_PACKAGES.keys()),
+            },
+        )
+
+    sub = db.execute(
+        select(Subscriber).where(Subscriber.event_feed_uuid == req.feed_uuid)
+    ).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=403, detail="Invalid feed_uuid")
+    if sub.status == "disputed":
+        raise HTTPException(
+            status_code=403,
+            detail="Account on hold for review. Email support@forcedaction.io.",
+        )
+
+    credits = WALLET_TOPUP_PACKAGES[req.amount_cents]
+    from src.services.payment_sheet import create_payment_intent as _create_pi
+    try:
+        result = _create_pi(
+            subscriber_id=sub.id,
+            amount_cents=req.amount_cents,
+            description=f"Wallet top-up — {credits} credits",
+            save_card=True,
+            db=db,
+            metadata={
+                "product": "wallet_topup",
+                "amount_cents": str(req.amount_cents),
+                "credits": str(credits),
+            },
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    return {**result, "credits": credits}
+
+
 # ── Phase 2B: Payment Sheet — POST /api/payment-intent ───────────────────────
 
 class PaymentIntentRequest(BaseModel):
@@ -2613,6 +2987,163 @@ def create_payment_intent_endpoint(
     return result
 
 
+# ── Stage 5: Premium credit SKUs ─────────────────────────────────────────────
+
+class PremiumPurchaseRequest(BaseModel):
+    feed_uuid: str
+    sku: str = Field(..., description="report | brief | transfer | byol")
+    payment_mode: str = Field(..., description="credits | card")
+    property_id: Optional[int] = None
+    target_address: Optional[str] = Field(default=None, max_length=255)
+
+    @field_validator("sku")
+    @classmethod
+    def _valid_sku(cls, v: str) -> str:
+        if v not in {"report", "brief", "transfer", "byol"}:
+            raise ValueError("sku must be one of report|brief|transfer|byol")
+        return v
+
+    @field_validator("payment_mode")
+    @classmethod
+    def _valid_mode(cls, v: str) -> str:
+        if v not in {"credits", "card"}:
+            raise ValueError("payment_mode must be credits or card")
+        return v
+
+
+@app.post("/api/premium/purchase", status_code=201)
+def premium_purchase_endpoint(
+    req: PremiumPurchaseRequest, db: Session = Depends(get_db)
+):
+    """
+    Stage 5 — Premium credit SKU purchase.
+
+    `payment_mode='credits'` debits the wallet immediately and runs fulfillment
+    in-band (returns 402 if balance insufficient with a topup deep link).
+
+    `payment_mode='card'` creates a Stripe PaymentIntent for the Payment Sheet;
+    the row is persisted on payment_intent.succeeded webhook.
+    """
+    from config.revenue_ladder import PREMIUM_CREDITS
+
+    sub = db.execute(
+        select(Subscriber).where(Subscriber.event_feed_uuid == req.feed_uuid)
+    ).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=403, detail="Invalid feed_uuid")
+
+    # Block subscribers flagged after repeated disputes (fa004, 2026-05-04)
+    if sub.status == "disputed":
+        raise HTTPException(
+            status_code=403,
+            detail="Account on hold for review. Email support@forcedaction.io.",
+        )
+
+    cfg = PREMIUM_CREDITS[req.sku]
+
+    # SKU-specific argument validation
+    if req.sku in ("report", "brief", "transfer") and not req.property_id:
+        raise HTTPException(status_code=400, detail=f"{req.sku} requires property_id")
+    if req.sku == "byol" and not req.target_address:
+        raise HTTPException(status_code=400, detail="byol requires target_address")
+
+    # Per-subscriber rate cap on the highest-ticket SKU. Prevents burst-and-
+    # dispute attacks on Transfer ($65/26cr).
+    if req.sku == "transfer":
+        from src.core.models import PremiumPurchase
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        recent_transfers = db.execute(
+            select(func.count()).select_from(PremiumPurchase).where(
+                PremiumPurchase.subscriber_id == sub.id,
+                PremiumPurchase.sku == "transfer",
+                PremiumPurchase.purchased_at >= cutoff,
+                # Don't count refunded/disputed against the cap (those are losses, not abuse)
+                PremiumPurchase.status.notin_(["refunded", "disputed", "failed"]),
+            )
+        ).scalar() or 0
+        if recent_transfers >= 3:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "error": "transfer_daily_cap_reached",
+                    "message": "Maximum 3 skip-trace transfers per 24 hours.",
+                    "retry_after_hours": 24,
+                },
+            )
+
+    if req.payment_mode == "credits":
+        from src.services import wallet_engine
+        from src.services.premium_engine import record_credit_purchase, fulfill
+        ok = wallet_engine.debit(sub.id, action=req.sku, db=db, description=f"premium_{req.sku}")
+        if not ok:
+            balance = wallet_engine.get_balance(sub.id, db)
+            return JSONResponse(
+                status_code=402,
+                content={
+                    "error": "insufficient_credits",
+                    "balance": balance,
+                    "required": cfg["credits_cost"],
+                    "topup_url": f"/dashboard/{sub.event_feed_uuid}?wallet=topup",
+                },
+            )
+        purchase = record_credit_purchase(
+            subscriber_id=sub.id,
+            sku=req.sku,
+            db=db,
+            property_id=req.property_id,
+            target_address=req.target_address,
+        )
+        try:
+            fulfill(purchase.id, db)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {
+            "purchase_id": purchase.id,
+            "sku": req.sku,
+            "paid_via": "credits",
+            "credits_spent": cfg["credits_cost"],
+            "status": purchase.status,
+            "output_ref": purchase.output_ref,
+        }
+
+    # payment_mode == "card"
+    settings = get_settings()
+    price_id = settings.active_stripe_price(f"premium_{req.sku}")
+    if not price_id:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Stripe price not configured for premium_{req.sku}",
+        )
+
+    from src.services.payment_sheet import create_payment_intent as _create_pi
+    try:
+        result = _create_pi(
+            subscriber_id=sub.id,
+            amount_cents=cfg["retail_price_cents"],
+            description=f"Premium {cfg['label']}",
+            save_card=False,
+            db=db,
+            metadata={
+                "product": "premium",
+                "sku": req.sku,
+                "property_id": str(req.property_id) if req.property_id else "",
+                "target_address": req.target_address or "",
+            },
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {
+        "client_secret": result["client_secret"],
+        "payment_intent_id": result["payment_intent_id"],
+        "amount": result["amount"],
+        "publishable_key": result["publishable_key"],
+        "sku": req.sku,
+        "paid_via": "card",
+    }
+
+
 # ── Phase 2B: Missed-Call Voice Webhook ──────────────────────────────────────
 
 @app.post("/webhooks/twilio/voice", include_in_schema=False)
@@ -2633,3 +3164,17 @@ async def twilio_voice_webhook(request: Request, db: Session = Depends(get_db)):
     from src.services.signup_engine import handle_missed_call
     twiml = handle_missed_call(from_number=from_number, db=db)
     return Response(content=twiml, media_type="application/xml")
+
+
+# ---------------------------------------------------------------------------
+# SPA catch-all — must be LAST so it never shadows /api/* or /webhooks/*
+# Handles any client-side route (e.g. /dashboard/:uuid/settings, /proof-wall)
+# that the browser requests directly on reload or deep-link.
+# ---------------------------------------------------------------------------
+
+@app.get("/{full_path:path}", include_in_schema=False)
+def spa_fallback(full_path: str):
+    react_index = REACT_DIST / "index.html"
+    if react_index.is_file():
+        return FileResponse(str(react_index))
+    raise HTTPException(status_code=503, detail="UI not built — run npm run build in Forced-action-ui/")

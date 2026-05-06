@@ -743,6 +743,10 @@ class Subscriber(Base):
     referral_code: Mapped[Optional[str]] = mapped_column(String(20), unique=True, index=True)
     auto_mode_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
+    # ── Stage 5+: dispute / fraud tracking (added 2026-05-04, fa004) ──
+    disputed_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    disputed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
     bundle_purchases = relationship("BundlePurchase", back_populates="subscriber")
 
     # Audit
@@ -757,11 +761,11 @@ class Subscriber(Base):
         Index("idx_subscriber_status", "status"),
         Index("idx_subscriber_vertical", "vertical"),
         CheckConstraint(
-            "tier IN ('free', 'starter', 'pro', 'dominator', 'data_only', 'autopilot_lite', 'autopilot_pro', 'partner')",
+            "tier IN ('free', 'starter', 'pro', 'dominator', 'data_only', 'autopilot_lite', 'autopilot_pro', 'partner', 'annual_lock')",
             name="check_subscriber_tier",
         ),
         CheckConstraint(
-            "status IN ('active', 'grace', 'churned', 'cancelled', 'paused')",
+            "status IN ('active', 'grace', 'churned', 'cancelled', 'paused', 'disputed')",
             name="check_subscriber_status",
         ),
     )
@@ -1586,6 +1590,7 @@ class BundlePurchase(Base):
     county_id: Mapped[str] = mapped_column(String(50), nullable=False, default="hillsborough")
     credits_awarded: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     lead_ids: Mapped[Optional[list]] = mapped_column(ARRAY(Integer))
+    ab_variant: Mapped[Optional[str]] = mapped_column(String(8))   # Stage 5: 'a' / 'b' / NULL
     purchased_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
@@ -1606,6 +1611,116 @@ class BundlePurchase(Base):
 
     def __repr__(self):
         return f"<BundlePurchase(id={self.id}, type={self.bundle_type}, status={self.status})>"
+
+
+class ReferralTeam(Base):
+    """
+    Stage 5 — referral team mechanic.
+
+    When a referrer accumulates 3 confirmed referrals where every member is
+    in the same county AND vertical, a ReferralTeam row is created and all
+    three members get a Shared ZIP View (lead density across their union of
+    locked ZIPs — density only, no PII shared between members).
+    """
+    __tablename__ = "referral_teams"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    lead_subscriber_id: Mapped[int] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=False, index=True)
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    vertical: Mapped[str] = mapped_column(String(50), nullable=False)
+    member_subscriber_ids: Mapped[list] = mapped_column(ARRAY(Integer), nullable=False)
+    shared_zips: Mapped[Optional[list]] = mapped_column(ARRAY(String(10)))
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")  # active | broken
+    unlocked_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("status IN ('active', 'broken')", name="check_referral_team_status"),
+        Index("idx_referral_team_county_vertical", "county_id", "vertical"),
+    )
+
+    def __repr__(self):
+        return f"<ReferralTeam(id={self.id}, lead={self.lead_subscriber_id}, members={self.member_subscriber_ids})>"
+
+
+class PremiumPurchase(Base):
+    """
+    Stage 5: Premium credit SKU purchase (report / brief / transfer / byol).
+
+    Either paid via wallet credits (`paid_via='credits'`, no Stripe row) or
+    cash via Stripe Checkout / PaymentIntent (`paid_via='card'`,
+    `stripe_payment_intent_id` set). Fulfillment artifact (PDF, skip-trace
+    record id, etc.) is referenced via `output_ref`.
+    """
+    __tablename__ = "premium_purchases"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=False, index=True)
+    sku: Mapped[str] = mapped_column(String(30), nullable=False)             # report|brief|transfer|byol
+    paid_via: Mapped[str] = mapped_column(String(10), nullable=False)        # credits|card
+    amount_cents: Mapped[Optional[int]] = mapped_column(Integer)             # null for credit purchases
+    credits_spent: Mapped[Optional[int]] = mapped_column(Integer)            # null for cash purchases
+    stripe_payment_intent_id: Mapped[Optional[str]] = mapped_column(String(100), unique=True, index=True)
+    property_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("properties.id"), index=True)
+    target_address: Mapped[Optional[str]] = mapped_column(String(255))       # for BYOL when no property_id
+    output_ref: Mapped[Optional[str]] = mapped_column(String(255))           # path to PDF / FK to enriched_contacts.id
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")  # pending|delivered|failed|refunded|disputed
+    purchased_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    # ── Refund / dispute audit (fa004, 2026-05-04) ──────────────────
+    refunded_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    refund_reason: Mapped[Optional[str]] = mapped_column(String(100))
+    refund_amount_cents: Mapped[Optional[int]] = mapped_column(Integer)
+    disputed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    dispute_reason: Mapped[Optional[str]] = mapped_column(String(100))
+    stripe_charge_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)
+
+    __table_args__ = (
+        CheckConstraint("sku IN ('report', 'brief', 'transfer', 'byol')", name="check_premium_sku"),
+        CheckConstraint("paid_via IN ('credits', 'card')", name="check_premium_paid_via"),
+        CheckConstraint(
+            "status IN ('pending', 'delivered', 'failed', 'refunded', 'disputed')",
+            name="check_premium_status",
+        ),
+        Index("idx_premium_purchase_sub_sku", "subscriber_id", "sku"),
+    )
+
+    def __repr__(self):
+        return f"<PremiumPurchase(id={self.id}, sku={self.sku}, paid_via={self.paid_via}, status={self.status})>"
+
+
+class EnrichmentUsageLog(Base):
+    """
+    Per-call cost log for third-party enrichment vendors (BatchData skip-trace,
+    future Twilio Lookup, etc.).
+
+    Drives the per-SKU margin dashboard and the daily Revenue Pulse line for
+    each enrichment-backed product (lead unlock, BYOL, Transfer, batch run).
+    Append-only — one row per vendor lookup, success or failure.
+
+    Added 2026-05-04 (fa004).
+    """
+    __tablename__ = "enrichment_usage_logs"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    vendor: Mapped[str] = mapped_column(String(30), nullable=False)              # batchdata | twilio_lookup | ...
+    purpose: Mapped[str] = mapped_column(String(40), nullable=False)             # premium_transfer | premium_byol | lead_unlock | batch_skip_trace
+    subscriber_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("subscribers.id"), index=True)
+    property_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("properties.id"), index=True)
+    target_address: Mapped[Optional[str]] = mapped_column(String(255))
+    cost_cents: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    success: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    error: Mapped[Optional[str]] = mapped_column(String(255))
+    request_ref: Mapped[Optional[str]] = mapped_column(String(100))               # vendor request id, batch id, etc.
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+
+    __table_args__ = (
+        Index("idx_enrichment_purpose_created", "purpose", "created_at"),
+        Index("idx_enrichment_vendor_created", "vendor", "created_at"),
+    )
+
+    def __repr__(self):
+        return f"<EnrichmentUsageLog(vendor={self.vendor}, purpose={self.purpose}, cost_cents={self.cost_cents})>"
 
 
 class SmsOptIn(Base):

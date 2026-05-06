@@ -100,23 +100,35 @@ def deactivate(zip_code: str) -> None:
 
 
 def _extract_zip_codes(properties: dict) -> list[str]:
-    zip_codes = []
-    # Try geocode field (FIPS codes → convert to ZIP is out of scope here)
-    geocode = properties.get("geocode", {})
-    same = geocode.get("SAME", [])
-    ugc = geocode.get("UGC", [])
+    """Resolve a CAP alert payload to the affected ZIP set.
 
-    # Look for explicit zip codes in affected area descriptions
-    area_desc = properties.get("areaDesc", "")
+    Three ingest paths:
+      1. `geocode.SAME` / `geocode.UGC` — FIPS / UGC codes. Expanded via the
+         static crosswalk in `nws_same_to_zip` for our active counties.
+         (fa008+, 2026-05-04 — previously ignored.)
+      2. `areaDesc` — regex for any 5-digit run.
+      3. `parameters.affectedZips` — explicit ZIP list when an upstream relay
+         pre-computes it.
+    """
+    zip_codes: list[str] = []
+
+    # 1. SAME / UGC code expansion
+    geocode = properties.get("geocode", {}) or {}
+    same = geocode.get("SAME", []) or []
+    ugc = geocode.get("UGC", []) or []
+    if same or ugc:
+        from src.services.nws_same_to_zip import expand_codes
+        zip_codes.extend(expand_codes(same, ugc))
+
+    # 2. Explicit ZIPs in the prose
+    area_desc = properties.get("areaDesc", "") or ""
     import re
-    found = re.findall(r"\b\d{5}\b", area_desc)
-    zip_codes.extend(found)
+    zip_codes.extend(re.findall(r"\b\d{5}\b", area_desc))
 
-    # Fallback: check parameters for zip list
-    params = properties.get("parameters", {})
-    if "affectedZips" in params:
-        zips = params["affectedZips"]
-        if isinstance(zips, list):
-            zip_codes.extend(zips)
+    # 3. Pre-computed affected-ZIP list from a relay
+    params = properties.get("parameters", {}) or {}
+    explicit = params.get("affectedZips")
+    if isinstance(explicit, list):
+        zip_codes.extend(str(z) for z in explicit)
 
-    return list(set(zip_codes))
+    return sorted(set(zip_codes))

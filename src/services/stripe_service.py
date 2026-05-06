@@ -340,6 +340,29 @@ def create_hot_lead_unlock_link(
     return {"session_id": session.id, "url": session.url}
 
 
+# Subscriber.status values that block any plan switch. The user must clear
+# the underlying state first (update card, end pause, exit dispute) before
+# we'll send a proration request to Stripe — otherwise we get a confusing
+# 502 cascade through the failed-payment recovery path.
+_BLOCKED_SWITCH_STATUSES = frozenset({"grace", "churned", "cancelled", "paused", "disputed"})
+
+
+def can_switch_subscription(subscriber) -> tuple[bool, str | None]:
+    """Pre-flight gate for any plan change (annual lock, AP Pro upgrade, data-only).
+
+    Returns (True, None) if the switch can proceed, otherwise (False, reason)
+    where reason is the subscriber's current status. Callers should surface
+    a 409 response that points the user to the billing portal so they can
+    clear the underlying state before retrying.
+    """
+    if subscriber is None:
+        return False, "missing"
+    status = (getattr(subscriber, "status", None) or "").lower()
+    if status in _BLOCKED_SWITCH_STATUSES:
+        return False, status
+    return True, None
+
+
 def switch_subscription_plan(
     subscription_id: str,
     new_price_id: str,

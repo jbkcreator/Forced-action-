@@ -555,7 +555,43 @@ def _render_html(weeks: Dict[str, dict], freshness: dict, coverage: dict,
             f"(MessageOutcome / AbTest writer code lands when phase-2-b/one merges.)</p>"
         )
 
+    # Stage 5 — Top Referrers leaderboard injected from latest snapshot
+    parts.append(_render_leaderboard_html())
+
     parts.append("</div>")
+    return "\n".join(parts)
+
+
+def _render_leaderboard_html() -> str:
+    """Render the latest referral leaderboard as a section. Empty on missing data."""
+    try:
+        from src.tasks.leaderboard import latest_snapshot
+    except Exception:
+        return ""
+    snap = latest_snapshot()
+    if not snap or not snap.get("leaderboards"):
+        return ""
+
+    parts = ["<h2 style='margin-top:24px;'>Top Referrers — last 7 days</h2>"]
+    for board in snap["leaderboards"][:5]:
+        title = f"{board['county_id'].title()} · {board['vertical'].replace('_', ' ').title()}"
+        parts.append(f"<h3 style='margin:14px 0 6px 0;font-size:14px;color:#374151;'>{title}</h3>")
+        parts.append(f"<table style='{_TABLE_STYLE}'>")
+        parts.append(
+            f"<tr><th style='{_TH_STYLE}'>#</th>"
+            f"<th style='{_TH_STYLE}'>Member</th>"
+            f"<th style='{_TH_STYLE}'>This week</th>"
+            f"<th style='{_TH_STYLE}'>Lifetime</th></tr>"
+        )
+        for row in board.get("leaderboard", []):
+            badge = f" <span style='font-size:11px;color:#6b7280;'>({row['badge']})</span>" if row.get("badge") else ""
+            parts.append(
+                f"<tr><td style='{_TD_STYLE}'>{row['rank']}</td>"
+                f"<td style='{_TD_STYLE}'>{row['handle']}{badge}</td>"
+                f"<td style='{_TD_STYLE}'>{row['refs_this_week']}</td>"
+                f"<td style='{_TD_STYLE}'>{row['refs_total']}</td></tr>"
+            )
+        parts.append("</table>")
     return "\n".join(parts)
 
 

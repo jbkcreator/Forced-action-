@@ -12,3 +12,5 @@ forced-action.service
 docs/
 fa-agents.service
 /cron
+src/static/
+scripts/cron/

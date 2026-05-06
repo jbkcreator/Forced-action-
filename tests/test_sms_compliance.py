@@ -225,7 +225,8 @@ class TestSendSmsUnit:
 
     def test_dry_run_returns_true_without_twilio(self):
         db = MagicMock()
-        with patch("src.services.sms_compliance.can_send", return_value=True):
+        with patch("src.services.sms_compliance.can_send", return_value=True), \
+             patch("src.services.sms_compliance.is_quiet_hours", return_value=False):
             with patch("src.services.sms_compliance.settings") as mock_settings:
                 mock_settings.twilio_enabled = False
                 result = send_sms("+18135550100", "Hello", db)
@@ -233,7 +234,8 @@ class TestSendSmsUnit:
 
     def test_twilio_not_configured_returns_false_and_dlqs(self):
         db = MagicMock()
-        with patch("src.services.sms_compliance.can_send", return_value=True):
+        with patch("src.services.sms_compliance.can_send", return_value=True), \
+             patch("src.services.sms_compliance.is_quiet_hours", return_value=False):
             with patch("src.services.sms_compliance.settings") as mock_settings:
                 mock_settings.twilio_enabled = True
                 mock_settings.twilio_account_sid = None
@@ -248,7 +250,8 @@ class TestSendSmsUnit:
         db = MagicMock()
         mock_message = MagicMock()
         mock_message.sid = "SM123"
-        with patch("src.services.sms_compliance.can_send", return_value=True):
+        with patch("src.services.sms_compliance.can_send", return_value=True), \
+             patch("src.services.sms_compliance.is_quiet_hours", return_value=False):
             with patch("src.services.sms_compliance.settings") as mock_settings:
                 mock_settings.twilio_enabled = True
                 mock_settings.twilio_account_sid = "ACtest"
@@ -261,7 +264,8 @@ class TestSendSmsUnit:
 
     def test_twilio_exception_dlqs_and_returns_false(self):
         db = MagicMock()
-        with patch("src.services.sms_compliance.can_send", return_value=True):
+        with patch("src.services.sms_compliance.can_send", return_value=True), \
+             patch("src.services.sms_compliance.is_quiet_hours", return_value=False):
             with patch("src.services.sms_compliance.settings") as mock_settings:
                 mock_settings.twilio_enabled = True
                 mock_settings.twilio_account_sid = "ACtest"
@@ -354,3 +358,67 @@ class TestFullOptOutFlowIntegration:
         result = handle_inbound(phone, "YES", fresh_db)
         assert result is None
         assert can_send(phone, fresh_db) is True
+
+
+# ── Panhandle / multi-timezone quiet-hours guard ───────────────────────────────
+
+
+class TestQuietHoursTimezone:
+    """fa008+ (2026-05-04): 850 area code now maps to CST instead of ET.
+
+    The TCPA window is 8am-9pm recipient local. For 850 numbers that are
+    physically in CST (Pensacola etc.), the old ET mapping would have allowed
+    sends between 8pm and 9pm CST = 9pm-10pm ET, which is a TCPA violation.
+    """
+
+    def _patch_now(self, hour_local: int, tz_name: str):
+        """Force datetime.now(tz) to return `hour_local` in the given TZ."""
+        from datetime import datetime, timezone
+        from zoneinfo import ZoneInfo
+        target = datetime.now(ZoneInfo(tz_name)).replace(
+            hour=hour_local, minute=0, second=0, microsecond=0,
+        )
+        # Convert back to UTC for a "frozen" point in time
+        utc_now = target.astimezone(timezone.utc)
+
+        class _FrozenDT:
+            @staticmethod
+            def now(tz=None):
+                if tz is None:
+                    return utc_now
+                return utc_now.astimezone(tz)
+        return patch("src.services.sms_compliance.datetime", _FrozenDT)
+
+    def test_850_treated_as_cst(self):
+        """850 numbers should resolve to America/Chicago, not New_York."""
+        from src.services.sms_compliance import _recipient_tz
+        tz = _recipient_tz("+18505550100")
+        assert str(tz) == "America/Chicago"
+
+    def test_850_quiet_hours_at_8pm_cst_are_quiet(self):
+        """8:30pm CST = 9:30pm ET. If the gate were ET-based we'd block, but
+        we evaluate in CST — and 8:30pm CST is INSIDE quiet hours
+        (gate fires at 9pm CST). So this should be blocked too."""
+        from src.services.sms_compliance import is_quiet_hours
+        # 21:00 CST → quiet
+        with self._patch_now(21, "America/Chicago"):
+            assert is_quiet_hours("+18505550100") is True
+
+    def test_850_quiet_hours_at_2pm_cst_are_open(self):
+        """2pm CST is well inside the 8am-9pm window — gate must be open."""
+        from src.services.sms_compliance import is_quiet_hours
+        with self._patch_now(14, "America/Chicago"):
+            assert is_quiet_hours("+18505550100") is False
+
+    def test_813_still_eastern(self):
+        """Tampa numbers (813) must still resolve to America/New_York."""
+        from src.services.sms_compliance import _recipient_tz
+        tz = _recipient_tz("+18135550100")
+        assert str(tz) == "America/New_York"
+
+    def test_unknown_area_code_defaults_to_eastern(self):
+        """Conservative fallback: any non-FL area code → ET. Prevents 'no quiet
+        hours at all' for junk numbers."""
+        from src.services.sms_compliance import _recipient_tz
+        tz = _recipient_tz("+12125550100")  # NYC, not in our FL list
+        assert str(tz) == "America/New_York"
