@@ -1127,9 +1127,36 @@ def event_feed(
         raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
 
     if not locked_zips:
+        from config.ap_lite import AP_LITE_ELIGIBLE_TIERS, AP_LITE_THRESHOLD_PER_WEEK
+        from src.services.manual_action_counter import count_this_week as _count_actions
+        _manual_actions = _count_actions(db, subscriber.id)
+        _ap_lite_eligible = (
+            subscriber.tier in AP_LITE_ELIGIBLE_TIERS
+            and subscriber.status == "active"
+            and _manual_actions >= AP_LITE_THRESHOLD_PER_WEEK
+        )
+        from src.core.models import WalletBalance as _WB
+        _wallet = db.execute(select(_WB).where(_WB.subscriber_id == subscriber.id)).scalar_one_or_none()
         return {
             "feed_uuid": feed_uuid,
-            "subscriber": {"tier": subscriber.tier, "vertical": subscriber.vertical},
+            "subscriber": {
+                "id": subscriber.id,
+                "tier": subscriber.tier,
+                "vertical": subscriber.vertical,
+                "county_id": subscriber.county_id,
+                "locked_zips": [],
+                "founding_member": subscriber.founding_member,
+                "status": subscriber.status,
+                "has_saved_card": subscriber.has_saved_card,
+                "auto_mode_enabled": subscriber.auto_mode_enabled,
+                "created_at": subscriber.created_at.isoformat() if subscriber.created_at else None,
+                "wallet_balance": _wallet.credits_remaining if _wallet else None,
+                "wallet_tier": _wallet.wallet_tier if _wallet else None,
+                "ap_lite_eligible": _ap_lite_eligible,
+                "manual_actions_this_week": _manual_actions,
+                "paused_at": subscriber.paused_at.isoformat() if subscriber.paused_at else None,
+                "pause_resume_at": subscriber.pause_resume_at.isoformat() if subscriber.pause_resume_at else None,
+            },
             "total": 0,
             "page": page,
             "page_size": page_size,
@@ -1306,6 +1333,15 @@ def event_feed(
         select(_WalletBalance).where(_WalletBalance.subscriber_id == subscriber.id)
     ).scalar_one_or_none()
 
+    from config.ap_lite import AP_LITE_ELIGIBLE_TIERS, AP_LITE_THRESHOLD_PER_WEEK
+    from src.services.manual_action_counter import count_this_week as _count_actions
+    manual_actions_this_week = _count_actions(db, subscriber.id)
+    ap_lite_eligible = (
+        subscriber.tier in AP_LITE_ELIGIBLE_TIERS
+        and subscriber.status == "active"
+        and manual_actions_this_week >= AP_LITE_THRESHOLD_PER_WEEK
+    )
+
     return {
         "feed_uuid": feed_uuid,
         "subscriber": {
@@ -1321,6 +1357,10 @@ def event_feed(
             "created_at": subscriber.created_at.isoformat() if subscriber.created_at else None,
             "wallet_balance": wallet.credits_remaining if wallet else None,
             "wallet_tier": wallet.wallet_tier if wallet else None,
+            "ap_lite_eligible": ap_lite_eligible,
+            "manual_actions_this_week": manual_actions_this_week,
+            "paused_at": subscriber.paused_at.isoformat() if subscriber.paused_at else None,
+            "pause_resume_at": subscriber.pause_resume_at.isoformat() if subscriber.pause_resume_at else None,
         },
         "total": total,
         "page": page,
@@ -2583,6 +2623,99 @@ def upgrade_get(feed_uuid: str, tier: str, db: Session = Depends(get_db)):
     return upgrade(UpgradeRequest(feed_uuid=feed_uuid, tier=tier), db)
 
 
+# ── Phase B: ZIP Territory Map ───────────────────────────────────────────────
+
+@app.get("/api/territory-map")
+def territory_map(
+    county_id: str,
+    vertical: str,
+    db: Session = Depends(get_db),
+):
+    """
+    Returns all ZIP territories for a county/vertical combination with live status.
+    Used by the ZIP Territory Map UI component.
+    Response cached 60s in Redis.
+    """
+    import json
+    from src.core.models import ZipTerritory, Property as _Prop, DistressScore as _DS
+    from src.core.redis_client import redis_available, rget, rset
+    from src.services.urgency_engine import get_active_count
+
+    cache_key = f"territory_map:{county_id}:{vertical}"
+    if redis_available():
+        cached = rget(cache_key)
+        if cached:
+            return json.loads(cached)
+
+    zip_rows = db.execute(
+        select(ZipTerritory).where(
+            ZipTerritory.county_id == county_id,
+            ZipTerritory.vertical == vertical,
+        )
+    ).scalars().all()
+
+    now = datetime.now(timezone.utc)
+    results = []
+    for zt in zip_rows:
+        lead_count = db.execute(
+            select(func.count()).select_from(_Prop).where(
+                _Prop.zip == zt.zip_code,
+                _Prop.county_id == county_id,
+            )
+        ).scalar() or 0
+
+        active_viewers = 0
+        try:
+            active_viewers = get_active_count(zt.zip_code)
+        except Exception:
+            pass
+
+        entry: dict = {
+            "zip": zt.zip_code,
+            "status": zt.status,
+            "active_viewers": active_viewers,
+            "lead_count": lead_count,
+        }
+        if zt.status == "grace" and zt.grace_expires_at:
+            entry["grace_expires_at"] = zt.grace_expires_at.isoformat()
+        results.append(entry)
+
+    payload = {
+        "county_id": county_id,
+        "vertical": vertical,
+        "zips": results,
+        "generated_at": now.isoformat(),
+    }
+
+    if redis_available():
+        rset(cache_key, json.dumps(payload), ttl_seconds=60)
+
+    return payload
+
+
+@app.post("/api/admin/human-close/{escalation_id}/outcome")
+def human_close_outcome(
+    escalation_id: int,
+    outcome: str,
+    closer_assigned: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """Record outcome for a human close escalation. Admin-only (no additional auth here — mount behind admin router if needed)."""
+    from src.core.models import HumanCloseEscalation
+    esc = db.get(HumanCloseEscalation, escalation_id)
+    if not esc:
+        raise HTTPException(status_code=404, detail="Escalation not found")
+    valid = {"won", "lost", "no_response", "rescheduled"}
+    if outcome not in valid:
+        raise HTTPException(status_code=422, detail=f"outcome must be one of {valid}")
+    esc.outcome = outcome
+    esc.outcome_at = datetime.now(timezone.utc)
+    if closer_assigned:
+        esc.closer_assigned = closer_assigned
+    db.flush()
+    return {"ok": True, "escalation_id": escalation_id, "outcome": outcome}
+
+
 # ── Stage 5: Referral team view + weekly leaderboard ─────────────────────────
 
 @app.get("/api/feed/{feed_uuid}/team-view")
@@ -3164,6 +3297,100 @@ async def twilio_voice_webhook(request: Request, db: Session = Depends(get_db)):
     from src.services.signup_engine import handle_missed_call
     twiml = handle_missed_call(from_number=from_number, db=db)
     return Response(content=twiml, media_type="application/xml")
+
+
+# ── Phase 2B Frontend: Pause / Resume / Partner / AP-Lite endpoints ─────────
+
+class PauseRequest(BaseModel):
+    feed_uuid: str
+    days: int = 60
+
+class ResumeRequest(BaseModel):
+    feed_uuid: str
+
+class PartnerCheckoutRequest(BaseModel):
+    feed_uuid: str
+    zip_codes: list
+    vertical: str
+
+
+@app.post("/api/pause-subscription")
+def pause_subscription_endpoint(req: PauseRequest, db: Session = Depends(get_db)):
+    sub = db.execute(select(Subscriber).where(Subscriber.event_feed_uuid == req.feed_uuid)).scalar_one_or_none()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscriber not found")
+    from src.services.pause_subscription import pause_subscriber
+    ok = pause_subscriber(db, sub.id, days=req.days)
+    if not ok:
+        raise HTTPException(status_code=409, detail={"error": "already_paused", "message": "Subscription already paused or invalid."})
+    db.refresh(sub)
+    return {"ok": True, "paused_at": sub.paused_at.isoformat() if sub.paused_at else None, "resume_at": sub.pause_resume_at.isoformat() if sub.pause_resume_at else None}
+
+
+@app.post("/api/resume-subscription")
+def resume_subscription_endpoint(req: ResumeRequest, db: Session = Depends(get_db)):
+    sub = db.execute(select(Subscriber).where(Subscriber.event_feed_uuid == req.feed_uuid)).scalar_one_or_none()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscriber not found")
+    from src.services.pause_subscription import resume_subscriber
+    ok = resume_subscriber(db, sub.id)
+    if not ok:
+        raise HTTPException(status_code=409, detail={"error": "not_paused", "message": "Subscription is not paused."})
+    return {"ok": True, "resumed_at": datetime.now(timezone.utc).isoformat()}
+
+
+@app.get("/api/upgrade/partner/eligibility")
+def partner_eligibility(feed_uuid: str, db: Session = Depends(get_db)):
+    sub = db.execute(select(Subscriber).where(Subscriber.event_feed_uuid == feed_uuid)).scalar_one_or_none()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscriber not found")
+    from src.services.partner_tier import is_eligible
+    eligible, reason = is_eligible(sub)
+    return {
+        "eligible": eligible,
+        "reason": reason,
+        "current_tier": sub.tier,
+        "county_id": sub.county_id or "fl_hillsborough",
+        "vertical": sub.vertical or "roofing",
+    }
+
+
+@app.post("/api/upgrade/partner")
+def partner_checkout(req: PartnerCheckoutRequest, db: Session = Depends(get_db)):
+    sub = db.execute(select(Subscriber).where(Subscriber.event_feed_uuid == req.feed_uuid)).scalar_one_or_none()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subscriber not found")
+    from src.services.partner_tier import is_eligible, validate_zip_selection
+    eligible, reason = is_eligible(sub)
+    if not eligible:
+        raise HTTPException(status_code=403, detail={"error": "not_eligible", "message": reason})
+    ok, err, locked = validate_zip_selection(db, req.zip_codes, req.vertical, sub.county_id or "fl_hillsborough")
+    if not ok:
+        raise HTTPException(status_code=409, detail={"error": "zips_already_locked", "message": err, "zips": locked})
+    from src.services.stripe_service import create_subscription_checkout
+    from config.settings import get_settings
+    _s = get_settings()
+    base = _s.app_base_url.rstrip("/")
+    try:
+        result = create_subscription_checkout(
+            db=db,
+            tier="partner",
+            vertical=req.vertical,
+            county_id=sub.county_id or "fl_hillsborough",
+            zip_codes=req.zip_codes,
+            success_url=f"{base}/success?tier=partner&zips={','.join(req.zip_codes)}",
+            cancel_url=f"{base}/dashboard/{sub.event_feed_uuid}/partner",
+            customer_email=sub.email,
+        )
+        return {"checkout_url": result["url"]}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail={"error": "checkout_failed", "message": str(exc)})
+
+
+@app.post("/api/upgrade/ap-lite")
+def ap_lite_upgrade(req: UpgradeRequest, db: Session = Depends(get_db)):
+    req.tier = "autopilot_lite"
+    return upgrade(req, db)
 
 
 # ---------------------------------------------------------------------------

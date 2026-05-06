@@ -747,6 +747,21 @@ class Subscriber(Base):
     disputed_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
     disputed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
+    # ── Phase A: Wallet-to-Lock candidate flags ──
+    lock_candidate_zip: Mapped[Optional[str]] = mapped_column(String(10))
+    lock_candidate_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    # ── Phase A: AP Lite candidate flag ──
+    ap_lite_candidate_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    # ── Phase B: Pause flow ──
+    paused_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    pause_resume_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    # ── Phase A: Human close routing ──
+    escalation_routed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    escalation_channel: Mapped[Optional[str]] = mapped_column(String(20))
+
     bundle_purchases = relationship("BundlePurchase", back_populates="subscriber")
 
     # Audit
@@ -1297,6 +1312,8 @@ class WalletTransaction(Base):
     balance_after: Mapped[int] = mapped_column(Integer, nullable=False)
     description: Mapped[Optional[str]] = mapped_column(String(255))
     stripe_charge_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)
+    # ZIP attribution for Wallet-to-Lock detection (Phase A)
+    zip_code: Mapped[Optional[str]] = mapped_column(String(10))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     wallet = relationship("WalletBalance", backref="transactions")
@@ -1304,6 +1321,7 @@ class WalletTransaction(Base):
     __table_args__ = (
         CheckConstraint("txn_type IN ('credit', 'debit', 'reload', 'bonus', 'refund')", name="check_txn_type"),
         Index("idx_wallet_txn_sub_created", "subscriber_id", "created_at"),
+        Index("idx_wallet_txn_sub_zip_created", "subscriber_id", "zip_code", "created_at"),
     )
 
     def __repr__(self):
@@ -1839,3 +1857,103 @@ class SandboxOutbox(Base):
 
     def __repr__(self):
         return f"<SandboxOutbox(id={self.id}, channel={self.channel}, to={self.to_number}, campaign={self.campaign})>"
+
+
+# ============================================================================
+# Phase A: Wallet-to-Lock / AP Lite / Human Close
+# ============================================================================
+
+class ManualActionLog(Base):
+    """
+    Tracks per-subscriber manual actions for AP Lite threshold detection.
+    Populated by wallet_engine.debit() for any action in MANUAL_ACTION_TYPES.
+    """
+    __tablename__ = "manual_action_log"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("subscribers.id"), nullable=False
+    )
+    action_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    week_start: Mapped[date] = mapped_column(Date, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        Index("idx_mal_sub_week", "subscriber_id", "week_start"),
+        Index("idx_mal_created", "created_at"),
+    )
+
+    def __repr__(self):
+        return f"<ManualActionLog(sub={self.subscriber_id}, action={self.action_type}, week={self.week_start})>"
+
+
+class HumanCloseEscalation(Base):
+    """
+    Audit trail for high-intent subscriber escalations routed to human closers.
+    UNIQUE(subscriber_id, decision_id) prevents duplicate routing.
+    """
+    __tablename__ = "human_close_escalations"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("subscribers.id"), nullable=False
+    )
+    decision_id: Mapped[str] = mapped_column(String(40), nullable=False)
+    revenue_signal_score: Mapped[int] = mapped_column(Integer, nullable=False)
+    interactions_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    target_tier: Mapped[str] = mapped_column(String(20), nullable=False)
+    channel: Mapped[str] = mapped_column(String(20), nullable=False)
+    routed_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    closer_assigned: Mapped[Optional[str]] = mapped_column(String(80))
+    outcome: Mapped[Optional[str]] = mapped_column(String(20))
+    outcome_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    context_json: Mapped[Optional[dict]] = mapped_column(JSONB)
+
+    __table_args__ = (
+        UniqueConstraint("subscriber_id", "decision_id", name="uq_hce_sub_decision"),
+        Index("idx_hce_routed", "routed_at"),
+        Index("idx_hce_open", "outcome", "routed_at"),
+        CheckConstraint(
+            "channel IN ('slack', 'ghl', 'sms', 'email')",
+            name="check_hce_channel",
+        ),
+        CheckConstraint(
+            "outcome IN ('won', 'lost', 'no_response', 'rescheduled') OR outcome IS NULL",
+            name="check_hce_outcome",
+        ),
+    )
+
+    def __repr__(self):
+        return f"<HumanCloseEscalation(sub={self.subscriber_id}, channel={self.channel}, outcome={self.outcome})>"
+
+
+# ============================================================================
+# Phase B: Partner Tier
+# ============================================================================
+
+DEFAULT_MAX_PARTNER_ZIPS = 5
+
+
+class PartnerSubscription(Base):
+    """
+    One row per partner subscriber. Tracks max ZIP allotment and lifecycle.
+    Multiple ZipTerritory rows (one per ZIP) point to the same subscriber_id.
+    """
+    __tablename__ = "partner_subscriptions"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("subscribers.id"), nullable=False, unique=True
+    )
+    max_zips: Mapped[int] = mapped_column(Integer, nullable=False, default=DEFAULT_MAX_PARTNER_ZIPS)
+    activated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    deactivated_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    def __repr__(self):
+        return f"<PartnerSubscription(sub={self.subscriber_id}, max_zips={self.max_zips})>"

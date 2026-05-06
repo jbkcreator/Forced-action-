@@ -1,0 +1,5 @@
+# Static fallback — YELLOW kill-switch for wallet_to_lock_close.
+version: 1
+body: |
+  {first_name}, you've spent enough on leads in {zip_code} to own it outright.
+  Lock the ZIP and stop the monthly credit drain. {cta_url}

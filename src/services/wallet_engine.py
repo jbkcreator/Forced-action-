@@ -75,11 +75,20 @@ def get_balance(subscriber_id: int, db: Session) -> int:
     return wallet.credits_remaining if wallet else 0
 
 
-def debit(subscriber_id: int, action: str, db: Session, description: str = "") -> bool:
+def debit(
+    subscriber_id: int,
+    action: str,
+    db: Session,
+    description: str = "",
+    zip_code: Optional[str] = None,
+) -> bool:
     """Atomic debit. Returns False if the wallet has insufficient credits.
 
     Holds a row-level lock for the duration so concurrent debits cannot both
     pass the balance check on the same wallet.
+
+    zip_code: if provided, attributed to the transaction for Wallet-to-Lock
+    detection. Pass the ZIP of the lead being acted on.
     """
     cost = CREDIT_COSTS.get(action, 1)
     wallet = get_or_create_wallet(subscriber_id, db, lock=True)
@@ -94,12 +103,37 @@ def debit(subscriber_id: int, action: str, db: Session, description: str = "") -
         amount=-cost,
         balance_after=wallet.credits_remaining,
         description=description or action,
+        zip_code=zip_code,
     )
     db.add(txn)
     db.flush()
     if wallet.credits_remaining < WALLET_AUTO_RELOAD_THRESHOLD:
         check_auto_reload(wallet, db)
+    # Log manual action for AP Lite threshold detection (no DB round-trip for
+    # action types we don't care about).
+    _maybe_log_manual_action(subscriber_id, action, db)
     return True
+
+
+def _maybe_log_manual_action(subscriber_id: int, action: str, db: Session) -> None:
+    """Insert into manual_action_log if action is a tracked manual type."""
+    from config.ap_lite import MANUAL_ACTION_TYPES
+    from src.core.models import ManualActionLog
+    from datetime import date, timedelta
+    if action not in MANUAL_ACTION_TYPES:
+        return
+    today = date.today()
+    # Monday of the current week
+    week_start = today - timedelta(days=today.weekday())
+    try:
+        db.add(ManualActionLog(
+            subscriber_id=subscriber_id,
+            action_type=action,
+            week_start=week_start,
+        ))
+        db.flush()
+    except Exception as exc:
+        logger.warning("manual_action_log insert failed for sub %s: %s", subscriber_id, exc)
 
 
 def credit(

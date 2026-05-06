@@ -205,6 +205,14 @@ class AppSettings(BaseSettings):
 	# UptimeRobot (optional — used by scripts/setup_uptimerobot.py to create monitors)
 	uptimerobot_api_key: Optional[SecretStr] = Field(default=None, env="UPTIMEROBOT_API_KEY")
 
+	# Human close routing (Phase A)
+	slack_human_close_webhook: Optional[str] = Field(default=None, env="SLACK_HUMAN_CLOSE_WEBHOOK")
+
+	# Synthflow outbound voice drops (Phase C)
+	synthflow_api_base: str = Field(default="https://api.synthflow.ai/v2", env="SYNTHFLOW_API_BASE")
+	synthflow_api_key: Optional[SecretStr] = Field(default=None, env="SYNTHFLOW_API_KEY")
+	synthflow_outbound_agent_roofing: Optional[str] = Field(default=None, env="SYNTHFLOW_OUTBOUND_AGENT_ROOFING")
+
 	# Admin upload layer
 	admin_username: str = Field(default="admin", env="ADMIN_USERNAME")
 	admin_password: Optional[SecretStr] = Field(default=None, env="ADMIN_PASSWORD")
