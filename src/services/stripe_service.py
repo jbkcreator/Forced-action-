@@ -400,12 +400,12 @@ def switch_subscription_plan(
         logger.error("switch_subscription_plan: subscription %s not found: %s", subscription_id, exc)
         raise
 
-    # Find the current subscription item ID
-    items = subscription.get("items", {}).get("data", [])
+    # Find the current subscription item ID (SDK v5+ uses attribute access, not dict)
+    items = list(subscription.items.data) if subscription.items else []
     if not items:
         raise ValueError(f"Subscription {subscription_id} has no items")
 
-    item_id = items[0]["id"]
+    item_id = items[0].id
 
     proration_behavior = "create_prorations" if prorate else "none"
 
@@ -432,7 +432,7 @@ def switch_subscription_plan(
         "Subscription %s switched to price %s (prorate=%s)",
         subscription_id, new_price_id, prorate,
     )
-    return dict(updated)
+    return updated.to_dict()
 
 
 def get_founding_spots_remaining(

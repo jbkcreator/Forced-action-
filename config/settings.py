@@ -147,8 +147,9 @@ class AppSettings(BaseSettings):
 	# Founding subscriber spot limit (default 10, changeable without redeploy)
 	founding_spot_limit: int = Field(default=10, env="FOUNDING_SPOT_LIMIT")
 
-	# Grace period after cancellation — default 48hr, set lower for testing (e.g. GRACE_PERIOD_HOURS=0.017 ≈ 1 min)
-	grace_period_hours: float = Field(default=48.0, env="GRACE_PERIOD_HOURS")
+	# Grace period after subscription deletion — 7 days lets payment_failure_day5 trigger fire.
+	# Set GRACE_PERIOD_HOURS=0.017 (≈1 min) for rapid local testing.
+	grace_period_hours: float = Field(default=168.0, env="GRACE_PERIOD_HOURS")
 
 	# Alert deduplication — suppress repeat alerts for the same failure within this window
 	alert_cooldown_hours: float = Field(default=4.0, env="ALERT_COOLDOWN_HOURS")
