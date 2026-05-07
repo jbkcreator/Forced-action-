@@ -275,10 +275,11 @@ def run_fomo(event_payload: Dict[str, Any], subscriber_id: int,
 			 decision_id: Optional[str] = None) -> Dict[str, Any]:
 	"""Compile + invoke the FOMO graph for a single event. Convenience wrapper."""
 	graph = build_fomo_graph().compile()
+	event_type = (event_payload or {}).get("event_type", "competitor_acted_on_lead")
 	final = graph.invoke({
 		"decision_id": decision_id or str(uuid.uuid4()),
 		"subscriber_id": subscriber_id,
-		"event_type": "competitor_acted_on_lead",
+		"event_type": event_type,
 		"event_payload": event_payload,
 	})
 	return dict(final)
