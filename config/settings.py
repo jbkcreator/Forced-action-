@@ -212,6 +212,8 @@ class AppSettings(BaseSettings):
 	synthflow_api_base: str = Field(default="https://api.synthflow.ai/v2", env="SYNTHFLOW_API_BASE")
 	synthflow_api_key: Optional[SecretStr] = Field(default=None, env="SYNTHFLOW_API_KEY")
 	synthflow_outbound_agent_roofing: Optional[str] = Field(default=None, env="SYNTHFLOW_OUTBOUND_AGENT_ROOFING")
+	synthflow_outbound_agent_remediation: Optional[str] = Field(default=None, env="SYNTHFLOW_OUTBOUND_AGENT_REMEDIATION")
+	synthflow_outbound_agent_revenue_recovery: Optional[str] = Field(default=None, env="SYNTHFLOW_OUTBOUND_AGENT_REVENUE_RECOVERY")
 
 	# Admin upload layer
 	admin_username: str = Field(default="admin", env="ADMIN_USERNAME")
