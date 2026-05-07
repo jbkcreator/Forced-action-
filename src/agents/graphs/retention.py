@@ -8,7 +8,7 @@ matching subscriber.
 
 Trigger shape:
 	event_type: 'retention_summary_due'
-	event_payload: {'tier': 'wallet' | 'lock' | 'autopilot', 'window_days': 7}
+	event_payload: {'tier': 'wallet' | 'annual_lock' | 'autopilot_lite' | 'autopilot_pro', 'window_days': 7}
 
 A scheduler produces one such event per subscriber in the target cohort.
 The graph itself is single-subscriber; the fan-out is a concern of the
@@ -34,10 +34,12 @@ from langgraph.graph import END, START, StateGraph
 from src.agents.prompts.loader import render_fallback_body, render_system_and_user
 from src.agents.subgraphs.compose_and_send import run_compose_and_send
 from src.agents.subgraphs.decision_hierarchy import run_decision_hierarchy
+from src.tasks.kill_switch_metric_ingest import get_cached_metric
 from src.agents.tools.read_tools import (
 	get_deal_history,
 	get_lead_pool,
 	get_subscriber_profile,
+	get_subscriber_territories,
 	get_wallet_state,
 	get_zip_activity,
 )
@@ -105,14 +107,18 @@ def _node_assemble_history(state: RetentionState) -> RetentionState:
 	wallet = get_wallet_state(sub_id)
 	deals = get_deal_history(sub_id, limit=10)
 
-	# Find a "top ZIP" from deal history if available. Fall back to the
-	# subscriber's county in the profile.
+	# Find a "top ZIP" from deal history; fall back to subscriber's locked territory.
 	top_zip: Optional[str] = None
 	for d in deals:
 		lead_source = d.get("lead_source")
 		if lead_source and lead_source.startswith("zip:"):
 			top_zip = lead_source.split(":", 1)[1]
 			break
+
+	if top_zip is None:
+		territories = get_subscriber_territories(sub_id, status="locked")
+		if territories:
+			top_zip = territories[0]
 
 	return {
 		"wallet_state": wallet,
@@ -149,7 +155,8 @@ def _node_hierarchy_check(state: RetentionState) -> RetentionState:
 	hierarchy = run_decision_hierarchy({
 		"subscriber_id": state["subscriber_id"],
 		"graph_name": GRAPH_NAME,
-		"kill_switch_feature": None,          # priority-list scope: fail-open
+		"kill_switch_feature": KILL_SWITCH_FEATURE,
+		"kill_switch_observed_value": get_cached_metric(KILL_SWITCH_FEATURE),
 		"learning_card_type": "churn_signal",
 	})
 

@@ -38,6 +38,7 @@ from src.core.models import (
     PremiumPurchase,
     Property,
     SentLead,
+    SmsOptIn,
     Subscriber,
 )
 from src.loaders.tax import TaxDelinquencyLoader
@@ -556,3 +557,159 @@ def sku_margin_stats(
         out["windows"][window_key] = per_sku
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# SMS Opt-In management (for live SMS testing)
+# ---------------------------------------------------------------------------
+
+class SmsOptInRequest(BaseModel):
+    phone: str
+    subscriber_id: Optional[int] = None
+    keyword_used: Optional[str] = "YES"
+    source: str = "manual"
+
+
+@router.post("/sms-opt-in", dependencies=[Depends(get_current_admin)])
+def create_sms_opt_in(req: SmsOptInRequest, db: Session = Depends(get_db)):
+    """Create or update an SMS opt-in record. Used to seed consent before live SMS testing."""
+    existing = db.query(SmsOptIn).filter(SmsOptIn.phone == req.phone).first()
+    if existing:
+        existing.subscriber_id = req.subscriber_id or existing.subscriber_id
+        existing.keyword_used = req.keyword_used
+        existing.opted_in_at = datetime.now(timezone.utc)
+        db.commit()
+        return {"ok": True, "action": "updated", "phone": req.phone}
+
+    record = SmsOptIn(
+        phone=req.phone,
+        subscriber_id=req.subscriber_id,
+        keyword_used=req.keyword_used,
+        source=req.source,
+        opt_in_message="Manual opt-in via admin API",
+        opted_in_at=datetime.now(timezone.utc),
+    )
+    db.add(record)
+    db.commit()
+    return {"ok": True, "action": "created", "phone": req.phone}
+
+
+@router.get("/sms-opt-in", dependencies=[Depends(get_current_admin)])
+def list_sms_opt_ins(
+    subscriber_id: Optional[int] = Query(None),
+    phone: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    """List SMS opt-in records. Filter by subscriber_id or phone for pre-test verification."""
+    q = db.query(SmsOptIn)
+    if subscriber_id:
+        q = q.filter(SmsOptIn.subscriber_id == subscriber_id)
+    if phone:
+        q = q.filter(SmsOptIn.phone == phone)
+    rows = q.order_by(SmsOptIn.opted_in_at.desc()).limit(50).all()
+    return [
+        {
+            "id": r.id,
+            "phone": r.phone,
+            "subscriber_id": r.subscriber_id,
+            "keyword_used": r.keyword_used,
+            "source": r.source,
+            "opted_in_at": r.opted_in_at.isoformat() if r.opted_in_at else None,
+        }
+        for r in rows
+    ]
+
+
+@router.delete("/sms-opt-in/{phone}", dependencies=[Depends(get_current_admin)])
+def delete_sms_opt_in(phone: str, db: Session = Depends(get_db)):
+    """Remove an SMS opt-in record (simulate opt-out for testing compliance gate)."""
+    record = db.query(SmsOptIn).filter(SmsOptIn.phone == phone).first()
+    if not record:
+        raise HTTPException(status_code=404, detail="No opt-in record for that phone")
+    db.delete(record)
+    db.commit()
+    return {"ok": True, "deleted": phone}
+
+
+# ---------------------------------------------------------------------------
+# Gate Monitoring endpoints
+# ---------------------------------------------------------------------------
+
+@router.get("/gate-metrics", dependencies=[Depends(get_current_admin)])
+def gate_metrics(
+    days: int = Query(1, ge=1, le=90),
+    graph_name: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    """
+    Aggregate agent_decisions for the last N days.
+    Returns per-graph pass/fail/abort rates and top block reasons.
+    Powered by gate_metrics_aggregator.
+    """
+    from src.tasks.gate_metrics_aggregator import compute_block_reasons, compute_gate_metrics
+
+    metrics = compute_gate_metrics(db, days=days)
+    if graph_name:
+        metrics = [g for g in metrics if g["graph_name"] == graph_name]
+
+    block_reasons = compute_block_reasons(db, days=max(days, 7))
+    return {
+        "days": days,
+        "graphs": metrics,
+        "top_block_reasons": block_reasons,
+    }
+
+
+@router.get("/kill-switch-status", dependencies=[Depends(get_current_admin)])
+def kill_switch_status_overview():
+    """
+    Return current kill-switch colour + cached observed metric for every
+    configured feature. Requires kill_switch_metric_ingest cron to have run.
+    """
+    from config.cora_guardrails import KILL_SWITCH
+    from src.agents.tools.gating_tools import kill_switch_status
+    from src.tasks.kill_switch_metric_ingest import get_cached_metric
+
+    results = []
+    for feature, cfg in KILL_SWITCH.items():
+        observed = get_cached_metric(feature)
+        status = kill_switch_status(feature, observed)
+        results.append({
+            "feature": feature,
+            "observed_value": observed,
+            "color": status.get("color"),
+            "action": status.get("action") or cfg.get("action"),
+            "threshold_yellow": cfg.get("yellow"),
+            "threshold_red": cfg.get("red"),
+            "cached": observed is not None,
+        })
+
+    return {"features": results}
+
+
+@router.get("/decision-audit/{decision_id}", dependencies=[Depends(get_current_admin)])
+def decision_audit(decision_id: str, db: Session = Depends(get_db)):
+    """
+    Return full decision trace for a single agent_decisions row.
+    Includes hierarchy_path, kill_switch_color, tokens, cost, and full summary JSONB.
+    """
+    from src.core.models import AgentDecision
+
+    row = db.execute(
+        select(AgentDecision).where(AgentDecision.decision_id == decision_id)
+    ).scalar_one_or_none()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Decision not found")
+
+    return {
+        "decision_id": row.decision_id,
+        "graph_name": row.graph_name,
+        "subscriber_id": row.subscriber_id,
+        "terminal_status": row.terminal_status,
+        "started_at": row.started_at.isoformat() if row.started_at else None,
+        "completed_at": row.completed_at.isoformat() if row.completed_at else None,
+        "tokens_used": row.tokens_used,
+        "cost_usd": float(row.cost_usd) if row.cost_usd is not None else None,
+        "summary": row.summary,
+    }
