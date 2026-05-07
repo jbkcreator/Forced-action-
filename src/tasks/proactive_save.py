@@ -8,7 +8,7 @@ Triggers (either fires the save offer):
   - inactivity:          5–7 days with no wallet activity
   - payment_failure_day5: subscriber has been in grace for 5+ days
 
-Cron: 0 10 * * * (10 AM UTC daily, after scoring + annual push)
+Cron: 0 15 * * * (15:00 UTC daily, after annual push at 14:00)
 """
 import logging
 import sys
@@ -107,25 +107,119 @@ def _send_save_offer(sub: Subscriber, trigger: str) -> bool:
     )
 
     feed_url = (
-        f"{settings.app_base_url}/dashboard/{sub.event_feed_uuid}"
+        f"{settings.app_base_url}/dashboard/{sub.event_feed_uuid}?save_offer=accept"
         if sub.event_feed_uuid
         else settings.app_base_url
     )
+
+    name = sub.name or "there"
+    body_text = (
+        f"Hi {name},\n\n"
+        f"{trigger_line}\n\n"
+        f"We don't want you to lose your territory. Switch to our Data-Only plan at "
+        f"just ${price}/mo — full property data feed, no enrichment fees, cancel anytime.\n\n"
+        f"Switch now:\n{feed_url}\n\n"
+        f"Questions? Reply to this email.\n\n"
+        f"— Forced Action Team"
+    )
+
+    founding_html = (
+        '<p style="margin:0 0 16px;padding:10px 16px;background:#451a03;'
+        'border:1px solid #92400e;border-radius:8px;color:#fbbf24;font-size:14px;">'
+        "⭐ Founding Member — your locked rate will be permanently lost if you don't reactivate."
+        "</p>"
+        if getattr(sub, "founding_member", False) else ""
+    )
+
+    body_html = f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/></head>
+<body style="margin:0;padding:0;background:#0f172a;font-family:Inter,Arial,sans-serif;color:#e2e8f0;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f172a;padding:40px 0;">
+    <tr><td align="center">
+      <table width="560" cellpadding="0" cellspacing="0"
+             style="background:#1e293b;border:1px solid rgba(255,255,255,0.08);border-radius:16px;overflow:hidden;max-width:560px;width:100%;">
+
+        <!-- Header -->
+        <tr>
+          <td style="padding:32px 40px 24px;border-bottom:1px solid rgba(255,255,255,0.08);">
+            <p style="margin:0;font-size:22px;font-weight:800;color:#ffffff;">
+              Forced <span style="color:#fbbf24;">Action</span>
+            </p>
+          </td>
+        </tr>
+
+        <!-- Body -->
+        <tr>
+          <td style="padding:32px 40px;">
+            <h1 style="margin:0 0 8px;font-size:24px;font-weight:800;color:#ffffff;">
+              Keep your leads for ${price}/mo.
+            </h1>
+            <p style="margin:0 0 24px;color:#94a3b8;font-size:15px;">
+              Hi {name}, {trigger_line}
+            </p>
+
+            {founding_html}
+
+            <!-- Offer box -->
+            <table width="100%" cellpadding="0" cellspacing="0"
+                   style="background:rgba(251,191,36,0.06);border:1px solid rgba(251,191,36,0.2);
+                          border-radius:12px;padding:20px 24px;margin-bottom:24px;">
+              <tr>
+                <td>
+                  <p style="margin:0 0 6px;font-size:16px;font-weight:800;color:#fbbf24;">
+                    Data-Only Plan — ${price}/mo
+                  </p>
+                  <p style="margin:0;font-size:13px;color:#94a3b8;">
+                    Full property data feed &middot; No enrichment fees &middot; Cancel anytime
+                  </p>
+                </td>
+              </tr>
+            </table>
+
+            <!-- CTA -->
+            <table cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
+              <tr>
+                <td style="background:#fbbf24;border-radius:8px;">
+                  <a href="{feed_url}"
+                     style="display:inline-block;padding:14px 28px;color:#0f172a;font-size:15px;
+                            font-weight:700;text-decoration:none;">
+                    Switch to Data-Only &rarr;
+                  </a>
+                </td>
+              </tr>
+            </table>
+
+            <p style="margin:0;font-size:13px;color:#64748b;">
+              Questions? Reply to this email or reach us at
+              <a href="mailto:support@forcedaction.io" style="color:#fbbf24;text-decoration:none;">
+                support@forcedaction.io
+              </a>
+            </p>
+          </td>
+        </tr>
+
+        <!-- Footer -->
+        <tr>
+          <td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.08);
+                     font-size:12px;color:#475569;text-align:center;">
+            Forced Action &mdash; Hillsborough County Property Intelligence
+          </td>
+        </tr>
+
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>"""
 
     try:
         from src.services.email import send_email
         send_email(
             to=sub.email,
             subject=f"Keep your leads for ${price}/mo — Data-Only access",
-            body_text=(
-                f"Hi {sub.name or 'there'},\n\n"
-                f"{trigger_line}\n\n"
-                f"We don't want you to lose your territory. Switch to our Data-Only plan at "
-                f"just ${price}/mo — full property data feed, no enrichment fees, cancel anytime.\n\n"
-                f"Visit your dashboard to make the switch:\n{feed_url}\n\n"
-                f"Questions? Reply to this email.\n\n"
-                f"— Forced Action Team"
-            ),
+            body_text=body_text,
+            body_html=body_html,
         )
         logger.info("[ProactiveSave] Offer sent: subscriber=%d trigger=%s", sub.id, trigger)
         return True
@@ -161,6 +255,14 @@ def downgrade_to_data_only(subscriber_id: int, db: Session) -> bool:
         return True
     except Exception as exc:
         logger.error("downgrade_to_data_only failed for subscriber %d: %s", subscriber_id, exc)
+        return False
+
+
+def compute_save_offer_active(subscriber, db) -> bool:
+    """Return True if subscriber is eligible for the Data-Only save offer. Safe to call from API layer."""
+    try:
+        return bool(_identify_risk(subscriber, db))
+    except Exception:
         return False
 
 

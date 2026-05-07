@@ -1080,6 +1080,12 @@ def zip_availability(
 _VALID_SORTS = {"score_desc", "newest", "value_desc"}
 
 
+def _compute_save_offer_active(subscriber, db) -> bool:
+    """Return True if this subscriber is eligible for the Data-Only save offer."""
+    from src.tasks.proactive_save import compute_save_offer_active
+    return compute_save_offer_active(subscriber, db)
+
+
 @app.get("/api/feed/{feed_uuid}")
 def event_feed(
     feed_uuid: str,
@@ -1129,6 +1135,7 @@ def event_feed(
                 "manual_actions_this_week": 0,
                 "paused_at": subscriber.paused_at.isoformat() if subscriber.paused_at else None,
                 "pause_resume_at": subscriber.pause_resume_at.isoformat() if subscriber.pause_resume_at else None,
+                "save_offer_active": False,
             },
             "total": 0,
             "page": page,
@@ -1184,6 +1191,7 @@ def event_feed(
                 "manual_actions_this_week": _manual_actions,
                 "paused_at": subscriber.paused_at.isoformat() if subscriber.paused_at else None,
                 "pause_resume_at": subscriber.pause_resume_at.isoformat() if subscriber.pause_resume_at else None,
+                "save_offer_active": _compute_save_offer_active(subscriber, db),
             },
             "total": 0,
             "page": page,
@@ -1389,6 +1397,7 @@ def event_feed(
             "manual_actions_this_week": manual_actions_this_week,
             "paused_at": subscriber.paused_at.isoformat() if subscriber.paused_at else None,
             "pause_resume_at": subscriber.pause_resume_at.isoformat() if subscriber.pause_resume_at else None,
+            "save_offer_active": _compute_save_offer_active(subscriber, db),
         },
         "total": total,
         "page": page,
@@ -2649,6 +2658,12 @@ def upgrade(req: UpgradeRequest, db: Session = Depends(get_db)):
 def upgrade_get(feed_uuid: str, tier: str, db: Session = Depends(get_db)):
     """GET-friendly upgrade so the link in the upsell email can be tapped directly."""
     return upgrade(UpgradeRequest(feed_uuid=feed_uuid, tier=tier), db)
+
+
+@app.get("/api/save-offer/accept", include_in_schema=False)
+def save_offer_accept_get(feed_uuid: str, db: Session = Depends(get_db)):
+    """GET-friendly save-offer accept so the link in the proactive-save email can be tapped directly."""
+    return upgrade(UpgradeRequest(feed_uuid=feed_uuid, tier="data_only"), db)
 
 
 # ── Phase B: ZIP Territory Map ───────────────────────────────────────────────

@@ -14,6 +14,7 @@ import pytest
 from src.tasks.proactive_save import (
     _identify_risk,
     _send_save_offer,
+    compute_save_offer_active,
     downgrade_to_data_only,
 )
 
@@ -220,3 +221,67 @@ class TestDowngradeToDataOnlyUnit:
             mock_settings.active_stripe_price.return_value = "price_data_only_test"
             mock_switch.side_effect = Exception("Stripe error")
             assert downgrade_to_data_only(1, db) is False
+
+
+# ============================================================================
+# Feed API — save_offer_active field
+# ============================================================================
+
+
+class TestSaveOfferActive:
+    def test_true_when_inactivity_5_days(self):
+        sub = _make_sub(tier="starter", status="active")
+        db = _make_db(last_txn_days_ago=5)
+        assert compute_save_offer_active(sub, db) is True
+
+    def test_false_when_recently_active(self):
+        sub = _make_sub(tier="starter", status="active")
+        db = _make_db(last_txn_days_ago=1)
+        assert compute_save_offer_active(sub, db) is False
+
+    def test_false_for_data_only_tier(self):
+        sub = _make_sub(tier="data_only", status="active")
+        db = _make_db(last_txn_days_ago=6)
+        assert compute_save_offer_active(sub, db) is False
+
+    def test_false_for_free_tier(self):
+        sub = _make_sub(tier="free", status="active")
+        db = _make_db(last_txn_days_ago=6)
+        assert compute_save_offer_active(sub, db) is False
+
+    def test_returns_false_on_exception(self):
+        sub = _make_sub(tier="starter", status="active")
+        db = MagicMock()
+        db.execute.side_effect = Exception("DB error")
+        assert compute_save_offer_active(sub, db) is False
+
+
+# ============================================================================
+# Email CTA URL — ?save_offer=accept param
+# ============================================================================
+
+
+class TestSaveOfferEmailUrl:
+    def test_email_cta_url_contains_save_offer_param(self):
+        sub = _make_sub(email="user@example.com", event_feed_uuid="abc-123")
+        captured = {}
+
+        with patch("src.services.email.send_email", side_effect=lambda **kw: captured.update(kw)), \
+             patch("src.tasks.proactive_save.settings") as mock_settings:
+            mock_settings.app_base_url = "https://app.example.com"
+            _send_save_offer(sub, "inactivity")
+
+        body = captured.get("body_text", "")
+        assert "?save_offer=accept" in body
+
+    def test_email_cta_url_fallback_when_no_uuid(self):
+        sub = _make_sub(email="user@example.com", event_feed_uuid=None)
+        captured = {}
+
+        with patch("src.services.email.send_email", side_effect=lambda **kw: captured.update(kw)), \
+             patch("src.tasks.proactive_save.settings") as mock_settings:
+            mock_settings.app_base_url = "https://app.example.com"
+            _send_save_offer(sub, "inactivity")
+
+        body = captured.get("body_text", "")
+        assert "app.example.com" in body

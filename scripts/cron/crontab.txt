@@ -149,6 +149,10 @@ COUNTY_ID=hillsborough
 # Big-deal-win path also fires inline from /api/deal-capture for instant conversion.
 0 14 * * * $PROJECT/scripts/cron/run.sh src.tasks.annual_push
 
+# Proactive Save (Data-Only) — daily 15:00 UTC, after annual push (14:00).
+# Catches at-risk subscribers (5-7d inactivity or grace day 5+) before churn.
+0 15 * * * $PROJECT/scripts/cron/run.sh src.tasks.proactive_save
+
 # AutoPilot Pro upsell — daily 09:15 UTC. Finds Lite subscribers with 30+ days
 # tenure and 30-day close rate >=15%; sends one-tap upgrade offer (14-day cooldown).
 15 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.ap_pro_upsell
