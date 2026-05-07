@@ -3,7 +3,7 @@ Foreclosure loader.
 """
 
 import logging
-from typing import Tuple
+from typing import Optional, Tuple
 
 import pandas as pd
 
@@ -15,7 +15,73 @@ logger = logging.getLogger(__name__)
 
 class ForeclosureLoader(BaseLoader):
     """Loader for foreclosure records."""
-    
+
+    def load_from_csv(
+        self,
+        csv_path: str,
+        skip_duplicates: bool = True,
+        **kwargs,
+    ) -> Tuple[int, int, int]:
+        """
+        Load foreclosures from a CSV file, applying ColumnMapper before processing.
+
+        The mapper looks up (or LLM-generates) an approved column mapping for this
+        county's foreclosures source so arbitrary CSV column names are renamed to the
+        canonical names expected by load_from_dataframe().
+        """
+        logger.info("[ForeclosureLoader] Loading from CSV: %s", csv_path)
+
+        col_mapping: Optional[dict] = self._resolve_column_mapping(csv_path)
+
+        try:
+            df = pd.read_csv(csv_path, dtype=str, on_bad_lines='warn')
+        except Exception:
+            df = pd.read_csv(csv_path, dtype=str, engine='python', on_bad_lines='warn')
+
+        if col_mapping:
+            from src.loaders.column_mapper import ColumnMapper
+            df = ColumnMapper.apply(df, col_mapping)
+
+        return self.load_from_dataframe(df, skip_duplicates=skip_duplicates, **kwargs)
+
+    def _resolve_column_mapping(self, csv_path: str) -> Optional[dict]:
+        """
+        Peek at the CSV header, look up the CountySource for this county's foreclosures
+        signal, and return a mapping dict via ColumnMapper.
+
+        Returns None if no source row exists (columns assumed already canonical) or if
+        the signal type has no schema defined.
+        """
+        from src.loaders.column_mapper import ColumnMapper, SkipMapping, NeedsMappingError
+        from src.core.models import CountySource
+
+        src = (
+            self.session.query(CountySource)
+            .filter_by(county_id=self.county_id, signal_type="foreclosures")
+            .first()
+        )
+        if src is None:
+            logger.debug(
+                "[ForeclosureLoader] No county_sources row for %s/foreclosures — "
+                "skipping column mapping (columns assumed canonical)",
+                self.county_id,
+            )
+            return None
+
+        sample_df = pd.read_csv(csv_path, dtype=str, nrows=5)
+
+        try:
+            mapper = ColumnMapper()
+            return mapper.get_or_create("foreclosures", src.id, sample_df)
+        except SkipMapping:
+            return None
+        except NeedsMappingError as e:
+            logger.error(
+                "[ForeclosureLoader] Column mapping required but LLM failed — "
+                "create a mapping via admin UI before loading. Error: %s", e,
+            )
+            raise
+
     def load_from_dataframe(
         self,
         df: pd.DataFrame,

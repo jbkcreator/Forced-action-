@@ -25,6 +25,11 @@ class AppSettings(BaseSettings):
 
 	debug: bool = Field(default=True, env="DEBUG")
 
+	# Set to true in local/staging environments to expose the /dev admin route.
+	# Keep false (or unset) in production — the /api/admin/dev/ping endpoint
+	# returns 403 when this is false, which blocks the DevPage from rendering.
+	dev_tools_enabled: bool = Field(default=False, env="DEV_TOOLS_ENABLED")
+
 
 	# Oxylabs proxy (optional — used by foreclosure + tax delinquency scrapers)
 	oxylabs_username: Optional[str] = Field(default=None, env="OXYLABS_USERNAME")

@@ -1839,3 +1839,130 @@ class SandboxOutbox(Base):
 
     def __repr__(self):
         return f"<SandboxOutbox(id={self.id}, channel={self.channel}, to={self.to_number}, campaign={self.campaign})>"
+
+
+# ============================================================================
+# COUNTY CONFIGURATION (Admin-managed, replaces counties.json)
+# ============================================================================
+
+class County(Base):
+    """
+    One row per county. Replaces the top-level keys in counties.json.
+    Admin UI does CRUD on this table; scrapers and loaders read via get_county_config().
+    """
+    __tablename__ = "counties"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    county_id: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
+    display_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    fips: Mapped[Optional[str]] = mapped_column(String(10))
+    nws_zone: Mapped[Optional[str]] = mapped_column(String(20))
+    parcel_id_format: Mapped[Optional[str]] = mapped_column(String(20), default="folio")
+    bankruptcy_division: Mapped[Optional[str]] = mapped_column(String(10))
+    city_filer_keywords: Mapped[Optional[dict]] = mapped_column(JSONB, default=list)
+    code_lien_type_map: Mapped[Optional[dict]] = mapped_column(JSONB, default=dict)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), onupdate=func.now()
+    )
+
+    sources: Mapped[List["CountySource"]] = relationship(
+        "CountySource", back_populates="county", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        Index("idx_counties_county_id", "county_id"),
+        Index("idx_counties_is_active", "is_active"),
+    )
+
+    def __repr__(self):
+        return f"<County(county_id={self.county_id!r}, display_name={self.display_name!r})>"
+
+
+class CountySource(Base):
+    """
+    One row per (county, signal_type) pair. Holds the portal URL, description,
+    and navigation hints that browser-use scrapers consume at runtime.
+    """
+    __tablename__ = "county_sources"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    county_id: Mapped[str] = mapped_column(
+        String(50), ForeignKey("counties.county_id"), nullable=False
+    )
+    signal_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    source_name: Mapped[Optional[str]] = mapped_column(String(100))
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text)
+    navigation_hint: Mapped[Optional[str]] = mapped_column(Text)
+    output_format: Mapped[Optional[str]] = mapped_column(String(20))
+    date_range_available: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    frequency: Mapped[Optional[str]] = mapped_column(String(20), default="daily")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    special_flags: Mapped[Optional[dict]] = mapped_column(JSONB, default=dict)
+    # ORI / CSV structure fields — explicit so the admin UI can show labeled form inputs.
+    # ori_column_map:   raw CSV column → canonical name  (e.g. {"DirectName": "Grantor"})
+    # ori_book_page_col: name of the combined "Book/Page" column to split on "/"
+    # ori_doc_type_map: raw DocType value → canonical label (e.g. {"JUDGEMENT LIEN": "JUDGMENT"})
+    ori_column_map: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    ori_book_page_col: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    ori_doc_type_map: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), onupdate=func.now()
+    )
+
+    county: Mapped["County"] = relationship("County", back_populates="sources")
+    mappings: Mapped[List["CountyColumnMapping"]] = relationship(
+        "CountyColumnMapping", back_populates="source", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        UniqueConstraint("county_id", "signal_type", name="uq_county_signal_source"),
+        Index("idx_county_sources_county_id", "county_id"),
+        Index("idx_county_sources_signal_type", "signal_type"),
+        Index("idx_county_sources_is_active", "is_active"),
+    )
+
+    def __repr__(self):
+        return f"<CountySource(county_id={self.county_id!r}, signal_type={self.signal_type!r})>"
+
+
+class CountyColumnMapping(Base):
+    """
+    Column mapping for a given source.  One row per (source, approval event).
+    - mapped_by='llm'   → auto-proposed, is_approved=False until admin reviews
+    - mapped_by='human' → saved directly from admin UI, is_approved=True immediately
+    """
+    __tablename__ = "county_column_mappings"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    source_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("county_sources.id"), nullable=False
+    )
+    source_columns: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    mapping: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    is_approved: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    mapped_by: Mapped[Optional[str]] = mapped_column(String(10), default="llm")
+    approved_by: Mapped[Optional[str]] = mapped_column(String(100))
+    approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    sample_rows: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    reject_feedback: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), onupdate=func.now()
+    )
+
+    source: Mapped["CountySource"] = relationship("CountySource", back_populates="mappings")
+
+    __table_args__ = (
+        Index("idx_county_col_mappings_source_id", "source_id"),
+        Index("idx_county_col_mappings_is_approved", "is_approved"),
+    )

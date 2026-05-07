@@ -1,21 +1,21 @@
 """
-Building Permit Data Collection Pipeline
+Building Permit Data Collection Pipeline — county-agnostic, browser-use only.
 
-This module automates the collection of building permit records from
-the Hillsborough County Accela system. It uses browser automation via browser_use
-and Claude Sonnet 4.5 to navigate the permit search interface, extract table data
-directly from the HTML, and process permit records.
+Navigates the county Accela permit portal, applies date filters, triggers the
+"Export to Spreadsheet" button to download all results in one shot, then loads
+the file into a DataFrame and saves it to the raw data directory.
 
-The pipeline performs the following steps:
-    1. Launches a browser agent with Claude Sonnet 4.5 to navigate the Accela permit portal
-    2. Applies date range filters based on lookback period
-    3. Extracts permit data directly from HTML table as pipe-delimited text
-    4. Parses and saves the data to the processed data directory with deduplication
-
-Author: Distressed Property Intelligence Platform
+Usage:
+    python -m src.scrappers.permit.permit_engine --county-id hillsborough
+    python -m src.scrappers.permit.permit_engine --county-id hillsborough --start-date 2026-05-01 --end-date 2026-05-07
+    python -m src.scrappers.permit.permit_engine --county-id hillsborough --load-to-db --headful
+    python -m src.scrappers.permit.permit_engine --county-id pinellas --load-to-db
 """
 
 import asyncio
+import argparse
+import json
+import sys
 import time
 import traceback
 from datetime import datetime, timedelta
@@ -23,765 +23,412 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
-from browser_use import Agent, ChatAnthropic, Browser
 
-from config.settings import settings
+project_root = Path(__file__).parent.parent.parent.parent
+sys.path.insert(0, str(project_root))
+
 from config.constants import (
-	BROWSER_MODEL,
-	BROWSER_TEMPERATURE,
-	RAW_PERMIT_DIR,
-	PROCESSED_DATA_DIR,
-	PERMIT_SEARCH_URL,
-	get_county_config,
+    RAW_PERMIT_DIR,
+    PERMIT_SEARCH_URL,
+    DOWNLOAD_FILE_PATTERNS,
+    TEMP_DOWNLOADS_DIR,
+    BROWSER_DOWNLOAD_TEMP_PATTERN,
+    BROWSER_MODEL,
+    BROWSER_TEMPERATURE,
 )
+from src.utils.county_config import get_county_config
 from src.utils.logger import setup_logging, get_logger
-from src.utils.prompt_loader import get_prompt
-from src.utils.db_deduplicator import filter_new_records
 
-# Initialize logging
 setup_logging()
 logger = get_logger(__name__)
 
-# Model + agent configuration
-llm = ChatAnthropic(
-	model=BROWSER_MODEL,
-	timeout=150,
-	api_key=settings.anthropic_api_key.get_secret_value(),
-	temperature=BROWSER_TEMPERATURE,
-)
-
-# Ensure directories exist
 RAW_PERMIT_DIR.mkdir(parents=True, exist_ok=True)
-PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-
-async def scrape_permits_with_playwright(
-	start_date: str = None,
-	end_date: str = None,
-	headless: bool = True,
-	debug: bool = False,
-	permit_url: str = PERMIT_SEARCH_URL,
-) -> Optional[Path]:
-	"""
-	Primary Playwright scraper — deterministic, no AI credits consumed.
-
-	Navigates the Accela building permit portal, fills date filters, then tries
-	the "Download results" button to get all records in one shot. Falls back to
-	page-by-page table scraping if the download fails.
-	Raises on any failure so the caller can fall back to browser_use.
-
-	Args:
-		start_date: Start date in YYYY-MM-DD format (default: yesterday)
-		end_date:   End date in YYYY-MM-DD format (default: today)
-		headless:   Run browser headlessly (default True). Set False with xvfb-run.
-		debug:      Save screenshots + HTML dumps to data/debug/playwright/permits/.
-
-	Returns:
-		Path to saved CSV, True if all records already in DB, or raises on failure.
-	"""
-	from playwright.async_api import async_playwright
-
-	if end_date:
-		end_dt = datetime.strptime(end_date, "%Y-%m-%d")
-	else:
-		end_dt = datetime.now()
-	if start_date:
-		start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-	else:
-		start_dt = end_dt - timedelta(days=1)
-
-	end_date_str   = end_dt.strftime("%m/%d/%Y")
-	start_date_str = start_dt.strftime("%m/%d/%Y")
-
-	logger.info(f"[Playwright] Scraping permits {start_date_str} → {end_date_str}")
-
-	# Exact element IDs from the Accela portal HTML
-	START_DATE_ID   = "ctl00_PlaceHolderMain_generalSearchForm_txtGSStartDate"
-	END_DATE_ID     = "ctl00_PlaceHolderMain_generalSearchForm_txtGSEndDate"
-	SEARCH_BTN_ID   = "ctl00_PlaceHolderMain_btnNewSearch"
-	DOWNLOAD_BTN_ID = "ctl00_PlaceHolderMain_dgvPermitList_gdvPermitList_gdvPermitListtop4btnExport"
-
-	debug_dir = Path("data/debug/playwright/permits")
-	if debug:
-		debug_dir.mkdir(parents=True, exist_ok=True)
-		logger.info(f"[Playwright][DEBUG] Screenshots/HTML saved to {debug_dir.resolve()}")
-
-	async def snap(page, name):
-		if not debug:
-			return
-		await page.screenshot(path=str(debug_dir / f"{name}.png"), full_page=True)
-		(debug_dir / f"{name}.html").write_text(await page.content(), encoding="utf-8")
-		logger.info(f"[Playwright][DEBUG] Saved {name}.png + {name}.html")
-
-	async def js_fill_date(page, input_id: str, value: str):
-		"""Set a masked date input value and fire all events the portal listens to."""
-		await page.evaluate(
-			'''([id, val]) => {
-				const el = document.getElementById(id);
-				if (!el) throw new Error("Input #" + id + " not found");
-				el.value = val;
-				el.dispatchEvent(new Event("focus",  {bubbles: true}));
-				el.dispatchEvent(new Event("input",  {bubbles: true}));
-				el.dispatchEvent(new Event("change", {bubbles: true}));
-				el.dispatchEvent(new Event("blur",   {bubbles: true}));
-			}''',
-			[input_id, value],
-		)
-
-	all_rows = []
-
-	async with async_playwright() as pw:
-		browser = await pw.chromium.launch(
-			headless=headless,
-			args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--no-zygote', '--single-process'],
-		)
-		ctx = await browser.new_context(
-			viewport={'width': 1280, 'height': 900},
-			accept_downloads=True,
-		)
-		page = await ctx.new_page()
-
-		try:
-			# 1. Load the portal
-			await page.goto(permit_url, wait_until='domcontentloaded', timeout=60000)
-			await page.wait_for_timeout(2000)
-			await snap(page, "01_page_loaded")
-
-			# 2. Expand search form if collapsed
-			try:
-				toggle = page.locator('a:has-text("Search Applications")').first
-				if await toggle.is_visible(timeout=5000):
-					await toggle.click()
-					await page.wait_for_timeout(1500)
-					await snap(page, "02_form_expanded")
-			except Exception:
-				pass  # Already visible
-
-			# 3. Fill start date using exact known ID
-			await page.wait_for_selector(f'#{START_DATE_ID}', timeout=20000)
-			await js_fill_date(page, START_DATE_ID, start_date_str)
-			logger.info(f"[Playwright] Start date set: {start_date_str}")
-
-			# 4. Fill end date
-			await js_fill_date(page, END_DATE_ID, end_date_str)
-			logger.info(f"[Playwright] End date set: {end_date_str}")
-			await snap(page, "03_dates_filled")
-
-			# 5. Submit search using exact known button ID
-			await page.evaluate(f'''() => {{
-				const btn = document.getElementById("{SEARCH_BTN_ID}");
-				if (!btn) throw new Error("Search button #{SEARCH_BTN_ID} not found");
-				btn.click();
-			}}''')
-			await page.wait_for_load_state('networkidle', timeout=60000)
-			await snap(page, "04_search_results")
-			logger.info("[Playwright] Search submitted")
-
-			# 6. Try "Download results" button — fetches ALL records in one shot
-			downloaded = False
-			try:
-				async with page.expect_download(timeout=60000) as dl_info:
-					await page.evaluate(f'''() => {{
-						const btn = document.getElementById("{DOWNLOAD_BTN_ID}");
-						if (!btn) throw new Error("Download button not found");
-						btn.click();
-					}}''')
-				download = await dl_info.value
-				dl_filename = download.suggested_filename or "permits_download.csv"
-				dl_path = RAW_PERMIT_DIR / "temp" / dl_filename
-				dl_path.parent.mkdir(parents=True, exist_ok=True)
-				await download.save_as(dl_path)
-				logger.info(f"[Playwright] Downloaded: {dl_filename} ({dl_path.stat().st_size:,} bytes)")
-
-				if dl_filename.endswith('.csv'):
-					df_dl = pd.read_csv(dl_path)
-				elif dl_filename.endswith(('.xls', '.xlsx')):
-					df_dl = pd.read_excel(dl_path)
-				else:
-					try:
-						df_dl = pd.read_csv(dl_path)
-					except Exception:
-						df_dl = pd.read_excel(dl_path)
-
-				all_rows = df_dl.to_dict('records')
-				logger.info(f"[Playwright] Download method: {len(all_rows)} records")
-				downloaded = True
-
-			except Exception as e:
-				logger.warning(f"[Playwright] Download button failed ({e}) — scraping page by page")
-
-			# 7. Fallback: page-by-page table scraping
-			if not downloaded:
-				# Wait for results table to render
-				try:
-					await page.wait_for_selector("tr.ACA_TabRow_Odd, tr.ACA_TabRow_Even", timeout=30000)
-					logger.info("[Playwright] Results table detected")
-				except Exception:
-					logger.warning("[Playwright] Timed out waiting for results rows \u2014 page may have no results")
-
-				visited_pages = set()
-
-				async def get_selected_page_num() -> str:
-					return await page.evaluate(
-						'''() => {
-							const el = document.querySelector("span.SelectedPageButton");
-							return el ? el.textContent.trim() : "";
-						}'''
-					)
-
-				async def next_is_clickable() -> bool:
-					return await page.evaluate(
-						'''() => {
-							const tds = Array.from(document.querySelectorAll("td.aca_pagination_PrevNext"));
-							const nextTd = tds.find(td => td.textContent.includes("Next"));
-							if (!nextTd) return false;
-							return !!nextTd.querySelector("a");
-						}'''
-					)
-
-				async def click_next():
-					await page.evaluate(
-						'''() => {
-							const tds = Array.from(document.querySelectorAll("td.aca_pagination_PrevNext"));
-							const nextTd = tds.find(td => td.textContent.includes("Next"));
-							const a = nextTd ? nextTd.querySelector("a") : null;
-							if (!a) throw new Error("Next link not found/clickable");
-							a.click();
-						}'''
-					)
-
-				while True:
-					current_page = await get_selected_page_num()
-					if not current_page:
-						logger.warning("[Playwright] SelectedPageButton missing \u2014 stopping pagination.")
-						break
-
-					if current_page in visited_pages:
-						logger.warning(f"[Playwright] Page {current_page} already visited \u2014 stopping to avoid loop.")
-						break
-					visited_pages.add(current_page)
-
-					logger.info(f"[Playwright] Scraping page {current_page}...")
-					if current_page.isdigit():
-						await snap(page, f"page_{int(current_page):02d}")
-					else:
-						await snap(page, f"page_{current_page}")
-
-					rows = await page.evaluate('''() => {
-						const result = [];
-						const dataRow = document.querySelector("tr.ACA_TabRow_Odd, tr.ACA_TabRow_Even");
-						if (!dataRow) return result;
-						const table = dataRow.closest("table");
-						if (!table) return result;
-
-						const ths = table.querySelectorAll("th");
-						const headers = Array.from(ths).map(th =>
-							th.classList.contains("ACA_Hide") ? "Address" : th.innerText.trim()
-						);
-
-						const dataRows = table.querySelectorAll("tr.ACA_TabRow_Odd, tr.ACA_TabRow_Even");
-						for (const row of dataRows) {
-							const cells = row.querySelectorAll("td");
-							const obj = {};
-							cells.forEach((td, i) => {
-								const key = headers[i];
-								if (key) obj[key] = td.innerText.trim();
-							});
-							result.push(obj);
-						}
-						return result;
-					}''')
-
-					if rows:
-						all_rows.extend(rows)
-						logger.info(f"[Playwright] Page {current_page}: {len(rows)} rows (total: {len(all_rows)})")
-					else:
-						logger.info(f"[Playwright] Page {current_page}: no rows \u2014 stopping.")
-						await snap(page, f"page_{current_page}_empty")
-						break
-
-					if not await next_is_clickable():
-						logger.info("[Playwright] Next is not clickable \u2014 last page reached.")
-						break
-
-					old_page = current_page
-					old_first_row = await page.evaluate(
-						'''() => {
-							const row = document.querySelector("tr.ACA_TabRow_Odd, tr.ACA_TabRow_Even");
-							return row ? row.innerText.trim() : "";
-						}'''
-					)
-
-					await click_next()
-
-					await page.wait_for_function(
-						'''(oldVal) => {
-							const el = document.querySelector("span.SelectedPageButton");
-							return el && el.textContent.trim() !== oldVal;
-						}''',
-						arg=old_page,
-						timeout=45000,
-					)
-
-					await page.wait_for_function(
-						'''(oldText) => {
-							const row = document.querySelector("tr.ACA_TabRow_Odd, tr.ACA_TabRow_Even");
-							const now = row ? row.innerText.trim() : "";
-							return now && now !== oldText;
-						}''',
-						arg=old_first_row,
-						timeout=45000,
-					)
-
-			logger.info(f"[Playwright] Total records extracted: {len(all_rows)}")
-
-		finally:
-			await browser.close()
-
-	if not all_rows:
-		logger.info("[Playwright] 0 records found — no permits in this date range")
-		return None
-
-	# Normalize column names
-	COLUMN_ALIASES = {
-		'Date':            ['Date', 'Filed Date', 'Opened Date', 'Application Date'],
-		'Record Number':   ['Record Number', 'Application Number', 'Record #'],
-		'Record Type':     ['Record Type', 'Application Type', 'Type'],
-		'Description':     ['Description', 'Desc'],
-		'Project Name':    ['Project Name', 'Project'],
-		'Related Records': ['Related Records', 'Related'],
-		'Status':          ['Status', 'Application Status'],
-		'Short Notes':     ['Short Notes', 'Notes', 'Short Note'],
-		'Address':         ['Address', 'Location', 'Parcel Address'],
-	}
-	normalized = []
-	for row in all_rows:
-		norm_row = {}
-		for target_col, aliases in COLUMN_ALIASES.items():
-			for alias in aliases:
-				if alias in row:
-					norm_row[target_col] = row[alias]
-					break
-			if target_col not in norm_row:
-				norm_row[target_col] = ''
-		normalized.append(norm_row)
-
-	df = pd.DataFrame(normalized)
-
-	logger.info("DB DEDUPLICATION: Checking for existing permits")
-	initial_count = len(df)
-	df_new = filter_new_records(df, 'permits')
-
-	if df_new.empty:
-		logger.info("All permits already exist in database — nothing new to load")
-		return True
-
-	new_dir = RAW_PERMIT_DIR / "new"
-	new_dir.mkdir(parents=True, exist_ok=True)
-	today_str = datetime.now().strftime("%Y%m%d")
-	csv_path = new_dir / f"building_permits_new_{today_str}.csv"
-	df_new.to_csv(csv_path, index=False)
-	size_mb = csv_path.stat().st_size / (1024 ** 2)
-	logger.info(f"[Playwright] Saved {len(df_new)} new permits to {csv_path} ({size_mb:.2f} MB)")
-	logger.info(f"[Playwright] Filtered {initial_count - len(df_new)} already-existing records")
-	return csv_path
-
-
-async def scrape_permits_with_browser_use(
-	start_date: str = None,
-	end_date: str = None,
-	permit_url: str = PERMIT_SEARCH_URL,
-) -> Optional[Path]:
-	"""
-	AI-led table extraction method for permit records (fallback).
-
-	Args:
-		start_date: Start date in YYYY-MM-DD format (default: yesterday)
-		end_date:   End date in YYYY-MM-DD format (default: today)
-
-	Returns:
-		Optional[Path]: Path to saved CSV file if successful, None otherwise
-	"""
-	try:
-		if end_date:
-			end_dt = datetime.strptime(end_date, "%Y-%m-%d")
-		else:
-			end_dt = datetime.now()
-		if start_date:
-			start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-		else:
-			start_dt = end_dt - timedelta(days=1)
-
-		end_date_str   = end_dt.strftime("%m/%d/%Y")
-		start_date_str = start_dt.strftime("%m/%d/%Y")
-		
-		logger.info(f"Using browser-use to scrape permits from {start_date_str} to {end_date_str}")
-		logger.info("Agent will extract table data and return as text - we'll build CSV in Python")
-		
-		# Load task instructions from YAML configuration
-		try:
-			task_instructions = get_prompt(
-				"permit_prompts.yaml",
-				"permit_search.task_template",
-				url=permit_url,
-				end_date=end_date_str,
-				start_date=start_date_str
-			)
-		except Exception as e:
-			logger.error(f"Failed to load prompt from YAML: {e}")
-			raise
-
-		logger.info("Launching browser agent to scrape permit table...")
-		
-		# Configure browser for headless server environment
-		browser = Browser(
-			headless=True,
-			disable_security=True,
-			args=[
-				'--no-sandbox',
-				'--disable-setuid-sandbox',
-				'--disable-dev-shm-usage',
-				'--disable-gpu',
-				'--no-first-run',
-				'--no-zygote',
-				'--single-process',
-				'--disable-blink-features=AutomationControlled',
-			]
-		)
-		
-		agent = Agent(
-			task=task_instructions,
-			llm=llm,
-			max_steps=75,  # Increased to handle pagination through many pages
-			browser=browser,
-		)
-		
-		try:
-			history = await agent.run()
-			
-			# Check completion status
-			completed = history.is_done()
-			if not completed:
-				# history.history is a list property, not a method
-				try:
-					step_count = len(history.history) if hasattr(history, 'history') else "unknown"
-				except Exception:
-					step_count = "unknown"
-				logger.warning(f"Agent did not complete all steps (stopped at step {step_count})")
-				logger.warning("Will attempt to parse any data that was collected")
-			else:
-				logger.info("Agent workflow completed successfully")
-			
-			# Get the final result from the agent
-			final_result = history.final_result()
-			
-			if not final_result:
-				logger.error("No result returned from browser agent")
-				logger.error("This usually means the agent crashed before returning data")
-				return None
-			
-			result_str = str(final_result)
-			logger.info(f"Agent returned result of length {len(result_str)} characters")
-			
-			# Log if we got partial data
-			if not completed:
-				logger.info("Processing partial data from incomplete run")
-			
-			logger.debug(f"First 1000 chars: {result_str[:1000]}")
-			
-			# Parse the pipe-delimited data
-			all_permits = []
-			lines = result_str.strip().split('\n')
-			
-			# Find the header line
-			header_idx = -1
-			header_columns = []
-			
-			# Look for the header line
-			for idx, line in enumerate(lines):
-				if '|' in line and any(col in line for col in ['Record Number', 'Status', 'Date']):
-					header_columns = [col.strip() for col in line.split('|')]
-					header_idx = idx
-					logger.info(f"Found header at line {idx}: {header_columns}")
-					break
-			
-			if header_idx == -1:
-				logger.error("Could not find pipe-delimited header in agent result")
-				logger.error(f"Result content (first 2000 chars): {result_str[:2000]}")
-				logger.warning("Will try to parse anyway looking for any pipe-delimited data")
-				return None
-			
-			# Parse ALL data rows after the header
-			records_found = 0
-			for line_num, line in enumerate(lines[header_idx + 1:], start=header_idx + 1):
-				line = line.strip()
-				if not line or '|' not in line:
-					continue
-				
-				# Skip separator lines (like |------|------|)
-				if line.replace('|', '').replace('-', '').strip() == '':
-					continue
-				
-				values = [val.strip() for val in line.split('|')]
-				
-				# Only process if we have enough values
-				if len(values) >= len(header_columns):
-					row_dict = {}
-					for i, col in enumerate(header_columns):
-						if i < len(values):
-							row_dict[col] = values[i]
-					all_permits.append(row_dict)
-					records_found += 1
-					
-					# Log progress every 10 records
-					if records_found % 10 == 0:
-						logger.info(f"Parsed {records_found} records so far...")
-			
-			logger.info(f"Finished parsing. Total records found: {records_found}")
-			
-			if not all_permits:
-				logger.error("No permit records parsed from agent result")
-				logger.error(f"Parsed {len(lines)} lines, header at {header_idx}")
-				return None
-			
-			# Warn if incomplete run but we got some data
-			if not completed and records_found > 0:
-				logger.warning("=" * 60)
-				logger.warning("PARTIAL DATA EXTRACTED")
-				logger.warning("=" * 60)
-				logger.warning(f"Agent stopped early but collected {records_found} records")
-				logger.warning("This data will be saved, but you may want to re-run after fixing the issue")
-				logger.warning("(e.g., adding API credits, increasing timeouts, etc.)")
-			
-			logger.info(f"Successfully parsed {len(all_permits)} permit records")
-			
-			# Convert to DataFrame
-			df = pd.DataFrame(all_permits)
-			
-			# Save to temporary file first
-			# Check DB for existing permits (deduplicate BEFORE CSV save)
-			logger.info("=" * 60)
-			logger.info("DB DEDUPLICATION: Checking for existing permits")
-			logger.info("=" * 60)
-			
-			initial_count = len(df)
-			df_new = filter_new_records(df, 'permits')
-			
-			if df_new.empty:
-				logger.info("✓ All permits already exist in database - nothing new to load")
-				return True  # Success, but no new records
-			
-			# Save only NEW permits to temporary CSV
-			new_dir = RAW_PERMIT_DIR / "new"
-			new_dir.mkdir(parents=True, exist_ok=True)
-			
-			today = datetime.now().strftime("%Y%m%d")
-			temp_file = new_dir / f"building_permits_new_{today}.csv"
-			
-			df_new.to_csv(temp_file, index=False)
-			size_mb = temp_file.stat().st_size / (1024 ** 2)
-			logger.info(f"Saved {len(df_new)} NEW permits to {temp_file} ({size_mb:.2f} MB)")
-			logger.info(f"Filtered {initial_count - len(df_new)} existing records")
-			
-			return temp_file
-			
-		except Exception as e:
-			logger.error(f"Browser agent execution failed: {e}")
-			logger.debug(traceback.format_exc())
-			
-			# Check for common failure reasons
-			error_str = str(e).lower()
-			if "credit balance" in error_str or "too low" in error_str:
-				logger.error("=" * 60)
-				logger.error("ANTHROPIC API CREDITS EXHAUSTED")
-				logger.error("=" * 60)
-				logger.error("Add credits at: https://console.anthropic.com/settings/billing")
-				logger.error("The agent may have collected partial data before running out of credits.")
-			
-			return None
-			
-	except Exception as e:
-		logger.error(f"Browser-use scraping failed: {e}")
-		logger.debug(traceback.format_exc())
-		return None
-
-
-async def run_permit_pipeline(
-	start_date: str = None,
-	end_date: str = None,
-	scraper: str = "auto",
-	headless: bool = True,
-	debug: bool = False,
-	county_id: str = "hillsborough",
-):
-	"""
-	Execute the complete permit data collection pipeline.
-
-	Args:
-		start_date: Start date in YYYY-MM-DD format (default: yesterday)
-		end_date:   End date in YYYY-MM-DD format (default: today)
-		scraper:    "auto" (playwright→ai fallback), "playwright", or "ai"
-		headless:   Run browser headlessly
-		debug:      Save screenshots + HTML dumps
-
-	Raises:
-		Exception: Re-raises any exceptions after logging
-	"""
-	county_cfg = get_county_config(county_id)
-	permit_url = county_cfg["urls"]["permit"]
-
-	logger.info("=" * 60)
-	logger.info(f"{county_cfg['display_name'].upper()} BUILDING PERMITS - DATA COLLECTION")
-	logger.info("=" * 60)
-
-	try:
-		file_path = None
-		active_scraper = scraper
-		MAX_PLAYWRIGHT_RETRIES = 5
-
-		if active_scraper in ("auto", "playwright"):
-			logger.info("Scraping permits via Playwright (primary method)")
-			playwright_error = None
-			playwright_no_results = False
-			for attempt in range(1, MAX_PLAYWRIGHT_RETRIES + 1):
-				try:
-					file_path = await scrape_permits_with_playwright(
-						start_date=start_date, end_date=end_date,
-						headless=headless, debug=debug,
-						permit_url=permit_url,
-					)
-					if file_path is None:
-						# No results from site — retry (could be temporary)
-						if attempt < MAX_PLAYWRIGHT_RETRIES:
-							logger.warning(f"[Playwright] No results (attempt {attempt}/{MAX_PLAYWRIGHT_RETRIES}) — retrying in 5s...")
-							await asyncio.sleep(5)
-							continue
-						logger.warning(f"[Playwright] No results after {MAX_PLAYWRIGHT_RETRIES} attempts — triggering AI fallback")
-						playwright_no_results = True
-						break
-					logger.info("Playwright scraping succeeded")
-					playwright_error = None
-					break
-				except Exception as e:
-					if active_scraper == "playwright":
-						raise
-					playwright_error = e
-					if attempt < MAX_PLAYWRIGHT_RETRIES:
-						logger.warning(f"[Playwright] Attempt {attempt}/{MAX_PLAYWRIGHT_RETRIES} failed: {e} — retrying in 5s...")
-						await asyncio.sleep(5)
-						continue
-					logger.warning(f"[Playwright] All {MAX_PLAYWRIGHT_RETRIES} retries failed with errors")
-
-			# Fall back to AI if Playwright errored OR returned no results after all retries
-			if (playwright_error is not None or playwright_no_results) and active_scraper == "auto":
-				logger.warning("Falling back to browser-use AI method...")
-				active_scraper = "ai"
-
-		if active_scraper == "ai" and file_path is None:
-			logger.info("Running browser-use AI scraper...")
-			file_path = await scrape_permits_with_browser_use(
-				start_date=start_date, end_date=end_date,
-				permit_url=permit_url,
-			)
-
-		if not file_path:
-			logger.error("Scraping failed. Aborting pipeline.")
-			return
-
-		logger.info("=" * 60)
-		logger.info("PERMIT PIPELINE COMPLETE")
-		logger.info("=" * 60)
-		logger.info(f"Output file location: {file_path}")
-
-	except Exception as e:
-		logger.error(f"Permit pipeline failed with error: {e}")
-		logger.debug(traceback.format_exc())
-		raise
+
+# Canonical column aliases — Accela portals vary slightly by county
+COLUMN_ALIASES: dict[str, list[str]] = {
+    "Date": ["Date", "Filed Date", "Opened Date", "Application Date", "Open Date"],
+    "Record Number": ["Record Number", "Application Number", "Record #", "Permit Number"],
+    "Record Type": ["Record Type", "Application Type", "Type", "Permit Type"],
+    "Description": ["Description", "Desc", "Permit Description"],
+    "Project Name": ["Project Name", "Project"],
+    "Related Records": ["Related Records", "Related"],
+    "Status": ["Status", "Application Status", "Permit Status"],
+    "Short Notes": ["Short Notes", "Notes", "Short Note"],
+    "Address": ["Address", "Location", "Parcel Address", "Property Address"],
+}
+
+
+# ---------------------------------------------------------------------------
+# LLM helpers
+# ---------------------------------------------------------------------------
+
+def _make_llm():
+    from browser_use import ChatAnthropic
+    from config.settings import get_settings
+    settings = get_settings()
+    return ChatAnthropic(
+        model=BROWSER_MODEL,
+        timeout=180,
+        api_key=settings.anthropic_api_key.get_secret_value(),
+        temperature=BROWSER_TEMPERATURE,
+    )
+
+
+def build_agent_task(source: dict, start_str: str, end_str: str) -> str:
+    """
+    Generate a browser-use agent task from county source metadata + date range.
+    Uses Claude to produce step-by-step instructions tailored to the source's
+    navigation_hint and description. Falls back to a template on LLM failure.
+    """
+    import anthropic
+    from config.settings import get_settings
+
+    portal_url = source.get("url", PERMIT_SEARCH_URL)
+    description = source.get("description", "")
+    nav_hint = source.get("navigation_hint", "") or ""
+
+    meta = {
+        "portal_url": portal_url,
+        "start_date": start_str,
+        "end_date": end_str,
+        "description": description,
+        "navigation_hint": nav_hint,
+    }
+
+    system_prompt = (
+        "You generate browser-automation task instructions for a browser-use Agent. "
+        "The agent controls a Chromium browser and must trigger a file download (CSV or Excel export). "
+        "Write concise, numbered steps in plain English. "
+        "Do NOT add any explanation outside the task text."
+    )
+
+    user_prompt = f"""Generate a browser-use agent task to download building permit records from a county Accela portal.
+
+Source metadata:
+{json.dumps(meta, indent=2)}
+
+Requirements:
+- Navigate to portal_url.
+- If the search form is collapsed, expand it (look for "Search Applications" link).
+- Fill the start date field with {start_str} and the end date field with {end_str} (MM/DD/YYYY format).
+- Submit the search and wait for the results table to appear.
+- Find and click the "Export to Spreadsheet" or "Export Results" or "Download" button to download all records.
+- Wait at least 20 seconds for the file download to complete before finishing.
+- Do not navigate away or open new tabs during the download.
+- Keep the task under 350 words.
+"""
+
+    try:
+        settings = get_settings()
+        client = anthropic.Anthropic(
+            api_key=settings.anthropic_api_key.get_secret_value()
+        )
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=512,
+            temperature=0,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        task = response.content[0].text.strip()
+        logger.info("[LLM] Generated agent task:\n%s", task)
+        return task
+    except Exception as e:
+        logger.warning("[LLM] Task generation failed (%s) — using template fallback", e)
+        return _template_task(source, start_str, end_str)
+
+
+def _template_task(source: dict, start_str: str, end_str: str) -> str:
+    """Template fallback when LLM is unavailable."""
+    portal_url = source.get("url", PERMIT_SEARCH_URL)
+    nav_hint = source.get("navigation_hint", "") or ""
+    return (
+        f"Go to {portal_url}.\n"
+        "Wait 5 seconds for the page to fully load.\n"
+        f"{nav_hint}\n"
+        "If you see a 'Search Applications' link, click it to expand the search form.\n"
+        f"Fill the start date field with {start_str} and the end date field with {end_str}.\n"
+        "Click the Search button and wait for the results table to load.\n"
+        "Find the 'Export to Spreadsheet' or 'Export Results' or 'Download' button and click it.\n"
+        "Wait 20 seconds for the file download to complete.\n"
+        "Do not navigate away or open new tabs."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Browser-use agent (file download mode)
+# ---------------------------------------------------------------------------
+
+async def run_browser_agent(
+    task: str,
+    download_dir: Path,
+    headful: bool = False,
+) -> tuple:
+    """
+    Run a browser-use Agent that triggers a file download (export button).
+
+    Returns (history, start_time). Caller uses start_time with _locate_download()
+    to find the file the agent downloaded.
+    """
+    from browser_use import Agent, Browser
+    from src.utils.http_helpers import get_browser_use_proxy
+
+    llm = _make_llm()
+
+    browser = Browser(
+        headless=not headful,
+        disable_security=True,
+        proxy=get_browser_use_proxy(),
+        downloads_path=str(download_dir),
+        args=[
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-gpu',
+            '--disable-blink-features=AutomationControlled',
+            '--window-size=1920,1080',
+        ],
+    )
+
+    agent = Agent(
+        task=task,
+        llm=llm,
+        browser=browser,
+        max_steps=60,
+        use_judge=False,
+    )
+
+    start_time = time.time()
+    logger.info("[Agent] Starting browser-use agent (download mode)...")
+    try:
+        history = await agent.run()
+        if not history.is_done():
+            logger.warning("[Agent] Agent did not complete within step budget")
+        return history, start_time
+    except Exception as e:
+        logger.error("[Agent] Run failed: %s", e)
+        logger.debug(traceback.format_exc())
+        return None, start_time
+
+
+# ---------------------------------------------------------------------------
+# Download file detection
+# ---------------------------------------------------------------------------
+
+def _locate_download(download_dir: Path, start_time: float) -> Optional[Path]:
+    """Find a file downloaded after start_time in download_dir and temp dirs."""
+    def recent_candidates(folder: Path):
+        if not folder.exists():
+            return []
+        paths = []
+        for pattern in DOWNLOAD_FILE_PATTERNS:
+            for f in folder.glob(pattern):
+                try:
+                    if f.stat().st_mtime >= start_time:
+                        paths.append(f)
+                except FileNotFoundError:
+                    continue
+        return paths
+
+    candidates = recent_candidates(download_dir)
+
+    temp_base = TEMP_DOWNLOADS_DIR
+    if temp_base.exists():
+        for temp_dir in temp_base.glob(BROWSER_DOWNLOAD_TEMP_PATTERN):
+            candidates.extend(recent_candidates(temp_dir))
+
+    if not candidates:
+        logger.warning("[Locate] No downloaded files found after agent run")
+        return None
+
+    most_recent = max(candidates, key=lambda p: p.stat().st_mtime)
+    logger.info("[Locate] Found download: %s", most_recent)
+    return most_recent
+
+
+# ---------------------------------------------------------------------------
+# Data processing
+# ---------------------------------------------------------------------------
+
+def _load_file(file_path: Path) -> pd.DataFrame:
+    """Load the downloaded CSV or Excel file into a DataFrame."""
+    logger.info("[Process] Loading: %s", file_path)
+    if file_path.suffix.lower() in (".xls", ".xlsx"):
+        df = pd.read_excel(file_path)
+        logger.info("[Process] Loaded %d records from Excel", len(df))
+        return df
+    for enc in ("utf-8", "latin1", "cp1252"):
+        try:
+            df = pd.read_csv(file_path, encoding=enc)
+            logger.info("[Process] Loaded %d records (enc=%s)", len(df), enc)
+            return df
+        except (UnicodeDecodeError, pd.errors.ParserError):
+            continue
+    raise ValueError(f"Could not read file with any known encoding: {file_path}")
+
+
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Map raw column names to canonical names using COLUMN_ALIASES."""
+    rename_map = {}
+    for canonical, aliases in COLUMN_ALIASES.items():
+        for alias in aliases:
+            if alias in df.columns and alias != canonical:
+                rename_map[alias] = canonical
+                break
+    if rename_map:
+        df = df.rename(columns=rename_map)
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Stats helper
+# ---------------------------------------------------------------------------
+
+def _record_stats(source_type: str, **kwargs):
+    try:
+        from src.utils.scraper_db_helper import record_scraper_stats
+        record_scraper_stats(source_type=source_type, **kwargs)
+    except Exception as e:
+        logger.warning("[Stats] Could not record scraper stats (non-critical): %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+async def main(args):
+    county_id = args.county_id
+    county_cfg = get_county_config(county_id)
+
+    source = county_cfg.get("sources", {}).get("permits")
+    if source is None:
+        portal_url = county_cfg.get("urls", {}).get("permit") or PERMIT_SEARCH_URL
+        source = {"url": portal_url, "signal_type": "permits"}
+
+    if args.end_date:
+        end_dt = datetime.strptime(args.end_date, "%Y-%m-%d")
+    else:
+        end_dt = datetime.now()
+    if args.start_date:
+        start_dt = datetime.strptime(args.start_date, "%Y-%m-%d")
+    else:
+        start_dt = end_dt - timedelta(days=1)
+
+    start_str = start_dt.strftime("%m/%d/%Y")
+    end_str = end_dt.strftime("%m/%d/%Y")
+
+    logger.info("=" * 60)
+    logger.info("%s BUILDING PERMITS — DATA COLLECTION", county_cfg["display_name"].upper())
+    logger.info("Date range: %s → %s", start_str, end_str)
+    logger.info("=" * 60)
+
+    download_dir = RAW_PERMIT_DIR / county_id / "downloads"
+    download_dir.mkdir(parents=True, exist_ok=True)
+
+    task = build_agent_task(source, start_str, end_str)
+    history, start_time = await run_browser_agent(task, download_dir, headful=args.headful)
+
+    if history is None:
+        logger.error("[Main] Agent run returned no history — aborting")
+        return
+
+    # Give the browser a moment to finish writing
+    await asyncio.sleep(5)
+
+    downloaded_file = _locate_download(download_dir, start_time)
+    if downloaded_file is None:
+        logger.error("[Main] No downloaded file found — aborting")
+        return
+
+    df = _load_file(downloaded_file)
+    df = _normalize_columns(df)
+    logger.info("[Main] %d total records after normalization", len(df))
+
+    today_str = datetime.now().strftime("%Y%m%d")
+    out_dir = RAW_PERMIT_DIR / county_id / "new"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / f"permits_{county_id}_{today_str}.csv"
+    df.to_csv(csv_path, index=False)
+    logger.info("[Main] Saved %d records → %s", len(df), csv_path)
+
+    # Clean up the raw download
+    try:
+        downloaded_file.unlink()
+    except Exception:
+        pass
+
+    if not args.load_to_db:
+        logger.info("[Main] Skipping DB load (pass --load-to-db to enable)")
+        return
+
+    logger.info("[Main] Loading permits into database...")
+    from src.core.database import get_db_context
+    from src.loaders.permits import PermitLoader
+
+    try:
+        with get_db_context() as session:
+            loader = PermitLoader(session, county_id)
+            matched, unmatched, skipped = loader.load_from_csv(
+                str(csv_path),
+                skip_duplicates=True,
+            )
+            session.commit()
+
+        total = matched + unmatched + skipped
+        match_rate = (matched / total * 100) if total > 0 else 0
+        logger.info("=" * 60)
+        logger.info("DATABASE LOAD SUMMARY")
+        logger.info("  Matched:    %6d", matched)
+        logger.info("  Unmatched:  %6d", unmatched)
+        logger.info("  Skipped:    %6d", skipped)
+        logger.info("  Match Rate: %5.1f%%", match_rate)
+        logger.info("=" * 60)
+
+        # Rescore affected properties
+        try:
+            affected_ids = loader.get_affected_property_ids() if hasattr(loader, "get_affected_property_ids") else []
+            if affected_ids:
+                logger.info("[Rescore] Triggering CDS rescore for %d properties...", len(affected_ids))
+                from src.services.cds_engine import MultiVerticalScorer
+                with get_db_context() as score_session:
+                    scorer = MultiVerticalScorer(score_session)
+                    scorer.score_properties_by_ids(affected_ids, save_to_db=True, county_id=county_id)
+                    score_session.commit()
+                logger.info("[Rescore] CDS rescore completed")
+        except Exception as score_err:
+            logger.warning("[Rescore] CDS rescore failed (non-critical): %s", score_err)
+
+        _record_stats(
+            source_type="permits",
+            county_id=county_id,
+            total_scraped=total,
+            matched=matched,
+            unmatched=unmatched,
+            skipped=skipped,
+        )
+
+        try:
+            csv_path.unlink()
+            logger.info("[Main] CSV deleted after successful DB insertion")
+        except Exception:
+            pass
+
+    except Exception as e:
+        logger.error("[Main] DB load failed: %s", e)
+        logger.debug(traceback.format_exc())
 
 
 if __name__ == "__main__":
-	import sys
-	import argparse
-	from src.utils.scraper_db_helper import load_scraped_data_to_db, add_load_to_db_arg, record_scraper_stats
-	
-	parser = argparse.ArgumentParser(description="Scrape Hillsborough County building permits")
-	parser.add_argument(
-		"--start-date",
-		type=str,
-		help="Start date in YYYY-MM-DD format (default: yesterday). Example: 2026-02-26"
-	)
-	parser.add_argument(
-		"--end-date",
-		type=str,
-		help="End date in YYYY-MM-DD format (default: today). Example: 2026-02-27"
-	)
-	add_load_to_db_arg(parser)
-	parser.add_argument(
-		"--scraper",
-		choices=["auto", "playwright", "ai"],
-		default="auto",
-		help="Which scraper to use: auto (playwright→ai fallback), playwright only, ai only (default: auto)"
-	)
-	parser.add_argument(
-		"--debug",
-		action="store_true",
-		help="Save screenshots + HTML dumps at each step to data/debug/playwright/permits/ (works headless)"
-	)
-	parser.add_argument(
-		"--headful",
-		action="store_true",
-		help="Open a real browser window (requires: xvfb-run -a python -m ...)"
-	)
-	parser.add_argument(
-		"--county-id",
-		dest="county_id",
-		default="hillsborough",
-		help="County identifier (default: hillsborough)",
-	)
-	args = parser.parse_args()
-
-	if args.headful:
-		logger.info("[HEADFUL] Browser window enabled — requires xvfb-run on server")
-	if args.debug:
-		logger.info("[DEBUG] Screenshot/HTML dumps enabled → data/debug/playwright/permits/")
-
-	_t0 = time.monotonic()
-	try:
-		asyncio.run(run_permit_pipeline(
-			start_date=args.start_date,
-			end_date=args.end_date,
-			scraper=args.scraper,
-			headless=not args.headful,
-			debug=args.debug,
-			county_id=args.county_id,
-		))
-
-		if args.load_to_db:
-			new_dir = RAW_PERMIT_DIR / "new"
-			csv_files = sorted(new_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
-			if csv_files:
-				csv_to_load = csv_files[0]
-				logger.info(f"Loading to database: {csv_to_load}")
-				load_scraped_data_to_db('permits', csv_to_load, destination_dir=RAW_PERMIT_DIR)
-			else:
-				logger.warning("No new permit records to load — nothing new today")
-				try:
-					record_scraper_stats(source_type='permits', total_scraped=0, matched=0, unmatched=0, skipped=0, run_success=True, error_type='no_data', duration_seconds=round(time.monotonic() - _t0, 2), county_id=args.county_id)
-				except Exception as _se:
-					logger.warning("Could not record scraper stats: %s", _se)
-				sys.exit(0)
-		else:
-			try:
-				record_scraper_stats(source_type='permits', total_scraped=0, matched=0, unmatched=0, skipped=0, run_success=True, duration_seconds=round(time.monotonic() - _t0, 2), county_id=args.county_id)
-			except Exception as _se:
-				logger.warning("Could not record scraper stats: %s", _se)
-
-		sys.exit(0)
-
-	except Exception as e:
-		logger.error(f"Pipeline failed: {e}")
-		try:
-			record_scraper_stats(source_type='permits', total_scraped=0, matched=0, unmatched=0, skipped=0, run_success=False, error_message=str(e)[:500], duration_seconds=round(time.monotonic() - _t0, 2), county_id=args.county_id)
-		except Exception as _se:
-			logger.warning("Could not record scraper stats: %s", _se)
-		sys.exit(1)
+    parser = argparse.ArgumentParser(description="Scrape building permits from county Accela portal")
+    parser.add_argument("--county-id", dest="county_id", default="hillsborough",
+                        help="County identifier (default: hillsborough)")
+    parser.add_argument("--start-date", type=str,
+                        help="Start date YYYY-MM-DD (default: yesterday)")
+    parser.add_argument("--end-date", type=str,
+                        help="End date YYYY-MM-DD (default: today)")
+    parser.add_argument("--load-to-db", action="store_true",
+                        help="Load scraped data into database after scraping")
+    parser.add_argument("--headful", action="store_true",
+                        help="Open a real browser window (requires xvfb-run on server)")
+    args = parser.parse_args()
+    asyncio.run(main(args))

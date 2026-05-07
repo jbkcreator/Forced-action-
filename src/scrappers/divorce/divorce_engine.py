@@ -1,24 +1,25 @@
 """
-Divorce / Dissolution-of-Marriage Filing Scraper — Hillsborough County Clerk
+Divorce / Dissolution-of-Marriage Filing Scraper — county-agnostic
 
-Downloads the daily civil filing CSV from the Hillsborough County Clerk's
-public records portal, filters for domestic-relations / dissolution-of-marriage
-case types, deduplicates against existing DB records, and loads matches into
-the LegalProceeding table with record_type='Divorce'.
+Downloads civil filings from the county clerk portal, filters for
+domestic-relations / dissolution-of-marriage case types, deduplicates
+against existing DB records, and loads matches into the LegalProceeding
+table with record_type='Divorce'.
 
-The civil filing CSV is the same source used by the eviction scraper —
-each day's file contains all civil case types, and this engine filters to the
-DR (Domestic Relations) subset. One download per day is shared across both
-scrapers at the file level (each saves to its own raw directory).
+For Hillsborough: requests-based directory listing of daily CSV files.
+For Pinellas (output_format=excel): browser-use agent navigates the clerk
+portal, searches by date range, and downloads the Excel export.
 
-Entry point:
-    python -m src.scrappers.divorce.divorce_engine --load-to-db
+Usage:
+    python -m src.scrappers.divorce.divorce_engine --county-id hillsborough --load-to-db
+    python -m src.scrappers.divorce.divorce_engine --county-id pinellas --load-to-db --headful
 """
 
+import asyncio
 import re
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -29,11 +30,15 @@ from config.constants import (
     RAW_DIVORCE_DIR,
     DIVORCE_CASE_PATTERNS,
     CIVIL_FILING_PATTERN,
+    CIVIL_FILINGS_URL,
+    HILLSCLERK_BASE_URL,
     DEFAULT_USER_AGENT,
     REQUEST_TIMEOUT_DEFAULT,
     REQUEST_TIMEOUT_LONG,
+    BROWSER_MODEL,
+    BROWSER_TEMPERATURE,
 )
-from src.utils.county_config import get_county as _get_county
+from src.utils.county_config import get_county_config as _get_county
 from src.utils.http_helpers import requests_get_with_retry
 from src.utils.logger import setup_logging, get_logger
 from src.utils.db_deduplicator import filter_new_records
@@ -41,19 +46,125 @@ from src.utils.db_deduplicator import filter_new_records
 setup_logging()
 logger = get_logger(__name__)
 
+_STEALTH_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/136.0.0.0 Safari/537.36"
+)
+
+
+def _make_llm():
+    from browser_use import ChatAnthropic
+    from config.settings import get_settings
+    settings = get_settings()
+    return ChatAnthropic(
+        model=BROWSER_MODEL,
+        temperature=BROWSER_TEMPERATURE,
+        api_key=settings.anthropic_api_key.get_secret_value(),
+    )
+
+
+def _get_court_source(county_id: str) -> dict:
+    """Return the court_records source dict for county_id (empty dict if absent)."""
+    cfg = _get_county(county_id)
+    return cfg.get("sources", {}).get("court_records", {})
+
+
+async def _download_civil_filing_browser(
+    county_id: str, source: dict, target_date: str | None, dest_dir: Path
+) -> Path:
+    """
+    Browser-use agent download for counties whose civil portal requires a browser
+    (output_format='excel', e.g. Pinellas courtrecords.mypinellasclerk.gov).
+    Returns the path to the downloaded file.
+    """
+    from browser_use import Agent, Browser
+    from playwright_stealth import Stealth
+    from src.utils.http_helpers import get_browser_use_proxy
+
+    if target_date:
+        target_dt = datetime.strptime(target_date.replace("-", ""), "%Y%m%d")
+        start_str = end_str = target_dt.strftime("%m/%d/%Y")
+    else:
+        end_dt = datetime.now()
+        start_str = (end_dt - timedelta(days=1)).strftime("%m/%d/%Y")
+        end_str = end_dt.strftime("%m/%d/%Y")
+
+    url = source.get("url", "")
+    nav_hint = source.get("navigation_hint") or ""
+    task = (
+        f"Go to {url}. "
+        f"Search for civil court filings filed between {start_str} and {end_str}. "
+        f"Export or download the full results as a file (Excel or CSV). "
+        f"Wait for the download to complete. "
+        f"Do not open new tabs or navigate away from the portal."
+    )
+    if nav_hint:
+        task += f"\n\nPortal navigation hint: {nav_hint}"
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    browser = Browser(
+        headless=True,
+        disable_security=True,
+        proxy=get_browser_use_proxy(),
+        downloads_path=str(dest_dir),
+        user_agent=_STEALTH_UA,
+        ignore_default_args=["--enable-automation"],
+        enable_default_extensions=True,
+        minimum_wait_page_load_time=1.5,
+        wait_between_actions=1.0,
+        args=["--no-sandbox", "--disable-blink-features=AutomationControlled", "--window-size=1920,1080"],
+    )
+    await browser.start()
+    stealth = Stealth(
+        chrome_runtime=True, navigator_webdriver=True, navigator_plugins=True, webgl_vendor=True,
+        webgl_vendor_override="Google Inc. (Intel)",
+        webgl_renderer_override="ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+    )
+    await browser._cdp_add_init_script(stealth.script_payload)
+    logger.info("[divorce] Stealth fingerprint patches injected")
+
+    start_time = time.time()
+    agent = Agent(task=task, llm=_make_llm(), browser=browser, max_steps=60, use_judge=False)
+    try:
+        history = await agent.run()
+        if not history.is_done():
+            logger.warning("[divorce] Browser agent did not complete within step budget")
+    except Exception as e:
+        logger.error("[divorce] Browser agent failed: %s", e)
+        raise
+
+    await asyncio.sleep(5)
+    candidates = [
+        p for p in dest_dir.iterdir()
+        if p.stat().st_mtime >= start_time and p.suffix.lower() in (".xlsx", ".xls", ".csv")
+    ]
+    if not candidates:
+        raise FileNotFoundError(f"[divorce] No downloaded civil filing found in {dest_dir}")
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
 
 def download_latest_civil_filing(target_date: str = None, county_id: str = "hillsborough") -> Path:
     """
-    Download the latest civil filing CSV from the county clerk.
-    Saves to RAW_DIVORCE_DIR. Mirrors the evictions engine download function
-    with a different destination directory.
+    Download the latest civil filing from the county clerk.
+    Hillsborough: requests-based directory listing → CSV.
+    Other counties (output_format=excel, e.g. Pinellas): browser-use → Excel.
     """
+    source = _get_court_source(county_id)
+    output_format = source.get("output_format", "csv")
+
+    if output_format == "excel":
+        logger.info("[divorce] County '%s' uses browser download (output_format=excel)", county_id)
+        return asyncio.run(
+            _download_civil_filing_browser(county_id, source, target_date, RAW_DIVORCE_DIR)
+        )
+
+    # Hillsborough / CSV directory-listing path
     _county = _get_county(county_id)
-    _civil_filings_url = _county["portals"]["civil_filings_url"]
-    _clerk_base_url = _county["portals"]["clerk_base_url"]
+    _civil_filings_url = _county["urls"].get("civil") or CIVIL_FILINGS_URL
+    _clerk_base_url = _county["urls"].get("clerk_base") or HILLSCLERK_BASE_URL
 
     logger.info("[divorce] Fetching civil filings list from: %s", _civil_filings_url)
-
     RAW_DIVORCE_DIR.mkdir(parents=True, exist_ok=True)
 
     response = requests_get_with_retry(
@@ -61,14 +172,12 @@ def download_latest_civil_filing(target_date: str = None, county_id: str = "hill
         headers={"User-Agent": DEFAULT_USER_AGENT},
         timeout=REQUEST_TIMEOUT_DEFAULT,
     )
-
     soup = BeautifulSoup(response.content, "html.parser")
     file_links = [
         link["href"]
         for link in soup.find_all("a", href=True)
         if "CivilFiling_" in link["href"] and link["href"].endswith(".csv")
     ]
-
     if not file_links:
         raise ValueError("[divorce] No civil filing CSV files found on the page")
 
@@ -81,10 +190,8 @@ def download_latest_civil_filing(target_date: str = None, county_id: str = "hill
                 files_with_dates.append((datetime.strptime(m.group(1), "%Y%m%d"), href))
             except ValueError:
                 continue
-
     if not files_with_dates:
         raise ValueError("[divorce] No valid dated civil files found")
-
     files_with_dates.sort(key=lambda x: x[0], reverse=True)
 
     if target_date:
@@ -98,13 +205,11 @@ def download_latest_civil_filing(target_date: str = None, county_id: str = "hill
         latest_date, latest_file = files_with_dates[0]
 
     logger.info("[divorce] Selected civil filing: %s (%s)", latest_file, latest_date.strftime("%Y-%m-%d"))
-
     download_url = (
         f"{_clerk_base_url}{latest_file}"
         if latest_file.startswith("/")
         else f"{_civil_filings_url.rstrip('/')}/{latest_file}"
     )
-
     output_path = RAW_DIVORCE_DIR / Path(latest_file).name
     file_response = requests_get_with_retry(
         download_url,
@@ -116,57 +221,63 @@ def download_latest_civil_filing(target_date: str = None, county_id: str = "hill
     return output_path
 
 
-def filter_divorce_cases(csv_path: Path) -> pd.DataFrame:
+def filter_divorce_cases(file_path: Path, county_id: str = "hillsborough") -> pd.DataFrame:
     """
-    Load the civil filing CSV and return only domestic-relations / dissolution rows.
-    Matches against DIVORCE_CASE_PATTERNS (case-insensitive substring match on
-    CaseTypeDescription).
+    Load the civil filing and return only domestic-relations / dissolution rows.
+    Uses style_col from county source config as the filter column
+    (default: CaseTypeDescription for Hillsborough).
+    Reads CSV or Excel based on file extension / county output_format.
     """
-    encodings = ["utf-8", "latin1", "cp1252"]
-    df = None
-    for enc in encodings:
+    source = _get_court_source(county_id)
+    style_col = source.get("style_col", "CaseTypeDescription")
+    output_format = source.get("output_format", "csv")
+
+    if output_format == "excel" or file_path.suffix.lower() in (".xlsx", ".xls"):
         try:
-            df = pd.read_csv(csv_path, encoding=enc)
-            break
-        except (UnicodeDecodeError, pd.errors.ParserError):
-            continue
+            df = pd.read_excel(file_path)
+        except Exception as e:
+            raise ValueError(f"[divorce] Could not read Excel file {file_path}: {e}")
+    else:
+        encodings = ["utf-8", "latin1", "cp1252"]
+        df = None
+        for enc in encodings:
+            try:
+                df = pd.read_csv(file_path, encoding=enc)
+                break
+            except (UnicodeDecodeError, pd.errors.ParserError):
+                continue
+        if df is None:
+            raise ValueError(f"[divorce] Could not read CSV: {file_path}")
 
-    if df is None:
-        raise ValueError(f"[divorce] Could not read CSV: {csv_path}")
+    logger.info("[divorce] Raw civil filing: %d rows (filter col: '%s')", len(df), style_col)
 
-    logger.info("[divorce] Raw civil CSV: %d rows", len(df))
-
-    if "CaseTypeDescription" not in df.columns:
-        logger.warning("[divorce] 'CaseTypeDescription' column not found — columns: %s", list(df.columns))
+    if style_col not in df.columns:
+        logger.warning("[divorce] '%s' column not found — columns: %s", style_col, list(df.columns))
         return pd.DataFrame()
 
     pattern = "|".join(re.escape(p) for p in DIVORCE_CASE_PATTERNS)
-    mask = df["CaseTypeDescription"].str.contains(pattern, case=False, na=False)
+    mask = df[style_col].str.contains(pattern, case=False, na=False)
     df_divorce = df[mask].copy()
     logger.info("[divorce] Dissolution/DR rows: %d / %d total", len(df_divorce), len(df))
     return df_divorce
 
 
 def run_divorce_pipeline(target_date: str = None, county_id: str = "hillsborough") -> bool:
-    """
-    Full pipeline: download → filter → dedup → save.
-    Returns True on success.
-    """
+    """Full pipeline: download → filter → dedup → save. Returns True on success."""
     t0 = time.monotonic()
     logger.info("=" * 60)
-    logger.info("HILLSBOROUGH DIVORCE / DISSOLUTION FILINGS")
+    logger.info("%s DIVORCE / DISSOLUTION FILINGS", county_id.upper())
     logger.info("=" * 60)
 
     try:
-        csv_path = download_latest_civil_filing(target_date=target_date, county_id=county_id)
-        df = filter_divorce_cases(csv_path)
+        file_path = download_latest_civil_filing(target_date=target_date, county_id=county_id)
+        df = filter_divorce_cases(file_path, county_id=county_id)
 
         if df.empty:
             logger.info("[divorce] No dissolution-of-marriage cases in today's civil filing")
             _record_stats(0, 0, 0, 0, True, t0, county_id)
             return True
 
-        # Normalize column name for deduplicator
         if "CaseNumber" in df.columns and "Case Number" not in df.columns:
             df = df.rename(columns={"CaseNumber": "Case Number"})
 
@@ -219,7 +330,7 @@ if __name__ == "__main__":
     import argparse
     from src.utils.scraper_db_helper import load_scraped_data_to_db, add_load_to_db_arg
 
-    parser = argparse.ArgumentParser(description="Scrape Hillsborough County divorce/dissolution filings")
+    parser = argparse.ArgumentParser(description="Scrape county divorce/dissolution filings")
     parser.add_argument("--date", type=str, default=None, help="Target date YYYY-MM-DD (default: latest)")
     parser.add_argument("--county-id", dest="county_id", default="hillsborough")
     add_load_to_db_arg(parser)
@@ -232,7 +343,10 @@ if __name__ == "__main__":
             new_dir = RAW_DIVORCE_DIR / "new"
             csv_files = sorted(new_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
             if csv_files:
-                load_scraped_data_to_db("divorce_filings", csv_files[0], destination_dir=RAW_DIVORCE_DIR)
+                load_scraped_data_to_db(
+                    "divorce_filings", csv_files[0],
+                    destination_dir=RAW_DIVORCE_DIR, county_id=args.county_id,
+                )
             else:
                 logger.warning("[divorce] No new divorce records to load")
         except Exception as exc:

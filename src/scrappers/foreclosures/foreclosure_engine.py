@@ -1,694 +1,432 @@
 """
-Foreclosure Auction Data Collection Pipeline
+Foreclosure Auction Data Collection Pipeline — county-agnostic, browser-use only.
 
-This module automates the scraping of foreclosure auction records from the
-Hillsborough County RealForeclose auction calendar. It uses Playwright as the
-primary scraper (deterministic, no AI credits) and falls back to browser_use
-with Claude Sonnet if Playwright fails.
+For each county reads the foreclosures source config and runs a single browser-use
+Agent to extract auction records for a given date.  The agent task is generated
+by Claude from the source metadata so no per-county prompt files are needed.
 
-The pipeline performs the following steps:
-    1. Navigates to the RealForeclose calendar preview for a specific date
-    2. Waits for #BID_WINDOW_CONTAINER to load
-    3. Extracts all .AUCTION_ITEM.PREVIEW cards across Running/Waiting/Closed sections
-    4. Handles pagination within each section
-    5. Deduplicates against the database and saves new records to CSV
+Hillsborough → hillsborough.realforeclose.com  (same platform)
+Pinellas     → pinellas.realforeclose.com      (same platform, different URL)
 
-Author: Distressed Property Intelligence Platform
+Usage:
+    python -m src.scrappers.foreclosures.foreclosure_engine --county-id hillsborough
+    python -m src.scrappers.foreclosures.foreclosure_engine --county-id pinellas --date 2026-05-08
+    python -m src.scrappers.foreclosures.foreclosure_engine --county-id hillsborough --load-to-db --headful
 """
 
 import argparse
 import asyncio
 import datetime as dt
+import json
+import sys
 import traceback
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
-from browser_use import Agent, ChatAnthropic, Browser
 
-from config.settings import settings
-from config.constants import (
-	REALFORECLOSE_BASE_URL,
-	AUCTION_DATE_FORMAT,
-	RAW_FORECLOSURE_DIR,
-	PROCESSED_DATA_DIR,
-	BROWSER_MODEL,
-	BROWSER_TEMPERATURE,
-	get_county_config,
-)
-from src.core.database import get_db_context
-from src.loaders.foreclosures import ForeclosureLoader
+project_root = Path(__file__).parent.parent.parent.parent
+sys.path.insert(0, str(project_root))
+
 from src.utils.logger import setup_logging, get_logger
-from src.utils.prompt_loader import get_prompt
+from src.utils.county_config import get_county_config
 from src.utils.db_deduplicator import filter_new_records
+from config.constants import BROWSER_MODEL, BROWSER_TEMPERATURE, RAW_FORECLOSURE_DIR
 
-# Initialize logging
 setup_logging()
 logger = get_logger(__name__)
 
-# LLM configuration for browser-use AI fallback
-llm = ChatAnthropic(
-	model=BROWSER_MODEL,
-	timeout=180,
-	api_key=settings.anthropic_api_key.get_secret_value(),
-	temperature=BROWSER_TEMPERATURE,
-)
-
-RAW_FORECLOSURE_DIR.mkdir(parents=True, exist_ok=True)
-PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
+AUCTION_DATE_FORMAT = "%m/%d/%Y"
 
 
-def build_preview_url(auction_date: dt.date, base_url: str = REALFORECLOSE_BASE_URL) -> str:
-	"""
-	Build the RealForeclose calendar preview URL for a given auction date.
+# ---------------------------------------------------------------------------
+# URL helper
+# ---------------------------------------------------------------------------
 
-	Example:
-		>>> build_preview_url(dt.date(2026, 2, 19))
-		'https://www.hillsborough.realforeclose.com/index.cfm?zaction=AUCTION&Zmethod=PREVIEW&AUCTIONDATE=02/19/2026'
-	"""
+def build_preview_url(base_url: str, auction_date: dt.date) -> str:
+	"""Build the RealForeclose calendar preview URL for a given date."""
 	date_str = auction_date.strftime(AUCTION_DATE_FORMAT)
 	return f"{base_url}?zaction=AUCTION&Zmethod=PREVIEW&AUCTIONDATE={date_str}"
 
 
-def _save_new_foreclosures(df: pd.DataFrame, auction_date: dt.date) -> Optional[Path]:
+# ---------------------------------------------------------------------------
+# LLM helpers (mirrors master_engine pattern)
+# ---------------------------------------------------------------------------
+
+def _make_llm():
+	from browser_use import ChatAnthropic
+	from config.settings import get_settings
+	settings = get_settings()
+	return ChatAnthropic(
+		model=BROWSER_MODEL,
+		timeout=180,
+		api_key=settings.anthropic_api_key.get_secret_value(),
+		temperature=BROWSER_TEMPERATURE,
+	)
+
+
+def build_agent_task(source: dict, auction_date: dt.date) -> str:
 	"""
-	Deduplicate DataFrame against the database and save new records to new/ directory.
+	Generate a browser-use agent task from the county source config + auction date.
 
-	Returns the saved file path, or None if all records already exist.
+	Uses Claude to produce step-by-step instructions tailored to the source's
+	navigation_hint and description.  Falls back to a template on LLM failure.
 	"""
-	logger.info("=" * 60)
-	logger.info("DB DEDUPLICATION: Checking for existing foreclosures")
-	logger.info("=" * 60)
+	import anthropic
+	from config.settings import get_settings
 
-	initial_count = len(df)
-	df_new = filter_new_records(df, 'foreclosures')
-
-	if df_new.empty:
-		logger.info("✓ All foreclosures already exist in database - nothing new")
-		return None
-
-	new_dir = RAW_FORECLOSURE_DIR / "new"
-	new_dir.mkdir(parents=True, exist_ok=True)
-	final_file = new_dir / f"foreclosures_new_{auction_date:%Y%m%d}.csv"
-
-	df_new.to_csv(final_file, index=False)
-	size_mb = final_file.stat().st_size / (1024 ** 2)
-	logger.info(f"Saved {len(df_new)} NEW foreclosures to {final_file} ({size_mb:.2f} MB)")
-	logger.info(f"Filtered {initial_count - len(df_new)} existing records")
-
-	return final_file
-
-
-# ── Party enrichment (shared by Playwright + AI paths) ───────────────────────
-
-async def enrich_parties(df: "pd.DataFrame") -> "pd.DataFrame":
-	"""
-	For each row with a Case Detail URL, navigate to the Hillsborough Clerk
-	detail page and extract plaintiff/defendant party names.
-	Runs in a fresh Playwright browser session.
-	"""
-	import pandas as pd
-	from playwright.async_api import async_playwright
-	from playwright_stealth import Stealth
-
-	urls = df.get('Case Detail URL', pd.Series(dtype=str)).fillna('')
-	has_urls = urls.str.strip().astype(bool)
-	if not has_urls.any():
-		logger.info("[Party] No Case Detail URLs — skipping party enrichment")
-		return df
-
-	df['Plaintiff'] = ''
-	df['Defendant'] = ''
-
-	logger.info(f"[Party] Fetching party names for {has_urls.sum()} auctions...")
-	async with async_playwright() as pw:
-		from src.utils.http_helpers import get_playwright_proxy
-		browser = await pw.chromium.launch(
-			headless=True,
-			proxy=get_playwright_proxy(),
-			args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
-		)
-		context = await browser.new_context(
-			user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-			viewport={"width": 1920, "height": 1080},
-		)
-		page = await context.new_page()
-		await Stealth().apply_stealth_async(page)
-		try:
-			for idx, row in df[has_urls].iterrows():
-				parties = await _fetch_parties_from_detail(page, row['Case Detail URL'])
-				df.at[idx, 'Plaintiff'] = parties['plaintiff']
-				df.at[idx, 'Defendant'] = parties['defendant']
-		finally:
-			await context.close()
-			await browser.close()
-
-	logger.info("[Party] Party enrichment complete")
-	return df
-
-
-# ── Party detail scraper ─────────────────────────────────────────────────────
-
-async def _fetch_parties_from_detail(page, detail_url: str) -> dict:
-	"""
-	Navigate to the Hillsborough Clerk detail page and extract party names
-	from the #obpa-grid table (ORI - Person Type / Name columns).
-
-	Returns dict with keys: plaintiff, defendant, all_parties (list of dicts)
-	"""
-	try:
-		await page.goto(detail_url, wait_until="domcontentloaded", timeout=30_000)
-		await page.wait_for_selector('#obpa-grid tbody tr', state='attached', timeout=15_000)
-
-		rows = await page.query_selector_all('#obpa-grid tbody tr')
-		parties = []
-		for row in rows:
-			cells = await row.query_selector_all('td')
-			if len(cells) < 3:
-				continue
-			party_type = (await cells[1].inner_text()).strip()
-			name = (await cells[2].inner_text()).strip()
-			if name and name != '\xa0':
-				parties.append({'party_type': party_type, 'name': name})
-
-		plaintiff = next((p['name'] for p in parties if 'PARTY 1' in p['party_type'].upper()), '')
-		defendants = [p['name'] for p in parties if 'PARTY 1' not in p['party_type'].upper()]
-		defendant = '; '.join(defendants)
-
-		return {'plaintiff': plaintiff, 'defendant': defendant, 'all_parties': parties}
-	except Exception as e:
-		logger.warning(f"[Playwright] Failed to fetch parties from {detail_url}: {e}")
-		return {'plaintiff': '', 'defendant': '', 'all_parties': []}
-
-
-# ── Playwright scraper ────────────────────────────────────────────────────────
-
-async def _extract_auction_item_playwright(item) -> Optional[dict]:
-	"""Extract all fields from a single .AUCTION_ITEM.PREVIEW locator."""
-	try:
-		record = {}
-
-		# Auction ID from the 'aid' attribute on the card element
-		record['Auction ID'] = await item.get_attribute('aid') or ''
-
-		# Status / start-time from AUCTION_STATS section
-		status_lbl = item.locator('.ASTAT_MSGA')
-		status_val = item.locator('.ASTAT_MSGB')
-		label_text = (await status_lbl.inner_text()).strip() if await status_lbl.count() else ''
-		value_text = (await status_val.inner_text()).strip() if await status_val.count() else ''
-
-		if 'Auction Starts' in label_text:
-			record['Auction Start Date/Time'] = value_text
-			record['Auction Status'] = 'Waiting'
-		else:
-			# "Auction Status" label with value like "Canceled per County"
-			record['Auction Status'] = value_text
-			record['Auction Start Date/Time'] = ''
-
-		# Detail table: iterate AD_LBL / AD_DTA row pairs
-		rows = item.locator('.ad_tab tr')
-		row_count = await rows.count()
-		address_parts = []
-		record['Case Detail URL'] = ''
-
-		for i in range(row_count):
-			row = rows.nth(i)
-			lbl_el = row.locator('.AD_LBL')
-			dta_el = row.locator('.AD_DTA')
-			if not await lbl_el.count() or not await dta_el.count():
-				continue
-			lbl = (await lbl_el.inner_text()).strip().rstrip(':')
-			dta = (await dta_el.inner_text()).strip()
-
-			# Extract Case Detail URL from the anchor inside AD_DTA
-			if lbl == 'Case #':
-				record['Case Number'] = dta
-				link_el = dta_el.locator('a')
-				if await link_el.count():
-					record['Case Detail URL'] = await link_el.get_attribute('href') or ''
-			elif lbl == 'Auction Type':
-				record['Auction Type'] = dta
-			elif lbl == 'Final Judgment Amount':
-				record['Judgment Amount'] = dta
-			elif lbl == 'Parcel ID':
-				record['Parcel ID'] = dta
-			elif lbl == 'Property Address' or (lbl == '' and dta):
-				# First row is street address, second blank-label row is city/state/zip
-				address_parts.append(dta)
-			elif lbl == 'Assessed Value':
-				record['Assessed Value'] = dta
-			elif lbl == 'Plaintiff Max Bid':
-				record['Plaintiff Max Bid'] = dta
-
-		record['Property Address'] = ', '.join(filter(None, address_parts))
-		return record
-
-	except Exception as e:
-		logger.warning(f"[Playwright] Failed to extract auction item: {e}")
-		return None
-
-
-async def scrape_foreclosures_with_playwright(
-	auction_date: dt.date,
-	debug: bool = False,
-	foreclosure_base_url: str = REALFORECLOSE_BASE_URL,
-) -> Optional[Path]:
-	"""
-	Primary Playwright scraper — deterministic, no AI credits consumed.
-
-	Reads #BID_WINDOW_CONTAINER and extracts .AUCTION_ITEM.PREVIEW cards from
-	all three sections (Running/Waiting/Closed), handling pagination per section.
-
-	Args:
-		auction_date: Date of the auction to scrape.
-		debug:        Save screenshots + HTML to data/debug/playwright/foreclosures/.
-
-	Returns:
-		Path to the deduplicated CSV, or None if nothing new.
-
-	Raises:
-		RuntimeError: If no auction items are found (page empty or selectors changed).
-	"""
-	from playwright.async_api import async_playwright
-	from playwright_stealth import Stealth
-
-	preview_url = build_preview_url(auction_date, base_url=foreclosure_base_url)
-	logger.info(f"[Playwright] Scraping foreclosures for {auction_date}: {preview_url}")
-
-	debug_dir = Path("data/debug/playwright/foreclosures")
-	if debug:
-		debug_dir.mkdir(parents=True, exist_ok=True)
-		logger.info(f"[Playwright][DEBUG] Screenshots/HTML → {debug_dir.resolve()}")
-
-	async def save_debug(page, name: str):
-		if debug:
-			await page.screenshot(path=str(debug_dir / f"{name}.png"), full_page=True)
-			(debug_dir / f"{name}.html").write_text(await page.content(), encoding="utf-8")
-			logger.info(f"[Playwright][DEBUG] Saved {name}.png + {name}.html")
-
-	async with async_playwright() as pw:
-		from src.utils.http_helpers import get_playwright_proxy
-		browser = await pw.chromium.launch(
-			headless=True,
-			proxy=get_playwright_proxy(),
-			args=[
-				'--no-sandbox',
-				'--disable-setuid-sandbox',
-				'--disable-dev-shm-usage',
-				'--disable-gpu',
-			],
-		)
-		context = await browser.new_context(
-			user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-			viewport={"width": 1920, "height": 1080},
-			extra_http_headers={
-				"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-				"Accept-Language": "en-US,en;q=0.9",
-				"Accept-Encoding": "gzip, deflate, br",
-				"sec-ch-ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-				"sec-ch-ua-mobile": "?0",
-				"sec-ch-ua-platform": '"Windows"',
-				"Upgrade-Insecure-Requests": "1",
-			},
-		)
-		page = await context.new_page()
-		await Stealth().apply_stealth_async(page)
-		try:
-			await page.goto(preview_url, wait_until="commit", timeout=120_000)
-
-			# Give JS time to render the auction container
-			try:
-				await page.wait_for_selector(
-					"#BID_WINDOW_CONTAINER", state="attached", timeout=30_000
-				)
-			except Exception:
-				# Container absent → no auctions scheduled for this date
-				page_text = await page.inner_text("body")
-				logger.info(
-					f"[Playwright] #BID_WINDOW_CONTAINER not found for {auction_date} "
-					f"— likely no auctions scheduled. Page snippet: {page_text[:300]!r}"
-				)
-				return None
-
-			await save_debug(page, "01_loaded")
-
-			all_records = []
-
-			# Three auction sections: Running (R), Waiting (W), Closed/Canceled (C)
-			# Only W and C have pagination controls.
-			sections = [
-				("Area_R", "R", None,     None),
-				("Area_W", "W", "maxWA",  "Head_W"),
-				("Area_C", "C", "maxCA",  "Head_C"),
-			]
-
-			for area_id, _letter, max_pg_id, head_class in sections:
-				page_num = 1
-				while True:
-					area = page.locator(f"#{area_id}")
-					items = area.locator(".AUCTION_ITEM.PREVIEW")
-					count = await items.count()
-					logger.info(f"[Playwright] #{area_id} page {page_num}: {count} items")
-
-					for i in range(count):
-						record = await _extract_auction_item_playwright(items.nth(i))
-						if record:
-							all_records.append(record)
-
-					# Stop if no pagination for this section
-					if not max_pg_id:
-						break
-
-					max_el = page.locator(f"#{max_pg_id}")
-					max_text = (await max_el.inner_text()).strip() if await max_el.count() else "1"
-					max_pages = int(max_text) if max_text.isdigit() else 1
-
-					if page_num >= max_pages:
-						break
-
-					# Click the bottom "Next Page" button for this section
-					next_btn = page.locator(f".{head_class} .PageFrame .PageRight").last
-					await next_btn.click()
-					await page.wait_for_timeout(2_000)
-					await save_debug(page, f"{area_id}_page{page_num + 1}")
-					page_num += 1
-
-			await save_debug(page, "99_done")
-
-		finally:
-			await context.close()
-			await browser.close()
-
-	if not all_records:
-		raise RuntimeError(
-			"[Playwright] No auction items found — page may be empty or selectors changed"
-		)
-
-	logger.info(f"[Playwright] Extracted {len(all_records)} total auction records")
-	df = pd.DataFrame(all_records)
-	df = await enrich_parties(df)
-	return _save_new_foreclosures(df, auction_date)
-
-
-# ── AI fallback scraper ───────────────────────────────────────────────────────
-
-async def _scrape_with_ai(
-	auction_date: dt.date,
-	wait_after_scrape: int = 10,
-	foreclosure_base_url: str = REALFORECLOSE_BASE_URL,
-) -> Optional[Path]:
-	"""
-	AI browser-use fallback scraper. Returns data via agent final_result() as JSON.
-	"""
-	import json
-
-	preview_url = build_preview_url(auction_date, base_url=foreclosure_base_url)
+	base_url = source["url"]
+	preview_url = build_preview_url(base_url, auction_date)
 	iso_date = auction_date.strftime("%Y-%m-%d")
+	description = source.get("description", "")
+	nav_hint = source.get("navigation_hint", "") or ""
+
+	meta = {
+		"preview_url": preview_url,
+		"auction_date": iso_date,
+		"description": description,
+		"navigation_hint": nav_hint,
+	}
+
+	system_prompt = (
+		"You generate browser-automation task instructions for a browser-use Agent. "
+		"The agent is a Chromium browser controller that can navigate pages and extract text. "
+		"Write a concise, step-by-step task in plain English. "
+		"Do NOT add any explanation outside the task text."
+	)
+
+	user_prompt = f"""Generate a browser-use agent task to extract foreclosure auction records.
+
+Source metadata:
+{json.dumps(meta, indent=2)}
+
+Requirements:
+- Navigate to preview_url.
+- Wait for the auction listing to load.
+- Extract ALL auction records visible on the page across all sections (Running, Waiting, Closed/Canceled).
+- For each record capture: case_number, property_address, judgment_amount, parcel_id, auction_type, auction_status, case_detail_url.
+- For each case_detail_url, navigate to it and extract plaintiff and defendant party names, then go back.
+- Return ALL records as a single JSON object in this exact format:
+  {{"auctions": [{{"case_number": "", "property_address": "", "judgment_amount": "", "parcel_id": "", "auction_type": "", "auction_status": "", "plaintiff": "", "defendant": "", "case_detail_url": ""}}]}}
+- If no auctions are listed for this date, return: {{"auctions": []}}
+- Do not save any files. Return the JSON as your final result.
+- Keep the task under 250 words.
+"""
 
 	try:
-		task_instructions = get_prompt(
-			"foreclosure_prompts.yaml",
-			"auction_scrape.task_template",
-			preview_url=preview_url,
+		settings = get_settings()
+		client = anthropic.Anthropic(
+			api_key=settings.anthropic_api_key.get_secret_value()
 		)
+		response = client.messages.create(
+			model="claude-sonnet-4-6",
+			max_tokens=512,
+			temperature=0,
+			system=system_prompt,
+			messages=[{"role": "user", "content": user_prompt}],
+		)
+		task = response.content[0].text.strip()
+		logger.info(f"[LLM] Generated agent task:\n{task}")
+		return task
 	except Exception as e:
-		logger.error(f"[AI] Failed to load prompt from YAML: {e}")
-		raise
+		logger.warning(f"[LLM] Task generation failed ({e}) — using template fallback")
+		return _template_task(source, auction_date)
 
-	logger.info(f"[AI] Launching browser agent for {iso_date}: {preview_url}")
 
+def _template_task(source: dict, auction_date: dt.date) -> str:
+	"""Template fallback when LLM is unavailable."""
+	base_url = source["url"]
+	preview_url = build_preview_url(base_url, auction_date)
+	nav_hint = source.get("navigation_hint", "") or ""
+	return (
+		f"Go to {preview_url}.\n"
+		f"{nav_hint}\n"
+		"Wait for the auction listing to load.\n"
+		"Extract all auction records across all sections (Running, Waiting, Closed/Canceled).\n"
+		"For each record capture: case_number, property_address, judgment_amount, parcel_id, "
+		"auction_type, auction_status, case_detail_url.\n"
+		"For each case_detail_url, navigate to it and extract plaintiff and defendant names, then go back.\n"
+		'Return all records as JSON: {"auctions": [...]}.\n'
+		'If no auctions exist for this date return: {"auctions": []}.'
+	)
+
+
+# ---------------------------------------------------------------------------
+# Browser-use agent (mirrors master_engine pattern)
+# ---------------------------------------------------------------------------
+
+async def run_browser_agent(task: str, headful: bool = False):
+	"""
+	Run a browser-use Agent with the given task.
+	Returns the agent history object, or None on failure.
+	"""
+	from browser_use import Agent, Browser
 	from src.utils.http_helpers import get_browser_use_proxy
+
+	llm = _make_llm()
+
 	browser = Browser(
-		headless=True,
+		headless=not headful,
 		disable_security=True,
 		proxy=get_browser_use_proxy(),
-		user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
 		args=[
 			'--no-sandbox',
 			'--disable-setuid-sandbox',
 			'--disable-dev-shm-usage',
 			'--disable-gpu',
-			'--no-first-run',
-			'--no-zygote',
-			'--single-process',
 			'--disable-blink-features=AutomationControlled',
 			'--window-size=1920,1080',
 		],
 	)
 
 	agent = Agent(
-		task=task_instructions,
+		task=task,
 		llm=llm,
-		max_steps=50,
 		browser=browser,
+		max_steps=80,
+		use_judge=False,
 	)
 
+	logger.info("[Agent] Starting browser-use agent...")
 	try:
 		history = await agent.run()
-
 		if not history.is_done():
-			logger.warning("[AI] Agent could not complete within 50 steps")
-			return None
-
+			logger.warning("[Agent] Agent did not complete all steps within budget")
+		return history
 	except Exception as e:
-		logger.error(f"[AI] Browser agent execution failed: {e}")
-		logger.debug(traceback.format_exc())
-		return None
-
-	# Parse JSON from agent's final result
-	try:
-		final = history.final_result()
-		if not final:
-			# Fallback: check extracted_content
-			contents = history.extracted_content()
-			final = contents[-1] if contents else None
-		if not final:
-			logger.error("[AI] Agent returned no result")
-			return None
-
-		# Extract JSON — agent may wrap it in text
-		json_start = final.find('{')
-		json_end = final.rfind('}') + 1
-		if json_start == -1 or json_end == 0:
-			logger.error(f"[AI] No JSON found in agent result: {final[:200]}")
-			return None
-
-		data = json.loads(final[json_start:json_end])
-		auctions = data.get('auctions', [])
-		if not auctions:
-			logger.warning("[AI] Agent returned empty auctions list")
-			return None
-
-		logger.info(f"[AI] Agent extracted {len(auctions)} auction records")
-		df = pd.DataFrame(auctions).rename(columns={
-			'case_number': 'Case Number',
-			'status': 'Status',
-			'property_address': 'Property Address',
-			'opening_bid': 'Opening Bid',
-			'judgment_amount': 'Judgment Amount',
-			'case_detail_url': 'Case Detail URL',
-		})
-		df = await enrich_parties(df)
-		return _save_new_foreclosures(df, auction_date)
-
-	except Exception as e:
-		logger.error(f"[AI] Failed to parse agent result: {e}")
+		logger.error(f"[Agent] Run failed: {e}")
 		logger.debug(traceback.format_exc())
 		return None
 
 
-# ── Orchestrator ──────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Result parsing + save
+# ---------------------------------------------------------------------------
 
-async def scrape_realforeclose_calendar(
+def _parse_agent_result(
+	history,
 	auction_date: dt.date,
-	wait_after_scrape: int = 10,
-	scraper: str = "auto",
-	county_id: str = "hillsborough",
+	county_id: str,
 ) -> Optional[Path]:
 	"""
-	Scrape RealForeclose auction calendar for a given date.
-
-	Args:
-		auction_date:     Date to scrape.
-		wait_after_scrape: Seconds to wait after AI agent finishes (AI path only).
-		scraper:          'auto' (playwright → AI fallback), 'playwright', or 'ai'.
-
-	Returns:
-		Path to deduplicated CSV of new records, or None if nothing new.
+	Extract the JSON auction list from agent's final_result(),
+	normalise column names, deduplicate against DB, and save to CSV.
 	"""
-	county_cfg = get_county_config(county_id)
-	foreclosure_base_url = county_cfg["urls"]["foreclosure"]
+	if history is None:
+		logger.error("[Parse] No agent history — agent failed to run")
+		return None
 
-	csv_file = None
-	playwright_succeeded = False  # True = Playwright ran cleanly (even if no records)
-	MAX_PLAYWRIGHT_RETRIES = 5
+	# Try final_result() first, fall back to last extracted_content entry
+	final = history.final_result()
+	if not final:
+		contents = history.extracted_content()
+		final = contents[-1] if contents else None
+	if not final:
+		logger.error("[Parse] Agent returned no result")
+		return None
 
-	if scraper in ("auto", "playwright"):
-		logger.info("\nAttempting Playwright scraping (primary method)...")
-		playwright_error = None
-		for attempt in range(1, MAX_PLAYWRIGHT_RETRIES + 1):
-			try:
-				csv_file = await scrape_foreclosures_with_playwright(auction_date, foreclosure_base_url=foreclosure_base_url)
-				playwright_succeeded = True
-				logger.info("Playwright scraping succeeded")
-				playwright_error = None
-				break
-			except Exception as e:
-				if scraper == "playwright":
-					raise
-				playwright_error = e
-				if attempt < MAX_PLAYWRIGHT_RETRIES:
-					logger.warning(f"[Playwright] Attempt {attempt}/{MAX_PLAYWRIGHT_RETRIES} failed: {e} — retrying in 5s...")
-					await asyncio.sleep(5)
-					continue
-				logger.warning(f"[Playwright] All {MAX_PLAYWRIGHT_RETRIES} retries failed")
+	# Pull the JSON object out of the agent's text response
+	json_start = final.find('{')
+	json_end = final.rfind('}') + 1
+	if json_start == -1 or json_end == 0:
+		logger.error(f"[Parse] No JSON found in agent result: {final[:300]!r}")
+		return None
 
-	# Fall back to AI if Playwright errored OR returned no records (csv_file is None)
-	if scraper == "ai" or (scraper == "auto" and (not playwright_succeeded or csv_file is None)):
-		logger.info("Running browser-use AI scraper...")
-		csv_file = await _scrape_with_ai(auction_date, wait_after_scrape, foreclosure_base_url=foreclosure_base_url)
+	try:
+		data = json.loads(final[json_start:json_end])
+	except json.JSONDecodeError as e:
+		logger.error(f"[Parse] JSON decode failed: {e} | snippet: {final[json_start:json_end][:300]!r}")
+		return None
+
+	auctions = data.get("auctions", [])
+	if not auctions:
+		logger.info(f"[Parse] No auctions for {auction_date} — none scheduled or all cancelled")
+		return None
+
+	logger.info(f"[Parse] Agent extracted {len(auctions)} auction records")
+
+	df = pd.DataFrame(auctions)
+
+	# Normalise to canonical column names expected by ForeclosureLoader
+	rename_map = {
+		"case_number":      "Case Number",
+		"property_address": "Property Address",
+		"judgment_amount":  "Judgment Amount",
+		"parcel_id":        "Parcel ID",
+		"auction_type":     "Auction Type",
+		"auction_status":   "Auction Status",
+		"plaintiff":        "Plaintiff",
+		"defendant":        "Defendant",
+		"case_detail_url":  "Case Detail URL",
+	}
+	df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+	df["Auction Start Date/Time"] = auction_date.strftime("%Y-%m-%d")
+	df["county_id"] = county_id
+
+	return _save_new_foreclosures(df, auction_date, county_id)
+
+
+def _save_new_foreclosures(
+	df: pd.DataFrame,
+	auction_date: dt.date,
+	county_id: str,
+) -> Optional[Path]:
+	"""Deduplicate against DB and save new records to the county new/ directory."""
+	initial_count = len(df)
+	df_new = filter_new_records(df, "foreclosures")
+
+	if df_new.empty:
+		logger.info("All records already exist in DB — nothing new to save")
+		return None
+
+	new_dir = RAW_FORECLOSURE_DIR / county_id / "new"
+	new_dir.mkdir(parents=True, exist_ok=True)
+	out_path = new_dir / f"foreclosures_{county_id}_{auction_date:%Y%m%d}.csv"
+
+	df_new.to_csv(out_path, index=False)
+	logger.info(
+		f"Saved {len(df_new)} new records to {out_path} "
+		f"(filtered {initial_count - len(df_new)} existing)"
+	)
+	return out_path
+
+
+# ---------------------------------------------------------------------------
+# Pipeline
+# ---------------------------------------------------------------------------
+
+async def run_foreclosure_pipeline(
+	county_id: str = "hillsborough",
+	auction_date: Optional[dt.date] = None,
+	headful: bool = False,
+	load_to_db: bool = False,
+) -> Optional[Path]:
+	"""
+	County-agnostic foreclosure scrape for a single auction date.
+
+	Reads the foreclosures source from county config, generates a browser-use
+	agent task via LLM, runs the agent, parses the JSON result, deduplicates,
+	and optionally loads to DB.
+	"""
+	if auction_date is None:
+		auction_date = dt.date.today()
+
+	cfg = get_county_config(county_id)
+	source = cfg["sources"].get("foreclosures")
+	if not source:
+		logger.error(f"[{county_id}] No foreclosures source configured — add one via admin UI")
+		return None
+
+	if source.get("prr_only"):
+		logger.info(f"[{county_id}] Foreclosures source is PRR-only — load CSV manually")
+		return None
+
+	logger.info("=" * 70)
+	logger.info(f"FORECLOSURE PIPELINE — {cfg['display_name'].upper()}")
+	logger.info(f"Date: {auction_date}  headful={headful}  load_to_db={load_to_db}")
+	logger.info("=" * 70)
+
+	task = build_agent_task(source, auction_date)
+	history = await run_browser_agent(task, headful=headful)
+	csv_file = _parse_agent_result(history, auction_date, county_id)
+
+	if not csv_file:
+		logger.info("No new foreclosure records — nothing to load")
+		return None
+
+	if load_to_db:
+		_load_to_database(csv_file, county_id)
 
 	return csv_file
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+def _load_to_database(csv_file: Path, county_id: str) -> None:
+	"""Load scraped CSV into the foreclosures table via ForeclosureLoader."""
+	from src.core.database import get_db_context
+	from src.loaders.foreclosures import ForeclosureLoader
 
-def _parse_auction_date(date_str: Optional[str]) -> dt.date:
-	"""Parse YYYY-MM-DD string or default to today."""
+	logger.info("=" * 60)
+	logger.info("Loading foreclosures into database...")
+	logger.info("=" * 60)
+
+	try:
+		with get_db_context() as session:
+			loader = ForeclosureLoader(session, county_id=county_id)
+			matched, unmatched, skipped = loader.load_from_csv(
+				str(csv_file), skip_duplicates=True
+			)
+			session.commit()
+
+		total = matched + unmatched + skipped
+		match_rate = (matched / total * 100) if total > 0 else 0
+		logger.info(
+			f"Matched: {matched}  Unmatched: {unmatched}  "
+			f"Skipped: {skipped}  Match rate: {match_rate:.1f}%"
+		)
+
+		# Rescore affected properties immediately
+		try:
+			with get_db_context() as session:
+				loader2 = ForeclosureLoader(session, county_id=county_id)
+				affected_ids = loader2.get_affected_property_ids()
+			if affected_ids:
+				logger.info(f"Triggering CDS rescore for {len(affected_ids)} properties...")
+				from src.services.cds_engine import MultiVerticalScorer
+				from src.core.database import get_db_context as _gdb
+				with _gdb() as score_session:
+					scorer = MultiVerticalScorer(score_session)
+					scorer.score_properties_by_ids(affected_ids, save_to_db=True, county_id=county_id)
+					score_session.commit()
+				logger.info("CDS rescore complete")
+		except Exception as e:
+			logger.warning(f"CDS rescore failed (non-critical): {e}")
+
+	except Exception as e:
+		logger.error(f"Database load failed: {e}")
+		logger.debug(traceback.format_exc())
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _parse_date(date_str: Optional[str]) -> dt.date:
 	if date_str:
 		try:
 			return dt.datetime.strptime(date_str, "%Y-%m-%d").date()
-		except ValueError as e:
-			logger.error(f"Invalid date format '{date_str}': {e}")
+		except ValueError:
+			logger.error(f"Invalid date '{date_str}' — expected YYYY-MM-DD")
 			raise
 	return dt.date.today()
 
 
 def main():
 	parser = argparse.ArgumentParser(
-		description="Scrape Hillsborough RealForeclose auction calendar"
+		description="Foreclosure auction scraper — county-agnostic, browser-use only"
 	)
-	parser.add_argument(
-		"--date",
-		help="Auction date (YYYY-MM-DD). Defaults to today.",
-	)
-	parser.add_argument(
-		"--wait",
-		type=int,
-		default=10,
-		help="Seconds to wait after AI agent completes (AI path only, default: 10).",
-	)
-	parser.add_argument(
-		"--scraper",
-		choices=["auto", "playwright", "ai"],
-		default="auto",
-		help="Which scraper to use: auto (playwright → AI fallback), playwright only, ai only (default: auto)",
-	)
-	parser.add_argument(
-		"--debug",
-		action="store_true",
-		help="Save screenshots + HTML dumps to data/debug/playwright/foreclosures/",
-	)
-	parser.add_argument(
-		"--load-to-db",
-		action="store_true",
-		help="Automatically load scraped data into database after scraping",
-	)
-	parser.add_argument(
-		"--county-id",
-		dest="county_id",
-		default="hillsborough",
-		help="County identifier (default: hillsborough)",
-	)
+	parser.add_argument("--county-id", default="hillsborough",
+		help="County identifier (default: hillsborough)")
+	parser.add_argument("--date",
+		help="Auction date YYYY-MM-DD (default: today)")
+	parser.add_argument("--headful", action="store_true",
+		help="Run browser in visible mode")
+	parser.add_argument("--load-to-db", action="store_true",
+		help="Load scraped records into database after scraping")
 
 	args = parser.parse_args()
+	auction_date = _parse_date(args.date)
 
-	if args.debug:
-		logger.info("[DEBUG] Screenshot/HTML dumps enabled → data/debug/playwright/foreclosures/")
+	result = asyncio.run(run_foreclosure_pipeline(
+		county_id=args.county_id,
+		auction_date=auction_date,
+		headful=args.headful,
+		load_to_db=args.load_to_db,
+	))
 
-	try:
-		auction_date = _parse_auction_date(args.date)
-
-		result_file = asyncio.run(
-			scrape_realforeclose_calendar(
-				auction_date=auction_date,
-				wait_after_scrape=args.wait,
-				scraper=args.scraper,
-				county_id=args.county_id,
-			)
-		)
-
-		if not result_file:
-			logger.warning("No new foreclosure records to process today")
-			return
-
-		logger.info(f"Foreclosure data collected for {auction_date.strftime('%Y-%m-%d')}")
-		logger.info(f"Output file: {result_file}")
-
-		if args.load_to_db:
-			logger.info("\n" + "=" * 60)
-			logger.info("Loading foreclosures into database...")
-			logger.info("=" * 60)
-
-			try:
-				with get_db_context() as session:
-					loader = ForeclosureLoader(session)
-					matched, unmatched, skipped = loader.load_from_csv(
-						str(result_file),
-						skip_duplicates=True,
-					)
-					session.commit()
-
-					logger.info(f"\n{'='*60}")
-					logger.info("DATABASE LOAD SUMMARY")
-					logger.info(f"{'='*60}")
-					logger.info(f"  Matched:   {matched:>6}")
-					logger.info(f"  Unmatched: {unmatched:>6}")
-					logger.info(f"  Skipped:   {skipped:>6}")
-					total = matched + unmatched + skipped
-					match_rate = (matched / total * 100) if total > 0 else 0
-					logger.info(f"  Match Rate: {match_rate:>5.1f}%")
-					logger.info(f"{'='*60}\n")
-					logger.info("✓ Database load completed!")
-
-					# Rescore affected properties immediately
-					affected_ids = loader.get_affected_property_ids()
-					if affected_ids:
-						logger.info(f"Triggering CDS rescore for {len(affected_ids)} affected properties...")
-						try:
-							from src.services.cds_engine import MultiVerticalScorer
-							from src.core.database import get_db_context as _get_db
-							with _get_db() as score_session:
-								scorer = MultiVerticalScorer(score_session)
-								scorer.score_properties_by_ids(affected_ids, save_to_db=True)
-								score_session.commit()
-							logger.info("✓ CDS rescore completed")
-						except Exception as score_err:
-							logger.warning(f"⚠ CDS rescore failed (non-critical): {score_err}")
-
-				# Record stats
-				try:
-					from src.utils.scraper_db_helper import record_scraper_stats
-					record_scraper_stats(
-						source_type='foreclosures',
-						total_scraped=total,
-						matched=matched,
-						unmatched=unmatched,
-						skipped=skipped,
-						scored=len(affected_ids) if affected_ids else 0,
-					)
-				except Exception as stats_err:
-					logger.warning(f"⚠ Could not record scraper stats (non-critical): {stats_err}")
-
-			except Exception as e:
-				logger.error(f"Failed to load data to database: {e}")
-				logger.debug(traceback.format_exc())
-		else:
-			logger.info("\nSkipping database load (use --load-to-db flag to enable)")
-
-	except Exception as e:
-		logger.error(f"Error in main execution: {e}")
-		logger.debug(traceback.format_exc())
+	if result:
+		logger.info(f"Output: {result}")
+	else:
+		logger.info("No output file — nothing new or agent returned no data")
 
 
 if __name__ == "__main__":

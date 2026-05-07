@@ -47,28 +47,27 @@ RAW_DIVORCE_DIR = RAW_DATA_DIR / "divorce"
 TEMP_DOWNLOADS_DIR = Path(tempfile.gettempdir())
 
 # =============================================================================
-# PORTAL URLS — loaded from config/counties.json via county_config utility.
+# PORTAL URLS — legacy constants for scrapers not yet refactored to county_id.
 #
-# Use get_portal(county_id, key) in scraper functions instead of these
-# module-level constants. The constants below are kept only for modules
-# that have not yet been refactored to accept county_id.
+# Read directly from counties.json (no DB dependency at import time).
+# These constants are Hillsborough-only and will be removed after Task 5
+# scraper refactors replace them with get_county_config(county_id)["sources"].
 # =============================================================================
 
-from src.utils.county_config import get_county as _get_county
+_COUNTIES_JSON = Path(__file__).parent / "counties.json"
+_hc_portals = _json.loads(_COUNTIES_JSON.read_text())["hillsborough"]["portals"]
 
-_hc = _get_county("hillsborough")["portals"]
-
-HILLSCLERK_BASE_URL          = _hc["clerk_base_url"]
-HILLSCLERK_PUBLIC_ACCESS_URL = _hc["clerk_public_access_url"]
-CIVIL_FILINGS_URL            = _hc["civil_filings_url"]
-PROBATE_FILINGS_URL          = _hc["probate_filings_url"]
-ACCELA_BASE_URL              = _hc["accela_base_url"]
-PERMIT_SEARCH_URL            = _hc["permit_search_url"]
-VIOLATION_SEARCH_URL         = _hc["violation_search_url"]
-REALFORECLOSE_BASE_URL       = _hc["realforeclose_base_url"]
-TAX_COLLECTOR_BASE_URL       = _hc["tax_collector_base_url"]
-PARCEL_LOOKUP_URL            = _hc["parcel_lookup_url"]
-MASTER_DATA_URL              = _hc["master_data_url"]
+HILLSCLERK_BASE_URL          = _hc_portals["clerk_base_url"]
+HILLSCLERK_PUBLIC_ACCESS_URL = _hc_portals["clerk_public_access_url"]
+CIVIL_FILINGS_URL            = _hc_portals["civil_filings_url"]
+PROBATE_FILINGS_URL          = _hc_portals["probate_filings_url"]
+ACCELA_BASE_URL              = _hc_portals["accela_base_url"]
+PERMIT_SEARCH_URL            = _hc_portals["permit_search_url"]
+VIOLATION_SEARCH_URL         = _hc_portals["violation_search_url"]
+REALFORECLOSE_BASE_URL       = _hc_portals["realforeclose_base_url"]
+TAX_COLLECTOR_BASE_URL       = _hc_portals["tax_collector_base_url"]
+PARCEL_LOOKUP_URL            = _hc_portals["parcel_lookup_url"]
+MASTER_DATA_URL              = _hc_portals["master_data_url"]
 
 # =============================================================================
 # COURT LISTENER API - Federal Bankruptcy Court
@@ -109,6 +108,14 @@ DIVORCE_CASE_PATTERNS = [
     "Dissolution of Marriage",
     "Domestic Relations",
     "Family Law",
+]
+
+PROBATE_CASE_PATTERNS = [
+    "Probate",
+    "PR ",
+    "Estate",
+    "Guardianship",
+    "Trust Administration",
 ]
 
 # =============================================================================

@@ -5,12 +5,12 @@ Building permit loader.
 import logging
 import re
 from datetime import date
-from typing import Tuple
+from typing import Optional, Tuple
 
 import pandas as pd
 
 from src.loaders.base import BaseLoader
-from src.core.models import BuildingPermit
+from src.core.models import BuildingPermit, CountySource
 
 # Hillsborough County permit_type substrings that indicate an enforcement permit
 _ENFORCEMENT_TYPE_KEYWORDS = frozenset({
@@ -20,7 +20,8 @@ _ENFORCEMENT_TYPE_KEYWORDS = frozenset({
 # "awaiting client reply" = owner not responding, work stalled — strong distress signal
 # "expired" / "revoked" = permit lapsed without completion — owner stalled or non-compliant
 _ENFORCEMENT_STATUS_VALUES = frozenset({
-    "withdrawn", "cancel", "awaiting client reply", "expired", "revoked",
+    "withdrawn", "cancel", "awaiting client reply", "waiting on applicant",
+    "expired", "revoked",
 })
 
 # Status values that indicate completed work — not a lead, skip entirely
@@ -46,7 +47,37 @@ logger = logging.getLogger(__name__)
 
 class BuildingPermitLoader(BaseLoader):
     """Loader for building permits."""
-    
+
+    def load_from_csv(
+        self,
+        csv_path: str,
+        skip_duplicates: bool = True,
+    ) -> Tuple[int, int, int]:
+        """Load permits from CSV, applying ColumnMapper if a mapping exists."""
+        col_mapping = self._resolve_column_mapping(csv_path)
+        df = pd.read_csv(csv_path, dtype=str)
+        if col_mapping:
+            from src.loaders.column_mapper import ColumnMapper
+            df = ColumnMapper.apply(df, col_mapping)
+        return self.load_from_dataframe(df, skip_duplicates=skip_duplicates)
+
+    def _resolve_column_mapping(self, csv_path: str) -> Optional[dict]:
+        from src.loaders.column_mapper import ColumnMapper, SkipMapping, NeedsMappingError
+        src = self.session.query(CountySource).filter_by(
+            county_id=self.county_id, signal_type="permits"
+        ).first()
+        if src is None:
+            return None
+        sample_df = pd.read_csv(csv_path, dtype=str, nrows=5)
+        try:
+            mapper = ColumnMapper()
+            return mapper.get_or_create("permits", src.id, sample_df)
+        except SkipMapping:
+            return None
+        except NeedsMappingError as e:
+            logger.error("[BuildingPermitLoader] Column mapping required but LLM failed: %s", e)
+            raise
+
     def load_from_dataframe(
         self,
         df: pd.DataFrame,
@@ -144,3 +175,6 @@ class BuildingPermitLoader(BaseLoader):
         
         logger.info(f"Building Permits: {matched} matched, {unmatched} unmatched, {skipped} skipped")
         return matched, unmatched, skipped
+
+
+PermitLoader = BuildingPermitLoader

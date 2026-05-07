@@ -32,6 +32,9 @@ from sqlalchemy.orm import Session
 from config.settings import settings
 from src.core.database import get_db_context
 from src.core.models import (
+    County,
+    CountyColumnMapping,
+    CountySource,
     DistressScore,
     EnrichmentUsageLog,
     Owner,
@@ -41,6 +44,7 @@ from src.core.models import (
     Subscriber,
 )
 from src.loaders.tax import TaxDelinquencyLoader
+from src.utils.county_config import invalidate_cache
 
 logger = logging.getLogger(__name__)
 
@@ -556,3 +560,663 @@ def sku_margin_stats(
         out["windows"][window_key] = per_sku
 
     return out
+
+
+# ===========================================================================
+# DEV TOOLS GATE
+# ===========================================================================
+
+@router.get("/dev/ping")
+def dev_ping(_admin: dict = Depends(get_current_admin)):
+    """
+    Returns 200 if DEV_TOOLS_ENABLED=true, 403 otherwise.
+    The /dev frontend route calls this on mount — if it gets a 403 it shows
+    a locked screen instead of rendering the dev tools.
+    """
+    if not settings.dev_tools_enabled:
+        raise HTTPException(status_code=403, detail="Dev tools are disabled in this environment")
+    return {"enabled": True}
+
+
+# ===========================================================================
+# COUNTY MANAGEMENT
+# ===========================================================================
+# GET  /api/admin/counties                           — list all counties
+# POST /api/admin/counties                           — create county
+# GET  /api/admin/counties/{county_id}               — get single county
+# PATCH /api/admin/counties/{county_id}              — update county fields
+# DELETE /api/admin/counties/{county_id}             — soft-delete (is_active=False)
+# GET  /api/admin/counties/{county_id}/sources       — list sources for county
+# POST /api/admin/counties/{county_id}/sources       — add source
+# PUT  /api/admin/counties/{county_id}/sources/{id}  — update source
+# DELETE /api/admin/counties/{county_id}/sources/{id} — soft-delete source
+# ===========================================================================
+
+
+class CountyCreateRequest(BaseModel):
+    county_id: str
+    display_name: str
+    fips: Optional[str] = None
+    nws_zone: Optional[str] = None
+    parcel_id_format: str = "folio"
+    bankruptcy_division: Optional[str] = None
+    city_filer_keywords: list[str] = []
+    code_lien_type_map: dict = {}
+
+
+class CountyUpdateRequest(BaseModel):
+    display_name: Optional[str] = None
+    fips: Optional[str] = None
+    nws_zone: Optional[str] = None
+    parcel_id_format: Optional[str] = None
+    bankruptcy_division: Optional[str] = None
+    city_filer_keywords: Optional[list[str]] = None
+    code_lien_type_map: Optional[dict] = None
+    is_active: Optional[bool] = None
+
+
+class CountySourceCreateRequest(BaseModel):
+    signal_type: str
+    source_name: Optional[str] = None
+    url: str
+    description: Optional[str] = None
+    navigation_hint: Optional[str] = None
+    output_format: Optional[str] = None
+    date_range_available: bool = True
+    frequency: str = "daily"
+    special_flags: dict = {}
+    ori_column_map: Optional[dict] = None
+    ori_book_page_col: Optional[str] = None
+    ori_doc_type_map: Optional[dict] = None
+
+
+class CountySourceUpdateRequest(BaseModel):
+    source_name: Optional[str] = None
+    url: Optional[str] = None
+    description: Optional[str] = None
+    navigation_hint: Optional[str] = None
+    output_format: Optional[str] = None
+    date_range_available: Optional[bool] = None
+    frequency: Optional[str] = None
+    is_active: Optional[bool] = None
+    special_flags: Optional[dict] = None
+    ori_column_map: Optional[dict] = None
+    ori_book_page_col: Optional[str] = None
+    ori_doc_type_map: Optional[dict] = None
+
+
+def _county_to_dict(county: County) -> dict:
+    return {
+        "county_id":           county.county_id,
+        "display_name":        county.display_name,
+        "fips":                county.fips,
+        "nws_zone":            county.nws_zone,
+        "parcel_id_format":    county.parcel_id_format,
+        "bankruptcy_division": county.bankruptcy_division,
+        "city_filer_keywords": county.city_filer_keywords or [],
+        "code_lien_type_map":  county.code_lien_type_map or {},
+        "is_active":           county.is_active,
+        "created_at":          county.created_at.isoformat() if county.created_at else None,
+        "updated_at":          county.updated_at.isoformat() if county.updated_at else None,
+    }
+
+
+def _source_to_dict(src: CountySource) -> dict:
+    return {
+        "id":                   src.id,
+        "county_id":            src.county_id,
+        "signal_type":          src.signal_type,
+        "source_name":          src.source_name,
+        "url":                  src.url,
+        "description":          src.description,
+        "navigation_hint":      src.navigation_hint,
+        "output_format":        src.output_format,
+        "date_range_available": src.date_range_available,
+        "frequency":            src.frequency,
+        "is_active":            src.is_active,
+        "special_flags":        src.special_flags or {},
+        "ori_column_map":       src.ori_column_map or {},
+        "ori_book_page_col":    src.ori_book_page_col,
+        "ori_doc_type_map":     src.ori_doc_type_map or {},
+        "created_at":           src.created_at.isoformat() if src.created_at else None,
+        "updated_at":           src.updated_at.isoformat() if src.updated_at else None,
+    }
+
+
+@router.get("/counties")
+def list_counties(
+    include_inactive: bool = Query(False),
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    q = db.query(County)
+    if not include_inactive:
+        q = q.filter(County.is_active == True)
+    counties = q.order_by(County.county_id).all()
+    return [_county_to_dict(c) for c in counties]
+
+
+@router.post("/counties", status_code=201)
+def create_county(
+    body: CountyCreateRequest,
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    if db.query(County).filter_by(county_id=body.county_id).first():
+        raise HTTPException(status_code=409, detail=f"County '{body.county_id}' already exists")
+
+    county = County(
+        county_id=body.county_id,
+        display_name=body.display_name,
+        fips=body.fips,
+        nws_zone=body.nws_zone,
+        parcel_id_format=body.parcel_id_format,
+        bankruptcy_division=body.bankruptcy_division,
+        city_filer_keywords=body.city_filer_keywords,
+        code_lien_type_map=body.code_lien_type_map,
+        is_active=True,
+    )
+    db.add(county)
+    db.commit()
+    db.refresh(county)
+    logger.info("[Admin] County created: %s by %s", body.county_id, _admin.get("sub"))
+    invalidate_cache(body.county_id)
+    return _county_to_dict(county)
+
+
+@router.get("/counties/{county_id}")
+def get_county(
+    county_id: str,
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    county = db.query(County).filter_by(county_id=county_id).first()
+    if not county:
+        raise HTTPException(status_code=404, detail=f"County '{county_id}' not found")
+    return _county_to_dict(county)
+
+
+@router.patch("/counties/{county_id}")
+def update_county(
+    county_id: str,
+    body: CountyUpdateRequest,
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    county = db.query(County).filter_by(county_id=county_id).first()
+    if not county:
+        raise HTTPException(status_code=404, detail=f"County '{county_id}' not found")
+
+    updates = body.model_dump(exclude_none=True)
+    for field, value in updates.items():
+        setattr(county, field, value)
+
+    db.commit()
+    db.refresh(county)
+    logger.info("[Admin] County updated: %s fields=%s by %s", county_id, list(updates), _admin.get("sub"))
+    invalidate_cache(county_id)
+    return _county_to_dict(county)
+
+
+@router.delete("/counties/{county_id}", status_code=204)
+def deactivate_county(
+    county_id: str,
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    county = db.query(County).filter_by(county_id=county_id).first()
+    if not county:
+        raise HTTPException(status_code=404, detail=f"County '{county_id}' not found")
+    county.is_active = False
+    db.commit()
+    logger.info("[Admin] County deactivated: %s by %s", county_id, _admin.get("sub"))
+    invalidate_cache(county_id)
+
+
+# ---------------------------------------------------------------------------
+# Sources
+# ---------------------------------------------------------------------------
+
+@router.get("/counties/{county_id}/sources")
+def list_sources(
+    county_id: str,
+    include_inactive: bool = Query(False),
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    if not db.query(County).filter_by(county_id=county_id).first():
+        raise HTTPException(status_code=404, detail=f"County '{county_id}' not found")
+
+    q = db.query(CountySource).filter_by(county_id=county_id)
+    if not include_inactive:
+        q = q.filter(CountySource.is_active == True)
+    sources = q.order_by(CountySource.signal_type).all()
+    return [_source_to_dict(s) for s in sources]
+
+
+@router.post("/counties/{county_id}/sources", status_code=201)
+def add_source(
+    county_id: str,
+    body: CountySourceCreateRequest,
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    if not db.query(County).filter_by(county_id=county_id).first():
+        raise HTTPException(status_code=404, detail=f"County '{county_id}' not found")
+
+    existing = db.query(CountySource).filter_by(
+        county_id=county_id, signal_type=body.signal_type
+    ).first()
+    if existing and existing.is_active:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Active source for signal_type '{body.signal_type}' already exists in '{county_id}'",
+        )
+
+    src = CountySource(
+        county_id=county_id,
+        signal_type=body.signal_type,
+        source_name=body.source_name,
+        url=body.url,
+        description=body.description,
+        navigation_hint=body.navigation_hint,
+        output_format=body.output_format,
+        date_range_available=body.date_range_available,
+        frequency=body.frequency,
+        special_flags=body.special_flags,
+        ori_column_map=body.ori_column_map,
+        ori_book_page_col=body.ori_book_page_col,
+        ori_doc_type_map=body.ori_doc_type_map,
+        is_active=True,
+    )
+    db.add(src)
+    db.commit()
+    db.refresh(src)
+    logger.info(
+        "[Admin] Source added: county=%s signal=%s id=%s by %s",
+        county_id, body.signal_type, src.id, _admin.get("sub"),
+    )
+    invalidate_cache(county_id)
+    return _source_to_dict(src)
+
+
+@router.put("/counties/{county_id}/sources/{source_id}")
+def update_source(
+    county_id: str,
+    source_id: int,
+    body: CountySourceUpdateRequest,
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    src = db.query(CountySource).filter_by(id=source_id, county_id=county_id).first()
+    if not src:
+        raise HTTPException(status_code=404, detail=f"Source {source_id} not found in '{county_id}'")
+
+    updates = body.model_dump(exclude_none=True)
+    for field, value in updates.items():
+        setattr(src, field, value)
+
+    db.commit()
+    db.refresh(src)
+    logger.info(
+        "[Admin] Source updated: id=%s county=%s fields=%s by %s",
+        source_id, county_id, list(updates), _admin.get("sub"),
+    )
+    invalidate_cache(county_id)
+    return _source_to_dict(src)
+
+
+@router.delete("/counties/{county_id}/sources/{source_id}", status_code=204)
+def deactivate_source(
+    county_id: str,
+    source_id: int,
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    src = db.query(CountySource).filter_by(id=source_id, county_id=county_id).first()
+    if not src:
+        raise HTTPException(status_code=404, detail=f"Source {source_id} not found in '{county_id}'")
+    src.is_active = False
+    db.commit()
+    logger.info("[Admin] Source deactivated: id=%s county=%s by %s", source_id, county_id, _admin.get("sub"))
+    invalidate_cache(county_id)
+
+
+# ===========================================================================
+# COLUMN MAPPING APPROVAL WORKFLOW
+# ===========================================================================
+# GET   /api/admin/mappings/pending          — list pending (LLM-proposed, awaiting review)
+# GET   /api/admin/mappings/approved         — list all active approved mappings
+# GET   /api/admin/mappings/rejected         — list rejected mappings (queued for re-map)
+# GET   /api/admin/mappings/{id}             — single mapping detail
+# POST  /api/admin/mappings/{id}/approve     — approve a pending mapping
+# POST  /api/admin/mappings/{id}/reject      — reject mapping (with feedback for LLM)
+# PATCH /api/admin/mappings/{id}             — edit column assignments on any mapping
+# POST  /api/admin/mappings/preview-columns  — upload CSV/XLSX → get columns + sample rows
+# POST  /api/admin/mappings/manual           — save human-created mapping as approved
+# ===========================================================================
+
+
+def _mapping_to_dict(m: CountyColumnMapping) -> dict:
+    return {
+        "id":              m.id,
+        "source_id":       m.source_id,
+        "source_columns":  m.source_columns,
+        "mapping":         m.mapping,
+        "is_approved":     m.is_approved,
+        "mapped_by":       m.mapped_by,
+        "approved_by":     m.approved_by,
+        "approved_at":     m.approved_at.isoformat() if m.approved_at else None,
+        "sample_rows":     m.sample_rows,
+        "reject_feedback": m.reject_feedback,
+        "created_at":      m.created_at.isoformat() if m.created_at else None,
+        "updated_at":      m.updated_at.isoformat() if m.updated_at else None,
+    }
+
+
+@router.get("/mappings/pending")
+def list_pending_mappings(
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Return all column mappings awaiting approval, with their source info.
+    The LLM column mapper saves mappings as is_approved=False when it encounters
+    a new source or changed columns.
+    """
+    rows = (
+        db.query(CountyColumnMapping, CountySource)
+        .join(CountySource, CountySource.id == CountyColumnMapping.source_id)
+        .filter(
+            CountyColumnMapping.is_approved == False,
+            CountyColumnMapping.reject_feedback == None,
+        )
+        .order_by(CountyColumnMapping.created_at.desc())
+        .all()
+    )
+    return [
+        {
+            **_mapping_to_dict(mapping),
+            "source": _source_to_dict(source),
+        }
+        for mapping, source in rows
+    ]
+
+
+@router.get("/mappings/rejected")
+def list_rejected_mappings(
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Return all rejected column mappings (is_approved=False, reject_feedback set).
+    These are queued for LLM re-map on the next scrape run.
+    """
+    rows = (
+        db.query(CountyColumnMapping, CountySource)
+        .join(CountySource, CountySource.id == CountyColumnMapping.source_id)
+        .filter(
+            CountyColumnMapping.is_approved == False,
+            CountyColumnMapping.reject_feedback != None,
+        )
+        .order_by(CountyColumnMapping.created_at.desc())
+        .all()
+    )
+    return [
+        {
+            **_mapping_to_dict(mapping),
+            "source": _source_to_dict(source),
+        }
+        for mapping, source in rows
+    ]
+
+
+@router.get("/mappings/approved")
+def list_approved_mappings(
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Return all active approved mappings, one per source (most recently approved wins).
+    Used by the admin UI to browse and edit existing mappings.
+    """
+    from sqlalchemy import func as sqlfunc
+
+    # Subquery: latest approved_at per source_id
+    latest_subq = (
+        db.query(
+            CountyColumnMapping.source_id,
+            sqlfunc.max(CountyColumnMapping.approved_at).label("latest_approved_at"),
+        )
+        .filter(CountyColumnMapping.is_approved == True)
+        .group_by(CountyColumnMapping.source_id)
+        .subquery()
+    )
+
+    rows = (
+        db.query(CountyColumnMapping, CountySource)
+        .join(CountySource, CountySource.id == CountyColumnMapping.source_id)
+        .join(
+            latest_subq,
+            (CountyColumnMapping.source_id == latest_subq.c.source_id)
+            & (CountyColumnMapping.approved_at == latest_subq.c.latest_approved_at),
+        )
+        .order_by(CountySource.county_id, CountySource.signal_type)
+        .all()
+    )
+    return [
+        {
+            **_mapping_to_dict(mapping),
+            "source": _source_to_dict(source),
+        }
+        for mapping, source in rows
+    ]
+
+
+@router.get("/mappings/{mapping_id}")
+def get_mapping(
+    mapping_id: int,
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    mapping = db.query(CountyColumnMapping).filter_by(id=mapping_id).first()
+    if not mapping:
+        raise HTTPException(status_code=404, detail=f"Mapping {mapping_id} not found")
+    source = db.query(CountySource).filter_by(id=mapping.source_id).first()
+    return {**_mapping_to_dict(mapping), "source": _source_to_dict(source) if source else None}
+
+
+class MappingUpdateRequest(BaseModel):
+    column_updates: dict  # {source_col: new_canonical_or_passthrough} — merged into existing mapping
+
+
+@router.patch("/mappings/{mapping_id}")
+def update_mapping(
+    mapping_id: int,
+    body: MappingUpdateRequest,
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Edit column assignments on an existing mapping (approved or pending).
+
+    Merges body.column_updates into the stored mapping dict, then marks the
+    mapping as approved (so edits by the admin are always live immediately).
+    The approved_by / approved_at fields are updated to reflect the edit.
+
+    Use this to fix individual column assignments without re-running the LLM.
+    """
+    from datetime import datetime, timezone
+
+    mapping = db.query(CountyColumnMapping).filter_by(id=mapping_id).first()
+    if not mapping:
+        raise HTTPException(status_code=404, detail=f"Mapping {mapping_id} not found")
+
+    merged = dict(mapping.mapping)
+    merged.update(body.column_updates)
+    mapping.mapping = merged
+    mapping.is_approved = True
+    mapping.reject_feedback = None  # clear any prior rejection if editing back to approved
+    mapping.approved_by = _admin.get("sub")
+    mapping.approved_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(mapping)
+
+    logger.info(
+        "[Admin] Mapping updated: id=%s source_id=%s by %s cols_changed=%s",
+        mapping_id, mapping.source_id, _admin.get("sub"), list(body.column_updates.keys()),
+    )
+    return _mapping_to_dict(mapping)
+
+
+class MappingApproveRequest(BaseModel):
+    mapping_overrides: Optional[dict] = None  # optional admin corrections before approving
+
+
+class MappingRejectRequest(BaseModel):
+    feedback: str  # plain-English reason — returned to LLM on re-map
+
+
+@router.post("/mappings/{mapping_id}/approve")
+def approve_mapping(
+    mapping_id: int,
+    body: MappingApproveRequest,
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Approve a pending column mapping. Optional mapping_overrides let the admin
+    correct individual column assignments before approving — the overrides are
+    merged into the LLM-proposed mapping before saving.
+    """
+    from datetime import datetime, timezone
+
+    mapping = db.query(CountyColumnMapping).filter_by(id=mapping_id).first()
+    if not mapping:
+        raise HTTPException(status_code=404, detail=f"Mapping {mapping_id} not found")
+    if mapping.is_approved:
+        raise HTTPException(status_code=409, detail="Mapping is already approved")
+
+    if body.mapping_overrides:
+        merged = dict(mapping.mapping)
+        merged.update(body.mapping_overrides)
+        mapping.mapping = merged
+
+    mapping.is_approved = True
+    mapping.approved_by = _admin.get("sub")
+    mapping.approved_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(mapping)
+
+    logger.info(
+        "[Admin] Mapping approved: id=%s source_id=%s by %s overrides=%s",
+        mapping_id, mapping.source_id, _admin.get("sub"), bool(body.mapping_overrides),
+    )
+    return _mapping_to_dict(mapping)
+
+
+@router.post("/mappings/{mapping_id}/reject")
+def reject_mapping(
+    mapping_id: int,
+    body: MappingRejectRequest,
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Reject a pending mapping. The feedback string is stored on the mapping row
+    so the LLM column mapper can incorporate it on the next re-map attempt.
+    The rejected mapping is left in the table (is_approved=False) — the mapper
+    will create a new pending mapping on the next scrape run.
+    """
+    mapping = db.query(CountyColumnMapping).filter_by(id=mapping_id).first()
+    if not mapping:
+        raise HTTPException(status_code=404, detail=f"Mapping {mapping_id} not found")
+
+    mapping.reject_feedback = body.feedback
+    db.commit()
+
+    logger.info(
+        "[Admin] Mapping rejected: id=%s source_id=%s by %s feedback=%r",
+        mapping_id, mapping.source_id, _admin.get("sub"), body.feedback[:100],
+    )
+    return {"status": "rejected", "mapping_id": mapping_id, "feedback": body.feedback}
+
+
+# ---------------------------------------------------------------------------
+# Column Mapping — admin-created (human) mappings
+# ---------------------------------------------------------------------------
+
+@router.post("/mappings/preview-columns")
+async def preview_columns(
+    file: UploadFile,
+    _admin: dict = Depends(get_current_admin),
+):
+    """
+    Accept a CSV or XLSX file upload and return its column names plus the first
+    5 rows as sample data.  Used by the admin UI to populate the manual mapping form.
+    """
+    import io
+    import pandas as pd
+
+    contents = await file.read()
+    filename = (file.filename or "").lower()
+
+    try:
+        if filename.endswith(".xlsx") or filename.endswith(".xls"):
+            df = pd.read_excel(io.BytesIO(contents), dtype=str, nrows=5)
+        else:
+            df = pd.read_csv(io.BytesIO(contents), dtype=str, nrows=5)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Could not parse file: {e}")
+
+    df.columns = df.columns.str.strip()
+    sample_rows = df.fillna("").astype(str).to_dict("records")
+
+    return {
+        "columns": list(df.columns),
+        "sample_rows": sample_rows,
+    }
+
+
+class ManualMappingRequest(BaseModel):
+    source_id: int
+    mapping: dict          # {source_col: canonical_col}
+    sample_rows: Optional[list] = None  # optional — populated from preview-columns step
+
+
+@router.post("/mappings/manual")
+def create_manual_mapping(
+    body: ManualMappingRequest,
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Save a human-created column mapping as immediately approved.
+    Supersedes any existing approved mapping for the same source.
+    """
+    from datetime import datetime, timezone
+
+    source = db.query(CountySource).filter_by(id=body.source_id).first()
+    if not source:
+        raise HTTPException(status_code=404, detail=f"Source {body.source_id} not found")
+
+    now = datetime.now(timezone.utc)
+    row = CountyColumnMapping(
+        source_id=body.source_id,
+        source_columns=sorted(body.mapping.keys()),
+        mapping=body.mapping,
+        is_approved=True,
+        mapped_by="human",
+        approved_by=_admin.get("sub"),
+        approved_at=now,
+        sample_rows=body.sample_rows,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+
+    logger.info(
+        "[Admin] Manual mapping saved: id=%s source_id=%s by %s",
+        row.id, row.source_id, _admin.get("sub"),
+    )
+    return _mapping_to_dict(row)

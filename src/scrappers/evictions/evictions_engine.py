@@ -1,25 +1,23 @@
 """
-Eviction Filing Data Collection Pipeline
+Eviction Filing Data Collection Pipeline — county-agnostic
 
-This module automates the download and processing of Hillsborough County eviction
-daily filings from the Civil Court daily filings page. It retrieves the latest 
-civil filing CSV from the county clerk's website, filters for eviction-related cases,
-and saves them to the processed data directory.
+Downloads civil filings from the county clerk portal, filters for eviction
+case types, deduplicates against existing DB records, and saves results.
 
-The pipeline performs the following steps:
-    1. Fetches the directory listing of available civil filing CSVs
-    2. Identifies and downloads the most recent file based on date
-    3. Loads and processes the CSV data with multi-encoding support
-    4. Filters for eviction-related cases (LT Residential Eviction types)
-    5. Saves the filtered eviction data to the output directory
+For Hillsborough: requests-based directory listing of daily CSV files.
+For Pinellas (output_format=excel): browser-use agent navigates the clerk
+portal, searches by date range, and downloads the Excel export.
 
-Author: Distressed Property Intelligence Platform
+Usage:
+    python -m src.scrappers.evictions.evictions_engine --county-id hillsborough --load-to-db
+    python -m src.scrappers.evictions.evictions_engine --county-id pinellas --load-to-db --headful
 """
 
+import asyncio
 import re
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -29,455 +27,349 @@ from bs4 import BeautifulSoup
 from src.utils.http_helpers import requests_get_with_retry
 
 from config.constants import (
-	RAW_EVICTIONS_DIR,
-	EVICTION_CASE_PATTERNS,
-	CIVIL_FILING_PATTERN,
-	DEFAULT_USER_AGENT,
-	REQUEST_TIMEOUT_DEFAULT,
-	REQUEST_TIMEOUT_LONG,
-	OUTPUT_DATE_FORMAT,
-	OUTPUT_SEPARATOR,
+    RAW_EVICTIONS_DIR,
+    EVICTION_CASE_PATTERNS,
+    CIVIL_FILING_PATTERN,
+    CIVIL_FILINGS_URL,
+    HILLSCLERK_BASE_URL,
+    DEFAULT_USER_AGENT,
+    REQUEST_TIMEOUT_DEFAULT,
+    REQUEST_TIMEOUT_LONG,
+    OUTPUT_DATE_FORMAT,
+    OUTPUT_SEPARATOR,
+    BROWSER_MODEL,
+    BROWSER_TEMPERATURE,
 )
-from src.utils.county_config import get_county as _get_county
+from src.utils.county_config import get_county_config as _get_county
 from src.utils.logger import setup_logging, get_logger
 from src.utils.db_deduplicator import filter_new_records
 
-# Initialize logging
 setup_logging()
 logger = get_logger(__name__)
 
+_STEALTH_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/136.0.0.0 Safari/537.36"
+)
+
+
+def _make_llm():
+    from browser_use import ChatAnthropic
+    from config.settings import get_settings
+    settings = get_settings()
+    return ChatAnthropic(
+        model=BROWSER_MODEL,
+        temperature=BROWSER_TEMPERATURE,
+        api_key=settings.anthropic_api_key.get_secret_value(),
+    )
+
+
+def _get_court_source(county_id: str) -> dict:
+    """Return the court_records source dict for county_id (empty dict if absent)."""
+    cfg = _get_county(county_id)
+    return cfg.get("sources", {}).get("court_records", {})
+
+
+async def _download_civil_filing_browser(
+    county_id: str, source: dict, target_date: str | None, dest_dir: Path
+) -> Path:
+    """
+    Browser-use agent download for counties whose civil portal requires a browser
+    (output_format='excel', e.g. Pinellas courtrecords.mypinellasclerk.gov).
+    Returns the path to the downloaded file.
+    """
+    from browser_use import Agent, Browser
+    from playwright_stealth import Stealth
+    from src.utils.http_helpers import get_browser_use_proxy
+
+    if target_date:
+        target_dt = datetime.strptime(target_date.replace("-", ""), "%Y%m%d")
+        start_str = end_str = target_dt.strftime("%m/%d/%Y")
+    else:
+        end_dt = datetime.now()
+        start_str = (end_dt - timedelta(days=1)).strftime("%m/%d/%Y")
+        end_str = end_dt.strftime("%m/%d/%Y")
+
+    url = source.get("url", "")
+    nav_hint = source.get("navigation_hint") or ""
+    task = (
+        f"Go to {url}. "
+        f"Search for civil court filings filed between {start_str} and {end_str}. "
+        f"Export or download the full results as a file (Excel or CSV). "
+        f"Wait for the download to complete. "
+        f"Do not open new tabs or navigate away from the portal."
+    )
+    if nav_hint:
+        task += f"\n\nPortal navigation hint: {nav_hint}"
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    browser = Browser(
+        headless=True,
+        disable_security=True,
+        proxy=get_browser_use_proxy(),
+        downloads_path=str(dest_dir),
+        user_agent=_STEALTH_UA,
+        ignore_default_args=["--enable-automation"],
+        enable_default_extensions=True,
+        minimum_wait_page_load_time=1.5,
+        wait_between_actions=1.0,
+        args=["--no-sandbox", "--disable-blink-features=AutomationControlled", "--window-size=1920,1080"],
+    )
+    await browser.start()
+    stealth = Stealth(
+        chrome_runtime=True, navigator_webdriver=True, navigator_plugins=True, webgl_vendor=True,
+        webgl_vendor_override="Google Inc. (Intel)",
+        webgl_renderer_override="ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+    )
+    await browser._cdp_add_init_script(stealth.script_payload)
+    logger.info("[evictions] Stealth fingerprint patches injected")
+
+    start_time = time.time()
+    agent = Agent(task=task, llm=_make_llm(), browser=browser, max_steps=60, use_judge=False)
+    try:
+        history = await agent.run()
+        if not history.is_done():
+            logger.warning("[evictions] Browser agent did not complete within step budget")
+    except Exception as e:
+        logger.error("[evictions] Browser agent failed: %s", e)
+        raise
+
+    await asyncio.sleep(5)
+    candidates = [
+        p for p in dest_dir.iterdir()
+        if p.stat().st_mtime >= start_time and p.suffix.lower() in (".xlsx", ".xls", ".csv")
+    ]
+    if not candidates:
+        raise FileNotFoundError(f"[evictions] No downloaded civil filing found in {dest_dir}")
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
 
 def download_latest_civil_filing(target_date: str = None, county_id: str = "hillsborough") -> Path:
-	"""
-	Download the latest civil filing CSV from Hillsborough County Clerk.
-	
-	This function fetches the directory listing from the civil filings page,
-	identifies the most recent filing based on date in the filename, and downloads
-	the corresponding CSV file to the raw data directory.
-	
-	Returns:
-		Path: Path object pointing to the downloaded CSV file
-		
-	Raises:
-		ValueError: If no civil filing files are found or no valid dates can be parsed
-		requests.HTTPError: If the HTTP request fails
-		requests.Timeout: If the request times out
-		
-	Example:
-		>>> csv_path = download_latest_civil_filing()
-		>>> print(f"Downloaded to: {csv_path}")
-	"""
-	_county = _get_county(county_id)
-	_civil_filings_url = _county["portals"]["civil_filings_url"]
-	_clerk_base_url = _county["portals"]["clerk_base_url"]
+    """
+    Download the latest civil filing from the county clerk.
+    Hillsborough: requests-based directory listing → CSV.
+    Other counties (output_format=excel, e.g. Pinellas): browser-use → Excel.
+    """
+    source = _get_court_source(county_id)
+    output_format = source.get("output_format", "csv")
 
-	logger.info(f"Fetching civil filings list from: {_civil_filings_url}")
+    if output_format == "excel":
+        logger.info("[evictions] County '%s' uses browser download (output_format=excel)", county_id)
+        return asyncio.run(
+            _download_civil_filing_browser(county_id, source, target_date, RAW_EVICTIONS_DIR)
+        )
 
-	try:
-		# Ensure download directory exists
-		RAW_EVICTIONS_DIR.mkdir(parents=True, exist_ok=True)
-		logger.debug(f"Ensured download directory exists: {RAW_EVICTIONS_DIR}")
+    # Hillsborough / CSV directory-listing path
+    _county = _get_county(county_id)
+    _civil_filings_url = _county["urls"].get("civil") or CIVIL_FILINGS_URL
+    _clerk_base_url = _county["urls"].get("clerk_base") or HILLSCLERK_BASE_URL
 
-		# Fetch the directory listing page
-		response = requests_get_with_retry(
-			_civil_filings_url,
-			headers={"User-Agent": DEFAULT_USER_AGENT},
-			timeout=REQUEST_TIMEOUT_DEFAULT,
-		)
-		logger.debug(f"Successfully fetched directory listing (status code: {response.status_code})")
-		
-	except requests.Timeout as e:
-		logger.error(f"Request timed out while fetching civil filings list: {e}")
-		raise
-	except requests.HTTPError as e:
-		logger.error(f"HTTP error occurred while fetching civil filings list: {e}")
-		raise
-	except requests.RequestException as e:
-		logger.error(f"Request error occurred while fetching civil filings list: {e}")
-		raise
-	
-	try:
-		# Parse HTML to find CSV files
-		soup = BeautifulSoup(response.content, "html.parser")
-		file_links = []
-		
-		for link in soup.find_all("a", href=True):
-			href = link["href"]
-			# Look for CivilFiling_YYYYMMDD.csv pattern
-			if "CivilFiling_" in href and href.endswith(".csv"):
-				file_links.append(href)
-		
-		if not file_links:
-			logger.error("No civil filing CSV files found on the page")
-			raise ValueError("No civil filing CSV files found on the page")
-		
-		logger.info(f"Found {len(file_links)} civil filing files")
-		
-		# Extract dates from filenames and find the latest
-		date_pattern = re.compile(CIVIL_FILING_PATTERN)
-		files_with_dates = []
-		
-		for file_link in file_links:
-			match = date_pattern.search(file_link)
-			if match:
-				date_str = match.group(1)
-				try:
-					file_date = datetime.strptime(date_str, "%Y%m%d")
-					files_with_dates.append((file_date, file_link))
-				except ValueError:
-					logger.warning(f"Could not parse date from filename: {file_link}")
-					continue
-		
-		if not files_with_dates:
-			logger.error("No valid dated civil files found")
-			raise ValueError("No valid dated civil files found")
-		
-		# Sort by date and get the latest
-		files_with_dates.sort(key=lambda x: x[0], reverse=True)
-		if target_date:
-			target_dt = datetime.strptime(target_date.replace("-", ""), "%Y%m%d")
-			match = [(d, f) for d, f in files_with_dates if d.date() == target_dt.date()]
-			if not match:
-				from src.utils.scraper_exceptions import ScraperNoDataError
-				raise ScraperNoDataError(f"No civil filing found for date: {target_date}")
-			latest_date, latest_file = match[0]
-		else:
-			latest_date, latest_file = files_with_dates[0]
-		
-		logger.info(f"Latest civil filing: {latest_file} (Date: {latest_date.strftime('%Y-%m-%d')})")
-		
-	except Exception as e:
-		logger.error(f"Error parsing HTML or extracting file information: {e}")
-		raise
-	
-	try:
-		# Construct full URL
-		if latest_file.startswith("/"):
-			download_url = f"{_clerk_base_url}{latest_file}"
-		else:
-			download_url = f"{_civil_filings_url.rstrip('/')}/{latest_file}"
-		
-		# Download the file
-		filename = Path(latest_file).name
-		output_path = RAW_EVICTIONS_DIR / filename
-		
-		logger.info(f"Downloading civil filing from: {download_url}")
-		file_response = requests_get_with_retry(
-			download_url,
-			headers={"User-Agent": DEFAULT_USER_AGENT},
-			timeout=REQUEST_TIMEOUT_LONG,
-		)
-		
-		# Save to disk
-		output_path.write_bytes(file_response.content)
-		file_size_kb = output_path.stat().st_size / 1024
-		logger.info(f"Downloaded to: {output_path} (Size: {file_size_kb:.2f} KB)")
-		
-		return output_path
-		
-	except requests.Timeout as e:
-		logger.error(f"Request timed out while downloading file: {e}")
-		raise
-	except requests.HTTPError as e:
-		logger.error(f"HTTP error occurred while downloading file: {e}")
-		raise
-	except IOError as e:
-		logger.error(f"I/O error occurred while writing file: {e}")
-		raise
-	except Exception as e:
-		logger.error(f"Unexpected error during file download: {e}")
-		raise
+    logger.info("[evictions] Fetching civil filings list from: %s", _civil_filings_url)
+    RAW_EVICTIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+    response = requests_get_with_retry(
+        _civil_filings_url,
+        headers={"User-Agent": DEFAULT_USER_AGENT},
+        timeout=REQUEST_TIMEOUT_DEFAULT,
+    )
+    soup = BeautifulSoup(response.content, "html.parser")
+    file_links = [
+        link["href"]
+        for link in soup.find_all("a", href=True)
+        if "CivilFiling_" in link["href"] and link["href"].endswith(".csv")
+    ]
+    if not file_links:
+        raise ValueError("[evictions] No civil filing CSV files found on the page")
+
+    date_pattern = re.compile(CIVIL_FILING_PATTERN)
+    files_with_dates = []
+    for href in file_links:
+        m = date_pattern.search(href)
+        if m:
+            try:
+                files_with_dates.append((datetime.strptime(m.group(1), "%Y%m%d"), href))
+            except ValueError:
+                continue
+    if not files_with_dates:
+        raise ValueError("[evictions] No valid dated civil files found")
+    files_with_dates.sort(key=lambda x: x[0], reverse=True)
+
+    if target_date:
+        target_dt = datetime.strptime(target_date.replace("-", ""), "%Y%m%d")
+        matches = [(d, f) for d, f in files_with_dates if d.date() == target_dt.date()]
+        if not matches:
+            from src.utils.scraper_exceptions import ScraperNoDataError
+            raise ScraperNoDataError(f"No civil filing found for date: {target_date}")
+        latest_date, latest_file = matches[0]
+    else:
+        latest_date, latest_file = files_with_dates[0]
+
+    logger.info("[evictions] Selected civil filing: %s (%s)", latest_file, latest_date.strftime("%Y-%m-%d"))
+    download_url = (
+        f"{_clerk_base_url}{latest_file}"
+        if latest_file.startswith("/")
+        else f"{_civil_filings_url.rstrip('/')}/{latest_file}"
+    )
+    output_path = RAW_EVICTIONS_DIR / Path(latest_file).name
+    file_response = requests_get_with_retry(
+        download_url,
+        headers={"User-Agent": DEFAULT_USER_AGENT},
+        timeout=REQUEST_TIMEOUT_LONG,
+    )
+    output_path.write_bytes(file_response.content)
+    logger.info("[evictions] Downloaded to: %s (%.1f KB)", output_path, output_path.stat().st_size / 1024)
+    return output_path
 
 
-def process_civil_data(csv_path: Path) -> pd.DataFrame:
-	"""
-	Load and process the civil filing CSV file with multi-encoding support.
-	
-	This function attempts to load the CSV file using multiple encodings
-	(UTF-8, Latin-1, and CP1252) to handle various character sets that
-	may be present in the source data.
-	
-	Args:
-		csv_path: Path object pointing to the civil filing CSV file
-		
-	Returns:
-		pd.DataFrame: Loaded and parsed civil filing records as a DataFrame
-		
-	Raises:
-		ValueError: If the CSV cannot be read with any standard encoding
-		FileNotFoundError: If the specified file does not exist
-		pd.errors.ParserError: If the CSV structure is invalid
-		
-	Example:
-		>>> df = process_civil_data(Path("data/raw/evictions/CivilFiling_20260219.csv"))
-		>>> print(f"Loaded {len(df)} records")
-	"""
-	logger.info(f"Loading civil filing data from: {csv_path}")
-	
-	if not csv_path.exists():
-		logger.error(f"Civil filing CSV file not found: {csv_path}")
-		raise FileNotFoundError(f"Civil filing CSV file not found: {csv_path}")
-	
-	# Try multiple encodings
-	encodings_to_try = ["utf-8", "latin1", "cp1252"]
-	df = None
-	
-	for encoding in encodings_to_try:
-		try:
-			df = pd.read_csv(csv_path, encoding=encoding)
-			logger.info(f"Successfully loaded CSV with {encoding} encoding")
-			break
-		except (UnicodeDecodeError, pd.errors.ParserError) as e:
-			logger.debug(f"Failed to load with {encoding} encoding: {e}")
-			continue
-	
-	if df is None:
-		error_msg = f"Could not read CSV with any standard encoding: {csv_path}"
-		logger.error(error_msg)
-		raise ValueError(error_msg)
-	
-	logger.info(f"Loaded {len(df)} civil filing records")
-	logger.debug(f"DataFrame columns: {list(df.columns)}")
-	
-	return df
+def process_civil_data(file_path: Path, county_id: str = "hillsborough") -> pd.DataFrame:
+    """Load the civil filing (CSV or Excel) with multi-encoding support."""
+    source = _get_court_source(county_id)
+    output_format = source.get("output_format", "csv")
+
+    if output_format == "excel" or file_path.suffix.lower() in (".xlsx", ".xls"):
+        logger.info("[evictions] Reading Excel civil filing: %s", file_path)
+        return pd.read_excel(file_path)
+
+    logger.info("[evictions] Loading civil filing from: %s", file_path)
+    encodings = ["utf-8", "latin1", "cp1252"]
+    for enc in encodings:
+        try:
+            df = pd.read_csv(file_path, encoding=enc)
+            logger.info("[evictions] Loaded %d records (%s)", len(df), enc)
+            return df
+        except (UnicodeDecodeError, pd.errors.ParserError):
+            continue
+    raise ValueError(f"[evictions] Could not read civil filing with any standard encoding: {file_path}")
 
 
-def filter_evictions(df: pd.DataFrame) -> pd.DataFrame:
-	"""
-	Filter civil filing data to include only eviction-related cases.
-	
-	This function filters the DataFrame to retain only records where the
-	CaseTypeDescription contains eviction-related keywords. Common patterns
-	include "LT Residential Eviction", "LT Commercial Eviction", etc.
-	
-	Args:
-		df: DataFrame containing all civil filing records
-		
-	Returns:
-		pd.DataFrame: Filtered DataFrame containing only eviction cases
-		
-	Raises:
-		KeyError: If the expected 'CaseTypeDescription' column is not found
-		
-	Example:
-		>>> evictions_df = filter_evictions(civil_df)
-		>>> print(f"Found {len(evictions_df)} eviction cases")
-	"""
-	logger.info("Filtering for eviction cases")
-	
-	# Check if required column exists
-	if "CaseTypeDescription" not in df.columns:
-		logger.error("Column 'CaseTypeDescription' not found in CSV")
-		logger.debug(f"Available columns: {list(df.columns)}")
-		raise KeyError("Column 'CaseTypeDescription' not found in CSV")
-	
-	# Create filter mask for eviction patterns
-	eviction_mask = df["CaseTypeDescription"].str.contains(
-		"|".join(EVICTION_CASE_PATTERNS),
-		case=False,
-		na=False
-	)
-	
-	evictions_df = df[eviction_mask].copy()
-	
-	logger.info(f"Filtered {len(evictions_df)} eviction records from {len(df)} total civil filings")
-	
-	if len(evictions_df) > 0:
-		# Log case type breakdown
-		case_type_counts = evictions_df["CaseTypeDescription"].value_counts()
-		logger.info("Eviction case type breakdown:")
-		for case_type, count in case_type_counts.items():
-			logger.info(f"  {case_type}: {count}")
-	else:
-		logger.warning("No eviction cases found in the civil filing data")
-	
-	return evictions_df
+def filter_evictions(df: pd.DataFrame, county_id: str = "hillsborough") -> pd.DataFrame:
+    """
+    Filter civil filing data to include only eviction-related cases.
+    Uses style_col from county source config as the filter column
+    (default: CaseTypeDescription for Hillsborough).
+    """
+    source = _get_court_source(county_id)
+    style_col = source.get("style_col", "CaseTypeDescription")
+
+    if style_col not in df.columns:
+        logger.error("[evictions] Column '%s' not found — columns: %s", style_col, list(df.columns))
+        raise KeyError(f"Column '{style_col}' not found in civil filing")
+
+    mask = df[style_col].str.contains("|".join(EVICTION_CASE_PATTERNS), case=False, na=False)
+    evictions_df = df[mask].copy()
+    logger.info("[evictions] Filtered %d eviction records from %d total (col: %s)",
+                len(evictions_df), len(df), style_col)
+    return evictions_df
 
 
 def save_processed_evictions(df: pd.DataFrame, output_filename: str = "eviction_leads.csv") -> Path:
-	"""
-	Save processed eviction data to the output directory with deduplication.
-	
-	This function creates the processed data directory if it doesn't exist,
-	deduplicates against existing CSV files, and saves the DataFrame as a CSV
-	file with the specified filename.
-	
-	Args:
-		df: DataFrame containing processed eviction records
-		output_filename: Name for the output CSV file (default: "eviction_leads.csv")
-		
-	Returns:
-		Path: Path object pointing to the saved deduplicated CSV file
-		
-	Raises:
-		IOError: If the file cannot be written to disk
-		PermissionError: If there are insufficient permissions to write the file
-		
-	Example:
-		>>> output_path = save_processed_evictions(df, "evictions_20260219.csv")
-		>>> print(f"Saved to: {output_path}")
-	"""
-	try:
-		RAW_EVICTIONS_DIR.mkdir(parents=True, exist_ok=True)
-		logger.debug(f"Ensured evictions directory exists: {RAW_EVICTIONS_DIR}")
-		
-		# Check DB for existing eviction cases (deduplicate BEFORE CSV save)
-		logger.info("=" * 60)
-		logger.info("DB DEDUPLICATION: Checking for existing evictions")
-		logger.info("=" * 60)
-		
-		initial_count = len(df)
-		df_new = filter_new_records(df, 'evictions', record_type='Eviction')
-		
-		if df_new.empty:
-			logger.info("✓ All evictions already exist in database - nothing new")
-			return None
-		
-		# Save only NEW evictions
-		new_dir = RAW_EVICTIONS_DIR / "new"
-		new_dir.mkdir(parents=True, exist_ok=True)
-		final_file = new_dir / output_filename
-		
-		df_new.to_csv(final_file, index=False)
-		logger.info(f"Saved {len(df_new)} NEW evictions to {final_file}")
-		logger.info(f"Filtered {initial_count - len(df_new)} existing records")
-		
-		return final_file
-		
-	except PermissionError as e:
-		logger.error(f"Permission denied when writing file: {e}")
-		raise
-	except IOError as e:
-		logger.error(f"I/O error occurred while writing file: {e}")
-		raise
-	except Exception as e:
-		logger.error(f"Unexpected error saving processed evictions: {e}")
-		raise
+    """Save processed eviction data with dedup against DB."""
+    RAW_EVICTIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+    initial_count = len(df)
+    df_new = filter_new_records(df, "evictions", record_type="Eviction")
+
+    if df_new.empty:
+        logger.info("[evictions] All evictions already in DB — nothing new")
+        return None
+
+    new_dir = RAW_EVICTIONS_DIR / "new"
+    new_dir.mkdir(parents=True, exist_ok=True)
+    final_file = new_dir / output_filename
+    df_new.to_csv(final_file, index=False)
+    logger.info("[evictions] Saved %d new evictions (filtered %d existing)", len(df_new), initial_count - len(df_new))
+    return final_file
 
 
 def run_eviction_pipeline(target_date: str = None, county_id: str = "hillsborough") -> bool:
-	"""
-	Execute the complete eviction data collection pipeline.
+    """Full pipeline: download → load → filter → dedup → save. Returns True on success."""
+    t0 = time.monotonic()
+    try:
+        logger.info(OUTPUT_SEPARATOR)
+        logger.info("%s EVICTION DATA COLLECTION PIPELINE", county_id.upper())
+        logger.info(OUTPUT_SEPARATOR)
 
-	This function orchestrates the entire workflow:
-	    1. Downloads the latest civil filing CSV
-	    2. Loads and processes the data
-	    3. Filters for eviction cases only
-	    4. Saves the filtered results
+        file_path = download_latest_civil_filing(target_date=target_date, county_id=county_id)
+        civil_df = process_civil_data(file_path, county_id=county_id)
+        evictions_df = filter_evictions(civil_df, county_id=county_id)
 
-	Returns:
-		bool: True if the pipeline executed successfully, False otherwise
+        if len(evictions_df) == 0:
+            logger.warning("[evictions] No eviction cases found")
+            try:
+                from src.utils.scraper_db_helper import record_scraper_stats
+                record_scraper_stats(
+                    source_type="evictions", total_scraped=0, matched=0, unmatched=0, skipped=0,
+                    run_success=True, error_type="no_data",
+                    duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id,
+                )
+            except Exception as _se:
+                logger.warning("[evictions] Could not record scraper stats: %s", _se)
+            return False
 
-	Example:
-		>>> success = run_eviction_pipeline()
-		>>> if success:
-		>>>     print("Eviction pipeline completed successfully")
-	"""
-	t0 = time.monotonic()
-	try:
-		logger.info(OUTPUT_SEPARATOR)
-		logger.info("STARTING EVICTION DATA COLLECTION PIPELINE")
-		logger.info(OUTPUT_SEPARATOR)
+        today = datetime.now().strftime(OUTPUT_DATE_FORMAT)
+        output_path = save_processed_evictions(evictions_df, f"eviction_leads_{today}.csv")
 
-		# Step 1: Download latest civil filing
-		logger.info("\n[STEP 1/4] Downloading latest civil filing...")
-		csv_path = download_latest_civil_filing(target_date=target_date, county_id=county_id)
+        logger.info(OUTPUT_SEPARATOR)
+        logger.info("EVICTION PIPELINE COMPLETED — %d records, output: %s", len(evictions_df), output_path)
+        logger.info(OUTPUT_SEPARATOR)
 
-		# Step 2: Load and process the data
-		logger.info("\n[STEP 2/4] Loading and processing civil filing data...")
-		civil_df = process_civil_data(csv_path)
+        try:
+            from src.utils.scraper_db_helper import record_scraper_stats
+            record_scraper_stats(
+                source_type="evictions", total_scraped=len(evictions_df), matched=0, unmatched=0, skipped=0,
+                run_success=True, duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id,
+            )
+        except Exception as _se:
+            logger.warning("[evictions] Could not record scraper stats: %s", _se)
 
-		# Step 3: Filter for evictions
-		logger.info("\n[STEP 3/4] Filtering for eviction cases...")
-		evictions_df = filter_evictions(civil_df)
+        return True
 
-		if len(evictions_df) == 0:
-			logger.warning("No eviction cases found - pipeline completed but no data to save")
-			try:
-				from src.utils.scraper_db_helper import record_scraper_stats
-				record_scraper_stats(source_type='evictions', total_scraped=0, matched=0, unmatched=0, skipped=0, run_success=True, error_type='no_data', duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id)
-			except Exception as _se:
-				logger.warning("Could not record scraper stats: %s", _se)
-			return False
-
-		# Step 4: Save processed evictions
-		logger.info("\n[STEP 4/4] Saving processed eviction data...")
-		today = datetime.now().strftime(OUTPUT_DATE_FORMAT)
-		output_filename = f"eviction_leads_{today}.csv"
-		output_path = save_processed_evictions(evictions_df, output_filename)
-
-		logger.info(OUTPUT_SEPARATOR)
-		logger.info("EVICTION PIPELINE COMPLETED SUCCESSFULLY")
-		logger.info(f"Output file: {output_path}")
-		logger.info(f"Total eviction records: {len(evictions_df)}")
-		logger.info(OUTPUT_SEPARATOR)
-
-		try:
-			from src.utils.scraper_db_helper import record_scraper_stats
-			record_scraper_stats(source_type='evictions', total_scraped=len(evictions_df), matched=0, unmatched=0, skipped=0, run_success=True, duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id)
-		except Exception as _se:
-			logger.warning("Could not record scraper stats: %s", _se)
-
-		return True
-
-	except Exception as e:
-		logger.error(OUTPUT_SEPARATOR)
-		logger.error("EVICTION PIPELINE FAILED")
-		logger.error(f"Error: {e}")
-		logger.error("Traceback:")
-		logger.error(traceback.format_exc())
-		logger.error(OUTPUT_SEPARATOR)
-		try:
-			from src.utils.scraper_db_helper import record_scraper_stats
-			record_scraper_stats(source_type='evictions', total_scraped=0, matched=0, unmatched=0, skipped=0, run_success=False, error_message=str(e)[:500], duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id)
-		except Exception as _se:
-			logger.warning("Could not record scraper stats: %s", _se)
-		return False
+    except Exception as e:
+        logger.error("[evictions] Pipeline failed: %s", e)
+        logger.debug(traceback.format_exc())
+        try:
+            from src.utils.scraper_db_helper import record_scraper_stats
+            record_scraper_stats(
+                source_type="evictions", total_scraped=0, matched=0, unmatched=0, skipped=0,
+                run_success=False, error_message=str(e)[:500],
+                duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id,
+            )
+        except Exception as _se:
+            logger.warning("[evictions] Could not record scraper stats: %s", _se)
+        return False
 
 
 if __name__ == "__main__":
-	"""
-	Main entry point for the eviction data collection pipeline.
-	
-	This script can be run directly to execute the complete pipeline:
-	    python -m src.scrappers.evictions.evictions_engine
-	    
-	With database loading:
-	    python -m src.scrappers.evictions.evictions_engine --load-to-db
-	    
-	Exit codes:
-	    0: Pipeline completed successfully
-	    1: Pipeline failed or no eviction data found
-	"""
-	import sys
-	import argparse
-	from src.utils.scraper_db_helper import load_scraped_data_to_db, add_load_to_db_arg
-	
-	parser = argparse.ArgumentParser(description="Scrape county eviction filings")
-	parser.add_argument("--date", type=str, default=None, help="Target date YYYY-MM-DD (default: latest)")
-	parser.add_argument("--county-id", dest="county_id", default="hillsborough", help="County identifier (default: hillsborough)")
-	add_load_to_db_arg(parser)
-	args = parser.parse_args()
+    import sys
+    import argparse
+    from src.utils.scraper_db_helper import load_scraped_data_to_db, add_load_to_db_arg
 
-	success = run_eviction_pipeline(target_date=args.date, county_id=args.county_id)
-	
-	# Load to database if requested and scraping was successful
-	if success and args.load_to_db:
-		try:
-			# Find the most recent eviction CSV in new/ subdirectory
-			new_dir = RAW_EVICTIONS_DIR / "new"
-			csv_files = sorted(new_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
-			if csv_files:
-				csv_to_load = csv_files[0]
-				logger.info(f"Loading to database: {csv_to_load}")
-				load_scraped_data_to_db('evictions', csv_to_load, destination_dir=RAW_EVICTIONS_DIR)
-			else:
-				logger.error("No eviction CSV file found to load")
-				sys.exit(1)
-		except Exception as e:
-			logger.error(f"Failed to load data to database: {e}")
-			sys.exit(1)
-	elif args.load_to_db:
-		logger.warning("Skipping database load due to scraping failure")
-	
-	sys.exit(0 if success else 1)
+    parser = argparse.ArgumentParser(description="Scrape county eviction filings")
+    parser.add_argument("--date", type=str, default=None, help="Target date YYYY-MM-DD (default: latest)")
+    parser.add_argument("--county-id", dest="county_id", default="hillsborough",
+                        help="County identifier (default: hillsborough)")
+    add_load_to_db_arg(parser)
+    args = parser.parse_args()
+
+    success = run_eviction_pipeline(target_date=args.date, county_id=args.county_id)
+
+    if success and args.load_to_db:
+        try:
+            new_dir = RAW_EVICTIONS_DIR / "new"
+            csv_files = sorted(new_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if csv_files:
+                load_scraped_data_to_db(
+                    "evictions", csv_files[0],
+                    destination_dir=RAW_EVICTIONS_DIR, county_id=args.county_id,
+                )
+            else:
+                logger.error("[evictions] No eviction CSV file found to load")
+                sys.exit(1)
+        except Exception as e:
+            logger.error("[evictions] Failed to load data to database: %s", e)
+            sys.exit(1)
+    elif args.load_to_db:
+        logger.warning("[evictions] Skipping database load due to scraping failure")
+
+    sys.exit(0 if success else 1)
