@@ -153,6 +153,20 @@ COUNTY_ID=hillsborough
 # Catches at-risk subscribers (5-7d inactivity or grace day 5+) before churn.
 0 15 * * * $PROJECT/scripts/cron/run.sh src.tasks.proactive_save
 
+# Retention summaries — daily 16:00 UTC. Emits retention_summary_due per tier cadence.
+0 16 * * * $PROJECT/scripts/cron/run.sh src.tasks.retention_event_producer
+
+# ── CORA GATE OBSERVABILITY ──────────────────────────────────────────────────
+# Kill-switch metric ingest — daily 06:00 UTC. Queries DB for live business
+# metrics (first_payment_rate, retention_30d, etc.) and caches in Redis (25hr TTL)
+# so agent graphs can call kill_switch_status() with real observed values.
+0 6 * * * $PROJECT/scripts/cron/run.sh src.tasks.kill_switch_metric_ingest
+
+# Gate metrics aggregator — daily 07:00 UTC (after metric ingest at 06:00).
+# Rolls up agent_decisions into per-graph pass/fail/abort rates; logs alerts
+# when any graph pass rate drops below 90%.
+0 7 * * * $PROJECT/scripts/cron/run.sh src.tasks.gate_metrics_aggregator
+
 # AutoPilot Pro upsell — daily 09:15 UTC. Finds Lite subscribers with 30+ days
 # tenure and 30-day close rate >=15%; sends one-tap upgrade offer (14-day cooldown).
 15 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.ap_pro_upsell
