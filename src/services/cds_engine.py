@@ -1537,21 +1537,21 @@ def main():
                 LEFT JOIN distress_scores ds ON ds.property_id = p.id
                 WHERE ds.id IS NULL  -- never scored
                    OR EXISTS (
-                    SELECT 1 FROM foreclosures f WHERE f.property_id = p.id AND f.created_at > ds.score_date
+                    SELECT 1 FROM foreclosures f WHERE f.property_id = p.id AND f.date_added > ds.score_date
                   ) OR EXISTS (
-                    SELECT 1 FROM tax_delinquencies t WHERE t.property_id = p.id AND t.created_at > ds.score_date
+                    SELECT 1 FROM tax_delinquencies t WHERE t.property_id = p.id AND t.date_added > ds.score_date
                   ) OR EXISTS (
-                    SELECT 1 FROM code_violations v WHERE v.property_id = p.id AND v.created_at > ds.score_date
+                    SELECT 1 FROM code_violations v WHERE v.property_id = p.id AND v.date_added > ds.score_date
                   ) OR EXISTS (
-                    SELECT 1 FROM legal_and_liens l WHERE l.property_id = p.id AND l.created_at > ds.score_date
+                    SELECT 1 FROM legal_and_liens l WHERE l.property_id = p.id AND l.date_added > ds.score_date
                   ) OR EXISTS (
-                    SELECT 1 FROM building_permits bp WHERE bp.property_id = p.id AND bp.created_at > ds.score_date
+                    SELECT 1 FROM building_permits bp WHERE bp.property_id = p.id AND bp.date_added > ds.score_date
                   ) OR EXISTS (
-                    SELECT 1 FROM legal_proceedings lp WHERE lp.property_id = p.id AND lp.created_at > ds.score_date
+                    SELECT 1 FROM legal_proceedings lp WHERE lp.property_id = p.id AND lp.date_added > ds.score_date
                   ) OR EXISTS (
-                    SELECT 1 FROM incidents i WHERE i.property_id = p.id AND i.created_at > ds.score_date
+                    SELECT 1 FROM incidents i WHERE i.property_id = p.id AND i.date_added > ds.score_date
                   ) OR EXISTS (
-                    SELECT 1 FROM deeds d WHERE d.property_id = p.id AND d.created_at > ds.score_date
+                    SELECT 1 FROM deeds d WHERE d.property_id = p.id AND d.date_added > ds.score_date
                   )
             """)).fetchall()
             property_ids = [row[0] for row in new_signal_ids]
