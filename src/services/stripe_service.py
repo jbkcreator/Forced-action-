@@ -400,8 +400,10 @@ def switch_subscription_plan(
         logger.error("switch_subscription_plan: subscription %s not found: %s", subscription_id, exc)
         raise
 
-    # Find the current subscription item ID (SDK v5+ uses attribute access, not dict)
-    items = list(subscription.items.data) if subscription.items else []
+    # Use bracket access — subscription["items"] avoids the dict.items() builtin collision
+    # in Stripe SDK v11+ where StripeObject inherits from dict.
+    items_obj = subscription.get("items")
+    items = list(items_obj.data) if items_obj else []
     if not items:
         raise ValueError(f"Subscription {subscription_id} has no items")
 
