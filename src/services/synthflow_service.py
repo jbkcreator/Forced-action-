@@ -29,12 +29,15 @@ _GHL_BASE = "https://services.leadconnectorhq.com"
 
 # ── Outcome → GHL tag mapping ─────────────────────────────────────────────────
 _OUTCOME_TAGS: dict[str, list[str]] = {
-    "sample_requested":  ["synthflow-called", "sample_leads_requested"],
-    "demo_requested":    ["synthflow-called", "demo_requested"],
-    "not_interested":    ["synthflow-called", "not_interested"],
-    "voicemail":         ["synthflow-called", "synthflow-voicemail"],
-    "no_answer":         ["synthflow-called", "synthflow-no_answer"],
-    "completed":         ["synthflow-called"],   # talked but no clear outcome
+    "sample_requested":   ["synthflow-called", "sample_leads_requested"],
+    "demo_requested":     ["synthflow-called", "demo_requested"],
+    "not_interested":     ["synthflow-called", "not_interested"],
+    "voicemail":          ["synthflow-called", "synthflow-voicemail"],
+    "no_answer":          ["synthflow-called", "synthflow-no_answer"],
+    "completed":          ["synthflow-called"],
+    # Revenue recovery outcomes
+    "offer_accepted":     ["synthflow-called", "recovery-offer-accepted"],
+    "callback_scheduled": ["synthflow-called", "recovery-callback-scheduled"],
 }
 
 

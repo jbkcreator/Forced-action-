@@ -147,8 +147,9 @@ class AppSettings(BaseSettings):
 	# Founding subscriber spot limit (default 10, changeable without redeploy)
 	founding_spot_limit: int = Field(default=10, env="FOUNDING_SPOT_LIMIT")
 
-	# Grace period after cancellation — default 48hr, set lower for testing (e.g. GRACE_PERIOD_HOURS=0.017 ≈ 1 min)
-	grace_period_hours: float = Field(default=48.0, env="GRACE_PERIOD_HOURS")
+	# Grace period after subscription deletion — 7 days lets payment_failure_day5 trigger fire.
+	# Set GRACE_PERIOD_HOURS=0.017 (≈1 min) for rapid local testing.
+	grace_period_hours: float = Field(default=168.0, env="GRACE_PERIOD_HOURS")
 
 	# Alert deduplication — suppress repeat alerts for the same failure within this window
 	alert_cooldown_hours: float = Field(default=4.0, env="ALERT_COOLDOWN_HOURS")
@@ -204,6 +205,16 @@ class AppSettings(BaseSettings):
 
 	# UptimeRobot (optional — used by scripts/setup_uptimerobot.py to create monitors)
 	uptimerobot_api_key: Optional[SecretStr] = Field(default=None, env="UPTIMEROBOT_API_KEY")
+
+	# Human close routing (Phase A)
+	slack_human_close_webhook: Optional[str] = Field(default=None, env="SLACK_HUMAN_CLOSE_WEBHOOK")
+
+	# Synthflow outbound voice drops (Phase C)
+	synthflow_api_base: str = Field(default="https://api.synthflow.ai/v2", env="SYNTHFLOW_API_BASE")
+	synthflow_api_key: Optional[SecretStr] = Field(default=None, env="SYNTHFLOW_API_KEY")
+	synthflow_outbound_agent_roofing: Optional[str] = Field(default=None, env="SYNTHFLOW_OUTBOUND_AGENT_ROOFING")
+	synthflow_outbound_agent_remediation: Optional[str] = Field(default=None, env="SYNTHFLOW_OUTBOUND_AGENT_REMEDIATION")
+	synthflow_outbound_agent_revenue_recovery: Optional[str] = Field(default=None, env="SYNTHFLOW_OUTBOUND_AGENT_REVENUE_RECOVERY")
 
 	# Admin upload layer
 	admin_username: str = Field(default="admin", env="ADMIN_USERNAME")

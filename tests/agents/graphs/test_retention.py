@@ -13,8 +13,31 @@ FAKE_CLAUDE = {
 }
 
 
+_FAKE_PROFILE = {
+	"id": 107, "tier": "wallet", "status": "active", "vertical": "roofing",
+	"county_id": "hillsborough", "founding_member": False,
+	"email": "test@example.com", "name": "Amal Test",
+	"has_saved_card": True, "auto_mode_enabled": False,
+	"referral_code": None, "created_at": None, "billing_date": None,
+}
+
+
 def _happy_mocks():
 	return [
+		patch("src.agents.graphs.retention.get_subscriber_profile",
+			  return_value=_FAKE_PROFILE),
+		patch("src.agents.graphs.retention.get_wallet_state",
+			  return_value={"credits_used_total": 30, "credits_remaining": 5}),
+		patch("src.agents.graphs.retention.get_deal_history",
+			  return_value=[{"lead_source": "zip:33647", "deal_amount": 12000}]),
+		patch("src.agents.graphs.retention.get_subscriber_territories",
+			  return_value=["33647"]),
+		patch("src.agents.graphs.retention.get_lead_pool",
+			  return_value=[{"tier": "Gold"}, {"tier": "Gold"}]),
+		patch("src.agents.graphs.retention.get_zip_activity",
+			  return_value={"active_viewers": 3}),
+		patch("src.agents.subgraphs.decision_hierarchy.kill_switch_status",
+			  return_value={"color": "green", "observed_value": None, "action": "proceed"}),
 		patch("src.agents.subgraphs.compose_and_send.call_claude_with_usage",
 			  return_value=FAKE_CLAUDE),
 		patch("src.agents.subgraphs.compose_and_send.compliance_check",

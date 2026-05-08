@@ -23,8 +23,12 @@ from typing import Callable, Dict, Optional
 
 from src.agents.graphs.abandonment import run_wave1 as _run_abandonment_wave1
 from src.agents.graphs.abandonment import run_wave2 as _run_abandonment_wave2
+from src.agents.graphs.ap_lite_close import run_ap_lite_close as _run_ap_lite_close
 from src.agents.graphs.fomo import run_fomo as _run_fomo
+from src.agents.graphs.human_close_route import run_human_close_route as _run_human_close_route
 from src.agents.graphs.retention import run_retention as _run_retention_inner
+from src.agents.graphs.synthflow_voice_drop import run_synthflow_voice_drop as _run_synthflow_voice_drop
+from src.agents.graphs.wallet_to_lock_close import run_wallet_to_lock_close as _run_wallet_to_lock_close
 
 
 def _run_retention_adapter(event_payload, subscriber_id, decision_id=None):
@@ -61,6 +65,26 @@ EVENT_TO_GRAPH: Dict[str, GraphSpec] = {
 	"retention_summary_due": GraphSpec(
 		graph_name="retention",
 		runner=_run_retention_adapter,
+	),
+	"subscriber_crossed_lock_threshold": GraphSpec(
+		graph_name="wallet_to_lock_close",
+		runner=_run_wallet_to_lock_close,
+	),
+	"subscriber_crossed_ap_lite_threshold": GraphSpec(
+		graph_name="ap_lite_close",
+		runner=_run_ap_lite_close,
+	),
+	"flash_scarcity_window_open": GraphSpec(
+		graph_name="fomo",
+		runner=_run_fomo,
+	),
+	"escalate_to_human_closer": GraphSpec(
+		graph_name="human_close_route",
+		runner=_run_human_close_route,
+	),
+	"high_intent_no_convert": GraphSpec(
+		graph_name="synthflow_voice_drop",
+		runner=_run_synthflow_voice_drop,
 	),
 }
 

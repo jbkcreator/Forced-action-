@@ -12,3 +12,4 @@ forced-action.service
 fa-agents.service
 src/static/
 
+venv/

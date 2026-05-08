@@ -467,3 +467,23 @@ def check_opt_in(
 			"opt_out_keyword": opt_out.keyword_used if opt_out else None,
 			"opt_out_at": opt_out.opted_out_at.isoformat() if opt_out and opt_out.opted_out_at else None,
 		}
+
+
+@tool(category="read")
+def get_subscriber_territories(
+	subscriber_id: int,
+	status: str = "locked",
+	session: Optional[Session] = None,
+) -> list:
+	"""Return ZIP codes for a subscriber's territories in the given status (default: locked)."""
+	from src.core.models import ZipTerritory
+	with _session(session) as s:
+		rows = (
+			s.query(ZipTerritory.zip_code)
+			.filter(
+				ZipTerritory.subscriber_id == subscriber_id,
+				ZipTerritory.status == status,
+			)
+			.all()
+		)
+		return [r[0] for r in rows]

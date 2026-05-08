@@ -1,0 +1,5 @@
+# Static fallback — YELLOW kill-switch for ap_lite_close.
+version: 1
+body: |
+  {first_name}, you ran {weekly_actions} manual actions last week.
+  AutoPilot Lite automates that for $299/mo. {cta_url}

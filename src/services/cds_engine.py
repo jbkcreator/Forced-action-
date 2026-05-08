@@ -1230,6 +1230,18 @@ class MultiVerticalScorer:
                         _record, status, upgraded = self.save_score_to_database(score_data, scoring_run_id=scoring_run_id)
                         if status == 'new':
                             new_count += 1
+                            # Flash scarcity: new Gold lead may trigger urgency window
+                            if score_data.get("lead_tier") == "Gold":
+                                try:
+                                    from src.services.flash_scarcity import open_window_if_spike
+                                    zip_code = score_data.get("zip") or prop.zip
+                                    vertical = score_data.get("top_vertical") or prop.vertical if hasattr(prop, "vertical") else None
+                                    if zip_code and vertical and _record:
+                                        open_window_if_spike(
+                                            self.session, _record.id, zip_code, vertical
+                                        )
+                                except Exception as _fse:
+                                    logger.debug("flash_scarcity hook error: %s", _fse)
                         elif status == 'updated':
                             updated_count += 1
                         else:

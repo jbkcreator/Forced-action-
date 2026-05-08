@@ -398,6 +398,22 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
                     subscriber.id, exc_info=True,
                 )
 
+    # ── Partner tier: provision multi-ZIP access ──────────────────────────
+    # When a subscriber upgrades to the partner tier via checkout, we need to
+    # lock all their chosen ZIPs and create the PartnerSubscription audit row.
+    # The ZIP locking loop above already handles individual ZIPs; this call
+    # sets the tier and creates the PartnerSubscription record.
+    if tier == "partner" and zip_codes:
+        try:
+            from src.services.partner_tier import provision_partner_access
+            provision_partner_access(db, subscriber.id, zip_codes, vertical, county_id)
+        except Exception:
+            logger.error(
+                "partner provision failed for subscriber %s — non-fatal, tier already set",
+                subscriber.id,
+                exc_info=True,
+            )
+
     # ── Referral confirmation (Phase A.1, 2026-05-04) ────────────────────
     # The referee just made their first paid purchase — flip any pending
     # ReferralEvent to confirmed and credit the referrer. Idempotent:
@@ -654,6 +670,11 @@ def _on_payment_succeeded(invoice: dict, db: Session) -> None:
             stripe_customer_id, exc,
         )
 
+    # Clear recovery state on successful payment
+    subscriber.payment_failed_at = None
+    subscriber.recovery_day1_sent = False
+    subscriber.recovery_day3_sent = False
+
     logger.info(
         "invoice.payment_succeeded: subscriber=%s billing_date=%s",
         subscriber.id, subscriber.billing_date,
@@ -814,6 +835,11 @@ def _on_payment_failed(invoice: dict, db: Session) -> None:
             "invoice.payment_failed: no subscriber for customer %s", stripe_customer_id
         )
         return
+
+    subscriber.payment_failed_at = datetime.now(timezone.utc)
+    subscriber.recovery_day1_sent = False
+    subscriber.recovery_day3_sent = False
+    db.flush()
 
     try:
         push_subscriber_to_ghl(subscriber, stage=None, tags=["payment_failed"])
