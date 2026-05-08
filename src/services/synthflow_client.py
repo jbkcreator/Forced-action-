@@ -19,7 +19,6 @@ def initiate_call(
     Returns the call_id string on success, None on failure.
     phone must be E.164 format.
     """
-    import httpx
     from config.settings import get_settings as _get_settings
 
     settings = _get_settings()
@@ -43,7 +42,8 @@ def initiate_call(
     }
 
     try:
-        resp = httpx.post(
+        import requests as _requests  # noqa: PLC0415 (lazy import — avoids circular at module level)
+        resp = _requests.post(
             f"{base}/calls",
             json=payload,
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},

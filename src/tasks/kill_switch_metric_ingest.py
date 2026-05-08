@@ -145,14 +145,14 @@ def _compute_metrics(db: Session) -> dict:
     ).scalar() or 0
     metrics["retention_30d"] = round((cohort_still_active / cohort_total * 100), 1) if cohort_total > 0 else None
 
-    # twilio_cost_per_signup — avg cost_usd per completed decision / total active subs (proxy)
+    # claude_cost_per_decision — avg Claude API cost_usd per completed agent decision (scaled ×100 for Redis precision)
     avg_cost = db.execute(
         select(func.avg(AgentDecision.cost_usd)).where(
             AgentDecision.started_at >= ago_30,
             AgentDecision.terminal_status == "completed",
         )
     ).scalar()
-    metrics["twilio_cost_per_signup"] = round(float(avg_cost or 0) * 100, 4) if avg_cost else None
+    metrics["claude_cost_per_decision"] = round(float(avg_cost or 0) * 100, 4) if avg_cost else None
 
     # Skipped — no data source yet
     metrics["sms_reply_rate"] = None

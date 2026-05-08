@@ -74,9 +74,10 @@ def open_window_if_spike(
     try:
         from src.core.redis_client import redis_available, rget, rset
 
+        key = _dedup_key(zip_code)
+
         # Redis dedup: skip if window opened in last 30 min for this ZIP
         if redis_available():
-            key = _dedup_key(zip_code)
             if rget(key):
                 logger.debug("flash_scarcity: dedup hit for ZIP %s", zip_code)
                 return False
@@ -106,6 +107,74 @@ def open_window_if_spike(
     except Exception as exc:
         logger.error("flash_scarcity.open_window_if_spike error: %s", exc)
         return False
+
+
+def _subscriber_relevant_zips(db: Session, subscriber_id: int) -> list[tuple[str, str]]:
+    """Return (zip_code, vertical) pairs for ZIPs the subscriber is active in but hasn't locked."""
+    from src.core.models import Subscriber, WalletTransaction, ZipTerritory
+    from sqlalchemy import select as _sel
+    from datetime import timedelta
+
+    sub = db.get(Subscriber, subscriber_id)
+    if not sub:
+        return []
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+    vertical = sub.vertical or "roofing"
+
+    # Locked territories
+    locked = db.execute(
+        _sel(ZipTerritory.zip_code).where(
+            ZipTerritory.subscriber_id == subscriber_id,
+            ZipTerritory.status.in_(["locked", "grace"]),
+        )
+    ).scalars().all()
+
+    # Recent debit ZIPs (wallet activity)
+    wallet_zips = db.execute(
+        _sel(WalletTransaction.zip_code).where(
+            WalletTransaction.subscriber_id == subscriber_id,
+            WalletTransaction.txn_type == "debit",
+            WalletTransaction.zip_code.is_not(None),
+            WalletTransaction.created_at >= cutoff,
+        ).distinct()
+    ).scalars().all()
+
+    seen = set()
+    result = []
+    for z in list(locked) + list(wallet_zips):
+        if z and z not in seen:
+            seen.add(z)
+            result.append((z, vertical))
+    return result
+
+
+def get_active_windows_for_subscriber(db: Session, subscriber_id: int) -> list[dict]:
+    """Return active flash-scarcity windows for ZIPs this subscriber holds or has been active in."""
+    try:
+        from src.core.redis_client import redis_available, rttl as _rttl
+
+        if not redis_available():
+            return []
+
+        zips = _subscriber_relevant_zips(db, subscriber_id)
+        out = []
+        seen_zips = set()
+        for zip_code, vertical in zips:
+            if zip_code in seen_zips:
+                continue
+            seen_zips.add(zip_code)
+            ttl = _rttl(_dedup_key(zip_code))
+            if ttl and ttl > 0:
+                out.append({
+                    "zip_code": zip_code,
+                    "vertical": vertical,
+                    "expires_in_seconds": ttl,
+                })
+        return out
+    except Exception as exc:
+        logger.error("flash_scarcity.get_active_windows_for_subscriber error: %s", exc)
+        return []
 
 
 def _emit_event(

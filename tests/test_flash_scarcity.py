@@ -129,3 +129,44 @@ class TestEmitEvent:
         with patch("src.agents.supervisor.dispatch_event", side_effect=_side_effect):
             _emit_event(mock_db, "33647", "roofing", 1, {"expires_at": None, "window_minutes": 60})
         assert call_count == 2
+
+
+class TestGetActiveWindowsForSubscriber:
+    def test_returns_empty_when_redis_unavailable(self, mock_db):
+        from src.services.flash_scarcity import get_active_windows_for_subscriber
+        with patch("src.services.flash_scarcity._subscriber_relevant_zips", return_value=[("33647", "roofing")]), \
+             patch("src.core.redis_client.redis_available", return_value=False):
+            result = get_active_windows_for_subscriber(mock_db, 1)
+        assert result == []
+
+    def test_active_window_returns_entry(self, mock_db):
+        from src.services.flash_scarcity import get_active_windows_for_subscriber
+        with patch("src.services.flash_scarcity._subscriber_relevant_zips", return_value=[("33647", "roofing")]), \
+             patch("src.core.redis_client.redis_available", return_value=True), \
+             patch("src.core.redis_client.rttl", return_value=900):
+            result = get_active_windows_for_subscriber(mock_db, 1)
+        assert len(result) == 1
+        assert result[0]["zip_code"] == "33647"
+        assert result[0]["expires_in_seconds"] == 900
+
+    def test_expired_window_not_returned(self, mock_db):
+        from src.services.flash_scarcity import get_active_windows_for_subscriber
+        with patch("src.services.flash_scarcity._subscriber_relevant_zips", return_value=[("33647", "roofing")]), \
+             patch("src.core.redis_client.redis_available", return_value=True), \
+             patch("src.core.redis_client.rttl", return_value=None):
+            result = get_active_windows_for_subscriber(mock_db, 1)
+        assert result == []
+
+    def test_multiple_zips_only_active_returned(self, mock_db):
+        from src.services.flash_scarcity import get_active_windows_for_subscriber
+
+        def _ttl_side(key):
+            return 500 if "33647" in key else None
+
+        with patch("src.services.flash_scarcity._subscriber_relevant_zips",
+                   return_value=[("33647", "roofing"), ("33601", "roofing")]), \
+             patch("src.core.redis_client.redis_available", return_value=True), \
+             patch("src.core.redis_client.rttl", side_effect=_ttl_side):
+            result = get_active_windows_for_subscriber(mock_db, 1)
+        assert len(result) == 1
+        assert result[0]["zip_code"] == "33647"

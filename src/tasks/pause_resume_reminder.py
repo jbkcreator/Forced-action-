@@ -58,7 +58,10 @@ def run(dry_run: bool = False) -> dict:
 
 
 def _send_reminder(sub: Subscriber) -> None:
-    from src.services.twilio_client import send_sms
+    from sqlalchemy import select as _sel
+    from src.core.database import get_db_context
+    from src.core.models import SmsOptIn
+    from src.services.sms_compliance import send_sms
     from config.settings import settings
 
     resume_date = sub.pause_resume_at.strftime("%B %d")
@@ -68,7 +71,15 @@ def _send_reminder(sub: Subscriber) -> None:
         f"Leads will start flowing again automatically. "
         f"Questions? {feed_url}"
     )[:160]
-    send_sms(to=sub.phone if hasattr(sub, "phone") and sub.phone else None, body=msg, subscriber=sub)
+
+    with get_db_context() as db:
+        opt_in = db.execute(
+            _sel(SmsOptIn).where(SmsOptIn.subscriber_id == sub.id)
+        ).scalar_one_or_none()
+        if not opt_in or not opt_in.phone:
+            logger.warning("pause_reminder: no SMS opt-in phone for sub=%d — skipping SMS", sub.id)
+            return
+        send_sms(to=opt_in.phone, body=msg, db=db)
 
 
 if __name__ == "__main__":

@@ -49,7 +49,7 @@ def dispatch(from_number: str, command: str, db: Session) -> str:
         "AUTO ON": _handle_auto_on,
         "AUTO OFF": _handle_auto_off,
         "PAUSE": _handle_pause,
-        "YES": _handle_pause_yes,
+        "YES": _handle_yes,
         "RESUME": _handle_resume,
         "TOPUP": _handle_topup,
         "REPORT": _handle_report,
@@ -111,23 +111,11 @@ _PAUSE_PENDING_TTL = 300  # 5 minutes
 
 def _handle_pause(sub: Subscriber, db: Session) -> str:
     from src.core.redis_client import redis_available, rget, rset
-    from src.services.pause_subscription import pause_subscriber
 
     key = f"pause_pending:{sub.id}"
 
     if redis_available() and rget(key):
-        # Second message — treat as confirmation if body was "YES"
-        # (caller passes full body; for command-based flow YES is handled separately)
-        ok = pause_subscriber(db, sub.id)
-        if ok:
-            from src.core.redis_client import rdelete
-            rdelete(key)
-            resume_str = sub.pause_resume_at.strftime("%B %d, %Y") if sub.pause_resume_at else "60 days"
-            return (
-                f"Subscription paused. Leads resume {resume_str}. "
-                f"Reply RESUME to restart early."
-            )[:_MAX_SMS_LEN]
-        return "Pause failed. Contact support or visit your dashboard."[:_MAX_SMS_LEN]
+        return "You already have a pending pause — reply YES to confirm."[:_MAX_SMS_LEN]
 
     # First PAUSE — set pending state and ask for confirmation
     if redis_available():
@@ -136,6 +124,43 @@ def _handle_pause(sub: Subscriber, db: Session) -> str:
         "Reply YES to pause your subscription for 60 days. "
         "Leads will stop and billing pauses. Reply NO to cancel."
     )[:_MAX_SMS_LEN]
+
+
+def _handle_yes(sub: Subscriber, db: Session) -> str:
+    """Context-aware YES: routes to pending offer checkout or falls back to pause."""
+    import json as _json
+    from src.core.redis_client import redis_available, rget as _rget, rdelete as _rdelete
+
+    if redis_available():
+        raw = _rget(f"fa:pending_offer:{sub.id}")
+        if raw:
+            try:
+                offer = _json.loads(raw)
+            except Exception:
+                offer = None
+            if offer and offer.get("type") == "lock_close":
+                _rdelete(f"fa:pending_offer:{sub.id}")
+                return _open_checkout_for_lock(sub, offer.get("zip_code", ""))
+    return _handle_pause_yes(sub, db)
+
+
+def _open_checkout_for_lock(sub: Subscriber, zip_code: str) -> str:
+    """Create a Stripe Checkout Session for annual_lock and SMS-reply the URL."""
+    try:
+        from src.services.stripe_service import create_checkout_session
+        result = create_checkout_session(
+            subscriber=sub,
+            tier="annual_lock",
+            lock_zip=zip_code,
+        )
+        url = result.get("url") or result.get("checkout_url", "")
+        if url:
+            return f"Your lock checkout: {url}"[:_MAX_SMS_LEN]
+    except Exception as exc:
+        logger.error("_open_checkout_for_lock failed sub=%s: %s", sub.id, exc)
+    from config.settings import settings
+    fallback = f"{settings.app_base_url}/checkout?tier=annual_lock&zip={zip_code}&sub={sub.id}"
+    return f"Lock {zip_code}: {fallback}"[:_MAX_SMS_LEN]
 
 
 def _handle_pause_yes(sub: Subscriber, db: Session) -> str:

@@ -107,18 +107,36 @@ def _node_build_compose_context(state: WalletToLockState) -> Dict[str, Any]:
     profile = state.get("subscriber_profile") or {}
     payload = state.get("event_payload") or {}
 
+    credits_spent = payload.get("credits_spent") or 0
+    zip_code = payload.get("zip_code") or ""
+    uncontacted_count = payload.get("uncontacted_count", 0)
+    tier_breakdown = payload.get("tier_breakdown") or {}
+    spend_rate = round(credits_spent / 4, 1) if credits_spent else 0
+
+    try:
+        from src.services.urgency_engine import get_active_count as _active_count
+        competing_viewers = _active_count(zip_code)
+    except Exception:
+        competing_viewers = 0
+
     context = {
         "first_name": (profile.get("name") or "there").split(" ")[0],
         "subscriber_first_name": (profile.get("name") or "there").split(" ")[0],
-        "zip_code": payload.get("zip_code") or "",
-        "credits_spent": payload.get("credits_spent") or 0,
+        "zip_code": zip_code,
+        "credits_spent": credits_spent,
+        "spend_rate_per_week": spend_rate,
+        "uncontacted_count": uncontacted_count,
+        "gold_count": tier_breakdown.get("gold", 0),
+        "silver_count": tier_breakdown.get("silver", 0),
+        "bronze_count": tier_breakdown.get("bronze", 0),
+        "competing_viewers": competing_viewers,
         "lock_threshold": payload.get("lock_threshold") or 40,
         "cta_url": payload.get("cta_url") or "",
         "tier": profile.get("tier") or "wallet",
         "revenue_signal_score": state.get("revenue_signal_score", 0),
         "lock_signal": (
-            f"you've spent {payload.get('credits_spent', 0)} credits in "
-            f"{payload.get('zip_code', 'this ZIP')} this month"
+            f"you've spent {credits_spent} credits in "
+            f"{zip_code or 'this ZIP'} this month"
         ),
     }
 
@@ -168,11 +186,27 @@ def _node_compose_and_send(state: WalletToLockState) -> WalletToLockState:
 
 
 def _node_finalize(state: WalletToLockState) -> WalletToLockState:
+    import json as _json
     from src.agents.tools.write_tools import log_decision
 
     final_status = state.get("terminal_status") or "completed"
+    payload = state.get("event_payload") or {}
+    uncontacted_count = payload.get("uncontacted_count", 0)
+    tier_breakdown = payload.get("tier_breakdown") or {}
 
-    if final_status != "completed" or not state.get("sent"):
+    if final_status == "completed" and state.get("sent"):
+        # Set pending offer so YES reply routes to checkout (24h TTL)
+        try:
+            from src.core.redis_client import redis_available, rset as _rset
+            if redis_available():
+                offer = _json.dumps({
+                    "type": "lock_close",
+                    "zip_code": payload.get("zip_code", ""),
+                })
+                _rset(f"fa:pending_offer:{state['subscriber_id']}", offer, ttl_seconds=86400)
+        except Exception:
+            pass
+    else:
         try:
             log_decision(
                 decision_id=state["decision_id"],
@@ -182,7 +216,12 @@ def _node_finalize(state: WalletToLockState) -> WalletToLockState:
                 terminal_status=final_status,
                 tokens_used=int(state.get("tokens_used", 0) or 0),
                 cost_usd=float(state.get("cost_usd", 0.0) or 0.0),
-                summary={"failure_reason": state.get("failure_reason"), "early_abort": True},
+                summary={
+                    "failure_reason": state.get("failure_reason"),
+                    "early_abort": True,
+                    "uncontacted_count": uncontacted_count,
+                    "tier_breakdown": tier_breakdown,
+                },
             )
         except Exception:
             pass

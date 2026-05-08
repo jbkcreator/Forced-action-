@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 def run_sweep(dry_run: bool = False) -> dict:
     results = {
-        "candidates_found": 0,
+        "total_candidates": 0,
         "skipped_zip_locked": 0,
         "events_emitted": 0,
         "errors": 0,
@@ -35,6 +35,7 @@ def run_sweep(dry_run: bool = False) -> dict:
 
         for cand in candidates:
             try:
+                results["total_candidates"] += 1
                 if is_zip_locked(db, cand.zip_code, cand.vertical, cand.county_id):
                     results["skipped_zip_locked"] += 1
                     logger.debug(
@@ -42,8 +43,6 @@ def run_sweep(dry_run: bool = False) -> dict:
                         cand.zip_code, cand.subscriber_id,
                     )
                     continue
-
-                results["candidates_found"] += 1
                 logger.info(
                     "wallet_to_lock: candidate sub=%s zip=%s credits=%d",
                     cand.subscriber_id, cand.zip_code, cand.credits_used,
@@ -56,6 +55,8 @@ def run_sweep(dry_run: bool = False) -> dict:
                         cand.zip_code,
                         cand.credits_used,
                         cand.vertical,
+                        uncontacted_count=cand.uncontacted_count,
+                        tier_breakdown=cand.tier_breakdown,
                     )
                     results["events_emitted"] += 1
 
@@ -67,8 +68,8 @@ def run_sweep(dry_run: bool = False) -> dict:
                 results["errors"] += 1
 
     logger.info(
-        "[WalletToLockSweep] candidates=%d skipped_locked=%d emitted=%d errors=%d dry_run=%s",
-        results["candidates_found"],
+        "[WalletToLockSweep] total=%d skipped_locked=%d emitted=%d errors=%d dry_run=%s",
+        results["total_candidates"],
         results["skipped_zip_locked"],
         results["events_emitted"],
         results["errors"],

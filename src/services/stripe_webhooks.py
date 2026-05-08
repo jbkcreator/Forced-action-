@@ -670,6 +670,11 @@ def _on_payment_succeeded(invoice: dict, db: Session) -> None:
             stripe_customer_id, exc,
         )
 
+    # Clear recovery state on successful payment
+    subscriber.payment_failed_at = None
+    subscriber.recovery_day1_sent = False
+    subscriber.recovery_day3_sent = False
+
     logger.info(
         "invoice.payment_succeeded: subscriber=%s billing_date=%s",
         subscriber.id, subscriber.billing_date,
@@ -830,6 +835,11 @@ def _on_payment_failed(invoice: dict, db: Session) -> None:
             "invoice.payment_failed: no subscriber for customer %s", stripe_customer_id
         )
         return
+
+    subscriber.payment_failed_at = datetime.now(timezone.utc)
+    subscriber.recovery_day1_sent = False
+    subscriber.recovery_day3_sent = False
+    db.flush()
 
     try:
         push_subscriber_to_ghl(subscriber, stage=None, tags=["payment_failed"])

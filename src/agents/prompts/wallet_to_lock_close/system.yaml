@@ -25,6 +25,10 @@ user: |
     - First name: {first_name}.
     - ZIP they've been buying leads in: {zip_code}.
     - Credits spent in this ZIP in last 30 days: {credits_spent}.
+    - Spend rate (credits/week): {spend_rate_per_week}.
+    - Uncontacted leads available in ZIP: {uncontacted_count}.
+    - Lead tier breakdown: Gold {gold_count} / Silver {silver_count} / Bronze {bronze_count}.
+    - Competing viewers in ZIP (last 7d): {competing_viewers}.
     - Lock threshold: {lock_threshold} credits.
     - Lock CTA link: {cta_url}.
     - Current tier: {tier}.

@@ -29,6 +29,9 @@ from src.core.models import Subscriber, WalletTransaction, ZipTerritory
 logger = logging.getLogger(__name__)
 
 
+LOCK_MIN_UNCONTACTED_LEADS = 10
+
+
 @dataclass
 class WalletToLockCandidate:
     subscriber_id: int
@@ -36,6 +39,8 @@ class WalletToLockCandidate:
     credits_used: int
     vertical: str
     county_id: str
+    uncontacted_count: int = 0
+    tier_breakdown: dict = None  # {"gold": N, "silver": N, "bronze": N}
 
 
 def find_candidates(db: Session) -> List[WalletToLockCandidate]:
@@ -68,12 +73,37 @@ def find_candidates(db: Session) -> List[WalletToLockCandidate]:
             continue
         if sub.tier in LOCK_OR_ABOVE_TIERS:
             continue
+
+        # Gate: require ≥10 scorable leads in this ZIP
+        try:
+            from src.agents.tools.read_tools import get_lead_pool
+            leads = get_lead_pool(zip_code=row.zip_code, vertical=sub.vertical, min_score=60, limit=50)
+            # leads with no contacted field are treated as uncontacted
+            uncontacted = [l for l in leads if not l.get("contacted")]
+            if len(uncontacted) < LOCK_MIN_UNCONTACTED_LEADS:
+                logger.debug(
+                    "wallet_to_lock: sub=%s zip=%s only %d uncontacted leads, skipping",
+                    row.subscriber_id, row.zip_code, len(uncontacted),
+                )
+                continue
+            tier_counts = {"gold": 0, "silver": 0, "bronze": 0}
+            for lead in uncontacted:
+                t = (lead.get("tier") or "").lower()
+                if t in tier_counts:
+                    tier_counts[t] += 1
+        except Exception as exc:
+            logger.warning("wallet_to_lock lead-pool gate failed sub=%s: %s", row.subscriber_id, exc)
+            uncontacted = []
+            tier_counts = {"gold": 0, "silver": 0, "bronze": 0}
+
         candidates.append(WalletToLockCandidate(
             subscriber_id=row.subscriber_id,
             zip_code=row.zip_code,
             credits_used=int(row.credits),
             vertical=sub.vertical,
             county_id=sub.county_id,
+            uncontacted_count=len(uncontacted),
+            tier_breakdown=tier_counts,
         ))
 
     return candidates
@@ -116,6 +146,8 @@ def emit_event(
     zip_code: str,
     credits_used: int,
     vertical: str,
+    uncontacted_count: int = 0,
+    tier_breakdown: dict = None,
 ) -> None:
     """Emit subscriber_crossed_lock_threshold event to Cora supervisor."""
     from src.agents.events.types import Event
@@ -130,9 +162,13 @@ def emit_event(
         payload={
             "zip_code": zip_code,
             "credits_used": credits_used,
+            "credits_spent": credits_used,
             "window_days": LOCK_WINDOW_DAYS,
             "vertical": vertical,
             "lock_cta_url": build_lock_cta_url(subscriber_id, zip_code),
+            "cta_url": build_lock_cta_url(subscriber_id, zip_code),
+            "uncontacted_count": uncontacted_count,
+            "tier_breakdown": tier_breakdown or {"gold": 0, "silver": 0, "bronze": 0},
         },
         source="cron",
         decision_id=decision_id,

@@ -129,6 +129,19 @@ def rdelete(key: str) -> None:
         logger.warning("Redis rdelete failed for %s: %s", key, exc)
 
 
+def rttl(key: str) -> Optional[int]:
+    """Return remaining TTL in seconds, or None if key absent / no TTL."""
+    client = _get_client()
+    if client is None:
+        return None
+    try:
+        val = client.ttl(key)
+        return val if val >= 0 else None
+    except Exception as exc:
+        logger.warning("Redis rttl failed for %s: %s", key, exc)
+        return None
+
+
 def get_redis():
     """Return the raw Redis client (or None if unavailable). Use redis_available() guard first."""
     return _get_client()

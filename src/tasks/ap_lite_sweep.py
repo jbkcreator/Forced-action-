@@ -60,7 +60,6 @@ def _emit_event(subscriber_id: int, actions_count: int, week_start: date) -> Non
         idempotency_key=f"aplite:{subscriber_id}:{iso_week}",
     )
     try:
-        from src.agents.supervisor import dispatch_event
         dispatch_event(evt.to_dispatch_dict())
     except Exception as exc:
         logger.error("ap_lite_sweep emit failed sub=%s: %s", subscriber_id, exc)

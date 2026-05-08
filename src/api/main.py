@@ -19,7 +19,7 @@ import re
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import requests as _requests
 import stripe
@@ -55,7 +55,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-from src.api.admin_router import router as admin_router  # noqa: E402
+from src.api.admin_router import router as admin_router, get_current_admin  # noqa: E402
 app.include_router(admin_router)
 
 from src.api.sandbox_router import router as sandbox_router  # noqa: E402
@@ -1136,6 +1136,11 @@ def event_feed(
                 "paused_at": subscriber.paused_at.isoformat() if subscriber.paused_at else None,
                 "pause_resume_at": subscriber.pause_resume_at.isoformat() if subscriber.pause_resume_at else None,
                 "save_offer_active": False,
+                "lock_candidate_zip": None,
+                "lock_candidate_at": None,
+                "wallet_to_lock_eligible": False,
+                "wallet_credits_30d": None,
+                "flash_scarcity_windows": [],
             },
             "total": 0,
             "page": page,
@@ -1172,6 +1177,16 @@ def event_feed(
         )
         from src.core.models import WalletBalance as _WB
         _wallet = db.execute(select(_WB).where(_WB.subscriber_id == subscriber.id)).scalar_one_or_none()
+        _w2l_eligible_nz = (
+            subscriber.tier == "wallet"
+            and subscriber.lock_candidate_zip is not None
+            and subscriber.lock_candidate_at is not None
+        )
+        try:
+            from src.services.flash_scarcity import get_active_windows_for_subscriber as _get_flash_nz
+            _flash_windows_nz = _get_flash_nz(db, subscriber.id)
+        except Exception:
+            _flash_windows_nz = []
         return {
             "feed_uuid": feed_uuid,
             "subscriber": {
@@ -1192,6 +1207,11 @@ def event_feed(
                 "paused_at": subscriber.paused_at.isoformat() if subscriber.paused_at else None,
                 "pause_resume_at": subscriber.pause_resume_at.isoformat() if subscriber.pause_resume_at else None,
                 "save_offer_active": _compute_save_offer_active(subscriber, db),
+                "lock_candidate_zip": subscriber.lock_candidate_zip,
+                "lock_candidate_at": subscriber.lock_candidate_at.isoformat() if subscriber.lock_candidate_at else None,
+                "wallet_to_lock_eligible": _w2l_eligible_nz,
+                "wallet_credits_30d": None,
+                "flash_scarcity_windows": _flash_windows_nz,
             },
             "total": 0,
             "page": page,
@@ -1378,6 +1398,34 @@ def event_feed(
         and manual_actions_this_week >= AP_LITE_THRESHOLD_PER_WEEK
     )
 
+    # Wallet-to-Lock eligibility
+    _w2l_eligible = (
+        subscriber.tier == "wallet"
+        and subscriber.lock_candidate_zip is not None
+        and subscriber.lock_candidate_at is not None
+    )
+    _wallet_credits_30d = None
+    if _w2l_eligible and subscriber.lock_candidate_zip:
+        from datetime import timedelta as _td
+        from src.core.models import WalletTransaction as _WT
+        _cutoff_30d = datetime.now(timezone.utc) - _td(days=30)
+        _wallet_credits_30d = db.execute(
+            select(func.sum(func.abs(_WT.amount))).where(
+                _WT.subscriber_id == subscriber.id,
+                _WT.zip_code == subscriber.lock_candidate_zip,
+                _WT.txn_type == "debit",
+                _WT.created_at >= _cutoff_30d,
+            )
+        ).scalar()
+        _wallet_credits_30d = int(_wallet_credits_30d) if _wallet_credits_30d else 0
+
+    # Flash scarcity windows
+    try:
+        from src.services.flash_scarcity import get_active_windows_for_subscriber as _get_flash
+        _flash_windows = _get_flash(db, subscriber.id)
+    except Exception:
+        _flash_windows = []
+
     return {
         "feed_uuid": feed_uuid,
         "subscriber": {
@@ -1398,6 +1446,11 @@ def event_feed(
             "paused_at": subscriber.paused_at.isoformat() if subscriber.paused_at else None,
             "pause_resume_at": subscriber.pause_resume_at.isoformat() if subscriber.pause_resume_at else None,
             "save_offer_active": _compute_save_offer_active(subscriber, db),
+            "lock_candidate_zip": subscriber.lock_candidate_zip,
+            "lock_candidate_at": subscriber.lock_candidate_at.isoformat() if subscriber.lock_candidate_at else None,
+            "wallet_to_lock_eligible": _w2l_eligible,
+            "wallet_credits_30d": _wallet_credits_30d,
+            "flash_scarcity_windows": _flash_windows,
         },
         "total": total,
         "page": page,
@@ -2661,8 +2714,17 @@ def upgrade_get(feed_uuid: str, tier: str, db: Session = Depends(get_db)):
 
 
 @app.get("/api/save-offer/accept", include_in_schema=False)
-def save_offer_accept_get(feed_uuid: str, db: Session = Depends(get_db)):
-    """GET-friendly save-offer accept so the link in the proactive-save email can be tapped directly."""
+def save_offer_accept_get(feed_uuid: str):
+    """Redirect email link to a confirmation page — prevents link prefetchers from triggering the downgrade."""
+    from fastapi.responses import RedirectResponse
+    from config.settings import get_settings as _gs
+    base = _gs().app_base_url.rstrip("/")
+    return RedirectResponse(url=f"{base}/save-offer/confirm?uuid={feed_uuid}", status_code=302)
+
+
+@app.post("/api/save-offer/accept", include_in_schema=False)
+def save_offer_accept_post(feed_uuid: str, db: Session = Depends(get_db)):
+    """Execute the tier downgrade after the user confirms on the confirmation page."""
     return upgrade(UpgradeRequest(feed_uuid=feed_uuid, tier="data_only"), db)
 
 
@@ -2698,15 +2760,20 @@ def territory_map(
         )
     ).scalars().all()
 
+    # Single GROUP BY query instead of one COUNT per ZIP
+    zip_codes_in = [zt.zip_code for zt in zip_rows]
+    lead_counts: dict = {}
+    if zip_codes_in:
+        lead_counts = dict(db.execute(
+            select(_Prop.zip, func.count().label("cnt"))
+            .where(_Prop.zip.in_(zip_codes_in), _Prop.county_id == county_id)
+            .group_by(_Prop.zip)
+        ).all())
+
     now = datetime.now(timezone.utc)
     results = []
     for zt in zip_rows:
-        lead_count = db.execute(
-            select(func.count()).select_from(_Prop).where(
-                _Prop.zip == zt.zip_code,
-                _Prop.county_id == county_id,
-            )
-        ).scalar() or 0
+        lead_count = lead_counts.get(zt.zip_code, 0)
 
         active_viewers = 0
         try:
@@ -2746,8 +2813,9 @@ def human_close_outcome(
     outcome: str,
     closer_assigned: Optional[str] = None,
     db: Session = Depends(get_db),
+    _admin: dict = Depends(get_current_admin),
 ):
-    """Record outcome for a human close escalation. Admin-only (no additional auth here — mount behind admin router if needed)."""
+    """Record outcome for a human close escalation. Requires admin JWT."""
     from src.core.models import HumanCloseEscalation
     esc = db.get(HumanCloseEscalation, escalation_id)
     if not esc:
@@ -3357,7 +3425,7 @@ class ResumeRequest(BaseModel):
 
 class PartnerCheckoutRequest(BaseModel):
     feed_uuid: str
-    zip_codes: list
+    zip_codes: List[str]
     vertical: str
 
 

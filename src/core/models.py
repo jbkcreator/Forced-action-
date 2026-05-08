@@ -762,6 +762,11 @@ class Subscriber(Base):
     escalation_routed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     escalation_channel: Mapped[Optional[str]] = mapped_column(String(20))
 
+    # ── Stage 6: Stripe payment-failure recovery ──
+    payment_failed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    recovery_day1_sent: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
+    recovery_day3_sent: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
+
     bundle_purchases = relationship("BundlePurchase", back_populates="subscriber")
 
     # Audit

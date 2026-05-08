@@ -67,6 +67,10 @@ def resume_subscriber(db: Session, subscriber_id: int) -> bool:
         logger.error("resume_subscriber: subscriber %d not found", subscriber_id)
         return False
 
+    if sub.status != "paused":
+        logger.info("resume_subscriber: sub=%d status=%s — not paused", subscriber_id, sub.status)
+        return False
+
     if sub.stripe_subscription_id:
         try:
             import stripe as _stripe

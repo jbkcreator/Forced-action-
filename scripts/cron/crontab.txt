@@ -186,4 +186,17 @@ COUNTY_ID=hillsborough
 # SMS + writes a learning_card row.
 0 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.ab_rollback_check
 
+# ── STAGE 6 SWEEPS ───────────────────────────────────────────
+# AP Lite candidate sweep — weekly Monday 14:00 UTC (after annual_push slot).
+0 14 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.ap_lite_sweep
+
+# Wallet-to-Lock sweep — daily 13:30 UTC (before annual_push 14:00).
+30 13 * * * $PROJECT/scripts/cron/run.sh src.tasks.wallet_to_lock_sweep
+
+# Synthflow voice drop sweep — weekdays 15:00 UTC (after proactive_save 15:00).
+0 15 * * 1-5 $PROJECT/scripts/cron/run.sh src.tasks.synthflow_voice_drop_sweep
+
+# Stripe recovery sequence (Day 1 + Day 3) — daily 16:00 UTC, after proactive_save 15:00.
+0 16 * * * $PROJECT/scripts/cron/run.sh src.tasks.stripe_recovery_sweep
+
 # === END FORCED-ACTION-PLATFORM ===
