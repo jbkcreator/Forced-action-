@@ -94,9 +94,6 @@ COUNTY_ID=hillsborough
 
 # ── CDS SCORING ──────────────────────────────────────────────
 # CDS Scoring Engine         — 07:00 AM UTC / 03:00 AM EDT / 12:30 PM IST (after all scrapers complete)
-0 7 * * 1-5 $PROJECT/scripts/cron/run.sh src.services.cds_engine
-
-# --rescore-all: rescore all 522k properties daily
 0 7 * * 1-5 $PROJECT/scripts/cron/run.sh src.services.cds_engine --rescore-all
 
 # ── STRIPE RECONCILIATION ────────────────────────────────────
