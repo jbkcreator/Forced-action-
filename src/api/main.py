@@ -2745,7 +2745,7 @@ def territory_map(
     from src.core.models import ZipTerritory, Property as _Prop, DistressScore as _DS
     from src.core.redis_client import redis_available, rget, rset
     from src.services.urgency_engine import get_active_count
-    from src.utils.zip_centroids import get_zip_centroid
+    from src.utils.zip_centroids import HILLSBOROUGH_ZIP_CENTROIDS, get_zip_centroid
 
     cache_key = f"territory_map:{county_id}:{vertical}"
     if redis_available():
@@ -2759,38 +2759,44 @@ def territory_map(
             ZipTerritory.vertical == vertical,
         )
     ).scalars().all()
+    territory_db = {zt.zip_code: zt for zt in zip_rows}
 
-    # Single GROUP BY query instead of one COUNT per ZIP
-    zip_codes_in = [zt.zip_code for zt in zip_rows]
+    # Always show all known ZIPs for this county; default to 'available' if not yet locked.
+    # For non-hillsborough counties fall back to only the rows that exist in zip_territories.
+    known_zips = sorted(HILLSBOROUGH_ZIP_CENTROIDS.keys()) if county_id == "hillsborough" else sorted(territory_db.keys())
+
+    # Single GROUP BY query for lead counts across all known ZIPs
     lead_counts: dict = {}
-    if zip_codes_in:
+    if known_zips:
         lead_counts = dict(db.execute(
             select(_Prop.zip, func.count().label("cnt"))
-            .where(_Prop.zip.in_(zip_codes_in), _Prop.county_id == county_id)
+            .where(_Prop.zip.in_(known_zips), _Prop.county_id == county_id)
             .group_by(_Prop.zip)
         ).all())
 
     now = datetime.now(timezone.utc)
     results = []
-    for zt in zip_rows:
-        lead_count = lead_counts.get(zt.zip_code, 0)
+    for zip_code in known_zips:
+        zt = territory_db.get(zip_code)
+        status = zt.status if zt else "available"
+        lead_count = lead_counts.get(zip_code, 0)
 
         active_viewers = 0
         try:
-            active_viewers = get_active_count(zt.zip_code)
+            active_viewers = get_active_count(zip_code)
         except Exception:
             pass
 
-        centroid = get_zip_centroid(zt.zip_code)
+        centroid = get_zip_centroid(zip_code)
         entry: dict = {
-            "zip": zt.zip_code,
-            "status": zt.status,
+            "zip": zip_code,
+            "status": status,
             "active_viewers": active_viewers,
             "lead_count": lead_count,
             "lat": centroid[0] if centroid else None,
             "lon": centroid[1] if centroid else None,
         }
-        if zt.status == "grace" and zt.grace_expires_at:
+        if zt and zt.status == "grace" and zt.grace_expires_at:
             entry["grace_expires_at"] = zt.grace_expires_at.isoformat()
         results.append(entry)
 
