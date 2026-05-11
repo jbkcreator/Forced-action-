@@ -118,7 +118,6 @@ def scrape_storm_damage(
         return 0
 
     state = config.get("state", "FL")
-    zip_prefixes = config.get("zip_prefixes", [])
     nws_zones = config.get("nws_zones", [])
 
     if nws_zones:
@@ -128,6 +127,8 @@ def scrape_storm_damage(
         logger.info("[storm] %s: no nws_zones configured, falling back to state-level fetch", county_id)
         alerts = _fetch_nws_alerts(state)
 
+    # ZIPs come from alerts. The DB query below scopes by Property.county_id,
+    # so out-of-county ZIPs (state-fallback case) get filtered naturally.
     affected_zips: set = set()
     storm_date = date.today()
 
@@ -137,12 +138,7 @@ def scrape_storm_damage(
         if not any(event_type in event for event_type in STORM_EVENT_TYPES):
             continue
 
-        alert_zips = _extract_affected_zips(alert)
-        county_zips = [
-            z for z in alert_zips
-            if any(z.startswith(pfx) for pfx in zip_prefixes)
-        ]
-        affected_zips.update(county_zips)
+        affected_zips.update(_extract_affected_zips(alert))
 
     if not affected_zips:
         logger.info("[storm] %s: no active storm alerts — 0 incidents", county_id)

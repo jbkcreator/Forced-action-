@@ -79,15 +79,29 @@ SIGNAL_SCHEMAS: dict[str, list[str]] = {
         "record_number", "opened_date", "violation_type", "status", "address",
     ],
     "permits": [
-        "permit_number", "issue_date", "permit_type", "status",
-        "address", "expiration_date", "description",
+        "Record Number",    # permit / application number
+        "Date",             # issue / filed date
+        "Record Type",      # permit type
+        "Status",           # application status
+        "Address",          # property address
+        "Expiration Date",  # permit expiration date
+        "Description",      # permit description
+        "Action",           # current workflow action
+        "Project Name",     # project name
     ],
     "court_records": [
         "Case Number", "FilingDate", "CaseTypeDescription", "Title",
         "PartyType", "LastName/CompanyName", "FirstName", "PartyAddress",
     ],
     "tax_delinquency": [
-        "parcel_id", "owner_name", "address", "total_amount_due", "years_delinquent",
+        "Account Number",    # parcel account id (A + parcel_id strip)
+        "Tax Yr",            # tax year
+        "Cert Status",       # tax certificate status
+        "Deed Status",       # tax deed application status
+        "Owner",             # owner name
+        "Property Address",  # site address
+        "Total Due",         # total amount owed (bulk download value)
+        "Years Delinquent",  # years delinquent (bulk download value)
     ],
     "deeds": [
         "Grantor", "Grantee", "Instrument", "document_type",

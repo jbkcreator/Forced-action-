@@ -108,7 +108,6 @@ def scrape_insurance_claims(
     config = get_county(county_id)
     fips = config.get("fips", "")
     state = config.get("state", "FL")
-    zip_prefixes = config.get("zip_prefixes", [])
 
     if date_range is None:
         end_date = date.today()
@@ -156,10 +155,12 @@ def scrape_insurance_claims(
         # ── Source 2: FEMA IA registrants → match by ZIP ──────────────────
         fema_registrants = _fetch_fema_ia_registrants(state, start_date)
 
+        # FEMA returns ZIPs state-wide; the DB query below scopes by
+        # Property.county_id == county_id so out-of-county ZIPs are filtered.
         affected_zips = set()
         for reg in fema_registrants:
             z = str(reg.get("zipCode", "")).zfill(5)
-            if any(z.startswith(p) for p in zip_prefixes):
+            if z and z != "00000":
                 affected_zips.add(z)
 
         if affected_zips:

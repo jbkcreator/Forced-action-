@@ -55,7 +55,6 @@ from src.core.database import get_db_context
 from src.core.models import TaxDelinquency, Property
 from src.utils.logger import setup_logging, get_logger
 from src.utils.prompt_loader import get_prompt, get_config
-from src.utils.csv_deduplicator import deduplicate_csv, get_unique_keys_for_type
 
 setup_logging()
 logger = get_logger(__name__)
@@ -83,7 +82,9 @@ def _make_llm():
 def build_agent_task(source: dict, tax_year: int, account_status: str) -> str:
     """
     Generate a browser-use agent task from county source metadata.
-    Falls back to a template if the LLM call fails.
+    When the source has a configured URL/nav_hint, uses LLM with source metadata.
+    Falls back to YAML prompt (Hillsborough legacy) only when no source URL is set,
+    then falls back to template if both fail.
     """
     import anthropic
     from config.settings import get_settings
@@ -91,6 +92,21 @@ def build_agent_task(source: dict, tax_year: int, account_status: str) -> str:
     portal_url = source.get("url", "")
     description = source.get("description", "")
     nav_hint = source.get("navigation_hint", "") or ""
+
+    # YAML prompt is Hillsborough-specific — skip it when source has a configured URL
+    if not portal_url:
+        try:
+            task = get_prompt(
+                "tax_delinquent_prompts.yaml",
+                "tax_delinquent_download.task_template",
+                account_status=account_status,
+                tax_year=tax_year,
+            )
+            if task:
+                logger.info("[LLM] Loaded agent task from YAML prompt")
+                return task
+        except Exception:
+            pass
 
     meta = {
         "portal_url": portal_url,
@@ -113,31 +129,9 @@ Source metadata:
 {json.dumps(meta, indent=2)}
 
 Requirements:
-- Navigate to portal_url.
-- Select or search for the "Public - Delinquent Report" (or equivalent delinquent report).
-- Set the tax year to {tax_year} and account status to "{account_status}" (or "Unpaid").
-- Submit the search and wait for results to load.
-- Click the CSV download button to download all results.
-- Wait at least 30 seconds for the file download to complete before finishing.
-- Do not navigate away or open new tabs during the download.
 - Keep the task under 350 words.
 """
 
-    # First try the YAML prompt (county-specific, preferred)
-    try:
-        task = get_prompt(
-            "tax_delinquent_prompts.yaml",
-            "tax_delinquent_download.task_template",
-            account_status=account_status,
-            tax_year=tax_year,
-        )
-        if task:
-            logger.info("[LLM] Loaded agent task from YAML prompt")
-            return task
-    except Exception:
-        pass
-
-    # Fall back to LLM generation
     try:
         settings = get_settings()
         client = anthropic.Anthropic(
@@ -216,6 +210,7 @@ async def download_tax_delinquent_report(
     account_status: str = DEFAULT_ACCOUNT_STATUS,
     wait_after_download: int = 30,
     county_id: str = "hillsborough",
+    headful: bool = False,
 ) -> bool:
     """
     RADAR PHASE: Download bulk tax delinquent report via browser-use agent.
@@ -242,7 +237,7 @@ async def download_tax_delinquent_report(
     logger.info("[RADAR] Proxy: %s", "Oxylabs enabled" if proxy else "NO PROXY — running direct")
 
     browser = Browser(
-        headless=True,
+        headless=not headful,
         disable_security=True,
         proxy=proxy,
         downloads_path=str(REFERENCE_DATA_DIR),
@@ -330,20 +325,21 @@ async def download_tax_delinquent_report(
 # Support: DB dedup + distress filter
 # ---------------------------------------------------------------------------
 
-def _get_existing_tax_records(tax_year: int) -> set:
-    """Query DB for existing tax delinquency account numbers for the given year."""
-    logger.info("[Dedup] Querying DB for existing tax records (year %s)...", tax_year)
+def _get_existing_tax_records(tax_year: int, county_id: str = "hillsborough") -> set:
+    """Query DB for existing tax delinquency account numbers for the given year + county."""
+    logger.info("[Dedup] Querying DB for existing tax records (year %s, county=%s)...", tax_year, county_id)
     try:
         with get_db_context() as session:
             results = (
                 session.query(Property.parcel_id)
                 .join(TaxDelinquency, TaxDelinquency.property_id == Property.id)
                 .filter(TaxDelinquency.tax_year == tax_year)
+                .filter(Property.county_id == county_id)
                 .distinct()
                 .all()
             )
             existing = {"A" + row[0] for row in results if row[0]}
-            logger.info("[Dedup] Found %d existing records for %s", len(existing), tax_year)
+            logger.info("[Dedup] Found %d existing records for %s / %s", len(existing), tax_year, county_id)
             return existing
     except Exception as e:
         logger.error("[Dedup] Failed to query existing records: %s", e)
@@ -493,6 +489,8 @@ async def run_radar_sniper_pipeline(
     max_sniper_accounts: int = 100,
     skip_download: bool = False,
     county_id: str = "hillsborough",
+    load_to_db: bool = False,
+    headful: bool = False,
 ) -> bool:
     """Execute the full RADAR + SNIPER pipeline for tax delinquent lead generation."""
     try:
@@ -505,6 +503,7 @@ async def run_radar_sniper_pipeline(
                 tax_year=tax_year,
                 account_status=account_status,
                 county_id=county_id,
+                headful=headful,
             )
             if not success:
                 logger.error("[RADAR] Phase failed — aborting pipeline")
@@ -551,14 +550,21 @@ async def run_radar_sniper_pipeline(
             logger.warning("[Filter] No distressed accounts found")
             return False
 
-        # PHASE 3.5: DB dedup — only enrich NEW accounts
-        existing_accounts = _get_existing_tax_records(tax_year)
-        account_col = "Account Number"
+        # PHASE 3.5: DB dedup — only enrich NEW accounts (county-scoped)
+        existing_accounts = _get_existing_tax_records(tax_year, county_id=county_id)
+        # Detect account column — varies by county portal
+        account_col = None
+        for _col in ("Account Number", "Account #", "Account", "Parcel ID", "account_number"):
+            if _col in df_distressed.columns:
+                account_col = _col
+                break
         initial_count = len(df_distressed)
-        if existing_accounts:
+        if account_col and existing_accounts:
             df_new_only = df_distressed[~df_distressed[account_col].isin(existing_accounts)].copy()
             logger.info("[Dedup] %d existing filtered, %d new remain", initial_count - len(df_new_only), len(df_new_only))
         else:
+            if not account_col:
+                logger.warning("[Dedup] Account column not found — skipping pre-dedup")
             df_new_only = df_distressed
             logger.info("[Dedup] No existing records — all %d are new", len(df_new_only))
 
@@ -570,29 +576,17 @@ async def run_radar_sniper_pipeline(
         _parcel_url = _get_county(county_id)["urls"].get("parcel") or PARCEL_LOOKUP_URL
         df_enriched = await _sniper_enrich_accounts(df_new_only, max_accounts=max_sniper_accounts, parcel_lookup_url=_parcel_url)
 
-        # PHASE 5: Save with dedup
-        temp_dir = PROCESSED_DATA_DIR / "temp"
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        temp_file = temp_dir / "tax_temp.csv"
-        df_enriched.to_csv(temp_file, index=False)
+        # PHASE 5: Save to county-scoped output directory
+        from datetime import datetime
+        today = datetime.now().strftime("%Y%m%d")
+        out_dir = RAW_TAX_DELINQUENCIES_DIR / county_id / "new"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = out_dir / f"tax_delinquencies_{county_id}_{today}.csv"
+        df_enriched.to_csv(csv_path, index=False)
+        logger.info("[Save] Saved %d records → %s", len(df_enriched), csv_path)
 
-        try:
-            from datetime import datetime
-            unique_keys = get_unique_keys_for_type("tax")
-            today = datetime.now().strftime("%Y%m%d")
-            final_output = deduplicate_csv(
-                new_csv_path=temp_file,
-                destination_dir=PROCESSED_DATA_DIR,
-                unique_key_columns=unique_keys,
-                output_filename=f"tax_deliquencies_{today}.csv",
-                keep_original=False,
-            )
-            logger.info("[Save] Tax delinquency leads saved → %s", final_output)
-        except Exception as e:
-            logger.error("[Save] Deduplication failed: %s — saving without dedup", e)
-            final_output = PROCESSED_DATA_DIR / "final_weekly_distress_leads.csv"
-            df_enriched.to_csv(final_output, index=False)
-            temp_file.unlink(missing_ok=True)
+        if load_to_db:
+            _load_to_database(csv_path, county_id)
 
         return True
 
@@ -603,11 +597,49 @@ async def run_radar_sniper_pipeline(
 
 
 # ---------------------------------------------------------------------------
+# DB load
+# ---------------------------------------------------------------------------
+
+def _load_to_database(csv_path: Path, county_id: str) -> None:
+    """Load scraped CSV into the tax_delinquencies table via TaxDelinquencyLoader."""
+    from src.loaders.tax import TaxDelinquencyLoader
+
+    logger.info("=" * 60)
+    logger.info("Loading tax delinquencies into database...")
+    logger.info("=" * 60)
+
+    try:
+        with get_db_context() as session:
+            loader = TaxDelinquencyLoader(session, county_id)
+            matched, updated, unmatched = loader.load_from_csv(
+                str(csv_path), skip_duplicates=True
+            )
+            session.commit()
+
+        total = matched + updated + unmatched
+        match_rate = ((matched + updated) / total * 100) if total > 0 else 0
+        logger.info(
+            "Inserted: %d  Updated: %d  Unmatched: %d  Match rate: %.1f%%",
+            matched, updated, unmatched, match_rate,
+        )
+
+        try:
+            csv_path.unlink()
+            logger.info("[DB] CSV deleted after successful load")
+        except Exception:
+            pass
+
+    except Exception as e:
+        logger.error("[DB] Load failed: %s", e)
+        logger.debug(traceback.format_exc())
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    from src.utils.scraper_db_helper import add_load_to_db_arg, load_scraped_data_to_db, record_scraper_stats
+    from src.utils.scraper_db_helper import record_scraper_stats
 
     parser = argparse.ArgumentParser(description="Tax Delinquent RADAR + SNIPER Pipeline")
     parser.add_argument("--county-id", dest="county_id", default="hillsborough",
@@ -624,7 +656,10 @@ if __name__ == "__main__":
                         help=f"Account status filter (default: {DEFAULT_ACCOUNT_STATUS})")
     parser.add_argument("--skip-download", action="store_true",
                         help="Skip RADAR phase and use existing CSV")
-    add_load_to_db_arg(parser)
+    parser.add_argument("--load-to-db", action="store_true",
+                        help="Load scraped records into database after pipeline completes")
+    parser.add_argument("--headful", action="store_true",
+                        help="Open a real browser window (useful for debugging)")
     args = parser.parse_args()
 
     _t0 = time.monotonic()
@@ -636,6 +671,7 @@ if __name__ == "__main__":
                 tax_year=args.tax_year,
                 account_status=args.status,
                 county_id=args.county_id,
+                headful=args.headful,
             ))
         else:
             asyncio.run(run_radar_sniper_pipeline(
@@ -645,27 +681,22 @@ if __name__ == "__main__":
                 max_sniper_accounts=args.max_sniper,
                 skip_download=args.skip_download,
                 county_id=args.county_id,
+                headful=args.headful,
+                load_to_db=args.load_to_db,
             ))
 
         logger.info("Tax Delinquent Engine completed successfully")
 
-        if args.load_to_db:
-            _file_prefix = _get_county(args.county_id)["file_prefix"]
-            new_dir = RAW_TAX_DELINQUENCIES_DIR / "new"
-            csv_files = sorted(new_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True) if new_dir.exists() else []
-            if not csv_files:
-                csv_files = sorted(REFERENCE_DATA_DIR.glob(f"{_file_prefix}_tax_delinquent_*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
-            if csv_files:
-                logger.info("Loading to database: %s", csv_files[0])
-                load_scraped_data_to_db("tax", csv_files[0], destination_dir=RAW_TAX_DELINQUENCIES_DIR)
-            else:
-                logger.error("No tax delinquency CSV found to load")
-                sys.exit(1)
-        else:
-            try:
-                record_scraper_stats(source_type="tax_delinquencies", total_scraped=0, matched=0, unmatched=0, skipped=0, run_success=True, duration_seconds=round(time.monotonic() - _t0, 2), county_id=args.county_id)
-            except Exception as _se:
-                logger.warning("Could not record scraper stats: %s", _se)
+        try:
+            record_scraper_stats(
+                source_type="tax_delinquencies",
+                total_scraped=0, matched=0, unmatched=0, skipped=0,
+                run_success=True,
+                duration_seconds=round(time.monotonic() - _t0, 2),
+                county_id=args.county_id,
+            )
+        except Exception as _se:
+            logger.warning("Could not record scraper stats: %s", _se)
 
     except KeyboardInterrupt:
         logger.warning("Pipeline interrupted by user")
@@ -674,7 +705,14 @@ if __name__ == "__main__":
         logger.error("Pipeline failed: %s", e)
         logger.debug(traceback.format_exc())
         try:
-            record_scraper_stats(source_type="tax_delinquencies", total_scraped=0, matched=0, unmatched=0, skipped=0, run_success=False, error_message=str(e)[:500], duration_seconds=round(time.monotonic() - _t0, 2), county_id=args.county_id)
+            record_scraper_stats(
+                source_type="tax_delinquencies",
+                total_scraped=0, matched=0, unmatched=0, skipped=0,
+                run_success=False,
+                error_message=str(e)[:500],
+                duration_seconds=round(time.monotonic() - _t0, 2),
+                county_id=args.county_id,
+            )
         except Exception:
             pass
         sys.exit(1)

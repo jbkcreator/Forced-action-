@@ -1966,3 +1966,38 @@ class CountyColumnMapping(Base):
         Index("idx_county_col_mappings_source_id", "source_id"),
         Index("idx_county_col_mappings_is_approved", "is_approved"),
     )
+
+
+class PlaywrightCodeHistory(Base):
+    """
+    Append-only history of every LLM-generated Playwright scrape function.
+
+    One row per (re)generation or cache-clear event. Lets us answer:
+      - When did this source's scraper change?
+      - Was it a prompt-version change or a portal change?
+      - Roll back to the previous code if a new generation regresses.
+    """
+    __tablename__ = "playwright_code_history"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    source_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("county_sources.id"), nullable=False, index=True
+    )
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    code: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # null on 'cleared' rows
+    prompt_version: Mapped[Optional[str]] = mapped_column(String(20))
+    reason: Mapped[str] = mapped_column(String(40), nullable=False)  # generated | cleared | approved
+    is_approved: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    generated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        Index("idx_pwc_history_source_generated", "source_id", "generated_at"),
+    )
+
+    def __repr__(self):
+        return (
+            f"<PlaywrightCodeHistory(source_id={self.source_id}, "
+            f"reason={self.reason!r}, version={self.prompt_version})>"
+        )

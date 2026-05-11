@@ -250,7 +250,7 @@ async def _run_download_pipeline(
 ) -> Optional[Path]:
     """Download → filter → deduplicate. Returns deduplicated CSV path or None."""
     config = get_county(county_id)
-    portal_url = config.get("portals", {}).get("fire_incidents_url", _FIRE_PORTAL_URL)
+    portal_url = config.get("sources", {}).get("fire", {}).get("url") or _FIRE_PORTAL_URL
 
     raw_csv = await _download_calls_csv(portal_url)
     if not raw_csv:

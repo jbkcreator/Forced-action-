@@ -72,7 +72,8 @@ def _get_court_source(county_id: str) -> dict:
 
 
 async def _download_civil_filing_browser(
-    county_id: str, source: dict, target_date: str | None, dest_dir: Path
+    county_id: str, source: dict, target_date: str | None, dest_dir: Path,
+    headful: bool = False,
 ) -> Path:
     """
     Browser-use agent download for counties whose civil portal requires a browser
@@ -86,6 +87,9 @@ async def _download_civil_filing_browser(
     if target_date:
         target_dt = datetime.strptime(target_date.replace("-", ""), "%Y%m%d")
         start_str = end_str = target_dt.strftime("%m/%d/%Y")
+    elif source.get("start_date") and source.get("end_date"):
+        start_str = datetime.strptime(source["start_date"], "%Y-%m-%d").strftime("%m/%d/%Y")
+        end_str   = datetime.strptime(source["end_date"],   "%Y-%m-%d").strftime("%m/%d/%Y")
     else:
         end_dt = datetime.now()
         start_str = (end_dt - timedelta(days=1)).strftime("%m/%d/%Y")
@@ -105,9 +109,8 @@ async def _download_civil_filing_browser(
 
     dest_dir.mkdir(parents=True, exist_ok=True)
     browser = Browser(
-        headless=True,
+        headless=not headful,
         disable_security=True,
-        proxy=get_browser_use_proxy(),
         downloads_path=str(dest_dir),
         user_agent=_STEALTH_UA,
         ignore_default_args=["--enable-automation"],
@@ -145,7 +148,10 @@ async def _download_civil_filing_browser(
     return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
-def download_latest_civil_filing(target_date: str = None, county_id: str = "hillsborough") -> Path:
+def download_latest_civil_filing(
+    target_date: str = None, county_id: str = "hillsborough", headful: bool = False,
+    start_date: str = None, end_date: str = None,
+) -> Path:
     """
     Download the latest civil filing from the county clerk.
     Hillsborough: requests-based directory listing → CSV.
@@ -154,10 +160,13 @@ def download_latest_civil_filing(target_date: str = None, county_id: str = "hill
     source = _get_court_source(county_id)
     output_format = source.get("output_format", "csv")
 
+    if start_date:
+        source = dict(source, start_date=start_date, end_date=end_date or start_date)
+
     if output_format == "excel":
         logger.info("[evictions] County '%s' uses browser download (output_format=excel)", county_id)
         return asyncio.run(
-            _download_civil_filing_browser(county_id, source, target_date, RAW_EVICTIONS_DIR)
+            _download_civil_filing_browser(county_id, source, target_date, RAW_EVICTIONS_DIR, headful=headful)
         )
 
     # Hillsborough / CSV directory-listing path
@@ -222,6 +231,61 @@ def download_latest_civil_filing(target_date: str = None, county_id: str = "hill
     return output_path
 
 
+def _normalize_style_col_format(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize Pinellas-style one-row-per-case court export to the multi-row
+    format that Hillsborough uses and downstream loaders expect.
+
+    Pinellas columns: Case Type, Case #, Filed, Style/Description, Status, Judicial Officer
+    Canonical format: CaseTypeDescription, Case Number, FilingDate, Title, PartyType,
+                      LastName/CompanyName, PartyAddress
+
+    Style/Description format: "PLAINTIFF NAME\nVs.\nDEFENDANT NAME"
+    Each case row is expanded into two rows (Plaintiff + Defendant).
+    """
+    rename = {
+        "Case #":        "Case Number",
+        "Filed":         "FilingDate",
+        "Case Type":     "CaseTypeDescription",
+        "Status":        "Title",
+    }
+    df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+
+    if "Style/Description" not in df.columns:
+        return df
+
+    expanded_rows = []
+    for _, row in df.iterrows():
+        style = str(row.get("Style/Description", "") or "")
+        # Split on "Vs." variants — newline-separated or just " Vs. "
+        parts = re.split(r'\n[Vv][Ss]\.\n|[\s]+[Vv][Ss]\.[\s]+', style, maxsplit=1)
+        plaintiff = parts[0].strip() if len(parts) >= 1 else ""
+        defendant = parts[1].strip().rstrip(".").strip() if len(parts) >= 2 else ""
+        # Strip common suffixes like "et al"
+        for suffix in (" et al", " ET AL", " Et Al"):
+            defendant = defendant.removesuffix(suffix).strip()
+
+        for party_type, name in (("Plaintiff", plaintiff), ("Defendant", defendant)):
+            if not name:
+                continue
+            new_row = row.to_dict()
+            new_row["PartyType"] = party_type
+            new_row["LastName/CompanyName"] = name
+            new_row["FirstName"] = ""
+            new_row["PartyAddress"] = None
+            expanded_rows.append(new_row)
+
+    if not expanded_rows:
+        return df
+
+    result = pd.DataFrame(expanded_rows)
+    logger.info(
+        "[evictions] Pinellas normalizer: %d cases → %d party rows",
+        len(df), len(result),
+    )
+    return result
+
+
 def process_civil_data(file_path: Path, county_id: str = "hillsborough") -> pd.DataFrame:
     """Load the civil filing (CSV or Excel) with multi-encoding support."""
     source = _get_court_source(county_id)
@@ -229,18 +293,26 @@ def process_civil_data(file_path: Path, county_id: str = "hillsborough") -> pd.D
 
     if output_format == "excel" or file_path.suffix.lower() in (".xlsx", ".xls"):
         logger.info("[evictions] Reading Excel civil filing: %s", file_path)
-        return pd.read_excel(file_path)
+        df = pd.read_excel(file_path)
+    else:
+        logger.info("[evictions] Loading civil filing from: %s", file_path)
+        encodings = ["utf-8", "latin1", "cp1252"]
+        df = None
+        for enc in encodings:
+            try:
+                df = pd.read_csv(file_path, encoding=enc)
+                logger.info("[evictions] Loaded %d records (%s)", len(df), enc)
+                break
+            except (UnicodeDecodeError, pd.errors.ParserError):
+                continue
+        if df is None:
+            raise ValueError(f"[evictions] Could not read civil filing with any standard encoding: {file_path}")
 
-    logger.info("[evictions] Loading civil filing from: %s", file_path)
-    encodings = ["utf-8", "latin1", "cp1252"]
-    for enc in encodings:
-        try:
-            df = pd.read_csv(file_path, encoding=enc)
-            logger.info("[evictions] Loaded %d records (%s)", len(df), enc)
-            return df
-        except (UnicodeDecodeError, pd.errors.ParserError):
-            continue
-    raise ValueError(f"[evictions] Could not read civil filing with any standard encoding: {file_path}")
+    # Apply Pinellas-style normalizer when Style/Description column parsing is needed
+    if source.get("style_col") == "Style/Description":
+        df = _normalize_style_col_format(df)
+
+    return df
 
 
 def filter_evictions(df: pd.DataFrame, county_id: str = "hillsborough") -> pd.DataFrame:
@@ -282,7 +354,10 @@ def save_processed_evictions(df: pd.DataFrame, output_filename: str = "eviction_
     return final_file
 
 
-def run_eviction_pipeline(target_date: str = None, county_id: str = "hillsborough") -> bool:
+def run_eviction_pipeline(
+    target_date: str = None, county_id: str = "hillsborough", headful: bool = False,
+    start_date: str = None, end_date: str = None,
+) -> bool:
     """Full pipeline: download → load → filter → dedup → save. Returns True on success."""
     t0 = time.monotonic()
     try:
@@ -290,7 +365,10 @@ def run_eviction_pipeline(target_date: str = None, county_id: str = "hillsboroug
         logger.info("%s EVICTION DATA COLLECTION PIPELINE", county_id.upper())
         logger.info(OUTPUT_SEPARATOR)
 
-        file_path = download_latest_civil_filing(target_date=target_date, county_id=county_id)
+        file_path = download_latest_civil_filing(
+            target_date=target_date, county_id=county_id, headful=headful,
+            start_date=start_date, end_date=end_date,
+        )
         civil_df = process_civil_data(file_path, county_id=county_id)
         evictions_df = filter_evictions(civil_df, county_id=county_id)
 
@@ -346,13 +424,20 @@ if __name__ == "__main__":
     from src.utils.scraper_db_helper import load_scraped_data_to_db, add_load_to_db_arg
 
     parser = argparse.ArgumentParser(description="Scrape county eviction filings")
-    parser.add_argument("--date", type=str, default=None, help="Target date YYYY-MM-DD (default: latest)")
+    parser.add_argument("--date", type=str, default=None, help="Single target date YYYY-MM-DD")
+    parser.add_argument("--start-date", dest="start_date", type=str, default=None, help="Start date YYYY-MM-DD")
+    parser.add_argument("--end-date", dest="end_date", type=str, default=None, help="End date YYYY-MM-DD (default: today)")
     parser.add_argument("--county-id", dest="county_id", default="hillsborough",
                         help="County identifier (default: hillsborough)")
+    parser.add_argument("--headful", action="store_true", default=False,
+                        help="Run browser in headed (visible) mode for debugging")
     add_load_to_db_arg(parser)
     args = parser.parse_args()
 
-    success = run_eviction_pipeline(target_date=args.date, county_id=args.county_id)
+    success = run_eviction_pipeline(
+        target_date=args.date, county_id=args.county_id, headful=args.headful,
+        start_date=args.start_date, end_date=args.end_date,
+    )
 
     if success and args.load_to_db:
         try:

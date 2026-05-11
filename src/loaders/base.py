@@ -635,7 +635,8 @@ class BaseLoader(ABC):
 
         # ── Strategy 1: Exact case-insensitive match ─────────────────────
         exact_owner = self.session.query(Owner).filter(
-            Owner.owner_name.ilike(normalized_search)
+            Owner.owner_name.ilike(normalized_search),
+            Owner.county_id == self.county_id,
         ).first()
         if exact_owner:
             return exact_owner.property, 100
@@ -656,7 +657,8 @@ class BaseLoader(ABC):
             candidates = []
             for pattern in patterns:
                 rows = self.session.query(Owner).filter(
-                    Owner.owner_name.ilike(pattern)
+                    Owner.owner_name.ilike(pattern),
+                    Owner.county_id == self.county_id,
                 ).limit(50).all()
                 for r in rows:
                     if r.id not in seen_ids:
@@ -688,7 +690,10 @@ class BaseLoader(ABC):
             with self.session.begin_nested():   # savepoint
                 trgm_owners = (
                     self.session.query(Owner)
-                    .filter(sqlfunc.similarity(Owner.owner_name, normalized_search) >= 0.35)
+                    .filter(
+                        sqlfunc.similarity(Owner.owner_name, normalized_search) >= 0.35,
+                        Owner.county_id == self.county_id,
+                    )
                     .order_by(sqlfunc.similarity(Owner.owner_name, normalized_search).desc())
                     .limit(10)
                     .all()
@@ -731,7 +736,10 @@ class BaseLoader(ABC):
             with self.session.begin_nested():
                 owners = (
                     self.session.query(Owner)
-                    .filter(sqlfunc.similarity(Owner.owner_name, normalized) >= 0.3)
+                    .filter(
+                        sqlfunc.similarity(Owner.owner_name, normalized) >= 0.3,
+                        Owner.county_id == self.county_id,
+                    )
                     .order_by(sqlfunc.similarity(Owner.owner_name, normalized).desc())
                     .limit(limit)
                     .all()
@@ -863,7 +871,7 @@ class BaseLoader(ABC):
         self,
         source_type: str,
         raw_row: dict,
-        county_id: str = "hillsborough",
+        county_id: str = None,
         instrument_number: str = None,
         grantor: str = None,
         address_string: str = None,
@@ -874,6 +882,9 @@ class BaseLoader(ABC):
         """
         from src.core.models import UnmatchedRecord
         from datetime import datetime, timezone
+
+        if county_id is None:
+            county_id = self.county_id
 
         # Sanitize raw_row — convert non-serializable values to strings
         import math
@@ -889,7 +900,7 @@ class BaseLoader(ABC):
                 except (TypeError, ValueError):
                     safe_raw[k] = str(v)
 
-        record = UnmatchedRecord(
+        values = dict(
             source_type=source_type,
             county_id=county_id,
             raw_data=safe_raw,
@@ -899,9 +910,31 @@ class BaseLoader(ABC):
             match_status="unmatched",
             match_attempted_at=datetime.now(timezone.utc),
         )
+
         try:
             with self.session.begin_nested():
-                self.session.add(record)
+                if values["instrument_number"]:
+                    # Upsert so re-encountering the same source record refreshes
+                    # the attempt timestamp + raw_data instead of raising on the
+                    # partial unique index uq_unmatched_instrument_source_county.
+                    from sqlalchemy.dialects.postgresql import insert as pg_insert
+                    stmt = pg_insert(UnmatchedRecord.__table__).values(**values)
+                    stmt = stmt.on_conflict_do_update(
+                        index_elements=["instrument_number", "source_type", "county_id"],
+                        index_where=UnmatchedRecord.instrument_number.isnot(None),
+                        set_={
+                            "raw_data":            stmt.excluded.raw_data,
+                            "match_status":        stmt.excluded.match_status,
+                            "match_attempted_at":  stmt.excluded.match_attempted_at,
+                            "grantor":             stmt.excluded.grantor,
+                            "address_string":      stmt.excluded.address_string,
+                        },
+                    )
+                    self.session.execute(stmt)
+                else:
+                    # No instrument_number → partial unique index doesn't apply;
+                    # plain insert is fine.
+                    self.session.add(UnmatchedRecord(**values))
         except Exception as e:
             logger.warning("Could not quarantine unmatched record (source=%s): %s", source_type, e)
 
