@@ -20,7 +20,7 @@ Usage:
 import logging
 import sys
 import uuid
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import select
@@ -32,7 +32,7 @@ from config.retention import (
     RETENTION_IDEMPOTENCY_WINDOW,
 )
 from src.core.database import get_db_context
-from src.core.models import MessageOutcome, Subscriber
+from src.core.models import MessageOutcome, Subscriber, WalletBalance
 from src.core.redis_client import redis_available, rget, rset
 
 logger = logging.getLogger(__name__)
@@ -55,14 +55,14 @@ def _last_engagement(db: Session, subscriber_id: int) -> Optional[datetime]:
 def _is_deduplicated(subscriber_id: int) -> bool:
     if not redis_available():
         return False
-    key = f"retention_idem:{subscriber_id}:{date.today().strftime(RETENTION_IDEMPOTENCY_WINDOW)}"
+    key = f"retention_idem:{subscriber_id}:{datetime.now(timezone.utc).date().strftime(RETENTION_IDEMPOTENCY_WINDOW)}"
     return bool(rget(key))
 
 
 def _mark_deduplicated(subscriber_id: int) -> None:
     if not redis_available():
         return
-    key = f"retention_idem:{subscriber_id}:{date.today().strftime(RETENTION_IDEMPOTENCY_WINDOW)}"
+    key = f"retention_idem:{subscriber_id}:{datetime.now(timezone.utc).date().strftime(RETENTION_IDEMPOTENCY_WINDOW)}"
     rset(key, "1", ttl_seconds=_IDEM_TTL_SECONDS)
 
 
@@ -76,7 +76,7 @@ def _emit_event(subscriber_id: int, tier: str, window_days: int) -> None:
         payload={"tier": tier, "window_days": window_days},
         source="cron",
         decision_id=str(uuid.uuid4()),
-        idempotency_key=f"retention:{subscriber_id}:{date.today().strftime(RETENTION_IDEMPOTENCY_WINDOW)}",
+        idempotency_key=f"retention:{subscriber_id}:{datetime.now(timezone.utc).date().strftime(RETENTION_IDEMPOTENCY_WINDOW)}",
     )
     dispatch_event(evt.to_dispatch_dict())
 
@@ -93,12 +93,21 @@ def run(dry_run: bool = False) -> dict:
 
     with get_db_context() as db:
         for tier, days in RETENTION_CADENCE_DAYS.items():
-            subs = db.execute(
-                select(Subscriber).where(
-                    Subscriber.tier == tier,
-                    Subscriber.status == "active",
-                )
-            ).scalars().all()
+            # "wallet" is not a DB tier — resolve via WalletBalance membership
+            if tier == "wallet":
+                subs = db.execute(
+                    select(Subscriber).where(
+                        Subscriber.id.in_(select(WalletBalance.subscriber_id)),
+                        Subscriber.status == "active",
+                    )
+                ).scalars().all()
+            else:
+                subs = db.execute(
+                    select(Subscriber).where(
+                        Subscriber.tier == tier,
+                        Subscriber.status == "active",
+                    )
+                ).scalars().all()
 
             cutoff = now - timedelta(days=days)
 
@@ -110,11 +119,14 @@ def run(dry_run: bool = False) -> dict:
                         continue
 
                     last = _last_engagement(db, sub.id)
-                    ref = last if last else (
-                        sub.created_at.replace(tzinfo=timezone.utc)
-                        if sub.created_at and sub.created_at.tzinfo is None
-                        else sub.created_at
-                    )
+                    # Normalize to UTC-aware to avoid TypeError when comparing
+                    # with aware cutoff (MessageOutcome.sent_at has no timezone column).
+                    def _to_utc(dt: Optional[datetime]) -> Optional[datetime]:
+                        if dt is None:
+                            return None
+                        return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+                    ref = _to_utc(last) or _to_utc(sub.created_at)
 
                     if not ref or ref >= cutoff:
                         continue

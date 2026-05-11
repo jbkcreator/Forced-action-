@@ -37,7 +37,7 @@ def run(dry_run: bool = False) -> dict:
 
         for sub in subs:
             try:
-                elapsed = now - sub.payment_failed_at
+                elapsed = now - sub.payment_failed_at.replace(tzinfo=timezone.utc)
                 if DAY1_MIN <= elapsed <= DAY1_MAX and not sub.recovery_day1_sent:
                     if not dry_run:
                         _send_day1(sub)
@@ -91,7 +91,7 @@ def _send_day1(sub: Subscriber) -> None:
 </body>
 </html>"""
     send_email(
-        to_address=sub.email,
+        to=sub.email,
         subject=subject,
         body_text=body_text,
         body_html=body_html,
@@ -155,7 +155,7 @@ def _send_day3(sub: Subscriber, db) -> None:
 </body>
 </html>"""
     send_email(
-        to_address=sub.email,
+        to=sub.email,
         subject=subject,
         body_text=body_text,
         body_html=body_html,

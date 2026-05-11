@@ -978,6 +978,19 @@ def _on_subscription_updated(subscription: dict, db: Session) -> None:
     }
     new_status = status_map.get(stripe_status, subscriber.status)
 
+    # When Stripe fires subscription.updated after pause_collection is set, the Stripe-side
+    # status remains "active" — don't let that overwrite our local "paused" status.
+    # Guard: keep "paused" if pause_collection is still active in the event payload.
+    if subscriber.status == "paused" and new_status == "active":
+        pause_collection = subscription.get("pause_collection")
+        if pause_collection:
+            logger.info(
+                "subscription.updated: subscriber=%s keeping local status=paused "
+                "(Stripe status=%s but pause_collection is set)",
+                subscriber.id, stripe_status,
+            )
+            new_status = "paused"
+
     # Never overwrite founding_price_id — only update status
     subscriber.status = new_status
     subscriber.stripe_subscription_id = subscription.get("id", subscriber.stripe_subscription_id)
@@ -1122,6 +1135,11 @@ def _on_subscription_deleted(subscription: dict, db: Session) -> None:
     subscriber.status = "grace"
     subscriber.grace_expires_at = grace_expires
     subscriber.ghl_stage = 7
+    # Clear recovery sweep state — sweep query has no status filter, so without this
+    # a subscriber who cancelled mid-recovery would keep receiving Day 1/Day 3 emails.
+    subscriber.payment_failed_at = None
+    subscriber.recovery_day1_sent = False
+    subscriber.recovery_day3_sent = False
 
     # Set ZIP territories to grace — they remain locked for 48hr
     territories = db.execute(

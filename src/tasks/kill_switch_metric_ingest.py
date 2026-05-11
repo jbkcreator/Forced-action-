@@ -32,6 +32,7 @@ from sqlalchemy.orm import Session
 
 from src.core.database import get_db_context
 from src.core.models import AgentDecision, Subscriber, WalletBalance
+from src.core.redis_client import redis_available, rget, rset
 
 logger = logging.getLogger(__name__)
 
@@ -39,36 +40,20 @@ _REDIS_TTL = 25 * 3600  # 25 hours — survives one missed cron run
 _REDIS_PREFIX = "fa:ks_metric:"
 
 
-def _get_redis():
-    """Return a Redis client or None if not configured."""
-    try:
-        from config.settings import settings
-        if not settings.redis_url:
-            return None
-        import redis as redis_lib
-        return redis_lib.from_url(settings.redis_url, decode_responses=True)
-    except Exception:
-        return None
-
-
-def _cache_metric(r, feature: str, value: Optional[float]) -> None:
-    if r is None or value is None:
+def _cache_metric(feature: str, value: Optional[float]) -> None:
+    if value is None or not redis_available():
         return
-    try:
-        r.setex(f"{_REDIS_PREFIX}{feature}", _REDIS_TTL, str(value))
-    except Exception as exc:
-        logger.warning("kill_switch_metric_ingest: Redis write failed for %s: %s", feature, exc)
+    rset(f"{_REDIS_PREFIX}{feature}", str(value), ttl_seconds=_REDIS_TTL)
 
 
 def get_cached_metric(feature: str) -> Optional[float]:
     """Return the last-cached metric value for a feature, or None."""
-    r = _get_redis()
-    if r is None:
+    if not redis_available():
         return None
+    val = rget(f"{_REDIS_PREFIX}{feature}")
     try:
-        val = r.get(f"{_REDIS_PREFIX}{feature}")
         return float(val) if val is not None else None
-    except Exception:
+    except (TypeError, ValueError):
         return None
 
 
@@ -113,10 +98,11 @@ def _compute_metrics(db: Session) -> dict:
     metrics["wallet_adoption"] = round((with_wallet / total_active * 100), 1) if total_active > 0 else None
 
     # lock_conversion — active annual_lock subs created last 30d / wallet subs last 30d
+    # "wallet" is not a DB tier; resolve via WalletBalance membership.
     wallet_new = db.execute(
         select(func.count(Subscriber.id)).where(
             Subscriber.created_at >= ago_30,
-            Subscriber.tier == "wallet",
+            Subscriber.id.in_(select(WalletBalance.subscriber_id)),
         )
     ).scalar() or 0
     lock_new = db.execute(
@@ -164,14 +150,12 @@ def _compute_metrics(db: Session) -> dict:
 
 def run_kill_switch_metric_ingest(dry_run: bool = False) -> dict:
     """Compute kill-switch metrics and cache in Redis. Returns computed values."""
-    r = _get_redis()
-
     with get_db_context() as db:
         metrics = _compute_metrics(db)
 
     if not dry_run:
         for feature, value in metrics.items():
-            _cache_metric(r, feature, value)
+            _cache_metric(feature, value)
         logger.info("[KillSwitchMetricIngest] cached %d metrics", sum(1 for v in metrics.values() if v is not None))
     else:
         logger.info("[KillSwitchMetricIngest] dry_run — computed: %s", json.dumps(metrics, indent=2))
