@@ -1,0 +1,19 @@
+# Abandonment Wave 1 — Variant B
+# Frame: time pressure — countdown to wall close, no specific count.
+version: 1
+variant: b
+user: |
+  Free user in {vertical} bounced from the proof-moment wall without paying.
+  Wall has been open {minutes_since_session_start} min.
+
+  Live context:
+    - {wall_countdown_minutes} min of the urgency window remain.
+    - First name: {subscriber_first_name}.
+    - Unlock link: {unlock_link}.
+
+  Frame this message as the COUNTDOWN — anchor on
+  {wall_countdown_minutes} minutes remaining. Make the countdown
+  feel like a hard deadline. Avoid using lead-count numbers; pure
+  time-based urgency.
+
+  Write the SMS. No preamble.

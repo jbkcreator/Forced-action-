@@ -1,0 +1,6 @@
+# Static fallback body used when kill-switch is YELLOW for abandonment Wave 1.
+# No Claude call — we ship this verbatim.
+version: 1
+body: |
+  {subscriber_first_name}, your preview is still open with Gold leads ready.
+  Tap to unlock before it closes. {unlock_link}

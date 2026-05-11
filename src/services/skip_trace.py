@@ -76,7 +76,31 @@ def _call_batch_data(requests_payload: list, api_key: str) -> list:
 
     data = resp.json()
     # Response shape: {"status": {"code": 200}, "results": {"persons": [...], "meta": {...}}}
-    return data.get("results", {}).get("persons", [])
+    persons = data.get("results", {}).get("persons", [])
+
+    # Audit-log every BatchData poll so it shows up in the unified webhook_events
+    # log alongside the other sources (BatchData has no inbound webhook — we poll).
+    try:
+        from src.services.webhook_log import log_webhook_event
+        match_count = sum(1 for p in persons if p)
+        log_webhook_event(
+            source="batch_data",
+            event_type="skip_trace_completed",
+            direction="outbound",
+            status="processed",
+            payload={
+                "request_count": len(requests_payload),
+                "match_count":   match_count,
+                "phone_count":   sum(len(p.get("phoneNumbers") or []) for p in persons if isinstance(p, dict)),
+                "email_count":   sum(len(p.get("emails") or []) for p in persons if isinstance(p, dict)),
+                "status":        "ok",
+            },
+            payload_kind="batch_data",
+        )
+    except Exception:
+        pass  # never let audit-logging break the skip-trace path
+
+    return persons
 
 
 def _parse_result(person: dict) -> dict:

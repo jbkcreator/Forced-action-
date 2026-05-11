@@ -1,0 +1,21 @@
+# FOMO — Variant B
+# Frame: direct competitive loss — name the action that just happened.
+# Overrides only the `user` block; system persona/rules unchanged.
+version: 1
+variant: b
+user: |
+  A contractor in {zip_code} running the {vertical} vertical needs a
+  competitor-loss nudge.
+
+  Live context:
+    - A competitor just contacted a {lead_tier} lead in {zip_code}.
+    - {active_lead_count} Gold leads remain in the ZIP.
+    - Subscriber's first name: {subscriber_first_name}.
+    - Unlock link: {unlock_link}.
+
+  Frame this message around the COMPETITOR ACTION that just happened —
+  make the loss feel concrete. Reference {zip_code} and the lead tier.
+  Avoid generic scarcity language; lead with the specific action that
+  triggered this alert.
+
+  Write the SMS. No preamble.

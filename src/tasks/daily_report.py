@@ -468,6 +468,98 @@ def _build_gold_delta(session, run_date: date, county_id: str) -> dict:
     return {"by_vertical": by_vertical, "by_zip": by_zip}
 
 
+def _build_phone_coverage(session, run_date: date, county_id: str) -> dict:
+    """
+    Phone-coverage on Gold+ leads — measures the upstream-drop volume.
+
+    For every property whose latest distress_score on or before run_date is
+    Gold+, check whether the linked Owner has a phone_1 set. Leads with no
+    phone are effectively dropped at the upstream stage — they cannot be
+    routed to Synthflow voice or Twilio SMS, regardless of vertical or tier.
+
+    Returned shape:
+      {
+        "total_gold_plus":        int,
+        "with_phone":             int,
+        "without_phone":          int,           # the "dropped" count
+        "without_phone_pct":      float,
+        "by_tier": {
+           "Ultra Platinum": {"total": int, "with_phone": int, "without_phone": int},
+           "Platinum":       {"total": int, "with_phone": int, "without_phone": int},
+           "Gold":           {"total": int, "with_phone": int, "without_phone": int},
+        },
+      }
+    """
+    sql = text("""
+        WITH latest AS (
+            SELECT DISTINCT ON (property_id)
+                property_id, lead_tier, score_date
+            FROM distress_scores
+            WHERE county_id = :county_id
+              AND date(score_date) <= :run_date
+            ORDER BY property_id, score_date DESC
+        )
+        SELECT
+            l.lead_tier,
+            COUNT(*)                                       AS total,
+            SUM(CASE
+                    WHEN o.phone_1 IS NOT NULL
+                     AND length(trim(o.phone_1)) > 0 THEN 1
+                    ELSE 0
+                END)                                       AS with_phone
+        FROM latest l
+        LEFT JOIN owners o ON o.property_id = l.property_id
+        WHERE l.lead_tier = ANY(:tiers)
+        GROUP BY l.lead_tier
+    """)
+
+    try:
+        rows = session.execute(sql, {
+            "county_id": county_id,
+            "run_date":  run_date,
+            "tiers":     list(GOLD_PLUS_TIERS),
+        }).fetchall()
+    except Exception as exc:
+        logger.warning("[daily_report] phone-coverage query failed: %s", exc)
+        return {
+            "total_gold_plus":   0,
+            "with_phone":        0,
+            "without_phone":     0,
+            "without_phone_pct": 0.0,
+            "by_tier":           {},
+        }
+
+    by_tier = {}
+    grand_total = 0
+    grand_with = 0
+    for tier, total, with_phone in rows:
+        total = int(total or 0)
+        with_phone = int(with_phone or 0)
+        without_phone = total - with_phone
+        by_tier[tier] = {
+            "total":         total,
+            "with_phone":    with_phone,
+            "without_phone": without_phone,
+        }
+        grand_total += total
+        grand_with += with_phone
+
+    # Ensure every tier appears even if zero
+    for tier in ("Ultra Platinum", "Platinum", "Gold"):
+        by_tier.setdefault(tier, {"total": 0, "with_phone": 0, "without_phone": 0})
+
+    grand_without = grand_total - grand_with
+    pct = (100.0 * grand_without / grand_total) if grand_total else 0.0
+
+    return {
+        "total_gold_plus":   grand_total,
+        "with_phone":        grand_with,
+        "without_phone":     grand_without,
+        "without_phone_pct": round(pct, 1),
+        "by_tier":           by_tier,
+    }
+
+
 def _build_signal_composition(session, run_date: date, county_id: str) -> dict:
     """
     Primary signal distribution across the standing Gold+ pool.
@@ -538,6 +630,7 @@ def build_report(run_date: date, county_id: str) -> dict:
         zip_breakdown           = _build_zip_breakdown(session, run_date, county_id, top_n=10)
         signal_composition      = _build_signal_composition(session, run_date, county_id)
         gold_delta              = _build_gold_delta(session, run_date, county_id)
+        phone_coverage          = _build_phone_coverage(session, run_date, county_id)
 
     return {
         "run_date":              run_date,
@@ -554,6 +647,7 @@ def build_report(run_date: date, county_id: str) -> dict:
         "zip_breakdown":         zip_breakdown,
         "signal_composition":    signal_composition,
         "gold_delta":            gold_delta,
+        "phone_coverage":        phone_coverage,
         "errors":                errors,
     }
 
@@ -655,6 +749,26 @@ def write_csv(report: dict, path: Path) -> None:
         w.writerow(["ZIP", "Ultra Platinum", "Platinum", "Gold", "Total"])
         for z in report["zip_breakdown"]:
             w.writerow([z["zip"], z["ultra_platinum"], z["platinum"], z["gold"], z["total"]])
+        w.writerow([])
+
+        # ── Section 6b: Phone Coverage (upstream-drop counter) ────────────
+        pc = report.get("phone_coverage") or {}
+        w.writerow(["PHONE COVERAGE — Gold+ leads dropped upstream for missing phone"])
+        w.writerow([
+            f"Total Gold+: {pc.get('total_gold_plus', 0):,} | "
+            f"With phone: {pc.get('with_phone', 0):,} | "
+            f"DROPPED (no phone): {pc.get('without_phone', 0):,} "
+            f"({pc.get('without_phone_pct', 0.0):.1f}%)"
+        ])
+        w.writerow([])
+        w.writerow(["Tier", "Total", "With Phone", "Dropped (no phone)", "Drop %"])
+        for tier in ("Ultra Platinum", "Platinum", "Gold"):
+            tier_d = (pc.get("by_tier") or {}).get(tier, {"total": 0, "with_phone": 0, "without_phone": 0})
+            total = tier_d["total"]
+            wp    = tier_d["with_phone"]
+            dropped = tier_d["without_phone"]
+            drop_pct = (100.0 * dropped / total) if total else 0.0
+            w.writerow([tier, total, wp, dropped, f"{drop_pct:.1f}%"])
         w.writerow([])
 
         # ── Section 7: Signal Composition by Vertical ────────────────────

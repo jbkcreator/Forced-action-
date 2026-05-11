@@ -1,0 +1,70 @@
+# Cora A/B test registry — traffic split per graph.
+#
+# Each entry defines an A/B test that the prompt loader and ab_engine
+# will use to decide which prompt variant a given subscriber sees.
+#
+# Schema per entry:
+#   graph          required  — which graph this test attaches to
+#                              (must match the directory name under
+#                              src/agents/prompts/<graph>/)
+#   enabled        required  — global on/off switch for the test
+#   traffic_pct    required  — % of eligible subscribers placed into
+#                              the test (cap enforced by guardrails:
+#                              `ab_test_traffic_cap` in cora_guardrails)
+#   segment        optional  — subscriber segment filter ("all" by default)
+#   variant_a      required  — descriptor written to AbTest.variant_a
+#   variant_b      required  — descriptor written to AbTest.variant_b
+#
+# Setting enabled=false makes the loader behave as if no test exists
+# for that graph — the base system.yaml prompt is used for everyone.
+#
+# Hash-based deterministic assignment in ab_engine.assign_variant means
+# the same subscriber always gets the same variant for a given test.
+
+fomo_sms_v1:
+  graph:       fomo
+  enabled:     false
+  traffic_pct: 50
+  segment:     all
+  variant_a:
+    prompt:      variant_a
+    description: "scarcity — anchor on remaining Gold-lead count"
+  variant_b:
+    prompt:      variant_b
+    description: "competitive loss — anchor on competitor's recent action"
+
+abandonment_w1_sms_v1:
+  graph:       abandonment_w1
+  enabled:     false
+  traffic_pct: 30
+  segment:     all
+  variant_a:
+    prompt:      variant_a
+    description: "loss-aversion — anchor on Gold-lead count"
+  variant_b:
+    prompt:      variant_b
+    description: "time pressure — anchor on countdown minutes"
+
+abandonment_w2_sms_v1:
+  graph:       abandonment_w2
+  enabled:     false
+  traffic_pct: 30
+  segment:     all
+  variant_a:
+    prompt:      variant_a
+    description: "social proof — competing viewers on the same ZIP"
+  variant_b:
+    prompt:      variant_b
+    description: "specific-lead — anchor on the lead tier they viewed"
+
+retention_sms_v1:
+  graph:       retention
+  enabled:     false
+  traffic_pct: 25
+  segment:     all
+  variant_a:
+    prompt:      variant_a
+    description: "celebration — anchor on usage / deals achieved"
+  variant_b:
+    prompt:      variant_b
+    description: "missed-opportunity — anchor on what's been left on the table"

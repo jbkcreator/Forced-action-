@@ -924,6 +924,116 @@ class LeadQualitySnapshot(Base):
         )
 
 
+class WebhookEvent(Base):
+    """
+    Unified audit log across all webhook + vendor-callback sources.
+
+    One row per received/sent event. Best-effort write — failures here
+    never block the webhook handler. Payloads are stored as SANITIZED
+    summaries only (no raw PII, no message bodies, no payment details).
+    Per-source sanitizers live in src/services/webhook_log.py.
+
+    Stripe still uses stripe_webhook_events for its idempotency lock;
+    this table is pure audit and additive to it.
+    """
+    __tablename__ = "webhook_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    event_type: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
+    direction: Mapped[str] = mapped_column(String(10), nullable=False, default="inbound")
+    source_event_id: Mapped[Optional[str]] = mapped_column(String(120), index=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="received")
+    status_detail: Mapped[Optional[str]] = mapped_column(Text)
+
+    subscriber_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("subscribers.id"), nullable=True, index=True
+    )
+    property_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("properties.id"), nullable=True, index=True
+    )
+
+    payload_summary: Mapped[Optional[dict]] = mapped_column(JSONB)
+    duration_ms: Mapped[Optional[int]] = mapped_column(Integer)
+
+    processed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        Index("idx_webhook_events_source_processed", "source", "processed_at"),
+        CheckConstraint(
+            "direction IN ('inbound', 'outbound')",
+            name="check_webhook_event_direction",
+        ),
+        CheckConstraint(
+            "status IN ('received', 'processed', 'failed', 'duplicate', 'skipped')",
+            name="check_webhook_event_status",
+        ),
+    )
+
+    def __repr__(self):
+        return (
+            f"<WebhookEvent(source={self.source!r}, type={self.event_type!r}, "
+            f"status={self.status!r}, at={self.processed_at})>"
+        )
+
+
+class PhoneDeliverabilitySnapshot(Base):
+    """
+    Daily sample of phone-deliverability quality across Gold+ leads.
+
+    Populated by src/tasks/phone_deliverability_sampler.py. Reads cached
+    phone_metadata from Owner first; only calls Telnyx Number Lookup for
+    phones missing metadata, then backfills the result onto Owner.phone_metadata.
+
+    mobile_pct is the headline metric: % of sampled Gold+ contacts whose
+    primary phone is a mobile line (SMS-deliverable). Alerts fire when
+    mobile_pct drops below the configured threshold for two days in a row.
+    """
+    __tablename__ = "phone_deliverability_snapshots"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    snapshot_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    tier_filter: Mapped[str] = mapped_column(String(40), nullable=False, default="gold_plus")
+
+    sample_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    lookups_cached: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    lookups_attempted: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    lookups_succeeded: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    mobile_count:   Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    voip_count:     Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    landline_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    unknown_count:  Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    no_phone_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    mobile_pct: Mapped[Optional[float]] = mapped_column(Numeric(5, 2))
+
+    vendor: Mapped[str] = mapped_column(String(20), nullable=False, default="telnyx")
+    cost_cents: Mapped[Optional[int]] = mapped_column(Integer, default=0)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("snapshot_date", "county_id", "tier_filter",
+                         name="uq_phone_deliv_snapshot_day"),
+        Index("idx_phone_deliv_date_county", "snapshot_date", "county_id"),
+    )
+
+    def __repr__(self):
+        return (
+            f"<PhoneDeliverabilitySnapshot(date={self.snapshot_date}, "
+            f"county={self.county_id}, mobile_pct={self.mobile_pct})>"
+        )
+
+
 class EnrichedContact(Base):
     """
     Skip-traced contact data from BatchSkipTracing (primary) and IDI (fallback).

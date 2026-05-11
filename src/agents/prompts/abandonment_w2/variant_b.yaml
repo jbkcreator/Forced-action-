@@ -1,0 +1,19 @@
+# Abandonment Wave 2 — Variant B
+# Frame: specific-lead anchor — the exact lead/tier they viewed.
+version: 1
+variant: b
+user: |
+  User clicked through Wave 1, viewed leads, did not pay.
+
+  Live context:
+    - First name: {subscriber_first_name}
+    - Viewed lead tier: {lead_tier_viewed}
+    - Countdown remaining: {wall_countdown_minutes} min.
+    - Unlock link: {unlock_link}
+
+  Frame this message around the SPECIFIC LEAD TIER they viewed —
+  anchor on {lead_tier_viewed}. Acknowledge what they looked at,
+  then add a single concrete urgency detail (countdown). Avoid
+  generic competition language; keep it about the lead itself.
+
+  Write the SMS. No preamble.

@@ -1,0 +1,23 @@
+# Retention — Variant A
+# Frame: usage-celebration — anchor on what the subscriber HAS done.
+version: 1
+variant: a
+user: |
+  Compose a retention message for a {tier}-tier subscriber.
+
+  Usage this period (the headline of THIS variant):
+    - Credits spent: {credits_used_total}
+    - Leads unlocked: {leads_unlocked_count}
+    - Deals reported: {deals_reported_count}
+    - Largest deal: {largest_deal_size}
+    - Primary ZIP worked: {top_zip}
+
+  First name: {subscriber_first_name}.
+  Action link: {action_link}.
+
+  Frame this message as a CELEBRATION of what they've achieved this
+  period. Lead with the most impressive concrete number (largest deal,
+  leads unlocked, deals reported — pick whichever is highest). Close
+  with the upsell CTA. No missed-opportunity language in this variant.
+
+  Write the message. No preamble.

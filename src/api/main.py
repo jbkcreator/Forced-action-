@@ -2336,10 +2336,24 @@ async def synthflow_webhook(request: Request):
     except Exception:
         raw_json = {"_unparseable": raw_body.decode("utf-8", errors="replace")[:2000]}
 
+    from src.services.webhook_log import log_webhook_event
+    log_webhook_event(
+        source="synthflow",
+        event_type=(raw_json.get("event") or raw_json.get("event_type") or "post_call"),
+        source_event_id=(raw_json.get("call_id") or raw_json.get("id")),
+        status="received",
+        payload=raw_json,
+        payload_kind="synthflow",
+    )
+
     try:
         payload = SynthflowWebhookPayload(**raw_json)
     except Exception as exc:
         logger.error("[Synthflow webhook] payload validation failed: %s — keys=%s", exc, list(raw_json.keys()))
+        log_webhook_event(
+            source="synthflow", event_type="payload_validation_failed",
+            status="failed", status_detail=str(exc)[:500],
+        )
         return {"status": "error", "reason": "invalid_payload"}
 
     phone = payload.resolved_phone
@@ -2412,6 +2426,20 @@ async def ghl_sample_leads_webhook(payload: GHLSampleLeadsPayload):
                 "zipCode": "{{contact.postalCode}}", "vertical": "{{contact.tags}}",
                 "firstName": "{{contact.firstName}}", "lastName": "{{contact.lastName}}" }
     """
+    from src.services.webhook_log import log_webhook_event
+    log_webhook_event(
+        source="ghl_inbound",
+        event_type="sample_leads_requested",
+        source_event_id=payload.contact_id,
+        status="received",
+        payload={
+            "contactId":  payload.contact_id,
+            "zipCode":    payload.zip_code,
+            "vertical":   payload.vertical,
+        },
+        payload_kind="ghl",
+    )
+
     if not payload.contact_id:
         logger.warning("[GHL sample-leads] Missing contact_id — skipping")
         return {"status": "skipped", "reason": "no_contact_id"}
@@ -2949,7 +2977,17 @@ def leaderboard_endpoint(
 async def nws_alert(request: Request, db: Session = Depends(get_db)):
     """Receive NWS CAP alert and activate storm packs in affected ZIPs."""
     from src.services import nws_webhook
+    from src.services.webhook_log import log_webhook_event
     payload = await request.json()
+    log_webhook_event(
+        source="nws",
+        event_type=((payload.get("properties") or payload).get("event") or "alert"),
+        source_event_id=((payload.get("properties") or payload).get("id") or payload.get("id")),
+        status="received",
+        payload=payload,
+        payload_kind="nws",
+        db=db,
+    )
     result = nws_webhook.process_alert(payload, db)
     return result
 

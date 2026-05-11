@@ -1,0 +1,18 @@
+# Abandonment Wave 2 — Variant A
+# Frame: social proof — competing viewers on the same ZIP right now.
+version: 1
+variant: a
+user: |
+  User clicked through Wave 1, viewed leads, did not pay.
+
+  Live context:
+    - First name: {subscriber_first_name}
+    - Viewed lead tier: {lead_tier_viewed}
+    - {other_viewers_count} other contractors viewing this ZIP right now.
+    - Unlock link: {unlock_link}
+
+  Frame this message around the OTHER CONTRACTORS currently viewing
+  the same ZIP — anchor on {other_viewers_count}. Acknowledge briefly
+  that they already looked. Make the competition feel live.
+
+  Write the SMS. No preamble.

@@ -1,0 +1,24 @@
+# Retention — Variant B
+# Frame: missed-opportunity — anchor on what the subscriber LEFT on the table.
+version: 1
+variant: b
+user: |
+  Compose a retention message for a {tier}-tier subscriber.
+
+  Usage this period (context, not headline):
+    - Credits spent: {credits_used_total}
+    - Leads unlocked: {leads_unlocked_count}
+
+  Missed opportunities near them (the headline of THIS variant):
+    - Gold leads left unclaimed in {top_zip}: {unclaimed_gold_count}
+    - Other contractors viewing {top_zip} this week: {competing_viewers}
+
+  First name: {subscriber_first_name}.
+  Action link: {action_link}.
+
+  Frame this message around what they LEFT ON THE TABLE — lead with
+  {unclaimed_gold_count} unclaimed Gold leads in {top_zip} or with
+  {competing_viewers} competitors. The usage facts are for credibility
+  only; do not make them the headline. Close with the upsell CTA.
+
+  Write the message. No preamble.

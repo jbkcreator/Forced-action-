@@ -97,13 +97,26 @@ def handle_webhook(raw_body: bytes, sig_header: str, db: Session) -> tuple[bool,
     # ── Idempotency guard ─────────────────────────────────────────────────────
     # Insert the event_id before processing. If the unique constraint fires,
     # this event was already handled — return immediately without side effects.
+    from src.services.webhook_log import log_webhook_event
+
     try:
         db.add(StripeWebhookEvent(event_id=event_id, event_type=event_type))
         db.flush()
     except Exception:
         db.rollback()
         logger.info("Stripe event %s already processed — skipping", event_id)
+        log_webhook_event(
+            source="stripe", event_type=event_type, source_event_id=event_id,
+            status="duplicate", payload=event, payload_kind="stripe",
+        )
         return True, "Already processed"
+
+    # Audit-log the received event before dispatching — captures it even if
+    # the handler below raises mid-flight.
+    log_webhook_event(
+        source="stripe", event_type=event_type, source_event_id=event_id,
+        status="received", payload=event, payload_kind="stripe", db=db,
+    )
 
     handlers = {
         "checkout.session.completed":    _on_checkout_completed,

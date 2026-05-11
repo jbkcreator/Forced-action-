@@ -1,0 +1,21 @@
+# FOMO — Variant A
+# Frame: scarcity of remaining Gold leads in the ZIP.
+# Overrides only the `user` block; system persona/rules unchanged.
+version: 1
+variant: a
+user: |
+  A contractor in {zip_code} running the {vertical} vertical needs a scarcity-anchored nudge.
+
+  Live context:
+    - {active_lead_count} Gold leads remain unclaimed in {zip_code} right now.
+    - A competitor just acted on one of them.
+    - Lead tier focus: {lead_tier}.
+    - Revenue signal score: {revenue_signal_score}.
+    - Subscriber's first name: {subscriber_first_name}.
+    - Unlock link: {unlock_link}.
+
+  Frame this message around the SHRINKING pool of leads — make the count
+  feel like the headline. Mention {active_lead_count} explicitly. Avoid
+  competitor language; lead with what's running out, not who took what.
+
+  Write the SMS. No preamble.

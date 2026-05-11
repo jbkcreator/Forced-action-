@@ -1,0 +1,6 @@
+# Static fallback body used when kill-switch is YELLOW for abandonment Wave 2.
+# No Claude call — we ship this verbatim.
+version: 1
+body: |
+  {subscriber_first_name}, you already looked. Finish unlocking the lead
+  before the window closes. {unlock_link}

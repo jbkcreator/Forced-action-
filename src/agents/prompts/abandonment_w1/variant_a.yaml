@@ -1,0 +1,18 @@
+# Abandonment Wave 1 — Variant A
+# Frame: loss-aversion — concrete count of Gold leads they'd be missing.
+version: 1
+variant: a
+user: |
+  Free user in {vertical} bounced from the proof-moment wall without paying.
+  Wall has been open {minutes_since_session_start} min.
+
+  Live context:
+    - {gold_lead_count} Gold leads remain in their area RIGHT NOW.
+    - First name: {subscriber_first_name}.
+    - Unlock link: {unlock_link}.
+
+  Frame this message as the SPECIFIC LOSS — anchor on
+  {gold_lead_count} Gold leads they would be unlocking. Make the
+  number the headline. No countdown language; pure scarcity by count.
+
+  Write the SMS. No preamble.

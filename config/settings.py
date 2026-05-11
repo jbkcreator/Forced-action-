@@ -23,6 +23,14 @@ class AppSettings(BaseSettings):
 	firecrawl_api_key: SecretStr = Field(..., env="FIRECRAWL_API_KEY")
 	court_listener_api_key: SecretStr = Field(..., env="COURT_LISTENER_API_KEY")
 
+	# Telnyx (phone deliverability sampler — carrier / line-type lookup)
+	telnyx_api_key: Optional[SecretStr] = Field(default=None, env="TELNYX_API_KEY")
+	telnyx_lookup_type: str = Field(default="carrier", env="TELNYX_LOOKUP_TYPE")
+	phone_sample_size: int = Field(default=200, env="PHONE_SAMPLE_SIZE")
+	phone_sample_mobile_alert_pct: float = Field(
+		default=70.0, env="PHONE_SAMPLE_MOBILE_ALERT_PCT"
+	)
+
 	debug: bool = Field(default=True, env="DEBUG")
 
 

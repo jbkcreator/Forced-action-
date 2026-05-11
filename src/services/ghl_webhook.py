@@ -495,7 +495,38 @@ def push_subscriber_to_ghl(
     Raises nothing — all errors are logged internally.
     """
     if not _is_configured():
+        try:
+            from src.services.webhook_log import log_webhook_event
+            log_webhook_event(
+                source="ghl_outbound", event_type="contact_upsert",
+                direction="outbound", status="skipped",
+                status_detail="GHL not configured",
+                subscriber_id=getattr(subscriber, "id", None),
+            )
+        except Exception:
+            pass
         return False
+
+    # Audit the outbound push attempt (sanitized — no email/phone in the log)
+    try:
+        from src.services.webhook_log import log_webhook_event
+        log_webhook_event(
+            source="ghl_outbound",
+            event_type=("contact_upsert" if stage is None else f"stage_move:{stage}"),
+            direction="outbound",
+            status="received",  # received-by-our-handler; final status updated below isn't strictly tracked here
+            subscriber_id=getattr(subscriber, "id", None),
+            payload={
+                "stage":         stage,
+                "tags":          tags or [],
+                "zip_count":     len(zip_codes or []),
+                "is_founding":   bool(is_founding),
+                "contact_id":    getattr(subscriber, "ghl_contact_id", None),
+            },
+            payload_kind="ghl",
+        )
+    except Exception:
+        pass
 
     # Build subscriber custom fields if GHL field IDs are configured
     subscriber_custom_fields = []
