@@ -1,9 +1,11 @@
 """
 AP Lite upgrade sweep task.
 
-Runs every Monday at 0 14 * * 1 (2 PM UTC) after the weekly reset.
-Finds territory_lock subscribers who performed >= 10 manual actions
-in the previous week and emits Cora AP Lite upsell events.
+Runs daily at 0 14 * * * (2 PM UTC). Finds territory_lock subscribers
+who performed >= 10 manual actions in the trailing 7 days and emits
+Cora AP Lite upsell events. Idempotency key is bucketed by ISO week,
+so each subscriber fires at most once per calendar week even though
+the sweep runs every day.
 
 Usage:
     python -m src.tasks.ap_lite_sweep [--dry-run]
@@ -28,31 +30,32 @@ logger = logging.getLogger(__name__)
 
 
 def _last_monday(ref: date) -> date:
-    """Monday of the previous week."""
+    """Monday of the previous week (kept for idempotency key bucketing)."""
     this_monday = ref - timedelta(days=ref.weekday())
     return this_monday - timedelta(weeks=1)
 
 
-def count_actions_week(db: Session, subscriber_id: int, week_start: date) -> int:
+def count_actions_trailing_7d(db: Session, subscriber_id: int) -> int:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
     return db.execute(
         select(func.count()).select_from(ManualActionLog).where(
             ManualActionLog.subscriber_id == subscriber_id,
-            ManualActionLog.week_start == week_start,
+            ManualActionLog.created_at >= cutoff,
         )
     ).scalar() or 0
 
 
-def _emit_event(subscriber_id: int, actions_count: int, week_start: date) -> None:
+def _emit_event(subscriber_id: int, actions_count: int, window_end: date) -> None:
     from src.agents.events.types import Event
     from src.agents.supervisor import dispatch_event
 
-    iso_week = week_start.strftime(AP_LITE_IDEMPOTENCY_WINDOW)
+    iso_week = window_end.strftime(AP_LITE_IDEMPOTENCY_WINDOW)
     evt = Event(
         event_type="subscriber_crossed_ap_lite_threshold",
         subscriber_id=subscriber_id,
         payload={
-            "manual_actions_last_week": actions_count,
-            "week_start": week_start.isoformat(),
+            "manual_actions_trailing_7d": actions_count,
+            "window_end": window_end.isoformat(),
             "threshold": AP_LITE_THRESHOLD_PER_WEEK,
         },
         source="cron",
@@ -73,7 +76,7 @@ def run_sweep(dry_run: bool = False) -> dict:
         "errors": 0,
     }
 
-    prev_week_start = _last_monday(date.today())
+    today = date.today()
 
     with get_db_context() as db:
         subs = db.execute(
@@ -86,20 +89,20 @@ def run_sweep(dry_run: bool = False) -> dict:
         for sub in subs:
             results["lock_holders_checked"] += 1
             try:
-                n = count_actions_week(db, sub.id, prev_week_start)
+                n = count_actions_trailing_7d(db, sub.id)
                 if n < AP_LITE_THRESHOLD_PER_WEEK:
                     continue
 
                 results["candidates_found"] += 1
                 logger.info(
-                    "ap_lite: candidate sub=%s actions=%d week=%s",
-                    sub.id, n, prev_week_start,
+                    "ap_lite: candidate sub=%s actions=%d window_end=%s",
+                    sub.id, n, today,
                 )
 
                 if not dry_run:
                     sub.ap_lite_candidate_at = datetime.now(timezone.utc)
                     db.flush()
-                    _emit_event(sub.id, n, prev_week_start)
+                    _emit_event(sub.id, n, today)
                     results["events_emitted"] += 1
 
             except Exception as exc:

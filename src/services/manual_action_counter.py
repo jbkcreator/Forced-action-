@@ -2,11 +2,15 @@
 Manual action counter service.
 
 Counts tracked manual actions logged in manual_action_log for a given
-subscriber within the current ISO week. Used by:
+subscriber over a trailing 7-day window. Used by:
   - /api/feed/{uuid} to populate ap_lite_eligible + manual_actions_this_week
-  - ap_lite_sweep.py for the Monday cron
+  - ap_lite_sweep.py (daily cron)
+
+Rolling window (created_at >= now-7d) replaces the previous ISO-week bucket
+so that activity spanning a Mon 00:00 UTC boundary still trips the threshold.
+Backed by Index("idx_mal_created", "created_at") in core.models.
 """
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -19,11 +23,11 @@ def _monday_of_week(ref: date) -> date:
 
 
 def count_this_week(db: Session, subscriber_id: int) -> int:
-    week_start = _monday_of_week(date.today())
+    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
     return db.execute(
         select(func.count()).select_from(ManualActionLog).where(
             ManualActionLog.subscriber_id == subscriber_id,
-            ManualActionLog.week_start == week_start,
+            ManualActionLog.created_at >= cutoff,
         )
     ).scalar() or 0
 

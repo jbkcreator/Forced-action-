@@ -187,8 +187,9 @@ COUNTY_ID=hillsborough
 0 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.ab_rollback_check
 
 # ── STAGE 6 SWEEPS ───────────────────────────────────────────
-# AP Lite candidate sweep — weekly Monday 14:00 UTC (after annual_push slot).
-0 14 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.ap_lite_sweep
+# AP Lite candidate sweep — daily 14:00 UTC. Rolling 7-day window; idempotency
+# key buckets by ISO week so each subscriber still fires at most once per week.
+0 14 * * * $PROJECT/scripts/cron/run.sh src.tasks.ap_lite_sweep
 
 # Wallet-to-Lock sweep — daily 13:30 UTC (before annual_push 14:00).
 30 13 * * * $PROJECT/scripts/cron/run.sh src.tasks.wallet_to_lock_sweep
