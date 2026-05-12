@@ -34,7 +34,7 @@ from typing import Any, Dict, Optional, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from src.agents.prompts.loader import render_fallback_body, render_system_and_user
+from src.agents.prompts.loader import render_fallback_body, render_for_subscriber_auto
 from src.agents.subgraphs.compose_and_send import run_compose_and_send
 from src.agents.subgraphs.decision_hierarchy import run_decision_hierarchy
 from src.agents.tools.read_tools import (
@@ -177,7 +177,9 @@ def _node_build_compose_context(state: FOMOState) -> Dict[str, Any]:
 		"unlock_link": f"https://app.forcedaction.io/feed/{profile.get('id')}",
 	}
 
-	system, user = render_system_and_user(GRAPH_NAME, context)
+	system, user, variant, test_name = render_for_subscriber_auto(
+		GRAPH_NAME, state["subscriber_id"], context
+	)
 	fallback = render_fallback_body(GRAPH_NAME, context)
 
 	return {
@@ -185,7 +187,15 @@ def _node_build_compose_context(state: FOMOState) -> Dict[str, Any]:
 		"_user_prompt": user,
 		"_fallback_body": fallback,
 		"_render_context": context,
+		"_variant_id": _format_variant_id(test_name, variant),
 	}
+
+
+def _format_variant_id(test_name: Optional[str], variant: Optional[str]) -> Optional[str]:
+	"""Compose 'test_name:variant' attribution id, or None when no test is active."""
+	if not test_name or not variant:
+		return None
+	return f"{test_name}:{variant}"
 
 
 def _node_compose_and_send(state: FOMOState) -> FOMOState:
@@ -202,7 +212,7 @@ def _node_compose_and_send(state: FOMOState) -> FOMOState:
 		"user_prompt": state.get("_user_prompt", ""),
 		"cache_system": True,                      # same system prompt across FOMO calls
 		"max_output_tokens": 160,
-		"variant_id": None,
+		"variant_id": state.get("_variant_id"),
 		"message_type": "marketing",
 		"use_fallback": state.get("use_fallback", False),
 		"ab_fallback_body": state.get("_fallback_body"),

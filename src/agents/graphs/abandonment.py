@@ -38,8 +38,16 @@ from src.agents.prompts.loader import (
 	load_prompt,
 	render,
 	render_fallback_body,
+	render_for_subscriber_auto,
 	render_system_and_user,
 )
+
+
+def _format_variant_id(test_name: Optional[str], variant: Optional[str]) -> Optional[str]:
+	"""'test_name:variant' attribution id, or None when no A/B test is active."""
+	if not test_name or not variant:
+		return None
+	return f"{test_name}:{variant}"
 from src.agents.subgraphs.compose_and_send import run_compose_and_send
 from src.agents.subgraphs.decision_hierarchy import run_decision_hierarchy
 from src.agents.tools.read_tools import (
@@ -161,12 +169,15 @@ def _wave1_build_context(state: AbandonmentState) -> AbandonmentState:
 		"unlock_link": f"https://app.forcedaction.io/feed/{profile.get('id')}",
 	}
 
-	system, user = render_system_and_user("abandonment", ctx)
-	fallback = render_fallback_body("abandonment", ctx)
+	system, user, variant, test_name = render_for_subscriber_auto(
+		"abandonment_w1", state["subscriber_id"], ctx
+	)
+	fallback = render_fallback_body("abandonment_w1", ctx)
 	return {
 		"_system_prompt": system,
 		"_user_prompt": user,
 		"_fallback_body": fallback,
+		"_variant_id": _format_variant_id(test_name, variant),
 	}
 
 
@@ -184,6 +195,7 @@ def _wave1_compose_and_send(state: AbandonmentState) -> AbandonmentState:
 		"user_prompt": state.get("_user_prompt", ""),
 		"cache_system": True,
 		"max_output_tokens": 160,
+		"variant_id": state.get("_variant_id"),
 		"message_type": "marketing",
 		"use_fallback": state.get("use_fallback", False),
 		"ab_fallback_body": state.get("_fallback_body"),
@@ -323,14 +335,15 @@ def _wave2_build_context(state: AbandonmentState) -> AbandonmentState:
 		"unlock_link": f"https://app.forcedaction.io/feed/{profile.get('id')}",
 	}
 
-	data = load_prompt("abandonment", "wave2_system")
-	system = render(data.get("system", ""), ctx)
-	user = render(data.get("user", ""), ctx)
-	fallback = render_fallback_body("abandonment", ctx)
+	system, user, variant, test_name = render_for_subscriber_auto(
+		"abandonment_w2", state["subscriber_id"], ctx
+	)
+	fallback = render_fallback_body("abandonment_w2", ctx)
 	return {
 		"_system_prompt": system,
 		"_user_prompt": user,
 		"_fallback_body": fallback,
+		"_variant_id": _format_variant_id(test_name, variant),
 	}
 
 
@@ -348,6 +361,7 @@ def _wave2_compose_and_send(state: AbandonmentState) -> AbandonmentState:
 		"user_prompt": state.get("_user_prompt", ""),
 		"cache_system": True,
 		"max_output_tokens": 160,
+		"variant_id": state.get("_variant_id"),
 		"message_type": "marketing",
 		"use_fallback": state.get("use_fallback", False),
 		"ab_fallback_body": state.get("_fallback_body"),

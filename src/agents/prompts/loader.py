@@ -207,6 +207,32 @@ def render_for_subscriber(
 	return sys_txt, usr_txt, variant, test_name
 
 
+def render_for_subscriber_auto(
+	graph: str,
+	subscriber_id: int,
+	context: Dict[str, Any],
+) -> Tuple[str, str, Optional[str], Optional[str]]:
+	"""
+	Same as render_for_subscriber but opens (and closes) its own DB session.
+
+	Graph nodes are pure context-builders today — they do not carry a session
+	through state. This wrapper lets them pick up A/B variant assignment with
+	a single call. Errors degrade to the base prompt rather than blocking the
+	graph (same fail-open posture as render_for_subscriber).
+	"""
+	try:
+		from src.core.database import Database
+		with Database().session_scope() as session:
+			return render_for_subscriber(graph, subscriber_id, context, session)
+	except Exception as exc:
+		logger.warning(
+			"render_for_subscriber_auto: DB session unavailable for graph=%s sub=%s — using base prompt (%s)",
+			graph, subscriber_id, exc,
+		)
+		sys_txt, usr_txt = render_system_and_user(graph, context)
+		return sys_txt, usr_txt, None, None
+
+
 def reset_ab_config_cache() -> None:
 	"""Drop the cached A/B config so the next call re-reads from disk.
 

@@ -3109,6 +3109,65 @@ def zip_activity(zip_code: str, vertical: Optional[str] = None):
     }
 
 
+# ── Phase 2B: Lead hold status — GET /api/leads/{property_id}/hold ────────────
+
+@app.get("/api/leads/{property_id}/hold")
+def lead_hold_status(
+    property_id: int,
+    feed_uuid: Optional[str] = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    """
+    Return current 20-min hold reservation state for a lead.
+
+    Public-readable (no auth) so the LeadCard FOMO banner can poll without
+    leaking subscriber context to other viewers. When `feed_uuid` is supplied
+    the response also flags whether the hold belongs to the requesting
+    subscriber so the UI can show "currently held FOR YOU" vs
+    "currently being worked".
+
+    Degrades cleanly when Redis is unavailable: returns held=false.
+    """
+    from src.services.lead_hold import get_holder
+
+    holder_id = get_holder(property_id)
+    if holder_id is None:
+        return {
+            "property_id": property_id,
+            "held": False,
+            "held_by_self": False,
+            "expires_at": None,
+            "hold_minutes": 20,
+        }
+
+    # Compute remaining TTL from Redis if available so the UI can render a countdown.
+    expires_at = None
+    try:
+        from src.core.redis_client import get_redis, redis_available
+        if redis_available():
+            ttl = get_redis().ttl(f"lead_hold:{property_id}")
+            if ttl and ttl > 0:
+                from datetime import datetime, timedelta, timezone
+                expires_at = (datetime.now(timezone.utc) + timedelta(seconds=int(ttl))).isoformat()
+    except Exception:
+        expires_at = None
+
+    held_by_self = False
+    if feed_uuid:
+        sub = db.execute(
+            select(Subscriber.id).where(Subscriber.event_feed_uuid == feed_uuid)
+        ).scalar_one_or_none()
+        held_by_self = sub is not None and int(sub) == int(holder_id)
+
+    return {
+        "property_id": property_id,
+        "held": True,
+        "held_by_self": held_by_self,
+        "expires_at": expires_at,
+        "hold_minutes": 20,
+    }
+
+
 # ── Phase 2B: Proof Moment — GET /api/proof-leads ────────────────────────────
 
 @app.get("/api/proof-leads")
