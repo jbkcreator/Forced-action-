@@ -270,14 +270,32 @@ def _normalize_columns(rows: list[dict], source: dict) -> pd.DataFrame:
     """
     Map raw column names to canonical names.
 
-    Applies county-specific renames from source config's `ori_column_map`
-    first, then falls back to COLUMN_ALIASES for Accela column variants.
+    Order:
+      1. Apply admin-configured renames from CountyColumnMapping.mapping (was
+         previously source["ori_column_map"]; now read from the dedicated
+         ColumnMapper table).
+      2. Apply the engine-internal COLUMN_ALIASES fallback for Accela variants
+         that don't yet have an admin mapping.
     """
-    ori_col_map: dict = source.get("ori_column_map") or {}
+    source_id = source.get("source_id")
+    col_rename: dict = {}
+    if source_id:
+        try:
+            from src.loaders.column_mapper import ColumnMapper
+            # Pass the actual scraped columns so an approved mapping built against
+            # a different column shape (stale Accela variant) gets skipped in
+            # favour of any matching pending row.
+            raw_cols = list(rows[0].keys()) if rows else None
+            row = ColumnMapper.fetch_mapping_row(source_id, raw_cols=raw_cols)
+            if row is not None:
+                col_rename = dict(row.mapping or {})
+        except Exception as exc:  # noqa: BLE001 — non-critical lookup, fallback path is fine
+            logger.warning("[Normalize] ColumnMapper lookup failed (%s) — relying on aliases", exc)
+
     normalized = []
     for row in rows:
-        if ori_col_map:
-            row = {ori_col_map.get(k, k): v for k, v in row.items()}
+        if col_rename:
+            row = {col_rename.get(k, k): v for k, v in row.items()}
         norm_row = {}
         for target_col, aliases in COLUMN_ALIASES.items():
             for alias in aliases:

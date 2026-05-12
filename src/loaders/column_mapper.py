@@ -225,8 +225,190 @@ class ColumnMapper:
 
     @staticmethod
     def apply(df: pd.DataFrame, mapping: dict[str, str]) -> pd.DataFrame:
-        """Apply a mapping dict to rename df columns. Unmapped columns pass through."""
+        """Apply a mapping dict to rename df columns. Unmapped columns pass through.
+
+        Legacy single-DataFrame path used by simple loaders. New multi-bucket
+        flows (e.g. liens engine fanning out into deeds/judgments/probate) use
+        `apply_transformations(df, mapping_row)` which honors post_processors,
+        value_maps, and row_routing on a CountyColumnMapping row.
+        """
         return df.rename(columns=mapping)
+
+    @classmethod
+    def fetch_mapping_row(cls, source_id: int, raw_cols: Optional[list[str]] = None):
+        """
+        Return the active CountyColumnMapping row for this source.
+
+        Resolution order:
+          1. Approved row whose source_columns overlap the current scrape ≥50%.
+          2. Pending (non-rejected) row whose source_columns overlap ≥50%.
+          3. If `raw_cols` is None, no overlap check — return the latest approved
+             (or pending) regardless. Callers that already have a DataFrame
+             should pass raw_cols so a stale-mapping situation can fall back.
+          4. None if no row matches.
+        """
+        from src.core.database import get_db_context
+        from src.core.models import CountyColumnMapping
+
+        with get_db_context() as session:
+            approved = (
+                session.query(CountyColumnMapping)
+                .filter_by(source_id=source_id, is_approved=True)
+                .order_by(CountyColumnMapping.approved_at.desc())
+                .first()
+            )
+            pending = (
+                session.query(CountyColumnMapping)
+                .filter(
+                    CountyColumnMapping.source_id == source_id,
+                    CountyColumnMapping.is_approved == False,
+                    CountyColumnMapping.reject_feedback == None,
+                )
+                .order_by(CountyColumnMapping.created_at.desc())
+                .first()
+            )
+
+            chosen = None
+            if raw_cols is None:
+                chosen = approved or pending
+            else:
+                raw_set = set(raw_cols)
+                for candidate in (approved, pending):
+                    if candidate is None:
+                        continue
+                    stored = set(candidate.source_columns) if isinstance(candidate.source_columns, list) else set()
+                    if not stored:
+                        continue
+                    if len(stored & raw_set) / len(stored) >= 0.5:
+                        chosen = candidate
+                        break
+
+            if chosen is None:
+                return None
+            # Detach so the session can close — attributes still readable.
+            session.expunge(chosen)
+            return chosen
+
+    @classmethod
+    def apply_transformations(
+        cls,
+        df: pd.DataFrame,
+        mapping_row,
+    ) -> dict[str, pd.DataFrame]:
+        """
+        Full transformation pipeline driven by a CountyColumnMapping row.
+
+        Order (each step is optional, controlled by which JSONB fields are set):
+          1. Column rename  (`mapping`)
+          2. Post-processors (`post_processors` — currently only split_on_separator)
+          3. Value maps     (`value_maps` — per-column value normalization)
+          4. Row routing    (`row_routing` — split rows into per-bucket DataFrames)
+
+        Returns:
+          dict[bucket_name -> DataFrame]. When `row_routing` is unset, the
+          result is `{"_default": <single_df>}`. Routed rows that match no
+          rule and have `default == "skip"` are excluded entirely.
+        """
+        # 1. Rename
+        df = df.rename(columns=mapping_row.mapping or {})
+
+        # 2. Post-processors
+        for pp in mapping_row.post_processors or []:
+            df = cls._apply_post_processor(df, pp)
+
+        # 3. Value maps (case-insensitive lookup, preserves unmapped values)
+        for col, vmap in (mapping_row.value_maps or {}).items():
+            if col in df.columns and vmap:
+                normalized = {str(k).strip().upper(): v for k, v in vmap.items()}
+                df = df.copy()
+                df[col] = df[col].fillna("").astype(str).apply(
+                    lambda raw: normalized.get(raw.strip().upper(), raw)
+                )
+
+        # 4. Routing
+        if mapping_row.row_routing:
+            return cls._apply_row_routing(df, mapping_row.row_routing)
+        return {"_default": df}
+
+    # ------------------------------------------------------------------
+    # Transformation helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _apply_post_processor(df: pd.DataFrame, pp: dict) -> pd.DataFrame:
+        """
+        Apply a single post-processor op to df. New ops slot in here.
+
+        Supported ops:
+          split_on_separator
+            Split `from` column on `sep` into two output columns in `into`.
+            If the source column is missing, this is a no-op (allows the same
+            mapping row to apply to subsets of the data).
+        """
+        op = pp.get("op")
+        if op == "split_on_separator":
+            src_col = pp["from"]
+            sep = pp.get("sep", "/")
+            into = pp["into"]
+            if src_col not in df.columns:
+                return df
+            parts = df[src_col].astype(str).str.split(sep, n=len(into) - 1, expand=True)
+            df = df.copy()
+            for i, out_col in enumerate(into):
+                df[out_col] = parts[i].str.strip() if i in parts.columns else ""
+            return df.drop(columns=[src_col])
+
+        logger.warning("[ColumnMapper] Unknown post_processor op=%r — skipping", op)
+        return df
+
+    @staticmethod
+    def _apply_row_routing(df: pd.DataFrame, routing: dict) -> dict[str, pd.DataFrame]:
+        """
+        Split df into bucket-keyed DataFrames per the routing config.
+
+        Rule shape (any one of `match_exact` / `match_contains` per rule):
+          {"match_exact":    ["DEED", "TAX DEED"], "bucket": "deeds"}
+          {"match_contains": ["LIS PENDENS"],       "bucket": "liens"}
+
+        Rules are evaluated in order; the first match wins. Rows matching no
+        rule go to the `default` bucket (or are dropped if default == "skip").
+        """
+        col = routing.get("column")
+        if not col or col not in df.columns:
+            logger.warning(
+                "[ColumnMapper] row_routing column=%r not in DataFrame — returning single bucket",
+                col,
+            )
+            return {"_default": df}
+
+        default_bucket = routing.get("default", "skip")
+        rules = routing.get("rules") or []
+        values = df[col].fillna("").astype(str).str.strip().str.upper()
+
+        def _bucket_for(value: str) -> str:
+            for rule in rules:
+                exacts = rule.get("match_exact") or []
+                if isinstance(exacts, str):
+                    exacts = [exacts]
+                if exacts and value in {e.upper() for e in exacts}:
+                    return rule["bucket"]
+                contains = rule.get("match_contains") or []
+                if isinstance(contains, str):
+                    contains = [contains]
+                for substr in contains:
+                    if substr.upper() in value:
+                        return rule["bucket"]
+            return default_bucket
+
+        df = df.copy()
+        df["_bucket"] = values.apply(_bucket_for)
+
+        out: dict[str, pd.DataFrame] = {}
+        for bucket, group in df.groupby("_bucket"):
+            if bucket == "skip":
+                continue
+            out[bucket] = group.drop(columns=["_bucket"]).reset_index(drop=True)
+        return out
 
     # ------------------------------------------------------------------
     # DB helpers
@@ -269,24 +451,38 @@ class ColumnMapper:
                 .first()
             )
 
-            row = approved or pending
-            if row is None:
-                return None
-
-            stored_set = set(row.source_columns) if isinstance(row.source_columns, list) else set()
+            # Try approved first; if its source_columns no longer overlap with the
+            # current scrape we fall back to the pending row before giving up.
+            # Previously this returned None as soon as approved overlap failed,
+            # which triggered a fresh LLM call + new pending on every run and
+            # let duplicate pending rows accumulate for the same source.
             raw_set = set(raw_cols)
-            overlap = len(stored_set & raw_set) / max(len(stored_set), 1) if stored_set else 0
 
-            if overlap < 0.5:
-                logger.info(
-                    "[ColumnMapper] Mapping overlap too low (%.0f%%) for source_id=%s — will re-map",
-                    100 * overlap, source_id,
-                )
-                return None
+            def _overlap(candidate) -> float:
+                if candidate is None:
+                    return -1.0
+                stored = set(candidate.source_columns) if isinstance(candidate.source_columns, list) else set()
+                if not stored:
+                    return 0.0
+                return len(stored & raw_set) / len(stored)
 
-            label = "approved" if row.is_approved else "pending (optimistic)"
-            logger.info("[ColumnMapper] Using %s mapping for source_id=%s", label, source_id)
-            return dict(row.mapping)
+            for label, candidate in (
+                ("approved", approved),
+                ("pending (optimistic)", pending),
+            ):
+                if candidate is None:
+                    continue
+                overlap = _overlap(candidate)
+                if overlap < 0.5:
+                    logger.info(
+                        "[ColumnMapper] %s mapping overlap too low (%.0f%%) for source_id=%s — trying next",
+                        label, 100 * overlap, source_id,
+                    )
+                    continue
+                logger.info("[ColumnMapper] Using %s mapping for source_id=%s", label, source_id)
+                return dict(candidate.mapping)
+
+            return None
 
     def _fetch_reject_feedback(self, source_id: int) -> Optional[str]:
         """Return the most recent rejection feedback for this source, if any."""

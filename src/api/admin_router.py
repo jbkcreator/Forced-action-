@@ -18,14 +18,14 @@ import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Literal
 
 import pandas as pd
 import stripe
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, UploadFile
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import and_, case, distinct, func, or_, select, text
 from sqlalchemy.orm import Session
 
@@ -615,6 +615,9 @@ class CountyUpdateRequest(BaseModel):
     is_active: Optional[bool] = None
 
 
+ScrapeMode = Literal["ai_only", "playwright_only", "playwright_then_ai"]
+
+
 class CountySourceCreateRequest(BaseModel):
     signal_type: str
     source_name: Optional[str] = None
@@ -625,9 +628,10 @@ class CountySourceCreateRequest(BaseModel):
     date_range_available: bool = True
     frequency: str = "daily"
     special_flags: dict = {}
-    ori_column_map: Optional[dict] = None
-    ori_book_page_col: Optional[str] = None
-    ori_doc_type_map: Optional[dict] = None
+    scrape_mode: ScrapeMode = "ai_only"
+    # playwright_code is intentionally NOT settable from this endpoint —
+    # callers go through /sources/{id}/playwright-code/{save,generate,validate}
+    # so the AST + LLM safety pipeline runs first.
 
 
 class CountySourceUpdateRequest(BaseModel):
@@ -640,9 +644,7 @@ class CountySourceUpdateRequest(BaseModel):
     frequency: Optional[str] = None
     is_active: Optional[bool] = None
     special_flags: Optional[dict] = None
-    ori_column_map: Optional[dict] = None
-    ori_book_page_col: Optional[str] = None
-    ori_doc_type_map: Optional[dict] = None
+    scrape_mode: Optional[ScrapeMode] = None
 
 
 def _county_to_dict(county: County) -> dict:
@@ -663,23 +665,24 @@ def _county_to_dict(county: County) -> dict:
 
 def _source_to_dict(src: CountySource) -> dict:
     return {
-        "id":                   src.id,
-        "county_id":            src.county_id,
-        "signal_type":          src.signal_type,
-        "source_name":          src.source_name,
-        "url":                  src.url,
-        "description":          src.description,
-        "navigation_hint":      src.navigation_hint,
-        "output_format":        src.output_format,
-        "date_range_available": src.date_range_available,
-        "frequency":            src.frequency,
-        "is_active":            src.is_active,
-        "special_flags":        src.special_flags or {},
-        "ori_column_map":       src.ori_column_map or {},
-        "ori_book_page_col":    src.ori_book_page_col,
-        "ori_doc_type_map":     src.ori_doc_type_map or {},
-        "created_at":           src.created_at.isoformat() if src.created_at else None,
-        "updated_at":           src.updated_at.isoformat() if src.updated_at else None,
+        "id":                       src.id,
+        "county_id":                src.county_id,
+        "signal_type":              src.signal_type,
+        "source_name":              src.source_name,
+        "url":                      src.url,
+        "description":              src.description,
+        "navigation_hint":          src.navigation_hint,
+        "output_format":            src.output_format,
+        "date_range_available":     src.date_range_available,
+        "frequency":                src.frequency,
+        "is_active":                src.is_active,
+        "special_flags":            src.special_flags or {},
+        "scrape_mode":              src.scrape_mode,
+        "playwright_code":          src.playwright_code,
+        "playwright_code_version":  src.playwright_code_version,
+        "playwright_code_approved": src.playwright_code_approved,
+        "created_at":               src.created_at.isoformat() if src.created_at else None,
+        "updated_at":               src.updated_at.isoformat() if src.updated_at else None,
     }
 
 
@@ -824,9 +827,7 @@ def add_source(
         date_range_available=body.date_range_available,
         frequency=body.frequency,
         special_flags=body.special_flags,
-        ori_column_map=body.ori_column_map,
-        ori_book_page_col=body.ori_book_page_col,
-        ori_doc_type_map=body.ori_doc_type_map,
+        scrape_mode=body.scrape_mode,
         is_active=True,
     )
     db.add(src)
@@ -883,6 +884,154 @@ def deactivate_source(
 
 
 # ===========================================================================
+# PLAYWRIGHT CODE LIFECYCLE
+# ===========================================================================
+# Mounted under /api/admin/counties/{cid}/sources/{sid}/playwright-code.
+# Every route enforces ownership of the source by the county_id in the path.
+# The on-disk module that does all the heavy lifting (AST validation, LLM
+# generation, history-table append) is src/utils/action_sequence.py — these
+# routes are thin HTTP wrappers around its helpers.
+# ===========================================================================
+
+
+class PlaywrightCodeSaveRequest(BaseModel):
+    code: str
+    approved: bool = False  # admin-authored code: True; LLM output: False
+    prompt_version: Optional[str] = None
+
+
+class PlaywrightCodeValidateRequest(BaseModel):
+    code: str
+
+
+def _require_source(county_id: str, source_id: int, db: Session) -> CountySource:
+    src = db.query(CountySource).filter_by(id=source_id, county_id=county_id).first()
+    if not src:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Source {source_id} not found in county '{county_id}'",
+        )
+    return src
+
+
+@router.post("/counties/{county_id}/sources/{source_id}/playwright-code/generate")
+def generate_playwright_code_route(
+    county_id: str,
+    source_id: int,
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Ask the LLM to generate a run_scrape function for this source. Returns
+    the code WITHOUT saving it — caller decides whether to validate, edit, or
+    persist. Generation is read-only; the source row is not modified.
+    """
+    src = _require_source(county_id, source_id, db)
+    from src.utils.action_sequence import (
+        generate_playwright_code,
+        PlaywrightCodeError,
+    )
+    source_dict = _source_to_dict(src) | (src.special_flags or {})
+    try:
+        code = generate_playwright_code(source_dict, signal_type=src.signal_type)
+    except PlaywrightCodeError as exc:
+        raise HTTPException(status_code=502, detail=f"Code generation failed: {exc}")
+    return {"code": code, "approved": False}
+
+
+@router.post("/counties/{county_id}/sources/{source_id}/playwright-code/validate")
+def validate_playwright_code_route(
+    county_id: str,
+    source_id: int,
+    body: PlaywrightCodeValidateRequest,
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Run the AST safety check + structural validation against caller-supplied
+    code. Returns {valid, errors} without persisting. Use this from the admin
+    UI before saving paste-your-own code.
+    """
+    _require_source(county_id, source_id, db)
+    from src.utils.action_sequence import (
+        validate_playwright_code,
+        PlaywrightCodeError,
+    )
+    try:
+        validate_playwright_code(body.code)
+    except PlaywrightCodeError as exc:
+        return {"valid": False, "errors": [str(exc)]}
+    return {"valid": True, "errors": []}
+
+
+@router.post("/counties/{county_id}/sources/{source_id}/playwright-code", status_code=201)
+def save_playwright_code_route(
+    county_id: str,
+    source_id: int,
+    body: PlaywrightCodeSaveRequest,
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Persist code to county_sources.playwright_code + append a history row.
+
+    Re-runs the AST validator server-side so a client that bypasses /validate
+    can't sneak unsafe code in. `approved=True` marks it admin-authored and
+    skips the unapproved-code-warning at scrape time.
+    """
+    _require_source(county_id, source_id, db)
+    from src.utils.action_sequence import (
+        validate_playwright_code,
+        persist_playwright_code,
+        PlaywrightCodeError,
+    )
+    try:
+        validate_playwright_code(body.code)
+    except PlaywrightCodeError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid code: {exc}")
+
+    persist_playwright_code(
+        county_id, source_id, body.code,
+        prompt_version=body.prompt_version,
+        is_approved=body.approved,
+    )
+    logger.info(
+        "[Admin] playwright_code saved: source_id=%s approved=%s by %s",
+        source_id, body.approved, _admin.get("sub"),
+    )
+    return {"is_approved": body.approved}
+
+
+@router.post("/counties/{county_id}/sources/{source_id}/playwright-code/approve")
+def approve_playwright_code_route(
+    county_id: str,
+    source_id: int,
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """Flip playwright_code_approved=True; appends an 'approved_by:<sub>' history row."""
+    _require_source(county_id, source_id, db)
+    from src.utils.action_sequence import approve_playwright_code
+    approve_playwright_code(county_id, source_id, approved_by=_admin.get("sub") or "admin")
+    return {"is_approved": True}
+
+
+@router.delete("/counties/{county_id}/sources/{source_id}/playwright-code", status_code=204)
+def clear_playwright_code_route(
+    county_id: str,
+    source_id: int,
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """Wipe the cached code (engine will regenerate on next run)."""
+    _require_source(county_id, source_id, db)
+    from src.utils.action_sequence import clear_playwright_code
+    clear_playwright_code(county_id, source_id)
+    logger.info("[Admin] playwright_code cleared: source_id=%s by %s",
+                source_id, _admin.get("sub"))
+
+
+# ===========================================================================
 # COLUMN MAPPING APPROVAL WORKFLOW
 # ===========================================================================
 # GET   /api/admin/mappings/pending          — list pending (LLM-proposed, awaiting review)
@@ -909,6 +1058,10 @@ def _mapping_to_dict(m: CountyColumnMapping) -> dict:
         "approved_at":     m.approved_at.isoformat() if m.approved_at else None,
         "sample_rows":     m.sample_rows,
         "reject_feedback": m.reject_feedback,
+        # Transformation fields — applied in order after the column rename.
+        "post_processors": m.post_processors or [],
+        "value_maps":      m.value_maps or {},
+        "row_routing":     m.row_routing,
         "created_at":      m.created_at.isoformat() if m.created_at else None,
         "updated_at":      m.updated_at.isoformat() if m.updated_at else None,
     }
@@ -1027,7 +1180,13 @@ def get_mapping(
 
 
 class MappingUpdateRequest(BaseModel):
-    column_updates: dict  # {source_col: new_canonical_or_passthrough} — merged into existing mapping
+    # {source_col: new_canonical} — merged into the existing rename dict
+    column_updates: Optional[dict] = None
+    # Optional transformation-layer replacements. None = leave field unchanged.
+    # Empty list / dict = clear the field.
+    post_processors: Optional[list] = None
+    value_maps: Optional[dict] = None
+    row_routing: Optional[dict] = None
 
 
 @router.patch("/mappings/{mapping_id}")
@@ -1038,13 +1197,14 @@ def update_mapping(
     db: Session = Depends(get_db),
 ):
     """
-    Edit column assignments on an existing mapping (approved or pending).
+    Edit column assignments and/or transformation rules on an existing mapping.
 
-    Merges body.column_updates into the stored mapping dict, then marks the
-    mapping as approved (so edits by the admin are always live immediately).
-    The approved_by / approved_at fields are updated to reflect the edit.
+    Any field omitted from the body is left unchanged. column_updates is merged
+    into the existing rename dict; post_processors / value_maps / row_routing
+    are full replacements (since they're admin-curated structured payloads).
 
-    Use this to fix individual column assignments without re-running the LLM.
+    Approval state: marks the mapping is_approved=True, clears any prior reject
+    feedback, and stamps approved_by/at to reflect the edit.
     """
     from datetime import datetime, timezone
 
@@ -1052,9 +1212,17 @@ def update_mapping(
     if not mapping:
         raise HTTPException(status_code=404, detail=f"Mapping {mapping_id} not found")
 
-    merged = dict(mapping.mapping)
-    merged.update(body.column_updates)
-    mapping.mapping = merged
+    if body.column_updates is not None:
+        merged = dict(mapping.mapping)
+        merged.update(body.column_updates)
+        mapping.mapping = merged
+    if body.post_processors is not None:
+        mapping.post_processors = body.post_processors
+    if body.value_maps is not None:
+        mapping.value_maps = body.value_maps
+    if body.row_routing is not None:
+        mapping.row_routing = body.row_routing
+
     mapping.is_approved = True
     mapping.reject_feedback = None  # clear any prior rejection if editing back to approved
     mapping.approved_by = _admin.get("sub")
@@ -1063,8 +1231,12 @@ def update_mapping(
     db.refresh(mapping)
 
     logger.info(
-        "[Admin] Mapping updated: id=%s source_id=%s by %s cols_changed=%s",
-        mapping_id, mapping.source_id, _admin.get("sub"), list(body.column_updates.keys()),
+        "[Admin] Mapping updated: id=%s source_id=%s by %s cols=%s pp=%s vmap=%s routing=%s",
+        mapping_id, mapping.source_id, _admin.get("sub"),
+        list((body.column_updates or {}).keys()),
+        body.post_processors is not None,
+        body.value_maps is not None,
+        body.row_routing is not None,
     )
     return _mapping_to_dict(mapping)
 
@@ -1182,6 +1354,10 @@ class ManualMappingRequest(BaseModel):
     source_id: int
     mapping: dict          # {source_col: canonical_col}
     sample_rows: Optional[list] = None  # optional — populated from preview-columns step
+    # Optional transformations alongside the rename. All admin-curated.
+    post_processors: Optional[list] = None
+    value_maps: Optional[dict] = None
+    row_routing: Optional[dict] = None
 
 
 @router.post("/mappings/manual")
@@ -1193,6 +1369,11 @@ def create_manual_mapping(
     """
     Save a human-created column mapping as immediately approved.
     Supersedes any existing approved mapping for the same source.
+
+    Optional post_processors / value_maps / row_routing fields carry
+    transformations beyond the simple rename — used to express the BookPage
+    split, DocType normalization, and DocType→bucket routing for sources
+    that fan out into multiple downstream signals (e.g. clerk ORI exports).
     """
     from datetime import datetime, timezone
 
@@ -1210,13 +1391,19 @@ def create_manual_mapping(
         approved_by=_admin.get("sub"),
         approved_at=now,
         sample_rows=body.sample_rows,
+        post_processors=body.post_processors,
+        value_maps=body.value_maps,
+        row_routing=body.row_routing,
     )
     db.add(row)
     db.commit()
     db.refresh(row)
 
     logger.info(
-        "[Admin] Manual mapping saved: id=%s source_id=%s by %s",
+        "[Admin] Manual mapping saved: id=%s source_id=%s by %s pp=%s vmap=%s routing=%s",
         row.id, row.source_id, _admin.get("sub"),
+        body.post_processors is not None,
+        body.value_maps is not None,
+        body.row_routing is not None,
     )
     return _mapping_to_dict(row)

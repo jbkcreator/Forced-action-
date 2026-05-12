@@ -428,12 +428,42 @@ FORBIDDEN (code will be rejected):
        row_sel,
    )
 
+6. EXTRACTING HEADER ROW (critical — wrong header → DataFrame ends up with 0,1,2,...
+   column names and downstream loaders break):
+   Accela's grid header row uses <td> inside a row with class ACA_GridHeader,
+   NOT <th>. Try in order: header td → ACA_GridHeader td → first non-data
+   <tr>'s td cells. Pseudocode:
+
+       headers = await page.evaluate(
+           "(tableSel) => {"
+           "  const t = document.querySelector(tableSel);"
+           "  if (!t) return [];"
+           "  // 1. Real <th> cells"
+           "  let ths = Array.from(t.querySelectorAll('th'))"
+           "    .map(e => e.textContent.trim()).filter(Boolean);"
+           "  if (ths.length) return ths;"
+           "  // 2. Accela ACA_GridHeader row of <td>"
+           "  const hdr = t.querySelector('tr.ACA_GridHeader, tr.aca_grid_header');"
+           "  if (hdr) return Array.from(hdr.querySelectorAll('td'))"
+           "    .map(e => e.textContent.trim()).filter(Boolean);"
+           "  return [];"
+           "}",
+           results_table_sel,
+       )
+
+   If headers come back empty, DO NOT fall through to `pd.DataFrame(rows)`
+   (that gives integer column names). Instead either: (a) hard-code the column
+   names from the navigation_hint / portal docs if the grid is fixed-shape, or
+   (b) return pd.DataFrame() and let the engine surface the failure.
+
 RULES:
   - Output ONLY the async def run_scrape(...): block — nothing else.
   - No nested classes. No top-level statements outside the function.
   - Wrap main logic in try/except; on unrecoverable error log and return pd.DataFrame().
   - Always set df['county_id'] = county_id before returning.
-  - Keep under 140 lines total.\
+  - **Never** return a DataFrame with integer column names. If you can't recover
+    real headers, return an empty DataFrame instead so the operator notices.
+  - Keep under 160 lines total.\
 """
 
 

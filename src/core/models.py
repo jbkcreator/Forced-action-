@@ -13,6 +13,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    LargeBinary as sa_LargeBinary,
     Numeric,
     String,
     Text,
@@ -20,6 +21,7 @@ from sqlalchemy import (
     CheckConstraint,
     Index,
     func,
+    false as sa_false,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import DeclarativeBase, relationship, Mapped, mapped_column
@@ -1903,13 +1905,27 @@ class CountySource(Base):
     frequency: Mapped[Optional[str]] = mapped_column(String(20), default="daily")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     special_flags: Mapped[Optional[dict]] = mapped_column(JSONB, default=dict)
-    # ORI / CSV structure fields — explicit so the admin UI can show labeled form inputs.
-    # ori_column_map:   raw CSV column → canonical name  (e.g. {"DirectName": "Grantor"})
-    # ori_book_page_col: name of the combined "Book/Page" column to split on "/"
-    # ori_doc_type_map: raw DocType value → canonical label (e.g. {"JUDGEMENT LIEN": "JUDGMENT"})
-    ori_column_map: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
-    ori_book_page_col: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
-    ori_doc_type_map: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    # Scrape-mode enum (DB-side CHECK constraint enforces values):
+    #   ai_only            — browser-use Agent only
+    #   playwright_only    — execute cached playwright_code only; no AI fallback
+    #   playwright_then_ai — try cached code first, fall back to AI on failure
+    scrape_mode: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="ai_only",
+        server_default="ai_only",
+    )
+    # Cached Playwright function (async def run_scrape(...)) — either LLM-
+    # generated or admin-pasted. Engine refuses to run unapproved code unless
+    # scrape_mode forces it; the in-engine warning logs unapproved usage.
+    playwright_code: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    playwright_code_version: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    playwright_code_approved: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=sa_false(),
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -1927,6 +1943,10 @@ class CountySource(Base):
         Index("idx_county_sources_county_id", "county_id"),
         Index("idx_county_sources_signal_type", "signal_type"),
         Index("idx_county_sources_is_active", "is_active"),
+        CheckConstraint(
+            "scrape_mode IN ('ai_only','playwright_only','playwright_then_ai')",
+            name="ck_county_sources_scrape_mode",
+        ),
     )
 
     def __repr__(self):
@@ -1953,6 +1973,20 @@ class CountyColumnMapping(Base):
     approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     sample_rows: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     reject_feedback: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Ordered transformations applied to the renamed DataFrame, before value
+    # normalization. Currently supports one op:
+    #   {"op": "split_on_separator", "from": "BookPage", "sep": "/", "into": ["Book", "Page"]}
+    post_processors: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
+    # Per-column value normalization, applied after rename + post_processors.
+    # Shape: {"DocType": {"JUDGEMENT": "JUDGMENT", "LIEN (IRS)": "TAX LIEN", ...}}
+    value_maps: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    # DocType → downstream signal-bucket routing. Only set on multi-bucket
+    # sources (the liens ORI export, which fans out into liens/deeds/judgments/
+    # probate/divorce). Shape:
+    #   {"column": "DocType",
+    #    "default": "skip",
+    #    "rules": [{"match_exact": ["DEED"], "bucket": "deeds"}, ...]}
+    row_routing: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -2000,4 +2034,65 @@ class PlaywrightCodeHistory(Base):
         return (
             f"<PlaywrightCodeHistory(source_id={self.source_id}, "
             f"reason={self.reason!r}, version={self.prompt_version})>"
+        )
+
+
+class CFBypassProfile(Base):
+    """
+    Per-county Cloudflare-bypass session metadata.
+
+    Profile FILES live on the scraping host's local disk under
+    data/cf_session/edge_profile_<profile_name>/ — this row tracks the
+    metadata (status, last warmed / validated timestamps, failure reasons)
+    plus an optional zipped backup blob so a fresh host can restore a
+    known-good profile without re-warming from scratch.
+
+    See: src/utils/cf_session_manager.py for the lifecycle logic and
+    src/utils/cf_persistent_browser.py for the Playwright launch wrapper.
+    """
+    __tablename__ = "cf_bypass_profiles"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    profile_name: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    county_id:    Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    portal_url:   Mapped[str] = mapped_column(Text, nullable=False)
+    status:       Mapped[str] = mapped_column(
+        String(20), nullable=False, default="unwarmed", server_default="unwarmed",
+    )
+
+    last_warmed_at:      Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_validated_at:   Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_failure_at:     Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_failure_reason: Mapped[Optional[str]]      = mapped_column(Text)
+
+    profile_dir_path: Mapped[str] = mapped_column(Text, nullable=False)
+    validation_ttl_minutes: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=540, server_default="540",
+    )
+
+    # Optional zipped backup of the on-disk profile dir. NULL until first warm.
+    profile_blob:      Mapped[Optional[bytes]]     = mapped_column(sa_LargeBinary, nullable=True)  # type: ignore[name-defined]
+    profile_blob_size: Mapped[Optional[int]]       = mapped_column(Integer, nullable=True)
+    profile_blob_at:   Mapped[Optional[datetime]]  = mapped_column(DateTime(timezone=True))
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False,
+        onupdate=func.now(),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('unwarmed', 'ready', 'warming', 'expired', 'failed')",
+            name="check_cf_profile_status",
+        ),
+        Index("ix_cf_bypass_profiles_status_lookup", "status"),
+    )
+
+    def __repr__(self):
+        return (
+            f"<CFBypassProfile(name={self.profile_name!r}, "
+            f"county={self.county_id}, status={self.status})>"
         )

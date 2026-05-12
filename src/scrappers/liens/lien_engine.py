@@ -55,30 +55,28 @@ for _d in (RAW_LIEN_DIR, PROCESSED_DATA_DIR, PROCESSED_LIENS_DIR,
            PROCESSED_DEEDS_DIR, PROCESSED_JUDGMENTS_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
-# ---------------------------------------------------------------------------
-# Built-in Hillsborough coded → canonical doc type normalisation.
-# Hillsborough ORI exports use parenthesised codes like "(D) DEED", "(LN) LIEN".
-# Pinellas ORI uses plain English names that are handled via ori_doc_type_map
-# in county config. This built-in map is the fallback so Hillsborough works
-# even with an empty ori_doc_type_map in config.
-# ---------------------------------------------------------------------------
-_HILLSBOROUGH_DOC_MAP: dict[str, str] = {
-    "(D) DEED":                                          "DEED",
-    "(TAXDEED) TAX DEED":                                "DEED",
-    "(DPL) DEED PLAT":                                   "DEED",
-    "(JUD) JUDGMENT":                                    "JUDGMENT",
-    "(CCJ) CERTIFIED COPY OF A COURT JUDGMENT":          "JUDGMENT",
-    "(LN) LIEN":                                         "LIEN",
-    "(LNCORPTX) CORP TAX LIEN FOR STATE OF FLORIDA":     "TAX LIEN",
-    "(LP) LIS PENDENS":                                  "LIS PENDENS",
-    "LIS PENDENS":                                       "LIS PENDENS",
-}
+# Document-type → canonical normalization, doc-type → signal-bucket routing,
+# and column renames (DirectName→Grantor etc.) all live on the per-source
+# CountyColumnMapping row. Build/edit them via the Column Mappings admin UI
+# or via the migration `y9z0a1b2c3d4_promote_scrape_mode_and_collapse_ori`.
 
-# HOA / IRS keywords are the same for every county.
+# HOA / IRS keywords are still applied below for sub-categorising LIEN rows
+# (HOA lien vs IRS tax lien). Could move into a value-map on the bucketed
+# DataFrame later; for now they stay here.
 _HOA_KEYWORDS = frozenset(["ASSOCIATION", "HOA", "CONDO", "COMMUNITY",
                             "VILLAGE", "TOWNHOME", "PROPERTY OWNERS"])
 _IRS_KEYWORDS = frozenset(["UNITED STATES", "INTERNAL REVENUE",
                             "STATE OF FLORIDA", "DEPARTMENT OF REVENUE"])
+
+# Bucket name → output directory. row_routing in the CountyColumnMapping uses
+# these bucket names; this map tells the pipeline where each one lands.
+_BUCKET_DIRS = {
+    "liens":     PROCESSED_LIENS_DIR,
+    "deeds":     PROCESSED_DEEDS_DIR,
+    "judgments": PROCESSED_JUDGMENTS_DIR,
+    "probate":   PROCESSED_DATA_DIR / "probate",
+    "divorce":   PROCESSED_DATA_DIR / "divorce",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -192,55 +190,87 @@ _STEALTH_UA = (
 )
 
 
-async def run_browser_agent(task: str, download_dir: Path, headful: bool = False,
-                           no_proxy: bool = False) -> tuple:
+async def run_browser_agent(
+    task: str,
+    download_dir: Path,
+    headful: bool = False,
+    no_proxy: bool = False,
+    cf_profile: Optional[dict] = None,
+) -> tuple:
     """
     Run a browser-use Agent that triggers a file download.
+
+    cf_profile = {"edge_path": "...", "profile_dir": "..."} switches the launch
+    into persistent-Edge-profile mode for Cloudflare-protected portals:
+      - Edge binary instead of bundled Chromium (TLS fingerprint that earned
+        the cf_clearance cookie)
+      - user_data_dir = warmed profile (cookie + Turnstile state persist there)
+      - No proxy, no stealth init script — both would disturb the fingerprint
+        Cloudflare hashed when issuing the cookie.
+
     Returns (history, start_time).
     """
     from browser_use import Agent, Browser
-    from playwright_stealth import Stealth
     from src.utils.http_helpers import get_browser_use_proxy
 
     llm = _make_llm()
 
-    browser = Browser(
+    browser_kwargs = dict(
         headless=not headful,
         disable_security=True,
-        proxy=None if no_proxy else get_browser_use_proxy(),
         downloads_path=str(download_dir),
-        user_agent=_STEALTH_UA,
         ignore_default_args=["--enable-automation"],
-        enable_default_extensions=True,
         minimum_wait_page_load_time=1.5,
         wait_between_actions=1.0,
         args=[
-            '--no-sandbox',
-            '--disable-blink-features=AutomationControlled',
-            '--window-size=1920,1080',
+            "--no-sandbox",
+            "--disable-blink-features=AutomationControlled",
+            "--window-size=1920,1080",
         ],
     )
 
+    if cf_profile:
+        browser_kwargs.update(
+            executable_path=cf_profile["edge_path"],
+            user_data_dir=cf_profile["profile_dir"],
+            proxy=None,
+            enable_default_extensions=False,
+        )
+        logger.info(
+            "[Agent] CF-bypass mode — Edge=%s profile=%s",
+            cf_profile["edge_path"], cf_profile["profile_dir"],
+        )
+    else:
+        browser_kwargs.update(
+            proxy=None if no_proxy else get_browser_use_proxy(),
+            user_agent=_STEALTH_UA,
+            enable_default_extensions=True,
+        )
+
+    browser = Browser(**browser_kwargs)
+
     # Start browser before the agent so CDP is live for init script injection.
-    # agent.run() calls start() again but it's idempotent (skips if already connected).
+    # agent.run() calls start() again but it's idempotent.
     await browser.start()
 
-    # Inject playwright-stealth patches before any page loads.
-    # Fixes: window.chrome missing, navigator.plugins=0, WebGL SwiftShader renderer —
-    # all three are Cloudflare Turnstile detection signals.
-    stealth = Stealth(
-        chrome_runtime=True,
-        navigator_webdriver=True,
-        navigator_plugins=True,
-        webgl_vendor=True,
-        webgl_vendor_override="Google Inc. (Intel)",
-        webgl_renderer_override=(
-            "ANGLE (Intel, Intel(R) UHD Graphics 620 "
-            "Direct3D11 vs_5_0 ps_5_0, D3D11)"
-        ),
-    )
-    await browser._cdp_add_init_script(stealth.script_payload)
-    logger.info("[Stealth] Injected fingerprint patches via CDP init script")
+    if not cf_profile:
+        # Stealth patches the navigator/WebGL signatures Cloudflare hashes when
+        # issuing cf_clearance — skip injection in CF mode to keep the warmed
+        # profile's fingerprint intact.
+        from playwright_stealth import Stealth
+        stealth = Stealth(
+            chrome_runtime=True,
+            navigator_webdriver=True,
+            navigator_plugins=True,
+            webgl_vendor=True,
+            webgl_vendor_override="Google Inc. (Intel)",
+            webgl_renderer_override=(
+                "ANGLE (Intel, Intel(R) UHD Graphics 620 "
+                "Direct3D11 vs_5_0 ps_5_0, D3D11)"
+            ),
+        )
+        await browser._cdp_add_init_script(stealth.script_payload)
+        logger.info("[Stealth] Injected fingerprint patches via CDP init script")
 
     agent = Agent(task=task, llm=llm, browser=browser, max_steps=60, use_judge=False)
 
@@ -290,109 +320,29 @@ def _locate_download(download_dir: Path, start_time: float) -> Optional[Path]:
 
 
 # ---------------------------------------------------------------------------
-# Column normalisation — driven by source config (special_flags)
+# Lien sub-categorisation for the LIEN bucket
 # ---------------------------------------------------------------------------
-
-def _normalize_ori_columns(df: pd.DataFrame, source: dict) -> pd.DataFrame:
-    """
-    Apply county-specific column renames and structural fixes using values
-    stored in source["ori_column_map"] and source["ori_book_page_col"].
-
-    Hillsborough: ori_column_map={}, ori_book_page_col=None → no-op.
-    Pinellas:     ori_column_map={"DirectName":"Grantor",...}, ori_book_page_col="BookPage".
-
-    Both fields come from CountySource.special_flags and are merged into the
-    source dict by get_county_config().
-    """
-    # 1. Column renames
-    col_map: dict = source.get("ori_column_map") or {}
-    if col_map:
-        df = df.rename(columns=col_map)
-        logger.info("[Normalize] Renamed columns: %s", list(col_map.keys()))
-
-    # 2. Split combined BookPage column (e.g. "23544/1338" → Book="23544", Page="1338")
-    book_page_col: Optional[str] = source.get("ori_book_page_col")
-    if book_page_col and book_page_col in df.columns:
-        split = df[book_page_col].astype(str).str.split("/", n=1, expand=True)
-        df["Book"] = split[0].str.strip() if 0 in split.columns else ""
-        df["Page"] = split[1].str.strip() if 1 in split.columns else ""
-        df = df.drop(columns=[book_page_col])
-        logger.info("[Normalize] Split %s → Book / Page", book_page_col)
-
-    # 3. Ensure Filing Amt column exists (absent in Pinellas portal)
-    if "Filing Amt" not in df.columns:
-        df["Filing Amt"] = None
-
-    return df
-
-
-# ---------------------------------------------------------------------------
-# Doc type normalisation — built-in Hillsborough codes + config override map
-# ---------------------------------------------------------------------------
-
-def _canonical_doc_type(raw: str, ori_doc_type_map: dict) -> str:
-    """
-    Normalise a single DocType value to a canonical label.
-
-    Resolution order:
-      1. County-specific ori_doc_type_map from config (handles Pinellas verbose types)
-      2. Built-in Hillsborough coded map (handles "(D) DEED", "(LN) LIEN", etc.)
-      3. Pass through as-is if not found in either map.
-    """
-    raw_stripped = raw.strip()
-    raw_upper = raw_stripped.upper()
-
-    # Config-level override (e.g. Pinellas "JUDGEMENT LIEN" → "JUDGMENT LIEN")
-    if raw_stripped in ori_doc_type_map:
-        return ori_doc_type_map[raw_stripped]
-    if raw_upper in {k.upper(): v for k, v in ori_doc_type_map.items()}:
-        return {k.upper(): v for k, v in ori_doc_type_map.items()}[raw_upper]
-
-    # Built-in Hillsborough coded types
-    if raw_stripped in _HILLSBOROUGH_DOC_MAP:
-        return _HILLSBOROUGH_DOC_MAP[raw_stripped]
-    if raw_upper in {k.upper(): v for k, v in _HILLSBOROUGH_DOC_MAP.items()}:
-        return {k.upper(): v for k, v in _HILLSBOROUGH_DOC_MAP.items()}[raw_upper]
-
-    return raw_stripped
-
-
-def _normalize_doc_types(df: pd.DataFrame, source: dict) -> pd.DataFrame:
-    """Apply canonical doc type normalisation to the DocType column."""
-    ori_doc_type_map: dict = source.get("ori_doc_type_map") or {}
-    if "DocType" in df.columns:
-        df = df.copy()
-        df["DocType"] = df["DocType"].fillna("").apply(
-            lambda v: _canonical_doc_type(str(v), ori_doc_type_map)
-        )
-    return df
-
-
-# ---------------------------------------------------------------------------
-# Code lien label — county-aware, driven by county config
-# ---------------------------------------------------------------------------
+# The row_routing on the CountyColumnMapping splits rows into top-level buckets
+# (liens / deeds / judgments / probate / divorce) by raw DocType value. The
+# generic "liens" bucket is then further sub-categorised here, based on party
+# names (HOA vs IRS vs city/county filer vs mechanics).
+# This sub-bucketing relies on per-county filer keywords from county_cfg, so
+# it can't easily move to the CountyColumnMapping today.
 
 def _code_lien_label(grantor_upper: str, grantee_upper: str,
                      city_filer_keywords: list, code_lien_type_map: dict) -> Optional[str]:
     """
-    Return the code lien document_type label if either party is a known
-    government filer, or None if no filer match.
-
-    Uses county_cfg["city_filer_keywords"] for detection and
-    county_cfg["code_lien_type_map"] to build the type-coded label
-    (e.g. "CODE LIENS (TCL)" for Hillsborough/Tampa).
-
-    For counties without a code_lien_type_map, returns the generic "CODE LIEN".
+    Return the code-lien document_type label if either party is a known
+    government filer, else None.
     """
     combined = grantor_upper + " " + grantee_upper
     matched_keyword = next(
         (kw for kw in city_filer_keywords if kw.upper() in combined),
-        None
+        None,
     )
     if not matched_keyword:
         return None
 
-    # Try to map to a specific type code (e.g. TCL, CCL for Hillsborough)
     for type_code, city_name in code_lien_type_map.items():
         if city_name and city_name.upper() in matched_keyword.upper():
             return f"CODE LIENS ({type_code})"
@@ -402,59 +352,27 @@ def _code_lien_label(grantor_upper: str, grantee_upper: str,
     return "CODE LIEN"
 
 
-# ---------------------------------------------------------------------------
-# Categorisation — county-aware
-# ---------------------------------------------------------------------------
-
-def categorize_and_split_data(combined_df: pd.DataFrame, county_cfg: dict) -> dict:
+def _sub_categorise_liens(df: pd.DataFrame, county_cfg: dict) -> pd.DataFrame:
     """
-    Route records to liens/deeds/judgments/probate using the canonical DocType
-    values (already normalised by _normalize_doc_types).
-
-    county_cfg supplies:
-      - city_filer_keywords  → detect code liens by party name
-      - code_lien_type_map   → build typed label (TCL/CCL) or fall back to "CODE LIEN"
-
-    Saves each category to processed/<type>/new/.
-    Returns {filename: row_count}.
+    Stamp a `document_type` column on the liens bucket based on doc type +
+    party names. This is the only piece of routing left in code; everything
+    else has moved into CountyColumnMapping.row_routing.
     """
+    if df.empty:
+        return df
+
     city_filer_keywords: list = county_cfg.get("city_filer_keywords") or []
-    code_lien_type_map: dict  = county_cfg.get("code_lien_type_map")  or {}
+    code_lien_type_map: dict = county_cfg.get("code_lien_type_map") or {}
 
-    logger.info("[Categorize] Routing %d records — county_filer_keywords: %s",
-                len(combined_df), city_filer_keywords)
-
-    def categorize_record(row) -> str:
+    def label_row(row) -> str:
         doc_type = str(row.get("DocType", "") or "").strip().upper()
-        grantor  = str(row.get("Grantor",  "") or "").upper()
-        grantee  = str(row.get("Grantee",  "") or "").upper()
+        grantor = str(row.get("Grantor", "") or "").upper()
+        grantee = str(row.get("Grantee", "") or "").upper()
 
-        # Deeds
-        if doc_type in ("DEED", "TAX DEED"):
-            return "DEED"
-
-        # Lis Pendens
         if "LIS PENDENS" in doc_type:
             return "LIS PENDENS"
-
-        # Probate (Pinellas ORI export; no-op for Hillsborough)
-        if doc_type in ("PROBATE", "PROBATE REAL PROPERTY"):
-            return "PROBATE"
-
-        # Divorce judgments (Pinellas ORI export; no-op for Hillsborough)
-        if "DOMESTIC RELATIONS" in doc_type or "DISSOLUTION OF MARRIAGE" in doc_type:
-            return "DIVORCE JUDGMENT"
-
-        # Judgments and judgment liens
-        if doc_type in ("JUDGMENT", "JUDGMENT LIEN"):
-            label = _code_lien_label(grantor, grantee, city_filer_keywords, code_lien_type_map)
-            return label if label else "JUDGMENT"
-
-        # Tax lien (IRS / state)
         if doc_type == "TAX LIEN":
             return "TAX LIEN"
-
-        # General lien — sub-categorise by party
         if doc_type in ("LIEN", "FINANCING STATEMENT", "CORPORATE LIEN"):
             if any(kw in grantor or kw in grantee for kw in _HOA_KEYWORDS):
                 return "HOA LIENS (HL)"
@@ -464,71 +382,63 @@ def categorize_and_split_data(combined_df: pd.DataFrame, county_cfg: dict) -> di
             if label:
                 return label
             return "MECHANICS LIENS (ML)"
+        # Routing put this row in the liens bucket but we couldn't sub-label it.
+        return doc_type or "LIEN"
 
-        return "SKIP"
+    df = df.copy()
+    df["document_type"] = df.apply(label_row, axis=1)
+    return df
 
-    combined_df = combined_df.copy()
-    combined_df["document_type"] = combined_df.apply(categorize_record, axis=1)
 
-    lien_types     = {"HOA LIENS (HL)", "TAX LIEN", "MECHANICS LIENS (ML)",
-                      "LIS PENDENS", "CODE LIEN"}
-    deed_types     = {"DEED"}
-    judgment_types = {"JUDGMENT", "JUDGMENT LIEN"}
-    probate_types  = {"PROBATE"}
-    divorce_types  = {"DIVORCE JUDGMENT"}
-
-    # Also bucket any CODE LIENS (TCL) / CODE LIENS (CCL) style labels into liens
-    def _is_lien(dt: str) -> bool:
-        return dt in lien_types or dt.startswith("CODE LIENS (")
-
-    skipped = (combined_df["document_type"] == "SKIP").sum()
-    kept    = len(combined_df) - skipped
-    logger.info("[Categorize] %d kept, %d discarded", kept, skipped)
-
+def _save_buckets(buckets: dict, county_cfg: dict) -> dict:
+    """
+    Persist each routed bucket DataFrame to its processed/<bucket>/new/ dir.
+    The liens bucket goes through _sub_categorise_liens first so individual
+    HOA / TAX / MECHANICS / CODE labels still land in the CSV.
+    Returns {filename: row_count}.
+    """
     today_str = datetime.now().strftime("%Y%m%d")
     file_counts: dict = {}
 
-    def _save(df_cat: pd.DataFrame, cat_dir: Path, filename: str):
-        if df_cat.empty:
-            return
-        new_dir = cat_dir / "new"
-        new_dir.mkdir(parents=True, exist_ok=True)
-        out = new_dir / filename
-        df_cat.to_csv(out, index=False)
-        file_counts[out.name] = len(df_cat)
-        logger.info("[Categorize] Saved %d records → %s", len(df_cat), out.name)
-        for dt in df_cat["document_type"].unique():
-            logger.info("  %s: %d", dt, (df_cat["document_type"] == dt).sum())
+    bucket_filename = {
+        "liens":     f"all_liens_{today_str}.csv",
+        "deeds":     f"all_deeds_{today_str}.csv",
+        "judgments": f"all_judgments_{today_str}.csv",
+        "probate":   f"all_probate_{today_str}.csv",
+        "divorce":   f"all_divorce_{today_str}.csv",
+    }
 
-    _save(
-        combined_df[combined_df["document_type"].apply(_is_lien)],
-        PROCESSED_LIENS_DIR,
-        f"all_liens_{today_str}.csv",
-    )
-    _save(
-        combined_df[combined_df["document_type"].isin(deed_types)],
-        PROCESSED_DEEDS_DIR,
-        f"all_deeds_{today_str}.csv",
-    )
-    _save(
-        combined_df[combined_df["document_type"].isin(judgment_types)],
-        PROCESSED_JUDGMENTS_DIR,
-        f"all_judgments_{today_str}.csv",
-    )
-    # Probate from Pinellas ORI — saved to processed/probate/new/
-    probate_dir = PROCESSED_DATA_DIR / "probate"
-    _save(
-        combined_df[combined_df["document_type"].isin(probate_types)],
-        probate_dir,
-        f"all_probate_{today_str}.csv",
-    )
-    # Divorce judgments from Pinellas ORI — saved to processed/divorce/new/
-    divorce_dir = PROCESSED_DATA_DIR / "divorce"
-    _save(
-        combined_df[combined_df["document_type"].isin(divorce_types)],
-        divorce_dir,
-        f"all_divorce_{today_str}.csv",
-    )
+    for bucket, df_bucket in buckets.items():
+        if bucket == "_default":
+            # No row_routing on this mapping — write the whole frame into liens.
+            bucket = "liens"
+        if df_bucket.empty:
+            continue
+        out_dir = _BUCKET_DIRS.get(bucket)
+        if out_dir is None:
+            logger.warning("[Categorize] Unknown bucket %r — skipping %d rows",
+                           bucket, len(df_bucket))
+            continue
+        if bucket == "liens":
+            df_bucket = _sub_categorise_liens(df_bucket, county_cfg)
+        else:
+            df_bucket = df_bucket.copy()
+            if "document_type" not in df_bucket.columns:
+                # Stamp a canonical label so downstream loaders have it
+                df_bucket["document_type"] = bucket.upper()
+
+        # Ensure Filing Amt column exists for loaders that expect it
+        if "Filing Amt" not in df_bucket.columns:
+            df_bucket["Filing Amt"] = None
+
+        new_dir = out_dir / "new"
+        new_dir.mkdir(parents=True, exist_ok=True)
+        out = new_dir / bucket_filename[bucket]
+        df_bucket.to_csv(out, index=False)
+        file_counts[out.name] = len(df_bucket)
+        logger.info("[Categorize] Saved %d records → %s", len(df_bucket), out.name)
+        for dt in df_bucket["document_type"].unique():
+            logger.info("  %s: %d", dt, (df_bucket["document_type"] == dt).sum())
 
     return file_counts
 
@@ -571,7 +481,13 @@ async def run_lien_pipeline(
     load_to_db: bool = False,
     no_proxy: bool = False,
 ) -> bool:
-    """County-agnostic lien/deed/judgment/probate scrape for a date range."""
+    """County-agnostic lien/deed/judgment/probate scrape for a date range.
+
+    Every scrape goes through the browser-use Agent. When the source has
+    `cf_bypass_required=true`, the Agent is launched against the warmed Edge
+    profile validated by cf_session_manager.ensure_ready — same fingerprint
+    that earned the cf_clearance cookie, so the Cloudflare wall stays down.
+    """
     _t0 = time.monotonic()
 
     county_cfg = get_county_config(county_id)
@@ -590,15 +506,51 @@ async def run_lien_pipeline(
     start_str = _start_dt.strftime("%m/%d/%Y")
     end_str   = _end_dt.strftime("%m/%d/%Y")
 
+    cf_required = bool(source.get("cf_bypass_required"))
+
     logger.info("=" * 70)
     logger.info("LIEN/DEED/JUDGMENT PIPELINE — %s", county_cfg["display_name"].upper())
-    logger.info("Date range: %s → %s  headful=%s  load_to_db=%s",
-                start_str, end_str, headful, load_to_db)
+    logger.info("Date range: %s → %s  headful=%s  load_to_db=%s  cf_bypass=%s",
+                start_str, end_str, headful, load_to_db, cf_required)
     logger.info("=" * 70)
 
+    # --- Warm / validate Cloudflare profile if portal requires it ------------
+    cf_profile: Optional[dict] = None
+    if cf_required:
+        from src.utils.cf_session_manager import ensure_ready, CFBypassFailedError
+        from src.utils.cf_persistent_browser import find_edge_binary, profile_dir_for
+
+        profile_name = source.get("cf_bypass_profile_name") or f"{county_id}_clerk"
+        portal_url = source.get("url", "")
+        try:
+            profile_dir = await ensure_ready(
+                profile_name=profile_name,
+                county_id=county_id,
+                portal_url=portal_url,
+            )
+        except CFBypassFailedError as exc:
+            logger.error("[CF] Profile unusable for %s: %s", profile_name, exc)
+            _record_stats(0, False, _t0, county_id, error=f"cf_bypass_failed: {exc}")
+            return False
+
+        edge_path = find_edge_binary()
+        if not edge_path:
+            logger.error("[CF] No Edge binary found — set CF_BYPASS_BROWSER_PATH")
+            _record_stats(0, False, _t0, county_id, error="no_edge_binary")
+            return False
+
+        cf_profile = {"edge_path": edge_path, "profile_dir": str(profile_dir)}
+        # CF profile requires direct connection — proxy would break TLS fingerprint
+        no_proxy = True
+
+    # --- Run browser-use Agent ----------------------------------------------
     task = build_agent_task(source, start_str, end_str)
-    history, start_time = await run_browser_agent(task, RAW_LIEN_DIR, headful=headful,
-                                                  no_proxy=no_proxy)
+    history, start_time = await run_browser_agent(
+        task, RAW_LIEN_DIR,
+        headful=headful,
+        no_proxy=no_proxy,
+        cf_profile=cf_profile,
+    )
 
     if history is None:
         logger.error("[Pipeline] Agent failed to run")
@@ -625,11 +577,40 @@ async def run_lien_pipeline(
         _record_stats(0, True, _t0, county_id)
         return True
 
-    # Normalise columns and doc types using county source config
-    df = _normalize_ori_columns(df, source)
-    df = _normalize_doc_types(df, source)
+    # Resolve the ColumnMapping for this source. Renames, BookPage split, doc-
+    # type value normalisation, and row routing all happen inside ColumnMapper.
+    from src.loaders.column_mapper import ColumnMapper, NeedsMappingError, SkipMapping
+    source_id = source.get("source_id")
+    try:
+        mapper = ColumnMapper()
+        # Trigger the LLM auto-map only when no approved/pending mapping exists
+        # for this source. The synthesized migration row keeps the legacy
+        # Hillsborough / Pinellas configs working without an LLM call.
+        mapper.get_or_create("liens", source_id, df)
+        # Pass the scraped columns so a stale approved mapping (different shape)
+        # falls back to a matching pending row instead of being returned as-is.
+        mapping_row = ColumnMapper.fetch_mapping_row(
+            source_id, raw_cols=list(df.columns)
+        )
+    except (NeedsMappingError, SkipMapping) as exc:
+        logger.error("[Pipeline] ColumnMapper unavailable: %s", exc)
+        _record_stats(0, False, _t0, county_id, error=f"column_mapping_failed: {exc}")
+        return False
 
-    file_counts = categorize_and_split_data(df, county_cfg)
+    if mapping_row is None:
+        logger.error("[Pipeline] No CountyColumnMapping for source_id=%s", source_id)
+        _record_stats(0, False, _t0, county_id, error="no_column_mapping")
+        return False
+
+    buckets = ColumnMapper.apply_transformations(df, mapping_row)
+    logger.info(
+        "[Pipeline] Routed %d records into %d buckets: %s",
+        sum(len(b) for b in buckets.values()),
+        len(buckets),
+        {k: len(v) for k, v in buckets.items()},
+    )
+
+    file_counts = _save_buckets(buckets, county_cfg)
     total = sum(file_counts.values())
 
     logger.info("=" * 70)

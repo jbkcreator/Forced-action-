@@ -52,8 +52,15 @@ def _load_from_db(county_id: str) -> dict:
                 "Add it via the admin UI (/api/admin/counties) first."
             )
 
+        # Build per-signal source dicts. special_flags is spread FIRST so that
+        # any explicit first-class column below overrides a stale leftover key
+        # in the JSONB (e.g. legacy `scrape_mode` or `playwright_code` keys
+        # that haven't been swept out yet by the cleanup migration).
         sources: dict[str, Any] = {
             src.signal_type: {
+                # Remaining one-off flags (prr_only, cf_bypass_required,
+                # style_col, bulk_tables, permit_ai_strategy, etc.) come first.
+                **(src.special_flags or {}),
                 "source_id":            src.id,
                 "url":                  src.url,
                 "source_name":          src.source_name,
@@ -62,12 +69,12 @@ def _load_from_db(county_id: str) -> dict:
                 "output_format":        src.output_format,
                 "date_range_available": src.date_range_available,
                 "frequency":            src.frequency,
-                # Explicit ORI/CSV structure fields (surfaced as labeled admin UI inputs)
-                "ori_column_map":       src.ori_column_map or {},
-                "ori_book_page_col":    src.ori_book_page_col,
-                "ori_doc_type_map":     src.ori_doc_type_map or {},
-                # Remaining one-off flags (prr_only, style_col, bulk_tables, etc.)
-                **(src.special_flags or {}),
+                # First-class scrape-mode + Playwright-code fields. Explicit
+                # values here win over any legacy values in special_flags.
+                "scrape_mode":              src.scrape_mode,
+                "playwright_code":          src.playwright_code,
+                "playwright_code_version":  src.playwright_code_version,
+                "playwright_code_approved": src.playwright_code_approved,
             }
             for src in county.sources
             if src.is_active

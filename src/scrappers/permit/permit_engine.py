@@ -82,16 +82,21 @@ def _make_llm():
 
 
 def _get_scrape_mode(source: dict) -> str:
-    """Return scrape mode from source special_flags (spread directly into source dict).
-
-    Modes:
-      download_direct  Direct HTTP — reads download_url / download_params from source.
-      selector         Playwright CSS selectors — reads source.selectors dict.
-                       Automatically falls back to browser_use on failure.
-      extract          browser-use reads table rows and returns JSON (no file).
-      download         browser-use clicks export button, waits for file (default).
     """
-    return source.get("scrape_mode", "download")
+    Return the effective permit-engine sub-mode for main()'s dispatch.
+
+    The top-level `scrape_mode` enum on county_sources is:
+      playwright_only / playwright_then_ai → "selector"  (cached code path)
+      ai_only / unset                      → look up permit-specific sub-mode
+
+    The AI sub-mode (download_direct / extract / download) is stored in
+    special_flags.permit_ai_strategy. Sources that don't set it default to
+    "download" (browser-use clicks export, waits for file).
+    """
+    top_level = source.get("scrape_mode")
+    if top_level in ("playwright_only", "playwright_then_ai"):
+        return "selector"
+    return source.get("permit_ai_strategy") or "download"
 
 
 def build_agent_task(source: dict, start_str: str, end_str: str) -> str:
