@@ -178,6 +178,54 @@ def _check_team_unlock(referrer_id: int, db: Session) -> Optional[ReferralTeam]:
     return team
 
 
+def revoke_team_for_subscriber(subscriber_id: int, reason: str, db: Session) -> int:
+    """
+    Break every active ReferralTeam in which subscriber_id appears as lead or member.
+
+    Called when a subscriber refunds, disputes, or confirms churn (NOT during grace).
+    Idempotent: already-broken teams are skipped.
+    Returns the number of teams actually broken.
+    """
+    from sqlalchemy import or_, func as _func
+
+    now = datetime.now(timezone.utc)
+    reason = reason[:32]
+
+    # Teams where the subscriber is the lead
+    lead_teams = db.execute(
+        select(ReferralTeam).where(
+            ReferralTeam.lead_subscriber_id == subscriber_id,
+            ReferralTeam.status == "active",
+        )
+    ).scalars().all()
+
+    # Teams where the subscriber is a member (ARRAY @> ARRAY[id])
+    from sqlalchemy import cast, text as _text
+    from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY
+    member_teams = db.execute(
+        select(ReferralTeam).where(
+            ReferralTeam.status == "active",
+            ReferralTeam.lead_subscriber_id != subscriber_id,
+            _text(f"member_subscriber_ids @> ARRAY[{subscriber_id}]::integer[]"),
+        )
+    ).scalars().all()
+
+    all_teams = {t.id: t for t in lead_teams + member_teams}
+    for team in all_teams.values():
+        team.status = "broken"
+        team.broken_at = now
+        team.broken_reason = reason
+
+    if all_teams:
+        db.flush()
+        logger.info(
+            "[Referral] revoked %d team(s) for subscriber=%d reason=%s",
+            len(all_teams), subscriber_id, reason,
+        )
+
+    return len(all_teams)
+
+
 def reward_referrer(referral_event_id: int, db: Session) -> ReferralEvent:
     event = db.get(ReferralEvent, referral_event_id)
     if not event:

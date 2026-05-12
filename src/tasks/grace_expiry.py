@@ -219,6 +219,7 @@ def expire_subscriber_grace_periods(db: Session) -> int:
     ).scalars().all()
 
     churned = 0
+    from src.services.referral_engine import revoke_team_for_subscriber
     for subscriber in expired:
         subscriber.status = "churned"
         churned += 1
@@ -226,6 +227,7 @@ def expire_subscriber_grace_periods(db: Session) -> int:
             f"Subscriber churned: id={subscriber.id} "
             f"tier={subscriber.tier} vertical={subscriber.vertical}"
         )
+        revoke_team_for_subscriber(subscriber.id, "churn", db)
 
     if churned:
         logger.info(f"grace_expiry: churned {churned} subscribers")

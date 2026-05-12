@@ -2934,6 +2934,22 @@ def team_view(feed_uuid: str, db: Session = Depends(get_db)):
         ).limit(1)
     ).scalar_one_or_none()
     if not team:
+        # Check whether the subscriber had a team that was subsequently broken
+        broken_team = db.execute(
+            select(ReferralTeam).where(
+                ReferralTeam.member_subscriber_ids.any(sub.id),
+                ReferralTeam.status == "broken",
+            ).order_by(ReferralTeam.broken_at.desc()).limit(1)
+        ).scalar_one_or_none()
+        if broken_team:
+            return {
+                "unlocked": False,
+                "status": "broken",
+                "broken_at": broken_team.broken_at.isoformat() if broken_team.broken_at else None,
+                "broken_reason": broken_team.broken_reason,
+                "shared_zips": [],
+                "density": [],
+            }
         return {"unlocked": False, "shared_zips": [], "density": []}
 
     zips = team.shared_zips or []
