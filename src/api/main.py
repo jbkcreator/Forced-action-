@@ -1149,7 +1149,7 @@ def event_feed(
             "leads": [],
         }
 
-    if subscriber.status not in ("active", "grace"):
+    if subscriber.status not in ("active", "grace", "disputed"):
         raise HTTPException(status_code=403, detail={"error": "subscription_inactive", "message": "Subscription is not active"})
 
     # 2. Get subscriber's locked ZIP codes
@@ -1483,7 +1483,7 @@ def feed_stats(feed_uuid: str, db: Session = Depends(get_db)):
     if not subscriber:
         raise HTTPException(status_code=404, detail={"error": "not_found", "message": "Feed not found"})
 
-    if subscriber.status not in ("active", "grace"):
+    if subscriber.status not in ("active", "grace", "disputed"):
         raise HTTPException(status_code=403, detail={"error": "subscription_inactive", "message": "Subscription is not active"})
 
     try:
