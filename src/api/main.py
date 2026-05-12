@@ -1436,6 +1436,7 @@ def event_feed(
             "locked_zips": list(locked_zips),
             "founding_member": subscriber.founding_member,
             "status": subscriber.status,
+            "disputed_at": subscriber.disputed_at.isoformat() if subscriber.disputed_at else None,
             "has_saved_card": subscriber.has_saved_card,
             "auto_mode_enabled": subscriber.auto_mode_enabled,
             "created_at": subscriber.created_at.isoformat() if subscriber.created_at else None,
