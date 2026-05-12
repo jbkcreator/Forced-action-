@@ -150,7 +150,7 @@ def _record_outcome(subscriber_id: int, body: str, db: Session) -> MessageOutcom
         subscriber_id=subscriber_id,
         message_type="sms",
         template_id="auto_mode_first_text",
-        channel="twilio",
+        channel="telnyx",
         sent_at=datetime.now(timezone.utc),
     )
     db.add(outcome)

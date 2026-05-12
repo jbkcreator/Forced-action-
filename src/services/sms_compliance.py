@@ -1,20 +1,22 @@
 """
 SMS compliance gate — TCPA / CTIA.
 
-Every outbound SMS must pass through can_send() before hitting Twilio.
+Every outbound SMS must pass through can_send() before hitting the vendor.
 Inbound STOP keywords are handled by handle_inbound() and written to sms_opt_outs.
 
 Pre-send flow:
     can_send(phone, db) → False  →  add_to_dead_letter(), do not send
-                        → True   →  send via Twilio
+                        → True   →  send via Telnyx
 
-Inbound keyword flow (Twilio webhook):
+Inbound keyword flow (Telnyx webhook):
     handle_inbound(from_number, body, db)
-        → if STOP keyword: record_opt_out(), return TwiML opt-out reply
+        → if STOP keyword: record_opt_out(), return TeXML opt-out reply
         → else:            return None (caller handles normal inbound)
 
-Redis note: sms_opt_outs is the Postgres-backed suppression list for 2B-1.
-In 2B-2 this will be fronted by a Redis SET for sub-millisecond pre-send checks.
+Vendor: Telnyx Messaging API (replaced Twilio 2026-05-11 — see plan
+mellow-strolling-fairy.md). Send mechanics live one layer down in
+src/services/telnyx_sms.py; this file owns only the compliance gate
+and the dead-letter queue.
 """
 
 import logging
@@ -27,11 +29,7 @@ from sqlalchemy.orm import Session
 
 from config.settings import settings
 from src.core.models import SmsDeadLetter, SmsOptIn, SmsOptOut
-
-try:
-    from twilio.rest import Client
-except ImportError:  # Twilio not installed in test/CI environments
-    Client = None  # type: ignore[assignment,misc]
+from src.services.telnyx_sms import TelnyxSMSError, send_message as telnyx_send_message
 
 logger = logging.getLogger(__name__)
 
@@ -181,9 +179,9 @@ def send_sms(
     Central outbound SMS dispatcher.
 
     1. Runs can_send() gate — writes to DLQ and returns False if suppressed.
-    2. Sends via Twilio if TWILIO_ENABLED=true, else logs only.
-    3. When TWILIO_SANDBOX=true, writes a sandbox_outbox row regardless of
-       TWILIO_ENABLED, so scenario tests can inspect the attempted send.
+    2. Sends via Telnyx if TELNYX_SMS_ENABLED=true, else logs only.
+    3. When TELNYX_SANDBOX=true, writes a sandbox_outbox row regardless of
+       TELNYX_SMS_ENABLED, so scenario tests can inspect the attempted send.
     4. Logs to api_usage_logs via claude_router pattern (cost tracked separately).
 
     Optional kwargs (campaign/variant_id/decision_id) enrich the sandbox_outbox
@@ -219,8 +217,8 @@ def send_sms(
         )
         return False
 
-    # 2. Dry-run path (TWILIO_ENABLED=false)
-    if not settings.twilio_enabled:
+    # 2. Dry-run path (TELNYX_SMS_ENABLED=false)
+    if not settings.telnyx_sms_enabled:
         logger.info("[DRY RUN] SMS to=%s body=%r", to, body[:160])
         _capture_sandbox_attempt(
             db=db, to=to, body=body, subscriber_id=subscriber_id,
@@ -230,10 +228,17 @@ def send_sms(
         )
         return True
 
-    # 3. Twilio misconfiguration (live mode on but creds missing)
-    if not all([settings.twilio_account_sid, settings.twilio_auth_token, settings.twilio_from_number]):
-        logger.error("Twilio not configured — cannot send SMS to %s", to)
-        add_to_dead_letter(to, "error", {"body": body[:160], "error": "twilio_not_configured"}, db)
+    # 3. Telnyx misconfiguration (live mode on but creds missing).
+    # The wrapper raises TelnyxSMSError with a clear "X is not configured"
+    # message for each missing field; we surface it here so the DLQ row
+    # records what was missing without leaking the key value itself.
+    if not all([
+        settings.telnyx_sms_api_key,
+        settings.telnyx_from_number,
+        settings.telnyx_messaging_profile_id,
+    ]):
+        logger.error("Telnyx not configured — cannot send SMS to %s", to)
+        add_to_dead_letter(to, "error", {"body": body[:160], "error": "telnyx_not_configured"}, db)
         _capture_sandbox_attempt(
             db=db, to=to, body=body, subscriber_id=subscriber_id,
             campaign=campaign_label, variant_id=variant_id, decision_id=decision_id,
@@ -242,19 +247,12 @@ def send_sms(
         )
         return False
 
-    # 4. Real Twilio dispatch
+    # 4. Real Telnyx dispatch
     try:
-        client = Client(
-            settings.twilio_account_sid,
-            settings.twilio_auth_token.get_secret_value(),
-        )
-        message = client.messages.create(
-            body=body,
-            from_=settings.twilio_from_number,
-            to=to,
-        )
-        logger.info("SMS sent: sid=%s to=%s", message.sid, to)
-        # In live mode we still record to sandbox_outbox when TWILIO_SANDBOX=true
+        result = telnyx_send_message(to=to, body=body)
+        logger.info("SMS sent: id=%s to=%s status=%s",
+                    result.get("message_id"), to, result.get("status"))
+        # In live mode we still record to sandbox_outbox when TELNYX_SANDBOX=true
         # (e.g. staging smoke tests that fire real SMS but want a local audit).
         _capture_sandbox_attempt(
             db=db, to=to, body=body, subscriber_id=subscriber_id,
@@ -263,8 +261,18 @@ def send_sms(
             would_have_delivered=True,
         )
         return True
+    except TelnyxSMSError as exc:
+        logger.error("Telnyx send failed: to=%s error=%s", to, exc)
+        add_to_dead_letter(to, "delivery_failed", {"body": body[:160], "error": str(exc)}, db)
+        _capture_sandbox_attempt(
+            db=db, to=to, body=body, subscriber_id=subscriber_id,
+            campaign=campaign_label, variant_id=variant_id, decision_id=decision_id,
+            compliance_allowed=True, compliance_reason="ok",
+            would_have_delivered=False,
+        )
+        return False
     except Exception as exc:
-        logger.error("Twilio send failed: to=%s error=%s", to, exc)
+        logger.exception("Unexpected SMS send failure: to=%s error=%s", to, exc)
         add_to_dead_letter(to, "delivery_failed", {"body": body[:160], "error": str(exc)}, db)
         _capture_sandbox_attempt(
             db=db, to=to, body=body, subscriber_id=subscriber_id,
@@ -288,8 +296,8 @@ def _capture_sandbox_attempt(
     compliance_reason: str,
     would_have_delivered: bool,
 ) -> None:
-    """Write one sandbox_outbox row when TWILIO_SANDBOX is enabled. No-op otherwise."""
-    if not settings.twilio_sandbox:
+    """Write one sandbox_outbox row when TELNYX_SANDBOX is enabled. No-op otherwise."""
+    if not settings.telnyx_sandbox:
         return
     try:
         from src.core.models import SandboxOutbox  # local import to avoid cycle
@@ -304,7 +312,7 @@ def _capture_sandbox_attempt(
             compliance_allowed=compliance_allowed,
             compliance_reason=compliance_reason,
             would_have_delivered=would_have_delivered,
-            sandbox_flag="twilio_sandbox",
+            sandbox_flag="telnyx_sandbox",
         )
         db.add(row)
         db.flush()

@@ -2477,48 +2477,93 @@ def _twiml_ok() -> str:
     return '<?xml version="1.0" encoding="UTF-8"?><Response></Response>'
 
 
-@app.post("/webhooks/twilio/inbound")
-async def twilio_inbound(request: Request, db: Session = Depends(get_db)):
+@app.post("/webhooks/telnyx/inbound")
+async def telnyx_inbound(request: Request, db: Session = Depends(get_db)):
     """
-    Twilio inbound SMS webhook.
-    Routes STOP keywords to sms_compliance, then product commands to sms_commands.
+    Telnyx inbound SMS webhook (replaces /webhooks/twilio/inbound).
+
+    Verifies the Ed25519 signature, extracts (from, body) from the nested
+    Telnyx event envelope, then routes through the existing compliance
+    handler — STOP keywords still flow to sms_compliance.handle_inbound()
+    and product commands still flow to sms_commands.dispatch().
+
+    The handlers downstream are vendor-neutral; only the payload shape and
+    signature scheme change here.
     """
     from src.services.sms_compliance import handle_inbound, send_sms
     from src.services import sms_commands
+    from src.services.telnyx_signature import (
+        SIGNATURE_HEADER, TIMESTAMP_HEADER, verify as verify_telnyx_signature,
+    )
+    from src.services.webhook_log import log_webhook_event
     from fastapi.responses import Response
 
-    form = await request.form()
-    from_number = form.get("From", "")
-    body = form.get("Body", "")
-
-    # Validate Twilio signature
+    raw_body = await request.body()
     settings_obj = get_settings()
-    if settings_obj.twilio_auth_token:
-        try:
-            from twilio.request_validator import RequestValidator  # type: ignore
-            validator = RequestValidator(settings_obj.twilio_auth_token.get_secret_value())
-            url = str(request.url)
-            signature = request.headers.get("X-Twilio-Signature", "")
-            form_dict = dict(form)
-            if not validator.validate(url, form_dict, signature):
-                logger.warning("Invalid Twilio signature from %s", from_number)
-                raise HTTPException(status_code=403, detail="Invalid signature")
-        except ImportError:
-            pass  # twilio not installed in some envs
 
-    # STOP / compliance handling
+    # 1. Signature verification (Ed25519). Reject before parsing the body.
+    if not verify_telnyx_signature(
+        body=raw_body,
+        signature_b64=request.headers.get(SIGNATURE_HEADER),
+        timestamp=request.headers.get(TIMESTAMP_HEADER),
+        public_key_b64=settings_obj.telnyx_public_key,
+    ):
+        log_webhook_event(
+            source="telnyx_inbound",
+            event_type="sms_received",
+            status="failed",
+            status_detail="signature_verification_failed",
+        )
+        raise HTTPException(status_code=403, detail="Invalid signature")
+
+    # 2. Parse Telnyx event envelope:
+    #    { "data": { "event_type": "message.received",
+    #                "payload": { "from": {"phone_number": ...}, "to": {...}, "text": ... } } }
+    try:
+        envelope = json.loads(raw_body.decode("utf-8") or "{}")
+    except json.JSONDecodeError as exc:
+        logger.warning("Telnyx inbound body not JSON-decodable: %s", exc)
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    data = envelope.get("data") or {}
+    event_type = data.get("event_type", "")
+    payload = data.get("payload") or {}
+    from_number = (payload.get("from") or {}).get("phone_number", "")
+    body = payload.get("text", "") or ""
+    msg_id = payload.get("id")
+
+    log_webhook_event(
+        source="telnyx_inbound",
+        event_type=event_type or "sms_received",
+        source_event_id=msg_id,
+        status="received",
+        payload=envelope,
+        payload_kind="telnyx",
+    )
+
+    # Only act on inbound message events. Delivery-status callbacks (e.g.
+    # "message.sent", "message.finalized") share the same webhook URL but
+    # don't need handler routing — we just audit-log them above.
+    if event_type != "message.received":
+        return Response(content="", media_type="application/json")
+
+    if not from_number:
+        logger.warning("Telnyx inbound with no from-number: %s", payload)
+        return Response(content="", media_type="application/json")
+
+    # 3. STOP / HELP compliance handling — unchanged from the Twilio path.
     twiml_reply = handle_inbound(from_number, body, db)
     if twiml_reply:
         return Response(content=twiml_reply, media_type="application/xml")
 
-    # Product command routing
+    # 4. Product command routing — unchanged from the Twilio path.
     command = sms_commands.parse(body)
     if command:
         reply = sms_commands.dispatch(from_number, command, db)
         if reply:
             send_sms(from_number, reply, db)
 
-    return Response(content=_twiml_ok(), media_type="application/xml")
+    return Response(content="", media_type="application/json")
 
 
 # ── Phase 2B: Deal-size capture ────────────────────────────────────────────────
@@ -3438,24 +3483,76 @@ def premium_purchase_endpoint(
 
 # ── Phase 2B: Missed-Call Voice Webhook ──────────────────────────────────────
 
-@app.post("/webhooks/twilio/voice", include_in_schema=False)
-async def twilio_voice_webhook(request: Request, db: Session = Depends(get_db)):
+@app.post("/webhooks/telnyx/voice", include_in_schema=False)
+async def telnyx_voice_webhook(request: Request, db: Session = Depends(get_db)):
     """
-    Twilio Programmable Voice webhook for missed/answered calls.
-    Auto-creates a free account and sends welcome SMS with dashboard link.
+    Telnyx Programmable Voice webhook (replaces /webhooks/twilio/voice).
+
+    Verifies the Ed25519 signature, extracts the caller phone from the
+    Telnyx call.initiated event envelope, then routes through the
+    existing signup_engine.handle_missed_call() — auto-creates a free
+    account and sends a welcome SMS.
+
+    Returns 200 with an empty JSON body. Telnyx Call Control commands
+    (hang up, redirect, etc.) flow through the separate REST API, not
+    the webhook reply, so no TeXML response is needed here.
     """
-    form = await request.form()
-    from_number = form.get("From", "")
+    from src.services.signup_engine import handle_missed_call
+    from src.services.telnyx_signature import (
+        SIGNATURE_HEADER, TIMESTAMP_HEADER, verify as verify_telnyx_signature,
+    )
+    from src.services.webhook_log import log_webhook_event
+
+    raw_body = await request.body()
+    settings_obj = get_settings()
+
+    if not verify_telnyx_signature(
+        body=raw_body,
+        signature_b64=request.headers.get(SIGNATURE_HEADER),
+        timestamp=request.headers.get(TIMESTAMP_HEADER),
+        public_key_b64=settings_obj.telnyx_public_key,
+    ):
+        log_webhook_event(
+            source="telnyx_voice",
+            event_type="call_initiated",
+            status="failed",
+            status_detail="signature_verification_failed",
+        )
+        raise HTTPException(status_code=403, detail="Invalid signature")
+
+    try:
+        envelope = json.loads(raw_body.decode("utf-8") or "{}")
+    except json.JSONDecodeError as exc:
+        logger.warning("Telnyx voice body not JSON-decodable: %s", exc)
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    data = envelope.get("data") or {}
+    event_type = data.get("event_type", "")
+    payload = data.get("payload") or {}
+    from_number = (payload.get("from") or {}).get("phone_number", "")
+    call_id = payload.get("call_control_id") or payload.get("call_leg_id")
+
+    log_webhook_event(
+        source="telnyx_voice",
+        event_type=event_type or "call_initiated",
+        source_event_id=call_id,
+        status="received",
+        payload=envelope,
+        payload_kind="telnyx",
+    )
+
+    if event_type != "call.initiated":
+        # We only act on the inbound-call-start event. Other voice events
+        # (answered, hangup, etc.) share this URL but don't need handler
+        # routing for the signup flow.
+        return Response(content="", media_type="application/json")
+
     if not from_number:
         logger.warning("[Voice] Inbound call with no From number")
-        return Response(
-            content='<?xml version="1.0"?><Response><Hangup/></Response>',
-            media_type="application/xml",
-        )
+        return Response(content="", media_type="application/json")
 
-    from src.services.signup_engine import handle_missed_call
-    twiml = handle_missed_call(from_number=from_number, db=db)
-    return Response(content=twiml, media_type="application/xml")
+    handle_missed_call(from_number=from_number, db=db)
+    return Response(content="", media_type="application/json")
 
 
 # ── Phase 2B Frontend: Pause / Resume / Partner / AP-Lite endpoints ─────────

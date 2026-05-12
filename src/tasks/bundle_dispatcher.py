@@ -212,7 +212,7 @@ def _log_outcome(subscriber_id: int, bundle_type: str, variant: str, db: Session
         message_type="sms",
         template_id=f"bundle_{bundle_type}_offer",
         variant_id=variant,
-        channel="twilio",
+        channel="telnyx",
         sent_at=datetime.now(timezone.utc),
     ))
     db.flush()

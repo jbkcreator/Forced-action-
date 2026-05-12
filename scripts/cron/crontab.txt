@@ -51,8 +51,9 @@ COUNTY_ID=hillsborough
 #    Replaces the previous 3 separate scraper jobs (liens/deeds/judgments)
 0 5 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.liens.lien_engine --mode combined --start-date $(date -d "1 day ago" +\%Y-\%m-\%d) --load-to-db --county-id $COUNTY_ID
 
-# 8. Building Permits        — 05:45 AM UTC / 01:45 AM EDT / 11:15 AM IST
-45 5 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.permit.permit_engine --load-to-db --county-id $COUNTY_ID
+# 8. Building Permits — 3x/day at 05:45, 13:45, 21:45 UTC (every 8h, weekdays).
+#    Bumped from 1x to 3x to keep permit-driven distress signals fresh through the day.
+45 5,13,21 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.permit.permit_engine --load-to-db --county-id $COUNTY_ID
 
 # 9. Tax Delinquencies — DISABLED. County portal is blocking the scraper.
 #    Data is now loaded exclusively via the admin upload layer:
@@ -72,8 +73,9 @@ COUNTY_ID=hillsborough
 # 13. Flood Damage (FEMA + NWS) — 06:21 AM UTC / 02:21 AM EDT / 11:51 AM IST
 21 6 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.flood.flood_engine --county-id $COUNTY_ID
 
-# 14. Insurance Claims (FEMA IA + adjuster permits) — 06:23 AM UTC / 02:23 AM EDT / 11:53 AM IST
-23 6 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.insurance.insurance_engine --county-id $COUNTY_ID
+# 14. Insurance Claims (FEMA IA + adjuster permits) — 3x/day at 06:23, 14:23, 22:23 UTC (every 8h, weekdays).
+#     Bumped from 1x to 3x to catch new FEMA IA filings and adjuster permits same-day.
+23 6,14,22 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.insurance.insurance_engine --county-id $COUNTY_ID
 
 # 15. Fire Incidents — 06:25 AM UTC / 02:25 AM EDT / 11:55 AM IST
 25 6 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.fire.fire_engine --county-id $COUNTY_ID
@@ -144,14 +146,23 @@ COUNTY_ID=hillsborough
 # went 24h+ without a reply (tags GHL contact for Synthflow workflow).
 */30 * * * * $PROJECT/scripts/cron/run.sh src.tasks.auto_mode_followup
 
-# Annual push — daily 14:00 UTC (≈ 9-10am ET). Covers all triggers:
+# Annual push — daily 08:00 UTC. Covers all triggers:
 # charter_day_7, day_10_14, two_deals, spend_250, deal_win_10k, auto_switch_day_60.
 # Big-deal-win path also fires inline from /api/deal-capture for instant conversion.
-0 14 * * * $PROJECT/scripts/cron/run.sh src.tasks.annual_push
+0 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.annual_push
 
-# Proactive Save (Data-Only) — daily 15:00 UTC, after annual push (14:00).
+# Proactive Save (Data-Only) — daily 10:00 UTC.
 # Catches at-risk subscribers (5-7d inactivity or grace day 5+) before churn.
-0 15 * * * $PROJECT/scripts/cron/run.sh src.tasks.proactive_save
+0 10 * * * $PROJECT/scripts/cron/run.sh src.tasks.proactive_save
+
+# Revenue Pulse — daily founder SMS at 07:30 UTC (lead count, wallet actives, top deal/alert, kill switch).
+30 7 * * * $PROJECT/scripts/cron/run.sh src.tasks.revenue_pulse --daily
+
+# Revenue Pulse — weekly founder SMS, Monday 09:00 UTC (revenue est, churn, top learning).
+0 9 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.revenue_pulse --weekly
+
+# Learning Card job — Sunday midnight UTC. Generates weekly performance cards for Cora's context.
+0 0 * * 0 $PROJECT/scripts/cron/run.sh src.tasks.learning_card_job
 
 # Retention summaries — daily 16:00 UTC. Emits retention_summary_due per tier cadence.
 0 16 * * * $PROJECT/scripts/cron/run.sh src.tasks.retention_event_producer

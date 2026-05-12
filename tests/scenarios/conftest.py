@@ -43,19 +43,19 @@ from src.core.models import (
 @pytest.fixture(autouse=True, scope="session")
 def _enable_sandbox_for_session():
 	"""Flip sandbox flags on for the entire scenarios test session."""
-	prev_twilio_sandbox = settings.twilio_sandbox
+	prev_telnyx_sandbox = settings.telnyx_sandbox
 	prev_redis_sandbox = settings.redis_sandbox
-	prev_twilio_enabled = settings.twilio_enabled
+	prev_telnyx_enabled = settings.telnyx_sms_enabled
 
-	settings.twilio_sandbox = True
+	settings.telnyx_sandbox = True
 	settings.redis_sandbox = True
-	settings.twilio_enabled = False     # dry-run path — no real Twilio calls
+	settings.telnyx_sms_enabled = False    # dry-run path — no real Telnyx calls
 
 	redis_client.reset_client_cache()
 	yield
-	settings.twilio_sandbox = prev_twilio_sandbox
+	settings.telnyx_sandbox = prev_telnyx_sandbox
 	settings.redis_sandbox = prev_redis_sandbox
-	settings.twilio_enabled = prev_twilio_enabled
+	settings.telnyx_sms_enabled = prev_telnyx_enabled
 	redis_client.reset_client_cache()
 
 

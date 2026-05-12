@@ -2,13 +2,13 @@
 Sandbox admin endpoints — inspect sandbox_outbox + simulate webhooks.
 
 Mounted at /api/admin/sandbox. Reuses the same JWT bearer auth as the
-regular admin endpoints. All endpoints return 503 if TWILIO_SANDBOX (or the
+regular admin endpoints. All endpoints return 503 if TELNYX_SANDBOX (or the
 relevant sandbox flag) is disabled, so production deployments with sandbox
 off effectively disable this router.
 
 Endpoints:
   GET  /api/admin/sandbox/outbox                — list captured messages
-  POST /api/admin/sandbox/simulate-inbound      — Twilio-shape inbound SMS
+  POST /api/admin/sandbox/simulate-inbound      — Telnyx-shape inbound SMS
   POST /api/admin/sandbox/simulate-nws-alert    — CAP payload → NWS handler
   POST /api/admin/sandbox/simulate-stripe-event — scripted webhook event
 """
@@ -34,10 +34,10 @@ router = APIRouter(prefix="/api/admin/sandbox", tags=["admin-sandbox"])
 
 
 def _require_sandbox_mode() -> None:
-	if not settings.twilio_sandbox and not settings.redis_sandbox:
+	if not settings.telnyx_sandbox and not settings.redis_sandbox:
 		raise HTTPException(
 			status_code=503,
-			detail="Sandbox endpoints are disabled. Set TWILIO_SANDBOX=true or REDIS_SANDBOX=true.",
+			detail="Sandbox endpoints are disabled. Set TELNYX_SANDBOX=true or REDIS_SANDBOX=true.",
 		)
 
 

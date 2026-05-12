@@ -185,16 +185,22 @@ class AppSettings(BaseSettings):
 	alert_email: Optional[str] = Field(default=None, env="ALERT_EMAIL")  # ops alert recipient
 	report_recipients: Optional[str] = Field(default=None, env="REPORT_RECIPIENTS")  # comma-separated emails for daily/weekly reports
 
-	# Twilio (SMS outbound — required for all Cora messaging)
-	twilio_account_sid: Optional[str] = Field(default=None, env="TWILIO_ACCOUNT_SID")
-	twilio_auth_token: Optional[SecretStr] = Field(default=None, env="TWILIO_AUTH_TOKEN")
-	twilio_from_number: Optional[str] = Field(default=None, env="TWILIO_FROM_NUMBER")  # E.164 format: +1XXXXXXXXXX
-	twilio_enabled: bool = Field(default=False, env="TWILIO_ENABLED")  # master kill-switch
+	# Telnyx SMS — outbound + inbound webhook (replaces Twilio as of the
+	# hard-cut migration; see docs/plan: mellow-strolling-fairy.md).
+	# `telnyx_api_key` (defined earlier in this file) is the carrier-lookup key
+	# for the phone-deliverability sampler. The SMS key is a SEPARATE Telnyx
+	# API key so blast radius on a key rotation is contained per-product.
+	telnyx_sms_api_key:           Optional[SecretStr] = Field(default=None, env="TELNYX_SMS_API_KEY")
+	telnyx_public_key:            Optional[str]       = Field(default=None, env="TELNYX_PUBLIC_KEY")          # Ed25519 webhook verify key (base64)
+	telnyx_messaging_profile_id:  Optional[str]       = Field(default=None, env="TELNYX_MESSAGING_PROFILE_ID")
+	telnyx_from_number:           Optional[str]       = Field(default=None, env="TELNYX_FROM_NUMBER")          # E.164 sender
+	telnyx_voice_app_id:          Optional[str]       = Field(default=None, env="TELNYX_VOICE_APP_ID")          # Voice API Application UUID
+	telnyx_sms_enabled:           bool                = Field(default=False, env="TELNYX_SMS_ENABLED")           # master kill-switch (dry-run when False)
 
 	# Sandbox flags — when set, outbound/integration side effects are captured to
 	# local tables instead of calling real services. Used for scenario tests.
-	twilio_sandbox: bool = Field(default=False, env="TWILIO_SANDBOX")
-	redis_sandbox: bool = Field(default=False, env="REDIS_SANDBOX")
+	telnyx_sandbox: bool = Field(default=False, env="TELNYX_SANDBOX")
+	redis_sandbox:  bool = Field(default=False, env="REDIS_SANDBOX")
 
 	# Claude model routing (update model IDs here without touching code)
 	claude_haiku_model: str = Field(default="claude-haiku-4-5-20251001", env="CLAUDE_HAIKU_MODEL")

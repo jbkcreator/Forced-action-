@@ -191,14 +191,34 @@ def _nws(payload: Dict[str, Any]) -> dict:
     }
 
 
-def _twilio(payload: Dict[str, Any]) -> dict:
-    """Inbound Twilio — keep SID + From hash + status only. Never log Body."""
+def _telnyx(payload: Dict[str, Any]) -> dict:
+    """
+    Telnyx SMS + voice webhook — keep event/message ids + carrier/status.
+    Never log full message body. Phone numbers are kept only as last-4
+    digits so the audit row is still useful for correlation but not PII.
+    """
+    data = (payload.get("data") or {})
+    inner = (data.get("payload") or {})
+    from_phone = (inner.get("from") or {}).get("phone_number") or ""
+    to_phone   = (inner.get("to")   or {}).get("phone_number") or ""
+
+    def _last4(p: str) -> str:
+        digits = "".join(c for c in p if c.isdigit())
+        return f"***{digits[-4:]}" if len(digits) >= 4 else "***"
+
     return {
-        "MessageSid":   payload.get("MessageSid") or payload.get("CallSid"),
-        "AccountSid":   payload.get("AccountSid"),
-        "MessageStatus": payload.get("MessageStatus") or payload.get("CallStatus"),
-        "NumMedia":     payload.get("NumMedia"),
-        # Note: From / To / Body intentionally omitted (PII / message body)
+        "event_id":   data.get("id") or payload.get("id"),
+        "event_type": data.get("event_type"),
+        "record_type": inner.get("record_type"),
+        "message_id": inner.get("id"),  # for SMS events
+        "call_control_id": inner.get("call_control_id"),  # for voice events
+        "direction": inner.get("direction"),
+        "status":    inner.get("status"),
+        "from_last4": _last4(from_phone) if from_phone else None,
+        "to_last4":   _last4(to_phone)   if to_phone   else None,
+        "encoding":  inner.get("encoding"),
+        "parts":     inner.get("parts"),
+        # Note: text / media / full phone intentionally omitted (PII / message body)
     }
 
 
@@ -211,6 +231,7 @@ _SANITIZERS = {
     "batch_data":      _batch_data,
     "batchdata":       _batch_data,
     "nws":             _nws,
-    "twilio":          _twilio,
-    "twilio_inbound":  _twilio,
+    "telnyx":          _telnyx,
+    "telnyx_inbound":  _telnyx,
+    "telnyx_voice":    _telnyx,
 }

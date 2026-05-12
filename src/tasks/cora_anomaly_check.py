@@ -93,28 +93,30 @@ def _send_alert(settings, anomalies: list[str], total: int, no_answer: int) -> N
     if not phone:
         logger.warning("[CoraMonitor] no alert phone configured (ALERT_SMS_NUMBER / FOUNDER_PHONE) — SMS skipped")
         return
-    if not (settings.twilio_account_sid and settings.twilio_auth_token and settings.twilio_from_number):
-        logger.warning("[CoraMonitor] Twilio not configured — SMS skipped")
-        return
-
     lines = ["[FA] Cora anomaly alert"]
     for a in anomalies:
         lines.append(f"• {a}")
     lines.append(f"Calls(60m): {total}  No-answer: {no_answer}")
     message = "\n".join(lines)
 
+    # Route through the compliance gate so ops alerts honour opt-out + TCPA
+    # quiet hours just like every other outbound SMS. Previously bypassed
+    # by instantiating a Twilio client inline.
+    from src.core.database import get_db_context
+    from src.services.sms_compliance import send_sms
     try:
-        from twilio.rest import Client
-        client = Client(
-            settings.twilio_account_sid,
-            settings.twilio_auth_token.get_secret_value(),
-        )
-        client.messages.create(
-            body=message[:320],
-            from_=settings.twilio_from_number,
-            to=phone,
-        )
-        logger.info("[CoraMonitor] alert SMS sent to %s", phone)
+        with get_db_context() as db:
+            sent = send_sms(
+                to=phone,
+                body=message[:320],
+                db=db,
+                task_type="cora_anomaly",
+                campaign="cora_anomaly_alert",
+            )
+        if sent:
+            logger.info("[CoraMonitor] alert SMS sent to %s", phone)
+        else:
+            logger.info("[CoraMonitor] alert SMS suppressed by compliance gate")
     except Exception as exc:
         logger.error("[CoraMonitor] alert SMS failed: %s", exc)
 

@@ -118,7 +118,10 @@ KILL_SWITCH = {
     "sms_reply_rate":      {"green": 8,  "yellow": (5, 8),   "red": 5,  "action": "swap copy, change timing"},
     "cac_paid_channels":   {"green": 25, "yellow": (25, 40), "red": 40, "action": "pause channel, fix targeting"},
     "free_tier_cost_ratio": {"green": 40, "yellow": (40, 50), "red": 50, "action": "tighten free cap, earlier wall"},
-    "twilio_cost_per_signup": {"green": 2, "yellow": (2, 4),  "red": 4,  "action": "pause offending sequence"},
+    # SMS unit-cost guardrail. Calibrated to Telnyx pricing ($0.004/segment, May 2026),
+    # which is ~52% cheaper than the Twilio rate this guardrail was originally tuned for.
+    # GREEN ≤$1/signup, YELLOW $1–2, RED >$2.
+    "sms_cost_per_signup": {"green": 1, "yellow": (1, 2),  "red": 2,  "action": "pause offending sequence"},
 }
 
 

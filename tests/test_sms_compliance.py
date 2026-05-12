@@ -223,56 +223,59 @@ class TestSendSmsUnit:
         _, reason, _ = mock_dlq.call_args[0][:3]
         assert reason == "opt_out"
 
-    def test_dry_run_returns_true_without_twilio(self):
+    def test_dry_run_returns_true_without_telnyx(self):
         db = MagicMock()
         with patch("src.services.sms_compliance.can_send", return_value=True), \
              patch("src.services.sms_compliance.is_quiet_hours", return_value=False):
             with patch("src.services.sms_compliance.settings") as mock_settings:
-                mock_settings.twilio_enabled = False
+                mock_settings.telnyx_sms_enabled = False
                 result = send_sms("+18135550100", "Hello", db)
         assert result is True
 
-    def test_twilio_not_configured_returns_false_and_dlqs(self):
+    def test_telnyx_not_configured_returns_false_and_dlqs(self):
         db = MagicMock()
         with patch("src.services.sms_compliance.can_send", return_value=True), \
              patch("src.services.sms_compliance.is_quiet_hours", return_value=False):
             with patch("src.services.sms_compliance.settings") as mock_settings:
-                mock_settings.twilio_enabled = True
-                mock_settings.twilio_account_sid = None
-                mock_settings.twilio_auth_token = None
-                mock_settings.twilio_from_number = None
+                mock_settings.telnyx_sms_enabled = True
+                mock_settings.telnyx_sms_api_key = None
+                mock_settings.telnyx_messaging_profile_id = None
+                mock_settings.telnyx_from_number = None
                 with patch("src.services.sms_compliance.add_to_dead_letter") as mock_dlq:
                     result = send_sms("+18135550100", "Hello", db)
         assert result is False
         mock_dlq.assert_called_once()
 
-    def test_twilio_success_returns_true(self):
+    def test_telnyx_success_returns_true(self):
         db = MagicMock()
-        mock_message = MagicMock()
-        mock_message.sid = "SM123"
         with patch("src.services.sms_compliance.can_send", return_value=True), \
              patch("src.services.sms_compliance.is_quiet_hours", return_value=False):
             with patch("src.services.sms_compliance.settings") as mock_settings:
-                mock_settings.twilio_enabled = True
-                mock_settings.twilio_account_sid = "ACtest"
-                mock_settings.twilio_auth_token.get_secret_value.return_value = "token"
-                mock_settings.twilio_from_number = "+18005550000"
-                with patch("src.services.sms_compliance.Client") as mock_client_cls:
-                    mock_client_cls.return_value.messages.create.return_value = mock_message
+                mock_settings.telnyx_sms_enabled = True
+                mock_settings.telnyx_sms_api_key = "tlnx_key"
+                mock_settings.telnyx_messaging_profile_id = "mp_xxx"
+                mock_settings.telnyx_from_number = "+18005550000"
+                with patch("src.services.sms_compliance.telnyx_send_message") as mock_send:
+                    mock_send.return_value = {
+                        "message_id": "msg_xxx", "status": "queued",
+                        "vendor": "telnyx", "cost_cents": 0,
+                        "sent_at": "2026-05-11T00:00:00",
+                    }
                     result = send_sms("+18135550100", "Hello", db)
         assert result is True
 
-    def test_twilio_exception_dlqs_and_returns_false(self):
+    def test_telnyx_exception_dlqs_and_returns_false(self):
+        from src.services.telnyx_sms import TelnyxSMSError
         db = MagicMock()
         with patch("src.services.sms_compliance.can_send", return_value=True), \
              patch("src.services.sms_compliance.is_quiet_hours", return_value=False):
             with patch("src.services.sms_compliance.settings") as mock_settings:
-                mock_settings.twilio_enabled = True
-                mock_settings.twilio_account_sid = "ACtest"
-                mock_settings.twilio_auth_token.get_secret_value.return_value = "token"
-                mock_settings.twilio_from_number = "+18005550000"
-                with patch("src.services.sms_compliance.Client") as mock_client_cls:
-                    mock_client_cls.return_value.messages.create.side_effect = Exception("Network error")
+                mock_settings.telnyx_sms_enabled = True
+                mock_settings.telnyx_sms_api_key = "tlnx_key"
+                mock_settings.telnyx_messaging_profile_id = "mp_xxx"
+                mock_settings.telnyx_from_number = "+18005550000"
+                with patch("src.services.sms_compliance.telnyx_send_message") as mock_send:
+                    mock_send.side_effect = TelnyxSMSError("Network error")
                     with patch("src.services.sms_compliance.add_to_dead_letter") as mock_dlq:
                         result = send_sms("+18135550100", "Hello", db)
         assert result is False

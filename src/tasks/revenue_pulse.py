@@ -174,19 +174,33 @@ def _kill_switch_status(db: Session) -> dict:
 
 
 def _send_sms(message: str) -> None:
-    """Send pulse SMS directly via Twilio (bypasses compliance gate — ops-only)."""
+    """
+    Send pulse SMS to the founder's phone.
+
+    Previously bypassed the compliance gate by calling Twilio directly.
+    Now routes through src.services.sms_compliance.send_sms so the founder
+    SMS respects opt-out + TCPA quiet hours like every other outbound
+    message. If the founder ever does opt out, that intent is honoured.
+    """
     phone = settings.founder_phone
     if not phone:
         logger.warning("[RevenuePulse] FOUNDER_PHONE not set — SMS skipped")
         return
-    if not (settings.twilio_account_sid and settings.twilio_auth_token and settings.twilio_from_number):
-        logger.warning("[RevenuePulse] Twilio not configured — SMS skipped")
-        return
+    from src.core.database import get_db_context
+    from src.services.sms_compliance import send_sms
     try:
-        from twilio.rest import Client
-        client = Client(settings.twilio_account_sid, settings.twilio_auth_token.get_secret_value())
-        client.messages.create(body=message[:320], from_=settings.twilio_from_number, to=phone)
-        logger.info("[RevenuePulse] SMS sent to founder")
+        with get_db_context() as db:
+            sent = send_sms(
+                to=phone,
+                body=message[:320],
+                db=db,
+                task_type="revenue_pulse",
+                campaign="revenue_pulse",
+            )
+        if sent:
+            logger.info("[RevenuePulse] SMS sent to founder")
+        else:
+            logger.info("[RevenuePulse] SMS suppressed by compliance gate (opt-out / quiet hours / not configured)")
     except Exception as exc:
         logger.error("[RevenuePulse] SMS failed: %s", exc)
 

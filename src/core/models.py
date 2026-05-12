@@ -1690,7 +1690,7 @@ class ApiUsageLog(Base):
     __tablename__ = "api_usage_logs"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    service: Mapped[str] = mapped_column(String(20), nullable=False)      # claude/twilio/stripe
+    service: Mapped[str] = mapped_column(String(20), nullable=False)      # claude/telnyx/stripe
     model: Mapped[Optional[str]] = mapped_column(String(60))              # haiku/sonnet/opus (Claude only)
     input_tokens: Mapped[Optional[int]] = mapped_column(Integer)
     output_tokens: Mapped[Optional[int]] = mapped_column(Integer)
@@ -1700,7 +1700,7 @@ class ApiUsageLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     __table_args__ = (
-        CheckConstraint("service IN ('claude', 'twilio', 'stripe')", name="check_api_service"),
+        CheckConstraint("service IN ('claude', 'telnyx', 'stripe', 'twilio')", name="check_api_service"),
         Index("idx_api_usage_service_created", "service", "created_at"),
         Index("idx_api_usage_task_created", "task_type", "created_at"),
     )
@@ -1933,13 +1933,13 @@ class SandboxOutbox(Base):
     """
     Capture table for would-be outbound messages during scenario tests.
 
-    When TWILIO_SANDBOX or SYNTHFLOW_SANDBOX is true, the outbound services
+    When TELNYX_SANDBOX or SYNTHFLOW_SANDBOX is true, the outbound services
     write one row here instead of (or alongside) the dry-run log. Developers
     inspect these rows via /admin/sandbox/outbox to verify message bodies,
     compliance outcomes, and graph-produced copy.
 
-    Production with TWILIO_ENABLED=true and TWILIO_SANDBOX=false leaves this
-    table empty.
+    Production with TELNYX_SMS_ENABLED=true and TELNYX_SANDBOX=false leaves
+    this table empty.
     """
     __tablename__ = "sandbox_outbox"
 
@@ -1956,7 +1956,7 @@ class SandboxOutbox(Base):
     compliance_allowed: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     compliance_reason: Mapped[Optional[str]] = mapped_column(String(60))
     would_have_delivered: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    sandbox_flag: Mapped[str] = mapped_column(String(40), nullable=False, default="twilio_sandbox")
+    sandbox_flag: Mapped[str] = mapped_column(String(40), nullable=False, default="telnyx_sandbox")
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc), nullable=False, index=True
     )

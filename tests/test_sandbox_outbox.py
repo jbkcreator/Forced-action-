@@ -1,8 +1,8 @@
 """
 Tests for sandbox_outbox capture in sms_compliance.send_sms.
 
-Verifies that when TWILIO_SANDBOX is on, a sandbox_outbox row is written
-at every outcome path: opt-out suppression, dry-run, Twilio misconfig,
+Verifies that when TELNYX_SANDBOX is on, a sandbox_outbox row is written
+at every outcome path: opt-out suppression, dry-run, Telnyx misconfig,
 and live-send error.
 
 Also tests the negative case — sandbox off → no capture.
@@ -18,16 +18,16 @@ from src.core.models import SandboxOutbox
 @pytest.fixture
 def sandbox_on(monkeypatch):
 	from config.settings import settings
-	monkeypatch.setattr(settings, "twilio_sandbox", True)
-	monkeypatch.setattr(settings, "twilio_enabled", False)
+	monkeypatch.setattr(settings, "telnyx_sandbox", True)
+	monkeypatch.setattr(settings, "telnyx_sms_enabled", False)
 	return settings
 
 
 @pytest.fixture
 def sandbox_off(monkeypatch):
 	from config.settings import settings
-	monkeypatch.setattr(settings, "twilio_sandbox", False)
-	monkeypatch.setattr(settings, "twilio_enabled", False)
+	monkeypatch.setattr(settings, "telnyx_sandbox", False)
+	monkeypatch.setattr(settings, "telnyx_sms_enabled", False)
 	return settings
 
 
@@ -158,8 +158,8 @@ def test_sandbox_off_optout_still_adds_dlq_only(sandbox_off):
 
 def test_live_mode_misconfig_captures_as_not_delivered(sandbox_on, monkeypatch):
 	from config.settings import settings
-	monkeypatch.setattr(settings, "twilio_enabled", True)
-	monkeypatch.setattr(settings, "twilio_account_sid", None)  # not configured
+	monkeypatch.setattr(settings, "telnyx_sms_enabled", True)
+	monkeypatch.setattr(settings, "telnyx_sms_api_key", None)  # not configured
 
 	from src.services import sms_compliance
 	sess = _fake_session(can_send=True)
@@ -180,23 +180,24 @@ def test_live_mode_misconfig_captures_as_not_delivered(sandbox_on, monkeypatch):
 	assert len(outbox_calls) == 1
 	row = outbox_calls[0].args[0]
 	assert row.compliance_allowed is True          # compliance passed
-	assert row.would_have_delivered is False       # Twilio misconfigured
+	assert row.would_have_delivered is False       # Telnyx misconfigured
 
 
-def test_live_mode_twilio_error_captures_as_not_delivered(sandbox_on, monkeypatch):
+def test_live_mode_telnyx_error_captures_as_not_delivered(sandbox_on, monkeypatch):
 	from config.settings import settings
 	from unittest.mock import MagicMock as MM
 
 	secret = MM()
 	secret.get_secret_value.return_value = "xxx"
-	monkeypatch.setattr(settings, "twilio_enabled", True)
-	monkeypatch.setattr(settings, "twilio_account_sid", "AC_x")
-	monkeypatch.setattr(settings, "twilio_auth_token", secret)
-	monkeypatch.setattr(settings, "twilio_from_number", "+15550000")
+	monkeypatch.setattr(settings, "telnyx_sms_enabled", True)
+	monkeypatch.setattr(settings, "telnyx_sms_api_key", secret)
+	monkeypatch.setattr(settings, "telnyx_messaging_profile_id", "mp_xxx")
+	monkeypatch.setattr(settings, "telnyx_from_number", "+15550000")
 
-	# Twilio Client raises on send
-	with patch("src.services.sms_compliance.Client") as mock_client_cls:
-		mock_client_cls.return_value.messages.create.side_effect = RuntimeError("boom")
+	# Telnyx wrapper raises on send
+	from src.services.telnyx_sms import TelnyxSMSError
+	with patch("src.services.sms_compliance.telnyx_send_message") as mock_send:
+		mock_send.side_effect = TelnyxSMSError("boom")
 
 		from src.services import sms_compliance
 		sess = _fake_session(can_send=True)

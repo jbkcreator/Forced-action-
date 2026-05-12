@@ -67,13 +67,13 @@ def send_sms(
 	  1. Load subscriber's phone from the latest SmsOptIn row
 	  2. Resolve idempotency: if a recent MessageOutcome row matches, return it
 	  3. Call src.services.sms_compliance.send_sms — runs the opt-out gate
-		 internally, writes to DLQ on failure, dry-runs if TWILIO_ENABLED=false
+		 internally, writes to DLQ on failure, dry-runs if TELNYX_SMS_ENABLED=false
 	  4. Record a MessageOutcome row keyed by campaign + variant_id
 
 	Returns:
 	  {
 		'sent': bool,              # True on success (including dry-run)
-		'reason': str,             # 'ok' | 'no_phone' | 'opted_out' | 'twilio_error' | 'duplicate'
+		'reason': str,             # 'ok' | 'no_phone' | 'opted_out' | 'sms_error' | 'duplicate'
 		'subscriber_id': int,
 		'campaign': str,
 		'variant_id': str | None,
@@ -140,7 +140,7 @@ def send_sms(
 		if not ok:
 			return {
 				"sent": False,
-				"reason": "opted_out_or_twilio_error",
+				"reason": "opted_out_or_sms_error",
 				"subscriber_id": subscriber_id,
 				"campaign": campaign,
 				"variant_id": variant_id,
@@ -153,7 +153,7 @@ def send_sms(
 			message_type="sms",
 			template_id=campaign,
 			variant_id=variant_id,
-			channel="twilio",
+			channel="telnyx",
 			sent_at=datetime.now(timezone.utc),
 		)
 		s.add(outcome)

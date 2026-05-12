@@ -14,7 +14,7 @@ Metrics computed:
   sms_reply_rate      — skipped (no reply tracking table yet — returns None)
   cac_paid_channels   — skipped (no ad spend tracking yet — returns None)
   free_tier_cost_ratio — % of compute cost attributable to free-tier subscribers (proxy)
-  twilio_cost_per_signup — avg Twilio cost per new subscriber (proxy from agent_decisions)
+  sms_cost_per_signup — avg SMS vendor cost per new subscriber (proxy from agent_decisions; Telnyx)
 
 Cron: 0 6 * * * (6:00 UTC daily, before retention cron at 16:00)
 

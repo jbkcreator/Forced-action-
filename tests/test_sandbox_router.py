@@ -46,13 +46,13 @@ def auth_headers(admin_token):
 @pytest.fixture
 def sandbox_on(monkeypatch):
 	from config.settings import settings
-	monkeypatch.setattr(settings, "twilio_sandbox", True)
+	monkeypatch.setattr(settings, "telnyx_sandbox", True)
 
 
 @pytest.fixture
 def sandbox_off(monkeypatch):
 	from config.settings import settings
-	monkeypatch.setattr(settings, "twilio_sandbox", False)
+	monkeypatch.setattr(settings, "telnyx_sandbox", False)
 	monkeypatch.setattr(settings, "redis_sandbox", False)
 
 

@@ -211,7 +211,15 @@ def run_skip_trace(
     today_only: bool = False,
 ) -> dict:
     """
-    Enrich owner contacts for high-priority leads with no contact info.
+    Enrich owner contacts for high-priority leads that are missing a phone.
+
+    Candidate selection: Gold+ owners whose `phone_1` is NULL or empty AND
+    haven't been successfully skip-traced before. Email presence is NOT
+    considered — leads that have an email but no phone are still enriched,
+    because the platform's primary outreach channel is SMS / voice and the
+    phone gap is the real bottleneck (92.8% of Gold+ leads on the latest
+    coverage report). Skip-traces of email-only owners that incidentally
+    fill in the phone are the entire point of this widening.
 
     Args:
         limit:      Max number of owners to process in this run.
@@ -280,6 +288,38 @@ def run_skip_trace(
 
         ds_current = ds_q.subquery()
 
+        # Phone-missing criterion: NULL or empty/whitespace phone_1.
+        # Email is intentionally NOT in the filter — leads with email but no
+        # phone are still enriched because the phone gap drives outbound
+        # deliverability and email is a secondary channel.
+        from sqlalchemy import or_ as sa_or, func as _sa_func
+        no_phone = sa_or(
+            Owner.phone_1.is_(None),
+            _sa_func.length(_sa_func.trim(Owner.phone_1)) == 0,
+        )
+
+        # Exclude properties already attempted via BatchData — whether or
+        # not the prior call returned a match. The duplicate-charge guard
+        # in the inner loop catches these too, but excluding at SELECT
+        # means the per-run `limit` budget goes to fresh candidates
+        # instead of being consumed by already-tried-and-failed owners.
+        # Failed batches go through IDI fallback (Stage 2) on their own.
+        already_batch_traced = (
+            session.query(EnrichedContact.property_id)
+            .filter(EnrichedContact.source == "batch_skip_tracing")
+            .subquery()
+        )
+
+        # Also require an address — properties with no street or no ZIP
+        # cannot be sent to BatchData (the no_address counter previously
+        # logged these mid-loop after they had already consumed a slot).
+        addr_present = (
+            Property.address.is_not(None)
+            & (_sa_func.length(_sa_func.trim(Property.address)) > 0)
+            & Property.zip.is_not(None)
+            & (_sa_func.length(_sa_func.trim(Property.zip)) > 0)
+        )
+
         rows = (
             session.query(Owner, Property)
             .join(Property, Owner.property_id == Property.id)
@@ -288,17 +328,18 @@ def run_skip_trace(
                 ds_latest,
                 ds_latest.c.property_id == Property.id,
             )
-            .filter(Owner.phone_1.is_(None))
-            .filter(Owner.email_1.is_(None))
+            .filter(no_phone)
             .filter(Owner.skip_trace_success.is_not(True))
             .filter(Owner.county_id == county_id)
+            .filter(Property.id.notin_(session.query(already_batch_traced)))
+            .filter(addr_present)
             .order_by(ds_latest.c.max_date.desc())   # freshest leads first
             .limit(limit)
             .all()
         )
 
     if not rows:
-        logger.info("No candidates found — all high-priority owners already have contact info.")
+        logger.info("No candidates found — every high-priority owner already has a usable phone.")
         return stats
 
     logger.info(f"Found {len(rows)} owners to skip-trace (limit={limit}, tiers={tier_values}, vertical={vertical or 'all'})")

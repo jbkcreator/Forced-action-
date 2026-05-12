@@ -188,14 +188,22 @@ def run_idi_fallback(
     api_key = settings.idi_api_key.get_secret_value()
     stats = {"total": 0, "success": 0, "failed": 0, "no_address": 0, "already_done": 0}
 
-    # Pull candidates: BatchData misses not yet tried via IDI
+    # Pull candidates: BatchData misses not yet tried via IDI, whose owner
+    # is STILL missing a phone. The extra phone-missing filter prevents IDI
+    # credits from being burned on properties that picked up a phone via
+    # another path (manual edit, secondary BatchData pass, etc.) between
+    # the original BatchData miss and now.
     with get_db_context() as session:
-        # Properties with a failed BatchData trace and no IDI trace yet
-        from sqlalchemy import exists, and_
+        from sqlalchemy import exists, and_, or_ as sa_or, func as sa_func
 
         idi_exists = session.query(EnrichedContact.property_id).filter(
             EnrichedContact.source == "idi"
         ).subquery()
+
+        no_phone = sa_or(
+            Owner.phone_1.is_(None),
+            sa_func.length(sa_func.trim(Owner.phone_1)) == 0,
+        )
 
         candidates = (
             session.query(EnrichedContact, Owner, Property)
@@ -208,13 +216,14 @@ def run_idi_fallback(
                     session.query(idi_exists)
                 ),
                 Owner.county_id == county_id,
+                no_phone,
             )
             .limit(limit)
             .all()
         )
 
     if not candidates:
-        logger.info("[IDI] No BatchData misses to retry — all already tried or no misses found.")
+        logger.info("[IDI] No BatchData misses to retry — every miss either has a phone now or was already retried.")
         return stats
 
     logger.info("[IDI] Found %d BatchData misses to retry via IDI", len(candidates))
