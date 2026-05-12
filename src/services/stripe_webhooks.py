@@ -1788,6 +1788,10 @@ def _on_charge_refunded(charge: dict, db: Session) -> None:
             purchase.id, purchase.sku,
         )
 
+    # Revoke any active referral teams the refunded subscriber belongs to
+    from src.services.referral_engine import revoke_team_for_subscriber
+    revoke_team_for_subscriber(purchase.subscriber_id, "refund", db)
+
     _send_founder_alert(
         f"REFUND: {purchase.sku} ${(refund_amount or 0) / 100:.0f} sub={purchase.subscriber_id} "
         f"purchase={purchase.id} reason={reason}"
@@ -1849,6 +1853,10 @@ def _on_dispute_created(dispute: dict, db: Session) -> None:
                 sub.id, recent,
             )
     db.flush()
+
+    # Revoke any active referral teams the disputed subscriber belongs to
+    from src.services.referral_engine import revoke_team_for_subscriber
+    revoke_team_for_subscriber(purchase.subscriber_id, "dispute", db)
 
     _send_founder_alert(
         f"DISPUTE: {purchase.sku} sub={purchase.subscriber_id} "

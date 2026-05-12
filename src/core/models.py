@@ -1765,6 +1765,8 @@ class ReferralTeam(Base):
     shared_zips: Mapped[Optional[list]] = mapped_column(ARRAY(String(10)))
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")  # active | broken
     unlocked_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    broken_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    broken_reason: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)  # dispute|refund|churn
 
     __table_args__ = (
         CheckConstraint("status IN ('active', 'broken')", name="check_referral_team_status"),
