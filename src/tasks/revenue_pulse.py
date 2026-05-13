@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 from config.revenue_pulse import (
     DAILY_PULSE_TEMPLATE,
     KILL_SWITCH_LEVELS,
+    MAX_DAILY_SMS_CHARS,
     WEEKLY_PULSE_TEMPLATE,
 )
 from config.settings import settings
@@ -43,9 +44,9 @@ def run_daily_pulse(dry_run: bool = False) -> dict:
 
     logger.info("[RevenuePulse] Daily message: %r", msg)
 
-    if not dry_run and settings.founder_phone:
-        _send_sms(msg)
-        return {"sent": True, "message": msg}
+    if not dry_run:
+        sent = _send_sms(msg)
+        return {"sent": sent, "message": msg}
     return {"sent": False, "dry_run": dry_run, "message": msg}
 
 
@@ -56,9 +57,9 @@ def run_weekly_pulse(dry_run: bool = False) -> dict:
 
     logger.info("[RevenuePulse] Weekly message: %r", msg)
 
-    if not dry_run and settings.founder_phone:
-        _send_sms(msg)
-        return {"sent": True, "message": msg}
+    if not dry_run:
+        sent = _send_sms(msg)
+        return {"sent": sent, "message": msg}
     return {"sent": False, "dry_run": dry_run, "message": msg}
 
 
@@ -173,7 +174,7 @@ def _kill_switch_status(db: Session) -> dict:
     return {"status": "RED", "label": "investigate"}
 
 
-def _send_sms(message: str) -> None:
+def _send_sms(message: str) -> bool:
     """
     Send pulse SMS to the founder's phone.
 
@@ -181,18 +182,21 @@ def _send_sms(message: str) -> None:
     Now routes through src.services.sms_compliance.send_sms so the founder
     SMS respects opt-out + TCPA quiet hours like every other outbound
     message. If the founder ever does opt out, that intent is honoured.
+
+    Returns True if Twilio accepted the message, False otherwise
+    (no phone configured, compliance suppression, or send error).
     """
     phone = settings.founder_phone
     if not phone:
         logger.warning("[RevenuePulse] FOUNDER_PHONE not set — SMS skipped")
-        return
+        return False
     from src.core.database import get_db_context
     from src.services.sms_compliance import send_sms
     try:
         with get_db_context() as db:
             sent = send_sms(
                 to=phone,
-                body=message[:320],
+                body=message[:MAX_DAILY_SMS_CHARS],
                 db=db,
                 task_type="revenue_pulse",
                 campaign="revenue_pulse",
@@ -201,8 +205,10 @@ def _send_sms(message: str) -> None:
             logger.info("[RevenuePulse] SMS sent to founder")
         else:
             logger.info("[RevenuePulse] SMS suppressed by compliance gate (opt-out / quiet hours / not configured)")
+        return bool(sent)
     except Exception as exc:
         logger.error("[RevenuePulse] SMS failed: %s", exc)
+        return False
 
 
 if __name__ == "__main__":

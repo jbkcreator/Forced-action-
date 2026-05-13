@@ -20,6 +20,9 @@ from src.tasks.revenue_pulse import (
     _compose_daily,
     _compose_weekly,
     _kill_switch_status,
+    _send_sms,
+    run_daily_pulse,
+    run_weekly_pulse,
 )
 
 
@@ -255,7 +258,6 @@ class TestRunPulseDryRunUnit:
 
             db.execute.side_effect = side_effect
 
-            from src.tasks.revenue_pulse import run_daily_pulse
             result = run_daily_pulse(dry_run=True)
 
         assert result["sent"] is False
@@ -282,9 +284,191 @@ class TestRunPulseDryRunUnit:
 
             db.execute.side_effect = side_effect
 
-            from src.tasks.revenue_pulse import run_weekly_pulse
             result = run_weekly_pulse(dry_run=True)
 
         assert result["sent"] is False
         assert "message" in result
         mock_sms.assert_not_called()
+
+
+# ============================================================================
+# _compose_weekly() unit tests
+# ============================================================================
+
+
+class TestComposeWeeklyUnit:
+    def _make_weekly_db(self, new_subs=2, churned=0, active=10, avg_score=70.0, total=10, churned_kill=1, card=None):
+        db = MagicMock()
+        # _compose_weekly queries: new_subs, churned, active_count, kill(avg_score, total, churned), card
+        results = [new_subs, churned, active, avg_score, total, churned_kill, card]
+        call_count = [0]
+
+        def side_effect(stmt):
+            idx = call_count[0]
+            call_count[0] += 1
+            result = MagicMock()
+            result.scalar_one_or_none.return_value = results[idx] if idx < len(results) else None
+            return result
+
+        db.execute.side_effect = side_effect
+        return db
+
+    def test_returns_string(self):
+        db = self._make_weekly_db()
+        msg = _compose_weekly(db)
+        assert isinstance(msg, str)
+        assert len(msg) > 0
+
+    def test_contains_revenue_estimate(self):
+        db = self._make_weekly_db(active=10)
+        msg = _compose_weekly(db)
+        # 10 active × $800 = $8,000
+        assert "8,000" in msg
+
+    def test_contains_kill_switch_status(self):
+        db = self._make_weekly_db(avg_score=70.0, total=10, churned_kill=0)
+        msg = _compose_weekly(db)
+        assert any(s in msg for s in ("GREEN", "YELLOW", "RED"))
+
+    def test_no_card_fallback(self):
+        db = self._make_weekly_db(card=None)
+        msg = _compose_weekly(db)
+        assert "no card" in msg.lower()
+
+
+# ============================================================================
+# _kill_switch_status() — YELLOW branch
+# ============================================================================
+
+
+class TestKillSwitchYellow:
+    def _make_kill_db(self, avg_score, total, churned):
+        db = MagicMock()
+        results = [avg_score, total, churned]
+        call_count = [0]
+
+        def side_effect(stmt):
+            idx = call_count[0]
+            call_count[0] += 1
+            result = MagicMock()
+            result.scalar_one_or_none.return_value = results[idx] if idx < len(results) else None
+            return result
+
+        db.execute.side_effect = side_effect
+        return db
+
+    def test_yellow_when_mid_score_mid_churn(self):
+        # avg_score=50 (above YELLOW min 40, below GREEN min 60), churn=8% (below YELLOW max 10)
+        db = self._make_kill_db(avg_score=50.0, total=100, churned=8)
+        status = _kill_switch_status(db)
+        assert status["status"] == "YELLOW"
+        assert status["label"] == "watch churn"
+
+    def test_yellow_boundary_score_exactly_at_green_threshold_minus_one(self):
+        # score=59 — just below GREEN min (60) but above YELLOW min (40), churn=3%
+        db = self._make_kill_db(avg_score=59.0, total=100, churned=3)
+        status = _kill_switch_status(db)
+        assert status["status"] == "YELLOW"
+
+
+# ============================================================================
+# _send_sms() — live send, suppression, no phone, exception
+# ============================================================================
+
+
+class TestSendSms:
+    def test_returns_true_when_send_sms_succeeds(self):
+        with patch("src.tasks.revenue_pulse.settings") as mock_settings, \
+             patch("src.tasks.revenue_pulse.get_db_context") as mock_ctx:
+            mock_settings.founder_phone = "+18135550100"
+            db = MagicMock()
+            mock_ctx.return_value.__enter__.return_value = db
+
+            with patch("src.services.sms_compliance.send_sms", return_value=True):
+                result = _send_sms("test message")
+
+        assert result is True
+
+    def test_returns_false_when_compliance_suppresses(self):
+        with patch("src.tasks.revenue_pulse.settings") as mock_settings, \
+             patch("src.tasks.revenue_pulse.get_db_context") as mock_ctx:
+            mock_settings.founder_phone = "+18135550100"
+            db = MagicMock()
+            mock_ctx.return_value.__enter__.return_value = db
+
+            with patch("src.services.sms_compliance.send_sms", return_value=False):
+                result = _send_sms("test message")
+
+        assert result is False
+
+    def test_returns_false_when_no_founder_phone(self):
+        with patch("src.tasks.revenue_pulse.settings") as mock_settings:
+            mock_settings.founder_phone = None
+            result = _send_sms("test message")
+        assert result is False
+
+    def test_returns_false_and_no_exception_on_send_error(self):
+        with patch("src.tasks.revenue_pulse.settings") as mock_settings, \
+             patch("src.tasks.revenue_pulse.get_db_context") as mock_ctx:
+            mock_settings.founder_phone = "+18135550100"
+            db = MagicMock()
+            mock_ctx.return_value.__enter__.return_value = db
+
+            with patch("src.services.sms_compliance.send_sms", side_effect=RuntimeError("Twilio 500")):
+                result = _send_sms("test message")
+
+        assert result is False
+
+
+# ============================================================================
+# run_daily_pulse / run_weekly_pulse — live send result dict
+# ============================================================================
+
+
+class TestRunPulseLiveSend:
+    def _make_daily_db(self):
+        db = MagicMock()
+        results = [5, 3, None, None, 70.0, 10, 1]
+        call_count = [0]
+
+        def side_effect(stmt):
+            idx = call_count[0]
+            call_count[0] += 1
+            result = MagicMock()
+            result.scalar_one_or_none.return_value = results[idx] if idx < len(results) else None
+            return result
+
+        db.execute.side_effect = side_effect
+        return db
+
+    def test_live_send_calls_send_sms_once(self):
+        with patch("src.tasks.revenue_pulse.get_db_context") as mock_ctx, \
+             patch("src.tasks.revenue_pulse._send_sms", return_value=True) as mock_sms, \
+             patch("src.tasks.revenue_pulse.settings") as mock_settings:
+            mock_settings.founder_phone = "+18135550100"
+            mock_ctx.return_value.__enter__.return_value = self._make_daily_db()
+
+            run_daily_pulse(dry_run=False)
+
+        mock_sms.assert_called_once()
+
+    def test_live_send_result_sent_true_when_sms_succeeds(self):
+        with patch("src.tasks.revenue_pulse.get_db_context") as mock_ctx, \
+             patch("src.tasks.revenue_pulse._send_sms", return_value=True), \
+             patch("src.tasks.revenue_pulse.settings") as mock_settings:
+            mock_settings.founder_phone = "+18135550100"
+            mock_ctx.return_value.__enter__.return_value = self._make_daily_db()
+            result = run_daily_pulse(dry_run=False)
+
+        assert result["sent"] is True
+        assert "message" in result
+
+    def test_live_send_result_sent_false_when_sms_suppressed(self):
+        with patch("src.tasks.revenue_pulse.get_db_context") as mock_ctx, \
+             patch("src.tasks.revenue_pulse._send_sms", return_value=False), \
+             patch("src.tasks.revenue_pulse.settings") as mock_settings:
+            mock_settings.founder_phone = "+18135550100"
+            mock_ctx.return_value.__enter__.return_value = self._make_daily_db()
+            result = run_daily_pulse(dry_run=False)
+
+        assert result["sent"] is False

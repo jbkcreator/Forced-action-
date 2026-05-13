@@ -4,6 +4,8 @@ Revenue Pulse config — Item 9.
 Daily + weekly founder SMS template and kill-switch thresholds.
 """
 
+# Informational only — source of truth is scripts/cron/crontab.txt.
+# Not used at runtime; kept here as docs for cron setup reference.
 PULSE_SCHEDULE = {
     "daily":  "30 7 * * *",   # 7:30 AM UTC (after 7 AM scoring)
     "weekly": "0 9 * * 1",    # Monday 9 AM UTC
