@@ -203,6 +203,11 @@ def create_subscription_checkout(
             mode="subscription",
             payment_method_types=["card"],
             customer_email=customer_email,
+            # Collect a phone number on the Stripe payment page so we have it
+            # on file for SMS features (Cora SMS, accelerated wallet push,
+            # etc.). Stripe validates the number and exposes it in
+            # session.customer_details.phone on checkout.session.completed.
+            phone_number_collection={"enabled": True},
             line_items=[{"price": price_id, "quantity": 1}],
             success_url=success_url,
             cancel_url=cancel_url,
@@ -435,6 +440,97 @@ def switch_subscription_plan(
         subscription_id, new_price_id, prorate,
     )
     return updated.to_dict()
+
+
+def create_subscription_off_saved_pm(
+    subscriber,
+    tier: str,
+    offer_id: int,
+) -> dict:
+    """Create a wallet Subscription off the subscriber's saved payment method,
+    off-session. Wallet credits land on the webhook (invoice.payment_succeeded);
+    do NOT credit here.
+
+    `payment_behavior="default_incomplete"` ensures we don't recognise revenue
+    until the first invoice clears. If 3DS / authentication is needed, the
+    returned `client_secret` and `requires_action=True` let the caller send a
+    fallback SMS with a Checkout URL.
+
+    Used by:
+      - `wallet_engine.activate_via_saved_card` (SMS reply WALLET / YES / TOPUP)
+      - `POST /api/wallet/accept-accelerated-offer/{uuid}` (in-app modal)
+    """
+    if not _init_stripe():
+        raise RuntimeError("Stripe not configured")
+
+    if not subscriber.stripe_customer_id or not subscriber.stripe_payment_method_id:
+        raise ValueError("subscriber missing stripe_customer_id or payment_method_id")
+
+    # Wallet price IDs are keyed `wallet_{starter|growth|power}`; tier name in
+    # config.revenue_ladder is `starter_wallet|growth|power`. Map both forms.
+    suffix = tier.replace("_wallet", "")  # 'starter_wallet'→'starter'; 'growth'→'growth'
+    price_name = f"wallet_{suffix}"
+    price_id = settings.active_stripe_price(price_name)
+    if not price_id:
+        raise ValueError(
+            f"Stripe price not configured for tier '{tier}' "
+            f"(expected env STRIPE_PRICE_{price_name.upper()})"
+        )
+
+    try:
+        # `allow_incomplete` = Stripe attempts the off-session charge against
+        # the saved PM immediately. If it succeeds, invoice.payment_succeeded
+        # fires and the webhook activates the wallet. If 3DS / authentication
+        # is required, the subscription lands in `incomplete` and we surface
+        # `requires_action=True` so the caller can SMS a fallback link.
+        sub = stripe.Subscription.create(
+            customer=subscriber.stripe_customer_id,
+            items=[{"price": price_id, "quantity": 1}],
+            default_payment_method=subscriber.stripe_payment_method_id,
+            off_session=True,
+            payment_behavior="allow_incomplete",
+            metadata={
+                "product": "wallet_subscription",
+                "subscriber_id": str(subscriber.id),
+                "wallet_offer_id": str(offer_id),
+                "tier": tier,
+            },
+        )
+    except stripe.error.CardError as exc:
+        logger.warning(
+            "Wallet subscription card error for sub=%s offer=%s: %s",
+            subscriber.id, offer_id, exc,
+        )
+        return {
+            "subscription_id": None,
+            "status": "failed",
+            "requires_action": True,
+            "error_code": getattr(exc, "code", "card_error"),
+            "error_message": str(exc),
+        }
+    except stripe.error.StripeError:
+        logger.error(
+            "Stripe error creating wallet subscription sub=%s offer=%s",
+            subscriber.id, offer_id, exc_info=True,
+        )
+        raise
+
+    # `incomplete` subscription status means the off-session charge couldn't
+    # complete without further action (3DS / requires_action). The webhook
+    # will not fire `invoice.payment_succeeded` until the customer authenticates,
+    # so we tell the caller to send a fallback link.
+    requires_action = sub.status == "incomplete"
+
+    logger.info(
+        "Wallet subscription created sub=%s offer=%s id=%s status=%s requires_action=%s",
+        subscriber.id, offer_id, sub.id, sub.status, requires_action,
+    )
+
+    return {
+        "subscription_id": sub.id,
+        "status": sub.status,
+        "requires_action": requires_action,
+    }
 
 
 def get_founding_spots_remaining(

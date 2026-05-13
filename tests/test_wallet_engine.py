@@ -43,6 +43,7 @@ class TestWalletEngineUnit:
         from src.services.wallet_engine import check_enrollment_triggers
         sub = MagicMock()
         sub.has_saved_card = True
+        sub.wallet_opt_out = False  # fa016: explicit so MagicMock auto-attr doesn't go truthy
         mock_db.get.return_value = sub
         mock_db.execute.return_value.scalar_one_or_none.return_value = None
         result = check_enrollment_triggers(1, mock_db)
@@ -52,6 +53,7 @@ class TestWalletEngineUnit:
         from src.services.wallet_engine import check_enrollment_triggers
         sub = MagicMock()
         sub.has_saved_card = True
+        sub.wallet_opt_out = False  # fa016
         mock_db.get.return_value = sub
         existing_wallet = WalletBalance(subscriber_id=1, wallet_tier="growth", credits_remaining=5)
         mock_db.execute.return_value.scalar_one_or_none.return_value = existing_wallet

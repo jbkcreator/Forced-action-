@@ -1,0 +1,37 @@
+# Variant B — bulk-discount framing.
+# Anchors on the unit economics: bulk-credit subscription drops the
+# per-action cost vs paying card-by-card.
+version: 1
+user: |
+  FRAMING = bulk-discount (position the wallet as a paid monthly plan
+  that lowers per-action cost on future premium actions — lead unlocks,
+  skip traces, briefs, reports).
+
+  This is a PAID monthly subscription pitch — not a free reward and
+  not part of the base platform subscription. The CTA "Reply WALLET"
+  authorizes a recurring $49/mo charge.
+
+  Live context:
+    - First name: {first_name}
+    - Monthly subscription price: {price_dollars_formatted}
+    - Credits per month if they subscribe: {credits_in_offer}
+    - CTA link: {cta_url}
+    - Tier name: {tier}
+
+  Pricing math to surface:
+    - {price_dollars_formatted}/mo for {credits_in_offer} credits
+      = ~$2.45/credit vs $7 per card-pay unlock.
+    - Auto-reload below 5 credits is included.
+
+  Aim for a body like this (don't copy verbatim — produce a clean,
+  ≤160 char body in your own words that includes the price + the
+  ~$2.45 vs $7 comparison):
+
+    "{first_name}, {price_dollars_formatted}/mo gets you
+    {credits_in_offer} credits — ~$2.45 per unlock vs $7 by card.
+    Auto-reload included. Reply WALLET to subscribe. {cta_url}"
+
+  Hard rules: include the price, never say "free / ready / waiting /
+  pre-loaded / claim", never use urgency.
+
+  Write the SMS body. No preamble, no quotes.

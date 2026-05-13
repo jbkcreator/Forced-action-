@@ -27,9 +27,7 @@ state's servers and avoid IP blocks.
 import argparse
 import re
 import time
-import logging
 from typing import Optional, Tuple
-from urllib.parse import quote_plus
 
 import requests
 from bs4 import BeautifulSoup
@@ -38,7 +36,7 @@ from sqlalchemy.orm import Session
 from src.core.database import get_db_context
 from src.core.models import Owner, Property
 from src.utils.logger import setup_logging, get_logger
-from src.utils.http_helpers import requests_get_with_retry
+from src.utils.http_helpers import get_requests_proxies
 from config.constants import DEFAULT_USER_AGENT
 
 setup_logging()
@@ -49,26 +47,60 @@ logger = get_logger(__name__)
 # ---------------------------------------------------------------------------
 SUNBIZ_SEARCH_URL = "https://search.sunbiz.org/Inquiry/CorporationSearch/SearchResults"
 SUNBIZ_DETAIL_BASE = "https://search.sunbiz.org"
+SUNBIZ_HOME_URL = "https://search.sunbiz.org/Inquiry/CorporationSearch/ByName"
 
 _HEADERS = {
     "User-Agent": DEFAULT_USER_AGENT,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 _DELAY_BETWEEN_REQUESTS = 1.5  # seconds — polite crawl rate
 
 
 # ---------------------------------------------------------------------------
+# Session management
+# ---------------------------------------------------------------------------
+
+def _build_session() -> requests.Session:
+    """
+    Create a requests.Session with proxy and browser-like headers, then warm
+    it up against the Sunbiz search homepage so session cookies are set before
+    any search requests are made.
+    """
+    session = requests.Session()
+    session.headers.update(_HEADERS)
+
+    proxies = get_requests_proxies()
+    if proxies:
+        session.proxies.update(proxies)
+        logger.info("[Sunbiz] Session using Oxylabs proxy")
+    else:
+        logger.warning("[Sunbiz] No proxy configured — requests will be sent direct")
+
+    # Warm up: visit the search landing page so the server sets session cookies
+    try:
+        resp = session.get(SUNBIZ_HOME_URL, timeout=15)
+        resp.raise_for_status()
+        logger.info(f"[Sunbiz] Session warmed up (status {resp.status_code}, cookies: {list(session.cookies.keys())})")
+    except Exception as e:
+        logger.warning(f"[Sunbiz] Warm-up request failed (continuing anyway): {e}")
+
+    return session
+
+
+# ---------------------------------------------------------------------------
 # Core scraping functions
 # ---------------------------------------------------------------------------
 
-def _search_sunbiz(company_name: str) -> Optional[str]:
+def _search_sunbiz(session: requests.Session, company_name: str) -> Optional[str]:
     """
     Search Sunbiz for a company name and return the detail page URL of the
-    first exact (or best) result, or None if not found.
+    first exact (or best) match, or None if not found.
     """
-    # Strip common legal suffixes for a cleaner search
     clean_name = re.sub(
         r"\b(LLC|INC|CORP|LTD|LP|LLP|PLLC|CO|COMPANY|INCORPORATED|LIMITED)\b\.?",
         "",
@@ -85,11 +117,11 @@ def _search_sunbiz(company_name: str) -> Optional[str]:
     }
 
     try:
-        resp = requests_get_with_retry(
+        resp = session.get(
             SUNBIZ_SEARCH_URL,
-            headers=_HEADERS,
             params=params,
             timeout=15,
+            headers={**_HEADERS, "Referer": SUNBIZ_HOME_URL},
         )
         resp.raise_for_status()
     except Exception as e:
@@ -98,7 +130,6 @@ def _search_sunbiz(company_name: str) -> Optional[str]:
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Results are in a table with class "searchResultTable"
     table = soup.find("table", class_="searchResultTable") or soup.find("table")
     if not table:
         logger.debug(f"[Sunbiz] No results table found for '{clean_name}'")
@@ -116,7 +147,6 @@ def _search_sunbiz(company_name: str) -> Optional[str]:
         result_name = link_tag.get_text(strip=True).upper()
         search_upper = company_name.upper()
 
-        # Accept if the result name contains the search name (handles LLC / Inc variations)
         if clean_name.upper() in result_name or result_name in search_upper:
             href = link_tag["href"]
             if not href.startswith("http"):
@@ -128,24 +158,83 @@ def _search_sunbiz(company_name: str) -> Optional[str]:
     return None
 
 
-def _extract_contact_from_detail(detail_url: str) -> Tuple[Optional[str], Optional[str]]:
+# Officer titles in priority order — MGR/MGRM are LLC-specific, PRES/VP/DIR for corps
+_MANAGER_TITLE_PRIORITY = ["MGR", "MGRM", "PRES", "VP", "DIR"]
+
+
+def _parse_officers_section(soup: BeautifulSoup) -> Optional[dict]:
     """
-    Fetch the Sunbiz entity detail page and extract phone and email from the
-    registered agent section.
+    Parse the Officers/Directors section of a Sunbiz detail page.
+
+    Sunbiz renders each section as a <div class="detailSection"> with a
+    <span class="detailSectionHeader"> label, followed by <span class="label">
+    / <span class="info"> pairs for each field of each officer.
+
+    Returns the best manager as {"name": str, "title": str}, preferring
+    MGR > MGRM > PRES > VP > DIR > first-available. Returns None if the
+    section is absent or empty.
+    """
+    officers = []
+
+    for section in soup.find_all("div", class_="detailSection"):
+        header = section.find("span", class_="detailSectionHeader")
+        if not header or "officer" not in header.get_text(separator=" ", strip=True).lower():
+            continue
+
+        # Walk label/info pairs within this section
+        labels = section.find_all("span", class_="label")
+        infos = section.find_all("span", class_="info")
+
+        current: dict = {}
+        for label_tag, info_tag in zip(labels, infos):
+            key = label_tag.get_text(strip=True).lower().rstrip(":")
+            val = info_tag.get_text(strip=True)
+            if not val:
+                continue
+            if key == "title":
+                if current:
+                    officers.append(current)
+                current = {"title": val.upper()}
+            elif key == "name" and "title" in current:
+                current["name"] = val.upper()
+        if current and "name" in current:
+            officers.append(current)
+
+        break  # only need the first Officers section
+
+    if not officers:
+        return None
+
+    # Skip pure registered-agent entries — those are handled separately
+    candidates = [o for o in officers if o.get("title") != "RAGT" and o.get("name")]
+    if not candidates:
+        return None
+
+    # Return highest-priority title; fall back to first candidate
+    for preferred in _MANAGER_TITLE_PRIORITY:
+        for officer in candidates:
+            if officer.get("title") == preferred:
+                return officer
+    return candidates[0]
+
+
+def _extract_contact_from_detail(
+    session: requests.Session, detail_url: str
+) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """
+    Fetch the Sunbiz entity detail page and extract:
+      - phone and email from the registered agent / page text
+      - manager name and title from the Officers/Directors section
 
     Returns:
-        (phone, email) — either may be None if not found on the page.
+        (phone, email, manager_name, manager_title)
     """
     try:
-        resp = requests_get_with_retry(
-            detail_url,
-            headers=_HEADERS,
-            timeout=15,
-        )
+        resp = session.get(detail_url, timeout=15)
         resp.raise_for_status()
     except Exception as e:
         logger.debug(f"[Sunbiz] Detail fetch failed for {detail_url}: {e}")
-        return None, None
+        return None, None, None, None
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -153,8 +242,6 @@ def _extract_contact_from_detail(detail_url: str) -> Tuple[Optional[str], Option
     email: Optional[str] = None
 
     # ── Phone ────────────────────────────────────────────────────────────────
-    # Sunbiz renders phone as plain text near "Registered Agent" section.
-    # Also check principal address / officer sections.
     page_text = soup.get_text(" ", strip=True)
 
     phone_matches = re.findall(
@@ -162,7 +249,6 @@ def _extract_contact_from_detail(detail_url: str) -> Tuple[Optional[str], Option
         page_text,
     )
     if phone_matches:
-        # Prefer the first valid 10-digit number
         for raw in phone_matches:
             digits = re.sub(r"\D", "", raw)
             if len(digits) == 10 and digits[0] not in ("0", "1"):
@@ -175,13 +261,21 @@ def _extract_contact_from_detail(detail_url: str) -> Tuple[Optional[str], Option
         page_text,
     )
     if email_matches:
-        # Filter out Sunbiz system emails
         for candidate in email_matches:
             if "sunbiz" not in candidate.lower() and "dos.myflorida" not in candidate.lower():
                 email = candidate.lower()
                 break
 
-    return phone, email
+    # ── Manager (Officers/Directors section) ─────────────────────────────────
+    manager_name: Optional[str] = None
+    manager_title: Optional[str] = None
+
+    officer = _parse_officers_section(soup)
+    if officer:
+        manager_name = officer.get("name")
+        manager_title = officer.get("title")
+
+    return phone, email, manager_name, manager_title
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +307,7 @@ def enrich_llc_owners(
     from sqlalchemy import or_, desc
     from src.core.models import DistressScore
 
-    stats = {"processed": 0, "enriched": 0, "skipped": 0, "failed": 0}
+    stats = {"processed": 0, "enriched": 0, "manager_found": 0, "skipped": 0, "failed": 0}
 
     if urgency_tiers is None:
         urgency_tiers = ["Immediate", "High"]
@@ -243,6 +337,8 @@ def enrich_llc_owners(
         f"[Sunbiz] Found {total} LLC owners in {urgency_tiers} tier(s) without phone numbers"
     )
 
+    http_session = _build_session()
+
     for idx, owner in enumerate(owners, 1):
         stats["processed"] += 1
         name = owner.owner_name.strip()
@@ -260,7 +356,7 @@ def enrich_llc_owners(
         # Rate-limit
         time.sleep(_DELAY_BETWEEN_REQUESTS)
 
-        detail_url = _search_sunbiz(name)
+        detail_url = _search_sunbiz(http_session, name)
         if not detail_url:
             stats["skipped"] += 1
             continue
@@ -268,38 +364,48 @@ def enrich_llc_owners(
         time.sleep(_DELAY_BETWEEN_REQUESTS)
 
         try:
-            phone, email = _extract_contact_from_detail(detail_url)
+            phone, email, manager_name, manager_title = _extract_contact_from_detail(http_session, detail_url)
         except Exception as e:
             logger.warning(f"[Sunbiz] Failed to extract contact for '{name}': {e}")
             stats["failed"] += 1
             continue
 
-        if not phone and not email:
-            logger.debug(f"[Sunbiz] No contact data found for '{name}'")
+        if not phone and not email and not manager_name:
+            logger.debug(f"[Sunbiz] No data found for '{name}'")
             stats["skipped"] += 1
             continue
 
-        logger.info(
-            f"[Sunbiz] Found — {name} | phone={phone} | email={email}"
-        )
+        if manager_name:
+            logger.info(f"[Sunbiz] Manager: {manager_name} ({manager_title}) for '{name}'")
+        if phone or email:
+            logger.info(f"[Sunbiz] Contact: {name} | phone={phone} | email={email}")
 
         if not dry_run:
             if phone:
                 owner.phone_1 = phone
             if email:
                 owner.email_1 = email
-            owner.skip_trace_success = True
-            # Fix misclassified owner_type
+            if phone or email:
+                owner.skip_trace_success = True
+            if manager_name:
+                owner.manager_name = manager_name
+                owner.manager_title = manager_title
+                stats["manager_found"] += 1
             if owner.owner_type != "LLC":
                 owner.owner_type = "LLC"
-            stats["enriched"] += 1
+            if phone or email:
+                stats["enriched"] += 1
         else:
-            logger.info(f"[Sunbiz] DRY RUN — would update owner_id={owner.id}")
-            stats["enriched"] += 1
+            if phone or email:
+                logger.info(f"[Sunbiz] DRY RUN — would write contact for owner_id={owner.id}")
+                stats["enriched"] += 1
+            if manager_name:
+                logger.info(f"[Sunbiz] DRY RUN — would write manager for owner_id={owner.id}")
+                stats["manager_found"] += 1
 
     if not dry_run:
         session.commit()
-        logger.info(f"[Sunbiz] Committed {stats['enriched']} owner updates to DB")
+        logger.info(f"[Sunbiz] Committed {stats['enriched']} contact + {stats['manager_found']} manager updates to DB")
 
     return stats
 
@@ -337,10 +443,11 @@ def run_sunbiz_pipeline(
 
     logger.info("=" * 60)
     logger.info("SUNBIZ ENRICHMENT COMPLETE")
-    logger.info(f"  Processed : {stats['processed']}")
-    logger.info(f"  Enriched  : {stats['enriched']}")
-    logger.info(f"  Skipped   : {stats['skipped']}  (no Sunbiz match)")
-    logger.info(f"  Failed    : {stats['failed']}")
+    logger.info(f"  Processed      : {stats['processed']}")
+    logger.info(f"  Enriched       : {stats['enriched']}  (phone or email found)")
+    logger.info(f"  Manager found  : {stats['manager_found']}  (name+title stored, no phone yet)")
+    logger.info(f"  Skipped        : {stats['skipped']}  (no Sunbiz match)")
+    logger.info(f"  Failed         : {stats['failed']}")
     logger.info("=" * 60)
 
     if rescore and stats["enriched"] > 0 and not dry_run:

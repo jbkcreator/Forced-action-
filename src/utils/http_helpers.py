@@ -58,6 +58,25 @@ def get_browser_use_proxy():
     )
 
 
+def get_requests_proxies(rotate: bool = False) -> Optional[dict]:
+    """
+    Return a requests-compatible proxies dict for Oxylabs, or None if not configured.
+
+    Usage:
+        resp = requests.get(url, proxies=get_requests_proxies(rotate=True), ...)
+    """
+    from config.settings import settings
+    if not settings.oxylabs_username or not settings.oxylabs_password:
+        logger.warning("[Proxy] OXYLABS_USERNAME/PASSWORD not found — requests will be sent directly")
+        return None
+    username = settings.oxylabs_username
+    if rotate or settings.oxylabs_rotate:
+        username = f"{username}-sessid-{uuid4().hex[:8]}"
+    password = settings.oxylabs_password.get_secret_value()
+    proxy_url = f"http://{username}:{password}@pr.oxylabs.io:7777"
+    return {"http": proxy_url, "https": proxy_url}
+
+
 # Retry on network-level failures and server errors; never retry on client errors (4xx)
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
@@ -66,6 +85,7 @@ def requests_get_with_retry(
     url: str,
     max_retries: int = 5,
     retry_delay: int = 5,
+    use_proxy: bool = False,
     **kwargs,
 ) -> requests.Response:
     """
@@ -82,17 +102,27 @@ def requests_get_with_retry(
         url:         Target URL.
         max_retries: Number of attempts before giving up (default 5).
         retry_delay: Seconds to wait between attempts (default 5).
+        use_proxy:   Route through Oxylabs proxy if credentials are configured.
         **kwargs:    Forwarded to requests.get (headers, params, timeout, etc.).
 
     Returns:
-        requests.Response with status verified via raise_for_status().
+        requests.Response
 
     Raises:
         requests.HTTPError, requests.Timeout, requests.ConnectionError, etc.
     """
+    _proxy_warned = False
     for attempt in range(1, max_retries + 1):
+        request_kwargs = kwargs
+        if use_proxy:
+            proxies = get_requests_proxies()
+            if proxies:
+                request_kwargs = {**kwargs, "proxies": proxies}
+            elif not _proxy_warned:
+                logger.warning("[Proxy] use_proxy=True but OXYLABS_USERNAME/PASSWORD not set — sending direct")
+                _proxy_warned = True
         try:
-            response = requests.get(url, **kwargs)
+            response = requests.get(url, **request_kwargs)  # type: ignore[arg-type]
             response.raise_for_status()
             return response
         except (requests.Timeout, requests.ConnectionError) as e:

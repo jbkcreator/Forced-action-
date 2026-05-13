@@ -68,3 +68,15 @@ retention_sms_v1:
   variant_b:
     prompt:      variant_b
     description: "missed-opportunity — anchor on what's been left on the table"
+
+accelerated_wallet_push_framing:
+  graph:       accelerated_wallet_push
+  enabled:     true
+  traffic_pct: 100
+  segment:     all
+  variant_a:
+    prompt:      variant_a
+    description: "missing-leads — anchor on unlocks they couldn't grab this week"
+  variant_b:
+    prompt:      variant_b
+    description: "credits-ready — anchor on credits pre-loaded on saved card"

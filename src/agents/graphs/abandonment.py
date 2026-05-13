@@ -95,6 +95,13 @@ class AbandonmentState(TypedDict, total=False):
 	terminal_status: str
 	failure_reason: str
 
+	# Intermediate compose inputs (must be declared — LangGraph drops undeclared keys)
+	_system_prompt: str
+	_user_prompt: str
+	_fallback_body: str
+	_render_context: dict
+	_variant_id: Optional[str]
+
 	# Wave-2 bookkeeping
 	wave2_scheduled_at: Optional[str]
 	wave1_already_converted: bool

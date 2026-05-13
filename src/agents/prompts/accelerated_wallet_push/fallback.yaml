@@ -1,0 +1,7 @@
+# Static fallback — used when Cora is rate-limited or kill_switch_color
+# is yellow. No LLM call. The body deliberately leads with the price so
+# the subscriber understands this is a PAID monthly subscription, not
+# a free reward.
+version: 1
+body: |
+  {first_name}, Starter Wallet is {price_dollars_formatted}/mo for {credits_in_offer} credits — ~$2.45 per unlock vs $7 by card. Auto-reload included. Reply WALLET to subscribe. {cta_url}

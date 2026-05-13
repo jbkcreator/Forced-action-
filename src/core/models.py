@@ -152,6 +152,10 @@ class Owner(Base):
     credit_score_tier: Mapped[Optional[str]] = mapped_column(String(50))
     skip_trace_success: Mapped[Optional[bool]] = mapped_column(Boolean, default=False)
 
+    # LLC manager — populated by Sunbiz officer parser (free enrichment layer)
+    manager_name: Mapped[Optional[str]] = mapped_column(String(255))
+    manager_title: Mapped[Optional[str]] = mapped_column(String(50))
+
     # Multi-county
     county_id: Mapped[Optional[str]] = mapped_column(String(50), default='hillsborough', index=True)
 
@@ -612,6 +616,62 @@ class Incident(Base):
         return f"<Incident(id={self.id}, type='{self.incident_type}', date={self.incident_date})>"
 
 
+class NWSAlert(Base):
+    """
+    Idempotent store for NWS CAP alerts processed by the platform.
+    One row per unique NWS alert ID — prevents duplicate storm-pack triggers
+    and Cora urgency messages across poll cycles.
+    """
+    __tablename__ = "nws_alerts"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+
+    # NWS @id field — globally unique alert identifier (urn:oid:...)
+    alert_id: Mapped[str] = mapped_column(String(200), unique=True, nullable=False, index=True)
+
+    # Core alert fields from CAP properties
+    event: Mapped[str] = mapped_column(String(100), nullable=False)
+    severity: Mapped[Optional[str]] = mapped_column(String(30))
+    urgency: Mapped[Optional[str]] = mapped_column(String(30))
+    certainty: Mapped[Optional[str]] = mapped_column(String(30))
+    headline: Mapped[Optional[str]] = mapped_column(Text)
+    description: Mapped[Optional[str]] = mapped_column(Text)
+    instruction: Mapped[Optional[str]] = mapped_column(Text)
+    area_desc: Mapped[Optional[str]] = mapped_column(Text)
+
+    # Geocode lists stored as JSONB (consistent with rest of codebase)
+    same_codes: Mapped[Optional[dict]] = mapped_column(JSONB)
+    ugc_codes: Mapped[Optional[dict]] = mapped_column(JSONB)
+    affected_zips: Mapped[Optional[dict]] = mapped_column(JSONB)
+
+    # Alert time window
+    effective: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    onset: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    expires: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    ends: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    # Platform tracking
+    county_id: Mapped[str] = mapped_column(String(50), default="hillsborough", index=True)
+    storm_pack_triggered: Mapped[bool] = mapped_column(Boolean, default=False)
+    cora_urgency_sent: Mapped[bool] = mapped_column(Boolean, default=False)
+    subscriber_count: Mapped[int] = mapped_column(Integer, default=0)
+
+    # Full raw properties payload for debugging/audit
+    raw_payload: Mapped[Optional[dict]] = mapped_column(JSONB)
+
+    processed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), index=True
+    )
+
+    __table_args__ = (
+        Index("idx_nws_alerts_event_processed", "event", "processed_at"),
+        Index("idx_nws_alerts_affected_zips", "affected_zips", postgresql_using="gin"),
+    )
+
+    def __repr__(self):
+        return f"<NWSAlert(id={self.id}, event='{self.event}', alert_id='{self.alert_id[:40]}...')>"
+
+
 # ============================================================================
 # 4. SCORING & INTELLIGENCE
 # ============================================================================
@@ -766,6 +826,23 @@ class Subscriber(Base):
     payment_failed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     recovery_day1_sent: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
     recovery_day3_sent: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
+
+    # ── fa016: Accelerated Wallet Push ──
+    phone: Mapped[Optional[str]] = mapped_column(String(20), unique=True, index=True)
+    wallet_opt_out: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
+    missed_lead_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+
+    # ── fa017: Signup source attribution ──
+    # CHECK constraint (`check_subscriber_signup_source`) enforces allow-list:
+    # direct / landing_page / dbpr_email / cora_sms / missed_call / referral / admin / unknown.
+    signup_source: Mapped[str] = mapped_column(
+        String(30), default="direct", server_default="direct", nullable=False, index=True,
+    )
+    utm_source: Mapped[Optional[str]] = mapped_column(String(100))
+    utm_medium: Mapped[Optional[str]] = mapped_column(String(100))
+    utm_campaign: Mapped[Optional[str]] = mapped_column(String(100))
+    campaign_id: Mapped[Optional[str]] = mapped_column(String(50))
+    attribution_token: Mapped[Optional[str]] = mapped_column(String(200))
 
     bundle_purchases = relationship("BundlePurchase", back_populates="subscriber")
 
@@ -1441,6 +1518,46 @@ class WalletTransaction(Base):
 
     def __repr__(self):
         return f"<WalletTransaction(id={self.id}, type={self.txn_type}, amount={self.amount})>"
+
+
+class WalletPushOffer(Base):
+    """Accelerated Wallet Push offer funnel (fa016)."""
+    __tablename__ = "wallet_push_offers"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("subscribers.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    decision_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
+    framing_variant: Mapped[str] = mapped_column(String(20), nullable=False)
+    ab_variant: Mapped[Optional[str]] = mapped_column(String(1))
+    tier: Mapped[str] = mapped_column(String(20), nullable=False, server_default="starter_wallet")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, server_default="offered")
+    stripe_subscription_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)
+
+    offered_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    accepted_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    declined_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    activated_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    subscriber = relationship("Subscriber", backref="wallet_push_offers")
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('offered','accepted','declined','activated','expired','failed')",
+            name="check_wallet_push_offer_status",
+        ),
+        CheckConstraint(
+            "framing_variant IN ('missing_leads','credits_ready')",
+            name="check_wallet_push_framing_variant",
+        ),
+        Index("idx_wallet_push_offers_subscriber_offered", "subscriber_id", "offered_at"),
+    )
+
+    def __repr__(self):
+        return f"<WalletPushOffer(id={self.id}, sub={self.subscriber_id}, status={self.status})>"
 
 
 class UserSegment(Base):

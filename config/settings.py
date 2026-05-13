@@ -223,6 +223,39 @@ class AppSettings(BaseSettings):
 	# Human close routing (Phase A)
 	slack_human_close_webhook: Optional[str] = Field(default=None, env="SLACK_HUMAN_CLOSE_WEBHOOK")
 
+	# Accelerated Wallet Push (fa016) — master kill switch.
+	# Detector, sweep, Cora graph, and API endpoints all skip when False.
+	# Auto-flipped to False if Day-35 take_rate < wallet_adoption.floor_pct (12%).
+	accelerated_wallet_push_enabled: bool = Field(default=False, env="ACCELERATED_WALLET_PUSH_ENABLED")
+
+	# NWS Weather / Storm Pack (fa018)
+	# nws_weather_enabled      — master kill switch for entire NWS subsystem
+	# nws_revenue_polling_enabled — controls whether poller triggers storm pack / Cora
+	# storm_pack_enabled        — controls bundle offer dispatch specifically
+	# nws_cora_urgency_enabled  — controls Cora urgency graph dispatch specifically
+	nws_weather_enabled: bool = Field(default=True, env="NWS_WEATHER_ENABLED")
+	nws_revenue_polling_enabled: bool = Field(default=True, env="NWS_REVENUE_POLLING_ENABLED")
+	storm_pack_enabled: bool = Field(default=True, env="STORM_PACK_ENABLED")
+	nws_cora_urgency_enabled: bool = Field(default=True, env="NWS_CORA_URGENCY_ENABLED")
+	nws_poll_interval_seconds: int = Field(default=300, env="NWS_POLL_INTERVAL_SECONDS")
+	nws_supported_states: list = Field(default=["FL"], env="NWS_SUPPORTED_STATES")
+	nws_relevant_events: list = Field(default=[
+		"Tornado Warning", "Tornado Watch",
+		"Severe Thunderstorm Warning", "Severe Thunderstorm Watch",
+		"Hurricane Warning", "Hurricane Watch",
+		"Tropical Storm Warning", "Tropical Storm Watch",
+		"Flash Flood Warning", "Flood Warning",
+		"High Wind Warning", "Wind Advisory",
+		"Storm Surge Warning", "Storm Surge Watch",
+		"Special Weather Statement",
+	], env="NWS_RELEVANT_EVENTS")
+
+	# Landing token secret (fa017) — HS256 key for signed missed-call /
+	# email-onboarding links. Token carries (subscriber_id, source, exp) and
+	# is validated by POST /api/landing/resolve-token. Falls back to
+	# admin_jwt_secret when unset so local-dev works without extra env config.
+	landing_token_secret: Optional[SecretStr] = Field(default=None, env="LANDING_TOKEN_SECRET")
+
 	# Synthflow outbound voice drops (Phase C)
 	synthflow_api_base: str = Field(default="https://api.synthflow.ai/v2", env="SYNTHFLOW_API_BASE")
 	synthflow_api_key: Optional[SecretStr] = Field(default=None, env="SYNTHFLOW_API_KEY")

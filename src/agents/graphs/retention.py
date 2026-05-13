@@ -72,6 +72,13 @@ class RetentionState(TypedDict, total=False):
 	action_blocked_reason: str
 	use_fallback: bool
 
+	# Intermediate compose inputs (must be declared — LangGraph drops undeclared keys)
+	_system_prompt: str
+	_user_prompt: str
+	_fallback_body: str
+	_render_context: dict
+	_variant_id: Optional[str]
+
 	# Compose
 	message_body: str
 	sent: bool

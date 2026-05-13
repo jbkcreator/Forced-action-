@@ -6,6 +6,7 @@ dispatch() routes to the appropriate handler and returns a reply string.
 Caller (main.py /webhooks/twilio/inbound) is responsible for sending the reply.
 """
 
+import json as _json
 import logging
 from typing import Optional
 
@@ -19,6 +20,8 @@ logger = logging.getLogger(__name__)
 COMMANDS = {
     "LOCK", "BOOST", "AUTO ON", "AUTO OFF",
     "PAUSE", "YES", "RESUME", "BALANCE", "TOPUP", "REPORT", "YEARLY", "SAVE CARD",
+    # fa016 Accelerated Wallet Push
+    "WALLET", "NO", "PASS",
 }
 
 _MAX_SMS_LEN = 160
@@ -55,6 +58,9 @@ def dispatch(from_number: str, command: str, db: Session) -> str:
         "REPORT": _handle_report,
         "YEARLY": _handle_yearly,
         "SAVE CARD": _handle_save_card,
+        "WALLET": _handle_wallet,
+        "NO": _handle_no,
+        "PASS": _handle_no,
     }
     handler = handlers.get(command)
     if not handler:
@@ -63,17 +69,20 @@ def dispatch(from_number: str, command: str, db: Session) -> str:
 
 
 def _find_subscriber(phone: str, db: Session) -> Optional[Subscriber]:
-    from src.core.models import Owner
-    # Try owner lookup first (phone_1 field on Owner)
-    owner_match = db.execute(
-        select(Owner).where(Owner.phone_1 == phone)
+    """Look up a Subscriber by inbound phone number.
+
+    Primary lookup is `Subscriber.phone` (E.164). If the phone number happens
+    to be stored on an Owner row (legacy data from before the column was
+    backfilled), that path is still a no-op — Owner→Subscriber link is loose
+    and unreliable, so we don't try to resolve it here.
+    """
+    if not phone:
+        return None
+    normalized = phone.strip()
+    sub = db.execute(
+        select(Subscriber).where(Subscriber.phone == normalized)
     ).scalar_one_or_none()
-    if owner_match:
-        # Owner → Property → Subscriber via territory is complex; best effort via email match
-        pass
-    # Direct subscriber lookup by email not possible without phone field on Subscriber
-    # For now return None — will be wired when subscriber.phone field is added in 2B-2
-    return None
+    return sub
 
 
 def _handle_balance(sub: Subscriber, db: Session) -> str:
@@ -126,21 +135,35 @@ def _handle_pause(sub: Subscriber, db: Session) -> str:
     )[:_MAX_SMS_LEN]
 
 
+def _pending_offer(sub_id: int) -> Optional[dict]:
+    from src.core.redis_client import redis_available, rget
+    if not redis_available():
+        return None
+    raw = rget(f"fa:pending_offer:{sub_id}")
+    if not raw:
+        return None
+    try:
+        return _json.loads(raw)
+    except Exception:
+        return None
+
+
+def _clear_pending_offer(sub_id: int) -> None:
+    from src.core.redis_client import redis_available, rdelete
+    if redis_available():
+        rdelete(f"fa:pending_offer:{sub_id}")
+
+
 def _handle_yes(sub: Subscriber, db: Session) -> str:
     """Context-aware YES: routes to pending offer checkout or falls back to pause."""
-    import json as _json
-    from src.core.redis_client import redis_available, rget as _rget, rdelete as _rdelete
-
-    if redis_available():
-        raw = _rget(f"fa:pending_offer:{sub.id}")
-        if raw:
-            try:
-                offer = _json.loads(raw)
-            except Exception:
-                offer = None
-            if offer and offer.get("type") == "lock_close":
-                _rdelete(f"fa:pending_offer:{sub.id}")
-                return _open_checkout_for_lock(sub, offer.get("zip_code", ""))
+    offer = _pending_offer(sub.id)
+    if offer:
+        otype = offer.get("type")
+        if otype == "lock_close":
+            _clear_pending_offer(sub.id)
+            return _open_checkout_for_lock(sub, offer.get("zip_code", ""))
+        if otype == "wallet_push":
+            return _accept_wallet_offer(sub, offer, db)
     return _handle_pause_yes(sub, db)
 
 
@@ -194,6 +217,11 @@ def _handle_resume(sub: Subscriber, db: Session) -> str:
 
 
 def _handle_topup(sub: Subscriber, db: Session) -> str:
+    """TOPUP is context-aware: when a wallet_push offer is pending, treat it
+    as acceptance (per spec). Otherwise return the standard top-up URL."""
+    offer = _pending_offer(sub.id)
+    if offer and offer.get("type") == "wallet_push":
+        return _accept_wallet_offer(sub, offer, db)
     from config.settings import settings
     url = f"{settings.app_base_url}/wallet?uuid={sub.event_feed_uuid}"
     return f"Top up your wallet here: {url}"[:_MAX_SMS_LEN]
@@ -215,3 +243,94 @@ def _handle_save_card(sub: Subscriber, db: Session) -> str:
     from config.settings import settings
     url = f"{settings.app_base_url}/save-card?uuid={sub.event_feed_uuid}"
     return f"Save your card for faster checkout: {url}"[:_MAX_SMS_LEN]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# fa016 Accelerated Wallet Push — WALLET / NO / PASS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _handle_wallet(sub: Subscriber, db: Session) -> str:
+    offer = _pending_offer(sub.id)
+    if offer and offer.get("type") == "wallet_push":
+        return _accept_wallet_offer(sub, offer, db)
+    return _handle_balance(sub, db)
+
+
+def _accept_wallet_offer(sub: Subscriber, offer: dict, db: Session) -> str:
+    from datetime import datetime, timezone
+    from src.core.models import WalletPushOffer
+    from src.services import wallet_engine
+
+    tier = offer.get("tier") or "starter_wallet"
+    offer_id = offer.get("offer_id")
+    row: Optional[WalletPushOffer] = None
+    if offer_id:
+        try:
+            row = db.get(WalletPushOffer, int(offer_id))
+        except (TypeError, ValueError):
+            row = None
+
+    try:
+        result = wallet_engine.activate_via_saved_card(
+            subscriber_id=sub.id, tier=tier, db=db, offer_id=int(offer_id or 0)
+        )
+    except ValueError as exc:
+        logger.warning("activate_via_saved_card refused sub=%s: %s", sub.id, exc)
+        from config.settings import settings
+        url = f"{settings.app_base_url}/save-card?uuid={sub.event_feed_uuid}"
+        return f"Couldn't activate wallet. Save a card: {url}"[:_MAX_SMS_LEN]
+    except Exception:
+        logger.error("activate_via_saved_card error sub=%s", sub.id, exc_info=True)
+        from config.settings import settings
+        url = f"{settings.app_base_url}/wallet?uuid={sub.event_feed_uuid}"
+        return f"Activation issue. Open: {url}"[:_MAX_SMS_LEN]
+
+    requires_action = bool(result.get("requires_action"))
+    sub_id = result.get("subscription_id")
+
+    if row is not None:
+        row.accepted_at = datetime.now(timezone.utc)
+        if sub_id:
+            row.stripe_subscription_id = sub_id
+        if result.get("status") == "failed":
+            row.status = "failed"
+        elif row.status == "offered":
+            row.status = "accepted"
+        db.flush()
+
+    _clear_pending_offer(sub.id)
+
+    if requires_action or not sub_id:
+        from config.settings import settings
+        url = f"{settings.app_base_url}/dashboard/{sub.event_feed_uuid}?wallet_offer=accept"
+        return f"Need to verify card. Open: {url}"[:_MAX_SMS_LEN]
+
+    return "Wallet activating. Credits land in ~1 min."[:_MAX_SMS_LEN]
+
+
+def _handle_no(sub: Subscriber, db: Session) -> str:
+    """NO / PASS — opt out of wallet pushes for this subscriber."""
+    from datetime import datetime, timezone
+    from src.core.models import WalletPushOffer
+
+    offer = _pending_offer(sub.id)
+    if not offer or offer.get("type") != "wallet_push":
+        # Fall through to nothing-specific — return a polite default
+        return "Got it. Reply HELP for options."[:_MAX_SMS_LEN]
+
+    sub.wallet_opt_out = True
+    db.flush()
+
+    offer_id = offer.get("offer_id")
+    if offer_id:
+        try:
+            row = db.get(WalletPushOffer, int(offer_id))
+            if row is not None and row.status == "offered":
+                row.status = "declined"
+                row.declined_at = datetime.now(timezone.utc)
+                db.flush()
+        except (TypeError, ValueError):
+            pass
+
+    _clear_pending_offer(sub.id)
+    return "No problem, we won't ask again about Wallet."[:_MAX_SMS_LEN]

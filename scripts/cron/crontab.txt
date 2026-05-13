@@ -67,6 +67,11 @@ COUNTY_ID=hillsborough
 # 11. Roofing Permits (classify from building_permits) — 06:17 AM UTC / 02:17 AM EDT / 11:47 AM IST
 17 6 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.roofing_permits.roofing_permit_engine --county-id $COUNTY_ID
 
+# NWS revenue alert polling — every 5 minutes, all days (fa018)
+# Autonomous trigger for storm-pack offers and Cora urgency messages.
+# Idempotent: same alert_id is never processed twice.
+*/5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.nws_poll --county-id $COUNTY_ID
+
 # 12. Storm Damage (NWS alerts) — 06:19 AM UTC / 02:19 AM EDT / 11:49 AM IST
 19 6 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.storm.storm_engine --county-id $COUNTY_ID
 
@@ -210,5 +215,10 @@ COUNTY_ID=hillsborough
 
 # Stripe recovery sequence (Day 1 + Day 3) — daily 16:00 UTC, after proactive_save 15:00.
 0 16 * * * $PROJECT/scripts/cron/run.sh src.tasks.stripe_recovery_sweep
+
+# Accelerated Wallet Push sweep (fa016) — every 5 minutes. Safety net for
+# the inline detector in wallet_engine.debit / stripe_webhooks. Gated by
+# ACCELERATED_WALLET_PUSH_ENABLED.
+*/5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.accelerated_wallet_push_sweep
 
 # === END FORCED-ACTION-PLATFORM ===
