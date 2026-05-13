@@ -118,6 +118,11 @@ COUNTY_ID=hillsborough
 # Decoupled from scoring so GHL API latency never blocks scraper sessions.
 0 8 * * 1-5 $PROJECT/scripts/cron/run.sh src.tasks.ghl_sync
 
+# ── REFERRAL FORWARD PACK ─────────────────────────────────────
+# Render Claude-written per-vertical share copy weekly (caches to DB, bounds Claude spend)
+# Monday @ 03:00 AM UTC — before any subscriber activity, before weekly report
+0 3 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.referral_forward_pack_task
+
 # ── WEEKLY REPORT ────────────────────────────────────────────
 # Weekly Report — Monday @ 09:00 AM UTC / 05:00 AM EDT / 02:30 PM IST (after GHL sync)
 0 9 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.weekly_report

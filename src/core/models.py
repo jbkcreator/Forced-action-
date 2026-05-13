@@ -767,6 +767,9 @@ class Subscriber(Base):
     recovery_day1_sent: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
     recovery_day3_sent: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
 
+    # ── Referral Core Loop ──
+    bonus_zip_slots: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+
     bundle_purchases = relationship("BundlePurchase", back_populates="subscriber")
 
     # Audit
@@ -1580,7 +1583,7 @@ class ReferralEvent(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "status IN ('pending', 'confirmed', 'rewarded', 'expired')",
+            "status IN ('pending', 'confirmed', 'rewarded', 'expired', 'revoked')",
             name="check_referral_status",
         ),
         Index("idx_referral_referrer_status", "referrer_subscriber_id", "status"),
@@ -1588,6 +1591,63 @@ class ReferralEvent(Base):
 
     def __repr__(self):
         return f"<ReferralEvent(referrer={self.referrer_subscriber_id}, status={self.status})>"
+
+
+class ReferralMilestoneAward(Base):
+    """
+    Idempotent record of a milestone grant for a referrer.
+    UNIQUE(referrer_subscriber_id, milestone) prevents double-grants.
+    milestone values: free_month_3 | lock_slot_5
+    """
+    __tablename__ = "referral_milestone_awards"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    referrer_subscriber_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("subscribers.id"), nullable=False, index=True
+    )
+    milestone: Mapped[str] = mapped_column(String(30), nullable=False)
+    awarded_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    triggering_referral_event_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("referral_events.id")
+    )
+    grant_ref: Mapped[Optional[str]] = mapped_column(Text)  # Stripe coupon id or similar
+    notified_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    __table_args__ = (
+        UniqueConstraint("referrer_subscriber_id", "milestone", name="uq_referral_milestone_per_referrer"),
+        CheckConstraint(
+            "milestone IN ('free_month_3', 'lock_slot_5')",
+            name="check_referral_milestone",
+        ),
+    )
+
+    def __repr__(self):
+        return f"<ReferralMilestoneAward(referrer={self.referrer_subscriber_id}, milestone={self.milestone})>"
+
+
+class ReferralForwardCopy(Base):
+    """
+    Weekly Claude-generated share copy per buyer vertical.
+    Cached to bound Claude spend and keep per-share latency low.
+    """
+    __tablename__ = "referral_forward_copy"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    vertical: Mapped[str] = mapped_column(String(50), nullable=False)
+    week_start: Mapped[date] = mapped_column(Date, nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    generated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("vertical", "week_start", name="uq_referral_forward_copy_vertical_week"),
+    )
+
+    def __repr__(self):
+        return f"<ReferralForwardCopy(vertical={self.vertical}, week_start={self.week_start})>"
 
 
 class AbTest(Base):

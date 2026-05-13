@@ -51,3 +51,11 @@ def get_file_prefix(county_id: str) -> str:
 def list_counties() -> list[str]:
     """Return all configured county IDs."""
     return list(_load().keys())
+
+
+def is_zip_in_county(county_id: str, zip_code: str) -> bool:
+    """True if zip_code's 3-digit prefix matches one configured for this county."""
+    if not zip_code or len(zip_code) < 3:
+        return False
+    prefixes = get_county(county_id).get("zip_prefixes") or []
+    return zip_code[:3] in prefixes

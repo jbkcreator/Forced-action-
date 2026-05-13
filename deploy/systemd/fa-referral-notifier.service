@@ -1,0 +1,27 @@
+[Unit]
+Description=Forced Action — Referral notifier worker (Redis Pub/Sub → Telnyx SMS)
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target redis-server.service
+
+[Service]
+Type=simple
+User=forcedaction
+Group=forcedaction
+WorkingDirectory=/opt/forced-action
+EnvironmentFile=/etc/forced-action/env
+ExecStart=/opt/forced-action/.venv/bin/python -m src.services.referral_notifier
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fa-referral-notifier
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/forced-action /var/log/forced-action
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
