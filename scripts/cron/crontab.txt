@@ -67,6 +67,11 @@ COUNTY_ID=hillsborough
 # 11. Roofing Permits (classify from building_permits) — 06:17 AM UTC / 02:17 AM EDT / 11:47 AM IST
 17 6 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.roofing_permits.roofing_permit_engine --county-id $COUNTY_ID
 
+# NWS revenue alert polling — every 5 minutes, all days (fa018)
+# Autonomous trigger for storm-pack offers and Cora urgency messages.
+# Idempotent: same alert_id is never processed twice.
+*/5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.nws_poll --county-id $COUNTY_ID
+
 # 12. Storm Damage (NWS alerts) — 06:19 AM UTC / 02:19 AM EDT / 11:49 AM IST
 19 6 * * 1-5 $PROJECT/scripts/cron/run.sh src.scrappers.storm.storm_engine --county-id $COUNTY_ID
 
@@ -142,6 +147,14 @@ COUNTY_ID=hillsborough
 # Unmatched record rematch — Sunday 03:30 AM UTC
 30 3 * * 0 $PROJECT/scripts/cron/run.sh src.tasks.rematch_unmatched
 
+# ── DBPR CONTRACTOR REGISTRY ─────────────────────────────────────────────────
+# Weekly file sync — Sunday 02:00 AM UTC (before enrichment jobs start).
+# Downloads certified + registered files, deduplicates by license_number,
+# filters to Hillsborough ZIPs, upserts dbpr_contacts, purges stale registered
+# rows (revoked/upgraded licenses), deletes downloaded file after load.
+0 2 * * 0 $PROJECT/scripts/cron/run.sh src.scrappers.dbpr.dbpr_engine --source certified --county $COUNTY_ID
+15 2 * * 0 $PROJECT/scripts/cron/run.sh src.scrappers.dbpr.dbpr_engine --source registered --county $COUNTY_ID
+
 # ── STAGE 5: BUNDLES + AUTOPILOT + ANNUAL ───────────────────────────────────
 # Bundle dispatcher — every hour, contextually offers Weekend / Storm /
 # ZIP Booster / Monthly Reload bundles to wallet subscribers (with A/B pricing)
@@ -215,5 +228,10 @@ COUNTY_ID=hillsborough
 
 # Stripe recovery sequence (Day 1 + Day 3) — daily 16:00 UTC, after proactive_save 15:00.
 0 16 * * * $PROJECT/scripts/cron/run.sh src.tasks.stripe_recovery_sweep
+
+# Accelerated Wallet Push sweep (fa016) — every 5 minutes. Safety net for
+# the inline detector in wallet_engine.debit / stripe_webhooks. Gated by
+# ACCELERATED_WALLET_PUSH_ENABLED.
+*/5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.accelerated_wallet_push_sweep
 
 # === END FORCED-ACTION-PLATFORM ===

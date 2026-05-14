@@ -172,3 +172,131 @@ def send_alert(
         logger.warning("Alert could not be sent (no recipient or SMTP). Subject: %s", subject)
 
     return sent
+
+
+def send_welcome_email(subscriber) -> None:
+    """
+    Send the dashboard-link welcome email for any new subscriber (free or paid).
+
+    `subscriber` duck-typed: needs .email, .name, .tier, .vertical,
+    .founding_member, .event_feed_uuid, .id.
+    Non-blocking — caller must wrap in try/except if needed.
+    """
+    if not subscriber.email:
+        return
+
+    _settings = get_settings()
+
+    name = subscriber.name or "there"
+    tier = (subscriber.tier or "free").title()
+    vertical = (subscriber.vertical or "").replace("_", " ").title()
+    founding = subscriber.founding_member
+
+    feed_url = (
+        f"{_settings.app_base_url}/dashboard/{subscriber.event_feed_uuid}"
+        if subscriber.event_feed_uuid
+        else _settings.app_base_url
+    )
+
+    subject = (
+        "Founding member confirmed — your rate is locked forever"
+        if founding
+        else "You're in — your Forced Action feed is ready"
+    )
+
+    founding_line = (
+        "\nAs a founding member your rate is locked for as long as you stay subscribed.\n"
+        if founding else ""
+    )
+    body_text = (
+        f"Hi {name},\n\n"
+        f"Welcome to Forced Action.\n"
+        f"{founding_line}\n"
+        f"Plan: {tier} — {vertical}\n\n"
+        f"Your private Event Feed is live. Bookmark this link — it's yours alone:\n"
+        f"{feed_url}\n\n"
+        f"New distressed property leads matching your territory and vertical will appear "
+        f"here automatically as our scrapers run each day.\n\n"
+        f"Questions? Reply to this email or reach us at support@forcedaction.io\n\n"
+        f"— Forced Action Team"
+    )
+
+    founding_badge = (
+        '<p style="margin:0 0 16px;padding:10px 16px;background:#451a03;'
+        'border:1px solid #92400e;border-radius:8px;color:#fbbf24;font-size:14px;">'
+        "⭐ Founding Member — your rate is locked for life."
+        "</p>"
+        if founding else ""
+    )
+    body_html = f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/></head>
+<body style="margin:0;padding:0;background:#0f172a;font-family:Inter,Arial,sans-serif;color:#e2e8f0;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f172a;padding:40px 0;">
+    <tr><td align="center">
+      <table width="560" cellpadding="0" cellspacing="0"
+             style="background:#1e293b;border:1px solid rgba(255,255,255,0.08);border-radius:16px;overflow:hidden;max-width:560px;width:100%;">
+        <tr>
+          <td style="padding:32px 40px 24px;border-bottom:1px solid rgba(255,255,255,0.08);">
+            <p style="margin:0;font-size:22px;font-weight:800;color:#ffffff;">
+              Forced <span style="color:#fbbf24;">Action</span>
+            </p>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:32px 40px;">
+            <h1 style="margin:0 0 8px;font-size:26px;font-weight:800;color:#ffffff;">
+              You&rsquo;re in, {name}.
+            </h1>
+            <p style="margin:0 0 24px;color:#94a3b8;font-size:15px;">
+              Your Event Feed is live and your territory is reserved.
+            </p>
+            {founding_badge}
+            <p style="margin:0 0 24px;">
+              <span style="display:inline-block;background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.3);
+                           color:#fbbf24;font-size:13px;font-weight:700;padding:5px 14px;border-radius:999px;">
+                {tier} &middot; {vertical}
+              </span>
+            </p>
+            <p style="margin:0 0 12px;font-size:14px;color:#94a3b8;">
+              Your private feed link — bookmark it:
+            </p>
+            <table cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
+              <tr>
+                <td style="background:#fbbf24;border-radius:8px;">
+                  <a href="{feed_url}"
+                     style="display:inline-block;padding:14px 28px;color:#0f172a;font-size:15px;
+                            font-weight:700;text-decoration:none;">
+                    Open My Event Feed &rarr;
+                  </a>
+                </td>
+              </tr>
+            </table>
+            <p style="margin:0;font-size:13px;color:#64748b;">
+              Questions? Reply to this email or reach us at
+              <a href="mailto:support@forcedaction.io" style="color:#fbbf24;text-decoration:none;">
+                support@forcedaction.io
+              </a>
+            </p>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.08);
+                     font-size:12px;color:#475569;text-align:center;">
+            Forced Action &mdash; Hillsborough County Property Intelligence<br/>
+            <a href="{_settings.app_base_url}" style="color:#475569;">forcedaction.io</a>
+          </td>
+        </tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>"""
+
+    send_email(
+        to=subscriber.email,
+        subject=subject,
+        body_text=body_text,
+        body_html=body_html,
+    )
+    logger.info("Welcome email sent → %s (subscriber=%s)", subscriber.email, subscriber.id)

@@ -114,16 +114,30 @@ def handle_webhook(raw_body: bytes, sig_header: str, db: Session) -> tuple[bool,
             )
             return True, "Stale event skipped"
 
-    # ── Idempotency guard ─────────────────────────────────────────────────────
-    # Insert the event_id before processing. If the unique constraint fires,
-    # this event was already handled — return immediately without side effects.
+    # ── Idempotency guard (fa016 followup #21) ───────────────────────────────
+    # Look up the dedupe row first; if present, this event has already been
+    # handled and we return without re-running.
+    #
+    # Crucially the dedupe row is INSERTED AFTER the handler succeeds, not
+    # before. The old behaviour inserted at the start: if the handler then
+    # crashed, the dedupe row stayed planted (committed in a separate
+    # session flush) and Stripe's retries were silently swallowed. With
+    # post-commit insertion a crashed handler leaves no trace and the retry
+    # actually re-runs.
+    #
+    # Multi-listener race note: when two backends share a DB and race the
+    # same event, both can pass this check, both run the handler, one wins
+    # the dedupe insert (unique constraint), the other catches the
+    # IntegrityError and logs it. Handler writes are idempotent at the row
+    # level (PremiumPurchase.stripe_payment_intent_id unique, WalletBalance
+    # uniq on subscriber_id, WalletPushOffer.stripe_subscription_id unique,
+    # etc.) so duplicate work is harmless.
     from src.services.webhook_log import log_webhook_event
 
-    try:
-        db.add(StripeWebhookEvent(event_id=event_id, event_type=event_type))
-        db.flush()
-    except Exception:
-        db.rollback()
+    existing_dedupe = db.execute(
+        select(StripeWebhookEvent).where(StripeWebhookEvent.event_id == event_id)
+    ).scalar_one_or_none()
+    if existing_dedupe is not None:
         logger.info("Stripe event %s already processed — skipping", event_id)
         log_webhook_event(
             source="stripe", event_type=event_type, source_event_id=event_id,
@@ -145,6 +159,7 @@ def handle_webhook(raw_body: bytes, sig_header: str, db: Session) -> tuple[bool,
         "customer.subscription.updated": _on_subscription_updated,
         "customer.subscription.deleted": _on_subscription_deleted,
         "payment_intent.succeeded":      _on_payment_intent_succeeded,
+        "payment_method.attached":       _on_payment_method_attached,
         "charge.refunded":                _on_charge_refunded,
         "charge.dispute.created":         _on_dispute_created,
         "charge.dispute.funds_withdrawn": _on_dispute_funds_withdrawn,
@@ -157,17 +172,29 @@ def handle_webhook(raw_body: bytes, sig_header: str, db: Session) -> tuple[bool,
 
     try:
         handler(data, db)
-        db.commit()
+        # Plant the dedupe row in the SAME transaction as the handler writes,
+        # so they commit together. If another listener already committed for
+        # this event_id, the unique constraint fires and we treat it as a
+        # successful idempotent retry (the handler's writes were also
+        # idempotent at the row level).
+        try:
+            db.add(StripeWebhookEvent(event_id=event_id, event_type=event_type))
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            logger.info(
+                "Stripe event %s dedupe insert lost the race — handler still ran successfully",
+                event_id,
+            )
+            return True, "OK (lost dedupe race)"
         return True, "OK"
     except (OperationalError, SQLAlchemyError):
         db.rollback()
-        # Re-raise DB errors — let the caller return 503 so Stripe retries
         logger.error("Database error handling %s — will retry", event_type, exc_info=True)
         raise
     except Exception as exc:
         db.rollback()
         logger.error("Error handling %s: %s", event_type, exc, exc_info=True)
-        # Return 200 so Stripe doesn't retry for application-level errors
         return True, f"Handler error (logged): {exc}"
 
 
@@ -197,6 +224,9 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
     _raw_email             = session.get("customer_details", {}).get("email") or ""
     customer_email         = _raw_email.lower().strip() or None
     customer_name          = session.get("customer_details", {}).get("name")
+    # Phone is collected by Stripe Checkout when phone_number_collection.enabled=True
+    # (see stripe_service.create_subscription_checkout). E.164 format already.
+    customer_phone         = (session.get("customer_details", {}) or {}).get("phone") or None
 
     if not all([tier, vertical, county_id, stripe_customer_id]):
         logger.error(
@@ -345,6 +375,7 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
             event_feed_uuid=str(uuid.uuid4()),
             email=customer_email,
             name=customer_name,
+            phone=customer_phone,
             ghl_stage=5,
         )
         db.add(subscriber)
@@ -356,12 +387,112 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
         subscriber.tier    = tier
         subscriber.status  = "active"
         subscriber.ghl_stage = 5
+        # Backfill phone if Stripe collected one and we don't have it yet.
+        if customer_phone and not subscriber.phone:
+            subscriber.phone = customer_phone
         if is_founding and not subscriber.founding_member:
             subscriber.founding_member    = True
             subscriber.founding_price_id  = founding_price_id
             subscriber.rate_locked_at     = now
 
     db.flush()  # get subscriber.id before ZIP territory inserts
+
+    # ── Race-free saved-card flag (fa016 followup #20) ───────────────────────
+    # We're in the same transaction that just committed the Subscriber row, so
+    # there's no race against payment_method.attached / payment_intent.succeeded
+    # webhooks running in parallel. Read default_payment_method from the
+    # session's payment_intent (synchronous, in-payload) — fall back to a
+    # Customer.retrieve only if the inline path is missing.
+    if not subscriber.has_saved_card:
+        pm_id = None
+        # 1) Try the session's payment_intent block (present for subscription
+        #    + one-time modes when expand was set; sometimes a bare id).
+        pi_block = session.get("payment_intent") or {}
+        if isinstance(pi_block, dict):
+            pm_id = pi_block.get("payment_method")
+        # 2) Try the session's subscription_details (Basil API shape).
+        if not pm_id:
+            sd = (session.get("parent") or {}).get("subscription_details") or {}
+            if isinstance(sd, dict):
+                pm_id = sd.get("default_payment_method")
+        # 3) Fall back to retrieving the customer once.
+        if not pm_id and stripe_customer_id:
+            try:
+                cust = stripe.Customer.retrieve(stripe_customer_id)
+                pm_id = (cust.get("invoice_settings") or {}).get("default_payment_method")
+            except Exception as exc:
+                logger.warning(
+                    "checkout: customer retrieve failed for %s: %s",
+                    stripe_customer_id, exc,
+                )
+        # 4) Last resort: list attached PMs and take the most recent card.
+        if not pm_id and stripe_customer_id:
+            try:
+                pms = stripe.PaymentMethod.list(customer=stripe_customer_id, type="card", limit=1)
+                if pms.get("data"):
+                    pm_id = pms["data"][0]["id"]
+            except Exception as exc:
+                logger.warning(
+                    "checkout: PM list failed for customer=%s: %s",
+                    stripe_customer_id, exc,
+                )
+
+        if pm_id:
+            subscriber.has_saved_card = True
+            subscriber.stripe_payment_method_id = pm_id
+            db.flush()
+            logger.info(
+                "checkout: saved-card flag set inline — subscriber=%s pm=%s",
+                subscriber.id, pm_id,
+            )
+
+            # If they already had paid activity, the accelerated wallet push
+            # detector becomes eligible the moment has_saved_card flips. Fire
+            # it now — race-free since we're in the same transaction.
+            try:
+                from src.services import wallet_engine
+                eligible = wallet_engine.accelerated_push_eligible(subscriber.id, db)
+                if eligible:
+                    from src.agents.supervisor import dispatch_event
+                    dispatch_event({
+                        "event_type": "accelerated_wallet_push_eligible",
+                        "subscriber_id": subscriber.id,
+                        "payload": eligible,
+                    })
+            except Exception as exc:
+                logger.warning(
+                    "accelerated_wallet_push from _on_checkout_completed failed sub=%s: %s",
+                    subscriber.id, exc,
+                )
+
+    # ── TCPA opt-in record ─────────────────────────────────────────────────
+    # Stripe Checkout's phone collection field is presented next to the
+    # subscription-purchase consent on the same form. Treat completion as
+    # an opt-in to operational SMS (BALANCE / WALLET / etc) and the
+    # accelerated-wallet-push offer. Only insert if we have a phone AND
+    # no opt-in row exists yet for this subscriber.
+    if customer_phone and subscriber.id:
+        try:
+            from src.core.models import SmsOptIn as _SmsOptIn
+            existing_opt = db.execute(
+                select(_SmsOptIn).where(_SmsOptIn.subscriber_id == subscriber.id)
+            ).scalar_one_or_none()
+            if existing_opt is None:
+                db.add(_SmsOptIn(
+                    phone=customer_phone,
+                    subscriber_id=subscriber.id,
+                    source="widget",
+                    opt_in_message="Stripe Checkout phone collection",
+                    opted_in_at=now,
+                ))
+                db.flush()
+                logger.info(
+                    "SmsOptIn created from Stripe Checkout: subscriber=%s phone=%s",
+                    subscriber.id, customer_phone,
+                )
+        except Exception as exc:
+            # Never block checkout flow on opt-in row insert failures
+            logger.warning("SmsOptIn insert failed for subscriber=%s: %s", subscriber.id, exc)
 
     if not subscriber.id:
         logger.warning(
@@ -420,7 +551,8 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
     # Skipped when we merged onto an existing row — subscriber is already onboarded.
     if is_new_subscriber:
         if subscriber.email:
-            _send_welcome_email(subscriber)
+            from src.services.email import send_welcome_email
+            send_welcome_email(subscriber)
 
         if subscriber.email and zip_codes:
             try:
@@ -475,168 +607,6 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# Welcome email helper
-# ---------------------------------------------------------------------------
-
-def _send_welcome_email(subscriber: "Subscriber") -> None:
-    """Send the post-checkout welcome email containing the Event Feed UUID link."""
-    from src.services.email import send_email
-    from config.settings import get_settings
-
-    _settings = get_settings()
-
-    name = subscriber.name or "there"
-    tier = (subscriber.tier or "starter").title()
-    vertical = (subscriber.vertical or "").replace("_", " ").title()
-    founding = subscriber.founding_member
-
-    feed_url = (
-        f"{_settings.app_base_url}/dashboard/{subscriber.event_feed_uuid}"
-        if subscriber.event_feed_uuid
-        else _settings.app_base_url
-    )
-
-    subject = (
-        "You're in — your Forced Action feed is ready"
-        if not founding
-        else "Founding member confirmed — your rate is locked forever"
-    )
-
-    # ── Plain-text body ────────────────────────────────────────────────────
-    founding_line = (
-        "\nAs a founding member your rate is locked for as long as you stay subscribed.\n"
-        if founding else ""
-    )
-    body_text = (
-        f"Hi {name},\n\n"
-        f"Welcome to Forced Action.\n"
-        f"{founding_line}\n"
-        f"Plan: {tier} — {vertical}\n\n"
-        f"Your private Event Feed is live. Bookmark this link — it's yours alone:\n"
-        f"{feed_url}\n\n"
-        f"New distressed property leads matching your territory and vertical will appear "
-        f"here automatically as our scrapers run each day.\n\n"
-        f"Questions? Reply to this email or reach us at support@forcedaction.io\n\n"
-        f"— Forced Action Team"
-    )
-
-    # ── HTML body ──────────────────────────────────────────────────────────
-    founding_badge = (
-        '<p style="margin:0 0 16px;padding:10px 16px;background:#451a03;'
-        'border:1px solid #92400e;border-radius:8px;color:#fbbf24;font-size:14px;">'
-        "⭐ Founding Member — your rate is locked for life."
-        "</p>"
-        if founding else ""
-    )
-    body_html = f"""<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/></head>
-<body style="margin:0;padding:0;background:#0f172a;font-family:Inter,Arial,sans-serif;color:#e2e8f0;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f172a;padding:40px 0;">
-    <tr><td align="center">
-      <table width="560" cellpadding="0" cellspacing="0"
-             style="background:#1e293b;border:1px solid rgba(255,255,255,0.08);border-radius:16px;overflow:hidden;max-width:560px;width:100%;">
-
-        <!-- Header -->
-        <tr>
-          <td style="padding:32px 40px 24px;border-bottom:1px solid rgba(255,255,255,0.08);">
-            <p style="margin:0;font-size:22px;font-weight:800;color:#ffffff;">
-              Forced <span style="color:#fbbf24;">Action</span>
-            </p>
-          </td>
-        </tr>
-
-        <!-- Body -->
-        <tr>
-          <td style="padding:32px 40px;">
-            <h1 style="margin:0 0 8px;font-size:26px;font-weight:800;color:#ffffff;">
-              You&rsquo;re in, {name}.
-            </h1>
-            <p style="margin:0 0 24px;color:#94a3b8;font-size:15px;">
-              Your Event Feed is live and your territory is reserved.
-            </p>
-
-            {founding_badge}
-
-            <!-- Plan pill -->
-            <p style="margin:0 0 24px;">
-              <span style="display:inline-block;background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.3);
-                           color:#fbbf24;font-size:13px;font-weight:700;padding:5px 14px;border-radius:999px;">
-                {tier} &middot; {vertical}
-              </span>
-            </p>
-
-            <!-- CTA -->
-            <p style="margin:0 0 12px;font-size:14px;color:#94a3b8;">
-              Your private feed link — bookmark it:
-            </p>
-            <table cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
-              <tr>
-                <td style="background:#fbbf24;border-radius:8px;">
-                  <a href="{feed_url}"
-                     style="display:inline-block;padding:14px 28px;color:#0f172a;font-size:15px;
-                            font-weight:700;text-decoration:none;">
-                    Open My Event Feed &rarr;
-                  </a>
-                </td>
-              </tr>
-            </table>
-
-            <!-- What to expect -->
-            <table width="100%" cellpadding="0" cellspacing="0"
-                   style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);
-                          border-radius:12px;padding:20px 24px;margin-bottom:24px;">
-              <tr>
-                <td>
-                  <p style="margin:0 0 12px;font-size:14px;font-weight:700;color:#ffffff;">What happens next</p>
-                  <p style="margin:0 0 8px;font-size:13px;color:#94a3b8;">
-                    ✓ &nbsp;Scrapers run daily — new distressed property leads appear automatically.
-                  </p>
-                  <p style="margin:0 0 8px;font-size:13px;color:#94a3b8;">
-                    ✓ &nbsp;Leads are scored across your selected vertical and ranked by urgency.
-                  </p>
-                  <p style="margin:0;font-size:13px;color:#94a3b8;">
-                    ✓ &nbsp;Your territory ZIPs are exclusively yours — no other subscriber sees the same leads.
-                  </p>
-                </td>
-              </tr>
-            </table>
-
-            <p style="margin:0;font-size:13px;color:#64748b;">
-              Questions? Reply to this email or reach us at
-              <a href="mailto:support@forcedaction.io" style="color:#fbbf24;text-decoration:none;">
-                support@forcedaction.io
-              </a>
-            </p>
-          </td>
-        </tr>
-
-        <!-- Footer -->
-        <tr>
-          <td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.08);
-                     font-size:12px;color:#475569;text-align:center;">
-            Forced Action &mdash; Hillsborough County Property Intelligence<br/>
-            <a href="{_settings.app_base_url}" style="color:#475569;">forcedaction.io</a>
-          </td>
-        </tr>
-
-      </table>
-    </td></tr>
-  </table>
-</body>
-</html>"""
-
-    send_email(
-        to=subscriber.email,
-        subject=subject,
-        body_text=body_text,
-        body_html=body_html,
-    )
-
-    logger.info("Welcome email sent → %s (subscriber=%s)", subscriber.email, subscriber.id)
-
-
 def _send_first_leads_email(subscriber, zip_codes: list, db) -> None:
     """
     Immediately after checkout, deliver the top 10 existing leads in the
@@ -669,6 +639,13 @@ def _on_payment_succeeded(invoice: dict, db: Session) -> None:
     stripe_customer_id = invoice.get("customer")
     if not stripe_customer_id:
         logger.warning("invoice.payment_succeeded: no customer ID in payload")
+        return
+
+    # Accelerated Wallet Push (fa016): wallet subscription first invoice cleared.
+    # Branch out BEFORE the regular billing_date update so wallet activation
+    # doesn't accidentally overwrite a non-wallet subscriber's billing_date.
+    if _is_wallet_subscription_invoice(invoice):
+        _on_wallet_subscription_invoice(invoice, db)
         return
 
     # Skip payment receipt on initial checkout — checkout.session.completed already
@@ -856,6 +833,12 @@ def _on_payment_failed(invoice: dict, db: Session) -> None:
     stripe_customer_id = invoice.get("customer")
     if not stripe_customer_id:
         logger.warning("invoice.payment_failed: no customer ID in payload")
+        return
+
+    # fa016: wallet subscription first-invoice failures don't enter the regular
+    # recovery sequence — mark the offer 'failed' so the funnel reflects it.
+    if _is_wallet_subscription_invoice(invoice):
+        _on_wallet_subscription_invoice_failed(invoice, db)
         return
 
     subscriber = db.execute(
@@ -1508,6 +1491,22 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
     except Exception as exc:
         logger.error("lead_unlock: email send failed: %s", exc, exc_info=True)
 
+    # Welcome email — deferred from /api/free-signup with intent='unlock'.
+    # Sent only on the first unlock so repeat unlocks don't spam the inbox.
+    try:
+        first_unlock = db.execute(
+            select(func.count()).select_from(SentLead).where(
+                SentLead.subscriber_id == subscriber.id,
+                SentLead.source == "lead_unlock_payment",
+            )
+        ).scalar() or 0
+        if first_unlock <= 1:
+            from src.services.email import send_welcome_email
+            send_welcome_email(subscriber)
+    except Exception as exc:
+        logger.warning("lead_unlock: welcome email failed sub=%s: %s",
+                       subscriber.id, exc)
+
     logger.info(
         "lead_unlock complete: subscriber=%s property=%s pi=%s",
         subscriber.id, property_id, _attr(payment_intent, "id"),
@@ -1622,8 +1621,142 @@ def _on_card_saved(payment_intent, db: Session) -> None:
 
     from src.core.redis_client import rset
     rset(f"saved_card_window:{subscriber.id}", "1", ttl_seconds=600)
+    db.flush()
 
     logger.info("Default card saved for subscriber=%s pm=%s", subscriber.id, pm_id)
+
+    # +2 bonus credits on first save-card event. Creates WalletBalance so the
+    # dashboard wallet card becomes visible (Stage 5).
+    try:
+        from src.services import wallet_engine
+        granted = wallet_engine.check_saved_card_bonus(subscriber.id, db)
+        if granted:
+            logger.info("+2 bonus credits granted to subscriber=%s (saved_card)", subscriber.id)
+    except Exception as exc:
+        logger.warning("saved_card_bonus grant failed sub=%s: %s", subscriber.id, exc)
+
+    # fa017: business event audit
+    try:
+        from src.services.business_events import log_business_event
+        log_business_event(
+            "CARD_SAVED", subscriber_id=subscriber.id,
+            payload={"trigger": "_on_card_saved", "pm": pm_id}, db=db,
+        )
+    except Exception:
+        pass
+
+    # fa016 Accelerated Wallet Push — if the subscriber already had a debit
+    # before they saved the card, schedule the offer immediately.
+    try:
+        db.flush()  # ensure has_saved_card is visible to the detector query
+        from src.services import wallet_engine
+        eligible = wallet_engine.accelerated_push_eligible(subscriber.id, db)
+        if eligible:
+            try:
+                wallet_engine.ensure_offer_row(subscriber.id, eligible, db)
+            except Exception as exc_offer:
+                logger.warning("ensure_offer_row failed sub=%s: %s", subscriber.id, exc_offer)
+            try:
+                from src.services.business_events import log_business_event
+                log_business_event(
+                    "ACCELERATED_WALLET_ELIGIBLE", subscriber_id=subscriber.id,
+                    payload={"trigger": "_on_card_saved"}, db=db,
+                )
+            except Exception:
+                pass
+            from src.agents.supervisor import dispatch_event
+            dispatch_event({
+                "event_type": "accelerated_wallet_push_eligible",
+                "subscriber_id": subscriber.id,
+                "payload": eligible,
+            })
+    except Exception as exc:
+        logger.warning("accelerated_wallet_push from _on_card_saved failed sub=%s: %s",
+                       subscriber.id, exc)
+
+
+def _on_payment_method_attached(pm: dict, db: Session) -> None:
+    """fa016: belt-and-suspenders save-card flag setter.
+
+    `payment_intent.succeeded` races with `checkout.session.completed` for paid
+    signups — `_on_card_saved` often runs before the Subscriber row has been
+    committed, silently exits, and `has_saved_card` stays false forever.
+    `payment_method.attached` fires later in the sequence, by which point the
+    Subscriber row exists, so it's a reliable secondary trigger.
+
+    Also fires the accelerated_wallet_push detector so saved-card users with
+    prior paid activity get the offer without needing another payment event.
+    """
+    customer_id = pm.get("customer")
+    pm_id = pm.get("id")
+    if not (customer_id and pm_id):
+        return
+
+    subscriber = db.execute(
+        select(Subscriber).where(Subscriber.stripe_customer_id == customer_id)
+    ).scalar_one_or_none()
+    if subscriber is None:
+        logger.info("payment_method.attached: no subscriber yet for customer=%s pm=%s",
+                    customer_id, pm_id)
+        return
+    if subscriber.has_saved_card and subscriber.stripe_payment_method_id == pm_id:
+        return  # already recorded, nothing to do
+
+    subscriber.has_saved_card = True
+    subscriber.stripe_payment_method_id = pm_id
+
+    from src.core.redis_client import redis_available, rset
+    if redis_available():
+        rset(f"saved_card_window:{subscriber.id}", "1", ttl_seconds=600)
+
+    db.flush()
+    logger.info("payment_method.attached: subscriber=%s pm=%s saved", subscriber.id, pm_id)
+
+    # +2 bonus credits on first save-card event.
+    try:
+        from src.services import wallet_engine
+        granted = wallet_engine.check_saved_card_bonus(subscriber.id, db)
+        if granted:
+            logger.info("+2 bonus credits granted to subscriber=%s (pm.attached)", subscriber.id)
+    except Exception as exc:
+        logger.warning("saved_card_bonus grant failed sub=%s: %s", subscriber.id, exc)
+
+    # fa017: business event audit
+    try:
+        from src.services.business_events import log_business_event
+        log_business_event(
+            "CARD_SAVED", subscriber_id=subscriber.id,
+            payload={"trigger": "_on_payment_method_attached", "pm": pm_id}, db=db,
+        )
+    except Exception:
+        pass
+
+    # fa016 Accelerated Wallet Push — if they already have paid intent, fire now.
+    try:
+        from src.services import wallet_engine
+        eligible = wallet_engine.accelerated_push_eligible(subscriber.id, db)
+        if eligible:
+            try:
+                wallet_engine.ensure_offer_row(subscriber.id, eligible, db)
+            except Exception as exc_offer:
+                logger.warning("ensure_offer_row failed sub=%s: %s", subscriber.id, exc_offer)
+            try:
+                from src.services.business_events import log_business_event
+                log_business_event(
+                    "ACCELERATED_WALLET_ELIGIBLE", subscriber_id=subscriber.id,
+                    payload={"trigger": "_on_payment_method_attached"}, db=db,
+                )
+            except Exception:
+                pass
+            from src.agents.supervisor import dispatch_event
+            dispatch_event({
+                "event_type": "accelerated_wallet_push_eligible",
+                "subscriber_id": subscriber.id,
+                "payload": eligible,
+            })
+    except Exception as exc:
+        logger.warning("accelerated_wallet_push from pm.attached failed sub=%s: %s",
+                       subscriber.id, exc)
 
 
 def _on_bundle_payment(payment_intent, db: Session) -> None:
@@ -1716,6 +1849,27 @@ def _on_premium_payment(payment_intent, db: Session) -> None:
         logger.error("[Premium] non-int subscriber_id=%r", subscriber_id_str)
         return
 
+    # fa017 orphan-safety: validate the subscriber exists BEFORE handing off
+    # to record_card_purchase, which would otherwise raise IntegrityError on
+    # the FK constraint and abort the transaction with no audit trail.
+    if db.get(Subscriber, subscriber_id) is None:
+        logger.error(
+            "[Premium] orphan PI %s — subscriber_id=%d not found; logging audit row",
+            pi_id, subscriber_id,
+        )
+        try:
+            from src.services.webhook_log import log_webhook_event
+            log_webhook_event(
+                source="stripe", event_type="payment_intent.succeeded",
+                source_event_id=pi_id, status="failed",
+                status_detail="orphan_subscriber",
+                payload={"subscriber_id": subscriber_id, "sku": sku},
+                payload_kind="generic", db=db,
+            )
+        except Exception:
+            pass
+        return
+
     property_id_raw = _attr(meta, "property_id")
     property_id: Optional[int] = None
     if property_id_raw:
@@ -1748,6 +1902,49 @@ def _on_premium_payment(payment_intent, db: Session) -> None:
         "[Premium] Purchase recorded: id=%d sku=%s subscriber=%d pi=%s",
         purchase.id, sku, subscriber_id, pi_id,
     )
+
+    # fa017: business event audit trail
+    try:
+        from src.services.business_events import log_business_event
+        log_business_event(
+            "PREMIUM_PURCHASE_COMPLETED", subscriber_id=subscriber_id,
+            property_id=property_id,
+            payload={"sku": sku, "pi": pi_id, "amount_cents": amount_cents},
+            db=db,
+        )
+        log_business_event(
+            "PAYMENT_SUCCEEDED", subscriber_id=subscriber_id,
+            property_id=property_id,
+            payload={"product": "premium", "sku": sku, "pi": pi_id}, db=db,
+        )
+    except Exception:
+        pass
+
+    # fa016 Accelerated Wallet Push — cash premium purchase is "first paid
+    # intent" for a saved-card user. Wrap in try/except so failure never
+    # disturbs the webhook ack.
+    try:
+        from src.services import wallet_engine
+        eligible = wallet_engine.accelerated_push_eligible(subscriber_id, db)
+        if eligible:
+            try:
+                from src.services.business_events import log_business_event
+                log_business_event(
+                    "ACCELERATED_WALLET_ELIGIBLE", subscriber_id=subscriber_id,
+                    payload={"reason": eligible.get("reason"),
+                             "tier": eligible.get("tier")}, db=db,
+                )
+            except Exception:
+                pass
+            from src.agents.supervisor import dispatch_event
+            dispatch_event({
+                "event_type": "accelerated_wallet_push_eligible",
+                "subscriber_id": subscriber_id,
+                "payload": eligible,
+            })
+    except Exception as exc:
+        logger.warning("accelerated_wallet_push detector failed sub=%s: %s",
+                       subscriber_id, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1809,6 +2006,214 @@ def _on_wallet_topup_payment(payment_intent, db: Session) -> None:
         "[WalletTopup] subscriber=%d credited=%d cents=%s pi=%s",
         subscriber_id, credits, amount_cents_str, pi_id,
     )
+
+
+# ---------------------------------------------------------------------------
+# 6f. invoice.payment_succeeded — wallet subscription activation (fa016)
+# ---------------------------------------------------------------------------
+
+def _invoice_subscription_details(invoice: dict) -> dict:
+    """Locate the subscription_details block for an invoice across Stripe API
+    versions.
+
+    - Pre-Basil: `invoice.subscription_details = {subscription, metadata}`
+    - Basil (2025-03-31+): `invoice.parent.subscription_details = {...}`
+    Returns {} when the invoice is not subscription-derived.
+    """
+    sd = invoice.get("subscription_details")
+    if sd:
+        return sd
+    parent = invoice.get("parent") or {}
+    if isinstance(parent, dict) and parent.get("type") == "subscription_details":
+        return parent.get("subscription_details") or {}
+    return {}
+
+
+def _invoice_subscription_id(invoice: dict) -> Optional[str]:
+    """Locate the parent subscription id across Stripe API versions."""
+    sub_id = invoice.get("subscription")
+    if sub_id:
+        return sub_id
+    sd = _invoice_subscription_details(invoice)
+    return sd.get("subscription") if sd else None
+
+
+def _is_wallet_subscription_invoice(invoice: dict) -> bool:
+    """Return True when the invoice belongs to a wallet_subscription created by
+    accelerated_wallet_push (or in-app accept)."""
+    inv_meta = (invoice.get("metadata") or {})
+    if inv_meta.get("product") == "wallet_subscription":
+        return True
+    sub_meta = (_invoice_subscription_details(invoice).get("metadata") or {})
+    if sub_meta.get("product") == "wallet_subscription":
+        return True
+    sub_id = _invoice_subscription_id(invoice)
+    if not sub_id:
+        return False
+    try:
+        from config.settings import settings
+        import stripe as _stripe
+        key = settings.active_stripe_secret_key
+        if not key:
+            return False
+        _stripe.api_key = key.get_secret_value()
+        sub = _stripe.Subscription.retrieve(sub_id)
+        return (sub.get("metadata") or {}).get("product") == "wallet_subscription"
+    except Exception:
+        return False
+
+
+def _extract_wallet_sub_metadata(invoice: dict) -> dict:
+    """Pull subscriber_id / wallet_offer_id / tier / subscription_id from the
+    invoice metadata, parent.subscription_details.metadata, or (as a last
+    resort) the parent Subscription itself."""
+    out: dict = {}
+    for src in (invoice.get("metadata"), _invoice_subscription_details(invoice).get("metadata")):
+        if src:
+            out.update({k: v for k, v in src.items() if v is not None})
+    sub_id = _invoice_subscription_id(invoice)
+    if sub_id and "tier" not in out:
+        try:
+            from config.settings import settings
+            import stripe as _stripe
+            key = settings.active_stripe_secret_key
+            if key:
+                _stripe.api_key = key.get_secret_value()
+                sub = _stripe.Subscription.retrieve(sub_id)
+                out.update(sub.get("metadata") or {})
+        except Exception:
+            pass
+    if sub_id:
+        out["subscription_id"] = sub_id
+    return out
+
+
+def _on_wallet_subscription_invoice(invoice: dict, db: Session) -> None:
+    """Activate the wallet on the first successful invoice of a wallet
+    subscription. Idempotent — replay via either StripeWebhookEvent (handled
+    by dispatcher) or WalletPushOffer.status == 'activated' short-circuit."""
+    from src.core.models import Subscriber, WalletPushOffer
+    from src.services import wallet_engine
+
+    meta = _extract_wallet_sub_metadata(invoice)
+    subscriber_id_str = meta.get("subscriber_id")
+    offer_id_str = meta.get("wallet_offer_id")
+    tier = meta.get("tier") or "starter_wallet"
+    subscription_id = meta.get("subscription_id")
+    pi = (invoice.get("payment_intent") or invoice.get("id"))
+
+    if not subscriber_id_str:
+        logger.error("[WalletSub] invoice missing subscriber_id meta=%s", meta)
+        return
+    try:
+        subscriber_id = int(subscriber_id_str)
+    except (TypeError, ValueError):
+        logger.error("[WalletSub] non-int subscriber_id=%r", subscriber_id_str)
+        return
+
+    sub = db.get(Subscriber, subscriber_id)
+    if sub is None:
+        logger.error("[WalletSub] subscriber=%d not found", subscriber_id)
+        return
+
+    # Secondary idempotency on the funnel table
+    offer = None
+    if offer_id_str:
+        try:
+            offer = db.get(WalletPushOffer, int(offer_id_str))
+        except (TypeError, ValueError):
+            offer = None
+    if offer is None and subscription_id:
+        offer = db.execute(
+            select(WalletPushOffer)
+            .where(WalletPushOffer.stripe_subscription_id == subscription_id)
+        ).scalar_one_or_none()
+    if offer is not None and offer.status == "activated":
+        logger.info("[WalletSub] offer=%s already activated — skipping", offer.id)
+        return
+
+    # Enroll wallet (creates WalletBalance and credits the cycle credits)
+    wallet_engine.enroll(subscriber_id, tier, db=db)
+
+    if offer is not None:
+        offer.status = "activated"
+        offer.activated_at = datetime.now(timezone.utc)
+        if subscription_id:
+            offer.stripe_subscription_id = subscription_id
+        db.flush()
+    elif subscription_id:
+        logger.warning(
+            "[WalletSub] no WalletPushOffer matched subscription=%s — wallet activated regardless",
+            subscription_id,
+        )
+
+    # Transactional confirmation SMS (bypasses Cora — not marketing)
+    try:
+        from src.services.sms_compliance import send_sms as _send_sms
+        if sub.phone:
+            credits = wallet_engine.get_balance(subscriber_id, db)
+            _send_sms(
+                to=sub.phone,
+                body=f"Wallet active. {credits} credits loaded. Reply BALANCE any time.",
+                db=db,
+                subscriber_id=subscriber_id,
+                task_type="wallet_activated",
+                campaign="accelerated_wallet_push_activation",
+            )
+    except Exception as exc:
+        logger.warning("[WalletSub] confirmation SMS failed sub=%s: %s", subscriber_id, exc)
+
+    logger.info(
+        "[WalletSub] activated subscriber=%d offer=%s sub=%s tier=%s pi=%s",
+        subscriber_id, getattr(offer, "id", None), subscription_id, tier, pi,
+    )
+
+    try:
+        from src.services.business_events import log_business_event
+        log_business_event(
+            "WALLET_ACTIVATED", subscriber_id=subscriber_id,
+            payload={
+                "tier": tier,
+                "subscription_id": subscription_id,
+                "offer_id": getattr(offer, "id", None),
+            },
+            db=db,
+        )
+    except Exception:
+        pass
+
+
+def _on_wallet_subscription_invoice_failed(invoice: dict, db: Session) -> None:
+    """Mark a wallet_push_offers row as 'failed' when the first invoice fails.
+    Does not touch the subscriber's regular billing recovery flags."""
+    from src.core.models import WalletPushOffer
+
+    meta = _extract_wallet_sub_metadata(invoice)
+    subscription_id = meta.get("subscription_id")
+    offer_id_str = meta.get("wallet_offer_id")
+
+    offer = None
+    if offer_id_str:
+        try:
+            offer = db.get(WalletPushOffer, int(offer_id_str))
+        except (TypeError, ValueError):
+            offer = None
+    if offer is None and subscription_id:
+        offer = db.execute(
+            select(WalletPushOffer)
+            .where(WalletPushOffer.stripe_subscription_id == subscription_id)
+        ).scalar_one_or_none()
+
+    if offer is None:
+        logger.warning("[WalletSub] no offer matched failed invoice meta=%s", meta)
+        return
+
+    if offer.status not in ("offered", "accepted"):
+        return  # already terminal — do not regress
+
+    offer.status = "failed"
+    db.flush()
+    logger.info("[WalletSub] offer=%s marked failed sub=%s", offer.id, subscription_id)
 
 
 # ---------------------------------------------------------------------------

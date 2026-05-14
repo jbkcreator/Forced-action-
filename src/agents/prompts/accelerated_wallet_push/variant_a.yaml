@@ -1,0 +1,39 @@
+# Variant A — "missing-leads" framing.
+# Anchors on the cash-per-action cost the subscriber just paid versus
+# the wallet's per-credit cost. Best when missed_leads > 0.
+version: 1
+user: |
+  FRAMING = missing-leads (bulk-credit subscription pitched against
+  the cash-per-action cost the subscriber is paying right now).
+
+  This is a PAID monthly subscription pitch — not a free reward and
+  not part of the base platform subscription. The CTA "Reply WALLET"
+  authorizes a recurring $49/mo charge.
+
+  Live context:
+    - First name: {first_name}
+    - ZIP they're working: {zip_code}
+    - Lead unlocks they couldn't grab this week: {missed_leads}
+    - Monthly subscription price: {price_dollars_formatted}
+    - Credits per month if they subscribe: {credits_in_offer}
+    - CTA link: {cta_url}
+    - Tier name: {tier}
+
+  Pricing math to surface:
+    - 1 lead unlock by card = $7
+    - 1 credit from the {tier} subscription = 1 unlock at ~$2.45
+    - Difference = ~$4.55 saved per unlock when bundled.
+
+  Aim for a body like this (don't copy verbatim — produce a clean,
+  ≤160 char body in your own words that includes the price + the
+  ~$2.45 vs $7 comparison):
+
+    "{first_name}, those {missed_leads} unlocks in {zip_code} cost $7
+    each by card — the Starter Wallet bundles {credits_in_offer} at
+    ~$2.45 each for {price_dollars_formatted}/mo. Reply WALLET to
+    subscribe. {cta_url}"
+
+  Hard rules: include the price, never say "free / ready / waiting /
+  pre-loaded / claim", never use urgency.
+
+  Write the SMS body. No preamble, no quotes.

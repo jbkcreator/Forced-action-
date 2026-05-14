@@ -112,7 +112,15 @@ EXPANSION_GATES = {
 KILL_SWITCH = {
     "first_payment_rate":  {"green": 30, "yellow": (20, 30), "red": 20, "action": "simplify proof, cut friction"},
     "saved_card_rate":     {"green": 70, "yellow": (50, 70), "red": 50, "action": "default harder, bonus credits"},
-    "wallet_adoption":     {"green": 15, "yellow": (10, 15), "red": 10, "action": "trigger sooner, missing-leads frame"},
+    "wallet_adoption":     {
+        "green": 15, "yellow": (10, 15), "red": 10,
+        "action": "trigger sooner, missing-leads frame",
+        # fa016 Accelerated Wallet Push — Day-35 rollback floor.
+        # If accelerated_wallet_push_take_rate < floor_pct after floor_check_after_days,
+        # kill_switch_metric_ingest flips Redis kill_switch:accelerated_wallet_push=red.
+        "floor_pct": 12,
+        "floor_check_after_days": 35,
+    },
     "lock_conversion":     {"green": 5,  "yellow": (3, 5),   "red": 3,  "action": "live-data close, voice drop, urgency"},
     "retention_30d":       {"green": 70, "yellow": (55, 70), "red": 55, "action": "earlier saves, missed-opp summaries"},
     "sms_reply_rate":      {"green": 8,  "yellow": (5, 8),   "red": 5,  "action": "swap copy, change timing"},

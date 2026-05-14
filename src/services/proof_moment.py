@@ -165,6 +165,80 @@ def get_proof_leads(
     return result
 
 
+def get_blurred_stack(
+    subscriber_id: int,
+    vertical: str,
+    county_id: str,
+    db: Session,
+    limit: int = 5,
+) -> list[dict]:
+    """
+    Return up to `limit` blurred lead cards for the free-tier dashboard.
+
+    Top-scored qualified properties in the subscriber's county+vertical, excluding
+    any property the subscriber has already unlocked (SentLead row exists). Each
+    card carries score, city, ZIP, lead_tier, distress_types — but address is
+    blurred and no contact info is returned. Frontend renders the "Unlock for $4"
+    CTA per card.
+    """
+    try:
+        score_col = DistressScore.vertical_scores[vertical].as_float()
+    except (KeyError, TypeError):
+        score_col = DistressScore.final_cds_score
+
+    from config.settings import get_settings
+    from src.utils.lead_filters import has_contact_filter, phone_priority_order
+    contact_clause = has_contact_filter(get_settings())
+
+    already_unlocked = db.execute(
+        select(SentLead.property_id).where(SentLead.subscriber_id == subscriber_id)
+    ).scalars().all()
+    excluded_ids = set(already_unlocked)
+
+    where_clauses = [
+        Property.county_id == county_id,
+        DistressScore.qualified == True,  # noqa: E712
+    ]
+    if contact_clause is not None:
+        where_clauses.append(contact_clause)
+    if excluded_ids:
+        where_clauses.append(~Property.id.in_(excluded_ids))
+
+    rows = db.execute(
+        select(Property, DistressScore)
+        .join(DistressScore, DistressScore.property_id == Property.id)
+        .outerjoin(Owner, Owner.property_id == Property.id)
+        .where(and_(*where_clauses))
+        .order_by(*phone_priority_order(score_col))
+        .limit(limit)
+    ).all()
+
+    stack: list[dict] = []
+    for prop, score in rows:
+        v_score = score.vertical_scores.get(vertical) if score.vertical_scores else None
+        dt = score.distress_types
+        if isinstance(dt, dict):
+            distress = list(dt.keys())
+        elif isinstance(dt, list):
+            distress = list(dt)
+        else:
+            distress = []
+        stack.append({
+            "property_id": prop.id,
+            "address_masked": _blur_address(prop.address),
+            "city": prop.city,
+            "state": prop.state,
+            "zip": prop.zip,
+            "score": float(score.final_cds_score or 0),
+            "vertical_score": float(v_score) if v_score is not None else None,
+            "lead_tier": score.lead_tier,
+            "distress_types": distress,
+            "urgency_level": score.urgency_level,
+            "unlocked": False,
+        })
+    return stack
+
+
 def _blur_address(address: Optional[str]) -> str:
     """Partially obscure a street address: '1234 *** **' to hide street name."""
     if not address:

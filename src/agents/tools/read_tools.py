@@ -72,9 +72,12 @@ def get_subscriber_profile(
 			"founding_member": sub.founding_member,
 			"email": sub.email,
 			"name": sub.name,
+			"phone": getattr(sub, "phone", None),
 			"has_saved_card": sub.has_saved_card,
 			"auto_mode_enabled": sub.auto_mode_enabled,
 			"referral_code": sub.referral_code,
+			"wallet_opt_out": bool(getattr(sub, "wallet_opt_out", False)),
+			"missed_lead_count": int(getattr(sub, "missed_lead_count", 0) or 0),
 			"created_at": sub.created_at.isoformat() if sub.created_at else None,
 			"billing_date": sub.billing_date.isoformat() if sub.billing_date else None,
 		}

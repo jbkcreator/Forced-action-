@@ -242,8 +242,10 @@ def send_sms(
         )
         return False
 
-    # 3. TCPA quiet hours — no SMS before 8am or after 9pm recipient local time
-    if is_quiet_hours(to):
+    # 3. TCPA quiet hours — no SMS before 8am or after 9pm recipient local time.
+    # Gated behind sms_quiet_hours_enabled so QA + local sandbox runs aren't
+    # blocked overnight; default ON in production.
+    if settings.sms_quiet_hours_enabled and is_quiet_hours(to):
         logger.info("SMS suppressed (quiet hours): to=%s", to)
         add_to_dead_letter(to, "quiet_hours", {"body": body[:160]}, db)
         _log("suppressed", suppress_reason="quiet_hours")

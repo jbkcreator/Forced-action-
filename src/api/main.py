@@ -39,6 +39,11 @@ from src.services.stripe_webhooks import handle_webhook
 from src.services.stripe_service import get_price_id_for_checkout
 from config.settings import get_settings
 from config.scoring import VERTICAL_WEIGHTS
+from src.utils.logger import setup_logging
+
+# Load config/logging.yaml so every logger.info/warning/error across src/* is
+# visible in the uvicorn console (instead of just uvicorn's access logs).
+setup_logging()
 
 logger = logging.getLogger(__name__)
 
@@ -474,8 +479,10 @@ def create_checkout(payload: CheckoutRequest, db: Session = Depends(get_db)):
             detail={"error": "price_not_configured", "message": f"No price configured for tier '{payload.tier}'"},
         )
 
-    # Block duplicate subscriptions — check before creating Stripe session so the
-    # user is never charged twice.  Email is normalised by the request validator.
+    # Block duplicate PAID subscriptions — check before creating Stripe session
+    # so the user is never charged twice. Free-tier rows (created via
+    # /api/free-signup as part of the Phase 2B ladder) are allowed through;
+    # the checkout webhook upgrades the existing row in place.
     try:
         existing_sub = db.execute(
             select(Subscriber).where(
@@ -483,6 +490,7 @@ def create_checkout(payload: CheckoutRequest, db: Session = Depends(get_db)):
                 Subscriber.vertical == payload.vertical,
                 Subscriber.county_id == payload.county_id,
                 Subscriber.status.in_(["active", "grace"]),
+                Subscriber.tier != "free",
             )
         ).scalar_one_or_none()
     except OperationalError:
@@ -1086,6 +1094,74 @@ def _compute_save_offer_active(subscriber, db) -> bool:
     return compute_save_offer_active(subscriber, db)
 
 
+def _accelerated_wallet_offer_fields(subscriber, db) -> dict:
+    """Surface the latest open accelerated_wallet_push offer to the frontend.
+
+    Returns dict with:
+      accelerated_wallet_offer_active: bool
+      accelerated_wallet_offer_id:     int | None
+      accelerated_wallet_offer_tier:   str | None
+      accelerated_wallet_offer_credits: int | None
+      accelerated_wallet_offer_price_cents: int | None
+      missed_lead_count:               int
+      saved_card_last4:                str | None
+    """
+    from config.revenue_ladder import WALLET_TIERS
+    from src.core.models import WalletPushOffer
+
+    out = {
+        "accelerated_wallet_offer_active": False,
+        "accelerated_wallet_offer_id": None,
+        "accelerated_wallet_offer_tier": None,
+        "accelerated_wallet_offer_credits": None,
+        "accelerated_wallet_offer_price_cents": None,
+        "missed_lead_count": int(getattr(subscriber, "missed_lead_count", 0) or 0),
+        "saved_card_last4": None,
+    }
+
+    if getattr(subscriber, "wallet_opt_out", False):
+        return out
+
+    try:
+        offer = db.execute(
+            select(WalletPushOffer)
+            .where(
+                WalletPushOffer.subscriber_id == subscriber.id,
+                WalletPushOffer.status == "offered",
+            )
+            .order_by(WalletPushOffer.offered_at.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+    except Exception:
+        offer = None
+
+    if offer is not None:
+        tier_cfg = WALLET_TIERS.get(offer.tier) or WALLET_TIERS.get("starter_wallet")
+        out["accelerated_wallet_offer_active"] = True
+        out["accelerated_wallet_offer_id"] = offer.id
+        out["accelerated_wallet_offer_tier"] = offer.tier
+        if tier_cfg:
+            out["accelerated_wallet_offer_credits"] = tier_cfg.get("credits_per_cycle")
+            out["accelerated_wallet_offer_price_cents"] = tier_cfg.get("price_cents")
+
+    # Saved-card last4 lookup is best-effort via Stripe. Skip if Stripe is not
+    # configured — frontend just shows "your saved card" without last4.
+    pm_id = getattr(subscriber, "stripe_payment_method_id", None)
+    if pm_id:
+        try:
+            from config.settings import settings
+            import stripe as _stripe
+            key = settings.active_stripe_secret_key
+            if key:
+                _stripe.api_key = key.get_secret_value()
+                pm = _stripe.PaymentMethod.retrieve(pm_id)
+                out["saved_card_last4"] = (pm.get("card") or {}).get("last4")
+        except Exception:
+            pass
+
+    return out
+
+
 @app.get("/api/feed/{feed_uuid}")
 def event_feed(
     feed_uuid: str,
@@ -1141,6 +1217,7 @@ def event_feed(
                 "wallet_to_lock_eligible": False,
                 "wallet_credits_30d": None,
                 "flash_scarcity_windows": [],
+                **_accelerated_wallet_offer_fields(subscriber, db),
             },
             "total": 0,
             "page": page,
@@ -1187,6 +1264,115 @@ def event_feed(
             _flash_windows_nz = _get_flash_nz(db, subscriber.id)
         except Exception:
             _flash_windows_nz = []
+
+        # Free-tier unlocked leads (from $4 unlocks). Must appear in the feed
+        # even without a ZIP territory — that's the whole pay-per-lead promise.
+        _unlocked_leads: list = []
+        try:
+            with db.begin_nested():
+                unlocked_ids_no_zip = db.execute(
+                    select(SentLead.property_id).where(
+                        SentLead.subscriber_id == subscriber.id,
+                    )
+                ).scalars().all()
+                if unlocked_ids_no_zip:
+                    # DistressScore is 1-to-many with Property — pick the latest
+                    # row per property to avoid duplicate cards.
+                    _latest_score_for_unlocked = (
+                        select(
+                            DistressScore.property_id.label("prop_id"),
+                            func.max(DistressScore.score_date).label("max_date"),
+                        )
+                        .where(DistressScore.property_id.in_(unlocked_ids_no_zip))
+                        .group_by(DistressScore.property_id)
+                        .subquery()
+                    )
+                    unlocked_rows = db.execute(
+                        select(Property, DistressScore, Owner)
+                        .join(DistressScore, DistressScore.property_id == Property.id)
+                        .join(
+                            _latest_score_for_unlocked,
+                            and_(
+                                _latest_score_for_unlocked.c.prop_id == DistressScore.property_id,
+                                _latest_score_for_unlocked.c.max_date == DistressScore.score_date,
+                            ),
+                        )
+                        .outerjoin(Owner, Owner.property_id == Property.id)
+                        .where(Property.id.in_(unlocked_ids_no_zip))
+                    ).all()
+                    # Final-line dedupe in case two scores share score_date.
+                    _seen_prop_ids = set()
+                    unlocked_rows = [
+                        r for r in unlocked_rows
+                        if not (r[0].id in _seen_prop_ids or _seen_prop_ids.add(r[0].id))
+                    ]
+                    incs_for_unlocked = db.execute(
+                        select(Incident).where(Incident.property_id.in_(unlocked_ids_no_zip))
+                    ).scalars().all()
+                    inc_map: dict = {}
+                    for inc in incs_for_unlocked:
+                        inc_map.setdefault(inc.property_id, []).append({
+                            "type": inc.incident_type,
+                            "date": inc.incident_date.isoformat() if inc.incident_date else None,
+                        })
+                    for prop, score, owner in unlocked_rows:
+                        owner_phone, owner_phone_quality = _resolve_phone_with_quality(owner)
+                        owner_email = (owner.email_1 or owner.email_2) if owner else None
+                        _unlocked_leads.append({
+                            "property_id": prop.id,
+                            "parcel_id": prop.parcel_id,
+                            "address": prop.address,
+                            "city": prop.city,
+                            "state": prop.state,
+                            "zip": prop.zip,
+                            "property_type": prop.property_type,
+                            "year_built": prop.year_built,
+                            "sq_ft": prop.sq_ft,
+                            "lat": float(prop.lat) if prop.lat else None,
+                            "lon": float(prop.lon) if prop.lon else None,
+                            "cds_score": float(score.final_cds_score) if score.final_cds_score else None,
+                            "vertical_score": score.vertical_scores.get(subscriber.vertical) if score.vertical_scores else None,
+                            "lead_tier": score.lead_tier,
+                            "urgency": score.urgency_level,
+                            "distress_types": score.distress_types,
+                            "est_job_value": _estimate_lead_job_value(prop, score),
+                            "incidents": inc_map.get(prop.id, []),
+                            "unlocked": True,
+                            "owner_name": owner.owner_name if owner else None,
+                            "phone": owner_phone,
+                            "phone_quality": owner_phone_quality,
+                            "email": owner_email,
+                        })
+        except Exception as exc:
+            logger.warning("free-tier unlocked leads query failed for sub=%s: %s",
+                           subscriber.id, exc)
+
+        # Free-tier blurred stack — gives the dashboard real content to render
+        # instead of a dead empty state. Each card is "Unlock for $4".
+        # Wrapped in begin_nested() so a SQL error here can't poison the
+        # outer transaction (the request still needs to return + commit).
+        _blurred_stack: list = []
+        try:
+            with db.begin_nested():
+                from src.services.proof_moment import get_blurred_stack as _get_blurred_stack
+                _blurred_stack = _get_blurred_stack(
+                    subscriber.id, subscriber.vertical, subscriber.county_id, db, limit=5,
+                )
+        except Exception as exc:
+            logger.warning("blurred_stack failed for sub=%s: %s", subscriber.id, exc)
+            _blurred_stack = []
+
+        try:
+            with db.begin_nested():
+                from src.services.business_events import log_business_event
+                log_business_event(
+                    "FEED_REFRESHED", subscriber_id=subscriber.id,
+                    payload={"tier": subscriber.tier, "lead_count": 0,
+                             "blurred_count": len(_blurred_stack)}, db=db,
+                )
+        except Exception:
+            pass
+
         return {
             "feed_uuid": feed_uuid,
             "subscriber": {
@@ -1212,12 +1398,14 @@ def event_feed(
                 "wallet_to_lock_eligible": _w2l_eligible_nz,
                 "wallet_credits_30d": None,
                 "flash_scarcity_windows": _flash_windows_nz,
+                **_accelerated_wallet_offer_fields(subscriber, db),
             },
-            "total": 0,
+            "total": len(_unlocked_leads),
             "page": page,
             "page_size": page_size,
-            "pages": 0,
-            "leads": [],
+            "pages": 1 if _unlocked_leads else 0,
+            "leads": _unlocked_leads,
+            "blurred_stack": _blurred_stack,
         }
 
     # 3. Build lead query — properties in locked ZIPs with a distress score
@@ -1345,6 +1533,12 @@ def event_feed(
             logger.error("DB error fetching unlocks for feed", exc_info=True)
             # Non-fatal — render leads as locked rather than 503
 
+    # Subscribers with locked ZIP territories see all in-territory contacts
+    # revealed — independent of whether the daily-email job has stamped a
+    # SentLead row yet. `locked_zips` was already resolved above for the lead
+    # query; convert to a set for O(1) membership checks per lead.
+    locked_zip_set: set[str] = {z for z in locked_zips if z}
+
     incidents_by_prop: dict = {}
     for inc in incidents_raw:
         incidents_by_prop.setdefault(inc.property_id, []).append({
@@ -1355,7 +1549,7 @@ def event_feed(
     # 7. Build response
     leads = []
     for prop, score, owner in rows:
-        is_unlocked = prop.id in unlocked_ids
+        is_unlocked = (prop.id in unlocked_ids) or (prop.zip in locked_zip_set)
         owner_phone, owner_phone_quality = _resolve_phone_with_quality(owner)
         owner_email = (owner.email_1 or owner.email_2) if owner else None
         leads.append({
@@ -1426,6 +1620,16 @@ def event_feed(
     except Exception:
         _flash_windows = []
 
+    try:
+        with db.begin_nested():
+            from src.services.business_events import log_business_event
+            log_business_event(
+                "FEED_REFRESHED", subscriber_id=subscriber.id,
+                payload={"tier": subscriber.tier, "lead_count": len(leads)}, db=db,
+            )
+    except Exception:
+        pass
+
     return {
         "feed_uuid": feed_uuid,
         "subscriber": {
@@ -1452,6 +1656,7 @@ def event_feed(
             "wallet_to_lock_eligible": _w2l_eligible,
             "wallet_credits_30d": _wallet_credits_30d,
             "flash_scarcity_windows": _flash_windows,
+            **_accelerated_wallet_offer_fields(subscriber, db),
         },
         "total": total,
         "page": page,
@@ -3189,9 +3394,19 @@ def proof_leads(
     Requires no auth — used immediately after free account creation.
     """
     from src.services.proof_moment import get_proof_leads
+    from src.services.business_events import log_business_event
     if vertical not in VALID_VERTICALS:
         raise HTTPException(status_code=400, detail=f"Invalid vertical. Must be one of: {sorted(VALID_VERTICALS)}")
-    return get_proof_leads(vertical=vertical, county_id=county_id, db=db, feed_uuid=feed_uuid)
+    result = get_proof_leads(vertical=vertical, county_id=county_id, db=db, feed_uuid=feed_uuid)
+    if feed_uuid:
+        sub = db.query(Subscriber).filter_by(event_feed_uuid=feed_uuid).first()
+        log_business_event(
+            "PROOF_MOMENT_VIEWED",
+            subscriber_id=sub.id if sub else None,
+            payload={"vertical": vertical, "county_id": county_id},
+            db=db,
+        )
+    return result
 
 
 # ── Phase 2B: Free signup — POST /api/free-signup ────────────────────────────
@@ -3202,6 +3417,26 @@ class FreeSignupRequest(BaseModel):
     county_id: str = "hillsborough"
     name: Optional[str] = None
     referral_code: Optional[str] = None
+    # Optional phone + TCPA consent for SMS features. When provided AND
+    # sms_consent=True, signup_engine inserts an SmsOptIn row so Cora can
+    # send marketing SMS (lead alerts, accelerated wallet push, FOMO).
+    phone: Optional[str] = None
+    sms_consent: bool = False
+    # fa017 signup-source attribution. signup_source is validated against
+    # the allow-list in signup_engine.ALLOWED_SIGNUP_SOURCES; anything else
+    # falls back to 'unknown'. utm_*/campaign_id/attribution_token are free
+    # text and stored as-is (truncated to schema lengths).
+    signup_source: Optional[str] = None
+    utm_source: Optional[str] = None
+    utm_medium: Optional[str] = None
+    utm_campaign: Optional[str] = None
+    campaign_id: Optional[str] = None
+    attribution_token: Optional[str] = None
+    # Phase 2B: caller hint about what the user is about to do. Suppresses the
+    # welcome email when the user is mid-purchase ('upgrade' = paid checkout,
+    # 'unlock' = $4 lead unlock). Welcome fires from the relevant payment
+    # webhook instead, so abandoned-cart users never get a misleading email.
+    intent: Optional[str] = None
 
     @field_validator("email")
     @classmethod
@@ -3232,6 +3467,10 @@ def free_signup(req: FreeSignupRequest, db: Session = Depends(get_db)):
 
     from src.services.signup_engine import create_free_account_by_email
 
+    # Defer the welcome email when the user is mid-purchase. The corresponding
+    # payment webhook handler is responsible for sending the welcome on success.
+    defer_welcome = req.intent in ("upgrade", "unlock")
+
     sub = create_free_account_by_email(
         email=req.email,
         db=db,
@@ -3239,6 +3478,15 @@ def free_signup(req: FreeSignupRequest, db: Session = Depends(get_db)):
         county_id=req.county_id,
         name=req.name,
         referral_code=req.referral_code,
+        phone=req.phone,
+        sms_consent=req.sms_consent,
+        signup_source=req.signup_source,
+        utm_source=req.utm_source,
+        utm_medium=req.utm_medium,
+        utm_campaign=req.utm_campaign,
+        campaign_id=req.campaign_id,
+        attribution_token=req.attribution_token,
+        send_welcome=not defer_welcome,
     )
 
     return {
@@ -3247,9 +3495,90 @@ def free_signup(req: FreeSignupRequest, db: Session = Depends(get_db)):
         "tier": sub.tier,
         "status": sub.status,
         "email": sub.email,
+        "phone": sub.phone,
         "vertical": sub.vertical,
         "county_id": sub.county_id,
+        "signup_source": sub.signup_source,
     }
+
+
+# ── fa017: Landing token resolver ───────────────────────────────────────────
+# Maps a signed HMAC token from a missed-call / DBPR / Cora SMS landing link
+# back to the Subscriber's feed_uuid so the frontend can navigate directly to
+# /dashboard/<uuid> without forcing a re-signup. Best-effort: invalid /
+# expired tokens return 410 Gone and the frontend silently falls back to the
+# normal landing-page signup flow.
+
+class ResolveTokenRequest(BaseModel):
+    token: str = Field(..., min_length=10, max_length=2000)
+
+
+@app.post("/api/landing/resolve-token", status_code=200)
+def resolve_landing_token(req: ResolveTokenRequest, db: Session = Depends(get_db)):
+    from src.services.signed_links import decode_landing_token
+
+    payload = decode_landing_token(req.token)
+    if not payload:
+        raise HTTPException(
+            status_code=410,
+            detail={"error": "invalid_or_expired_token"},
+        )
+
+    sub_id = payload.get("sub_id")
+    if not isinstance(sub_id, int):
+        raise HTTPException(status_code=410, detail={"error": "malformed_token"})
+
+    sub = db.get(Subscriber, sub_id)
+    if sub is None:
+        raise HTTPException(status_code=410, detail={"error": "subscriber_not_found"})
+
+    from src.services.business_events import log_business_event
+    log_business_event(
+        "TOKEN_RESOLVED",
+        subscriber_id=sub.id,
+        payload={"signup_source": sub.signup_source, "source": payload.get("source")},
+        db=db,
+    )
+
+    return {
+        "feed_uuid": sub.event_feed_uuid,
+        "subscriber_id": sub.id,
+        "signup_source": sub.signup_source,
+    }
+
+
+# ── fa017: Business event log ───────────────────────────────────────────────
+# Frontend-callable audit endpoint. Captures landing_page_viewed / signup_started /
+# lead_unlock_clicked / payment_started events that only the FE can observe.
+# Returns 204 always — failures swallowed by the business_events helper so this
+# can never block the user's flow.
+
+class BusinessEventRequest(BaseModel):
+    event_type: str = Field(..., max_length=80)
+    feed_uuid: Optional[str] = None
+    payload: Optional[dict] = None
+
+
+@app.post("/api/business-event", status_code=204)
+def post_business_event(req: BusinessEventRequest, db: Session = Depends(get_db)):
+    from src.services.business_events import log_business_event
+
+    subscriber_id: Optional[int] = None
+    if req.feed_uuid:
+        sub = db.execute(
+            select(Subscriber).where(Subscriber.event_feed_uuid == req.feed_uuid)
+        ).scalar_one_or_none()
+        if sub is not None:
+            subscriber_id = sub.id
+
+    log_business_event(
+        event_type=req.event_type,
+        subscriber_id=subscriber_id,
+        payload=req.payload or None,
+        source="frontend",
+        db=db,
+    )
+    return Response(status_code=204)
 
 
 # ── Phase 2B: Monetization Wall ───────────────────────────────────────────────
@@ -3346,6 +3675,135 @@ def wallet_topup_endpoint(
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     return {**result, "credits": credits}
+
+
+# ── fa016: Accelerated Wallet Push — accept / decline ──────────────────────
+
+class AcceleratedWalletOfferRequest(BaseModel):
+    offer_id: int = Field(..., gt=0)
+
+
+@app.post("/api/wallet/accept-accelerated-offer/{feed_uuid}", status_code=200)
+def accept_accelerated_wallet_offer(
+    feed_uuid: str,
+    req: AcceleratedWalletOfferRequest,
+    db: Session = Depends(get_db),
+):
+    """Accept an Accelerated Wallet Push offer (in-app modal or `?wallet_offer=accept`).
+    Creates a wallet Subscription against the saved card off-session.
+    Activation happens asynchronously via the invoice.payment_succeeded webhook.
+    Returns 409 if the offer is not in 'offered' status (already accepted, declined, etc).
+    """
+    from config.settings import settings as _settings
+    if not getattr(_settings, "accelerated_wallet_push_enabled", False):
+        raise HTTPException(status_code=404, detail={"error": "feature_disabled"})
+
+    sub = db.execute(
+        select(Subscriber).where(Subscriber.event_feed_uuid == feed_uuid)
+    ).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=403, detail="Invalid feed_uuid")
+    if not sub.has_saved_card or not sub.stripe_payment_method_id:
+        raise HTTPException(status_code=409, detail={"error": "no_saved_card"})
+
+    from src.core.models import WalletPushOffer
+    offer = db.get(WalletPushOffer, req.offer_id)
+    if offer is None or offer.subscriber_id != sub.id:
+        raise HTTPException(status_code=404, detail={"error": "offer_not_found"})
+    if offer.status != "offered":
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "offer_not_open", "status": offer.status},
+        )
+
+    from src.services import wallet_engine
+    try:
+        result = wallet_engine.activate_via_saved_card(
+            subscriber_id=sub.id, tier=offer.tier, db=db, offer_id=offer.id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail={"error": str(exc)})
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail={"error": str(exc)})
+    except Exception as exc:
+        logger.error("activate_via_saved_card failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail={"error": "internal_error"})
+
+    from datetime import datetime, timezone
+    offer.accepted_at = datetime.now(timezone.utc)
+    if result.get("subscription_id"):
+        offer.stripe_subscription_id = result["subscription_id"]
+    if result.get("status") == "failed":
+        offer.status = "failed"
+    else:
+        offer.status = "accepted"
+    db.flush()
+
+    # Clear pending offer so subsequent SMS YES/WALLET aren't double-routed
+    try:
+        from src.core.redis_client import redis_available, rdelete
+        if redis_available():
+            rdelete(f"fa:pending_offer:{sub.id}")
+    except Exception:
+        pass
+
+    return {
+        "offer_id": offer.id,
+        "status": offer.status,
+        "subscription_id": result.get("subscription_id"),
+        "stripe_status": result.get("status"),
+        "requires_action": bool(result.get("requires_action")),
+        "client_secret": result.get("client_secret"),
+    }
+
+
+@app.post("/api/wallet/decline-accelerated-offer/{feed_uuid}", status_code=200)
+def decline_accelerated_wallet_offer(
+    feed_uuid: str,
+    req: AcceleratedWalletOfferRequest,
+    db: Session = Depends(get_db),
+):
+    """Decline an Accelerated Wallet Push offer. Sets wallet_opt_out so the
+    subscriber won't receive another push (until cleared manually)."""
+    from config.settings import settings as _settings
+    if not getattr(_settings, "accelerated_wallet_push_enabled", False):
+        raise HTTPException(status_code=404, detail={"error": "feature_disabled"})
+
+    sub = db.execute(
+        select(Subscriber).where(Subscriber.event_feed_uuid == feed_uuid)
+    ).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(status_code=403, detail="Invalid feed_uuid")
+
+    from src.core.models import WalletPushOffer
+    offer = db.get(WalletPushOffer, req.offer_id)
+    if offer is None or offer.subscriber_id != sub.id:
+        raise HTTPException(status_code=404, detail={"error": "offer_not_found"})
+
+    from datetime import datetime, timezone
+    if offer.status == "offered":
+        offer.status = "declined"
+        offer.declined_at = datetime.now(timezone.utc)
+    sub.wallet_opt_out = True
+    db.flush()
+
+    try:
+        from src.core.redis_client import redis_available, rdelete
+        if redis_available():
+            rdelete(f"fa:pending_offer:{sub.id}")
+    except Exception:
+        pass
+
+    try:
+        from src.services.business_events import log_business_event
+        log_business_event(
+            "WALLET_DECLINED", subscriber_id=sub.id,
+            payload={"offer_id": offer.id}, db=db,
+        )
+    except Exception:
+        pass
+
+    return {"offer_id": offer.id, "status": offer.status, "wallet_opt_out": True}
 
 
 # ── Phase 2B: Payment Sheet — POST /api/payment-intent ───────────────────────

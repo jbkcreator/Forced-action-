@@ -51,6 +51,13 @@ class WalletToLockState(TypedDict, total=False):
     kill_switch_color: str
     revenue_signal_score: int
 
+    # Intermediate compose inputs (must be declared — LangGraph drops undeclared keys)
+    _system_prompt: str
+    _user_prompt: str
+    _fallback_body: str
+    _render_context: dict
+    _variant_id: Optional[str]
+
     message_body: str
     sent: bool
     send_reason: str

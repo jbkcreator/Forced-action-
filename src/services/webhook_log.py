@@ -182,7 +182,7 @@ def _nws(payload: Dict[str, Any]) -> dict:
     """NWS alert — keep alert id + event + area, drop description blobs."""
     props = (payload.get("properties") or payload).copy() if isinstance(payload.get("properties"), dict) else payload
     return {
-        "alert_id":   props.get("id") or payload.get("id"),
+        "alert_id":   props.get("id") or props.get("alert_id") or payload.get("id") or payload.get("alert_id"),
         "event":      props.get("event"),
         "severity":   props.get("severity"),
         "area_desc":  (props.get("areaDesc") or "")[:120],

@@ -112,6 +112,25 @@ def debit(
     # Log manual action for AP Lite threshold detection (no DB round-trip for
     # action types we don't care about).
     _maybe_log_manual_action(subscriber_id, action, db)
+
+    # fa016 Accelerated Wallet Push — first paid debit is "paid intent".
+    # Wallet already exists at this point so the detector will only emit on
+    # the narrow edge case where a saved-card user landed credits via a
+    # bonus/manual top-up but never had an enrollment offer.
+    try:
+        eligible = accelerated_push_eligible(subscriber_id, db)
+        if eligible:
+            from src.agents.supervisor import dispatch_event
+            dispatch_event({
+                "event_type": "accelerated_wallet_push_eligible",
+                "subscriber_id": subscriber_id,
+                "payload": eligible,
+            })
+    except Exception as exc:
+        logger.warning(
+            "accelerated_wallet_push detector failed sub=%s: %s",
+            subscriber_id, exc,
+        )
     return True
 
 
@@ -189,24 +208,35 @@ def refund_credits(
 
 
 def check_enrollment_triggers(subscriber_id: int, db: Session) -> Optional[str]:
+    """Return tier name if the subscriber qualifies for wallet enrollment, else None.
+
+    Triggers (any one fires):
+      • saved-card pre-qualify (has_saved_card AND no wallet yet, AND not opted-out)
+      • two_unlocks_24h
+      • three_total_unlocks
+      • eight_dollar_day (≥ 4 credits debited today, ~$8 in starter pricing)
+      • repeat_zip_48h   (≥ 2 debits on same ZIP within last 48h)
+    """
     sub = db.get(Subscriber, subscriber_id)
     if not sub:
         return None
-
-    # Saved-card users skip threshold — pre-qualified for starter_wallet
-    if sub.has_saved_card:
-        existing = db.execute(
-            select(WalletBalance).where(WalletBalance.subscriber_id == subscriber_id)
-        ).scalar_one_or_none()
-        if not existing:
-            return "starter_wallet"
+    if getattr(sub, "wallet_opt_out", False):
         return None
 
-    # Check purchase-based triggers via WalletTransaction debits
+    existing_wallet = db.execute(
+        select(WalletBalance).where(WalletBalance.subscriber_id == subscriber_id)
+    ).scalar_one_or_none()
+
+    # Saved-card users skip threshold — pre-qualified for starter_wallet
+    if sub.has_saved_card and not existing_wallet:
+        return "starter_wallet"
+    if existing_wallet:
+        return None
+
     now = datetime.now(timezone.utc)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
-    # two_unlocks_24h: 2+ lead_unlock debits in last 24h
+    # two_unlocks_24h
     unlocks_24h = db.execute(
         select(func.count()).select_from(WalletTransaction).where(
             WalletTransaction.subscriber_id == subscriber_id,
@@ -217,7 +247,7 @@ def check_enrollment_triggers(subscriber_id: int, db: Session) -> Optional[str]:
     if unlocks_24h >= 2:
         return "starter_wallet"
 
-    # three_total_unlocks: 3+ total lead_unlock debits
+    # three_total_unlocks
     total_unlocks = db.execute(
         select(func.count()).select_from(WalletTransaction).where(
             WalletTransaction.subscriber_id == subscriber_id,
@@ -227,7 +257,170 @@ def check_enrollment_triggers(subscriber_id: int, db: Session) -> Optional[str]:
     if total_unlocks >= 3:
         return "starter_wallet"
 
+    # eight_dollar_day — ≥ 4 credits debited today (~$8 at starter pricing)
+    today_credits = db.execute(
+        select(func.coalesce(func.sum(WalletTransaction.amount), 0)).where(
+            WalletTransaction.subscriber_id == subscriber_id,
+            WalletTransaction.txn_type == "debit",
+            WalletTransaction.created_at >= today_start,
+        )
+    ).scalar() or 0
+    if abs(int(today_credits)) >= 4:
+        return "starter_wallet"
+
+    # repeat_zip_48h — same ZIP touched ≥ 2 times in last 48h
+    forty_eight_ago = now - timedelta(hours=48)
+    repeat_zip = db.execute(
+        select(WalletTransaction.zip_code, func.count().label("c")).where(
+            WalletTransaction.subscriber_id == subscriber_id,
+            WalletTransaction.zip_code.is_not(None),
+            WalletTransaction.created_at >= forty_eight_ago,
+        ).group_by(WalletTransaction.zip_code).having(func.count() >= 2)
+    ).first()
+    if repeat_zip:
+        return "starter_wallet"
+
     return None
+
+
+def accelerated_push_eligible(subscriber_id: int, db: Session) -> Optional[dict]:
+    """Return offer dict if subscriber qualifies for an Accelerated Wallet Push,
+    else None.
+
+    Eligible when ALL hold:
+      • feature flag enabled
+      • subscriber exists, not wallet_opt_out
+      • has_saved_card AND stripe_payment_method_id
+      • no existing WalletBalance row
+      • at least one WalletTransaction(txn_type='debit') exists (paid intent)
+      • per-day idempotency key not set in Redis
+
+    Sets Redis key `aw_push:{sub}:{yyyy-mm-dd}` (TTL ~26h) on a positive return so
+    repeated invocations within the same UTC day are a no-op.
+    """
+    from config.settings import settings
+    if not getattr(settings, "accelerated_wallet_push_enabled", False):
+        return None
+
+    sub = db.get(Subscriber, subscriber_id)
+    if not sub:
+        return None
+    if getattr(sub, "wallet_opt_out", False):
+        return None
+    if not sub.has_saved_card or not sub.stripe_payment_method_id:
+        return None
+
+    existing_wallet = db.execute(
+        select(WalletBalance).where(WalletBalance.subscriber_id == subscriber_id)
+    ).scalar_one_or_none()
+    if existing_wallet:
+        return None
+
+    # "Paid intent" = any of:
+    #   (a) a successful WalletTransaction debit (rare here since wallet
+    #       doesn't exist yet — only set by existing wallet users)
+    #   (b) a card-paid PremiumPurchase (the common case: subscriber paid cash
+    #       for a premium unlock / brief / transfer / byol)
+    debit_exists = db.execute(
+        select(func.count()).select_from(WalletTransaction).where(
+            WalletTransaction.subscriber_id == subscriber_id,
+            WalletTransaction.txn_type == "debit",
+        )
+    ).scalar() or 0
+    if debit_exists < 1:
+        from src.core.models import PremiumPurchase
+        premium_paid = db.execute(
+            select(func.count()).select_from(PremiumPurchase).where(
+                PremiumPurchase.subscriber_id == subscriber_id,
+                PremiumPurchase.paid_via == "card",
+                PremiumPurchase.status.in_(("pending", "delivered")),
+            )
+        ).scalar() or 0
+        if premium_paid < 1:
+            return None
+
+    # Redis dedupe — one push per subscriber per UTC day
+    from src.core.redis_client import redis_available, rget, rset
+    today_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    redis_key = f"aw_push:{subscriber_id}:{today_key}"
+    if redis_available() and rget(redis_key):
+        return None
+
+    tier = "starter_wallet"
+    tier_config = WALLET_TIERS[tier]
+    missed_leads = int(getattr(sub, "missed_lead_count", 0) or 0)
+
+    if redis_available():
+        rset(redis_key, "1", ttl_seconds=26 * 3600)
+
+    return {
+        "tier": tier,
+        "missed_leads": missed_leads,
+        "credits_in_offer": tier_config["credits_per_cycle"],
+        "price_cents": tier_config["price_cents"],
+        "reason": "saved_card_paid_intent",
+    }
+
+
+def ensure_offer_row(subscriber_id: int, eligibility: dict, db: Session):
+    """Idempotent: return existing 'offered' row for this subscriber, else create one.
+
+    Called as soon as `accelerated_push_eligible()` returns truthy, BEFORE
+    agent dispatch — so the in-app surface (`subscriber.accelerated_wallet_offer_active`
+    computed from this table) is populated regardless of whether the SMS
+    delivery succeeds.
+    """
+    from src.core.models import WalletPushOffer
+
+    existing = db.execute(
+        select(WalletPushOffer).where(
+            WalletPushOffer.subscriber_id == subscriber_id,
+            WalletPushOffer.status == "offered",
+        )
+    ).scalar_one_or_none()
+    if existing:
+        return existing
+
+    offer = WalletPushOffer(
+        subscriber_id=subscriber_id,
+        framing_variant="credits_ready",
+        tier=eligibility.get("tier", "starter_wallet"),
+        status="offered",
+    )
+    db.add(offer)
+    db.flush()
+    logger.info(
+        "WalletPushOffer ensured sub=%s offer=%s trigger=%s",
+        subscriber_id, offer.id, eligibility.get("reason"),
+    )
+    return offer
+
+
+def activate_via_saved_card(
+    subscriber_id: int, tier: str, db: Session, offer_id: int
+) -> dict:
+    """Create an off-session Stripe Subscription against the saved PM.
+
+    The wallet is NOT credited here; activation happens in the
+    `invoice.payment_succeeded` webhook so we never grant credits before
+    Stripe confirms the first invoice.
+
+    Returns dict with `subscription_id`, `status`, and optional
+    `client_secret`/`requires_action` for fallback handling.
+    Raises ValueError("no_saved_card") if prerequisites are missing.
+    """
+    sub = db.get(Subscriber, subscriber_id)
+    if not sub:
+        raise ValueError("no_subscriber")
+    if not sub.has_saved_card or not sub.stripe_payment_method_id:
+        raise ValueError("no_saved_card")
+    if not sub.stripe_customer_id:
+        raise ValueError("no_stripe_customer")
+
+    from src.services import stripe_service
+    return stripe_service.create_subscription_off_saved_pm(
+        subscriber=sub, tier=tier, offer_id=offer_id
+    )
 
 
 def enroll(subscriber_id: int, tier: str, db: Session) -> WalletBalance:
@@ -319,14 +512,31 @@ def add_bonus(subscriber_id: int, amount: int, reason: str, db: Session) -> Wall
 
 
 def check_saved_card_bonus(subscriber_id: int, db: Session) -> bool:
-    from src.core.redis_client import redis_available, rget
+    """Grant 2 bonus credits if the subscriber saved a card within the 10-min
+    window (Redis key set by stripe webhook). Idempotent — the Redis key is
+    consumed on successful grant so repeat calls in the same window are
+    no-ops. Also short-circuits if any 'saved_card_bonus' transaction already
+    exists for this subscriber (defense-in-depth if Redis is unavailable).
+    """
+    from src.core.redis_client import redis_available, rget, rdelete
+    from sqlalchemy import select as _select
     if not redis_available():
         return False
     key = f"saved_card_window:{subscriber_id}"
-    if rget(key):
-        add_bonus(subscriber_id, 2, "saved_card_bonus", db)
-        return True
-    return False
+    if not rget(key):
+        return False
+    already = db.execute(
+        _select(func.count()).select_from(WalletTransaction).where(
+            WalletTransaction.subscriber_id == subscriber_id,
+            WalletTransaction.description == "saved_card_bonus",
+        )
+    ).scalar() or 0
+    if already > 0:
+        rdelete(key)
+        return False
+    add_bonus(subscriber_id, 2, "saved_card_bonus", db)
+    rdelete(key)
+    return True
 
 
 def check_accelerated_push(subscriber_id: int, db: Session) -> Optional[str]:

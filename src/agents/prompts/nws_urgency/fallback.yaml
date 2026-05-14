@@ -1,0 +1,5 @@
+# Static fallback body for NWS urgency — used when kill-switch is YELLOW.
+# No Claude call — shipped verbatim.
+version: 1
+body: |
+  {first_name}, a weather alert is active in your territory. {lead_count} leads available now. [link]
