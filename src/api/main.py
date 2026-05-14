@@ -3999,7 +3999,12 @@ def premium_purchase_endpoint(
             subscriber_id=sub.id,
             amount_cents=cfg["retail_price_cents"],
             description=f"Premium {cfg['label']}",
-            save_card=False,
+            # Match the $4 lead-unlock UX: save card by default so premium-only
+            # buyers also enter the accelerated-wallet-push funnel. The
+            # PremiumCreditsModal already pre-checks "save card" on the
+            # PaymentSheet UI; this aligns the server-side flag with that
+            # default. The user can still uncheck on the Stripe sheet.
+            save_card=True,
             db=db,
             metadata={
                 "product": "premium",
