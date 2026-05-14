@@ -479,6 +479,7 @@ def push_subscriber_to_ghl(
     tags: Optional[List[str]] = None,
     zip_codes: Optional[List[str]] = None,
     is_founding: bool = False,
+    db=None,
 ) -> bool:
     """
     Create or update a GHL contact for a subscriber and optionally move them
@@ -491,6 +492,11 @@ def push_subscriber_to_ghl(
     zip_codes and is_founding are used to populate subscriber-context custom fields
     (fa_tier, fa_zip, fa_founding, fa_dashboard_url) when their GHL field IDs are configured.
 
+    `db` is optional; when provided, audit rows go into the caller's session so
+    they're visible to the subscriber FK before the outer transaction commits.
+    Without it, webhook_log opens its own session and FK-fails on
+    subscriber_id for in-flight checkout flows.
+
     Returns True on success, False on any failure.
     Raises nothing — all errors are logged internally.
     """
@@ -502,6 +508,7 @@ def push_subscriber_to_ghl(
                 direction="outbound", status="skipped",
                 status_detail="GHL not configured",
                 subscriber_id=getattr(subscriber, "id", None),
+                db=db,
             )
         except Exception:
             pass
@@ -524,6 +531,7 @@ def push_subscriber_to_ghl(
                 "contact_id":    getattr(subscriber, "ghl_contact_id", None),
             },
             payload_kind="ghl",
+            db=db,
         )
     except Exception:
         pass

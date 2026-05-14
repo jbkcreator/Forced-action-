@@ -290,7 +290,7 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
         db.add(churned)
         db.flush()
         try:
-            push_subscriber_to_ghl(churned, stage=7, tags=["checkout_payment_failed"])
+            push_subscriber_to_ghl(churned, stage=7, tags=["checkout_payment_failed"], db=db)
         except Exception:
             logger.error(
                 "GHL stage 7 push failed for churned checkout subscriber %s",
@@ -533,12 +533,16 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
             )
 
     # ── Push to GHL stage 5 ────────────────────────────────────────────────
+    # Pass `db=` so the GHL push's audit row joins the parent transaction —
+    # otherwise webhook_log opens its own session that can't see the
+    # not-yet-committed subscriber row, FK-fails, and we lose the audit.
     try:
         push_subscriber_to_ghl(
             subscriber,
             stage=5,
             zip_codes=list(zip_codes),
             is_founding=is_founding,
+            db=db,
         )
     except Exception:
         logger.error(
