@@ -134,6 +134,9 @@ def mark_lock_candidate(
     sub.lock_candidate_at = datetime.now(timezone.utc)
     db.flush()
 
+    from src.services.segmentation_engine import reclassify_safe
+    reclassify_safe(subscriber_id, db)
+
 
 def build_lock_cta_url(subscriber_id: int, zip_code: str) -> str:
     """Build pre-filled Territory Lock checkout URL for SMS CTA."""

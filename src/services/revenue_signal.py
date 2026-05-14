@@ -119,3 +119,7 @@ def _zip_competition(sub: Subscriber, db: Session) -> float:
         return 0.5  # neutral default without Redis
     # Placeholder: would query ZIP activity counters from Redis sorted set
     return 0.5
+
+
+# Alias expected by reclassify_safe
+recompute = compute_score

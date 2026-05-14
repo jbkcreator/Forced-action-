@@ -131,6 +131,9 @@ def debit(
             "accelerated_wallet_push detector failed sub=%s: %s",
             subscriber_id, exc,
         )
+
+    from src.services.segmentation_engine import reclassify_safe
+    reclassify_safe(subscriber_id, db)
     return True
 
 

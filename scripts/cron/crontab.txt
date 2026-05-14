@@ -234,4 +234,9 @@ COUNTY_ID=hillsborough
 # ACCELERATED_WALLET_PUSH_ENABLED.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.accelerated_wallet_push_sweep
 
+# ── SEGMENTATION SWEEP ───────────────────────────────────────────────────────
+# Daily classify_all — 02:00 UTC. Catches any subscribers whose segment drifted
+# without triggering an event hook (e.g. time-boundary at_risk, daily inactivity).
+0 2 * * * cd $PROJECT && python -c "from src.core.database import Database; from src.services.segmentation_engine import classify_all; db=Database(); s=db.get_session(); print(classify_all(s)); s.close()"
+
 # === END FORCED-ACTION-PLATFORM ===
