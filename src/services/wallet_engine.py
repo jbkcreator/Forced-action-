@@ -310,10 +310,20 @@ def accelerated_push_eligible(subscriber_id: int, db: Session) -> Optional[dict]
     if not sub.has_saved_card or not sub.stripe_payment_method_id:
         return None
 
-    existing_wallet = db.execute(
-        select(WalletBalance).where(WalletBalance.subscriber_id == subscriber_id)
-    ).scalar_one_or_none()
-    if existing_wallet:
+    # Block the push only when the subscriber already has an ACTIVE wallet
+    # subscription (accepted/activated WalletPushOffer with a Stripe sub id).
+    # A bare WalletBalance row (created by the +2 saved-card bonus credits
+    # grant) is NOT a subscription — those users are exactly who should get
+    # the push to convert into the $49/mo recurring plan.
+    from src.core.models import WalletPushOffer as _WPO
+    has_active_subscription = db.execute(
+        select(func.count()).select_from(_WPO).where(
+            _WPO.subscriber_id == subscriber_id,
+            _WPO.stripe_subscription_id.isnot(None),
+            _WPO.status.in_(("accepted", "activated")),
+        )
+    ).scalar() or 0
+    if has_active_subscription:
         return None
 
     # "Paid intent" = any of:

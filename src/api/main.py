@@ -4249,7 +4249,12 @@ def referral_status(feed_uuid: str, db: Session = Depends(get_db)):
         next_milestone = {"milestone": "lock_slot_5", "threshold": 5, "remaining": 5 - confirmed_count}
 
     settings = get_settings()
-    base_url = getattr(settings, "base_url", "")
+    # `app_base_url` is the canonical setting; `base_url` was the older
+    # name and is no longer defined, so the getattr fallback would always
+    # produce a relative URL ("/share/REFXXXX"). Frontend now composes the
+    # absolute URL from window.location.origin when the backend value isn't
+    # absolute, so this still works either way.
+    base_url = (getattr(settings, "app_base_url", "") or "").rstrip("/")
     share_url = f"{base_url}/share/{subscriber.referral_code}" if subscriber.referral_code else None
 
     return {
