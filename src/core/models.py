@@ -152,9 +152,9 @@ class Owner(Base):
     credit_score_tier: Mapped[Optional[str]] = mapped_column(String(50))
     skip_trace_success: Mapped[Optional[bool]] = mapped_column(Boolean, default=False)
 
-    # LLC manager — populated by Sunbiz officer parser (free enrichment layer)
-    manager_name: Mapped[Optional[str]] = mapped_column(String(255))
-    manager_title: Mapped[Optional[str]] = mapped_column(String(50))
+    # Sunbiz registered agent — populated by Sunbiz Playwright scraper (LLC owners only)
+    registered_agent_name: Mapped[Optional[str]] = mapped_column(String(255))
+    registered_agent_address: Mapped[Optional[str]] = mapped_column(String(500))
 
     # Multi-county
     county_id: Mapped[Optional[str]] = mapped_column(String(50), default='hillsborough', index=True)
@@ -2191,3 +2191,80 @@ class PartnerSubscription(Base):
 
     def __repr__(self):
         return f"<PartnerSubscription(sub={self.subscriber_id}, max_zips={self.max_zips})>"
+
+
+# ============================================================================
+# DBPR — Contractor Contact Registry
+# ============================================================================
+
+class DBPRContact(Base):
+    """
+    Florida DBPR licensed contractor registry — one row per unique license number.
+
+    Weekly file from myfloridalicense.com replaces all data. Loader upserts on
+    license_number, preserving email/phone/enrichment_status across syncs so
+    BatchData enrichment work is not lost on each weekly refresh.
+
+    Flow: download → parse → dedup by license_number → filter to target ZIPs
+          → upsert → enrich via BatchData → email campaign → signup.
+    """
+    __tablename__ = "dbpr_contacts"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+
+    # ── Identity (from DBPR file) ─────────────────────────────────────────────
+    license_number: Mapped[str] = mapped_column(String(30), unique=True, nullable=False, index=True)
+    license_type_code: Mapped[str] = mapped_column(String(10), nullable=False)       # CGC / CCC / CBC / CFC / CAC
+    license_type_desc: Mapped[Optional[str]] = mapped_column(String(60))             # Cert General / Cert Roofing
+    full_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    address: Mapped[Optional[str]] = mapped_column(String(255))
+    city: Mapped[Optional[str]] = mapped_column(String(100))
+    state: Mapped[Optional[str]] = mapped_column(String(5), default="FL")
+    zip_code: Mapped[Optional[str]] = mapped_column(String(10), index=True)
+    county_id: Mapped[Optional[str]] = mapped_column(String(50), index=True)         # hillsborough / pinellas etc.
+    license_expiry: Mapped[Optional[date]] = mapped_column(Date)
+    data_source: Mapped[str] = mapped_column(String(20), nullable=False, default="certified")  # certified / registered
+
+    # ── Vertical mapping ──────────────────────────────────────────────────────
+    vertical: Mapped[Optional[str]] = mapped_column(String(50), index=True)          # roofing / general / plumbing / hvac / remediation
+
+    # ── Enrichment (BatchData / IDI) ──────────────────────────────────────────
+    email: Mapped[Optional[str]] = mapped_column(String(200))
+    phone: Mapped[Optional[str]] = mapped_column(String(20))
+    enrichment_status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    enrichment_attempted_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    # ── Email campaign ────────────────────────────────────────────────────────
+    email_status: Mapped[str] = mapped_column(String(20), nullable=False, default="not_sent")
+    email_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    # ── Signup tracking ───────────────────────────────────────────────────────
+    subscriber_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("subscribers.id"), index=True)
+    signed_up_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    # ── Sync metadata ─────────────────────────────────────────────────────────
+    last_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "enrichment_status IN ('pending', 'enriched', 'failed', 'skipped')",
+            name="check_dbpr_enrichment_status",
+        ),
+        CheckConstraint(
+            "email_status IN ('not_sent', 'sent', 'bounced', 'signed_up', 'opted_out')",
+            name="check_dbpr_email_status",
+        ),
+        CheckConstraint(
+            "data_source IN ('certified', 'registered')",
+            name="check_dbpr_data_source",
+        ),
+        Index("idx_dbpr_county_vertical", "county_id", "vertical"),
+        Index("idx_dbpr_enrichment_status", "enrichment_status"),
+        Index("idx_dbpr_email_status", "email_status"),
+        Index("idx_dbpr_last_synced", "last_synced_at"),
+    )
+
+    def __repr__(self):
+        return f"<DBPRContact(license={self.license_number}, name={self.full_name}, status={self.email_status})>"

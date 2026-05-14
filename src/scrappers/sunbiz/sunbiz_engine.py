@@ -1,453 +1,333 @@
 """
-Florida Sunbiz (FL Division of Corporations) LLC Contact Enrichment
+Florida Sunbiz (FL Division of Corporations) — Registered Agent Enrichment
 
-Searches the FL DOS Sunbiz database for LLC-owned properties in our system and
-extracts the registered agent's phone and email address. These are written back
-to the Owner record (phone_1 / email_1) so they appear in GHL CRM on the next
-rescore/push.
+For each LLC-owned property with a high distress score and no registered agent
+on file, this scraper:
+  1. Navigates to search.sunbiz.org via Playwright + playwright-stealth
+  2. Searches by LLC name, finds the exact matching row in #search-results
+  3. Opens the entity detail page and reads the "Registered Agent Name & Address"
+     detailSection (present on ~99% of active FL filings)
+  4. Writes registered_agent_name + registered_agent_address back to the Owner row
 
-Why Sunbiz?
-  - FL Secretary of State maintains a public, searchable database of all Florida
-    LLCs at search.sunbiz.org.
-  - Each LLC filing lists a registered agent with an address, phone, and sometimes
-    an email.
-  - ~30-50% of LLC-owned investment properties have a reachable registered agent
-    contact — free, no API key required.
+Falls back to a browser-use AI agent if Playwright encounters a hard error.
 
 Usage:
     python -m src.scrappers.sunbiz.sunbiz_engine
     python -m src.scrappers.sunbiz.sunbiz_engine --limit 100
     python -m src.scrappers.sunbiz.sunbiz_engine --dry-run
     python -m src.scrappers.sunbiz.sunbiz_engine --rescore
-
-The scraper is intentionally slow (1-2 s between requests) to be polite to the
-state's servers and avoid IP blocks.
 """
 
-import argparse
+import asyncio
 import re
-import time
 from typing import Optional, Tuple
 
-import requests
-from bs4 import BeautifulSoup
 from sqlalchemy.orm import Session
 
 from src.core.database import get_db_context
 from src.core.models import Owner, Property
 from src.utils.logger import setup_logging, get_logger
-from src.utils.http_helpers import get_requests_proxies
-from config.constants import DEFAULT_USER_AGENT
 
 setup_logging()
 logger = get_logger(__name__)
 
-# ---------------------------------------------------------------------------
-# Sunbiz search / detail URLs
-# ---------------------------------------------------------------------------
-SUNBIZ_SEARCH_URL = "https://search.sunbiz.org/Inquiry/CorporationSearch/SearchResults"
-SUNBIZ_DETAIL_BASE = "https://search.sunbiz.org"
-SUNBIZ_HOME_URL = "https://search.sunbiz.org/Inquiry/CorporationSearch/ByName"
+SUNBIZ_SEARCH_URL = "https://search.sunbiz.org/Inquiry/CorporationSearch/ByName"
+SUNBIZ_BASE = "https://search.sunbiz.org"
 
-_HEADERS = {
-    "User-Agent": DEFAULT_USER_AGENT,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-}
-
-_DELAY_BETWEEN_REQUESTS = 1.5  # seconds — polite crawl rate
+_DELAY_SECONDS = 1.5  # polite crawl rate between owners
 
 
 # ---------------------------------------------------------------------------
-# Session management
+# Name normalization for exact-match comparison
 # ---------------------------------------------------------------------------
 
-def _build_session() -> requests.Session:
+def _normalize(name: str) -> str:
+    name = name.upper()
+    name = name.replace("&", "AND")
+    name = re.sub(r"[.,;'\"]", "", name)
+    name = re.sub(r"\s+", " ", name)
+    return name.strip()
+
+
+# ---------------------------------------------------------------------------
+# Playwright scraper
+# ---------------------------------------------------------------------------
+
+async def _scrape_registered_agent(
+    page, company_name: str
+) -> Tuple[Optional[str], Optional[str]]:
     """
-    Create a requests.Session with proxy and browser-like headers, then warm
-    it up against the Sunbiz search homepage so session cookies are set before
-    any search requests are made.
+    Search Sunbiz for company_name and return (agent_name, agent_address).
+    Returns (None, None) if no exact match is found or the registered agent
+    section is absent on the detail page.
     """
-    session = requests.Session()
-    session.headers.update(_HEADERS)
-
-    proxies = get_requests_proxies()
-    if proxies:
-        session.proxies.update(proxies)
-        logger.info("[Sunbiz] Session using Oxylabs proxy")
-    else:
-        logger.warning("[Sunbiz] No proxy configured — requests will be sent direct")
-
-    # Warm up: visit the search landing page so the server sets session cookies
     try:
-        resp = session.get(SUNBIZ_HOME_URL, timeout=15)
-        resp.raise_for_status()
-        logger.info(f"[Sunbiz] Session warmed up (status {resp.status_code}, cookies: {list(session.cookies.keys())})")
+        await page.goto(SUNBIZ_SEARCH_URL, wait_until="domcontentloaded", timeout=20000)
+        await page.fill("#SearchTerm", company_name)
+        await page.click("input[value='Search Now']")
+        await page.wait_for_selector("#search-results", timeout=15000)
     except Exception as e:
-        logger.warning(f"[Sunbiz] Warm-up request failed (continuing anyway): {e}")
+        logger.debug(f"[Sunbiz] Search navigation failed for '{company_name}': {e}")
+        raise
 
-    return session
+    # Find exact name match in the results table
+    rows = await page.query_selector_all("#search-results table tbody tr")
+    detail_url: Optional[str] = None
+    normalized_search = _normalize(company_name)
 
+    for row in rows:
+        link = await row.query_selector("td.large-width a")
+        if not link:
+            continue
+        result_text = await link.inner_text()
+        if _normalize(result_text) == normalized_search:
+            href = await link.get_attribute("href")
+            if href:
+                detail_url = href if href.startswith("http") else SUNBIZ_BASE + href
+            break
 
-# ---------------------------------------------------------------------------
-# Core scraping functions
-# ---------------------------------------------------------------------------
+    if not detail_url:
+        logger.debug(f"[Sunbiz] No exact match in results for '{company_name}'")
+        return None, None
 
-def _search_sunbiz(session: requests.Session, company_name: str) -> Optional[str]:
-    """
-    Search Sunbiz for a company name and return the detail page URL of the
-    first exact (or best) match, or None if not found.
-    """
-    clean_name = re.sub(
-        r"\b(LLC|INC|CORP|LTD|LP|LLP|PLLC|CO|COMPANY|INCORPORATED|LIMITED)\b\.?",
-        "",
-        company_name,
-        flags=re.IGNORECASE,
-    ).strip().strip(",").strip()
-
-    if not clean_name:
-        return None
-
-    params = {
-        "SearchTerm": clean_name,
-        "SearchType": "EntityName",
-    }
-
+    # Navigate to detail page
     try:
-        resp = session.get(
-            SUNBIZ_SEARCH_URL,
-            params=params,
-            timeout=15,
-            headers={**_HEADERS, "Referer": SUNBIZ_HOME_URL},
+        await page.goto(detail_url, wait_until="domcontentloaded", timeout=20000)
+    except Exception as e:
+        logger.debug(f"[Sunbiz] Detail page load failed: {e}")
+        return None, None
+
+    # Find the "Registered Agent Name & Address" detailSection
+    sections = await page.query_selector_all("div.detailSection")
+    for section in sections:
+        header = await section.query_selector("span:first-child")
+        if not header:
+            continue
+        header_text = await header.inner_text()
+        if "registered agent" not in header_text.lower():
+            continue
+
+        # spans[0]=header, spans[1]=agent name, spans[2]=address block
+        spans = await section.query_selector_all("span")
+        if len(spans) < 2:
+            return None, None
+
+        agent_name = (await spans[1].inner_text()).strip()
+        agent_address: Optional[str] = None
+        if len(spans) >= 3:
+            raw_addr = (await spans[2].inner_text()).strip()
+            # Collapse whitespace / blank lines left by <br> tags
+            agent_address = re.sub(r"\n{2,}", "\n", raw_addr).strip()
+
+        return agent_name or None, agent_address or None
+
+    logger.debug(f"[Sunbiz] No registered agent section found for '{company_name}'")
+    return None, None
+
+
+async def _run_playwright_batch(
+    owners: list,
+    dry_run: bool,
+    stats: dict,
+    session: Session,
+    headless: bool = True,
+) -> None:
+    from playwright.async_api import async_playwright
+    from playwright_stealth import Stealth
+    from src.utils.http_helpers import get_playwright_proxy
+
+    async with async_playwright() as pw:
+        launch_args = [] if not headless else ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+        browser = await pw.chromium.launch(
+            headless=headless,
+            proxy=get_playwright_proxy(),
+            args=launch_args,
         )
-        resp.raise_for_status()
-    except Exception as e:
-        logger.debug(f"[Sunbiz] Search request failed for '{clean_name}': {e}")
-        return None
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1920, "height": 1080},
+        )
+        page = await context.new_page()
+        await Stealth().apply_stealth_async(page)
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+        try:
+            total = len(owners)
+            for idx, owner in enumerate(owners, 1):
+                stats["processed"] += 1
+                name = owner.owner_name.strip()
 
-    table = soup.find("table", class_="searchResultTable") or soup.find("table")
-    if not table:
-        logger.debug(f"[Sunbiz] No results table found for '{clean_name}'")
-        return None
+                skip_patterns = [
+                    "ASSESSED BY DEPT", "ASSESSED BY STATE", "STATE OF FL",
+                    "TRUSTEE", " TRUST", "ESTATE OF",
+                ]
+                if any(p in name.upper() for p in skip_patterns):
+                    logger.debug(f"[Sunbiz] Skipping non-LLC entity: {name}")
+                    stats["skipped"] += 1
+                    continue
 
-    rows = table.find_all("tr")
-    for row in rows[1:]:  # skip header row
-        cols = row.find_all("td")
-        if not cols:
-            continue
-        link_tag = cols[0].find("a", href=True)
-        if not link_tag:
-            continue
+                logger.info(f"[Sunbiz] [{idx}/{total}] Searching: {name}")
+                await asyncio.sleep(_DELAY_SECONDS)
 
-        result_name = link_tag.get_text(strip=True).upper()
-        search_upper = company_name.upper()
+                try:
+                    agent_name, agent_address = await _scrape_registered_agent(page, name)
+                except Exception as e:
+                    logger.warning(f"[Sunbiz] Playwright failed for '{name}': {e} — trying AI fallback")
+                    try:
+                        agent_name, agent_address = await _ai_fallback(name)
+                    except Exception as ae:
+                        logger.warning(f"[Sunbiz] AI fallback also failed for '{name}': {ae}")
+                        stats["failed"] += 1
+                        continue
 
-        if clean_name.upper() in result_name or result_name in search_upper:
-            href = link_tag["href"]
-            if not href.startswith("http"):
-                href = SUNBIZ_DETAIL_BASE + href
-            logger.debug(f"[Sunbiz] Matched '{result_name}' → {href}")
-            return href
+                if not agent_name:
+                    stats["skipped"] += 1
+                    continue
 
-    logger.debug(f"[Sunbiz] No match found for '{company_name}'")
-    return None
+                logger.info(
+                    f"[Sunbiz] Found agent for '{name}': {agent_name} | {agent_address}"
+                )
 
+                if not dry_run:
+                    owner.registered_agent_name = agent_name
+                    owner.registered_agent_address = agent_address
+                    if owner.owner_type != "LLC":
+                        owner.owner_type = "LLC"
+                    stats["enriched"] += 1
+                else:
+                    logger.info(
+                        f"[Sunbiz] DRY RUN — would write agent for owner_id={owner.id}"
+                    )
+                    stats["enriched"] += 1
 
-# Officer titles in priority order — MGR/MGRM are LLC-specific, PRES/VP/DIR for corps
-_MANAGER_TITLE_PRIORITY = ["MGR", "MGRM", "PRES", "VP", "DIR"]
-
-
-def _parse_officers_section(soup: BeautifulSoup) -> Optional[dict]:
-    """
-    Parse the Officers/Directors section of a Sunbiz detail page.
-
-    Sunbiz renders each section as a <div class="detailSection"> with a
-    <span class="detailSectionHeader"> label, followed by <span class="label">
-    / <span class="info"> pairs for each field of each officer.
-
-    Returns the best manager as {"name": str, "title": str}, preferring
-    MGR > MGRM > PRES > VP > DIR > first-available. Returns None if the
-    section is absent or empty.
-    """
-    officers = []
-
-    for section in soup.find_all("div", class_="detailSection"):
-        header = section.find("span", class_="detailSectionHeader")
-        if not header or "officer" not in header.get_text(separator=" ", strip=True).lower():
-            continue
-
-        # Walk label/info pairs within this section
-        labels = section.find_all("span", class_="label")
-        infos = section.find_all("span", class_="info")
-
-        current: dict = {}
-        for label_tag, info_tag in zip(labels, infos):
-            key = label_tag.get_text(strip=True).lower().rstrip(":")
-            val = info_tag.get_text(strip=True)
-            if not val:
-                continue
-            if key == "title":
-                if current:
-                    officers.append(current)
-                current = {"title": val.upper()}
-            elif key == "name" and "title" in current:
-                current["name"] = val.upper()
-        if current and "name" in current:
-            officers.append(current)
-
-        break  # only need the first Officers section
-
-    if not officers:
-        return None
-
-    # Skip pure registered-agent entries — those are handled separately
-    candidates = [o for o in officers if o.get("title") != "RAGT" and o.get("name")]
-    if not candidates:
-        return None
-
-    # Return highest-priority title; fall back to first candidate
-    for preferred in _MANAGER_TITLE_PRIORITY:
-        for officer in candidates:
-            if officer.get("title") == preferred:
-                return officer
-    return candidates[0]
-
-
-def _extract_contact_from_detail(
-    session: requests.Session, detail_url: str
-) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
-    """
-    Fetch the Sunbiz entity detail page and extract:
-      - phone and email from the registered agent / page text
-      - manager name and title from the Officers/Directors section
-
-    Returns:
-        (phone, email, manager_name, manager_title)
-    """
-    try:
-        resp = session.get(detail_url, timeout=15)
-        resp.raise_for_status()
-    except Exception as e:
-        logger.debug(f"[Sunbiz] Detail fetch failed for {detail_url}: {e}")
-        return None, None, None, None
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    phone: Optional[str] = None
-    email: Optional[str] = None
-
-    # ── Phone ────────────────────────────────────────────────────────────────
-    page_text = soup.get_text(" ", strip=True)
-
-    phone_matches = re.findall(
-        r"\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4}",
-        page_text,
-    )
-    if phone_matches:
-        for raw in phone_matches:
-            digits = re.sub(r"\D", "", raw)
-            if len(digits) == 10 and digits[0] not in ("0", "1"):
-                phone = f"({digits[:3]}) {digits[3:6]}-{digits[6:]}"
-                break
-
-    # ── Email ────────────────────────────────────────────────────────────────
-    email_matches = re.findall(
-        r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}",
-        page_text,
-    )
-    if email_matches:
-        for candidate in email_matches:
-            if "sunbiz" not in candidate.lower() and "dos.myflorida" not in candidate.lower():
-                email = candidate.lower()
-                break
-
-    # ── Manager (Officers/Directors section) ─────────────────────────────────
-    manager_name: Optional[str] = None
-    manager_title: Optional[str] = None
-
-    officer = _parse_officers_section(soup)
-    if officer:
-        manager_name = officer.get("name")
-        manager_title = officer.get("title")
-
-    return phone, email, manager_name, manager_title
+        finally:
+            await context.close()
+            await browser.close()
 
 
 # ---------------------------------------------------------------------------
-# Main enrichment loop
+# AI fallback (browser-use) — only used when Playwright raises
+# ---------------------------------------------------------------------------
+
+async def _ai_fallback(company_name: str) -> Tuple[Optional[str], Optional[str]]:
+    from browser_use import Agent, Browser, ChatAnthropic
+    from src.utils.http_helpers import get_browser_use_proxy
+
+    task = (
+        f"Go to https://search.sunbiz.org/Inquiry/CorporationSearch/ByName, "
+        f"search for the company named '{company_name}', find the exact matching result, "
+        f"open its detail page, locate the section titled 'Registered Agent Name & Address', "
+        f"and return ONLY a JSON object with keys 'agent_name' and 'agent_address'. "
+        f"If no exact match or no registered agent section exists, return "
+        f"{{\"agent_name\": null, \"agent_address\": null}}."
+    )
+
+    proxy = get_browser_use_proxy()
+    browser = Browser(headless=True, disable_security=True, proxy=proxy)
+    llm = ChatAnthropic(model="claude-sonnet-4-6")
+
+    agent = Agent(task=task, llm=llm, browser=browser)
+    result = await agent.run()
+
+    # Parse JSON from agent output
+    import json
+    text = str(result).strip()
+    match = re.search(r"\{[^}]+\}", text)
+    if match:
+        try:
+            data = json.loads(match.group())
+            return data.get("agent_name"), data.get("agent_address")
+        except json.JSONDecodeError:
+            pass
+
+    return None, None
+
+
+# ---------------------------------------------------------------------------
+# Main enrichment loop (sync entry point)
 # ---------------------------------------------------------------------------
 
 def enrich_llc_owners(
     session: Session,
-    limit: int = 500,
+    limit: int = 0,
     dry_run: bool = False,
-    urgency_tiers: list = None,
     county_id: str = "hillsborough",
+    headless: bool = True,
 ) -> dict:
     """
-    Query LLC-named owners of high-priority scored leads with no phone/email,
-    search Sunbiz for each, and write contact data back to the Owner record.
-
-    Priority order: Immediate → High → (others if urgency_tiers not set)
-
-    Args:
-        session:       SQLAlchemy session
-        limit:         Max number of owners to process in this run
-        dry_run:       If True, print results without writing to DB
-        urgency_tiers: List of urgency levels to filter (default: Immediate + High)
-
-    Returns:
-        dict with keys: processed, enriched, skipped, failed
+    Query all LLC-owned scored leads (Property → DistressScore join) with no
+    registered agent on file and scrape Sunbiz for each.
     """
     from sqlalchemy import or_, desc
     from src.core.models import DistressScore
 
-    stats = {"processed": 0, "enriched": 0, "manager_found": 0, "skipped": 0, "failed": 0}
-
-    if urgency_tiers is None:
-        urgency_tiers = ["Immediate", "High"]
+    stats = {"processed": 0, "enriched": 0, "skipped": 0, "failed": 0}
 
     llc_keywords = ["%LLC%", "%INC%", "%CORP%", "%LLP%", "%PLLC%", "%LTD%"]
 
-    # Join Owner → Property → DistressScore to get only high-priority scored leads
-    # Order by score descending so highest-value leads are enriched first
-    owners = (
+    q = (
         session.query(Owner)
         .join(Property, Property.id == Owner.property_id)
         .join(DistressScore, DistressScore.property_id == Property.id)
         .filter(
             or_(*[Owner.owner_name.ilike(kw) for kw in llc_keywords]),
-            Owner.phone_1.is_(None),
+            Owner.registered_agent_name.is_(None),
             Owner.owner_name.isnot(None),
-            DistressScore.urgency_level.in_(urgency_tiers),
             Property.county_id == county_id,
         )
-        .order_by(desc(DistressScore.final_cds_score))
-        .limit(limit)
-        .all()
+        .distinct(Owner.id)
+        .order_by(Owner.id, desc(DistressScore.final_cds_score))
     )
+
+    if limit:
+        q = q.limit(limit)
+
+    owners = q.all()
 
     total = len(owners)
-    logger.info(
-        f"[Sunbiz] Found {total} LLC owners in {urgency_tiers} tier(s) without phone numbers"
-    )
+    logger.info(f"[Sunbiz] Found {total} LLC-owned scored leads without registered agent")
 
-    http_session = _build_session()
+    if total == 0:
+        return stats
 
-    for idx, owner in enumerate(owners, 1):
-        stats["processed"] += 1
-        name = owner.owner_name.strip()
-
-        # Skip state-assessed entities, trusts, estates — not searchable on Sunbiz
-        skip_patterns = ["ASSESSED BY DEPT", "ASSESSED BY STATE", "STATE OF FL",
-                         "TRUSTEE", " TRUST", "ESTATE OF"]
-        if any(p in name.upper() for p in skip_patterns):
-            logger.debug(f"[Sunbiz] Skipping non-LLC entity: {name}")
-            stats["skipped"] += 1
-            continue
-
-        logger.info(f"[Sunbiz] [{idx}/{total}] Searching: {name}")
-
-        # Rate-limit
-        time.sleep(_DELAY_BETWEEN_REQUESTS)
-
-        detail_url = _search_sunbiz(http_session, name)
-        if not detail_url:
-            stats["skipped"] += 1
-            continue
-
-        time.sleep(_DELAY_BETWEEN_REQUESTS)
-
-        try:
-            phone, email, manager_name, manager_title = _extract_contact_from_detail(http_session, detail_url)
-        except Exception as e:
-            logger.warning(f"[Sunbiz] Failed to extract contact for '{name}': {e}")
-            stats["failed"] += 1
-            continue
-
-        if not phone and not email and not manager_name:
-            logger.debug(f"[Sunbiz] No data found for '{name}'")
-            stats["skipped"] += 1
-            continue
-
-        if manager_name:
-            logger.info(f"[Sunbiz] Manager: {manager_name} ({manager_title}) for '{name}'")
-        if phone or email:
-            logger.info(f"[Sunbiz] Contact: {name} | phone={phone} | email={email}")
-
-        if not dry_run:
-            if phone:
-                owner.phone_1 = phone
-            if email:
-                owner.email_1 = email
-            if phone or email:
-                owner.skip_trace_success = True
-            if manager_name:
-                owner.manager_name = manager_name
-                owner.manager_title = manager_title
-                stats["manager_found"] += 1
-            if owner.owner_type != "LLC":
-                owner.owner_type = "LLC"
-            if phone or email:
-                stats["enriched"] += 1
-        else:
-            if phone or email:
-                logger.info(f"[Sunbiz] DRY RUN — would write contact for owner_id={owner.id}")
-                stats["enriched"] += 1
-            if manager_name:
-                logger.info(f"[Sunbiz] DRY RUN — would write manager for owner_id={owner.id}")
-                stats["manager_found"] += 1
+    asyncio.run(_run_playwright_batch(owners, dry_run, stats, session, headless=headless))
 
     if not dry_run:
         session.commit()
-        logger.info(f"[Sunbiz] Committed {stats['enriched']} contact + {stats['manager_found']} manager updates to DB")
+        logger.info(f"[Sunbiz] Committed {stats['enriched']} registered agent updates to DB")
 
     return stats
 
 
 def run_sunbiz_pipeline(
-    limit: int = 500,
+    limit: int = 0,
     dry_run: bool = False,
     rescore: bool = False,
-    urgency_tiers: list = None,
     county_id: str = "hillsborough",
-):
-    """
-    Run the full Sunbiz enrichment pipeline.
-
-    Args:
-        limit:         Max owners to process
-        dry_run:       Print results without writing to DB
-        rescore:       Trigger CDS rescore for enriched properties after enrichment
-        urgency_tiers: Urgency levels to target (default: Immediate + High)
-    """
-    if urgency_tiers is None:
-        urgency_tiers = ["Immediate", "High"]
-
+    headless: bool = True,
+) -> dict:
     logger.info("=" * 60)
-    logger.info("SUNBIZ LLC CONTACT ENRICHMENT")
-    logger.info(f"Targeting urgency tiers: {urgency_tiers}")
+    logger.info("SUNBIZ REGISTERED AGENT ENRICHMENT")
+    logger.info(f"Target: all LLC-owned scored leads  county={county_id}")
     logger.info("=" * 60)
     if dry_run:
         logger.info("DRY RUN mode — no DB writes")
 
     with get_db_context() as session:
         stats = enrich_llc_owners(
-            session, limit=limit, dry_run=dry_run, urgency_tiers=urgency_tiers, county_id=county_id
+            session, limit=limit, dry_run=dry_run,
+            county_id=county_id, headless=headless,
         )
 
     logger.info("=" * 60)
     logger.info("SUNBIZ ENRICHMENT COMPLETE")
-    logger.info(f"  Processed      : {stats['processed']}")
-    logger.info(f"  Enriched       : {stats['enriched']}  (phone or email found)")
-    logger.info(f"  Manager found  : {stats['manager_found']}  (name+title stored, no phone yet)")
-    logger.info(f"  Skipped        : {stats['skipped']}  (no Sunbiz match)")
-    logger.info(f"  Failed         : {stats['failed']}")
+    logger.info(f"  Processed : {stats['processed']}")
+    logger.info(f"  Enriched  : {stats['enriched']}  (agent name + address found)")
+    logger.info(f"  Skipped   : {stats['skipped']}  (no Sunbiz match)")
+    logger.info(f"  Failed    : {stats['failed']}")
     logger.info("=" * 60)
 
     if rescore and stats["enriched"] > 0 and not dry_run:
@@ -455,12 +335,11 @@ def run_sunbiz_pipeline(
         try:
             from src.services.cds_engine import MultiVerticalScorer
             with get_db_context() as score_session:
-                # Re-query enriched owner property IDs
                 property_ids = (
                     score_session.query(Owner.property_id)
                     .filter(
                         Owner.owner_type == "LLC",
-                        Owner.skip_trace_success == True,
+                        Owner.registered_agent_name.isnot(None),
                     )
                     .all()
                 )
@@ -485,55 +364,33 @@ def run_sunbiz_pipeline(
                 run_success=True,
                 county_id=county_id,
             )
-        except Exception as _se:
-            logger.warning("[Sunbiz] Could not record scraper stats: %s", _se)
+        except Exception as e:
+            logger.warning("[Sunbiz] Could not record scraper stats: %s", e)
 
     return stats
 
 
 # ---------------------------------------------------------------------------
-# CLI entry point
+# CLI
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import argparse
+
     parser = argparse.ArgumentParser(
-        description="Enrich LLC owner contacts from Florida Sunbiz"
+        description="Enrich LLC owner registered agent info from Florida Sunbiz"
     )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=500,
-        help="Max number of LLC owners to process (default: 500)",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Search Sunbiz and print results without writing to DB",
-    )
-    parser.add_argument(
-        "--rescore",
-        action="store_true",
-        help="Trigger CDS rescore for enriched properties after enrichment",
-    )
-    parser.add_argument(
-        "--tiers",
-        nargs="+",
-        default=["Immediate", "High"],
-        choices=["Immediate", "High", "Medium", "Low"],
-        help="Urgency tiers to target (default: Immediate High)",
-    )
-    parser.add_argument(
-        "--county-id",
-        dest="county_id",
-        default="hillsborough",
-        help="County identifier (default: hillsborough)",
-    )
+    parser.add_argument("--limit", type=int, default=0, help="Max owners to process (0 = all)")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--rescore", action="store_true")
+    parser.add_argument("--county-id", dest="county_id", default="hillsborough")
+    parser.add_argument("--headful", action="store_true", help="Run browser in headful (visible) mode")
     args = parser.parse_args()
 
     run_sunbiz_pipeline(
         limit=args.limit,
         dry_run=args.dry_run,
         rescore=args.rescore,
-        urgency_tiers=args.tiers,
         county_id=args.county_id,
+        headless=not args.headful,
     )

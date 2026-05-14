@@ -268,24 +268,30 @@ def _node_finalize(state: AcceleratedWalletPushState) -> AcceleratedWalletPushSt
     offer_id: Optional[int] = None
 
     if final_status == "completed" and state.get("sent"):
-        # Persist the offer for the funnel + tie SMS reply back via Redis.
+        # Reuse the offer row created upstream by ensure_offer_row() (called
+        # from the webhook handler). If missing (legacy path), create it.
         try:
             from src.core.database import Database
             from src.core.models import WalletPushOffer
+            from src.services import wallet_engine
             with Database().session_scope() as session:
-                offer = WalletPushOffer(
-                    subscriber_id=state["subscriber_id"],
-                    decision_id=state.get("decision_id"),
-                    framing_variant=state.get("framing_variant") or "credits_ready",
-                    ab_variant=state.get("ab_variant"),
-                    tier=payload.get("tier") or "starter_wallet",
-                    status="offered",
+                offer = wallet_engine.ensure_offer_row(
+                    state["subscriber_id"],
+                    {"tier": payload.get("tier") or "starter_wallet",
+                     "reason": "agent_sms_sent"},
+                    session,
                 )
-                session.add(offer)
+                # Stamp agent-side metadata if this is the row we just promoted.
+                if not offer.decision_id:
+                    offer.decision_id = state.get("decision_id")
+                if not offer.framing_variant or offer.framing_variant == "credits_ready":
+                    offer.framing_variant = state.get("framing_variant") or "credits_ready"
+                if not offer.ab_variant and state.get("ab_variant"):
+                    offer.ab_variant = state.get("ab_variant")
                 session.flush()
                 offer_id = offer.id
         except Exception as exc:
-            logger.warning("wallet_push_offer insert failed: %s", exc)
+            logger.warning("wallet_push_offer ensure failed: %s", exc)
 
         # fa017: business event audit (offer sent successfully)
         try:

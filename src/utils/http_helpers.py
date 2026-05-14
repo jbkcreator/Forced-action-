@@ -28,7 +28,7 @@ def get_playwright_proxy() -> Optional[dict]:
     if settings.oxylabs_rotate:
         username = f"{username}-sessid-{uuid4().hex[:8]}"
     password = settings.oxylabs_password.get_secret_value()
-    logger.info(f"[Proxy] Using proxy: ...@pr.oxylabs.io:7777 (user: {username})")
+    logger.info(f"[Proxy] Using proxy")
     return {
         "server": "http://pr.oxylabs.io:7777",
         "username": username,

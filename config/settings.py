@@ -228,6 +228,10 @@ class AppSettings(BaseSettings):
 	# Auto-flipped to False if Day-35 take_rate < wallet_adoption.floor_pct (12%).
 	accelerated_wallet_push_enabled: bool = Field(default=False, env="ACCELERATED_WALLET_PUSH_ENABLED")
 
+	# TCPA quiet-hours enforcement (8am–9pm recipient local time).
+	# Set False in dev/staging to send SMS at any hour during testing.
+	sms_quiet_hours_enabled: bool = Field(default=True, env="SMS_QUIET_HOURS_ENABLED")
+
 	# NWS Weather / Storm Pack (fa018)
 	# nws_weather_enabled      — master kill switch for entire NWS subsystem
 	# nws_revenue_polling_enabled — controls whether poller triggers storm pack / Cora

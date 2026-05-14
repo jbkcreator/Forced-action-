@@ -142,6 +142,14 @@ COUNTY_ID=hillsborough
 # Unmatched record rematch — Sunday 03:30 AM UTC
 30 3 * * 0 $PROJECT/scripts/cron/run.sh src.tasks.rematch_unmatched
 
+# ── DBPR CONTRACTOR REGISTRY ─────────────────────────────────────────────────
+# Weekly file sync — Sunday 02:00 AM UTC (before enrichment jobs start).
+# Downloads certified + registered files, deduplicates by license_number,
+# filters to Hillsborough ZIPs, upserts dbpr_contacts, purges stale registered
+# rows (revoked/upgraded licenses), deletes downloaded file after load.
+0 2 * * 0 $PROJECT/scripts/cron/run.sh src.scrappers.dbpr.dbpr_engine --source certified --county $COUNTY_ID
+15 2 * * 0 $PROJECT/scripts/cron/run.sh src.scrappers.dbpr.dbpr_engine --source registered --county $COUNTY_ID
+
 # ── STAGE 5: BUNDLES + AUTOPILOT + ANNUAL ───────────────────────────────────
 # Bundle dispatcher — every hour, contextually offers Weekend / Storm /
 # ZIP Booster / Monthly Reload bundles to wallet subscribers (with A/B pricing)

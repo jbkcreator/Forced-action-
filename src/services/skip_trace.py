@@ -199,6 +199,57 @@ def _parse_result(person: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# LLC agent name / address helpers
+# ---------------------------------------------------------------------------
+
+def _split_agent_name(name: str):
+    """
+    Split a Sunbiz registered agent name into (first, last).
+    Handles "LAST, FIRST" and "FIRST LAST" formats.
+    Returns ("", full_name) if ambiguous.
+    """
+    name = name.strip()
+    if "," in name:
+        parts = [p.strip() for p in name.split(",", 1)]
+        return parts[1], parts[0]  # LAST, FIRST → first, last
+    parts = name.split()
+    if len(parts) >= 2:
+        return parts[0], " ".join(parts[1:])
+    return "", name
+
+
+def _parse_agent_address(address: str) -> Optional[dict]:
+    """
+    Parse a Sunbiz agent address block into BatchData address dict.
+    Expected format (from Sunbiz detail page):
+        13909 LYNMAR BLVD
+        TAMPA, FL 33626
+    """
+    lines = [l.strip() for l in address.strip().splitlines() if l.strip()]
+    if len(lines) < 2:
+        return None
+
+    street = lines[0]
+    # Second line: "CITY, STATE ZIP" or "CITY STATE ZIP"
+    second = lines[1]
+    # Try "CITY, ST 00000"
+    import re as _re
+    m = _re.match(r"^(.+?),\s*([A-Z]{2})\s+(\d{5}(?:-\d{4})?)", second)
+    if not m:
+        # Try without comma "CITY ST 00000"
+        m = _re.match(r"^(.+?)\s+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)", second)
+    if not m:
+        return None
+
+    return {
+        "street": street,
+        "city":   m.group(1).strip(),
+        "state":  m.group(2),
+        "zip":    m.group(3)[:5],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main runner
 # ---------------------------------------------------------------------------
 
@@ -364,24 +415,42 @@ def run_skip_trace(
         index_map = []  # parallel list: index_map[i] = (owner, prop) for payloads[i]
 
         for owner, prop in batch:
-            street = (prop.address or "").strip()
-            city   = (prop.city or "Tampa").strip()
-            state  = (prop.state or "FL").strip()
-            zip_code = (prop.zip or "").strip()[:5]  # always 5-digit
-
-            if not street or not zip_code:
-                stats["no_address"] += 1
-                logger.debug(f"Skipping property_id={prop.id} — missing address or ZIP")
-                continue
-
-            payload_entry = {
-                "propertyAddress": {
-                    "street": street,
-                    "city":   city,
-                    "state":  state,
-                    "zip":    zip_code,
+            # LLC with registered agent — skip trace the agent by name + address
+            if owner.owner_type == "LLC" and owner.registered_agent_name and owner.registered_agent_address:
+                first_name, last_name = _split_agent_name(owner.registered_agent_name)
+                agent_addr = _parse_agent_address(owner.registered_agent_address)
+                if not agent_addr:
+                    stats["no_address"] += 1
+                    logger.debug(f"Skipping property_id={prop.id} — cannot parse agent address")
+                    continue
+                payload_entry = {
+                    "firstName": first_name,
+                    "lastName":  last_name,
+                    "address": agent_addr,
                 }
-            }
+                logger.debug(
+                    f"[LLC] property_id={prop.id} tracing agent: {first_name} {last_name} @ {agent_addr['street']}"
+                )
+            else:
+                # Individual owner — use property address as before
+                street = (prop.address or "").strip()
+                city   = (prop.city or "Tampa").strip()
+                state  = (prop.state or "FL").strip()
+                zip_code = (prop.zip or "").strip()[:5]
+
+                if not street or not zip_code:
+                    stats["no_address"] += 1
+                    logger.debug(f"Skipping property_id={prop.id} — missing address or ZIP")
+                    continue
+
+                payload_entry = {
+                    "propertyAddress": {
+                        "street": street,
+                        "city":   city,
+                        "state":  state,
+                        "zip":    zip_code,
+                    }
+                }
 
             payloads.append(payload_entry)
             index_map.append((owner, prop))

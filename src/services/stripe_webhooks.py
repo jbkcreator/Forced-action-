@@ -531,7 +531,8 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
     # Skipped when we merged onto an existing row — subscriber is already onboarded.
     if is_new_subscriber:
         if subscriber.email:
-            _send_welcome_email(subscriber)
+            from src.services.email import send_welcome_email
+            send_welcome_email(subscriber)
 
         if subscriber.email and zip_codes:
             try:
@@ -585,168 +586,6 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
         subscriber.id, tier, vertical, is_founding,
         zip_codes, subscriber.event_feed_uuid,
     )
-
-
-# ---------------------------------------------------------------------------
-# Welcome email helper
-# ---------------------------------------------------------------------------
-
-def _send_welcome_email(subscriber: "Subscriber") -> None:
-    """Send the post-checkout welcome email containing the Event Feed UUID link."""
-    from src.services.email import send_email
-    from config.settings import get_settings
-
-    _settings = get_settings()
-
-    name = subscriber.name or "there"
-    tier = (subscriber.tier or "starter").title()
-    vertical = (subscriber.vertical or "").replace("_", " ").title()
-    founding = subscriber.founding_member
-
-    feed_url = (
-        f"{_settings.app_base_url}/dashboard/{subscriber.event_feed_uuid}"
-        if subscriber.event_feed_uuid
-        else _settings.app_base_url
-    )
-
-    subject = (
-        "You're in — your Forced Action feed is ready"
-        if not founding
-        else "Founding member confirmed — your rate is locked forever"
-    )
-
-    # ── Plain-text body ────────────────────────────────────────────────────
-    founding_line = (
-        "\nAs a founding member your rate is locked for as long as you stay subscribed.\n"
-        if founding else ""
-    )
-    body_text = (
-        f"Hi {name},\n\n"
-        f"Welcome to Forced Action.\n"
-        f"{founding_line}\n"
-        f"Plan: {tier} — {vertical}\n\n"
-        f"Your private Event Feed is live. Bookmark this link — it's yours alone:\n"
-        f"{feed_url}\n\n"
-        f"New distressed property leads matching your territory and vertical will appear "
-        f"here automatically as our scrapers run each day.\n\n"
-        f"Questions? Reply to this email or reach us at support@forcedaction.io\n\n"
-        f"— Forced Action Team"
-    )
-
-    # ── HTML body ──────────────────────────────────────────────────────────
-    founding_badge = (
-        '<p style="margin:0 0 16px;padding:10px 16px;background:#451a03;'
-        'border:1px solid #92400e;border-radius:8px;color:#fbbf24;font-size:14px;">'
-        "⭐ Founding Member — your rate is locked for life."
-        "</p>"
-        if founding else ""
-    )
-    body_html = f"""<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/></head>
-<body style="margin:0;padding:0;background:#0f172a;font-family:Inter,Arial,sans-serif;color:#e2e8f0;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f172a;padding:40px 0;">
-    <tr><td align="center">
-      <table width="560" cellpadding="0" cellspacing="0"
-             style="background:#1e293b;border:1px solid rgba(255,255,255,0.08);border-radius:16px;overflow:hidden;max-width:560px;width:100%;">
-
-        <!-- Header -->
-        <tr>
-          <td style="padding:32px 40px 24px;border-bottom:1px solid rgba(255,255,255,0.08);">
-            <p style="margin:0;font-size:22px;font-weight:800;color:#ffffff;">
-              Forced <span style="color:#fbbf24;">Action</span>
-            </p>
-          </td>
-        </tr>
-
-        <!-- Body -->
-        <tr>
-          <td style="padding:32px 40px;">
-            <h1 style="margin:0 0 8px;font-size:26px;font-weight:800;color:#ffffff;">
-              You&rsquo;re in, {name}.
-            </h1>
-            <p style="margin:0 0 24px;color:#94a3b8;font-size:15px;">
-              Your Event Feed is live and your territory is reserved.
-            </p>
-
-            {founding_badge}
-
-            <!-- Plan pill -->
-            <p style="margin:0 0 24px;">
-              <span style="display:inline-block;background:rgba(251,191,36,0.1);border:1px solid rgba(251,191,36,0.3);
-                           color:#fbbf24;font-size:13px;font-weight:700;padding:5px 14px;border-radius:999px;">
-                {tier} &middot; {vertical}
-              </span>
-            </p>
-
-            <!-- CTA -->
-            <p style="margin:0 0 12px;font-size:14px;color:#94a3b8;">
-              Your private feed link — bookmark it:
-            </p>
-            <table cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
-              <tr>
-                <td style="background:#fbbf24;border-radius:8px;">
-                  <a href="{feed_url}"
-                     style="display:inline-block;padding:14px 28px;color:#0f172a;font-size:15px;
-                            font-weight:700;text-decoration:none;">
-                    Open My Event Feed &rarr;
-                  </a>
-                </td>
-              </tr>
-            </table>
-
-            <!-- What to expect -->
-            <table width="100%" cellpadding="0" cellspacing="0"
-                   style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);
-                          border-radius:12px;padding:20px 24px;margin-bottom:24px;">
-              <tr>
-                <td>
-                  <p style="margin:0 0 12px;font-size:14px;font-weight:700;color:#ffffff;">What happens next</p>
-                  <p style="margin:0 0 8px;font-size:13px;color:#94a3b8;">
-                    ✓ &nbsp;Scrapers run daily — new distressed property leads appear automatically.
-                  </p>
-                  <p style="margin:0 0 8px;font-size:13px;color:#94a3b8;">
-                    ✓ &nbsp;Leads are scored across your selected vertical and ranked by urgency.
-                  </p>
-                  <p style="margin:0;font-size:13px;color:#94a3b8;">
-                    ✓ &nbsp;Your territory ZIPs are exclusively yours — no other subscriber sees the same leads.
-                  </p>
-                </td>
-              </tr>
-            </table>
-
-            <p style="margin:0;font-size:13px;color:#64748b;">
-              Questions? Reply to this email or reach us at
-              <a href="mailto:support@forcedaction.io" style="color:#fbbf24;text-decoration:none;">
-                support@forcedaction.io
-              </a>
-            </p>
-          </td>
-        </tr>
-
-        <!-- Footer -->
-        <tr>
-          <td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.08);
-                     font-size:12px;color:#475569;text-align:center;">
-            Forced Action &mdash; Hillsborough County Property Intelligence<br/>
-            <a href="{_settings.app_base_url}" style="color:#475569;">forcedaction.io</a>
-          </td>
-        </tr>
-
-      </table>
-    </td></tr>
-  </table>
-</body>
-</html>"""
-
-    send_email(
-        to=subscriber.email,
-        subject=subject,
-        body_text=body_text,
-        body_html=body_html,
-    )
-
-    logger.info("Welcome email sent → %s (subscriber=%s)", subscriber.email, subscriber.id)
 
 
 def _send_first_leads_email(subscriber, zip_codes: list, db) -> None:
@@ -1540,6 +1379,22 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
     except Exception as exc:
         logger.error("lead_unlock: email send failed: %s", exc, exc_info=True)
 
+    # Welcome email — deferred from /api/free-signup with intent='unlock'.
+    # Sent only on the first unlock so repeat unlocks don't spam the inbox.
+    try:
+        first_unlock = db.execute(
+            select(func.count()).select_from(SentLead).where(
+                SentLead.subscriber_id == subscriber.id,
+                SentLead.source == "lead_unlock_payment",
+            )
+        ).scalar() or 0
+        if first_unlock <= 1:
+            from src.services.email import send_welcome_email
+            send_welcome_email(subscriber)
+    except Exception as exc:
+        logger.warning("lead_unlock: welcome email failed sub=%s: %s",
+                       subscriber.id, exc)
+
     logger.info(
         "lead_unlock complete: subscriber=%s property=%s pi=%s",
         subscriber.id, property_id, payment_intent.get("id"),
@@ -1644,8 +1499,19 @@ def _on_card_saved(payment_intent: dict, db: Session) -> None:
 
     from src.core.redis_client import rset
     rset(f"saved_card_window:{subscriber.id}", "1", ttl_seconds=600)
+    db.flush()
 
     logger.info("Default card saved for subscriber=%s pm=%s", subscriber.id, pm_id)
+
+    # +2 bonus credits on first save-card event. Creates WalletBalance so the
+    # dashboard wallet card becomes visible (Stage 5).
+    try:
+        from src.services import wallet_engine
+        granted = wallet_engine.check_saved_card_bonus(subscriber.id, db)
+        if granted:
+            logger.info("+2 bonus credits granted to subscriber=%s (saved_card)", subscriber.id)
+    except Exception as exc:
+        logger.warning("saved_card_bonus grant failed sub=%s: %s", subscriber.id, exc)
 
     # fa017: business event audit
     try:
@@ -1664,6 +1530,10 @@ def _on_card_saved(payment_intent: dict, db: Session) -> None:
         from src.services import wallet_engine
         eligible = wallet_engine.accelerated_push_eligible(subscriber.id, db)
         if eligible:
+            try:
+                wallet_engine.ensure_offer_row(subscriber.id, eligible, db)
+            except Exception as exc_offer:
+                logger.warning("ensure_offer_row failed sub=%s: %s", subscriber.id, exc_offer)
             try:
                 from src.services.business_events import log_business_event
                 log_business_event(
@@ -1720,6 +1590,15 @@ def _on_payment_method_attached(pm: dict, db: Session) -> None:
     db.flush()
     logger.info("payment_method.attached: subscriber=%s pm=%s saved", subscriber.id, pm_id)
 
+    # +2 bonus credits on first save-card event.
+    try:
+        from src.services import wallet_engine
+        granted = wallet_engine.check_saved_card_bonus(subscriber.id, db)
+        if granted:
+            logger.info("+2 bonus credits granted to subscriber=%s (pm.attached)", subscriber.id)
+    except Exception as exc:
+        logger.warning("saved_card_bonus grant failed sub=%s: %s", subscriber.id, exc)
+
     # fa017: business event audit
     try:
         from src.services.business_events import log_business_event
@@ -1735,6 +1614,10 @@ def _on_payment_method_attached(pm: dict, db: Session) -> None:
         from src.services import wallet_engine
         eligible = wallet_engine.accelerated_push_eligible(subscriber.id, db)
         if eligible:
+            try:
+                wallet_engine.ensure_offer_row(subscriber.id, eligible, db)
+            except Exception as exc_offer:
+                logger.warning("ensure_offer_row failed sub=%s: %s", subscriber.id, exc_offer)
             try:
                 from src.services.business_events import log_business_event
                 log_business_event(

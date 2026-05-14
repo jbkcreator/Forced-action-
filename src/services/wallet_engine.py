@@ -362,6 +362,40 @@ def accelerated_push_eligible(subscriber_id: int, db: Session) -> Optional[dict]
     }
 
 
+def ensure_offer_row(subscriber_id: int, eligibility: dict, db: Session):
+    """Idempotent: return existing 'offered' row for this subscriber, else create one.
+
+    Called as soon as `accelerated_push_eligible()` returns truthy, BEFORE
+    agent dispatch — so the in-app surface (`subscriber.accelerated_wallet_offer_active`
+    computed from this table) is populated regardless of whether the SMS
+    delivery succeeds.
+    """
+    from src.core.models import WalletPushOffer
+
+    existing = db.execute(
+        select(WalletPushOffer).where(
+            WalletPushOffer.subscriber_id == subscriber_id,
+            WalletPushOffer.status == "offered",
+        )
+    ).scalar_one_or_none()
+    if existing:
+        return existing
+
+    offer = WalletPushOffer(
+        subscriber_id=subscriber_id,
+        framing_variant="credits_ready",
+        tier=eligibility.get("tier", "starter_wallet"),
+        status="offered",
+    )
+    db.add(offer)
+    db.flush()
+    logger.info(
+        "WalletPushOffer ensured sub=%s offer=%s trigger=%s",
+        subscriber_id, offer.id, eligibility.get("reason"),
+    )
+    return offer
+
+
 def activate_via_saved_card(
     subscriber_id: int, tier: str, db: Session, offer_id: int
 ) -> dict:
@@ -478,14 +512,31 @@ def add_bonus(subscriber_id: int, amount: int, reason: str, db: Session) -> Wall
 
 
 def check_saved_card_bonus(subscriber_id: int, db: Session) -> bool:
-    from src.core.redis_client import redis_available, rget
+    """Grant 2 bonus credits if the subscriber saved a card within the 10-min
+    window (Redis key set by stripe webhook). Idempotent — the Redis key is
+    consumed on successful grant so repeat calls in the same window are
+    no-ops. Also short-circuits if any 'saved_card_bonus' transaction already
+    exists for this subscriber (defense-in-depth if Redis is unavailable).
+    """
+    from src.core.redis_client import redis_available, rget, rdelete
+    from sqlalchemy import select as _select
     if not redis_available():
         return False
     key = f"saved_card_window:{subscriber_id}"
-    if rget(key):
-        add_bonus(subscriber_id, 2, "saved_card_bonus", db)
-        return True
-    return False
+    if not rget(key):
+        return False
+    already = db.execute(
+        _select(func.count()).select_from(WalletTransaction).where(
+            WalletTransaction.subscriber_id == subscriber_id,
+            WalletTransaction.description == "saved_card_bonus",
+        )
+    ).scalar() or 0
+    if already > 0:
+        rdelete(key)
+        return False
+    add_bonus(subscriber_id, 2, "saved_card_bonus", db)
+    rdelete(key)
+    return True
 
 
 def check_accelerated_push(subscriber_id: int, db: Session) -> Optional[str]:

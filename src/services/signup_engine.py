@@ -106,17 +106,25 @@ def create_free_account(
     campaign_id: Optional[str] = None,
     attribution_token: Optional[str] = None,
 ) -> Subscriber:
-    """Create a free (tier='free') Subscriber from a phone number.
+    """Create (or re-use) a free Subscriber keyed by phone number.
 
-    `source` is the canonical signup channel and persists to
-    `Subscriber.signup_source`; the optional utm_*/campaign_id/attribution_token
-    kwargs are stored as free-text marketing attribution.
-
-    Idempotency note: no phone field on Subscriber yet — creates a new row each
-    time. Will be deduplicated once Subscriber.phone is added in 2B-2.
+    Idempotent — if a Subscriber with this normalized E.164 phone already
+    exists, returns it without creating a duplicate. New rows store the
+    normalized phone so subsequent calls hit the dedup path.
     """
+    normalized = _normalize_phone(phone)
+
+    # Dedup: return existing subscriber for this phone number
+    if normalized:
+        existing = db.query(Subscriber).filter_by(phone=normalized).first()
+        if existing:
+            logger.info(
+                "Free account deduped: subscriber=%d phone=%s source=%s",
+                existing.id, normalized, source,
+            )
+            return existing
+
     now = datetime.now(timezone.utc)
-    # Stripe customer ID placeholder until user completes checkout
     stripe_placeholder = f"free_{uuid.uuid4().hex[:12]}"
 
     sub = Subscriber(
@@ -128,6 +136,7 @@ def create_free_account(
         status="active",
         event_feed_uuid=str(uuid.uuid4()),
         name=name,
+        phone=normalized,
         signup_source=_coerce_signup_source(source, default="missed_call"),
         utm_source=(utm_source or None) and utm_source[:100],
         utm_medium=(utm_medium or None) and utm_medium[:100],
@@ -205,6 +214,7 @@ def create_free_account_by_email(
 	utm_campaign: Optional[str] = None,
 	campaign_id: Optional[str] = None,
 	attribution_token: Optional[str] = None,
+	send_welcome: bool = True,
 ) -> Subscriber:
 	"""
 	Create (or re-use) a free-tier Subscriber keyed by email.
@@ -303,6 +313,18 @@ def create_free_account_by_email(
 			process_signup(sub.id, referral_code, db)
 		except Exception as exc:
 			logger.warning("Referral processing failed for subscriber %d: %s", sub.id, exc)
+
+	if send_welcome:
+		try:
+			from src.services.email import send_welcome_email
+			send_welcome_email(sub)
+		except Exception as exc:
+			logger.warning("Welcome email failed for new subscriber %d: %s", sub.id, exc)
+	else:
+		logger.info(
+			"Welcome email deferred for subscriber=%d — caller will send post-payment",
+			sub.id,
+		)
 
 	return sub
 
