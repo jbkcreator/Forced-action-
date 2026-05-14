@@ -2491,7 +2491,7 @@ async def telnyx_inbound(request: Request, db: Session = Depends(get_db)):
     The handlers downstream are vendor-neutral; only the payload shape and
     signature scheme change here.
     """
-    from src.services.sms_compliance import handle_inbound, send_sms
+    from src.services.sms_compliance import handle_inbound, handle_opt_in_reply, send_sms
     from src.services import sms_commands
     from src.services.telnyx_signature import (
         SIGNATURE_HEADER, TIMESTAMP_HEADER, verify as verify_telnyx_signature,
@@ -2557,12 +2557,19 @@ async def telnyx_inbound(request: Request, db: Session = Depends(get_db)):
     if twiml_reply:
         return Response(content=twiml_reply, media_type="application/xml")
 
+    # 3b. Opt-in confirmation (V5 sentinel-gated). Returns TwiML only when
+    # send_opt_in_prompt previously set the Redis key for this number.
+    # If the key is absent the call returns None and falls through to product commands.
+    opt_in_reply = handle_opt_in_reply(from_number, body, db)
+    if opt_in_reply:
+        return Response(content=opt_in_reply, media_type="application/xml")
+
     # 4. Product command routing — unchanged from the Twilio path.
     command = sms_commands.parse(body)
     if command:
         reply = sms_commands.dispatch(from_number, command, db)
         if reply:
-            send_sms(from_number, reply, db)
+            send_sms(from_number, reply, db, message_type="transactional")
 
     return Response(content="", media_type="application/json")
 
@@ -3723,6 +3730,193 @@ def partner_checkout(req: PartnerCheckoutRequest, db: Session = Depends(get_db))
 def ap_lite_upgrade(req: UpgradeRequest, db: Session = Depends(get_db)):
     req.tier = "autopilot_lite"
     return upgrade(req, db)
+
+
+# ---------------------------------------------------------------------------
+# Referral Core Loop endpoints
+# ---------------------------------------------------------------------------
+
+class ClaimBonusZipRequest(BaseModel):
+    zip_code: str
+
+    @field_validator("zip_code")
+    @classmethod
+    def validate_zip(cls, v: str) -> str:
+        if not _ZIP_RE.match(v):
+            raise ValueError("ZIP code must be exactly 5 digits")
+        return v
+
+
+@app.get("/api/referral/status/{feed_uuid}")
+def referral_status(feed_uuid: str, db: Session = Depends(get_db)):
+    """
+    Returns the referrer's referral program status.
+    Authenticated by event_feed_uuid (same pattern as the lead feed).
+    """
+    subscriber = db.execute(
+        select(Subscriber).where(Subscriber.event_feed_uuid == feed_uuid)
+    ).scalar_one_or_none()
+    if not subscriber:
+        raise HTTPException(status_code=404, detail={"error": "not_found", "message": "Feed not found"})
+
+    from src.core.models import ReferralEvent, ReferralMilestoneAward
+    from config.settings import get_settings
+
+    confirmed_count = len(db.execute(
+        select(ReferralEvent).where(
+            ReferralEvent.referrer_subscriber_id == subscriber.id,
+            ReferralEvent.status.in_(("confirmed", "rewarded")),
+        )
+    ).scalars().all())
+
+    milestones_awarded = [
+        {"milestone": row.milestone, "awarded_at": row.awarded_at.isoformat()}
+        for row in db.execute(
+            select(ReferralMilestoneAward).where(
+                ReferralMilestoneAward.referrer_subscriber_id == subscriber.id
+            )
+        ).scalars().all()
+    ]
+    awarded_names = {m["milestone"] for m in milestones_awarded}
+
+    next_milestone = None
+    if "free_month_3" not in awarded_names and confirmed_count < 3:
+        next_milestone = {"milestone": "free_month_3", "threshold": 3, "remaining": 3 - confirmed_count}
+    elif "lock_slot_5" not in awarded_names and confirmed_count < 5:
+        next_milestone = {"milestone": "lock_slot_5", "threshold": 5, "remaining": 5 - confirmed_count}
+
+    settings = get_settings()
+    base_url = getattr(settings, "base_url", "")
+    share_url = f"{base_url}/share/{subscriber.referral_code}" if subscriber.referral_code else None
+
+    return {
+        "confirmed_count": confirmed_count,
+        "milestones_awarded": milestones_awarded,
+        "next_milestone": next_milestone,
+        "bonus_zip_slots": subscriber.bonus_zip_slots,
+        "share_url": share_url,
+    }
+
+
+@app.post("/api/referral/claim-bonus-zip/{feed_uuid}")
+def claim_bonus_zip(feed_uuid: str, body: ClaimBonusZipRequest, db: Session = Depends(get_db)):
+    """
+    Redeem one bonus ZIP lock slot granted by the 5-referral milestone.
+    Authenticated by event_feed_uuid.
+    """
+    subscriber = db.execute(
+        select(Subscriber).where(Subscriber.event_feed_uuid == feed_uuid)
+    ).scalar_one_or_none()
+    if not subscriber:
+        raise HTTPException(status_code=404, detail={"error": "not_found", "message": "Feed not found"})
+
+    if subscriber.bonus_zip_slots <= 0:
+        raise HTTPException(status_code=409, detail={
+            "error": "no_bonus_slots",
+            "message": "No bonus ZIP slots available. Refer 5 paying users to earn one.",
+        })
+
+    # Validate ZIP is within the subscriber's county (3-digit prefix match)
+    from src.utils.county_config import is_zip_in_county
+    try:
+        in_county = is_zip_in_county(subscriber.county_id, body.zip_code)
+    except KeyError:
+        in_county = True  # unknown county_id — skip strict check rather than 500
+
+    if not in_county:
+        raise HTTPException(status_code=400, detail={
+            "error": "zip_out_of_county",
+            "message": f"ZIP {body.zip_code} is not in your county ({subscriber.county_id}).",
+        })
+
+    # Unique constraint is on (zip_code, vertical, county_id) regardless of
+    # status — fetch any existing row, not just locked ones.
+    existing = db.execute(
+        select(ZipTerritory).where(
+            ZipTerritory.zip_code == body.zip_code,
+            ZipTerritory.vertical == subscriber.vertical,
+            ZipTerritory.county_id == subscriber.county_id,
+        )
+    ).scalar_one_or_none()
+
+    if existing and existing.subscriber_id == subscriber.id:
+        raise HTTPException(status_code=400, detail={
+            "error": "zip_already_owned",
+            "message": f"ZIP {body.zip_code} is already in your territory.",
+        })
+    if existing and existing.status == "locked":
+        raise HTTPException(status_code=400, detail={
+            "error": "zip_already_locked",
+            "message": f"ZIP {body.zip_code} is already locked by another subscriber.",
+        })
+
+    # Grant the bonus ZIP — either reclaim the existing (non-locked) row or
+    # insert a fresh one.
+    from sqlalchemy import update as _update
+    now = datetime.now(timezone.utc)
+    if existing:
+        existing.subscriber_id = subscriber.id
+        existing.status = "locked"
+        existing.locked_at = now
+        existing.grace_expires_at = None
+        existing.updated_at = now
+    else:
+        db.add(ZipTerritory(
+            zip_code=body.zip_code,
+            vertical=subscriber.vertical,
+            county_id=subscriber.county_id,
+            subscriber_id=subscriber.id,
+            status="locked",
+            locked_at=now,
+        ))
+    db.execute(
+        _update(Subscriber)
+        .where(Subscriber.id == subscriber.id)
+        .values(bonus_zip_slots=Subscriber.bonus_zip_slots - 1)
+    )
+    db.flush()
+
+    return {
+        "ok": True,
+        "zip_code": body.zip_code,
+        "bonus_zip_slots_remaining": subscriber.bonus_zip_slots - 1,
+    }
+
+
+@app.get("/share/{referral_code}", include_in_schema=False)
+def referral_share_page(referral_code: str, db: Session = Depends(get_db)):
+    """
+    Public referral landing page. Looks up the referrer's vertical and
+    renders current weekly forward-pack copy with a signup CTA.
+    """
+    from src.services.forward_pack_renderer import get_current_copy
+    from fastapi.responses import HTMLResponse
+
+    referrer = db.execute(
+        select(Subscriber).where(Subscriber.referral_code == referral_code)
+    ).scalar_one_or_none()
+    if not referrer:
+        raise HTTPException(status_code=404, detail="Referral link not found")
+
+    copy_body = get_current_copy(referrer.vertical, db)
+    _settings = get_settings()
+    base_url = getattr(_settings, "base_url", "")
+    signup_url = f"{base_url}/?ref={referral_code}"
+
+    html = f"""<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Join Forced Action</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{{font-family:sans-serif;max-width:640px;margin:40px auto;padding:0 20px;line-height:1.6}}
+h1{{font-size:1.5rem}}a.cta{{display:inline-block;margin-top:24px;padding:12px 28px;background:#1a56db;color:#fff;border-radius:6px;text-decoration:none;font-weight:600}}</style>
+</head>
+<body>
+<h1>You've been invited</h1>
+<p>{copy_body or "Join the platform that finds distressed properties before anyone else."}</p>
+<a href="{signup_url}" class="cta">Get started free →</a>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
 
 
 # ---------------------------------------------------------------------------

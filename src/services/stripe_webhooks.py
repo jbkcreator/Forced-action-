@@ -38,6 +38,26 @@ from src.services.ghl_webhook import push_subscriber_to_ghl
 logger = logging.getLogger(__name__)
 
 
+def _attr(obj, key: str, default=None):
+    """Read `key` from a Stripe SDK object or a plain dict.
+
+    The Stripe Python SDK (>=6) returns StripeObject instances that are NOT
+    dict subclasses — calling .get() on them raises AttributeError. This
+    helper resolves the key via attribute access for StripeObjects and via
+    .get() for plain dicts (sandbox simulate-stripe-event path).
+    """
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        v = obj.get(key, default)
+    else:
+        try:
+            v = getattr(obj, key)
+        except AttributeError:
+            return default
+    return v if v is not None else default
+
+
 def _init_stripe() -> bool:
     """Initialise Stripe API key. Returns False if not configured."""
     key = settings.active_stripe_secret_key
@@ -434,12 +454,11 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
     # delivery is a no-op. Best-effort — referral failures must not break
     # the checkout flow.
     try:
-        from src.services.referral_engine import confirm_purchase, reward_referrer
+        from src.services.referral_engine import confirm_purchase
         event = confirm_purchase(subscriber.id, db)
         if event is not None:
-            reward_referrer(event.id, db)
             logger.info(
-                "[Referral] confirmed + rewarded: referee=%d event=%d",
+                "[Referral] confirmed: referee=%d event=%d",
                 subscriber.id, event.id,
             )
     except Exception:
@@ -1283,32 +1302,125 @@ def _on_subscription_deleted(subscription: dict, db: Session) -> None:
 # 6. payment_intent.succeeded — router (lead pack + default card save + bundles)
 # ---------------------------------------------------------------------------
 
-def _on_payment_intent_succeeded(payment_intent: dict, db: Session) -> None:
+def _on_payment_intent_succeeded(payment_intent, db: Session) -> None:
     """Route payment_intent.succeeded to the appropriate sub-handler."""
-    meta = payment_intent.get("metadata", {})
-    product = meta.get("product") or meta.get("kind")   # tolerate both keys
+    meta = _attr(payment_intent, "metadata") or {}
+    product = _attr(meta, "product") or _attr(meta, "kind")   # tolerate both keys
+    pi_id = _attr(payment_intent, "id")
+    customer_id = _attr(payment_intent, "customer")
+    amount = _attr(payment_intent, "amount_received") or _attr(payment_intent, "amount")
+
+    logger.info(
+        "[PI] payment_intent.succeeded received: pi=%s product=%s customer=%s amount=%s meta_keys=%s",
+        pi_id, product, customer_id, amount,
+        sorted(list(meta.keys())) if isinstance(meta, dict) else "stripe_obj",
+    )
 
     if product == "lead_pack":
+        logger.info("[PI] routing -> lead_pack pi=%s", pi_id)
         _on_lead_pack_payment(payment_intent, db)
-        return
-
-    if product == "bundle":
+    elif product == "bundle":
+        logger.info("[PI] routing -> bundle pi=%s", pi_id)
         _on_bundle_payment(payment_intent, db)
-        return
-
-    if product == "premium":
+    elif product == "premium":
+        logger.info("[PI] routing -> premium pi=%s", pi_id)
         _on_premium_payment(payment_intent, db)
-        return
-
-    if product == "wallet_topup":
+    elif product == "wallet_topup":
+        logger.info("[PI] routing -> wallet_topup pi=%s", pi_id)
         _on_wallet_topup_payment(payment_intent, db)
-        return
-
-    if product == "lead_unlock":
+    elif product == "lead_unlock":
+        logger.info("[PI] routing -> lead_unlock (+ card_save) pi=%s", pi_id)
         _on_lead_unlock_payment(payment_intent, db)
         # Fall through to card-save so the unlock also triggers the saved-card flow
-    # Default: check for card save (setup_future_usage=off_session)
-    _on_card_saved(payment_intent, db)
+        _on_card_saved(payment_intent, db)
+    else:
+        logger.info("[PI] routing -> card_save (no product metadata) pi=%s", pi_id)
+        _on_card_saved(payment_intent, db)
+
+    # ── Referral confirmation (any PI-based paid action) ─────────────────
+    # checkout.session.completed handles subscription first-payments; this
+    # branch covers wallet top-ups, premium credits, bundles, lead packs,
+    # and one-off lead unlocks. confirm_purchase is idempotent (matches only
+    # pending events), so a duplicate webhook delivery — or a referee whose
+    # event was already confirmed by an earlier checkout — is a no-op.
+    subscriber_id = _resolve_subscriber_id_from_pi(payment_intent, db)
+    if subscriber_id is None:
+        logger.info(
+            "[Referral] PI %s — no subscriber resolved (meta.subscriber_id missing and "
+            "customer=%s did not match a Subscriber); skipping referral confirm",
+            pi_id, customer_id,
+        )
+        return
+
+    logger.info(
+        "[Referral] PI %s — attempting confirm_purchase(referee=%d, product=%s)",
+        pi_id, subscriber_id, product,
+    )
+    try:
+        from src.services.referral_engine import confirm_purchase
+        event = confirm_purchase(subscriber_id, db)
+        if event is None:
+            logger.info(
+                "[Referral] PI %s — confirm_purchase returned None (no pending event "
+                "for referee=%d; already confirmed or never referred)",
+                pi_id, subscriber_id,
+            )
+        else:
+            logger.info(
+                "[Referral] confirmed via PI: referee=%d event=%d pi=%s product=%s "
+                "referrer=%d confirmed_at=%s",
+                subscriber_id, event.id, pi_id, product,
+                event.referrer_subscriber_id, event.confirmed_at,
+            )
+    except Exception as exc:
+        logger.error(
+            "[Referral] PI-path confirm failed for subscriber %s — non-fatal: %s",
+            subscriber_id, exc, exc_info=True,
+        )
+
+
+def _resolve_subscriber_id_from_pi(payment_intent, db: Session) -> Optional[int]:
+    """Best-effort subscriber resolution for a PaymentIntent.
+
+    `payment_intent` arrives from the Stripe webhook handler as a
+    stripe.StripeObject, which exposes fields as attributes (not as plain
+    dict keys reachable via .get()). Use getattr throughout so the same
+    code works for both the SDK object and any plain-dict payload that
+    may come through the sandbox simulate-stripe-event path.
+
+    Prefers metadata.subscriber_id (set by wallet_topup, premium, bundle,
+    lead_pack flows). Falls back to Stripe customer id -> Subscriber lookup
+    for paths that don't set the metadata (lead_unlock, plain card-save).
+    Returns None if neither yields a hit.
+    """
+    from src.core.models import Subscriber
+
+    meta = _attr(payment_intent, "metadata") or {}
+    raw = _attr(meta, "subscriber_id")
+    if raw is not None:
+        try:
+            sid = int(raw)
+            logger.debug("[Referral] subscriber resolved via metadata.subscriber_id=%d", sid)
+            return sid
+        except (TypeError, ValueError):
+            logger.warning("[Referral] non-int subscriber_id in PI metadata: %r", raw)
+
+    customer_id = _attr(payment_intent, "customer")
+    if customer_id:
+        sub = db.execute(
+            select(Subscriber).where(Subscriber.stripe_customer_id == customer_id)
+        ).scalar_one_or_none()
+        if sub is not None:
+            logger.debug(
+                "[Referral] subscriber resolved via stripe_customer_id=%s -> id=%d",
+                customer_id, sub.id,
+            )
+            return sub.id
+        logger.debug(
+            "[Referral] stripe_customer_id=%s did not match any Subscriber row",
+            customer_id,
+        )
+    return None
 
 
 def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
@@ -1322,14 +1434,14 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
     """
     from src.core.models import Property, Owner, DistressScore, EnrichedContact, Subscriber, SentLead
 
-    meta = payment_intent.get("metadata", {}) or {}
-    property_id_raw = meta.get("property_id")
-    customer_id = payment_intent.get("customer")
+    meta = _attr(payment_intent, "metadata") or {}
+    property_id_raw = _attr(meta, "property_id")
+    customer_id = _attr(payment_intent, "customer")
 
     if not property_id_raw or not customer_id:
         logger.warning(
             "lead_unlock payment missing property_id or customer: pi=%s",
-            payment_intent.get("id"),
+            _attr(payment_intent, "id"),
         )
         return
 
@@ -1383,10 +1495,10 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
                 subscriber_id=subscriber.id,
                 property_id=property_id,
                 source="lead_unlock_payment",
-                stripe_payment_intent_id=payment_intent.get("id"),
+                stripe_payment_intent_id=_attr(payment_intent, "id"),
             ))
         elif existing_sent and not existing_sent.stripe_payment_intent_id:
-            existing_sent.stripe_payment_intent_id = payment_intent.get("id")
+            existing_sent.stripe_payment_intent_id = _attr(payment_intent, "id")
     except (IntegrityError, OperationalError) as exc:
         logger.warning("lead_unlock: SentLead insert failed: %s", exc)
 
@@ -1398,7 +1510,7 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
 
     logger.info(
         "lead_unlock complete: subscriber=%s property=%s pi=%s",
-        subscriber.id, property_id, payment_intent.get("id"),
+        subscriber.id, property_id, _attr(payment_intent, "id"),
     )
 
 
@@ -1482,17 +1594,27 @@ def _send_lead_unlock_email(subscriber, prop, score, owner, enriched) -> None:
     logger.info("lead_unlock email sent → %s (property=%s)", subscriber.email, prop.id)
 
 
-def _on_card_saved(payment_intent: dict, db: Session) -> None:
-    customer_id = payment_intent.get("customer")
-    pm_id = payment_intent.get("payment_method")
-    setup_future = payment_intent.get("setup_future_usage")
+def _on_card_saved(payment_intent, db: Session) -> None:
+    customer_id = _attr(payment_intent, "customer")
+    pm_id = _attr(payment_intent, "payment_method")
+    setup_future = _attr(payment_intent, "setup_future_usage")
+    pi_id = _attr(payment_intent, "id")
     if not all([customer_id, pm_id, setup_future == "off_session"]):
+        logger.debug(
+            "[CardSave] skipping pi=%s — customer=%s pm=%s setup_future=%s",
+            pi_id, customer_id, pm_id, setup_future,
+        )
         return
 
     subscriber = db.execute(
         select(Subscriber).where(Subscriber.stripe_customer_id == customer_id)
     ).scalar_one_or_none()
-    if not subscriber or subscriber.has_saved_card:
+    if not subscriber:
+        logger.info("[CardSave] no subscriber for customer=%s pi=%s", customer_id, pi_id)
+        return
+    if subscriber.has_saved_card:
+        logger.debug("[CardSave] subscriber=%s already has saved card; pi=%s",
+                     subscriber.id, pi_id)
         return
 
     subscriber.has_saved_card = True
@@ -1504,15 +1626,15 @@ def _on_card_saved(payment_intent: dict, db: Session) -> None:
     logger.info("Default card saved for subscriber=%s pm=%s", subscriber.id, pm_id)
 
 
-def _on_bundle_payment(payment_intent: dict, db: Session) -> None:
+def _on_bundle_payment(payment_intent, db: Session) -> None:
     from src.core.models import BundlePurchase
-    meta = payment_intent.get("metadata", {})
-    pi_id = payment_intent.get("id")
-    bundle_type = meta.get("bundle_type")
-    subscriber_id_str = meta.get("subscriber_id")
-    zip_code = meta.get("zip_code")
-    vertical = meta.get("vertical")
-    ab_variant = meta.get("ab_variant") or None  # Stage 5: optional 'a'/'b'
+    meta = _attr(payment_intent, "metadata") or {}
+    pi_id = _attr(payment_intent, "id")
+    bundle_type = _attr(meta, "bundle_type")
+    subscriber_id_str = _attr(meta, "subscriber_id")
+    zip_code = _attr(meta, "zip_code")
+    vertical = _attr(meta, "vertical")
+    ab_variant = _attr(meta, "ab_variant") or None  # Stage 5: optional 'a'/'b'
 
     if not all([pi_id, bundle_type, subscriber_id_str]):
         logger.error("[Bundle] payment_intent.succeeded missing metadata: %s", meta)
@@ -1557,7 +1679,7 @@ def _on_bundle_payment(payment_intent: dict, db: Session) -> None:
 # 6c. payment_intent.succeeded — Stage 5 premium credit SKUs
 # ---------------------------------------------------------------------------
 
-def _on_premium_payment(payment_intent: dict, db: Session) -> None:
+def _on_premium_payment(payment_intent, db: Session) -> None:
     """
     Handle cash-paid premium SKU purchases (report / brief / transfer / byol).
 
@@ -1571,10 +1693,10 @@ def _on_premium_payment(payment_intent: dict, db: Session) -> None:
     from src.core.models import PremiumPurchase
     from src.services.premium_engine import record_card_purchase, fulfill
 
-    meta = payment_intent.get("metadata", {}) or {}
-    pi_id = payment_intent.get("id")
-    sku = meta.get("sku")
-    subscriber_id_str = meta.get("subscriber_id")
+    meta = _attr(payment_intent, "metadata") or {}
+    pi_id = _attr(payment_intent, "id")
+    sku = _attr(meta, "sku")
+    subscriber_id_str = _attr(meta, "subscriber_id")
 
     if not all([pi_id, sku, subscriber_id_str]):
         logger.error("[Premium] payment_intent missing metadata: pi=%s meta=%s", pi_id, meta)
@@ -1594,7 +1716,7 @@ def _on_premium_payment(payment_intent: dict, db: Session) -> None:
         logger.error("[Premium] non-int subscriber_id=%r", subscriber_id_str)
         return
 
-    property_id_raw = meta.get("property_id")
+    property_id_raw = _attr(meta, "property_id")
     property_id: Optional[int] = None
     if property_id_raw:
         try:
@@ -1602,8 +1724,8 @@ def _on_premium_payment(payment_intent: dict, db: Session) -> None:
         except (TypeError, ValueError):
             logger.warning("[Premium] non-int property_id=%r", property_id_raw)
 
-    target_address = meta.get("target_address")
-    amount_cents = payment_intent.get("amount_received") or payment_intent.get("amount")
+    target_address = _attr(meta, "target_address")
+    amount_cents = _attr(payment_intent, "amount_received") or _attr(payment_intent, "amount")
 
     purchase = record_card_purchase(
         subscriber_id=subscriber_id,
@@ -1632,7 +1754,7 @@ def _on_premium_payment(payment_intent: dict, db: Session) -> None:
 # 6e. payment_intent.succeeded — wallet top-ups (Stage 5+, fa004 2026-05-04)
 # ---------------------------------------------------------------------------
 
-def _on_wallet_topup_payment(payment_intent: dict, db: Session) -> None:
+def _on_wallet_topup_payment(payment_intent, db: Session) -> None:
     """Credit the subscriber's wallet for a successful wallet top-up.
 
     Idempotent on the PaymentIntent id — replayed events become a no-op
@@ -1642,11 +1764,11 @@ def _on_wallet_topup_payment(payment_intent: dict, db: Session) -> None:
     from src.core.models import Subscriber, WalletTransaction
     from src.services import wallet_engine
 
-    meta = payment_intent.get("metadata", {}) or {}
-    pi_id = payment_intent.get("id")
-    subscriber_id_str = meta.get("subscriber_id")
-    credits_str = meta.get("credits")
-    amount_cents_str = meta.get("amount_cents")
+    meta = _attr(payment_intent, "metadata") or {}
+    pi_id = _attr(payment_intent, "id")
+    subscriber_id_str = _attr(meta, "subscriber_id")
+    credits_str = _attr(meta, "credits")
+    amount_cents_str = _attr(meta, "amount_cents")
 
     if not all([pi_id, subscriber_id_str, credits_str]):
         logger.error("[WalletTopup] missing metadata: pi=%s meta=%s", pi_id, meta)
@@ -1931,16 +2053,16 @@ def _on_lead_pack_payment(payment_intent: dict, db: Session) -> None:
         vertical   = e.g. "roofing"
         county_id  = e.g. "hillsborough"
     """
-    meta = payment_intent.get("metadata", {})
-    if meta.get("product") != "lead_pack":
+    meta = _attr(payment_intent, "metadata") or {}
+    if _attr(meta, "product") != "lead_pack":
         # Not a lead pack payment — silently ignore
         return
 
-    stripe_payment_intent_id = payment_intent.get("id")
-    feed_uuid  = meta.get("feed_uuid")
-    zip_code   = meta.get("zip_code")
-    vertical   = meta.get("vertical")
-    county_id  = meta.get("county_id", "hillsborough")
+    stripe_payment_intent_id = _attr(payment_intent, "id")
+    feed_uuid  = _attr(meta, "feed_uuid")
+    zip_code   = _attr(meta, "zip_code")
+    vertical   = _attr(meta, "vertical")
+    county_id  = _attr(meta, "county_id", "hillsborough")
 
     if not all([stripe_payment_intent_id, feed_uuid, zip_code, vertical]):
         logger.error(

@@ -28,6 +28,7 @@ from src.core.models import (
 	SmsDeadLetter,
 	SmsOptIn,
 	SmsOptOut,
+	SmsSendLog,
 	Subscriber,
 	UserSegment,
 	WalletBalance,
@@ -163,7 +164,9 @@ def seed_subscriber():
 			s.query(WalletBalance).filter(WalletBalance.subscriber_id == sid).delete(synchronize_session=False)
 			s.query(UserSegment).filter(UserSegment.subscriber_id == sid).delete(synchronize_session=False)
 			s.query(SmsOptIn).filter(SmsOptIn.subscriber_id == sid).delete(synchronize_session=False)
+			s.query(SmsSendLog).filter(SmsSendLog.subscriber_id == sid).delete(synchronize_session=False)
 			if phone:
 				s.query(SmsOptOut).filter(SmsOptOut.phone == phone).delete(synchronize_session=False)
 				s.query(SmsDeadLetter).filter(SmsDeadLetter.phone == phone).delete(synchronize_session=False)
+				s.query(SmsSendLog).filter(SmsSendLog.phone == phone).delete(synchronize_session=False)
 			s.query(Subscriber).filter(Subscriber.id == sid).delete(synchronize_session=False)

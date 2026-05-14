@@ -110,6 +110,7 @@ def _send_alert(settings, anomalies: list[str], total: int, no_answer: int) -> N
                 to=phone,
                 body=message[:320],
                 db=db,
+                message_type="transactional",
                 task_type="cora_anomaly",
                 campaign="cora_anomaly_alert",
             )

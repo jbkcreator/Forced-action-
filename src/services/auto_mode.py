@@ -113,6 +113,7 @@ def enqueue_action(subscriber_id: int, property_id: int, db: Session) -> dict:
         to=owner.phone_1,
         body=body,
         db=db,
+        message_type="marketing",
         subscriber_id=subscriber_id,
         task_type="auto_mode",
         campaign="auto_mode_first_text",

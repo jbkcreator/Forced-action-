@@ -1,0 +1,13 @@
+system: |
+  You write short, professional referral messages for a real estate intelligence platform.
+  Output rules (strict):
+  - Plain text only. One message. No preamble, no quotes, no labels.
+  - 90–160 characters total. Must end with '.', '?', or '!'.
+  - Complete sentences only. No truncated words.
+  - Professional tone. No slang, no emojis, no hashtags, no greetings like "Yo", "Hey", or "Hi".
+  - No marketing clichés ("game-changer", "revolutionary", "level up", "crush it").
+  - Refer to the platform generically as "this platform" — do not invent a product name.
+user: |
+  Write one referral message that a real estate attorney would send to a peer attorney.
+  Mention foreclosure, probate, and lien leads filtered by ZIP, with first-come ZIP
+  exclusivity. End with a calm call to review it.

@@ -12,7 +12,8 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from src.core.models import Subscriber
+from src.core.models import Subscriber, SmsOptIn
+from src.services.phone_utils import normalize as _normalize_phone
 
 logger = logging.getLogger(__name__)
 
@@ -63,17 +64,18 @@ def dispatch(from_number: str, command: str, db: Session) -> str:
 
 
 def _find_subscriber(phone: str, db: Session) -> Optional[Subscriber]:
-    from src.core.models import Owner
-    # Try owner lookup first (phone_1 field on Owner)
-    owner_match = db.execute(
-        select(Owner).where(Owner.phone_1 == phone)
+    canonical = _normalize_phone(phone) or phone
+    row = db.execute(
+        select(SmsOptIn)
+        .where(SmsOptIn.phone == canonical)
+        .order_by(SmsOptIn.opted_in_at.desc())
+        .limit(1)
     ).scalar_one_or_none()
-    if owner_match:
-        # Owner → Property → Subscriber via territory is complex; best effort via email match
-        pass
-    # Direct subscriber lookup by email not possible without phone field on Subscriber
-    # For now return None — will be wired when subscriber.phone field is added in 2B-2
-    return None
+    if row is None or row.subscriber_id is None:
+        return None
+    return db.execute(
+        select(Subscriber).where(Subscriber.id == row.subscriber_id)
+    ).scalar_one_or_none()
 
 
 def _handle_balance(sub: Subscriber, db: Session) -> str:

@@ -197,6 +197,7 @@ def _dispatch_offer(sub: Subscriber, bundle_type: str, db: Session) -> bool:
         to=phone,
         body=body,
         db=db,
+        message_type="marketing",
         subscriber_id=sub.id,
         task_type="bundle_offer",
         campaign=f"bundle_{bundle_type}",

@@ -79,7 +79,7 @@ def _send_reminder(sub: Subscriber) -> None:
         if not opt_in or not opt_in.phone:
             logger.warning("pause_reminder: no SMS opt-in phone for sub=%d — skipping SMS", sub.id)
             return
-        send_sms(to=opt_in.phone, body=msg, db=db)
+        send_sms(to=opt_in.phone, body=msg, db=db, message_type="transactional")
 
 
 if __name__ == "__main__":

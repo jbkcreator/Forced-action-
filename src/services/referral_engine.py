@@ -1,12 +1,15 @@
 """
 Referral engine — credit-based referral program.
 
-Referrer receives 20 credits on referee's first purchase.
-Referee receives 10 bonus credits on signup via referral code.
+Reward structure:
+  - Referee receives 10 bonus credits on signup via referral code.
+  - Referrer receives 5 credits per confirmed referral (every referral).
+  - Milestone at 3 confirmed referrals: one-time Stripe free-month coupon.
+  - Milestone at 5 confirmed referrals: one-time +1 bonus ZIP lock slot.
 
-Stage 5 adds team-unlock logic: when a referrer accumulates 3 confirmed
-referrals where every member is in the same county + vertical, a
-ReferralTeam row is created so all three members get a Shared ZIP View.
+Milestones are tracked in referral_milestone_awards (UNIQUE per referrer+milestone)
+so all grants are idempotent. Notifications are published async via Redis Pub/Sub
+by referral_notifier — no SMS in the webhook hot path.
 """
 
 import logging
@@ -20,7 +23,6 @@ from src.core.models import ReferralEvent, ReferralTeam, Subscriber, ZipTerritor
 
 logger = logging.getLogger(__name__)
 
-REFERRER_CREDIT = 20
 REFEREE_CREDIT = 10
 TEAM_UNLOCK_THRESHOLD = 3   # confirmed referrals in same county + vertical
 
@@ -60,7 +62,7 @@ def process_signup(referee_id: int, referral_code: str, db: Session) -> Optional
         referral_code=referral_code,
         status="pending",
         reward_type="credits",
-        reward_value=str(REFERRER_CREDIT),
+        reward_value="5",
     )
     db.add(event)
     db.flush()
@@ -73,6 +75,18 @@ def process_signup(referee_id: int, referral_code: str, db: Session) -> Optional
 
 
 def confirm_purchase(referee_id: int, db: Session) -> Optional[ReferralEvent]:
+    """
+    Called when a referee's first purchase is confirmed (Stripe webhook).
+
+    Orchestrates the full reward flow:
+      1. Transition event pending → confirmed.
+      2. Grant 5 credits to the referrer.
+      3. Evaluate and apply any newly-crossed milestones (free_month, lock_slot).
+      4. Publish async notifications via Redis Pub/Sub (best-effort).
+      5. Check team-unlock (Stage 5).
+    """
+    from config.settings import get_settings
+
     event = db.execute(
         select(ReferralEvent).where(
             ReferralEvent.referee_subscriber_id == referee_id,
@@ -81,16 +95,97 @@ def confirm_purchase(referee_id: int, db: Session) -> Optional[ReferralEvent]:
     ).scalar_one_or_none()
     if not event:
         return None
+
     event.status = "confirmed"
     event.confirmed_at = datetime.now(timezone.utc)
     db.flush()
 
+    referrer_id = event.referrer_subscriber_id
+
+    # Grant per-referral credits
+    from src.services.milestone_grants import (
+        grant_free_month,
+        grant_lock_slot,
+        grant_per_referral_credits,
+    )
+    from src.services.milestone_evaluator import Milestone, evaluate
+    from src.services.referral_notifier import publish
+
+    grant_per_referral_credits(referrer_id, event.id, db)
+
+    # Evaluate and fire milestone grants
+    settings = get_settings()
+    base_url = getattr(settings, "base_url", "")
+    referrer = db.get(Subscriber, referrer_id)
+    share_url = f"{base_url}/share/{referrer.referral_code}" if referrer and referrer.referral_code else ""
+
+    newly_crossed = evaluate(referrer_id, db)
+    for milestone in newly_crossed:
+        if milestone == Milestone.FREE_MONTH_3:
+            grant_free_month(referrer_id, event.id, db)
+        elif milestone == Milestone.LOCK_SLOT_5:
+            grant_lock_slot(referrer_id, event.id, db)
+
+    # Count current confirmed referrals for notification copy
+    n_total = db.execute(
+        select(ReferralEvent).where(
+            ReferralEvent.referrer_subscriber_id == referrer_id,
+            ReferralEvent.status.in_(("confirmed", "rewarded")),
+        )
+    ).scalars().all()
+
+    # Publish async notifications (best-effort; never block on failure)
+    try:
+        publish({
+            "type": "per_referral",
+            "event_id": event.id,
+            "referrer_id": referrer_id,
+            "n_total": len(n_total),
+            "share_url": share_url,
+        })
+        for milestone in newly_crossed:
+            publish({
+                "type": milestone.value,
+                "event_id": event.id,
+                "referrer_id": referrer_id,
+                "n_total": len(n_total),
+                "share_url": share_url,
+            })
+    except Exception as exc:
+        logger.warning("[Referral] notification publish failed: %s", exc)
+
     # Stage 5 — check whether this confirmation completes a 3-person team
     try:
-        _check_team_unlock(event.referrer_subscriber_id, db)
+        _check_team_unlock(referrer_id, db)
     except Exception as exc:
         logger.warning("[Referral] team unlock check failed: %s", exc)
 
+    return event
+
+
+def revoke_referral_event(event_id: int, reason: str, db: Session) -> Optional[ReferralEvent]:
+    """
+    Mark a referral event as revoked (referee refunded / disputed).
+    The referrer keeps any already-granted milestones and per-referral credits.
+    The revoked event no longer counts toward milestone thresholds.
+    Logs to fraud review via standard logger (future: dedicated table).
+    """
+    event = db.get(ReferralEvent, event_id)
+    if not event:
+        return None
+    if event.status == "revoked":
+        return event  # idempotent
+
+    prior_status = event.status
+    event.status = "revoked"
+    db.flush()
+
+    logger.warning(
+        "[Referral][FRAUD_REVIEW] event=%d revoked from status=%s reason=%s "
+        "referrer=%d referee=%d",
+        event_id, prior_status, reason,
+        event.referrer_subscriber_id, event.referee_subscriber_id,
+    )
     return event
 
 
@@ -171,7 +266,7 @@ def _check_team_unlock(referrer_id: int, db: Session) -> Optional[ReferralTeam]:
                 f"Team unlocked! 3 of you in {referrer.county_id.title()} "
                 f"{referrer.vertical} now share a live ZIP heat map. Open your dashboard."
             )
-            send_sms(phone, body, db, subscriber_id=mid, task_type="referral_team_unlock")
+            send_sms(phone, body, db, message_type="transactional", subscriber_id=mid, task_type="referral_team_unlock")
     except Exception as exc:
         logger.warning("[Referral] team unlock SMS failed: %s", exc)
 
@@ -186,7 +281,7 @@ def revoke_team_for_subscriber(subscriber_id: int, reason: str, db: Session) -> 
     Idempotent: already-broken teams are skipped.
     Returns the number of teams actually broken.
     """
-    from sqlalchemy import or_, func as _func
+    from sqlalchemy import text as _text
 
     now = datetime.now(timezone.utc)
     reason = reason[:32]
@@ -200,8 +295,6 @@ def revoke_team_for_subscriber(subscriber_id: int, reason: str, db: Session) -> 
     ).scalars().all()
 
     # Teams where the subscriber is a member (ARRAY @> ARRAY[id])
-    from sqlalchemy import cast, text as _text
-    from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY
     member_teams = db.execute(
         select(ReferralTeam).where(
             ReferralTeam.status == "active",
@@ -224,34 +317,3 @@ def revoke_team_for_subscriber(subscriber_id: int, reason: str, db: Session) -> 
         )
 
     return len(all_teams)
-
-
-def reward_referrer(referral_event_id: int, db: Session) -> ReferralEvent:
-    event = db.get(ReferralEvent, referral_event_id)
-    if not event:
-        raise ValueError(f"ReferralEvent {referral_event_id} not found")
-
-    # Use credit() directly — referral reward is a pre-approved amount, not a per-event bonus
-    from src.services.wallet_engine import credit
-    credit(event.referrer_subscriber_id, REFERRER_CREDIT, "referral_reward", db)
-
-    event.status = "rewarded"
-    db.flush()
-
-    # Notify referrer via SMS
-    referrer = db.get(Subscriber, event.referrer_subscriber_id)
-    if referrer:
-        _notify_referrer(referrer, db)
-
-    return event
-
-
-def _notify_referrer(referrer: Subscriber, db: Session) -> None:
-    from src.services.sms_compliance import can_send, send_sms
-    phone = getattr(referrer, "phone", None) or getattr(referrer, "email", None)
-    if not phone:
-        return
-    if not can_send(phone, db):
-        return
-    msg = f"Your referral bonus: {REFERRER_CREDIT} credits added to your wallet. Keep sharing!"
-    send_sms(phone, msg, db, subscriber_id=referrer.id, task_type="sms_copy")
