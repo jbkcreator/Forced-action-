@@ -341,7 +341,9 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
     # Stage 2: if not found by Stripe ID, look for an existing active/grace row
     # with the same normalised email + vertical + county.  This catches the case
     # where the same person checks out again (stale replay, duplicate browser tab,
-    # re-subscribe after cancel before the DB constraint was in place).
+    # re-subscribe after cancel before the DB constraint was in place), AND the
+    # Phase 2B upgrade path where /api/free-signup pre-provisions a tier='free'
+    # row before the paid checkout opens.
     is_new_subscriber = False
     if subscriber is None and customer_email:
         subscriber = db.execute(
@@ -353,11 +355,23 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
             )
         ).scalar_one_or_none()
         if subscriber is not None:
-            logger.warning(
-                "checkout.session.completed: duplicate detected — email=%s vertical=%s county=%s"
-                " already has subscriber id=%s — merging onto existing row, skipping welcome email",
-                customer_email, vertical, county_id, subscriber.id,
-            )
+            # tier='free' row → this is the Phase 2B upgrade-from-free path
+            # (welcome email was deferred during /api/free-signup with
+            # intent='upgrade'); send it now that payment succeeded.
+            # Any other tier → genuine duplicate (stale replay, dup tab) — skip.
+            if subscriber.tier == "free":
+                is_new_subscriber = True
+                logger.info(
+                    "checkout.session.completed: upgrading pre-provisioned free row"
+                    " — email=%s subscriber=%s tier=free → %s (welcome will fire)",
+                    customer_email, subscriber.id, tier,
+                )
+            else:
+                logger.warning(
+                    "checkout.session.completed: duplicate detected — email=%s vertical=%s county=%s"
+                    " already has subscriber id=%s tier=%s — merging onto existing row, skipping welcome email",
+                    customer_email, vertical, county_id, subscriber.id, subscriber.tier,
+                )
 
     if subscriber is None:
         # Genuinely new subscriber
