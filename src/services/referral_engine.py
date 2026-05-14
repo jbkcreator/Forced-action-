@@ -266,7 +266,7 @@ def _check_team_unlock(referrer_id: int, db: Session) -> Optional[ReferralTeam]:
                 f"Team unlocked! 3 of you in {referrer.county_id.title()} "
                 f"{referrer.vertical} now share a live ZIP heat map. Open your dashboard."
             )
-            send_sms(phone, body, db, subscriber_id=mid, task_type="referral_team_unlock")
+            send_sms(phone, body, db, message_type="transactional", subscriber_id=mid, task_type="referral_team_unlock")
     except Exception as exc:
         logger.warning("[Referral] team unlock SMS failed: %s", exc)
 

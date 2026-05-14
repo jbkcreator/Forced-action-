@@ -29,6 +29,7 @@ from sqlalchemy.orm import Session
 
 from config.settings import settings
 from src.core.models import SmsDeadLetter, SmsOptIn, SmsOptOut
+from src.services import phone_utils
 from src.services.telnyx_sms import TelnyxSMSError, send_message as telnyx_send_message
 
 logger = logging.getLogger(__name__)
@@ -87,8 +88,8 @@ def is_quiet_hours(phone: str) -> bool:
 def can_send(phone: str, db: Session) -> bool:
     """
     Return True if it is legal to send an outbound SMS to this number.
-    Checks the sms_opt_outs suppression table (Redis in 2B-2).
-    Callers must check this before every Twilio send.
+    Checks the sms_opt_outs suppression table.
+    Callers must check this before every outbound send.
     """
     phone = _normalize(phone)
     if not phone:
@@ -150,9 +151,9 @@ def add_to_dead_letter(
 ) -> None:
     """
     Write a failed or blocked SMS event to the dead-letter queue for manual review.
-    reason must be one of: opt_out / delivery_failed / error / unresolvable
+    reason must be one of: opt_out / delivery_failed / error / unresolvable / quiet_hours / no_opt_in
     """
-    valid_reasons = {"opt_out", "delivery_failed", "error", "unresolvable"}
+    valid_reasons = {"opt_out", "delivery_failed", "error", "unresolvable", "quiet_hours", "no_opt_in"}
     if reason not in valid_reasons:
         logger.warning("Invalid DLQ reason '%s' — defaulting to 'error'", reason)
         reason = "error"
@@ -169,6 +170,8 @@ def send_sms(
     to: str,
     body: str,
     db: Session,
+    *,
+    message_type: str = "marketing",
     subscriber_id: Optional[int] = None,
     task_type: Optional[str] = None,
     campaign: Optional[str] = None,
@@ -178,25 +181,46 @@ def send_sms(
     """
     Central outbound SMS dispatcher.
 
-    1. Runs can_send() gate — writes to DLQ and returns False if suppressed.
-    2. Sends via Telnyx if TELNYX_SMS_ENABLED=true, else logs only.
-    3. When TELNYX_SANDBOX=true, writes a sandbox_outbox row regardless of
-       TELNYX_SMS_ENABLED, so scenario tests can inspect the attempted send.
-    4. Logs to api_usage_logs via claude_router pattern (cost tracked separately).
+    Gate order (TCPA/CTIA): opt-out → opt-in (marketing only) → quiet hours → creds → dispatch.
+    Every exit writes one SmsSendLog row (V3) for ops auditing.
 
-    Optional kwargs (campaign/variant_id/decision_id) enrich the sandbox_outbox
-    row for scenario attribution. task_type is used as a fallback campaign name
-    when campaign is not supplied — preserves behaviour for existing callers.
+    message_type:
+      "marketing"     — requires SmsOptIn consent record. Default.
+      "transactional" — skips opt-in gate (account events, alerts, receipts).
+      "opt_in_prompt" — skips opt-in gate; used only by send_opt_in_prompt.
 
     Returns True if the message was sent (or logged in dry-run), False if suppressed.
     """
+    _VALID_MESSAGE_TYPES = {"marketing", "transactional", "opt_in_prompt"}
+    if message_type not in _VALID_MESSAGE_TYPES:
+        logger.warning("Invalid message_type '%s' — defaulting to 'marketing'", message_type)
+        message_type = "marketing"
+
     to = _normalize(to)
     campaign_label = campaign or task_type
 
-    # 1. Opt-out suppression (compliance gate)
+    def _log(outcome: str, suppress_reason: Optional[str] = None, vendor_message_id: Optional[str] = None) -> None:
+        from src.services import sms_send_log
+        sms_send_log.log_send(
+            db=db,
+            phone=to or None,
+            subscriber_id=subscriber_id,
+            task_type=task_type,
+            message_type=message_type,
+            outcome=outcome,
+            suppress_reason=suppress_reason,
+            vendor_message_id=vendor_message_id,
+            campaign=campaign_label,
+            variant_id=variant_id,
+            decision_id=decision_id,
+            body_preview=body[:160],
+        )
+
+    # 1. Opt-out suppression
     if not can_send(to, db):
         logger.info("SMS suppressed (opt-out): to=%s", to)
         add_to_dead_letter(to, "opt_out", {"body": body[:160]}, db)
+        _log("suppressed", suppress_reason="opt_out")
         _capture_sandbox_attempt(
             db=db, to=to, body=body, subscriber_id=subscriber_id,
             campaign=campaign_label, variant_id=variant_id, decision_id=decision_id,
@@ -205,10 +229,24 @@ def send_sms(
         )
         return False
 
-    # 1b. TCPA quiet hours — no SMS before 8am or after 9pm recipient local time
+    # 2. Opt-in gate — marketing requires confirmed consent
+    if message_type == "marketing" and not has_opted_in(to, db):
+        logger.info("SMS suppressed (no opt-in): to=%s", to)
+        add_to_dead_letter(to, "no_opt_in", {"body": body[:160]}, db)
+        _log("suppressed", suppress_reason="no_opt_in")
+        _capture_sandbox_attempt(
+            db=db, to=to, body=body, subscriber_id=subscriber_id,
+            campaign=campaign_label, variant_id=variant_id, decision_id=decision_id,
+            compliance_allowed=False, compliance_reason="no_opt_in",
+            would_have_delivered=False,
+        )
+        return False
+
+    # 3. TCPA quiet hours — no SMS before 8am or after 9pm recipient local time
     if is_quiet_hours(to):
         logger.info("SMS suppressed (quiet hours): to=%s", to)
         add_to_dead_letter(to, "quiet_hours", {"body": body[:160]}, db)
+        _log("suppressed", suppress_reason="quiet_hours")
         _capture_sandbox_attempt(
             db=db, to=to, body=body, subscriber_id=subscriber_id,
             campaign=campaign_label, variant_id=variant_id, decision_id=decision_id,
@@ -217,9 +255,10 @@ def send_sms(
         )
         return False
 
-    # 2. Dry-run path (TELNYX_SMS_ENABLED=false)
+    # 4. Dry-run path (TELNYX_SMS_ENABLED=false)
     if not settings.telnyx_sms_enabled:
         logger.info("[DRY RUN] SMS to=%s body=%r", to, body[:160])
+        _log("dry_run")
         _capture_sandbox_attempt(
             db=db, to=to, body=body, subscriber_id=subscriber_id,
             campaign=campaign_label, variant_id=variant_id, decision_id=decision_id,
@@ -228,10 +267,7 @@ def send_sms(
         )
         return True
 
-    # 3. Telnyx misconfiguration (live mode on but creds missing).
-    # The wrapper raises TelnyxSMSError with a clear "X is not configured"
-    # message for each missing field; we surface it here so the DLQ row
-    # records what was missing without leaking the key value itself.
+    # 5. Telnyx misconfiguration — live mode but creds missing
     if not all([
         settings.telnyx_sms_api_key,
         settings.telnyx_from_number,
@@ -239,6 +275,7 @@ def send_sms(
     ]):
         logger.error("Telnyx not configured — cannot send SMS to %s", to)
         add_to_dead_letter(to, "error", {"body": body[:160], "error": "telnyx_not_configured"}, db)
+        _log("failed", suppress_reason="error")
         _capture_sandbox_attempt(
             db=db, to=to, body=body, subscriber_id=subscriber_id,
             campaign=campaign_label, variant_id=variant_id, decision_id=decision_id,
@@ -247,13 +284,12 @@ def send_sms(
         )
         return False
 
-    # 4. Real Telnyx dispatch
+    # 6. Real Telnyx dispatch
     try:
         result = telnyx_send_message(to=to, body=body)
-        logger.info("SMS sent: id=%s to=%s status=%s",
-                    result.get("message_id"), to, result.get("status"))
-        # In live mode we still record to sandbox_outbox when TELNYX_SANDBOX=true
-        # (e.g. staging smoke tests that fire real SMS but want a local audit).
+        vendor_message_id = result.get("message_id")
+        logger.info("SMS sent: id=%s to=%s status=%s", vendor_message_id, to, result.get("status"))
+        _log("sent", vendor_message_id=vendor_message_id)
         _capture_sandbox_attempt(
             db=db, to=to, body=body, subscriber_id=subscriber_id,
             campaign=campaign_label, variant_id=variant_id, decision_id=decision_id,
@@ -264,6 +300,7 @@ def send_sms(
     except TelnyxSMSError as exc:
         logger.error("Telnyx send failed: to=%s error=%s", to, exc)
         add_to_dead_letter(to, "delivery_failed", {"body": body[:160], "error": str(exc)}, db)
+        _log("failed")
         _capture_sandbox_attempt(
             db=db, to=to, body=body, subscriber_id=subscriber_id,
             campaign=campaign_label, variant_id=variant_id, decision_id=decision_id,
@@ -274,6 +311,7 @@ def send_sms(
     except Exception as exc:
         logger.exception("Unexpected SMS send failure: to=%s error=%s", to, exc)
         add_to_dead_letter(to, "delivery_failed", {"body": body[:160], "error": str(exc)}, db)
+        _log("failed")
         _capture_sandbox_attempt(
             db=db, to=to, body=body, subscriber_id=subscriber_id,
             campaign=campaign_label, variant_id=variant_id, decision_id=decision_id,
@@ -387,28 +425,44 @@ def send_opt_in_prompt(
     """
     Send the TCPA double opt-in prompt ("Reply YES to confirm…").
     Only sends if the number is not already opted in and not suppressed.
+    Sets the opt_in_pending Redis sentinel before sending so a subsequent YES
+    reply is treated as valid double opt-in consent (V5).
     Returns True if sent, False if suppressed or already opted in.
     """
     if has_opted_in(phone, db):
         return False
-    return send_sms(
+    from src.services import opt_in_sentinel
+    normalized = _normalize(phone) or phone
+    opt_in_sentinel.mark_pending(normalized)
+    sent = send_sms(
         to=phone,
         body=_OPT_IN_PROMPT,
         db=db,
         subscriber_id=subscriber_id,
         task_type="tcpa_opt_in_prompt",
+        message_type="opt_in_prompt",
     )
+    if not sent:
+        # Best-effort: clear sentinel so a stale key can't grant consent later
+        opt_in_sentinel.consume_pending(normalized)
+    return sent
 
 
 def handle_opt_in_reply(from_number: str, body: str, db: Session) -> Optional[str]:
     """
     Check if the inbound message is an opt-in keyword (YES, START, etc.).
-    If yes, record the opt-in and return a TwiML confirmation reply.
-    Returns None if not an opt-in keyword (caller handles normally).
+    Only records consent and returns TwiML when the opt_in_pending Redis
+    sentinel is present (set by send_opt_in_prompt within the last 15 min).
+    Returns None in all other cases so the caller falls through to sms_commands
+    (preserving the PAUSE-confirm YES flow and blocking unsolicited consent).
     """
     word = body.strip().lower().split()[0] if body.strip() else ""
     if word not in _OPT_IN_KEYWORDS:
         return None
+    from src.services import opt_in_sentinel
+    phone = _normalize(from_number) or from_number
+    if not opt_in_sentinel.consume_pending(phone):
+        return None  # no prompt was sent — fall through to sms_commands
     record_opt_in(from_number, keyword=word, source="double_opt_in", db=db)
     reply = (
         "You're confirmed! You'll receive distressed property leads from Forced Action. "
@@ -439,8 +493,8 @@ def check_dnc(phone: str, db: Session) -> bool:
 
 
 def _normalize(phone: str) -> str:
-    """Strip whitespace; ensure E.164 format check is caller's responsibility."""
-    return (phone or "").strip()
+    """Normalize to strict E.164 via phone_utils. Returns '' for invalid/unparseable."""
+    return phone_utils.normalize(phone) or ""
 
 
 def _extract_stop_keyword(body: str) -> Optional[str]:

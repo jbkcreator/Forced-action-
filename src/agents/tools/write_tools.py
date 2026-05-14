@@ -131,6 +131,7 @@ def send_sms(
 			to=phone,
 			body=body,
 			db=s,
+			message_type=message_type,
 			subscriber_id=subscriber_id,
 			task_type=campaign,
 			campaign=campaign,

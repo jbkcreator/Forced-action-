@@ -142,7 +142,7 @@ def subscribe_and_send() -> None:
                 sub = db.get(Subscriber, referrer_id)
                 phone = getattr(sub, "phone", None) if sub else None
                 if phone and can_send(phone, db):
-                    send_sms(phone, sms_body, db, subscriber_id=referrer_id, task_type="referral_notify")
+                    send_sms(phone, sms_body, db, message_type="transactional", subscriber_id=referrer_id, task_type="referral_notify")
                 _stamp_notified_at(payload, db)
         except Exception as exc:
             logger.error("[ReferralNotifier] SMS dispatch failed for referrer=%s: %s", referrer_id, exc)

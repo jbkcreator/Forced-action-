@@ -2491,7 +2491,7 @@ async def telnyx_inbound(request: Request, db: Session = Depends(get_db)):
     The handlers downstream are vendor-neutral; only the payload shape and
     signature scheme change here.
     """
-    from src.services.sms_compliance import handle_inbound, send_sms
+    from src.services.sms_compliance import handle_inbound, handle_opt_in_reply, send_sms
     from src.services import sms_commands
     from src.services.telnyx_signature import (
         SIGNATURE_HEADER, TIMESTAMP_HEADER, verify as verify_telnyx_signature,
@@ -2557,12 +2557,19 @@ async def telnyx_inbound(request: Request, db: Session = Depends(get_db)):
     if twiml_reply:
         return Response(content=twiml_reply, media_type="application/xml")
 
+    # 3b. Opt-in confirmation (V5 sentinel-gated). Returns TwiML only when
+    # send_opt_in_prompt previously set the Redis key for this number.
+    # If the key is absent the call returns None and falls through to product commands.
+    opt_in_reply = handle_opt_in_reply(from_number, body, db)
+    if opt_in_reply:
+        return Response(content=opt_in_reply, media_type="application/xml")
+
     # 4. Product command routing — unchanged from the Twilio path.
     command = sms_commands.parse(body)
     if command:
         reply = sms_commands.dispatch(from_number, command, db)
         if reply:
-            send_sms(from_number, reply, db)
+            send_sms(from_number, reply, db, message_type="transactional")
 
     return Response(content="", media_type="application/json")
 

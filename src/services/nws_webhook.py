@@ -83,7 +83,7 @@ def activate_storm_packs(zip_codes: list[str], db: Session) -> int:
         )
         phone = getattr(sub, "phone", None)
         if phone and can_send(phone, db):
-            send_sms(phone, msg, db, subscriber_id=sub.id, task_type="sms_copy")
+            send_sms(phone, msg, db, message_type="transactional", subscriber_id=sub.id, task_type="sms_copy")
             notified += 1
 
     logger.info("Storm packs activated for %d ZIPs, notified %d subscribers", len(zip_codes), notified)

@@ -1732,7 +1732,7 @@ class SmsDeadLetter(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "reason IN ('opt_out', 'delivery_failed', 'error', 'unresolvable')",
+            "reason IN ('opt_out', 'delivery_failed', 'error', 'unresolvable', 'quiet_hours', 'no_opt_in')",
             name="check_dlq_reason",
         ),
         Index("idx_dlq_reviewed", "reviewed_at"),
@@ -2034,6 +2034,46 @@ class SandboxOutbox(Base):
 
     def __repr__(self):
         return f"<SandboxOutbox(id={self.id}, channel={self.channel}, to={self.to_number}, campaign={self.campaign})>"
+
+
+class SmsSendLog(Base):
+    """One row per sms_compliance.send_sms call — ops audit of every send attempt."""
+    __tablename__ = "sms_send_logs"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    phone: Mapped[Optional[str]] = mapped_column(String(20))
+    subscriber_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=True)
+    task_type: Mapped[Optional[str]] = mapped_column(String(80))
+    message_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    outcome: Mapped[str] = mapped_column(String(20), nullable=False)
+    suppress_reason: Mapped[Optional[str]] = mapped_column(String(40))
+    vendor_message_id: Mapped[Optional[str]] = mapped_column(String(80))
+    vendor: Mapped[str] = mapped_column(String(20), nullable=False, default="telnyx")
+    campaign: Mapped[Optional[str]] = mapped_column(String(100))
+    variant_id: Mapped[Optional[str]] = mapped_column(String(100))
+    decision_id: Mapped[Optional[str]] = mapped_column(String(36))
+    body_preview: Mapped[Optional[str]] = mapped_column(String(160))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "outcome IN ('sent', 'suppressed', 'dry_run', 'failed')",
+            name="check_ssl_outcome",
+        ),
+        CheckConstraint(
+            "message_type IN ('marketing', 'transactional', 'opt_in_prompt')",
+            name="check_ssl_message_type",
+        ),
+        Index("idx_ssl_phone", "phone"),
+        Index("idx_ssl_sub_created", "subscriber_id", "created_at"),
+        Index("idx_ssl_outcome_created", "outcome", "created_at"),
+        Index("idx_ssl_vendor_msg_id", "vendor_message_id"),
+    )
+
+    def __repr__(self):
+        return f"<SmsSendLog(id={self.id}, phone={self.phone}, outcome={self.outcome})>"
 
 
 # ============================================================================

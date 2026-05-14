@@ -198,6 +198,7 @@ def _send_sms(message: str) -> bool:
                 to=phone,
                 body=message[:MAX_DAILY_SMS_CHARS],
                 db=db,
+                message_type="transactional",
                 task_type="revenue_pulse",
                 campaign="revenue_pulse",
             )

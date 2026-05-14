@@ -173,6 +173,7 @@ def handle_missed_call(from_number: str, db: Session) -> str:
             to=from_number,
             body=sms_body[:160],
             db=db,
+            message_type="transactional",
             subscriber_id=sub.id,
             task_type="missed_call_welcome",
         )

@@ -106,17 +106,78 @@ def test_twilio_inbound_non_stop_returns_none(seed_subscriber):
 # Opt-in double-handshake flow
 # ──────────────────────────────────────────────────────────────────────────────
 
-def test_opt_in_yes_reply_records_consent(seed_subscriber):
+def test_opt_in_yes_without_prompt_returns_none(seed_subscriber):
 	"""
-	YES / START / JOIN all count as TCPA opt-in. Record the consent row and
-	reply with a welcome message.
+	V5: YES with no prior opt-in prompt sentinel returns None and creates no
+	SmsOptIn row. Prevents arbitrary inbound texts from recording TCPA consent.
 	"""
-	# Seed WITHOUT opt-in so we can insert fresh
-	sub = seed_subscriber(opt_in=False)
-	phone = sub._test_phone
-
+	import fakeredis
+	from unittest.mock import patch
+	from sqlalchemy import select, delete as _delete
+	from src.core.models import SmsOptIn, SmsOptOut, SmsDeadLetter, SmsSendLog
 	from src.services import sms_compliance
+
+	TEST_PHONE = "+18135550199"
+	sub = seed_subscriber(opt_in=False, phone=TEST_PHONE)
+	phone = sub._test_phone
+	fake = fakeredis.FakeRedis(decode_responses=True)
+
 	with _db_mgr.session_scope() as s:
-		reply = sms_compliance.handle_opt_in_reply(phone, "YES", s)
-	# May return None if no pending opt-in prompt exists — accept either.
-	assert reply is None or isinstance(reply, str)
+		# Wipe any rows committed by previous test runs for this phone.
+		s.execute(_delete(SmsOptIn).where(SmsOptIn.phone == phone))
+		s.execute(_delete(SmsOptOut).where(SmsOptOut.phone == phone))
+		s.execute(_delete(SmsDeadLetter).where(SmsDeadLetter.phone == phone))
+		s.execute(_delete(SmsSendLog).where(SmsSendLog.phone == phone))
+		s.flush()
+
+		with patch("src.core.redis_client._get_client", return_value=fake):
+			reply = sms_compliance.handle_opt_in_reply(phone, "YES", s)
+		assert reply is None
+		row = s.execute(
+			select(SmsOptIn).where(SmsOptIn.phone == phone)
+		).scalar_one_or_none()
+		assert row is None
+
+
+def test_opt_in_yes_after_prompt_records_consent(seed_subscriber):
+	"""
+	V5: send_opt_in_prompt sets the sentinel; a subsequent YES creates the
+	SmsOptIn row and returns the TwiML confirmation.
+	"""
+	import fakeredis
+	from unittest.mock import patch
+	from sqlalchemy import select, delete as _delete
+	from src.core.models import SmsOptIn, SmsOptOut, SmsDeadLetter, SmsSendLog
+	from src.services import sms_compliance
+
+	TEST_PHONE = "+18135550199"
+	sub = seed_subscriber(opt_in=False, phone=TEST_PHONE)
+	phone = sub._test_phone
+	fake = fakeredis.FakeRedis(decode_responses=True)
+
+	with _db_mgr.session_scope() as s:
+		# Wipe any rows committed by previous test runs for this phone.
+		s.execute(_delete(SmsOptIn).where(SmsOptIn.phone == phone))
+		s.execute(_delete(SmsOptOut).where(SmsOptOut.phone == phone))
+		s.execute(_delete(SmsDeadLetter).where(SmsDeadLetter.phone == phone))
+		s.execute(_delete(SmsSendLog).where(SmsSendLog.phone == phone))
+		s.flush()
+
+		with patch("src.core.redis_client._get_client", return_value=fake), \
+			 patch("src.services.sms_compliance.is_quiet_hours", return_value=False), \
+			 patch("src.services.sms_compliance.settings") as ms:
+			ms.telnyx_sms_enabled = False
+			ms.telnyx_sandbox = False
+			sms_compliance.send_opt_in_prompt(phone, s, subscriber_id=sub.id)
+
+		# Sentinel is now set in `fake` — YES should record consent.
+		with patch("src.core.redis_client._get_client", return_value=fake):
+			reply = sms_compliance.handle_opt_in_reply(phone, "YES", s)
+
+		assert reply is not None
+		assert "confirmed" in reply.lower()
+		row = s.execute(
+			select(SmsOptIn).where(SmsOptIn.phone == phone)
+		).scalar_one_or_none()
+		assert row is not None
+		assert row.source == "double_opt_in"
