@@ -1938,6 +1938,37 @@ def _on_premium_payment(payment_intent, db: Session) -> None:
     except Exception:
         pass
 
+    # fa016: Re-check accelerated wallet push after PremiumPurchase is persisted.
+    # `payment_method.attached` can race ahead of `payment_intent.succeeded` and
+    # run its own eligibility check BEFORE this row exists — in that case the
+    # check silently fails on the "paid intent" gate. Run it again here so a
+    # premium purchase with a freshly saved card reliably dispatches.
+    try:
+        from src.services import wallet_engine
+        from src.agents.supervisor import dispatch_event
+        eligible = wallet_engine.accelerated_push_eligible(subscriber_id, db)
+        if eligible:
+            try:
+                wallet_engine.ensure_offer_row(subscriber_id, eligible, db)
+            except Exception as exc_offer:
+                logger.warning("ensure_offer_row failed sub=%s: %s", subscriber_id, exc_offer)
+            try:
+                from src.services.business_events import log_business_event
+                log_business_event(
+                    "ACCELERATED_WALLET_ELIGIBLE", subscriber_id=subscriber_id,
+                    payload={"trigger": "_on_premium_payment", "pi": pi_id}, db=db,
+                )
+            except Exception:
+                pass
+            dispatch_event({
+                "event_type": "accelerated_wallet_push_eligible",
+                "subscriber_id": subscriber_id,
+                "payload": eligible,
+            })
+    except Exception as exc:
+        logger.warning("accelerated_wallet_push from _on_premium_payment failed sub=%s: %s",
+                       subscriber_id, exc)
+
     # fa016 Accelerated Wallet Push — cash premium purchase is "first paid
     # intent" for a saved-card user. Wrap in try/except so failure never
     # disturbs the webhook ack.
