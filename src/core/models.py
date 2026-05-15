@@ -13,6 +13,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    LargeBinary,
     Numeric,
     String,
     Text,
@@ -2368,3 +2369,63 @@ class DBPRContact(Base):
 
     def __repr__(self):
         return f"<DBPRContact(license={self.license_number}, name={self.full_name}, status={self.email_status})>"
+
+
+class CFBypassProfile(Base):
+    """
+    Per-county Cloudflare-bypass session metadata.
+
+    Profile FILES live on the scraping host's local disk under
+    data/cf_session/edge_profile_<profile_name>/ — this row tracks the
+    metadata (status, last warmed / validated timestamps, failure reasons)
+    plus an optional zipped backup blob so a fresh host can restore a
+    known-good profile without re-warming from scratch.
+
+    See: src/utils/cf_session_manager.py for the lifecycle logic and
+    src/utils/cf_persistent_browser.py for the Playwright launch wrapper.
+    """
+    __tablename__ = "cf_bypass_profiles"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    profile_name: Mapped[str] = mapped_column(String(80), nullable=False, unique=True)
+    county_id:    Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    portal_url:   Mapped[str] = mapped_column(Text, nullable=False)
+    status:       Mapped[str] = mapped_column(
+        String(20), nullable=False, default="unwarmed", server_default="unwarmed",
+    )
+
+    last_warmed_at:      Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_validated_at:   Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_failure_at:     Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_failure_reason: Mapped[Optional[str]]      = mapped_column(Text)
+
+    profile_dir_path: Mapped[str] = mapped_column(Text, nullable=False)
+    validation_ttl_minutes: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=540, server_default="540",
+    )
+
+    profile_blob:      Mapped[Optional[bytes]]    = mapped_column(LargeBinary, nullable=True)
+    profile_blob_size: Mapped[Optional[int]]      = mapped_column(Integer, nullable=True)
+    profile_blob_at:   Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False,
+        onupdate=func.now(),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('unwarmed', 'ready', 'warming', 'expired', 'failed')",
+            name="check_cf_profile_status",
+        ),
+        Index("ix_cf_bypass_profiles_status_lookup", "status"),
+    )
+
+    def __repr__(self):
+        return (
+            f"<CFBypassProfile(name={self.profile_name!r}, "
+            f"county={self.county_id}, status={self.status})>"
+        )

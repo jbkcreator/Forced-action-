@@ -63,6 +63,15 @@ RAW_TAX_DELINQUENCIES_DIR.mkdir(parents=True, exist_ok=True)
 PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _mark_cf_failed(profile_name: str, reason: str) -> None:
+    """Flag a CF profile as expired after a mid-flow failure. Best-effort."""
+    try:
+        from src.utils.cf_session_manager import mark_failed_during_scrape
+        mark_failed_during_scrape(profile_name, reason)
+    except Exception as exc:
+        logger.warning("[CFSess] could not mark profile %s failed: %s", profile_name, exc)
+
+
 # ---------------------------------------------------------------------------
 # LLM helpers
 # ---------------------------------------------------------------------------
@@ -240,21 +249,36 @@ async def download_tax_delinquent_report(
     # per-source flag set by an admin in counties.json.
     cf_required = bool(source.get("cf_bypass_required")) if cf_bypass is None else cf_bypass
     cf_profile: Optional[dict] = None
+    cf_profile_name: Optional[str] = None
     if cf_required:
         from src.utils.cf_persistent_browser import (
-            resolve_cf_profile,
+            find_edge_binary,
             CFProfileNotWarmedError,
         )
-        profile_name = source.get("cf_bypass_profile_name") or f"{county_id}_tax"
+        from src.utils.cf_session_manager import ensure_ready, CFBypassFailedError
+
+        cf_profile_name = source.get("cf_bypass_profile_name") or f"{county_id}_tax"
+        portal_url = source.get("url", "")
         try:
-            cf_profile = resolve_cf_profile(profile_name)
-            logger.info(
-                "[RADAR] CF-bypass mode — Edge=%s profile=%s",
-                cf_profile["edge_path"], cf_profile["profile_dir"],
+            profile_dir = await ensure_ready(
+                profile_name=cf_profile_name,
+                county_id=county_id,
+                portal_url=portal_url,
             )
-        except CFProfileNotWarmedError as exc:
-            logger.error("[RADAR] CF-bypass requested but profile unusable: %s", exc)
+        except CFBypassFailedError as exc:
+            logger.error("[RADAR] CF-bypass profile unusable for %s: %s", cf_profile_name, exc)
             return False
+
+        edge_path = find_edge_binary()
+        if not edge_path:
+            logger.error("[RADAR] No Edge binary found — set CF_BYPASS_BROWSER_PATH")
+            return False
+
+        cf_profile = {"edge_path": edge_path, "profile_dir": str(profile_dir)}
+        logger.info(
+            "[RADAR] CF-bypass mode — Edge=%s profile=%s (name=%s)",
+            edge_path, profile_dir, cf_profile_name,
+        )
 
     task = build_agent_task(source, tax_year, account_status)
 
@@ -324,6 +348,8 @@ async def download_tax_delinquent_report(
     except Exception as e:
         logger.error("[RADAR] Browser agent execution failed: %s", e)
         logger.debug(traceback.format_exc())
+        if cf_profile_name:
+            _mark_cf_failed(cf_profile_name, f"agent_exception: {e!s}")
         return False
 
     logger.info("[RADAR] Agent completed. Waiting %ds for download to finalize...", wait_after_download)
@@ -353,6 +379,12 @@ async def download_tax_delinquent_report(
     if "<!DOCTYPE" in _head or "<html" in _head.lower():
         logger.error("[RADAR] Downloaded file is an HTML error page — session may have expired")
         dest_file.unlink(missing_ok=True)
+        if cf_profile_name:
+            cf_markers = ("just a moment", "checking your browser", "cf-challenge", "cf-mitigated", "cloudflare")
+            if any(m in _head.lower() for m in cf_markers):
+                _mark_cf_failed(cf_profile_name, "cf_challenge_in_response_body")
+            else:
+                _mark_cf_failed(cf_profile_name, "html_error_page_returned")
         return False
 
     size_mb = file_size / (1024 ** 2)
