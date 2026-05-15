@@ -1142,6 +1142,29 @@ def _compute_save_offer_active(subscriber, db) -> bool:
     return compute_save_offer_active(subscriber, db)
 
 
+def _auto_mode_entitlement_fields(subscriber, db) -> dict:
+    """Tell the frontend whether the user can flip the Auto Mode toggle for free.
+
+    Growth/Power wallet tiers include it natively. Starter users need an
+    active Stripe subscription on the auto_mode add-on price — checking
+    Stripe per page load is cheap because we only call it for starter_wallet.
+
+    Returns:
+        {"auto_mode_entitled": bool}
+    """
+    from src.core.models import WalletBalance
+    from src.services.auto_mode import _AUTO_MODE_TIERS, _has_active_auto_mode_addon
+
+    wallet = db.execute(
+        select(WalletBalance).where(WalletBalance.subscriber_id == subscriber.id)
+    ).scalar_one_or_none()
+    if wallet and wallet.wallet_tier in _AUTO_MODE_TIERS:
+        return {"auto_mode_entitled": True}
+    # Starter or no-wallet path: source of truth is the live Stripe subscription
+    # list. Fails closed (any error → not entitled) per _has_active_auto_mode_addon.
+    return {"auto_mode_entitled": _has_active_auto_mode_addon(subscriber)}
+
+
 def _accelerated_wallet_offer_fields(subscriber, db) -> dict:
     """Surface the latest open accelerated_wallet_push offer to the frontend.
 
@@ -1266,6 +1289,7 @@ def event_feed(
                 "wallet_credits_30d": None,
                 "flash_scarcity_windows": [],
                 **_accelerated_wallet_offer_fields(subscriber, db),
+                **_auto_mode_entitlement_fields(subscriber, db),
             },
             "total": 0,
             "page": page,
@@ -1447,6 +1471,7 @@ def event_feed(
                 "wallet_credits_30d": None,
                 "flash_scarcity_windows": _flash_windows_nz,
                 **_accelerated_wallet_offer_fields(subscriber, db),
+                **_auto_mode_entitlement_fields(subscriber, db),
             },
             "total": len(_unlocked_leads),
             "page": page,
@@ -2197,6 +2222,113 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, db: Session = Depends(g
         "amount":           amount,
         "currency":         currency,
     }
+
+
+# ---------------------------------------------------------------------------
+# POST /api/checkout/auto-mode — Stripe Checkout Session for Auto Mode add-on
+# ---------------------------------------------------------------------------
+# Authed-user pattern (feed_uuid in body). Creates a Stripe subscription
+# checkout for the $79–$99/mo Auto Mode add-on (Starter tier's paywall path).
+# Growth/Power wallets get Auto Mode included — they hit the toggle endpoint
+# below instead. Webhook entitlement activation lives in stripe_webhooks.
+
+class AutoModeCheckoutRequest(BaseModel):
+    feed_uuid: str
+
+
+@app.post("/api/checkout/auto-mode")
+def auto_mode_checkout(payload: AutoModeCheckoutRequest, db: Session = Depends(get_db)):
+    _s = get_settings()
+    if not _s.active_stripe_secret_key:
+        raise HTTPException(status_code=503, detail={"error": "payment_unavailable", "message": "Payment not configured"})
+
+    try:
+        subscriber = db.execute(
+            select(Subscriber).where(Subscriber.event_feed_uuid == payload.feed_uuid)
+        ).scalar_one_or_none()
+    except OperationalError:
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
+
+    if not subscriber or subscriber.status not in ("active", "grace"):
+        raise HTTPException(status_code=403, detail={"error": "unauthorized", "message": "Active subscription required"})
+
+    # Confirmed policy: do NOT create the Stripe customer inline. Subscriber
+    # must already have one (means they paid for a main subscription first).
+    if not subscriber.stripe_customer_id:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "no_stripe_customer", "message": "An active subscription is required before adding Auto Mode."},
+        )
+
+    price_id = _s.active_stripe_price("auto_mode")
+    if not price_id:
+        raise HTTPException(status_code=503, detail={"error": "price_not_configured", "message": "Auto Mode price not configured"})
+
+    stripe.api_key = _s.active_stripe_secret_key.get_secret_value()
+    base_url = _s.app_base_url.rstrip("/")
+
+    try:
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            ui_mode="embedded",
+            customer=subscriber.stripe_customer_id,
+            line_items=[{"price": price_id, "quantity": 1}],
+            return_url=f"{base_url}/dashboard/{payload.feed_uuid}/settings?auto_mode=success&session_id={{CHECKOUT_SESSION_ID}}",
+            metadata={
+                "product":        "auto_mode_addon",
+                "subscriber_id":  str(subscriber.id),
+                "feed_uuid":      payload.feed_uuid,
+            },
+            subscription_data={
+                "metadata": {
+                    "product":       "auto_mode_addon",
+                    "subscriber_id": str(subscriber.id),
+                }
+            },
+        )
+    except stripe.StripeError as exc:
+        logger.error("Stripe error creating auto_mode checkout: %s", exc)
+        raise HTTPException(status_code=502, detail={"error": "payment_unavailable", "message": "Could not create checkout session"})
+
+    return {
+        "client_secret":   session.client_secret,
+        "publishable_key": _s.active_stripe_publishable_key,
+        "session_id":      session.id,
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /api/auto-mode/toggle — Enable/disable Auto Mode (REST counterpart of SMS AUTO ON/OFF)
+# ---------------------------------------------------------------------------
+# Routes through src.services.auto_mode.toggle() which enforces tier gating.
+# Returns 402 Payment Required when a non-entitled Starter tries to enable.
+
+class AutoModeToggleRequest(BaseModel):
+    feed_uuid: str
+    enabled: bool
+
+
+@app.post("/api/auto-mode/toggle")
+def auto_mode_toggle(payload: AutoModeToggleRequest, db: Session = Depends(get_db)):
+    try:
+        subscriber = db.execute(
+            select(Subscriber).where(Subscriber.event_feed_uuid == payload.feed_uuid)
+        ).scalar_one_or_none()
+    except OperationalError:
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
+    if not subscriber:
+        raise HTTPException(status_code=404, detail={"error": "subscriber_not_found", "message": "Unknown feed_uuid"})
+
+    from src.services.auto_mode import toggle as auto_mode_toggle_fn
+    try:
+        auto_mode_toggle_fn(subscriber.id, payload.enabled, db)
+    except PermissionError as exc:
+        raise HTTPException(
+            status_code=402,
+            detail={"error": "requires_addon", "message": str(exc)},
+        )
+    db.commit()
+    return {"auto_mode_enabled": payload.enabled}
 
 
 # ---------------------------------------------------------------------------

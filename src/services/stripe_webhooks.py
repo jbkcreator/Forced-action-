@@ -209,8 +209,22 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
     - Lock ZIP territories
     - Set GHL stage 5
     - Generate event_feed_uuid
+
+    Add-on products (auto_mode_addon, etc.) short-circuit at the top — they
+    don't create a Subscriber row, they activate an entitlement flag on an
+    existing one. Identification is by `metadata.subscriber_id` (set by the
+    /api/checkout/auto-mode endpoint).
     """
-    meta = session.get("metadata", {})
+    meta = session.get("metadata", {}) or {}
+
+    # ── Auto Mode add-on branch ─────────────────────────────────────────────
+    # Triggered by POST /api/checkout/auto-mode → Stripe Checkout completion.
+    # Match by line item price == settings.stripe_price_auto_mode AND by the
+    # metadata flag (belt-and-braces against schema drift).
+    if meta.get("product") == "auto_mode_addon":
+        _on_auto_mode_addon_purchase(session, db)
+        return
+
     tier        = meta.get("tier")
     vertical    = meta.get("vertical")
     county_id   = meta.get("county_id")
@@ -1512,6 +1526,19 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
     except (IntegrityError, OperationalError) as exc:
         logger.warning("lead_unlock: SentLead insert failed: %s", exc)
 
+    # Trigger Auto Mode (skip-trace + first SMS) for this unlocked lead.
+    # Self-guarded on eligibility + fails soft — non-Auto-Mode subscribers
+    # get a near-no-op. Wrapped in try/except so the email send below is
+    # never blocked by an Auto Mode failure.
+    try:
+        from src.services.auto_mode import enqueue_action
+        enqueue_action(subscriber.id, property_id, db)
+    except Exception:
+        logger.error(
+            "lead_unlock: Auto Mode enqueue failed sub=%s prop=%s — continuing",
+            subscriber.id, property_id, exc_info=True,
+        )
+
     # Send the email with full lead details
     try:
         _send_lead_unlock_email(subscriber, prop, score, owner, enriched)
@@ -2149,6 +2176,86 @@ def _extract_wallet_sub_metadata(invoice: dict) -> dict:
     return out
 
 
+def _on_auto_mode_addon_purchase(session: dict, db: Session) -> None:
+    """Activate Auto Mode entitlement on a successful $79–$99/mo add-on
+    checkout. Identifies the subscriber by metadata.subscriber_id and
+    cross-checks line items for the configured Auto Mode price id.
+    Idempotent: re-running for the same subscriber is a no-op.
+    """
+    from src.core.models import Subscriber
+
+    meta = session.get("metadata", {}) or {}
+    subscriber_id_str = meta.get("subscriber_id")
+    session_id = session.get("id")
+    if not subscriber_id_str:
+        logger.error("[auto_mode_addon] checkout session missing subscriber_id meta=%s", meta)
+        return
+    try:
+        subscriber_id = int(subscriber_id_str)
+    except (TypeError, ValueError):
+        logger.error("[auto_mode_addon] non-int subscriber_id=%r", subscriber_id_str)
+        return
+
+    # Belt-and-braces: confirm the completed session actually purchased the
+    # auto_mode price (guards against metadata being copied to a wrong session).
+    expected_price_id = None
+    try:
+        from config.settings import settings
+        expected_price_id = settings.active_stripe_price("auto_mode")
+    except Exception as exc:
+        logger.error("[auto_mode_addon] could not resolve auto_mode price: %s", exc)
+        return
+    if not expected_price_id:
+        logger.error("[auto_mode_addon] STRIPE_PRICE_AUTO_MODE unconfigured")
+        return
+
+    matched_price = False
+    try:
+        if session.get("api_key") or not stripe.api_key:
+            stripe.api_key = (settings.active_stripe_secret_key.get_secret_value()
+                              if settings.active_stripe_secret_key else stripe.api_key)
+        items = stripe.checkout.Session.list_line_items(session_id, limit=10)
+        for li in items.data:
+            li_price = li.get("price") or {}
+            if li_price.get("id") == expected_price_id:
+                matched_price = True
+                break
+    except Exception as exc:
+        logger.warning(
+            "[auto_mode_addon] list_line_items failed for session=%s: %s — "
+            "falling back to metadata-only match",
+            session_id, exc,
+        )
+        # Metadata says auto_mode_addon — trust it if the API call fails.
+        matched_price = True
+
+    if not matched_price:
+        logger.warning(
+            "[auto_mode_addon] session=%s metadata says auto_mode_addon but no "
+            "matching line item — skipping",
+            session_id,
+        )
+        return
+
+    sub = db.get(Subscriber, subscriber_id)
+    if not sub:
+        logger.error("[auto_mode_addon] subscriber=%d not found", subscriber_id)
+        return
+    if sub.auto_mode_enabled:
+        logger.info(
+            "[auto_mode_addon] subscriber=%d already enabled — idempotent no-op",
+            subscriber_id,
+        )
+        return
+
+    sub.auto_mode_enabled = True
+    db.flush()
+    logger.info(
+        "[auto_mode_addon] enabled via add-on purchase: subscriber=%d session=%s",
+        subscriber_id, session_id,
+    )
+
+
 def _on_wallet_subscription_invoice(invoice: dict, db: Session) -> None:
     """Activate the wallet on the first successful invoice of a wallet
     subscription. Idempotent — replay via either StripeWebhookEvent (handled
@@ -2195,6 +2302,17 @@ def _on_wallet_subscription_invoice(invoice: dict, db: Session) -> None:
 
     # Enroll wallet (creates WalletBalance and credits the cycle credits)
     wallet_engine.enroll(subscriber_id, tier, db=db)
+
+    # Growth/Power wallets include Auto Mode by spec — set the flag explicitly
+    # so dashboards don't have to compute eligibility client-side. is_eligible()
+    # would already return True via wallet_tier, this just makes state explicit.
+    if tier in ("growth", "power") and not sub.auto_mode_enabled:
+        sub.auto_mode_enabled = True
+        db.flush()
+        logger.info(
+            "[WalletSub] auto-enabled Auto Mode for %s tier subscriber=%d",
+            tier, subscriber_id,
+        )
 
     if offer is not None:
         offer.status = "activated"

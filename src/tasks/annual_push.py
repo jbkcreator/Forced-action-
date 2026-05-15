@@ -37,7 +37,30 @@ from src.core.database import get_db_context
 from src.core.models import DealOutcome, MessageOutcome, Subscriber, WalletTransaction
 
 
-_OFFER_SUPPRESSION_DAYS = 30   # don't re-offer annual within 30 days
+_OFFER_SUPPRESSION_DAYS = 30   # don't re-offer annual within 30 days (other triggers)
+
+# Day-60 auto-switch sequence (Phase 2B v9). Three touches with progressively
+# longer gaps; sequence stops when the user accepts (tier=annual_lock) or
+# after the final reminder (subscriber stays in 30-day quiet period).
+_AUTO_SWITCH_BASE_TEMPLATE       = "annual_offer_auto_switch_day_60"
+_AUTO_SWITCH_R1_TEMPLATE         = "annual_offer_auto_switch_day_60_r1"
+_AUTO_SWITCH_R2_TEMPLATE         = "annual_offer_auto_switch_day_60_r2"
+_AUTO_SWITCH_TEMPLATES           = (
+    _AUTO_SWITCH_BASE_TEMPLATE,
+    _AUTO_SWITCH_R1_TEMPLATE,
+    _AUTO_SWITCH_R2_TEMPLATE,
+)
+_AUTO_SWITCH_MIN_AGE_DAYS        = 60   # account_age must be >= this; was == 60 (single-day bug)
+_AUTO_SWITCH_R1_GAP_DAYS         = 3    # reminder 1 fires 3 days after first offer
+_AUTO_SWITCH_R2_GAP_DAYS         = 7    # reminder 2 fires 7 days after reminder 1
+
+# Trigger short-names returned by _check_triggers (turned into template_ids
+# by _push_annual_offer as `f"annual_offer_{trigger}"`).
+_AUTO_SWITCH_TRIGGER_NAMES = {
+    _AUTO_SWITCH_BASE_TEMPLATE: "auto_switch_day_60",
+    _AUTO_SWITCH_R1_TEMPLATE:   "auto_switch_day_60_r1",
+    _AUTO_SWITCH_R2_TEMPLATE:   "auto_switch_day_60_r2",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -72,21 +95,16 @@ def run_annual_push(dry_run: bool = False) -> dict:
 
 
 def _check_triggers(sub: Subscriber, db: Session) -> list[str]:
-    """Return list of trigger names that apply to this subscriber (may be empty)."""
+    """Return list of trigger names that apply to this subscriber (may be empty).
+
+    The Day-60 auto-switch sequence runs an independent state machine — three
+    touches at Day 60+, +3 days, +7 days. It is NOT gated by the 30-day
+    suppression that governs the other triggers, because those reminders are
+    part of one logical campaign. After the final reminder the global 30-day
+    suppression resumes via the most-recent annual_offer_* row.
+    """
     if sub.tier == "annual_lock":
         return []   # already annual
-
-    # Stage 5: 30-day suppression — skip if we already offered annual recently.
-    cutoff = datetime.now(timezone.utc) - timedelta(days=_OFFER_SUPPRESSION_DAYS)
-    recent_offer = db.execute(
-        select(MessageOutcome.id).where(
-            MessageOutcome.subscriber_id == sub.id,
-            MessageOutcome.template_id.like("annual_offer_%"),
-            MessageOutcome.sent_at >= cutoff,
-        ).limit(1)
-    ).scalar_one_or_none()
-    if recent_offer:
-        return []
 
     now = datetime.now(timezone.utc)
     created = sub.created_at
@@ -95,6 +113,27 @@ def _check_triggers(sub: Subscriber, db: Session) -> list[str]:
     account_age = (now - created).days if created else 0
 
     triggered: list[str] = []
+
+    # ── Day-60 auto-switch (own multi-step state machine) ─────────────────
+    # Evaluated first so it takes priority when other triggers also fire.
+    auto_switch_trigger = _next_auto_switch_step(sub, account_age, now, db)
+    if auto_switch_trigger:
+        triggered.append(auto_switch_trigger)
+
+    # ── Other triggers (charter_day_7, day_10_14, two_deals, spend_250,
+    #    deal_win_10k) — guarded by the 30-day "any annual_offer_* recently"
+    #    suppression. The auto_switch row from above (if just queued) doesn't
+    #    yet exist in the DB this iteration, so it doesn't suppress itself.
+    cutoff = now - timedelta(days=_OFFER_SUPPRESSION_DAYS)
+    recent_offer = db.execute(
+        select(MessageOutcome.id).where(
+            MessageOutcome.subscriber_id == sub.id,
+            MessageOutcome.template_id.like("annual_offer_%"),
+            MessageOutcome.sent_at >= cutoff,
+        ).limit(1)
+    ).scalar_one_or_none()
+    if recent_offer:
+        return triggered  # auto_switch may already be queued; suppress the rest
 
     if sub.founding_member and account_age == 7:
         triggered.append("charter_day_7")
@@ -129,10 +168,56 @@ def _check_triggers(sub: Subscriber, db: Session) -> list[str]:
     if big_deal:
         triggered.append("deal_win_10k")
 
-    if account_age == 60:
-        triggered.append("auto_switch_day_60")
-
     return triggered
+
+
+def _next_auto_switch_step(
+    sub: Subscriber,
+    account_age: int,
+    now: datetime,
+    db: Session,
+) -> Optional[str]:
+    """Determine which step (if any) of the Day-60 auto-switch sequence to
+    fire today. Returns the short trigger name (e.g. 'auto_switch_day_60_r1')
+    or None.
+
+    Sequence:
+        Day 60+ : first offer (template 'annual_offer_auto_switch_day_60')
+        +3 days : reminder 1   (template '..._r1')
+        +7 days : reminder 2   (template '..._r2') — final touch
+    The user accepting (tier=annual_lock) halts the sequence at the top of
+    _check_triggers. After r2 fires the sequence is permanently complete for
+    this subscriber.
+    """
+    if account_age < _AUTO_SWITCH_MIN_AGE_DAYS:
+        return None
+
+    # Most recent row in the auto-switch sequence, if any.
+    last_row = db.execute(
+        select(MessageOutcome.template_id, MessageOutcome.sent_at).where(
+            MessageOutcome.subscriber_id == sub.id,
+            MessageOutcome.template_id.in_(_AUTO_SWITCH_TEMPLATES),
+        ).order_by(MessageOutcome.sent_at.desc()).limit(1)
+    ).first()
+
+    if last_row is None:
+        return _AUTO_SWITCH_TRIGGER_NAMES[_AUTO_SWITCH_BASE_TEMPLATE]
+
+    last_template, last_sent = last_row
+    if last_sent and last_sent.tzinfo is None:
+        last_sent = last_sent.replace(tzinfo=timezone.utc)
+    days_since_last = (now - last_sent).days if last_sent else 0
+
+    if last_template == _AUTO_SWITCH_BASE_TEMPLATE:
+        if days_since_last >= _AUTO_SWITCH_R1_GAP_DAYS:
+            return _AUTO_SWITCH_TRIGGER_NAMES[_AUTO_SWITCH_R1_TEMPLATE]
+        return None
+    if last_template == _AUTO_SWITCH_R1_TEMPLATE:
+        if days_since_last >= _AUTO_SWITCH_R2_GAP_DAYS:
+            return _AUTO_SWITCH_TRIGGER_NAMES[_AUTO_SWITCH_R2_TEMPLATE]
+        return None
+    # last_template is r2 → final reminder already sent; sequence complete.
+    return None
 
 
 def _push_annual_offer(sub: Subscriber, trigger: str, db: Session) -> bool:
@@ -158,8 +243,10 @@ def _push_annual_offer(sub: Subscriber, trigger: str, db: Session) -> bool:
     accept_url = f"{settings.app_base_url}/api/annual/accept?feed_uuid={sub.event_feed_uuid}" if sub.event_feed_uuid else feed_url
 
     subject_by_trigger = {
-        "deal_win_10k":       "You just closed a deal - lock the year, save 2 months",
-        "auto_switch_day_60": "Your 60-day mark - lock the year, save 2 months",
+        "deal_win_10k":               "You just closed a deal - lock the year, save 2 months",
+        "auto_switch_day_60":         "Your 60-day mark - lock the year, save 2 months",
+        "auto_switch_day_60_r1":      "Reminder: 2 months free if you lock in by this week",
+        "auto_switch_day_60_r2":      "Last reminder: your annual offer expires soon",
     }
     subject = subject_by_trigger.get(trigger, "Save 2 months - lock your territory for a full year")
 
@@ -174,6 +261,7 @@ def _push_annual_offer(sub: Subscriber, trigger: str, db: Session) -> bool:
                 f"{annual_str}/yr ({monthly_str}/mo effective - 2 months free).\n\n"
                 f"This rate is available now. Visit your dashboard to upgrade:\n{feed_url}\n\n"
                 f"One-tap accept: {accept_url}\n\n"
+                f"Or reply YEARLY to your Forced Action number to lock it in.\n\n"
                 f"- Forced Action Team"
             ),
         )
@@ -190,6 +278,11 @@ def _push_annual_offer(sub: Subscriber, trigger: str, db: Session) -> bool:
         except Exception as exc:
             logger.warning("[AnnualPush] MessageOutcome log failed for sub=%d: %s", sub.id, exc)
 
+        # Best-effort GHL handoff: tag the subscriber's GHL contact so any
+        # workflow listening for `annual_60_day_offer*` can take over (SMS
+        # cadence, in-app banner, etc.). Failure is logged but never blocks.
+        _apply_ghl_annual_tag(sub, trigger, db)
+
         logger.info(
             "[AnnualPush] Offer sent: subscriber=%d trigger=%s", sub.id, trigger
         )
@@ -197,6 +290,36 @@ def _push_annual_offer(sub: Subscriber, trigger: str, db: Session) -> bool:
     except Exception as exc:
         logger.error("Annual push email failed for subscriber %d: %s", sub.id, exc)
         return False
+
+
+def _apply_ghl_annual_tag(sub: Subscriber, trigger: str, db: Session) -> None:
+    """Push a tag like `annual_60_day_offer` / `_r1` / `_r2` onto the
+    subscriber's GHL contact. Pure side-effect; never raises. If GHL isn't
+    configured, `push_subscriber_to_ghl` silently returns False and we just
+    log debug.
+    """
+    try:
+        from src.services.ghl_webhook import push_subscriber_to_ghl
+        tag = f"annual_60_day_offer_{trigger}" if trigger.startswith("auto_switch_day_60") \
+            else f"annual_offer_{trigger}"
+        ok = push_subscriber_to_ghl(
+            sub, stage=None, tags=[tag], db=db,
+        )
+        if ok:
+            logger.info(
+                "[AnnualPush] GHL tag applied: subscriber=%d tag=%s",
+                sub.id, tag,
+            )
+        else:
+            logger.debug(
+                "[AnnualPush] GHL not configured or push failed (non-fatal): "
+                "subscriber=%d tag=%s", sub.id, tag,
+            )
+    except Exception as exc:
+        logger.warning(
+            "[AnnualPush] GHL tag push raised (non-fatal): subscriber=%d: %s",
+            sub.id, exc,
+        )
 
 
 def switch_to_annual(subscriber_id: int, db: Session) -> bool:

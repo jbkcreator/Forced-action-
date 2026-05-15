@@ -123,8 +123,14 @@ def _handle_boost(sub: Subscriber, db: Session) -> str:
 
 def _handle_auto_on(sub: Subscriber, db: Session) -> str:
     from src.services.auto_mode import toggle
-    toggle(sub.id, True, db)
-    return "Auto Mode ON. Cora will act on your behalf within your settings."[:_MAX_SMS_LEN]
+    try:
+        toggle(sub.id, True, db)
+        return "Auto Mode ON. Cora will act on your behalf within your settings."[:_MAX_SMS_LEN]
+    except PermissionError as exc:
+        return (
+            f"{exc}. Visit your dashboard Settings to upgrade your wallet "
+            "or purchase the Auto Mode add-on."
+        )[:_MAX_SMS_LEN]
 
 
 def _handle_auto_off(sub: Subscriber, db: Session) -> str:
@@ -252,9 +258,38 @@ def _handle_report(sub: Subscriber, db: Session) -> str:
 
 
 def _handle_yearly(sub: Subscriber, db: Session) -> str:
+    """SMS YEARLY now actually performs the switch (Phase 2B v9).
+
+    Old behavior: reply with a dashboard link to self-serve.
+    New behavior: treat YEARLY as direct acceptance of the annual offer.
+    Maps the three failure modes (already annual / billing blocked / Stripe
+    error) to clear SMS replies the user can act on.
+    """
     from config.settings import settings
-    url = f"{settings.app_base_url}/annual?uuid={sub.event_feed_uuid}"
-    return f"Lock in your annual rate ($1,970/yr): {url}"[:_MAX_SMS_LEN]
+    from src.services.stripe_service import can_switch_subscription
+    from src.tasks.annual_push import switch_to_annual
+
+    if sub.tier == "annual_lock":
+        return "You're already on the annual plan. Reply BALANCE for credits."[:_MAX_SMS_LEN]
+
+    ok, reason = can_switch_subscription(sub)
+    if not ok:
+        portal_url = f"{settings.app_base_url}/dashboard/{sub.event_feed_uuid}/settings"
+        return (
+            f"Annual switch blocked: status={reason}. Update billing first: {portal_url}"
+        )[:_MAX_SMS_LEN]
+
+    if switch_to_annual(sub.id, db):
+        return (
+            "Locked in! You're now on the annual plan ($1,970/yr). "
+            "Confirmation email on the way."
+        )[:_MAX_SMS_LEN]
+
+    # Stripe call failed — give them the manual route.
+    dashboard_url = f"{settings.app_base_url}/dashboard/{sub.event_feed_uuid}/settings"
+    return (
+        f"Could not switch to annual right now. Try again from your dashboard: {dashboard_url}"
+    )[:_MAX_SMS_LEN]
 
 
 def _handle_save_card(sub: Subscriber, db: Session) -> str:

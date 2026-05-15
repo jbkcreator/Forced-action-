@@ -37,6 +37,8 @@ logger = logging.getLogger(__name__)
 
 _AUTO_MODE_TIERS = {"growth", "power"}    # wallet tiers where Auto Mode is included
 
+_DENY_MESSAGE = "Auto Mode requires Growth/Power wallet or paid Auto Mode add-on"
+
 
 def is_enabled(subscriber_id: int, db: Session) -> bool:
     """Subscriber.auto_mode_enabled flag check (kept for back-compat)."""
@@ -44,10 +46,76 @@ def is_enabled(subscriber_id: int, db: Session) -> bool:
     return bool(sub and sub.auto_mode_enabled)
 
 
+def _has_active_auto_mode_addon(sub: Subscriber) -> bool:
+    """True if Stripe shows an active subscription on STRIPE_PRICE_AUTO_MODE
+    for this customer. Source of truth for the Starter add-on entitlement.
+
+    Fails closed: any Stripe error / config gap treats the customer as
+    NOT entitled rather than letting them slip past the paywall.
+    """
+    if not sub.stripe_customer_id:
+        return False
+    try:
+        import stripe
+        from config.settings import get_settings
+        s = get_settings()
+        price_id = s.active_stripe_price("auto_mode")
+        if not price_id:
+            return False
+        if not s.active_stripe_secret_key:
+            return False
+        stripe.api_key = s.active_stripe_secret_key.get_secret_value()
+        subs = stripe.Subscription.list(
+            customer=sub.stripe_customer_id, status="active", limit=10
+        )
+        for s_obj in subs.auto_paging_iter():
+            for item in (s_obj.get("items") or {}).get("data", []):
+                if item.get("price", {}).get("id") == price_id:
+                    return True
+        return False
+    except Exception as exc:
+        logger.warning(
+            "[AutoMode] add-on entitlement lookup failed for subscriber=%s: %s "
+            "(failing closed — treating as not entitled)",
+            sub.id, exc,
+        )
+        return False
+
+
+def _can_enable(sub: Subscriber, db: Session) -> tuple[bool, str]:
+    """Can this subscriber legitimately flip auto_mode_enabled to True?
+
+    Separate from is_eligible() so we never grant the toggle solely
+    because the flag is already set (would defeat the gate).
+    """
+    wallet = db.execute(
+        select(WalletBalance).where(WalletBalance.subscriber_id == sub.id)
+    ).scalar_one_or_none()
+    if wallet and wallet.wallet_tier in _AUTO_MODE_TIERS:
+        return True, ""
+    if _has_active_auto_mode_addon(sub):
+        return True, ""
+    return False, _DENY_MESSAGE
+
+
 def toggle(subscriber_id: int, enabled: bool, db: Session) -> bool:
+    """Flip auto_mode_enabled. Enabling enforces tier/entitlement gate.
+    Disabling is always allowed (anyone can opt themselves out).
+
+    Raises PermissionError when a non-entitled subscriber tries to enable.
+    Callers (SMS handler, API endpoint) should catch and surface to user.
+    """
     sub = db.get(Subscriber, subscriber_id)
     if not sub:
         return False
+    if enabled:
+        allowed, reason = _can_enable(sub, db)
+        if not allowed:
+            logger.info(
+                "Auto mode enable DENIED for subscriber=%d: %s",
+                subscriber_id, reason,
+            )
+            raise PermissionError(reason)
     sub.auto_mode_enabled = enabled
     db.flush()
     logger.info("Auto mode %s for subscriber %d", "enabled" if enabled else "disabled", subscriber_id)

@@ -759,6 +759,19 @@ def run_daily_emails(dry_run: bool = False, feed_uuid: Optional[str] = None) -> 
                 if ok:
                     stats["sent"] += 1
                     _upsert_sent_leads(db, sub.id, [lead["property_id"] for lead in leads])
+                    # Trigger Auto Mode (skip-trace + first SMS) per lead.
+                    # enqueue_action self-guards on eligibility and fails soft,
+                    # so it's safe to call unconditionally — non-Auto-Mode
+                    # subscribers get a near-no-op.
+                    try:
+                        from src.services.auto_mode import enqueue_action
+                        for lead in leads:
+                            enqueue_action(sub.id, lead["property_id"], db)
+                    except Exception:
+                        logger.error(
+                            "Auto Mode enqueue failed for subscriber %s — continuing",
+                            sub.id, exc_info=True,
+                        )
                 else:
                     stats["errors"] += 1
             except Exception:
