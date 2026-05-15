@@ -617,6 +617,9 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
             subscriber.id, exc_info=True,
         )
 
+    from src.services.segmentation_engine import reclassify_safe
+    reclassify_safe(subscriber.id, db)
+
     logger.info(
         "checkout.session.completed: subscriber=%s tier=%s vertical=%s"
         " founding=%s zips=%s feed_uuid=%s",
@@ -1298,6 +1301,9 @@ def _on_subscription_deleted(subscription: dict, db: Session) -> None:
             body_html=body_html,
         )
 
+    from src.services.segmentation_engine import reclassify_safe
+    reclassify_safe(subscriber.id, db)
+
 
 # ---------------------------------------------------------------------------
 # 6. payment_intent.succeeded — router (lead pack + default card save + bundles)
@@ -1378,6 +1384,9 @@ def _on_payment_intent_succeeded(payment_intent, db: Session) -> None:
             "[Referral] PI-path confirm failed for subscriber %s — non-fatal: %s",
             subscriber_id, exc, exc_info=True,
         )
+
+    from src.services.segmentation_engine import reclassify_safe
+    reclassify_safe(subscriber_id, db)
 
 
 def _resolve_subscriber_id_from_pi(payment_intent, db: Session) -> Optional[int]:
@@ -1529,6 +1538,9 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
         "lead_unlock complete: subscriber=%s property=%s pi=%s",
         subscriber.id, property_id, _attr(payment_intent, "id"),
     )
+
+    from src.services.segmentation_engine import reclassify_safe
+    reclassify_safe(subscriber.id, db)
 
 
 def _send_lead_unlock_email(subscriber, prop, score, owner, enriched) -> None:
@@ -2230,6 +2242,9 @@ def _on_wallet_subscription_invoice(invoice: dict, db: Session) -> None:
         )
     except Exception:
         pass
+
+    from src.services.segmentation_engine import reclassify_safe
+    reclassify_safe(subscriber_id, db)
 
 
 def _on_wallet_subscription_invoice_failed(invoice: dict, db: Session) -> None:

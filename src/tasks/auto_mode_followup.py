@@ -74,6 +74,8 @@ def run(dry_run: bool = False) -> dict:
                 _trigger_vm_for_subscriber(sub)
                 outcome.clicked_at = now   # mark "vm dispatched"
                 db.flush()
+                from src.services.segmentation_engine import reclassify_safe
+                reclassify_safe(sub.id, db)
                 stats["vm_triggered"] += 1
             except Exception as exc:
                 logger.error(

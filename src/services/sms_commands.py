@@ -46,6 +46,9 @@ def dispatch(from_number: str, command: str, db: Session) -> str:
     if not sub:
         return "Reply HELP to get started with Forced Action."
 
+    from src.services.segmentation_engine import reclassify_safe
+    reclassify_safe(sub.id, db)
+
     handlers = {
         "BALANCE": _handle_balance,
         "LOCK": _handle_lock,
