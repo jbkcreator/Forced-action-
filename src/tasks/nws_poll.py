@@ -37,12 +37,17 @@ _NWS_USER_AGENT = "ForcedAction/1.0 (distressed-property-intelligence)"
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _fetch_alerts_for_zones(zone_ids: list) -> list:
-    """Fetch active NWS alerts for the given UGC zone list."""
+    """Fetch active NWS alerts for the given UGC zone list.
+
+    api.weather.gov is a public US-government endpoint with no anti-bot
+    defenses; routing through Oxylabs (a residential proxy network) actively
+    HURTS the call — NWS flags those IPs as data-center traffic and returns
+    403 Forbidden. We pass `proxies={}` explicitly so the requests library
+    can't pick up HTTPS_PROXY env vars that may be set for scrapers.
+    """
     if not zone_ids:
         return []
     zone_param = ",".join(zone_ids)
-    from src.utils.http_helpers import get_requests_proxies
-    proxies = get_requests_proxies()
     try:
         resp = requests.get(
             _NWS_ALERTS_ZONE_URL,
@@ -52,7 +57,7 @@ def _fetch_alerts_for_zones(zone_ids: list) -> list:
                 "Accept": "application/geo+json",
             },
             timeout=(5, 15),
-            proxies=proxies,
+            proxies={"http": None, "https": None},
         )
         resp.raise_for_status()
         features = resp.json().get("features", [])

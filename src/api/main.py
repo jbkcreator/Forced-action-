@@ -36,9 +36,10 @@ from sqlalchemy import select, and_, or_, desc, func, cast, text, Date
 from src.core.database import get_db_context
 from src.core.models import FoundingSubscriberCount, ZipTerritory, Subscriber, Property, DistressScore, Incident, LeadPackPurchase, ScraperRunStats, EnrichedContact, Owner, SentLead
 from src.services.stripe_webhooks import handle_webhook
-from src.services.stripe_service import get_price_id_for_checkout
+from src.services.stripe_service import get_price_id_for_checkout, _price_ids
 from config.settings import get_settings
 from config.scoring import VERTICAL_WEIGHTS
+from config.constants import TIER_DISPLAY
 from src.utils.logger import setup_logging
 
 # Load config/logging.yaml so every logger.info/warning/error across src/* is
@@ -51,6 +52,7 @@ REACT_DIST = Path(__file__).parent.parent.parent.parent / "Forced-action-ui" / "
 
 VALID_TIERS = {"starter", "pro", "dominator"}
 VALID_VERTICALS = set(VERTICAL_WEIGHTS.keys())
+
 
 app = FastAPI(title="Forced Action API", version="1.0.0")
 app.add_middleware(
@@ -398,6 +400,52 @@ def landing_page():
     if react_index.is_file():
         return FileResponse(str(react_index))
     raise HTTPException(status_code=503, detail="UI not built — run npm run build in Forced-action-ui/")
+
+
+@app.get("/api/pricing")
+def get_pricing_info():
+    """Returns pricing config for the landing page.
+
+    Founding + regular dollar amounts come from Stripe Price objects (via the
+    STRIPE_PRICE_{TIER}_{FOUNDING|REGULAR} env vars). Display copy (label,
+    zip_limit, features) is owned by TIER_DISPLAY above. The frontend reads
+    this once at LandingPage mount and passes it through LandingContext.
+    """
+    _s = get_settings()
+    stripe.api_key = _s.active_stripe_secret_key.get_secret_value()
+    all_prices = _price_ids()
+
+    pricing_info = {}
+    for tier in ("starter", "pro", "dominator"):
+        founding_id = all_prices.get(tier, {}).get("founding")
+        regular_id = all_prices.get(tier, {}).get("regular")
+
+        founding_amount = None
+        regular_amount = None
+        currency = "usd"
+
+        try:
+            if founding_id:
+                p = stripe.Price.retrieve(founding_id)
+                if p.unit_amount is not None:
+                    founding_amount = p.unit_amount // 100
+                currency = p.currency
+            if regular_id:
+                p = stripe.Price.retrieve(regular_id)
+                if p.unit_amount is not None:
+                    regular_amount = p.unit_amount // 100
+                currency = p.currency
+        except Exception as e:
+            logger.error(f"Error retrieving Stripe price for tier '{tier}': {e}", exc_info=True)
+
+        pricing_info[tier] = {
+            "founding_amount": founding_amount,
+            "regular_amount": regular_amount,
+            "currency": currency,
+            **TIER_DISPLAY[tier],
+        }
+
+    return {"pricing": pricing_info}
 
 
 # ---------------------------------------------------------------------------
