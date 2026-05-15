@@ -32,14 +32,21 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Iterable, Optional
 
-from sqlalchemy import func, text
+from sqlalchemy import String, cast, func, text
 
 from src.core.database import get_db_context
 from src.core.models import (
+    BuildingPermit,
+    CodeViolation,
+    Deed,
+    Foreclosure,
+    LegalAndLien,
+    LegalProceeding,
     Owner,
     PlatformDailyStats,
     ScraperAlertLog,
@@ -59,6 +66,85 @@ PAGE_RECIPIENT_HINT = (
     "via a SES → Slack forwarder, or wire send_alert to call a Slack "
     "webhook directly when a pager-grade route is needed."
 )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Content-quality rule config — duplicate-rate + field-coverage detectors.
+# Each entry: source_name → (Model, unique_key_attr, [required_field_attrs]).
+# Only sources with a stable per-source unique key are included; Incidents
+# (fire/flood/storm/insurance) are intentionally excluded for v1 — they have
+# only composite keys which produce false positives on duplicate detection.
+# ─────────────────────────────────────────────────────────────────────────────
+CONTENT_QUALITY_SOURCES = {
+    "foreclosures":      (Foreclosure,     "case_number",       ["plaintiff", "auction_date", "case_status"]),
+    "violations":        (CodeViolation,   "record_number",     ["violation_type", "description", "status"]),
+    "permits":           (BuildingPermit,  "permit_number",     ["permit_type", "status"]),
+    "liens":             (LegalAndLien,    "instrument_number", ["creditor", "debtor", "amount"]),
+    "legal_proceedings": (LegalProceeding, "case_number",       ["associated_party", "case_status"]),
+    "deeds":             (Deed,            "instrument_number", ["grantor", "grantee", "record_date", "sale_price"]),
+}
+
+# Days of the week each source is intentionally NOT scheduled (Python weekday:
+# Mon=0, Sun=6). Mirrors heartbeat_monitor.SOURCE_OFF_DAYS. Skip the rule for
+# that source on those days — no false positives when a M-Sat scraper is
+# legitimately not running on Sunday. Foreclosures runs daily → empty set.
+RULE_OFF_DAYS = {
+    "foreclosures":      set(),
+    "violations":        {6},
+    "permits":           {6},
+    "liens":             {6},
+    "legal_proceedings": {6},
+    "deeds":             {6},
+}
+
+# Duplicate-rate detection: defensive / kept-as-canary. The unique constraint
+# on each source's key plus the pre-insert dedup in db_deduplicator.py means
+# a key cannot legitimately appear on two date_added values, so in current
+# production this rule never fires — its blind-spot is already covered by
+# load_validator's zero-record check + anomaly_pager's volume_drop. Keep
+# the constants here so the rule's behaviour stays tunable if a future
+# scraper bypasses dedup or the schema changes. See full rationale in the
+# docstring of _rule_scraper_duplicate_rate below.
+DUPLICATE_RATE_THRESHOLD       = 0.95
+DUPLICATE_RATE_MIN_TODAY_ROWS  = 5
+
+# Field-coverage detection: alert if % of today's rows with a non-null/non-empty
+# value for a required field drops sharply vs the 7-day baseline. Catches DOM
+# extraction failures where one column silently becomes blank.
+FIELD_COVERAGE_DROP_PP         = 30.0
+FIELD_COVERAGE_MIN_ROWS        = 10
+FIELD_COVERAGE_HISTORY_DAYS    = 7
+
+# Filing-date freshness detection — closes the "scraper writes new rows but
+# their event dates are stuck in the past" blind spot. For each source, the
+# value below names the column that records when the event actually happened
+# (court filing date, permit issue date, etc.) as distinct from `date_added`
+# which records when the row landed in our DB. A healthy scraper sees
+# MAX(<filing_col>) advance over time; a stuck one keeps writing rows whose
+# filing dates anchor to an old window.
+FILING_DATE_FRESHNESS = {
+    "foreclosures":      "filing_date",
+    "violations":        "opened_date",
+    "permits":           "issue_date",
+    "liens":             "filing_date",
+    "legal_proceedings": "filing_date",
+    "deeds":             "record_date",
+}
+
+# Trip if today's MAX(filing_date) is the same as or older than yesterday's
+# MAX(filing_date), for N consecutive days. 1 day of "didn't advance" is
+# normal (weekends, slow news days). 2+ days is the signal.
+FILING_DATE_STALE_DAYS         = 2
+FILING_DATE_MIN_TODAY_ROWS     = 5
+
+# Soft-launch gate: while SHIP_CONTENT_QUALITY_ALERTS is 0 (default), trips
+# from these new rules are LOGGED but not emailed and not recorded in
+# scraper_alert_log. Flip to 1 in .env after a clean 1-week dry-run.
+SOFT_LAUNCH_RULES = {
+    "scraper_duplicate_rate_high",
+    "scraper_field_coverage_drop",
+    "scraper_filing_date_not_advancing",
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -256,11 +342,236 @@ def _rule_cds_no_run_today(session, today: date) -> Iterable[Trip]:
         )
 
 
+def _rule_scraper_duplicate_rate(session, today: date) -> Iterable[Trip]:
+    """% of today's rows whose unique key already existed yesterday is too high.
+
+    DEFENSIVE / DEAD-CODE-IN-PRODUCTION:
+    With the current data model — unique constraint on each source's primary
+    key (foreclosures.case_number, code_violations.record_number, …) plus the
+    pre-insert dedup in src/utils/db_deduplicator.py — a single key cannot
+    exist on two different date_added values at the same time. So in
+    production this rule's set-intersection is always empty and it never
+    fires. The redundant failure modes are covered by:
+
+      - load_validator zero-record alert
+        (broken scraper writes no new INSERTs → today's row count drops to 0)
+      - anomaly_pager.scraper_volume_drop_50pct
+        (broken scraper produces only a fraction of usual new records)
+
+    The rule is kept as defense-in-depth: if a future scraper bypasses
+    dedup, or the schema relaxes its unique constraint, or upsert semantics
+    change to copy rows across dates, this rule will catch the regression
+    before stale leads start scoring. Until then it's a no-op.
+
+    Mocked unit tests in tests/test_anomaly_pager_content_quality.py verify
+    the set-intersection logic itself is correct (TestDuplicateRateRuleMocked).
+    """
+    yesterday = today - timedelta(days=1)
+    weekday = today.weekday()
+
+    for source, (model, key_attr, _fields) in CONTENT_QUALITY_SOURCES.items():
+        if weekday in RULE_OFF_DAYS.get(source, set()):
+            continue
+
+        key_col = getattr(model, key_attr)
+        date_col = model.date_added
+
+        today_keys = {
+            row[0] for row in session.query(key_col).filter(date_col == today).all()
+            if row[0] is not None
+        }
+        if len(today_keys) < DUPLICATE_RATE_MIN_TODAY_ROWS:
+            continue
+
+        yesterday_keys = {
+            row[0] for row in session.query(key_col).filter(date_col == yesterday).all()
+            if row[0] is not None
+        }
+        if not yesterday_keys:
+            continue  # nothing to compare against — yesterday was empty or off-day
+
+        dup_count = len(today_keys & yesterday_keys)
+        dup_rate = dup_count / len(today_keys)
+
+        if dup_rate >= DUPLICATE_RATE_THRESHOLD:
+            sample = sorted(today_keys & yesterday_keys)[:3]
+            yield Trip(
+                rule="scraper_duplicate_rate_high",
+                observed=f"{source}: {dup_rate*100:.1f}% of today's batch ({dup_count}/{len(today_keys)}) existed yesterday",
+                baseline="<5% normal carry-over",
+                threshold=f">= {DUPLICATE_RATE_THRESHOLD*100:.0f}% repeats vs yesterday",
+                context={
+                    "source":            source,
+                    "today_count":       len(today_keys),
+                    "yesterday_count":   len(yesterday_keys),
+                    "duplicate_count":   dup_count,
+                    "duplicate_rate":    round(dup_rate, 3),
+                    "duplicate_sample":  sample,
+                    "date":              str(today),
+                },
+            )
+
+
+def _rule_scraper_field_coverage_drop(session, today: date) -> Iterable[Trip]:
+    """% of today's rows with a non-null value for a required field dropped
+    sharply vs the 7-day baseline.
+
+    Catches HTML scraper degradation where one column silently goes blank
+    (e.g. plaintiff field empty after a DOM change). Row count stays normal
+    so volume rules don't catch it; only content does.
+    """
+    weekday = today.weekday()
+
+    for source, (model, _key_attr, fields) in CONTENT_QUALITY_SOURCES.items():
+        if weekday in RULE_OFF_DAYS.get(source, set()):
+            continue
+
+        date_col = model.date_added
+        total_today = session.query(func.count()).select_from(model).filter(
+            date_col == today
+        ).scalar() or 0
+        if total_today < FIELD_COVERAGE_MIN_ROWS:
+            continue
+
+        for field_name in fields:
+            field_col = getattr(model, field_name)
+
+            today_pct = _field_coverage_pct(session, model, field_col, date_col, today, total_today)
+
+            # Baseline: per-day coverage % over the previous N days. Need >=3 days.
+            baseline_pcts = []
+            for day_offset in range(1, FIELD_COVERAGE_HISTORY_DAYS + 1):
+                d = today - timedelta(days=day_offset)
+                day_total = session.query(func.count()).select_from(model).filter(
+                    date_col == d
+                ).scalar() or 0
+                if day_total < FIELD_COVERAGE_MIN_ROWS:
+                    continue
+                baseline_pcts.append(_field_coverage_pct(session, model, field_col, date_col, d, day_total))
+            if len(baseline_pcts) < 3:
+                continue
+
+            baseline_pct = sum(baseline_pcts) / len(baseline_pcts)
+            delta_pp = baseline_pct - today_pct
+
+            if delta_pp > FIELD_COVERAGE_DROP_PP:
+                yield Trip(
+                    rule="scraper_field_coverage_drop",
+                    observed=f"{source}.{field_name}: {today_pct:.1f}% non-null today",
+                    baseline=f"{baseline_pct:.1f}% non-null (avg of last {len(baseline_pcts)} days)",
+                    threshold=f"> {FIELD_COVERAGE_DROP_PP:.0f}pp drop",
+                    context={
+                        "source":         source,
+                        "field":          field_name,
+                        "total_today":    total_today,
+                        "today_pct":      round(today_pct, 1),
+                        "baseline_pct":   round(baseline_pct, 1),
+                        "delta_pp":       round(delta_pp, 1),
+                        "history_days":   len(baseline_pcts),
+                        "date":           str(today),
+                    },
+                )
+
+
+def _field_coverage_pct(session, model, field_col, date_col, target_date: date, total: int) -> float:
+    """Returns % of rows on target_date where field_col is non-null and non-empty.
+
+    For string columns, also rejects whitespace-only values — that's what a
+    failed-extraction empty span looks like in the DB. For Numeric/Date columns
+    the cast-to-string still works since length() on a stringified non-null
+    value is always > 0 (so the trim/length is a no-op there).
+    """
+    non_null = session.query(func.count()).select_from(model).filter(
+        date_col == target_date,
+        field_col.isnot(None),
+        func.length(func.trim(cast(field_col, String))) > 0,
+    ).scalar() or 0
+    return 100.0 * non_null / total if total else 0.0
+
+
+def _rule_scraper_filing_date_not_advancing(session, today: date) -> Iterable[Trip]:
+    """MAX(<event-date column>) for today's batch is not newer than yesterday's.
+
+    Closes the "stale event-date" blind spot: scraper writes new rows
+    (unique keys, populated fields, normal volume) but the underlying
+    event dates — filing_date, opened_date, issue_date — are anchored
+    in the past. Court systems file new cases continuously; a healthy
+    scraper sees the max advance over time. A stuck one doesn't.
+
+    Logic: if MAX(filing_col) on today's batch is <= MAX(filing_col)
+    on each of the previous FILING_DATE_STALE_DAYS batches, fire.
+    Requires at least FILING_DATE_MIN_TODAY_ROWS rows today so a slow
+    Saturday doesn't trip the rule.
+    """
+    weekday = today.weekday()
+
+    for source, filing_col_name in FILING_DATE_FRESHNESS.items():
+        if weekday in RULE_OFF_DAYS.get(source, set()):
+            continue
+        if source not in CONTENT_QUALITY_SOURCES:
+            continue
+        model, _key_attr, _fields = CONTENT_QUALITY_SOURCES[source]
+        filing_col = getattr(model, filing_col_name)
+        date_col = model.date_added
+
+        # Skip tiny batches — a few rows can naturally have the same MAX.
+        total_today = session.query(func.count()).select_from(model).filter(
+            date_col == today
+        ).scalar() or 0
+        if total_today < FILING_DATE_MIN_TODAY_ROWS:
+            continue
+
+        today_max = session.query(func.max(filing_col)).filter(date_col == today).scalar()
+        if today_max is None:
+            continue  # all rows have NULL filing date — field-coverage rule's domain
+
+        # Compare against each of the previous N days. Only fires if today's
+        # max is NOT strictly greater than ANY of them — i.e. the scraper
+        # has been stuck for FILING_DATE_STALE_DAYS days running.
+        prior_maxes = []
+        for day_offset in range(1, FILING_DATE_STALE_DAYS + 1):
+            d = today - timedelta(days=day_offset)
+            d_total = session.query(func.count()).select_from(model).filter(
+                date_col == d
+            ).scalar() or 0
+            if d_total < FILING_DATE_MIN_TODAY_ROWS:
+                continue  # weekend / off-day with thin data — skip comparison
+            d_max = session.query(func.max(filing_col)).filter(date_col == d).scalar()
+            if d_max is not None:
+                prior_maxes.append((d, d_max))
+
+        if not prior_maxes:
+            continue  # no useful baseline
+
+        # If today's max strictly exceeds at least one prior day's max,
+        # we ARE advancing. Only fire if today fails to beat EVERY prior.
+        if any(today_max > pm for _, pm in prior_maxes):
+            continue
+
+        yield Trip(
+            rule="scraper_filing_date_not_advancing",
+            observed=f"{source}.{filing_col_name}: today's max={today_max}",
+            baseline=", ".join(f"{d}={m}" for d, m in prior_maxes),
+            threshold=f"today's max must exceed prior {FILING_DATE_STALE_DAYS} days",
+            context={
+                "source":           source,
+                "filing_column":    filing_col_name,
+                "today_count":      total_today,
+                "today_max":        str(today_max),
+                "prior_maxes":      [(str(d), str(m)) for d, m in prior_maxes],
+                "date":             str(today),
+            },
+        )
+
+
 _RULES = (
     _rule_scraper_volume_drop,
     _rule_gold_plus_volume_drop,
     _rule_gold_plus_phone_coverage_drop,
     _rule_cds_no_run_today,
+    _rule_scraper_duplicate_rate,
+    _rule_scraper_field_coverage_drop,
+    _rule_scraper_filing_date_not_advancing,
 )
 
 
@@ -308,6 +619,17 @@ def evaluate(today: Optional[date] = None) -> list[Trip]:
     return trips
 
 
+def _is_soft_launched(rule: str) -> bool:
+    """Soft-launch rules log-only until SHIP_CONTENT_QUALITY_ALERTS=1 in env.
+    Trips still evaluate (visible in --dry-run + cron logs) but no email is sent
+    and no dedup row is written, so flipping the flag later doesn't suppress
+    the first real alert via stale cooldown.
+    """
+    if rule not in SOFT_LAUNCH_RULES:
+        return False
+    return os.getenv("SHIP_CONTENT_QUALITY_ALERTS", "0").strip() not in ("1", "true", "True")
+
+
 def run_and_page(today: Optional[date] = None, county_id: str = "hillsborough", dry_run: bool = False) -> list[Trip]:
     """Run rules and send paging emails for any trips not recently sent."""
     trips = evaluate(today)
@@ -317,6 +639,12 @@ def run_and_page(today: Optional[date] = None, county_id: str = "hillsborough", 
 
     with get_db_context() as session:
         for trip in trips:
+            if _is_soft_launched(trip.rule):
+                logger.info(
+                    "[anomaly_pager][SOFT-LAUNCH] %s would have fired: %s",
+                    trip.rule, trip.context,
+                )
+                continue
             if _recently_paged(session, trip.rule, county_id):
                 logger.info("[anomaly_pager] %s already paged in the last %dh — skipping",
                             trip.rule, ALERT_DEDUP_WINDOW_HOURS)
@@ -337,13 +665,23 @@ def run_and_page(today: Optional[date] = None, county_id: str = "hillsborough", 
 
 def print_rule_catalog() -> None:
     """Operator-facing: list every rule the pager will check."""
+    ship_content = os.getenv("SHIP_CONTENT_QUALITY_ALERTS", "0").strip() in ("1", "true", "True")
     print("anomaly_pager — rule catalog:\n")
     for fn in _RULES:
         name = fn.__name__.removeprefix("_rule_")
-        # Pull the one-line description from the rule function's docstring.
         doc = (fn.__doc__ or "").strip().split("\n")[0]
-        print(f"  {name:<32}  {doc}")
+        # Map fn name → trip's `rule` string to flag soft-launch state.
+        marker = ""
+        fn_to_trip = {
+            "scraper_duplicate_rate":            "scraper_duplicate_rate_high",
+            "scraper_field_coverage_drop":       "scraper_field_coverage_drop",
+            "scraper_filing_date_not_advancing": "scraper_filing_date_not_advancing",
+        }
+        if name in fn_to_trip:
+            marker = "  [LIVE]" if ship_content else "  [SOFT-LAUNCH — log-only]"
+        print(f"  {name:<32}  {doc}{marker}")
     print(f"\nDedup window: {ALERT_DEDUP_WINDOW_HOURS} hours per rule")
+    print(f"Soft-launch flag: SHIP_CONTENT_QUALITY_ALERTS={'1 (live)' if ship_content else '0 (log-only)'}")
     print(PAGE_RECIPIENT_HINT)
 
 
