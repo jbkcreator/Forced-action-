@@ -13,6 +13,7 @@ Create Date: 2026-05-15
 
 import sqlalchemy as sa
 from alembic import op
+from sqlalchemy import inspect
 
 
 revision = "fa022_cf_bypass_profiles"
@@ -22,6 +23,13 @@ depends_on = None
 
 
 def upgrade() -> None:
+    # distress_dev was seeded from scaling/county's alembic chain
+    # (revision z0a1b2c3d4e5) which already created this table. Skip if
+    # it's already present so this migration is a no-op there.
+    bind = op.get_bind()
+    if inspect(bind).has_table("cf_bypass_profiles"):
+        return
+
     op.create_table(
         "cf_bypass_profiles",
         sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
@@ -62,6 +70,9 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    bind = op.get_bind()
+    if not inspect(bind).has_table("cf_bypass_profiles"):
+        return
     op.drop_index("ix_cf_bypass_profiles_status", table_name="cf_bypass_profiles")
     op.drop_index("ix_cf_bypass_profiles_county", table_name="cf_bypass_profiles")
     op.drop_table("cf_bypass_profiles")
