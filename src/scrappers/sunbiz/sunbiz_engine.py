@@ -34,7 +34,9 @@ logger = get_logger(__name__)
 SUNBIZ_SEARCH_URL = "https://search.sunbiz.org/Inquiry/CorporationSearch/ByName"
 SUNBIZ_BASE = "https://search.sunbiz.org"
 
-_DELAY_SECONDS = 1.5  # polite crawl rate between owners
+# polite crawl rate between owners — config/scrapers/sunbiz.yaml
+from src.utils.scraper_config import get_scraper_config
+_DELAY_SECONDS = get_scraper_config("sunbiz")["polite_crawl_delay_seconds"]
 
 
 # ---------------------------------------------------------------------------

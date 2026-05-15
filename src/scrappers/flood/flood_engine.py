@@ -30,16 +30,8 @@ _FEMA_NFIP_CLAIMS_URL = "https://www.fema.gov/api/open/v2/FimaNfipClaims"
 _NWS_ALERTS_URL = "https://api.weather.gov/alerts/active"
 _NWS_ZONE_URL = "https://api.weather.gov/alerts/active/zone/{zone_id}"
 
-FLOOD_NWS_EVENTS = [
-    "Flash Flood Warning",
-    "Flash Flood Watch",
-    "Flood Warning",
-    "Flood Watch",
-    "Flood Advisory",
-    "Coastal Flood Warning",
-    "Coastal Flood Advisory",
-    "Areal Flood Warning",
-]
+from src.utils.scraper_config import get_keywords
+FLOOD_NWS_EVENTS = get_keywords("flood")
 
 
 def _fetch_fema_declarations(state: str, county_fips: str, start_date: date) -> List[Dict]:

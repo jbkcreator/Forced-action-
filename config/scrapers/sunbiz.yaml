@@ -1,0 +1,4 @@
+# Per-scraper config for sunbiz (FL SOS corporate enrichment).
+# Loader: src.utils.scraper_config.get_scraper_config('sunbiz')
+
+polite_crawl_delay_seconds: 1.5

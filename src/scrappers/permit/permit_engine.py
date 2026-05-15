@@ -37,6 +37,7 @@ from config.constants import (
 from src.utils.logger import setup_logging, get_logger
 from src.utils.prompt_loader import get_prompt
 from src.utils.db_deduplicator import filter_new_records
+from src.utils.scraper_config import get_selectors
 
 # Initialize logging
 setup_logging()
@@ -95,11 +96,12 @@ async def scrape_permits_with_playwright(
 
 	logger.info(f"[Playwright] Scraping permits {start_date_str} → {end_date_str}")
 
-	# Exact element IDs from the Accela portal HTML
-	START_DATE_ID   = "ctl00_PlaceHolderMain_generalSearchForm_txtGSStartDate"
-	END_DATE_ID     = "ctl00_PlaceHolderMain_generalSearchForm_txtGSEndDate"
-	SEARCH_BTN_ID   = "ctl00_PlaceHolderMain_btnNewSearch"
-	DOWNLOAD_BTN_ID = "ctl00_PlaceHolderMain_dgvPermitList_gdvPermitList_gdvPermitListtop4btnExport"
+	# Accela portal element IDs — config/scrapers/permits.yaml
+	_sel = get_selectors("permits")
+	START_DATE_ID   = _sel["start_date"]
+	END_DATE_ID     = _sel["end_date"]
+	SEARCH_BTN_ID   = _sel["search_button"]
+	DOWNLOAD_BTN_ID = _sel["download_button"]
 
 	debug_dir = Path("data/debug/playwright/permits")
 	if debug:

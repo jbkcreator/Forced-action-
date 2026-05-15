@@ -1,0 +1,3 @@
+# Per-scraper config for liens.
+# Loader: src.utils.scraper_config.get_scraper_config('liens') / get_selectors('liens')
+# Reserved for future config — populated as needed during migration.

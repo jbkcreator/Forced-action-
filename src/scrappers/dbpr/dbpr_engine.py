@@ -53,23 +53,9 @@ _DBPR_URLS = {
 # Local download staging directory
 _DOWNLOAD_DIR = Path("data/dbpr")
 
-# License type code → platform vertical
-_LICENSE_TO_VERTICAL: dict[str, str] = {
-    "CCC": "roofing",
-    "CRC": "roofing",          # Registered roofing
-    "CGC": "general",
-    "CBC": "general",
-    "RGC": "general",          # Registered general
-    "RBC": "general",          # Registered building
-    "CFC": "plumbing",
-    "RFC": "plumbing",         # Registered plumbing
-    "CAC": "hvac",
-    "CMC": "hvac",
-    "RAC": "hvac",             # Registered AC
-    "RMC": "hvac",             # Registered mechanical
-    "MRSA": "remediation",
-    "MRSR": "remediation",
-}
+# License type code → platform vertical — config/scrapers/dbpr.yaml
+from src.utils.scraper_config import get_scraper_config
+_LICENSE_TO_VERTICAL: dict[str, str] = get_scraper_config("dbpr")["license_to_vertical"]
 
 # TSV column positions (0-indexed) — confirmed from sample data
 _COL_TYPE_CODE   = 0   # CGC / CFC / CBC …

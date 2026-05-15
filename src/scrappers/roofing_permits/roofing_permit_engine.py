@@ -25,11 +25,8 @@ from src.core.models import BuildingPermit, Property, Incident
 logger = logging.getLogger(__name__)
 
 # Keywords that indicate a roofing job
-ROOFING_KEYWORDS = [
-    "roof", "shingle", "tpo", "tile", "fascia",
-    "soffit", "gutters", "flashing", "underlayment",
-    "re-roof", "reroof",
-]
+from src.utils.scraper_config import get_keywords
+ROOFING_KEYWORDS = get_keywords("roofing_permit")
 
 
 def _keyword_filter():

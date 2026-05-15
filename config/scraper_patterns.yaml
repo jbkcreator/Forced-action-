@@ -1,0 +1,26 @@
+# Regex, case-type codes, doc-type codes, and file-name patterns per engine.
+# Loader: src.utils.scraper_config.get_patterns(engine)
+
+evictions:
+  filename_regex: 'CivilFiling_(\d{8})\.csv'
+  case_types:
+    - LT Residential Eviction
+    - LT Commercial Eviction
+    - Eviction
+
+probate:
+  filename_regex: 'ProbateFiling_(\d{8})\.csv'
+
+divorce:
+  filename_regex: 'CivilFiling_(\d{8})\.csv'
+  case_types:
+    - DR Dissolution of Marriage
+    - DR Dissolution
+    - Dissolution of Marriage
+    - Domestic Relations
+    - Family Law
+
+master:
+  chunk_size: 50000
+  raw_file_encoding: cp1252
+  dbf_signature_bytes: [0x02, 0x03, 0x04, 0x05, 0x83, 0x8B, 0x8C]

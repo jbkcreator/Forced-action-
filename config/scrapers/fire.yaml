@@ -1,0 +1,3 @@
+# Per-scraper config for fire.
+# Loader: src.utils.scraper_config.get_scraper_config('fire') / get_selectors('fire')
+# Reserved for future config — populated as needed during migration.

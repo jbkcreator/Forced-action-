@@ -27,13 +27,15 @@ from bs4 import BeautifulSoup
 
 from config.constants import (
     RAW_DIVORCE_DIR,
-    DIVORCE_CASE_PATTERNS,
-    CIVIL_FILING_PATTERN,
     DEFAULT_USER_AGENT,
     REQUEST_TIMEOUT_DEFAULT,
     REQUEST_TIMEOUT_LONG,
 )
 from src.utils.county_config import get_county as _get_county
+from src.utils.scraper_config import get_patterns
+_divorce_patterns = get_patterns("divorce")
+DIVORCE_CASE_PATTERNS = _divorce_patterns["case_types"]
+CIVIL_FILING_PATTERN = _divorce_patterns["filename_regex"]
 from src.utils.http_helpers import requests_get_with_retry
 from src.utils.logger import setup_logging, get_logger
 from src.utils.db_deduplicator import filter_new_records

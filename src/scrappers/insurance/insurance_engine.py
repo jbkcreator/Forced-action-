@@ -31,18 +31,8 @@ logger = logging.getLogger(__name__)
 _FEMA_IA_URL = "https://www.fema.gov/api/open/v2/HousingAssistanceOwners"
 
 # Permit keywords indicating insurance/adjuster activity
-INSURANCE_PERMIT_KEYWORDS = [
-    "insurance",
-    "adjuster",
-    "claim",
-    "damage assessment",
-    "damage repair",
-    "storm damage",
-    "flood damage",
-    "fire damage",
-    "wind damage",
-    "hail damage",
-]
+from src.utils.scraper_config import get_keywords
+INSURANCE_PERMIT_KEYWORDS = get_keywords("insurance")
 
 
 def _insurance_permit_filter():

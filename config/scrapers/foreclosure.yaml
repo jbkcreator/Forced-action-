@@ -1,0 +1,6 @@
+# Per-scraper config for foreclosure (Hillsborough RealForeclose preview).
+# Loader: src.utils.scraper_config.get_selectors('foreclosure')
+
+selectors:
+  party_grid_rows: '#obpa-grid tbody tr'
+  bid_window:      '#BID_WINDOW_CONTAINER'

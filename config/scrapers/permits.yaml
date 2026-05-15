@@ -1,0 +1,8 @@
+# Per-scraper config for permits (Hillsborough Accela portal).
+# Loader: src.utils.scraper_config.get_selectors('permits')
+
+selectors:
+  start_date:      ctl00_PlaceHolderMain_generalSearchForm_txtGSStartDate
+  end_date:        ctl00_PlaceHolderMain_generalSearchForm_txtGSEndDate
+  search_button:   ctl00_PlaceHolderMain_btnNewSearch
+  download_button: ctl00_PlaceHolderMain_dgvPermitList_gdvPermitList_gdvPermitListtop4btnExport

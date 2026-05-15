@@ -39,6 +39,7 @@ from src.core.models import Property, Incident
 from src.utils.county_config import get_county
 from src.utils.csv_deduplicator import deduplicate_csv, rotate_csv_archives
 from src.utils.prompt_loader import get_prompt
+from src.utils.scraper_config import get_keywords, get_timeout
 from sqlalchemy import select, and_
 
 logger = logging.getLogger(__name__)
@@ -57,16 +58,9 @@ _FIRE_PORTAL_URL = "https://gis.hcso.tampa.fl.us/publicgis/callsforservice/"
 # Dedup unique key — Report Number uniquely identifies each call
 _FIRE_DEDUP_KEY = ["Report Number"]
 
-# Fire incident type keywords to include (exclude medical, traffic)
-FIRE_INCIDENT_TYPES = [
-    "structure fire",
-    "fire",
-    "smoke",
-    "explosion",
-    "arson",
-    "wildland fire",
-    "vehicle fire",
-]
+# Fire incident type keywords (config/scraper_keywords.yaml :: fire).
+# Re-exported as module-level constant for back-compat with any callers.
+FIRE_INCIDENT_TYPES = get_keywords("fire")
 
 
 def _locate_recent_download(start_time: float) -> Optional[Path]:
@@ -179,9 +173,10 @@ async def _download_calls_csv_ai(portal_url: str = _FIRE_PORTAL_URL) -> Optional
         if not history.is_done():
             logger.warning("[fire][AI] Agent could not finish within step limit")
             return None
-        logger.warning("[fire][AI] Agent completed, waiting 15s for download to finalize")
+        finalize_wait = get_timeout("fire", "agent_finalize_wait")
+        logger.warning("[fire][AI] Agent completed, waiting %ds for download to finalize", finalize_wait)
         import asyncio
-        await asyncio.sleep(15)
+        await asyncio.sleep(finalize_wait)
     except Exception as e:
         logger.error("[fire][AI] Agent execution failed: %s", e, exc_info=True)
         return None

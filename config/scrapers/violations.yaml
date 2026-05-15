@@ -1,0 +1,7 @@
+# Per-scraper config for violations (Hillsborough Accela portal).
+# Loader: src.utils.scraper_config.get_selectors('violations')
+
+selectors:
+  start_date:    ctl00_PlaceHolderMain_generalSearchForm_txtGSStartDate
+  end_date:      ctl00_PlaceHolderMain_generalSearchForm_txtGSEndDate
+  search_button: ctl00_PlaceHolderMain_btnNewSearch

@@ -29,21 +29,8 @@ _NWS_ALERTS_URL = "https://api.weather.gov/alerts/active"
 _NWS_ZONE_URL = "https://api.weather.gov/alerts/active/zone/{zone_id}"
 
 # NWS event types that indicate storm/wind/hail damage relevant to roofing
-STORM_EVENT_TYPES = [
-    "Tornado Warning",
-    "Tornado Watch",
-    "Severe Thunderstorm Warning",
-    "Severe Thunderstorm Watch",
-    "Hurricane Warning",
-    "Hurricane Watch",
-    "Tropical Storm Warning",
-    "Tropical Storm Watch",
-    "High Wind Warning",
-    "Wind Advisory",
-    "Special Weather Statement",
-    "Flash Flood Warning",
-    "Flood Warning",
-]
+from src.utils.scraper_config import get_keywords
+STORM_EVENT_TYPES = get_keywords("storm")
 
 
 def _fetch_nws_alerts_by_zones(zone_ids: List[str]) -> List[Dict]:

@@ -28,12 +28,13 @@ from src.utils.http_helpers import requests_get_with_retry
 
 from config.constants import (
 	RAW_PROBATE_DIR,
-	PROBATE_FILING_PATTERN,
 	DEFAULT_USER_AGENT,
 	REQUEST_TIMEOUT_DEFAULT,
 	REQUEST_TIMEOUT_LONG,
 	get_county_config,
 )
+from src.utils.scraper_config import get_patterns
+PROBATE_FILING_PATTERN = get_patterns("probate")["filename_regex"]
 from src.core.database import get_db_context
 from src.loaders.legal_proceedings import ProbateLoader
 from src.utils.logger import setup_logging, get_logger

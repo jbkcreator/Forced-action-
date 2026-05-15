@@ -1,0 +1,3 @@
+# Per-scraper config for flood.
+# Loader: src.utils.scraper_config.get_scraper_config('flood') / get_selectors('flood')
+# Reserved for future config — populated as needed during migration.

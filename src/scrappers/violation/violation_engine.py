@@ -35,6 +35,7 @@ from config.constants import (
 from src.utils.logger import setup_logging, get_logger
 from src.utils.prompt_loader import get_prompt
 from src.utils.db_deduplicator import filter_new_records
+from src.utils.scraper_config import get_selectors
 from src.core.database import get_db_context
 from src.loaders.violations import ViolationLoader
 
@@ -93,10 +94,11 @@ async def scrape_violations_with_playwright(
 
     logger.info(f"[Playwright] Scraping violations {start_date_str} → {end_date_str}")
 
-    # Exact element IDs from the Accela portal HTML
-    START_DATE_ID = "ctl00_PlaceHolderMain_generalSearchForm_txtGSStartDate"
-    END_DATE_ID = "ctl00_PlaceHolderMain_generalSearchForm_txtGSEndDate"
-    SEARCH_BTN_ID = "ctl00_PlaceHolderMain_btnNewSearch"
+    # Accela portal element IDs — config/scrapers/violations.yaml
+    _sel = get_selectors("violations")
+    START_DATE_ID = _sel["start_date"]
+    END_DATE_ID = _sel["end_date"]
+    SEARCH_BTN_ID = _sel["search_button"]
 
     debug_dir = Path("data/debug/playwright/violations")
     if debug:

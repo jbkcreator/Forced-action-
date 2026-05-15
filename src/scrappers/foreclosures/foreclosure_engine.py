@@ -41,6 +41,10 @@ from src.loaders.foreclosures import ForeclosureLoader
 from src.utils.logger import setup_logging, get_logger
 from src.utils.prompt_loader import get_prompt
 from src.utils.db_deduplicator import filter_new_records
+from src.utils.scraper_config import get_selectors, get_timeout
+
+_FORECLOSURE_SELECTORS = get_selectors("foreclosure")
+_FORECLOSURE_PAGE_WAIT_MS = get_timeout("foreclosure", "page_wait_ms")
 
 # Initialize logging
 setup_logging()
@@ -158,9 +162,9 @@ async def _fetch_parties_from_detail(page, detail_url: str) -> dict:
 	"""
 	try:
 		await page.goto(detail_url, wait_until="domcontentloaded", timeout=30_000)
-		await page.wait_for_selector('#obpa-grid tbody tr', state='attached', timeout=15_000)
+		await page.wait_for_selector(_FORECLOSURE_SELECTORS["party_grid_rows"], state='attached', timeout=15_000)
 
-		rows = await page.query_selector_all('#obpa-grid tbody tr')
+		rows = await page.query_selector_all(_FORECLOSURE_SELECTORS["party_grid_rows"])
 		parties = []
 		for row in rows:
 			cells = await row.query_selector_all('td')
@@ -319,13 +323,13 @@ async def scrape_foreclosures_with_playwright(
 			# Give JS time to render the auction container
 			try:
 				await page.wait_for_selector(
-					"#BID_WINDOW_CONTAINER", state="attached", timeout=30_000
+					_FORECLOSURE_SELECTORS["bid_window"], state="attached", timeout=30_000
 				)
 			except Exception:
 				# Container absent → no auctions scheduled for this date
 				page_text = await page.inner_text("body")
 				logger.info(
-					f"[Playwright] #BID_WINDOW_CONTAINER not found for {auction_date} "
+					f"[Playwright] {_FORECLOSURE_SELECTORS['bid_window']} not found for {auction_date} "
 					f"— likely no auctions scheduled. Page snippet: {page_text[:300]!r}"
 				)
 				return None
@@ -369,7 +373,7 @@ async def scrape_foreclosures_with_playwright(
 					# Click the bottom "Next Page" button for this section
 					next_btn = page.locator(f".{head_class} .PageFrame .PageRight").last
 					await next_btn.click()
-					await page.wait_for_timeout(2_000)
+					await page.wait_for_timeout(_FORECLOSURE_PAGE_WAIT_MS)
 					await save_debug(page, f"{area_id}_page{page_num + 1}")
 					page_num += 1
 

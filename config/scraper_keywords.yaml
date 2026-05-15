@@ -1,0 +1,61 @@
+# Keyword lists per scraper engine.
+# Loader: src.utils.scraper_config.get_keywords(engine)
+
+fire:
+  - structure fire
+  - fire
+  - smoke
+  - explosion
+  - arson
+  - wildland fire
+  - vehicle fire
+
+flood:
+  - Flash Flood Warning
+  - Flash Flood Watch
+  - Flood Warning
+  - Flood Watch
+  - Flood Advisory
+  - Coastal Flood Warning
+  - Coastal Flood Advisory
+  - Areal Flood Warning
+
+storm:
+  - Tornado Warning
+  - Tornado Watch
+  - Severe Thunderstorm Warning
+  - Severe Thunderstorm Watch
+  - Hurricane Warning
+  - Hurricane Watch
+  - Tropical Storm Warning
+  - Tropical Storm Watch
+  - High Wind Warning
+  - Wind Advisory
+  - Special Weather Statement
+  - Flash Flood Warning
+  - Flood Warning
+
+insurance:
+  - insurance
+  - adjuster
+  - claim
+  - damage assessment
+  - damage repair
+  - storm damage
+  - flood damage
+  - fire damage
+  - wind damage
+  - hail damage
+
+roofing_permit:
+  - roof
+  - shingle
+  - tpo
+  - tile
+  - fascia
+  - soffit
+  - gutters
+  - flashing
+  - underlayment
+  - re-roof
+  - reroof

@@ -39,10 +39,12 @@ llm = ChatAnthropic(
 	temperature=0
 )
 
-# Configuration
-CHUNK_SIZE = 50000
-RAW_FILE_ENCODING = "cp1252"
-DBF_SIGNATURES = {0x02, 0x03, 0x04, 0x05, 0x83, 0x8B, 0x8C}
+# Configuration — config/scraper_patterns.yaml :: master
+from src.utils.scraper_config import get_patterns
+_master_patterns = get_patterns("master")
+CHUNK_SIZE = _master_patterns["chunk_size"]
+RAW_FILE_ENCODING = _master_patterns["raw_file_encoding"]
+DBF_SIGNATURES = set(_master_patterns["dbf_signature_bytes"])
 
 
 # Helper functions for CSV conversion

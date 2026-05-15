@@ -1,0 +1,16 @@
+# Per-engine timeouts (seconds unless suffix says otherwise).
+# Loader: src.utils.scraper_config.get_timeout(engine, name)
+# Engines are added here as they migrate from constants.py / inline literals.
+
+# Conventional timeout names:
+#   download_wait      — seconds to wait after triggering a file download
+#   request_timeout    — HTTP request timeout
+#   page_wait          — inter-page paging delay
+#   nav_timeout        — browser navigation timeout
+#   agent_finalize_wait — post-AI-agent settle window for downloads
+
+fire:
+  agent_finalize_wait: 15
+
+foreclosure:
+  page_wait_ms: 2000

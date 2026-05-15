@@ -1,0 +1,20 @@
+# Per-scraper config for dbpr (FL DBPR contractor extracts).
+# Loader: src.utils.scraper_config.get_scraper_config('dbpr')
+
+# DBPR license type code → platform vertical.
+# C* = certified, R* = registered. MRSA/MRSR = mold remediation.
+license_to_vertical:
+  CCC:  roofing
+  CRC:  roofing
+  CGC:  general
+  CBC:  general
+  RGC:  general
+  RBC:  general
+  CFC:  plumbing
+  RFC:  plumbing
+  CAC:  hvac
+  CMC:  hvac
+  RAC:  hvac
+  RMC:  hvac
+  MRSA: remediation
+  MRSR: remediation

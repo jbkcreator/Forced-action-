@@ -30,8 +30,6 @@ from src.utils.http_helpers import requests_get_with_retry
 
 from config.constants import (
 	RAW_EVICTIONS_DIR,
-	EVICTION_CASE_PATTERNS,
-	CIVIL_FILING_PATTERN,
 	DEFAULT_USER_AGENT,
 	REQUEST_TIMEOUT_DEFAULT,
 	REQUEST_TIMEOUT_LONG,
@@ -39,6 +37,10 @@ from config.constants import (
 	OUTPUT_SEPARATOR,
 )
 from src.utils.county_config import get_county as _get_county
+from src.utils.scraper_config import get_patterns
+_evictions_patterns = get_patterns("evictions")
+EVICTION_CASE_PATTERNS = _evictions_patterns["case_types"]
+CIVIL_FILING_PATTERN = _evictions_patterns["filename_regex"]
 from src.utils.logger import setup_logging, get_logger
 from src.utils.db_deduplicator import filter_new_records
 

@@ -86,8 +86,8 @@ TAMPA_DIVISION_PREFIX = "8:"
 DOWNLOAD_FILE_PATTERNS = ("*.csv", "*.xls", "*.xlsx", "*.json", "*.zip")
 
 # Specific file name patterns
-CIVIL_FILING_PATTERN = r"CivilFiling_(\d{8})\.csv"
-PROBATE_FILING_PATTERN = r"ProbateFiling_(\d{8})\.csv"
+# CIVIL_FILING_PATTERN, PROBATE_FILING_PATTERN moved to
+# config/scraper_patterns.yaml — access via src.utils.scraper_config.get_patterns.
 MASTER_PARCEL_FILE = "PARCEL_SPREADSHEET.xls"
 
 # Browser download temp directory pattern
@@ -97,19 +97,8 @@ BROWSER_DOWNLOAD_TEMP_PATTERN = "browser-use-downloads-*"
 # EVICTION CASE TYPE PATTERNS
 # =============================================================================
 
-EVICTION_CASE_PATTERNS = [
-    "LT Residential Eviction",
-    "LT Commercial Eviction",
-    "Eviction",
-]
-
-DIVORCE_CASE_PATTERNS = [
-    "DR Dissolution of Marriage",
-    "DR Dissolution",
-    "Dissolution of Marriage",
-    "Domestic Relations",
-    "Family Law",
-]
+# EVICTION_CASE_PATTERNS, DIVORCE_CASE_PATTERNS moved to
+# config/scraper_patterns.yaml — access via src.utils.scraper_config.get_patterns.
 
 # =============================================================================
 # TAX DELINQUENCY CONFIGURATION

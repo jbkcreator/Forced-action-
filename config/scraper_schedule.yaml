@@ -1,0 +1,32 @@
+# Human-readable mirror of scripts/cron/crontab.txt.
+# DOCUMENTATION ONLY — crontab.txt remains authoritative.
+# If you edit a schedule, edit crontab.txt; update this file to match.
+
+quarterly:
+  master:
+    cron: "0 1 1 1,4,7,10 *"
+    description: "Master Parcel Data — 1st of Jan/Apr/Jul/Oct at 01:00 UTC"
+
+daily_weekdays:
+  violation:        { cron: "0 4 * * 1-5",   note: "Code violations" }
+  bankruptcy:       { cron: "15 4 * * 1-5",  note: "Bankruptcy filings" }
+  evictions:        { cron: "30 4 * * 1-5",  note: "Eviction filings (civil LT)" }
+  probate:          { cron: "45 4 * * 1-5",  note: "Probate filings" }
+  divorce:          { cron: "47 4 * * 1-5",  note: "Divorce/dissolution (civil DR)" }
+  liens:            { cron: "0 5 * * 1-5",   note: "Liens + deeds + judgments combined" }
+  permit:           { cron: "45 5,13,21 * * 1-5", note: "Permits — 3x/day" }
+  foreclosure:      { cron: "15 6 * * 1-5",  note: "Foreclosure auctions" }
+  roofing_permit:   { cron: "17 6 * * 1-5",  note: "Roofing permit classifier (SQL-only)" }
+  storm:            { cron: "19 6 * * 1-5",  note: "NWS storm alerts" }
+  flood:            { cron: "21 6 * * 1-5",  note: "FEMA/NFIP/NWS flood data" }
+  insurance:        { cron: "23 6,14,22 * * 1-5", note: "Insurance signals — 3x/day" }
+  fire:             { cron: "25 6 * * 1-5",  note: "HCSO fire calls" }
+  sunbiz:           { cron: "40 7 * * 1-5",  note: "FL Sunbiz LLC enrichment" }
+
+weekly:
+  dbpr_certified:   { cron: "0 2 * * 0",     note: "DBPR certified contractors — Sunday" }
+  dbpr_registered:  { cron: "15 2 * * 0",    note: "DBPR registered contractors — Sunday" }
+
+disabled:
+  tax_delinquent:
+    note: "Hillsborough tax collector portal blocks the scraper. Loaded via admin upload."
