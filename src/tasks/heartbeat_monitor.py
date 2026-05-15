@@ -78,6 +78,36 @@ HEARTBEAT_SLAS: Dict[str, int] = {
     "insurance_claims":  1800,
 }
 
+# Sources that are intentionally NOT scheduled on certain weekdays. Heartbeat
+# skips them on those days so a M-Sat scraper isn't reported as "stale" on a
+# Sunday morning by design. Python weekday(): Mon=0, Tue=1, ..., Sat=5, Sun=6.
+#
+# Everything except foreclosures runs M-Sat in cron, so Sunday (6) is their
+# off-day. foreclosures runs daily and has no entry here → checked every day.
+# Keep this in sync with scripts/cron/crontab.txt.
+SOURCE_OFF_DAYS: Dict[str, set] = {
+    "violations":       {6},
+    "permits":          {6},
+    "roofing_permits":  {6},
+    "probate":          {6},
+    "evictions":        {6},
+    "divorce_filings":  {6},
+    "bankruptcy":       {6},
+    "lien_ml":          {6},
+    "lien_tcl":         {6},
+    "lien_ccl":         {6},
+    "lien_hoa":         {6},
+    "lien_tl":          {6},
+    "judgments":        {6},
+    "sunbiz":           {6},
+    "storm_damage":     {6},
+    "fire_incidents":   {6},
+    "flood_damage":     {6},
+    "insurance_claims": {6},
+}
+
+_WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
 # Dedup: one alert per stale source per 24h.  At a 15-min tick cadence a broken
 # scraper would otherwise produce 96 emails per source per day.  With a 24h
 # cooldown ops sees exactly one alert when the incident starts and one daily
@@ -134,12 +164,24 @@ class Heartbeat:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_heartbeats(now: Optional[datetime] = None) -> list[Heartbeat]:
-    """Compute heartbeat status for every source in HEARTBEAT_SLAS."""
+    """Compute heartbeat status for every source in HEARTBEAT_SLAS.
+
+    Sources whose entry in SOURCE_OFF_DAYS includes today's weekday are skipped
+    entirely — they're not expected to have run, so a "stale" alert would be
+    a false positive.
+    """
     now = now or datetime.now(timezone.utc)
+    today_wd = now.weekday()
     out: list[Heartbeat] = []
 
     with get_db_context() as session:
         for source_type, sla_minutes in HEARTBEAT_SLAS.items():
+            if today_wd in SOURCE_OFF_DAYS.get(source_type, set()):
+                logger.info(
+                    "[Heartbeat] %s skipped — %s is an off-day for this source",
+                    source_type, _WEEKDAY_NAMES[today_wd],
+                )
+                continue
             last_success = (
                 session.query(func.max(ScraperRunStats.created_at))
                 .filter(
@@ -275,12 +317,16 @@ def run_once(dry_run: bool = False) -> list[Heartbeat]:
 
 def print_slas() -> None:
     print("\nHeartbeat SLA registry:\n")
-    print(f"  {'Source':<22} {'SLA (min)':>10}  {'SLA (h)':>10}")
-    print(f"  {'-'*22}  {'-'*10}  {'-'*10}")
+    print(f"  {'Source':<22} {'SLA (min)':>10}  {'SLA (h)':>10}  {'Off-days':<20}")
+    print(f"  {'-'*22}  {'-'*10}  {'-'*10}  {'-'*20}")
     for source, mins in HEARTBEAT_SLAS.items():
-        print(f"  {source:<22} {mins:>10}  {mins/60:>10.1f}")
+        off = SOURCE_OFF_DAYS.get(source, set())
+        off_label = ",".join(_WEEKDAY_NAMES[d] for d in sorted(off)) if off else "—"
+        print(f"  {source:<22} {mins:>10}  {mins/60:>10.1f}  {off_label:<20}")
     print(f"\nDedup cooldown: {DEDUP_COOLDOWN_HOURS}h per source "
           "(auto-cleared when source recovers).")
+    print("Sources are skipped on their off-days — no alerts fire for "
+          "intentionally-not-scheduled days.")
 
 
 def kill_source_for_demo(source_type: str) -> None:
