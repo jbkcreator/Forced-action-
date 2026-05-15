@@ -197,6 +197,42 @@ _PORTAL_KEY_MAP = {
 }
 
 
+TIER_DISPLAY = {
+    "starter": {
+        "label": "Starter — 1 ZIP",
+        "zip_limit": 1,
+        "features": [
+            "1 ZIP territory",
+            "Daily lead feed",
+            "CDS scoring",
+            "All event types",
+            "Rate locked forever",
+        ],
+    },
+    "pro": {
+        "label": "Pro — 3 ZIPs",
+        "zip_limit": 3,
+        "features": [
+            "3 ZIP territories",
+            "Priority lead delivery",
+            "Skip-traced phone numbers",
+            "All event types",
+            "Rate locked forever",
+        ],
+    },
+    "dominator": {
+        "label": "Dominator — 10 ZIPs",
+        "zip_limit": 10,
+        "features": [
+            "Unlimited ZIPs in county",
+            "First-access lead delivery",
+            "Skip-traced phone numbers",
+            "Dedicated account manager",
+            "Rate locked forever",
+        ],
+    },
+}
+
 def _build_county_config() -> dict:
     with open(_COUNTIES_JSON, "r", encoding="utf-8") as _f:
         _data = _json.load(_f)
