@@ -211,9 +211,17 @@ async def download_tax_delinquent_report(
     wait_after_download: int = 30,
     county_id: str = "hillsborough",
     headful: bool = False,
+    cf_bypass: Optional[bool] = None,
 ) -> bool:
     """
     RADAR PHASE: Download bulk tax delinquent report via browser-use agent.
+
+    When the source has ``cf_bypass_required=true`` in counties.json (or the
+    caller passes ``cf_bypass=True``), the Agent is launched against the
+    warmed Edge profile — Edge binary + persistent user_data_dir + no proxy
+    + no stealth init script — so the warmed cf_clearance + TLS fingerprint
+    stays intact. Same pattern the lien engine uses on the Pinellas clerk
+    portal.
     """
     from browser_use import Agent, Browser
     from src.utils.http_helpers import get_browser_use_proxy
@@ -228,26 +236,37 @@ async def download_tax_delinquent_report(
         tax_url = _county.get("urls", {}).get("tax") or ""
         source = {"url": tax_url, "signal_type": "tax_delinquency"}
 
+    # Resolve CF-bypass: explicit CLI flag overrides; otherwise honor the
+    # per-source flag set by an admin in counties.json.
+    cf_required = bool(source.get("cf_bypass_required")) if cf_bypass is None else cf_bypass
+    cf_profile: Optional[dict] = None
+    if cf_required:
+        from src.utils.cf_persistent_browser import (
+            resolve_cf_profile,
+            CFProfileNotWarmedError,
+        )
+        profile_name = source.get("cf_bypass_profile_name") or f"{county_id}_tax"
+        try:
+            cf_profile = resolve_cf_profile(profile_name)
+            logger.info(
+                "[RADAR] CF-bypass mode — Edge=%s profile=%s",
+                cf_profile["edge_path"], cf_profile["profile_dir"],
+            )
+        except CFProfileNotWarmedError as exc:
+            logger.error("[RADAR] CF-bypass requested but profile unusable: %s", exc)
+            return False
+
     task = build_agent_task(source, tax_year, account_status)
 
     logger.info("[RADAR] Launching browser-use agent — tax_year=%s county=%s", tax_year, county_id)
 
     llm = _make_llm()
-    proxy = get_browser_use_proxy()
-    logger.info("[RADAR] Proxy: %s", "Oxylabs enabled" if proxy else "NO PROXY — running direct")
 
-    browser = Browser(
+    browser_kwargs = dict(
         headless=not headful,
         disable_security=True,
-        proxy=proxy,
         downloads_path=str(REFERENCE_DATA_DIR),
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/136.0.0.0 Safari/537.36"
-        ),
         ignore_default_args=["--enable-automation"],
-        enable_default_extensions=True,
         minimum_wait_page_load_time=1.5,
         wait_between_actions=1.0,
         args=[
@@ -257,14 +276,43 @@ async def download_tax_delinquent_report(
         ],
     )
 
+    if cf_profile:
+        # Persistent Edge profile + no proxy + no stealth — anything else
+        # would perturb the fingerprint Cloudflare hashed when issuing
+        # cf_clearance.
+        browser_kwargs.update(
+            executable_path=cf_profile["edge_path"],
+            user_data_dir=cf_profile["profile_dir"],
+            proxy=None,
+            enable_default_extensions=False,
+        )
+    else:
+        proxy = get_browser_use_proxy()
+        logger.info("[RADAR] Proxy: %s", "Oxylabs enabled" if proxy else "NO PROXY — running direct")
+        browser_kwargs.update(
+            proxy=proxy,
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/136.0.0.0 Safari/537.36"
+            ),
+            enable_default_extensions=True,
+        )
+
+    browser = Browser(**browser_kwargs)
+
     await browser.start()
-    from playwright_stealth import Stealth
-    stealth = Stealth(
-        chrome_runtime=True, navigator_webdriver=True, navigator_plugins=True, webgl_vendor=True,
-        webgl_vendor_override="Google Inc. (Intel)",
-        webgl_renderer_override="ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)",
-    )
-    await browser._cdp_add_init_script(stealth.script_payload)
+    if not cf_profile:
+        # Stealth patches the navigator/WebGL signatures Cloudflare hashes
+        # when issuing cf_clearance — skip injection in CF mode to keep the
+        # warmed profile's fingerprint intact.
+        from playwright_stealth import Stealth
+        stealth = Stealth(
+            chrome_runtime=True, navigator_webdriver=True, navigator_plugins=True, webgl_vendor=True,
+            webgl_vendor_override="Google Inc. (Intel)",
+            webgl_renderer_override="ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        )
+        await browser._cdp_add_init_script(stealth.script_payload)
 
     agent = Agent(task=task, llm=llm, browser=browser, max_steps=80, use_judge=False)
 
@@ -491,6 +539,7 @@ async def run_radar_sniper_pipeline(
     county_id: str = "hillsborough",
     load_to_db: bool = False,
     headful: bool = False,
+    cf_bypass: Optional[bool] = None,
 ) -> bool:
     """Execute the full RADAR + SNIPER pipeline for tax delinquent lead generation."""
     try:
@@ -504,6 +553,7 @@ async def run_radar_sniper_pipeline(
                 account_status=account_status,
                 county_id=county_id,
                 headful=headful,
+                cf_bypass=cf_bypass,
             )
             if not success:
                 logger.error("[RADAR] Phase failed — aborting pipeline")
@@ -645,6 +695,11 @@ if __name__ == "__main__":
                         help="Load scraped records into database after pipeline completes")
     parser.add_argument("--headful", action="store_true",
                         help="Open a real browser window (useful for debugging)")
+    parser.add_argument("--cf-bypass", dest="cf_bypass", action="store_true", default=None,
+                        help="Force Cloudflare-bypass mode (Edge + warmed persistent profile, no proxy, no stealth). "
+                             "Otherwise auto-enabled when source has cf_bypass_required=true.")
+    parser.add_argument("--no-cf-bypass", dest="cf_bypass", action="store_false",
+                        help="Force-disable CF-bypass even if source has cf_bypass_required=true.")
     args = parser.parse_args()
 
     _t0 = time.monotonic()
@@ -657,6 +712,7 @@ if __name__ == "__main__":
                 account_status=args.status,
                 county_id=args.county_id,
                 headful=args.headful,
+                cf_bypass=args.cf_bypass,
             ))
         else:
             asyncio.run(run_radar_sniper_pipeline(
@@ -668,6 +724,7 @@ if __name__ == "__main__":
                 county_id=args.county_id,
                 headful=args.headful,
                 load_to_db=args.load_to_db,
+                cf_bypass=args.cf_bypass,
             ))
 
         logger.info("Tax Delinquent Engine completed successfully")
