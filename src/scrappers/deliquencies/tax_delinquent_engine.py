@@ -1,1014 +1,703 @@
 """
-Tax Delinquent Property Data Collection Pipeline (Hybrid RADAR & SNIPER)
-
-This module implements a two-phase approach for collecting tax delinquent property data:
+Tax Delinquent Property Data Collection Pipeline — county-agnostic, browser-use only.
 
 RADAR Phase:
-    - Downloads bulk tax delinquent reports from the county tax website
-    - Filters accounts by delinquency criteria (minimum years unpaid)
-    - Creates a target list of high-priority distressed properties
+    - Downloads bulk tax delinquent report from the county tax portal using browser-use.
+    - Filters accounts by delinquency criteria (minimum years unpaid).
+    - Creates a target list of high-priority distressed properties.
 
 SNIPER Phase:
-    - Enriches individual accounts with detailed scraped data
-    - Uses Firecrawl API for structured data extraction
-    - Extracts total amounts due, delinquency years, payment plan status
-    - Rate-limited to respect API quotas and site policies
+    - Enriches individual accounts with detailed data via Firecrawl API.
+    - Extracts total amounts due, delinquency years, payment plan status.
+    - Rate-limited to respect API quotas and site policies.
 
-The pipeline produces a final enriched dataset of distressed properties suitable
-for investment analysis and lead generation.
-
-Author: Distressed Property Intelligence Platform
+Usage:
+    python -m src.scrappers.deliquencies.tax_delinquent_engine --county-id hillsborough
+    python -m src.scrappers.deliquencies.tax_delinquent_engine --county-id hillsborough --mode download-only
+    python -m src.scrappers.deliquencies.tax_delinquent_engine --county-id hillsborough --skip-download --load-to-db
 """
 
 import asyncio
+import argparse
+import json
 import os
 import random
 import shutil
+import sys
 import time
 import traceback
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
-from browser_use import Agent, ChatAnthropic, Browser
 from firecrawl import FirecrawlApp
 
-from config.settings import settings
+project_root = Path(__file__).parent.parent.parent.parent
+sys.path.insert(0, str(project_root))
+
 from config.constants import (
-	DEFAULT_TAX_YEAR,
-	DEFAULT_ACCOUNT_STATUS,
-	MIN_YEARS_DELINQUENT,
-	RAW_TAX_DELINQUENCIES_DIR,
-	PROCESSED_DATA_DIR,
-	REFERENCE_DATA_DIR,
-	DOWNLOAD_FILE_PATTERNS,
-	PARCEL_LOOKUP_URL,
-	REQUEST_DELAY_RANGE,
-	TEMP_DOWNLOADS_DIR,
-	BROWSER_DOWNLOAD_TEMP_PATTERN,
+    DEFAULT_TAX_YEAR,
+    DEFAULT_ACCOUNT_STATUS,
+    MIN_YEARS_DELINQUENT,
+    RAW_TAX_DELINQUENCIES_DIR,
+    PROCESSED_DATA_DIR,
+    REFERENCE_DATA_DIR,
+    DOWNLOAD_FILE_PATTERNS,
+    PARCEL_LOOKUP_URL,
+    REQUEST_DELAY_RANGE,
+    TEMP_DOWNLOADS_DIR,
+    BROWSER_DOWNLOAD_TEMP_PATTERN,
+    BROWSER_MODEL,
+    BROWSER_TEMPERATURE,
 )
 from src.utils.county_config import get_county as _get_county
 from src.core.database import get_db_context
 from src.core.models import TaxDelinquency, Property
 from src.utils.logger import setup_logging, get_logger
 from src.utils.prompt_loader import get_prompt, get_config
-from src.utils.csv_deduplicator import deduplicate_csv, get_unique_keys_for_type
 
-# Initialize logging
 setup_logging()
 logger = get_logger(__name__)
 
-# Model + agent configuration
-llm = ChatAnthropic(
-	model="claude-sonnet-4-5-20250929",
-	timeout=150,
-	api_key=settings.anthropic_api_key.get_secret_value(),
-	temperature=0,
-)
-
-# Ensure directories exist
 RAW_TAX_DELINQUENCIES_DIR.mkdir(parents=True, exist_ok=True)
 PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _locate_download(start_time: float) -> Optional[Path]:
-	"""
-	Search for recently downloaded tax delinquency files.
-	
-	This function searches both the configured download directory and browser-use
-	temporary directories for files matching download patterns that were created
-	after the specified timestamp.
-	
-	Args:
-		start_time: Unix timestamp representing when the download started
-		
-	Returns:
-		Optional[Path]: Path to the most recently modified downloaded file, or None if not found
-		
-	Note:
-		Searches for files matching patterns: *.csv, *.xls, *.xlsx
-	"""
-	
-	def recent_candidates(folder: Path):
-		"""Find files in folder that match download patterns and were created after start_time."""
-		paths = []
-		if not folder.exists():
-			return paths
-		for pattern in DOWNLOAD_FILE_PATTERNS:
-			for candidate in folder.glob(pattern):
-				try:
-					if candidate.stat().st_mtime >= start_time:
-						paths.append(candidate)
-				except FileNotFoundError:
-					logger.debug(f"File disappeared during check: {candidate}")
-					continue
-		return paths
-	
-	candidates = recent_candidates(REFERENCE_DATA_DIR)
-	logger.debug(f"Found {len(candidates)} candidate files in {REFERENCE_DATA_DIR}")
-	
-	temp_base = TEMP_DOWNLOADS_DIR
-	if temp_base.exists():
-		for download_dir in temp_base.glob(BROWSER_DOWNLOAD_TEMP_PATTERN):
-			temp_candidates = recent_candidates(download_dir)
-			candidates.extend(temp_candidates)
-			logger.debug(f"Found {len(temp_candidates)} candidate files in {download_dir}")
-	
-	if not candidates:
-		searched = [str(REFERENCE_DATA_DIR)]
-		if TEMP_DOWNLOADS_DIR.exists():
-			searched += [str(d) for d in TEMP_DOWNLOADS_DIR.glob(BROWSER_DOWNLOAD_TEMP_PATTERN)]
-		logger.warning(
-			"[RADAR] Download not found. start_time=%.1fs ago. Searched %d location(s): %s",
-			time.time() - start_time,
-			len(searched),
-			searched,
-		)
-		return None
-	
-	# Return the most recently modified file
-	most_recent = max(candidates, key=lambda path: path.stat().st_mtime)
-	logger.debug(f"Selected most recent file: {most_recent}")
-	return most_recent
+# ---------------------------------------------------------------------------
+# LLM helpers
+# ---------------------------------------------------------------------------
+
+def _make_llm():
+    from browser_use import ChatAnthropic
+    from config.settings import get_settings
+    settings = get_settings()
+    return ChatAnthropic(
+        model=BROWSER_MODEL,
+        timeout=180,
+        api_key=settings.anthropic_api_key.get_secret_value(),
+        temperature=BROWSER_TEMPERATURE,
+    )
 
 
-def _get_existing_tax_records(tax_year: int) -> set:
-	"""
-	Query database for existing tax delinquency account numbers for given year.
-	
-	Args:
-		tax_year: Tax year to check
-		
-	Returns:
-		set: Set of existing account numbers (with 'A' prefix) for O(1) lookup
-	"""
-	logger.info(f"Querying database for existing tax records (year {tax_year})...")
-	
-	try:
-		with get_db_context() as session:
-			# Join TaxDelinquency → Property to recover parcel_ids, then reconstruct
-			# account numbers (parcel_id with 'A' prefix) for O(1) dedup lookup.
-			# TaxDelinquency has no account_number column — the unique constraint is
-			# (property_id, tax_year); parcel_id lives on the Property row.
-			results = (
-				session.query(Property.parcel_id)
-				.join(TaxDelinquency, TaxDelinquency.property_id == Property.id)
-				.filter(TaxDelinquency.tax_year == tax_year)
-				.distinct()
-				.all()
-			)
-			existing = {'A' + row[0] for row in results if row[0]}
-			logger.info(f"Found {len(existing):,} existing tax records in database for {tax_year}")
-			return existing
-			
-	except Exception as e:
-		logger.error(f"Failed to query existing tax records: {e}")
-		logger.debug(traceback.format_exc())
-		return set()
+def build_agent_task(source: dict, tax_year: int, account_status: str) -> str:
+    """
+    Generate a browser-use agent task from county source metadata.
+    When the source has a configured URL/nav_hint, uses LLM with source metadata.
+    Falls back to YAML prompt (Hillsborough legacy) only when no source URL is set,
+    then falls back to template if both fail.
+    """
+    import anthropic
+    from config.settings import get_settings
+
+    portal_url = source.get("url", "")
+    description = source.get("description", "")
+    nav_hint = source.get("navigation_hint", "") or ""
+
+    # YAML prompt is Hillsborough-specific — skip it when source has a configured URL
+    if not portal_url:
+        try:
+            task = get_prompt(
+                "tax_delinquent_prompts.yaml",
+                "tax_delinquent_download.task_template",
+                account_status=account_status,
+                tax_year=tax_year,
+            )
+            if task:
+                logger.info("[LLM] Loaded agent task from YAML prompt")
+                return task
+        except Exception:
+            pass
+
+    meta = {
+        "portal_url": portal_url,
+        "tax_year": tax_year,
+        "account_status": account_status,
+        "description": description,
+        "navigation_hint": nav_hint,
+    }
+
+    system_prompt = (
+        "You generate browser-automation task instructions for a browser-use Agent. "
+        "The agent controls a Chromium browser and must trigger a file download (CSV). "
+        "Write concise, numbered steps in plain English. "
+        "Do NOT add any explanation outside the task text."
+    )
+
+    user_prompt = f"""Generate a browser-use agent task to download a bulk tax delinquent report from a county tax portal.
+
+Source metadata:
+{json.dumps(meta, indent=2)}
+
+Requirements:
+- Keep the task under 350 words.
+"""
+
+    try:
+        settings = get_settings()
+        client = anthropic.Anthropic(
+            api_key=settings.anthropic_api_key.get_secret_value()
+        )
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=512,
+            temperature=0,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        task = response.content[0].text.strip()
+        logger.info("[LLM] Generated agent task:\n%s", task)
+        return task
+    except Exception as e:
+        logger.warning("[LLM] Task generation failed (%s) — using template fallback", e)
+        return _template_task(source, tax_year, account_status)
 
 
-async def _playwright_download_tax_delinquent(
-	tax_year: int = DEFAULT_TAX_YEAR,
-	county_id: str = "hillsborough",
-) -> bool:
-	"""
-	Primary Playwright scraper for tax delinquent bulk report download.
-	Deterministic, no AI credits consumed.
-
-	Flow:
-		1. Navigate to the county tax reports portal
-		2. Search for "Public - Delinquent Report" in the shared-report filter
-		3. Select the matching report from the dropdown
-		4. Enter the current tax year
-		5. Click Search and wait for results
-		6. Click the CSV download button
-	"""
-	from playwright.async_api import async_playwright
-	from playwright_stealth import Stealth
-
-	_county = _get_county(county_id)
-	TAX_REPORT_URL = _county["portals"]["tax_report_url"]
-	_file_prefix = _county["file_prefix"]
-	REFERENCE_DATA_DIR.mkdir(parents=True, exist_ok=True)
-	dest_path = REFERENCE_DATA_DIR / f"{_file_prefix}_tax_delinquent_{tax_year}.csv"
-
-	logger.info(f"[Playwright][RADAR] Downloading tax delinquent report for {tax_year}")
-
-	async with async_playwright() as pw:
-		from src.utils.http_helpers import get_playwright_proxy
-		proxy = get_playwright_proxy()
-		logger.info("[Playwright][RADAR] Proxy: %s", "Oxylabs enabled" if proxy else "NO PROXY — running direct")
-		browser = await pw.chromium.launch(
-			headless=True,
-			proxy=proxy,
-			args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
-		)
-		context = await browser.new_context(
-			accept_downloads=True,
-			user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-			viewport={"width": 1920, "height": 1080},
-			extra_http_headers={
-				"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-				"Accept-Language": "en-US,en;q=0.9",
-				"Accept-Encoding": "gzip, deflate, br",
-				"sec-ch-ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-				"sec-ch-ua-mobile": "?0",
-				"sec-ch-ua-platform": '"Windows"',
-				"Upgrade-Insecure-Requests": "1",
-			},
-		)
-		page = await context.new_page()
-		await Stealth().apply_stealth_async(page)
-		try:
-			# 1. Navigate and wait for SPA to fully render
-			await page.goto(TAX_REPORT_URL, wait_until="domcontentloaded", timeout=120_000)
-			await page.wait_for_selector('#selected-report-filter', state='attached', timeout=90_000)
-			logger.info("[Playwright][RADAR] Page loaded, SPA ready")
-
-			# 2. Select report via JS — set hidden #selected_report value (id=2470) and
-			#    update the visible text input, then fire the onchange to load filter fields.
-			#    This bypasses the flaky mousedown/blur race on the dropdown.
-			await page.evaluate("""() => {
-				const hidden = document.getElementById('selected_report');
-				const filter = document.getElementById('selected-report-filter');
-				if (!hidden || !filter) throw new Error('Report selector elements not found');
-				hidden.value = '2470';
-				filter.value = 'Public - Delinquent Report';
-				hidden.dispatchEvent(new Event('change', {bubbles: true}));
-			}""")
-			logger.info("[Playwright][RADAR] Set report to 'Public - Delinquent Report' (id=2470)")
-
-			# 3. Wait for filter fields to render after report selection
-			await page.wait_for_selector('#tax_year', state='attached', timeout=20_000)
-			await page.wait_for_timeout(1_000)
-
-			# 4. Fill tax year
-			await page.evaluate(f"""() => {{
-				const el = document.getElementById('tax_year');
-				if (el) {{ el.value = '{tax_year}'; el.dispatchEvent(new Event('change', {{bubbles: true}})); }}
-			}}""")
-			logger.info(f"[Playwright][RADAR] Set tax year: {tax_year}")
-
-			# 5. Set Account Status if the filter exists
-			await page.evaluate("""() => {
-				const el = document.getElementById('account_status') || document.querySelector('select[name="account_status"]');
-				if (el) {
-					el.value = 'Unpaid';
-					el.dispatchEvent(new Event('change', {bubbles: true}));
-				}
-			}""")
-
-			await page.wait_for_timeout(500)
-
-			# 6. Run search via the page's own view_report() function
-			await page.evaluate("view_report()")
-			logger.info("[Playwright][RADAR] Search submitted via view_report(), waiting for results...")
-
-			# 7. Wait for results table to appear (SPA populates a tbody with data rows)
-			await page.wait_for_selector(
-				'table tbody tr td, #report-results tr td',
-				state='attached',
-				timeout=90_000,
-			)
-			logger.info("[Playwright][RADAR] Results loaded")
-
-			# 8. Click CSV download button and capture file
-			async with page.expect_download(timeout=120_000) as dl_info:
-				await page.evaluate('download_options("csv")')
-			download = await dl_info.value
-
-			if dest_path.exists():
-				dest_path.unlink()
-			await download.save_as(str(dest_path))
-
-			size_mb = dest_path.stat().st_size / (1024 ** 2)
-			logger.info(f"[Playwright][RADAR] Saved {dest_path.name} ({size_mb:.1f} MB)")
-			return True
-
-		except Exception as e:
-			logger.warning(f"[Playwright][RADAR] Playwright download failed: {e}")
-			raise
-		finally:
-			await context.close()
-			await browser.close()
+def _template_task(source: dict, tax_year: int, account_status: str) -> str:
+    """Template fallback when LLM and YAML are unavailable."""
+    portal_url = source.get("url", "")
+    nav_hint = source.get("navigation_hint", "") or ""
+    return (
+        f"Go to {portal_url}.\n"
+        "Wait 5 seconds for the page to load.\n"
+        f"{nav_hint}\n"
+        'Find the "Public - Delinquent Report" or similar delinquent report option and select it.\n'
+        f"Set the tax year to {tax_year}.\n"
+        f'Set the account status filter to "{account_status}" or "Unpaid".\n'
+        "Submit the search and wait for results.\n"
+        "Click the CSV download button.\n"
+        "Wait 30 seconds for the download to complete.\n"
+        "Do not navigate away."
+    )
 
 
-async def _ai_download_tax_delinquent(
-	tax_year: int = DEFAULT_TAX_YEAR,
-	account_status: str = DEFAULT_ACCOUNT_STATUS,
-	wait_after_download: int = 30,
-	county_id: str = "hillsborough",
-) -> bool:
-	"""
-	AI browser-use fallback for tax delinquent report download.
-	"""
-	try:
-		REFERENCE_DATA_DIR.mkdir(parents=True, exist_ok=True)
+# ---------------------------------------------------------------------------
+# RADAR: Download bulk tax delinquent report
+# ---------------------------------------------------------------------------
 
-		_file_prefix = _get_county(county_id)["file_prefix"]
-		save_dir = os.path.abspath(str(REFERENCE_DATA_DIR))
-		dest_stub = f"{_file_prefix}_tax_delinquent_{tax_year}"
-		start_time = time.time()
+def _locate_download(start_time: float, download_dir: Optional[Path] = None) -> Optional[Path]:
+    """Search for recently downloaded tax delinquency files."""
+    def recent_candidates(folder: Path):
+        paths = []
+        if not folder.exists():
+            return paths
+        for pattern in DOWNLOAD_FILE_PATTERNS:
+            for candidate in folder.glob(pattern):
+                try:
+                    if candidate.stat().st_mtime >= start_time:
+                        paths.append(candidate)
+                except FileNotFoundError:
+                    continue
+        return paths
 
-		try:
-			task = get_prompt(
-				"tax_delinquent_prompts.yaml",
-				"tax_delinquent_download.task_template",
-				account_status=account_status,
-				tax_year=tax_year
-			)
-		except Exception as e:
-			logger.error(f"[AI][RADAR] Failed to load prompt from YAML: {e}")
-			raise
+    candidates = recent_candidates(REFERENCE_DATA_DIR)
+    if download_dir:
+        candidates.extend(recent_candidates(download_dir))
 
-		logger.warning("[AI][RADAR] Launching browser agent — tax_year=%s status=%s (may take 10-30 min)", tax_year, account_status)
+    temp_base = TEMP_DOWNLOADS_DIR
+    if temp_base.exists():
+        for dl_dir in temp_base.glob(BROWSER_DOWNLOAD_TEMP_PATTERN):
+            candidates.extend(recent_candidates(dl_dir))
 
-		from src.utils.http_helpers import get_browser_use_proxy
-		proxy = get_browser_use_proxy()
-		logger.warning("[AI][RADAR] Proxy: %s", "Oxylabs enabled" if proxy else "NO PROXY — running direct")
-		browser = Browser(
-			headless=True,
-			disable_security=True,
-			proxy=proxy,
-			user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-			args=[
-				'--no-sandbox',
-				'--disable-setuid-sandbox',
-				'--disable-dev-shm-usage',
-				'--disable-gpu',
-				'--no-first-run',
-				'--disable-blink-features=AutomationControlled',
-				'--window-size=1920,1080',
-			]
-		)
+    if not candidates:
+        logger.warning("[RADAR] No downloaded file found. start_time=%.1fs ago", time.time() - start_time)
+        return None
 
-		agent = Agent(task=task, llm=llm, browser=browser)
-
-		try:
-			history = await agent.run()
-			if not history.is_done():
-				logger.warning("[AI][RADAR] Agent could not finish within step limit")
-				return False
-			logger.warning("[AI][RADAR] Agent completed. Waiting %ds for download to finalize...", wait_after_download)
-			await asyncio.sleep(wait_after_download)
-		except Exception as e:
-			logger.error(f"[AI][RADAR] Browser agent execution failed: {e}")
-			logger.debug(traceback.format_exc())
-			return False
-
-		downloaded_file = _locate_download(start_time)
-		if not downloaded_file or not downloaded_file.exists():
-			logger.error("[AI][RADAR] Could not detect the downloaded report")
-			return False
-
-		final_ext = downloaded_file.suffix.lower() or ".csv"
-		# Save to REFERENCE_DATA_DIR so run_radar_sniper_pipeline can find it
-		REFERENCE_DATA_DIR.mkdir(parents=True, exist_ok=True)
-		dest_file = REFERENCE_DATA_DIR / f"{dest_stub}{final_ext}"
-		if dest_file.exists():
-			dest_file.unlink()
-
-		logger.info(f"[AI][RADAR] Moving {downloaded_file} → {dest_file}")
-		shutil.move(str(downloaded_file), str(dest_file))
-
-		file_size_mb = dest_file.stat().st_size / (1024 ** 2)
-		logger.info(f"[AI][RADAR] Report saved to {dest_file} ({file_size_mb:.1f} MB)")
-
-		# Validate file is a real CSV, not an HTML error page or empty file
-		if dest_file.stat().st_size < 1024:
-			logger.error(f"[AI][RADAR] Downloaded file is too small ({dest_file.stat().st_size} bytes) — likely empty or an error page")
-			dest_file.unlink(missing_ok=True)
-			return False
-		with open(dest_file, 'r', errors='replace') as _f:
-			_head = _f.read(512)
-		if '<!DOCTYPE' in _head or '<html' in _head.lower():
-			logger.error(f"[AI][RADAR] Downloaded file is an HTML error page — session may have expired")
-			dest_file.unlink(missing_ok=True)
-			return False
-
-
-		temp_dir = downloaded_file.parent
-		if temp_dir.exists() and temp_dir.name.startswith("browser-use-downloads-"):
-			try:
-				shutil.rmtree(temp_dir)
-			except Exception as exc:
-				logger.warning(f"[AI][RADAR] Could not clean temp dir {temp_dir}: {exc}")
-
-		return True
-
-	except Exception as e:
-		logger.error(f"[AI][RADAR] Error during download: {e}")
-		logger.debug(traceback.format_exc())
-		return False
+    return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
 async def download_tax_delinquent_report(
-	tax_year: int = DEFAULT_TAX_YEAR,
-	account_status: str = DEFAULT_ACCOUNT_STATUS,
-	wait_after_download: int = 30,
-	scraper: str = "auto",
-	county_id: str = "hillsborough",
+    tax_year: int = DEFAULT_TAX_YEAR,
+    account_status: str = DEFAULT_ACCOUNT_STATUS,
+    wait_after_download: int = 30,
+    county_id: str = "hillsborough",
+    headful: bool = False,
 ) -> bool:
-	"""
-	RADAR PHASE: Download bulk tax delinquent report.
+    """
+    RADAR PHASE: Download bulk tax delinquent report via browser-use agent.
+    """
+    from browser_use import Agent, Browser
+    from src.utils.http_helpers import get_browser_use_proxy
 
-	Tries Playwright first (deterministic, no AI credits). Falls back to the
-	browser-use AI agent if Playwright fails.
+    _county = _get_county(county_id)
+    _file_prefix = _county["file_prefix"]
+    REFERENCE_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    dest_path = REFERENCE_DATA_DIR / f"{_file_prefix}_tax_delinquent_{tax_year}.csv"
 
-	Args:
-		tax_year: Tax year to query (default: 2026)
-		account_status: Account status filter (default: "Unpaid")
-		wait_after_download: Seconds to wait after AI agent finishes (AI path only)
+    source = _county.get("sources", {}).get("tax_delinquency")
+    if source is None:
+        tax_url = _county.get("urls", {}).get("tax") or ""
+        source = {"url": tax_url, "signal_type": "tax_delinquency"}
 
-	Returns:
-		bool: True if download succeeded, False otherwise
-	"""
-	# ── Playwright (primary, with retries) ────────────────────────────────────
-	if scraper in ("auto", "playwright"):
-		logger.info("[RADAR] Attempting Playwright download (primary)...")
-		MAX_PLAYWRIGHT_RETRIES = 5
-		playwright_error = None
-		for attempt in range(1, MAX_PLAYWRIGHT_RETRIES + 1):
-			try:
-				success = await _playwright_download_tax_delinquent(tax_year=tax_year, county_id=county_id)
-				if success:
-					logger.info("[RADAR] Playwright download succeeded")
-					return True
-				playwright_error = RuntimeError("Playwright returned False unexpectedly")
-			except Exception as e:
-				playwright_error = e
-				if attempt < MAX_PLAYWRIGHT_RETRIES:
-					logger.warning(f"[RADAR] Playwright attempt {attempt}/{MAX_PLAYWRIGHT_RETRIES} failed: {e} — retrying in 5s...")
-					await asyncio.sleep(5)
-					continue
-				logger.warning(f"[RADAR] All {MAX_PLAYWRIGHT_RETRIES} Playwright retries failed")
-				break
-		if scraper == "playwright":
-			return False
+    task = build_agent_task(source, tax_year, account_status)
 
-	logger.info("[RADAR] Running browser-use AI downloader...")
+    logger.info("[RADAR] Launching browser-use agent — tax_year=%s county=%s", tax_year, county_id)
 
-	# ── AI (direct or fallback) ────────────────────────────────────────────────
-	return await _ai_download_tax_delinquent(
-		tax_year=tax_year,
-		account_status=account_status,
-		wait_after_download=wait_after_download,
-		county_id=county_id,
-	)
+    llm = _make_llm()
+    proxy = get_browser_use_proxy()
+    logger.info("[RADAR] Proxy: %s", "Oxylabs enabled" if proxy else "NO PROXY — running direct")
+
+    browser = Browser(
+        headless=not headful,
+        disable_security=True,
+        proxy=proxy,
+        downloads_path=str(REFERENCE_DATA_DIR),
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/136.0.0.0 Safari/537.36"
+        ),
+        ignore_default_args=["--enable-automation"],
+        enable_default_extensions=True,
+        minimum_wait_page_load_time=1.5,
+        wait_between_actions=1.0,
+        args=[
+            '--no-sandbox',
+            '--disable-blink-features=AutomationControlled',
+            '--window-size=1920,1080',
+        ],
+    )
+
+    await browser.start()
+    from playwright_stealth import Stealth
+    stealth = Stealth(
+        chrome_runtime=True, navigator_webdriver=True, navigator_plugins=True, webgl_vendor=True,
+        webgl_vendor_override="Google Inc. (Intel)",
+        webgl_renderer_override="ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+    )
+    await browser._cdp_add_init_script(stealth.script_payload)
+
+    agent = Agent(task=task, llm=llm, browser=browser, max_steps=80, use_judge=False)
+
+    start_time = time.time()
+    try:
+        history = await agent.run()
+        if not history.is_done():
+            logger.warning("[RADAR] Agent did not complete within step budget")
+    except Exception as e:
+        logger.error("[RADAR] Browser agent execution failed: %s", e)
+        logger.debug(traceback.format_exc())
+        return False
+
+    logger.info("[RADAR] Agent completed. Waiting %ds for download to finalize...", wait_after_download)
+    await asyncio.sleep(wait_after_download)
+
+    downloaded_file = _locate_download(start_time)
+    if not downloaded_file or not downloaded_file.exists():
+        logger.error("[RADAR] Could not detect the downloaded report")
+        return False
+
+    final_ext = downloaded_file.suffix.lower() or ".csv"
+    dest_file = REFERENCE_DATA_DIR / f"{_file_prefix}_tax_delinquent_{tax_year}{final_ext}"
+    if dest_file.exists():
+        dest_file.unlink()
+
+    logger.info("[RADAR] Moving %s → %s", downloaded_file, dest_file)
+    shutil.move(str(downloaded_file), str(dest_file))
+
+    # Validate file — must not be empty or an HTML error page
+    file_size = dest_file.stat().st_size
+    if file_size < 1024:
+        logger.error("[RADAR] Downloaded file too small (%d bytes) — likely empty or error page", file_size)
+        dest_file.unlink(missing_ok=True)
+        return False
+    with open(dest_file, "r", errors="replace") as _f:
+        _head = _f.read(512)
+    if "<!DOCTYPE" in _head or "<html" in _head.lower():
+        logger.error("[RADAR] Downloaded file is an HTML error page — session may have expired")
+        dest_file.unlink(missing_ok=True)
+        return False
+
+    size_mb = file_size / (1024 ** 2)
+    logger.info("[RADAR] Report saved: %s (%.1f MB)", dest_file, size_mb)
+
+    # Clean up temp dir
+    temp_dir = downloaded_file.parent
+    if temp_dir.exists() and temp_dir.name.startswith("browser-use-downloads-"):
+        try:
+            shutil.rmtree(temp_dir)
+        except Exception as exc:
+            logger.warning("[RADAR] Could not clean temp dir %s: %s", temp_dir, exc)
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Support: DB dedup + distress filter
+# ---------------------------------------------------------------------------
+
+def _get_existing_tax_records(tax_year: int, county_id: str = "hillsborough") -> set:
+    """Query DB for existing tax delinquency account numbers for the given year + county."""
+    logger.info("[Dedup] Querying DB for existing tax records (year %s, county=%s)...", tax_year, county_id)
+    try:
+        with get_db_context() as session:
+            results = (
+                session.query(Property.parcel_id)
+                .join(TaxDelinquency, TaxDelinquency.property_id == Property.id)
+                .filter(TaxDelinquency.tax_year == tax_year)
+                .filter(Property.county_id == county_id)
+                .distinct()
+                .all()
+            )
+            existing = {"A" + row[0] for row in results if row[0]}
+            logger.info("[Dedup] Found %d existing records for %s / %s", len(existing), tax_year, county_id)
+            return existing
+    except Exception as e:
+        logger.error("[Dedup] Failed to query existing records: %s", e)
+        return set()
 
 
 def _filter_distressed_accounts(df: pd.DataFrame, min_years: int = MIN_YEARS_DELINQUENT) -> pd.DataFrame:
-	"""
-	Filter accounts based on minimum years of delinquency.
-	
-	This function attempts to identify and filter tax accounts with a specified
-	minimum number of years of delinquency. It searches for common column names
-	that indicate years delinquent.
-	
-	Args:
-		df: DataFrame containing tax delinquent account records
-		min_years: Minimum number of delinquent years required (default: 2)
-		
-	Returns:
-		pd.DataFrame: Filtered DataFrame containing only accounts meeting the criteria
-		
-	Note:
-		If the years delinquent column cannot be found, returns the full DataFrame
-		with a warning logged.
-	"""
-	
-	logger.debug(f"Available columns (first 10): {list(df.columns)[:10]}")
-	
-	# Try to identify the years delinquent column (common names)
-	years_col = None
-	possible_cols = ["Years Delinquent", "years_delinquent", "Delinquent Years", "Years", "YRS", "Yrs Delinq"]
-	for col_name in possible_cols:
-		if col_name in df.columns:
-			years_col = col_name
-			logger.info(f"Found years column: '{years_col}'")
-			break
-	
-	if years_col:
-		try:
-			df_filtered = df[pd.to_numeric(df[years_col], errors="coerce") >= min_years].copy()
-			logger.info(f"Filtered {len(df_filtered)} accounts with {min_years}+ years delinquent (from {len(df)} total)")
-		except Exception as e:
-			logger.error(f"Error filtering by years delinquent: {e}")
-			df_filtered = df.copy()
-	else:
-		logger.warning(f"Could not find 'Years Delinquent' column in: {list(df.columns)}")
-		logger.warning(f"Processing all {len(df)} accounts without years filter")
-		df_filtered = df.copy()
-	
-	return df_filtered
+    """Filter accounts to those with at least `min_years` of delinquency."""
+    years_col = None
+    for col_name in ("Years Delinquent", "years_delinquent", "Delinquent Years", "Years", "YRS", "Yrs Delinq"):
+        if col_name in df.columns:
+            years_col = col_name
+            break
+
+    if years_col:
+        try:
+            df_filtered = df[pd.to_numeric(df[years_col], errors="coerce") >= min_years].copy()
+            logger.info("[Filter] %d/%d accounts have %d+ years delinquent", len(df_filtered), len(df), min_years)
+            return df_filtered
+        except Exception as e:
+            logger.error("[Filter] Error filtering by years delinquent: %s", e)
+
+    logger.warning("[Filter] 'Years Delinquent' column not found — processing all %d accounts", len(df))
+    return df.copy()
 
 
-async def _scrape_parcel_with_firecrawl(firecrawl_client: FirecrawlApp, account_number: str, parcel_lookup_url: str = PARCEL_LOOKUP_URL) -> dict:
-	"""
-	SNIPER PHASE: Extract structured tax delinquent data using Firecrawl API.
-	
-	This function uses Firecrawl's extract feature to retrieve structured data
-	from individual parcel pages. It loads the extraction schema and prompt from
-	YAML configuration for maintainability.
-	
-	Args:
-		firecrawl_client: Initialized Firecrawl API client
-		account_number: Tax account number to scrape
-		
-	Returns:
-		dict: Extracted data containing:
-			- account_number: Original account number
-			- total_amount_due: Total tax amount due (string)
-			- years_delinquent: Count of delinquent years (int)
-			- payment_plan_status: Payment plan status (default: "No Plan")
-			- custom_flags: List of custom flags (default: [])
-			
-	Note:
-		Returns default values if extraction fails. All errors are logged but
-		don't raise exceptions to allow batch processing to continue.
-	"""
+# ---------------------------------------------------------------------------
+# SNIPER: Firecrawl enrichment
+# ---------------------------------------------------------------------------
 
-	url = f"{parcel_lookup_url}/{account_number}"
-	result = {
-		"account_number": account_number,
-		"total_amount_due": None,
-		"years_delinquent": 0,
-		"payment_plan_status": "No Plan",
-		"custom_flags": [],
-	}
+async def _scrape_parcel_with_firecrawl(
+    firecrawl_client: FirecrawlApp,
+    account_number: str,
+    parcel_lookup_url: str = PARCEL_LOOKUP_URL,
+) -> dict:
+    """SNIPER PHASE: Extract structured tax data for one account via Firecrawl."""
+    url = f"{parcel_lookup_url}/{account_number}"
+    result = {
+        "account_number": account_number,
+        "total_amount_due": None,
+        "years_delinquent": 0,
+        "payment_plan_status": "No Plan",
+        "custom_flags": [],
+    }
 
-	try:
-		logger.info(f"[SNIPER] Extracting data for {account_number} with Firecrawl")
-		
-		# Load extraction schema and prompt from YAML
-		extract_schema = get_config("tax_delinquent_prompts", "parcel_extraction", "schema")
-		prompt_template = get_config("tax_delinquent_prompts", "parcel_extraction", "prompt_template")
-		
-		if not extract_schema:
-			logger.error("[SNIPER] Missing Firecrawl extraction schema in tax_delinquent_prompts.yaml")
-			return result
-		
-		prompt = prompt_template.format(account_number=account_number) if prompt_template else ""
-		
-		# Use Firecrawl's extract feature
-		extract_result = firecrawl_client.extract(
-			urls=[url],
-			schema=extract_schema,
-			prompt=prompt
-		)
-		
-		logger.debug(f"[SNIPER] Extract result type: {type(extract_result)}")
-		logger.debug(f"[SNIPER] Extract result data type: {type(extract_result.data) if extract_result and hasattr(extract_result, 'data') else 'N/A'}")
-		
-		if extract_result and hasattr(extract_result, 'data') and extract_result.data:
-			data = extract_result.data
-			
-			# Handle if data is a list or dict
-			if isinstance(data, list) and len(data) > 0:
-				data = data[0]
-			
-			# Access extracted fields
-			total_amount = data.get("total_amount_due") if isinstance(data, dict) else getattr(data, "total_amount_due", None)
-			years_delinq = data.get("years_delinquent") if isinstance(data, dict) else getattr(data, "years_delinquent", None)
-			
-			if total_amount:
-				result["total_amount_due"] = str(total_amount).replace("$", "").replace(",", "").strip()
-				logger.info(f"[SNIPER] Extracted amount: ${result['total_amount_due']}")
-			else:
-				logger.warning(f"[SNIPER] Could not extract amount for {account_number}")
-			
-			if years_delinq is not None:
-				result["years_delinquent"] = int(years_delinq)
-				logger.info(f"[SNIPER] Extracted years delinquent: {result['years_delinquent']}")
-			else:
-				logger.warning(f"[SNIPER] Could not extract years for {account_number}")
-		else:
-			logger.warning(f"[SNIPER] No data returned from Firecrawl for {account_number}")
+    try:
+        logger.info("[SNIPER] Extracting %s", account_number)
+        extract_schema = get_config("tax_delinquent_prompts", "parcel_extraction", "schema")
+        prompt_template = get_config("tax_delinquent_prompts", "parcel_extraction", "prompt_template")
 
-	except Exception as exc:
-		logger.error(f"[SNIPER] Failed to extract {account_number}: {exc}")
-		logger.debug(traceback.format_exc())
+        if not extract_schema:
+            logger.error("[SNIPER] Missing Firecrawl extraction schema in tax_delinquent_prompts.yaml")
+            return result
 
-	return result
+        prompt = prompt_template.format(account_number=account_number) if prompt_template else ""
+        extract_result = firecrawl_client.extract(urls=[url], schema=extract_schema, prompt=prompt)
+
+        if extract_result and hasattr(extract_result, "data") and extract_result.data:
+            data = extract_result.data
+            if isinstance(data, list) and data:
+                data = data[0]
+
+            total_amount = data.get("total_amount_due") if isinstance(data, dict) else getattr(data, "total_amount_due", None)
+            years_delinq = data.get("years_delinquent") if isinstance(data, dict) else getattr(data, "years_delinquent", None)
+
+            if total_amount:
+                result["total_amount_due"] = str(total_amount).replace("$", "").replace(",", "").strip()
+            if years_delinq is not None:
+                result["years_delinquent"] = int(years_delinq)
+        else:
+            logger.warning("[SNIPER] No data returned for %s", account_number)
+
+    except Exception as exc:
+        logger.error("[SNIPER] Failed to extract %s: %s", account_number, exc)
+        logger.debug(traceback.format_exc())
+
+    return result
 
 
-async def _sniper_enrich_accounts(df: pd.DataFrame, max_accounts: int = 100, parcel_lookup_url: str = PARCEL_LOOKUP_URL) -> pd.DataFrame:
-	"""
-	SNIPER PHASE: Enrich high-priority accounts using Firecrawl extraction.
-	
-	This function takes filtered distressed accounts and enriches them with
-	live-scraped data via Firecrawl API. It includes rate limiting to respect
-	API quotas and prevents excessive requests.
-	
-	Args:
-		df: DataFrame containing filtered distressed accounts
-		max_accounts: Maximum number of accounts to enrich (default: 100)
-		
-	Returns:
-		pd.DataFrame: Enriched DataFrame with additional columns:
-			- total_amount_due: Scraped total amount due
-			- years_delinquent_scraped: Scraped delinquent years count
-			- payment_plan_status: Payment plan status
-			- custom_flags: List of custom flags
-			
-	Note:
-		Accounts without valid account numbers are skipped. Rate limiting delays
-		are applied between requests (see REQUEST_DELAY_RANGE constant).
-	"""
+async def _sniper_enrich_accounts(
+    df: pd.DataFrame,
+    max_accounts: int = 100,
+    parcel_lookup_url: str = PARCEL_LOOKUP_URL,
+) -> pd.DataFrame:
+    """SNIPER PHASE: Enrich high-priority accounts using Firecrawl."""
+    from config.settings import get_settings
 
-	# Limit scraping to prevent excessive requests
-	if len(df) > max_accounts:
-		logger.info(f"[SNIPER] Limiting enrichment to first {max_accounts} accounts (out of {len(df)})")
-		df = df.head(max_accounts)
-	else:
-		logger.info(f"[SNIPER] Starting enrichment for {len(df)} accounts")
+    if len(df) > max_accounts:
+        logger.info("[SNIPER] Limiting enrichment to first %d accounts (of %d)", max_accounts, len(df))
+        df = df.head(max_accounts)
 
-	enriched_rows = []
-	skipped = 0
+    enriched_rows = []
+    skipped = 0
 
-	try:
-		# Initialize Firecrawl client
-		firecrawl_client = FirecrawlApp(api_key=settings.firecrawl_api_key.get_secret_value())
-		logger.info("[SNIPER] Firecrawl initialized for structured extraction")
+    try:
+        settings = get_settings()
+        firecrawl_client = FirecrawlApp(api_key=settings.firecrawl_api_key.get_secret_value())
+        logger.info("[SNIPER] Firecrawl initialized — enriching %d accounts", len(df))
 
-		for idx, row in df.iterrows():
-			account_number = row.get("Account Number") or row.get("account_number") or row.get("Parcel ID") or row.get("Account #")
+        for idx, row in df.iterrows():
+            account_number = (
+                row.get("Account Number")
+                or row.get("account_number")
+                or row.get("Parcel ID")
+                or row.get("Account #")
+            )
 
-			if not account_number:
-				skipped += 1
-				continue
+            if not account_number:
+                skipped += 1
+                continue
 
-			if (idx + 1) % 10 == 0 or idx == 0:
-				logger.warning("[SNIPER] Progress: %d/%d accounts enriched", idx + 1, len(df))
-			logger.info(f"[SNIPER] [{idx + 1}/{len(df)}] Extracting account: {account_number}")
+            if (idx + 1) % 10 == 0 or idx == 0:
+                logger.info("[SNIPER] Progress: %d/%d accounts enriched", idx + 1, len(df))
 
-			details = await _scrape_parcel_with_firecrawl(firecrawl_client, str(account_number), parcel_lookup_url=parcel_lookup_url)
+            details = await _scrape_parcel_with_firecrawl(firecrawl_client, str(account_number), parcel_lookup_url)
 
-			# Merge scraped data
-			enriched_row = row.to_dict()
-			enriched_row["total_amount_due"] = details["total_amount_due"]
-			enriched_row["years_delinquent_scraped"] = details["years_delinquent"]
-			enriched_row["payment_plan_status"] = details["payment_plan_status"]
-			enriched_row["custom_flags"] = details["custom_flags"]
+            enriched_row = row.to_dict()
+            enriched_row["total_amount_due"] = details["total_amount_due"]
+            enriched_row["years_delinquent_scraped"] = details["years_delinquent"]
+            enriched_row["payment_plan_status"] = details["payment_plan_status"]
+            enriched_row["custom_flags"] = details["custom_flags"]
+            enriched_rows.append(enriched_row)
 
-			enriched_rows.append(enriched_row)
+            if idx < len(df) - 1:
+                delay = random.uniform(*REQUEST_DELAY_RANGE)
+                await asyncio.sleep(delay)
 
-			# Delay between accounts to respect rate limits
-			if idx < len(df) - 1:  # Don't delay after last account
-				delay = random.uniform(*REQUEST_DELAY_RANGE)
-				logger.debug(f"[SNIPER] Waiting {delay:.1f} seconds before next account")
-				await asyncio.sleep(delay)
+        if skipped:
+            logger.warning("[SNIPER] Skipped %d accounts with missing account numbers", skipped)
+        logger.info("[SNIPER] Enrichment complete: %d accounts", len(enriched_rows))
+        return pd.DataFrame(enriched_rows)
 
-		enriched_df = pd.DataFrame(enriched_rows)
-		logger.info(f"[SNIPER] Enrichment complete. Processed {len(enriched_df)} accounts")
-		if skipped > 0:
-			logger.warning(f"[SNIPER] Skipped {skipped} accounts with missing account numbers")
+    except Exception as e:
+        logger.error("[SNIPER] Error during enrichment: %s", e)
+        logger.debug(traceback.format_exc())
+        return pd.DataFrame(enriched_rows) if enriched_rows else df
 
-		return enriched_df
-		
-	except Exception as e:
-		logger.error(f"[SNIPER] Error during account enrichment: {e}")
-		logger.debug(traceback.format_exc())
-		return pd.DataFrame(enriched_rows) if enriched_rows else df
 
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
 
 async def run_radar_sniper_pipeline(
-	tax_year: int = DEFAULT_TAX_YEAR,
-	account_status: str = DEFAULT_ACCOUNT_STATUS,
-	min_years_delinquent: int = MIN_YEARS_DELINQUENT,
-	max_sniper_accounts: int = 100,
-	skip_download: bool = False,
-	county_id: str = "hillsborough",
+    tax_year: int = DEFAULT_TAX_YEAR,
+    account_status: str = DEFAULT_ACCOUNT_STATUS,
+    min_years_delinquent: int = MIN_YEARS_DELINQUENT,
+    max_sniper_accounts: int = 100,
+    skip_download: bool = False,
+    county_id: str = "hillsborough",
+    load_to_db: bool = False,
+    headful: bool = False,
 ) -> bool:
-	"""
-	Execute the full Radar & Sniper pipeline for tax delinquent lead generation.
-	
-	This orchestration function coordinates the complete pipeline:
-	1. RADAR Phase: Bulk download of tax delinquent CSV (optional)
-	2. CSV Parsing: Load and validate CSV with multiple encoding strategies
-	3. Filtering: Filter accounts by minimum years of delinquency
-	4. SNIPER Phase: Individual enrichment via Firecrawl API
-	5. Output: Save enriched leads to final CSV
-	
-	Args:
-		tax_year: Tax year to query (default: 2026)
-		account_status: Account status filter (default: "CURRENT")
-		min_years_delinquent: Minimum years delinquent for filtering (default: 2)
-		max_sniper_accounts: Maximum accounts to enrich (default: 100)
-		skip_download: Skip download phase and use existing CSV (default: False)
-		
-	Returns:
-		bool: True if pipeline completed successfully, False otherwise
-		
-	Raises:
-		Does not raise exceptions - all errors are logged and return False
-		
-	Note:
-		CSV parsing includes 3 fallback strategies: UTF-8, latin1, and Python engine.
-		Final output is written to data/processed/final_weekly_distress_leads.csv.
-	"""
+    """Execute the full RADAR + SNIPER pipeline for tax delinquent lead generation."""
+    try:
+        # PHASE 1: RADAR
+        if skip_download:
+            logger.info("[RADAR] Skipping download (using existing CSV)")
+        else:
+            logger.info("[RADAR] Starting bulk download phase")
+            success = await download_tax_delinquent_report(
+                tax_year=tax_year,
+                account_status=account_status,
+                county_id=county_id,
+                headful=headful,
+            )
+            if not success:
+                logger.error("[RADAR] Phase failed — aborting pipeline")
+                return False
 
-	try:
-		# PHASE 1: RADAR - Download bulk CSV (optional)
-		if skip_download:
-			logger.info("Skipping download phase (using existing CSV)")
-		else:
-			logger.info("[RADAR] Starting bulk download phase")
-			success = await download_tax_delinquent_report(tax_year=tax_year, account_status=account_status, county_id=county_id)
+        # Locate downloaded file
+        _file_prefix = _get_county(county_id)["file_prefix"]
+        bulk_csv_path = REFERENCE_DATA_DIR / f"{_file_prefix}_tax_delinquent_{tax_year}.csv"
+        if not bulk_csv_path.exists():
+            for ext in (".xls", ".xlsx"):
+                alt = REFERENCE_DATA_DIR / f"{_file_prefix}_tax_delinquent_{tax_year}{ext}"
+                if alt.exists():
+                    bulk_csv_path = alt
+                    break
 
-			if not success:
-				logger.error("[RADAR] Phase failed. Aborting pipeline")
-				return False
+        if not bulk_csv_path.exists():
+            logger.error("[RADAR] Cannot find CSV at %s", bulk_csv_path)
+            return False
 
-		# Locate the CSV file (either just downloaded or existing)
-		_file_prefix = _get_county(county_id)["file_prefix"]
-		bulk_csv_path = REFERENCE_DATA_DIR / f"{_file_prefix}_tax_delinquent_{tax_year}.csv"
-		if not bulk_csv_path.exists():
-			# Try alternate extensions
-			for ext in [".xls", ".xlsx"]:
-				alt_path = REFERENCE_DATA_DIR / f"{_file_prefix}_tax_delinquent_{tax_year}{ext}"
-				if alt_path.exists():
-					bulk_csv_path = alt_path
-					logger.debug(f"Found alternate file: {bulk_csv_path}")
-					break
+        # PHASE 2: Parse CSV
+        logger.info("[Parse] Loading bulk CSV: %s", bulk_csv_path)
+        df = None
+        for enc in ("utf-8", "latin1"):
+            try:
+                df = pd.read_csv(bulk_csv_path, on_bad_lines="skip", encoding=enc, low_memory=False, skipinitialspace=True, quoting=1)
+                break
+            except Exception:
+                continue
+        if df is None:
+            try:
+                df = pd.read_csv(bulk_csv_path, on_bad_lines="skip", encoding="utf-8", low_memory=False, dtype=str, skipinitialspace=True, engine="python")
+            except Exception as exc:
+                logger.error("[Parse] All parsing strategies failed: %s", exc)
+                return False
 
-		if not bulk_csv_path.exists():
-			logger.error(f"Could not find CSV file at {bulk_csv_path}")
-			return False
+        if df.empty:
+            logger.error("[Parse] CSV is empty or could not be parsed")
+            return False
+        logger.info("[Parse] Loaded %d records", len(df))
 
-		# PHASE 2: Parse CSV
-		logger.info("Parsing bulk CSV")
-		
-		try:
-			# Try with error handling for malformed CSV
-			df = pd.read_csv(
-				bulk_csv_path,
-				on_bad_lines='skip',
-				encoding='utf-8',
-				low_memory=False,
-				skipinitialspace=True,
-				quoting=1  # QUOTE_ALL
-			)
-			logger.info(f"Loaded {len(df)} records from bulk CSV")
-			
-			if df.empty:
-				logger.error("CSV is empty or could not be parsed")
-				return False
-				
-		except Exception as exc:
-			logger.warning(f"Failed to parse CSV (UTF-8): {exc}")
-			logger.info("Attempting alternative parsing strategies")
-			
-			# Strategy 2: Try latin1 encoding
-			try:
-				df = pd.read_csv(
-					bulk_csv_path,
-					on_bad_lines='skip',
-					encoding='latin1',
-					low_memory=False,
-					skipinitialspace=True,
-					quoting=1
-				)
-				logger.info(f"Loaded {len(df)} records from bulk CSV (latin1 encoding)")
-			except Exception as exc2:
-				logger.warning(f"Alternative parsing with latin1 failed: {exc2}")
-				
-				# Strategy 3: Try with minimal parsing (treat everything as strings)
-				try:
-					df = pd.read_csv(
-						bulk_csv_path,
-						on_bad_lines='skip',
-						encoding='utf-8',
-						low_memory=False,
-						dtype=str,
-						skipinitialspace=True,
-						engine='python'  # More forgiving parser
-					)
-					logger.info(f"Loaded {len(df)} records using Python engine (all strings)")
-				except Exception as exc3:
-					logger.error(f"All parsing strategies failed: {exc3}")
-					logger.error(f"Please manually inspect the CSV file: {bulk_csv_path}")
-					return False
+        # PHASE 3: Filter distressed accounts
+        df_distressed = _filter_distressed_accounts(df, min_years=min_years_delinquent)
+        if df_distressed.empty:
+            logger.warning("[Filter] No distressed accounts found")
+            return False
 
-		# PHASE 3: Filter distressed accounts
-		df_distressed = _filter_distressed_accounts(df, min_years=min_years_delinquent)
+        # PHASE 3.5: DB dedup — only enrich NEW accounts (county-scoped)
+        existing_accounts = _get_existing_tax_records(tax_year, county_id=county_id)
+        # Detect account column — varies by county portal
+        account_col = None
+        for _col in ("Account Number", "Account #", "Account", "Parcel ID", "account_number"):
+            if _col in df_distressed.columns:
+                account_col = _col
+                break
+        initial_count = len(df_distressed)
+        if account_col and existing_accounts:
+            df_new_only = df_distressed[~df_distressed[account_col].isin(existing_accounts)].copy()
+            logger.info("[Dedup] %d existing filtered, %d new remain", initial_count - len(df_new_only), len(df_new_only))
+        else:
+            if not account_col:
+                logger.warning("[Dedup] Account column not found — skipping pre-dedup")
+            df_new_only = df_distressed
+            logger.info("[Dedup] No existing records — all %d are new", len(df_new_only))
 
-		if df_distressed.empty:
-			logger.warning("No distressed accounts found matching criteria")
-			return False
+        if df_new_only.empty:
+            logger.info("[Dedup] All distressed records already in DB — nothing to do")
+            return True
 
-		# PHASE 3.5: Check DB for existing records (deduplicate BEFORE Firecrawl)
-		logger.info("=" * 80)
-		logger.info("DB DEDUPLICATION: Checking for existing records")
-		logger.info("=" * 80)
-		
-		existing_accounts = _get_existing_tax_records(tax_year)
-		
-		# Filter out accounts that already exist in DB
-		account_col = "Account Number"
-		initial_count = len(df_distressed)
-		
-		if existing_accounts:
-			df_new_only = df_distressed[~df_distressed[account_col].isin(existing_accounts)].copy()
-			logger.info(f"Filtered {initial_count - len(df_new_only):,} existing records")
-			logger.info(f"NEW records to enrich: {len(df_new_only):,}")
-		else:
-			df_new_only = df_distressed
-			logger.info(f"No existing records found, all {len(df_new_only):,} are new")
-		
-		if df_new_only.empty:
-			logger.warning("[RADAR] All %d distressed records already exist in DB for tax_year=%s — skipping SNIPER", initial_count, tax_year)
-			return True
+        # PHASE 4: SNIPER
+        _parcel_url = _get_county(county_id)["urls"].get("parcel") or PARCEL_LOOKUP_URL
+        df_enriched = await _sniper_enrich_accounts(df_new_only, max_accounts=max_sniper_accounts, parcel_lookup_url=_parcel_url)
 
-		# PHASE 4: SNIPER - Enrich ONLY NEW accounts with Firecrawl (cost optimization!)
-		logger.info(f"[SNIPER] Enriching {len(df_new_only)} NEW accounts (skipped {len(existing_accounts)} existing)")
-		_parcel_url = _get_county(county_id)["portals"]["parcel_lookup_url"]
-		df_enriched = await _sniper_enrich_accounts(df_new_only, max_accounts=max_sniper_accounts, parcel_lookup_url=_parcel_url)
+        # PHASE 5: Save to county-scoped output directory
+        from datetime import datetime
+        today = datetime.now().strftime("%Y%m%d")
+        out_dir = RAW_TAX_DELINQUENCIES_DIR / county_id / "new"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = out_dir / f"tax_delinquencies_{county_id}_{today}.csv"
+        df_enriched.to_csv(csv_path, index=False)
+        logger.info("[Save] Saved %d records → %s", len(df_enriched), csv_path)
 
-		# PHASE 5: Save final output with deduplication
-		temp_dir = PROCESSED_DATA_DIR / "temp"
-		temp_dir.mkdir(parents=True, exist_ok=True)
-		temp_file = temp_dir / "tax_temp.csv"
-		
-		df_enriched.to_csv(temp_file, index=False)
-		logger.info(f"Saved {len(df_enriched)} records to temporary file: {temp_file}")
-		
-		# Deduplicate against existing CSVs
-		try:
-			from datetime import datetime
-			unique_keys = get_unique_keys_for_type('tax')
-			today = datetime.now().strftime('%Y%m%d')
-			final_output = deduplicate_csv(
-				new_csv_path=temp_file,
-				destination_dir=PROCESSED_DATA_DIR,
-				unique_key_columns=unique_keys,
-				output_filename=f"tax_deliquencies_{today}.csv",
-				keep_original=False  # Remove temp file after deduplication
-			)
-			
-			file_size_kb = final_output.stat().st_size / 1024
-			logger.info(f"Tax delinquency leads saved to {final_output} ({file_size_kb:.1f} KB)")
-			logger.info(f"Total accounts processed: {len(pd.read_csv(final_output))}")
-			
-		except Exception as e:
-			logger.error(f"Deduplication failed: {e}")
-			logger.debug(traceback.format_exc())
-			# Fallback: save without deduplication (old behavior)
-			logger.warning("Falling back to non-deduplicated save")
-			final_output = PROCESSED_DATA_DIR / "final_weekly_distress_leads.csv"
-			df_enriched.to_csv(final_output, index=False)
-			file_size_kb = final_output.stat().st_size / 1024
-			logger.info(f"Final distress leads saved to {final_output} ({file_size_kb:.1f} KB)")
-			logger.info(f"Total accounts processed: {len(df_enriched)}")
-			temp_file.unlink(missing_ok=True)
+        if load_to_db:
+            _load_to_database(csv_path, county_id)
 
-		return True
-		
-	except Exception as e:
-		logger.error(f"Pipeline execution failed: {e}")
-		logger.debug(traceback.format_exc())
-		return False
+        return True
 
+    except Exception as e:
+        logger.error("[Pipeline] Execution failed: %s", e)
+        logger.debug(traceback.format_exc())
+        return False
+
+
+# ---------------------------------------------------------------------------
+# DB load
+# ---------------------------------------------------------------------------
+
+def _load_to_database(csv_path: Path, county_id: str) -> None:
+    """Load scraped CSV into the tax_delinquencies table.
+
+    Delegates to the shared `load_scraped_data_to_db` helper so this engine uses
+    the same loader path as the admin upload endpoint (preserving fallback).
+    """
+    from src.utils.scraper_db_helper import load_scraped_data_to_db
+
+    try:
+        load_scraped_data_to_db(
+            'tax',
+            csv_path,
+            destination_dir=RAW_TAX_DELINQUENCIES_DIR / county_id,
+        )
+    except Exception as e:
+        logger.error("[DB] Load failed: %s", e)
+        logger.debug(traceback.format_exc())
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-	"""
-	CLI entrypoint for the Hillsborough Tax Delinquent pipeline.
-	
-	Supports two modes:
-	- download-only: Only execute RADAR phase (bulk download)
-	- full-pipeline: Execute complete RADAR + SNIPER pipeline
-	
-	Example usage:
-		# Full pipeline with default settings
-		python tax_delinquent_engine.py
-		
-		# Download only for specific year
-		python tax_delinquent_engine.py --mode download-only --tax-year 2025
-		
-		# Full pipeline with custom filters
-		python tax_delinquent_engine.py --min-years 3 --max-sniper 50
-		
-		# Skip download and use existing CSV
-		python tax_delinquent_engine.py --skip-download
-	"""
-	import argparse
-	
-	parser = argparse.ArgumentParser(
-		description="Hybrid Radar & Sniper strategy for Hillsborough Tax Delinquencies"
-	)
-	parser.add_argument(
-		"--mode",
-		choices=["download-only", "full-pipeline"],
-		default="full-pipeline",
-		help="Run mode: download-only or full-pipeline (default: full-pipeline)"
-	)
-	parser.add_argument(
-		"--tax-year",
-		type=int,
-		default=DEFAULT_TAX_YEAR,
-		help=f"Tax year to query (default: {DEFAULT_TAX_YEAR})"
-	)
-	parser.add_argument(
-		"--min-years",
-		type=int,
-		default=MIN_YEARS_DELINQUENT,
-		help=f"Minimum years delinquent to filter (default: {MIN_YEARS_DELINQUENT})"
-	)
-	parser.add_argument(
-		"--max-sniper",
-		type=int,
-		default=100,
-		help="Maximum accounts to enrich in SNIPER phase (default: 100)"
-	)
-	parser.add_argument(
-		"--status",
-		default=DEFAULT_ACCOUNT_STATUS,
-		help=f"Account status filter (default: {DEFAULT_ACCOUNT_STATUS})"
-	)
-	parser.add_argument(
-		"--skip-download",
-		action="store_true",
-		help="Skip download phase and use existing CSV file for SNIPER phase"
-	)
-	parser.add_argument(
-		"--scraper",
-		choices=["auto", "playwright", "ai"],
-		default="auto",
-		help="Which scraper to use: auto (playwright → AI fallback), playwright only, ai only (default: auto)",
-	)
-	parser.add_argument(
-		"--county-id",
-		dest="county_id",
-		default="hillsborough",
-		help="County identifier (default: hillsborough)",
-	)
+    from src.utils.scraper_db_helper import record_scraper_stats
 
-	from src.utils.scraper_db_helper import add_load_to_db_arg, load_scraped_data_to_db, record_scraper_stats
-	add_load_to_db_arg(parser)
-	args = parser.parse_args()
+    parser = argparse.ArgumentParser(description="Tax Delinquent RADAR + SNIPER Pipeline")
+    parser.add_argument("--county-id", dest="county_id", default="hillsborough",
+                        help="County identifier (default: hillsborough)")
+    parser.add_argument("--mode", choices=["download-only", "full-pipeline"], default="full-pipeline",
+                        help="Run mode (default: full-pipeline)")
+    parser.add_argument("--tax-year", type=int, default=DEFAULT_TAX_YEAR,
+                        help=f"Tax year to query (default: {DEFAULT_TAX_YEAR})")
+    parser.add_argument("--min-years", type=int, default=MIN_YEARS_DELINQUENT,
+                        help=f"Minimum years delinquent (default: {MIN_YEARS_DELINQUENT})")
+    parser.add_argument("--max-sniper", type=int, default=100,
+                        help="Max accounts to enrich in SNIPER phase (default: 100)")
+    parser.add_argument("--status", default=DEFAULT_ACCOUNT_STATUS,
+                        help=f"Account status filter (default: {DEFAULT_ACCOUNT_STATUS})")
+    parser.add_argument("--skip-download", action="store_true",
+                        help="Skip RADAR phase and use existing CSV")
+    parser.add_argument("--load-to-db", action="store_true",
+                        help="Load scraped records into database after pipeline completes")
+    parser.add_argument("--headful", action="store_true",
+                        help="Open a real browser window (useful for debugging)")
+    args = parser.parse_args()
 
-	import sys
-	_t0 = time.monotonic()
-	try:
-		logger.info(f"Starting Tax Delinquent Engine in {args.mode} mode")
+    _t0 = time.monotonic()
+    try:
+        logger.info("Starting Tax Delinquent Engine (%s mode, county=%s)", args.mode, args.county_id)
 
-		if args.mode == "download-only":
-			asyncio.run(download_tax_delinquent_report(
-				tax_year=args.tax_year,
-				account_status=args.status,
-				scraper=args.scraper,
-				county_id=args.county_id,
-			))
-		else:
-			asyncio.run(
-				run_radar_sniper_pipeline(
-					tax_year=args.tax_year,
-					account_status=args.status,
-					min_years_delinquent=args.min_years,
-					max_sniper_accounts=args.max_sniper,
-					skip_download=args.skip_download,
-					county_id=args.county_id,
-				)
-			)
+        if args.mode == "download-only":
+            asyncio.run(download_tax_delinquent_report(
+                tax_year=args.tax_year,
+                account_status=args.status,
+                county_id=args.county_id,
+                headful=args.headful,
+            ))
+        else:
+            asyncio.run(run_radar_sniper_pipeline(
+                tax_year=args.tax_year,
+                account_status=args.status,
+                min_years_delinquent=args.min_years,
+                max_sniper_accounts=args.max_sniper,
+                skip_download=args.skip_download,
+                county_id=args.county_id,
+                headful=args.headful,
+                load_to_db=args.load_to_db,
+            ))
 
-		logger.info("Tax Delinquent Engine completed successfully")
+        logger.info("Tax Delinquent Engine completed successfully")
 
-		# Load to database if requested
-		if args.load_to_db:
-			_file_prefix = _get_county(args.county_id)["file_prefix"]
-			new_dir = RAW_TAX_DELINQUENCIES_DIR / "new"
-			csv_files = sorted(new_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True) if new_dir.exists() else []
-			if not csv_files:
-				csv_files = sorted(RAW_TAX_DELINQUENCIES_DIR.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
-			if not csv_files:
-				csv_files = sorted(REFERENCE_DATA_DIR.glob(f"{_file_prefix}_tax_delinquent_*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
-			if csv_files:
-				csv_to_load = csv_files[0]
-				logger.info(f"Loading to database: {csv_to_load}")
-				load_scraped_data_to_db('tax', csv_to_load, destination_dir=RAW_TAX_DELINQUENCIES_DIR)
-			else:
-				logger.error("No tax delinquency CSV file found to load")
-				try:
-					record_scraper_stats(source_type='tax_delinquencies', total_scraped=0, matched=0, unmatched=0, skipped=0, run_success=False, error_message='No CSV found after pipeline success', duration_seconds=round(time.monotonic() - _t0, 2), county_id=args.county_id)
-				except Exception as _se:
-					logger.warning("Could not record scraper stats: %s", _se)
-				sys.exit(1)
-		else:
-			# Dry-run: pipeline completed, record basic success so load_validator sees the run.
-			try:
-				record_scraper_stats(source_type='tax_delinquencies', total_scraped=0, matched=0, unmatched=0, skipped=0, run_success=True, duration_seconds=round(time.monotonic() - _t0, 2), county_id=args.county_id)
-			except Exception as _se:
-				logger.warning("Could not record scraper stats: %s", _se)
+        try:
+            record_scraper_stats(
+                source_type="tax_delinquencies",
+                total_scraped=0, matched=0, unmatched=0, skipped=0,
+                run_success=True,
+                duration_seconds=round(time.monotonic() - _t0, 2),
+                county_id=args.county_id,
+            )
+        except Exception as _se:
+            logger.warning("Could not record scraper stats: %s", _se)
 
-	except KeyboardInterrupt:
-		logger.warning("Pipeline interrupted by user")
-		sys.exit(0)
-	except Exception as e:
-		logger.error(f"Pipeline failed: {e}")
-		logger.debug(traceback.format_exc())
-		try:
-			record_scraper_stats(source_type='tax_delinquencies', total_scraped=0, matched=0, unmatched=0, skipped=0, run_success=False, error_message=str(e)[:500], duration_seconds=round(time.monotonic() - _t0, 2), county_id=args.county_id)
-		except Exception as _se:
-			logger.warning("Could not record scraper stats: %s", _se)
-		sys.exit(1)
-
+    except KeyboardInterrupt:
+        logger.warning("Pipeline interrupted by user")
+        sys.exit(0)
+    except Exception as e:
+        logger.error("Pipeline failed: %s", e)
+        logger.debug(traceback.format_exc())
+        try:
+            record_scraper_stats(
+                source_type="tax_delinquencies",
+                total_scraped=0, matched=0, unmatched=0, skipped=0,
+                run_success=False,
+                error_message=str(e)[:500],
+                duration_seconds=round(time.monotonic() - _t0, 2),
+                county_id=args.county_id,
+            )
+        except Exception:
+            pass
+        sys.exit(1)

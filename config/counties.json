@@ -24,7 +24,21 @@
     },
     "nws_zones": ["FLC057", "FLZ151", "FLZ251"],
     "credentials_ref": "HILLSBOROUGH_PORTAL_USER",
-    "file_prefix": "hillsborough"
+    "file_prefix": "hillsborough",
+    "sources": {
+      "tax_delinquency": {
+        "signal_type": "tax_delinquency",
+        "source_name": "Hillsborough Tax Delinquency",
+        "url": "https://county-taxes.net/hillsborough/reports/real-estate",
+        "description": "Hillsborough County tax delinquency and certificate data.",
+        "navigation_hint": "Access tax report at /reports/real-estate or search by parcel.",
+        "output_format": "csv"
+      }
+    },
+    "urls": {
+      "tax": "https://hillsborough.county-taxes.com",
+      "parcel": "https://hillsborough.county-taxes.com/public/real_estate/parcels"
+    }
   },
 
   "pinellas": {
@@ -36,7 +50,21 @@
     "portals": {},
     "court": {"bankruptcy_code": "flmb", "division_prefix": "8:"},
     "nws_zones": ["FLC103"],
-    "file_prefix": "pinellas"
+    "file_prefix": "pinellas",
+    "sources": {
+      "tax_delinquency": {
+        "signal_type": "tax_delinquency",
+        "source_name": "Pinellas County Taxes",
+        "url": "https://pinellas.county-taxes.com/public/search/property_tax",
+        "description": "Pinellas County tax delinquency search portal.",
+        "navigation_hint": "Search for delinquent tax accounts, extract all results.",
+        "output_format": "table"
+      }
+    },
+    "urls": {
+      "tax": "https://pinellas.county-taxes.com",
+      "parcel": "https://pinellas.county-taxes.com/public/real_estate/parcels"
+    }
   },
 
   "pasco": {
