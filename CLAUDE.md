@@ -56,7 +56,7 @@ Central `properties` table (~522k parcels). 1:Many → foreclosures, tax_delinqu
 - **CDS Engine** (`src/services/cds_engine.py`): 6 verticals × 14+ signals. Weights/thresholds in `config/scoring.py`. Formula: primary_score (base+recency-age_decay) + stacking_bonus (STACKING_WINDOW_DAYS=180, cap=60) + absentee/contact/equity bonuses. Equity bonus applies to ALL 6 verticals (per-vertical rates). Stacking-only signals (`insurance_claim`, `fire`, `storm_damage`, `flood_damage`, `building_permits` non-enforcement) cannot be primary. Dead lead gate: deed transfer <45 days → zero investment verticals. Owner-occupied → zero wholesalers/fix_flip/attorneys. HCPA passive boosts (old building/long-term owner/declining value) stack on top. Batch commit every 1000 properties. After scoring: bulk UPDATE `sync_status='pending_sync'` — no GHL API calls in loop. Tiers: Ultra Platinum(95+) → Platinum(83+) → Gold(57+) → Silver(40+) → Bronze.
 - **API** (`src/api/main.py` + `admin_router.py` + `sandbox_router.py`): FastAPI. Stripe webhooks, checkout, lead feed, JWT-protected admin upload, sandbox scenario harness, static SPA from `src/static/`.
 - **Services** (`src/services/`): `stripe_service.py` = outgoing (create checkout sessions, founding vs regular price via SELECT FOR UPDATE). `stripe_webhooks.py` = incoming (5 events: checkout.session.completed → activate subscriber+lock ZIP+GHL; invoice.payment_failed → retry; subscription.deleted → 48hr grace). Idempotency via `stripe_webhook_events` table. GHL push decoupled: `ghl_webhook.py` does 4 API calls per lead (upsert contact → save contact_id → upsert opportunity → tags), 0.5s throttle + 429 backoff. `skip_trace.py` = BatchData API (200/day); `idi_fallback.py` = IDI fallback for BatchData misses (100/day) — both write to `enriched_contacts` + update `Owner.phone_1/email_1`. Monetization: wallet, allotment, bundle, lead_hold, wall, referral, ab, urgency, segmentation, revenue_signal, proactive_save.
-- **Agents** (`src/agents/`): LangGraph (Cora) runtime. Supervisor routes events via dict lookup (no Claude call for routing). 3 graphs: `fomo` (competitor_acted_on_lead → SMS <60s), `abandonment` Wave1+Wave2 (bounce recovery, shared decision_id), `retention` (weekly summary per subscriber tier). Every graph passes through `decision_hierarchy` subgraph (6-step gate: guardrail → learning_card → segment+score → A/B → kill_switch) then `compose_and_send` (Claude writes SMS → compliance check → Twilio). Kill switch colors: green=send, yellow=fallback template, red=block. All decisions logged to `agent_decisions`. Guardrails in `config/cora_guardrails.py`.
+- **Agents** (`src/agents/`): LangGraph (Cora) runtime. Supervisor routes events via dict lookup (no Claude call for routing). 3 graphs: `fomo` (competitor_acted_on_lead → SMS <60s), `abandonment` Wave1+Wave2 (bounce recovery, shared decision_id), `retention` (weekly summary per subscriber tier). Every graph passes through `decision_hierarchy` subgraph (6-step gate: guardrail → learning_card → segment+score → A/B → kill_switch) then `compose_and_send` (Claude writes SMS → compliance check → Telnyx). Kill switch colors: green=send, yellow=fallback template, red=block. All decisions logged to `agent_decisions`. Guardrails in `config/cora_guardrails.py`.
 - **Tasks** (`src/tasks/`): Scheduled jobs — scraper orchestration, Stripe reconcile, grace_expiry, rematch_unmatched, GHL sync, daily/weekly/monthly/annual reports, learning_card_job, lead_quality_monitor, match_rate_monitor, price_escalation, cora_anomaly_check, health_check, run_enrichment, revenue_pulse, weekly_one_pager.
 
 ### Database Access
@@ -87,7 +87,8 @@ All ORM models in `src/core/models.py`. Polymorphic `record_type` on LegalAndLie
 - **Scraping**: Playwright + playwright-stealth. Browser-use + Anthropic for AI fallback. Firecrawl for static pages. No Selenium, no BeautifulSoup-only scrapers (BS4 is for parsing only).
 - **Fuzzy matching**: rapidfuzz. No fuzzywuzzy.
 - **Agents**: LangGraph 1.x with Postgres checkpointer. LangSmith for tracing. No raw Anthropic SDK loops for agent flows.
-- **SMS**: Twilio. **Voice/AI calls**: Synthflow.
+- **SMS**: Telnyx (replaced Twilio 2026-05-11). All sends go through `src/services/sms_compliance.send_sms` with an explicit `message_type ∈ {marketing, transactional, opt_in_prompt}`. Marketing sends require a recorded `SmsOptIn`. **Voice/AI calls**: Synthflow.
+- **Phone numbers**: every read or write of a phone column MUST go through `src/services/phone_utils.normalize` (strict E.164, US-only). Never `phone.strip()` or ad-hoc regex.
 - **Payments**: Stripe SDK ≥11. All webhook handlers in `src/services/stripe_webhooks.py`.
 - **Cache/rate-limit**: Redis (server). Use `fakeredis` in tests/sandbox.
 - **Auth (admin)**: python-jose JWT.
@@ -99,10 +100,11 @@ All ORM models in `src/core/models.py`. Polymorphic `record_type` on LegalAndLie
 
 - Scrapers dir is `src/scrappers/` (double p) — do not rename.
 - `.gitignore` excludes `data/`, `*.txt`, `*.sh`, `reports/` (local scraping output).
-- Required env: `DATABASE_URL`, `ANTHROPIC_API_KEY`. Feature-gated: Stripe, GHL, Synthflow, Twilio, Oxylabs proxy, IDI/skip-trace APIs, LangSmith.
+- Required env: `DATABASE_URL`, `ANTHROPIC_API_KEY`. Feature-gated: Stripe, GHL, Synthflow, Telnyx, Oxylabs proxy, IDI/skip-trace APIs, LangSmith.
 - Oxylabs proxy used for IP rotation when configured.
 - County-specific config in `config/counties.json` + `src/utils/county_config.py`.
 - Redis is server-only; locally use fakeredis shim.
+- **Redis STOP cache deferred** (compliance baseline Q9): `sms_compliance.can_send` queries Postgres on every send. The Redis-fronted STOP cache is intentionally postponed until A2P 10DLC approval lands and throughput data justifies the added failure mode. Do not add it ad-hoc.
 - **Tax delinquency scraper DISABLED** (county portal blocks it). Load via `POST /api/admin/upload/tax-delinquency` with admin JWT instead.
 - **Cron ordering dependency (hard-coded stagger, no inter-job signaling):** scrapers 04:00–06:30 → CDS scoring 07:00 → skip trace 07:30 → GHL sync 08:00. Overrun = stale data that day.
 - **GHL sync_status state machine:** `pending_sync` (set by CDS bulk UPDATE) → `synced` (push OK) / `sync_failed` (retried next run). Never lost.

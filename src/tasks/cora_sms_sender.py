@@ -29,6 +29,7 @@ from src.core.models import DBPRContact
 from src.services.signup_engine import create_free_account
 from src.services.sms_compliance import can_send, send_sms
 from src.services.signed_links import encode_landing_token
+from src.services import opt_in_sentinel
 from src.utils.logger import setup_logging, get_logger
 
 setup_logging()
@@ -150,11 +151,18 @@ def run_cora_sms_sender(
         # Step 3 — send SMS
         body = _sms_body(contact.full_name, vertical, landing_url)
 
+        # Cold first-contact to a DBPR-licensed contractor. There is no prior
+        # SmsOptIn row, so this send bypasses the marketing opt-in gate via
+        # message_type="opt_in_prompt". The signed landing URL drives consent
+        # capture on the web; we also mark the Redis opt-in sentinel so a
+        # direct YES reply within 15 min flows through handle_opt_in_reply.
         with get_db_context() as db:
+            opt_in_sentinel.mark_pending(phone)
             ok = can_send(phone, db) and send_sms(
                 to=phone,
                 body=body,
                 db=db,
+                message_type="opt_in_prompt",
                 subscriber_id=sub.id,
                 task_type="cora_sms_signup",
             )

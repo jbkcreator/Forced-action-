@@ -1825,7 +1825,9 @@ class SmsOptOut(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     phone: Mapped[str] = mapped_column(String(20), nullable=False, unique=True, index=True)
     keyword_used: Mapped[Optional[str]] = mapped_column(String(20))   # STOP / UNSUBSCRIBE / etc.
-    source: Mapped[str] = mapped_column(String(30), nullable=False, default="twilio_inbound")  # twilio_inbound/manual/import
+    # Vendor neutral going forward. Historical rows keep "twilio_inbound";
+    # new inbound STOP events tag as "inbound_sms" regardless of carrier.
+    source: Mapped[str] = mapped_column(String(30), nullable=False, default="inbound_sms")  # inbound_sms/twilio_inbound (legacy)/manual/import
     opted_out_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
     def __repr__(self):

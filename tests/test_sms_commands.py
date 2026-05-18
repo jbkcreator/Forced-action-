@@ -196,9 +196,21 @@ class TestFindSubscriber:
         sub = MagicMock()
         sub.id = 5
         mock_db.execute.return_value.scalar_one_or_none.return_value = sub
-        result = _find_subscriber("+15551234567", mock_db)
+        # Use a real (non-555) US number; phonenumbers rejects the reserved
+        # 555 exchange so strict-normalize would short-circuit to None.
+        result = _find_subscriber("+18135550100", mock_db)
         assert result is sub
-        mock_db.execute.assert_called_once()
+        # _find_subscriber may execute up to two queries (SmsOptIn join
+        # then Subscriber.phone fallback); assert at-least-once instead of
+        # exactly-once.
+        assert mock_db.execute.called
+
+    def test_find_subscriber_returns_none_for_unparseable_phone(self, mock_db):
+        from src.services.sms_commands import _find_subscriber
+        # 555 exchange is reserved; library returns None — function must
+        # refuse to query rather than fall back to a raw string.
+        assert _find_subscriber("+15551234567", mock_db) is None
+        mock_db.execute.assert_not_called()
 
     def test_find_subscriber_returns_none_when_empty_input(self, mock_db):
         from src.services.sms_commands import _find_subscriber
