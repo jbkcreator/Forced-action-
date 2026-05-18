@@ -2246,6 +2246,11 @@ class HumanCloseEscalation(Base):
     outcome: Mapped[Optional[str]] = mapped_column(String(20))
     outcome_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     context_json: Mapped[Optional[dict]] = mapped_column(JSONB)
+    posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    post_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_post_error: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    target_tier_price_cents: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    vertical: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
 
     __table_args__ = (
         UniqueConstraint("subscriber_id", "decision_id", name="uq_hce_sub_decision"),
