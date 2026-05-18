@@ -1190,7 +1190,9 @@ def _what_you_missed_fields(subscriber, db, *, save_offer_active: bool, locked_z
     except Exception:
         pool = []
 
-    gold_count = sum(1 for lead in pool if (lead.get("tier") or "").lower().endswith("gold"))
+    # All leads in pool already pass min_score=60 (Gold+); count them all.
+    # Checking .endswith("gold") would exclude Platinum and Ultra Platinum.
+    gold_count = len(pool)
     if gold_count <= 0:
         return {"what_you_missed": None}
 
@@ -1358,6 +1360,8 @@ def event_feed(
                 "flash_scarcity_windows": [],
                 **_accelerated_wallet_offer_fields(subscriber, db),
                 **_auto_mode_entitlement_fields(subscriber, db),
+                **_payment_recovery_fields(subscriber),
+                **_what_you_missed_fields(subscriber, db, save_offer_active=False),
             },
             "total": 0,
             "page": page,
@@ -1537,6 +1541,11 @@ def event_feed(
                 "flash_scarcity_windows": _flash_windows_nz,
                 **_accelerated_wallet_offer_fields(subscriber, db),
                 **_auto_mode_entitlement_fields(subscriber, db),
+                **_payment_recovery_fields(subscriber),
+                **_what_you_missed_fields(
+                    subscriber, db,
+                    save_offer_active=_compute_save_offer_active(subscriber, db),
+                ),
             },
             "total": len(_unlocked_leads),
             "page": page,
@@ -1781,6 +1790,12 @@ def event_feed(
             "wallet_credits_30d": _wallet_credits_30d,
             "flash_scarcity_windows": _flash_windows,
             **_accelerated_wallet_offer_fields(subscriber, db),
+            **_payment_recovery_fields(subscriber),
+            **_what_you_missed_fields(
+                subscriber, db,
+                save_offer_active=_compute_save_offer_active(subscriber, db),
+                locked_zips=locked_zips,
+            ),
         },
         "total": total,
         "page": page,

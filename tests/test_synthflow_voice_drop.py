@@ -98,7 +98,15 @@ class TestSynthflowClient:
 # ─── VoiceDropGraph tests ────────────────────────────────────────────────────
 
 class TestVoiceDropGraph:
-    def _invoke(self, profile=None, call_id="c1", recent_drop=None, agent_id="agent_123"):
+    def _invoke(
+        self,
+        profile=None,
+        call_id="c1",
+        recent_drop=None,
+        agent_id="agent_123",
+        sms_result=True,
+        sms_mock=None,
+    ):
         from src.agents.graphs.synthflow_voice_drop import build_synthflow_voice_drop_graph
 
         profile = profile or _make_sub_profile()
@@ -112,12 +120,18 @@ class TestVoiceDropGraph:
 
         hierarchy_result = {"action_allowed": True, "kill_switch_color": "green"}
 
+        # Build a fake sms_compliance module so the lazy import inside
+        # _node_followup_sms resolves to our mock without needing real telnyx env.
+        sms_module = MagicMock()
+        sms_module.send_sms = sms_mock or MagicMock(return_value=sms_result)
+
         with patch("src.agents.tools.read_tools.get_subscriber_profile", return_value=profile), \
              patch("src.agents.graphs.synthflow_voice_drop.get_subscriber_profile", return_value=profile), \
              patch("src.agents.graphs.synthflow_voice_drop.get_db_context", return_value=db_ctx), \
              patch("src.agents.graphs.synthflow_voice_drop.run_decision_hierarchy", return_value=hierarchy_result), \
              patch("src.services.synthflow_client.initiate_call", return_value=call_id), \
              patch("src.agents.graphs.synthflow_voice_drop.initiate_call", return_value=call_id), \
+             patch.dict(sys.modules, {"src.services.sms_compliance": sms_module}), \
              patch("config.settings.get_settings", return_value=_settings_mock(agent_id=agent_id)):
             graph = build_synthflow_voice_drop_graph().compile()
             result = graph.invoke({
@@ -126,6 +140,7 @@ class TestVoiceDropGraph:
                 "event_type": "high_intent_no_convert",
                 "event_payload": {"vertical": "roofing"},
             })
+        result["_sms_mock"] = sms_module.send_sms
         return result
 
     def test_happy_path_sent_true(self):
@@ -153,6 +168,40 @@ class TestVoiceDropGraph:
         result = self._invoke(call_id=None)
         assert result["sent"] is False
         assert result["terminal_status"] == "failed"
+
+    def test_followup_sms_fires_on_success(self):
+        """SMS reinforcement must fire after a successful voice drop dispatch
+        (covers all eligible outcomes — outcome isn't known yet at this point)."""
+        result = self._invoke()
+        assert result["followup_sent"] is True
+        assert result["_sms_mock"].call_count == 1
+        _, kwargs = result["_sms_mock"].call_args
+        assert kwargs["task_type"] == "synthflow_voice_drop_followup"
+        assert kwargs["message_type"] == "marketing"
+        assert kwargs["decision_id"] == "d-test-1"
+
+    def test_followup_sms_skipped_when_voice_drop_failed(self):
+        result = self._invoke(call_id=None)
+        assert result.get("followup_sent") is False
+        assert result["_sms_mock"].call_count == 0
+
+    def test_followup_sms_blocked_by_compliance(self):
+        """send_sms returning False (opt-out / quiet hours / no opt-in) must
+        not break the graph; followup_sent stays False and terminal_status
+        still reflects the underlying voice-drop send."""
+        result = self._invoke(sms_result=False)
+        assert result["sent"] is True
+        assert result["followup_sent"] is False
+        assert result.get("followup_skipped_reason") == "compliance_suppressed"
+        assert result["terminal_status"] == "completed"
+
+    def test_no_duplicate_sms_on_rerun(self):
+        """The 7-day dedup at assemble_context aborts the graph before
+        initiate_drop / followup_sms, so a rerun within the window fires
+        exactly zero SMS."""
+        result = self._invoke(recent_drop=MagicMock())
+        assert result["terminal_status"] == "aborted"
+        assert result["_sms_mock"].call_count == 0
 
     def test_no_agent_configured_aborts(self):
         s = _settings_mock(agent_id=None)
