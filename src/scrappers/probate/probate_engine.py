@@ -1,23 +1,25 @@
 """
-Probate Filing Data Collection Pipeline
+Probate Filing Data Collection Pipeline — county-agnostic
 
-This module automates the download and processing of Hillsborough County probate
-daily filings. It retrieves the latest probate filing CSV from the county clerk's
-website, processes the data, and saves it to the processed data directory.
+Downloads probate filings from the county clerk portal, deduplicates
+against existing DB records, and saves results.
 
-The pipeline performs the following steps:
-    1. Fetches the directory listing of available probate filing CSVs
-    2. Identifies and downloads the most recent file based on date
-    3. Loads and processes the CSV data with multi-encoding support
-    4. Saves the processed data to the output directory
+For Hillsborough: requests-based directory listing of daily CSV files
+at {clerk_base}/Probate/dailyfilings/.
+For Pinellas (output_format=excel): browser-use agent navigates the clerk
+portal, searches by date range, downloads the Excel export, and filters
+for probate case types via style_col.
 
-Author: Distressed Property Intelligence Platform
+Usage:
+    python -m src.scrappers.probate.probate_engine --county-id hillsborough --load-to-db
+    python -m src.scrappers.probate.probate_engine --county-id pinellas --load-to-db --headful
 """
 
+import asyncio
 import re
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -27,363 +29,385 @@ from bs4 import BeautifulSoup
 from src.utils.http_helpers import requests_get_with_retry
 
 from config.constants import (
-	RAW_PROBATE_DIR,
-	PROBATE_FILING_PATTERN,
-	DEFAULT_USER_AGENT,
-	REQUEST_TIMEOUT_DEFAULT,
-	REQUEST_TIMEOUT_LONG,
-	get_county_config,
+    RAW_PROBATE_DIR,
+    PROBATE_FILING_PATTERN,
+    PROBATE_FILINGS_URL,
+    PROBATE_CASE_PATTERNS,
+    HILLSCLERK_BASE_URL,
+    DEFAULT_USER_AGENT,
+    REQUEST_TIMEOUT_DEFAULT,
+    REQUEST_TIMEOUT_LONG,
+    BROWSER_MODEL,
+    BROWSER_TEMPERATURE,
 )
-from src.core.database import get_db_context
-from src.loaders.legal_proceedings import ProbateLoader
+from src.utils.county_config import get_county_config
 from src.utils.logger import setup_logging, get_logger
-from src.utils.csv_deduplicator import deduplicate_csv, get_unique_keys_for_type
 from src.utils.db_deduplicator import filter_new_records
 
-# Initialize logging
 setup_logging()
 logger = get_logger(__name__)
 
+_STEALTH_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/136.0.0.0 Safari/537.36"
+)
+
+
+def _make_llm():
+    from browser_use import ChatAnthropic
+    from config.settings import get_settings
+    settings = get_settings()
+    return ChatAnthropic(
+        model=BROWSER_MODEL,
+        temperature=BROWSER_TEMPERATURE,
+        api_key=settings.anthropic_api_key.get_secret_value(),
+    )
+
+
+
+def _get_probate_source(county_id: str) -> dict:
+    """Return the probate source dict, falling back to court_records if absent."""
+    cfg = get_county_config(county_id)
+    sources = cfg.get("sources", {})
+    return sources.get("probate") or sources.get("court_records") or {}
+
+
+async def _download_probate_via_browser(
+    county_id: str, source: dict, target_date: str | None, dest_dir: Path
+) -> Path:
+    """
+    Browser-use agent download for counties whose civil/probate portal requires a browser
+    (output_format='excel', e.g. Pinellas courtrecords.mypinellasclerk.gov).
+    Downloads the combined civil filing; the caller filters for probate case types.
+    Returns the path to the downloaded file.
+    """
+    from browser_use import Agent, Browser
+    from playwright_stealth import Stealth
+    from src.utils.http_helpers import get_browser_use_proxy
+
+    if target_date:
+        target_dt = datetime.strptime(target_date.replace("-", ""), "%Y%m%d")
+        start_str = end_str = target_dt.strftime("%m/%d/%Y")
+    else:
+        end_dt = datetime.now()
+        start_str = (end_dt - timedelta(days=1)).strftime("%m/%d/%Y")
+        end_str = end_dt.strftime("%m/%d/%Y")
+
+    url = source.get("url", "")
+    nav_hint = source.get("navigation_hint") or ""
+    task = (
+        f"Go to {url}. "
+        f"Search for court filings filed between {start_str} and {end_str}. "
+        f"Export or download the full results as a file (Excel or CSV). "
+        f"Wait for the download to complete. "
+        f"Do not open new tabs or navigate away from the portal."
+    )
+    if nav_hint:
+        task += f"\n\nPortal navigation hint: {nav_hint}"
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    browser = Browser(
+        headless=True,
+        disable_security=True,
+        proxy=get_browser_use_proxy(),
+        downloads_path=str(dest_dir),
+        user_agent=_STEALTH_UA,
+        ignore_default_args=["--enable-automation"],
+        enable_default_extensions=True,
+        minimum_wait_page_load_time=1.5,
+        wait_between_actions=1.0,
+        args=["--no-sandbox", "--disable-blink-features=AutomationControlled", "--window-size=1920,1080"],
+    )
+    await browser.start()
+    stealth = Stealth(
+        chrome_runtime=True, navigator_webdriver=True, navigator_plugins=True, webgl_vendor=True,
+        webgl_vendor_override="Google Inc. (Intel)",
+        webgl_renderer_override="ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+    )
+    await browser._cdp_add_init_script(stealth.script_payload)
+    logger.info("[probate] Stealth fingerprint patches injected")
+
+    start_time = time.time()
+    agent = Agent(task=task, llm=_make_llm(), browser=browser, max_steps=60, use_judge=False)
+    try:
+        history = await agent.run()
+        if not history.is_done():
+            logger.warning("[probate] Browser agent did not complete within step budget")
+    except Exception as e:
+        logger.error("[probate] Browser agent failed: %s", e)
+        raise
+
+    await asyncio.sleep(5)
+    candidates = [
+        p for p in dest_dir.iterdir()
+        if p.stat().st_mtime >= start_time and p.suffix.lower() in (".xlsx", ".xls", ".csv")
+    ]
+    if not candidates:
+        raise FileNotFoundError(f"[probate] No downloaded filing found in {dest_dir}")
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _static_download(source: dict, target_date: str = None) -> Path:
+    """
+    Download a dated file directly from a URL pattern stored in source["url"].
+    The URL must contain the literal placeholder {date} which is replaced with YYYYMMDD.
+    Tries the target date first; if none given, walks back up to 7 days to find the
+    latest available file (skips empty files — 151-byte placeholder from weekends).
+    """
+    url_pattern = source.get("url", "")
+    if "{date}" not in url_pattern:
+        raise ValueError(f"static_download source url must contain {{date}}: {url_pattern!r}")
+
+    if target_date:
+        dates_to_try = [datetime.strptime(target_date.replace("-", ""), "%Y%m%d")]
+    else:
+        today = datetime.now().date()
+        dates_to_try = [
+            datetime.combine(today - timedelta(days=i), datetime.min.time())
+            for i in range(1, 8)
+        ]
+
+    RAW_PROBATE_DIR.mkdir(parents=True, exist_ok=True)
+    for dt in dates_to_try:
+        date_str = dt.strftime("%Y%m%d")
+        download_url = url_pattern.replace("{date}", date_str)
+        try:
+            resp = requests_get_with_retry(
+                download_url,
+                headers={"User-Agent": DEFAULT_USER_AGENT},
+                timeout=REQUEST_TIMEOUT_DEFAULT,
+            )
+            if resp.status_code != 200 or len(resp.content) <= 200:
+                logger.debug("[probate] %s — empty or missing (size=%d)", date_str, len(resp.content))
+                continue
+            out_path = RAW_PROBATE_DIR / f"ProbateFiling_{date_str}.csv"
+            out_path.write_bytes(resp.content)
+            logger.info("[probate] Downloaded %s (%.1f KB)", out_path.name, out_path.stat().st_size / 1024)
+            return out_path
+        except Exception as e:
+            logger.warning("[probate] Could not fetch %s: %s", download_url, e)
+
+    raise FileNotFoundError("[probate] No probate filing found in last 7 days")
+
 
 def download_latest_probate_filing(target_date: str = None, county_id: str = "hillsborough") -> Path:
-	"""
-	Download the latest probate filing CSV from Hillsborough County Clerk.
-	
-	This function fetches the directory listing from the probate filings page,
-	identifies the most recent filing based on date in the filename, and downloads
-	the corresponding CSV file to the raw data directory.
-	
-	Returns:
-		Path: Path object pointing to the downloaded CSV file
-		
-	Raises:
-		ValueError: If no probate filing files are found or no valid dates can be parsed
-		requests.HTTPError: If the HTTP request fails
-		requests.Timeout: If the request times out
-		
-	Example:
-		>>> csv_path = download_latest_probate_filing()
-		>>> print(f"Downloaded to: {csv_path}")
-	"""
-	county_cfg = get_county_config(county_id)
-	probate_url = county_cfg["urls"]["probate"]
-	clerk_base_url = county_cfg["urls"]["clerk_base"]
+    """
+    Download the latest probate filing from the county clerk.
+    static_download: direct HTTP GET from URL pattern in DB source config.
+    excel (browser-use): Pinellas combined civil filing downloaded via browser-use agent.
+    csv (default): Hillsborough requests-based directory listing fallback.
+    """
+    source = _get_probate_source(county_id)
+    scrape_mode = source.get("scrape_mode", "")
+    output_format = source.get("output_format", "csv")
 
-	logger.info(f"Fetching probate filings list from: {probate_url}")
+    if scrape_mode == "static_download":
+        logger.info("[probate] Using static_download mode for '%s'", county_id)
+        return _static_download(source, target_date)
 
-	try:
-		# Ensure download directory exists
-		RAW_PROBATE_DIR.mkdir(parents=True, exist_ok=True)
-		logger.debug(f"Ensured download directory exists: {RAW_PROBATE_DIR}")
+    if output_format == "excel":
+        logger.info("[probate] County '%s' uses browser download (output_format=excel)", county_id)
+        return asyncio.run(
+            _download_probate_via_browser(county_id, source, target_date, RAW_PROBATE_DIR)
+        )
 
-		# Fetch the directory listing page
-		response = requests_get_with_retry(
-			probate_url,
-			headers={"User-Agent": DEFAULT_USER_AGENT},
-			timeout=REQUEST_TIMEOUT_DEFAULT,
-		)
-		logger.debug(f"Successfully fetched directory listing (status code: {response.status_code})")
-		
-	except requests.Timeout as e:
-		logger.error(f"Request timed out while fetching probate filings list: {e}")
-		raise
-	except requests.HTTPError as e:
-		logger.error(f"HTTP error occurred while fetching probate filings list: {e}")
-		raise
-	except requests.RequestException as e:
-		logger.error(f"Request error occurred while fetching probate filings list: {e}")
-		raise
-	
-	try:
-		# Parse HTML to find CSV files
-		soup = BeautifulSoup(response.content, "html.parser")
-		file_links = []
-		
-		for link in soup.find_all("a", href=True):
-			href = link["href"]
-			# Look for ProbateFiling_YYYYMMDD.csv pattern
-			if "ProbateFiling_" in href and href.endswith(".csv"):
-				file_links.append(href)
-		
-		if not file_links:
-			logger.error("No probate filing CSV files found on the page")
-			raise ValueError("No probate filing CSV files found on the page")
-		
-		logger.info(f"Found {len(file_links)} probate filing files")
-		
-		# Extract dates from filenames and find the latest
-		date_pattern = re.compile(PROBATE_FILING_PATTERN)
-		files_with_dates = []
-		
-		for file_link in file_links:
-			match = date_pattern.search(file_link)
-			if match:
-				date_str = match.group(1)
-				try:
-					file_date = datetime.strptime(date_str, "%Y%m%d")
-					files_with_dates.append((file_date, file_link))
-				except ValueError:
-					logger.warning(f"Could not parse date from filename: {file_link}")
-					continue
-		
-		if not files_with_dates:
-			logger.error("No valid dated probate files found")
-			raise ValueError("No valid dated probate files found")
-		
-		# Pick target date if specified, otherwise latest
-		files_with_dates.sort(key=lambda x: x[0], reverse=True)
-		if target_date:
-			target_dt = datetime.strptime(target_date.replace("-", ""), "%Y%m%d")
-			match = [(d, f) for d, f in files_with_dates if d.date() == target_dt.date()]
-			if not match:
-				from src.utils.scraper_exceptions import ScraperNoDataError
-				raise ScraperNoDataError(f"No probate filing found for date: {target_date}")
-			latest_date, latest_file = match[0]
-		else:
-			latest_date, latest_file = files_with_dates[0]
-		
-		logger.info(f"Selected probate filing: {latest_file} (Date: {latest_date.strftime('%Y-%m-%d')})")
-		
-	except Exception as e:
-		logger.error(f"Error parsing HTML or extracting file information: {e}")
-		raise
-	
-	try:
-		# Construct full URL
-		if latest_file.startswith("/"):
-			download_url = f"{clerk_base_url}{latest_file}"
-		else:
-			download_url = f"{probate_url.rstrip('/')}/{latest_file}"
-		
-		# Download the file
-		filename = Path(latest_file).name
-		output_path = RAW_PROBATE_DIR / filename
-		
-		logger.info(f"Downloading probate file from: {download_url}")
-		file_response = requests_get_with_retry(
-			download_url,
-			headers={"User-Agent": DEFAULT_USER_AGENT},
-			timeout=REQUEST_TIMEOUT_LONG,
-		)
-		
-		# Save to disk
-		output_path.write_bytes(file_response.content)
-		file_size_kb = output_path.stat().st_size / 1024
-		logger.info(f"Downloaded to: {output_path} (Size: {file_size_kb:.2f} KB)")
-		
-		return output_path
-		
-	except requests.Timeout as e:
-		logger.error(f"Request timed out while downloading file: {e}")
-		raise
-	except requests.HTTPError as e:
-		logger.error(f"HTTP error occurred while downloading file: {e}")
-		raise
-	except IOError as e:
-		logger.error(f"I/O error occurred while writing file: {e}")
-		raise
-	except Exception as e:
-		logger.error(f"Unexpected error during file download: {e}")
-		raise
+    # Hillsborough / probate directory-listing path
+    county_cfg = get_county_config(county_id)
+    probate_url = county_cfg["urls"].get("probate") or PROBATE_FILINGS_URL
+    clerk_base_url = county_cfg["urls"].get("clerk_base") or HILLSCLERK_BASE_URL
+
+    logger.info("[probate] Fetching probate filings list from: %s", probate_url)
+    RAW_PROBATE_DIR.mkdir(parents=True, exist_ok=True)
+
+    response = requests_get_with_retry(
+        probate_url,
+        headers={"User-Agent": DEFAULT_USER_AGENT},
+        timeout=REQUEST_TIMEOUT_DEFAULT,
+    )
+    soup = BeautifulSoup(response.content, "html.parser")
+    file_links = [
+        link["href"]
+        for link in soup.find_all("a", href=True)
+        if "ProbateFiling_" in link["href"] and link["href"].endswith(".csv")
+    ]
+    if not file_links:
+        raise ValueError("[probate] No probate filing CSV files found on the page")
+
+    date_pattern = re.compile(PROBATE_FILING_PATTERN)
+    files_with_dates = []
+    for href in file_links:
+        m = date_pattern.search(href)
+        if m:
+            try:
+                files_with_dates.append((datetime.strptime(m.group(1), "%Y%m%d"), href))
+            except ValueError:
+                continue
+    if not files_with_dates:
+        raise ValueError("[probate] No valid dated probate files found")
+    files_with_dates.sort(key=lambda x: x[0], reverse=True)
+
+    if target_date:
+        target_dt = datetime.strptime(target_date.replace("-", ""), "%Y%m%d")
+        matches = [(d, f) for d, f in files_with_dates if d.date() == target_dt.date()]
+        if not matches:
+            from src.utils.scraper_exceptions import ScraperNoDataError
+            raise ScraperNoDataError(f"No probate filing found for date: {target_date}")
+        latest_date, latest_file = matches[0]
+    else:
+        latest_date, latest_file = files_with_dates[0]
+
+    logger.info("[probate] Selected: %s (%s)", latest_file, latest_date.strftime("%Y-%m-%d"))
+    download_url = (
+        f"{clerk_base_url}{latest_file}"
+        if latest_file.startswith("/")
+        else f"{probate_url.rstrip('/')}/{latest_file}"
+    )
+    output_path = RAW_PROBATE_DIR / Path(latest_file).name
+    file_response = requests_get_with_retry(
+        download_url,
+        headers={"User-Agent": DEFAULT_USER_AGENT},
+        timeout=REQUEST_TIMEOUT_LONG,
+    )
+    output_path.write_bytes(file_response.content)
+    logger.info("[probate] Downloaded to: %s (%.1f KB)", output_path, output_path.stat().st_size / 1024)
+    return output_path
 
 
-def process_probate_data(csv_path: Path) -> pd.DataFrame:
-	"""
-	Load and process the probate CSV file with multi-encoding support.
-	
-	This function attempts to load the CSV file using multiple encodings
-	(UTF-8, Latin-1, and CP1252) to handle various character sets that
-	may be present in the source data.
-	
-	Args:
-		csv_path: Path object pointing to the probate CSV file
-		
-	Returns:
-		pd.DataFrame: Loaded and parsed probate records as a DataFrame
-		
-	Raises:
-		ValueError: If the CSV cannot be read with any standard encoding
-		FileNotFoundError: If the specified file does not exist
-		pd.errors.ParserError: If the CSV structure is invalid
-		
-	Example:
-		>>> df = process_probate_data(Path("data/raw/probate/ProbateFiling_20260218.csv"))
-		>>> print(f"Loaded {len(df)} records")
-	"""
-	logger.info(f"Loading probate data from: {csv_path}")
-	
-	if not csv_path.exists():
-		logger.error(f"Probate CSV file not found: {csv_path}")
-		raise FileNotFoundError(f"Probate CSV file not found: {csv_path}")
-	
-	# Try multiple encodings
-	encodings_to_try = ["utf-8", "latin1", "cp1252"]
-	df = None
-	
-	for encoding in encodings_to_try:
-		try:
-			df = pd.read_csv(csv_path, encoding=encoding)
-			logger.info(f"Successfully loaded CSV with {encoding} encoding")
-			break
-		except (UnicodeDecodeError, pd.errors.ParserError) as e:
-			logger.debug(f"Failed to load with {encoding} encoding: {e}")
-			continue
-	
-	if df is None:
-		error_msg = f"Could not read CSV with any standard encoding: {csv_path}"
-		logger.error(error_msg)
-		raise ValueError(error_msg)
-	
-	logger.info(f"Loaded {len(df)} probate records")
-	logger.debug(f"DataFrame columns: {list(df.columns)}")
-	
-	return df
+def process_probate_data(file_path: Path, county_id: str = "hillsborough") -> pd.DataFrame:
+    """
+    Load the probate filing (CSV or Excel) and return probate rows.
+    For Hillsborough: the file is already probate-only (no filtering needed).
+    For Pinellas (Excel, combined civil filing): filters by style_col using
+    PROBATE_CASE_PATTERNS.
+    """
+    source = _get_probate_source(county_id)
+    output_format = source.get("output_format", "csv")
+    style_col = source.get("style_col")
+
+    if output_format == "excel" or file_path.suffix.lower() in (".xlsx", ".xls"):
+        logger.info("[probate] Reading Excel civil filing: %s", file_path)
+        df = pd.read_excel(file_path)
+    else:
+        encodings = ["utf-8", "latin1", "cp1252"]
+        df = None
+        for enc in encodings:
+            try:
+                df = pd.read_csv(file_path, encoding=enc)
+                break
+            except (UnicodeDecodeError, pd.errors.ParserError):
+                continue
+        if df is None:
+            raise ValueError(f"[probate] Could not read file with any standard encoding: {file_path}")
+
+    logger.info("[probate] Loaded %d rows from %s", len(df), file_path.name)
+
+    # For counties with a combined civil filing (style_col present), filter for probate
+    if style_col and style_col in df.columns:
+        pattern = "|".join(re.escape(p) for p in PROBATE_CASE_PATTERNS)
+        mask = df[style_col].str.contains(pattern, case=False, na=False)
+        df = df[mask].copy()
+        logger.info("[probate] Filtered %d probate rows via '%s'", len(df), style_col)
+    elif style_col:
+        logger.warning("[probate] style_col '%s' not found — columns: %s", style_col, list(df.columns))
+
+    return df
 
 
 def save_processed_probate(df: pd.DataFrame, output_filename: str = "probate_leads.csv") -> Path:
-	"""
-	Save processed probate data to the output directory with deduplication.
-	
-	This function creates the processed data directory if it doesn't exist,
-	deduplicates against existing CSV files, and saves the DataFrame as a CSV
-	file with the specified filename.
-	
-	Args:
-		df: DataFrame containing processed probate records
-		output_filename: Name for the output CSV file (default: "probate_leads.csv")
-		
-	Returns:
-		Path: Path object pointing to the saved deduplicated CSV file
-		
-	Raises:
-		IOError: If the file cannot be written to disk
-		PermissionError: If there are insufficient permissions to write the file
-		
-	Example:
-		>>> output_path = save_processed_probate(df, "probate_leads_2026.csv")
-		>>> print(f"Saved to: {output_path}")
-	"""
-	try:
-		RAW_PROBATE_DIR.mkdir(parents=True, exist_ok=True)
-		logger.debug(f"Ensured probate directory exists: {RAW_PROBATE_DIR}")
-		
-		# Check DB for existing probate cases (deduplicate BEFORE CSV save)
-		logger.info("=" * 60)
-		logger.info("DB DEDUPLICATION: Checking for existing probate cases")
-		logger.info("=" * 60)
-		
-		# Normalize column name: CSV uses 'CaseNumber' but deduplicator expects 'Case Number'
-		if 'CaseNumber' in df.columns and 'Case Number' not in df.columns:
-			df = df.rename(columns={'CaseNumber': 'Case Number'})
+    """Save processed probate data with dedup against DB."""
+    RAW_PROBATE_DIR.mkdir(parents=True, exist_ok=True)
 
-		initial_count = len(df)
-		df_new = filter_new_records(df, 'probate', record_type='Probate')
-		
-		if df_new.empty:
-			logger.info("✓ All probate cases already exist in database - nothing new")
-			return None
-		
-		# Save only NEW probate cases
-		new_dir = RAW_PROBATE_DIR / "new"
-		new_dir.mkdir(parents=True, exist_ok=True)
-		final_file = new_dir / output_filename
-		
-		df_new.to_csv(final_file, index=False)
-		logger.info(f"Saved {len(df_new)} NEW probate cases to {final_file}")
-		logger.info(f"Filtered {initial_count - len(df_new)} existing records")
-		
-		return final_file
+    if "CaseNumber" in df.columns and "Case Number" not in df.columns:
+        df = df.rename(columns={"CaseNumber": "Case Number"})
 
-		logger.error(f"I/O error while saving file: {e}")
-		raise
-	except Exception as e:
-		logger.error(f"Unexpected error while saving processed data: {e}")
-		raise
+    initial_count = len(df)
+    df_new = filter_new_records(df, "probate", record_type="Probate")
+
+    if df_new.empty:
+        logger.info("[probate] All probate cases already in DB — nothing new")
+        return None
+
+    new_dir = RAW_PROBATE_DIR / "new"
+    new_dir.mkdir(parents=True, exist_ok=True)
+    final_file = new_dir / output_filename
+    df_new.to_csv(final_file, index=False)
+    logger.info("[probate] Saved %d new probate cases (filtered %d existing)", len(df_new), initial_count - len(df_new))
+    return final_file
 
 
 def run_probate_pipeline(target_date: str = None, county_id: str = "hillsborough") -> bool:
-	"""
-	Execute the complete probate data collection pipeline.
+    """Full pipeline: download → process → dedup → save. Returns True on success."""
+    t0 = time.monotonic()
+    county_cfg = get_county_config(county_id)
+    logger.info("=" * 60)
+    logger.info("%s PROBATE FILINGS — DATA COLLECTION", county_cfg["display_name"].upper())
+    logger.info("=" * 60)
 
-	This function orchestrates the entire workflow:
-		1. Downloads the latest probate filing CSV
-		2. Processes and loads the data
-		3. Saves the processed data to the output directory
+    try:
+        file_path = download_latest_probate_filing(target_date=target_date, county_id=county_id)
+        df = process_probate_data(file_path, county_id=county_id)
+        output_path = save_processed_probate(df)
 
-	Returns:
-		bool: True if the pipeline executed successfully, False otherwise.
-	"""
-	t0 = time.monotonic()
-	county_cfg = get_county_config(county_id)
-	logger.info("=" * 60)
-	logger.info(f"{county_cfg['display_name'].upper()} PROBATE FILINGS - DATA COLLECTION")
-	logger.info("=" * 60)
+        logger.info("=" * 60)
+        logger.info("PROBATE PIPELINE COMPLETE — %d records, output: %s", len(df), output_path)
+        logger.info("=" * 60)
 
-	try:
-		# Step 1: Download latest probate filing
-		logger.info("Step 1: Downloading latest probate filing")
-		csv_path = download_latest_probate_filing(target_date=target_date, county_id=county_id)
+        try:
+            from src.utils.scraper_db_helper import record_scraper_stats
+            record_scraper_stats(
+                source_type="probate", total_scraped=len(df), matched=0, unmatched=0, skipped=0,
+                run_success=True, duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id,
+            )
+        except Exception as _se:
+            logger.warning("[probate] Could not record scraper stats: %s", _se)
 
-		# Step 2: Process the data
-		logger.info("Step 2: Processing probate data")
-		df = process_probate_data(csv_path)
+        return True
 
-		# Step 3: Save processed data
-		logger.info("Step 3: Saving processed data")
-		output_path = save_processed_probate(df)
-
-		logger.info("=" * 60)
-		logger.info("PROBATE PIPELINE COMPLETE")
-		logger.info("=" * 60)
-		logger.info(f"Total records processed: {len(df)}")
-		logger.info(f"Output file location: {output_path}")
-
-		try:
-			from src.utils.scraper_db_helper import record_scraper_stats
-			record_scraper_stats(source_type='probate', total_scraped=len(df), matched=0, unmatched=0, skipped=0, run_success=True, duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id)
-		except Exception as _se:
-			logger.warning("Could not record scraper stats: %s", _se)
-
-		return True
-
-	except Exception as e:
-		logger.error(f"Probate pipeline failed with error: {e}")
-		logger.debug(traceback.format_exc())
-		try:
-			from src.utils.scraper_db_helper import record_scraper_stats
-			record_scraper_stats(source_type='probate', total_scraped=0, matched=0, unmatched=0, skipped=0, run_success=False, error_message=str(e)[:500], duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id)
-		except Exception as _se:
-			logger.warning("Could not record scraper stats: %s", _se)
-		return False
+    except Exception as e:
+        logger.error("[probate] Pipeline failed: %s", e)
+        logger.debug(traceback.format_exc())
+        try:
+            from src.utils.scraper_db_helper import record_scraper_stats
+            record_scraper_stats(
+                source_type="probate", total_scraped=0, matched=0, unmatched=0, skipped=0,
+                run_success=False, error_message=str(e)[:500],
+                duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id,
+            )
+        except Exception as _se:
+            logger.warning("[probate] Could not record scraper stats: %s", _se)
+        return False
 
 
 if __name__ == "__main__":
-	import sys
-	import argparse
-	from src.utils.scraper_db_helper import load_scraped_data_to_db, add_load_to_db_arg
-	
-	parser = argparse.ArgumentParser(description="Scrape Hillsborough County probate filings")
-	parser.add_argument("--date", type=str, default=None, help="Target date YYYY-MM-DD (default: latest)")
-	parser.add_argument("--county-id", dest="county_id", default="hillsborough", help="County identifier (default: hillsborough)")
-	add_load_to_db_arg(parser)
-	args = parser.parse_args()
+    import sys
+    import argparse
+    from src.utils.scraper_db_helper import load_scraped_data_to_db, add_load_to_db_arg
 
-	success = run_probate_pipeline(target_date=args.date, county_id=args.county_id)
+    parser = argparse.ArgumentParser(description="Scrape county probate filings")
+    parser.add_argument("--date", type=str, default=None, help="Target date YYYY-MM-DD (default: latest)")
+    parser.add_argument("--county-id", dest="county_id", default="hillsborough",
+                        help="County identifier (default: hillsborough)")
+    add_load_to_db_arg(parser)
+    args = parser.parse_args()
 
-	if success and args.load_to_db:
-		try:
-			new_dir = RAW_PROBATE_DIR / "new"
-			csv_files = sorted(new_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
-			if csv_files:
-				csv_to_load = csv_files[0]
-				logger.info(f"Loading to database: {csv_to_load}")
-				load_scraped_data_to_db('probate', csv_to_load, destination_dir=RAW_PROBATE_DIR)
-			else:
-				logger.warning("No new probate records to load - nothing new today")
-		except Exception as e:
-			logger.error(f"Failed to load data to database: {e}")
-			sys.exit(1)
-	elif args.load_to_db:
-		logger.warning("Skipping database load due to scraping failure")
+    success = run_probate_pipeline(target_date=args.date, county_id=args.county_id)
 
-	sys.exit(0 if success else 1)
+    if success and args.load_to_db:
+        try:
+            new_dir = RAW_PROBATE_DIR / "new"
+            csv_files = sorted(new_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if csv_files:
+                load_scraped_data_to_db(
+                    "probate", csv_files[0],
+                    destination_dir=RAW_PROBATE_DIR, county_id=args.county_id,
+                )
+            else:
+                logger.warning("[probate] No new probate records to load")
+        except Exception as e:
+            logger.error("[probate] DB load failed: %s", e)
+            sys.exit(1)
+    elif args.load_to_db:
+        logger.warning("[probate] Skipping database load due to scraping failure")
+
+    sys.exit(0 if success else 1)

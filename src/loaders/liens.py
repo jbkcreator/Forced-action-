@@ -18,15 +18,31 @@ class LienLoader(BaseLoader):
 
     _LLM_MAX_CALLS = 50  # higher budget — liens are highest-volume loader
 
-    # Keywords that identify the governmental/institutional filer side of a code lien.
-    # Mirrors the detection logic in lien_engine.py so both modules agree on party roles.
+    # Hillsborough defaults — overridden per-county at init time.
     _CITY_FILER_KEYWORDS = frozenset({'CITY OF TAMPA', 'HILLSBOROUGH COUNTY'})
-
-    # Maps code-lien doc-type key → required Property.city value for geographic validation.
-    # TCL (Tampa Code Liens) can only apply to properties inside Tampa city limits.
-    # CCL (County Code Liens) apply to unincorporated Hillsborough — no single city value,
-    # so None means "skip city filter".
     _CODE_LIEN_CITY_MAP = {'TCL': 'TAMPA', 'CCL': None}
+
+    def __init__(self, session, county_id: str = "hillsborough"):
+        super().__init__(session, county_id)
+        try:
+            from src.utils.county_config import get_county_config
+            county_cfg = get_county_config(county_id)
+        except Exception:
+            county_cfg = {}
+
+        raw_keywords = county_cfg.get("city_filer_keywords") or []
+        self._city_filer_keywords: frozenset = (
+            frozenset(kw.upper() for kw in raw_keywords)
+            if raw_keywords else self._CITY_FILER_KEYWORDS
+        )
+
+        # code_lien_type_map shape: {type_code: required_city}
+        # None (absent from config) → fall back to class defaults.
+        # {} (explicitly empty, e.g. Pinellas) → use as-is (no typed codes).
+        raw_type_map = county_cfg.get("code_lien_type_map")
+        self._code_lien_city_map: dict = (
+            self._CODE_LIEN_CITY_MAP if raw_type_map is None else raw_type_map
+        )
 
     # ──────────────────────────────────────────────────────────────────────────
     # Private helpers
@@ -41,7 +57,7 @@ class LienLoader(BaseLoader):
                 return False
         except (TypeError, ValueError):
             pass
-        return any(kw in str(party_val).upper() for kw in self._CITY_FILER_KEYWORDS)
+        return any(kw in str(party_val).upper() for kw in self._city_filer_keywords)
 
     def _find_code_lien_owner(
         self,
@@ -74,7 +90,7 @@ class LienLoader(BaseLoader):
         property_record, score = match_result
 
         # Geographic validation — check Property.city against the expected jurisdiction
-        for key, required_city in self._CODE_LIEN_CITY_MAP.items():
+        for key, required_city in self._code_lien_city_map.items():
             if key in doc_type_str.upper():
                 if required_city is None:
                     # CCL: unincorporated county — skip city filter
@@ -176,8 +192,13 @@ class LienLoader(BaseLoader):
             owner_name_for_match = None  # set in code-lien branch; used by LLM verifier
 
             doc_type_str = str(row.get('document_type', ''))
-            is_tax_lien = 'TAX LIEN' in doc_type_str.upper()
-            is_code_lien = 'TCL' in doc_type_str.upper() or 'CCL' in doc_type_str.upper()
+            doc_type_upper = doc_type_str.upper()
+            is_tax_lien = 'TAX LIEN' in doc_type_upper
+            # Matches typed codes (TCL, CCL, …) and generic "CODE LIEN" (Pinellas)
+            is_code_lien = (
+                any(code in doc_type_upper for code in self._code_lien_city_map)
+                or 'CODE LIEN' in doc_type_upper
+            )
             name_threshold = 90 if is_code_lien else 75
 
             # Strategy A: Legal description (lot/block/subdivision → parcel)
@@ -275,7 +296,7 @@ class LienLoader(BaseLoader):
                 # Mechanics Liens (ML): Grantor = contractor/creditor, Grantee = property owner.
                 # Try Grantee first so we match against the actual owner, not the contractor.
                 # All other liens (judgment, HOA, etc.): Grantor = debtor/owner — try Grantor first.
-                is_mechanics_lien = 'ML' in doc_type_str or 'MECHANIC' in doc_type_str
+                is_mechanics_lien = 'ML' in doc_type_upper or 'MECHANIC' in doc_type_upper
                 first_field, second_field = (
                     ('Grantee', 'Grantor') if is_mechanics_lien else ('Grantor', 'Grantee')
                 )
@@ -303,9 +324,10 @@ class LienLoader(BaseLoader):
             # the party roles. Geographic validation stays in _find_code_lien_owner().
             if property_record is not None and match_score is not None and match_method == 'owner_name':
                 lien_rt = (
-                    'lien_tcl' if 'TCL' in doc_type_str.upper() else
-                    'lien_ccl' if 'CCL' in doc_type_str.upper() else
-                    'lien_tl'  if is_tax_lien else
+                    'lien_tcl'  if 'TCL' in doc_type_upper else
+                    'lien_ccl'  if 'CCL' in doc_type_upper else
+                    'lien_code' if 'CODE LIEN' in doc_type_upper else
+                    'lien_tl'   if is_tax_lien else
                     'lien_ml'
                 )
                 property_record, llm_method = self._apply_llm_verification(
@@ -321,7 +343,7 @@ class LienLoader(BaseLoader):
             if property_record:
                 try:
                     # Determine record type
-                    if 'JUDGMENT' in doc_type_str.upper() or 'CERTIFIED' in doc_type_str.upper():
+                    if 'JUDGMENT' in doc_type_upper or 'CERTIFIED' in doc_type_upper:
                         record_type = 'Judgment'
                     else:
                         record_type = 'Lien'

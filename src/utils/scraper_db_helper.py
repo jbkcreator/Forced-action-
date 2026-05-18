@@ -155,7 +155,8 @@ def load_scraped_data_to_db(
     csv_path: Path,
     destination_dir: Optional[Path] = None,
     skip_duplicates: bool = True,
-    sample_mode: bool = False
+    sample_mode: bool = False,
+    county_id: str = "hillsborough",
 ) -> Tuple[int, int, int]:
     """
     Load scraped CSV data into database using appropriate loader.
@@ -191,7 +192,7 @@ def load_scraped_data_to_db(
     try:
         with get_db_context() as session:
             loader_class = LOADER_MAP[data_type]
-            loader = loader_class(session)
+            loader = loader_class(session, county_id)
 
             loader_kwargs = {'skip_duplicates': skip_duplicates}
             if sample_mode:
@@ -263,7 +264,7 @@ def load_scraped_data_to_db(
                     from src.services.cds_engine import MultiVerticalScorer
                     with get_db_context() as score_session:
                         scorer = MultiVerticalScorer(score_session)
-                        scorer.score_properties_by_ids(affected_ids, save_to_db=True)
+                        scorer.score_properties_by_ids(affected_ids, save_to_db=True, county_id=county_id)
                         score_session.commit()
                     scored = len(affected_ids)
                     logger.info("✓ CDS rescore completed")

@@ -1,5 +1,10 @@
 """
 Master property loader - inserts properties with owners and financials.
+
+Column normalization is handled by ColumnMapper (src/loaders/column_mapper.py).
+On the first load for a new county the mapper calls the LLM to propose a mapping,
+saves it as pending for admin review, and applies it optimistically.  On subsequent
+loads the approved mapping is used directly (no LLM call).
 """
 
 import logging
@@ -95,36 +100,95 @@ class MasterPropertyLoader(BaseLoader):
     ) -> Tuple[int, int, int]:
         """
         Load data from CSV file with validation, processing in chunks.
-        
+
         Args:
             csv_path: Path to CSV file
             skip_duplicates: Skip existing records
             chunksize: Number of rows to read per chunk from CSV
-            
+
         Returns:
             Tuple of (inserted, 0, skipped)
         """
         logger.info(f"Loading data from: {csv_path}")
-        
+
+        # Resolve column mapping for this county via ColumnMapper middleware.
+        # Peek at the first chunk to get column names → look up approved mapping or LLM-map.
+        col_mapping: Optional[dict] = self._resolve_column_mapping(csv_path)
+
+        # Pre-load all existing parcel_ids for this county into memory so we can
+        # skip duplicates with a set lookup instead of a per-row DB query.
+        # For a 450k-row county this saves ~450k SELECT round-trips.
+        existing_ids: set = set()
+        if skip_duplicates:
+            logger.info(f"Pre-loading existing parcel IDs for {self.county_id}...")
+            rows = self.session.query(Property.parcel_id).filter(
+                Property.county_id == self.county_id
+            ).all()
+            existing_ids = {r[0] for r in rows if r[0]}
+            logger.info(f"  Found {len(existing_ids):,} existing parcels")
+
         total_inserted = 0
         total_unmatched = 0
         total_skipped = 0
-        
-        # Process CSV in chunks to handle large files efficiently
+
         chunk_num = 0
-        for chunk in pd.read_csv(csv_path, dtype={'folio': str}, chunksize=chunksize):
+        for chunk in pd.read_csv(csv_path, dtype=str, chunksize=chunksize):
             chunk_num += 1
-            # Normalize column names to uppercase for consistency
             chunk.columns = chunk.columns.str.upper()
+            if col_mapping:
+                from src.loaders.column_mapper import ColumnMapper
+                chunk = ColumnMapper.apply(chunk, col_mapping)
             logger.info(f"Processing chunk {chunk_num} ({len(chunk)} rows)")
-            
-            inserted, unmatched, skipped = self.load_from_dataframe(chunk, skip_duplicates, batch_size=1000)
+
+            inserted, unmatched, skipped = self.load_from_dataframe(
+                chunk, skip_duplicates=False, batch_size=1000,
+                _existing_ids=existing_ids,
+            )
             total_inserted += inserted
             total_unmatched += unmatched
             total_skipped += skipped
-        
+
         logger.info(f"CSV loading complete: {total_inserted} inserted, {total_skipped} skipped")
         return total_inserted, total_unmatched, total_skipped
+
+    def _resolve_column_mapping(self, csv_path: str) -> Optional[dict]:
+        """
+        Peek at the CSV header, look up the source_id for this county's master_data source,
+        and return a mapping dict via ColumnMapper.  Returns None if source is not in DB
+        (Hillsborough canonical pass-through) or if mapper raises SkipMapping.
+        """
+        from src.loaders.column_mapper import ColumnMapper, SkipMapping, NeedsMappingError
+        from src.core.models import CountySource
+
+        # Look up source_id
+        src = (
+            self.session.query(CountySource)
+            .filter_by(county_id=self.county_id, signal_type="master_data")
+            .first()
+        )
+        if src is None:
+            logger.warning(
+                "[MasterLoader] No county_sources row for %s/master_data — "
+                "skipping column mapping (assuming columns already canonical)",
+                self.county_id,
+            )
+            return None
+
+        # Read just the first 5 rows to give the LLM sample data
+        sample_df = pd.read_csv(csv_path, dtype=str, nrows=5)
+        sample_df.columns = sample_df.columns.str.upper()
+
+        try:
+            mapper = ColumnMapper()
+            return mapper.get_or_create("master_data", src.id, sample_df)
+        except SkipMapping:
+            return None
+        except NeedsMappingError as e:
+            logger.error(
+                "[MasterLoader] Column mapping required but LLM failed — "
+                "create a mapping via admin UI before loading. Error: %s", e
+            )
+            raise
 
         
     def load_from_dataframe(
@@ -132,28 +196,37 @@ class MasterPropertyLoader(BaseLoader):
         df: pd.DataFrame,
         skip_duplicates: bool = True,
         batch_size: int = 1000,
-        county_id: str = 'hillsborough',
+        _existing_ids: Optional[set] = None,
     ) -> Tuple[int, int, int]:
         """
         Load master properties from DataFrame with validation.
-        
+
         Skips rows with invalid/missing critical fields (FOLIO, OWNER).
         Uses None for invalid non-critical fields.
-        
+
         Args:
             df: DataFrame with property data
-            skip_duplicates: Skip existing properties
+            skip_duplicates: Skip existing properties (per-row DB check — slow for large files;
+                             prefer passing _existing_ids from load_from_csv instead)
             batch_size: Number of records to commit per batch
-            
+            _existing_ids: Optional pre-loaded set of parcel_ids already in DB.
+                           When provided, skip_duplicates is ignored and this set is used.
+
         Returns:
             Tuple of (inserted, 0, skipped)
         """
         logger.info(f"Loading {len(df)} master properties in batches of {batch_size}")
-        
+
+        from src.utils.county_config import get_county_config as _gc
+        _county_cfg = _gc(self.county_id)
+
         inserted = 0
         skipped = 0
         skip_reasons = {'no_folio': 0, 'no_owner': 0, 'invalid_owner': 0, 'duplicate': 0, 'error': 0}
-        
+        # Use the caller-supplied set directly (mutated in-place so cross-chunk dedup works)
+        # or create an empty set for standalone calls.
+        _seen_ids: set = _existing_ids if _existing_ids is not None else set()
+
         for idx, row in df.iterrows():
             # FOLIO is critical - skip if missing/invalid
             parcel_id = str(row.get('FOLIO', '')).strip()
@@ -161,14 +234,14 @@ class MasterPropertyLoader(BaseLoader):
                 skip_reasons['no_folio'] += 1
                 skipped += 1
                 continue
-            
+
             # OWNER is critical - skip if looks like an address or clearly wrong
             owner_name = str(row.get('OWNER', '')).strip()
             if not owner_name or owner_name == 'nan':
                 skip_reasons['no_owner'] += 1
                 skipped += 1
                 continue
-            
+
             # Skip if owner name looks invalid:
             # - Starts with digits (likely an address)
             # - Is a single word with no spaces and all caps (likely a city name like "ODESSA")
@@ -179,13 +252,17 @@ class MasterPropertyLoader(BaseLoader):
                 skip_reasons['invalid_owner'] += 1
                 skipped += 1
                 continue
-            
-            # Check for duplicates
-            if skip_duplicates and self.check_duplicate(Property, {'parcel_id': parcel_id}):
+
+            # Dedup: O(1) set lookup — either pre-loaded from DB or per-row DB query fallback.
+            if parcel_id in _seen_ids:
                 skip_reasons['duplicate'] += 1
                 skipped += 1
                 continue
-            
+            if _existing_ids is None and skip_duplicates and self.check_duplicate(Property, {'parcel_id': parcel_id}):
+                skip_reasons['duplicate'] += 1
+                skipped += 1
+                continue
+
             try:
                 # Safely extract fields - use None if invalid
                 site_zip = self._is_valid_zip(row.get('SITE_ZIP'))
@@ -213,8 +290,6 @@ class MasterPropertyLoader(BaseLoader):
                 legal_desc = ' '.join(legal_parts) if legal_parts else None
                 
                 # Create property
-                from src.utils.county_config import get_county as _gc
-                _county_cfg = _gc(county_id)
                 # Year built — try common HCPA column names
                 yr_raw = row.get('YR_BLT') or row.get('YEAR_BUILT') or row.get('YR_BUILT')
                 year_built = None
@@ -230,10 +305,10 @@ class MasterPropertyLoader(BaseLoader):
                     parcel_id=parcel_id,
                     address=site_addr,
                     city=site_city,
-                    state=_county_cfg.get("state", "FL"),
+                    state="FL",
                     zip=site_zip,
-                    jurisdiction=_county_cfg["name"],
-                    county_id=county_id,
+                    jurisdiction=_county_cfg.get("display_name", self.county_id),
+                    county_id=self.county_id,
                     property_type=prop_type,
                     legal_description=legal_desc,
                     lot_size=self.parse_amount(row.get('ACREAGE')),
@@ -302,20 +377,20 @@ class MasterPropertyLoader(BaseLoader):
                 )
                 
                 self.session.add_all([property_record, owner_record, financial_record])
+                _seen_ids.add(parcel_id)
                 inserted += 1
-                
+
                 # Commit in batches to avoid memory issues
                 if inserted % batch_size == 0:
                     self.session.commit()
                     logger.info(f"Progress: {inserted} inserted, {skipped} skipped")
-                
+
             except Exception as e:
-                logger.error(f"Error inserting property {parcel_id}: {e}")
-                logger.debug(f"Row data: {dict(row)}")
+                logger.warning(f"Skipped property {parcel_id}: {e}")
                 skip_reasons['error'] += 1
                 skipped += 1
                 continue
-        
+
         # Commit any remaining records
         if inserted % batch_size != 0:
             self.session.commit()

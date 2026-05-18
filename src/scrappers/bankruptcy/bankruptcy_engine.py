@@ -33,8 +33,8 @@ from config.constants import (
 	RAW_BANKRUPTCY_DIR,
 	API_USER_AGENT,
 	REQUEST_TIMEOUT_DEFAULT,
-	get_county_config,
 )
+from src.utils.county_config import get_county_config
 from src.utils.logger import setup_logging, get_logger
 from src.utils.db_deduplicator import filter_new_records
 

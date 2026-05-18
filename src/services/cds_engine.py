@@ -1153,7 +1153,11 @@ class MultiVerticalScorer:
 
     # ── Batch scoring ──────────────────────────────────────────────────────────
 
-    def _load_properties(self, property_ids: Optional[List[int]] = None) -> List[Property]:
+    def _load_properties(
+        self,
+        property_ids: Optional[List[int]] = None,
+        county_id: Optional[str] = None,
+    ) -> List[Property]:
         """Load properties with all signal relationships eager-loaded."""
         try:
             q = self.session.query(Property).options(
@@ -1170,6 +1174,8 @@ class MultiVerticalScorer:
             )
             if property_ids:
                 q = q.filter(Property.id.in_(property_ids))
+            if county_id:
+                q = q.filter(Property.county_id == county_id)
             return q.all()
         except OperationalError as exc:
             logger.error(
@@ -1182,13 +1188,15 @@ class MultiVerticalScorer:
         self,
         save_to_db: bool = True,
         property_ids: Optional[List[int]] = None,
+        county_id: Optional[str] = None,
     ) -> List[Dict]:
         """
-        Score all properties (or only specific IDs).
+        Score all properties (or only specific IDs / county).
 
         Args:
             save_to_db:   Persist scores to the database.
             property_ids: If provided, only rescore these property IDs.
+            county_id:    If provided, restrict scoring to this county.
 
         Returns:
             List of score dicts for successfully scored properties.
@@ -1196,9 +1204,9 @@ class MultiVerticalScorer:
         scoring_run_id = int(datetime.now(timezone.utc).timestamp())
         logger.info("Scoring run ID: %d", scoring_run_id)
 
-        label = f"{len(property_ids)} properties" if property_ids else "all properties"
+        label = f"{len(property_ids)} properties" if property_ids else f"all properties{' (' + county_id + ')' if county_id else ''}"
         logger.info("Loading %s for scoring...", label)
-        properties = self._load_properties(property_ids)
+        properties = self._load_properties(property_ids, county_id=county_id)
         logger.info("Scoring %d properties across 6 verticals...", len(properties))
 
         scores: List[Dict] = []
@@ -1310,6 +1318,7 @@ class MultiVerticalScorer:
                     leads_qualified=qualified_count,
                     leads_upgraded=upgraded_count,
                     tier_counts=tier_counts,
+                    county_id=county_id or "hillsborough",
                 )
             except Exception as stats_err:
                 logger.warning("⚠ Could not record platform daily stats (non-critical): %s", stats_err)
@@ -1414,12 +1423,17 @@ class MultiVerticalScorer:
             properties_scored, leads_new, leads_updated, leads_qualified, leads_upgraded,
         )
 
-    def score_properties_by_ids(self, property_ids: List[int], save_to_db: bool = True) -> List[Dict]:
+    def score_properties_by_ids(
+        self,
+        property_ids: List[int],
+        save_to_db: bool = True,
+        county_id: Optional[str] = None,
+    ) -> List[Dict]:
         """
         Fast path: rescore only specific properties.
         Used by the ingestion-time hook after a scraper run.
         """
-        return self.score_all_properties(save_to_db=save_to_db, property_ids=property_ids)
+        return self.score_all_properties(save_to_db=save_to_db, property_ids=property_ids, county_id=county_id)
 
     # ── Query helpers ──────────────────────────────────────────────────────────
 
@@ -1513,6 +1527,13 @@ def main():
         help="Only rescore properties with new signal data since their last score",
     )
     parser.add_argument(
+        "--county-id",
+        dest="county_id",
+        default=None,
+        metavar="COUNTY",
+        help="Restrict scoring to a single county (e.g. hillsborough, pinellas). Default: all counties",
+    )
+    parser.add_argument(
         "--no-ghl",
         action="store_true",
         help="Skip GHL CRM push (useful for bulk rescores to avoid rate limits)",
@@ -1560,11 +1581,12 @@ def main():
             log.info("No properties need rescoring — all up to date")
             sys.exit(0)
 
+    county_label = f" [{args.county_id}]" if args.county_id else ""
     run_label = (
         f"property {args.property_id}" if args.property_id
-        else f"{len(property_ids)} properties (new signals)" if args.rescore_new_signals
-        else "all properties (rescore)" if args.rescore_all
-        else "daily run (all properties)"
+        else f"{len(property_ids)} properties (new signals){county_label}" if args.rescore_new_signals
+        else f"all properties (rescore){county_label}" if args.rescore_all
+        else f"daily run (all properties){county_label}"
     )
 
     log.info("=" * 60)
@@ -1579,7 +1601,11 @@ def main():
     try:
         with get_db_context() as session:
             scorer = MultiVerticalScorer(session)
-            scores = scorer.score_all_properties(save_to_db=True, property_ids=property_ids)
+            scores = scorer.score_all_properties(
+                save_to_db=True,
+                property_ids=property_ids,
+                county_id=args.county_id,
+            )
             session.commit()
 
     except KeyboardInterrupt:
