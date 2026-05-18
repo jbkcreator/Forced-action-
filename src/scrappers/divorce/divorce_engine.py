@@ -64,10 +64,44 @@ def _make_llm():
     )
 
 
-def _get_court_source(county_id: str) -> dict:
-    """Return the court_records source dict for county_id (empty dict if absent)."""
+def _get_divorce_source(county_id: str) -> dict:
+    """Return the divorce or court_records source dict for county_id (empty dict if absent)."""
     cfg = _get_county(county_id)
-    return cfg.get("sources", {}).get("court_records", {})
+    sources = cfg.get("sources", {})
+    return sources.get("divorce") or sources.get("court_records") or {}
+
+
+def _static_download(source: dict, target_date: str | None = None) -> Path:
+    """Direct HTTP download using the {date} URL pattern (no browser needed)."""
+    url_pattern = source.get("url", "")
+    if "{date}" not in url_pattern:
+        raise ValueError(f"[divorce] static_download URL must contain {{date}}: {url_pattern!r}")
+
+    RAW_DIVORCE_DIR.mkdir(parents=True, exist_ok=True)
+
+    if target_date:
+        dates_to_try = [datetime.strptime(target_date.replace("-", ""), "%Y%m%d")]
+    else:
+        today = datetime.now()
+        dates_to_try = [today - timedelta(days=i) for i in range(1, 8)]
+
+    for dt in dates_to_try:
+        date_str = dt.strftime("%Y%m%d")
+        download_url = url_pattern.replace("{date}", date_str)
+        resp = requests_get_with_retry(
+            download_url,
+            headers={"User-Agent": DEFAULT_USER_AGENT},
+            timeout=REQUEST_TIMEOUT_DEFAULT,
+        )
+        if resp.status_code != 200 or len(resp.content) <= 200:
+            logger.debug("[divorce] Skipping %s (status=%s size=%s)", date_str, resp.status_code, len(resp.content))
+            continue
+        out_path = RAW_DIVORCE_DIR / f"CivilFiling_{date_str}.csv"
+        out_path.write_bytes(resp.content)
+        logger.info("[divorce] Downloaded CivilFiling_%s.csv (%.1f KB)", date_str, len(resp.content) / 1024)
+        return out_path
+
+    raise FileNotFoundError("[divorce] No civil filing found in last 7 days")
 
 
 async def _download_civil_filing_browser(
@@ -147,11 +181,17 @@ async def _download_civil_filing_browser(
 def download_latest_civil_filing(target_date: str = None, county_id: str = "hillsborough") -> Path:
     """
     Download the latest civil filing from the county clerk.
-    Hillsborough: requests-based directory listing → CSV.
-    Other counties (output_format=excel, e.g. Pinellas): browser-use → Excel.
+    static_download: direct HTTP GET via {date} URL pattern.
+    excel: browser-use agent (e.g. Pinellas).
+    Default: requests-based directory listing → CSV.
     """
-    source = _get_court_source(county_id)
+    source = _get_divorce_source(county_id)
+    scrape_mode = source.get("scrape_mode", "")
     output_format = source.get("output_format", "csv")
+
+    if scrape_mode == "static_download":
+        logger.info("[divorce] Using static_download mode for '%s'", county_id)
+        return _static_download(source, target_date)
 
     if output_format == "excel":
         logger.info("[divorce] County '%s' uses browser download (output_format=excel)", county_id)
@@ -228,7 +268,7 @@ def filter_divorce_cases(file_path: Path, county_id: str = "hillsborough") -> pd
     (default: CaseTypeDescription for Hillsborough).
     Reads CSV or Excel based on file extension / county output_format.
     """
-    source = _get_court_source(county_id)
+    source = _get_divorce_source(county_id)
     style_col = source.get("style_col", "CaseTypeDescription")
     output_format = source.get("output_format", "csv")
 

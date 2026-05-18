@@ -155,7 +155,7 @@ def _template_task(source: dict, auction_date: dt.date) -> str:
 # Browser-use agent (mirrors master_engine pattern)
 # ---------------------------------------------------------------------------
 
-async def run_browser_agent(task: str, headful: bool = False):
+async def run_browser_agent(task: str, headful: bool = False, no_proxy: bool = False):
 	"""
 	Run a browser-use Agent with the given task.
 	Returns the agent history object, or None on failure.
@@ -168,10 +168,9 @@ async def run_browser_agent(task: str, headful: bool = False):
 	browser = Browser(
 		headless=not headful,
 		disable_security=True,
-		proxy=get_browser_use_proxy(),
+		proxy=None if no_proxy else get_browser_use_proxy(),
 		args=[
 			'--no-sandbox',
-			'--disable-setuid-sandbox',
 			'--disable-dev-shm-usage',
 			'--disable-gpu',
 			'--disable-blink-features=AutomationControlled',
@@ -300,6 +299,7 @@ async def run_foreclosure_pipeline(
 	auction_date: Optional[dt.date] = None,
 	headful: bool = False,
 	load_to_db: bool = False,
+	no_proxy: bool = False,
 ) -> Optional[Path]:
 	"""
 	County-agnostic foreclosure scrape for a single auction date.
@@ -327,7 +327,7 @@ async def run_foreclosure_pipeline(
 	logger.info("=" * 70)
 
 	task = build_agent_task(source, auction_date)
-	history = await run_browser_agent(task, headful=headful)
+	history = await run_browser_agent(task, headful=headful, no_proxy=no_proxy)
 	csv_file = _parse_agent_result(history, auction_date, county_id)
 
 	if not csv_file:
@@ -412,6 +412,8 @@ def main():
 		help="Run browser in visible mode")
 	parser.add_argument("--load-to-db", action="store_true",
 		help="Load scraped records into database after scraping")
+	parser.add_argument("--no-proxy", action="store_true",
+		help="Disable Oxylabs proxy (for testing direct connectivity)")
 
 	args = parser.parse_args()
 	auction_date = _parse_date(args.date)
@@ -421,6 +423,7 @@ def main():
 		auction_date=auction_date,
 		headful=args.headful,
 		load_to_db=args.load_to_db,
+		no_proxy=args.no_proxy,
 	))
 
 	if result:

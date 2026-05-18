@@ -71,6 +71,110 @@ def _get_court_source(county_id: str) -> dict:
     return cfg.get("sources", {}).get("court_records", {})
 
 
+def _get_eviction_source(county_id: str) -> dict:
+    """Return the evictions source dict, falling back to court_records if absent."""
+    cfg = _get_county(county_id)
+    sources = cfg.get("sources", {})
+    return sources.get("evictions") or sources.get("court_records") or {}
+
+
+def _static_download(source: dict, dest_dir: Path, target_date: str = None) -> Path:
+    """
+    Download a dated file directly from a URL pattern stored in source["url"].
+    The URL must contain the literal placeholder {date} (replaced with YYYYMMDD).
+    Walks back up to 7 days to find the latest available file when no date given;
+    skips empty/weekend files (≤200 bytes).
+    """
+    url_pattern = source.get("url", "")
+    if "{date}" not in url_pattern:
+        raise ValueError(f"static_download source url must contain {{date}}: {url_pattern!r}")
+
+    if target_date:
+        dates_to_try = [datetime.strptime(target_date.replace("-", ""), "%Y%m%d")]
+    else:
+        today = datetime.now().date()
+        dates_to_try = [
+            datetime.combine(today - timedelta(days=i), datetime.min.time())
+            for i in range(1, 8)
+        ]
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for dt in dates_to_try:
+        date_str = dt.strftime("%Y%m%d")
+        download_url = url_pattern.replace("{date}", date_str)
+        try:
+            resp = requests_get_with_retry(
+                download_url,
+                headers={"User-Agent": DEFAULT_USER_AGENT},
+                timeout=REQUEST_TIMEOUT_DEFAULT,
+            )
+            if resp.status_code != 200 or len(resp.content) <= 200:
+                logger.debug("[evictions] %s — empty or missing (size=%d)", date_str, len(resp.content))
+                continue
+            out_path = dest_dir / f"CivilFiling_{date_str}.csv"
+            out_path.write_bytes(resp.content)
+            logger.info("[evictions] Downloaded %s (%.1f KB)", out_path.name, out_path.stat().st_size / 1024)
+            return out_path
+        except Exception as e:
+            logger.warning("[evictions] Could not fetch %s: %s", download_url, e)
+
+    raise FileNotFoundError("[evictions] No civil filing found in last 7 days")
+
+
+async def _scrape_with_playwright(
+    source: dict, county_id: str, target_date: str | None,
+    start_date: str | None, end_date: str | None, headful: bool = False,
+) -> Path:
+    """Run the source's playwright_code and save the resulting DataFrame to disk."""
+    from playwright.async_api import async_playwright
+    from src.utils.action_sequence import execute_playwright_code, PlaywrightCodeError
+
+    playwright_code = source.get("playwright_code", "")
+    if not playwright_code:
+        raise ValueError(f"[evictions] playwright_code is empty for '{county_id}' source")
+
+    if target_date:
+        dt = datetime.strptime(target_date.replace("-", ""), "%Y%m%d")
+        start_str = end_str = dt.strftime("%Y%m%d")
+    elif start_date:
+        start_str = start_date.replace("-", "")
+        end_str = (end_date or start_date).replace("-", "")
+    else:
+        yesterday = datetime.now() - timedelta(days=1)
+        start_str = end_str = yesterday.strftime("%Y%m%d")
+
+    url = source.get("url", "")
+    RAW_EVICTIONS_DIR.mkdir(parents=True, exist_ok=True)
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=not headful,
+            downloads_path=str(RAW_EVICTIONS_DIR),
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
+        context = await browser.new_context(accept_downloads=True)
+        page = await context.new_page()
+        try:
+            df = await execute_playwright_code(
+                playwright_code, page, RAW_EVICTIONS_DIR,
+                placeholders={"url": url, "start_date": start_str, "end_date": end_str},
+                county_id=county_id,
+            )
+        except PlaywrightCodeError as e:
+            logger.error("[evictions] Playwright scrape failed: %s", e)
+            raise
+        finally:
+            await browser.close()
+
+    if df is None or df.empty:
+        raise ValueError(f"[evictions] Playwright returned no data for '{county_id}'")
+
+    out_path = RAW_EVICTIONS_DIR / f"evictions_playwright_{county_id}_{start_str}.xlsx"
+    df.to_excel(out_path, index=False)
+    logger.info("[evictions] Playwright data saved: %s (%d rows)", out_path.name, len(df))
+    return out_path
+
+
 async def _download_civil_filing_browser(
     county_id: str, source: dict, target_date: str | None, dest_dir: Path,
     headful: bool = False,
@@ -157,11 +261,22 @@ def download_latest_civil_filing(
     Hillsborough: requests-based directory listing → CSV.
     Other counties (output_format=excel, e.g. Pinellas): browser-use → Excel.
     """
-    source = _get_court_source(county_id)
+    source = _get_eviction_source(county_id)
+    scrape_mode = source.get("scrape_mode", "")
     output_format = source.get("output_format", "csv")
 
     if start_date:
         source = dict(source, start_date=start_date, end_date=end_date or start_date)
+
+    if scrape_mode == "static_download":
+        logger.info("[evictions] Using static_download mode for '%s'", county_id)
+        return _static_download(source, RAW_EVICTIONS_DIR, target_date)
+
+    if scrape_mode in ("playwright_only", "playwright_then_ai"):
+        logger.info("[evictions] Using playwright mode for '%s'", county_id)
+        return asyncio.run(
+            _scrape_with_playwright(source, county_id, target_date, start_date, end_date, headful)
+        )
 
     if output_format == "excel":
         logger.info("[evictions] County '%s' uses browser download (output_format=excel)", county_id)
@@ -288,7 +403,7 @@ def _normalize_style_col_format(df: pd.DataFrame) -> pd.DataFrame:
 
 def process_civil_data(file_path: Path, county_id: str = "hillsborough") -> pd.DataFrame:
     """Load the civil filing (CSV or Excel) with multi-encoding support."""
-    source = _get_court_source(county_id)
+    source = _get_eviction_source(county_id)
     output_format = source.get("output_format", "csv")
 
     if output_format == "excel" or file_path.suffix.lower() in (".xlsx", ".xls"):
@@ -318,20 +433,19 @@ def process_civil_data(file_path: Path, county_id: str = "hillsborough") -> pd.D
 def filter_evictions(df: pd.DataFrame, county_id: str = "hillsborough") -> pd.DataFrame:
     """
     Filter civil filing data to include only eviction-related cases.
-    Uses style_col from county source config as the filter column
-    (default: CaseTypeDescription for Hillsborough).
+    Always filters on CaseTypeDescription (Hillsborough native name, or renamed from
+    'Case Type' for Pinellas after _normalize_style_col_format runs in process_civil_data).
     """
-    source = _get_court_source(county_id)
-    style_col = source.get("style_col", "CaseTypeDescription")
+    source = _get_eviction_source(county_id)
+    filter_col = source.get("special_flags", {}).get("case_type_col", "CaseTypeDescription")
+    if filter_col not in df.columns:
+        logger.error("[evictions] Column '%s' not found — columns: %s", filter_col, list(df.columns))
+        raise KeyError(f"Column '{filter_col}' not found in civil filing")
 
-    if style_col not in df.columns:
-        logger.error("[evictions] Column '%s' not found — columns: %s", style_col, list(df.columns))
-        raise KeyError(f"Column '{style_col}' not found in civil filing")
-
-    mask = df[style_col].str.contains("|".join(EVICTION_CASE_PATTERNS), case=False, na=False)
+    mask = df[filter_col].str.contains("|".join(EVICTION_CASE_PATTERNS), case=False, na=False)
     evictions_df = df[mask].copy()
     logger.info("[evictions] Filtered %d eviction records from %d total (col: %s)",
-                len(evictions_df), len(df), style_col)
+                len(evictions_df), len(df), filter_col)
     return evictions_df
 
 

@@ -120,7 +120,9 @@ def build_agent_task(source: dict, start_str: str, end_str: str) -> str:
         "You generate browser-automation task instructions for a browser-use Agent. "
         "The agent controls a Chromium browser. Write a concise, numbered task in plain English. "
         "The agent must trigger a file download (CSV export). "
-        "Do NOT add any explanation outside the task text."
+        "Do NOT add any explanation outside the task text. "
+        "Write all URLs as plain text only — do NOT wrap them in markdown bold (**), "
+        "backticks, or any other formatting."
     )
 
     user_prompt = f"""Generate a browser-use agent task to download lien/deed/judgment records from a county clerk portal.
@@ -154,6 +156,11 @@ Requirements:
             messages=[{"role": "user", "content": user_prompt}],
         )
         task = response.content[0].text.strip()
+        # Strip markdown bold markers that browser-use's URL extractor would absorb
+        # into the URL (e.g. **https://foo.com/** → https://foo.com/)
+        import re as _re
+        task = _re.sub(r'\*\*(https?://[^\s*]+)\*\*', r'\1', task)
+        task = _re.sub(r'(https?://[^\s*]+)\*\*', r'\1', task)
         logger.info("[LLM] Generated agent task:\n%s", task)
         return task
     except Exception as e:
@@ -230,6 +237,22 @@ async def run_browser_agent(
     )
 
     if cf_profile:
+        # Kill any lingering Edge processes holding the profile's singleton lock.
+        # If a previous run crashed without cleanup, Edge holds the user_data_dir
+        # and the new subprocess can't bind its CDP port → _wait_for_cdp_url times out.
+        import psutil as _psutil
+        profile_dir = cf_profile["profile_dir"]
+        for _proc in _psutil.process_iter(["pid", "name", "cmdline"]):
+            try:
+                _cmdline = _proc.info.get("cmdline") or []
+                if any(profile_dir in str(_arg) for _arg in _cmdline):
+                    logger.info("[CF] Killing stale Edge PID=%s holding profile lock", _proc.pid)
+                    _proc.kill()
+                    _proc.wait(timeout=5)
+            except (_psutil.NoSuchProcess, _psutil.AccessDenied, _psutil.TimeoutExpired):
+                pass
+        await asyncio.sleep(1)
+
         browser_kwargs.update(
             executable_path=cf_profile["edge_path"],
             user_data_dir=cf_profile["profile_dir"],
@@ -249,28 +272,8 @@ async def run_browser_agent(
 
     browser = Browser(**browser_kwargs)
 
-    # Start browser before the agent so CDP is live for init script injection.
-    # agent.run() calls start() again but it's idempotent.
-    await browser.start()
-
     if not cf_profile:
-        # Stealth patches the navigator/WebGL signatures Cloudflare hashes when
-        # issuing cf_clearance — skip injection in CF mode to keep the warmed
-        # profile's fingerprint intact.
-        from playwright_stealth import Stealth
-        stealth = Stealth(
-            chrome_runtime=True,
-            navigator_webdriver=True,
-            navigator_plugins=True,
-            webgl_vendor=True,
-            webgl_vendor_override="Google Inc. (Intel)",
-            webgl_renderer_override=(
-                "ANGLE (Intel, Intel(R) UHD Graphics 620 "
-                "Direct3D11 vs_5_0 ps_5_0, D3D11)"
-            ),
-        )
-        await browser._cdp_add_init_script(stealth.script_payload)
-        logger.info("[Stealth] Injected fingerprint patches via CDP init script")
+        logger.info("[Stealth] Using --disable-blink-features=AutomationControlled (CDP init script skipped)")
 
     agent = Agent(task=task, llm=llm, browser=browser, max_steps=60, use_judge=False)
 
@@ -285,6 +288,93 @@ async def run_browser_agent(
         logger.error("[Agent] Run failed: %s", e)
         logger.debug(traceback.format_exc())
         return None, start_time
+
+
+# ---------------------------------------------------------------------------
+# Playwright selector mode (used when source has playwright_code stored)
+# ---------------------------------------------------------------------------
+
+async def _scrape_with_playwright(
+    playwright_code: str,
+    source: dict,
+    start_str: str,
+    end_str: str,
+    download_dir: Path,
+    headful: bool = False,
+    cf_profile: Optional[dict] = None,
+) -> Optional[pd.DataFrame]:
+    """
+    Execute stored playwright_code against a Playwright page.
+
+    For CF-bypass sources, launches Edge via launch_persistent_context so the
+    warmed profile's clearance cookies are loaded natively — no subprocess CDP
+    tricks, no watchdog deadlocks.
+    """
+    from playwright.async_api import async_playwright
+    from src.utils.action_sequence import execute_playwright_code
+
+    url = source.get("url", "")
+    county_id = source.get("county_id", "")
+
+    async with async_playwright() as p:
+        if cf_profile:
+            import psutil as _psutil
+            profile_dir = cf_profile["profile_dir"]
+            for _proc in _psutil.process_iter(["pid", "name", "cmdline"]):
+                try:
+                    _cmdline = _proc.info.get("cmdline") or []
+                    if any(profile_dir in str(_arg) for _arg in _cmdline):
+                        logger.info("[CF/PW] Killing stale Edge PID=%s before launch", _proc.pid)
+                        _proc.kill()
+                        _proc.wait(timeout=5)
+                except (_psutil.NoSuchProcess, _psutil.AccessDenied, _psutil.TimeoutExpired):
+                    pass
+            await asyncio.sleep(1)
+
+            context = await p.chromium.launch_persistent_context(
+                user_data_dir=profile_dir,
+                executable_path=cf_profile["edge_path"],
+                headless=not headful,
+                accept_downloads=True,
+                downloads_path=str(download_dir),
+                args=[
+                    "--no-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                    "--window-size=1920,1080",
+                ],
+                ignore_default_args=["--enable-automation"],
+            )
+            page = context.pages[0] if context.pages else await context.new_page()
+        else:
+            browser = await p.chromium.launch(
+                headless=not headful,
+                downloads_path=str(download_dir),
+                args=[
+                    "--no-sandbox",
+                    "--disable-blink-features=AutomationControlled",
+                    "--window-size=1920,1080",
+                ],
+                ignore_default_args=["--enable-automation"],
+            )
+            context = await browser.new_context(accept_downloads=True)
+            page = await context.new_page()
+
+        try:
+            df = await execute_playwright_code(
+                playwright_code,
+                page,
+                download_dir,
+                placeholders={"url": url, "start_date": start_str, "end_date": end_str},
+                county_id=county_id,
+            )
+            logger.info("[Playwright] Scraped %d rows", len(df) if df is not None else 0)
+            return df
+        except Exception as e:
+            logger.error("[Playwright] Scrape failed: %s", e)
+            logger.debug(traceback.format_exc())
+            return None
+        finally:
+            await context.close()
 
 
 # ---------------------------------------------------------------------------
@@ -543,39 +633,55 @@ async def run_lien_pipeline(
         # CF profile requires direct connection — proxy would break TLS fingerprint
         no_proxy = True
 
-    # --- Run browser-use Agent ----------------------------------------------
-    task = build_agent_task(source, start_str, end_str)
-    history, start_time = await run_browser_agent(
-        task, RAW_LIEN_DIR,
-        headful=headful,
-        no_proxy=no_proxy,
-        cf_profile=cf_profile,
-    )
+    # --- Playwright selector mode OR browser-use agent ----------------------
+    playwright_code = source.get("playwright_code") or ""
+    if playwright_code:
+        logger.info("[Pipeline] playwright_code found — using Playwright selector mode")
+        df = await _scrape_with_playwright(
+            playwright_code, source, start_str, end_str, RAW_LIEN_DIR,
+            headful=headful, cf_profile=cf_profile,
+        )
+        if df is None:
+            logger.error("[Pipeline] Playwright scrape failed")
+            _record_stats(0, False, _t0, county_id, error="playwright_scrape_failed")
+            return False
+        if df.empty:
+            logger.info("[Pipeline] Playwright scrape returned no records")
+            _record_stats(0, True, _t0, county_id)
+            return True
+    else:
+        task = build_agent_task(source, start_str, end_str)
+        history, start_time = await run_browser_agent(
+            task, RAW_LIEN_DIR,
+            headful=headful,
+            no_proxy=no_proxy,
+            cf_profile=cf_profile,
+        )
 
-    if history is None:
-        logger.error("[Pipeline] Agent failed to run")
-        _record_stats(0, False, _t0, county_id, error="Agent run failed")
-        return False
+        if history is None:
+            logger.error("[Pipeline] Agent failed to run")
+            _record_stats(0, False, _t0, county_id, error="Agent run failed")
+            return False
 
-    await asyncio.sleep(5)
+        await asyncio.sleep(5)
 
-    downloaded_file = _locate_download(RAW_LIEN_DIR, start_time)
-    if not downloaded_file:
-        logger.error("[Pipeline] No download detected after agent run")
-        _record_stats(0, False, _t0, county_id, error="No download file found")
-        return False
+        downloaded_file = _locate_download(RAW_LIEN_DIR, start_time)
+        if not downloaded_file:
+            logger.error("[Pipeline] No download detected after agent run")
+            _record_stats(0, False, _t0, county_id, error="No download file found")
+            return False
 
-    try:
-        df = process_lien_data(downloaded_file)
-    except Exception as e:
-        logger.error("[Pipeline] Failed to process downloaded file: %s", e)
-        _record_stats(0, False, _t0, county_id, error=str(e))
-        return False
+        try:
+            df = process_lien_data(downloaded_file)
+        except Exception as e:
+            logger.error("[Pipeline] Failed to process downloaded file: %s", e)
+            _record_stats(0, False, _t0, county_id, error=str(e))
+            return False
 
-    if df.empty:
-        logger.info("[Pipeline] Downloaded file is empty — no records for this date range")
-        _record_stats(0, True, _t0, county_id)
-        return True
+        if df.empty:
+            logger.info("[Pipeline] Downloaded file is empty — no records for this date range")
+            _record_stats(0, True, _t0, county_id)
+            return True
 
     # Resolve the ColumnMapping for this source. Renames, BookPage split, doc-
     # type value normalisation, and row routing all happen inside ColumnMapper.

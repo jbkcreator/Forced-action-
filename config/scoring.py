@@ -45,7 +45,7 @@ VERTICAL_WEIGHTS = {
         "evictions": 45,         # Adjusted [cite: 109]
         "mechanics_liens": 55,
         "insurance_claim": 10,   # Stacking only
-        "Fire": 10,              # Stacking only
+        "fire": 10,              # Stacking only
         "storm_damage": 10,      # Stacking only
         "flood_damage": 10,      # Stacking only
         "tampa_code_liens": 35,
@@ -67,7 +67,7 @@ VERTICAL_WEIGHTS = {
         "deed_transfers": 45,    # Adjusted [cite: 109]
         "evictions": 40,         # Adjusted [cite: 109]
         "insurance_claim": 10,   # Stacking only
-        "Fire": 10,              # Stacking only
+        "fire": 10,              # Stacking only
         "storm_damage": 10,      # Stacking only
         "flood_damage": 10,      # Stacking only
         "tampa_code_liens": 45,
@@ -79,7 +79,7 @@ VERTICAL_WEIGHTS = {
     "restoration": {
         "code_violations": 75,   # 2026-05-04: was 90 — single signal at 90 + recency 25 auto-saturated cap at 100
         "insurance_claim": 10,   # Stacking only
-        "Fire": 10,              # Stacking only
+        "fire": 10,              # Stacking only
         "storm_damage": 10,      # Stacking only
         "flood_damage": 10,      # Stacking only
         "tampa_code_liens": 65,  # 2026-05-04: was 75 — same saturation problem
@@ -102,7 +102,7 @@ VERTICAL_WEIGHTS = {
         "building_permits": 10,  # Stacking only — active permit = contractor on job, not a lead signal
         "enforcement_permit": 70,  # 2026-05-04: was 80 — was hitting cap when stacked with universal bonuses
         "insurance_claim": 10,   # Stacking only
-        "Fire": 10,              # Stacking only
+        "fire": 10,              # Stacking only
         "storm_damage": 10,      # Stacking only
         "flood_damage": 10,      # Stacking only
         "code_violations": 58,   # 2026-05-04: was 68 — code_violations also drives restoration/PA, multi-vertical correlation
@@ -123,7 +123,7 @@ VERTICAL_WEIGHTS = {
     "public_adjusters": {        # Activated Vertical
         "code_violations": 70,   # 2026-05-04: was 85 — base + recency was capping; same signal also fires restoration/roofing
         "insurance_claim": 10,   # Stacking only — reverted 2026-05-06 (was 72, caused 38k FEMA claims to auto-qualify)
-        "Fire": 10,              # Stacking only
+        "fire": 10,              # Stacking only
         "storm_damage": 10,      # Stacking only
         "flood_damage": 10,      # Stacking only
         "tampa_code_liens": 60,  # 2026-05-04: was 70 — same saturation problem
@@ -154,7 +154,7 @@ VERTICAL_WEIGHTS = {
         "tax_delinquencies": 50, # Adjusted [cite: 109]
         "probate": 40,           # Adjusted [cite: 109]
         "insurance_claim": 10,   # Stacking only
-        "Fire": 10,              # Stacking only
+        "fire": 10,              # Stacking only
         "storm_damage": 10,      # Stacking only
         "flood_damage": 10,      # Stacking only
         "code_violations": 30,

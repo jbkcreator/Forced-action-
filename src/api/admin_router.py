@@ -25,7 +25,7 @@ import stripe
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, UploadFile
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import and_, case, distinct, func, or_, select, text
 from sqlalchemy.orm import Session
 
@@ -615,7 +615,7 @@ class CountyUpdateRequest(BaseModel):
     is_active: Optional[bool] = None
 
 
-ScrapeMode = Literal["ai_only", "playwright_only", "playwright_then_ai"]
+ScrapeMode = Literal["ai_only", "playwright_only", "playwright_then_ai", "static_download", "api"]
 
 
 class CountySourceCreateRequest(BaseModel):
@@ -632,6 +632,15 @@ class CountySourceCreateRequest(BaseModel):
     # playwright_code is intentionally NOT settable from this endpoint —
     # callers go through /sources/{id}/playwright-code/{save,generate,validate}
     # so the AST + LLM safety pipeline runs first.
+
+    @model_validator(mode='after')
+    def validate_static_download(self) -> 'CountySourceCreateRequest':
+        if self.scrape_mode == 'static_download':
+            if not self.url:
+                raise ValueError("url is required for static_download mode")
+            if '{date}' not in self.url:
+                raise ValueError("url must contain {date} placeholder for static_download mode")
+        return self
 
 
 class CountySourceUpdateRequest(BaseModel):
@@ -852,6 +861,15 @@ def update_source(
     src = db.query(CountySource).filter_by(id=source_id, county_id=county_id).first()
     if not src:
         raise HTTPException(status_code=404, detail=f"Source {source_id} not found in '{county_id}'")
+
+    # Validate static_download: effective mode after this update + effective URL after this update
+    effective_mode = body.scrape_mode if body.scrape_mode is not None else src.scrape_mode
+    effective_url = body.url if body.url is not None else (src.url or "")
+    if effective_mode == 'static_download':
+        if not effective_url:
+            raise HTTPException(status_code=422, detail="url is required for static_download mode")
+        if '{date}' not in effective_url:
+            raise HTTPException(status_code=422, detail="url must contain {date} placeholder for static_download mode")
 
     updates = body.model_dump(exclude_none=True)
     for field, value in updates.items():

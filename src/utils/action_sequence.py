@@ -628,7 +628,7 @@ def persist_playwright_code(
     is_approved: bool = False,
 ) -> None:
     """
-    Store playwright_code in CountySource.special_flags and bust the config cache.
+    Store playwright_code in the CountySource direct columns and bust the config cache.
     Also appends a row to playwright_code_history for audit/rollback.
 
     Args:
@@ -639,14 +639,12 @@ def persist_playwright_code(
                      unapproved code (does not block execution).
     """
     pv = prompt_version or _CODE_PROMPT_VERSION
-    _patch_source_flags(
+    _patch_source_columns(
         county_id,
         source_id,
-        {
-            "playwright_code":           code,
-            "playwright_code_version":   pv,
-            "playwright_code_approved":  is_approved,
-        },
+        playwright_code=code,
+        playwright_code_version=pv,
+        playwright_code_approved=is_approved,
     )
     _record_code_history(
         county_id=county_id,
@@ -664,12 +662,16 @@ def persist_playwright_code(
 
 def clear_playwright_code(county_id: str, source_id: int) -> None:
     """
-    Remove cached playwright_code from CountySource.special_flags.
+    Remove cached playwright_code from CountySource direct columns.
     Writes a history row so we can correlate failures to clears.
     """
-    _remove_source_flag(county_id, source_id, "playwright_code")
-    _remove_source_flag(county_id, source_id, "playwright_code_version")
-    _remove_source_flag(county_id, source_id, "playwright_code_approved")
+    _patch_source_columns(
+        county_id,
+        source_id,
+        playwright_code=None,
+        playwright_code_version=None,
+        playwright_code_approved=False,
+    )
     _record_code_history(
         county_id=county_id,
         source_id=source_id,
@@ -689,11 +691,11 @@ def approve_playwright_code(county_id: str, source_id: int, approved_by: str = "
     Intended to be called from the admin UI after a human reviews the generated
     code. Idempotent.
     """
-    _patch_source_flags(county_id, source_id, {"playwright_code_approved": True})
+    _patch_source_columns(county_id, source_id, playwright_code_approved=True)
     _record_code_history(
         county_id=county_id,
         source_id=source_id,
-        code=None,                # code already in special_flags — no need to duplicate
+        code=None,
         prompt_version=None,
         reason=f"approved_by:{approved_by}",
         is_approved=True,
@@ -731,6 +733,32 @@ def _record_code_history(
 # ---------------------------------------------------------------------------
 # Shared DB helpers
 # ---------------------------------------------------------------------------
+
+def _patch_source_columns(county_id: str, source_id: int, **kwargs) -> None:
+    """Write playwright_code/version/approved directly to CountySource columns.
+
+    county_config.py reads these as first-class columns (not from special_flags),
+    so this is the single canonical write path for all playwright_code state.
+    kwargs accepted: playwright_code, playwright_code_version, playwright_code_approved.
+    """
+    try:
+        from src.core.database import Database
+        from src.core.models import CountySource
+        from src.utils.county_config import invalidate_cache
+
+        db = Database()
+        with db.session_scope() as session:
+            src = session.query(CountySource).filter_by(id=source_id, county_id=county_id).first()
+            if src is None:
+                logger.warning("[ActionSeq] patch_columns: source_id=%s county=%s not found", source_id, county_id)
+                return
+            for col, val in kwargs.items():
+                setattr(src, col, val)
+
+        invalidate_cache(county_id)
+    except Exception as exc:
+        logger.warning("[ActionSeq] patch_source_columns failed (non-critical): %s", exc)
+
 
 def _patch_source_flags(county_id: str, source_id: int, updates: dict) -> None:
     try:

@@ -65,10 +65,12 @@ def _make_llm():
     )
 
 
-def _get_court_source(county_id: str) -> dict:
-    """Return the court_records source dict for county_id (empty dict if absent)."""
+
+def _get_probate_source(county_id: str) -> dict:
+    """Return the probate source dict, falling back to court_records if absent."""
     cfg = get_county_config(county_id)
-    return cfg.get("sources", {}).get("court_records", {})
+    sources = cfg.get("sources", {})
+    return sources.get("probate") or sources.get("court_records") or {}
 
 
 async def _download_probate_via_browser(
@@ -146,15 +148,63 @@ async def _download_probate_via_browser(
     return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
+def _static_download(source: dict, target_date: str = None) -> Path:
+    """
+    Download a dated file directly from a URL pattern stored in source["url"].
+    The URL must contain the literal placeholder {date} which is replaced with YYYYMMDD.
+    Tries the target date first; if none given, walks back up to 7 days to find the
+    latest available file (skips empty files — 151-byte placeholder from weekends).
+    """
+    url_pattern = source.get("url", "")
+    if "{date}" not in url_pattern:
+        raise ValueError(f"static_download source url must contain {{date}}: {url_pattern!r}")
+
+    if target_date:
+        dates_to_try = [datetime.strptime(target_date.replace("-", ""), "%Y%m%d")]
+    else:
+        today = datetime.now().date()
+        dates_to_try = [
+            datetime.combine(today - timedelta(days=i), datetime.min.time())
+            for i in range(1, 8)
+        ]
+
+    RAW_PROBATE_DIR.mkdir(parents=True, exist_ok=True)
+    for dt in dates_to_try:
+        date_str = dt.strftime("%Y%m%d")
+        download_url = url_pattern.replace("{date}", date_str)
+        try:
+            resp = requests_get_with_retry(
+                download_url,
+                headers={"User-Agent": DEFAULT_USER_AGENT},
+                timeout=REQUEST_TIMEOUT_DEFAULT,
+            )
+            if resp.status_code != 200 or len(resp.content) <= 200:
+                logger.debug("[probate] %s — empty or missing (size=%d)", date_str, len(resp.content))
+                continue
+            out_path = RAW_PROBATE_DIR / f"ProbateFiling_{date_str}.csv"
+            out_path.write_bytes(resp.content)
+            logger.info("[probate] Downloaded %s (%.1f KB)", out_path.name, out_path.stat().st_size / 1024)
+            return out_path
+        except Exception as e:
+            logger.warning("[probate] Could not fetch %s: %s", download_url, e)
+
+    raise FileNotFoundError("[probate] No probate filing found in last 7 days")
+
+
 def download_latest_probate_filing(target_date: str = None, county_id: str = "hillsborough") -> Path:
     """
     Download the latest probate filing from the county clerk.
-    Hillsborough: requests-based directory listing at /Probate/dailyfilings/ → CSV.
-    Other counties (output_format=excel, e.g. Pinellas): browser-use → Excel
-    (combined civil filing; probate rows filtered in process_probate_data).
+    static_download: direct HTTP GET from URL pattern in DB source config.
+    excel (browser-use): Pinellas combined civil filing downloaded via browser-use agent.
+    csv (default): Hillsborough requests-based directory listing fallback.
     """
-    source = _get_court_source(county_id)
+    source = _get_probate_source(county_id)
+    scrape_mode = source.get("scrape_mode", "")
     output_format = source.get("output_format", "csv")
+
+    if scrape_mode == "static_download":
+        logger.info("[probate] Using static_download mode for '%s'", county_id)
+        return _static_download(source, target_date)
 
     if output_format == "excel":
         logger.info("[probate] County '%s' uses browser download (output_format=excel)", county_id)
@@ -231,7 +281,7 @@ def process_probate_data(file_path: Path, county_id: str = "hillsborough") -> pd
     For Pinellas (Excel, combined civil filing): filters by style_col using
     PROBATE_CASE_PATTERNS.
     """
-    source = _get_court_source(county_id)
+    source = _get_probate_source(county_id)
     output_format = source.get("output_format", "csv")
     style_col = source.get("style_col")
 

@@ -1009,8 +1009,8 @@ class ScraperRunStats(Base):
         Index("idx_run_stats_date_source", "run_date", "source_type"),
         CheckConstraint(
             "source_type IN ("
-            "'lien_tcl', 'lien_ccl', 'lien_hoa', 'lien_ml', 'lien_tl',"
-            "'judgments', 'deeds', 'evictions', 'probate', 'bankruptcy',"
+            "'lien_tcl', 'lien_ccl', 'lien_hoa', 'lien_ml', 'lien_tl', 'lis_pendens',"
+            "'judgments', 'deeds', 'evictions', 'divorce_filings', 'probate', 'bankruptcy',"
             "'violations', 'foreclosures', 'permits', 'tax_delinquencies',"
             "'roofing_permits', 'storm_damage', 'flood_damage', 'insurance_claims', 'fire_incidents'"
             ")",
@@ -1897,7 +1897,7 @@ class CountySource(Base):
     )
     signal_type: Mapped[str] = mapped_column(String(50), nullable=False)
     source_name: Mapped[Optional[str]] = mapped_column(String(100))
-    url: Mapped[str] = mapped_column(Text, nullable=False)
+    url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     description: Mapped[Optional[str]] = mapped_column(Text)
     navigation_hint: Mapped[Optional[str]] = mapped_column(Text)
     output_format: Mapped[Optional[str]] = mapped_column(String(20))
@@ -1944,7 +1944,7 @@ class CountySource(Base):
         Index("idx_county_sources_signal_type", "signal_type"),
         Index("idx_county_sources_is_active", "is_active"),
         CheckConstraint(
-            "scrape_mode IN ('ai_only','playwright_only','playwright_then_ai')",
+            "scrape_mode IN ('ai_only','playwright_only','playwright_then_ai','static_download','api')",
             name="ck_county_sources_scrape_mode",
         ),
     )

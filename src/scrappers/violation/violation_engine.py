@@ -172,7 +172,6 @@ async def run_browser_agent(task: str, headful: bool = False) -> tuple:
     browser = Browser(
         headless=not headful,
         disable_security=True,
-        proxy=get_browser_use_proxy(),
         args=[
             '--no-sandbox',
             '--disable-setuid-sandbox',
@@ -309,6 +308,58 @@ def _normalize_columns(rows: list[dict], source: dict) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Playwright scrape (bypasses browser-use timeout issues)
+# ---------------------------------------------------------------------------
+
+async def _scrape_with_playwright(
+    playwright_code: str,
+    source: dict,
+    start_str: str,
+    end_str: str,
+    download_dir: Path,
+    headful: bool = False,
+    county_id: str = "",
+) -> Optional[pd.DataFrame]:
+    from playwright.async_api import async_playwright
+    from src.utils.action_sequence import execute_playwright_code, PlaywrightCodeError
+
+    url = source.get("url") or VIOLATION_SEARCH_URL
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=not headful,
+            downloads_path=str(download_dir),
+            args=[
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+                '--disable-blink-features=AutomationControlled',
+                '--window-size=1920,1080',
+            ],
+        )
+        context = await browser.new_context(accept_downloads=True)
+        page = await context.new_page()
+        try:
+            df = await execute_playwright_code(
+                playwright_code,
+                page,
+                download_dir,
+                placeholders={"url": url, "start_date": start_str, "end_date": end_str},
+                county_id=county_id,
+            )
+            return df if not df.empty else None
+        except PlaywrightCodeError as e:
+            logger.error("[Playwright] Scrape failed: %s", e)
+            return None
+        finally:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # Stats helper
 # ---------------------------------------------------------------------------
 
@@ -356,31 +407,47 @@ async def main(args):
     start_str = start_dt.strftime("%m/%d/%Y")
     end_str = end_dt.strftime("%m/%d/%Y")
 
+    download_dir = RAW_VIOLATIONS_DIR / county_id
+    download_dir.mkdir(parents=True, exist_ok=True)
+
     logger.info("=" * 60)
     logger.info("%s CODE VIOLATIONS — DATA COLLECTION", county_cfg["display_name"].upper())
     logger.info("Date range: %s → %s", start_str, end_str)
     logger.info("=" * 60)
 
-    task = build_agent_task(source, start_str, end_str)
-    history, _ = await run_browser_agent(task, headful=args.headful)
+    playwright_code = source.get("playwright_code")
+    if playwright_code:
+        logger.info("[Main] Using Playwright scrape mode")
+        raw_df = await _scrape_with_playwright(
+            playwright_code, source, start_str, end_str, download_dir,
+            headful=args.headful, county_id=county_id,
+        )
+        if raw_df is None or raw_df.empty:
+            logger.info("[Main] 0 violation records from Playwright — nothing to load")
+            return
+        df = _normalize_columns(raw_df.to_dict("records"), source)
+    else:
+        task = build_agent_task(source, start_str, end_str)
+        history, _ = await run_browser_agent(task, headful=args.headful)
 
-    if history is None:
-        logger.error("[Main] Agent run returned no history — aborting")
-        return
+        if history is None:
+            logger.error("[Main] Agent run returned no history — aborting")
+            return
 
-    final_result = history.final_result()
-    if not final_result:
-        logger.error("[Main] Agent returned empty result — aborting")
-        return
+        final_result = history.final_result()
+        if not final_result:
+            logger.error("[Main] Agent returned empty result — aborting")
+            return
 
-    logger.info("[Main] Agent result length: %d chars", len(str(final_result)))
-    rows = _parse_agent_result(str(final_result))
+        logger.info("[Main] Agent result length: %d chars", len(str(final_result)))
+        rows = _parse_agent_result(str(final_result))
 
-    if not rows:
-        logger.info("[Main] 0 violation records extracted for this date range")
-        return
+        if not rows:
+            logger.info("[Main] 0 violation records extracted for this date range")
+            return
 
-    df = _normalize_columns(rows, source)
+        df = _normalize_columns(rows, source)
+
     logger.info("[Main] %d total records after normalization", len(df))
 
     today_str = datetime.now().strftime("%Y%m%d")

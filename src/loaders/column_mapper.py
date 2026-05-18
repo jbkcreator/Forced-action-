@@ -76,7 +76,8 @@ SIGNAL_SCHEMAS: dict[str, list[str]] = {
         "BookType", "Book", "Page", "RecordDate", "Filing Amt",
     ],
     "violations": [
-        "record_number", "opened_date", "violation_type", "status", "address",
+        "Record Number", "Date", "Record Type", "Description",
+        "Status", "Address", "Short Notes", "Fine Amount", "Is Lien",
     ],
     "permits": [
         "Record Number",    # permit / application number
