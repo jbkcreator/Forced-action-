@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 def run_sweep(dry_run: bool = False) -> dict:
     results = {
-        "total_candidates": 0,
+        "candidates_found": 0,
         "skipped_zip_locked": 0,
         "events_emitted": 0,
         "errors": 0,
@@ -35,7 +35,6 @@ def run_sweep(dry_run: bool = False) -> dict:
 
         for cand in candidates:
             try:
-                results["total_candidates"] += 1
                 if is_zip_locked(db, cand.zip_code, cand.vertical, cand.county_id):
                     results["skipped_zip_locked"] += 1
                     logger.debug(
@@ -48,6 +47,7 @@ def run_sweep(dry_run: bool = False) -> dict:
                     cand.subscriber_id, cand.zip_code, cand.credits_used,
                 )
 
+                results["candidates_found"] += 1
                 if not dry_run:
                     mark_lock_candidate(db, cand.subscriber_id, cand.zip_code)
                     emit_event(
@@ -69,7 +69,7 @@ def run_sweep(dry_run: bool = False) -> dict:
 
     logger.info(
         "[WalletToLockSweep] total=%d skipped_locked=%d emitted=%d errors=%d dry_run=%s",
-        results["total_candidates"],
+        results["candidates_found"],
         results["skipped_zip_locked"],
         results["events_emitted"],
         results["errors"],

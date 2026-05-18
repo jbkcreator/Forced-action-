@@ -193,6 +193,11 @@ COUNTY_ID=hillsborough
 # Catches at-risk subscribers (5-7d inactivity or grace day 5+) before churn.
 0 10 * * * $PROJECT/scripts/cron/run.sh src.tasks.proactive_save
 
+# Pause-resume reminder — daily 11:00 UTC. Sends a transactional SMS to paused
+# subscribers 7 days before their pause_resume_at date so they know leads are
+# about to start flowing again. Idempotency via the ±1d window on resume date.
+0 11 * * * $PROJECT/scripts/cron/run.sh src.tasks.pause_resume_reminder
+
 # Revenue Pulse — daily founder SMS at 07:30 UTC (lead count, wallet actives, top deal/alert, kill switch).
 30 7 * * * $PROJECT/scripts/cron/run.sh src.tasks.revenue_pulse --daily
 
