@@ -238,3 +238,27 @@ class TestSmsPauseFlow:
              patch("config.settings.get_settings", return_value=_settings_mock()):
             reply = _handle_resume(sub, db)
         assert "resumed" in reply.lower()
+
+
+class TestPauseReminderCron:
+    """The 7-day-before-resume reminder must be scheduled in crontab.txt
+    so it runs automatically — otherwise paused subscribers get no heads-up
+    before leads start flowing again."""
+
+    def test_pause_resume_reminder_cron_entry_present(self):
+        import pathlib
+        crontab = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "cron" / "crontab.txt"
+        text = crontab.read_text()
+        lines = [
+            ln.strip() for ln in text.splitlines()
+            if "pause_resume_reminder" in ln and not ln.lstrip().startswith("#")
+        ]
+        assert lines, "No active cron entry found for src.tasks.pause_resume_reminder"
+        # Module docstring says: Cron: 0 11 * * * (11 AM UTC daily)
+        assert any(ln.startswith("0 11 ") for ln in lines), (
+            f"pause_resume_reminder cron present but not at 0 11 * * *: {lines}"
+        )
+
+    def test_pause_resume_reminder_module_importable(self):
+        from src.tasks import pause_resume_reminder
+        assert callable(pause_resume_reminder.run)

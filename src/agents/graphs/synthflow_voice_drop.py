@@ -8,7 +8,16 @@ Flow:
   1. assemble_context  — load subscriber + lead context, run qualification checks
   2. hierarchy_check   — standard decision hierarchy gate
   3. initiate_drop     — call Synthflow API, log ManualActionLog row
-  4. finalize          — record terminal status
+  4. followup_sms      — send SMS reinforcement within ~60s, fires for ALL
+                         eligible outcomes per PDF requirement (voicemail,
+                         no_answer, completed, sample/demo_requested). Goes
+                         through sms_compliance.send_sms so TCPA opt-out,
+                         opt-in, and quiet-hour gates still apply.
+  5. finalize          — record terminal status
+
+Voicemail duration (20 seconds, per client PDF) is enforced by the Synthflow
+agent script itself, not in this code path. **Duration must be confirmed in
+Synthflow agent config** for each `synthflow_outbound_agent_*` env var.
 """
 
 from __future__ import annotations
@@ -22,6 +31,8 @@ from langgraph.graph import END, START, StateGraph
 
 from src.agents.subgraphs.decision_hierarchy import run_decision_hierarchy
 from src.agents.tools.read_tools import get_subscriber_profile
+from src.core.database import get_db_context
+from src.services.synthflow_client import initiate_call
 
 logger = logging.getLogger(__name__)
 
@@ -55,13 +66,14 @@ class VoiceDropState(TypedDict, total=False):
 
     call_id: Optional[str]
     sent: bool
+    followup_sent: bool
+    followup_skipped_reason: str
     terminal_status: str
     failure_reason: str
 
 
 def _node_assemble_context(state: VoiceDropState) -> VoiceDropState:
     from config.settings import get_settings
-    from src.core.database import get_db_context
     from src.core.models import Subscriber, ManualActionLog
     from sqlalchemy import text
 
@@ -147,8 +159,6 @@ def _node_initiate_drop(state: VoiceDropState) -> VoiceDropState:
     if state.get("terminal_status"):
         return {}
 
-    from src.services.synthflow_client import initiate_call
-    from src.core.database import get_db_context
     from src.core.models import ManualActionLog
 
     profile = state.get("subscriber_profile") or {}
@@ -202,6 +212,74 @@ def _node_initiate_drop(state: VoiceDropState) -> VoiceDropState:
     }
 
 
+def _compose_followup_body(profile: dict, vertical: str) -> str:
+    """One-liner SMS reinforcement copy. Capped at 160 chars (single segment)."""
+    from config.settings import settings
+
+    name = (profile.get("name") or "").strip().split(" ", 1)[0] or "there"
+    zip_code = profile.get("territory_zip") or ""
+    feed_uuid = profile.get("event_feed_uuid") or ""
+    base_url = getattr(settings, "app_base_url", "") or ""
+    feed_url = f"{base_url}/dashboard?uuid={feed_uuid}" if feed_uuid and base_url else base_url
+    in_zip = f" in {zip_code}" if zip_code else ""
+    msg = (
+        f"Hey {name}, just left you a voicemail — fresh {vertical} leads"
+        f"{in_zip} are piling up. Tap: {feed_url}"
+    )
+    return msg[:160]
+
+
+def _node_followup_sms(state: VoiceDropState) -> VoiceDropState:
+    """
+    Send reinforcement SMS within ~60s of voicemail per PDF requirement.
+
+    Fires for every eligible voice-drop dispatch regardless of post-call
+    outcome (voicemail / no_answer / completed / sample_requested / etc.),
+    because we don't know the outcome at this point — Synthflow reports it
+    later via webhook. Compliance (opt-out, opt-in, quiet hours) is enforced
+    inside sms_compliance.send_sms so we don't duplicate those checks here.
+
+    Idempotency: the 7-day dedup in assemble_context blocks re-runs for the
+    same subscriber, so a successful path through this node can fire at most
+    once per 7d per subscriber.
+    """
+    if state.get("terminal_status"):
+        return {}
+    if not state.get("sent"):
+        return {"followup_sent": False, "followup_skipped_reason": "voice_drop_not_sent"}
+    if state.get("kill_switch_color") == "red":
+        return {"followup_sent": False, "followup_skipped_reason": "kill_switch_red"}
+
+    profile = state.get("subscriber_profile") or {}
+    phone = profile.get("phone") or state.get("phone")
+    if not phone:
+        return {"followup_sent": False, "followup_skipped_reason": "no_phone"}
+
+    body = _compose_followup_body(profile, state.get("vertical") or "roofing")
+
+    try:
+        from src.services.sms_compliance import send_sms
+
+        with get_db_context() as db:
+            ok = send_sms(
+                to=phone,
+                body=body,
+                db=db,
+                message_type="marketing",
+                subscriber_id=state["subscriber_id"],
+                task_type="synthflow_voice_drop_followup",
+                campaign=GRAPH_NAME,
+                decision_id=state.get("decision_id"),
+            )
+    except Exception as exc:
+        logger.warning("voice_drop followup_sms failed sub=%s: %s", state.get("subscriber_id"), exc)
+        return {"followup_sent": False, "followup_skipped_reason": f"error:{exc.__class__.__name__}"}
+
+    if not ok:
+        return {"followup_sent": False, "followup_skipped_reason": "compliance_suppressed"}
+    return {"followup_sent": True}
+
+
 def _node_finalize(state: VoiceDropState) -> VoiceDropState:
     final_status = state.get("terminal_status") or ("completed" if state.get("sent") else "failed")
     return {"terminal_status": final_status}
@@ -212,12 +290,14 @@ def build_synthflow_voice_drop_graph() -> StateGraph:
     g.add_node("assemble_context", _node_assemble_context)
     g.add_node("hierarchy_check", _node_hierarchy_check)
     g.add_node("initiate_drop", _node_initiate_drop)
+    g.add_node("followup_sms", _node_followup_sms)
     g.add_node("finalize", _node_finalize)
 
     g.add_edge(START, "assemble_context")
     g.add_edge("assemble_context", "hierarchy_check")
     g.add_edge("hierarchy_check", "initiate_drop")
-    g.add_edge("initiate_drop", "finalize")
+    g.add_edge("initiate_drop", "followup_sms")
+    g.add_edge("followup_sms", "finalize")
     g.add_edge("finalize", END)
     return g
 
