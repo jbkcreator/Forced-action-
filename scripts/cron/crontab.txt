@@ -259,4 +259,14 @@ COUNTY_ID=hillsborough
 # without triggering an event hook (e.g. time-boundary at_risk, daily inactivity).
 0 2 * * * cd $PROJECT && python -c "from src.core.database import Database; from src.services.segmentation_engine import classify_all; db=Database(); s=db.get_session(); print(classify_all(s)); s.close()"
 
+# ── COUNTY LAUNCH AUTOMATION ─────────────────────────────────────────────────
+# County Launch Evaluator — every 6h. Checks all 7 expansion gates for the
+# source county; posts Slack one-tap approval when all are green. Underlying
+# metrics refresh once daily at 06:00 UTC; cooldown prevents Slack spam.
+0 */6 * * * $PROJECT/scripts/cron/run.sh src.tasks.county_launch_evaluator
+
+# County Launch Runner — every 15 min. Re-verifies gates, then executes the
+# launch playbook (v1: manual Slack thread) for approved candidates.
+*/15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.county_launch_runner
+
 # === END FORCED-ACTION-PLATFORM ===

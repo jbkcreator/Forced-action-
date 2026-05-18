@@ -15,6 +15,7 @@ Metrics computed:
   cac_paid_channels   — skipped (no ad spend tracking yet — returns None)
   free_tier_cost_ratio — % of compute cost attributable to free-tier subscribers (proxy)
   sms_cost_per_signup — avg SMS vendor cost per new subscriber (proxy from agent_decisions; Telnyx)
+  county_profitability — 1.0 if any active paying subscribers in county, else 0.0 (v1 proxy)
 
 Cron: 0 6 * * * (6:00 UTC daily, before retention cron at 16:00)
 
@@ -30,6 +31,7 @@ from typing import Optional
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from config.settings import settings
 from src.core.database import get_db_context
 from src.core.models import AgentDecision, Subscriber, WalletBalance, WalletPushOffer
 from src.core.redis_client import redis_available, rget, rset
@@ -40,24 +42,32 @@ _REDIS_TTL = 25 * 3600  # 25 hours — survives one missed cron run
 _REDIS_PREFIX = "fa:ks_metric:"
 
 
-def _cache_metric(feature: str, value: Optional[float]) -> None:
+def _cache_metric(feature: str, value: Optional[float], county_id: Optional[str] = None) -> None:
     if value is None or not redis_available():
         return
-    rset(f"{_REDIS_PREFIX}{feature}", str(value), ttl_seconds=_REDIS_TTL)
+    if county_id is not None:
+        key = f"{_REDIS_PREFIX}{county_id}:{feature}"
+    else:
+        key = f"{_REDIS_PREFIX}{feature}"
+    rset(key, str(value), ttl_seconds=_REDIS_TTL)
 
 
-def get_cached_metric(feature: str) -> Optional[float]:
+def get_cached_metric(feature: str, county_id: Optional[str] = None) -> Optional[float]:
     """Return the last-cached metric value for a feature, or None."""
     if not redis_available():
         return None
-    val = rget(f"{_REDIS_PREFIX}{feature}")
+    if county_id is not None:
+        key = f"{_REDIS_PREFIX}{county_id}:{feature}"
+    else:
+        key = f"{_REDIS_PREFIX}{feature}"
+    val = rget(key)
     try:
         return float(val) if val is not None else None
     except (TypeError, ValueError):
         return None
 
 
-def _compute_metrics(db: Session) -> dict:
+def _compute_metrics(db: Session, county_id: str) -> dict:
     now = datetime.now(timezone.utc)
     ago_30 = now - timedelta(days=30)
 
@@ -65,10 +75,14 @@ def _compute_metrics(db: Session) -> dict:
 
     # first_payment_rate — active subs created in last 30d / total created last 30d
     total_new = db.execute(
-        select(func.count(Subscriber.id)).where(Subscriber.created_at >= ago_30)
+        select(func.count(Subscriber.id)).where(
+            Subscriber.county_id == county_id,
+            Subscriber.created_at >= ago_30,
+        )
     ).scalar() or 0
     active_new = db.execute(
         select(func.count(Subscriber.id)).where(
+            Subscriber.county_id == county_id,
             Subscriber.created_at >= ago_30,
             Subscriber.status == "active",
         )
@@ -77,10 +91,14 @@ def _compute_metrics(db: Session) -> dict:
 
     # saved_card_rate — active subs with has_saved_card=True / total active
     total_active = db.execute(
-        select(func.count(Subscriber.id)).where(Subscriber.status == "active")
+        select(func.count(Subscriber.id)).where(
+            Subscriber.county_id == county_id,
+            Subscriber.status == "active",
+        )
     ).scalar() or 0
     saved_card = db.execute(
         select(func.count(Subscriber.id)).where(
+            Subscriber.county_id == county_id,
             Subscriber.status == "active",
             Subscriber.has_saved_card.is_(True),
         )
@@ -94,6 +112,7 @@ def _compute_metrics(db: Session) -> dict:
         select(func.count(WalletBalance.id)).where(
             WalletBalance.subscriber_id.in_(
                 select(Subscriber.id).where(
+                    Subscriber.county_id == county_id,
                     Subscriber.status == "active",
                     Subscriber.has_saved_card.is_(True),
                 )
@@ -126,12 +145,14 @@ def _compute_metrics(db: Session) -> dict:
     # "wallet" is not a DB tier; resolve via WalletBalance membership.
     wallet_new = db.execute(
         select(func.count(Subscriber.id)).where(
+            Subscriber.county_id == county_id,
             Subscriber.created_at >= ago_30,
             Subscriber.id.in_(select(WalletBalance.subscriber_id)),
         )
     ).scalar() or 0
     lock_new = db.execute(
         select(func.count(Subscriber.id)).where(
+            Subscriber.county_id == county_id,
             Subscriber.created_at >= ago_30,
             Subscriber.tier == "annual_lock",
             Subscriber.status == "active",
@@ -143,12 +164,14 @@ def _compute_metrics(db: Session) -> dict:
     # retention_30d — subs active 30d ago (created before ago_30) still active today
     cohort_total = db.execute(
         select(func.count(Subscriber.id)).where(
+            Subscriber.county_id == county_id,
             Subscriber.created_at <= ago_30,
             Subscriber.tier.notin_(["free", "data_only"]),
         )
     ).scalar() or 0
     cohort_still_active = db.execute(
         select(func.count(Subscriber.id)).where(
+            Subscriber.county_id == county_id,
             Subscriber.created_at <= ago_30,
             Subscriber.tier.notin_(["free", "data_only"]),
             Subscriber.status == "active",
@@ -169,6 +192,17 @@ def _compute_metrics(db: Session) -> dict:
     metrics["sms_reply_rate"] = None
     metrics["cac_paid_channels"] = None
     metrics["free_tier_cost_ratio"] = None
+
+    # county_profitability — v1 proxy: any active paying subscribers in county
+    # See docs/adr/0001-county-profitability-gate.md for rationale and v2 plan.
+    paying_subs = db.execute(
+        select(func.count(Subscriber.id)).where(
+            Subscriber.county_id == county_id,
+            Subscriber.status == "active",
+            Subscriber.tier.notin_(["free", "data_only"]),
+        )
+    ).scalar() or 0
+    metrics["county_profitability"] = 1.0 if paying_subs > 0 else 0.0
 
     return metrics
 
@@ -208,23 +242,28 @@ def _check_accelerated_wallet_push_floor(db, take_rate: Optional[float]) -> Opti
 
 def run_kill_switch_metric_ingest(dry_run: bool = False) -> dict:
     """Compute kill-switch metrics and cache in Redis. Returns computed values."""
+    county_id = settings.county_launch_source_county
+
     with get_db_context() as db:
-        metrics = _compute_metrics(db)
+        metrics = _compute_metrics(db, county_id=county_id)
         floor_color = _check_accelerated_wallet_push_floor(
             db, metrics.get("accelerated_wallet_push_take_rate"),
         )
 
     if not dry_run:
         for feature, value in metrics.items():
+            # Write county-scoped key (new)
+            _cache_metric(feature, value, county_id=county_id)
+            # Write legacy key (no county prefix) for backward compat
             _cache_metric(feature, value)
         logger.info(
-            "[KillSwitchMetricIngest] cached %d metrics aw_push_floor=%s",
-            sum(1 for v in metrics.values() if v is not None), floor_color,
+            "[KillSwitchMetricIngest] cached %d metrics county=%s aw_push_floor=%s",
+            sum(1 for v in metrics.values() if v is not None), county_id, floor_color,
         )
     else:
         logger.info(
-            "[KillSwitchMetricIngest] dry_run — metrics=%s aw_push_floor=%s",
-            json.dumps(metrics, indent=2), floor_color,
+            "[KillSwitchMetricIngest] dry_run county=%s — metrics=%s aw_push_floor=%s",
+            county_id, json.dumps(metrics, indent=2), floor_color,
         )
 
     metrics["_accelerated_wallet_push_floor"] = floor_color

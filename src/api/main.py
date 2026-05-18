@@ -1144,6 +1144,72 @@ def _compute_save_offer_active(subscriber, db) -> bool:
     return compute_save_offer_active(subscriber, db)
 
 
+def _payment_recovery_fields(subscriber) -> dict:
+    """Surface Stripe failed-payment recovery state to the frontend so the
+    dashboard can render a PaymentFailedBanner. Stage is derived client-side
+    from `recovery_day3_sent` (soft until day-3 email fires, urgency after)."""
+    failed_at = getattr(subscriber, "payment_failed_at", None)
+    return {
+        "payment_failed_at": failed_at.isoformat() if failed_at else None,
+        "recovery_day1_sent": bool(getattr(subscriber, "recovery_day1_sent", False)),
+        "recovery_day3_sent": bool(getattr(subscriber, "recovery_day3_sent", False)),
+    }
+
+
+def _what_you_missed_fields(subscriber, db, *, save_offer_active: bool, locked_zips=None) -> dict:
+    """Emit a `what_you_missed` block ONLY for recovery-targeted subscribers
+    (matches the audience the retention graph already messages). Reuses the
+    same lead-pool/zip-activity tools as `_node_assemble_opportunity_gap` so
+    copy parity with email/SMS is automatic.
+
+    Gate: save_offer_active OR payment_failed_at set OR status == 'grace'.
+    Returns `{"what_you_missed": None}` when the gate is closed.
+    """
+    qualifies = (
+        bool(save_offer_active)
+        or getattr(subscriber, "payment_failed_at", None) is not None
+        or subscriber.status == "grace"
+    )
+    if not qualifies:
+        return {"what_you_missed": None}
+
+    zip_pool = list(locked_zips or [])
+    if not zip_pool and subscriber.lock_candidate_zip:
+        zip_pool = [subscriber.lock_candidate_zip]
+    if not zip_pool:
+        return {"what_you_missed": None}
+
+    try:
+        from src.agents.tools.read_tools import get_lead_pool, get_zip_activity
+    except Exception:
+        return {"what_you_missed": None}
+
+    top_zip = zip_pool[0]
+    try:
+        pool = get_lead_pool(top_zip, vertical=subscriber.vertical, min_score=60, limit=50, session=db)
+    except Exception:
+        pool = []
+
+    gold_count = sum(1 for lead in pool if (lead.get("tier") or "").lower().endswith("gold"))
+    if gold_count <= 0:
+        return {"what_you_missed": None}
+
+    try:
+        activity = get_zip_activity(top_zip, vertical=subscriber.vertical, session=db)
+        competing_viewers = int(activity.get("active_viewers", 0) or 0)
+    except Exception:
+        competing_viewers = 0
+
+    return {
+        "what_you_missed": {
+            "gold_count": gold_count,
+            "top_zip": top_zip,
+            "competing_viewers": competing_viewers,
+            "vertical": subscriber.vertical,
+        }
+    }
+
+
 def _auto_mode_entitlement_fields(subscriber, db) -> dict:
     """Tell the frontend whether the user can flip the Auto Mode toggle for free.
 
