@@ -225,6 +225,12 @@ COUNTY_ID=hillsborough
 # and injected into the 09:30 weekly one-pager + served by /api/leaderboard.
 0 9 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.leaderboard
 
+# Human close sweep — weekdays 13:00 UTC. Routes top-10 high-intent subs to Slack closer.
+0 13 * * 1-5 $PROJECT/scripts/cron/run.sh src.tasks.human_close_sweep
+
+# Human close retry — nightly 01:30 UTC. Retries failed Slack posts (max 3 attempts).
+30 1 * * * $PROJECT/scripts/cron/run.sh src.tasks.human_close_retry
+
 # Stripe webhook event retention — Sunday 04:00 UTC. Deletes
 # StripeWebhookEvent rows older than 90 days (Stripe retries cap at 30 days,
 # so 90d is generous belt-and-braces).

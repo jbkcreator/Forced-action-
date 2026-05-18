@@ -3282,6 +3282,48 @@ def territory_map(
     return payload
 
 
+@app.get("/api/admin/human-close")
+def list_human_close(
+    status: str = "open",
+    limit: int = 50,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+    _admin: dict = Depends(get_current_admin),
+):
+    """List human close escalations. status=open|closed|all. Requires admin JWT."""
+    from src.core.models import HumanCloseEscalation
+    q = select(HumanCloseEscalation)
+    if status == "open":
+        q = q.where(HumanCloseEscalation.outcome.is_(None))
+    elif status == "closed":
+        q = q.where(HumanCloseEscalation.outcome.is_not(None))
+    elif status != "all":
+        raise HTTPException(status_code=422, detail="status must be open|closed|all")
+    q = q.order_by(HumanCloseEscalation.routed_at.desc()).limit(min(limit, 200)).offset(offset)
+    rows = db.execute(q).scalars().all()
+    return {
+        "count": len(rows),
+        "items": [
+            {
+                "id": r.id,
+                "subscriber_id": r.subscriber_id,
+                "revenue_signal_score": r.revenue_signal_score,
+                "interactions_count": r.interactions_count,
+                "target_tier": r.target_tier,
+                "target_tier_price_cents": r.target_tier_price_cents,
+                "vertical": r.vertical,
+                "channel": r.channel,
+                "routed_at": r.routed_at.isoformat() if r.routed_at else None,
+                "outcome": r.outcome,
+                "closer_assigned": r.closer_assigned,
+                "posted_at": r.posted_at.isoformat() if r.posted_at else None,
+                "post_attempts": r.post_attempts,
+            }
+            for r in rows
+        ],
+    }
+
+
 @app.post("/api/admin/human-close/{escalation_id}/outcome")
 def human_close_outcome(
     escalation_id: int,
