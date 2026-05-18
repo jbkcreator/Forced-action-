@@ -138,6 +138,59 @@ def mark_lock_candidate(
     reclassify_safe(subscriber_id, db)
 
 
+def compute_wallet_to_lock_eligibility(db: Session, subscriber) -> tuple[bool, Optional[int]]:
+    """
+    Server-side Wallet-to-Lock eligibility check used by the subscriber feed.
+
+    "wallet" is NOT a valid Subscriber.tier value — wallet customers are
+    free / starter tier with a WalletBalance row. The old check
+    `subscriber.tier == "wallet"` was always False, so the upgrade banner
+    never surfaced. Replace with the documented client rule:
+
+      - status == "active"
+      - tier NOT already on Lock-or-above
+      - lock_candidate_zip IS NOT NULL  (set by wallet_to_lock_sweep)
+      - >= LOCK_THRESHOLD_CREDITS debits in that ZIP within LOCK_WINDOW_DAYS
+      - ZIP is not currently locked by ANOTHER subscriber
+
+    Returns (eligible, credits_30d_in_candidate_zip).
+    """
+    if not subscriber or subscriber.status != "active":
+        return False, None
+    if subscriber.tier in LOCK_OR_ABOVE_TIERS:
+        return False, None
+    if not subscriber.lock_candidate_zip or not subscriber.lock_candidate_at:
+        return False, None
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=LOCK_WINDOW_DAYS)
+    credits = db.execute(
+        select(func.sum(func.abs(WalletTransaction.amount))).where(
+            WalletTransaction.subscriber_id == subscriber.id,
+            WalletTransaction.zip_code == subscriber.lock_candidate_zip,
+            WalletTransaction.txn_type == "debit",
+            WalletTransaction.created_at >= cutoff,
+        )
+    ).scalar()
+    credits = int(credits) if credits else 0
+    if credits < LOCK_THRESHOLD_CREDITS:
+        return False, credits
+
+    # ZIP must be available — not held by a different subscriber.
+    held_by_other = db.execute(
+        select(ZipTerritory.id).where(
+            ZipTerritory.zip_code == subscriber.lock_candidate_zip,
+            ZipTerritory.vertical == subscriber.vertical,
+            ZipTerritory.county_id == subscriber.county_id,
+            ZipTerritory.status == "locked",
+            ZipTerritory.subscriber_id != subscriber.id,
+        )
+    ).scalar_one_or_none()
+    if held_by_other is not None:
+        return False, credits
+
+    return True, credits
+
+
 def build_lock_cta_url(subscriber_id: int, zip_code: str) -> str:
     """Build pre-filled Territory Lock checkout URL for SMS CTA."""
     base = settings.app_base_url.rstrip("/")
