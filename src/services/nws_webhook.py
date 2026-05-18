@@ -147,14 +147,49 @@ def process_alert(alert_payload: dict, db: Session) -> dict:
     else:
         logger.info("[NWS] storm_pack_enabled=False — skipping storm pack activation")
 
-    # ── 9. Update NWSAlert with activation results ────────────────────────────
+    # ── 9. Storm signal tagging (storm_damage incidents on distressed props) ──
+    tagged_ids: list = []
+    if settings.storm_signal_tagging_enabled and affected_zips:
+        try:
+            from src.services.storm_signal_tagger import tag_affected_properties
+            tagged_ids = tag_affected_properties(
+                affected_zips, alert_id, nws_alert.effective, db
+            )
+            _log_event(db, "STORM_SIGNAL_TAGGED", {
+                "alert_id": alert_id,
+                "tagged_count": len(tagged_ids),
+                "zip_count": len(affected_zips),
+            })
+        except Exception:
+            logger.exception(
+                "[NWS] storm signal tagging failed for alert %s", alert_id[:40]
+            )
+            tagged_ids = []
+
+    # ── 10. Update NWSAlert with activation results + commit ──────────────────
     nws_alert.storm_pack_triggered = notified > 0
     nws_alert.subscriber_count = notified
     db.commit()
 
+    # ── 11. CDS rescore for tagged properties (post-commit, isolated) ─────────
+    if tagged_ids and settings.storm_signal_rescore_enabled:
+        try:
+            from src.services.cds_engine import MultiVerticalScorer
+            scorer = MultiVerticalScorer(db)
+            scorer.score_properties_by_ids(tagged_ids, save_to_db=True)
+            _log_event(db, "STORM_RESCORE_COMPLETE", {
+                "alert_id": alert_id,
+                "rescored_count": len(tagged_ids),
+            })
+        except Exception:
+            logger.exception(
+                "[NWS] storm rescore failed for alert %s (%d properties)",
+                alert_id[:40], len(tagged_ids),
+            )
+
     logger.info(
-        "[NWS] Alert %s processed: %d ZIPs, %d subscribers notified",
-        alert_id[:40], len(affected_zips), notified,
+        "[NWS] Alert %s processed: %d ZIPs, %d subscribers notified, %d props tagged",
+        alert_id[:40], len(affected_zips), notified, len(tagged_ids),
     )
 
     return {
@@ -162,6 +197,7 @@ def process_alert(alert_payload: dict, db: Session) -> dict:
         "alert_id": alert_id,
         "affected_zips": affected_zips,
         "subscriber_count": notified,
+        "tagged_count": len(tagged_ids),
         "event": event_type,
     }
 
@@ -299,7 +335,3 @@ def is_qualifying(event_type: str) -> bool:
 def deactivate(zip_code: str) -> None:
     from src.core.redis_client import rdelete
     rdelete(f"storm_active:{zip_code}")
-
-
-def queue_storm_scraper(zip_codes: list) -> None:
-    logger.info("Storm scraper queued for ZIPs: %s (full impl in 2B-2)", zip_codes)

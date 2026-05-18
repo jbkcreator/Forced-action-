@@ -3620,7 +3620,7 @@ def post_business_event(req: BusinessEventRequest, db: Session = Depends(get_db)
             subscriber_id = sub.id
 
     log_business_event(
-        event_type=req.event_type,
+        event_type=req.event_type.upper(),
         subscriber_id=subscriber_id,
         payload=req.payload or None,
         source="frontend",
@@ -3655,6 +3655,58 @@ def get_wall_session(session_id: str):
     if state is None:
         raise HTTPException(status_code=404, detail="Session not found or expired")
     return state
+
+
+# ── Bundle Checkout — POST /api/bundle/checkout ───────────────────────────────
+
+class BundleCheckoutRequest(BaseModel):
+    feed_uuid: str
+    bundle_type: str
+    zip_code: Optional[str] = None
+    vertical: Optional[str] = None
+    ab_variant: Optional[str] = None
+
+
+@app.post("/api/bundle/checkout", status_code=201)
+def bundle_checkout(req: BundleCheckoutRequest, db: Session = Depends(get_db)):
+    """Create a Stripe PaymentIntent for a bundle purchase.
+    Returns { client_secret, publishable_key, amount, currency, bundle_type }.
+    """
+    from src.services.bundle_engine import create_payment_intent, is_available
+    _s = get_settings()
+
+    sub = db.execute(
+        select(Subscriber).where(Subscriber.event_feed_uuid == req.feed_uuid)
+    ).scalar_one_or_none()
+    if not sub or sub.status not in ("active", "grace"):
+        raise HTTPException(status_code=403, detail="Active subscription required")
+
+    if not is_available(req.bundle_type, sub.id, db):
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "bundle_unavailable", "message": "This bundle is not available right now."},
+        )
+
+    try:
+        result = create_payment_intent(
+            bundle_type=req.bundle_type,
+            subscriber_id=sub.id,
+            zip_code=req.zip_code or "",
+            vertical=req.vertical or "",
+            db=db,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+    return {
+        "client_secret": result["client_secret"],
+        "publishable_key": _s.active_stripe_publishable_key,
+        "amount": result["amount"],
+        "currency": "usd",
+        "bundle_type": req.bundle_type,
+    }
 
 
 # ── Stage 5+: Wallet Topup — POST /api/wallet/topup ───────────────────────────
