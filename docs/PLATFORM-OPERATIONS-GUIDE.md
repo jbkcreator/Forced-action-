@@ -450,3 +450,47 @@ Everything above sits behind a clear gate. Flipping each gate is a contained tas
 ---
 
 *This guide is a live document — update as behaviour changes or new items land.*
+
+---
+
+## County Launch Approval
+
+### Overview
+When all 7 expansion gates are green for the source county, the platform
+automatically posts a Slack message in `COUNTY_LAUNCH_SLACK_CHANNEL` with
+an "Approve launch" button.
+
+### Required `.env` settings
+```
+COUNTY_LAUNCH_SOURCE_COUNTY=hillsborough
+COUNTY_LAUNCH_APPROVERS=["U01ABC123","U02DEF456"]   # Slack user IDs
+COUNTY_LAUNCH_SLACK_CHANNEL=#expansion
+COUNTY_LAUNCH_COOLDOWN_HOURS=24
+COUNTY_LAUNCH_REMINDER_DAYS=7
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_SIGNING_SECRET=...
+```
+
+### Slack app setup
+1. Create a Slack app at api.slack.com/apps.
+2. Add `chat:write` bot scope.
+3. Enable "Interactivity & Shortcuts" and set Request URL to:
+   `https://<your-host>/api/admin/slack/county-launch/interact`
+4. Install to workspace. Copy Bot User OAuth Token → `SLACK_BOT_TOKEN`.
+5. Copy Signing Secret → `SLACK_SIGNING_SECRET`.
+
+### Adding a candidate county
+```sql
+INSERT INTO expansion_candidates (county_id, priority, status)
+VALUES ('pinellas', 100, 'queued');
+```
+
+### Manual gate check
+```bash
+python -m src.tasks.county_launch_evaluator --dry-run
+```
+
+### Emergency skip
+```sql
+UPDATE expansion_candidates SET status='skipped' WHERE county_id='pinellas';
+```

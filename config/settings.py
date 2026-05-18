@@ -306,6 +306,15 @@ class AppSettings(BaseSettings):
 		description="Max overflow connections beyond pool_size"
 	)
 
+	# County Launch Automation
+	county_launch_source_county: str = Field(default="hillsborough", env="COUNTY_LAUNCH_SOURCE_COUNTY")
+	county_launch_approvers: list = Field(default=[], env="COUNTY_LAUNCH_APPROVERS")
+	county_launch_slack_channel: str = Field(default="", env="COUNTY_LAUNCH_SLACK_CHANNEL")
+	county_launch_cooldown_hours: int = Field(default=24, env="COUNTY_LAUNCH_COOLDOWN_HOURS")
+	county_launch_reminder_days: int = Field(default=7, env="COUNTY_LAUNCH_REMINDER_DAYS")
+	slack_bot_token: Optional[SecretStr] = Field(default=None, env="SLACK_BOT_TOKEN")
+	slack_signing_secret: Optional[SecretStr] = Field(default=None, env="SLACK_SIGNING_SECRET")
+
 
 @lru_cache
 def get_settings() -> AppSettings:

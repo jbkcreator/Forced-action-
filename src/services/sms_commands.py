@@ -83,7 +83,11 @@ def _find_subscriber(phone: str, db: Session) -> Optional[Subscriber]:
     """
     if not phone:
         return None
-    canonical = _normalize_phone(phone) or phone.strip()
+    canonical = _normalize_phone(phone)
+    if not canonical:
+        # Unparseable inbound — refuse to query with a raw string that would
+        # defeat the unique-constraint guarantee on SmsOptIn/Subscriber.phone.
+        return None
 
     row = db.execute(
         select(SmsOptIn)

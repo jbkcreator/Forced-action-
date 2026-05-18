@@ -32,8 +32,10 @@ from sqlalchemy.orm import Session
 from config.settings import settings
 from src.core.database import get_db_context
 from src.core.models import (
+    CountyLaunchAudit,
     DistressScore,
     EnrichmentUsageLog,
+    ExpansionCandidate,
     Owner,
     PremiumPurchase,
     Property,
@@ -713,3 +715,144 @@ def decision_audit(decision_id: str, db: Session = Depends(get_db)):
         "cost_usd": float(row.cost_usd) if row.cost_usd is not None else None,
         "summary": row.summary,
     }
+
+
+# ---------------------------------------------------------------------------
+# Slack county-launch interactive endpoint
+# ---------------------------------------------------------------------------
+
+import hashlib
+import hmac
+import time
+from urllib.parse import parse_qs
+
+from fastapi import Request
+
+
+def _verify_slack_signature(headers: dict, body: bytes) -> bool:
+    """Verify Slack request signature (HMAC-SHA256). Rejects replays > 5 min old."""
+    secret = settings.slack_signing_secret
+    if not secret:
+        return False
+    ts = headers.get("x-slack-request-timestamp", "")
+    try:
+        if abs(time.time() - int(ts)) > 300:
+            return False
+    except (TypeError, ValueError):
+        return False
+    sig_base = f"v0:{ts}:{body.decode('utf-8')}"
+    expected = "v0=" + hmac.new(
+        secret.get_secret_value().encode(),
+        sig_base.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    received = headers.get("x-slack-signature", "")
+    return hmac.compare_digest(expected, received)
+
+
+def _slack_ephemeral(text: str) -> dict:
+    return {"response_type": "ephemeral", "text": text}
+
+
+@router.post("/slack/county-launch/interact")
+async def slack_county_launch_interact(request: Request, db: Session = Depends(get_db)):
+    """
+    Receives Slack interactive component payloads for county-launch approval buttons.
+    Auth: Slack HMAC-SHA256 signature (no JWT — Slack signature IS the auth).
+    """
+    raw = await request.body()
+    if not _verify_slack_signature(dict(request.headers), raw):
+        raise HTTPException(status_code=401, detail="Invalid Slack signature")
+
+    try:
+        payload_str = parse_qs(raw.decode("utf-8")).get("payload", ["{}"])[0]
+        payload = json.loads(payload_str)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Malformed payload")
+
+    user_id = payload.get("user", {}).get("id", "")
+    approvers = settings.county_launch_approvers
+    if approvers and user_id not in approvers:
+        return _slack_ephemeral("Not authorized to approve county launches.")
+
+    actions = payload.get("actions", [])
+    if not actions:
+        return _slack_ephemeral("No action found in payload.")
+
+    try:
+        action_data = json.loads(actions[0].get("value", "{}"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid action value")
+
+    candidate_id = action_data.get("candidate_id")
+    action = action_data.get("action")
+    if not candidate_id or action not in ("approve", "skip"):
+        raise HTTPException(status_code=400, detail="Invalid action data")
+
+    # SELECT FOR UPDATE — idempotency guard against double-tap races
+    candidate = db.execute(
+        select(ExpansionCandidate)
+        .where(ExpansionCandidate.id == candidate_id)
+        .with_for_update()
+    ).scalar_one_or_none()
+
+    if not candidate:
+        return _slack_ephemeral(f"Candidate {candidate_id} not found.")
+
+    if candidate.status != "queued":
+        msg = f"Already {candidate.status}"
+        if candidate.approved_by_slack_user:
+            msg += f" by <@{candidate.approved_by_slack_user}>"
+        return _slack_ephemeral(msg)
+
+    now = datetime.now(timezone.utc)
+    audit_actor = f"slack:{user_id}"
+
+    if action == "approve":
+        candidate.status = "approved"
+        candidate.approved_at = now
+        candidate.approved_by_slack_user = user_id
+        event_type = "approved"
+        reply_text = f":white_check_mark: Launch approved by <@{user_id}>."
+    else:
+        candidate.status = "skipped"
+        event_type = "rejected"
+        reply_text = f":no_entry: Launch skipped by <@{user_id}>."
+
+    audit_row = CountyLaunchAudit(
+        county_id=candidate.county_id,
+        event_type=event_type,
+        actor=audit_actor,
+        detail={"candidate_id": candidate_id, "action": action},
+    )
+    db.add(audit_row)
+    db.commit()
+
+    # Strip buttons from original message
+    _update_slack_message(candidate, reply_text)
+
+    return {"ok": True}
+
+
+def _update_slack_message(candidate: "ExpansionCandidate", reply_text: str) -> None:
+    """Replace button block with result text in the original Slack message."""
+    token = settings.slack_bot_token
+    channel = settings.county_launch_slack_channel
+    if not token or not channel or not candidate.last_slack_message_ts:
+        return
+    try:
+        from slack_sdk import WebClient
+        client = WebClient(token=token.get_secret_value())
+        client.chat_update(
+            channel=channel,
+            ts=candidate.last_slack_message_ts,
+            text=reply_text,
+            blocks=[
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": reply_text},
+                }
+            ],
+        )
+    except Exception as exc:
+        logger.error("[SlackInteract] chat.update failed: %s", exc)

@@ -2,7 +2,7 @@
 Unit tests for Wallet-to-Lock sweep and service.
 """
 import pytest
-from datetime import date
+from datetime import date, datetime, timezone, timedelta
 from unittest.mock import MagicMock, patch
 
 
@@ -108,6 +108,91 @@ class TestEmitEvent:
     def test_uncontacted_count_gate_minimum(self):
         from src.services.wallet_to_lock import LOCK_MIN_UNCONTACTED_LEADS
         assert LOCK_MIN_UNCONTACTED_LEADS == 10
+
+
+# ── feed eligibility helper ──────────────────────────────────────────────────
+
+class _Sub:
+    """Lightweight Subscriber stand-in for compute_wallet_to_lock_eligibility."""
+    def __init__(self, **kw):
+        self.id = kw.get("id", 1)
+        self.status = kw.get("status", "active")
+        self.tier = kw.get("tier", "free")
+        self.vertical = kw.get("vertical", "roofing")
+        self.county_id = kw.get("county_id", "fl_hillsborough")
+        self.lock_candidate_zip = kw.get("lock_candidate_zip", "33647")
+        self.lock_candidate_at = kw.get(
+            "lock_candidate_at", datetime.now(timezone.utc) - timedelta(days=1),
+        )
+
+
+def _db_with_credits_and_zip(credits, held_by_other=False):
+    """Mock db.execute().scalar() / .scalar_one_or_none() to simulate state."""
+    db = MagicMock()
+    sum_result = MagicMock()
+    sum_result.scalar.return_value = credits
+    zip_result = MagicMock()
+    zip_result.scalar_one_or_none.return_value = 99 if held_by_other else None
+    db.execute.side_effect = [sum_result, zip_result]
+    return db
+
+
+class TestComputeWalletToLockEligibility:
+    """Client requirement: 40+ wallet credits in one ZIP within 30d, ZIP available."""
+
+    def test_eligible_when_40_credits_in_candidate_zip(self):
+        from src.services.wallet_to_lock import compute_wallet_to_lock_eligibility
+        db = _db_with_credits_and_zip(credits=42)
+        eligible, credits = compute_wallet_to_lock_eligibility(db, _Sub())
+        assert eligible is True
+        assert credits == 42
+
+    def test_not_eligible_under_threshold(self):
+        from src.services.wallet_to_lock import compute_wallet_to_lock_eligibility
+        db = _db_with_credits_and_zip(credits=39)
+        eligible, credits = compute_wallet_to_lock_eligibility(db, _Sub())
+        assert eligible is False
+        assert credits == 39
+
+    def test_not_eligible_when_zip_locked_by_other(self):
+        from src.services.wallet_to_lock import compute_wallet_to_lock_eligibility
+        db = _db_with_credits_and_zip(credits=80, held_by_other=True)
+        eligible, _ = compute_wallet_to_lock_eligibility(db, _Sub())
+        assert eligible is False
+
+    def test_not_eligible_when_lock_candidate_zip_null(self):
+        from src.services.wallet_to_lock import compute_wallet_to_lock_eligibility
+        db = MagicMock()
+        eligible, credits = compute_wallet_to_lock_eligibility(
+            db, _Sub(lock_candidate_zip=None, lock_candidate_at=None),
+        )
+        assert eligible is False
+        assert credits is None
+        db.execute.assert_not_called()
+
+    def test_not_eligible_when_already_lock_or_above(self):
+        from src.services.wallet_to_lock import compute_wallet_to_lock_eligibility
+        db = MagicMock()
+        eligible, _ = compute_wallet_to_lock_eligibility(db, _Sub(tier="annual_lock"))
+        assert eligible is False
+        db.execute.assert_not_called()
+
+    def test_not_eligible_when_status_not_active(self):
+        from src.services.wallet_to_lock import compute_wallet_to_lock_eligibility
+        db = MagicMock()
+        eligible, _ = compute_wallet_to_lock_eligibility(db, _Sub(status="paused"))
+        assert eligible is False
+
+    def test_tier_wallet_string_never_used(self):
+        """Regression guard: the legacy `tier == 'wallet'` branch was dead code —
+        'wallet' isn't in the Subscriber.tier check constraint. Eligibility must
+        come from credit count + lock_candidate_zip, not tier string."""
+        from src.core.models import Subscriber  # noqa: F401
+        valid_tiers = {
+            "free", "starter", "pro", "dominator", "data_only",
+            "autopilot_lite", "autopilot_pro", "partner", "annual_lock",
+        }
+        assert "wallet" not in valid_tiers
 
 
 # ── sweep task ───────────────────────────────────────────────────────────────

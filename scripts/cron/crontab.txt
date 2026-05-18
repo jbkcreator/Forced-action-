@@ -193,6 +193,11 @@ COUNTY_ID=hillsborough
 # Catches at-risk subscribers (5-7d inactivity or grace day 5+) before churn.
 0 10 * * * $PROJECT/scripts/cron/run.sh src.tasks.proactive_save
 
+# Pause-resume reminder — daily 11:00 UTC. Sends a transactional SMS to paused
+# subscribers 7 days before their pause_resume_at date so they know leads are
+# about to start flowing again. Idempotency via the ±1d window on resume date.
+0 11 * * * $PROJECT/scripts/cron/run.sh src.tasks.pause_resume_reminder
+
 # Revenue Pulse — daily founder SMS at 07:30 UTC (lead count, wallet actives, top deal/alert, kill switch).
 30 7 * * * $PROJECT/scripts/cron/run.sh src.tasks.revenue_pulse --daily
 
@@ -224,6 +229,12 @@ COUNTY_ID=hillsborough
 # confirmed referrals per (county, vertical); written to data/leaderboards/
 # and injected into the 09:30 weekly one-pager + served by /api/leaderboard.
 0 9 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.leaderboard
+
+# Human close sweep — weekdays 13:00 UTC. Routes top-10 high-intent subs to Slack closer.
+0 13 * * 1-5 $PROJECT/scripts/cron/run.sh src.tasks.human_close_sweep
+
+# Human close retry — nightly 01:30 UTC. Retries failed Slack posts (max 3 attempts).
+30 1 * * * $PROJECT/scripts/cron/run.sh src.tasks.human_close_retry
 
 # Stripe webhook event retention — Sunday 04:00 UTC. Deletes
 # StripeWebhookEvent rows older than 90 days (Stripe retries cap at 30 days,
@@ -258,5 +269,15 @@ COUNTY_ID=hillsborough
 # Daily classify_all — 02:00 UTC. Catches any subscribers whose segment drifted
 # without triggering an event hook (e.g. time-boundary at_risk, daily inactivity).
 0 2 * * * cd $PROJECT && python -c "from src.core.database import Database; from src.services.segmentation_engine import classify_all; db=Database(); s=db.get_session(); print(classify_all(s)); s.close()"
+
+# ── COUNTY LAUNCH AUTOMATION ─────────────────────────────────────────────────
+# County Launch Evaluator — every 6h. Checks all 7 expansion gates for the
+# source county; posts Slack one-tap approval when all are green. Underlying
+# metrics refresh once daily at 06:00 UTC; cooldown prevents Slack spam.
+0 */6 * * * $PROJECT/scripts/cron/run.sh src.tasks.county_launch_evaluator
+
+# County Launch Runner — every 15 min. Re-verifies gates, then executes the
+# launch playbook (v1: manual Slack thread) for approved candidates.
+*/15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.county_launch_runner
 
 # === END FORCED-ACTION-PLATFORM ===

@@ -1398,11 +1398,8 @@ def event_feed(
         )
         from src.core.models import WalletBalance as _WB
         _wallet = db.execute(select(_WB).where(_WB.subscriber_id == subscriber.id)).scalar_one_or_none()
-        _w2l_eligible_nz = (
-            subscriber.tier == "wallet"
-            and subscriber.lock_candidate_zip is not None
-            and subscriber.lock_candidate_at is not None
-        )
+        from src.services.wallet_to_lock import compute_wallet_to_lock_eligibility as _w2l_compute
+        _w2l_eligible_nz, _wallet_credits_30d_nz = _w2l_compute(db, subscriber)
         try:
             from src.services.flash_scarcity import get_active_windows_for_subscriber as _get_flash_nz
             _flash_windows_nz = _get_flash_nz(db, subscriber.id)
@@ -1540,7 +1537,7 @@ def event_feed(
                 "lock_candidate_zip": subscriber.lock_candidate_zip,
                 "lock_candidate_at": subscriber.lock_candidate_at.isoformat() if subscriber.lock_candidate_at else None,
                 "wallet_to_lock_eligible": _w2l_eligible_nz,
-                "wallet_credits_30d": None,
+                "wallet_credits_30d": _wallet_credits_30d_nz,
                 "flash_scarcity_windows": _flash_windows_nz,
                 **_accelerated_wallet_offer_fields(subscriber, db),
                 **_auto_mode_entitlement_fields(subscriber, db),
@@ -1742,26 +1739,12 @@ def event_feed(
         and manual_actions_this_week >= AP_LITE_THRESHOLD_PER_WEEK
     )
 
-    # Wallet-to-Lock eligibility
-    _w2l_eligible = (
-        subscriber.tier == "wallet"
-        and subscriber.lock_candidate_zip is not None
-        and subscriber.lock_candidate_at is not None
-    )
-    _wallet_credits_30d = None
-    if _w2l_eligible and subscriber.lock_candidate_zip:
-        from datetime import timedelta as _td
-        from src.core.models import WalletTransaction as _WT
-        _cutoff_30d = datetime.now(timezone.utc) - _td(days=30)
-        _wallet_credits_30d = db.execute(
-            select(func.sum(func.abs(_WT.amount))).where(
-                _WT.subscriber_id == subscriber.id,
-                _WT.zip_code == subscriber.lock_candidate_zip,
-                _WT.txn_type == "debit",
-                _WT.created_at >= _cutoff_30d,
-            )
-        ).scalar()
-        _wallet_credits_30d = int(_wallet_credits_30d) if _wallet_credits_30d else 0
+    # Wallet-to-Lock eligibility — wallet-tier sub (free/starter w/ WalletBalance)
+    # who hit 40+ debits in a single available ZIP within the last 30d. The
+    # legacy check `tier == "wallet"` was a dead branch — "wallet" isn't a
+    # valid Subscriber.tier value.
+    from src.services.wallet_to_lock import compute_wallet_to_lock_eligibility as _w2l_compute
+    _w2l_eligible, _wallet_credits_30d = _w2l_compute(db, subscriber)
 
     # Flash scarcity windows
     try:
@@ -3361,6 +3344,48 @@ def territory_map(
         rset(cache_key, json.dumps(payload), ttl_seconds=60)
 
     return payload
+
+
+@app.get("/api/admin/human-close")
+def list_human_close(
+    status: str = "open",
+    limit: int = 50,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+    _admin: dict = Depends(get_current_admin),
+):
+    """List human close escalations. status=open|closed|all. Requires admin JWT."""
+    from src.core.models import HumanCloseEscalation
+    q = select(HumanCloseEscalation)
+    if status == "open":
+        q = q.where(HumanCloseEscalation.outcome.is_(None))
+    elif status == "closed":
+        q = q.where(HumanCloseEscalation.outcome.is_not(None))
+    elif status != "all":
+        raise HTTPException(status_code=422, detail="status must be open|closed|all")
+    q = q.order_by(HumanCloseEscalation.routed_at.desc()).limit(min(limit, 200)).offset(offset)
+    rows = db.execute(q).scalars().all()
+    return {
+        "count": len(rows),
+        "items": [
+            {
+                "id": r.id,
+                "subscriber_id": r.subscriber_id,
+                "revenue_signal_score": r.revenue_signal_score,
+                "interactions_count": r.interactions_count,
+                "target_tier": r.target_tier,
+                "target_tier_price_cents": r.target_tier_price_cents,
+                "vertical": r.vertical,
+                "channel": r.channel,
+                "routed_at": r.routed_at.isoformat() if r.routed_at else None,
+                "outcome": r.outcome,
+                "closer_assigned": r.closer_assigned,
+                "posted_at": r.posted_at.isoformat() if r.posted_at else None,
+                "post_attempts": r.post_attempts,
+            }
+            for r in rows
+        ],
+    }
 
 
 @app.post("/api/admin/human-close/{escalation_id}/outcome")

@@ -1825,7 +1825,9 @@ class SmsOptOut(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     phone: Mapped[str] = mapped_column(String(20), nullable=False, unique=True, index=True)
     keyword_used: Mapped[Optional[str]] = mapped_column(String(20))   # STOP / UNSUBSCRIBE / etc.
-    source: Mapped[str] = mapped_column(String(30), nullable=False, default="twilio_inbound")  # twilio_inbound/manual/import
+    # Vendor neutral going forward. Historical rows keep "twilio_inbound";
+    # new inbound STOP events tag as "inbound_sms" regardless of carrier.
+    source: Mapped[str] = mapped_column(String(30), nullable=False, default="inbound_sms")  # inbound_sms/twilio_inbound (legacy)/manual/import
     opted_out_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
     def __repr__(self):
@@ -2246,6 +2248,11 @@ class HumanCloseEscalation(Base):
     outcome: Mapped[Optional[str]] = mapped_column(String(20))
     outcome_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     context_json: Mapped[Optional[dict]] = mapped_column(JSONB)
+    posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    post_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_post_error: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    target_tier_price_cents: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    vertical: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
 
     __table_args__ = (
         UniqueConstraint("subscriber_id", "decision_id", name="uq_hce_sub_decision"),
@@ -2368,3 +2375,63 @@ class DBPRContact(Base):
 
     def __repr__(self):
         return f"<DBPRContact(license={self.license_number}, name={self.full_name}, status={self.email_status})>"
+
+
+# ============================================================================
+# 8. COUNTY LAUNCH — EXPANSION CANDIDATES + AUDIT
+# ============================================================================
+
+class ExpansionCandidate(Base):
+    """Queue of counties awaiting launch approval."""
+    __tablename__ = "expansion_candidates"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    county_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="queued")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+    last_slack_posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_slack_message_ts: Mapped[Optional[str]] = mapped_column(String(32))
+    approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    approved_by_slack_user: Mapped[Optional[str]] = mapped_column(String(32))
+    launched_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('queued','approved','launching','launched','aborted','skipped')",
+            name="ck_expansion_candidates_status",
+        ),
+        Index("ix_expansion_candidates_status_priority", "status", "priority"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<ExpansionCandidate(id={self.id}, county={self.county_id}, status={self.status})>"
+
+
+class CountyLaunchAudit(Base):
+    """Immutable audit log for every event in the county launch lifecycle."""
+    __tablename__ = "county_launch_audit"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    county_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    actor: Mapped[str] = mapped_column(String(64), nullable=False)
+    gate_snapshot: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    detail: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "event_type IN ('evaluated','posted','approved','rejected','launch_started',"
+            "'launch_aborted_gate_red','launched','cooldown_skipped')",
+            name="ck_county_launch_audit_event",
+        ),
+        Index("ix_county_launch_audit_county_time", "county_id", "created_at"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<CountyLaunchAudit(id={self.id}, county={self.county_id}, event={self.event_type})>"
