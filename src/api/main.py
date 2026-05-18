@@ -1063,7 +1063,7 @@ def zip_availability(
     # Locked/grace territories for this vertical
     try:
         territory_rows = db.execute(
-            select(ZipTerritory.zip_code, ZipTerritory.status).where(
+            select(ZipTerritory.zip_code, ZipTerritory.status, ZipTerritory.waitlist_emails).where(
                 ZipTerritory.zip_code.in_(all_zips),
                 ZipTerritory.vertical == vertical,
                 ZipTerritory.county_id == county_id,
@@ -1075,6 +1075,7 @@ def zip_availability(
         raise HTTPException(status_code=503, detail={"error": "service_unavailable"})
 
     taken_map = {r[0]: r[1] for r in territory_rows}  # zip -> "locked" | "grace"
+    waitlist_map = {r[0]: len(r[2]) if r[2] else 0 for r in territory_rows}
 
     # Gold+ lead counts per ZIP (deduped to latest score per property).
     # Without the latest-score subquery every historical scoring run is counted,
@@ -1120,6 +1121,7 @@ def zip_availability(
             "status": availability,
             "property_count": prop_counts.get(zip_code, 0),
             "lead_count": lead_counts.get(zip_code, 0),
+            "waitlist_count": waitlist_map.get(zip_code, 0),
         })
 
     return {
@@ -3264,6 +3266,7 @@ def territory_map(
         }
         if zt and zt.status == "grace" and zt.grace_expires_at:
             entry["grace_expires_at"] = zt.grace_expires_at.isoformat()
+        entry["waitlist_count"] = len(zt.waitlist_emails) if zt and zt.waitlist_emails else 0
         results.append(entry)
 
     payload = {
