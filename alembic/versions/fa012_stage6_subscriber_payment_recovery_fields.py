@@ -10,7 +10,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = 'fa012_stage6'
-down_revision: str | None = '2ad0c9f6597c'
+down_revision: tuple = ('fa011_phase_b', 'u5v6w7x8y9z0')
 branch_labels: str | tuple[str, ...] | None = None
 depends_on: str | tuple[str, ...] | None = None
 
