@@ -165,7 +165,6 @@ async def run_browser_agent(task: str, headful: bool = False) -> tuple:
     Returns (history, None). Caller reads history.final_result() for the JSON payload.
     """
     from browser_use import Agent, Browser
-    from src.utils.http_helpers import get_browser_use_proxy
 
     llm = _make_llm()
 

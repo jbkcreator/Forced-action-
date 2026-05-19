@@ -1139,10 +1139,6 @@ class EnrichedContact(Base):
     source: Mapped[str] = mapped_column(String(50), nullable=False)   # batch_skip_tracing | idi
     match_success: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
-    # GHL sync
-    ghl_contact_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)
-    ghl_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
-
     # Audit
     enriched_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 

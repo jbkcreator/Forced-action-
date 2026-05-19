@@ -134,13 +134,11 @@ async def _run_playwright_batch(
 ) -> None:
     from playwright.async_api import async_playwright
     from playwright_stealth import Stealth
-    from src.utils.http_helpers import get_playwright_proxy
 
     async with async_playwright() as pw:
         launch_args = [] if not headless else ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
         browser = await pw.chromium.launch(
             headless=headless,
-            proxy=get_playwright_proxy(),
             args=launch_args,
         )
         context = await browser.new_context(
@@ -214,7 +212,6 @@ async def _run_playwright_batch(
 
 async def _ai_fallback(company_name: str) -> Tuple[Optional[str], Optional[str]]:
     from browser_use import Agent, Browser, ChatAnthropic
-    from src.utils.http_helpers import get_browser_use_proxy
 
     task = (
         f"Go to https://search.sunbiz.org/Inquiry/CorporationSearch/ByName, "
@@ -225,8 +222,7 @@ async def _ai_fallback(company_name: str) -> Tuple[Optional[str], Optional[str]]
         f"{{\"agent_name\": null, \"agent_address\": null}}."
     )
 
-    proxy = get_browser_use_proxy()
-    browser = Browser(headless=True, disable_security=True, proxy=proxy)
+    browser = Browser(headless=True, disable_security=True)
     llm = ChatAnthropic(model="claude-sonnet-4-6")
 
     agent = Agent(task=task, llm=llm, browser=browser)

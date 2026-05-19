@@ -216,7 +216,6 @@ async def download_tax_delinquent_report(
     RADAR PHASE: Download bulk tax delinquent report via browser-use agent.
     """
     from browser_use import Agent, Browser
-    from src.utils.http_helpers import get_browser_use_proxy
 
     _county = _get_county(county_id)
     _file_prefix = _county["file_prefix"]
@@ -233,13 +232,10 @@ async def download_tax_delinquent_report(
     logger.info("[RADAR] Launching browser-use agent — tax_year=%s county=%s", tax_year, county_id)
 
     llm = _make_llm()
-    proxy = get_browser_use_proxy()
-    logger.info("[RADAR] Proxy: %s", "Oxylabs enabled" if proxy else "NO PROXY — running direct")
 
     browser = Browser(
         headless=not headful,
         disable_security=True,
-        proxy=proxy,
         downloads_path=str(REFERENCE_DATA_DIR),
         user_agent=(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "

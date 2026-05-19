@@ -201,7 +201,6 @@ async def run_browser_agent(
     task: str,
     download_dir: Path,
     headful: bool = False,
-    no_proxy: bool = False,
     cf_profile: Optional[dict] = None,
 ) -> tuple:
     """
@@ -218,7 +217,6 @@ async def run_browser_agent(
     Returns (history, start_time).
     """
     from browser_use import Agent, Browser
-    from src.utils.http_helpers import get_browser_use_proxy
 
     llm = _make_llm()
 
@@ -265,7 +263,6 @@ async def run_browser_agent(
         )
     else:
         browser_kwargs.update(
-            proxy=None if no_proxy else get_browser_use_proxy(),
             user_agent=_STEALTH_UA,
             enable_default_extensions=True,
         )
@@ -569,7 +566,6 @@ async def run_lien_pipeline(
     county_id: str = "hillsborough",
     headful: bool = False,
     load_to_db: bool = False,
-    no_proxy: bool = False,
 ) -> bool:
     """County-agnostic lien/deed/judgment/probate scrape for a date range.
 
@@ -630,8 +626,6 @@ async def run_lien_pipeline(
             return False
 
         cf_profile = {"edge_path": edge_path, "profile_dir": str(profile_dir)}
-        # CF profile requires direct connection — proxy would break TLS fingerprint
-        no_proxy = True
 
     # --- Playwright selector mode OR browser-use agent ----------------------
     playwright_code = source.get("playwright_code") or ""
@@ -654,7 +648,6 @@ async def run_lien_pipeline(
         history, start_time = await run_browser_agent(
             task, RAW_LIEN_DIR,
             headful=headful,
-            no_proxy=no_proxy,
             cf_profile=cf_profile,
         )
 
@@ -876,8 +869,6 @@ def main():
                         help="End date YYYY-MM-DD (default: today)")
     parser.add_argument("--headful", action="store_true",
                         help="Run browser in visible mode")
-    parser.add_argument("--no-proxy", action="store_true",
-                        help="Skip Oxylabs proxy (useful for local testing)")
     add_load_to_db_arg(parser)
 
     args = parser.parse_args()
@@ -887,7 +878,6 @@ def main():
         county_id=args.county_id,
         headful=args.headful,
         load_to_db=args.load_to_db,
-        no_proxy=args.no_proxy,
     ))
 
     import sys

@@ -84,7 +84,6 @@ async def _download_probate_via_browser(
     """
     from browser_use import Agent, Browser
     from playwright_stealth import Stealth
-    from src.utils.http_helpers import get_browser_use_proxy
 
     if target_date:
         target_dt = datetime.strptime(target_date.replace("-", ""), "%Y%m%d")
@@ -110,7 +109,6 @@ async def _download_probate_via_browser(
     browser = Browser(
         headless=True,
         disable_security=True,
-        proxy=get_browser_use_proxy(),
         downloads_path=str(dest_dir),
         user_agent=_STEALTH_UA,
         ignore_default_args=["--enable-automation"],

@@ -142,7 +142,6 @@ async def _download_calls_csv(portal_url: str = _FIRE_PORTAL_URL) -> Optional[Pa
     ID changes — the LLM reads the page and adapts.
     """
     from browser_use import Agent, Browser
-    from src.utils.http_helpers import get_browser_use_proxy
 
     temp_dir = RAW_FIRE_DIR / "temp"
     temp_dir.mkdir(parents=True, exist_ok=True)
@@ -166,14 +165,11 @@ async def _download_calls_csv(portal_url: str = _FIRE_PORTAL_URL) -> Optional[Pa
             "Do not navigate away or open new tabs."
         )
 
-    proxy = get_browser_use_proxy()
-    logger.warning("[fire] Launching browser-use agent — proxy: %s",
-                   "Oxylabs enabled" if proxy else "NO PROXY — direct")
+    logger.warning("[fire] Launching browser-use agent")
 
     browser = Browser(
         headless=_is_headless(),
         disable_security=True,
-        proxy=proxy,
         downloads_path=str(temp_dir),
         args=[
             "--no-sandbox",

@@ -152,7 +152,6 @@ def _download_file(source: str = "certified", dry_run: bool = False) -> Optional
     Returns the local path to the saved file, or None on failure.
     """
     import requests
-    from src.utils.http_helpers import get_requests_proxies
 
     url = _DBPR_URLS.get(source)
     if not url:
@@ -177,7 +176,6 @@ def _download_file(source: str = "certified", dry_run: bool = False) -> Optional
             resp = requests.get(
                 url,
                 headers=headers,
-                proxies=get_requests_proxies(),
                 timeout=(10, 120),
                 stream=True,
             )

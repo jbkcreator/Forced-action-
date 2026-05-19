@@ -237,7 +237,6 @@ async def run_browser_agent(
     to find the file the agent downloaded.
     """
     from browser_use import Agent, Browser
-    from src.utils.http_helpers import get_browser_use_proxy
 
     llm = _make_llm()
 

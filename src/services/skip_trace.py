@@ -431,6 +431,15 @@ def run_skip_trace(
                 logger.debug(
                     f"[LLC] property_id={prop.id} tracing agent: {first_name} {last_name} @ {agent_addr['street']}"
                 )
+            elif owner.owner_type in ("LLC", "Corporate", "Trust", "Estate"):
+                # Non-individual with no registered agent — a property-address lookup
+                # would match historical residents, not the actual decision-maker. Skip.
+                stats["no_address"] += 1
+                logger.debug(
+                    f"Skipping property_id={prop.id} — owner_type={owner.owner_type!r} "
+                    f"with no registered agent ({owner.owner_name!r})"
+                )
+                continue
             else:
                 # Individual owner — use property address as before
                 street = (prop.address or "").strip()

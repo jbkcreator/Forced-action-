@@ -166,7 +166,6 @@ async def run_browser_agent(task: str, save_dir: Path, headful: bool = False) ->
     """
     from browser_use import Agent, Browser
     from playwright_stealth import Stealth
-    from src.utils.http_helpers import get_browser_use_proxy
 
     save_dir.mkdir(parents=True, exist_ok=True)
     llm = _make_llm()
@@ -175,7 +174,6 @@ async def run_browser_agent(task: str, save_dir: Path, headful: bool = False) ->
         headless=not headful,
         downloads_path=str(save_dir),
         disable_security=True,
-        proxy=None if headful else get_browser_use_proxy(),
         user_agent=_STEALTH_UA,
         ignore_default_args=["--enable-automation"],
         enable_default_extensions=True,
