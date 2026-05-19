@@ -113,6 +113,7 @@ def _load_from_db(county_id: str) -> dict:
             "bankruptcy_division": county.bankruptcy_division,
             "city_filer_keywords": county.city_filer_keywords or [],
             "code_lien_type_map":  county.code_lien_type_map or {},
+            "address_city_tokens": county.address_city_tokens or [],
             "file_prefix":         county.county_id,
             # court sub-dict expected by bankruptcy_engine
             "court": {
