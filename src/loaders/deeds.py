@@ -140,7 +140,8 @@ class DeedLoader(BaseLoader):
                         book_type=book_type_val,
                         book_number=book_number_val,
                         page_number=page_number_val,
-                        legal_description=legal_desc_val
+                        legal_description=legal_desc_val,
+                        county_id=self.county_id,
                     )
                     
                     if self.safe_add(deed_record):

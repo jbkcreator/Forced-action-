@@ -166,6 +166,7 @@ class ProbateLoader(BaseLoader):
                         case_status=case_status_val,
                         associated_party=decedent_name,
                         secondary_party=beneficiary,
+                        county_id=self.county_id,
                         meta_data={
                             'case_type': case_type_val,
                             'party_address': party_address_val
@@ -229,6 +230,10 @@ class EvictionLoader(BaseLoader):
             logger.info(f"🧪 SAMPLE MODE: Loading {len(df)} eviction rows (out of {original_count} total)")
         else:
             logger.info(f"Loading evictions from {len(df)} rows")
+
+        # Normalize column name: some CSVs use "Case Number" (with space)
+        if 'Case Number' in df.columns and 'CaseNumber' not in df.columns:
+            df = df.rename(columns={'Case Number': 'CaseNumber'})
 
         # Group by case number (plaintiff + defendant rows)
         grouped = df.groupby('CaseNumber')
@@ -318,6 +323,7 @@ class EvictionLoader(BaseLoader):
                         case_status=case_status_val,
                         associated_party=defendant_name,
                         secondary_party=plaintiff_name,
+                        county_id=self.county_id,
                         meta_data={
                             'case_type': case_type_val,
                             'party_address': party_address_val
@@ -442,6 +448,7 @@ class BankruptcyLoader(BaseLoader):
                         case_number=docket_number,
                         filing_date=self.parse_date(row.get('Date Filed')),
                         associated_party=lead_name_val,
+                        county_id=self.county_id,
                         meta_data={
                             'case_type': case_type_val,
                             'division': division_val,
@@ -618,6 +625,7 @@ class DivorceLoader(BaseLoader):
                         case_status=case_status_val,
                         associated_party=petitioner_name,
                         secondary_party=respondent_name,
+                        county_id=self.county_id,
                         meta_data={
                             "case_type": case_type_val,
                             "party_address": addr_used,

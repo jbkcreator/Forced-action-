@@ -153,6 +153,7 @@ class BuildingPermitLoader(BaseLoader):
                         issue_date=self.parse_date(row.get('Date')),
                         expire_date=parsed_expire,
                         is_enforcement_permit=enforcement,
+                        county_id=self.county_id,
                     )
                     
                     if self.safe_add(permit_record):

@@ -168,6 +168,7 @@ class TaxDelinquencyLoader(BaseLoader):
                         total_amount_due=amount_val,
                         certificate_data=certificate_data,
                         deed_app_date=None,
+                        county_id=self.county_id,
                     )
                     if self.safe_add(tax_record):
                         existing_map[key] = tax_record.id

@@ -313,6 +313,30 @@ async def _scrape_with_playwright(
     url = source.get("url", "")
     county_id = source.get("county_id", "")
 
+    # CF-bypass requires headful Playwright on Linux — headless launches get
+    # re-challenged by Cloudflare even on a warmed profile (see
+    # docs/PINELLAS_CLOUDFLARE_BYPASS.md). Auto-start Xvfb to provide a virtual
+    # display if one isn't already attached.
+    import os as _os
+    import subprocess as _subprocess
+    xvfb_proc = None
+    if cf_profile and not _os.environ.get("DISPLAY"):
+        try:
+            xvfb_proc = _subprocess.Popen(
+                ["Xvfb", ":99", "-screen", "0", "1920x1080x24"],
+                stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL,
+            )
+            _os.environ["DISPLAY"] = ":99"
+            await asyncio.sleep(0.5)
+            logger.info("[CF/PW] Started Xvfb on :99 for headful Playwright run")
+        except FileNotFoundError:
+            logger.warning("[CF/PW] Xvfb not installed — falling back to headless "
+                           "(CF may re-challenge)")
+
+    # Force headful when CF bypass is in play so automation markers don't
+    # trigger a fresh CF JS challenge.
+    pw_headless = (not headful) and (cf_profile is None)
+
     async with async_playwright() as p:
         if cf_profile:
             import psutil as _psutil
@@ -331,7 +355,7 @@ async def _scrape_with_playwright(
             context = await p.chromium.launch_persistent_context(
                 user_data_dir=profile_dir,
                 executable_path=cf_profile["edge_path"],
-                headless=not headful,
+                headless=pw_headless,
                 accept_downloads=True,
                 downloads_path=str(download_dir),
                 args=[
@@ -364,14 +388,75 @@ async def _scrape_with_playwright(
                 placeholders={"url": url, "start_date": start_str, "end_date": end_str},
                 county_id=county_id,
             )
+            # --- DEBUG: capture page state when result is empty ---
+            if df is None or df.empty:
+                try:
+                    import datetime as _dt
+                    import re as _re
+                    _ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    _dbg = download_dir / "debug"
+                    _dbg.mkdir(parents=True, exist_ok=True)
+
+                    _url = page.url
+                    _title = await page.title()
+                    logger.error("[liens][debug] URL: %s | Title: %s", _url, _title)
+
+                    _shot = _dbg / f"liens_debug_{county_id}_{_ts}.png"
+                    await page.screenshot(path=str(_shot), full_page=True)
+                    logger.error("[liens][debug] Screenshot: %s", _shot)
+
+                    _html_path = _dbg / f"liens_debug_{county_id}_{_ts}.html"
+                    _html_path.write_text(await page.content(), encoding="utf-8")
+                    logger.error("[liens][debug] HTML: %s", _html_path)
+
+                    _keywords = _re.compile(
+                        r"export|results|search|download|excel|csv", _re.IGNORECASE
+                    )
+                    _links = await page.locator("a, button").all()
+                    _found = []
+                    for _el in _links:
+                        try:
+                            _txt = (await _el.inner_text()).strip()
+                            _href = await _el.get_attribute("href") or ""
+                            if _keywords.search(_txt) or _keywords.search(_href):
+                                _found.append(f"{_txt!r} href={_href!r}")
+                        except Exception:
+                            pass
+                    logger.error("[liens][debug] Export-related elements (%d): %s",
+                                 len(_found), _found or ["<none found>"])
+                except Exception as _dbg_exc:
+                    logger.error("[liens][debug] Debug capture failed: %s", _dbg_exc)
+            # --- END DEBUG ---
             logger.info("[Playwright] Scraped %d rows", len(df) if df is not None else 0)
             return df
         except Exception as e:
             logger.error("[Playwright] Scrape failed: %s", e)
             logger.debug(traceback.format_exc())
+            # --- DEBUG: capture on unexpected exception bubble-up ---
+            try:
+                import datetime as _dt
+                _ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+                _dbg = download_dir / "debug"
+                _dbg.mkdir(parents=True, exist_ok=True)
+                logger.error("[liens][debug] URL: %s | Title: %s", page.url, await page.title())
+                _shot = _dbg / f"liens_debug_{county_id}_{_ts}.png"
+                await page.screenshot(path=str(_shot), full_page=True)
+                logger.error("[liens][debug] Screenshot: %s", _shot)
+            except Exception as _dbg_exc:
+                logger.error("[liens][debug] Debug capture failed: %s", _dbg_exc)
+            # --- END DEBUG ---
             return None
         finally:
-            await context.close()
+            try:
+                await context.close()
+            except Exception:
+                pass
+            if xvfb_proc is not None:
+                try:
+                    xvfb_proc.terminate()
+                    xvfb_proc.wait(timeout=3)
+                except Exception:
+                    pass
 
 
 # ---------------------------------------------------------------------------
@@ -777,10 +862,15 @@ def _load_ori_legal_proceedings(county_id: str, type_dir: Path, data_type: str) 
                 logger.info("[DB] Applied ColumnMapper for %s source_id=%s", data_type, source_id)
             except SkipMapping:
                 logger.warning("[DB] No ColumnMapper schema for %s — using built-in bridge", data_type)
-                df = df.rename(columns=_ORI_TO_LEGAL_COLS_FALLBACK)
         else:
             logger.warning("[DB] No source_id for %s/%s — using built-in bridge", county_id, data_type)
-            df = df.rename(columns=_ORI_TO_LEGAL_COLS_FALLBACK)
+
+        # Always apply the ORI fallback bridge as a second pass.
+        # ColumnMapper maps raw portal columns (InstrumentNumber → Instrument, DirectName → Grantor).
+        # The divorce/probate CSVs are already in ORI-normalized form (Instrument, Grantor, …)
+        # so ColumnMapper renames nothing, leaving CaseNumber absent. The fallback bridge
+        # converts those ORI names to canonical loader column names regardless.
+        df = df.rename(columns=_ORI_TO_LEGAL_COLS_FALLBACK)
 
         # Ensure name-part columns exist so loader name-assembly doesn't raise
         for col in ('FirstName', 'MiddleName'):
@@ -856,6 +946,14 @@ def _record_stats(total: int, success: bool, t0: float, county_id: str, error: s
 
 def main():
     import argparse
+    # Load .env so CF_BYPASS_BROWSER_PATH, ANTHROPIC_API_KEY, etc. are visible
+    # to find_edge_binary() and other helpers that read os.environ directly.
+    try:
+        from dotenv import load_dotenv
+        from pathlib import Path
+        load_dotenv(Path(__file__).resolve().parents[3] / ".env", override=False)
+    except ImportError:
+        pass
     from src.utils.scraper_db_helper import add_load_to_db_arg
 
     parser = argparse.ArgumentParser(

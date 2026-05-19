@@ -52,7 +52,8 @@ class CFProfileNotWarmedError(RuntimeError):
 
 def find_edge_binary() -> Optional[str]:
     """Return the first existing Edge / Chromium binary path, or None."""
-    for p in _EDGE_CANDIDATES:
+    candidates = [os.environ.get("CF_BYPASS_BROWSER_PATH")] + _EDGE_CANDIDATES[1:]
+    for p in candidates:
         if p and os.path.isfile(p):
             return p
     return None
@@ -74,7 +75,14 @@ async def _launch_edge(
     Low-level Playwright launch — assumes the profile dir already exists.
     cf_session_manager._validate_profile() uses this to do health checks
     without triggering an ensure_ready recursion.
+
+    Per docs/PINELLAS_CLOUDFLARE_BYPASS.md, CF re-challenges Playwright
+    headless launches even on a warmed profile (Linux). When `headless=False`
+    is requested on a headless host, an Xvfb display is auto-started so the
+    headful path can run without a physical display.
     """
+    import asyncio as _asyncio
+    import subprocess as _subprocess
     from playwright.async_api import async_playwright
 
     edge_path = find_edge_binary()
@@ -90,22 +98,47 @@ async def _launch_edge(
             f"Edge profile {profile_dir} does not exist on disk."
         )
 
-    async with async_playwright() as pw:
-        context = await pw.chromium.launch_persistent_context(
-            user_data_dir=str(profile_dir),
-            executable_path=edge_path,
-            headless=headless,
-            accept_downloads=accept_downloads,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-            ],
-            ignore_default_args=["--enable-automation"],
-        )
+    xvfb_proc = None
+    if not headless and not os.environ.get("DISPLAY"):
         try:
-            yield context
-        finally:
+            xvfb_proc = _subprocess.Popen(
+                ["Xvfb", ":99", "-screen", "0", "1280x800x24"],
+                stdout=_subprocess.DEVNULL,
+                stderr=_subprocess.DEVNULL,
+            )
+            os.environ["DISPLAY"] = ":99"
+            await _asyncio.sleep(0.5)
+        except FileNotFoundError:
+            logger.warning("[cf_bypass] Xvfb not installed — falling back to headless "
+                           "(CF may re-challenge)")
+            headless = True
+
+    try:
+        async with async_playwright() as pw:
+            context = await pw.chromium.launch_persistent_context(
+                user_data_dir=str(profile_dir),
+                executable_path=edge_path,
+                headless=headless,
+                accept_downloads=accept_downloads,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                ],
+                ignore_default_args=["--enable-automation"],
+            )
             try:
-                await context.close()
+                yield context
+            finally:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+    finally:
+        if xvfb_proc is not None:
+            try:
+                xvfb_proc.terminate()
+                xvfb_proc.wait(timeout=3)
             except Exception:
                 pass
 
@@ -116,7 +149,7 @@ async def launch_cf_bypass_context(
     profile_name: str,
     county_id: str,
     portal_url: str,
-    headless: bool = False,
+    headless: bool = False,  # CF re-challenges headless on Linux even when warmed
     accept_downloads: bool = True,
 ):
     """

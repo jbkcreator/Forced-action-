@@ -795,6 +795,7 @@ class MultiVerticalScorer:
 
         return {
             "property_id":     prop.id,
+            "county_id":       prop.county_id,
             "parcel_id":       prop.parcel_id,
             "address":         prop.address,
             "city":            prop.city,
@@ -1129,6 +1130,7 @@ class MultiVerticalScorer:
 
         record = DistressScore(
             property_id=property_id,
+            county_id=score_data.get("county_id", "hillsborough"),
             score_date=datetime.now(timezone.utc),
             final_cds_score=final_score,
             lead_tier=lead_tier,

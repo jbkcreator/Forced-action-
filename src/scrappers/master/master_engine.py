@@ -229,14 +229,18 @@ def extract_zips(directory: Path) -> list[Path]:
     """
     import zipfile
     extracted = []
-    for zip_path in list(directory.glob("*.zip")):
-        logger.info(f"Extracting {zip_path.name}...")
-        with zipfile.ZipFile(zip_path, 'r') as zf:
-            for member in zf.namelist():
-                zf.extract(member, directory)
-                extracted.append(directory / member)
-                logger.info(f"  -> {member}")
-        zip_path.unlink()
+    for zip_path in sorted(directory.glob("*.zip"), key=lambda p: p.stat().st_size, reverse=True):
+        try:
+            logger.info(f"Extracting {zip_path.name}...")
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                for member in zf.namelist():
+                    zf.extract(member, directory)
+                    extracted.append(directory / member)
+                    logger.info(f"  -> {member}")
+            zip_path.unlink()
+        except zipfile.BadZipFile:
+            logger.warning(f"Skipping {zip_path.name} ({zip_path.stat().st_size} bytes) — not a valid zip, likely a duplicate/stub download. Deleting.")
+            zip_path.unlink()
     return extracted
 
 

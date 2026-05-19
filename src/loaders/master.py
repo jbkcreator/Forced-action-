@@ -356,6 +356,7 @@ class MasterPropertyLoader(BaseLoader):
                     mailing_address=mailing_addr,
                     owner_type=owner_type,
                     absentee_status=absentee_status,
+                    county_id=self.county_id,
                 )
                 
                 # Last sale — try common HCPA column names
@@ -374,6 +375,7 @@ class MasterPropertyLoader(BaseLoader):
                     last_sale_date=sale_date,
                     last_sale_price=sale_price,
                     annual_tax_amount=None,
+                    county_id=self.county_id,
                 )
                 
                 self.session.add_all([property_record, owner_record, financial_record])

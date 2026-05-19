@@ -162,6 +162,41 @@ async def _scrape_with_playwright(
             )
         except PlaywrightCodeError as e:
             logger.error("[evictions] Playwright scrape failed: %s", e)
+            # --- DEBUG: capture page state before browser closes ---
+            try:
+                import datetime as _dt
+                _ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+                _dbg = RAW_EVICTIONS_DIR / "debug"
+                _dbg.mkdir(parents=True, exist_ok=True)
+
+                _url = page.url
+                _title = await page.title()
+                logger.error("[evictions][debug] URL: %s | Title: %s", _url, _title)
+
+                _shot = _dbg / f"evictions_debug_{county_id}_{_ts}.png"
+                await page.screenshot(path=str(_shot), full_page=True)
+                logger.error("[evictions][debug] Screenshot: %s", _shot)
+
+                _html_path = _dbg / f"evictions_debug_{county_id}_{_ts}.html"
+                _html_path.write_text(await page.content(), encoding="utf-8")
+                logger.error("[evictions][debug] HTML: %s", _html_path)
+
+                _keywords = re.compile(r"export|excel|download|csv|results", re.IGNORECASE)
+                _links = await page.locator("a, button").all()
+                _found = []
+                for _el in _links:
+                    try:
+                        _txt = (await _el.inner_text()).strip()
+                        _href = await _el.get_attribute("href") or ""
+                        if _keywords.search(_txt) or _keywords.search(_href):
+                            _found.append(f"{_txt!r} href={_href!r}")
+                    except Exception:
+                        pass
+                logger.error("[evictions][debug] Export-related elements (%d): %s",
+                             len(_found), _found or ["<none found>"])
+            except Exception as _dbg_exc:
+                logger.error("[evictions][debug] Debug capture failed: %s", _dbg_exc)
+            # --- END DEBUG ---
             raise
         finally:
             await browser.close()
@@ -351,14 +386,14 @@ def _normalize_style_col_format(df: pd.DataFrame) -> pd.DataFrame:
     format that Hillsborough uses and downstream loaders expect.
 
     Pinellas columns: Case Type, Case #, Filed, Style/Description, Status, Judicial Officer
-    Canonical format: CaseTypeDescription, Case Number, FilingDate, Title, PartyType,
+    Canonical format: CaseTypeDescription, CaseNumber, FilingDate, Title, PartyType,
                       LastName/CompanyName, PartyAddress
 
     Style/Description format: "PLAINTIFF NAME\nVs.\nDEFENDANT NAME"
     Each case row is expanded into two rows (Plaintiff + Defendant).
     """
     rename = {
-        "Case #":        "Case Number",
+        "Case #":        "CaseNumber",
         "Filed":         "FilingDate",
         "Case Type":     "CaseTypeDescription",
         "Status":        "Title",

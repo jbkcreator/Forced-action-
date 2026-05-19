@@ -209,37 +209,77 @@ async def _validate_profile(profile_name: str, portal_url: str) -> bool:
     """
     Launch Edge with the profile, GET the portal URL, check for CF challenge.
     Returns True if the session is healthy, False if blocked or unreachable.
+
+    Per docs/PINELLAS_CLOUDFLARE_BYPASS.md: Playwright headless is detected
+    by CF on Linux even with a warmed profile. Use headful via Xvfb (same
+    pattern as _auto_warm) and poll up to 30s for CF to auto-resolve.
     """
+    import os as _os
+    import subprocess as _subprocess
     from src.utils.cf_persistent_browser import (
         CFProfileNotWarmedError, _launch_edge,
     )
 
+    _xvfb_proc = None
+    if not _os.environ.get("DISPLAY"):
+        try:
+            _xvfb_proc = _subprocess.Popen(
+                ["Xvfb", ":99", "-screen", "0", "1280x800x24"],
+                stdout=_subprocess.DEVNULL,
+                stderr=_subprocess.DEVNULL,
+            )
+            _os.environ["DISPLAY"] = ":99"
+            await asyncio.sleep(0.5)
+        except FileNotFoundError:
+            pass
+
     try:
-        async with _launch_edge(profile_name=profile_name, headless=True) as ctx:
+        async with _launch_edge(
+            profile_name=profile_name,
+            headless=not bool(_os.environ.get("DISPLAY")),
+        ) as ctx:
             page = await ctx.new_page()
             try:
                 await page.goto(portal_url, wait_until="domcontentloaded",
                                 timeout=HEALTH_CHECK_TIMEOUT_SECONDS * 1000)
-                await asyncio.sleep(2)  # let any JS challenge settle
-                title = (await page.title()) or ""
-                body  = await page.evaluate("document.body ? document.body.innerText.slice(0,500) : ''")
             except Exception as exc:
                 logger.warning("[CFSess] validate %s: page load failed: %s", profile_name, exc)
                 return False
 
-        challenge_markers = ("just a moment", "checking your browser", "cf-challenge", "cf-mitigated")
-        text = (title + " " + body).lower()
-        if any(m in text for m in challenge_markers):
-            logger.info("[CFSess] validate %s: CF challenge detected — session expired",
-                        profile_name)
-            return False
-        return True
+            challenge_markers = ("just a moment", "checking your browser",
+                                 "cf-challenge", "cf-mitigated")
+            # Poll up to 30s for CF JS challenge to auto-resolve.
+            title = ""
+            body = ""
+            for _ in range(15):
+                await asyncio.sleep(2)
+                try:
+                    title = (await page.title()) or ""
+                    body = await page.evaluate(
+                        "document.body ? document.body.innerText.slice(0,500) : ''"
+                    )
+                except Exception:
+                    continue
+                text = (title + " " + body).lower()
+                if not any(m in text for m in challenge_markers):
+                    return True
+
+        logger.info("[CFSess] validate %s: CF challenge did not clear within 30s",
+                    profile_name)
+        return False
     except CFProfileNotWarmedError as exc:
         logger.info("[CFSess] validate %s: profile not warmed (%s)", profile_name, exc)
         return False
     except Exception as exc:
         logger.warning("[CFSess] validate %s: unexpected error: %s", profile_name, exc)
         return False
+    finally:
+        if _xvfb_proc is not None:
+            try:
+                _xvfb_proc.terminate()
+                _xvfb_proc.wait(timeout=3)
+            except Exception:
+                pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -268,14 +308,32 @@ async def _auto_warm(profile_name: str, portal_url: str) -> bool:
     profile_dir.mkdir(parents=True, exist_ok=True)
     _patch_nodriver_cookie_parser()
 
+    # Per docs/PINELLAS_CLOUDFLARE_BYPASS.md, headless=False is the validated
+    # path — nodriver's automation-marker patches are less effective in headless
+    # mode and CF can still detect the bot. On a headless Linux server we
+    # provide a virtual display via Xvfb (auto-started below if DISPLAY is unset).
+    import os as _os
+    import subprocess as _subprocess
+    _xvfb_proc = None
+    if not _os.environ.get("DISPLAY"):
+        try:
+            _xvfb_proc = _subprocess.Popen(
+                ["Xvfb", ":99", "-screen", "0", "1280x800x24"],
+                stdout=_subprocess.DEVNULL,
+                stderr=_subprocess.DEVNULL,
+            )
+            _os.environ["DISPLAY"] = ":99"
+            await asyncio.sleep(0.5)
+            logger.info("[CFSess] %s: started Xvfb on :99 for nodriver headful warm", profile_name)
+        except FileNotFoundError:
+            logger.warning("[CFSess] %s: Xvfb not installed — falling back to headless mode "
+                           "(may fail to pass CF challenge)", profile_name)
+
     browser = None
     try:
-        # nodriver headless=False is more reliable for CF challenges, but we
-        # accept the GUI as long as no human is required — the JS challenge
-        # auto-resolves in seconds when the profile is intact.
         browser = await asyncio.wait_for(
             uc.start(
-                headless=False,
+                headless=not bool(_os.environ.get("DISPLAY")),
                 browser_executable_path=edge_path,
                 user_data_dir=str(profile_dir),
             ),
@@ -309,6 +367,12 @@ async def _auto_warm(profile_name: str, portal_url: str) -> bool:
                 result = browser.stop()
                 if asyncio.iscoroutine(result):
                     await result
+            except Exception:
+                pass
+        if _xvfb_proc is not None:
+            try:
+                _xvfb_proc.terminate()
+                _xvfb_proc.wait(timeout=3)
             except Exception:
                 pass
 
@@ -509,6 +573,14 @@ def _cli_status() -> int:
 
 
 def main() -> int:
+    # Load .env so CF_BYPASS_BROWSER_PATH and other env vars are available
+    # when running as a standalone CLI (they are not inherited from the shell).
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(PROJECT_ROOT / ".env", override=False)
+    except ImportError:
+        pass
+
     ap = argparse.ArgumentParser(description="CF-bypass session manager")
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--warm",     metavar="PROFILE_NAME", help="Validate + auto-warm a profile")

@@ -553,7 +553,12 @@ class BaseLoader(ABC):
         block_match = re.search(r'\bB(?:LOCK|LK)\s+(\d+\w*)\b', legal)
 
         # Subdivision = text before the first structural keyword
-        subd_raw = re.split(r'\b(?:LOT|BLK|BLOCK|SEC|SECTION|UNIT|TRACT)\b', legal)[0].strip()
+        parts = re.split(r'\b(?:LOT|BLK|BLOCK|SEC|SECTION|UNIT|TRACT)\b', legal)
+        subd_raw = parts[0].strip()
+        # ORI often puts subdivision AFTER lot/block (e.g. "LOT 16 BLOCK 4 OAKWOOD ESTATES")
+        # Fallback: use the tail after the last structural keyword when prefix is empty.
+        if not subd_raw and len(parts) > 1:
+            subd_raw = parts[-1].strip()
         # Keep only words longer than 3 chars (skip filler like "OF", "THE")
         subd_words = [w for w in subd_raw.split() if len(w) > 3][:4]
 
@@ -570,8 +575,9 @@ class BaseLoader(ABC):
             lot_num = lot_match.group(1)
             filters.append(Property.legal_description.op('~*')(rf'\mLOT {lot_num}\M'))
         if block_match:
-            blk_text = block_match.group(0)  # e.g. "BLK 3" or "BLOCK 3"
-            filters.append(Property.legal_description.op('~*')(rf'\m{blk_text}\M'))
+            # Match either spelling: BLK 3 ↔ BLOCK 3 (ORI uses BLOCK, HCPA uses BLK)
+            blk_num = block_match.group(1)
+            filters.append(Property.legal_description.op('~*')(rf'\mB(LOCK|LK) {blk_num}\M'))
         for word in subd_words:
             filters.append(Property.legal_description.ilike(f'%{word}%'))
 

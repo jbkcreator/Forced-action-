@@ -248,6 +248,7 @@ class ViolationLoader(BaseLoader):
                         severity_tier=severity,
                         fine_amount=fine_amount_val,
                         is_lien=is_lien_val,
+                        county_id=self.county_id,
                     )
                     
                     if self.safe_add(violation_record):

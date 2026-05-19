@@ -415,6 +415,7 @@ class LienLoader(BaseLoader):
                         match_confidence=match_score,
                         match_method=match_method,
                         meta_data={'match_field': match_field},
+                        county_id=self.county_id,
                     )
 
                     if self.safe_add(lien_record):
