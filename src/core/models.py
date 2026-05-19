@@ -2213,6 +2213,10 @@ class County(Base):
     bankruptcy_division: Mapped[Optional[str]] = mapped_column(String(10))
     city_filer_keywords: Mapped[Optional[dict]] = mapped_column(JSONB, default=list)
     code_lien_type_map: Mapped[Optional[dict]] = mapped_column(JSONB, default=dict)
+    # Lowercase city/CDP tokens stripped from address suffixes during
+    # normalization. Source of truth for per-county address city stripping —
+    # replaces the hardcoded Hillsborough list previously in BaseLoader.
+    address_city_tokens: Mapped[Optional[list]] = mapped_column(JSONB, default=list)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
