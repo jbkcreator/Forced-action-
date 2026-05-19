@@ -145,12 +145,15 @@ class ProbateLoader(BaseLoader):
                     decedent_name = " ".join([str(first).strip(), str(middle).strip(), str(last).strip()]).strip()
                     decedent_name = " ".join(decedent_name.split()) or None
 
-                    # Beneficiary (optional)
+                    # Beneficiary (optional) — store full name so skip-trace can target by name
                     beneficiary = None
                     if 'PartyType' in group.columns and 'LastName/CompanyName' in group.columns:
                         ben_rows = group[group['PartyType'] == 'Beneficiary']
                         if not ben_rows.empty:
-                            beneficiary = _safe_str(ben_rows['LastName/CompanyName'].iloc[0])
+                            ben_row = ben_rows.iloc[0]
+                            ben_first = str(_none_if_nan(ben_row.get('FirstName')) or "").strip()
+                            ben_last  = _safe_str(ben_row.get('LastName/CompanyName')) or ""
+                            beneficiary = " ".join(p for p in [ben_first, ben_last] if p) or None
                     beneficiary = _none_if_nan(beneficiary)
 
                     # Other nullable fields

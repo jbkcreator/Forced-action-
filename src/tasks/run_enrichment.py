@@ -40,6 +40,10 @@ def run_enrichment_pipeline(
     idi_limit: int = _DEFAULT_IDI_LIMIT,
     skip_idi: bool = False,
     today_only: bool = True,
+    retrace: bool = False,
+    retrace_after_days: int = 60,
+    refresh_stale: bool = False,
+    refresh_stale_after_days: int = 90,
 ) -> dict:
     """
     Run the full enrichment pipeline for a county.
@@ -63,6 +67,10 @@ def run_enrichment_pipeline(
             limit=batchdata_limit,
             county_id=county_id,
             today_only=today_only,
+            retrace=retrace,
+            retrace_after_days=retrace_after_days,
+            refresh_stale=refresh_stale,
+            refresh_stale_after_days=refresh_stale_after_days,
         )
         results["batchdata"] = bd_stats
         logger.info(
@@ -147,6 +155,14 @@ if __name__ == "__main__":
                         help="Skip IDI fallback stage")
     parser.add_argument("--all-leads", dest="all_leads", action="store_true",
                         help="Skip-trace all un-traced Gold+ leads, not just today's (use with caution)")
+    parser.add_argument("--retrace", action="store_true",
+                        help="Re-attempt failed traces older than --retrace-after-days")
+    parser.add_argument("--retrace-after-days", dest="retrace_after_days", type=int, default=60,
+                        help="Minimum days since failed trace before retrying (default: 60)")
+    parser.add_argument("--refresh-stale", dest="refresh_stale", action="store_true",
+                        help="Re-enrich successfully traced leads with contact data older than --refresh-stale-after-days")
+    parser.add_argument("--refresh-stale-after-days", dest="refresh_stale_after_days", type=int, default=90,
+                        help="Minimum age of a successful trace before refreshing (default: 90)")
     args = parser.parse_args()
 
     try:
@@ -156,6 +172,10 @@ if __name__ == "__main__":
             idi_limit=args.idi_limit,
             skip_idi=args.skip_idi,
             today_only=not args.all_leads,
+            retrace=args.retrace,
+            retrace_after_days=args.retrace_after_days,
+            refresh_stale=args.refresh_stale,
+            refresh_stale_after_days=args.refresh_stale_after_days,
         )
         print(f"  BatchData enriched : {stats['batchdata'].get('success', 0)}")
         print(f"  IDI enriched       : {stats['idi'].get('success', 0)}")

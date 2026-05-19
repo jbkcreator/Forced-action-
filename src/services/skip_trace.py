@@ -28,7 +28,7 @@ from sqlalchemy import text
 
 from config.settings import get_settings
 from src.core.database import get_db_context
-from src.core.models import Owner, Property, EnrichedContact, DistressScore
+from src.core.models import Owner, Property, EnrichedContact, DistressScore, LegalProceeding
 from src.services.email import send_alert
 from src.utils.logger import setup_logging, get_logger
 
@@ -202,9 +202,21 @@ def _parse_result(person: dict) -> dict:
 # LLC agent name / address helpers
 # ---------------------------------------------------------------------------
 
+_ENTITY_SUFFIXES = frozenset([
+    "LLC", "CORP", "INC", "TRUST", "ESTATE", "FOUNDATION",
+    "ASSOCIATION", "LTD", "LP", "HOLDINGS", "PROPERTIES",
+])
+
+
+def _is_entity_name(name: str) -> bool:
+    """Return True if the name looks like an organization rather than a person."""
+    upper = name.upper()
+    return any(f" {kw}" in upper or upper.endswith(kw) for kw in _ENTITY_SUFFIXES)
+
+
 def _split_agent_name(name: str):
     """
-    Split a Sunbiz registered agent name into (first, last).
+    Split a name into (first, last).
     Handles "LAST, FIRST" and "FIRST LAST" formats.
     Returns ("", full_name) if ambiguous.
     """
@@ -260,6 +272,10 @@ def run_skip_trace(
     dry_run: bool = False,
     county_id: str = "hillsborough",
     today_only: bool = False,
+    retrace: bool = False,
+    retrace_after_days: int = 60,
+    refresh_stale: bool = False,
+    refresh_stale_after_days: int = 90,
 ) -> dict:
     """
     Enrich owner contacts for high-priority leads that are missing a phone.
@@ -273,12 +289,19 @@ def run_skip_trace(
     fill in the phone are the entire point of this widening.
 
     Args:
-        limit:      Max number of owners to process in this run.
-        tier_filter: Filter by lead tier (e.g. 'Gold', 'Platinum'). None = all tiers ≥ Gold.
-        dry_run:    If True, build payloads and print but do NOT call API or write DB.
-        county_id:  County to process.
-        today_only: If True, only process leads whose latest score was recorded today.
-                    Use this for daily cron runs to avoid spending credits on stale leads.
+        limit:                   Max number of owners to process in this run.
+        tier_filter:             Filter by lead tier (e.g. 'Gold', 'Platinum'). None = all tiers ≥ Gold.
+        dry_run:                 If True, build payloads and print but do NOT call API or write DB.
+        county_id:               County to process.
+        today_only:              If True, only process leads whose latest score was recorded today.
+        retrace:                 If True, re-attempt leads whose prior BatchData call returned no match
+                                 and are older than retrace_after_days.
+        retrace_after_days:      Minimum days since the failed trace before a lead qualifies for retry.
+        refresh_stale:           If True, re-enrich successfully traced leads whose contact data is
+                                 older than refresh_stale_after_days. Handles owners who have moved
+                                 or changed their number since the original trace.
+        refresh_stale_after_days: Minimum age of a successful trace before it qualifies for refresh.
+                                 Default 90 days.
 
     Returns:
         Stats dict with total/success/failed/skipped counts.
@@ -290,7 +313,7 @@ def run_skip_trace(
 
     api_key = settings.batch_skip_tracing_api_key.get_secret_value()
 
-    stats = {"total": 0, "success": 0, "failed": 0, "already_traced": 0, "no_address": 0}
+    stats = {"total": 0, "success": 0, "failed": 0, "already_traced": 0, "no_address": 0, "retraced": 0}
 
     # --- 1. Pull candidates from DB ---
     tier_values = ["Ultra Platinum", "Platinum", "Gold"]
@@ -349,17 +372,50 @@ def run_skip_trace(
             _sa_func.length(_sa_func.trim(Owner.phone_1)) == 0,
         )
 
-        # Exclude properties already attempted via BatchData — whether or
-        # not the prior call returned a match. The duplicate-charge guard
-        # in the inner loop catches these too, but excluding at SELECT
-        # means the per-run `limit` budget goes to fresh candidates
-        # instead of being consumed by already-tried-and-failed owners.
-        # Failed batches go through IDI fallback (Stage 2) on their own.
-        already_batch_traced = (
-            session.query(EnrichedContact.property_id)
-            .filter(EnrichedContact.source == "batch_skip_tracing")
-            .subquery()
-        )
+        # Exclude properties already attempted via BatchData.
+        # retrace=True:       re-queue failed traces older than retrace_after_days.
+        # refresh_stale=True: re-queue successful traces older than refresh_stale_after_days.
+        from sqlalchemy import or_ as sa_or
+        from datetime import timedelta
+
+        if refresh_stale:
+            stale_cutoff = datetime.now(timezone.utc) - timedelta(days=refresh_stale_after_days)
+            # Exclude only traces done recently — stale successful traces are let through.
+            already_batch_traced = (
+                session.query(EnrichedContact.property_id)
+                .filter(EnrichedContact.source == "batch_skip_tracing")
+                .filter(EnrichedContact.enriched_at > stale_cutoff)
+                .subquery()
+            )
+            logger.info(
+                "refresh_stale mode: re-queuing successful traces older than %d days (cutoff %s)",
+                refresh_stale_after_days,
+                stale_cutoff.strftime("%Y-%m-%d"),
+            )
+        elif retrace:
+            retrace_cutoff = datetime.now(timezone.utc) - timedelta(days=retrace_after_days)
+            already_batch_traced = (
+                session.query(EnrichedContact.property_id)
+                .filter(EnrichedContact.source == "batch_skip_tracing")
+                .filter(
+                    sa_or(
+                        EnrichedContact.match_success.is_(True),
+                        EnrichedContact.enriched_at > retrace_cutoff,
+                    )
+                )
+                .subquery()
+            )
+            logger.info(
+                "retrace mode: re-queuing failed traces older than %d days (cutoff %s)",
+                retrace_after_days,
+                retrace_cutoff.strftime("%Y-%m-%d"),
+            )
+        else:
+            already_batch_traced = (
+                session.query(EnrichedContact.property_id)
+                .filter(EnrichedContact.source == "batch_skip_tracing")
+                .subquery()
+            )
 
         # Also require an address — properties with no street or no ZIP
         # cannot be sent to BatchData (the no_address counter previously
@@ -371,23 +427,45 @@ def run_skip_trace(
             & (_sa_func.length(_sa_func.trim(Property.zip)) > 0)
         )
 
-        rows = (
+        q = (
             session.query(Owner, Property)
             .join(Property, Owner.property_id == Property.id)
             .join(ds_current, ds_current.c.property_id == Property.id)
-            .join(
-                ds_latest,
-                ds_latest.c.property_id == Property.id,
-            )
-            .filter(no_phone)
-            .filter(Owner.skip_trace_success.is_not(True))
+            .join(ds_latest, ds_latest.c.property_id == Property.id)
             .filter(Owner.county_id == county_id)
             .filter(Property.id.notin_(session.query(already_batch_traced)))
             .filter(addr_present)
-            .order_by(ds_latest.c.max_date.desc())   # freshest leads first
-            .limit(limit)
+        )
+
+        if refresh_stale:
+            # Stale refresh targets owners who WERE successfully traced — they already
+            # have a phone, so the no_phone and skip_trace_success filters must be off.
+            q = q.filter(Owner.skip_trace_success.is_(True))
+        else:
+            q = q.filter(no_phone).filter(Owner.skip_trace_success.is_not(True))
+
+        rows = q.order_by(ds_latest.c.max_date.desc()).limit(limit).all()
+
+        # Pre-fetch probate heirs for all candidate properties in one query.
+        # The beneficiary name (secondary_party) is the actual decision-maker
+        # for probate leads — we use it instead of the deceased owner's name.
+        property_ids = [p.id for _, p in rows]
+        probate_rows = (
+            session.query(LegalProceeding.property_id, LegalProceeding.secondary_party)
+            .filter(
+                LegalProceeding.property_id.in_(property_ids),
+                LegalProceeding.record_type == "Probate",
+                LegalProceeding.secondary_party.isnot(None),
+                sa_func.length(sa_func.trim(LegalProceeding.secondary_party)) > 0,
+            )
+            .order_by(LegalProceeding.filing_date.desc())
             .all()
         )
+        # Keep most recent heir per property
+        probate_heir_by_property: dict = {}
+        for pid, heir_name in probate_rows:
+            if pid not in probate_heir_by_property:
+                probate_heir_by_property[pid] = heir_name
 
     if not rows:
         logger.info("No candidates found — every high-priority owner already has a usable phone.")
@@ -432,19 +510,44 @@ def run_skip_trace(
                     f"[LLC] property_id={prop.id} tracing agent: {first_name} {last_name} @ {agent_addr['street']}"
                 )
             elif owner.owner_type in ("LLC", "Corporate", "Trust", "Estate"):
-                # Non-individual with no registered agent — a property-address lookup
-                # would match historical residents, not the actual decision-maker. Skip.
-                stats["no_address"] += 1
+                # Non-individual with no registered agent.
+                # Exception: Estate owners with a known probate heir — trace the heir.
+                heir = probate_heir_by_property.get(prop.id)
+                if not heir or _is_entity_name(heir):
+                    stats["no_address"] += 1
+                    logger.debug(
+                        f"Skipping property_id={prop.id} — owner_type={owner.owner_type!r} "
+                        f"with no registered agent ({owner.owner_name!r})"
+                    )
+                    continue
+                first_name, last_name = _split_agent_name(heir)
+                street   = (prop.address or "").strip()
+                zip_code = (prop.zip or "").strip()[:5]
+                if not street or not zip_code:
+                    stats["no_address"] += 1
+                    continue
+                payload_entry = {
+                    "firstName": first_name,
+                    "lastName":  last_name,
+                    "propertyAddress": {
+                        "street": street,
+                        "city":   (prop.city or "Tampa").strip(),
+                        "state":  (prop.state or "FL").strip(),
+                        "zip":    zip_code,
+                    },
+                }
                 logger.debug(
-                    f"Skipping property_id={prop.id} — owner_type={owner.owner_type!r} "
-                    f"with no registered agent ({owner.owner_name!r})"
+                    f"[Probate/Estate] property_id={prop.id} tracing heir: "
+                    f"{first_name} {last_name}"
                 )
-                continue
             else:
-                # Individual owner — use property address as before
-                street = (prop.address or "").strip()
-                city   = (prop.city or "Tampa").strip()
-                state  = (prop.state or "FL").strip()
+                # Individual owner — check for probate heir first.
+                # If heir is known, target them by name; otherwise fall back to
+                # a blind property-address lookup (which would return the deceased).
+                heir     = probate_heir_by_property.get(prop.id)
+                street   = (prop.address or "").strip()
+                city     = (prop.city or "Tampa").strip()
+                state    = (prop.state or "FL").strip()
                 zip_code = (prop.zip or "").strip()[:5]
 
                 if not street or not zip_code:
@@ -452,14 +555,31 @@ def run_skip_trace(
                     logger.debug(f"Skipping property_id={prop.id} — missing address or ZIP")
                     continue
 
-                payload_entry = {
-                    "propertyAddress": {
-                        "street": street,
-                        "city":   city,
-                        "state":  state,
-                        "zip":    zip_code,
+                if heir and not _is_entity_name(heir):
+                    first_name, last_name = _split_agent_name(heir)
+                    payload_entry = {
+                        "firstName": first_name,
+                        "lastName":  last_name,
+                        "propertyAddress": {
+                            "street": street,
+                            "city":   city,
+                            "state":  state,
+                            "zip":    zip_code,
+                        },
                     }
-                }
+                    logger.debug(
+                        f"[Probate/Individual] property_id={prop.id} tracing heir: "
+                        f"{first_name} {last_name}"
+                    )
+                else:
+                    payload_entry = {
+                        "propertyAddress": {
+                            "street": street,
+                            "city":   city,
+                            "state":  state,
+                            "zip":    zip_code,
+                        }
+                    }
 
             payloads.append(payload_entry)
             index_map.append((owner, prop))
@@ -533,10 +653,12 @@ def run_skip_trace(
                     )
 
                     if existing:
-                        stats["already_traced"] += 1
-                        # Already enriched once — skip the cost log to avoid
-                        # double-counting (we billed when the original ran).
-                        continue
+                        if refresh_stale or (retrace and not existing.match_success):
+                            pass  # fall through to update in place below
+                        else:
+                            stats["already_traced"] += 1
+                            # Already enriched once — skip cost log to avoid double-counting.
+                            continue
 
                     # Cost log — one row per BatchData lookup, success or fail.
                     # fa005 (2026-05-04). Best-effort; failures don't break flow.
@@ -548,21 +670,32 @@ def run_skip_trace(
                         property_id=owner.property_id,
                     )
 
-                    # Save EnrichedContact
-                    ec = EnrichedContact(
-                        property_id=owner.property_id,
-                        county_id=owner.county_id or county_id,
-                        mobile_phone=parsed["mobile_phone"],
-                        landline=parsed["landline"],
-                        email=parsed["email"],
-                        mailing_address=parsed["mailing_address"],
-                        llc_owner_name=parsed["llc_owner_name"],
-                        relative_contacts=parsed["relative_contacts"],
-                        source="batch_skip_tracing",
-                        match_success=parsed["match_success"],
-                        enriched_at=datetime.now(timezone.utc),
-                    )
-                    session.add(ec)
+                    # Save or update EnrichedContact
+                    if (retrace or refresh_stale) and existing:
+                        # Update the stale failed record in place
+                        existing.mobile_phone    = parsed["mobile_phone"]
+                        existing.landline        = parsed["landline"]
+                        existing.email           = parsed["email"]
+                        existing.mailing_address = parsed["mailing_address"]
+                        existing.match_success   = parsed["match_success"]
+                        existing.enriched_at     = datetime.now(timezone.utc)
+                        if parsed["match_success"]:
+                            stats["retraced"] += 1
+                    else:
+                        ec = EnrichedContact(
+                            property_id=owner.property_id,
+                            county_id=owner.county_id or county_id,
+                            mobile_phone=parsed["mobile_phone"],
+                            landline=parsed["landline"],
+                            email=parsed["email"],
+                            mailing_address=parsed["mailing_address"],
+                            llc_owner_name=parsed["llc_owner_name"],
+                            relative_contacts=parsed["relative_contacts"],
+                            source="batch_skip_tracing",
+                            match_success=parsed["match_success"],
+                            enriched_at=datetime.now(timezone.utc),
+                        )
+                        session.add(ec)
 
                     # Update Owner contact fields + phone metadata
                     meta_for_phone_1 = None
@@ -612,6 +745,7 @@ def run_skip_trace(
     logger.info("SKIP TRACE COMPLETE")
     logger.info(f"  Total processed : {stats['total']}")
     logger.info(f"  Success         : {stats['success']}")
+    logger.info(f"  Retraced (new)  : {stats['retraced']}")
     logger.info(f"  No contact found: {stats['failed']}")
     logger.info(f"  Already traced  : {stats['already_traced']}")
     logger.info(f"  No address      : {stats['no_address']}")
@@ -641,6 +775,14 @@ if __name__ == "__main__":
     parser.add_argument("--county-id", dest="county_id", default="hillsborough")
     parser.add_argument("--today-only", dest="today_only", action="store_true",
                         help="Only skip-trace leads scored today (safe for daily cron)")
+    parser.add_argument("--retrace", action="store_true",
+                        help="Re-attempt failed traces older than --retrace-after-days")
+    parser.add_argument("--retrace-after-days", dest="retrace_after_days", type=int, default=60,
+                        help="Minimum days since failed trace before retrying (default: 60)")
+    parser.add_argument("--refresh-stale", dest="refresh_stale", action="store_true",
+                        help="Re-enrich successfully traced leads whose contact data is older than --refresh-stale-after-days")
+    parser.add_argument("--refresh-stale-after-days", dest="refresh_stale_after_days", type=int, default=90,
+                        help="Minimum age of a successful trace before refreshing (default: 90)")
     args = parser.parse_args()
 
     try:
@@ -651,6 +793,10 @@ if __name__ == "__main__":
             dry_run=args.dry_run,
             county_id=args.county_id,
             today_only=args.today_only,
+            retrace=args.retrace,
+            retrace_after_days=args.retrace_after_days,
+            refresh_stale=args.refresh_stale,
+            refresh_stale_after_days=args.refresh_stale_after_days,
         )
         sys.exit(0)
     except Exception as e:

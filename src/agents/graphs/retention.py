@@ -210,6 +210,11 @@ def _node_build_context(state: RetentionState) -> RetentionState:
 	system, user, variant, test_name = render_for_subscriber_auto(
 		GRAPH_NAME, state["subscriber_id"], ctx
 	)
+	if not user.strip():
+		return {
+			"terminal_status": "failed",
+			"failure_reason": "retention:empty_user_prompt — check retention/system.yaml user: block",
+		}
 	fallback = render_fallback_body(GRAPH_NAME, ctx)
 	return {
 		"_system_prompt": system,

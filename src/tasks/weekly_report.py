@@ -23,7 +23,7 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from sqlalchemy import func
+from sqlalchemy import func, text as sa_text
 
 from src.core.database import get_db_context
 from src.core.models import (
@@ -58,6 +58,11 @@ VERTICAL_DISPLAY = {
 
 GOLD_PLUS_TIERS = {"Ultra Platinum", "Platinum", "Gold"}
 
+# Scrapers excluded from daily match-% calculation.
+# Sunbiz is an owner-lookup scraper; it never produces property-ID matches
+# and inflates the denominator, causing wild day-to-day match% swings.
+MATCH_PCT_EXCLUDE = {"sunbiz"}
+
 _FRESHNESS_MAP = {
     "permits":          (BuildingPermit,   BuildingPermit.date_added,   None),
     "roofing_permits":  (BuildingPermit,   BuildingPermit.date_added,   None),
@@ -79,6 +84,37 @@ _FRESHNESS_MAP = {
     "lien_ccl":         (LegalAndLien,     LegalAndLien.date_added,     None),
     "lien_tl":          (LegalAndLien,     LegalAndLien.date_added,     None),
 }
+
+
+def _query_tier_snapshot(session, as_of: date, county_id: str) -> dict:
+    """
+    Return tier counts from the full property portfolio as of as_of.
+
+    Uses DISTINCT ON to select each property's latest score, so a property
+    scored multiple times this week counts only once at its current tier.
+    This is the correct source for the tier breakdown — platform_daily_stats
+    .tier_* only covers properties in that day's incremental batch.
+    """
+    rows = session.execute(
+        sa_text("""
+            SELECT lead_tier, COUNT(*) AS cnt
+            FROM (
+                SELECT DISTINCT ON (property_id) lead_tier
+                FROM distress_scores
+                WHERE county_id = :county_id
+                  AND date(score_date) <= :as_of
+                ORDER BY property_id, score_date DESC
+            ) latest
+            WHERE lead_tier IS NOT NULL
+            GROUP BY lead_tier
+        """),
+        {"county_id": county_id, "as_of": str(as_of)},
+    ).fetchall()
+    tier_counts = {"Ultra Platinum": 0, "Platinum": 0, "Gold": 0, "Silver": 0, "Bronze": 0}
+    for tier, cnt in rows:
+        if tier in tier_counts:
+            tier_counts[tier] = int(cnt)
+    return tier_counts
 
 
 def _week_range(week_ending: date):
@@ -123,13 +159,14 @@ def _build_scraper_section(session, monday: date, friday: date, county_id: str):
     extras  = sorted(t for t in agg if t not in SCRAPER_ORDER)
 
     scraper_data = []
-    total_scraped = total_matched = 0
+    total_scraped = total_matched = 0  # property-matching scrapers only (excludes MATCH_PCT_EXCLUDE)
     week_errors = []
 
     for source_type in ordered + extras:
         a = agg[source_type]
-        total_scraped += a["scraped"]
-        total_matched += a["matched"]
+        if source_type not in MATCH_PCT_EXCLUDE:
+            total_scraped += a["scraped"]
+            total_matched += a["matched"]
         scraper_data.append({
             "label":    source_type.replace("_", " ").title(),
             "scraped":  a["scraped"],
@@ -155,7 +192,17 @@ def _build_scraper_section(session, monday: date, friday: date, county_id: str):
 
 
 def _build_scoring_section(session, monday: date, friday: date, county_id: str, errors: list):
-    """Sum leads_new/updated over the week; use last available day for snapshot."""
+    """
+    Aggregate scoring stats for the week.
+
+    properties_scored — sum across all daily runs (each day scores a batch).
+    leads_new/updated — summed across the week (flow metrics).
+    properties_with_signals / leads_unchanged — end-of-week snapshot from the
+      last available platform_daily_stats row (point-in-time stock metrics).
+    tiers — queried directly from distress_scores DISTINCT ON latest score per
+      property; platform_daily_stats.tier_* only covers that day's scored batch
+      and must NOT be used for the portfolio-wide tier breakdown.
+    """
     platform_rows = (
         session.query(PlatformDailyStats)
         .filter(
@@ -175,26 +222,26 @@ def _build_scoring_section(session, monday: date, friday: date, county_id: str, 
             {"Ultra Platinum": 0, "Platinum": 0, "Gold": 0, "Silver": 0, "Bronze": 0},
         )
 
-    last = platform_rows[-1]  # end-of-week snapshot for scored/tiers
+    last = platform_rows[-1]
     scoring = {
-        "properties_scored":       last.properties_scored,
+        "properties_scored":       sum(r.properties_scored for r in platform_rows),
         "properties_with_signals": last.properties_with_signals,
-        "leads_new":      sum(r.leads_new     for r in platform_rows),
-        "leads_updated":  sum(r.leads_updated for r in platform_rows),
-        "leads_unchanged":last.leads_unchanged,
+        "leads_new":               sum(r.leads_new     for r in platform_rows),
+        "leads_updated":           sum(r.leads_updated for r in platform_rows),
+        "leads_unchanged":         last.leads_unchanged,
     }
-    tiers = {
-        "Ultra Platinum": last.tier_ultra_platinum,
-        "Platinum":       last.tier_platinum,
-        "Gold":           last.tier_gold,
-        "Silver":         last.tier_silver,
-        "Bronze":         last.tier_bronze,
-    }
+    tiers = _query_tier_snapshot(session, friday, county_id)
     return scoring, tiers
 
 
 def _build_daily_scraper_totals(session, monday: date, friday: date, county_id: str) -> list:
-    """Total scraped per day across all scrapers — for the day-by-day table."""
+    """
+    Total scraped per day across property-matching scrapers — for the day-by-day table.
+
+    MATCH_PCT_EXCLUDE scrapers (e.g. sunbiz) are omitted: they do owner lookups,
+    never produce property-ID matches, and cause multi-percentage-point match%
+    swings on the days they run.  They appear in the per-scraper summary table.
+    """
     rows = (
         session.query(
             ScraperRunStats.run_date,
@@ -205,6 +252,7 @@ def _build_daily_scraper_totals(session, monday: date, friday: date, county_id: 
             ScraperRunStats.run_date >= monday,
             ScraperRunStats.run_date <= friday,
             ScraperRunStats.county_id == county_id,
+            ScraperRunStats.source_type.notin_(MATCH_PCT_EXCLUDE),
         )
         .group_by(ScraperRunStats.run_date)
         .order_by(ScraperRunStats.run_date)
@@ -333,7 +381,7 @@ def write_csv(report: dict, path: Path) -> None:
         w.writerow([])
 
         # ── Section 1: Scraper Ingest (weekly totals) ─────────────────────
-        w.writerow(["SCRAPER INGEST (WEEKLY TOTALS)"])
+        w.writerow(["SCRAPER INGEST (WEEKLY TOTALS — match% excludes owner-lookup scrapers e.g. sunbiz)"])
         w.writerow([
             f"Total: {report['total_scraped']:,} scraped | "
             f"{report['total_matched']:,} matched ({report['match_pct']:.1f}%)"
@@ -357,8 +405,8 @@ def write_csv(report: dict, path: Path) -> None:
         w.writerow([])
 
         # ── Section 3: Scoring Summary ────────────────────────────────────
-        w.writerow(["SCORING"])
-        w.writerow([f"Total Properties Scored (end of week): {report['scoring']['properties_scored']:,}"])
+        w.writerow(["SCORING (properties_scored = weekly run total; tiers = full portfolio snapshot)"])
+        w.writerow([f"Total Properties Scored (this week): {report['scoring']['properties_scored']:,}"])
         w.writerow([])
         w.writerow(["Metric", "Count"])
         for key, label in [
@@ -371,7 +419,7 @@ def write_csv(report: dict, path: Path) -> None:
         w.writerow([])
 
         # ── Section 4: Tier Breakdown (end of week snapshot) ──────────────
-        w.writerow(["TIER BREAKDOWN (end of week)"])
+        w.writerow([f"TIER BREAKDOWN (full portfolio snapshot as of {report['week_end']})"])
         w.writerow(["Tier", "Count"])
         for tier, count in report["tiers"].items():
             w.writerow([tier, f"{count:,}"])
