@@ -101,6 +101,12 @@ def _node_compose(state: ComposeAndSendState) -> ComposeAndSendState:
 	max_tokens = int(state.get("max_output_tokens") or 240)
 	cache_system = bool(state.get("cache_system", False))
 
+	if not user.strip():
+		return {
+			"terminal_status": "failed",
+			"failure_reason": "compose:empty_user_prompt",
+		}
+
 	messages: List[Dict[str, Any]] = [{"role": "user", "content": user}]
 
 	try:

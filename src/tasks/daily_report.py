@@ -74,6 +74,11 @@ VERTICAL_DISPLAY = {
 
 GOLD_PLUS_TIERS = {"Ultra Platinum", "Platinum", "Gold"}
 
+# Scrapers excluded from the top-level match-% summary.
+# Sunbiz does owner lookups; it never produces property-ID matches and
+# deflates the overall match rate on the days it runs.
+MATCH_PCT_EXCLUDE = {"sunbiz"}
+
 # Maps scraper source_type → (Model, date_field, optional filter)
 # Used to compute newest record age per scraper.
 _FRESHNESS_MAP = {
@@ -119,8 +124,9 @@ def _build_scraper_section(session, run_date: date, county_id: str):
 
     for source_type in ordered + extras:
         row = scraper_by_type[source_type]
-        total_scraped += row.total_scraped
-        total_matched += row.matched
+        if source_type not in MATCH_PCT_EXCLUDE:
+            total_scraped += row.total_scraped
+            total_matched += row.matched
         scraper_data.append({
             "label":    source_type.replace("_", " ").title(),
             "scraped":  row.total_scraped,
