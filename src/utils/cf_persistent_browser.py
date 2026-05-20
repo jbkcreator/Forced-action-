@@ -98,8 +98,9 @@ async def _launch_edge(
             f"Edge profile {profile_dir} does not exist on disk."
         )
 
+    import sys as _sys
     xvfb_proc = None
-    if not headless and not os.environ.get("DISPLAY"):
+    if not headless and not os.environ.get("DISPLAY") and _sys.platform != "win32":
         try:
             xvfb_proc = _subprocess.Popen(
                 ["Xvfb", ":99", "-screen", "0", "1280x800x24"],

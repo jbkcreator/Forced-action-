@@ -49,7 +49,7 @@ COUNTY_ID=hillsborough
 
 # 5. Liens + Deeds + Judgments — 05:00 AM UTC / 01:00 AM EDT / 10:30 AM IST
 #    Replaces the previous 3 separate scraper jobs (liens/deeds/judgments)
-0 5 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.liens.lien_engine --mode combined --start-date $(date -d "1 day ago" +\%Y-\%m-\%d) --load-to-db --county-id $COUNTY_ID
+0 5 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.liens.lien_engine --start-date $(date -d "1 day ago" +\%Y-\%m-\%d) --load-to-db --county-id $COUNTY_ID
 
 # 8. Building Permits — 3x/day at 05:45, 13:45, 21:45 UTC (every 8h, Mon-Sat).
 #    Bumped from 1x to 3x to keep permit-driven distress signals fresh through the day.
@@ -64,7 +64,7 @@ COUNTY_ID=hillsborough
 # 10. Foreclosure Auctions   — 06:15 AM UTC daily (every day, not just Mon-Sat).
 #     Runs with --date=today; portal lists auctions scheduled for that date.
 #     Daily cadence ensures Sunday-scheduled auctions are captured the same day.
-15 6 * * * $PROJECT/scripts/cron/run.sh src.scrappers.foreclosures.foreclosure_engine --date $(date +\%Y-\%m-\%d) --load-to-db --scraper ai --county-id $COUNTY_ID
+15 6 * * * $PROJECT/scripts/cron/run.sh src.scrappers.foreclosures.foreclosure_engine --date $(date +\%Y-\%m-\%d) --load-to-db --county-id $COUNTY_ID
 
 # 11. Roofing Permits (classify from building_permits) — 06:17 AM UTC / 02:17 AM EDT / 11:47 AM IST
 17 6 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.roofing_permits.roofing_permit_engine --county-id $COUNTY_ID
@@ -89,6 +89,34 @@ COUNTY_ID=hillsborough
 
 # 16. Load Validator — 06:30 AM UTC Mon-Sat (after all scrapers complete)
 30 6 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.load_validator
+
+# ── PINELLAS DAILY ────────────────────────────────────────────
+# Staggered +5 min after their Hillsborough counterparts within 04:00–06:30 UTC window.
+# Violations: SKIP — PRR-only, loaded manually.
+
+# P1. Bankruptcy Filings     — 04:20 AM UTC / 12:20 AM EDT / 09:50 AM IST
+20 4 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.bankruptcy.bankruptcy_engine --lookback 1 --load-to-db --county-id pinellas
+
+# P2. Eviction Filings       — 04:35 AM UTC / 12:35 AM EDT / 10:05 AM IST
+35 4 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.evictions.evictions_engine --start-date $(date -d "1 day ago" +\%Y-\%m-\%d) --end-date $(date +\%Y-\%m-\%d) --load-to-db --county-id pinellas
+
+# P3. Probate Filings        — 04:50 AM UTC / 12:50 AM EDT / 10:20 AM IST
+50 4 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.probate.probate_engine --load-to-db --county-id pinellas
+
+# P4. Divorce / Dissolution  — 04:52 AM UTC / 12:52 AM EDT / 10:22 AM IST
+52 4 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.divorce.divorce_engine --load-to-db --county-id pinellas
+
+# P5. Liens + Deeds + Judgments — 05:05 AM UTC / 01:05 AM EDT / 10:35 AM IST
+5 5 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.liens.lien_engine --start-date $(date -d "1 day ago" +\%Y-\%m-\%d) --end-date $(date +\%Y-\%m-\%d) --load-to-db --county-id pinellas
+
+# P6. Building Permits       — 3x/day at 05:50, 13:50, 21:50 UTC (every 8h, Mon-Sat)
+50 5,13,21 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.permit.permit_engine --start-date $(date -d "1 day ago" +\%Y-\%m-\%d) --end-date $(date +\%Y-\%m-\%d) --load-to-db --county-id pinellas
+
+# P7. Foreclosure Auctions   — 06:20 AM UTC daily (every day, not just Mon-Sat)
+20 6 * * * $PROJECT/scripts/cron/run.sh src.scrappers.foreclosures.foreclosure_engine --date $(date +\%Y-\%m-\%d) --load-to-db --county-id pinellas
+
+# P8. Skip Tracing (Pinellas) — 07:38 AM UTC Mon-Sat (after CDS rescore-all 07:00)
+38 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.run_enrichment pinellas --limit 500
 
 # 17. Lead Quality Monitor — 07:35 AM UTC Mon-Sat (after CDS scoring at 07:00, skip tracing at 07:30)
 #     Snapshots leads sent ~30 days ago; computes Gold+ false-positive rate.

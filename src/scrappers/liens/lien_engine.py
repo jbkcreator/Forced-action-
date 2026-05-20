@@ -46,6 +46,7 @@ from config.constants import (
     BROWSER_TEMPERATURE,
 )
 from src.utils.county_config import get_county_config
+from src.utils.http_helpers import STEALTH_UA, STEALTH_ARGS, apply_stealth_to_browser_use
 from src.utils.logger import setup_logging, get_logger
 
 setup_logging()
@@ -190,11 +191,6 @@ def _template_task(source: dict, start_str: str, end_str: str) -> str:
 # Browser-use agent (file download mode)
 # ---------------------------------------------------------------------------
 
-_STEALTH_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/136.0.0.0 Safari/537.36"
-)
 
 
 async def run_browser_agent(
@@ -263,14 +259,16 @@ async def run_browser_agent(
         )
     else:
         browser_kwargs.update(
-            user_agent=_STEALTH_UA,
+            user_agent=STEALTH_UA,
             enable_default_extensions=True,
         )
 
     browser = Browser(**browser_kwargs)
+    await browser.start()
 
     if not cf_profile:
-        logger.info("[Stealth] Using --disable-blink-features=AutomationControlled (CDP init script skipped)")
+        await apply_stealth_to_browser_use(browser)
+        logger.info("[Stealth] Stealth fingerprint patches injected")
 
     agent = Agent(task=task, llm=llm, browser=browser, max_steps=60, use_judge=False)
 

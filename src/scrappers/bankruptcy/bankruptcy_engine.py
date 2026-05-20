@@ -172,8 +172,9 @@ def filter_tampa_bankruptcies(dockets: List[Dict[str, Any]], division_prefix: st
 
 
 def save_bankruptcy_leads(
-	leads: List[Dict[str, Any]], 
-	output_filename: str = "tampa_bankruptcy_leads.csv"
+	leads: List[Dict[str, Any]],
+	output_filename: str = "tampa_bankruptcy_leads.csv",
+	county_id: str = "hillsborough",
 ) -> Optional[Path]:
 	"""
 	Save bankruptcy leads to a CSV file with deduplication.
@@ -214,7 +215,7 @@ def save_bankruptcy_leads(
 		logger.info("=" * 60)
 		
 		initial_count = len(df)
-		df_new = filter_new_records(df, 'bankruptcy', record_type='Bankruptcy')
+		df_new = filter_new_records(df, 'bankruptcy', record_type='Bankruptcy', county_id=county_id)
 		
 		if df_new.empty:
 			logger.info("✓ All bankruptcies already exist in database - nothing new")
@@ -306,7 +307,7 @@ def run_bankruptcy_pipeline(lookback_days: int = 1, county_id: str = "hillsborou
 		logger.info("\n[STEP 3/3] Saving processed bankruptcy leads...")
 		today = datetime.now().strftime("%Y%m%d")
 		output_filename = f"tampa_bankruptcy_leads_{today}.csv"
-		output_path = save_bankruptcy_leads(tampa_leads, output_filename)
+		output_path = save_bankruptcy_leads(tampa_leads, output_filename, county_id=county_id)
 
 		if not output_path:
 			logger.error("Failed to save bankruptcy leads")

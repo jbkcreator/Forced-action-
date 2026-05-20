@@ -55,7 +55,8 @@ class DeedLoader(BaseLoader):
             # Check for duplicates
             if skip_duplicates:
                 existing = self.session.query(Deed).filter(
-                    Deed.instrument_number == instrument
+                    Deed.instrument_number == instrument,
+                    Deed.county_id == self.county_id,
                 ).first()
                 if existing:
                     logger.debug(f"Skipping duplicate deed: {instrument}")

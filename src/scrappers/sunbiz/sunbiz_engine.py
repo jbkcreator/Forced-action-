@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 from src.core.database import get_db_context
 from src.core.models import Owner, Property
 from src.utils.logger import setup_logging, get_logger
+from src.utils.http_helpers import STEALTH_UA, STEALTH_ARGS, apply_stealth_to_page
 
 setup_logging()
 logger = get_logger(__name__)
@@ -133,24 +134,18 @@ async def _run_playwright_batch(
     headless: bool = True,
 ) -> None:
     from playwright.async_api import async_playwright
-    from playwright_stealth import Stealth
 
     async with async_playwright() as pw:
-        launch_args = [] if not headless else ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
         browser = await pw.chromium.launch(
             headless=headless,
-            args=launch_args,
+            args=STEALTH_ARGS,
         )
         context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
-            ),
+            user_agent=STEALTH_UA,
             viewport={"width": 1920, "height": 1080},
         )
         page = await context.new_page()
-        await Stealth().apply_stealth_async(page)
+        await apply_stealth_to_page(page)
 
         try:
             total = len(owners)

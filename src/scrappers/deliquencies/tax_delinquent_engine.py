@@ -51,6 +51,7 @@ from config.constants import (
     BROWSER_TEMPERATURE,
 )
 from src.utils.county_config import get_county_config as _get_county
+from src.utils.http_helpers import STEALTH_UA, STEALTH_ARGS, apply_stealth_to_browser_use
 from src.core.database import get_db_context
 from src.core.models import TaxDelinquency, Property
 from src.utils.logger import setup_logging, get_logger
@@ -237,30 +238,16 @@ async def download_tax_delinquent_report(
         headless=not headful,
         disable_security=True,
         downloads_path=str(REFERENCE_DATA_DIR),
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/136.0.0.0 Safari/537.36"
-        ),
+        user_agent=STEALTH_UA,
         ignore_default_args=["--enable-automation"],
         enable_default_extensions=True,
         minimum_wait_page_load_time=1.5,
         wait_between_actions=1.0,
-        args=[
-            '--no-sandbox',
-            '--disable-blink-features=AutomationControlled',
-            '--window-size=1920,1080',
-        ],
+        args=STEALTH_ARGS,
     )
 
     await browser.start()
-    from playwright_stealth import Stealth
-    stealth = Stealth(
-        chrome_runtime=True, navigator_webdriver=True, navigator_plugins=True, webgl_vendor=True,
-        webgl_vendor_override="Google Inc. (Intel)",
-        webgl_renderer_override="ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)",
-    )
-    await browser._cdp_add_init_script(stealth.script_payload)
+    await apply_stealth_to_browser_use(browser)
 
     agent = Agent(task=task, llm=llm, browser=browser, max_steps=80, use_judge=False)
 

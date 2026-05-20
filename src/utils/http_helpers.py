@@ -11,6 +11,51 @@ import requests
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Stealth constants — import these instead of defining locally in each scraper
+# ---------------------------------------------------------------------------
+
+STEALTH_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/136.0.0.0 Safari/537.36"
+)
+
+STEALTH_ARGS = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-blink-features=AutomationControlled",
+    "--window-size=1920,1080",
+]
+
+
+def get_stealth():
+    """Return a configured playwright_stealth Stealth instance."""
+    from playwright_stealth import Stealth
+    return Stealth(
+        chrome_runtime=True,
+        navigator_webdriver=True,
+        navigator_plugins=True,
+        webgl_vendor=True,
+        webgl_vendor_override="Google Inc. (Intel)",
+        webgl_renderer_override=(
+            "ANGLE (Intel, Intel(R) UHD Graphics 620 "
+            "Direct3D11 vs_5_0 ps_5_0, D3D11)"
+        ),
+    )
+
+
+async def apply_stealth_to_page(page) -> None:
+    """Inject stealth fingerprint patches into a direct Playwright page."""
+    await page.add_init_script(get_stealth().script_payload)
+
+
+async def apply_stealth_to_browser_use(browser) -> None:
+    """Inject stealth fingerprint patches into a browser_use Browser instance."""
+    await browser._cdp_add_init_script(get_stealth().script_payload)
+
 
 def get_playwright_proxy() -> Optional[dict]:
     """

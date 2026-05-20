@@ -24,7 +24,7 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
-from src.utils.http_helpers import requests_get_with_retry
+from src.utils.http_helpers import requests_get_with_retry, STEALTH_UA, STEALTH_ARGS, apply_stealth_to_browser_use, apply_stealth_to_page
 
 from config.constants import (
     RAW_EVICTIONS_DIR,
@@ -47,11 +47,6 @@ from src.utils.db_deduplicator import filter_new_records
 setup_logging()
 logger = get_logger(__name__)
 
-_STEALTH_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/136.0.0.0 Safari/537.36"
-)
 
 
 def _make_llm():
@@ -64,11 +59,6 @@ def _make_llm():
         api_key=settings.anthropic_api_key.get_secret_value(),
     )
 
-
-def _get_court_source(county_id: str) -> dict:
-    """Return the court_records source dict for county_id (empty dict if absent)."""
-    cfg = _get_county(county_id)
-    return cfg.get("sources", {}).get("court_records", {})
 
 
 def _get_eviction_source(county_id: str) -> dict:
@@ -121,14 +111,51 @@ def _static_download(source: dict, dest_dir: Path, target_date: str = None) -> P
     raise FileNotFoundError("[evictions] No civil filing found in last 7 days")
 
 
+async def _execute_playwright_code_on_page(page, playwright_code, url, start_str, end_str, county_id):
+    """Run playwright_code on an already-open page; captures debug state on failure."""
+    from src.utils.action_sequence import execute_playwright_code, PlaywrightCodeError
+    try:
+        return await execute_playwright_code(
+            playwright_code, page, RAW_EVICTIONS_DIR,
+            placeholders={"url": url, "start_date": start_str, "end_date": end_str},
+            county_id=county_id,
+        )
+    except PlaywrightCodeError as e:
+        logger.error("[evictions] Playwright scrape failed: %s", e)
+        try:
+            import datetime as _dt
+            _ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+            _dbg = RAW_EVICTIONS_DIR / "debug"
+            _dbg.mkdir(parents=True, exist_ok=True)
+            logger.error("[evictions][debug] URL: %s | Title: %s", page.url, await page.title())
+            _shot = _dbg / f"evictions_debug_{county_id}_{_ts}.png"
+            await page.screenshot(path=str(_shot), full_page=True)
+            logger.error("[evictions][debug] Screenshot: %s", _shot)
+            _html_path = _dbg / f"evictions_debug_{county_id}_{_ts}.html"
+            _html_path.write_text(await page.content(), encoding="utf-8")
+            logger.error("[evictions][debug] HTML: %s", _html_path)
+            _keywords = re.compile(r"export|excel|download|csv|results", re.IGNORECASE)
+            _found = []
+            for _el in await page.locator("a, button").all():
+                try:
+                    _txt = (await _el.inner_text()).strip()
+                    _href = await _el.get_attribute("href") or ""
+                    if _keywords.search(_txt) or _keywords.search(_href):
+                        _found.append(f"{_txt!r} href={_href!r}")
+                except Exception:
+                    pass
+            logger.error("[evictions][debug] Export-related elements (%d): %s",
+                         len(_found), _found or ["<none found>"])
+        except Exception as _dbg_exc:
+            logger.error("[evictions][debug] Debug capture failed: %s", _dbg_exc)
+        raise
+
+
 async def _scrape_with_playwright(
     source: dict, county_id: str, target_date: str | None,
     start_date: str | None, end_date: str | None, headful: bool = False,
 ) -> Path:
     """Run the source's playwright_code and save the resulting DataFrame to disk."""
-    from playwright.async_api import async_playwright
-    from src.utils.action_sequence import execute_playwright_code, PlaywrightCodeError
-
     playwright_code = source.get("playwright_code", "")
     if not playwright_code:
         raise ValueError(f"[evictions] playwright_code is empty for '{county_id}' source")
@@ -144,62 +171,37 @@ async def _scrape_with_playwright(
         start_str = end_str = yesterday.strftime("%Y%m%d")
 
     url = source.get("url", "")
+    cf_required = source.get("cf_bypass_required", False)
+    profile_name = source.get("cf_bypass_profile_name", f"{county_id}_evictions_clerk")
     RAW_EVICTIONS_DIR.mkdir(parents=True, exist_ok=True)
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=not headful,
-            downloads_path=str(RAW_EVICTIONS_DIR),
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
-        context = await browser.new_context(accept_downloads=True)
-        page = await context.new_page()
-        try:
-            df = await execute_playwright_code(
-                playwright_code, page, RAW_EVICTIONS_DIR,
-                placeholders={"url": url, "start_date": start_str, "end_date": end_str},
-                county_id=county_id,
+    if cf_required:
+        from src.utils.cf_persistent_browser import launch_cf_bypass_context
+        logger.info("[evictions] CF-bypass mode — using persistent Edge profile")
+        async with launch_cf_bypass_context(
+            profile_name=profile_name,
+            county_id=county_id,
+            portal_url=url,
+            headless=False,
+            accept_downloads=True,
+        ) as ctx:
+            page = await ctx.new_page()
+            df = await _execute_playwright_code_on_page(page, playwright_code, url, start_str, end_str, county_id)
+    else:
+        from playwright.async_api import async_playwright
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=not headful,
+                downloads_path=str(RAW_EVICTIONS_DIR),
+                args=STEALTH_ARGS,
             )
-        except PlaywrightCodeError as e:
-            logger.error("[evictions] Playwright scrape failed: %s", e)
-            # --- DEBUG: capture page state before browser closes ---
+            context = await browser.new_context(user_agent=STEALTH_UA, accept_downloads=True)
+            page = await context.new_page()
+            await apply_stealth_to_page(page)
             try:
-                import datetime as _dt
-                _ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-                _dbg = RAW_EVICTIONS_DIR / "debug"
-                _dbg.mkdir(parents=True, exist_ok=True)
-
-                _url = page.url
-                _title = await page.title()
-                logger.error("[evictions][debug] URL: %s | Title: %s", _url, _title)
-
-                _shot = _dbg / f"evictions_debug_{county_id}_{_ts}.png"
-                await page.screenshot(path=str(_shot), full_page=True)
-                logger.error("[evictions][debug] Screenshot: %s", _shot)
-
-                _html_path = _dbg / f"evictions_debug_{county_id}_{_ts}.html"
-                _html_path.write_text(await page.content(), encoding="utf-8")
-                logger.error("[evictions][debug] HTML: %s", _html_path)
-
-                _keywords = re.compile(r"export|excel|download|csv|results", re.IGNORECASE)
-                _links = await page.locator("a, button").all()
-                _found = []
-                for _el in _links:
-                    try:
-                        _txt = (await _el.inner_text()).strip()
-                        _href = await _el.get_attribute("href") or ""
-                        if _keywords.search(_txt) or _keywords.search(_href):
-                            _found.append(f"{_txt!r} href={_href!r}")
-                    except Exception:
-                        pass
-                logger.error("[evictions][debug] Export-related elements (%d): %s",
-                             len(_found), _found or ["<none found>"])
-            except Exception as _dbg_exc:
-                logger.error("[evictions][debug] Debug capture failed: %s", _dbg_exc)
-            # --- END DEBUG ---
-            raise
-        finally:
-            await browser.close()
+                df = await _execute_playwright_code_on_page(page, playwright_code, url, start_str, end_str, county_id)
+            finally:
+                await browser.close()
 
     if df is None or df.empty:
         raise ValueError(f"[evictions] Playwright returned no data for '{county_id}'")
@@ -220,7 +222,6 @@ async def _download_civil_filing_browser(
     Returns the path to the downloaded file.
     """
     from browser_use import Agent, Browser
-    from playwright_stealth import Stealth
 
     if target_date:
         target_dt = datetime.strptime(target_date.replace("-", ""), "%Y%m%d")
@@ -246,25 +247,47 @@ async def _download_civil_filing_browser(
         task += f"\n\nPortal navigation hint: {nav_hint}"
 
     dest_dir.mkdir(parents=True, exist_ok=True)
-    browser = Browser(
-        headless=not headful,
+    cf_required = source.get("cf_bypass_required", False)
+    profile_name = source.get("cf_bypass_profile_name", f"{county_id}_evictions_clerk")
+    cf_profile = None
+    if cf_required:
+        from src.utils.cf_session_manager import ensure_ready
+        from src.utils.cf_persistent_browser import find_edge_binary
+        logger.info("[evictions] CF-bypass mode — using persistent Edge profile")
+        profile_dir = await ensure_ready(
+            profile_name=profile_name,
+            county_id=county_id,
+            portal_url=url,
+        )
+        cf_profile = {"edge_path": find_edge_binary(), "profile_dir": str(profile_dir)}
+
+    browser_kwargs = dict(
+        headless=False if cf_profile else not headful,
         disable_security=True,
         downloads_path=str(dest_dir),
-        user_agent=_STEALTH_UA,
         ignore_default_args=["--enable-automation"],
-        enable_default_extensions=True,
         minimum_wait_page_load_time=1.5,
         wait_between_actions=1.0,
-        args=["--no-sandbox", "--disable-blink-features=AutomationControlled", "--window-size=1920,1080"],
+        args=STEALTH_ARGS,
     )
+    if cf_profile:
+        browser_kwargs.update(
+            executable_path=cf_profile["edge_path"],
+            user_data_dir=cf_profile["profile_dir"],
+            proxy=None,
+            enable_default_extensions=False,
+        )
+    else:
+        browser_kwargs.update(
+            user_agent=STEALTH_UA,
+            enable_default_extensions=True,
+        )
+
+    browser = Browser(**browser_kwargs)
     await browser.start()
-    stealth = Stealth(
-        chrome_runtime=True, navigator_webdriver=True, navigator_plugins=True, webgl_vendor=True,
-        webgl_vendor_override="Google Inc. (Intel)",
-        webgl_renderer_override="ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)",
-    )
-    await browser._cdp_add_init_script(stealth.script_payload)
-    logger.info("[evictions] Stealth fingerprint patches injected")
+    if not cf_profile:
+        await apply_stealth_to_browser_use(browser)
+        logger.info("[evictions] Stealth fingerprint patches injected")
 
     start_time = time.time()
     agent = Agent(task=task, llm=_make_llm(), browser=browser, max_steps=60, use_judge=False)
@@ -483,12 +506,12 @@ def filter_evictions(df: pd.DataFrame, county_id: str = "hillsborough") -> pd.Da
     return evictions_df
 
 
-def save_processed_evictions(df: pd.DataFrame, output_filename: str = "eviction_leads.csv") -> Path:
+def save_processed_evictions(df: pd.DataFrame, county_id: str = "hillsborough", output_filename: str = "eviction_leads.csv") -> Path:
     """Save processed eviction data with dedup against DB."""
     RAW_EVICTIONS_DIR.mkdir(parents=True, exist_ok=True)
 
     initial_count = len(df)
-    df_new = filter_new_records(df, "evictions", record_type="Eviction")
+    df_new = filter_new_records(df, "evictions", record_type="Eviction", county_id=county_id)
 
     if df_new.empty:
         logger.info("[evictions] All evictions already in DB — nothing new")
@@ -534,7 +557,7 @@ def run_eviction_pipeline(
             return False
 
         today = datetime.now().strftime(OUTPUT_DATE_FORMAT)
-        output_path = save_processed_evictions(evictions_df, f"eviction_leads_{today}.csv")
+        output_path = save_processed_evictions(evictions_df, county_id, f"eviction_leads_{today}.csv")
 
         logger.info(OUTPUT_SEPARATOR)
         logger.info("EVICTION PIPELINE COMPLETED — %d records, output: %s", len(evictions_df), output_path)

@@ -34,6 +34,7 @@ from config.constants import (
 )
 from src.utils.county_config import get_county_config
 from src.utils.logger import setup_logging, get_logger
+from src.utils.http_helpers import STEALTH_UA, STEALTH_ARGS, apply_stealth_to_browser_use
 
 setup_logging()
 logger = get_logger(__name__)
@@ -171,15 +172,13 @@ async def run_browser_agent(task: str, headful: bool = False) -> tuple:
     browser = Browser(
         headless=not headful,
         disable_security=True,
-        args=[
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-gpu',
-            '--disable-blink-features=AutomationControlled',
-            '--window-size=1920,1080',
-        ],
+        user_agent=STEALTH_UA,
+        ignore_default_args=["--enable-automation"],
+        args=STEALTH_ARGS,
     )
+    await browser.start()
+    await apply_stealth_to_browser_use(browser)
+    logger.info("[Agent] Stealth fingerprint patches injected")
 
     agent = Agent(
         task=task,

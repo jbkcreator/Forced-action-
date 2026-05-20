@@ -139,7 +139,7 @@ class ForeclosureLoader(BaseLoader):
                     # Case 1: exact case_number already exists → skip (true dup)
                     existing_exact = (
                         self.session.query(Foreclosure)
-                        .filter_by(case_number=case_number)
+                        .filter_by(case_number=case_number, county_id=self.county_id)
                         .first()
                     )
                     if existing_exact:

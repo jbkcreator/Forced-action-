@@ -215,13 +215,14 @@ async def _validate_profile(profile_name: str, portal_url: str) -> bool:
     pattern as _auto_warm) and poll up to 30s for CF to auto-resolve.
     """
     import os as _os
+    import sys as _sys
     import subprocess as _subprocess
     from src.utils.cf_persistent_browser import (
         CFProfileNotWarmedError, _launch_edge,
     )
 
     _xvfb_proc = None
-    if not _os.environ.get("DISPLAY"):
+    if not _os.environ.get("DISPLAY") and _sys.platform != "win32":
         try:
             _xvfb_proc = _subprocess.Popen(
                 ["Xvfb", ":99", "-screen", "0", "1280x800x24"],
@@ -313,9 +314,10 @@ async def _auto_warm(profile_name: str, portal_url: str) -> bool:
     # mode and CF can still detect the bot. On a headless Linux server we
     # provide a virtual display via Xvfb (auto-started below if DISPLAY is unset).
     import os as _os
+    import sys as _sys
     import subprocess as _subprocess
     _xvfb_proc = None
-    if not _os.environ.get("DISPLAY"):
+    if not _os.environ.get("DISPLAY") and _sys.platform != "win32":
         try:
             _xvfb_proc = _subprocess.Popen(
                 ["Xvfb", ":99", "-screen", "0", "1280x800x24"],

@@ -966,5 +966,7 @@ class BaseLoader(ABC):
         Returns:
             True if duplicate exists, False otherwise
         """
+        if hasattr(model, 'county_id') and 'county_id' not in unique_fields:
+            unique_fields = {**unique_fields, 'county_id': self.county_id}
         existing = self.session.query(model).filter_by(**unique_fields).first()
         return existing is not None

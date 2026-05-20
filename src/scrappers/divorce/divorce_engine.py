@@ -39,18 +39,13 @@ from config.constants import (
     BROWSER_TEMPERATURE,
 )
 from src.utils.county_config import get_county_config as _get_county
-from src.utils.http_helpers import requests_get_with_retry
+from src.utils.http_helpers import requests_get_with_retry, STEALTH_UA, STEALTH_ARGS, apply_stealth_to_browser_use
 from src.utils.logger import setup_logging, get_logger
 from src.utils.db_deduplicator import filter_new_records
 
 setup_logging()
 logger = get_logger(__name__)
 
-_STEALTH_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/136.0.0.0 Safari/537.36"
-)
 
 
 def _make_llm():
@@ -113,7 +108,6 @@ async def _download_civil_filing_browser(
     Returns the path to the downloaded file.
     """
     from browser_use import Agent, Browser
-    from playwright_stealth import Stealth
 
     if target_date:
         target_dt = datetime.strptime(target_date.replace("-", ""), "%Y%m%d")
@@ -140,20 +134,15 @@ async def _download_civil_filing_browser(
         headless=True,
         disable_security=True,
         downloads_path=str(dest_dir),
-        user_agent=_STEALTH_UA,
+        user_agent=STEALTH_UA,
         ignore_default_args=["--enable-automation"],
         enable_default_extensions=True,
         minimum_wait_page_load_time=1.5,
         wait_between_actions=1.0,
-        args=["--no-sandbox", "--disable-blink-features=AutomationControlled", "--window-size=1920,1080"],
+        args=STEALTH_ARGS,
     )
     await browser.start()
-    stealth = Stealth(
-        chrome_runtime=True, navigator_webdriver=True, navigator_plugins=True, webgl_vendor=True,
-        webgl_vendor_override="Google Inc. (Intel)",
-        webgl_renderer_override="ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)",
-    )
-    await browser._cdp_add_init_script(stealth.script_payload)
+    await apply_stealth_to_browser_use(browser)
     logger.info("[divorce] Stealth fingerprint patches injected")
 
     start_time = time.time()
@@ -320,7 +309,7 @@ def run_divorce_pipeline(target_date: str = None, county_id: str = "hillsborough
             df = df.rename(columns={"CaseNumber": "Case Number"})
 
         initial_count = len(df)
-        df_new = filter_new_records(df, "divorce", record_type="Divorce")
+        df_new = filter_new_records(df, "divorce", record_type="Divorce", county_id=county_id)
 
         if df_new.empty:
             logger.info("[divorce] All dissolution cases already in DB — nothing new")

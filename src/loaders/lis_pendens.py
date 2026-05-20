@@ -110,7 +110,7 @@ class LisPendensLoader(BaseLoader):
             if skip_duplicates:
                 existing_lp = (
                     self.session.query(Foreclosure)
-                    .filter_by(case_number=synthetic_case)
+                    .filter_by(case_number=synthetic_case, county_id=self.county_id)
                     .first()
                 )
                 if existing_lp:

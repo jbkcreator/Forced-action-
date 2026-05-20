@@ -33,6 +33,7 @@ sys.path.insert(0, str(project_root))
 
 from src.utils.logger import setup_logging, get_logger
 from src.utils.county_config import get_county_config
+from src.utils.http_helpers import STEALTH_UA, STEALTH_ARGS, apply_stealth_to_browser_use
 from config.constants import BROWSER_MODEL, BROWSER_TEMPERATURE
 
 setup_logging()
@@ -41,12 +42,6 @@ logger = get_logger(__name__)
 CHUNK_SIZE = 50_000
 RAW_FILE_ENCODING = "cp1252"
 DBF_SIGNATURES = {0x02, 0x03, 0x04, 0x05, 0x83, 0x8B, 0x8C}
-
-_STEALTH_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/136.0.0.0 Safari/537.36"
-)
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +160,6 @@ async def run_browser_agent(task: str, save_dir: Path, headful: bool = False) ->
     Returns True if the agent reported done.
     """
     from browser_use import Agent, Browser
-    from playwright_stealth import Stealth
 
     save_dir.mkdir(parents=True, exist_ok=True)
     llm = _make_llm()
@@ -174,27 +168,15 @@ async def run_browser_agent(task: str, save_dir: Path, headful: bool = False) ->
         headless=not headful,
         downloads_path=str(save_dir),
         disable_security=True,
-        user_agent=_STEALTH_UA,
+        user_agent=STEALTH_UA,
         ignore_default_args=["--enable-automation"],
         enable_default_extensions=True,
         minimum_wait_page_load_time=1.5,
         wait_between_actions=1.0,
-        args=[
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-gpu',
-            '--disable-blink-features=AutomationControlled',
-            '--window-size=1920,1080',
-        ],
+        args=STEALTH_ARGS,
     )
     await browser.start()
-    stealth = Stealth(
-        chrome_runtime=True, navigator_webdriver=True, navigator_plugins=True, webgl_vendor=True,
-        webgl_vendor_override="Google Inc. (Intel)",
-        webgl_renderer_override="ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)",
-    )
-    await browser._cdp_add_init_script(stealth.script_payload)
+    await apply_stealth_to_browser_use(browser)
     logger.info("[master] Stealth fingerprint patches injected")
 
     agent = Agent(

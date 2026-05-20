@@ -1209,6 +1209,9 @@ class ScraperRunStats(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
     )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, onupdate=lambda: datetime.now(timezone.utc), nullable=True
+    )
 
     __table_args__ = (
         UniqueConstraint("run_date", "source_type", "county_id", name="uq_scraper_run_stats"),
