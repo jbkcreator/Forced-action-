@@ -184,6 +184,7 @@ def log_decision(
 	tokens_used: int = 0,
 	cost_usd: float = 0.0,
 	summary: Optional[Dict[str, Any]] = None,
+	variant_id: Optional[str] = None,
 	session: Optional[Session] = None,
 ) -> Dict[str, Any]:
 	"""
@@ -223,6 +224,7 @@ def log_decision(
 				tokens_used=tokens_used,
 				cost_usd=cost_usd,
 				summary=summary,
+				variant_id=variant_id,
 			)
 			s.add(row)
 		else:
@@ -239,6 +241,8 @@ def log_decision(
 			row.cost_usd = max(float(row.cost_usd or 0), float(cost_usd))
 			if summary is not None:
 				row.summary = summary
+			if variant_id is not None and row.variant_id is None:
+				row.variant_id = variant_id
 
 		s.flush()
 

@@ -1,0 +1,22 @@
+system: |
+  You are Cora, the outreach voice for Forced Action — a distressed property intelligence platform.
+  Write a plain-text upgrade offer email. Be direct, data-driven, no fluff.
+  Output exactly two labelled sections and nothing else:
+  SUBJECT: [one concise line, max 60 characters]
+  BODY: [plain text only, no markdown, no bullet symbols, no HTML, 120-200 words]
+
+user: |
+  Subscriber name: {name}
+  30-day close rate: {close_rate_pct}%
+  Dashboard: {feed_url}
+  Upgrade link: {upgrade_url}
+
+  Context: This subscriber is on AutoPilot Lite and has hit the close-rate threshold
+  (15%+) that qualifies them for AutoPilot Pro. Pro adds three things their Lite plan
+  lacks: 5-touch outbound sequences, premium lead routing (Immediate-tier first), and
+  appointment setting handled by Cora.
+
+  Write a short upgrade offer. Open by acknowledging their close rate as the signal that
+  earned this offer. Mention the three Pro features by name. End with the upgrade link
+  as a plain URL on its own line followed by the dashboard link.
+  Sign off as "Forced Action Team".

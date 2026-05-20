@@ -169,6 +169,7 @@ def _node_send_and_log(state: ComposeAndSendState) -> ComposeAndSendState:
 			terminal_status=state["terminal_status"],
 			tokens_used=int(state.get("tokens_used", 0) or 0),
 			cost_usd=float(state.get("cost_usd", 0.0) or 0.0),
+			variant_id=state.get("variant_id"),
 			summary={
 				"failure_reason": state.get("failure_reason"),
 				"compose_skipped": True,
@@ -185,6 +186,7 @@ def _node_send_and_log(state: ComposeAndSendState) -> ComposeAndSendState:
 			terminal_status="failed",
 			tokens_used=int(state.get("tokens_used", 0) or 0),
 			cost_usd=float(state.get("cost_usd", 0.0) or 0.0),
+			variant_id=state.get("variant_id"),
 			summary={"failure_reason": "empty_message_body"},
 		)
 		return {
@@ -218,6 +220,7 @@ def _node_send_and_log(state: ComposeAndSendState) -> ComposeAndSendState:
 		terminal_status=final_status,
 		tokens_used=int(state.get("tokens_used", 0) or 0),
 		cost_usd=float(state.get("cost_usd", 0.0) or 0.0),
+		variant_id=state.get("variant_id"),
 		summary={
 			"campaign": state.get("campaign"),
 			"variant_id": state.get("variant_id"),

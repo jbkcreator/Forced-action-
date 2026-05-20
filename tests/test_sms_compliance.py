@@ -169,6 +169,7 @@ class TestAddToDeadLetterUnit:
 
     @pytest.mark.parametrize("reason", [
         "opt_out", "delivery_failed", "error", "unresolvable", "quiet_hours", "no_opt_in",
+        "subscriber_sms_frequency_cap",
     ])
     def test_all_valid_reasons_accepted(self, reason):
         db = MagicMock()
@@ -232,9 +233,13 @@ class TestSendSmsUnit:
     def test_quiet_hours_returns_false_and_dlqs_with_correct_reason(self):
         db = MagicMock()
         with patch("src.services.sms_compliance.can_send", return_value=True), \
-             patch("src.services.sms_compliance.is_quiet_hours", return_value=True):
+             patch("src.services.sms_compliance.has_opted_in", return_value=True), \
+             patch("src.services.sms_compliance.is_quiet_hours", return_value=True), \
+             patch("src.services.sms_compliance.settings") as mock_s:
+            mock_s.sms_quiet_hours_enabled = True
+            mock_s.telnyx_sandbox = False
             with patch("src.services.sms_compliance.add_to_dead_letter") as mock_dlq:
-                result = send_sms("+18135550100", "Hello", db)
+                result = send_sms("+18135550100", "Hello", db, message_type="transactional")
         assert result is False
         mock_dlq.assert_called_once()
         _, reason, _ = mock_dlq.call_args[0][:3]
@@ -809,3 +814,153 @@ class TestSmsSendLogIntegration:
         assert row.outcome == "suppressed"
         assert row.suppress_reason == "no_opt_in"
         assert row.message_type == "marketing"
+
+
+# ============================================================================
+# V6: per-subscriber marketing SMS frequency cap
+# ============================================================================
+
+
+class TestSmsFrequencyCapUnit:
+    """
+    Unit tests for _check_marketing_frequency_cap and the send_sms gate it feeds.
+
+    DB is mocked: db.execute(...).scalar() side_effect controls count_24h then count_7d.
+    The cap constants are: 24h = 2, 7d = 5.
+    """
+
+    def _make_db(self, count_24h: int, count_7d: int = 0):
+        """Mock DB where the first scalar() call returns count_24h, the second count_7d."""
+        db = MagicMock()
+        db.execute.return_value.scalar.side_effect = [count_24h, count_7d]
+        return db
+
+    # ── _check_marketing_frequency_cap direct tests ───────────────────────────
+
+    def test_first_marketing_sms_allowed(self):
+        from src.services.sms_compliance import _check_marketing_frequency_cap
+        assert _check_marketing_frequency_cap(1, self._make_db(0, 0)) is False
+
+    def test_second_marketing_sms_allowed(self):
+        from src.services.sms_compliance import _check_marketing_frequency_cap
+        # 1 send already in 24h window (under 2-cap) and 1 in 7d (under 5-cap)
+        assert _check_marketing_frequency_cap(1, self._make_db(1, 1)) is False
+
+    def test_third_marketing_sms_in_24h_blocked(self):
+        """2 already sent in 24h → 24h cap hit → blocked."""
+        from src.services.sms_compliance import _check_marketing_frequency_cap
+        assert _check_marketing_frequency_cap(1, self._make_db(2, 2)) is True
+
+    def test_sixth_marketing_sms_in_7d_blocked(self):
+        """Under 24h cap (1 send) but 7d cap hit (5 sends) → blocked."""
+        from src.services.sms_compliance import _check_marketing_frequency_cap
+        assert _check_marketing_frequency_cap(1, self._make_db(1, 5)) is True
+
+    def test_24h_cap_short_circuits_7d_query(self):
+        """When 24h cap fires, the 7d query is never executed (only one scalar() call)."""
+        from src.services.sms_compliance import _check_marketing_frequency_cap
+        db = MagicMock()
+        db.execute.return_value.scalar.return_value = 2  # any call returns 2
+        _check_marketing_frequency_cap(1, db)
+        assert db.execute.call_count == 1  # only the 24h query fired
+
+    def test_different_campaigns_counted_together(self):
+        """
+        The cap is per subscriber, not per campaign. Sends from any campaign count toward
+        the same subscriber bucket. A third send — regardless of task_type/campaign — is blocked
+        once count_24h reaches 2.
+        """
+        from src.services.sms_compliance import _check_marketing_frequency_cap
+        # subscriber_id=1 has 2 sends: 1 from 'fomo' campaign + 1 from 'retention' campaign
+        assert _check_marketing_frequency_cap(1, self._make_db(2, 2)) is True
+
+    # ── send_sms gate integration ─────────────────────────────────────────────
+
+    def _send(self, db, *, cap_return=False, message_type="marketing", subscriber_id=1, **kwargs):
+        """Helper: run send_sms through all gates up to dry-run, controlling the cap check."""
+        with patch("src.services.sms_compliance.can_send", return_value=True), \
+             patch("src.services.sms_compliance.has_opted_in", return_value=True), \
+             patch("src.services.sms_compliance.is_quiet_hours", return_value=False), \
+             patch("src.services.sms_compliance._check_marketing_frequency_cap",
+                   return_value=cap_return) as mock_cap, \
+             patch("src.services.sms_compliance.settings") as mock_s:
+            mock_s.telnyx_sms_enabled = False
+            mock_s.telnyx_sandbox = False
+            mock_s.sms_quiet_hours_enabled = False
+            result = send_sms(
+                "+18135550100", "Hello", db,
+                message_type=message_type, subscriber_id=subscriber_id, **kwargs,
+            )
+        return result, mock_cap
+
+    def test_marketing_under_cap_sends(self):
+        db = MagicMock()
+        result, _ = self._send(db, cap_return=False)
+        assert result is True
+
+    def test_marketing_at_cap_blocked_returns_false(self):
+        db = MagicMock()
+        with patch("src.services.sms_compliance.can_send", return_value=True), \
+             patch("src.services.sms_compliance.has_opted_in", return_value=True), \
+             patch("src.services.sms_compliance.is_quiet_hours", return_value=False), \
+             patch("src.services.sms_compliance._check_marketing_frequency_cap", return_value=True), \
+             patch("src.services.sms_compliance.add_to_dead_letter") as mock_dlq, \
+             patch("src.services.sms_compliance.settings") as mock_s:
+            mock_s.telnyx_sms_enabled = False
+            mock_s.telnyx_sandbox = False
+            mock_s.sms_quiet_hours_enabled = False
+            result = send_sms("+18135550100", "Hello", db,
+                              message_type="marketing", subscriber_id=1)
+        assert result is False
+        _, reason, _ = mock_dlq.call_args[0][:3]
+        assert reason == "subscriber_sms_frequency_cap"
+
+    def test_cap_blocked_logs_suppress_reason(self):
+        """SmsSendLog row must record suppress_reason='subscriber_sms_frequency_cap'."""
+        db = MagicMock()
+        with patch("src.services.sms_compliance.can_send", return_value=True), \
+             patch("src.services.sms_compliance.has_opted_in", return_value=True), \
+             patch("src.services.sms_compliance.is_quiet_hours", return_value=False), \
+             patch("src.services.sms_compliance._check_marketing_frequency_cap", return_value=True), \
+             patch("src.services.sms_compliance.add_to_dead_letter"), \
+             patch("src.services.sms_compliance.settings") as mock_s, \
+             patch("src.services.sms_send_log.log_send") as mock_log:
+            mock_s.telnyx_sms_enabled = False
+            mock_s.telnyx_sandbox = False
+            mock_s.sms_quiet_hours_enabled = False
+            send_sms("+18135550100", "Hello", db, message_type="marketing", subscriber_id=1)
+        mock_log.assert_called_once()
+        assert mock_log.call_args.kwargs["suppress_reason"] == "subscriber_sms_frequency_cap"
+        assert mock_log.call_args.kwargs["outcome"] == "suppressed"
+
+    def test_transactional_bypasses_frequency_cap(self):
+        """send_sms with message_type='transactional' never calls _check_marketing_frequency_cap."""
+        db = MagicMock()
+        result, mock_cap = self._send(db, message_type="transactional")
+        assert result is True
+        mock_cap.assert_not_called()
+
+    def test_opt_in_prompt_bypasses_frequency_cap(self):
+        """opt_in_prompt messages bypass the cap gate entirely."""
+        db = MagicMock()
+        result, mock_cap = self._send(db, message_type="opt_in_prompt")
+        assert result is True
+        mock_cap.assert_not_called()
+
+    def test_opt_out_still_enforced_before_cap(self):
+        """Opt-out check fires before frequency cap — suppressed number never reaches cap check."""
+        db = MagicMock()
+        with patch("src.services.sms_compliance.can_send", return_value=False), \
+             patch("src.services.sms_compliance._check_marketing_frequency_cap") as mock_cap, \
+             patch("src.services.sms_compliance.add_to_dead_letter"):
+            result = send_sms("+18135550100", "Hello", db,
+                              message_type="marketing", subscriber_id=1)
+        assert result is False
+        mock_cap.assert_not_called()
+
+    def test_no_subscriber_id_skips_cap(self):
+        """Without subscriber_id the cap cannot be evaluated — send proceeds normally."""
+        db = MagicMock()
+        result, mock_cap = self._send(db, subscriber_id=None)
+        assert result is True
+        mock_cap.assert_not_called()

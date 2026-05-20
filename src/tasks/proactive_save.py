@@ -22,6 +22,8 @@ from config.revenue_ladder import DATA_ONLY_TIER
 from config.settings import settings
 from src.core.database import get_db_context
 from src.core.models import Subscriber, WalletTransaction
+from src.services.claude_router import call_claude_with_usage
+from src.utils.prompt_loader import get_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -94,133 +96,70 @@ def _identify_risk(sub: Subscriber, db: Session) -> Optional[str]:
     return None
 
 
+def _parse_email(text: str) -> tuple[str, str]:
+    lines = text.strip().splitlines()
+    subject = next((l.replace("SUBJECT:", "").strip() for l in lines if l.startswith("SUBJECT:")), "")
+    body_start = next((i for i, l in enumerate(lines) if l.startswith("BODY:")), None)
+    body = "\n".join(lines[body_start + 1:]).strip() if body_start is not None else ""
+    if not subject or len(subject) > 60 or not body:
+        return "", ""
+    return subject, body
+
+
 def _send_save_offer(sub: Subscriber, trigger: str) -> bool:
     """Send Data-Only save offer email. Returns True if sent."""
     if not sub.email:
         return False
 
     price = DATA_ONLY_TIER["price_cents"] // 100
-    trigger_line = (
-        "We noticed you haven't been active recently — life gets busy."
-        if trigger == "inactivity"
-        else "We noticed your payment hasn't gone through yet."
-    )
-
     feed_url = (
         f"{settings.app_base_url}/dashboard/{sub.event_feed_uuid}?save_offer=accept"
         if sub.event_feed_uuid
         else settings.app_base_url
     )
-
     name = sub.name or "there"
-    body_text = (
-        f"Hi {name},\n\n"
-        f"{trigger_line}\n\n"
-        f"We don't want you to lose your territory. Switch to our Data-Only plan at "
-        f"just ${price}/mo — full property data feed, no enrichment fees, cancel anytime.\n\n"
-        f"Switch now:\n{feed_url}\n\n"
-        f"Questions? Reply to this email.\n\n"
-        f"— Forced Action Team"
-    )
+    founding_member = getattr(sub, "founding_member", False)
 
-    founding_html = (
-        '<p style="margin:0 0 16px;padding:10px 16px;background:#451a03;'
-        'border:1px solid #92400e;border-radius:8px;color:#fbbf24;font-size:14px;">'
-        "⭐ Founding Member — your locked rate will be permanently lost if you don't reactivate."
-        "</p>"
-        if getattr(sub, "founding_member", False) else ""
-    )
+    subject = ""
+    body_text = ""
+    try:
+        system_prompt = get_prompt("emails/proactive_save.yaml", "system")
+        user_prompt = get_prompt(
+            "emails/proactive_save.yaml", "user",
+            name=name, trigger=trigger, price=price,
+            feed_url=feed_url, founding_member=founding_member,
+        )
+        result = call_claude_with_usage(
+            task_type="email_copy",
+            messages=[{"role": "user", "content": user_prompt}],
+            system=system_prompt,
+            max_tokens=800,
+            subscriber_id=sub.id,
+        )
+        subject, body_text = _parse_email(result["text"])
+    except Exception as exc:
+        logger.warning("[ProactiveSave] Cora composition failed for sub=%d, using fallback: %s", sub.id, exc)
 
-    body_html = f"""<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/></head>
-<body style="margin:0;padding:0;background:#0f172a;font-family:Inter,Arial,sans-serif;color:#e2e8f0;">
-  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f172a;padding:40px 0;">
-    <tr><td align="center">
-      <table width="560" cellpadding="0" cellspacing="0"
-             style="background:#1e293b;border:1px solid rgba(255,255,255,0.08);border-radius:16px;overflow:hidden;max-width:560px;width:100%;">
-
-        <!-- Header -->
-        <tr>
-          <td style="padding:32px 40px 24px;border-bottom:1px solid rgba(255,255,255,0.08);">
-            <p style="margin:0;font-size:22px;font-weight:800;color:#ffffff;">
-              Forced <span style="color:#fbbf24;">Action</span>
-            </p>
-          </td>
-        </tr>
-
-        <!-- Body -->
-        <tr>
-          <td style="padding:32px 40px;">
-            <h1 style="margin:0 0 8px;font-size:24px;font-weight:800;color:#ffffff;">
-              Keep your leads for ${price}/mo.
-            </h1>
-            <p style="margin:0 0 24px;color:#94a3b8;font-size:15px;">
-              Hi {name}, {trigger_line}
-            </p>
-
-            {founding_html}
-
-            <!-- Offer box -->
-            <table width="100%" cellpadding="0" cellspacing="0"
-                   style="background:rgba(251,191,36,0.06);border:1px solid rgba(251,191,36,0.2);
-                          border-radius:12px;padding:20px 24px;margin-bottom:24px;">
-              <tr>
-                <td>
-                  <p style="margin:0 0 6px;font-size:16px;font-weight:800;color:#fbbf24;">
-                    Data-Only Plan — ${price}/mo
-                  </p>
-                  <p style="margin:0;font-size:13px;color:#94a3b8;">
-                    Full property data feed &middot; No enrichment fees &middot; Cancel anytime
-                  </p>
-                </td>
-              </tr>
-            </table>
-
-            <!-- CTA -->
-            <table cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
-              <tr>
-                <td style="background:#fbbf24;border-radius:8px;">
-                  <a href="{feed_url}"
-                     style="display:inline-block;padding:14px 28px;color:#0f172a;font-size:15px;
-                            font-weight:700;text-decoration:none;">
-                    Switch to Data-Only &rarr;
-                  </a>
-                </td>
-              </tr>
-            </table>
-
-            <p style="margin:0;font-size:13px;color:#64748b;">
-              Questions? Reply to this email or reach us at
-              <a href="mailto:support@forcedaction.io" style="color:#fbbf24;text-decoration:none;">
-                support@forcedaction.io
-              </a>
-            </p>
-          </td>
-        </tr>
-
-        <!-- Footer -->
-        <tr>
-          <td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.08);
-                     font-size:12px;color:#475569;text-align:center;">
-            Forced Action &mdash; Hillsborough County Property Intelligence
-          </td>
-        </tr>
-
-      </table>
-    </td></tr>
-  </table>
-</body>
-</html>"""
+    if not subject or not body_text:
+        trigger_line = (
+            "We noticed you haven't been active recently — life gets busy."
+            if trigger == "inactivity"
+            else "We noticed your payment hasn't gone through yet."
+        )
+        subject = f"Keep your leads for ${price}/mo — Data-Only access"
+        body_text = (
+            f"Hi {name},\n\n"
+            f"{trigger_line}\n\n"
+            f"We don't want you to lose your territory. Switch to our Data-Only plan at "
+            f"just ${price}/mo — full property data feed, no enrichment fees, cancel anytime.\n\n"
+            f"Switch now:\n{feed_url}\n\n"
+            f"Questions? Reply to this email.\n\n"
+            f"— Forced Action Team"
+        )
 
     try:
         from src.services.email import send_email
-        send_email(
-            to=sub.email,
-            subject=f"Keep your leads for ${price}/mo — Data-Only access",
-            body_text=body_text,
-            body_html=body_html,
-        )
+        send_email(to=sub.email, subject=subject, body_text=body_text)
         logger.info("[ProactiveSave] Offer sent: subscriber=%d trigger=%s", sub.id, trigger)
         return True
     except Exception as exc:

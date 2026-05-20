@@ -720,6 +720,9 @@ async def run_lien_pipeline(
 
     # --- Playwright selector mode OR browser-use agent ----------------------
     playwright_code = source.get("playwright_code") or ""
+    scrape_mode = source.get("scrape_mode", "")
+    use_ai_fallback = False
+
     if playwright_code:
         logger.info("[Pipeline] playwright_code found — using Playwright selector mode")
         df = await _scrape_with_playwright(
@@ -727,14 +730,22 @@ async def run_lien_pipeline(
             headful=headful, cf_profile=cf_profile, no_proxy=no_proxy,
         )
         if df is None:
-            logger.error("[Pipeline] Playwright scrape failed")
-            _record_stats(0, False, _t0, county_id, error="playwright_scrape_failed")
-            return False
-        if df.empty:
+            if scrape_mode == "playwright_then_ai":
+                logger.warning(
+                    "[Pipeline] Playwright failed for '%s' — falling back to browser-use AI agent",
+                    county_id,
+                )
+                use_ai_fallback = True
+            else:
+                logger.error("[Pipeline] Playwright scrape failed")
+                _record_stats(0, False, _t0, county_id, error="playwright_scrape_failed")
+                return False
+        elif df.empty:
             logger.info("[Pipeline] Playwright scrape returned no records")
             _record_stats(0, True, _t0, county_id)
             return True
-    else:
+
+    if not playwright_code or use_ai_fallback:
         task = build_agent_task(source, start_str, end_str)
         history, start_time = await run_browser_agent(
             task, RAW_LIEN_DIR,

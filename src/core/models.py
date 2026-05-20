@@ -828,6 +828,7 @@ class Subscriber(Base):
     payment_failed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     recovery_day1_sent: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
     recovery_day3_sent: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
+    recovery_day5_sent: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
 
     # ── Referral Core Loop ──
     bonus_zip_slots: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
@@ -1852,7 +1853,7 @@ class SmsDeadLetter(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "reason IN ('opt_out', 'delivery_failed', 'error', 'unresolvable', 'quiet_hours', 'no_opt_in')",
+            "reason IN ('opt_out', 'delivery_failed', 'error', 'unresolvable', 'quiet_hours', 'no_opt_in', 'subscriber_sms_frequency_cap')",
             name="check_dlq_reason",
         ),
         Index("idx_dlq_reviewed", "reviewed_at"),
@@ -2098,6 +2099,7 @@ class AgentDecision(Base):
     tokens_used: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     cost_usd: Mapped[float] = mapped_column(Numeric(10, 6), default=0, nullable=False)
     summary: Mapped[Optional[dict]] = mapped_column(JSONB)
+    variant_id: Mapped[Optional[str]] = mapped_column(String(80), nullable=True, index=True)
 
     __table_args__ = (
         CheckConstraint(

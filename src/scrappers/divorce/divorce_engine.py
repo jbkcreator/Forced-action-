@@ -39,7 +39,11 @@ from config.constants import (
     BROWSER_TEMPERATURE,
 )
 from src.utils.county_config import get_county_config as _get_county
-from src.utils.http_helpers import requests_get_with_retry, STEALTH_UA, STEALTH_ARGS, apply_stealth_to_browser_use
+from src.utils.http_helpers import (
+    requests_get_with_retry, STEALTH_UA, STEALTH_ARGS,
+    apply_stealth_to_browser_use, apply_stealth_to_page,
+    get_playwright_proxy, get_browser_use_proxy,
+)
 from src.utils.logger import setup_logging, get_logger
 from src.utils.db_deduplicator import filter_new_records
 
@@ -99,8 +103,64 @@ def _static_download(source: dict, target_date: str | None = None) -> Path:
     raise FileNotFoundError("[divorce] No civil filing found in last 7 days")
 
 
+async def _scrape_with_playwright(
+    source: dict, county_id: str, target_date: str | None,
+    headful: bool = False, no_proxy: bool = False,
+) -> Path:
+    """Run the source's playwright_code and save the resulting DataFrame to disk."""
+    from playwright.async_api import async_playwright
+    from src.utils.action_sequence import execute_playwright_code, PlaywrightCodeError
+
+    playwright_code = source.get("playwright_code", "")
+    if not playwright_code:
+        raise ValueError(f"[divorce] playwright_code is empty for '{county_id}' source")
+
+    if target_date:
+        dt = datetime.strptime(target_date.replace("-", ""), "%Y%m%d")
+        start_str = end_str = dt.strftime("%Y%m%d")
+    else:
+        yesterday = datetime.now() - timedelta(days=1)
+        start_str = end_str = yesterday.strftime("%Y%m%d")
+
+    url = source.get("url", "")
+    RAW_DIVORCE_DIR.mkdir(parents=True, exist_ok=True)
+
+    _proxy = None if no_proxy else get_playwright_proxy()
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=not headful,
+            downloads_path=str(RAW_DIVORCE_DIR),
+            args=STEALTH_ARGS,
+        )
+        context = await browser.new_context(
+            user_agent=STEALTH_UA, accept_downloads=True, proxy=_proxy,
+        )
+        page = await context.new_page()
+        await apply_stealth_to_page(page)
+        try:
+            df = await execute_playwright_code(
+                playwright_code, page, RAW_DIVORCE_DIR,
+                placeholders={"url": url, "start_date": start_str, "end_date": end_str},
+                county_id=county_id,
+            )
+        except PlaywrightCodeError as e:
+            logger.error("[divorce] Playwright scrape failed: %s", e)
+            raise
+        finally:
+            await browser.close()
+
+    if df is None or df.empty:
+        raise ValueError(f"[divorce] Playwright returned no data for '{county_id}'")
+
+    out_path = RAW_DIVORCE_DIR / f"divorce_playwright_{county_id}_{start_str}.xlsx"
+    df.to_excel(out_path, index=False)
+    logger.info("[divorce] Playwright data saved: %s (%d rows)", out_path.name, len(df))
+    return out_path
+
+
 async def _download_civil_filing_browser(
-    county_id: str, source: dict, target_date: str | None, dest_dir: Path
+    county_id: str, source: dict, target_date: str | None, dest_dir: Path,
+    headful: bool = False, no_proxy: bool = False,
 ) -> Path:
     """
     Browser-use agent download for counties whose civil portal requires a browser
@@ -131,7 +191,7 @@ async def _download_civil_filing_browser(
 
     dest_dir.mkdir(parents=True, exist_ok=True)
     browser = Browser(
-        headless=True,
+        headless=not headful,
         disable_security=True,
         downloads_path=str(dest_dir),
         user_agent=STEALTH_UA,
@@ -140,6 +200,7 @@ async def _download_civil_filing_browser(
         minimum_wait_page_load_time=1.5,
         wait_between_actions=1.0,
         args=STEALTH_ARGS,
+        proxy=None if no_proxy else get_browser_use_proxy(),
     )
     await browser.start()
     await apply_stealth_to_browser_use(browser)
@@ -165,10 +226,14 @@ async def _download_civil_filing_browser(
     return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
-def download_latest_civil_filing(target_date: str = None, county_id: str = "hillsborough") -> Path:
+def download_latest_civil_filing(
+    target_date: str = None, county_id: str = "hillsborough",
+    headful: bool = False, no_proxy: bool = False,
+) -> Path:
     """
     Download the latest civil filing from the county clerk.
     static_download: direct HTTP GET via {date} URL pattern.
+    playwright_only / playwright_then_ai: Playwright selector mode (with AI fallback for latter).
     excel: browser-use agent (e.g. Pinellas).
     Default: requests-based directory listing → CSV.
     """
@@ -180,10 +245,33 @@ def download_latest_civil_filing(target_date: str = None, county_id: str = "hill
         logger.info("[divorce] Using static_download mode for '%s'", county_id)
         return _static_download(source, target_date)
 
+    if scrape_mode in ("playwright_only", "playwright_then_ai"):
+        logger.info("[divorce] Using playwright mode for '%s'", county_id)
+        try:
+            return asyncio.run(
+                _scrape_with_playwright(source, county_id, target_date, headful, no_proxy=no_proxy)
+            )
+        except Exception as pw_exc:
+            if scrape_mode != "playwright_then_ai":
+                raise
+            logger.warning(
+                "[divorce] Playwright failed for '%s' (%s) — falling back to browser-use AI agent",
+                county_id, pw_exc,
+            )
+            return asyncio.run(
+                _download_civil_filing_browser(
+                    county_id, source, target_date, RAW_DIVORCE_DIR,
+                    headful=headful, no_proxy=no_proxy,
+                )
+            )
+
     if output_format == "excel":
         logger.info("[divorce] County '%s' uses browser download (output_format=excel)", county_id)
         return asyncio.run(
-            _download_civil_filing_browser(county_id, source, target_date, RAW_DIVORCE_DIR)
+            _download_civil_filing_browser(
+                county_id, source, target_date, RAW_DIVORCE_DIR,
+                headful=headful, no_proxy=no_proxy,
+            )
         )
 
     # Hillsborough / CSV directory-listing path
@@ -289,7 +377,10 @@ def filter_divorce_cases(file_path: Path, county_id: str = "hillsborough") -> pd
     return df_divorce
 
 
-def run_divorce_pipeline(target_date: str = None, county_id: str = "hillsborough") -> bool:
+def run_divorce_pipeline(
+    target_date: str = None, county_id: str = "hillsborough",
+    headful: bool = False, no_proxy: bool = False,
+) -> bool:
     """Full pipeline: download → filter → dedup → save. Returns True on success."""
     t0 = time.monotonic()
     logger.info("=" * 60)
@@ -297,7 +388,10 @@ def run_divorce_pipeline(target_date: str = None, county_id: str = "hillsborough
     logger.info("=" * 60)
 
     try:
-        file_path = download_latest_civil_filing(target_date=target_date, county_id=county_id)
+        file_path = download_latest_civil_filing(
+            target_date=target_date, county_id=county_id,
+            headful=headful, no_proxy=no_proxy,
+        )
         df = filter_divorce_cases(file_path, county_id=county_id)
 
         if df.empty:
@@ -360,10 +454,17 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Scrape county divorce/dissolution filings")
     parser.add_argument("--date", type=str, default=None, help="Target date YYYY-MM-DD (default: latest)")
     parser.add_argument("--county-id", dest="county_id", default="hillsborough")
+    parser.add_argument("--headful", action="store_true", default=False,
+                        help="Run browser in headed (visible) mode for debugging")
+    parser.add_argument("--no-proxy", dest="no_proxy", action="store_true", default=False,
+                        help="Disable Oxylabs proxy for all requests")
     add_load_to_db_arg(parser)
     args = parser.parse_args()
 
-    success = run_divorce_pipeline(target_date=args.date, county_id=args.county_id)
+    success = run_divorce_pipeline(
+        target_date=args.date, county_id=args.county_id,
+        headful=args.headful, no_proxy=args.no_proxy,
+    )
 
     if success and args.load_to_db:
         try:

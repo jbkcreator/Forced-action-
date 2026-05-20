@@ -3,7 +3,7 @@ Stripe payment-failure recovery sweep.
 
 Day 1: soft reminder (~24h after failure).
 Day 3: urgency message + missed Gold-lead count (~72h after failure).
-Day 5: handled by proactive_save.py (existing, no change needed here).
+Day 5: downgrade/save offer — pivot away from payment retry, offer Data-Only plan.
 
 Cron: 0 16 * * * (daily 16:00 UTC, after proactive_save 15:00).
 
@@ -15,8 +15,11 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 
+from config.revenue_ladder import DATA_ONLY_TIER
 from src.core.database import get_db_context
 from src.core.models import Subscriber
+from src.services.claude_router import call_claude_with_usage
+from src.utils.prompt_loader import get_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -24,11 +27,13 @@ DAY1_MIN = timedelta(hours=20)
 DAY1_MAX = timedelta(hours=28)
 DAY3_MIN = timedelta(days=2, hours=20)
 DAY3_MAX = timedelta(days=3, hours=4)
+DAY5_MIN = timedelta(days=4, hours=20)
+DAY5_MAX = timedelta(days=5, hours=4)
 
 
 def run(dry_run: bool = False) -> dict:
     now = datetime.now(timezone.utc)
-    sent = {"day1": 0, "day3": 0, "skipped": 0, "errors": 0}
+    sent = {"day1": 0, "day3": 0, "day5": 0, "skipped": 0, "errors": 0}
 
     with get_db_context() as db:
         subs = db.execute(
@@ -48,6 +53,11 @@ def run(dry_run: bool = False) -> dict:
                         _send_day3(sub, db)
                         sub.recovery_day3_sent = True
                     sent["day3"] += 1
+                elif DAY5_MIN <= elapsed <= DAY5_MAX and not sub.recovery_day5_sent:
+                    if not dry_run:
+                        _send_day5(sub)
+                        sub.recovery_day5_sent = True
+                    sent["day5"] += 1
                 else:
                     sent["skipped"] += 1
             except Exception as exc:
@@ -61,6 +71,16 @@ def run(dry_run: bool = False) -> dict:
     return sent
 
 
+def _parse_email(text: str) -> tuple[str, str]:
+    lines = text.strip().splitlines()
+    subject = next((l.replace("SUBJECT:", "").strip() for l in lines if l.startswith("SUBJECT:")), "")
+    body_start = next((i for i, l in enumerate(lines) if l.startswith("BODY:")), None)
+    body = "\n".join(lines[body_start + 1:]).strip() if body_start is not None else ""
+    if not subject or len(subject) > 60 or not body:
+        return "", ""
+    return subject, body
+
+
 def _send_day1(sub: Subscriber) -> None:
     from config.settings import get_settings
     from src.services.email import send_email
@@ -71,31 +91,36 @@ def _send_day1(sub: Subscriber) -> None:
         f"{settings.app_base_url}/dashboard/{sub.event_feed_uuid}"
         if sub.event_feed_uuid else settings.app_base_url
     )
-    subject = "Heads up — your card didn't go through"
-    body_text = (
-        f"Hi {name},\n\n"
-        f"We weren't able to process your Forced Action payment. "
-        f"Update your card to keep your territories locked:\n\n"
-        f"{feed_url}\n\n"
-        f"Questions? support@forcedaction.io\n\n— Forced Action Team"
-    )
-    body_html = f"""<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"/></head>
-<body style="margin:0;padding:40px;background:#0f172a;font-family:Inter,Arial,sans-serif;color:#e2e8f0;">
-  <h2 style="color:#f1f5f9;">Heads up, {name}</h2>
-  <p>We weren't able to process your Forced Action payment.</p>
-  <p>Update your payment method to keep your ZIP territories active:</p>
-  <p><a href="{feed_url}" style="color:#38bdf8;">Update billing →</a></p>
-  <p style="color:#94a3b8;font-size:12px;">Questions? support@forcedaction.io</p>
-</body>
-</html>"""
-    send_email(
-        to=sub.email,
-        subject=subject,
-        body_text=body_text,
-        body_html=body_html,
-    )
+
+    subject = ""
+    body_text = ""
+    try:
+        system_prompt = get_prompt("emails/stripe_recovery.yaml", "day1.system")
+        user_prompt = get_prompt(
+            "emails/stripe_recovery.yaml", "day1.user",
+            name=name, feed_url=feed_url,
+        )
+        result = call_claude_with_usage(
+            task_type="email_copy",
+            messages=[{"role": "user", "content": user_prompt}],
+            system=system_prompt,
+            max_tokens=600,
+        )
+        subject, body_text = _parse_email(result["text"])
+    except Exception as exc:
+        logger.warning("stripe_recovery day1 Cora composition failed sub=%s, using fallback: %s", sub.id, exc)
+
+    if not subject or not body_text:
+        subject = "Heads up — your card didn't go through"
+        body_text = (
+            f"Hi {name},\n\n"
+            f"We weren't able to process your Forced Action payment. "
+            f"Update your card to keep your territories locked:\n\n"
+            f"{feed_url}\n\n"
+            f"Questions? support@forcedaction.io\n\n— Forced Action Team"
+        )
+
+    send_email(to=sub.email, subject=subject, body_text=body_text)
     logger.info("stripe_recovery day1 sent sub=%s", sub.id)
 
 
@@ -129,38 +154,89 @@ def _send_day3(sub: Subscriber, db) -> None:
         logger.warning("stripe_recovery day3 lead fetch failed sub=%s: %s", sub.id, exc)
 
     gold_count = len(gold_leads)
-    lead_lines = "\n".join(
-        f"  • {l.get('address', 'Undisclosed address')} ({l.get('zip', '')})"
+    lead_list = "\n".join(
+        f"  - {l.get('address', 'Undisclosed address')} ({l.get('zip', '')})"
         for l in gold_leads[:3]
-    ) or "  • Leads available in your territory"
+    ) or "  - Leads available in your territory"
 
-    subject = f"{gold_count or 'New'} Gold leads in your ZIP you can't see"
-    body_text = (
-        f"Hi {name},\n\n"
-        f"Your payment is still past due and {gold_count} new Gold leads have appeared "
-        f"in your locked territory that you're missing:\n\n"
-        f"{lead_lines}\n\n"
-        f"Fix your billing now to regain access:\n{feed_url}\n\n"
-        f"— Forced Action Team"
-    )
-    body_html = f"""<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"/></head>
-<body style="margin:0;padding:40px;background:#0f172a;font-family:Inter,Arial,sans-serif;color:#e2e8f0;">
-  <h2 style="color:#fbbf24;">You're missing {gold_count} Gold leads, {name}</h2>
-  <p>Your payment is past due. New leads in your territory:</p>
-  <pre style="background:#1e293b;padding:12px;border-radius:8px;">{lead_lines}</pre>
-  <p><a href="{feed_url}" style="color:#38bdf8;font-weight:bold;">Fix billing to unlock access →</a></p>
-  <p style="color:#94a3b8;font-size:12px;">Questions? support@forcedaction.io</p>
-</body>
-</html>"""
-    send_email(
-        to=sub.email,
-        subject=subject,
-        body_text=body_text,
-        body_html=body_html,
-    )
+    subject = ""
+    body_text = ""
+    try:
+        system_prompt = get_prompt("emails/stripe_recovery.yaml", "day3.system")
+        user_prompt = get_prompt(
+            "emails/stripe_recovery.yaml", "day3.user",
+            name=name, gold_count=gold_count,
+            lead_list=lead_list, feed_url=feed_url,
+        )
+        result = call_claude_with_usage(
+            task_type="email_copy",
+            messages=[{"role": "user", "content": user_prompt}],
+            system=system_prompt,
+            max_tokens=900,
+            subscriber_id=sub.id,
+        )
+        subject, body_text = _parse_email(result["text"])
+    except Exception as exc:
+        logger.warning("stripe_recovery day3 Cora composition failed sub=%s, using fallback: %s", sub.id, exc)
+
+    if not subject or not body_text:
+        subject = f"{gold_count or 'New'} Gold leads in your ZIP you can't see"
+        body_text = (
+            f"Hi {name},\n\n"
+            f"Your payment is still past due and {gold_count} new Gold leads have appeared "
+            f"in your locked territory that you're missing:\n\n"
+            f"{lead_list}\n\n"
+            f"Fix your billing now to regain access:\n{feed_url}\n\n"
+            f"— Forced Action Team"
+        )
+
+    send_email(to=sub.email, subject=subject, body_text=body_text)
     logger.info("stripe_recovery day3 sent sub=%s gold_count=%d", sub.id, gold_count)
+
+
+def _send_day5(sub: Subscriber) -> None:
+    from config.settings import get_settings
+    from src.services.email import send_email
+
+    settings = get_settings()
+    name = sub.name or "there"
+    price = DATA_ONLY_TIER["price_cents"] // 100
+    feed_url = (
+        f"{settings.app_base_url}/dashboard/{sub.event_feed_uuid}"
+        if sub.event_feed_uuid else settings.app_base_url
+    )
+
+    subject = ""
+    body_text = ""
+    try:
+        system_prompt = get_prompt("emails/stripe_recovery.yaml", "day5_downgrade.system")
+        user_prompt = get_prompt(
+            "emails/stripe_recovery.yaml", "day5_downgrade.user",
+            name=name, price=price, feed_url=feed_url,
+        )
+        result = call_claude_with_usage(
+            task_type="email_copy",
+            messages=[{"role": "user", "content": user_prompt}],
+            system=system_prompt,
+            max_tokens=800,
+        )
+        subject, body_text = _parse_email(result["text"])
+    except Exception as exc:
+        logger.warning("stripe_recovery day5 Cora composition failed sub=%s, using fallback: %s", sub.id, exc)
+
+    if not subject or not body_text:
+        subject = f"Stay on Forced Action for ${price}/mo — Data-Only plan"
+        body_text = (
+            f"Hi {name},\n\n"
+            f"Your payment has been past due for 5 days. We'd rather keep you than lose you.\n\n"
+            f"Our Data-Only plan lets you keep your territory and full property data feed "
+            f"at just ${price}/mo — no enrichment fees, cancel anytime.\n\n"
+            f"Switch now:\n{feed_url}\n\n"
+            f"Questions? support@forcedaction.io\n\n— Forced Action Team"
+        )
+
+    send_email(to=sub.email, subject=subject, body_text=body_text)
+    logger.info("stripe_recovery day5 sent sub=%s", sub.id)
 
 
 if __name__ == "__main__":

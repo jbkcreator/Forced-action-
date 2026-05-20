@@ -240,3 +240,53 @@ def reset_ab_config_cache() -> None:
 	live without restarting the process.
 	"""
 	_load_ab_config.cache_clear()
+
+
+def validate_ab_config_vs_db(db: Any = None) -> list:
+	"""
+	Compare YAML traffic_pct vs DB traffic_pct for every enabled A/B test.
+	Returns a list of warning strings (empty list = all in sync).
+
+	Intended for startup checks and admin diagnostics. The ab_engine
+	auto-syncs on next get_or_create_test call, so mismatches here mean
+	a test exists in DB but hasn't been touched since the YAML changed.
+
+	Pass a SQLAlchemy session as `db`, or omit to open one automatically.
+	"""
+	cfg = _load_ab_config()
+	if not cfg:
+		return []
+
+	def _check(session: Any) -> list:
+		mismatches = []
+		try:
+			from sqlalchemy import select as _select
+			from src.core.models import AbTest
+			for test_name, entry in cfg.items():
+				if not isinstance(entry, dict) or not entry.get("enabled"):
+					continue
+				yaml_pct = int(entry.get("traffic_pct", 0))
+				row = session.execute(
+					_select(AbTest).where(AbTest.test_name == test_name)
+				).scalar_one_or_none()
+				if row and row.traffic_pct != yaml_pct:
+					msg = (
+						f"A/B config mismatch — {test_name}: "
+						f"YAML traffic_pct={yaml_pct}, DB traffic_pct={row.traffic_pct}"
+					)
+					logger.warning(msg)
+					mismatches.append(msg)
+		except Exception as exc:
+			logger.warning("validate_ab_config_vs_db: check failed: %s", exc)
+		return mismatches
+
+	if db is not None:
+		return _check(db)
+
+	try:
+		from src.core.database import Database
+		with Database().session_scope() as session:
+			return _check(session)
+	except Exception as exc:
+		logger.warning("validate_ab_config_vs_db: DB unavailable: %s", exc)
+		return []

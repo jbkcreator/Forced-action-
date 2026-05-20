@@ -38,6 +38,7 @@ from langgraph.graph import END, START, StateGraph
 from src.agents.prompts.loader import (
     render_fallback_body,
     render_for_subscriber_auto,
+    render_variant,
 )
 from src.agents.subgraphs.compose_and_send import run_compose_and_send
 from src.agents.subgraphs.decision_hierarchy import run_decision_hierarchy
@@ -69,6 +70,7 @@ class AcceleratedWalletPushState(TypedDict, total=False):
 
     framing_variant: str
     ab_variant: Optional[str]
+    _variant_id: Optional[str]   # formatted "{test_name}:{variant}" for attribution
 
     # Intermediate prompt artefacts produced by build_compose_context and
     # consumed by compose_and_send. Declared so LangGraph's TypedDict schema
@@ -155,6 +157,7 @@ def _node_hierarchy_check(state: AcceleratedWalletPushState) -> AcceleratedWalle
         "use_fallback": bool(hierarchy.get("use_fallback", False)),
         "kill_switch_color": hierarchy.get("kill_switch_color"),
         "revenue_signal_score": hierarchy.get("revenue_signal_score", 0),
+        "ab_variant": hierarchy.get("ab_variant"),
     }
 
 
@@ -197,14 +200,29 @@ def _node_build_compose_context(state: AcceleratedWalletPushState) -> Dict[str, 
 
     # Use render_for_subscriber_auto so A/B variant assignment (deterministic)
     # is honoured. Falls back to base system.yaml if no test is enabled.
+    _test_name = "accelerated_wallet_push_framing"
     try:
-        system, user, variant, _test_name = render_for_subscriber_auto(
+        system, user, variant, _test_name_result = render_for_subscriber_auto(
             GRAPH_NAME, state["subscriber_id"], context
         )
+        if _test_name_result:
+            _test_name = _test_name_result
     except Exception as exc:  # never block a send on prompt loading
         logger.warning("render_for_subscriber_auto failed: %s", exc)
         system, user = "", ""
         variant = None
+
+    # If render returned no variant (e.g. prompt load error), fall back to the
+    # variant already assigned by the decision_hierarchy so attribution is not
+    # lost even when the prompt loader is degraded.
+    if variant is None and state.get("ab_variant"):
+        variant = state["ab_variant"]
+        try:
+            system, user = render_variant(GRAPH_NAME, variant, context)
+        except Exception:
+            pass  # keep whatever system/user are already set
+
+    formatted_variant_id = f"{_test_name}:{variant}" if variant else None
 
     try:
         fallback = render_fallback_body(GRAPH_NAME, context)
@@ -218,6 +236,7 @@ def _node_build_compose_context(state: AcceleratedWalletPushState) -> Dict[str, 
     return {
         "framing_variant": framing,
         "ab_variant": variant,
+        "_variant_id": formatted_variant_id,
         "_system_prompt": system,
         "_user_prompt": user,
         "_fallback_body": fallback,
@@ -239,7 +258,7 @@ def _node_compose_and_send(state: AcceleratedWalletPushState) -> AcceleratedWall
         "user_prompt": state.get("_user_prompt", ""),
         "cache_system": True,
         "max_output_tokens": 160,
-        "variant_id": state.get("ab_variant"),
+        "variant_id": state.get("_variant_id"),
         "message_type": "marketing",
         "use_fallback": state.get("use_fallback", False),
         "ab_fallback_body": state.get("_fallback_body"),
@@ -335,10 +354,12 @@ def _node_finalize(state: AcceleratedWalletPushState) -> AcceleratedWalletPushSt
                 terminal_status=final_status,
                 tokens_used=int(state.get("tokens_used", 0) or 0),
                 cost_usd=float(state.get("cost_usd", 0.0) or 0.0),
+                variant_id=state.get("_variant_id"),
                 summary={
                     "failure_reason": state.get("failure_reason"),
                     "early_abort": True,
                     "framing_variant": state.get("framing_variant"),
+                    "variant_id": state.get("_variant_id"),
                 },
             )
         except Exception:

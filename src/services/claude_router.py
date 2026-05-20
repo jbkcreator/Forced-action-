@@ -53,7 +53,10 @@ _TASK_ROUTING: dict[str, str] = {
     "complex_reasoning":     "sonnet",
     "lead_analysis":         "sonnet",
     "learning_card":         "sonnet",
-    "retention_copy":        "sonnet",
+    "retention_copy":           "sonnet",
+    "email_copy":               "sonnet",
+    "referral_milestone_sms":   "haiku",
+    "referral_milestone_email": "sonnet",
     # Opus — explicit override, edge cases only
     "edge_case": "opus",
 }

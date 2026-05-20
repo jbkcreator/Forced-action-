@@ -28,6 +28,8 @@ from config.revenue_ladder import AP_PRO_UPSELL
 from config.settings import settings
 from src.core.database import get_db_context
 from src.core.models import DealOutcome, MessageOutcome, SentLead, Subscriber
+from src.services.claude_router import call_claude_with_usage
+from src.utils.prompt_loader import get_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +66,34 @@ def _was_offered_recently(subscriber_id: int, db: Session) -> bool:
     return found is not None
 
 
+def _parse_email(text: str) -> tuple[str, str]:
+    lines = text.strip().splitlines()
+    subject = next((l.replace("SUBJECT:", "").strip() for l in lines if l.startswith("SUBJECT:")), "")
+    body_start = next((i for i, l in enumerate(lines) if l.startswith("BODY:")), None)
+    body = "\n".join(lines[body_start + 1:]).strip() if body_start is not None else ""
+    if not subject or len(subject) > 60 or not body:
+        return "", ""
+    return subject, body
+
+
+_STATIC_AP_SUBJECT = "You earned AutoPilot Pro - 5-touch + appointment setting"
+
+
+def _static_ap_body(name: str, rate_pct: int, upgrade_url: str, feed_url: str) -> str:
+    return (
+        f"Hi {name},\n\n"
+        f"You're closing at {rate_pct}% on AutoPilot Lite. That's the threshold "
+        f"where 5-touch sequences + appointment setting start paying back.\n\n"
+        f"AutoPilot Pro adds:\n"
+        f"  - 5-touch outbound sequences per lead\n"
+        f"  - Premium routing (Immediate-tier leads first)\n"
+        f"  - Appointment setting handled by Cora\n\n"
+        f"Upgrade:  {upgrade_url}\n"
+        f"Dashboard: {feed_url}\n\n"
+        f"- Forced Action Team"
+    )
+
+
 def _send_offer(sub: Subscriber, close_rate: float, db: Session) -> bool:
     if not sub.email:
         return False
@@ -71,28 +101,41 @@ def _send_offer(sub: Subscriber, close_rate: float, db: Session) -> bool:
         f"{settings.app_base_url}/dashboard/{sub.event_feed_uuid}"
         if sub.event_feed_uuid else settings.app_base_url
     )
-    upgrade_url = f"{settings.app_base_url}/api/upgrade?feed_uuid={sub.event_feed_uuid}&tier=autopilot_pro" \
+    upgrade_url = (
+        f"{settings.app_base_url}/api/upgrade?feed_uuid={sub.event_feed_uuid}&tier=autopilot_pro"
         if sub.event_feed_uuid else feed_url
-
+    )
     rate_pct = round(close_rate * 100)
+    name = sub.name or "there"
+
+    subject = ""
+    body_text = ""
+    try:
+        system_prompt = get_prompt("emails/ap_pro_upsell.yaml", "system")
+        user_prompt = get_prompt(
+            "emails/ap_pro_upsell.yaml", "user",
+            name=name, close_rate_pct=rate_pct,
+            feed_url=feed_url, upgrade_url=upgrade_url,
+        )
+        result = call_claude_with_usage(
+            task_type="email_copy",
+            messages=[{"role": "user", "content": user_prompt}],
+            system=system_prompt,
+            max_tokens=700,
+            subscriber_id=sub.id,
+            db=db,
+        )
+        subject, body_text = _parse_email(result["text"])
+    except Exception as exc:
+        logger.warning("[APProUpsell] Cora composition failed for sub=%d, using fallback: %s", sub.id, exc)
+
+    if not subject or not body_text:
+        subject = _STATIC_AP_SUBJECT
+        body_text = _static_ap_body(name, rate_pct, upgrade_url, feed_url)
+
     try:
         from src.services.email import send_email
-        send_email(
-            to=sub.email,
-            subject="You earned AutoPilot Pro - 5-touch + appointment setting",
-            body_text=(
-                f"Hi {sub.name or 'there'},\n\n"
-                f"You're closing at {rate_pct}% on AutoPilot Lite. That's the threshold "
-                f"where 5-touch sequences + appointment setting start paying back.\n\n"
-                f"AutoPilot Pro adds:\n"
-                f"  - 5-touch outbound sequences per lead\n"
-                f"  - Premium routing (Immediate-tier leads first)\n"
-                f"  - Appointment setting handled by Cora\n\n"
-                f"Upgrade with one tap:  {upgrade_url}\n"
-                f"Or open your dashboard: {feed_url}\n\n"
-                f"- Forced Action Team"
-            ),
-        )
+        send_email(to=sub.email, subject=subject, body_text=body_text)
     except Exception as exc:
         logger.error("[APProUpsell] email send failed for sub=%d: %s", sub.id, exc)
         return False

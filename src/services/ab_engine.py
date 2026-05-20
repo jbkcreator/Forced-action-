@@ -24,17 +24,28 @@ def get_or_create_test(
     traffic_pct: int,
     db: Session,
 ) -> AbTest:
+    cap = get_guardrail("ab_test_traffic_cap")["max_pct"]
+    capped_pct = min(traffic_pct, cap)
+
     existing = db.execute(
         select(AbTest).where(AbTest.test_name == test_name)
     ).scalar_one_or_none()
     if existing:
+        # Sync traffic_pct from YAML config (source of truth) to DB.
+        if existing.traffic_pct != capped_pct:
+            logger.info(
+                "ab_engine: syncing traffic_pct for %s: %s → %s",
+                test_name, existing.traffic_pct, capped_pct,
+            )
+            existing.traffic_pct = capped_pct
+            db.flush()
         return existing
     test = AbTest(
         test_name=test_name,
         segment=segment,
         variant_a=variant_a,
         variant_b=variant_b,
-        traffic_pct=min(traffic_pct, get_guardrail("ab_test_traffic_cap")["max_pct"]),
+        traffic_pct=capped_pct,
         status="active",
     )
     db.add(test)

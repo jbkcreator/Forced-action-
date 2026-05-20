@@ -20,15 +20,15 @@ and the dead-letter queue.
 """
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from config.settings import settings
-from src.core.models import SmsDeadLetter, SmsOptIn, SmsOptOut
+from src.core.models import SmsDeadLetter, SmsOptIn, SmsOptOut, SmsSendLog
 from src.services import phone_utils
 from src.services.telnyx_sms import TelnyxSMSError, send_message as telnyx_send_message
 
@@ -47,6 +47,10 @@ _OPT_OUT_REPLY = (
 # TCPA quiet hours: 8am–9pm recipient local time
 _QUIET_START = 21   # 9pm (exclusive upper bound)
 _QUIET_END   = 8    # 8am (inclusive lower bound)
+
+# Per-subscriber marketing SMS frequency caps
+_MARKETING_CAP_24H = 2   # max successful marketing sends per subscriber in a rolling 24-hour window
+_MARKETING_CAP_7D  = 5   # max successful marketing sends per subscriber in a rolling 7-day window
 
 # Area code → IANA timezone. Most FL area codes are Eastern.
 #
@@ -153,7 +157,7 @@ def add_to_dead_letter(
     Write a failed or blocked SMS event to the dead-letter queue for manual review.
     reason must be one of: opt_out / delivery_failed / error / unresolvable / quiet_hours / no_opt_in
     """
-    valid_reasons = {"opt_out", "delivery_failed", "error", "unresolvable", "quiet_hours", "no_opt_in"}
+    valid_reasons = {"opt_out", "delivery_failed", "error", "unresolvable", "quiet_hours", "no_opt_in", "subscriber_sms_frequency_cap"}
     if reason not in valid_reasons:
         logger.warning("Invalid DLQ reason '%s' — defaulting to 'error'", reason)
         reason = "error"
@@ -242,7 +246,25 @@ def send_sms(
         )
         return False
 
-    # 3. TCPA quiet hours — no SMS before 8am or after 9pm recipient local time.
+    # 3. Per-subscriber marketing frequency cap — applied globally regardless of campaign.
+    # Transactional, opt_in_prompt, and messages without a known subscriber_id bypass this gate.
+    if message_type == "marketing" and subscriber_id is not None:
+        if _check_marketing_frequency_cap(subscriber_id, db):
+            logger.info(
+                "SMS suppressed (subscriber_sms_frequency_cap): subscriber_id=%s to=%s",
+                subscriber_id, to,
+            )
+            add_to_dead_letter(to, "subscriber_sms_frequency_cap", {"body": body[:160]}, db)
+            _log("suppressed", suppress_reason="subscriber_sms_frequency_cap")
+            _capture_sandbox_attempt(
+                db=db, to=to, body=body, subscriber_id=subscriber_id,
+                campaign=campaign_label, variant_id=variant_id, decision_id=decision_id,
+                compliance_allowed=False, compliance_reason="subscriber_sms_frequency_cap",
+                would_have_delivered=False,
+            )
+            return False
+
+    # 5. TCPA quiet hours — no SMS before 8am or after 9pm recipient local time.
     # Gated behind sms_quiet_hours_enabled so QA + local sandbox runs aren't
     # blocked overnight; default ON in production.
     if settings.sms_quiet_hours_enabled and is_quiet_hours(to):
@@ -257,7 +279,7 @@ def send_sms(
         )
         return False
 
-    # 4. Dry-run path (TELNYX_SMS_ENABLED=false)
+    # 6. Dry-run path (TELNYX_SMS_ENABLED=false)
     if not settings.telnyx_sms_enabled:
         logger.info("[DRY RUN] SMS to=%s body=%r", to, body[:160])
         _log("dry_run")
@@ -269,7 +291,7 @@ def send_sms(
         )
         return True
 
-    # 5. Telnyx misconfiguration — live mode but creds missing
+    # 7. Telnyx misconfiguration — live mode but creds missing
     if not all([
         settings.telnyx_sms_api_key,
         settings.telnyx_from_number,
@@ -286,7 +308,7 @@ def send_sms(
         )
         return False
 
-    # 6. Real Telnyx dispatch
+    # 8. Real Telnyx dispatch
     try:
         result = telnyx_send_message(to=to, body=body)
         vendor_message_id = result.get("message_id")
@@ -509,3 +531,54 @@ def _twiml_reply(message: str) -> str:
     """Minimal TwiML response for Twilio webhook."""
     safe = message.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     return f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{safe}</Message></Response>'
+
+
+def _check_marketing_frequency_cap(subscriber_id: int, db: Session) -> bool:
+    """
+    Return True (blocked) if the subscriber has hit the marketing SMS frequency cap.
+
+    Counts rows in SmsSendLog where outcome IN ('sent', 'dry_run') and
+    message_type = 'marketing' within the rolling 24-hour and 7-day windows.
+    Dry-run sends are counted so the cap holds in staging environments too.
+
+    Caps (per _MARKETING_CAP_24H / _MARKETING_CAP_7D):
+        24h window: 2 sends max
+        7d window:  5 sends max
+    """
+    now = datetime.now(timezone.utc)
+    cutoff_24h = now - timedelta(hours=24)
+    cutoff_7d = now - timedelta(days=7)
+
+    count_24h = db.execute(
+        select(func.count()).select_from(SmsSendLog).where(
+            SmsSendLog.subscriber_id == subscriber_id,
+            SmsSendLog.message_type == "marketing",
+            SmsSendLog.outcome.in_(["sent", "dry_run"]),
+            SmsSendLog.created_at >= cutoff_24h,
+        )
+    ).scalar() or 0
+
+    if count_24h >= _MARKETING_CAP_24H:
+        logger.debug(
+            "marketing_frequency_cap 24h: subscriber_id=%s count=%d cap=%d",
+            subscriber_id, count_24h, _MARKETING_CAP_24H,
+        )
+        return True
+
+    count_7d = db.execute(
+        select(func.count()).select_from(SmsSendLog).where(
+            SmsSendLog.subscriber_id == subscriber_id,
+            SmsSendLog.message_type == "marketing",
+            SmsSendLog.outcome.in_(["sent", "dry_run"]),
+            SmsSendLog.created_at >= cutoff_7d,
+        )
+    ).scalar() or 0
+
+    if count_7d >= _MARKETING_CAP_7D:
+        logger.debug(
+            "marketing_frequency_cap 7d: subscriber_id=%s count=%d cap=%d",
+            subscriber_id, count_7d, _MARKETING_CAP_7D,
+        )
+        return True
+
+    return False

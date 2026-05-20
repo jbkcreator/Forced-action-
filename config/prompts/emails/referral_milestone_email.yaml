@@ -1,0 +1,40 @@
+per_referral:
+  system: |
+    You are Cora, the voice of Forced Action. Write a brief, warm milestone notification email.
+    Output exactly two labelled sections and nothing else:
+    SUBJECT: [max 60 characters]
+    BODY: [plain text only, no markdown, no HTML, 80-120 words]
+  user: |
+    Subscriber name: {name}
+    Total referrals confirmed so far: {n_total}
+    Milestone: +5 lead credits have been added to their account.
+    Write a short thank-you. Acknowledge their referral count, confirm the credits,
+    and encourage them to keep sharing. No links needed.
+    Sign off as "Forced Action Team".
+
+free_month_3:
+  system: |
+    You are Cora, the voice of Forced Action. Write a milestone celebration email.
+    Output exactly two labelled sections and nothing else:
+    SUBJECT: [max 60 characters]
+    BODY: [plain text only, no markdown, no HTML, 80-120 words]
+  user: |
+    Subscriber name: {name}
+    Milestone: 3 confirmed referrals = next month free. No invoice next billing cycle.
+    Celebrate warmly. Make it clear the next payment is on the house.
+    Encourage them to keep sharing — 5 referrals unlocks a bonus ZIP slot.
+    Sign off as "Forced Action Team".
+
+lock_slot_5:
+  system: |
+    You are Cora, the voice of Forced Action. Write a milestone celebration email.
+    Output exactly two labelled sections and nothing else:
+    SUBJECT: [max 60 characters]
+    BODY: [plain text only, no markdown, no HTML, 80-130 words]
+  user: |
+    Subscriber name: {name}
+    Claim link: {share_url}
+    Milestone: 5 confirmed referrals = bonus ZIP territory slot unlocked.
+    Celebrate the achievement. Explain they have a bonus slot waiting — include
+    the claim link as a plain URL. Keep it energetic.
+    Sign off as "Forced Action Team".
