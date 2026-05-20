@@ -344,9 +344,23 @@ def download_latest_civil_filing(
 
     if scrape_mode in ("playwright_only", "playwright_then_ai"):
         logger.info("[evictions] Using playwright mode for '%s'", county_id)
-        return asyncio.run(
-            _scrape_with_playwright(source, county_id, target_date, start_date, end_date, headful, no_proxy=no_proxy)
-        )
+        try:
+            return asyncio.run(
+                _scrape_with_playwright(source, county_id, target_date, start_date, end_date, headful, no_proxy=no_proxy)
+            )
+        except Exception as pw_exc:
+            if scrape_mode != "playwright_then_ai":
+                raise
+            logger.warning(
+                "[evictions] Playwright failed for '%s' (%s) — falling back to browser-use AI agent",
+                county_id, pw_exc,
+            )
+            return asyncio.run(
+                _download_civil_filing_browser(
+                    county_id, source, target_date, RAW_EVICTIONS_DIR,
+                    headful=headful, no_proxy=no_proxy,
+                )
+            )
 
     if output_format == "excel":
         logger.info("[evictions] County '%s' uses browser download (output_format=excel)", county_id)

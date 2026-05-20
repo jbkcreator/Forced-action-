@@ -46,7 +46,10 @@ from config.constants import (
     BROWSER_TEMPERATURE,
 )
 from src.utils.county_config import get_county_config
-from src.utils.http_helpers import STEALTH_UA, STEALTH_ARGS, apply_stealth_to_browser_use
+from src.utils.http_helpers import (
+    STEALTH_UA, STEALTH_ARGS, apply_stealth_to_browser_use,
+    get_playwright_proxy, get_browser_use_proxy,
+)
 from src.utils.logger import setup_logging, get_logger
 
 setup_logging()
@@ -198,6 +201,7 @@ async def run_browser_agent(
     download_dir: Path,
     headful: bool = False,
     cf_profile: Optional[dict] = None,
+    no_proxy: bool = False,
 ) -> tuple:
     """
     Run a browser-use Agent that triggers a file download.
@@ -261,6 +265,7 @@ async def run_browser_agent(
         browser_kwargs.update(
             user_agent=STEALTH_UA,
             enable_default_extensions=True,
+            proxy=None if no_proxy else get_browser_use_proxy(),
         )
 
     browser = Browser(**browser_kwargs)
@@ -297,6 +302,7 @@ async def _scrape_with_playwright(
     download_dir: Path,
     headful: bool = False,
     cf_profile: Optional[dict] = None,
+    no_proxy: bool = False,
 ) -> Optional[pd.DataFrame]:
     """
     Execute stored playwright_code against a Playwright page.
@@ -375,7 +381,8 @@ async def _scrape_with_playwright(
                 ],
                 ignore_default_args=["--enable-automation"],
             )
-            context = await browser.new_context(accept_downloads=True)
+            _proxy = None if no_proxy else get_playwright_proxy()
+            context = await browser.new_context(accept_downloads=True, proxy=_proxy)
             page = await context.new_page()
 
         try:
@@ -649,6 +656,7 @@ async def run_lien_pipeline(
     county_id: str = "hillsborough",
     headful: bool = False,
     load_to_db: bool = False,
+    no_proxy: bool = False,
 ) -> bool:
     """County-agnostic lien/deed/judgment/probate scrape for a date range.
 
@@ -716,7 +724,7 @@ async def run_lien_pipeline(
         logger.info("[Pipeline] playwright_code found — using Playwright selector mode")
         df = await _scrape_with_playwright(
             playwright_code, source, start_str, end_str, RAW_LIEN_DIR,
-            headful=headful, cf_profile=cf_profile,
+            headful=headful, cf_profile=cf_profile, no_proxy=no_proxy,
         )
         if df is None:
             logger.error("[Pipeline] Playwright scrape failed")
@@ -732,6 +740,7 @@ async def run_lien_pipeline(
             task, RAW_LIEN_DIR,
             headful=headful,
             cf_profile=cf_profile,
+            no_proxy=no_proxy,
         )
 
         if history is None:
@@ -965,6 +974,8 @@ def main():
                         help="End date YYYY-MM-DD (default: today)")
     parser.add_argument("--headful", action="store_true",
                         help="Run browser in visible mode")
+    parser.add_argument("--no-proxy", dest="no_proxy", action="store_true", default=False,
+                        help="Disable Oxylabs proxy for all requests")
     add_load_to_db_arg(parser)
 
     args = parser.parse_args()
@@ -974,6 +985,7 @@ def main():
         county_id=args.county_id,
         headful=args.headful,
         load_to_db=args.load_to_db,
+        no_proxy=args.no_proxy,
     ))
 
     import sys
