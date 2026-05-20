@@ -115,16 +115,20 @@ class BaseLoader(ABC):
     # ========================================================================
     
     @staticmethod
-    def normalize_address(addr: str) -> str:
+    def normalize_address(addr: str, county_id: Optional[str] = None) -> str:
         """
         Standardize address for matching - uses same logic as CSV matching.
-        
+
         Extracts street address only, removing city/state/zip and normalizing
         to lowercase with standard abbreviations.
-        
+
         Args:
             addr: Raw address string
-            
+            county_id: County slug used to look up address_city_tokens from the
+                       DB-backed county config. When None, no city-suffix strip
+                       is applied (defensive fallback — pass self.county_id from
+                       loader instances so the correct per-county tokens win).
+
         Returns:
             Normalized street address (lowercase, abbreviated)
         """
@@ -213,16 +217,21 @@ class BaseLoader(ABC):
         if parts and parts[-1].replace('-', '').isdigit():
             addr = ' '.join(parts[:-1])
 
-        # Remove common city names that might be embedded at the end
-        cities = ['tampa', 'riverview', 'valrico', 'gibsonton', 'lithia',
-                  'brandon', 'seffner', 'plant city', 'sun city center',
-                  'thonotosassa', 'odessa', 'lutz', 'wesley chapel',
-                  'ruskin', 'wimauma', 'apollo beach', 'dover', 'balm',
-                  'sydney', 'mango', 'citrus park', 'new tampa']
-
-        for city in cities:
-            if addr.endswith(' ' + city):
-                addr = addr[:-len(city)].strip()
+        # Remove common city/CDP tokens embedded at the end. Tokens come from
+        # the per-county DB config (counties.address_city_tokens) so adding a
+        # new county is config-only — no code change.
+        if county_id:
+            try:
+                from src.utils.county_config import get_county_config
+                tokens = get_county_config(county_id).get("address_city_tokens", []) or []
+            except Exception:
+                tokens = []
+            # Strip longest tokens first so "sun city center" wins over "center".
+            for city in sorted(tokens, key=len, reverse=True):
+                city = str(city).lower().strip()
+                if city and addr.endswith(' ' + city):
+                    addr = addr[:-len(city)].strip()
+                    break
 
         return addr.strip()
     
@@ -430,7 +439,7 @@ class BaseLoader(ABC):
         if pd.isna(address) or not address:
             return None
 
-        normalized_search = self.normalize_address(address)
+        normalized_search = self.normalize_address(address, self.county_id)
         if not normalized_search:
             return None
 
@@ -455,7 +464,7 @@ class BaseLoader(ABC):
             for prop in ilike_rows:
                 if not prop.address:
                     continue
-                normalized_prop = self.normalize_address(prop.address)
+                normalized_prop = self.normalize_address(prop.address, self.county_id)
                 if normalized_prop == normalized_search:
                     return prop, 100   # exact match — done
                 if normalized_prop:
