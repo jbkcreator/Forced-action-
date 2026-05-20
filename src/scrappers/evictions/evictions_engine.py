@@ -24,7 +24,11 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
-from src.utils.http_helpers import requests_get_with_retry, STEALTH_UA, STEALTH_ARGS, apply_stealth_to_browser_use, apply_stealth_to_page
+from src.utils.http_helpers import (
+    requests_get_with_retry, STEALTH_UA, STEALTH_ARGS,
+    apply_stealth_to_browser_use, apply_stealth_to_page,
+    get_playwright_proxy, get_browser_use_proxy,
+)
 
 from config.constants import (
     RAW_EVICTIONS_DIR,
@@ -68,7 +72,7 @@ def _get_eviction_source(county_id: str) -> dict:
     return sources.get("evictions") or sources.get("court_records") or {}
 
 
-def _static_download(source: dict, dest_dir: Path, target_date: str = None) -> Path:
+def _static_download(source: dict, dest_dir: Path, target_date: str = None, no_proxy: bool = False) -> Path:
     """
     Download a dated file directly from a URL pattern stored in source["url"].
     The URL must contain the literal placeholder {date} (replaced with YYYYMMDD).
@@ -154,6 +158,7 @@ async def _execute_playwright_code_on_page(page, playwright_code, url, start_str
 async def _scrape_with_playwright(
     source: dict, county_id: str, target_date: str | None,
     start_date: str | None, end_date: str | None, headful: bool = False,
+    no_proxy: bool = False,
 ) -> Path:
     """Run the source's playwright_code and save the resulting DataFrame to disk."""
     playwright_code = source.get("playwright_code", "")
@@ -189,13 +194,18 @@ async def _scrape_with_playwright(
             df = await _execute_playwright_code_on_page(page, playwright_code, url, start_str, end_str, county_id)
     else:
         from playwright.async_api import async_playwright
+        _proxy = None if no_proxy else get_playwright_proxy()
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=not headful,
                 downloads_path=str(RAW_EVICTIONS_DIR),
                 args=STEALTH_ARGS,
             )
-            context = await browser.new_context(user_agent=STEALTH_UA, accept_downloads=True)
+            context = await browser.new_context(
+                user_agent=STEALTH_UA,
+                accept_downloads=True,
+                proxy=_proxy,
+            )
             page = await context.new_page()
             await apply_stealth_to_page(page)
             try:
@@ -214,7 +224,7 @@ async def _scrape_with_playwright(
 
 async def _download_civil_filing_browser(
     county_id: str, source: dict, target_date: str | None, dest_dir: Path,
-    headful: bool = False,
+    headful: bool = False, no_proxy: bool = False,
 ) -> Path:
     """
     Browser-use agent download for counties whose civil portal requires a browser
@@ -271,6 +281,8 @@ async def _download_civil_filing_browser(
         args=STEALTH_ARGS,
     )
     if cf_profile:
+        # CF bypass: use warmed Edge profile — proxy must be None to preserve
+        # the fingerprint that earned the cf_clearance cookie.
         browser_kwargs.update(
             executable_path=cf_profile["edge_path"],
             user_data_dir=cf_profile["profile_dir"],
@@ -281,6 +293,7 @@ async def _download_civil_filing_browser(
         browser_kwargs.update(
             user_agent=STEALTH_UA,
             enable_default_extensions=True,
+            proxy=None if no_proxy else get_browser_use_proxy(),
         )
 
     browser = Browser(**browser_kwargs)
@@ -311,7 +324,7 @@ async def _download_civil_filing_browser(
 
 def download_latest_civil_filing(
     target_date: str = None, county_id: str = "hillsborough", headful: bool = False,
-    start_date: str = None, end_date: str = None,
+    start_date: str = None, end_date: str = None, no_proxy: bool = False,
 ) -> Path:
     """
     Download the latest civil filing from the county clerk.
@@ -327,18 +340,18 @@ def download_latest_civil_filing(
 
     if scrape_mode == "static_download":
         logger.info("[evictions] Using static_download mode for '%s'", county_id)
-        return _static_download(source, RAW_EVICTIONS_DIR, target_date)
+        return _static_download(source, RAW_EVICTIONS_DIR, target_date, no_proxy=no_proxy)
 
     if scrape_mode in ("playwright_only", "playwright_then_ai"):
         logger.info("[evictions] Using playwright mode for '%s'", county_id)
         return asyncio.run(
-            _scrape_with_playwright(source, county_id, target_date, start_date, end_date, headful)
+            _scrape_with_playwright(source, county_id, target_date, start_date, end_date, headful, no_proxy=no_proxy)
         )
 
     if output_format == "excel":
         logger.info("[evictions] County '%s' uses browser download (output_format=excel)", county_id)
         return asyncio.run(
-            _download_civil_filing_browser(county_id, source, target_date, RAW_EVICTIONS_DIR, headful=headful)
+            _download_civil_filing_browser(county_id, source, target_date, RAW_EVICTIONS_DIR, headful=headful, no_proxy=no_proxy)
         )
 
     # Hillsborough / CSV directory-listing path
@@ -527,7 +540,7 @@ def save_processed_evictions(df: pd.DataFrame, county_id: str = "hillsborough", 
 
 def run_eviction_pipeline(
     target_date: str = None, county_id: str = "hillsborough", headful: bool = False,
-    start_date: str = None, end_date: str = None,
+    start_date: str = None, end_date: str = None, no_proxy: bool = False,
 ) -> bool:
     """Full pipeline: download → load → filter → dedup → save. Returns True on success."""
     t0 = time.monotonic()
@@ -538,7 +551,7 @@ def run_eviction_pipeline(
 
         file_path = download_latest_civil_filing(
             target_date=target_date, county_id=county_id, headful=headful,
-            start_date=start_date, end_date=end_date,
+            start_date=start_date, end_date=end_date, no_proxy=no_proxy,
         )
         civil_df = process_civil_data(file_path, county_id=county_id)
         evictions_df = filter_evictions(civil_df, county_id=county_id)
@@ -602,12 +615,14 @@ if __name__ == "__main__":
                         help="County identifier (default: hillsborough)")
     parser.add_argument("--headful", action="store_true", default=False,
                         help="Run browser in headed (visible) mode for debugging")
+    parser.add_argument("--no-proxy", dest="no_proxy", action="store_true", default=False,
+                        help="Disable Oxylabs proxy for all requests")
     add_load_to_db_arg(parser)
     args = parser.parse_args()
 
     success = run_eviction_pipeline(
         target_date=args.date, county_id=args.county_id, headful=args.headful,
-        start_date=args.start_date, end_date=args.end_date,
+        start_date=args.start_date, end_date=args.end_date, no_proxy=args.no_proxy,
     )
 
     if success and args.load_to_db:
