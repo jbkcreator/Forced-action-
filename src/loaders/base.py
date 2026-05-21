@@ -23,6 +23,33 @@ from src.core.models import Property, Owner
 logger = logging.getLogger(__name__)
 
 
+# Multi-word role/relationship phrases stripped from owner names before
+# fuzzy matching. Exported so other loaders (e.g. lis_pendens) can reuse
+# the same list when filtering candidate party names.
+_OWNER_NAME_NOISE_PHRASES: tuple[str, ...] = (
+    "AS TRUSTEE OF THE",
+    "AS SUCCESSOR TRUSTEE",
+    "AS TRUSTEE OF",
+    "AS NOMINEE FOR",
+    "AS NOMINEE",
+    "AS SUCCESSOR",
+    "SUCCESSOR IN INTEREST",
+    "THROUGH UNDER",
+    "CLAIMING BY",
+    "TRUSTEE OF THE",
+    "TRUSTEE OF",
+)
+
+# Single-token suffixes / role labels.
+_OWNER_NAME_SUFFIXES: tuple[str, ...] = (
+    "LLC", "INC", "CORP", "CO", "LTD", "LP", "LLP", "PLLC",
+    "TRUSTEE", "TRUST", "ESTATE", "EST",
+    "REVOCABLE", "IRREVOCABLE", "REV", "IRREV",
+    "INDIVIDUALLY", "AKA", "FKA", "NKA", "DBA",
+    "THE", "AND", "&",
+)
+
+
 class BaseLoader(ABC):
     """
     Abstract base class for all data loaders.
@@ -117,109 +144,21 @@ class BaseLoader(ABC):
     @staticmethod
     def normalize_address(addr: str, county_id: Optional[str] = None) -> str:
         """
-        Standardize address for matching - uses same logic as CSV matching.
+        Standardize address for matching.
 
-        Extracts street address only, removing city/state/zip and normalizing
-        to lowercase with standard abbreviations.
-
-        Args:
-            addr: Raw address string
-            county_id: County slug used to look up address_city_tokens from the
-                       DB-backed county config. When None, no city-suffix strip
-                       is applied (defensive fallback — pass self.county_id from
-                       loader instances so the correct per-county tokens win).
-
-        Returns:
-            Normalized street address (lowercase, abbreviated)
+        Delegates the heavy lifting (USPS suffixes, directionals at any
+        position, unit stripping, zero-padding) to the canonical
+        `src.utils.address_normalize.normalize_street_address` so the same
+        rules apply at ingestion (MasterPropertyLoader) and match time.
+        County-specific city/CDP token stripping stays here because it
+        requires DB access.
         """
-        if pd.isna(addr) or not addr:
+        from src.utils.address_normalize import normalize_street_address
+
+        addr_norm = normalize_street_address(addr)
+        if not addr_norm:
             return ""
-        
-        addr = str(addr).lower().strip()
-        
-        # Filter out invalid addresses
-        invalid_patterns = ['not provided', 'landlord/tenant', 'progress residential',
-                           'right of way', 'right of wy', 'right-of-way',
-                           'processed', 'row at', 'intersection',
-                           'final', 'piles at', 'accumulations', 'county facility']
-        for pattern in invalid_patterns:
-            if pattern in addr:
-                return ""
-        
-        # Filter intersections (addresses with &)
-        if ' & ' in addr or ' and ' in addr:
-            return ""
-        
-        # Remove semicolon and everything after it
-        addr = addr.split(';')[0].strip()
-        
-        # Remove periods
-        addr = addr.replace('.', '')
-        
-        # Standardize common abbreviations to match database format
-        replacements = {
-            # Must come before shorter patterns to avoid partial replacement
-            'state road': 'sr',       # "W State Road 60" → "W SR 60"
-            ' street': ' st',
-            ' drive': ' dr',
-            ' road': ' rd',
-            ' avenue': ' ave',
-            ' lane': ' ln',
-            ' circle': ' cir',
-            ' boulevard': ' blvd',
-            ' court': ' ct',
-            ' place': ' pl',
-            ' terrace': ' ter',
-            ' trail': ' trl',
-            ' highway': ' hwy',
-            ' parkway': ' pkwy',
-            ' way': ' wy',
-            'florida': 'fl',
-            ' north ': ' n ',
-            ' south ': ' s ',
-            ' east ': ' e ',
-            ' west ': ' w ',
-            ' northwest ': ' nw ',
-            ' northeast ': ' ne ',
-            ' southwest ': ' sw ',
-            ' southeast ': ' se ',
-        }
-        
-        for old, new in replacements.items():
-            addr = addr.replace(old, new)
-        
-        # Remove extra spaces
-        addr = ' '.join(addr.split())
-        
-        # Check if address starts with a number (most real addresses do)
-        parts = addr.split()
-        if not parts or not any(char.isdigit() for char in parts[0]):
-            return ""
-        
-        # Split by comma and take first part (street only)
-        addr = addr.split(',')[0].strip()
 
-        # Remove unit/apt/lot/building indicators with numeric or letter designators
-        # Must run BEFORE trailing-digit strip so "Unit 109" is removed as a unit
-        # designator (not as a zip code). Handles: "Apt 4", "Unit B", "Ste 101",
-        # "#4A", "Bldg 3", "Fl 2", "Unit 109".
-        addr = re.sub(r'\s+(apt|unit|lot|ste|suite|bldg|building|fl|floor|#)\s*[\w-]+', '', addr, flags=re.IGNORECASE)
-        # Remove trailing standalone hash+designator: "123 Main St #4"
-        addr = re.sub(r'\s+#[\w-]+$', '', addr)
-
-        # Remove trailing state/zip patterns
-        addr = addr.split(' fl ')[0].strip()
-
-        # Remove numeric-only zip codes at the end — must run BEFORE city removal so
-        # that "5017 LOWELL RD TAMPA 33624" strips the zip first, leaving "5017 LOWELL RD TAMPA",
-        # then city removal correctly strips the trailing city name.
-        parts = addr.split()
-        if parts and parts[-1].replace('-', '').isdigit():
-            addr = ' '.join(parts[:-1])
-
-        # Remove common city/CDP tokens embedded at the end. Tokens come from
-        # the per-county DB config (counties.address_city_tokens) so adding a
-        # new county is config-only — no code change.
         if county_id:
             try:
                 from src.utils.county_config import get_county_config
@@ -229,43 +168,48 @@ class BaseLoader(ABC):
             # Strip longest tokens first so "sun city center" wins over "center".
             for city in sorted(tokens, key=len, reverse=True):
                 city = str(city).lower().strip()
-                if city and addr.endswith(' ' + city):
-                    addr = addr[:-len(city)].strip()
+                if city and addr_norm.endswith(' ' + city):
+                    addr_norm = addr_norm[:-len(city)].strip()
                     break
 
-        return addr.strip()
+        return addr_norm.strip()
     
     @staticmethod
     def normalize_owner_name(name: str) -> str:
         """
         Standardize owner name for fuzzy matching.
-        
+
+        Two-phase strip: multi-word noise phrases first so things like
+        "AS TRUSTEE OF THE" are removed wholesale (otherwise the per-token
+        loop would leave residual "AS OF"), then single-word suffixes,
+        then punctuation and whitespace.
+
         Args:
             name: Raw owner name string
-            
+
         Returns:
             Normalized owner name
         """
         if pd.isna(name) or not name:
             return ""
-        
+
         name = str(name).upper().strip()
-        
-        # Remove legal suffixes
-        suffixes = [
-            'LLC', 'INC', 'CORP', 'CO', 'LTD', 'LP', 'LLP', 'PLLC',
-            'TRUSTEE', 'TRUST', 'ESTATE', 'REVOCABLE', 'IRREVOCABLE',
-            'THE', 'AND', '&'
-        ]
-        for suffix in suffixes:
+
+        # Phase 1: multi-word noise phrases (longest first to avoid the
+        # "AS TRUSTEE OF" substring eating into "AS TRUSTEE OF THE").
+        for phrase in sorted(_OWNER_NAME_NOISE_PHRASES, key=len, reverse=True):
+            name = re.sub(rf'\b{re.escape(phrase)}\b', ' ', name)
+
+        # Phase 2: single-word suffixes / role labels
+        for suffix in _OWNER_NAME_SUFFIXES:
             name = re.sub(rf'\b{suffix}\b\.?', '', name)
-        
+
         # Remove punctuation
         name = re.sub(r'[^\w\s]', ' ', name)
-        
-        # Remove extra whitespace
+
+        # Collapse whitespace
         name = re.sub(r'\s+', ' ', name).strip()
-        
+
         return name
     
     @staticmethod
@@ -451,7 +395,7 @@ class BaseLoader(ABC):
 
         if house_number and house_number.isdigit():
             ilike_filters = [
-                Property.address.ilike(f"{house_number} %"),
+                Property.normalized_address.ilike(f"{house_number} %"),
                 Property.county_id == self.county_id,
             ]
             if zip_code:
@@ -462,13 +406,12 @@ class BaseLoader(ABC):
                 .all()
             )
             for prop in ilike_rows:
-                if not prop.address:
+                normalized_prop = prop.normalized_address or ""
+                if not normalized_prop:
                     continue
-                normalized_prop = self.normalize_address(prop.address, self.county_id)
                 if normalized_prop == normalized_search:
                     return prop, 100   # exact match — done
-                if normalized_prop:
-                    candidates.append((prop, normalized_prop))
+                candidates.append((prop, normalized_prop))
 
         # ── Strategy 2: pg_trgm full-table similarity ────────────────────
         trgm_props: list = []
@@ -476,16 +419,16 @@ class BaseLoader(ABC):
             from sqlalchemy import func as sqlfunc
             with self.session.begin_nested():   # savepoint — protects outer tx
                 trgm_filters = [
-                    Property.address.isnot(None),
+                    Property.normalized_address.isnot(None),
                     Property.county_id == self.county_id,
-                    sqlfunc.similarity(Property.address, address) >= 0.3,
+                    sqlfunc.similarity(Property.normalized_address, normalized_search) >= 0.3,
                 ]
                 if zip_code:
                     trgm_filters.append(Property.zip == zip_code)
                 trgm_props = (
                     self.session.query(Property)
                     .filter(*trgm_filters)
-                    .order_by(sqlfunc.similarity(Property.address, address).desc())
+                    .order_by(sqlfunc.similarity(Property.normalized_address, normalized_search).desc())
                     .limit(15)
                     .all()
                 )
@@ -494,9 +437,7 @@ class BaseLoader(ABC):
             trgm_props = []
 
         for prop in trgm_props:
-            if not prop.address:
-                continue
-            normalized_prop = self.normalize_address(prop.address)
+            normalized_prop = prop.normalized_address or ""
             if normalized_prop and (prop.id, normalized_prop) not in {(p.id, n) for p, n in candidates}:
                 candidates.append((prop, normalized_prop))
 
@@ -557,6 +498,17 @@ class BaseLoader(ABC):
         if not legal:
             return None
 
+        # Normalize recorder long-forms to the abbreviations the property
+        # appraiser stores in legal_description. Also strip possessive apostrophes
+        # (recorder: "GIBBS ADD"; appraiser: "GIBB'S ADD") so ILIKE filters match.
+        for long_form, short_form in [
+            ('SUBDIVISION', 'SUB'),
+            ('BUILDING',    'BLDG'),
+            ('ADDITION',    'ADD'),
+        ]:
+            legal = re.sub(rf'\b{long_form}\b', short_form, legal)
+        legal = legal.replace("'", "")
+
         # ── Parse key tokens ────────────────────────────────────────────────
         lot_match   = re.search(r'\bLOT\s+(\d+\w*)\b', legal)
         block_match = re.search(r'\bB(?:LOCK|LK)\s+(\d+\w*)\b', legal)
@@ -568,14 +520,17 @@ class BaseLoader(ABC):
         # Fallback: use the tail after the last structural keyword when prefix is empty.
         if not subd_raw and len(parts) > 1:
             subd_raw = parts[-1].strip()
-        # Keep only words longer than 3 chars (skip filler like "OF", "THE")
+        # Keep only words longer than 3 chars (skip filler like "OF", "THE", "SUB")
         subd_words = [w for w in subd_raw.split() if len(w) > 3][:4]
 
         if not lot_match and not subd_words:
             return None  # Not enough info to narrow down
 
         # ── Build ILIKE filters ──────────────────────────────────────────────
-        from sqlalchemy import and_
+        from sqlalchemy import and_, func as sa_func
+
+        # Strip apostrophes from the DB field at match time so GIBBS matches GIBB'S.
+        legal_desc_stripped = sa_func.replace(Property.legal_description, "'", "")
 
         filters = [Property.legal_description.isnot(None)]
 
@@ -588,7 +543,7 @@ class BaseLoader(ABC):
             blk_num = block_match.group(1)
             filters.append(Property.legal_description.op('~*')(rf'\mB(LOCK|LK) {blk_num}\M'))
         for word in subd_words:
-            filters.append(Property.legal_description.ilike(f'%{word}%'))
+            filters.append(legal_desc_stripped.ilike(f'%{word}%'))
 
         filters.append(Property.county_id == self.county_id)
         candidates = (
@@ -730,7 +685,34 @@ class BaseLoader(ABC):
             return best_match, best_score
 
         return None
-    
+
+    def find_property_by_owner_name_multi(
+        self,
+        raw_name: str,
+        threshold: int = 80,
+    ) -> Optional[Tuple[Property, int]]:
+        """
+        Like find_property_by_owner_name but handles comma-separated multi-party
+        fields (e.g. "KUMP LEOPOLD A, KUMP CARMEN M" or trust/multi-grantor strings).
+
+        Splits on commas and tries each segment individually, returning the first
+        match that meets the threshold. Falls back to the full string last so that
+        single-name callers see identical behaviour.
+        """
+        if pd.isna(raw_name) or not raw_name:
+            return None
+
+        segments = [s.strip() for s in str(raw_name).split(',') if s.strip()]
+        # Try individual segments first; full string last (deduped)
+        if len(segments) > 1:
+            segments.append(str(raw_name))  # full string as final fallback
+
+        for segment in segments:
+            result = self.find_property_by_owner_name(segment, threshold=threshold)
+            if result:
+                return result
+        return None
+
     # ========================================================================
     # LLM VERIFICATION HELPERS
     # ========================================================================
@@ -882,6 +864,24 @@ class BaseLoader(ABC):
             logger.warning(f"Skipped record — DB rejected it: {e}")
             return False
 
+    @property
+    def _thresholds(self):
+        """County-aware matching thresholds for this loader."""
+        from config.matching import for_county
+        return for_county(self.county_id)
+
+    def _classify_match(self, score: int, match_method: Optional[str]) -> str:
+        """Return tier string based on score and method: 'matched', 'pending_review', or 'unmatched'."""
+        if match_method == "llm_verified":
+            return "matched"
+        normalized = score / 100.0
+        t = self._thresholds
+        if normalized >= t.auto_match:
+            return "matched"
+        if normalized >= t.review_min:
+            return "pending_review"
+        return "unmatched"
+
     def quarantine_unmatched(
         self,
         source_type: str,
@@ -890,9 +890,13 @@ class BaseLoader(ABC):
         instrument_number: str = None,
         grantor: str = None,
         address_string: str = None,
+        match_status: str = "unmatched",
+        match_confidence: Optional[float] = None,
+        candidate_property_id: Optional[int] = None,
+        match_method: Optional[str] = None,
     ) -> None:
         """
-        Store an unmatched record in the staging table instead of silently discarding it.
+        Store an unmatched or pending-review record in the staging table.
         Records can be re-matched later when the master parcel is refreshed.
         """
         from src.core.models import UnmatchedRecord
@@ -922,8 +926,11 @@ class BaseLoader(ABC):
             instrument_number=str(instrument_number) if instrument_number else None,
             grantor=str(grantor)[:500] if grantor else None,
             address_string=str(address_string)[:500] if address_string else None,
-            match_status="unmatched",
+            match_status=match_status,
             match_attempted_at=datetime.now(timezone.utc),
+            match_confidence=round(match_confidence, 3) if match_confidence is not None else None,
+            candidate_property_id=candidate_property_id,
+            match_method=match_method,
         )
 
         try:
@@ -938,11 +945,14 @@ class BaseLoader(ABC):
                         index_elements=["instrument_number", "source_type", "county_id"],
                         index_where=UnmatchedRecord.instrument_number.isnot(None),
                         set_={
-                            "raw_data":            stmt.excluded.raw_data,
-                            "match_status":        stmt.excluded.match_status,
-                            "match_attempted_at":  stmt.excluded.match_attempted_at,
-                            "grantor":             stmt.excluded.grantor,
-                            "address_string":      stmt.excluded.address_string,
+                            "raw_data":               stmt.excluded.raw_data,
+                            "match_status":           stmt.excluded.match_status,
+                            "match_attempted_at":     stmt.excluded.match_attempted_at,
+                            "grantor":                stmt.excluded.grantor,
+                            "address_string":         stmt.excluded.address_string,
+                            "match_confidence":       stmt.excluded.match_confidence,
+                            "candidate_property_id":  stmt.excluded.candidate_property_id,
+                            "match_method":           stmt.excluded.match_method,
                         },
                     )
                     self.session.execute(stmt)

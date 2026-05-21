@@ -119,7 +119,7 @@ def _build_scraper_section(session, run_date: date, county_id: str):
     extras = sorted(t for t in scraper_by_type if t not in SCRAPER_ORDER)
 
     scraper_data = []
-    total_scraped = total_matched = 0
+    total_scraped = total_matched = total_unmatched = 0
     errors = []
 
     for source_type in ordered + extras:
@@ -127,11 +127,13 @@ def _build_scraper_section(session, run_date: date, county_id: str):
         if source_type not in MATCH_PCT_EXCLUDE:
             total_scraped += row.total_scraped
             total_matched += row.matched
+            total_unmatched += row.unmatched
         scraper_data.append({
             "label":    source_type.replace("_", " ").title(),
             "scraped":  row.total_scraped,
             "matched":  row.matched   if row.total_scraped > 0 else None,
             "unmatched":row.unmatched if row.total_scraped > 0 else None,
+            "skipped":  row.skipped   if row.total_scraped > 0 else None,
             "ok":       row.run_success,
             "error":    row.error_message,
         })
@@ -142,11 +144,15 @@ def _build_scraper_section(session, run_date: date, county_id: str):
         if source_type not in scraper_by_type:
             scraper_data.append({
                 "label": source_type.replace("_", " ").title(),
-                "scraped": 0, "matched": None, "unmatched": None,
+                "scraped": 0, "matched": None, "unmatched": None, "skipped": None,
                 "ok": None, "error": "No run recorded",
             })
 
-    match_pct = (total_matched / total_scraped * 100) if total_scraped else 0.0
+    # Denominator is new records only (matched + unmatched), excluding duplicates
+    # that were skipped before matching. Using total_scraped inflates the denominator
+    # and produces artificially low match rates on days with heavy duplicate traffic.
+    new_records = total_matched + total_unmatched
+    match_pct = (total_matched / new_records * 100) if new_records else 0.0
     return scraper_data, total_scraped, total_matched, match_pct, errors
 
 
@@ -678,13 +684,14 @@ def write_csv(report: dict, path: Path) -> None:
         w.writerow([f"Total: {report['total_scraped']:,} scraped | "
                     f"{report['total_matched']:,} matched ({report['match_pct']:.1f}%)"])
         w.writerow([])
-        w.writerow(["Scraper", "Scraped", "Matched", "Unmatched"])
+        w.writerow(["Scraper", "Scraped", "Matched", "Unmatched", "Skipped (dupes)"])
         for row in report["scraper_data"]:
             w.writerow([
                 row["label"],
                 row["scraped"],
                 row["matched"]   if row["matched"]   is not None else "—",
                 row["unmatched"] if row["unmatched"] is not None else "—",
+                row["skipped"]   if row.get("skipped") is not None else "—",
             ])
         w.writerow([])
 

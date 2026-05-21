@@ -16,6 +16,7 @@ import pandas as pd
 
 from src.loaders.base import BaseLoader
 from src.core.models import Property, Owner, Financial
+from src.utils.address_normalize import normalize_street_address
 
 logger = logging.getLogger(__name__)
 
@@ -272,6 +273,11 @@ class MasterPropertyLoader(BaseLoader):
                 # Extract string fields - skip if they look wrong
                 site_addr_raw = str(row.get('SITE_ADDR', '')) if pd.notna(row.get('SITE_ADDR')) else ''
                 site_addr = site_addr_raw[:255] if site_addr_raw and len(site_addr_raw) > 5 else None
+                # Canonical form for ingestion + match-time comparison; shares
+                # the same normalizer used by BaseLoader.normalize_address.
+                site_addr_normalized = (normalize_street_address(site_addr) or None) if site_addr else None
+                if site_addr_normalized:
+                    site_addr_normalized = site_addr_normalized[:255]
                 
                 site_city_raw = str(row.get('SITE_CITY', '')) if pd.notna(row.get('SITE_CITY')) else ''
                 # Skip if site_city looks like a legal description (too long or has degrees/minutes)
@@ -304,6 +310,7 @@ class MasterPropertyLoader(BaseLoader):
                 property_record = Property(
                     parcel_id=parcel_id,
                     address=site_addr,
+                    normalized_address=site_addr_normalized,
                     city=site_city,
                     state="FL",
                     zip=site_zip,

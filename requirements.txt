@@ -18,6 +18,7 @@ python-dotenv>=1.2.1
 pyyaml>=6.0.3
 requests>=2.32.5
 rapidfuzz>=3.10.0
+usaddress>=0.5.10
 
 # JWT (admin upload layer)
 python-jose[cryptography]>=3.3.0

@@ -47,30 +47,34 @@ def test_pinellas_strips_st_petersburg(patched_config):
 
 
 def test_pinellas_strips_clearwater(patched_config):
-    assert BaseLoader.normalize_address("1340 HOMESTEAD WAY CLEARWATER", "pinellas") == "1340 homestead wy"
+    # USPS abbreviation for WAY is WAY (WY = Wyoming, the state) — fixed in
+    # the shared normalize_street_address module.
+    assert BaseLoader.normalize_address("1340 HOMESTEAD WAY CLEARWATER", "pinellas") == "1340 homestead way"
 
 
-def test_pinellas_does_not_strip_tampa(patched_config):
-    # Tampa is not a Pinellas token — must remain in the string so the
-    # cross-county mismatch is visible to downstream fuzzy matching.
+def test_pinellas_input_with_other_county_city(patched_config):
+    # usaddress strips well-known city tokens regardless of county config.
+    # Cross-county isolation is enforced at the SQL filter level
+    # (Property.county_id == self.county_id), not the normalizer.
     out = BaseLoader.normalize_address("100 MAIN ST TAMPA", "pinellas")
-    assert out.endswith("tampa")
+    assert out == "100 main st"
 
 
-def test_hillsborough_does_not_strip_clearwater(patched_config):
+def test_hillsborough_input_with_other_county_city(patched_config):
     out = BaseLoader.normalize_address("100 MAIN ST CLEARWATER", "hillsborough")
-    assert out.endswith("clearwater")
+    assert out == "100 main st"
 
 
-def test_unknown_county_no_strip(patched_config):
-    # KeyError from config lookup → tokens default to [] → no strip happens.
+def test_unknown_county_falls_back_to_usaddress_strip(patched_config):
+    # KeyError from config lookup → tokens default to [] → usaddress
+    # still strips PlaceName components.
     out = BaseLoader.normalize_address("100 MAIN ST TAMPA", "nonexistent_county")
-    assert out.endswith("tampa")
+    assert out == "100 main st"
 
 
-def test_none_county_id_no_strip(patched_config):
+def test_none_county_id_falls_back_to_usaddress_strip(patched_config):
     out = BaseLoader.normalize_address("100 MAIN ST TAMPA", None)
-    assert out.endswith("tampa")
+    assert out == "100 main st"
 
 
 def test_longest_token_wins(patched_config):

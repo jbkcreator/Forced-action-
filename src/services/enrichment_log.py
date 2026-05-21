@@ -25,10 +25,10 @@ logger = logging.getLogger(__name__)
 # Adjust when vendor pricing is renegotiated. Source these from settings/
 # config if they need to change at runtime.
 DEFAULT_COST_CENTS = {
-    ("batchdata", "premium_transfer"):   12,   # ~$0.12/lookup retail
-    ("batchdata", "premium_byol"):       12,
-    ("batchdata", "lead_unlock"):        12,
-    ("batchdata", "batch_skip_trace"):   12,
+    ("batchdata", "premium_transfer"):   7,
+    ("batchdata", "premium_byol"):       7,
+    ("batchdata", "lead_unlock"):        7,
+    ("batchdata", "batch_skip_trace"):   7,
     ("twilio_lookup", "phone_verify"):   1,
 }
 

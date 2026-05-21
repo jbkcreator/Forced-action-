@@ -66,92 +66,121 @@ class DeedLoader(BaseLoader):
             # Match property — try legal description first (most accurate),
             # then fall back to owner name (Grantor → Grantee).
             property_record = None
+            match_score = 0
+            match_method = None
 
             # Strategy A: Legal description (lot/block/subdivision → parcel)
             if pd.notna(row.get('Legal')):
-                match_result = self.find_property_by_legal_description(row['Legal'])
+                match_result = self.find_property_by_legal_description(
+                    row['Legal'], threshold=self._thresholds.legal_desc_floor,
+                )
                 if match_result:
-                    property_record, score = match_result
-                    logger.info(f"Matched deed by legal desc (score: {score}%): {instrument}")
+                    property_record, match_score = match_result
+                    match_method = 'legal_desc'
+                    logger.info(f"Matched deed by legal desc (score: {match_score}%): {instrument}")
 
-            # Strategy B: Grantor (seller) name
+            # Strategy B: Grantor (seller) name — comma-split handles multi-grantor/trust fields
             if not property_record and pd.notna(row.get('Grantor')):
-                match_result = self.find_property_by_owner_name(row['Grantor'], threshold=75)
+                match_result = self.find_property_by_owner_name_multi(row['Grantor'], threshold=self._thresholds.owner_name_floor)
                 if match_result:
-                    property_record, score = match_result
-                    logger.info(f"Matched deed by grantor (score: {score}%): {instrument}")
-                    property_record, _ = self._apply_llm_verification(
+                    property_record, match_score = match_result
+                    match_method = 'owner_name'
+                    logger.info(f"Matched deed by grantor (score: {match_score}%): {instrument}")
+                    property_record, llm_method = self._apply_llm_verification(
                         raw_row=row.to_dict() if hasattr(row, 'to_dict') else dict(row),
-                        current_best=property_record, match_score=score,
+                        current_best=property_record, match_score=match_score,
                         record_type='deed', match_field='Grantor',
                     )
+                    if llm_method:
+                        match_method = llm_method
 
-            # Strategy C: Grantee (buyer) name
+            # Strategy C: Grantee (buyer) name — comma-split handles multi-grantee fields
             if not property_record and pd.notna(row.get('Grantee')):
-                match_result = self.find_property_by_owner_name(row['Grantee'], threshold=75)
+                match_result = self.find_property_by_owner_name_multi(row['Grantee'], threshold=self._thresholds.owner_name_floor)
                 if match_result:
-                    property_record, score = match_result
-                    logger.info(f"Matched deed by grantee (score: {score}%): {instrument}")
-                    property_record, _ = self._apply_llm_verification(
+                    property_record, match_score = match_result
+                    match_method = 'owner_name'
+                    logger.info(f"Matched deed by grantee (score: {match_score}%): {instrument}")
+                    property_record, llm_method = self._apply_llm_verification(
                         raw_row=row.to_dict() if hasattr(row, 'to_dict') else dict(row),
-                        current_best=property_record, match_score=score,
+                        current_best=property_record, match_score=match_score,
                         record_type='deed', match_field='Grantee',
                     )
-            
-            if property_record:
-                try:
-                    # Handle NaN values
-                    grantor_val = row.get('Grantor')
-                    if pd.isna(grantor_val):
-                        grantor_val = None
-                    
-                    grantee_val = row.get('Grantee')
-                    if pd.isna(grantee_val):
-                        grantee_val = None
-                    
-                    deed_type_val = row.get('DocType')
-                    if pd.isna(deed_type_val):
-                        deed_type_val = None
-                    
-                    book_type_val = row.get('BookType')
-                    if pd.isna(book_type_val):
-                        book_type_val = None
-                    
-                    book_number_val = row.get('BookNum')
-                    if pd.isna(book_number_val):
-                        book_number_val = None
-                    
-                    page_number_val = row.get('PageNum')
-                    if pd.isna(page_number_val):
-                        page_number_val = None
-                    
-                    legal_desc_val = row.get('Legal')
-                    if pd.isna(legal_desc_val):
-                        legal_desc_val = None
-                    
-                    deed_record = Deed(
-                        property_id=property_record.id,
-                        instrument_number=instrument,
-                        grantor=grantor_val,
-                        grantee=grantee_val,
-                        record_date=self.parse_date(row.get('RecordDate')),
-                        sale_price=self.parse_amount(row.get('SalesPrice')),
-                        deed_type=deed_type_val,
-                        doc_type=None,  # Not in this CSV format
-                        book_type=book_type_val,
-                        book_number=book_number_val,
-                        page_number=page_number_val,
-                        legal_description=legal_desc_val,
-                        county_id=self.county_id,
-                    )
-                    
-                    if self.safe_add(deed_record):
-                        matched += 1
-                    else:
-                        unmatched += 1
+                    if llm_method:
+                        match_method = llm_method
 
-                except Exception as e:
-                    logger.error(f"Error building deed {instrument}: {e}")
+            if property_record:
+                tier = self._classify_match(match_score, match_method)
+                if tier == "matched":
+                    try:
+                        # Handle NaN values
+                        grantor_val = row.get('Grantor')
+                        if pd.isna(grantor_val):
+                            grantor_val = None
+
+                        grantee_val = row.get('Grantee')
+                        if pd.isna(grantee_val):
+                            grantee_val = None
+
+                        deed_type_val = row.get('DocType')
+                        if pd.isna(deed_type_val):
+                            deed_type_val = None
+
+                        book_type_val = row.get('BookType')
+                        if pd.isna(book_type_val):
+                            book_type_val = None
+
+                        book_number_val = row.get('BookNum')
+                        if pd.isna(book_number_val):
+                            book_number_val = None
+
+                        page_number_val = row.get('PageNum')
+                        if pd.isna(page_number_val):
+                            page_number_val = None
+
+                        legal_desc_val = row.get('Legal')
+                        if pd.isna(legal_desc_val):
+                            legal_desc_val = None
+
+                        deed_record = Deed(
+                            property_id=property_record.id,
+                            instrument_number=instrument,
+                            grantor=grantor_val,
+                            grantee=grantee_val,
+                            record_date=self.parse_date(row.get('RecordDate')),
+                            sale_price=self.parse_amount(row.get('SalesPrice')),
+                            deed_type=deed_type_val,
+                            doc_type=None,  # Not in this CSV format
+                            book_type=book_type_val,
+                            book_number=book_number_val,
+                            page_number=page_number_val,
+                            legal_description=legal_desc_val,
+                            match_confidence=round(match_score / 100.0, 3),
+                            match_method=match_method,
+                            county_id=self.county_id,
+                        )
+
+                        if self.safe_add(deed_record):
+                            matched += 1
+                        else:
+                            unmatched += 1
+
+                    except Exception as e:
+                        logger.error(f"Error building deed {instrument}: {e}")
+                        unmatched += 1
+                else:
+                    logger.debug(f"Pending review deed: {instrument} (score: {match_score}%, method: {match_method})")
+                    self.quarantine_unmatched(
+                        source_type="deeds",
+                        raw_row=row.to_dict() if hasattr(row, 'to_dict') else dict(row),
+                        county_id=self.county_id,
+                        instrument_number=instrument,
+                        grantor=row.get('Grantor'),
+                        match_status="pending_review",
+                        match_confidence=match_score / 100.0,
+                        candidate_property_id=property_record.id,
+                        match_method=match_method,
+                    )
                     unmatched += 1
             else:
                 logger.debug(f"No property match for deed: {instrument} (Grantor: {row.get('Grantor')})")

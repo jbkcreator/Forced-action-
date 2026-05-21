@@ -119,6 +119,19 @@ def _node_compose(state: ComposeAndSendState) -> ComposeAndSendState:
 			subscriber_id=state.get("subscriber_id"),
 		)
 	except Exception as exc:
+		# API timeout or error — use static fallback body if available rather
+		# than aborting the decision entirely.
+		fallback = state.get("ab_fallback_body")
+		if fallback:
+			logger.warning(
+				"compose: Claude call failed (%s: %s) — using static fallback body",
+				type(exc).__name__, exc,
+			)
+			return {
+				"message_body": fallback,
+				"tokens_used": int(state.get("tokens_used", 0) or 0),
+				"cost_usd": float(state.get("cost_usd", 0.0) or 0.0),
+			}
 		return {
 			"terminal_status": "failed",
 			"failure_reason": f"compose:{type(exc).__name__}:{exc}",
