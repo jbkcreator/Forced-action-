@@ -523,6 +523,7 @@ class Foreclosure(Base):
     # Foreclosure Information
     case_number: Mapped[str] = mapped_column(String(100), unique=True, nullable=False, index=True)
     plaintiff: Mapped[Optional[str]] = mapped_column(Text)
+    defendant: Mapped[Optional[str]] = mapped_column(Text)
     filing_date: Mapped[Optional[datetime]] = mapped_column(Date)
     lis_pendens_date: Mapped[Optional[datetime]] = mapped_column(Date)
     judgment_amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
@@ -545,6 +546,7 @@ class Foreclosure(Base):
         Index("idx_foreclosure_filing_date", "filing_date"),
         Index("idx_foreclosure_auction_date", "auction_date"),
         Index("idx_foreclosure_plaintiff", "plaintiff"),
+        Index("idx_foreclosure_defendant", "defendant"),
         Index("idx_foreclosure_case_status", "case_status"),
     )
 
