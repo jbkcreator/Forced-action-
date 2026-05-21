@@ -7,9 +7,18 @@ Fixes:
 """
 
 import logging
+import re
 from typing import Tuple, Optional
 
 import pandas as pd
+
+# Patterns that indicate a PartyAddress field contains a legal description
+# (lot/block/unit/condo) rather than a postal street address.
+_LEGAL_DESC_RE = re.compile(
+    r'^\s*(LOT\s|BLOCK\s|UNIT\s|BLDG\s|BUILDING\s|TRACT\s|PARCEL\s|CONDO\s|'
+    r'[A-Z]-\d|UNIT\s*NO\.?\s*\d)',
+    re.IGNORECASE,
+)
 
 from src.loaders.base import BaseLoader
 from src.core.models import LegalProceeding
@@ -91,13 +100,28 @@ class ProbateLoader(BaseLoader):
 
             # Match by address
             property_record = None
+            match_score = 0
+            match_method = None
             party_address_val = _none_if_nan(decedent_row.get('PartyAddress'))
 
             if party_address_val:
-                match_result = self.find_property_by_address(str(party_address_val))
+                addr_str = str(party_address_val)
+                if _LEGAL_DESC_RE.match(addr_str):
+                    # PartyAddress is a legal description (LOT/BLOCK/UNIT…), not a
+                    # street address — find_property_by_address would fail on it.
+                    match_result = self.find_property_by_legal_description(
+                        addr_str, threshold=self._thresholds.legal_desc_floor,
+                    )
+                    match_via = "legal_desc"
+                else:
+                    match_result = self.find_property_by_address(
+                        addr_str, threshold=self._thresholds.address_floor,
+                    )
+                    match_via = "address"
                 if match_result:
-                    property_record, score = match_result
-                    logger.info(f"Matched probate by address (score: {score}%): {case_number}")
+                    property_record, match_score = match_result
+                    match_method = match_via
+                    logger.info(f"Matched probate by {match_via} (score: {match_score}%): {case_number}")
 
             # Fallback to owner name — try multiple permutations
             if not property_record:
@@ -125,68 +149,89 @@ class ProbateLoader(BaseLoader):
                                 name_variants.append(f"{first} {part}")
 
                     for variant in name_variants:
-                        match_result = self.find_property_by_owner_name(variant)
+                        match_result = self.find_property_by_owner_name(
+                            variant, threshold=self._thresholds.owner_name_floor,
+                        )
                         if match_result:
-                            property_record, score = match_result
-                            logger.info(f"Matched probate by name '{variant}' (score: {score}%): {case_number}")
-                            property_record, _ = self._apply_llm_verification(
+                            property_record, match_score = match_result
+                            match_method = 'owner_name'
+                            logger.info(f"Matched probate by name '{variant}' (score: {match_score}%): {case_number}")
+                            property_record, llm_method = self._apply_llm_verification(
                                 raw_row=decedent_row.to_dict() if hasattr(decedent_row, 'to_dict') else dict(decedent_row),
-                                current_best=property_record, match_score=score,
+                                current_best=property_record, match_score=match_score,
                                 record_type='probate', match_field='LastName/CompanyName',
                             )
+                            if llm_method:
+                                match_method = llm_method
                             break
 
             if property_record:
-                try:
-                    # Decedent name
-                    first = _none_if_nan(decedent_row.get('FirstName')) or ""
-                    middle = _none_if_nan(decedent_row.get('MiddleName')) or ""
-                    last = _none_if_nan(decedent_row.get('LastName/CompanyName')) or ""
-                    decedent_name = " ".join([str(first).strip(), str(middle).strip(), str(last).strip()]).strip()
-                    decedent_name = " ".join(decedent_name.split()) or None
+                tier = self._classify_match(match_score, match_method)
+                if tier == "matched":
+                    try:
+                        # Decedent name
+                        first = _none_if_nan(decedent_row.get('FirstName')) or ""
+                        middle = _none_if_nan(decedent_row.get('MiddleName')) or ""
+                        last = _none_if_nan(decedent_row.get('LastName/CompanyName')) or ""
+                        decedent_name = " ".join([str(first).strip(), str(middle).strip(), str(last).strip()]).strip()
+                        decedent_name = " ".join(decedent_name.split()) or None
 
-                    # Beneficiary (optional) — store full name so skip-trace can target by name
-                    beneficiary = None
-                    if 'PartyType' in group.columns and 'LastName/CompanyName' in group.columns:
-                        ben_rows = group[group['PartyType'] == 'Beneficiary']
-                        if not ben_rows.empty:
-                            ben_row = ben_rows.iloc[0]
-                            ben_first = str(_none_if_nan(ben_row.get('FirstName')) or "").strip()
-                            ben_last  = _safe_str(ben_row.get('LastName/CompanyName')) or ""
-                            beneficiary = " ".join(p for p in [ben_first, ben_last] if p) or None
-                    beneficiary = _none_if_nan(beneficiary)
+                        # Collect all heirs (Beneficiary + Next of Kin) — store first in
+                        # secondary_party for skip-trace compatibility, full list in meta_data.
+                        all_heirs = []
+                        if 'PartyType' in group.columns and 'LastName/CompanyName' in group.columns:
+                            heir_rows = group[group['PartyType'].isin(['Beneficiary', 'Next of Kin'])]
+                            for _, heir_row in heir_rows.iterrows():
+                                h_first = str(_none_if_nan(heir_row.get('FirstName')) or "").strip()
+                                h_last  = _safe_str(heir_row.get('LastName/CompanyName')) or ""
+                                name = " ".join(p for p in [h_first, h_last] if p)
+                                if name:
+                                    all_heirs.append(name)
+                        beneficiary = all_heirs[0] if all_heirs else None
 
-                    # Other nullable fields
-                    case_status_val = _none_if_nan(decedent_row.get('Title'))
-                    case_type_val = _none_if_nan(decedent_row.get('CaseTypeDescription'))
-                    party_address_val = _none_if_nan(decedent_row.get('PartyAddress'))
+                        # Other nullable fields
+                        case_status_val = _none_if_nan(decedent_row.get('Title'))
+                        case_type_val = _none_if_nan(decedent_row.get('CaseTypeDescription'))
+                        party_address_val = _none_if_nan(decedent_row.get('PartyAddress'))
 
-                    probate_record = LegalProceeding(
-                        property_id=property_record.id,
-                        record_type='Probate',
-                        case_number=case_number,
-                        filing_date=self.parse_date(decedent_row.get('FilingDate')),
-                        case_status=case_status_val,
-                        associated_party=decedent_name,
-                        secondary_party=beneficiary,
-                        county_id=self.county_id,
-                        meta_data={
-                            'case_type': case_type_val,
-                            'party_address': party_address_val
-                        }
-                    )
+                        probate_record = LegalProceeding(
+                            property_id=property_record.id,
+                            record_type='Probate',
+                            case_number=case_number,
+                            filing_date=self.parse_date(decedent_row.get('FilingDate')),
+                            case_status=case_status_val,
+                            associated_party=decedent_name,
+                            secondary_party=beneficiary,
+                            match_confidence=round(match_score / 100.0, 3),
+                            match_method=match_method,
+                            county_id=self.county_id,
+                            meta_data={
+                                'case_type': case_type_val,
+                                'party_address': party_address_val,
+                                'heirs': all_heirs,
+                            }
+                        )
 
-                    # Optional: enforce strict JSON validity (catches NaN early if it ever slips in)
-                    # import json
-                    # json.dumps(probate_record.meta_data, allow_nan=False)
+                        if self.safe_add(probate_record):
+                            matched += 1
+                        else:
+                            unmatched += 1
 
-                    if self.safe_add(probate_record):
-                        matched += 1
-                    else:
+                    except Exception as e:
+                        logger.error(f"Error building probate case {case_number}: {e}")
                         unmatched += 1
-
-                except Exception as e:
-                    logger.error(f"Error building probate case {case_number}: {e}")
+                else:
+                    logger.debug(f"Pending review probate: {case_number} (score: {match_score}%, method: {match_method})")
+                    self.quarantine_unmatched(
+                        source_type="probate",
+                        raw_row=decedent_row.to_dict() if hasattr(decedent_row, 'to_dict') else dict(decedent_row),
+                        county_id=self.county_id,
+                        address_string=str(party_address_val) if party_address_val else None,
+                        match_status="pending_review",
+                        match_confidence=match_score / 100.0,
+                        candidate_property_id=property_record.id,
+                        match_method=match_method,
+                    )
                     unmatched += 1
             else:
                 logger.debug(f"No property match for probate case: {case_number}")
@@ -263,13 +308,18 @@ class EvictionLoader(BaseLoader):
 
             # Match by address
             property_record = None
+            match_score = 0
+            match_method = None
             party_address_val = _none_if_nan(defendant_row.get('PartyAddress'))
 
             if party_address_val:
-                match_result = self.find_property_by_address(str(party_address_val))
+                match_result = self.find_property_by_address(
+                    str(party_address_val), threshold=self._thresholds.address_floor,
+                )
                 if match_result:
-                    property_record, score = match_result
-                    logger.info(f"Matched eviction by address (score: {score}%): {case_number}")
+                    property_record, match_score = match_result
+                    match_method = 'address'
+                    logger.info(f"Matched eviction by address (score: {match_score}%): {case_number}")
 
             # Fallback: try plaintiff name (landlord/property owner)
             # Defendant = tenant — never use tenant name for property matching
@@ -286,60 +336,82 @@ class EvictionLoader(BaseLoader):
                         else:
                             name_variants.append(last)
                         for variant in name_variants:
-                            match_result = self.find_property_by_owner_name(variant)
+                            match_result = self.find_property_by_owner_name(
+                                variant, threshold=self._thresholds.owner_name_floor,
+                            )
                             if match_result:
-                                property_record, score = match_result
-                                logger.info(f"Matched eviction by plaintiff name '{variant}' (score: {score}%): {case_number}")
-                                property_record, _ = self._apply_llm_verification(
+                                property_record, match_score = match_result
+                                match_method = 'owner_name'
+                                logger.info(f"Matched eviction by plaintiff name '{variant}' (score: {match_score}%): {case_number}")
+                                property_record, llm_method = self._apply_llm_verification(
                                     raw_row=prow.to_dict() if hasattr(prow, 'to_dict') else dict(prow),
-                                    current_best=property_record, match_score=score,
+                                    current_best=property_record, match_score=match_score,
                                     record_type='eviction', match_field='Plaintiff',
                                 )
+                                if llm_method:
+                                    match_method = llm_method
                                 break
 
             if property_record:
-                try:
-                    # Plaintiff and defendant names
-                    plaintiff_name = None
-                    if 'PartyType' in group.columns and 'LastName/CompanyName' in group.columns:
-                        pl_rows = group[group['PartyType'] == 'Plaintiff']
-                        if not pl_rows.empty:
-                            plaintiff_name = _safe_str(pl_rows['LastName/CompanyName'].iloc[0])
+                tier = self._classify_match(match_score, match_method)
+                if tier == "matched":
+                    try:
+                        # Plaintiff and defendant names
+                        plaintiff_name = None
+                        if 'PartyType' in group.columns and 'LastName/CompanyName' in group.columns:
+                            pl_rows = group[group['PartyType'] == 'Plaintiff']
+                            if not pl_rows.empty:
+                                plaintiff_name = _safe_str(pl_rows['LastName/CompanyName'].iloc[0])
 
-                    first = _none_if_nan(defendant_row.get('FirstName')) or ""
-                    middle = _none_if_nan(defendant_row.get('MiddleName')) or ""
-                    last = _none_if_nan(defendant_row.get('LastName/CompanyName')) or ""
-                    defendant_name = " ".join([str(first).strip(), str(middle).strip(), str(last).strip()]).strip()
-                    defendant_name = " ".join(defendant_name.split()) or None
+                        first = _none_if_nan(defendant_row.get('FirstName')) or ""
+                        middle = _none_if_nan(defendant_row.get('MiddleName')) or ""
+                        last = _none_if_nan(defendant_row.get('LastName/CompanyName')) or ""
+                        defendant_name = " ".join([str(first).strip(), str(middle).strip(), str(last).strip()]).strip()
+                        defendant_name = " ".join(defendant_name.split()) or None
 
-                    # Nullable fields
-                    case_status_val = _none_if_nan(defendant_row.get('Title'))
-                    case_type_val = _none_if_nan(defendant_row.get('CaseTypeDescription'))
-                    party_address_val = _none_if_nan(defendant_row.get('PartyAddress'))
-                    plaintiff_name = _none_if_nan(plaintiff_name)
+                        # Nullable fields
+                        case_status_val = _none_if_nan(defendant_row.get('Title'))
+                        case_type_val = _none_if_nan(defendant_row.get('CaseTypeDescription'))
+                        party_address_val = _none_if_nan(defendant_row.get('PartyAddress'))
+                        plaintiff_name = _none_if_nan(plaintiff_name)
 
-                    eviction_record = LegalProceeding(
-                        property_id=property_record.id,
-                        record_type='Eviction',
-                        case_number=case_number,
-                        filing_date=self.parse_date(defendant_row.get('FilingDate')),
-                        case_status=case_status_val,
-                        associated_party=defendant_name,
-                        secondary_party=plaintiff_name,
-                        county_id=self.county_id,
-                        meta_data={
-                            'case_type': case_type_val,
-                            'party_address': party_address_val
-                        }
-                    )
+                        eviction_record = LegalProceeding(
+                            property_id=property_record.id,
+                            record_type='Eviction',
+                            case_number=case_number,
+                            filing_date=self.parse_date(defendant_row.get('FilingDate')),
+                            case_status=case_status_val,
+                            associated_party=defendant_name,
+                            secondary_party=plaintiff_name,
+                            match_confidence=round(match_score / 100.0, 3),
+                            match_method=match_method,
+                            county_id=self.county_id,
+                            meta_data={
+                                'case_type': case_type_val,
+                                'party_address': party_address_val
+                            }
+                        )
 
-                    if self.safe_add(eviction_record):
-                        matched += 1
-                    else:
+                        if self.safe_add(eviction_record):
+                            matched += 1
+                        else:
+                            unmatched += 1
+
+                    except Exception as e:
+                        logger.error(f"Error building eviction {case_number}: {e}")
                         unmatched += 1
-
-                except Exception as e:
-                    logger.error(f"Error building eviction {case_number}: {e}")
+                else:
+                    logger.debug(f"Pending review eviction: {case_number} (score: {match_score}%, method: {match_method})")
+                    self.quarantine_unmatched(
+                        source_type="evictions",
+                        raw_row=defendant_row.to_dict() if hasattr(defendant_row, 'to_dict') else dict(defendant_row),
+                        county_id=self.county_id,
+                        address_string=str(party_address_val) if party_address_val else None,
+                        match_status="pending_review",
+                        match_confidence=match_score / 100.0,
+                        candidate_property_id=property_record.id,
+                        match_method=match_method,
+                    )
                     unmatched += 1
             else:
                 logger.warning(
@@ -401,6 +473,8 @@ class BankruptcyLoader(BaseLoader):
             #   - Hyphenated compound last names ("Reina-Perez")
             #   - Property appraiser LAST FIRST vs filing FIRST LAST
             property_record = None
+            match_score = 0
+            match_method = None
             lead_name_val = _none_if_nan(row.get('Lead Name'))
 
             if lead_name_val:
@@ -424,48 +498,70 @@ class BankruptcyLoader(BaseLoader):
                                 name_variants.append(f"{name_parts[0]} {part}")
 
                 for variant in name_variants:
-                    match_result = self.find_property_by_owner_name(variant)
+                    match_result = self.find_property_by_owner_name(
+                        variant, threshold=self._thresholds.owner_name_floor,
+                    )
                     if match_result:
-                        property_record, score = match_result
+                        property_record, match_score = match_result
+                        match_method = 'owner_name'
                         logger.info(
-                            f"Matched bankruptcy by name '{variant}' (score: {score}%): {docket_number}"
+                            f"Matched bankruptcy by name '{variant}' (score: {match_score}%): {docket_number}"
                         )
-                        property_record, _ = self._apply_llm_verification(
+                        property_record, llm_method = self._apply_llm_verification(
                             raw_row=row.to_dict() if hasattr(row, 'to_dict') else dict(row),
-                            current_best=property_record, match_score=score,
+                            current_best=property_record, match_score=match_score,
                             record_type='bankruptcy', match_field='Lead Name',
                         )
+                        if llm_method:
+                            match_method = llm_method
                         break
 
             if property_record:
-                try:
-                    # Nullable fields
-                    lead_name_val = _none_if_nan(row.get('Lead Name'))
-                    case_type_val = _none_if_nan(row.get('Case Type'))
-                    division_val = _none_if_nan(row.get('Division'))
-                    court_id_val = _none_if_nan(row.get('Court ID'))
+                tier = self._classify_match(match_score, match_method)
+                if tier == "matched":
+                    try:
+                        # Nullable fields
+                        lead_name_val = _none_if_nan(row.get('Lead Name'))
+                        case_type_val = _none_if_nan(row.get('Case Type'))
+                        division_val = _none_if_nan(row.get('Division'))
+                        court_id_val = _none_if_nan(row.get('Court ID'))
 
-                    bankruptcy_record = LegalProceeding(
-                        property_id=property_record.id,
-                        record_type='Bankruptcy',
-                        case_number=docket_number,
-                        filing_date=self.parse_date(row.get('Date Filed')),
-                        associated_party=lead_name_val,
-                        county_id=self.county_id,
-                        meta_data={
-                            'case_type': case_type_val,
-                            'division': division_val,
-                            'court_id': court_id_val
-                        }
-                    )
+                        bankruptcy_record = LegalProceeding(
+                            property_id=property_record.id,
+                            record_type='Bankruptcy',
+                            case_number=docket_number,
+                            filing_date=self.parse_date(row.get('Date Filed')),
+                            associated_party=lead_name_val,
+                            match_confidence=round(match_score / 100.0, 3),
+                            match_method=match_method,
+                            county_id=self.county_id,
+                            meta_data={
+                                'case_type': case_type_val,
+                                'division': division_val,
+                                'court_id': court_id_val
+                            }
+                        )
 
-                    if self.safe_add(bankruptcy_record):
-                        matched += 1
-                    else:
+                        if self.safe_add(bankruptcy_record):
+                            matched += 1
+                        else:
+                            unmatched += 1
+
+                    except Exception as e:
+                        logger.error(f"Error building bankruptcy {docket_number}: {e}")
                         unmatched += 1
-
-                except Exception as e:
-                    logger.error(f"Error building bankruptcy {docket_number}: {e}")
+                else:
+                    logger.debug(f"Pending review bankruptcy: {docket_number} (score: {match_score}%, method: {match_method})")
+                    self.quarantine_unmatched(
+                        source_type="bankruptcies",
+                        raw_row=row.to_dict() if hasattr(row, 'to_dict') else dict(row),
+                        county_id=self.county_id,
+                        grantor=str(lead_name_val) if lead_name_val else None,
+                        match_status="pending_review",
+                        match_confidence=match_score / 100.0,
+                        candidate_property_id=property_record.id,
+                        match_method=match_method,
+                    )
                     unmatched += 1
             else:
                 logger.debug(f"No property match for bankruptcy: {docket_number} (Name: {row.get('Lead Name')})")
@@ -548,24 +644,32 @@ class DivorceLoader(BaseLoader):
                 petitioner_row = group.iloc[0]
 
             property_record = None
+            match_score = 0
+            match_method = None
             primary_row = petitioner_row
 
             # Try petitioner address
             party_address_val = _none_if_nan(primary_row.get("PartyAddress"))
             if party_address_val:
-                match_result = self.find_property_by_address(str(party_address_val))
+                match_result = self.find_property_by_address(
+                    str(party_address_val), threshold=self._thresholds.address_floor,
+                )
                 if match_result:
-                    property_record, score = match_result
-                    logger.info(f"[DivorceLoader] Matched by petitioner address (score: {score}%): {case_number}")
+                    property_record, match_score = match_result
+                    match_method = 'address'
+                    logger.info(f"[DivorceLoader] Matched by petitioner address (score: {match_score}%): {case_number}")
 
             # Try respondent address
             if not property_record and respondent_row is not None:
                 res_addr = _none_if_nan(respondent_row.get("PartyAddress"))
                 if res_addr:
-                    match_result = self.find_property_by_address(str(res_addr))
+                    match_result = self.find_property_by_address(
+                        str(res_addr), threshold=self._thresholds.address_floor,
+                    )
                     if match_result:
-                        property_record, score = match_result
-                        logger.info(f"[DivorceLoader] Matched by respondent address (score: {score}%): {case_number}")
+                        property_record, match_score = match_result
+                        match_method = 'address'
+                        logger.info(f"[DivorceLoader] Matched by respondent address (score: {match_score}%): {case_number}")
 
             # Fallback: petitioner name
             if not property_record:
@@ -582,66 +686,88 @@ class DivorceLoader(BaseLoader):
                             if len(part) > 4 and first:
                                 variants.append(f"{first} {part}")
                     for variant in variants:
-                        match_result = self.find_property_by_owner_name(variant)
+                        match_result = self.find_property_by_owner_name(
+                            variant, threshold=self._thresholds.owner_name_floor,
+                        )
                         if match_result:
-                            property_record, score = match_result
+                            property_record, match_score = match_result
+                            match_method = 'owner_name'
                             logger.info(
                                 f"[DivorceLoader] Matched by petitioner name '{variant}' "
-                                f"(score: {score}%): {case_number}"
+                                f"(score: {match_score}%): {case_number}"
                             )
-                            property_record, _ = self._apply_llm_verification(
+                            property_record, llm_method = self._apply_llm_verification(
                                 raw_row=primary_row.to_dict() if hasattr(primary_row, "to_dict") else dict(primary_row),
                                 current_best=property_record,
-                                match_score=score,
+                                match_score=match_score,
                                 record_type="divorce",
                                 match_field="LastName/CompanyName",
                             )
+                            if llm_method:
+                                match_method = llm_method
                             break
 
             if property_record:
-                try:
-                    first = _none_if_nan(primary_row.get("FirstName")) or ""
-                    middle = _none_if_nan(primary_row.get("MiddleName")) or ""
-                    last = _none_if_nan(primary_row.get("LastName/CompanyName")) or ""
-                    petitioner_name = " ".join(
-                        [str(first).strip(), str(middle).strip(), str(last).strip()]
-                    ).strip()
-                    petitioner_name = " ".join(petitioner_name.split()) or None
+                tier = self._classify_match(match_score, match_method)
+                if tier == "matched":
+                    try:
+                        first = _none_if_nan(primary_row.get("FirstName")) or ""
+                        middle = _none_if_nan(primary_row.get("MiddleName")) or ""
+                        last = _none_if_nan(primary_row.get("LastName/CompanyName")) or ""
+                        petitioner_name = " ".join(
+                            [str(first).strip(), str(middle).strip(), str(last).strip()]
+                        ).strip()
+                        petitioner_name = " ".join(petitioner_name.split()) or None
 
-                    respondent_name = None
-                    if respondent_row is not None and "LastName/CompanyName" in group.columns:
-                        r_last = _none_if_nan(respondent_row.get("LastName/CompanyName"))
-                        r_first = _none_if_nan(respondent_row.get("FirstName")) or ""
-                        if r_last:
-                            respondent_name = " ".join([str(r_first).strip(), str(r_last).strip()]).strip()
-                            respondent_name = " ".join(respondent_name.split()) or None
+                        respondent_name = None
+                        if respondent_row is not None and "LastName/CompanyName" in group.columns:
+                            r_last = _none_if_nan(respondent_row.get("LastName/CompanyName"))
+                            r_first = _none_if_nan(respondent_row.get("FirstName")) or ""
+                            if r_last:
+                                respondent_name = " ".join([str(r_first).strip(), str(r_last).strip()]).strip()
+                                respondent_name = " ".join(respondent_name.split()) or None
 
-                    case_status_val = _none_if_nan(primary_row.get("Title"))
-                    case_type_val = _none_if_nan(primary_row.get("CaseTypeDescription"))
-                    addr_used = _none_if_nan(primary_row.get("PartyAddress"))
+                        case_status_val = _none_if_nan(primary_row.get("Title"))
+                        case_type_val = _none_if_nan(primary_row.get("CaseTypeDescription"))
+                        addr_used = _none_if_nan(primary_row.get("PartyAddress"))
 
-                    divorce_record = LegalProceeding(
-                        property_id=property_record.id,
-                        record_type="Divorce",
-                        case_number=case_number,
-                        filing_date=self.parse_date(primary_row.get("FilingDate")),
-                        case_status=case_status_val,
-                        associated_party=petitioner_name,
-                        secondary_party=respondent_name,
-                        county_id=self.county_id,
-                        meta_data={
-                            "case_type": case_type_val,
-                            "party_address": addr_used,
-                        },
-                    )
+                        divorce_record = LegalProceeding(
+                            property_id=property_record.id,
+                            record_type="Divorce",
+                            case_number=case_number,
+                            filing_date=self.parse_date(primary_row.get("FilingDate")),
+                            case_status=case_status_val,
+                            associated_party=petitioner_name,
+                            secondary_party=respondent_name,
+                            match_confidence=round(match_score / 100.0, 3),
+                            match_method=match_method,
+                            county_id=self.county_id,
+                            meta_data={
+                                "case_type": case_type_val,
+                                "party_address": addr_used,
+                            },
+                        )
 
-                    if self.safe_add(divorce_record):
-                        matched += 1
-                    else:
+                        if self.safe_add(divorce_record):
+                            matched += 1
+                        else:
+                            unmatched += 1
+
+                    except Exception as exc:
+                        logger.error(f"[DivorceLoader] Error building case {case_number}: {exc}")
                         unmatched += 1
-
-                except Exception as exc:
-                    logger.error(f"[DivorceLoader] Error building case {case_number}: {exc}")
+                else:
+                    logger.debug(f"[DivorceLoader] Pending review: {case_number} (score: {match_score}%, method: {match_method})")
+                    self.quarantine_unmatched(
+                        source_type="divorce_filings",
+                        raw_row=primary_row.to_dict() if hasattr(primary_row, "to_dict") else dict(primary_row),
+                        county_id=self.county_id,
+                        address_string=str(party_address_val) if party_address_val else None,
+                        match_status="pending_review",
+                        match_confidence=match_score / 100.0,
+                        candidate_property_id=property_record.id,
+                        match_method=match_method,
+                    )
                     unmatched += 1
             else:
                 logger.debug(

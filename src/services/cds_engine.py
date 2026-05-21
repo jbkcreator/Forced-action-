@@ -41,11 +41,14 @@ Foreclosure     → foreclosures
 BuildingPermit  → building_permits
 """
 
+import heapq
+import json
 import logging
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
+from types import SimpleNamespace
 from datetime import datetime, date, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from src.services.ghl_webhook import push_lead_to_ghl
 from config.settings import settings
@@ -57,6 +60,10 @@ _GHL_PUSH_ENABLED: bool = settings.ghl_push_enabled
 _GHL_BATCH_SIZE: int = 25   # leads per batch
 _GHL_BATCH_DELAY: float = 3.0  # seconds between batches
 
+# Property loading batch size — keyset pagination chunk for full-table scoring runs
+_BULK_BATCH_SIZE: int = 500
+
+from sqlalchemy import text as sa_text
 from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session, joinedload
 
@@ -130,6 +137,18 @@ if not VERTICAL_WEIGHTS:
     )
 
 
+class _ScoreRef:
+    """Lightweight proxy returned by save_score_to_database for new score rows.
+
+    Only exists so that the Gold flash_scarcity hook can read .id without
+    requiring a full ORM-hydrated DistressScore object.
+    """
+    __slots__ = ("id",)
+
+    def __init__(self, id_: int) -> None:
+        self.id = id_
+
+
 class MultiVerticalScorer:
     """
     6-vertical CDS scoring engine.
@@ -142,6 +161,7 @@ class MultiVerticalScorer:
     def __init__(self, session: Session):
         self.session = session
         self._ghl_push_queue: List[Dict] = []
+        self._total_scored: int = 0
 
     # ── GHL batch flush ───────────────────────────────────────────────────────
 
@@ -168,9 +188,18 @@ class MultiVerticalScorer:
 
         property_ids = [sd["property_id"] for sd in queue if sd.get("property_id")]
         if property_ids:
-            self.session.query(Property).filter(
-                Property.id.in_(property_ids)
-            ).update({"sync_status": "pending_sync"}, synchronize_session=False)
+            # Chunk into batches of 1000 — avoids unbounded IN-list that degrades
+            # PostgreSQL query planning and can lock large table ranges.
+            _CHUNK = 1000
+            for i in range(0, len(property_ids), _CHUNK):
+                chunk = property_ids[i : i + _CHUNK]
+                self.session.execute(
+                    sa_text(
+                        "UPDATE properties SET sync_status = 'pending_sync' "
+                        "WHERE id = ANY(:ids)"
+                    ),
+                    {"ids": chunk},
+                )
             logger.info(
                 "[GHL] Marked %d properties as pending_sync for async push "
                 "(run `python -m src.tasks.ghl_sync` to flush to CRM)",
@@ -832,8 +861,12 @@ class MultiVerticalScorer:
             "signal_count":    len(signals),
             "distress_types":  list({s["type"] for s in signals}),
             "factor_scores":   self._build_factor_scores(signals, vertical_results),
-            "signal_summaries": self._build_signal_summaries(prop),
-            "est_job_value":   self._estimate_job_value(prop, signals),
+            # Skip expensive summary/estimation work for zero-signal properties —
+            # these fields are only consumed by the CRM push path (qualified leads).
+            "signal_summaries": self._build_signal_summaries(prop) if signals else {},
+            "est_job_value":    self._estimate_job_value(prop, signals) if signals else {
+                "low": 0, "high": 0, "display": "N/A", "method": "skipped"
+            },
         }
 
     def _build_signal_summaries(self, prop: "Property") -> Dict[str, str]:
@@ -1045,20 +1078,18 @@ class MultiVerticalScorer:
 
     def save_score_to_database(self, score_data: Dict, upsert: bool = True, scoring_run_id: Optional[int] = None):
         """
-        UPSERT a DistressScore record.
+        UPSERT a DistressScore record using raw SQL for performance.
 
-        - If a score already exists for this property today → update it.
+        - If a score already exists for this property today → update it (raw SQL UPDATE).
         - If not, check the most recent score; if unchanged → skip.
-        - Otherwise → create new record.
+        - Otherwise → INSERT via raw SQL RETURNING id (no ORM flush needed).
 
-        Returns a tuple (record_or_None, status) where status is one of:
+        Returns a tuple (record_or_None, status, upgraded) where status is one of:
             'new'       — first-ever score for this property today
             'updated'   — existing today's record was refreshed
             'unchanged' — score identical to last recorded; skipped
         Raises SQLAlchemyError on DB failure — caller must handle rollback.
         """
-        from sqlalchemy import cast, Date as SADate
-
         property_id   = score_data["property_id"]
         final_score   = score_data["final_cds_score"]
         lead_tier     = score_data["lead_tier"]
@@ -1068,33 +1099,65 @@ class MultiVerticalScorer:
         vertical_json = score_data["vertical_scores"]
         distress_list = score_data["distress_types"]
         today         = date.today()
+        now           = datetime.now(timezone.utc)
 
-        # Check for existing today's record (UPSERT)
-        existing = None
+        # Range filter instead of CAST(score_date AS DATE) — allows the composite
+        # index on (property_id, score_date DESC) to be used without a function call.
+        today_start    = datetime(today.year, today.month, today.day, tzinfo=timezone.utc)
+        tomorrow_start = today_start + timedelta(days=1)
+
+        # --- Today's score lookup (raw SQL, hits composite index) ---
+        existing_row = None
         if upsert:
-            existing = self.session.query(DistressScore).filter(
-                DistressScore.property_id == property_id,
-                cast(DistressScore.score_date, SADate) == today,
+            existing_row = self.session.execute(
+                sa_text("""
+                    SELECT id, final_cds_score, lead_tier
+                    FROM distress_scores
+                    WHERE property_id = :pid
+                      AND score_date >= :start
+                      AND score_date  < :end
+                    LIMIT 1
+                """),
+                {"pid": property_id, "start": today_start, "end": tomorrow_start},
             ).first()
 
-        if existing:
-            # Guard against NULL stored in DB column
+        if existing_row:
             try:
-                prev_score = float(existing.final_cds_score) if existing.final_cds_score is not None else 0.0
+                prev_score = float(existing_row.final_cds_score) if existing_row.final_cds_score is not None else 0.0
             except (TypeError, ValueError):
                 prev_score = 0.0
 
-            prev_tier = existing.lead_tier
+            prev_tier     = existing_row.lead_tier
             score_changed = prev_score != float(final_score)
-            existing.score_date      = datetime.now(timezone.utc)
-            existing.final_cds_score = final_score
-            existing.lead_tier       = lead_tier
-            existing.urgency_level   = urgency
-            existing.qualified       = qualified
-            existing.factor_scores   = factor_json
-            existing.vertical_scores = vertical_json
-            existing.distress_types  = distress_list
-            existing.scoring_run_id  = scoring_run_id
+
+            # Raw SQL UPDATE — no ORM object load, no per-row flush
+            self.session.execute(
+                sa_text("""
+                    UPDATE distress_scores SET
+                        score_date      = :now,
+                        final_cds_score = :score,
+                        lead_tier       = :tier,
+                        urgency_level   = :urgency,
+                        qualified       = :qualified,
+                        factor_scores   = CAST(:factor AS jsonb),
+                        vertical_scores = CAST(:vertical AS jsonb),
+                        distress_types  = CAST(:distress AS jsonb),
+                        scoring_run_id  = :run_id
+                    WHERE id = :id
+                """),
+                {
+                    "now":      now,
+                    "score":    final_score,
+                    "tier":     lead_tier,
+                    "urgency":  urgency,
+                    "qualified": qualified,
+                    "factor":   json.dumps(factor_json),
+                    "vertical": json.dumps(vertical_json),
+                    "distress": json.dumps(distress_list),
+                    "run_id":   scoring_run_id,
+                    "id":       existing_row.id,
+                },
+            )
             logger.debug(
                 "Updated score for property %s: %.2f (%s)",
                 score_data.get("parcel_id"), final_score, lead_tier,
@@ -1102,25 +1165,31 @@ class MultiVerticalScorer:
             is_new_contact = not score_data.get("ghl_contact_id")
             if _GHL_PUSH_ENABLED and (score_changed or is_new_contact):
                 self._ghl_push_queue.append(score_data)
-            # Detect tier upgrade for stats (tiers ordered best→worst)
             _TIER_ORDER = ["Ultra Platinum", "Platinum", "Gold", "Silver", "Bronze"]
             upgraded = (
                 prev_tier in _TIER_ORDER and lead_tier in _TIER_ORDER
                 and _TIER_ORDER.index(lead_tier) < _TIER_ORDER.index(prev_tier)
             )
-            return existing, 'updated', upgraded
+            return None, 'updated', upgraded
 
-        # Check most recent score to avoid accumulating identical rows
-        latest = self.session.query(DistressScore).filter(
-            DistressScore.property_id == property_id,
-        ).order_by(DistressScore.score_date.desc()).first()
+        # --- Latest historical score lookup (raw SQL, hits composite index) ---
+        latest_row = self.session.execute(
+            sa_text("""
+                SELECT final_cds_score, lead_tier
+                FROM distress_scores
+                WHERE property_id = :pid
+                ORDER BY score_date DESC
+                LIMIT 1
+            """),
+            {"pid": property_id},
+        ).first()
 
         try:
-            latest_score = float(latest.final_cds_score) if latest and latest.final_cds_score is not None else None
+            latest_score = float(latest_row.final_cds_score) if latest_row and latest_row.final_cds_score is not None else None
         except (TypeError, ValueError):
             latest_score = None
 
-        latest_tier = latest.lead_tier if latest else None
+        latest_tier = latest_row.lead_tier if latest_row else None
         if latest_score is not None and latest_score == float(final_score) and latest_tier == lead_tier:
             logger.debug(
                 "Score unchanged for property %s: %.2f — skipping",
@@ -1128,22 +1197,35 @@ class MultiVerticalScorer:
             )
             return None, 'unchanged', False
 
-        record = DistressScore(
-            property_id=property_id,
-            county_id=score_data.get("county_id", "hillsborough"),
-            score_date=datetime.now(timezone.utc),
-            final_cds_score=final_score,
-            lead_tier=lead_tier,
-            urgency_level=urgency,
-            qualified=qualified,
-            factor_scores=factor_json,
-            vertical_scores=vertical_json,
-            distress_types=distress_list,
-            scoring_run_id=scoring_run_id,
-        )
-        self.session.add(record)
-        # Flush to get the DB-assigned primary key before pushing to GHL
-        self.session.flush()
+        # --- Insert new score, get PK via RETURNING (no ORM flush needed) ---
+        new_id_row = self.session.execute(
+            sa_text("""
+                INSERT INTO distress_scores (
+                    property_id, county_id, score_date, final_cds_score,
+                    lead_tier, urgency_level, qualified,
+                    factor_scores, vertical_scores, distress_types, scoring_run_id
+                ) VALUES (
+                    :pid, :county, :now, :score,
+                    :tier, :urgency, :qualified,
+                    CAST(:factor AS jsonb), CAST(:vertical AS jsonb), CAST(:distress AS jsonb), :run_id
+                )
+                RETURNING id
+            """),
+            {
+                "pid":      property_id,
+                "county":   score_data.get("county_id", "hillsborough"),
+                "now":      now,
+                "score":    final_score,
+                "tier":     lead_tier,
+                "urgency":  urgency,
+                "qualified": qualified,
+                "factor":   json.dumps(factor_json),
+                "vertical": json.dumps(vertical_json),
+                "distress": json.dumps(distress_list),
+                "run_id":   scoring_run_id,
+            },
+        ).first()
+        new_id = new_id_row.id if new_id_row else None
 
         logger.debug(
             "Created score for property %s: %.2f (%s)",
@@ -1151,9 +1233,14 @@ class MultiVerticalScorer:
         )
         if _GHL_PUSH_ENABLED:
             self._ghl_push_queue.append(score_data)
-        return record, 'new', False
+
+        # Return a lightweight proxy so flash_scarcity can read .id for Gold leads
+        # without requiring a full ORM-hydrated DistressScore object.
+        return _ScoreRef(new_id) if new_id else None, 'new', False
 
     # ── Batch scoring ──────────────────────────────────────────────────────────
+
+    #deprecated: not used in Phase 2 — consider removal or repurposing for a future batch scoring mode  
 
     def _load_properties(
         self,
@@ -1186,114 +1273,616 @@ class MultiVerticalScorer:
             )
             raise
 
+    # ── Raw SQL property loading (Phase 2) ───────────────────────────────────
+
+    _PROP_COLS = """
+        id, parcel_id, address, city, state, zip, county_id,
+        year_built, sq_ft, beds, baths, lot_size, gohighlevel_contact_id
+    """
+
+    def _fetch_properties_chunk(
+        self,
+        last_id: int,
+        batch_size: int,
+        county_id: Optional[str] = None,
+    ) -> list:
+        """Keyset pagination: next batch of properties after last_id."""
+        sql = f"SELECT {self._PROP_COLS} FROM properties WHERE id > :last_id"
+        params: dict = {"last_id": last_id, "n": batch_size}
+        if county_id:
+            sql += " AND county_id = :county"
+            params["county"] = county_id
+        sql += " ORDER BY id LIMIT :n"
+        return self.session.execute(sa_text(sql), params).fetchall()
+
+    def _fetch_properties_by_ids(self, ids: List[int]) -> list:
+        """Fetch property rows for a specific list of IDs."""
+        return self.session.execute(
+            sa_text(f"SELECT {self._PROP_COLS} FROM properties WHERE id = ANY(:ids) ORDER BY id"),
+            {"ids": ids},
+        ).fetchall()
+
+    def _fetch_signals_for_batch(self, property_ids: List[int]) -> "defaultdict":
+        """
+        10 raw SQL queries for all signal data belonging to a batch of properties.
+
+        Returns a defaultdict keyed by property_id. Each value is a dict with keys:
+          owner, financial, code_violations, legal_and_liens, deeds, legal_proceedings,
+          tax_delinquencies, foreclosures, building_permits, incidents.
+        """
+        p = {"ids": property_ids}
+
+        def _q(sql: str) -> list:
+            return self.session.execute(sa_text(sql), p).fetchall()
+
+        def _ns(row) -> SimpleNamespace:
+            return SimpleNamespace(**dict(row._mapping))
+
+        owner_rows = _q("""
+            SELECT property_id, owner_name, owner_type, absentee_status, mailing_address,
+                   ownership_years, phone_1, phone_2, phone_3, email_1, email_2
+            FROM owners WHERE property_id = ANY(:ids)
+        """)
+        fin_rows = _q("""
+            SELECT property_id, assessed_value_mkt, homestead_exempt, est_equity,
+                   equity_pct, last_sale_price, last_sale_date, value_change_yoy
+            FROM financials WHERE property_id = ANY(:ids)
+        """)
+        cv_rows = _q("""
+            SELECT property_id, status, violation_type, opened_date, fine_amount
+            FROM code_violations WHERE property_id = ANY(:ids)
+        """)
+        lal_rows = _q("""
+            SELECT property_id, record_type, document_type, filing_date, amount
+            FROM legal_and_liens WHERE property_id = ANY(:ids)
+        """)
+        deed_rows = _q("""
+            SELECT property_id, sale_price, record_date, deed_type
+            FROM deeds WHERE property_id = ANY(:ids)
+        """)
+        lp_rows = _q("""
+            SELECT property_id, record_type, case_status, associated_party, filing_date, amount
+            FROM legal_proceedings WHERE property_id = ANY(:ids)
+        """)
+        td_rows = _q("""
+            SELECT property_id, total_amount_due, years_delinquent, deed_app_date, date_added
+            FROM tax_delinquencies WHERE property_id = ANY(:ids)
+        """)
+        fc_rows = _q("""
+            SELECT property_id, filing_date, lis_pendens_date, judgment_amount, plaintiff, auction_date
+            FROM foreclosures WHERE property_id = ANY(:ids)
+        """)
+        bp_rows = _q("""
+            SELECT property_id, is_enforcement_permit, status, issue_date, permit_type
+            FROM building_permits WHERE property_id = ANY(:ids)
+        """)
+        inc_rows = _q("""
+            SELECT property_id, incident_type, incident_date
+            FROM incidents WHERE property_id = ANY(:ids)
+        """)
+
+        signal_map: defaultdict = defaultdict(lambda: {
+            "owner": None, "financial": None,
+            "code_violations": [], "legal_and_liens": [], "deeds": [],
+            "legal_proceedings": [], "tax_delinquencies": [], "foreclosures": [],
+            "building_permits": [], "incidents": [],
+        })
+
+        for row in owner_rows:
+            signal_map[row.property_id]["owner"] = _ns(row)
+        for row in fin_rows:
+            signal_map[row.property_id]["financial"] = _ns(row)
+        for row in cv_rows:
+            signal_map[row.property_id]["code_violations"].append(_ns(row))
+        for row in lal_rows:
+            signal_map[row.property_id]["legal_and_liens"].append(_ns(row))
+        for row in deed_rows:
+            signal_map[row.property_id]["deeds"].append(_ns(row))
+        for row in lp_rows:
+            signal_map[row.property_id]["legal_proceedings"].append(_ns(row))
+        for row in td_rows:
+            signal_map[row.property_id]["tax_delinquencies"].append(_ns(row))
+        for row in fc_rows:
+            signal_map[row.property_id]["foreclosures"].append(_ns(row))
+        for row in bp_rows:
+            signal_map[row.property_id]["building_permits"].append(_ns(row))
+        for row in inc_rows:
+            signal_map[row.property_id]["incidents"].append(_ns(row))
+
+        return signal_map
+
+    def _build_property_bundle(self, prop_row, signal_map: "defaultdict") -> SimpleNamespace:
+        """Assemble a duck-typed SimpleNamespace that score_property() can consume."""
+        pid = prop_row.id
+        sigs = signal_map[pid]
+        return SimpleNamespace(
+            id=prop_row.id,
+            parcel_id=prop_row.parcel_id,
+            address=prop_row.address,
+            city=prop_row.city,
+            state=prop_row.state,
+            zip=prop_row.zip,
+            county_id=prop_row.county_id,
+            year_built=prop_row.year_built,
+            sq_ft=prop_row.sq_ft,
+            beds=prop_row.beds,
+            baths=prop_row.baths,
+            lot_size=prop_row.lot_size,
+            gohighlevel_contact_id=prop_row.gohighlevel_contact_id,
+            owner=sigs["owner"],
+            financial=sigs["financial"],
+            code_violations=sigs["code_violations"],
+            legal_and_liens=sigs["legal_and_liens"],
+            deeds=sigs["deeds"],
+            legal_proceedings=sigs["legal_proceedings"],
+            tax_delinquencies=sigs["tax_delinquencies"],
+            foreclosures=sigs["foreclosures"],
+            building_permits=sigs["building_permits"],
+            incidents=sigs["incidents"],
+        )
+
+    def _collect_changed_property_ids(
+        self,
+        county_id: Optional[str] = None,
+    ) -> List[int]:
+        """
+        Return IDs of properties that either have never been scored or have at
+        least one signal row with date_added > their latest score_date.
+
+        Uses the (property_id, date_added) composite indexes from fa005 for
+        efficient LEFT JOIN lookups instead of correlated EXISTS scans.
+        When county_id is supplied the result is further filtered via a JOIN to
+        the properties table (uses idx_properties_county_id from fa006).
+        """
+        _SIGNAL_TABLES = [
+            "code_violations",
+            "legal_and_liens",
+            "deeds",
+            "legal_proceedings",
+            "tax_delinquencies",
+            "foreclosures",
+            "building_permits",
+            "incidents",
+        ]
+
+        union_branches = "\n    UNION ALL\n    ".join(
+            f"SELECT t.property_id FROM {tbl} t "
+            f"LEFT JOIN latest_scores ls ON ls.property_id = t.property_id "
+            f"WHERE ls.property_id IS NULL OR t.date_added > ls.score_date"
+            for tbl in _SIGNAL_TABLES
+        )
+
+        if county_id:
+            outer = (
+                "SELECT DISTINCT s.property_id\n"
+                "FROM (\n"
+                f"    {union_branches}\n"
+                ") s\n"
+                "JOIN properties p ON p.id = s.property_id\n"
+                "WHERE p.county_id = :county"
+            )
+            params: dict = {"county": county_id}
+        else:
+            outer = (
+                "SELECT DISTINCT s.property_id\n"
+                "FROM (\n"
+                f"    {union_branches}\n"
+                ") s\n"
+                "WHERE s.property_id IS NOT NULL"
+            )
+            params = {}
+
+        sql = (
+            "WITH latest_scores AS (\n"
+            "    SELECT DISTINCT ON (property_id)\n"
+            "        property_id, score_date\n"
+            "    FROM distress_scores\n"
+            "    ORDER BY property_id, score_date DESC\n"
+            ")\n"
+            f"{outer}"
+        )
+
+        rows = self.session.execute(sa_text(sql), params).fetchall()
+        return [row[0] for row in rows]
+
+    def _iter_property_batches(
+        self,
+        property_ids: Optional[List[int]] = None,
+        county_id: Optional[str] = None,
+        batch_size: int = _BULK_BATCH_SIZE,
+    ):
+        """
+        Yield batches of property bundles.
+
+        For targeted lists (property_ids set): chunk the IDs directly.
+        For full / county runs: use keyset pagination on the primary key —
+          never loads the whole table into memory.
+        """
+        if property_ids is not None:
+            for i in range(0, len(property_ids), batch_size):
+                chunk_ids = property_ids[i : i + batch_size]
+                prop_rows = self._fetch_properties_by_ids(chunk_ids)
+                if not prop_rows:
+                    continue
+                pid_list = [r.id for r in prop_rows]
+                signal_map = self._fetch_signals_for_batch(pid_list)
+                yield [self._build_property_bundle(r, signal_map) for r in prop_rows]
+        else:
+            last_id = 0
+            while True:
+                prop_rows = self._fetch_properties_chunk(last_id, batch_size, county_id)
+                if not prop_rows:
+                    break
+                pid_list = [r.id for r in prop_rows]
+                signal_map = self._fetch_signals_for_batch(pid_list)
+                yield [self._build_property_bundle(r, signal_map) for r in prop_rows]
+                last_id = prop_rows[-1].id
+
+    # ── Batch score persistence (Phase 3) ────────────────────────────────────
+
+    _TIER_ORDER = ["Ultra Platinum", "Platinum", "Gold", "Silver", "Bronze"]
+
+    def _persist_score_batch(
+        self,
+        scored_batch: List[Dict],
+        scoring_run_id: int,
+        today_start: datetime,
+        tomorrow_start: datetime,
+    ) -> Dict[str, Any]:
+        """
+        Persist a batch of with-signal score dicts with two reads + two writes
+        instead of N×4 per-property round trips.
+
+        Read path:
+          1. Fetch today's existing rows for ALL batch PIDs in one query.
+          2. Fetch latest historical row for PIDs WITHOUT a today row (DISTINCT ON).
+
+        Write path:
+          3. Batch UPDATE existing today rows (executemany).
+          4. Batch INSERT new rows (executemany, no RETURNING).
+             → Gold new rows: follow-up SELECT by scoring_run_id to get IDs
+               for flash_scarcity hook.
+
+        Returns a dict with aggregate counters and side-effect queues.
+        """
+        if not scored_batch:
+            return {
+                "new": 0, "updated": 0, "unchanged": 0, "upgraded": 0,
+                "qualified": 0, "ghl_queued": [], "new_gold_records": [],
+            }
+
+        now          = datetime.now(timezone.utc)
+        property_ids = [sd["property_id"] for sd in scored_batch]
+
+        # ── 1. Today's rows ───────────────────────────────────────────────
+        today_rows = self.session.execute(sa_text("""
+            SELECT id, property_id, final_cds_score, lead_tier
+            FROM distress_scores
+            WHERE property_id = ANY(:ids)
+              AND score_date >= :start
+              AND score_date  < :end
+        """), {"ids": property_ids, "start": today_start, "end": tomorrow_start}).fetchall()
+        today_by_pid: Dict[int, Any] = {r.property_id: r for r in today_rows}
+
+        # ── 2. Latest historical rows (only for PIDs without a today row) ─
+        needs_latest = [pid for pid in property_ids if pid not in today_by_pid]
+        latest_by_pid: Dict[int, Any] = {}
+        if needs_latest:
+            latest_rows = self.session.execute(sa_text("""
+                SELECT DISTINCT ON (property_id)
+                    id, property_id, final_cds_score, lead_tier
+                FROM distress_scores
+                WHERE property_id = ANY(:ids)
+                ORDER BY property_id, score_date DESC
+            """), {"ids": needs_latest}).fetchall()
+            latest_by_pid = {r.property_id: r for r in latest_rows}
+
+        # ── 3. Classify each score ────────────────────────────────────────
+        updates_params: List[Dict] = []
+        inserts_data:   List[Dict] = []
+        new_count = updated_count = unchanged_count = upgraded_count = qualified_count = 0
+        ghl_queued: List[Dict] = []
+
+        for sd in scored_batch:
+            pid         = sd["property_id"]
+            final_score = float(sd["final_cds_score"])
+            lead_tier   = sd["lead_tier"]
+
+            today_row = today_by_pid.get(pid)
+            if today_row:
+                prev_score = float(today_row.final_cds_score) if today_row.final_cds_score is not None else 0.0
+                prev_tier  = today_row.lead_tier or ""
+                updates_params.append({
+                    "now":      now,
+                    "score":    final_score,
+                    "tier":     lead_tier,
+                    "urgency":  sd["urgency_level"],
+                    "qualified": sd["qualified"],
+                    "factor":   json.dumps(sd["factor_scores"]),
+                    "vertical": json.dumps(sd["vertical_scores"]),
+                    "distress": json.dumps(sd["distress_types"]),
+                    "run_id":   scoring_run_id,
+                    "id":       today_row.id,
+                })
+                updated_count += 1
+                if sd.get("qualified"):
+                    qualified_count += 1
+                upgraded = (
+                    prev_tier in self._TIER_ORDER and lead_tier in self._TIER_ORDER
+                    and self._TIER_ORDER.index(lead_tier) < self._TIER_ORDER.index(prev_tier)
+                )
+                if upgraded:
+                    upgraded_count += 1
+                score_changed = prev_score != final_score
+                if _GHL_PUSH_ENABLED and (score_changed or not sd.get("ghl_contact_id")):
+                    ghl_queued.append(sd)
+            else:
+                latest_row = latest_by_pid.get(pid)
+                try:
+                    latest_score = float(latest_row.final_cds_score) if latest_row and latest_row.final_cds_score is not None else None
+                except (TypeError, ValueError):
+                    latest_score = None
+                latest_tier = latest_row.lead_tier if latest_row else None
+
+                if latest_score is not None and latest_score == final_score and latest_tier == lead_tier:
+                    unchanged_count += 1
+                else:
+                    inserts_data.append(sd)
+                    new_count += 1
+                    if sd.get("qualified"):
+                        qualified_count += 1
+                    if _GHL_PUSH_ENABLED:
+                        ghl_queued.append(sd)
+
+        # ── 4. Batch UPDATE ───────────────────────────────────────────────
+        if updates_params:
+            self.session.execute(
+                sa_text("""
+                    UPDATE distress_scores SET
+                        score_date      = :now,
+                        final_cds_score = :score,
+                        lead_tier       = :tier,
+                        urgency_level   = :urgency,
+                        qualified       = :qualified,
+                        factor_scores   = CAST(:factor AS jsonb),
+                        vertical_scores = CAST(:vertical AS jsonb),
+                        distress_types  = CAST(:distress AS jsonb),
+                        scoring_run_id  = :run_id
+                    WHERE id = :id
+                """),
+                updates_params,
+            )
+
+        # ── 5. Batch INSERT ───────────────────────────────────────────────
+        new_gold_records: List[tuple] = []
+        if inserts_data:
+            insert_params = [
+                {
+                    "pid":      sd["property_id"],
+                    "county":   sd.get("county_id", "hillsborough"),
+                    "now":      now,
+                    "score":    sd["final_cds_score"],
+                    "tier":     sd["lead_tier"],
+                    "urgency":  sd["urgency_level"],
+                    "qualified": sd["qualified"],
+                    "factor":   json.dumps(sd["factor_scores"]),
+                    "vertical": json.dumps(sd["vertical_scores"]),
+                    "distress": json.dumps(sd["distress_types"]),
+                    "run_id":   scoring_run_id,
+                }
+                for sd in inserts_data
+            ]
+            self.session.execute(
+                sa_text("""
+                    INSERT INTO distress_scores (
+                        property_id, county_id, score_date, final_cds_score,
+                        lead_tier, urgency_level, qualified,
+                        factor_scores, vertical_scores, distress_types, scoring_run_id
+                    ) VALUES (
+                        :pid, :county, :now, :score,
+                        :tier, :urgency, :qualified,
+                        CAST(:factor AS jsonb), CAST(:vertical AS jsonb),
+                        CAST(:distress AS jsonb), :run_id
+                    )
+                """),
+                insert_params,
+            )
+
+            # Flash scarcity needs the new row ID for Gold leads — retrieve via
+            # (property_id, scoring_run_id) after the insert completes.
+            gold_inserts = [sd for sd in inserts_data if sd["lead_tier"] == "Gold"]
+            if gold_inserts:
+                gold_pids = [sd["property_id"] for sd in gold_inserts]
+                gold_id_rows = self.session.execute(sa_text("""
+                    SELECT id, property_id
+                    FROM distress_scores
+                    WHERE property_id = ANY(:pids)
+                      AND scoring_run_id = :run_id
+                """), {"pids": gold_pids, "run_id": scoring_run_id}).fetchall()
+                gold_id_map = {r.property_id: r.id for r in gold_id_rows}
+                for sd in gold_inserts:
+                    if sd["property_id"] in gold_id_map:
+                        new_gold_records.append((sd, gold_id_map[sd["property_id"]]))
+
+        return {
+            "new":              new_count,
+            "updated":          updated_count,
+            "unchanged":        unchanged_count,
+            "upgraded":         upgraded_count,
+            "qualified":        qualified_count,
+            "ghl_queued":       ghl_queued,
+            "new_gold_records": new_gold_records,
+        }
+
     def score_all_properties(
         self,
         save_to_db: bool = True,
         property_ids: Optional[List[int]] = None,
         county_id: Optional[str] = None,
+        batch_size: int = _BULK_BATCH_SIZE,
     ) -> List[Dict]:
         """
         Score all properties (or only specific IDs / county).
+
+        Uses raw SQL keyset pagination + batched signal loading + batch
+        persistence — never loads the full property table into memory and
+        replaces N×4 per-property DB round trips with 2 reads + 2 writes
+        per batch.
+
+        For targeted runs (property_ids given): returns ALL with-signal score
+        dicts (callers such as verify_cds_scores.py need the full list).
+        For full / county runs: returns only the top-10 by score to avoid
+        growing an unbounded list at 500k+ scale. Aggregate stats for all
+        properties are always available in self._last_run_stats after the
+        call returns.
 
         Args:
             save_to_db:   Persist scores to the database.
             property_ids: If provided, only rescore these property IDs.
             county_id:    If provided, restrict scoring to this county.
+            batch_size:   Properties per fetch+score cycle (default _BULK_BATCH_SIZE).
 
         Returns:
-            List of score dicts for successfully scored properties.
+            All with-signal score dicts (targeted run) or top-10 (full run).
         """
         scoring_run_id = int(datetime.now(timezone.utc).timestamp())
         logger.info("Scoring run ID: %d", scoring_run_id)
 
-        label = f"{len(property_ids)} properties" if property_ids else f"all properties{' (' + county_id + ')' if county_id else ''}"
-        logger.info("Loading %s for scoring...", label)
-        properties = self._load_properties(property_ids, county_id=county_id)
-        logger.info("Scoring %d properties across 6 verticals...", len(properties))
+        today          = date.today()
+        today_start    = datetime(today.year, today.month, today.day, tzinfo=timezone.utc)
+        tomorrow_start = today_start + timedelta(days=1)
 
-        scores: List[Dict] = []
+        label = (
+            f"{len(property_ids)} properties" if property_ids
+            else f"all properties{' (' + county_id + ')' if county_id else ''}"
+        )
+        logger.info("Scoring %s (batch_size=%d)...", label, batch_size)
+
+        # ── Persistence counters ──────────────────────────────────────────
         new_count       = 0
         updated_count   = 0
         unchanged_count = 0
         upgraded_count  = 0
         no_signal_count = 0
         failed_count    = 0
-        qualified_count = 0
-        tier_counts: Counter = Counter()
+        qualified_db    = 0   # qualified from persistence (new+updated), for platform stats
+        self._total_scored = 0
 
-        # Prevent attribute expiry after intermediate batch commits so that the
-        # already-loaded Property objects remain accessible across commit boundaries.
-        self.session.expire_on_commit = False
+        # ── Running stats for CLI display (never hold all score dicts) ────
+        stats_with_signals   = 0
+        stats_qualified      = 0     # all with-signal qualified, for CLI
+        stats_tier_counts:   Counter = Counter()
+        stats_urgency:       Counter = Counter()
+        stats_top_vertical:  Counter = Counter()
+        stats_signal_types:  Counter = Counter()
+        stats_score_sum      = 0.0
+        stats_score_max      = 0.0
+        top10_heap: list     = []    # (score, pid, score_data) min-heap, capped at 10
 
-        _SCORE_BATCH_SIZE = 1000  # commit frequency — keeps session identity map small
-        _total = len(properties)
+        # ── Return-value collection ───────────────────────────────────────
+        _targeted = property_ids is not None
+        collected_scores: List[Dict] = []   # filled for targeted runs only
 
-        for i, prop in enumerate(properties):
-            try:
-                score_data = self.score_property(prop)
-                scores.append(score_data)
+        for batch in self._iter_property_batches(property_ids, county_id, batch_size):
+            with_signal_batch: List[Dict] = []
 
-                if score_data["signal_count"] == 0 or score_data["final_cds_score"] == 0:
-                    no_signal_count += 1
-                else:
-                    if save_to_db:
-                        _record, status, upgraded = self.save_score_to_database(score_data, scoring_run_id=scoring_run_id)
-                        if status == 'new':
-                            new_count += 1
-                            # Flash scarcity: new Gold lead may trigger urgency window
-                            if score_data.get("lead_tier") == "Gold":
-                                try:
-                                    from src.services.flash_scarcity import open_window_if_spike
-                                    zip_code = score_data.get("zip") or prop.zip
-                                    vertical = score_data.get("top_vertical") or prop.vertical if hasattr(prop, "vertical") else None
-                                    if zip_code and vertical and _record:
-                                        open_window_if_spike(
-                                            self.session, _record.id, zip_code, vertical
-                                        )
-                                except Exception as _fse:
-                                    logger.debug("flash_scarcity hook error: %s", _fse)
-                        elif status == 'updated':
-                            updated_count += 1
-                        else:
-                            unchanged_count += 1
-                        if upgraded:
-                            upgraded_count += 1
-                        if score_data.get("qualified"):
-                            qualified_count += 1
-                        tier_counts[score_data["lead_tier"]] += 1
-
-            except SQLAlchemyError as exc:
-                # DB error mid-batch: roll back the failed unit so the session
-                # stays usable for subsequent properties.
-                failed_count += 1
-                logger.error(
-                    "Database error scoring property %s (%s) — rolling back and continuing",
-                    prop.id, prop.parcel_id, exc_info=True,
-                )
+            for prop in batch:
+                self._total_scored += 1
                 try:
-                    self.session.rollback()
-                except Exception:
-                    logger.error("Rollback failed after DB error on property %s", prop.id, exc_info=True)
+                    score_data = self.score_property(prop)
 
-            except Exception as exc:
-                failed_count += 1
-                logger.error(
-                    "Unexpected error scoring property %s (%s): %s",
-                    prop.id, prop.parcel_id, exc, exc_info=True,
+                    if score_data["signal_count"] == 0 or score_data["final_cds_score"] == 0:
+                        no_signal_count += 1
+                    else:
+                        with_signal_batch.append(score_data)
+
+                        # Update running stats incrementally
+                        stats_with_signals += 1
+                        sc = score_data["final_cds_score"]
+                        stats_score_sum += sc
+                        if sc > stats_score_max:
+                            stats_score_max = sc
+                        stats_tier_counts[score_data["lead_tier"]] += 1
+                        stats_urgency[score_data["urgency_level"]] += 1
+                        if score_data["vertical_scores"]:
+                            best_v = max(score_data["vertical_scores"], key=score_data["vertical_scores"].get)
+                            stats_top_vertical[best_v] += 1
+                        for t in score_data["distress_types"]:
+                            stats_signal_types[t] += 1
+                        if score_data.get("qualified"):
+                            stats_qualified += 1
+
+                        # Maintain top-10 min-heap (score, pid as tiebreaker, dict)
+                        pid_key = score_data["property_id"]
+                        if len(top10_heap) < 10:
+                            heapq.heappush(top10_heap, (sc, pid_key, score_data))
+                        elif sc > top10_heap[0][0]:
+                            heapq.heapreplace(top10_heap, (sc, pid_key, score_data))
+
+                except SQLAlchemyError:
+                    failed_count += 1
+                    logger.error(
+                        "Database error scoring property %s (%s) — rolling back and continuing",
+                        prop.id, prop.parcel_id, exc_info=True,
+                    )
+                    try:
+                        self.session.rollback()
+                    except Exception:
+                        logger.error(
+                            "Rollback failed after DB error on property %s",
+                            prop.id, exc_info=True,
+                        )
+
+                except Exception as exc:
+                    failed_count += 1
+                    logger.error(
+                        "Unexpected error scoring property %s (%s): %s",
+                        prop.id, prop.parcel_id, exc, exc_info=True,
+                    )
+
+            # ── Batch persistence ─────────────────────────────────────────
+            if save_to_db and with_signal_batch:
+                result = self._persist_score_batch(
+                    with_signal_batch, scoring_run_id, today_start, tomorrow_start,
                 )
+                new_count       += result["new"]
+                updated_count   += result["updated"]
+                unchanged_count += result["unchanged"]
+                upgraded_count  += result["upgraded"]
+                qualified_db    += result["qualified"]
 
-            # Periodic batch commit — prevents the session identity map from growing
-            # unboundedly across 500k+ properties and keeps flush() calls fast.
-            if save_to_db and i > 0 and i % _SCORE_BATCH_SIZE == 0:
+                self._ghl_push_queue.extend(result["ghl_queued"])
+
+                for sd, new_id in result["new_gold_records"]:
+                    try:
+                        from src.services.flash_scarcity import open_window_if_spike
+                        zip_code = sd.get("zip")
+                        vertical = sd.get("top_vertical")
+                        if zip_code and vertical:
+                            open_window_if_spike(self.session, new_id, zip_code, vertical)
+                    except Exception as _fse:
+                        logger.debug("flash_scarcity hook error: %s", _fse)
+
+            if save_to_db:
                 try:
                     self.session.commit()
                     logger.info(
-                        "Scoring progress: %d/%d (%.1f%%) — new=%d updated=%d no_signal=%d",
-                        i, _total, i / _total * 100, new_count, updated_count, no_signal_count,
+                        "Scoring progress: %d scored — new=%d updated=%d no_signal=%d",
+                        self._total_scored, new_count, updated_count, no_signal_count,
                     )
                 except SQLAlchemyError as batch_exc:
-                    logger.error("Batch commit failed at property %d: %s", i, batch_exc, exc_info=True)
+                    logger.error(
+                        "Batch commit failed at property %d: %s",
+                        self._total_scored, batch_exc, exc_info=True,
+                    )
 
+            if save_to_db and _GHL_PUSH_ENABLED:
+                self._flush_ghl_queue()
+
+            if _targeted:
+                collected_scores.extend(with_signal_batch)
+
+        # ── Post-run ──────────────────────────────────────────────────────
         if save_to_db:
             logger.info(
                 "Scoring complete — %d new, %d updated, %d unchanged, %d no signals, %d failed",
@@ -1304,28 +1893,46 @@ class MultiVerticalScorer:
                     "%d properties failed to score — check logs above for details",
                     failed_count,
                 )
-            # Flush GHL push queue in batches
             if _GHL_PUSH_ENABLED:
                 self._flush_ghl_queue()
 
-            # Persist platform-level daily stats
             try:
                 self._record_platform_stats(
-                    properties_scored=len(scores),
-                    properties_with_signals=len(scores) - no_signal_count,
+                    properties_scored=self._total_scored,
+                    properties_with_signals=stats_with_signals,
                     score_runs_total=new_count + updated_count + unchanged_count,
                     leads_new=new_count,
                     leads_updated=updated_count,
                     leads_unchanged=unchanged_count,
-                    leads_qualified=qualified_count,
+                    leads_qualified=qualified_db,
                     leads_upgraded=upgraded_count,
-                    tier_counts=tier_counts,
+                    tier_counts=stats_tier_counts,
                     county_id=county_id or "hillsborough",
                 )
             except Exception as stats_err:
                 logger.warning("⚠ Could not record platform daily stats (non-critical): %s", stats_err)
 
-        return scores
+        # ── Expose aggregate stats for CLI / callers ──────────────────────
+        top10 = [sd for _, _, sd in sorted(top10_heap, key=lambda x: -x[0])]
+        self._last_run_stats: Dict[str, Any] = {
+            "with_signals":       stats_with_signals,
+            "qualified":          stats_qualified,
+            "tier_counts":        stats_tier_counts,
+            "urgency_counts":     stats_urgency,
+            "top_vertical_counts": stats_top_vertical,
+            "signal_type_counts": stats_signal_types,
+            "score_sum":          stats_score_sum,
+            "score_max":          stats_score_max,
+            "new":                new_count,
+            "updated":            updated_count,
+            "unchanged":          unchanged_count,
+            "upgraded":           upgraded_count,
+            "failed":             failed_count,
+            "no_signal":          no_signal_count,
+            "top10":              top10,
+        }
+
+        return collected_scores if _targeted else top10
 
     def _record_platform_stats(
         self,
@@ -1430,12 +2037,18 @@ class MultiVerticalScorer:
         property_ids: List[int],
         save_to_db: bool = True,
         county_id: Optional[str] = None,
+        batch_size: int = _BULK_BATCH_SIZE,
     ) -> List[Dict]:
         """
         Fast path: rescore only specific properties.
         Used by the ingestion-time hook after a scraper run.
         """
-        return self.score_all_properties(save_to_db=save_to_db, property_ids=property_ids, county_id=county_id)
+        return self.score_all_properties(
+            save_to_db=save_to_db,
+            property_ids=property_ids,
+            county_id=county_id,
+            batch_size=batch_size,
+        )
 
     # ── Query helpers ──────────────────────────────────────────────────────────
 
@@ -1476,11 +2089,14 @@ class MultiVerticalScorer:
 
     def get_todays_score_for_property(self, property_id: int) -> Optional[DistressScore]:
         """Get today's DistressScore for a property (if it exists)."""
-        from sqlalchemy import cast, Date as SADate
+        today          = date.today()
+        today_start    = datetime(today.year, today.month, today.day, tzinfo=timezone.utc)
+        tomorrow_start = today_start + timedelta(days=1)
         try:
             return self.session.query(DistressScore).filter(
                 DistressScore.property_id == property_id,
-                cast(DistressScore.score_date, SADate) == date.today(),
+                DistressScore.score_date >= today_start,
+                DistressScore.score_date  < tomorrow_start,
             ).first()
         except OperationalError:
             logger.error("Database error in get_todays_score_for_property(id=%s)", property_id, exc_info=True)
@@ -1540,6 +2156,17 @@ def main():
         action="store_true",
         help="Skip GHL CRM push (useful for bulk rescores to avoid rate limits)",
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=_BULK_BATCH_SIZE,
+        metavar="N",
+        dest="batch_size",
+        help=(
+            f"Properties per scoring batch (default {_BULK_BATCH_SIZE}). "
+            "Increase on high-RAM servers for fewer round-trips; decrease to reduce peak memory."
+        ),
+    )
     args = parser.parse_args()
 
     if args.no_ghl:
@@ -1550,46 +2177,16 @@ def main():
     property_ids = None
     if args.property_id:
         property_ids = [args.property_id]
-    elif args.rescore_new_signals:
-        # Find properties with new signals since last score, or never scored
-        log.info("Querying properties with new signals since last score...")
-        with get_db_context() as _sess:
-            from sqlalchemy import text as sa_text
-            new_signal_ids = _sess.execute(sa_text("""
-                SELECT DISTINCT p.id FROM properties p
-                LEFT JOIN distress_scores ds ON ds.property_id = p.id
-                WHERE ds.id IS NULL  -- never scored
-                   OR EXISTS (
-                    SELECT 1 FROM foreclosures f WHERE f.property_id = p.id AND f.date_added > ds.score_date
-                  ) OR EXISTS (
-                    SELECT 1 FROM tax_delinquencies t WHERE t.property_id = p.id AND t.date_added > ds.score_date
-                  ) OR EXISTS (
-                    SELECT 1 FROM code_violations v WHERE v.property_id = p.id AND v.date_added > ds.score_date
-                  ) OR EXISTS (
-                    SELECT 1 FROM legal_and_liens l WHERE l.property_id = p.id AND l.date_added > ds.score_date
-                  ) OR EXISTS (
-                    SELECT 1 FROM building_permits bp WHERE bp.property_id = p.id AND bp.date_added > ds.score_date
-                  ) OR EXISTS (
-                    SELECT 1 FROM legal_proceedings lp WHERE lp.property_id = p.id AND lp.date_added > ds.score_date
-                  ) OR EXISTS (
-                    SELECT 1 FROM incidents i WHERE i.property_id = p.id AND i.date_added > ds.score_date
-                  ) OR EXISTS (
-                    SELECT 1 FROM deeds d WHERE d.property_id = p.id AND d.date_added > ds.score_date
-                  )
-            """)).fetchall()
-            property_ids = [row[0] for row in new_signal_ids]
-        log.info("Found %d properties with new signals to rescore", len(property_ids))
-        if not property_ids:
-            log.info("No properties need rescoring — all up to date")
-            sys.exit(0)
 
     county_label = f" [{args.county_id}]" if args.county_id else ""
-    run_label = (
-        f"property {args.property_id}" if args.property_id
-        else f"{len(property_ids)} properties (new signals){county_label}" if args.rescore_new_signals
-        else f"all properties (rescore){county_label}" if args.rescore_all
-        else f"daily run (all properties){county_label}"
-    )
+    if args.property_id:
+        run_label = f"property {args.property_id}"
+    elif args.rescore_new_signals:
+        run_label = f"new-signals run{county_label}"
+    elif args.rescore_all:
+        run_label = f"all properties (rescore){county_label}"
+    else:
+        run_label = f"daily run (all properties){county_label}"
 
     log.info("=" * 60)
     log.info("CDS Multi-Vertical Scoring Engine")
@@ -1598,15 +2195,25 @@ def main():
     log.info("=" * 60)
 
     interrupted = False
-    scores = []
+    scorer = None
 
     try:
         with get_db_context() as session:
             scorer = MultiVerticalScorer(session)
-            scores = scorer.score_all_properties(
+
+            if args.rescore_new_signals:
+                log.info("Collecting properties with new signals since last score...")
+                property_ids = scorer._collect_changed_property_ids(county_id=args.county_id)
+                log.info("Found %d properties with new signals to rescore", len(property_ids))
+                if not property_ids:
+                    log.info("No properties need rescoring — all up to date")
+                    sys.exit(0)
+
+            scorer.score_all_properties(
                 save_to_db=True,
                 property_ids=property_ids,
                 county_id=args.county_id,
+                batch_size=args.batch_size,
             )
             session.commit()
 
@@ -1628,36 +2235,40 @@ def main():
         sys.exit(3)
 
     # ── Stats output ──────────────────────────────────────────────────────────
-    total = len(scores)
-    with_signals = [s for s in scores if s["signal_count"] > 0 and s["final_cds_score"] > 0]
-    qualified = sum(1 for s in with_signals if s["qualified"])
+    # All aggregate stats come from scorer._last_run_stats which is populated
+    # incrementally during scoring — no need to iterate the returned scores list.
+    if scorer is None:
+        log.info("Scoring did not start — no stats available.")
+        sys.exit(1)
+
+    rs    = getattr(scorer, "_last_run_stats", {})
+    total = scorer._total_scored
 
     log.info("=" * 60)
     log.info("CDS SCORING COMPLETE%s", " (INTERRUPTED)" if interrupted else "")
-    log.info("  Properties loaded:   %7d", total)
-    log.info("  With signals:        %7d", len(with_signals))
-    log.info("  No signals (skipped):%7d", total - len(with_signals))
-    log.info("  Qualified (≥%s):       %7d", ROUTING_THRESHOLDS["weekly"], qualified)
+    log.info("  Properties scored:   %7d", total)
+    _ws = rs.get("with_signals", 0)
+    log.info("  With signals:        %7d", _ws)
+    log.info("  No signals (skipped):%7d", total - _ws)
+    log.info("  Qualified (≥%s):       %7d", ROUTING_THRESHOLDS["weekly"], rs.get("qualified", 0))
 
-    if with_signals:
-        scores_only = [s["final_cds_score"] for s in with_signals]
-        avg = sum(scores_only) / len(scores_only)
-        top = max(scores_only)
+    if _ws:
+        avg = rs.get("score_sum", 0) / _ws
         log.info("  Avg score:           %7.1f", avg)
-        log.info("  Top score:           %7.1f", top)
+        log.info("  Top score:           %7.1f", rs.get("score_max", 0))
 
         # ── Lead tier distribution ────────────────────────────────────────
         log.info("")
         log.info("LEAD TIER DISTRIBUTION:")
-        tier_counts = Counter(s["lead_tier"] for s in with_signals)
         for tier in ["Ultra Platinum", "Platinum", "Gold", "Silver", "Bronze"]:
-            bar = "█" * min(30, tier_counts.get(tier, 0))
-            log.info("  %-15s %5d  %s", tier, tier_counts.get(tier, 0), bar)
+            cnt = rs.get("tier_counts", Counter()).get(tier, 0)
+            bar = "█" * min(30, cnt)
+            log.info("  %-15s %5d  %s", tier, cnt, bar)
 
         # ── Urgency distribution ──────────────────────────────────────────
         log.info("")
         log.info("URGENCY / ROUTING DISTRIBUTION:")
-        urgency_counts = Counter(s["urgency_level"] for s in with_signals)
+        urgency_counts = rs.get("urgency_counts", Counter())
         for urgency, label in [
             ("Immediate", f"SMS  (≥{ROUTING_THRESHOLDS['immediate']})"),
             ("High",      f"Email(≥{ROUTING_THRESHOLDS['daily']})"),
@@ -1669,19 +2280,14 @@ def main():
         # ── Vertical driving max score ────────────────────────────────────
         log.info("")
         log.info("TOP VERTICAL (driving final_cds_score):")
-        top_v_counts = Counter(
-            max(s["vertical_scores"], key=s["vertical_scores"].get)
-            for s in with_signals
-        )
-        for v, count in top_v_counts.most_common():
+        for v, count in rs.get("top_vertical_counts", Counter()).most_common():
             bar = "█" * min(30, count)
             log.info("  %-20s %5d  %s", v, count, bar)
 
         # ── Signal type frequency ─────────────────────────────────────────
         log.info("")
         log.info("SIGNAL TYPE FREQUENCY (properties carrying each type):")
-        sig_counts = Counter(t for s in with_signals for t in s["distress_types"])
-        for sig_type, count in sig_counts.most_common():
+        for sig_type, count in rs.get("signal_type_counts", Counter()).most_common():
             bar = "█" * min(30, count)
             log.info("  %-25s %5d  %s", sig_type, count, bar)
 
@@ -1690,7 +2296,9 @@ def main():
         log.info("TOP 10 SCORED PROPERTIES:")
         log.info("  %-20s %6s %-15s %-10s %-20s %s", "Parcel", "Score", "Tier", "Urgency", "Best Vertical", "Signals")
         log.info("  %s %s %s %s %s %s", "-"*20, "-"*6, "-"*15, "-"*10, "-"*20, "-"*7)
-        for s in sorted(with_signals, key=lambda x: x["final_cds_score"], reverse=True)[:10]:
+        for s in rs.get("top10", []):
+            if not s.get("vertical_scores"):
+                continue
             best_v = max(s["vertical_scores"], key=s["vertical_scores"].get)
             best_v_score = s["vertical_scores"][best_v]
             log.info(

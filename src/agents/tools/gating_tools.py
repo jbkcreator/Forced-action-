@@ -178,7 +178,34 @@ def kill_switch_status(feature: str, observed_value: Optional[float] = None) -> 
 
 	Unknown feature → {'color': 'unknown', 'reason': 'unknown_feature'}.
 	This is the fail-safe: graphs treat 'unknown' as RED.
+
+	Manual override: set Redis key 'kill_switch_override:{feature}' or
+	'kill_switch_override:global' to 'red'/'yellow'/'green' with a TTL.
+	Global takes precedence over per-feature. The key auto-expires so no
+	cleanup is needed after an incident.
+
+	  redis-cli SET kill_switch_override:sms_reply_rate red EX 3600
+	  redis-cli SET kill_switch_override:global yellow EX 1800
 	"""
+	from src.core.redis_client import rget, rttl
+
+	_VALID_OVERRIDE_COLORS = {"red", "yellow", "green"}
+	for override_key in (
+		"kill_switch_override:global",
+		f"kill_switch_override:{feature}",
+	):
+		raw = rget(override_key)
+		if raw and raw.lower() in _VALID_OVERRIDE_COLORS:
+			color = raw.lower()
+			return {
+				"feature": feature,
+				"color": color,
+				"reason": "manual_override",
+				"override_key": override_key,
+				"ttl_seconds": rttl(override_key),
+				"observed_value": observed_value,
+			}
+
 	from config.cora_guardrails import KILL_SWITCH
 
 	band = KILL_SWITCH.get(feature)

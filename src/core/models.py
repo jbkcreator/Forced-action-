@@ -4,6 +4,7 @@ Implements the Hub-and-Spoke architecture with properties as the central hub.
 """
 
 from datetime import date, datetime, timezone
+from decimal import Decimal
 from typing import List, Optional
 
 from sqlalchemy import (
@@ -51,6 +52,7 @@ class Property(Base):
 
     # Address Information
     address: Mapped[Optional[str]] = mapped_column(String(255))
+    normalized_address: Mapped[Optional[str]] = mapped_column(String(255))
     city: Mapped[Optional[str]] = mapped_column(String(100))
     state: Mapped[Optional[str]] = mapped_column(String(2))
     zip: Mapped[Optional[str]] = mapped_column(String(10))
@@ -99,6 +101,7 @@ class Property(Base):
     # Indexes
     __table_args__ = (
         Index("idx_property_address", "address"),
+        Index("idx_property_normalized_address", "normalized_address"),
         Index("idx_property_city_state", "city", "state"),
         Index("idx_property_zip", "zip"),
         Index("idx_property_county_id", "county_id"),
@@ -265,6 +268,10 @@ class CodeViolation(Base):
     fine_amount: Mapped[Optional[float]] = mapped_column(Numeric(10, 2))
     is_lien: Mapped[Optional[bool]] = mapped_column(Boolean, default=False)
 
+    # Match provenance
+    match_confidence: Mapped[Optional[Decimal]] = mapped_column(Numeric(4, 3), nullable=True)  # 0.000–1.000
+    match_method: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)  # address | parcel_id
+
     # Load tracking & multi-county
     date_added: Mapped[Optional[date]] = mapped_column(Date, default=date.today, index=True)
     county_id: Mapped[Optional[str]] = mapped_column(String(50), default='hillsborough', index=True)
@@ -319,7 +326,7 @@ class LegalAndLien(Base):
     meta_data: Mapped[Optional[dict]] = mapped_column(JSONB)  # Additional type-specific fields
 
     # Match provenance — populated by the loader at insert time
-    match_confidence: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    match_confidence: Mapped[Optional[Decimal]] = mapped_column(Numeric(4, 3), nullable=True)  # 0.000–1.000
     match_method: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)  # legal_desc | owner_name | llm_verified | address | manual
 
     # Load tracking & multi-county
@@ -382,6 +389,10 @@ class Deed(Base):
     # Legal description
     legal_description: Mapped[Optional[str]] = mapped_column(Text)
 
+    # Match provenance
+    match_confidence: Mapped[Optional[Decimal]] = mapped_column(Numeric(4, 3), nullable=True)  # 0.000–1.000
+    match_method: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)  # legal_desc | owner_name | llm_verified | address | manual
+
     # Load tracking & multi-county
     date_added: Mapped[Optional[date]] = mapped_column(Date, default=date.today, index=True)
     county_id: Mapped[Optional[str]] = mapped_column(String(50), default='hillsborough', index=True)
@@ -432,6 +443,10 @@ class LegalProceeding(Base):
     
     # Flexible metadata bucket for type-specific fields
     meta_data: Mapped[Optional[dict]] = mapped_column(JSONB)
+
+    # Match provenance
+    match_confidence: Mapped[Optional[Decimal]] = mapped_column(Numeric(4, 3), nullable=True)  # 0.000–1.000
+    match_method: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)  # legal_desc | owner_name | llm_verified | address | manual
 
     # Load tracking & multi-county
     date_added: Mapped[Optional[date]] = mapped_column(Date, default=date.today, index=True)
@@ -513,6 +528,10 @@ class Foreclosure(Base):
     judgment_amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
     auction_date: Mapped[Optional[datetime]] = mapped_column(DateTime)
     case_status: Mapped[Optional[str]] = mapped_column(String(100))
+
+    # Match provenance
+    match_confidence: Mapped[Optional[Decimal]] = mapped_column(Numeric(4, 3), nullable=True)  # 0.000–1.000
+    match_method: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)  # parcel_id | address | legal_desc | owner_name
 
     # Load tracking & multi-county
     date_added: Mapped[Optional[date]] = mapped_column(Date, default=date.today, index=True)
@@ -1355,10 +1374,16 @@ class UnmatchedRecord(Base):
     instrument_number   = mapped_column(String(100), nullable=True, index=True)
     grantor             = mapped_column(Text, nullable=True)
     address_string      = mapped_column(Text, nullable=True)
-    match_status        = mapped_column(String(20), nullable=False, default="unmatched", index=True)  # unmatched | matched | skipped
-    match_attempted_at  = mapped_column(DateTime(timezone=True), nullable=True)
-    matched_property_id = mapped_column(Integer, ForeignKey("properties.id"), nullable=True)
-    date_added          = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    match_status          = mapped_column(String(20), nullable=False, default="unmatched", index=True)  # unmatched | matched | skipped | pending_review
+    match_attempted_at    = mapped_column(DateTime(timezone=True), nullable=True)
+    matched_property_id   = mapped_column(Integer, ForeignKey("properties.id"), nullable=True)
+    match_confidence      = mapped_column(Numeric(4, 3), nullable=True)        # 0.000–1.000
+    match_method          = mapped_column(String(30), nullable=True)            # address | owner_name | legal_desc | parcel_id
+    candidate_property_id = mapped_column(Integer, ForeignKey("properties.id"), nullable=True)
+    date_added            = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    matched_property   = relationship("Property", foreign_keys=[matched_property_id])
+    candidate_property = relationship("Property", foreign_keys=[candidate_property_id])
 
     __table_args__ = (
         Index("ix_unmatched_source_status", "source_type", "match_status"),
@@ -1367,6 +1392,15 @@ class UnmatchedRecord(Base):
             "instrument_number", "source_type", "county_id",
             unique=True,
             postgresql_where="instrument_number IS NOT NULL",
+        ),
+        Index("ix_unmatched_candidate_property", "candidate_property_id"),
+        CheckConstraint(
+            "match_status IN ('unmatched','matched','skipped','pending_review')",
+            name="check_unmatched_match_status",
+        ),
+        CheckConstraint(
+            "match_method IN ('address','owner_name','legal_desc','parcel_id') OR match_method IS NULL",
+            name="check_unmatched_match_method",
         ),
     )
 

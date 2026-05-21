@@ -189,75 +189,93 @@ class ViolationLoader(BaseLoader):
             
             # Match by address
             property_record = None
+            match_score = 0
             if pd.notna(row.get('Address')):
-                match_result = self.find_property_by_address(row['Address'], threshold=80)
+                match_result = self.find_property_by_address(row['Address'], threshold=self._thresholds.address_floor)
                 if match_result:
-                    property_record, score = match_result
-                    logger.info(f"Matched violation by address (score: {score}%): {record_number}")
-            
+                    property_record, match_score = match_result
+                    logger.info(f"Matched violation by address (score: {match_score}%): {record_number}")
+
             if property_record:
-                try:
-                    # Map CSV columns to database fields:
-                    # CSV 'Record Number' → record_number
-                    # CSV 'Record Type' → violation_type  
-                    # CSV 'Description' → description
-                    # CSV 'Date' → opened_date
-                    # CSV 'Status' → status
-                    
-                    # Handle NaN values from pandas - convert to None
-                    description_val = row.get('Description')
-                    if pd.isna(description_val):
-                        description_val = None
-                    
-                    violation_type_val = row.get('Record Type')
-                    if pd.isna(violation_type_val):
-                        violation_type_val = None
-                    
-                    status_val = row.get('Status')
-                    if pd.isna(status_val):
-                        status_val = None
-                    
-                    fine_amount_val = None
-                    raw_fine = row.get('Fine Amount')
-                    if raw_fine is not None and not (isinstance(raw_fine, float) and pd.isna(raw_fine)):
-                        try:
-                            fine_amount_val = float(str(raw_fine).replace('$', '').replace(',', '').strip())
-                        except (ValueError, TypeError):
-                            fine_amount_val = None
+                tier = self._classify_match(match_score, 'address')
+                if tier == "matched":
+                    try:
+                        # Map CSV columns to database fields:
+                        # CSV 'Record Number' → record_number
+                        # CSV 'Record Type' → violation_type
+                        # CSV 'Description' → description
+                        # CSV 'Date' → opened_date
+                        # CSV 'Status' → status
 
-                    is_lien_val = False
-                    raw_lien = row.get('Is Lien')
-                    if raw_lien is not None and not (isinstance(raw_lien, float) and pd.isna(raw_lien)):
-                        is_lien_val = str(raw_lien).strip().lower() in ('true', 'yes', '1')
+                        # Handle NaN values from pandas - convert to None
+                        description_val = row.get('Description')
+                        if pd.isna(description_val):
+                            description_val = None
 
-                    severity = classify_severity(
-                        violation_type=violation_type_val,
-                        description=description_val,
-                        fine_amount=fine_amount_val,
-                        is_lien=is_lien_val,
-                        status=status_val,
-                    )
+                        violation_type_val = row.get('Record Type')
+                        if pd.isna(violation_type_val):
+                            violation_type_val = None
 
-                    violation_record = CodeViolation(
-                        property_id=property_record.id,
-                        record_number=record_number,
-                        violation_type=violation_type_val,
-                        description=description_val,
-                        opened_date=self.parse_date(row.get('Date')),
-                        status=status_val,
-                        severity_tier=severity,
-                        fine_amount=fine_amount_val,
-                        is_lien=is_lien_val,
-                        county_id=self.county_id,
-                    )
-                    
-                    if self.safe_add(violation_record):
-                        matched += 1
-                    else:
+                        status_val = row.get('Status')
+                        if pd.isna(status_val):
+                            status_val = None
+
+                        fine_amount_val = None
+                        raw_fine = row.get('Fine Amount')
+                        if raw_fine is not None and not (isinstance(raw_fine, float) and pd.isna(raw_fine)):
+                            try:
+                                fine_amount_val = float(str(raw_fine).replace('$', '').replace(',', '').strip())
+                            except (ValueError, TypeError):
+                                fine_amount_val = None
+
+                        is_lien_val = False
+                        raw_lien = row.get('Is Lien')
+                        if raw_lien is not None and not (isinstance(raw_lien, float) and pd.isna(raw_lien)):
+                            is_lien_val = str(raw_lien).strip().lower() in ('true', 'yes', '1')
+
+                        severity = classify_severity(
+                            violation_type=violation_type_val,
+                            description=description_val,
+                            fine_amount=fine_amount_val,
+                            is_lien=is_lien_val,
+                            status=status_val,
+                        )
+
+                        violation_record = CodeViolation(
+                            property_id=property_record.id,
+                            record_number=record_number,
+                            violation_type=violation_type_val,
+                            description=description_val,
+                            opened_date=self.parse_date(row.get('Date')),
+                            status=status_val,
+                            severity_tier=severity,
+                            fine_amount=fine_amount_val,
+                            is_lien=is_lien_val,
+                            match_confidence=round(match_score / 100.0, 3),
+                            match_method='address',
+                            county_id=self.county_id,
+                        )
+
+                        if self.safe_add(violation_record):
+                            matched += 1
+                        else:
+                            unmatched += 1
+
+                    except Exception as e:
+                        logger.error(f"Error building violation {record_number}: {e}")
                         unmatched += 1
-
-                except Exception as e:
-                    logger.error(f"Error building violation {record_number}: {e}")
+                else:
+                    logger.debug(f"Pending review violation: {record_number} (score: {match_score}%)")
+                    self.quarantine_unmatched(
+                        source_type="violations",
+                        raw_row=row.to_dict() if hasattr(row, 'to_dict') else dict(row),
+                        address_string=str(row.get('Address', '')),
+                        instrument_number=str(record_number),
+                        match_status="pending_review",
+                        match_confidence=match_score / 100.0,
+                        candidate_property_id=property_record.id,
+                        match_method='address',
+                    )
                     unmatched += 1
             else:
                 logger.warning(f"No property match for violation: {record_number} at {row.get('Address')}")

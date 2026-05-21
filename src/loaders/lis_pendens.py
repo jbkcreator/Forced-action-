@@ -21,7 +21,7 @@ from typing import Tuple
 
 import pandas as pd
 
-from src.loaders.base import BaseLoader
+from src.loaders.base import BaseLoader, _OWNER_NAME_NOISE_PHRASES
 from src.core.models import Foreclosure
 
 logger = logging.getLogger(__name__)
@@ -29,16 +29,20 @@ logger = logging.getLogger(__name__)
 # Substrings that identify a lis pendens row in the document_type column
 _LP_MARKERS = ('LIS PENDENS', '(LP)')
 
-# Noise party substrings to exclude from grantee candidate matching.
-# These appear in every LP filing but are never the property owner.
-_NOISE_PARTIES = (
+# LP-specific institutional fillers (governments, GSE acronyms, "unknown"
+# placeholders). Substring-matched against grantee candidates.
+_LIS_PENDENS_ONLY_NOISE = (
     'UNKNOWN SPOUSE', 'UNKNOWN TENANT', 'UNKNOWN HEIR', 'UNKNOWN PARTY',
     'UNKNOWN OCCUPANT', 'FLORIDA DEPARTMENT', 'UNITED STATES', 'SECRETARY OF',
     'DEPARTMENT OF', 'HILLSBOROUGH COUNTY', 'CITY OF ', 'INTERNAL REVENUE',
-    'ANY AND ALL', 'AS TRUSTEE', 'AS NOMINEE', 'AS SUCCESSOR', 'SUCCESSOR IN',
-    'MORTGAGE ELECTRONIC', 'MERS', 'FLHSMV', 'FHFC', 'FLORIDA HOUSING',
-    'INDIVIDUALLY', 'THROUGH UNDER', 'CLAIMING BY',
+    'ANY AND ALL', 'MORTGAGE ELECTRONIC', 'MERS', 'FLHSMV', 'FHFC',
+    'FLORIDA HOUSING', 'INDIVIDUALLY',
 )
+
+# Combined noise list: shared role/relationship phrases (TRUSTEE/SUCCESSOR/...)
+# plus LP-specific institutions. Kept as a single tuple so the candidate-filter
+# loop stays a single pass.
+_NOISE_PARTIES = _LIS_PENDENS_ONLY_NOISE + _OWNER_NAME_NOISE_PHRASES
 
 
 def _extract_owner_candidates(grantee_raw: str) -> list:
@@ -124,6 +128,8 @@ class LisPendensLoader(BaseLoader):
             #   2. Legal description parsing (LOT/BLOCK/SUBDIVISION)
             #   3. Grantee name matching + LLM verification
             property_record = None
+            match_score = 0
+            match_method = None
 
             # Strategy 1: Extract parcel ID from the Legal field
             if pd.notna(row.get('Legal')):
@@ -132,95 +138,123 @@ class LisPendensLoader(BaseLoader):
                     prop = self.find_property_by_parcel_id(pid)
                     if prop:
                         property_record = prop
+                        match_score = 100
+                        match_method = 'parcel_id'
                         logger.info(f"Matched LP by parcel ID {pid}: {instrument}")
                         break
 
             # Strategy 2: Legal description parsing
             if not property_record and pd.notna(row.get('Legal')):
-                match_result = self.find_property_by_legal_description(row['Legal'])
+                match_result = self.find_property_by_legal_description(
+                    row['Legal'], threshold=self._thresholds.legal_desc_floor,
+                )
                 if match_result:
-                    property_record, score = match_result
-                    logger.info(f"Matched LP by legal desc (score: {score}%): {instrument}")
+                    property_record, match_score = match_result
+                    match_method = 'legal_desc'
+                    logger.info(f"Matched LP by legal desc (score: {match_score}%): {instrument}")
 
+            # Strategy 3: Grantee name matching + LLM verification
             if not property_record and pd.notna(row.get('Grantee')):
                 grantee_raw = str(row['Grantee'])
                 # LP grantee fields are multi-party defendant lists.
                 # Split by comma, filter out non-owner noise parties, try each candidate.
                 candidates = _extract_owner_candidates(grantee_raw)
                 for candidate in candidates:
-                    match_result = self.find_property_by_owner_name(candidate, threshold=75)
+                    match_result = self.find_property_by_owner_name(candidate, threshold=self._thresholds.owner_name_floor)
                     if match_result:
-                        property_record, score = match_result
-                        logger.info(f"Matched LP by grantee candidate '{candidate}' (score: {score}%): {instrument}")
-                        property_record, _ = self._apply_llm_verification(
+                        property_record, match_score = match_result
+                        match_method = 'owner_name'
+                        logger.info(f"Matched LP by grantee candidate '{candidate}' (score: {match_score}%): {instrument}")
+                        property_record, llm_method = self._apply_llm_verification(
                             raw_row=row.to_dict() if hasattr(row, 'to_dict') else dict(row),
-                            current_best=property_record, match_score=score,
+                            current_best=property_record, match_score=match_score,
                             record_type='lis_pendens', match_field='Grantee',
                         )
+                        if llm_method:
+                            match_method = llm_method
                         break
 
             if property_record:
-                try:
-                    lis_pendens_date = self.parse_date(row.get('RecordDate'))
+                tier = self._classify_match(match_score, match_method)
+                if tier == "matched":
+                    try:
+                        lis_pendens_date = self.parse_date(row.get('RecordDate'))
 
-                    plaintiff = None
-                    grantor_val = row.get('Grantor')
-                    if pd.notna(grantor_val):
-                        plaintiff = str(grantor_val)[:500]
+                        plaintiff = None
+                        grantor_val = row.get('Grantor')
+                        if pd.notna(grantor_val):
+                            plaintiff = str(grantor_val)[:500]
 
-                    # Check if a Foreclosure row already exists for this property
-                    # (e.g. auction data loaded first from realforeclose.com)
-                    existing = (
-                        self.session.query(Foreclosure)
-                        .filter_by(property_id=property_record.id)
-                        .order_by(Foreclosure.date_added.desc())
-                        .first()
-                    )
+                        # Check if a Foreclosure row already exists for this property
+                        # (e.g. auction data loaded first from realforeclose.com)
+                        existing = (
+                            self.session.query(Foreclosure)
+                            .filter_by(property_id=property_record.id)
+                            .order_by(Foreclosure.date_added.desc())
+                            .first()
+                        )
 
-                    if existing:
-                        # Merge LP data into the existing row — never overwrite
-                        # auction fields, never blank a field that's already set.
-                        updated = False
-                        if existing.lis_pendens_date is None and lis_pendens_date:
-                            existing.lis_pendens_date = lis_pendens_date
-                            updated = True
-                        if existing.plaintiff is None and plaintiff:
-                            existing.plaintiff = plaintiff
-                            updated = True
-                        if updated:
-                            try:
-                                with self.session.begin_nested():
-                                    self.session.flush()
-                                self._affected_property_ids.add(property_record.id)
-                                logger.info(
-                                    f"Updated existing foreclosure row with LP data: "
+                        if existing:
+                            # Merge LP data into the existing row — never overwrite
+                            # auction fields, never blank a field that's already set.
+                            updated = False
+                            if existing.lis_pendens_date is None and lis_pendens_date:
+                                existing.lis_pendens_date = lis_pendens_date
+                                updated = True
+                            if existing.plaintiff is None and plaintiff:
+                                existing.plaintiff = plaintiff
+                                updated = True
+                            if updated:
+                                try:
+                                    with self.session.begin_nested():
+                                        self.session.flush()
+                                    self._affected_property_ids.add(property_record.id)
+                                    logger.info(
+                                        f"Updated existing foreclosure row with LP data: "
+                                        f"property_id={property_record.id}"
+                                    )
+                                except Exception as e:
+                                    logger.warning(f"Could not update foreclosure with LP data: {e}")
+                            else:
+                                logger.debug(
+                                    f"LP data already present on foreclosure row: "
                                     f"property_id={property_record.id}"
                                 )
-                            except Exception as e:
-                                logger.warning(f"Could not update foreclosure with LP data: {e}")
-                        else:
-                            logger.debug(
-                                f"LP data already present on foreclosure row: "
-                                f"property_id={property_record.id}"
-                            )
-                        matched += 1
-                    else:
-                        # No prior row — create new placeholder with synthetic case_number
-                        record = Foreclosure(
-                            property_id=property_record.id,
-                            case_number=synthetic_case,
-                            plaintiff=plaintiff,
-                            lis_pendens_date=lis_pendens_date,
-                            filing_date=lis_pendens_date,
-                            county_id=self.county_id,
-                        )
-                        if self.safe_add(record):
                             matched += 1
                         else:
-                            unmatched += 1
+                            # No prior row — create new placeholder with synthetic case_number
+                            record = Foreclosure(
+                                property_id=property_record.id,
+                                case_number=synthetic_case,
+                                plaintiff=plaintiff,
+                                lis_pendens_date=lis_pendens_date,
+                                filing_date=lis_pendens_date,
+                                match_confidence=round(match_score / 100.0, 3),
+                                match_method=match_method,
+                                county_id=self.county_id,
+                            )
+                            if self.safe_add(record):
+                                matched += 1
+                            else:
+                                unmatched += 1
 
-                except Exception as e:
-                    logger.error(f"Error building LP record {instrument}: {e}")
+                    except Exception as e:
+                        logger.error(f"Error building LP record {instrument}: {e}")
+                        unmatched += 1
+                else:
+                    logger.debug(f"Pending review LP: {instrument} (score: {match_score}%, method: {match_method})")
+                    self.quarantine_unmatched(
+                        source_type="lis_pendens",
+                        raw_row=row.to_dict() if hasattr(row, 'to_dict') else dict(row),
+                        county_id=self.county_id,
+                        instrument_number=instrument,
+                        grantor=str(row.get('Grantor', '')),
+                        address_string=str(row.get('Grantee', ''))[:500],
+                        match_status="pending_review",
+                        match_confidence=match_score / 100.0,
+                        candidate_property_id=property_record.id,
+                        match_method=match_method,
+                    )
                     unmatched += 1
             else:
                 logger.debug(

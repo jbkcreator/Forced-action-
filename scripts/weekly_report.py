@@ -113,15 +113,20 @@ def _build_scraper_section(session, start: date, end: date, county_id: str):
     return scraper_data, total_scraped, total_matched, match_pct
 
 
+def _latest_score_date(session, on_date: date, county_id: str):
+    """Most recent score_date <= on_date, or None if no scores exist yet."""
+    return session.query(func.max(func.date(DistressScore.score_date))).filter(
+        func.date(DistressScore.score_date) <= on_date,
+        DistressScore.county_id == county_id,
+    ).scalar()
+
+
 def _fetch_gold_plus(session, on_date: date, county_id: str) -> dict:
     """
     Return {property_id: (best_vertical, lead_tier)} for Gold+ on or before on_date.
     Uses the most recent available score_date <= on_date to handle weekends/gaps.
     """
-    latest = session.query(func.max(func.date(DistressScore.score_date))).filter(
-        func.date(DistressScore.score_date) <= on_date,
-        DistressScore.county_id == county_id,
-    ).scalar()
+    latest = _latest_score_date(session, on_date, county_id)
 
     if not latest:
         return {}
@@ -217,6 +222,10 @@ def _build_vertical_tier_crosstab(session, end: date, start: date, county_id: st
 
 def _build_zip_breakdown(session, end: date, county_id: str, top_n: int = 20) -> list:
     """Top ZIPs by Gold+ count as of end date."""
+    score_date = _latest_score_date(session, end, county_id)
+    if not score_date:
+        return []
+
     rows = (
         session.query(
             Property.zip,
@@ -225,7 +234,7 @@ def _build_zip_breakdown(session, end: date, county_id: str, top_n: int = 20) ->
         )
         .join(Property, Property.id == DistressScore.property_id)
         .filter(
-            func.date(DistressScore.score_date) == end,
+            func.date(DistressScore.score_date) == score_date,
             DistressScore.lead_tier.in_(GOLD_PLUS_TIERS),
             DistressScore.county_id == county_id,
             Property.zip.isnot(None),
@@ -255,6 +264,10 @@ def _build_zip_breakdown(session, end: date, county_id: str, top_n: int = 20) ->
 
 def _build_signal_composition(session, end: date, county_id: str) -> dict:
     """Top signals driving Gold+ scores per vertical as of end date."""
+    score_date = _latest_score_date(session, end, county_id)
+    if not score_date:
+        return {}
+
     sql = text("""
         SELECT
             ds.vertical_scores,
@@ -272,7 +285,7 @@ def _build_signal_composition(session, end: date, county_id: str) -> dict:
 
     try:
         rows = session.execute(sql, {
-            "run_date":  end,
+            "run_date":  score_date,
             "tiers":     list(GOLD_PLUS_TIERS),
             "county_id": county_id,
         }).fetchall()

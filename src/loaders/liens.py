@@ -199,11 +199,15 @@ class LienLoader(BaseLoader):
                 any(code in doc_type_upper for code in self._code_lien_city_map)
                 or 'CODE LIEN' in doc_type_upper
             )
-            name_threshold = 90 if is_code_lien else 75
+            # Code liens hold at 90 (business rule: false-positive prevention — the
+            # 113-record cascade incident). All other lien types use the county floor.
+            name_threshold = 90 if is_code_lien else self._thresholds.owner_name_floor
 
             # Strategy A: Legal description (lot/block/subdivision → parcel)
             if pd.notna(row.get('Legal')):
-                match_result = self.find_property_by_legal_description(row['Legal'])
+                match_result = self.find_property_by_legal_description(
+                    row['Legal'], threshold=self._thresholds.legal_desc_floor,
+                )
                 if match_result:
                     property_record, score = match_result
                     match_method = 'legal_desc'
@@ -295,10 +299,13 @@ class LienLoader(BaseLoader):
             elif not property_record and not is_tax_lien and not is_code_lien:
                 # Mechanics Liens (ML): Grantor = contractor/creditor, Grantee = property owner.
                 # Try Grantee first so we match against the actual owner, not the contractor.
-                # All other liens (judgment, HOA, etc.): Grantor = debtor/owner — try Grantor first.
+                # Judgments: Grantor = creditor (bank/LLC), Grantee = debtor/property owner.
+                # Try Grantee first — avoids wasting the first match attempt on the creditor.
+                # All other liens (HOA, etc.): Grantor = debtor/owner — try Grantor first.
                 is_mechanics_lien = 'ML' in doc_type_upper or 'MECHANIC' in doc_type_upper
+                is_judgment = 'JUDGMENT' in doc_type_upper or 'CERTIFIED' in doc_type_upper
                 first_field, second_field = (
-                    ('Grantee', 'Grantor') if is_mechanics_lien else ('Grantor', 'Grantee')
+                    ('Grantee', 'Grantor') if (is_mechanics_lien or is_judgment) else ('Grantor', 'Grantee')
                 )
 
                 if pd.notna(row.get(first_field)):
@@ -341,92 +348,113 @@ class LienLoader(BaseLoader):
                     match_method = llm_method
 
             if property_record:
-                try:
-                    # Determine record type
-                    if 'JUDGMENT' in doc_type_upper or 'CERTIFIED' in doc_type_upper:
-                        record_type = 'Judgment'
-                    else:
-                        record_type = 'Lien'
-
-                    # Assign creditor/debtor so that debtor = property owner in all cases.
-                    #
-                    # Field assignment rules:
-                    #   (a) IRS Tax Liens: Grantor = IRS (filer) → creditor_val hardcoded,
-                    #       debtor = Grantee (the taxpayer/property owner).
-                    #   (b) Code Liens: city/county may be in either Grantor or Grantee —
-                    #       whichever side contains the filer keyword is the creditor;
-                    #       the other side is the debtor (property owner).
-                    #   (c) All other liens: creditor = Grantee, debtor = Grantor.
-                    if is_tax_lien:
-                        creditor_val = 'INTERNAL REVENUE SERVICE'
-                        debtor_raw = row.get('Grantee')
-                    elif is_code_lien:
-                        grantor_raw = row.get('Grantor')
-                        grantee_raw = row.get('Grantee')
-                        if self._party_is_filer(grantor_raw):
-                            # Grantor = city/county (creditor); Grantee = property owner (debtor)
-                            creditor_raw = grantor_raw
-                            debtor_raw = grantee_raw
+                tier = self._classify_match(match_score or 0, match_method)
+                if tier == "matched":
+                    try:
+                        # Determine record type
+                        if 'JUDGMENT' in doc_type_upper or 'CERTIFIED' in doc_type_upper:
+                            record_type = 'Judgment'
                         else:
-                            # Grantee = city/county (creditor); Grantor = property owner (debtor)
-                            creditor_raw = grantee_raw
-                            debtor_raw = grantor_raw
-                        creditor_val = None if pd.isna(creditor_raw) else creditor_raw
-                    else:
-                        creditor_raw = row.get('Grantee')
-                        creditor_val = None if pd.isna(creditor_raw) else creditor_raw
-                        debtor_raw = row.get('Grantor')
+                            record_type = 'Lien'
 
-                    debtor_val = None if pd.isna(debtor_raw) else debtor_raw
+                        # Assign creditor/debtor so that debtor = property owner in all cases.
+                        #
+                        # Field assignment rules:
+                        #   (a) IRS Tax Liens: Grantor = IRS (filer) → creditor_val hardcoded,
+                        #       debtor = Grantee (the taxpayer/property owner).
+                        #   (b) Code Liens: city/county may be in either Grantor or Grantee —
+                        #       whichever side contains the filer keyword is the creditor;
+                        #       the other side is the debtor (property owner).
+                        #   (c) All other liens: creditor = Grantee, debtor = Grantor.
+                        if is_tax_lien:
+                            creditor_val = 'INTERNAL REVENUE SERVICE'
+                            debtor_raw = row.get('Grantee')
+                        elif is_code_lien:
+                            grantor_raw = row.get('Grantor')
+                            grantee_raw = row.get('Grantee')
+                            if self._party_is_filer(grantor_raw):
+                                # Grantor = city/county (creditor); Grantee = property owner (debtor)
+                                creditor_raw = grantor_raw
+                                debtor_raw = grantee_raw
+                            else:
+                                # Grantee = city/county (creditor); Grantor = property owner (debtor)
+                                creditor_raw = grantee_raw
+                                debtor_raw = grantor_raw
+                            creditor_val = None if pd.isna(creditor_raw) else creditor_raw
+                        else:
+                            creditor_raw = row.get('Grantee')
+                            creditor_val = None if pd.isna(creditor_raw) else creditor_raw
+                            debtor_raw = row.get('Grantor')
 
-                    book_type_val = row.get('BookType')
-                    if pd.isna(book_type_val):
-                        book_type_val = None
+                        debtor_val = None if pd.isna(debtor_raw) else debtor_raw
 
-                    book_number_val = row.get('Book')
-                    if pd.isna(book_number_val):
-                        book_number_val = None
+                        book_type_val = row.get('BookType')
+                        if pd.isna(book_type_val):
+                            book_type_val = None
 
-                    page_number_val = row.get('Page')
-                    if pd.isna(page_number_val):
-                        page_number_val = None
+                        book_number_val = row.get('Book')
+                        if pd.isna(book_number_val):
+                            book_number_val = None
 
-                    doc_type_val = row.get('document_type')
-                    if pd.isna(doc_type_val):
-                        doc_type_val = None
+                        page_number_val = row.get('Page')
+                        if pd.isna(page_number_val):
+                            page_number_val = None
 
-                    legal_desc_val = row.get('Legal')
-                    if pd.isna(legal_desc_val):
-                        legal_desc_val = None
+                        doc_type_val = row.get('document_type')
+                        if pd.isna(doc_type_val):
+                            doc_type_val = None
 
-                    lien_record = LegalAndLien(
-                        property_id=property_record.id,
-                        record_type=record_type,
-                        instrument_number=instrument,
-                        creditor=creditor_val,
-                        debtor=debtor_val,
-                        amount=self.parse_amount(row.get('Filing Amt')),
-                        filing_date=self.parse_date(row.get('RecordDate')),
-                        book_type=book_type_val,
-                        book_number=book_number_val,
-                        page_number=page_number_val,
-                        document_type=doc_type_val,
-                        legal_description=legal_desc_val,
-                        match_confidence=match_score,
-                        match_method=match_method,
-                        meta_data={'match_field': match_field},
-                        county_id=self.county_id,
-                    )
+                        legal_desc_val = row.get('Legal')
+                        if pd.isna(legal_desc_val):
+                            legal_desc_val = None
 
-                    if self.safe_add(lien_record):
-                        matched += 1
-                        self.stats_by_doc_type[_doc_type_label]['matched'] += 1
-                    else:
+                        lien_record = LegalAndLien(
+                            property_id=property_record.id,
+                            record_type=record_type,
+                            instrument_number=instrument,
+                            creditor=creditor_val,
+                            debtor=debtor_val,
+                            amount=self.parse_amount(row.get('Filing Amt')),
+                            filing_date=self.parse_date(row.get('RecordDate')),
+                            book_type=book_type_val,
+                            book_number=book_number_val,
+                            page_number=page_number_val,
+                            document_type=doc_type_val,
+                            legal_description=legal_desc_val,
+                            match_confidence=round(match_score / 100.0, 3),
+                            match_method=match_method,
+                            meta_data={'match_field': match_field},
+                            county_id=self.county_id,
+                        )
+
+                        if self.safe_add(lien_record):
+                            matched += 1
+                            self.stats_by_doc_type[_doc_type_label]['matched'] += 1
+                        else:
+                            unmatched += 1
+                            self.stats_by_doc_type[_doc_type_label]['unmatched'] += 1
+
+                    except Exception as e:
+                        logger.error(f"Error building lien {instrument}: {e}")
                         unmatched += 1
                         self.stats_by_doc_type[_doc_type_label]['unmatched'] += 1
-
-                except Exception as e:
-                    logger.error(f"Error building lien {instrument}: {e}")
+                else:
+                    # pending_review — candidate found but confidence below auto-match threshold
+                    logger.debug(
+                        f"Pending review lien: {instrument} "
+                        f"(score: {match_score}%, method: {match_method}, doc_type: {_doc_type_label})"
+                    )
+                    self.quarantine_unmatched(
+                        source_type="liens",
+                        raw_row=row.to_dict() if hasattr(row, 'to_dict') else dict(row),
+                        county_id=self.county_id,
+                        instrument_number=instrument,
+                        grantor=row.get('Grantor'),
+                        match_status="pending_review",
+                        match_confidence=match_score / 100.0,
+                        candidate_property_id=property_record.id,
+                        match_method=match_method,
+                    )
                     unmatched += 1
                     self.stats_by_doc_type[_doc_type_label]['unmatched'] += 1
             else:

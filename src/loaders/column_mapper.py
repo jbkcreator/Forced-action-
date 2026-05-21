@@ -107,6 +107,10 @@ SIGNAL_SCHEMAS: dict[str, list[str]] = {
     "deeds": [
         "Grantor", "Grantee", "Instrument", "document_type",
         "Book", "Page", "RecordDate", "sale_price",
+        # Legal description — DeedLoader's primary match strategy. In some
+        # counties (e.g. Pinellas) the recorder CSV puts this in a non-Legal
+        # column, so the mapper needs an explicit canonical target to bind to.
+        "Legal",
     ],
     "probate": [
         "CaseNumber", "PartyType", "LastName/CompanyName", "FirstName", "MiddleName",

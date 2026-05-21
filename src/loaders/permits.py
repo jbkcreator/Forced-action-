@@ -126,7 +126,10 @@ class BuildingPermitLoader(BaseLoader):
                 if not zip_match:
                     zip_match = re.search(r',\s*(\d{5})(?:-\d{4})?\s*$', raw_address)
                 zip_code = zip_match.group(1) if zip_match else None
-                match_result = self.find_property_by_address(raw_address, zip_code=zip_code, strict_house_number=False)
+                match_result = self.find_property_by_address(
+                    raw_address, zip_code=zip_code, strict_house_number=False,
+                    threshold=self._thresholds.address_floor,
+                )
                 if match_result:
                     property_record, score = match_result
                     logger.info(f"Matched permit by address (score: {score}%): {record_number}")
