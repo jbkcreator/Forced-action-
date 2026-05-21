@@ -6,10 +6,15 @@ Enriches high-priority distressed property leads with owner contact info
 
 Flow:
   1. Query owners with no contact info, filtered by lead tier
-  2. POST to BatchData API (up to 100 records per batch)
-  3. Parse response → phones, emails, mailing address
-  4. Persist EnrichedContact record per property
-  5. Update Owner.phone_1 / email_1 for GHL push
+  2. Pre-fetch filing-derived party names (probate heir, eviction landlord,
+     divorce petitioner, lis pendens defendant) for candidate properties
+  3. POST to BatchData API (up to 100 records per batch) — when a candidate
+     has a filing party name, send that name instead of the assessor owner
+     name (resolve_party_name applies priority: probate > eviction >
+     divorce > lp). Same per-call cost, higher match rate.
+  4. Parse response → phones, emails, mailing address
+  5. Persist EnrichedContact record per property
+  6. Update Owner.phone_1 / email_1 for GHL push
 
 Usage:
   python -m src.services.skip_trace --limit 10 --dry-run
@@ -28,7 +33,7 @@ from sqlalchemy import text
 
 from config.settings import get_settings
 from src.core.database import get_db_context
-from src.core.models import Owner, Property, EnrichedContact, DistressScore, LegalProceeding
+from src.core.models import Owner, Property, EnrichedContact, DistressScore, LegalProceeding, Foreclosure
 from src.services.email import send_alert
 from src.utils.logger import setup_logging, get_logger
 
@@ -446,10 +451,18 @@ def run_skip_trace(
 
         rows = q.order_by(ds_latest.c.max_date.desc()).limit(limit).all()
 
-        # Pre-fetch probate heirs for all candidate properties in one query.
-        # The beneficiary name (secondary_party) is the actual decision-maker
-        # for probate leads — we use it instead of the deceased owner's name.
+        # Pre-fetch party names from court filings for all candidate properties.
+        # Why: the name on the assessor record is often NOT the actual
+        # decision-maker (deceased owner in probate, LLC in an eviction, etc.).
+        # Submitting the right human name + property address to BatchData
+        # materially improves match rate without increasing the per-lookup cost.
+        #
+        # Priority order applied at payload-build time:
+        #   Probate > Eviction > Divorce > LP
+        # (see resolve_party_name() below)
         property_ids = [p.id for _, p in rows]
+
+        # Probate heir = beneficiary (decedent is unreachable)
         probate_rows = (
             session.query(LegalProceeding.property_id, LegalProceeding.secondary_party)
             .filter(
@@ -461,11 +474,87 @@ def run_skip_trace(
             .order_by(LegalProceeding.filing_date.desc())
             .all()
         )
-        # Keep most recent heir per property
         probate_heir_by_property: dict = {}
         for pid, heir_name in probate_rows:
             if pid not in probate_heir_by_property:
                 probate_heir_by_property[pid] = heir_name
+
+        # Eviction landlord = plaintiff (defendant is the tenant, NOT the owner)
+        eviction_rows = (
+            session.query(LegalProceeding.property_id, LegalProceeding.secondary_party)
+            .filter(
+                LegalProceeding.property_id.in_(property_ids),
+                LegalProceeding.record_type == "Eviction",
+                LegalProceeding.secondary_party.isnot(None),
+                sa_func.length(sa_func.trim(LegalProceeding.secondary_party)) > 0,
+            )
+            .order_by(LegalProceeding.filing_date.desc())
+            .all()
+        )
+        eviction_landlord_by_property: dict = {}
+        for pid, landlord_name in eviction_rows:
+            if pid not in eviction_landlord_by_property:
+                eviction_landlord_by_property[pid] = landlord_name
+
+        # Divorce petitioner = associated_party (the one who filed)
+        divorce_rows = (
+            session.query(LegalProceeding.property_id, LegalProceeding.associated_party)
+            .filter(
+                LegalProceeding.property_id.in_(property_ids),
+                LegalProceeding.record_type == "Divorce",
+                LegalProceeding.associated_party.isnot(None),
+                sa_func.length(sa_func.trim(LegalProceeding.associated_party)) > 0,
+            )
+            .order_by(LegalProceeding.filing_date.desc())
+            .all()
+        )
+        divorce_petitioner_by_property: dict = {}
+        for pid, petitioner_name in divorce_rows:
+            if pid not in divorce_petitioner_by_property:
+                divorce_petitioner_by_property[pid] = petitioner_name
+
+        # Lis pendens defendant = the borrower/homeowner being foreclosed.
+        # Ordered by lis_pendens_date (when the LP was filed) — filing_date
+        # may have been set to the auction date by the realforeclose scraper.
+        lp_rows = (
+            session.query(Foreclosure.property_id, Foreclosure.defendant)
+            .filter(
+                Foreclosure.property_id.in_(property_ids),
+                Foreclosure.defendant.isnot(None),
+                sa_func.length(sa_func.trim(Foreclosure.defendant)) > 0,
+            )
+            .order_by(Foreclosure.lis_pendens_date.desc().nullslast())
+            .all()
+        )
+        lp_defendant_by_property: dict = {}
+        for pid, defendant_name in lp_rows:
+            if pid not in lp_defendant_by_property:
+                lp_defendant_by_property[pid] = defendant_name
+
+    def resolve_party_name(prop_id: int):
+        """
+        Pick the best filing-derived party name for a property.
+
+        Returns (name, source_tag) or (None, None) if no usable name found.
+        Skips entity-looking names (LLC/Corp/Trust/Estate) since BatchData
+        cannot skip-trace an organization.
+
+        Priority order (highest first):
+          1. Probate heir       — decedent is unreachable, heir is decision-maker
+          2. Eviction landlord  — owner running rentals, active manager
+          3. Divorce petitioner — the spouse who initiated the case
+          4. LP defendant       — borrower/homeowner being foreclosed
+        """
+        for source_tag, lookup in (
+            ("probate",  probate_heir_by_property),
+            ("eviction", eviction_landlord_by_property),
+            ("divorce",  divorce_petitioner_by_property),
+            ("lp",       lp_defendant_by_property),
+        ):
+            candidate = lookup.get(prop_id)
+            if candidate and not _is_entity_name(candidate):
+                return candidate, source_tag
+        return None, None
 
     if not rows:
         logger.info("No candidates found — every high-priority owner already has a usable phone.")
@@ -511,16 +600,18 @@ def run_skip_trace(
                 )
             elif owner.owner_type in ("LLC", "Corporate", "Trust", "Estate"):
                 # Non-individual with no registered agent.
-                # Exception: Estate owners with a known probate heir — trace the heir.
-                heir = probate_heir_by_property.get(prop.id)
-                if not heir or _is_entity_name(heir):
+                # Exception: if we have a filing-derived party name (probate
+                # heir, eviction landlord, divorce petitioner, or LP defendant)
+                # we can still skip-trace the underlying human.
+                party_name, source_tag = resolve_party_name(prop.id)
+                if not party_name:
                     stats["no_address"] += 1
                     logger.debug(
                         f"Skipping property_id={prop.id} — owner_type={owner.owner_type!r} "
                         f"with no registered agent ({owner.owner_name!r})"
                     )
                     continue
-                first_name, last_name = _split_agent_name(heir)
+                first_name, last_name = _split_agent_name(party_name)
                 street   = (prop.address or "").strip()
                 zip_code = (prop.zip or "").strip()[:5]
                 if not street or not zip_code:
@@ -537,14 +628,15 @@ def run_skip_trace(
                     },
                 }
                 logger.debug(
-                    f"[Probate/Estate] property_id={prop.id} tracing heir: "
+                    f"[{source_tag}/Entity] property_id={prop.id} tracing: "
                     f"{first_name} {last_name}"
                 )
             else:
-                # Individual owner — check for probate heir first.
-                # If heir is known, target them by name; otherwise fall back to
-                # a blind property-address lookup (which would return the deceased).
-                heir     = probate_heir_by_property.get(prop.id)
+                # Individual owner — check for a filing-derived party name first.
+                # If one is found (heir, landlord, petitioner, LP defendant) target
+                # them by name; otherwise fall back to a blind property-address
+                # lookup. Order: probate > eviction > divorce > lp.
+                party_name, source_tag = resolve_party_name(prop.id)
                 street   = (prop.address or "").strip()
                 city     = (prop.city or "Tampa").strip()
                 state    = (prop.state or "FL").strip()
@@ -555,8 +647,8 @@ def run_skip_trace(
                     logger.debug(f"Skipping property_id={prop.id} — missing address or ZIP")
                     continue
 
-                if heir and not _is_entity_name(heir):
-                    first_name, last_name = _split_agent_name(heir)
+                if party_name:
+                    first_name, last_name = _split_agent_name(party_name)
                     payload_entry = {
                         "firstName": first_name,
                         "lastName":  last_name,
@@ -568,7 +660,7 @@ def run_skip_trace(
                         },
                     }
                     logger.debug(
-                        f"[Probate/Individual] property_id={prop.id} tracing heir: "
+                        f"[{source_tag}/Individual] property_id={prop.id} tracing: "
                         f"{first_name} {last_name}"
                     )
                 else:

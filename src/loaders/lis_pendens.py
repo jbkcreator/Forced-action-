@@ -122,6 +122,13 @@ class LisPendensLoader(BaseLoader):
                     skipped += 1
                     continue
 
+            # Extract defendant candidates from Grantee up front so we can both
+            # match by them AND persist the primary candidate on the Foreclosure
+            # row regardless of which matching strategy ultimately succeeds.
+            grantee_candidates: list = []
+            if pd.notna(row.get('Grantee')):
+                grantee_candidates = _extract_owner_candidates(str(row['Grantee']))
+
             # ── Property matching ────────────────────────────────────────────
             # Strategy priority:
             #   1. Parcel ID from Legal text (direct, 100% confidence)
@@ -154,13 +161,13 @@ class LisPendensLoader(BaseLoader):
                     logger.info(f"Matched LP by legal desc (score: {match_score}%): {instrument}")
 
             # Strategy 3: Grantee name matching + LLM verification
-            if not property_record and pd.notna(row.get('Grantee')):
-                grantee_raw = str(row['Grantee'])
+            # Reuses grantee_candidates extracted above (also used for defendant persistence).
+            if not property_record and grantee_candidates:
                 # LP grantee fields are multi-party defendant lists.
-                # Split by comma, filter out non-owner noise parties, try each candidate.
-                candidates = _extract_owner_candidates(grantee_raw)
-                for candidate in candidates:
-                    match_result = self.find_property_by_owner_name(candidate, threshold=self._thresholds.owner_name_floor)
+                for candidate in grantee_candidates:
+                    match_result = self.find_property_by_owner_name(
+                        candidate, threshold=self._thresholds.owner_name_floor,
+                    )
                     if match_result:
                         property_record, match_score = match_result
                         match_method = 'owner_name'
@@ -185,6 +192,12 @@ class LisPendensLoader(BaseLoader):
                         if pd.notna(grantor_val):
                             plaintiff = str(grantor_val)[:500]
 
+                        # Primary defendant = first filtered grantee candidate.
+                        # _extract_owner_candidates() already strips noise like
+                        # UNKNOWN SPOUSE / MERS / AS TRUSTEE; the homeowner is
+                        # typically the first remaining name.
+                        defendant = grantee_candidates[0][:500] if grantee_candidates else None
+
                         # Check if a Foreclosure row already exists for this property
                         # (e.g. auction data loaded first from realforeclose.com)
                         existing = (
@@ -203,6 +216,9 @@ class LisPendensLoader(BaseLoader):
                                 updated = True
                             if existing.plaintiff is None and plaintiff:
                                 existing.plaintiff = plaintiff
+                                updated = True
+                            if existing.defendant is None and defendant:
+                                existing.defendant = defendant
                                 updated = True
                             if updated:
                                 try:
@@ -227,6 +243,7 @@ class LisPendensLoader(BaseLoader):
                                 property_id=property_record.id,
                                 case_number=synthetic_case,
                                 plaintiff=plaintiff,
+                                defendant=defendant,
                                 lis_pendens_date=lis_pendens_date,
                                 filing_date=lis_pendens_date,
                                 match_confidence=round(match_score / 100.0, 3),

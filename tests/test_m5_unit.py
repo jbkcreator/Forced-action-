@@ -415,3 +415,276 @@ class TestMatchRateMonitor:
             result = run_match_rate_monitor()
 
         assert result["rate"] is None
+
+
+# ---------------------------------------------------------------------------
+# Filing-derived name override (probate / eviction / divorce / lis pendens)
+# ---------------------------------------------------------------------------
+
+def _make_owner(owner_type="Individual", name="JOHN SMITH"):
+    """Build a mock Owner row used by the candidate query."""
+    owner = MagicMock()
+    owner.id = 1
+    owner.phone_1 = None
+    owner.email_1 = None
+    owner.skip_trace_success = None
+    owner.county_id = "hillsborough"
+    owner.owner_name = name
+    owner.owner_type = owner_type
+    owner.registered_agent_name = None
+    owner.registered_agent_address = None
+    return owner
+
+
+def _make_prop(prop_id=1):
+    """Build a mock Property row used by the candidate query."""
+    prop = MagicMock()
+    prop.id = prop_id
+    prop.address = "100 Test St"
+    prop.city = "Tampa"
+    prop.state = "FL"
+    prop.zip = "33601"
+    return prop
+
+
+def _make_filing_aware_session(
+    candidates,
+    probate_rows=None,
+    eviction_rows=None,
+    divorce_rows=None,
+    lp_rows=None,
+):
+    """
+    Build a MagicMock session whose `.all()` returns results in the order
+    that run_skip_trace() issues them inside its `with get_db_context()` block:
+        1. main candidate query  → (owner, prop) tuples
+        2. probate pre-fetch     → (property_id, name) tuples
+        3. eviction pre-fetch    → (property_id, name) tuples
+        4. divorce pre-fetch     → (property_id, name) tuples
+        5. lis pendens pre-fetch → (property_id, name) tuples
+    """
+    q = MagicMock()
+    q.join.return_value = q
+    q.filter.return_value = q
+    q.limit.return_value = q
+    q.group_by.return_value = q
+    q.order_by.return_value = q
+    q.subquery.return_value = MagicMock()
+    q.all.side_effect = [
+        candidates,
+        probate_rows or [],
+        eviction_rows or [],
+        divorce_rows or [],
+        lp_rows or [],
+    ]
+
+    session = MagicMock()
+    session.query.return_value = q
+    return session
+
+
+def _run_and_capture_payload(session, batch_call_side_effect=None):
+    """
+    Run skip_trace.run_skip_trace(limit=1) with the supplied mock session,
+    making `_call_batch_data` fail fast so we capture the payload sent
+    (mirrors the TestSkipTraceFailureAlerting pattern).
+    Returns (mock_call_batch_data, stats).
+    """
+    from contextlib import contextmanager
+
+    @contextmanager
+    def fake_ctx():
+        yield session
+
+    if batch_call_side_effect is None:
+        # Default: raise 402 so the function exits cleanly after the first
+        # _call_batch_data call. The mock still captures call_args.
+        batch_call_side_effect = RuntimeError("BatchData: out of credits (402)")
+
+    with patch("src.services.skip_trace.get_settings") as mock_settings, \
+         patch("src.services.skip_trace.get_db_context", side_effect=fake_ctx), \
+         patch("src.services.skip_trace._call_batch_data",
+               side_effect=batch_call_side_effect) as mock_call, \
+         patch("src.services.skip_trace.send_alert"):
+
+        mock_settings.return_value.batch_skip_tracing_api_key = MagicMock()
+        mock_settings.return_value.batch_skip_tracing_api_key.get_secret_value.return_value = "key"
+
+        stats = skip_trace_mod.run_skip_trace(limit=1)
+
+    return mock_call, stats
+
+
+class TestProbateHeirOverride:
+    """Probate heir (LegalProceeding.secondary_party) replaces deceased owner name."""
+
+    def test_individual_owner_uses_probate_heir_name(self):
+        """Individual owner + probate filing → heir's name in payload."""
+        owner, prop = _make_owner(name="JOHN DECEASED"), _make_prop()
+        session = _make_filing_aware_session(
+            candidates=[(owner, prop)],
+            probate_rows=[(prop.id, "Jane Heir")],
+        )
+        mock_call, _ = _run_and_capture_payload(session)
+
+        payload = mock_call.call_args[0][0][0]
+        assert payload["firstName"] == "Jane"
+        assert payload["lastName"] == "Heir"
+        assert payload["propertyAddress"]["street"] == "100 Test St"
+
+    def test_estate_owner_uses_probate_heir_name(self):
+        """Estate-type owner (no registered agent) + probate heir → heir traced."""
+        owner = _make_owner(owner_type="Estate", name="SMITH ESTATE")
+        prop = _make_prop()
+        session = _make_filing_aware_session(
+            candidates=[(owner, prop)],
+            probate_rows=[(prop.id, "Mary Beneficiary")],
+        )
+        mock_call, _ = _run_and_capture_payload(session)
+
+        payload = mock_call.call_args[0][0][0]
+        assert payload["firstName"] == "Mary"
+        assert payload["lastName"] == "Beneficiary"
+
+    def test_estate_owner_with_entity_heir_is_skipped(self):
+        """Estate + heir that is itself an entity → cannot trace, skipped."""
+        owner = _make_owner(owner_type="Trust", name="SMITH FAMILY TRUST")
+        prop = _make_prop()
+        session = _make_filing_aware_session(
+            candidates=[(owner, prop)],
+            probate_rows=[(prop.id, "ACME HOLDINGS LLC")],
+        )
+        mock_call, stats = _run_and_capture_payload(session)
+
+        # No payload sent because the only "heir" is an entity name.
+        assert not mock_call.called
+        assert stats["no_address"] >= 1
+
+
+class TestEvictionLandlordOverride:
+    """Eviction plaintiff (LegalProceeding.secondary_party, record_type='Eviction')."""
+
+    def test_individual_owner_uses_eviction_landlord_name(self):
+        owner, prop = _make_owner(name="LLC OWNED PROP"), _make_prop()
+        session = _make_filing_aware_session(
+            candidates=[(owner, prop)],
+            eviction_rows=[(prop.id, "Robert Landlord")],
+        )
+        mock_call, _ = _run_and_capture_payload(session)
+
+        payload = mock_call.call_args[0][0][0]
+        assert payload["firstName"] == "Robert"
+        assert payload["lastName"] == "Landlord"
+
+    def test_llc_owner_no_agent_uses_eviction_landlord(self):
+        """LLC owner with no registered agent → resolves to eviction landlord."""
+        owner = _make_owner(owner_type="LLC", name="MAIN ST LLC")
+        prop = _make_prop()
+        session = _make_filing_aware_session(
+            candidates=[(owner, prop)],
+            eviction_rows=[(prop.id, "Linda Plaintiff")],
+        )
+        mock_call, _ = _run_and_capture_payload(session)
+
+        payload = mock_call.call_args[0][0][0]
+        assert payload["firstName"] == "Linda"
+        assert payload["lastName"] == "Plaintiff"
+
+
+class TestDivorcePetitionerOverride:
+    """Divorce petitioner (LegalProceeding.associated_party, record_type='Divorce')."""
+
+    def test_individual_owner_uses_divorce_petitioner_name(self):
+        owner, prop = _make_owner(name="MARK SPOUSE"), _make_prop()
+        session = _make_filing_aware_session(
+            candidates=[(owner, prop)],
+            divorce_rows=[(prop.id, "Sarah Petitioner")],
+        )
+        mock_call, _ = _run_and_capture_payload(session)
+
+        payload = mock_call.call_args[0][0][0]
+        assert payload["firstName"] == "Sarah"
+        assert payload["lastName"] == "Petitioner"
+
+
+class TestLisPendensDefendantOverride:
+    """LP defendant (Foreclosure.defendant) — borrower being foreclosed."""
+
+    def test_individual_owner_uses_lp_defendant_name(self):
+        owner, prop = _make_owner(name="OWNER OF RECORD"), _make_prop()
+        session = _make_filing_aware_session(
+            candidates=[(owner, prop)],
+            lp_rows=[(prop.id, "David Defendant")],
+        )
+        mock_call, _ = _run_and_capture_payload(session)
+
+        payload = mock_call.call_args[0][0][0]
+        assert payload["firstName"] == "David"
+        assert payload["lastName"] == "Defendant"
+
+
+class TestFilingPriorityResolver:
+    """When multiple filings exist for one property, priority order applies:
+       Probate > Eviction > Divorce > LP."""
+
+    def test_probate_wins_over_eviction(self):
+        owner, prop = _make_owner(), _make_prop()
+        session = _make_filing_aware_session(
+            candidates=[(owner, prop)],
+            probate_rows=[(prop.id, "Probate Heir")],
+            eviction_rows=[(prop.id, "Eviction Landlord")],
+        )
+        mock_call, _ = _run_and_capture_payload(session)
+
+        payload = mock_call.call_args[0][0][0]
+        assert payload["firstName"] == "Probate"
+        assert payload["lastName"] == "Heir"
+
+    def test_eviction_wins_over_divorce(self):
+        owner, prop = _make_owner(), _make_prop()
+        session = _make_filing_aware_session(
+            candidates=[(owner, prop)],
+            eviction_rows=[(prop.id, "Eviction Landlord")],
+            divorce_rows=[(prop.id, "Divorce Petitioner")],
+        )
+        mock_call, _ = _run_and_capture_payload(session)
+
+        payload = mock_call.call_args[0][0][0]
+        assert payload["firstName"] == "Eviction"
+        assert payload["lastName"] == "Landlord"
+
+    def test_divorce_wins_over_lp(self):
+        owner, prop = _make_owner(), _make_prop()
+        session = _make_filing_aware_session(
+            candidates=[(owner, prop)],
+            divorce_rows=[(prop.id, "Divorce Petitioner")],
+            lp_rows=[(prop.id, "LP Defendant")],
+        )
+        mock_call, _ = _run_and_capture_payload(session)
+
+        payload = mock_call.call_args[0][0][0]
+        assert payload["firstName"] == "Divorce"
+        assert payload["lastName"] == "Petitioner"
+
+    def test_lp_used_when_no_higher_priority_filing(self):
+        owner, prop = _make_owner(), _make_prop()
+        session = _make_filing_aware_session(
+            candidates=[(owner, prop)],
+            lp_rows=[(prop.id, "LP Defendant")],
+        )
+        mock_call, _ = _run_and_capture_payload(session)
+
+        payload = mock_call.call_args[0][0][0]
+        assert payload["firstName"] == "LP"
+        assert payload["lastName"] == "Defendant"
+
+    def test_no_filings_falls_back_to_blind_address_lookup(self):
+        """Individual owner, no filings → payload has only propertyAddress."""
+        owner, prop = _make_owner(), _make_prop()
+        session = _make_filing_aware_session(candidates=[(owner, prop)])
+        mock_call, _ = _run_and_capture_payload(session)
+
+        payload = mock_call.call_args[0][0][0]
+        assert "firstName" not in payload
+        assert "lastName" not in payload
+        assert payload["propertyAddress"]["street"] == "100 Test St"
