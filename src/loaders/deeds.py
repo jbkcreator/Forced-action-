@@ -7,7 +7,13 @@ from typing import Tuple
 
 import pandas as pd
 
-from src.loaders.base import BaseLoader
+from src.loaders.base import (
+    BaseLoader,
+    MATCH_METHOD_LEGAL_DESC,
+    MATCH_METHOD_OWNER_NAME,
+    MATCH_METHOD_OWNER_ZIP,
+    MATCH_METHOD_OWNER_CITY,
+)
 from src.core.models import Deed
 
 logger = logging.getLogger(__name__)
@@ -76,15 +82,17 @@ class DeedLoader(BaseLoader):
                 )
                 if match_result:
                     property_record, match_score = match_result
-                    match_method = 'legal_desc'
+                    match_method = MATCH_METHOD_LEGAL_DESC
                     logger.info(f"Matched deed by legal desc (score: {match_score}%): {instrument}")
 
-            # Strategy B: Grantor (seller) name — comma-split handles multi-grantor/trust fields
+            # Strategy B: Grantor (seller) name — comma-split handles multi-grantor/trust fields.
+            # Deed source has no address column → cascade reduces to stage 5 (owner_name).
+            # find_property_by_owner_name_multi is retained for the comma-split semantics.
             if not property_record and pd.notna(row.get('Grantor')):
                 match_result = self.find_property_by_owner_name_multi(row['Grantor'], threshold=self._thresholds.owner_name_floor)
                 if match_result:
                     property_record, match_score = match_result
-                    match_method = 'owner_name'
+                    match_method = MATCH_METHOD_OWNER_NAME
                     logger.info(f"Matched deed by grantor (score: {match_score}%): {instrument}")
                     property_record, llm_method = self._apply_llm_verification(
                         raw_row=row.to_dict() if hasattr(row, 'to_dict') else dict(row),
@@ -99,7 +107,7 @@ class DeedLoader(BaseLoader):
                 match_result = self.find_property_by_owner_name_multi(row['Grantee'], threshold=self._thresholds.owner_name_floor)
                 if match_result:
                     property_record, match_score = match_result
-                    match_method = 'owner_name'
+                    match_method = MATCH_METHOD_OWNER_NAME
                     logger.info(f"Matched deed by grantee (score: {match_score}%): {instrument}")
                     property_record, llm_method = self._apply_llm_verification(
                         raw_row=row.to_dict() if hasattr(row, 'to_dict') else dict(row),

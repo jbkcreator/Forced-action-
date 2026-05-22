@@ -28,7 +28,7 @@ import requests
 from requests.exceptions import ConnectionError, Timeout, RequestException
 
 from config.settings import settings
-from config.scoring import ROUTING_THRESHOLDS
+from config.scoring import ROUTING_THRESHOLDS, for_county
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +165,15 @@ def _upsert_contact(score_data: Dict) -> Optional[str]:
     first_name = name_parts[0] if name_parts else "Unknown"
     last_name = name_parts[1] if len(name_parts) > 1 else "Owner"
 
+    # Counties whose tier distribution isn't yet cross-county-comparable
+    # (set via config.scoring.COUNTY_OVERRIDES) flag tier_visibility="internal".
+    # Suppress the tier and urgency custom fields downstream so GHL workflows
+    # don't act on labels that don't carry consistent meaning yet.
+    _cfg = for_county(score_data.get("county_id"))
+    _tier_visible = _cfg.tier_visibility != "internal"
+    _tier_field_value = score_data.get("lead_tier") or "" if _tier_visible else ""
+    _urgency_field_value = score_data.get("urgency_level") or "" if _tier_visible else ""
+
     payload = {
         "locationId":  settings.ghl_location_id,
         "firstName":   first_name,
@@ -176,8 +185,8 @@ def _upsert_contact(score_data: Dict) -> Optional[str]:
         "customFields": [
             {"id": "CyqT2fZ2VS9hANAKqDFB", "value": str(score_data.get("parcel_id") or "")},
             {"id": "eApA0zTDLatkrEjiRsSj", "value": str(score_data.get("final_cds_score") or 0)},
-            {"id": "x2gdIlD8v1mMTt1kZKEI", "value": score_data.get("lead_tier") or ""},
-            {"id": "3AHU9KWEyXaDNKFy3azC", "value": score_data.get("urgency_level") or ""},
+            {"id": "x2gdIlD8v1mMTt1kZKEI", "value": _tier_field_value},
+            {"id": "3AHU9KWEyXaDNKFy3azC", "value": _urgency_field_value},
             {"id": "QrohTQclVzyGNdeX31K9", "value": _best_vertical(score_data)},
             {"id": "9biCuTixgCWZ6HZcemig", "value": ", ".join(_top_signals(score_data))},
             {"id": "minc73GThMkfiTp6cXCv", "value": str(score_data.get("signal_count") or 0)},
@@ -215,10 +224,16 @@ def _upsert_contact(score_data: Dict) -> Optional[str]:
             {"id": "U4AVIb21Q1ScMTEKtZuD", "value": f"{score_data['lot_size']:.2f} acres" if score_data.get("lot_size") else ""},
         ],
         "tags": [
-            f"cds-{score_data.get('lead_tier', '').lower().replace(' ', '-')}",
+            *( [f"cds-{score_data.get('lead_tier', '').lower().replace(' ', '-')}"] if _tier_visible else [] ),
             f"vertical-{_best_vertical(score_data)}",
             "distressed-property",
-            *( ["synthflow-suppress"] if score_data.get("lead_tier") == "Silver" else ["synthflow-eligible"] ),
+            # Tier-driven Synthflow gating is paused for internal-visibility
+            # counties — the label can't be trusted to decide AI calling.
+            *(
+                ( ["synthflow-suppress"] if score_data.get("lead_tier") == "Silver"
+                  else ["synthflow-eligible"] )
+                if _tier_visible else []
+            ),
         ],
     }
     if phone:

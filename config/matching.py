@@ -39,7 +39,13 @@ COUNTY_OVERRIDES: dict[str, MatchingThresholds] = {
     "pinellas": MatchingThresholds(
         auto_match=0.92,          # unchanged — never auto-match weak hits
         review_min=0.65,          # widened pending_review band (was 0.75)
-        address_floor=65,
+        # Per-method floor split (2026-05-22): address-method matches against
+        # Pinellas filings tend to score 5-10 points lower than owner-name
+        # because filings sometimes pack legal descriptions or partial address
+        # strings into the address field. Lowering the address floor surfaces
+        # weak candidates for Cora triage; owner_name and legal_desc stay at
+        # 65 because their score distributions are well-calibrated.
+        address_floor=60,
         owner_name_floor=65,
         legal_desc_floor=65,
     ),

@@ -183,6 +183,14 @@ class AppSettings(BaseSettings):
 	# Contact enrichment (M1)
 	batch_skip_tracing_api_key: Optional[SecretStr] = Field(default=None, env="BATCH_SKIP_TRACING_API_KEY")
 	idi_api_key: Optional[SecretStr] = Field(default=None, env="IDI_API_KEY")
+	# Multi-heir probate enrichment (default OFF).
+	# When True, skip-trace enumerates every named heir from
+	# legal_proceedings.meta_data->'heirs' for probate-derived leads instead of
+	# only the first heir (secondary_party). Capped at MAX_HEIRS_PER_PROPERTY
+	# to bound BatchData spend (200/day quota). Enable only after the audit at
+	# `scripts/_probate_multi_heir_audit.py` confirms >20% multi-heir prevalence.
+	multi_heir_enrichment_enabled: bool = Field(default=False, env="MULTI_HEIR_ENRICHMENT_ENABLED")
+	max_heirs_per_property: int = Field(default=5, env="MAX_HEIRS_PER_PROPERTY")
 
 	# SMTP (used by welcome email, payment receipts, grace period alerts)
 	smtp_host: Optional[str] = Field(default=None, env="SMTP_HOST")

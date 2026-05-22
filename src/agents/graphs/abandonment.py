@@ -34,6 +34,7 @@ from typing import Any, Dict, Optional, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
+from config.scoring import for_county
 from src.agents.prompts.loader import (
 	load_prompt,
 	render,
@@ -41,6 +42,12 @@ from src.agents.prompts.loader import (
 	render_for_subscriber_auto,
 	render_system_and_user,
 )
+
+
+# Phrase used in place of the tier label when the subscriber's county is
+# flagged tier_visibility="internal" (Pinellas pre-retune). Keep in sync
+# with the FOMO graph constant.
+_TIER_SUPPRESSED_PHRASE = "matching"
 
 
 def _format_variant_id(test_name: Optional[str], variant: Optional[str]) -> Optional[str]:
@@ -333,10 +340,17 @@ def _wave2_build_context(state: AbandonmentState) -> AbandonmentState:
 	payload = state.get("event_payload") or {}
 	zip_activity = state.get("zip_activity") or {}
 
+	_county_cfg = for_county(profile.get("county_id"))
+	_tier_viewed = (
+		_TIER_SUPPRESSED_PHRASE
+		if _county_cfg.tier_visibility == "internal"
+		else payload.get("lead_tier_viewed", "Gold")
+	)
+
 	ctx = {
 		"subscriber_first_name": (profile.get("name") or "there").split(" ")[0],
 		"first_name": (profile.get("name") or "there").split(" ")[0],
-		"lead_tier_viewed": payload.get("lead_tier_viewed", "Gold"),
+		"lead_tier_viewed": _tier_viewed,
 		"other_viewers_count": zip_activity.get("active_viewers", 0),
 		"wall_countdown_minutes": payload.get("wall_countdown_minutes", 2),
 		"unlock_link": f"https://app.forcedaction.io/feed/{profile.get('id')}",

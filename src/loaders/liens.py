@@ -7,7 +7,15 @@ from typing import Optional, Tuple
 
 import pandas as pd
 
-from src.loaders.base import BaseLoader
+from src.loaders.base import (
+    BaseLoader,
+    MATCH_METHOD_LEGAL_DESC,
+    MATCH_METHOD_OWNER_NAME,
+    MATCH_METHOD_OWNER_ZIP,
+    MATCH_METHOD_OWNER_CITY,
+    MATCH_METHOD_NORM_ADDR,
+)
+from src.loaders._address_utils import split_address
 from src.core.models import LegalAndLien
 
 logger = logging.getLogger(__name__)
@@ -177,7 +185,9 @@ class LienLoader(BaseLoader):
             self.stats_by_doc_type[_doc_type_label]['total'] += 1
 
             # Check for duplicates
-            if skip_duplicates and self.check_duplicate(LegalAndLien, {'instrument_number': instrument}):
+            # DB unique constraint on instrument_number is single-column (no county_id),
+            # so dedup must match that scope to avoid UniqueViolation on cross-county dupes.
+            if skip_duplicates and self.check_duplicate(LegalAndLien, {'instrument_number': instrument}, scope_county=False):
                 logger.debug(f"Skipping duplicate lien: {instrument}")
                 self.stats_by_doc_type[_doc_type_label]['skipped'] += 1
                 skipped += 1
@@ -210,7 +220,7 @@ class LienLoader(BaseLoader):
                 )
                 if match_result:
                     property_record, score = match_result
-                    match_method = 'legal_desc'
+                    match_method = MATCH_METHOD_LEGAL_DESC
                     match_score = score
                     match_field = 'Legal'
                     logger.info(f"Matched lien by legal desc (score: {score}%): {instrument}")
@@ -231,7 +241,7 @@ class LienLoader(BaseLoader):
                 match_result = self.find_property_by_owner_name(row['Grantee'], threshold=name_threshold)
                 if match_result:
                     property_record, score = match_result
-                    match_method = 'owner_name'
+                    match_method = MATCH_METHOD_OWNER_NAME
                     match_score = score
                     match_field = 'Grantee'
                     logger.info(f"Matched tax lien by grantee/owner name (score: {score}%): {instrument}")
@@ -288,7 +298,10 @@ class LienLoader(BaseLoader):
                     )
                     if match_result:
                         property_record, score = match_result
-                        match_method = 'owner_name'
+                        # Code liens filter candidates by property.city == hardcoded
+                        # lien-city (TAMPA for TCL, etc.), so the granular method is
+                        # owner_name_city — not the generic owner_name.
+                        match_method = MATCH_METHOD_OWNER_CITY
                         match_score = score
                         match_field = owner_field_used
                         logger.info(
@@ -312,7 +325,7 @@ class LienLoader(BaseLoader):
                     match_result = self.find_property_by_owner_name(row[first_field], threshold=name_threshold)
                     if match_result:
                         property_record, score = match_result
-                        match_method = 'owner_name'
+                        match_method = MATCH_METHOD_OWNER_NAME
                         match_score = score
                         match_field = first_field
                         logger.info(f"Matched lien by {first_field.lower()} name (score: {score}%, threshold: {name_threshold}%): {instrument}")
@@ -321,7 +334,7 @@ class LienLoader(BaseLoader):
                     match_result = self.find_property_by_owner_name(row[second_field], threshold=name_threshold)
                     if match_result:
                         property_record, score = match_result
-                        match_method = 'owner_name'
+                        match_method = MATCH_METHOD_OWNER_NAME
                         match_score = score
                         match_field = second_field
                         logger.info(f"Matched lien by {second_field.lower()} name (score: {score}%, threshold: {name_threshold}%): {instrument}")
@@ -329,7 +342,10 @@ class LienLoader(BaseLoader):
             # LLM verification — applied to all name-matched liens in the borderline
             # score range (80-94%), with record-type context so Claude understands
             # the party roles. Geographic validation stays in _find_code_lien_owner().
-            if property_record is not None and match_score is not None and match_method == 'owner_name':
+            # LLM verifies any owner-name based match (including zip- or city-scoped)
+            if property_record is not None and match_score is not None and match_method in (
+                MATCH_METHOD_OWNER_NAME, MATCH_METHOD_OWNER_ZIP, MATCH_METHOD_OWNER_CITY,
+            ):
                 lien_rt = (
                     'lien_tcl'  if 'TCL' in doc_type_upper else
                     'lien_ccl'  if 'CCL' in doc_type_upper else

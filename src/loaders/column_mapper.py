@@ -120,6 +120,28 @@ SIGNAL_SCHEMAS: dict[str, list[str]] = {
         "CaseNumber", "PartyType", "LastName/CompanyName", "FirstName", "MiddleName",
         "FilingDate", "PartyAddress", "Title", "CaseTypeDescription",
     ],
+    "property_appraiser": [
+        # Identity
+        "parcel_id", "owner_name", "mailing_address", "site_address",
+        # Valuations
+        "market_value", "county_assessed_value", "school_assessed_value",
+        "county_taxable_value", "school_taxable_value",
+        "soh_assessment_reduction", "exemption_code",
+        # Building characteristics
+        "year_built", "building_condition", "building_class",
+        "heated_sq_ft", "gross_sq_ft", "beds", "baths",
+        "lot_size", "land_value", "legal_description",
+        "subdivision", "neighborhood_code", "property_use_code",
+        # Sales history
+        "last_sale_date", "last_sale_price", "last_sale_type", "last_sale_qualified",
+        "last_sale_vacant_improved",
+        # TRIM forward-looking
+        "prior_year_market_value", "proposed_next_assessed",
+        # Tax collector
+        "tax_status", "tax_last_paid_amount", "tax_last_paid_date",
+        # Extra features (JSONB blob)
+        "building_details",
+    ],
 }
 
 # Human-readable descriptions for LLM prompts, keyed by canonical column name.

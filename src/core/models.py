@@ -73,6 +73,16 @@ class Property(Base):
     # Legal Information
     legal_description: Mapped[Optional[str]] = mapped_column(Text)
 
+    # HCPA Enrichment — property classification
+    property_use_code: Mapped[Optional[str]] = mapped_column(String(20))       # e.g. "0100" SFR, "0200" condo
+    building_condition: Mapped[Optional[str]] = mapped_column(String(20))      # Average / Fair / Poor / Good / Excellent
+    building_class: Mapped[Optional[str]] = mapped_column(String(5))           # A / B / C / M
+    heated_sq_ft: Mapped[Optional[float]] = mapped_column(Numeric(10, 2))      # heated living area; sq_ft may be gross
+    subdivision: Mapped[Optional[str]] = mapped_column(String(255))
+    hcpa_neighborhood_code: Mapped[Optional[str]] = mapped_column(String(50))
+    building_details: Mapped[Optional[dict]] = mapped_column(JSONB)            # roof, walls, sub-areas, extra features
+    hcpa_last_refreshed: Mapped[Optional[datetime]] = mapped_column(DateTime)  # NULL = never enriched
+
     # Multi-county
     county_id: Mapped[Optional[str]] = mapped_column(String(50), default='hillsborough', index=True)
 
@@ -97,6 +107,7 @@ class Property(Base):
     building_permits: Mapped[List["BuildingPermit"]] = relationship("BuildingPermit", back_populates="property", cascade="all, delete-orphan")
     incidents: Mapped[List["Incident"]] = relationship("Incident", back_populates="property", cascade="all, delete-orphan")
     distress_scores: Mapped[List["DistressScore"]] = relationship("DistressScore", back_populates="property", cascade="all, delete-orphan")
+    tax_payment_history: Mapped[List["TaxPaymentHistory"]] = relationship("TaxPaymentHistory", back_populates="property", cascade="all, delete-orphan")
 
     # Indexes
     __table_args__ = (
@@ -106,6 +117,9 @@ class Property(Base):
         Index("idx_property_zip", "zip"),
         Index("idx_property_county_id", "county_id"),
         Index("idx_property_sync_status", "sync_status"),
+        Index("idx_property_hcpa_refreshed", "hcpa_last_refreshed"),
+        Index("idx_property_building_condition", "building_condition"),
+        Index("idx_property_building_details", "building_details", postgresql_using="gin"),
         CheckConstraint("sync_status IN ('pending', 'pending_sync', 'synced', 'sync_failed', 'error')", name="check_sync_status"),
     )
 
@@ -219,6 +233,18 @@ class Financial(Base):
     price_per_sq_ft: Mapped[Optional[float]] = mapped_column(Numeric(8, 2))
     annual_tax_amount: Mapped[Optional[float]] = mapped_column(Numeric(10, 2))
     homestead_exempt: Mapped[Optional[bool]] = mapped_column(Boolean, default=False)
+
+    # HCPA Enrichment — exemptions, SOH cap, tax status
+    exemption_code: Mapped[Optional[str]] = mapped_column(String(10))
+    soh_assessment_reduction: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
+    taxable_value_county: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
+    taxable_value_schools: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
+    prior_year_market_value: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
+    proposed_next_assessed: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
+    tax_current_status: Mapped[Optional[str]] = mapped_column(String(20))
+    tax_last_paid_amount: Mapped[Optional[float]] = mapped_column(Numeric(10, 2))
+    tax_last_paid_date: Mapped[Optional[date]] = mapped_column(Date)
+    hcpa_refreshed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
     # Investment Metrics (API Gap)
     est_repair_cost: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
@@ -388,6 +414,10 @@ class Deed(Base):
     
     # Legal description
     legal_description: Mapped[Optional[str]] = mapped_column(Text)
+
+    # HCPA Enrichment — sale qualification
+    sale_qualified: Mapped[Optional[bool]] = mapped_column(Boolean)
+    vacant_improved: Mapped[Optional[str]] = mapped_column(String(20))
 
     # Match provenance
     match_confidence: Mapped[Optional[Decimal]] = mapped_column(Numeric(4, 3), nullable=True)  # 0.000–1.000
@@ -1157,9 +1187,19 @@ class EnrichedContact(Base):
     llc_owner_name: Mapped[Optional[str]] = mapped_column(String(255))
     relative_contacts: Mapped[Optional[dict]] = mapped_column(JSONB)  # relative contact chain
 
+    # Full raw API response — stored so callers can re-parse without another API call
+    raw_response: Mapped[Optional[dict]] = mapped_column(JSONB)
+
     # Source tracking
     source: Mapped[str] = mapped_column(String(50), nullable=False)   # batch_skip_tracing | idi
     match_success: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    # Which named individual was traced. NULL for legacy single-trace rows
+    # (assessor owner or first heir). Populated when MULTI_HEIR_ENRICHMENT
+    # produces one row per heir for a probate-derived lead — the name acts as
+    # the discriminator that lets multiple rows share property_id without
+    # collapsing into the same person.
+    traced_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
     # Audit
     enriched_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
@@ -1240,10 +1280,11 @@ class ScraperRunStats(Base):
         Index("idx_run_stats_date_source", "run_date", "source_type"),
         CheckConstraint(
             "source_type IN ("
-            "'lien_tcl', 'lien_ccl', 'lien_hoa', 'lien_ml', 'lien_tl', 'lis_pendens',"
+            "'lien_tcl', 'lien_ccl', 'lien_hoa', 'lien_ml', 'lien_tl', 'lien_unknown', 'lis_pendens',"
             "'judgments', 'deeds', 'evictions', 'divorce_filings', 'probate', 'bankruptcy',"
             "'violations', 'foreclosures', 'permits', 'tax_delinquencies',"
-            "'roofing_permits', 'storm_damage', 'flood_damage', 'insurance_claims', 'fire_incidents'"
+            "'roofing_permits', 'storm_damage', 'flood_damage', 'insurance_claims', 'fire_incidents',"
+            "'sunbiz', 'property_appraiser'"
             ")",
             name="check_run_stats_source_type",
         ),
@@ -2726,4 +2767,45 @@ class CountyLaunchAudit(Base):
 
     def __repr__(self) -> str:
         return f"<CountyLaunchAudit(id={self.id}, county={self.county_id}, event={self.event_type})>"
+
+
+# ============================================================================
+# HCPA ENRICHMENT — TAX PAYMENT HISTORY
+# ============================================================================
+
+class TaxPaymentHistory(Base):
+    """
+    Annual tax payment records scraped from Hillsborough County Tax Collector.
+    One property can have multiple rows (one per tax year / bill type).
+    UniqueConstraint prevents duplicate ingestion on re-runs.
+    """
+    __tablename__ = "tax_payment_history"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+
+    property_id: Mapped[int] = mapped_column(ForeignKey("properties.id"), nullable=False, index=True)
+
+    tax_year: Mapped[int] = mapped_column(Integer, nullable=False)
+    bill_type: Mapped[Optional[str]] = mapped_column(String(50))   # Annual / Homestead Penalty / Tangible Personal Property
+    amount_paid: Mapped[Optional[float]] = mapped_column(Numeric(10, 2))
+    payment_date: Mapped[Optional[date]] = mapped_column(Date)
+    receipt_number: Mapped[Optional[str]] = mapped_column(String(50))
+    days_late: Mapped[Optional[int]] = mapped_column(Integer)      # negative = paid early; 0 = on time; positive = late
+
+    # Multi-county
+    county_id: Mapped[str] = mapped_column(String(50), default='hillsborough', nullable=False)
+    date_added: Mapped[Optional[date]] = mapped_column(Date, default=date.today)
+
+    # Relationship
+    property: Mapped["Property"] = relationship("Property", back_populates="tax_payment_history")
+
+    __table_args__ = (
+        UniqueConstraint("property_id", "tax_year", "bill_type", name="uq_tax_payment_property_year_type"),
+        Index("idx_tax_payment_property_year", "property_id", "tax_year"),
+        Index("idx_tax_payment_date", "payment_date"),
+        Index("idx_tax_payment_bill_type", "bill_type"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<TaxPaymentHistory(id={self.id}, property_id={self.property_id}, year={self.tax_year}, paid={self.amount_paid})>"
 

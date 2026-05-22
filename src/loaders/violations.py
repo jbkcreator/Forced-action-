@@ -7,7 +7,11 @@ from typing import Optional, Tuple
 
 import pandas as pd
 
-from src.loaders.base import BaseLoader
+from src.loaders.base import (
+    BaseLoader,
+    MATCH_METHOD_NORM_ADDR,
+)
+from src.loaders._address_utils import split_address
 from src.core.models import CodeViolation, CountySource
 
 logger = logging.getLogger(__name__)
@@ -187,17 +191,27 @@ class ViolationLoader(BaseLoader):
                 skipped += 1
                 continue
             
-            # Match by address
+            # ── Cascade match (address only — violations have no owner name) ──
+            # The cascade extracts zip from the address and lets find_property_by_address
+            # use that to narrow candidates. Records the granular 'normalized_address'
+            # match method (vs the old 'address' string).
             property_record = None
             match_score = 0
+            match_method_val = None
             if pd.notna(row.get('Address')):
-                match_result = self.find_property_by_address(row['Address'], threshold=self._thresholds.address_floor)
-                if match_result:
-                    property_record, match_score = match_result
-                    logger.info(f"Matched violation by address (score: {match_score}%): {record_number}")
+                _, city_v, zip_v = split_address(str(row['Address']))
+                prop, method, score = self.find_property_cascade(
+                    address=str(row['Address']),
+                    zip_code=zip_v,
+                    city=city_v,
+                    addr_threshold=self._thresholds.address_floor,
+                )
+                if prop:
+                    property_record, match_method_val, match_score = prop, method, score
+                    logger.info(f"Matched violation by {method} (score: {score}%): {record_number}")
 
             if property_record:
-                tier = self._classify_match(match_score, 'address')
+                tier = self._classify_match(match_score, match_method_val)
                 if tier == "matched":
                     try:
                         # Map CSV columns to database fields:
@@ -252,7 +266,7 @@ class ViolationLoader(BaseLoader):
                             fine_amount=fine_amount_val,
                             is_lien=is_lien_val,
                             match_confidence=round(match_score / 100.0, 3),
-                            match_method='address',
+                            match_method=match_method_val or MATCH_METHOD_NORM_ADDR,
                             county_id=self.county_id,
                         )
 
@@ -274,7 +288,7 @@ class ViolationLoader(BaseLoader):
                         match_status="pending_review",
                         match_confidence=match_score / 100.0,
                         candidate_property_id=property_record.id,
-                        match_method='address',
+                        match_method=match_method_val or MATCH_METHOD_NORM_ADDR,
                     )
                     unmatched += 1
             else:

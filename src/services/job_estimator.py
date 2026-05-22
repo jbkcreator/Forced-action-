@@ -47,8 +47,7 @@ _SIGNAL_COST_PER_SQFT = {
     "irs_tax_liens":       (0, 0),
     "hoa_liens":           (0, 0),
     "mechanics_liens":     (3.00,  6.00),    # Indicates prior repair scope
-    "county_code_liens":   (2.00,  5.00),
-    "tampa_code_liens":    (2.00,  5.00),
+    "code_lien":           (2.00,  5.00),    # Unified TCL/CCL/CODE LIEN (Stage 1)
     # Code violations — repair cost depends on severity
     "code_violations":     (2.00,  8.00),    # Wide range: $4K–$16K
     # Proceedings

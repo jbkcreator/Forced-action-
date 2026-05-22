@@ -115,7 +115,7 @@ COUNTY_ID=hillsborough
 # P7. Foreclosure Auctions   — 06:20 AM UTC daily (every day, not just Mon-Sat)
 20 6 * * * $PROJECT/scripts/cron/run.sh src.scrappers.foreclosures.foreclosure_engine --date $(date +\%Y-\%m-\%d) --load-to-db --county-id pinellas
 
-# P8. Skip Tracing (Pinellas) — 07:38 AM UTC Mon-Sat (after CDS rescore-all 07:00)
+# P8. Skip Tracing (Pinellas) — 07:38 AM UTC Mon-Sat (after CDS --rescore-new-signals at 07:00)
 38 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.run_enrichment pinellas --limit 500
 
 # 17. Lead Quality Monitor — 07:35 AM UTC Mon-Sat (after CDS scoring at 07:00, skip tracing at 07:30)
@@ -149,7 +149,7 @@ COUNTY_ID=hillsborough
 
 # ── CDS SCORING ──────────────────────────────────────────────
 # CDS Scoring Engine         — 07:00 AM UTC Mon-Sat (after all scrapers complete)
-0 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.services.cds_engine --rescore-all
+0 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.services.cds_engine --rescore-new-signals
 
 # ── STRIPE RECONCILIATION ────────────────────────────────────
 # Daily reconciliation Mon-Sat — catch any subscribers who paid but weren't activated
@@ -190,7 +190,7 @@ COUNTY_ID=hillsborough
 30 9 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.daily_report
 
 # ── HEALTH CHECK — every 4 hours (logs to separate file for monitoring)
-0 2,6,10,14,18,22 * * * cd /opt/forced-action && python -m src.tasks.health_check >> /var/log/fa-health.log 2>&1
+0 2,6,10,14,18,22 * * * $PROJECT/scripts/cron/run.sh src.tasks.health_check
 
 # Unmatched record rematch — Sunday 03:30 AM UTC
 30 3 * * 0 $PROJECT/scripts/cron/run.sh src.tasks.rematch_unmatched
@@ -239,15 +239,17 @@ COUNTY_ID=hillsborough
 0 16 * * * $PROJECT/scripts/cron/run.sh src.tasks.retention_event_producer
 
 # ── CORA GATE OBSERVABILITY ──────────────────────────────────────────────────
-# Kill-switch metric ingest — daily 06:00 UTC. Queries DB for live business
-# metrics (first_payment_rate, retention_30d, etc.) and caches in Redis (25hr TTL)
-# so agent graphs can call kill_switch_status() with real observed values.
-0 6 * * * $PROJECT/scripts/cron/run.sh src.tasks.kill_switch_metric_ingest
+# Kill-switch metric ingest — every 6h at 00:00, 06:00, 12:00, 18:00 UTC.
+# Queries DB for live business metrics (first_payment_rate, retention_30d, etc.)
+# and caches in Redis (25hr TTL) so agent graphs can call kill_switch_status()
+# with real observed values.
+0 0,6,12,18 * * * $PROJECT/scripts/cron/run.sh src.tasks.kill_switch_metric_ingest
 
-# Gate metrics aggregator — daily 07:00 UTC (after metric ingest at 06:00).
+# Gate metrics aggregator — every 6h at 01:00, 07:00, 13:00, 19:00 UTC
+# (always 1h after the metric ingest above so the cache is warm).
 # Rolls up agent_decisions into per-graph pass/fail/abort rates; logs alerts
 # when any graph pass rate drops below 90%.
-0 7 * * * $PROJECT/scripts/cron/run.sh src.tasks.gate_metrics_aggregator
+0 1,7,13,19 * * * $PROJECT/scripts/cron/run.sh src.tasks.gate_metrics_aggregator
 
 # AutoPilot Pro upsell — daily 09:15 UTC. Finds Lite subscribers with 30+ days
 # tenure and 30-day close rate >=15%; sends one-tap upgrade offer (14-day cooldown).
@@ -279,13 +281,13 @@ COUNTY_ID=hillsborough
 # key buckets by ISO week so each subscriber still fires at most once per week.
 0 14 * * * $PROJECT/scripts/cron/run.sh src.tasks.ap_lite_sweep
 
-# Wallet-to-Lock sweep — daily 13:30 UTC (before annual_push 14:00).
+# Wallet-to-Lock sweep — daily 13:30 UTC.
 30 13 * * * $PROJECT/scripts/cron/run.sh src.tasks.wallet_to_lock_sweep
 
-# Synthflow voice drop sweep — weekdays 15:00 UTC (after proactive_save 15:00).
+# Synthflow voice drop sweep — weekdays 15:00 UTC (after proactive_save at 10:00).
 0 15 * * 1-5 $PROJECT/scripts/cron/run.sh src.tasks.synthflow_voice_drop_sweep
 
-# Stripe recovery sequence (Day 1 + Day 3) — daily 16:00 UTC, after proactive_save 15:00.
+# Stripe recovery sequence (Day 1 + Day 3) — daily 16:00 UTC, after proactive_save at 10:00.
 0 16 * * * $PROJECT/scripts/cron/run.sh src.tasks.stripe_recovery_sweep
 
 # Accelerated Wallet Push sweep (fa016) — every 5 minutes. Safety net for

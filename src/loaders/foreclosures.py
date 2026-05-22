@@ -7,7 +7,15 @@ from typing import Optional, Tuple
 
 import pandas as pd
 
-from src.loaders.base import BaseLoader
+from src.loaders.base import (
+    BaseLoader,
+    MATCH_METHOD_PARCEL_ID,
+    MATCH_METHOD_NORM_ADDR,
+    MATCH_METHOD_OWNER_NAME,
+    MATCH_METHOD_OWNER_ZIP,
+    MATCH_METHOD_OWNER_CITY,
+)
+from src.loaders._address_utils import split_address
 from src.core.models import Foreclosure
 
 logger = logging.getLogger(__name__)
@@ -106,25 +114,34 @@ class ForeclosureLoader(BaseLoader):
         for _, row in df.iterrows():
             case_number = str(row['Case Number']).strip()
 
-            # Try parcel ID first (exact match — always auto-matched at 1.0)
+            # ── Cascade match ─────────────────────────────────────────────
+            # Foreclosures have Parcel ID + Property Address. Some records may
+            # also include a Defendant name (fa028) — use it if present.
             property_record = None
             match_score = 0
             match_method = None
-            if pd.notna(row.get('Parcel ID')):
-                property_record = self.find_property_by_parcel_id(row['Parcel ID'])
-                if property_record:
-                    match_score = 100
-                    match_method = 'parcel_id'
 
-            # Fallback to address matching
-            if not property_record and pd.notna(row.get('Property Address')):
-                match_result = self.find_property_by_address(
-                    row['Property Address'], threshold=self._thresholds.address_floor,
-                )
-                if match_result:
-                    property_record, match_score = match_result
-                    match_method = 'address'
-                    logger.info(f"Matched foreclosure by address (score: {match_score}%): {case_number}")
+            addr_val = row.get('Property Address')
+            addr_str = str(addr_val) if pd.notna(addr_val) else None
+            zip_v = city_v = None
+            if addr_str:
+                _, city_v, zip_v = split_address(addr_str)
+
+            defendant_val = row.get('Defendant') if 'Defendant' in row else None
+            defendant_str = str(defendant_val).strip() if pd.notna(defendant_val) else None
+
+            prop, method, score = self.find_property_cascade(
+                parcel_id=str(row.get('Parcel ID')).strip() if pd.notna(row.get('Parcel ID')) else None,
+                address=addr_str,
+                owner_name=defendant_str,
+                zip_code=zip_v,
+                city=city_v,
+                addr_threshold=self._thresholds.address_floor,
+                owner_threshold=self._thresholds.owner_name_floor,
+            )
+            if prop:
+                property_record, match_method, match_score = prop, method, score
+                logger.info(f"Matched foreclosure by {method} (score: {score}%): {case_number}")
 
             if property_record:
                 tier = self._classify_match(match_score, match_method)
