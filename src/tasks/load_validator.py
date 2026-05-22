@@ -41,6 +41,10 @@ _CONSECUTIVE_DAYS_ALERT = 2 # alert after N consecutive low days
 # Minimum baseline average before we bother checking (ignore brand-new scrapers)
 _MIN_BASELINE_AVG = 3
 
+# Match-rate alerting: fire immediately when any scraper drops below this threshold
+_MATCH_RATE_THRESHOLD = 0.50     # 50%
+_MATCH_RATE_MIN_SAMPLE = 10      # skip scrapers with fewer than 10 new records (matched+unmatched)
+
 _STATE_FILE = Path(__file__).parent.parent.parent / "data" / "load_validator_state.json"
 
 # Missing-scraper detection lives in src/tasks/heartbeat_monitor.py
@@ -151,6 +155,34 @@ def _get_failed_runs(session, county_id: str, run_date: date) -> list:
     ]
 
 
+def _check_match_rates(today_rows: list) -> list:
+    """
+    Return alert lines for scrapers whose match rate is below _MATCH_RATE_THRESHOLD.
+
+    Denominator is matched + unmatched (excludes skipped/dupes), same formula used in
+    daily_report.py. Scrapers with fewer than _MATCH_RATE_MIN_SAMPLE new records are
+    skipped to avoid false alarms on quiet days.
+    """
+    low_rate_lines = []
+    for row in today_rows:
+        new_records = row.matched + row.unmatched
+        if new_records < _MATCH_RATE_MIN_SAMPLE:
+            continue
+        rate = row.matched / new_records
+        if rate < _MATCH_RATE_THRESHOLD:
+            low_rate_lines.append(
+                f"  {row.source_type}: {rate*100:.0f}% match rate "
+                f"({row.matched} matched / {new_records} new records)"
+            )
+            logger.warning(
+                "[LoadValidator] %s: match rate %.0f%% below %.0f%% threshold "
+                "(%d matched / %d new records)",
+                row.source_type, rate * 100, _MATCH_RATE_THRESHOLD * 100,
+                row.matched, new_records,
+            )
+    return low_rate_lines
+
+
 def run_load_validator(county_id: str = "hillsborough") -> dict:
     """
     Validate today's scraper loads against 7-day rolling baseline.
@@ -159,7 +191,7 @@ def run_load_validator(county_id: str = "hillsborough") -> dict:
         dict with keys: anomalies (list), failed_runs (list), alerts_sent (int)
     """
     today = date.today()
-    results = {"anomalies": [], "zero_record_scrapers": [], "failed_runs": [], "alerts_sent": 0, "checked_date": str(today)}
+    results = {"anomalies": [], "zero_record_scrapers": [], "low_match_rate_scrapers": [], "failed_runs": [], "alerts_sent": 0, "checked_date": str(today)}
 
     state = _load_state()
 
@@ -236,6 +268,47 @@ def run_load_validator(county_id: str = "hillsborough") -> dict:
 
     results["zero_record_scrapers"] = [
         line.strip().split(":")[0] for line in zero_record_lines
+    ]
+
+    # ── Check match rates (<50% of new records matched) ───────────────────
+    # Fires immediately (no consecutive-day grace) — a sub-50% match rate is
+    # a structural bug (address format change, loader regression), not noise.
+    # Alert fires at 06:30 UTC same morning for real-time detection vs. month-end.
+    low_rate_lines = _check_match_rates(today_rows)
+
+    if low_rate_lines:
+        if _was_recently_alerted('_batch', county_id, 'low_match_rate'):
+            logger.info("[LoadValidator] Match-rate alert suppressed — already sent within cooldown")
+        else:
+            sent = send_alert(
+                subject=(
+                    f"[Forced Action] ALERT: {len(low_rate_lines)} scraper(s) "
+                    f"low match rate (<{_MATCH_RATE_THRESHOLD*100:.0f}%) ({today})"
+                ),
+                body=(
+                    f"The following scraper(s) matched fewer than "
+                    f"{_MATCH_RATE_THRESHOLD*100:.0f}% of new records today ({today}):\n\n"
+                    + "\n".join(low_rate_lines)
+                    + "\n\nThis means most scraped records are NOT matching to properties in the DB.\n"
+                    "Possible causes:\n"
+                    "  - Address format change on the source portal\n"
+                    "  - Column mapping bug in the loader (check src/loaders/)\n"
+                    "  - Bulk new filings from addresses not yet in the properties table\n"
+                    "  - Data quality regression in a recent code change\n"
+                    "\nDiagnostic query:\n"
+                    "  SELECT source_type, match_status, count(*)\n"
+                    f"  FROM unmatched_records WHERE date_added = '{today}'\n"
+                    "  GROUP BY 1, 2;\n"
+                    f"\nForced Action Ops Alert — "
+                    f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+                ),
+            )
+            if sent:
+                results["alerts_sent"] += 1
+                _record_alert_sent('_batch', county_id, 'low_match_rate')
+
+    results["low_match_rate_scrapers"] = [
+        line.strip().split(":")[0] for line in low_rate_lines
     ]
 
     # ── Check for count anomalies (< 30% of 7-day baseline) ──────────────
@@ -334,8 +407,8 @@ def run_load_validator(county_id: str = "hillsborough") -> dict:
     _save_state(state)
 
     logger.info(
-        "[LoadValidator] Done. anomalies=%d failed_runs=%d alerts_sent=%d",
-        len(anomalies), len(failed), results["alerts_sent"],
+        "[LoadValidator] Done. anomalies=%d low_match_rate=%d failed_runs=%d alerts_sent=%d",
+        len(anomalies), len(results["low_match_rate_scrapers"]), len(failed), results["alerts_sent"],
     )
     return results
 
