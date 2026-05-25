@@ -1,15 +1,18 @@
 """
-Florida Sunbiz (FL Division of Corporations) — Registered Agent Enrichment
+Florida Sunbiz (FL Division of Corporations) — LLC piercing enrichment.
 
-For each LLC-owned property with a high distress score and no registered agent
-on file, this scraper:
+For each LLC-owned property pending Sunbiz enrichment, this scraper:
   1. Navigates to search.sunbiz.org via Playwright + playwright-stealth
   2. Searches by LLC name, finds the exact matching row in #search-results
-  3. Opens the entity detail page and reads the "Registered Agent Name & Address"
-     detailSection (present on ~99% of active FL filings)
-  4. Writes registered_agent_name + registered_agent_address back to the Owner row
+  3. Opens the entity detail page and captures the full HTML
+  4. Hands HTML to `parser.parse_sunbiz_detail` (pure function, unit-tested)
+  5. Writes a sunbiz_snapshots row (raw HTML + parsed JSONB) and updates the
+     Owner row with doc_number, principal_address, registered agent + email,
+     entity_status, formation_date, managing_members, sunbiz_enriched_at, and
+     sunbiz_status.
 
-Falls back to a browser-use AI agent if Playwright encounters a hard error.
+Falls back to a browser-use AI agent when Playwright raises OR when the parser
+reports status='parser_failed' (Sunbiz layout drift).
 
 Usage:
     python -m src.scrappers.sunbiz.sunbiz_engine
@@ -20,12 +23,18 @@ Usage:
 
 import asyncio
 import re
+from datetime import datetime, timezone
 from typing import Optional, Tuple
 
 from sqlalchemy.orm import Session
 
 from src.core.database import get_db_context
-from src.core.models import Owner, Property
+from src.core.models import Owner, Property, SunbizSnapshot as SunbizSnapshotRow
+from src.scrappers.sunbiz.parser import (
+    PARSER_VERSION,
+    SunbizSnapshot,
+    parse_sunbiz_detail,
+)
 from src.utils.logger import setup_logging, get_logger
 from src.utils.http_helpers import STEALTH_UA, STEALTH_ARGS, apply_stealth_to_page
 
@@ -54,13 +63,17 @@ def _normalize(name: str) -> str:
 # Playwright scraper
 # ---------------------------------------------------------------------------
 
-async def _scrape_registered_agent(
+async def _scrape_entity_detail(
     page, company_name: str
-) -> Tuple[Optional[str], Optional[str]]:
+) -> Tuple[Optional[str], Optional[SunbizSnapshot]]:
     """
-    Search Sunbiz for company_name and return (agent_name, agent_address).
-    Returns (None, None) if no exact match is found or the registered agent
-    section is absent on the detail page.
+    Search Sunbiz for company_name and return (raw_html, parsed_snapshot).
+
+    Returns (None, None) when no exact name match exists in the result table —
+    caller should mark owner.sunbiz_status='not_found' (no snapshot written).
+    Returns (html, snapshot) on detail-page hit; snapshot.status reflects parser
+    outcome ('ok' / 'partial' / 'parser_failed'). On Playwright exception during
+    search nav, raises — caller handles AI fallback.
     """
     try:
         await page.goto(SUNBIZ_SEARCH_URL, wait_until="domcontentloaded", timeout=20000)
@@ -71,7 +84,6 @@ async def _scrape_registered_agent(
         logger.debug(f"[Sunbiz] Search navigation failed for '{company_name}': {e}")
         raise
 
-    # Find exact name match in the results table
     rows = await page.query_selector_all("#search-results table tbody tr")
     detail_url: Optional[str] = None
     normalized_search = _normalize(company_name)
@@ -91,39 +103,15 @@ async def _scrape_registered_agent(
         logger.debug(f"[Sunbiz] No exact match in results for '{company_name}'")
         return None, None
 
-    # Navigate to detail page
     try:
         await page.goto(detail_url, wait_until="domcontentloaded", timeout=20000)
     except Exception as e:
         logger.debug(f"[Sunbiz] Detail page load failed: {e}")
         return None, None
 
-    # Find the "Registered Agent Name & Address" detailSection
-    sections = await page.query_selector_all("div.detailSection")
-    for section in sections:
-        header = await section.query_selector("span:first-child")
-        if not header:
-            continue
-        header_text = await header.inner_text()
-        if "registered agent" not in header_text.lower():
-            continue
-
-        # spans[0]=header, spans[1]=agent name, spans[2]=address block
-        spans = await section.query_selector_all("span")
-        if len(spans) < 2:
-            return None, None
-
-        agent_name = (await spans[1].inner_text()).strip()
-        agent_address: Optional[str] = None
-        if len(spans) >= 3:
-            raw_addr = (await spans[2].inner_text()).strip()
-            # Collapse whitespace / blank lines left by <br> tags
-            agent_address = re.sub(r"\n{2,}", "\n", raw_addr).strip()
-
-        return agent_name or None, agent_address or None
-
-    logger.debug(f"[Sunbiz] No registered agent section found for '{company_name}'")
-    return None, None
+    html = await page.content()
+    snap = parse_sunbiz_detail(html)
+    return html, snap
 
 
 async def _run_playwright_batch(
@@ -159,82 +147,167 @@ async def _run_playwright_batch(
                 ]
                 if any(p in name.upper() for p in skip_patterns):
                     logger.debug(f"[Sunbiz] Skipping non-LLC entity: {name}")
+                    if not dry_run:
+                        _mark_not_an_llc(session, owner)
                     stats["skipped"] += 1
                     continue
 
                 logger.info(f"[Sunbiz] [{idx}/{total}] Searching: {name}")
                 await asyncio.sleep(_DELAY_SECONDS)
 
+                html: Optional[str] = None
+                snap: Optional[SunbizSnapshot] = None
                 try:
-                    agent_name, agent_address = await _scrape_registered_agent(page, name)
+                    html, snap = await _scrape_entity_detail(page, name)
                 except Exception as e:
                     logger.warning(f"[Sunbiz] Playwright failed for '{name}': {e} — trying AI fallback")
                     try:
-                        agent_name, agent_address = await _ai_fallback(name)
+                        html, snap = await _ai_fallback(name)
                     except Exception as ae:
                         logger.warning(f"[Sunbiz] AI fallback also failed for '{name}': {ae}")
+                        if not dry_run:
+                            _mark_status(session, owner, "parser_failed")
                         stats["failed"] += 1
                         continue
 
-                if not agent_name:
+                # No exact match in Sunbiz search results.
+                if snap is None:
+                    if not dry_run:
+                        _mark_status(session, owner, "not_found")
                     stats["skipped"] += 1
                     continue
 
+                # Parser found zero detail sections → AI fallback on layout drift.
+                if snap.status == "parser_failed":
+                    logger.warning(f"[Sunbiz] Parser failed for '{name}' — trying AI fallback")
+                    try:
+                        ai_html, ai_snap = await _ai_fallback(name)
+                        if ai_snap and ai_snap.status != "parser_failed":
+                            html, snap = ai_html, ai_snap
+                    except Exception as ae:
+                        logger.warning(f"[Sunbiz] AI fallback also failed for '{name}': {ae}")
+
                 logger.info(
-                    f"[Sunbiz] Found agent for '{name}': {agent_name} | {agent_address}"
+                    f"[Sunbiz] '{name}' status={snap.status} doc={snap.doc_number} "
+                    f"agent={snap.registered_agent_name} members={len(snap.managing_members)}"
                 )
 
-                if not dry_run:
-                    owner.registered_agent_name = agent_name
-                    owner.registered_agent_address = agent_address
-                    if owner.owner_type != "LLC":
-                        owner.owner_type = "LLC"
+                if dry_run:
+                    stats["enriched" if snap.status in ("ok", "partial") else "failed"] += 1
+                    continue
+
+                _persist_snapshot_and_owner(session, owner, html, snap)
+                if snap.status in ("ok", "partial"):
                     stats["enriched"] += 1
                 else:
-                    logger.info(
-                        f"[Sunbiz] DRY RUN — would write agent for owner_id={owner.id}"
-                    )
-                    stats["enriched"] += 1
+                    stats["failed"] += 1
 
         finally:
             await context.close()
             await browser.close()
 
+    # Structured outcome log consumed by sunbiz_anomaly_check and log aggregators.
+    logger.info(
+        "[Sunbiz] batch_complete processed=%d enriched=%d skipped=%d failed=%d",
+        stats.get("processed", 0),
+        stats.get("enriched", 0),
+        stats.get("skipped", 0),
+        stats.get("failed", 0),
+    )
+
 
 # ---------------------------------------------------------------------------
-# AI fallback (browser-use) — only used when Playwright raises
+# DB writers (sync; called from inside async loop via attached Session)
 # ---------------------------------------------------------------------------
 
-async def _ai_fallback(company_name: str) -> Tuple[Optional[str], Optional[str]]:
+
+def _persist_snapshot_and_owner(
+    session: Session,
+    owner: Owner,
+    html: Optional[str],
+    snap: SunbizSnapshot,
+) -> None:
+    """
+    Row-locked update of the Owner row + append-only snapshot insert.
+    Snapshot is only written when we have a Sunbiz doc number (i.e. status is
+    'ok' or 'partial'); parser_failed runs produce no snapshot row but still
+    update sunbiz_status on the Owner so the daily task doesn't re-pick them
+    until the staleness window elapses.
+    """
+    session.refresh(owner, with_for_update=True)
+
+    if snap.doc_number and snap.status in ("ok", "partial"):
+        session.add(
+            SunbizSnapshotRow(
+                sunbiz_doc_number=snap.doc_number,
+                raw_html=html,
+                raw_jsonb=snap.to_jsonb(),
+                parser_version=snap.parser_version or PARSER_VERSION,
+                status=snap.status,
+            )
+        )
+
+        owner.sunbiz_doc_number = snap.doc_number
+        owner.principal_address = snap.principal_address
+        owner.registered_agent_name = snap.registered_agent_name
+        owner.registered_agent_address = snap.registered_agent_address
+        owner.registered_agent_email = snap.registered_agent_email
+        owner.entity_status = snap.entity_status
+        owner.formation_date = snap.formation_date
+        owner.managing_members = [m.__dict__ for m in snap.managing_members] or None
+        owner.sunbiz_status = "matched"
+        if owner.owner_type not in ("LLC", "Corporate"):
+            owner.owner_type = "LLC"
+    else:
+        owner.sunbiz_status = "parser_failed"
+
+    owner.sunbiz_enriched_at = datetime.now(timezone.utc)
+
+
+def _mark_status(session: Session, owner: Owner, status: str) -> None:
+    session.refresh(owner, with_for_update=True)
+    owner.sunbiz_status = status
+    owner.sunbiz_enriched_at = datetime.now(timezone.utc)
+
+
+def _mark_not_an_llc(session: Session, owner: Owner) -> None:
+    _mark_status(session, owner, "not_an_llc")
+
+
+# ---------------------------------------------------------------------------
+# AI fallback (browser-use) — fires on Playwright exception OR parser_failed.
+# Asks the agent to return the full detail page HTML so the same pure-function
+# parser (and future reparse jobs) can process it. No bespoke JSON contract
+# with the LLM; the LLM only handles the browser-driving + page-grab steps.
+# ---------------------------------------------------------------------------
+
+async def _ai_fallback(company_name: str) -> Tuple[Optional[str], Optional[SunbizSnapshot]]:
     from browser_use import Agent, Browser, ChatAnthropic
 
     task = (
         f"Go to https://search.sunbiz.org/Inquiry/CorporationSearch/ByName, "
-        f"search for the company named '{company_name}', find the exact matching result, "
-        f"open its detail page, locate the section titled 'Registered Agent Name & Address', "
-        f"and return ONLY a JSON object with keys 'agent_name' and 'agent_address'. "
-        f"If no exact match or no registered agent section exists, return "
-        f"{{\"agent_name\": null, \"agent_address\": null}}."
+        f"search for the company named '{company_name}', find the exact matching "
+        f"result row, click into its detail page, and return the COMPLETE raw HTML "
+        f"of the detail page wrapped in <html_payload>...</html_payload> markers. "
+        f"If no exact match exists in the result list, return "
+        f"<html_payload>NO_MATCH</html_payload>."
     )
 
     browser = Browser(headless=True, disable_security=True)
     llm = ChatAnthropic(model="claude-sonnet-4-6")
-
     agent = Agent(task=task, llm=llm, browser=browser)
     result = await agent.run()
 
-    # Parse JSON from agent output
-    import json
-    text = str(result).strip()
-    match = re.search(r"\{[^}]+\}", text)
-    if match:
-        try:
-            data = json.loads(match.group())
-            return data.get("agent_name"), data.get("agent_address")
-        except json.JSONDecodeError:
-            pass
+    text = str(result)
+    m = re.search(r"<html_payload>([\s\S]*?)</html_payload>", text)
+    if not m:
+        return None, None
+    payload = m.group(1).strip()
+    if payload == "NO_MATCH" or not payload:
+        return None, None
 
-    return None, None
+    snap = parse_sunbiz_detail(payload)
+    return payload, snap
 
 
 # ---------------------------------------------------------------------------
@@ -259,13 +332,17 @@ def enrich_llc_owners(
 
     llc_keywords = ["%LLC%", "%INC%", "%CORP%", "%LLP%", "%PLLC%", "%LTD%"]
 
+    # Targets: LLC owners that have never been enriched (sunbiz_status='pending')
+    # OR previously matched rows past the active-lead staleness window. The
+    # staleness refresh job is handled by `src/tasks/sunbiz_enrichment.py` in
+    # Phase 5; this entry point picks up new pendings only.
     q = (
         session.query(Owner)
         .join(Property, Property.id == Owner.property_id)
         .join(DistressScore, DistressScore.property_id == Property.id)
         .filter(
             or_(*[Owner.owner_name.ilike(kw) for kw in llc_keywords]),
-            Owner.registered_agent_name.is_(None),
+            Owner.sunbiz_status == "pending",
             Owner.owner_name.isnot(None),
             Property.county_id == county_id,
         )

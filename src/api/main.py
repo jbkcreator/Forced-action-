@@ -1695,12 +1695,24 @@ def event_feed(
         })
 
     # 7. Build response
+    # Bulk-resolve portfolio sizes for every owner on this page in one query
+    # (avoids N+1 across the 25-lead window). Scoped to the subscriber's
+    # county so the count reflects what they can actually act on. Names absent
+    # from the result map default to 1 (the lead's own row).
+    from src.services.owner_lookup import portfolio_sizes_for_names
+    _portfolio_map = portfolio_sizes_for_names(
+        db,
+        (owner.owner_name for _, _, owner in rows if owner),
+        county_id=subscriber.county_id,
+    )
+
     leads = []
     for prop, score, owner in rows:
         is_unlocked = (prop.id in unlocked_ids) or (prop.zip in locked_zip_set)
         owner_phone, owner_phone_quality = _resolve_phone_with_quality(owner)
         owner_email = (owner.email_1 or owner.email_2) if owner else None
         _visible_tier, _visible_urgency = _visible_tier_fields(prop, score)
+        portfolio = _portfolio_map.get(owner.owner_name, 1) if owner else 1
         leads.append({
             "property_id": prop.id,
             "parcel_id": prop.parcel_id,
@@ -1725,6 +1737,7 @@ def event_feed(
             "phone": owner_phone if is_unlocked else None,
             "phone_quality": owner_phone_quality if is_unlocked else None,
             "email": owner_email if is_unlocked else None,
+            "portfolio_size": portfolio,
         })
 
     from src.core.models import WalletBalance as _WalletBalance

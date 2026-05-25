@@ -191,6 +191,11 @@ class AppSettings(BaseSettings):
 	# `scripts/_probate_multi_heir_audit.py` confirms >20% multi-heir prevalence.
 	multi_heir_enrichment_enabled: bool = Field(default=False, env="MULTI_HEIR_ENRICHMENT_ENABLED")
 	max_heirs_per_property: int = Field(default=5, env="MAX_HEIRS_PER_PROPERTY")
+	pdl_api_key: Optional[SecretStr] = Field(default=None, env="PDL_API_KEY")
+
+	# Skip trace waterfall behaviour
+	skip_trace_confidence_threshold: float = Field(default=0.70, env="SKIP_TRACE_CONFIDENCE_THRESHOLD")
+	skip_trace_cost_ceiling_cents: int = Field(default=80, env="SKIP_TRACE_COST_CEILING_CENTS")
 
 	# SMTP (used by welcome email, payment receipts, grace period alerts)
 	smtp_host: Optional[str] = Field(default=None, env="SMTP_HOST")

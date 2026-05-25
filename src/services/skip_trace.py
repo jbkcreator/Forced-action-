@@ -287,6 +287,104 @@ def _parse_agent_address(address: str) -> Optional[dict]:
     }
 
 
+def _build_entity_payload(owner, prop, resolve_party_name) -> Optional[dict]:
+    """
+    Construct the BatchData payload for an LLC / Corporate / Trust / Estate
+    owner using the v1 priority chain:
+
+      1. Filing-derived party (probate heir / eviction landlord / divorce
+         petitioner / LP defendant) → target at property address.
+      2. Managing member (Sunbiz fa031 piercing) → target at member's own
+         address from the JSONB; falls back to property address when the
+         member address can't be parsed.
+      3. Registered agent → target at agent address.
+
+    Returns None when no tier yields a viable payload (caller increments
+    `stats["no_address"]`). All branches log their pick at debug level so
+    skip-trace runs are auditable.
+    """
+    # Tier 1 — filing-derived party (highest signal: a real human tied to
+    # the property by an active legal proceeding).
+    party_name, source_tag = resolve_party_name(prop.id)
+    if party_name:
+        first_name, last_name = _split_agent_name(party_name)
+        street   = (prop.address or "").strip()
+        zip_code = (prop.zip or "").strip()[:5]
+        if street and zip_code:
+            logger.debug(
+                f"[{source_tag}/Entity] property_id={prop.id} tracing filing party: "
+                f"{first_name} {last_name}"
+            )
+            return {
+                "firstName": first_name,
+                "lastName":  last_name,
+                "propertyAddress": {
+                    "street": street,
+                    "city":   (prop.city or "Tampa").strip(),
+                    "state":  (prop.state or "FL").strip(),
+                    "zip":    zip_code,
+                },
+            }
+
+    # Tier 2 — managing member from Sunbiz piercing. Use the first non-entity
+    # member; skip the row entirely if the only members are themselves LLCs
+    # (recursive ownership — handled by v2 entity graph).
+    members = owner.managing_members or []
+    for member in members:
+        if not isinstance(member, dict):
+            continue
+        m_name = (member.get("name") or "").strip()
+        if not m_name or _is_entity_name(m_name):
+            continue
+        first_name, last_name = _split_agent_name(m_name)
+        m_addr = _parse_agent_address(member.get("address") or "")
+        if m_addr:
+            logger.debug(
+                f"[managing_member] property_id={prop.id} tracing: "
+                f"{first_name} {last_name} @ {m_addr['street']}"
+            )
+            return {
+                "firstName": first_name,
+                "lastName":  last_name,
+                "address":   m_addr,
+            }
+        # Member address unparseable — fall back to property address.
+        street   = (prop.address or "").strip()
+        zip_code = (prop.zip or "").strip()[:5]
+        if street and zip_code:
+            logger.debug(
+                f"[managing_member/prop_addr] property_id={prop.id} tracing: "
+                f"{first_name} {last_name}"
+            )
+            return {
+                "firstName": first_name,
+                "lastName":  last_name,
+                "propertyAddress": {
+                    "street": street,
+                    "city":   (prop.city or "Tampa").strip(),
+                    "state":  (prop.state or "FL").strip(),
+                    "zip":    zip_code,
+                },
+            }
+
+    # Tier 3 — registered agent (service company in the common case).
+    if owner.registered_agent_name and owner.registered_agent_address:
+        first_name, last_name = _split_agent_name(owner.registered_agent_name)
+        agent_addr = _parse_agent_address(owner.registered_agent_address)
+        if agent_addr:
+            logger.debug(
+                f"[LLC/agent] property_id={prop.id} tracing agent: "
+                f"{first_name} {last_name} @ {agent_addr['street']}"
+            )
+            return {
+                "firstName": first_name,
+                "lastName":  last_name,
+                "address":   agent_addr,
+            }
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Main runner
 # ---------------------------------------------------------------------------
@@ -302,6 +400,7 @@ def run_skip_trace(
     retrace_after_days: int = 60,
     refresh_stale: bool = False,
     refresh_stale_after_days: int = 90,
+    owner_ids: Optional[list] = None,
 ) -> dict:
     """
     Enrich owner contacts for high-priority leads that are missing a phone.
@@ -470,7 +569,16 @@ def run_skip_trace(
         else:
             q = q.filter(no_phone).filter(Owner.skip_trace_success.is_not(True))
 
-        rows = q.order_by(ds_latest.c.max_date.desc()).limit(limit).all()
+        if owner_ids is not None:
+            # Waterfall mode: process only these specific owners, skip candidate query.
+            rows = (
+                session.query(Owner, Property)
+                .join(Property, Owner.property_id == Property.id)
+                .filter(Owner.id.in_(owner_ids))
+                .all()
+            )
+        else:
+            rows = q.order_by(ds_latest.c.max_date.desc()).limit(limit).all()
 
         # Pre-fetch party names from court filings for all candidate properties.
         # Why: the name on the assessor record is often NOT the actual
@@ -692,6 +800,29 @@ def run_skip_trace(
             if owner.owner_type in ("LLC", "Corporate", "Trust", "Estate"):
                 # Non-individual with no registered agent. Filing-derived party
                 # names are the only way to reach a human here.
+            # ── LLC / Corporate / Trust / Estate ───────────────────────────
+            # Priority chain (fa031 — real-people-first):
+            #   1. Filing-derived party (probate heir, eviction landlord,
+            #      divorce petitioner, LP defendant) — most actionable human
+            #   2. Managing member from Sunbiz (NEW v1) — decision-maker
+            #      behind the LLC; targeted at the member's own address
+            #   3. Registered agent (existing fallback) — often a service co
+            #   4. Skip with no_address counter
+            if owner.owner_type in ("LLC", "Corporate", "Trust", "Estate"):
+                payload_entry = _build_entity_payload(owner, prop, resolve_party_name)
+                if payload_entry is None:
+                    stats["no_address"] += 1
+                    logger.debug(
+                        f"Skipping property_id={prop.id} — no usable filing party, "
+                        f"managing member, or registered agent ({owner.owner_name!r})"
+                    )
+                    continue
+            else:
+                # Individual owner — check for a filing-derived party name first.
+                # If one is found (heir, landlord, petitioner, LP defendant) target
+                # them by name; otherwise fall back to a blind property-address
+                # lookup. Order: probate > eviction > divorce > lp.
+                party_name, source_tag = resolve_party_name(prop.id)
                 street   = (prop.address or "").strip()
                 zip_code = (prop.zip or "").strip()[:5]
                 if not street or not zip_code:

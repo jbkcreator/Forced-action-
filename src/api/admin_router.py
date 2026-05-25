@@ -1725,3 +1725,68 @@ def create_manual_mapping(
         body.row_routing is not None,
     )
     return _mapping_to_dict(row)
+
+
+# ── Sunbiz owner detail ─────────────────────────────────────────────────────
+# Surfaces the fa031 piercing fields + latest sunbiz_snapshots row + portfolio
+# (sibling properties owned by the same name). Admin-only; the subscriber feed
+# only carries a portfolio_size count, not the full graph.
+
+@router.get("/owners/{owner_id}/sunbiz")
+def get_owner_sunbiz_detail(
+    owner_id: int,
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    from src.core.models import SunbizSnapshot as _SunbizSnapshotRow
+    from src.services.owner_lookup import (
+        portfolio_size,
+        properties_by_normalized_owner,
+    )
+
+    owner = db.execute(select(Owner).where(Owner.id == owner_id)).scalar_one_or_none()
+    if not owner:
+        raise HTTPException(status_code=404, detail={"error": "owner_not_found"})
+
+    latest_snapshot = None
+    if owner.sunbiz_doc_number:
+        snap = db.execute(
+            select(_SunbizSnapshotRow)
+            .where(_SunbizSnapshotRow.sunbiz_doc_number == owner.sunbiz_doc_number)
+            .order_by(_SunbizSnapshotRow.scraped_at.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if snap:
+            latest_snapshot = {
+                "scraped_at": snap.scraped_at.isoformat() if snap.scraped_at else None,
+                "status": snap.status,
+                "parser_version": snap.parser_version,
+                "raw_jsonb": snap.raw_jsonb,
+            }
+
+    portfolio_property_ids = properties_by_normalized_owner(
+        db, owner.owner_name or "", county_id=None, limit=200,
+    )
+
+    return {
+        "owner_id": owner.id,
+        "property_id": owner.property_id,
+        "owner_name": owner.owner_name,
+        "owner_type": owner.owner_type,
+        "sunbiz_doc_number": owner.sunbiz_doc_number,
+        "sunbiz_status": owner.sunbiz_status,
+        "sunbiz_enriched_at": (
+            owner.sunbiz_enriched_at.isoformat() if owner.sunbiz_enriched_at else None
+        ),
+        "entity_status": owner.entity_status,
+        "formation_date": owner.formation_date.isoformat() if owner.formation_date else None,
+        "principal_address": owner.principal_address,
+        "registered_agent_name": owner.registered_agent_name,
+        "registered_agent_address": owner.registered_agent_address,
+        "registered_agent_email": owner.registered_agent_email,
+        "managing_members": owner.managing_members or [],
+        "portfolio_size": portfolio_size(db, owner.owner_name),
+        "portfolio_normalized_size": len(portfolio_property_ids),
+        "portfolio_property_ids": portfolio_property_ids,
+        "latest_snapshot": latest_snapshot,
+    }
