@@ -30,6 +30,8 @@ DEFAULT_COST_CENTS = {
     ("batchdata", "lead_unlock"):        7,
     ("batchdata", "batch_skip_trace"):   7,
     ("twilio_lookup", "phone_verify"):   1,
+    ("idi", "skip_trace"):              50,   # $0.50/lookup — charged on success only
+    ("pdl", "skip_trace"):              28,   # $0.28/lookup — charged on success only
 }
 
 
