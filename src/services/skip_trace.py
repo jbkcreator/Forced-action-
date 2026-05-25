@@ -771,44 +771,52 @@ def run_skip_trace(
         index_map = []
 
         for owner, prop in batch:
-            # LLC with registered agent — single trace of the agent, no fan-out.
-            if owner.owner_type == "LLC" and owner.registered_agent_name and owner.registered_agent_address:
-                first_name, last_name = _split_agent_name(owner.registered_agent_name)
-                agent_addr = _parse_agent_address(owner.registered_agent_address)
-                if not agent_addr:
-                    stats["no_address"] += 1
-                    logger.debug(f"Skipping property_id={prop.id} — cannot parse agent address")
-                    continue
-                payload_entry = {
-                    "firstName": first_name,
-                    "lastName":  last_name,
-                    "address": agent_addr,
-                }
-                logger.debug(
-                    f"[LLC] property_id={prop.id} tracing agent: {first_name} {last_name} @ {agent_addr['street']}"
-                )
-                payloads.append(payload_entry)
-                index_map.append((owner, prop, None))
-                continue
-
-            # All other branches go through candidate_parties_for_property() so
-            # the multi-heir fan-out hooks in cleanly when the feature flag is
-            # on. The default path returns a single (name, tag, None) tuple
-            # which preserves legacy single-trace behavior.
+            # candidate_parties_for_property handles the multi-heir fan-out:
+            # when MULTI_HEIR_ENRICHMENT is on AND the probate filing lists
+            # 2+ non-entity heirs, it returns one tuple per heir. Otherwise
+            # the single-trace default returns one tuple with traced_name=None.
             candidates = candidate_parties_for_property(prop.id)
+            is_multi_heir = len(candidates) >= 2
 
             if owner.owner_type in ("LLC", "Corporate", "Trust", "Estate"):
-                # Non-individual with no registered agent. Filing-derived party
-                # names are the only way to reach a human here.
-            # ── LLC / Corporate / Trust / Estate ───────────────────────────
-            # Priority chain (fa031 — real-people-first):
-            #   1. Filing-derived party (probate heir, eviction landlord,
-            #      divorce petitioner, LP defendant) — most actionable human
-            #   2. Managing member from Sunbiz (NEW v1) — decision-maker
-            #      behind the LLC; targeted at the member's own address
-            #   3. Registered agent (existing fallback) — often a service co
-            #   4. Skip with no_address counter
-            if owner.owner_type in ("LLC", "Corporate", "Trust", "Estate"):
+                # ── Entity owner ───────────────────────────────────────────
+                # Multi-heir fan-out beats the priority chain — spreading
+                # outreach across all named heirs is a stronger signal than
+                # picking the single best contact via _build_entity_payload.
+                if is_multi_heir:
+                    street   = (prop.address or "").strip()
+                    zip_code = (prop.zip or "").strip()[:5]
+                    if not street or not zip_code:
+                        stats["no_address"] += 1
+                        continue
+                    fanned = 0
+                    for party_name, source_tag, traced_name in candidates:
+                        if not party_name:
+                            continue
+                        first_name, last_name = _split_agent_name(party_name)
+                        payload_entry = {
+                            "firstName": first_name,
+                            "lastName":  last_name,
+                            "propertyAddress": {
+                                "street": street,
+                                "city":   (prop.city or "Tampa").strip(),
+                                "state":  (prop.state or "FL").strip(),
+                                "zip":    zip_code,
+                            },
+                        }
+                        logger.debug(
+                            f"[{source_tag}/Entity] property_id={prop.id} tracing: "
+                            f"{first_name} {last_name} (heir {fanned + 1}/{len(candidates)})"
+                        )
+                        payloads.append(payload_entry)
+                        index_map.append((owner, prop, traced_name))
+                        fanned += 1
+                    if fanned == 0:
+                        stats["no_address"] += 1
+                    continue
+
+                # Single-trace entity path — use the priority chain
+                # (filing party → managing member → registered agent).
                 payload_entry = _build_entity_payload(owner, prop, resolve_party_name)
                 if payload_entry is None:
                     stats["no_address"] += 1
@@ -817,51 +825,13 @@ def run_skip_trace(
                         f"managing member, or registered agent ({owner.owner_name!r})"
                     )
                     continue
-            else:
-                # Individual owner — check for a filing-derived party name first.
-                # If one is found (heir, landlord, petitioner, LP defendant) target
-                # them by name; otherwise fall back to a blind property-address
-                # lookup. Order: probate > eviction > divorce > lp.
-                party_name, source_tag = resolve_party_name(prop.id)
-                street   = (prop.address or "").strip()
-                zip_code = (prop.zip or "").strip()[:5]
-                if not street or not zip_code:
-                    stats["no_address"] += 1
-                    continue
+                payloads.append(payload_entry)
+                index_map.append((owner, prop, None))
 
-                fanned = 0
-                for party_name, source_tag, traced_name in candidates:
-                    if not party_name:
-                        continue  # no fallback to address-only for entities
-                    first_name, last_name = _split_agent_name(party_name)
-                    payload_entry = {
-                        "firstName": first_name,
-                        "lastName":  last_name,
-                        "propertyAddress": {
-                            "street": street,
-                            "city":   (prop.city or "Tampa").strip(),
-                            "state":  (prop.state or "FL").strip(),
-                            "zip":    zip_code,
-                        },
-                    }
-                    logger.debug(
-                        f"[{source_tag}/Entity] property_id={prop.id} tracing: "
-                        f"{first_name} {last_name}"
-                        + (f" (heir {fanned + 1}/{len(candidates)})" if traced_name else "")
-                    )
-                    payloads.append(payload_entry)
-                    index_map.append((owner, prop, traced_name))
-                    fanned += 1
-
-                if fanned == 0:
-                    stats["no_address"] += 1
-                    logger.debug(
-                        f"Skipping property_id={prop.id} — owner_type={owner.owner_type!r} "
-                        f"with no registered agent ({owner.owner_name!r})"
-                    )
             else:
-                # Individual owner — filing-derived party name preferred,
-                # otherwise blind address-only lookup.
+                # ── Individual owner ───────────────────────────────────────
+                # Either multi-heir fan-out (2+ heirs) or single trace
+                # (filing-derived party at property address, else address-only).
                 street   = (prop.address or "").strip()
                 city     = (prop.city or "Tampa").strip()
                 state    = (prop.state or "FL").strip()
