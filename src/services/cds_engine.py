@@ -32,7 +32,7 @@ SIGNAL SOURCES (14 total):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Model           → Signal key
 CodeViolation   → code_violations
-LegalAndLien    → judgment_liens, tampa_code_liens, county_code_liens,
+LegalAndLien    → judgment_liens, code_lien (unified TCL/CCL/Pinellas CODE LIEN),
                   hoa_liens, mechanics_liens, irs_tax_liens
 Deed            → deed_transfers
 LegalProceeding → probate, evictions, bankruptcy
@@ -45,7 +45,9 @@ import heapq
 import json
 import logging
 import sys
+import time
 from collections import Counter, defaultdict
+from contextlib import contextmanager
 from types import SimpleNamespace
 from datetime import datetime, date, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -56,13 +58,10 @@ from config.settings import settings
 # Can be overridden at runtime via --no-ghl CLI flag; default comes from GHL_PUSH_ENABLED env var
 _GHL_PUSH_ENABLED: bool = settings.ghl_push_enabled
 
-# GHL batching — push leads in chunks with a pause between batches to stay under rate limits
-_GHL_BATCH_SIZE: int = 25   # leads per batch
-_GHL_BATCH_DELAY: float = 3.0  # seconds between batches
-
 # Property loading batch size — keyset pagination chunk for full-table scoring runs
 _BULK_BATCH_SIZE: int = 500
 
+import psycopg2.extras
 from sqlalchemy import text as sa_text
 from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session, joinedload
@@ -108,17 +107,33 @@ from config.scoring import (
     STACKING_MIN_WEIGHT,
     STACKING_WINDOW_DAYS,
     VERTICAL_WEIGHTS,
+    # Stage 2/3 — per-county overrides + signal-coverage normalizer
+    for_county,
+    signal_coverage_pct,
 )
 
 logger = logging.getLogger(__name__)
 
 # ── LegalAndLien.document_type → signal key ───────────────────────────────────
+# All code-lien doc-type variants collapse to a single `code_lien` signal so
+# Pinellas's bare "CODE LIEN" doc type contributes to scoring just like
+# Hillsborough's TCL/CCL variants. Per-county filer identity (Tampa city vs
+# unincorporated county) is preserved on the LegalAndLien record itself —
+# only the scoring signal name is unified. Previously TCL/CCL produced two
+# distinct signal keys whose weights existed globally in config/scoring.py;
+# Pinellas's "CODE LIEN" matched neither and silently contributed zero,
+# concentrating Pinellas leads in Ultra Platinum from missing-signal-as-
+# not-a-deduction bias.
 _DOCUMENT_TYPE_TO_SIGNAL: Dict[str, str] = {
-    "TAMPA CODE LIENS (TCL)":  "tampa_code_liens",
-    "COUNTY CODE LIENS (CCL)": "county_code_liens",
+    "TAMPA CODE LIENS (TCL)":  "code_lien",
+    "COUNTY CODE LIENS (CCL)": "code_lien",
+    "CODE LIEN":               "code_lien",
     "HOA LIENS (HL)":          "hoa_liens",
     "MECHANICS LIENS (ML)":    "mechanics_liens",
     "TAX LIENS (TL)":          "irs_tax_liens",
+    # Bare "TAX LIEN" variant — present in both Pinellas (24 rows) and
+    # Hillsborough (11 rows). Without this entry these rows scored zero.
+    "TAX LIEN":                "irs_tax_liens",
 }
 
 # ── LegalProceeding.record_type → signal key ─────────────────────────────────
@@ -135,6 +150,78 @@ if not VERTICAL_WEIGHTS:
         "VERTICAL_WEIGHTS is empty — check config/scoring.py. "
         "At least one vertical must be configured."
     )
+
+
+class _Profiler:
+    """Per-phase wall-clock timer for scoring runs.
+
+    Off by default → context manager is a zero-cost no-op. Enabled via
+    the --profile CLI flag to surface where time is spent across:
+      properties_fetch, signals_fetch, score_python, persist_batch,
+      commit, ghl_flush.
+
+    NOTE: the original ANY(:ids) → unnest()/temp-table refactor question
+    was answered on 2026-05-25 — production runs scale to ~50k IDs per
+    batch where ANY() risks suboptimal plans. All 13 hot-path queries
+    were converted to `WHERE x IN (SELECT unnest(CAST(:ids AS bigint[])))` which
+    gives the planner a known-small driving relation + indexed inner
+    lookup. The profiler remains useful for monitoring overall scoring
+    cost, but the unnest refactor itself is no longer pending.
+    """
+    __slots__ = ("enabled", "phases", "start", "_batch_count")
+
+    def __init__(self, enabled: bool = False) -> None:
+        self.enabled = enabled
+        self.phases: Dict[str, List[float]] = defaultdict(list)
+        self.start = time.perf_counter()
+        self._batch_count = 0
+
+    @contextmanager
+    def phase(self, name: str):
+        if not self.enabled:
+            yield
+            return
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.phases[name].append(time.perf_counter() - t0)
+
+    def mark_batch(self) -> None:
+        if self.enabled:
+            self._batch_count += 1
+
+    def report(self, log: logging.Logger) -> None:
+        if not self.enabled:
+            return
+        total_wall = time.perf_counter() - self.start
+        log.info("")
+        log.info("=" * 70)
+        log.info("PROFILING REPORT (--profile)")
+        log.info("  Wall time:         %7.2f s", total_wall)
+        log.info("  Batches processed: %7d", self._batch_count)
+        log.info("")
+        log.info(
+            "  %-20s %7s %9s %10s %10s %7s",
+            "Phase", "calls", "total_s", "mean_ms", "max_ms", "%wall",
+        )
+        log.info("  " + "-" * 68)
+        rows = []
+        for name, samples in self.phases.items():
+            if not samples:
+                continue
+            total = sum(samples)
+            rows.append((total, name, samples))
+        rows.sort(reverse=True)  # by total desc
+        for total, name, samples in rows:
+            mean_ms = (total / len(samples)) * 1000
+            max_ms = max(samples) * 1000
+            pct = (total / total_wall * 100) if total_wall else 0
+            log.info(
+                "  %-20s %7d %9.2f %10.1f %10.1f  %5.1f%%",
+                name, len(samples), total, mean_ms, max_ms, pct,
+            )
+        log.info("=" * 70)
 
 
 class _ScoreRef:
@@ -158,10 +245,25 @@ class MultiVerticalScorer:
     when tuning.
     """
 
+    # Live destination table. Shadow rescore runs (Stage E of the cross-county
+    # retune) swap this to "distress_scores_shadow" so the live feed, GHL push,
+    # and Cora flows are unaffected while the proposed weights are being
+    # evaluated. The schema of the two tables is identical (see migration
+    # fa032_distress_scores_shadow.py), so every SQL string below references
+    # this attribute via f-strings and routes transparently.
+    _scores_table_name: str = "distress_scores"
+
+    # When True, side effects that mutate live operational state are skipped:
+    # the sync_status='pending_sync' bulk UPDATE and the GHL push queue. Set
+    # by the CLI when --shadow is passed.
+    _shadow_mode: bool = False
+
     def __init__(self, session: Session):
         self.session = session
         self._ghl_push_queue: List[Dict] = []
         self._total_scored: int = 0
+        # Default no-op profiler; CLI replaces with enabled instance under --profile.
+        self._profiler: _Profiler = _Profiler(enabled=False)
 
     # ── GHL batch flush ───────────────────────────────────────────────────────
 
@@ -186,6 +288,14 @@ class MultiVerticalScorer:
         if not queue:
             return
 
+        # Stage E — shadow runs don't touch live operational state. Skip the
+        # bulk pending_sync UPDATE so subscriber feeds and GHL sync don't pick
+        # up shadow-only scores.
+        if self._shadow_mode:
+            self._ghl_push_queue.clear()
+            logger.debug("[shadow] sync_status update suppressed; cleared %d queued leads", len(queue))
+            return
+
         property_ids = [sd["property_id"] for sd in queue if sd.get("property_id")]
         if property_ids:
             # Chunk into batches of 1000 — avoids unbounded IN-list that degrades
@@ -196,7 +306,7 @@ class MultiVerticalScorer:
                 self.session.execute(
                     sa_text(
                         "UPDATE properties SET sync_status = 'pending_sync' "
-                        "WHERE id = ANY(:ids)"
+                        "WHERE id IN (SELECT unnest(CAST(:ids AS bigint[])))"
                     ),
                     {"ids": chunk},
                 )
@@ -446,6 +556,7 @@ class MultiVerticalScorer:
         financial: Optional[Financial],
         violation_count: int = 0,
         persistence_data: Optional[Dict] = None,
+        missing_signals: frozenset = frozenset(),
     ) -> Dict:
         """
         Score a single vertical per spec. Returns a result dict.
@@ -462,6 +573,15 @@ class MultiVerticalScorer:
                                  + absentee + contact + equity)
 
         Equity bonus applies to all verticals with per-vertical rates.
+
+        `missing_signals` (Stage D — feature suppression): signal types the
+        property's county does not load. These are excluded entirely from
+        scoring — they cannot be the primary signal AND don't contribute to
+        the stacking count. Treating them as "absent" (zero contribution but
+        still counted) caused the Pinellas inversion: a Pinellas lead with
+        one strong primary signal scored at the engine cap because the
+        engine considered "no code_violation = clean property" rather than
+        "no code_violation = we don't observe this for this county."
         """
         weights = VERTICAL_WEIGHTS.get(vertical)
         if weights is None:
@@ -474,10 +594,15 @@ class MultiVerticalScorer:
 
         # Group by signal type — each type counts once, using its most recent signal.
         # For code_violations keep the most recent opened_date + associated fine_amount.
+        # Stage D: signals listed in missing_signals are skipped entirely. These are
+        # signal types this county does not load (e.g. Pinellas lacks code_violations),
+        # so any value treated as "absent" would be a false zero.
         latest_by_type: Dict[str, Dict] = {}
         for sig in signals:
             sig_type = sig["type"]
             if sig_type not in weights:
+                continue
+            if sig_type in missing_signals:
                 continue
             d = sig["date"]
             if isinstance(d, datetime):
@@ -670,8 +795,18 @@ class MultiVerticalScorer:
         else:
             persistence_data = {}
 
+        # Stage D — resolve county config once and pass missing_signals into
+        # every per-vertical scoring call. Missing signals are dropped before
+        # primary selection and stacking counts; the multiplicative coverage
+        # discount that used to live at the end of this function is gone.
+        _cfg = for_county(prop.county_id)
+        _missing = _cfg.missing_signals
+
         vertical_results = {
-            v: self._score_vertical(v, signals, owner, financial, violation_count, persistence_data)
+            v: self._score_vertical(
+                v, signals, owner, financial, violation_count, persistence_data,
+                missing_signals=_missing,
+            )
             for v in VERTICAL_WEIGHTS
         }
         vertical_scores = {v: r["score"] for v, r in vertical_results.items()}
@@ -769,6 +904,13 @@ class MultiVerticalScorer:
 
         if _hcpa_passive:
             logger.debug("  HCPA passive signals: %s", _hcpa_passive)
+
+        # Stage D — missing-signal handling now happens upstream in
+        # _score_vertical via the missing_signals frozenset. Those signal
+        # types are dropped before primary selection and stacking counts, so
+        # there is no multiplicative discount to apply here anymore. The
+        # signal_coverage_pct function in config/scoring.py is unused and
+        # will be removed at the Stage F cutover.
 
         # Guard: if no verticals produced any score, default to 0.0
         score_values = [s for s in vertical_scores.values() if s]
@@ -1110,9 +1252,9 @@ class MultiVerticalScorer:
         existing_row = None
         if upsert:
             existing_row = self.session.execute(
-                sa_text("""
+                sa_text(f"""
                     SELECT id, final_cds_score, lead_tier
-                    FROM distress_scores
+                    FROM {self._scores_table_name}
                     WHERE property_id = :pid
                       AND score_date >= :start
                       AND score_date  < :end
@@ -1132,8 +1274,8 @@ class MultiVerticalScorer:
 
             # Raw SQL UPDATE — no ORM object load, no per-row flush
             self.session.execute(
-                sa_text("""
-                    UPDATE distress_scores SET
+                sa_text(f"""
+                    UPDATE {self._scores_table_name} SET
                         score_date      = :now,
                         final_cds_score = :score,
                         lead_tier       = :tier,
@@ -1174,9 +1316,9 @@ class MultiVerticalScorer:
 
         # --- Latest historical score lookup (raw SQL, hits composite index) ---
         latest_row = self.session.execute(
-            sa_text("""
+            sa_text(f"""
                 SELECT final_cds_score, lead_tier
-                FROM distress_scores
+                FROM {self._scores_table_name}
                 WHERE property_id = :pid
                 ORDER BY score_date DESC
                 LIMIT 1
@@ -1199,8 +1341,8 @@ class MultiVerticalScorer:
 
         # --- Insert new score, get PK via RETURNING (no ORM flush needed) ---
         new_id_row = self.session.execute(
-            sa_text("""
-                INSERT INTO distress_scores (
+            sa_text(f"""
+                INSERT INTO {self._scores_table_name} (
                     property_id, county_id, score_date, final_cds_score,
                     lead_tier, urgency_level, qualified,
                     factor_scores, vertical_scores, distress_types, scoring_run_id
@@ -1287,20 +1429,22 @@ class MultiVerticalScorer:
         county_id: Optional[str] = None,
     ) -> list:
         """Keyset pagination: next batch of properties after last_id."""
-        sql = f"SELECT {self._PROP_COLS} FROM properties WHERE id > :last_id"
-        params: dict = {"last_id": last_id, "n": batch_size}
-        if county_id:
-            sql += " AND county_id = :county"
-            params["county"] = county_id
-        sql += " ORDER BY id LIMIT :n"
-        return self.session.execute(sa_text(sql), params).fetchall()
+        with self._profiler.phase("properties_fetch"):
+            sql = f"SELECT {self._PROP_COLS} FROM properties WHERE id > :last_id"
+            params: dict = {"last_id": last_id, "n": batch_size}
+            if county_id:
+                sql += " AND county_id = :county"
+                params["county"] = county_id
+            sql += " ORDER BY id LIMIT :n"
+            return self.session.execute(sa_text(sql), params).fetchall()
 
     def _fetch_properties_by_ids(self, ids: List[int]) -> list:
         """Fetch property rows for a specific list of IDs."""
-        return self.session.execute(
-            sa_text(f"SELECT {self._PROP_COLS} FROM properties WHERE id = ANY(:ids) ORDER BY id"),
-            {"ids": ids},
-        ).fetchall()
+        with self._profiler.phase("properties_fetch"):
+            return self.session.execute(
+                sa_text(f"SELECT {self._PROP_COLS} FROM properties WHERE id IN (SELECT unnest(CAST(:ids AS bigint[]))) ORDER BY id"),
+                {"ids": ids},
+            ).fetchall()
 
     def _fetch_signals_for_batch(self, property_ids: List[int]) -> "defaultdict":
         """
@@ -1313,7 +1457,8 @@ class MultiVerticalScorer:
         p = {"ids": property_ids}
 
         def _q(sql: str) -> list:
-            return self.session.execute(sa_text(sql), p).fetchall()
+            with self._profiler.phase("signals_fetch"):
+                return self.session.execute(sa_text(sql), p).fetchall()
 
         def _ns(row) -> SimpleNamespace:
             return SimpleNamespace(**dict(row._mapping))
@@ -1321,44 +1466,44 @@ class MultiVerticalScorer:
         owner_rows = _q("""
             SELECT property_id, owner_name, owner_type, absentee_status, mailing_address,
                    ownership_years, phone_1, phone_2, phone_3, email_1, email_2
-            FROM owners WHERE property_id = ANY(:ids)
+            FROM owners WHERE property_id IN (SELECT unnest(CAST(:ids AS bigint[])))
         """)
         fin_rows = _q("""
             SELECT property_id, assessed_value_mkt, homestead_exempt, est_equity,
                    equity_pct, last_sale_price, last_sale_date, value_change_yoy
-            FROM financials WHERE property_id = ANY(:ids)
+            FROM financials WHERE property_id IN (SELECT unnest(CAST(:ids AS bigint[])))
         """)
         cv_rows = _q("""
             SELECT property_id, status, violation_type, opened_date, fine_amount
-            FROM code_violations WHERE property_id = ANY(:ids)
+            FROM code_violations WHERE property_id IN (SELECT unnest(CAST(:ids AS bigint[])))
         """)
         lal_rows = _q("""
             SELECT property_id, record_type, document_type, filing_date, amount
-            FROM legal_and_liens WHERE property_id = ANY(:ids)
+            FROM legal_and_liens WHERE property_id IN (SELECT unnest(CAST(:ids AS bigint[])))
         """)
         deed_rows = _q("""
             SELECT property_id, sale_price, record_date, deed_type
-            FROM deeds WHERE property_id = ANY(:ids)
+            FROM deeds WHERE property_id IN (SELECT unnest(CAST(:ids AS bigint[])))
         """)
         lp_rows = _q("""
             SELECT property_id, record_type, case_status, associated_party, filing_date, amount
-            FROM legal_proceedings WHERE property_id = ANY(:ids)
+            FROM legal_proceedings WHERE property_id IN (SELECT unnest(CAST(:ids AS bigint[])))
         """)
         td_rows = _q("""
             SELECT property_id, total_amount_due, years_delinquent, deed_app_date, date_added
-            FROM tax_delinquencies WHERE property_id = ANY(:ids)
+            FROM tax_delinquencies WHERE property_id IN (SELECT unnest(CAST(:ids AS bigint[])))
         """)
         fc_rows = _q("""
             SELECT property_id, filing_date, lis_pendens_date, judgment_amount, plaintiff, auction_date
-            FROM foreclosures WHERE property_id = ANY(:ids)
+            FROM foreclosures WHERE property_id IN (SELECT unnest(CAST(:ids AS bigint[])))
         """)
         bp_rows = _q("""
             SELECT property_id, is_enforcement_permit, status, issue_date, permit_type
-            FROM building_permits WHERE property_id = ANY(:ids)
+            FROM building_permits WHERE property_id IN (SELECT unnest(CAST(:ids AS bigint[])))
         """)
         inc_rows = _q("""
             SELECT property_id, incident_type, incident_date
-            FROM incidents WHERE property_id = ANY(:ids)
+            FROM incidents WHERE property_id IN (SELECT unnest(CAST(:ids AS bigint[])))
         """)
 
         signal_map: defaultdict = defaultdict(lambda: {
@@ -1476,7 +1621,7 @@ class MultiVerticalScorer:
             "WITH latest_scores AS (\n"
             "    SELECT DISTINCT ON (property_id)\n"
             "        property_id, score_date\n"
-            "    FROM distress_scores\n"
+            f"    FROM {self._scores_table_name}\n"
             "    ORDER BY property_id, score_date DESC\n"
             ")\n"
             f"{outer}"
@@ -1522,6 +1667,52 @@ class MultiVerticalScorer:
 
     _TIER_ORDER = ["Ultra Platinum", "Platinum", "Gold", "Silver", "Bronze"]
 
+    def _bulk_update_distress_scores(self, updates_params: List[Dict]) -> None:
+        """Single-round-trip bulk UPDATE via VALUES, replacing executemany.
+
+        Why: with a remote DB, SQLAlchemy's executemany sends N statements
+        over the wire and waits one RTT per row. At ~250ms RTT and 800
+        rows/batch the network tax alone is ~200s/batch. Collapsing to
+        one `UPDATE ... FROM (VALUES %s)` statement makes it one RTT.
+
+        Explicit casts on the SET clause defend against VALUES type
+        inference picking the wrong type from the first row.
+        """
+        if not updates_params:
+            return
+        rows = [
+            (
+                row["id"], row["now"], row["score"], row["tier"], row["urgency"],
+                row["qualified"], row["factor"], row["vertical"], row["distress"],
+                row["run_id"],
+            )
+            for row in updates_params
+        ]
+        raw_conn = self.session.connection().connection
+        with raw_conn.cursor() as cur:
+            psycopg2.extras.execute_values(
+                cur,
+                f"""
+                UPDATE {self._scores_table_name} ds SET
+                    score_date      = v.score_date::timestamp,
+                    final_cds_score = v.final_score::numeric,
+                    lead_tier       = v.tier,
+                    urgency_level   = v.urgency,
+                    qualified       = v.qualified::boolean,
+                    factor_scores   = v.factor::jsonb,
+                    vertical_scores = v.vertical::jsonb,
+                    distress_types  = v.distress::jsonb,
+                    scoring_run_id  = v.run_id::integer
+                FROM (VALUES %s) AS v(
+                    id, score_date, final_score, tier, urgency,
+                    qualified, factor, vertical, distress, run_id
+                )
+                WHERE ds.id = v.id::bigint
+                """,
+                rows,
+                page_size=5000,
+            )
+
     def _persist_score_batch(
         self,
         scored_batch: List[Dict],
@@ -1555,35 +1746,39 @@ class MultiVerticalScorer:
         property_ids = [sd["property_id"] for sd in scored_batch]
 
         # ── 1. Today's rows ───────────────────────────────────────────────
-        today_rows = self.session.execute(sa_text("""
-            SELECT id, property_id, final_cds_score, lead_tier
-            FROM distress_scores
-            WHERE property_id = ANY(:ids)
-              AND score_date >= :start
-              AND score_date  < :end
-        """), {"ids": property_ids, "start": today_start, "end": tomorrow_start}).fetchall()
-        today_by_pid: Dict[int, Any] = {r.property_id: r for r in today_rows}
+        with self._profiler.phase("persist_read_today"):
+            today_rows = self.session.execute(sa_text(f"""
+                SELECT id, property_id, final_cds_score, lead_tier
+                FROM {self._scores_table_name}
+                WHERE property_id IN (SELECT unnest(CAST(:ids AS bigint[])))
+                  AND score_date >= :start
+                  AND score_date  < :end
+            """), {"ids": property_ids, "start": today_start, "end": tomorrow_start}).fetchall()
+            today_by_pid: Dict[int, Any] = {r.property_id: r for r in today_rows}
 
         # ── 2. Latest historical rows (only for PIDs without a today row) ─
         needs_latest = [pid for pid in property_ids if pid not in today_by_pid]
         latest_by_pid: Dict[int, Any] = {}
         if needs_latest:
-            latest_rows = self.session.execute(sa_text("""
-                SELECT DISTINCT ON (property_id)
-                    id, property_id, final_cds_score, lead_tier
-                FROM distress_scores
-                WHERE property_id = ANY(:ids)
-                ORDER BY property_id, score_date DESC
-            """), {"ids": needs_latest}).fetchall()
-            latest_by_pid = {r.property_id: r for r in latest_rows}
+            with self._profiler.phase("persist_read_latest"):
+                latest_rows = self.session.execute(sa_text(f"""
+                    SELECT DISTINCT ON (property_id)
+                        id, property_id, final_cds_score, lead_tier
+                    FROM {self._scores_table_name}
+                    WHERE property_id IN (SELECT unnest(CAST(:ids AS bigint[])))
+                    ORDER BY property_id, score_date DESC
+                """), {"ids": needs_latest}).fetchall()
+                latest_by_pid = {r.property_id: r for r in latest_rows}
 
         # ── 3. Classify each score ────────────────────────────────────────
+        # (Python work — includes json.dumps for the UPDATE-path payloads.)
         updates_params: List[Dict] = []
         inserts_data:   List[Dict] = []
         new_count = updated_count = unchanged_count = upgraded_count = qualified_count = 0
         ghl_queued: List[Dict] = []
 
-        for sd in scored_batch:
+        with self._profiler.phase("persist_classify"):
+          for sd in scored_batch:
             pid         = sd["property_id"]
             final_score = float(sd["final_cds_score"])
             lead_tier   = sd["lead_tier"]
@@ -1635,74 +1830,66 @@ class MultiVerticalScorer:
                         ghl_queued.append(sd)
 
         # ── 4. Batch UPDATE ───────────────────────────────────────────────
+        # Routed through _bulk_update_distress_scores so the N-row UPDATE is
+        # a single round-trip (VALUES join), not N executemany statements.
         if updates_params:
-            self.session.execute(
-                sa_text("""
-                    UPDATE distress_scores SET
-                        score_date      = :now,
-                        final_cds_score = :score,
-                        lead_tier       = :tier,
-                        urgency_level   = :urgency,
-                        qualified       = :qualified,
-                        factor_scores   = CAST(:factor AS jsonb),
-                        vertical_scores = CAST(:vertical AS jsonb),
-                        distress_types  = CAST(:distress AS jsonb),
-                        scoring_run_id  = :run_id
-                    WHERE id = :id
-                """),
-                updates_params,
-            )
+            with self._profiler.phase("persist_update"):
+                self._bulk_update_distress_scores(updates_params)
 
         # ── 5. Batch INSERT ───────────────────────────────────────────────
         new_gold_records: List[tuple] = []
         if inserts_data:
-            insert_params = [
-                {
-                    "pid":      sd["property_id"],
-                    "county":   sd.get("county_id", "hillsborough"),
-                    "now":      now,
-                    "score":    sd["final_cds_score"],
-                    "tier":     sd["lead_tier"],
-                    "urgency":  sd["urgency_level"],
-                    "qualified": sd["qualified"],
-                    "factor":   json.dumps(sd["factor_scores"]),
-                    "vertical": json.dumps(sd["vertical_scores"]),
-                    "distress": json.dumps(sd["distress_types"]),
-                    "run_id":   scoring_run_id,
-                }
-                for sd in inserts_data
-            ]
-            self.session.execute(
-                sa_text("""
-                    INSERT INTO distress_scores (
-                        property_id, county_id, score_date, final_cds_score,
-                        lead_tier, urgency_level, qualified,
-                        factor_scores, vertical_scores, distress_types, scoring_run_id
-                    ) VALUES (
-                        :pid, :county, :now, :score,
-                        :tier, :urgency, :qualified,
-                        CAST(:factor AS jsonb), CAST(:vertical AS jsonb),
-                        CAST(:distress AS jsonb), :run_id
-                    )
-                """),
-                insert_params,
-            )
+            # Split insert-side JSON serialization from the SQL exec so each is
+            # measured separately — JSON cost grows with factor_scores depth.
+            with self._profiler.phase("persist_insert_build"):
+                insert_params = [
+                    {
+                        "pid":      sd["property_id"],
+                        "county":   sd.get("county_id", "hillsborough"),
+                        "now":      now,
+                        "score":    sd["final_cds_score"],
+                        "tier":     sd["lead_tier"],
+                        "urgency":  sd["urgency_level"],
+                        "qualified": sd["qualified"],
+                        "factor":   json.dumps(sd["factor_scores"]),
+                        "vertical": json.dumps(sd["vertical_scores"]),
+                        "distress": json.dumps(sd["distress_types"]),
+                        "run_id":   scoring_run_id,
+                    }
+                    for sd in inserts_data
+                ]
+            with self._profiler.phase("persist_insert_exec"):
+                self.session.execute(
+                    sa_text(f"""
+                        INSERT INTO {self._scores_table_name} (
+                            property_id, county_id, score_date, final_cds_score,
+                            lead_tier, urgency_level, qualified,
+                            factor_scores, vertical_scores, distress_types, scoring_run_id
+                        ) VALUES (
+                            :pid, :county, :now, :score,
+                            :tier, :urgency, :qualified,
+                            CAST(:factor AS jsonb), CAST(:vertical AS jsonb),
+                            CAST(:distress AS jsonb), :run_id
+                        )
+                    """),
+                    insert_params,
+                )
 
-            # Flash scarcity needs the new row ID for Gold leads — retrieve via
-            # (property_id, scoring_run_id) after the insert completes.
-            gold_inserts = [sd for sd in inserts_data if sd["lead_tier"] == "Gold"]
-            if gold_inserts:
-                gold_pids = [sd["property_id"] for sd in gold_inserts]
-                gold_id_rows = self.session.execute(sa_text("""
-                    SELECT id, property_id
-                    FROM distress_scores
-                    WHERE property_id = ANY(:pids)
-                      AND scoring_run_id = :run_id
-                """), {"pids": gold_pids, "run_id": scoring_run_id}).fetchall()
-                gold_id_map = {r.property_id: r.id for r in gold_id_rows}
-                for sd in gold_inserts:
-                    if sd["property_id"] in gold_id_map:
-                        new_gold_records.append((sd, gold_id_map[sd["property_id"]]))
+                # Flash scarcity needs the new row ID for Gold leads — retrieve via
+                # (property_id, scoring_run_id) after the insert completes.
+                gold_inserts = [sd for sd in inserts_data if sd["lead_tier"] == "Gold"]
+                if gold_inserts:
+                    gold_pids = [sd["property_id"] for sd in gold_inserts]
+                    gold_id_rows = self.session.execute(sa_text(f"""
+                        SELECT id, property_id
+                        FROM {self._scores_table_name}
+                        WHERE property_id IN (SELECT unnest(CAST(:pids AS bigint[])))
+                          AND scoring_run_id = :run_id
+                    """), {"pids": gold_pids, "run_id": scoring_run_id}).fetchall()
+                    gold_id_map = {r.property_id: r.id for r in gold_id_rows}
+                    for sd in gold_inserts:
+                        if sd["property_id"] in gold_id_map:
+                            new_gold_records.append((sd, gold_id_map[sd["property_id"]]))
 
         return {
             "new":              new_count,
@@ -1784,12 +1971,14 @@ class MultiVerticalScorer:
         collected_scores: List[Dict] = []   # filled for targeted runs only
 
         for batch in self._iter_property_batches(property_ids, county_id, batch_size):
+            self._profiler.mark_batch()
             with_signal_batch: List[Dict] = []
 
             for prop in batch:
                 self._total_scored += 1
                 try:
-                    score_data = self.score_property(prop)
+                    with self._profiler.phase("score_python"):
+                        score_data = self.score_property(prop)
 
                     if score_data["signal_count"] == 0 or score_data["final_cds_score"] == 0:
                         no_signal_count += 1
@@ -1842,9 +2031,10 @@ class MultiVerticalScorer:
 
             # ── Batch persistence ─────────────────────────────────────────
             if save_to_db and with_signal_batch:
-                result = self._persist_score_batch(
-                    with_signal_batch, scoring_run_id, today_start, tomorrow_start,
-                )
+                with self._profiler.phase("persist_batch"):
+                    result = self._persist_score_batch(
+                        with_signal_batch, scoring_run_id, today_start, tomorrow_start,
+                    )
                 new_count       += result["new"]
                 updated_count   += result["updated"]
                 unchanged_count += result["unchanged"]
@@ -1865,7 +2055,8 @@ class MultiVerticalScorer:
 
             if save_to_db:
                 try:
-                    self.session.commit()
+                    with self._profiler.phase("commit"):
+                        self.session.commit()
                     logger.info(
                         "Scoring progress: %d scored — new=%d updated=%d no_signal=%d",
                         self._total_scored, new_count, updated_count, no_signal_count,
@@ -1877,7 +2068,8 @@ class MultiVerticalScorer:
                     )
 
             if save_to_db and _GHL_PUSH_ENABLED:
-                self._flush_ghl_queue()
+                with self._profiler.phase("ghl_flush"):
+                    self._flush_ghl_queue()
 
             if _targeted:
                 collected_scores.extend(with_signal_batch)
@@ -1907,7 +2099,7 @@ class MultiVerticalScorer:
                     leads_qualified=qualified_db,
                     leads_upgraded=upgraded_count,
                     tier_counts=stats_tier_counts,
-                    county_id=county_id or "hillsborough",
+                    county_id=county_id,
                 )
             except Exception as stats_err:
                 logger.warning("⚠ Could not record platform daily stats (non-critical): %s", stats_err)
@@ -1945,7 +2137,7 @@ class MultiVerticalScorer:
         leads_qualified: int,
         leads_upgraded: int,
         tier_counts: "Counter",
-        county_id: str = 'hillsborough',
+        county_id: Optional[str] = None,
     ) -> None:
         """
         Upsert a row in platform_daily_stats for today.
@@ -1953,7 +2145,18 @@ class MultiVerticalScorer:
         Signal totals (signals_scraped/matched/skipped) are pulled live from
         scraper_run_stats for today so they reflect all scrapers that have run,
         regardless of whether they ran before or after the CDS engine.
+
+        Requires county_id — without one, stats can't be attributed correctly
+        across multi-county pools, so the call is skipped with a warning.
         """
+        if not county_id:
+            logger.warning(
+                "Skipping platform_daily_stats — county_id missing. "
+                "Per-property distress_scores are still correct; only the "
+                "daily roll-up was skipped."
+            )
+            return
+
         from sqlalchemy.dialects.postgresql import insert as pg_insert
         from sqlalchemy import func
 
@@ -2105,6 +2308,60 @@ class MultiVerticalScorer:
 
 # ── CLI entry point ────────────────────────────────────────────────────────────
 
+def _apply_fit_artifact(path: str, log: logging.Logger) -> None:
+    """Load a Stage C JSON artifact and overwrite the module-level
+    ``VERTICAL_WEIGHTS`` dict in-place with the fitted proposals.
+
+    Mutates the existing dict instead of rebinding so any closure/import
+    that already captured the reference (e.g. ``from config.scoring import
+    VERTICAL_WEIGHTS`` elsewhere) sees the updated values. Only signals
+    that exist in both the artifact and the current weights are touched —
+    artifact entries for unknown signals are ignored to avoid silently
+    extending the scoring surface.
+
+    Raises SystemExit(2) on any malformed artifact — Stage E must fail
+    loudly rather than score against partial/wrong data.
+    """
+    import json
+    from pathlib import Path
+
+    artifact_path = Path(path)
+    if not artifact_path.is_file():
+        log.error("Fit artifact not found: %s", artifact_path)
+        sys.exit(2)
+
+    try:
+        artifact = json.loads(artifact_path.read_text())
+    except json.JSONDecodeError as exc:
+        log.error("Fit artifact is not valid JSON (%s): %s", artifact_path, exc)
+        sys.exit(2)
+
+    proposals = artifact.get("proposals")
+    if not isinstance(proposals, list):
+        log.error("Fit artifact missing 'proposals' list: %s", artifact_path)
+        sys.exit(2)
+
+    applied = 0
+    skipped: List[str] = []
+    for proposal in proposals:
+        vertical = proposal.get("vertical")
+        weights = proposal.get("vertical_weights") or {}
+        if vertical not in VERTICAL_WEIGHTS:
+            skipped.append(vertical or "<no-vertical>")
+            continue
+        # Mutate in place — preserves dict identity across all importers.
+        target = VERTICAL_WEIGHTS[vertical]
+        for sig, w in weights.items():
+            if sig in target:
+                target[sig] = int(w)
+                applied += 1
+    log.info(
+        "[fit-artifact] loaded %s — applied %d (signal, vertical) weights%s",
+        artifact_path.name, applied,
+        f", skipped verticals: {skipped}" if skipped else "",
+    )
+
+
 def main():
     """
     Entry point for CLI / cron execution.
@@ -2157,6 +2414,16 @@ def main():
         help="Skip GHL CRM push (useful for bulk rescores to avoid rate limits)",
     )
     parser.add_argument(
+        "--profile",
+        action="store_true",
+        help=(
+            "Emit a per-phase wall-clock breakdown (properties_fetch, "
+            "signals_fetch, score_python, persist_batch, commit, ghl_flush) "
+            "at the end of the run. Useful for monitoring scoring throughput "
+            "and validating that no single phase regresses after schema changes."
+        ),
+    )
+    parser.add_argument(
         "--batch-size",
         type=int,
         default=_BULK_BATCH_SIZE,
@@ -2167,18 +2434,75 @@ def main():
             "Increase on high-RAM servers for fewer round-trips; decrease to reduce peak memory."
         ),
     )
+    parser.add_argument(
+        "--shadow",
+        action="store_true",
+        help=(
+            "Stage E shadow-rescore mode. Writes scores to distress_scores_shadow "
+            "instead of distress_scores, skips the pending_sync GHL flush, and "
+            "leaves the live subscriber-facing state untouched. Pair with "
+            "--fit-artifact to evaluate proposed Stage C weights before cutover."
+        ),
+    )
+    parser.add_argument(
+        "--fit-artifact",
+        type=str,
+        default=None,
+        metavar="PATH",
+        dest="fit_artifact",
+        help=(
+            "Path to a Stage C JSON artifact (data/scoring_fit/<id>.json). "
+            "Overrides VERTICAL_WEIGHTS in-memory with the fitted proposals. "
+            "Requires --shadow — must not be used against the live tables."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.fit_artifact and not args.shadow:
+        log.error(
+            "--fit-artifact requires --shadow. Refusing to score the live table "
+            "with proposed weights — use Stage F's cutover edit to config/scoring.py instead."
+        )
+        sys.exit(2)
 
     if args.no_ghl:
         global _GHL_PUSH_ENABLED
         _GHL_PUSH_ENABLED = False
         log.info("[GHL] Push disabled via --no-ghl flag")
 
-    property_ids = None
-    if args.property_id:
-        property_ids = [args.property_id]
+    # ── Resolve target counties ───────────────────────────────────────────
+    # --county-id wins. Otherwise, --property-id resolves to that property's
+    # own county (so platform_daily_stats is attributed correctly). With
+    # neither, iterate every active county from the `counties` DB table.
+    from src.utils.county_config import list_counties
 
-    county_label = f" [{args.county_id}]" if args.county_id else ""
+    if args.county_id:
+        target_counties: List[str] = [args.county_id]
+    elif args.property_id:
+        try:
+            with get_db_context() as _lookup:
+                row = _lookup.execute(
+                    sa_text("SELECT county_id FROM properties WHERE id = :id"),
+                    {"id": args.property_id},
+                ).first()
+            if not row or not row.county_id:
+                log.error("Property id=%s not found or has no county_id", args.property_id)
+                sys.exit(2)
+            target_counties = [row.county_id]
+        except (OperationalError, SQLAlchemyError) as exc:
+            log.error("Database error looking up property county: %s", exc, exc_info=True)
+            sys.exit(1)
+    else:
+        target_counties = list_counties()
+        if not target_counties:
+            log.error("No active counties found in `counties` table — nothing to score")
+            sys.exit(2)
+        log.info(
+            "No --county-id given — iterating %d active counties: %s",
+            len(target_counties), target_counties,
+        )
+
+    county_label = f" [{','.join(target_counties)}]"
     if args.property_id:
         run_label = f"property {args.property_id}"
     elif args.rescore_new_signals:
@@ -2197,25 +2521,105 @@ def main():
     interrupted = False
     scorer = None
 
+    # ── Cross-county aggregate stats (for CLI summary) ────────────────────
+    # platform_daily_stats is written per-county inside the loop; this dict
+    # only feeds the operator's terminal output.
+    combined_total = 0
+    combined_stats: Dict[str, Any] = {
+        "with_signals":        0,
+        "qualified":           0,
+        "tier_counts":         Counter(),
+        "urgency_counts":      Counter(),
+        "top_vertical_counts": Counter(),
+        "signal_type_counts":  Counter(),
+        "score_sum":           0.0,
+        "score_max":           0.0,
+        "new":                 0,
+        "updated":             0,
+        "unchanged":           0,
+        "upgraded":            0,
+        "failed":              0,
+        "no_signal":           0,
+        "top10":               [],
+    }
+
+    # Stage E — apply shadow-mode and fit-artifact overrides before any
+    # scoring work happens. fit_artifact mutates the global VERTICAL_WEIGHTS
+    # so the engine's _score_vertical reads the proposed numbers; shadow mode
+    # routes writes to the shadow table and suppresses pending_sync flushes.
+    if args.fit_artifact:
+        _apply_fit_artifact(args.fit_artifact, log)
+    if args.shadow:
+        # Mutate the module-level flag directly. `global _GHL_PUSH_ENABLED`
+        # was already declared earlier in this function under --no-ghl, so
+        # redeclaring it here would be a SyntaxError. The bare assignment
+        # below still hits the global because of that earlier declaration.
+        _GHL_PUSH_ENABLED = False  # noqa: F841 — global is in scope from earlier
+        log.info("[shadow] writing to distress_scores_shadow; GHL push disabled")
+
     try:
         with get_db_context() as session:
             scorer = MultiVerticalScorer(session)
+            if args.shadow:
+                scorer._scores_table_name = "distress_scores_shadow"
+                scorer._shadow_mode = True
+            if args.profile:
+                scorer._profiler = _Profiler(enabled=True)
+                log.info("[profile] enabled — phase timings will be reported at end of run")
 
-            if args.rescore_new_signals:
-                log.info("Collecting properties with new signals since last score...")
-                property_ids = scorer._collect_changed_property_ids(county_id=args.county_id)
-                log.info("Found %d properties with new signals to rescore", len(property_ids))
-                if not property_ids:
-                    log.info("No properties need rescoring — all up to date")
-                    sys.exit(0)
+            for cid in target_counties:
+                if len(target_counties) > 1:
+                    log.info("─" * 60)
+                    log.info("County: %s", cid)
+                    log.info("─" * 60)
 
-            scorer.score_all_properties(
-                save_to_db=True,
-                property_ids=property_ids,
-                county_id=args.county_id,
-                batch_size=args.batch_size,
+                if args.property_id:
+                    this_property_ids: Optional[List[int]] = [args.property_id]
+                elif args.rescore_new_signals:
+                    log.info("[%s] Collecting properties with new signals…", cid)
+                    this_property_ids = scorer._collect_changed_property_ids(county_id=cid)
+                    log.info("[%s] Found %d properties with new signals to rescore",
+                             cid, len(this_property_ids))
+                    if not this_property_ids:
+                        log.info("[%s] up to date — skipping", cid)
+                        continue
+                else:
+                    this_property_ids = None
+
+                scorer.score_all_properties(
+                    save_to_db=True,
+                    property_ids=this_property_ids,
+                    county_id=cid,
+                    batch_size=args.batch_size,
+                )
+                session.commit()
+
+                # Roll up per-county stats into the combined summary.
+                rs_county = getattr(scorer, "_last_run_stats", {}) or {}
+                combined_total += scorer._total_scored
+                combined_stats["with_signals"]        += rs_county.get("with_signals", 0)
+                combined_stats["qualified"]           += rs_county.get("qualified", 0)
+                combined_stats["tier_counts"]         += rs_county.get("tier_counts", Counter())
+                combined_stats["urgency_counts"]      += rs_county.get("urgency_counts", Counter())
+                combined_stats["top_vertical_counts"] += rs_county.get("top_vertical_counts", Counter())
+                combined_stats["signal_type_counts"]  += rs_county.get("signal_type_counts", Counter())
+                combined_stats["score_sum"]           += rs_county.get("score_sum", 0.0)
+                combined_stats["score_max"]            = max(
+                    combined_stats["score_max"], rs_county.get("score_max", 0.0),
+                )
+                combined_stats["new"]                 += rs_county.get("new", 0)
+                combined_stats["updated"]             += rs_county.get("updated", 0)
+                combined_stats["unchanged"]           += rs_county.get("unchanged", 0)
+                combined_stats["upgraded"]            += rs_county.get("upgraded", 0)
+                combined_stats["failed"]              += rs_county.get("failed", 0)
+                combined_stats["no_signal"]           += rs_county.get("no_signal", 0)
+                combined_stats["top10"].extend(rs_county.get("top10", []))
+
+            # Trim the merged top-10 across counties to the global top 10.
+            combined_stats["top10"].sort(
+                key=lambda sd: sd.get("final_cds_score", 0.0), reverse=True,
             )
-            session.commit()
+            combined_stats["top10"] = combined_stats["top10"][:10]
 
     except KeyboardInterrupt:
         interrupted = True
@@ -2235,14 +2639,15 @@ def main():
         sys.exit(3)
 
     # ── Stats output ──────────────────────────────────────────────────────────
-    # All aggregate stats come from scorer._last_run_stats which is populated
-    # incrementally during scoring — no need to iterate the returned scores list.
+    # combined_stats merges _last_run_stats across each county processed in
+    # the loop above. platform_daily_stats already got per-county rows; this
+    # output is just the operator's terminal summary.
     if scorer is None:
         log.info("Scoring did not start — no stats available.")
         sys.exit(1)
 
-    rs    = getattr(scorer, "_last_run_stats", {})
-    total = scorer._total_scored
+    rs    = combined_stats
+    total = combined_total
 
     log.info("=" * 60)
     log.info("CDS SCORING COMPLETE%s", " (INTERRUPTED)" if interrupted else "")
@@ -2310,6 +2715,10 @@ def main():
                 best_v, best_v_score,
                 s["signal_count"],
             )
+
+    # ── Profiling report ──────────────────────────────────────────────────────
+    if args.profile and scorer is not None:
+        scorer._profiler.report(log)
 
     log.info("")
     log.info("Finished: %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))

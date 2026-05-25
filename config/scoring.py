@@ -41,18 +41,24 @@ VERTICAL_WEIGHTS = {
         "deed_transfers": 50,    # Adjusted [cite: 109]
         "irs_tax_liens": 55,     # Adjusted [cite: 109]
         "hoa_liens": 68,         # Boosted: unpaid dues = financial distress = motivated seller
+                                 # 2026-05-25 diag confirms — 30d lift 1.73 (the only positive
+                                 # non-deed signal in the per-signal predictability report)
         "divorce_filings": 60,   # Couple splitting = motivated to sell quickly
         "evictions": 45,         # Adjusted [cite: 109]
-        "mechanics_liens": 55,
+        "mechanics_liens": 35,   # 2026-05-25: was 55. Per-signal diag lift 0.23 at 30d —
+                                 # anti-predicts short-term sales. Long-term timescale unknown;
+                                 # revisit after 90d outcome window matures.
         "insurance_claim": 10,   # Stacking only
         "fire": 10,              # Stacking only
         "storm_damage": 10,      # Stacking only
         "flood_damage": 10,      # Stacking only
-        "tampa_code_liens": 35,
-        "county_code_liens": 30,
+        "code_lien": 35,         # Unified TCL/CCL/CODE LIEN (Stage 1: was TCL=35, CCL=30)
         "building_permits": 20,
         "enforcement_permit": 50,  # Stop work/after-the-fact/failed/expired/revoked
-        "code_violations": 35,
+        "code_violations": 20,   # 2026-05-25: was 35. Per-signal diag lift 0.35 at 30d —
+                                 # weakest non-zero predictor in the report. Industry priors
+                                 # agree code_violations alone is weak (useful only stacked
+                                 # with a primary distress signal).
     },
     "fix_flip": {
         "foreclosures": 75,      # Adjusted [cite: 109]
@@ -61,7 +67,8 @@ VERTICAL_WEIGHTS = {
         "judgment_liens": 55,    # Adjusted [cite: 109]
         "irs_tax_liens": 50,     # Adjusted [cite: 109]
         "probate": 55,           # Adjusted [cite: 109]
-        "mechanics_liens": 60,   # Adjusted [cite: 109]
+        "mechanics_liens": 40,   # 2026-05-25: was 60. Per-signal diag lift 0.23 at 30d.
+                                 # See wholesalers.mechanics_liens note.
         "hoa_liens": 65,         # Boosted: financial distress = motivated to sell
         "divorce_filings": 55,   # Motivated seller, property often priced to move
         "deed_transfers": 45,    # Adjusted [cite: 109]
@@ -70,11 +77,11 @@ VERTICAL_WEIGHTS = {
         "fire": 10,              # Stacking only
         "storm_damage": 10,      # Stacking only
         "flood_damage": 10,      # Stacking only
-        "tampa_code_liens": 45,
-        "code_violations": 50,
+        "code_lien": 45,         # Unified TCL/CCL/CODE LIEN (Stage 1: was TCL=45, CCL=20)
+        "code_violations": 30,   # 2026-05-25: was 50. Per-signal diag lift 0.35 at 30d.
+                                 # See wholesalers.code_violations note.
         "building_permits": 45,
         "enforcement_permit": 60,  # Stop work/after-the-fact/failed/expired/revoked
-        "county_code_liens": 20,
     },
     "restoration": {
         "code_violations": 75,   # 2026-05-04: was 90 — single signal at 90 + recency 25 auto-saturated cap at 100
@@ -82,7 +89,7 @@ VERTICAL_WEIGHTS = {
         "fire": 10,              # Stacking only
         "storm_damage": 10,      # Stacking only
         "flood_damage": 10,      # Stacking only
-        "tampa_code_liens": 65,  # 2026-05-04: was 75 — same saturation problem
+        "code_lien": 65,         # Unified TCL/CCL/CODE LIEN (Stage 1: was TCL=65, CCL=15)
         "building_permits": 10,  # Stacking only — active permit = contractor on job, not a distress signal
         "enforcement_permit": 65,  # 2026-05-04: was 75 — same saturation problem
         "evictions": 65,
@@ -96,7 +103,6 @@ VERTICAL_WEIGHTS = {
         "bankruptcy": 30,
         "tax_delinquencies": 30,
         "irs_tax_liens": 40,
-        "county_code_liens": 15,
     },
     "roofing": {
         "building_permits": 10,  # Stacking only — active permit = contractor on job, not a lead signal
@@ -106,7 +112,7 @@ VERTICAL_WEIGHTS = {
         "storm_damage": 10,      # Stacking only
         "flood_damage": 10,      # Stacking only
         "code_violations": 58,   # 2026-05-04: was 68 — code_violations also drives restoration/PA, multi-vertical correlation
-        "tampa_code_liens": 55,  # 2026-05-04: was 65 — same multi-vertical correlation
+        "code_lien": 55,         # Unified TCL/CCL/CODE LIEN (Stage 1: was TCL=55, CCL=20)
         "mechanics_liens": 60,   # Adjusted [cite: 109]
         "hoa_liens": 60,
         "divorce_filings": 20,
@@ -117,7 +123,6 @@ VERTICAL_WEIGHTS = {
         "bankruptcy": 30,
         "tax_delinquencies": 30,
         "irs_tax_liens": 50,
-        "county_code_liens": 20,
         "deed_transfers": 20,
     },
     "public_adjusters": {        # Activated Vertical
@@ -126,7 +131,7 @@ VERTICAL_WEIGHTS = {
         "fire": 10,              # Stacking only
         "storm_damage": 10,      # Stacking only
         "flood_damage": 10,      # Stacking only
-        "tampa_code_liens": 60,  # 2026-05-04: was 70 — same saturation problem
+        "code_lien": 60,         # Unified TCL/CCL/CODE LIEN (Stage 1: was TCL=60, CCL=20)
         "building_permits": 55,  # Adjusted [cite: 109]
         "enforcement_permit": 60,  # 2026-05-04: was 70 — same saturation problem
         "hoa_liens": 50,         # Adjusted from 55
@@ -139,7 +144,6 @@ VERTICAL_WEIGHTS = {
         "bankruptcy": 30,
         "tax_delinquencies": 30,
         "irs_tax_liens": 45,
-        "county_code_liens": 20,
         "deed_transfers": 20,
     },
     "attorneys": {
@@ -148,21 +152,22 @@ VERTICAL_WEIGHTS = {
         "divorce_filings": 65,   # Property settlements, title disputes = direct attorney work
         "foreclosures": 55,      # Adjusted [cite: 109]
         "bankruptcy": 55,        # Adjusted [cite: 109]
-        "tampa_code_liens": 40,  # Adjusted [cite: 109]
+        "code_lien": 40,         # Unified TCL/CCL/CODE LIEN (Stage 1: was TCL=40, CCL=20)
         "hoa_liens": 70,         # Boosted: HOA litigation is common attorney engagement
-        "mechanics_liens": 50,   # Adjusted [cite: 109]
+        "mechanics_liens": 35,   # 2026-05-25: was 50. Per-signal diag lift 0.23 at 30d.
+                                 # See wholesalers.mechanics_liens note.
         "tax_delinquencies": 50, # Adjusted [cite: 109]
         "probate": 40,           # Adjusted [cite: 109]
         "insurance_claim": 10,   # Stacking only
         "fire": 10,              # Stacking only
         "storm_damage": 10,      # Stacking only
         "flood_damage": 10,      # Stacking only
-        "code_violations": 30,
+        "code_violations": 20,   # 2026-05-25: was 30. Per-signal diag lift 0.35 at 30d.
+                                 # See wholesalers.code_violations note.
         "building_permits": 20,
         "enforcement_permit": 40,  # Stop work/after-the-fact/failed/expired/revoked
         "evictions": 25,
         "deed_transfers": 25,
-        "county_code_liens": 20,
     },
 }
 
@@ -394,3 +399,151 @@ OWNER_OCCUPIED_EXCLUSION_VERTICALS = frozenset({
 # A property sold within this window is off-market. Distress signals belong to
 # the previous owner. Return no signals so the property scores 0 and exits routing.
 DEAD_LEAD_DEED_DAYS = 45
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Per-county configuration (Stage 2 + Stage 3 — fa030 county-aware scoring)
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# Stage 2: ScoringConfig + for_county() mirror the config/matching.py pattern
+# but use SPARSE overrides — a county only specifies fields that differ from
+# globals. The full set of fields stays in the dataclass so any field can be
+# overridden when data justifies it.
+#
+# Stage 3: `missing_signals` drives the coverage normalizer in cds_engine.
+# Pinellas isn't loading several signal types yet (code_violations,
+# tax_delinquencies, etc. — see 2026-05-22 audit). Without a normalizer, a
+# Pinellas lead with one heavy primary signal (probate, foreclosure) scores
+# the same as a Hillsborough lead with that same signal — but Hillsborough
+# has corroborating evidence from 6+ other signal axes saying "yes, real
+# distress." The normalizer applies a per-vertical confidence discount when
+# signals are missing from the data, so tier assignment stays meaningful
+# across counties without forcing a fixed distribution shape per county.
+
+from dataclasses import dataclass, field, replace
+from typing import Any
+
+
+@dataclass(frozen=True)
+class ScoringConfig:
+    """Bundle of scoring knobs. Override sparsely per county via COUNTY_OVERRIDES."""
+    vertical_weights:                   dict[str, dict[str, int]]
+    lead_tier_thresholds:               list[tuple[int, str]]
+    routing_thresholds:                 dict[str, int]
+    equity_bonus_by_vertical:           dict[str, int]
+    equity_high_thresh:                 int
+    equity_mid_thresh:                  int
+    stacking_window_days:               int
+    stacking_bonus_per_signal:          int
+    stacking_bonus_cap:                 int
+    stacking_min_weight:                int
+    stacking_only_signals:              frozenset
+    absentee_bonus:                     dict[str, int]
+    contact_phone_bonus:                int
+    contact_email_bonus:                int
+    recency_bonuses:                    list
+    age_decay_1y:                       int
+    age_decay_2y:                       int
+    signal_hard_cutoff_days:            int
+    dead_lead_deed_days:                int
+    score_cap:                          int
+    owner_occupied_exclusion_verticals: frozenset
+    # Stage 3 — coverage normalizer. Empty frozenset = full coverage.
+    missing_signals:                    frozenset = field(default_factory=frozenset)
+    # Stopgap for the cross-county calibration retune: counties whose tier
+    # distribution is not yet trustworthy (e.g. Pinellas pre-refit) set this
+    # to "internal" so the feed API, GHL webhook, and Cora prompts suppress
+    # the tier label. "public" = expose tier downstream as normal.
+    tier_visibility:                    str = "public"
+
+
+SCORING_CONFIG = ScoringConfig(
+    vertical_weights=VERTICAL_WEIGHTS,
+    lead_tier_thresholds=LEAD_TIER_THRESHOLDS,
+    routing_thresholds=ROUTING_THRESHOLDS,
+    equity_bonus_by_vertical=EQUITY_BONUS_BY_VERTICAL,
+    equity_high_thresh=EQUITY_HIGH_THRESH,
+    equity_mid_thresh=EQUITY_MID_THRESH,
+    stacking_window_days=STACKING_WINDOW_DAYS,
+    stacking_bonus_per_signal=STACKING_BONUS_PER_SIGNAL,
+    stacking_bonus_cap=STACKING_BONUS_CAP,
+    stacking_min_weight=STACKING_MIN_WEIGHT,
+    stacking_only_signals=frozenset(STACKING_ONLY_SIGNALS),
+    absentee_bonus=ABSENTEE_BONUS,
+    contact_phone_bonus=CONTACT_PHONE_BONUS,
+    contact_email_bonus=CONTACT_EMAIL_BONUS,
+    recency_bonuses=RECENCY_BONUSES,
+    age_decay_1y=AGE_DECAY_1Y,
+    age_decay_2y=AGE_DECAY_2Y,
+    signal_hard_cutoff_days=SIGNAL_HARD_CUTOFF_DAYS,
+    dead_lead_deed_days=DEAD_LEAD_DEED_DAYS,
+    score_cap=SCORE_CAP,
+    owner_occupied_exclusion_verticals=frozenset(OWNER_OCCUPIED_EXCLUSION_VERTICALS),
+    missing_signals=frozenset(),  # Hillsborough has all signals
+    tier_visibility="public",
+)
+
+
+# Sparse per-county overrides. Keys must match ScoringConfig field names.
+# Missing key → use the global value from SCORING_CONFIG above.
+COUNTY_OVERRIDES: dict[str, dict[str, Any]] = {
+    # Pinellas — per 2026-05-22 audit, these signal types have zero rows
+    # loaded in the data, so the coverage normalizer must discount Pinellas
+    # vertical scores by the weight share these missing signals would
+    # otherwise contribute. Once the relevant scrapers are onboarded, remove
+    # entries from this set rather than retuning weights.
+    "pinellas": {
+        "missing_signals": frozenset({
+            "code_violations",
+            "code_lien",
+            "enforcement_permit",
+            "tax_delinquencies",
+            "bankruptcy",
+            "evictions",
+        }),
+        # Tier labels suppressed downstream until the cross-county
+        # calibration retune lands. The score itself is still written to
+        # distress_scores.lead_tier for internal analytics; only the
+        # subscriber-facing surfaces (feed API, GHL contact, Cora SMS)
+        # omit the label.
+        "tier_visibility": "internal",
+    },
+}
+
+
+def for_county(county_id: str | None) -> ScoringConfig:
+    """Return a ScoringConfig with sparse county overrides applied.
+
+    None or unknown county_id → global SCORING_CONFIG unchanged. Empty
+    override dict (e.g. county registered but no deltas) also returns the
+    global.
+    """
+    if not county_id:
+        return SCORING_CONFIG
+    overrides = COUNTY_OVERRIDES.get(county_id)
+    if not overrides:
+        return SCORING_CONFIG
+    return replace(SCORING_CONFIG, **overrides)
+
+
+def signal_coverage_pct(vertical: str, cfg: ScoringConfig) -> float:
+    """Per-vertical signal-availability ratio for the given config (0.0–1.0).
+
+    Coverage = (sum of weights for available signals) / (sum of all weights).
+    Counties with full data return 1.0. Counties missing signals return a
+    smaller value used by the score normalizer as a confidence discount.
+
+    Stacking-only signals (insurance_claim, fire, etc.) are included in the
+    total weight basis — they contribute to scoring even though they can't
+    be primary, so excluding them would understate the discount.
+    """
+    if not cfg.missing_signals:
+        return 1.0
+    weights = cfg.vertical_weights.get(vertical) or {}
+    total = sum(weights.values())
+    if total == 0:
+        return 1.0
+    missing_weight = sum(
+        w for sig, w in weights.items() if sig in cfg.missing_signals
+    )
+    return max(0.0, (total - missing_weight) / total)

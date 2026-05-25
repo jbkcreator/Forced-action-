@@ -20,7 +20,15 @@ _LEGAL_DESC_RE = re.compile(
     re.IGNORECASE,
 )
 
-from src.loaders.base import BaseLoader
+from src.loaders.base import (
+    BaseLoader,
+    MATCH_METHOD_LEGAL_DESC,
+    MATCH_METHOD_NORM_ADDR,
+    MATCH_METHOD_OWNER_NAME,
+    MATCH_METHOD_OWNER_ZIP,
+    MATCH_METHOD_OWNER_CITY,
+)
+from src.loaders._address_utils import split_address
 from src.core.models import LegalProceeding
 
 logger = logging.getLogger(__name__)
@@ -86,7 +94,7 @@ class ProbateLoader(BaseLoader):
             case_number = _safe_str(case_number) or str(case_number).strip()
 
             # Check for duplicates
-            if skip_duplicates and self.check_duplicate(LegalProceeding, {'case_number': case_number}):
+            if skip_duplicates and self.check_duplicate(LegalProceeding, {'case_number': case_number}, scope_county=False):
                 logger.debug(f"Skipping duplicate probate case: {case_number}")
                 skipped += 1
                 continue
@@ -98,72 +106,76 @@ class ProbateLoader(BaseLoader):
             else:
                 decedent_row = group.iloc[0]
 
-            # Match by address
-            property_record = None
-            match_score = 0
-            match_method = None
+            # ── Cascade match ─────────────────────────────────────────────
+            # Build inputs: PartyAddress can be either a street address (cascade
+            # stage 2) or a legal description (alternate path). Split on the
+            # legal-desc regex so we route to the right stage.
             party_address_val = _none_if_nan(decedent_row.get('PartyAddress'))
+            addr_for_cascade: Optional[str] = None
+            legal_for_cascade: Optional[str] = None
+            zip_for_cascade: Optional[str] = None
+            city_for_cascade: Optional[str] = None
 
             if party_address_val:
                 addr_str = str(party_address_val)
                 if _LEGAL_DESC_RE.match(addr_str):
-                    # PartyAddress is a legal description (LOT/BLOCK/UNIT…), not a
-                    # street address — find_property_by_address would fail on it.
-                    match_result = self.find_property_by_legal_description(
-                        addr_str, threshold=self._thresholds.legal_desc_floor,
-                    )
-                    match_via = "legal_desc"
+                    legal_for_cascade = addr_str
                 else:
-                    match_result = self.find_property_by_address(
-                        addr_str, threshold=self._thresholds.address_floor,
-                    )
-                    match_via = "address"
-                if match_result:
-                    property_record, match_score = match_result
-                    match_method = match_via
-                    logger.info(f"Matched probate by {match_via} (score: {match_score}%): {case_number}")
+                    addr_for_cascade = addr_str
+                    _, city_for_cascade, zip_for_cascade = split_address(addr_str)
 
-            # Fallback to owner name — try multiple permutations
-            if not property_record:
-                last_name = _none_if_nan(decedent_row.get('LastName/CompanyName'))
-                if last_name:
-                    first = str(_none_if_nan(decedent_row.get('FirstName')) or "").strip()
-                    middle = str(_none_if_nan(decedent_row.get('MiddleName')) or "").strip()
-                    last = str(last_name).strip()
+            # Build owner-name variants (try most specific first; cascade is
+            # called once per variant until a match meets the threshold).
+            name_variants: list = []
+            last_name = _none_if_nan(decedent_row.get('LastName/CompanyName'))
+            if last_name:
+                first = str(_none_if_nan(decedent_row.get('FirstName')) or "").strip()
+                middle = str(_none_if_nan(decedent_row.get('MiddleName')) or "").strip()
+                last = str(last_name).strip()
+                full_name = " ".join([first, middle, last]).strip()
+                full_name = " ".join(full_name.split())
+                if full_name:
+                    name_variants.append(full_name)
+                if first and last:
+                    first_last = f"{first} {last}"
+                    if first_last != full_name:
+                        name_variants.append(first_last)
+                if '-' in last:
+                    for part in last.split('-'):
+                        if len(part) > 4 and first:
+                            name_variants.append(f"{first} {part}")
 
-                    full_name = " ".join([first, middle, last]).strip()
-                    full_name = " ".join(full_name.split())
+            property_record = None
+            match_score = 0
+            match_method = None
 
-                    # Build variants: full → first+last → hyphen parts
-                    # (bare surname removed — too many false positives on common last names)
-                    name_variants: list = []
-                    if full_name:
-                        name_variants.append(full_name)
-                    if first and last:
-                        first_last = f"{first} {last}"
-                        if first_last != full_name:
-                            name_variants.append(first_last)
-                    if '-' in last:
-                        for part in last.split('-'):
-                            if len(part) > 4 and first:
-                                name_variants.append(f"{first} {part}")
-
-                    for variant in name_variants:
-                        match_result = self.find_property_by_owner_name(
-                            variant, threshold=self._thresholds.owner_name_floor,
+            for variant in (name_variants or [None]):
+                # One cascade call per name variant. Address/legal stages don't
+                # depend on the name so they get re-evaluated each loop, but
+                # that's cheap — the cascade short-circuits at stage 1 or 2.
+                prop, method, score = self.find_property_cascade(
+                    address=addr_for_cascade,
+                    legal_desc=legal_for_cascade,
+                    owner_name=variant,
+                    zip_code=zip_for_cascade,
+                    city=city_for_cascade,
+                    addr_threshold=self._thresholds.address_floor,
+                    owner_threshold=self._thresholds.owner_name_floor,
+                    legal_threshold=self._thresholds.legal_desc_floor,
+                )
+                if prop:
+                    property_record, match_method, match_score = prop, method, score
+                    logger.info(f"Matched probate by {method} (score: {score}%, variant: {variant!r}): {case_number}")
+                    # LLM verification for owner-based matches (any zip/city/plain)
+                    if method in (MATCH_METHOD_OWNER_NAME, MATCH_METHOD_OWNER_ZIP, MATCH_METHOD_OWNER_CITY):
+                        property_record, llm_method = self._apply_llm_verification(
+                            raw_row=decedent_row.to_dict() if hasattr(decedent_row, 'to_dict') else dict(decedent_row),
+                            current_best=property_record, match_score=match_score,
+                            record_type='probate', match_field='LastName/CompanyName',
                         )
-                        if match_result:
-                            property_record, match_score = match_result
-                            match_method = 'owner_name'
-                            logger.info(f"Matched probate by name '{variant}' (score: {match_score}%): {case_number}")
-                            property_record, llm_method = self._apply_llm_verification(
-                                raw_row=decedent_row.to_dict() if hasattr(decedent_row, 'to_dict') else dict(decedent_row),
-                                current_best=property_record, match_score=match_score,
-                                record_type='probate', match_field='LastName/CompanyName',
-                            )
-                            if llm_method:
-                                match_method = llm_method
-                            break
+                        if llm_method:
+                            match_method = llm_method
+                    break
 
             if property_record:
                 tier = self._classify_match(match_score, match_method)
@@ -294,7 +306,7 @@ class EvictionLoader(BaseLoader):
             case_number = _safe_str(case_number) or str(case_number).strip()
 
             # Check for duplicates
-            if skip_duplicates and self.check_duplicate(LegalProceeding, {'case_number': case_number}):
+            if skip_duplicates and self.check_duplicate(LegalProceeding, {'case_number': case_number}, scope_county=False):
                 logger.debug(f"Skipping duplicate eviction: {case_number}")
                 skipped += 1
                 continue
@@ -306,51 +318,55 @@ class EvictionLoader(BaseLoader):
             else:
                 defendant_row = group.iloc[0]
 
-            # Match by address
-            property_record = None
-            match_score = 0
-            match_method = None
+            # ── Cascade match ─────────────────────────────────────────────
+            # Defendant address (tenant address = property address). Defendant
+            # NAME is never used for matching (it's the tenant, not the owner).
+            # Plaintiff name (landlord/owner) is the owner candidate.
             party_address_val = _none_if_nan(defendant_row.get('PartyAddress'))
+            addr_for_cascade = str(party_address_val) if party_address_val else None
+            _, city_for_cascade, zip_for_cascade = split_address(addr_for_cascade) if addr_for_cascade else (None, None, None)
 
-            if party_address_val:
-                match_result = self.find_property_by_address(
-                    str(party_address_val), threshold=self._thresholds.address_floor,
-                )
-                if match_result:
-                    property_record, match_score = match_result
-                    match_method = 'address'
-                    logger.info(f"Matched eviction by address (score: {match_score}%): {case_number}")
-
-            # Fallback: try plaintiff name (landlord/property owner)
-            # Defendant = tenant — never use tenant name for property matching
-            if not property_record and 'PartyType' in group.columns and 'LastName/CompanyName' in group.columns:
+            # Plaintiff (owner) name variants
+            name_variants: list = []
+            plaintiff_row_for_llm = None
+            if 'PartyType' in group.columns and 'LastName/CompanyName' in group.columns:
                 plaintiff_rows = group[group['PartyType'] == 'Plaintiff']
                 if not plaintiff_rows.empty:
                     prow = plaintiff_rows.iloc[0]
+                    plaintiff_row_for_llm = prow
                     first = str(_none_if_nan(prow.get('FirstName')) or '').strip()
                     last = str(_none_if_nan(prow.get('LastName/CompanyName')) or '').strip()
                     if last:
-                        name_variants = []
                         if first:
                             name_variants.append(f"{first} {last}")
                         else:
                             name_variants.append(last)
-                        for variant in name_variants:
-                            match_result = self.find_property_by_owner_name(
-                                variant, threshold=self._thresholds.owner_name_floor,
-                            )
-                            if match_result:
-                                property_record, match_score = match_result
-                                match_method = 'owner_name'
-                                logger.info(f"Matched eviction by plaintiff name '{variant}' (score: {match_score}%): {case_number}")
-                                property_record, llm_method = self._apply_llm_verification(
-                                    raw_row=prow.to_dict() if hasattr(prow, 'to_dict') else dict(prow),
-                                    current_best=property_record, match_score=match_score,
-                                    record_type='eviction', match_field='Plaintiff',
-                                )
-                                if llm_method:
-                                    match_method = llm_method
-                                break
+
+            property_record = None
+            match_score = 0
+            match_method = None
+
+            for variant in (name_variants or [None]):
+                prop, method, score = self.find_property_cascade(
+                    address=addr_for_cascade,
+                    owner_name=variant,
+                    zip_code=zip_for_cascade,
+                    city=city_for_cascade,
+                    addr_threshold=self._thresholds.address_floor,
+                    owner_threshold=self._thresholds.owner_name_floor,
+                )
+                if prop:
+                    property_record, match_method, match_score = prop, method, score
+                    logger.info(f"Matched eviction by {method} (score: {score}%, variant: {variant!r}): {case_number}")
+                    if method in (MATCH_METHOD_OWNER_NAME, MATCH_METHOD_OWNER_ZIP, MATCH_METHOD_OWNER_CITY) and plaintiff_row_for_llm is not None:
+                        property_record, llm_method = self._apply_llm_verification(
+                            raw_row=plaintiff_row_for_llm.to_dict() if hasattr(plaintiff_row_for_llm, 'to_dict') else dict(plaintiff_row_for_llm),
+                            current_best=property_record, match_score=match_score,
+                            record_type='eviction', match_field='Plaintiff',
+                        )
+                        if llm_method:
+                            match_method = llm_method
+                    break
 
             if property_record:
                 tier = self._classify_match(match_score, match_method)
@@ -462,7 +478,7 @@ class BankruptcyLoader(BaseLoader):
             docket_number = _safe_str(row.get('Docket Number')) or str(row.get('Docket Number')).strip()
 
             # Check for duplicates
-            if skip_duplicates and self.check_duplicate(LegalProceeding, {'case_number': docket_number}):
+            if skip_duplicates and self.check_duplicate(LegalProceeding, {'case_number': docket_number}, scope_county=False):
                 logger.debug(f"Skipping duplicate bankruptcy: {docket_number}")
                 skipped += 1
                 continue
@@ -497,23 +513,26 @@ class BankruptcyLoader(BaseLoader):
                             if len(part) > 4:
                                 name_variants.append(f"{name_parts[0]} {part}")
 
+                # Bankruptcy is name-only (no address/zip/city in CourtListener) —
+                # cascade falls straight to stage 5 (owner_name across the county).
                 for variant in name_variants:
-                    match_result = self.find_property_by_owner_name(
-                        variant, threshold=self._thresholds.owner_name_floor,
+                    prop, method, score = self.find_property_cascade(
+                        owner_name=variant,
+                        owner_threshold=self._thresholds.owner_name_floor,
                     )
-                    if match_result:
-                        property_record, match_score = match_result
-                        match_method = 'owner_name'
+                    if prop:
+                        property_record, match_method, match_score = prop, method, score
                         logger.info(
-                            f"Matched bankruptcy by name '{variant}' (score: {match_score}%): {docket_number}"
+                            f"Matched bankruptcy by {method} '{variant}' (score: {score}%): {docket_number}"
                         )
-                        property_record, llm_method = self._apply_llm_verification(
-                            raw_row=row.to_dict() if hasattr(row, 'to_dict') else dict(row),
-                            current_best=property_record, match_score=match_score,
-                            record_type='bankruptcy', match_field='Lead Name',
-                        )
-                        if llm_method:
-                            match_method = llm_method
+                        if method in (MATCH_METHOD_OWNER_NAME, MATCH_METHOD_OWNER_ZIP, MATCH_METHOD_OWNER_CITY):
+                            property_record, llm_method = self._apply_llm_verification(
+                                raw_row=row.to_dict() if hasattr(row, 'to_dict') else dict(row),
+                                current_best=property_record, match_score=match_score,
+                                record_type='bankruptcy', match_field='Lead Name',
+                            )
+                            if llm_method:
+                                match_method = llm_method
                         break
 
             if property_record:
@@ -627,7 +646,7 @@ class DivorceLoader(BaseLoader):
         for case_number, group in grouped:
             case_number = _safe_str(case_number) or str(case_number).strip()
 
-            if skip_duplicates and self.check_duplicate(LegalProceeding, {"case_number": case_number}):
+            if skip_duplicates and self.check_duplicate(LegalProceeding, {"case_number": case_number}, scope_county=False):
                 logger.debug(f"[DivorceLoader] Skipping duplicate: {case_number}")
                 skipped += 1
                 continue
@@ -648,54 +667,58 @@ class DivorceLoader(BaseLoader):
             match_method = None
             primary_row = petitioner_row
 
-            # Try petitioner address
-            party_address_val = _none_if_nan(primary_row.get("PartyAddress"))
-            if party_address_val:
-                match_result = self.find_property_by_address(
-                    str(party_address_val), threshold=self._thresholds.address_floor,
-                )
-                if match_result:
-                    property_record, match_score = match_result
-                    match_method = 'address'
-                    logger.info(f"[DivorceLoader] Matched by petitioner address (score: {match_score}%): {case_number}")
+            # ── Cascade match ─────────────────────────────────────────────
+            # Tries petitioner address → respondent address → petitioner name.
+            # Each address gets its own cascade call so zip/city from each can
+            # be exploited independently. Owner-name cascade also fires once
+            # per address-bearing party (in case the address didn't match but
+            # the petitioner's name does, scoped to their zip).
+            petitioner_addr = _none_if_nan(primary_row.get("PartyAddress"))
+            respondent_addr = _none_if_nan(respondent_row.get("PartyAddress")) if respondent_row is not None else None
 
-            # Try respondent address
-            if not property_record and respondent_row is not None:
-                res_addr = _none_if_nan(respondent_row.get("PartyAddress"))
-                if res_addr:
-                    match_result = self.find_property_by_address(
-                        str(res_addr), threshold=self._thresholds.address_floor,
+            # Build name variants from the petitioner
+            first = str(_none_if_nan(primary_row.get("FirstName")) or "").strip()
+            last = str(_none_if_nan(primary_row.get("LastName/CompanyName")) or "").strip()
+            name_variants: list = []
+            if last:
+                if first:
+                    name_variants.append(f"{first} {last}")
+                else:
+                    name_variants.append(last)
+                if "-" in last:
+                    for part in last.split("-"):
+                        if len(part) > 4 and first:
+                            name_variants.append(f"{first} {part}")
+
+            # Cascade attempts: each address tried as a separate cascade call,
+            # then plain-name attempts at the end.
+            attempts: list = []
+            if petitioner_addr:
+                _, p_city, p_zip = split_address(str(petitioner_addr))
+                attempts.append((str(petitioner_addr), p_zip, p_city, "petitioner-addr"))
+            if respondent_addr:
+                _, r_city, r_zip = split_address(str(respondent_addr))
+                attempts.append((str(respondent_addr), r_zip, r_city, "respondent-addr"))
+            if not attempts:
+                attempts.append((None, None, None, "name-only"))
+
+            for addr, zip_c, city_c, label in attempts:
+                for variant in (name_variants or [None]):
+                    prop, method, score = self.find_property_cascade(
+                        address=addr,
+                        owner_name=variant,
+                        zip_code=zip_c,
+                        city=city_c,
+                        addr_threshold=self._thresholds.address_floor,
+                        owner_threshold=self._thresholds.owner_name_floor,
                     )
-                    if match_result:
-                        property_record, match_score = match_result
-                        match_method = 'address'
-                        logger.info(f"[DivorceLoader] Matched by respondent address (score: {match_score}%): {case_number}")
-
-            # Fallback: petitioner name
-            if not property_record:
-                first = str(_none_if_nan(primary_row.get("FirstName")) or "").strip()
-                last = str(_none_if_nan(primary_row.get("LastName/CompanyName")) or "").strip()
-                if last:
-                    variants = []
-                    if first:
-                        variants.append(f"{first} {last}")
-                    else:
-                        variants.append(last)
-                    if "-" in last:
-                        for part in last.split("-"):
-                            if len(part) > 4 and first:
-                                variants.append(f"{first} {part}")
-                    for variant in variants:
-                        match_result = self.find_property_by_owner_name(
-                            variant, threshold=self._thresholds.owner_name_floor,
+                    if prop:
+                        property_record, match_method, match_score = prop, method, score
+                        logger.info(
+                            f"[DivorceLoader] Matched by {method} ({label}, variant: {variant!r}, "
+                            f"score: {score}%): {case_number}"
                         )
-                        if match_result:
-                            property_record, match_score = match_result
-                            match_method = 'owner_name'
-                            logger.info(
-                                f"[DivorceLoader] Matched by petitioner name '{variant}' "
-                                f"(score: {match_score}%): {case_number}"
-                            )
+                        if method in (MATCH_METHOD_OWNER_NAME, MATCH_METHOD_OWNER_ZIP, MATCH_METHOD_OWNER_CITY):
                             property_record, llm_method = self._apply_llm_verification(
                                 raw_row=primary_row.to_dict() if hasattr(primary_row, "to_dict") else dict(primary_row),
                                 current_best=property_record,
@@ -705,7 +728,9 @@ class DivorceLoader(BaseLoader):
                             )
                             if llm_method:
                                 match_method = llm_method
-                            break
+                        break
+                if property_record:
+                    break
 
             if property_record:
                 tier = self._classify_match(match_score, match_method)

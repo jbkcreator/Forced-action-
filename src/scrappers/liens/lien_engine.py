@@ -820,9 +820,14 @@ async def run_lien_pipeline(
     logger.info("=" * 70)
 
     if load_to_db:
+        # Per-subtype stats are written inside _load_to_database via
+        # scraper_db_helper:_record_load_stats — one row each for
+        # lien_tcl/lien_ccl/lien_hoa/lien_ml/lien_tl/lis_pendens plus
+        # 'no_data' rows for absent subtypes. Calling _record_stats here
+        # would write a duplicate aggregate that clobbers them via the
+        # (run_date, source_type, county_id) upsert.
         _load_to_database(county_id, _t0)
 
-    _record_stats(total, True, _t0, county_id)
     return True
 
 
@@ -849,19 +854,33 @@ def _load_ori_legal_proceedings(county_id: str, type_dir: Path, data_type: str) 
 
     ORI exports: Instrument, Grantor, Grantee, RecordDate, Legal
     Loaders expect: CaseNumber, LastName/CompanyName, FilingDate, PartyAddress
+
+    Writes one scraper_run_stats row per call using data_type as source_type
+    ('probate' or 'divorce_filings'). Without this, Pinellas probate/divorce
+    runs leave no trace and look "missing" in the daily report.
     """
     from src.loaders.legal_proceedings import ProbateLoader, DivorceLoader
     from src.loaders.column_mapper import ColumnMapper, SkipMapping
     from src.core.database import Database
+    from src.utils.scraper_db_helper import record_scraper_stats
 
     _loader_map = {'probate': ProbateLoader, 'divorce_filings': DivorceLoader}
     loader_class = _loader_map[data_type]
+
+    t0 = time.monotonic()
 
     new_dir = type_dir / "new"
     csv_files = sorted(new_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True) \
         if new_dir.exists() else []
     if not csv_files:
         logger.info("[DB] No new %s records to load", data_type)
+        record_scraper_stats(
+            source_type=data_type,
+            total_scraped=0, matched=0, unmatched=0, skipped=0, scored=0,
+            run_success=True, error_type='no_data',
+            duration_seconds=round(time.monotonic() - t0, 2),
+            county_id=county_id,
+        )
         return
 
     csv_path = csv_files[0]
@@ -902,8 +921,25 @@ def _load_ori_legal_proceedings(county_id: str, type_dir: Path, data_type: str) 
             logger.info("[DB] ORI %s — matched=%d unmatched=%d skipped=%d",
                         data_type, matched, unmatched, skipped)
 
+        record_scraper_stats(
+            source_type=data_type,
+            total_scraped=matched + unmatched + skipped,
+            matched=matched, unmatched=unmatched, skipped=skipped, scored=0,
+            run_success=True,
+            duration_seconds=round(time.monotonic() - t0, 2),
+            county_id=county_id,
+        )
+
     except Exception as e:
         logger.error("[DB] Failed to load ORI %s: %s", data_type, e)
+        record_scraper_stats(
+            source_type=data_type,
+            total_scraped=0, matched=0, unmatched=0, skipped=0, scored=0,
+            run_success=False, error_type='scraper_error',
+            error_message=str(e)[:500],
+            duration_seconds=round(time.monotonic() - t0, 2),
+            county_id=county_id,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -938,11 +974,21 @@ def _load_to_database(county_id: str, t0: float) -> None:
     _load_ori_legal_proceedings(county_id, PROCESSED_DATA_DIR / "divorce", "divorce_filings")
 
 
-def _record_stats(total: int, success: bool, t0: float, county_id: str, error: str = None):
+def _record_stats(total: int, success: bool, t0: float, county_id: str,
+                  source_type: str = "lien_unknown", error: str = None):
+    """Record a single scraper_run_stats row.
+
+    source_type defaults to 'lien_unknown' so engine-level failures (CF bypass,
+    column mapping, etc.) that happen before any subtype is known surface as a
+    visible non-zero row.  Real per-subtype stats are written by the breakdown
+    path in src/utils/scraper_db_helper.py:_record_load_stats — this function
+    must NOT be called on the success path or it would clobber those rows via
+    the (run_date, source_type, county_id) unique constraint.
+    """
     try:
         from src.utils.scraper_db_helper import record_scraper_stats
         kwargs = dict(
-            source_type="lien_ml",
+            source_type=source_type,
             total_scraped=total,
             matched=0,
             unmatched=0,

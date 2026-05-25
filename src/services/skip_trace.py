@@ -23,6 +23,7 @@ Usage:
   python -m src.services.skip_trace --limit 50 --vertical roofing
 """
 
+import re
 import time
 import traceback
 from datetime import date, datetime, timezone
@@ -31,10 +32,21 @@ from typing import Optional
 import requests
 from sqlalchemy import text
 
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _valid_email(addr: Optional[str]) -> Optional[str]:
+    """Lowercase + format-check. Returns None if obviously malformed."""
+    if not addr:
+        return None
+    cleaned = addr.strip().lower()
+    return cleaned if _EMAIL_RE.match(cleaned) else None
+
 from config.settings import get_settings
 from src.core.database import get_db_context
 from src.core.models import Owner, Property, EnrichedContact, DistressScore, LegalProceeding, Foreclosure
 from src.services.email import send_alert
+from src.services.phone_utils import normalize as normalize_phone
 from src.utils.logger import setup_logging, get_logger
 
 setup_logging()
@@ -144,11 +156,13 @@ def _parse_result(person: dict) -> dict:
             "source":    "batch_data",
         }
 
-    # Sort by score descending so best numbers come first
+    # Sort by score descending so best numbers come first.
+    # Phone numbers are normalized to strict E.164 (+1XXXXXXXXXX) via phone_utils.
+    # Invalid / non-US numbers from BatchData are dropped, not stored.
     phones_sorted = sorted(phones, key=lambda p: int(p.get("score", 0) or 0), reverse=True)
     for ph in phones_sorted:
         ptype = (ph.get("type") or "").lower()
-        number = str(ph.get("number") or "").strip()
+        number = normalize_phone(ph.get("number"))
         if not number:
             continue
         if "mobile" in ptype and not mobile_phone:
@@ -157,16 +171,23 @@ def _parse_result(person: dict) -> dict:
         elif "land" in ptype and not landline:
             landline = number
             landline_meta = _meta(ph)
-    # fallback: use first number regardless of type
+    # fallback: use first valid number regardless of type
     if not mobile_phone and not landline and phones_sorted:
-        first = phones_sorted[0]
-        mobile_phone = str(first.get("number", "")).strip() or None
-        if mobile_phone:
-            mobile_meta = _meta(first)
+        for ph in phones_sorted:
+            number = normalize_phone(ph.get("number"))
+            if number:
+                mobile_phone = number
+                mobile_meta = _meta(ph)
+                break
 
-    # Email
+    # Email — format-validated, lowercased; malformed strings dropped.
     emails = person.get("emails") or []
-    email = emails[0].get("email") if emails else None
+    email = None
+    for em in emails:
+        candidate = _valid_email(em.get("email"))
+        if candidate:
+            email = candidate
+            break
 
     # Mailing address
     addr_obj = person.get("mailingAddress") or {}
@@ -570,9 +591,17 @@ def run_skip_trace(
         # (see resolve_party_name() below)
         property_ids = [p.id for _, p in rows]
 
-        # Probate heir = beneficiary (decedent is unreachable)
+        # Probate heir = beneficiary (decedent is unreachable). Two collections:
+        #   probate_heir_by_property   — first heir (legacy single-trace path)
+        #   probate_heirs_by_property  — full list from meta_data->'heirs' for
+        #                                multi-heir enrichment, capped at
+        #                                MAX_HEIRS_PER_PROPERTY at use-time
         probate_rows = (
-            session.query(LegalProceeding.property_id, LegalProceeding.secondary_party)
+            session.query(
+                LegalProceeding.property_id,
+                LegalProceeding.secondary_party,
+                LegalProceeding.meta_data,
+            )
             .filter(
                 LegalProceeding.property_id.in_(property_ids),
                 LegalProceeding.record_type == "Probate",
@@ -583,9 +612,31 @@ def run_skip_trace(
             .all()
         )
         probate_heir_by_property: dict = {}
-        for pid, heir_name in probate_rows:
+        probate_heirs_by_property: dict = {}
+        for pid, heir_name, meta in probate_rows:
             if pid not in probate_heir_by_property:
                 probate_heir_by_property[pid] = heir_name
+            # Multi-heir list (most recent filing per property wins).
+            if pid not in probate_heirs_by_property:
+                heirs: list = []
+                if isinstance(meta, dict):
+                    raw_heirs = meta.get("heirs")
+                    if isinstance(raw_heirs, list):
+                        # Dedup while preserving order; keep only non-empty strings.
+                        seen = set()
+                        for h in raw_heirs:
+                            if not h:
+                                continue
+                            name = str(h).strip()
+                            key = name.upper()
+                            if not name or key in seen:
+                                continue
+                            seen.add(key)
+                            heirs.append(name)
+                # Fallback: at least the secondary_party we already had.
+                if not heirs and heir_name:
+                    heirs = [str(heir_name).strip()]
+                probate_heirs_by_property[pid] = heirs
 
         # Eviction landlord = plaintiff (defendant is the tenant, NOT the owner)
         eviction_rows = (
@@ -664,6 +715,32 @@ def run_skip_trace(
                 return candidate, source_tag
         return None, None
 
+    def candidate_parties_for_property(prop_id: int):
+        """Return the list of (party_name, source_tag, traced_name) tuples to enrich.
+
+        Default single-trace path (matches legacy behavior):
+            -> [(name, tag, None)]   when resolve_party_name finds a usable name
+            -> [(None, None, None)]  when nothing usable — caller falls back
+                                     to address-only enrichment.
+
+        Multi-heir probate fan-out — when MULTI_HEIR_ENRICHMENT_ENABLED is on
+        AND the property has 2+ non-entity heirs in meta_data->'heirs':
+            -> [(heir, "probate", heir), ...] capped at MAX_HEIRS_PER_PROPERTY.
+
+        traced_name is the value persisted on EnrichedContact so multiple
+        rows per property are disambiguable.
+        """
+        if settings.multi_heir_enrichment_enabled:
+            heirs = probate_heirs_by_property.get(prop_id) or []
+            valid_heirs = [h for h in heirs if h and not _is_entity_name(h)]
+            if len(valid_heirs) >= 2:
+                cap = max(1, int(settings.max_heirs_per_property or 5))
+                return [(heir, "probate", heir) for heir in valid_heirs[:cap]]
+        name, tag = resolve_party_name(prop_id)
+        if name:
+            return [(name, tag, None)]
+        return [(None, None, None)]
+
     if not rows:
         logger.info("No candidates found — every high-priority owner already has a usable phone.")
         return stats
@@ -687,9 +764,42 @@ def run_skip_trace(
 
         # Build request payloads, keep index → (owner, prop) mapping
         payloads = []
-        index_map = []  # parallel list: index_map[i] = (owner, prop) for payloads[i]
+        # 3-tuple: (owner, prop, traced_name).
+        # traced_name is None on the legacy single-trace path; populated with
+        # the heir's name on the multi-heir fan-out so persistence can write
+        # one EnrichedContact row per heir without collapsing duplicates.
+        index_map = []
 
         for owner, prop in batch:
+            # LLC with registered agent — single trace of the agent, no fan-out.
+            if owner.owner_type == "LLC" and owner.registered_agent_name and owner.registered_agent_address:
+                first_name, last_name = _split_agent_name(owner.registered_agent_name)
+                agent_addr = _parse_agent_address(owner.registered_agent_address)
+                if not agent_addr:
+                    stats["no_address"] += 1
+                    logger.debug(f"Skipping property_id={prop.id} — cannot parse agent address")
+                    continue
+                payload_entry = {
+                    "firstName": first_name,
+                    "lastName":  last_name,
+                    "address": agent_addr,
+                }
+                logger.debug(
+                    f"[LLC] property_id={prop.id} tracing agent: {first_name} {last_name} @ {agent_addr['street']}"
+                )
+                payloads.append(payload_entry)
+                index_map.append((owner, prop, None))
+                continue
+
+            # All other branches go through candidate_parties_for_property() so
+            # the multi-heir fan-out hooks in cleanly when the feature flag is
+            # on. The default path returns a single (name, tag, None) tuple
+            # which preserves legacy single-trace behavior.
+            candidates = candidate_parties_for_property(prop.id)
+
+            if owner.owner_type in ("LLC", "Corporate", "Trust", "Estate"):
+                # Non-individual with no registered agent. Filing-derived party
+                # names are the only way to reach a human here.
             # ── LLC / Corporate / Trust / Estate ───────────────────────────
             # Priority chain (fa031 — real-people-first):
             #   1. Filing-derived party (probate heir, eviction landlord,
@@ -714,6 +824,45 @@ def run_skip_trace(
                 # lookup. Order: probate > eviction > divorce > lp.
                 party_name, source_tag = resolve_party_name(prop.id)
                 street   = (prop.address or "").strip()
+                zip_code = (prop.zip or "").strip()[:5]
+                if not street or not zip_code:
+                    stats["no_address"] += 1
+                    continue
+
+                fanned = 0
+                for party_name, source_tag, traced_name in candidates:
+                    if not party_name:
+                        continue  # no fallback to address-only for entities
+                    first_name, last_name = _split_agent_name(party_name)
+                    payload_entry = {
+                        "firstName": first_name,
+                        "lastName":  last_name,
+                        "propertyAddress": {
+                            "street": street,
+                            "city":   (prop.city or "Tampa").strip(),
+                            "state":  (prop.state or "FL").strip(),
+                            "zip":    zip_code,
+                        },
+                    }
+                    logger.debug(
+                        f"[{source_tag}/Entity] property_id={prop.id} tracing: "
+                        f"{first_name} {last_name}"
+                        + (f" (heir {fanned + 1}/{len(candidates)})" if traced_name else "")
+                    )
+                    payloads.append(payload_entry)
+                    index_map.append((owner, prop, traced_name))
+                    fanned += 1
+
+                if fanned == 0:
+                    stats["no_address"] += 1
+                    logger.debug(
+                        f"Skipping property_id={prop.id} — owner_type={owner.owner_type!r} "
+                        f"with no registered agent ({owner.owner_name!r})"
+                    )
+            else:
+                # Individual owner — filing-derived party name preferred,
+                # otherwise blind address-only lookup.
+                street   = (prop.address or "").strip()
                 city     = (prop.city or "Tampa").strip()
                 state    = (prop.state or "FL").strip()
                 zip_code = (prop.zip or "").strip()[:5]
@@ -723,34 +872,37 @@ def run_skip_trace(
                     logger.debug(f"Skipping property_id={prop.id} — missing address or ZIP")
                     continue
 
-                if party_name:
-                    first_name, last_name = _split_agent_name(party_name)
-                    payload_entry = {
-                        "firstName": first_name,
-                        "lastName":  last_name,
-                        "propertyAddress": {
-                            "street": street,
-                            "city":   city,
-                            "state":  state,
-                            "zip":    zip_code,
-                        },
-                    }
-                    logger.debug(
-                        f"[{source_tag}/Individual] property_id={prop.id} tracing: "
-                        f"{first_name} {last_name}"
-                    )
-                else:
-                    payload_entry = {
-                        "propertyAddress": {
-                            "street": street,
-                            "city":   city,
-                            "state":  state,
-                            "zip":    zip_code,
+                fanned = 0
+                for party_name, source_tag, traced_name in candidates:
+                    if party_name:
+                        first_name, last_name = _split_agent_name(party_name)
+                        payload_entry = {
+                            "firstName": first_name,
+                            "lastName":  last_name,
+                            "propertyAddress": {
+                                "street": street,
+                                "city":   city,
+                                "state":  state,
+                                "zip":    zip_code,
+                            },
                         }
-                    }
-
-            payloads.append(payload_entry)
-            index_map.append((owner, prop))
+                        logger.debug(
+                            f"[{source_tag}/Individual] property_id={prop.id} tracing: "
+                            f"{first_name} {last_name}"
+                            + (f" (heir {fanned + 1}/{len(candidates)})" if traced_name else "")
+                        )
+                    else:
+                        payload_entry = {
+                            "propertyAddress": {
+                                "street": street,
+                                "city":   city,
+                                "state":  state,
+                                "zip":    zip_code,
+                            }
+                        }
+                    payloads.append(payload_entry)
+                    index_map.append((owner, prop, traced_name))
+                    fanned += 1
 
         if not payloads:
             continue
@@ -803,7 +955,11 @@ def run_skip_trace(
                 if i >= len(index_map):
                     break
 
-                owner_snap, prop_snap = index_map[i]
+                # 3-tuple: (owner_snap, prop_snap, traced_name).
+                # traced_name is None for single-trace rows; populated when the
+                # multi-heir fan-out emitted multiple payloads for the same
+                # property, each targeting a different heir.
+                owner_snap, prop_snap, traced_name = index_map[i]
 
                 try:
                     parsed = _parse_result(result)
@@ -813,12 +969,17 @@ def run_skip_trace(
                     if owner is None:
                         continue
 
-                    # Check for duplicate enriched_contact
-                    existing = (
-                        session.query(EnrichedContact)
-                        .filter_by(property_id=owner.property_id, source="batch_skip_tracing")
-                        .first()
+                    # Check for duplicate enriched_contact.
+                    # Multi-heir rows dedup by (property_id, source, traced_name)
+                    # so multiple heirs of the same property each get their own
+                    # row. Legacy single-trace rows dedup by (property_id, source)
+                    # — preserves the existing skip-on-retrace semantics.
+                    existing_q = session.query(EnrichedContact).filter_by(
+                        property_id=owner.property_id, source="batch_skip_tracing",
                     )
+                    if traced_name is not None:
+                        existing_q = existing_q.filter(EnrichedContact.traced_name == traced_name)
+                    existing = existing_q.first()
 
                     if existing:
                         if refresh_stale or (retrace and not existing.match_success):
@@ -846,6 +1007,7 @@ def run_skip_trace(
                         existing.email           = parsed["email"]
                         existing.mailing_address = parsed["mailing_address"]
                         existing.match_success   = parsed["match_success"]
+                        existing.raw_response    = result
                         existing.enriched_at     = datetime.now(timezone.utc)
                         if parsed["match_success"]:
                             stats["retraced"] += 1
@@ -859,8 +1021,10 @@ def run_skip_trace(
                             mailing_address=parsed["mailing_address"],
                             llc_owner_name=parsed["llc_owner_name"],
                             relative_contacts=parsed["relative_contacts"],
+                            raw_response=result,
                             source="batch_skip_tracing",
                             match_success=parsed["match_success"],
+                            traced_name=traced_name,
                             enriched_at=datetime.now(timezone.utc),
                         )
                         session.add(ec)

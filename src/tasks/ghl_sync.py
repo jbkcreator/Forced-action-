@@ -73,6 +73,7 @@ def _build_score_data_from_db(prop: Property, ds: DistressScore) -> dict:
     return {
         "property_id":        prop.id,
         "parcel_id":          prop.parcel_id,
+        "county_id":          prop.county_id,
         "address":            prop.address,
         "city":               prop.city,
         "state":              prop.state,

@@ -23,6 +23,30 @@ from src.core.models import Property, Owner
 logger = logging.getLogger(__name__)
 
 
+# ─── match_method taxonomy ──────────────────────────────────────────────────
+# Stored on every destination row (legal_and_liens.match_method, deeds.match_method,
+# legal_proceedings.match_method, etc.). Use these constants instead of string
+# literals so a typo doesn't silently corrupt the per-county debugging signal.
+#
+# Cascade order (stage 1 → 5), short-circuits on first hit ≥ floor:
+#   1. parcel_id        — exact match on properties.parcel_id (1.0 confidence)
+#   2. normalized_addr  — existing find_property_by_address waterfall (≥0.75)
+#   3. owner_name_zip   — owner-name fuzzy scoped to properties.zip equality
+#   4. owner_name_city  — owner-name fuzzy scoped to properties.city equality
+#   5. owner_name       — owner-name fuzzy across the entire county
+# Alternates:
+#   legal_desc          — find_property_by_legal_description (used when
+#                          PartyAddress is a lot/block string, not a street)
+#   llm_verified        — promoted from any owner-* stage by the LLM tiebreaker
+MATCH_METHOD_PARCEL_ID   = "parcel_id"
+MATCH_METHOD_NORM_ADDR   = "normalized_address"
+MATCH_METHOD_OWNER_ZIP   = "owner_name_zip"
+MATCH_METHOD_OWNER_CITY  = "owner_name_city"
+MATCH_METHOD_OWNER_NAME  = "owner_name"
+MATCH_METHOD_LEGAL_DESC  = "legal_desc"
+MATCH_METHOD_LLM         = "llm_verified"
+
+
 # Multi-word role/relationship phrases stripped from owner names before
 # fuzzy matching. Exported so other loaders (e.g. lis_pendens) can reuse
 # the same list when filtering candidate party names.
@@ -38,7 +62,60 @@ _OWNER_NAME_NOISE_PHRASES: tuple[str, ...] = (
     "CLAIMING BY",
     "TRUSTEE OF THE",
     "TRUSTEE OF",
+    # Trust compound phrases — surface in deeds (e.g. "MORGAN FAMILY LIVING
+    # TRUST DATED MAY 7 2026"). Stripping the trust descriptor leaves the
+    # family/surname token which is what the property table actually stores.
+    "FAMILY LIVING TRUST",
+    "REVOCABLE LIVING TRUST",
+    "IRREVOCABLE LIVING TRUST",
+    "FAMILY TRUST",
+    "LIVING TRUST",
+    "LAND TRUST",
 )
+
+# Tail phrase that often follows trust names: "DATED MAY 7 2026", "DTD 4/15/24",
+# "DATED THE 15TH DAY OF JANUARY 2026". Stripped wholesale before token sort so
+# the variable date string does not drive score differences.
+_TRUST_DATE_TAIL_RE = re.compile(r'\b(?:DATED|DTD)\b.*$', re.IGNORECASE)
+
+
+# Trust-type classification. Ordered longest-first so "FAMILY LIVING TRUST"
+# wins over "FAMILY TRUST" when both phrases match. Returned as a snake_case
+# tag so it can be persisted as metadata or shown as a separate audit column
+# without losing the trust-type signal that name normalization strips.
+_TRUST_TYPE_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("REVOCABLE LIVING TRUST",   "revocable_living_trust"),
+    ("IRREVOCABLE LIVING TRUST", "irrevocable_living_trust"),
+    ("FAMILY LIVING TRUST",      "family_living_trust"),
+    ("FAMILY TRUST",             "family_trust"),
+    ("REVOCABLE TRUST",          "revocable_trust"),
+    ("IRREVOCABLE TRUST",        "irrevocable_trust"),
+    ("LIVING TRUST",             "living_trust"),
+    ("LAND TRUST",               "land_trust"),
+    ("TRUST",                    "trust"),   # bare-word fallback
+)
+
+
+def extract_trust_type(raw_name: str | None) -> str | None:
+    """Classify a raw owner/grantor string as a trust type, or return None.
+
+    Examples:
+      "MORGAN FAMILY LIVING TRUST DATED MAY 7 2026" -> "family_living_trust"
+      "ROBERTS FAMILY TRUST"                        -> "family_trust"
+      "PETER J. BILLIA REVOCABLE LIVING TRUST"      -> "revocable_living_trust"
+      "BASSINGTHWAITE TRUSTEE"                      -> None  (trustee, not trust)
+      "SMITH JOHN L"                                -> None
+
+    Use this alongside normalize_owner_name when you want the trust-type
+    signal preserved as separate metadata (the normalizer strips it).
+    """
+    if not raw_name:
+        return None
+    upper = str(raw_name).upper()
+    for phrase, tag in _TRUST_TYPE_PATTERNS:
+        if re.search(rf'\b{re.escape(phrase)}\b', upper):
+            return tag
+    return None
 
 # Single-token suffixes / role labels.
 _OWNER_NAME_SUFFIXES: tuple[str, ...] = (
@@ -195,6 +272,11 @@ class BaseLoader(ABC):
 
         name = str(name).upper().strip()
 
+        # Phase 0: strip trust date-tail. "MORGAN FAMILY LIVING TRUST DATED MAY 7
+        # 2026" → "MORGAN FAMILY LIVING TRUST". Done before phrase stripping so
+        # the dangling date tokens don't survive as residual noise.
+        name = _TRUST_DATE_TAIL_RE.sub('', name).strip()
+
         # Phase 1: multi-word noise phrases (longest first to avoid the
         # "AS TRUSTEE OF" substring eating into "AS TRUSTEE OF THE").
         for phrase in sorted(_OWNER_NAME_NOISE_PHRASES, key=len, reverse=True):
@@ -209,6 +291,15 @@ class BaseLoader(ABC):
 
         # Collapse whitespace
         name = re.sub(r'\s+', ' ', name).strip()
+
+        # Phase 3: drop standalone middle initials (single-character tokens)
+        # so "ANHEIER DIANE M" aligns with "ANHEIER DIANE MATILDE". Skip the
+        # first token to avoid collapsing real first-initial owners like
+        # "J SMITH" → "SMITH".
+        tokens = name.split()
+        if len(tokens) > 1:
+            tokens = [tokens[0]] + [t for t in tokens[1:] if len(t) > 1]
+            name = ' '.join(tokens)
 
         return name
     
@@ -713,6 +804,154 @@ class BaseLoader(ABC):
                 return result
         return None
 
+    def find_property_by_owner_name_scoped(
+        self,
+        owner_name: str,
+        scope_column: str,
+        scope_value: str,
+        threshold: int = 80,
+    ) -> Optional[Tuple[Property, int]]:
+        """
+        Owner-name fuzzy match restricted to properties where a scoping column
+        (zip or city) equals an exact value. Used by the cascade's stage 3
+        (owner+zip) and stage 4 (owner+city).
+
+        The strict scope makes false positives far less likely than a county-wide
+        owner-name search, so we can keep the same fuzzy threshold without
+        relaxing it.
+
+        Args:
+            owner_name:   Raw owner name to match.
+            scope_column: Either 'zip' or 'city' — the Property column to filter on.
+            scope_value:  The exact value to match in that column.
+            threshold:    Minimum rapidfuzz score.
+
+        Returns:
+            (Property, score) or None.
+        """
+        if pd.isna(owner_name) or not owner_name or not scope_value:
+            return None
+        if scope_column not in ('zip', 'city'):
+            raise ValueError(f"scope_column must be 'zip' or 'city', got {scope_column!r}")
+
+        normalized_search = self.normalize_owner_name(owner_name)
+        if not normalized_search:
+            return None
+
+        # Get the candidate Owner rows whose property matches the scope value.
+        scope_col_attr = getattr(Property, scope_column)
+        candidates = (
+            self.session.query(Owner)
+            .join(Property, Owner.property_id == Property.id)
+            .filter(
+                scope_col_attr == scope_value,
+                Owner.county_id == self.county_id,
+                Owner.owner_name.isnot(None),
+            )
+            .all()
+        )
+
+        best_match: Optional[Property] = None
+        best_score = 0
+        for owner in candidates:
+            normalized_owner = self.normalize_owner_name(owner.owner_name or "")
+            if not normalized_owner:
+                continue
+            score = fuzz.token_sort_ratio(normalized_search, normalized_owner)
+            if score > best_score:
+                best_score = score
+                best_match = owner.property
+
+        if best_score >= threshold:
+            return best_match, best_score
+        return None
+
+    def find_property_cascade(
+        self,
+        *,
+        parcel_id:    Optional[str] = None,
+        address:      Optional[str] = None,
+        owner_name:   Optional[str] = None,
+        zip_code:     Optional[str] = None,
+        city:         Optional[str] = None,
+        legal_desc:   Optional[str] = None,
+        addr_threshold:  int = 75,
+        owner_threshold: int = 80,
+        legal_threshold: int = 70,
+    ) -> Tuple[Optional[Property], Optional[str], Optional[int]]:
+        """
+        Unified property-matching cascade. Walks five stages in order and
+        short-circuits at the first stage that produces a match meeting its
+        threshold. Returns the granular `match_method` so per-county debugging
+        can tell which stage actually carried the match.
+
+        Stage order:
+            1. parcel_id           — exact match (confidence 100)
+            2. normalized_address  — find_property_by_address (ilike → pg_trgm → rapidfuzz)
+            3. owner_name + zip    — owner fuzzy scoped to properties.zip equality
+            4. owner_name + city   — owner fuzzy scoped to properties.city equality
+            5. owner_name          — owner fuzzy across the entire county
+            (alt) legal_desc       — tried only after stage 5 if all else failed
+
+        Any stage whose required input is missing is skipped silently — so a
+        name-only caller (just `owner_name=...`) goes straight to stages 3→5
+        (or just 5 if no zip/city). A parcel-id-only caller hits stage 1 and
+        returns immediately.
+
+        Returns:
+            (property, match_method_const, confidence_int_0_to_100) or (None, None, None)
+        """
+        # Stage 1 — parcel_id (exact)
+        if parcel_id and not pd.isna(parcel_id):
+            prop = self.find_property_by_parcel_id(parcel_id)
+            if prop:
+                return prop, MATCH_METHOD_PARCEL_ID, 100
+
+        # Stage 2 — normalized address
+        if address and not pd.isna(address):
+            result = self.find_property_by_address(
+                address, threshold=addr_threshold, zip_code=zip_code,
+            )
+            if result:
+                prop, score = result
+                return prop, MATCH_METHOD_NORM_ADDR, score
+
+        # Stages 3 & 4 — owner_name scoped by zip / city
+        if owner_name and not pd.isna(owner_name):
+            if zip_code:
+                result = self.find_property_by_owner_name_scoped(
+                    owner_name, scope_column='zip', scope_value=zip_code,
+                    threshold=owner_threshold,
+                )
+                if result:
+                    prop, score = result
+                    return prop, MATCH_METHOD_OWNER_ZIP, score
+
+            if city:
+                result = self.find_property_by_owner_name_scoped(
+                    owner_name, scope_column='city', scope_value=city,
+                    threshold=owner_threshold,
+                )
+                if result:
+                    prop, score = result
+                    return prop, MATCH_METHOD_OWNER_CITY, score
+
+            # Stage 5 — owner name across county
+            result = self.find_property_by_owner_name(owner_name, threshold=owner_threshold)
+            if result:
+                prop, score = result
+                return prop, MATCH_METHOD_OWNER_NAME, score
+
+        # Alternate path — legal description (lot/block/subdivision strings).
+        # Tried last because it's the noisiest match strategy.
+        if legal_desc and not pd.isna(legal_desc):
+            result = self.find_property_by_legal_description(legal_desc, threshold=legal_threshold)
+            if result:
+                prop, score = result
+                return prop, MATCH_METHOD_LEGAL_DESC, score
+
+        return None, None, None
+
     # ========================================================================
     # LLM VERIFICATION HELPERS
     # ========================================================================
@@ -772,30 +1011,37 @@ class BaseLoader(ABC):
             force:        If True, bypass the HIGH_CONFIDENCE skip (for suspicious strategies).
 
         Returns:
-            (property_record_or_None, match_method_str_or_None)
-            match_method is 'owner_name' (unchanged), 'llm_verified', or None (quarantine).
+            (property_record_or_None, match_method_or_None)
+
+            match_method semantics:
+              - 'llm_verified' when the LLM actually ran and accepted/overrode the match
+              - None when no LLM-driven decision was made (high confidence skip,
+                below floor, or budget exhausted) — the caller keeps whatever
+                cascade stage the match came from (parcel_id / normalized_address
+                / owner_name_zip / owner_name_city / owner_name) unchanged.
         """
         from src.loaders.llm_matcher import HIGH_CONFIDENCE, LLM_SCORE_FLOOR
 
         if current_best is None:
             return None, None
 
-        # High confidence — no LLM needed
+        # High confidence — no LLM needed; preserve cascade-stage method
         if match_score >= HIGH_CONFIDENCE and not force:
-            return current_best, 'owner_name'
+            return current_best, None
 
-        # Below floor — cannot rescue with LLM; caller will quarantine
+        # Below floor — cannot rescue with LLM; preserve cascade-stage method
+        # so caller can decide whether to quarantine based on its own classify-match call.
         if match_score < LLM_SCORE_FLOOR and not force:
-            return current_best, 'owner_name'
+            return current_best, None
 
-        # Budget exhausted — log and pass through (don't quarantine just because LLM is out)
+        # Budget exhausted — log and pass through; preserve cascade-stage method
         if self._llm_matcher.budget_exhausted:
             logger.warning(
                 "[LLM] Budget exhausted — skipping verification for %s match "
                 "(score=%d%%, record_type=%s). Accepting match as-is.",
                 match_field, match_score, record_type,
             )
-            return current_best, 'owner_name'
+            return current_best, None
 
         # Run LLM verification
         owner_name_val = (
@@ -835,7 +1081,7 @@ class BaseLoader(ABC):
                 "[LLM] Could not improve match (confidence=%s, score=%d%%, record_type=%s): %s — keeping original",
                 llm_result.confidence, match_score, record_type, llm_result.reason,
             )
-            return current_best, 'owner_name'  # LLM couldn't find better — keep original match
+            return current_best, None  # LLM ran but didn't improve — preserve cascade-stage method
 
     # ========================================================================
     # DUPLICATE CHECKING
@@ -973,19 +1219,27 @@ class BaseLoader(ABC):
     def check_duplicate(
         self,
         model: Any,
-        unique_fields: Dict[str, Any]
+        unique_fields: Dict[str, Any],
+        scope_county: bool = True,
     ) -> bool:
         """
         Check if record already exists in database.
-        
+
         Args:
             model: SQLAlchemy model class
             unique_fields: Dict of field names and values to check
-            
+            scope_county: If True (default), auto-add county_id to the filter.
+                Pass False when the model's DB-level unique constraint is
+                single-column (e.g. legal_and_liens.instrument_number,
+                deeds.instrument_number, legal_proceedings.case_number) —
+                otherwise the dedup query is stricter than the DB constraint
+                and rows that look unique-within-county will still crash
+                INSERT with UniqueViolation.
+
         Returns:
             True if duplicate exists, False otherwise
         """
-        if hasattr(model, 'county_id') and 'county_id' not in unique_fields:
+        if scope_county and hasattr(model, 'county_id') and 'county_id' not in unique_fields:
             unique_fields = {**unique_fields, 'county_id': self.county_id}
         existing = self.session.query(model).filter_by(**unique_fields).first()
         return existing is not None

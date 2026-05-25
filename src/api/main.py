@@ -38,7 +38,7 @@ from src.core.models import FoundingSubscriberCount, ZipTerritory, Subscriber, P
 from src.services.stripe_webhooks import handle_webhook
 from src.services.stripe_service import get_price_id_for_checkout, _price_ids
 from config.settings import get_settings
-from config.scoring import VERTICAL_WEIGHTS
+from config.scoring import VERTICAL_WEIGHTS, for_county
 from config.constants import TIER_DISPLAY
 from src.utils.logger import setup_logging
 
@@ -1459,6 +1459,7 @@ def event_feed(
                     for prop, score, owner in unlocked_rows:
                         owner_phone, owner_phone_quality = _resolve_phone_with_quality(owner)
                         owner_email = (owner.email_1 or owner.email_2) if owner else None
+                        _visible_tier, _visible_urgency = _visible_tier_fields(prop, score)
                         _unlocked_leads.append({
                             "property_id": prop.id,
                             "parcel_id": prop.parcel_id,
@@ -1473,8 +1474,8 @@ def event_feed(
                             "lon": float(prop.lon) if prop.lon else None,
                             "cds_score": float(score.final_cds_score) if score.final_cds_score else None,
                             "vertical_score": score.vertical_scores.get(subscriber.vertical) if score.vertical_scores else None,
-                            "lead_tier": score.lead_tier,
-                            "urgency": score.urgency_level,
+                            "lead_tier": _visible_tier,
+                            "urgency": _visible_urgency,
                             "distress_types": score.distress_types,
                             "est_job_value": _estimate_lead_job_value(prop, score),
                             "incidents": inc_map.get(prop.id, []),
@@ -1710,6 +1711,7 @@ def event_feed(
         is_unlocked = (prop.id in unlocked_ids) or (prop.zip in locked_zip_set)
         owner_phone, owner_phone_quality = _resolve_phone_with_quality(owner)
         owner_email = (owner.email_1 or owner.email_2) if owner else None
+        _visible_tier, _visible_urgency = _visible_tier_fields(prop, score)
         portfolio = _portfolio_map.get(owner.owner_name, 1) if owner else 1
         leads.append({
             "property_id": prop.id,
@@ -1725,8 +1727,8 @@ def event_feed(
             "lon": float(prop.lon) if prop.lon else None,
             "cds_score": float(score.final_cds_score) if score.final_cds_score else None,
             "vertical_score": score.vertical_scores.get(subscriber.vertical) if score.vertical_scores else None,
-            "lead_tier": score.lead_tier,
-            "urgency": score.urgency_level,
+            "lead_tier": _visible_tier,
+            "urgency": _visible_urgency,
             "distress_types": score.distress_types,
             "est_job_value": _estimate_lead_job_value(prop, score),
             "incidents": incidents_by_prop.get(prop.id, []),
@@ -1883,13 +1885,20 @@ def feed_stats(feed_uuid: str, db: Session = Depends(get_db)):
             )
         ).scalar()
 
-        tier_rows = db.execute(
-            select(DistressScore.lead_tier, func.count().label("cnt"))
-            .join(Property, Property.id == DistressScore.property_id)
-            .where(and_(*base_filter))
-            .group_by(DistressScore.lead_tier)
-        ).all()
-        tier_distribution = {row.lead_tier: row.cnt for row in tier_rows if row.lead_tier}
+        # Suppress the tier breakdown for counties whose tier distribution
+        # isn't yet trustworthy (see config.scoring.COUNTY_OVERRIDES). The
+        # raw counts stay in distress_scores for internal analytics.
+        _county_cfg = for_county(subscriber.county_id)
+        if _county_cfg.tier_visibility == "internal":
+            tier_distribution: dict = {}
+        else:
+            tier_rows = db.execute(
+                select(DistressScore.lead_tier, func.count().label("cnt"))
+                .join(Property, Property.id == DistressScore.property_id)
+                .where(and_(*base_filter))
+                .group_by(DistressScore.lead_tier)
+            ).all()
+            tier_distribution = {row.lead_tier: row.cnt for row in tier_rows if row.lead_tier}
 
         last_updated_row = db.execute(
             select(func.max(DistressScore.score_date))
@@ -1983,6 +1992,26 @@ def _estimate_lead_job_value(prop, score) -> dict:
         return estimate_job_value(prop, distress_types)
     except Exception:
         return {"low": 0, "high": 0, "display": "N/A", "method": "error"}
+
+
+def _visible_tier_fields(prop, score) -> tuple:
+    """Return (lead_tier, urgency) honoring the county's tier_visibility flag.
+
+    Counties whose tier distribution is not yet cross-county-comparable
+    (set via COUNTY_OVERRIDES[...].tier_visibility = 'internal') return
+    None for both fields so subscribers don't see misleading labels while
+    the calibration retune is in flight. The values remain stored on the
+    DistressScore row for internal analytics.
+    """
+    try:
+        cfg = for_county(getattr(prop, "county_id", None))
+        if cfg.tier_visibility == "internal":
+            return (None, None)
+    except Exception:
+        # If the lookup fails for any reason, fail open (show the tier) —
+        # this is a UI cosmetic decision, not a correctness gate.
+        pass
+    return (score.lead_tier, score.urgency_level)
 
 
 # ---------------------------------------------------------------------------
@@ -2182,6 +2211,7 @@ def sample_leads(
         is_unlocked = prop.id in unlocked_ids
         owner_phone, owner_phone_quality = _resolve_phone_with_quality(owner)
         owner_email = (owner.email_1 or owner.email_2) if owner else None
+        _visible_tier, _ = _visible_tier_fields(prop, score)
 
         leads.append({
             "property_id": prop.id,
@@ -2192,7 +2222,7 @@ def sample_leads(
             "sq_ft": prop.sq_ft,
             "cds_score": float(score.final_cds_score) if score.final_cds_score else None,
             "vertical_score": score.vertical_scores.get(vertical) if score.vertical_scores else None,
-            "lead_tier": score.lead_tier,
+            "lead_tier": _visible_tier,
             "distress_types": score.distress_types,
             "latest_incident": inc.incident_type if inc else None,
             "latest_incident_date": inc.incident_date.isoformat() if inc and inc.incident_date else None,
@@ -2494,6 +2524,7 @@ def lead_pack_detail(purchase_id: int, db: Session = Depends(get_db)):
 
     leads = []
     for prop, score in rows:
+        _visible_tier, _ = _visible_tier_fields(prop, score)
         leads.append({
             "property_id": prop.id,
             "address": prop.address,
@@ -2505,7 +2536,7 @@ def lead_pack_detail(purchase_id: int, db: Session = Depends(get_db)):
             "sq_ft": prop.sq_ft,
             "cds_score": float(score.final_cds_score) if score.final_cds_score else None,
             "vertical_score": score.vertical_scores.get(purchase.vertical) if score.vertical_scores else None,
-            "lead_tier": score.lead_tier,
+            "lead_tier": _visible_tier,
             "distress_types": score.distress_types,
         })
 

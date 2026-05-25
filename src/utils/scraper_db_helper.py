@@ -36,6 +36,7 @@ LIEN_DOCTYPE_TO_SOURCE = {
     'HOA LIENS (HL)':           'lien_hoa',
     'MECHANICS LIENS (ML)':     'lien_ml',
     'TAX LIENS (TL)':           'lien_tl',
+    'TAX LIEN':                 'lien_tl',   # Pinellas categorizer uses this label
 }
 
 # Maps the data_type key used by load_scraped_data_to_db → source_type stored in scraper_run_stats.
@@ -115,6 +116,7 @@ def record_scraper_stats(
         error_type = 'none' if run_success else 'scraper_error'
 
     try:
+        from sqlalchemy import func
         with get_db_context() as session:
             stmt = pg_insert(ScraperRunStats).values(
                 run_date=run_date,
@@ -129,18 +131,35 @@ def record_scraper_stats(
                 error_type=error_type,
                 error_message=error_message,
                 duration_seconds=duration_seconds,
-            ).on_conflict_do_update(
+                updated_at=func.now(),
+            )
+            # On re-run within the same day (e.g. 3x/day permits, retries),
+            # ACCUMULATE counts instead of overwriting them.  Matches the
+            # docstring contract; previous behaviour silently dropped earlier
+            # runs.  Notes on the non-additive columns:
+            #   • duration_seconds → GREATEST so a fast retry doesn't hide a
+            #     slow earlier run.
+            #   • run_success → logical OR (any successful run wins).
+            #   • error_type / error_message → keep the latest non-null value
+            #     so the most recent failure detail is visible.
+            excluded = stmt.excluded
+            existing = ScraperRunStats.__table__.c
+            stmt = stmt.on_conflict_do_update(
                 constraint='uq_scraper_run_stats',
                 set_=dict(
-                    total_scraped=total_scraped,
-                    matched=matched,
-                    unmatched=unmatched,
-                    skipped=skipped,
-                    scored=scored,
-                    run_success=run_success,
-                    error_type=error_type,
-                    error_message=error_message,
-                    duration_seconds=duration_seconds,
+                    total_scraped=existing.total_scraped + excluded.total_scraped,
+                    matched=existing.matched + excluded.matched,
+                    unmatched=existing.unmatched + excluded.unmatched,
+                    skipped=existing.skipped + excluded.skipped,
+                    scored=existing.scored + excluded.scored,
+                    run_success=existing.run_success.op('OR')(excluded.run_success),
+                    error_type=func.coalesce(excluded.error_type, existing.error_type),
+                    error_message=func.coalesce(excluded.error_message, existing.error_message),
+                    duration_seconds=func.greatest(
+                        func.coalesce(existing.duration_seconds, 0),
+                        func.coalesce(excluded.duration_seconds, 0),
+                    ),
+                    updated_at=excluded.updated_at,
                 )
             )
             session.execute(stmt)
@@ -281,27 +300,45 @@ def load_scraped_data_to_db(
                 # using per-document_type counts captured by the loader.
                 lien_counts = getattr(loader, 'stats_by_doc_type', {})
                 if lien_counts:
-                    total_lien_matched = sum(c.get('matched', 0) for c in lien_counts.values())
+                    # Aggregate by source_type FIRST so multiple doc_type labels mapping
+                    # to the same source_type (or to the 'lien_unknown' fallback) don't
+                    # overwrite each other via the (date, source_type, county) upsert.
+                    agg: dict[str, dict] = {}
                     for doc_type_label, counts in lien_counts.items():
-                        src = LIEN_DOCTYPE_TO_SOURCE.get(doc_type_label, 'lien_ml')
-                        # Distribute scored count proportionally across subtypes
-                        subtype_matched = counts.get('matched', 0)
-                        subtype_scored = round(scored * subtype_matched / total_lien_matched) if total_lien_matched else 0
+                        src = LIEN_DOCTYPE_TO_SOURCE.get(doc_type_label)
+                        if src is None:
+                            logger.warning(
+                                "Unknown lien doc_type label %r — routing to 'lien_unknown'. "
+                                "Add it to LIEN_DOCTYPE_TO_SOURCE if it should map to a real subtype.",
+                                doc_type_label,
+                            )
+                            src = 'lien_unknown'
+                        bucket = agg.setdefault(src, {'total': 0, 'matched': 0, 'unmatched': 0, 'skipped': 0})
+                        bucket['total']     += counts.get('total', 0)
+                        bucket['matched']   += counts.get('matched', 0)
+                        bucket['unmatched'] += counts.get('unmatched', 0)
+                        bucket['skipped']   += counts.get('skipped', 0)
+
+                    total_lien_matched = sum(b['matched'] for b in agg.values())
+                    for src, bucket in agg.items():
+                        subtype_scored = (
+                            round(scored * bucket['matched'] / total_lien_matched)
+                            if total_lien_matched else 0
+                        )
                         record_scraper_stats(
                             source_type=src,
-                            total_scraped=counts.get('total', 0),
-                            matched=subtype_matched,
-                            unmatched=counts.get('unmatched', 0),
-                            skipped=counts.get('skipped', 0),
+                            total_scraped=bucket['total'],
+                            matched=bucket['matched'],
+                            unmatched=bucket['unmatched'],
+                            skipped=bucket['skipped'],
                             scored=subtype_scored,
                             duration_seconds=duration,
                         )
                     # Write no_data rows for expected subtypes absent from today's combined download
                     # so load_validator always sees a row for every subtype (e.g. lien_tcl on days
                     # with zero Tampa Code Liens in the county portal export).
-                    seen_sources = {LIEN_DOCTYPE_TO_SOURCE.get(lbl) for lbl in lien_counts}
-                    for src in LIEN_DOCTYPE_TO_SOURCE.values():
-                        if src not in seen_sources:
+                    for src in set(LIEN_DOCTYPE_TO_SOURCE.values()):
+                        if src not in agg:
                             record_scraper_stats(
                                 source_type=src,
                                 total_scraped=0,

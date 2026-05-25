@@ -34,6 +34,7 @@ from typing import Any, Dict, Optional, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
+from config.scoring import for_county
 from src.agents.prompts.loader import render_fallback_body, render_for_subscriber_auto
 from src.agents.subgraphs.compose_and_send import run_compose_and_send
 from src.agents.subgraphs.decision_hierarchy import run_decision_hierarchy
@@ -42,6 +43,12 @@ from src.agents.tools.read_tools import (
 	get_subscriber_profile,
 	get_zip_activity,
 )
+
+
+# Phrase used in place of the tier label when the subscriber's county is
+# flagged tier_visibility="internal" (Pinellas pre-retune). Reads naturally
+# in every template that currently interpolates {lead_tier}.
+_TIER_SUPPRESSED_PHRASE = "matching"
 
 
 GRAPH_NAME = "fomo"
@@ -171,15 +178,25 @@ def _node_build_compose_context(state: FOMOState) -> Dict[str, Any]:
 	zip_activity = state.get("zip_activity") or {}
 	payload = state.get("event_payload") or {}
 
+	# Counties whose tier distribution isn't yet trustworthy substitute a
+	# neutral phrase for {lead_tier} in every prompt template. The subscriber
+	# never sees the broken label, but the rest of the FOMO copy is unchanged.
+	_county_cfg = for_county(profile.get("county_id"))
+	_tier_for_prompt = (
+		_TIER_SUPPRESSED_PHRASE
+		if _county_cfg.tier_visibility == "internal"
+		else (payload.get("lead_tier") or "Gold")
+	)
+
 	context = {
 		"subscriber_first_name": (profile.get("name") or "there").split(" ")[0],
 		"first_name": (profile.get("name") or "there").split(" ")[0],
 		"vertical": profile.get("vertical") or payload.get("vertical") or "",
 		"zip_code": payload.get("zip_code") or "",
-		"lead_tier": payload.get("lead_tier") or "Gold",
+		"lead_tier": _tier_for_prompt,
 		"active_lead_count": zip_activity.get("active_viewers", 0),
 		"revenue_signal_score": state.get("revenue_signal_score", 0),
-		"competitor_signal": f"a competitor just contacted a {payload.get('lead_tier', 'Gold')} lead in {payload.get('zip_code', '')}",
+		"competitor_signal": f"a competitor just contacted a {_tier_for_prompt} lead in {payload.get('zip_code', '')}",
 		"lead_specific_detail": f"{zip_activity.get('active_viewers', 0)} more viewers active in {payload.get('zip_code', '')}",
 		"unlock_link": f"https://app.forcedaction.io/feed/{profile.get('id')}",
 	}
