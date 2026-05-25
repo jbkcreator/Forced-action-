@@ -183,6 +183,11 @@ class AppSettings(BaseSettings):
 	# Contact enrichment (M1)
 	batch_skip_tracing_api_key: Optional[SecretStr] = Field(default=None, env="BATCH_SKIP_TRACING_API_KEY")
 	idi_api_key: Optional[SecretStr] = Field(default=None, env="IDI_API_KEY")
+	pdl_api_key: Optional[SecretStr] = Field(default=None, env="PDL_API_KEY")
+
+	# Skip trace waterfall behaviour
+	skip_trace_confidence_threshold: float = Field(default=0.70, env="SKIP_TRACE_CONFIDENCE_THRESHOLD")
+	skip_trace_cost_ceiling_cents: int = Field(default=80, env="SKIP_TRACE_COST_CEILING_CENTS")
 
 	# SMTP (used by welcome email, payment receipts, grace period alerts)
 	smtp_host: Optional[str] = Field(default=None, env="SMTP_HOST")

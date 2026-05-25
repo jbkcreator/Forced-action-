@@ -1158,8 +1158,11 @@ class EnrichedContact(Base):
     relative_contacts: Mapped[Optional[dict]] = mapped_column(JSONB)  # relative contact chain
 
     # Source tracking
-    source: Mapped[str] = mapped_column(String(50), nullable=False)   # batch_skip_tracing | idi
+    source: Mapped[str] = mapped_column(String(50), nullable=False)   # batch_skip_tracing | idi | pdl
     match_success: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    # Waterfall quality score (0.000–1.000) — set by the waterfall coordinator
+    confidence: Mapped[Optional[float]] = mapped_column(Numeric(4, 3), nullable=True)
 
     # Audit
     enriched_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
@@ -1169,7 +1172,7 @@ class EnrichedContact(Base):
     __table_args__ = (
         Index("idx_enriched_match_success", "match_success"),
         Index("idx_enriched_source", "source"),
-        CheckConstraint("source IN ('batch_skip_tracing', 'idi')", name="check_enriched_source"),
+        CheckConstraint("source IN ('batch_skip_tracing', 'idi', 'pdl')", name="check_enriched_source"),
     )
 
     def __repr__(self):

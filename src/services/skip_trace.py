@@ -281,6 +281,7 @@ def run_skip_trace(
     retrace_after_days: int = 60,
     refresh_stale: bool = False,
     refresh_stale_after_days: int = 90,
+    owner_ids: Optional[list] = None,
 ) -> dict:
     """
     Enrich owner contacts for high-priority leads that are missing a phone.
@@ -449,7 +450,16 @@ def run_skip_trace(
         else:
             q = q.filter(no_phone).filter(Owner.skip_trace_success.is_not(True))
 
-        rows = q.order_by(ds_latest.c.max_date.desc()).limit(limit).all()
+        if owner_ids is not None:
+            # Waterfall mode: process only these specific owners, skip candidate query.
+            rows = (
+                session.query(Owner, Property)
+                .join(Property, Owner.property_id == Property.id)
+                .filter(Owner.id.in_(owner_ids))
+                .all()
+            )
+        else:
+            rows = q.order_by(ds_latest.c.max_date.desc()).limit(limit).all()
 
         # Pre-fetch party names from court filings for all candidate properties.
         # Why: the name on the assessor record is often NOT the actual

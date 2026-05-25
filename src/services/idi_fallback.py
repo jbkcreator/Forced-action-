@@ -168,14 +168,15 @@ def _parse_idi_result(result: dict) -> dict:
 def run_idi_fallback(
     limit: int = 100,
     county_id: str = "hillsborough",
+    owner_ids: Optional[list] = None,
     dry_run: bool = False,
 ) -> dict:
     """
     Run IDI fallback enrichment for BatchData misses.
 
-    Targets properties where:
-      - EnrichedContact(source='batch_skip_tracing', match_success=False) exists
-      - No EnrichedContact(source='idi') exists yet
+    Standard mode (owner_ids=None): targets BatchData misses not yet IDI-traced.
+    Waterfall mode (owner_ids=[...]): processes specific owners directly, skips
+    the BatchData-miss candidate query.
 
     Returns stats dict.
     """
@@ -188,39 +189,53 @@ def run_idi_fallback(
     api_key = settings.idi_api_key.get_secret_value()
     stats = {"total": 0, "success": 0, "failed": 0, "no_address": 0, "already_done": 0}
 
-    # Pull candidates: BatchData misses not yet tried via IDI, whose owner
-    # is STILL missing a phone. The extra phone-missing filter prevents IDI
-    # credits from being burned on properties that picked up a phone via
-    # another path (manual edit, secondary BatchData pass, etc.) between
-    # the original BatchData miss and now.
     with get_db_context() as session:
-        from sqlalchemy import exists, and_, or_ as sa_or, func as sa_func
+        from sqlalchemy import or_ as sa_or, func as sa_func
 
-        idi_exists = session.query(EnrichedContact.property_id).filter(
+        idi_already = session.query(EnrichedContact.property_id).filter(
             EnrichedContact.source == "idi"
         ).subquery()
 
-        no_phone = sa_or(
-            Owner.phone_1.is_(None),
-            sa_func.length(sa_func.trim(Owner.phone_1)) == 0,
-        )
-
-        candidates = (
-            session.query(EnrichedContact, Owner, Property)
-            .join(Owner, EnrichedContact.property_id == Owner.property_id)
-            .join(Property, Property.id == EnrichedContact.property_id)
-            .filter(
-                EnrichedContact.source == "batch_skip_tracing",
-                EnrichedContact.match_success == False,   # noqa: E712
-                EnrichedContact.property_id.notin_(
-                    session.query(idi_exists)
-                ),
-                Owner.county_id == county_id,
-                no_phone,
+        if owner_ids is not None:
+            # Waterfall mode: process the given owners directly.
+            # Still skip any owner whose property already has an IDI record (idempotency).
+            owner_prop_rows = (
+                session.query(Owner, Property)
+                .join(Property, Owner.property_id == Property.id)
+                .filter(
+                    Owner.id.in_(owner_ids),
+                    Owner.property_id.notin_(session.query(idi_already)),
+                )
+                .all()
             )
-            .limit(limit)
-            .all()
-        )
+            candidates = [(None, owner, prop) for owner, prop in owner_prop_rows]
+        else:
+            # Standard mode: BatchData misses not yet tried via IDI, whose owner
+            # is STILL missing a phone. The extra phone-missing filter prevents IDI
+            # credits from being burned on properties that picked up a phone via
+            # another path (manual edit, secondary BatchData pass, etc.) between
+            # the original BatchData miss and now.
+            no_phone = sa_or(
+                Owner.phone_1.is_(None),
+                sa_func.length(sa_func.trim(Owner.phone_1)) == 0,
+            )
+
+            candidates = (
+                session.query(EnrichedContact, Owner, Property)
+                .join(Owner, EnrichedContact.property_id == Owner.property_id)
+                .join(Property, Property.id == EnrichedContact.property_id)
+                .filter(
+                    EnrichedContact.source == "batch_skip_tracing",
+                    EnrichedContact.match_success == False,   # noqa: E712
+                    EnrichedContact.property_id.notin_(
+                        session.query(idi_already)
+                    ),
+                    Owner.county_id == county_id,
+                    no_phone,
+                )
+                .limit(limit)
+                .all()
+            )
 
     if not candidates:
         logger.info("[IDI] No BatchData misses to retry — every miss either has a phone now or was already retried.")
@@ -230,7 +245,7 @@ def run_idi_fallback(
     stats["total"] = len(candidates)
 
     if dry_run:
-        for ec, owner, prop in candidates[:5]:
+        for _, owner, prop in candidates[:5]:
             logger.info("[IDI DRY RUN] Would retry: property_id=%d | %s | %s",
                         prop.id, prop.address, owner.owner_name)
         logger.info("[IDI DRY RUN] Would process %d records total.", len(candidates))
@@ -245,7 +260,7 @@ def run_idi_fallback(
         search_records = []
         index_map = []
 
-        for ec, owner, prop in batch:
+        for _, owner, prop in batch:
             if not prop.address or not prop.zip:
                 stats["no_address"] += 1
                 continue
@@ -266,7 +281,7 @@ def run_idi_fallback(
                     "zip": prop.zip,
                 },
             })
-            index_map.append((ec, owner, prop))
+            index_map.append(owner)
 
         if not search_records:
             continue
@@ -298,7 +313,7 @@ def run_idi_fallback(
                 if i >= len(index_map):
                     break
 
-                ec_snap, owner_snap, prop_snap = index_map[i]
+                owner_snap = index_map[i]
 
                 try:
                     parsed = _parse_idi_result(result)
