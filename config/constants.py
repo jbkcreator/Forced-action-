@@ -72,6 +72,16 @@ COURT_CODE_FLORIDA_MIDDLE_BANKRUPTCY = "flmb"
 TAMPA_DIVISION_PREFIX = "8:"
 
 # =============================================================================
+# PACER — PCL REST API + CM/ECF docket scrape (primary bankruptcy source)
+# =============================================================================
+
+PACER_AUTH_URL        = "https://pacer.login.uscourts.gov/services/cso-auth"
+PACER_PCL_PARTIES_URL = "https://pcl.uscourts.gov/pcl-public-api/rest/parties/find"
+PACER_CMECF_FLMB_URL  = "https://ecf.flmb.uscourts.gov/cgi-bin/DktRpt.pl"
+PACER_COURT_FLMB      = "flmb"
+PACER_CHAPTER_FILTER  = ["7", "11", "13"]
+
+# =============================================================================
 # FILE PATTERNS
 # =============================================================================
 

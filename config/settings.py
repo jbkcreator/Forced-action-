@@ -21,7 +21,11 @@ class AppSettings(BaseSettings):
 	# API Keys
 	anthropic_api_key: SecretStr = Field(..., env="ANTHROPIC_API_KEY")
 	firecrawl_api_key: SecretStr = Field(..., env="FIRECRAWL_API_KEY")
-	court_listener_api_key: SecretStr = Field(..., env="COURT_LISTENER_API_KEY")
+	court_listener_api_key: Optional[SecretStr] = Field(default=None, env="COURT_LISTENER_API_KEY")
+
+	# PACER — primary bankruptcy source (PCL batch search + CM/ECF per-case address fetch)
+	pacer_username: Optional[str]       = Field(default=None, env="PACER_USERNAME")
+	pacer_password: Optional[SecretStr] = Field(default=None, env="PACER_PASSWORD")
 
 	# Telnyx (phone deliverability sampler — carrier / line-type lookup)
 	telnyx_api_key: Optional[SecretStr] = Field(default=None, env="TELNYX_API_KEY")

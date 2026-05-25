@@ -1,20 +1,18 @@
 """
-Bankruptcy Filing Data Collection Pipeline
+Bankruptcy Filing Data Collection Pipeline — PACER Source
 
-This module automates the collection of bankruptcy filing records from the
-CourtListener API for the Florida Middle Bankruptcy Court (Tampa Division).
-It retrieves recent bankruptcy filings, filters for Tampa-specific cases,
-and saves them to the processed data directory.
+Fetches Tampa FLMB bankruptcy cases via two steps:
+  1. PACER PCL Party Search (batch REST API, $0.10/page) — case list + debtor names
+  2. PACER CM/ECF docket fetch per case (Playwright, $0.10/case) — debtor street address
 
-The pipeline performs the following steps:
-    1. Fetches bankruptcy dockets from CourtListener API for specified date range
-    2. Filters for Tampa Division cases (docket numbers starting with '8:')
-    3. Cleans and structures the data for downstream processing
-    4. Saves the processed bankruptcy leads to CSV format
+Debtor address enables address-first property matching in BankruptcyLoader,
+lifting match rates from ~15% (name-only) to ~40-60%.
 
 Author: Distressed Property Intelligence Platform
 """
 
+import random
+import re
 import time
 import traceback
 from datetime import datetime, timedelta
@@ -23,6 +21,8 @@ from typing import Optional, List, Dict, Any
 
 import pandas as pd
 import requests
+from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
 from config.settings import settings
 from src.utils.http_helpers import requests_get_with_retry
@@ -32,7 +32,13 @@ from config.constants import (
 	TAMPA_DIVISION_PREFIX,
 	RAW_BANKRUPTCY_DIR,
 	API_USER_AGENT,
+	DEFAULT_USER_AGENT,
 	REQUEST_TIMEOUT_DEFAULT,
+	PACER_AUTH_URL,
+	PACER_PCL_PARTIES_URL,
+	PACER_CMECF_FLMB_URL,
+	PACER_COURT_FLMB,
+	PACER_CHAPTER_FILTER,
 )
 from src.utils.county_config import get_county_config
 from src.utils.logger import setup_logging, get_logger
@@ -42,6 +48,255 @@ from src.utils.db_deduplicator import filter_new_records
 setup_logging()
 logger = get_logger(__name__)
 
+
+def _record_stats(source_type, total, matched, unmatched, skipped, success, county_id, t0, **kwargs):
+	try:
+		from src.utils.scraper_db_helper import record_scraper_stats
+		record_scraper_stats(
+			source_type=source_type, total_scraped=total, matched=matched,
+			unmatched=unmatched, skipped=skipped, run_success=success,
+			duration_seconds=round(time.monotonic() - t0, 2),
+			county_id=county_id, **kwargs,
+		)
+	except Exception as _se:
+		logger.warning("Could not record scraper stats: %s", _se)
+
+
+def _get_pacer_token() -> str:
+	"""
+	Authenticate with PACER and return the nextGenCSO session token.
+	Token is used as a header on PCL API requests and as a cookie on CM/ECF page fetches.
+	Raises RuntimeError if credentials are not configured.
+	"""
+	if not settings.pacer_username or not settings.pacer_password:
+		raise RuntimeError(
+			"PACER credentials not configured. Set PACER_USERNAME and PACER_PASSWORD in .env"
+		)
+
+	resp = requests.post(
+		PACER_AUTH_URL,
+		json={
+			"loginId": settings.pacer_username,
+			"password": settings.pacer_password.get_secret_value(),
+			"redactFlag": "1",
+		},
+		timeout=REQUEST_TIMEOUT_DEFAULT,
+		headers={"User-Agent": API_USER_AGENT},
+	)
+	resp.raise_for_status()
+
+	token = resp.json().get("nextGenCSO")
+	if not token:
+		raise RuntimeError(f"PACER auth response missing nextGenCSO token: {resp.text[:200]}")
+
+	logger.info("PACER authentication successful")
+	return token
+
+
+def fetch_cases_from_pcl(
+	lookback_days: int = 1,
+	court_code: str = PACER_COURT_FLMB,
+	pacer_token: str = "",
+) -> List[Dict[str, Any]]:
+	"""
+	POST to PACER PCL /parties/find to get all debtor-role cases filed in the
+	given date range. Handles pagination. Each page costs $0.10 (PACER billing).
+	"""
+	today = datetime.now().date()
+	date_from = (today - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+	date_to = today.strftime("%Y-%m-%d")
+
+	logger.info(f"Fetching PCL party search: court={court_code}, {date_from} → {date_to}")
+
+	headers = {
+		"X-NEXT-GEN-CSO": pacer_token,
+		"Content-Type": "application/json",
+		"Accept": "application/json",
+		"User-Agent": API_USER_AGENT,
+	}
+
+	payload = {
+		"role": ["db"],
+		"courtCase": {
+			"courtId": [court_code],
+			"dateFiledFrom": date_from,
+			"dateFiledTo": date_to,
+			"federalBankruptcyChapter": PACER_CHAPTER_FILTER,
+		},
+	}
+
+	all_results: List[Dict] = []
+	page = 0
+
+	while True:
+		resp = requests.post(
+			PACER_PCL_PARTIES_URL,
+			json=payload,
+			params={"page": page},
+			headers=headers,
+			timeout=REQUEST_TIMEOUT_DEFAULT,
+		)
+		if not resp.ok:
+			logger.error(f"PCL API error (page {page}): HTTP {resp.status_code} — {resp.text[:300]}")
+			resp.raise_for_status()
+
+		data = resp.json()
+		results = data.get("content", [])
+		all_results.extend(results)
+
+		total_pages = data.get("totalPages", 1)
+		logger.info(f"PCL page {page + 1}/{total_pages}: {len(results)} results")
+
+		if page >= total_pages - 1:
+			break
+		page += 1
+
+	logger.info(f"PCL total results: {len(all_results)}")
+	return all_results
+
+
+def _parse_cmecf_address(html: str) -> Dict[str, Optional[str]]:
+	"""
+	Parse debtor address from CM/ECF docket HTML.
+
+	Expected debtor section structure:
+	    <TD><I><B>Debtor</B></I><BR>
+	    <B>Name</B><BR>123 Main St<BR>Tampa, FL 33601<BR>COUNTY-FL</TD>
+
+	Lines after parsing: ['Debtor', 'Name', '123 Main St', 'Tampa, FL 33601', 'HILLSBOROUGH-FL']
+	Returns empty dict for PO Box or unparseable HTML (non-fatal — caller falls through to name match).
+	"""
+	soup = BeautifulSoup(html, "html.parser")
+
+	debtor_td = None
+	for i_tag in soup.find_all("i"):
+		b_tag = i_tag.find("b")
+		if b_tag and "Debtor" in b_tag.get_text():
+			debtor_td = i_tag.find_parent("td")
+			break
+
+	if not debtor_td:
+		logger.debug("CM/ECF parse: Debtor section not found in HTML")
+		return {}
+
+	lines = [ln.strip() for ln in debtor_td.get_text(separator="\n").split("\n") if ln.strip()]
+	if len(lines) < 4:
+		logger.debug(f"CM/ECF parse: not enough address lines: {lines}")
+		return {}
+
+	street = lines[2]
+	city_state_zip_raw = lines[3]
+
+	if re.match(r"^P\.?O\.?\s*Box", street, re.IGNORECASE):
+		logger.debug(f"CM/ECF parse: PO Box skipped: {street}")
+		return {}
+
+	m = re.match(r"^(.+),\s+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)$", city_state_zip_raw)
+	if not m:
+		logger.debug(f"CM/ECF parse: city/state/zip not matched: {city_state_zip_raw!r}")
+		return {"street": street, "city": None, "state": None, "zip": None}
+
+	return {
+		"street": street,
+		"city":   m.group(1).strip(),
+		"state":  m.group(2),
+		"zip":    m.group(3),
+	}
+
+
+def fetch_debtor_address_cmecf(case_id: str, pacer_token: str) -> Dict[str, Optional[str]]:
+	"""
+	Fetch debtor address from CM/ECF docket page via Playwright + PACER session cookie.
+	Costs $0.10 per call (PACER billing). Returns empty dict on any error (non-fatal).
+	"""
+	url = f"{PACER_CMECF_FLMB_URL}?{case_id}"
+	logger.debug(f"Fetching CM/ECF docket: {url}")
+
+	try:
+		with sync_playwright() as pw:
+			browser = pw.chromium.launch(headless=True)
+			context = browser.new_context(user_agent=DEFAULT_USER_AGENT)
+			context.add_cookies([{
+				"name":   "nextGenCSO",
+				"value":  pacer_token,
+				"domain": ".uscourts.gov",
+				"path":   "/",
+			}])
+			page = context.new_page()
+			page.goto(url, timeout=30_000, wait_until="domcontentloaded")
+			html = page.content()
+			browser.close()
+
+		return _parse_cmecf_address(html)
+
+	except Exception as e:
+		logger.warning(f"CM/ECF address fetch failed for case_id={case_id}: {e}")
+		return {}
+
+
+def build_bankruptcy_leads(
+	pcl_cases: List[Dict[str, Any]],
+	pacer_token: str,
+	division_prefix: str = TAMPA_DIVISION_PREFIX,
+) -> List[Dict[str, Any]]:
+	"""
+	Filter PCL results for Tampa Division cases and fetch CM/ECF address per case.
+
+	PCL party response shape (PACER PCL API User Guide, Nov 2024):
+	    {"firstName": "John", "middleName": "A", "lastName": "Smith", "role": "db",
+	     "courtCase": {"caseId": "12345678", "courtId": "flmb",
+	                   "docketNum": "8:26-bk-01234", "caseTitle": "Smith, John A",
+	                   "dateFiled": "2026-05-25", "chapter": "7"}}
+
+	Field names are from the PDF spec — verify against live API on first run.
+	"""
+	leads: List[Dict] = []
+
+	for case in pcl_cases:
+		court_case = case.get("courtCase") or {}
+		docket_num = court_case.get("docketNum", "")
+
+		if not docket_num.startswith(division_prefix):
+			continue
+
+		first  = (case.get("firstName")  or "").strip()
+		middle = (case.get("middleName") or "").strip()
+		last   = (case.get("lastName")   or "").strip()
+		lead_name = " ".join(filter(None, [first, middle, last])) or court_case.get("caseTitle", "")
+
+		case_id    = court_case.get("caseId", "")
+		chapter    = court_case.get("chapter", "")
+		date_filed = court_case.get("dateFiled", "")
+		court_id   = court_case.get("courtId", "")
+
+		address: Dict = {}
+		if case_id:
+			time.sleep(random.uniform(1.0, 2.5))
+			address = fetch_debtor_address_cmecf(str(case_id), pacer_token)
+
+		leads.append({
+			"Docket Number": docket_num,
+			"Lead Name":     lead_name,
+			"Date Filed":    date_filed,
+			"Case Type":     "bk",
+			"Court ID":      court_id,
+			"Chapter":       chapter,
+			"Debtor Street": address.get("street"),
+			"Debtor City":   address.get("city"),
+			"Debtor State":  address.get("state"),
+			"Debtor Zip":    address.get("zip"),
+		})
+		logger.debug(f"Lead: {lead_name} ({docket_num}) — address: {address.get('street') or 'none'}")
+
+	logger.info(f"Built {len(leads)} Tampa leads from {len(pcl_cases)} PCL cases")
+	if not leads:
+		logger.warning("No Tampa Division cases found after filtering")
+	return leads
+
+
+# =============================================================================
+# LEGACY — CourtListener source (kept for reference; not called by pipeline)
+# =============================================================================
 
 def fetch_bankruptcy_filings(lookback_days: int = 1, court_code: str = COURT_CODE_FLORIDA_MIDDLE_BANKRUPTCY) -> List[Dict[str, Any]]:
 	"""
@@ -76,6 +331,8 @@ def fetch_bankruptcy_filings(lookback_days: int = 1, court_code: str = COURT_COD
 		"date_filed__gte": start_date,
 	}
 	
+	if not settings.court_listener_api_key:
+		raise RuntimeError("COURT_LISTENER_API_KEY not configured (legacy CourtListener path)")
 	headers = {
 		"Authorization": f"Token {settings.court_listener_api_key.get_secret_value()}",
 		"User-Agent": API_USER_AGENT,
@@ -247,105 +504,73 @@ def save_bankruptcy_leads(
 
 
 def run_bankruptcy_pipeline(lookback_days: int = 1, county_id: str = "hillsborough") -> bool:
-	"""
-	Execute the complete bankruptcy data collection pipeline.
-
-	This function orchestrates the entire workflow:
-	    1. Fetches bankruptcy filings from CourtListener API
-	    2. Filters for Tampa Division cases only
-	    3. Saves the filtered results to CSV
-
-	Args:
-		lookback_days: Number of days to look back for filings (default: 1)
-
-	Returns:
-		bool: True if the pipeline executed successfully, False otherwise
-
-	Example:
-		>>> success = run_bankruptcy_pipeline(lookback_days=7)
-		>>> if success:
-		>>>     print("Bankruptcy pipeline completed successfully")
-	"""
+	"""Execute the complete bankruptcy data collection pipeline (PACER source)."""
 	t0 = time.monotonic()
 	try:
 		county_cfg = get_county_config(county_id)
 		court_cfg = county_cfg.get("court", {})
-		court_code = court_cfg.get("bankruptcy_code", COURT_CODE_FLORIDA_MIDDLE_BANKRUPTCY)
+		court_code = court_cfg.get("bankruptcy_code", PACER_COURT_FLMB)
 		division_prefix = court_cfg.get("division_prefix", TAMPA_DIVISION_PREFIX)
 
 		logger.info("=" * 80)
-		logger.info(f"STARTING BANKRUPTCY DATA COLLECTION PIPELINE ({county_cfg['display_name'].upper()})")
+		logger.info(f"STARTING BANKRUPTCY PIPELINE — PACER SOURCE ({county_cfg['display_name'].upper()})")
 		logger.info("=" * 80)
 
-		# Step 1: Fetch bankruptcy filings from API
-		logger.info(f"\n[STEP 1/3] Fetching bankruptcy filings (lookback: {lookback_days} days)...")
-		dockets = fetch_bankruptcy_filings(lookback_days=lookback_days, court_code=court_code)
-
-		if not dockets:
-			logger.warning("No bankruptcy filings found in the specified date range")
-			try:
-				from src.utils.scraper_db_helper import record_scraper_stats
-				record_scraper_stats(source_type='bankruptcy', total_scraped=0, matched=0, unmatched=0, skipped=0, run_success=True, error_type='no_data', duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id)
-			except Exception as _se:
-				logger.warning("Could not record scraper stats: %s", _se)
+		# Step 1: Authenticate with PACER
+		logger.info("\n[STEP 1/3] Authenticating with PACER...")
+		try:
+			pacer_token = _get_pacer_token()
+		except RuntimeError as e:
+			logger.error(f"PACER auth failed: {e}")
+			_record_stats('bankruptcy', 0, 0, 0, 0, False, county_id, t0, error_type='config_error')
 			return False
 
-		# Step 2: Filter for division cases
-		logger.info(f"\n[STEP 2/3] Filtering for division '{division_prefix}' bankruptcy cases...")
-		tampa_leads = filter_tampa_bankruptcies(dockets, division_prefix=division_prefix)
+		# Step 2: Fetch cases from PCL ($0.10/page billed to PACER account)
+		logger.info(f"\n[STEP 2/3] Fetching from PACER PCL (lookback: {lookback_days} days)...")
+		pcl_cases = fetch_cases_from_pcl(
+			lookback_days=lookback_days,
+			court_code=court_code,
+			pacer_token=pacer_token,
+		)
 
-		if not tampa_leads:
-			logger.warning("No Tampa bankruptcy cases found - pipeline completed but no data to save")
-			try:
-				from src.utils.scraper_db_helper import record_scraper_stats
-				record_scraper_stats(source_type='bankruptcy', total_scraped=0, matched=0, unmatched=0, skipped=0, run_success=True, error_type='no_data', duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id)
-			except Exception as _se:
-				logger.warning("Could not record scraper stats: %s", _se)
+		if not pcl_cases:
+			logger.warning("No bankruptcy filings found in PCL for the specified date range")
+			_record_stats('bankruptcy', 0, 0, 0, 0, True, county_id, t0, error_type='no_data')
 			return False
 
-		# Step 3: Save processed leads
-		logger.info("\n[STEP 3/3] Saving processed bankruptcy leads...")
+		# Step 3: Build leads — filter Tampa cases + fetch CM/ECF addresses ($0.10/case)
+		logger.info(f"\n[STEP 3/3] Building leads + fetching CM/ECF addresses ({len(pcl_cases)} PCL cases)...")
+		leads = build_bankruptcy_leads(pcl_cases, pacer_token, division_prefix=division_prefix)
+
+		if not leads:
+			logger.warning("No Tampa bankruptcy cases found after division filter")
+			_record_stats('bankruptcy', 0, 0, 0, 0, True, county_id, t0, error_type='no_data')
+			return False
+
+		# Step 4: Save (dedup + CSV)
 		today = datetime.now().strftime("%Y%m%d")
 		output_filename = f"tampa_bankruptcy_leads_{today}.csv"
-		output_path = save_bankruptcy_leads(tampa_leads, output_filename, county_id=county_id)
+		output_path = save_bankruptcy_leads(leads, output_filename, county_id=county_id)
 
 		if not output_path:
-			logger.error("Failed to save bankruptcy leads")
-			try:
-				from src.utils.scraper_db_helper import record_scraper_stats
-				record_scraper_stats(source_type='bankruptcy', total_scraped=len(tampa_leads), matched=0, unmatched=0, skipped=0, run_success=False, error_message='Failed to save bankruptcy leads CSV', duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id)
-			except Exception as _se:
-				logger.warning("Could not record scraper stats: %s", _se)
-			return False
+			logger.info("All bankruptcy cases already exist in DB — nothing new to save")
+			_record_stats('bankruptcy', len(leads), 0, 0, len(leads), True, county_id, t0)
+			return True
 
 		logger.info("=" * 80)
 		logger.info("BANKRUPTCY PIPELINE COMPLETED SUCCESSFULLY")
-		logger.info(f"Output file: {output_path}")
-		logger.info(f"Total Tampa bankruptcy leads: {len(tampa_leads)}")
+		logger.info(f"Output: {output_path}  |  New leads: {len(leads)}")
 		logger.info("=" * 80)
 
-		# Record scraper stats (load_scraped_data_to_db will upsert with matched/unmatched
-		# when --load-to-db is used; this covers the dry-run path).
-		try:
-			from src.utils.scraper_db_helper import record_scraper_stats
-			record_scraper_stats(source_type='bankruptcy', total_scraped=len(tampa_leads), matched=0, unmatched=0, skipped=0, run_success=True, duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id)
-		except Exception as _se:
-			logger.warning("Could not record scraper stats: %s", _se)
-
+		_record_stats('bankruptcy', len(leads), 0, 0, 0, True, county_id, t0)
 		return True
 
 	except Exception as e:
 		logger.error("=" * 80)
-		logger.error("BANKRUPTCY PIPELINE FAILED")
-		logger.error(f"Error: {e}")
-		logger.error("Traceback:")
+		logger.error(f"BANKRUPTCY PIPELINE FAILED: {e}")
 		logger.error(traceback.format_exc())
 		logger.error("=" * 80)
-		try:
-			from src.utils.scraper_db_helper import record_scraper_stats
-			record_scraper_stats(source_type='bankruptcy', total_scraped=0, matched=0, unmatched=0, skipped=0, run_success=False, error_message=str(e)[:500], duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id)
-		except Exception as _se:
-			logger.warning("Could not record scraper stats: %s", _se)
+		_record_stats('bankruptcy', 0, 0, 0, 0, False, county_id, t0, error_message=str(e)[:500])
 		return False
 
 

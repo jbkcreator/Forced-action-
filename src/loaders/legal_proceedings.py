@@ -483,38 +483,42 @@ class BankruptcyLoader(BaseLoader):
                 skipped += 1
                 continue
 
-            # Match by owner name (only option available — no address in CourtListener API)
-            # Try multiple name permutations to handle:
-            #   - Middle names/initials adding noise ("Nicole Mary-Nell Montgomery")
-            #   - Hyphenated compound last names ("Reina-Perez")
-            #   - Property appraiser LAST FIRST vs filing FIRST LAST
+            # ── Address match (PACER CM/ECF provides debtor street address) ────
             property_record = None
             match_score = 0
             match_method = None
             lead_name_val = _none_if_nan(row.get('Lead Name'))
+            debtor_street = _none_if_nan(row.get('Debtor Street'))
+            debtor_zip    = _none_if_nan(row.get('Debtor Zip'))
 
-            if lead_name_val:
+            if debtor_street and debtor_zip:
+                result = self.find_property_by_address(
+                    address=debtor_street,
+                    zip_code=str(debtor_zip).split('-')[0],  # strip ZIP+4 if present
+                )
+                if result:
+                    property_record, match_score = result
+                    match_method = MATCH_METHOD_NORM_ADDR
+                    logger.info(
+                        f"Matched bankruptcy by address (score: {match_score}%): "
+                        f"{docket_number} — {debtor_street}"
+                    )
+
+            # ── Name match fallback (no address or address match failed) ─────
+            if not property_record and lead_name_val:
                 name_str = str(lead_name_val).strip()
                 name_parts = name_str.split()
 
-                # Build a set of name variants to try (deduplicated, order matters)
                 name_variants: list = [name_str]
-
                 if len(name_parts) >= 2:
-                    # First + Last only (strips middle name/initial noise)
                     first_last = f"{name_parts[0]} {name_parts[-1]}"
                     if first_last != name_str:
                         name_variants.append(first_last)
-
-                    # Handle hyphenated last names: try each component separately
-                    # (bare surname removed — too many false positives on common last names)
                     if '-' in name_parts[-1]:
                         for part in name_parts[-1].split('-'):
                             if len(part) > 4:
                                 name_variants.append(f"{name_parts[0]} {part}")
 
-                # Bankruptcy is name-only (no address/zip/city in CourtListener) —
-                # cascade falls straight to stage 5 (owner_name across the county).
                 for variant in name_variants:
                     prop, method, score = self.find_property_cascade(
                         owner_name=variant,
@@ -542,8 +546,7 @@ class BankruptcyLoader(BaseLoader):
                         # Nullable fields
                         lead_name_val = _none_if_nan(row.get('Lead Name'))
                         case_type_val = _none_if_nan(row.get('Case Type'))
-                        division_val = _none_if_nan(row.get('Division'))
-                        court_id_val = _none_if_nan(row.get('Court ID'))
+                        court_id_val  = _none_if_nan(row.get('Court ID'))
 
                         bankruptcy_record = LegalProceeding(
                             property_id=property_record.id,
@@ -556,8 +559,14 @@ class BankruptcyLoader(BaseLoader):
                             county_id=self.county_id,
                             meta_data={
                                 'case_type': case_type_val,
-                                'division': division_val,
-                                'court_id': court_id_val
+                                'chapter':   _none_if_nan(row.get('Chapter')),
+                                'court_id':  court_id_val,
+                                'debtor_address': {
+                                    'street': _none_if_nan(row.get('Debtor Street')),
+                                    'city':   _none_if_nan(row.get('Debtor City')),
+                                    'state':  _none_if_nan(row.get('Debtor State')),
+                                    'zip':    _none_if_nan(row.get('Debtor Zip')),
+                                },
                             }
                         )
 
@@ -593,7 +602,6 @@ class BankruptcyLoader(BaseLoader):
                 unmatched += 1
 
         logger.info(f"Bankruptcy: {matched} matched, {unmatched} unmatched, {skipped} skipped")
-        logger.warning("Bankruptcy match rate is low (name-only matching). Consider adding address enrichment.")
         return matched, unmatched, skipped
 
 
