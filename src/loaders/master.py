@@ -61,36 +61,67 @@ class MasterPropertyLoader(BaseLoader):
         return None
     
     @staticmethod
-    def _determine_absentee_status(property_address: Optional[str], 
-                                    mailing_address: Optional[str]) -> Optional[str]:
-        """Determine if owner is absentee by comparing addresses.
-        
-        Args:
-            property_address: Property street address
-            mailing_address: Owner mailing address
-            
+    def _parse_mailing_parts(mailing_address: str) -> tuple:
+        """Extract (street, state_code) from mailing address blob.
+
+        The loader stores mailing address as joined CSV parts: ADDR_1, CITY, STATE, ZIP.
+        When some CSV columns are blank only ADDR_1 is stored (street-only format).
+        This helper handles both cases and is only used by _determine_absentee_status.
+
         Returns:
-            'In-County' (owner-occupied), 'Out-of-County' (absentee), or None if cannot determine
-        
-        Note:
-            Since mailing addresses in the data only contain street addresses (no city/state/ZIP),
-            we use a simple comparison: matching address = owner-occupied, different = absentee.
-            This is conservative - we mark different addresses as Out-of-County (8 pts) rather than
-            Out-of-State (15 pts) to avoid over-scoring.
+            (mailing_street, mailing_state) — either may be None if not determinable.
+        """
+        parts = [p.strip() for p in mailing_address.split(", ") if p.strip()]
+        n = len(parts)
+        if n >= 4:
+            # Full format: ADDR_1, CITY, STATE, ZIP
+            # Join parts before last 3 to handle streets containing commas (e.g. "123 MAIN ST, APT 4")
+            street = ", ".join(parts[:-3]) or None
+            state  = parts[-2][:2].upper() or None
+        elif n == 3:
+            # ADDR_1, CITY, STATE — ZIP was blank in CSV
+            street = parts[0] or None
+            state  = parts[2][:2].upper() or None
+        else:
+            # Street only — CITY/STATE/ZIP were blank in original CSV
+            street = parts[0] if parts else None
+            state  = None
+        return street, state
+
+    @staticmethod
+    def _determine_absentee_status(
+        property_address: Optional[str],
+        property_state: Optional[str],
+        mailing_address: Optional[str],
+    ) -> Optional[str]:
+        """Determine owner occupancy by comparing situs and mailing addresses.
+
+        Comparison is field-by-field against Property's structured columns:
+          1. State mismatch  → Out-of-State  (owner mails from outside property's state)
+          2. Street match    → In-County     (owner lives at the property)
+          3. Fallback        → Out-of-County (different address, same state)
+
+        NOTE: This is only for absentee_status at ingest time. It does not interact
+        with the match waterfall (find_property_by_address) or Property.normalized_address.
         """
         if not mailing_address or not property_address:
             return None
-        
-        # Normalize both addresses for comparison
-        mail_clean = mailing_address.strip().upper()
-        prop_clean = property_address.strip().upper()
-        
-        # Exact match = owner-occupied
-        if mail_clean == prop_clean:
-            return 'In-County'
-        
-        # Different addresses = absentee (investment property)
-        # Use Out-of-County (8 pts) as conservative estimate
+
+        mailing_street, mailing_state = MasterPropertyLoader._parse_mailing_parts(mailing_address)
+
+        # Step 1 — Out-of-State: compare mailing state against Property.state
+        if mailing_state and property_state:
+            if mailing_state.upper() != property_state.upper():
+                return 'Out-of-State'
+
+        # Step 2 — In-County: normalize and compare streets in-memory only
+        if mailing_street:
+            norm_mail = normalize_street_address(mailing_street) or mailing_street.strip().upper()
+            norm_prop = normalize_street_address(property_address) or property_address.strip().upper()
+            if norm_mail == norm_prop:
+                return 'In-County'
+
+        # Step 3 — fallback
         return 'Out-of-County'
     
     def load_from_csv(
@@ -338,10 +369,11 @@ class MasterPropertyLoader(BaseLoader):
                 
                 mailing_addr = ', '.join(mailing_parts)[:255] if mailing_parts else None
                 
-                # Determine absentee status by comparing addresses
+                # Determine absentee status by comparing situs vs mailing address
                 absentee_status = self._determine_absentee_status(
                     property_address=site_addr,
-                    mailing_address=mailing_addr
+                    property_state="FL",
+                    mailing_address=mailing_addr,
                 )
                 
                 # Classify owner type from name
