@@ -57,6 +57,9 @@ _TASK_ROUTING: dict[str, str] = {
     "email_copy":               "sonnet",
     "referral_milestone_sms":   "haiku",
     "referral_milestone_email": "sonnet",
+    # Concierge Chat (M5a)
+    "chat_intent":    "haiku",   # intent classifier — cheap, fast
+    "chat_response":  "sonnet",  # conversational reply — quality matters
     # Opus — explicit override, edge cases only
     "edge_case": "opus",
 }
@@ -217,6 +220,61 @@ def call_claude_batch(
     batch = client.beta.messages.batches.create(requests=requests)
     logger.info("claude_router: batch submitted id=%s task=%s count=%d", batch.id, task_type, len(requests))
     return batch.id
+
+
+def stream_claude(
+    task_type: str,
+    messages: list[dict],
+    system: Optional[str] = None,
+    cache_system: bool = False,
+    max_tokens: int = 512,
+    subscriber_id: Optional[int] = None,
+    db: Optional[Session] = None,
+):
+    """
+    Streaming variant of call_claude(). Yields text chunks as they arrive.
+
+    Does NOT change call_claude() behaviour. Uses the same model routing and
+    logs one api_usage_logs row after the stream completes.
+
+    Usage:
+        for chunk in stream_claude("chat_response", messages, system=sys, cache_system=True):
+            yield chunk  # SSE chunk to client
+    """
+    import time as _time
+    model_tier = _TASK_ROUTING.get(task_type, "sonnet")
+    model_id = _model_id(model_tier)
+
+    client = Anthropic(api_key=settings.anthropic_api_key.get_secret_value())
+
+    kwargs: dict = {
+        "model": model_id,
+        "max_tokens": max_tokens,
+        "messages": messages,
+    }
+
+    if system:
+        if cache_system:
+            kwargs["system"] = [
+                {
+                    "type": "text",
+                    "text": system,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
+        else:
+            kwargs["system"] = system
+
+    logger.debug("claude_router: stream task=%s model=%s", task_type, model_tier)
+
+    t0 = _time.monotonic()
+    with client.messages.stream(**kwargs) as stream_ctx:
+        for text in stream_ctx.text_stream:
+            yield text
+
+    # Log usage after stream completes
+    final = stream_ctx.get_final_message()
+    _log_usage(final, model_tier, task_type, subscriber_id, db)
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
