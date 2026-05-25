@@ -133,7 +133,10 @@ async def _run_playwright_batch(
             viewport={"width": 1920, "height": 1080},
         )
         page = await context.new_page()
-        await apply_stealth_to_page(page)
+        try:
+            await apply_stealth_to_page(page)
+        except (ModuleNotFoundError, ImportError):
+            pass
 
         try:
             total = len(owners)
