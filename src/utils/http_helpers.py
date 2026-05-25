@@ -103,6 +103,50 @@ def get_browser_use_proxy():
     )
 
 
+def get_rotated_browser_use_proxy(attempt: int = 0):
+    """
+    Return a browser_use ProxySettings with a fresh session ID on every call.
+    Always rotates regardless of the OXYLABS_ROTATE setting — intended for
+    explicit failover retries where each attempt needs a distinct Oxylabs IP.
+    Returns None if credentials are not configured.
+    """
+    from config.settings import settings
+    if not settings.oxylabs_username or not settings.oxylabs_password:
+        return None
+    username = f"{settings.oxylabs_username}-sessid-{uuid4().hex[:8]}"
+    from browser_use.browser.profile import ProxySettings
+    return ProxySettings(
+        server="http://pr.oxylabs.io:7777",
+        username=username,
+        password=settings.oxylabs_password.get_secret_value(),
+    )
+
+
+_PROXY_HEALTH_URL = "https://ip.oxylabs.io/"
+_PROXY_HEALTH_TIMEOUT = 10
+
+
+def check_proxy_health() -> bool:
+    """
+    Quick connectivity test through the Oxylabs proxy.
+    GETs ip.oxylabs.io (Oxylabs' own IP-echo endpoint) and returns True on HTTP 200.
+    Returns False on any network error, non-200 response, or missing credentials.
+    Used as a pre-flight gate before launching a full browser agent run.
+    """
+    from config.settings import settings
+    if not settings.oxylabs_username or not settings.oxylabs_password:
+        return False
+    proxies = get_requests_proxies(rotate=False)
+    if not proxies:
+        return False
+    try:
+        resp = requests.get(_PROXY_HEALTH_URL, proxies=proxies, timeout=_PROXY_HEALTH_TIMEOUT)
+        return resp.status_code == 200
+    except Exception as e:
+        logger.warning(f"[proxy] Health check failed: {e}")
+        return False
+
+
 def get_requests_proxies(rotate: bool = False) -> Optional[dict]:
     """
     Return a requests-compatible proxies dict for Oxylabs, or None if not configured.
