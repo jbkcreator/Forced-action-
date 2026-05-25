@@ -161,6 +161,19 @@ class Owner(Base):
     registered_agent_name: Mapped[Optional[str]] = mapped_column(String(255))
     registered_agent_address: Mapped[Optional[str]] = mapped_column(String(500))
 
+    # Sunbiz LLC piercing — populated by expanded Sunbiz scraper (fa031).
+    # managing_members shape: [{name, address, role, title}]. JSONB GIN-indexed
+    # so "what LLCs does this person manage?" is an indexable query without a
+    # separate canonical-entity table (graph schema deferred to v2).
+    sunbiz_doc_number: Mapped[Optional[str]] = mapped_column(Text)
+    principal_address: Mapped[Optional[str]] = mapped_column(Text)
+    registered_agent_email: Mapped[Optional[str]] = mapped_column(String(255))
+    entity_status: Mapped[Optional[str]] = mapped_column(String(20))   # ACTIVE | INACTIVE | DISSOLVED
+    formation_date: Mapped[Optional[date]] = mapped_column(Date)
+    managing_members: Mapped[Optional[list]] = mapped_column(JSONB)
+    sunbiz_enriched_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    sunbiz_status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+
     # Multi-county
     county_id: Mapped[Optional[str]] = mapped_column(String(50), default='hillsborough', index=True)
 
@@ -174,12 +187,56 @@ class Owner(Base):
         Index("idx_absentee_status", "absentee_status"),
         Index("idx_owner_county_id", "county_id"),
         Index("idx_owner_phone_metadata", "phone_metadata", postgresql_using="gin"),
+        Index("ix_owners_sunbiz_status", "sunbiz_status"),
+        Index("ix_owners_managing_members", "managing_members", postgresql_using="gin"),
         CheckConstraint("owner_type IN ('Individual', 'LLC', 'Trust', 'Estate', 'Corporate')", name="check_owner_type"),
         CheckConstraint("absentee_status IN ('In-County', 'Out-of-County', 'Out-of-State')", name="check_absentee_status"),
+        CheckConstraint(
+            "sunbiz_status IN ('pending','matched','not_found','ambiguous',"
+            "'parser_failed','not_an_llc')",
+            name="check_sunbiz_status",
+        ),
     )
 
     def __repr__(self):
         return f"<Owner(id={self.id}, property_id={self.property_id}, name='{self.owner_name}')>"
+
+
+class SunbizSnapshot(Base):
+    """
+    Raw + parsed Sunbiz scrape audit, keyed by document number (fa031).
+    Append-only. The scraper writes a row per scrape regardless of parse outcome
+    so a future parser upgrade can reprocess historical scrapes without re-hitting
+    the Sunbiz portal. Latest row per doc is retrieved via the
+    (sunbiz_doc_number, scraped_at DESC) index.
+    """
+    __tablename__ = "sunbiz_snapshots"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    sunbiz_doc_number: Mapped[str] = mapped_column(Text, nullable=False)
+    scraped_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    raw_html: Mapped[Optional[str]] = mapped_column(Text)
+    raw_jsonb: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    parser_version: Mapped[str] = mapped_column(String(40), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)   # ok | partial | parser_failed
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('ok','partial','parser_failed')",
+            name="check_snapshot_status",
+        ),
+        Index("ix_sbsnap_doc_recent", "sunbiz_doc_number", "scraped_at"),
+    )
+
+    def __repr__(self):
+        return (
+            f"<SunbizSnapshot(doc={self.sunbiz_doc_number}, "
+            f"scraped_at={self.scraped_at}, status={self.status})>"
+        )
 
 
 class Financial(Base):
@@ -2095,11 +2152,19 @@ class SmsOptIn(Base):
         DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
     )
     ip_address: Mapped[Optional[str]] = mapped_column(String(50))       # web opt-in source IP
+    # Per-identity consent scope (fa031). 'subscriber' = LLC/account-level opt-in,
+    # default for all legacy rows. 'managing_member_direct' = personal consent from
+    # a managing-member-derived phone — required before any member-targeted SMS.
+    consent_scope: Mapped[str] = mapped_column(String(30), nullable=False, default="subscriber")
 
     __table_args__ = (
         CheckConstraint(
             "source IN ('double_opt_in', 'manual', 'import', 'widget')",
             name="check_opt_in_source",
+        ),
+        CheckConstraint(
+            "consent_scope IN ('subscriber','managing_member_direct','agent_direct','other')",
+            name="check_opt_in_consent_scope",
         ),
         Index("idx_sms_opt_in_subscriber", "subscriber_id"),
     )

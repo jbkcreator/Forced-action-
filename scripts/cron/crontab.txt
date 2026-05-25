@@ -161,9 +161,15 @@ COUNTY_ID=hillsborough
 # --today-only: only process leads scored in the current run (safe, avoids re-processing history)
 30 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.run_enrichment $COUNTY_ID --limit 500
 
-# SunBiz LLC Contact Enrichment — 07:40 AM UTC Mon-Sat
-# Searches FL SOS Sunbiz for registered-agent contacts of LLC-owned Gold+ leads
-40 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.sunbiz.sunbiz_engine --county-id $COUNTY_ID
+# SunBiz LLC Piercing Enrichment — 07:40 AM UTC Mon-Sat (fa031 tiered staleness)
+# Tier A: active-lead pending/30d-stale  •  Tier B: cold pending/180d-stale
+# Writes doc_number, principal address, managing members + raw HTML snapshot.
+40 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.sunbiz_enrichment --county $COUNTY_ID --limit 200
+
+# SunBiz Anomaly Check — 07:50 AM UTC Mon-Sat (fa031 observability, after enrichment at 07:40)
+# Alerts if parser_failed_rate >5% in last 24h (min 10 outcomes).
+# Logs status distribution, enriched count, multi-property LLC group gauge.
+50 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.sunbiz_anomaly_check
 
 # ── GHL CRM SYNC ─────────────────────────────────────────────
 # GHL CRM Sync               — 08:00 AM UTC Mon-Sat (after CDS scoring completes)
