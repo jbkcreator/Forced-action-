@@ -211,15 +211,75 @@ class TestPrepareFeatureMatrix:
         with pytest.raises(ValueError, match="outcome_event"):
             prepare_feature_matrix(df, "wholesalers")
 
-    def test_drops_rows_with_nan_features(self):
-        """Pinellas-style rows (NaN per-signal mask) drop out of the fit set."""
+    def test_signal_nan_drops_row_from_fit(self):
+        """Pinellas-style per-county-masked signal NaN drops the row entirely."""
         import numpy as np
         df = _toy_training_frame(n_per_vertical=10, county_id="pinellas")
-        # Simulate per-county NaN on a missing signal axis (code_violations).
+        # Simulate per-county NaN on a missing signal axis (code_violations)
+        # for every row of this vertical — none should survive.
         df.loc[df["vertical"] == "wholesalers", "has_code_violations"] = np.nan
-        df.loc[df["vertical"] == "wholesalers", "recency_code_violations_days"] = np.nan
-        with pytest.raises(ValueError, match="no rows survive NaN drop"):
+        with pytest.raises(ValueError, match="no rows survive signal-NaN drop"):
             prepare_feature_matrix(df, "wholesalers")
+
+    def test_filters_rows_to_vertical_score_above_zero(self):
+        """Each vertical should fit on the population it actually scored.
+
+        Without this filter every vertical fans out to the same 16k rows and
+        produces identical coefficients — the per-vertical decomposition is
+        theatrical. Verify rows where vertical_score == 0 are excluded.
+        """
+        df = _toy_training_frame(n_per_vertical=10)
+        # Zero out the wholesalers vertical_score on the first 6 rows.
+        zero_mask = (df["vertical"] == "wholesalers") & (df["property_id"] < 6)
+        df.loc[zero_mask, "vertical_score"] = 0.0
+        X, y, names = prepare_feature_matrix(df, "wholesalers")
+        # Only 4 rows survive (property_id 6, 7, 8, 9 with non-zero score).
+        assert X.shape[0] == 4
+
+    def test_all_zero_vertical_score_raises(self):
+        df = _toy_training_frame(n_per_vertical=10)
+        df.loc[df["vertical"] == "wholesalers", "vertical_score"] = 0.0
+        with pytest.raises(ValueError, match="no rows with vertical_score > 0"):
+            prepare_feature_matrix(df, "wholesalers")
+
+    def test_per_vertical_populations_diverge(self):
+        """Two verticals scoring different subsets of properties must produce
+        different training sets — that's the whole point of fitting per vertical."""
+        df = _toy_training_frame(n_per_vertical=20)
+        # Wholesalers cares about first half, roofing cares about second half.
+        df.loc[
+            (df["vertical"] == "wholesalers") & (df["property_id"] >= 10),
+            "vertical_score",
+        ] = 0.0
+        df.loc[
+            (df["vertical"] == "roofing") & (df["property_id"] < 10),
+            "vertical_score",
+        ] = 0.0
+        X_w, _, _ = prepare_feature_matrix(df, "wholesalers")
+        X_r, _, _ = prepare_feature_matrix(df, "roofing")
+        assert X_w.shape[0] == 10
+        assert X_r.shape[0] == 10
+        # Distinct rows — sums shouldn't match.
+        assert X_w.sum() != X_r.sum()
+
+    def test_non_signal_nan_is_imputed_not_dropped(self):
+        """Sparse non-signal columns (equity_pct, value_change_yoy, etc.)
+        get imputed to 0 instead of dropping the whole row — otherwise any
+        Hillsborough property with a missing Financial row gets excluded."""
+        import numpy as np
+        df = _toy_training_frame(n_per_vertical=10)
+        # Wipe out a couple of non-signal numeric columns for ALL wholesalers rows.
+        df.loc[df["vertical"] == "wholesalers", "equity_pct"] = np.nan
+        df.loc[df["vertical"] == "wholesalers", "value_change_yoy"] = np.nan
+        X, y, names = prepare_feature_matrix(df, "wholesalers")
+        # All rows should survive — NaN got imputed, not dropped.
+        assert X.shape[0] == 10
+        equity_idx = names.index("equity_pct")
+        value_change_idx = names.index("value_change_yoy")
+        # Imputed values must be 0, not NaN.
+        assert not np.isnan(X[:, equity_idx]).any()
+        assert (X[:, equity_idx] == 0).all()
+        assert not np.isnan(X[:, value_change_idx]).any()
 
     def test_one_hot_expansion_produces_dummy_columns(self):
         df = _toy_training_frame(n_per_vertical=10)

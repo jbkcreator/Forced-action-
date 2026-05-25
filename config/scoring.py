@@ -41,9 +41,13 @@ VERTICAL_WEIGHTS = {
         "deed_transfers": 50,    # Adjusted [cite: 109]
         "irs_tax_liens": 55,     # Adjusted [cite: 109]
         "hoa_liens": 68,         # Boosted: unpaid dues = financial distress = motivated seller
+                                 # 2026-05-25 diag confirms — 30d lift 1.73 (the only positive
+                                 # non-deed signal in the per-signal predictability report)
         "divorce_filings": 60,   # Couple splitting = motivated to sell quickly
         "evictions": 45,         # Adjusted [cite: 109]
-        "mechanics_liens": 55,
+        "mechanics_liens": 35,   # 2026-05-25: was 55. Per-signal diag lift 0.23 at 30d —
+                                 # anti-predicts short-term sales. Long-term timescale unknown;
+                                 # revisit after 90d outcome window matures.
         "insurance_claim": 10,   # Stacking only
         "fire": 10,              # Stacking only
         "storm_damage": 10,      # Stacking only
@@ -51,7 +55,10 @@ VERTICAL_WEIGHTS = {
         "code_lien": 35,         # Unified TCL/CCL/CODE LIEN (Stage 1: was TCL=35, CCL=30)
         "building_permits": 20,
         "enforcement_permit": 50,  # Stop work/after-the-fact/failed/expired/revoked
-        "code_violations": 35,
+        "code_violations": 20,   # 2026-05-25: was 35. Per-signal diag lift 0.35 at 30d —
+                                 # weakest non-zero predictor in the report. Industry priors
+                                 # agree code_violations alone is weak (useful only stacked
+                                 # with a primary distress signal).
     },
     "fix_flip": {
         "foreclosures": 75,      # Adjusted [cite: 109]
@@ -60,7 +67,8 @@ VERTICAL_WEIGHTS = {
         "judgment_liens": 55,    # Adjusted [cite: 109]
         "irs_tax_liens": 50,     # Adjusted [cite: 109]
         "probate": 55,           # Adjusted [cite: 109]
-        "mechanics_liens": 60,   # Adjusted [cite: 109]
+        "mechanics_liens": 40,   # 2026-05-25: was 60. Per-signal diag lift 0.23 at 30d.
+                                 # See wholesalers.mechanics_liens note.
         "hoa_liens": 65,         # Boosted: financial distress = motivated to sell
         "divorce_filings": 55,   # Motivated seller, property often priced to move
         "deed_transfers": 45,    # Adjusted [cite: 109]
@@ -70,7 +78,8 @@ VERTICAL_WEIGHTS = {
         "storm_damage": 10,      # Stacking only
         "flood_damage": 10,      # Stacking only
         "code_lien": 45,         # Unified TCL/CCL/CODE LIEN (Stage 1: was TCL=45, CCL=20)
-        "code_violations": 50,
+        "code_violations": 30,   # 2026-05-25: was 50. Per-signal diag lift 0.35 at 30d.
+                                 # See wholesalers.code_violations note.
         "building_permits": 45,
         "enforcement_permit": 60,  # Stop work/after-the-fact/failed/expired/revoked
     },
@@ -145,14 +154,16 @@ VERTICAL_WEIGHTS = {
         "bankruptcy": 55,        # Adjusted [cite: 109]
         "code_lien": 40,         # Unified TCL/CCL/CODE LIEN (Stage 1: was TCL=40, CCL=20)
         "hoa_liens": 70,         # Boosted: HOA litigation is common attorney engagement
-        "mechanics_liens": 50,   # Adjusted [cite: 109]
+        "mechanics_liens": 35,   # 2026-05-25: was 50. Per-signal diag lift 0.23 at 30d.
+                                 # See wholesalers.mechanics_liens note.
         "tax_delinquencies": 50, # Adjusted [cite: 109]
         "probate": 40,           # Adjusted [cite: 109]
         "insurance_claim": 10,   # Stacking only
         "fire": 10,              # Stacking only
         "storm_damage": 10,      # Stacking only
         "flood_damage": 10,      # Stacking only
-        "code_violations": 30,
+        "code_violations": 20,   # 2026-05-25: was 30. Per-signal diag lift 0.35 at 30d.
+                                 # See wholesalers.code_violations note.
         "building_permits": 20,
         "enforcement_permit": 40,  # Stop work/after-the-fact/failed/expired/revoked
         "evictions": 25,

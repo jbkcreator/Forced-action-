@@ -103,9 +103,6 @@ COUNTY_ID=hillsborough
 # P3. Probate Filings        — 04:50 AM UTC / 12:50 AM EDT / 10:20 AM IST
 50 4 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.probate.probate_engine --load-to-db --county-id pinellas
 
-# P4. Divorce / Dissolution  — 04:52 AM UTC / 12:52 AM EDT / 10:22 AM IST
-52 4 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.divorce.divorce_engine --load-to-db --county-id pinellas
-
 # P5. Liens + Deeds + Judgments — 05:05 AM UTC / 01:05 AM EDT / 10:35 AM IST
 5 5 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.liens.lien_engine --start-date $(date -d "1 day ago" +\%Y-\%m-\%d) --end-date $(date +\%Y-\%m-\%d) --load-to-db --county-id pinellas
 
@@ -164,6 +161,12 @@ COUNTY_ID=hillsborough
 # SunBiz LLC Contact Enrichment — 07:40 AM UTC Mon-Sat
 # Searches FL SOS Sunbiz for registered-agent contacts of LLC-owned Gold+ leads
 40 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.sunbiz.sunbiz_engine --county-id $COUNTY_ID
+
+# PA Enrichment (leads-only) — 07:45 AM UTC daily
+# Enriches 100 qualified leads per day that haven't been refreshed in 30+ days.
+# --mode refresh skips properties enriched recently; nulls (never enriched) always qualify.
+# Runs after CDS scoring (07:00) so qualified=true reflects today's scores.
+45 7 * * * $PROJECT/scripts/cron/run.sh src.scrappers.property_appraiser.pa_engine --county-id $COUNTY_ID --mode refresh --stale-days 30 --leads-only --limit 100 --load-to-db
 
 # ── GHL CRM SYNC ─────────────────────────────────────────────
 # GHL CRM Sync               — 08:00 AM UTC Mon-Sat (after CDS scoring completes)
@@ -299,6 +302,16 @@ COUNTY_ID=hillsborough
 # Daily classify_all — 02:00 UTC. Catches any subscribers whose segment drifted
 # without triggering an event hook (e.g. time-boundary at_risk, daily inactivity).
 0 2 * * * cd $PROJECT && python -c "from src.core.database import Database; from src.services.segmentation_engine import classify_all; db=Database(); s=db.get_session(); print(classify_all(s)); s.close()"
+
+# ── CDS RETUNE DIAGNOSTIC ────────────────────────────────────────────────────
+# Per-signal predictability snapshot — 1st of each month @ 04:00 UTC.
+# Tracks lift per signal at 30/60/90/180-day windows so we can see when
+# slow-burn signals (foreclosure 8-14mo, probate 6-12mo, tax_delinq 24mo)
+# turn predictive on their natural timescale. Drives the re-fit decision
+# in CDS_RETUNE_STATUS.md — when ≥3 signals show lift>1.5 at 90d AND
+# 90d base event rate ≥3%, run Stage B/C/E for the data-driven cutover.
+# Output: data/diag/signal_predict_YYYY-MM.json (one file per month).
+0 4 1 * * $PROJECT/scripts/cron/run.sh src.tasks.signal_predictability_report --windows 30,60,90,180 --json $PROJECT/data/diag/signal_predict_$(date +\%Y-\%m).json
 
 # ── COUNTY LAUNCH AUTOMATION ─────────────────────────────────────────────────
 # County Launch Evaluator — every 6h. Checks all 7 expansion gates for the

@@ -160,8 +160,13 @@ class _Profiler:
       properties_fetch, signals_fetch, score_python, persist_batch,
       commit, ghl_flush.
 
-    Use the data to decide whether the ANY(:ids) → unnest()/temp-table
-    refactor is worth the engineering investment.
+    NOTE: the original ANY(:ids) → unnest()/temp-table refactor question
+    was answered on 2026-05-25 — production runs scale to ~50k IDs per
+    batch where ANY() risks suboptimal plans. All 13 hot-path queries
+    were converted to `WHERE x IN (SELECT unnest(CAST(:ids AS bigint[])))` which
+    gives the planner a known-small driving relation + indexed inner
+    lookup. The profiler remains useful for monitoring overall scoring
+    cost, but the unnest refactor itself is no longer pending.
     """
     __slots__ = ("enabled", "phases", "start", "_batch_count")
 
@@ -240,6 +245,19 @@ class MultiVerticalScorer:
     when tuning.
     """
 
+    # Live destination table. Shadow rescore runs (Stage E of the cross-county
+    # retune) swap this to "distress_scores_shadow" so the live feed, GHL push,
+    # and Cora flows are unaffected while the proposed weights are being
+    # evaluated. The schema of the two tables is identical (see migration
+    # fa032_distress_scores_shadow.py), so every SQL string below references
+    # this attribute via f-strings and routes transparently.
+    _scores_table_name: str = "distress_scores"
+
+    # When True, side effects that mutate live operational state are skipped:
+    # the sync_status='pending_sync' bulk UPDATE and the GHL push queue. Set
+    # by the CLI when --shadow is passed.
+    _shadow_mode: bool = False
+
     def __init__(self, session: Session):
         self.session = session
         self._ghl_push_queue: List[Dict] = []
@@ -270,6 +288,14 @@ class MultiVerticalScorer:
         if not queue:
             return
 
+        # Stage E — shadow runs don't touch live operational state. Skip the
+        # bulk pending_sync UPDATE so subscriber feeds and GHL sync don't pick
+        # up shadow-only scores.
+        if self._shadow_mode:
+            self._ghl_push_queue.clear()
+            logger.debug("[shadow] sync_status update suppressed; cleared %d queued leads", len(queue))
+            return
+
         property_ids = [sd["property_id"] for sd in queue if sd.get("property_id")]
         if property_ids:
             # Chunk into batches of 1000 — avoids unbounded IN-list that degrades
@@ -280,7 +306,7 @@ class MultiVerticalScorer:
                 self.session.execute(
                     sa_text(
                         "UPDATE properties SET sync_status = 'pending_sync' "
-                        "WHERE id = ANY(:ids)"
+                        "WHERE id IN (SELECT unnest(CAST(:ids AS bigint[])))"
                     ),
                     {"ids": chunk},
                 )
@@ -530,6 +556,7 @@ class MultiVerticalScorer:
         financial: Optional[Financial],
         violation_count: int = 0,
         persistence_data: Optional[Dict] = None,
+        missing_signals: frozenset = frozenset(),
     ) -> Dict:
         """
         Score a single vertical per spec. Returns a result dict.
@@ -546,6 +573,15 @@ class MultiVerticalScorer:
                                  + absentee + contact + equity)
 
         Equity bonus applies to all verticals with per-vertical rates.
+
+        `missing_signals` (Stage D — feature suppression): signal types the
+        property's county does not load. These are excluded entirely from
+        scoring — they cannot be the primary signal AND don't contribute to
+        the stacking count. Treating them as "absent" (zero contribution but
+        still counted) caused the Pinellas inversion: a Pinellas lead with
+        one strong primary signal scored at the engine cap because the
+        engine considered "no code_violation = clean property" rather than
+        "no code_violation = we don't observe this for this county."
         """
         weights = VERTICAL_WEIGHTS.get(vertical)
         if weights is None:
@@ -558,10 +594,15 @@ class MultiVerticalScorer:
 
         # Group by signal type — each type counts once, using its most recent signal.
         # For code_violations keep the most recent opened_date + associated fine_amount.
+        # Stage D: signals listed in missing_signals are skipped entirely. These are
+        # signal types this county does not load (e.g. Pinellas lacks code_violations),
+        # so any value treated as "absent" would be a false zero.
         latest_by_type: Dict[str, Dict] = {}
         for sig in signals:
             sig_type = sig["type"]
             if sig_type not in weights:
+                continue
+            if sig_type in missing_signals:
                 continue
             d = sig["date"]
             if isinstance(d, datetime):
@@ -754,8 +795,18 @@ class MultiVerticalScorer:
         else:
             persistence_data = {}
 
+        # Stage D — resolve county config once and pass missing_signals into
+        # every per-vertical scoring call. Missing signals are dropped before
+        # primary selection and stacking counts; the multiplicative coverage
+        # discount that used to live at the end of this function is gone.
+        _cfg = for_county(prop.county_id)
+        _missing = _cfg.missing_signals
+
         vertical_results = {
-            v: self._score_vertical(v, signals, owner, financial, violation_count, persistence_data)
+            v: self._score_vertical(
+                v, signals, owner, financial, violation_count, persistence_data,
+                missing_signals=_missing,
+            )
             for v in VERTICAL_WEIGHTS
         }
         vertical_scores = {v: r["score"] for v, r in vertical_results.items()}
@@ -854,30 +905,12 @@ class MultiVerticalScorer:
         if _hcpa_passive:
             logger.debug("  HCPA passive signals: %s", _hcpa_passive)
 
-        # ── Stage 3: signal-coverage normalizer ────────────────────────────
-        # Apply a per-vertical confidence discount when the property's county
-        # is missing signal types from its data load (e.g. Pinellas has no
-        # code_violations or tax_delinquencies loaded yet). Without this, a
-        # Pinellas lead with one heavy primary signal scores identically to a
-        # Hillsborough lead with the same signal — but Hillsborough has the
-        # corroborating signal mass to back it up. The normalizer scales each
-        # vertical's score by (available_weight / total_weight) so tier
-        # assignment stays honest across counties without forcing a fixed
-        # distribution shape per county. Hillsborough.missing_signals is
-        # empty → coverage=1.0 → no change.
-        _cfg = for_county(prop.county_id)
-        if _cfg.missing_signals:
-            for v in list(vertical_scores.keys()):
-                if vertical_scores[v] > 0.0:
-                    _cov = signal_coverage_pct(v, _cfg)
-                    vertical_scores[v] = vertical_scores[v] * _cov
-                    if v in vertical_results:
-                        vertical_results[v]["score"] = vertical_scores[v]
-                        vertical_results[v]["coverage_pct"] = round(_cov, 3)
-            logger.debug(
-                "  Coverage normalized — county=%s missing=%d signal(s)",
-                prop.county_id, len(_cfg.missing_signals),
-            )
+        # Stage D — missing-signal handling now happens upstream in
+        # _score_vertical via the missing_signals frozenset. Those signal
+        # types are dropped before primary selection and stacking counts, so
+        # there is no multiplicative discount to apply here anymore. The
+        # signal_coverage_pct function in config/scoring.py is unused and
+        # will be removed at the Stage F cutover.
 
         # Guard: if no verticals produced any score, default to 0.0
         score_values = [s for s in vertical_scores.values() if s]
@@ -1219,9 +1252,9 @@ class MultiVerticalScorer:
         existing_row = None
         if upsert:
             existing_row = self.session.execute(
-                sa_text("""
+                sa_text(f"""
                     SELECT id, final_cds_score, lead_tier
-                    FROM distress_scores
+                    FROM {self._scores_table_name}
                     WHERE property_id = :pid
                       AND score_date >= :start
                       AND score_date  < :end
@@ -1241,8 +1274,8 @@ class MultiVerticalScorer:
 
             # Raw SQL UPDATE — no ORM object load, no per-row flush
             self.session.execute(
-                sa_text("""
-                    UPDATE distress_scores SET
+                sa_text(f"""
+                    UPDATE {self._scores_table_name} SET
                         score_date      = :now,
                         final_cds_score = :score,
                         lead_tier       = :tier,
@@ -1283,9 +1316,9 @@ class MultiVerticalScorer:
 
         # --- Latest historical score lookup (raw SQL, hits composite index) ---
         latest_row = self.session.execute(
-            sa_text("""
+            sa_text(f"""
                 SELECT final_cds_score, lead_tier
-                FROM distress_scores
+                FROM {self._scores_table_name}
                 WHERE property_id = :pid
                 ORDER BY score_date DESC
                 LIMIT 1
@@ -1308,8 +1341,8 @@ class MultiVerticalScorer:
 
         # --- Insert new score, get PK via RETURNING (no ORM flush needed) ---
         new_id_row = self.session.execute(
-            sa_text("""
-                INSERT INTO distress_scores (
+            sa_text(f"""
+                INSERT INTO {self._scores_table_name} (
                     property_id, county_id, score_date, final_cds_score,
                     lead_tier, urgency_level, qualified,
                     factor_scores, vertical_scores, distress_types, scoring_run_id
@@ -1409,7 +1442,7 @@ class MultiVerticalScorer:
         """Fetch property rows for a specific list of IDs."""
         with self._profiler.phase("properties_fetch"):
             return self.session.execute(
-                sa_text(f"SELECT {self._PROP_COLS} FROM properties WHERE id = ANY(:ids) ORDER BY id"),
+                sa_text(f"SELECT {self._PROP_COLS} FROM properties WHERE id IN (SELECT unnest(CAST(:ids AS bigint[]))) ORDER BY id"),
                 {"ids": ids},
             ).fetchall()
 
@@ -1433,44 +1466,44 @@ class MultiVerticalScorer:
         owner_rows = _q("""
             SELECT property_id, owner_name, owner_type, absentee_status, mailing_address,
                    ownership_years, phone_1, phone_2, phone_3, email_1, email_2
-            FROM owners WHERE property_id = ANY(:ids)
+            FROM owners WHERE property_id IN (SELECT unnest(CAST(:ids AS bigint[])))
         """)
         fin_rows = _q("""
             SELECT property_id, assessed_value_mkt, homestead_exempt, est_equity,
                    equity_pct, last_sale_price, last_sale_date, value_change_yoy
-            FROM financials WHERE property_id = ANY(:ids)
+            FROM financials WHERE property_id IN (SELECT unnest(CAST(:ids AS bigint[])))
         """)
         cv_rows = _q("""
             SELECT property_id, status, violation_type, opened_date, fine_amount
-            FROM code_violations WHERE property_id = ANY(:ids)
+            FROM code_violations WHERE property_id IN (SELECT unnest(CAST(:ids AS bigint[])))
         """)
         lal_rows = _q("""
             SELECT property_id, record_type, document_type, filing_date, amount
-            FROM legal_and_liens WHERE property_id = ANY(:ids)
+            FROM legal_and_liens WHERE property_id IN (SELECT unnest(CAST(:ids AS bigint[])))
         """)
         deed_rows = _q("""
             SELECT property_id, sale_price, record_date, deed_type
-            FROM deeds WHERE property_id = ANY(:ids)
+            FROM deeds WHERE property_id IN (SELECT unnest(CAST(:ids AS bigint[])))
         """)
         lp_rows = _q("""
             SELECT property_id, record_type, case_status, associated_party, filing_date, amount
-            FROM legal_proceedings WHERE property_id = ANY(:ids)
+            FROM legal_proceedings WHERE property_id IN (SELECT unnest(CAST(:ids AS bigint[])))
         """)
         td_rows = _q("""
             SELECT property_id, total_amount_due, years_delinquent, deed_app_date, date_added
-            FROM tax_delinquencies WHERE property_id = ANY(:ids)
+            FROM tax_delinquencies WHERE property_id IN (SELECT unnest(CAST(:ids AS bigint[])))
         """)
         fc_rows = _q("""
             SELECT property_id, filing_date, lis_pendens_date, judgment_amount, plaintiff, auction_date
-            FROM foreclosures WHERE property_id = ANY(:ids)
+            FROM foreclosures WHERE property_id IN (SELECT unnest(CAST(:ids AS bigint[])))
         """)
         bp_rows = _q("""
             SELECT property_id, is_enforcement_permit, status, issue_date, permit_type
-            FROM building_permits WHERE property_id = ANY(:ids)
+            FROM building_permits WHERE property_id IN (SELECT unnest(CAST(:ids AS bigint[])))
         """)
         inc_rows = _q("""
             SELECT property_id, incident_type, incident_date
-            FROM incidents WHERE property_id = ANY(:ids)
+            FROM incidents WHERE property_id IN (SELECT unnest(CAST(:ids AS bigint[])))
         """)
 
         signal_map: defaultdict = defaultdict(lambda: {
@@ -1588,7 +1621,7 @@ class MultiVerticalScorer:
             "WITH latest_scores AS (\n"
             "    SELECT DISTINCT ON (property_id)\n"
             "        property_id, score_date\n"
-            "    FROM distress_scores\n"
+            f"    FROM {self._scores_table_name}\n"
             "    ORDER BY property_id, score_date DESC\n"
             ")\n"
             f"{outer}"
@@ -1659,8 +1692,8 @@ class MultiVerticalScorer:
         with raw_conn.cursor() as cur:
             psycopg2.extras.execute_values(
                 cur,
-                """
-                UPDATE distress_scores ds SET
+                f"""
+                UPDATE {self._scores_table_name} ds SET
                     score_date      = v.score_date::timestamp,
                     final_cds_score = v.final_score::numeric,
                     lead_tier       = v.tier,
@@ -1714,10 +1747,10 @@ class MultiVerticalScorer:
 
         # ── 1. Today's rows ───────────────────────────────────────────────
         with self._profiler.phase("persist_read_today"):
-            today_rows = self.session.execute(sa_text("""
+            today_rows = self.session.execute(sa_text(f"""
                 SELECT id, property_id, final_cds_score, lead_tier
-                FROM distress_scores
-                WHERE property_id = ANY(:ids)
+                FROM {self._scores_table_name}
+                WHERE property_id IN (SELECT unnest(CAST(:ids AS bigint[])))
                   AND score_date >= :start
                   AND score_date  < :end
             """), {"ids": property_ids, "start": today_start, "end": tomorrow_start}).fetchall()
@@ -1728,11 +1761,11 @@ class MultiVerticalScorer:
         latest_by_pid: Dict[int, Any] = {}
         if needs_latest:
             with self._profiler.phase("persist_read_latest"):
-                latest_rows = self.session.execute(sa_text("""
+                latest_rows = self.session.execute(sa_text(f"""
                     SELECT DISTINCT ON (property_id)
                         id, property_id, final_cds_score, lead_tier
-                    FROM distress_scores
-                    WHERE property_id = ANY(:ids)
+                    FROM {self._scores_table_name}
+                    WHERE property_id IN (SELECT unnest(CAST(:ids AS bigint[])))
                     ORDER BY property_id, score_date DESC
                 """), {"ids": needs_latest}).fetchall()
                 latest_by_pid = {r.property_id: r for r in latest_rows}
@@ -1827,8 +1860,8 @@ class MultiVerticalScorer:
                 ]
             with self._profiler.phase("persist_insert_exec"):
                 self.session.execute(
-                    sa_text("""
-                        INSERT INTO distress_scores (
+                    sa_text(f"""
+                        INSERT INTO {self._scores_table_name} (
                             property_id, county_id, score_date, final_cds_score,
                             lead_tier, urgency_level, qualified,
                             factor_scores, vertical_scores, distress_types, scoring_run_id
@@ -1847,10 +1880,10 @@ class MultiVerticalScorer:
                 gold_inserts = [sd for sd in inserts_data if sd["lead_tier"] == "Gold"]
                 if gold_inserts:
                     gold_pids = [sd["property_id"] for sd in gold_inserts]
-                    gold_id_rows = self.session.execute(sa_text("""
+                    gold_id_rows = self.session.execute(sa_text(f"""
                         SELECT id, property_id
-                        FROM distress_scores
-                        WHERE property_id = ANY(:pids)
+                        FROM {self._scores_table_name}
+                        WHERE property_id IN (SELECT unnest(CAST(:pids AS bigint[])))
                           AND scoring_run_id = :run_id
                     """), {"pids": gold_pids, "run_id": scoring_run_id}).fetchall()
                     gold_id_map = {r.property_id: r.id for r in gold_id_rows}
@@ -2275,6 +2308,60 @@ class MultiVerticalScorer:
 
 # ── CLI entry point ────────────────────────────────────────────────────────────
 
+def _apply_fit_artifact(path: str, log: logging.Logger) -> None:
+    """Load a Stage C JSON artifact and overwrite the module-level
+    ``VERTICAL_WEIGHTS`` dict in-place with the fitted proposals.
+
+    Mutates the existing dict instead of rebinding so any closure/import
+    that already captured the reference (e.g. ``from config.scoring import
+    VERTICAL_WEIGHTS`` elsewhere) sees the updated values. Only signals
+    that exist in both the artifact and the current weights are touched —
+    artifact entries for unknown signals are ignored to avoid silently
+    extending the scoring surface.
+
+    Raises SystemExit(2) on any malformed artifact — Stage E must fail
+    loudly rather than score against partial/wrong data.
+    """
+    import json
+    from pathlib import Path
+
+    artifact_path = Path(path)
+    if not artifact_path.is_file():
+        log.error("Fit artifact not found: %s", artifact_path)
+        sys.exit(2)
+
+    try:
+        artifact = json.loads(artifact_path.read_text())
+    except json.JSONDecodeError as exc:
+        log.error("Fit artifact is not valid JSON (%s): %s", artifact_path, exc)
+        sys.exit(2)
+
+    proposals = artifact.get("proposals")
+    if not isinstance(proposals, list):
+        log.error("Fit artifact missing 'proposals' list: %s", artifact_path)
+        sys.exit(2)
+
+    applied = 0
+    skipped: List[str] = []
+    for proposal in proposals:
+        vertical = proposal.get("vertical")
+        weights = proposal.get("vertical_weights") or {}
+        if vertical not in VERTICAL_WEIGHTS:
+            skipped.append(vertical or "<no-vertical>")
+            continue
+        # Mutate in place — preserves dict identity across all importers.
+        target = VERTICAL_WEIGHTS[vertical]
+        for sig, w in weights.items():
+            if sig in target:
+                target[sig] = int(w)
+                applied += 1
+    log.info(
+        "[fit-artifact] loaded %s — applied %d (signal, vertical) weights%s",
+        artifact_path.name, applied,
+        f", skipped verticals: {skipped}" if skipped else "",
+    )
+
+
 def main():
     """
     Entry point for CLI / cron execution.
@@ -2332,8 +2419,8 @@ def main():
         help=(
             "Emit a per-phase wall-clock breakdown (properties_fetch, "
             "signals_fetch, score_python, persist_batch, commit, ghl_flush) "
-            "at the end of the run. Use to decide whether the ANY(:ids) → "
-            "unnest()/temp-table refactor is worth the work."
+            "at the end of the run. Useful for monitoring scoring throughput "
+            "and validating that no single phase regresses after schema changes."
         ),
     )
     parser.add_argument(
@@ -2347,7 +2434,36 @@ def main():
             "Increase on high-RAM servers for fewer round-trips; decrease to reduce peak memory."
         ),
     )
+    parser.add_argument(
+        "--shadow",
+        action="store_true",
+        help=(
+            "Stage E shadow-rescore mode. Writes scores to distress_scores_shadow "
+            "instead of distress_scores, skips the pending_sync GHL flush, and "
+            "leaves the live subscriber-facing state untouched. Pair with "
+            "--fit-artifact to evaluate proposed Stage C weights before cutover."
+        ),
+    )
+    parser.add_argument(
+        "--fit-artifact",
+        type=str,
+        default=None,
+        metavar="PATH",
+        dest="fit_artifact",
+        help=(
+            "Path to a Stage C JSON artifact (data/scoring_fit/<id>.json). "
+            "Overrides VERTICAL_WEIGHTS in-memory with the fitted proposals. "
+            "Requires --shadow — must not be used against the live tables."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.fit_artifact and not args.shadow:
+        log.error(
+            "--fit-artifact requires --shadow. Refusing to score the live table "
+            "with proposed weights — use Stage F's cutover edit to config/scoring.py instead."
+        )
+        sys.exit(2)
 
     if args.no_ghl:
         global _GHL_PUSH_ENABLED
@@ -2427,9 +2543,26 @@ def main():
         "top10":               [],
     }
 
+    # Stage E — apply shadow-mode and fit-artifact overrides before any
+    # scoring work happens. fit_artifact mutates the global VERTICAL_WEIGHTS
+    # so the engine's _score_vertical reads the proposed numbers; shadow mode
+    # routes writes to the shadow table and suppresses pending_sync flushes.
+    if args.fit_artifact:
+        _apply_fit_artifact(args.fit_artifact, log)
+    if args.shadow:
+        # Mutate the module-level flag directly. `global _GHL_PUSH_ENABLED`
+        # was already declared earlier in this function under --no-ghl, so
+        # redeclaring it here would be a SyntaxError. The bare assignment
+        # below still hits the global because of that earlier declaration.
+        _GHL_PUSH_ENABLED = False  # noqa: F841 — global is in scope from earlier
+        log.info("[shadow] writing to distress_scores_shadow; GHL push disabled")
+
     try:
         with get_db_context() as session:
             scorer = MultiVerticalScorer(session)
+            if args.shadow:
+                scorer._scores_table_name = "distress_scores_shadow"
+                scorer._shadow_mode = True
             if args.profile:
                 scorer._profiler = _Profiler(enabled=True)
                 log.info("[profile] enabled — phase timings will be reported at end of run")

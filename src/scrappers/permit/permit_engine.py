@@ -582,6 +582,7 @@ def _record_stats(source_type: str, **kwargs):
 # ---------------------------------------------------------------------------
 
 async def main(args):
+    t0 = time.monotonic()
     county_id = args.county_id
     county_cfg = get_county_config(county_id)
 
@@ -750,6 +751,8 @@ async def main(args):
             matched=matched,
             unmatched=unmatched,
             skipped=skipped,
+            run_success=True,
+            duration_seconds=round(time.monotonic() - t0, 2),
         )
 
         try:

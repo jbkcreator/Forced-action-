@@ -247,14 +247,26 @@ def derive_lead_tier_thresholds(
 def prepare_feature_matrix(df, vertical: str):
     """Build (X, y, used_feature_names) for one vertical's fit.
 
-    Rows are filtered to the given vertical. Rows with NaN in any feature
-    column are dropped — that's the structural fix for the missing-signal-
-    rewards-absence bias (Pinellas rows have NaN for unobserved axes, so
-    they drop out of the fit for those axes instead of contributing zeros).
+    Rows are filtered to the given vertical. NaN handling differentiates
+    two missing-data regimes:
 
-    Returns a tuple `(X, y, feature_names)` where X and y are numpy arrays.
-    Raises ValueError if `df` is empty after filtering or the outcome column
-    is missing — callers should guard at the orchestrator level.
+      * **Signal columns** (`has_<sig>`) — NaN here means "this county does
+        not load this signal type" (the Stage B per-county mask). The
+        property has no observation on this axis, so the whole row is
+        dropped from the fit for this vertical. This is the structural fix
+        for the missing-signal-rewards-absence bias.
+
+      * **Non-signal numeric columns** (`equity_pct`, `value_change_yoy`,
+        `years_since_sale`, etc.) — NaN here means the underlying field is
+        sparse on this particular property (e.g. no financial row, no
+        recorded sale date). These are imputed to 0 so the row survives
+        the fit. The non-signal coefficients absorb the "this feature is
+        missing for this property" effect through the indicator columns
+        (`has_phone`, `long_term_owner`, `property_age_30plus`) which are
+        already 0 when their underlying field is absent.
+
+    Returns `(X, y, feature_names)` as numpy arrays. Raises ValueError if
+    `df` is empty after filtering or the outcome column is missing.
     """
     # Lazy import: keeps the module loadable even without numpy installed.
     import numpy as np
@@ -268,27 +280,58 @@ def prepare_feature_matrix(df, vertical: str):
     if sub.empty:
         raise ValueError(f"no training rows for vertical={vertical}")
 
+    # Per-vertical population: only fit on properties this vertical actually
+    # scored above zero for. Otherwise every vertical fans out to the same
+    # 16k rows with identical features and the same outcome label, the
+    # logistic regression produces identical coefficients across all six
+    # verticals, and the per-vertical decomposition is theatrical. Filtering
+    # by `vertical_score > 0` yields a vertical-specific subset (properties
+    # the vertical considered scorable) — each fit then sees the data
+    # distribution this vertical's leads actually come from.
+    #
+    # Properties scoring zero for the vertical (no qualifying signals OR
+    # owner-occupied / dead-lead gate fired) are excluded — the engine
+    # wouldn't route them as that vertical's leads anyway.
+    if "vertical_score" in sub.columns:
+        sub = sub[sub["vertical_score"].fillna(0) > 0].copy()
+        if sub.empty:
+            raise ValueError(
+                f"no rows with vertical_score > 0 for vertical={vertical} — "
+                "this vertical didn't score any properties in the training window."
+            )
+
     # Expand categoricals to one-hot.
     for col, levels in _CATEGORICAL_FEATURES:
         for lvl in levels:
             sub[f"{col}__{lvl}"] = (sub[col].astype(str) == lvl).astype(int)
 
     cols = feature_names()
-    # `errors="ignore"` lets the function survive missing columns gracefully —
-    # the caller would already have aborted if the CSV is malformed.
     matrix = sub[cols].apply(lambda c: c.astype(float) if c.dtype != float else c, axis=0)
 
-    # Drop rows that have NaN in any numeric feature — those are the
-    # Pinellas-style rows where the per-county mask suppressed signals.
-    mask_complete = ~matrix.isna().any(axis=1)
-    matrix = matrix[mask_complete]
-    y_series = sub.loc[mask_complete, "outcome_event"].astype(int)
+    # Drop rows where any has_<sig> column is NaN — these are the per-county
+    # masked rows (Pinellas without code_violations data, etc.). All other
+    # NaN-bearing rows survive — they get their non-signal columns imputed.
+    signal_cols = [f"has_{sig}" for sig in SIGNAL_TYPES]
+    available_signal_cols = [c for c in signal_cols if c in matrix.columns]
+    if available_signal_cols:
+        mask_signals_observed = ~matrix[available_signal_cols].isna().any(axis=1)
+    else:
+        mask_signals_observed = np.ones(len(matrix), dtype=bool)
+
+    matrix = matrix[mask_signals_observed]
+    y_series = sub.loc[mask_signals_observed, "outcome_event"].astype(int)
 
     if matrix.empty:
         raise ValueError(
-            f"no rows survive NaN drop for vertical={vertical} — "
-            "are signals available for this county/vertical combination?"
+            f"no rows survive signal-NaN drop for vertical={vertical} — "
+            "is this county masking every signal type?"
         )
+
+    # Impute the remaining NaN in non-signal columns to 0. "Equity unknown"
+    # → no equity bonus contribution; "sale_date unknown" → years_since_sale
+    # neutralized; etc. This is the same behavior the live engine has for
+    # these fields, just made explicit at the fit boundary.
+    matrix = matrix.fillna(0.0)
 
     X = matrix.to_numpy(dtype=float)
     y = y_series.to_numpy(dtype=int)

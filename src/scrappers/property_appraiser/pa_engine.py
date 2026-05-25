@@ -46,19 +46,40 @@ _COMMIT_BATCH_SIZE = 100
 # Property query helpers
 # ---------------------------------------------------------------------------
 
-def _query_properties(county_id: str, mode: str, limit: int, stale_days: int) -> list[dict]:
-    """Return list of {id, parcel_id} dicts matching the requested mode."""
+def _query_properties(county_id: str, mode: str, limit: int, stale_days: int, leads_only: bool = False) -> list[dict]:
+    """Return list of {id, parcel_id} dicts matching the requested mode.
+
+    leads_only=True restricts to properties whose most recent distress_score
+    has qualified=true (the ~15k active leads).  Combines with mode filters —
+    e.g. leads_only + new-only = leads not yet HCPA-enriched.
+    """
     from sqlalchemy import text
 
     with get_db_context() as session:
-        base = "SELECT id, parcel_id FROM properties WHERE county_id = :cid AND parcel_id IS NOT NULL"
+        if leads_only:
+            # Join to the latest distress_score per property, keep only qualified=true.
+            # DISTINCT ON ordered by score_date DESC picks the most recent row per property.
+            base = (
+                "SELECT p.id, p.parcel_id "
+                "FROM properties p "
+                "JOIN ( "
+                "  SELECT DISTINCT ON (property_id) property_id "
+                "  FROM distress_scores "
+                "  WHERE county_id = :cid AND qualified = true "
+                "  ORDER BY property_id, score_date DESC "
+                ") qs ON qs.property_id = p.id "
+                "WHERE p.county_id = :cid AND p.parcel_id IS NOT NULL"
+            )
+        else:
+            base = "SELECT id, parcel_id FROM properties WHERE county_id = :cid AND parcel_id IS NOT NULL"
 
         if mode == "new-only":
-            q = f"{base} AND hcpa_last_refreshed IS NULL LIMIT :lim"
+            q = f"{base} AND p.hcpa_last_refreshed IS NULL LIMIT :lim" if leads_only else f"{base} AND hcpa_last_refreshed IS NULL LIMIT :lim"
         elif mode == "refresh":
+            col = "p.hcpa_last_refreshed" if leads_only else "hcpa_last_refreshed"
             q = (
-                f"{base} AND (hcpa_last_refreshed IS NULL OR "
-                f"hcpa_last_refreshed < NOW() - INTERVAL '{stale_days} days') LIMIT :lim"
+                f"{base} AND ({col} IS NULL OR "
+                f"{col} < NOW() - INTERVAL '{stale_days} days') LIMIT :lim"
             )
         else:  # all
             q = f"{base} LIMIT :lim"
@@ -146,6 +167,7 @@ async def run_pa_pipeline(
     load_to_db: bool = False,
     headful: bool = False,
     debug: bool = False,
+    leads_only: bool = False,
 ) -> dict:
     """
     Full enrichment pipeline: query → scrape → parse → load.
@@ -153,7 +175,8 @@ async def run_pa_pipeline(
     Returns summary stats dict.
     """
     run_start = time.time()
-    logger.info("PA enrichment starting | county=%s mode=%s limit=%d load=%s", county_id, mode, limit, load_to_db)
+    logger.info("PA enrichment starting | county=%s mode=%s limit=%d load=%s leads_only=%s",
+                county_id, mode, limit, load_to_db, leads_only)
 
     # Load county source config
     try:
@@ -167,7 +190,7 @@ async def run_pa_pipeline(
         pa_config = {}
 
     # Query properties to enrich
-    properties = _query_properties(county_id, mode, limit, stale_days)
+    properties = _query_properties(county_id, mode, limit, stale_days, leads_only=leads_only)
     if not properties:
         logger.info("No properties to enrich (mode=%s)", mode)
         return {"updated": 0, "skipped": 0, "errors": 0, "duration_s": 0}
@@ -279,6 +302,8 @@ def main():
     parser.add_argument("--load-to-db", action="store_true", help="Write enriched data to DB")
     parser.add_argument("--headful", action="store_true", help="Show browser window")
     parser.add_argument("--debug", action="store_true", help="Print raw scraped text and parsed fields")
+    parser.add_argument("--leads-only", action="store_true",
+                        help="Restrict to properties with qualified=true in their latest distress_score (~15k leads)")
     args = parser.parse_args()
 
     result = asyncio.run(run_pa_pipeline(
@@ -289,6 +314,7 @@ def main():
         load_to_db=args.load_to_db,
         headful=args.headful,
         debug=args.debug,
+        leads_only=args.leads_only,
     ))
     print(result)
 

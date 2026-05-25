@@ -116,6 +116,7 @@ def record_scraper_stats(
         error_type = 'none' if run_success else 'scraper_error'
 
     try:
+        from sqlalchemy import func
         with get_db_context() as session:
             stmt = pg_insert(ScraperRunStats).values(
                 run_date=run_date,
@@ -130,18 +131,35 @@ def record_scraper_stats(
                 error_type=error_type,
                 error_message=error_message,
                 duration_seconds=duration_seconds,
-            ).on_conflict_do_update(
+                updated_at=func.now(),
+            )
+            # On re-run within the same day (e.g. 3x/day permits, retries),
+            # ACCUMULATE counts instead of overwriting them.  Matches the
+            # docstring contract; previous behaviour silently dropped earlier
+            # runs.  Notes on the non-additive columns:
+            #   • duration_seconds → GREATEST so a fast retry doesn't hide a
+            #     slow earlier run.
+            #   • run_success → logical OR (any successful run wins).
+            #   • error_type / error_message → keep the latest non-null value
+            #     so the most recent failure detail is visible.
+            excluded = stmt.excluded
+            existing = ScraperRunStats.__table__.c
+            stmt = stmt.on_conflict_do_update(
                 constraint='uq_scraper_run_stats',
                 set_=dict(
-                    total_scraped=total_scraped,
-                    matched=matched,
-                    unmatched=unmatched,
-                    skipped=skipped,
-                    scored=scored,
-                    run_success=run_success,
-                    error_type=error_type,
-                    error_message=error_message,
-                    duration_seconds=duration_seconds,
+                    total_scraped=existing.total_scraped + excluded.total_scraped,
+                    matched=existing.matched + excluded.matched,
+                    unmatched=existing.unmatched + excluded.unmatched,
+                    skipped=existing.skipped + excluded.skipped,
+                    scored=existing.scored + excluded.scored,
+                    run_success=existing.run_success.op('OR')(excluded.run_success),
+                    error_type=func.coalesce(excluded.error_type, existing.error_type),
+                    error_message=func.coalesce(excluded.error_message, existing.error_message),
+                    duration_seconds=func.greatest(
+                        func.coalesce(existing.duration_seconds, 0),
+                        func.coalesce(excluded.duration_seconds, 0),
+                    ),
+                    updated_at=excluded.updated_at,
                 )
             )
             session.execute(stmt)
