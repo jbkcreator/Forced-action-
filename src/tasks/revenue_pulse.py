@@ -10,6 +10,7 @@ Cron lines (add to scripts/cron/crontab.txt):
   30 7 * * *    cd /opt/forced-action && python -m src.tasks.revenue_pulse --daily
   0 9 * * 1     cd /opt/forced-action && python -m src.tasks.revenue_pulse --weekly
 """
+from langchain_core.messages import ChatMessage
 import logging
 import sys
 from datetime import date, datetime, timedelta, timezone
@@ -149,6 +150,34 @@ def _compose_weekly(db: Session) -> str:
         kill_label=kill["label"],
         learning=learning_str,
     )
+
+
+def _chat_metrics_today(db: Session) -> dict:
+    """Return Concierge Chat funnel metrics for today."""
+    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    try:
+        sessions = db.execute(
+            select(func.count(ChatSession.id)).where(
+                ChatSession.created_at >= today_start
+            )
+        ).scalar_one_or_none() or 0
+
+        assistant_replies = db.execute(
+            select(func.count(ChatMessage.id)).where(
+                ChatMessage.created_at >= today_start,
+                ChatMessage.role == "assistant",
+            )
+        ).scalar_one_or_none() or 0
+
+        return {
+            "sessions": sessions,
+            "intent_detected": 0,
+            "payment_triggered": 0,
+            "assistant_replies": assistant_replies,
+        }
+    except Exception as exc:
+        logger.warning("[RevenuePulse] chat metrics failed: %s", exc)
+        return {"sessions": 0, "intent_detected": 0, "payment_triggered": 0}
 
 
 def _kill_switch_status(db: Session) -> dict:

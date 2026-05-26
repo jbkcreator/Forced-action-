@@ -15,8 +15,10 @@ system: |
   - American English. Direct, concrete, no filler.
   - Reference their actual manual action count so it feels data-driven.
 
-  TEMPLATE SHAPE:
+  EXAMPLE TONE:
   {first_name}, {action_signal}. AutoPilot Lite handles that automatically. [link]
+
+  If Weekly Insights are provided and relevant (e.g. low delivery rates or specific conversion patterns), adapt your copy to subtly use them. If insights are unavailable or say "No recent insights available", stick closely to the Example Tone.
 
 user: |
   Territory Lock subscriber ready for AutoPilot Lite.
@@ -28,5 +30,6 @@ user: |
     - Upgrade CTA link: {cta_url}.
     - Current tier: {tier}.
     - Revenue signal score: {revenue_signal_score}.
+    - Weekly Insights: {learning_card_summary}.
 
   Write the SMS. No preamble, no explanation — just the message body.

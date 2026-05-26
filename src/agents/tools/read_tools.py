@@ -17,12 +17,22 @@ Pattern:
 
 from __future__ import annotations
 
+import json
+import logging
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Generator, List, Optional
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
+
+logger = logging.getLogger(__name__)
+
+LEARNING_CARD_CACHE_TTL = 8 * 86400  # 8 days — outlives weekly Sunday refresh
+
+
+def _learning_card_key(card_type: str) -> str:
+    return f"learning_card:{card_type}"
 
 from src.agents.tools.registry import tool
 from src.core.database import db
@@ -320,7 +330,22 @@ def get_learning_card(
 
 	Card types: message_perf, deal_pattern, ab_result, churn_signal,
 	pricing_test, general.
+
+	Read path is Redis-fronted (key=learning_card:{card_type}, TTL 8d) to
+	keep the decision_hierarchy hot path under the M5 <100 ms SLA. Cache
+	misses fall through to Postgres and backfill the key; Redis failures
+	degrade silently to a direct DB read.
 	"""
+	from src.core.redis_client import rget, rset
+
+	key = _learning_card_key(card_type)
+	cached = rget(key)
+	if cached:
+		try:
+			return json.loads(cached)
+		except (ValueError, TypeError) as exc:
+			logger.warning("learning_card cache decode failed for %s: %s", key, exc)
+
 	with _session(session) as s:
 		card = (
 			s.query(LearningCard)
@@ -330,13 +355,15 @@ def get_learning_card(
 		)
 		if card is None:
 			return {}
-		return {
+		payload = {
 			"card_date": card.card_date.isoformat(),
 			"card_type": card.card_type,
 			"summary_text": card.summary_text,
 			"data": card.data_json or {},
 			"action_taken": card.action_taken,
 		}
+	rset(key, json.dumps(payload), ttl_seconds=LEARNING_CARD_CACHE_TTL)
+	return payload
 
 
 # ──────────────────────────────────────────────────────────────────────────────

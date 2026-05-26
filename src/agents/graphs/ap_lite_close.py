@@ -50,6 +50,7 @@ class ApLiteState(TypedDict, total=False):
     use_fallback: bool
     kill_switch_color: str
     revenue_signal_score: int
+    learning_card_summary: str
 
     # Intermediate compose inputs (must be declared — LangGraph drops undeclared keys)
     _system_prompt: str
@@ -104,6 +105,7 @@ def _node_hierarchy_check(state: ApLiteState) -> ApLiteState:
         "use_fallback": bool(hierarchy.get("use_fallback", False)),
         "kill_switch_color": hierarchy.get("kill_switch_color"),
         "revenue_signal_score": hierarchy.get("revenue_signal_score", 0),
+        "learning_card_summary": hierarchy.get("learning_card", {}).get("summary_text") or "No recent insights available.",
     }
 
 
@@ -123,6 +125,7 @@ def _node_build_compose_context(state: ApLiteState) -> Dict[str, Any]:
         "cta_url": payload.get("cta_url") or "",
         "tier": profile.get("tier") or "annual_lock",
         "revenue_signal_score": state.get("revenue_signal_score", 0),
+        "learning_card_summary": state.get("learning_card_summary", "No recent insights available."),
         "action_signal": f"you did {weekly_actions} manual lead actions last week",
     }
 
