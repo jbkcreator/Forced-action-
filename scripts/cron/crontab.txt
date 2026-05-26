@@ -144,6 +144,16 @@ COUNTY_ID=hillsborough
 # Cora anomaly check — volume + no-answer rate monitor — every 15 min
 */15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.cora_anomaly_check
 
+# Cora self-healing loop (fa034) — every hour at :30. Reads kill-switch
+# metrics + 7-day baselines, opens/maintains/closes cora_incident rows,
+# takes safe actions inside guardrails (fallback only — never auto-pricing
+# or auto-kill), escalates to Slack + Revenue Pulse when human review needed.
+# Source of truth: FA-2B-v9-FINAL Self-Healing Ops + Q44 + Q52.
+# Gated by CORA_SELF_HEALING_ENABLED=true (default false). Task is a no-op
+# when disabled — safe to leave the cron entry in even on environments that
+# haven't opted in yet.
+30 * * * * $PROJECT/scripts/cron/run.sh src.tasks.cora_self_healing
+
 # ── CDS SCORING ──────────────────────────────────────────────
 # CDS Scoring Engine         — 07:00 AM UTC Mon-Sat (after all scrapers complete)
 0 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.services.cds_engine --rescore-new-signals
@@ -237,6 +247,15 @@ COUNTY_ID=hillsborough
 
 # Revenue Pulse — daily founder SMS at 07:30 UTC (lead count, wallet actives, top deal/alert, kill switch).
 30 7 * * * $PROJECT/scripts/cron/run.sh src.tasks.revenue_pulse --daily
+
+# Weekly Cora autonomy scorecard (fa036) — Monday 08:45 UTC. Computes 5
+# autonomy metrics over the last 7 days from agent_decisions + cora_playbook,
+# writes one learning_cards row (card_type='autonomy_summary'), and posts to
+# Slack via cora_slack. Scheduled 15 min before the 09:00 weekly Revenue Pulse
+# so the pulse can append the latest autonomy summary line.
+# Read-only metric computation — no env gate, safe to leave wired.
+# Source: FA-2B-v9-FINAL §Weekly Cora Autonomy Scorecard.
+45 8 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.cora_autonomy_report
 
 # Revenue Pulse — weekly founder SMS, Monday 09:00 UTC (revenue est, churn, top learning).
 0 9 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.revenue_pulse --weekly

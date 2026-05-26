@@ -14,7 +14,7 @@ endpoints) — the actual network delivery is stubbed by the sandbox layer.
 import pytest
 
 from src.core.database import db as _db_mgr
-from tests.scenarios.helpers import dispatch, freeze_at, read_outbox
+from tests.scenarios.helpers import dispatch, freeze_at
 
 
 pytestmark = pytest.mark.scenario_platform

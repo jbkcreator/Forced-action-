@@ -20,9 +20,12 @@ lets FOMO, Abandonment, and Retention all reuse the exact same flow.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional, TypedDict
 
 from langgraph.graph import END, START, StateGraph
+
+logger = logging.getLogger(__name__)
 
 from src.agents.tools.gating_tools import budget_check, compliance_check
 from src.agents.tools.write_tools import log_decision, send_sms
@@ -47,6 +50,7 @@ class ComposeAndSendState(TypedDict, total=False):
 	variant_id: Optional[str]      # A/B variant attribution
 	message_type: str              # 'marketing' | 'transactional'
 	ab_fallback_body: Optional[str]  # literal body to send when use_fallback=True
+	personalization_context: Optional[dict]  # fa038 — render context for outcome logging
 
 	# Feature flags the caller may already have resolved.
 	use_fallback: Optional[bool]   # from decision_hierarchy (yellow kill-switch)
@@ -216,6 +220,7 @@ def _node_send_and_log(state: ComposeAndSendState) -> ComposeAndSendState:
 		variant_id=state.get("variant_id"),
 		decision_id=state.get("decision_id"),
 		message_type=state.get("message_type") or "marketing",
+		personalization_context=state.get("personalization_context"),
 	)
 
 	if send_result["sent"]:

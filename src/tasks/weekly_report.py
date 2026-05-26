@@ -58,10 +58,12 @@ VERTICAL_DISPLAY = {
 
 GOLD_PLUS_TIERS = {"Ultra Platinum", "Platinum", "Gold"}
 
-# Scrapers excluded from daily match-% calculation.
-# Sunbiz is an owner-lookup scraper; it never produces property-ID matches
-# and inflates the denominator, causing wild day-to-day match% swings.
-MATCH_PCT_EXCLUDE = {"sunbiz"}
+# Enrichment tasks that write to scraper_run_stats but are NOT signal scrapers.
+# Excluded from all ingest counts and match-% calculations — including the
+# day-by-day breakdown — so a large PA refresh batch or LLC enrichment run
+# doesn't spike "scraped" and tank the match% for that day.
+ENRICHMENT_ONLY = {"sunbiz", "property_appraiser"}
+MATCH_PCT_EXCLUDE = ENRICHMENT_ONLY  # kept for backward compat with existing references
 
 _FRESHNESS_MAP = {
     "permits":          (BuildingPermit,   BuildingPermit.date_added,   None),
@@ -156,15 +158,16 @@ def _build_scraper_section(session, monday: date, friday: date, county_id: str):
                 a["errors"].append(f"{r.run_date}: {r.error_message}")
 
     ordered = [t for t in SCRAPER_ORDER if t in agg]
-    extras  = sorted(t for t in agg if t not in SCRAPER_ORDER)
+    # Never surface enrichment-only tasks (sunbiz, property_appraiser) as signal scrapers
+    extras  = sorted(t for t in agg if t not in SCRAPER_ORDER and t not in ENRICHMENT_ONLY)
 
     scraper_data = []
-    total_scraped = total_matched = 0  # property-matching scrapers only (excludes MATCH_PCT_EXCLUDE)
+    total_scraped = total_matched = 0  # signal scrapers only (excludes ENRICHMENT_ONLY)
     week_errors = []
 
     for source_type in ordered + extras:
         a = agg[source_type]
-        if source_type not in MATCH_PCT_EXCLUDE:
+        if source_type not in ENRICHMENT_ONLY:
             total_scraped += a["scraped"]
             total_matched += a["matched"]
         scraper_data.append({
@@ -187,7 +190,13 @@ def _build_scraper_section(session, monday: date, friday: date, county_id: str):
                 "failures": 0, "runs": 0,
             })
 
-    match_pct = (total_matched / total_scraped * 100) if total_scraped else 0.0
+    # Denominator is new records only (matched + unmatched), excluding duplicates
+    # that were skipped before matching. Using total_scraped inflates the denominator
+    # and produces artificially low match rates on weeks with heavy duplicate traffic.
+    # Mirrors the same fix that daily_report applies in _build_scraper_section.
+    total_unmatched = sum(a["unmatched"] for s, a in agg.items() if s not in ENRICHMENT_ONLY)
+    new_records = total_matched + total_unmatched
+    match_pct = (total_matched / new_records * 100) if new_records else 0.0
     return scraper_data, total_scraped, total_matched, match_pct, week_errors
 
 
@@ -236,23 +245,25 @@ def _build_scoring_section(session, monday: date, friday: date, county_id: str, 
 
 def _build_daily_scraper_totals(session, monday: date, friday: date, county_id: str) -> list:
     """
-    Total scraped per day across property-matching scrapers — for the day-by-day table.
+    Total scraped per day across signal scrapers — for the day-by-day table.
 
-    MATCH_PCT_EXCLUDE scrapers (e.g. sunbiz) are omitted: they do owner lookups,
-    never produce property-ID matches, and cause multi-percentage-point match%
-    swings on the days they run.  They appear in the per-scraper summary table.
+    ENRICHMENT_ONLY scrapers (sunbiz, property_appraiser) are excluded: they run
+    large batches that inflate "scraped" and cause match% to swing wildly on the
+    days they run.  Match% uses matched/(matched+unmatched) — the same denominator
+    as the weekly summary — so skipped duplicates don't deflate the rate.
     """
     rows = (
         session.query(
             ScraperRunStats.run_date,
             func.sum(ScraperRunStats.total_scraped).label("scraped"),
             func.sum(ScraperRunStats.matched).label("matched"),
+            func.sum(ScraperRunStats.unmatched).label("unmatched"),
         )
         .filter(
             ScraperRunStats.run_date >= monday,
             ScraperRunStats.run_date <= friday,
             ScraperRunStats.county_id == county_id,
-            ScraperRunStats.source_type.notin_(MATCH_PCT_EXCLUDE),
+            ScraperRunStats.source_type.notin_(ENRICHMENT_ONLY),
         )
         .group_by(ScraperRunStats.run_date)
         .order_by(ScraperRunStats.run_date)
@@ -260,30 +271,47 @@ def _build_daily_scraper_totals(session, monday: date, friday: date, county_id: 
     )
     result = []
     for r in rows:
-        pct = (r.matched / r.scraped * 100) if r.scraped else 0.0
+        new_records = (r.matched or 0) + (r.unmatched or 0)
+        pct = (r.matched / new_records * 100) if new_records else 0.0
         result.append({"date": str(r.run_date), "scraped": r.scraped,
                         "matched": r.matched, "pct": pct})
     return result
 
 
 def _build_vertical_breakdown(session, monday: date, friday: date, county_id: str) -> dict:
-    """Aggregate Gold+ vertical breakdown across the whole week."""
-    rows = (
-        session.query(DistressScore)
-        .filter(
-            func.date(DistressScore.score_date) >= monday,
-            func.date(DistressScore.score_date) <= friday,
-            DistressScore.lead_tier.in_(GOLD_PLUS_TIERS),
-            DistressScore.county_id == county_id,
-        )
-        .all()
-    )
+    """Aggregate Gold+ vertical breakdown across the whole week.
+
+    Counts each property at most once at its latest Gold+ score during the
+    week.  Without DISTINCT ON, a property rescored on three days would be
+    counted three times — inflating Gold+ counts by 3-5x and silently shifting
+    properties between vertical buckets based on rescore frequency.
+
+    The dedup + bucketing is pushed to Postgres so we don't materialise a
+    week's worth of DistressScore rows (potentially 50k-250k JSONB rows) into
+    Python only to throw most away.
+    """
+    rows = session.execute(
+        sa_text("""
+            SELECT DISTINCT ON (property_id) property_id, lead_tier, vertical_scores
+            FROM distress_scores
+            WHERE county_id = :county_id
+              AND date(score_date) >= :monday
+              AND date(score_date) <= :friday
+              AND lead_tier = ANY(:tiers)
+            ORDER BY property_id, score_date DESC
+        """),
+        {
+            "county_id": county_id,
+            "monday":    monday,
+            "friday":    friday,
+            "tiers":     list(GOLD_PLUS_TIERS),
+        },
+    ).fetchall()
 
     vertical_counts = defaultdict(int)
     unclassified = 0
 
-    for r in rows:
-        vs = r.vertical_scores or {}
+    for _pid, _tier, vs in rows:
         if not vs:
             unclassified += 1
             continue

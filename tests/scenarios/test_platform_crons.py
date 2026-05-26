@@ -13,7 +13,7 @@ that the platform cron jobs behave correctly when the scheduler triggers.
 
 import pytest
 
-from tests.scenarios.helpers import freeze_at, read_outbox
+from tests.scenarios.helpers import freeze_at
 
 
 pytestmark = pytest.mark.scenario_platform

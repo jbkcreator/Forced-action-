@@ -5,9 +5,10 @@ Implements the Hub-and-Spoke architecture with properties as the central hub.
 
 from datetime import date, datetime, timezone
 from decimal import Decimal
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     Column,
     Date,
@@ -24,7 +25,7 @@ from sqlalchemy import (
     func,
     false as sa_false,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID as PG_UUID
 from sqlalchemy.orm import DeclarativeBase, relationship, Mapped, mapped_column
 
 
@@ -557,8 +558,14 @@ class LegalProceeding(Base):
 
 class TaxDelinquency(Base):
     """
-    Tax delinquency records for properties.
-    One-to-many relationship with Property.
+    Tax delinquency / tax certificate records for properties.
+
+    Supports both:
+    - Pinellas: Delinq Taxes-Certs Unpaid
+    - Hillsborough: Public - Certificates (Unpaid)
+
+    One property can have multiple tax delinquency/certificate rows across
+    tax years and certificate numbers.
     """
     __tablename__ = "tax_delinquencies"
 
@@ -568,12 +575,72 @@ class TaxDelinquency(Base):
     # Foreign Key
     property_id: Mapped[int] = mapped_column(ForeignKey("properties.id"), nullable=False, index=True)
 
+    # County / source tracking
+    source_report: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+
     # Tax Information
     tax_year: Mapped[Optional[int]] = mapped_column(Integer)
     years_delinquent: Mapped[Optional[int]] = mapped_column(Integer)
+
+    # Raw source identifier from the upload CSV before any prefix stripping.
+    # Hillsborough: "A12345", Pinellas: "R265727". Used for deduplication and
+    # updates when the same cert is re-uploaded across runs.
+    source_account_number: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)
+
+    # Normalized/source identifiers
+    account_number: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)
+    alternate_key: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)
+    parcel_number: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
+
+    # Owner / property snapshot from source file
+    owner_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
+    owner_address: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    property_address: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+
+    # Certificate details
+    certificate_number: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)
+    certificate_status: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)
+    issued_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+
+    bidder_number: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    certificate_buyer: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    certificate_buyer_address: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+
+    # Financial details
+    face_amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2), nullable=True)
+    account_balance_amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2), nullable=True)
     total_amount_due: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
-    certificate_data: Mapped[Optional[str]] = mapped_column(String(255))
+    interest_rate: Mapped[Optional[float]] = mapped_column(Numeric(8, 4), nullable=True)
+    assessed_value: Mapped[Optional[float]] = mapped_column(Numeric(14, 2), nullable=True)
+
+    # Status / lifecycle
+    account_status: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)
+    deed_status: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)
     deed_app_date: Mapped[Optional[datetime]] = mapped_column(Date)
+
+    date_redeemed: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    purchased_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    county_held: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+
+    # Classification / flags
+    standard_flags: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    custom_flags: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    use_code: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+
+    # Legacy/raw certificate data if needed
+    certificate_data: Mapped[Optional[str]] = mapped_column(String(255))
+
+    # Raw source safety/debugging
+    raw_source_data: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB, nullable=True)
+
+    # Timestamps
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime, default=datetime.utcnow, nullable=True)
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        nullable=True,
+    )
 
     # Load tracking & multi-county
     date_added: Mapped[Optional[date]] = mapped_column(Date, default=date.today, index=True)
@@ -587,11 +654,24 @@ class TaxDelinquency(Base):
         Index("idx_tax_year", "tax_year"),
         Index("idx_tax_years_delinquent", "years_delinquent"),
         Index("idx_tax_deed_app_date", "deed_app_date"),
+        Index("idx_tax_delinquency_county_status", "county_id", "account_status"),
+        Index("idx_tax_delinquency_cert_status", "certificate_status"),
+        Index("idx_tax_delinquency_county_account", "county_id", "source_account_number"),
+        Index("idx_tax_delinquency_parcel", "parcel_number"),
         UniqueConstraint("property_id", "tax_year", name="uq_tax_delinquency_property_year"),
     )
 
     def __repr__(self):
-        return f"<TaxDelinquency(id={self.id}, tax_year={self.tax_year}, amount_due={self.total_amount_due})>"
+        return (
+            f"<TaxDelinquency("
+            f"id={self.id}, "
+            f"county={self.county_id}, "
+            f"account={self.source_account_number}, "
+            f"tax_year={self.tax_year}, "
+            f"cert={self.certificate_number}, "
+            f"amount_due={self.total_amount_due}"
+            f")>"
+        )
 
 
 class Foreclosure(Base):
@@ -1439,6 +1519,22 @@ class PlatformDailyStats(Base):
     tier_silver: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     tier_bronze: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
+    # ── Cora self-healing baseline snapshots (fa034 + fa035) ─────────────────
+    # Daily metric values written by kill_switch_metric_ingest after the
+    # ks_metric_* Redis cache is updated. Read by cora_self_healing.compute_baseline
+    # to derive a 7-day rolling mean per metric. NULL = "no data for this day"
+    # (pre-deploy rows, or metric not computable for this county).
+    # NUMERIC(7,4): admits 0-999.9999 — percent values are stored in 0-100
+    # range so 100.0 fits (e.g. retention_30d=100.0 for a fresh cohort).
+    sms_reply_rate: Mapped[Optional[float]] = mapped_column(Numeric(7, 4), nullable=True)
+    offer_acceptance_rate: Mapped[Optional[float]] = mapped_column(Numeric(7, 4), nullable=True)
+    first_payment_rate: Mapped[Optional[float]] = mapped_column(Numeric(7, 4), nullable=True)
+    saved_card_rate: Mapped[Optional[float]] = mapped_column(Numeric(7, 4), nullable=True)
+    wallet_adoption: Mapped[Optional[float]] = mapped_column(Numeric(7, 4), nullable=True)
+    lock_conversion: Mapped[Optional[float]] = mapped_column(Numeric(7, 4), nullable=True)
+    retention_30d: Mapped[Optional[float]] = mapped_column(Numeric(7, 4), nullable=True)
+    cac_paid_channels: Mapped[Optional[float]] = mapped_column(Numeric(10, 2), nullable=True)
+
     # Audit
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
@@ -1459,6 +1555,71 @@ class PlatformDailyStats(Base):
         return (
             f"<PlatformDailyStats(date={self.run_date}, scored={self.properties_scored}, "
             f"leads_new={self.leads_new}, qualified={self.leads_qualified})>"
+        )
+
+
+class CoraIncident(Base):
+    """Cora self-healing incident ledger (fa034).
+
+    One row per (metric, county, feature) breach. Opened by
+    `src/tasks/cora_self_healing.py` when a metric crosses its yellow/red
+    threshold; updated when duration passes action triggers; closed when
+    the metric recovers.
+
+    Runtime never instantiates this model directly — every read/write in
+    cora_self_healing.py and the revenue_pulse extension uses raw SQL via
+    `sa_text(...)` (per repo convention). This declaration exists only so
+    Alembic autogenerate stays consistent with the live schema.
+    """
+    __tablename__ = "cora_incident"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    metric_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    county_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    feature_name: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+    severity: Mapped[str] = mapped_column(String(16), nullable=False)
+    observed_value: Mapped[float] = mapped_column(Numeric(10, 4), nullable=False)
+    threshold_value: Mapped[float] = mapped_column(Numeric(10, 4), nullable=False)
+    baseline_value: Mapped[Optional[float]] = mapped_column(Numeric(10, 4), nullable=True)
+
+    breach_started: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    breach_resolved: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    duration_hours: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    action_taken: Mapped[str] = mapped_column(String(32), nullable=False, default="no_op")
+    action_details: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    decision_id: Mapped[Optional[str]] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        CheckConstraint("severity IN ('yellow','red')", name="check_cora_incident_severity"),
+        CheckConstraint(
+            "action_taken IN ('no_op','fallback_enabled','auto_paused',"
+            "'human_escalated','feature_killed','resolved')",
+            name="check_cora_incident_action",
+        ),
+        # Partial indexes (idx_cora_incident_metric_open, idx_cora_incident_unresolved)
+        # are created via raw SQL in fa034 and not declared here, so autogenerate
+        # doesn't try to recreate them.
+        Index("idx_cora_incident_breach_started", "breach_started"),
+    )
+
+    def __repr__(self):
+        return (
+            f"<CoraIncident(id={self.id}, metric={self.metric_name}, "
+            f"severity={self.severity}, action={self.action_taken}, "
+            f"resolved={self.breach_resolved is not None})>"
         )
 
 
@@ -1709,6 +1870,15 @@ class UserSegment(Base):
     subscriber_id: Mapped[int] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=False, unique=True, index=True)
     segment: Mapped[str] = mapped_column(String(30), nullable=False)  # 8 buckets
     revenue_signal_score: Mapped[Optional[int]] = mapped_column(Integer, default=0)  # 0–100
+
+    # fa037 — Revenue Signal Score explainability + freshness columns.
+    # Nullable to stay back-compat with rows written before fa037.
+    revenue_signal_band: Mapped[Optional[str]] = mapped_column(String(20))  # low/medium/high/very_high
+    revenue_signal_breakdown: Mapped[Optional[dict]] = mapped_column(JSONB)
+    revenue_signal_updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_significant_action_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    revenue_signal_last_action: Mapped[Optional[str]] = mapped_column(String(80))
+
     last_classified_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     classification_reason: Mapped[Optional[str]] = mapped_column(String(255))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
@@ -1723,10 +1893,50 @@ class UserSegment(Base):
             "segment IN ('new', 'browsing', 'engaged', 'wallet_active', 'high_intent', 'lock_candidate', 'at_risk', 'churned')",
             name="check_user_segment",
         ),
+        CheckConstraint(
+            "revenue_signal_band IS NULL OR "
+            "revenue_signal_band IN ('low', 'medium', 'high', 'very_high')",
+            name="check_revenue_signal_band",
+        ),
     )
 
     def __repr__(self):
         return f"<UserSegment(subscriber={self.subscriber_id}, segment={self.segment}, score={self.revenue_signal_score})>"
+
+
+class RevenueSignalScoreEvent(Base):
+    """fa037 — append-only audit row per Revenue Signal Score update.
+
+    One row is written every time `update_revenue_signal_score()` runs,
+    capturing the action that triggered the recompute, the old/new score,
+    the delta, and the full breakdown at the time. Powers the admin
+    subscriber detail "why did the score change?" view.
+
+    Indexed for (subscriber_id, created_at DESC) so the admin endpoint
+    can grab the last 20 history rows in one seek.
+    """
+    __tablename__ = "revenue_signal_score_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("subscribers.id", ondelete="CASCADE"), nullable=False
+    )
+    action_type: Mapped[Optional[str]] = mapped_column(String(80))
+    old_score: Mapped[Optional[int]] = mapped_column(Integer)
+    new_score: Mapped[int] = mapped_column(Integer, nullable=False)
+    delta: Mapped[int] = mapped_column(Integer, nullable=False)
+    band: Mapped[Optional[str]] = mapped_column(String(20))
+    breakdown: Mapped[Optional[dict]] = mapped_column(JSONB)
+    meta_data: Mapped[Optional[dict]] = mapped_column("metadata", JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    def __repr__(self):
+        return (
+            f"<RevenueSignalScoreEvent(sub={self.subscriber_id}, "
+            f"action={self.action_type}, delta={self.delta})>"
+        )
 
 
 class MessageOutcome(Base):
@@ -1752,11 +1962,21 @@ class MessageOutcome(Base):
     conversion_within_24h: Mapped[bool] = mapped_column(Boolean, default=False)
     conversion_within_48h: Mapped[bool] = mapped_column(Boolean, default=False)
     revenue_attributed: Mapped[Optional[float]] = mapped_column(Numeric(10, 2))
+    # fa038 — personalization fields for variant performance attribution
+    trade_vertical: Mapped[Optional[str]] = mapped_column(String(50))
+    county_id: Mapped[Optional[str]] = mapped_column(String(50))
+    behavioral_segment: Mapped[Optional[str]] = mapped_column(String(30))
+    revenue_signal_score: Mapped[Optional[int]] = mapped_column(Integer)
+    revenue_signal_score_band: Mapped[Optional[str]] = mapped_column(String(20))
+    last_action_recency_band: Mapped[Optional[str]] = mapped_column(String(30))
+    prompt_version: Mapped[Optional[str]] = mapped_column(String(20))
+    context_snapshot: Mapped[Optional[dict]] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     __table_args__ = (
         CheckConstraint("message_type IN ('sms', 'email', 'voice')", name="check_message_type"),
         Index("idx_msg_outcome_sub_sent", "subscriber_id", "sent_at"),
+        Index("idx_msg_outcome_vertical_segment", "trade_vertical", "behavioral_segment"),
     )
 
     def __repr__(self):
@@ -1809,7 +2029,9 @@ class LearningCard(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "card_type IN ('message_perf', 'deal_pattern', 'ab_result', 'churn_signal', 'pricing_test', 'general')",
+            "card_type IN ('message_perf', 'deal_pattern', 'ab_result', "
+            "'churn_signal', 'pricing_test', 'general', "
+            "'autonomy_summary')",      # fa036 — weekly Cora autonomy scorecard
             name="check_card_type",
         ),
         UniqueConstraint("card_date", "card_type", name="uq_learning_card_date_type"),
@@ -2245,10 +2467,35 @@ class AgentDecision(Base):
     summary: Mapped[Optional[dict]] = mapped_column(JSONB)
     variant_id: Mapped[Optional[str]] = mapped_column(String(80), nullable=True, index=True)
 
+    # ── fa036 — autonomy classification ────────────────────────────────────
+    # autonomy_class: classification at decision time. Enum-CHECK enforces values.
+    # was_autonomous: STICKY flag. Set TRUE on first 'autonomous' classification;
+    #   never cleared. Metric 2 ("% overridden among autonomous") queries on this
+    #   instead of the current autonomy_class so rows that flipped to 'overridden'
+    #   still count in the denominator.
+    # playbook_id: nullable link to the cora_playbook row that drove this decision.
+    autonomy_class: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    was_autonomous: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    requires_approval: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    approved_by: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    overridden_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    overridden_by: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    override_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    playbook_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("cora_playbook.id", ondelete="SET NULL"), nullable=True,
+    )
+
     __table_args__ = (
         CheckConstraint(
             "terminal_status IS NULL OR terminal_status IN ('completed', 'aborted', 'escalated', 'failed')",
             name="check_agent_terminal_status",
+        ),
+        CheckConstraint(
+            "autonomy_class IS NULL OR autonomy_class IN ("
+            "'autonomous','approval_required','approved',"
+            "'rejected','overridden','recommendation_only')",
+            name="check_agent_autonomy_class",
         ),
         Index("idx_agent_decisions_graph_started", "graph_name", "started_at"),
     )
@@ -2257,49 +2504,91 @@ class AgentDecision(Base):
         return f"<AgentDecision(id={self.decision_id[:8]}, graph={self.graph_name}, status={self.terminal_status})>"
 
 
-class SandboxOutbox(Base):
+class CoraPlaybook(Base):
+    """Cora-recommended pattern lifecycle (fa036).
+
+    One row per Cora-authored recommendation (A/B winner promotion, kill
+    recommendation, future explicit recommendations). Lifecycle:
+        recommended → adopted   (human approves via admin endpoint)
+                    → rejected  (human declines)
+                    → retired   (previously-adopted playbook is disabled)
+
+    Runtime never instantiates this model — every read/write goes through
+    raw SQL via `sa_text` (per repo convention) in `src/services/playbook_writer.py`,
+    `src/api/admin_router.py`, and `src/tasks/cora_autonomy_report.py`. The
+    declaration exists for Alembic autogenerate consistency.
+
+    The `source_key` column + the partial-unique index on it prevent
+    duplicate recommendations from the same A/B test or metric breach
+    (see `idx_cora_playbook_source_key_unique` in fa036). NULL source_key
+    is allowed and uncounted by the index.
     """
-    Capture table for would-be outbound messages during scenario tests.
+    __tablename__ = "cora_playbook"
 
-    When TELNYX_SANDBOX or SYNTHFLOW_SANDBOX is true, the outbound services
-    write one row here instead of (or alongside) the dry-run log. Developers
-    inspect these rows via /admin/sandbox/outbox to verify message bodies,
-    compliance outcomes, and graph-produced copy.
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    pattern_json: Mapped[dict] = mapped_column(JSONB, nullable=False)
 
-    Production with TELNYX_SMS_ENABLED=true and TELNYX_SANDBOX=false leaves
-    this table empty.
-    """
-    __tablename__ = "sandbox_outbox"
-
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    channel: Mapped[str] = mapped_column(String(20), nullable=False)        # sms | voice | email
-    to_number: Mapped[Optional[str]] = mapped_column(String(64))            # E.164 or email
-    body: Mapped[str] = mapped_column(Text, nullable=False)
-    campaign: Mapped[Optional[str]] = mapped_column(String(100), index=True)
-    variant_id: Mapped[Optional[str]] = mapped_column(String(100))
-    subscriber_id: Mapped[Optional[int]] = mapped_column(
-        Integer, ForeignKey("subscribers.id"), nullable=True, index=True
+    # authored_by: 'cora' for autonomous paths; <operator handle> for manual.
+    # The ab_engine.complete_test source_actor kwarg carries this through.
+    authored_by: Mapped[str] = mapped_column(String(80), nullable=False)
+    authored_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc), nullable=False,
     )
-    decision_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)
-    compliance_allowed: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    compliance_reason: Mapped[Optional[str]] = mapped_column(String(60))
-    would_have_delivered: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    sandbox_flag: Mapped[str] = mapped_column(String(40), nullable=False, default="telnyx_sandbox")
+
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="recommended")
+
+    adopted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    adopted_by: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    rejected_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    rejected_by: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    rejection_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    retired_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    retired_by: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+
+    # decision_id is VARCHAR(36) to match agent_decisions.decision_id exactly
+    # (which is String(36), not PG UUID type — see correction #8 in plan).
+    decision_id: Mapped[Optional[str]] = mapped_column(
+        String(36),
+        ForeignKey("agent_decisions.decision_id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    # Source tracking — dedupes repeat recommendations for the same source.
+    source_type: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    source_id: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    source_key: Mapped[Optional[str]] = mapped_column(String(160), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False, index=True
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc), nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
     )
 
     __table_args__ = (
         CheckConstraint(
-            "channel IN ('sms', 'voice', 'email')",
-            name="check_sandbox_outbox_channel",
+            "status IN ('recommended','adopted','rejected','retired')",
+            name="check_cora_playbook_status",
         ),
-        Index("idx_sandbox_outbox_sub_created", "subscriber_id", "created_at"),
-        Index("idx_sandbox_outbox_campaign_created", "campaign", "created_at"),
+        # Non-unique indexes mirror fa036. The unique partial index on
+        # source_key is created via raw SQL in the migration, not declared
+        # here, so autogenerate doesn't try to re-create it.
+        Index("idx_cora_playbook_status", "status"),
+        Index("idx_cora_playbook_authored", "authored_by", "authored_at"),
     )
 
     def __repr__(self):
-        return f"<SandboxOutbox(id={self.id}, channel={self.channel}, to={self.to_number}, campaign={self.campaign})>"
+        return (
+            f"<CoraPlaybook(id={self.id}, name={self.name}, "
+            f"status={self.status}, authored_by={self.authored_by})>"
+        )
 
 
 class SmsSendLog(Base):

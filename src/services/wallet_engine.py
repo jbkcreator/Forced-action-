@@ -133,7 +133,12 @@ def debit(
         )
 
     from src.services.segmentation_engine import reclassify_safe
-    reclassify_safe(subscriber_id, db)
+    from src.services.revenue_signal import ACTION_WALLET_TXN
+    reclassify_safe(
+        subscriber_id, db,
+        action_type=ACTION_WALLET_TXN,
+        metadata={"txn_type": "debit", "amount": int(cost), "action": action, "zip_code": zip_code},
+    )
     return True
 
 

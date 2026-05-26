@@ -1,0 +1,6 @@
+# FOMO fallback — roofing vertical
+# Used when kill-switch is YELLOW and vertical=roofing
+version: 1
+body: |
+  {first_name}, a roofing contractor just moved on a storm lead in {zip_code}.
+  {active_lead_count} leads still open. Tap to see them. {unlock_link}

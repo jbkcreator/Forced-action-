@@ -5,7 +5,7 @@ These verify:
   - seed_subscriber creates + tears down correctly
   - clock helpers work through the `freeze_at` re-export
   - dispatch() routes events through the supervisor
-  - read_outbox / read_agent_decisions round-trip against the real DB
+  - read_agent_decisions round-trips against the real DB
 
 Once this passes we know the harness is ready for real scenario tests.
 """
@@ -17,11 +17,9 @@ import pytest
 from tests.scenarios.helpers import (
 	advance_by,
 	assert_agent_decision,
-	clear_outbox,
 	dispatch,
 	freeze_at,
 	read_agent_decisions,
-	read_outbox,
 )
 
 
@@ -60,11 +58,10 @@ def test_dispatch_routes_unknown_event(seed_subscriber):
 	assert decisions[0].terminal_status == "aborted"
 
 
-def test_fomo_scenario_writes_outbox_and_audit(seed_subscriber):
+def test_fomo_scenario_writes_audit(seed_subscriber):
 	"""
 	Minimal Cora scenario: seed subscriber, dispatch FOMO event, assert
-	outbox + agent_decisions. Claude mocked, send_sms goes through the
-	sandbox path writing to sandbox_outbox.
+	agent_decisions. Claude mocked, send_sms goes through the dry-run path.
 	"""
 	sub = seed_subscriber(name="Mike Harness", vertical="public_adjusters")
 
@@ -95,38 +92,6 @@ def test_fomo_scenario_writes_outbox_and_audit(seed_subscriber):
 	assert result["outcome"] == "routed"
 	assert result["graph_name"] == "fomo"
 
-	outbox = read_outbox(subscriber_id=sub.id)
-	assert len(outbox) >= 1
-	latest = outbox[0]
-	assert latest.channel == "sms"
-	assert latest.campaign == "fomo_competitor_action"
-	assert latest.compliance_allowed is True
-	assert latest.would_have_delivered is True
-
 	decision = assert_agent_decision(sub.id, graph="fomo", terminal_status="completed")
 	assert decision.tokens_used > 0
 	assert float(decision.cost_usd) > 0
-
-
-def test_clear_outbox_removes_captured_rows(seed_subscriber):
-	sub = seed_subscriber()
-
-	fake = {
-		"text": "hi", "model": "haiku",
-		"input_tokens": 5, "output_tokens": 2, "cost_usd": 0.00001,
-	}
-	with patch(
-		"src.agents.subgraphs.compose_and_send.call_claude_with_usage",
-		return_value=fake,
-	):
-		dispatch({
-			"event_type": "competitor_acted_on_lead",
-			"subscriber_id": sub.id,
-			"payload": {
-				"zip_code": "33647", "vertical": "roofing", "lead_tier": "Gold",
-			},
-		})
-
-	assert len(read_outbox(sub.id)) >= 1
-	clear_outbox(subscriber_id=sub.id)
-	assert read_outbox(sub.id) == []

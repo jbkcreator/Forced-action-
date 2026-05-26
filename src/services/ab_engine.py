@@ -143,7 +143,29 @@ def should_rollback(test_name: str, db: Session) -> bool:
     return abs(z) > 2.0 and (p_a < p_b)  # variant A is losing by >2 std devs
 
 
-def complete_test(test_name: str, winner: str, db: Session) -> None:
+def complete_test(
+    test_name: str,
+    winner: str,
+    db: Session,
+    *,
+    source_actor: str = "cora",
+) -> None:
+    """Close out an A/B test by recording the winner and writing a
+    `cora_playbook` recommendation row.
+
+    The `source_actor` kwarg attributes who decided the test was over:
+      - 'cora' (default) — called automatically by `ab_rollback_check`
+                           when the Z-test triggers. Drives Metric 5
+                           "net new playbooks Cora authored."
+      - <operator handle> — called manually from an admin endpoint or
+                            an operator script. Attributes the playbook
+                            to the real human actor so Metric 5 doesn't
+                            double-count human decisions as Cora's.
+
+    The playbook row writes through `playbook_writer.upsert_recommendation`,
+    which dedupes by source_key (so re-running ab_rollback_check on a
+    test that already has a recommendation silently skips).
+    """
     test = db.execute(
         select(AbTest).where(AbTest.test_name == test_name)
     ).scalar_one_or_none()
@@ -153,3 +175,25 @@ def complete_test(test_name: str, winner: str, db: Session) -> None:
     test.winner = winner
     test.ended_at = datetime.now(timezone.utc)
     db.flush()
+
+    # fa036 — write a `cora_playbook` recommendation row for the winning
+    # variant. Status stays 'recommended' until a human adopts via the
+    # admin endpoint (no auto-promote — pinned decision #1).
+    from src.services.playbook_writer import upsert_recommendation
+    upsert_recommendation(
+        db,
+        name=f"ab_winner:{test_name}",
+        description=(
+            f"A/B test {test_name} winner '{winner}' — recommend promoting "
+            f"variant_{winner} to default"
+        ),
+        pattern={
+            "test_name": test_name,
+            "winner": winner,
+            "variant": test.variant_b if winner == "b" else test.variant_a,
+            "segment": test.segment,
+        },
+        source_type="ab_test",
+        source_id=test_name,
+        authored_by=source_actor,
+    )

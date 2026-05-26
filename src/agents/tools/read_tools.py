@@ -92,7 +92,7 @@ def get_segment_and_score(
 	subscriber_id: int,
 	session: Optional[Session] = None,
 ) -> Dict[str, Any]:
-	"""Return the subscriber's current bucket and 0–100 revenue signal score."""
+	"""Return the subscriber's current bucket, 0–100 revenue signal score, and fa037 freshness fields."""
 	with _session(session) as s:
 		seg = (
 			s.query(UserSegment)
@@ -100,10 +100,26 @@ def get_segment_and_score(
 			.first()
 		)
 		if seg is None:
-			return {"segment": "new", "revenue_signal_score": 0, "classified_at": None}
+			return {
+				"segment": "new",
+				"revenue_signal_score": 0,
+				"revenue_signal_band": None,
+				"last_significant_action_at": None,
+				"revenue_signal_last_action": None,
+				"classified_at": None,
+				"reason": None,
+			}
 		return {
 			"segment": seg.segment,
 			"revenue_signal_score": int(seg.revenue_signal_score or 0),
+			# fa037 explainability fields (nullable until score-update event writes them)
+			"revenue_signal_band": getattr(seg, "revenue_signal_band", None),
+			"last_significant_action_at": (
+				seg.last_significant_action_at.isoformat()
+				if getattr(seg, "last_significant_action_at", None)
+				else None
+			),
+			"revenue_signal_last_action": getattr(seg, "revenue_signal_last_action", None),
 			"classified_at": seg.last_classified_at.isoformat() if seg.last_classified_at else None,
 			"reason": seg.classification_reason,
 		}

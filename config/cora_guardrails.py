@@ -110,8 +110,31 @@ EXPANSION_GATES = {
 # Red for 7 days after adjustment → kill or pivot.
 
 KILL_SWITCH = {
-    "first_payment_rate":  {"green": 30, "yellow": (20, 30), "red": 20, "action": "simplify proof, cut friction"},
-    "saved_card_rate":     {"green": 70, "yellow": (50, 70), "red": 50, "action": "default harder, bonus credits"},
+    "first_payment_rate":  {
+        "green": 30, "yellow": (20, 30), "red": 20,
+        "action": "simplify proof, cut friction",
+        # fa034 self-healing knobs. first_payment_rate touches the checkout
+        # funnel + pricing — too sensitive for autonomous action. At 48hr
+        # in red Cora opens an incident, posts Slack, surfaces in Revenue
+        # Pulse; human decides. Never auto-pauses or auto-falls-back.
+        "duration_hours_for_action": 48,
+        "auto_action_type": "human_escalated",
+        "fallback_feature_flag": None,
+        "requires_approval": True,
+        "kill_after_red_days": 7,
+        # Metric direction: higher is better. A drop BELOW threshold is bad.
+        "direction": "higher_is_better",
+    },
+    "saved_card_rate":     {
+        "green": 70, "yellow": (50, 70), "red": 50,
+        "action": "default harder, bonus credits",
+        "duration_hours_for_action": 48,
+        "auto_action_type": "human_escalated",
+        "fallback_feature_flag": None,
+        "requires_approval": True,
+        "kill_after_red_days": 7,
+        "direction": "higher_is_better",
+    },
     "wallet_adoption":     {
         "green": 15, "yellow": (10, 15), "red": 10,
         "action": "trigger sooner, missing-leads frame",
@@ -120,16 +143,125 @@ KILL_SWITCH = {
         # kill_switch_metric_ingest flips Redis kill_switch:accelerated_wallet_push=red.
         "floor_pct": 12,
         "floor_check_after_days": 35,
+        # fa034 self-healing: wallet adoption tolerates auto-fallback —
+        # downgrading accelerated_wallet_push to its baseline triggers is
+        # reversible and doesn't touch pricing.
+        "duration_hours_for_action": 48,
+        "auto_action_type": "fallback_enabled",
+        "fallback_feature_flag": "accelerated_wallet_push_paused",
+        "requires_approval": False,
+        "kill_after_red_days": 7,
+        "direction": "higher_is_better",
     },
-    "lock_conversion":     {"green": 5,  "yellow": (3, 5),   "red": 3,  "action": "live-data close, voice drop, urgency"},
-    "retention_30d":       {"green": 70, "yellow": (55, 70), "red": 55, "action": "earlier saves, missed-opp summaries"},
-    "sms_reply_rate":      {"green": 8,  "yellow": (5, 8),   "red": 5,  "action": "swap copy, change timing"},
-    "cac_paid_channels":   {"green": 25, "yellow": (25, 40), "red": 40, "action": "pause channel, fix targeting"},
-    "free_tier_cost_ratio": {"green": 40, "yellow": (40, 50), "red": 50, "action": "tighten free cap, earlier wall"},
+    "lock_conversion":     {
+        "green": 5,  "yellow": (3, 5),   "red": 3,
+        "action": "live-data close, voice drop, urgency",
+        # Auto-fallback drops Cora to static template SMS for the lock
+        # close path, away from Claude-composed copy. Reversible.
+        "duration_hours_for_action": 48,
+        "auto_action_type": "fallback_enabled",
+        "fallback_feature_flag": "lock_close_use_fallback",
+        "requires_approval": False,
+        "kill_after_red_days": 7,
+        "direction": "higher_is_better",
+    },
+    "retention_30d":       {
+        "green": 70, "yellow": (55, 70), "red": 55,
+        "action": "earlier saves, missed-opp summaries",
+        # Retention drift is structural — needs human attention, not a
+        # mid-stream automated fix.
+        "duration_hours_for_action": 72,    # slower-moving metric
+        "auto_action_type": "human_escalated",
+        "fallback_feature_flag": None,
+        "requires_approval": True,
+        "kill_after_red_days": 14,           # longer kill window
+        "direction": "higher_is_better",
+    },
+    "sms_reply_rate":      {
+        "green": 8,  "yellow": (5, 8),   "red": 5,
+        "action": "swap copy, change timing",
+        # Reply-rate drop = copy/timing issue. Fallback to static template
+        # is the spec-approved automatic response.
+        "duration_hours_for_action": 48,
+        "auto_action_type": "fallback_enabled",
+        "fallback_feature_flag": "cora_use_static_copy",
+        "requires_approval": False,
+        "kill_after_red_days": 7,
+        "direction": "higher_is_better",
+    },
+    "cac_paid_channels":   {
+        "green": 25, "yellow": (25, 40), "red": 40,
+        "action": "pause channel, fix targeting",
+        # CAC blow-up triggers human review — pausing a channel is a real
+        # business decision, not a copy change. Direction: LOWER is better.
+        "duration_hours_for_action": 168,   # 7 days per spec
+        "auto_action_type": "human_escalated",
+        "fallback_feature_flag": None,
+        "requires_approval": True,
+        "kill_after_red_days": 7,
+        "direction": "lower_is_better",
+    },
+    "free_tier_cost_ratio": {
+        "green": 40, "yellow": (40, 50), "red": 50,
+        "action": "tighten free cap, earlier wall",
+        # KNOWN GAP: free_tier_cost_ratio is not currently computed by
+        # kill_switch_metric_ingest (no cost-allocation table). The guardrail
+        # remains in place so when data becomes available, the self-healing
+        # job will start enforcing it automatically.
+        "duration_hours_for_action": 72,
+        "auto_action_type": "human_escalated",
+        "fallback_feature_flag": None,
+        "requires_approval": True,
+        "kill_after_red_days": 14,
+        "direction": "lower_is_better",
+    },
     # SMS unit-cost guardrail. Calibrated to Telnyx pricing ($0.004/segment, May 2026),
     # which is ~52% cheaper than the Twilio rate this guardrail was originally tuned for.
     # GREEN ≤$1/signup, YELLOW $1–2, RED >$2.
-    "sms_cost_per_signup": {"green": 1, "yellow": (1, 2),  "red": 2,  "action": "pause offending sequence"},
+    "sms_cost_per_signup": {
+        "green": 1, "yellow": (1, 2),  "red": 2,
+        "action": "pause offending sequence",
+        # KNOWN GAP: per-message cost not tracked on MessageOutcome since
+        # the project moved to Telnyx (May 2026). Guardrail kept for when
+        # cost data becomes available.
+        "duration_hours_for_action": 48,
+        "auto_action_type": "human_escalated",
+        "fallback_feature_flag": None,
+        "requires_approval": True,
+        "kill_after_red_days": 7,
+        "direction": "lower_is_better",
+    },
+    "offer_acceptance_rate": {
+        # Wallet-push offers + bundle offers. Spec example: drop from 35% → 12%.
+        # Below 15% is yellow, below 10% is red.
+        "green": 15, "yellow": (10, 15), "red": 10,
+        "action": "swap variants, lower friction",
+        "duration_hours_for_action": 48,
+        "auto_action_type": "fallback_enabled",
+        "fallback_feature_flag": "offer_use_baseline_template",
+        "requires_approval": False,
+        "kill_after_red_days": 7,
+        "direction": "higher_is_better",
+    },
+}
+
+
+# ── fa034 Cora self-healing — rate limits and global knobs ──────────────────
+# Safety rails on the hourly self-healing job. Reads these at the top of every
+# run; aborts (with a WARN log) when a limit is hit.
+CORA_SELF_HEALING = {
+    # Max number of automatic-actions taken in a single run (across all metrics).
+    # Prevents a multi-metric breach from triggering a cascade of changes Cora
+    # can't reason about in one pass.
+    "max_actions_per_run": 3,
+    # Cap on kill-recommendation rows per day. A "kill" is a Slack message
+    # asking Josh to disable a feature; one per day is plenty for human review.
+    "max_feature_kill_recommendations_per_day": 1,
+    # Cap on new incidents opened per hour — prevents a metric storm from
+    # opening 50 nearly-identical rows.
+    "max_new_incidents_per_hour": 5,
+    # Baseline window for compute_baseline() in kill_switch_metric_ingest.
+    "baseline_window_days": 7,
 }
 
 

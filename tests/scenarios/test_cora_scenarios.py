@@ -3,9 +3,8 @@ Cora scenario suite — priority-list graphs tested end-to-end.
 
 Each scenario seeds a realistic subscriber into the DB, dispatches the
 trigger event through the Cora supervisor, and asserts the effects are
-visible in three tables:
+visible in two tables:
 
-  - sandbox_outbox     (SMS Cora tried to send)
   - agent_decisions    (Cora's audit trail)
   - message_outcomes   (platform attribution)
 
@@ -24,7 +23,6 @@ from tests.scenarios.helpers import (
 	dispatch,
 	freeze_at,
 	read_agent_decisions,
-	read_outbox,
 )
 
 
@@ -98,7 +96,6 @@ def test_scenario_1_baseline_no_graph_events_no_outbox(seed_subscriber):
 	sub = seed_subscriber(name="Mike Baseline", vertical="roofing")
 	freeze_at("2026-05-01T10:00:00Z")
 
-	assert read_outbox(sub.id) == []
 	assert read_agent_decisions(sub.id) == []
 
 
@@ -131,14 +128,6 @@ def test_scenario_2_abandonment_wave1_recovers_signup(
 	})
 	assert result["outcome"] == "routed"
 	assert result["graph_name"] == "abandonment_wave1"
-
-	# Outbox has exactly one SMS attributed to wave1
-	outbox = read_outbox(sub.id, campaign="abandonment_wave1")
-	assert len(outbox) == 1
-	body = outbox[0].body
-	assert len(body) <= 320   # at most 2 SMS segments
-	assert outbox[0].compliance_allowed is True
-	assert outbox[0].would_have_delivered is True
 
 	# Audit: single Wave 1 decision marked completed
 	decision = assert_agent_decision(
@@ -177,12 +166,6 @@ def test_scenario_5_fomo_competitor_triggers_nudge(
 	assert result["outcome"] == "routed"
 	assert result["graph_name"] == "fomo"
 
-	outbox = read_outbox(sub.id, campaign="fomo_competitor_action")
-	assert len(outbox) == 1
-	# FOMO uses Haiku → body will be short and reference the context
-	body = outbox[0].body
-	assert len(body) <= 200
-
 	decision = assert_agent_decision(
 		sub.id, graph="fomo", terminal_status="completed",
 	)
@@ -214,12 +197,6 @@ def test_scenario_7_retention_wallet_summary(
 	assert result["outcome"] == "routed"
 	assert result["graph_name"] == "retention"
 
-	outbox = read_outbox(sub.id)
-	assert len(outbox) == 1
-	assert outbox[0].campaign == "retention_summary_wallet"
-	# Retention body may be 2 SMS segments (<= 320 chars)
-	assert len(outbox[0].body) <= 400
-
 	decision = assert_agent_decision(
 		sub.id, graph="retention", terminal_status="completed",
 	)
@@ -246,9 +223,6 @@ def test_scenario_8_retention_skips_churned_subscriber(seed_subscriber):
 		"payload": {"tier": "wallet"},
 	})
 	assert result["outcome"] == "routed"
-
-	# No outbox row
-	assert read_outbox(sub.id) == []
 
 	# Audit row present but aborted
 	decision = assert_agent_decision(

@@ -136,6 +136,13 @@ def _node_finalize(state: HumanCloseState) -> HumanCloseState:
                 "routed": state.get("routed"),
                 "failure_reason": state.get("failure_reason"),
             },
+            # fa036 — human close routing is Cora handing the lead to a
+            # human closer. Classify as approval_required so Metric 1
+            # (% autonomous) doesn't double-count it as autonomous.
+            # HumanCloseEscalation.outcome (won/lost/no_response) is
+            # recorded separately and can later populate approved_at.
+            autonomy_class="approval_required",
+            requires_approval=True,
         )
     except Exception:
         pass

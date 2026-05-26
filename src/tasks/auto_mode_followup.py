@@ -75,7 +75,12 @@ def run(dry_run: bool = False) -> dict:
                 outcome.clicked_at = now   # mark "vm dispatched"
                 db.flush()
                 from src.services.segmentation_engine import reclassify_safe
-                reclassify_safe(sub.id, db)
+                from src.services.revenue_signal import ACTION_AUTO_MODE_SMS_SENT
+                reclassify_safe(
+                    sub.id, db,
+                    action_type=ACTION_AUTO_MODE_SMS_SENT,
+                    metadata={"outcome_id": outcome.id},
+                )
                 stats["vm_triggered"] += 1
             except Exception as exc:
                 logger.error(

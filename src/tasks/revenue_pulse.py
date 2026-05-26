@@ -14,7 +14,7 @@ import logging
 import sys
 from datetime import date, datetime, timedelta, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text as sa_text
 from sqlalchemy.orm import Session
 
 from config.revenue_pulse import (
@@ -93,10 +93,18 @@ def _compose_daily(db: Session) -> str:
         else "no deals"
     )
 
-    card = db.execute(
-        select(LearningCard).order_by(LearningCard.card_date.desc()).limit(1)
-    ).scalar_one_or_none()
-    alert_str = (card.summary_text[:55] + "…") if card and len(card.summary_text) > 55 else (card.summary_text if card else "no alerts")
+    # fa034: the "alert" slot in the daily pulse prefers an unresolved
+    # Cora incident over a learning-card snippet. If no incidents are open,
+    # fall back to the latest learning card as before.
+    alert_str = _format_cora_incident_alert(db)
+    if alert_str is None:
+        card = db.execute(
+            select(LearningCard).order_by(LearningCard.card_date.desc()).limit(1)
+        ).scalar_one_or_none()
+        alert_str = (
+            (card.summary_text[:55] + "…") if card and len(card.summary_text) > 55
+            else (card.summary_text if card else "no alerts")
+        )
 
     kill = _kill_switch_status(db)
 
@@ -140,7 +148,7 @@ def _compose_weekly(db: Session) -> str:
     ).scalar_one_or_none()
     learning_str = card.summary_text[:75] if card else "no card"
 
-    return WEEKLY_PULSE_TEMPLATE.format(
+    body = WEEKLY_PULSE_TEMPLATE.format(
         week=now.strftime("%W"),
         revenue=f"{est_revenue:,}",
         new_subs=new_subs,
@@ -148,6 +156,119 @@ def _compose_weekly(db: Session) -> str:
         kill_switch=kill["status"],
         kill_label=kill["label"],
         learning=learning_str,
+    )
+
+    # fa034: append a one-line Cora incidents summary if there's room.
+    incidents_line = _format_cora_incidents_weekly_summary(db)
+    if incidents_line:
+        candidate = f"{body}\nIncidents 7d: {incidents_line}"
+        if len(candidate) <= MAX_DAILY_SMS_CHARS:
+            body = candidate
+
+    # fa036: append a one-line Cora autonomy summary from the latest
+    # autonomy_summary learning card (written by cora_autonomy_report at
+    # Monday 08:45 UTC, 15 min before this task at 09:00). Defensively
+    # truncated if it would blow the SMS budget — same pattern as the
+    # incidents line.
+    autonomy_line = _format_cora_autonomy_weekly_summary(db)
+    if autonomy_line:
+        candidate = f"{body}\n{autonomy_line}"
+        if len(candidate) <= MAX_DAILY_SMS_CHARS:
+            body = candidate
+    return body
+
+
+# ── fa034 helpers — pure raw SQL, no ORM ────────────────────────────────────
+
+def _format_cora_incident_alert(db: Session) -> str | None:
+    """Return a 140-char alert string built from the latest unresolved
+    cora_incident, or None if no incident is open.
+
+    Prioritizes severity=red over yellow, then most recent breach_started.
+    """
+    row = db.execute(sa_text("""
+        SELECT metric_name, severity, observed_value, threshold_value,
+               action_taken, breach_started, county_id
+        FROM cora_incident
+        WHERE breach_resolved IS NULL
+        ORDER BY (severity = 'red') DESC, breach_started DESC
+        LIMIT 1
+    """)).first()
+    if row is None:
+        return None
+    # Format compactly: "[RED] first_payment_rate 18 (thr 20) — fallback_enabled"
+    sev = (row.severity or "?").upper()
+    metric = row.metric_name or "?"
+    obs = row.observed_value
+    thr = row.threshold_value
+    act = row.action_taken or "no_op"
+    pieces = [f"[{sev}] {metric}"]
+    if obs is not None and thr is not None:
+        pieces.append(f"{obs} (thr {thr})")
+    if act and act != "no_op":
+        pieces.append(act)
+    text = " — ".join(pieces)
+    return text[:140]
+
+
+def _format_cora_autonomy_weekly_summary(db: Session) -> str | None:
+    """Return a one-line summary built from the latest autonomy_summary
+    learning card (written by src/tasks/cora_autonomy_report.py), or None
+    if no card exists yet.
+
+    Honest about missing data: null metrics render as 'n/a', not '0' —
+    so a fresh deploy with no classified decisions shows the gap clearly
+    instead of faking a feel-good 0%.
+
+    Example output:
+        "Cora autonomy: 72% autonomous, 3% overridden, 4 adopted, +2 net playbooks"
+        "Cora autonomy: n/a autonomous, n/a overridden, 0 adopted, +0 net playbooks"
+    """
+    row = db.execute(sa_text("""
+        SELECT data_json FROM learning_cards
+        WHERE card_type = 'autonomy_summary'
+        ORDER BY card_date DESC
+        LIMIT 1
+    """)).first()
+    if row is None or not row.data_json:
+        return None
+    d = row.data_json
+
+    def pct(v):
+        return f"{v}%" if v is not None else "n/a"
+
+    net = d.get("net_new_playbooks", 0)
+    return (
+        f"Cora autonomy: {pct(d.get('autonomous_pct'))} autonomous, "
+        f"{pct(d.get('overridden_pct'))} overridden, "
+        f"{d.get('recommended_adoptions', 0)} adopted, "
+        f"{net:+d} net playbooks"
+    )
+
+
+def _format_cora_incidents_weekly_summary(db: Session) -> str | None:
+    """Return a one-line counts summary or None if no incident activity
+    in the last 7 days.
+
+    Example output: "2 red / 4 yellow open, 3 resolved, 1 kill-pending"
+    """
+    row = db.execute(sa_text("""
+        SELECT
+            COUNT(*) FILTER (WHERE severity='red'    AND breach_resolved IS NULL) AS red_open,
+            COUNT(*) FILTER (WHERE severity='yellow' AND breach_resolved IS NULL) AS yellow_open,
+            COUNT(*) FILTER (WHERE breach_resolved >= NOW() - INTERVAL '7 days') AS resolved_7d,
+            COUNT(*) FILTER (WHERE action_taken='feature_killed'
+                              AND created_at >= NOW() - INTERVAL '7 days')        AS kill_pending_7d
+        FROM cora_incident
+    """)).first()
+    if row is None:
+        return None
+    total = (row.red_open or 0) + (row.yellow_open or 0) + (row.resolved_7d or 0) + (row.kill_pending_7d or 0)
+    if total == 0:
+        return None
+    return (
+        f"{row.red_open or 0} red / {row.yellow_open or 0} yellow open, "
+        f"{row.resolved_7d or 0} resolved, {row.kill_pending_7d or 0} kill-pending"
     )
 
 

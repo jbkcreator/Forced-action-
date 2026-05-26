@@ -129,6 +129,12 @@ def record_opt_out(
     """
     Add a phone number to the suppression list.
     Safe to call multiple times — uses INSERT ... ON CONFLICT DO NOTHING.
+
+    fa037 — also fires a Revenue Signal Score update with
+    action_type=ACTION_SMS_OPT_OUT so the score reflects the disengagement
+    immediately and a clean audit row lands in revenue_signal_score_events.
+    Wrapped in try so a score-write failure cannot block the suppression
+    write (TCPA compliance must always win).
     """
     phone = _normalize(phone)
     if not phone:
@@ -145,6 +151,42 @@ def record_opt_out(
         opted_out_at=datetime.now(timezone.utc),
     ))
     db.flush()
+
+    # fa037 — Revenue Signal Score hook. Resolve the subscriber via the
+    # existing SmsOptIn → Subscriber lookup pattern (mirrors
+    # sms_commands._find_subscriber). Best-effort: phones imported from
+    # external DNC lists may not map to any subscriber, in which case we
+    # skip silently.
+    try:
+        from src.core.models import SmsOptIn, Subscriber
+        row = db.execute(
+            select(SmsOptIn)
+            .where(SmsOptIn.phone == phone)
+            .order_by(SmsOptIn.opted_in_at.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        sub_id: Optional[int] = None
+        if row is not None and row.subscriber_id is not None:
+            sub_id = row.subscriber_id
+        else:
+            sub = db.execute(
+                select(Subscriber).where(Subscriber.phone == phone)
+            ).scalar_one_or_none()
+            if sub is not None:
+                sub_id = sub.id
+        if sub_id is not None:
+            from src.services.segmentation_engine import reclassify_safe
+            from src.services.revenue_signal import ACTION_SMS_OPT_OUT
+            reclassify_safe(
+                sub_id, db,
+                action_type=ACTION_SMS_OPT_OUT,
+                metadata={"source": source, "keyword": keyword.upper()[:20]},
+            )
+    except Exception:
+        logger.warning(
+            "record_opt_out: revenue signal update failed for phone=%s",
+            phone, exc_info=True,
+        )
 
 
 def add_to_dead_letter(
@@ -225,12 +267,6 @@ def send_sms(
         logger.info("SMS suppressed (opt-out): to=%s", to)
         add_to_dead_letter(to, "opt_out", {"body": body[:160]}, db)
         _log("suppressed", suppress_reason="opt_out")
-        _capture_sandbox_attempt(
-            db=db, to=to, body=body, subscriber_id=subscriber_id,
-            campaign=campaign_label, variant_id=variant_id, decision_id=decision_id,
-            compliance_allowed=False, compliance_reason="opt_out",
-            would_have_delivered=False,
-        )
         return False
 
     # 2. Opt-in gate — marketing requires confirmed consent
@@ -238,12 +274,6 @@ def send_sms(
         logger.info("SMS suppressed (no opt-in): to=%s", to)
         add_to_dead_letter(to, "no_opt_in", {"body": body[:160]}, db)
         _log("suppressed", suppress_reason="no_opt_in")
-        _capture_sandbox_attempt(
-            db=db, to=to, body=body, subscriber_id=subscriber_id,
-            campaign=campaign_label, variant_id=variant_id, decision_id=decision_id,
-            compliance_allowed=False, compliance_reason="no_opt_in",
-            would_have_delivered=False,
-        )
         return False
 
     # 3. Per-subscriber marketing frequency cap — applied globally regardless of campaign.
@@ -256,12 +286,6 @@ def send_sms(
             )
             add_to_dead_letter(to, "subscriber_sms_frequency_cap", {"body": body[:160]}, db)
             _log("suppressed", suppress_reason="subscriber_sms_frequency_cap")
-            _capture_sandbox_attempt(
-                db=db, to=to, body=body, subscriber_id=subscriber_id,
-                campaign=campaign_label, variant_id=variant_id, decision_id=decision_id,
-                compliance_allowed=False, compliance_reason="subscriber_sms_frequency_cap",
-                would_have_delivered=False,
-            )
             return False
 
     # 5. TCPA quiet hours — no SMS before 8am or after 9pm recipient local time.
@@ -271,24 +295,12 @@ def send_sms(
         logger.info("SMS suppressed (quiet hours): to=%s", to)
         add_to_dead_letter(to, "quiet_hours", {"body": body[:160]}, db)
         _log("suppressed", suppress_reason="quiet_hours")
-        _capture_sandbox_attempt(
-            db=db, to=to, body=body, subscriber_id=subscriber_id,
-            campaign=campaign_label, variant_id=variant_id, decision_id=decision_id,
-            compliance_allowed=False, compliance_reason="quiet_hours",
-            would_have_delivered=False,
-        )
         return False
 
     # 6. Dry-run path (TELNYX_SMS_ENABLED=false)
     if not settings.telnyx_sms_enabled:
         logger.info("[DRY RUN] SMS to=%s body=%r", to, body[:160])
         _log("dry_run")
-        _capture_sandbox_attempt(
-            db=db, to=to, body=body, subscriber_id=subscriber_id,
-            campaign=campaign_label, variant_id=variant_id, decision_id=decision_id,
-            compliance_allowed=True, compliance_reason="ok",
-            would_have_delivered=True,
-        )
         return True
 
     # 7. Telnyx misconfiguration — live mode but creds missing
@@ -300,12 +312,6 @@ def send_sms(
         logger.error("Telnyx not configured — cannot send SMS to %s", to)
         add_to_dead_letter(to, "error", {"body": body[:160], "error": "telnyx_not_configured"}, db)
         _log("failed", suppress_reason="error")
-        _capture_sandbox_attempt(
-            db=db, to=to, body=body, subscriber_id=subscriber_id,
-            campaign=campaign_label, variant_id=variant_id, decision_id=decision_id,
-            compliance_allowed=True, compliance_reason="ok",
-            would_have_delivered=False,
-        )
         return False
 
     # 8. Real Telnyx dispatch
@@ -314,73 +320,17 @@ def send_sms(
         vendor_message_id = result.get("message_id")
         logger.info("SMS sent: id=%s to=%s status=%s", vendor_message_id, to, result.get("status"))
         _log("sent", vendor_message_id=vendor_message_id)
-        _capture_sandbox_attempt(
-            db=db, to=to, body=body, subscriber_id=subscriber_id,
-            campaign=campaign_label, variant_id=variant_id, decision_id=decision_id,
-            compliance_allowed=True, compliance_reason="ok",
-            would_have_delivered=True,
-        )
         return True
     except TelnyxSMSError as exc:
         logger.error("Telnyx send failed: to=%s error=%s", to, exc)
         add_to_dead_letter(to, "delivery_failed", {"body": body[:160], "error": str(exc)}, db)
         _log("failed")
-        _capture_sandbox_attempt(
-            db=db, to=to, body=body, subscriber_id=subscriber_id,
-            campaign=campaign_label, variant_id=variant_id, decision_id=decision_id,
-            compliance_allowed=True, compliance_reason="ok",
-            would_have_delivered=False,
-        )
         return False
     except Exception as exc:
         logger.exception("Unexpected SMS send failure: to=%s error=%s", to, exc)
         add_to_dead_letter(to, "delivery_failed", {"body": body[:160], "error": str(exc)}, db)
         _log("failed")
-        _capture_sandbox_attempt(
-            db=db, to=to, body=body, subscriber_id=subscriber_id,
-            campaign=campaign_label, variant_id=variant_id, decision_id=decision_id,
-            compliance_allowed=True, compliance_reason="ok",
-            would_have_delivered=False,
-        )
         return False
-
-
-def _capture_sandbox_attempt(
-    *,
-    db: Session,
-    to: Optional[str],
-    body: str,
-    subscriber_id: Optional[int],
-    campaign: Optional[str],
-    variant_id: Optional[str],
-    decision_id: Optional[str],
-    compliance_allowed: bool,
-    compliance_reason: str,
-    would_have_delivered: bool,
-) -> None:
-    """Write one sandbox_outbox row when TELNYX_SANDBOX is enabled. No-op otherwise."""
-    if not settings.telnyx_sandbox:
-        return
-    try:
-        from src.core.models import SandboxOutbox  # local import to avoid cycle
-        row = SandboxOutbox(
-            channel="sms",
-            to_number=to,
-            body=body,
-            campaign=campaign,
-            variant_id=variant_id,
-            subscriber_id=subscriber_id,
-            decision_id=decision_id,
-            compliance_allowed=compliance_allowed,
-            compliance_reason=compliance_reason,
-            would_have_delivered=would_have_delivered,
-            sandbox_flag="telnyx_sandbox",
-        )
-        db.add(row)
-        db.flush()
-    except Exception as exc:
-        # Sandbox capture must never break real dispatch. Log and carry on.
-        logger.warning("sandbox_outbox capture failed: %s", exc)
 
 
 # TCPA opt-in consent prompt — sent to new numbers before any proactive outbound SMS

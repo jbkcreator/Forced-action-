@@ -1,8 +1,7 @@
 """
 Scenario driver helpers.
 
-Thin wrappers around dispatch_event / DB queries / outbox reads so scenario
-tests read like narratives.
+Thin wrappers around dispatch_event / DB queries so scenario tests read like narratives.
 
 Typical usage:
 
@@ -12,8 +11,6 @@ Typical usage:
 
 		dispatch({"event_type": "...", "subscriber_id": sub.id, "payload": {...}})
 
-		outbox = read_outbox(sub.id)
-		assert len(outbox) == 1
 		assert_agent_decision(sub.id, graph="fomo", terminal_status="completed")
 """
 
@@ -25,7 +22,7 @@ from sqlalchemy import desc
 
 from src.core import clock
 from src.core.database import db
-from src.core.models import AgentDecision, SandboxOutbox, SmsDeadLetter
+from src.core.models import AgentDecision, SmsDeadLetter
 
 
 # Re-export clock controls so scenario tests only import from one place.
@@ -42,45 +39,6 @@ def dispatch(event: Dict[str, Any]) -> Dict[str, Any]:
 	"""Route an event through the Cora supervisor. Returns the supervisor outcome dict."""
 	from src.agents.supervisor import dispatch_event
 	return dispatch_event(event)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Outbox readers
-# ──────────────────────────────────────────────────────────────────────────────
-
-def read_outbox(
-	subscriber_id: Optional[int] = None,
-	campaign: Optional[str] = None,
-	channel: Optional[str] = None,
-	limit: int = 50,
-) -> List[SandboxOutbox]:
-	"""Return sandbox_outbox rows, newest first, filtered as requested."""
-	with db.session_scope() as s:
-		q = s.query(SandboxOutbox)
-		if subscriber_id is not None:
-			q = q.filter(SandboxOutbox.subscriber_id == subscriber_id)
-		if campaign is not None:
-			q = q.filter(SandboxOutbox.campaign == campaign)
-		if channel is not None:
-			q = q.filter(SandboxOutbox.channel == channel)
-		rows = q.order_by(desc(SandboxOutbox.created_at)).limit(limit).all()
-		s.expunge_all()
-		return rows
-
-
-def last_outbox_body(subscriber_id: int) -> Optional[str]:
-	"""Most recent captured SMS body for a subscriber, or None."""
-	rows = read_outbox(subscriber_id=subscriber_id, limit=1)
-	return rows[0].body if rows else None
-
-
-def clear_outbox(subscriber_id: Optional[int] = None) -> None:
-	"""Remove captured rows for a subscriber (or all if None). Test hygiene helper."""
-	with db.session_scope() as s:
-		q = s.query(SandboxOutbox)
-		if subscriber_id is not None:
-			q = q.filter(SandboxOutbox.subscriber_id == subscriber_id)
-		q.delete(synchronize_session=False)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

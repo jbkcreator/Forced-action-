@@ -65,9 +65,6 @@ app.add_middleware(
 from src.api.admin_router import router as admin_router, get_current_admin  # noqa: E402
 app.include_router(admin_router)
 
-from src.api.sandbox_router import router as sandbox_router  # noqa: E402
-app.include_router(sandbox_router)
-
 # Mount React build assets (JS/CSS chunks) if the dist directory exists
 if REACT_DIST.is_dir() and (REACT_DIST / "assets").is_dir():
     app.mount("/assets", StaticFiles(directory=str(REACT_DIST / "assets")), name="react-assets")

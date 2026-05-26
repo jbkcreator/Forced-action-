@@ -74,10 +74,11 @@ VERTICAL_DISPLAY = {
 
 GOLD_PLUS_TIERS = {"Ultra Platinum", "Platinum", "Gold"}
 
-# Scrapers excluded from the top-level match-% summary.
-# Sunbiz does owner lookups; it never produces property-ID matches and
-# deflates the overall match rate on the days it runs.
-MATCH_PCT_EXCLUDE = {"sunbiz"}
+# Enrichment tasks that write to scraper_run_stats but are NOT signal scrapers.
+# Excluded from all ingest display and match-% calculations so a large PA refresh
+# or LLC enrichment run doesn't distort signal scraper numbers.
+ENRICHMENT_ONLY = {"sunbiz", "property_appraiser"}
+MATCH_PCT_EXCLUDE = ENRICHMENT_ONLY  # kept for backward compat with existing references
 
 # Maps scraper source_type → (Model, date_field, optional filter)
 # Used to compute newest record age per scraper.
@@ -116,7 +117,8 @@ def _build_scraper_section(session, run_date: date, county_id: str):
     )
     scraper_by_type = {r.source_type: r for r in scraper_rows}
     ordered = [t for t in SCRAPER_ORDER if t in scraper_by_type]
-    extras = sorted(t for t in scraper_by_type if t not in SCRAPER_ORDER)
+    # Never surface enrichment-only tasks (sunbiz, property_appraiser) as signal scrapers
+    extras = sorted(t for t in scraper_by_type if t not in SCRAPER_ORDER and t not in ENRICHMENT_ONLY)
 
     scraper_data = []
     total_scraped = total_matched = total_unmatched = 0
@@ -124,7 +126,7 @@ def _build_scraper_section(session, run_date: date, county_id: str):
 
     for source_type in ordered + extras:
         row = scraper_by_type[source_type]
-        if source_type not in MATCH_PCT_EXCLUDE:
+        if source_type not in ENRICHMENT_ONLY:
             total_scraped += row.total_scraped
             total_matched += row.matched
             total_unmatched += row.unmatched
@@ -157,6 +159,16 @@ def _build_scraper_section(session, run_date: date, county_id: str):
 
 
 def _build_scoring_section(session, run_date: date, county_id: str, errors: list):
+    """
+    Scoring counts (flow metrics) come from PlatformDailyStats — those are
+    today's run-batch deltas.
+
+    Tiers (stock metric) come from a DISTINCT-ON portfolio query against
+    distress_scores so both reports agree on "how many Gold+ exist right now."
+    PlatformDailyStats.tier_* only covers today's scored batch — using it for
+    the tier breakdown silently undercounts the standing pool and disagrees
+    with the weekly report.
+    """
     platform_row = (
         session.query(PlatformDailyStats)
         .filter(PlatformDailyStats.run_date == run_date, PlatformDailyStats.county_id == county_id)
@@ -170,19 +182,42 @@ def _build_scoring_section(session, run_date: date, county_id: str, errors: list
             "leads_updated":            platform_row.leads_updated,
             "leads_unchanged":          platform_row.leads_unchanged,
         }
-        tiers = {
-            "Ultra Platinum": platform_row.tier_ultra_platinum,
-            "Platinum":       platform_row.tier_platinum,
-            "Gold":           platform_row.tier_gold,
-            "Silver":         platform_row.tier_silver,
-            "Bronze":         platform_row.tier_bronze,
-        }
     else:
         scoring = {k: 0 for k in ("properties_scored", "properties_with_signals",
                                    "leads_new", "leads_updated", "leads_unchanged")}
-        tiers = {"Ultra Platinum": 0, "Platinum": 0, "Gold": 0, "Silver": 0, "Bronze": 0}
         errors.append("platform_daily_stats: no row found for this date")
+
+    tiers = _query_tier_snapshot(session, run_date, county_id)
     return scoring, tiers
+
+
+def _query_tier_snapshot(session, as_of: date, county_id: str) -> dict:
+    """
+    Full portfolio tier counts as of `as_of`.  DISTINCT ON picks each
+    property's latest score so multiple rescores in one day don't
+    double-count.  Mirrors the same helper in weekly_report so the two
+    reports agree on the tier breakdown.
+    """
+    rows = session.execute(
+        text("""
+            SELECT lead_tier, COUNT(*) AS cnt
+            FROM (
+                SELECT DISTINCT ON (property_id) lead_tier
+                FROM distress_scores
+                WHERE county_id = :county_id
+                  AND date(score_date) <= :as_of
+                ORDER BY property_id, score_date DESC
+            ) latest
+            WHERE lead_tier IS NOT NULL
+            GROUP BY lead_tier
+        """),
+        {"county_id": county_id, "as_of": str(as_of)},
+    ).fetchall()
+    tier_counts = {"Ultra Platinum": 0, "Platinum": 0, "Gold": 0, "Silver": 0, "Bronze": 0}
+    for tier, cnt in rows:
+        if tier in tier_counts:
+            tier_counts[tier] = int(cnt)
+    return tier_counts
 
 
 def _build_tier_history(session, run_date: date, county_id: str) -> list:
@@ -713,8 +748,8 @@ def write_csv(report: dict, path: Path) -> None:
             w.writerow([label, f"{report['scoring'][key]:,}"])
         w.writerow([])
 
-        # ── Section 3: Tier Breakdown (today) ─────────────────────────────
-        w.writerow(["TIER BREAKDOWN"])
+        # ── Section 3: Tier Breakdown (portfolio snapshot) ────────────────
+        w.writerow([f"TIER BREAKDOWN (full portfolio snapshot as of {report['run_date']})"])
         w.writerow(["Tier", "Count"])
         for tier, count in report["tiers"].items():
             w.writerow([tier, f"{count:,}"])
