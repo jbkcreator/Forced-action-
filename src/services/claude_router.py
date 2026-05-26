@@ -57,9 +57,8 @@ _TASK_ROUTING: dict[str, str] = {
     "email_copy":               "sonnet",
     "referral_milestone_sms":   "haiku",
     "referral_milestone_email": "sonnet",
-    # Concierge Chat (M5a)
-    "chat_intent":    "haiku",   # intent classifier — cheap, fast
-    "chat_response":  "sonnet",  # conversational reply — quality matters
+    # Concierge Chat
+    "chat_response":  "haiku",   # MD-grounded FAQ reply — Haiku is plenty
     # Opus — explicit override, edge cases only
     "edge_case": "opus",
 }
