@@ -1343,7 +1343,7 @@ class ScraperRunStats(Base):
             "'judgments', 'deeds', 'evictions', 'divorce_filings', 'probate', 'bankruptcy',"
             "'violations', 'foreclosures', 'permits', 'tax_delinquencies',"
             "'roofing_permits', 'storm_damage', 'flood_damage', 'insurance_claims', 'fire_incidents',"
-            "'sunbiz', 'property_appraiser'"
+            "'sunbiz', 'property_appraiser', 'dbpr_company'"
             ")",
             name="check_run_stats_source_type",
         ),
@@ -2738,6 +2738,13 @@ class DBPRContact(Base):
 
     vertical: Mapped[Optional[str]] = mapped_column(String(50), index=True)
 
+    # Company name (DBA) — scraped per-license from myfloridalicense.com (ADR 0003).
+    # Not in the bulk CSV extract. status: pending (not scraped) / found / none
+    # (license has no DBA) / failed (mismatch or error, retried next run).
+    company_name: Mapped[Optional[str]] = mapped_column(String(255))
+    company_name_status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    company_name_scraped_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
     email: Mapped[Optional[str]] = mapped_column(String(200))
     phone: Mapped[Optional[str]] = mapped_column(String(20))
     enrichment_status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
@@ -2766,6 +2773,11 @@ class DBPRContact(Base):
             "data_source IN ('certified', 'registered')",
             name="check_dbpr_data_source",
         ),
+        CheckConstraint(
+            "company_name_status IN ('pending', 'found', 'none', 'failed')",
+            name="check_dbpr_company_name_status",
+        ),
+        Index("ix_dbpr_company_name_status", "company_name_status"),
         Index("idx_dbpr_county_vertical", "county_id", "vertical"),
         Index("idx_dbpr_enrichment_status", "enrichment_status"),
         Index("idx_dbpr_email_status", "email_status"),
