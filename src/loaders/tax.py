@@ -1,19 +1,31 @@
 """
 Tax delinquency loader — optimised with bulk upsert and pre-loaded property maps.
+Version 2.0 — 2024-06-10
+
+Well-optimized loader for tax delinquency records with the following features:
+- Flexible field mapping via FIELD_ALIASES to handle varying source schemas.
+- County-specific parcel matching strategies with configurable transforms.
+- Pre-loading of property IDs for all unique parcel candidates to avoid per-row DB queries.
+- Bulk upsert of matched records with null-safe field updates to preserve existing data.
+- Batch quarantine of unmatched records into a separate table for later review. 
+
 """
 
+import json
 import logging
+import math
 import re
 from collections import OrderedDict
-from datetime import date
-from typing import Any, Optional, Tuple
+from datetime import date, datetime, timezone
+from typing import Any, Callable, Optional, Tuple
 
 import pandas as pd
-from sqlalchemy import String, bindparam, func, text
+from sqlalchemy import Integer, String, bindparam, func, text
 from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.loaders.base import BaseLoader
-from src.core.models import TaxDelinquency, CountySource, Property
+from src.core.models import TaxDelinquency, UnmatchedRecord
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +46,13 @@ class TaxDelinquencyLoader(BaseLoader):
             "source_field": "parcel_number",
             "transform": "none",
         },
+    }
+
+    # Registry of parcel transform functions. Add a new entry here to support
+    # a new county — no changes to _parcel_match_candidate needed.
+    _PARCEL_TRANSFORMS: dict[str, Callable[[str], Optional[str]]] = {
+        "none": lambda v: v,
+        "strip_alpha_prefix": lambda v: re.sub(r"^[A-Za-z]+", "", v).strip() or None,
     }
 
     FIELD_ALIASES: dict[str, tuple[str, ...]] = {
@@ -181,18 +200,15 @@ class TaxDelinquencyLoader(BaseLoader):
             return None
 
         candidate = str(candidate)
-        if transform == "none":
+        transform_fn = self._PARCEL_TRANSFORMS.get(transform)
+        if transform_fn is None:
+            logger.warning(
+                "Unknown tax parcel transform=%s for county=%s",
+                transform,
+                self.county_id,
+            )
             return candidate
-        if transform == "strip_alpha_prefix":
-            stripped = re.sub(r"^[A-Za-z]+", "", candidate).strip()
-            return stripped or None
-
-        logger.warning(
-            "Unknown tax parcel transform=%s for county=%s",
-            transform,
-            self.county_id,
-        )
-        return candidate
+        return transform_fn(candidate)
 
     @staticmethod
     def _chunks(values: set[str], size: int = 5000):
@@ -316,10 +332,10 @@ class TaxDelinquencyLoader(BaseLoader):
         col_mapping = self._resolve_column_mapping(csv_path)
         total_matched = total_updated = total_unmatched = 0
         chunk_count = 0
+        from src.loaders.column_mapper import ColumnMapper
         for chunk in pd.read_csv(csv_path, dtype=str, chunksize=5000):
             chunk_count += 1
             if col_mapping:
-                from src.loaders.column_mapper import ColumnMapper
                 chunk = ColumnMapper.apply(chunk, col_mapping)
             m, u, um = self.load_from_dataframe(chunk, skip_duplicates=skip_duplicates)
             total_matched += m
@@ -333,15 +349,17 @@ class TaxDelinquencyLoader(BaseLoader):
 
     def _resolve_column_mapping(self, csv_path: str) -> Optional[dict]:
         from src.loaders.column_mapper import ColumnMapper, SkipMapping, NeedsMappingError
-        src = self.session.query(CountySource).filter_by(
-            county_id=self.county_id, signal_type="tax_delinquency"
-        ).first()
-        if src is None:
+        src_row = self.session.execute(text("""
+            SELECT id FROM county_sources
+            WHERE county_id = :county_id AND signal_type = 'tax_delinquency'
+            LIMIT 1
+        """), {"county_id": self.county_id}).mappings().first()
+        if src_row is None:
             return None
         sample_df = pd.read_csv(csv_path, dtype=str, nrows=5)
         try:
             mapper = ColumnMapper()
-            return mapper.get_or_create("tax_delinquency", src.id, sample_df)
+            return mapper.get_or_create("tax_delinquency", src_row["id"], sample_df)
         except SkipMapping:
             return None
         except NeedsMappingError as e:
@@ -370,29 +388,10 @@ class TaxDelinquencyLoader(BaseLoader):
         """
         logger.info("Loading %d tax delinquency rows (county=%s)", len(df), self.county_id)
 
-        # ── Phase 1a: Pre-load existing (property_id, tax_year) keys ──────
-        existing_map: dict[tuple, int] = {}
-        if skip_duplicates:
-            rows = (
-                self.session.query(
-                    TaxDelinquency.id,
-                    TaxDelinquency.property_id,
-                    TaxDelinquency.tax_year,
-                )
-                .join(Property, Property.id == TaxDelinquency.property_id)
-                .filter(Property.county_id == self.county_id)
-                .all()
-            )
-            for td_id, prop_id, yr in rows:
-                existing_map[(prop_id, yr)] = td_id
-            logger.info("Pre-loaded %d existing tax delinquency keys", len(existing_map))
-
-        # Warn early if the county has zero properties
-        has_properties = self.session.query(
-            self.session.query(Property.id)
-            .filter(Property.county_id == self.county_id)
-            .exists()
-        ).scalar()
+        # ── Phase 1a: Warn early if the county has zero properties ───────
+        has_properties = self.session.execute(text("""
+            SELECT EXISTS (SELECT 1 FROM properties WHERE county_id = :county_id)
+        """), {"county_id": self.county_id}).scalar()
         if not has_properties:
             logger.warning(
                 "[TaxDelinquencyLoader] No properties found for county=%s — "
@@ -414,22 +413,24 @@ class TaxDelinquencyLoader(BaseLoader):
         exact_property_map, normalized_property_map = self._preload_property_ids(parcel_candidates)
 
         # ── Phase 2: Row loop (no per-row DB queries in the hot path) ─────
-        matched = 0
-        updated = 0
-        unmatched = 0
-
         records_to_upsert: list[dict[str, Any]] = []
         unmatched_to_quarantine: list[dict[str, Any]] = []
+        unmatched = 0
 
         for idx, (_, row, values, parcel_number) in enumerate(prepared_rows):
             if idx > 0 and idx % 500 == 0:
                 logger.info(
-                    "Tax delinquency progress: %d/%d rows (matched=%d updated=%d unmatched=%d)",
-                    idx, len(df), matched, updated, unmatched,
+                    "Tax delinquency progress: %d/%d rows (unmatched=%d so far)",
+                    idx, len(df), unmatched,
                 )
 
             account_number = values.get("source_account_number") or values.get("account_number")
             if not account_number:
+                unmatched_to_quarantine.append({
+                    "source_type": "tax_delinquencies",
+                    "raw_row": row.to_dict() if hasattr(row, "to_dict") else dict(row),
+                    "instrument_number": None,
+                })
                 unmatched += 1
                 continue
 
@@ -510,6 +511,22 @@ class TaxDelinquencyLoader(BaseLoader):
             records_to_upsert.append(values)
 
         records_to_upsert = self._dedupe_upsert_records(records_to_upsert)
+
+        # ── Phase 2.5: Batch-query existing keys (batch-scoped, not full-county) ──
+        existing_map: dict[tuple, int] = {}
+        if records_to_upsert:
+            property_ids = list({r["property_id"] for r in records_to_upsert})
+            db_rows = self.session.execute(
+                text("""
+                    SELECT id, property_id, tax_year
+                    FROM tax_delinquencies
+                    WHERE property_id = ANY(:property_ids)
+                      AND county_id = :county_id
+                """).bindparams(bindparam("property_ids", type_=ARRAY(Integer))),
+                {"property_ids": property_ids, "county_id": self.county_id},
+            ).mappings()
+            existing_map = {(r["property_id"], r["tax_year"]): r["id"] for r in db_rows}
+
         matched = sum(
             1 for rec in records_to_upsert
             if (rec["property_id"], rec["tax_year"]) not in existing_map
@@ -572,9 +589,7 @@ class TaxDelinquencyLoader(BaseLoader):
         if not records:
             return
 
-        records = self._normalize_upsert_records(self._dedupe_upsert_records(records))
-
-        from sqlalchemy.dialects.postgresql import insert as pg_insert
+        records = self._normalize_upsert_records(records)
 
         table = TaxDelinquency.__table__
         stmt = pg_insert(table).values(records)
@@ -612,19 +627,21 @@ class TaxDelinquencyLoader(BaseLoader):
         if not records:
             return
 
-        from src.core.models import UnmatchedRecord
-        from datetime import datetime, timezone
-
-        # Deduplicate by the conflict key
-        deduped: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        # Keyed rows dedup by (instrument, source, county); None-instrument rows
+        # each get a unique slot — the partial unique index doesn't cover NULLs
+        # so they always do plain inserts and must not be collapsed.
+        deduped: OrderedDict[Any, dict[str, Any]] = OrderedDict()
+        anon_idx = 0
         for rec in records:
             county_id = rec.get("county_id", self.county_id)
-            key = f"{rec['instrument_number']}|{rec['source_type']}|{county_id}"
-            deduped[key] = rec
+            instrument = rec.get("instrument_number")
+            if instrument is not None:
+                key: Any = f"{instrument}|{rec['source_type']}|{county_id}"
+                deduped[key] = rec
+            else:
+                deduped[anon_idx] = rec
+                anon_idx += 1
         records = list(deduped.values())
-
-        import math
-        from sqlalchemy.dialects.postgresql import insert as pg_insert
 
         values_list: list[dict[str, Any]] = []
         for rec in records:
@@ -635,18 +652,17 @@ class TaxDelinquencyLoader(BaseLoader):
                     safe_raw[k] = None
                 else:
                     try:
-                        import json
                         json.dumps(v)
                         safe_raw[k] = v
                     except (TypeError, ValueError):
                         safe_raw[k] = str(v)
 
-            instrument = str(rec.get("instrument_number", ""))
+            instrument_val = rec.get("instrument_number")
             values_list.append({
                 "source_type": rec.get("source_type", "tax_delinquencies"),
                 "county_id": rec.get("county_id", self.county_id),
                 "raw_data": safe_raw,
-                "instrument_number": instrument,
+                "instrument_number": str(instrument_val) if instrument_val is not None else None,
                 "match_status": "unmatched",
                 "match_attempted_at": datetime.now(timezone.utc),
             })

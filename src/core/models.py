@@ -1040,6 +1040,12 @@ class Subscriber(Base):
 
     bundle_purchases = relationship("BundlePurchase", back_populates="subscriber")
 
+    # ── Stage 8: Revenue Signal Score (latest state; history in revenue_signal_score_events) ──
+    revenue_signal_score: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    revenue_signal_band: Mapped[Optional[str]] = mapped_column(String(20))
+    revenue_signal_breakdown: Mapped[Optional[dict]] = mapped_column(JSONB)
+    revenue_signal_updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
     # Audit
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(
@@ -1051,6 +1057,7 @@ class Subscriber(Base):
         Index("idx_subscriber_county_id", "county_id"),
         Index("idx_subscriber_status", "status"),
         Index("idx_subscriber_vertical", "vertical"),
+        Index("idx_subscriber_signal_score", "revenue_signal_score"),
         CheckConstraint(
             "tier IN ('free', 'starter', 'pro', 'dominator', 'data_only', 'autopilot_lite', 'autopilot_pro', 'partner', 'annual_lock')",
             name="check_subscriber_tier",
@@ -1058,6 +1065,10 @@ class Subscriber(Base):
         CheckConstraint(
             "status IN ('active', 'grace', 'churned', 'cancelled', 'paused', 'disputed')",
             name="check_subscriber_status",
+        ),
+        CheckConstraint(
+            "revenue_signal_band IS NULL OR revenue_signal_band IN ('low','medium','high','very_high')",
+            name="check_subscriber_revenue_signal_band",
         ),
     )
 
@@ -1936,6 +1947,79 @@ class RevenueSignalScoreEvent(Base):
         return (
             f"<RevenueSignalScoreEvent(sub={self.subscriber_id}, "
             f"action={self.action_type}, delta={self.delta})>"
+        )
+
+
+class ConversionAttributionEvent(Base):
+    """fa044 — one row per billable conversion event, capturing all 8 attribution
+    dimensions at the moment the conversion was recorded.
+
+    Unique on (source_table, source_event_id) — duplicate-safe at DB level.
+    Score state is written to subscribers.revenue_signal_score; the audit trail
+    lives in revenue_signal_score_events (fa037) with attribution_event_id in
+    its metadata column linking back here.
+    """
+    __tablename__ = "conversion_attribution_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    conversion_type: Mapped[str] = mapped_column(String(60), nullable=False)
+    source_table: Mapped[str] = mapped_column(String(80), nullable=False)
+    source_event_id: Mapped[str] = mapped_column(String(120), nullable=False)
+    subscriber_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("subscribers.id", ondelete="CASCADE"), nullable=False
+    )
+    lead_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("sent_leads.id", ondelete="SET NULL"), nullable=True
+    )
+    property_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("properties.id", ondelete="SET NULL"), nullable=True
+    )
+    zip_code: Mapped[Optional[str]] = mapped_column(String(10))
+    trade: Mapped[Optional[str]] = mapped_column(String(50))
+    wallet_tier: Mapped[Optional[str]] = mapped_column(String(30))
+    lock_status: Mapped[Optional[str]] = mapped_column(String(20))
+    lock_zip: Mapped[Optional[str]] = mapped_column(String(10))
+    autopilot_tier: Mapped[Optional[str]] = mapped_column(String(30))
+    bundle_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("bundle_purchases.id", ondelete="SET NULL"), nullable=True
+    )
+    bundle_type: Mapped[Optional[str]] = mapped_column(String(50))
+    deal_size_bucket: Mapped[Optional[str]] = mapped_column(String(20))
+    revenue_amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
+    currency: Mapped[str] = mapped_column(String(3), default="usd", server_default="usd", nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    attribution_status: Mapped[Optional[str]] = mapped_column(String(20))
+    attribution_confidence: Mapped[Optional[str]] = mapped_column(String(20))
+    attribution_metadata: Mapped[Optional[dict]] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint("source_table", "source_event_id", name="uq_attribution_source"),
+        Index("idx_cae_subscriber_id", "subscriber_id"),
+        Index("idx_cae_lead_id", "lead_id"),
+        Index("idx_cae_zip_code", "zip_code"),
+        Index("idx_cae_trade", "trade"),
+        Index("idx_cae_wallet_tier", "wallet_tier"),
+        Index("idx_cae_lock_status", "lock_status"),
+        Index("idx_cae_autopilot_tier", "autopilot_tier"),
+        Index("idx_cae_bundle_type", "bundle_type"),
+        Index("idx_cae_deal_size_bucket", "deal_size_bucket"),
+        Index("idx_cae_conversion_type", "conversion_type"),
+        Index("idx_cae_occurred_at", "occurred_at"),
+    )
+
+    def __repr__(self):
+        return (
+            f"<ConversionAttributionEvent(id={self.id}, sub={self.subscriber_id}, "
+            f"type={self.conversion_type}, status={self.attribution_status})>"
         )
 
 

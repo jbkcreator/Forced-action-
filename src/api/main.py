@@ -63,7 +63,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 from src.api.admin_router import router as admin_router, get_current_admin  # noqa: E402
+from src.api.attribution_router import router as attribution_router  # noqa: E402
 app.include_router(admin_router)
+app.include_router(attribution_router)
 
 # Mount React build assets (JS/CSS chunks) if the dist directory exists
 if REACT_DIST.is_dir() and (REACT_DIST / "assets").is_dir():
@@ -3132,6 +3134,21 @@ def deal_capture(payload: DealCaptureRequest, db: Session = Depends(get_db)):
                 annual_offered = True
         except Exception as exc:
             logger.warning("[DealCapture] annual push failed: %s", exc)
+
+    try:
+        from src.services.attribution_service import record_conversion_attribution
+        record_conversion_attribution(
+            conversion_type="deal_win_reported",
+            source_table="deal_outcomes",
+            source_event_id=str(outcome.id),
+            subscriber_id=sub.id,
+            occurred_at=datetime.now(timezone.utc),
+            property_id=payload.property_id,
+            deal_size_bucket=payload.deal_size_bucket,
+            db=db,
+        )
+    except Exception:
+        logger.warning("[DealCapture] Attribution recording failed sub=%s", sub.id, exc_info=True)
 
     return {
         "ok": True,

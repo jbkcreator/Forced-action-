@@ -90,11 +90,15 @@ def build_personalization_fields(
     profile: dict,
     segment_data: dict,
     raw_score: int,
+    attribution_data: Optional[dict] = None,
 ) -> dict:
     """
     Return a flat dict of personalization fields ready to merge into a
     Cora render context. Accepts the dicts from get_subscriber_profile and
     get_segment_and_score (both may be empty — defaults are safe).
+
+    Pass attribution_data=get_attribution_context(...) to include Stage 8
+    conversion attribution fields in the output.
 
     Returned keys:
       county_id                  — raw county id from profile
@@ -104,6 +108,12 @@ def build_personalization_fields(
       revenue_signal_score_band  — low/medium/high/very_high
       days_since_last_action     — int or None
       last_action_recency_band   — same_day/recent_1_3_days/cooling_4_7_days/stale_8_plus_days/unknown
+
+    Additional keys when attribution_data is provided:
+      attribution_score          — latest revenue signal score from attribution system
+      attribution_score_band     — band for that score
+      attribution_score_reasons  — list of reasons from breakdown
+      recent_conversion_types    — last 3 conversion type strings
     """
     county_id = profile.get("county_id") or ""
     behavioral_segment = segment_data.get("segment") or "unknown"
@@ -122,7 +132,7 @@ def build_personalization_fields(
 
     days_since_last_action, recency_band = recency_from_timestamp(last_action_ts)
 
-    return {
+    result = {
         "county_id": county_id,
         "county_name": county_display_name(county_id or None),
         "behavioral_segment": behavioral_segment,
@@ -131,3 +141,12 @@ def build_personalization_fields(
         "days_since_last_action": days_since_last_action if days_since_last_action is not None else "unknown",
         "last_action_recency_band": recency_band,
     }
+
+    if attribution_data:
+        breakdown = attribution_data.get("revenue_signal_breakdown") or {}
+        result["attribution_score"] = attribution_data.get("revenue_signal_score", 0)
+        result["attribution_score_band"] = attribution_data.get("revenue_signal_band", "low")
+        result["attribution_score_reasons"] = breakdown.get("reasons", [])
+        result["recent_conversion_types"] = attribution_data.get("recent_conversion_types", [])
+
+    return result

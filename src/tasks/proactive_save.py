@@ -191,10 +191,24 @@ def downgrade_to_data_only(subscriber_id: int, db: Session) -> bool:
         switch_subscription_plan(sub.stripe_subscription_id, price_id)
         sub.tier = "data_only"
         logger.info("Subscriber %d downgraded to data_only", subscriber_id)
-        return True
     except Exception as exc:
         logger.error("downgrade_to_data_only failed for subscriber %d: %s", subscriber_id, exc)
         return False
+
+    try:
+        from src.services.attribution_service import record_conversion_attribution
+        record_conversion_attribution(
+            conversion_type="data_only_save",
+            source_table="stripe_subscriptions",
+            source_event_id=sub.stripe_subscription_id,
+            subscriber_id=sub.id,
+            occurred_at=datetime.now(timezone.utc),
+            db=db,
+        )
+    except Exception:
+        logger.warning("Attribution recording failed sub=%s", sub.id, exc_info=True)
+
+    return True
 
 
 def compute_save_offer_active(subscriber, db) -> bool:
