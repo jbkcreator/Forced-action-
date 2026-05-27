@@ -1,10 +1,16 @@
 """
 A/B testing engine — deterministic assignment, outcome recording, auto-rollback.
+
+Two assignment functions exist for two different test shapes:
+  assign_variant      — message-swap a/b tests; out-of-test traffic → None (unrecorded).
+  assign_rollout_arm  — rollout tests (e.g. cora_attribution_v1); records BOTH arms
+                        ('variant' / 'control') so control conversion rate is measurable.
 """
 
 import hashlib
 import logging
-from datetime import datetime, timezone
+import math
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import select
@@ -83,6 +89,130 @@ def assign_variant(subscriber_id: int, test_name: str, db: Session) -> Optional[
     db.add(assignment)
     db.flush()
     return variant
+
+
+ATTRIBUTION_ROLLOUT_TEST_NAME = "cora_attribution_v1"
+
+
+def ensure_attribution_rollout_test(db: Session) -> AbTest:
+    """Idempotently register the cora_attribution_v1 rollout test.
+
+    Called lazily from decision_hierarchy so the test row exists before
+    assign_rollout_arm tries to look it up.
+    """
+    return get_or_create_test(
+        test_name=ATTRIBUTION_ROLLOUT_TEST_NAME,
+        segment="attribution_eligible",
+        variant_a={"path": "control"},
+        variant_b={"path": "attribution_driven"},
+        traffic_pct=10,
+        db=db,
+    )
+
+
+def assign_rollout_arm(
+    subscriber_id: int,
+    test_name: str,
+    db: Session,
+) -> Optional[str]:
+    """Assign a subscriber to 'variant' or 'control' for a rollout-type test.
+
+    Unlike assign_variant, BOTH arms are recorded as AbAssignment rows so that
+    control conversion rate is measurable alongside the variant's. Returns None
+    only when the test doesn't exist or is not active.
+
+    Deterministic: same subscriber always gets the same arm for the life of the test.
+    """
+    test = db.execute(
+        select(AbTest).where(AbTest.test_name == test_name, AbTest.status == "active")
+    ).scalar_one_or_none()
+    if not test:
+        return None
+
+    existing = db.execute(
+        select(AbAssignment).where(
+            AbAssignment.test_id == test.id,
+            AbAssignment.subscriber_id == subscriber_id,
+        )
+    ).scalar_one_or_none()
+    if existing:
+        return existing.variant
+
+    h = int(hashlib.md5(f"{test_name}{subscriber_id}".encode()).hexdigest(), 16) % 100
+    arm = "variant" if h < test.traffic_pct else "control"
+    db.add(AbAssignment(
+        test_id=test.id,
+        subscriber_id=subscriber_id,
+        variant=arm,
+    ))
+    db.flush()
+    return arm
+
+
+def should_rollback_rollout(
+    test_name: str,
+    db: Session,
+    *,
+    window_hours: int = 48,
+    min_per_arm: int = 30,
+) -> bool:
+    """Return True when the 'variant' arm is losing by >2σ vs 'control' in the
+    rolling window, with ≥min_per_arm assignments per arm.
+
+    Fail-safe hold: returns False (no rollback) when the floor isn't met or
+    when the z-test is indeterminate (p_pool ∈ {0,1}, se==0).
+    """
+    test = db.execute(
+        select(AbTest).where(AbTest.test_name == test_name, AbTest.status == "active")
+    ).scalar_one_or_none()
+    if not test:
+        return False
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
+    assignments = db.execute(
+        select(AbAssignment).where(
+            AbAssignment.test_id == test.id,
+            AbAssignment.created_at >= cutoff,
+        )
+    ).scalars().all()
+
+    ctrl = [a for a in assignments if a.variant == "control"]
+    var = [a for a in assignments if a.variant == "variant"]
+
+    if len(ctrl) < min_per_arm or len(var) < min_per_arm:
+        return False
+
+    ctrl_conv = sum(1 for a in ctrl if a.outcome == "converted")
+    var_conv = sum(1 for a in var if a.outcome == "converted")
+    n_ctrl, n_var = len(ctrl), len(var)
+
+    p_ctrl = ctrl_conv / n_ctrl
+    p_var = var_conv / n_var
+    p_pool = (ctrl_conv + var_conv) / (n_ctrl + n_var)
+
+    if p_pool == 0 or p_pool == 1:
+        return False
+
+    se = math.sqrt(p_pool * (1 - p_pool) * (1 / n_ctrl + 1 / n_var))
+    if se == 0:
+        return False
+
+    # One-sided: variant is the suspect — rollback only if variant < control by >2σ
+    z = (p_var - p_ctrl) / se
+    return z < -2.0
+
+
+def rollback_rollout(test_name: str, db: Session) -> None:
+    """Flip AbTest.status to 'rolled_back' (terminal). assign_rollout_arm will
+    return None for this test going forward, routing all traffic to control."""
+    test = db.execute(
+        select(AbTest).where(AbTest.test_name == test_name)
+    ).scalar_one_or_none()
+    if not test:
+        return
+    test.status = "rolled_back"
+    test.ended_at = datetime.now(timezone.utc)
+    db.flush()
 
 
 def record_outcome(subscriber_id: int, test_name: str, outcome: str, db: Session) -> None:

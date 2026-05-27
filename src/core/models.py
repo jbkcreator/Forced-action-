@@ -2242,7 +2242,7 @@ class AbAssignment(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     test_id: Mapped[int] = mapped_column(Integer, ForeignKey("ab_tests.id"), nullable=False, index=True)
     subscriber_id: Mapped[int] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=False, index=True)
-    variant: Mapped[str] = mapped_column(String(10), nullable=False)  # 'a' or 'b'
+    variant: Mapped[str] = mapped_column(String(10), nullable=False)  # 'a'/'b' for message-swap tests; 'variant'/'control' for rollout tests
     outcome: Mapped[Optional[str]] = mapped_column(String(30))  # converted/ignored/bounced
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 

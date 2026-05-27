@@ -55,6 +55,11 @@ class DecisionHierarchyState(TypedDict, total=False):
 	# A/B (optional — skipped if ab_test_name is None)
 	ab_test_name: Optional[str]
 
+	# Attribution rollout (optional — skipped if attribution_context is None)
+	# Callers pass attribution_context=get_attribution_context(subscriber_id) when
+	# the subscriber has attribution data; leave None to stay on control path.
+	attribution_context: Optional[dict]
+
 	# Learning card type to consult. Defaults to 'general' if missing.
 	learning_card_type: Optional[str]
 
@@ -67,6 +72,7 @@ class DecisionHierarchyState(TypedDict, total=False):
 	segment: str
 	revenue_signal_score: int
 	ab_variant: Optional[str]
+	use_attribution_path: bool   # True = subscriber is on the attribution-driven arm
 	learning_card: dict
 	guardrails_in_scope: dict
 
@@ -160,6 +166,49 @@ def _node_assign_ab_variant(state: DecisionHierarchyState) -> DecisionHierarchyS
 	}
 
 
+def _node_assign_rollout_arm(state: DecisionHierarchyState) -> DecisionHierarchyState:
+	"""Step 5b — assign the subscriber to a rollout arm for cora_attribution_v1.
+
+	Only runs when attribution_context is provided (i.e. subscriber is eligible).
+	Sets use_attribution_path=True when the arm is 'variant', False otherwise.
+	"""
+	attribution_context = state.get("attribution_context")
+	subscriber_id = state.get("subscriber_id")
+
+	if attribution_context is None or not subscriber_id:
+		return {
+			"use_attribution_path": False,
+			"hierarchy_path": _append_path(state, "rollout:skip_no_context"),
+		}
+
+	try:
+		from src.core.database import db as _db
+		from src.services.ab_engine import (
+			ATTRIBUTION_ROLLOUT_TEST_NAME,
+			assign_rollout_arm,
+			ensure_attribution_rollout_test,
+		)
+
+		with _db.session_scope() as session:
+			ensure_attribution_rollout_test(session)
+			arm = assign_rollout_arm(subscriber_id, ATTRIBUTION_ROLLOUT_TEST_NAME, session)
+	except Exception as exc:
+		# DB error → fail-safe control path; never block a Cora decision.
+		import logging
+		logging.getLogger(__name__).warning(
+			"rollout arm assignment failed sub=%s: %s", subscriber_id, exc
+		)
+		arm = "control"
+
+	on_variant = arm == "variant"
+	return {
+		"use_attribution_path": on_variant,
+		"hierarchy_path": _append_path(
+			state, f"rollout:{'variant' if on_variant else 'control'}"
+		),
+	}
+
+
 def _node_check_kill_switch(state: DecisionHierarchyState) -> DecisionHierarchyState:
 	feature = state.get("kill_switch_feature")
 	if feature is None:
@@ -237,6 +286,7 @@ def build_decision_hierarchy_graph() -> StateGraph:
 	g.add_node("learning_card", _node_consult_learning_card)
 	g.add_node("segment", _node_read_segment_and_score)
 	g.add_node("ab_variant", _node_assign_ab_variant)
+	g.add_node("rollout_arm", _node_assign_rollout_arm)
 	g.add_node("kill_switch", _node_check_kill_switch)
 
 	g.add_edge(START, "guardrail")
@@ -247,7 +297,8 @@ def build_decision_hierarchy_graph() -> StateGraph:
 	)
 	g.add_edge("learning_card", "segment")
 	g.add_edge("segment", "ab_variant")
-	g.add_edge("ab_variant", "kill_switch")
+	g.add_edge("ab_variant", "rollout_arm")
+	g.add_edge("rollout_arm", "kill_switch")
 	g.add_edge("kill_switch", END)
 
 	return g

@@ -441,6 +441,18 @@ def record_conversion_attribution(
         "Attribution recorded sub=%s type=%s score %d→%d band=%s event_id=%d",
         subscriber_id, conversion_type, old_score, new_score, band, attribution_event_id,
     )
+
+    # Mark the subscriber's active cora_attribution_v1 assignment as converted
+    # so the rollout monitor can compute per-arm conversion rates.
+    try:
+        from src.services.ab_engine import (
+            ATTRIBUTION_ROLLOUT_TEST_NAME,
+            record_outcome,
+        )
+        record_outcome(subscriber_id, ATTRIBUTION_ROLLOUT_TEST_NAME, "converted", db)
+    except Exception:
+        logger.debug("rollout outcome label failed sub=%s — non-fatal", subscriber_id, exc_info=True)
+
     return attribution_event_id
 
 

@@ -304,6 +304,13 @@ COUNTY_ID=hillsborough
 # SMS + writes a learning_card row.
 0 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.ab_rollback_check
 
+# Cora attribution rollout monitor — every 2 min. Evaluates cora_attribution_v1
+# rollout arm: if variant conversion rate is >2σ worse than control over a
+# rolling 48h window (>=30/arm), rolls back AbTest.status='rolled_back',
+# fires founder SMS alert, writes learning_card. Fail-safe: no-op below floor.
+# Max detection lag: ~4 min — satisfies the <=5-min rollback DoD requirement.
+*/2 * * * * $PROJECT/scripts/cron/run.sh src.tasks.cora_attribution_rollback_check
+
 # ── STAGE 6 SWEEPS ───────────────────────────────────────────
 # AP Lite candidate sweep — daily 14:00 UTC. Rolling 7-day window; idempotency
 # key buckets by ISO week so each subscriber still fires at most once per week.
