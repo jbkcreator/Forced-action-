@@ -309,6 +309,31 @@ def get_revenue_signal_score(subscriber_id: int, db: Session) -> dict:
     """), {"sid": subscriber_id}).first()
 
     if row is None:
+        # No user_segments row — fall back to Stage 8 attribution score stored
+        # directly on the subscribers table (written by attribution_service).
+        sub_row = db.execute(sa_text("""
+            SELECT revenue_signal_score, revenue_signal_band,
+                   revenue_signal_breakdown, revenue_signal_updated_at
+            FROM subscribers
+            WHERE id = :sid
+        """), {"sid": subscriber_id}).first()
+
+        if sub_row and sub_row.revenue_signal_score:
+            score = int(sub_row.revenue_signal_score)
+            band  = sub_row.revenue_signal_band or band_for(score)
+            breakdown = sub_row.revenue_signal_breakdown or {}
+            reasons = breakdown.get("reasons", []) if isinstance(breakdown, dict) else []
+            return {
+                "score":    score,
+                "band":     band,
+                "breakdown": {k: 0 for k in WEIGHTS},
+                "reasons":  reasons if reasons else [f"attribution score {score}"],
+                "updated_at": sub_row.revenue_signal_updated_at.isoformat()
+                    if sub_row.revenue_signal_updated_at else None,
+                "last_significant_action_at": None,
+                "last_action": None,
+            }
+
         return {
             "score": 0, "band": "low",
             "breakdown": {k: 0 for k in WEIGHTS},
