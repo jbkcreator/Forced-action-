@@ -374,3 +374,140 @@ class TestApiUsageLogIntegration:
         ).scalar_one_or_none()
         assert row is not None
         assert row.subscriber_id == sub.id
+
+
+# ============================================================================
+# Vendor cost pause blocking (Phase 2 integration)
+# ============================================================================
+
+
+class TestCallClaudePauseBlocking:
+    """call_claude blocks and logs when an active pause exists for the resolved target."""
+
+    def _mock_settings(self, m):
+        m.anthropic_api_key.get_secret_value.return_value = "sk-test"
+        m.claude_sonnet_model = "claude-sonnet-4-6"
+        m.claude_haiku_model = "claude-haiku-4-5"
+        m.claude_opus_model = "claude-opus-4-7"
+
+    def test_blocked_call_returns_blocked_string(self):
+        from unittest.mock import patch, MagicMock
+        from src.core.models import VendorCostPause
+        from datetime import datetime, timedelta, timezone
+
+        fake_pause = MagicMock(spec=VendorCostPause)
+        fake_pause.reason = "hard_cap_exceeded: $15 > $10"
+
+        db = MagicMock()
+
+        with patch("src.services.claude_router.get_active_pause", return_value=fake_pause), \
+             patch("src.services.claude_router.settings") as mock_settings, \
+             patch("src.services.claude_router._log_usage") as mock_log:
+            self._mock_settings(mock_settings)
+            result = call_claude(
+                "sms_copy",
+                [{"role": "user", "content": "write copy"}],
+                pause_target="ap_lite_sweep",
+                db=db,
+            )
+
+        assert "[BLOCKED]" in result
+        assert "ap_lite_sweep" in result
+        mock_log.assert_called_once()
+        log_kwargs = mock_log.call_args
+        assert log_kwargs[1].get("blocked_by_pause") is True
+
+    def test_blocked_call_does_not_hit_anthropic(self):
+        from unittest.mock import patch, MagicMock
+        from src.core.models import VendorCostPause
+
+        fake_pause = MagicMock(spec=VendorCostPause)
+        fake_pause.reason = "test"
+
+        with patch("src.services.claude_router.get_active_pause", return_value=fake_pause), \
+             patch("src.services.claude_router.settings") as mock_settings, \
+             patch("src.services.claude_router.Anthropic") as mock_anthropic, \
+             patch("src.services.claude_router._log_usage"):
+            self._mock_settings(mock_settings)
+            call_claude(
+                "sms_copy",
+                [{"role": "user", "content": "hi"}],
+                pause_target="ap_lite_sweep",
+                db=MagicMock(),
+            )
+
+        mock_anthropic.return_value.messages.create.assert_not_called()
+
+    def test_no_pause_calls_anthropic_normally(self):
+        from unittest.mock import patch, MagicMock
+
+        response = _make_response(text="hello")
+
+        with patch("src.services.claude_router.get_active_pause", return_value=None), \
+             patch("src.services.claude_router.settings") as mock_settings, \
+             patch("src.services.claude_router.Anthropic") as mock_anthropic, \
+             patch("src.services.claude_router._log_usage"):
+            mock_anthropic.return_value.messages.create.return_value = response
+            self._mock_settings(mock_settings)
+            result = call_claude(
+                "sms_copy",
+                [{"role": "user", "content": "hi"}],
+                pause_target="ap_lite_sweep",
+                db=MagicMock(),
+            )
+
+        assert result == "hello"
+
+    def test_blocked_log_row_has_blocked_by_pause_true(self, fresh_db):
+        """Integration: blocked call writes ApiUsageLog row with blocked_by_pause=True."""
+        from datetime import datetime, timedelta, timezone
+        from src.core.models import VendorCostPause, ApiUsageLog
+        from unittest.mock import patch
+
+        now = datetime.now(timezone.utc)
+        pause = VendorCostPause(
+            vendor="claude",
+            pause_target="ap_lite_sweep",
+            reason="hard_cap_exceeded",
+            status="active",
+            paused_at=now,
+            auto_resume_at=now + timedelta(hours=24),
+            created_by="test",
+            metadata_json={},
+        )
+        fresh_db.add(pause)
+        fresh_db.flush()
+
+        from src.services.vendor_cost_pause_service import invalidate_cache
+        invalidate_cache("claude", "ap_lite_sweep")
+
+        with patch("src.services.claude_router.settings") as mock_settings:
+            self._mock_settings(mock_settings)
+            result = call_claude(
+                "sms_copy",
+                [{"role": "user", "content": "hi"}],
+                pause_target="ap_lite_sweep",
+                db=fresh_db,
+            )
+        fresh_db.flush()
+
+        assert "[BLOCKED]" in result
+        row = fresh_db.execute(
+            select(ApiUsageLog).where(
+                ApiUsageLog.pause_target == "ap_lite_sweep",
+                ApiUsageLog.blocked_by_pause == True,  # noqa: E712
+            )
+        ).scalar_one_or_none()
+        assert row is not None
+        assert row.blocked_by_pause is True
+
+    def test_cache_miss_after_invalidation_re_queries_db(self, fresh_db):
+        """Invalidating cache forces a fresh DB lookup on next call."""
+        from src.services.vendor_cost_pause_service import (
+            get_active_pause,
+            invalidate_cache,
+        )
+        # No pause exists
+        invalidate_cache("claude", "nws_poll")
+        result = get_active_pause(fresh_db, "claude", "nws_poll", use_cache=False)
+        assert result is None

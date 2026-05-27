@@ -1727,6 +1727,139 @@ def create_manual_mapping(
     return _mapping_to_dict(row)
 
 
+# ===========================================================================
+# VENDOR COST PAUSE — Phase 5 admin operations
+# ===========================================================================
+# GET  /api/admin/vendor-cost/pauses          — list active + recent pauses
+# POST /api/admin/vendor-cost/pauses/{id}/resume — manually resume a pause
+# GET  /api/admin/vendor-cost/pauses/{id}/skipped — inspect skipped actions
+# ===========================================================================
+
+
+class VendorCostResumeRequest(BaseModel):
+    reason: str = Field(..., min_length=5)
+
+
+def _pause_to_dict(p) -> dict:
+    return {
+        "id": p.id,
+        "vendor": p.vendor,
+        "pause_target": p.pause_target,
+        "status": p.status,
+        "reason": p.reason,
+        "today_cost_usd": float(p.today_cost_usd) if p.today_cost_usd is not None else None,
+        "threshold_usd": float(p.threshold_usd) if p.threshold_usd is not None else None,
+        "anomaly_score": float(p.anomaly_score) if p.anomaly_score is not None else None,
+        "sample_n": p.sample_n,
+        "paused_at": p.paused_at.isoformat() if p.paused_at else None,
+        "auto_resume_at": p.auto_resume_at.isoformat() if p.auto_resume_at else None,
+        "resumed_at": p.resumed_at.isoformat() if p.resumed_at else None,
+        "resumed_by": p.resumed_by,
+        "created_by": p.created_by,
+        "metadata": p.metadata_json or {},
+    }
+
+
+@router.get("/vendor-cost/pauses", dependencies=[Depends(get_current_admin)])
+def list_vendor_cost_pauses(
+    status: Optional[str] = Query(None, description="Filter: active | auto_resumed | manually_resumed | all"),
+    limit: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    """List active and recent vendor cost pauses."""
+    from src.core.models import VendorCostPause as _VCPause
+    from sqlalchemy import select as _sel
+
+    q = _sel(_VCPause).order_by(_VCPause.paused_at.desc()).limit(limit)
+    if status and status != "all":
+        q = q.where(_VCPause.status == status)
+    elif not status:
+        # default: active only
+        q = q.where(_VCPause.status == "active")
+
+    pauses = db.execute(q).scalars().all()
+    return [_pause_to_dict(p) for p in pauses]
+
+
+@router.post("/vendor-cost/pauses/{pause_id}/resume", dependencies=[Depends(get_current_admin)])
+def resume_vendor_cost_pause(
+    pause_id: int,
+    body: VendorCostResumeRequest,
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Manually resume an active vendor cost pause.
+    Requires a reason (min 5 chars). The daily monitor may re-pause
+    the next day if the anomaly condition still holds.
+    """
+    from src.core.models import VendorCostPause as _VCPause
+    from src.services.vendor_cost_pause_service import manual_resume
+
+    pause = db.execute(
+        select(_VCPause).where(_VCPause.id == pause_id)
+    ).scalar_one_or_none()
+
+    if not pause:
+        raise HTTPException(status_code=404, detail=f"Pause {pause_id} not found")
+    if pause.status != "active":
+        raise HTTPException(status_code=409, detail=f"Pause is already {pause.status}")
+
+    resumed_by = f"admin:{_admin.get('sub', 'unknown')}"
+    manual_resume(db, pause, resumed_by=resumed_by, reason=body.reason)
+    db.commit()
+
+    logger.info(
+        "[Admin] VendorCostPause %s manually resumed by %s: %s",
+        pause_id, resumed_by, body.reason,
+    )
+    return _pause_to_dict(pause)
+
+
+@router.get("/vendor-cost/pauses/{pause_id}/skipped", dependencies=[Depends(get_current_admin)])
+def list_skipped_actions(
+    pause_id: int,
+    limit: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    """Inspect recent API calls blocked by a specific vendor cost pause."""
+    from src.core.models import ApiUsageLog, VendorCostPause as _VCPause
+
+    pause = db.execute(
+        select(_VCPause).where(_VCPause.id == pause_id)
+    ).scalar_one_or_none()
+    if not pause:
+        raise HTTPException(status_code=404, detail=f"Pause {pause_id} not found")
+
+    rows = db.execute(
+        select(ApiUsageLog)
+        .where(
+            ApiUsageLog.service == pause.vendor,
+            ApiUsageLog.pause_target == pause.pause_target,
+            ApiUsageLog.blocked_by_pause == True,
+            ApiUsageLog.created_at >= pause.paused_at,
+        )
+        .order_by(ApiUsageLog.created_at.desc())
+        .limit(limit)
+    ).scalars().all()
+
+    return {
+        "pause_id": pause_id,
+        "vendor": pause.vendor,
+        "pause_target": pause.pause_target,
+        "total_skipped": len(rows),
+        "rows": [
+            {
+                "id": r.id,
+                "graph_name": r.graph_name,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "block_reason": r.block_reason,
+            }
+            for r in rows
+        ],
+    }
+
+
 # ── Sunbiz owner detail ─────────────────────────────────────────────────────
 # Surfaces the fa031 piercing fields + latest sunbiz_snapshots row + portfolio
 # (sibling properties owned by the same name). Admin-only; the subscriber feed

@@ -33,6 +33,7 @@ from config.retention import (
 )
 from src.core.database import get_db_context
 from src.core.models import MessageOutcome, Subscriber, WalletBalance
+from src.services.vendor_cost_pause_service import get_active_pause
 from src.core.redis_client import redis_available, rget, rset
 
 logger = logging.getLogger(__name__)
@@ -88,10 +89,16 @@ def run(dry_run: bool = False) -> dict:
         "events_emitted": 0,
         "deduped": 0,
         "errors": 0,
+        "skipped_by_pause": False,
     }
     now = datetime.now(timezone.utc)
 
     with get_db_context() as db:
+        if get_active_pause(db, "claude", "retention_event_producer"):
+            logger.warning("[RetentionProducer] active vendor cost pause — skipping run")
+            results["skipped_by_pause"] = True
+            return results
+
         for tier, days in RETENTION_CADENCE_DAYS.items():
             # "wallet" is not a DB tier — resolve via WalletBalance membership
             if tier == "wallet":

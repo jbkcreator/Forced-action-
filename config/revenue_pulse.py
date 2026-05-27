@@ -1,18 +1,14 @@
 """
-Revenue Pulse config — Item 9.
+Revenue Pulse config - Item 9.
 
 Daily + weekly founder SMS template and kill-switch thresholds.
 """
 
-# Informational only — source of truth is scripts/cron/crontab.txt.
-# Not used at runtime; kept here as docs for cron setup reference.
 PULSE_SCHEDULE = {
     "daily":  "30 7 * * *",   # 7:30 AM UTC (after 7 AM scoring)
     "weekly": "0 9 * * 1",    # Monday 9 AM UTC
 }
 
-# Kill-switch: GREEN / YELLOW / RED based on avg revenue_signal_score + churn rate
-# Evaluated in order — first match wins
 KILL_SWITCH_LEVELS = [
     {
         "status": "GREEN",
@@ -34,13 +30,16 @@ KILL_SWITCH_LEVELS = [
     },
 ]
 
-MAX_DAILY_SMS_CHARS = 320     # 2-segment Twilio message max
+MAX_DAILY_SMS_CHARS = 320
 
 DAILY_PULSE_TEMPLATE = (
     "FA {date}: {lead_count} leads | {wallet_active} wallets | {top_deal}\n"
     "Alert: {alert}\n"
+    "{vendor_cost}"
     "Signal: {kill_switch}"
 )
+
+VENDOR_COST_LINE_MAX_CHARS = 80
 
 WEEKLY_PULSE_TEMPLATE = (
     "FA Wk{week}: ${revenue} est | +{new_subs} subs | -{churned} churned\n"

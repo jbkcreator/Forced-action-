@@ -23,6 +23,7 @@ import requests
 
 from config.settings import get_settings
 from src.core.database import get_db_context
+from src.services.vendor_cost_pause_service import get_active_pause
 from src.utils.logger import setup_logging, get_logger
 
 setup_logging()
@@ -208,6 +209,11 @@ def run_nws_poll(county_id: str = "hillsborough", dry_run: bool = False) -> dict
     if not settings.nws_weather_enabled:
         logger.info("[NWSPoll] nws_weather_enabled=False — poll skipped")
         return stats
+
+    with get_db_context() as _pause_db:
+        if get_active_pause(_pause_db, "claude", "nws_poll"):
+            logger.warning("[NWSPoll] active vendor cost pause — skipping run")
+            return stats
 
     from src.services.nws_same_to_zip import UGC_TO_ZIPS
     zone_ids = list(UGC_TO_ZIPS.keys())

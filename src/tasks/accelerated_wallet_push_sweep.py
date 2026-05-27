@@ -32,6 +32,7 @@ from sqlalchemy import select
 
 from config.settings import settings
 from src.core.database import get_db_context
+from src.services.vendor_cost_pause_service import get_active_pause
 from src.core.models import (
     PremiumPurchase,
     Subscriber,
@@ -79,7 +80,7 @@ def _candidate_subscriber_ids(db, since) -> List[int]:
 
 
 def run_sweep(dry_run: bool = False) -> dict:
-    results = {"scanned": 0, "eligible": 0, "emitted": 0, "errors": 0, "skipped_disabled": False}
+    results = {"scanned": 0, "eligible": 0, "emitted": 0, "errors": 0, "skipped_disabled": False, "skipped_by_pause": False}
 
     if not getattr(settings, "accelerated_wallet_push_enabled", False):
         logger.info("[AccelWalletPushSweep] feature flag disabled — skipping")
@@ -92,6 +93,11 @@ def run_sweep(dry_run: bool = False) -> dict:
     from src.agents.supervisor import dispatch_event
 
     with get_db_context() as db:
+        if get_active_pause(db, "claude", "accelerated_wallet_push"):
+            logger.warning("[AccelWalletPushSweep] active vendor cost pause — skipping run")
+            results["skipped_by_pause"] = True
+            return results
+
         sub_ids = _candidate_subscriber_ids(db, since)
         results["scanned"] = len(sub_ids)
 

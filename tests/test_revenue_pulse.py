@@ -472,3 +472,82 @@ class TestRunPulseLiveSend:
             result = run_daily_pulse(dry_run=False)
 
         assert result["sent"] is False
+
+
+# ============================================================================
+# Vendor cost line in Revenue Pulse SMS
+# ============================================================================
+
+
+class TestRevenuePulseVendorCostLine:
+    """
+    _compose_daily calls build_vendor_cost_summary + format_sms_cost_summary.
+    Patch those to control output without needing a real DB.
+    """
+
+    def _make_compose_db(self, results):
+        from unittest.mock import MagicMock
+        db = MagicMock()
+        call_count = [0]
+
+        def side_effect(stmt):
+            idx = call_count[0]
+            call_count[0] += 1
+            r = MagicMock()
+            r.scalar_one_or_none.return_value = results[idx] if idx < len(results) else None
+            return r
+
+        db.execute.side_effect = side_effect
+        return db
+
+    def test_vendor_cost_line_included_when_spend_present(self):
+        from unittest.mock import patch
+        db = self._make_compose_db([5, 3, None, None, 70.0, 10, 1])
+        cost_line = "💰 $12.50 vendor | Claude=$12.50"
+        with patch("src.tasks.revenue_pulse.build_vendor_cost_summary") as mock_summary, \
+             patch("src.tasks.revenue_pulse.format_sms_cost_summary", return_value=cost_line):
+            mock_summary.return_value = {
+                "vendor_totals": {"claude": 12.5},
+                "active_pauses": [],
+            }
+            msg = _compose_daily(db)
+        assert cost_line in msg
+
+    def test_vendor_cost_line_omitted_when_none_returned(self):
+        from unittest.mock import patch
+        db = self._make_compose_db([5, 3, None, None, 70.0, 10, 1])
+        with patch("src.tasks.revenue_pulse.build_vendor_cost_summary") as mock_summary, \
+             patch("src.tasks.revenue_pulse.format_sms_cost_summary", return_value=None):
+            mock_summary.return_value = {"vendor_totals": {}, "active_pauses": []}
+            msg = _compose_daily(db)
+        assert "💰" not in msg
+
+    def test_pause_warning_in_cost_line(self):
+        from unittest.mock import patch
+        db = self._make_compose_db([5, 3, None, None, 70.0, 10, 1])
+        cost_line = "💰 $15.00 vendor | Claude=$15.00 | ⚠️ pause:ap_lite_sweep | skipped:7"
+        with patch("src.tasks.revenue_pulse.build_vendor_cost_summary") as mock_summary, \
+             patch("src.tasks.revenue_pulse.format_sms_cost_summary", return_value=cost_line):
+            mock_summary.return_value = {
+                "vendor_totals": {"claude": 15.0},
+                "active_pauses": [{"pause_target": "ap_lite_sweep", "skipped_actions": 7, "severity": 2.5}],
+            }
+            msg = _compose_daily(db)
+        assert "pause:ap_lite_sweep" in msg
+
+    def test_plus_n_more_in_cost_line_when_multiple_pauses(self):
+        from unittest.mock import patch
+        db = self._make_compose_db([5, 3, None, None, 70.0, 10, 1])
+        cost_line = "💰 $20.00 vendor | Claude=$20.00 | ⚠️ pause:ap_lite_sweep | skipped:7 | +2 more"
+        with patch("src.tasks.revenue_pulse.build_vendor_cost_summary") as mock_summary, \
+             patch("src.tasks.revenue_pulse.format_sms_cost_summary", return_value=cost_line):
+            mock_summary.return_value = {
+                "vendor_totals": {"claude": 20.0},
+                "active_pauses": [
+                    {"pause_target": "ap_lite_sweep", "skipped_actions": 7, "severity": 3.0},
+                    {"pause_target": "bundle_dispatcher", "skipped_actions": 2, "severity": 1.5},
+                    {"pause_target": "nws_poll", "skipped_actions": 0, "severity": 1.0},
+                ],
+            }
+            msg = _compose_daily(db)
+        assert "+2 more" in msg

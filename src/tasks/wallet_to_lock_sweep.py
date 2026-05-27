@@ -12,6 +12,7 @@ import logging
 import sys
 
 from src.core.database import get_db_context
+from src.services.vendor_cost_pause_service import get_active_pause
 from src.services.wallet_to_lock import (
     emit_event,
     find_candidates,
@@ -28,9 +29,15 @@ def run_sweep(dry_run: bool = False) -> dict:
         "skipped_zip_locked": 0,
         "events_emitted": 0,
         "errors": 0,
+        "skipped_by_pause": False,
     }
 
     with get_db_context() as db:
+        if get_active_pause(db, "claude", "wallet_to_lock"):
+            logger.warning("[WalletToLockSweep] active vendor cost pause — skipping run")
+            results["skipped_by_pause"] = True
+            return results
+
         candidates = find_candidates(db)
 
         for cand in candidates:

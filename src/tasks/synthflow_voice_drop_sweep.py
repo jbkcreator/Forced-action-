@@ -30,11 +30,16 @@ _DEDUP_DAYS = 7
 def run() -> dict:
     from src.core.database import get_db_context
     from src.agents.supervisor import dispatch_event
+    from src.services.vendor_cost_pause_service import get_active_pause
 
     cutoff_convert = datetime.now(timezone.utc) - timedelta(hours=_NO_CONVERT_HOURS)
     cutoff_drop = datetime.now(timezone.utc) - timedelta(days=_DEDUP_DAYS)
 
     with get_db_context() as db:
+        if get_active_pause(db, "claude", "synthflow_voice_drop"):
+            logger.warning("[VoiceDropSweep] active vendor cost pause — skipping run")
+            return {"dispatched": 0, "errors": 0, "candidates": 0, "skipped_by_pause": True}
+
         # Joins user_segments for subscriber-level revenue score and sms_opt_ins for
         # phone + TCPA opt-in. Excludes subscribers who locked a territory in the last
         # 48h (recently converted) or received a voice drop in the last 7 days.

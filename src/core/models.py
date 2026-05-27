@@ -2013,6 +2013,10 @@ class ApiUsageLog(Base):
     output_tokens: Mapped[Optional[int]] = mapped_column(Integer)
     cost_usd: Mapped[Optional[float]] = mapped_column(Numeric(10, 6))
     task_type: Mapped[Optional[str]] = mapped_column(String(60))          # sms_copy/classification/conversational_close/etc.
+    graph_name: Mapped[Optional[str]] = mapped_column(String(60), index=True)
+    pause_target: Mapped[Optional[str]] = mapped_column(String(80), index=True)
+    blocked_by_pause: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    block_reason: Mapped[Optional[str]] = mapped_column(String(120))
     subscriber_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("subscribers.id"), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
@@ -2020,6 +2024,7 @@ class ApiUsageLog(Base):
         CheckConstraint("service IN ('claude', 'telnyx', 'stripe', 'twilio')", name="check_api_service"),
         Index("idx_api_usage_service_created", "service", "created_at"),
         Index("idx_api_usage_task_created", "task_type", "created_at"),
+        Index("idx_api_usage_pause_created", "pause_target", "created_at"),
     )
 
     def __repr__(self):
@@ -2255,6 +2260,56 @@ class AgentDecision(Base):
 
     def __repr__(self):
         return f"<AgentDecision(id={self.decision_id[:8]}, graph={self.graph_name}, status={self.terminal_status})>"
+
+
+class VendorCostPause(Base):
+    """
+    Durable cost-pause record for a pause_target.
+
+    Lifecycle rows are retained for audit. Only one active row per
+    (vendor, pause_target) should exist at a time.
+    """
+    __tablename__ = "vendor_cost_pauses"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    vendor: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    pause_target: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
+    source_table: Mapped[Optional[str]] = mapped_column(String(80))
+    source_key: Mapped[Optional[str]] = mapped_column(String(120))
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    anomaly_score: Mapped[Optional[float]] = mapped_column(Numeric(10, 4))
+    today_cost_usd: Mapped[Optional[float]] = mapped_column(Numeric(10, 6))
+    baseline_avg_usd: Mapped[Optional[float]] = mapped_column(Numeric(10, 6))
+    baseline_stddev_usd: Mapped[Optional[float]] = mapped_column(Numeric(10, 6))
+    threshold_usd: Mapped[Optional[float]] = mapped_column(Numeric(10, 6))
+    sample_n: Mapped[Optional[int]] = mapped_column(Integer)
+    window_days: Mapped[int] = mapped_column(Integer, nullable=False, default=14)
+    paused_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False, index=True)
+    auto_resume_at: Mapped[Optional[datetime]] = mapped_column(DateTime, index=True)
+    resumed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="active", index=True)
+    created_by: Mapped[str] = mapped_column(String(40), nullable=False, default="cost_monitor")
+    resumed_by: Mapped[Optional[str]] = mapped_column(String(80))
+    metadata_json: Mapped[Optional[dict]] = mapped_column(JSONB, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('active', 'auto_resumed', 'manually_resumed', 'superseded')",
+            name="check_vendor_cost_pause_status",
+        ),
+        Index("idx_vendor_cost_pause_vendor_target", "vendor", "pause_target"),
+        Index("idx_vendor_cost_pause_status_resume", "status", "auto_resume_at"),
+    )
+
+    def __repr__(self):
+        return f"<VendorCostPause(vendor={self.vendor}, pause_target={self.pause_target}, status={self.status})>"
 
 
 class SandboxOutbox(Base):
