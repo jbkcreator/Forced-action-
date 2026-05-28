@@ -21,7 +21,7 @@ import json
 import sys
 import traceback
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import pandas as pd
 
@@ -31,13 +31,20 @@ sys.path.insert(0, str(project_root))
 from src.utils.logger import setup_logging, get_logger
 from src.utils.county_config import get_county_config
 from src.utils.db_deduplicator import filter_new_records
-from src.utils.http_helpers import STEALTH_UA, STEALTH_ARGS, apply_stealth_to_browser_use, get_browser_use_proxy
+from src.utils.http_helpers import (
+    STEALTH_UA, STEALTH_ARGS, apply_stealth_to_browser_use,
+    get_browser_use_proxy, get_rotated_browser_use_proxy, check_proxy_health,
+)
 from config.constants import BROWSER_MODEL, BROWSER_TEMPERATURE, RAW_FORECLOSURE_DIR
 
 setup_logging()
 logger = get_logger(__name__)
 
 AUCTION_DATE_FORMAT = "%m/%d/%Y"
+PROXY_MAX_ATTEMPTS = 3
+
+# Sentinel — means "use standard get_browser_use_proxy() logic" when passed to run_browser_agent
+_DEFAULT_PROXY = object()
 
 
 # ---------------------------------------------------------------------------
@@ -156,21 +163,29 @@ def _template_task(source: dict, auction_date: dt.date) -> str:
 # Browser-use agent (mirrors master_engine pattern)
 # ---------------------------------------------------------------------------
 
-async def run_browser_agent(task: str, headful: bool = False, no_proxy: bool = False):
+async def run_browser_agent(task: str, headful: bool = False, no_proxy: bool = False, proxy: Any = _DEFAULT_PROXY):
 	"""
 	Run a browser-use Agent with the given task.
 	Returns the agent history object, or None on failure.
+
+	proxy: omit to use standard get_browser_use_proxy() logic; pass None to force
+	       direct (no proxy); pass a ProxySettings to use a specific session.
 	"""
 	from browser_use import Agent, Browser
 
 	llm = _make_llm()
+
+	if proxy is _DEFAULT_PROXY:
+		resolved_proxy = None if no_proxy else get_browser_use_proxy()
+	else:
+		resolved_proxy = proxy  # None = direct, ProxySettings = explicit session
 
 	browser = Browser(
 		headless=not headful,
 		disable_security=True,
 		user_agent=STEALTH_UA,
 		ignore_default_args=["--enable-automation"],
-		proxy=None if no_proxy else get_browser_use_proxy(),
+		proxy=resolved_proxy,
 		minimum_wait_page_load_time=1.5,
 		wait_between_actions=1.0,
 		args=STEALTH_ARGS,
@@ -293,6 +308,45 @@ def _save_new_foreclosures(
 
 
 # ---------------------------------------------------------------------------
+# Proxy failover wrapper
+# ---------------------------------------------------------------------------
+
+async def _run_agent_with_proxy_failover(task: str, headful: bool = False, no_proxy: bool = False):
+	"""
+	Proxy-resilient wrapper around run_browser_agent.
+
+	Strategy:
+	  1. --no-proxy flag → run directly (test mode, bypass all proxy logic).
+	  2. Pre-flight health check → if Oxylabs is unreachable, skip straight to direct.
+	  3. Up to PROXY_MAX_ATTEMPTS retries, each with a fresh rotated session ID so a
+	     blocked IP does not poison subsequent attempts.
+	  4. If every proxy attempt returns None, one final attempt with no proxy.
+	"""
+	if no_proxy:
+		return await run_browser_agent(task, headful=headful, no_proxy=True)
+
+	if not check_proxy_health():
+		logger.warning("[proxy] Pre-flight health check failed — skipping proxy, going direct")
+		return await run_browser_agent(task, headful=headful, proxy=None)
+
+	history = None
+	for attempt in range(1, PROXY_MAX_ATTEMPTS + 1):
+		rotated = get_rotated_browser_use_proxy(attempt)
+		logger.info(f"[proxy] Attempt {attempt}/{PROXY_MAX_ATTEMPTS} (fresh session ID)")
+		history = await run_browser_agent(task, headful=headful, proxy=rotated)
+		if history is not None:
+			logger.info(f"[proxy] Agent succeeded on attempt {attempt}")
+			return history
+		logger.warning(f"[proxy] Attempt {attempt}/{PROXY_MAX_ATTEMPTS} returned no result — rotating")
+
+	logger.warning("[proxy] All proxy attempts exhausted — falling back to direct (no proxy)")
+	history = await run_browser_agent(task, headful=headful, proxy=None)
+	if history is None:
+		logger.error("[proxy] Direct fallback also failed — no agent result for this run")
+	return history
+
+
+# ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 
@@ -329,7 +383,7 @@ async def run_foreclosure_pipeline(
 	logger.info("=" * 70)
 
 	task = build_agent_task(source, auction_date)
-	history = await run_browser_agent(task, headful=headful, no_proxy=no_proxy)
+	history = await _run_agent_with_proxy_failover(task, headful=headful, no_proxy=no_proxy)
 	csv_file = _parse_agent_result(history, auction_date, county_id)
 
 	if not csv_file:
