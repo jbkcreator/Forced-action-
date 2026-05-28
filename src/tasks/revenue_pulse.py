@@ -26,6 +26,8 @@ from config.revenue_pulse import (
 from config.settings import settings
 from src.core.database import get_db_context
 from src.core.models import (
+    ChatMessage,
+    ChatSession,
     DealOutcome,
     DistressScore,
     LearningCard,
@@ -99,8 +101,9 @@ def _compose_daily(db: Session) -> str:
     alert_str = (card.summary_text[:55] + "…") if card and len(card.summary_text) > 55 else (card.summary_text if card else "no alerts")
 
     kill = _kill_switch_status(db)
+    chat = _chat_metrics_today(db)
 
-    return DAILY_PULSE_TEMPLATE.format(
+    msg = DAILY_PULSE_TEMPLATE.format(
         date=today.strftime("%m/%d").lstrip("0").replace("/0", "/") if hasattr(today, "strftime") else str(today),
         lead_count=lead_count,
         wallet_active=wallet_active,
@@ -108,6 +111,13 @@ def _compose_daily(db: Session) -> str:
         alert=alert_str,
         kill_switch=kill["status"],
     )
+    if chat["sessions"] > 0:
+        msg += (
+            f"\nChat: {chat['sessions']}sess "
+            f"{chat['intent_detected']}int "
+            f"{chat['payment_triggered']}paid"
+        )
+    return msg
 
 
 def _compose_weekly(db: Session) -> str:
@@ -149,6 +159,42 @@ def _compose_weekly(db: Session) -> str:
         kill_label=kill["label"],
         learning=learning_str,
     )
+
+
+def _chat_metrics_today(db: Session) -> dict:
+    """Return Concierge Chat funnel metrics for today."""
+    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    try:
+        sessions = db.execute(
+            select(func.count(ChatSession.id)).where(
+                ChatSession.created_at >= today_start
+            )
+        ).scalar_one_or_none() or 0
+
+        intent_detected = db.execute(
+            select(func.count(ChatMessage.id)).where(
+                ChatMessage.created_at >= today_start,
+                ChatMessage.role == "assistant",
+                ChatMessage.intent_label.notin_(["none", "pricing_question", "coverage_question", "support_question", "comparison_question"]),
+                ChatMessage.intent_confidence >= 0.85,
+            )
+        ).scalar_one_or_none() or 0
+
+        payment_triggered = db.execute(
+            select(func.count(ChatMessage.id)).where(
+                ChatMessage.created_at >= today_start,
+                ChatMessage.payment_trigger_json.isnot(None),
+            )
+        ).scalar_one_or_none() or 0
+
+        return {
+            "sessions": sessions,
+            "intent_detected": intent_detected,
+            "payment_triggered": payment_triggered,
+        }
+    except Exception as exc:
+        logger.warning("[RevenuePulse] chat metrics failed: %s", exc)
+        return {"sessions": 0, "intent_detected": 0, "payment_triggered": 0}
 
 
 def _kill_switch_status(db: Session) -> dict:

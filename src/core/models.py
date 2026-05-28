@@ -2876,3 +2876,81 @@ class TaxPaymentHistory(Base):
     def __repr__(self) -> str:
         return f"<TaxPaymentHistory(id={self.id}, property_id={self.property_id}, year={self.tax_year}, paid={self.amount_paid})>"
 
+
+# ---------------------------------------------------------------------------
+# Concierge Chat (M5a)
+# ---------------------------------------------------------------------------
+
+class ChatSession(Base):
+    """One row per conversation window. Anonymous sessions are keyed by anonymous_id;
+    post-signup sessions link to a subscriber via subscriber_id."""
+    __tablename__ = "chat_sessions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)  # UUID
+    subscriber_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("subscribers.id"), nullable=True, index=True
+    )
+    anonymous_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, index=True)
+    source: Mapped[str] = mapped_column(String(20), nullable=False, default="landing")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    linked_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+    messages: Mapped[List["ChatMessage"]] = relationship(
+        "ChatMessage", back_populates="session", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "source IN ('landing', 'dashboard', 'lead_feed')",
+            name="check_chat_session_source",
+        ),
+        Index("idx_chat_session_subscriber", "subscriber_id", "created_at"),
+        Index("idx_chat_session_anon", "anonymous_id", "created_at"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<ChatSession(id={self.id}, source={self.source})>"
+
+
+class ChatMessage(Base):
+    """One row per message turn (user or assistant)."""
+    __tablename__ = "chat_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("chat_sessions.id"), nullable=False, index=True
+    )
+    role: Mapped[str] = mapped_column(String(10), nullable=False)
+    content: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    intent_label: Mapped[Optional[str]] = mapped_column(String(40), nullable=True, index=True)
+    intent_confidence: Mapped[Optional[Decimal]] = mapped_column(Numeric(4, 3), nullable=True)
+    tool_calls_json: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    payment_trigger_json: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    claude_model: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    tokens_in: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    tokens_out: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    latency_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    error: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    session: Mapped["ChatSession"] = relationship("ChatSession", back_populates="messages")
+
+    __table_args__ = (
+        CheckConstraint(
+            "role IN ('user', 'assistant', 'system', 'tool')",
+            name="check_chat_message_role",
+        ),
+        Index("idx_chat_message_session_created", "session_id", "created_at"),
+        Index("idx_chat_message_intent", "intent_label", "created_at"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<ChatMessage(id={self.id}, session_id={self.session_id}, role={self.role})>"
+
