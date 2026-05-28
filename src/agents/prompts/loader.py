@@ -88,7 +88,24 @@ def render_system_and_user(
 
 
 def render_fallback_body(graph: str, context: Dict[str, Any]) -> str:
-	"""Load graph/fallback.yaml and return the rendered body string."""
+	"""
+	Load and render the fallback SMS body for the given graph.
+
+	Resolution order (first match wins):
+	  1. graph/fallback_{vertical}.yaml  — vertical-specific copy
+	  2. graph/fallback.yaml             — monolithic default
+
+	The vertical-specific templates are optional; if missing the default is
+	used transparently. Both templates receive the full context dict so county,
+	segment, and score band can be substituted in fallback copy too.
+	"""
+	vertical = (context.get("vertical") or "").lower().replace(" ", "_")
+	if vertical:
+		try:
+			data = load_prompt(graph, f"fallback_{vertical}")
+			return render(data.get("body", ""), context).strip()
+		except FileNotFoundError:
+			pass
 	data = load_prompt(graph, "fallback")
 	return render(data.get("body", ""), context).strip()
 

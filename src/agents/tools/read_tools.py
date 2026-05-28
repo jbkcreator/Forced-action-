@@ -92,7 +92,7 @@ def get_segment_and_score(
 	subscriber_id: int,
 	session: Optional[Session] = None,
 ) -> Dict[str, Any]:
-	"""Return the subscriber's current bucket and 0–100 revenue signal score."""
+	"""Return the subscriber's current bucket, 0–100 revenue signal score, and fa037 freshness fields."""
 	with _session(session) as s:
 		seg = (
 			s.query(UserSegment)
@@ -100,10 +100,26 @@ def get_segment_and_score(
 			.first()
 		)
 		if seg is None:
-			return {"segment": "new", "revenue_signal_score": 0, "classified_at": None}
+			return {
+				"segment": "new",
+				"revenue_signal_score": 0,
+				"revenue_signal_band": None,
+				"last_significant_action_at": None,
+				"revenue_signal_last_action": None,
+				"classified_at": None,
+				"reason": None,
+			}
 		return {
 			"segment": seg.segment,
 			"revenue_signal_score": int(seg.revenue_signal_score or 0),
+			# fa037 explainability fields (nullable until score-update event writes them)
+			"revenue_signal_band": getattr(seg, "revenue_signal_band", None),
+			"last_significant_action_at": (
+				seg.last_significant_action_at.isoformat()
+				if getattr(seg, "last_significant_action_at", None)
+				else None
+			),
+			"revenue_signal_last_action": getattr(seg, "revenue_signal_last_action", None),
 			"classified_at": seg.last_classified_at.isoformat() if seg.last_classified_at else None,
 			"reason": seg.classification_reason,
 		}
@@ -490,3 +506,95 @@ def get_subscriber_territories(
 			.all()
 		)
 		return [r[0] for r in rows]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 13. Attribution context (Stage 8)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@tool(category="read")
+def get_attribution_context(
+	subscriber_id: int,
+	session: Optional[Session] = None,
+) -> Dict[str, Any]:
+	"""Return attribution and revenue signal context for a subscriber.
+
+	Reads:
+	  - Latest score fields from subscribers
+	  - Last 5 conversion_attribution_events
+	  - Last 5 deal_outcomes
+	  - Active (locked) zip_territories
+
+	Returns a dict safe for merging into Cora personalization context.
+	All DB access is raw SQL.
+	"""
+	from sqlalchemy import text as sa_text
+
+	with _session(session) as s:
+		# Latest score state.
+		sub_row = s.execute(sa_text("""
+			SELECT revenue_signal_score, revenue_signal_band,
+			       revenue_signal_breakdown, revenue_signal_updated_at
+			FROM subscribers WHERE id = :sub_id
+		"""), {"sub_id": subscriber_id}).mappings().first()
+
+		score = int(sub_row["revenue_signal_score"]) if sub_row else 0
+		band = sub_row["revenue_signal_band"] if sub_row else "low"
+		breakdown = sub_row["revenue_signal_breakdown"] if sub_row else {}
+
+		# Last 5 conversion attribution events.
+		attr_rows = s.execute(sa_text("""
+			SELECT conversion_type, occurred_at, zip_code, wallet_tier,
+			       lock_status, deal_size_bucket, revenue_amount
+			FROM conversion_attribution_events
+			WHERE subscriber_id = :sub_id
+			ORDER BY occurred_at DESC
+			LIMIT 5
+		"""), {"sub_id": subscriber_id}).mappings().all()
+
+		recent_conversions = [
+			{
+				"conversion_type": r["conversion_type"],
+				"occurred_at": r["occurred_at"].isoformat() if r["occurred_at"] else None,
+				"zip_code": r["zip_code"],
+			}
+			for r in attr_rows
+		]
+		recent_conversion_types = [r["conversion_type"] for r in attr_rows[:3]]
+
+		# Last 5 deal outcomes.
+		deal_rows = s.execute(sa_text("""
+			SELECT deal_size_bucket, deal_date, deal_amount
+			FROM deal_outcomes
+			WHERE subscriber_id = :sub_id
+			ORDER BY deal_date DESC NULLS LAST
+			LIMIT 5
+		"""), {"sub_id": subscriber_id}).mappings().all()
+
+		deal_history = [
+			{
+				"deal_size_bucket": r["deal_size_bucket"],
+				"deal_date": r["deal_date"].isoformat() if r["deal_date"] else None,
+				"deal_amount": float(r["deal_amount"]) if r["deal_amount"] else None,
+			}
+			for r in deal_rows
+		]
+
+		# Active locked territories.
+		zip_rows = s.execute(sa_text("""
+			SELECT zip_code FROM zip_territories
+			WHERE subscriber_id = :sub_id AND status = 'locked'
+			ORDER BY locked_at DESC
+		"""), {"sub_id": subscriber_id}).mappings().all()
+
+		lock_zips = [r["zip_code"] for r in zip_rows]
+
+		return {
+			"revenue_signal_score": score,
+			"revenue_signal_band": band,
+			"revenue_signal_breakdown": breakdown or {},
+			"recent_conversions": recent_conversions,
+			"recent_conversion_types": recent_conversion_types,
+			"lock_zips": lock_zips,
+			"deal_history": deal_history,
+		}

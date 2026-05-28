@@ -33,6 +33,19 @@ from src.core.models import AgentDecision, MessageOutcome, Subscriber, SmsOptIn
 
 logger = logging.getLogger(__name__)
 
+# Keys containing PII or large blobs that we strip before storing context_snapshot.
+_SNAPSHOT_EXCLUDE_KEYS = {"unlock_link", "cta_url", "subscriber_first_name", "first_name"}
+
+
+def _safe_snapshot(ctx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return a JSONB-safe subset of the render context, stripping PII and None-valued entries."""
+    if not ctx:
+        return None
+    return {
+        k: v for k, v in ctx.items()
+        if k not in _SNAPSHOT_EXCLUDE_KEYS and v is not None and v != ""
+    }
+
 
 @contextmanager
 def _session(provided: Optional[Session]) -> Generator[Session, None, None]:
@@ -55,6 +68,7 @@ def send_sms(
 	variant_id: Optional[str] = None,
 	decision_id: Optional[str] = None,
 	message_type: str = "marketing",
+	personalization_context: Optional[Dict[str, Any]] = None,
 	session: Optional[Session] = None,
 ) -> Dict[str, Any]:
 	"""
@@ -149,6 +163,7 @@ def send_sms(
 			}
 
 		# 4. Record the MessageOutcome row so learning cards can attribute later.
+		ctx = personalization_context or {}
 		outcome = MessageOutcome(
 			subscriber_id=subscriber_id,
 			message_type="sms",
@@ -156,6 +171,15 @@ def send_sms(
 			variant_id=variant_id,
 			channel="telnyx",
 			sent_at=datetime.now(timezone.utc),
+			# fa038 personalization fields
+			trade_vertical=ctx.get("vertical") or None,
+			county_id=ctx.get("county_id") or None,
+			behavioral_segment=ctx.get("behavioral_segment") or None,
+			revenue_signal_score=ctx.get("revenue_signal_score"),
+			revenue_signal_score_band=ctx.get("revenue_signal_score_band") or None,
+			last_action_recency_band=ctx.get("last_action_recency_band") or None,
+			prompt_version=ctx.get("prompt_version") or None,
+			context_snapshot=_safe_snapshot(ctx),
 		)
 		s.add(outcome)
 		s.flush()
@@ -174,6 +198,12 @@ def send_sms(
 # log_decision
 # ──────────────────────────────────────────────────────────────────────────────
 
+_VALID_AUTONOMY_CLASSES = {
+	"autonomous", "approval_required", "approved",
+	"rejected", "overridden", "recommendation_only",
+}
+
+
 @tool(category="write", idempotent=True)
 def log_decision(
 	decision_id: str,
@@ -185,6 +215,16 @@ def log_decision(
 	cost_usd: float = 0.0,
 	summary: Optional[Dict[str, Any]] = None,
 	variant_id: Optional[str] = None,
+	# fa036 — autonomy tracking. Defaults preserve back-compat: every
+	# existing caller is implicitly 'autonomous' and was_autonomous=TRUE.
+	autonomy_class: Optional[str] = "autonomous",
+	requires_approval: bool = False,
+	approved_at: Optional[datetime] = None,
+	approved_by: Optional[str] = None,
+	overridden_at: Optional[datetime] = None,
+	overridden_by: Optional[str] = None,
+	override_reason: Optional[str] = None,
+	playbook_id: Optional[int] = None,
 	session: Optional[Session] = None,
 ) -> Dict[str, Any]:
 	"""
@@ -198,12 +238,27 @@ def log_decision(
 	same decision_id updates the existing row rather than inserting a new
 	one, so graphs can safely re-log on resume after a crash.
 
+	fa036 autonomy fields:
+	  - autonomy_class:    classification at decision time. Default 'autonomous'.
+	                       Callers escalating to humans pass 'approval_required'.
+	  - was_autonomous:    sticky flag, NOT a kwarg. Set TRUE on first
+	                       'autonomous' classification, never cleared.
+	                       Metric 2 ("% overridden") queries on this.
+	  - approved_at / by:  set when a human approves a previously-pending decision.
+	  - overridden_at / by / reason: set when a human reverses an autonomous decision.
+	  - playbook_id:       optional link to the cora_playbook that drove this decision.
+
 	Returns the final persisted state of the row.
 	"""
 	valid_statuses = {"completed", "aborted", "escalated", "failed", None}
 	if terminal_status not in valid_statuses:
 		raise ValueError(
 			f"terminal_status must be one of {valid_statuses}, got {terminal_status!r}"
+		)
+	if autonomy_class is not None and autonomy_class not in _VALID_AUTONOMY_CLASSES:
+		raise ValueError(
+			f"autonomy_class must be one of {_VALID_AUTONOMY_CLASSES}, "
+			f"got {autonomy_class!r}"
 		)
 
 	with _session(session) as s:
@@ -225,6 +280,17 @@ def log_decision(
 				cost_usd=cost_usd,
 				summary=summary,
 				variant_id=variant_id,
+				autonomy_class=autonomy_class,
+				# was_autonomous is sticky — set TRUE on first 'autonomous'
+				# classification, never cleared afterward.
+				was_autonomous=(autonomy_class == "autonomous"),
+				requires_approval=requires_approval,
+				approved_at=approved_at,
+				approved_by=approved_by,
+				overridden_at=overridden_at,
+				overridden_by=overridden_by,
+				override_reason=override_reason,
+				playbook_id=playbook_id,
 			)
 			s.add(row)
 		else:
@@ -244,6 +310,25 @@ def log_decision(
 			if variant_id is not None and row.variant_id is None:
 				row.variant_id = variant_id
 
+			# fa036 — autonomy field updates. autonomy_class is mutable
+			# (autonomous → overridden / rejected after the fact). The
+			# was_autonomous flag is STICKY: once TRUE it stays TRUE.
+			if autonomy_class is not None:
+				row.autonomy_class = autonomy_class
+				if autonomy_class == "autonomous" and not row.was_autonomous:
+					row.was_autonomous = True
+			if requires_approval and not row.requires_approval:
+				row.requires_approval = True
+			if approved_at is not None and row.approved_at is None:
+				row.approved_at = approved_at
+				row.approved_by = approved_by
+			if overridden_at is not None and row.overridden_at is None:
+				row.overridden_at = overridden_at
+				row.overridden_by = overridden_by
+				row.override_reason = override_reason
+			if playbook_id is not None and row.playbook_id is None:
+				row.playbook_id = playbook_id
+
 		s.flush()
 
 		return {
@@ -256,4 +341,10 @@ def log_decision(
 			"cost_usd": float(row.cost_usd or 0),
 			"started_at": row.started_at.isoformat() if row.started_at else None,
 			"completed_at": row.completed_at.isoformat() if row.completed_at else None,
+			"autonomy_class": row.autonomy_class,
+			"was_autonomous": bool(row.was_autonomous),
+			"requires_approval": bool(row.requires_approval),
+			"approved_at": row.approved_at.isoformat() if row.approved_at else None,
+			"overridden_at": row.overridden_at.isoformat() if row.overridden_at else None,
+			"playbook_id": row.playbook_id,
 		}

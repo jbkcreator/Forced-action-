@@ -25,10 +25,12 @@ from typing import Any, Dict, Optional, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
+from src.agents.context_utils import build_personalization_fields
 from src.agents.prompts.loader import render_fallback_body, render_system_and_user
 from src.agents.subgraphs.compose_and_send import run_compose_and_send
 from src.agents.subgraphs.decision_hierarchy import run_decision_hierarchy
-from src.agents.tools.read_tools import get_subscriber_profile
+from src.agents.tools.read_tools import get_segment_and_score, get_subscriber_profile
+from src.tasks.kill_switch_metric_ingest import get_cached_metric
 
 
 GRAPH_NAME = "wallet_to_lock_close"
@@ -44,6 +46,7 @@ class WalletToLockState(TypedDict, total=False):
     event_payload: dict
 
     subscriber_profile: dict
+    segment_data: dict          # fa038 — from get_segment_and_score
 
     action_allowed: bool
     action_blocked_reason: str
@@ -75,17 +78,21 @@ def _node_assemble_context(state: WalletToLockState) -> WalletToLockState:
             "terminal_status": "aborted",
             "failure_reason": "wallet_to_lock:subscriber_not_found",
         }
-    return {"subscriber_profile": profile}
+    segment_data = get_segment_and_score(state["subscriber_id"])
+    return {"subscriber_profile": profile, "segment_data": segment_data}
 
 
 def _node_hierarchy_check(state: WalletToLockState) -> WalletToLockState:
     if state.get("terminal_status"):
         return {}
 
+    # fa034: pass the live lock_conversion metric so the gate grades
+    # against an actual value instead of treating Unknown as RED (fail-safe).
     hierarchy = run_decision_hierarchy({
         "subscriber_id": state["subscriber_id"],
         "graph_name": GRAPH_NAME,
         "kill_switch_feature": KILL_SWITCH_FEATURE,
+        "kill_switch_observed_value": get_cached_metric(KILL_SWITCH_FEATURE),
         "learning_card_type": "message_perf",
     })
 
@@ -113,6 +120,7 @@ def _node_build_compose_context(state: WalletToLockState) -> Dict[str, Any]:
 
     profile = state.get("subscriber_profile") or {}
     payload = state.get("event_payload") or {}
+    segment_data = state.get("segment_data") or {}
 
     credits_spent = payload.get("credits_spent") or 0
     zip_code = payload.get("zip_code") or ""
@@ -126,9 +134,13 @@ def _node_build_compose_context(state: WalletToLockState) -> Dict[str, Any]:
     except Exception:
         competing_viewers = 0
 
+    raw_score = state.get("revenue_signal_score", 0)
+    personalization = build_personalization_fields(profile, segment_data, raw_score)
+
     context = {
         "first_name": (profile.get("name") or "there").split(" ")[0],
         "subscriber_first_name": (profile.get("name") or "there").split(" ")[0],
+        "vertical": profile.get("vertical") or "",
         "zip_code": zip_code,
         "credits_spent": credits_spent,
         "spend_rate_per_week": spend_rate,
@@ -140,11 +152,13 @@ def _node_build_compose_context(state: WalletToLockState) -> Dict[str, Any]:
         "lock_threshold": payload.get("lock_threshold") or 40,
         "cta_url": payload.get("cta_url") or "",
         "tier": profile.get("tier") or "wallet",
-        "revenue_signal_score": state.get("revenue_signal_score", 0),
         "lock_signal": (
             f"you've spent {credits_spent} credits in "
             f"{zip_code or 'this ZIP'} this month"
         ),
+        "prompt_version": "wallet_to_lock_v2",
+        # fa038 personalization fields (revenue_signal_score already in personalization)
+        **personalization,
     }
 
     system, user = render_system_and_user(GRAPH_NAME, context)
@@ -176,6 +190,7 @@ def _node_compose_and_send(state: WalletToLockState) -> WalletToLockState:
         "message_type": "marketing",
         "use_fallback": state.get("use_fallback", False),
         "ab_fallback_body": state.get("_fallback_body"),
+        "personalization_context": state.get("_render_context"),
         "tokens_used": int(state.get("tokens_used", 0) or 0),
         "cost_usd": float(state.get("cost_usd", 0.0) or 0.0),
     })

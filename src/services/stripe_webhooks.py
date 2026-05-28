@@ -632,7 +632,27 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
         )
 
     from src.services.segmentation_engine import reclassify_safe
-    reclassify_safe(subscriber.id, db)
+    from src.services.revenue_signal import ACTION_CHECKOUT_COMPLETED
+    reclassify_safe(subscriber.id, db, action_type=ACTION_CHECKOUT_COMPLETED)
+
+    try:
+        from src.services.attribution_service import record_conversion_attribution
+        _tier_conv = {
+            "annual_lock":    "annual_upgrade",
+            "autopilot_lite": "autopilot_lite_upgrade",
+            "autopilot_pro":  "autopilot_pro_upgrade",
+        }
+        record_conversion_attribution(
+            conversion_type=_tier_conv.get(tier, "territory_lock_purchase"),
+            source_table="checkout_sessions",
+            source_event_id=session.get("id", ""),
+            subscriber_id=subscriber.id,
+            occurred_at=now,
+            zip_code=zip_codes[0] if zip_codes else None,
+            db=db,
+        )
+    except Exception:
+        logger.warning("Attribution recording failed sub=%s", subscriber.id, exc_info=True)
 
     logger.info(
         "checkout.session.completed: subscriber=%s tier=%s vertical=%s"
@@ -715,6 +735,7 @@ def _on_payment_succeeded(invoice: dict, db: Session) -> None:
         )
 
     # Clear recovery state on successful payment
+    had_failed_payment = subscriber.payment_failed_at is not None
     subscriber.payment_failed_at = None
     subscriber.recovery_day1_sent = False
     subscriber.recovery_day3_sent = False
@@ -723,6 +744,20 @@ def _on_payment_succeeded(invoice: dict, db: Session) -> None:
         "invoice.payment_succeeded: subscriber=%s billing_date=%s",
         subscriber.id, subscriber.billing_date,
     )
+
+    if had_failed_payment:
+        try:
+            from src.services.attribution_service import record_conversion_attribution
+            record_conversion_attribution(
+                conversion_type="failed_payment_recovered",
+                source_table="stripe_invoices",
+                source_event_id=invoice.get("id", ""),
+                subscriber_id=subscriber.id,
+                occurred_at=datetime.now(timezone.utc),
+                db=db,
+            )
+        except Exception:
+            logger.warning("Attribution recording failed sub=%s", subscriber.id, exc_info=True)
 
     # Send payment receipt email only for renewals, not initial signup
     if subscriber.email and billing_reason != "subscription_create":
@@ -858,6 +893,10 @@ def _on_payment_succeeded(invoice: dict, db: Session) -> None:
             ),
             body_html=payment_html,
         )
+
+    from src.services.segmentation_engine import reclassify_safe
+    from src.services.revenue_signal import ACTION_INVOICE_PAID
+    reclassify_safe(subscriber.id, db, action_type=ACTION_INVOICE_PAID)
 
 
 # ---------------------------------------------------------------------------
@@ -1221,6 +1260,24 @@ def _on_subscription_deleted(subscription: dict, db: Session) -> None:
         grace_expires.isoformat(), len(territories),
     )
 
+    # fa037 — Revenue Signal Score: capture the churn as a significant
+    # action so the score drops (engagement_recency cools) and a clean
+    # audit row lands in revenue_signal_score_events. Wrapped in try so a
+    # score-write failure cannot block the grace/ZIP/GHL side effects above.
+    try:
+        from src.services.segmentation_engine import reclassify_safe
+        from src.services.revenue_signal import ACTION_SUBSCRIPTION_DELETED
+        reclassify_safe(
+            subscriber.id, db,
+            action_type=ACTION_SUBSCRIPTION_DELETED,
+            metadata={"churn_tag": churn_tag, "founding": bool(subscriber.founding_member)},
+        )
+    except Exception:
+        logger.warning(
+            "subscription.deleted: revenue signal update failed for sub=%s",
+            subscriber.id, exc_info=True,
+        )
+
     # ── Cancellation email ─────────────────────────────────────────────────
     if subscriber.email:
         from src.services.email import send_email
@@ -1315,9 +1372,6 @@ def _on_subscription_deleted(subscription: dict, db: Session) -> None:
             body_html=body_html,
         )
 
-    from src.services.segmentation_engine import reclassify_safe
-    reclassify_safe(subscriber.id, db)
-
 
 # ---------------------------------------------------------------------------
 # 6. payment_intent.succeeded — router (lead pack + default card save + bundles)
@@ -1400,7 +1454,8 @@ def _on_payment_intent_succeeded(payment_intent, db: Session) -> None:
         )
 
     from src.services.segmentation_engine import reclassify_safe
-    reclassify_safe(subscriber_id, db)
+    from src.services.revenue_signal import ACTION_PAYMENT_INTENT_SUCCEEDED
+    reclassify_safe(subscriber_id, db, action_type=ACTION_PAYMENT_INTENT_SUCCEEDED)
 
 
 def _resolve_subscriber_id_from_pi(payment_intent, db: Session) -> Optional[int]:
@@ -1567,7 +1622,26 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
     )
 
     from src.services.segmentation_engine import reclassify_safe
-    reclassify_safe(subscriber.id, db)
+    from src.services.revenue_signal import ACTION_LEAD_UNLOCK_PAID
+    reclassify_safe(
+        subscriber.id, db,
+        action_type=ACTION_LEAD_UNLOCK_PAID,
+        metadata={"property_id": property_id, "score": int(score) if score else None},
+    )
+
+    try:
+        from src.services.attribution_service import record_conversion_attribution
+        record_conversion_attribution(
+            conversion_type="paid_unlock",
+            source_table="stripe_payment_intents",
+            source_event_id=_attr(payment_intent, "id") or "",
+            subscriber_id=subscriber.id,
+            occurred_at=datetime.now(timezone.utc),
+            property_id=property_id,
+            db=db,
+        )
+    except Exception:
+        logger.warning("Attribution recording failed sub=%s", subscriber.id, exc_info=True)
 
 
 def _send_lead_unlock_email(subscriber, prop, score, owner, enriched) -> None:
@@ -1731,6 +1805,19 @@ def _on_card_saved(payment_intent, db: Session) -> None:
         logger.warning("accelerated_wallet_push from _on_card_saved failed sub=%s: %s",
                        subscriber.id, exc)
 
+    try:
+        from src.services.attribution_service import record_conversion_attribution
+        record_conversion_attribution(
+            conversion_type="saved_card",
+            source_table="stripe_payment_intents",
+            source_event_id=pi_id or "",
+            subscriber_id=subscriber.id,
+            occurred_at=datetime.now(timezone.utc),
+            db=db,
+        )
+    except Exception:
+        logger.warning("Attribution recording failed sub=%s", subscriber.id, exc_info=True)
+
 
 def _on_payment_method_attached(pm: dict, db: Session) -> None:
     """fa016: belt-and-suspenders save-card flag setter.
@@ -1854,6 +1941,22 @@ def _on_bundle_payment(payment_intent, db: Session) -> None:
     from src.services.bundle_engine import deliver
     deliver(purchase.id, db)
     logger.info("[Bundle] Delivered purchase=%d type=%s subscriber=%d", purchase.id, bundle_type, subscriber_id)
+
+    try:
+        from src.services.attribution_service import record_conversion_attribution
+        record_conversion_attribution(
+            conversion_type="bundle_purchase",
+            source_table="stripe_payment_intents",
+            source_event_id=pi_id or "",
+            subscriber_id=subscriber_id,
+            occurred_at=datetime.now(timezone.utc),
+            bundle_id=purchase.id,
+            bundle_type=bundle_type,
+            zip_code=zip_code,
+            db=db,
+        )
+    except Exception:
+        logger.warning("Attribution recording failed sub=%s", subscriber_id, exc_info=True)
 
     # Stage 5: record A/B conversion if a variant was assigned
     if ab_variant in ("a", "b"):
@@ -2094,6 +2197,19 @@ def _on_wallet_topup_payment(payment_intent, db: Session) -> None:
         "[WalletTopup] subscriber=%d credited=%d cents=%s pi=%s",
         subscriber_id, credits, amount_cents_str, pi_id,
     )
+
+    try:
+        from src.services.attribution_service import record_conversion_attribution
+        record_conversion_attribution(
+            conversion_type="wallet_topup",
+            source_table="stripe_payment_intents",
+            source_event_id=pi_id or "",
+            subscriber_id=subscriber_id,
+            occurred_at=datetime.now(timezone.utc),
+            db=db,
+        )
+    except Exception:
+        logger.warning("Attribution recording failed sub=%s", subscriber_id, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -2362,7 +2478,22 @@ def _on_wallet_subscription_invoice(invoice: dict, db: Session) -> None:
         pass
 
     from src.services.segmentation_engine import reclassify_safe
-    reclassify_safe(subscriber_id, db)
+    from src.services.revenue_signal import ACTION_WALLET_SUBSCRIPTION_RENEWED
+    reclassify_safe(subscriber_id, db, action_type=ACTION_WALLET_SUBSCRIPTION_RENEWED)
+
+    try:
+        from src.services.attribution_service import record_conversion_attribution
+        record_conversion_attribution(
+            conversion_type="wallet_activation",
+            source_table="stripe_invoices",
+            source_event_id=invoice.get("id", ""),
+            subscriber_id=subscriber_id,
+            occurred_at=datetime.now(timezone.utc),
+            wallet_tier=tier,
+            db=db,
+        )
+    except Exception:
+        logger.warning("Attribution recording failed sub=%s", subscriber_id, exc_info=True)
 
 
 def _on_wallet_subscription_invoice_failed(invoice: dict, db: Session) -> None:

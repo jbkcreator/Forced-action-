@@ -2,7 +2,7 @@
 Scenario test fixtures — seed + teardown + sandbox configuration.
 
 All scenario tests require:
-  - TWILIO_SANDBOX=true      → outbound captured in sandbox_outbox
+  - TELNYX_SANDBOX=true       → dry-run path (no real Telnyx calls)
   - REDIS_SANDBOX=true        → fakeredis in-memory
   - Claude mocked or real     → per-test choice
 
@@ -24,7 +24,6 @@ from src.core import clock, redis_client
 from src.core.database import db
 from src.core.models import (
 	AgentDecision,
-	SandboxOutbox,
 	SmsDeadLetter,
 	SmsOptIn,
 	SmsOptOut,
@@ -157,7 +156,6 @@ def seed_subscriber():
 				phone = opt_in_rows[0].phone
 
 			# Child rows referencing subscriber
-			s.query(SandboxOutbox).filter(SandboxOutbox.subscriber_id == sid).delete(synchronize_session=False)
 			s.query(MessageOutcome).filter(MessageOutcome.subscriber_id == sid).delete(synchronize_session=False)
 			s.query(AgentDecision).filter(AgentDecision.subscriber_id == sid).delete(synchronize_session=False)
 			s.query(WalletTransaction).filter(WalletTransaction.subscriber_id == sid).delete(synchronize_session=False)

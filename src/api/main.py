@@ -63,10 +63,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 from src.api.admin_router import router as admin_router, get_current_admin  # noqa: E402
+from src.api.attribution_router import router as attribution_router  # noqa: E402
+from src.api.cora_incidents_router import router as cora_incidents_router  # noqa: E402
+from src.api.sms_analytics_router import router as sms_analytics_router  # noqa: E402
 app.include_router(admin_router)
-
-from src.api.sandbox_router import router as sandbox_router  # noqa: E402
-app.include_router(sandbox_router)
+app.include_router(attribution_router)
+app.include_router(cora_incidents_router)
+app.include_router(sms_analytics_router)
 
 from src.api.chat_router import router as chat_router  # noqa: E402
 app.include_router(chat_router)
@@ -3138,6 +3141,21 @@ def deal_capture(payload: DealCaptureRequest, db: Session = Depends(get_db)):
                 annual_offered = True
         except Exception as exc:
             logger.warning("[DealCapture] annual push failed: %s", exc)
+
+    try:
+        from src.services.attribution_service import record_conversion_attribution
+        record_conversion_attribution(
+            conversion_type="deal_win_reported",
+            source_table="deal_outcomes",
+            source_event_id=str(outcome.id),
+            subscriber_id=sub.id,
+            occurred_at=datetime.now(timezone.utc),
+            property_id=payload.property_id,
+            deal_size_bucket=payload.deal_size_bucket,
+            db=db,
+        )
+    except Exception:
+        logger.warning("[DealCapture] Attribution recording failed sub=%s", sub.id, exc_info=True)
 
     return {
         "ok": True,
