@@ -47,7 +47,12 @@ def dispatch(from_number: str, command: str, db: Session) -> str:
         return "Reply HELP to get started with Forced Action."
 
     from src.services.segmentation_engine import reclassify_safe
-    reclassify_safe(sub.id, db)
+    from src.services.revenue_signal import ACTION_SMS_COMMAND_REPLY
+    reclassify_safe(
+        sub.id, db,
+        action_type=ACTION_SMS_COMMAND_REPLY,
+        metadata={"keyword": (command or "").strip().upper()[:40] or None},
+    )
 
     handlers = {
         "BALANCE": _handle_balance,

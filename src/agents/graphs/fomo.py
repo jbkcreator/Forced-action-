@@ -35,14 +35,17 @@ from typing import Any, Dict, Optional, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from config.scoring import for_county
+from src.agents.context_utils import build_personalization_fields
 from src.agents.prompts.loader import render_fallback_body, render_for_subscriber_auto
 from src.agents.subgraphs.compose_and_send import run_compose_and_send
 from src.agents.subgraphs.decision_hierarchy import run_decision_hierarchy
 from src.agents.tools.read_tools import (
 	get_competition_status,
+	get_segment_and_score,
 	get_subscriber_profile,
 	get_zip_activity,
 )
+from src.tasks.kill_switch_metric_ingest import get_cached_metric
 
 
 # Phrase used in place of the tier label when the subscriber's county is
@@ -69,6 +72,7 @@ class FOMOState(TypedDict, total=False):
 	subscriber_profile: dict
 	zip_activity: dict
 	competition_status: dict
+	segment_data: dict          # fa038 — from get_segment_and_score
 
 	# ── Hierarchy outputs ────────────────────────────────────────────────────
 	action_allowed: bool
@@ -114,6 +118,7 @@ def _node_assemble_context(state: FOMOState) -> FOMOState:
 
 	zip_activity = get_zip_activity(zip_code, vertical=vertical) if zip_code else {}
 	competition = get_competition_status(zip_code, vertical=vertical) if zip_code else {}
+	segment_data = get_segment_and_score(subscriber_id)
 
 	# Refuse early if the ZIP is already locked by someone else — FOMO only
 	# fires for non-locked ZIPs.
@@ -122,6 +127,7 @@ def _node_assemble_context(state: FOMOState) -> FOMOState:
 			"subscriber_profile": profile,
 			"zip_activity": zip_activity,
 			"competition_status": competition,
+			"segment_data": segment_data,
 			"terminal_status": "aborted",
 			"failure_reason": "fomo:zip_already_locked",
 		}
@@ -130,6 +136,7 @@ def _node_assemble_context(state: FOMOState) -> FOMOState:
 		"subscriber_profile": profile,
 		"zip_activity": zip_activity,
 		"competition_status": competition,
+		"segment_data": segment_data,
 	}
 
 
@@ -137,13 +144,14 @@ def _node_hierarchy_check(state: FOMOState) -> FOMOState:
 	if state.get("terminal_status"):
 		return {}
 
-	# Kill-switch observed value — for priority-list scope we pass None so
-	# "unknown" → fail-safe. When we wire the metrics aggregator later,
-	# populate this from the live lock_conversion metric.
+	# fa034: FOMO drives lock conversion. Wire the kill_switch gate to the
+	# live lock_conversion metric so a sustained drop fails decisions safely
+	# (red → block, yellow → fallback template). Pattern mirrors retention.py.
 	hierarchy = run_decision_hierarchy({
 		"subscriber_id": state["subscriber_id"],
 		"graph_name": GRAPH_NAME,
-		"kill_switch_feature": None,       # priority-list scope: skip kill_switch
+		"kill_switch_feature": KILL_SWITCH_FEATURE,
+		"kill_switch_observed_value": get_cached_metric(KILL_SWITCH_FEATURE),
 		"learning_card_type": "message_perf",
 	})
 
@@ -176,17 +184,21 @@ def _node_build_compose_context(state: FOMOState) -> Dict[str, Any]:
 
 	profile = state.get("subscriber_profile") or {}
 	zip_activity = state.get("zip_activity") or {}
+	competition = state.get("competition_status") or {}
+	segment_data = state.get("segment_data") or {}
 	payload = state.get("event_payload") or {}
 
 	# Counties whose tier distribution isn't yet trustworthy substitute a
-	# neutral phrase for {lead_tier} in every prompt template. The subscriber
-	# never sees the broken label, but the rest of the FOMO copy is unchanged.
+	# neutral phrase for {lead_tier} in every prompt template.
 	_county_cfg = for_county(profile.get("county_id"))
 	_tier_for_prompt = (
 		_TIER_SUPPRESSED_PHRASE
 		if _county_cfg.tier_visibility == "internal"
 		else (payload.get("lead_tier") or "Gold")
 	)
+
+	raw_score = state.get("revenue_signal_score", 0)
+	personalization = build_personalization_fields(profile, segment_data, raw_score)
 
 	context = {
 		"subscriber_first_name": (profile.get("name") or "there").split(" ")[0],
@@ -195,10 +207,17 @@ def _node_build_compose_context(state: FOMOState) -> Dict[str, Any]:
 		"zip_code": payload.get("zip_code") or "",
 		"lead_tier": _tier_for_prompt,
 		"active_lead_count": zip_activity.get("active_viewers", 0),
-		"revenue_signal_score": state.get("revenue_signal_score", 0),
-		"competitor_signal": f"a competitor just contacted a {_tier_for_prompt} lead in {payload.get('zip_code', '')}",
-		"lead_specific_detail": f"{zip_activity.get('active_viewers', 0)} more viewers active in {payload.get('zip_code', '')}",
+		"competing_viewers": competition.get("active_wallet_users_in_vertical", 0),
+		"competitor_signal": (
+			f"a competitor just contacted a {_tier_for_prompt} lead in {payload.get('zip_code', '')}"
+		),
+		"lead_specific_detail": (
+			f"{zip_activity.get('active_viewers', 0)} more viewers active in {payload.get('zip_code', '')}"
+		),
 		"unlock_link": f"https://app.forcedaction.io/feed/{profile.get('id')}",
+		"prompt_version": "fomo_v2",
+		# fa038 personalization fields
+		**personalization,
 	}
 
 	system, user, variant, test_name = render_for_subscriber_auto(
@@ -240,6 +259,7 @@ def _node_compose_and_send(state: FOMOState) -> FOMOState:
 		"message_type": "marketing",
 		"use_fallback": state.get("use_fallback", False),
 		"ab_fallback_body": state.get("_fallback_body"),
+		"personalization_context": state.get("_render_context"),
 		"tokens_used": int(state.get("tokens_used", 0) or 0),
 		"cost_usd": float(state.get("cost_usd", 0.0) or 0.0),
 	})

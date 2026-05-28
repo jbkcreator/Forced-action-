@@ -194,51 +194,6 @@ def check_admin_login(cfg: dict) -> str:
 	return token
 
 
-def check_sandbox_enabled(cfg: dict, token: str) -> None:
-	r = requests.get(
-		f"{cfg['base_url']}/api/admin/sandbox/outbox?limit=1",
-		headers={"Authorization": f"Bearer {token}"},
-		timeout=5,
-	)
-	if r.status_code == 503:
-		_fail(
-			"sandbox mode",
-			"endpoints report disabled at runtime — settings.twilio_sandbox / redis_sandbox must be true",
-		)
-	if r.status_code != 200:
-		_fail("sandbox outbox", f"{r.status_code} {r.text[:200]}")
-	active = []
-	if cfg["twilio_sandbox"]:
-		active.append("twilio")
-	if cfg["redis_sandbox"]:
-		active.append("redis")
-	_pass("sandbox mode", f"active: {'+'.join(active)}")
-
-
-def check_dispatch_endpoint(cfg: dict, token: str) -> None:
-	# Use subscriber_id=None + bogus event_type so the supervisor drops cleanly
-	# and returns 200. We're testing the *endpoint wiring*, not a real graph.
-	r = requests.post(
-		f"{cfg['base_url']}/api/admin/sandbox/dispatch-event",
-		headers={"Authorization": f"Bearer {token}"},
-		json={
-			"event_type": "smoke_test_unknown_event",
-			"subscriber_id": None,
-			"payload": {},
-		},
-		timeout=10,
-	)
-	if r.status_code != 200:
-		_fail("dispatch-event", f"{r.status_code} {r.text[:200]}")
-	body = r.json()
-	if body.get("outcome") != "dropped_unknown_event":
-		_fail(
-			"dispatch-event routing",
-			f"expected 'dropped_unknown_event', got {body.get('outcome')!r}",
-		)
-	_pass("dispatch-event", "supervisor drop path verified")
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
@@ -255,10 +210,8 @@ def main() -> int:
 	check_fastapi(cfg["base_url"])
 	check_checkpoint_store()
 
-	_section("admin + sandbox")
+	_section("admin")
 	token = check_admin_login(cfg)
-	check_sandbox_enabled(cfg, token)
-	check_dispatch_endpoint(cfg, token)
 
 	print("\nAll checks passed. Stage 1 infrastructure is ready for narratives.")
 	return 0

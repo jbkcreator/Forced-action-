@@ -8,6 +8,7 @@ Usage:
     python src/tasks/learning_card_job.py [--dry-run]
 """
 
+import json
 import logging
 import sys
 from datetime import date, datetime, timedelta, timezone
@@ -19,6 +20,8 @@ from sqlalchemy.orm import Session
 from src.core.models import AbTest, AbAssignment, DealOutcome, LearningCard, MessageOutcome, UserSegment
 
 logger = logging.getLogger(__name__)
+
+LEARNING_CARD_CACHE_TTL = 8 * 86400  # 8 days — matches read-side TTL in read_tools.py
 
 
 def run(dry_run: bool = False) -> dict:
@@ -179,6 +182,7 @@ def _upsert_card(
         existing.data_json = data
         existing.action_taken = action
         db.flush()
+        _prime_cache(existing)
         return existing
     card = LearningCard(
         card_date=card_date,
@@ -189,7 +193,22 @@ def _upsert_card(
     )
     db.add(card)
     db.flush()
+    _prime_cache(card)
     return card
+
+
+def _prime_cache(card: LearningCard) -> None:
+    """Write-through so Cora's next read hits Redis, not Postgres."""
+    from src.core.redis_client import rset
+
+    payload = {
+        "card_date": card.card_date.isoformat(),
+        "card_type": card.card_type,
+        "summary_text": card.summary_text,
+        "data": card.data_json or {},
+        "action_taken": card.action_taken,
+    }
+    rset(f"learning_card:{card.card_type}", json.dumps(payload), ttl_seconds=LEARNING_CARD_CACHE_TTL)
 
 
 if __name__ == "__main__":

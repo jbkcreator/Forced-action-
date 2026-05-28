@@ -95,14 +95,36 @@ SIGNAL_SCHEMAS: dict[str, list[str]] = {
         "PartyType", "LastName/CompanyName", "FirstName", "PartyAddress",
     ],
     "tax_delinquency": [
-        "Account Number",    # parcel account id (A + parcel_id strip)
-        "Tax Yr",            # tax year
-        "Cert Status",       # tax certificate status
-        "Deed Status",       # tax deed application status
-        "Owner",             # owner name
-        "Property Address",  # site address
-        "Total Due",         # total amount owed (bulk download value)
-        "Years Delinquent",  # years delinquent (bulk download value)
+        "source_report",
+        "tax_year",
+        "years_delinquent",
+        "source_account_number",
+        "account_number",
+        "alternate_key",
+        "parcel_number",
+        "owner_name",
+        "owner_address",
+        "property_address",
+        "certificate_number",
+        "certificate_status",
+        "issued_date",
+        "bidder_number",
+        "certificate_buyer",
+        "certificate_buyer_address",
+        "face_amount",
+        "account_balance_amount",
+        "total_amount_due",
+        "interest_rate",
+        "assessed_value",
+        "account_status",
+        "deed_status",
+        "deed_app_date",
+        "date_redeemed",
+        "purchased_date",
+        "county_held",
+        "standard_flags",
+        "custom_flags",
+        "use_code",
     ],
     "deeds": [
         "Grantor", "Grantee", "Instrument", "document_type",

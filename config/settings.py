@@ -333,6 +333,16 @@ class AppSettings(BaseSettings):
 	slack_bot_token: Optional[SecretStr] = Field(default=None, env="SLACK_BOT_TOKEN")
 	slack_signing_secret: Optional[SecretStr] = Field(default=None, env="SLACK_SIGNING_SECRET")
 
+	# Cora self-healing (fa034). Default OFF — must be opted in per environment.
+	# When false, src/tasks/cora_self_healing.py is a no-op (returns 0 without
+	# touching DB/Redis). Rollout: ship code → enable in dev → soak in staging
+	# → enable in prod after a quiet week.
+	cora_self_healing_enabled: bool = Field(default=False, env="CORA_SELF_HEALING_ENABLED")
+	# Slack channel for Cora incident posts. When unset, post_incident_slack()
+	# falls back to email.send_alert (same path as heartbeat_monitor /
+	# anomaly_pager). Slack-disabled is NEVER a silent failure.
+	cora_incident_slack_channel: Optional[str] = Field(default=None, env="CORA_INCIDENT_SLACK_CHANNEL")
+
 
 @lru_cache
 def get_settings() -> AppSettings:

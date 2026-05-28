@@ -75,11 +75,31 @@ def classify_all(db: Session, batch_size: int = 500) -> int:
     return count
 
 
-def reclassify_safe(subscriber_id: int, db: Session) -> None:
-    """Recompute revenue_signal_score then classify. Never raises."""
+def reclassify_safe(
+    subscriber_id: int,
+    db: Session,
+    *,
+    action_type: Optional[str] = None,
+    metadata: Optional[dict] = None,
+) -> None:
+    """Recompute Revenue Signal Score (with explainability + audit row)
+    then reclassify segment. Never raises.
+
+    fa037 — when `action_type` is passed, the new fa037 write path is
+    used and one audit row lands in `revenue_signal_score_events` with
+    the trigger label + metadata. When called with no kwargs (the
+    pre-fa037 contract that some call sites still use), behaviour is
+    unchanged: score recomputes and persists, no audit row.
+    """
     try:
         from src.services import revenue_signal
-        revenue_signal.recompute(subscriber_id, db)
+        if action_type is not None:
+            revenue_signal.update_revenue_signal_score(
+                subscriber_id, action_type=action_type,
+                metadata=metadata, db=db,
+            )
+        else:
+            revenue_signal.recompute(subscriber_id, db)
         classify(subscriber_id, db)
     except Exception as exc:
         logger.warning("reclassify_safe failed for sub=%s: %s", subscriber_id, exc)

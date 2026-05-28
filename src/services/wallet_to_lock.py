@@ -135,7 +135,12 @@ def mark_lock_candidate(
     db.flush()
 
     from src.services.segmentation_engine import reclassify_safe
-    reclassify_safe(subscriber_id, db)
+    from src.services.revenue_signal import ACTION_ZIP_LOCK_ACQUIRED
+    reclassify_safe(
+        subscriber_id, db,
+        action_type=ACTION_ZIP_LOCK_ACQUIRED,
+        metadata={"zip_code": zip_code},
+    )
 
 
 def compute_wallet_to_lock_eligibility(db: Session, subscriber) -> tuple[bool, Optional[int]]:

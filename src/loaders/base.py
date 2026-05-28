@@ -422,23 +422,56 @@ class BaseLoader(ABC):
 
         return candidates
 
-    def find_property_by_parcel_id(self, parcel_id: str) -> Optional[Property]:
+    @staticmethod
+    def normalize_parcel_id(parcel_id: str) -> str:
+        """Strip all separators from a parcel ID, leaving only alphanumerics.
+
+        Allows separator-agnostic matching between sources that use slashes
+        (Pinellas: 31/31/17/95096/888/0010) and those that use hyphens
+        (Hillsborough: 17-29-16-17028-000-0010).
         """
-        Find property by exact parcel ID match.
-        
-        Args:
-            parcel_id: Parcel ID to search for
-            
-        Returns:
-            Property object or None
+        return re.sub(r'[^A-Za-z0-9]', '', str(parcel_id)).upper()
+
+    def find_property_by_parcel_id(self, parcel_id: str) -> Optional[Property]:
+        """Find property by parcel ID.
+
+        Stage 1 — exact match (uses the parcel_id unique index, fast).
+        Stage 2 — separator-normalized match via regexp_replace on the DB column
+                  (handles slash vs hyphen format differences across counties).
+                  Requires idx_property_parcel_id_normalized function index.
         """
         if pd.isna(parcel_id) or not parcel_id:
             return None
-        
-        return self.session.query(Property).filter_by(
-            parcel_id=str(parcel_id).strip(),
+
+        clean = str(parcel_id).strip()
+
+        # Stage 1: exact
+        prop = self.session.query(Property).filter_by(
+            parcel_id=clean,
             county_id=self.county_id,
         ).first()
+        if prop:
+            return prop
+
+        # Stage 2: normalize both sides — strip all non-alphanumeric characters
+        normalized = self.normalize_parcel_id(clean)
+        if not normalized:
+            return None
+
+        from sqlalchemy import func as sqlfunc, text as sa_text
+        try:
+            with self.session.begin_nested():
+                prop = (
+                    self.session.query(Property)
+                    .filter(
+                        sqlfunc.regexp_replace(Property.parcel_id, '[^A-Za-z0-9]', '', 'g') == normalized,
+                        Property.county_id == self.county_id,
+                    )
+                    .first()
+                )
+        except Exception:
+            prop = None
+        return prop
     
     def find_property_by_address(
         self,

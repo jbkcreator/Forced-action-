@@ -35,6 +35,7 @@ from typing import Any, Dict, Optional, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from config.scoring import for_county
+from src.agents.context_utils import build_personalization_fields
 from src.agents.prompts.loader import (
 	load_prompt,
 	render,
@@ -42,6 +43,7 @@ from src.agents.prompts.loader import (
 	render_for_subscriber_auto,
 	render_system_and_user,
 )
+from src.tasks.kill_switch_metric_ingest import get_cached_metric
 
 
 # Phrase used in place of the tier label when the subscriber's county is
@@ -59,6 +61,7 @@ from src.agents.subgraphs.compose_and_send import run_compose_and_send
 from src.agents.subgraphs.decision_hierarchy import run_decision_hierarchy
 from src.agents.tools.read_tools import (
 	get_recent_messages,
+	get_segment_and_score,
 	get_subscriber_profile,
 	get_wallet_state,
 	get_zip_activity,
@@ -84,6 +87,7 @@ class AbandonmentState(TypedDict, total=False):
 	wallet_state: dict
 	zip_activity: dict
 	recent_messages: list
+	segment_data: dict              # fa038 — from get_segment_and_score
 	wave: str                        # 'wave1' | 'wave2'
 
 	# Hierarchy
@@ -132,6 +136,7 @@ def _node_load_profile(state: AbandonmentState) -> AbandonmentState:
 		"wallet_state": get_wallet_state(state["subscriber_id"]),
 		"zip_activity": get_zip_activity(zip_code, vertical=vertical) if zip_code else {},
 		"recent_messages": get_recent_messages(state["subscriber_id"], hours=24),
+		"segment_data": get_segment_and_score(state["subscriber_id"]),
 	}
 
 
@@ -139,10 +144,15 @@ def _node_hierarchy_check(state: AbandonmentState) -> AbandonmentState:
 	if state.get("terminal_status"):
 		return {}
 
+	# fa034: abandonment recovery's success is measured by first-payment
+	# rate (Wave1 = save the conversion; Wave2 = win it back). Wire the
+	# gate to the live first_payment_rate metric so a sustained drop
+	# fails decisions safely.
 	hierarchy = run_decision_hierarchy({
 		"subscriber_id": state["subscriber_id"],
 		"graph_name": state.get("wave") or GRAPH_WAVE1,
-		"kill_switch_feature": None,           # priority-list scope: fail-open
+		"kill_switch_feature": KILL_SWITCH_FEATURE,
+		"kill_switch_observed_value": get_cached_metric(KILL_SWITCH_FEATURE),
 		"learning_card_type": "message_perf",
 	})
 
@@ -172,6 +182,12 @@ def _wave1_build_context(state: AbandonmentState) -> AbandonmentState:
 	profile = state.get("subscriber_profile") or {}
 	payload = state.get("event_payload") or {}
 	zip_activity = state.get("zip_activity") or {}
+	segment_data = state.get("segment_data") or {}
+
+	# hierarchy node doesn't run for wave1 until after load_profile, so
+	# fall back to segment_data score if hierarchy hasn't written it yet.
+	raw_score = int(segment_data.get("revenue_signal_score") or 0)
+	personalization = build_personalization_fields(profile, segment_data, raw_score)
 
 	ctx = {
 		"subscriber_first_name": (profile.get("name") or "there").split(" ")[0],
@@ -181,6 +197,9 @@ def _wave1_build_context(state: AbandonmentState) -> AbandonmentState:
 		"gold_lead_count": zip_activity.get("active_viewers", 0),
 		"wall_countdown_minutes": payload.get("wall_countdown_minutes", 3),
 		"unlock_link": f"https://app.forcedaction.io/feed/{profile.get('id')}",
+		"prompt_version": "abandonment_w1_v2",
+		# fa038 personalization fields
+		**personalization,
 	}
 
 	system, user, variant, test_name = render_for_subscriber_auto(
@@ -191,6 +210,7 @@ def _wave1_build_context(state: AbandonmentState) -> AbandonmentState:
 		"_system_prompt": system,
 		"_user_prompt": user,
 		"_fallback_body": fallback,
+		"_render_context": ctx,
 		"_variant_id": _format_variant_id(test_name, variant),
 	}
 
@@ -213,6 +233,7 @@ def _wave1_compose_and_send(state: AbandonmentState) -> AbandonmentState:
 		"message_type": "marketing",
 		"use_fallback": state.get("use_fallback", False),
 		"ab_fallback_body": state.get("_fallback_body"),
+		"personalization_context": state.get("_render_context"),
 		"tokens_used": int(state.get("tokens_used", 0) or 0),
 		"cost_usd": float(state.get("cost_usd", 0.0) or 0.0),
 	})
@@ -339,6 +360,7 @@ def _wave2_build_context(state: AbandonmentState) -> AbandonmentState:
 	profile = state.get("subscriber_profile") or {}
 	payload = state.get("event_payload") or {}
 	zip_activity = state.get("zip_activity") or {}
+	segment_data = state.get("segment_data") or {}
 
 	_county_cfg = for_county(profile.get("county_id"))
 	_tier_viewed = (
@@ -347,13 +369,20 @@ def _wave2_build_context(state: AbandonmentState) -> AbandonmentState:
 		else payload.get("lead_tier_viewed", "Gold")
 	)
 
+	raw_score = int(segment_data.get("revenue_signal_score") or 0)
+	personalization = build_personalization_fields(profile, segment_data, raw_score)
+
 	ctx = {
 		"subscriber_first_name": (profile.get("name") or "there").split(" ")[0],
 		"first_name": (profile.get("name") or "there").split(" ")[0],
+		"vertical": profile.get("vertical") or payload.get("vertical") or "",
 		"lead_tier_viewed": _tier_viewed,
 		"other_viewers_count": zip_activity.get("active_viewers", 0),
 		"wall_countdown_minutes": payload.get("wall_countdown_minutes", 2),
 		"unlock_link": f"https://app.forcedaction.io/feed/{profile.get('id')}",
+		"prompt_version": "abandonment_w2_v2",
+		# fa038 personalization fields
+		**personalization,
 	}
 
 	system, user, variant, test_name = render_for_subscriber_auto(
@@ -364,6 +393,7 @@ def _wave2_build_context(state: AbandonmentState) -> AbandonmentState:
 		"_system_prompt": system,
 		"_user_prompt": user,
 		"_fallback_body": fallback,
+		"_render_context": ctx,
 		"_variant_id": _format_variant_id(test_name, variant),
 	}
 
@@ -386,6 +416,7 @@ def _wave2_compose_and_send(state: AbandonmentState) -> AbandonmentState:
 		"message_type": "marketing",
 		"use_fallback": state.get("use_fallback", False),
 		"ab_fallback_body": state.get("_fallback_body"),
+		"personalization_context": state.get("_render_context"),
 		"tokens_used": int(state.get("tokens_used", 0) or 0),
 		"cost_usd": float(state.get("cost_usd", 0.0) or 0.0),
 	})

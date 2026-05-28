@@ -148,12 +148,19 @@ def upload_tax_delinquency(
     """
     Upload a tax delinquency CSV and run it through TaxDelinquencyLoader.
 
-    Expected CSV columns: Account Number, Tax Yr, Owner Name
-    Optional enrichment columns: years_delinquent_scraped, total_amount_due, Cert Status, Deed Status
+    Column mapping is applied automatically if an approved/pending mapping exists for this
+    county in county_column_mappings. Raw source headers are renamed to model-style
+    canonical names before the loader sees them.
 
-    If tax_year is provided and the CSV lacks a 'Tax Yr' column, it is injected automatically.
+    Required canonical columns (after mapping): source_account_number/account_number, tax_year
+    Optional canonical columns include: parcel_number, owner_name, property_address,
+                                       certificate_status, deed_status, total_amount_due,
+                                       years_delinquent, certificate_number, etc.
+    Enrichment overrides (bypass mapping): years_delinquent_scraped, total_amount_due
 
-    Returns matched/unmatched/skipped counts.
+    If tax_year is provided and the CSV lacks a tax year column, it is injected automatically.
+
+    Returns matched/updated/unmatched counts.
     """
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="File must be a .csv")
@@ -161,26 +168,52 @@ def upload_tax_delinquency(
     content = file.file.read().decode("utf-8", errors="replace")
 
     try:
-        df = pd.read_csv(io.StringIO(content))
+        df = pd.read_csv(io.StringIO(content), dtype=str)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Could not parse CSV: {exc}")
 
-    # Validate required column
-    if "Account Number" not in df.columns:
+    # Apply column mapping if a CountySource + approved/pending mapping exists.
+    # This renames raw county-specific headers to the canonical names the loader
+    # expects ("source_account_number", "parcel_number", "owner_name", "property_address", ...).
+    from src.loaders.column_mapper import ColumnMapper, SkipMapping, NeedsMappingError
+    from src.core.models import CountySource
+    src = db.query(CountySource).filter_by(
+        county_id=county_id, signal_type="tax_delinquency"
+    ).first()
+    if src is not None:
+        try:
+            sample_df = df.head(5)
+            mapper = ColumnMapper()
+            col_mapping = mapper.get_or_create("tax_delinquency", src.id, sample_df)
+            df = ColumnMapper.apply(df, col_mapping)
+        except SkipMapping:
+            pass
+        except NeedsMappingError as e:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Column mapping required but LLM failed — create a manual mapping in Admin > Col Mappings first. ({e})",
+            )
+
+    # Validate required column (after mapping so canonical/model names are expected)
+    account_cols = {"source_account_number", "account_number", "Account Number"}
+    if not account_cols.intersection(df.columns):
         raise HTTPException(
             status_code=400,
-            detail="CSV must contain 'Account Number' column. "
+            detail="CSV must contain an account/certificate column mapped to "
+                   "'source_account_number' or 'account_number'. "
                    f"Found columns: {list(df.columns)}",
         )
 
-    # Inject Tax Yr column if caller provided it and CSV doesn't have one
-    if "Tax Yr" not in df.columns:
+    # Inject tax_year if caller provided it and CSV doesn't have one.
+    tax_year_cols = {"tax_year", "Tax Yr", "Tax Year"}
+    if not tax_year_cols.intersection(df.columns):
         if tax_year is not None:
-            df["Tax Yr"] = tax_year
+            df["tax_year"] = str(tax_year)
         else:
             raise HTTPException(
                 status_code=400,
-                detail="CSV must contain 'Tax Yr' column, or pass tax_year as a form field.",
+                detail="CSV must contain a tax year column mapped to 'tax_year', "
+                       "or pass tax_year as a form field.",
             )
 
     total_rows = len(df)
@@ -1922,4 +1955,321 @@ def get_owner_sunbiz_detail(
         "portfolio_normalized_size": len(portfolio_property_ids),
         "portfolio_property_ids": portfolio_property_ids,
         "latest_snapshot": latest_snapshot,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# fa036 — Cora playbook lifecycle + autonomy summary endpoints
+# ─────────────────────────────────────────────────────────────────────────
+
+class _PlaybookActionBody(BaseModel):
+    actor: str = Field(..., min_length=1, max_length=80,
+                       description="Operator handle attributed to this action")
+    reason: Optional[str] = Field(default=None, max_length=4000,
+                                  description="Optional free-text reason (rejection only)")
+
+
+@router.post("/cora-playbook/{playbook_id}/adopt")
+def adopt_cora_playbook(
+    playbook_id: int,
+    body: _PlaybookActionBody,
+    _admin: dict = Depends(get_current_admin),
+):
+    """Adopt a Cora-authored recommendation. Transitions
+    `recommended` → `adopted`. Idempotent: re-adopting an already-adopted
+    playbook does nothing and returns the existing state.
+    """
+    from src.services.playbook_writer import transition_status
+
+    with get_db_context() as db:
+        ok = transition_status(
+            db, playbook_id,
+            to_status="adopted", actor=body.actor,
+        )
+        if not ok:
+            row = db.execute(text(
+                "SELECT status FROM cora_playbook WHERE id = :id"
+            ), {"id": playbook_id}).first()
+            if row is None:
+                raise HTTPException(status_code=404, detail={
+                    "error": "not_found",
+                    "message": f"cora_playbook id={playbook_id} not found",
+                })
+            return {
+                "ok": True, "id": playbook_id, "status": row.status,
+                "note": "no transition — playbook was not in 'recommended' state",
+            }
+        return {"ok": True, "id": playbook_id, "status": "adopted"}
+
+
+@router.post("/cora-playbook/{playbook_id}/reject")
+def reject_cora_playbook(
+    playbook_id: int,
+    body: _PlaybookActionBody,
+    _admin: dict = Depends(get_current_admin),
+):
+    """Reject a Cora-authored recommendation. `recommended` → `rejected`.
+    `body.reason` is optional but recommended for the audit log.
+    """
+    from src.services.playbook_writer import transition_status
+
+    with get_db_context() as db:
+        ok = transition_status(
+            db, playbook_id,
+            to_status="rejected", actor=body.actor, reason=body.reason,
+        )
+        if not ok:
+            row = db.execute(text(
+                "SELECT status FROM cora_playbook WHERE id = :id"
+            ), {"id": playbook_id}).first()
+            if row is None:
+                raise HTTPException(status_code=404, detail={
+                    "error": "not_found",
+                    "message": f"cora_playbook id={playbook_id} not found",
+                })
+            return {
+                "ok": True, "id": playbook_id, "status": row.status,
+                "note": "no transition — playbook was not in 'recommended' state",
+            }
+        return {"ok": True, "id": playbook_id, "status": "rejected"}
+
+
+@router.post("/cora-playbook/{playbook_id}/retire")
+def retire_cora_playbook(
+    playbook_id: int,
+    body: _PlaybookActionBody,
+    _admin: dict = Depends(get_current_admin),
+):
+    """Retire a previously-adopted playbook. `adopted` → `retired`. The
+    Metric 5 ("net new playbooks") aggregation subtracts retirements in
+    the window.
+    """
+    from src.services.playbook_writer import transition_status
+
+    with get_db_context() as db:
+        ok = transition_status(
+            db, playbook_id,
+            to_status="retired", actor=body.actor,
+        )
+        if not ok:
+            row = db.execute(text(
+                "SELECT status FROM cora_playbook WHERE id = :id"
+            ), {"id": playbook_id}).first()
+            if row is None:
+                raise HTTPException(status_code=404, detail={
+                    "error": "not_found",
+                    "message": f"cora_playbook id={playbook_id} not found",
+                })
+            return {
+                "ok": True, "id": playbook_id, "status": row.status,
+                "note": "no transition — playbook was not in 'adopted' state",
+            }
+        return {"ok": True, "id": playbook_id, "status": "retired"}
+
+
+@router.get("/cora-autonomy")
+def get_cora_autonomy_summary(
+    weeks: int = Query(default=8, ge=1, le=52,
+                       description="Number of weekly snapshots to return"),
+    _admin: dict = Depends(get_current_admin),
+):
+    """Return the latest weekly Cora autonomy scorecard plus prior weeks
+    for trend inspection. Driven by `learning_cards` rows with
+    `card_type='autonomy_summary'`, written by
+    `src/tasks/cora_autonomy_report.py` Monday 08:45 UTC.
+    """
+    with get_db_context() as db:
+        rows = db.execute(text("""
+            SELECT card_date, summary_text, data_json
+            FROM learning_cards
+            WHERE card_type = 'autonomy_summary'
+            ORDER BY card_date DESC
+            LIMIT :weeks
+        """), {"weeks": weeks}).fetchall()
+
+        history = [
+            {
+                "card_date":     r.card_date.isoformat() if r.card_date else None,
+                "summary_text":  r.summary_text,
+                "metrics":       r.data_json,
+            }
+            for r in rows
+        ]
+
+    return {
+        "ok":      True,
+        "latest":  history[0] if history else None,
+        "history": history,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# fa036 — Cora Playbook list (read endpoint — adopt/reject/retire above)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+@router.get("/cora-playbooks")
+def list_cora_playbooks(
+    status: str = Query(default="recommended"),
+    limit: int = Query(default=50, ge=1, le=200),
+    _admin: dict = Depends(get_current_admin),
+):
+    """List cora_playbook rows filtered by status. Used by admin Playbook
+    Recommendations UI to surface items that need adopt/reject action."""
+    from src.core.models import CoraPlaybook
+
+    with get_db_context() as db:
+        rows = db.execute(
+            select(CoraPlaybook)
+            .where(CoraPlaybook.status == status)
+            .order_by(CoraPlaybook.authored_at.desc())
+            .limit(limit)
+        ).scalars().all()
+
+    return {
+        "ok": True,
+        "status_filter": status,
+        "playbooks": [
+            {
+                "id":               r.id,
+                "name":             r.name,
+                "description":      r.description,
+                "authored_by":      r.authored_by,
+                "authored_at":      r.authored_at.isoformat() if r.authored_at else None,
+                "source_type":      r.source_type,
+                "status":           r.status,
+                "rejection_reason": r.rejection_reason,
+                "created_at":       r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ],
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# fa037 — Revenue Signal Score per-subscriber admin view
+# ─────────────────────────────────────────────────────────────────────────
+
+
+@router.get("/subscribers/{subscriber_id}/revenue-signal")
+def get_subscriber_revenue_signal(
+    subscriber_id: int,
+    history_limit: int = Query(default=20, ge=1, le=200,
+                               description="Number of audit rows to return"),
+    _admin: dict = Depends(get_current_admin),
+):
+    """Return the live Revenue Signal Score for a subscriber plus the
+    last N audit rows from `revenue_signal_score_events`.
+
+    Returns 404 when the subscriber id doesn't exist at all. Returns a
+    safe-default body (`score=0, band='low', history=[]`) when the
+    subscriber exists but has no UserSegment row yet (brand-new sign-up
+    that hasn't fired a significant action).
+
+    Driven by `src.services.revenue_signal.get_revenue_signal_score`
+    (read-only — no recompute, no audit row written by this endpoint).
+    """
+    from src.core.models import Subscriber
+    from src.services.revenue_signal import get_revenue_signal_score
+
+    with get_db_context() as db:
+        sub = db.get(Subscriber, subscriber_id)
+        if sub is None:
+            raise HTTPException(status_code=404, detail={
+                "error": "not_found",
+                "message": f"subscriber id={subscriber_id} not found",
+            })
+
+        snapshot = get_revenue_signal_score(subscriber_id, db)
+
+        history_rows = db.execute(text("""
+            SELECT action_type, old_score, new_score, delta, band,
+                   metadata, created_at
+            FROM revenue_signal_score_events
+            WHERE subscriber_id = :sid
+            ORDER BY created_at DESC
+            LIMIT :limit
+        """), {"sid": subscriber_id, "limit": history_limit}).fetchall()
+
+        history = [
+            {
+                "action_type": r.action_type,
+                "old_score":   r.old_score,
+                "new_score":   r.new_score,
+                "delta":       r.delta,
+                "band":        r.band,
+                "metadata":    r.metadata,
+                "created_at":  r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in history_rows
+        ]
+
+    return {
+        "ok":                          True,
+        "subscriber_id":               subscriber_id,
+        "score":                       snapshot["score"],
+        "band":                        snapshot["band"],
+        "breakdown":                   snapshot["breakdown"],
+        "reasons":                     snapshot["reasons"],
+        "revenue_signal_updated_at":   snapshot["updated_at"],
+        "last_significant_action_at":  snapshot["last_significant_action_at"],
+        "last_action":                 snapshot["last_action"],
+        "history":                     history,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Storm Packs — NWS alerts + bundle purchases
+# ---------------------------------------------------------------------------
+
+@router.get("/storm-packs")
+def get_storm_packs(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    _admin: dict = Depends(get_current_admin),
+):
+    from src.core.models import BundlePurchase, NWSAlert
+
+    with get_db_context() as db:
+        total_alerts = db.execute(
+            select(func.count()).select_from(NWSAlert)
+        ).scalar() or 0
+
+        alert_rows = db.execute(
+            select(NWSAlert).order_by(NWSAlert.id.desc()).limit(limit).offset(offset)
+        ).scalars().all()
+
+        purchase_rows = db.execute(
+            select(BundlePurchase).order_by(BundlePurchase.id.desc()).limit(limit).offset(offset)
+        ).scalars().all()
+
+    return {
+        "ok": True,
+        "total_alerts": total_alerts,
+        "alerts": [
+            {
+                "id":                  a.id,
+                "event":               a.event,
+                "severity":            a.severity,
+                "affected_zips":       a.affected_zips or [],
+                "subscriber_count":    a.subscriber_count,
+                "storm_pack_triggered": bool(a.storm_pack_triggered),
+                "created_at":          a.processed_at.isoformat() if a.processed_at else None,
+                "expires":             a.expires.isoformat() if a.expires else None,
+            }
+            for a in alert_rows
+        ],
+        "bundle_purchases": [
+            {
+                "id":           bp.id,
+                "bundle_type":  bp.bundle_type,
+                "status":       bp.status,
+                "subscriber_id": bp.subscriber_id,
+                "zip_code":     bp.zip_code,
+                "lead_count":   len(bp.lead_ids) if bp.lead_ids else 0,
+                "expires_at":   bp.expires_at.isoformat() if bp.expires_at else None,
+                "created_at":   bp.purchased_at.isoformat() if bp.purchased_at else None,
+            }
+            for bp in purchase_rows
+        ],
     }

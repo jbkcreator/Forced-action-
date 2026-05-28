@@ -1,0 +1,6 @@
+# FOMO fallback — attorneys vertical
+# Used when kill-switch is YELLOW and vertical=attorneys
+version: 1
+body: |
+  {first_name}, an attorney just contacted a probate lead in {zip_code}.
+  {active_lead_count} leads remain. Tap to view them. {unlock_link}

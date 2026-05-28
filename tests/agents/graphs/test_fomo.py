@@ -36,8 +36,46 @@ def _payload(**overrides):
 	return p
 
 
+_FAKE_SEGMENT = {
+	"segment": "high_intent",
+	"revenue_signal_score": 80,
+	"revenue_signal_band": "very_high",
+	"last_significant_action_at": None,
+	"revenue_signal_last_action": None,
+	"classified_at": None,
+	"reason": "test",
+}
+
+
+_FAKE_PROFILE = {
+	"id": 107,
+	"name": "Amal Test",
+	"tier": "gold",
+	"vertical": "roofing",
+	"status": "active",
+	"county_id": "hillsborough",
+}
+
+_FAKE_ZIP_ACTIVITY = {"active_viewers": 3}
+_FAKE_COMPETITION = {"is_locked": False, "active_wallet_users_in_vertical": 1}
+
+
+_FAKE_HIERARCHY = {
+	"action_allowed": True,
+	"use_fallback": False,
+	"kill_switch_color": "green",
+	"revenue_signal_score": 80,
+}
+
+
 def _with_happy_mocks():
 	return [
+		patch("src.agents.graphs.fomo.get_subscriber_profile", return_value=_FAKE_PROFILE),
+		patch("src.agents.graphs.fomo.get_zip_activity", return_value=_FAKE_ZIP_ACTIVITY),
+		patch("src.agents.graphs.fomo.get_competition_status", return_value=_FAKE_COMPETITION),
+		patch("src.agents.graphs.fomo.get_segment_and_score", return_value=_FAKE_SEGMENT),
+		patch("src.agents.graphs.fomo.run_decision_hierarchy", return_value=_FAKE_HIERARCHY),
+		patch("src.agents.graphs.fomo.get_cached_metric", return_value=None),
 		patch("src.agents.subgraphs.compose_and_send.call_claude_with_usage",
 			  return_value=FAKE_CLAUDE),
 		patch("src.agents.subgraphs.compose_and_send.compliance_check",
@@ -79,6 +117,7 @@ def test_zip_already_locked_aborts():
 		 patch("src.agents.graphs.fomo.get_zip_activity", return_value={"active_viewers": 0}), \
 		 patch("src.agents.graphs.fomo.get_competition_status",
 			   return_value={"is_locked": True, "lock_holder_subscriber_id": 99}), \
+		 patch("src.agents.graphs.fomo.get_segment_and_score", return_value=_FAKE_SEGMENT), \
 		 patch("src.agents.subgraphs.compose_and_send.call_claude_with_usage") as mock_cc:
 		r = run_fomo(event_payload=_payload(), subscriber_id=107)
 	assert r["terminal_status"] == "aborted"
@@ -87,7 +126,8 @@ def test_zip_already_locked_aborts():
 
 
 def test_compliance_block_is_aborted_not_failed():
-	with patch("src.agents.subgraphs.compose_and_send.call_claude_with_usage",
+	with patch("src.agents.graphs.fomo.get_segment_and_score", return_value=_FAKE_SEGMENT), \
+		 patch("src.agents.subgraphs.compose_and_send.call_claude_with_usage",
 			   return_value=FAKE_CLAUDE), \
 		 patch("src.agents.subgraphs.compose_and_send.compliance_check",
 			   return_value={"can_send": False, "reason": "opted_out"}), \

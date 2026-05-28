@@ -1,0 +1,6 @@
+# FOMO fallback — public_adjusters vertical
+# Used when kill-switch is YELLOW and vertical=public_adjusters
+version: 1
+body: |
+  {first_name}, a PA just reached a storm-damage lead in {zip_code}.
+  {active_lead_count} claim leads still open. Tap to view. {unlock_link}

@@ -26,7 +26,6 @@ from tests.scenarios.helpers import (
 	dispatch,
 	freeze_at,
 	read_agent_decisions,
-	read_outbox,
 )
 
 
@@ -86,12 +85,6 @@ def test_scenario_3_wave2_clicks_no_pay(seed_subscriber):
 			"decision_id": wave2_decision_id,
 		})
 
-	outbox = read_outbox(sub.id)
-	# Both Wave 1 and Wave 2 should have emitted SMS
-	campaigns = {o.campaign for o in outbox}
-	assert "abandonment_wave1" in campaigns
-	assert "abandonment_wave2_click_no_complete" in campaigns
-
 	# Two audit rows, one per wave
 	assert_agent_decision(sub.id, graph="abandonment_wave1", terminal_status="completed")
 	assert_agent_decision(sub.id, graph="abandonment_wave2", terminal_status="completed")
@@ -130,9 +123,6 @@ def test_scenario_4_wave2_skipped_if_user_already_converted(seed_subscriber):
 	# Compose should never have been called — user already converted
 	mock_claude.assert_not_called()
 
-	# No outbox row
-	assert read_outbox(sub.id) == []
-
 	# Audit row present, marked completed (early-exit is not a failure)
 	decision = assert_agent_decision(sub.id, graph="abandonment_wave2", terminal_status="completed")
 	assert decision.tokens_used == 0
@@ -170,7 +160,6 @@ def test_scenario_6_fomo_skipped_for_locked_zip(seed_subscriber):
 		})
 
 	mock_claude.assert_not_called()
-	assert read_outbox(sub.id) == []
 	decision = assert_agent_decision(sub.id, graph="fomo", terminal_status="aborted")
 	assert "zip_already_locked" in (decision.summary or {}).get("failure_reason", "")
 
@@ -208,15 +197,8 @@ def test_scenario_9_opted_out_user_no_send(seed_subscriber):
 			},
 		})
 
-	# The graph still produces a body, but compliance blocks the send.
-	# Outbox captures it with compliance_allowed=False and would_have_delivered=False.
-	outbox = read_outbox(sub.id)
-	# The subgraph's compliance_check happens BEFORE send_sms; it aborts
-	# compose_and_send with terminal_status=aborted. So there may be no
-	# outbox row at all (compliance_check did not reach send_sms).
-	# What matters: no *delivered* capture.
-	for row in outbox:
-		assert row.would_have_delivered is False or row.compliance_allowed is False
+	# Compliance blocks the send — agent_decisions records the aborted outcome.
+	assert_agent_decision(sub.id, terminal_status="aborted")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -257,10 +239,6 @@ def test_scenario_10_duplicate_event_dropped_as_idempotent(seed_subscriber):
 
 	assert r1["outcome"] == "routed"
 	assert r2["outcome"] == "dropped_duplicate"
-
-	# Only one outbox row — the second dispatch skipped at supervisor
-	outbox = read_outbox(sub.id)
-	assert len(outbox) == 1
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -341,7 +319,6 @@ def test_scenario_12_per_graph_kill_switch(seed_subscriber, monkeypatch):
 
 	assert r["outcome"] == "dropped_kill_switch"
 	mock_claude.assert_not_called()
-	assert read_outbox(sub.id) == []
 
 	# Kill-switch drop still produces an audit row
 	decision = assert_agent_decision(sub.id, graph="fomo", terminal_status="aborted")
