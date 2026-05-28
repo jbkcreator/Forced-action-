@@ -2587,6 +2587,7 @@ class AgentDecision(Base):
             name="check_agent_autonomy_class",
         ),
         Index("idx_agent_decisions_graph_started", "graph_name", "started_at"),
+        Index("idx_agent_decisions_subscriber_started", "subscriber_id", "started_at"),
     )
 
     def __repr__(self):
@@ -3274,6 +3275,64 @@ class CountyLaunchAudit(Base):
 
     def __repr__(self) -> str:
         return f"<CountyLaunchAudit(id={self.id}, county={self.county_id}, event={self.event_type})>"
+
+
+# ============================================================================
+# WAITLIST
+# ============================================================================
+
+class WaitlistEntry(Base):
+    """
+    One person's interest in a (zip_code, vertical, county_id) tuple.
+    Replaces ZipTerritory.waitlist_emails array.
+    waitlist_type='coming_soon' fires on county launch;
+    waitlist_type='sold_out' fires on ZIP available transition.
+    """
+    __tablename__ = "waitlist_entries"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    zip_code: Mapped[str] = mapped_column(String(10), nullable=False)
+    vertical: Mapped[str] = mapped_column(String(50), nullable=False)
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    email: Mapped[str] = mapped_column(String(255), nullable=False)
+    phone_e164: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    sms_opt_in: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    waitlist_type: Mapped[str] = mapped_column(String(20), nullable=False, default="sold_out")
+    signup_ip: Mapped[Optional[str]] = mapped_column(String(45), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    notified_email_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    notified_sms_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    reactivation_decision_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="waiting", server_default="waiting")
+
+    __table_args__ = (
+        UniqueConstraint("zip_code", "vertical", "county_id", "email",
+                         name="uq_waitlist_zip_vert_county_email"),
+        Index("ix_waitlist_county_status", "county_id", "status"),
+        Index("ix_waitlist_county_type_status", "county_id", "waitlist_type", "status"),
+        Index("ix_waitlist_zip_vertical", "zip_code", "vertical"),
+        CheckConstraint(
+            "status IN ('waiting','notified','converted','expired','opted_out','lost')",
+            name="ck_waitlist_entries_status",
+        ),
+        CheckConstraint(
+            "waitlist_type IN ('coming_soon','sold_out')",
+            name="ck_waitlist_entries_type",
+        ),
+        CheckConstraint(
+            "vertical IN ('roofing','restoration','public_adjusters',"
+            "'wholesalers','fix_flip','attorneys')",
+            name="ck_waitlist_entries_vertical",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (f"<WaitlistEntry(id={self.id}, zip={self.zip_code}, "
+                f"vertical={self.vertical}, type={self.waitlist_type}, "
+                f"status={self.status})>")
 
 
 # ============================================================================
