@@ -6,6 +6,7 @@ Endpoints:
     GET  /api/admin/cora-incidents/{incident_id}        — detail
     POST /api/admin/cora-incidents/{incident_id}/acknowledge — ack action
     POST /api/admin/cora-incidents/{incident_id}/resolve     — close incident
+    GET  /api/admin/cora/subscribers/{subscriber_id}/timeline — Cora touch timeline
 
 All endpoints are JWT-protected via get_current_admin.
 All DB access uses sa_text() / session.execute — no ORM chains.
@@ -13,6 +14,7 @@ All DB access uses sa_text() / session.execute — no ORM chains.
 
 from __future__ import annotations
 
+import base64
 import logging
 from datetime import datetime
 from typing import Any, Optional
@@ -298,3 +300,163 @@ def resolve_cora_incident(
         raise HTTPException(status_code=500, detail="Failed to resolve cora incident")
 
     return dict(updated)
+
+
+# ── GET /cora/subscribers/{subscriber_id}/timeline ───────────────────────────
+
+_VALID_TERMINAL_STATUSES = frozenset({"completed", "aborted", "escalated", "failed"})
+
+
+def _encode_cursor(started_at: datetime, decision_id: str) -> str:
+    raw = f"{started_at.isoformat()}|{decision_id}"
+    return base64.urlsafe_b64encode(raw.encode()).decode()
+
+
+def _decode_cursor(cursor: str) -> tuple[str, str]:
+    try:
+        raw = base64.urlsafe_b64decode(cursor.encode()).decode()
+        started_at_iso, decision_id = raw.split("|", 1)
+        return started_at_iso, decision_id
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid cursor")
+
+
+@router.get("/cora/subscribers/{subscriber_id}/timeline")
+def get_subscriber_cora_timeline(
+    subscriber_id: int,
+    cursor: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    graph_name: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    since: Optional[datetime] = Query(None),
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(_get_db),
+) -> dict[str, Any]:
+    """Per-subscriber Cora touch timeline. One row per agent_decisions entry, newest first."""
+    if status is not None and status not in _VALID_TERMINAL_STATUSES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"status must be one of {sorted(_VALID_TERMINAL_STATUSES)}",
+        )
+
+    # Verify subscriber exists.
+    try:
+        sub_row = db.execute(
+            sa_text("SELECT id FROM subscribers WHERE id = :id"),
+            {"id": subscriber_id},
+        ).fetchone()
+    except SQLAlchemyError:
+        logger.exception("timeline subscriber check DB error subscriber_id=%s", subscriber_id)
+        raise HTTPException(status_code=500, detail="Database error")
+
+    if sub_row is None:
+        raise HTTPException(status_code=404, detail=f"Subscriber {subscriber_id} not found")
+
+    conditions: list[str] = ["subscriber_id = :subscriber_id"]
+    params: dict[str, Any] = {"subscriber_id": subscriber_id, "limit": limit + 1}
+
+    if graph_name is not None:
+        conditions.append("graph_name = :graph_name")
+        params["graph_name"] = graph_name
+    if status is not None:
+        conditions.append("terminal_status = :status")
+        params["status"] = status
+    if since is not None:
+        conditions.append("started_at >= :since")
+        params["since"] = since
+    if cursor is not None:
+        cursor_started_at, cursor_decision_id = _decode_cursor(cursor)
+        conditions.append(
+            "(started_at, decision_id) < (:cursor_started_at, :cursor_decision_id)"
+        )
+        params["cursor_started_at"] = cursor_started_at
+        params["cursor_decision_id"] = cursor_decision_id
+
+    where = " AND ".join(conditions)
+
+    try:
+        rows = db.execute(sa_text(f"""
+            SELECT
+                decision_id, graph_name, event_type,
+                started_at, completed_at, terminal_status,
+                autonomy_class, was_autonomous, variant_id,
+                requires_approval, approved_at, approved_by,
+                overridden_at, overridden_by, override_reason,
+                tokens_used, cost_usd, summary
+            FROM agent_decisions
+            WHERE {where}
+            ORDER BY started_at DESC, decision_id DESC
+            LIMIT :limit
+        """), params).mappings().all()
+    except SQLAlchemyError:
+        logger.exception("timeline decisions DB error subscriber_id=%s", subscriber_id)
+        raise HTTPException(status_code=500, detail="Failed to query timeline")
+
+    has_more = len(rows) > limit
+    page_rows = list(rows[:limit])
+
+    # Fetch child SMS sends for this page in one query.
+    decision_ids = [r["decision_id"] for r in page_rows]
+    sms_by_decision: dict[str, list[dict]] = {d: [] for d in decision_ids}
+    if decision_ids:
+        try:
+            sms_rows = db.execute(
+                sa_text("""
+                    SELECT id, decision_id, outcome, message_type, vendor,
+                           vendor_message_id, body_preview, created_at
+                    FROM sms_send_logs
+                    WHERE decision_id = ANY(:ids)
+                    ORDER BY created_at ASC
+                """),
+                {"ids": decision_ids},
+            ).mappings().all()
+        except SQLAlchemyError:
+            logger.exception("timeline sms_send_logs DB error subscriber_id=%s", subscriber_id)
+            raise HTTPException(status_code=500, detail="Failed to query SMS sends")
+
+        for sms in sms_rows:
+            sms_by_decision[sms["decision_id"]].append(dict(sms))
+
+    def _serialize(row: Any) -> dict[str, Any]:
+        d = dict(row)
+        override: Optional[dict] = None
+        if d.get("overridden_at"):
+            override = {
+                "overridden_at": d["overridden_at"],
+                "overridden_by": d.get("overridden_by"),
+                "override_reason": d.get("override_reason"),
+            }
+        elif d.get("approved_at"):
+            override = {
+                "approved_at": d["approved_at"],
+                "approved_by": d.get("approved_by"),
+            }
+        return {
+            "decision_id": d["decision_id"],
+            "graph_name": d["graph_name"],
+            "event_type": d.get("event_type"),
+            "started_at": d["started_at"],
+            "completed_at": d.get("completed_at"),
+            "terminal_status": d.get("terminal_status"),
+            "autonomy_class": d.get("autonomy_class"),
+            "was_autonomous": d.get("was_autonomous", False),
+            "requires_approval": d.get("requires_approval", False),
+            "variant_id": d.get("variant_id"),
+            "tokens_used": d.get("tokens_used", 0),
+            "cost_usd": float(d["cost_usd"]) if d.get("cost_usd") is not None else None,
+            "override": override,
+            "summary": d.get("summary"),
+            "sms_sends": sms_by_decision.get(d["decision_id"], []),
+        }
+
+    items = [_serialize(r) for r in page_rows]
+    next_cursor: Optional[str] = None
+    if has_more and items:
+        last = items[-1]
+        next_cursor = _encode_cursor(last["started_at"], last["decision_id"])
+
+    return {
+        "subscriber_id": subscriber_id,
+        "items": items,
+        "next_cursor": next_cursor,
+    }
