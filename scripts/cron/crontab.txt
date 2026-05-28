@@ -360,4 +360,8 @@ COUNTY_ID=hillsborough
 # launch playbook (v1: manual Slack thread) for approved candidates.
 */15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.county_launch_runner
 
+# County Live Reactivation — every 5 min. Fires waitlist notifications
+# for newly-launched counties (coming_soon entries).
+*/5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.county_live_reactivation
+
 # === END FORCED-ACTION-PLATFORM ===
