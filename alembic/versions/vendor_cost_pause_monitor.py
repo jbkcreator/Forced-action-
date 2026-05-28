@@ -20,79 +20,50 @@ depends_on = None
 
 
 def upgrade() -> None:
-    # -- vendor_cost_pauses table -------------------------------------------------
-    op.create_table(
-        "vendor_cost_pauses",
-        sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
-        sa.Column("vendor", sa.String(30), nullable=False),
-        sa.Column("pause_target", sa.String(80), nullable=False),
-        sa.Column("source_table", sa.String(80), nullable=True),
-        sa.Column("source_key", sa.String(120), nullable=True),
-        sa.Column("reason", sa.Text(), nullable=False),
-        sa.Column("anomaly_score", sa.Numeric(10, 4), nullable=True),
-        sa.Column("today_cost_usd", sa.Numeric(10, 6), nullable=True),
-        sa.Column("baseline_avg_usd", sa.Numeric(10, 6), nullable=True),
-        sa.Column("baseline_stddev_usd", sa.Numeric(10, 6), nullable=True),
-        sa.Column("threshold_usd", sa.Numeric(10, 6), nullable=True),
-        sa.Column("sample_n", sa.Integer(), nullable=True),
-        sa.Column("window_days", sa.Integer(), nullable=False, server_default="14"),
-        sa.Column("paused_at", sa.DateTime(), nullable=False, server_default=sa.func.now()),
-        sa.Column("auto_resume_at", sa.DateTime(), nullable=True),
-        sa.Column("resumed_at", sa.DateTime(), nullable=True),
-        sa.Column("status", sa.String(20), nullable=False, server_default="active"),
-        sa.Column("created_by", sa.String(40), nullable=False, server_default="cost_monitor"),
-        sa.Column("resumed_by", sa.String(80), nullable=True),
-        sa.Column("metadata_json", JSONB(), nullable=True, server_default=sa.text("'{}'")),
-        sa.Column("created_at", sa.DateTime(), nullable=False, server_default=sa.func.now()),
-        sa.Column("updated_at", sa.DateTime(), nullable=False, server_default=sa.func.now()),
-        sa.CheckConstraint(
-            "status IN ('active', 'auto_resumed', 'manually_resumed', 'superseded')",
-            name="check_vendor_cost_pause_status",
-        ),
-    )
-    op.create_index("idx_vendor_cost_pause_vendor", "vendor_cost_pauses", ["vendor"])
-    op.create_index("idx_vendor_cost_pause_target", "vendor_cost_pauses", ["pause_target"])
-    op.create_index(
-        "idx_vendor_cost_pause_vendor_target",
-        "vendor_cost_pauses",
-        ["vendor", "pause_target"],
-    )
-    op.create_index(
-        "idx_vendor_cost_pause_status_resume",
-        "vendor_cost_pauses",
-        ["status", "auto_resume_at"],
-    )
-    op.create_index(
-        "idx_vendor_cost_pause_paused_at",
-        "vendor_cost_pauses",
-        ["paused_at"],
-    )
+    # -- vendor_cost_pauses table (idempotent) ------------------------------------
+    op.execute("""
+        CREATE TABLE IF NOT EXISTS vendor_cost_pauses (
+            id SERIAL PRIMARY KEY,
+            vendor VARCHAR(30) NOT NULL,
+            pause_target VARCHAR(80) NOT NULL,
+            source_table VARCHAR(80),
+            source_key VARCHAR(120),
+            reason TEXT NOT NULL,
+            anomaly_score NUMERIC(10,4),
+            today_cost_usd NUMERIC(10,6),
+            baseline_avg_usd NUMERIC(10,6),
+            baseline_stddev_usd NUMERIC(10,6),
+            threshold_usd NUMERIC(10,6),
+            sample_n INTEGER,
+            window_days INTEGER NOT NULL DEFAULT 14,
+            paused_at TIMESTAMP NOT NULL DEFAULT now(),
+            auto_resume_at TIMESTAMP,
+            resumed_at TIMESTAMP,
+            status VARCHAR(20) NOT NULL DEFAULT 'active',
+            created_by VARCHAR(40) NOT NULL DEFAULT 'cost_monitor',
+            resumed_by VARCHAR(80),
+            metadata_json JSONB DEFAULT '{}',
+            created_at TIMESTAMP NOT NULL DEFAULT now(),
+            updated_at TIMESTAMP NOT NULL DEFAULT now(),
+            CONSTRAINT check_vendor_cost_pause_status
+                CHECK (status IN ('active','auto_resumed','manually_resumed','superseded'))
+        )
+    """)
+    op.execute("CREATE INDEX IF NOT EXISTS idx_vendor_cost_pause_vendor ON vendor_cost_pauses (vendor)")
+    op.execute("CREATE INDEX IF NOT EXISTS idx_vendor_cost_pause_target ON vendor_cost_pauses (pause_target)")
+    op.execute("CREATE INDEX IF NOT EXISTS idx_vendor_cost_pause_vendor_target ON vendor_cost_pauses (vendor, pause_target)")
+    op.execute("CREATE INDEX IF NOT EXISTS idx_vendor_cost_pause_status_resume ON vendor_cost_pauses (status, auto_resume_at)")
+    op.execute("CREATE INDEX IF NOT EXISTS idx_vendor_cost_pause_paused_at ON vendor_cost_pauses (paused_at)")
 
-    # -- api_usage_logs column additions -----------------------------------------
-    op.add_column(
-        "api_usage_logs",
-        sa.Column("graph_name", sa.String(60), nullable=True),
-    )
-    op.add_column(
-        "api_usage_logs",
-        sa.Column("pause_target", sa.String(80), nullable=True),
-    )
-    op.add_column(
-        "api_usage_logs",
-        sa.Column("blocked_by_pause", sa.Boolean(), nullable=False, server_default=sa.text("false")),
-    )
-    op.add_column(
-        "api_usage_logs",
-        sa.Column("block_reason", sa.String(120), nullable=True),
-    )
+    # -- api_usage_logs column additions (idempotent) ----------------------------
+    op.execute("ALTER TABLE api_usage_logs ADD COLUMN IF NOT EXISTS graph_name VARCHAR(60)")
+    op.execute("ALTER TABLE api_usage_logs ADD COLUMN IF NOT EXISTS pause_target VARCHAR(80)")
+    op.execute("ALTER TABLE api_usage_logs ADD COLUMN IF NOT EXISTS blocked_by_pause BOOLEAN NOT NULL DEFAULT false")
+    op.execute("ALTER TABLE api_usage_logs ADD COLUMN IF NOT EXISTS block_reason VARCHAR(120)")
 
-    op.create_index("idx_api_usage_graph_name", "api_usage_logs", ["graph_name"])
-    op.create_index("idx_api_usage_pause_target", "api_usage_logs", ["pause_target"])
-    op.create_index(
-        "idx_api_usage_pause_created",
-        "api_usage_logs",
-        ["pause_target", "created_at"],
-    )
+    op.execute("CREATE INDEX IF NOT EXISTS idx_api_usage_graph_name ON api_usage_logs (graph_name)")
+    op.execute("CREATE INDEX IF NOT EXISTS idx_api_usage_pause_target ON api_usage_logs (pause_target)")
+    op.execute("CREATE INDEX IF NOT EXISTS idx_api_usage_pause_created ON api_usage_logs (pause_target, created_at)")
 
 
 def downgrade() -> None:

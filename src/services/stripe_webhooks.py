@@ -423,6 +423,35 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
             subscriber.founding_price_id  = founding_price_id
             subscriber.rate_locked_at     = now
 
+    # ── Plan price + trial flags (fa048) ────────────────────────────────────
+    # amount_total is in cents; represents the charge for this billing period.
+    # For active (non-trial) subscriptions this equals the monthly plan price.
+    _amount_total = session.get("amount_total") or 0
+    if _amount_total > 0:
+        subscriber.plan_price = round(_amount_total / 100, 2)
+    # Trial detection: Stripe sets amount_total=0 when trial_period_days > 0.
+    # Retrieve the subscription to get the real price and trial_end.
+    if stripe_subscription_id and _amount_total == 0:
+        try:
+            _sub = stripe.Subscription.retrieve(
+                stripe_subscription_id, expand=["items.data.price"]
+            )
+            _items = (_sub.get("items") or {}).get("data") or []
+            if _items:
+                _unit = (_items[0].get("price") or {}).get("unit_amount") or 0
+                if _unit:
+                    subscriber.plan_price = round(_unit / 100, 2)
+            _trial_end = _sub.get("trial_end")
+            if _trial_end:
+                from datetime import timezone as _tz
+                subscriber.is_trial = True
+                subscriber.trial_ends_at = datetime.fromtimestamp(_trial_end, tz=timezone.utc)
+        except Exception:
+            logger.warning(
+                "checkout.session.completed: could not retrieve subscription %s for trial/price",
+                stripe_subscription_id, exc_info=True,
+            )
+
     db.flush()  # get subscriber.id before ZIP territory inserts
 
     # ── Race-free saved-card flag (fa016 followup #20) ───────────────────────

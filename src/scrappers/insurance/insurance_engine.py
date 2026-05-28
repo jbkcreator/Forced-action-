@@ -238,6 +238,7 @@ def scrape_insurance_claims(
             matched=created,
             unmatched=0,
             skipped=skipped_duplicate,
+            county_id=county_id,
         )
     except Exception as stats_err:
         logger.warning("⚠ Could not record scraper stats (non-critical): %s", stats_err)

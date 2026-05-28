@@ -324,14 +324,6 @@ def run_bankruptcy_pipeline(lookback_days: int = 1, county_id: str = "hillsborou
 		logger.info(f"Total Tampa bankruptcy leads: {len(tampa_leads)}")
 		logger.info("=" * 80)
 
-		# Record scraper stats (load_scraped_data_to_db will upsert with matched/unmatched
-		# when --load-to-db is used; this covers the dry-run path).
-		try:
-			from src.utils.scraper_db_helper import record_scraper_stats
-			record_scraper_stats(source_type='bankruptcy', total_scraped=len(tampa_leads), matched=0, unmatched=0, skipped=0, run_success=True, duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id)
-		except Exception as _se:
-			logger.warning("Could not record scraper stats: %s", _se)
-
 		return True
 
 	except Exception as e:
@@ -399,7 +391,7 @@ if __name__ == "__main__":
 			if csv_files:
 				csv_to_load = csv_files[0]
 				logger.info(f"Loading to database: {csv_to_load}")
-				load_scraped_data_to_db('bankruptcy', csv_to_load, destination_dir=RAW_BANKRUPTCY_DIR)
+				load_scraped_data_to_db('bankruptcy', csv_to_load, destination_dir=RAW_BANKRUPTCY_DIR, county_id=args.county_id)
 			else:
 				logger.error("No bankruptcy CSV file found to load")
 				sys.exit(1)

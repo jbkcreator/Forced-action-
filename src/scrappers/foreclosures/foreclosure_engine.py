@@ -391,55 +391,14 @@ async def run_foreclosure_pipeline(
 		return None
 
 	if load_to_db:
-		_load_to_database(csv_file, county_id)
-
-	return csv_file
-
-
-def _load_to_database(csv_file: Path, county_id: str) -> None:
-	"""Load scraped CSV into the foreclosures table via ForeclosureLoader."""
-	from src.core.database import get_db_context
-	from src.loaders.foreclosures import ForeclosureLoader
-
-	logger.info("=" * 60)
-	logger.info("Loading foreclosures into database...")
-	logger.info("=" * 60)
-
-	try:
-		with get_db_context() as session:
-			loader = ForeclosureLoader(session, county_id=county_id)
-			matched, unmatched, skipped = loader.load_from_csv(
-				str(csv_file), skip_duplicates=True
-			)
-			session.commit()
-
-		total = matched + unmatched + skipped
-		match_rate = (matched / total * 100) if total > 0 else 0
-		logger.info(
-			f"Matched: {matched}  Unmatched: {unmatched}  "
-			f"Skipped: {skipped}  Match rate: {match_rate:.1f}%"
+		from src.utils.scraper_db_helper import load_scraped_data_to_db
+		load_scraped_data_to_db(
+			"foreclosures", csv_file,
+			destination_dir=csv_file.parent.parent,
+			county_id=county_id,
 		)
 
-		# Rescore affected properties immediately
-		try:
-			with get_db_context() as session:
-				loader2 = ForeclosureLoader(session, county_id=county_id)
-				affected_ids = loader2.get_affected_property_ids()
-			if affected_ids:
-				logger.info(f"Triggering CDS rescore for {len(affected_ids)} properties...")
-				from src.services.cds_engine import MultiVerticalScorer
-				from src.core.database import get_db_context as _gdb
-				with _gdb() as score_session:
-					scorer = MultiVerticalScorer(score_session)
-					scorer.score_properties_by_ids(affected_ids, save_to_db=True, county_id=county_id)
-					score_session.commit()
-				logger.info("CDS rescore complete")
-		except Exception as e:
-			logger.warning(f"CDS rescore failed (non-critical): {e}")
-
-	except Exception as e:
-		logger.error(f"Database load failed: {e}")
-		logger.debug(traceback.format_exc())
+	return csv_file
 
 
 # ---------------------------------------------------------------------------

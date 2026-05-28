@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 from src.agents.tools.gating_tools import budget_check, compliance_check
 from src.agents.tools.write_tools import log_decision, send_sms
+from src.core.database import get_db_context
 from src.services.claude_router import call_claude_with_usage
 
 
@@ -114,14 +115,17 @@ def _node_compose(state: ComposeAndSendState) -> ComposeAndSendState:
 	messages: List[Dict[str, Any]] = [{"role": "user", "content": user}]
 
 	try:
-		result = call_claude_with_usage(
-			task_type=task_type,
-			messages=messages,
-			system=system or None,
-			cache_system=cache_system,
-			max_tokens=max_tokens,
-			subscriber_id=state.get("subscriber_id"),
-		)
+		with get_db_context() as _db:
+			result = call_claude_with_usage(
+				task_type=task_type,
+				messages=messages,
+				system=system or None,
+				cache_system=cache_system,
+				max_tokens=max_tokens,
+				subscriber_id=state.get("subscriber_id"),
+				graph_name=state.get("graph_name"),
+				db=_db,
+			)
 	except Exception as exc:
 		# API timeout or error — use static fallback body if available rather
 		# than aborting the decision entirely.

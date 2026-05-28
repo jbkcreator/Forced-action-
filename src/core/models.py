@@ -1046,6 +1046,12 @@ class Subscriber(Base):
     revenue_signal_breakdown: Mapped[Optional[dict]] = mapped_column(JSONB)
     revenue_signal_updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
+    # ── Revenue / churn tracking (fa048) ─────────────────────────────────────
+    plan_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)
+    churned_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    is_trial: Mapped[bool] = mapped_column(Boolean, server_default="false", nullable=False, default=False)
+    trial_ends_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
     # Audit
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(
@@ -2047,6 +2053,23 @@ class MessageOutcome(Base):
     conversion_within_48h: Mapped[bool] = mapped_column(Boolean, default=False)
     revenue_attributed: Mapped[Optional[float]] = mapped_column(Numeric(10, 2))
     # fa038 — personalization fields for variant performance attribution
+
+    # hold / review / cancel flow
+    send_status = Column(String(20), nullable=False, default="sent")
+    requires_review = Column(Boolean, nullable=False, default=False)
+    review_reason = Column(String(255), nullable=True)
+
+    scheduled_send_at = Column(DateTime, nullable=True)
+    approved_at = Column(DateTime, nullable=True)
+    approved_by = Column(String(100), nullable=True)
+
+    cancelled_at = Column(DateTime, nullable=True)
+    cancelled_by = Column(String(100), nullable=True)
+    cancel_reason = Column(String(255), nullable=True)
+
+    # link back to Cora decision
+    decision_id = Column(String(36), nullable=True, index=True)
+
     trade_vertical: Mapped[Optional[str]] = mapped_column(String(50))
     county_id: Mapped[Optional[str]] = mapped_column(String(50))
     behavioral_segment: Mapped[Optional[str]] = mapped_column(String(30))
@@ -2737,6 +2760,7 @@ class SmsSendLog(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     phone: Mapped[Optional[str]] = mapped_column(String(20))
     subscriber_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=True)
+    message_outcome_id = Column(Integer, ForeignKey("message_outcomes.id"), nullable=True, index=True)
     task_type: Mapped[Optional[str]] = mapped_column(String(80))
     message_type: Mapped[str] = mapped_column(String(20), nullable=False)
     outcome: Mapped[str] = mapped_column(String(20), nullable=False)
@@ -3393,4 +3417,33 @@ class ChatMessage(Base):
 
     def __repr__(self) -> str:
         return f"<ChatMessage(id={self.id}, session_id={self.session_id}, role={self.role})>"
+
+
+# ============================================================================
+# SYNTHFLOW CALLS (fa048)
+# ============================================================================
+
+class SynthflowCall(Base):
+    """One row per inbound post-call webhook from Synthflow / Finetuner.ai."""
+    __tablename__ = "synthflow_calls"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    prospect_phone: Mapped[str] = mapped_column(String(20), nullable=False)
+    outcome: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    vertical: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    zip_code: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    contact_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    call_date: Mapped[date] = mapped_column(Date, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        Index("idx_synthflow_calls_call_date", "call_date"),
+        Index("idx_synthflow_calls_outcome", "outcome"),
+        Index("idx_synthflow_calls_prospect_phone", "prospect_phone"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<SynthflowCall(id={self.id}, phone={self.prospect_phone}, outcome={self.outcome})>"
 

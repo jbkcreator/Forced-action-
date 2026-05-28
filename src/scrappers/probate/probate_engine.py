@@ -434,15 +434,6 @@ def run_probate_pipeline(
         logger.info("PROBATE PIPELINE COMPLETE — %d records, output: %s", len(df), output_path)
         logger.info("=" * 60)
 
-        try:
-            from src.utils.scraper_db_helper import record_scraper_stats
-            record_scraper_stats(
-                source_type="probate", total_scraped=len(df), matched=0, unmatched=0, skipped=0,
-                run_success=True, duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id,
-            )
-        except Exception as _se:
-            logger.warning("[probate] Could not record scraper stats: %s", _se)
-
         return True
 
     except Exception as e:

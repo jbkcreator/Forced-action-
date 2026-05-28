@@ -590,15 +590,6 @@ def run_eviction_pipeline(
         logger.info("EVICTION PIPELINE COMPLETED — %d records, output: %s", len(evictions_df), output_path)
         logger.info(OUTPUT_SEPARATOR)
 
-        try:
-            from src.utils.scraper_db_helper import record_scraper_stats
-            record_scraper_stats(
-                source_type="evictions", total_scraped=len(evictions_df), matched=0, unmatched=0, skipped=0,
-                run_success=True, duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id,
-            )
-        except Exception as _se:
-            logger.warning("[evictions] Could not record scraper stats: %s", _se)
-
         return True
 
     except Exception as e:

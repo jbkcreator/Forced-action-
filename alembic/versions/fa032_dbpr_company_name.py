@@ -21,33 +21,27 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column(
-        "dbpr_contacts",
-        sa.Column("company_name", sa.String(255), nullable=True),
+    # Idempotent — columns/constraints may already exist if applied outside Alembic
+    op.execute("ALTER TABLE dbpr_contacts ADD COLUMN IF NOT EXISTS company_name VARCHAR(255)")
+    op.execute(
+        "ALTER TABLE dbpr_contacts ADD COLUMN IF NOT EXISTS"
+        " company_name_status VARCHAR(20) NOT NULL DEFAULT 'pending'"
     )
-    op.add_column(
-        "dbpr_contacts",
-        sa.Column(
-            "company_name_status",
-            sa.String(20),
-            nullable=False,
-            server_default="pending",
-        ),
+    op.execute(
+        "ALTER TABLE dbpr_contacts ADD COLUMN IF NOT EXISTS"
+        " company_name_scraped_at TIMESTAMPTZ"
     )
-    op.add_column(
-        "dbpr_contacts",
-        sa.Column("company_name_scraped_at", sa.DateTime(timezone=True), nullable=True),
+    op.execute(
+        "ALTER TABLE dbpr_contacts DROP CONSTRAINT IF EXISTS check_dbpr_company_name_status"
     )
     op.create_check_constraint(
         "check_dbpr_company_name_status",
         "dbpr_contacts",
         "company_name_status IN ('pending', 'found', 'none', 'failed')",
     )
-    # Drives the weekly incremental scrape: target pending + failed, oldest first.
-    op.create_index(
-        "ix_dbpr_company_name_status",
-        "dbpr_contacts",
-        ["company_name_status"],
+    op.execute(
+        "CREATE INDEX IF NOT EXISTS ix_dbpr_company_name_status"
+        " ON dbpr_contacts (company_name_status)"
     )
 
     # Allow the company scraper to record its run under a new source_type.
