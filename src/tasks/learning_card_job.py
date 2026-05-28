@@ -26,8 +26,13 @@ LEARNING_CARD_CACHE_TTL = 8 * 86400  # 8 days — matches read-side TTL in read_
 
 def run(dry_run: bool = False) -> dict:
     from src.core.database import get_db_context
+    from src.services.vendor_cost_pause_service import get_active_pause
     written = 0
     with get_db_context() as db:
+        if get_active_pause(db, "claude", "learning_card"):
+            logger.warning("[LearningCardJob] active vendor cost pause — skipping run")
+            return {"cards_written": 0, "skipped_by_pause": True}
+
         today = date.today()
         for generator in (_message_perf_card, _deal_pattern_card, _ab_result_card, _churn_signal_card):
             card = generator(db)

@@ -25,6 +25,7 @@ from config.ap_lite import (
 )
 from src.core.database import get_db_context
 from src.core.models import ManualActionLog, Subscriber
+from src.services.vendor_cost_pause_service import get_active_pause
 
 logger = logging.getLogger(__name__)
 
@@ -74,11 +75,17 @@ def run_sweep(dry_run: bool = False) -> dict:
         "candidates_found": 0,
         "events_emitted": 0,
         "errors": 0,
+        "skipped_by_pause": False,
     }
 
     today = date.today()
 
     with get_db_context() as db:
+        if get_active_pause(db, "claude", "ap_lite_sweep"):
+            logger.warning("[ApLiteSweep] active vendor cost pause — skipping run")
+            results["skipped_by_pause"] = True
+            return results
+
         subs = db.execute(
             select(Subscriber).where(
                 Subscriber.tier.in_(AP_LITE_ELIGIBLE_TIERS),

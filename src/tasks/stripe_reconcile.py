@@ -140,11 +140,71 @@ def reconcile_subscriptions(dry_run: bool = False) -> dict:
     return stats
 
 
+def log_stripe_daily_fees(dry_run: bool = False) -> dict:
+    """
+    Fetch today's Stripe balance transactions, sum processing fees,
+    and write a single ApiUsageLog row (service="stripe") for vendor cost reporting.
+
+    Stripe is alert-only in v1 — no auto-pause is triggered regardless of spend.
+    Returns: { "fee_usd": float, "transactions": int, "logged": bool }
+    """
+    from datetime import timezone as _tz, datetime as _dt
+    if not _init_stripe():
+        logger.warning("[StripeReconcile] Stripe not configured — skipping fee logging")
+        return {"fee_usd": 0.0, "transactions": 0, "logged": False}
+
+    today = _dt.now(_tz.utc).date()
+    day_start = int(_dt(today.year, today.month, today.day, tzinfo=_tz.utc).timestamp())
+    day_end = day_start + 86400
+
+    total_fee_usd = 0.0
+    tx_count = 0
+    try:
+        params = {
+            "type": "charge",
+            "created": {"gte": day_start, "lt": day_end},
+            "limit": 100,
+        }
+        while True:
+            page = stripe.BalanceTransaction.list(**params)
+            for bt in page.data:
+                total_fee_usd += bt.fee / 100.0
+                tx_count += 1
+            if not page.has_more:
+                break
+            params["starting_after"] = page.data[-1].id
+    except stripe.error.StripeError as exc:
+        logger.error("[StripeReconcile] Fee fetch failed: %s", exc)
+        return {"fee_usd": 0.0, "transactions": 0, "logged": False}
+
+    if dry_run:
+        logger.info("[StripeReconcile][DRY RUN] Would log Stripe fee: $%.4f (%d tx)", total_fee_usd, tx_count)
+        return {"fee_usd": total_fee_usd, "transactions": tx_count, "logged": False}
+
+    if total_fee_usd > 0:
+        with get_db_context() as db:
+            from src.core.models import ApiUsageLog
+            db.add(ApiUsageLog(
+                service="stripe",
+                task_type="daily_fee_summary",
+                cost_usd=total_fee_usd,
+                blocked_by_pause=False,
+            ))
+            db.commit()
+        logger.info("[StripeReconcile] Logged Stripe daily fees: $%.4f (%d tx)", total_fee_usd, tx_count)
+
+    return {"fee_usd": total_fee_usd, "transactions": tx_count, "logged": total_fee_usd > 0 and not dry_run}
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Reconcile Stripe subscriptions with local DB")
     parser.add_argument("--dry-run", action="store_true", help="Check only, do not activate")
+    parser.add_argument("--log-fees", action="store_true", help="Also log today's Stripe processing fees")
     args = parser.parse_args()
 
     result = reconcile_subscriptions(dry_run=args.dry_run)
+    if args.log_fees:
+        fee_result = log_stripe_daily_fees(dry_run=args.dry_run)
+        print("Stripe fees:", fee_result)
     if result["failed"] > 0:
         sys.exit(1)

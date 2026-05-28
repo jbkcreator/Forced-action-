@@ -29,6 +29,8 @@ from sqlalchemy.orm import Session
 
 from config.settings import settings
 from src.core.models import ApiUsageLog
+from src.services.vendor_cost_attribution import resolve_pause_target
+from src.services.vendor_cost_pause_service import get_active_pause
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +73,8 @@ def call_claude(
     cache_system: bool = False,
     max_tokens: int = 1024,
     subscriber_id: Optional[int] = None,
+    graph_name: Optional[str] = None,
+    pause_target: Optional[str] = None,
     db: Optional[Session] = None,
 ) -> str:
     """
@@ -117,10 +121,22 @@ def call_claude(
 
     logger.debug("claude_router: task=%s model=%s", task_type, model_tier)
 
+    # ── Vendor cost pause check (Phase 2) ────────────────────────────────
+    resolved_target = pause_target or resolve_pause_target(graph_name=graph_name, task_type=task_type)
+    active_pause = get_active_pause(db, "claude", resolved_target) if db and resolved_target else None
+    if active_pause:
+        logger.warning("claude_router: blocked task=%s pause_target=%s reason=%s",
+                       task_type, resolved_target, active_pause.reason)
+        _log_usage(None, model_tier, task_type, subscriber_id, db,
+                   graph_name=graph_name, pause_target=resolved_target,
+                   blocked_by_pause=True, block_reason=f"pause: {active_pause.reason}")
+        return f"[BLOCKED] Vendor cost pause active for '{resolved_target}': {active_pause.reason}"
+
     response = client.messages.create(**kwargs)
 
     text = _extract_text(response)
-    _log_usage(response, model_tier, task_type, subscriber_id, db)
+    _log_usage(response, model_tier, task_type, subscriber_id, db,
+               graph_name=graph_name, pause_target=resolved_target)
 
     return text
 
@@ -132,6 +148,8 @@ def call_claude_with_usage(
     cache_system: bool = False,
     max_tokens: int = 1024,
     subscriber_id: Optional[int] = None,
+    graph_name: Optional[str] = None,
+    pause_target: Optional[str] = None,
     db: Optional[Session] = None,
 ) -> dict:
     """
@@ -171,10 +189,28 @@ def call_claude_with_usage(
         else:
             kwargs["system"] = system
 
+    # ── Vendor cost pause check (Phase 2) ────────────────────────────────
+    resolved_target = pause_target or resolve_pause_target(graph_name=graph_name, task_type=task_type)
+    active_pause = get_active_pause(db, "claude", resolved_target) if db and resolved_target else None
+    if active_pause:
+        logger.warning("claude_router: blocked task=%s pause_target=%s reason=%s",
+                       task_type, resolved_target, active_pause.reason)
+        _log_usage(None, model_tier, task_type, subscriber_id, db,
+                   graph_name=graph_name, pause_target=resolved_target,
+                   blocked_by_pause=True, block_reason=f"pause: {active_pause.reason}")
+        return {
+            "text": f"[BLOCKED] Vendor cost pause active for '{resolved_target}': {active_pause.reason}",
+            "model": model_tier,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cost_usd": 0.0,
+        }
+
     response = client.messages.create(**kwargs)
 
     text = _extract_text(response)
-    _log_usage(response, model_tier, task_type, subscriber_id, db)
+    _log_usage(response, model_tier, task_type, subscriber_id, db,
+               graph_name=graph_name, pause_target=resolved_target)
 
     usage = getattr(response, "usage", None)
     input_tokens = getattr(usage, "input_tokens", 0) if usage else 0
@@ -301,20 +337,29 @@ def _log_usage(
     task_type: str,
     subscriber_id: Optional[int],
     db: Optional[Session],
+    graph_name: Optional[str] = None,
+    pause_target: Optional[str] = None,
+    blocked_by_pause: bool = False,
+    block_reason: Optional[str] = None,
 ) -> None:
-    usage = getattr(response, "usage", None)
-    if not usage:
-        return
+    if blocked_by_pause:
+        # Blocked calls have no response -- log the skip with zero tokens/cost
+        input_tokens = 0
+        output_tokens = 0
+        cost_usd = 0.0
+    else:
+        usage = getattr(response, "usage", None)
+        if not usage:
+            return
+        input_tokens = getattr(usage, "input_tokens", 0)
+        output_tokens = getattr(usage, "output_tokens", 0)
+        costs = _COST_TABLE.get(model_tier, _COST_TABLE["sonnet"])
+        cost_usd = (input_tokens * costs["input"] + output_tokens * costs["output"]) / 1_000_000
 
-    input_tokens = getattr(usage, "input_tokens", 0)
-    output_tokens = getattr(usage, "output_tokens", 0)
-    costs = _COST_TABLE.get(model_tier, _COST_TABLE["sonnet"])
-    cost_usd = (input_tokens * costs["input"] + output_tokens * costs["output"]) / 1_000_000
-
-    logger.debug(
-        "claude_router: model=%s in=%d out=%d cost=$%.6f",
-        model_tier, input_tokens, output_tokens, cost_usd,
-    )
+        logger.debug(
+            "claude_router: model=%s in=%d out=%d cost=$%.6f",
+            model_tier, input_tokens, output_tokens, cost_usd,
+        )
 
     if db is None:
         return
@@ -327,6 +372,10 @@ def _log_usage(
             output_tokens=output_tokens,
             cost_usd=cost_usd,
             task_type=task_type,
+            graph_name=graph_name,
+            pause_target=pause_target,
+            blocked_by_pause=blocked_by_pause,
+            block_reason=block_reason,
             subscriber_id=subscriber_id,
             created_at=datetime.now(timezone.utc),
         ))

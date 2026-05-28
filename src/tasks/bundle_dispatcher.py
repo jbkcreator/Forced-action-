@@ -39,6 +39,7 @@ from config.revenue_ladder import (
 )
 from config.settings import settings
 from src.core.database import get_db_context
+from src.services.vendor_cost_pause_service import get_active_pause
 from src.core.models import (
     BundlePurchase,
     MessageOutcome,
@@ -222,10 +223,15 @@ def _log_outcome(subscriber_id: int, bundle_type: str, variant: str, db: Session
 # ── Main loop ────────────────────────────────────────────────────────────────
 
 def run(dry_run: bool = False) -> dict:
-    stats = {"checked": 0, "dispatched": 0, "skipped_cooldown": 0, "skipped_schedule": 0}
+    stats = {"checked": 0, "dispatched": 0, "skipped_cooldown": 0, "skipped_schedule": 0, "skipped_by_pause": False}
     now = datetime.now(timezone.utc)
 
     with get_db_context() as db:
+        if get_active_pause(db, "claude", "bundle_dispatcher"):
+            logger.warning("[BundleDispatcher] active vendor cost pause — skipping run")
+            stats["skipped_by_pause"] = True
+            return stats
+
         for bundle_type, trigger in BUNDLE_TRIGGERS.items():
             if not _should_dispatch(bundle_type, now):
                 stats["skipped_schedule"] += 1

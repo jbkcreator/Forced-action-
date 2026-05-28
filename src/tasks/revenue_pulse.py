@@ -22,6 +22,7 @@ from config.revenue_pulse import (
     DAILY_PULSE_TEMPLATE,
     KILL_SWITCH_LEVELS,
     MAX_DAILY_SMS_CHARS,
+    VENDOR_COST_LINE_MAX_CHARS,
     WEEKLY_PULSE_TEMPLATE,
 )
 from config.settings import settings
@@ -36,6 +37,7 @@ from src.core.models import (
     UserSegment,
     WalletBalance,
 )
+from src.services.vendor_cost_report import build_vendor_cost_summary, format_sms_cost_summary
 
 logger = logging.getLogger(__name__)
 
@@ -112,12 +114,23 @@ def _compose_daily(db: Session) -> str:
     kill = _kill_switch_status(db)
     chat = _chat_metrics_today(db)
 
+    # Vendor cost summary line (Phase 3)
+    vendor_cost_line = ""
+    try:
+        vc_summary = build_vendor_cost_summary(db)
+        cost_text = format_sms_cost_summary(vc_summary)
+        if cost_text:
+            vendor_cost_line = cost_text[:VENDOR_COST_LINE_MAX_CHARS] + "\n"
+    except Exception as exc:
+        logger.warning("[RevenuePulse] Vendor cost summary failed: %s", exc)
+        
     msg = DAILY_PULSE_TEMPLATE.format(
         date=today.strftime("%m/%d").lstrip("0").replace("/0", "/") if hasattr(today, "strftime") else str(today),
         lead_count=lead_count,
         wallet_active=wallet_active,
         top_deal=top_deal_str,
         alert=alert_str,
+        vendor_cost=vendor_cost_line,
         kill_switch=kill["status"],
     )
     if chat["sessions"] > 0:
