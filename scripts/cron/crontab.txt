@@ -221,6 +221,11 @@ COUNTY_ID=hillsborough
 # rows (revoked/upgraded licenses), deletes downloaded file after load.
 0 2 * * 0 $PROJECT/scripts/cron/run.sh src.scrappers.dbpr.dbpr_engine --source certified --county $COUNTY_ID
 15 2 * * 0 $PROJECT/scripts/cron/run.sh src.scrappers.dbpr.dbpr_engine --source registered --county $COUNTY_ID
+# Company name (DBA) scrape — Sunday 02:30 UTC, after the file sync creates new
+# rows. Per-license lookup on myfloridalicense.com (the bulk file has no DBA).
+# Table-wide (not county-scoped); fills company_name_status pending/failed,
+# leaves found/none alone. First backfill (~6k rows) runs ~2.5h in one session.
+30 2 * * 0 $PROJECT/scripts/cron/run.sh src.scrappers.dbpr.dbpr_company_scraper
 
 # ── STAGE 5: BUNDLES + AUTOPILOT + ANNUAL ───────────────────────────────────
 # Bundle dispatcher — every hour, contextually offers Weekend / Storm /
