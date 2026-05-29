@@ -208,6 +208,15 @@ COUNTY_ID=hillsborough
 # Writes reports/daily/report_YYYY-MM-DD.csv with scraper health + scoring summary
 30 9 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.daily_report
 
+# Pinellas daily report — 09:33 AM UTC Mon-Sat (staggered 3 min after Hillsborough)
+33 9 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.daily_report --county pinellas
+
+# ── DAILY DASHBOARD PDF ──────────────────────────────────────
+# 10-section executive PDF — 10:00 AM UTC Mon-Sat (after daily_report at 09:30)
+# Writes reports/daily_dashboard/YYYY-MM-DD_forced_action_daily_dashboard.pdf
+# 30-day retention; email delivery wired via render_html() in future
+0 10 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.daily_dashboard
+
 # ── HEALTH CHECK — every 4 hours (logs to separate file for monitoring)
 0 2,6,10,14,18,22 * * * $PROJECT/scripts/cron/run.sh src.tasks.health_check
 

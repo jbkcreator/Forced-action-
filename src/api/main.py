@@ -13,6 +13,7 @@ Endpoints:
     GET  /                         — Landing page
 """
 
+import functools
 import json
 import logging
 import re
@@ -43,6 +44,7 @@ from config.constants import TIER_DISPLAY
 from src.utils.logger import setup_logging
 from src.services.rate_limit import enforce_or_429
 from src.services.phone_utils import normalize as normalize_phone
+
 
 # Load config/logging.yaml so every logger.info/warning/error across src/* is
 # visible in the uvicorn console (instead of just uvicorn's access logs).
@@ -412,15 +414,9 @@ def landing_page():
     raise HTTPException(status_code=503, detail="UI not built — run npm run build in Forced-action-ui/")
 
 
-@app.get("/api/pricing")
-def get_pricing_info():
-    """Returns pricing config for the landing page.
-
-    Founding + regular dollar amounts come from Stripe Price objects (via the
-    STRIPE_PRICE_{TIER}_{FOUNDING|REGULAR} env vars). Display copy (label,
-    zip_limit, features) is owned by TIER_DISPLAY above. The frontend reads
-    this once at LandingPage mount and passes it through LandingContext.
-    """
+@functools.lru_cache(maxsize=1)
+def _cached_pricing_info() -> dict:
+    """Fetch pricing from Stripe once and cache for the process lifetime."""
     _s = get_settings()
     stripe.api_key = _s.active_stripe_secret_key.get_secret_value()
     all_prices = _price_ids()
@@ -455,7 +451,19 @@ def get_pricing_info():
             **TIER_DISPLAY[tier],
         }
 
-    return {"pricing": pricing_info}
+    return pricing_info
+
+
+@app.get("/api/pricing")
+def get_pricing_info():
+    """Returns pricing config for the landing page.
+
+    Founding + regular dollar amounts come from Stripe Price objects (via the
+    STRIPE_PRICE_{TIER}_{FOUNDING|REGULAR} env vars). Display copy (label,
+    zip_limit, features) is owned by TIER_DISPLAY above. The frontend reads
+    this once at LandingPage mount and passes it through LandingContext.
+    """
+    return {"pricing": _cached_pricing_info()}
 
 
 # ---------------------------------------------------------------------------
@@ -3238,6 +3246,13 @@ async def telnyx_inbound(request: Request, db: Session = Depends(get_db)):
         reply = sms_commands.dispatch(from_number, command, db)
         if reply:
             send_sms(from_number, reply, db, message_type="transactional")
+    else:
+        from src.services.cora_suppression import record_generic_sms_reply
+        record_generic_sms_reply(
+            db,
+            phone=from_number,
+            source_id=msg_id,
+        )
 
     return Response(content="", media_type="application/json")
 
@@ -3281,6 +3296,20 @@ def deal_capture(payload: DealCaptureRequest, db: Session = Depends(get_db)):
     )
     db.add(outcome)
     db.flush()
+
+    try:
+        from src.services.cora_suppression import create_suppression
+        create_suppression(
+            db,
+            subscriber_id=sub.id,
+            reason="deal_lost" if payload.deal_size_bucket == "skip" else "deal_won",
+            source="deal_capture",
+            source_id=outcome.id,
+            notes="Auto-pause triggered by deal outcome",
+            cancel_reason="deal_outcome_auto_pause",
+        )
+    except Exception as exc:
+        logger.warning("[DealCapture] cora suppression failed: %s", exc)
 
     graphic_url: Optional[str] = None
     annual_offered = False
@@ -3640,6 +3669,21 @@ def human_close_outcome(
     esc.outcome_at = datetime.now(timezone.utc)
     if closer_assigned:
         esc.closer_assigned = closer_assigned
+    if outcome in {"won", "lost"}:
+        try:
+            from src.services.cora_suppression import create_suppression
+            create_suppression(
+                db,
+                subscriber_id=esc.subscriber_id,
+                reason=f"deal_{outcome}",
+                source="human_close",
+                source_id=esc.id,
+                notes="Auto-pause triggered by deal outcome",
+                cancel_reason="deal_outcome_auto_pause",
+                created_by=closer_assigned,
+            )
+        except Exception as exc:
+            logger.warning("[HumanClose] cora suppression failed escalation=%s: %s", escalation_id, exc)
     db.flush()
     return {"ok": True, "escalation_id": escalation_id, "outcome": outcome}
 

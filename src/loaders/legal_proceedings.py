@@ -234,10 +234,12 @@ class ProbateLoader(BaseLoader):
                         unmatched += 1
                 else:
                     logger.debug(f"Pending review probate: {case_number} (score: {match_score}%, method: {match_method})")
+                    _decedent_name = _none_if_nan(decedent_row.get('LastName/CompanyName'))
                     self.quarantine_unmatched(
                         source_type="probate",
                         raw_row=decedent_row.to_dict() if hasattr(decedent_row, 'to_dict') else dict(decedent_row),
                         county_id=self.county_id,
+                        grantor=str(_decedent_name) if _decedent_name else None,
                         address_string=str(party_address_val) if party_address_val else None,
                         match_status="pending_review",
                         match_confidence=match_score / 100.0,
@@ -247,10 +249,12 @@ class ProbateLoader(BaseLoader):
                     unmatched += 1
             else:
                 logger.debug(f"No property match for probate case: {case_number}")
+                _decedent_name = _none_if_nan(decedent_row.get('LastName/CompanyName'))
                 self.quarantine_unmatched(
                     source_type="probate",
                     raw_row=decedent_row.to_dict() if hasattr(decedent_row, 'to_dict') else dict(decedent_row),
                     county_id=self.county_id,
+                    grantor=str(_decedent_name) if _decedent_name else None,
                     address_string=str(party_address_val) if party_address_val else None,
                 )
                 unmatched += 1
@@ -422,6 +426,7 @@ class EvictionLoader(BaseLoader):
                         source_type="evictions",
                         raw_row=defendant_row.to_dict() if hasattr(defendant_row, 'to_dict') else dict(defendant_row),
                         county_id=self.county_id,
+                        grantor=name_variants[0] if name_variants else None,
                         address_string=str(party_address_val) if party_address_val else None,
                         match_status="pending_review",
                         match_confidence=match_score / 100.0,
@@ -437,6 +442,7 @@ class EvictionLoader(BaseLoader):
                     source_type="evictions",
                     raw_row=defendant_row.to_dict() if hasattr(defendant_row, 'to_dict') else dict(defendant_row),
                     county_id=self.county_id,
+                    grantor=name_variants[0] if name_variants else None,
                     address_string=str(party_address_val) if party_address_val else None,
                 )
                 unmatched += 1
@@ -787,7 +793,8 @@ class DivorceLoader(BaseLoader):
                         source_type="divorce_filings",
                         raw_row=primary_row.to_dict() if hasattr(primary_row, "to_dict") else dict(primary_row),
                         county_id=self.county_id,
-                        address_string=str(party_address_val) if party_address_val else None,
+                        grantor=name_variants[0] if name_variants else None,
+                        address_string=str(petitioner_addr) if petitioner_addr else None,
                         match_status="pending_review",
                         match_confidence=match_score / 100.0,
                         candidate_property_id=property_record.id,
@@ -803,7 +810,8 @@ class DivorceLoader(BaseLoader):
                     source_type="divorce_filings",
                     raw_row=primary_row.to_dict() if hasattr(primary_row, "to_dict") else dict(primary_row),
                     county_id=self.county_id,
-                    address_string=str(party_address_val) if party_address_val else None,
+                    grantor=name_variants[0] if name_variants else None,
+                    address_string=str(petitioner_addr) if petitioner_addr else None,
                 )
                 unmatched += 1
 

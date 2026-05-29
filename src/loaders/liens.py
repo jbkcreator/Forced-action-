@@ -174,9 +174,15 @@ class LienLoader(BaseLoader):
 
             # LP (Lis Pendens) rows are handled by LisPendensLoader — skip here
             # to avoid creating spurious LegalAndLien records.
+            # Medical liens (e.g. healthcare subrogation against insurers) are not
+            # property liens and will never match a parcel — skip silently.
             _doc_upper = _doc_type_label.upper()
             if 'LIS PENDENS' in _doc_upper or '(LP)' in _doc_upper:
                 logger.debug(f"Skipping LP row (handled by LisPendensLoader): {instrument}")
+                skipped += 1
+                continue
+            if _doc_type_label == 'MEDICAL LIEN':
+                logger.debug(f"Skipping medical subrogation lien: {instrument}")
                 skipped += 1
                 continue
 
@@ -237,7 +243,14 @@ class LienLoader(BaseLoader):
             #     the 113-record / 2-property-ID cascade incident.
             # (c) All other liens: Grantor = debtor / property owner.
 
-            if not property_record and is_tax_lien and pd.notna(row.get('Grantee')):
+            _BUSINESS_SUFFIXES = ('LLC', 'CORP', 'INC', 'LTD', 'PLLC', 'PA', 'LP',
+                                  'L.L.C', 'L.P.', 'CO.', 'COMPANY', 'ENTERPRISES',
+                                  'ASSOCIATES', 'GROUP', 'HOLDINGS', 'SERVICES')
+            _tl_grantee = str(row.get('Grantee') or '').strip().upper()
+            _tl_is_business = any(_tl_grantee.endswith(s) or f' {s} ' in _tl_grantee
+                                  for s in _BUSINESS_SUFFIXES)
+
+            if not property_record and is_tax_lien and pd.notna(row.get('Grantee')) and not _tl_is_business:
                 match_result = self.find_property_by_owner_name(row['Grantee'], threshold=name_threshold)
                 if match_result:
                     property_record, score = match_result
@@ -460,8 +473,9 @@ class LienLoader(BaseLoader):
                         f"Pending review lien: {instrument} "
                         f"(score: {match_score}%, method: {match_method}, doc_type: {_doc_type_label})"
                     )
+                    _ur_source = "judgments" if "JUDGMENT" in _doc_type_label.upper() else "liens"
                     self.quarantine_unmatched(
-                        source_type="liens",
+                        source_type=_ur_source,
                         raw_row=row.to_dict() if hasattr(row, 'to_dict') else dict(row),
                         county_id=self.county_id,
                         instrument_number=instrument,
@@ -479,8 +493,9 @@ class LienLoader(BaseLoader):
                     f"(Grantor: {row.get('Grantor')}, Grantee: {row.get('Grantee')}, "
                     f"doc_type: {_doc_type_label})"
                 )
+                _ur_source = "judgments" if "JUDGMENT" in _doc_type_label.upper() else "liens"
                 self.quarantine_unmatched(
-                    source_type="liens",
+                    source_type=_ur_source,
                     raw_row=row.to_dict() if hasattr(row, 'to_dict') else dict(row),
                     county_id=self.county_id,
                     instrument_number=instrument,

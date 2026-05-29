@@ -51,6 +51,9 @@ langsmith>=0.7.0
 # Sandbox — in-memory Redis shim for scenario tests
 fakeredis>=2.24
 
+# HTML templating (daily_dashboard PDF generator)
+jinja2>=3.1.0
+
 # Image generation (Stage 5: deal-win graphic, social proof wall)
 Pillow>=10.0.0
 

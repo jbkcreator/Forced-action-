@@ -43,6 +43,7 @@ from src.core.models import (
     PremiumPurchase,
     Property,
     SentLead,
+    MessageOutcome,
     SmsOptIn,
     Subscriber,
 )
@@ -2273,3 +2274,216 @@ def get_storm_packs(
             for bp in purchase_rows
         ],
     }
+
+
+@router.get("/cora-messages/pending")
+def list_pending_cora_messages(
+    limit: int = Query(default=100, ge=1, le=500),
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Return Cora SMS messages waiting for manual review.
+
+    Cora writes outbound-message audit rows to message_outcomes. Messages held
+    for review have send_status='pending_review' and requires_review=true; the
+    composed SMS body is stored in context_snapshot['body'] by the Cora write
+    tool.
+    Used by the admin UI to surface messages that may need manual review.
+
+    Index recommendation (run once):
+        CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_mo_pending_review
+        ON message_outcomes (created_at DESC, id DESC)
+        WHERE send_status = 'pending_review'
+          AND requires_review = true
+          AND message_type = 'sms'
+          AND cancelled_at IS NULL;
+    """
+    try:
+        # Postgres builds the full response shape — json_build_object per row,
+        # json_agg assembles the array. TO_CHAR emits ISO-8601 strings so no
+        # Python datetime serialization is needed. ->> extracts phone/body as
+        # plain text. The outer COALESCE turns the null json_agg returns on an
+        # empty result set into an empty array.
+        messages = db.execute(
+            text("""
+                SELECT COALESCE(
+                    json_agg(msg ORDER BY msg_created_at DESC, msg_id DESC),
+                    '[]'::json
+                )
+                FROM (
+                    SELECT
+                        json_build_object(
+                            'id',                        mo.id,
+                            'message_outcome_id',        mo.id,
+                            'subscriber_id',             mo.subscriber_id,
+                            'subscriber_email',          s.email,
+                            'phone',                     COALESCE(mo.context_snapshot, '{}'::jsonb) ->> 'phone',
+                            'body',                      COALESCE(mo.context_snapshot, '{}'::jsonb) ->> 'body',
+                            'campaign',                  mo.template_id,
+                            'variant_id',                mo.variant_id,
+                            'message_type',              mo.message_type,
+                            'channel',                   mo.channel,
+                            'send_status',               mo.send_status,
+                            'requires_review',           mo.requires_review,
+                            'review_reason',             mo.review_reason,
+                            'scheduled_send_at',         TO_CHAR(mo.scheduled_send_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                            'created_at',                TO_CHAR(mo.created_at        AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+                            'decision_id',               mo.decision_id,
+                            'trade_vertical',            mo.trade_vertical,
+                            'county_id',                 mo.county_id,
+                            'behavioral_segment',        mo.behavioral_segment,
+                            'revenue_signal_score',      mo.revenue_signal_score,
+                            'revenue_signal_score_band', mo.revenue_signal_score_band,
+                            'last_action_recency_band',  mo.last_action_recency_band,
+                            'prompt_version',            mo.prompt_version,
+                            'context_snapshot',          COALESCE(mo.context_snapshot, '{}'::jsonb)
+                        )                          AS msg,
+                        mo.created_at              AS msg_created_at,
+                        mo.id                      AS msg_id
+                    FROM message_outcomes mo
+                    LEFT JOIN subscribers s ON s.id = mo.subscriber_id
+                    WHERE mo.message_type   = 'sms'
+                      AND mo.requires_review = true
+                      AND mo.send_status    = 'pending_review'
+                      AND mo.cancelled_at  IS NULL
+                    LIMIT :limit
+                ) sub
+            """),
+            {"limit": limit},
+        ).scalar()
+    except Exception as exc:
+        logger.error("[cora-messages/pending] query failed: %s", exc)
+        raise HTTPException(status_code=503, detail="Failed to fetch pending messages")
+
+    return {
+        "ok": True,
+        "total": len(messages),
+        "messages": messages,
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /api/admin/cora-messages/{id}/approve
+# POST /api/admin/cora-messages/{id}/cancel
+# ---------------------------------------------------------------------------
+
+class _MessageReviewBody(BaseModel):
+    reason: Optional[str] = Field(default=None, max_length=255)
+
+
+@router.post("/cora-messages/{message_id}/approve")
+def approve_cora_message(
+    message_id: int,
+    body: _MessageReviewBody,
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Approve a pending-review Cora SMS message.
+    Sets send_status='approved', approved_by, and approved_at.
+    Returns 404 if the message does not exist, 409 if it is not pending_review.
+    """
+    try:
+        row = db.execute(
+            text("""
+                SELECT id, send_status
+                FROM message_outcomes
+                WHERE id = :id
+            """),
+            {"id": message_id},
+        ).fetchone()
+    except Exception as exc:
+        logger.error("[cora-messages/approve] fetch failed id=%s: %s", message_id, exc)
+        raise HTTPException(status_code=503, detail="Database error")
+
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Message {message_id} not found")
+    if row.send_status != "pending_review":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Message {message_id} is '{row.send_status}', not pending_review",
+        )
+
+    try:
+        db.execute(
+            text("""
+                UPDATE message_outcomes
+                SET send_status  = 'approved',
+                    approved_by  = :actor,
+                    approved_at  = NOW()
+                WHERE id = :id
+            """),
+            {"id": message_id, "actor": _admin.get("sub")},
+        )
+        db.commit()
+    except Exception as exc:
+        logger.error("[cora-messages/approve] update failed id=%s: %s", message_id, exc)
+        raise HTTPException(status_code=503, detail="Failed to approve message")
+
+    logger.info(
+        "[cora-messages/approve] id=%s approved by %s",
+        message_id, _admin.get("sub"),
+    )
+    return {"ok": True, "id": message_id, "send_status": "approved"}
+
+
+@router.post("/cora-messages/{message_id}/cancel")
+def cancel_cora_message(
+    message_id: int,
+    body: _MessageReviewBody,
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Cancel a pending-review Cora SMS message.
+    Sets send_status='cancelled', cancelled_by, cancelled_at, and optionally cancel_reason.
+    Returns 404 if the message does not exist, 409 if it is not pending_review.
+    """
+    try:
+        row = db.execute(
+            text("""
+                SELECT id, send_status
+                FROM message_outcomes
+                WHERE id = :id
+            """),
+            {"id": message_id},
+        ).fetchone()
+    except Exception as exc:
+        logger.error("[cora-messages/cancel] fetch failed id=%s: %s", message_id, exc)
+        raise HTTPException(status_code=503, detail="Database error")
+
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Message {message_id} not found")
+    if row.send_status != "pending_review":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Message {message_id} is '{row.send_status}', not pending_review",
+        )
+
+    try:
+        db.execute(
+            text("""
+                UPDATE message_outcomes
+                SET send_status   = 'cancelled',
+                    cancelled_by  = :actor,
+                    cancelled_at  = NOW(),
+                    cancel_reason = :reason
+                WHERE id = :id
+            """),
+            {
+                "id":     message_id,
+                "actor":  _admin.get("sub"),
+                "reason": body.reason,
+            },
+        )
+        db.commit()
+    except Exception as exc:
+        logger.error("[cora-messages/cancel] update failed id=%s: %s", message_id, exc)
+        raise HTTPException(status_code=503, detail="Failed to cancel message")
+
+    logger.info(
+        "[cora-messages/cancel] id=%s cancelled by %s reason=%r",
+        message_id, _admin.get("sub"), body.reason,
+    )
+    return {"ok": True, "id": message_id, "send_status": "cancelled"}

@@ -62,137 +62,160 @@ def _session(provided: Optional[Session]) -> Generator[Session, None, None]:
 
 @tool(category="write", idempotent=True, requires_compliance=True)
 def send_sms(
-	subscriber_id: int,
-	body: str,
-	campaign: str,
-	variant_id: Optional[str] = None,
-	decision_id: Optional[str] = None,
-	message_type: str = "marketing",
-	personalization_context: Optional[Dict[str, Any]] = None,
-	session: Optional[Session] = None,
+    subscriber_id: int,
+    body: str,
+    campaign: str,
+    variant_id: Optional[str] = None,
+    decision_id: Optional[str] = None,
+    message_type: str = "marketing",
+    personalization_context: Optional[Dict[str, Any]] = None,
+    session: Optional[Session] = None,
 ) -> Dict[str, Any]:
-	"""
-	Send an SMS through the compliance gate. Records a MessageOutcome row on
-	success. Idempotent within a 24-hour window by (subscriber_id, campaign,
-	variant_id) — a duplicate call returns the prior send's result without
-	re-dispatching to Twilio.
+    """
+    Create a MessageOutcome row for every Cora SMS.
 
-	Behaviour:
-	  1. Load subscriber's phone from the latest SmsOptIn row
-	  2. Resolve idempotency: if a recent MessageOutcome row matches, return it
-	  3. Call src.services.sms_compliance.send_sms — runs the opt-out gate
-		 internally, writes to DLQ on failure, dry-runs if TELNYX_SMS_ENABLED=false
-	  4. Record a MessageOutcome row keyed by campaign + variant_id
+    If the message requires human review, it is stored as pending_review and is
+    not sent immediately. If it does not require review, it is sent immediately
+    through sms_compliance.send_sms().
+    """
+    from src.services.cora_suppression import has_active_suppression
 
-	Returns:
-	  {
-		'sent': bool,              # True on success (including dry-run)
-		'reason': str,             # 'ok' | 'no_phone' | 'opted_out' | 'sms_error' | 'duplicate'
-		'subscriber_id': int,
-		'campaign': str,
-		'variant_id': str | None,
-		'message_outcome_id': int | None,
-	  }
-	"""
-	from src.services import sms_compliance
+    with _session(session) as s:
+        if message_type != "transactional" and has_active_suppression(s, subscriber_id):
+            logger.info(
+                "Cora SMS suppressed by active cora_suppression subscriber=%s campaign=%s",
+                subscriber_id,
+                campaign,
+            )
+            return {
+                "sent": False,
+                "reason": "cora_suppressed",
+                "subscriber_id": subscriber_id,
+                "campaign": campaign,
+                "variant_id": variant_id,
+                "message_outcome_id": None,
+            }
 
-	with _session(session) as s:
-		# 1. Resolve phone via the most recent opt-in (subscriber has no direct phone column).
-		opt_in = (
-			s.query(SmsOptIn)
-			.filter(SmsOptIn.subscriber_id == subscriber_id)
-			.order_by(SmsOptIn.opted_in_at.desc())
-			.first()
-		)
-		if opt_in is None:
-			return {
-				"sent": False,
-				"reason": "no_phone",
-				"subscriber_id": subscriber_id,
-				"campaign": campaign,
-				"variant_id": variant_id,
-				"message_outcome_id": None,
-			}
-		phone = opt_in.phone
+        opt_in = (
+            s.query(SmsOptIn)
+            .filter(SmsOptIn.subscriber_id == subscriber_id)
+            .order_by(SmsOptIn.opted_in_at.desc())
+            .first()
+        )
 
-		# 2. Idempotency — look for a matching MessageOutcome in the last 24h.
-		cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-		dup_q = (
-			s.query(MessageOutcome)
-			.filter(MessageOutcome.subscriber_id == subscriber_id)
-			.filter(MessageOutcome.template_id == campaign)
-			.filter(MessageOutcome.sent_at >= cutoff)
-		)
-		if variant_id:
-			dup_q = dup_q.filter(MessageOutcome.variant_id == variant_id)
-		duplicate = dup_q.first()
-		if duplicate is not None:
-			logger.info(
-				"send_sms: duplicate skipped (subscriber=%s campaign=%s variant=%s outcome=%s)",
-				subscriber_id, campaign, variant_id, duplicate.id,
-			)
-			return {
-				"sent": False,
-				"reason": "duplicate",
-				"subscriber_id": subscriber_id,
-				"campaign": campaign,
-				"variant_id": variant_id,
-				"message_outcome_id": duplicate.id,
-			}
+        if opt_in is None:
+            return {
+                "sent": False,
+                "reason": "no_phone",
+                "subscriber_id": subscriber_id,
+                "campaign": campaign,
+                "variant_id": variant_id,
+                "message_outcome_id": None,
+            }
 
-		# 3. Dispatch through the compliance-gated outbound service.
-		ok = sms_compliance.send_sms(
-			to=phone,
-			body=body,
-			db=s,
-			message_type=message_type,
-			subscriber_id=subscriber_id,
-			task_type=campaign,
-			campaign=campaign,
-			variant_id=variant_id,
-			decision_id=decision_id,
-		)
-		if not ok:
-			return {
-				"sent": False,
-				"reason": "opted_out_or_sms_error",
-				"subscriber_id": subscriber_id,
-				"campaign": campaign,
-				"variant_id": variant_id,
-				"message_outcome_id": None,
-			}
+        phone = opt_in.phone
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(hours=24)
 
-		# 4. Record the MessageOutcome row so learning cards can attribute later.
-		ctx = personalization_context or {}
-		outcome = MessageOutcome(
-			subscriber_id=subscriber_id,
-			message_type="sms",
-			template_id=campaign,
-			variant_id=variant_id,
-			channel="telnyx",
-			sent_at=datetime.now(timezone.utc),
-			# fa038 personalization fields
-			trade_vertical=ctx.get("vertical") or None,
-			county_id=ctx.get("county_id") or None,
-			behavioral_segment=ctx.get("behavioral_segment") or None,
-			revenue_signal_score=ctx.get("revenue_signal_score"),
-			revenue_signal_score_band=ctx.get("revenue_signal_score_band") or None,
-			last_action_recency_band=ctx.get("last_action_recency_band") or None,
-			prompt_version=ctx.get("prompt_version") or None,
-			context_snapshot=_safe_snapshot(ctx),
-		)
-		s.add(outcome)
-		s.flush()
+        dup_q = (
+            s.query(MessageOutcome)
+            .filter(MessageOutcome.subscriber_id == subscriber_id)
+            .filter(MessageOutcome.template_id == campaign)
+            .filter(MessageOutcome.created_at >= cutoff)
+        )
 
-		return {
-			"sent": True,
-			"reason": "ok",
-			"subscriber_id": subscriber_id,
-			"campaign": campaign,
-			"variant_id": variant_id,
-			"message_outcome_id": outcome.id,
-		}
+        if variant_id:
+            dup_q = dup_q.filter(MessageOutcome.variant_id == variant_id)
 
+        duplicate = dup_q.first()
+        if duplicate is not None:
+            return {
+                "sent": False,
+                "reason": "duplicate",
+                "subscriber_id": subscriber_id,
+                "campaign": campaign,
+                "variant_id": variant_id,
+                "message_outcome_id": duplicate.id,
+            }
+
+        ctx = personalization_context or {}
+
+        requires_review = bool(ctx.get("requires_review")) or message_type == "marketing"
+
+        outcome = MessageOutcome(
+            subscriber_id=subscriber_id,
+            message_type="sms",
+            template_id=campaign,
+            variant_id=variant_id,
+            channel="telnyx",
+            decision_id=decision_id,
+            send_status="pending_review" if requires_review else "approved",
+            requires_review=requires_review,
+            review_reason=ctx.get("review_reason") if requires_review else None,
+            scheduled_send_at=now,
+            sent_at=now if not requires_review else None,
+            trade_vertical=ctx.get("vertical") or None,
+            county_id=ctx.get("county_id") or None,
+            behavioral_segment=ctx.get("behavioral_segment") or None,
+            revenue_signal_score=ctx.get("revenue_signal_score"),
+            revenue_signal_score_band=ctx.get("revenue_signal_score_band") or None,
+            last_action_recency_band=ctx.get("last_action_recency_band") or None,
+            prompt_version=ctx.get("prompt_version") or None,
+            context_snapshot={
+                **(_safe_snapshot(ctx) or {}),
+                "body": body,
+                "phone": phone,
+            },
+        )
+        s.add(outcome)
+        s.flush()
+
+        if requires_review:
+            return {
+                "sent": False,
+                "reason": "pending_review",
+                "subscriber_id": subscriber_id,
+                "campaign": campaign,
+                "variant_id": variant_id,
+                "message_outcome_id": outcome.id,
+            }
+
+        from src.services import sms_compliance
+
+        ok = sms_compliance.send_sms(
+            to=phone,
+            body=body,
+            db=s,
+            message_type=message_type,
+            subscriber_id=subscriber_id,
+            task_type=campaign,
+            campaign=campaign,
+            variant_id=variant_id,
+            decision_id=decision_id,
+        )
+
+        if not ok:
+            outcome.send_status = "failed"
+            return {
+                "sent": False,
+                "reason": "opted_out_or_sms_error",
+                "subscriber_id": subscriber_id,
+                "campaign": campaign,
+                "variant_id": variant_id,
+                "message_outcome_id": outcome.id,
+            }
+
+        outcome.send_status = "sent"
+        outcome.sent_at = datetime.now(timezone.utc)
+
+        return {
+            "sent": True,
+            "reason": "ok",
+            "subscriber_id": subscriber_id,
+            "campaign": campaign,
+            "variant_id": variant_id,
+            "message_outcome_id": outcome.id,
+        }
 
 # ──────────────────────────────────────────────────────────────────────────────
 # log_decision
