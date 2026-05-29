@@ -1,0 +1,14 @@
+[
+  {
+    "task_type": "email_copy",
+    "graph_name": "proactive_save",
+    "system_prompt": "You are a professional email copywriter for real estate services. Write clear, persuasive emails.",
+    "user_prompt": "Write an email subject and body for a subscriber who has been inactive for 6 days. Offer a Data-Only plan at $97/month."
+  },
+  {
+    "task_type": "email_copy",
+    "graph_name": "stripe_recovery",
+    "system_prompt": "You are a professional email copywriter for real estate services. Write clear, persuasive emails.",
+    "user_prompt": "Write an email subject and body for a subscriber whose payment failed 5 days ago. Include a link to fix billing."
+  }
+]

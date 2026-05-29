@@ -45,7 +45,7 @@ def run(dry_run: bool = False) -> dict:
                 elapsed = now - sub.payment_failed_at.replace(tzinfo=timezone.utc)
                 if DAY1_MIN <= elapsed <= DAY1_MAX and not sub.recovery_day1_sent:
                     if not dry_run:
-                        _send_day1(sub)
+                        _send_day1(sub, db)
                         sub.recovery_day1_sent = True
                     sent["day1"] += 1
                 elif DAY3_MIN <= elapsed <= DAY3_MAX and not sub.recovery_day3_sent:
@@ -55,7 +55,7 @@ def run(dry_run: bool = False) -> dict:
                     sent["day3"] += 1
                 elif DAY5_MIN <= elapsed <= DAY5_MAX and not sub.recovery_day5_sent:
                     if not dry_run:
-                        _send_day5(sub)
+                        _send_day5(sub, db)
                         sub.recovery_day5_sent = True
                     sent["day5"] += 1
                 else:
@@ -81,7 +81,7 @@ def _parse_email(text: str) -> tuple[str, str]:
     return subject, body
 
 
-def _send_day1(sub: Subscriber) -> None:
+def _send_day1(sub: Subscriber, db) -> None:
     from config.settings import get_settings
     from src.services.email import send_email
 
@@ -105,6 +105,8 @@ def _send_day1(sub: Subscriber) -> None:
             messages=[{"role": "user", "content": user_prompt}],
             system=system_prompt,
             max_tokens=600,
+            subscriber_id=sub.id,
+            db=db,
         )
         subject, body_text = _parse_email(result["text"])
     except Exception as exc:
@@ -174,6 +176,7 @@ def _send_day3(sub: Subscriber, db) -> None:
             system=system_prompt,
             max_tokens=900,
             subscriber_id=sub.id,
+            db=db,
         )
         subject, body_text = _parse_email(result["text"])
     except Exception as exc:
@@ -194,7 +197,7 @@ def _send_day3(sub: Subscriber, db) -> None:
     logger.info("stripe_recovery day3 sent sub=%s gold_count=%d", sub.id, gold_count)
 
 
-def _send_day5(sub: Subscriber) -> None:
+def _send_day5(sub: Subscriber, db) -> None:
     from config.settings import get_settings
     from src.services.email import send_email
 
@@ -219,6 +222,8 @@ def _send_day5(sub: Subscriber) -> None:
             messages=[{"role": "user", "content": user_prompt}],
             system=system_prompt,
             max_tokens=800,
+            subscriber_id=sub.id,
+            db=db,
         )
         subject, body_text = _parse_email(result["text"])
     except Exception as exc:

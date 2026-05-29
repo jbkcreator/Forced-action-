@@ -64,6 +64,11 @@ class AgentsSettings(AppSettings):
 		env="LANGSMITH_TRACING",
 		description="Enable LangSmith trace uploads",
 	)
+	langsmith_endpoint: str = Field(
+		default="https://api.smith.langchain.com",
+		env="LANGSMITH_ENDPOINT",
+		description="LangSmith API endpoint (US default; EU is https://eu.api.smith.langchain.com)",
+	)
 
 	# ── Logging ───────────────────────────────────────────────────────────────
 	agents_log_level: str = Field(
