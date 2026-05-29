@@ -2090,6 +2090,32 @@ class MessageOutcome(Base):
         return f"<MessageOutcome(id={self.id}, type={self.message_type}, conversion={self.conversion_type})>"
 
 
+class CoraSuppression(Base):
+    """
+    Active subscriber-level stop for Cora-led outbound touches.
+    Compliance messages still flow through their own SMS gates.
+    """
+    __tablename__ = "cora_suppressions"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=False, index=True)
+    reason: Mapped[str] = mapped_column(String(40), nullable=False)
+    source: Mapped[str] = mapped_column(String(40), nullable=False)
+    source_id: Mapped[Optional[str]] = mapped_column(String(100))
+    paused_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_by: Mapped[Optional[str]] = mapped_column(String(100))
+    notes: Mapped[Optional[str]] = mapped_column(String(255))
+
+    __table_args__ = (
+        Index("idx_cora_suppression_active_sub", "subscriber_id", "is_active"),
+        Index("idx_cora_suppression_reason", "reason"),
+    )
+
+    def __repr__(self):
+        return f"<CoraSuppression(sub={self.subscriber_id}, reason={self.reason}, active={self.is_active})>"
+
+
 class DealOutcome(Base):
     """
     Tracks confirmed deals reported by subscribers. Feeds revenue signal score,

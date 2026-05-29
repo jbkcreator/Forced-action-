@@ -113,7 +113,6 @@ h3 { font-size: 9.5px; font-weight: 600; color: #475569; margin-bottom: 5px; tex
 .kpi .lbl { font-size: 7.5px; color: #64748b; text-transform: uppercase; letter-spacing: 0.5px; margin-top: 2px; }
 .kpi .sub { font-size: 8px; color: #94a3b8; margin-top: 1px; }
 .kpi-na .val { color: #94a3b8; font-size: 14px; }
-.kpi-na .lbl { color: #94a3b8; }
 .kpi-accent .val { color: #d97706; }
 .kpi-blue .val   { color: #1d4ed8; }
 .kpi-green .val  { color: #16a34a; }
@@ -198,7 +197,7 @@ tbody td { padding: 3.5px 6px; color: #334155; }
 <body>
 <div class="container">
 
-{# ── Badge macro (no emoji — pure CSS spans) ── #}
+{# ── Badge macro ── #}
 {% macro badge(val) %}
 {%- if val == 'ok' %}<span class="b-ok">OK</span>
 {%- elif val == 'caution' %}<span class="b-caution">CAUTION</span>
@@ -216,15 +215,6 @@ tbody td { padding: 3.5px 6px; color: #334155; }
 {%- elif name == 'Silver' %}<span class="t-si">{{ name }}</span>
 {%- elif name == 'Bronze' %}<span class="t-br">{{ name }}</span>
 {%- else %}{{ name }}{%- endif %}
-{%- endmacro %}
-
-
-{# Trend symbol macro #}
-{% macro trend_icon(val) %}
-{%- if val == 'up' %}&uarr;
-{%- elif val == 'down' %}&darr;
-{%- else %}&rarr;
-{%- endif %}
 {%- endmacro %}
 
 
@@ -287,26 +277,33 @@ tbody td { padding: 3.5px 6px; color: #334155; }
       <div class="sub">mobile phone on Gold+</div>
     </div>
   </div>
-  <div class="kpi-grid g4">
-    <div class="kpi">
-      <div class="val">{{ exec_summary.cora_autonomy }}</div>
-      <div class="lbl">Cora Autonomy</div>
-    </div>
-    <div class="kpi {% if exec_summary.mrr != 'N/A' %}kpi-green{% else %}kpi-na{% endif %}">
-      <div class="val">{{ exec_summary.mrr }}</div>
-      <div class="lbl">MRR</div>
-    </div>
-    <div class="kpi kpi-na">
-      <div class="val">{{ exec_summary.trial_conversion }}</div>
-      <div class="lbl">Trial to Paid</div>
-      <div class="sub">No trial status</div>
-    </div>
-    <div class="kpi {% if exec_summary.churn_rate_30d != 'N/A' %}kpi-red{% else %}kpi-na{% endif %}">
-      <div class="val">{{ exec_summary.churn_rate_30d }}</div>
-      <div class="lbl">30-Day Churn</div>
-      {% if exec_summary.churn_rate_30d == 'N/A' %}<div class="sub">No churn in window</div>{% endif %}
-    </div>
-  </div>
+
+  {#─ Model layout: Metric | Today | This Week | Monthly Pace | Target | Status ─#}
+  <table>
+    <thead><tr>
+      <th>Metric</th><th class="r">Today</th><th class="r">This Week</th><th class="r">Monthly Pace</th><th class="r">Target</th><th class="c">Status</th>
+    </tr></thead>
+    <tbody>
+    {% for row in exec_summary_rows %}
+    <tr>
+      <td class="em">{{ row.metric }}</td>
+      <td class="r">{{ row.today }}</td>
+      <td class="r">{{ row.this_week }}</td>
+      <td class="r">{{ row.monthly_pace }}</td>
+      <td class="r">{{ row.target }}</td>
+      <td class="c">
+        {% if row.status == '' %}
+          {% if row.trend == 'up' %}<span class="b-ok">OK</span>
+          {% elif row.trend == 'down' %}<span class="b-warn">WARN</span>
+          {% else %}<span class="b-gray">—</span>{% endif %}
+        {% elif row.status == '⚠️' %}<span class="b-warn">WARN</span>
+        {% else %}<span class="b-na">N/A</span>{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
   <div class="note">
     Ingest: <strong>{{ exec_summary.total_scraped }}</strong> scraped &nbsp;&middot;&nbsp;
     <strong>{{ exec_summary.total_matched }}</strong> matched &nbsp;&middot;&nbsp;
@@ -338,7 +335,7 @@ tbody td { padding: 3.5px 6px; color: #334155; }
         <td class="r">{{ row.avg_7d }}</td>
         <td class="r">{{ row.monthly }}</td>
         <td class="r">{{ row.target }}</td>
-        <td class="c">{% if row.status == 'ok' %}<span class="b-ok">OK</span>{% elif row.status == 'warn' %}<span class="b-warn">WARN</span>{% else %}<span class="trend">{{ trend_icon(row.trend) }}</span>{% endif %}</td>
+        <td class="c">{% if row.status == 'ok' or row.status == 'warn' %}{{ badge(row.status) }}{% else %}{{ trend_arrow(row.trend) }}{% endif %}</td>
       </tr>
       {% endfor %}
       </tbody>
@@ -361,7 +358,7 @@ tbody td { padding: 3.5px 6px; color: #334155; }
           {% elif row.status == 'early' %}<span class="b-caution">Early</span>
           {% else %}<span class="b-na">Pre-launch</span>{% endif %}
         </td>
-        <td>{% if row.notes %}{{ row.notes }}{% else %}&mdash;{% endif %}</td>
+        <td>{{ row.notes or '&mdash;' }}</td>
       </tr>
       {% endfor %}
       </tbody>
@@ -372,11 +369,31 @@ tbody td { padding: 3.5px 6px; color: #334155; }
   {% else %}
   <div class="county-na"><div>No active counties found.</div></div>
   {% endfor %}
-  <div class="note">Future county expansion managed via <code>counties.is_active</code> — no code changes required to add Pasco, Polk, Manatee, or Sarasota.</div>
+
+  {#─ Future Counties (Pipeline) ─#}
+  <hr class="divider"/>
+  <h3>Future Counties (Pipeline)</h3>
+  <table>
+    <thead><tr>
+      <th>County</th><th class="r">Signals Density</th><th class="r">Est. MRR Potential</th><th class="c">Status</th><th>Target Launch</th>
+    </tr></thead>
+    <tbody>
+    {% for c in ['pasco', 'polk', 'manatee', 'sarasota'] %}
+    <tr>
+      <td class="em">{{ c|title }}</td>
+      <td class="r na">N/A</td>
+      <td class="r na">N/A</td>
+      <td class="c"><span class="b-gray">Queued</span></td>
+      <td class="na">TBD</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <div class="note" style="margin-top:4px;">Future county expansion managed via <code>counties.is_active</code> — no code changes required.</div>
 </div>
 
 
-<!-- ═══════════════════════════════ S3: LEAD GENERATION BY TIER ═══════════════════════════════ -->
+<!-- ═══════════════════════════════ S3: DAILY LEAD GENERATION BY TIER ═══════════════════════════════ -->
 <div class="section">
   <h2>3 &mdash; Daily Lead Generation by Tier</h2>
   <div class="two-col">
@@ -384,15 +401,21 @@ tbody td { padding: 3.5px 6px; color: #334155; }
       <h3>Today's Tier Distribution</h3>
       <table>
         <thead><tr>
-          <th>Tier</th><th class="r">Count</th><th class="r">% of Today</th>
+          <th>Tier</th><th class="r">Today</th><th class="r">% of Today</th><th class="r">7-Day Avg</th><th class="r">This Week</th><th class="r">Weekly Target</th><th class="r">Pace</th>
         </tr></thead>
         <tbody>
         {% set t = exec_summary.leads_today %}
         {% for tier_name, cnt in tiers.items() %}
+        {% set avg = tier_7day_avg.get(tier_name, 0) %}
+        {% set wk = tier_this_week.get(tier_name, 0) %}
         <tr>
           <td>{{ tier_chip(tier_name) }}</td>
           <td class="r em">{{ cnt }}</td>
           <td class="r">{{ pct(cnt, t) }}</td>
+          <td class="r">{{ avg }}</td>
+          <td class="r">{{ wk }}</td>
+          <td class="r na">—</td>
+          <td class="r na">—</td>
         </tr>
         {% endfor %}
         </tbody>
@@ -403,11 +426,7 @@ tbody td { padding: 3.5px 6px; color: #334155; }
       <h3>7-Day Gold+ Trend</h3>
       <table>
         <thead><tr>
-          <th>Date</th>
-          <th class="r t-up">Ultra Plat</th>
-          <th class="r t-pl">Plat</th>
-          <th class="r t-go">Gold</th>
-          <th class="r">Total</th>
+          <th>Date</th><th class="r t-up">Ultra Plat</th><th class="r t-pl">Plat</th><th class="r t-go">Gold</th><th class="r">Total</th>
         </tr></thead>
         <tbody>
         {% for row in tier_history %}
@@ -425,39 +444,56 @@ tbody td { padding: 3.5px 6px; color: #334155; }
     </div>
   </div>
 
+  {#─ Weekly Daily Breakdown — model layout: Tier rows, Day columns ─#}
+  {% set all_tiers = ['Ultra Platinum', 'Platinum', 'Gold', 'Silver', 'Bronze'] %}
+  {% set num_days = weekly_tier_history | length %}
+  {# Pre-compute grand total across all tiers and all days #}
+  {% set all_tier_totals = {} %}
+  {% for tn in all_tiers %}{% set _ = all_tier_totals.__setitem__(tn, 0) %}{% endfor %}
+  {% for day_row in weekly_tier_history %}
+    {% for tn in all_tiers %}
+      {% set _ = all_tier_totals.__setitem__(tn, all_tier_totals[tn] + day_row.counts.get(tn, 0)) %}
+    {% endfor %}
+  {% endfor %}
+  {% set grand_total = all_tier_totals.values() | sum %}
+
   <hr class="divider"/>
   <h3>This Week &mdash; Daily Breakdown</h3>
   <table>
     <thead><tr>
-      <th>Day</th>
-      <th class="r t-up">Ultra Plat</th>
-      <th class="r t-pl">Platinum</th>
-      <th class="r t-go">Gold</th>
-      <th class="r t-si">Silver</th>
-      <th class="r t-br">Bronze</th>
-      <th class="r">Gold+ Total</th>
+      <th>Tier</th>
+      {% for row in weekly_tier_history %}
+      <th class="r">{{ row.day_name }}</th>
+      {% endfor %}
+      <th class="r"><strong>Week Total</strong></th>
+      <th class="r"><strong>Avg/Day</strong></th>
+      <th class="r"><strong>% of Week</strong></th>
     </tr></thead>
     <tbody>
-    {% for row in weekly_tier_history %}
+    {% for tn in all_tiers %}
     <tr>
-      <td>{{ row.date }}</td>
-      <td class="r t-up">{{ row.counts.get('Ultra Platinum', 0) }}</td>
-      <td class="r t-pl">{{ row.counts.get('Platinum', 0) }}</td>
-      <td class="r t-go">{{ row.counts.get('Gold', 0) }}</td>
-      <td class="r t-si">{{ row.counts.get('Silver', 0) }}</td>
-      <td class="r t-br">{{ row.counts.get('Bronze', 0) }}</td>
-      <td class="r em" style="color:#d97706;">{{ row.gold_plus }}</td>
+      <td>{{ tier_chip(tn) }}</td>
+      {% set wt = all_tier_totals[tn] %}
+      {% for day_row in weekly_tier_history %}
+      <td class="r">{{ day_row.counts.get(tn, 0) }}</td>
+      {% endfor %}
+      <td class="r em"><strong>{{ wt }}</strong></td>
+      <td class="r">{{ '%.1f' | format(wt / num_days) if num_days else '0.0' }}</td>
+      <td class="r"><strong>{{ '%.1f' | format(wt / grand_total * 100 if grand_total else 0) }}%</strong></td>
     </tr>
     {% endfor %}
-    {% if not weekly_tier_history %}<tr><td colspan="7" class="na c" style="padding:7px;">No data</td></tr>{% endif %}
     </tbody>
   </table>
+  <div class="note">
+    Gold+ Today: <strong>{{ exec_summary.gold_plus_today }}</strong> leads &nbsp;&middot;&nbsp;
+    Premium (Ultra Plat + Plat) Today: <strong>{{ exec_summary.ultra_plat_portfolio + exec_summary.plat_portfolio }}</strong>
+  </div>
 </div>
 
 
 <!-- ═══════════════════════════════ S4: SCRAPER INGEST ═══════════════════════════════ -->
 <div class="section">
-  <h2>4 &mdash; Scraper Ingest &amp; Data Quality</h2>
+  <h2>4 &mdash; Scraper Ingest & Data Quality</h2>
   <div class="two-col">
     <div>
       <h3>Today's Ingest — By County</h3>
@@ -468,23 +504,15 @@ tbody td { padding: 3.5px 6px; color: #334155; }
         </div>
         <table>
           <thead><tr>
-            <th>Scraper</th><th class="r">Scraped</th>
-            <th class="r">Matched</th><th class="r">Match%</th><th class="c">Status</th>
+            <th>Scraper</th><th class="r">Records/Day</th><th class="r">Match%</th><th class="c">Status</th>
           </tr></thead>
           <tbody>
           {% for row in grp.rows %}
           <tr>
             <td>{{ row.label }}</td>
-            <td class="r">{{ row.scraped }}</td>
-            <td class="r">{{ row.matched if row.matched is not none else '&mdash;' }}</td>
-            <td class="r">
-              {% if row.scraped and row.matched is not none %}{{ pct(row.matched, row.scraped) }}
-              {% else %}<span class="na">&mdash;</span>{% endif %}
-            </td>
-            <td class="c">
-              {% if row.ok is none %}<span class="na">&mdash;</span>
-              {% elif row.ok %}{{ badge('ok') }}{% else %}{{ badge('fail') }}{% endif %}
-            </td>
+            <td class="r">{{ row.scraped if row.scraped is not none else '&mdash;' }}</td>
+            <td class="r">{% if row.scraped and row.matched is not none %}{{ pct(row.matched, row.scraped) }}{% else %}<span class="na">&mdash;</span>{% endif %}</td>
+            <td class="c">{% if row.ok is none %}<span class="na">&mdash;</span>{% elif row.ok %}{{ badge('ok') }}{% else %}{{ badge('fail') }}{% endif %}</td>
           </tr>
           {% endfor %}
           </tbody>
@@ -497,16 +525,19 @@ tbody td { padding: 3.5px 6px; color: #334155; }
     </div>
     <div>
       <h3>Signal Freshness (worst-case across counties)</h3>
+      {#─ Model: source | Days Stale | Health | Quality | Action ─#}
       <table>
         <thead><tr>
-          <th>Signal</th><th class="r">Days Stale</th><th class="c">Health</th>
+          <th>Signal</th><th class="r">Days Stale</th><th class="c">Health</th><th class="c">Quality</th><th>Action</th>
         </tr></thead>
         <tbody>
-        {% for row in quality_signals %}
+        {% for row in scraper_ingest_details %}
         <tr>
           <td>{{ row.source }}</td>
           <td class="r">{{ row.days_stale }}</td>
-          <td class="c">{{ badge(row.health) }}</td>
+          <td class="c">{{ badge(row.status) }}</td>
+          <td class="c" style="font-size:7.5px;">{{ row.quality }}</td>
+          <td style="font-size:7.5px;">{{ row.action }}</td>
         </tr>
         {% endfor %}
         </tbody>
@@ -548,50 +579,54 @@ tbody td { padding: 3.5px 6px; color: #334155; }
       <div class="note">Total Gold+ today: {{ eb.total }}</div>
     </div>
 
+    {#─ Model: Tier | Phone % | Email % | Both % | Impact | Action if Low ─#}
     <div>
-      <h3>Enrichment by Tier</h3>
+      <h3>Enrichment by Tier — With Impact & Action</h3>
       <table>
         <thead><tr>
-          <th>Tier</th><th class="r">Leads</th>
-          <th class="r">Phone</th><th class="r">Email</th>
+          <th>Tier</th><th class="r">Phone %</th><th class="r">Email %</th><th class="r">Both %</th><th>Impact</th><th>Action if Low</th>
         </tr></thead>
         <tbody>
-        {% for row in enrichment_by_tier %}
+        {% for row in enrichment_by_tier_ext %}
         <tr>
           <td>{{ tier_chip(row.tier) }}</td>
-          <td class="r">{{ row.total }}</td>
-          <td class="r">{{ row.with_phone }} <span class="na">({{ row.phone_pct }})</span></td>
-          <td class="r">{{ row.with_email }} <span class="na">({{ row.email_pct }})</span></td>
+          <td class="r">{{ row.phone_pct }}</td>
+          <td class="r">{{ row.email_pct }}</td>
+          <td class="r">{{ row.both_pct }}</td>
+          <td style="font-size:7.5px;">{{ row.impact }}</td>
+          <td style="font-size:7.5px;">{{ row.action or '—' }}</td>
         </tr>
         {% endfor %}
-        {% if not enrichment_by_tier %}<tr><td colspan="4" class="na c" style="padding:7px;">No data</td></tr>{% endif %}
+        {% if not enrichment_by_tier_ext %}<tr><td colspan="6" class="na c" style="padding:7px;">No data</td></tr>{% endif %}
         </tbody>
       </table>
     </div>
 
+    {#─ Source Performance: Source | Success Rate | Cost/Lead | Volume/Day | API Health | Status ─#}
     <div>
       <h3>Source Performance (7-day)</h3>
       <table>
         <thead><tr>
-          <th>Source</th><th class="r">Calls</th>
-          <th class="r">Match%</th><th class="r">Phone%</th>
+          <th>Source</th><th class="r">Success Rate</th><th class="r">Cost/Lead</th><th class="r">Volume/Day</th><th class="c">API Health</th><th>Status</th>
         </tr></thead>
         <tbody>
-        {% for row in enrichment_by_source %}
+        {% for row in enrichment_source_detail %}
         <tr>
           <td>{{ row.source }}</td>
-          <td class="r">{{ row.total }}</td>
-          <td class="r">{{ row.match_pct }}</td>
-          <td class="r">{{ row.phone_pct }}</td>
+          <td class="r">{{ row.success_rate }}</td>
+          <td class="r na">{{ row.cost_per_lead }}</td>
+          <td class="r">{{ row.volume_per_day }}</td>
+          <td class="c">{{ row.api_health }}</td>
+          <td style="font-size:7.5px;">{{ row.status }}</td>
         </tr>
         {% endfor %}
-        {% if not enrichment_by_source %}
-        <tr><td colspan="4" class="na c" style="padding:7px;">No enrichment runs in last 7 days</td></tr>
+        {% if not enrichment_source_detail %}
+        <tr><td colspan="6" class="na c" style="padding:7px;">No enrichment runs in last 7 days</td></tr>
         {% endif %}
         </tbody>
       </table>
       <div class="note" style="margin-top:6px;">
-        RocketReach, Hunter.io, vendor credits remaining: <span class="na">N/A</span>
+        RocketReach, Hunter.io, PDL, idiCORE: <span class="na">N/A (not integrated)</span>
       </div>
     </div>
   </div>
@@ -624,141 +659,56 @@ tbody td { padding: 3.5px 6px; color: #334155; }
 <!-- ═══════════════════════════════ S6: VERTICAL PERFORMANCE ═══════════════════════════════ -->
 <div class="section">
   <h2>6 &mdash; Vertical Performance</h2>
-  <div class="two-col">
-    <div>
-      <h3>Gold+ Portfolio by Primary Vertical</h3>
-      <table>
-        <thead><tr>
-          <th>Vertical</th><th class="r">Gold+ Count</th>
-          <th class="r">% of Pool</th><th class="r">Avg CDS</th>
-        </tr></thead>
-        <tbody>
-        {% for vert in vertical_avg_cds %}
-        {% set vb_data = vertical_breakdown.get(vert.vertical, {'count': 0, 'pct': 0}) %}
-        <tr>
-          <td>{{ vert.vertical }}</td>
-          <td class="r em">{{ vb_data.count }}</td>
-          <td class="r">{{ '{:.1f}'.format(vb_data.pct) }}%</td>
-          <td class="r">{{ vert.avg_cds }}</td>
-        </tr>
-        {% endfor %}
-        </tbody>
-      </table>
-    </div>
-
-    <div>
-      <h3>New Leads Today by Vertical x Tier</h3>
-      <table>
-        <thead><tr>
-          <th>Vertical</th>
-          <th class="r t-up">Ultra Plat</th>
-          <th class="r t-pl">Platinum</th>
-          <th class="r t-go">Gold</th>
-        </tr></thead>
-        <tbody>
-        {% for vertical_label, tier_data in vertical_tier_crosstab.items() %}
-        <tr>
-          <td>{{ vertical_label }}</td>
-          {% for tier_name in ['Ultra Platinum', 'Platinum', 'Gold'] %}
-          {% set td = tier_data.get(tier_name, {'count': 0, 'new_today': 0}) %}
-          <td class="r">
-            {{ td.count }}
-            {% if td.new_today > 0 %}
-            <span style="color:#16a34a; font-size:7.5px;">(+{{ td.new_today }})</span>
-            {% endif %}
-          </td>
-          {% endfor %}
-        </tr>
-        {% endfor %}
-        </tbody>
-      </table>
-    </div>
-  </div>
-
-  <hr class="divider"/>
-  <div class="two-col">
-    <div>
-      <h3>Active Subscribers by Vertical</h3>
-      <table>
-        <thead><tr><th>Vertical</th><th class="r">Active Subs</th></tr></thead>
-        <tbody>
-        {% for row in subs_by_vertical %}
-        <tr><td>{{ row.vertical }}</td><td class="r em">{{ row.count }}</td></tr>
-        {% endfor %}
-        {% if not subs_by_vertical %}<tr><td colspan="2" class="na c" style="padding:7px;">No data</td></tr>{% endif %}
-        </tbody>
-      </table>
-    </div>
-    <div>
-      <h3>Top Primary Signals per Vertical</h3>
-      {% for label, signals in signal_composition.items() %}
-      {% if signals %}
-      <div style="margin-bottom:5px;">
-        <div style="font-size:8px; font-weight:700; color:#1e3a5f; text-transform:uppercase; letter-spacing:0.4px; margin-bottom:2px;">{{ label }}</div>
-        {% for sig, cnt in signals[:3] %}
-        <div class="sig-row"><span class="sig-lbl">{{ sig }}</span><span class="sig-cnt">{{ cnt }}</span></div>
-        {% endfor %}
-      </div>
-      {% endif %}
-      {% endfor %}
-      {% if not signal_composition %}<div class="na" style="font-size:8.5px;">No signal data</div>{% endif %}
-    </div>
-  </div>
+  {#─ Model: Vertical | Gold+ | % of Gold+ | 7-Day Avg | Status | Enrichment % | Monetization ─#}
+  <h3>Gold+ Portfolio by Vertical</h3>
+  <table>
+    <thead><tr>
+      <th>Vertical</th><th class="r">Gold+</th><th class="r">% of Gold+</th><th class="r">7-Day Avg</th><th class="c">Status</th><th class="r">Enrichment %</th><th>Monetization Status</th>
+    </tr></thead>
+    <tbody>
+    {% for row in vertical_performance_ext %}
+    <tr>
+      <td class="em">{{ row.vertical }}</td>
+      <td class="r">{{ row.gold_plus }}</td>
+      <td class="r">{{ row.pct }}</td>
+      <td class="r">{{ row.avg_7d }}</td>
+      <td class="c">{{ row.status }}</td>
+      <td class="r na">{{ row.enrichment_pct }}</td>
+      <td style="font-size:7.5px;">{{ row.monetization }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
 </div>
 
 
 <!-- ═══════════════════════════════ S7: REVENUE & SUBSCRIBERS ═══════════════════════════════ -->
 <div class="section">
-  <h2>7 &mdash; Revenue &amp; Subscriber Metrics</h2>
+  <h2>7 &mdash; Revenue & Subscriber Metrics</h2>
   {% set sm = subscriber_metrics %}
-  <div class="kpi-grid g6" style="margin-bottom:7px;">
-    <div class="kpi kpi-green">
-      <div class="val">{{ sm.get('active', 0) }}</div>
-      <div class="lbl">Active</div>
-    </div>
-    <div class="kpi kpi-accent">
-      <div class="val">{{ sm.get('founding_active', 0) }}</div>
-      <div class="lbl">Founding Active</div>
-    </div>
-    <div class="kpi kpi-blue">
-      <div class="val">{{ sm.get('new_this_week', 0) }}</div>
-      <div class="lbl">New This Week</div>
-    </div>
-    <div class="kpi kpi-red">
-      <div class="val">{{ sm.get('at_risk', 0) }}</div>
-      <div class="lbl">At-Risk</div>
-    </div>
-    <div class="kpi">
-      <div class="val">{{ sm.get('auto_mode', 0) }}</div>
-      <div class="lbl">Auto Mode On</div>
-    </div>
-    <div class="kpi">
-      <div class="val">{{ sm.get('grace', 0) }}</div>
-      <div class="lbl">In Grace Period</div>
-    </div>
-  </div>
 
-  <div class="kpi-grid g4" style="margin-bottom:9px;">
-    <div class="kpi {% if sm.get('mrr', 'N/A') != 'N/A' %}kpi-green{% else %}kpi-na{% endif %}">
-      <div class="val">{{ sm.get('mrr', 'N/A') }}</div>
-      <div class="lbl">MRR</div>
-      {% if sm.get('mrr', 'N/A') == 'N/A' %}<div class="sub">No subscribers with price yet</div>{% endif %}
-    </div>
-    <div class="kpi {% if sm.get('trial_signups', 0) > 0 %}kpi-blue{% else %}kpi-na{% endif %}">
-      <div class="val">{{ sm.get('trial_signups', 0) }}</div>
-      <div class="lbl">Trial Signups (30d)</div>
-    </div>
-    <div class="kpi {% if sm.get('churn_rate_30d', 'N/A') != 'N/A' %}{% else %}kpi-na{% endif %}">
-      <div class="val">{{ sm.get('churn_rate_30d', 'N/A') }}</div>
-      <div class="lbl">30-Day Churn Rate</div>
-    </div>
-    <div class="kpi {% if sm.get('avg_ltv', 'N/A') != 'N/A' %}kpi-blue{% else %}kpi-na{% endif %}">
-      <div class="val">{{ sm.get('avg_ltv', 'N/A') }}</div>
-      <div class="lbl">Avg LTV</div>
-      {% if sm.get('avg_ltv', 'N/A') == 'N/A' %}<div class="sub">Fills once plan_price set</div>{% endif %}
-    </div>
-  </div>
+  {#─ Model: Metric | Today | This Week | This Month | Monthly Pace | Target | Status ─#}
+  <h3>Current MRR & Subscriber Health</h3>
+  <table>
+    <thead><tr>
+      <th>Metric</th><th class="r">Today</th><th class="r">This Week</th><th class="r">This Month</th><th class="r">Monthly Pace</th><th class="r">Target</th><th class="c">Status</th>
+    </tr></thead>
+    <tbody>
+    {% for row in revenue_table_ext %}
+    <tr>
+      <td class="em">{{ row.metric }}</td>
+      <td class="r">{{ row.today }}</td>
+      <td class="r">{{ row.this_week }}</td>
+      <td class="r">{{ row.this_month }}</td>
+      <td class="r">{{ row.monthly_pace }}</td>
+      <td class="r">{{ row.target }}</td>
+      <td class="c">{{ row.status or '—' }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
 
+  <hr class="divider"/>
   <div class="two-col">
     <div>
       <h3>Status Distribution</h3>
@@ -768,21 +718,32 @@ tbody td { padding: 3.5px 6px; color: #334155; }
         <tr><td>Active</td><td class="r" style="color:#16a34a; font-weight:700;">{{ sm.get('active', 0) }}</td></tr>
         <tr><td>Grace Period</td><td class="r" style="color:#ca8a04; font-weight:700;">{{ sm.get('grace', 0) }}</td></tr>
         <tr><td>Paused</td><td class="r">{{ sm.get('paused', 0) }}</td></tr>
-        <tr><td>Churned / Cancelled (all time)</td><td class="r" style="color:#dc2626; font-weight:700;">{{ sm.get('churned_total', 0) }}</td></tr>
+        <tr><td>Churned / Cancelled</td><td class="r" style="color:#dc2626; font-weight:700;">{{ sm.get('churned_total', 0) }}</td></tr>
         <tr><td>Disputed</td><td class="r" style="color:#dc2626;">{{ sm.get('disputed', 0) }}</td></tr>
         </tbody>
       </table>
     </div>
     <div>
+      {#─ Cohort — model: Cohort | Count | Avg Age | Avg MRR/Sub | Churn Rate | Engagement | NPS ─#}
       <h3>Active Subscriber Cohorts</h3>
       <table>
-        <thead><tr><th>Cohort</th><th class="r">Count</th></tr></thead>
+        <thead><tr>
+          <th>Cohort</th><th class="r">Count</th><th class="r">Avg Age</th><th class="r">Avg MRR/Sub</th><th class="r">Churn Rate</th><th>Engagement</th><th class="c">NPS</th>
+        </tr></thead>
         <tbody>
-        {% for row in cohort_breakdown %}
-        <tr><td>{{ row.cohort }}</td><td class="r em">{{ row.count }}</td></tr>
+        {% for row in cohort_ext %}
+        <tr>
+          <td>{{ row.cohort }}</td>
+          <td class="r em">{{ row.count }}</td>
+          <td class="r" style="font-size:7.5px;">{{ row.avg_age }}</td>
+          <td class="r" style="font-size:7.5px;">{{ row.avg_mrr }}</td>
+          <td class="r" style="font-size:7.5px;">{{ row.churn_rate }}</td>
+          <td style="font-size:7.5px;">{{ row.engagement }}</td>
+          <td class="c na">{{ row.nps }}</td>
+        </tr>
         {% endfor %}
-        {% if not cohort_breakdown %}
-        <tr><td colspan="2" class="na c" style="padding:7px;">No data</td></tr>
+        {% if not cohort_ext %}
+        <tr><td colspan="7" class="na c" style="padding:7px;">No data</td></tr>
         {% endif %}
         </tbody>
       </table>
@@ -792,7 +753,7 @@ tbody td { padding: 3.5px 6px; color: #334155; }
           <strong>{{ sm.get('synthflow_booking_rate') }}</strong>
           &nbsp;({{ sm.get('synthflow_bookings_30d', 0) }} booked / {{ sm.get('synthflow_calls_30d', 0) }} calls)
         {% else %}
-          <span class="na">N/A — no calls logged yet</span>
+          <span class="na">N/A</span>
         {% endif %}
         &nbsp;&middot;&nbsp; Full conversion funnel: <span class="na">N/A</span>
         &nbsp;&middot;&nbsp; NPS: <span class="na">N/A</span>
@@ -851,41 +812,31 @@ tbody td { padding: 3.5px 6px; color: #334155; }
       <h3>Recently Completed A/B Tests (30 days)</h3>
       {% if cm.ab_completed_recent %}
       <table>
-        <thead><tr>
-          <th>Test Name</th><th class="c">Winner</th><th class="r">Ended</th>
-        </tr></thead>
+        <thead><tr><th>Test Name</th><th class="c">Winner</th><th class="r">Ended</th></tr></thead>
         <tbody>
         {% for row in cm.ab_completed_recent %}
         <tr>
           <td>{{ row.name }}</td>
-          <td class="c">
-            {% if row.winner != 'N/A' %}<span class="b-winner">{{ row.winner }}</span>
-            {% else %}<span class="na">N/A</span>{% endif %}
-          </td>
+          <td class="c">{% if row.winner != 'N/A' %}<span class="b-winner">{{ row.winner }}</span>{% else %}<span class="na">N/A</span>{% endif %}</td>
           <td class="r">{{ row.ended }}</td>
         </tr>
         {% endfor %}
         </tbody>
       </table>
       {% else %}
-      <div class="na" style="font-size:8.5px; padding:5px 0;">No tests completed in last 30 days</div>
+      <div class="na" style="font-size:8.5px; padding:5px 0;">No tests completed</div>
       {% endif %}
     </div>
   </div>
 
   <hr class="divider"/>
-  <h3>Cora Decisions &mdash; Today by Graph</h3>
+  <h3>Cora Decisions — Today by Graph</h3>
   {% if cm.decision_stats %}
   <table>
     <thead><tr>
-      <th>Graph</th>
-      <th class="r">Total</th>
-      <th class="r" style="color:#16a34a;">Completed</th>
-      <th class="r" style="color:#ca8a04;">Aborted</th>
-      <th class="r" style="color:#dc2626;">Failed</th>
-      <th class="r">Autonomous%</th>
-      <th class="r">Tokens</th>
-      <th class="r">Cost</th>
+      <th>Graph</th><th class="r">Total</th><th class="r" style="color:#16a34a;">Completed</th>
+      <th class="r" style="color:#ca8a04;">Aborted</th><th class="r" style="color:#dc2626;">Failed</th>
+      <th class="r">Autonomous%</th><th class="r">Tokens</th><th class="r">Cost</th>
     </tr></thead>
     <tbody>
     {% for row in cm.decision_stats %}
@@ -910,18 +861,27 @@ tbody td { padding: 3.5px 6px; color: #334155; }
 
 <!-- ═══════════════════════════════ S9: DATA QUALITY ALERTS ═══════════════════════════════ -->
 <div class="section">
-  <h2>9 &mdash; Data Quality Alerts &amp; Stale Signal Flags</h2>
+  <h2>9 &mdash; Data Quality Alerts & Stale Signal Flags</h2>
 
   {% if open_incidents %}
-  <h3>Open Cora Incidents</h3>
-  {% for inc in open_incidents %}
-  <div class="alert alert-{{ 'fail' if inc.severity == 'red' else 'warn' }}">
-    <strong>[{{ inc.severity | upper }}]</strong>
-    {{ inc.metric }} &mdash; observed <strong>{{ inc.observed }}</strong> vs threshold {{ inc.threshold }} &nbsp;&middot;&nbsp;
-    open since {{ inc.started }} &nbsp;&middot;&nbsp; action: {{ inc.action }}
-    {% if inc.county != '&mdash;' %} &nbsp;&middot;&nbsp; county: {{ inc.county }}{% endif %}
-  </div>
-  {% endfor %}
+  <table>
+    <thead><tr>
+      <th>Alert</th><th class="c">Severity</th><th>Root Cause</th><th>Observed</th><th>Threshold</th><th>Action</th><th>Owner</th>
+    </tr></thead>
+    <tbody>
+    {% for inc in open_incidents %}
+    <tr>
+      <td>{{ inc.metric }}</td>
+      <td class="c">{{ badge(inc.badge) }}</td>
+      <td style="font-size:7.5px;">{{ inc.county }}</td>
+      <td class="r">{{ inc.observed }}</td>
+      <td class="r">{{ inc.threshold }}</td>
+      <td style="font-size:7.5px;">{{ inc.action }}</td>
+      <td style="font-size:7.5px;">Cora</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
   {% else %}
   <div class="alert-none">No open Cora incidents</div>
   {% endif %}
@@ -931,7 +891,7 @@ tbody td { padding: 3.5px 6px; color: #334155; }
   <h3 style="margin-top:8px;">Stale or Missing Signals</h3>
   <table>
     <thead><tr>
-      <th>Signal</th><th class="r">Days Stale</th><th class="c">Health</th>
+      <th>Signal</th><th class="r">Days Stale</th><th class="c">Health</th><th>Impact</th><th>Action</th>
     </tr></thead>
     <tbody>
     {% for row in stale_signals %}
@@ -939,6 +899,8 @@ tbody td { padding: 3.5px 6px; color: #334155; }
       <td>{{ row.source }}</td>
       <td class="r">{{ row.days_stale }}</td>
       <td class="c">{{ badge(row.health) }}</td>
+      <td class="na" style="font-size:7.5px;">N/A</td>
+      <td style="font-size:7.5px;">{% if row.health == 'warn' %}ESCALATE{% elif row.health == 'caution' %}Check{% else %}—{% endif %}</td>
     </tr>
     {% endfor %}
     </tbody>
@@ -951,18 +913,43 @@ tbody td { padding: 3.5px 6px; color: #334155; }
 
 <!-- ═══════════════════════════════ S10: OPPORTUNITY & STRATEGIC ANALYSIS ═══════════════════════════════ -->
 <div class="section">
-  <h2>10 &mdash; Opportunity &amp; Strategic Analysis</h2>
+  <h2>10 &mdash; Opportunity & Strategic Analysis</h2>
+
+  {#─ High-Leverage Opportunities table ─#}
+  <h3>High-Leverage Monetization Opportunities</h3>
+  <table>
+    <thead><tr>
+      <th>Opportunity</th><th class="r">Lead Volume</th><th class="r">Enrichment %</th>
+      <th class="r">Current Subs</th><th class="r">Est. New MRR</th>
+      <th>Effort</th><th class="r">ROI</th>
+    </tr></thead>
+    <tbody>
+    <tr><td>Enrichment Gap</td><td class="r na">N/A</td><td class="r">{{ enrichment_rate }}</td>
+        <td class="r">{{ exec_summary.active_subscribers }}</td><td class="r na">N/A (MRR required)</td>
+        <td style="font-size:7.5px;">Low</td><td class="r na">N/A</td></tr>
+    {% set stale_count = quality_signals | selectattr('health', 'ne', 'ok') | list | length %}
+    {% if stale_count > 0 %}
+    <tr><td>Fix Stale Scrapers</td><td class="r na">N/A</td><td class="r na">—</td>
+        <td class="r na">—</td><td class="r na">N/A</td>
+        <td style="font-size:7.5px;">Medium</td><td class="r na">N/A</td></tr>
+    {% endif %}
+    {% if subscriber_metrics.get('at_risk', 0) > 0 %}
+    <tr><td>At-Risk Subscribers</td><td class="r na">—</td><td class="r na">—</td>
+        <td class="r" style="color:#dc2626;">{{ subscriber_metrics.get('at_risk', 0) }}</td>
+        <td class="r na">N/A</td><td style="font-size:7.5px;">Low</td><td class="r na">N/A</td></tr>
+    {% endif %}
+    </tbody>
+  </table>
+
+  <hr class="divider"/>
+  {#─ ZIP Hotspots ─#}
   <div class="two-col">
     <div>
       <h3>Top ZIP Hotspots (Gold+ Concentration)</h3>
       <table>
         <thead><tr>
-          <th>ZIP</th>
-          <th class="r t-up">Ultra Plat</th>
-          <th class="r t-pl">Plat</th>
-          <th class="r t-go">Gold</th>
-          <th class="r">Total</th>
-          <th class="c">Territory</th>
+          <th>ZIP</th><th class="r t-up">Ultra Plat</th><th class="r t-pl">Plat</th>
+          <th class="r t-go">Gold</th><th class="r">Total</th><th class="c">Territory</th>
         </tr></thead>
         <tbody>
         {% for z in zip_hotspots %}
@@ -972,171 +959,41 @@ tbody td { padding: 3.5px 6px; color: #334155; }
           <td class="r t-pl">{{ z.platinum }}</td>
           <td class="r t-go">{{ z.gold }}</td>
           <td class="r em">{{ z.total }}</td>
-          <td class="c">
-            {% if z.territory_status == 'locked' %}<span class="b-locked">Locked</span>
-            {% elif z.territory_status == 'grace' %}<span class="b-grace">Grace</span>
-            {% else %}<span class="b-open">Open</span>{% endif %}
-          </td>
+          <td class="c">{% if z.territory_status == 'locked' %}<span class="b-locked">Locked</span>{% elif z.territory_status == 'grace' %}<span class="b-grace">Grace</span>{% else %}<span class="b-open">Open</span>{% endif %}</td>
         </tr>
         {% endfor %}
-        {% if not zip_hotspots %}
-        <tr><td colspan="6" class="na c" style="padding:7px;">No ZIP data</td></tr>
-        {% endif %}
+        {% if not zip_hotspots %}<tr><td colspan="6" class="na c" style="padding:7px;">No ZIP data</td></tr>{% endif %}
         </tbody>
       </table>
     </div>
 
     <div>
-      <h3>High-Leverage Opportunities</h3>
-
-      <div class="opp-card">
-        <div class="title">Enrichment Gap</div>
-        <div class="body">
-          Current phone enrichment on Gold+:
-          <span class="hi">{{ enrichment_rate }}</span>
-          {% if enrichment_gap != 'N/A' %}
-          &nbsp;&middot;&nbsp; Gap to 75% target:
-          <span class="hi" style="color:#dc2626;">{{ enrichment_gap }} pp</span>
-          {% endif %}
-          <br/>
-          Est. revenue impact: <span class="na">N/A (requires MRR)</span>
-        </div>
-      </div>
-
-      {% set stale_count = quality_signals | selectattr('health', 'ne', 'ok') | list | length %}
-      {% if stale_count > 0 %}
-      <div class="opp-card">
-        <div class="title">Vertical Scoring Gaps</div>
-        <div class="body">
-          <span class="hi" style="color:#ea580c;">{{ stale_count }}</span>
-          signal(s) are stale or missing. Verticals relying on these signals
-          may be under-scored. See Section 4 for details.
-        </div>
+      <h3>Recommended Actions</h3>
+      {% set stale_sig_count = quality_signals | selectattr('health', 'ne', 'ok') | list | length %}
+      {% if stale_sig_count >= 3 %}
+      <div class="opp-card" style="border-left:3px solid #ea580c;">
+        <div class="title" style="color:#ea580c;">Fix Stale Scrapers</div>
+        <div class="body"><span class="hi" style="color:#ea580c;">{{ stale_sig_count }}</span> signal source(s) are stale or missing. Degrading CDS accuracy.</div>
       </div>
       {% endif %}
-
+      {% set enrich_float = enrichment_rate.rstrip('%') | float if enrichment_rate != 'N/A' else None %}
+      {% if enrich_float is not none and (75.0 - enrich_float) > 20 %}
+      <div class="opp-card" style="border-left:3px solid #d97706;">
+        <div class="title" style="color:#d97706;">Close Enrichment Gap</div>
+        <div class="body">Phone coverage on Gold+ is <span class="hi">{{ enrichment_rate }}</span> — below 75% target.</div>
+      </div>
+      {% endif %}
       {% if subscriber_metrics.get('at_risk', 0) > 0 %}
-      <div class="opp-card">
-        <div class="title">At-Risk Subscribers</div>
-        <div class="body">
-          <span class="hi" style="color:#dc2626;">{{ subscriber_metrics.get('at_risk', 0) }}</span>
-          active subscribers are segment = at_risk.
-          Proactive save flow triggers daily at 10:00 UTC.
-          Est. MRR at risk: <span class="na">N/A</span>
-        </div>
+      <div class="opp-card" style="border-left:3px solid #dc2626;">
+        <div class="title" style="color:#dc2626;">At-Risk Subscribers</div>
+        <div class="body"><span class="hi" style="color:#dc2626;">{{ subscriber_metrics.get('at_risk', 0) }}</span> active subscribers flagged at-risk.</div>
       </div>
       {% endif %}
-
-      {% if cora_metrics.open_incidents_red > 0 %}
-      <div class="opp-card">
-        <div class="title">Critical Cora Incidents</div>
-        <div class="body">
-          <span class="hi" style="color:#dc2626;">{{ cora_metrics.open_incidents_red }}</span>
-          red incident(s) open. All red incidents block Cora marketing sends.
-          See Section 9 for details.
-        </div>
-      </div>
-      {% endif %}
-
       <div class="note" style="margin-top:8px;">
-        Est. new leads from fixes &nbsp;&middot;&nbsp; Est. MRR uplift &nbsp;&middot;&nbsp; ROI:
-        <span class="na">N/A (requires MRR)</span>
+        Est. revenue impact requires MRR data collection.
       </div>
     </div>
   </div>
-
-  <hr class="divider"/>
-
-  {# ── Quick Actions — deterministic rules, no LLM ── #}
-  <h3>Recommended Actions</h3>
-  {% set stale_sig_count = quality_signals | selectattr('health', 'ne', 'ok') | list | length %}
-  {% set at_risk_count   = subscriber_metrics.get('at_risk', 0) %}
-  {% set red_incidents   = cora_metrics.open_incidents_red %}
-  {# Find first open high-density ZIP (list is already sorted by Gold+ total desc) #}
-  {% set top_open_zip = namespace(found=false, zip='', total=0) %}
-  {% for z in zip_hotspots %}
-    {% if not top_open_zip.found and z.territory_status != 'locked' and z.total >= 5 %}
-      {% set top_open_zip.found  = true %}
-      {% set top_open_zip.zip    = z.zip %}
-      {% set top_open_zip.total  = z.total %}
-    {% endif %}
-  {% endfor %}
-
-  {% set any_action = false %}
-
-  {% if red_incidents > 0 %}
-  {% set any_action = true %}
-  <div class="opp-card" style="border-left:3px solid #dc2626;">
-    <div class="title" style="color:#dc2626;">1. Resolve Critical Cora Incidents (Blocking)</div>
-    <div class="body">
-      <span class="hi" style="color:#dc2626;">{{ red_incidents }}</span> red incident(s) are blocking all Cora
-      marketing sends. No outbound messages can be delivered until resolved. Review Section 9.
-    </div>
-  </div>
-  {% endif %}
-
-  {% if stale_sig_count >= 3 %}
-  {% set any_action = true %}
-  <div class="opp-card" style="border-left:3px solid #ea580c;">
-    <div class="title" style="color:#ea580c;">{{ '2' if red_incidents > 0 else '1' }}. Fix Stale Scrapers</div>
-    <div class="body">
-      <span class="hi" style="color:#ea580c;">{{ stale_sig_count }}</span>
-      signal source(s) are stale or missing, degrading CDS accuracy across multiple verticals.
-      Every day stale reduces score reliability. Review Section 4 for per-scraper errors.
-    </div>
-  </div>
-  {% endif %}
-
-  {% if enrichment_gap_float is not none and enrichment_gap_float > 20 %}
-  {% set any_action = true %}
-  {% set seq = (1 + (1 if red_incidents > 0 else 0) + (1 if stale_sig_count >= 3 else 0)) %}
-  <div class="opp-card" style="border-left:3px solid #d97706;">
-    <div class="title" style="color:#d97706;">{{ seq }}. Close Enrichment Gap</div>
-    <div class="body">
-      Phone coverage on Gold+ is
-      <span class="hi">{{ enrichment_rate }}</span> &mdash;
-      <span class="hi" style="color:#d97706;">{{ enrichment_gap }}pp</span>
-      below the 75% target. Increase daily BatchData / IDI run limits before the 08:00 UTC GHL sync.
-      Leads without a phone number cannot receive Cora SMS or Synthflow voice drops.
-      Est. revenue impact: <span class="na">N/A (requires MRR)</span>
-    </div>
-  </div>
-  {% endif %}
-
-  {% if top_open_zip.found %}
-  {% set any_action = true %}
-  {% set seq2 = (1 + (1 if red_incidents > 0 else 0) + (1 if stale_sig_count >= 3 else 0) + (1 if enrichment_gap_float is not none and enrichment_gap_float > 20 else 0)) %}
-  <div class="opp-card" style="border-left:3px solid #1d4ed8;">
-    <div class="title" style="color:#1d4ed8;">{{ seq2 }}. Territory Lock Opportunity</div>
-    <div class="body">
-      ZIP <span class="hi">{{ top_open_zip.zip }}</span> has
-      <span class="hi">{{ top_open_zip.total }}</span> Gold+ leads and is currently unlocked.
-      High-density open territory &mdash; consider a targeted lock offer to convert a wallet
-      subscriber or drive a new sign-up before a competitor locks it.
-      Est. subscriber revenue: <span class="na">N/A (requires MRR)</span>
-    </div>
-  </div>
-  {% endif %}
-
-  {% if at_risk_count > 5 %}
-  {% set any_action = true %}
-  <div class="opp-card" style="border-left:3px solid #7c3aed;">
-    <div class="title" style="color:#7c3aed;">Churn Risk: Proactive Save Priority</div>
-    <div class="body">
-      <span class="hi" style="color:#7c3aed;">{{ at_risk_count }}</span>
-      active subscribers are flagged at-risk. Proactive save flow runs daily at 10:00 UTC &mdash;
-      verify it ran without error. Consider a manual outreach for highest-revenue-signal accounts.
-      Est. MRR at risk: <span class="na">N/A</span>
-    </div>
-  </div>
-  {% endif %}
-
-  {% if not any_action %}
-  <div style="font-size:8.5px; color:#16a34a; padding:6px 0;">
-    No high-priority actions identified. All signals healthy, enrichment on target,
-    Cora incidents resolved.
-  </div>
-  {% endif %}
 </div>
 
 

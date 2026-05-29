@@ -53,9 +53,6 @@ TEMPLATES_DIR = Path("src/templates")
 NA = "N/A"
 
 # Lien and judgment subtypes that are common to every county.
-# These are stripped from per-county scraper rows and merged into one
-# unified "Liens & Judgements" section so the county tables don't repeat
-# the same subtype list for Hillsborough, Pinellas, etc.
 LIEN_SUBTYPES: frozenset[str] = frozenset({
     "judgments", "lis_pendens",
     "lien_ml", "lien_tcl", "lien_hoa", "lien_ccl", "lien_tl", "lien_unknown",
@@ -64,7 +61,6 @@ LIEN_SUBTYPE_ORDER = [
     "judgments", "lis_pendens",
     "lien_ml", "lien_tcl", "lien_hoa", "lien_ccl", "lien_tl", "lien_unknown",
 ]
-# Pre-computed label set for fast membership tests against row["label"]
 LIEN_LABELS: frozenset[str] = frozenset(st.replace("_", " ").title() for st in LIEN_SUBTYPES)
 
 SOURCE_LABELS = {
@@ -160,12 +156,39 @@ def _staleness_badge(days: Any) -> str:
     return "warn"
 
 
+def _quality_label(health: str) -> str:
+    return {
+        "ok": "🟢 Clean",
+        "caution": "🟡 Moderate",
+        "warn": "🟠 Stale",
+        "fail": "🔴 Error",
+        "na": "⚪ N/A",
+    }.get(health, "—")
+
+
+def _status_emoji(status: str) -> str:
+    if status in ("ok", "healthy", "on_track", "exceeding"):
+        return "✅"
+    if status in ("warn", "caution", "early", "lagging"):
+        return "⚠️"
+    if status in ("fail", "prelaunch", "pending", "off_track"):
+        return "⏳"
+    return "—"
+
+
+def _trend_arrow(val: str) -> str:
+    return {
+        "up": "↑",
+        "down": "↓",
+        "flat": "→",
+    }.get(val, "→")
+
+
 # ---------------------------------------------------------------------------
 # County discovery
 # ---------------------------------------------------------------------------
 
 def _fetch_active_counties(session) -> list[str]:
-    """Return county_ids where is_active=true. Falls back to ['hillsborough']."""
     try:
         rows = session.execute(
             text("SELECT county_id FROM counties WHERE is_active = true ORDER BY county_id")
@@ -177,7 +200,7 @@ def _fetch_active_counties(session) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Merge helpers for results from county-specific imported functions
+# Merge helpers
 # ---------------------------------------------------------------------------
 
 def _merge_tier_snapshots(snapshots: list[dict]) -> dict:
@@ -205,7 +228,7 @@ def _merge_vertical_breakdowns(breakdowns: list[dict]) -> dict:
     merged: dict = {}
     for bd in breakdowns:
         for vert, data in bd.items():
-            if not isinstance(data, dict):  # skip _total and other scalar sentinels
+            if not isinstance(data, dict):
                 continue
             if vert not in merged:
                 merged[vert] = {"count": 0, "pct": 0.0}
@@ -263,7 +286,7 @@ def _merge_signal_freshness_dicts(freshnesses: list[dict]) -> dict:
             if src not in merged:
                 merged[src] = days
             elif days is None:
-                merged[src] = None  # never run → worst case
+                merged[src] = None
             elif merged[src] is not None and days > merged[src]:
                 merged[src] = days
     return merged
@@ -318,16 +341,58 @@ def _fetch_weekly_tier_history(session, run_date: date, county_ids: list[str]) -
             by_day[str(day)][tier] = int(cnt)
         result = []
         d = week_start
+        day_names = []
         while d <= run_date:
             key = str(d)
             counts = by_day.get(key, {t: 0 for t in ("Ultra Platinum", "Platinum", "Gold", "Silver", "Bronze")})
             gp = sum(counts.get(t, 0) for t in GOLD_PLUS_TIERS)
-            result.append({"date": key, "counts": counts, "gold_plus": gp})
+            result.append({"date": key, "day_name": d.strftime("%a"), "counts": counts, "gold_plus": gp})
+            day_names.append(d.strftime("%a"))
             d += timedelta(days=1)
         return result
     except Exception as exc:
         logger.warning("_fetch_weekly_tier_history failed: %s", exc)
         return []
+
+
+def _fetch_tier_7day_avg(session, run_date: date, county_ids: list[str]) -> dict:
+    """Return 7-day daily average count per tier."""
+    seven_start = run_date - timedelta(days=6)
+    try:
+        rows = session.execute(
+            text("""
+                SELECT lead_tier, COUNT(*)::float / 7.0 AS avg_per_day
+                FROM distress_scores
+                WHERE date(score_date) BETWEEN :seven_start AND :today
+                  AND county_id = ANY(:county_ids)
+                GROUP BY lead_tier
+            """),
+            {"seven_start": str(seven_start), "today": str(run_date), "county_ids": county_ids},
+        ).fetchall()
+        return {tier: round(float(avg), 1) for tier, avg in rows}
+    except Exception as exc:
+        logger.warning("_fetch_tier_7day_avg failed: %s", exc)
+        return {}
+
+
+def _fetch_tier_this_week_total(session, run_date: date, county_ids: list[str]) -> dict:
+    """Return this week's total count per tier."""
+    week_start = run_date - timedelta(days=run_date.weekday())
+    try:
+        rows = session.execute(
+            text("""
+                SELECT lead_tier, COUNT(*) AS cnt
+                FROM distress_scores
+                WHERE date(score_date) BETWEEN :week_start AND :today
+                  AND county_id = ANY(:county_ids)
+                GROUP BY lead_tier
+            """),
+            {"week_start": str(week_start), "today": str(run_date), "county_ids": county_ids},
+        ).fetchall()
+        return {tier: int(cnt) for tier, cnt in rows}
+    except Exception as exc:
+        logger.warning("_fetch_tier_this_week_total failed: %s", exc)
+        return {}
 
 
 def _fetch_avg_cds(session, run_date: date, county_ids: list[str]) -> str:
@@ -402,7 +467,6 @@ def _county_zip_list(county_id: str) -> list[str]:
 
 
 def _fetch_county_revenue_kpis(session, run_date: date, county_id: str, active: int) -> dict:
-    """County-scoped commercial KPIs for the Section 2 county tiles."""
     try:
         mrr_val = session.execute(
             text("""
@@ -512,23 +576,16 @@ def _fetch_county_revenue_kpis(session, run_date: date, county_id: str, active: 
     except Exception as exc:
         logger.warning("_fetch_county_revenue_kpis failed for %s: %s", county_id, exc)
         return {
-            "subscriber_mrr": NA,
-            "subscriber_mrr_trend": "flat",
-            "subscriber_churn": NA,
-            "subscriber_churn_trend": "flat",
-            "lead_delivery_sla": NA,
-            "lead_delivery_sla_ok": False,
+            "subscriber_mrr": NA, "subscriber_mrr_trend": "flat",
+            "subscriber_churn": NA, "subscriber_churn_trend": "flat",
+            "lead_delivery_sla": NA, "lead_delivery_sla_ok": False,
             "lead_delivery_sla_trend": "flat",
-            "synthflow_booking_rate": NA,
-            "synthflow_booking_rate_trend": "flat",
+            "synthflow_booking_rate": NA, "synthflow_booking_rate_trend": "flat",
         }
 
 
 def _count_distress_scores(
-    session,
-    county_id: str,
-    start_date: date,
-    end_date: date,
+    session, county_id: str, start_date: date, end_date: date,
     tier_filter: str | None = None,
 ) -> int:
     tier_clause = ""
@@ -673,26 +730,14 @@ def _fetch_dbpr_prospects(session, county_id: str, start_date: date, end_date: d
 
 
 def _county_metric_row(
-    metric: str,
-    today: str,
-    this_week: str,
-    avg_7d: str,
-    monthly: str,
-    target: str = "—",
-    trend: str = "flat",
-    status: str | None = None,
+    metric: str, today: str, this_week: str, avg_7d: str, monthly: str,
+    target: str = "—", trend: str = "flat", status: str | None = None,
     notes: str | None = None,
 ) -> dict:
     return {
-        "metric": metric,
-        "today": today,
-        "this_week": this_week,
-        "avg_7d": avg_7d,
-        "monthly": monthly,
-        "target": target,
-        "trend": trend,
-        "status": status,
-        "notes": notes,
+        "metric": metric, "today": today, "this_week": this_week,
+        "avg_7d": avg_7d, "monthly": monthly, "target": target,
+        "trend": trend, "status": status, "notes": notes,
     }
 
 
@@ -710,9 +755,9 @@ def _fetch_county_performance_table(session, run_date: date, county_id: str, mar
         prev = _count_distress_scores(session, county_id, prev_day, prev_day, tier_filter)
         return today, week, seven, month, prev
 
-    leads_today, leads_week, leads_7d, leads_month, leads_prev = counts()
-    gold_today, gold_week, gold_7d, gold_month, gold_prev = counts("gold_plus")
-    up_today, up_week, up_7d, up_month, up_prev = counts("up_plat")
+    (leads_today, leads_week, leads_7d, leads_month, leads_prev) = counts()
+    (gold_today, gold_week, gold_7d, gold_month, gold_prev) = counts("gold_plus")
+    (up_today, up_week, up_7d, up_month, up_prev) = counts("up_plat")
 
     cds_today = _avg_cds_for_period(session, county_id, run_date, run_date)
     cds_week = _avg_cds_for_period(session, county_id, week_start, run_date)
@@ -875,7 +920,360 @@ def _fetch_cora_autonomy(session) -> str:
 
 
 # ---------------------------------------------------------------------------
-# County-specific (called once per county for Section 2)
+# NEW: Additional query functions for missing model columns
+# ---------------------------------------------------------------------------
+
+def _fetch_exec_summary_rows(session, run_date: date, county_ids: list[str]) -> list[dict]:
+    """Build executive summary table rows: Metric | Today | This Week | Monthly Pace | Target | Status."""
+    week_start = run_date - timedelta(days=run_date.weekday())
+    month_start = run_date.replace(day=1)
+    prev_month_end = month_start - timedelta(days=1)
+    prev_month_start = prev_month_end.replace(day=1)
+
+    results = []
+
+    def daily(n, d):
+        return f"{n / d:.0f}/day" if d else NA
+
+    # Total Leads
+    t_today = int(session.execute(text("SELECT COUNT(*) FROM distress_scores WHERE date(score_date)=:today AND county_id=ANY(:cids)"), {"today": str(run_date), "cids": county_ids}).scalar() or 0)
+    t_week = int(session.execute(text("SELECT COUNT(*) FROM distress_scores WHERE date(score_date) BETWEEN :ws AND :today AND county_id=ANY(:cids)"), {"ws": str(week_start), "today": str(run_date), "cids": county_ids}).scalar() or 0)
+    t_month = int(session.execute(text("SELECT COUNT(*) FROM distress_scores WHERE date(score_date) BETWEEN :ms AND :today AND county_id=ANY(:cids)"), {"ms": str(month_start), "today": str(run_date), "cids": county_ids}).scalar() or 0)
+    t_prev_month = int(session.execute(text("SELECT COUNT(*) FROM distress_scores WHERE date(score_date) BETWEEN :pms AND :pme AND county_id=ANY(:cids)"), {"pms": str(prev_month_start), "pme": str(prev_month_end), "cids": county_ids}).scalar() or 0)
+    days_in_month = (run_date - month_start).days + 1
+    monthly_pace = t_month / days_in_month * 30 if days_in_month else NA
+    results.append(("Total Leads Generated", _num_fmt(t_today), _num_fmt(t_week), daily(t_month, days_in_month), _num_fmt(int(monthly_pace)) if isinstance(monthly_pace, float) else NA,  "—", _trend(float(t_today), float(t_prev_month / 30)), ""))
+
+    # Gold+ Leads
+    gp_today = int(session.execute(text("SELECT COUNT(*) FROM distress_scores WHERE date(score_date)=:today AND lead_tier=ANY(:tiers) AND county_id=ANY(:cids)"), {"today": str(run_date), "tiers": list(GOLD_PLUS_TIERS), "cids": county_ids}).scalar() or 0)
+    gp_week = int(session.execute(text("SELECT COUNT(*) FROM distress_scores WHERE date(score_date) BETWEEN :ws AND :today AND lead_tier=ANY(:tiers) AND county_id=ANY(:cids)"), {"ws": str(week_start), "today": str(run_date), "tiers": list(GOLD_PLUS_TIERS), "cids": county_ids}).scalar() or 0)
+    gp_month = int(session.execute(text("SELECT COUNT(*) FROM distress_scores WHERE date(score_date) BETWEEN :ms AND :today AND lead_tier=ANY(:tiers) AND county_id=ANY(:cids)"), {"ms": str(month_start), "today": str(run_date), "tiers": list(GOLD_PLUS_TIERS), "cids": county_ids}).scalar() or 0)
+    gp_pace = gp_month / days_in_month * 30 if days_in_month else NA
+    results.append(("Gold+ Leads (Monetizable)", _num_fmt(gp_today), _num_fmt(gp_week), daily(gp_month, days_in_month), _num_fmt(int(gp_pace)) if isinstance(gp_pace, float) else NA, "—", "", ""))
+
+    # MRR
+    mrr_val = session.execute(text("SELECT SUM(plan_price) FROM subscribers WHERE status='active' AND plan_price IS NOT NULL AND county_id=ANY(:cids)"), {"cids": county_ids}).scalar()
+    mrr = _currency(mrr_val) if mrr_val else NA
+    results.append(("MRR (if live subscribers)", mrr, mrr, mrr, mrr, "—", "", ""))
+
+    # Active Subscribers
+    active = int(session.execute(text("SELECT COUNT(*) FROM subscribers WHERE status='active' AND county_id=ANY(:cids)"), {"cids": county_ids}).scalar() or 0)
+    active_last_month = int(session.execute(text("SELECT COUNT(*) FROM subscribers WHERE status='active' AND date(created_at) <= :pme AND (churned_at IS NULL OR date(churned_at) > :pme) AND county_id=ANY(:cids)"), {"pme": str(prev_month_end), "cids": county_ids}).scalar() or 0)
+    results.append(("Active Subscribers", _num_fmt(active), f"{active - active_last_month:+d}", "—", _num_fmt(active), "—", _trend(float(active), float(active_last_month)), ""))
+
+    # Lead Enrichment Rate
+    enrich = _fetch_enrichment_rate(session, run_date, county_ids)
+    results.append(("Lead Enrichment Rate", enrich, enrich, enrich, enrich, "75%", "", "" if enrich != NA and float(enrich.rstrip("%")) >= 75 else "⚠️"))
+
+    # Avg CDS Score
+    cds = _fetch_avg_cds(session, run_date, county_ids)
+    results.append(("Avg CDS Score", cds, cds, "—", cds, "70+", "", "" if cds != NA and float(cds) >= 70 else "⚠️"))
+
+    # Trial→Paid Conversion
+    results.append(("Trial→Paid Conversion", NA, NA, "—", NA, "15%+", "", ""))
+
+    # 30-Day Churn Rate
+    churn_val = session.execute(text("SELECT COUNT(*) FROM subscribers WHERE churned_at >= now() - INTERVAL '30 days' AND county_id=ANY(:cids)"), {"cids": county_ids}).scalar() or 0
+    churn_rate = f"{int(churn_val or 0) / max(1, active + int(churn_val or 0)) * 100:.1f}%" if active + int(churn_val or 0) > 0 else NA
+    results.append(("Churn Rate (30-day)", churn_rate, "—", churn_rate, churn_rate, "<5%", "", ""))
+
+    # Cora Autonomy
+    auto = _fetch_cora_autonomy(session)
+    results.append(("Cora Autonomy Score", auto, "—", "—", auto, "95%+", "", ""))
+
+    return [
+        {"metric": r[0], "today": r[1], "this_week": r[2], "monthly_pace": r[3], "target": r[4], "trend": r[5], "status": r[6], "notes": r[7]}
+        for r in results
+    ]
+
+
+def _fetch_scraper_ingest_details(session, run_date: date, county_ids: list[str]) -> list[dict]:
+    """Build scraper rows with Last Update, Days Stale, Quality, Action columns."""
+    rows = session.execute(
+        text("""
+            SELECT source_type,
+                   MAX(run_date) AS last_update,
+                   COUNT(*) AS total_runs,
+                   SUM(CASE WHEN run_success THEN 1 ELSE 0 END) AS ok_runs,
+                   BOOL_AND(run_success) AS all_ok
+            FROM scraper_run_stats
+            WHERE county_id = ANY(:cids)
+            GROUP BY source_type
+            ORDER BY source_type
+        """),
+        {"cids": county_ids},
+    ).fetchall()
+    result = []
+    for source_type, last_update, total_runs, ok_runs, all_ok in rows:
+        days_stale = (run_date - last_update).days if last_update else None
+        health = _staleness_badge(days_stale)
+        action = "—"
+        if days_stale is not None and days_stale > 3:
+            action = "ESCALATE" if days_stale > 5 else "Check"
+        result.append({
+            "source": source_type.replace("_", " ").title(),
+            "records_per_day": int(total_runs or 0),
+            "updated": str(last_update) if last_update else "Never",
+            "days_stale": days_stale if days_stale is not None else "Never",
+            "status": "ok" if bool(all_ok) else ("caution" if ok_runs and ok_runs > 0 else "fail"),
+            "quality": _quality_label(health),
+            "action": action,
+        })
+    return result
+
+
+def _fetch_enrichment_both_pct_by_tier(session, run_date: date, county_ids: list[str]) -> list[dict]:
+    """Enrichment by tier with Both%, Impact, Action columns."""
+    rows = session.execute(
+        text("""
+            WITH gp AS (
+                SELECT DISTINCT ON (ds.property_id) ds.property_id, ds.lead_tier
+                FROM distress_scores ds
+                WHERE ds.county_id = ANY(:cids)
+                  AND date(ds.score_date) = :today AND ds.lead_tier = ANY(:tiers)
+                ORDER BY ds.property_id, ds.score_date DESC
+            )
+            SELECT gp.lead_tier,
+                COUNT(DISTINCT gp.property_id) AS total,
+                COUNT(DISTINCT CASE WHEN ec.mobile_phone IS NOT NULL AND ec.email IS NOT NULL THEN gp.property_id END) AS both_,
+                COUNT(DISTINCT CASE WHEN ec.mobile_phone IS NOT NULL THEN gp.property_id END) AS phone,
+                COUNT(DISTINCT CASE WHEN ec.email IS NOT NULL THEN gp.property_id END) AS email
+            FROM gp
+            LEFT JOIN enriched_contacts ec ON ec.property_id = gp.property_id AND ec.match_success = true
+            GROUP BY gp.lead_tier
+            ORDER BY CASE gp.lead_tier
+                WHEN 'Ultra Platinum' THEN 1 WHEN 'Platinum' THEN 2 WHEN 'Gold' THEN 3
+                WHEN 'Silver' THEN 4 ELSE 5 END
+        """),
+        {"cids": county_ids, "today": str(run_date), "tiers": list(GOLD_PLUS_TIERS)},
+    ).fetchall()
+    result = []
+    for tier, total, both_, phone, email in rows:
+        total, both_, phone, email = int(total or 0), int(both_ or 0), int(phone or 0), int(email or 0)
+        both_pct = (both_ / total * 100) if total else 0
+        phone_pct = (phone / total * 100) if total else 0
+        email_pct = (email / total * 100) if total else 0
+        impact = {"Ultra Platinum": "Highest ROI — must be enriched", "Platinum": "Very high ROI", "Gold": "Good ROI", "Silver": "Moderate ROI", "Bronze": "Lower ROI"}.get(tier, "")
+        action = ""
+        if tier in ("Ultra Platinum", "Platinum") and both_pct < 80:
+            action = "Escalate if <80%"
+        elif tier == "Gold" and both_pct < 70:
+            action = "Monitor if <70%"
+        elif tier == "Silver" and both_pct < 60:
+            action = "Monitor if <60%"
+        elif tier == "Bronze" and both_pct < 50:
+            action = "Monitor if <50%"
+        result.append({
+            "tier": tier, "total": total,
+            "phone_pct": f"{phone_pct:.1f}%",
+            "email_pct": f"{email_pct:.1f}%",
+            "both_pct": f"{both_pct:.1f}%",
+            "impact": impact,
+            "action": action,
+        })
+    return result
+
+
+def _fetch_enrichment_source_detailed(session, county_ids: list[str]) -> list[dict]:
+    """Enrichment source performance with Cost/Lead, Volume/Day, API Health."""
+    since = date.today() - timedelta(days=7)
+    rows = session.execute(
+        text("""
+            SELECT source, COUNT(*) AS total,
+                   SUM(CASE WHEN match_success THEN 1 ELSE 0 END) AS matched,
+                   SUM(CASE WHEN mobile_phone IS NOT NULL THEN 1 ELSE 0 END) AS with_phone
+            FROM enriched_contacts
+            WHERE county_id = ANY(:cids) AND enriched_at >= :since
+            GROUP BY source ORDER BY total DESC
+        """),
+        {"cids": county_ids, "since": str(since)},
+    ).fetchall()
+    result = []
+    for source, total, matched, with_phone in rows:
+        total, matched = int(total or 0), int(matched or 0)
+        success_pct = _pct(matched, total)
+        result.append({
+            "source": SOURCE_LABELS.get(source, source),
+            "success_rate": success_pct,
+            "cost_per_lead": "N/A",  # No per-lead cost tracking
+            "volume_per_day": f"{total / 7:.0f}/day" if total else "0/day",
+            "api_health": "✅" if matched > 0 else "⚠️",
+            "status": f"Match: {success_pct}",
+        })
+    return result
+
+
+def _fetch_vertical_performance_extended(session, run_date: date, county_ids: list[str]) -> list[dict]:
+    """Vertical performance with 7-Day Avg, Status, Enrichment %, Monetization Status."""
+    seven_start = run_date - timedelta(days=6)
+    week_start = run_date - timedelta(days=run_date.weekday())
+
+    gp_7d = session.execute(
+        text("""
+            WITH latest AS (
+                SELECT DISTINCT ON (property_id) property_id, lead_tier, vertical_scores
+                FROM distress_scores
+                WHERE county_id = ANY(:cids) AND date(score_date) BETWEEN :ss AND :today
+                  AND lead_tier = ANY(:tiers)
+                ORDER BY property_id, score_date DESC
+            )
+            SELECT COUNT(*) FROM latest
+        """),
+        {"cids": county_ids, "ss": str(seven_start), "today": str(run_date), "tiers": list(GOLD_PLUS_TIERS)},
+    ).scalar() or 0
+    gp_7d_avg = round(int(gp_7d) / 7, 1)
+
+    gp_week = session.execute(
+        text("""
+            WITH latest AS (
+                SELECT DISTINCT ON (property_id) property_id, lead_tier, vertical_scores
+                FROM distress_scores
+                WHERE county_id = ANY(:cids) AND date(score_date) BETWEEN :ws AND :today
+                  AND lead_tier = ANY(:tiers)
+                ORDER BY property_id, score_date DESC
+            )
+            SELECT COUNT(*) FROM latest
+        """),
+        {"cids": county_ids, "ws": str(week_start), "today": str(run_date), "tiers": list(GOLD_PLUS_TIERS)},
+    ).scalar() or 0
+    gp_week_avg = round(int(gp_week) / max(1, (run_date - week_start).days + 1), 1)
+
+    rows = []
+    for key, label in VERTICAL_DISPLAY.items():
+        count = 0
+        try:
+            raw = session.execute(
+                text("""
+                    SELECT COUNT(*) FROM (
+                        SELECT DISTINCT ON (ds.property_id) ds.property_id, ds.vertical_scores
+                        FROM distress_scores ds
+                        WHERE ds.county_id = ANY(:cids)
+                          AND date(ds.score_date) BETWEEN :ss AND :today
+                          AND ds.lead_tier = ANY(:tiers)
+                        ORDER BY ds.property_id, ds.score_date DESC
+                    ) latest
+                    WHERE vertical_scores IS NOT NULL AND (vertical_scores->>:key) IS NOT NULL
+                """),
+                {"cids": county_ids, "ss": str(seven_start), "today": str(run_date),
+                 "tiers": list(GOLD_PLUS_TIERS), "key": key},
+            ).scalar() or 0
+            count = int(raw)
+        except Exception:
+            pass
+
+        sub_count = int(session.execute(
+            text("SELECT COUNT(*) FROM subscribers WHERE status='active' AND vertical=:vert AND county_id=ANY(:cids)"),
+            {"vert": key, "cids": county_ids},
+        ).scalar() or 0)
+
+        status = "✅" if count > 10 else ("🟡" if count > 5 else "⏳")
+        rows.append({
+            "vertical": label,
+            "gold_plus": count,
+            "pct": _pct(count, gp_7d),
+            "avg_7d": f"{count / 7:.0f}/day" if count else "0/day",
+            "status": status,
+            "enrichment_pct": "N/A",
+            "monetization": f"Active subs: {sub_count}",
+        })
+    return rows
+
+
+def _fetch_revenue_table_extended(session, run_date: date, county_ids: list[str]) -> list[dict]:
+    """Revenue & subscriber metric rows with This Month, Monthly Pace, Target, Status columns."""
+    month_start = run_date.replace(day=1)
+    prev_day = run_date - timedelta(days=1)
+    week_start = run_date - timedelta(days=run_date.weekday())
+
+    active = int(session.execute(text("SELECT COUNT(*) FROM subscribers WHERE status='active' AND county_id=ANY(:cids)"), {"cids": county_ids}).scalar() or 0)
+    mrr_val = session.execute(text("SELECT SUM(plan_price) FROM subscribers WHERE status='active' AND plan_price IS NOT NULL AND county_id=ANY(:cids)"), {"cids": county_ids}).scalar()
+    mrr = _currency(mrr_val) if mrr_val else NA
+    new_week = int(session.execute(text("SELECT COUNT(*) FROM subscribers WHERE status='active' AND created_at >= :ws AND county_id=ANY(:cids)"), {"ws": str(week_start), "cids": county_ids}).scalar() or 0)
+    new_month = int(session.execute(text("SELECT COUNT(*) FROM subscribers WHERE status='active' AND created_at >= :ms AND county_id=ANY(:cids)"), {"ms": str(month_start), "cids": county_ids}).scalar() or 0)
+    churned_month = int(session.execute(text("SELECT COUNT(*) FROM subscribers WHERE churned_at >= :ms AND county_id=ANY(:cids)"), {"ms": str(month_start), "cids": county_ids}).scalar() or 0)
+
+    rows = [
+        ("MRR Total", mrr, mrr, mrr, mrr, "—", ""),
+        ("MRR from Hillsborough", mrr, mrr, mrr, mrr, "—", ""),
+        ("MRR from Pinellas", "$0 (Pre-revenue)", "$0", "$0", "$0", "$0 (Pre-revenue)", "⏳"),
+        ("MRR from Other Counties", "$0", "$0", "$0", "$0", "$0", "⏳"),
+        ("Active Subscribers", _num_fmt(active), f"+{new_week}", f"+{new_month}", _num_fmt(active), "—", ""),
+        ("New Subs This Week", _num_fmt(new_week), "", "", "", "", ""),
+        ("Churned Subs This Week", _num_fmt(churned_month), "", "", "", "", ""),
+        ("Trial Signups", NA, NA, NA, NA, "—", "⏳"),
+        ("Trial→Paid Conversion", NA, NA, NA, NA, "15%+", "⏳"),
+        ("Avg Subscriber LTV", NA, "—", "—", NA, "—", "⏳"),
+        ("Churn Rate (30-day)", NA, NA, NA, NA, "<5%", ""),
+    ]
+
+    # Compute churn for display
+    churned_30d = int(session.execute(text("SELECT COUNT(*) FROM subscribers WHERE churned_at >= now() - INTERVAL '30 days' AND county_id=ANY(:cids)"), {"cids": county_ids}).scalar() or 0)
+    churn_rate = f"{churned_30d / max(1, active + churned_30d) * 100:.1f}%" if active + churned_30d > 0 else NA
+    rows[10] = ("Churn Rate (30-day)", churn_rate, churn_rate, churn_rate, churn_rate, "<5%", "")
+
+    return [
+        {"metric": r[0], "today": r[1], "this_week": r[2], "this_month": r[3], "monthly_pace": r[4], "target": r[5], "status": r[6]}
+        for r in rows
+    ]
+
+
+def _fetch_cohort_extended(session, county_ids: list[str]) -> list[dict]:
+    """Cohort with Avg Age, Avg MRR/Sub, Churn Rate, Engagement, NPS."""
+    today = date.today()
+    rows = session.execute(
+        text("""
+            SELECT CASE
+                WHEN founding_member = true THEN 'Founding (1st month)'
+                WHEN created_at >= now() - INTERVAL '30 days' THEN 'New (30d)'
+                WHEN created_at >= now() - INTERVAL '90 days' THEN 'Early (2-3 months)'
+                ELSE 'Established (3+ months)'
+            END AS cohort,
+            COUNT(*) AS cnt,
+            AVG(EXTRACT(EPOCH FROM (now() - created_at)) / 86400.0) AS avg_age_days,
+            AVG(plan_price) AS avg_mrr
+            FROM subscribers
+            WHERE status = 'active' AND county_id = ANY(:cids)
+            GROUP BY 1 ORDER BY 1
+        """),
+        {"cids": county_ids},
+    ).fetchall()
+
+    results = []
+    for cohort, cnt, avg_age, avg_mrr in rows:
+        cnt = int(cnt or 0)
+        avg_age_str = f"{int(avg_age or 0)} days"
+        avg_mrr_str = _currency(avg_mrr) if avg_mrr else NA
+        churned_in_cohort = 0
+        if cohort == "Founding (1st month)":
+            churned_in_cohort = int(session.execute(text("SELECT COUNT(*) FROM subscribers WHERE founding_member=true AND churned_at >= now() - INTERVAL '30 days' AND county_id=ANY(:cids)"), {"cids": county_ids}).scalar() or 0)
+        churn_str = f"{churned_in_cohort / max(1, cnt) * 100:.1f}%" if cnt else NA
+        results.append({
+            "cohort": cohort,
+            "count": cnt,
+            "avg_age": avg_age_str,
+            "avg_mrr": avg_mrr_str,
+            "churn_rate": churn_str,
+            "engagement": "N/A",
+            "nps": "N/A",
+        })
+    # Add At-Risk row
+    at_risk = int(session.execute(text("SELECT COUNT(DISTINCT us.subscriber_id) FROM user_segments us JOIN subscribers s ON s.id=us.subscriber_id WHERE us.segment='at_risk' AND s.county_id=ANY(:cids) AND s.status='active'"), {"cids": county_ids}).scalar() or 0)
+    at_risk_mrr = session.execute(text("SELECT SUM(plan_price) FROM subscribers WHERE id IN (SELECT subscriber_id FROM user_segments WHERE segment='at_risk') AND status='active' AND county_id=ANY(:cids)"), {"cids": county_ids}).scalar()
+    if at_risk > 0:
+        results.append({
+            "cohort": "At-Risk (Inactive 5+ days)",
+            "count": at_risk,
+            "avg_age": "—",
+            "avg_mrr": _currency(at_risk_mrr) if at_risk_mrr else NA,
+            "churn_rate": "—",
+            "engagement": "Low 🔴",
+            "nps": "N/A",
+        })
+    return results
+
+
+# ---------------------------------------------------------------------------
+# County-specific
 # ---------------------------------------------------------------------------
 
 def _fetch_county_snapshot(session, run_date: date, county_id: str) -> dict:
@@ -1071,14 +1469,12 @@ def _fetch_subscriber_metrics(session, county_ids: list[str]) -> dict:
             {"county_ids": county_ids},
         ).scalar() or 0)
 
-        # MRR — sum of plan_price for active subscribers
         mrr_val = session.execute(
             text("SELECT SUM(plan_price) FROM subscribers WHERE status='active' AND plan_price IS NOT NULL AND county_id = ANY(:cids)"),
             {"cids": county_ids},
         ).scalar()
         mrr = _currency(mrr_val) if mrr_val else NA
 
-        # 30-day churn rate: churned in window / (active now + churned in window)
         churned_30d = int(session.execute(
             text("SELECT COUNT(*) FROM subscribers WHERE churned_at >= now() - INTERVAL '30 days' AND county_id = ANY(:cids)"),
             {"cids": county_ids},
@@ -1086,13 +1482,11 @@ def _fetch_subscriber_metrics(session, county_ids: list[str]) -> dict:
         churn_denom = active + churned_30d
         churn_rate_30d = f"{churned_30d / churn_denom * 100:.1f}%" if churn_denom else NA
 
-        # Trial signups (last 30 days)
         trial_signups = int(session.execute(
             text("SELECT COUNT(*) FROM subscribers WHERE is_trial = true AND created_at >= now() - INTERVAL '30 days' AND county_id = ANY(:cids)"),
             {"cids": county_ids},
         ).scalar() or 0)
 
-        # Avg LTV = avg(plan_price × months subscribed) for active subscribers with a price
         ltv_val = session.execute(
             text("""
                 SELECT AVG(plan_price * GREATEST(1, EXTRACT(EPOCH FROM (now() - created_at)) / 2592000.0))
@@ -1104,7 +1498,6 @@ def _fetch_subscriber_metrics(session, county_ids: list[str]) -> dict:
         ).scalar()
         avg_ltv = _currency(ltv_val) if ltv_val else NA
 
-        # Synthflow booking rate (last 30 days) — demo_requested / total calls
         synthflow_zips = sorted({
             zip_code
             for county_id in county_ids
@@ -1341,14 +1734,12 @@ def _fetch_data_quality_signals(session, run_date: date, county_ids: list[str]) 
 
 
 # ---------------------------------------------------------------------------
-# Combined liens & judgements (unified across all active counties)
+# Combined liens & judgements
 # ---------------------------------------------------------------------------
 
 def _fetch_liens_judgements_combined(
     session, run_date: date, county_ids: list[str]
 ) -> tuple[list[dict], int, int]:
-    """Return (rows, total_scraped, total_matched) for lien/judgment subtypes
-    summed across all active counties.  Used for the unified S4 sub-table."""
     try:
         db_rows = session.execute(
             text("""
@@ -1394,7 +1785,6 @@ def _fetch_liens_judgements_combined(
             "matched": matched if scraped > 0 else None,
             "ok":      ok,
         })
-    # Catch any unknown lien subtypes that arrived (e.g. new portal categories)
     for st, r in by_type.items():
         if st not in LIEN_SUBTYPE_ORDER:
             scraped = int(r[1] or 0)
@@ -1456,8 +1846,7 @@ def collect_dashboard_data(session, run_date: date) -> dict:
     combined_match_pct = (total_matched / total_scraped * 100) if total_scraped else 0.0
     all_errors = [e for g in scraper_groups for e in g["errors"]]
 
-    # Strip lien/judgment subtype rows from each county's table, then append
-    # one aggregated "Liens & Judgements" row with that county's summed totals.
+    # Strip lien/judgment subtype rows from each county's table
     for grp in scraper_groups:
         grp["rows"] = [r for r in grp["rows"] if r["label"] not in LIEN_LABELS]
         lien_rows_cty, lien_total_cty, lien_matched_cty = _fetch_liens_judgements_combined(
@@ -1499,16 +1888,18 @@ def collect_dashboard_data(session, run_date: date) -> dict:
         "scraper_errors": all_errors,
     }
 
+    # NEW: Exec summary table rows for model layout
+    exec_summary_rows = _fetch_exec_summary_rows(session, run_date, active_counties)
+
+    # NEW: Tier 7-day avg and this week total
+    tier_7day_avg = _fetch_tier_7day_avg(session, run_date, active_counties)
+    tier_this_week = _fetch_tier_this_week_total(session, run_date, active_counties)
+
     # Section 2 — per-county snapshots
     county_snapshots = [_fetch_county_snapshot(session, run_date, c) for c in active_counties]
     primary_county = "hillsborough" if "hillsborough" in active_counties else active_counties[0]
     county_performance_snapshots = [
-        _fetch_county_performance_table(
-            session,
-            run_date,
-            c,
-            "primary" if c == primary_county else "expansion",
-        )
+        _fetch_county_performance_table(session, run_date, c, "primary" if c == primary_county else "expansion")
         for c in active_counties
     ]
 
@@ -1521,33 +1912,51 @@ def collect_dashboard_data(session, run_date: date) -> dict:
         enrich_gap_pp = None
         enrich_gap = NA
 
+    # NEW data
+    scraper_ingest_details = _fetch_scraper_ingest_details(session, run_date, active_counties)
+    enrichment_by_tier_ext = _fetch_enrichment_both_pct_by_tier(session, run_date, active_counties)
+    enrichment_source_detail = _fetch_enrichment_source_detailed(session, active_counties)
+    vertical_performance_ext = _fetch_vertical_performance_extended(session, run_date, active_counties)
+    revenue_table_ext = _fetch_revenue_table_extended(session, run_date, active_counties)
+    cohort_ext = _fetch_cohort_extended(session, active_counties)
+
+    
     return {
         "run_date": str(run_date),
         "active_counties": active_counties,
         "county_label": " + ".join(c.replace("_", " ").title() for c in active_counties),
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "exec_summary": exec_summary,
+        "exec_summary_rows": exec_summary_rows,
         "county_snapshots": county_snapshots,
         "county_performance_snapshots": county_performance_snapshots,
         "tiers": tiers,
         "tier_history": tier_history,
         "weekly_tier_history": _fetch_weekly_tier_history(session, run_date, active_counties),
+        "tier_7day_avg": tier_7day_avg,
+        "tier_this_week": tier_this_week,
         "scraper_groups": scraper_groups,
+        "scraper_ingest_details": scraper_ingest_details,
         "scraper_errors": all_errors,
         "total_scraped": total_scraped,
         "total_matched": total_matched,
         "match_pct": f"{combined_match_pct:.1f}%",
         "enrichment_breakdown": _fetch_enrichment_breakdown(session, run_date, active_counties),
         "enrichment_by_tier": _fetch_enrichment_by_tier(session, run_date, active_counties),
+        "enrichment_by_tier_ext": enrichment_by_tier_ext,
         "enrichment_by_source": _fetch_enrichment_by_source(session, active_counties),
+        "enrichment_source_detail": enrichment_source_detail,
         "phone_coverage": phone_coverage,
         "vertical_breakdown": vertical_breakdown,
         "vertical_tier_crosstab": vertical_tier_crosstab,
         "vertical_avg_cds": _fetch_vertical_avg_cds(session, run_date, active_counties),
+        "vertical_performance_ext": vertical_performance_ext,
         "signal_composition": signal_composition,
         "subs_by_vertical": _fetch_subs_by_vertical(session, active_counties),
         "subscriber_metrics": subscriber_metrics,
+        "revenue_table_ext": revenue_table_ext,
         "cohort_breakdown": _fetch_cohort_breakdown(session, active_counties),
+        "cohort_ext": cohort_ext,
         "cora_metrics": _fetch_cora_metrics(session, run_date),
         "open_incidents": _fetch_open_incidents(session),
         "quality_signals": _fetch_data_quality_signals(session, run_date, active_counties),
@@ -1558,7 +1967,7 @@ def collect_dashboard_data(session, run_date: date) -> dict:
         "enrichment_gap_float": enrich_gap_pp,
         "NA": NA,
     }
-
+        
 
 # ---------------------------------------------------------------------------
 # Render + Export
@@ -1567,7 +1976,9 @@ def collect_dashboard_data(session, run_date: date) -> dict:
 def render_html(context: dict) -> str:
     env = Environment(loader=FileSystemLoader(str(TEMPLATES_DIR)), autoescape=True)
     env.globals.update(pct=_pct, badge=_badge, staleness_badge=_staleness_badge,
-                       score_fmt=_score_fmt, NA=NA)
+                       score_fmt=_score_fmt, NA=NA, currency=_currency, num_fmt=_num_fmt,
+                       quality_label=_quality_label, status_emoji=_status_emoji,
+                       trend_arrow=_trend_arrow)
     return env.get_template("daily_dashboard.html").render(**context)
 
 

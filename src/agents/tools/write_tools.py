@@ -78,9 +78,24 @@ def send_sms(
     not sent immediately. If it does not require review, it is sent immediately
     through sms_compliance.send_sms().
     """
-    from src.services import sms_compliance
+    from src.services.cora_suppression import has_active_suppression
 
     with _session(session) as s:
+        if message_type != "transactional" and has_active_suppression(s, subscriber_id):
+            logger.info(
+                "Cora SMS suppressed by active cora_suppression subscriber=%s campaign=%s",
+                subscriber_id,
+                campaign,
+            )
+            return {
+                "sent": False,
+                "reason": "cora_suppressed",
+                "subscriber_id": subscriber_id,
+                "campaign": campaign,
+                "variant_id": variant_id,
+                "message_outcome_id": None,
+            }
+
         opt_in = (
             s.query(SmsOptIn)
             .filter(SmsOptIn.subscriber_id == subscriber_id)
@@ -164,6 +179,8 @@ def send_sms(
                 "variant_id": variant_id,
                 "message_outcome_id": outcome.id,
             }
+
+        from src.services import sms_compliance
 
         ok = sms_compliance.send_sms(
             to=phone,

@@ -3071,6 +3071,13 @@ async def telnyx_inbound(request: Request, db: Session = Depends(get_db)):
         reply = sms_commands.dispatch(from_number, command, db)
         if reply:
             send_sms(from_number, reply, db, message_type="transactional")
+    else:
+        from src.services.cora_suppression import record_generic_sms_reply
+        record_generic_sms_reply(
+            db,
+            phone=from_number,
+            source_id=msg_id,
+        )
 
     return Response(content="", media_type="application/json")
 
@@ -3114,6 +3121,20 @@ def deal_capture(payload: DealCaptureRequest, db: Session = Depends(get_db)):
     )
     db.add(outcome)
     db.flush()
+
+    try:
+        from src.services.cora_suppression import create_suppression
+        create_suppression(
+            db,
+            subscriber_id=sub.id,
+            reason="deal_lost" if payload.deal_size_bucket == "skip" else "deal_won",
+            source="deal_capture",
+            source_id=outcome.id,
+            notes="Auto-pause triggered by deal outcome",
+            cancel_reason="deal_outcome_auto_pause",
+        )
+    except Exception as exc:
+        logger.warning("[DealCapture] cora suppression failed: %s", exc)
 
     graphic_url: Optional[str] = None
     annual_offered = False
@@ -3473,6 +3494,21 @@ def human_close_outcome(
     esc.outcome_at = datetime.now(timezone.utc)
     if closer_assigned:
         esc.closer_assigned = closer_assigned
+    if outcome in {"won", "lost"}:
+        try:
+            from src.services.cora_suppression import create_suppression
+            create_suppression(
+                db,
+                subscriber_id=esc.subscriber_id,
+                reason=f"deal_{outcome}",
+                source="human_close",
+                source_id=esc.id,
+                notes="Auto-pause triggered by deal outcome",
+                cancel_reason="deal_outcome_auto_pause",
+                created_by=closer_assigned,
+            )
+        except Exception as exc:
+            logger.warning("[HumanClose] cora suppression failed escalation=%s: %s", escalation_id, exc)
     db.flush()
     return {"ok": True, "escalation_id": escalation_id, "outcome": outcome}
 
