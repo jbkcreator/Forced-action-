@@ -1609,6 +1609,10 @@ class CoraIncident(Base):
     action_details: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     decision_id: Mapped[Optional[str]] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
 
+    # Human-readable root cause for the breach (fa050). Nullable; the daily
+    # dashboard derives a fallback from metric_name/county_id when unset.
+    root_cause: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False,
     )
@@ -3312,6 +3316,8 @@ class ExpansionCandidate(Base):
     approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     approved_by_slack_user: Mapped[Optional[str]] = mapped_column(String(32))
     launched_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    waitlist_notified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    revenue_pulse_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         CheckConstraint(
@@ -3342,7 +3348,8 @@ class CountyLaunchAudit(Base):
     __table_args__ = (
         CheckConstraint(
             "event_type IN ('evaluated','posted','approved','rejected','launch_started',"
-            "'launch_aborted_gate_red','launched','cooldown_skipped')",
+            "'launch_aborted_gate_red','launched','cooldown_skipped',"
+            "'waitlist_notified','revenue_pulse_sent')",
             name="ck_county_launch_audit_event",
         ),
         Index("ix_county_launch_audit_county_time", "county_id", "created_at"),

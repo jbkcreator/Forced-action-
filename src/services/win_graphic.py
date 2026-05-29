@@ -109,21 +109,25 @@ def generate(deal_outcome_id: int, db: Session) -> Optional[Path]:
     return out
 
 
-def proof_wall_payload(db: Session, limit: int = 50) -> list[dict]:
+def proof_wall_payload(db: Session, limit: int = 50, county_id: str | None = None) -> list[dict]:
     """
     Anonymized recent deal wins for the public Social Proof Wall.
     Returns list of dicts with bucket / vertical / county_id / days_ago / graphic_url.
     No subscriber name, no exact amount, no address.
+
+    When county_id is provided, results are filtered to that county only.
+    When absent, returns global results (admin / cross-county view).
     """
     from datetime import timezone as _tz
     today = datetime.now(_tz.utc).date()
-    rows = db.execute(
+    q = (
         select(DealOutcome, Subscriber)
         .join(Subscriber, Subscriber.id == DealOutcome.subscriber_id)
         .where(DealOutcome.deal_size_bucket != "skip")
-        .order_by(DealOutcome.created_at.desc())
-        .limit(limit)
-    ).all()
+    )
+    if county_id:
+        q = q.where(Subscriber.county_id == county_id)
+    rows = db.execute(q.order_by(DealOutcome.created_at.desc()).limit(limit)).all()
 
     payload: list[dict] = []
     for deal, sub in rows:

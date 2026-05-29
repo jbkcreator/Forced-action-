@@ -2134,6 +2134,223 @@ def get_county_landing(county_id: str, db: Session = Depends(get_db)):
     }
 
 
+_ALLOWED_WAITLIST_COUNTIES = {"hillsborough", "pinellas"}
+
+# Counties that may show a landing page (superset of waitlist counties).
+_ALLOWED_LANDING_COUNTIES = {"hillsborough", "pinellas"}
+
+
+@app.get("/api/landing-data")
+def get_landing_data(county_id: Optional[str] = Query(default=None), db: Session = Depends(get_db)):
+    """
+    Aggregated county-specific landing page data.
+
+    Returns all metrics needed to render the landing page for a single county.
+    All counts and queries are filtered by county_id — no global numbers returned.
+
+    400  county_id missing
+    404  county not found in counties table
+    200  county_status=unavailable when county exists but is not in _ALLOWED_LANDING_COUNTIES
+    200  full response otherwise
+    """
+    if not county_id:
+        raise HTTPException(status_code=400, detail={"error": "county_id_required"})
+
+    county = db.execute(
+        select(County).where(County.county_id == county_id)
+    ).scalar_one_or_none()
+    if not county:
+        raise HTTPException(status_code=404, detail={"error": "county_not_found", "county_id": county_id})
+
+    if county_id not in _ALLOWED_LANDING_COUNTIES:
+        return {
+            "county_id": county_id,
+            "county_name": county.display_name,
+            "county_status": "unavailable",
+            "cta_mode": None,
+            "hero": {"headline": None, "subtitle": None},
+            "stats": None,
+            "top_zips": [],
+            "territory_availability": None,
+            "scraper_health": None,
+            "coming_soon": None,
+        }
+
+    # ── county_status + cta_mode from expansion_candidates ─────────────────
+    candidate = db.execute(
+        select(ExpansionCandidate).where(ExpansionCandidate.county_id == county_id)
+    ).scalar_one_or_none()
+
+    if candidate is None:
+        # No expansion_candidate row. Source counties (e.g. Hillsborough) have
+        # active subscribers; unconfigured or pre-launch counties do not.
+        active_subs = db.execute(
+            select(func.count(Subscriber.id)).where(
+                Subscriber.county_id == county_id,
+                Subscriber.status == "active",
+            )
+        ).scalar_one_or_none() or 0
+        if active_subs > 0:
+            county_status = "active"
+            cta_mode = "signup"
+        else:
+            county_status = "unavailable"
+            cta_mode = None
+        coming_soon = None
+    elif candidate.status == "launched":
+        county_status = "launched"
+        cta_mode = "signup"
+        coming_soon = None
+    elif candidate.status in ("queued", "approved", "launching"):
+        county_status = "coming_soon"
+        cta_mode = "waitlist"
+        coming_soon = {"expected_launch": None, "waitlist_open": True}
+    else:
+        county_status = "unavailable"
+        cta_mode = None
+        coming_soon = None
+
+    today = date.today()
+
+    # ── stats ───────────────────────────────────────────────────────────────
+    gold_plus = db.execute(
+        select(func.count(DistressScore.id)).where(
+            DistressScore.county_id == county_id,
+            DistressScore.score_date >= datetime.combine(today, datetime.min.time()),
+            DistressScore.lead_tier.in_(["Gold", "Platinum", "Ultra Platinum"]),
+        )
+    ).scalar_one_or_none() or 0
+
+    total_scored = db.execute(
+        select(func.count(DistressScore.id)).where(
+            DistressScore.county_id == county_id,
+            DistressScore.score_date >= datetime.combine(today, datetime.min.time()),
+            DistressScore.qualified == True,  # noqa: E712
+        )
+    ).scalar_one_or_none() or 0
+
+    prop_count = db.execute(
+        select(func.count(Property.id)).where(Property.county_id == county_id)
+    ).scalar_one_or_none() or 0
+
+    enriched_count = db.execute(
+        select(func.count(EnrichedContact.id)).where(EnrichedContact.county_id == county_id)
+    ).scalar_one_or_none() or 0
+
+    enrichment_rate = round((enriched_count / prop_count) * 100) if prop_count > 0 else None
+
+    active_sub_count = db.execute(
+        select(func.count(Subscriber.id)).where(
+            Subscriber.county_id == county_id,
+            Subscriber.status == "active",
+        )
+    ).scalar_one_or_none() or 0
+
+    waitlist_count = db.execute(
+        select(func.count(WaitlistEntry.id)).where(
+            WaitlistEntry.county_id == county_id,
+            WaitlistEntry.status == "waiting",
+        )
+    ).scalar_one_or_none() or 0 if county_status == "coming_soon" else None
+
+    # ── top ZIPs ────────────────────────────────────────────────────────────
+    top_zip_rows2 = db.execute(
+        text("""
+            SELECT p.zip, COUNT(ds.id) AS lead_count,
+                   COALESCE(zt.status, 'available') AS status
+            FROM distress_scores ds
+            JOIN properties p ON p.id = ds.property_id
+            LEFT JOIN zip_territories zt
+                ON zt.zip_code = p.zip AND zt.county_id = :cid
+                AND zt.vertical = 'roofing'
+            WHERE ds.county_id = :cid
+              AND ds.score_date >= :today
+              AND ds.qualified = true
+              AND p.zip IS NOT NULL
+            GROUP BY p.zip, zt.status
+            ORDER BY lead_count DESC
+            LIMIT 5
+        """),
+        {"cid": county_id, "today": today},
+    ).mappings().all()
+
+    top_zips = [
+        {"zip_code": r["zip"], "lead_count": r["lead_count"], "status": r["status"]}
+        for r in top_zip_rows2
+    ]
+
+    # ── territory availability ───────────────────────────────────────────────
+    terr_row = db.execute(
+        text("""
+            SELECT
+                COUNT(DISTINCT zip_code) AS total_zips,
+                COUNT(DISTINCT zip_code) FILTER (WHERE status = 'locked') AS locked_zips,
+                COUNT(DISTINCT zip_code) FILTER (WHERE status NOT IN ('locked','grace')) AS available_zips
+            FROM zip_territories
+            WHERE county_id = :cid
+        """),
+        {"cid": county_id},
+    ).mappings().first()
+
+    territory_availability = {
+        "total_zips": terr_row["total_zips"] or 0,
+        "available_zips": terr_row["available_zips"] or 0,
+        "locked_zips": terr_row["locked_zips"] or 0,
+    } if terr_row else None
+
+    # ── scraper health ───────────────────────────────────────────────────────
+    health_row = db.execute(
+        select(ScraperRunStats)
+        .where(ScraperRunStats.county_id == county_id)
+        .order_by(ScraperRunStats.run_date.desc(), ScraperRunStats.created_at.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+    if health_row:
+        # Count distinct source_types active in the last 30 days
+        signals_active = db.execute(
+            select(func.count(func.distinct(ScraperRunStats.source_type))).where(
+                ScraperRunStats.county_id == county_id,
+                ScraperRunStats.run_success == True,  # noqa: E712
+                ScraperRunStats.run_date >= (today - timedelta(days=30)),
+            )
+        ).scalar_one_or_none() or 0
+
+        signals_total = db.execute(
+            select(func.count(func.distinct(ScraperRunStats.source_type))).where(
+                ScraperRunStats.county_id == county_id,
+            )
+        ).scalar_one_or_none() or 0
+
+        scraper_health = {
+            "last_run_at": health_row.run_date.isoformat() if health_row.run_date else None,
+            "signals_active": signals_active,
+            "signals_total": signals_total,
+        }
+    else:
+        scraper_health = None
+
+    return {
+        "county_id": county_id,
+        "county_name": county.display_name,
+        "county_status": county_status,
+        "cta_mode": cta_mode,
+        "hero": {"headline": None, "subtitle": None},
+        "stats": {
+            "gold_plus_lead_count": gold_plus,
+            "total_scored_count": total_scored,
+            "enrichment_rate_pct": enrichment_rate,
+            "active_subscriber_count": active_sub_count,
+            "waitlist_count": waitlist_count,
+        },
+        "top_zips": top_zips,
+        "territory_availability": territory_availability,
+        "scraper_health": scraper_health,
+        "coming_soon": coming_soon,
+    }
+
+
+
 class WaitlistRequest(BaseModel):
     zip_code: str
     vertical: str
@@ -2168,6 +2385,22 @@ class WaitlistRequest(BaseModel):
         if v not in VALID_VERTICALS:
             raise ValueError(f"Invalid vertical '{v}'. Must be one of: {sorted(VALID_VERTICALS)}")
         return v
+
+    @field_validator("county_id")
+    @classmethod
+    def validate_county(cls, v: str) -> str:
+        v = v.strip().lower()
+        if v not in _ALLOWED_WAITLIST_COUNTIES:
+            raise ValueError(f"county_id must be one of: {sorted(_ALLOWED_WAITLIST_COUNTIES)}")
+        return v
+
+    from pydantic import model_validator
+
+    @model_validator(mode="after")
+    def validate_sms_requires_phone(self) -> "WaitlistRequest":
+        if self.sms_opt_in and not (self.phone and self.phone.strip()):
+            raise ValueError("phone is required when sms_opt_in is True")
+        return self
 
     @field_validator("name")
     @classmethod
@@ -2231,6 +2464,19 @@ def join_waitlist(payload: WaitlistRequest, request: Request, db: Session = Depe
         )
 
     signup_ip = _client_ip_for_waitlist(request)
+
+    # Dedup by phone — check before insert to give a clean already_registered response
+    if phone_e164:
+        phone_dupe = db.execute(
+            select(WaitlistEntry).where(
+                WaitlistEntry.phone_e164 == phone_e164,
+                WaitlistEntry.county_id == payload.county_id,
+            )
+        ).scalar_one_or_none()
+        if phone_dupe:
+            return {"status": "already_registered",
+                    "zip_code": payload.zip_code,
+                    "email": payload.email}
 
     try:
         entry = WaitlistEntry(
@@ -3376,9 +3622,14 @@ def win_graphic_endpoint(deal_outcome_id: int, db: Session = Depends(get_db)):
 
 # Stage 5: anonymized social proof wall — recent wins powering the landing page
 @app.get("/api/proof-wall")
-def proof_wall(limit: int = Query(50, ge=1, le=200), db: Session = Depends(get_db)):
+def proof_wall(
+    limit: int = Query(50, ge=1, le=200),
+    county_id: Optional[str] = Query(default=None),
+    db: Session = Depends(get_db),
+):
     from src.services.win_graphic import proof_wall_payload
-    return {"items": proof_wall_payload(db, limit=limit)}
+    items = proof_wall_payload(db, limit=limit, county_id=county_id)
+    return {"items": items}
 
 
 # ── Stage 5: Annual lock acceptance (deal-win + Day-60 path) ─────────────────
@@ -3859,13 +4110,18 @@ def admin_dlq(limit: int = 50, db: Session = Depends(get_db)):
 # ── Phase 2B: Live ZIP activity — GET /api/zip-activity ──────────────────────
 
 @app.get("/api/zip-activity")
-def zip_activity(zip_code: str, vertical: Optional[str] = None):
+def zip_activity(
+    zip_code: str,
+    vertical: Optional[str] = None,
+    county_id: Optional[str] = Query(default=None),
+):
     """
     Return live urgency signal for a ZIP — viewer count + recent message
     volume. Powers the FOMO indicator on SampleLeads / dashboard feed.
 
-    Read-only, no auth required (public signal, like the ZIP checker).
-    Redis-degrades cleanly: returns active_viewers=0 when Redis is down.
+    When county_id is provided, uses a county-scoped Redis key so activity
+    from different counties is tracked separately.
+    Read-only, no auth required. Degrades cleanly when Redis is down.
     """
     if not _ZIP_RE.match(zip_code):
         raise HTTPException(
@@ -3878,10 +4134,12 @@ def zip_activity(zip_code: str, vertical: Optional[str] = None):
             detail={"error": "invalid_vertical", "message": f"vertical must be one of: {sorted(VALID_VERTICALS)}"},
         )
     from src.services.urgency_engine import get_active_count
+    active_viewers = get_active_count(zip_code, county_id=county_id)
     return {
         "zip_code": zip_code,
         "vertical": vertical,
-        "active_viewers": get_active_count(zip_code),
+        "county_id": county_id,
+        "active_viewers": active_viewers,
     }
 
 

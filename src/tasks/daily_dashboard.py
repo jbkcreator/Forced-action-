@@ -52,6 +52,19 @@ TEMPLATES_DIR = Path("src/templates")
 
 NA = "N/A"
 
+# All five lead tiers in display order. GOLD_PLUS_TIERS covers the top three;
+# this adds Silver/Bronze for tables that report the full distribution.
+ALL_TIERS = ["Ultra Platinum", "Platinum", "Gold", "Silver", "Bronze"]
+
+# Source types surfaced in the Data Quality / freshness tables in addition to
+# daily_report.SCRAPER_ORDER. divorce_filings + code_enforcement are valid
+# scraper_run_stats source_types but are not in the shared SCRAPER_ORDER list.
+DASHBOARD_EXTRA_SOURCES = ["divorce_filings", "code_enforcement"]
+
+# Default future-county pipeline (not yet active). Expansion managed via
+# counties.is_active; these surface as queued rows in Section 2.
+DEFAULT_FUTURE_COUNTIES = ["pasco", "polk", "manatee", "sarasota"]
+
 # Lien and judgment subtypes that are common to every county.
 LIEN_SUBTYPES: frozenset[str] = frozenset({
     "judgments", "lis_pendens",
@@ -67,6 +80,13 @@ SOURCE_LABELS = {
     "batch_skip_tracing": "BatchData (BST)",
     "idi": "IDI Fallback",
     "pdl": "PDL",
+}
+
+# enriched_contacts.source -> enrichment_usage_logs.vendor, for real per-lead cost.
+# Only vendors that log to enrichment_usage_logs (currently BatchData) yield a cost;
+# others fall back to N/A rather than fabricating a number.
+SOURCE_TO_VENDOR = {
+    "batch_skip_tracing": "batchdata",
 }
 
 SIGNAL_TO_VERTICALS = {
@@ -923,6 +943,91 @@ def _fetch_cora_autonomy(session) -> str:
 # NEW: Additional query functions for missing model columns
 # ---------------------------------------------------------------------------
 
+def _fetch_trial_conversion(session, county_ids: list[str]) -> str:
+    """Trial→Paid conversion rate.
+
+    Of subscribers who started a trial whose trial window has now closed
+    (``is_trial = True`` AND ``trial_ends_at < now()``), the percentage that
+    are currently ``status = 'active'`` (i.e. converted to paid).
+    """
+    try:
+        row = session.execute(
+            text("""
+                SELECT
+                    COUNT(*) FILTER (
+                        WHERE is_trial = true
+                          AND trial_ends_at IS NOT NULL
+                          AND trial_ends_at < now()
+                    ) AS ended,
+                    COUNT(*) FILTER (
+                        WHERE is_trial = true
+                          AND trial_ends_at IS NOT NULL
+                          AND trial_ends_at < now()
+                          AND status = 'active'
+                    ) AS converted
+                FROM subscribers
+                WHERE county_id = ANY(:cids)
+            """),
+            {"cids": county_ids},
+        ).fetchone()
+        if not row or not row[0]:
+            return NA
+        return _pct(row[1], row[0])
+    except Exception as exc:
+        logger.warning("_fetch_trial_conversion failed: %s", exc)
+        return NA
+
+
+def _fetch_enrichment_pct_by_vertical(session, run_date: date, county_ids: list[str]) -> dict:
+    """Phone+email enrichment % keyed by best vertical for Gold+ leads (7-day).
+
+    Joins the latest Gold+ distress_scores to enriched_contacts, derives each
+    property's best vertical from the ``vertical_scores`` JSONB, and reports the
+    share of each vertical's leads that have both a mobile phone and email.
+    """
+    seven_start = run_date - timedelta(days=6)
+    try:
+        rows = session.execute(
+            text("""
+                WITH latest AS (
+                    SELECT DISTINCT ON (ds.property_id) ds.property_id, ds.vertical_scores
+                    FROM distress_scores ds
+                    WHERE ds.county_id = ANY(:cids)
+                      AND date(ds.score_date) BETWEEN :ss AND :today
+                      AND ds.lead_tier = ANY(:tiers)
+                      AND ds.vertical_scores IS NOT NULL
+                    ORDER BY ds.property_id, ds.score_date DESC
+                )
+                SELECT l.vertical_scores,
+                       (ec.property_id IS NOT NULL
+                        AND ec.mobile_phone IS NOT NULL
+                        AND ec.email IS NOT NULL) AS enriched
+                FROM latest l
+                LEFT JOIN enriched_contacts ec
+                    ON ec.property_id = l.property_id AND ec.match_success = true
+            """),
+            {"cids": county_ids, "ss": str(seven_start), "today": str(run_date),
+             "tiers": list(GOLD_PLUS_TIERS)},
+        ).fetchall()
+    except Exception as exc:
+        logger.warning("_fetch_enrichment_pct_by_vertical failed: %s", exc)
+        return {}
+    totals: dict = defaultdict(int)
+    enriched_counts: dict = defaultdict(int)
+    for vertical_scores, is_enriched in rows:
+        if not vertical_scores:
+            continue
+        best = max(vertical_scores, key=lambda k: vertical_scores.get(k, 0))
+        if best in VERTICAL_DISPLAY:
+            totals[best] += 1
+            if is_enriched:
+                enriched_counts[best] += 1
+    return {
+        key: (_pct(enriched_counts[key], totals[key]) if totals[key] else NA)
+        for key in VERTICAL_DISPLAY
+    }
+
+
 def _fetch_exec_summary_rows(session, run_date: date, county_ids: list[str]) -> list[dict]:
     """Build executive summary table rows: Metric | Today | This Week | Monthly Pace | Target | Status."""
     week_start = run_date - timedelta(days=run_date.weekday())
@@ -942,7 +1047,7 @@ def _fetch_exec_summary_rows(session, run_date: date, county_ids: list[str]) -> 
     t_prev_month = int(session.execute(text("SELECT COUNT(*) FROM distress_scores WHERE date(score_date) BETWEEN :pms AND :pme AND county_id=ANY(:cids)"), {"pms": str(prev_month_start), "pme": str(prev_month_end), "cids": county_ids}).scalar() or 0)
     days_in_month = (run_date - month_start).days + 1
     monthly_pace = t_month / days_in_month * 30 if days_in_month else NA
-    results.append(("Total Leads Generated", _num_fmt(t_today), _num_fmt(t_week), daily(t_month, days_in_month), _num_fmt(int(monthly_pace)) if isinstance(monthly_pace, float) else NA,  "—", _trend(float(t_today), float(t_prev_month / 30)), ""))
+    results.append(("Total Leads Generated", _num_fmt(t_today), _num_fmt(t_week), daily(t_month, days_in_month), _num_fmt(int(monthly_pace)) if isinstance(monthly_pace, float) else NA, _trend(float(t_today), float(t_prev_month / 30)), "", ""))
 
     # Gold+ Leads
     gp_today = int(session.execute(text("SELECT COUNT(*) FROM distress_scores WHERE date(score_date)=:today AND lead_tier=ANY(:tiers) AND county_id=ANY(:cids)"), {"today": str(run_date), "tiers": list(GOLD_PLUS_TIERS), "cids": county_ids}).scalar() or 0)
@@ -959,7 +1064,7 @@ def _fetch_exec_summary_rows(session, run_date: date, county_ids: list[str]) -> 
     # Active Subscribers
     active = int(session.execute(text("SELECT COUNT(*) FROM subscribers WHERE status='active' AND county_id=ANY(:cids)"), {"cids": county_ids}).scalar() or 0)
     active_last_month = int(session.execute(text("SELECT COUNT(*) FROM subscribers WHERE status='active' AND date(created_at) <= :pme AND (churned_at IS NULL OR date(churned_at) > :pme) AND county_id=ANY(:cids)"), {"pme": str(prev_month_end), "cids": county_ids}).scalar() or 0)
-    results.append(("Active Subscribers", _num_fmt(active), f"{active - active_last_month:+d}", "—", _num_fmt(active), "—", _trend(float(active), float(active_last_month)), ""))
+    results.append(("Active Subscribers", _num_fmt(active), f"{active - active_last_month:+d}", "—", _num_fmt(active), _trend(float(active), float(active_last_month)), "", ""))
 
     # Lead Enrichment Rate
     enrich = _fetch_enrichment_rate(session, run_date, county_ids)
@@ -969,8 +1074,9 @@ def _fetch_exec_summary_rows(session, run_date: date, county_ids: list[str]) -> 
     cds = _fetch_avg_cds(session, run_date, county_ids)
     results.append(("Avg CDS Score", cds, cds, "—", cds, "70+", "", "" if cds != NA and float(cds) >= 70 else "⚠️"))
 
-    # Trial→Paid Conversion
-    results.append(("Trial→Paid Conversion", NA, NA, "—", NA, "15%+", "", ""))
+    # Trial→Paid Conversion (computed from is_trial / trial_ends_at)
+    trial_conv = _fetch_trial_conversion(session, county_ids)
+    results.append(("Trial→Paid Conversion", trial_conv, trial_conv, "—", trial_conv, "15%+", "", ""))
 
     # 30-Day Churn Rate
     churn_val = session.execute(text("SELECT COUNT(*) FROM subscribers WHERE churned_at >= now() - INTERVAL '30 days' AND county_id=ANY(:cids)"), {"cids": county_ids}).scalar() or 0
@@ -1003,14 +1109,13 @@ def _fetch_scraper_ingest_details(session, run_date: date, county_ids: list[str]
         """),
         {"cids": county_ids},
     ).fetchall()
-    result = []
-    for source_type, last_update, total_runs, ok_runs, all_ok in rows:
+    def _row(source_type: str, last_update, total_runs, ok_runs, all_ok) -> dict:
         days_stale = (run_date - last_update).days if last_update else None
         health = _staleness_badge(days_stale)
         action = "—"
         if days_stale is not None and days_stale > 3:
             action = "ESCALATE" if days_stale > 5 else "Check"
-        result.append({
+        return {
             "source": source_type.replace("_", " ").title(),
             "records_per_day": int(total_runs or 0),
             "updated": str(last_update) if last_update else "Never",
@@ -1018,12 +1123,61 @@ def _fetch_scraper_ingest_details(session, run_date: date, county_ids: list[str]
             "status": "ok" if bool(all_ok) else ("caution" if ok_runs and ok_runs > 0 else "fail"),
             "quality": _quality_label(health),
             "action": action,
-        })
+        }
+
+    seen: set[str] = set()
+    result = []
+    for source_type, last_update, total_runs, ok_runs, all_ok in rows:
+        seen.add(source_type)
+        result.append(_row(source_type, last_update, total_runs, ok_runs, all_ok))
+
+    # Code Enforcement / Divorce Filings: valid scraper_run_stats source_types
+    # that aren't in the shared SCRAPER_ORDER — surface a row even with no runs.
+    for extra in DASHBOARD_EXTRA_SOURCES:
+        if extra in seen:
+            continue
+        er = session.execute(
+            text("""
+                SELECT MAX(run_date) AS last_update, COUNT(*) AS total_runs,
+                       SUM(CASE WHEN run_success THEN 1 ELSE 0 END) AS ok_runs,
+                       BOOL_AND(run_success) AS all_ok
+                FROM scraper_run_stats
+                WHERE county_id = ANY(:cids) AND source_type = :st
+            """),
+            {"cids": county_ids, "st": extra},
+        ).fetchone()
+        result.append(_row(extra, er[0] if er else None, er[1] if er else 0,
+                           er[2] if er else 0, er[3] if er else None))
+
+    # Stop Work Orders: derived from building_permits (enforcement permits),
+    # not a scraper_run_stats source_type.
+    swo = session.execute(
+        text("""
+            SELECT MAX(date_added) AS last_update, COUNT(*) AS cnt
+            FROM building_permits
+            WHERE is_enforcement_permit = true AND county_id = ANY(:cids)
+        """),
+        {"cids": county_ids},
+    ).fetchone()
+    swo_last = swo[0] if swo else None
+    swo_cnt = int(swo[1] or 0) if swo else 0
+    swo_days = (run_date - swo_last).days if swo_last else None
+    swo_health = _staleness_badge(swo_days)
+    result.append({
+        "source": "Stop Work Orders",
+        "records_per_day": swo_cnt,
+        "updated": str(swo_last) if swo_last else "Never",
+        "days_stale": swo_days if swo_days is not None else "Never",
+        "status": swo_health,
+        "quality": _quality_label(swo_health),
+        "action": ("ESCALATE" if swo_days is not None and swo_days > 5
+                   else "Check" if swo_days is not None and swo_days > 3 else "—"),
+    })
     return result
 
 
 def _fetch_enrichment_both_pct_by_tier(session, run_date: date, county_ids: list[str]) -> list[dict]:
-    """Enrichment by tier with Both%, Impact, Action columns."""
+    """Enrichment by tier with Both%, Impact, Action columns — all 5 tiers."""
     rows = session.execute(
         text("""
             WITH gp AS (
@@ -1045,7 +1199,7 @@ def _fetch_enrichment_both_pct_by_tier(session, run_date: date, county_ids: list
                 WHEN 'Ultra Platinum' THEN 1 WHEN 'Platinum' THEN 2 WHEN 'Gold' THEN 3
                 WHEN 'Silver' THEN 4 ELSE 5 END
         """),
-        {"cids": county_ids, "today": str(run_date), "tiers": list(GOLD_PLUS_TIERS)},
+        {"cids": county_ids, "today": str(run_date), "tiers": ALL_TIERS},
     ).fetchall()
     result = []
     for tier, total, both_, phone, email in rows:
@@ -1088,14 +1242,31 @@ def _fetch_enrichment_source_detailed(session, county_ids: list[str]) -> list[di
         """),
         {"cids": county_ids, "since": str(since)},
     ).fetchall()
+
+    # Real cost/lead from enrichment_usage_logs (cost_cents per vendor call).
+    # Cost per *successful* lead = total spend / successful lookups, all-time.
+    vendor_cost: dict = {}
+    try:
+        for vendor, cents, ok in session.execute(text("""
+            SELECT vendor, SUM(cost_cents) AS cents,
+                   SUM(CASE WHEN success THEN 1 ELSE 0 END) AS ok
+            FROM enrichment_usage_logs GROUP BY vendor
+        """)).fetchall():
+            ok = int(ok or 0)
+            if ok:
+                vendor_cost[vendor] = (int(cents or 0) / 100.0) / ok
+    except Exception as exc:
+        logger.warning("_fetch_enrichment_source_detailed cost query failed: %s", exc)
+
     result = []
     for source, total, matched, with_phone in rows:
         total, matched = int(total or 0), int(matched or 0)
         success_pct = _pct(matched, total)
+        cpl = vendor_cost.get(SOURCE_TO_VENDOR.get(source))
         result.append({
             "source": SOURCE_LABELS.get(source, source),
             "success_rate": success_pct,
-            "cost_per_lead": "N/A",  # No per-lead cost tracking
+            "cost_per_lead": f"${cpl:.2f}" if cpl is not None else "N/A",  # N/A where vendor logs no cost
             "volume_per_day": f"{total / 7:.0f}/day" if total else "0/day",
             "api_health": "✅" if matched > 0 else "⚠️",
             "status": f"Match: {success_pct}",
@@ -1138,28 +1309,41 @@ def _fetch_vertical_performance_extended(session, run_date: date, county_ids: li
     ).scalar() or 0
     gp_week_avg = round(int(gp_week) / max(1, (run_date - week_start).days + 1), 1)
 
+    enrichment_by_vertical = _fetch_enrichment_pct_by_vertical(session, run_date, county_ids)
+
+    # Best-vertical attribution: each Gold+ property counts toward only its
+    # dominant vertical (the max score in vertical_scores), not every vertical it
+    # was scored on. distress_scores stores all six vertical scores per property,
+    # so a "key present" check counted every property in every vertical (all 100%).
+    best_counts: dict = defaultdict(int)
+    try:
+        vs_rows = session.execute(
+            text("""
+                SELECT vertical_scores FROM (
+                    SELECT DISTINCT ON (ds.property_id) ds.property_id, ds.vertical_scores
+                    FROM distress_scores ds
+                    WHERE ds.county_id = ANY(:cids)
+                      AND date(ds.score_date) BETWEEN :ss AND :today
+                      AND ds.lead_tier = ANY(:tiers)
+                    ORDER BY ds.property_id, ds.score_date DESC
+                ) latest
+                WHERE vertical_scores IS NOT NULL
+            """),
+            {"cids": county_ids, "ss": str(seven_start), "today": str(run_date),
+             "tiers": list(GOLD_PLUS_TIERS)},
+        ).fetchall()
+        for (vertical_scores,) in vs_rows:
+            if not vertical_scores:
+                continue
+            best = max(vertical_scores, key=lambda k: vertical_scores.get(k, 0))
+            if best in VERTICAL_DISPLAY:
+                best_counts[best] += 1
+    except Exception as exc:
+        logger.warning("_fetch_vertical_performance_extended best-vertical query failed: %s", exc)
+
     rows = []
     for key, label in VERTICAL_DISPLAY.items():
-        count = 0
-        try:
-            raw = session.execute(
-                text("""
-                    SELECT COUNT(*) FROM (
-                        SELECT DISTINCT ON (ds.property_id) ds.property_id, ds.vertical_scores
-                        FROM distress_scores ds
-                        WHERE ds.county_id = ANY(:cids)
-                          AND date(ds.score_date) BETWEEN :ss AND :today
-                          AND ds.lead_tier = ANY(:tiers)
-                        ORDER BY ds.property_id, ds.score_date DESC
-                    ) latest
-                    WHERE vertical_scores IS NOT NULL AND (vertical_scores->>:key) IS NOT NULL
-                """),
-                {"cids": county_ids, "ss": str(seven_start), "today": str(run_date),
-                 "tiers": list(GOLD_PLUS_TIERS), "key": key},
-            ).scalar() or 0
-            count = int(raw)
-        except Exception:
-            pass
+        count = best_counts.get(key, 0)
 
         sub_count = int(session.execute(
             text("SELECT COUNT(*) FROM subscribers WHERE status='active' AND vertical=:vert AND county_id=ANY(:cids)"),
@@ -1173,14 +1357,18 @@ def _fetch_vertical_performance_extended(session, run_date: date, county_ids: li
             "pct": _pct(count, gp_7d),
             "avg_7d": f"{count / 7:.0f}/day" if count else "0/day",
             "status": status,
-            "enrichment_pct": "N/A",
+            "enrichment_pct": enrichment_by_vertical.get(key, NA),
             "monetization": f"Active subs: {sub_count}",
         })
     return rows
 
 
-def _fetch_revenue_table_extended(session, run_date: date, county_ids: list[str]) -> list[dict]:
+def _fetch_revenue_table_extended(
+    session, run_date: date, county_ids: list[str],
+    subscriber_metrics: dict | None = None,
+) -> list[dict]:
     """Revenue & subscriber metric rows with This Month, Monthly Pace, Target, Status columns."""
+    subscriber_metrics = subscriber_metrics or {}
     month_start = run_date.replace(day=1)
     prev_day = run_date - timedelta(days=1)
     week_start = run_date - timedelta(days=run_date.weekday())
@@ -1188,21 +1376,30 @@ def _fetch_revenue_table_extended(session, run_date: date, county_ids: list[str]
     active = int(session.execute(text("SELECT COUNT(*) FROM subscribers WHERE status='active' AND county_id=ANY(:cids)"), {"cids": county_ids}).scalar() or 0)
     mrr_val = session.execute(text("SELECT SUM(plan_price) FROM subscribers WHERE status='active' AND plan_price IS NOT NULL AND county_id=ANY(:cids)"), {"cids": county_ids}).scalar()
     mrr = _currency(mrr_val) if mrr_val else NA
+    # MRR from Hillsborough — filtered on county_id='hillsborough' specifically.
+    hcsb_mrr_val = session.execute(text("SELECT SUM(plan_price) FROM subscribers WHERE status='active' AND plan_price IS NOT NULL AND county_id='hillsborough'")).scalar()
+    hcsb_mrr = _currency(hcsb_mrr_val) if hcsb_mrr_val else NA
     new_week = int(session.execute(text("SELECT COUNT(*) FROM subscribers WHERE status='active' AND created_at >= :ws AND county_id=ANY(:cids)"), {"ws": str(week_start), "cids": county_ids}).scalar() or 0)
     new_month = int(session.execute(text("SELECT COUNT(*) FROM subscribers WHERE status='active' AND created_at >= :ms AND county_id=ANY(:cids)"), {"ms": str(month_start), "cids": county_ids}).scalar() or 0)
     churned_month = int(session.execute(text("SELECT COUNT(*) FROM subscribers WHERE churned_at >= :ms AND county_id=ANY(:cids)"), {"ms": str(month_start), "cids": county_ids}).scalar() or 0)
 
+    # Pulled from subscriber_metrics so we don't re-query the same aggregates.
+    trial_signups = subscriber_metrics.get("trial_signups")
+    trial_signups_fmt = _num_fmt(trial_signups) if trial_signups is not None else NA
+    avg_ltv = subscriber_metrics.get("avg_ltv", NA)
+    trial_conv = _fetch_trial_conversion(session, county_ids)
+
     rows = [
         ("MRR Total", mrr, mrr, mrr, mrr, "—", ""),
-        ("MRR from Hillsborough", mrr, mrr, mrr, mrr, "—", ""),
+        ("MRR from Hillsborough", hcsb_mrr, hcsb_mrr, hcsb_mrr, hcsb_mrr, "—", ""),
         ("MRR from Pinellas", "$0 (Pre-revenue)", "$0", "$0", "$0", "$0 (Pre-revenue)", "⏳"),
         ("MRR from Other Counties", "$0", "$0", "$0", "$0", "$0", "⏳"),
         ("Active Subscribers", _num_fmt(active), f"+{new_week}", f"+{new_month}", _num_fmt(active), "—", ""),
         ("New Subs This Week", _num_fmt(new_week), "", "", "", "", ""),
         ("Churned Subs This Week", _num_fmt(churned_month), "", "", "", "", ""),
-        ("Trial Signups", NA, NA, NA, NA, "—", "⏳"),
-        ("Trial→Paid Conversion", NA, NA, NA, NA, "15%+", "⏳"),
-        ("Avg Subscriber LTV", NA, "—", "—", NA, "—", "⏳"),
+        ("Trial Signups", trial_signups_fmt, trial_signups_fmt, trial_signups_fmt, trial_signups_fmt, "—", ""),
+        ("Trial→Paid Conversion", trial_conv, trial_conv, trial_conv, trial_conv, "15%+", ""),
+        ("Avg Subscriber LTV", avg_ltv, "—", "—", avg_ltv, "—", ""),
         ("Churn Rate (30-day)", NA, NA, NA, NA, "<5%", ""),
     ]
 
@@ -1217,9 +1414,193 @@ def _fetch_revenue_table_extended(session, run_date: date, county_ids: list[str]
     ]
 
 
+def _fetch_conversion_funnel(session, run_date: date, county_ids: list[str]) -> list[dict]:
+    """Cross-entity conversion funnel over the last 30 days, county-scoped.
+
+    Stages blend lead-flow (scored -> delivered -> opened -> clicked -> demo)
+    with subscriber-flow (trial -> new paid -> closed deal), so the conversion
+    percentages are DIRECTIONAL — not a single-cohort funnel. Each stage reads an
+    existing table; mid-funnel sales stages (Demo/Closed) fill in as Synthflow
+    webhooks and GHL stage callbacks land.
+
+    Returns ordered rows: {stage, count, pct_of_top, conv_to_next}.
+    """
+    start = run_date - timedelta(days=30)
+    zips = sorted({z for cid in county_ids for z in _county_zip_list(cid)})
+
+    def scalar(sql: str, params: dict) -> int:
+        try:
+            return int(session.execute(text(sql), params).scalar() or 0)
+        except Exception as exc:
+            logger.warning("_fetch_conversion_funnel stage failed: %s", exc)
+            return 0
+
+    common = {"cids": county_ids, "start": str(start), "today": str(run_date)}
+
+    scored = scalar(
+        "SELECT COUNT(DISTINCT property_id) FROM distress_scores "
+        "WHERE county_id = ANY(:cids) AND date(score_date) BETWEEN :start AND :today "
+        "AND lead_tier = ANY(:tiers)",
+        {**common, "tiers": list(GOLD_PLUS_TIERS)},
+    )
+    delivered = scalar(
+        "SELECT COUNT(*) FROM sent_leads sl JOIN subscribers s ON s.id = sl.subscriber_id "
+        "WHERE s.county_id = ANY(:cids) AND date(sl.sent_at) BETWEEN :start AND :today",
+        common,
+    )
+    opened = scalar(
+        "SELECT COUNT(*) FROM message_outcomes mo JOIN subscribers s ON s.id = mo.subscriber_id "
+        "WHERE s.county_id = ANY(:cids) AND mo.opened_at IS NOT NULL "
+        "AND date(mo.sent_at) BETWEEN :start AND :today",
+        common,
+    )
+    clicked = scalar(
+        "SELECT COUNT(*) FROM message_outcomes mo JOIN subscribers s ON s.id = mo.subscriber_id "
+        "WHERE s.county_id = ANY(:cids) AND mo.clicked_at IS NOT NULL "
+        "AND date(mo.sent_at) BETWEEN :start AND :today",
+        common,
+    )
+    demo = scalar(
+        "SELECT COUNT(*) FROM synthflow_calls WHERE outcome = 'demo_requested' "
+        "AND call_date BETWEEN :start AND :today AND zip_code = ANY(:zips)",
+        {"start": str(start), "today": str(run_date), "zips": zips},
+    ) if zips else 0
+    trial = scalar(
+        "SELECT COUNT(*) FROM subscribers WHERE is_trial = true AND county_id = ANY(:cids) "
+        "AND created_at >= now() - INTERVAL '30 days'",
+        {"cids": county_ids},
+    )
+    paid_new = scalar(
+        "SELECT COUNT(*) FROM subscribers WHERE status = 'active' AND county_id = ANY(:cids) "
+        "AND created_at >= now() - INTERVAL '30 days'",
+        {"cids": county_ids},
+    )
+    closed = scalar(
+        "SELECT COUNT(*) FROM deal_outcomes d JOIN subscribers s ON s.id = d.subscriber_id "
+        "WHERE s.county_id = ANY(:cids) AND d.pipeline_stage = 'closed_won' "
+        "AND d.created_at >= now() - INTERVAL '30 days'",
+        {"cids": county_ids},
+    )
+
+    stages = [
+        ("Leads Scored (Gold+)", scored),
+        ("Delivered to Subscribers", delivered),
+        ("Opened", opened),
+        ("Clicked / Engaged", clicked),
+        ("Demo Booked", demo),
+        ("Trial Started", trial),
+        ("New Paid Subscribers", paid_new),
+        ("Deals Closed (won)", closed),
+    ]
+    top = stages[0][1] or 0
+    out = []
+    for i, (label, count) in enumerate(stages):
+        nxt = stages[i + 1][1] if i + 1 < len(stages) else None
+        out.append({
+            "stage": label,
+            "count": _num_fmt(count),
+            "pct_of_top": _pct(count, top) if top else NA,
+            "conv_to_next": (_pct(nxt, count) if (nxt is not None and count) else ("—" if nxt is None else NA)),
+        })
+    return out
+
+
+def _fetch_engagement_by_cohort(session, county_ids: list[str]) -> dict:
+    """Engagement band per active-subscriber cohort over the last 30 days.
+
+    Signals (existing tables — no new infra): message_outcomes
+    (opened/clicked/replied/delivered, populated by Cora SMS + any email-event
+    capture), sent_leads (delivery), deal_outcomes (deals reported).
+
+    Banding per subscriber:
+        High   — clicked OR replied OR reported a deal
+        Medium — opened, OR delivered >= 3 (engaged with volume)
+        Low    — received >= 1 delivery, no opens
+        (none) — no signal at all
+
+    Returns {cohort_label: "High 🟢" | "Medium 🟡" | "Low 🔴" | "—"} using the
+    dominant band per cohort (ties resolve to the higher band). Cohort labels
+    match _fetch_cohort_extended so the rows line up.
+    """
+    try:
+        rows = session.execute(
+            text("""
+                WITH sub AS (
+                    SELECT s.id,
+                        CASE
+                            WHEN s.founding_member = true THEN 'Founding (1st month)'
+                            WHEN s.created_at >= now() - INTERVAL '30 days' THEN 'New (30d)'
+                            WHEN s.created_at >= now() - INTERVAL '90 days' THEN 'Early (2-3 months)'
+                            ELSE 'Established (3+ months)'
+                        END AS cohort
+                    FROM subscribers s
+                    WHERE s.status = 'active' AND s.county_id = ANY(:cids)
+                ),
+                sl AS (
+                    SELECT subscriber_id, COUNT(*) AS delivered
+                    FROM sent_leads
+                    WHERE sent_at >= now() - INTERVAL '30 days'
+                    GROUP BY subscriber_id
+                ),
+                mo AS (
+                    SELECT subscriber_id,
+                        COUNT(*) FILTER (WHERE clicked_at   IS NOT NULL) AS clicked,
+                        COUNT(*) FILTER (WHERE opened_at    IS NOT NULL) AS opened,
+                        COUNT(*) FILTER (WHERE replied_at   IS NOT NULL) AS replied,
+                        COUNT(*) FILTER (WHERE delivered_at IS NOT NULL) AS msg_delivered
+                    FROM message_outcomes
+                    WHERE sent_at >= now() - INTERVAL '30 days'
+                    GROUP BY subscriber_id
+                ),
+                dl AS (
+                    SELECT subscriber_id, COUNT(*) AS deals
+                    FROM deal_outcomes
+                    WHERE created_at >= now() - INTERVAL '30 days'
+                    GROUP BY subscriber_id
+                ),
+                flags AS (
+                    SELECT sub.cohort,
+                        (COALESCE(mo.clicked, 0) > 0 OR COALESCE(mo.replied, 0) > 0
+                         OR COALESCE(dl.deals, 0) > 0) AS high_flag,
+                        (COALESCE(mo.opened, 0) > 0
+                         OR (COALESCE(sl.delivered, 0) + COALESCE(mo.msg_delivered, 0)) >= 3) AS med_flag,
+                        ((COALESCE(sl.delivered, 0) + COALESCE(mo.msg_delivered, 0)) > 0) AS low_flag
+                    FROM sub
+                    LEFT JOIN sl ON sl.subscriber_id = sub.id
+                    LEFT JOIN mo ON mo.subscriber_id = sub.id
+                    LEFT JOIN dl ON dl.subscriber_id = sub.id
+                )
+                SELECT cohort,
+                    COUNT(*) FILTER (WHERE high_flag) AS high,
+                    COUNT(*) FILTER (WHERE NOT high_flag AND med_flag) AS med,
+                    COUNT(*) FILTER (WHERE NOT high_flag AND NOT med_flag AND low_flag) AS low
+                FROM flags
+                GROUP BY cohort
+            """),
+            {"cids": county_ids},
+        ).fetchall()
+    except Exception as exc:
+        logger.warning("_fetch_engagement_by_cohort failed: %s", exc)
+        return {}
+
+    out: dict = {}
+    for cohort, high, med, low in rows:
+        high, med, low = int(high or 0), int(med or 0), int(low or 0)
+        if high == 0 and med == 0 and low == 0:
+            out[cohort] = "—"
+        elif high >= med and high >= low and high > 0:
+            out[cohort] = "High 🟢"
+        elif med >= low and med > 0:
+            out[cohort] = "Medium 🟡"
+        else:
+            out[cohort] = "Low 🔴"
+    return out
+
+
 def _fetch_cohort_extended(session, county_ids: list[str]) -> list[dict]:
     """Cohort with Avg Age, Avg MRR/Sub, Churn Rate, Engagement, NPS."""
     today = date.today()
+    engagement_by_cohort = _fetch_engagement_by_cohort(session, county_ids)
     rows = session.execute(
         text("""
             SELECT CASE
@@ -1253,7 +1634,7 @@ def _fetch_cohort_extended(session, county_ids: list[str]) -> list[dict]:
             "avg_age": avg_age_str,
             "avg_mrr": avg_mrr_str,
             "churn_rate": churn_str,
-            "engagement": "N/A",
+            "engagement": engagement_by_cohort.get(cohort, "—"),
             "nps": "N/A",
         })
     # Add At-Risk row
@@ -1646,23 +2027,46 @@ def _fetch_cora_metrics(session, run_date: date) -> dict:
     return result
 
 
+def _human_root_cause(metric_name: str | None, county_id: str | None, stored: str | None) -> str:
+    """Human-readable root cause: stored value if present, else a derived fallback."""
+    if stored:
+        return stored
+    metric = (metric_name or "metric").replace("_", " ").title()
+    where = f" in {county_id.replace('_', ' ').title()}" if county_id else ""
+    return f"{metric} breached threshold{where}"
+
+
 def _fetch_open_incidents(session) -> list:
-    try:
-        rows = session.execute(
-            text("""
-                SELECT id, metric_name, severity, observed_value, threshold_value,
-                       breach_started, action_taken, county_id
-                FROM cora_incident WHERE breach_resolved IS NULL
-                ORDER BY CASE severity WHEN 'red' THEN 1 WHEN 'yellow' THEN 2 ELSE 3 END, breach_started
-            """),
-        ).fetchall()
+    # Prefer the root_cause column (fa050); fall back gracefully if the
+    # migration has not yet been applied on this database. The first attempt
+    # runs inside a savepoint so a missing-column error doesn't abort the
+    # outer transaction (mirrors the begin_nested pattern used in loaders).
+    base_cols = "id, metric_name, severity, observed_value, threshold_value, breach_started, action_taken, county_id"
+
+    def _build(rows, has_root):
         return [{
             "id": r[0], "metric": r[1], "severity": r[2],
             "observed": _score_fmt(r[3]), "threshold": _score_fmt(r[4]),
             "started": str(r[5])[:19] if r[5] else NA,
             "action": r[6], "county": r[7] or "—",
+            "root_cause": _human_root_cause(r[1], r[7], r[8] if has_root else None),
             "badge": "fail" if r[2] == "red" else "warn",
         } for r in rows]
+
+    order = "ORDER BY CASE severity WHEN 'red' THEN 1 WHEN 'yellow' THEN 2 ELSE 3 END, breach_started"
+    try:
+        with session.begin_nested():
+            rows = session.execute(
+                text(f"SELECT {base_cols}, root_cause FROM cora_incident WHERE breach_resolved IS NULL {order}")
+            ).fetchall()
+        return _build(rows, has_root=True)
+    except Exception as exc:
+        logger.info("_fetch_open_incidents: root_cause column unavailable, deriving fallback (%s)", exc)
+    try:
+        rows = session.execute(
+            text(f"SELECT {base_cols} FROM cora_incident WHERE breach_resolved IS NULL {order}")
+        ).fetchall()
+        return _build(rows, has_root=False)
     except Exception as exc:
         logger.warning("_fetch_open_incidents failed: %s", exc)
         return []
@@ -1686,6 +2090,78 @@ def _fetch_zip_hotspots(session, run_date: date, county_ids: list[str], top_n: i
         all_zips.extend(zips)
     all_zips.sort(key=lambda z: z.get("total", 0), reverse=True)
     return all_zips[:top_n]
+
+
+def _fetch_future_counties(session, active_counties: list[str]) -> list[dict]:
+    """Pipeline rows for queued future counties.
+
+    Per county: Signals Density vs Hillsborough (distress_scores COUNT(*) as % of
+    Hillsborough), Contractor Count (dbpr_contacts), Addressable ZIPs
+    (zip_territories). A final "Other FL Counties" row aggregates any
+    non-default, non-active counties present in the data.
+    """
+    try:
+        h_count = int(session.execute(
+            text("SELECT COUNT(*) FROM distress_scores WHERE county_id = 'hillsborough'")
+        ).scalar() or 0)
+
+        future = [c for c in DEFAULT_FUTURE_COUNTIES if c not in active_counties]
+        rows: list[dict] = []
+        for cid in future:
+            signals = int(session.execute(
+                text("SELECT COUNT(*) FROM distress_scores WHERE county_id = :cid"),
+                {"cid": cid},
+            ).scalar() or 0)
+            contractors = int(session.execute(
+                text("SELECT COUNT(*) FROM dbpr_contacts WHERE county_id = :cid"),
+                {"cid": cid},
+            ).scalar() or 0)
+            zips = int(session.execute(
+                text("SELECT COUNT(*) FROM zip_territories WHERE county_id = :cid"),
+                {"cid": cid},
+            ).scalar() or 0)
+            rows.append({
+                "county": cid.replace("_", " ").title(),
+                "signals_density": _pct(signals, h_count) if h_count else NA,
+                "contractor_count": _num_fmt(contractors),
+                "addressable_zips": _num_fmt(zips),
+                "est_mrr": NA,
+                "status": NA,
+                "target_launch": NA,
+            })
+
+        # Other FL Counties — aggregate of counties not active and not default future.
+        exclude = list({*active_counties, *DEFAULT_FUTURE_COUNTIES})
+        other_signals = int(session.execute(
+            text("SELECT COUNT(*) FROM distress_scores WHERE NOT (county_id = ANY(:ex))"),
+            {"ex": exclude},
+        ).scalar() or 0)
+        other_contractors = int(session.execute(
+            text("SELECT COUNT(*) FROM dbpr_contacts WHERE NOT (county_id = ANY(:ex))"),
+            {"ex": exclude},
+        ).scalar() or 0)
+        other_zips = int(session.execute(
+            text("SELECT COUNT(*) FROM zip_territories WHERE NOT (county_id = ANY(:ex))"),
+            {"ex": exclude},
+        ).scalar() or 0)
+        rows.append({
+            "county": "Other FL Counties",
+            "signals_density": _pct(other_signals, h_count) if h_count else NA,
+            "contractor_count": _num_fmt(other_contractors),
+            "addressable_zips": _num_fmt(other_zips),
+            "est_mrr": NA,
+            "status": NA,
+            "target_launch": NA,
+        })
+        return rows
+    except Exception as exc:
+        logger.warning("_fetch_future_counties failed: %s", exc)
+        return [
+            {"county": cid.replace("_", " ").title(), "signals_density": NA,
+             "contractor_count": NA, "addressable_zips": NA, "est_mrr": NA,
+             "status": NA, "target_launch": NA}
+            for cid in DEFAULT_FUTURE_COUNTIES if cid not in active_counties
+        ]
 
 
 def _fetch_vertical_avg_cds(session, run_date: date, county_ids: list[str]) -> list:
@@ -1720,15 +2196,46 @@ def _fetch_vertical_avg_cds(session, run_date: date, county_ids: list[str]) -> l
     ]
 
 
+def _signal_impact(source_type: str) -> str:
+    """Human-readable impact of a stale/missing signal, from SIGNAL_TO_VERTICALS.
+
+    Each scraper feeds specific buyer verticals' CDS; if it's stale, those
+    verticals' scoring degrades. Pure code-level lookup — no DB, no assumptions.
+    """
+    verticals = SIGNAL_TO_VERTICALS.get(source_type)
+    if not verticals:
+        return "—"
+    labels = [VERTICAL_DISPLAY.get(v, v.replace("_", " ").title()) for v in verticals]
+    return "Degrades CDS: " + ", ".join(labels)
+
+
 def _fetch_data_quality_signals(session, run_date: date, county_ids: list[str]) -> list:
     merged = _merge_signal_freshness_dicts([_build_signal_freshness(session, cid) for cid in county_ids])
+
+    # SCRAPER_ORDER is shared with daily_report; surface divorce_filings /
+    # code_enforcement here (valid source_types, absent from that list) without
+    # mutating the import. Staleness comes from scraper_run_stats freshness.
+    extras = [s for s in DASHBOARD_EXTRA_SOURCES if s not in SCRAPER_ORDER]
+    for src in extras:
+        if src in merged:
+            continue
+        try:
+            last = session.execute(
+                text("SELECT MAX(run_date) FROM scraper_run_stats WHERE source_type = :st AND county_id = ANY(:cids)"),
+                {"st": src, "cids": county_ids},
+            ).scalar()
+            merged[src] = (run_date - last).days if last else None
+        except Exception:
+            merged[src] = None
+
     return [
         {
             "source": source_type.replace("_", " ").title(),
             "days_stale": merged.get(source_type) if merged.get(source_type) is not None else "Never",
             "health": _staleness_badge(merged.get(source_type)),
+            "impact": _signal_impact(source_type),
         }
-        for source_type in SCRAPER_ORDER
+        for source_type in [*SCRAPER_ORDER, *extras]
         if source_type not in ENRICHMENT_ONLY
     ]
 
@@ -1912,13 +2419,51 @@ def collect_dashboard_data(session, run_date: date) -> dict:
         enrich_gap_pp = None
         enrich_gap = NA
 
+    # Real cost to close the enrichment gap (no assumptions): the Gold+ leads
+    # without a phone × actual cost per successful enrichment (enrichment_usage_logs).
+    try:
+        crow = session.execute(
+            text("SELECT SUM(cost_cents), SUM(CASE WHEN success THEN 1 ELSE 0 END) FROM enrichment_usage_logs")
+        ).fetchone()
+        cost_per_lead = (int(crow[0] or 0) / 100.0) / int(crow[1]) if crow and crow[1] else None
+    except Exception as exc:
+        logger.warning("enrichment gap cost query failed: %s", exc)
+        cost_per_lead = None
+    gap_leads = int(phone_coverage.get("without_phone", 0) or 0)
+    enrichment_cost_per_lead = f"${cost_per_lead:.2f}" if cost_per_lead else NA
+    enrichment_gap_cost = _currency(gap_leads * cost_per_lead) if cost_per_lead else NA
+
     # NEW data
     scraper_ingest_details = _fetch_scraper_ingest_details(session, run_date, active_counties)
     enrichment_by_tier_ext = _fetch_enrichment_both_pct_by_tier(session, run_date, active_counties)
     enrichment_source_detail = _fetch_enrichment_source_detailed(session, active_counties)
     vertical_performance_ext = _fetch_vertical_performance_extended(session, run_date, active_counties)
-    revenue_table_ext = _fetch_revenue_table_extended(session, run_date, active_counties)
+    revenue_table_ext = _fetch_revenue_table_extended(session, run_date, active_counties, subscriber_metrics)
     cohort_ext = _fetch_cohort_extended(session, active_counties)
+    conversion_funnel = _fetch_conversion_funnel(session, run_date, active_counties)
+    future_counties = _fetch_future_counties(session, active_counties)
+
+    # Demo-data guard: seeded subscribers carry a 'seed_demo_' stripe_customer_id
+    # prefix (scripts/seed_demo_metrics.py). When present, the report renders a
+    # TEST-DATA banner so subscriber / revenue / Cora figures are never mistaken
+    # for production — there are no real subscribers yet.
+    try:
+        demo_subscriber_count = int(session.execute(
+            text("SELECT COUNT(*) FROM subscribers WHERE stripe_customer_id LIKE 'seed_demo_%'")
+        ).scalar() or 0)
+        # Total active subscribers (the figure the report's numbers derive from).
+        # While seed data is present there are no production subscribers, so ALL
+        # active subs are non-production — the banner cites this total, not just
+        # the seed-tagged count, so a reader can't infer the rest are real.
+        demo_active_total = int(session.execute(
+            text("SELECT COUNT(*) FROM subscribers WHERE status='active' AND county_id=ANY(:cids)"),
+            {"cids": active_counties},
+        ).scalar() or 0)
+    except Exception as exc:
+        logger.warning("demo-data guard query failed: %s", exc)
+        demo_subscriber_count = 0
+        demo_active_total = 0
+    demo_data_active = demo_subscriber_count > 0
 
     
     return {
@@ -1928,8 +2473,12 @@ def collect_dashboard_data(session, run_date: date) -> dict:
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "exec_summary": exec_summary,
         "exec_summary_rows": exec_summary_rows,
+        "demo_data_active": demo_data_active,
+        "demo_subscriber_count": demo_subscriber_count,
+        "demo_active_total": demo_active_total,
         "county_snapshots": county_snapshots,
         "county_performance_snapshots": county_performance_snapshots,
+        "future_counties": future_counties,
         "tiers": tiers,
         "tier_history": tier_history,
         "weekly_tier_history": _fetch_weekly_tier_history(session, run_date, active_counties),
@@ -1955,6 +2504,7 @@ def collect_dashboard_data(session, run_date: date) -> dict:
         "subs_by_vertical": _fetch_subs_by_vertical(session, active_counties),
         "subscriber_metrics": subscriber_metrics,
         "revenue_table_ext": revenue_table_ext,
+        "conversion_funnel": conversion_funnel,
         "cohort_breakdown": _fetch_cohort_breakdown(session, active_counties),
         "cohort_ext": cohort_ext,
         "cora_metrics": _fetch_cora_metrics(session, run_date),
@@ -1965,6 +2515,8 @@ def collect_dashboard_data(session, run_date: date) -> dict:
         "enrichment_rate": enrichment_rate,
         "enrichment_gap": enrich_gap,
         "enrichment_gap_float": enrich_gap_pp,
+        "enrichment_gap_cost": enrichment_gap_cost,
+        "enrichment_cost_per_lead": enrichment_cost_per_lead,
         "NA": NA,
     }
         

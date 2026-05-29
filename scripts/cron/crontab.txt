@@ -241,7 +241,7 @@ COUNTY_ID=hillsborough
 # ZIP Booster / Monthly Reload bundles to wallet subscribers (with A/B pricing)
 0 * * * * $PROJECT/scripts/cron/run.sh src.tasks.bundle_dispatcher
 
-# Auto Mode follow-up — every 30 min, fires VM drop on Auto Mode SMS that
+# Auto Mode follow-up — every 30 min, fires VM drop on Auto Mode SMS thatF
 # went 24h+ without a reply (tags GHL contact for Synthflow workflow).
 */30 * * * * $PROJECT/scripts/cron/run.sh src.tasks.auto_mode_followup
 
@@ -264,7 +264,6 @@ COUNTY_ID=hillsborough
 # daily vendor cost report, and hands a summary to Revenue Pulse. Dry-run at 06:30
 # pre-validates aggregation; the 07:00 run (after CDS scoring) is the live cycle,
 # scheduled before Revenue Pulse at 07:30 so its summary is available.
-30 6 * * * $PROJECT/scripts/cron/run.sh src.tasks.vendor_cost_monitor --dry-run
 0 7 * * * $PROJECT/scripts/cron/run.sh src.tasks.vendor_cost_monitor
 
 # Revenue Pulse — daily founder SMS at 07:30 UTC (lead count, wallet actives, top deal/alert, kill switch).
@@ -380,5 +379,14 @@ COUNTY_ID=hillsborough
 # County Live Reactivation — every 5 min. Fires waitlist notifications
 # for newly-launched counties (coming_soon entries).
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.county_live_reactivation
+
+# County Waitlist Notifier — T+0. Fires within 15min of launch.
+# Sends SMS + email to all coming_soon waitlist entries for newly launched counties.
+# Idempotent: stamps waitlist_notified_at on expansion_candidates when fully clean.
+*/15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.county_waitlist_notifier
+
+# County Launch T+24 Pulse — fires within 15min after 24h post-launch.
+# One-time per county (revenue_pulse_sent_at guard). Reuses run_daily_pulse.
+*/15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.county_launch_pulse
 
 # === END FORCED-ACTION-PLATFORM ===

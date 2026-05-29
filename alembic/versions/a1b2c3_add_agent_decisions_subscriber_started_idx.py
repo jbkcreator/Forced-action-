@@ -1,7 +1,7 @@
 """add_agent_decisions_subscriber_started_idx
 
 Revision ID: a1b2c3_timeline_idx
-Revises: z0a1b2c3d4e5
+Revises: fa005_concierge_chat
 Create Date: 2026-05-28
 
 Adds composite index (subscriber_id, started_at DESC) on agent_decisions to
@@ -12,7 +12,7 @@ rather than `alembic upgrade head`.
 from typing import Sequence, Union
 
 revision: str = 'a1b2c3_timeline_idx'
-down_revision: Union[str, Sequence[str], None] = 'z0a1b2c3d4e5'
+down_revision: Union[str, Sequence[str], None] = 'fa005_concierge_chat'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

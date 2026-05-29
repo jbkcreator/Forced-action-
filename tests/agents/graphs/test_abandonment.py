@@ -13,9 +13,48 @@ FAKE_CLAUDE = {
 	"model": "haiku", "input_tokens": 70, "output_tokens": 20, "cost_usd": 0.00009,
 }
 
+_FAKE_PROFILE = {
+	"id": 107,
+	"name": "Amal Test",
+	"tier": "free",
+	"status": "active",
+	"vertical": "public_adjusters",
+	"county_id": "hillsborough",
+	"has_saved_card": False,
+}
+
+_FAKE_SEGMENT = {
+	"segment": "high_intent",
+	"revenue_signal_score": 75,
+	"revenue_signal_band": "high",
+	"last_significant_action_at": None,
+	"revenue_signal_last_action": None,
+	"classified_at": None,
+	"reason": "test",
+}
+
+_FAKE_HIERARCHY = {
+	"action_allowed": True,
+	"use_fallback": False,
+	"kill_switch_color": "green",
+	"revenue_signal_score": 75,
+}
+
 
 def _happy_mocks():
 	return [
+		patch("src.agents.graphs.abandonment.get_subscriber_profile",
+			  return_value=_FAKE_PROFILE),
+		patch("src.agents.graphs.abandonment.get_wallet_state",
+			  return_value={"enrolled": False, "credits_remaining": 0}),
+		patch("src.agents.graphs.abandonment.get_zip_activity",
+			  return_value={"active_viewers": 3}),
+		patch("src.agents.graphs.abandonment.get_recent_messages", return_value=[]),
+		patch("src.agents.graphs.abandonment.get_segment_and_score",
+			  return_value=_FAKE_SEGMENT),
+		patch("src.agents.graphs.abandonment.run_decision_hierarchy",
+			  return_value=_FAKE_HIERARCHY),
+		patch("src.agents.graphs.abandonment.get_cached_metric", return_value=None),
 		patch("src.agents.subgraphs.compose_and_send.call_claude_with_usage",
 			  return_value=FAKE_CLAUDE),
 		patch("src.agents.subgraphs.compose_and_send.compliance_check",
@@ -64,6 +103,7 @@ def test_wave2_early_exit_when_user_already_converted():
 	converted_profile = {
 		"id": 107, "tier": "starter", "status": "active",
 		"vertical": "public_adjusters", "has_saved_card": True,
+		"county_id": "hillsborough",
 	}
 	with patch("src.agents.graphs.abandonment.get_subscriber_profile",
 			   return_value=converted_profile), \
@@ -73,6 +113,8 @@ def test_wave2_early_exit_when_user_already_converted():
 			   return_value={"active_viewers": 0}), \
 		 patch("src.agents.graphs.abandonment.get_recent_messages",
 			   return_value=[]), \
+		 patch("src.agents.graphs.abandonment.get_segment_and_score",
+			   return_value=_FAKE_SEGMENT), \
 		 patch("src.agents.subgraphs.compose_and_send.call_claude_with_usage") as mock_cc:
 		r = run_wave2(
 			event_payload={"lead_tier_viewed": "Gold"},
@@ -85,16 +127,7 @@ def test_wave2_early_exit_when_user_already_converted():
 
 
 def test_wave2_sends_when_user_has_not_converted():
-	profile = {
-		"id": 107, "tier": "free", "status": "active",
-		"vertical": "public_adjusters", "has_saved_card": False,
-	}
 	patches = _happy_mocks() + [
-		patch("src.agents.graphs.abandonment.get_subscriber_profile", return_value=profile),
-		patch("src.agents.graphs.abandonment.get_wallet_state",
-			  return_value={"enrolled": False, "credits_remaining": 0}),
-		patch("src.agents.graphs.abandonment.get_zip_activity",
-			  return_value={"active_viewers": 2}),
 		patch("src.agents.graphs.abandonment.get_recent_messages", return_value=[]),
 	]
 	_start(patches)
