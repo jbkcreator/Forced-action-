@@ -66,10 +66,12 @@ from src.api.admin_router import router as admin_router, get_current_admin  # no
 from src.api.attribution_router import router as attribution_router  # noqa: E402
 from src.api.cora_incidents_router import router as cora_incidents_router  # noqa: E402
 from src.api.sms_analytics_router import router as sms_analytics_router  # noqa: E402
+from src.api.operator_crm_router import router as operator_crm_router  # noqa: E402
 app.include_router(admin_router)
 app.include_router(attribution_router)
 app.include_router(cora_incidents_router)
 app.include_router(sms_analytics_router)
+app.include_router(operator_crm_router)
 
 from src.api.chat_router import router as chat_router  # noqa: E402
 app.include_router(chat_router)
