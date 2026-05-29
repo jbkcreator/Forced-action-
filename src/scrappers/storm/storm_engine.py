@@ -144,7 +144,7 @@ def scrape_storm_damage(
         logger.info("[storm] %s: no active storm alerts — 0 incidents", county_id)
         try:
             from src.utils.scraper_db_helper import record_scraper_stats
-            record_scraper_stats(source_type='storm_damage', total_scraped=0, matched=0, unmatched=0, skipped=0)
+            record_scraper_stats(source_type='storm_damage', total_scraped=0, matched=0, unmatched=0, skipped=0, county_id=county_id)
         except Exception:
             pass
         return 0
@@ -199,6 +199,7 @@ def scrape_storm_damage(
             matched=created,
             unmatched=0,
             skipped=skipped_duplicate,
+            county_id=county_id,
         )
     except Exception as stats_err:
         logger.warning("⚠ Could not record scraper stats (non-critical): %s", stats_err)

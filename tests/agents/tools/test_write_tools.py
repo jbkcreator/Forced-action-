@@ -50,6 +50,7 @@ def test_log_decision_registered_as_write_idempotent_no_compliance():
 def _mock_query_returning(*, opt_in=None, duplicate=None):
 	"""Session mock where the first .first() returns opt_in, second returns duplicate."""
 	sess = MagicMock()
+	sess.execute.return_value.first.return_value = None
 	opt_in_q = MagicMock()
 	opt_in_q.filter.return_value = opt_in_q
 	opt_in_q.order_by.return_value = opt_in_q
@@ -92,6 +93,25 @@ def test_send_sms_returns_duplicate_when_recent_send_exists():
 	assert result["sent"] is False
 	assert result["reason"] == "duplicate"
 	assert result["message_outcome_id"] == 17
+
+
+def test_send_sms_returns_suppressed_when_cora_paused():
+	opt_in = MagicMock(phone="+15555550000")
+	sess = _mock_query_returning(opt_in=opt_in, duplicate=None)
+	sess.execute.return_value.first.return_value = (1,)
+
+	result = write_tools.send_sms(
+		subscriber_id=42,
+		body="test",
+		campaign="smoke",
+		variant_id="a",
+		session=sess,
+	)
+
+	assert result["sent"] is False
+	assert result["reason"] == "cora_suppressed"
+	assert result["message_outcome_id"] is None
+	sess.add.assert_not_called()
 
 
 def test_send_sms_returns_block_when_compliance_fails():

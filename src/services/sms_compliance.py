@@ -276,6 +276,19 @@ def send_sms(
         _log("suppressed", suppress_reason="no_opt_in")
         return False
 
+    # 2b. do_not_text tag — operator-applied marketing-suppression tag (fa045)
+    if message_type == "marketing" and subscriber_id is not None:
+        from src.core.models import SubscriberTag
+        has_dnt = db.query(SubscriberTag).filter(
+            SubscriberTag.subscriber_id == subscriber_id,
+            SubscriberTag.tag == "do_not_text",
+        ).first() is not None
+        if has_dnt:
+            logger.info("SMS suppressed (do_not_text tag): subscriber_id=%s", subscriber_id)
+            add_to_dead_letter(to, "do_not_text_tag", {"body": body[:160]}, db)
+            _log("suppressed", suppress_reason="do_not_text_tag")
+            return False
+
     # 3. Per-subscriber marketing frequency cap — applied globally regardless of campaign.
     # Transactional, opt_in_prompt, and messages without a known subscriber_id bypass this gate.
     if message_type == "marketing" and subscriber_id is not None:

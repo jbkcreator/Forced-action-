@@ -222,6 +222,7 @@ def expire_subscriber_grace_periods(db: Session) -> int:
     from src.services.referral_engine import revoke_team_for_subscriber
     for subscriber in expired:
         subscriber.status = "churned"
+        subscriber.churned_at = now
         churned += 1
         logger.info(
             f"Subscriber churned: id={subscriber.id} "

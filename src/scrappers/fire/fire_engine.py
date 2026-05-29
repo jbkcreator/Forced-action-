@@ -356,6 +356,7 @@ def scrape_fire_incidents(
             matched=created,
             unmatched=skipped_no_match,
             skipped=0,
+            county_id=county_id,
         )
     except Exception as stats_err:
         logger.warning("[fire] Could not record scraper stats (non-critical): %s", stats_err)

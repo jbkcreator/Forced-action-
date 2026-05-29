@@ -69,8 +69,21 @@ for _d in (RAW_LIEN_DIR, PROCESSED_DATA_DIR, PROCESSED_LIENS_DIR,
 # DataFrame later; for now they stay here.
 _HOA_KEYWORDS = frozenset(["ASSOCIATION", "HOA", "CONDO", "COMMUNITY",
                             "VILLAGE", "TOWNHOME", "PROPERTY OWNERS"])
-_IRS_KEYWORDS = frozenset(["UNITED STATES", "INTERNAL REVENUE",
-                            "STATE OF FLORIDA", "DEPARTMENT OF REVENUE"])
+_IRS_KEYWORDS = frozenset([
+    "UNITED STATES", "INTERNAL REVENUE",
+    "STATE OF FLORIDA", "DEPARTMENT OF REVENUE",
+    "FLORIDA DEPARTMENT OF REVENUE", "FLORIDA STATE REVENUE", "FL DEPT OF REVENUE",
+])
+# Medical subrogation liens (healthcare filers against insurers) — not property liens.
+_MEDICAL_FILER_KEYWORDS = frozenset([
+    "HEALTH ADVENT", "ADVENT HEALTH", "ADVENTHEALTH",
+    "HCA FLORIDA", "BAYCARE", "TAMPA GENERAL",
+    "FLORIDA HOSPITAL", "JOHNS HOPKINS ALL CHILDRENS",
+])
+_INSURANCE_GRANTEE_KEYWORDS = frozenset([
+    "GEICO", "PROGRESSIVE", "ALLSTATE", "STATE FARM", "FARM STATE",
+    "DIRECT GENERAL", "USAA", "NATIONWIDE", "TRAVELERS", "LIBERTY MUTUAL",
+])
 
 # Bucket name → output directory. row_routing in the CountyColumnMapping uses
 # these bucket names; this map tells the pipeline where each one lands.
@@ -551,6 +564,10 @@ def _sub_categorise_liens(df: pd.DataFrame, county_cfg: dict) -> pd.DataFrame:
         if doc_type == "TAX LIEN":
             return "TAX LIEN"
         if doc_type in ("LIEN", "FINANCING STATEMENT", "CORPORATE LIEN"):
+            if any(kw in grantor for kw in _MEDICAL_FILER_KEYWORDS):
+                return "MEDICAL LIEN"
+            if any(kw in grantee for kw in _INSURANCE_GRANTEE_KEYWORDS):
+                return "MEDICAL LIEN"
             if any(kw in grantor or kw in grantee for kw in _HOA_KEYWORDS):
                 return "HOA LIENS (HL)"
             if any(kw in grantor or kw in grantee for kw in _IRS_KEYWORDS):
