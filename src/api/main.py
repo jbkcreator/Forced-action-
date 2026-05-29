@@ -13,6 +13,7 @@ Endpoints:
     GET  /                         — Landing page
 """
 
+import functools
 import json
 import logging
 import re
@@ -41,6 +42,7 @@ from config.settings import get_settings
 from config.scoring import VERTICAL_WEIGHTS, for_county
 from config.constants import TIER_DISPLAY
 from src.utils.logger import setup_logging
+
 
 # Load config/logging.yaml so every logger.info/warning/error across src/* is
 # visible in the uvicorn console (instead of just uvicorn's access logs).
@@ -408,15 +410,9 @@ def landing_page():
     raise HTTPException(status_code=503, detail="UI not built — run npm run build in Forced-action-ui/")
 
 
-@app.get("/api/pricing")
-def get_pricing_info():
-    """Returns pricing config for the landing page.
-
-    Founding + regular dollar amounts come from Stripe Price objects (via the
-    STRIPE_PRICE_{TIER}_{FOUNDING|REGULAR} env vars). Display copy (label,
-    zip_limit, features) is owned by TIER_DISPLAY above. The frontend reads
-    this once at LandingPage mount and passes it through LandingContext.
-    """
+@functools.lru_cache(maxsize=1)
+def _cached_pricing_info() -> dict:
+    """Fetch pricing from Stripe once and cache for the process lifetime."""
     _s = get_settings()
     stripe.api_key = _s.active_stripe_secret_key.get_secret_value()
     all_prices = _price_ids()
@@ -451,7 +447,19 @@ def get_pricing_info():
             **TIER_DISPLAY[tier],
         }
 
-    return {"pricing": pricing_info}
+    return pricing_info
+
+
+@app.get("/api/pricing")
+def get_pricing_info():
+    """Returns pricing config for the landing page.
+
+    Founding + regular dollar amounts come from Stripe Price objects (via the
+    STRIPE_PRICE_{TIER}_{FOUNDING|REGULAR} env vars). Display copy (label,
+    zip_limit, features) is owned by TIER_DISPLAY above. The frontend reads
+    this once at LandingPage mount and passes it through LandingContext.
+    """
+    return {"pricing": _cached_pricing_info()}
 
 
 # ---------------------------------------------------------------------------
