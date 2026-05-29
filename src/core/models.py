@@ -2082,6 +2082,7 @@ class DealOutcome(Base):
     deal_date: Mapped[Optional[date]] = mapped_column(Date)
     lead_source: Mapped[Optional[str]] = mapped_column(String(50))  # which signal drove the lead
     days_to_close: Mapped[Optional[int]] = mapped_column(Integer)
+    pipeline_stage: Mapped[Optional[str]] = mapped_column(String(30))  # lead / contacted / qualified / proposal / negotiation / closed_won / closed_lost
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     __table_args__ = (
@@ -2090,12 +2091,36 @@ class DealOutcome(Base):
             name="check_deal_size_bucket",
         ),
         Index("idx_deal_outcome_sub_date", "subscriber_id", "deal_date"),
+        CheckConstraint(
+            "pipeline_stage IS NULL OR pipeline_stage IN ('lead','contacted','qualified','proposal','negotiation','closed_won','closed_lost')",
+            name="check_deal_pipeline_stage",
+        ),
+        Index("idx_deal_outcome_pipeline_stage", "pipeline_stage"),
     )
 
     def __repr__(self):
         return f"<DealOutcome(id={self.id}, subscriber={self.subscriber_id}, bucket={self.deal_size_bucket})>"
 
 
+class SubscriberTag(Base):
+    """Tags applied to subscribers for segmentation and filtering."""
+    __tablename__ = "subscriber_tags"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=False, index=True)
+    tag: Mapped[str] = mapped_column(String(50), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    subscriber: Mapped["Subscriber"] = relationship("Subscriber", backref="tags")
+
+    __table_args__ = (
+        UniqueConstraint("subscriber_id", "tag", name="uq_subscriber_tag"),
+        Index("idx_subscriber_tags_subscriber_id", "subscriber_id"),
+        Index("idx_subscriber_tags_tag", "tag"),
+    )
+
+    def __repr__(self):
+        return f"<SubscriberTag(id={self.id}, subscriber_id={self.subscriber_id}, tag='{self.tag}')>"
 class LearningCard(Base):
     """
     Weekly Cora learning summary. Sunday midnight LangGraph job writes one card
@@ -3453,3 +3478,58 @@ class ChatMessage(Base):
     def __repr__(self) -> str:
         return f"<ChatMessage(id={self.id}, session_id={self.session_id}, role={self.role})>"
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Operator CRM — Notes & Deal Pipeline Audit (fa045)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class SubscriberNote(Base):
+    """Free-form operator note on a subscriber. Any admin can edit/delete."""
+    __tablename__ = "subscriber_notes"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("subscribers.id"), nullable=False, index=True
+    )
+    author_email: Mapped[str] = mapped_column(String(255), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    pinned: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc), nullable=False,
+    )
+
+    __table_args__ = (
+        Index("idx_subscriber_notes_sub_pinned", "subscriber_id", "pinned", "created_at"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<SubscriberNote(id={self.id}, sub={self.subscriber_id}, pinned={self.pinned})>"
+
+
+class DealPipelineEvent(Base):
+    """Audit row written every time a deal's pipeline_stage changes."""
+    __tablename__ = "deal_pipeline_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    deal_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("deal_outcomes.id"), nullable=False, index=True
+    )
+    from_stage: Mapped[Optional[str]] = mapped_column(String(30))
+    to_stage: Mapped[str] = mapped_column(String(30), nullable=False)
+    changed_by: Mapped[str] = mapped_column(String(255), nullable=False)
+    note: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        Index("idx_deal_pipeline_events_deal_created", "deal_id", "created_at"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<DealPipelineEvent(deal={self.deal_id}, {self.from_stage}->{self.to_stage})>"
