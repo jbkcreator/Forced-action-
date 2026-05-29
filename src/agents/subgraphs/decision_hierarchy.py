@@ -169,19 +169,22 @@ def _node_assign_ab_variant(state: DecisionHierarchyState) -> DecisionHierarchyS
 def _node_assign_rollout_arm(state: DecisionHierarchyState) -> DecisionHierarchyState:
 	"""Step 5b — assign the subscriber to a rollout arm for cora_attribution_v1.
 
-	Only runs when attribution_context is provided (i.e. subscriber is eligible).
+	Eligibility = subscriber has a non-empty attribution context (revenue signal
+	score or recent conversion events). The context is fetched here rather than
+	expected from callers so every graph passing through the hierarchy
+	participates in the 10% rollout automatically.
+
 	Sets use_attribution_path=True when the arm is 'variant', False otherwise.
 	"""
-	attribution_context = state.get("attribution_context")
 	subscriber_id = state.get("subscriber_id")
-
-	if attribution_context is None or not subscriber_id:
+	if not subscriber_id:
 		return {
 			"use_attribution_path": False,
-			"hierarchy_path": _append_path(state, "rollout:skip_no_context"),
+			"hierarchy_path": _append_path(state, "rollout:skip_no_subscriber"),
 		}
 
 	try:
+		from src.agents.tools.read_tools import get_attribution_context
 		from src.core.database import db as _db
 		from src.services.ab_engine import (
 			ATTRIBUTION_ROLLOUT_TEST_NAME,
@@ -189,11 +192,29 @@ def _node_assign_rollout_arm(state: DecisionHierarchyState) -> DecisionHierarchy
 			ensure_attribution_rollout_test,
 		)
 
+		attribution_context = state.get("attribution_context")
+		if attribution_context is None:
+			attribution_context = get_attribution_context(subscriber_id)
+
+		# Eligibility: subscriber has any attribution signal worth measuring.
+		# Fresh subs with zero score, zero conversions, zero deals, zero locks
+		# stay on control to avoid polluting the rollout with noise.
+		has_signal = bool(
+			attribution_context.get("revenue_signal_score")
+			or attribution_context.get("recent_conversions")
+			or attribution_context.get("deal_history")
+			or attribution_context.get("lock_zips")
+		)
+		if not has_signal:
+			return {
+				"use_attribution_path": False,
+				"hierarchy_path": _append_path(state, "rollout:skip_ineligible"),
+			}
+
 		with _db.session_scope() as session:
 			ensure_attribution_rollout_test(session)
 			arm = assign_rollout_arm(subscriber_id, ATTRIBUTION_ROLLOUT_TEST_NAME, session)
 	except Exception as exc:
-		# DB error → fail-safe control path; never block a Cora decision.
 		import logging
 		logging.getLogger(__name__).warning(
 			"rollout arm assignment failed sub=%s: %s", subscriber_id, exc

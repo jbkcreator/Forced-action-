@@ -32,16 +32,18 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator, model_validator, EmailStr
 from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
-from sqlalchemy import select, and_, or_, desc, func, cast, text, Date
+from sqlalchemy import select, and_, or_, desc, func, cast, text, Date, distinct, update
 
 from src.core.database import get_db_context
-from src.core.models import FoundingSubscriberCount, ZipTerritory, Subscriber, Property, DistressScore, Incident, LeadPackPurchase, ScraperRunStats, EnrichedContact, Owner, SentLead
+from src.core.models import FoundingSubscriberCount, ZipTerritory, Subscriber, Property, DistressScore, Incident, LeadPackPurchase, ScraperRunStats, EnrichedContact, Owner, SentLead, WaitlistEntry, SmsOptIn, ExpansionCandidate, County
 from src.services.stripe_webhooks import handle_webhook
 from src.services.stripe_service import get_price_id_for_checkout, _price_ids
 from config.settings import get_settings
 from config.scoring import VERTICAL_WEIGHTS, for_county
 from config.constants import TIER_DISPLAY
 from src.utils.logger import setup_logging
+from src.services.rate_limit import enforce_or_429
+from src.services.phone_utils import normalize as normalize_phone
 
 
 # Load config/logging.yaml so every logger.info/warning/error across src/* is
@@ -68,10 +70,12 @@ from src.api.admin_router import router as admin_router, get_current_admin  # no
 from src.api.attribution_router import router as attribution_router  # noqa: E402
 from src.api.cora_incidents_router import router as cora_incidents_router  # noqa: E402
 from src.api.sms_analytics_router import router as sms_analytics_router  # noqa: E402
+from src.api.operator_crm_router import router as operator_crm_router  # noqa: E402
 app.include_router(admin_router)
 app.include_router(attribution_router)
 app.include_router(cora_incidents_router)
 app.include_router(sms_analytics_router)
+app.include_router(operator_crm_router)
 
 from src.api.chat_router import router as chat_router  # noqa: E402
 app.include_router(chat_router)
@@ -2029,10 +2033,105 @@ def _visible_tier_fields(prop, score) -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# POST /api/waitlist — Add email to ZIP waitlist
+# ---------------------------------------------------------------------------
+# GET /api/counties/{county_id}/landing  — server-authoritative landing state
+# POST /api/waitlist                     — write WaitlistEntry
 # ---------------------------------------------------------------------------
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+_WAITLIST_TRADE_LABELS = {
+    "roofing": "Roofing",
+    "restoration": "Restoration",
+    "public_adjusters": "Public Adjuster",
+    "wholesalers": "Wholesaler",
+    "fix_flip": "Fix & Flip",
+    "attorneys": "Attorney",
+}
+
+
+def _resolve_county_landing_state(county_id: str, db: Session) -> tuple[str, str, int, dict]:
+    """
+    Returns (waitlist_type, county_display_name, zip_count, vertical_waitlist_counts)
+    or raises HTTPException(404).
+
+    Resolution rules (ADR-0004):
+    - ExpansionCandidate status in (queued, approved) → coming_soon
+    - ExpansionCandidate status launched, OR no candidate row but county exists
+      AND ≥1 taken/grace ZIP → sold_out
+    - Anything else → 404
+    """
+    county = db.execute(
+        select(County).where(County.county_id == county_id)
+    ).scalar_one_or_none()
+    if not county:
+        raise HTTPException(status_code=404, detail={"error": "unknown_county"})
+
+    candidate = db.execute(
+        select(ExpansionCandidate).where(ExpansionCandidate.county_id == county_id)
+    ).scalar_one_or_none()
+
+    if candidate and candidate.status in ("queued", "approved"):
+        waitlist_type = "coming_soon"
+    else:
+        # launched candidate OR source county (no candidate row) — check ZIP availability
+        any_taken = db.execute(
+            select(func.count(ZipTerritory.id)).where(
+                ZipTerritory.county_id == county_id,
+                ZipTerritory.status.in_(("locked", "grace")),
+            )
+        ).scalar_one()
+        if any_taken == 0:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": "no_waitlist_state",
+                        "message": "County has no taken territories and is not pre-launch."},
+            )
+        waitlist_type = "sold_out"
+
+    zip_count = db.execute(
+        select(func.count(distinct(ZipTerritory.zip_code))).where(
+            ZipTerritory.county_id == county_id
+        )
+    ).scalar_one()
+
+    vertical_counts = dict(
+        db.execute(
+            select(WaitlistEntry.vertical, func.count())
+            .where(
+                WaitlistEntry.county_id == county_id,
+                WaitlistEntry.status == "waiting",
+            )
+            .group_by(WaitlistEntry.vertical)
+        ).all()
+    )
+
+    return waitlist_type, county.display_name, zip_count, vertical_counts
+
+
+@app.get("/api/counties/{county_id}/landing")
+def get_county_landing(county_id: str, db: Session = Depends(get_db)):
+    """
+    Server-authoritative county landing page state (ADR-0004).
+    Returns waitlist_type, display metadata, and waitlist counts.
+    404 when the county has no waitlistable state.
+    """
+    try:
+        wl_type, display_name, zip_count, vert_counts = _resolve_county_landing_state(county_id, db)
+    except HTTPException:
+        raise
+    except OperationalError:
+        logger.error("DB error in get_county_landing", exc_info=True)
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable"})
+
+    return {
+        "county_id": county_id,
+        "county_display_name": display_name,
+        "waitlist_type": wl_type,
+        "zip_count": zip_count,
+        "vertical_waitlist_counts": vert_counts,
+        "trade_labels": _WAITLIST_TRADE_LABELS,
+    }
 
 
 class WaitlistRequest(BaseModel):
@@ -2041,6 +2140,10 @@ class WaitlistRequest(BaseModel):
     county_id: str = "hillsborough"
     name: str
     email: str
+    phone: Optional[str] = None
+    sms_opt_in: bool = False
+    # waitlist_type is accepted from client but always server-verified
+    waitlist_type: Optional[str] = None
 
     @field_validator("email")
     @classmethod
@@ -2074,53 +2177,117 @@ class WaitlistRequest(BaseModel):
             raise ValueError("name is required")
         return v
 
+    @model_validator(mode="after")
+    def sms_opt_in_requires_phone(self) -> "WaitlistRequest":
+        if self.sms_opt_in and not self.phone:
+            raise ValueError("phone is required when sms_opt_in is True")
+        return self
+
+
+def _client_ip_for_waitlist(request: Request) -> str:
+    xff = request.headers.get("X-Forwarded-For")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
 
 @app.post("/api/waitlist", status_code=201)
-def join_waitlist(payload: WaitlistRequest, db: Session = Depends(get_db)):
+def join_waitlist(payload: WaitlistRequest, request: Request, db: Session = Depends(get_db)):
     """
-    Add an email to the waitlist for a taken/grace ZIP territory.
-    Appended to ZipTerritory.waitlist_emails array.
+    Write a WaitlistEntry. Writes to waitlist_entries table.
+    waitlist_type is server-resolved — client value is a hint only.
     """
-    try:
-        territory = db.execute(
-            select(ZipTerritory).where(
-                ZipTerritory.zip_code == payload.zip_code,
-                ZipTerritory.vertical == payload.vertical,
-                ZipTerritory.county_id == payload.county_id,
-            )
-        ).scalar_one_or_none()
-    except OperationalError:
-        logger.error("DB error fetching territory in waitlist", exc_info=True)
-        raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
+    enforce_or_429(request, scope="waitlist_post", limit=3, window_seconds=3600)
 
-    if territory is None:
-        territory = ZipTerritory(
+    # Normalize phone
+    phone_e164: Optional[str] = None
+    if payload.phone:
+        phone_e164 = normalize_phone(payload.phone)
+        if not phone_e164:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "invalid_phone",
+                        "message": "Phone must be a valid US number (E.164)."},
+            )
+
+    # Server-authoritative waitlist_type — ADR-0004
+    try:
+        server_wl_type, _, _, _ = _resolve_county_landing_state(payload.county_id, db)
+    except HTTPException as e:
+        if e.status_code == 404:
+            # County has no waitlistable state — still allow the submit,
+            # default to sold_out so the row lands somewhere useful.
+            server_wl_type = "sold_out"
+        else:
+            raise
+
+    if payload.waitlist_type and payload.waitlist_type != server_wl_type:
+        logger.warning(
+            "waitlist_type mismatch county=%s client=%s server=%s email_hash=%s",
+            payload.county_id,
+            payload.waitlist_type,
+            server_wl_type,
+            hash(payload.email),
+        )
+
+    signup_ip = _client_ip_for_waitlist(request)
+
+    try:
+        entry = WaitlistEntry(
             zip_code=payload.zip_code,
             vertical=payload.vertical,
             county_id=payload.county_id,
-            status="available",
-            waitlist_emails=[payload.email],
+            name=payload.name,
+            email=payload.email,
+            phone_e164=phone_e164,
+            sms_opt_in=bool(payload.sms_opt_in and phone_e164),
+            waitlist_type=server_wl_type,
+            signup_ip=signup_ip,
+            status="waiting",
         )
-        db.add(territory)
-    else:
-        existing = list(territory.waitlist_emails or [])
-        if payload.email in existing:
-            return {"status": "already_registered", "zip_code": payload.zip_code, "email": payload.email}
-        existing.append(payload.email)
-        territory.waitlist_emails = existing
+        db.add(entry)
+        db.flush()  # get id before TCPA write
 
-    try:
+        # TCPA: write SmsOptIn row when phone + consent present
+        if phone_e164 and payload.sms_opt_in:
+            existing_opt_in = db.execute(
+                select(SmsOptIn).where(SmsOptIn.phone == phone_e164)
+            ).scalar_one_or_none()
+            if not existing_opt_in:
+                opt_in = SmsOptIn(
+                    phone=phone_e164,
+                    subscriber_id=None,
+                    source="waitlist_form",
+                    opt_in_message=(
+                        f"Waitlist signup for {payload.county_id} county — "
+                        f"user checked SMS consent box. "
+                        f"Reply STOP to unsubscribe, HELP for help."
+                    ),
+                    ip_address=signup_ip,
+                    consent_scope="other",
+                )
+                db.add(opt_in)
+
         db.commit()
     except IntegrityError:
         db.rollback()
-        logger.warning("Integrity error on waitlist insert for %s / %s", payload.zip_code, payload.email)
-        return {"status": "already_registered", "zip_code": payload.zip_code, "email": payload.email}
+        logger.info("Duplicate waitlist entry for %s / %s / %s / %s",
+                    payload.zip_code, payload.vertical, payload.county_id, payload.email)
+        return {"status": "already_registered",
+                "zip_code": payload.zip_code,
+                "email": payload.email}
     except OperationalError:
         db.rollback()
         logger.error("DB error committing waitlist entry", exc_info=True)
-        raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable",
+                                                      "message": "Database temporarily unavailable"})
 
-    return {"status": "added", "zip_code": payload.zip_code, "email": payload.email}
+    return {
+        "status": "added",
+        "zip_code": payload.zip_code,
+        "email": payload.email,
+        "waitlist_type": server_wl_type,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -3617,7 +3784,6 @@ def leaderboard_endpoint(
       - Cache-Control: public, max-age=3600. Snapshot only refreshes Monday,
         so a 1-hour CDN / browser cache is safe and absorbs scraper traffic.
     """
-    from src.services.rate_limit import enforce_or_429
     enforce_or_429(request, scope="leaderboard", limit=60, window_seconds=60)
 
     from src.tasks.leaderboard import latest_snapshot

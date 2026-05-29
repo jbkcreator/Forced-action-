@@ -259,6 +259,14 @@ COUNTY_ID=hillsborough
 # about to start flowing again. Idempotency via the ±1d window on resume date.
 0 11 * * * $PROJECT/scripts/cron/run.sh src.tasks.pause_resume_reminder
 
+# Vendor Cost Monitor (Stage 7) — daily. Aggregates Telnyx/Claude/Stripe spend,
+# detects per-(vendor,pause_target) anomalies, creates/extends pauses, emails the
+# daily vendor cost report, and hands a summary to Revenue Pulse. Dry-run at 06:30
+# pre-validates aggregation; the 07:00 run (after CDS scoring) is the live cycle,
+# scheduled before Revenue Pulse at 07:30 so its summary is available.
+30 6 * * * $PROJECT/scripts/cron/run.sh src.tasks.vendor_cost_monitor --dry-run
+0 7 * * * $PROJECT/scripts/cron/run.sh src.tasks.vendor_cost_monitor
+
 # Revenue Pulse — daily founder SMS at 07:30 UTC (lead count, wallet actives, top deal/alert, kill switch).
 30 7 * * * $PROJECT/scripts/cron/run.sh src.tasks.revenue_pulse --daily
 
@@ -368,5 +376,9 @@ COUNTY_ID=hillsborough
 # County Launch Runner — every 15 min. Re-verifies gates, then executes the
 # launch playbook (v1: manual Slack thread) for approved candidates.
 */15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.county_launch_runner
+
+# County Live Reactivation — every 5 min. Fires waitlist notifications
+# for newly-launched counties (coming_soon entries).
+*/5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.county_live_reactivation
 
 # === END FORCED-ACTION-PLATFORM ===

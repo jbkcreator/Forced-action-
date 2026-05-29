@@ -2131,6 +2131,7 @@ class DealOutcome(Base):
     deal_date: Mapped[Optional[date]] = mapped_column(Date)
     lead_source: Mapped[Optional[str]] = mapped_column(String(50))  # which signal drove the lead
     days_to_close: Mapped[Optional[int]] = mapped_column(Integer)
+    pipeline_stage: Mapped[Optional[str]] = mapped_column(String(30))  # lead / contacted / qualified / proposal / negotiation / closed_won / closed_lost
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     __table_args__ = (
@@ -2139,12 +2140,36 @@ class DealOutcome(Base):
             name="check_deal_size_bucket",
         ),
         Index("idx_deal_outcome_sub_date", "subscriber_id", "deal_date"),
+        CheckConstraint(
+            "pipeline_stage IS NULL OR pipeline_stage IN ('lead','contacted','qualified','proposal','negotiation','closed_won','closed_lost')",
+            name="check_deal_pipeline_stage",
+        ),
+        Index("idx_deal_outcome_pipeline_stage", "pipeline_stage"),
     )
 
     def __repr__(self):
         return f"<DealOutcome(id={self.id}, subscriber={self.subscriber_id}, bucket={self.deal_size_bucket})>"
 
 
+class SubscriberTag(Base):
+    """Tags applied to subscribers for segmentation and filtering."""
+    __tablename__ = "subscriber_tags"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=False, index=True)
+    tag: Mapped[str] = mapped_column(String(50), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    subscriber: Mapped["Subscriber"] = relationship("Subscriber", backref="tags")
+
+    __table_args__ = (
+        UniqueConstraint("subscriber_id", "tag", name="uq_subscriber_tag"),
+        Index("idx_subscriber_tags_subscriber_id", "subscriber_id"),
+        Index("idx_subscriber_tags_tag", "tag"),
+    )
+
+    def __repr__(self):
+        return f"<SubscriberTag(id={self.id}, subscriber_id={self.subscriber_id}, tag='{self.tag}')>"
 class LearningCard(Base):
     """
     Weekly Cora learning summary. Sunday midnight LangGraph job writes one card
@@ -2636,6 +2661,7 @@ class AgentDecision(Base):
             name="check_agent_autonomy_class",
         ),
         Index("idx_agent_decisions_graph_started", "graph_name", "started_at"),
+        Index("idx_agent_decisions_subscriber_started", "subscriber_id", "started_at"),
     )
 
     def __repr__(self):
@@ -3327,6 +3353,64 @@ class CountyLaunchAudit(Base):
 
 
 # ============================================================================
+# WAITLIST
+# ============================================================================
+
+class WaitlistEntry(Base):
+    """
+    One person's interest in a (zip_code, vertical, county_id) tuple.
+    Replaces ZipTerritory.waitlist_emails array.
+    waitlist_type='coming_soon' fires on county launch;
+    waitlist_type='sold_out' fires on ZIP available transition.
+    """
+    __tablename__ = "waitlist_entries"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    zip_code: Mapped[str] = mapped_column(String(10), nullable=False)
+    vertical: Mapped[str] = mapped_column(String(50), nullable=False)
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    email: Mapped[str] = mapped_column(String(255), nullable=False)
+    phone_e164: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    sms_opt_in: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    waitlist_type: Mapped[str] = mapped_column(String(20), nullable=False, default="sold_out")
+    signup_ip: Mapped[Optional[str]] = mapped_column(String(45), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    notified_email_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    notified_sms_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    reactivation_decision_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="waiting", server_default="waiting")
+
+    __table_args__ = (
+        UniqueConstraint("zip_code", "vertical", "county_id", "email",
+                         name="uq_waitlist_zip_vert_county_email"),
+        Index("ix_waitlist_county_status", "county_id", "status"),
+        Index("ix_waitlist_county_type_status", "county_id", "waitlist_type", "status"),
+        Index("ix_waitlist_zip_vertical", "zip_code", "vertical"),
+        CheckConstraint(
+            "status IN ('waiting','notified','converted','expired','opted_out','lost')",
+            name="ck_waitlist_entries_status",
+        ),
+        CheckConstraint(
+            "waitlist_type IN ('coming_soon','sold_out')",
+            name="ck_waitlist_entries_type",
+        ),
+        CheckConstraint(
+            "vertical IN ('roofing','restoration','public_adjusters',"
+            "'wholesalers','fix_flip','attorneys')",
+            name="ck_waitlist_entries_vertical",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (f"<WaitlistEntry(id={self.id}, zip={self.zip_code}, "
+                f"vertical={self.vertical}, type={self.waitlist_type}, "
+                f"status={self.status})>")
+
+
+# ============================================================================
 # HCPA ENRICHMENT — TAX PAYMENT HISTORY
 # ============================================================================
 
@@ -3473,3 +3557,58 @@ class SynthflowCall(Base):
     def __repr__(self) -> str:
         return f"<SynthflowCall(id={self.id}, phone={self.prospect_phone}, outcome={self.outcome})>"
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Operator CRM — Notes & Deal Pipeline Audit (fa045)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class SubscriberNote(Base):
+    """Free-form operator note on a subscriber. Any admin can edit/delete."""
+    __tablename__ = "subscriber_notes"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("subscribers.id"), nullable=False, index=True
+    )
+    author_email: Mapped[str] = mapped_column(String(255), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    pinned: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc), nullable=False,
+    )
+
+    __table_args__ = (
+        Index("idx_subscriber_notes_sub_pinned", "subscriber_id", "pinned", "created_at"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<SubscriberNote(id={self.id}, sub={self.subscriber_id}, pinned={self.pinned})>"
+
+
+class DealPipelineEvent(Base):
+    """Audit row written every time a deal's pipeline_stage changes."""
+    __tablename__ = "deal_pipeline_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    deal_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("deal_outcomes.id"), nullable=False, index=True
+    )
+    from_stage: Mapped[Optional[str]] = mapped_column(String(30))
+    to_stage: Mapped[str] = mapped_column(String(30), nullable=False)
+    changed_by: Mapped[str] = mapped_column(String(255), nullable=False)
+    note: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        Index("idx_deal_pipeline_events_deal_created", "deal_id", "created_at"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<DealPipelineEvent(deal={self.deal_id}, {self.from_stage}->{self.to_stage})>"
