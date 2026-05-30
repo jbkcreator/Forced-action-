@@ -395,37 +395,63 @@ def _check_accelerated_wallet_push_floor(db, take_rate: Optional[float]) -> Opti
 
 
 def run_kill_switch_metric_ingest(dry_run: bool = False) -> dict:
-    """Compute kill-switch metrics and cache in Redis. Returns computed values."""
-    county_id = settings.county_launch_source_county
+    """Compute kill-switch metrics for all active counties and cache in Redis.
+
+    Returns {county_id: metrics_dict} for every county processed, plus a
+    ``_source`` alias pointing at the source-county metrics for backward compat.
+    """
+    from src.utils.county_config import list_counties
+
+    source_county = settings.county_launch_source_county
+    try:
+        county_ids = list_counties()
+    except Exception:
+        county_ids = [source_county]
+
+    if not county_ids:
+        county_ids = [source_county]
+
+    all_results: dict = {}
+    floor_color = None
 
     with get_db_context() as db:
-        metrics = _compute_metrics(db, county_id=county_id)
-        floor_color = _check_accelerated_wallet_push_floor(
-            db, metrics.get("accelerated_wallet_push_take_rate"),
-        )
-        if not dry_run:
-            # fa034: snapshot today's values into platform_daily_stats so
-            # cora_self_healing can compute a 7-day rolling baseline.
-            _write_platform_daily_stats_row(db, county_id, metrics)
+        for county_id in county_ids:
+            metrics = _compute_metrics(db, county_id=county_id)
+
+            # AW-push floor check: source county only (flips a global feature flag).
+            if county_id == source_county:
+                floor_color = _check_accelerated_wallet_push_floor(
+                    db, metrics.get("accelerated_wallet_push_take_rate"),
+                )
+                metrics["_accelerated_wallet_push_floor"] = floor_color
+
+            if not dry_run:
+                _write_platform_daily_stats_row(db, county_id, metrics)
+
+            all_results[county_id] = metrics
 
     if not dry_run:
-        for feature, value in metrics.items():
-            # Write county-scoped key (new)
-            _cache_metric(feature, value, county_id=county_id)
-            # Write legacy key (no county prefix) for backward compat
-            _cache_metric(feature, value)
+        for county_id, metrics in all_results.items():
+            for feature, value in metrics.items():
+                if feature.startswith("_"):
+                    continue
+                _cache_metric(feature, value, county_id=county_id)
+                # Legacy no-prefix key — source county only (Cora graphs read this).
+                if county_id == source_county:
+                    _cache_metric(feature, value)
         logger.info(
-            "[KillSwitchMetricIngest] cached %d metrics county=%s aw_push_floor=%s",
-            sum(1 for v in metrics.values() if v is not None), county_id, floor_color,
+            "[KillSwitchMetricIngest] cached metrics counties=%s aw_push_floor=%s",
+            list(all_results.keys()), floor_color,
         )
     else:
-        logger.info(
-            "[KillSwitchMetricIngest] dry_run county=%s — metrics=%s aw_push_floor=%s",
-            county_id, json.dumps(metrics, indent=2), floor_color,
-        )
+        for county_id, metrics in all_results.items():
+            logger.info(
+                "[KillSwitchMetricIngest] dry_run county=%s — metrics=%s",
+                county_id, json.dumps(metrics, indent=2),
+            )
 
-    metrics["_accelerated_wallet_push_floor"] = floor_color
-    return metrics
+    all_results["_source"] = all_results.get(source_county, {})
+    return all_results
 
 
 if __name__ == "__main__":

@@ -270,7 +270,13 @@ COUNTY_ID=hillsborough
 # Source: FA-2B-v9-FINAL §Weekly Cora Autonomy Scorecard.
 45 8 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.cora_autonomy_report
 
-# Revenue Pulse — weekly founder SMS, Monday 09:00 UTC (revenue est, churn, top learning).
+# Weekly Kill-Switch Scorecard (fa037) — Monday 08:50 UTC. Reads daily
+# platform_daily_stats snapshots + cora_incident; writes one
+# learning_cards row (card_type='kill_switch_scorecard'); the 09:00 weekly
+# Revenue Pulse appends a compact alarm line. Read-only — no env gate.
+50 8 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.kill_switch_scorecard
+
+# Revenue Pulse — weekly founder SMS, Monday 09:00 UTC (revenue est, churn, top learning, KS scorecard).
 0 9 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.revenue_pulse --weekly
 
 # Learning Card job — Sunday midnight UTC. Generates weekly performance cards for Cora's context.
