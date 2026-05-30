@@ -140,7 +140,17 @@ def send_sms(
 
         ctx = personalization_context or {}
 
-        requires_review = bool(ctx.get("requires_review")) or message_type == "marketing"
+        # Hold for human review ONLY when the operator has flipped the
+        # human-review switch ON. Default is OFF → messages send immediately
+        # (we do not hold every marketing send waiting on approval). When the
+        # switch is ON, Cora's outbound marketing — and anything a graph
+        # explicitly flags via ctx['requires_review'] — is queued for approve/
+        # cancel. Transactional sends (receipts, opt-in prompts) never hold.
+        from src.services.cora_review_switch import is_review_enabled
+
+        requires_review = is_review_enabled() and (
+            message_type == "marketing" or bool(ctx.get("requires_review"))
+        )
 
         outcome = MessageOutcome(
             subscriber_id=subscriber_id,

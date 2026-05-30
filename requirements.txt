@@ -60,3 +60,6 @@ Pillow>=10.0.0
 # CDS scoring fit (Stage C of cross-county retune — src/services/scoring_fit.py)
 # numpy is already pulled in transitively by pandas.
 scikit-learn>=1.5.0
+
+# Prometheus metrics exposition (Stage 10 — /metrics endpoint for Alertmanager pipeline)
+prometheus_client>=0.21.0

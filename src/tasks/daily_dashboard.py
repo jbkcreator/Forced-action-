@@ -25,14 +25,15 @@ from typing import Any
 from jinja2 import Environment, FileSystemLoader
 from sqlalchemy import text
 
+from config.settings import get_settings
 from src.core.database import get_db_context
+from src.services.email import send_email
 from src.tasks.daily_report import (
     ENRICHMENT_ONLY,
     GOLD_PLUS_TIERS,
     SCRAPER_ORDER,
     VERTICAL_DISPLAY,
     _build_phone_coverage,
-    _build_scraper_section,
     _build_signal_composition,
     _build_signal_freshness,
     _build_tier_history,
@@ -2308,6 +2309,174 @@ def _fetch_liens_judgements_combined(
 
 
 # ---------------------------------------------------------------------------
+# Signal-table ingest (replaces scraper_run_stats while stats table is stale)
+# ---------------------------------------------------------------------------
+
+# (label, src_key, table, filter_clause, unmatched_srcs, is_event, is_critical)
+# src_key=None  → no signal table (show N/A, still check unmatched_srcs)
+# is_event=True → zero records today is expected (fires, floods…)
+# is_critical=True → stale data escalates to ESCALATE instead of Check
+_INGEST_SOURCES: list[tuple] = [
+    ("Permits (Building/Elec.)", "permits",         "building_permits",  "is_enforcement_permit = false", ["permits", "roofing_permits"],       False, False),
+    ("Stop Work Orders",         "stop_work",       "building_permits",  "is_enforcement_permit = true",  [],                                   False, False),
+    ("Judgments & Liens",        "legal_and_liens", "legal_and_liens",   None,                            ["judgments", "liens", "lis_pendens"], False, True),
+    ("Lis Pendens / Foreclosures","foreclosures",   "foreclosures",      None,                            ["foreclosures"],                     False, False),
+    ("Tax Delinquencies",        "tax_delinq",      "tax_delinquencies", None,                            ["tax_delinquencies"],                False, True),
+    ("Code Violations",          "code_viols",      "code_violations",   None,                            ["violations"],                       False, False),
+    ("Insurance Claims",         "ins_claims",      "incidents",         "incident_type = 'insurance_claim'", ["insurance_claims"],             True,  True),
+    ("Fire Incidents",           "fire_inc",        "incidents",         "incident_type = 'Fire'",            ["fire_incidents"],               True,  False),
+    ("Flood / Water Damage",     "flood",           "incidents",         "incident_type = 'flood_damage'",    ["flood_damage"],                 True,  False),
+    ("Storm Damage",             "storm",           "incidents",         "incident_type = 'storm_damage'",    ["storm_damage"],                 True,  False),
+    ("Probate Filings",          "probate",         "legal_proceedings", "record_type = 'Probate'",           ["probate"],                     False, False),
+    ("Evictions",                "evictions",       "legal_proceedings", "record_type = 'Eviction'",          ["evictions"],                   False, False),
+    ("Bankruptcy",               "bankruptcy",      "legal_proceedings", "record_type = 'Bankruptcy'",        ["bankruptcies"],                False, False),
+    ("Divorce Filings",          "divorce",         "legal_proceedings", "record_type = 'Divorce'",           ["divorce_filings"],             False, False),
+    ("Deeds",                    "deeds",           "deeds",             None,                                ["deeds"],                       False, False),
+    ("Code Enforcement",         None,              None,                None,                                ["code_enforcement"],            False, False),
+]
+
+
+def _ingest_status(days_stale: int | None, scraped: int, is_event: bool) -> str:
+    if days_stale is None:
+        return "fail"
+    if days_stale > 5:
+        return "fail"
+    if days_stale > 2:
+        return "caution"
+    if is_event and scraped == 0:
+        return "ok"   # event-based, no events today but scraper ran recently
+    return "ok"
+
+
+def _ingest_quality(days_stale: int | None, match_pct: float | None, is_event: bool, scraped: int) -> str:
+    if days_stale is None:
+        return "Error"
+    if days_stale > 5:
+        return "Stale"
+    if days_stale > 2:
+        return "Moderate"
+    if is_event and scraped == 0:
+        return "Clean"   # event-based, no events today but fresh
+    if match_pct is not None and scraped > 0 and match_pct < 30:
+        return "Moderate"
+    return "Clean"
+
+
+def _ingest_action(label: str, days_stale: int | None, scraped: int, is_event: bool, is_critical: bool) -> str:
+    if days_stale is None:
+        return "ESCALATE" if is_critical else "Check"
+    if days_stale > 5:
+        return "ESCALATE" if is_critical else "Check"  # stale always beats event-based
+    if days_stale > 2:
+        return "Check"
+    if is_event and scraped == 0:
+        return "Source check"   # fresh scraper, but zero events — verify feed is live
+    return "—"
+
+
+def _build_scraper_section_from_signals(
+    session, run_date: date, county_id: str,
+) -> dict:
+    """Signal-table replacement for daily_report._build_scraper_section.
+
+    Returns a dict with rows (all 8 display columns), totals, and a summary block.
+    Each source in _INGEST_SOURCES gets today's count + last_update from signal tables.
+    Unmatched counts come from unmatched_records.
+    """
+    params = {"county_id": county_id, "run_date": run_date}
+
+    # Single UNION ALL: today's count + last ever date_added per source
+    union_legs = []
+    for _label, src_key, table, filt, _um, _ev, _cr in _INGEST_SOURCES:
+        if table is None or src_key is None:
+            continue
+        where = f"county_id = :county_id{' AND ' + filt if filt else ''}"
+        union_legs.append(
+            f"SELECT '{src_key}' AS src,"
+            f" COUNT(*) FILTER (WHERE date_added = :run_date) AS today_cnt,"
+            f" MAX(date_added) AS last_upd"
+            f" FROM {table} WHERE {where}"
+        )
+
+    today_by_src: dict[str, int] = {}
+    last_upd_by_src: dict[str, date | None] = {}
+    if union_legs:
+        try:
+            for src, cnt, lu in session.execute(
+                text("\nUNION ALL\n".join(union_legs)), params
+            ).fetchall():
+                today_by_src[src] = int(cnt or 0)
+                last_upd_by_src[src] = lu.date() if lu and hasattr(lu, "date") else lu
+        except Exception as exc:
+            logger.warning("_build_scraper_section_from_signals signal query failed %s: %s", county_id, exc)
+
+    # Unmatched counts for today
+    raw_unmatched: dict[str, int] = {}
+    try:
+        for st, cnt in session.execute(text("""
+            SELECT source_type, COUNT(*) FROM unmatched_records
+             WHERE county_id = :county_id
+               AND date(date_added AT TIME ZONE 'UTC') = :run_date
+               AND match_status IN ('unmatched', 'pending_review')
+             GROUP BY source_type
+        """), params).fetchall():
+            raw_unmatched[st] = int(cnt or 0)
+    except Exception as exc:
+        logger.warning("_build_scraper_section_from_signals unmatched query failed %s: %s", county_id, exc)
+
+    rows: list[dict] = []
+    for label, src_key, _table, _filt, unmatched_srcs, is_event, is_critical in _INGEST_SOURCES:
+        if src_key is not None:
+            matched   = today_by_src.get(src_key, 0)
+            last_upd  = last_upd_by_src.get(src_key)
+            days_stale: int | None = (run_date - last_upd).days if last_upd else None
+        else:
+            matched, last_upd, days_stale = 0, None, None
+
+        unmatched  = sum(raw_unmatched.get(st, 0) for st in unmatched_srcs)
+        scraped    = matched + unmatched
+        match_pct_row = (matched / scraped * 100) if scraped > 0 else None
+
+        rows.append({
+            "label":       label,
+            "scraped":     scraped   if (scraped > 0 or src_key is not None) else None,
+            "matched":     matched   if scraped > 0 else None,
+            "unmatched":   unmatched if scraped > 0 else None,
+            "match_rate":  f"{match_pct_row:.1f}%" if match_pct_row is not None else "—",
+            "last_update": str(last_upd) if last_upd else ("N/A" if src_key is None else "Never"),
+            "days_stale":  days_stale if days_stale is not None else ("N/A" if src_key is None else "Never"),
+            "status":      _ingest_status(days_stale, scraped, is_event),
+            "quality":     _ingest_quality(days_stale, match_pct_row, is_event, scraped),
+            "action":      _ingest_action(label, days_stale, scraped, is_event, is_critical),
+            "is_event":    is_event,
+        })
+
+    total_matched   = sum(r["matched"]   or 0 for r in rows)
+    total_unmatched = sum(r["unmatched"] or 0 for r in rows)
+    total_scraped   = total_matched + total_unmatched
+    match_pct       = (total_matched / total_scraped * 100) if total_scraped else 0.0
+
+    # Data quality score: fraction of trackable sources that are "Clean" × 10
+    trackable = [r for r in rows if r["quality"] not in ("N/A",) and r["last_update"] not in ("N/A", "Never")]
+    clean     = [r for r in trackable if r["quality"] == "Clean"]
+    dq_score  = round(len(clean) / max(len(trackable), 1) * 10, 1) if trackable else 0.0
+
+    return {
+        "rows":          rows,
+        "total_scraped": total_scraped,
+        "total_matched": total_matched,
+        "match_pct":     match_pct,
+        "errors":        [],
+        "summary": {
+            "data_quality_score": dq_score,
+            "unmatched_count":    total_unmatched,
+            "unmatched_pct":      f"{total_unmatched / total_scraped * 100:.1f}%" if total_scraped else "—",
+            "match_target_ok":    match_pct >= 85,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Assembly
 # ---------------------------------------------------------------------------
 
@@ -2335,38 +2504,24 @@ def collect_dashboard_data(session, run_date: date) -> dict:
     signal_composition = _merge_signal_compositions(sig_comps)
     signal_freshness = _merge_signal_freshness_dicts(sig_freshs)
 
-    # Section 4 — per-county scraper groups
+    # Section 4 — per-county scraper groups (signal tables, not scraper_run_stats)
     scraper_groups = []
     for cid in active_counties:
-        rows, total, matched, pct_val, errors = _build_scraper_section(session, run_date, cid)
+        result = _build_scraper_section_from_signals(session, run_date, cid)
         scraper_groups.append({
             "county_id": cid,
-            "display": cid.replace("_", " ").title(),
-            "rows": rows,
-            "total": total,
-            "matched": matched,
-            "match_pct": f"{pct_val:.1f}%",
-            "errors": errors or [],
+            "display":   cid.replace("_", " ").title(),
+            "rows":      result["rows"],
+            "total":     result["total_scraped"],
+            "matched":   result["total_matched"],
+            "match_pct": f"{result['match_pct']:.1f}%",
+            "errors":    result["errors"],
+            "summary":   result["summary"],
         })
     total_scraped = sum(g["total"] for g in scraper_groups)
     total_matched = sum(g["matched"] for g in scraper_groups)
     combined_match_pct = (total_matched / total_scraped * 100) if total_scraped else 0.0
     all_errors = [e for g in scraper_groups for e in g["errors"]]
-
-    # Strip lien/judgment subtype rows from each county's table
-    for grp in scraper_groups:
-        grp["rows"] = [r for r in grp["rows"] if r["label"] not in LIEN_LABELS]
-        lien_rows_cty, lien_total_cty, lien_matched_cty = _fetch_liens_judgements_combined(
-            session, run_date, [grp["county_id"]]
-        )
-        any_fail = any(r["ok"] is False for r in lien_rows_cty)
-        all_ok = lien_rows_cty and all(r["ok"] is True for r in lien_rows_cty if r["ok"] is not None)
-        grp["rows"].append({
-            "label": "Liens & Judgements",
-            "scraped": lien_total_cty,
-            "matched": lien_matched_cty if lien_total_cty > 0 else None,
-            "ok": False if any_fail else (True if all_ok else None),
-        })
 
     # Section 1 — Executive Summary
     tier_counts_today = _fetch_tier_counts(session, run_date, active_counties)
@@ -2563,6 +2718,58 @@ def prune_old_dashboards(directory: Path, keep_days: int = RETENTION_DAYS) -> in
     return removed
 
 
+def send_dashboard_email(pdf_path: Path, run_date: date) -> bool:
+    """Email the dashboard PDF to every address in REPORT_RECIPIENTS.
+
+    Returns True if at least one send succeeded.
+    No-ops (returns False) when SMTP or REPORT_RECIPIENTS are not configured.
+    """
+    settings = get_settings()
+    raw = settings.report_recipients or ""
+    recipients = [r.strip() for r in raw.split(",") if r.strip()]
+    if not recipients:
+        logger.info("[daily_dashboard] REPORT_RECIPIENTS not set — skipping email")
+        return False
+
+    subject = f"Forced Action Daily Dashboard — {run_date.strftime('%b %d, %Y')}"
+    body_text = (
+        f"Daily operations dashboard for {run_date.strftime('%B %d, %Y')}.\n"
+        f"Full 10-section PDF is attached.\n\n"
+        f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+    )
+    body_html = f"""
+    <div style="font-family:sans-serif;background:#0f172a;padding:32px;border-radius:8px">
+      <h2 style="color:#f59e0b;margin:0 0 8px">Forced Action Daily Dashboard</h2>
+      <p style="color:#94a3b8;margin:0 0 16px;font-size:15px">
+        {run_date.strftime("%B %d, %Y")}
+      </p>
+      <p style="color:#e2e8f0;font-size:14px">
+        The full 10-section operations dashboard is attached as a PDF.
+      </p>
+      <p style="color:#475569;font-size:12px;margin-top:24px">
+        Generated {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")}
+      </p>
+    </div>
+    """
+
+    any_ok = False
+    for recipient in recipients:
+        ok = send_email(
+            to=recipient,
+            subject=subject,
+            body_text=body_text,
+            body_html=body_html,
+            attachments=[pdf_path],
+        )
+        if ok:
+            logger.info("[daily_dashboard] emailed dashboard to %s", recipient)
+            any_ok = True
+        else:
+            logger.warning("[daily_dashboard] failed to email dashboard to %s", recipient)
+
+    return any_ok
+
+
 def generate_dashboard_pdf(run_date: date | None = None) -> Path:
     run_date = run_date or date.today()
     DASHBOARD_DIR.mkdir(parents=True, exist_ok=True)
@@ -2584,6 +2791,13 @@ def generate_dashboard_pdf(run_date: date | None = None) -> Path:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate daily operations dashboard PDF")
     parser.add_argument("--date", help="YYYY-MM-DD (defaults to today)")
+    parser.add_argument(
+        "--send", action="store_true",
+        help="Email the PDF to REPORT_RECIPIENTS after generating",
+    )
     args = parser.parse_args()
-    path = generate_dashboard_pdf(run_date=date.fromisoformat(args.date) if args.date else None)
+    run_date = date.fromisoformat(args.date) if args.date else date.today()
+    path = generate_dashboard_pdf(run_date=run_date)
+    if args.send:
+        send_dashboard_email(path, run_date)
     print(f"Dashboard written to: {path}")

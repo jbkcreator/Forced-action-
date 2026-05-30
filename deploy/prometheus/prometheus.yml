@@ -1,0 +1,23 @@
+global:
+  scrape_interval: 60s
+  evaluation_interval: 60s
+  external_labels:
+    environment: "production"
+    service: "forced-action"
+
+rule_files:
+  - "/etc/prometheus/rules/alert_rules.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["localhost:9093"]
+
+scrape_configs:
+  - job_name: "cora_stage10"
+    metrics_path: "/metrics"
+    static_configs:
+      - targets: ["localhost:8000"]
+    # Basic auth not needed — PROMETHEUS_ALERT_WEBHOOK_SECRET guards the
+    # webhook receiver; the /metrics endpoint is unauthenticated (read-only).
+    scrape_timeout: 15s

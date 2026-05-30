@@ -280,3 +280,20 @@ def is_within_guardrail(name: str, value: float) -> bool:
     if "max_credits" in g:
         return value <= g["max_credits"]
     return True  # guardrails without numeric bounds (e.g. save_offer) need custom checks
+
+
+def get_effective_kill_switch(metric_name: str) -> dict:
+    """Return the KILL_SWITCH config for a metric, with Stage 10 overrides merged in.
+
+    Stage 10 overrides auto_action_type for first_payment_rate from
+    'human_escalated' to 'variant_promotion' without touching the existing
+    config dict (immutable source of truth stays in this file).
+    """
+    base = dict(KILL_SWITCH.get(metric_name, {}))
+    try:
+        from config.stage10_config import STAGE10_KILL_SWITCH_OVERRIDES
+        overrides = STAGE10_KILL_SWITCH_OVERRIDES.get(metric_name, {})
+        base.update(overrides)
+    except ImportError:
+        pass
+    return base
