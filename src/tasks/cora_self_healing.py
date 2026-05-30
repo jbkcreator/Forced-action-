@@ -67,7 +67,7 @@ from typing import Any, Optional
 from sqlalchemy import text as sa_text
 from sqlalchemy.orm import Session
 
-from config.cora_guardrails import CORA_SELF_HEALING, KILL_SWITCH
+from config.cora_guardrails import CORA_SELF_HEALING, KILL_SWITCH, get_effective_kill_switch
 from config.settings import get_settings
 from src.core.database import get_db_context
 from src.core.redis_client import redis_available, rset
@@ -226,6 +226,33 @@ def _apply_fallback(feature_flag: str) -> None:
     rset(f"kill_switch:{feature_flag}", "red", ttl_seconds=24 * 3600)
 
 
+def _apply_variant_promotion(db: Session, metric_name: str) -> Optional[dict]:
+    """Stage 10 — auto-pause losing 3-variant slot and promote winner.
+
+    Triggered when first_payment_rate breaches the Stage 10 alert threshold
+    for >= 48 hours. Uses STAGE10_KILL_SWITCH_OVERRIDES to look up the target
+    sequence name, then delegates to variant_engine.promote_winner().
+
+    Returns a details dict, or None if the config doesn't point to a sequence.
+    """
+    try:
+        from config.stage10_config import STAGE10_KILL_SWITCH_OVERRIDES
+        from src.services.variant_engine import promote_winner
+    except ImportError:
+        logger.warning("[cora-self-heal] Stage 10 variant_engine not importable")
+        return None
+
+    overrides = STAGE10_KILL_SWITCH_OVERRIDES.get(metric_name, {})
+    sequence_name = overrides.get("variant_sequence_name")
+    if not sequence_name:
+        return None
+
+    result = promote_winner(sequence_name, db)
+    if result.get("status") in ("promoted", "already_promoted"):
+        return {"sequence": sequence_name, **result}
+    return {"sequence": sequence_name, "skipped": result.get("status")}
+
+
 def _apply_ab_pause(db: Session, metric_name: str) -> Optional[dict]:
     """If `metric_name` maps to an active A/B test that should be rolled
     back, call ab_engine.complete_test(winner=control). Returns a details
@@ -276,8 +303,8 @@ def _process_metric(
 ) -> dict:
     """Run the state machine for a single (metric, county, feature). Returns
     a dict describing what happened — used for the run summary log line."""
-    cfg = KILL_SWITCH.get(metric_name)
-    if cfg is None:
+    cfg = get_effective_kill_switch(metric_name)
+    if not cfg:
         return {"metric": metric_name, "skipped": "unknown_metric"}
 
     observed = get_cached_metric(metric_name, county_id=county_id)
@@ -416,6 +443,20 @@ def _process_metric(
         )
         return {"metric": metric_name, "result": "fallback_enabled",
                 "flag": fallback_feature_flag}
+
+    if auto_action_type == "variant_promotion":
+        if dry_run:
+            return {"metric": metric_name, "result": "would_apply_variant_promotion"}
+        vp_details = _apply_variant_promotion(db, metric_name)
+        if vp_details and vp_details.get("status") in ("promoted", "already_promoted"):
+            _record_action(db, open_incident.id, "auto_paused", vp_details)
+            counters.actions_taken += 1
+            post_incident_alert(
+                open_incident, kind="action_taken",
+                action_summary=f"3-variant auto-promote: {vp_details}",
+            )
+            return {"metric": metric_name, "result": "variant_promoted", **vp_details}
+        # Fell through — fall back to human escalation.
 
     if auto_action_type == "auto_paused":
         if dry_run:

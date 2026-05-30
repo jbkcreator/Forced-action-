@@ -49,7 +49,7 @@ def get_window(lead_id: int) -> Optional[dict]:
         return None
 
 
-def get_active_count(zip_code: str) -> int:
+def get_active_count(zip_code: str, county_id: str | None = None) -> int:
     if not redis_available():
         return 0
     from src.core.redis_client import _get_client
@@ -57,7 +57,13 @@ def get_active_count(zip_code: str) -> int:
     if client is None:
         return 0
     try:
-        count = client.zcard(f"urgency_zips:{zip_code}")
+        # County-scoped key when county_id provided; legacy global key otherwise.
+        key = (
+            f"fa:zip_activity:{county_id}:{zip_code}"
+            if county_id
+            else f"urgency_zips:{zip_code}"
+        )
+        count = client.zcard(key)
         return count or 0
     except Exception:
         return 0

@@ -2276,6 +2276,50 @@ def get_storm_packs(
     }
 
 
+# ---------------------------------------------------------------------------
+# GET  /api/admin/cora-messages/review-switch   — read current switch state
+# POST /api/admin/cora-messages/review-switch   — turn human review on/off
+# ---------------------------------------------------------------------------
+
+class _ReviewSwitchBody(BaseModel):
+    enabled: bool
+
+
+@router.get("/cora-messages/review-switch")
+def get_cora_review_switch(
+    _admin: dict = Depends(get_current_admin),
+):
+    """
+    Return whether human review of outbound Cora messages is currently ON.
+
+    When ON, Cora's outbound marketing SMS are held in the pending-review
+    queue for manual approve/cancel. When OFF (the default) they send
+    immediately.
+    """
+    from src.services.cora_review_switch import is_review_enabled
+    return {"ok": True, "enabled": is_review_enabled()}
+
+
+@router.post("/cora-messages/review-switch")
+def set_cora_review_switch(
+    body: _ReviewSwitchBody,
+    _admin: dict = Depends(get_current_admin),
+):
+    """
+    Turn human review of outbound Cora messages on or off at runtime.
+
+    Takes effect immediately for all subsequent sends — no redeploy. Turning
+    it OFF does not auto-send messages already sitting in the queue; clear
+    those with approve/cancel.
+    """
+    from src.services.cora_review_switch import set_review_enabled
+    try:
+        enabled = set_review_enabled(body.enabled, actor=_admin.get("sub"))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    return {"ok": True, "enabled": enabled}
+
+
 @router.get("/cora-messages/pending")
 def list_pending_cora_messages(
     limit: int = Query(default=100, ge=1, le=500),
@@ -2380,14 +2424,26 @@ def approve_cora_message(
     db: Session = Depends(get_db),
 ):
     """
-    Approve a pending-review Cora SMS message.
-    Sets send_status='approved', approved_by, and approved_at.
+    Approve a pending-review Cora SMS message — and send it immediately.
+
+    Marks the row approved (approved_by / approved_at), then dispatches the
+    held body to the recipient through the compliance-gated outbound path.
+    On a successful send the row lands at send_status='sent'; if the send is
+    suppressed or fails it lands at 'failed'. Either way it leaves the queue.
     Returns 404 if the message does not exist, 409 if it is not pending_review.
     """
     try:
         row = db.execute(
             text("""
-                SELECT id, send_status
+                SELECT
+                    id,
+                    send_status,
+                    subscriber_id,
+                    template_id,
+                    variant_id,
+                    decision_id,
+                    COALESCE(context_snapshot, '{}'::jsonb) ->> 'phone' AS phone,
+                    COALESCE(context_snapshot, '{}'::jsonb) ->> 'body'  AS body
                 FROM message_outcomes
                 WHERE id = :id
             """),
@@ -2404,28 +2460,59 @@ def approve_cora_message(
             status_code=409,
             detail=f"Message {message_id} is '{row.send_status}', not pending_review",
         )
+    if not row.phone or not row.body:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Message {message_id} is missing a stored phone or body — cannot send.",
+        )
+
+    # Stamp the approval first so the audit trail records who released it,
+    # then dispatch through the compliance gate (opt-out / quiet-hours / caps).
+    from src.services import sms_compliance
 
     try:
         db.execute(
             text("""
                 UPDATE message_outcomes
-                SET send_status  = 'approved',
-                    approved_by  = :actor,
-                    approved_at  = NOW()
+                SET approved_by = :actor,
+                    approved_at = NOW()
                 WHERE id = :id
             """),
             {"id": message_id, "actor": _admin.get("sub")},
         )
+
+        sent = sms_compliance.send_sms(
+            to=row.phone,
+            body=row.body,
+            db=db,
+            message_type="marketing",
+            subscriber_id=row.subscriber_id,
+            task_type=row.template_id,
+            campaign=row.template_id,
+            variant_id=row.variant_id,
+            decision_id=row.decision_id,
+        )
+
+        final_status = "sent" if sent else "failed"
+        db.execute(
+            text("""
+                UPDATE message_outcomes
+                SET send_status = :status,
+                    sent_at     = CASE WHEN :status = 'sent' THEN NOW() ELSE sent_at END
+                WHERE id = :id
+            """),
+            {"id": message_id, "status": final_status},
+        )
         db.commit()
     except Exception as exc:
-        logger.error("[cora-messages/approve] update failed id=%s: %s", message_id, exc)
-        raise HTTPException(status_code=503, detail="Failed to approve message")
+        logger.error("[cora-messages/approve] send/update failed id=%s: %s", message_id, exc)
+        raise HTTPException(status_code=503, detail="Failed to approve and send message")
 
     logger.info(
-        "[cora-messages/approve] id=%s approved by %s",
-        message_id, _admin.get("sub"),
+        "[cora-messages/approve] id=%s approved by %s → %s",
+        message_id, _admin.get("sub"), final_status,
     )
-    return {"ok": True, "id": message_id, "send_status": "approved"}
+    return {"ok": True, "id": message_id, "send_status": final_status}
 
 
 @router.post("/cora-messages/{message_id}/cancel")

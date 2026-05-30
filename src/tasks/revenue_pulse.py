@@ -43,12 +43,12 @@ from src.services.claude_savings_report import format_savings_sms
 logger = logging.getLogger(__name__)
 
 
-def run_daily_pulse(dry_run: bool = False) -> dict:
+def run_daily_pulse(dry_run: bool = False, county_id: str | None = None) -> dict:
     """Compose and optionally send the daily founder SMS."""
     with get_db_context() as db:
-        msg = _compose_daily(db)
+        msg = _compose_daily(db, county_id=county_id)
 
-    logger.info("[RevenuePulse] Daily message: %r", msg)
+    logger.info("[RevenuePulse] Daily message (county=%s): %r", county_id or "global", msg)
 
     if not dry_run:
         sent = _send_sms(msg)
@@ -56,12 +56,12 @@ def run_daily_pulse(dry_run: bool = False) -> dict:
     return {"sent": False, "dry_run": dry_run, "message": msg}
 
 
-def run_weekly_pulse(dry_run: bool = False) -> dict:
+def run_weekly_pulse(dry_run: bool = False, county_id: str | None = None) -> dict:
     """Compose and optionally send the weekly founder SMS."""
     with get_db_context() as db:
-        msg = _compose_weekly(db)
+        msg = _compose_weekly(db, county_id=county_id)
 
-    logger.info("[RevenuePulse] Weekly message: %r", msg)
+    logger.info("[RevenuePulse] Weekly message (county=%s): %r", county_id or "global", msg)
 
     if not dry_run:
         sent = _send_sms(msg)
@@ -69,31 +69,34 @@ def run_weekly_pulse(dry_run: bool = False) -> dict:
     return {"sent": False, "dry_run": dry_run, "message": msg}
 
 
-def _compose_daily(db: Session) -> str:
+def _compose_daily(db: Session, county_id: str | None = None) -> str:
     today = date.today()
+    county_label = f" [{county_id}]" if county_id else ""
 
-    lead_count = db.execute(
-        select(func.count(DistressScore.id)).where(
-            DistressScore.score_date >= datetime.combine(today, datetime.min.time()),
-            DistressScore.qualified == True,  # noqa: E712
+    lead_q = select(func.count(DistressScore.id)).where(
+        DistressScore.score_date >= datetime.combine(today, datetime.min.time()),
+        DistressScore.qualified == True,  # noqa: E712
+    )
+    if county_id:
+        lead_q = lead_q.where(DistressScore.county_id == county_id)
+    lead_count = db.execute(lead_q).scalar_one_or_none() or 0
+
+    wallet_q = select(func.count(WalletBalance.id)).where(WalletBalance.credits_remaining > 0)
+    if county_id:
+        wallet_q = wallet_q.join(Subscriber, Subscriber.id == WalletBalance.subscriber_id).where(
+            Subscriber.county_id == county_id
         )
-    ).scalar_one_or_none() or 0
+    wallet_active = db.execute(wallet_q).scalar_one_or_none() or 0
 
-    wallet_active = db.execute(
-        select(func.count(WalletBalance.id)).where(
-            WalletBalance.credits_remaining > 0
-        )
-    ).scalar_one_or_none() or 0
-
-    top_deal = db.execute(
+    deal_q = (
         select(DealOutcome)
-        .where(
-            DealOutcome.deal_date == today,
-            DealOutcome.deal_size_bucket != "skip",
+        .where(DealOutcome.deal_date == today, DealOutcome.deal_size_bucket != "skip")
+    )
+    if county_id:
+        deal_q = deal_q.join(Subscriber, Subscriber.id == DealOutcome.subscriber_id).where(
+            Subscriber.county_id == county_id
         )
-        .order_by(DealOutcome.deal_amount.desc().nullslast())
-        .limit(1)
-    ).scalar_one_or_none()
+    top_deal = db.execute(deal_q.order_by(DealOutcome.deal_amount.desc().nullslast()).limit(1)).scalar_one_or_none()
     top_deal_str = (
         f"${int(top_deal.deal_amount):,}" if top_deal and top_deal.deal_amount
         else "no deals"
@@ -102,7 +105,7 @@ def _compose_daily(db: Session) -> str:
     # fa034: the "alert" slot in the daily pulse prefers an unresolved
     # Cora incident over a learning-card snippet. If no incidents are open,
     # fall back to the latest learning card as before.
-    alert_str = _format_cora_incident_alert(db)
+    alert_str = _format_cora_incident_alert(db, county_id=county_id)
     if alert_str is None:
         card = db.execute(
             select(LearningCard).order_by(LearningCard.card_date.desc()).limit(1)
@@ -112,7 +115,7 @@ def _compose_daily(db: Session) -> str:
             else (card.summary_text if card else "no alerts")
         )
 
-    kill = _kill_switch_status(db)
+    kill = _kill_switch_status(db, county_id=county_id)
     chat = _chat_metrics_today(db)
     claude_savings = _claude_savings_summary(db)
 
@@ -125,9 +128,10 @@ def _compose_daily(db: Session) -> str:
             vendor_cost_line = cost_text[:VENDOR_COST_LINE_MAX_CHARS] + "\n"
     except Exception as exc:
         logger.warning("[RevenuePulse] Vendor cost summary failed: %s", exc)
-        
+
+    date_str = today.strftime("%m/%d").lstrip("0").replace("/0", "/") if hasattr(today, "strftime") else str(today)
     msg = DAILY_PULSE_TEMPLATE.format(
-        date=today.strftime("%m/%d").lstrip("0").replace("/0", "/") if hasattr(today, "strftime") else str(today),
+        date=f"{date_str}{county_label}",
         lead_count=lead_count,
         wallet_active=wallet_active,
         top_deal=top_deal_str,
@@ -146,30 +150,35 @@ def _compose_daily(db: Session) -> str:
     return msg
 
 
-def _compose_weekly(db: Session) -> str:
+def _compose_weekly(db: Session, county_id: str | None = None) -> str:
     now = datetime.now(timezone.utc)
     week_start = now - timedelta(days=now.weekday() + 7)
+    county_label = f" [{county_id}]" if county_id else ""
+
+    def _sub_filter(*extra):
+        clauses = list(extra)
+        if county_id:
+            clauses.append(Subscriber.county_id == county_id)
+        return clauses
 
     new_subs = db.execute(
         select(func.count(Subscriber.id)).where(
-            Subscriber.created_at >= week_start,
-            Subscriber.status == "active",
+            *_sub_filter(Subscriber.created_at >= week_start, Subscriber.status == "active")
         )
     ).scalar_one_or_none() or 0
 
     churned = db.execute(
         select(func.count(Subscriber.id)).where(
-            Subscriber.updated_at >= week_start,
-            Subscriber.status.in_(["churned", "cancelled"]),
+            *_sub_filter(Subscriber.updated_at >= week_start, Subscriber.status.in_(["churned", "cancelled"]))
         )
     ).scalar_one_or_none() or 0
 
     active_count = db.execute(
-        select(func.count(Subscriber.id)).where(Subscriber.status == "active")
+        select(func.count(Subscriber.id)).where(*_sub_filter(Subscriber.status == "active"))
     ).scalar_one_or_none() or 0
     est_revenue = active_count * 800
 
-    kill = _kill_switch_status(db)
+    kill = _kill_switch_status(db, county_id=county_id)
 
     card = db.execute(
         select(LearningCard).order_by(LearningCard.card_date.desc()).limit(1)
@@ -177,7 +186,7 @@ def _compose_weekly(db: Session) -> str:
     learning_str = card.summary_text[:75] if card else "no card"
 
     body = WEEKLY_PULSE_TEMPLATE.format(
-        week=now.strftime("%W"),
+        week=f"{now.strftime('%W')}{county_label}",
         revenue=f"{est_revenue:,}",
         new_subs=new_subs,
         churned=churned,
@@ -187,7 +196,7 @@ def _compose_weekly(db: Session) -> str:
     )
 
     # fa034: append a one-line Cora incidents summary if there's room.
-    incidents_line = _format_cora_incidents_weekly_summary(db)
+    incidents_line = _format_cora_incidents_weekly_summary(db, county_id=county_id)
     if incidents_line:
         candidate = f"{body}\nIncidents 7d: {incidents_line}"
         if len(candidate) <= MAX_DAILY_SMS_CHARS:
@@ -208,20 +217,22 @@ def _compose_weekly(db: Session) -> str:
 
 # ── fa034 helpers — pure raw SQL, no ORM ────────────────────────────────────
 
-def _format_cora_incident_alert(db: Session) -> str | None:
+def _format_cora_incident_alert(db: Session, county_id: str | None = None) -> str | None:
     """Return a 140-char alert string built from the latest unresolved
     cora_incident, or None if no incident is open.
 
     Prioritizes severity=red over yellow, then most recent breach_started.
     """
-    row = db.execute(sa_text("""
+    county_clause = "AND county_id = :county_id" if county_id else ""
+    row = db.execute(sa_text(f"""
         SELECT metric_name, severity, observed_value, threshold_value,
                action_taken, breach_started, county_id
         FROM cora_incident
         WHERE breach_resolved IS NULL
+        {county_clause}
         ORDER BY (severity = 'red') DESC, breach_started DESC
         LIMIT 1
-    """)).first()
+    """), {"county_id": county_id} if county_id else {}).first()
     if row is None:
         return None
     # Format compactly: "[RED] first_payment_rate 18 (thr 20) — fallback_enabled"
@@ -274,13 +285,14 @@ def _format_cora_autonomy_weekly_summary(db: Session) -> str | None:
     )
 
 
-def _format_cora_incidents_weekly_summary(db: Session) -> str | None:
+def _format_cora_incidents_weekly_summary(db: Session, county_id: str | None = None) -> str | None:
     """Return a one-line counts summary or None if no incident activity
     in the last 7 days.
 
     Example output: "2 red / 4 yellow open, 3 resolved, 1 kill-pending"
     """
-    row = db.execute(sa_text("""
+    county_clause = "WHERE county_id = :county_id" if county_id else ""
+    row = db.execute(sa_text(f"""
         SELECT
             COUNT(*) FILTER (WHERE severity='red'    AND breach_resolved IS NULL) AS red_open,
             COUNT(*) FILTER (WHERE severity='yellow' AND breach_resolved IS NULL) AS yellow_open,
@@ -288,7 +300,8 @@ def _format_cora_incidents_weekly_summary(db: Session) -> str | None:
             COUNT(*) FILTER (WHERE action_taken='feature_killed'
                               AND created_at >= NOW() - INTERVAL '7 days')        AS kill_pending_7d
         FROM cora_incident
-    """)).first()
+        {county_clause}
+    """), {"county_id": county_id} if county_id else {}).first()
     if row is None:
         return None
     total = (row.red_open or 0) + (row.yellow_open or 0) + (row.resolved_7d or 0) + (row.kill_pending_7d or 0)
@@ -364,19 +377,28 @@ def _chat_metrics_today(db: Session) -> dict:
         return {"sessions": 0, "intent_detected": 0, "payment_triggered": 0}
 
 
-def _kill_switch_status(db: Session) -> dict:
-    avg_score = db.execute(
-        select(func.avg(UserSegment.revenue_signal_score))
-    ).scalar_one_or_none() or 0
+def _kill_switch_status(db: Session, county_id: str | None = None) -> dict:
+    score_q = select(func.avg(UserSegment.revenue_signal_score))
+    if county_id:
+        score_q = score_q.join(Subscriber, Subscriber.id == UserSegment.subscriber_id).where(
+            Subscriber.county_id == county_id
+        )
+    avg_score = db.execute(score_q).scalar_one_or_none() or 0
+
+    def _sub_where(*extra):
+        clauses = list(extra)
+        if county_id:
+            clauses.append(Subscriber.county_id == county_id)
+        return clauses
 
     total = db.execute(
         select(func.count(Subscriber.id))
-        .where(Subscriber.status.in_(["active", "churned", "cancelled"]))
+        .where(*_sub_where(Subscriber.status.in_(["active", "churned", "cancelled"])))
     ).scalar_one_or_none() or 1
 
     churned = db.execute(
         select(func.count(Subscriber.id))
-        .where(Subscriber.status.in_(["churned", "cancelled"]))
+        .where(*_sub_where(Subscriber.status.in_(["churned", "cancelled"])))
     ).scalar_one_or_none() or 0
 
     churn_pct = (churned / total) * 100
@@ -438,11 +460,19 @@ def _send_sms(message: str) -> bool:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    # --county hillsborough  (optional, defaults to global)
+    _county = None
+    if "--county" in sys.argv:
+        idx = sys.argv.index("--county")
+        if idx + 1 < len(sys.argv):
+            _county = sys.argv[idx + 1]
+
     if "--daily" in sys.argv:
-        result = run_daily_pulse(dry_run="--dry-run" in sys.argv)
+        result = run_daily_pulse(dry_run="--dry-run" in sys.argv, county_id=_county)
     elif "--weekly" in sys.argv:
-        result = run_weekly_pulse(dry_run="--dry-run" in sys.argv)
+        result = run_weekly_pulse(dry_run="--dry-run" in sys.argv, county_id=_county)
     else:
-        print("Usage: python -m src.tasks.revenue_pulse [--daily|--weekly] [--dry-run]")
+        print("Usage: python -m src.tasks.revenue_pulse [--daily|--weekly] [--dry-run] [--county <county_id>]")
         sys.exit(1)
     print(result)

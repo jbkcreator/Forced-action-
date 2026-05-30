@@ -154,6 +154,20 @@ COUNTY_ID=hillsborough
 # haven't opted in yet.
 30 * * * * $PROJECT/scripts/cron/run.sh src.tasks.cora_self_healing
 
+# Stage 10 — Variant Mutation Job (fa055) — every hour at :45 (15 min after self-healing).
+# Runs sigma rollback check, proving-cycle evaluation, and slot retirement/replacement
+# loop for all active message_variant_tests. Also checks rollback triggers for all
+# active pricing_cohorts. Reuses CORA_SELF_HEALING_ENABLED gate — no-op when disabled.
+# Max 3 actions per run (shared guardrail with cora_self_healing).
+45 * * * * $PROJECT/scripts/cron/run.sh src.tasks.variant_mutation_job
+
+# Stage 10 — Alert Rules Check (fa055) — every 15 min.
+# Evaluates the same conditions as deploy/prometheus/alert_rules.yml but via cron,
+# so self-healing fires correctly even without a running Prometheus/Alertmanager stack.
+# Actions: variant_engine.promote_winner, sigma_rollback, cora_self_healing steps.
+# Gated by CORA_SELF_HEALING_ENABLED. Idempotent — no duplicate actions within breach.
+*/15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.alert_rules_check
+
 # ── CDS SCORING ──────────────────────────────────────────────
 # CDS Scoring Engine         — 07:00 AM UTC Mon-Sat (after all scrapers complete)
 0 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.services.cds_engine --rescore-new-signals
@@ -214,8 +228,8 @@ COUNTY_ID=hillsborough
 # ── DAILY DASHBOARD PDF ──────────────────────────────────────
 # 10-section executive PDF — 10:00 AM UTC Mon-Sat (after daily_report at 09:30)
 # Writes reports/daily_dashboard/YYYY-MM-DD_forced_action_daily_dashboard.pdf
-# 30-day retention; email delivery wired via render_html() in future
-0 10 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.daily_dashboard
+# 30-day retention; emails PDF to REPORT_RECIPIENTS (comma-separated in .env)
+0 10 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.daily_dashboard --send
 
 # ── HEALTH CHECK — every 4 hours (logs to separate file for monitoring)
 0 2,6,10,14,18,22 * * * $PROJECT/scripts/cron/run.sh src.tasks.health_check
@@ -241,7 +255,7 @@ COUNTY_ID=hillsborough
 # ZIP Booster / Monthly Reload bundles to wallet subscribers (with A/B pricing)
 0 * * * * $PROJECT/scripts/cron/run.sh src.tasks.bundle_dispatcher
 
-# Auto Mode follow-up — every 30 min, fires VM drop on Auto Mode SMS that
+# Auto Mode follow-up — every 30 min, fires VM drop on Auto Mode SMS thatF
 # went 24h+ without a reply (tags GHL contact for Synthflow workflow).
 */30 * * * * $PROJECT/scripts/cron/run.sh src.tasks.auto_mode_followup
 
@@ -264,7 +278,6 @@ COUNTY_ID=hillsborough
 # daily vendor cost report, and hands a summary to Revenue Pulse. Dry-run at 06:30
 # pre-validates aggregation; the 07:00 run (after CDS scoring) is the live cycle,
 # scheduled before Revenue Pulse at 07:30 so its summary is available.
-30 6 * * * $PROJECT/scripts/cron/run.sh src.tasks.vendor_cost_monitor --dry-run
 0 7 * * * $PROJECT/scripts/cron/run.sh src.tasks.vendor_cost_monitor
 
 # Revenue Pulse — daily founder SMS at 07:30 UTC (lead count, wallet actives, top deal/alert, kill switch).
@@ -380,5 +393,14 @@ COUNTY_ID=hillsborough
 # County Live Reactivation — every 5 min. Fires waitlist notifications
 # for newly-launched counties (coming_soon entries).
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.county_live_reactivation
+
+# County Waitlist Notifier — T+0. Fires within 15min of launch.
+# Sends SMS + email to all coming_soon waitlist entries for newly launched counties.
+# Idempotent: stamps waitlist_notified_at on expansion_candidates when fully clean.
+*/15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.county_waitlist_notifier
+
+# County Launch T+24 Pulse — fires within 15min after 24h post-launch.
+# One-time per county (revenue_pulse_sent_at guard). Reuses run_daily_pulse.
+*/15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.county_launch_pulse
 
 # === END FORCED-ACTION-PLATFORM ===

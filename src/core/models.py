@@ -1609,6 +1609,10 @@ class CoraIncident(Base):
     action_details: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     decision_id: Mapped[Optional[str]] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
 
+    # Human-readable root cause for the breach (fa050). Nullable; the daily
+    # dashboard derives a fallback from metric_name/county_id when unset.
+    root_cause: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False,
     )
@@ -2132,6 +2136,9 @@ class DealOutcome(Base):
     lead_source: Mapped[Optional[str]] = mapped_column(String(50))  # which signal drove the lead
     days_to_close: Mapped[Optional[int]] = mapped_column(Integer)
     pipeline_stage: Mapped[Optional[str]] = mapped_column(String(30))  # lead / contacted / qualified / proposal / negotiation / closed_won / closed_lost
+    # fa056 — Stage 10 pricing cohort activation gate columns
+    county_id: Mapped[Optional[str]] = mapped_column(String(50))
+    trade_vertical: Mapped[Optional[str]] = mapped_column(String(50))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     __table_args__ = (
@@ -2145,6 +2152,7 @@ class DealOutcome(Base):
             name="check_deal_pipeline_stage",
         ),
         Index("idx_deal_outcome_pipeline_stage", "pipeline_stage"),
+        Index("idx_deal_outcomes_county_vertical", "county_id", "trade_vertical"),
     )
 
     def __repr__(self):
@@ -3312,6 +3320,8 @@ class ExpansionCandidate(Base):
     approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     approved_by_slack_user: Mapped[Optional[str]] = mapped_column(String(32))
     launched_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    waitlist_notified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    revenue_pulse_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         CheckConstraint(
@@ -3342,7 +3352,8 @@ class CountyLaunchAudit(Base):
     __table_args__ = (
         CheckConstraint(
             "event_type IN ('evaluated','posted','approved','rejected','launch_started',"
-            "'launch_aborted_gate_red','launched','cooldown_skipped')",
+            "'launch_aborted_gate_red','launched','cooldown_skipped',"
+            "'waitlist_notified','revenue_pulse_sent')",
             name="ck_county_launch_audit_event",
         ),
         Index("ix_county_launch_audit_county_time", "county_id", "created_at"),
@@ -3612,3 +3623,158 @@ class DealPipelineEvent(Base):
 
     def __repr__(self) -> str:
         return f"<DealPipelineEvent(deal={self.deal_id}, {self.from_stage}->{self.to_stage})>"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Stage 10: 3-Variant A/B + Pricing Cohorts (fa055)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class MessageVariantTest(Base):
+    """3-slot (a/b/c) variant test per named message sequence (fa055).
+
+    Tracks send counts, conversion counts, slot retirement state, and the
+    proving-cycle pointer for the replacement variant. All runtime reads/
+    writes go through raw SQL in variant_engine.py — this declaration keeps
+    Alembic autogenerate consistent with the live schema.
+    """
+    __tablename__ = "message_variant_tests"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    sequence_name: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
+    segment: Mapped[Optional[str]] = mapped_column(String(50))
+    traffic_pct: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
+
+    slot_a_body: Mapped[str] = mapped_column(Text, nullable=False)
+    slot_a_sends: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    slot_a_conversions: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    slot_a_replies: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    slot_a_status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
+    slot_a_retired_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    slot_b_body: Mapped[str] = mapped_column(Text, nullable=False)
+    slot_b_sends: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    slot_b_conversions: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    slot_b_replies: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    slot_b_status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
+    slot_b_retired_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    slot_c_body: Mapped[str] = mapped_column(Text, nullable=False)
+    slot_c_sends: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    slot_c_conversions: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    slot_c_replies: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    slot_c_status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
+    slot_c_retired_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    proving_slot: Mapped[Optional[str]] = mapped_column(String(5))
+    proving_baseline_conv_rate: Mapped[Optional[float]] = mapped_column(Numeric(8, 6))
+    proving_started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint("status IN ('active','paused','completed')", name="check_mvt_status"),
+        CheckConstraint("traffic_pct BETWEEN 1 AND 10", name="check_mvt_traffic_cap"),
+        CheckConstraint(
+            "slot_a_status IN ('active','retired') AND "
+            "slot_b_status IN ('active','retired') AND "
+            "slot_c_status IN ('active','retired')",
+            name="check_mvt_slot_statuses",
+        ),
+        CheckConstraint(
+            "proving_slot IS NULL OR proving_slot IN ('a','b','c')",
+            name="check_mvt_proving_slot",
+        ),
+        Index("idx_mvt_status", "status"),
+        Index("idx_mvt_sequence_name", "sequence_name"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<MessageVariantTest(seq={self.sequence_name}, status={self.status})>"
+
+
+class VariantRetirementLog(Base):
+    """Idempotent audit record for every slot retirement, replacement, or reversion (fa055).
+
+    idempotency_key UNIQUE ensures retries never produce duplicate rows.
+    """
+    __tablename__ = "variant_retirement_log"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    test_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("message_variant_tests.id", ondelete="CASCADE"), nullable=False
+    )
+    action: Mapped[str] = mapped_column(String(30), nullable=False)
+    slot: Mapped[str] = mapped_column(String(5), nullable=False)
+    old_body: Mapped[Optional[str]] = mapped_column(Text)
+    new_body: Mapped[Optional[str]] = mapped_column(Text)
+    old_conversion_rate: Mapped[Optional[float]] = mapped_column(Numeric(8, 6))
+    new_conversion_rate: Mapped[Optional[float]] = mapped_column(Numeric(8, 6))
+    reason: Mapped[Optional[str]] = mapped_column(Text)
+    idempotency_key: Mapped[str] = mapped_column(String(120), nullable=False, unique=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "action IN ('retired','replaced','reverted','promoted','rollback')",
+            name="check_vrl_action",
+        ),
+        CheckConstraint("slot IN ('a','b','c')", name="check_vrl_slot"),
+        Index("idx_vrl_test_id", "test_id"),
+        Index("idx_vrl_idempotency_key", "idempotency_key"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<VariantRetirementLog(test={self.test_id}, slot={self.slot}, action={self.action})>"
+
+
+class PricingCohort(Base):
+    """Per-trade, per-county pricing override (fa055).
+
+    Activates only after >= 6 weeks of deal data and within guardrail bounds.
+    At most one active row per (county_id, trade_vertical, price_type) tuple,
+    enforced by partial unique index idx_pc_active_unique.
+    """
+    __tablename__ = "pricing_cohorts"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    trade_vertical: Mapped[str] = mapped_column(String(50), nullable=False)
+    price_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    base_price_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    adjusted_price_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    adjustment_pct: Mapped[float] = mapped_column(Numeric(6, 2), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    activation_reason: Mapped[Optional[str]] = mapped_column(Text)
+    rollback_reason: Mapped[Optional[str]] = mapped_column(Text)
+    deal_weeks: Mapped[Optional[int]] = mapped_column(Integer)
+    deal_count: Mapped[Optional[int]] = mapped_column(Integer)
+    activated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    rolled_back_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint("status IN ('pending','active','rolled_back')", name="check_pc_status"),
+        CheckConstraint("adjustment_pct BETWEEN -25 AND 25", name="check_pc_adjustment_bounds"),
+        Index("idx_pc_county_vertical_type", "county_id", "trade_vertical", "price_type"),
+        Index("idx_pc_status", "status"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<PricingCohort(county={self.county_id}, vertical={self.trade_vertical}, "
+            f"type={self.price_type}, adj={self.adjustment_pct}%, status={self.status})>"
+        )

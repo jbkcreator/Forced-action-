@@ -253,6 +253,12 @@ class AppSettings(BaseSettings):
 	# Set False in dev/staging to send SMS at any hour during testing.
 	sms_quiet_hours_enabled: bool = Field(default=True, env="SMS_QUIET_HOURS_ENABLED")
 
+	# Human review of Cora outbound SMS. OFF by default — Cora's messages send
+	# immediately. This is only the *baseline*; operators flip the switch at
+	# runtime via the admin queue (Redis override, see services/cora_review_switch).
+	# When ON, marketing sends are held as pending_review for manual approve/cancel.
+	cora_human_review_enabled: bool = Field(default=False, env="CORA_HUMAN_REVIEW_ENABLED")
+
 	# NWS Weather / Storm Pack (fa018)
 	# nws_weather_enabled      — master kill switch for entire NWS subsystem
 	# nws_revenue_polling_enabled — controls whether poller triggers storm pack / Cora
@@ -342,6 +348,16 @@ class AppSettings(BaseSettings):
 	# falls back to email.send_alert (same path as heartbeat_monitor /
 	# anomaly_pager). Slack-disabled is NEVER a silent failure.
 	cora_incident_slack_channel: Optional[str] = Field(default=None, env="CORA_INCIDENT_SLACK_CHANNEL")
+
+	# Stage 10 — Prometheus metrics exposition (fa055).
+	# When true, GET /metrics returns Prometheus text format with kill-switch
+	# business metrics and variant slot performance.
+	prometheus_enabled: bool = Field(default=False, env="PROMETHEUS_ENABLED")
+	# Shared secret for Alertmanager → /webhooks/alerts/prometheus.
+	# When unset the endpoint is open (acceptable for internal-only deploys).
+	prometheus_alert_webhook_secret: Optional[str] = Field(
+		default=None, env="PROMETHEUS_ALERT_WEBHOOK_SECRET"
+	)
 
 
 @lru_cache
