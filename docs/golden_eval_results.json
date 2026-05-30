@@ -1,0 +1,109 @@
+{
+  "sms_copy": {
+    "task_type": "sms_copy",
+    "total_cases": 3,
+    "haiku_wins": 1,
+    "sonnet_wins": 2,
+    "recommendation": "sonnet",
+    "results": [
+      {
+        "case_id": "sms_copy_000",
+        "task_type": "sms_copy",
+        "graph_name": "fomo",
+        "haiku_score": 60.0,
+        "sonnet_score": 70.0,
+        "verdict": "upgrade_to_sonnet",
+        "haiku_text": "# Tampa Distressed Property Alert\n\nHere's an urgent but professional SMS:\n\n---\n\n**Option 1 (Short & ...",
+        "sonnet_text": "Here's a clean, effective SMS for a distressed property lead:\n\n---\n\n**\ud83c\udfe0 New Lead Alert \u2013 Tampa**\n\nDi..."
+      },
+      {
+        "case_id": "sms_copy_001",
+        "task_type": "sms_copy",
+        "graph_name": "abandonment",
+        "haiku_score": 70.0,
+        "sonnet_score": 60.0,
+        "verdict": "haiku_sufficient",
+        "haiku_text": "# SMS for Inactive Subscriber\n\n**Option 1 (Direct & Urgent):**\n\"Hi [Name]! Your [Territory] lock exp...",
+        "sonnet_text": "Here's an effective re-engagement SMS:\n\n---\n\n**SMS Draft:**\n\n\"Hi [Name]! \ud83d\udc4b Your exclusive territory ..."
+      },
+      {
+        "case_id": "sms_copy_002",
+        "task_type": "sms_copy",
+        "graph_name": "retention",
+        "haiku_score": 60.0,
+        "sonnet_score": 75.0,
+        "verdict": "upgrade_to_sonnet",
+        "haiku_text": "# Retention SMS - Payment Failed\n\n**Option 1 (Direct & Urgent):**\n\"Hi [Name]! Your payment didn't go...",
+        "sonnet_text": "# Retention SMS - Failed Payment / Data-Only Downgrade Offer\n\n---\n\n**SMS Copy:**\n\n> Hi [First Name]!..."
+      }
+    ]
+  },
+  "email_copy": {
+    "task_type": "email_copy",
+    "total_cases": 2,
+    "haiku_wins": 1,
+    "sonnet_wins": 1,
+    "recommendation": "haiku",
+    "results": [
+      {
+        "case_id": "email_copy_000",
+        "task_type": "email_copy",
+        "graph_name": "proactive_save",
+        "haiku_score": 75.0,
+        "sonnet_score": 60.0,
+        "verdict": "haiku_sufficient",
+        "haiku_text": "# Email: Re-Engagement Campaign\n\n**Subject Line:**\nWe Miss You! Exclusive Data-Only Plan Just $97/Mo...",
+        "sonnet_text": "# Email Subject & Body\n\n---\n\n**SUBJECT:** We saved something for you, [First Name] \ud83d\udc40\n\n---\n\n**Hi [Fir..."
+      },
+      {
+        "case_id": "email_copy_001",
+        "task_type": "email_copy",
+        "graph_name": "stripe_recovery",
+        "haiku_score": 75.0,
+        "sonnet_score": 85.0,
+        "verdict": "upgrade_to_sonnet",
+        "haiku_text": "# Email: Payment Issue - Action Needed\n\n**Subject:** Your Subscription Payment Failed \u2013 Quick Fix Ne...",
+        "sonnet_text": "# Email Subject & Body\n\n---\n\n**Subject:** Action Required: Update Your Payment to Restore Access \u26a0\ufe0f\n..."
+      }
+    ]
+  },
+  "chat_response": {
+    "task_type": "chat_response",
+    "total_cases": 3,
+    "haiku_wins": 1,
+    "sonnet_wins": 2,
+    "recommendation": "sonnet",
+    "results": [
+      {
+        "case_id": "chat_response_000",
+        "task_type": "chat_response",
+        "graph_name": "concierge_chat",
+        "haiku_score": 75.0,
+        "sonnet_score": 75.0,
+        "verdict": "haiku_sufficient",
+        "haiku_text": "I'd be happy to help! To check if we cover your ZIP code, could you let me know which ZIP code you'r...",
+        "sonnet_text": "Great question! I'd love to help you check on that. **Could you share your ZIP code?** I can let you..."
+      },
+      {
+        "case_id": "chat_response_001",
+        "task_type": "chat_response",
+        "graph_name": "concierge_chat",
+        "haiku_score": 70.0,
+        "sonnet_score": 85.0,
+        "verdict": "upgrade_to_sonnet",
+        "haiku_text": "Our plans start at **$297/month**! \n\nThe exact cost depends on which vertical and ZIP territory you'...",
+        "sonnet_text": "Plans start at **$297/month**! \ud83c\udf89\n\nThe exact pricing can vary depending on the vertical and ZIP terri..."
+      },
+      {
+        "case_id": "chat_response_002",
+        "task_type": "chat_response",
+        "graph_name": "concierge_chat",
+        "haiku_score": 70.0,
+        "sonnet_score": 75.0,
+        "verdict": "upgrade_to_sonnet",
+        "haiku_text": "Hey! We deliver distressed-property leads directly to you in Hillsborough County, FL. Here's how it ...",
+        "sonnet_text": "Great question! **Forced Action** is a lead delivery service specializing in **distressed property l..."
+      }
+    ]
+  }
+}

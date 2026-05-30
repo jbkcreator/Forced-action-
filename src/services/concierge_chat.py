@@ -187,6 +187,8 @@ def handle_user_turn(
             system=system,
             cache_system=True,
             max_tokens=MAX_OUTPUT_TOKENS,
+            db=db,
+            graph_name="concierge_chat",
         )
     except Exception as exc:
         logger.error("chat: Claude call failed session=%s: %s", session_id, exc)

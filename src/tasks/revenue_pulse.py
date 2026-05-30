@@ -38,6 +38,7 @@ from src.core.models import (
     WalletBalance,
 )
 from src.services.vendor_cost_report import build_vendor_cost_summary, format_sms_cost_summary
+from src.services.claude_savings_report import format_savings_sms
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +114,7 @@ def _compose_daily(db: Session) -> str:
 
     kill = _kill_switch_status(db)
     chat = _chat_metrics_today(db)
+    claude_savings = _claude_savings_summary(db)
 
     # Vendor cost summary line (Phase 3)
     vendor_cost_line = ""
@@ -139,6 +141,8 @@ def _compose_daily(db: Session) -> str:
             f"{chat['intent_detected']}int "
             f"{chat['payment_triggered']}paid"
         )
+    if claude_savings:
+        msg += f"\n{claude_savings}"
     return msg
 
 
@@ -381,6 +385,17 @@ def _kill_switch_status(db: Session) -> dict:
         if float(avg_score) >= level["min_avg_revenue_score"] and churn_pct <= level["max_churn_rate_pct"]:
             return {"status": level["status"], "label": level["label"]}
     return {"status": "RED", "label": "investigate"}
+
+
+def _claude_savings_summary(db: Session) -> str:
+    """Return Claude savings summary for daily pulse."""
+    try:
+        from src.services.claude_savings_report import compute_savings_report
+        report = compute_savings_report(db, since_hours=24)
+        return format_savings_sms(report)
+    except Exception as exc:
+        logger.warning("[RevenuePulse] Claude savings report failed: %s", exc)
+        return ""
 
 
 def _send_sms(message: str) -> bool:

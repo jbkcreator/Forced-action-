@@ -47,7 +47,7 @@ def run_proactive_save(dry_run: bool = False) -> dict:
                 if trigger:
                     results["at_risk"] += 1
                     if not dry_run:
-                        if _send_save_offer(sub, trigger):
+                        if _send_save_offer(sub, trigger, db):
                             results["offers_sent"] += 1
             except Exception as exc:
                 logger.error("Proactive save failed for subscriber %d: %s", sub.id, exc)
@@ -106,7 +106,7 @@ def _parse_email(text: str) -> tuple[str, str]:
     return subject, body
 
 
-def _send_save_offer(sub: Subscriber, trigger: str) -> bool:
+def _send_save_offer(sub: Subscriber, trigger: str, db) -> bool:
     """Send Data-Only save offer email. Returns True if sent."""
     if not sub.email:
         return False
@@ -135,6 +135,7 @@ def _send_save_offer(sub: Subscriber, trigger: str) -> bool:
             system=system_prompt,
             max_tokens=800,
             subscriber_id=sub.id,
+            db=db,
         )
         subject, body_text = _parse_email(result["text"])
     except Exception as exc:

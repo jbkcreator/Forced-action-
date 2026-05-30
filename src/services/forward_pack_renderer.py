@@ -79,7 +79,7 @@ def render_weekly(db: Session) -> dict[str, str]:
     Idempotent: re-running on the same Monday is a no-op (UNIQUE(vertical, week_start)).
     Returns a dict mapping vertical → generated body.
     """
-    from src.services.claude_router import call_claude
+    from src.core.database import Database
 
     week_start = _current_week_start()
     results: dict[str, str] = {}
@@ -100,12 +100,16 @@ def render_weekly(db: Session) -> dict[str, str]:
                         "professional tone, no greeting words, no slang, no emojis, no hashtags, "
                         "between 90 and 160 characters, complete sentence ending with '.', '?' or '!'."
                     )
-                raw = call_claude(
-                    task_type="sms_copy",
-                    messages=[{"role": "user", "content": user_msg}],
-                    system=system_prompt,
-                    max_tokens=200,
-                )
+                with Database().session_scope() as session:
+                    raw = call_claude(
+                        task_type="sms_copy",
+                        messages=[{"role": "user", "content": user_msg}],
+                        system=system_prompt,
+                        max_tokens=200,
+                        graph_name="forward_pack",
+                        pause_target="compose",
+                        db=session,
+                    )
                 candidate = (raw or "").strip().strip('"').strip("'")
                 ok, reject_reason = _validate_body(candidate)
                 if ok:

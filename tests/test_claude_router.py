@@ -29,6 +29,21 @@ from src.services.claude_router import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _disable_langsmith_wrap(monkeypatch):
+    """
+    These are offline tests that mock the Anthropic SDK. The LangSmith
+    wrap_anthropic instrumentation in _build_client() would otherwise rebind
+    the mocked messages.create (it fires whenever LANGSMITH_TRACING=true in
+    .env), breaking call_args assertions. Tracing is exercised separately by
+    the live smoke test, not here.
+    """
+    monkeypatch.setattr(
+        "src.agents.observability.langsmith.configure_tracing",
+        lambda: False,
+    )
+
+
 # ============================================================================
 # Helpers
 # ============================================================================
@@ -318,11 +333,15 @@ class TestCallClaudeBatchUnit:
 
 class TestApiUsageLogIntegration:
     def test_log_usage_persists_to_db(self, fresh_db):
+        from sqlalchemy import delete
+        fresh_db.execute(delete(ApiUsageLog))
+        fresh_db.flush()
+        
         response = _make_response(input_tokens=500, output_tokens=200)
-        _log_usage(response, "haiku", "sms_copy", subscriber_id=None, db=fresh_db)
+        _log_usage(response, "haiku", "sms_copy_unique_1", subscriber_id=1, db=fresh_db)
         fresh_db.flush()
         row = fresh_db.execute(
-            select(ApiUsageLog).where(ApiUsageLog.task_type == "sms_copy")
+            select(ApiUsageLog).where(ApiUsageLog.task_type == "sms_copy_unique_1")
         ).scalar_one_or_none()
         assert row is not None
         assert row.service == "claude"
@@ -332,27 +351,41 @@ class TestApiUsageLogIntegration:
         assert float(row.cost_usd) > 0
 
     def test_cost_stored_with_precision(self, fresh_db):
+        from sqlalchemy import delete
+        fresh_db.execute(delete(ApiUsageLog))
+        fresh_db.flush()
+        
         response = _make_response(input_tokens=1234, output_tokens=567)
-        _log_usage(response, "sonnet", "lead_analysis", subscriber_id=None, db=fresh_db)
+        _log_usage(response, "sonnet", "lead_analysis_unique", subscriber_id=None, db=fresh_db)
         fresh_db.flush()
         row = fresh_db.execute(
-            select(ApiUsageLog).where(ApiUsageLog.task_type == "lead_analysis")
+            select(ApiUsageLog).where(ApiUsageLog.task_type == "lead_analysis_unique")
         ).scalar_one_or_none()
         assert row is not None
         expected = (1234 * 3.00 + 567 * 15.00) / 1_000_000
         assert abs(float(row.cost_usd) - expected) < 0.000001
 
     def test_multiple_calls_create_multiple_rows(self, fresh_db):
+        from sqlalchemy import delete
+        fresh_db.execute(delete(ApiUsageLog))
+        fresh_db.flush()
+        
         response = _make_response()
-        _log_usage(response, "haiku", "classification", subscriber_id=None, db=fresh_db)
-        _log_usage(response, "haiku", "classification", subscriber_id=None, db=fresh_db)
+        _log_usage(response, "haiku", "classification_unique_a", subscriber_id=None, db=fresh_db)
+        _log_usage(response, "haiku", "classification_unique_b", subscriber_id=None, db=fresh_db)
         fresh_db.flush()
         rows = fresh_db.execute(
-            select(ApiUsageLog).where(ApiUsageLog.task_type == "classification")
+            select(ApiUsageLog).where(
+                ApiUsageLog.task_type.in_(["classification_unique_a", "classification_unique_b"])
+            )
         ).scalars().all()
         assert len(rows) == 2
 
     def test_subscriber_id_stored(self, fresh_db):
+        from sqlalchemy import delete
+        fresh_db.execute(delete(ApiUsageLog))
+        fresh_db.flush()
+        
         sub = Subscriber(
             stripe_customer_id="cus_router_test",
             tier="starter",
@@ -367,10 +400,10 @@ class TestApiUsageLogIntegration:
         fresh_db.flush()
 
         response = _make_response()
-        _log_usage(response, "sonnet", "retention_copy", subscriber_id=sub.id, db=fresh_db)
+        _log_usage(response, "sonnet", "retention_copy_unique_test", subscriber_id=sub.id, db=fresh_db)
         fresh_db.flush()
         row = fresh_db.execute(
-            select(ApiUsageLog).where(ApiUsageLog.task_type == "retention_copy")
+            select(ApiUsageLog).where(ApiUsageLog.task_type == "retention_copy_unique_test")
         ).scalar_one_or_none()
         assert row is not None
         assert row.subscriber_id == sub.id
@@ -457,6 +490,74 @@ class TestCallClaudePauseBlocking:
             )
 
         assert result == "hello"
+
+
+class TestForceTierOverride:
+    """force_tier parameter overrides task-based routing."""
+
+    def _mock_settings(self, m):
+        m.anthropic_api_key.get_secret_value.return_value = "sk-test"
+        m.claude_haiku_model = "claude-haiku-4-5-20251001"
+        m.claude_sonnet_model = "claude-sonnet-4-6"
+        m.claude_opus_model = "claude-opus-4-7"
+
+    @pytest.mark.parametrize("task_type,force_tier,expected_model", [
+        ("sms_copy", "sonnet", "claude-sonnet-4-6"),
+        ("sms_copy", "opus", "claude-opus-4-7"),
+        ("conversational_close", "haiku", "claude-haiku-4-5-20251001"),
+        ("complex_reasoning", "haiku", "claude-haiku-4-5-20251001"),
+    ])
+    def test_force_tier_overrides_routing(self, task_type, force_tier, expected_model):
+        response = _make_response()
+        with patch("src.services.claude_router.Anthropic") as mock_anthropic:
+            mock_anthropic.return_value.messages.create.return_value = response
+            with patch("src.services.claude_router.settings") as mock_settings:
+                self._mock_settings(mock_settings)
+                call_claude(task_type, [{"role": "user", "content": "hi"}], force_tier=force_tier)
+        kwargs = mock_anthropic.return_value.messages.create.call_args[1]
+        assert kwargs["model"] == expected_model
+
+    def test_no_force_tier_uses_task_routing(self):
+        response = _make_response()
+        with patch("src.services.claude_router.Anthropic") as mock_anthropic:
+            mock_anthropic.return_value.messages.create.return_value = response
+            with patch("src.services.claude_router.settings") as mock_settings:
+                mock_settings.anthropic_api_key.get_secret_value.return_value = "sk-test"
+                mock_settings.claude_haiku_model = "claude-haiku-4-5-20251001"
+                mock_settings.claude_sonnet_model = "claude-sonnet-4-6"
+                mock_settings.claude_opus_model = "claude-opus-4-7"
+                call_claude("sms_copy", [{"role": "user", "content": "hi"}])
+        kwargs = mock_anthropic.return_value.messages.create.call_args[1]
+        assert kwargs["model"] == "claude-haiku-4-5-20251001"
+
+    def test_invalid_force_tier_falls_back_to_sonnet(self):
+        response = _make_response()
+        with patch("src.services.claude_router.Anthropic") as mock_anthropic:
+            mock_anthropic.return_value.messages.create.return_value = response
+            with patch("src.services.claude_router.settings") as mock_settings:
+                mock_settings.anthropic_api_key.get_secret_value.return_value = "sk-test"
+                mock_settings.claude_haiku_model = "claude-haiku-4-5-20251001"
+                mock_settings.claude_sonnet_model = "claude-sonnet-4-6"
+                mock_settings.claude_opus_model = "claude-opus-4-7"
+                call_claude("sms_copy", [{"role": "user", "content": "hi"}], force_tier="invalid")
+        kwargs = mock_anthropic.return_value.messages.create.call_args[1]
+        assert kwargs["model"] == "claude-sonnet-4-6"
+
+    def test_force_tier_in_call_claude_with_usage(self):
+        response = _make_response()
+        with patch("src.services.claude_router.Anthropic") as mock_anthropic:
+            mock_anthropic.return_value.messages.create.return_value = response
+            with patch("src.services.claude_router.settings") as mock_settings:
+                self._mock_settings(mock_settings)
+                from src.services.claude_router import call_claude_with_usage
+                result = call_claude_with_usage(
+                    "sms_copy",
+                    [{"role": "user", "content": "hi"}],
+                    force_tier="sonnet",
+                )
+        kwargs = mock_anthropic.return_value.messages.create.call_args[1]
+        assert kwargs["model"] == "claude-sonnet-4-6"
+        assert result["model"] == "sonnet"
 
     def test_blocked_log_row_has_blocked_by_pause_true(self, fresh_db):
         """Integration: blocked call writes ApiUsageLog row with blocked_by_pause=True."""

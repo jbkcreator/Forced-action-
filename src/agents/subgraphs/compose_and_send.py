@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 from src.agents.tools.gating_tools import budget_check, compliance_check
 from src.agents.tools.write_tools import log_decision, send_sms
-from src.core.database import get_db_context
+from src.core.database import Database
 from src.services.claude_router import call_claude_with_usage
 
 
@@ -39,6 +39,7 @@ class ComposeAndSendState(TypedDict, total=False):
 	graph_name: str                # e.g. 'fomo', 'abandonment', 'retention'
 	subscriber_id: int
 	campaign: str                  # short id — used for idempotency in send_sms
+	pause_target: Optional[str]    # e.g. 'compose', 'claude'
 
 	# ── Compose inputs ───────────────────────────────────────────────────────
 	claude_task_type: str          # routes model tier (haiku/sonnet/opus)
@@ -46,6 +47,7 @@ class ComposeAndSendState(TypedDict, total=False):
 	user_prompt: str               # the specific ask ("write the SMS")
 	cache_system: bool             # prompt caching hint
 	max_output_tokens: int         # default 160 words ≈ 240 tokens
+	force_tier: Optional[str]      # override routing — "haiku", "sonnet", or "opus"
 
 	# ── Optional inputs ──────────────────────────────────────────────────────
 	variant_id: Optional[str]      # A/B variant attribution
@@ -115,7 +117,7 @@ def _node_compose(state: ComposeAndSendState) -> ComposeAndSendState:
 	messages: List[Dict[str, Any]] = [{"role": "user", "content": user}]
 
 	try:
-		with get_db_context() as _db:
+		with Database().session_scope() as session:
 			result = call_claude_with_usage(
 				task_type=task_type,
 				messages=messages,
@@ -124,7 +126,9 @@ def _node_compose(state: ComposeAndSendState) -> ComposeAndSendState:
 				max_tokens=max_tokens,
 				subscriber_id=state.get("subscriber_id"),
 				graph_name=state.get("graph_name"),
-				db=_db,
+				pause_target=state.get("pause_target"),
+				force_tier=state.get("force_tier"),
+				db=session,
 			)
 	except Exception as exc:
 		# API timeout or error — use static fallback body if available rather
@@ -143,6 +147,20 @@ def _node_compose(state: ComposeAndSendState) -> ComposeAndSendState:
 		return {
 			"terminal_status": "failed",
 			"failure_reason": f"compose:{type(exc).__name__}:{exc}",
+		}
+
+	# Vendor cost pause active — never send "[BLOCKED]…" as SMS body.
+	if result["text"].startswith("[BLOCKED]"):
+		fallback = state.get("ab_fallback_body")
+		if fallback:
+			return {
+				"message_body": fallback,
+				"tokens_used": int(state.get("tokens_used", 0) or 0),
+				"cost_usd": float(state.get("cost_usd", 0.0) or 0.0),
+			}
+		return {
+			"terminal_status": "aborted",
+			"failure_reason": "compose:vendor_pause",
 		}
 
 	return {

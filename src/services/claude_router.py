@@ -17,6 +17,11 @@ Prompt caching:
     Pass cache=True on any system prompt that is reused across many calls
     (e.g. Cora persona prompt, ZIP stats context). Anthropic caches blocks
     >= 1024 tokens for 5 minutes; cache hits cost ~10% of normal input price.
+
+LangSmith Tracing:
+    Set LANGSMITH_API_KEY, LANGSMITH_PROJECT, LANGSMITH_TRACING=true to enable.
+    The LangSmith SDK automatically traces LangGraph runs. For raw Anthropic SDK
+    calls, use langsmith.wrappers.wrap_anthropic() or @traceable decorator.
 """
 
 import logging
@@ -76,6 +81,7 @@ def call_claude(
     graph_name: Optional[str] = None,
     pause_target: Optional[str] = None,
     db: Optional[Session] = None,
+    force_tier: Optional[str] = None,
 ) -> str:
     """
     Route a Claude call to the appropriate model and return the text response.
@@ -89,6 +95,7 @@ def call_claude(
         max_tokens:     Max output tokens. Default 1024.
         subscriber_id:  FK to subscribers.id — stored in api_usage_logs for cost attribution.
         db:             SQLAlchemy session. If None, cost is logged but not persisted.
+        force_tier:     Override routing — "haiku", "sonnet", or "opus".
 
     Returns:
         The text content of the first response block.
@@ -96,10 +103,10 @@ def call_claude(
     Raises:
         anthropic.APIError on API failure (caller decides retry behaviour).
     """
-    model_tier = _TASK_ROUTING.get(task_type, "sonnet")
+    model_tier = force_tier or _TASK_ROUTING.get(task_type, "sonnet")
     model_id = _model_id(model_tier)
 
-    client = Anthropic(api_key=settings.anthropic_api_key.get_secret_value())
+    client = _build_client()
 
     kwargs: dict = {
         "model": model_id,
@@ -151,6 +158,7 @@ def call_claude_with_usage(
     graph_name: Optional[str] = None,
     pause_target: Optional[str] = None,
     db: Optional[Session] = None,
+    force_tier: Optional[str] = None,
 ) -> dict:
     """
     Same as call_claude() but returns a dict that includes token counts and
@@ -166,10 +174,10 @@ def call_claude_with_usage(
             'cost_usd':     float,
         }
     """
-    model_tier = _TASK_ROUTING.get(task_type, "sonnet")
+    model_tier = force_tier or _TASK_ROUTING.get(task_type, "sonnet")
     model_id = _model_id(model_tier)
 
-    client = Anthropic(api_key=settings.anthropic_api_key.get_secret_value())
+    client = _build_client()
 
     kwargs: dict = {
         "model": model_id,
@@ -265,6 +273,7 @@ def stream_claude(
     max_tokens: int = 512,
     subscriber_id: Optional[int] = None,
     db: Optional[Session] = None,
+    force_tier: Optional[str] = None,
 ):
     """
     Streaming variant of call_claude(). Yields text chunks as they arrive.
@@ -277,10 +286,10 @@ def stream_claude(
             yield chunk  # SSE chunk to client
     """
     import time as _time
-    model_tier = _TASK_ROUTING.get(task_type, "sonnet")
+    model_tier = force_tier or _TASK_ROUTING.get(task_type, "sonnet")
     model_id = _model_id(model_tier)
 
-    client = Anthropic(api_key=settings.anthropic_api_key.get_secret_value())
+    client = _build_client()
 
     kwargs: dict = {
         "model": model_id,
@@ -313,6 +322,29 @@ def stream_claude(
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
+
+
+def _build_client() -> Anthropic:
+    """
+    Build the Anthropic client, wrapping it with LangSmith's wrap_anthropic when
+    tracing is enabled so every Claude call emits an LLM run to LangSmith.
+
+    Wrapping is best-effort: if the langsmith package or wrapper is unavailable,
+    or tracing is off, we return a plain client unchanged (no behaviour change).
+    """
+    client = Anthropic(api_key=settings.anthropic_api_key.get_secret_value())
+    try:
+        from src.agents.observability.langsmith import configure_tracing
+        # configure_tracing() bridges .env -> os.environ (idempotent) AND returns
+        # True when tracing is enabled. The bridge is required: wrap_anthropic
+        # only exports runs when LANGSMITH_TRACING is in os.environ, which a bare
+        # script/API/cron entrypoint won't have unless we set it here.
+        if configure_tracing():
+            from langsmith.wrappers import wrap_anthropic
+            client = wrap_anthropic(client)
+    except Exception as exc:  # pragma: no cover — tracing must never break sends
+        logger.debug("claude_router: LangSmith wrap skipped: %s", exc)
+    return client
 
 
 def _model_id(tier: str) -> str:

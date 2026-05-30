@@ -160,6 +160,13 @@ def run_forever() -> None:
 	"""
 	import signal
 
+	# Bridge LangSmith settings (.env → os.environ) so the tracer emits to the
+	# configured project. Must run before any graph executes a Claude call.
+	from src.agents.observability.langsmith import configure_tracing
+	if configure_tracing():
+		logger.info("ingestion: LangSmith tracing enabled (project=%s)",
+		            get_agents_settings().langsmith_project)
+
 	settings = get_agents_settings()
 	stop_event = threading.Event()
 	threads = []

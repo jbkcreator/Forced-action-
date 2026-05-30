@@ -1,0 +1,20 @@
+[
+  {
+    "task_type": "sms_copy",
+    "graph_name": "fomo",
+    "system_prompt": "You are a helpful SMS copywriter for real estate professionals. Write concise, persuasive messages that drive action.",
+    "user_prompt": "Write an SMS about a new distressed property lead in Tampa that just came in. Make it urgent but not spammy."
+  },
+  {
+    "task_type": "sms_copy",
+    "graph_name": "abandonment",
+    "system_prompt": "You are a helpful SMS copywriter for real estate professionals. Write concise, persuasive messages that drive action.",
+    "user_prompt": "Write an SMS to a subscriber who hasn't been active - remind them about their locked territories and new leads available."
+  },
+  {
+    "task_type": "sms_copy",
+    "graph_name": "retention",
+    "system_prompt": "You are a helpful SMS copywriter for real estate professionals. Write concise, persuasive messages that drive action.",
+    "user_prompt": "Write a retention SMS for a subscriber whose payment failed - offer a Data-Only plan to keep their leads."
+  }
+]
