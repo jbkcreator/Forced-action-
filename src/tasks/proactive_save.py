@@ -5,30 +5,35 @@ Identifies at-risk subscribers and offers the Data-Only plan ($97/mo) to
 prevent churn.
 
 Triggers (either fires the save offer):
-  - inactivity:          5–7 days with no wallet activity
-  - payment_failure_day5: subscriber has been in grace for 5+ days
+  - churn_risk:          band ∈ {high, very_high} AND predicted_inactivity_at
+                         ≤ HORIZON_DAYS out (fa051: reads churn_scoring output)
+  - payment_failure_day5: subscriber has been in grace for 5+ days (unchanged)
 
-Cron: 0 15 * * * (15:00 UTC daily, after annual push at 14:00)
+Gates (suppress the churn_risk trigger; payment_failure_day5 bypasses them):
+  - Save Offer Holdout:  latest churn_predictions.in_holdout is True (ADR 0007)
+  - Cooldown:            save_offer_sent_at within COOLDOWN_DAYS (ADR 0008)
+
+Cron: 0 15 * * * (15:00 UTC daily; churn_scoring at 13:00 must run first)
 """
 import logging
 import sys
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from config.churn import COOLDOWN_DAYS, FIRE_BANDS, HORIZON_DAYS
 from config.revenue_ladder import DATA_ONLY_TIER
 from config.settings import settings
 from src.core.database import get_db_context
-from src.core.models import Subscriber, WalletTransaction
+from src.core.models import ChurnPrediction, Subscriber
 from src.services.claude_router import call_claude_with_usage
 from src.utils.prompt_loader import get_prompt
 
 logger = logging.getLogger(__name__)
 
-_INACTIVE_MIN = 5
-_INACTIVE_MAX = 7
+_INACTIVE_MIN = 5  # kept for reference; Trigger 1 now reads predicted_inactivity_at
 
 
 def run_proactive_save(dry_run: bool = False) -> dict:
@@ -60,30 +65,86 @@ def run_proactive_save(dry_run: bool = False) -> dict:
     return results
 
 
+def _latest_churn_prediction(sub_id: int, db: Session) -> Optional[ChurnPrediction]:
+    """Return the most recent churn_predictions row for this subscriber, or None.
+
+    churn_predictions is the source of truth for the churn_risk trigger: the
+    nightly job appends one row per scored subscriber, so this is populated for
+    every subscriber it scores. (The user_segments churn columns are only a
+    display mirror and are UPDATE-only — absent for subscribers with no segment
+    row — so they must NOT be used for firing decisions.)
+    """
+    return db.execute(
+        select(ChurnPrediction)
+        .where(ChurnPrediction.subscriber_id == sub_id)
+        .order_by(ChurnPrediction.predicted_at.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+
+def _last_offer_sent_at(sub_id: int, db: Session) -> Optional[datetime]:
+    """Most recent save_offer_sent_at across ALL of this subscriber's predictions.
+
+    The cooldown must look across every prediction row, not just the latest one:
+    churn_scoring appends a fresh row nightly with save_offer_sent_at=NULL, so a
+    "latest row only" check would forget that an offer was sent days ago and let
+    the offer re-fire every night (defeating COOLDOWN_DAYS).
+    """
+    return db.execute(
+        select(func.max(ChurnPrediction.save_offer_sent_at))
+        .where(ChurnPrediction.subscriber_id == sub_id)
+    ).scalar_one_or_none()
+
+
 def _identify_risk(sub: Subscriber, db: Session) -> Optional[str]:
-    """Return trigger string if subscriber is at risk, else None."""
+    """Return trigger string if subscriber is at risk, else None.
+
+    Trigger 1 (churn_risk): read churn_scoring output from the latest
+    churn_predictions row. Subject to holdout + cooldown gates.
+
+    Trigger 2 (payment_failure_day5): grace period ≥ 5 days. Not gated by
+    holdout or cooldown — payment recovery always fires.
+    """
     if sub.tier in ("data_only", "free"):
         return None
 
     now = datetime.now(timezone.utc)
 
-    # Trigger 1: 5–7 days with no wallet transactions (proxy for inactivity)
-    last_txn_at = db.execute(
-        select(WalletTransaction.created_at)
-        .where(WalletTransaction.subscriber_id == sub.id)
-        .order_by(WalletTransaction.created_at.desc())
-        .limit(1)
-    ).scalar_one_or_none()
+    # ── Trigger 1: churn risk prediction ──────────────────────────────────
+    # Read band + onset + holdout from churn_predictions (written for every
+    # scored subscriber), NOT user_segments (UPDATE-only display mirror).
+    latest = _latest_churn_prediction(sub.id, db)
 
-    ref = last_txn_at or sub.created_at
-    if ref and ref.tzinfo is None:
-        ref = ref.replace(tzinfo=timezone.utc)
-    inactive_days = (now - ref).days if ref else 999
+    if latest and latest.churn_risk_band in FIRE_BANDS and latest.predicted_inactivity_at:
+        predicted = latest.predicted_inactivity_at
+        if predicted.tzinfo is None:
+            predicted = predicted.replace(tzinfo=timezone.utc)
+        days_out = (predicted - now).total_seconds() / 86400
 
-    if _INACTIVE_MIN <= inactive_days <= _INACTIVE_MAX:
-        return "inactivity"
+        if days_out <= HORIZON_DAYS:
+            # Check holdout gate (ADR 0007)
+            if latest.in_holdout:
+                logger.debug(
+                    "[ProactiveSave] sub=%d in Save Offer Holdout — skipping", sub.id
+                )
+                return None
 
-    # Trigger 2: Day 5+ of grace period (payment failure)
+            # Check cooldown gate — MAX across all predictions (see _last_offer_sent_at)
+            last_sent = _last_offer_sent_at(sub.id, db)
+            if last_sent:
+                if last_sent.tzinfo is None:
+                    last_sent = last_sent.replace(tzinfo=timezone.utc)
+                if (now - last_sent).days < COOLDOWN_DAYS:
+                    logger.debug(
+                        "[ProactiveSave] sub=%d on cooldown (%dd since last offer)",
+                        sub.id,
+                        (now - last_sent).days,
+                    )
+                    return None
+
+            return "churn_risk"
+
+    # ── Trigger 2: Day 5+ of grace period (payment failure) ───────────────
     if sub.status == "grace" and sub.grace_expires_at:
         expires = sub.grace_expires_at
         if expires.tzinfo is None:
@@ -94,6 +155,17 @@ def _identify_risk(sub: Subscriber, db: Session) -> Optional[str]:
             return "payment_failure_day5"
 
     return None
+
+
+def _stamp_save_offer_sent_at(sub_id: int, db: Session) -> None:
+    """Set save_offer_sent_at on the latest churn_predictions row (cooldown record)."""
+    latest = _latest_churn_prediction(sub_id, db)
+    if latest:
+        latest.save_offer_sent_at = datetime.now(timezone.utc)
+    else:
+        logger.debug(
+            "[ProactiveSave] No churn_predictions row for sub=%d — cooldown not stamped", sub_id
+        )
 
 
 def _parse_email(text: str) -> tuple[str, str]:
@@ -143,7 +215,7 @@ def _send_save_offer(sub: Subscriber, trigger: str) -> bool:
     if not subject or not body_text:
         trigger_line = (
             "We noticed you haven't been active recently — life gets busy."
-            if trigger == "inactivity"
+            if trigger in ("inactivity", "churn_risk")
             else "We noticed your payment hasn't gone through yet."
         )
         subject = f"Keep your leads for ${price}/mo — Data-Only access"
@@ -161,6 +233,9 @@ def _send_save_offer(sub: Subscriber, trigger: str) -> bool:
         from src.services.email import send_email
         send_email(to=sub.email, subject=subject, body_text=body_text)
         logger.info("[ProactiveSave] Offer sent: subscriber=%d trigger=%s", sub.id, trigger)
+        # Stamp cooldown record (churn_risk trigger only; payment_failure_day5 is not rate-limited)
+        if trigger == "churn_risk":
+            _stamp_save_offer_sent_at(sub.id, db)
         return True
     except Exception as exc:
         logger.error("Save offer email failed for subscriber %d: %s", sub.id, exc)

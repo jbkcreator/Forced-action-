@@ -26,13 +26,14 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from config.churn import FIRE_BANDS, HORIZON_DAYS
 from config.retention import (
     RETENTION_CADENCE_DAYS,
     RETENTION_EXCLUDED_TIERS,
     RETENTION_IDEMPOTENCY_WINDOW,
 )
 from src.core.database import get_db_context
-from src.core.models import MessageOutcome, Subscriber, WalletBalance
+from src.core.models import ChurnPrediction, MessageOutcome, Subscriber, WalletBalance
 from src.services.vendor_cost_pause_service import get_active_pause
 from src.core.redis_client import redis_available, rget, rset
 
@@ -40,6 +41,42 @@ logger = logging.getLogger(__name__)
 
 # TTL for idempotency key: 25 hours (slightly over 1 day to tolerate cron drift)
 _IDEM_TTL_SECONDS = 25 * 3600
+
+
+def _is_high_churn_risk(db: Session, subscriber_id: int) -> bool:
+    """Return True if the latest churn prediction is high/very_high and within horizon.
+
+    When True the churn_scoring job has already flagged this subscriber for a
+    proactive save offer — emitting a retention_summary_due would duplicate the
+    outreach on the same day. Suppress and count as deferred_to_save.
+
+    Reads the latest churn_predictions row (written for every scored subscriber),
+    NOT the user_segments churn columns: those are an UPDATE-only display mirror
+    and are absent for subscribers with no segment row (~90%), which would make
+    this silently return False and skip suppression.
+    """
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+
+    pred = db.execute(
+        select(ChurnPrediction)
+        .where(ChurnPrediction.subscriber_id == subscriber_id)
+        .order_by(ChurnPrediction.predicted_at.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+    if pred is None:
+        return False
+    if pred.churn_risk_band not in FIRE_BANDS:
+        return False
+    if pred.predicted_inactivity_at is None:
+        return False
+
+    predicted = pred.predicted_inactivity_at
+    if predicted.tzinfo is None:
+        predicted = predicted.replace(tzinfo=timezone.utc)
+    days_out = (predicted - now).total_seconds() / 86400
+    return days_out <= HORIZON_DAYS
 
 
 def _last_engagement(db: Session, subscriber_id: int) -> Optional[datetime]:
@@ -88,6 +125,7 @@ def run(dry_run: bool = False) -> dict:
         "inactive_found": 0,
         "events_emitted": 0,
         "deduped": 0,
+        "deferred_to_save": 0,
         "errors": 0,
         "skipped_by_pause": False,
     }
@@ -125,6 +163,14 @@ def run(dry_run: bool = False) -> dict:
                         results["deduped"] += 1
                         continue
 
+                    # Churn suppression guard: save offer takes precedence (ADR 0008)
+                    if _is_high_churn_risk(db, sub.id):
+                        results["deferred_to_save"] += 1
+                        logger.debug(
+                            "retention: sub=%d deferred to save offer (high churn risk)", sub.id
+                        )
+                        continue
+
                     last = _last_engagement(db, sub.id)
                     # Normalize to UTC-aware to avoid TypeError when comparing
                     # with aware cutoff (MessageOutcome.sent_at has no timezone column).
@@ -154,11 +200,12 @@ def run(dry_run: bool = False) -> dict:
                     results["errors"] += 1
 
     logger.info(
-        "[RetentionProducer] checked=%d inactive=%d emitted=%d deduped=%d errors=%d dry_run=%s",
+        "[RetentionProducer] checked=%d inactive=%d emitted=%d deduped=%d deferred=%d errors=%d dry_run=%s",
         results["checked"],
         results["inactive_found"],
         results["events_emitted"],
         results["deduped"],
+        results["deferred_to_save"],
         results["errors"],
         dry_run,
     )
