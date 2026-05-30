@@ -264,9 +264,21 @@ COUNTY_ID=hillsborough
 # Big-deal-win path also fires inline from /api/deal-capture for instant conversion.
 0 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.annual_push
 
-# Proactive Save (Data-Only) — daily 10:00 UTC.
-# Catches at-risk subscribers (5-7d inactivity or grace day 5+) before churn.
-0 10 * * * $PROJECT/scripts/cron/run.sh src.tasks.proactive_save
+# Churn Scoring (fa051) — daily 13:00 UTC.
+# Scores every active/grace subscriber for churn risk; writes snapshot +
+# appends churn_predictions history row. Sends NOTHING. No Claude calls.
+# MUST complete before proactive_save at 15:00 — see cron ordering in CLAUDE.md.
+0 13 * * * $PROJECT/scripts/cron/run.sh src.tasks.churn_scoring
+
+# Proactive Save (Data-Only) — daily 15:00 UTC.
+# Reads predicted_inactivity_at from user_segments (written by churn_scoring).
+# Fires Data-Only save offer when churn_risk band is high/very_high and
+# predicted onset is ≤ 3 days out, subject to holdout + cooldown gates.
+0 15 * * * $PROJECT/scripts/cron/run.sh src.tasks.proactive_save
+
+# Churn Validation Report (fa051) — weekly Monday 13:00 UTC.
+# Computes precision/recall, lead time, and holdout-arm lift from backfilled rows.
+0 13 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.churn_validation_report
 
 # Pause-resume reminder — daily 11:00 UTC. Sends a transactional SMS to paused
 # subscribers 7 days before their pause_resume_at date so they know leads are

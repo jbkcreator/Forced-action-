@@ -1900,6 +1900,13 @@ class UserSegment(Base):
     last_significant_action_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     revenue_signal_last_action: Mapped[Optional[str]] = mapped_column(String(80))
 
+    # fa051 — Predictive Churn Risk. Nullable for back-compat with rows written before fa051.
+    churn_risk_score: Mapped[Optional[int]] = mapped_column(Integer)
+    churn_risk_band: Mapped[Optional[str]] = mapped_column(String(20))
+    predicted_inactivity_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    churn_risk_reason: Mapped[Optional[str]] = mapped_column(String(255))
+    churn_risk_updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
     last_classified_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     classification_reason: Mapped[Optional[str]] = mapped_column(String(255))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
@@ -1918,6 +1925,11 @@ class UserSegment(Base):
             "revenue_signal_band IS NULL OR "
             "revenue_signal_band IN ('low', 'medium', 'high', 'very_high')",
             name="check_revenue_signal_band",
+        ),
+        CheckConstraint(
+            "churn_risk_band IS NULL OR "
+            "churn_risk_band IN ('low', 'medium', 'high', 'very_high')",
+            name="check_churn_risk_band",
         ),
     )
 
@@ -2030,6 +2042,54 @@ class ConversionAttributionEvent(Base):
         return (
             f"<ConversionAttributionEvent(id={self.id}, sub={self.subscriber_id}, "
             f"type={self.conversion_type}, status={self.attribution_status})>"
+        )
+
+
+class ChurnPrediction(Base):
+    """fa051 — append-only row per nightly churn scoring run per subscriber.
+
+    Written by churn_scoring job; consumed by proactive_save (save_offer_sent_at
+    cooldown + in_holdout gate) and churn_validation_report (backfilled outcomes).
+    Never mutated after write except for save_offer_sent_at, realized_inactive_at,
+    was_correct (backfill pass).
+
+    Index on (subscriber_id, predicted_at DESC) covers "latest prediction" and
+    cooldown lookups efficiently.
+    """
+    __tablename__ = "churn_predictions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("subscribers.id", ondelete="CASCADE"), nullable=False
+    )
+    predicted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    churn_risk_score: Mapped[int] = mapped_column(Integer, nullable=False)
+    churn_risk_band: Mapped[Optional[str]] = mapped_column(String(20))
+    predicted_inactivity_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    features: Mapped[Optional[dict]] = mapped_column(JSONB)
+    in_holdout: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    save_offer_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    realized_inactive_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    was_correct: Mapped[Optional[bool]] = mapped_column(Boolean)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    subscriber = relationship("Subscriber", backref="churn_predictions")
+
+    __table_args__ = (
+        Index("ix_churn_predictions_sub_predicted", "subscriber_id", "predicted_at"),
+        Index("ix_churn_predictions_subscriber_id", "subscriber_id"),
+        CheckConstraint(
+            "churn_risk_band IS NULL OR churn_risk_band IN ('low', 'medium', 'high', 'very_high')",
+            name="check_churn_prediction_band",
+        ),
+    )
+
+    def __repr__(self):
+        return (
+            f"<ChurnPrediction(sub={self.subscriber_id}, score={self.churn_risk_score}, "
+            f"band={self.churn_risk_band}, holdout={self.in_holdout})>"
         )
 
 
