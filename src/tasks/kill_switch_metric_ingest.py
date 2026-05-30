@@ -18,8 +18,11 @@ Metrics computed:
 
 Known gaps (kept as None so cora_self_healing treats them fail-safe):
   cac_paid_channels    — no ad-spend ledger yet
-  free_tier_cost_ratio — no per-sub cost allocation
   sms_cost_per_signup  — Telnyx doesn't expose per-send cost on MessageOutcome
+
+free_tier_cost_ratio and county_profitability are now computed from the Cost
+Ledger (api_usage_logs) per ADR 0006. Rows with NULL subscriber_id (shared
+cost) are intentionally excluded — optimistic v1 gap documented in the ADR.
 
 fa034: After computing the dict, this task also writes a row to
 platform_daily_stats (one row per (run_date, county_id)) so the
@@ -37,12 +40,14 @@ import sys
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from decimal import Decimal
+
 from sqlalchemy import func, select, text as sa_text
 from sqlalchemy.orm import Session
 
 from config.settings import settings
 from src.core.database import get_db_context
-from src.core.models import AgentDecision, Subscriber, WalletBalance, WalletPushOffer
+from src.core.models import AgentDecision, ApiUsageLog, Subscriber, WalletBalance, WalletPushOffer
 from src.core.redis_client import redis_available, rget, rset
 
 logger = logging.getLogger(__name__)
@@ -235,25 +240,81 @@ def _compute_metrics(db: Session, county_id: str) -> dict:
     #   subscribers but no spend ledger). Add when marketing budgets land
     #   in the DB.
     metrics["cac_paid_channels"] = None
-    # free_tier_cost_ratio: no per-subscriber compute-cost allocation. Would
-    #   need a Stripe invoice JOIN + free-tier cost imputation.
-    metrics["free_tier_cost_ratio"] = None
     # sms_cost_per_signup: project moved to Telnyx (May 2026) and MessageOutcome
     #   doesn't track per-send cost. Add when Telnyx billing API is wired.
     metrics["sms_cost_per_signup"] = None
 
-    # county_profitability — v1 proxy: any active paying subscribers in county
-    # See docs/adr/0001-county-profitability-gate.md for rationale and v2 plan.
-    paying_subs = db.execute(
-        select(func.count(Subscriber.id)).where(
+    # ── free_tier_cost_ratio (ADR 0006) ───────────────────────────────────
+    # Cost Ledger attribution: api_usage_logs rows JOIN subscribers on
+    # subscriber_id for free/data_only tier subs in this county, last 30d.
+    # Rows where subscriber_id IS NULL (shared cost) are intentionally excluded
+    # — documented optimistic gap (ADR 0006).
+    revenue_30d = _compute_revenue_30d(db, county_id)
+    free_cost = _compute_attributable_cost(db, county_id, ago_30, free_tier_only=True)
+    if revenue_30d and revenue_30d > 0:
+        metrics["free_tier_cost_ratio"] = round(float(free_cost / revenue_30d) * 100, 1)
+    else:
+        metrics["free_tier_cost_ratio"] = None  # no revenue → red (fail-safe)
+
+    # ── county_profitability (ADR 0006) ───────────────────────────────────
+    # Net positive = trailing-30d revenue minus all attributable variable cost
+    # for this county.  Binary 1.0/0.0 preserves the existing _gate_color
+    # special-case while making the value meaningful.
+    total_cost = _compute_attributable_cost(db, county_id, ago_30, free_tier_only=False)
+    if revenue_30d and revenue_30d > 0:
+        metrics["county_profitability"] = 1.0 if (revenue_30d - total_cost) > 0 else 0.0
+    else:
+        metrics["county_profitability"] = 0.0  # no revenue → not profitable
+
+    return metrics
+
+
+def _compute_revenue_30d(db: Session, county_id: str) -> Decimal:
+    """Trailing-30d MRR: sum of plan_price for active paying subscribers."""
+    result = db.execute(
+        select(func.coalesce(func.sum(Subscriber.plan_price), 0)).where(
             Subscriber.county_id == county_id,
             Subscriber.status == "active",
             Subscriber.tier.notin_(["free", "data_only"]),
         )
-    ).scalar() or 0
-    metrics["county_profitability"] = 1.0 if paying_subs > 0 else 0.0
+    ).scalar()
+    return Decimal(str(result or 0))
 
-    return metrics
+
+def _compute_attributable_cost(
+    db: Session,
+    county_id: str,
+    since,
+    free_tier_only: bool = False,
+) -> Decimal:
+    """
+    Sum api_usage_logs.cost_usd attributed to subscribers in this county
+    since `since`. Rows with NULL subscriber_id (shared cost) are excluded —
+    documented optimistic gap per ADR 0006.
+
+    free_tier_only=True: restrict to free/data_only tier subs only
+                         (for free_tier_cost_ratio gate).
+    free_tier_only=False: all subscriber-attributed cost (for county_profitability).
+    """
+    tier_filter = (
+        [Subscriber.tier.in_(["free", "data_only"])]
+        if free_tier_only
+        else []
+    )
+    sub_ids_q = (
+        select(Subscriber.id)
+        .where(
+            Subscriber.county_id == county_id,
+            *tier_filter,
+        )
+    )
+    result = db.execute(
+        select(func.coalesce(func.sum(ApiUsageLog.cost_usd), 0)).where(
+            ApiUsageLog.subscriber_id.in_(sub_ids_q),
+            ApiUsageLog.created_at >= since,
+        )
+    ).scalar()
+    return Decimal(str(result or 0))
 
 
 # Columns on platform_daily_stats that the self-healing job will read back

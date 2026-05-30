@@ -3352,6 +3352,54 @@ class CountyLaunchAudit(Base):
         return f"<CountyLaunchAudit(id={self.id}, county={self.county_id}, event={self.event_type})>"
 
 
+class ExpansionIcpChannel(Base):
+    """
+    Config-only record for each Expansion ICP Channel candidate.
+
+    Distinct from a Trade (a vertical inside the contractor lead product).
+    Launch gated on all 7 Expansion Gates green for the Source County AND
+    global Contractor MRR >= $50K.  Status stays 'gated' until the meta-gate
+    is cleared; only then can it be flipped to 'approved' / 'live'.
+
+    feed_scope: 'single_county' = Source County only (v1);
+                'multi_county'  = aggregate across launched counties (future).
+    """
+    __tablename__ = "expansion_icp_channels"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    key: Mapped[str] = mapped_column(String(40), nullable=False, unique=True)
+    display_name: Mapped[str] = mapped_column(String(80), nullable=False)
+    price_monthly: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    persona: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    data_source: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    feed_scope: Mapped[str] = mapped_column(String(20), nullable=False, default="single_county")
+    landing_slug: Mapped[str] = mapped_column(String(60), nullable=False, unique=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="gated")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('configured','gated','approved','live','retired')",
+            name="ck_expansion_icp_channels_status",
+        ),
+        CheckConstraint(
+            "feed_scope IN ('single_county','multi_county')",
+            name="ck_expansion_icp_channels_feed_scope",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return f"<ExpansionIcpChannel(key={self.key!r}, status={self.status!r})>"
+
+
 # ============================================================================
 # WAITLIST
 # ============================================================================
