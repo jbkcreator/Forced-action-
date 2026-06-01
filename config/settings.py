@@ -39,6 +39,9 @@ class AppSettings(BaseSettings):
 	dev_tools_enabled: bool = Field(default=False, env="DEV_TOOLS_ENABLED")
 
 
+	# 2Captcha — reCAPTCHA solving service (optional, used by Pinellas evictions scraper)
+	twocaptcha_api_key: Optional[SecretStr] = Field(default=None, env="TWOCAPTCHA_API_KEY")
+
 	# Oxylabs proxy (optional — used by foreclosure + tax delinquency scrapers)
 	oxylabs_username: Optional[str] = Field(default=None, env="OXYLABS_USERNAME")
 	oxylabs_password: Optional[SecretStr] = Field(default=None, env="OXYLABS_PASSWORD")
