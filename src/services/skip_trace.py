@@ -888,7 +888,7 @@ def run_skip_trace(
                 logger.info("Retrying batch %d as individual requests to isolate bad record...", batch_num)
                 results = []
                 for i, single_payload in enumerate(payloads):
-                    owner, prop = index_map[i]
+                    owner, prop, _traced_name = index_map[i]
                     try:
                         single_result = _call_batch_data([single_payload], api_key_val)
                         results.extend(single_result)

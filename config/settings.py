@@ -4,7 +4,7 @@ from functools import lru_cache
 
 from typing import Optional
 
-from pydantic import AnyUrl, Field, SecretStr, PostgresDsn
+from pydantic import AnyUrl, Field, SecretStr, PostgresDsn, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -190,7 +190,14 @@ class AppSettings(BaseSettings):
 	# to bound BatchData spend (200/day quota). Enable only after the audit at
 	# `scripts/_probate_multi_heir_audit.py` confirms >20% multi-heir prevalence.
 	multi_heir_enrichment_enabled: bool = Field(default=False, env="MULTI_HEIR_ENRICHMENT_ENABLED")
+	# Hard-clamped to [1, 10] regardless of env value — bounds BatchData spend so a
+	# fat-fingered or pathological large-estate value can't drain the 200/day quota.
 	max_heirs_per_property: int = Field(default=5, env="MAX_HEIRS_PER_PROPERTY")
+
+	@field_validator("max_heirs_per_property")
+	@classmethod
+	def _clamp_max_heirs(cls, v: int) -> int:
+		return max(1, min(int(v), 10))
 	pdl_api_key: Optional[SecretStr] = Field(default=None, env="PDL_API_KEY")
 
 	# Skip trace waterfall behaviour
