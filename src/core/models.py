@@ -1046,6 +1046,13 @@ class Subscriber(Base):
     revenue_signal_breakdown: Mapped[Optional[dict]] = mapped_column(JSONB)
     revenue_signal_updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
+    # ── fa057: Synthflow inbound signup ──────────────────────────────────────
+    # False when the Synthflow inbound event was missing ZIP or vertical.
+    # First-login corrects vertical; capture_complete flips True after update.
+    capture_complete: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default="true", nullable=False
+    )
+
     # ── Revenue / churn tracking (fa048) ─────────────────────────────────────
     plan_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)
     churned_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -2655,7 +2662,7 @@ class SmsOptIn(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "source IN ('double_opt_in', 'manual', 'import', 'widget')",
+            "source IN ('double_opt_in', 'manual', 'import', 'widget', 'waitlist_form', 'synthflow_inbound', 'missed_call_inbound')",
             name="check_opt_in_source",
         ),
         CheckConstraint(

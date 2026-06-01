@@ -223,15 +223,42 @@ def _telnyx(payload: Dict[str, Any]) -> dict:
 
 
 _SANITIZERS = {
-    "stripe":          _stripe,
-    "ghl":             _ghl,
-    "ghl_inbound":     _ghl,
-    "ghl_outbound":    _ghl,
-    "synthflow":       _synthflow,
-    "batch_data":      _batch_data,
-    "batchdata":       _batch_data,
-    "nws":             _nws,
-    "telnyx":          _telnyx,
-    "telnyx_inbound":  _telnyx,
-    "telnyx_voice":    _telnyx,
+    "stripe":              _stripe,
+    "ghl":                 _ghl,
+    "ghl_inbound":         _ghl,
+    "ghl_outbound":        _ghl,
+    "synthflow":           _synthflow,
+    "synthflow_inbound":   _synthflow,
+    "batch_data":          _batch_data,
+    "batchdata":           _batch_data,
+    "nws":                 _nws,
+    "telnyx":              _telnyx,
+    "telnyx_inbound":      _telnyx,
+    "telnyx_voice":        _telnyx,
 }
+
+
+def already_logged(source: str, source_event_id: str) -> bool:
+    """Return True if a webhook_event row exists for (source, source_event_id).
+
+    Used for call_id idempotency on /webhooks/synthflow/inbound — a second POST
+    with the same call_id is a Synthflow retry and should be a no-op.
+    Never raises; returns False on error (allows through on uncertainty).
+    """
+    try:
+        from src.core.models import WebhookEvent
+        from src.core.database import Database
+        db = Database()
+        with db.session_scope() as s:
+            row = (
+                s.query(WebhookEvent)
+                .filter(
+                    WebhookEvent.source == source,
+                    WebhookEvent.source_event_id == source_event_id,
+                )
+                .first()
+            )
+            return row is not None
+    except Exception as exc:
+        logger.warning("[webhook_log] already_logged check failed: %s — allowing", exc)
+        return False

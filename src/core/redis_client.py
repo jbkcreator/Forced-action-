@@ -53,7 +53,17 @@ def _get_client():
         return None
     try:
         import redis as _redis_lib
-        client = _redis_lib.Redis.from_url(url, decode_responses=True, socket_connect_timeout=2)
+        # Both timeouts required: socket_connect_timeout bounds the TCP connect,
+        # socket_timeout bounds every read. Without socket_timeout, a server that
+        # accepts the connection but never replies to PING (e.g. TLS/protocol
+        # mismatch) blocks the health-check read forever — hanging every agent
+        # dispatch instead of degrading gracefully to the Postgres fallback.
+        client = _redis_lib.Redis.from_url(
+            url,
+            decode_responses=True,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+        )
         client.ping()
         _redis = client
         logger.info("Redis connected: %s", url)

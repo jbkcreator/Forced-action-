@@ -366,8 +366,11 @@ COUNTY_ID=hillsborough
 # Wallet-to-Lock sweep — daily 13:30 UTC.
 30 13 * * * $PROJECT/scripts/cron/run.sh src.tasks.wallet_to_lock_sweep
 
-# Synthflow voice drop sweep — weekdays 15:00 UTC (after proactive_save at 10:00).
-0 15 * * 1-5 $PROJECT/scripts/cron/run.sh src.tasks.synthflow_voice_drop_sweep
+# Synthflow voice drop sweep — every 2 min, all days (fa057 high-frequency SLA).
+# Replaces the old weekday-15:00 daily schedule. Idempotency via per-subscriber
+# daily decision_id key; 7-day manual_action_log dedup is the terminal guard.
+# See ADR 0010 for the SLA/detection rationale.
+*/2 * * * * $PROJECT/scripts/cron/run.sh src.tasks.synthflow_voice_drop_sweep
 
 # Stripe recovery sequence (Day 1 + Day 3) — daily 16:00 UTC, after proactive_save at 10:00.
 0 16 * * * $PROJECT/scripts/cron/run.sh src.tasks.stripe_recovery_sweep

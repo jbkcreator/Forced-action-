@@ -30,14 +30,18 @@ def initiate_call(
     api_key = settings.synthflow_api_key.get_secret_value()
     base = settings.synthflow_api_base.rstrip("/")
 
-    # custom_variables is the Synthflow v2 format; metadata kept for backwards compat
+    # Synthflow v2 POST /calls schema: the agent is identified by `model_id`
+    # (not `agent_id`) and `name` (callee name) is required. custom_variables
+    # carries the per-call template context as a list of {name,value} pairs.
     custom_variables = [
-        f"{k}: {v}" for k, v in context.items() if v not in (None, "")
+        {"name": str(k), "value": str(v)}
+        for k, v in context.items() if v not in (None, "")
     ]
+    callee_name = context.get("subscriber_name") or "there"
     payload = {
+        "model_id": agent_id,
         "phone": phone,
-        "agent_id": agent_id,
-        "metadata": context,
+        "name": callee_name,
         "custom_variables": custom_variables,
     }
 
@@ -51,9 +55,13 @@ def initiate_call(
         )
         resp.raise_for_status()
         data = resp.json()
-        call_id = data.get("call_id") or data.get("id")
+        # v2 wraps the id under response.call_id; tolerate flat shapes too.
+        resp_obj = data.get("response") if isinstance(data.get("response"), dict) else data
+        call_id = resp_obj.get("call_id") or resp_obj.get("id") or data.get("call_id") or data.get("id")
         logger.info("synthflow call initiated call_id=%s phone=%s", call_id, phone[-4:])
         return call_id
     except Exception as exc:
-        logger.error("synthflow initiate_call failed: %s", exc)
+        # Include the response body — a bare HTTPError hides the field-level reason.
+        body = getattr(getattr(exc, "response", None), "text", "")
+        logger.error("synthflow initiate_call failed: %s | body=%s", exc, body[:500])
         return None

@@ -41,8 +41,12 @@ def run() -> dict:
             return {"dispatched": 0, "errors": 0, "candidates": 0, "skipped_by_pause": True}
 
         # Joins user_segments for subscriber-level revenue score and sms_opt_ins for
-        # phone + TCPA opt-in. Excludes subscribers who locked a territory in the last
-        # 48h (recently converted) or received a voice drop in the last 7 days.
+        # phone + TCPA opt-in. Excludes subscribers with any revenue/spend action in
+        # the last 48h (broadened from territory-lock-only — see ADR 0010) and
+        # those who received a voice drop in the last 7 days.
+        #
+        # Conversion = any of: territory lock, wallet debit, bundle purchase,
+        # paid lead unlock, credit-report purchase, subscription upgrade.
         rows = db.execute(text("""
             SELECT
                 s.id,
@@ -69,9 +73,23 @@ def run() -> dict:
               AND us.revenue_signal_score >= :threshold
               AND mal.id IS NULL
               AND NOT EXISTS (
+                  -- Territory lock
                   SELECT 1 FROM zip_territories zt
                   WHERE zt.subscriber_id = s.id
                     AND zt.locked_at > :cutoff_convert
+              )
+              AND NOT EXISTS (
+                  -- Wallet debit (any spend)
+                  SELECT 1 FROM wallet_transactions wt
+                  WHERE wt.subscriber_id = s.id
+                    AND wt.txn_type = 'debit'
+                    AND wt.created_at > :cutoff_convert
+              )
+              AND NOT EXISTS (
+                  -- Bundle purchase or paid lead unlock
+                  SELECT 1 FROM bundle_purchases bp
+                  WHERE bp.subscriber_id = s.id
+                    AND bp.purchased_at > :cutoff_convert
               )
         """), {
             "cutoff_drop": cutoff_drop,
@@ -81,8 +99,13 @@ def run() -> dict:
 
     dispatched = 0
     errors = 0
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
     for row in rows:
         try:
+            # Use the stable per-subscriber daily key as BOTH decision_id AND
+            # idempotency_key. _already_handled queries AgentDecision.decision_id;
+            # if they differ, dedup never fires and a 2-min sweep storms the queue.
+            idem_key = f"synthflow_drop:{row[0]}:{today}"
             dispatch_event({
                 "event_type": "high_intent_no_convert",
                 "subscriber_id": row[0],
@@ -92,8 +115,8 @@ def run() -> dict:
                     "offer_type": row[3] or "",
                 },
                 "source": "cron",
-                "decision_id": str(uuid.uuid4()),
-                "idempotency_key": f"synthflow_drop:{row[0]}:{cutoff_drop.strftime('%Y%m%d')}",
+                "decision_id": idem_key,
+                "idempotency_key": idem_key,
             })
             dispatched += 1
         except Exception as exc:

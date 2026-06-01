@@ -106,6 +106,10 @@ class AppSettings(BaseSettings):
 	stripe_price_premium_brief: Optional[str] = Field(default=None, env="STRIPE_PRICE_PREMIUM_BRIEF")
 	stripe_price_premium_transfer: Optional[str] = Field(default=None, env="STRIPE_PRICE_PREMIUM_TRANSFER")
 	stripe_price_premium_byol: Optional[str] = Field(default=None, env="STRIPE_PRICE_PREMIUM_BYOL")
+	# Stage 12: White-label + Bankruptcy
+	stripe_price_wl_standard: Optional[str] = Field(default=None, env="STRIPE_PRICE_WL_STANDARD")
+	stripe_price_wl_premium: Optional[str] = Field(default=None, env="STRIPE_PRICE_WL_PREMIUM")
+	stripe_price_bankruptcy_alerts: Optional[str] = Field(default=None, env="STRIPE_PRICE_BANKRUPTCY_ALERTS")
 
 	# Referral Core Loop
 	referral_free_month_coupon_id: Optional[str] = Field(default=None, env="REFERRAL_FREE_MONTH_COUPON_ID")
@@ -138,6 +142,10 @@ class AppSettings(BaseSettings):
 	stripe_test_price_premium_brief: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_PREMIUM_BRIEF")
 	stripe_test_price_premium_transfer: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_PREMIUM_TRANSFER")
 	stripe_test_price_premium_byol: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_PREMIUM_BYOL")
+	# Stage 12: White-label + Bankruptcy — test prices
+	stripe_test_price_wl_standard: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_WL_STANDARD")
+	stripe_test_price_wl_premium: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_WL_PREMIUM")
+	stripe_test_price_bankruptcy_alerts: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_BANKRUPTCY_ALERTS")
 
 	# ── Mode-aware helpers ────────────────────────────────────────────────────
 	# Use these everywhere instead of accessing live/test fields directly.
@@ -293,6 +301,16 @@ class AppSettings(BaseSettings):
 	synthflow_outbound_agent_roofing: Optional[str] = Field(default=None, env="SYNTHFLOW_OUTBOUND_AGENT_ROOFING")
 	synthflow_outbound_agent_remediation: Optional[str] = Field(default=None, env="SYNTHFLOW_OUTBOUND_AGENT_REMEDIATION")
 	synthflow_outbound_agent_revenue_recovery: Optional[str] = Field(default=None, env="SYNTHFLOW_OUTBOUND_AGENT_REVENUE_RECOVERY")
+
+	# Synthflow inbound signup flow (fa057)
+	synthflow_inbound_agent: Optional[str] = Field(default=None, env="SYNTHFLOW_INBOUND_AGENT")
+	synthflow_webhook_secret: Optional[SecretStr] = Field(default=None, env="SYNTHFLOW_WEBHOOK_SECRET")
+	synthflow_inbound_did: Optional[str] = Field(default=None, env="SYNTHFLOW_INBOUND_DID")
+
+	# QA-only: comma-separated E.164 numbers (incl. non-US) that phone_utils.normalize
+	# lets through for staging voice-drop tests. Unset in production → strict US-only
+	# guard is unchanged. Never enable in prod for real traffic.
+	qa_test_phone_allowlist: Optional[str] = Field(default=None, env="QA_TEST_PHONE_ALLOWLIST")
 
 	# Admin upload layer
 	admin_username: str = Field(default="admin", env="ADMIN_USERNAME")
