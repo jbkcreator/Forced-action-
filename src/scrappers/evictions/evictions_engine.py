@@ -5,8 +5,9 @@ Downloads civil filings from the county clerk portal, filters for eviction
 case types, deduplicates against existing DB records, and saves results.
 
 For Hillsborough: requests-based directory listing of daily CSV files.
-For Pinellas (output_format=excel): browser-use agent navigates the clerk
-portal, searches by date range, and downloads the Excel export.
+For Pinellas (output_format=excel): direct Playwright + 2Captcha reCAPTCHA
+solving navigates the clerk portal, searches by date range, filters to
+eviction case types, and downloads the Excel export.
 
 Usage:
     python -m src.scrappers.evictions.evictions_engine --county-id hillsborough --load-to-db
@@ -222,6 +223,433 @@ async def _scrape_with_playwright(
     return out_path
 
 
+# ---------------------------------------------------------------------------
+# 2Captcha reCAPTCHA solving helpers (Pinellas-specific)
+# ---------------------------------------------------------------------------
+
+async def _solve_recaptcha_2captcha(page, page_url: str) -> bool:
+    """
+    Detect Google reCAPTCHA v2 on the current page, solve it via the 2captcha
+    API, and inject the returned token so the form can be submitted.
+
+    Returns True if a captcha was found and the token was injected successfully.
+    Returns False if no captcha was found or if TWOCAPTCHA_API_KEY is unset.
+    Raises on 2captcha API errors so the caller can decide whether to retry.
+    """
+    from config.settings import get_settings
+    settings = get_settings()
+    api_key = (
+        settings.twocaptcha_api_key.get_secret_value()
+        if settings.twocaptcha_api_key else None
+    )
+    if not api_key:
+        logger.warning("[captcha] TWOCAPTCHA_API_KEY not set — cannot solve reCAPTCHA")
+        return False
+
+    # 1. Detect reCAPTCHA iframe
+    captcha_frame = await page.query_selector('iframe[src*="google.com/recaptcha"]')
+    if not captcha_frame:
+        logger.debug("[captcha] No reCAPTCHA iframe on page")
+        return False
+
+    # 2. Extract sitekey from the page DOM
+    sitekey = await page.evaluate("""
+        () => {
+            const selectors = [
+                '[data-sitekey]',
+                '.g-recaptcha[data-sitekey]',
+                '[id*="recaptcha"][data-sitekey]',
+            ];
+            for (const sel of selectors) {
+                const el = document.querySelector(sel);
+                if (el) {
+                    const key = el.getAttribute('data-sitekey');
+                    if (key) return key;
+                }
+            }
+            return null;
+        }
+    """)
+
+    if not sitekey:
+        logger.error("[captcha] reCAPTCHA iframe found but sitekey not extractable from DOM")
+        return False
+
+    logger.info("[captcha] reCAPTCHA v2 detected — sitekey=%s...", sitekey[:12])
+
+    # 3. Submit to 2captcha and wait for token (blocking SDK — run in thread)
+    try:
+        from twocaptcha import TwoCaptcha
+        solver = TwoCaptcha(api_key)
+        logger.info("[captcha] Submitting to 2captcha (this takes ~20-40 seconds)...")
+        result = await asyncio.to_thread(solver.recaptcha, sitekey=sitekey, url=page_url)
+        token = result["code"]
+        logger.info("[captcha] 2captcha returned token (len=%d)", len(token))
+    except Exception as e:
+        logger.error("[captcha] 2captcha API call failed: %s", e)
+        raise
+
+    # 4. Inject token into g-recaptcha-response and trigger the submit callback
+    await page.evaluate("""
+        (token) => {
+            // Set the hidden textarea value that the server reads
+            const resp = document.getElementById('g-recaptcha-response');
+            if (resp) {
+                resp.innerHTML = token;
+                resp.value = token;
+            }
+
+            // Try data-callback attribute on the widget element first
+            const captchaEl = document.querySelector('[data-sitekey]')
+                           || document.querySelector('.g-recaptcha');
+            if (captchaEl) {
+                const cb = captchaEl.getAttribute('data-callback');
+                if (cb && typeof window[cb] === 'function') {
+                    window[cb](token);
+                    return;
+                }
+            }
+
+            // Fall back to walking ___grecaptcha_cfg.clients for the callback fn
+            if (window.___grecaptcha_cfg) {
+                for (const clientKey in window.___grecaptcha_cfg.clients) {
+                    const client = window.___grecaptcha_cfg.clients[clientKey];
+                    if (!client) continue;
+                    for (const k in client) {
+                        if (client[k] && typeof client[k].callback === 'function') {
+                            client[k].callback(token);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    """, token)
+
+    logger.info("[captcha] Token injected — waiting for page response")
+    await page.wait_for_timeout(1500)
+    return True
+
+
+async def _scrape_pinellas_with_2captcha(
+    source: dict, county_id: str,
+    target_date: str | None, start_date: str | None, end_date: str | None,
+    headful: bool = False, no_proxy: bool = False,
+) -> Path:
+    """
+    Direct Playwright scrape for Pinellas clerk portal (courtrecords.mypinellasclerk.gov)
+    with integrated 2captcha reCAPTCHA v2 solving.
+
+    Replaces _download_civil_filing_browser (browser-use AI agent) for the
+    Pinellas output_format=excel path because the AI agent cannot handle the
+    Google reCAPTCHA image challenge that fires on form Submit.
+
+    Flow: navigate → fill date range → filter case types → submit → detect
+    captcha → solve via 2captcha → inject token → re-submit if needed →
+    wait for results → export Excel via direct URL navigation → save file.
+    """
+    from playwright.async_api import async_playwright
+
+    # Build MM/DD/YYYY date strings for the Pinellas portal form
+    if target_date:
+        dt = datetime.strptime(target_date.replace("-", ""), "%Y%m%d")
+        start_str = end_str = dt.strftime("%m/%d/%Y")
+    elif start_date:
+        start_str = datetime.strptime(start_date.replace("-", ""), "%Y%m%d").strftime("%m/%d/%Y")
+        end_str = datetime.strptime(
+            (end_date or start_date).replace("-", ""), "%Y%m%d"
+        ).strftime("%m/%d/%Y")
+    else:
+        end_dt = datetime.now()
+        end_str = end_dt.strftime("%m/%d/%Y")
+        start_str = (end_dt - timedelta(days=1)).strftime("%m/%d/%Y")
+
+    url = source.get("url", "")
+    RAW_EVICTIONS_DIR.mkdir(parents=True, exist_ok=True)
+    _proxy = None if no_proxy else get_playwright_proxy()
+
+    logger.info("[evictions-captcha] Pinellas direct scrape: %s → %s  url=%s", start_str, end_str, url)
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=not headful,
+            downloads_path=str(RAW_EVICTIONS_DIR),
+            args=STEALTH_ARGS,
+        )
+        context = await browser.new_context(
+            user_agent=STEALTH_UA,
+            accept_downloads=True,
+            proxy=_proxy,
+        )
+        page = await context.new_page()
+        await apply_stealth_to_page(page)
+
+        try:
+            logger.info("[evictions-captcha] Navigating to portal")
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(2000)
+
+            # Activate the Case search tab (shows date range + case type filters)
+            try:
+                case_tab = page.locator(
+                    'a:has-text("Case"), '
+                    'li:has-text("Case") > a, '
+                    '[role="tab"]:has-text("Case"), '
+                    '.tab:has-text("Case")'
+                )
+                if await case_tab.count() > 0:
+                    await case_tab.first.click()
+                    await page.wait_for_timeout(1000)
+                    logger.info("[evictions-captcha] Activated Case search tab")
+            except Exception as e:
+                logger.warning("[evictions-captcha] Could not click Case tab (may already be active): %s", e)
+
+            # Fill start date — known Pinellas IDs first, then generic fallbacks
+            filled_start = False
+            for sel in [
+                '#DateFrom',
+                'input[id="DateFrom"]',
+                'input[name="DateFrom"]',
+                'input[placeholder*="Start" i]',
+                'input[placeholder*="From" i]',
+                'input[placeholder*="Begin" i]',
+                'input[aria-label*="start" i]',
+                'input[aria-label*="from" i]',
+                'input[id*="DateFrom" i]',
+                'input[name*="DateFrom" i]',
+            ]:
+                el = page.locator(sel)
+                if await el.count() > 0:
+                    await el.first.fill(start_str)
+                    filled_start = True
+                    logger.info("[evictions-captcha] Filled start date (%s) via: %s", start_str, sel)
+                    break
+
+            filled_end = False
+            for sel in [
+                '#DateTo',
+                'input[id="DateTo"]',
+                'input[name="DateTo"]',
+                'input[placeholder*="End" i]',
+                'input[aria-label*="end" i]',
+                'input[id*="DateTo" i]',
+                'input[name*="DateTo" i]',
+            ]:
+                el = page.locator(sel)
+                if await el.count() > 0:
+                    await el.first.fill(end_str)
+                    filled_end = True
+                    logger.info("[evictions-captcha] Filled end date (%s) via: %s", end_str, sel)
+                    break
+
+            # Positional fallback: first two text/date inputs on the page
+            if not filled_start or not filled_end:
+                date_inputs = page.locator('input[type="date"], input[type="text"][class*="date" i]')
+                n = await date_inputs.count()
+                if n >= 2:
+                    await date_inputs.nth(0).fill(start_str)
+                    await date_inputs.nth(1).fill(end_str)
+                    logger.info("[evictions-captcha] Filled date range via positional fallback")
+                else:
+                    logger.warning(
+                        "[evictions-captcha] Could not locate date inputs "
+                        "(found %d) — proceeding anyway", n
+                    )
+
+            await page.wait_for_timeout(500)
+
+            # Filter Case Types dropdown to eviction-only before submitting.
+            # The portal returns max 500 rows total — selecting only eviction
+            # case types avoids wasting that cap on unrelated civil cases.
+            try:
+                eviction_values = await page.evaluate("""
+                    () => {
+                        const EVICTION_KEYWORDS = ['eviction', 'landlord', 'tenant', 'forcible'];
+                        const candidates = [
+                            ...document.querySelectorAll(
+                                'select[id*="CaseType" i], select[name*="CaseType" i], '
+                                + 'select[id*="casetype" i], select[id="CaseType"]'
+                            )
+                        ];
+                        if (!candidates.length) return null;
+                        const sel = candidates[0];
+                        for (const opt of sel.options) opt.selected = false;
+                        const matched = [];
+                        for (const opt of sel.options) {
+                            if (EVICTION_KEYWORDS.some(k => opt.text.toLowerCase().includes(k))) {
+                                opt.selected = true;
+                                matched.push(opt.text.trim());
+                            }
+                        }
+                        sel.dispatchEvent(new Event('change', {bubbles: true}));
+                        return matched.length ? matched : null;
+                    }
+                """)
+                if eviction_values:
+                    logger.info("[evictions-captcha] Case Types filtered to: %s", eviction_values)
+                else:
+                    logger.warning(
+                        "[evictions-captcha] Could not filter Case Types dropdown "
+                        "(element not found or no eviction options matched) — proceeding with all types"
+                    )
+            except Exception as ct_err:
+                logger.warning("[evictions-captcha] Case Types filter failed: %s — proceeding with all types", ct_err)
+
+            await page.wait_for_timeout(300)
+
+            # Click Submit
+            submit_btn = page.locator(
+                'input[type="submit"][value="Submit"], '
+                'button:has-text("Submit"), '
+                'input[value="Search"], '
+                'button[type="submit"]:has-text("Submit")'
+            )
+            if await submit_btn.count() == 0:
+                raise ValueError(
+                    "[evictions-captcha] Submit button not found — check debug screenshot"
+                )
+            logger.info("[evictions-captcha] Clicking Submit")
+            await submit_btn.first.click()
+
+            # Wait for reCAPTCHA overlay or results — whichever appears first
+            captcha_found = False
+            try:
+                await page.wait_for_selector(
+                    'iframe[src*="google.com/recaptcha"]', timeout=10000
+                )
+                captcha_found = True
+                logger.info("[evictions-captcha] reCAPTCHA detected — solving via 2captcha")
+            except Exception:
+                logger.info("[evictions-captcha] No reCAPTCHA appeared within 10s")
+
+            if captcha_found:
+                solved = await _solve_recaptcha_2captcha(page, page.url)
+                if not solved:
+                    raise RuntimeError(
+                        "[evictions-captcha] _solve_recaptcha_2captcha returned False — "
+                        "check TWOCAPTCHA_API_KEY and sitekey extraction"
+                    )
+                logger.info("[evictions-captcha] Captcha solved — checking if form auto-submitted")
+
+                # Some portals auto-submit via the reCAPTCHA callback; others just
+                # validate the widget and require a second Submit click.  Wait
+                # briefly for networkidle and, if the Submit button is still
+                # present, click it again with the captcha token now embedded.
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
+
+                try:
+                    resubmit = page.locator(
+                        'input[type="submit"][value="Submit"], '
+                        'button:has-text("Submit"), '
+                        'input[value="Search"], '
+                        'button[type="submit"]:has-text("Submit")'
+                    )
+                    if await resubmit.count() > 0:
+                        logger.info(
+                            "[evictions-captcha] Submit button still visible — "
+                            "re-clicking to submit form with captcha token"
+                        )
+                        await resubmit.first.click()
+                    else:
+                        logger.info("[evictions-captcha] Submit button gone — captcha callback auto-submitted")
+                except Exception as re_err:
+                    logger.warning("[evictions-captcha] Re-submit check failed: %s", re_err)
+
+                # Wait for the form-submission navigation to settle
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=60000)
+                except Exception as nw_exc:
+                    logger.warning("[evictions-captcha] networkidle wait timed out: %s", nw_exc)
+
+            # Wait for results table — extended timeout for slow portal responses
+            await page.wait_for_selector(
+                'table, .results, [class*="result"], [class*="grid"], [class*="case"]',
+                timeout=90000,
+            )
+            logger.info("[evictions-captcha] Results page loaded")
+
+            # Find Export to Excel link — prefer the direct ExportToExcel href.
+            # Pinellas portal uses target="_blank" which opens a new tab, so we
+            # extract the href and navigate the current page to it directly instead
+            # of clicking, bypassing the new-tab behavior so expect_download fires.
+            export_btn = page.locator(
+                'a[href*="ExportToExcel"], '
+                'a[href*="exporttoexcel" i], '
+                'a:has-text("Excel"), '
+                'button:has-text("Excel"), '
+                '[title*="excel" i], '
+                'a[href*=".xlsx"]'
+            )
+            if await export_btn.count() == 0:
+                all_btns = await page.locator("a, button").all()
+                labels = []
+                for el in all_btns[:30]:
+                    try:
+                        labels.append((await el.inner_text()).strip())
+                    except Exception:
+                        pass
+                logger.error("[evictions-captcha] Export button not found. Visible labels: %s", labels)
+                raise ValueError(
+                    "[evictions-captcha] Export/Excel button not found — "
+                    "check debug screenshot and labels above"
+                )
+
+            # Get the href and navigate directly — avoids target="_blank" new-tab issue
+            export_href = await export_btn.first.get_attribute("href")
+            if export_href:
+                base = "https://courtrecords.mypinellasclerk.gov"
+                export_url = (base + export_href) if export_href.startswith("/") else export_href
+                logger.info("[evictions-captcha] Navigating to export URL: %s", export_url)
+                async with page.expect_download(timeout=90000) as dl_info:
+                    try:
+                        await page.goto(export_url, wait_until="commit", timeout=60000)
+                    except Exception as _goto_err:
+                        if "Download is starting" not in str(_goto_err):
+                            raise
+            else:
+                # Fallback: catch new-tab popup and grab download from it
+                logger.info("[evictions-captcha] No href found — using popup download fallback")
+                async with context.expect_page() as popup_info:
+                    await export_btn.first.click()
+                popup = await popup_info.value
+                async with popup.expect_download(timeout=90000) as dl_info:
+                    pass
+            download = await dl_info.value
+
+            suggested = download.suggested_filename or (
+                f"pinellas_evictions_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+            )
+            save_path = RAW_EVICTIONS_DIR / suggested
+            await download.save_as(str(save_path))
+            logger.info(
+                "[evictions-captcha] Saved: %s (%.1f KB)",
+                save_path, save_path.stat().st_size / 1024,
+            )
+            return save_path
+
+        except Exception as e:
+            # Always capture a debug screenshot + HTML on failure
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            dbg_dir = RAW_EVICTIONS_DIR / "debug"
+            dbg_dir.mkdir(parents=True, exist_ok=True)
+            shot = dbg_dir / f"captcha_debug_{county_id}_{ts}.png"
+            html_f = dbg_dir / f"captcha_debug_{county_id}_{ts}.html"
+            try:
+                await page.screenshot(path=str(shot), full_page=True)
+                html_f.write_text(await page.content(), encoding="utf-8")
+                logger.error("[evictions-captcha] Debug screenshot: %s", shot)
+                logger.error("[evictions-captcha] Debug HTML: %s", html_f)
+            except Exception:
+                pass
+            logger.error("[evictions-captcha] Scrape failed: %s", e)
+            raise
+        finally:
+            await browser.close()
+
+
 async def _download_civil_filing_browser(
     county_id: str, source: dict, target_date: str | None, dest_dir: Path,
     headful: bool = False, no_proxy: bool = False,
@@ -329,7 +757,8 @@ def download_latest_civil_filing(
     """
     Download the latest civil filing from the county clerk.
     Hillsborough: requests-based directory listing → CSV.
-    Other counties (output_format=excel, e.g. Pinellas): browser-use → Excel.
+    Pinellas (output_format=excel): direct Playwright + 2captcha reCAPTCHA solving → Excel.
+    Other counties with playwright_code: playwright_only / playwright_then_ai path.
     """
     source = _get_eviction_source(county_id)
     scrape_mode = source.get("scrape_mode", "")
@@ -341,6 +770,17 @@ def download_latest_civil_filing(
     if scrape_mode == "static_download":
         logger.info("[evictions] Using static_download mode for '%s'", county_id)
         return _static_download(source, RAW_EVICTIONS_DIR, target_date, no_proxy=no_proxy)
+
+    # output_format=excel check runs BEFORE scrape_mode so that the 2captcha path
+    # always wins for Pinellas even when the DB config also has scrape_mode set.
+    if output_format == "excel":
+        logger.info("[evictions] County '%s' — using direct Playwright + 2captcha path", county_id)
+        return asyncio.run(
+            _scrape_pinellas_with_2captcha(
+                source, county_id, target_date, start_date, end_date,
+                headful=headful, no_proxy=no_proxy,
+            )
+        )
 
     if scrape_mode in ("playwright_only", "playwright_then_ai"):
         logger.info("[evictions] Using playwright mode for '%s'", county_id)
@@ -361,12 +801,6 @@ def download_latest_civil_filing(
                     headful=headful, no_proxy=no_proxy,
                 )
             )
-
-    if output_format == "excel":
-        logger.info("[evictions] County '%s' uses browser download (output_format=excel)", county_id)
-        return asyncio.run(
-            _download_civil_filing_browser(county_id, source, target_date, RAW_EVICTIONS_DIR, headful=headful, no_proxy=no_proxy)
-        )
 
     # Hillsborough / CSV directory-listing path
     _county = _get_county(county_id)
