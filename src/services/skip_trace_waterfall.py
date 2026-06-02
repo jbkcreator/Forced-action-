@@ -2,7 +2,7 @@
 Skip trace waterfall coordinator.
 
 Tier 1: BatchData  ($0.02/record) — active when BATCH_SKIP_TRACING_API_KEY set
-Tier 2: IDI        ($0.50/lookup) — active when IDI_API_KEY set
+Tier 2: Whitepages ($0.25/lookup) — active when WHITEPAGES_API_KEY set
 Tier 3: PDL        ($0.28/lookup) — active when PDL_API_KEY set
 
 Stop condition: confidence >= skip_trace_confidence_threshold (default 0.70)
@@ -24,7 +24,7 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-_PROVIDER_COST_CENTS = {"batchdata": 2, "idi": 50, "pdl": 28}
+_PROVIDER_COST_CENTS = {"batchdata": 2, "whitepages": 25, "pdl": 28}
 
 
 @dataclass
@@ -163,14 +163,14 @@ def run_waterfall(
     the confidence threshold after each tier.
     """
     from src.services.skip_trace import run_skip_trace
-    from src.services.idi_fallback import run_idi_fallback
+    from src.services.whitepages_fallback import run_whitepages_fallback
     from src.services.pdl_skip_trace import run_pdl_lookup
 
     settings  = get_settings()
     ceiling   = settings.skip_trace_cost_ceiling_cents
     threshold = settings.skip_trace_confidence_threshold
     stats     = WaterfallStats()
-    for p in ("batchdata", "idi", "pdl"):
+    for p in ("batchdata", "whitepages", "pdl"):
         stats.per_provider[p] = {"attempts": 0, "hits": 0, "cost_cents": 0}
 
     # ── Candidate selection ───────────────────────────────────────────────
@@ -213,49 +213,49 @@ def run_waterfall(
                     stats.hits += 1
                     stats.per_provider["batchdata"]["hits"] += 1
                 else:
-                    # Escalate if IDI cost still fits within ceiling
-                    if cost + _PROVIDER_COST_CENTS["idi"] <= ceiling:
+                    # Escalate if Whitepages cost still fits within ceiling
+                    if cost + _PROVIDER_COST_CENTS["whitepages"] <= ceiling:
                         tier2_ids.append(owner.id)
             session.commit()
     else:
         logger.warning("[Waterfall] BATCH_SKIP_TRACING_API_KEY not set — Tier 1 skipped")
         tier2_ids = all_ids
 
-    # ── Tier 2: IDI ──────────────────────────────────────────────────────
+    # ── Tier 2: Whitepages ───────────────────────────────────────────────
     tier3_ids: list[int] = []
 
     if tier2_ids:
-        if settings.idi_api_key:
-            run_idi_fallback(owner_ids=tier2_ids, county_id=county_id)
+        if settings.whitepages_api_key:
+            run_whitepages_fallback(owner_ids=tier2_ids, county_id=county_id)
 
             with get_db_context() as session:
                 for owner_id in tier2_ids:
                     owner = session.get(Owner, owner_id)
                     if not owner:
                         continue
-                    ec         = _read_ec(session, owner.property_id, "idi")
+                    ec         = _read_ec(session, owner.property_id, "whitepages")
                     confidence = _confidence_from_ec(owner, ec)
-                    cost       = _PROVIDER_COST_CENTS["idi"]
+                    cost       = _PROVIDER_COST_CENTS["whitepages"]
                     spent_so_far = _PROVIDER_COST_CENTS["batchdata"] + cost
 
-                    log_usage(session, vendor="idi", purpose="skip_trace",
+                    log_usage(session, vendor="whitepages", purpose="skip_trace",
                               success=bool(ec and ec.match_success),
                               cost_cents=cost, property_id=owner.property_id)
 
                     stats.total_cost_cents += cost
-                    stats.per_provider["idi"]["attempts"] += 1
-                    stats.per_provider["idi"]["cost_cents"] += cost
+                    stats.per_provider["whitepages"]["attempts"] += 1
+                    stats.per_provider["whitepages"]["cost_cents"] += cost
 
                     if ec and ec.match_success and confidence >= threshold:
-                        _stamp_confidence(session, owner.property_id, "idi", confidence)
+                        _stamp_confidence(session, owner.property_id, "whitepages", confidence)
                         stats.hits += 1
-                        stats.per_provider["idi"]["hits"] += 1
+                        stats.per_provider["whitepages"]["hits"] += 1
                     else:
                         if spent_so_far + _PROVIDER_COST_CENTS["pdl"] <= ceiling:
                             tier3_ids.append(owner_id)
                 session.commit()
         else:
-            logger.warning("[Waterfall] IDI_API_KEY not set — Tier 2 skipped")
+            logger.warning("[Waterfall] WHITEPAGES_API_KEY not set — Tier 2 skipped")
             tier3_ids = tier2_ids
 
     # ── Tier 3: PeopleDataLabs ───────────────────────────────────────────

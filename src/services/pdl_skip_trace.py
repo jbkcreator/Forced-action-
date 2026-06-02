@@ -70,33 +70,33 @@ def run_pdl_lookup(
             )
 
         resp.raise_for_status()
-        data = resp.json()
+        resp_json = resp.json()
 
-        phones = data.get("phone_numbers") or []
-        mobile, landline = None, None
-        for ph in phones:
-            num  = ph.get("number") or ph.get("e164_format")
-            kind = (ph.get("type") or "").lower()
-            if not num:
-                continue
-            if "mobile" in kind or "cell" in kind:
-                mobile = mobile or num
-            else:
-                landline = landline or num
+        # PDL wraps all person fields under "data"; likelihood is at the top level
+        person = resp_json.get("data") or {}
 
-        emails = data.get("emails") or []
+        # mobile_phone is a dedicated field — most reliable
+        mobile = person.get("mobile_phone")
+
+        # phones[] has number + metadata but NO type field; take first that differs from mobile
+        landline = None
+        for ph in (person.get("phones") or []):
+            num = (ph.get("number") or "").strip()
+            if num and num != mobile:
+                landline = num
+                break
+
+        emails = person.get("emails") or []
         email  = emails[0].get("address") if emails else None
 
-        locs    = data.get("locations") or []
-        mailing = None
-        if locs:
-            a = locs[0]
-            mailing = ", ".join(
-                p for p in [
-                    a.get("street_address"), a.get("locality"),
-                    a.get("region"), a.get("postal_code"),
-                ] if p
-            )
+        # No "locations" array — current address lives in flat location_* fields
+        parts = [
+            person.get("location_street_address"),
+            person.get("location_locality"),
+            person.get("location_region"),
+            person.get("location_postal_code"),
+        ]
+        mailing = ", ".join(p for p in parts if p) or None
 
         confidence = compute_confidence(mobile, landline, email, mailing)
         success    = bool(mobile or landline or email)
@@ -111,7 +111,7 @@ def run_pdl_lookup(
             landline=landline,
             email=email,
             mailing_address=mailing,
-            raw_metadata={"pdl_likelihood": data.get("likelihood")},
+            raw_metadata={"pdl_likelihood": resp_json.get("likelihood")},
         )
 
     except requests.RequestException as exc:

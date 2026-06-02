@@ -193,7 +193,7 @@ class AppSettings(BaseSettings):
 
 	# Contact enrichment (M1)
 	batch_skip_tracing_api_key: Optional[SecretStr] = Field(default=None, env="BATCH_SKIP_TRACING_API_KEY")
-	idi_api_key: Optional[SecretStr] = Field(default=None, env="IDI_API_KEY")
+	whitepages_api_key: Optional[SecretStr] = Field(default=None, env="WHITEPAGES_API_KEY")
 	# Multi-heir probate enrichment (default OFF).
 	# When True, skip-trace enumerates every named heir from
 	# legal_proceedings.meta_data->'heirs' for probate-derived leads instead of
