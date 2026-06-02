@@ -728,6 +728,33 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
     except Exception:
         logger.warning("Attribution recording failed sub=%s", subscriber.id, exc_info=True)
 
+    # Campaign conversion attribution (B6)
+    try:
+        from src.services.campaign_attribution import (
+            decode_attribution_token,
+            record_conversion,
+            try_email_fallback,
+        )
+        campaign_token = meta.get("campaign_attribution_token")
+        attributed = False
+        if campaign_token:
+            cc_id = decode_attribution_token(campaign_token)
+            if cc_id:
+                attributed = record_conversion(
+                    db=db,
+                    campaign_contact_id=cc_id,
+                    subscriber_id=subscriber.id,
+                    signed_up_at=now,
+                )
+        if not attributed and customer_email:
+            try_email_fallback(db=db, email=customer_email, subscriber_id=subscriber.id, signed_up_at=now)
+        # Stamp acquisition_source if this was an email campaign signup
+        if attributed and subscriber.acquisition_source != "dbpr_email":
+            subscriber.acquisition_source = "dbpr_email"
+            db.add(subscriber)
+    except Exception:
+        logger.warning("Campaign attribution failed sub=%s", subscriber.id, exc_info=True)
+
     logger.info(
         "checkout.session.completed: subscriber=%s tier=%s vertical=%s"
         " founding=%s zips=%s feed_uuid=%s",

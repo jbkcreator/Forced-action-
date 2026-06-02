@@ -88,6 +88,9 @@ app.include_router(alert_webhook_router)
 from src.api.bankruptcy_alert_router import router as bankruptcy_alert_router  # noqa: E402
 app.include_router(bankruptcy_alert_router)
 
+from src.api.email_campaign_router import router as email_campaign_router  # noqa: E402
+app.include_router(email_campaign_router)
+
 from src.api.subscriber_router import router as subscriber_router  # noqa: E402
 from src.services.subscriber_auth import get_current_subscriber  # noqa: E402
 app.include_router(subscriber_router)
