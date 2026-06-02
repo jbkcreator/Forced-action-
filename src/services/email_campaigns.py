@@ -341,11 +341,16 @@ def topup_campaign(campaign_id: int) -> int:
 
         for contact in contacts:
             batch_leads.append({
-                "email":        contact.email,
+                "email":        contact.email or contact.work_email or "",
                 "first_name":   _first_name(contact.full_name),
                 "last_name":    _last_name(contact.full_name),
                 "company_name": contact.company_name or "",
                 "phone":        contact.phone or "",
+                # Custom merge vars consumed by template tags {{website}}/{{location}}/{{linkedIn}}.
+                # Instantly substitutes these server-side at send time.
+                "website":      contact.domain or "",
+                "location":     contact.city or "",
+                "linkedin":     contact.linkedin_url or "",
             })
             batch_contacts.append(contact)
 

@@ -10,6 +10,15 @@ Allowed personalization variables (map to dbpr_contacts fields):
     {{company}}     — Company Name / DBA (falls back to Primary Name)
     {{city}}        — dbpr_contacts.city
     {{licenseType}} — dbpr_contacts.license_type_desc
+    {{email}}       — dbpr_contacts.email (falls back to work_email)
+    {{phone}}       — dbpr_contacts.phone
+    {{website}}     — dbpr_contacts.domain
+    {{location}}    — dbpr_contacts.city (alias of {{city}})
+    {{linkedIn}}    — dbpr_contacts.linkedin_url (personal)
+
+NOTE: Instantly performs the actual {{var}} substitution server-side at send
+time using the lead fields pushed in `email_campaigns` add_leads payload. A var
+here only renders if its value is included in that payload.
 """
 
 import re
@@ -22,6 +31,11 @@ ALLOWED_VARIABLES: dict[str, str] = {
     "company":     "company_name / full_name fallback",
     "city":        "city",
     "licenseType": "license_type_desc",
+    "email":       "email / work_email fallback",
+    "phone":       "phone",
+    "website":     "domain",
+    "location":    "city",
+    "linkedIn":    "linkedin_url",
 }
 
 _VAR_RE = re.compile(r"\{\{(\w+)\}\}")
@@ -78,7 +92,8 @@ def build_instantly_sequence(steps: list[dict]) -> list[dict]:
 def resolve_contact_variables(template_str: str, contact: dict) -> str:
     """
     Resolve {{var}} placeholders in a string using contact field values.
-    contact dict keys: full_name, company_name, city, license_type_desc.
+    contact dict keys: full_name, company_name, city, license_type_desc,
+    email, work_email, phone, domain, linkedin_url.
     Falls back gracefully when fields are absent.
     """
     full_name = (contact.get("full_name") or "").strip()
@@ -91,12 +106,19 @@ def resolve_contact_variables(template_str: str, contact: dict) -> str:
         first = tokens[0] if tokens else ""
         last = tokens[-1] if len(tokens) > 1 else ""
 
+    city = (contact.get("city") or "").strip()
     values: dict[str, str] = {
         "firstName":   first,
         "lastName":    last,
         "company":     (contact.get("company_name") or first or full_name).strip(),
-        "city":        (contact.get("city") or "").strip(),
+        "city":        city,
         "licenseType": (contact.get("license_type_desc") or "").strip(),
+        # personal-first resolution
+        "email":       (contact.get("email") or contact.get("work_email") or "").strip(),
+        "phone":       (contact.get("phone") or "").strip(),
+        "website":     (contact.get("domain") or "").strip(),
+        "location":    city,  # alias of {{city}}
+        "linkedIn":    (contact.get("linkedin_url") or "").strip(),
     }
 
     def replacer(match: re.Match) -> str:

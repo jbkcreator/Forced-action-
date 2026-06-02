@@ -3343,6 +3343,15 @@ class DBPRContact(Base):
     email_verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     clay_enriched_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
+    # Clay enrichment outputs — DDL already applied to DB; model synced here.
+    # Feed the email-campaign body merge variables (website/linkedIn/email).
+    work_email: Mapped[Optional[str]] = mapped_column(String(200))
+    domain: Mapped[Optional[str]] = mapped_column(String(255))           # {{website}}
+    linkedin_url: Mapped[Optional[str]] = mapped_column(String(255))     # {{linkedIn}} (personal)
+    company_linkedin_url: Mapped[Optional[str]] = mapped_column(String(255))
+    clay_synced: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    clay_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
     # Global suppression flags — contact-level, survive all campaign membership (fa062)
     is_opted_out: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
     is_hard_bounced: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
