@@ -139,23 +139,85 @@ def _fetch_eligible(
 # Campaign CRUD + Instantly orchestration
 # ---------------------------------------------------------------------------
 
+# Instantly's timezone enum rejects these ET aliases — remap to America/Detroit.
+_TZ_REMAP = {
+    "America/New_York": "America/Detroit",
+    "US/Eastern":       "America/Detroit",
+    "EST5EDT":          "America/Detroit",
+    "America/Toronto":  "America/Detroit",
+}
+
+# Instantly v2 days object uses NUMERIC string keys "0".."6" (0=Sunday … 6=Saturday).
+# Name keys ("monday": true) are silently dropped → empty days → campaign never sends.
+_DAY_NAME_TO_NUM = {
+    "sunday": "0", "monday": "1", "tuesday": "2", "wednesday": "3",
+    "thursday": "4", "friday": "5", "saturday": "6",
+}
+_ALL_DAYS_NUMERIC = {str(i): True for i in range(7)}
+
+
+def _normalize_days(days: dict | None) -> dict:
+    """Map name-keyed day dicts to Instantly's numeric keys. Already-numeric passes through."""
+    if not days:
+        # default: Mon–Fri
+        return {"1": True, "2": True, "3": True, "4": True, "5": True}
+    out: dict = {}
+    for key, val in days.items():
+        num = _DAY_NAME_TO_NUM.get(str(key).lower(), str(key))
+        out[num] = bool(val)
+    return out
+
+
 def _build_instantly_schedule(body) -> dict:
     """Convert our send_schedule pydantic model into Instantly campaign_schedule."""
     sched = body.send_schedule
+    timezone = _TZ_REMAP.get(sched.timezone, sched.timezone)
     return {
         "schedules": [
             {
                 "name":     sched.schedule_name,
                 "timing":   {"from": sched.from_time, "to": sched.to_time},
-                "days":     sched.days or {
-                    "monday": True, "tuesday": True, "wednesday": True,
-                    "thursday": True, "friday": True,
-                },
-                "timezone": sched.timezone,
+                "days":     _normalize_days(sched.days),
+                "timezone": timezone,
             }
         ],
         "start_date": body.start_date.isoformat() if body.start_date else None,
         "end_date":   body.end_date.isoformat()   if body.end_date   else None,
+    }
+
+
+def _normalize_campaign_schedule(raw: dict) -> dict:
+    """
+    Coerce a send_schedule dict (flat UI shape OR already-nested) into the
+    Instantly campaign_schedule shape, with numeric day keys + remapped timezone.
+
+    Flat shape:   {from, to, timezone, days, schedule_name}
+    Nested shape: {schedules: [{name, timing:{from,to}, days, timezone}], start_date, end_date}
+    """
+    raw = dict(raw or {})
+    if "schedules" in raw:
+        schedules = []
+        for sc in raw.get("schedules") or []:
+            sc = dict(sc)
+            sc["days"] = _normalize_days(sc.get("days"))
+            tz = sc.get("timezone")
+            if tz:
+                sc["timezone"] = _TZ_REMAP.get(tz, tz)
+            schedules.append(sc)
+        out = dict(raw)
+        out["schedules"] = schedules
+        return out
+    # Flat shape → wrap into a single schedule entry
+    tz = raw.get("timezone", "America/Detroit")
+    return {
+        "schedules": [
+            {
+                "name":     raw.get("schedule_name", "Default"),
+                "timing":   {"from": raw.get("from", "09:00"), "to": raw.get("to", "17:00")},
+                "days":     _normalize_days(raw.get("days")),
+                "timezone": _TZ_REMAP.get(tz, tz),
+            }
+        ],
     }
 
 
@@ -345,7 +407,7 @@ def update_campaign(campaign_id: int, patch: dict) -> dict:
             camp.end_date = patch["end_date"]
             schedule_touched = True
         if schedule_touched:
-            sched = dict(camp.send_schedule or {})
+            sched = _normalize_campaign_schedule(camp.send_schedule or {})
             if camp.start_date:
                 sched["start_date"] = camp.start_date.isoformat()
             if camp.end_date:

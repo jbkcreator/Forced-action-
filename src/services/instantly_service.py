@@ -196,7 +196,8 @@ def create_campaign(
     except RuntimeError:
         raise
     except Exception as exc:
-        logger.error("[Instantly] create_campaign failed: %s", exc)
+        body = getattr(getattr(exc, "response", None), "text", "")
+        logger.error("[Instantly] create_campaign failed: %s — response: %s", exc, body)
         return None
 
 
