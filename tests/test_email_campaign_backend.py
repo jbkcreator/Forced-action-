@@ -64,8 +64,11 @@ class TestEmailTemplates:
         result = build_instantly_sequence(steps)
         assert len(result) == 2
         assert result[0]["type"] == "email"
-        assert result[0]["delay_days"] == 0
-        assert result[1]["delay_days"] == 4
+        # Instantly v2 shape: `delay` (days) + subject/body inside `variants`
+        assert result[0]["delay"] == 0
+        assert result[1]["delay"] == 4
+        assert result[0]["variants"][0]["subject"] == "Hi"
+        assert result[0]["variants"][0]["body"] == "Hello"
 
     def test_resolve_contact_variables_last_first_format(self):
         from src.services.email_templates import resolve_contact_variables

@@ -60,7 +60,12 @@ def _request(method: str, path: str, **kwargs) -> requests.Response:
     """
     url = f"{_base_url()}{path}"
     kwargs.setdefault("timeout", _DEFAULT_TIMEOUT)
-    kwargs["headers"] = _headers()
+    headers = _headers()
+    # Instantly (Fastify) rejects a JSON content-type with an empty body
+    # (FST_ERR_CTP_EMPTY_JSON_BODY) — only declare it when we send a body.
+    if "json" not in kwargs and "data" not in kwargs:
+        headers.pop("Content-Type", None)
+    kwargs["headers"] = headers
 
     time.sleep(_BASE_THROTTLE)
 
