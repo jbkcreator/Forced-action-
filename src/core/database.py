@@ -184,6 +184,21 @@ def get_db_context() -> Generator[Session, None, None]:
         yield session
 
 
+def get_db() -> Generator[Session, None, None]:
+    """
+    FastAPI dependency that yields a database session.
+    Identical to the get_db() defined in src/api/main.py — consolidated here
+    so services can import it without a circular dependency on main.
+
+    Usage:
+        @router.get("/foo")
+        def foo(db: Session = Depends(get_db)):
+            ...
+    """
+    with get_db_context() as session:
+        yield session
+
+
 def init_database() -> None:
     """
     Initialize the database by creating all tables.

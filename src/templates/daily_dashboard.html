@@ -4,6 +4,14 @@
 <meta charset="UTF-8"/>
 <title>Forced Action Daily Dashboard — {{ run_date }}</title>
 <style>
+{% if wl_branding %}
+/* ── White-label branding overrides ── */
+:root {
+  --fa-color-primary: {{ wl_branding.primary_color }};
+  --fa-color-accent:  {{ wl_branding.secondary_color }};
+  --wl-primary:       {{ wl_branding.primary_color }};
+}
+{% endif %}
 /* ── Reset ── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -243,7 +251,10 @@ tbody td { padding: 3.5px 6px; color: #334155; }
 <!-- ═══════════════════════════════ COVER ═══════════════════════════════ -->
 <div class="cover">
   <div style="flex:1;">
-    <h1>Forced Action — Daily Operations Dashboard</h1>
+    {% if wl_branding and wl_branding.logo_url %}
+    <img src="{{ wl_branding.logo_url }}" alt="{{ wl_branding.company_name }}" style="height:28px;margin-bottom:6px;object-fit:contain;" />
+    {% endif %}
+    <h1>{{ wl_branding.company_name if wl_branding else 'Forced Action' }} — Daily Operations Dashboard</h1>
     <div class="cover-meta">
       <span>Date: {{ run_date }}</span>
       <span>Counties: {{ county_label }}</span>

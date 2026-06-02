@@ -1052,6 +1052,14 @@ class Subscriber(Base):
     is_trial: Mapped[bool] = mapped_column(Boolean, server_default="false", nullable=False, default=False)
     trial_ends_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # ── Feed password login (fa061) ──────────────────────────────────────────
+    # NULL until the subscriber has a password. event_feed_uuid stays the feed
+    # identifier; these gate access behind a session JWT.
+    password_hash: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    password_set_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    reset_token_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    reset_token_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
     # Audit
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(
@@ -3886,3 +3894,328 @@ class PricingCohort(Base):
             f"<PricingCohort(county={self.county_id}, vertical={self.trade_vertical}, "
             f"type={self.price_type}, adj={self.adjustment_pct}%, status={self.status})>"
         )
+
+
+# ============================================================================
+# STAGE 12 — WHITE-LABEL TIER (fa056)
+# ============================================================================
+
+class WhiteLabelClient(Base):
+    """
+    A B2B company account paying $2,500/mo (standard) or $5,000/mo (premium)
+    for branded access to Forced Action distress property intelligence.
+    Completely separate from the solo-operator Subscriber model.
+    """
+    __tablename__ = "white_label_clients"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+
+    # Identity
+    company_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    company_slug: Mapped[str] = mapped_column(String(100), unique=True, nullable=False, index=True)
+    display_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    admin_email: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    admin_name: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    # Lifecycle
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="pending_verification", index=True)
+
+    # Plan the client selected during signup (intent only — NOT a paid plan).
+    # Used to pre-select the Subscribe option in Billing. plan_tier stays NULL
+    # until a Stripe subscription is actually created.
+    intended_plan_tier: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+
+    # Stripe billing
+    stripe_customer_id: Mapped[Optional[str]] = mapped_column(String(100), unique=True, nullable=True, index=True)
+    stripe_subscription_id: Mapped[Optional[str]] = mapped_column(String(100), unique=True, nullable=True)
+    plan_tier: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    plan_price_cents: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    trial_ends_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Branding
+    logo_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    primary_color: Mapped[Optional[str]] = mapped_column(String(7), nullable=True)   # e.g. "#fbbf24"
+    secondary_color: Mapped[Optional[str]] = mapped_column(String(7), nullable=True)
+
+    # Data access scope
+    counties_enabled: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)   # ["hillsborough","pinellas"]
+    verticals_enabled: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)  # ["roofing","wholesalers"]
+    api_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    api_requests_per_day: Mapped[int] = mapped_column(Integer, default=10000, nullable=False)
+
+    # Timestamps
+    verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    activated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    churned_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    # Relationships
+    users: Mapped[List["WhiteLabelUser"]] = relationship(
+        "WhiteLabelUser", back_populates="client", cascade="all, delete-orphan"
+    )
+    api_keys: Mapped[List["WhiteLabelApiKey"]] = relationship(
+        "WhiteLabelApiKey", back_populates="client", cascade="all, delete-orphan"
+    )
+    contractor_enrichments: Mapped[List["WhiteLabelContractorEnrichment"]] = relationship(
+        "WhiteLabelContractorEnrichment", back_populates="client", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending_verification','active','suspended','churned')",
+            name="check_wl_client_status",
+        ),
+        CheckConstraint(
+            "plan_tier IS NULL OR plan_tier IN ('standard','premium')",
+            name="check_wl_client_plan_tier",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return f"<WhiteLabelClient(id={self.id}, slug={self.company_slug}, status={self.status})>"
+
+
+class WhiteLabelUser(Base):
+    """
+    A team member belonging to a WhiteLabelClient.
+    First user (role=admin) is created at signup; others are invited by admins.
+    """
+    __tablename__ = "white_label_users"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    client_id: Mapped[int] = mapped_column(ForeignKey("white_label_clients.id"), nullable=False, index=True)
+
+    # Auth
+    email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    role: Mapped[str] = mapped_column(String(20), nullable=False, default="member")
+    password_hash: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    # State
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    email_verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Password reset
+    reset_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    reset_token_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Invite provenance
+    invited_by_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("white_label_users.id"), nullable=True
+    )
+
+    # Audit
+    last_login_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    # Relationships
+    client: Mapped["WhiteLabelClient"] = relationship("WhiteLabelClient", back_populates="users")
+    api_keys_created: Mapped[List["WhiteLabelApiKey"]] = relationship(
+        "WhiteLabelApiKey", back_populates="created_by_user", foreign_keys="WhiteLabelApiKey.created_by"
+    )
+
+    __table_args__ = (
+        CheckConstraint("role IN ('admin','member')", name="check_wl_user_role"),
+        Index("idx_wl_user_client_email", "client_id", "email"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<WhiteLabelUser(id={self.id}, email={self.email}, role={self.role})>"
+
+
+class WhiteLabelApiKey(Base):
+    """
+    API key for programmatic access to /api/wl/data/* endpoints.
+    Full key shown once at creation; only SHA-256 hash + 8-char prefix stored.
+    Key format: fa_wl_{32 hex chars}
+    """
+    __tablename__ = "white_label_api_keys"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    client_id: Mapped[int] = mapped_column(ForeignKey("white_label_clients.id"), nullable=False, index=True)
+
+    key_prefix: Mapped[str] = mapped_column(String(12), nullable=False, index=True)  # first 12 chars for display
+    key_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)   # SHA-256 hex of full key
+    label: Mapped[str] = mapped_column(String(100), nullable=False, default="Default")
+
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_by: Mapped[Optional[int]] = mapped_column(ForeignKey("white_label_users.id"), nullable=True)
+
+    # Usage tracking
+    requests_today: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    total_requests: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Lifecycle
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Relationships
+    client: Mapped["WhiteLabelClient"] = relationship("WhiteLabelClient", back_populates="api_keys")
+    created_by_user: Mapped[Optional["WhiteLabelUser"]] = relationship(
+        "WhiteLabelUser", back_populates="api_keys_created", foreign_keys=[created_by]
+    )
+
+    __table_args__ = (
+        Index("idx_wl_api_key_client_active", "client_id", "is_active"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<WhiteLabelApiKey(id={self.id}, prefix={self.key_prefix}, active={self.is_active})>"
+
+
+class WhiteLabelContractorEnrichment(Base):
+    """
+    Clay-enriched contractor data cache per (client, county, vertical).
+    Refreshed automatically when data is older than 7 days.
+    """
+    __tablename__ = "white_label_contractor_enrichments"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    client_id: Mapped[int] = mapped_column(ForeignKey("white_label_clients.id"), nullable=False, index=True)
+
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    vertical: Mapped[str] = mapped_column(String(50), nullable=False)
+
+    clay_run_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    data: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)  # list of contractor dicts
+    enriched_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    # Relationship
+    client: Mapped["WhiteLabelClient"] = relationship(
+        "WhiteLabelClient", back_populates="contractor_enrichments"
+    )
+
+    __table_args__ = (
+        UniqueConstraint("client_id", "county_id", "vertical", name="uq_wl_contractor_enrichment"),
+        Index("idx_wl_enrichment_client_county", "client_id", "county_id"),
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Stage 12: Bankruptcy Filing Alert Product (fa059)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class BankruptcyFiling(Base):
+    """One row per unique CourtListener bankruptcy docket (fa059).
+
+    case_number is the dedup key for ingestion. Stand-alone from the
+    property hub-and-spoke — this is product data for the alert subscription,
+    not a distress signal. All runtime I/O uses raw SQL via sa_text.
+    """
+    __tablename__ = "bankruptcy_filings"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    case_number: Mapped[str] = mapped_column(String(60), nullable=False, unique=True)
+    chapter: Mapped[Optional[str]] = mapped_column(String(4))
+    court: Mapped[str] = mapped_column(String(20), nullable=False)
+    jurisdiction: Mapped[str] = mapped_column(String(40), nullable=False)
+    filer: Mapped[Optional[str]] = mapped_column(String(255))
+    trustee: Mapped[Optional[str]] = mapped_column(String(255))
+    date_filed: Mapped[Optional[date]] = mapped_column(Date)
+    docket_id: Mapped[Optional[str]] = mapped_column(String(40))
+    nature_of_suit: Mapped[Optional[str]] = mapped_column(String(120))
+    raw: Mapped[Optional[dict]] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        Index("idx_bkfiling_date_filed", "date_filed"),
+        Index("idx_bkfiling_jurisdiction_chapter", "jurisdiction", "chapter"),
+        Index("idx_bkfiling_created_at", "created_at"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<BankruptcyFiling(case={self.case_number}, ch={self.chapter}, juris={self.jurisdiction})>"
+
+
+class BankruptcyAlertSubscription(Base):
+    """Standalone $297/mo subscriber for the Bankruptcy Filing Alert product (fa059).
+
+    Separate from the property `subscribers` table — these are attorneys,
+    investors, and lenders with no ZIP territory or vertical. access_token
+    (uuid) authenticates the subscriber-facing status endpoint.
+    """
+    __tablename__ = "bankruptcy_alert_subscriptions"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    email: Mapped[str] = mapped_column(String(255), nullable=False)
+    phone: Mapped[Optional[str]] = mapped_column(String(20))
+    name: Mapped[Optional[str]] = mapped_column(String(255))
+    stripe_customer_id: Mapped[Optional[str]] = mapped_column(String(100), unique=True)
+    stripe_subscription_id: Mapped[Optional[str]] = mapped_column(String(100), unique=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="trialing")
+    jurisdictions: Mapped[Optional[list]] = mapped_column(JSONB)   # NULL = all
+    chapters: Mapped[Optional[list]] = mapped_column(JSONB)        # NULL = all
+    channel_email: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    channel_sms: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    trial_ends_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    access_token: Mapped[str] = mapped_column(String(36), nullable=False, unique=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    canceled_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('trialing','active','past_due','canceled')",
+            name="check_bkalert_sub_status",
+        ),
+        Index("idx_bkalert_sub_status", "status"),
+        Index("idx_bkalert_sub_email", "email"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<BankruptcyAlertSubscription(id={self.id}, email={self.email}, status={self.status})>"
+
+
+class BankruptcyFilingAlert(Base):
+    """Dedup + audit log for bankruptcy filing alerts (fa059).
+
+    UNIQUE(subscription_id, filing_id, channel) guarantees a subscriber is
+    never alerted twice for the same filing on the same channel.
+    """
+    __tablename__ = "bankruptcy_filing_alerts"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscription_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("bankruptcy_alert_subscriptions.id", ondelete="CASCADE"), nullable=False
+    )
+    filing_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("bankruptcy_filings.id", ondelete="CASCADE"), nullable=False
+    )
+    channel: Mapped[str] = mapped_column(String(10), nullable=False)
+    status: Mapped[str] = mapped_column(String(12), nullable=False)
+    error: Mapped[Optional[str]] = mapped_column(Text)
+    sent_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("subscription_id", "filing_id", "channel", name="uq_bkfiling_alert_dedup"),
+        CheckConstraint("channel IN ('email','sms')", name="check_bkalert_channel"),
+        CheckConstraint("status IN ('sent','failed','suppressed')", name="check_bkalert_status"),
+        Index("idx_bkfiling_alert_sent_at", "sent_at"),
+        Index("idx_bkfiling_alert_subscription", "subscription_id"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<BankruptcyFilingAlert(sub={self.subscription_id}, filing={self.filing_id}, {self.channel}={self.status})>"

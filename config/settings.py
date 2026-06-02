@@ -110,6 +110,15 @@ class AppSettings(BaseSettings):
 	# Referral Core Loop
 	referral_free_month_coupon_id: Optional[str] = Field(default=None, env="REFERRAL_FREE_MONTH_COUPON_ID")
 
+	# Stage 12: Bankruptcy Filing Alert product ($297/mo). Shares the common
+	# Stripe webhook endpoint + signing secret (active_stripe_webhook_secret) —
+	# events are routed by product in stripe_webhooks.handle_webhook.
+	stripe_price_bankruptcy_alerts: Optional[str] = Field(default=None, env="STRIPE_PRICE_BANKRUPTCY_ALERTS")
+	stripe_test_price_bankruptcy_alerts: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_BANKRUPTCY_ALERTS")
+	# Delay (minutes) after a new signup before the bankruptcy-alert invite email
+	# is sent. The signup path schedules it; the invite-sweep cron sends it.
+	bankruptcy_invite_delay_minutes: int = Field(default=30, env="BANKRUPTCY_INVITE_DELAY_MINUTES")
+
 	# Test price IDs
 	stripe_test_price_starter_founding: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_STARTER_FOUNDING")
 	stripe_test_price_starter_regular: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_STARTER_REGULAR")
@@ -138,6 +147,9 @@ class AppSettings(BaseSettings):
 	stripe_test_price_premium_brief: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_PREMIUM_BRIEF")
 	stripe_test_price_premium_transfer: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_PREMIUM_TRANSFER")
 	stripe_test_price_premium_byol: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_PREMIUM_BYOL")
+
+	clay_dbpr_webhook_url: Optional[str] = Field(default=None, env="CLAY_DBPR_WEBHOOK_URL")
+
 
 	# ── Mode-aware helpers ────────────────────────────────────────────────────
 	# Use these everywhere instead of accessing live/test fields directly.
@@ -358,6 +370,45 @@ class AppSettings(BaseSettings):
 	prometheus_alert_webhook_secret: Optional[str] = Field(
 		default=None, env="PROMETHEUS_ALERT_WEBHOOK_SECRET"
 	)
+
+	# ── Stage 12 — White-label Tier (fa056) ─────────────────────────────────
+	# Separate JWT secret from admin_jwt_secret so WL and admin auth are
+	# independently rotatable. Falls back to admin_jwt_secret when unset (dev).
+	wl_jwt_secret: Optional[SecretStr] = Field(default=None, env="WL_JWT_SECRET")
+	# Stripe price IDs for $2,500/mo and $5,000/mo WL plans (live + test).
+	# Read via active_stripe_price("wl_standard" / "wl_premium") so STRIPE_TEST_MODE
+	# selects the right one automatically.
+	stripe_price_wl_standard: Optional[str] = Field(default=None, env="STRIPE_PRICE_WL_STANDARD")
+	stripe_price_wl_premium: Optional[str] = Field(default=None, env="STRIPE_PRICE_WL_PREMIUM")
+	stripe_test_price_wl_standard: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_WL_STANDARD")
+	stripe_test_price_wl_premium: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_WL_PREMIUM")
+	# Public base URL of the React frontend — used to build links in WL emails
+	# (verify-email, password reset, invites, login). Dev default points at the
+	# Vite dev server; set WL_FRONTEND_BASE_URL=https://app.forcedaction.io in prod.
+	wl_frontend_base_url: str = Field(default="http://localhost:5173", env="WL_FRONTEND_BASE_URL")
+	# Separate webhook secret for the /webhooks/stripe/white-label endpoint
+	wl_stripe_webhook_secret: Optional[SecretStr] = Field(default=None, env="WL_STRIPE_WEBHOOK_SECRET")
+	# Trial duration; set to 0 to disable trials
+	wl_trial_period_days: int = Field(default=14, env="WL_TRIAL_PERIOD_DAYS")
+	# Default daily API request cap per WL client (overridable per client in DB)
+	wl_api_requests_per_day: int = Field(default=10000, env="WL_API_REQUESTS_PER_DAY")
+	# Directory for WL client logo uploads (relative to repo root)
+	wl_logo_upload_dir: str = Field(default="reports/white_label_logos", env="WL_LOGO_UPLOAD_DIR")
+	# Clay enrichment API key (for /api/wl/data/contractors)
+	clay_api_key: Optional[SecretStr] = Field(default=None, env="CLAY_API_KEY")
+	clay_api_base: str = Field(default="https://api.clay.com/v1", env="CLAY_API_BASE")
+	# Days before cached Clay enrichment data is considered stale
+	clay_enrichment_ttl_days: int = Field(default=7, env="CLAY_ENRICHMENT_TTL_DAYS")
+	# Shared bearer secret Clay must send when calling our HTTP API enrichment
+	# endpoints (e.g. POST /api/clay/resolve-linkedin-url). Header:
+	#   Authorization: Bearer <CLAY_HTTP_API_SECRET>
+	# When unset, those endpoints return 503 (refuse to run unauthenticated).
+	clay_http_api_secret: Optional[SecretStr] = Field(default=None, env="CLAY_HTTP_API_SECRET")
+
+	# ── Subscriber feed auth (fa061) ────────────────────────────────────────
+	# JWT secret for subscriber feed login. Separate from admin/WL so it's
+	# independently rotatable; falls back to admin_jwt_secret when unset (dev).
+	subscriber_jwt_secret: Optional[SecretStr] = Field(default=None, env="SUBSCRIBER_JWT_SECRET")
 
 
 @lru_cache

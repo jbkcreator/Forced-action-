@@ -165,7 +165,24 @@ def handle_webhook(raw_body: bytes, sig_header: str, db: Session) -> tuple[bool,
         "charge.dispute.funds_withdrawn": _on_dispute_funds_withdrawn,
     }
 
-    handler = handlers.get(event_type)
+    # Stage 12 — the bankruptcy-alert product shares this endpoint + signing
+    # secret. Check ownership FIRST so a bankruptcy event routes to its own
+    # handler and never runs the property-subscriber path (ZIP lock, founding
+    # count, GHL push). resolve_handler returns None for non-bankruptcy events.
+    handler = None
+    try:
+        from src.services.bankruptcy_alert.subscription import resolve_handler as _bk_resolve
+        handler = _bk_resolve(event_type, data, db)
+        if handler is not None:
+            logger.info("Routing %s to bankruptcy-alert handler", event_type)
+    except Exception:
+        logger.warning(
+            "bankruptcy resolve_handler errored — falling back to property handlers",
+            exc_info=True,
+        )
+
+    if handler is None:
+        handler = handlers.get(event_type)
     if handler is None:
         logger.debug("Unhandled Stripe event type: %s", event_type)
         return True, "Ignored"
@@ -613,7 +630,24 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
     if is_new_subscriber:
         if subscriber.email:
             from src.services.email import send_welcome_email
-            send_welcome_email(subscriber)
+            # fa061 — emit a feed login password only if one wasn't already set
+            # (e.g. free signup that deferred its welcome email). If the subscriber
+            # already has a password, don't reset it — just send the welcome.
+            feed_password = None
+            try:
+                if not subscriber.password_hash:
+                    from src.services import subscriber_auth
+                    feed_password = subscriber_auth.generate_random_password()
+                    subscriber.password_hash = subscriber_auth.hash_password(feed_password)
+                    subscriber.password_set_at = datetime.now(timezone.utc)
+                    db.flush()
+            except Exception:
+                feed_password = None
+                logger.warning(
+                    "Feed password setup failed for subscriber %s — sending welcome without it",
+                    subscriber.id, exc_info=True,
+                )
+            send_welcome_email(subscriber, plaintext_password=feed_password)
 
         if subscriber.email and zip_codes:
             try:
@@ -623,6 +657,17 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
                     "First leads email failed for subscriber %s — non-critical",
                     subscriber.id, exc_info=True,
                 )
+
+        # Stage 12 — schedule the bankruptcy-alert invite (sent T+X min by the
+        # invite sweep). Best-effort; never breaks checkout processing.
+        try:
+            from src.services.bankruptcy_alert.invite import schedule_invite
+            schedule_invite(db, subscriber.id)
+        except Exception:
+            logger.warning(
+                "Bankruptcy invite scheduling failed for subscriber %s — non-critical",
+                subscriber.id, exc_info=True,
+            )
 
     # ── Partner tier: provision multi-ZIP access ──────────────────────────
     # When a subscriber upgrades to the partner tier via checkout, we need to

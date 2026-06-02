@@ -2770,13 +2770,43 @@ def send_dashboard_email(pdf_path: Path, run_date: date) -> bool:
     return any_ok
 
 
-def generate_dashboard_pdf(run_date: date | None = None) -> Path:
+def generate_dashboard_pdf(
+    run_date: date | None = None,
+    wl_client: dict | None = None,
+) -> Path:
+    """
+    Generate the daily dashboard PDF.
+
+    Args:
+        run_date:  Date for the report (defaults to today).
+        wl_client: Optional white-label branding dict:
+                   {company_name, logo_url, primary_color, secondary_color}
+                   When provided the PDF substitutes WL branding for Forced Action
+                   branding and writes to a WL-specific output path.
+    """
     run_date = run_date or date.today()
     DASHBOARD_DIR.mkdir(parents=True, exist_ok=True)
-    output_path = DASHBOARD_DIR / f"{run_date}_forced_action_daily_dashboard.pdf"
-    logger.info("[daily_dashboard] generating for %s", run_date)
+
+    if wl_client:
+        slug = wl_client.get("company_slug", "wl")
+        output_path = DASHBOARD_DIR / f"{run_date}_{slug}_daily_dashboard.pdf"
+    else:
+        output_path = DASHBOARD_DIR / f"{run_date}_forced_action_daily_dashboard.pdf"
+
+    logger.info("[daily_dashboard] generating for %s (wl=%s)", run_date, bool(wl_client))
     with get_db_context() as session:
         context = collect_dashboard_data(session, run_date)
+
+    if wl_client:
+        context["wl_branding"] = {
+            "company_name":   wl_client.get("display_name") or wl_client.get("company_name", ""),
+            "logo_url":       wl_client.get("logo_url"),
+            "primary_color":  wl_client.get("primary_color") or "#fbbf24",
+            "secondary_color": wl_client.get("secondary_color") or "#a855f7",
+        }
+    else:
+        context["wl_branding"] = None
+
     html = render_html(context)
     html_to_pdf(html, output_path)
     pruned = prune_old_dashboards(DASHBOARD_DIR)

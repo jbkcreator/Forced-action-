@@ -38,6 +38,11 @@ PRODUCTS = [
     {"key": "annual_lock",          "name": "Annual Lock",              "amount": 197000, "recurring": "year"},    # $1,970/yr ≈ $164/mo effective
     {"key": "auto_mode",            "name": "Auto Mode Add-On",         "amount": 7900,   "recurring": "month"},   # $79/mo, add-on for Starter Wallet
     {"key": "partner",              "name": "Partner",                  "amount": 200000, "recurring": "month"},   # $2,000/mo, multi-ZIP power users
+    # ── Stage 12 white-label tiers ───────────────────────────────────────────
+    {"key": "wl_standard",          "name": "White-label Standard",     "amount": 250000, "recurring": "month"},   # $2,500/mo
+    {"key": "wl_premium",           "name": "White-label Premium",      "amount": 500000, "recurring": "month"},   # $5,000/mo
+    # ── Stage 12 Bankruptcy Filing Alert product ─────────────────────────────
+    {"key": "bankruptcy_alerts",    "name": "Bankruptcy Filing Alerts", "amount": 29700,  "recurring": "month"},   # $297/mo
     # ── Phase 2B bundles ─────────────────────────────────────────────────────
     {"key": "bundle_weekend",       "name": "Bundle: Weekend Pack",     "amount": 1900,   "recurring": None},      # $19, Fri-Sun only
     {"key": "bundle_storm",         "name": "Bundle: Storm Pack",       "amount": 3900,   "recurring": None},      # $39, NWS-activated

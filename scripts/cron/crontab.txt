@@ -10,7 +10,7 @@
 #   CDS Scoring      → Daily @ 07:00 AM UTC (03:00 AM EDT / 12:30 PM IST)
 #   GHL CRM Sync     → Daily @ 08:00 AM UTC (04:00 AM EDT / 01:30 PM IST)
 #   Skip Tracing     → Daily @ 07:30 AM UTC (03:30 AM EDT / 01:00 PM IST) — after CDS, before GHL
-#   Daily Report     → Daily @ 09:30 AM UTC (05:30 AM EDT / 03:00 PM IST) — after all other jobs
+#   Daily Dashboard  → Daily @ 23:30 UTC Mon-Sat — last daily job, after every other task has run
 #
 # Date overlap strategy:
 #   Liens/Deeds/Judgments use --start-date 1 day ago (single combined job).
@@ -217,19 +217,15 @@ COUNTY_ID=hillsborough
 # Monday @ 09:30 AM UTC — runs after weekly_report so it can pick up fresh data
 30 9 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.weekly_one_pager $COUNTY_ID
 
-# ── DAILY REPORT ─────────────────────────────────────────────
-# Daily Ops Report — 09:30 AM UTC Mon-Sat (after all other jobs complete)
-# Writes reports/daily/report_YYYY-MM-DD.csv with scraper health + scoring summary
-30 9 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.daily_report
-
-# Pinellas daily report — 09:33 AM UTC Mon-Sat (staggered 3 min after Hillsborough)
-33 9 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.daily_report --county pinellas
-
 # ── DAILY DASHBOARD PDF ──────────────────────────────────────
-# 10-section executive PDF — 10:00 AM UTC Mon-Sat (after daily_report at 09:30)
+# 10-section executive PDF — 23:30 UTC Mon-Sat. Runs LAST in the daily cycle,
+# after every other daily job (final data tasks: insurance 22:23, building
+# permits 21:45, health_check 22:00), so the dashboard reflects the full day's
+# activity. Stays on the same UTC calendar date (run_date defaults to today),
+# and lands before the next day's 00:00 kill_switch_metric_ingest cycle.
 # Writes reports/daily_dashboard/YYYY-MM-DD_forced_action_daily_dashboard.pdf
 # 30-day retention; emails PDF to REPORT_RECIPIENTS (comma-separated in .env)
-0 10 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.daily_dashboard --send
+30 23 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.daily_dashboard --send
 
 # ── HEALTH CHECK — every 4 hours (logs to separate file for monitoring)
 0 2,6,10,14,18,22 * * * $PROJECT/scripts/cron/run.sh src.tasks.health_check
@@ -309,6 +305,22 @@ COUNTY_ID=hillsborough
 
 # Learning Card job — Sunday midnight UTC. Generates weekly performance cards for Cora's context.
 0 0 * * 0 $PROJECT/scripts/cron/run.sh src.tasks.learning_card_job
+
+# Stage 12 — Contractor Benchmark Report — Monday 11:00 UTC.
+# Generates CSV + PDF comparing each contractor to their trade/county peer group.
+# Outputs to reports/contractor_benchmark/. Flags AP upsell + AP Pro candidates.
+0 11 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.contractor_benchmark_report
+
+# Stage 12 — Bankruptcy Filing Alerts — daily 05:00 UTC (after the 04:15 bankruptcy
+# scraper window). Ingests new CourtListener filings, then dispatches deduped
+# email/SMS alerts to $297/mo subscribers. Self-monitors: ops email on API or
+# delivery failure; records a ScraperRunStats row (source_type=bankruptcy_alerts).
+0 5 * * * $PROJECT/scripts/cron/run.sh src.tasks.bankruptcy_alert_dispatch
+
+# Stage 12 — Bankruptcy-alert invite sweep — every 5 minutes. Sends invite emails
+# scheduled at signup (free or paid) once they reach T+BANKRUPTCY_INVITE_DELAY_MINUTES.
+# Mints a fresh Stripe checkout session per invite at send time. Idempotent.
+*/5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.bankruptcy_alert_invite_sweep
 
 # Retention summaries — daily 16:00 UTC. Emits retention_summary_due per tier cadence.
 0 16 * * * $PROJECT/scripts/cron/run.sh src.tasks.retention_event_producer
