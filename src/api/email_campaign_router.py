@@ -93,7 +93,9 @@ class SendScheduleIn(BaseModel):
     from_time: str = Field("09:00", alias="from")          # HH:MM
     to_time:   str = Field("17:00", alias="to")            # HH:MM
     days:      dict = Field(default_factory=dict)           # Instantly days object
-    timezone:  str = "America/New_York"
+    # Eastern: MUST be America/Detroit — Instantly's timezone enum rejects
+    # America/New_York / US/Eastern. (Verified against v2 /campaigns 2026-06-02.)
+    timezone:  str = "America/Detroit"
     schedule_name: str = "Default"
 
     class Config:

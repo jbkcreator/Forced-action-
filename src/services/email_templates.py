@@ -73,19 +73,25 @@ def collect_variables_used(steps: list[dict]) -> list[str]:
 
 def build_instantly_sequence(steps: list[dict]) -> list[dict]:
     """
-    Expand template steps into the Instantly sequence steps format.
-    Input step: {step_number, delay_days, subject, body}
-    Output:     {step_number, type, delay_days, subject, body}
+    Expand template steps into the Instantly v2 sequence step format.
+    Input step:  {step_number, delay_days, subject, body}
+    Output step: {type, delay, variants:[{subject, body}]}
+
+    Instantly v2 requires subject/body inside a `variants` array (one variant
+    here = no A/B split) and the inter-step gap field is `delay` (days), not
+    `delay_days`. Order is taken from array position. (Verified against
+    POST /api/v2/campaigns 2026-06-02 — a flat subject/body 400s.)
     """
     return [
         {
-            "step_number": step.get("step_number", idx + 1),
-            "type":        "email",
-            "delay_days":  step.get("delay_days", 0),
-            "subject":     step.get("subject", ""),
-            "body":        step.get("body", ""),
+            "type":     "email",
+            "delay":    step.get("delay_days", 0),
+            "variants": [{
+                "subject": step.get("subject", ""),
+                "body":    step.get("body", ""),
+            }],
         }
-        for idx, step in enumerate(steps)
+        for step in steps
     ]
 
 
