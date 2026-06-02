@@ -85,6 +85,20 @@ from src.api.alert_webhook_router import router as alert_webhook_router  # noqa:
 app.include_router(metrics_router)
 app.include_router(alert_webhook_router)
 
+from src.api.bankruptcy_alert_router import router as bankruptcy_alert_router  # noqa: E402
+app.include_router(bankruptcy_alert_router)
+
+from src.api.subscriber_router import router as subscriber_router  # noqa: E402
+from src.services.subscriber_auth import get_current_subscriber  # noqa: E402
+app.include_router(subscriber_router)
+
+from src.api.white_label_router import router as wl_router, admin_wl_router  # noqa: E402
+app.include_router(wl_router)
+app.include_router(admin_wl_router)
+
+from src.api.clay_router import router as clay_router  # noqa: E402
+app.include_router(clay_router)
+
 # Mount React build assets (JS/CSS chunks) if the dist directory exists
 if REACT_DIST.is_dir() and (REACT_DIST / "assets").is_dir():
     app.mount("/assets", StaticFiles(directory=str(REACT_DIST / "assets")), name="react-assets")
@@ -850,6 +864,44 @@ async def stripe_webhook(
 
 
 # ---------------------------------------------------------------------------
+# POST /webhooks/stripe/white-label — WL-specific Stripe events (fa056)
+# Uses a separate webhook secret so WL and core webhooks are independently
+# rotatable. Falls back to the primary secret if WL secret is not configured.
+# ---------------------------------------------------------------------------
+
+@app.post("/webhooks/stripe/white-label", status_code=200)
+async def stripe_wl_webhook(
+    request: Request,
+    stripe_signature: str = Header(None, alias="stripe-signature"),
+):
+    if not stripe_signature:
+        raise HTTPException(400, detail="Missing stripe-signature header")
+
+    raw_body = await request.body()
+    s = get_settings()
+    secret = s.wl_stripe_webhook_secret or s.stripe_webhook_secret
+    if not secret:
+        raise HTTPException(503, detail="WL Stripe webhook not configured")
+    webhook_secret = secret.get_secret_value() if hasattr(secret, "get_secret_value") else secret
+
+    try:
+        event = stripe.Webhook.construct_event(raw_body, stripe_signature, webhook_secret)
+    except stripe.error.SignatureVerificationError as exc:
+        logger.warning("[wl_webhook] signature rejected: %s", exc)
+        raise HTTPException(400, detail="Invalid webhook signature")
+
+    from src.services.white_label_billing import handle_wl_webhook_event
+    with get_db_context() as db:
+        try:
+            handle_wl_webhook_event(event, db)
+        except Exception as exc:
+            logger.error("[wl_webhook] unhandled error for %s: %s", event.type, exc, exc_info=True)
+            raise HTTPException(500, detail="Webhook processing failed")
+
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
 # GET /api/founding-summary — Total spots taken across all tiers for vertical
 # ---------------------------------------------------------------------------
 
@@ -1336,10 +1388,12 @@ def event_feed(
     incident_type: Optional[str] = Query(default=None),
     search: Optional[str] = Query(default=None, max_length=100),
     db: Session = Depends(get_db),
+    _auth=Depends(get_current_subscriber),
 ):
     """
     Subscriber-facing Event Feed.
-    Authenticated by event_feed_uuid in the URL.
+    Token-gated (fa061): requires a valid subscriber session JWT whose subject
+    owns this event_feed_uuid — enforced by get_current_subscriber (401/403/404).
     Returns scored leads within the subscriber's locked ZIP territories,
     filtered by their vertical's score, ordered by CDS score descending.
     """
@@ -1851,8 +1905,10 @@ _RESCORE_FLAG = Path(__file__).resolve().parent.parent.parent / "data" / "rescor
 
 
 @app.get("/api/feed/{feed_uuid}/stats")
-def feed_stats(feed_uuid: str, db: Session = Depends(get_db)):
-    """Aggregate stats for the subscriber's feed: totals, new today, tier breakdown."""
+def feed_stats(feed_uuid: str, db: Session = Depends(get_db), _auth=Depends(get_current_subscriber)):
+    """Aggregate stats for the subscriber's feed: totals, new today, tier breakdown.
+
+    Token-gated (fa061) via get_current_subscriber — same auth as the feed."""
     from datetime import date, timezone, datetime as _dt
 
     try:
@@ -2139,9 +2195,9 @@ def get_county_landing(county_id: str, db: Session = Depends(get_db)):
     }
 
 
-_ALLOWED_WAITLIST_COUNTIES = {"hillsborough", "pinellas"}
+_ALLOWED_WAITLIST_COUNTIES = { "pinellas"}
 
-# Counties that may show a landing page (superset of waitlist counties).
+
 _ALLOWED_LANDING_COUNTIES = {"hillsborough", "pinellas"}
 
 

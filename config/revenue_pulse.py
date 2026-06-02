@@ -32,6 +32,24 @@ KILL_SWITCH_LEVELS = [
 
 MAX_DAILY_SMS_CHARS = 320
 
+# ── Kill-Switch Metrics for Weekly Scorecard ────────────────────────────────
+# These 7 active metrics are graded Green/Yellow/Red every Monday in Revenue
+# Pulse. Each entry maps metric_name → abbreviated label for the SMS line.
+# Metrics that are intentionally inactive (cac_paid_channels, sms_cost_per_signup)
+# or partially computed with different semantics (free_tier_cost_ratio) are
+# excluded from the scorecard — they'd always show '?' and add noise.
+KILL_SWITCH_METRICS_WEEKLY = [
+    ("first_payment_rate",     "FPR"),
+    ("saved_card_rate",        "SCR"),
+    ("wallet_adoption",        "WA"),
+    ("lock_conversion",        "LC"),
+    ("retention_30d",          "R30"),
+    ("sms_reply_rate",         "SMS"),
+    ("offer_acceptance_rate",  "OAR"),
+]
+
+MAX_KILL_SWITCH_SCORECARD_CHARS = 80
+
 DAILY_PULSE_TEMPLATE = (
     "FA {date}: {lead_count} leads | {wallet_active} wallets | {top_deal}\n"
     "Alert: {alert}\n"

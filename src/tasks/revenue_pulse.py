@@ -25,6 +25,7 @@ from config.revenue_pulse import (
     VENDOR_COST_LINE_MAX_CHARS,
     WEEKLY_PULSE_TEMPLATE,
 )
+
 from config.settings import settings
 from src.core.database import get_db_context
 from src.core.models import (
@@ -195,6 +196,13 @@ def _compose_weekly(db: Session, county_id: str | None = None) -> str:
         learning=learning_str,
     )
 
+    # Append per-metric kill-switch scorecard if there's room.
+    ks_scorecard = _format_kill_switch_scorecard(db, county_id=county_id)
+    if ks_scorecard:
+        candidate = f"{body}\n{ks_scorecard}"
+        if len(candidate) <= MAX_DAILY_SMS_CHARS:
+            body = candidate
+
     # fa034: append a one-line Cora incidents summary if there's room.
     incidents_line = _format_cora_incidents_weekly_summary(db, county_id=county_id)
     if incidents_line:
@@ -256,6 +264,46 @@ def _format_cora_incident_alert(db: Session, county_id: str | None = None) -> st
         pieces.append(act)
     text = " — ".join(pieces)
     return text[:140]
+
+
+def _format_kill_switch_scorecard(db: Session, county_id: str | None = None) -> str | None:
+    """Return a compact per-metric Green/Yellow/Red scorecard line for the
+    weekly Revenue Pulse SMS.
+
+    Reads each of the 7 active kill-switch metrics from the Redis cache
+    (written daily by kill_switch_metric_ingest), grades them against their
+    KILL_SWITCH thresholds using _grade(), and formats a compact line.
+
+    Example:
+        "KS: FPR G | SCR Y | WA G | LC R | R30 G | SMS G | OAR G"
+
+    Returns None if the metrics list is empty or all metrics are '?' (no data).
+    """
+    from config.revenue_pulse import KILL_SWITCH_METRICS_WEEKLY, MAX_KILL_SWITCH_SCORECARD_CHARS
+    from src.tasks.cora_self_healing import _grade
+    from src.tasks.kill_switch_metric_ingest import get_cached_metric
+
+    parts = []
+    for metric_name, label in KILL_SWITCH_METRICS_WEEKLY:
+        value = get_cached_metric(metric_name, county_id=county_id)
+        grade = _grade(metric_name, value)
+        if grade == "unknown":
+            abbrev = "?"
+        elif grade == "green":
+            abbrev = "G"
+        elif grade == "yellow":
+            abbrev = "Y"
+        else:
+            abbrev = "R"
+        parts.append(f"{label} {abbrev}")
+
+    if not parts:
+        return None
+
+    line = "KS: " + " | ".join(parts)
+    if len(line) > MAX_KILL_SWITCH_SCORECARD_CHARS:
+        line = line[:MAX_KILL_SWITCH_SCORECARD_CHARS - 3] + "..."
+    return line
 
 
 def _format_cora_autonomy_weekly_summary(db: Session) -> str | None:

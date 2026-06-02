@@ -13,3 +13,4 @@ fa-agents.service
 src/static/
 venv/
 .claude/
+ext_tasks/

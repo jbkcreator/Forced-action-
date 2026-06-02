@@ -315,9 +315,22 @@ def create_free_account_by_email(
 			logger.warning("Referral processing failed for subscriber %d: %s", sub.id, exc)
 
 	if send_welcome:
+		# fa061 — set a feed login password now and email the plaintext in the
+		# welcome email (only the bcrypt hash is stored; plaintext never logged).
+		# When deferred (intent=upgrade/unlock) the password is left unset here and
+		# generated+emailed by the payment webhook instead.
+		try:
+			from src.services import subscriber_auth
+			feed_password = subscriber_auth.generate_random_password()
+			sub.password_hash = subscriber_auth.hash_password(feed_password)
+			sub.password_set_at = datetime.now(timezone.utc)
+			db.flush()
+		except Exception as exc:
+			feed_password = None
+			logger.warning("Feed password setup failed for subscriber %d: %s", sub.id, exc)
 		try:
 			from src.services.email import send_welcome_email
-			send_welcome_email(sub)
+			send_welcome_email(sub, plaintext_password=feed_password)
 		except Exception as exc:
 			logger.warning("Welcome email failed for new subscriber %d: %s", sub.id, exc)
 	else:
@@ -325,6 +338,14 @@ def create_free_account_by_email(
 			"Welcome email deferred for subscriber=%d — caller will send post-payment",
 			sub.id,
 		)
+
+	# Stage 12 — schedule the bankruptcy-alert invite (sent T+X min by the
+	# invite sweep). Best-effort; never blocks signup.
+	try:
+		from src.services.bankruptcy_alert.invite import schedule_invite
+		schedule_invite(db, sub.id)
+	except Exception:
+		logger.warning("Bankruptcy invite scheduling failed for subscriber %d", sub.id, exc_info=True)
 
 	return sub
 

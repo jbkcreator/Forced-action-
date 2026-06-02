@@ -245,6 +245,96 @@ class TestActionTriggers:
         mock_ab.assert_not_called()
         assert mock_post.call_args.kwargs["kind"] == "human_required"
 
+    def test_yellow_band_covers_sub_25pct_48h_escalation(self):
+        """FA-2B-v9 ambiguity: first_payment_rate at 24% (within Yellow 20-30% band)
+        for >48h → opens incident, then human_escalated.
+        This pins that the Yellow band ALREADY covers the spec's "below 25% for 48h"
+        trigger without any code change to the banding.
+
+        Observed=24 → Yellow (≥20? yes, ≥30? no, <20? no)
+        After 49h → action fires as human_escalated (first_payment_rate default policy).
+        """
+        from src.tasks.cora_self_healing import _process_metric, _Counters
+
+        # 24% → yellow in the 20-30% band. Open for 49h (past 48h threshold).
+        open_row = _ns(
+            id=13, metric_name="first_payment_rate", severity="yellow",
+            observed_value=24, threshold_value=30, baseline_value=30,
+            breach_started=datetime.now(timezone.utc) - timedelta(hours=49),
+            action_taken="no_op", county_id="hillsborough", feature_name=None,
+        )
+        session = _FakeSession([
+            _FakeResult(first=open_row),
+            _FakeResult(first=None),
+        ])
+        with patch("src.tasks.cora_self_healing.get_cached_metric", return_value=24), \
+             patch("src.tasks.cora_self_healing.compute_baseline", return_value=30), \
+             patch("src.tasks.cora_self_healing._apply_fallback") as mock_apply, \
+             patch("src.tasks.cora_self_healing._apply_ab_pause") as mock_ab, \
+             patch("src.tasks.cora_self_healing.post_incident_alert") as mock_post:
+            result = _process_metric(
+                session, metric_name="first_payment_rate", county_id="hillsborough",
+                feature_name=None, counters=_Counters(0), dry_run=False,
+            )
+        # First assertion: _grade says "yellow" for 24%
+        # (confirmed by test_higher_is_better_grades in TestGrade)
+        # Second assertion: after 49h it's escalated, not auto-corrected.
+        assert result["result"] == "human_escalated"
+        mock_apply.assert_not_called()
+        mock_ab.assert_not_called()
+        assert mock_post.call_args.kwargs["kind"] == "human_required"
+
+    def test_yellow_24pct_opens_incident_then_observes_before_48h(self):
+        """FA-2B-v9: first_payment_rate at 24% (Yellow) for <48h → opens
+        incident when no incident exists, then observes until 48h threshold.
+
+        This proves the self-healing pipeline starts tracking a <25% breach
+        immediately and doesn't wait for the value to cross into Red.
+        """
+        from src.tasks.cora_self_healing import _process_metric, _Counters
+
+        # No open incident yet, observed=24 (yellow), age irrelevant.
+        session = _FakeSession([
+            _FakeResult(first=None),              # no open incident
+            _FakeResult(first=_ns(c=0)),          # no new incidents last hour
+            _FakeResult(first=_ns(id=55)),         # INSERT returns id=55
+            _FakeResult(first=_ns(
+                id=55, metric_name="first_payment_rate", severity="yellow",
+                observed_value=24, threshold_value=30, baseline_value=None,
+                breach_started=datetime.now(timezone.utc), action_taken="no_op",
+                county_id="hillsborough", feature_name=None,
+            )),
+        ])
+        counters = _Counters(kill_recs_today=0)
+        with patch("src.tasks.cora_self_healing.get_cached_metric", return_value=24), \
+             patch("src.tasks.cora_self_healing.compute_baseline", return_value=None), \
+             patch("src.tasks.cora_self_healing.post_incident_alert") as mock_post:
+            result = _process_metric(
+                session, metric_name="first_payment_rate", county_id="hillsborough",
+                feature_name=None, counters=counters, dry_run=False,
+            )
+        assert result["result"] == "opened"
+        assert result["severity"] == "yellow"
+        assert counters.incidents_opened == 1
+
+        # Now simulate the next cron run: incident open, 24% still yellow,
+        # age <48h → "observing"
+        open_row = _ns(
+            id=55, metric_name="first_payment_rate", severity="yellow",
+            observed_value=24, threshold_value=30, baseline_value=None,
+            breach_started=datetime.now(timezone.utc) - timedelta(hours=10),
+            action_taken="no_op", county_id="hillsborough", feature_name=None,
+        )
+        session2 = _FakeSession([_FakeResult(first=open_row)])
+        with patch("src.tasks.cora_self_healing.get_cached_metric", return_value=24), \
+             patch("src.tasks.cora_self_healing.compute_baseline", return_value=None), \
+             patch("src.tasks.cora_self_healing.post_incident_alert"):
+            result2 = _process_metric(
+                session2, metric_name="first_payment_rate", county_id="hillsborough",
+                feature_name=None, counters=_Counters(0), dry_run=False,
+            )
+        assert result2["result"] == "observing"
+
     def test_7d_red_triggers_kill_recommendation_only(self):
         """6. open red incident for >7d → action_taken='feature_killed' (recommendation)."""
         from src.tasks.cora_self_healing import _process_metric, _Counters

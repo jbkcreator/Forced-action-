@@ -23,8 +23,8 @@ All times UTC. Add to the app-user's crontab on the production server (`crontab 
 # Unmatched record rematch — Sunday 3:30 AM UTC (before Monday scrapers)
 30 3 * * 0     cd /opt/forced-action && python -m src.tasks.rematch_unmatched
 
-# Daily ops report + stakeholder email — 8 AM UTC daily (after scoring completes at 7 AM)
-0 8 * * *      cd /opt/forced-action && python -m src.tasks.daily_report     >> /var/log/fa-daily-report.log 2>&1
+# Daily dashboard PDF + stakeholder email — 23:30 UTC daily (runs last, after every other daily job)
+30 23 * * *    cd /opt/forced-action && python -m src.tasks.daily_dashboard --send >> /var/log/fa-daily-dashboard.log 2>&1
 
 # Weekly ops report + stakeholder email — Monday 9 AM UTC (covers Mon–Fri of prior week)
 0 9 * * 1      cd /opt/forced-action && python -m src.tasks.weekly_report    >> /var/log/fa-weekly-report.log 2>&1
