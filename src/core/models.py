@@ -3340,12 +3340,6 @@ class DBPRContact(Base):
     company_name_status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
     company_name_scraped_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
-    email: Mapped[Optional[str]] = mapped_column(String(200))
-    work_email: Mapped[Optional[str]] = mapped_column(String(200))
-    phone: Mapped[Optional[str]] = mapped_column(String(20))
-    linkedin_url: Mapped[Optional[str]] = mapped_column(String(500))
-    company_linkedin_url: Mapped[Optional[str]] = mapped_column(String(500))
-    domain: Mapped[Optional[str]] = mapped_column(String(255))
     enrichment_status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
     enrichment_attempted_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
@@ -4410,6 +4404,25 @@ class SupplierSubscription(Base):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('trialing','active','past_due','canceled')",
+            name="ck_supplier_subscriptions_status",
+        ),
+        CheckConstraint(
+            "plan_tier IN ('foundation','standard','premium')",
+            name="ck_supplier_subscriptions_tier",
+        ),
+        Index("idx_supplier_subscriptions_account", "account_id"),
+        Index("idx_supplier_subscriptions_status", "status"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<SupplierSubscription(account={self.account_id}, tier={self.plan_tier}, status={self.status})>"
+
+
 # ============================================================================
 # EMAIL CAMPAIGNS (fa062)
 # ============================================================================
@@ -4484,19 +4497,16 @@ class EmailCampaign(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "status IN ('trialing','active','past_due','canceled')",
-            name="ck_supplier_subscriptions_status",
+            "status IN ('draft','active','paused','completed')",
+            name="check_campaign_status",
         ),
-        CheckConstraint(
-            "plan_tier IN ('foundation','standard','premium')",
-            name="ck_supplier_subscriptions_tier",
-        ),
-        Index("idx_supplier_subscriptions_account", "account_id"),
-        Index("idx_supplier_subscriptions_status", "status"),
+        Index("idx_email_campaign_status", "status"),
+        Index("idx_email_campaign_county", "county_id"),
+        Index("idx_email_campaign_vertical", "vertical"),
     )
 
     def __repr__(self) -> str:
-        return f"<SupplierSubscription(account={self.account_id}, tier={self.plan_tier}, status={self.status})>"
+        return f"<EmailCampaign(id={self.id}, name='{self.name}', status='{self.status}')>"
 
 
 class SupplierReport(Base):
@@ -4559,13 +4569,6 @@ class SupplierReportExport(Base):
 
     def __repr__(self) -> str:
         return f"<SupplierReportExport(report={self.report_id}, format={self.format})>"
-            "status IN ('draft','active','paused','completed')",
-            name="check_campaign_status",
-        ),
-    )
-
-    def __repr__(self) -> str:
-        return f"<EmailCampaign(id={self.id}, name='{self.name}', status='{self.status}')>"
 
 
 class CampaignContact(Base):
