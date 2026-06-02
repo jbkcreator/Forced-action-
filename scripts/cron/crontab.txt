@@ -246,6 +246,15 @@ COUNTY_ID=hillsborough
 # leaves found/none alone. First backfill (~6k rows) runs ~2.5h in one session.
 30 2 * * 0 $PROJECT/scripts/cron/run.sh src.scrappers.dbpr.dbpr_company_scraper
 
+# ── EMAIL CAMPAIGNS ──────────────────────────────────────────────────────────
+# Campaign contact top-up — daily 08:30 UTC (after enrichment at 07:30, before GHL 08:00 gap).
+# Pushes newly eligible DBPR contacts into active Instantly campaigns (batch ≤1000).
+30 8 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.email_campaign_topup
+# Campaign analytics + status sync — daily 22:00 UTC (before Daily Dashboard 23:30).
+# Pulls daily analytics snapshots + per-contact engagement status from Instantly.
+# Maps unsubscribe/hard-bounce to global suppression. Auto-completes exhausted campaigns.
+0 22 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.email_campaign_sync
+
 # ── STAGE 5: BUNDLES + AUTOPILOT + ANNUAL ───────────────────────────────────
 # Bundle dispatcher — every hour, contextually offers Weekend / Storm /
 # ZIP Booster / Monthly Reload bundles to wallet subscribers (with A/B pricing)

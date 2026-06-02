@@ -3337,6 +3337,26 @@ class DBPRContact(Base):
     enrichment_status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
     enrichment_attempted_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
+    # Clay enrichment provenance (fa062)
+    email_source: Mapped[Optional[str]] = mapped_column(String(20))  # clay|batchdata|raw
+    email_verified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    email_verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    clay_enriched_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    # Clay enrichment outputs — DDL already applied to DB; model synced here.
+    # Feed the email-campaign body merge variables (website/linkedIn/email).
+    work_email: Mapped[Optional[str]] = mapped_column(String(200))
+    domain: Mapped[Optional[str]] = mapped_column(String(255))           # {{website}}
+    linkedin_url: Mapped[Optional[str]] = mapped_column(String(255))     # {{linkedIn}} (personal)
+    company_linkedin_url: Mapped[Optional[str]] = mapped_column(String(255))
+    clay_synced: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    clay_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    # Global suppression flags — contact-level, survive all campaign membership (fa062)
+    is_opted_out: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    is_hard_bounced: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+    is_signed_up: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, index=True)
+
     email_status: Mapped[str] = mapped_column(String(20), nullable=False, default="not_sent")
     email_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
@@ -4226,3 +4246,167 @@ class BankruptcyFilingAlert(Base):
 
     def __repr__(self) -> str:
         return f"<BankruptcyFilingAlert(sub={self.subscription_id}, filing={self.filing_id}, {self.channel}={self.status})>"
+
+
+# ============================================================================
+# EMAIL CAMPAIGNS (fa062)
+# ============================================================================
+
+class EmailSequenceTemplate(Base):
+    """
+    FA-side reusable email sequence template.
+    Authored once; campaigns reference it. Steps are expanded into an
+    Instantly sequence via the API at campaign creation time.
+
+    steps: [{step_number, delay_days, subject, body}]
+    variables_used: ['{firstName}', '{company}', ...]  — validated whitelist
+    """
+    __tablename__ = "email_sequence_templates"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    steps: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    variables_used: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    def __repr__(self) -> str:
+        return f"<EmailSequenceTemplate(id={self.id}, name='{self.name}', steps={len(self.steps or [])})>"
+
+
+class EmailCampaign(Base):
+    """
+    One FA campaign = one Instantly campaign (1:1).
+
+    geo_filter: {county_id: str, zips: [str]}
+    send_schedule: Instantly campaign_schedule payload
+        {schedules: [{name, timing:{from,to}, days:{}, timezone}],
+         start_date, end_date}
+    status: draft → active → paused / completed
+    """
+    __tablename__ = "email_campaigns"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    instantly_campaign_id: Mapped[Optional[str]] = mapped_column(String(100), unique=True)
+    template_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("email_sequence_templates.id", ondelete="RESTRICT")
+    )
+    county_id: Mapped[Optional[str]] = mapped_column(String(50), index=True)
+    geo_filter: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    vertical: Mapped[Optional[str]] = mapped_column(String(50), index=True)
+    max_contacts: Mapped[Optional[int]] = mapped_column(Integer)
+    start_date: Mapped[Optional[date]] = mapped_column(Date)
+    end_date: Mapped[Optional[date]] = mapped_column(Date)
+    send_schedule: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    # Instantly-only campaign knobs not modeled as columns (fa063): daily_limit,
+    # daily_max_leads, email_list, stop_on_reply, open_tracking, link_tracking.
+    # Persisted here AND PATCHed to Instantly on edit.
+    instantly_settings: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(12), nullable=False, default="draft", index=True)
+    last_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('draft','active','paused','completed')",
+            name="check_campaign_status",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return f"<EmailCampaign(id={self.id}, name='{self.name}', status='{self.status}')>"
+
+
+class CampaignContact(Base):
+    """
+    M:N junction — one contractor in one campaign.
+    Concurrent active memberships across DIFFERENT campaigns are allowed.
+    UNIQUE(campaign_id, dbpr_contact_id) prevents duplicate within same campaign.
+
+    engagement_status: Instantly lead status (per-campaign, not global).
+    Global suppression (is_opted_out, is_hard_bounced, is_signed_up) lives on DBPRContact.
+    """
+    __tablename__ = "campaign_contacts"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    campaign_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("email_campaigns.id", ondelete="CASCADE"), nullable=False
+    )
+    dbpr_contact_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("dbpr_contacts.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    instantly_lead_id: Mapped[Optional[str]] = mapped_column(String(100))
+    engagement_status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
+    added_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+    )
+    last_activity_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    converted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        UniqueConstraint("campaign_id", "dbpr_contact_id", name="uq_campaign_contact"),
+        CheckConstraint(
+            "engagement_status IN "
+            "('active','completed','bounced','unsubscribed','interested','not_interested')",
+            name="check_engagement_status",
+        ),
+        Index("idx_cc_campaign_status", "campaign_id", "engagement_status"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<CampaignContact(campaign={self.campaign_id}, "
+            f"contact={self.dbpr_contact_id}, status='{self.engagement_status}')>"
+        )
+
+
+class CampaignDailyAnalytics(Base):
+    """
+    Daily analytics snapshot per campaign — one row per (campaign_id, date).
+    Pulled from Instantly once/day; enables "last 30 days" without live API calls.
+    """
+    __tablename__ = "campaign_daily_analytics"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    campaign_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("email_campaigns.id", ondelete="CASCADE"), nullable=False
+    )
+    snapshot_date: Mapped[date] = mapped_column(Date, nullable=False)
+    total_contacts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    emails_sent: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    opens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    open_rate: Mapped[Decimal] = mapped_column(Numeric(6, 4), nullable=False, default=0)
+    replies: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    reply_rate: Mapped[Decimal] = mapped_column(Numeric(6, 4), nullable=False, default=0)
+    clicks: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    bounces: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    unsubscribes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    interested: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+    )
+
+    __table_args__ = (
+        UniqueConstraint("campaign_id", "snapshot_date", name="uq_campaign_snapshot"),
+        Index("idx_cda_campaign_date", "campaign_id", "snapshot_date"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<CampaignDailyAnalytics(campaign={self.campaign_id}, "
+            f"date={self.snapshot_date}, open_rate={self.open_rate})>"
+        )
