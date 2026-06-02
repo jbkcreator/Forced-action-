@@ -43,10 +43,18 @@ def test_is_wl_event_no_metadata():
 # _on_checkout_completed
 # ---------------------------------------------------------------------------
 
+def _mock_stripe_sub(trial_end=None):
+    """Return a patch for stripe.Subscription.retrieve with no trial by default."""
+    sub = MagicMock()
+    sub.trial_end = trial_end
+    return patch("src.services.white_label_billing.stripe.Subscription.retrieve", return_value=sub)
+
+
 def test_checkout_completed_activates_client():
     db = MagicMock()
     existing = MagicMock()
     existing.status = "pending_verification"
+    existing.stripe_subscription_id = None   # not yet subscribed → should proceed
     existing.admin_email = "admin@test.com"
     existing.company_name = "Test Corp"
     db.execute.return_value.fetchone.return_value = existing
@@ -56,7 +64,8 @@ def test_checkout_completed_activates_client():
     session.subscription = "sub_123"
     session.customer = "cus_abc"
 
-    with patch("src.services.white_label_billing.send_activation_email") as mock_email:
+    with patch("src.services.white_label_billing.send_activation_email") as mock_email, \
+         _mock_stripe_sub():
         _on_checkout_completed(session, db)
 
     db.execute.assert_called()
@@ -68,9 +77,11 @@ def test_checkout_completed_skips_already_active():
     db = MagicMock()
     existing = MagicMock()
     existing.status = "active"
+    existing.stripe_subscription_id = "sub_123"  # matches session.subscription → idempotent skip
     db.execute.return_value.fetchone.return_value = existing
 
     session = MagicMock()
+    session.subscription = "sub_123"  # same ID → triggers the idempotency guard
     session.metadata = {"wl_client_id": "1", "plan_tier": "standard"}
 
     with patch("src.services.white_label_billing.send_activation_email") as mock_email:

@@ -22,8 +22,10 @@ from src.core.models import ReferralForwardCopy
 
 logger = logging.getLogger(__name__)
 
+from config.vertical_display import VERTICAL_LABELS  # noqa: E402 — imported after logger
+
 PROMPTS_DIR = Path(__file__).resolve().parents[2] / "config" / "prompts" / "referral_forward"
-VERTICALS = ["attorneys", "fix_flip", "public_adjusters", "restoration", "roofing", "wholesalers"]
+VERTICALS = sorted(VERTICAL_LABELS.keys())  # derived from config; add new verticals there
 
 MIN_BODY_LEN = 60
 MAX_BODY_LEN = 160

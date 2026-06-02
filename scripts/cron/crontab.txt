@@ -317,6 +317,11 @@ COUNTY_ID=hillsborough
 # Outputs to reports/contractor_benchmark/. Flags AP upsell + AP Pro candidates.
 0 11 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.contractor_benchmark_report
 
+# Supplier Intelligence Foundation — monthly reports, 1st of month 08:00 UTC.
+# Generates, renders PDF, and emails report to every active/trialing supplier account.
+# Idempotent: skips accounts already reported this calendar month.
+0 8 1 * * $PROJECT/scripts/cron/run.sh src.tasks.supplier_report_monthly
+
 # Stage 12 — Bankruptcy Filing Alerts — daily 05:00 UTC (after the 04:15 bankruptcy
 # scraper window). Ingests new CourtListener filings, then dispatches deduped
 # email/SMS alerts to $297/mo subscribers. Self-monitors: ops email on API or
@@ -337,6 +342,11 @@ COUNTY_ID=hillsborough
 # and caches in Redis (25hr TTL) so agent graphs can call kill_switch_status()
 # with real observed values.
 0 0,6,12,18 * * * $PROJECT/scripts/cron/run.sh src.tasks.kill_switch_metric_ingest
+
+# ICP Channel Metrics Ingest — 07:15 UTC daily (after kill_switch_metric_ingest at 06:00).
+# Computes raw counts per ICP channel keyed by icp_channel_key (not verticals).
+# Writes to icp_daily_stats; caches derived rates to Redis for kill-switch scoring.
+15 7 * * * $PROJECT/scripts/cron/run.sh src.tasks.icp_metrics_ingest
 
 # Gate metrics aggregator — every 6h at 01:00, 07:00, 13:00, 19:00 UTC
 # (always 1h after the metric ingest above so the cache is warm).

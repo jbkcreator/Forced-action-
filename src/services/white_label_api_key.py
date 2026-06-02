@@ -84,7 +84,7 @@ def validate_api_key(raw_key: str, db) -> dict:
                    c.id AS client_id, c.status AS client_status,
                    c.api_enabled, c.api_requests_per_day,
                    c.counties_enabled, c.verticals_enabled,
-                   c.company_name, c.plan_tier
+                   c.company_name, c.plan_tier, c.trial_ends_at
               FROM white_label_api_keys k
               JOIN white_label_clients c ON c.id = k.client_id
              WHERE k.key_prefix = :prefix AND k.key_hash = :hash

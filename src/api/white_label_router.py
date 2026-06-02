@@ -612,13 +612,21 @@ def billing_checkout(req: CheckoutRequest, user=Depends(require_admin_role), db:
     if not client:
         raise HTTPException(404, "Account not found")
 
-    result = create_wl_checkout(
-        client_id=client.id,
-        company_slug=client.company_slug,
-        admin_email=client.admin_email,
-        plan_tier=req.plan_tier,
-        include_trial=req.include_trial,
-    )
+    try:
+        result = create_wl_checkout(
+            client_id=client.id,
+            company_slug=client.company_slug,
+            admin_email=client.admin_email,
+            plan_tier=req.plan_tier,
+            include_trial=req.include_trial,
+        )
+    except ValueError as exc:
+        # Price ID not configured in .env (STRIPE_PRICE_WL_* or STRIPE_TEST_PRICE_WL_*)
+        raise HTTPException(
+            status_code=503,
+            detail=f"Stripe price not configured for plan '{req.plan_tier}': {exc}. "
+                   f"Set STRIPE_PRICE_WL_{req.plan_tier.upper()} (or the TEST variant) in .env.",
+        )
     return result
 
 
@@ -718,6 +726,35 @@ def api_key_usage(user=Depends(get_current_wl_user), db: Session = Depends(get_d
 # Data endpoints — JWT Bearer OR X-API-Key
 # ---------------------------------------------------------------------------
 
+def _require_subscription(client: dict) -> None:
+    """Raise 402 if the client has no active subscription or live trial.
+
+    Access is allowed when:
+      - plan_tier is set (subscription created in Stripe, paid or in trial), OR
+      - trial_ends_at is in the future (trial started but not yet lapsed).
+
+    A client whose email is verified but has never subscribed stays locked out
+    until they go through Stripe checkout. This prevents free lead scraping.
+    """
+    from datetime import datetime, timezone
+    plan_tier = client.get("plan_tier")
+    trial_ends_at = client.get("trial_ends_at")
+
+    has_plan = bool(plan_tier)
+    has_live_trial = (
+        trial_ends_at is not None
+        and datetime.now(timezone.utc) < (
+            trial_ends_at if trial_ends_at.tzinfo else trial_ends_at.replace(tzinfo=timezone.utc)
+        )
+    )
+
+    if not has_plan and not has_live_trial:
+        raise HTTPException(
+            status_code=402,
+            detail="No active subscription. Start your trial from the Billing tab to access leads.",
+        )
+
+
 def _get_data_client(
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_optional_bearer),
@@ -731,14 +768,17 @@ def _get_data_client(
     so that an API-key-only request is not rejected for lacking a JWT.
     """
     if x_api_key:
-        return validate_api_key(x_api_key, db)
+        client = validate_api_key(x_api_key, db)
+        _require_subscription(client)
+        return client
 
     if credentials:
         payload = verify_access_token(credentials.credentials)
         client_id = int(payload["cid"])
         client_row = db.execute(
             sa_text("""
-                SELECT id AS client_id, counties_enabled, verticals_enabled, status
+                SELECT id AS client_id, counties_enabled, verticals_enabled,
+                       status, plan_tier, trial_ends_at
                   FROM white_label_clients WHERE id = :cid
             """),
             {"cid": client_id},
@@ -747,7 +787,9 @@ def _get_data_client(
             raise HTTPException(401, "Client not found")
         if client_row.status == "suspended":
             raise HTTPException(403, "Company account suspended")
-        return dict(client_row._mapping)
+        client = dict(client_row._mapping)
+        _require_subscription(client)
+        return client
 
     raise HTTPException(401, "Authentication required (Bearer JWT or X-API-Key)")
 

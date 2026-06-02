@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Supplier Intelligence Report — {{ company_name }}</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", Arial, sans-serif; font-size: 10px; color: #1a1a2e; background: #fff; }
+
+  .cover { padding: 28px 24px 20px; border-bottom: 3px solid #1a1a2e; display: flex; justify-content: space-between; align-items: flex-end; }
+  .cover h1 { font-size: 20px; font-weight: 800; }
+  .cover .meta { font-size: 9px; color: #666; text-align: right; line-height: 1.7; }
+
+  .kpi-bar { display: flex; border-bottom: 1px solid #e5e7eb; }
+  .kpi { flex: 1; padding: 10px 14px; border-right: 1px solid #e5e7eb; }
+  .kpi:last-child { border-right: none; }
+  .kpi-label { font-size: 8px; text-transform: uppercase; letter-spacing: .06em; color: #6b7280; }
+  .kpi-value { font-size: 18px; font-weight: 700; margin-top: 2px; }
+  .kpi-sub { font-size: 8px; color: #9ca3af; }
+
+  .section { margin-top: 16px; }
+  .section-header { background: #1a1a2e; color: #fff; padding: 6px 14px; font-size: 11px; font-weight: 600; letter-spacing: .04em; display: flex; justify-content: space-between; align-items: center; }
+  .section-body { padding: 10px 14px; border: 1px solid #e5e7eb; border-top: none; }
+
+  /* N/A / Phase 2 cards */
+  .na-card { background: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 6px; padding: 12px 16px; margin: 4px 0; }
+  .na-card .na-title { font-size: 10px; font-weight: 600; color: #64748b; }
+  .na-card .na-body { font-size: 9px; color: #94a3b8; margin-top: 4px; line-height: 1.5; }
+  .na-card .na-badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 8px; font-weight: 600; background: #f1f5f9; color: #64748b; margin-bottom: 4px; }
+  .phase2-badge { background: #ede9fe; color: #6d28d9; }
+
+  table { width: 100%; border-collapse: collapse; margin-top: 4px; }
+  th { background: #f1f5f9; padding: 5px 8px; text-align: right; font-size: 8px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: #475569; border-bottom: 1px solid #e2e8f0; }
+  th:first-child { text-align: left; }
+  td { padding: 5px 8px; text-align: right; font-size: 9px; border-bottom: 1px solid #f1f5f9; }
+  td:first-child { text-align: left; font-weight: 500; }
+
+  .readiness-grid { display: flex; flex-wrap: wrap; gap: 6px; padding: 6px 0; }
+  .readiness-item { padding: 4px 10px; border-radius: 8px; font-size: 8px; font-weight: 600; }
+  .r-ok { background: #dcfce7; color: #15803d; }
+  .r-na { background: #fef9c3; color: #854d0e; }
+  .r-p2 { background: #ede9fe; color: #6d28d9; }
+
+  .footer { margin-top: 20px; padding: 8px 14px; border-top: 1px solid #e5e7eb; font-size: 8px; color: #9ca3af; display: flex; justify-content: space-between; }
+  .page-break { page-break-before: always; }
+</style>
+</head>
+<body>
+
+<!-- Cover -->
+<div class="cover">
+  <div>
+    <p style="font-size:11px;color:#6b7280;margin-bottom:4px;">Supplier Intelligence Report — Foundation</p>
+    <h1>{{ company_name }}</h1>
+    <p style="margin-top:5px;font-size:10px;color:#6b7280;">
+      {{ report.get('period_start','') }} — {{ report.get('period_end','') }}
+      {% if report.get('county_id') %} · {{ report.county_id | upper }}{% endif %}
+    </p>
+  </div>
+  <div class="meta">
+    Generated {{ generated_date }}<br>
+    {% if counties %}Counties: {{ counties | join(', ') }}<br>{% endif %}
+    {% if verticals %}Verticals: {{ verticals | join(', ') }}<br>{% endif %}
+    Forced Action Intelligence
+  </div>
+</div>
+
+<!-- Data Readiness Summary -->
+{% set sections = report.get('sections', {}) %}
+{% set readiness = report.get('data_readiness_snapshot', {}) %}
+<div class="kpi-bar">
+  <div class="kpi">
+    <div class="kpi-label">Report Phase</div>
+    <div class="kpi-value" style="font-size:13px;">Foundation</div>
+    <div class="kpi-sub">Phase 1 of Supplier Intelligence</div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-label">Sections Available</div>
+    <div class="kpi-value">{{ sections.values() | selectattr('status', 'equalto', 'ok') | list | length }}</div>
+    <div class="kpi-sub">of {{ sections | length }} total</div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-label">Insufficient Data</div>
+    <div class="kpi-value">{{ sections.values() | selectattr('status', 'equalto', 'insufficient_data') | list | length }}</div>
+    <div class="kpi-sub">sections need more data</div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-label">Phase 2</div>
+    <div class="kpi-value">{{ sections.values() | selectattr('status', 'equalto', 'phase2') | list | length }}</div>
+    <div class="kpi-sub">deferred to advanced analytics</div>
+  </div>
+</div>
+
+<!-- Readiness pills -->
+<div style="padding: 8px 14px; border-bottom: 1px solid #e5e7eb; background: #f8fafc;">
+  <p style="font-size: 8px; font-weight: 600; color: #6b7280; margin-bottom: 4px;">SECTION STATUS</p>
+  <div class="readiness-grid">
+    {% for key, data in sections.items() %}
+      {% set s = data.get('status','ok') %}
+      <span class="readiness-item {% if s == 'ok' %}r-ok{% elif s == 'phase2' %}r-p2{% else %}r-na{% endif %}">
+        {{ key | replace('_', ' ') | title }}:
+        {% if s == 'ok' %}✓{% elif s == 'phase2' %}Phase 2{% else %}N/A{% endif %}
+      </span>
+    {% endfor %}
+  </div>
+</div>
+
+<!-- Market Activity -->
+{% set ma = sections.get('market_activity', {}) %}
+<div class="section">
+  <div class="section-header"><span>MARKET ACTIVITY</span></div>
+  <div class="section-body">
+    {% if ma.get('status') == 'ok' %}
+    <table>
+      <thead><tr><th>Metric</th><th>30-Day</th><th>60-Day</th><th>Change</th></tr></thead>
+      <tbody>
+        <tr><td>Qualified Leads</td><td>{{ ma.leads_last_30d }}</td><td>{{ ma.leads_last_60d }}</td>
+          <td>{% if ma.period_change_pct is not none %}{{ "%+.1f" | format(ma.period_change_pct) }}%{% else %}—{% endif %}</td></tr>
+        <tr><td>Unique Properties</td><td colspan="3">{{ ma.unique_properties }}</td></tr>
+        {% if ma.signals %}
+        <tr><td>Foreclosures</td><td colspan="3">{{ ma.signals.get('foreclosures', 0) }}</td></tr>
+        <tr><td>Tax Delinquencies</td><td colspan="3">{{ ma.signals.get('tax_delinquencies', 0) }}</td></tr>
+        <tr><td>Code Violations</td><td colspan="3">{{ ma.signals.get('code_violations', 0) }}</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="na-card"><div class="na-badge">N/A</div><div class="na-body">{{ ma.get('message', 'Data unavailable.') }}</div></div>
+    {% endif %}
+  </div>
+</div>
+
+<!-- Top ZIPs -->
+{% set tz = sections.get('top_zips', {}) %}
+<div class="section">
+  <div class="section-header"><span>TOP ZIPs BY LEAD COUNT</span></div>
+  <div class="section-body">
+    {% if tz.get('status') == 'ok' and tz.top_zips %}
+    <table>
+      <thead><tr><th>ZIP</th><th>Lead Count</th><th>Premium (Plat+)</th></tr></thead>
+      <tbody>
+        {% for z in tz.top_zips %}
+        <tr><td>{{ z.zip or '—' }}</td><td>{{ z.lead_count }}</td><td>{{ z.premium_count }}</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% elif tz.get('status') == 'ok' %}
+    <p style="color:#94a3b8;font-size:9px;padding:6px 0;">No ZIPs met the minimum lead threshold yet.</p>
+    {% else %}
+    <div class="na-card"><div class="na-badge">N/A</div><div class="na-body">{{ tz.get('message', 'Data unavailable.') }}</div></div>
+    {% endif %}
+  </div>
+</div>
+
+<!-- Signal Movement -->
+{% set sm = sections.get('signal_movement', {}) %}
+<div class="section">
+  <div class="section-header"><span>SIGNAL MOVEMENT</span></div>
+  <div class="section-body">
+    {% if sm.get('status') == 'ok' %}
+    <table>
+      <thead><tr><th>Signal</th><th>30d</th><th>60d</th><th>90d</th></tr></thead>
+      <tbody>
+        {% if sm.foreclosures %}<tr><td>Foreclosures</td><td>{{ sm.foreclosures['30d'] }}</td><td>{{ sm.foreclosures['60d'] }}</td><td>{{ sm.foreclosures['90d'] }}</td></tr>{% endif %}
+      </tbody>
+    </table>
+    {% if sm.note %}<p style="font-size:8px;color:#94a3b8;margin-top:4px;">{{ sm.note }}</p>{% endif %}
+    {% else %}
+    <div class="na-card"><div class="na-badge">N/A</div><div class="na-body">{{ sm.get('message', 'Data unavailable.') }}</div></div>
+    {% endif %}
+  </div>
+</div>
+
+<!-- Property Tier Distribution -->
+{% set pt = sections.get('property_tier_dist', {}) %}
+<div class="section">
+  <div class="section-header"><span>PROPERTY TIER DISTRIBUTION</span></div>
+  <div class="section-body">
+    {% if pt.get('status') == 'ok' %}
+    <table>
+      <thead><tr><th>Tier</th><th>Count</th><th>% of Total</th></tr></thead>
+      <tbody>
+        {% for tier, data in pt.distribution.items() %}
+        <tr><td>{{ tier }}</td><td>{{ data.count }}</td><td>{{ data.pct }}%</td></tr>
+        {% endfor %}
+        <tr style="font-weight:700;"><td>Total</td><td>{{ pt.total }}</td><td>100%</td></tr>
+      </tbody>
+    </table>
+    {% else %}
+    <div class="na-card"><div class="na-badge">N/A</div><div class="na-body">{{ pt.get('message', 'Data unavailable.') }}</div></div>
+    {% endif %}
+  </div>
+</div>
+
+<!-- Trade Coverage -->
+{% set tc = sections.get('trade_coverage', {}) %}
+<div class="section">
+  <div class="section-header"><span>TRADE COVERAGE</span></div>
+  <div class="section-body">
+    {% if tc.get('status') == 'ok' and tc.verticals %}
+    <table>
+      <thead><tr><th>Vertical</th><th>Leads Sent (30d)</th></tr></thead>
+      <tbody>
+        {% for v in tc.verticals %}<tr><td>{{ v.vertical | replace('_',' ') | title }}</td><td>{{ v.lead_count }}</td></tr>{% endfor %}
+      </tbody>
+    </table>
+    {% elif tc.get('status') == 'ok' %}
+    <p style="color:#94a3b8;font-size:9px;padding:6px 0;">No active subscriber trade data found for covered territory.</p>
+    {% else %}
+    <div class="na-card"><div class="na-badge">N/A</div><div class="na-body">{{ tc.get('message', 'Data unavailable.') }}</div></div>
+    {% endif %}
+  </div>
+</div>
+
+<div class="page-break"></div>
+
+<!-- Closed-Deal Benchmarks — gated -->
+{% set cd = sections.get('closed_deal_benchmarks', {}) %}
+<div class="section">
+  <div class="section-header"><span>CLOSED-DEAL BENCHMARKS</span></div>
+  <div class="section-body">
+    {% if cd.get('status') == 'ok' %}
+    <table>
+      <thead><tr><th>Metric</th><th>Value</th></tr></thead>
+      <tbody>
+        <tr><td>Avg Deal Size</td><td>${{ "{:,.0f}".format(cd.avg_deal_size_usd) }}</td></tr>
+        <tr><td>Avg Days to Close</td><td>{{ "%.0f" | format(cd.avg_days_to_close) }}d</td></tr>
+        <tr><td>Close Rate</td><td>{{ cd.close_rate_pct }}%</td></tr>
+        <tr><td>Sample Size</td><td>{{ cd.sample_size }} deals</td></tr>
+      </tbody>
+    </table>
+    {% elif cd.get('status') == 'insufficient_data' %}
+    <div class="na-card">
+      <div class="na-badge">Insufficient Data</div>
+      <div class="na-title">{{ cd.current_count }} / {{ cd.minimum_required }} closed deals required</div>
+      <div class="na-body">{{ cd.message }}</div>
+    </div>
+    {% else %}
+    <div class="na-card"><div class="na-badge">N/A</div><div class="na-body">{{ cd.get('message', 'Data unavailable.') }}</div></div>
+    {% endif %}
+  </div>
+</div>
+
+<!-- Contractor Demand — gated -->
+{% set dem = sections.get('contractor_demand', {}) %}
+<div class="section">
+  <div class="section-header"><span>CONTRACTOR DEMAND TREND</span></div>
+  <div class="section-body">
+    {% if dem.get('status') == 'ok' %}
+    <table>
+      <thead><tr><th>Metric</th><th>Value</th></tr></thead>
+      <tbody>
+        <tr><td>Active Subscribers</td><td>{{ dem.active_subscriber_count }}</td></tr>
+        <tr><td>Active Buyers (30d)</td><td>{{ dem.active_buyers_30d }}</td></tr>
+        <tr><td>Leads Consumed (30d)</td><td>{{ dem.leads_consumed_30d }}</td></tr>
+      </tbody>
+    </table>
+    {% elif dem.get('status') == 'insufficient_data' %}
+    <div class="na-card">
+      <div class="na-badge">Insufficient Data</div>
+      <div class="na-title">{{ dem.current_count }} / {{ dem.minimum_required }} subscribers required</div>
+      <div class="na-body">{{ dem.message }}</div>
+    </div>
+    {% else %}
+    <div class="na-card"><div class="na-badge">N/A</div><div class="na-body">{{ dem.get('message', 'Data unavailable.') }}</div></div>
+    {% endif %}
+  </div>
+</div>
+
+<!-- Recommendations — Phase 2 -->
+{% set rec = sections.get('recommendations', {}) %}
+<div class="section">
+  <div class="section-header" style="background:#5b21b6;"><span>RECOMMENDATIONS</span><span style="font-size:9px;background:rgba(255,255,255,.15);padding:2px 8px;border-radius:8px;">Phase 2</span></div>
+  <div class="section-body">
+    <div class="na-card">
+      <div class="na-badge phase2-badge">Phase 2 — Coming Soon</div>
+      <div class="na-body">{{ rec.get('message', 'AI-driven recommendations are coming in Phase 2.') }}</div>
+    </div>
+  </div>
+</div>
+
+<div class="footer">
+  <span>Forced Action Intelligence — Supplier Report · {{ company_name }} · {{ generated_date }}</span>
+  <span>Phase 1 Foundation · Sections marked N/A activate when data thresholds are met</span>
+</div>
+
+</body>
+</html>

@@ -16,6 +16,7 @@ from typing import Optional
 from sqlalchemy.orm import Session
 
 from config.settings import settings
+from config.vertical_display import DEFAULT_VERTICAL
 from src.core.models import Subscriber
 from src.services.sms_compliance import can_send, send_sms
 
@@ -202,7 +203,7 @@ def _normalize_phone(raw: Optional[str]) -> Optional[str]:
 def create_free_account_by_email(
 	email: str,
 	db: Session,
-	vertical: str = "roofing",
+	vertical: str = DEFAULT_VERTICAL,
 	county_id: str = "hillsborough",
 	name: Optional[str] = None,
 	referral_code: Optional[str] = None,

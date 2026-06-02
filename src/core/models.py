@@ -1067,6 +1067,13 @@ class Subscriber(Base):
     reset_token_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     reset_token_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # ── ICP channel attribution (fa066) ──────────────────────────────────────
+    # Explicit ICP attribution. Verticals can overlap between ICPs so scoping
+    # by vertical alone is unsafe. Default 'contractor' for all existing rows.
+    icp_channel_key: Mapped[str] = mapped_column(
+        String(40), nullable=False, default="contractor", server_default="contractor"
+    )
+
     # Audit
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(
@@ -1079,6 +1086,7 @@ class Subscriber(Base):
         Index("idx_subscriber_status", "status"),
         Index("idx_subscriber_vertical", "vertical"),
         Index("idx_subscriber_signal_score", "revenue_signal_score"),
+        Index("idx_subscribers_icp_channel_key", "icp_channel_key"),
         CheckConstraint(
             "tier IN ('free', 'starter', 'pro', 'dominator', 'data_only', 'autopilot_lite', 'autopilot_pro', 'partner', 'annual_lock')",
             name="check_subscriber_tier",
@@ -3333,7 +3341,11 @@ class DBPRContact(Base):
     company_name_scraped_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
     email: Mapped[Optional[str]] = mapped_column(String(200))
+    work_email: Mapped[Optional[str]] = mapped_column(String(200))
     phone: Mapped[Optional[str]] = mapped_column(String(20))
+    linkedin_url: Mapped[Optional[str]] = mapped_column(String(500))
+    company_linkedin_url: Mapped[Optional[str]] = mapped_column(String(500))
+    domain: Mapped[Optional[str]] = mapped_column(String(255))
     enrichment_status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
     enrichment_attempted_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
@@ -3344,6 +3356,11 @@ class DBPRContact(Base):
     signed_up_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
     last_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    # Clay CRM sync
+    clay_synced: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    clay_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc), nullable=False)
 
@@ -3369,6 +3386,7 @@ class DBPRContact(Base):
         Index("idx_dbpr_enrichment_status", "enrichment_status"),
         Index("idx_dbpr_email_status", "email_status"),
         Index("idx_dbpr_last_synced", "last_synced_at"),
+        Index("idx_dbpr_clay_synced", "clay_synced"),
     )
 
     def __repr__(self):
@@ -4226,3 +4244,228 @@ class BankruptcyFilingAlert(Base):
 
     def __repr__(self) -> str:
         return f"<BankruptcyFilingAlert(sub={self.subscription_id}, filing={self.filing_id}, {self.channel}={self.status})>"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Stage 12+ — ICP Channel Management (fa066)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class IcpDailyStats(Base):
+    """Per-ICP-channel daily raw metric counts (fa066).
+
+    Percentages (first_payment_rate, saved_card_rate, etc.) are computed
+    at read time from raw counts so kill-switch scores are fully auditable.
+    Attribution is on icp_channel_key, NOT verticals (verticals overlap ICPs).
+    """
+    __tablename__ = "icp_daily_stats"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    run_date: Mapped[date] = mapped_column(Date, nullable=False)
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    icp_channel_key: Mapped[str] = mapped_column(String(40), nullable=False)
+
+    signup_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    payer_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    saved_card_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    sms_sent_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    sms_reply_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    active_subscriber_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cancel_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    refund_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    mrr_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "run_date", "county_id", "icp_channel_key",
+            name="uq_icp_daily_stats_date_county_channel",
+        ),
+        Index("idx_icp_daily_stats_channel_date", "icp_channel_key", "run_date"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<IcpDailyStats(channel={self.icp_channel_key}, date={self.run_date}, mrr={self.mrr_cents})>"
+
+
+class IcpChannelLaunchAudit(Base):
+    """Immutable event log for every ICP channel status transition (fa066).
+
+    Force activations require a reason and are flagged with is_force_activate=True.
+    gate_snapshot stores the full gate evaluation at the time of the action.
+    """
+    __tablename__ = "icp_channel_launch_audit"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    channel_key: Mapped[str] = mapped_column(String(40), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    actor: Mapped[str] = mapped_column(String(100), nullable=False)
+    is_force_activate: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    force_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    gate_snapshot: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    prev_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    new_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    detail: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "event_type IN ("
+            "'activated','paused','killed','force_activated',"
+            "'config_updated','gate_evaluated','created'"
+            ")",
+            name="ck_icp_audit_event_type",
+        ),
+        Index("idx_icp_audit_channel_created", "channel_key", "created_at"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<IcpChannelLaunchAudit(channel={self.channel_key}, event={self.event_type})>"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Supplier Intelligence Foundation (fa067)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class SupplierAccount(Base):
+    """One row per supplier company (fa067).
+
+    Phase 1 foundation — admin-provisioned, no self-signup flow.
+    access_token is the UUID passed to the supplier for dashboard access.
+    """
+    __tablename__ = "supplier_accounts"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    company_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    contact_name: Mapped[Optional[str]] = mapped_column(String(255))
+    contact_email: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
+    counties: Mapped[Optional[list]] = mapped_column(JSONB)   # list of county_id strings
+    verticals: Mapped[Optional[list]] = mapped_column(JSONB)  # list of vertical codes
+    access_token: Mapped[str] = mapped_column(String(36), nullable=False, unique=True)
+    stripe_customer_id: Mapped[Optional[str]] = mapped_column(String(100), unique=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint("status IN ('active','suspended','canceled')", name="ck_supplier_accounts_status"),
+        Index("idx_supplier_accounts_email", "contact_email"),
+        Index("idx_supplier_accounts_status", "status"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<SupplierAccount(id={self.id}, company={self.company_name}, status={self.status})>"
+
+
+class SupplierSubscription(Base):
+    """Stripe subscription for a supplier account (fa067)."""
+    __tablename__ = "supplier_subscriptions"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("supplier_accounts.id", ondelete="CASCADE"), nullable=False
+    )
+    plan_tier: Mapped[str] = mapped_column(String(20), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="trialing")
+    stripe_subscription_id: Mapped[Optional[str]] = mapped_column(String(100), unique=True)
+    stripe_price_id: Mapped[Optional[str]] = mapped_column(String(100))
+    price_cents: Mapped[Optional[int]] = mapped_column(Integer)
+    trial_ends_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    canceled_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('trialing','active','past_due','canceled')",
+            name="ck_supplier_subscriptions_status",
+        ),
+        CheckConstraint(
+            "plan_tier IN ('foundation','standard','premium')",
+            name="ck_supplier_subscriptions_tier",
+        ),
+        Index("idx_supplier_subscriptions_account", "account_id"),
+        Index("idx_supplier_subscriptions_status", "status"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<SupplierSubscription(account={self.account_id}, tier={self.plan_tier}, status={self.status})>"
+
+
+class SupplierReport(Base):
+    """Generated intelligence report for a supplier account (fa067).
+
+    sections_json stores per-section data or {"status": "insufficient_data", ...}.
+    data_readiness_snapshot records threshold vs actual counts at generation time.
+    """
+    __tablename__ = "supplier_reports"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("supplier_accounts.id", ondelete="CASCADE"), nullable=False
+    )
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    generated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    report_period_start: Mapped[Optional[date]] = mapped_column(Date)
+    report_period_end: Mapped[Optional[date]] = mapped_column(Date)
+    sections_json: Mapped[Optional[dict]] = mapped_column(JSONB)
+    data_readiness_snapshot: Mapped[Optional[dict]] = mapped_column(JSONB)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    error_message: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending','generated','failed','exported')",
+            name="ck_supplier_reports_status",
+        ),
+        Index("idx_supplier_reports_account_date", "account_id", "created_at"),
+        Index("idx_supplier_reports_status", "status"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<SupplierReport(id={self.id}, account={self.account_id}, status={self.status})>"
+
+
+class SupplierReportExport(Base):
+    """PDF or CSV export of a supplier report (fa067)."""
+    __tablename__ = "supplier_report_exports"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    report_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("supplier_reports.id", ondelete="CASCADE"), nullable=False
+    )
+    format: Mapped[str] = mapped_column(String(10), nullable=False)
+    file_path: Mapped[Optional[str]] = mapped_column(Text)
+    exported_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    emailed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint("format IN ('pdf','csv')", name="ck_supplier_report_exports_format"),
+        Index("idx_supplier_report_exports_report", "report_id"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<SupplierReportExport(report={self.report_id}, format={self.format})>"
