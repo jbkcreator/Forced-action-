@@ -9,7 +9,7 @@ Covers:
 """
 
 import logging
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import HTTPException
@@ -434,10 +434,65 @@ def list_campaigns(status: Optional[str] = None) -> list[dict]:
         return result
 
 
+def get_campaign_detail(campaign_id: int) -> Optional[dict]:
+    """
+    Campaign config + live contact count + latest daily-analytics snapshot.
+    Returns None if the campaign does not exist (router maps to 404).
+    Analytics fields are 0 when no snapshot exists yet (fresh/draft campaign).
+    """
+    with get_db_context() as db:
+        camp = db.get(EmailCampaign, campaign_id)
+        if not camp:
+            return None
+
+        contact_count = (
+            db.query(func.count(CampaignContact.id))
+            .filter(CampaignContact.campaign_id == campaign_id)
+            .scalar() or 0
+        )
+        snap = (
+            db.query(CampaignDailyAnalytics)
+            .filter(CampaignDailyAnalytics.campaign_id == campaign_id)
+            .order_by(CampaignDailyAnalytics.snapshot_date.desc())
+            .first()
+        )
+
+        return {
+            # config
+            "id": camp.id,
+            "name": camp.name,
+            "instantly_campaign_id": camp.instantly_campaign_id,
+            "template_id": camp.template_id,
+            "county_id": camp.county_id,
+            "geo_filter": camp.geo_filter,
+            "vertical": camp.vertical,
+            "max_contacts": camp.max_contacts,
+            "start_date": camp.start_date,
+            "end_date": camp.end_date,
+            "send_schedule": camp.send_schedule,
+            "status": camp.status,
+            "last_synced_at": camp.last_synced_at,
+            "created_at": camp.created_at,
+            "updated_at": camp.updated_at,
+            # live count
+            "contact_count": contact_count,
+            # latest snapshot (analytics cards) — 0 when no snapshot yet
+            "snapshot_date":  snap.snapshot_date if snap else None,
+            "emails_sent":    snap.emails_sent if snap else 0,
+            "opens":          snap.opens if snap else 0,
+            "open_rate":      float(snap.open_rate) if snap else 0.0,
+            "replies":        snap.replies if snap else 0,
+            "reply_rate":     float(snap.reply_rate) if snap else 0.0,
+            "clicks":         snap.clicks if snap else 0,
+            "bounces":        snap.bounces if snap else 0,
+            "unsubscribes":   snap.unsubscribes if snap else 0,
+            "interested":     snap.interested if snap else 0,
+        }
+
+
 def get_summary() -> dict:
     """Dashboard widget — last 30 days aggregates from snapshots."""
-    from datetime import timedelta
-    cutoff = date.today().replace(day=1)  # start of current month approx
+    cutoff = date.today() - timedelta(days=30)  # true rolling 30-day window
 
     with get_db_context() as db:
         active_count = db.query(func.count(EmailCampaign.id)).filter_by(status="active").scalar() or 0

@@ -131,6 +131,39 @@ class CampaignOut(BaseModel):
         from_attributes = True
 
 
+class CampaignDetailOut(BaseModel):
+    """Detail view: config + live contact count + latest analytics snapshot."""
+    # config
+    id: int
+    name: str
+    instantly_campaign_id: Optional[str]
+    template_id: Optional[int]
+    county_id: Optional[str]
+    geo_filter: dict
+    vertical: Optional[str]
+    max_contacts: Optional[int]
+    start_date: Optional[date]
+    end_date: Optional[date]
+    send_schedule: dict
+    status: str
+    last_synced_at: Optional[datetime]
+    created_at: datetime
+    updated_at: datetime
+    # live count
+    contact_count: int
+    # latest snapshot (analytics cards); snapshot_date None when no snapshot yet
+    snapshot_date: Optional[date]
+    emails_sent: int
+    opens: int
+    open_rate: float
+    replies: int
+    reply_rate: float
+    clicks: int
+    bounces: int
+    unsubscribes: int
+    interested: int
+
+
 class CampaignListItem(BaseModel):
     id: int
     name: str
@@ -300,13 +333,12 @@ def create_campaign(body: CampaignCreateIn, _: str = Depends(get_current_admin))
     return campaign_svc.create_campaign(body)
 
 
-@router.get("/email-campaigns/{campaign_id}", response_model=CampaignOut)
+@router.get("/email-campaigns/{campaign_id}", response_model=CampaignDetailOut)
 def get_campaign(campaign_id: int, _: str = Depends(get_current_admin)):
-    with get_db_context() as db:
-        camp = db.get(EmailCampaign, campaign_id)
-        if not camp:
-            raise HTTPException(status_code=404, detail="Campaign not found")
-        return CampaignOut.model_validate(camp)
+    detail = campaign_svc.get_campaign_detail(campaign_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    return detail
 
 
 @router.post("/email-campaigns/{campaign_id}/pause", status_code=200)
