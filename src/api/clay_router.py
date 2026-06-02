@@ -29,6 +29,9 @@ from pydantic import BaseModel, Field
 
 from config.settings import get_settings
 from src.services.claude_router import call_claude
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+from src.core.database import get_db_context
 
 logger = logging.getLogger(__name__)
 
@@ -39,13 +42,10 @@ _MAX_SEARCH_CHARS = 12_000
 # Below this, we never surface a company_linkedin_url (safety rule 9).
 _MIN_CONFIDENCE = 0.70
 
-# A valid LinkedIn *company* page: linkedin.com/company/<slug>. Accepts optional
-# locale subdomain (e.g. uk.linkedin.com) and trailing path/query.
-_COMPANY_URL_RE = re.compile(
-    r"^https?://([a-z0-9-]+\.)?linkedin\.com/company/[^/\s?#]+",
-    re.IGNORECASE,
-)
 
+def get_db():
+    with get_db_context() as db:
+        yield db
 
 # ── Auth ────────────────────────────────────────────────────────────────────
 
@@ -72,29 +72,49 @@ def verify_clay_secret(request: Request) -> None:
 
 class ResolveLinkedInRequest(BaseModel):
     lead_id: Optional[str] = None
+    owner_name: Optional[str] = None
     company_name: Optional[str] = None
     domain: Optional[str] = None
+    linkedin_url: Optional[str] = None
     # Clay may send a string, a list of result objects, or a single object.
     google_search_results: Union[str, list, dict, None] = None
     city: Optional[str] = None
     state: Optional[str] = None
 
 
-class LinkedInCandidate(BaseModel):
-    url: str
-    title: Optional[str] = None
+class VerifyLinkedInResponse(BaseModel):
+    linkedin_url: Optional[str] = None
+    profile_type: str  # "person" | "company" | "no_match"
     confidence: float = Field(ge=0.0, le=1.0)
+    reason: str
 
 
-class ResolveLinkedInResponse(BaseModel):
-    company_linkedin_url: Optional[str] = None
-    linkedin_confidence: float = Field(ge=0.0, le=1.0)
-    linkedin_match_type: str  # "company_page" | "uncertain" | "no_match"
-    linkedin_reason: str
-    linkedin_candidates: list[LinkedInCandidate] = Field(default_factory=list)
+class ClayWebhookResponse(BaseModel):
+    status: str
+    message: str
+    lead_id: int
+    updated: bool
+    fields_received: list[str]
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
+
+def _clean_optional_str(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = str(value).strip()
+    return cleaned or None
+
+
+def _coerce_lead_id(value: Any) -> int:
+    try:
+        lead_id = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="lead_id must be a valid integer")
+    if lead_id <= 0:
+        raise HTTPException(status_code=422, detail="lead_id must be a positive integer")
+    return lead_id
+
 
 def _normalize_search_results(raw: Union[str, list, dict, None]) -> str:
     """Coerce google_search_results into a single bounded string.
@@ -113,45 +133,42 @@ def _normalize_search_results(raw: Union[str, list, dict, None]) -> str:
     return text[:_MAX_SEARCH_CHARS]
 
 
-def _is_company_url(url: Optional[str]) -> bool:
-    return bool(url) and bool(_COMPANY_URL_RE.match(url.strip()))
 
-
-def _no_match(reason: str, candidates: Optional[list] = None) -> dict:
+def _no_match(reason: str) -> dict:
     return {
-        "company_linkedin_url": None,
-        "linkedin_confidence": 0.0,
-        "linkedin_match_type": "no_match",
-        "linkedin_reason": reason,
-        "linkedin_candidates": candidates or [],
+        "linkedin_url": None,
+        "profile_type": "no_match",
+        "confidence": 0.0,
+        "reason": reason,
     }
 
-
 _SYSTEM_PROMPT = (
-    "You identify the official LinkedIn COMPANY PAGE for a business from Google "
-    "search results. A valid answer is a URL of the form "
-    "https://www.linkedin.com/company/<slug> (a locale subdomain like "
-    "uk.linkedin.com is acceptable).\n\n"
-    "REJECT and never choose: LinkedIn people/profiles (/in/...), jobs (/jobs/...), "
-    "posts (/posts/...), pulse articles (/pulse/...), school pages (/school/...), "
-    "search pages (/search/...), and any non-linkedin.com URL.\n\n"
-    "Use the company name, domain, and location to disambiguate between "
-    "similarly named companies. Only return high confidence when the match is "
-    "clearly the same company (name and/or domain align).\n\n"
+    "You find the best LinkedIn URL to contact the owner of a business from Google search results.\n\n"
+    "You will receive: owner name, company name, domain, location, and Google search results.\n\n"
+    "Priority order for picking a URL:\n"
+    "1. Owner's personal LinkedIn profile (/in/...) — preferred, enables direct contact.\n"
+    "2. Company LinkedIn page (/company/...) — fallback if no clear personal profile is found.\n\n"
+    "Rules:\n"
+    "- Only choose a URL that appears in the search results — never fabricate one.\n"
+    "- For a person profile: owner name must clearly match (allow nickname variations, e.g. 'Zach' for 'Zachary').\n"
+    "- For a company page: company name or domain must clearly match.\n"
+    "- If multiple person profiles exist, prefer the one whose title/snippet aligns with the industry or company.\n"
+    "- If no confident match exists, return null for linkedin_url.\n\n"
     "Respond with ONLY a JSON object, no prose, in exactly this shape:\n"
     "{\n"
-    '  "company_linkedin_url": string or null,\n'
-    '  "linkedin_confidence": number 0..1,\n'
-    '  "linkedin_match_type": "company_page" | "uncertain" | "no_match",\n'
-    '  "linkedin_reason": string,\n'
-    '  "linkedin_candidates": [{"url": string, "title": string or null, "confidence": number 0..1}]\n'
+    '  "linkedin_url": string or null,\n'
+    '  "profile_type": "person" | "company" | "no_match",\n'
+    '  "confidence": number 0..1,\n'
+    '  "reason": string\n'
     "}"
 )
 
 
-def _build_user_prompt(req: ResolveLinkedInRequest, search_text: str) -> str:
+
+def _build_user_prompt(req, search_text: str) -> str:
     location = ", ".join(p for p in (req.city, req.state) if p) or "unknown"
     return (
+        f"Owner name: {req.owner_name or 'unknown'}\n"
         f"Company name: {req.company_name or 'unknown'}\n"
         f"Domain/website: {req.domain or 'unknown'}\n"
         f"Location: {location}\n\n"
@@ -188,117 +205,92 @@ def _coerce_confidence(value: Any) -> float:
     return max(0.0, min(1.0, c))
 
 
-def _sanitize_candidates(raw: Any) -> list[dict]:
-    out: list[dict] = []
-    if not isinstance(raw, list):
-        return out
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        url = item.get("url")
-        if not isinstance(url, str) or not url.strip():
-            continue
-        title = item.get("title")
-        out.append({
-            "url": url.strip(),
-            "title": title if isinstance(title, str) else None,
-            "confidence": _coerce_confidence(item.get("confidence")),
-        })
-    return out
 
 
 # ── Endpoint ────────────────────────────────────────────────────────────────
 
-@router.post("/resolve-linkedin-url", response_model=ResolveLinkedInResponse)
-async def resolve_linkedin_url(
+@router.post("/webhook/clay", response_model=ClayWebhookResponse)
+async def clay_webhook(
     request: Request,
     _auth: None = Depends(verify_clay_secret),
+    db=Depends(get_db),
 ):
-    """Resolve the most likely LinkedIn company-page URL for a Clay row.
-
-    Body validation is intentionally removed: Clay's payload is read raw and
-    logged verbatim (debug visibility into what Clay actually sends), then
-    resolution runs off a plain dict. Always returns 200 with a structured
-    result (including the no_match shape) unless auth fails (401/503) or an
-    unexpected server error occurs (500).
     """
-    # ── Read + log the raw body exactly as received ──────────────────────────
+    Receive Clay enrichment data and update the matching DBPR contact.
+
+    Blank or missing enrichment fields are ignored so existing contact data is
+    not overwritten by partial webhook payloads.
+    """
+    # ── Read the raw body ────────────────────────────────────────────────────
     raw_body = await request.body()
     try:
         data = json.loads(raw_body) if raw_body else {}
     except (json.JSONDecodeError, ValueError):
-        data = {}
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
     if not isinstance(data, dict):
-        # Clay could (mis)send a bare array/string — wrap so .get() is safe.
-        data = {"google_search_results": data}
+        raise HTTPException(status_code=422, detail="JSON body must be an object")
+
+    # ── Extract requested fields ─────────────────────────────────────────────
+    lead_id = _coerce_lead_id(data.get("lead_id"))
+    fields = {
+        "work_email": _clean_optional_str(data.get("work_email")),
+        "linkedin_url": _clean_optional_str(data.get("linkedin_url")),
+        "personal_email": _clean_optional_str(data.get("personal_email")),
+        "domain": _clean_optional_str(data.get("domain")),
+    }
+    fields_received = [name for name, value in fields.items() if value is not None]
 
     logger.info(
-        "[clay] resolve-linkedin-url received: content_type=%s raw=%r parsed=%s",
-        request.headers.get("content-type"),
-        raw_body[:2000],
-        json.dumps(data, default=str)[:2000],
+        "[clay] webhook received: lead_id=%s, fields_received=%s",
+        lead_id,
+        fields_received,
     )
 
-    # Plain-dict accessor — no Pydantic validation, never raises on bad types.
-    req = SimpleNamespace(
-        lead_id=data.get("lead_id"),
-        company_name=data.get("company_name"),
-        domain=data.get("domain"),
-        google_search_results=data.get("google_search_results"),
-        city=data.get("city"),
-        state=data.get("state"),
-    )
-
-    search_text = _normalize_search_results(req.google_search_results)
-
-    # Nothing to reason over and no identifiers → deterministic no_match.
-    if not search_text and not (req.company_name or req.domain):
-        return _no_match("No company identifiers or search results provided.")
+    if not fields_received:
+        return ClayWebhookResponse(
+            status="accepted",
+            message="No enrichment fields provided; no database update performed.",
+            lead_id=lead_id,
+            updated=False,
+            fields_received=[],
+        )
 
     try:
-        user_prompt = _build_user_prompt(req, search_text)
-        raw = call_claude(
-            task_type="classification",
-            messages=[{"role": "user", "content": user_prompt}],
-            system=_SYSTEM_PROMPT,
-            max_tokens=700,
-            force_tier="haiku",
+        result = db.execute(
+            text(
+                """
+                UPDATE dbpr_contacts
+                SET
+                    work_email = COALESCE(:work_email, work_email),
+                    linkedin_url = COALESCE(:linkedin_url, linkedin_url),
+                    email = COALESCE(:personal_email, email),
+                    domain = COALESCE(:domain, domain),
+                    clay_synced_at = NOW(),
+                    clay_synced = TRUE,
+                    updated_at = NOW()
+                WHERE id = :lead_id
+                """
+            ),
+            {
+                "lead_id": lead_id,
+                "work_email": fields["work_email"],
+                "linkedin_url": fields["linkedin_url"],
+                "personal_email": fields["personal_email"],
+                "domain": fields["domain"],
+            },
         )
-    except Exception as exc:  # unexpected LLM/transport failure
-        logger.error("[clay] resolve-linkedin-url LLM call failed (lead_id=%s): %s",
-                     req.lead_id, exc, exc_info=True)
-        raise HTTPException(status_code=500, detail="LLM resolution failed")
+    except SQLAlchemyError:
+        logger.exception("[clay] failed to update dbpr_contacts: lead_id=%s", lead_id)
+        raise HTTPException(status_code=503, detail="Database update failed")
 
-    parsed = _parse_llm_json(raw)
-    if not parsed or not isinstance(parsed, dict):
-        logger.warning("[clay] unparseable LLM response (lead_id=%s): %r", req.lead_id, raw[:200])
-        return _no_match("Could not parse a LinkedIn match from search results.")
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail=f"DBPR contact {lead_id} not found")
 
-    chosen_url = parsed.get("company_linkedin_url")
-    confidence = _coerce_confidence(parsed.get("linkedin_confidence"))
-    match_type = parsed.get("linkedin_match_type")
-    if match_type not in ("company_page", "uncertain", "no_match"):
-        match_type = "uncertain"
-    reason = parsed.get("linkedin_reason")
-    if not isinstance(reason, str) or not reason:
-        reason = "LLM did not provide a reason."
-    candidates = _sanitize_candidates(parsed.get("linkedin_candidates"))
-
-    # Safety rules (9): drop the URL if it isn't a company page or is low-confidence.
-    if not _is_company_url(chosen_url):
-        chosen_url = None
-        if match_type == "company_page":
-            match_type = "no_match"
-        reason = f"{reason} | Rejected: not a linkedin.com/company URL."
-    elif confidence < _MIN_CONFIDENCE:
-        chosen_url = None
-        match_type = "uncertain"
-        reason = f"{reason} | Suppressed: confidence {confidence:.2f} < {_MIN_CONFIDENCE}."
-
-    return {
-        "company_linkedin_url": chosen_url,
-        "linkedin_confidence": confidence,
-        "linkedin_match_type": match_type,
-        "linkedin_reason": reason,
-        "linkedin_candidates": candidates,
-    }
+    return ClayWebhookResponse(
+        status="success",
+        message="Clay enrichment data updated successfully.",
+        lead_id=lead_id,
+        updated=True,
+        fields_received=fields_received,
+    )

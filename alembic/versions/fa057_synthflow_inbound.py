@@ -21,7 +21,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "fa057_synthflow_inbound"
-down_revision: Union[str, Sequence[str], None] = "fa056_deal_outcomes_county_vertical"
+down_revision: Union[str, Sequence[str], None] = "fa056"
 branch_labels = None
 depends_on = None
 

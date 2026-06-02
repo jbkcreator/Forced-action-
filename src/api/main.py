@@ -99,6 +99,12 @@ from src.api.white_label_router import router as wl_router, admin_wl_router  # n
 app.include_router(wl_router)
 app.include_router(admin_wl_router)
 
+from src.api.icp_channel_router import router as icp_channel_router  # noqa: E402
+app.include_router(icp_channel_router)
+
+from src.api.supplier_intel_router import router as supplier_intel_router  # noqa: E402
+app.include_router(supplier_intel_router)
+
 from src.api.clay_router import router as clay_router  # noqa: E402
 app.include_router(clay_router)
 

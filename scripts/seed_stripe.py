@@ -43,6 +43,17 @@ PRODUCTS = [
     {"key": "wl_premium",           "name": "White-label Premium",      "amount": 500000, "recurring": "month"},   # $5,000/mo
     # ── Stage 12 Bankruptcy Filing Alert product ─────────────────────────────
     {"key": "bankruptcy_alerts",    "name": "Bankruptcy Filing Alerts", "amount": 29700,  "recurring": "month"},   # $297/mo
+    # ── Supplier Intelligence Foundation (Phase 1) ────────────────────────────
+    {"key": "supplier_intel_foundation", "name": "Supplier Intelligence — Foundation", "amount": 49700,  "recurring": "month"},  # $497/mo
+    {"key": "supplier_intel_standard",   "name": "Supplier Intelligence — Standard",   "amount": 99700,  "recurring": "month"},  # $997/mo
+    {"key": "supplier_intel_premium",    "name": "Supplier Intelligence — Premium",    "amount": 149700, "recurring": "month"},  # $1,497/mo
+    # ── ICP-scoped pricing (expansion ICPs) ──────────────────────────────────
+    {"key": "icp_rei_investor",        "name": "ICP — REI Investor",        "amount": 19700, "recurring": "month"},  # $197/mo
+    {"key": "icp_insurance_adjuster",  "name": "ICP — Insurance Adjuster",  "amount": 9700,  "recurring": "month"},  # $97/mo
+    {"key": "icp_hard_money_lender",   "name": "ICP — Hard Money Lender",   "amount": 39700, "recurring": "month"},  # $397/mo
+    {"key": "icp_property_manager",    "name": "ICP — Property Manager",    "amount": 19700, "recurring": "month"},  # $197/mo
+    {"key": "icp_bankruptcy_attorney", "name": "ICP — Bankruptcy Attorney", "amount": 19700, "recurring": "month"},  # $197/mo
+    {"key": "icp_title_company",       "name": "ICP — Title Company",       "amount": 9700,  "recurring": "month"},  # $97/mo
     # ── Phase 2B bundles ─────────────────────────────────────────────────────
     {"key": "bundle_weekend",       "name": "Bundle: Weekend Pack",     "amount": 1900,   "recurring": None},      # $19, Fri-Sun only
     {"key": "bundle_storm",         "name": "Bundle: Storm Pack",       "amount": 3900,   "recurring": None},      # $39, NWS-activated

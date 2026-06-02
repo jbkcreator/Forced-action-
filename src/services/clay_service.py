@@ -49,15 +49,8 @@ def enrich_contractors(county_id: str, vertical: str, limit: int = 50) -> list[d
     base = s.clay_api_base
 
     # Build a query: search for businesses in county matching the vertical keyword
-    vertical_keywords = {
-        "roofing":       "roofing contractor",
-        "restoration":   "water damage restoration",
-        "wholesalers":   "real estate investor",
-        "fix_flip":      "house flipper investor",
-        "attorneys":     "real estate attorney",
-        "public_adjusters": "public adjuster insurance",
-    }
-    keyword = vertical_keywords.get(vertical, vertical.replace("_", " "))
+    from config.vertical_display import get_clay_description
+    keyword = get_clay_description(vertical)
 
     # Map county_id to a geographic location string
     county_locations = {

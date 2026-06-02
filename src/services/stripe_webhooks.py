@@ -165,21 +165,29 @@ def handle_webhook(raw_body: bytes, sig_header: str, db: Session) -> tuple[bool,
         "charge.dispute.funds_withdrawn": _on_dispute_funds_withdrawn,
     }
 
-    # Stage 12 — the bankruptcy-alert product shares this endpoint + signing
-    # secret. Check ownership FIRST so a bankruptcy event routes to its own
-    # handler and never runs the property-subscriber path (ZIP lock, founding
-    # count, GHL push). resolve_handler returns None for non-bankruptcy events.
+    # Standalone products share this endpoint + signing secret. Check ownership
+    # FIRST so events route to their own handler and never run the property path.
+
     handler = None
+
+    # Bankruptcy Filing Alerts
     try:
         from src.services.bankruptcy_alert.subscription import resolve_handler as _bk_resolve
         handler = _bk_resolve(event_type, data, db)
         if handler is not None:
             logger.info("Routing %s to bankruptcy-alert handler", event_type)
     except Exception:
-        logger.warning(
-            "bankruptcy resolve_handler errored — falling back to property handlers",
-            exc_info=True,
-        )
+        logger.warning("bankruptcy resolve_handler errored — falling back", exc_info=True)
+
+    # Supplier Intelligence Foundation (fa067)
+    if handler is None:
+        try:
+            from src.services.supplier_intel.subscription import resolve_handler as _si_resolve
+            handler = _si_resolve(event_type, data, db)
+            if handler is not None:
+                logger.info("Routing %s to supplier-intel handler", event_type)
+        except Exception:
+            logger.warning("supplier_intel resolve_handler errored — falling back", exc_info=True)
 
     if handler is None:
         handler = handlers.get(event_type)

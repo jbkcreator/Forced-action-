@@ -118,6 +118,27 @@ class AppSettings(BaseSettings):
 	stripe_price_wl_standard: Optional[str] = Field(default=None, env="STRIPE_PRICE_WL_STANDARD")
 	stripe_price_wl_premium: Optional[str] = Field(default=None, env="STRIPE_PRICE_WL_PREMIUM")
 	stripe_price_bankruptcy_alerts: Optional[str] = Field(default=None, env="STRIPE_PRICE_BANKRUPTCY_ALERTS")
+	# Supplier Intelligence Foundation — 3 tiers ($497/$997/$1,497 /mo)
+	stripe_price_supplier_intel_foundation: Optional[str] = Field(default=None, env="STRIPE_PRICE_SUPPLIER_INTEL_FOUNDATION")
+	stripe_price_supplier_intel_standard:   Optional[str] = Field(default=None, env="STRIPE_PRICE_SUPPLIER_INTEL_STANDARD")
+	stripe_price_supplier_intel_premium:    Optional[str] = Field(default=None, env="STRIPE_PRICE_SUPPLIER_INTEL_PREMIUM")
+	stripe_test_price_supplier_intel_foundation: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_SUPPLIER_INTEL_FOUNDATION")
+	stripe_test_price_supplier_intel_standard:   Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_SUPPLIER_INTEL_STANDARD")
+	stripe_test_price_supplier_intel_premium:    Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_SUPPLIER_INTEL_PREMIUM")
+
+	# ICP-scoped pricing — expansion ICPs each have their own Stripe price
+	stripe_price_icp_rei_investor:       Optional[str] = Field(default=None, env="STRIPE_PRICE_ICP_REI_INVESTOR")
+	stripe_price_icp_insurance_adjuster: Optional[str] = Field(default=None, env="STRIPE_PRICE_ICP_INSURANCE_ADJUSTER")
+	stripe_price_icp_hard_money_lender:  Optional[str] = Field(default=None, env="STRIPE_PRICE_ICP_HARD_MONEY_LENDER")
+	stripe_price_icp_property_manager:   Optional[str] = Field(default=None, env="STRIPE_PRICE_ICP_PROPERTY_MANAGER")
+	stripe_price_icp_bankruptcy_attorney:Optional[str] = Field(default=None, env="STRIPE_PRICE_ICP_BANKRUPTCY_ATTORNEY")
+	stripe_price_icp_title_company:      Optional[str] = Field(default=None, env="STRIPE_PRICE_ICP_TITLE_COMPANY")
+	stripe_test_price_icp_rei_investor:       Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_ICP_REI_INVESTOR")
+	stripe_test_price_icp_insurance_adjuster: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_ICP_INSURANCE_ADJUSTER")
+	stripe_test_price_icp_hard_money_lender:  Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_ICP_HARD_MONEY_LENDER")
+	stripe_test_price_icp_property_manager:   Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_ICP_PROPERTY_MANAGER")
+	stripe_test_price_icp_bankruptcy_attorney:Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_ICP_BANKRUPTCY_ATTORNEY")
+	stripe_test_price_icp_title_company:      Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_ICP_TITLE_COMPANY")
 
 	# Referral Core Loop
 	referral_free_month_coupon_id: Optional[str] = Field(default=None, env="REFERRAL_FREE_MONTH_COUPON_ID")
