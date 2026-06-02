@@ -161,13 +161,20 @@ def map_analytics(raw: dict) -> dict:
 # Campaign methods
 # ---------------------------------------------------------------------------
 
-def create_campaign(name: str, schedule: dict, sequence_steps: list[dict]) -> Optional[dict]:
+def create_campaign(
+    name: str,
+    schedule: dict,
+    sequence_steps: list[dict],
+    email_list: Optional[list[str]] = None,
+) -> Optional[dict]:
     """
     POST /api/v2/campaigns
 
     schedule  — {schedules: [{name, timing:{from,to}, days:{}, timezone}],
                   start_date, end_date}
     sequence_steps — [{step_number, subject, body, delay_days}]
+    email_list — sending inbox email addresses; campaign sends from these.
+                 Omitted → campaign has no mailbox attached and cannot send.
 
     Returns the created campaign dict (includes 'id'), or None on failure.
     """
@@ -180,6 +187,8 @@ def create_campaign(name: str, schedule: dict, sequence_steps: list[dict]) -> Op
         "campaign_schedule": schedule,
         "sequences": [{"steps": sequence_steps}],
     }
+    if email_list:
+        payload["email_list"] = email_list
     try:
         resp = _request("POST", "/api/v2/campaigns", json=payload)
         resp.raise_for_status()

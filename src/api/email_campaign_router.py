@@ -112,6 +112,9 @@ class CampaignCreateIn(BaseModel):
     start_date: Optional[date] = None
     end_date: Optional[date] = None
     send_schedule: SendScheduleIn = Field(default_factory=SendScheduleIn)
+    # Instantly sending inbox(es) — campaign sends from these accounts.
+    # Without this the Instantly campaign has no mailbox attached and cannot send.
+    email_list: Optional[list[str]] = None
 
 
 class CampaignUpdateIn(BaseModel):
@@ -306,6 +309,7 @@ def update_template(
         tmpl.variables_used = variables_used
         tmpl.updated_at = datetime.now(timezone.utc)
         db.add(tmpl)
+        db.flush()          # persist edits before refresh reloads the row (autoflush=False)
         db.refresh(tmpl)
         return TemplateOut.model_validate(tmpl)
 
@@ -373,6 +377,7 @@ def get_campaign(campaign_id: int, _: str = Depends(get_current_admin)):
 
 
 @router.patch("/email-campaigns/{campaign_id}", response_model=CampaignUpdateOut)
+@router.put("/email-campaigns/{campaign_id}", response_model=CampaignUpdateOut)
 def update_campaign(
     campaign_id: int,
     body: CampaignUpdateIn,

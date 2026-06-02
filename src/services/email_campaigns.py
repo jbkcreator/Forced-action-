@@ -176,6 +176,7 @@ def create_campaign(body) -> dict:
         if not tmpl:
             raise HTTPException(status_code=404, detail="Template not found")
 
+        email_list = getattr(body, "email_list", None) or []
         campaign = EmailCampaign(
             name=body.name,
             template_id=body.template_id,
@@ -186,6 +187,7 @@ def create_campaign(body) -> dict:
             start_date=body.start_date,
             end_date=body.end_date,
             send_schedule=_build_instantly_schedule(body),
+            instantly_settings={"email_list": email_list} if email_list else {},
             status="draft",
             created_at=now,
             updated_at=now,
@@ -211,6 +213,7 @@ def create_campaign(body) -> dict:
                 name=body.name,
                 schedule=schedule,
                 sequence_steps=steps,
+                email_list=email_list or None,
             )
             if not result or not result.get("id"):
                 raise RuntimeError("Instantly returned no campaign id")
