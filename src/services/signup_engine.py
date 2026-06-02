@@ -389,56 +389,137 @@ def _create_stripe_customer(email: str, name: Optional[str]) -> str:
 		return f"free_{uuid.uuid4().hex[:12]}"
 
 
-def handle_missed_call(from_number: str, db: Session) -> str:
-    """Process an inbound missed/answered call.
-    Creates a free Subscriber with signup_source='missed_call', then sends a
-    welcome SMS containing a SIGNED landing-page link so the subscriber lands
-    on the landing page (attribution preserved) and is auto-redirected to
-    their dashboard via /api/landing/resolve-token.
+def onboard_inbound_caller(
+    phone: str,
+    source: str,
+    db: Session,
+    *,
+    zip_code: Optional[str] = None,
+    vertical: Optional[str] = None,
+    call_id: Optional[str] = None,
+    name: Optional[str] = None,
+) -> dict:
+    """Provider-agnostic inbound signup core (Phases 1-3).
 
-    Returns TwiML response XML string.
+    Called by /webhooks/synthflow/inbound (primary) and by handle_missed_call
+    (Telnyx fallback). Account-create, consent, and First Leads logic live here.
+
+    Returns dict: subscriber_id, is_new, opt_in_created, first_leads_sent,
+    lead_count, welcome_sent, capture_complete.
+
+    Never raises — failures are logged and reflected in the return dict so
+    the webhook always responds 200.
     """
-    sub = create_free_account(phone=from_number, source="missed_call", db=db)
+    from src.services.first_leads import deliver_first_leads
 
-    if sub.event_feed_uuid and can_send(from_number, db):
-        from src.services.signed_links import encode_landing_token
-        token = encode_landing_token(sub.id, "missed_call", ttl_hours=24)
+    normalized = _normalize_phone(phone)
 
-        if token:
-            # Land on the public landing page with signed token. The frontend
-            # POSTs to /api/landing/resolve-token, gets the feed_uuid back,
-            # and navigates to /dashboard/<uuid> — attribution preserved.
-            landing_url = (
-                f"{settings.app_base_url}/?signup_source=missed_call&token={token}"
+    # Detect new vs returning before create so is_new is reliable.
+    is_new = True
+    if normalized:
+        existing = db.query(Subscriber).filter_by(phone=normalized).first()
+        if existing:
+            is_new = False
+
+    sub = create_free_account(phone=phone, source=source, db=db, name=name)
+
+    # Write captured vertical onto the subscriber; set capture_complete flag.
+    capture_complete = bool(zip_code and vertical)
+    if vertical:
+        sub.vertical = vertical
+    sub.capture_complete = capture_complete
+    try:
+        db.flush()
+    except Exception as exc:
+        logger.warning("[Onboard] flush after capture fields failed sub=%d: %s", sub.id, exc)
+
+    # Phase 2: SmsOptIn — inbound call is express consent.
+    opt_in_created = False
+    try:
+        from src.core.models import SmsOptIn
+        from sqlalchemy import select as sa_select
+        existing_opt = db.execute(
+            sa_select(SmsOptIn).where(SmsOptIn.phone == normalized)
+        ).scalar_one_or_none()
+        if existing_opt is None and normalized:
+            consent_msg = (
+                f"Inbound call — caller dialed in to Forced Action DID. "
+                f"call_id={call_id or 'n/a'}. "
+                f"Express consent: caller initiated contact."
             )
-            sub.attribution_token = token[:200]
-        else:
-            # Token signing disabled (no LANDING_TOKEN_SECRET) — fall back to
-            # the direct dashboard URL. Attribution still recorded on the row.
-            landing_url = f"{settings.app_base_url}/dashboard/{sub.event_feed_uuid}"
+            # Savepoint: a constraint failure rolls back only this insert,
+            # not the whole transaction — session stays usable for First Leads.
+            with db.begin_nested():
+                db.add(SmsOptIn(
+                    phone=normalized,
+                    subscriber_id=sub.id,
+                    source="synthflow_inbound",
+                    opt_in_message=consent_msg,
+                    opted_in_at=datetime.now(timezone.utc),
+                ))
+            opt_in_created = True
+            logger.info("[Onboard] SmsOptIn created sub=%d call_id=%s", sub.id, call_id)
+    except Exception as exc:
+        logger.warning("[Onboard] SmsOptIn failed sub=%d: %s", sub.id, exc)
 
-        sms_body = _MISSED_CALL_SMS.format(url=landing_url)
-        # Don't truncate to 160 — the signed token + URL is ~120 chars on its
-        # own, and chopping off "Reply STOP to opt out" would be a TCPA
-        # violation. Telnyx handles multi-segment SMS fine; this is a
-        # one-per-subscriber welcome message, the cost is negligible.
-        send_sms(
-            to=from_number,
-            body=sms_body,
-            db=db,
-            message_type="transactional",
+    # Phase 3: First Leads — only for newly created accounts.
+    # Dedupe-resolved callers already received First Leads on their first call.
+    first_leads_result = None
+    if is_new:
+        first_leads_result = deliver_first_leads(
             subscriber_id=sub.id,
-            task_type="missed_call_welcome",
+            phone=phone,
+            zip_code=zip_code,
+            vertical=vertical,
+            db=db,
         )
 
-    return (
-        '<?xml version="1.0" encoding="UTF-8"?>'
-        "<Response>"
-        "<Say voice=\"alice\">"
-        "Thanks for calling Forced Action. "
-        "We just texted you a link to your free property leads account. "
-        "Have a great day!"
-        "</Say>"
-        "<Hangup/>"
-        "</Response>"
+    # Welcome + signed link (transactional, independent of First Leads).
+    welcome_sent = False
+    try:
+        if sub.event_feed_uuid and can_send(phone, db):
+            from src.services.signed_links import encode_landing_token
+            token = encode_landing_token(sub.id, "missed_call", ttl_hours=24)
+            if token:
+                landing_url = (
+                    f"{settings.app_base_url}/?signup_source=missed_call&token={token}"
+                )
+                sub.attribution_token = token[:200]
+            else:
+                landing_url = f"{settings.app_base_url}/dashboard/{sub.event_feed_uuid}"
+
+            sms_body = _MISSED_CALL_SMS.format(url=landing_url)
+            send_sms(
+                to=phone,
+                body=sms_body,
+                db=db,
+                message_type="transactional",
+                subscriber_id=sub.id,
+                task_type="missed_call_welcome",
+            )
+            welcome_sent = True
+    except Exception as exc:
+        logger.warning("[Onboard] welcome SMS failed sub=%d: %s", sub.id, exc)
+
+    return {
+        "subscriber_id": sub.id,
+        "is_new": is_new,
+        "opt_in_created": opt_in_created,
+        "first_leads_sent": first_leads_result.sent if first_leads_result else False,
+        "lead_count": first_leads_result.lead_count if first_leads_result else 0,
+        "welcome_sent": welcome_sent,
+        "capture_complete": capture_complete,
+    }
+
+
+def handle_missed_call(from_number: str, db: Session) -> None:
+    """Telnyx voice path — delegates to provider-agnostic onboard_inbound_caller.
+
+    TwiML return removed: Telnyx uses Call Control REST, not a webhook response
+    body. The Telnyx webhook handler ignores this return value.
+    """
+    onboard_inbound_caller(
+        phone=from_number,
+        source="missed_call",
+        db=db,
     )

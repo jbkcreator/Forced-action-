@@ -3318,6 +3318,140 @@ async def synthflow_webhook(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# POST /webhooks/synthflow/inbound — Synthflow inbound missed-call signup
+# ---------------------------------------------------------------------------
+
+class SynthflowInboundPayload(BaseModel):
+    """Fields the Synthflow inbound agent posts after the call ends."""
+    # Phone
+    phone: Optional[str] = None
+    from_number: Optional[str] = None
+    caller_phone: Optional[str] = None
+    # Captured during the call
+    zip_code: Optional[str] = None
+    zip: Optional[str] = None
+    vertical: Optional[str] = None
+    # Idempotency
+    call_id: Optional[str] = None
+    event_id: Optional[str] = None
+    id: Optional[str] = None
+    # Extra context (ignored but accepted to avoid validation errors on unknown fields)
+    model_config = {"extra": "allow"}
+
+    @property
+    def resolved_phone(self) -> Optional[str]:
+        return self.phone or self.from_number or self.caller_phone
+
+    @property
+    def resolved_zip(self) -> Optional[str]:
+        return self.zip_code or self.zip
+
+    @property
+    def resolved_call_id(self) -> Optional[str]:
+        return self.call_id or self.event_id or self.id
+
+
+def _verify_synthflow_secret(request: Request) -> bool:
+    """Accept X-Synthflow-Secret or Authorization: Bearer <secret>."""
+    settings_obj = get_settings()
+    secret = settings_obj.synthflow_webhook_secret
+    if secret is None:
+        # Not configured — log a warning but allow through (dev/unconfigured envs).
+        logger.warning("[SynthflowInbound] SYNTHFLOW_WEBHOOK_SECRET not set — auth skipped")
+        return True
+    expected = secret.get_secret_value()
+    # Header: X-Synthflow-Secret: <secret>
+    if request.headers.get("X-Synthflow-Secret") == expected:
+        return True
+    # Header: Authorization: Bearer <secret>
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer ") and auth[7:] == expected:
+        return True
+    return False
+
+
+@app.post("/webhooks/synthflow/inbound", status_code=200)
+async def synthflow_inbound_webhook(request: Request, db: Session = Depends(get_db)):
+    """
+    Synthflow inbound missed-call signup endpoint (primary inbound path).
+
+    Synthflow posts here after the inbound agent collects the caller's phone,
+    ZIP, and vertical. This handler:
+      1. Verifies shared-secret auth.
+      2. Checks call_id idempotency — replays are 200 no-ops.
+      3. Calls onboard_inbound_caller → account create/resolve + SmsOptIn +
+         First Leads (marketing SMS) + welcome link (transactional SMS).
+      4. Always returns 200 to avoid Synthflow retry floods.
+
+    SLA: First Leads SMS enqueued within 60s of this webhook being received.
+    Measurement: webhook_log.created_at → message_outcomes.sent_at (task_type='first_leads').
+    """
+    from src.services.signup_engine import onboard_inbound_caller
+    from src.services.webhook_log import log_webhook_event
+
+    raw_body = await request.body()
+
+    if not _verify_synthflow_secret(request):
+        log_webhook_event(
+            source="synthflow_inbound",
+            event_type="call_ended",
+            status="failed",
+            status_detail="auth_failed",
+        )
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        raw_json = json.loads(raw_body.decode("utf-8") or "{}")
+    except Exception:
+        raw_json = {}
+
+    try:
+        payload = SynthflowInboundPayload(**raw_json)
+    except Exception as exc:
+        logger.error("[SynthflowInbound] payload validation failed: %s", exc)
+        return {"status": "error", "reason": "invalid_payload"}
+
+    call_id = payload.resolved_call_id
+    phone = payload.resolved_phone
+
+    # Idempotency: reject replays of the same call_id.
+    if call_id:
+        from src.services.webhook_log import already_logged
+        if already_logged(source="synthflow_inbound", source_event_id=call_id):
+            logger.info("[SynthflowInbound] duplicate call_id=%s — no-op", call_id)
+            return {"status": "duplicate", "call_id": call_id}
+
+    log_webhook_event(
+        source="synthflow_inbound",
+        event_type="call_ended",
+        source_event_id=call_id,
+        status="received",
+        payload=raw_json,
+        payload_kind="synthflow",
+    )
+
+    if not phone:
+        logger.warning("[SynthflowInbound] no phone in payload — ignored")
+        return {"status": "ignored", "reason": "no_phone"}
+
+    result = onboard_inbound_caller(
+        phone=phone,
+        source="missed_call",
+        db=db,
+        zip_code=payload.resolved_zip,
+        vertical=payload.vertical,
+        call_id=call_id,
+    )
+
+    logger.info(
+        "[SynthflowInbound] call_id=%s phone=%s sub=%s is_new=%s leads=%s capture_complete=%s",
+        call_id, phone, result.get("subscriber_id"),
+        result.get("is_new"), result.get("lead_count"), result.get("capture_complete"),
+    )
+    return {"status": "ok", **result}
+
+
+# ---------------------------------------------------------------------------
 # POST /webhooks/ghl/sample-leads — GHL workflow webhook for sample lead SMS
 # ---------------------------------------------------------------------------
 

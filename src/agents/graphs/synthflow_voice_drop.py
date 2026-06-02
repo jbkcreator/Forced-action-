@@ -33,11 +33,18 @@ from src.agents.subgraphs.decision_hierarchy import run_decision_hierarchy
 from src.agents.tools.read_tools import get_subscriber_profile
 from src.core.database import get_db_context
 from src.services.synthflow_client import initiate_call
+from src.tasks.kill_switch_metric_ingest import get_cached_metric
 
 logger = logging.getLogger(__name__)
 
 GRAPH_NAME = "synthflow_voice_drop"
-KILL_SWITCH_FEATURE = "synthflow_voice_drop"
+# Gate on lock_conversion: this voice drop is a high-intent conversion-recovery
+# call, and lock_conversion's documented remediation is "live-data close, voice
+# drop, urgency" (config/cora_guardrails.py) — the same metric fomo gates on.
+# The prior value "synthflow_voice_drop" was neither in the KILL_SWITCH config
+# nor computed by kill_switch_metric_ingest, so the gate always resolved to
+# 'unknown' → fail-safe RED → every dispatch aborted before initiating a call.
+KILL_SWITCH_FEATURE = "lock_conversion"
 _VOICE_DROP_ACTION_TYPE = "voice_drop"
 
 _OFFER_LABELS: Dict[str, str] = {
@@ -137,6 +144,7 @@ def _node_hierarchy_check(state: VoiceDropState) -> VoiceDropState:
         "subscriber_id": state["subscriber_id"],
         "graph_name": GRAPH_NAME,
         "kill_switch_feature": KILL_SWITCH_FEATURE,
+        "kill_switch_observed_value": get_cached_metric(KILL_SWITCH_FEATURE),
         "learning_card_type": "call_perf",
     })
 
@@ -163,7 +171,16 @@ def _node_initiate_drop(state: VoiceDropState) -> VoiceDropState:
 
     profile = state.get("subscriber_profile") or {}
     offer_type = state.get("offer_type", "")
+    # get_subscriber_profile serializes created_at to an ISO string; parse it
+    # back before arithmetic. Tolerate datetime, ISO string, or missing.
     created_at = profile.get("created_at")
+    if isinstance(created_at, str):
+        try:
+            created_at = datetime.fromisoformat(created_at)
+        except ValueError:
+            created_at = None
+    if created_at is not None and created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
     days_on_platform = (
         (datetime.now(timezone.utc) - created_at).days
         if created_at else 0
@@ -281,7 +298,33 @@ def _node_followup_sms(state: VoiceDropState) -> VoiceDropState:
 
 
 def _node_finalize(state: VoiceDropState) -> VoiceDropState:
+    from src.agents.tools.write_tools import log_decision
+
     final_status = state.get("terminal_status") or ("completed" if state.get("sent") else "failed")
+
+    # Unlike the other Cora graphs, this flow has no compose_and_send node that
+    # logs on the happy path — so we own the agent_decisions row on EVERY path.
+    # Without it there is no audit trail and the DoD SLA query (agent_decisions
+    # → synthflow_calls) can't see the dispatch.
+    try:
+        log_decision(
+            decision_id=state["decision_id"],
+            graph_name=GRAPH_NAME,
+            subscriber_id=state.get("subscriber_id"),
+            event_type=state.get("event_type"),
+            terminal_status=final_status,
+            summary={
+                "sent": bool(state.get("sent")),
+                "call_id": state.get("call_id"),
+                "kill_switch_color": state.get("kill_switch_color"),
+                "failure_reason": state.get("failure_reason"),
+                "followup_sent": state.get("followup_sent"),
+            },
+        )
+    except Exception as exc:
+        logger.warning("voice_drop log_decision failed sub=%s: %s",
+                       state.get("subscriber_id"), exc)
+
     return {"terminal_status": final_status}
 
 
