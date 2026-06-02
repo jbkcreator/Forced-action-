@@ -78,33 +78,9 @@ logger = logging.getLogger(__name__)
 
 
 # Severity grading -----------------------------------------------------------
-
-def _grade(metric_name: str, observed: Optional[float]) -> str:
-    """Return 'green' | 'yellow' | 'red' | 'unknown' for `observed`.
-
-    Uses the KILL_SWITCH thresholds for `metric_name`. Respects the
-    `direction` field: higher_is_better or lower_is_better. Unknown
-    metrics or None observed → 'unknown' (caller treats as no-op).
-    """
-    cfg = KILL_SWITCH.get(metric_name)
-    if cfg is None or observed is None:
-        return "unknown"
-    green = cfg["green"]
-    red = cfg["red"]
-    direction = cfg.get("direction", "higher_is_better")
-
-    if direction == "higher_is_better":
-        if observed >= green:
-            return "green"
-        if observed < red:
-            return "red"
-        return "yellow"
-    # lower_is_better
-    if observed <= green:
-        return "green"
-    if observed > red:
-        return "red"
-    return "yellow"
+# Logic lives in kill_switch_grade; re-exported here so existing call sites
+# (_grade(...)) remain unchanged — no behavior change.
+from src.services.kill_switch_grade import grade as _grade  # noqa: E402
 
 
 # Raw SQL helpers ------------------------------------------------------------

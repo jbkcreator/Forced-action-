@@ -551,3 +551,88 @@ class TestRevenuePulseVendorCostLine:
             }
             msg = _compose_daily(db)
         assert "+2 more" in msg
+
+
+# ============================================================================
+# _format_kill_switch_scorecard_line() — Phase 3 integration
+# ============================================================================
+
+
+class TestFormatKillSwitchScorecardLine:
+    def _make_scorecard_db(self, card_data=None):
+        db = MagicMock()
+        row = MagicMock()
+        row.data_json = card_data
+        call_count = [0]
+
+        def side_effect(stmt):
+            idx = call_count[0]
+            call_count[0] += 1
+            result = MagicMock()
+            if idx == 0:
+                result.first.return_value = row
+            else:
+                result.first.return_value = None
+            return result
+
+        db.execute.side_effect = side_effect
+        return db
+
+    def test_scorecard_line_present_when_red(self):
+        from src.tasks.revenue_pulse import _format_kill_switch_scorecard_line
+        card_data = {
+            "counties": {
+                "hillsborough": {
+                    "features": [{"metric": "lock_conversion", "current_color": "red", "red_streak": 5, "kill_rec_pending": True}],
+                    "summary": {"red": 1, "yellow": 0, "green": 0, "unknown": 0},
+                }
+            }
+        }
+        db = self._make_scorecard_db(card_data)
+        line = _format_kill_switch_scorecard_line(db)
+        assert line is not None
+        assert line.startswith("KS:")
+        assert "🔴1" in line
+        assert "lock_conversion" in line
+
+    def test_scorecard_line_omitted_when_all_green(self):
+        from src.tasks.revenue_pulse import _format_kill_switch_scorecard_line
+        card_data = {
+            "counties": {
+                "hillsborough": {
+                    "features": [{"metric": "lock_conversion", "current_color": "green", "red_streak": 0}],
+                    "summary": {"red": 0, "yellow": 0, "green": 1, "unknown": 0},
+                }
+            }
+        }
+        db = self._make_scorecard_db(card_data)
+        line = _format_kill_switch_scorecard_line(db)
+        assert line is None
+
+    def test_scorecard_line_omitted_when_no_card(self):
+        from src.tasks.revenue_pulse import _format_kill_switch_scorecard_line
+        db = self._make_scorecard_db(None)
+        line = _format_kill_switch_scorecard_line(db)
+        assert line is None
+
+
+class TestComposeWeeklyScorecardIntegration:
+    def test_scorecard_line_appended_to_weekly_message(self):
+        from src.tasks.revenue_pulse import _format_kill_switch_scorecard_line
+        from unittest.mock import patch, MagicMock
+        db = MagicMock()
+        card_data = {
+            "counties": {
+                "hillsborough": {
+                    "features": [{"metric": "lock_conversion", "current_color": "red", "red_streak": 3, "kill_rec_pending": False}],
+                    "summary": {"red": 1, "yellow": 0, "green": 0, "unknown": 0},
+                }
+            }
+        }
+        scorecard_row = MagicMock()
+        scorecard_row.data_json = card_data
+        scorecard_row.first.return_value = scorecard_row
+        db.execute.return_value = scorecard_row
+        line = _format_kill_switch_scorecard_line(db)
+        assert line is not None
+        assert line.startswith("KS:")

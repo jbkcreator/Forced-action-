@@ -212,6 +212,14 @@ def _compose_weekly(db: Session, county_id: str | None = None) -> str:
         candidate = f"{body}\n{autonomy_line}"
         if len(candidate) <= MAX_DAILY_SMS_CHARS:
             body = candidate
+
+    # fa037: append the kill-switch scorecard alarm line (written by
+    # kill_switch_scorecard at Monday 08:50 UTC, 5 min before this task).
+    scorecard_line = _format_kill_switch_scorecard_line(db)
+    if scorecard_line:
+        candidate = f"{body}\n{scorecard_line}"
+        if len(candidate) <= MAX_DAILY_SMS_CHARS:
+            body = candidate
     return body
 
 
@@ -298,7 +306,7 @@ def _format_cora_incidents_weekly_summary(db: Session, county_id: str | None = N
             COUNT(*) FILTER (WHERE severity='yellow' AND breach_resolved IS NULL) AS yellow_open,
             COUNT(*) FILTER (WHERE breach_resolved >= NOW() - INTERVAL '7 days') AS resolved_7d,
             COUNT(*) FILTER (WHERE action_taken='feature_killed'
-                              AND created_at >= NOW() - INTERVAL '7 days')        AS kill_pending_7d
+                            AND created_at >= NOW() - INTERVAL '7 days')        AS kill_pending_7d
         FROM cora_incident
         {county_clause}
     """), {"county_id": county_id} if county_id else {}).first()
@@ -311,6 +319,74 @@ def _format_cora_incidents_weekly_summary(db: Session, county_id: str | None = N
         f"{row.red_open or 0} red / {row.yellow_open or 0} yellow open, "
         f"{row.resolved_7d or 0} resolved, {row.kill_pending_7d or 0} kill-pending"
     )
+
+
+def _format_kill_switch_scorecard_line(db: Session) -> str | None:
+    """Return the compact KS alarm line from the latest kill_switch_scorecard.
+
+    Returns None if no card exists or every county is all-green.
+    Format: "KS: hills 🔴1 🟡2 (lock_conv red 5/7d→kill rec) | pinellas 🟢 all"
+    """
+    row = db.execute(sa_text("""
+        SELECT data_json FROM learning_cards
+        WHERE card_type = 'kill_switch_scorecard'
+        ORDER BY card_date DESC
+        LIMIT 1
+    """)).first()
+    if row is None or not row.data_json:
+        return None
+
+    data = row.data_json
+    counties = data.get("counties", {})
+    if not counties:
+        return None
+
+    parts = []
+    any_problem = False
+
+    for county_id, cdata in counties.items():
+        summary = cdata.get("summary", {})
+        red_n = summary.get("red", 0)
+        yellow_n = summary.get("yellow", 0)
+
+        if red_n == 0 and yellow_n == 0:
+            parts.append(f"{county_id[:6]} 🟢 all")
+            continue
+
+        any_problem = True
+        counts_str = ""
+        if red_n:
+            counts_str += f"🔴{red_n}"
+        if yellow_n:
+            counts_str += f" 🟡{yellow_n}"
+        counts_str = counts_str.strip()
+
+        features = cdata.get("features", [])
+        worst = _pick_worst_feature_for_line(features)
+        worst_str = ""
+        if worst:
+            streak = worst.get("red_streak")
+            streak_str = f"{streak}/7d" if streak is not None else "n/a"
+            kill_flag = "→kill rec" if worst.get("kill_rec_pending") else ""
+            suffix = f" {kill_flag}".rstrip()
+            worst_str = f" ({worst['metric']} red {streak_str}{suffix})"
+
+        parts.append(f"{county_id[:6]} {counts_str}{worst_str}")
+
+    if not any_problem:
+        return None
+
+    return "KS: " + " | ".join(parts)
+
+
+def _pick_worst_feature_for_line(features: list) -> dict | None:
+    """Red beats yellow; within same color, longest streak wins."""
+    reds = [f for f in features if f.get("current_color") == "red"]
+    yellows = [f for f in features if f.get("current_color") == "yellow"]
+    candidates = reds or yellows
+    if not candidates:
+        return None
+    return max(candidates, key=lambda f: (f.get("red_streak") or 0))
 
 
 def _chat_metrics_today(db: Session) -> dict:
