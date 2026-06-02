@@ -397,8 +397,6 @@ def health_check_detailed(db: Session = Depends(get_db)):
         missing_optional.append("STRIPE_SECRET_KEY" if not settings.stripe_test_mode else "STRIPE_TEST_SECRET_KEY")
     if not settings.batch_skip_tracing_api_key:
         missing_optional.append("BATCH_SKIP_TRACING_API_KEY")
-    if not settings.idi_api_key:
-        missing_optional.append("IDI_API_KEY")
     if not settings.smtp_host:
         missing_optional.append("SMTP_HOST")
     if not settings.alert_email:
