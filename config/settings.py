@@ -66,6 +66,11 @@ class AppSettings(BaseSettings):
 	ghl_cf_fa_founding: Optional[str] = Field(default=None, env="GHL_CF_FA_FOUNDING")
 	ghl_cf_fa_dashboard_url: Optional[str] = Field(default=None, env="GHL_CF_FA_DASHBOARD_URL")
 
+	# Instantly.ai email campaign integration (optional — feature disabled if not set)
+	instantly_api_key: Optional[SecretStr] = Field(default=None, env="INSTANTLY_API_KEY")
+	instantly_base_url: str = Field(default="https://api.instantly.ai", env="INSTANTLY_BASE_URL")
+	instantly_enabled: bool = Field(default=True, env="INSTANTLY_ENABLED")
+
 	# Stripe — set STRIPE_TEST_MODE=true to use test credentials/prices instead of live
 	stripe_test_mode: bool = Field(default=False, env="STRIPE_TEST_MODE")
 
