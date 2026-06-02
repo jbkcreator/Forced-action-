@@ -112,6 +112,28 @@ class CampaignCreateIn(BaseModel):
     send_schedule: SendScheduleIn = Field(default_factory=SendScheduleIn)
 
 
+class CampaignUpdateIn(BaseModel):
+    """PATCH body — every field optional; only provided fields change."""
+    name: Optional[str] = None
+    template_id: Optional[int] = None
+    geo_filter: Optional[dict] = None
+    vertical: Optional[str] = None
+    max_contacts: Optional[int] = Field(None, alias="max_contact_count")
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    send_schedule: Optional[dict] = Field(None, alias="campaign_schedule")
+    # Instantly-only knobs → stored in instantly_settings + PATCHed to Instantly
+    daily_limit: Optional[int] = None
+    daily_max_leads: Optional[int] = None
+    email_list: Optional[list[str]] = None
+    stop_on_reply: Optional[bool] = None
+    open_tracking: Optional[bool] = None
+    link_tracking: Optional[bool] = None
+
+    class Config:
+        populate_by_name = True
+
+
 class CampaignOut(BaseModel):
     id: int
     name: str
@@ -145,6 +167,7 @@ class CampaignDetailOut(BaseModel):
     start_date: Optional[date]
     end_date: Optional[date]
     send_schedule: dict
+    instantly_settings: dict
     status: str
     last_synced_at: Optional[datetime]
     created_at: datetime
@@ -162,6 +185,12 @@ class CampaignDetailOut(BaseModel):
     bounces: int
     unsubscribes: int
     interested: int
+
+
+class CampaignUpdateOut(BaseModel):
+    """PATCH response — updated campaign detail + downstream-effect warnings."""
+    campaign: CampaignDetailOut
+    warnings: list[str]
 
 
 class CampaignListItem(BaseModel):
@@ -339,6 +368,22 @@ def get_campaign(campaign_id: int, _: str = Depends(get_current_admin)):
     if detail is None:
         raise HTTPException(status_code=404, detail="Campaign not found")
     return detail
+
+
+@router.patch("/email-campaigns/{campaign_id}", response_model=CampaignUpdateOut)
+def update_campaign(
+    campaign_id: int,
+    body: CampaignUpdateIn,
+    _: str = Depends(get_current_admin),
+):
+    """
+    Edit a campaign (draft/active/paused; 409 on completed). PATCH semantics —
+    only provided fields change. Local + Instantly stay in sync; the response
+    `warnings` array describes downstream effects (re-pushed sequences, future-
+    only top-up changes, Instantly sync failures).
+    """
+    patch = body.model_dump(exclude_unset=True)
+    return campaign_svc.update_campaign(campaign_id, patch)
 
 
 @router.post("/email-campaigns/{campaign_id}/pause", status_code=200)

@@ -4305,6 +4305,10 @@ class EmailCampaign(Base):
     start_date: Mapped[Optional[date]] = mapped_column(Date)
     end_date: Mapped[Optional[date]] = mapped_column(Date)
     send_schedule: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    # Instantly-only campaign knobs not modeled as columns (fa063): daily_limit,
+    # daily_max_leads, email_list, stop_on_reply, open_tracking, link_tracking.
+    # Persisted here AND PATCHed to Instantly on edit.
+    instantly_settings: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     status: Mapped[str] = mapped_column(String(12), nullable=False, default="draft", index=True)
     last_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(

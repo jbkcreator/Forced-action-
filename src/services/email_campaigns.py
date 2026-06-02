@@ -262,6 +262,119 @@ def resume_campaign(campaign_id: int) -> None:
         db.add(camp)
 
 
+_INSTANTLY_SETTING_KEYS = (
+    "daily_limit", "daily_max_leads", "email_list",
+    "stop_on_reply", "open_tracking", "link_tracking",
+)
+
+
+def update_campaign(campaign_id: int, patch: dict) -> dict:
+    """
+    Edit a campaign in place (draft/active/paused — 409 on completed).
+    Applies local field changes, PATCHes the matching fields to Instantly,
+    and returns {"campaign": <detail dict>, "warnings": [...]}.
+
+    Effect notes the caller surfaces:
+      - template_id  → re-expands steps and PATCHes Instantly `sequences`
+                       (in-flight leads continue from their current step).
+      - geo_filter / vertical / max_contacts → local only; affect FUTURE
+                       top-ups, existing leads untouched.
+      - name / dates / send_schedule / Instantly knobs → PATCHed to Instantly.
+    """
+    warnings: list[str] = []
+    with get_db_context() as db:
+        camp = db.get(EmailCampaign, campaign_id)
+        if not camp:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+        if camp.status == "completed":
+            raise HTTPException(status_code=409, detail="Completed campaigns cannot be edited")
+
+        instantly_patch: dict = {}
+
+        if patch.get("name") is not None:
+            camp.name = patch["name"]
+            instantly_patch["name"] = patch["name"]
+
+        if patch.get("template_id") is not None and patch["template_id"] != camp.template_id:
+            tmpl = db.get(EmailSequenceTemplate, patch["template_id"])
+            if not tmpl:
+                raise HTTPException(status_code=404, detail="Template not found")
+            camp.template_id = patch["template_id"]
+            instantly_patch["sequences"] = [
+                {"steps": template_svc.build_instantly_sequence(tmpl.steps or [])}
+            ]
+            warnings.append(
+                "template changed: new sequence pushed to Instantly; in-flight "
+                "leads continue from their current step"
+            )
+
+        if patch.get("geo_filter") is not None:
+            camp.geo_filter = patch["geo_filter"]
+            camp.county_id = patch["geo_filter"].get("county_id")
+            warnings.append("geo_filter changed: affects future top-ups only; existing leads unchanged")
+
+        if patch.get("vertical") is not None:
+            camp.vertical = patch["vertical"]
+            warnings.append("vertical changed: affects future top-ups only; existing leads unchanged")
+
+        if patch.get("max_contacts") is not None:
+            current = (
+                db.query(func.count(CampaignContact.id))
+                .filter(CampaignContact.campaign_id == campaign_id)
+                .scalar() or 0
+            )
+            camp.max_contacts = patch["max_contacts"]
+            if patch["max_contacts"] < current:
+                warnings.append(
+                    f"max_contacts ({patch['max_contacts']}) is below current membership "
+                    f"({current}): no leads removed, future top-ups blocked until below cap"
+                )
+
+        # Schedule / dates → rebuild Instantly campaign_schedule
+        schedule_touched = False
+        if patch.get("send_schedule") is not None:
+            camp.send_schedule = patch["send_schedule"]
+            schedule_touched = True
+        if patch.get("start_date") is not None:
+            camp.start_date = patch["start_date"]
+            schedule_touched = True
+        if patch.get("end_date") is not None:
+            camp.end_date = patch["end_date"]
+            schedule_touched = True
+        if schedule_touched:
+            sched = dict(camp.send_schedule or {})
+            if camp.start_date:
+                sched["start_date"] = camp.start_date.isoformat()
+            if camp.end_date:
+                sched["end_date"] = camp.end_date.isoformat()
+            camp.send_schedule = sched
+            instantly_patch["campaign_schedule"] = sched
+
+        # Instantly-only knobs → instantly_settings JSONB + pass-through
+        settings_patch = {k: patch[k] for k in _INSTANTLY_SETTING_KEYS if patch.get(k) is not None}
+        if settings_patch:
+            camp.instantly_settings = {**(camp.instantly_settings or {}), **settings_patch}
+            instantly_patch.update(settings_patch)
+
+        # Push to Instantly
+        if not camp.instantly_campaign_id:
+            warnings.append("draft campaign has no Instantly campaign yet — changes saved locally only")
+        elif instantly_patch and instantly._is_configured():
+            ok = instantly.update_campaign(camp.instantly_campaign_id, instantly_patch)
+            if not ok:
+                warnings.append("Instantly PATCH failed — local changes saved but Instantly is out of sync")
+                send_alert(
+                    subject=f"[FA] Campaign update — Instantly PATCH failed: {camp.name}",
+                    body=f"Campaign {campaign_id} fields {list(instantly_patch)} not applied in Instantly",
+                )
+
+        camp.updated_at = datetime.now(timezone.utc)
+        db.add(camp)
+        db.flush()
+
+    return {"campaign": get_campaign_detail(campaign_id), "warnings": warnings}
+
+
 def duplicate_campaign(campaign_id: int) -> dict:
     """Clone template/filters/cap/dates — fresh draft, new Instantly campaign."""
     now = datetime.now(timezone.utc)
@@ -475,6 +588,7 @@ def get_campaign_detail(campaign_id: int) -> Optional[dict]:
             "start_date": camp.start_date,
             "end_date": camp.end_date,
             "send_schedule": camp.send_schedule,
+            "instantly_settings": camp.instantly_settings or {},
             "status": camp.status,
             "last_synced_at": camp.last_synced_at,
             "created_at": camp.created_at,

@@ -203,6 +203,7 @@ def mock_instantly():
                             return_value={"id": FAKE_INSTANTLY_CAMPAIGN_ID})
     activate_mock = MagicMock(name="activate_campaign", return_value=True)
     pause_mock = MagicMock(name="pause_campaign", return_value=True)
+    update_mock = MagicMock(name="update_campaign", return_value=True)
 
     # One raw analytics row in Instantly's native field names.
     analytics_mock = MagicMock(name="get_daily_analytics", return_value=[{
@@ -234,6 +235,7 @@ def mock_instantly():
         "create_campaign": create_mock,
         "activate_campaign": activate_mock,
         "pause_campaign": pause_mock,
+        "update_campaign": update_mock,
         "add_leads": add_leads_mock,
         "list_leads": list_leads_mock,
         "get_daily_analytics": analytics_mock,
@@ -268,27 +270,37 @@ def _existing_tables() -> set:
         }
 
 
-def _ensure_schema():
-    """Apply fa062 idempotently if a fresh DB hasn't been migrated.
-    upgrade() is guarded by IF NOT EXISTS except one ADD CONSTRAINT — tolerate
-    that one if it already exists."""
-    if all(t in _existing_tables() for t in REQUIRED_TABLES):
-        return
+def _load_migration_upgrade(filename, module_name):
     import importlib.util
     mig_path = os.path.join(
         os.path.dirname(os.path.dirname(__file__)),
-        "alembic", "versions", "fa062_email_campaigns.py",
+        "alembic", "versions", filename,
     )
-    spec = importlib.util.spec_from_file_location("fa062_email_campaigns", mig_path)
+    spec = importlib.util.spec_from_file_location(module_name, mig_path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    upgrade = mod.upgrade
+    return mod.upgrade
+
+
+def _ensure_schema():
+    """Apply fa062 idempotently if a fresh DB hasn't been migrated, then always
+    apply fa063 (instantly_settings column — IF NOT EXISTS, safe to re-run).
+    upgrade() is guarded by IF NOT EXISTS except one ADD CONSTRAINT — tolerate
+    that one if it already exists."""
+    if not all(t in _existing_tables() for t in REQUIRED_TABLES):
+        upgrade_062 = _load_migration_upgrade("fa062_email_campaigns.py", "fa062_email_campaigns")
+        with get_db_context() as db:
+            try:
+                upgrade_062(db.connection())
+            except Exception as exc:
+                if "already exists" not in str(exc).lower():
+                    raise
+    # fa063 is a single IF NOT EXISTS column add — always apply (idempotent).
+    upgrade_063 = _load_migration_upgrade(
+        "fa063_campaign_instantly_settings.py", "fa063_campaign_instantly_settings"
+    )
     with get_db_context() as db:
-        try:
-            upgrade(db.connection())
-        except Exception as exc:
-            if "already exists" not in str(exc).lower():
-                raise
+        upgrade_063(db.connection())
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -462,6 +474,42 @@ class TestEmailCampaignStaging:
         # the sequence payload was built from the template steps
         _, kwargs = STATE["instantly"]["create_campaign"].call_args
         assert kwargs["sequence_steps"][0]["type"] == "email"
+
+    # ------------------------------------------------------------------
+    # STEP 4b — Edit campaign (PATCH): local fields + Instantly knobs
+    # ------------------------------------------------------------------
+
+    def test_05b_update_campaign(self):
+        from src.services import email_campaigns as svc
+
+        STATE["instantly"]["update_campaign"].reset_mock()
+        result = svc.update_campaign(STATE["campaign_id"], {
+            "name": f"{CAMPAIGN_NAME} (edited)",
+            "vertical": "edited_vertical",          # local-only -> warning
+            "daily_limit": 50,                       # Instantly knob -> settings + PATCH
+            "stop_on_reply": True,
+        })
+
+        camp = result["campaign"]
+        assert camp["name"] == f"{CAMPAIGN_NAME} (edited)"
+        assert camp["vertical"] == "edited_vertical"
+        # Instantly-only knobs persisted in the JSONB column
+        assert camp["instantly_settings"]["daily_limit"] == 50
+        assert camp["instantly_settings"]["stop_on_reply"] is True
+        # vertical change surfaces a future-top-ups-only warning
+        assert any("future top-ups" in w for w in result["warnings"])
+
+        # Instantly PATCH was driven with name + the knobs
+        assert STATE["instantly"]["update_campaign"].call_count == 1
+        _, patch_data = STATE["instantly"]["update_campaign"].call_args[0]
+        assert patch_data["name"] == f"{CAMPAIGN_NAME} (edited)"
+        assert patch_data["daily_limit"] == 50
+        assert patch_data["stop_on_reply"] is True
+        # local-only fields are NOT pushed to Instantly
+        assert "vertical" not in patch_data
+
+        # restore vertical so downstream eligibility tests still match the seeds
+        svc.update_campaign(STATE["campaign_id"], {"vertical": TEST_VERTICAL})
 
     # ------------------------------------------------------------------
     # STEP 5 — Eligible count
