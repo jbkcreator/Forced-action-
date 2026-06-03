@@ -215,6 +215,10 @@ class LienLoader(BaseLoader):
                 any(code in doc_type_upper for code in self._code_lien_city_map)
                 or 'CODE LIEN' in doc_type_upper
             )
+            # Used by both the owner-name match-order logic and the
+            # creditor/debtor assignment at write time.
+            is_mechanics_lien = 'ML' in doc_type_upper or 'MECHANIC' in doc_type_upper
+            is_judgment = 'JUDGMENT' in doc_type_upper or 'CERTIFIED' in doc_type_upper
             # Code liens hold at 90 (business rule: false-positive prevention — the
             # 113-record cascade incident). All other lien types use the county floor.
             name_threshold = 90 if is_code_lien else self._thresholds.owner_name_floor
@@ -328,8 +332,6 @@ class LienLoader(BaseLoader):
                 # Judgments: Grantor = creditor (bank/LLC), Grantee = debtor/property owner.
                 # Try Grantee first — avoids wasting the first match attempt on the creditor.
                 # All other liens (HOA, etc.): Grantor = debtor/owner — try Grantor first.
-                is_mechanics_lien = 'ML' in doc_type_upper or 'MECHANIC' in doc_type_upper
-                is_judgment = 'JUDGMENT' in doc_type_upper or 'CERTIFIED' in doc_type_upper
                 first_field, second_field = (
                     ('Grantee', 'Grantor') if (is_mechanics_lien or is_judgment) else ('Grantor', 'Grantee')
                 )
@@ -394,7 +396,13 @@ class LienLoader(BaseLoader):
                         #   (b) Code Liens: city/county may be in either Grantor or Grantee —
                         #       whichever side contains the filer keyword is the creditor;
                         #       the other side is the debtor (property owner).
-                        #   (c) All other liens: creditor = Grantee, debtor = Grantor.
+                        #   (c) Judgments + Mechanics Liens: Grantor = creditor (state/
+                        #       bank/contractor), Grantee = debtor/property owner — same
+                        #       party-role model the match logic above uses. (Verified
+                        #       against recorded judgment PDFs 2026-06-03; prior rule had
+                        #       these swapped, inverting ~92% of judgment rows.)
+                        #   (d) All other liens (HOA, etc.): creditor = Grantee,
+                        #       debtor = Grantor.
                         if is_tax_lien:
                             creditor_val = 'INTERNAL REVENUE SERVICE'
                             debtor_raw = row.get('Grantee')
@@ -410,6 +418,10 @@ class LienLoader(BaseLoader):
                                 creditor_raw = grantee_raw
                                 debtor_raw = grantor_raw
                             creditor_val = None if pd.isna(creditor_raw) else creditor_raw
+                        elif is_mechanics_lien or is_judgment:
+                            creditor_raw = row.get('Grantor')
+                            creditor_val = None if pd.isna(creditor_raw) else creditor_raw
+                            debtor_raw = row.get('Grantee')
                         else:
                             creditor_raw = row.get('Grantee')
                             creditor_val = None if pd.isna(creditor_raw) else creditor_raw

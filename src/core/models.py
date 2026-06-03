@@ -403,15 +403,28 @@ class LegalAndLien(Base):
     book_type: Mapped[Optional[str]] = mapped_column(String(50))
     book_number: Mapped[Optional[str]] = mapped_column(String(50))
     page_number: Mapped[Optional[str]] = mapped_column(String(50))
-    
+
+    # Court case identifier (extracted from PDF by OCR v2; 0% populated pre-OCR)
+    case_number: Mapped[Optional[str]] = mapped_column(String(100))
+
     # Additional metadata
     document_type: Mapped[Optional[str]] = mapped_column(String(100))  # CCL, TCL, ML, TL, HL, Judgment
     legal_description: Mapped[Optional[str]] = mapped_column(Text)
     meta_data: Mapped[Optional[dict]] = mapped_column(JSONB)  # Additional type-specific fields
 
+    # OCR v2 — PDF-extracted property identifiers
+    parcel_id: Mapped[Optional[str]] = mapped_column(String(100))
+    property_address: Mapped[Optional[str]] = mapped_column(Text)
+    normalized_property_address: Mapped[Optional[str]] = mapped_column(Text)
+    pdf_url: Mapped[Optional[str]] = mapped_column(Text)
+    pdf_path: Mapped[Optional[str]] = mapped_column(Text)
+    ocr_status: Mapped[Optional[str]] = mapped_column(String(30), default='pending')
+    ocr_confidence: Mapped[Optional[float]] = mapped_column(Numeric(5, 4))
+    ocr_extracted_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
     # Match provenance — populated by the loader at insert time
     match_confidence: Mapped[Optional[Decimal]] = mapped_column(Numeric(4, 3), nullable=True)  # 0.000–1.000
-    match_method: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)  # legal_desc | owner_name | llm_verified | address | manual
+    match_method: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)  # parcel_id | normalized_address | legal_desc | owner_name | llm_verified | address | manual
 
     # Load tracking & multi-county
     date_added: Mapped[Optional[date]] = mapped_column(Date, default=date.today, index=True)
@@ -425,12 +438,23 @@ class LegalAndLien(Base):
         Index("idx_legal_record_type", "record_type"),
         Index("idx_legal_filing_date", "filing_date"),
         Index("idx_legal_instrument", "instrument_number"),
+        Index("idx_legal_case_number", "case_number"),
+        Index("idx_legal_parcel_id", "parcel_id"),
+        Index("idx_legal_ocr_status", "ocr_status"),
         Index("idx_legal_meta_data", "meta_data", postgresql_using="gin"),
         Index("idx_legal_match_method", "match_method"),
         CheckConstraint("record_type IN ('Lien', 'Judgment')", name="check_lien_record_type"),
         CheckConstraint(
-            "match_method IN ('legal_desc', 'owner_name', 'llm_verified', 'address', 'manual')",
+            "match_method IS NULL OR match_method IN ("
+            "'legal_desc', 'owner_name', 'llm_verified', 'address', "
+            "'manual', 'parcel_id', 'normalized_address')",
             name="check_legal_match_method",
+        ),
+        CheckConstraint(
+            "ocr_status IS NULL OR ocr_status IN ("
+            "'pending', 'downloaded', 'extracted', 'low_confidence', "
+            "'failed_download', 'failed_extraction')",
+            name="check_legal_ocr_status",
         ),
     )
 
