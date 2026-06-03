@@ -3991,7 +3991,7 @@ def territory_map(
     from src.core.models import ZipTerritory, Property as _Prop, DistressScore as _DS
     from src.core.redis_client import redis_available, rget, rset
     from src.services.urgency_engine import get_active_count
-    from src.utils.zip_centroids import HILLSBOROUGH_ZIP_CENTROIDS, get_zip_centroid
+    from src.utils.zip_centroids import get_county_zip_centroids, get_zip_centroid, get_county_map_config
 
     cache_key = f"territory_map:{county_id}:{vertical}"
     if redis_available():
@@ -4009,7 +4009,8 @@ def territory_map(
 
     # Always show all known ZIPs for this county; default to 'available' if not yet locked.
     # For non-hillsborough counties fall back to only the rows that exist in zip_territories.
-    known_zips = sorted(HILLSBOROUGH_ZIP_CENTROIDS.keys()) if county_id == "hillsborough" else sorted(territory_db.keys())
+    county_centroids = get_county_zip_centroids(county_id)
+    known_zips = sorted(county_centroids.keys()) if county_centroids else sorted(territory_db.keys())
 
     # Single GROUP BY query for lead counts across all known ZIPs
     lead_counts: dict = {}
@@ -4033,7 +4034,7 @@ def territory_map(
         except Exception:
             pass
 
-        centroid = get_zip_centroid(zip_code)
+        centroid = get_zip_centroid(zip_code, county_id)
         entry: dict = {
             "zip": zip_code,
             "status": status,
@@ -4051,6 +4052,7 @@ def territory_map(
         "county_id": county_id,
         "vertical": vertical,
         "zips": results,
+        "map_config": get_county_map_config(county_id),
         "generated_at": now.isoformat(),
     }
 

@@ -1,5 +1,6 @@
-# Static ZIP centroid lookup for Hillsborough County, FL.
+# Static ZIP centroid lookups per county, FL.
 # Coordinates are approximate geographic centers suitable for map markers.
+
 HILLSBOROUGH_ZIP_CENTROIDS: dict[str, tuple[float, float]] = {
     "33510": (27.9378, -82.2876),
     "33511": (27.9139, -82.2849),
@@ -56,6 +57,86 @@ HILLSBOROUGH_ZIP_CENTROIDS: dict[str, tuple[float, float]] = {
     "33647": (28.1092, -82.3733),
 }
 
+PINELLAS_ZIP_CENTROIDS: dict[str, tuple[float, float]] = {
+    "33701": (27.7703, -82.6393),
+    "33702": (27.8339, -82.6467),
+    "33703": (27.8075, -82.6256),
+    "33704": (27.7931, -82.6456),
+    "33705": (27.7497, -82.6461),
+    "33706": (27.7239, -82.7406),
+    "33707": (27.7614, -82.7083),
+    "33708": (27.8011, -82.7947),
+    "33709": (27.8025, -82.6978),
+    "33710": (27.7839, -82.7244),
+    "33711": (27.7353, -82.6836),
+    "33712": (27.7525, -82.6847),
+    "33713": (27.7692, -82.6958),
+    "33714": (27.8119, -82.6958),
+    "33715": (27.6903, -82.7169),
+    "33716": (27.8269, -82.6803),
+    "33755": (27.9608, -82.7978),
+    "33756": (27.9419, -82.7614),
+    "33759": (27.9408, -82.7450),
+    "33760": (27.8994, -82.7039),
+    "33761": (28.0072, -82.7478),
+    "33762": (27.8742, -82.7083),
+    "33763": (28.0000, -82.7844),
+    "33764": (27.9236, -82.7672),
+    "33765": (27.9975, -82.7822),
+    "33767": (27.9803, -82.8272),
+    "33770": (27.9128, -82.7811),
+    "33771": (27.9022, -82.7478),
+    "33772": (27.8628, -82.7789),
+    "33773": (27.8836, -82.7500),
+    "33774": (27.8653, -82.7594),
+    "33776": (27.8447, -82.8078),
+    "33777": (27.8614, -82.7453),
+    "33778": (27.8806, -82.7494),
+    "33781": (27.8519, -82.6981),
+    "33782": (27.8736, -82.7136),
+    "33785": (27.8914, -82.8461),
+    "33786": (27.9131, -82.8444),
+    "34677": (27.9953, -82.6939),
+    "34683": (28.0697, -82.7631),
+    "34684": (28.0939, -82.7328),
+    "34685": (28.1006, -82.6972),
+    "34688": (28.1275, -82.6819),
+    "34689": (28.1461, -82.7586),
+    "34695": (27.9886, -82.6967),
+    "34698": (28.0172, -82.7714),
+}
 
-def get_zip_centroid(zip_code: str) -> tuple[float, float] | None:
-    return HILLSBOROUGH_ZIP_CENTROIDS.get(zip_code)
+# county_id → ZIP centroid lookup
+COUNTY_ZIP_CENTROIDS: dict[str, dict[str, tuple[float, float]]] = {
+    "hillsborough": HILLSBOROUGH_ZIP_CENTROIDS,
+    "pinellas":     PINELLAS_ZIP_CENTROIDS,
+}
+
+# Server-authoritative map viewport config per county.
+# bounds: [[sw_lat, sw_lon], [ne_lat, ne_lon]] — Leaflet maxBounds format.
+COUNTY_MAP_CONFIG: dict[str, dict] = {
+    "hillsborough": {
+        "center":       [27.9644, -82.4572],
+        "default_zoom": 10,
+        "min_zoom":     9,
+        "bounds":       [[27.65, -82.70], [28.20, -81.99]],
+    },
+    "pinellas": {
+        "center":       [27.8758, -82.7873],
+        "default_zoom": 10,
+        "min_zoom":     9,
+        "bounds":       [[27.62, -82.92], [28.22, -82.55]],
+    },
+}
+
+
+def get_zip_centroid(zip_code: str, county_id: str = "hillsborough") -> tuple[float, float] | None:
+    return COUNTY_ZIP_CENTROIDS.get(county_id, {}).get(zip_code)
+
+
+def get_county_zip_centroids(county_id: str) -> dict[str, tuple[float, float]]:
+    return COUNTY_ZIP_CENTROIDS.get(county_id, {})
+
+
+def get_county_map_config(county_id: str) -> dict | None:
+    return COUNTY_MAP_CONFIG.get(county_id)
