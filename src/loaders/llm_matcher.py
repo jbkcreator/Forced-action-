@@ -50,6 +50,33 @@ RECORD_TYPE_CONTEXT = {
     'eviction':    "Eviction filing. Plaintiff = landlord (property owner). Match must be to Plaintiff, NOT the tenant/defendant.",
     'probate':     "Probate case. Decedent was likely the property owner.",
     'bankruptcy':  "Bankruptcy. Debtor MAY own property — verify name and context carefully.",
+    'divorce':     "Dissolution of marriage filing. Petitioner is typically a property co-owner. Match against petitioner name and address.",
+}
+
+# Maps unmatched_records.source_type to the RECORD_TYPE_CONTEXT key above.
+# Used by llm_tiebreak_pending_review() to build the correct LLM prompt context.
+SOURCE_TYPE_TO_RECORD_TYPE: dict[str, str] = {
+    "liens":           "lien_ml",
+    "judgments":       "lien_ml",
+    "deeds":           "deed",
+    "lis_pendens":     "lis_pendens",
+    "probate":         "probate",
+    "evictions":       "eviction",
+    "bankruptcies":    "bankruptcy",
+    "divorce_filings": "divorce",
+}
+
+# Which raw_data field was used for name-based matching, per source type.
+# Passed to the LLM prompt so Claude understands which party is the property owner.
+SOURCE_TYPE_TO_MATCH_FIELD: dict[str, str] = {
+    "liens":           "Grantor",
+    "judgments":       "Grantee",
+    "deeds":           "Grantor",
+    "lis_pendens":     "Grantee",
+    "probate":         "LastName/CompanyName",
+    "evictions":       "Plaintiff",
+    "bankruptcies":    "Lead Name",
+    "divorce_filings": "LastName/CompanyName",
 }
 
 
@@ -80,13 +107,18 @@ class LLMPropertyMatcher:
             # quarantine
     """
 
-    def __init__(self, max_calls: int = MAX_LLM_CALLS_PER_RUN):
+    def __init__(
+        self,
+        max_calls: int = MAX_LLM_CALLS_PER_RUN,
+        model: str = "claude-sonnet-4-5-20250929",
+    ):
         settings = get_settings()
         self._client = anthropic.Anthropic(
             api_key=settings.anthropic_api_key.get_secret_value()
         )
         self._calls_this_run: int = 0
         self._max_calls: int = max_calls
+        self._model: str = model
 
     @property
     def budget_exhausted(self) -> bool:
@@ -144,7 +176,7 @@ class LLMPropertyMatcher:
 
         try:
             response = self._client.messages.create(
-                model="claude-sonnet-4-5-20250929",
+                model=self._model,
                 max_tokens=512,
                 temperature=0,
                 system=(
