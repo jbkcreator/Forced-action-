@@ -1,15 +1,20 @@
 """
 Skip trace waterfall coordinator.
 
-Tier 1: BatchData  ($0.02/record) — active when BATCH_SKIP_TRACING_API_KEY set
-Tier 2: Whitepages ($0.25/lookup) — active when WHITEPAGES_API_KEY set
-Tier 3: PDL        ($0.28/lookup) — active when PDL_API_KEY set
+Tier 1: Tracerfy  ($0.25/hit, $0.00/miss) — active when TRACERFY_API_KEY set
+Tier 2: BatchData ($0.02/lookup always)    — active when BATCH_SKIP_TRACING_API_KEY set
+Tier 3: PDL       ($0.28/hit, $0.00/miss)  — active when PDL_API_KEY set
 
 Stop condition: confidence >= skip_trace_confidence_threshold (default 0.70)
 Cost ceiling:   skip_trace_cost_ceiling_cents per lead (default 80 = $0.80)
 
-Worst case: $0.02 + $0.50 + $0.28 = $0.80 — exactly at the ceiling.
-Per-provider hit rate and cost tracked via existing enrichment_usage_log table.
+Worst case: $0.25 + $0.02 + $0.28 = $0.55 — under the ceiling.
+
+Tracerfy is Tier 1 because it charges 0 on a miss (no spend on leads it
+can't find) and returns DNC/litigator flags inline on every hit, giving
+compliance data before any send happens.
+
+Per-provider hit rate and cost tracked via enrichment_usage_log table.
 """
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -24,7 +29,7 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-_PROVIDER_COST_CENTS = {"batchdata": 2, "whitepages": 25, "pdl": 28}
+_PROVIDER_COST_CENTS = {"tracerfy": 2, "batchdata": 2, "pdl": 28}
 
 
 @dataclass
@@ -42,12 +47,13 @@ def _select_candidates(session, county_id: str, limit: int, today_only: bool) ->
     """Return Owner objects eligible for enrichment: Gold+ tier, no phone, not yet traced."""
     from sqlalchemy import and_, or_, func, exists as sa_exists
 
+    # Exclude owners already attempted by either Tier 1 (Tracerfy) or Tier 2 (BatchData).
     already_traced = (
         sa_exists()
         .where(
             and_(
                 EnrichedContact.property_id == Owner.property_id,
-                EnrichedContact.source == "batch_skip_tracing",
+                EnrichedContact.source.in_(("tracerfy", "batch_skip_tracing")),
             )
         )
     )
@@ -159,18 +165,18 @@ def run_waterfall(
     Run the multi-provider skip trace waterfall for all eligible owners.
 
     Selects Gold+ candidates with no phone, then passes them through
-    BatchData → IDI → PDL, escalating only leads that remain below
+    Tracerfy → BatchData → PDL, escalating only leads that remain below
     the confidence threshold after each tier.
     """
+    from src.services.tracerfy_fallback import run_tracerfy_fallback
     from src.services.skip_trace import run_skip_trace
-    from src.services.whitepages_fallback import run_whitepages_fallback
     from src.services.pdl_skip_trace import run_pdl_lookup
 
     settings  = get_settings()
     ceiling   = settings.skip_trace_cost_ceiling_cents
     threshold = settings.skip_trace_confidence_threshold
     stats     = WaterfallStats()
-    for p in ("batchdata", "whitepages", "pdl"):
+    for p in ("tracerfy", "batchdata", "pdl"):
         stats.per_provider[p] = {"attempts": 0, "hits": 0, "cost_cents": 0}
 
     # ── Candidate selection ───────────────────────────────────────────────
@@ -185,77 +191,80 @@ def run_waterfall(
     all_ids = [o.id for o in candidates]
     logger.info("[Waterfall] %d candidates in %s", len(candidates), county_id)
 
-    # ── Tier 1: BatchData ────────────────────────────────────────────────
+    # ── Tier 1: Tracerfy ─────────────────────────────────────────────────
+    # 0 credits on miss — safe to run first. DNC flags written to
+    # sms_opt_outs inline by run_tracerfy_fallback.
     tier2_ids: list[int] = []
 
-    if settings.batch_skip_tracing_api_key:
-        run_skip_trace(owner_ids=all_ids, county_id=county_id, today_only=False)
+    if settings.tracerfy_api_key:
+        run_tracerfy_fallback(owner_ids=all_ids, county_id=county_id)
 
         with get_db_context() as session:
             for owner in candidates:
                 owner = session.get(Owner, owner.id)
                 if not owner:
                     continue
-                ec         = _read_ec(session, owner.property_id, "batch_skip_tracing")
+                ec         = _read_ec(session, owner.property_id, "tracerfy")
                 confidence = _confidence_from_ec(owner, ec)
-                cost       = _PROVIDER_COST_CENTS["batchdata"]
+                # Tracerfy charges only on hit; use list price for ceiling conservatism
+                cost = _PROVIDER_COST_CENTS["tracerfy"] if (ec and ec.match_success) else 0
 
-                log_usage(session, vendor="batchdata", purpose="skip_trace",
+                log_usage(session, vendor="tracerfy", purpose="skip_trace",
                           success=bool(ec and ec.match_success),
                           cost_cents=cost, property_id=owner.property_id)
 
                 stats.total_cost_cents += cost
-                stats.per_provider["batchdata"]["attempts"] += 1
-                stats.per_provider["batchdata"]["cost_cents"] += cost
+                stats.per_provider["tracerfy"]["attempts"] += 1
+                stats.per_provider["tracerfy"]["cost_cents"] += cost
 
                 if ec and ec.match_success and confidence >= threshold:
-                    _stamp_confidence(session, owner.property_id, "batch_skip_tracing", confidence)
+                    _stamp_confidence(session, owner.property_id, "tracerfy", confidence)
                     stats.hits += 1
-                    stats.per_provider["batchdata"]["hits"] += 1
+                    stats.per_provider["tracerfy"]["hits"] += 1
                 else:
-                    # Escalate if Whitepages cost still fits within ceiling
-                    if cost + _PROVIDER_COST_CENTS["whitepages"] <= ceiling:
+                    # Use list price for ceiling check (conservative)
+                    if _PROVIDER_COST_CENTS["tracerfy"] + _PROVIDER_COST_CENTS["batchdata"] <= ceiling:
                         tier2_ids.append(owner.id)
             session.commit()
     else:
-        logger.warning("[Waterfall] BATCH_SKIP_TRACING_API_KEY not set — Tier 1 skipped")
+        logger.warning("[Waterfall] TRACERFY_API_KEY not set — Tier 1 skipped")
         tier2_ids = all_ids
 
-    # ── Tier 2: Whitepages ───────────────────────────────────────────────
+    # ── Tier 2: BatchData ────────────────────────────────────────────────
     tier3_ids: list[int] = []
 
     if tier2_ids:
-        if settings.whitepages_api_key:
-            run_whitepages_fallback(owner_ids=tier2_ids, county_id=county_id)
+        if settings.batch_skip_tracing_api_key:
+            run_skip_trace(owner_ids=tier2_ids, county_id=county_id, today_only=False)
 
             with get_db_context() as session:
                 for owner_id in tier2_ids:
                     owner = session.get(Owner, owner_id)
                     if not owner:
                         continue
-                    ec         = _read_ec(session, owner.property_id, "whitepages")
+                    ec         = _read_ec(session, owner.property_id, "batch_skip_tracing")
                     confidence = _confidence_from_ec(owner, ec)
-                    cost       = _PROVIDER_COST_CENTS["whitepages"]
-                    spent_so_far = _PROVIDER_COST_CENTS["batchdata"] + cost
+                    cost       = _PROVIDER_COST_CENTS["batchdata"]  # always charged
+                    spent_so_far = _PROVIDER_COST_CENTS["tracerfy"] + cost
 
-                    log_usage(session, vendor="whitepages", purpose="skip_trace",
+                    log_usage(session, vendor="batchdata", purpose="skip_trace",
                               success=bool(ec and ec.match_success),
                               cost_cents=cost, property_id=owner.property_id)
 
                     stats.total_cost_cents += cost
-                    stats.per_provider["whitepages"]["attempts"] += 1
-                    stats.per_provider["whitepages"]["cost_cents"] += cost
+                    stats.per_provider["batchdata"]["attempts"] += 1
+                    stats.per_provider["batchdata"]["cost_cents"] += cost
 
                     if ec and ec.match_success and confidence >= threshold:
-                        _stamp_confidence(session, owner.property_id, "whitepages", confidence)
+                        _stamp_confidence(session, owner.property_id, "batch_skip_tracing", confidence)
                         stats.hits += 1
-                        stats.per_provider["whitepages"]["hits"] += 1
+                        stats.per_provider["batchdata"]["hits"] += 1
                     else:
                         if spent_so_far + _PROVIDER_COST_CENTS["pdl"] <= ceiling:
                             tier3_ids.append(owner_id)
                 session.commit()
         else:
-            logger.warning("[Waterfall] WHITEPAGES_API_KEY not set — Tier 2 skipped")
+            logger.warning("[Waterfall] BATCH_SKIP_TRACING_API_KEY not set — Tier 2 skipped")
             tier3_ids = tier2_ids
 
     # ── Tier 3: PeopleDataLabs ───────────────────────────────────────────

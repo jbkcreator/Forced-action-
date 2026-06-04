@@ -231,7 +231,10 @@ class AppSettings(BaseSettings):
 
 	# Contact enrichment (M1)
 	batch_skip_tracing_api_key: Optional[SecretStr] = Field(default=None, env="BATCH_SKIP_TRACING_API_KEY")
-	whitepages_api_key: Optional[SecretStr] = Field(default=None, env="WHITEPAGES_API_KEY")
+	whitepages_api_key: Optional[SecretStr] = Field(default=None, env="WHITEPAGES_API_KEY")  # deprecated — no-op, kept to avoid breaking existing .env files
+	tracerfy_api_key: Optional[SecretStr] = Field(default=None, env="TRACERFY_API_KEY")
+	tracerfy_cost_cents: int = Field(default=2, env="TRACERFY_COST_CENTS")
+	dnc_recheck_days: int = Field(default=30, env="DNC_RECHECK_DAYS")
 	# Multi-heir probate enrichment (default OFF).
 	# When True, skip-trace enumerates every named heir from
 	# legal_proceedings.meta_data->'heirs' for probate-derived leads instead of

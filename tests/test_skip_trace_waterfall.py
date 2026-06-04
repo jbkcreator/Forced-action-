@@ -46,24 +46,29 @@ class TestComputeConfidence:
 class TestCostCeilingInvariants:
 
     def test_all_three_providers_under_ceiling(self):
-        # $0.02 + $0.25 + $0.28 = $0.55 — under $0.80 ceiling
-        assert 2 + 25 + 28 == 55
-        assert 55 <= 80
+        # $0.02 (Tracerfy batch) + $0.02 (BatchData) + $0.28 (PDL) = $0.32 — under $0.80 ceiling
+        assert 2 + 2 + 28 == 32
+        assert 32 <= 80
 
-    def test_batchdata_only_well_under_ceiling(self):
+    def test_tracerfy_only_well_under_ceiling(self):
         assert 2 <= 80
 
-    def test_batchdata_plus_whitepages_under_ceiling(self):
-        assert 2 + 25 == 27
-        assert 27 <= 80
+    def test_tracerfy_plus_batchdata_under_ceiling(self):
+        assert 2 + 2 == 4
+        assert 4 <= 80
+
+    def test_tracerfy_zero_cost_on_miss(self):
+        # Tracerfy charges 0 on miss; 0 + BatchData $0.02 always under ceiling
+        tracerfy_miss_cost = 0
+        assert tracerfy_miss_cost + 2 <= 80
 
     def test_tlo_excluded_correctly(self):
-        # TLO minimum $1.00 = 100 cents; 2 + 25 + 100 = 127 > 80
-        assert 2 + 25 + 100 > 80
+        # TLO minimum $1.00 = 100 cents; 2 + 2 + 100 = 104 > 80
+        assert 2 + 2 + 100 > 80
 
     def test_irb_excluded_correctly(self):
-        # IRB ~$3.00 = 300 cents; 2 + 25 + 300 = 327 >> 80
-        assert 2 + 25 + 300 > 80
+        # IRB ~$3.00 = 300 cents; 2 + 2 + 300 = 304 >> 80
+        assert 2 + 2 + 300 > 80
 
 
 class TestSkipTraceResult:
@@ -104,15 +109,15 @@ class TestPDLSkippedWhenNoKey:
         assert result.provider == "pdl"
 
 
-class TestWhitepagesSkippedWhenNoKey:
+class TestTracerfySkippedWhenNoKey:
 
     def test_returns_skipped_dict_when_key_absent(self):
-        from src.services.whitepages_fallback import run_whitepages_fallback
-        with patch("src.services.whitepages_fallback.get_settings") as mock:
-            mock.return_value.whitepages_api_key = None
-            stats = run_whitepages_fallback(limit=10)
+        from src.services.tracerfy_fallback import run_tracerfy_fallback
+        with patch("src.services.tracerfy_fallback.get_settings") as mock:
+            mock.return_value.tracerfy_api_key = None
+            stats = run_tracerfy_fallback(limit=10)
         assert stats.get("skipped") is True
-        assert stats.get("reason") == "WHITEPAGES_API_KEY not configured"
+        assert stats.get("reason") == "TRACERFY_API_KEY not configured"
 
 
 class TestPDLResponseParsing:
@@ -211,48 +216,76 @@ class TestPDLResponseParsing:
         assert result.raw_metadata == {"pdl_likelihood": 9}
 
 
-class TestWhitepagesResponseParsing:
+class TestTracerfyResponseParsing:
+    """Tests use confirmed field names from GET /queue/:id (2026-06-03)."""
 
-    def test_mobile_preferred_over_landline(self):
-        from src.services.whitepages_fallback import _parse_wp_result
-        persons = [{
-            "phones": [
-                {"number": "(813) 555-0001", "type": "landline", "score": 90},
-                {"number": "(813) 555-0002", "type": "mobile",   "score": 85},
-            ],
-            "emails": [],
-            "current_addresses": [],
-        }]
-        result = _parse_wp_result(persons)
-        assert result["mobile_phone"] == "(813) 555-0002"
-        assert result["landline"] == "(813) 555-0001"
+    def _make(self, primary_phone="", primary_phone_type="Mobile",
+              mobile_1="", mobile_2="", landline_1="",
+              email_1="", mail_address="", mail_city="", mail_state=""):
+        return {
+            "primary_phone":      primary_phone,
+            "primary_phone_type": primary_phone_type,
+            "mobile_1":           mobile_1,
+            "mobile_2":           mobile_2,
+            "landline_1":         landline_1,
+            "email_1":            email_1,
+            "mail_address":       mail_address,
+            "mail_city":          mail_city,
+            "mail_state":         mail_state,
+        }
+
+    def test_primary_mobile_extracted(self):
+        from src.services.tracerfy_fallback import _parse_trace_row
+        row = self._make(primary_phone="8135550001", primary_phone_type="Mobile")
+        result = _parse_trace_row(row)
+        assert result["mobile_phone"] is not None
         assert result["match_success"] is True
 
-    def test_email_extracted_by_score(self):
-        from src.services.whitepages_fallback import _parse_wp_result
-        persons = [{
-            "phones": [],
-            "emails": [
-                {"address": "low@example.com",  "score": 40},
-                {"address": "high@example.com", "score": 90},
-            ],
-            "current_addresses": [],
-        }]
-        result = _parse_wp_result(persons)
-        assert result["email"] == "high@example.com"
+    def test_mobile_1_fallback(self):
+        from src.services.tracerfy_fallback import _parse_trace_row
+        row = self._make(mobile_1="8135550002")
+        result = _parse_trace_row(row)
+        assert result["mobile_phone"] is not None
 
-    def test_address_from_current_addresses_string(self):
-        from src.services.whitepages_fallback import _parse_wp_result
-        persons = [{
-            "phones": [{"number": "(813) 555-0003", "type": "mobile", "score": 80}],
-            "emails": [],
-            "current_addresses": [{"id": "A123", "address": "123 Main St, Tampa, FL 33601"}],
-        }]
-        result = _parse_wp_result(persons)
-        assert result["mailing_address"] == "123 Main St, Tampa, FL 33601"
+    def test_landline_extracted(self):
+        from src.services.tracerfy_fallback import _parse_trace_row
+        row = self._make(landline_1="8135550003")
+        result = _parse_trace_row(row)
+        assert result["landline"] is not None
 
-    def test_empty_persons_returns_no_match(self):
-        from src.services.whitepages_fallback import _parse_wp_result
-        result = _parse_wp_result([])
+    def test_email_extracted(self):
+        from src.services.tracerfy_fallback import _parse_trace_row
+        row = self._make(email_1="owner@example.com")
+        result = _parse_trace_row(row)
+        assert result["email"] == "owner@example.com"
+        assert result["match_success"] is True
+
+    def test_empty_row_returns_no_match(self):
+        from src.services.tracerfy_fallback import _parse_trace_row
+        result = _parse_trace_row({})
         assert result["match_success"] is False
+        assert result["mobile_phone"] is None
+        assert result["dnc_flags"] is None
+
+    def test_dnc_flags_none_batch_trace(self):
+        from src.services.tracerfy_fallback import _parse_trace_row
+        # batch trace does not return DNC flags — handled by dnc_refresh
+        row = self._make(primary_phone="8135550001", primary_phone_type="Mobile")
+        result = _parse_trace_row(row)
+        assert result["dnc_flags"] is None
+        assert result["all_dnc_phones"] == []
+
+    def test_mailing_address_assembled(self):
+        from src.services.tracerfy_fallback import _parse_trace_row
+        row = self._make(
+            primary_phone="8135550003", primary_phone_type="Mobile",
+            mail_address="123 Main St", mail_city="Tampa", mail_state="FL",
+        )
+        result = _parse_trace_row(row)
+        assert result["mailing_address"] == "123 Main St, Tampa, FL"
+
+    def test_invalid_phone_dropped(self):
+        from src.services.tracerfy_fallback import _parse_trace_row
+        row = self._make(primary_phone="not-a-number", primary_phone_type="Mobile")
+        result = _parse_trace_row(row)
         assert result["mobile_phone"] is None

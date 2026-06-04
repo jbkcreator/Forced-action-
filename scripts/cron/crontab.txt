@@ -84,9 +84,6 @@ COUNTY_ID=hillsborough
 #     Bumped from 1x to 3x to catch new FEMA IA filings and adjuster permits same-day.
 23 6,14,22 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.insurance.insurance_engine --county-id $COUNTY_ID
 
-# 15. Fire Incidents — 06:25 AM UTC / 02:25 AM EDT / 11:55 AM IST
-25 6 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.fire.fire_engine --county-id $COUNTY_ID
-
 # 16. Load Validator — 06:30 AM UTC Mon-Sat (after all scrapers complete)
 30 6 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.load_validator
 
@@ -112,8 +109,6 @@ COUNTY_ID=hillsborough
 # P7. Foreclosure Auctions   — 06:20 AM UTC daily (every day, not just Mon-Sat)
 20 6 * * * $PROJECT/scripts/cron/run.sh src.scrappers.foreclosures.foreclosure_engine --date $(date +\%Y-\%m-\%d) --load-to-db --county-id pinellas
 
-# P8. Skip Tracing (Pinellas) — 07:38 AM UTC Mon-Sat (after CDS --rescore-new-signals at 07:00)
-38 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.run_enrichment pinellas --limit 500
 
 # 17. Lead Quality Monitor — 07:35 AM UTC Mon-Sat (after CDS scoring at 07:00, skip tracing at 07:30)
 #     Snapshots leads sent ~30 days ago; computes Gold+ false-positive rate.
@@ -176,11 +171,6 @@ COUNTY_ID=hillsborough
 # Daily reconciliation Mon-Sat — catch any subscribers who paid but weren't activated
 15 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.stripe_reconcile
 
-# ── SKIP TRACING / CONTACT ENRICHMENT ────────────────────────
-# Enriches today's Gold+ leads with phone/email via BatchData (+ IDI fallback).
-# Runs after CDS scoring so today's new leads are enriched before GHL sync picks them up.
-# --today-only: only process leads scored in the current run (safe, avoids re-processing history)
-30 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.run_enrichment $COUNTY_ID --limit 500
 
 # SunBiz LLC Piercing Enrichment — 07:40 AM UTC Mon-Sat (fa031 tiered staleness)
 # Tier A: active-lead pending/30d-stale  •  Tier B: cold pending/180d-stale

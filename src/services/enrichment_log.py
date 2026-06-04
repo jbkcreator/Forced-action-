@@ -32,6 +32,8 @@ DEFAULT_COST_CENTS = {
     ("twilio_lookup", "phone_verify"):   1,
     ("idi", "skip_trace"):              50,   # $0.50/lookup — charged on success only
     ("pdl", "skip_trace"):              28,   # $0.28/lookup — charged on success only
+    ("tracerfy", "skip_trace"):          2,   # 1 credit/hit @ $0.02; 0 on miss (POST /trace/ batch)
+    ("tracerfy", "dnc_refresh"):         1,   # 1 credit/phone for batch /dnc/scrub/
 }
 
 

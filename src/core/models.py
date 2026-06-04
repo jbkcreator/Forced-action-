@@ -1368,7 +1368,7 @@ class EnrichedContact(Base):
     raw_response: Mapped[Optional[dict]] = mapped_column(JSONB)
 
     # Source tracking
-    source: Mapped[str] = mapped_column(String(50), nullable=False)   # batch_skip_tracing | idi | pdl
+    source: Mapped[str] = mapped_column(String(50), nullable=False)   # batch_skip_tracing | idi | pdl | tracerfy
     match_success: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     # Which named individual was traced. NULL for legacy single-trace rows
@@ -3339,6 +3339,9 @@ class DBPRContact(Base):
     company_name: Mapped[Optional[str]] = mapped_column(String(255))
     company_name_status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
     company_name_scraped_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    email: Mapped[Optional[str]] = mapped_column(String(200))   # raw email from DBPR file
+    phone: Mapped[Optional[str]] = mapped_column(String(20))    # raw phone from DBPR file
 
     enrichment_status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
     enrichment_attempted_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
