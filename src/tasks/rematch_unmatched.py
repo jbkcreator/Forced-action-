@@ -574,7 +574,7 @@ def llm_tiebreak_pending_review(
         limit:       Max records to process.
         county_id:   County to process.
         dry_run:     Log decisions without writing to DB.
-        batch_size:  Records per LLM API call (default 10).
+        batch_size:  Records per LLM API call (default 5).
         model:       Anthropic model ID.
 
     Returns:
@@ -660,7 +660,9 @@ def llm_tiebreak_pending_review(
                     record.id, src, confirmed_id, result.confidence, result.reason,
                 )
                 if not dry_run:
-                    _promote_to_destination(session, record, confirmed_id, county_id)
+                    promoted = _promote_to_destination(session, record, confirmed_id, county_id)
+                    # promoted=False means either duplicate (fine) or write error (rare).
+                    # Only gate on None-like; False from dedup is still a successful state.
                     record.match_status         = "matched"
                     record.matched_property_id  = confirmed_id
                     record.candidate_property_id = None
@@ -765,7 +767,11 @@ def llm_tiebreak_pending_review(
             # Apply decisions
             decided_ids = set()
             for decision in decisions:
-                rid = decision.get("record_id")
+                try:
+                    rid = int(decision.get("record_id"))  # coerce — LLM may return string
+                except (TypeError, ValueError):
+                    logger.warning("[LLM tiebreaker] Unparseable record_id in decision: %s", decision)
+                    continue
                 rec = rec_by_id.get(rid)
                 if not rec:
                     logger.warning("[LLM tiebreaker] Unknown record_id %s in batch response", rid)
@@ -782,10 +788,10 @@ def llm_tiebreak_pending_review(
                     )
                     if not dry_run:
                         _promote_to_destination(session, rec, confirmed_id, county_id)
-                        rec.match_status          = "matched"
-                        rec.matched_property_id   = confirmed_id
+                        rec.match_status         = "matched"
+                        rec.matched_property_id  = confirmed_id
                         rec.candidate_property_id = None
-                        rec.match_attempted_at    = datetime.now(timezone.utc)
+                        rec.match_attempted_at   = datetime.now(timezone.utc)
                     stats["confirmed"] += 1
                 else:
                     logger.info(
