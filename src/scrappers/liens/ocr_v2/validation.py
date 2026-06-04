@@ -15,12 +15,13 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Florida UCN pattern: YYYY-CA-NNNNNN, YYYY-CC-NNNNNN, etc.
-# Also matches short forms (22-CA-2345) and full undashed 20-char UCNs as
-# printed on Pinellas recorded judgments, e.g. 522026CT006851000APC
-# (CC=county YYYY=year TT=court-type NNNNNN=sequence NNN=party + suffix).
+# Florida UCN patterns:
+#   Standard:  YY-CF-NNNNNN  or  YYYY-CF-NNNNNN  (Hillsborough + most courts)
+#   Pinellas:  YY-NNNNN-CF-B  (sequence before court-type, optional suffix)
+#   Undashed:  522026CT006851000APC  (20-char compact form on recorded judgments)
 _FL_UCN_RE = re.compile(
     r'\b(?:\d{4}|\d{2})-(?:CA|CC|CF|CJ|CU|DR|MM|CT|SC|MH|CP|GD|GA|GT|AW|RE|AP)-\d{4,8}\b'
+    r'|\b(?:\d{2})-\d{4,8}-(?:CA|CC|CF|CJ|CU|DR|MM|CT|SC|MH|CP|GD|GA|GT|AW|RE|AP)(?:-\w+)?\b'
     r'|\b\d{6}(?:CA|CC|CF|CJ|CU|DR|MM|CT|SC|MH|CP|GD|GA|GT|AW|RE|AP)\d{6}\w{0,6}\b',
     re.IGNORECASE,
 )
