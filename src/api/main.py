@@ -3450,22 +3450,35 @@ class SynthflowInboundPayload(BaseModel):
         return None
 
     @property
+    def _transcript(self) -> Any:
+        return self.call.get("transcript") if isinstance(self.call, dict) else None
+
+    @property
     def resolved_zip(self) -> Optional[str]:
-        return (
+        structured = (
             self.zip_code or self.zip
             or self._slot(self.collected_variables, "zip_code", "zip")
             or self._slot(self.executed_actions, "zip_code", "zip")
             or self._slot((self.lead or {}).get("prompt_variables"), "zip_code", "zip")
         )
+        if structured:
+            return structured
+        # Fallback: flat-prompt agent has no Flow-Designer slots → parse transcript.
+        from src.services.synthflow_transcript import extract_zip
+        return extract_zip(self._transcript)
 
     @property
     def resolved_vertical(self) -> Optional[str]:
-        return (
+        structured = (
             self.vertical
             or self._slot(self.collected_variables, "vertical", "trade")
             or self._slot(self.executed_actions, "vertical", "trade")
             or self._slot((self.lead or {}).get("prompt_variables"), "vertical", "trade")
         )
+        if structured:
+            return structured
+        from src.services.synthflow_transcript import extract_vertical
+        return extract_vertical(self._transcript)
 
     @property
     def resolved_call_id(self) -> Optional[str]:
