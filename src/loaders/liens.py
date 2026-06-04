@@ -9,6 +9,7 @@ import pandas as pd
 
 from src.loaders.base import (
     BaseLoader,
+    MATCH_METHOD_PARCEL_ID,
     MATCH_METHOD_LEGAL_DESC,
     MATCH_METHOD_OWNER_NAME,
     MATCH_METHOD_OWNER_ZIP,
@@ -219,8 +220,21 @@ class LienLoader(BaseLoader):
             # 113-record cascade incident). All other lien types use the county floor.
             name_threshold = 90 if is_code_lien else self._thresholds.owner_name_floor
 
-            # Strategy A: Legal description (lot/block/subdivision → parcel)
+            # Strategy 0: parcel ID extracted from Legal text — fires when the
+            # county recording includes a folio/parcel number in the description.
+            # Falls through silently when the Legal field has no recognisable ID.
             if pd.notna(row.get('Legal')):
+                for pid in self.extract_parcel_ids_from_text(row['Legal']):
+                    prop = self.find_property_by_parcel_id(pid)
+                    if prop:
+                        property_record = prop
+                        match_score = 100
+                        match_method = MATCH_METHOD_PARCEL_ID
+                        logger.info(f"Matched lien/judgment by parcel ID {pid}: {instrument}")
+                        break
+
+            # Strategy A: Legal description (lot/block/subdivision → parcel)
+            if not property_record and pd.notna(row.get('Legal')):
                 match_result = self.find_property_by_legal_description(
                     row['Legal'], threshold=self._thresholds.legal_desc_floor,
                 )

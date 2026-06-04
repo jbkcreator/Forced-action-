@@ -429,7 +429,7 @@ class LegalAndLien(Base):
         Index("idx_legal_match_method", "match_method"),
         CheckConstraint("record_type IN ('Lien', 'Judgment')", name="check_lien_record_type"),
         CheckConstraint(
-            "match_method IN ('legal_desc', 'owner_name', 'llm_verified', 'address', 'manual')",
+            "match_method IN ('parcel_id', 'legal_desc', 'owner_name', 'llm_verified', 'address', 'manual')",
             name="check_legal_match_method",
         ),
     )
