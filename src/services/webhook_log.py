@@ -156,13 +156,16 @@ def _ghl(payload: Dict[str, Any]) -> dict:
 
 
 def _synthflow(payload: Dict[str, Any]) -> dict:
+    # Synthflow's native post-call webhook nests call data under `call` and the
+    # caller under `lead`; older/flat posts keep these at the top level.
+    call = payload.get("call") if isinstance(payload.get("call"), dict) else {}
     return {
         "event":          payload.get("event") or payload.get("event_type"),
-        "call_id":        payload.get("call_id") or payload.get("id"),
-        "agent_id":       payload.get("agent_id"),
-        "status":         payload.get("status"),
-        "duration_sec":   payload.get("duration_sec") or payload.get("duration"),
-        "outcome":        payload.get("outcome"),
+        "call_id":        payload.get("call_id") or payload.get("id") or call.get("call_id") or call.get("id"),
+        "agent_id":       payload.get("agent_id") or call.get("model_id"),
+        "status":         payload.get("status") or call.get("status"),
+        "duration_sec":   payload.get("duration_sec") or payload.get("duration") or call.get("duration"),
+        "outcome":        payload.get("outcome") or call.get("end_call_reason"),
     }
 
 

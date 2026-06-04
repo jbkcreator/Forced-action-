@@ -54,6 +54,65 @@ def _settings_mock(secret="test_secret", app_base_url="https://app.example.com")
     return s
 
 
+# ── SynthflowInboundPayload parsing (regression: nested vs flat) ──────────────
+
+class TestSynthflowInboundPayloadParsing:
+    """
+    Regression for the real-call bug: Synthflow's post-call webhook nests the
+    data (lead.phone_number, call.call_id, collected_variables.<x>.value), but
+    the handler originally read only flat top-level keys → every field parsed
+    null → 'ignored: no_phone' → pipeline never ran. These tests pin both the
+    native nested shape and the flat/direct-post shape.
+    """
+
+    @staticmethod
+    def _model():
+        from src.api.main import SynthflowInboundPayload
+        return SynthflowInboundPayload
+
+    def test_nested_synthflow_shape(self):
+        P = self._model()
+        p = P(
+            status="completed",
+            lead={"phone_number": "+17275551234", "prompt_variables": {}},
+            call={"call_id": "abc-123", "status": "completed",
+                  "end_call_reason": "hangup", "duration": 42},
+            collected_variables={"zip_code": {"value": "33510"},
+                                 "vertical": {"value": "roofing"}},
+        )
+        assert p.resolved_phone == "+17275551234"
+        assert p.resolved_call_id == "abc-123"
+        assert p.resolved_zip == "33510"
+        assert p.resolved_vertical == "roofing"
+
+    def test_flat_shape_still_works(self):
+        P = self._model()
+        p = P(phone="+17270001111", zip_code="33511", vertical="hvac", call_id="x1")
+        assert p.resolved_phone == "+17270001111"
+        assert p.resolved_call_id == "x1"
+        assert p.resolved_zip == "33511"
+        assert p.resolved_vertical == "hvac"
+
+    def test_phone_from_prompt_variables_fallback(self):
+        P = self._model()
+        p = P(
+            lead={"prompt_variables": {"zip_code": "33547", "vertical": "solar"}},
+            call={"call_id": "c9"},
+            from_number="+17279990000",
+        )
+        assert p.resolved_phone == "+17279990000"
+        assert p.resolved_zip == "33547"
+        assert p.resolved_vertical == "solar"
+
+    def test_empty_payload_resolves_none(self):
+        P = self._model()
+        p = P()
+        assert p.resolved_phone is None
+        assert p.resolved_call_id is None
+        assert p.resolved_zip is None
+        assert p.resolved_vertical is None
+
+
 # ── onboard_inbound_caller unit tests ────────────────────────────────────────
 
 class TestOnboardInboundCaller:

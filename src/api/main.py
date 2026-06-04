@@ -20,7 +20,7 @@ import re
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import requests as _requests
 import stripe
@@ -3385,33 +3385,84 @@ async def synthflow_webhook(request: Request):
 # ---------------------------------------------------------------------------
 
 class SynthflowInboundPayload(BaseModel):
-    """Fields the Synthflow inbound agent posts after the call ends."""
-    # Phone
+    """
+    Fields the Synthflow inbound agent posts after the call ends.
+
+    Synthflow's native post-call webhook nests the data:
+      - phone   → lead.phone_number
+      - call_id → call.call_id
+      - slots   → collected_variables.<name>.value  (zip_code, vertical, ...)
+      - actions → executed_actions.<name>.return_value
+    We also keep the flat top-level keys for direct/custom posts and tests.
+    The resolved_* properties read flat first, then fall back to the nested
+    Synthflow shape.
+    """
+    # Flat (direct-post / test compatibility)
     phone: Optional[str] = None
     from_number: Optional[str] = None
     caller_phone: Optional[str] = None
-    # Captured during the call
     zip_code: Optional[str] = None
     zip: Optional[str] = None
     vertical: Optional[str] = None
-    # Idempotency
     call_id: Optional[str] = None
     event_id: Optional[str] = None
     id: Optional[str] = None
+    # Synthflow native nested objects
+    lead: Optional[Dict[str, Any]] = None
+    call: Optional[Dict[str, Any]] = None
+    collected_variables: Optional[Dict[str, Any]] = None
+    executed_actions: Optional[Dict[str, Any]] = None
     # Extra context (ignored but accepted to avoid validation errors on unknown fields)
     model_config = {"extra": "allow"}
 
+    @staticmethod
+    def _slot(container: Optional[Dict[str, Any]], *keys: str) -> Optional[str]:
+        """Pull a value from a Synthflow slot dict ({name: {"value": ...}} or {name: ...})."""
+        if not isinstance(container, dict):
+            return None
+        for key in keys:
+            v = container.get(key)
+            if isinstance(v, dict):
+                v = v.get("value") or v.get("return_value")
+            if v not in (None, ""):
+                return str(v)
+        return None
+
     @property
     def resolved_phone(self) -> Optional[str]:
-        return self.phone or self.from_number or self.caller_phone
+        flat = self.phone or self.from_number or self.caller_phone
+        if flat:
+            return flat
+        if isinstance(self.lead, dict):
+            return self.lead.get("phone_number") or self.lead.get("phone")
+        return None
 
     @property
     def resolved_zip(self) -> Optional[str]:
-        return self.zip_code or self.zip
+        return (
+            self.zip_code or self.zip
+            or self._slot(self.collected_variables, "zip_code", "zip")
+            or self._slot(self.executed_actions, "zip_code", "zip")
+            or self._slot((self.lead or {}).get("prompt_variables"), "zip_code", "zip")
+        )
+
+    @property
+    def resolved_vertical(self) -> Optional[str]:
+        return (
+            self.vertical
+            or self._slot(self.collected_variables, "vertical", "trade")
+            or self._slot(self.executed_actions, "vertical", "trade")
+            or self._slot((self.lead or {}).get("prompt_variables"), "vertical", "trade")
+        )
 
     @property
     def resolved_call_id(self) -> Optional[str]:
-        return self.call_id or self.event_id or self.id
+        flat = self.call_id or self.event_id or self.id
+        if flat:
+            return flat
+        if isinstance(self.call, dict):
+            return self.call.get("call_id") or self.call.get("id")
+        return None
 
 
 def _verify_synthflow_secret(request: Request) -> bool:
@@ -3502,7 +3553,7 @@ async def synthflow_inbound_webhook(request: Request, db: Session = Depends(get_
         source="missed_call",
         db=db,
         zip_code=payload.resolved_zip,
-        vertical=payload.vertical,
+        vertical=payload.resolved_vertical,
         call_id=call_id,
     )
 
