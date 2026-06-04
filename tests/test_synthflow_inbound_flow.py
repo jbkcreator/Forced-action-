@@ -112,7 +112,44 @@ class TestSynthflowInboundPayloadParsing:
         assert p.resolved_zip is None
         assert p.resolved_vertical is None
 
+    def test_phone_from_user_phone_number(self):
+        P = self._model()
+        p = P(user_phone_number="+17270001111")
+        assert p.resolved_phone == "+17270001111"
 
+    def test_phone_from_call_from_number(self):
+        P = self._model()
+        p = P(call={"from_number": "+17270002222", "call_id": "c1"})
+        assert p.resolved_phone == "+17270002222"
+
+    def test_phone_from_call_inbound_from_number(self):
+        P = self._model()
+        p = P(call_inbound={"from_number": "+17270003333"})
+        assert p.resolved_phone == "+17270003333"
+
+    def test_phone_priority_flat_beats_nested(self):
+        P = self._model()
+        p = P(
+            phone="+11111111111",
+            lead={"phone_number": "+12222222222"},
+            call={"from_number": "+13333333333"},
+        )
+        assert p.resolved_phone == "+11111111111"
+
+    def test_phone_lead_beats_call(self):
+        P = self._model()
+        p = P(
+            lead={"phone_number": "+12222222222"},
+            call={"from_number": "+13333333333"},
+        )
+        assert p.resolved_phone == "+12222222222"
+
+    def test_phone_call_inbound_fallback(self):
+        P = self._model()
+        p = P(
+            call_inbound={"from_number": "+14444444444"},
+        )
+        assert p.resolved_phone == "+14444444444"
 # ── onboard_inbound_caller unit tests ────────────────────────────────────────
 
 class TestOnboardInboundCaller:

@@ -3401,6 +3401,7 @@ class SynthflowInboundPayload(BaseModel):
     phone: Optional[str] = None
     from_number: Optional[str] = None
     caller_phone: Optional[str] = None
+    user_phone_number: Optional[str] = None
     zip_code: Optional[str] = None
     zip: Optional[str] = None
     vertical: Optional[str] = None
@@ -3430,11 +3431,22 @@ class SynthflowInboundPayload(BaseModel):
 
     @property
     def resolved_phone(self) -> Optional[str]:
-        flat = self.phone or self.from_number or self.caller_phone
+        # Flat top-level keys (Synthflow post-call, direct-post, or tests)
+        flat = self.phone or self.from_number or self.caller_phone or self.user_phone_number
         if flat:
             return flat
+        # Nested Synthflow post-call shape: lead.phone_number
         if isinstance(self.lead, dict):
-            return self.lead.get("phone_number") or self.lead.get("phone")
+            lead_phone = self.lead.get("phone_number") or self.lead.get("phone")
+            if lead_phone:
+                return lead_phone
+        # Nested call / call_inbound (varies by webhook type)
+        for container_key in ("call", "call_inbound"):
+            container = getattr(self, container_key, None)
+            if isinstance(container, dict):
+                cpn = container.get("from_number") or container.get("phone_number") or container.get("phone")
+                if cpn:
+                    return cpn
         return None
 
     @property
@@ -3518,6 +3530,16 @@ async def synthflow_inbound_webhook(request: Request, db: Session = Depends(get_
         raw_json = json.loads(raw_body.decode("utf-8") or "{}")
     except Exception:
         raw_json = {}
+
+    # Diagnostic: log safe payload key names (no values) so we can see
+    # exactly which fields Synthflow sent in the real webhook body.
+    logger.info(
+        "[SynthflowInbound] payload keys=%s",
+        sorted(  # noqa: C414
+            key for key in (raw_json or {}).keys()
+            if key not in ("collected_variables", "lead", "call", "call_inbound", "executed_actions")
+        ),
+    )
 
     try:
         payload = SynthflowInboundPayload(**raw_json)
