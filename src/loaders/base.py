@@ -822,9 +822,12 @@ class BaseLoader(ABC):
         Like find_property_by_owner_name but handles comma-separated multi-party
         fields (e.g. "KUMP LEOPOLD A, KUMP CARMEN M" or trust/multi-grantor strings).
 
-        Splits on commas and tries each segment individually, returning the first
-        match that meets the threshold. Falls back to the full string last so that
-        single-name callers see identical behaviour.
+        For comma-containing names the full unsplit string is tried first. Pinellas
+        ORI uses "LAST, FIRST" format; normalize_owner_name strips the comma so the
+        full string scores 100% without needing to try segments. Individual segments
+        are fallback for multi-grantor fields where the combined string scores too
+        low and each party must be matched separately. Single-name callers (no comma)
+        are unaffected.
         """
         if pd.isna(raw_name) or not raw_name:
             return None
