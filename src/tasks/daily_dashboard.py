@@ -2752,14 +2752,20 @@ def send_dashboard_email(pdf_path: Path, run_date: date) -> bool:
     </div>
     """
 
+    cc_raw = settings.report_cc_recipients or ""
+    cc_recipients = [r.strip() for r in cc_raw.split(",") if r.strip()]
+    cc_set = {e.lower() for e in cc_recipients}
+
     any_ok = False
     for recipient in recipients:
+        cc = cc_recipients if recipient.lower() not in cc_set else None
         ok = send_email(
             to=recipient,
             subject=subject,
             body_text=body_text,
             body_html=body_html,
             attachments=[pdf_path],
+            cc=cc,
         )
         if ok:
             logger.info("[daily_dashboard] emailed dashboard to %s", recipient)

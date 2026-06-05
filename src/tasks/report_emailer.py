@@ -312,12 +312,24 @@ def _get_recipients() -> list:
     return [e.strip() for e in raw.split(",") if e.strip()]
 
 
+def _get_cc_recipients() -> list:
+    """Return CC addresses from REPORT_CC_RECIPIENTS (visibility/confirmation list)."""
+    settings = get_settings()
+    raw = settings.report_cc_recipients
+    if not raw:
+        return []
+    return [e.strip() for e in raw.split(",") if e.strip()]
+
+
 def send_daily_report(report: dict) -> int:
     """Send the daily report to all REPORT_RECIPIENTS. Returns count sent."""
     recipients = _get_recipients()
     if not recipients:
         logger.info("[report_emailer] No REPORT_RECIPIENTS configured — skipping email")
         return 0
+
+    cc_recipients = _get_cc_recipients()
+    cc_set = {e.lower() for e in cc_recipients}
 
     run_date = report["run_date"]
     gold_total = sum(report["tiers"].get(t, 0) for t in ("Ultra Platinum", "Platinum", "Gold"))
@@ -339,7 +351,9 @@ def send_daily_report(report: dict) -> int:
 
     sent = 0
     for addr in recipients:
-        if send_email(to=addr, subject=subject, body_text=text, body_html=html):
+        # CC internal addresses on external recipient emails only (not on their own sends)
+        cc = cc_recipients if addr.lower() not in cc_set else None
+        if send_email(to=addr, subject=subject, body_text=text, body_html=html, cc=cc):
             sent += 1
         else:
             logger.warning("[report_emailer] Failed to send daily report to %s", addr)
@@ -354,6 +368,9 @@ def send_weekly_report(report: dict) -> int:
     if not recipients:
         logger.info("[report_emailer] No REPORT_RECIPIENTS configured — skipping email")
         return 0
+
+    cc_recipients = _get_cc_recipients()
+    cc_set = {e.lower() for e in cc_recipients}
 
     week_start = report["week_start"]
     week_end = report["week_end"]
@@ -375,7 +392,8 @@ def send_weekly_report(report: dict) -> int:
 
     sent = 0
     for addr in recipients:
-        if send_email(to=addr, subject=subject, body_text=text, body_html=html):
+        cc = cc_recipients if addr.lower() not in cc_set else None
+        if send_email(to=addr, subject=subject, body_text=text, body_html=html, cc=cc):
             sent += 1
         else:
             logger.warning("[report_emailer] Failed to send weekly report to %s", addr)

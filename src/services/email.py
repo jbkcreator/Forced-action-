@@ -31,6 +31,7 @@ def send_email(
     body_text: str,
     body_html: Optional[str] = None,
     attachments: Optional[List[Union[str, Path]]] = None,
+    cc: Optional[List[str]] = None,
 ) -> bool:
     """
     Send a transactional email via SMTP.
@@ -97,13 +98,19 @@ def send_email(
         msg["Subject"] = subject
         msg["From"] = from_addr
         msg["To"] = to
+        if cc:
+            msg["Cc"] = ", ".join(cc)
+            # Tell Mandrill to preserve original To/Cc headers for all recipients
+            # instead of rewriting To: per-recipient (default ESP behaviour).
+            msg["X-MC-PreserveRecipients"] = "true"
 
+        all_recipients = [to] + (cc or [])
         with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=10) as server:
             server.starttls()
             server.login(settings.smtp_user, password)
-            server.sendmail(from_addr, [to], msg.as_string())
+            server.sendmail(from_addr, all_recipients, msg.as_string())
 
-        logger.info("Email sent → %s | %s", to, subject)
+        logger.info("Email sent → %s cc=%s | %s", to, cc or [], subject)
         return True
 
     except Exception as exc:

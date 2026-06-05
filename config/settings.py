@@ -264,6 +264,7 @@ class AppSettings(BaseSettings):
 	email_from: Optional[str] = Field(default=None, env="EMAIL_FROM")  # falls back to smtp_user if not set
 	alert_email: Optional[str] = Field(default=None, env="ALERT_EMAIL")  # ops alert recipient
 	report_recipients: Optional[str] = Field(default=None, env="REPORT_RECIPIENTS")  # comma-separated emails for daily/weekly reports
+	report_cc_recipients: Optional[str] = Field(default=None, env="REPORT_CC_RECIPIENTS")  # CC'd on every non-CC recipient send (visibility/confirmation)
 
 	# Telnyx SMS — outbound + inbound webhook (replaces Twilio as of the
 	# hard-cut migration; see docs/plan: mellow-strolling-fairy.md).
