@@ -62,6 +62,9 @@ _OWNER_NAME_NOISE_PHRASES: tuple[str, ...] = (
     "CLAIMING BY",
     "TRUSTEE OF THE",
     "TRUSTEE OF",
+    # Probate/decedent prefix — "ESTATE OF JOHN SMITH" must strip as a unit
+    # so Phase 2 ("ESTATE" single-token suffix) doesn't leave residual "OF".
+    "ESTATE OF",
     # Trust compound phrases — surface in deeds (e.g. "MORGAN FAMILY LIVING
     # TRUST DATED MAY 7 2026"). Stripping the trust descriptor leaves the
     # family/surname token which is what the property table actually stores.
@@ -827,9 +830,12 @@ class BaseLoader(ABC):
             return None
 
         segments = [s.strip() for s in str(raw_name).split(',') if s.strip()]
-        # Try individual segments first; full string last (deduped)
+        # Full string first: "SMITH, JOHN" normalises comma away → "SMITH JOHN"
+        # (100% match). Individual segments are fallback for multi-grantor fields
+        # like "KUMP LEOPOLD A, KUMP CARMEN M" where the combined string scores
+        # too low and each party needs to be tried separately.
         if len(segments) > 1:
-            segments.append(str(raw_name))  # full string as final fallback
+            segments = [str(raw_name)] + segments
 
         for segment in segments:
             result = self.find_property_by_owner_name(segment, threshold=threshold)
