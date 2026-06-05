@@ -112,6 +112,16 @@ PROBATE_CASE_PATTERNS = [
     "Trust Administration",
 ]
 
+# Pinellas courtrecords #caseTypesList option-text keywords per record type
+# (probed live 2026-06-05). Used by the shared 2captcha scraper to filter the
+# case-type multiselect BEFORE submit so results stay under the portal's
+# 500-row cap. Matched case-insensitively against each <option> text.
+PINELLAS_CASE_TYPE_KEYWORDS = {
+    "eviction": ["eviction"],                 # -> "Evictions"
+    "probate":  ["estate", "guardianship"],   # -> "Estate", "Guardianship"
+    "divorce":  ["dissolution"],              # -> "Dissolution Of Marriage"
+}
+
 # =============================================================================
 # TAX DELINQUENCY CONFIGURATION
 # =============================================================================

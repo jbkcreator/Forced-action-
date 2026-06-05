@@ -37,6 +37,7 @@ from config.constants import (
     PROBATE_FILING_PATTERN,
     PROBATE_FILINGS_URL,
     PROBATE_CASE_PATTERNS,
+    PINELLAS_CASE_TYPE_KEYWORDS,
     HILLSCLERK_BASE_URL,
     DEFAULT_USER_AGENT,
     REQUEST_TIMEOUT_DEFAULT,
@@ -254,6 +255,19 @@ def download_latest_probate_filing(
     scrape_mode = source.get("scrape_mode", "")
     output_format = source.get("output_format", "csv")
 
+    # Pinellas courtrecords: deterministic Playwright + 2captcha. Checked BEFORE
+    # scrape_mode (mirrors evictions_engine) so this proven path always wins for
+    # output_format=excel. Replaces the old browser-use AI agent that could not
+    # solve the reCAPTCHA.
+    if output_format == "excel":
+        from src.scrappers.court_docket.pinellas.civil_filing import scrape_pinellas_civil
+        kws = PINELLAS_CASE_TYPE_KEYWORDS.get("probate", ["estate", "guardianship"])
+        logger.info("[probate] County '%s' — Pinellas courtrecords 2captcha path", county_id)
+        return asyncio.run(scrape_pinellas_civil(
+            "probate", kws, source.get("url", ""), RAW_PROBATE_DIR,
+            target_date=target_date, headful=headful, no_proxy=no_proxy,
+        ))
+
     if scrape_mode == "static_download":
         logger.info("[probate] Using static_download mode for '%s'", county_id)
         return _static_download(source, target_date)
@@ -277,15 +291,6 @@ def download_latest_probate_filing(
                     headful=headful, no_proxy=no_proxy,
                 )
             )
-
-    if output_format == "excel":
-        logger.info("[probate] County '%s' uses browser download (output_format=excel)", county_id)
-        return asyncio.run(
-            _download_probate_via_browser(
-                county_id, source, target_date, RAW_PROBATE_DIR,
-                headful=headful, no_proxy=no_proxy,
-            )
-        )
 
     # Hillsborough / probate directory-listing path
     county_cfg = get_county_config(county_id)
@@ -377,7 +382,15 @@ def process_probate_data(file_path: Path, county_id: str = "hillsborough") -> pd
 
     logger.info("[probate] Loaded %d rows from %s", len(df), file_path.name)
 
-    # For counties with a combined civil filing (style_col present), filter for probate
+    # Pinellas courtrecords export: case types already filtered in-browser
+    # (Estate/Guardianship), so DON'T re-filter on Style/Description — the
+    # "IN RE: <name>" styles won't contain PROBATE_CASE_PATTERNS and would be
+    # wrongly dropped. Instead expand "IN RE: ..." into Decedent party rows.
+    if "Style/Description" in df.columns:
+        from src.scrappers.court_docket.pinellas.civil_filing import normalize_style_col
+        return normalize_style_col(df, "probate")
+
+    # Other counties with a combined civil filing (style_col present): filter for probate
     if style_col and style_col in df.columns:
         pattern = "|".join(re.escape(p) for p in PROBATE_CASE_PATTERNS)
         mask = df[style_col].str.contains(pattern, case=False, na=False)

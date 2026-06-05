@@ -29,6 +29,7 @@ from bs4 import BeautifulSoup
 from config.constants import (
     RAW_DIVORCE_DIR,
     DIVORCE_CASE_PATTERNS,
+    PINELLAS_CASE_TYPE_KEYWORDS,
     CIVIL_FILING_PATTERN,
     CIVIL_FILINGS_URL,
     HILLSCLERK_BASE_URL,
@@ -241,6 +242,18 @@ def download_latest_civil_filing(
     scrape_mode = source.get("scrape_mode", "")
     output_format = source.get("output_format", "csv")
 
+    # Pinellas courtrecords: deterministic Playwright + 2captcha. Checked BEFORE
+    # scrape_mode (mirrors evictions_engine). Replaces the browser-use AI agent
+    # that could not solve the reCAPTCHA.
+    if output_format == "excel":
+        from src.scrappers.court_docket.pinellas.civil_filing import scrape_pinellas_civil
+        kws = PINELLAS_CASE_TYPE_KEYWORDS.get("divorce", ["dissolution"])
+        logger.info("[divorce] County '%s' — Pinellas courtrecords 2captcha path", county_id)
+        return asyncio.run(scrape_pinellas_civil(
+            "divorce", kws, source.get("url", ""), RAW_DIVORCE_DIR,
+            target_date=target_date, headful=headful, no_proxy=no_proxy,
+        ))
+
     if scrape_mode == "static_download":
         logger.info("[divorce] Using static_download mode for '%s'", county_id)
         return _static_download(source, target_date)
@@ -264,15 +277,6 @@ def download_latest_civil_filing(
                     headful=headful, no_proxy=no_proxy,
                 )
             )
-
-    if output_format == "excel":
-        logger.info("[divorce] County '%s' uses browser download (output_format=excel)", county_id)
-        return asyncio.run(
-            _download_civil_filing_browser(
-                county_id, source, target_date, RAW_DIVORCE_DIR,
-                headful=headful, no_proxy=no_proxy,
-            )
-        )
 
     # Hillsborough / CSV directory-listing path
     _county = _get_county(county_id)
@@ -365,6 +369,13 @@ def filter_divorce_cases(file_path: Path, county_id: str = "hillsborough") -> pd
             raise ValueError(f"[divorce] Could not read CSV: {file_path}")
 
     logger.info("[divorce] Raw civil filing: %d rows (filter col: '%s')", len(df), style_col)
+
+    # Pinellas courtrecords export: case type already filtered in-browser
+    # (Dissolution Of Marriage). Expand "PETITIONER Vs. RESPONDENT" into
+    # Petitioner/Respondent party rows; skip the pattern re-filter.
+    if "Style/Description" in df.columns:
+        from src.scrappers.court_docket.pinellas.civil_filing import normalize_style_col
+        return normalize_style_col(df, "divorce")
 
     if style_col not in df.columns:
         logger.warning("[divorce] '%s' column not found — columns: %s", style_col, list(df.columns))
