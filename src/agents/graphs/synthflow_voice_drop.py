@@ -33,7 +33,7 @@ from src.agents.subgraphs.decision_hierarchy import run_decision_hierarchy
 from src.agents.tools.read_tools import get_subscriber_profile
 from src.core.database import get_db_context
 from src.services.synthflow_client import initiate_call
-from src.tasks.kill_switch_metric_ingest import get_cached_metric
+from src.services.kill_switch_service import get_cached_metric
 
 logger = logging.getLogger(__name__)
 

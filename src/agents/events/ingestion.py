@@ -8,8 +8,11 @@ Priority-list scope:
   - Postgres LISTEN/NOTIFY — works today with the existing DB
   - Cron trigger            — works today via the scheduler entry point
   - Admin API trigger       — works today via the ingest_admin_event helper
-  - Redis Pub/Sub           — scaffolded; enters dry-run mode if REDIS_URL
-							  is absent. Comes live when Redis is provisioned.
+  - Redis Pub/Sub           — active when REDIS_URL is set and
+                              AGENTS_EVENT_SOURCE_REDIS=true.
+
+Public event publish API (for use by services/tasks — never dispatch_event directly):
+  publish_cora_event(event)  — Redis primary, Postgres durable fallback.
 
 Production run:
 	python -m scripts.run_agents --serve
@@ -21,7 +24,11 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional
+
+from sqlalchemy import text
 
 from config.agents import get_agents_settings
 from src.agents.events.handlers import (
@@ -33,6 +40,58 @@ from src.agents.events.handlers import (
 from src.agents.supervisor import dispatch_event
 
 logger = logging.getLogger(__name__)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Public publish API — call this from services/tasks instead of dispatch_event
+# ──────────────────────────────────────────────────────────────────────────────
+
+def publish_cora_event(event: Dict[str, Any]) -> None:
+	"""
+	Publish an event for async pickup by the agents process.
+
+	Primary path  : Redis Pub/Sub channel "cora:events" (low-latency, <100ms).
+	Fallback path : INSERT into cora_event_queue + NOTIFY cora_events (durable).
+
+	Never calls dispatch_event() inline — the API/cron process must never own
+	a graph run. The agents process is the sole consumer.
+	"""
+	from src.core.redis_client import get_redis, redis_available
+
+	if redis_available():
+		try:
+			get_redis().publish("cora:events", json.dumps(event, default=str))
+			return
+		except Exception as exc:
+			logger.warning(
+				"publish_cora_event: Redis publish failed (%s) — falling back to Postgres", exc
+			)
+
+	_publish_via_postgres(event)
+
+
+def _publish_via_postgres(event: Dict[str, Any]) -> None:
+	"""Insert event into the durable queue table and emit a NOTIFY."""
+	from src.core.database import get_db_context
+	from src.core.models import CoraEventQueue
+
+	try:
+		with get_db_context() as session:
+			row = CoraEventQueue(
+				event_type=event.get("event_type"),
+				subscriber_id=event.get("subscriber_id"),
+				payload=event.get("payload") or {},
+				idempotency_key=event.get("idempotency_key"),
+				status="pending",
+			)
+			session.add(row)
+			session.flush()
+			session.execute(
+				text("SELECT pg_notify('cora_events', :payload)"),
+				{"payload": json.dumps(event, default=str)},
+			)
+	except Exception as exc:
+		logger.error("publish_cora_event: Postgres fallback also failed: %s", exc)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -53,12 +112,60 @@ def ingest_cron_event(payload: Dict[str, Any]) -> Dict[str, Any]:
 # Postgres LISTEN listener — notifies via NOTIFY cora_events, '<json-body>'
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _sweep_postgres_queue() -> int:
+	"""
+	Sweep cora_event_queue for pending events and dispatch them.
+	Called on listener startup and every 60s to catch events published
+	while the listener was offline. Returns the count of events processed.
+	"""
+	from src.core.database import get_db_context
+	from src.core.models import CoraEventQueue
+
+	processed = 0
+	try:
+		with get_db_context() as session:
+			rows = (
+				session.query(CoraEventQueue)
+				.filter(CoraEventQueue.status == "pending")
+				.order_by(CoraEventQueue.created_at)
+				.with_for_update(skip_locked=True)
+				.limit(100)
+				.all()
+			)
+			for row in rows:
+				try:
+					row.status = "processing"
+					session.flush()
+					event = {
+						"event_type": row.event_type,
+						"subscriber_id": row.subscriber_id,
+						"payload": row.payload or {},
+						"idempotency_key": row.idempotency_key,
+					}
+					dispatch_event(event)
+					row.status = "done"
+					row.processed_at = datetime.now(timezone.utc)
+					processed += 1
+				except Exception as exc:
+					row.status = "failed"
+					row.error = str(exc)[:500]
+					logger.exception("_sweep_postgres_queue: dispatch failed for id=%s: %s", row.id, exc)
+	except Exception as exc:
+		logger.error("_sweep_postgres_queue: sweep failed: %s", exc)
+	if processed:
+		logger.info("_sweep_postgres_queue: dispatched %d pending event(s)", processed)
+	return processed
+
+
 def listen_postgres(
 	channel: str = "cora_events",
 	stop_event: Optional[threading.Event] = None,
 ) -> None:
 	"""
 	Blocking listener on a Postgres NOTIFY channel.
+
+	On startup: sweeps cora_event_queue for any events published while the
+	listener was offline. Every 60s: re-sweeps for stuck pending rows.
 
 	Senders write:
 		NOTIFY cora_events, '{"event_type":"retention_summary_due", "subscriber_id": 42, "payload": {"tier":"wallet"}}';
@@ -82,6 +189,10 @@ def listen_postgres(
 		cur.execute(f'LISTEN "{channel}"')
 	logger.info("listen_postgres: subscribed to channel=%s", channel)
 
+	# Sweep on startup — dispatch any events published while we were offline
+	_sweep_postgres_queue()
+	last_sweep = time.monotonic()
+
 	try:
 		while not stop_event.is_set():
 			# psycopg3 generators block up to the timeout; pass timeout=1s
@@ -95,6 +206,11 @@ def listen_postgres(
 					logger.exception("listen_postgres: dispatch failed: %s", exc)
 				if stop_event.is_set():
 					break
+
+			# Periodic re-sweep every 60s to catch stuck pending rows
+			if time.monotonic() - last_sweep >= 60:
+				_sweep_postgres_queue()
+				last_sweep = time.monotonic()
 	finally:
 		conn.close()
 		logger.info("listen_postgres: closed")

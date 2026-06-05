@@ -16,13 +16,24 @@ log_decision tests exercise:
 """
 
 import uuid
+import types
 from datetime import datetime, timezone
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from src.agents.tools import write_tools
 from src.agents.tools.registry import TOOL_REGISTRY
+
+
+@contextmanager
+def _patch_sms_compliance_send(return_value):
+	fake_module = types.SimpleNamespace(send_sms=MagicMock(return_value=return_value))
+	with patch.dict("sys.modules", {"src.services.sms_compliance": fake_module}):
+		import src.services as services
+		with patch.object(services, "sms_compliance", fake_module, create=True):
+			yield fake_module.send_sms
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -118,7 +129,8 @@ def test_send_sms_returns_block_when_compliance_fails():
 	opt_in = MagicMock(phone="+15555550000")
 	sess = _mock_query_returning(opt_in=opt_in, duplicate=None)
 
-	with patch("src.services.sms_compliance.send_sms", return_value=False):
+	with patch("src.services.cora_review_switch.is_review_enabled", return_value=False), \
+		_patch_sms_compliance_send(False):
 		result = write_tools.send_sms(
 			subscriber_id=42,
 			body="test",
@@ -127,14 +139,15 @@ def test_send_sms_returns_block_when_compliance_fails():
 			session=sess,
 		)
 	assert result["sent"] is False
-	assert result["reason"] == "opted_out_or_twilio_error"
+	assert result["reason"] == "opted_out_or_sms_error"
 
 
 def test_send_sms_happy_path_writes_message_outcome():
 	opt_in = MagicMock(phone="+15555550000")
 	sess = _mock_query_returning(opt_in=opt_in, duplicate=None)
 
-	with patch("src.services.sms_compliance.send_sms", return_value=True):
+	with patch("src.services.cora_review_switch.is_review_enabled", return_value=False), \
+		_patch_sms_compliance_send(True):
 		result = write_tools.send_sms(
 			subscriber_id=42,
 			body="test",
@@ -158,6 +171,25 @@ def test_log_decision_validates_terminal_status():
 			decision_id=str(uuid.uuid4()),
 			graph_name="x",
 			terminal_status="bogus",
+		)
+
+
+def test_log_decision_validates_override_reason_code():
+	with pytest.raises(ValueError, match="override_reason_code must be one of"):
+		write_tools.log_decision(
+			decision_id=str(uuid.uuid4()),
+			graph_name="x",
+			overridden_at=datetime.now(timezone.utc),
+			override_reason_code="gut_feel",
+		)
+
+
+def test_log_decision_requires_override_reason_code_for_overrides():
+	with pytest.raises(ValueError, match="override_reason_code is required"):
+		write_tools.log_decision(
+			decision_id=str(uuid.uuid4()),
+			graph_name="x",
+			overridden_at=datetime.now(timezone.utc),
 		)
 
 

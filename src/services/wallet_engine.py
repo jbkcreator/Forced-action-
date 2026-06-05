@@ -120,8 +120,8 @@ def debit(
     try:
         eligible = accelerated_push_eligible(subscriber_id, db)
         if eligible:
-            from src.agents.supervisor import dispatch_event
-            dispatch_event({
+            from src.agents.events.ingestion import publish_cora_event
+            publish_cora_event({
                 "event_type": "accelerated_wallet_push_eligible",
                 "subscriber_id": subscriber_id,
                 "payload": eligible,

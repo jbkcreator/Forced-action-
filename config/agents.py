@@ -79,7 +79,7 @@ class AgentsSettings(AppSettings):
 	# ── Graph enable list & kill switches ─────────────────────────────────────
 	agents_graphs_enabled: str = Field(
 		default=(
-			"hello_world,fomo,abandonment_wave1,abandonment_wave2,retention,"
+			"fomo,abandonment_wave1,abandonment_wave2,retention,"
 			"wallet_to_lock_close,ap_lite_close,human_close_route,"
 			"synthflow_voice_drop,accelerated_wallet_push"
 		),

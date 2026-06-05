@@ -2,6 +2,8 @@
 
 **Purpose:** Detailed architecture for Cora's LangGraph layer. This is the "how" document. Preceded by `LANGGRAPH-PLATFORM-ROLE.md` (the "what"). Informed by `2B-V9-ORIENTATION.md` (the spec) and `client 2b report.md` (current state).
 
+**Status — as-built (synced to `src/agents/`).** The original launch plan in this doc was implemented and has since grown. Current runtime: **10 graphs** (not 5), **Telnyx** for SMS (not Twilio), and post-launch self-healing / playbook / autonomy layers (see §12.3). Part 16 is the original week-by-week build plan, retained for history.
+
 **Decisions this doc commits to:**
 
 - **Monorepo** — agents live alongside the FastAPI code in the same git repo
@@ -80,32 +82,33 @@ src/
 │   ├── supervisor.py              # Entry point: python -m src.agents.supervisor
 │   ├── router.py                  # Event → subgraph routing table
 │   ├── state.py                   # Shared state TypedDict definitions
-│   ├── runtime.py                 # Concurrency, budgets, circuit breakers
 │   ├── checkpoint.py              # Postgres checkpoint configuration
-│   ├── graphs/
+│   ├── context_utils.py          # Shared state/context helpers
+│   ├── graphs/                    # one file per top-level graph (10 total)
 │   │   ├── __init__.py
-│   │   ├── supervisor_graph.py    # Top-level routing graph
-│   │   ├── fomo.py                # FOMO Engine
-│   │   ├── abandonment.py         # Abandonment Pressure
+│   │   ├── fomo.py                # FOMO Engine (competitor / flash-scarcity)
+│   │   ├── abandonment.py         # Abandonment Pressure (Wave 1 + Wave 2)
 │   │   ├── retention.py           # Retention Summaries
-│   │   ├── lock_close.py          # Cora Conversational Lock Close
-│   │   └── auto_mode.py           # Auto Mode Execution
+│   │   ├── wallet_to_lock_close.py# Wallet → ZIP-lock close
+│   │   ├── ap_lite_close.py       # AutoPilot Lite close
+│   │   ├── accelerated_wallet_push.py # Accelerated wallet-push offer
+│   │   ├── human_close_route.py   # Route high-intent subs to a human closer
+│   │   ├── nws_urgency.py         # Storm / NWS urgency
+│   │   ├── synthflow_voice_drop.py# Outbound voice drop (Synthflow)
+│   │   └── hello_world.py         # Smoke-test graph
 │   ├── subgraphs/
 │   │   ├── __init__.py
-│   │   ├── decision_hierarchy.py  # 6-step gate, reused by 4 graphs
-│   │   └── compose_and_send.py    # Claude → compliance → send → log
+│   │   ├── decision_hierarchy.py  # 6-step gate, reused by every send graph
+│   │   └── compose_and_send.py    # Claude → compliance → Telnyx → log
 │   ├── tools/
 │   │   ├── __init__.py
 │   │   ├── registry.py            # @tool decorator, typed registry
-│   │   ├── read_tools.py          # 12 read tools
-│   │   ├── write_tools.py         # 12 write/action tools
-│   │   └── gating_tools.py        # 5 gating/safety tools
+│   │   ├── read_tools.py          # read tools
+│   │   ├── write_tools.py         # write/action tools
+│   │   └── gating_tools.py        # gating/safety tools
 │   ├── prompts/
-│   │   ├── fomo/
-│   │   ├── abandonment/
-│   │   ├── retention/
-│   │   ├── lock_close/
-│   │   └── auto_mode/
+│   │   ├── loader.py              # YAML prompt loader
+│   │   └── <graph>/               # per-graph system + A/B variant prompts
 │   ├── events/
 │   │   ├── __init__.py
 │   │   ├── ingestion.py           # Redis Pub/Sub + Postgres listener startup
@@ -113,9 +116,11 @@ src/
 │   │   └── types.py               # Event dataclasses
 │   └── observability/
 │       ├── __init__.py
-│       ├── langsmith.py           # Tracing config
-│       ├── metrics.py             # Prometheus metric definitions
-│       └── audit_log.py           # Agent decision audit trail
+│       └── langsmith.py           # LangSmith tracing config
+
+# Note: there is no runtime.py — concurrency / token & cost budgets / kill-switch
+# config live in config/agents.py (AgentsSettings); Prometheus metrics are exposed
+# by the API's metrics_router; the decision audit trail is the agent_decisions table.
 
 ├── api/                           # Existing — untouched
 ├── services/                      # Existing — tools wrap these
@@ -173,7 +178,7 @@ config/settings.py         config/agents.py
 - `REDIS_URL`
 - `ANTHROPIC_API_KEY`
 - `STRIPE_SECRET_KEY`
-- `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER`, `TWILIO_ENABLED`
+- `TELNYX_API_KEY`, `TELNYX_MESSAGING_PROFILE_ID`, `TELNYX_FROM_NUMBER` (SMS; migrated off Twilio 2026-05)
 - `SYNTHFLOW_API_KEY` (for outbound voice drop)
 - All Cora guardrail config (already loaded as config)
 - All Stripe price IDs
@@ -187,6 +192,7 @@ config/settings.py         config/agents.py
 | `AGENTS_WORKER_CONCURRENCY` | `5` | Max concurrent graph executions |
 | `AGENTS_MAX_TOKENS_PER_DECISION` | `3000` | Per-graph hard token cap |
 | `AGENTS_MAX_COST_USD_PER_DECISION` | `0.10` | Per-graph hard cost cap |
+| `AGENTS_MAX_NODE_CALLS_PER_DECISION` | `25` | Per-graph hard node-step cap (loop guard) |
 | `LANGSMITH_API_KEY` | — | Tracing |
 | `LANGSMITH_PROJECT` | `forced-action-agents` | Trace project name |
 | `LANGSMITH_TRACING` | `true` | Enable/disable tracing |

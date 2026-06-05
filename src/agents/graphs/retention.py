@@ -34,7 +34,7 @@ from langgraph.graph import END, START, StateGraph
 from src.agents.prompts.loader import render_fallback_body, render_for_subscriber_auto
 from src.agents.subgraphs.compose_and_send import run_compose_and_send
 from src.agents.subgraphs.decision_hierarchy import run_decision_hierarchy
-from src.tasks.kill_switch_metric_ingest import get_cached_metric
+from src.services.kill_switch_service import get_cached_metric
 from src.agents.tools.read_tools import (
 	get_deal_history,
 	get_lead_pool,

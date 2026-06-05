@@ -535,8 +535,8 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
                 from src.services import wallet_engine
                 eligible = wallet_engine.accelerated_push_eligible(subscriber.id, db)
                 if eligible:
-                    from src.agents.supervisor import dispatch_event
-                    dispatch_event({
+                    from src.agents.events.ingestion import publish_cora_event
+                    publish_cora_event({
                         "event_type": "accelerated_wallet_push_eligible",
                         "subscriber_id": subscriber.id,
                         "payload": eligible,
@@ -1904,12 +1904,15 @@ def _on_card_saved(payment_intent, db: Session) -> None:
                 )
             except Exception:
                 pass
-            from src.agents.supervisor import dispatch_event
-            dispatch_event({
-                "event_type": "accelerated_wallet_push_eligible",
-                "subscriber_id": subscriber.id,
-                "payload": eligible,
-            })
+            try:
+                from src.agents.events.ingestion import publish_cora_event
+                publish_cora_event({
+                    "event_type": "accelerated_wallet_push_eligible",
+                    "subscriber_id": subscriber.id,
+                    "payload": eligible,
+                })
+            except Exception as _pub_exc:
+                logger.warning("publish_cora_event failed sub=%s: %s", subscriber.id, _pub_exc)
     except Exception as exc:
         logger.warning("accelerated_wallet_push from _on_card_saved failed sub=%s: %s",
                        subscriber.id, exc)
@@ -2001,12 +2004,15 @@ def _on_payment_method_attached(pm: dict, db: Session) -> None:
                 )
             except Exception:
                 pass
-            from src.agents.supervisor import dispatch_event
-            dispatch_event({
-                "event_type": "accelerated_wallet_push_eligible",
-                "subscriber_id": subscriber.id,
-                "payload": eligible,
-            })
+            try:
+                from src.agents.events.ingestion import publish_cora_event
+                publish_cora_event({
+                    "event_type": "accelerated_wallet_push_eligible",
+                    "subscriber_id": subscriber.id,
+                    "payload": eligible,
+                })
+            except Exception as _pub_exc:
+                logger.warning("publish_cora_event failed sub=%s: %s", subscriber.id, _pub_exc)
     except Exception as exc:
         logger.warning("accelerated_wallet_push from pm.attached failed sub=%s: %s",
                        subscriber.id, exc)
@@ -2195,8 +2201,8 @@ def _on_premium_payment(payment_intent, db: Session) -> None:
     # check silently fails on the "paid intent" gate. Run it again here so a
     # premium purchase with a freshly saved card reliably dispatches.
     try:
+        from src.agents.events.ingestion import publish_cora_event
         from src.services import wallet_engine
-        from src.agents.supervisor import dispatch_event
         eligible = wallet_engine.accelerated_push_eligible(subscriber_id, db)
         if eligible:
             try:
@@ -2211,7 +2217,8 @@ def _on_premium_payment(payment_intent, db: Session) -> None:
                 )
             except Exception:
                 pass
-            dispatch_event({
+            from src.agents.events.ingestion import publish_cora_event
+            publish_cora_event({
                 "event_type": "accelerated_wallet_push_eligible",
                 "subscriber_id": subscriber_id,
                 "payload": eligible,
@@ -2236,8 +2243,8 @@ def _on_premium_payment(payment_intent, db: Session) -> None:
                 )
             except Exception:
                 pass
-            from src.agents.supervisor import dispatch_event
-            dispatch_event({
+            from src.agents.events.ingestion import publish_cora_event
+            publish_cora_event({
                 "event_type": "accelerated_wallet_push_eligible",
                 "subscriber_id": subscriber_id,
                 "payload": eligible,

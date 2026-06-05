@@ -60,7 +60,7 @@ def _select_tier_a(db: Session, county_id: str, limit: int) -> list[Owner]:
             Owner.owner_name.isnot(None),
             Owner.owner_type.in_(("LLC", "Corporate")),
             or_(
-                Owner.sunbiz_status == "pending",
+                Owner.sunbiz_status.in_(("pending", "parser_failed")),
                 and_(
                     Owner.sunbiz_status == "matched",
                     Owner.sunbiz_enriched_at < cutoff,
@@ -74,7 +74,7 @@ def _select_tier_a(db: Session, county_id: str, limit: int) -> list[Owner]:
 
 
 def _select_tier_b(db: Session, county_id: str, limit: int) -> list[Owner]:
-    """Cold: pending OR stale-180d, any LLC owner with a property."""
+    """Cold: pending OR parser_failed OR stale-180d, any LLC owner with a property."""
     cutoff = datetime.now(timezone.utc) - timedelta(days=TIER_B_DAYS)
     rows = db.execute(
         select(Owner)
@@ -84,7 +84,7 @@ def _select_tier_b(db: Session, county_id: str, limit: int) -> list[Owner]:
             Owner.owner_name.isnot(None),
             Owner.owner_type.in_(("LLC", "Corporate")),
             or_(
-                Owner.sunbiz_status == "pending",
+                Owner.sunbiz_status.in_(("pending", "parser_failed")),
                 and_(
                     Owner.sunbiz_status == "matched",
                     Owner.sunbiz_enriched_at < cutoff,

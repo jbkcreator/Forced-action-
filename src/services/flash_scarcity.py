@@ -185,8 +185,8 @@ def _emit_event(
     window: dict,
 ) -> None:
     """Emit flash_scarcity_window_open once per eligible subscriber in the vertical."""
+    from src.agents.events.ingestion import publish_cora_event
     from src.agents.events.types import Event
-    from src.agents.supervisor import dispatch_event
     from src.core.models import Subscriber
 
     try:
@@ -227,6 +227,6 @@ def _emit_event(
             idempotency_key=idem_key,
         )
         try:
-            dispatch_event(evt.to_dispatch_dict())
+            publish_cora_event(evt.to_dispatch_dict())
         except Exception as exc:
             logger.error("flash_scarcity emit_event failed sub=%s: %s", sub_id, exc)

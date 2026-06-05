@@ -35,7 +35,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select, and_, or_, desc, func, cast, text, Date, distinct, update
 
 from src.core.database import get_db_context
-from src.core.models import FoundingSubscriberCount, ZipTerritory, Subscriber, Property, DistressScore, Incident, LeadPackPurchase, ScraperRunStats, EnrichedContact, Owner, SentLead, WaitlistEntry, SmsOptIn, ExpansionCandidate, County
+from src.core.models import ConsentAcceptance, FoundingSubscriberCount, ZipTerritory, Subscriber, Property, DistressScore, Incident, LeadPackPurchase, ScraperRunStats, EnrichedContact, Owner, SentLead, WaitlistEntry, SmsOptIn, ExpansionCandidate, County
 from src.services.stripe_webhooks import handle_webhook
 from src.services.stripe_service import get_price_id_for_checkout, _price_ids
 from config.settings import get_settings
@@ -493,6 +493,24 @@ def get_pricing_info():
 
 
 # ---------------------------------------------------------------------------
+# Shared consent schema — used by checkout, waitlist, and free-signup routes
+# ---------------------------------------------------------------------------
+
+class ConsentAcceptanceRequest(BaseModel):
+    """Incoming consent acceptance payload from the frontend TermsConsentGate."""
+    terms_accepted: bool = Field(..., alias="terms_accepted")
+    terms_version: Optional[str] = None
+    privacy_version: Optional[str] = None
+    accepted_text_hash: Optional[str] = None
+    modal_opened_at: Optional[str] = None
+    modal_scrolled_to_end_at: Optional[str] = None
+    tcpa_accepted: Optional[bool] = Field(default=False, alias="tcpa_accepted")
+    tcpa_consent_text: Optional[str] = None
+    tcpa_consent_version: Optional[str] = None
+    user_agent: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
 # POST /api/checkout — Create Stripe checkout session
 # ---------------------------------------------------------------------------
 
@@ -502,6 +520,7 @@ class CheckoutRequest(BaseModel):
     county_id: str   # hillsborough
     zip_codes: list[str] = []  # ZIP territories to lock on purchase
     email: str       # collected before checkout — used to block duplicate subscriptions
+    consent_acceptance: Optional[ConsentAcceptanceRequest] = None
 
     @field_validator("email")
     @classmethod
@@ -630,6 +649,41 @@ def create_checkout(payload: CheckoutRequest, db: Session = Depends(get_db)):
                 "unavailable_zips": sorted(taken_zips),
             },
         )
+
+    if payload.consent_acceptance and payload.consent_acceptance.terms_accepted:
+        try:
+            from datetime import datetime
+
+            def _parse_iso_co(s):
+                if not s:
+                    return None
+                try:
+                    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+                except (ValueError, TypeError):
+                    return None
+
+            _co_tcpa = bool(payload.consent_acceptance.tcpa_accepted)
+            ca = ConsentAcceptance(
+                email=payload.email,
+                terms_version=payload.consent_acceptance.terms_version or "2026.06",
+                privacy_version=payload.consent_acceptance.privacy_version or "2026.06",
+                accepted_at=datetime.now(timezone.utc),
+                source_flow="checkout",
+                user_agent=payload.consent_acceptance.user_agent,
+                modal_opened_at=_parse_iso_co(payload.consent_acceptance.modal_opened_at),
+                modal_scrolled_to_end_at=_parse_iso_co(payload.consent_acceptance.modal_scrolled_to_end_at),
+                accepted_text_hash=payload.consent_acceptance.accepted_text_hash or "",
+                tcpa_consent_text=payload.consent_acceptance.tcpa_consent_text if _co_tcpa else None,
+                tcpa_consent_version=payload.consent_acceptance.tcpa_consent_version if _co_tcpa else None,
+                tcpa_checked_at=datetime.now(timezone.utc) if _co_tcpa else None,
+                consent_scope="marketing" if _co_tcpa else None,
+                not_condition_of_purchase_ack=_co_tcpa or None,
+                county_id=payload.county_id,
+            )
+            db.add(ca)
+            db.commit()
+        except Exception:
+            logger.warning("ConsentAcceptance write failed in checkout (non-fatal):", exc_info=True)
 
     try:
         session = stripe.checkout.Session.create(
@@ -1262,7 +1316,7 @@ def _what_you_missed_fields(subscriber, db, *, save_offer_active: bool, locked_z
         return {"what_you_missed": None}
 
     try:
-        from src.agents.tools.read_tools import get_lead_pool, get_zip_activity
+        from src.services.lead_pool_service import get_lead_pool, get_zip_activity
     except Exception:
         return {"what_you_missed": None}
 
@@ -2429,6 +2483,7 @@ class WaitlistRequest(BaseModel):
     sms_opt_in: bool = False
     # waitlist_type is accepted from client but always server-verified
     waitlist_type: Optional[str] = None
+    consent_acceptance: Optional[ConsentAcceptanceRequest] = None
 
     @field_validator("email")
     @classmethod
@@ -2533,6 +2588,18 @@ def join_waitlist(payload: WaitlistRequest, request: Request, db: Session = Depe
 
     signup_ip = _client_ip_for_waitlist(request)
 
+    # ── T&C / TCPA Consent Validation ──────────────────────────────────────────
+    consent = payload.consent_acceptance
+    if not consent or not consent.terms_accepted:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "terms_not_accepted",
+                "message": "You must accept the Terms & Conditions and Privacy Policy to join the waitlist.",
+            },
+        )
+    # TCPA is explicitly optional — no validation required.
+
     # Dedup by phone — check before insert to give a clean already_registered response
     if phone_e164:
         phone_dupe = db.execute(
@@ -2581,6 +2648,42 @@ def join_waitlist(payload: WaitlistRequest, request: Request, db: Session = Depe
                     consent_scope="other",
                 )
                 db.add(opt_in)
+
+        # ── Write ConsentAcceptance row ─────────────────────────────────────────
+        try:
+            from datetime import datetime
+
+            def _parse_iso(s):
+                if not s:
+                    return None
+                try:
+                    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+                except (ValueError, TypeError):
+                    return None
+
+            ca = ConsentAcceptance(
+                email=payload.email,
+                phone=phone_e164,
+                waitlist_entry_id=entry.id,
+                terms_version=consent.terms_version or "2026.06",
+                privacy_version=consent.privacy_version or "2026.06",
+                accepted_at=datetime.now(timezone.utc),
+                source_flow="waitlist",
+                ip_address=signup_ip,
+                user_agent=consent.user_agent,
+                modal_opened_at=_parse_iso(consent.modal_opened_at),
+                modal_scrolled_to_end_at=_parse_iso(consent.modal_scrolled_to_end_at),
+                accepted_text_hash=consent.accepted_text_hash or "",
+                tcpa_consent_text=consent.tcpa_consent_text if consent.tcpa_accepted else None,
+                tcpa_consent_version=consent.tcpa_consent_version if consent.tcpa_accepted else None,
+                tcpa_checked_at=datetime.now(timezone.utc) if consent.tcpa_accepted else None,
+                consent_scope="marketing" if consent.tcpa_accepted else None,
+                not_condition_of_purchase_ack=consent.tcpa_accepted or None,
+                county_id=payload.county_id,
+            )
+            db.add(ca)
+        except Exception:
+            logger.warning("ConsentAcceptance write failed (non-fatal):", exc_info=True)
 
         db.commit()
     except IntegrityError:
@@ -4463,6 +4566,7 @@ class FreeSignupRequest(BaseModel):
     # 'unlock' = $4 lead unlock). Welcome fires from the relevant payment
     # webhook instead, so abandoned-cart users never get a misleading email.
     intent: Optional[str] = None
+    consent_acceptance: Optional[ConsentAcceptanceRequest] = None
 
     @field_validator("email")
     @classmethod
@@ -4497,6 +4601,8 @@ def free_signup(req: FreeSignupRequest, db: Session = Depends(get_db)):
     # payment webhook handler is responsible for sending the welcome on success.
     defer_welcome = req.intent in ("upgrade", "unlock")
 
+    # Derive SMS consent from structured consent_acceptance when present.
+    tcpa_accepted = bool(req.consent_acceptance and req.consent_acceptance.tcpa_accepted)
     sub = create_free_account_by_email(
         email=req.email,
         db=db,
@@ -4505,7 +4611,7 @@ def free_signup(req: FreeSignupRequest, db: Session = Depends(get_db)):
         name=req.name,
         referral_code=req.referral_code,
         phone=req.phone,
-        sms_consent=req.sms_consent,
+        sms_consent=req.sms_consent or tcpa_accepted,
         signup_source=req.signup_source,
         utm_source=req.utm_source,
         utm_medium=req.utm_medium,
@@ -4514,6 +4620,41 @@ def free_signup(req: FreeSignupRequest, db: Session = Depends(get_db)):
         attribution_token=req.attribution_token,
         send_welcome=not defer_welcome,
     )
+
+    if req.consent_acceptance and req.consent_acceptance.terms_accepted:
+        try:
+            from datetime import datetime
+
+            def _parse_iso_fs(s):
+                if not s:
+                    return None
+                try:
+                    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+                except (ValueError, TypeError):
+                    return None
+
+            ca = ConsentAcceptance(
+                email=req.email,
+                phone=sub.phone,
+                subscriber_id=sub.id,
+                terms_version=req.consent_acceptance.terms_version or "2026.06",
+                privacy_version=req.consent_acceptance.privacy_version or "2026.06",
+                accepted_at=datetime.now(timezone.utc),
+                source_flow="free_signup",
+                user_agent=req.consent_acceptance.user_agent,
+                modal_opened_at=_parse_iso_fs(req.consent_acceptance.modal_opened_at),
+                modal_scrolled_to_end_at=_parse_iso_fs(req.consent_acceptance.modal_scrolled_to_end_at),
+                accepted_text_hash=req.consent_acceptance.accepted_text_hash or "",
+                tcpa_consent_text=req.consent_acceptance.tcpa_consent_text if tcpa_accepted else None,
+                tcpa_consent_version=req.consent_acceptance.tcpa_consent_version if tcpa_accepted else None,
+                tcpa_checked_at=datetime.now(timezone.utc) if tcpa_accepted else None,
+                consent_scope="marketing" if tcpa_accepted else None,
+                not_condition_of_purchase_ack=tcpa_accepted or None,
+            )
+            db.add(ca)
+            db.commit()
+        except Exception:
+            logger.warning("ConsentAcceptance write failed in free_signup (non-fatal):", exc_info=True)
 
     return {
         "subscriber_id": sub.id,

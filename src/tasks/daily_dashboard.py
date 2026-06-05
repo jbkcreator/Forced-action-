@@ -923,17 +923,37 @@ def _fetch_enrichment_rate(session, run_date: date, county_ids: list[str]) -> st
         return NA
 
 
-def _fetch_cora_autonomy(session) -> str:
+def _fetch_cora_autonomy(session, run_date: date | None = None) -> str:
+    """True platform autonomy for finalized Cora decisions in the trailing 7 days.
+
+    Numerator: completed decisions that stayed fully autonomous.
+    Denominator: all finalized decisions, including approval-required,
+    escalated, failed, aborted, rejected, and overridden outcomes. This replaces
+    the older scorecard/card read that effectively reported a "not overridden"
+    slice and overstated platform autonomy.
+    """
+    end_date = run_date or date.today()
+    start_date = end_date - timedelta(days=6)
     try:
         row = session.execute(
             text("""
-                SELECT data_json FROM learning_cards
-                WHERE card_type = 'autonomy_summary'
-                ORDER BY card_date DESC LIMIT 1
+                SELECT
+                    COUNT(*) AS finalized,
+                    COUNT(*) FILTER (
+                        WHERE terminal_status = 'completed'
+                          AND autonomy_class = 'autonomous'
+                          AND COALESCE(requires_approval, false) = false
+                          AND approved_at IS NULL
+                          AND overridden_at IS NULL
+                    ) AS autonomous_completed
+                FROM agent_decisions
+                WHERE date(started_at) BETWEEN :start_date AND :end_date
+                  AND terminal_status IS NOT NULL
             """),
+            {"start_date": str(start_date), "end_date": str(end_date)},
         ).fetchone()
-        if row and row[0] and row[0].get("autonomous_pct") is not None:
-            return f"{float(row[0]['autonomous_pct']):.1f}%"
+        if row and row[0]:
+            return _pct(row[1], row[0])
         return NA
     except Exception as exc:
         logger.warning("_fetch_cora_autonomy failed: %s", exc)
@@ -1085,8 +1105,8 @@ def _fetch_exec_summary_rows(session, run_date: date, county_ids: list[str]) -> 
     results.append(("Churn Rate (30-day)", churn_rate, "—", churn_rate, churn_rate, "<5%", "", ""))
 
     # Cora Autonomy
-    auto = _fetch_cora_autonomy(session)
-    results.append(("Cora Autonomy Score", auto, "—", "—", auto, "95%+", "", ""))
+    auto = _fetch_cora_autonomy(session, run_date)
+    results.append(("Cora Platform Autonomy", auto, "7d window", "—", auto, "95%+", "", ""))
 
     return [
         {"metric": r[0], "today": r[1], "this_week": r[2], "monthly_pace": r[3], "target": r[4], "trend": r[5], "status": r[6], "notes": r[7]}
@@ -1961,18 +1981,26 @@ def _fetch_cora_decision_stats(session, run_date: date) -> list:
                     SUM(CASE WHEN terminal_status = 'completed'  THEN 1 ELSE 0 END) AS completed,
                     SUM(CASE WHEN terminal_status = 'aborted'    THEN 1 ELSE 0 END) AS aborted,
                     SUM(CASE WHEN terminal_status = 'failed'     THEN 1 ELSE 0 END) AS failed,
-                    SUM(CASE WHEN was_autonomous = true          THEN 1 ELSE 0 END) AS autonomous,
+                    SUM(CASE
+                        WHEN terminal_status = 'completed'
+                         AND autonomy_class = 'autonomous'
+                         AND COALESCE(requires_approval, false) = false
+                         AND approved_at IS NULL
+                         AND overridden_at IS NULL
+                        THEN 1 ELSE 0
+                    END) AS autonomous_completed,
                     SUM(tokens_used)  AS tokens,
                     SUM(cost_usd)     AS cost
                 FROM agent_decisions
                 WHERE date(started_at) = :today
+                  AND terminal_status IS NOT NULL
                 GROUP BY graph_name
                 ORDER BY total DESC
             """),
             {"today": str(run_date)},
         ).fetchall()
         result = []
-        for graph_name, total, completed, aborted, failed, autonomous, tokens, cost in rows:
+        for graph_name, total, completed, aborted, failed, autonomous_completed, tokens, cost in rows:
             total = int(total or 0)
             result.append({
                 "graph": graph_name,
@@ -1980,7 +2008,7 @@ def _fetch_cora_decision_stats(session, run_date: date) -> list:
                 "completed": int(completed or 0),
                 "aborted": int(aborted or 0),
                 "failed": int(failed or 0),
-                "autonomous_pct": _pct(int(autonomous or 0), total),
+                "autonomous_pct": _pct(int(autonomous_completed or 0), total),
                 "tokens": int(tokens or 0),
                 "cost": f"${float(cost or 0):.4f}",
             })
@@ -1993,7 +2021,7 @@ def _fetch_cora_decision_stats(session, run_date: date) -> list:
 def _fetch_cora_metrics(session, run_date: date) -> dict:
     week_start = run_date - timedelta(days=run_date.weekday())
     result: dict = {
-        "autonomy_pct": _fetch_cora_autonomy(session),
+        "autonomy_pct": _fetch_cora_autonomy(session, run_date),
         "api_cost_today": NA, "api_cost_by_service": [], "api_cost_week": NA,
         "ab_active_count": NA, "ab_completed_recent": [],
         "open_incidents_red": 0, "open_incidents_yellow": 0,
@@ -2436,18 +2464,35 @@ def _build_scraper_section_from_signals(
         unmatched  = sum(raw_unmatched.get(st, 0) for st in unmatched_srcs)
         scraped    = matched + unmatched
         match_pct_row = (matched / scraped * 100) if scraped > 0 else None
+        scraped_cell = scraped if (scraped > 0 or src_key is not None) else None
+        days_stale_cell = days_stale if days_stale is not None else ("N/A" if src_key is None else "Never")
+        quality = _ingest_quality(days_stale, match_pct_row, is_event, scraped)
+        action = _ingest_action(label, days_stale, scraped, is_event, is_critical)
 
         rows.append({
             "label":       label,
-            "scraped":     scraped   if (scraped > 0 or src_key is not None) else None,
+            "scraped":     scraped_cell,
+            "scraped_display": "-" if scraped_cell is None else scraped_cell,
+            "scraped_class": "na" if scraped_cell in (None, 0) else "",
             "matched":     matched   if scraped > 0 else None,
             "unmatched":   unmatched if scraped > 0 else None,
             "match_rate":  f"{match_pct_row:.1f}%" if match_pct_row is not None else "—",
             "last_update": str(last_upd) if last_upd else ("N/A" if src_key is None else "Never"),
-            "days_stale":  days_stale if days_stale is not None else ("N/A" if src_key is None else "Never"),
+            "days_stale":  days_stale_cell,
+            "days_stale_class": "na" if days_stale_cell in ("Never", "N/A") else "",
             "status":      _ingest_status(days_stale, scraped, is_event),
-            "quality":     _ingest_quality(days_stale, match_pct_row, is_event, scraped),
-            "action":      _ingest_action(label, days_stale, scraped, is_event, is_critical),
+            "quality":     quality,
+            "quality_class": {
+                "Error": "q-error",
+                "Stale": "q-stale",
+                "Moderate": "q-moderate",
+            }.get(quality, "q-clean"),
+            "action":      action,
+            "action_class": {
+                "ESCALATE": "a-escalate",
+                "Check": "a-check",
+                "Source check": "a-source-check",
+            }.get(action, ""),
             "is_event":    is_event,
         })
 
@@ -2528,7 +2573,7 @@ def collect_dashboard_data(session, run_date: date) -> dict:
     avg_cds_today = _fetch_avg_cds(session, run_date, active_counties)
     active_subs = _fetch_active_subscriber_count(session, active_counties)
     enrichment_rate = _fetch_enrichment_rate(session, run_date, active_counties)
-    cora_autonomy = _fetch_cora_autonomy(session)
+    cora_autonomy = _fetch_cora_autonomy(session, run_date)
     subscriber_metrics = _fetch_subscriber_metrics(session, active_counties)
 
     exec_summary = {

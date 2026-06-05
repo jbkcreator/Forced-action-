@@ -89,8 +89,8 @@ def run_sweep(dry_run: bool = False) -> dict:
 
     since = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
 
+    from src.agents.events.ingestion import publish_cora_event
     from src.services import wallet_engine
-    from src.agents.supervisor import dispatch_event
 
     with get_db_context() as db:
         if get_active_pause(db, "claude", "accelerated_wallet_push"):
@@ -111,7 +111,7 @@ def run_sweep(dry_run: bool = False) -> dict:
                     logger.info("[AccelWalletPushSweep] dry-run eligible sub=%s payload=%s",
                                 sub_id, eligible)
                     continue
-                dispatch_event({
+                publish_cora_event({
                     "event_type": "accelerated_wallet_push_eligible",
                     "subscriber_id": sub_id,
                     "payload": eligible,

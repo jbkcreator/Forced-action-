@@ -28,8 +28,8 @@ _DEDUP_DAYS = 7
 
 
 def run() -> dict:
+    from src.agents.events.ingestion import publish_cora_event
     from src.core.database import get_db_context
-    from src.agents.supervisor import dispatch_event
     from src.services.vendor_cost_pause_service import get_active_pause
 
     cutoff_convert = datetime.now(timezone.utc) - timedelta(hours=_NO_CONVERT_HOURS)
@@ -106,7 +106,7 @@ def run() -> dict:
             # idempotency_key. _already_handled queries AgentDecision.decision_id;
             # if they differ, dedup never fires and a 2-min sweep storms the queue.
             idem_key = f"synthflow_drop:{row[0]}:{today}"
-            dispatch_event({
+            publish_cora_event({
                 "event_type": "high_intent_no_convert",
                 "subscriber_id": row[0],
                 "payload": {

@@ -105,8 +105,10 @@ def _load_from_db(county_id: str) -> dict:
             "display_name":        county.display_name,
             "fips":                county.fips or "",
             "nws_zone":            county.nws_zone,
-            # Plural list expected by storm/flood/insurance scrapers
-            "nws_zones":           [county.nws_zone] if county.nws_zone else [],
+            # Plural list expected by storm/flood/insurance scrapers.
+            # nws_zone may be comma-separated (e.g. "FLZ151,FLZ251") for
+            # counties that span multiple NWS forecast zones.
+            "nws_zones":           [z.strip() for z in county.nws_zone.split(",")] if county.nws_zone else [],
             "state":               "FL",
             "zip_prefixes":        [],
             "parcel_id_format":    county.parcel_id_format or "folio",

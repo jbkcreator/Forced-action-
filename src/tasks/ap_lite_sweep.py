@@ -47,8 +47,8 @@ def count_actions_trailing_7d(db: Session, subscriber_id: int) -> int:
 
 
 def _emit_event(subscriber_id: int, actions_count: int, window_end: date) -> None:
+    from src.agents.events.ingestion import publish_cora_event
     from src.agents.events.types import Event
-    from src.agents.supervisor import dispatch_event
 
     iso_week = window_end.strftime(AP_LITE_IDEMPOTENCY_WINDOW)
     evt = Event(
@@ -64,7 +64,7 @@ def _emit_event(subscriber_id: int, actions_count: int, window_end: date) -> Non
         idempotency_key=f"aplite:{subscriber_id}:{iso_week}",
     )
     try:
-        dispatch_event(evt.to_dispatch_dict())
+        publish_cora_event(evt.to_dispatch_dict())
     except Exception as exc:
         logger.error("ap_lite_sweep emit failed sub=%s: %s", subscriber_id, exc)
 

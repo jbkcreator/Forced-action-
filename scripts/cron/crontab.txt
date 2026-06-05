@@ -38,7 +38,7 @@ COUNTY_ID=hillsborough
 15 4 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.bankruptcy.bankruptcy_engine --lookback 1 --load-to-db --county-id $COUNTY_ID
 
 # 3. Eviction Filings        — 04:30 AM UTC / 12:30 AM EDT / 10:00 AM IST
-30 4 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.evictions.evictions_engine --load-to-db --county-id $COUNTY_ID
+30 4 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.evictions.evictions_engine --load-to-db --county-id $COUNTY_ID --no-proxy
 
 # 4. Probate Filings         — 04:45 AM UTC / 12:45 AM EDT / 10:15 AM IST
 45 4 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.probate.probate_engine --load-to-db --county-id $COUNTY_ID
@@ -76,9 +76,17 @@ COUNTY_ID=hillsborough
 
 # 12. Storm Damage (NWS alerts) — 06:19 AM UTC / 02:19 AM EDT / 11:49 AM IST
 19 6 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.storm.storm_engine --county-id $COUNTY_ID
+20 6 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.storm.storm_engine --county-id pinellas
 
 # 13. Flood Damage (FEMA + NWS) — 06:21 AM UTC / 02:21 AM EDT / 11:51 AM IST
 21 6 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.flood.flood_engine --county-id $COUNTY_ID
+22 6 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.flood.flood_engine --county-id pinellas
+
+# 12b. Fire Weather Alerts (NWS) — 06:19 AM UTC / 02:19 AM EDT / 11:49 AM IST
+#      Replaces HCSO browser-use scraper. Reads active NWS fire weather alerts
+#      (Red Flag Warning, Fire Weather Watch, etc.) via zone IDs in counties DB.
+19 6 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.fire.fire_engine --county-id $COUNTY_ID
+20 6 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.fire.fire_engine --county-id pinellas
 
 # 14. Insurance Claims (FEMA IA + adjuster permits) — 3x/day at 06:23, 14:23, 22:23 UTC (every 8h, Mon-Sat).
 #     Bumped from 1x to 3x to catch new FEMA IA filings and adjuster permits same-day.
@@ -95,7 +103,7 @@ COUNTY_ID=hillsborough
 20 4 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.bankruptcy.bankruptcy_engine --lookback 1 --load-to-db --county-id pinellas
 
 # P2. Eviction Filings       — 04:35 AM UTC / 12:35 AM EDT / 10:05 AM IST
-35 4 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.evictions.evictions_engine --start-date $(date -d "1 day ago" +\%Y-\%m-\%d) --end-date $(date +\%Y-\%m-\%d) --load-to-db --county-id pinellas
+35 4 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.evictions.evictions_engine --start-date $(date -d "1 day ago" +\%Y-\%m-\%d) --end-date $(date +\%Y-\%m-\%d) --load-to-db --county-id pinellas --no-proxy
 
 # P3. Probate Filings        — 04:50 AM UTC / 12:50 AM EDT / 10:20 AM IST
 50 4 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.probate.probate_engine --load-to-db --county-id pinellas
@@ -131,6 +139,13 @@ COUNTY_ID=hillsborough
 #     Note: first few Saturdays may false-positive on `scraper_volume_drop_50pct`
 #     until Saturday counts are absorbed into the 7-day baseline.
 5 8 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.anomaly_pager
+
+# 20. Daily Operations Report (CSV) — 08:10 AM UTC Mon-Sat.
+#     Runs after CDS scoring (07:00), skip-trace (07:30), and GHL sync (08:00)
+#     so the report reflects the full day's scraper ingest + scoring results.
+#     Writes reports/daily/report_YYYY-MM-DD.csv; 7-day retention; emails to REPORT_RECIPIENTS.
+10 8 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.daily_report --county $COUNTY_ID
+11 8 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.daily_report --county pinellas
 
 # ── PLATFORM TASKS ───────────────────────────────────────────
 # Grace Expiry (ZIP territories + subscribers) — every 15 min
@@ -176,6 +191,7 @@ COUNTY_ID=hillsborough
 # Tier A: active-lead pending/30d-stale  •  Tier B: cold pending/180d-stale
 # Writes doc_number, principal address, managing members + raw HTML snapshot.
 40 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.sunbiz_enrichment --county $COUNTY_ID --limit 200
+41 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.sunbiz_enrichment --county pinellas --limit 200
 
 # SunBiz Anomaly Check — 07:50 AM UTC Mon-Sat (fa031 observability, after enrichment at 07:40)
 # Alerts if parser_failed_rate >5% in last 24h (min 10 outcomes).
