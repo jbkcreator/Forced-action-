@@ -521,12 +521,21 @@ def _build_batch_prompt(batch: list[dict]) -> str:
 
     return f"""You are a property record matching expert for Florida county records.
 
+IMPORTANT: You are seeing at most 3 candidates per record. The database may contain other equally plausible matches not shown. Assume ambiguity unless the evidence clearly rules out alternatives.
+
+A false confirmation corrupts the property database. A false rejection only delays a match for manual review. When uncertain, always reject.
+
 Process each RECORD below INDEPENDENTLY. Each record's candidates belong ONLY to that record — do not let one record's data influence another's decision.
 
 {records_block}
 
-FOR EACH RECORD determine whether the best-matching candidate property is the correct match.
-Consider: (1) owner name correlation, (2) correct jurisdiction, (3) ambiguity between candidates, (4) corroborating details.
+FOR EACH RECORD, ALL of the following must be true to confirm a match:
+1. The name in MATCH_FIELD is essentially the same person or entity as the owner_name on the property (same person/entity, accounting only for punctuation, word order, and well-known abbreviations like TRE/TRUST/INC/LLC).
+2. The property is in the correct jurisdiction for the record type.
+3. No other shown candidate is equally or more plausible.
+4. No corroborating field (address number, city, zip) directly contradicts the match.
+
+If ANY of the above conditions is not clearly met, set matched=false.
 
 Respond with ONLY a valid JSON array — one element per record, in the same order:
 [
@@ -541,11 +550,12 @@ Respond with ONLY a valid JSON array — one element per record, in the same ord
 ]
 
 Rules:
-- "high": clear match — name strongly correlates AND correct jurisdiction
-- "medium": plausible match but some ambiguity
-- "low": cannot determine — set matched=false
-- If matched=false: property_id must be null
-- If multiple candidates are equally plausible: matched=false, confidence=low
+- "high": ALL four conditions above are clearly met. Name is essentially identical (not just similar). No contradicting evidence. Use this only when you are certain.
+- "medium": name is plausible but has spelling/abbreviation/truncation ambiguity, jurisdiction is correct, and no other candidate is equally plausible. NOT high because of name uncertainty only.
+- "low": any condition above is not clearly met — set matched=false.
+- NOT "high" if: only the surname matches with no other corroborating detail; address numbers differ; business name only partially overlaps; name is a common surname (e.g. SMITH, JONES, MILLER, JOHNSON) without additional corroboration.
+- CRITICAL: If multiple candidates are equally plausible, you MUST set matched=false and confidence=low. This is never "medium".
+- If matched=false: property_id must be null.
 - Output ONLY the JSON array. No text outside it."""
 
 
@@ -652,7 +662,7 @@ def llm_tiebreak_pending_review(
                 match_field=match_field,
             )
 
-            if result.matched and result.confidence in ("high", "medium"):
+            if result.matched and result.confidence == "high":
                 confirmed_id = result.property_id or record.candidate_property_id
                 logger.info(
                     "[LLM tiebreaker] CONFIRMED record_id=%s source=%s "
@@ -778,7 +788,7 @@ def llm_tiebreak_pending_review(
                     continue
                 decided_ids.add(rid)
 
-                if decision.get("matched") and decision.get("confidence") in ("high", "medium"):
+                if decision.get("matched") and decision.get("confidence") == "high":
                     confirmed_id = decision.get("property_id") or rec.candidate_property_id
                     logger.info(
                         "[LLM tiebreaker] CONFIRMED record_id=%s source=%s "

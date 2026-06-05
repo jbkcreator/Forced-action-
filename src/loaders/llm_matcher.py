@@ -315,9 +315,10 @@ Respond with ONLY this JSON object — no text outside it:
 
 Rules:
 - "high": clear match — name strongly correlates AND correct jurisdiction
-- "medium": plausible match but some ambiguity (e.g. common surname, partial name)
+- "medium": ONE plausible candidate with name/spelling/abbreviation ambiguity (e.g. common surname, partial name, abbreviated entity suffix). Only valid when there is a SINGLE best candidate — NOT when two candidates are equally plausible.
 - "low": cannot determine with confidence — set matched=false
 - If matched=false, property_id must be null
-- If multiple candidates are equally plausible, set matched=false and confidence="low"
+- CRITICAL: If multiple candidates are equally plausible (same surname, same name, similar names at different addresses), you MUST set matched=false and confidence="low". Ambiguity between candidates is NOT a "medium" case — it is always "low".
+- "medium" is for name-spelling/abbreviation uncertainty about ONE property, never for uncertainty about WHICH property.
 """
         return prompt
