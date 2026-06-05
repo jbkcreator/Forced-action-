@@ -1,0 +1,39 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Data and reports (large, not needed in image)
+data/
+reports/
+logs/
+
+# Local dev / test artifacts
+.pytest_cache/
+__pycache__/
+*.pyc
+*.pyo
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Git
+.git/
+.gitignore
+
+# Secrets (never bake into image — inject via --env-file)
+.env
+.env.*
+
+# Temp / downloads
+tmp/
+temp/
+*.tmp
+
+# OS
+.DS_Store
+Thumbs.db

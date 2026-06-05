@@ -28,7 +28,7 @@ from fastapi import FastAPI, Header, HTTPException, Request, Depends, Query, Res
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
+
 from pydantic import BaseModel, Field, field_validator, model_validator, EmailStr
 from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -52,7 +52,7 @@ setup_logging()
 
 logger = logging.getLogger(__name__)
 
-REACT_DIST = Path(__file__).parent.parent.parent.parent / "Forced-action-ui" / "dist"
+
 
 VALID_TIERS = {"starter", "pro", "dominator"}
 VALID_VERTICALS = set(VERTICAL_WEIGHTS.keys())
@@ -107,10 +107,6 @@ app.include_router(supplier_intel_router)
 
 from src.api.clay_router import router as clay_router  # noqa: E402
 app.include_router(clay_router)
-
-# Mount React build assets (JS/CSS chunks) if the dist directory exists
-if REACT_DIST.is_dir() and (REACT_DIST / "assets").is_dir():
-    app.mount("/assets", StaticFiles(directory=str(REACT_DIST / "assets")), name="react-assets")
 
 
 # ---------------------------------------------------------------------------
@@ -429,16 +425,6 @@ def health_check_detailed(db: Session = Depends(get_db)):
 
 \
 # ---------------------------------------------------------------------------
-# GET / — Landing page (React SPA or static HTML fallback)
-# ---------------------------------------------------------------------------
-
-@app.get("/", include_in_schema=False)
-def landing_page():
-    react_index = REACT_DIST / "index.html"
-    if react_index.is_file():
-        return FileResponse(str(react_index))
-    raise HTTPException(status_code=503, detail="UI not built — run npm run build in Forced-action-ui/")
-
 
 @functools.lru_cache(maxsize=1)
 def _cached_pricing_info() -> dict:
@@ -783,48 +769,6 @@ def checkout_status(session_id: str, db: Session = Depends(get_db)):
 
     return {"payment_status": payment_status, "feed_uuid": feed_uuid, "tier": tier}
 
-
-# GET /success — Post-checkout confirmation page (React SPA)
-# ---------------------------------------------------------------------------
-
-@app.get("/success", include_in_schema=False)
-def success_page():
-    react_index = REACT_DIST / "index.html"
-    if react_index.is_file():
-        return FileResponse(str(react_index))
-    raise HTTPException(status_code=503, detail="UI not built — run npm run build in Forced-action-ui/")
-
-
-# ---------------------------------------------------------------------------
-# GET /dashboard/{feed_uuid} — Subscriber dashboard (React SPA)
-# ---------------------------------------------------------------------------
-
-@app.get("/dashboard/{feed_uuid}", include_in_schema=False)
-def dashboard_page(feed_uuid: str):
-    react_index = REACT_DIST / "index.html"
-    if react_index.is_file():
-        return FileResponse(str(react_index))
-    raise HTTPException(status_code=503, detail="UI not built — run npm run build in Forced-action-ui/")
-
-
-# ---------------------------------------------------------------------------
-# GET /email-previews — Email template previews (React SPA)
-# ---------------------------------------------------------------------------
-
-@app.get("/email-previews", include_in_schema=False)
-def email_previews_page():
-    react_index = REACT_DIST / "index.html"
-    if react_index.is_file():
-        return FileResponse(str(react_index))
-    raise HTTPException(status_code=503, detail="UI not built — run npm run build in Forced-action-ui/")
-
-
-@app.get("/admin", include_in_schema=False)
-def admin_page():
-    react_index = REACT_DIST / "index.html"
-    if react_index.is_file():
-        return FileResponse(str(react_index))
-    raise HTTPException(status_code=503, detail="Admin UI not built — run npm run build in Forced-action-ui/")
 
 
 # ---------------------------------------------------------------------------
@@ -4476,7 +4420,7 @@ async def nws_alert(request: Request, db: Session = Depends(get_db)):
 
 # ── Phase 2B: Admin DLQ review ────────────────────────────────────────────────
 
-@app.get("/admin/dlq")
+@app.get("/api/admin/dlq")
 def admin_dlq(limit: int = 50, db: Session = Depends(get_db)):
     """Return unreviewed SMS dead-letter queue items for admin review."""
     from src.core.models import SmsDeadLetter
@@ -5698,9 +5642,3 @@ h1{{font-size:1.5rem}}a.cta{{display:inline-block;margin-top:24px;padding:12px 2
 # that the browser requests directly on reload or deep-link.
 # ---------------------------------------------------------------------------
 
-@app.get("/{full_path:path}", include_in_schema=False)
-def spa_fallback(full_path: str):
-    react_index = REACT_DIST / "index.html"
-    if react_index.is_file():
-        return FileResponse(str(react_index))
-    raise HTTPException(status_code=503, detail="UI not built — run npm run build in Forced-action-ui/")

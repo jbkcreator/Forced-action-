@@ -1,0 +1,17 @@
+services:
+  api:
+    build: .
+    image: forced-action-backend:latest
+    command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000 --workers 2
+    env_file: .env
+    network_mode: host
+    restart: unless-stopped
+
+  cora:
+    image: forced-action-backend:latest
+    command: python -m src.agents --serve
+    env_file: .env
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - api
