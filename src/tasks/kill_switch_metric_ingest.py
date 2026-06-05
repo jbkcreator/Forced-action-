@@ -67,18 +67,13 @@ def _cache_metric(feature: str, value: Optional[float], county_id: Optional[str]
 
 
 def get_cached_metric(feature: str, county_id: Optional[str] = None) -> Optional[float]:
-    """Return the last-cached metric value for a feature, or None."""
-    if not redis_available():
-        return None
-    if county_id is not None:
-        key = f"{_REDIS_PREFIX}{county_id}:{feature}"
-    else:
-        key = f"{_REDIS_PREFIX}{feature}"
-    val = rget(key)
-    try:
-        return float(val) if val is not None else None
-    except (TypeError, ValueError):
-        return None
+    """Return the last-cached metric value for a feature, or None.
+
+    Re-exported from src.services.kill_switch_service — kept here for
+    backwards compatibility with existing callers.
+    """
+    from src.services.kill_switch_service import get_cached_metric as _impl
+    return _impl(feature, county_id)
 
 
 def _compute_metrics(db: Session, county_id: str) -> dict:

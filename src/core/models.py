@@ -2693,6 +2693,108 @@ class SmsOptIn(Base):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Compliance — T&C / TCPA Consent Audit Trail
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class ConsentAcceptance(Base):
+    """
+    Granular audit trail for every T&C + TCPA consent interaction.
+    One row per signup/checkout/waitlist submit — NOT deduplicated, because
+    each interaction captures distinct scroll-timing and version data.
+
+    For T&C acceptance:
+      - subscriber_id / phone / email / ip_address / user_agent
+      - terms_version / privacy_version / accepted_at / source_flow
+      - modal_opened_at / modal_scrolled_to_end_at
+      - accepted_text_hash (SHA-256 of rendered text)
+
+    For TCPA marketing consent (optional):
+      - tcpa_consent_text / tcpa_consent_version / tcpa_checked_at
+      - consent_scope / not_condition_of_purchase_ack (must be true)
+    """
+    __tablename__ = "consent_acceptances"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+
+    # ── Identity ──────────────────────────────────────────────────────────────
+    # Linkable to subscriber or waitlist entry after creation
+    subscriber_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("subscribers.id"), nullable=True, index=True
+    )
+    waitlist_entry_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("waitlist_entries.id"), nullable=True, index=True
+    )
+    phone: Mapped[Optional[str]] = mapped_column(String(20), nullable=True, index=True)
+    email: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+
+    # ── T&C acceptance (always required) ──────────────────────────────────────
+    terms_version: Mapped[str] = mapped_column(String(20), nullable=False)
+    privacy_version: Mapped[str] = mapped_column(String(20), nullable=False)
+    accepted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    source_flow: Mapped[str] = mapped_column(
+        String(30), nullable=False, default="waitlist",
+    )
+    ip_address: Mapped[Optional[str]] = mapped_column(String(45), nullable=True)
+    user_agent: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # ── Scroll-to-bottom timestamps (T&C modal) ──────────────────────────────
+    modal_opened_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    modal_scrolled_to_end_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+
+    # ── Accepted-text hash (SHA-256 of the exact rendered T&C + Privacy text) ─
+    accepted_text_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    # ── TCPA marketing consent (optional — never a condition of purchase) ─────
+    tcpa_consent_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    tcpa_consent_version: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    tcpa_checked_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    consent_scope: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    not_condition_of_purchase_ack: Mapped[Optional[bool]] = mapped_column(
+        Boolean, nullable=True,
+    )
+
+    # ── Audit ─────────────────────────────────────────────────────────────────
+    county_id: Mapped[Optional[str]] = mapped_column(
+        String(50), nullable=True, default="hillsborough",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "source_flow IN ('waitlist','signup','checkout','county_launch','free_signup')",
+            name="ck_consent_source_flow",
+        ),
+        CheckConstraint(
+            "consent_scope IS NULL OR consent_scope IN ('marketing','waitlist_notify','lead_alerts')",
+            name="ck_consent_scope",
+        ),
+        Index("idx_consent_email", "email"),
+        Index("idx_consent_accepted_at", "accepted_at"),
+        Index("idx_consent_subscriber", "subscriber_id"),
+        Index("idx_consent_waitlist", "waitlist_entry_id"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<ConsentAcceptance(id={self.id}, email={self.email}, "
+            f"flow={self.source_flow}, tcpa={'YES' if self.tcpa_checked_at else 'NO'})>"
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Agents — Cora LangGraph Audit Log
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2735,6 +2837,7 @@ class AgentDecision(Base):
     approved_by: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
     overridden_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     overridden_by: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    override_reason_code: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
     override_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     playbook_id: Mapped[Optional[int]] = mapped_column(
         BigInteger, ForeignKey("cora_playbook.id", ondelete="SET NULL"), nullable=True,
@@ -2751,8 +2854,17 @@ class AgentDecision(Base):
             "'rejected','overridden','recommendation_only')",
             name="check_agent_autonomy_class",
         ),
+        CheckConstraint(
+            "override_reason_code IS NULL OR override_reason_code IN ("
+            "'factual_error','compliance_risk','wrong_audience','bad_timing',"
+            "'low_lead_quality','offer_mismatch','tone_or_brand_risk',"
+            "'duplicate_or_redundant','customer_context_missing',"
+            "'operator_strategy','other')",
+            name="check_agent_override_reason_code",
+        ),
         Index("idx_agent_decisions_graph_started", "graph_name", "started_at"),
         Index("idx_agent_decisions_subscriber_started", "subscriber_id", "started_at"),
+        Index("idx_agent_decisions_override_reason_code", "override_reason_code"),
     )
 
     def __repr__(self):
@@ -3049,6 +3161,35 @@ class CountySource(Base):
 
     def __repr__(self):
         return f"<CountySource(county_id={self.county_id!r}, signal_type={self.signal_type!r})>"
+
+
+class CoraEventQueue(Base):
+    """
+    Durable fallback queue for Cora events published when Redis is unavailable.
+
+    Primary delivery path: Redis Pub/Sub channel "cora:events".
+    This table is the secondary path — events are inserted here when Redis
+    publish fails, then swept by the agents process (listen_postgres sweep loop).
+    The idempotency_key unique constraint prevents double-processing.
+    """
+    __tablename__ = "cora_event_queue"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    event_type: Mapped[str] = mapped_column(Text, nullable=False)
+    subscriber_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
+    idempotency_key: Mapped[Optional[str]] = mapped_column(Text, nullable=True, unique=True)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="pending", server_default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("idx_cora_event_queue_status_created", "status", "created_at"),
+    )
+
+    def __repr__(self):
+        return f"<CoraEventQueue(id={self.id}, event_type={self.event_type!r}, status={self.status!r})>"
 
 
 class CountyColumnMapping(Base):

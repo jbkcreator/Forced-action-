@@ -45,7 +45,7 @@ from src.agents.tools.read_tools import (
 	get_subscriber_profile,
 	get_zip_activity,
 )
-from src.tasks.kill_switch_metric_ingest import get_cached_metric
+from src.services.kill_switch_service import get_cached_metric
 
 
 # Phrase used in place of the tier label when the subscriber's county is

@@ -195,7 +195,7 @@ async def _scrape_with_playwright(
             df = await _execute_playwright_code_on_page(page, playwright_code, url, start_str, end_str, county_id)
     else:
         from playwright.async_api import async_playwright
-        _proxy = None if no_proxy else get_playwright_proxy()
+        # _proxy = None if no_proxy else get_playwright_proxy()
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=not headful,
@@ -205,7 +205,7 @@ async def _scrape_with_playwright(
             context = await browser.new_context(
                 user_agent=STEALTH_UA,
                 accept_downloads=True,
-                proxy=_proxy,
+                # proxy=_proxy,
             )
             page = await context.new_page()
             await apply_stealth_to_page(page)
@@ -366,7 +366,7 @@ async def _scrape_pinellas_with_2captcha(
 
     url = source.get("url", "")
     RAW_EVICTIONS_DIR.mkdir(parents=True, exist_ok=True)
-    _proxy = None if no_proxy else get_playwright_proxy()
+    # _proxy = None if no_proxy else get_playwright_proxy()
 
     logger.info("[evictions-captcha] Pinellas direct scrape: %s → %s  url=%s", start_str, end_str, url)
 
@@ -379,7 +379,7 @@ async def _scrape_pinellas_with_2captcha(
         context = await browser.new_context(
             user_agent=STEALTH_UA,
             accept_downloads=True,
-            proxy=_proxy,
+            # proxy=_proxy,
         )
         page = await context.new_page()
         await apply_stealth_to_page(page)
@@ -721,7 +721,7 @@ async def _download_civil_filing_browser(
         browser_kwargs.update(
             user_agent=STEALTH_UA,
             enable_default_extensions=True,
-            proxy=None if no_proxy else get_browser_use_proxy(),
+            # proxy=None if no_proxy else get_browser_use_proxy(),
         )
 
     browser = Browser(**browser_kwargs)

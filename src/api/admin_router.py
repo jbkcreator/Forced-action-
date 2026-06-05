@@ -707,8 +707,7 @@ def kill_switch_status_overview():
     configured feature. Requires kill_switch_metric_ingest cron to have run.
     """
     from config.cora_guardrails import KILL_SWITCH
-    from src.agents.tools.gating_tools import kill_switch_status
-    from src.tasks.kill_switch_metric_ingest import get_cached_metric
+    from src.services.kill_switch_service import get_cached_metric, get_kill_switch_status as kill_switch_status
 
     results = []
     for feature, cfg in KILL_SWITCH.items():

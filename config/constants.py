@@ -174,6 +174,36 @@ LIEN_DOCUMENT_TYPES = {
     "TAXDEED": "Tax Deeds",
 }
 
+# =============================================================================
+# CONSENT & COMPLIANCE CONSTANTS (TCPA / T&C)
+# =============================================================================
+
+TERMS_VERSION = "2026.06"
+PRIVACY_VERSION = "2026.06"
+TCPA_CONSENT_VERSION = "2026.06.1"
+
+TCPA_CONSENT_TEXT = (
+    "I agree to receive recurring automated marketing calls and text messages "
+    "from Forced Action at the phone number provided. Consent is not a "
+    "condition of purchase. Msg & data rates may apply. "
+    "Reply STOP to opt out."
+)
+
+CONSENT_SOURCE_FLOWS = frozenset({
+    "waitlist",
+    "signup",
+    "checkout",
+    "county_launch",
+    "free_signup",
+})
+
+CONSENT_SCOPES = frozenset({
+    "marketing",
+    "waitlist_notify",
+    "lead_alerts",
+})
+
+
 TIER_DISPLAY = {
     "starter": {
         "label": "Starter — 1 ZIP",

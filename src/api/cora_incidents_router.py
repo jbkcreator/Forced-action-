@@ -381,7 +381,7 @@ def get_subscriber_cora_timeline(
                 started_at, completed_at, terminal_status,
                 autonomy_class, was_autonomous, variant_id,
                 requires_approval, approved_at, approved_by,
-                overridden_at, overridden_by, override_reason,
+                overridden_at, overridden_by, override_reason_code, override_reason,
                 tokens_used, cost_usd, summary
             FROM agent_decisions
             WHERE {where}
@@ -424,6 +424,7 @@ def get_subscriber_cora_timeline(
             override = {
                 "overridden_at": d["overridden_at"],
                 "overridden_by": d.get("overridden_by"),
+                "override_reason_code": d.get("override_reason_code"),
                 "override_reason": d.get("override_reason"),
             }
         elif d.get("approved_at"):

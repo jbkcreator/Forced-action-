@@ -180,7 +180,8 @@ class TestLogDecisionAutonomy:
             autonomy_class="autonomous", was_autonomous=True,
             requires_approval=False,
             approved_at=None, approved_by=None,
-            overridden_at=None, overridden_by=None, override_reason=None,
+            overridden_at=None, overridden_by=None, override_reason_code=None,
+            override_reason=None,
             playbook_id=None,
         )
         sess = _ORMSession(existing=existing)
@@ -191,6 +192,7 @@ class TestLogDecisionAutonomy:
                 autonomy_class="overridden",
                 overridden_at=when,
                 overridden_by="dev@heu.ai",
+                override_reason_code="wrong_audience",
                 override_reason="bad fit",
                 session=sess,
             )
@@ -198,6 +200,7 @@ class TestLogDecisionAutonomy:
         assert existing.autonomy_class == "overridden"
         assert existing.overridden_at == when
         assert existing.overridden_by == "dev@heu.ai"
+        assert existing.override_reason_code == "wrong_audience"
         assert existing.override_reason == "bad fit"
         # was_autonomous stays True (Test #23 ratchet).
         assert existing.was_autonomous is True
@@ -532,7 +535,8 @@ class TestStickyWasAutonomous:
             autonomy_class="autonomous", was_autonomous=True,
             requires_approval=False,
             approved_at=None, approved_by=None,
-            overridden_at=None, overridden_by=None, override_reason=None,
+            overridden_at=None, overridden_by=None, override_reason_code=None,
+            override_reason=None,
             playbook_id=None,
         )
         sess = _ORMSession(existing=existing)
@@ -542,6 +546,7 @@ class TestStickyWasAutonomous:
                 autonomy_class="overridden",
                 overridden_at=datetime.now(timezone.utc),
                 overridden_by="ops",
+                override_reason_code="operator_strategy",
                 override_reason="bad call",
                 session=sess,
             )

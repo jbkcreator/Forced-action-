@@ -33,6 +33,17 @@ class AppSettings(BaseSettings):
 
 	debug: bool = Field(default=True, env="DEBUG")
 
+	@field_validator("debug", mode="before")
+	@classmethod
+	def _coerce_debug(cls, value):
+		if isinstance(value, str):
+			normalized = value.strip().lower()
+			if normalized in {"release", "prod", "production"}:
+				return False
+			if normalized in {"dev", "development"}:
+				return True
+		return value
+
 	# Set to true in local/staging environments to expose the /dev admin route.
 	# Keep false (or unset) in production — the /api/admin/dev/ping endpoint
 	# returns 403 when this is false, which blocks the DevPage from rendering.

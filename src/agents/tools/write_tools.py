@@ -27,6 +27,7 @@ from typing import Any, Dict, Generator, Optional
 
 from sqlalchemy.orm import Session
 
+from src.agents.override_reasons import normalize_override_reason_code
 from src.agents.tools.registry import tool
 from src.core.database import db
 from src.core.models import AgentDecision, MessageOutcome, Subscriber, SmsOptIn
@@ -256,6 +257,7 @@ def log_decision(
 	approved_by: Optional[str] = None,
 	overridden_at: Optional[datetime] = None,
 	overridden_by: Optional[str] = None,
+	override_reason_code: Optional[str] = None,
 	override_reason: Optional[str] = None,
 	playbook_id: Optional[int] = None,
 	session: Optional[Session] = None,
@@ -278,7 +280,8 @@ def log_decision(
 	                       'autonomous' classification, never cleared.
 	                       Metric 2 ("% overridden") queries on this.
 	  - approved_at / by:  set when a human approves a previously-pending decision.
-	  - overridden_at / by / reason: set when a human reverses an autonomous decision.
+	  - overridden_at / by / reason_code / reason: set when a human reverses an
+	                                      autonomous decision.
 	  - playbook_id:       optional link to the cora_playbook that drove this decision.
 
 	Returns the final persisted state of the row.
@@ -292,6 +295,11 @@ def log_decision(
 		raise ValueError(
 			f"autonomy_class must be one of {_VALID_AUTONOMY_CLASSES}, "
 			f"got {autonomy_class!r}"
+		)
+	normalized_override_reason_code = normalize_override_reason_code(override_reason_code)
+	if overridden_at is not None and normalized_override_reason_code is None:
+		raise ValueError(
+			"override_reason_code is required when overridden_at is provided"
 		)
 
 	with _session(session) as s:
@@ -322,6 +330,7 @@ def log_decision(
 				approved_by=approved_by,
 				overridden_at=overridden_at,
 				overridden_by=overridden_by,
+				override_reason_code=normalized_override_reason_code,
 				override_reason=override_reason,
 				playbook_id=playbook_id,
 			)
@@ -358,6 +367,7 @@ def log_decision(
 			if overridden_at is not None and row.overridden_at is None:
 				row.overridden_at = overridden_at
 				row.overridden_by = overridden_by
+				row.override_reason_code = normalized_override_reason_code
 				row.override_reason = override_reason
 			if playbook_id is not None and row.playbook_id is None:
 				row.playbook_id = playbook_id
@@ -379,5 +389,7 @@ def log_decision(
 			"requires_approval": bool(row.requires_approval),
 			"approved_at": row.approved_at.isoformat() if row.approved_at else None,
 			"overridden_at": row.overridden_at.isoformat() if row.overridden_at else None,
+			"override_reason_code": getattr(row, "override_reason_code", None),
+			"override_reason": getattr(row, "override_reason", None),
 			"playbook_id": row.playbook_id,
 		}

@@ -76,7 +76,7 @@ def find_candidates(db: Session) -> List[WalletToLockCandidate]:
 
         # Gate: require ≥10 scorable leads in this ZIP
         try:
-            from src.agents.tools.read_tools import get_lead_pool
+            from src.services.lead_pool_service import get_lead_pool
             leads = get_lead_pool(zip_code=row.zip_code, vertical=sub.vertical, min_score=60, limit=50)
             # leads with no contacted field are treated as uncontacted
             uncontacted = [l for l in leads if not l.get("contacted")]
@@ -211,8 +211,8 @@ def emit_event(
     tier_breakdown: dict = None,
 ) -> None:
     """Emit subscriber_crossed_lock_threshold event to Cora supervisor."""
+    from src.agents.events.ingestion import publish_cora_event
     from src.agents.events.types import Event
-    from src.agents.supervisor import dispatch_event
 
     yyyymm = datetime.now(timezone.utc).strftime(LOCK_IDEMPOTENCY_WINDOW)
     decision_id = str(uuid.uuid4())
@@ -236,7 +236,7 @@ def emit_event(
         idempotency_key=f"wal2lock:{subscriber_id}:{zip_code}:{yyyymm}",
     )
     try:
-        dispatch_event(evt.to_dispatch_dict())
+        publish_cora_event(evt.to_dispatch_dict())
     except Exception as exc:
         logger.error(
             "wallet_to_lock emit_event failed sub=%s zip=%s: %s",

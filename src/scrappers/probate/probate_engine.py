@@ -94,7 +94,7 @@ async def _scrape_with_playwright(
     url = source.get("url", "")
     RAW_PROBATE_DIR.mkdir(parents=True, exist_ok=True)
 
-    _proxy = None if no_proxy else get_playwright_proxy()
+    # _proxy = None if no_proxy else get_playwright_proxy()
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=not headful,
@@ -102,7 +102,7 @@ async def _scrape_with_playwright(
             args=STEALTH_ARGS,
         )
         context = await browser.new_context(
-            user_agent=STEALTH_UA, accept_downloads=True, proxy=_proxy,
+            user_agent=STEALTH_UA, accept_downloads=True,  # proxy=_proxy,
         )
         page = await context.new_page()
         await apply_stealth_to_page(page)
@@ -170,7 +170,7 @@ async def _download_probate_via_browser(
         minimum_wait_page_load_time=1.5,
         wait_between_actions=1.0,
         args=STEALTH_ARGS,
-        proxy=None if no_proxy else get_browser_use_proxy(),
+        # proxy=None if no_proxy else get_browser_use_proxy(),
     )
     await browser.start()
     await apply_stealth_to_browser_use(browser)

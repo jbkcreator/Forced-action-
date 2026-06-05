@@ -105,8 +105,8 @@ def _mark_deduplicated(subscriber_id: int) -> None:
 
 
 def _emit_event(subscriber_id: int, tier: str, window_days: int) -> None:
+    from src.agents.events.ingestion import publish_cora_event
     from src.agents.events.types import Event
-    from src.agents.supervisor import dispatch_event
 
     evt = Event(
         event_type="retention_summary_due",
@@ -116,7 +116,10 @@ def _emit_event(subscriber_id: int, tier: str, window_days: int) -> None:
         decision_id=str(uuid.uuid4()),
         idempotency_key=f"retention:{subscriber_id}:{datetime.now(timezone.utc).date().strftime(RETENTION_IDEMPOTENCY_WINDOW)}",
     )
-    dispatch_event(evt.to_dispatch_dict())
+    try:
+        publish_cora_event(evt.to_dispatch_dict())
+    except Exception as exc:
+        logger.error("retention_event_producer emit failed sub=%s: %s", subscriber_id, exc)
 
 
 def run(dry_run: bool = False) -> dict:

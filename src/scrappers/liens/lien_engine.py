@@ -278,7 +278,7 @@ async def run_browser_agent(
         browser_kwargs.update(
             user_agent=STEALTH_UA,
             enable_default_extensions=True,
-            proxy=None if no_proxy else get_browser_use_proxy(),
+            # proxy=None if no_proxy else get_browser_use_proxy(),
         )
 
     browser = Browser(**browser_kwargs)
@@ -394,8 +394,8 @@ async def _scrape_with_playwright(
                 ],
                 ignore_default_args=["--enable-automation"],
             )
-            _proxy = None if no_proxy else get_playwright_proxy()
-            context = await browser.new_context(accept_downloads=True, proxy=_proxy)
+            # _proxy = None if no_proxy else get_playwright_proxy()
+            context = await browser.new_context(accept_downloads=True)  # proxy=_proxy
             page = await context.new_page()
 
         try:

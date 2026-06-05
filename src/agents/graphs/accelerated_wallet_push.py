@@ -128,7 +128,7 @@ def _node_hierarchy_check(state: AcceleratedWalletPushState) -> AcceleratedWalle
     # can compute green/yellow/red instead of returning "unknown" (which the
     # hierarchy treats as red).
     try:
-        from src.tasks.kill_switch_metric_ingest import get_cached_metric
+        from src.services.kill_switch_service import get_cached_metric
         observed = get_cached_metric(KILL_SWITCH_FEATURE)
     except Exception:
         observed = None

@@ -221,7 +221,7 @@ async def _run(limit: Optional[int], dry_run: bool, headless: bool, debug: bool)
         browser = await pw.chromium.launch(
             headless=headless,
             args=STEALTH_ARGS,
-            proxy=get_playwright_proxy(),
+            # proxy=get_playwright_proxy(),
         )
         context = await browser.new_context(
             user_agent=STEALTH_UA,
