@@ -376,6 +376,69 @@ async def _download_pdf_pinellas_async(
         return pdf_url, local_path
 
 
+async def get_pinellas_case_number_async(instrument_number: str) -> Tuple[Optional[str], Optional[str]]:
+    """Read the court CASENUMBER (and Grantor) from the Pinellas Official Records
+    Details popup — without OCR.
+
+    The Details popup exposes CASENUMBER as a structured field for every record
+    type, so this works even when the document IMAGE is restricted/sealed
+    (probate, divorce — FL §28.2221(5)(a)) or returns only an eCertify cover.
+    Returns (casenumber_raw, grantor); either may be None. The raw value is
+    undashed (e.g. "26001007ES") — feed it to the Pinellas court_scraper, whose
+    decompose_ucn accepts the undashed form.
+    """
+    import re as _re
+    import asyncio as _asyncio
+    from src.utils.cf_persistent_browser import _launch_edge
+
+    async with _launch_edge(profile_name="pinellas_clerk", headless=False) as ctx:
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        await page.goto(_PINELLAS_SEARCH, wait_until="domcontentloaded", timeout=30000)
+        try:
+            await page.locator("#InstrumentNumber, #btnButton").first.wait_for(state="visible", timeout=20000)
+        except Exception as exc:
+            raise DownloadError(f"Pinellas portal did not render (CF?): {exc}") from exc
+        if "Disclaimer" in page.url or await page.locator("#btnButton").count():
+            try:
+                if await page.locator("#btnButton").is_visible():
+                    await page.locator("#btnButton").click()
+                    await page.wait_for_selector("#InstrumentNumber", timeout=20000)
+            except Exception as exc:
+                raise DownloadError(f"Pinellas disclaimer click failed: {exc}") from exc
+        await page.fill("#InstrumentNumber", str(instrument_number), timeout=15000)
+        await page.click("#btnSearch")
+        await _asyncio.sleep(5)
+        if await page.locator(f"tr:has-text('{instrument_number}')").count() == 0:
+            raise DownloadError(f"No search results for instrument {instrument_number}")
+        try:
+            async with ctx.expect_page(timeout=10000) as new_page_info:
+                await page.locator(f"tr:has-text('{instrument_number}')").first.click()
+            details = await new_page_info.value
+        except Exception as exc:
+            raise DownloadError(f"Details popup did not open: {exc}") from exc
+        await details.wait_for_load_state("domcontentloaded", timeout=20000)
+        await _asyncio.sleep(2)
+        txt = await details.locator("body").inner_text()
+        cm = _re.search(r"CASE\s*NUMBER[:\s]*([A-Za-z0-9\-]+)", txt, _re.I)
+        gm = _re.search(r"Grantor[:\s]*(.+)", txt, _re.I)
+        case_number = cm.group(1).strip() if cm else None
+        grantor = gm.group(1).split("\n", 1)[0].strip() if gm else None
+        logger.info("Pinellas Details %s -> CASENUMBER=%s grantor=%s",
+                    instrument_number, case_number, grantor)
+        return case_number, grantor
+
+
+def get_pinellas_case_number(instrument_number: str) -> Tuple[Optional[str], Optional[str]]:
+    """Sync wrapper for get_pinellas_case_number_async."""
+    import asyncio as _asyncio
+    try:
+        return _asyncio.run(get_pinellas_case_number_async(instrument_number))
+    except DownloadError:
+        raise
+    except Exception as exc:
+        raise DownloadError(f"Pinellas CASENUMBER lookup failed: {exc}") from exc
+
+
 def download_pdf_pinellas(instrument_number: str, output_dir: Path) -> Tuple[str, Path]:
     """Sync wrapper for the async Pinellas downloader.
 
