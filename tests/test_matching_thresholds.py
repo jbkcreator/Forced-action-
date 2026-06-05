@@ -72,7 +72,7 @@ class TestForCounty:
         t = for_county("pinellas")
         assert t.auto_match == 0.92      # auto_match stays strict
         assert t.review_min == 0.65
-        assert t.address_floor == 65
+        assert t.address_floor == 60      # intentionally lower (per-method split 2026-05-22)
         assert t.owner_name_floor == 65
         assert t.legal_desc_floor == 65
 
@@ -106,7 +106,7 @@ class TestThresholdsProperty:
     def test_pinellas_loader_uses_loose_thresholds(self, pinellas_loader):
         t = pinellas_loader._thresholds
         assert t.review_min == 0.65
-        assert t.address_floor == 65
+        assert t.address_floor == 60  # intentionally lower (per-method split 2026-05-22)
 
     def test_unknown_county_falls_back(self, unknown_loader):
         assert unknown_loader._thresholds is THRESHOLDS
@@ -276,9 +276,9 @@ class TestLoaderFloorWiring:
         hills.load_from_dataframe(df, skip_duplicates=False)
         pin.load_from_dataframe(df, skip_duplicates=False)
 
-        # First call = Hillsborough (floor 75), second = Pinellas (floor 65)
+        # Hillsborough uses default address floor (75); Pinellas uses per-method split (60)
         assert called_thresholds[0] == 75
-        assert called_thresholds[1] == 65
+        assert called_thresholds[1] == 60  # address_floor intentionally 60 (2026-05-22 split)
 
     def test_lis_pendens_owner_name_floor_is_county_aware(self, monkeypatch):
         from src.loaders.lis_pendens import LisPendensLoader

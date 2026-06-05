@@ -84,11 +84,84 @@ class TestExistingBehaviorPreserved:
         assert BaseLoader.normalize_owner_name(None) == ""
 
 
+class TestEstateOf:
+    """Bug fix: 'ESTATE OF' must strip as a unit so 'OF' is not left as residue."""
+
+    def test_estate_of_prefix_stripped(self):
+        # "ESTATE OF JOHN SMITH" → "JOHN SMITH", not "OF JOHN SMITH"
+        out = BaseLoader.normalize_owner_name("ESTATE OF JOHN SMITH")
+        assert "OF" not in out.split()
+        assert "ESTATE" not in out
+        assert "JOHN" in out and "SMITH" in out
+
+    def test_estate_of_phrase_in_noise_list(self):
+        assert "ESTATE OF" in _OWNER_NAME_NOISE_PHRASES
+
+    def test_plain_estate_suffix_still_stripped(self):
+        # Existing behaviour: "SMITH JOHN ESTATE" → "SMITH JOHN"
+        assert BaseLoader.normalize_owner_name("SMITH JOHN ESTATE") == "SMITH JOHN"
+
+    def test_estate_of_strips_unit_leaving_name_only(self):
+        # "ESTATE OF JOHN SMITH HEIRS" — only ESTATE OF is noise; HEIRS stays
+        out = BaseLoader.normalize_owner_name("ESTATE OF JOHN SMITH HEIRS")
+        assert "ESTATE" not in out
+        assert "OF" not in out.split()
+        assert "JOHN" in out and "SMITH" in out
+
+
+class _StubLoader(BaseLoader):
+    """Minimal concrete BaseLoader for TestOwnerNameMultiCommaOrder."""
+    def load_from_dataframe(self, df, skip_duplicates=True):
+        return (0, 0, 0)
+
+
+class TestOwnerNameMultiCommaOrder:
+    """Bug fix: full string must be tried first so 'SMITH, JOHN' → 100% not 67%."""
+
+    def test_full_string_first_in_segment_list(self):
+        from unittest.mock import MagicMock, patch
+
+        loader = _StubLoader(session=MagicMock(), county_id="pinellas")
+
+        tried: list = []
+
+        def capture(self_inner, name, threshold=80):
+            tried.append(name)
+            return None  # no match, let it exhaust all segments
+
+        with patch.object(BaseLoader, "find_property_by_owner_name", capture):
+            loader.find_property_by_owner_name_multi("SMITH, JOHN", threshold=65)
+
+        # Full un-split string must be the very first attempt
+        assert tried[0] == "SMITH, JOHN", (
+            f"Expected full string first, got {tried[0]!r}. "
+            "Comma-split ordering is wrong — Pinellas LAST, FIRST names return at ~67% instead of 100%."
+        )
+
+    def test_single_name_no_comma_unchanged(self):
+        from unittest.mock import MagicMock, patch
+
+        loader = _StubLoader(session=MagicMock(), county_id="pinellas")
+
+        tried: list = []
+
+        def capture(self_inner, name, threshold=80):
+            tried.append(name)
+            return None
+
+        with patch.object(BaseLoader, "find_property_by_owner_name", capture):
+            loader.find_property_by_owner_name_multi("SMITH JOHN", threshold=65)
+
+        # No comma → exactly one segment, behaviour unchanged
+        assert tried == ["SMITH JOHN"]
+
+
 class TestSharedListsExported:
     def test_phrase_list_includes_required_entries(self):
         assert "AS TRUSTEE OF THE" in _OWNER_NAME_NOISE_PHRASES
         assert "AS NOMINEE FOR" in _OWNER_NAME_NOISE_PHRASES
         assert "SUCCESSOR IN INTEREST" in _OWNER_NAME_NOISE_PHRASES
+        assert "ESTATE OF" in _OWNER_NAME_NOISE_PHRASES
 
     def test_suffix_list_includes_new_tokens(self):
         for token in ("EST", "INDIVIDUALLY", "AKA", "FKA", "NKA", "REV", "IRREV"):
@@ -124,7 +197,7 @@ class TestCountyAwareThresholds:
         assert pin.review_min == 0.65
         assert pin.legal_desc_floor == 65
         assert pin.owner_name_floor == 65
-        assert pin.address_floor == 65
+        assert pin.address_floor == 60  # intentionally lower (per-method split 2026-05-22)
 
     def test_hillsborough_uses_default(self):
         from config.matching import for_county

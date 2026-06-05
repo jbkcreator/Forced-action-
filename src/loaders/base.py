@@ -62,6 +62,9 @@ _OWNER_NAME_NOISE_PHRASES: tuple[str, ...] = (
     "CLAIMING BY",
     "TRUSTEE OF THE",
     "TRUSTEE OF",
+    # Probate/decedent prefix — "ESTATE OF JOHN SMITH" must strip as a unit
+    # so Phase 2 ("ESTATE" single-token suffix) doesn't leave residual "OF".
+    "ESTATE OF",
     # Trust compound phrases — surface in deeds (e.g. "MORGAN FAMILY LIVING
     # TRUST DATED MAY 7 2026"). Stripping the trust descriptor leaves the
     # family/surname token which is what the property table actually stores.
@@ -819,17 +822,23 @@ class BaseLoader(ABC):
         Like find_property_by_owner_name but handles comma-separated multi-party
         fields (e.g. "KUMP LEOPOLD A, KUMP CARMEN M" or trust/multi-grantor strings).
 
-        Splits on commas and tries each segment individually, returning the first
-        match that meets the threshold. Falls back to the full string last so that
-        single-name callers see identical behaviour.
+        For comma-containing names the full unsplit string is tried first. Pinellas
+        ORI uses "LAST, FIRST" format; normalize_owner_name strips the comma so the
+        full string scores 100% without needing to try segments. Individual segments
+        are fallback for multi-grantor fields where the combined string scores too
+        low and each party must be matched separately. Single-name callers (no comma)
+        are unaffected.
         """
         if pd.isna(raw_name) or not raw_name:
             return None
 
         segments = [s.strip() for s in str(raw_name).split(',') if s.strip()]
-        # Try individual segments first; full string last (deduped)
+        # Full string first: "SMITH, JOHN" normalises comma away → "SMITH JOHN"
+        # (100% match). Individual segments are fallback for multi-grantor fields
+        # like "KUMP LEOPOLD A, KUMP CARMEN M" where the combined string scores
+        # too low and each party needs to be tried separately.
         if len(segments) > 1:
-            segments.append(str(raw_name))  # full string as final fallback
+            segments = [str(raw_name)] + segments
 
         for segment in segments:
             result = self.find_property_by_owner_name(segment, threshold=threshold)
