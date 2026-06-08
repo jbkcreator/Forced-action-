@@ -452,8 +452,8 @@ tbody td { padding: 3.5px 6px; color: #334155; }
           <th>Tier</th><th class="r">Today</th><th class="r">% of Today</th><th class="r">7-Day Avg</th><th class="r">This Week</th><th class="r">Weekly Target</th><th class="r">Pace</th>
         </tr></thead>
         <tbody>
-        {% set t = exec_summary.leads_today %}
-        {% for tier_name, cnt in tiers.items() %}
+        {% set t = tier_counts_today.values() | sum %}
+        {% for tier_name, cnt in tier_counts_today.items() %}
         {% set avg = tier_7day_avg.get(tier_name, 0) %}
         {% set wk = tier_this_week.get(tier_name, 0) %}
         <tr>
