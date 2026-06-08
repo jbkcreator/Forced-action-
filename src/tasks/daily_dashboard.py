@@ -2680,6 +2680,7 @@ def collect_dashboard_data(session, run_date: date) -> dict:
         "county_performance_snapshots": county_performance_snapshots,
         "future_counties": future_counties,
         "tiers": tiers,
+        "tier_counts_today": tier_counts_today["counts"],
         "tier_history": tier_history,
         "weekly_tier_history": _fetch_weekly_tier_history(session, run_date, active_counties),
         "tier_7day_avg": tier_7day_avg,
