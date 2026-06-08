@@ -61,7 +61,7 @@ def _candidate_subscriber_ids(db, since) -> List[int]:
         select(PremiumPurchase.subscriber_id).where(
             PremiumPurchase.paid_via == "card",
             PremiumPurchase.status.in_(("pending", "delivered")),
-            PremiumPurchase.created_at >= since,
+            PremiumPurchase.purchased_at >= since,
         ).distinct()
     ).scalars().all()
 
