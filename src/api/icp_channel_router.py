@@ -36,7 +36,7 @@ from config.icp_channels import (
     is_gate_required,
 )
 from src.api.admin_router import get_current_admin
-from src.core.database import get_db_context
+from src.api.deps import get_db as _get_db
 from src.services.icp_kill_switch import (
     compute_icp_gate_snapshot,
     gate_blocking_reasons,
@@ -46,11 +46,6 @@ from src.services.icp_kill_switch import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/admin/icp-channels", tags=["icp-channels"])
-
-
-def _get_db():
-    with get_db_context() as db:
-        yield db
 
 
 # ── request models ────────────────────────────────────────────────────────────

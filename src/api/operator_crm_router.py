@@ -39,7 +39,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from src.api.admin_router import get_current_admin, get_db
+from src.api.admin_router import get_current_admin
+from src.api.deps import get_db
 from src.core.models import (
     DealOutcome,
     DealPipelineEvent,

@@ -20,6 +20,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from src.core.database import get_db_context
+from src.api.deps import get_db
 from src.core.models import ChatSession
 from src.services.concierge_chat import handle_user_turn
 from src.services.rate_limit import enforce_or_429
@@ -30,11 +31,6 @@ router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 SESSION_COOKIE = "chat_session_id"
 SESSION_TTL_DAYS = 30
-
-
-def get_db():
-    with get_db_context() as db:
-        yield db
 
 
 class SendMessageRequest(BaseModel):

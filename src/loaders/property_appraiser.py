@@ -13,7 +13,7 @@ Multi-county:
 
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Optional, Tuple
 
 import pandas as pd
@@ -103,7 +103,7 @@ class PropertyAppraiserLoader(BaseLoader):
         _set_if_present(prop, "lot_size",               _float(row.get("lot_size")))
         _set_if_present(prop, "property_use_code",      row.get("property_use_code"))
         _set_if_present(prop, "building_condition",     row.get("building_condition"))
-        _set_if_present(prop, "building_class",         row.get("building_class"))
+        _set_if_present(prop, "building_class",         _short_str(row.get("building_class"), 5))
         _set_if_present(prop, "heated_sq_ft",           _float(row.get("heated_sq_ft")))
         _set_if_present(prop, "subdivision",            row.get("subdivision"))
         _set_if_present(prop, "hcpa_neighborhood_code", row.get("neighborhood_code"))
@@ -141,7 +141,7 @@ class PropertyAppraiserLoader(BaseLoader):
             owner = Owner(property_id=prop.id, county_id=self.county_id)
             self.session.add(owner)
 
-        _set_if_present(owner, "name",           owner_name)
+        _set_if_present(owner, "owner_name",     owner_name)
         _set_if_present(owner, "mailing_address", mailing_address)
 
         # Absentee status: matching addresses = owner-occupied, different = absentee
@@ -160,22 +160,22 @@ class PropertyAppraiserLoader(BaseLoader):
 
         # Core valuations
         _set_if_present(fin, "assessed_value_mkt",   _float(row.get("market_value")))
-        _set_if_present(fin, "assessed_value_tax",   _float(row.get("county_taxable_value") or row.get("county_assessed_value")))
-        _set_if_present(fin, "homestead_exempt",     bool(row.get("homestead_exempt")) if row.get("homestead_exempt") is not None else None)
+        _set_if_present(fin, "assessed_value_tax",   _float(_coalesce(row.get("county_taxable_value"), row.get("county_assessed_value"))))
+        _set_if_present(fin, "homestead_exempt",     _bool(row.get("homestead_exempt")))
 
         # HCPA enrichment fields
-        _set_if_present(fin, "exemption_code",           row.get("exemption_code"))
+        _set_if_present(fin, "exemption_code",           _str_or_none(row.get("exemption_code")))
         _set_if_present(fin, "soh_assessment_reduction", _float(row.get("soh_assessment_reduction")))
         _set_if_present(fin, "taxable_value_county",     _float(row.get("county_taxable_value")))
         _set_if_present(fin, "taxable_value_schools",    _float(row.get("school_taxable_value")))
         _set_if_present(fin, "prior_year_market_value",  _float(row.get("prior_year_market_value")))
         _set_if_present(fin, "proposed_next_assessed",   _float(row.get("proposed_next_assessed")))
-        _set_if_present(fin, "tax_current_status",       row.get("tax_status"))
+        _set_if_present(fin, "tax_current_status",       _str_or_none(row.get("tax_status")))
         _set_if_present(fin, "tax_last_paid_amount",     _float(row.get("tax_last_paid_amount")))
-        _set_if_present(fin, "tax_last_paid_date",       row.get("tax_last_paid_date"))
+        _set_if_present(fin, "tax_last_paid_date",       _date_or_none(row.get("tax_last_paid_date")))
 
         # Sales
-        _set_if_present(fin, "last_sale_date",  row.get("last_sale_date"))
+        _set_if_present(fin, "last_sale_date",  _date_or_none(row.get("last_sale_date")))
         _set_if_present(fin, "last_sale_price", _float(row.get("last_sale_price")))
 
         # Derived: value_change_yoy
@@ -256,23 +256,88 @@ class PropertyAppraiserLoader(BaseLoader):
 
 def _set_if_present(obj, attr: str, value) -> None:
     """Set obj.attr = value only if value is not None."""
-    if value is not None:
+    if not _missing(value):
         setattr(obj, attr, value)
 
 
-def _float(v) -> Optional[float]:
+def _missing(v) -> bool:
     if v is None:
+        return True
+    try:
+        return bool(pd.isna(v))
+    except (TypeError, ValueError):
+        return False
+
+
+def _coalesce(*values):
+    for value in values:
+        if not _missing(value):
+            return value
+    return None
+
+
+def _float(v) -> Optional[float]:
+    if _missing(v):
         return None
     try:
-        return float(v)
+        value = float(v)
+        return None if _missing(value) else value
     except (TypeError, ValueError):
         return None
 
 
 def _int(v) -> Optional[int]:
-    if v is None:
+    if _missing(v):
         return None
     try:
         return int(v)
     except (TypeError, ValueError):
         return None
+
+
+def _short_str(v, max_len: int) -> Optional[str]:
+    value = _str_or_none(v)
+    if value is None:
+        return None
+    if len(value) > max_len:
+        return None
+    return value
+
+
+def _str_or_none(v) -> Optional[str]:
+    if _missing(v):
+        return None
+    value = str(v).strip()
+    return value or None
+
+
+def _bool(v) -> Optional[bool]:
+    if _missing(v):
+        return None
+    if isinstance(v, bool):
+        return v
+    value = str(v).strip().lower()
+    if value in {"true", "t", "yes", "y", "1"}:
+        return True
+    if value in {"false", "f", "no", "n", "0"}:
+        return False
+    return bool(v)
+
+
+def _date_or_none(v) -> Optional[date]:
+    if _missing(v):
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    if isinstance(v, str):
+        value = v.strip()
+        if not value:
+            return None
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%B %d, %Y", "%b %d, %Y"):
+            try:
+                return datetime.strptime(value, fmt).date()
+            except ValueError:
+                continue
+    return None

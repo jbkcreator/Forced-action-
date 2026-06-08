@@ -17,11 +17,13 @@ Called by pa_engine.py.
 """
 
 import logging
+import html as html_lib
 import re
 import tempfile
 import time
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urljoin
 
 import requests
 from playwright.sync_api import sync_playwright, Page, BrowserContext, TimeoutError as PlaywrightTimeout
@@ -46,9 +48,33 @@ _SEL_TRIM_LINK     = "a:has-text('TRIM'), a[href*='trim'], a:has-text('Download 
 _SEL_TAX_LINK      = "a:has-text('Tax Collector'), a[href*='county-taxes'], button:has-text('Tax Collector')"
 _SEL_DETAIL_READY  = ".property-info, table.property-details, .parcel-info, div.ng-scope"
 
+_PCPAO_BASE_URL = "https://www.pcpao.gov"
+_PCPAO_DETAIL_READY = "#property_summary, #tblLastYearValue, #div-property-information"
+_PCPAO_RESULT_LINKS = (
+    "a[href*='/property-details'], "
+    "a[href*='property-details?s='], "
+    "table a[href*='property-details']"
+)
+_PCPAO_PARCEL_RADIO = "input#dogradio3[name='home_search_options'][value='parcel_number']"
+_PCPAO_KEYWORD_INPUTS = "input#txtKeyWord, input#txtSearchProperty, .select2-search__field, input[placeholder*='14-31-15']"
+_PCPAO_SEARCH_BUTTON = "#btnHomeQuickSearch, button:has-text('Search')"
+
 
 def _is_alphanumeric(s: str) -> bool:
     return bool(re.search(r"[A-Za-z]", s or ""))
+
+
+def hyphenate_pinellas_parcel(parcel_id: str) -> str:
+    """
+    Convert Pinellas compact parcel number to PCPAO public format.
+
+    PCPAO parcel numbers use RR-TT-SS-BBBBB-BBB-LLLL. The local DB stores the
+    same value compacted without hyphens after the one-time Pinellas backfill.
+    """
+    digits = re.sub(r"\D", "", parcel_id or "")
+    if len(digits) != 18:
+        return parcel_id
+    return f"{digits[0:2]}-{digits[2:4]}-{digits[4:6]}-{digits[6:11]}-{digits[11:14]}-{digits[14:18]}"
 
 
 class HCPAScraper:
@@ -327,4 +353,297 @@ class HCPAScraper:
             return self._extract_text(page)
         except Exception as e:
             logger.warning("Tax Collector navigation failed: %s", e)
+            return ""
+
+
+class PCPAOScraper(HCPAScraper):
+    """
+    Sync Playwright scraper for Pinellas County Property Appraiser (PCPAO).
+
+    The public detail URL needs PCPAO's internal `s` key, so this searches by
+    the hyphenated public parcel number and opens the first property-details
+    result instead of trying to synthesize the final detail URL.
+    """
+
+    def scrape_property(self, parcel_id: str) -> dict:
+        result = {
+            "parcel_id":     parcel_id,
+            "hcpa_text":     None,
+            "hcpa_html":     None,
+            "trim_pdf_path": None,
+            "tax_text":      None,
+            "errors":        [],
+        }
+
+        page: Page = self._context.new_page()
+        try:
+            reached = self._search_and_open_pcpao(page, parcel_id)
+            if not reached:
+                result["errors"].append(f"No PCPAO search result found for {parcel_id}")
+                return result
+
+            result["hcpa_text"] = self._extract_text(page)
+            result["hcpa_html"] = page.content()
+
+            try:
+                pdf_path = self._download_trim_from_page(page, parcel_id)
+                result["trim_pdf_path"] = str(pdf_path) if pdf_path else None
+            except Exception as e:
+                logger.info("PCPAO TRIM not available for %s: %s", parcel_id, e)
+                result["errors"].append(f"TRIM: {e}")
+
+            time.sleep(self._throttle_s)
+
+            try:
+                result["tax_text"] = self._click_tax_and_scrape(page)
+            except Exception as e:
+                logger.warning("Pinellas Tax Collector failed for %s: %s", parcel_id, e)
+                result["errors"].append(f"Tax Collector: {e}")
+        finally:
+            page.close()
+
+        return result
+
+    def _search_and_open_pcpao(self, page: Page, parcel_id: str) -> bool:
+        public_parcel = hyphenate_pinellas_parcel(parcel_id)
+
+        try:
+            detail_url = self._lookup_pcpao_detail_url(public_parcel)
+            if detail_url:
+                page.goto(detail_url, wait_until="domcontentloaded", timeout=30000)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=5000)
+                except PlaywrightTimeout:
+                    pass
+                self._wait_for_pcpao_detail(page, parcel_id, public_parcel)
+                page.wait_for_timeout(1000)
+                logger.debug("PCPAO detail page loaded via search API: %s", page.url)
+                return True
+
+            page.goto(f"{_PCPAO_BASE_URL}/quick-search?qu=1", wait_until="networkidle", timeout=30000)
+            page.wait_for_selector(_PCPAO_KEYWORD_INPUTS, timeout=15000)
+
+            radio = page.locator(_PCPAO_PARCEL_RADIO).first
+            if radio.count() and not radio.is_checked():
+                radio.click(force=True)
+                page.wait_for_timeout(700)
+
+            keyword = self._pcpao_visible_keyword_input(page)
+            keyword.fill("")
+            keyword.type(public_parcel, delay=40)
+            page.wait_for_timeout(500)
+            self._dispatch_pcpao_search_events(page, public_parcel)
+
+            # PCPAO starts searching automatically after the masked parcel input
+            # is complete. Pressing Enter is harmless when auto-search already ran,
+            # and helps if the JS event is delayed in headless Chromium.
+            keyword.press("Enter")
+            page.wait_for_timeout(500)
+
+            button = page.locator(_PCPAO_SEARCH_BUTTON).first
+            if button.count():
+                try:
+                    button.click(force=True, timeout=3000)
+                except Exception:
+                    pass
+
+            if self._is_pcpao_detail_page(page):
+                return True
+
+            link = page.locator(f"a[href*='property-details'][href*='{public_parcel}'], {_PCPAO_RESULT_LINKS}").first
+            link.wait_for(state="visible", timeout=20000)
+            href = link.get_attribute("href")
+            if href:
+                page.goto(urljoin(_PCPAO_BASE_URL, href), wait_until="networkidle", timeout=30000)
+            else:
+                link.click()
+            page.wait_for_selector(_PCPAO_DETAIL_READY, timeout=15000)
+            page.wait_for_timeout(1000)
+            logger.debug("PCPAO detail page loaded: %s", page.url)
+            return True
+        except PlaywrightTimeout:
+            if self._pcpao_detail_content_present(page, public_parcel):
+                logger.debug("PCPAO detail content accepted after timeout for %s", parcel_id)
+                return True
+            self._dump_pcpao_debug(page, parcel_id, public_parcel)
+            logger.debug("No PCPAO result for %s (%s)", parcel_id, public_parcel)
+            return False
+        except Exception as e:
+            if self._pcpao_detail_content_present(page, public_parcel):
+                logger.debug("PCPAO detail content accepted after exception for %s: %s", parcel_id, e)
+                return True
+            self._dump_pcpao_debug(page, parcel_id, public_parcel)
+            logger.warning("PCPAO search failed for %s: %s", parcel_id, e)
+            return False
+
+    def _wait_for_pcpao_detail(self, page: Page, parcel_id: str, public_parcel: str) -> None:
+        try:
+            page.wait_for_selector(_PCPAO_DETAIL_READY, timeout=15000)
+            return
+        except PlaywrightTimeout:
+            if self._pcpao_detail_content_present(page, public_parcel):
+                logger.debug("PCPAO detail content present despite selector timeout for %s", parcel_id)
+                return
+            raise
+
+    def _pcpao_detail_content_present(self, page: Page, public_parcel: str) -> bool:
+        try:
+            html = page.content()
+        except Exception:
+            return False
+        return "property_summary" in html or "Parcel Summary" in html or public_parcel in html
+
+    def _lookup_pcpao_detail_url(self, public_parcel: str) -> Optional[str]:
+        """
+        Ask PCPAO's DataTables search endpoint for the real detail URL.
+
+        The detail page needs PCPAO's internal `s` value. The quick-search API
+        returns links with that value, so this is more reliable than replaying
+        the custom radio/masked-input UI.
+        """
+        try:
+            resp = requests.post(
+                f"{_PCPAO_BASE_URL}/dal/quicksearch/searchProperty",
+                data={
+                    "draw": "1",
+                    "start": "0",
+                    "length": "10",
+                    "input": public_parcel,
+                    "searchsort": "parcel_number",
+                    "url": _PCPAO_BASE_URL,
+                },
+                headers={"User-Agent": STEALTH_UA, "Referer": f"{_PCPAO_BASE_URL}/quick-search?qu=1"},
+                timeout=20,
+            )
+            if resp.status_code != 200:
+                logger.debug("PCPAO search API HTTP %s for %s", resp.status_code, public_parcel)
+                return None
+            payload = resp.json()
+            if int(payload.get("recordsTotal") or 0) < 1:
+                logger.debug("PCPAO search API returned no rows for %s", public_parcel)
+                return None
+            for row in payload.get("data") or []:
+                for cell in row:
+                    match = re.search(r'href=\\"([^\\"]*property-details[^\\"]*)\\"|href="([^"]*property-details[^"]*)"', str(cell))
+                    if match:
+                        href = html_lib.unescape(match.group(1) or match.group(2))
+                        return urljoin(_PCPAO_BASE_URL, href.replace("\\/", "/"))
+            return None
+        except Exception as e:
+            logger.debug("PCPAO search API failed for %s: %s", public_parcel, e)
+            return None
+
+    def _pcpao_visible_keyword_input(self, page: Page):
+        inputs = page.locator(_PCPAO_KEYWORD_INPUTS)
+        count = inputs.count()
+        for idx in range(count):
+            candidate = inputs.nth(idx)
+            try:
+                if candidate.is_visible() and candidate.is_editable():
+                    candidate.click(force=True)
+                    return candidate
+            except Exception:
+                continue
+        candidate = inputs.first
+        candidate.wait_for(state="visible", timeout=10000)
+        candidate.click(force=True)
+        return candidate
+
+    def _dispatch_pcpao_search_events(self, page: Page, public_parcel: str) -> None:
+        """Wake PCPAO's masked-input/search JavaScript after Playwright typing."""
+        try:
+            page.evaluate(
+                """(value) => {
+                    const el = document.querySelector('#txtKeyWord, #txtSearchProperty');
+                    if (!el) return;
+                    el.value = value;
+                    for (const name of ['input', 'change', 'keyup', 'blur']) {
+                        el.dispatchEvent(new Event(name, { bubbles: true }));
+                    }
+                    if (window.jQuery) {
+                        window.jQuery(el).val(value).trigger('input').trigger('change').trigger('keyup');
+                    }
+                }""",
+                public_parcel,
+            )
+        except Exception:
+            pass
+
+    def _dump_pcpao_debug(self, page: Page, parcel_id: str, public_parcel: str) -> None:
+        try:
+            debug_dir = Path("reports/audit/pcpao_debug")
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", parcel_id)
+            html_path = debug_dir / f"{safe_id}.html"
+            png_path = debug_dir / f"{safe_id}.png"
+            html_path.write_text(page.content(), encoding="utf-8")
+            page.screenshot(path=str(png_path), full_page=True)
+            logger.warning(
+                "PCPAO search failed for %s (%s); debug saved html=%s screenshot=%s url=%s",
+                parcel_id,
+                public_parcel,
+                html_path,
+                png_path,
+                page.url,
+            )
+        except Exception as e:
+            logger.debug("Could not save PCPAO debug dump for %s: %s", parcel_id, e)
+
+    def _is_pcpao_detail_page(self, page: Page) -> bool:
+        try:
+            return page.locator(_PCPAO_DETAIL_READY).count() > 0
+        except Exception:
+            return False
+
+    def _download_trim_from_page(self, page: Page, parcel_id: str) -> Optional[Path]:
+        trim_locator = page.locator("a:has-text('TRIM Notice'), a[href*='trimNotice']").first
+        try:
+            trim_locator.wait_for(state="visible", timeout=4000)
+        except PlaywrightTimeout:
+            logger.debug("PCPAO TRIM link not visible for %s", parcel_id)
+            return None
+
+        href = trim_locator.get_attribute("href")
+        if not href:
+            return None
+
+        safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", parcel_id)
+        dest_path = self._trim_dir / f"trim_{safe_id}.pdf"
+        url = urljoin(_PCPAO_BASE_URL, href)
+
+        try:
+            resp = requests.get(url, timeout=20, headers={"User-Agent": STEALTH_UA})
+            if resp.status_code == 200 and len(resp.content) > 1024:
+                dest_path.write_bytes(resp.content)
+                logger.debug("PCPAO TRIM saved: %s (%d bytes)", dest_path, len(resp.content))
+                return dest_path
+            logger.info("PCPAO TRIM empty/error for %s: HTTP %d", parcel_id, resp.status_code)
+            return None
+        except Exception as e:
+            logger.info("PCPAO TRIM download failed for %s: %s", parcel_id, e)
+            return None
+
+    def _click_tax_and_scrape(self, page: Page) -> str:
+        tax_locator = page.locator("a[href*='county-taxes.com'], a:has-text('Tax Bill')").first
+        try:
+            tax_locator.wait_for(state="visible", timeout=5000)
+        except PlaywrightTimeout:
+            logger.debug("PCPAO tax link not found on detail page")
+            return ""
+
+        try:
+            href = tax_locator.get_attribute("href")
+            if href:
+                page.goto(urljoin(_PCPAO_BASE_URL, href), wait_until="domcontentloaded", timeout=20000)
+            else:
+                tax_locator.click()
+            try:
+                page.wait_for_load_state("networkidle", timeout=5000)
+            except PlaywrightTimeout:
+                pass
+            page.wait_for_timeout(1000)
+            logger.debug("Pinellas tax page: %s", page.url)
+            return self._extract_text(page)
+        except Exception as e:
+            logger.warning("PCPAO tax navigation failed: %s", e)
             return ""

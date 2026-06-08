@@ -178,6 +178,236 @@ def parse_hcpa_page(text: str, html: str) -> dict:
     return {k: v for k, v in data.items() if v is not None}
 
 
+# ---------------------------------------------------------------------------
+# 1b. PCPAO property page (Pinellas)
+# ---------------------------------------------------------------------------
+
+def parse_pcpao_page(text: str, html: str) -> dict:
+    """
+    Extract canonical fields from the Pinellas County Property Appraiser page.
+
+    PCPAO renders stable section/table IDs in the property detail HTML, so this
+    parser reads those sections with BeautifulSoup and emits the same canonical
+    keys the HCPA loader already consumes.
+    """
+    from bs4 import BeautifulSoup
+
+    data: dict = {}
+    soup = BeautifulSoup(html or "", "html.parser")
+
+    def by_id(node_id: str) -> Optional[str]:
+        node = soup.find(id=node_id)
+        if not node:
+            return None
+        value = node.get("value") if node.name == "input" else None
+        return _clean(value or node.get_text(" ", strip=True))
+
+    data["owner_name"] = by_id("first_second_owner")
+    data["site_address"] = _normalize_inline_address(by_id("site_address"))
+    data["mailing_address"] = _normalize_inline_address(by_id("mailling_add"))
+    data["legal_description"] = by_id("legal_full_desc") or by_id("legal_desc") or by_id("lLegal")
+
+    property_use = by_id("property_use")
+    if property_use:
+        m = re.search(r"\b(\d{4})\b", property_use)
+        if m:
+            data["property_use_code"] = m.group(1)
+
+    data["year_built"] = _parse_first_int(by_id("Yrb"))
+    data["heated_sq_ft"] = _parse_float(by_id("tls"))
+    data["gross_sq_ft"] = _parse_float(by_id("tgs"))
+
+    last_year = _first_table_row(soup, "tblLastYearValue")
+    if last_year:
+        data["market_value"] = _parse_amount(last_year.get("Just/Market Value"))
+        data["county_assessed_value"] = _parse_amount(last_year.get("Assessed Value/SOH Cap"))
+        data["county_taxable_value"] = _parse_amount(last_year.get("County Taxable Value"))
+        data["school_taxable_value"] = _parse_amount(last_year.get("School Taxable Value"))
+
+    exemptions = _table_rows(soup, "tblExemptions")
+    if exemptions:
+        current_exemption = _highest_year_row(exemptions)
+        hs = (current_exemption or {}).get("Homestead")
+        if hs is not None:
+            data["homestead_exempt"] = str(hs).strip().upper().startswith(("Y", "YES"))
+
+    history = _table_rows(soup, "tblValueHistory")
+    if history:
+        latest_history = _highest_year_row(history)
+        if latest_history:
+            data.setdefault("prior_year_market_value", _parse_amount(latest_history.get("Just/Market Value")))
+            if "homestead_exempt" not in data:
+                hs = latest_history.get("Homestead Exemption")
+                if hs is not None:
+                    data["homestead_exempt"] = str(hs).strip().upper().startswith(("Y", "YES"))
+
+    sale = _parse_pcpao_latest_sale(soup)
+    if sale:
+        data.update(sale)
+
+    details = _extract_pcpao_building_details(soup, text or "")
+    if details:
+        data["building_details"] = details
+        if "quality" in details:
+            data["building_condition"] = details["quality"]
+        if "heated_sq_ft" not in data and details.get("sub_area_totals", {}).get("heated_sq_ft"):
+            data["heated_sq_ft"] = details["sub_area_totals"]["heated_sq_ft"]
+        if "gross_sq_ft" not in data and details.get("sub_area_totals", {}).get("gross_sq_ft"):
+            data["gross_sq_ft"] = details["sub_area_totals"]["gross_sq_ft"]
+
+    lot_size = _parse_pcpao_lot_size(soup, text or "")
+    if lot_size is not None:
+        data["lot_size"] = lot_size
+
+    return {k: v for k, v in data.items() if v is not None}
+
+
+def _normalize_inline_address(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _parse_first_int(s) -> Optional[int]:
+    if not s:
+        return None
+    m = re.search(r"\d+", str(s))
+    return int(m.group(0)) if m else None
+
+
+def _table_rows(soup, table_id: str) -> list[dict]:
+    table = soup.find("table", id=table_id)
+    if not table:
+        return []
+    headers = [re.sub(r"\s+", " ", th.get_text(" ", strip=True)).strip() for th in table.find_all("th")]
+    rows = []
+    for tr in table.find_all("tr"):
+        cells = [re.sub(r"\s+", " ", td.get_text(" ", strip=True)).strip() for td in tr.find_all("td")]
+        if not cells:
+            continue
+        row = {}
+        for idx, cell in enumerate(cells):
+            key = headers[idx] if idx < len(headers) and headers[idx] else f"col_{idx}"
+            row[key] = cell
+        rows.append(row)
+    return rows
+
+
+def _first_table_row(soup, table_id: str) -> Optional[dict]:
+    rows = _table_rows(soup, table_id)
+    return rows[0] if rows else None
+
+
+def _highest_year_row(rows: list[dict]) -> Optional[dict]:
+    best = None
+    best_year = -1
+    for row in rows:
+        year = _parse_int(row.get("Year"))
+        if year is not None and year > best_year:
+            best = row
+            best_year = year
+    return best
+
+
+def _parse_pcpao_latest_sale(soup) -> dict:
+    data = {}
+    for row in _table_rows(soup, "tblSalesHistory"):
+        sale_date = _parse_date(row.get("Sale Date"))
+        if not sale_date:
+            continue
+        if data.get("last_sale_date") and sale_date <= data["last_sale_date"]:
+            continue
+        data = {
+            "last_sale_date": sale_date,
+            "last_sale_price": _parse_amount(row.get("Price")),
+            "last_sale_qualified": _parse_qualified(row.get("Qualified / Unqualified")),
+            "last_sale_vacant_improved": _clean(row.get("Vacant / Improved")),
+        }
+    return {k: v for k, v in data.items() if v is not None}
+
+
+def _extract_pcpao_building_details(soup, text: str) -> Optional[dict]:
+    details = {}
+
+    structural = soup.find(id=re.compile(r"^structural_\d+$"))
+    if structural:
+        structural_table = None
+        for table in structural.find_all("table"):
+            headers = " ".join(th.get_text(" ", strip=True).lower() for th in table.find_all("th"))
+            if "structural elements" in headers:
+                structural_table = table
+                break
+        for tr in (structural_table.find_all("tr") if structural_table else []):
+            cells = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+            if len(cells) < 2:
+                continue
+            key = re.sub(r"[^a-z0-9]+", "_", cells[0].strip(": ").lower()).strip("_")
+            val = _clean(cells[1])
+            if key and val:
+                details[key] = val
+
+    sub_area_rows = []
+    for table in soup.find_all("table"):
+        headers = [th.get_text(" ", strip=True).lower() for th in table.find_all("th")]
+        if "sub area" not in " ".join(headers):
+            continue
+        for tr in table.find_all("tr"):
+            cells = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+            if len(cells) >= 3:
+                row = {
+                    "sub_area": cells[0].strip(),
+                    "heated_sq_ft": _parse_float(cells[1]),
+                    "gross_sq_ft": _parse_float(cells[2]),
+                }
+                if row["sub_area"].lower().startswith("total area"):
+                    details["sub_area_totals"] = {
+                        "heated_sq_ft": row["heated_sq_ft"],
+                        "gross_sq_ft": row["gross_sq_ft"],
+                    }
+                else:
+                    sub_area_rows.append(row)
+    if sub_area_rows:
+        details["sub_areas"] = sub_area_rows
+
+    extra = _table_rows(soup, "tblExtraFeatures")
+    if extra:
+        details["extra_features"] = extra
+
+    permits = _table_rows(soup, "tblPermit")
+    if permits:
+        details["permits"] = permits
+
+    land_rows = _table_rows(soup, "tblLandInformation")
+    if land_rows:
+        details["land_information"] = land_rows
+
+    parcel_info = _table_rows(soup, "tblParcelInformation")
+    if parcel_info:
+        details["parcel_information"] = parcel_info
+
+    return details if details else None
+
+
+def _parse_pcpao_lot_size(soup, text: str) -> Optional[float]:
+    land_text = ""
+    node = soup.find(id="sw")
+    if node:
+        land_text = node.get_text(" ", strip=True)
+    if not land_text:
+        land_text = text
+
+    m = re.search(r"([\d,.]+)\s*acres?", land_text, re.IGNORECASE)
+    if m:
+        return _parse_float(m.group(1))
+
+    m = re.search(r"([\d,.]+)\s*sf\b", land_text, re.IGNORECASE)
+    if m:
+        sf = _parse_float(m.group(1))
+        return round(sf / 43560, 4) if sf is not None else None
+
+    return None
+
+
 def _tab_field(text: str, label: str) -> Optional[str]:
     """Extract value from a tab-separated 'Label:\tValue' or 'Label\tValue' line."""
     m = re.search(r"^" + re.escape(label) + r":?\s+(.+?)(?:\t|\n|$)", text, re.MULTILINE)

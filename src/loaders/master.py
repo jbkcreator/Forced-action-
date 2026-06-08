@@ -45,6 +45,17 @@ class MasterPropertyLoader(BaseLoader):
         return None
     
     @staticmethod
+    def normalize_parcel_id(parcel_id: str) -> str:
+        """
+        Normalize parcel ID by removing hyphens.
+        Example: 16-29-15-32292-019-0010 -> 162915322920190010
+        """
+        if not parcel_id:
+            return ""
+
+        return parcel_id.replace("-", "")
+
+    @staticmethod
     def _is_valid_small_number(value, max_value: float = 999.9) -> Optional[float]:
         """Validate number fits in NUMERIC(4,1) format (max 999.9)."""
         if pd.isna(value):
@@ -261,7 +272,7 @@ class MasterPropertyLoader(BaseLoader):
 
         for idx, row in df.iterrows():
             # FOLIO is critical - skip if missing/invalid
-            parcel_id = str(row.get('FOLIO', '')).strip()
+            parcel_id = self.normalize_parcel_id(self.nostr(row.get('FOLIO', '')).strip())
             if not parcel_id or parcel_id == 'nan':
                 skip_reasons['no_folio'] += 1
                 skipped += 1

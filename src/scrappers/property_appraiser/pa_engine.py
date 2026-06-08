@@ -46,7 +46,14 @@ _COMMIT_BATCH_SIZE = 100
 # Property query helpers
 # ---------------------------------------------------------------------------
 
-def _query_properties(county_id: str, mode: str, limit: int, stale_days: int, leads_only: bool = False) -> list[dict]:
+def _query_properties(
+    county_id: str,
+    mode: str,
+    limit: int,
+    stale_days: int,
+    leads_only: bool = False,
+    parcel_id: str | None = None,
+) -> list[dict]:
     """Return list of {id, parcel_id} dicts matching the requested mode.
 
     leads_only=True restricts to properties whose most recent distress_score
@@ -56,6 +63,21 @@ def _query_properties(county_id: str, mode: str, limit: int, stale_days: int, le
     from sqlalchemy import text
 
     with get_db_context() as session:
+        if parcel_id:
+            rows = session.execute(
+                text(
+                    """
+                    SELECT id, parcel_id
+                    FROM properties
+                    WHERE county_id = :cid
+                      AND parcel_id = :parcel_id
+                    LIMIT 1
+                    """
+                ),
+                {"cid": county_id, "parcel_id": parcel_id},
+            ).fetchall()
+            return [{"id": r[0], "parcel_id": r[1]} for r in rows]
+
         if leads_only:
             # Join to the latest distress_score per property, keep only qualified=true.
             # DISTINCT ON ordered by score_date DESC picks the most recent row per property.
@@ -92,20 +114,29 @@ def _query_properties(county_id: str, mode: str, limit: int, stale_days: int, le
 # Per-property worker (runs in thread pool)
 # ---------------------------------------------------------------------------
 
-def _scrape_and_parse(prop: dict, config: dict, headful: bool = False, debug: bool = False) -> Optional[pd.DataFrame]:
+def _scrape_and_parse(
+    prop: dict,
+    config: dict,
+    county_id: str = "hillsborough",
+    headful: bool = False,
+    debug: bool = False,
+) -> Optional[pd.DataFrame]:
     """
     Worker function: scrape one property and return a canonical DataFrame row.
     Each call creates its own HCPAScraper instance (one browser per thread
     is held externally by the pool initializer).
     """
-    from src.scrappers.property_appraiser.pa_scraper import HCPAScraper
+    from src.scrappers.property_appraiser.pa_scraper import HCPAScraper, PCPAOScraper
     from src.scrappers.property_appraiser.pa_parser import (
-        parse_hcpa_page, parse_trim_pdf, parse_tax_collector, to_canonical_dataframe
+        parse_hcpa_page, parse_pcpao_page, parse_trim_pdf, parse_tax_collector, to_canonical_dataframe
     )
 
     parcel_id = prop["parcel_id"]
+    use_pinellas = county_id.lower() == "pinellas"
+    scraper_cls = PCPAOScraper if use_pinellas else HCPAScraper
+    page_parser = parse_pcpao_page if use_pinellas else parse_hcpa_page
     try:
-        with HCPAScraper(config, headful=headful) as scraper:
+        with scraper_cls(config, headful=headful) as scraper:
             raw = scraper.scrape_property(parcel_id)
 
         if debug:
@@ -122,7 +153,16 @@ def _scrape_and_parse(prop: dict, config: dict, headful: bool = False, debug: bo
             if raw.get("tax_text"):
                 print(f"\n--- TAX TEXT (first 1500 chars) ---\n{(raw['tax_text'] or '')[:1500]}")
 
-        hcpa = parse_hcpa_page(raw.get("hcpa_text") or "", raw.get("hcpa_html") or "")
+        if not (raw.get("hcpa_text") or raw.get("hcpa_html")):
+            logger.warning(
+                "No property appraiser page content for parcel %s (id=%s): %s",
+                parcel_id,
+                prop["id"],
+                raw.get("errors") or [],
+            )
+            return None
+
+        hcpa = page_parser(raw.get("hcpa_text") or "", raw.get("hcpa_html") or "")
         trim_path = raw.get("trim_pdf_path")
         trim = parse_trim_pdf(trim_path) if trim_path else {}
         # Delete TRIM PDF immediately after parsing — no need to keep it on disk
@@ -137,6 +177,14 @@ def _scrape_and_parse(prop: dict, config: dict, headful: bool = False, debug: bo
             print(f"\n--- PARSED HCPA ---\n{hcpa}")
             print(f"\n--- PARSED TRIM ---\n{trim}")
             print(f"\n--- PARSED TAX  ---\n{tax}")
+
+        if not (hcpa or trim or tax):
+            logger.warning(
+                "Property appraiser parse produced no data for parcel %s (id=%s)",
+                parcel_id,
+                prop["id"],
+            )
+            return None
 
         df = to_canonical_dataframe(hcpa, trim, tax, parcel_id)
         df["_property_id"] = prop["id"]
@@ -168,6 +216,7 @@ async def run_pa_pipeline(
     headful: bool = False,
     debug: bool = False,
     leads_only: bool = False,
+    parcel_id: str | None = None,
 ) -> dict:
     """
     Full enrichment pipeline: query → scrape → parse → load.
@@ -190,7 +239,7 @@ async def run_pa_pipeline(
         pa_config = {}
 
     # Query properties to enrich
-    properties = _query_properties(county_id, mode, limit, stale_days, leads_only=leads_only)
+    properties = _query_properties(county_id, mode, limit, stale_days, leads_only=leads_only, parcel_id=parcel_id)
     if not properties:
         logger.info("No properties to enrich (mode=%s)", mode)
         return {"updated": 0, "skipped": 0, "errors": 0, "duration_s": 0}
@@ -204,7 +253,7 @@ async def run_pa_pipeline(
     loop = asyncio.get_event_loop()
     with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
         futures = {
-            pool.submit(_scrape_and_parse, prop, pa_config, headful, debug): prop
+            pool.submit(_scrape_and_parse, prop, pa_config, county_id, headful, debug): prop
             for prop in properties
         }
         for future in as_completed(futures):
@@ -304,6 +353,7 @@ def main():
     parser.add_argument("--debug", action="store_true", help="Print raw scraped text and parsed fields")
     parser.add_argument("--leads-only", action="store_true",
                         help="Restrict to properties with qualified=true in their latest distress_score (~15k leads)")
+    parser.add_argument("--parcel-id", default=None, help="Scrape one exact parcel_id for debugging")
     args = parser.parse_args()
 
     result = asyncio.run(run_pa_pipeline(
@@ -315,6 +365,7 @@ def main():
         headful=args.headful,
         debug=args.debug,
         leads_only=args.leads_only,
+        parcel_id=args.parcel_id,
     ))
     print(result)
 

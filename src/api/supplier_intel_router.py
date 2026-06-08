@@ -25,18 +25,13 @@ from sqlalchemy.orm import Session
 
 from config.supplier_intel_config import SUPPLIER_INTEL_TIERS, VALID_TIERS
 from src.api.admin_router import get_current_admin
-from src.core.database import get_db_context
+from src.api.deps import get_db as _get_db
 from src.services.supplier_intel.report_engine import generate_report
 from src.services.supplier_intel.subscription import get_current_supplier
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["supplier-intel"])
-
-
-def _get_db():
-    with get_db_context() as db:
-        yield db
 
 
 # ── Request models ─────────────────────────────────────────────────────────────

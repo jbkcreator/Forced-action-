@@ -31,7 +31,7 @@ from config.settings import get_settings
 from src.services.claude_router import call_claude
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
-from src.core.database import get_db_context
+from src.api.deps import get_db
 
 logger = logging.getLogger(__name__)
 
@@ -42,10 +42,6 @@ _MAX_SEARCH_CHARS = 12_000
 # Below this, we never surface a company_linkedin_url (safety rule 9).
 _MIN_CONFIDENCE = 0.70
 
-
-def get_db():
-    with get_db_context() as db:
-        yield db
 
 # ── Auth ────────────────────────────────────────────────────────────────────
 

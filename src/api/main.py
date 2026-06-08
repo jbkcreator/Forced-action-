@@ -44,6 +44,17 @@ from config.constants import TIER_DISPLAY
 from src.utils.logger import setup_logging
 from src.services.rate_limit import enforce_or_429
 from src.services.phone_utils import normalize as normalize_phone
+from src.api.deps import (
+    get_db,
+    VALID_TIERS,
+    VALID_VERTICALS,
+    ZIP_RE as _ZIP_RE,
+    FLORIDA_PREFIXES as _FLORIDA_PREFIXES,
+    ConsentAcceptanceRequest,
+    resolve_phone_with_quality as _resolve_phone_with_quality,
+    estimate_lead_job_value as _estimate_lead_job_value,
+    visible_tier_fields as _visible_tier_fields,
+)
 
 
 # Load config/logging.yaml so every logger.info/warning/error across src/* is
@@ -54,8 +65,7 @@ logger = logging.getLogger(__name__)
 
 
 
-VALID_TIERS = {"starter", "pro", "dominator"}
-VALID_VERTICALS = set(VERTICAL_WEIGHTS.keys())
+# VALID_TIERS and VALID_VERTICALS imported from src.api.deps
 
 
 app = FastAPI(title="Forced Action API", version="1.0.0")
@@ -130,15 +140,6 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
         status_code=500,
         content={"error": "internal_server_error", "message": "An unexpected error occurred"},
     )
-
-
-# ---------------------------------------------------------------------------
-# DB dependency
-# ---------------------------------------------------------------------------
-
-def get_db():
-    with get_db_context() as db:
-        yield db
 
 
 # ---------------------------------------------------------------------------
@@ -478,23 +479,7 @@ def get_pricing_info():
     return {"pricing": _cached_pricing_info()}
 
 
-# ---------------------------------------------------------------------------
-# Shared consent schema — used by checkout, waitlist, and free-signup routes
-# ---------------------------------------------------------------------------
-
-class ConsentAcceptanceRequest(BaseModel):
-    """Incoming consent acceptance payload from the frontend TermsConsentGate."""
-    terms_accepted: bool = Field(..., alias="terms_accepted")
-    terms_version: Optional[str] = None
-    privacy_version: Optional[str] = None
-    accepted_text_hash: Optional[str] = None
-    modal_opened_at: Optional[str] = None
-    modal_scrolled_to_end_at: Optional[str] = None
-    tcpa_accepted: Optional[bool] = Field(default=False, alias="tcpa_accepted")
-    tcpa_consent_text: Optional[str] = None
-    tcpa_consent_version: Optional[str] = None
-    user_agent: Optional[str] = None
-
+# ConsentAcceptanceRequest imported from src.api.deps
 
 # ---------------------------------------------------------------------------
 # POST /api/checkout — Create Stripe checkout session
@@ -1014,8 +999,7 @@ def founding_spots(
 # GET /api/zip-check
 # ---------------------------------------------------------------------------
 
-_ZIP_RE = re.compile(r"^\d{5}$")
-_FLORIDA_PREFIXES = ("33", "34")
+# _ZIP_RE and _FLORIDA_PREFIXES imported from src.api.deps
 
 
 @app.get("/api/zip-check")
@@ -2041,61 +2025,8 @@ def resend_confirmation(payload: ResendConfirmationRequest, db: Session = Depend
     return {"ok": True}
 
 
-def _resolve_phone_with_quality(owner) -> tuple[Optional[str], Optional[dict]]:
-    """
-    Pick the best phone number to display for an owner and return its
-    skip-trace metadata alongside it.
-
-    Iterates phone_1 → phone_2 → phone_3, picking the first non-empty number.
-    Returns (number, metadata) where metadata is the matching slot from
-    `owner.phone_metadata` if present, else None.
-
-    Metadata shape (when present):
-        { "type": "mobile|landline|voip|unknown",
-          "carrier": str | None,
-          "score": int 0-100,
-          "reachable": bool,
-          "tested": bool,
-          "source": "batch_data" | "idi" | "twilio_lookup" }
-    """
-    if not owner:
-        return (None, None)
-    meta_map = owner.phone_metadata or {}
-    for slot in ("phone_1", "phone_2", "phone_3"):
-        number = getattr(owner, slot, None)
-        if number:
-            return (number, meta_map.get(slot))
-    return (None, None)
-
-
-def _estimate_lead_job_value(prop, score) -> dict:
-    """Compute job value estimate for a feed lead."""
-    try:
-        from src.services.job_estimator import estimate_job_value
-        distress_types = score.distress_types or []
-        return estimate_job_value(prop, distress_types)
-    except Exception:
-        return {"low": 0, "high": 0, "display": "N/A", "method": "error"}
-
-
-def _visible_tier_fields(prop, score) -> tuple:
-    """Return (lead_tier, urgency) honoring the county's tier_visibility flag.
-
-    Counties whose tier distribution is not yet cross-county-comparable
-    (set via COUNTY_OVERRIDES[...].tier_visibility = 'internal') return
-    None for both fields so subscribers don't see misleading labels while
-    the calibration retune is in flight. The values remain stored on the
-    DistressScore row for internal analytics.
-    """
-    try:
-        cfg = for_county(getattr(prop, "county_id", None))
-        if cfg.tier_visibility == "internal":
-            return (None, None)
-    except Exception:
-        # If the lookup fails for any reason, fail open (show the tier) —
-        # this is a UI cosmetic decision, not a correctness gate.
-        pass
-    return (score.lead_tier, score.urgency_level)
+# _resolve_phone_with_quality, _estimate_lead_job_value, _visible_tier_fields
+# imported from src.api.deps
 
 
 # ---------------------------------------------------------------------------
@@ -3874,6 +3805,9 @@ def deal_capture(payload: DealCaptureRequest, db: Session = Depends(get_db)):
         deal_amount=payload.deal_amount,
         deal_date=date.today(),
         days_to_close=payload.days_to_close,
+        pipeline_stage="closed_lost" if payload.deal_size_bucket == "skip" else "closed_won",
+        county_id=sub.county_id,
+        trade_vertical=sub.vertical,
     )
     db.add(outcome)
     db.flush()
@@ -3904,6 +3838,12 @@ def deal_capture(payload: DealCaptureRequest, db: Session = Depends(get_db)):
                 graphic_url = f"/api/win-graphic/{outcome.id}"
         except Exception as exc:
             logger.warning("[DealCapture] win graphic gen failed: %s", exc)
+
+        try:
+            from src.services.win_autopsy import record_win_autopsy
+            record_win_autopsy(outcome.id, db)
+        except Exception as exc:
+            logger.warning("[DealCapture] win autopsy failed: %s", exc)
 
     # Stage 5: annual-at-deal-win trigger for $10K+ deals
     is_big = (payload.deal_amount and payload.deal_amount >= 10000) \

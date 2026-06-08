@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Guidance for Claude Code working in this repo.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
 
@@ -12,32 +12,31 @@ AI-powered distressed property intelligence platform for Hillsborough County, FL
 # API server
 uvicorn src.api.main:app --reload --port 8000
 
-# Run a single scraper (scheduled via scripts/cron/crontab.txt)
+# Cora agents (separate process — must run alongside API)
+python -m src.agents --serve          # production
+python -m src.agents --health         # pre-flight check
+python -m src.agents --migrate        # run LangGraph checkpoint migration
+
+# Docker (production — both API + Cora share same image)
+docker compose build
+docker compose up -d
+docker compose logs -f cora
+
+# Run a single scraper
 python -m src.scrappers.foreclosures.foreclosure_engine
 
 # Rescore all properties
 python -m src.services.cds_engine --rescore-all
 
-# Load data
-python scripts/load_data.py --init-db
-python scripts/load_data.py --type violations
-python scripts/load_data.py --all
-
-# DB migrations (Alembic)
-alembic revision --autogenerate -m "Description"
-alembic upgrade head
+# DB migrations (Alembic — multiple heads exist, target by revision ID)
+alembic upgrade <revision_id>
+alembic heads
 
 # Tests
 pytest tests/                                  # default (excludes scenario)
 pytest -m scenario                             # opt-in sandbox e2e
 pytest -m scenario_cora                        # Cora/LangGraph scenarios
-pytest -m scenario_platform                    # cron/webhook/API scenarios
-pytest -m scenario_chat                        # Concierge Chat mocked scenarios
 pytest tests/test_foo.py::test_specific_function
-
-# Install
-pip install -r requirements.txt
-playwright install
 ```
 
 ## Architecture
@@ -48,36 +47,35 @@ Scrapers (`src/scrappers/`) → CSV/DataFrame → Loaders (`src/loaders/`) → P
 **CDS = Composite Distress Score.** Scores 0–100 across 6 verticals. `config/scoring.py` is source of truth — `cds_engine.py` docstring is stale (wrong stacking window/cap/equity scope).
 
 ### Hub-and-Spoke Database
-Central `properties` table (~522k parcels). 1:Many → foreclosures, tax_delinquencies, code_violations, legal_and_liens, building_permits, legal_proceedings, incidents, deeds, **tax_payment_history** (HCPA annual tax payments). 1:1 → owners, financials. Scoring → `distress_scores` (one row per property per day, JSONB `vertical_scores`). `properties` has 8 new HCPA enrichment columns (property_use_code, building_condition, building_class, heated_sq_ft, subdivision, hcpa_neighborhood_code, building_details JSONB, hcpa_last_refreshed). `financials` has 10 new HCPA columns (exemption_code, soh_assessment_reduction, taxable_value_county/schools, prior_year_market_value, proposed_next_assessed, tax_current_status, tax_last_paid_amount/date, hcpa_refreshed_at).
+Central `properties` table (~522k parcels). 1:Many → foreclosures, tax_delinquencies, code_violations, legal_and_liens, building_permits, legal_proceedings, incidents, deeds, **tax_payment_history**. 1:1 → owners, financials. Scoring → `distress_scores` (one row per property per day, JSONB `vertical_scores`). `cora_event_queue` — durable fallback table for Cora events published when Redis is unavailable (fa072). All ORM models in `src/core/models.py`.
 
 ### Subsystems
 
-- **Scrapers** (`src/scrappers/`): Playwright + playwright-stealth, AI fallback via browser-use + Anthropic Claude, Firecrawl for static. Each scraper its own subpackage. **Directory spelled `scrappers` (double p).** `src/scrappers/property_appraiser/` — HCPA enrichment scraper (sync Playwright + ThreadPoolExecutor, no browser-use; URLs deterministic from folio number). Runs daily @ 06:45 UTC (new-only) and weekly Sunday @ 03:00 UTC (refresh). Uses `pdfplumber` annotation reader for TRIM PDFs.
-- **Loaders** (`src/loaders/`): Inherit `BaseLoader` (`base.py`). Property matching waterfall: (1) exact parcel_id, (2) address: ILIKE house# prefix → pg_trgm similarity → rapidfuzz token_sort_ratio ≥75%, (3) owner name: exact ilike → LIKE pattern both word orders → pg_trgm ≥75%. LLM tiebreaker (`llm_matcher.py`) only for borderline name matches, hard budget cap per run. Three-tier outcome: score ≥0.92 or llm_verified → **matched** (written to destination table with `match_confidence`+`match_method`); 0.75–0.92 → **pending_review** (quarantined with `candidate_property_id` for Cora triage); <0.75 → **unmatched**. All destination tables (`foreclosures`, `legal_and_liens`, `deeds`, `legal_proceedings`, `code_violations`) store `match_confidence Numeric(4,3)` and `match_method`. `unmatched_records` stores `match_confidence`, `match_method`, `candidate_property_id`, and `match_status ∈ {unmatched, pending_review, matched, skipped}`. Thresholds in `config/matching.py`. Rematch job: Sunday 03:30 UTC — processes both `unmatched` and `pending_review` rows. Both trgm steps wrapped in `begin_nested()` savepoint — pg_trgm absence won't abort outer transaction.
-- **CDS Engine** (`src/services/cds_engine.py`): 6 verticals × 14+ signals. Weights/thresholds in `config/scoring.py`. Formula: primary_score (base+recency-age_decay) + stacking_bonus (STACKING_WINDOW_DAYS=180, cap=60) + absentee/contact/equity bonuses. Equity bonus applies to ALL 6 verticals (per-vertical rates). Stacking-only signals (`insurance_claim`, `fire`, `storm_damage`, `flood_damage`, `building_permits` non-enforcement) cannot be primary. Dead lead gate: deed transfer <45 days → zero investment verticals. Owner-occupied → zero wholesalers/fix_flip/attorneys. HCPA passive boosts (old building/long-term owner/declining value) stack on top. Batch commit every 1000 properties. After scoring: bulk UPDATE `sync_status='pending_sync'` — no GHL API calls in loop. Tiers: Ultra Platinum(95+) → Platinum(83+) → Gold(57+) → Silver(40+) → Bronze.
-- **API** (`src/api/main.py` + `admin_router.py` + `sandbox_router.py` + `chat_router.py`): FastAPI. Stripe webhooks, checkout, lead feed, JWT-protected admin upload, sandbox scenario harness, static SPA from `src/static/`. `chat_router.py` — Concierge Chat (M5a): `POST /api/chat/messages`, `GET /api/chat/stream` (SSE), `POST /api/chat/sessions`, `POST /api/chat/sessions/{id}/link`, `POST /api/chat/sessions/{id}/escalate`.
-- **Services** (`src/services/`): `stripe_service.py` = outgoing (create checkout sessions, founding vs regular price via SELECT FOR UPDATE). `stripe_webhooks.py` = incoming (5 events: checkout.session.completed → activate subscriber+lock ZIP+GHL; invoice.payment_failed → retry; subscription.deleted → 48hr grace). Idempotency via `stripe_webhook_events` table. GHL push decoupled: `ghl_webhook.py` does 4 API calls per lead (upsert contact → save contact_id → upsert opportunity → tags), 0.5s throttle + 429 backoff. Skip-trace waterfall: Tier 1 `tracerfy_fallback.py` (Tracerfy, $0.25/hit $0/miss, DNC+litigator flags inline) → Tier 2 `skip_trace.py` (BatchData, $0.02 always) → Tier 3 `pdl_skip_trace.py` (PDL, $0.28/hit). All write to `enriched_contacts` + update `Owner.phone_1/email_1`. BatchData pre-fetches filing-derived party names (probate heir / eviction landlord / divorce petitioner / lis pendens defendant) for higher match rates. Tracerfy DNC hits (national_dnc / litigator) written to `sms_opt_outs(source="tracerfy_dnc")` immediately. Monetization: wallet, allotment, bundle, lead_hold, wall, referral, ab, urgency, segmentation, revenue_signal, proactive_save.
-- **Agents** (`src/agents/`): LangGraph (Cora) runtime. Supervisor routes events via dict lookup (no Claude call for routing). 3 graphs: `fomo` (competitor_acted_on_lead → SMS <60s), `abandonment` Wave1+Wave2 (bounce recovery, shared decision_id), `retention` (weekly summary per subscriber tier). Every graph passes through `decision_hierarchy` subgraph (6-step gate: guardrail → learning_card → segment+score → A/B → kill_switch) then `compose_and_send` (Claude writes SMS → compliance check → Telnyx). Kill switch colors: green=send, yellow=fallback template, red=block. All decisions logged to `agent_decisions`. Guardrails in `config/cora_guardrails.py`.
-- **Tasks** (`src/tasks/`): Scheduled jobs — scraper orchestration, Stripe reconcile, grace_expiry, rematch_unmatched, GHL sync, daily/weekly/monthly/annual reports, learning_card_job, lead_quality_monitor, match_rate_monitor, price_escalation, cora_anomaly_check, health_check, run_enrichment, revenue_pulse, weekly_one_pager, **daily_dashboard** (10-section PDF to `reports/daily_dashboard/`, 10:00 UTC Mon-Sat, 30-day retention, Jinja2 + Playwright PDF, completely separate from `daily_report.py`), **dnc_refresh** (monthly Tracerfy /dnc/scrub/ batch re-scrub, 1st of month 02:00 UTC — keeps stored DNC data within FTC 31-day safe harbor; 1 credit/phone, writes new hits to `sms_opt_outs`).
+- **Scrapers** (`src/scrappers/`): Playwright + playwright-stealth, AI fallback via browser-use + Anthropic Claude, Firecrawl for static. **Directory spelled `scrappers` (double p).** Proxy (Oxylabs) commented out from all scrapers **except** `foreclosures/`. Fire incidents: Tampa Fire Rescue JSON API (`ncapps.tampagov.net/callsforservice/TFR/GetTFRCallsForService`) — not HCSO portal. Storm/flood/fire use NWS forecast zones from `County.nws_zone` DB column (comma-separated for multi-zone counties, e.g. Hillsborough `FLZ151,FLZ251`). Both Hillsborough and Pinellas are in cron for all weather scrapers.
 
-### Database Access
-```python
-from src.core.database import Database
-db = Database()
-with db.session_scope() as session:
-    # Auto-commit on success, auto-rollback on exception
-    session.add(obj)
-```
-All ORM models in `src/core/models.py`. Polymorphic `record_type` on LegalAndLien. JSONB metadata on legal_proceedings + distress_scores. Check constraints on enum fields.
+- **Loaders** (`src/loaders/`): Inherit `BaseLoader` (`base.py`). Property matching waterfall: (1) exact parcel_id, (2) address: ILIKE house# prefix → pg_trgm similarity → rapidfuzz token_sort_ratio ≥75%, (3) owner name: exact ilike → LIKE pattern → pg_trgm ≥75%. Three-tier outcome: ≥0.92 → **matched**; 0.75–0.92 → **pending_review**; <0.75 → **unmatched**. Thresholds in `config/matching.py`. Pinellas stopgap: `review_min=0.65`.
+
+- **CDS Engine** (`src/services/cds_engine.py`): 6 verticals × 14+ signals. Formula: primary_score + stacking_bonus (STACKING_WINDOW_DAYS=180, cap=60) + absentee/contact/equity bonuses. Stacking-only signals: `insurance_claim`, `fire`, `storm_damage`, `flood_damage`, `building_permits` non-enforcement. Dead lead gate: deed transfer <45 days → zero investment verticals. Tiers: Ultra Platinum(95+) → Platinum(83+) → Gold(57+) → Silver(40+) → Bronze.
+
+- **API** (`src/api/`): FastAPI. **Static files (React SPA) are served by Nginx — not FastAPI.** `main.py` mounts all routers. `deps.py` — shared primitives imported by all routers: `get_db`, `VALID_TIERS`, `VALID_VERTICALS`, `ZIP_RE`. Every router imports `get_db` from `deps.py`. Stripe webhooks at `/webhooks/stripe`, all API routes under `/api/`.
+
+- **Services** (`src/services/`): `stripe_service.py` = outgoing. `stripe_webhooks.py` = incoming. `kill_switch_service.py` — `get_cached_metric()` + `get_kill_switch_status()` for non-agents code (use this, never import from `src.agents.tools` in services). `lead_pool_service.py` — `get_lead_pool()` + `get_zip_activity()` wrappers for API use. Skip-trace waterfall: Tracerfy → BatchData → PDL.
+
+- **Agents** (`src/agents/`): LangGraph (Cora) runtime. **Runs as a separate process/container from FastAPI.** Entry point: `python -m src.agents --serve`. API and Cora communicate **exclusively** through Redis Pub/Sub (`cora:events` channel) and Postgres NOTIFY (`cora_events` channel). **Never call `dispatch_event()` directly from API/services/tasks** — use `publish_cora_event()` from `src.agents.events.ingestion`. If Redis is unavailable, events fall back to `cora_event_queue` Postgres table with 60s sweep. Supervisor routes events via dict lookup (`src/agents/router.py`). 10 graphs. Kill switch colors: green=send, yellow=fallback template, red=block. All decisions logged to `agent_decisions`. Guardrails in `config/cora_guardrails.py`. `kill_switch_metric_ingest.get_cached_metric` re-exports from `kill_switch_service` — import from service layer, not tasks.
+
+- **Tasks** (`src/tasks/`): Scheduled jobs. `daily_report.py` — CSV ops report (runs 08:10 UTC for both Hillsborough and Pinellas). `daily_dashboard.py` — 10-section PDF (23:30 UTC Mon-Sat), separate from daily_report. `dnc_refresh` — monthly Tracerfy DNC re-scrub.
+
+### County Config
+County config is **DB-backed** via `counties` + `county_sources` tables — **not** `config/counties.json`. Read via `src/utils/county_config.py:get_county(county_id)` (5-min cache). `County.nws_zone` supports comma-separated values for multi-zone counties. Hillsborough: `FLZ151,FLZ251`. Pinellas: `FLZ050`.
 
 ### Configuration (`config/`)
-- `settings.py`: Pydantic BaseSettings from `.env`, accessed via `get_settings()` (cached `@lru_cache`).
-- `constants.py`: dir paths, scraper URLs, file patterns.
-- `scoring.py`: CDS weights, thresholds, tier defs.
-- `matching.py`: match tier thresholds (`auto_match=0.92`, `review_min=0.75`, floor thresholds for address/owner_name/legal_desc=75). Per-county overrides via `COUNTY_OVERRIDES` + `for_county(county_id)`; **Pinellas stopgap**: `review_min=0.65`, floors=65 (widens pending_review band while audit-flagged root causes — missing Legal column in ColumnMapper, owner-name normalization — are fixed). Code liens still use hardcoded `name_threshold=90` (false-positive prevention business rule, not a floor).
-- `counties.json` + `src/utils/county_config.py`: per-county portal URLs (Hillsborough only currently).
-- `prompts/`: YAML prompt templates for AI scraping. `chat_concierge.yaml` — Concierge Chat system prompts (pre_signup, post_signup).
-- `agents.py`, `cora_guardrails.py`, `revenue_ladder.py`, `revenue_pulse.py`, `logging.yaml`.
+- `settings.py`: Pydantic BaseSettings from `.env`, accessed via `get_settings()`.
+- `agents.py`: `AgentsSettings(AppSettings)` — LangGraph-specific keys. `AGENTS_EVENT_SOURCE_REDIS=true`, `AGENTS_EVENT_SOURCE_POSTGRES=true` required for full event routing.
+- `scoring.py`: CDS weights/thresholds — source of truth (not cds_engine.py docstring).
+- `matching.py`: match thresholds.
+
+### Deployment
+Single `Dockerfile` at project root. `docker-compose.yml` runs `api` and `cora` as two services from the same image with `network_mode: host` (Postgres + Redis run on the host). Nginx serves React SPA static files and proxies `/api/` + `/webhooks/` to FastAPI on port 8000.
 
 ## Tooling Rules (strict)
 
@@ -85,45 +83,61 @@ All ORM models in `src/core/models.py`. Polymorphic `record_type` on LegalAndLie
 - **Web framework**: FastAPI (no Flask/Django).
 - **ORM**: SQLAlchemy 2.0 style. **Migrations**: Alembic only — never edit schema by hand.
 - **Settings**: Pydantic v2 + pydantic-settings. Never read `os.environ` directly outside `config/settings.py`.
-- **HTTP**: `requests` for sync, `httpx` if async needed. No `urllib`.
-- **Scraping**: Playwright + playwright-stealth. Browser-use + Anthropic for AI fallback. Firecrawl for static pages. No Selenium, no BeautifulSoup-only scrapers (BS4 is for parsing only).
+- **HTTP**: `requests` for sync (`requests_get_with_retry` from `src/utils/http_helpers.py`), `httpx` if async. No `urllib`.
+- **Scraping**: Playwright + playwright-stealth. Browser-use + Anthropic for AI fallback. Firecrawl for static. No Selenium.
 - **Fuzzy matching**: rapidfuzz. No fuzzywuzzy.
 - **Agents**: LangGraph 1.x with Postgres checkpointer. LangSmith for tracing. No raw Anthropic SDK loops for agent flows.
-- **SMS**: Telnyx (replaced Twilio 2026-05-11). All sends go through `src/services/sms_compliance.send_sms` with an explicit `message_type ∈ {marketing, transactional, opt_in_prompt}`. Marketing sends require a recorded `SmsOptIn`. **Voice/AI calls**: Synthflow.
-- **Phone numbers**: every read or write of a phone column MUST go through `src/services/phone_utils.normalize` (strict E.164, US-only). Never `phone.strip()` or ad-hoc regex.
+- **Cora event dispatch**: `publish_cora_event(event_dict)` from `src.agents.events.ingestion` — never `dispatch_event()` from API/services/tasks.
+- **SMS**: Telnyx. All sends via `src/services/sms_compliance.send_sms` with explicit `message_type`. **Voice/AI calls**: Synthflow.
+- **Phone numbers**: every read/write of a phone column MUST go through `src/services/phone_utils.normalize`.
 - **Payments**: Stripe SDK ≥11. All webhook handlers in `src/services/stripe_webhooks.py`.
 - **Cache/rate-limit**: Redis (server). Use `fakeredis` in tests/sandbox.
-- **Auth (admin)**: python-jose JWT.
-- **Testing**: pytest only. Markers: `scenario`, `scenario_cora`, `scenario_platform`, `scenario_chat`. Place unit tests in `tests/`, scenario tests in `tests/scenarios/`, agent tests in `tests/agents/`. Use `conftest.py` fixtures; no ad-hoc DB setup in tests.
-- **Logging**: stdlib `logging` configured via `config/logging.yaml`. No `print()` in `src/`.
-- **File format readers**: dbfread (DBF), xlrd (legacy XLS), pandas (CSV/XLSX).
-- **HTML templating**: Jinja2 3.1+ for `daily_dashboard.py`. Templates live in `src/templates/`.
+- **Testing**: pytest only. Markers: `scenario`, `scenario_cora`, `scenario_platform`, `scenario_chat`. Unit tests in `tests/`, scenario in `tests/scenarios/`, agents in `tests/agents/`.
+- **Logging**: stdlib `logging` via `config/logging.yaml`. No `print()` in `src/`.
 
 ## Important Notes
 
 - Scrapers dir is `src/scrappers/` (double p) — do not rename.
-- `.gitignore` excludes `data/`, `*.txt`, `*.sh`, `reports/` (local scraping output).
-- Required env: `DATABASE_URL`, `ANTHROPIC_API_KEY`. Feature-gated: Stripe, GHL, Synthflow, Telnyx, Oxylabs proxy, IDI/skip-trace APIs, LangSmith.
-- Oxylabs proxy used for IP rotation when configured.
-- County-specific config in `config/counties.json` + `src/utils/county_config.py`.
-- Redis is server-only; locally use fakeredis shim.
-- **Redis STOP cache deferred** (compliance baseline Q9): `sms_compliance.can_send` queries Postgres on every send. The Redis-fronted STOP cache is intentionally postponed until A2P 10DLC approval lands and throughput data justifies the added failure mode. Do not add it ad-hoc.
-- **Tax delinquency scraper DISABLED** (county portal blocks it). Load via `POST /api/admin/upload/tax-delinquency` with admin JWT instead.
-- **Cron ordering dependency (hard-coded stagger, no inter-job signaling):** scrapers 04:00–06:30 → CDS scoring 07:00 → skip trace 07:30 → GHL sync 08:00. Overrun = stale data that day.
-- **GHL sync_status state machine:** `pending_sync` (set by CDS bulk UPDATE) → `synced` (push OK) / `sync_failed` (retried next run). Never lost.
-- **Subscriber feed:** `GET /api/feed/{uuid}` — UUID acts as auth token. Leads filtered by subscriber's ZIP territory + vertical + score threshold. No login required.
-- **`cds_engine.py` docstring is stale** — wrong stacking window (says 60, is 180), wrong cap (says 40, is 60), wrong equity scope (says wholesalers/fix_flip only, is all 6). Always trust `config/scoring.py`.
+- **Tax delinquency scraper DISABLED** — load via `POST /api/admin/upload/tax-delinquency` with admin JWT.
+- **`cds_engine.py` docstring is stale** — always trust `config/scoring.py`.
+- **Cron ordering (hard stagger):** scrapers 04:00–06:30 → CDS 07:00 → skip trace 07:30 → GHL sync 08:00.
+- **GHL sync_status:** `pending_sync` → `synced` / `sync_failed`. Never lost.
+- **Alembic has multiple heads** — always target by revision ID, not `head`. Run `alembic heads` first.
+- **Lead Pack MVP status**: Partially sellable. Missing: county launch gate at checkout, minimum 5-lead count enforcement, 80% enrichment threshold check, `SentLead` rows in webhook fulfillment. Zero test coverage for lead pack flow.
+- Required env: `DATABASE_URL`, `ANTHROPIC_API_KEY`, `REDIS_URL`. Feature-gated: Stripe, GHL, Synthflow, Telnyx, Oxylabs, LangSmith.
+
+## Implementation Standards
+
+### Code Quality
+- All code must be production-grade: typed, structured, and readable without inline comments explaining what is obvious from the code itself.
+- Log at the right level: `INFO` for normal flow milestones, `WARNING` for recoverable issues, `ERROR` for failures requiring attention. Never log raw secrets, tokens, passwords, phone numbers, or PII — log IDs and masked representations only.
+- Every external call (Stripe, Telnyx, Anthropic, GHL, NWS, FEMA, Redis, Postgres) must be wrapped in a try/except with a meaningful log message that includes enough context to diagnose the failure without exposing internals.
+- Functions must have a single clear responsibility. If a function needs a paragraph comment to explain what it does, split it.
+
+### API Error Responses
+- Return the semantically correct HTTP status code — never leak exception messages, stack traces, or internal field names to the client.
+- `400` — malformed request or failed validation. `401` — missing/invalid auth. `403` — authenticated but not authorised. `404` — resource not found. `409` — conflict (duplicate, state violation). `402` — payment required / insufficient funds. `422` — valid JSON but business rule violation. `500` — unexpected server error (log the real cause, return a generic message).
+- Error response shape must be consistent: `{"detail": "<human-readable message>"}`. Never include Python exception text in the response body.
+
+### Data Structures and Algorithms
+- **Choose the right structure for the access pattern before writing any loop.** If you are checking membership or deduplicating → `set`. If you are looking up by key → `dict`. If you are counting or grouping → `Counter` or `defaultdict`. Never iterate a list to check membership when a set exists.
+- **Eliminate O(n²) before it ships.** When joining two collections in code (not SQL), build a lookup dict from the smaller one and iterate the larger once — O(n+m), not O(n×m). If you see a loop inside a loop over DB-sourced data, stop and redesign.
+- **Pre-compute once, reuse many times.** Build lookup tables outside loops. If the same value is derived repeatedly inside a loop (regex compile, dict key construction, string formatting), move it above the loop.
+- **Sort once.** If a collection needs to be accessed in order multiple times, sort it once and use `bisect` for subsequent range queries. Never call `sorted()` inside a loop.
+- **Stream large result sets.** When processing all rows of a large table, use `yield_per(1000)` on the SQLAlchemy query or paginate with `LIMIT/OFFSET` in raw SQL. Never `.fetchall()` on a result set that could exceed tens of thousands of rows.
+- **Batch I/O operations.** Group DB writes, API calls, and Redis operations into batches. A loop that calls `session.execute()` or an external API once per item is always wrong at scale — collect, then execute once.
+- **Use generators for pipelines.** When transforming a large sequence through multiple steps, use generator functions (`yield`) to avoid materialising intermediate lists. Only collect into a list when random access or length is required.
+- **Measure before optimising**, but design for efficiency from the start. If a function processes more than ~1k items, its time and space complexity must be considered, not assumed acceptable.
+
+### Database and SQLAlchemy
+- All DB access must go through SQLAlchemy. Direct `psycopg2` calls or raw connection string queries are forbidden outside Alembic migrations.
+- **Use `sqlalchemy.text()` for all queries — do not use the SQLAlchemy ORM query API (`select(Model).where(...)`, `session.query(...)`) for data retrieval.** Write SQL directly via `session.execute(text("SELECT ..."), {"param": value})`. ORM is used only for `session.add()` / `session.delete()` on individual model instances and for Alembic schema definitions. Never concatenate user input into `text()` — always use named bind parameters.
+- Minimise round trips: fetch all required data in one query using joins or CTEs rather than issuing multiple sequential queries. Never query inside a loop.
+- Batch writes with `session.execute(insert(Model).values([...]))` when inserting more than ~10 rows. Commit once per batch, not once per row.
+- Filter, sort, and paginate in SQL — not in Python after fetching all rows.
+- Use `with_for_update(skip_locked=True)` for queue-style processing to avoid contention.
+- Index columns that appear in `WHERE`, `ORDER BY`, or `JOIN` clauses on hot paths. Add the index in the Alembic migration alongside the column.
 
 ## Self-Maintenance
 
-Update this file automatically after any major architectural change. Triggers:
-
-1. New top-level package under `src/` (e.g. new `src/agents/`-style subsystem) → add to **Subsystems**.
-2. Dependency added/removed in `requirements.txt` that changes a **Tooling Rule** (e.g. swap ORM, add framework) → update **Tooling Rules**.
-3. New `config/*.py` or `config/*.json` → add to **Configuration**.
-4. New pytest marker in `pytest.ini` → add to commands + Tooling Rules.
-5. New external integration (payments, CRM, telephony, LLM provider) → update **Subsystems** + **Important Notes**.
-6. Schema-shape change in `src/core/models.py` (new hub-and-spoke table, new JSONB field, new polymorphic type) → update **Hub-and-Spoke Database**.
-7. New scheduled task in `src/tasks/` that owns a recurring business flow → add to **Tasks** bullet.
-
-When updating: keep file <200 lines, prefer specifics over generics, delete stale rules in the same edit.
+Update after: new `src/` package, dependency change affecting tooling rules, new `config/*.py`, new pytest marker, new external integration, schema change in `models.py`, new scheduled task. Keep file <200 lines.

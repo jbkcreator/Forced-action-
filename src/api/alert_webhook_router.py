@@ -45,6 +45,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from config.settings import get_settings
+from src.api.deps import get_db as _get_db
 
 logger = logging.getLogger(__name__)
 
@@ -62,14 +63,6 @@ def _verify_secret(request: Request) -> None:
     token = auth.removeprefix("Bearer ").strip()
     if not hmac.compare_digest(token, secret):
         raise HTTPException(status_code=401, detail="Invalid alert webhook secret")
-
-
-# ── DB dependency ─────────────────────────────────────────────────────────────
-
-def _get_db():
-    from src.core.database import get_db_context
-    with get_db_context() as db:
-        yield db
 
 
 # ── alert dispatch ────────────────────────────────────────────────────────────

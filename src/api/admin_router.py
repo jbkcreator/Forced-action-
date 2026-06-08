@@ -30,6 +30,7 @@ from sqlalchemy import and_, case, distinct, func, or_, select, text
 from sqlalchemy.orm import Session
 
 from config.settings import settings
+from src.api.deps import get_db
 from src.core.database import get_db_context
 from src.core.models import (
     County,
@@ -86,15 +87,6 @@ def get_current_admin(
     credentials: HTTPAuthorizationCredentials = Depends(_bearer),
 ) -> dict:
     return verify_token(credentials.credentials)
-
-
-# ---------------------------------------------------------------------------
-# DB dependency
-# ---------------------------------------------------------------------------
-
-def get_db():
-    with get_db_context() as db:
-        yield db
 
 
 # ---------------------------------------------------------------------------

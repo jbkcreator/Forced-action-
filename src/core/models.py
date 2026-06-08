@@ -171,6 +171,12 @@ class Owner(Base):
     estimated_income: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
     credit_score_tier: Mapped[Optional[str]] = mapped_column(String(50))
     skip_trace_success: Mapped[Optional[bool]] = mapped_column(Boolean, default=False)
+    contact_info_confidence: Mapped[Optional[str]] = mapped_column(String(20))
+    contact_info_confidence_score: Mapped[Optional[float]] = mapped_column(Numeric(4, 3))
+    contact_last_verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    contact_next_refresh_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    contact_refresh_status: Mapped[Optional[str]] = mapped_column(String(20))
+    contact_refresh_reason: Mapped[Optional[str]] = mapped_column(String(120))
 
     # Sunbiz registered agent — populated by Sunbiz Playwright scraper (LLC owners only)
     registered_agent_name: Mapped[Optional[str]] = mapped_column(String(255))
@@ -202,10 +208,20 @@ class Owner(Base):
         Index("idx_absentee_status", "absentee_status"),
         Index("idx_owner_county_id", "county_id"),
         Index("idx_owner_phone_metadata", "phone_metadata", postgresql_using="gin"),
+        Index("idx_owner_contact_confidence", "contact_info_confidence"),
+        Index("idx_owner_contact_next_refresh", "contact_next_refresh_at"),
         Index("ix_owners_sunbiz_status", "sunbiz_status"),
         Index("ix_owners_managing_members", "managing_members", postgresql_using="gin"),
         CheckConstraint("owner_type IN ('Individual', 'LLC', 'Trust', 'Estate', 'Corporate')", name="check_owner_type"),
         CheckConstraint("absentee_status IN ('In-County', 'Out-of-County', 'Out-of-State')", name="check_absentee_status"),
+        CheckConstraint(
+            "contact_info_confidence IS NULL OR contact_info_confidence IN ('high','medium','low','stale')",
+            name="check_owner_contact_info_confidence",
+        ),
+        CheckConstraint(
+            "contact_refresh_status IS NULL OR contact_refresh_status IN ('fresh','due','queued','refreshed','failed')",
+            name="check_owner_contact_refresh_status",
+        ),
         CheckConstraint(
             "sunbiz_status IN ('pending','matched','not_found','ambiguous',"
             "'parser_failed','not_an_llc')",
@@ -1379,6 +1395,11 @@ class EnrichedContact(Base):
     traced_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     # Waterfall quality score (0.000–1.000) — set by the waterfall coordinator
     confidence: Mapped[Optional[float]] = mapped_column(Numeric(4, 3), nullable=True)
+    verification_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    superseded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    superseded_by_contact_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("enriched_contacts.id"), nullable=True
+    )
 
     # Audit
     enriched_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
@@ -1388,7 +1409,12 @@ class EnrichedContact(Base):
     __table_args__ = (
         Index("idx_enriched_match_success", "match_success"),
         Index("idx_enriched_source", "source"),
-        CheckConstraint("source IN ('batch_skip_tracing', 'idi', 'pdl')", name="check_enriched_source"),
+        Index("idx_enriched_verification_status", "verification_status"),
+        CheckConstraint("source IN ('batch_skip_tracing', 'idi', 'pdl', 'tracerfy')", name="check_enriched_source"),
+        CheckConstraint(
+            "verification_status IS NULL OR verification_status IN ('valid','invalid','unknown')",
+            name="check_enriched_verification_status",
+        ),
     )
 
     def __repr__(self):
@@ -2280,7 +2306,7 @@ class LearningCard(Base):
         CheckConstraint(
             "card_type IN ('message_perf', 'deal_pattern', 'ab_result', "
             "'churn_signal', 'pricing_test', 'general', "
-            "'autonomy_summary')",      # fa036 — weekly Cora autonomy scorecard
+            "'autonomy_summary', 'kill_switch_scorecard', 'win_autopsy')",
             name="check_card_type",
         ),
         UniqueConstraint("card_date", "card_type", name="uq_learning_card_date_type"),

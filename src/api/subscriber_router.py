@@ -20,7 +20,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select
 
-from src.core.database import get_db_context
+from src.api.deps import get_db
 from src.core.models import Subscriber
 from src.services import subscriber_auth as auth
 from src.services.rate_limit import enforce_or_429
@@ -28,11 +28,6 @@ from src.services.rate_limit import enforce_or_429
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/subscriber", tags=["subscriber"])
-
-
-def get_db():
-    with get_db_context() as db:
-        yield db
 
 
 # ── request models ──────────────────────────────────────────────────────────
