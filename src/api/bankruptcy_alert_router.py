@@ -37,8 +37,8 @@ from config.bankruptcy_alert_config import (
     RELEVANT_CHAPTERS,
 )
 from config.settings import get_settings
-from src.core.database import get_db_context
 from src.api.admin_router import get_current_admin
+from src.api.deps import get_db
 
 logger = logging.getLogger(__name__)
 
@@ -48,11 +48,6 @@ router = APIRouter(prefix="/api/bankruptcy-alerts", tags=["bankruptcy-alerts"])
 # the shared /webhooks/stripe endpoint and routed by product via
 # bankruptcy_alert.subscription.resolve_handler (verified with the common
 # active_stripe_webhook_secret).
-
-
-def get_db():
-    with get_db_context() as db:
-        yield db
 
 
 # ── Request models ──────────────────────────────────────────────────────────────

@@ -33,6 +33,8 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlalchemy import text as sa_text
 from sqlalchemy.orm import Session
 
+from src.api.deps import get_db as _get_db
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["metrics"])
@@ -48,12 +50,6 @@ _KILL_SWITCH_METRICS = [
 ]
 
 _PROMETHEUS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
-
-
-def _get_db():
-    from src.core.database import get_db_context
-    with get_db_context() as db:
-        yield db
 
 
 @router.get("/metrics", include_in_schema=False)

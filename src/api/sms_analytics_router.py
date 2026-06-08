@@ -24,7 +24,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from src.api.admin_router import get_current_admin
-from src.core.database import get_db_context
+from src.api.deps import get_db as _get_db
 
 logger = logging.getLogger(__name__)
 
@@ -62,11 +62,6 @@ _EQUALITY_FILTER_COLS: tuple[str, ...] = (
     "channel",
     "message_type",
 )
-
-
-def _get_db():
-    with get_db_context() as db:
-        yield db
 
 
 # ── GET /message-outcomes ────────────────────────────────────────────────────

@@ -34,7 +34,7 @@ from sqlalchemy.orm import Session
 
 from config.settings import get_settings
 from src.api.admin_router import get_current_admin
-from src.core.database import get_db_context
+from src.api.deps import get_db
 from src.services import clay_service
 from src.services.white_label_api_key import (
     generate_api_key,
@@ -79,11 +79,6 @@ _VERIFY_EXPIRE_HOURS = 24
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def get_db():
-    with get_db_context() as db:
-        yield db
-
 
 def _slugify(name: str) -> str:
     name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode()

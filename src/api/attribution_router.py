@@ -19,7 +19,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from src.api.admin_router import get_current_admin
-from src.core.database import get_db_context
+from src.api.deps import get_db as _get_db
 
 logger = logging.getLogger(__name__)
 
@@ -46,11 +46,6 @@ _TRACE_ATTR_COLS: frozenset[str] = frozenset({
     "revenue_amount", "currency", "occurred_at",
     "attribution_status", "attribution_confidence", "attribution_metadata", "created_at",
 })
-
-
-def _get_db():
-    with get_db_context() as db:
-        yield db
 
 
 def _apply_date_range(
