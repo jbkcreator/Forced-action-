@@ -236,6 +236,10 @@ def scrape_fire_incidents(
                 incident_type="Fire",
                 incident_date=fire_date,
                 county_id=county_id,
+                source_meta={
+                    "incident_number": inc["incident_number"],
+                    "description": inc["description"],
+                },
             ))
             created += 1
 

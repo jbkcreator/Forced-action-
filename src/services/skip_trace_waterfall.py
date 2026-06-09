@@ -63,31 +63,45 @@ def _select_candidates(session, county_id: str, limit: int, today_only: bool) ->
         func.length(func.trim(Owner.phone_1)) == 0,
     )
 
+    gold_plus = (
+        sa_exists()
+        .where(
+            and_(
+                DistressScore.property_id == Owner.property_id,
+                DistressScore.lead_tier.in_(("Gold", "Platinum", "Ultra Platinum")),
+            )
+        )
+    )
+
     q = (
         session.query(Owner)
         .join(Property, Owner.property_id == Property.id)
-        .join(
-            DistressScore,
-            and_(
-                DistressScore.property_id == Property.id,
-                DistressScore.lead_tier.in_(("Gold", "Platinum", "Ultra Platinum")),
-            ),
-        )
         .filter(
             Owner.county_id == county_id,
             no_phone,
             ~already_traced,
+            gold_plus,
             Property.address.isnot(None),
             Property.address != "",
             Property.zip.isnot(None),
             Property.zip != "",
         )
-        .order_by(DistressScore.score_date.desc())
+        .order_by(Owner.id)
     )
 
     if today_only:
         today = datetime.now(timezone.utc).date()
-        q = q.filter(func.date(DistressScore.score_date) == today)
+        gold_plus_today = (
+            sa_exists()
+            .where(
+                and_(
+                    DistressScore.property_id == Owner.property_id,
+                    DistressScore.lead_tier.in_(("Gold", "Platinum", "Ultra Platinum")),
+                    func.date(DistressScore.score_date) == today,
+                )
+            )
+        )
+        q = q.filter(gold_plus_today)
 
     return q.limit(limit).all()
 
@@ -160,6 +174,10 @@ def run_waterfall(
     county_id: str = "hillsborough",
     limit: int = 200,
     today_only: bool = True,
+    tracerfy_only: bool = False,
+    tracerfy_retrace_misses: bool = False,
+    individual_only: bool = False,
+    entity_only: bool = False,
 ) -> WaterfallStats:
     """
     Run the multi-provider skip trace waterfall for all eligible owners.
@@ -197,7 +215,19 @@ def run_waterfall(
     tier2_ids: list[int] = []
 
     if settings.tracerfy_api_key:
-        run_tracerfy_fallback(owner_ids=all_ids, county_id=county_id)
+        run_tracerfy_fallback(
+            owner_ids=None if tracerfy_retrace_misses else all_ids,
+            county_id=county_id,
+            retrace_misses=tracerfy_retrace_misses,
+            individual_only=individual_only,
+            entity_only=entity_only,
+            limit=limit,
+        )
+
+        # tracerfy_only: skip the per-owner EC loop entirely — no tier2 needed,
+        # and stats are authoritative in enrichment_usage_logs.
+        if tracerfy_only:
+            return stats
 
         with get_db_context() as session:
             for owner in candidates:
@@ -209,10 +239,7 @@ def run_waterfall(
                 # Tracerfy charges only on hit; use list price for ceiling conservatism
                 cost = _PROVIDER_COST_CENTS["tracerfy"] if (ec and ec.match_success) else 0
 
-                log_usage(session, vendor="tracerfy", purpose="skip_trace",
-                          success=bool(ec and ec.match_success),
-                          cost_cents=cost, property_id=owner.property_id)
-
+                # log_usage is handled inside run_tracerfy_fallback (with queue_id).
                 stats.total_cost_cents += cost
                 stats.per_provider["tracerfy"]["attempts"] += 1
                 stats.per_provider["tracerfy"]["cost_cents"] += cost

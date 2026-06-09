@@ -28,8 +28,7 @@ Usage:
   python -m src.services.tracerfy_fallback --balance
 """
 
-import csv
-import io
+import re
 import time
 import traceback
 from datetime import datetime, timezone
@@ -40,7 +39,7 @@ import requests
 from config.settings import get_settings
 from src.core.database import get_db_context
 from src.core.models import (
-    DistressScore, EnrichedContact, Owner, Property, SmsOptOut,
+    DistressScore, EnrichedContact, EnrichmentUsageLog, Owner, Property, SmsOptOut,
 )
 from src.services.email import send_alert
 from src.services.enrichment_log import log_usage
@@ -54,9 +53,138 @@ _TRACERFY_BASE        = "https://tracerfy.com/v1/api"
 _TRACE_ENDPOINT       = f"{_TRACERFY_BASE}/trace/"
 _TRACE_QUEUE_ENDPOINT = f"{_TRACERFY_BASE}/queue/"
 _ANALYTICS_ENDPOINT   = f"{_TRACERFY_BASE}/analytics/"
-_BATCH_SIZE           = 100   # Tracerfy max per POST /trace/ request
+_BATCH_SIZE           = 3000  # records per POST /trace/ queue submission
 _POLL_INTERVAL        = 5     # seconds between queue status polls
 _BATCH_DELAY          = 31    # seconds between batch POSTs (rate limit: 10/5min)
+
+# Tokens that indicate a name is a corporate entity rather than a traceable person.
+_ENTITY_TOKENS = frozenset({
+    "LLC", "LLP", "LLLP", "LP", "INC", "CORP", "CORPORATION", "LTD", "COMPANY", "CO",
+    "PLLC", "PA", "PL", "ENTERPRISES", "HOLDINGS", "PROPERTIES", "TRUST", "ESTATE",
+    "BANK", "NA", "N.A.", "GROUP", "SERVICES", "SOLUTIONS", "MANAGEMENT",
+    "ASSOCIATES", "PARTNERS", "INVESTMENTS", "REALTY", "VENTURES", "LAW", "OFFICE",
+    # Government / institutional entities often mis-classified as Individual in assessor data
+    "UNION", "FEDERAL", "AUTHORITY", "DEPARTMENT", "COUNTY", "CITY", "STATE",
+    "GOVERNMENT", "MUNICIPAL", "DISTRICT", "FOUNDATION", "ASSOCIATION", "CREDIT",
+    "HOUSING", "AUTHORITY", "AGENCY", "BOARD", "COMMITTEE", "COMMISSION",
+})
+
+_NAME_SUFFIXES = frozenset({"JR", "JR.", "SR", "SR.", "II", "III", "IV", "ESQ", "ESQ."})
+
+# Strips "ET AL", "ET ALS", "ET AL." from the end of assessor owner names.
+_ET_AL_RE = re.compile(r"\s+ET\s+AL[S.]?\s*$", re.IGNORECASE)
+
+
+def _looks_corporate(name: str) -> bool:
+    return bool(_ENTITY_TOKENS.intersection(name.upper().split()))
+
+
+def _parse_name(full_name: str) -> tuple[str, str]:
+    """
+    Parse a name string → (first, last).
+
+    Handles both 'FIRST LAST' and Sunbiz 'LAST, FIRST [MIDDLE] [SUFFIX]' formats.
+    Strips name suffixes (Jr., Sr., II, etc.) from the first component.
+    """
+    name = full_name.strip()
+    if "," in name:
+        # Sunbiz format: "Last, First [Middle] [Suffix]"
+        last_part, rest = name.split(",", 1)
+        tokens = rest.strip().split()
+        # Drop trailing suffixes to get the actual first name
+        first_tokens = [t for t in tokens if t.upper().rstrip(".") not in _NAME_SUFFIXES]
+        first = first_tokens[0] if first_tokens else ""
+        return first, last_part.strip()
+    parts = name.split(None, 1)
+    return (parts[0], parts[1]) if len(parts) > 1 else ("", parts[0] if parts else "")
+
+
+def _parse_ra_address(addr: str) -> dict | None:
+    """
+    Parse Sunbiz multi-line RA address into {address, city, state, zip}.
+
+    Sunbiz format:
+      Line 1: street address
+      Line N: City, ST 00000
+
+    Returns None if parsing fails (caller falls back to property address).
+    """
+    import re
+    lines = [ln.strip() for ln in addr.strip().splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return None
+    street = lines[0]
+    city_state_zip = lines[-1]
+    m = re.match(r"^(.*?),\s*([A-Z]{2})\s+(\d{5}(?:-\d{4})?)\s*$", city_state_zip, re.IGNORECASE)
+    if not m:
+        return None
+    return {
+        "address": street,
+        "city":    m.group(1).strip(),
+        "state":   m.group(2).upper(),
+        "zip":     m.group(3)[:5],
+    }
+
+
+def _resolve_trace_subject(owner: "Owner") -> tuple[str, str, dict | None, bool]:
+    """
+    Return (first, last, address_override, is_traceable).
+
+    is_traceable=False when the owner is an entity with no individual contact
+    found — the caller should skip this record rather than submit a corporate
+    name as a person's name (which returns 0% hit rate and wastes a queue slot).
+
+    For entity owners: managing member → registered agent (individual only).
+    For individuals: strip ET AL, handle joint-owner AND patterns (including
+    shared-last-name variants like "JOHN AND JANE SMITH"), strip middle initials.
+    """
+    is_entity = (
+        (owner.owner_type and owner.owner_type != "Individual")
+        or _looks_corporate(owner.owner_name or "")
+    )
+    if is_entity:
+        for member in (owner.managing_members or []):
+            name = (member.get("name") or "").strip()
+            if name and not _looks_corporate(name):
+                return (*_parse_name(name), None, True)
+        ra_name = (owner.registered_agent_name or "").strip()
+        if ra_name and not _looks_corporate(ra_name):
+            ra_addr = _parse_ra_address(owner.registered_agent_address or "")
+            return (*_parse_name(ra_name), ra_addr, True)
+        # Entity with no traceable individual — skip rather than submit LLC name
+        return "", "", None, False
+
+    # ── Individual path ────────────────────────────────────────────────────
+    raw = _ET_AL_RE.sub("", owner.owner_name or "").strip()
+
+    for sep in (" AND ", " & "):
+        idx = raw.upper().find(sep)
+        if idx != -1:
+            person_part = raw[:idx].strip()
+            tokens = person_part.split()
+            # Shared-last-name pattern: "JOHN AND JANE SMITH" → person_part="JOHN"
+            # or "PETER S AND JISLAYNE HARRISON" → person_part="PETER S".
+            # If no usable last name remains (1 token, or 2 tokens where the
+            # second looks like a middle initial), borrow the last word of the
+            # full original name as the shared family name.
+            missing_last = len(tokens) <= 1 or (
+                len(tokens) == 2 and len(tokens[-1]) <= 2
+            )
+            if missing_last:
+                all_tokens = raw.split()
+                shared_last = all_tokens[-1] if all_tokens else ""
+                if shared_last:
+                    person_part = f"{person_part} {shared_last}"
+            raw = person_part
+            break
+
+    first, last = _parse_name(raw)
+    # Strip a leading middle initial from the last-name slot:
+    # "KURT W JOHNSON" → last="W JOHNSON" → ["W", "JOHNSON"] → drop "W"
+    last_parts = last.split(None, 1)
+    if len(last_parts) == 2 and len(last_parts[0]) == 1:
+        last = last_parts[1]
+    return first, last, None, True
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +216,7 @@ def _submit_trace_batch(records: list[dict], api_key: str) -> tuple[str, int]:
         "zip_column":         "zip",
         "first_name_column":  "first_name",
         "last_name_column":   "last_name",
+        "label_column":       "label",   # owner_id echoed back for reliable result matching
         "mail_address_column": "address",
         "mail_city_column":   "city",
         "mail_state_column":  "state",
@@ -142,20 +271,40 @@ def _poll_trace_queue(queue_id: str, api_key: str, estimated_wait: int = 30) -> 
     logger.info("[Tracerfy] Waiting %ds for queue=%s...", estimated_wait, queue_id)
     time.sleep(estimated_wait)
 
-    for attempt in range(60):
+    last_count = -1
+    stable_rounds = 0
+
+    for attempt in range(120):
         resp = requests.get(url, headers=_headers(api_key), timeout=30)
         if not resp.ok:
             raise RuntimeError(f"Tracerfy GET /queue/ HTTP {resp.status_code}: {resp.text[:300]}")
         results = resp.json()
-        if results:
-            logger.info("[Tracerfy] queue=%s ready — %d rows. Sample: %s",
-                        queue_id, len(results), results[0])
-            return results
-        logger.info("[Tracerfy] queue=%s still empty attempt=%d", queue_id, attempt + 1)
+        current_count = len(results)
+
+        if current_count == 0:
+            logger.info("[Tracerfy] queue=%s still empty attempt=%d", queue_id, attempt + 1)
+            time.sleep(_POLL_INTERVAL)
+            continue
+
+        # Tracerfy streams results as it processes — wait until count stabilises
+        # across two consecutive polls before accepting as complete.
+        if current_count == last_count:
+            stable_rounds += 1
+            if stable_rounds >= 2:
+                logger.info("[Tracerfy] queue=%s stable at %d rows after %d attempts",
+                            queue_id, current_count, attempt + 1)
+                return results
+        else:
+            stable_rounds = 0
+            logger.info("[Tracerfy] queue=%s growing: %d rows (attempt=%d)",
+                        queue_id, current_count, attempt + 1)
+
+        last_count = current_count
         time.sleep(_POLL_INTERVAL)
 
-    logger.warning("[Tracerfy] queue=%s returned no results after timeout — treating as all misses", queue_id)
-    return []
+    logger.warning("[Tracerfy] queue=%s did not stabilise after timeout — returning %d rows",
+                   queue_id, last_count)
+    return results if results else []
 
 
 def _parse_trace_row(row: dict) -> dict:
@@ -259,12 +408,18 @@ def run_tracerfy_fallback(
     county_id: str = "hillsborough",
     owner_ids: Optional[list] = None,
     dry_run: bool = False,
+    retrace_misses: bool = False,
+    individual_only: bool = False,
+    entity_only: bool = False,
 ) -> dict:
     """
     Run Tracerfy batch skip-trace (POST /trace/, 1 credit/hit = $0.02) for Gold+ leads.
 
     Standard mode (owner_ids=None): selects Gold+ candidates not yet Tracerfy-traced.
     Waterfall mode (owner_ids=[...]): processes a specific list supplied by the orchestrator.
+    retrace_misses=True: re-submits properties with existing tracerfy miss EC rows,
+      updating them in-place on a hit. Ignores owner_ids when active.
+    individual_only / entity_only: restrict to individual or entity owner types.
 
     DNC side-effect: phones with dnc=True or litigator=True are written to
     sms_opt_outs(source="tracerfy_dnc") so can_send() blocks them immediately.
@@ -282,12 +437,45 @@ def run_tracerfy_fallback(
     stats   = {
         "total": 0, "success": 0, "failed": 0,
         "no_address": 0, "already_done": 0, "skipped": False,
+        "skipped_entity": 0,
     }
 
     with get_db_context() as session:
         from sqlalchemy import or_ as sa_or, func as sa_func
+        from sqlalchemy import text as sa_text
 
-        if owner_ids is not None:
+        if retrace_misses:
+            # Re-submit properties whose prior Tracerfy run returned no match.
+            # The existing miss EC row is updated in-place on a hit; continued
+            # misses are left unchanged (no duplicate rows inserted).
+            type_filter = ""
+            if individual_only:
+                type_filter = " AND o.owner_type = 'Individual'"
+            elif entity_only:
+                type_filter = " AND o.owner_type != 'Individual'"
+
+            miss_owner_ids = [
+                r[0]
+                for r in session.execute(sa_text(f"""
+                    SELECT DISTINCT o.id
+                    FROM enriched_contacts ec
+                    JOIN owners o ON o.property_id = ec.property_id
+                      AND o.county_id = :county_id
+                    WHERE ec.source = 'tracerfy'
+                      AND ec.match_success = FALSE
+                    {type_filter}
+                    ORDER BY o.id
+                    LIMIT :limit
+                """), {"county_id": county_id, "limit": limit}).fetchall()
+            ]
+            rows = (
+                session.query(Owner, Property)
+                .join(Property, Owner.property_id == Property.id)
+                .filter(Owner.id.in_(miss_owner_ids))
+                .all()
+            )
+
+        elif owner_ids is not None:
             already_tracerfy = (
                 session.query(EnrichedContact.property_id)
                 .filter(EnrichedContact.source == "tracerfy")
@@ -302,6 +490,7 @@ def run_tracerfy_fallback(
                 )
                 .all()
             )
+
         else:
             no_phone = sa_or(
                 Owner.phone_1.is_(None),
@@ -331,6 +520,13 @@ def run_tracerfy_fallback(
                 .all()
             )
 
+        # Post-query type filter (applies to all modes except retrace, which already filtered in SQL)
+        if not retrace_misses:
+            if individual_only:
+                rows = [(o, p) for o, p in rows if o.owner_type == "Individual" and not _looks_corporate(o.owner_name or "")]
+            elif entity_only:
+                rows = [(o, p) for o, p in rows if o.owner_type != "Individual" or _looks_corporate(o.owner_name or "")]
+
     if not rows:
         logger.info("[Tracerfy] No candidates found.")
         return stats
@@ -353,39 +549,43 @@ def run_tracerfy_fallback(
         batch = rows[batch_start: batch_start + _BATCH_SIZE]
         batch_num = batch_start // _BATCH_SIZE + 1
 
-        records   = []
-        label_map: dict[str, tuple] = {}  # owner_id str → (owner_snap, prop_snap)
+        records:    list[dict]        = []
+        label_map:  dict[str, tuple] = {}  # str(owner_id) → (owner_snap, prop_snap)
+        address_map: dict[str, tuple] = {}  # UPPER(submitted_address) → (owner_snap, prop_snap)
 
         for owner, prop in batch:
             if not prop.address or not prop.zip:
                 stats["no_address"] += 1
                 continue
-            name_parts = (owner.owner_name or "").strip().split(None, 1)
-            first = name_parts[0] if name_parts else ""
-            last  = name_parts[1] if len(name_parts) > 1 else ""
+            first, last, addr_override, is_traceable = _resolve_trace_subject(owner)
+            if not is_traceable:
+                stats["skipped_entity"] += 1
+                continue
+            addr = addr_override or {
+                "address": prop.address,
+                "city":    prop.city or "Tampa",
+                "state":   prop.state or "FL",
+                "zip":     (prop.zip or "")[:5],
+            }
             label = str(owner.id)
             records.append({
+                "label":      label,
                 "first_name": first,
                 "last_name":  last,
-                "address":    prop.address,
-                "city":       prop.city or "Tampa",
-                "state":      prop.state or "FL",
-                "zip":        (prop.zip or "")[:5],
-                "label":      label,
+                "address":    addr["address"],
+                "city":       addr["city"],
+                "state":      addr["state"],
+                "zip":        addr["zip"],
             })
             label_map[label] = (owner, prop)
+            # Secondary fallback key — use the address we actually submitted
+            # (addr_override for entities, property address for individuals).
+            address_map[addr["address"].upper().strip()] = (owner, prop)
 
         if not records:
             continue
 
         logger.info("[Tracerfy] Batch %d: submitting %d records...", batch_num, len(records))
-
-        # address_map for result correlation (label not echoed back by API)
-        address_map: dict[str, tuple] = {}
-        for owner_s, prop_s in batch:
-            key = (prop_s.address or "").upper().strip()
-            if key:
-                address_map[key] = (owner_s, prop_s)
 
         try:
             queue_id, estimated_wait = _submit_trace_batch(records, api_key)
@@ -409,54 +609,89 @@ def run_tracerfy_fallback(
             continue
 
         # ── Persist results ───────────────────────────────────────────────
-        hit_addresses = set()
+        hit_ids: set[str] = set()   # owner_id strings that returned a hit
         with get_db_context() as session:
+            from sqlalchemy import insert as sa_insert
+
+            # ── Bulk pre-loads — eliminates N round trips down to 2 ──────────
+            all_owner_ids = [int(lbl) for lbl in label_map]
+            owners_by_id: dict[int, Owner] = {
+                o.id: o
+                for o in session.query(Owner).filter(Owner.id.in_(all_owner_ids)).all()
+            }
+            all_property_ids = [o.property_id for o in owners_by_id.values()]
+            existing_ecs: dict[int, EnrichedContact] = {
+                ec.property_id: ec
+                for ec in session.query(EnrichedContact).filter(
+                    EnrichedContact.property_id.in_(all_property_ids),
+                    EnrichedContact.source == "tracerfy",
+                ).all()
+            }
+
+            # Accumulate usage log dicts — one bulk insert at end, no per-row flush.
+            usage_log_entries: list[dict] = []
+            now = datetime.now(timezone.utc)
+
             for row in results:
-                addr_key = (row.get("address") or "").upper().strip()
-                if addr_key not in address_map:
-                    logger.debug("[Tracerfy] Result address not in submitted batch: %s", addr_key)
+                label = str(row.get("label") or "").strip()
+                if label and label in label_map:
+                    owner_snap, prop_snap = label_map[label]
+                elif (row.get("address") or "").upper().strip() in address_map:
+                    addr_echo = (row.get("address") or "").upper().strip()
+                    owner_snap, prop_snap = address_map[addr_echo]
+                    label = str(owner_snap.id)
+                else:
+                    logger.debug(
+                        "[Tracerfy] Unmatched result row: label=%r addr=%r",
+                        row.get("label"), row.get("address"),
+                    )
                     continue
 
-                owner_snap, prop_snap = address_map[addr_key]
-                hit_addresses.add(addr_key)
+                hit_ids.add(label)
                 parsed = _parse_trace_row(row)
 
                 try:
-                    owner = session.get(Owner, owner_snap.id)
+                    owner = owners_by_id.get(owner_snap.id)
                     if owner is None:
                         continue
 
-                    existing = (
-                        session.query(EnrichedContact)
-                        .filter_by(property_id=owner.property_id, source="tracerfy")
-                        .first()
-                    )
-                    if existing:
+                    existing = existing_ecs.get(owner.property_id)
+
+                    if existing and not retrace_misses:
                         stats["already_done"] += 1
                         continue
 
-                    log_usage(
-                        db=session,
-                        vendor="tracerfy",
-                        purpose="skip_trace",
-                        success=parsed["match_success"],
-                        cost_cents=cost_per_hit if parsed["match_success"] else 0,
-                        property_id=owner.property_id,
-                    )
+                    usage_log_entries.append({
+                        "vendor":      "tracerfy",
+                        "purpose":     "skip_trace",
+                        "success":     parsed["match_success"],
+                        "cost_cents":  cost_per_hit if parsed["match_success"] else 0,
+                        "property_id": owner.property_id,
+                        "request_ref": queue_id,
+                        "created_at":  now,
+                    })
 
-                    ec = EnrichedContact(
-                        property_id=owner.property_id,
-                        county_id=owner.county_id or county_id,
-                        mobile_phone=parsed["mobile_phone"],
-                        landline=parsed["landline"],
-                        email=parsed["email"],
-                        mailing_address=parsed["mailing_address"],
-                        source="tracerfy",
-                        match_success=parsed["match_success"],
-                        raw_response=row,
-                        enriched_at=datetime.now(timezone.utc),
-                    )
-                    session.add(ec)
+                    if existing and retrace_misses:
+                        existing.mobile_phone    = parsed["mobile_phone"]
+                        existing.landline        = parsed["landline"]
+                        existing.email           = parsed["email"]
+                        existing.mailing_address = parsed["mailing_address"]
+                        existing.match_success   = parsed["match_success"]
+                        existing.raw_response    = row
+                        existing.enriched_at     = now
+                    else:
+                        session.add(EnrichedContact(
+                            property_id=owner.property_id,
+                            county_id=owner.county_id or county_id,
+                            mobile_phone=parsed["mobile_phone"],
+                            landline=parsed["landline"],
+                            email=parsed["email"],
+                            mailing_address=parsed["mailing_address"],
+                            source="tracerfy",
+                            match_success=parsed["match_success"],
+                            raw_response=row,
+                            enriched_at=now,
+                        ))
 
                     if parsed["mobile_phone"] and not owner.phone_1:
                         owner.phone_1 = parsed["mobile_phone"]
@@ -467,14 +702,12 @@ def run_tracerfy_fallback(
                     if parsed["match_success"]:
                         owner.skip_trace_success = True
 
-                    # Store DNC flags in phone_metadata
                     dnc_flags = parsed.get("dnc_flags")
                     if dnc_flags:
                         meta = dict(owner.phone_metadata or {})
                         meta["phone_1"] = {**(meta.get("phone_1") or {}), **dnc_flags}
                         owner.phone_metadata = meta
 
-                    # Suppress all DNC + litigator phones
                     for dnc_num in parsed.get("all_dnc_phones") or []:
                         already = session.query(SmsOptOut).filter_by(phone=dnc_num).first()
                         if not already:
@@ -482,7 +715,7 @@ def run_tracerfy_fallback(
                                 phone=dnc_num,
                                 keyword_used="DNC",
                                 source="tracerfy_dnc",
-                                opted_out_at=datetime.now(timezone.utc),
+                                opted_out_at=now,
                             ))
                             logger.info(
                                 "[Tracerfy] DNC suppression: property_id=%d phone=%s",
@@ -499,18 +732,47 @@ def run_tracerfy_fallback(
                     logger.debug(traceback.format_exc())
                     stats["failed"] += 1
 
-            # Mark misses (submitted but not in results — Tracerfy omits no-match rows)
-            for addr_key, (owner_snap, _) in address_map.items():
-                if addr_key not in hit_addresses:
-                    log_usage(
-                        db=session,
-                        vendor="tracerfy",
-                        purpose="skip_trace",
-                        success=False,
-                        cost_cents=0,
-                        property_id=owner_snap.property_id,
+            # ── Bulk-write usage logs for hits ───────────────────────────────
+            if usage_log_entries:
+                session.execute(sa_insert(EnrichmentUsageLog), usage_log_entries)
+
+            # ── Bulk-write misses ────────────────────────────────────────────
+            if not retrace_misses:
+                miss_snaps = [
+                    owner_snap
+                    for lbl, (owner_snap, _) in label_map.items()
+                    if lbl not in hit_ids
+                ]
+                if miss_snaps:
+                    session.execute(
+                        sa_insert(EnrichedContact),
+                        [
+                            {
+                                "property_id":   snap.property_id,
+                                "county_id":     snap.county_id or county_id,
+                                "source":        "tracerfy",
+                                "match_success": False,
+                                "enriched_at":   now,
+                            }
+                            for snap in miss_snaps
+                        ],
                     )
-                    stats["failed"] += 1
+                    session.execute(
+                        sa_insert(EnrichmentUsageLog),
+                        [
+                            {
+                                "vendor":      "tracerfy",
+                                "purpose":     "skip_trace",
+                                "success":     False,
+                                "cost_cents":  0,
+                                "property_id": snap.property_id,
+                                "request_ref": queue_id,
+                                "created_at":  now,
+                            }
+                            for snap in miss_snaps
+                        ],
+                    )
+                    stats["failed"] += len(miss_snaps)
 
             session.commit()
 
@@ -520,10 +782,11 @@ def run_tracerfy_fallback(
 
     logger.info("=" * 60)
     logger.info("TRACERFY SKIP TRACE COMPLETE")
-    logger.info("  Total processed : %d", stats["total"])
-    logger.info("  Success         : %d", stats["success"])
-    logger.info("  No contact found: %d", stats["failed"])
-    logger.info("  No address      : %d", stats["no_address"])
+    logger.info("  Total processed  : %d", stats["total"])
+    logger.info("  Success          : %d", stats["success"])
+    logger.info("  No contact found : %d", stats["failed"])
+    logger.info("  No address       : %d", stats["no_address"])
+    logger.info("  Skipped (entity) : %d", stats["skipped_entity"])
     logger.info("=" * 60)
 
     return stats
@@ -544,6 +807,12 @@ if __name__ == "__main__":
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--balance", action="store_true",
                         help="Print account credit balance and exit")
+    parser.add_argument("--retrace-misses", dest="retrace_misses", action="store_true",
+                        help="Re-submit properties with existing tracerfy miss EC rows")
+    parser.add_argument("--individual-only", dest="individual_only", action="store_true",
+                        help="Only process Individual owner_type records")
+    parser.add_argument("--entity-only", dest="entity_only", action="store_true",
+                        help="Only process non-Individual (LLC/Corp/Trust/Estate) records")
     args = parser.parse_args()
 
     try:
@@ -555,6 +824,9 @@ if __name__ == "__main__":
             limit=args.limit,
             county_id=args.county_id,
             dry_run=args.dry_run,
+            retrace_misses=args.retrace_misses,
+            individual_only=args.individual_only,
+            entity_only=args.entity_only,
         )
         sys.exit(0)
     except Exception as e:
