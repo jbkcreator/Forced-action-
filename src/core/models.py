@@ -171,12 +171,6 @@ class Owner(Base):
     estimated_income: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
     credit_score_tier: Mapped[Optional[str]] = mapped_column(String(50))
     skip_trace_success: Mapped[Optional[bool]] = mapped_column(Boolean, default=False)
-    contact_info_confidence: Mapped[Optional[str]] = mapped_column(String(20))
-    contact_info_confidence_score: Mapped[Optional[float]] = mapped_column(Numeric(4, 3))
-    contact_last_verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
-    contact_next_refresh_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
-    contact_refresh_status: Mapped[Optional[str]] = mapped_column(String(20))
-    contact_refresh_reason: Mapped[Optional[str]] = mapped_column(String(120))
 
     # Sunbiz registered agent — populated by Sunbiz Playwright scraper (LLC owners only)
     registered_agent_name: Mapped[Optional[str]] = mapped_column(String(255))
@@ -208,20 +202,10 @@ class Owner(Base):
         Index("idx_absentee_status", "absentee_status"),
         Index("idx_owner_county_id", "county_id"),
         Index("idx_owner_phone_metadata", "phone_metadata", postgresql_using="gin"),
-        Index("idx_owner_contact_confidence", "contact_info_confidence"),
-        Index("idx_owner_contact_next_refresh", "contact_next_refresh_at"),
         Index("ix_owners_sunbiz_status", "sunbiz_status"),
         Index("ix_owners_managing_members", "managing_members", postgresql_using="gin"),
         CheckConstraint("owner_type IN ('Individual', 'LLC', 'Trust', 'Estate', 'Corporate')", name="check_owner_type"),
         CheckConstraint("absentee_status IN ('In-County', 'Out-of-County', 'Out-of-State')", name="check_absentee_status"),
-        CheckConstraint(
-            "contact_info_confidence IS NULL OR contact_info_confidence IN ('high','medium','low','stale')",
-            name="check_owner_contact_info_confidence",
-        ),
-        CheckConstraint(
-            "contact_refresh_status IS NULL OR contact_refresh_status IN ('fresh','due','queued','refreshed','failed')",
-            name="check_owner_contact_refresh_status",
-        ),
         CheckConstraint(
             "sunbiz_status IN ('pending','matched','not_found','ambiguous',"
             "'parser_failed','not_an_llc')",
@@ -419,15 +403,28 @@ class LegalAndLien(Base):
     book_type: Mapped[Optional[str]] = mapped_column(String(50))
     book_number: Mapped[Optional[str]] = mapped_column(String(50))
     page_number: Mapped[Optional[str]] = mapped_column(String(50))
-    
+
+    # Court case identifier (extracted from PDF by OCR v2; 0% populated pre-OCR)
+    case_number: Mapped[Optional[str]] = mapped_column(String(100))
+
     # Additional metadata
     document_type: Mapped[Optional[str]] = mapped_column(String(100))  # CCL, TCL, ML, TL, HL, Judgment
     legal_description: Mapped[Optional[str]] = mapped_column(Text)
     meta_data: Mapped[Optional[dict]] = mapped_column(JSONB)  # Additional type-specific fields
 
+    # OCR v2 — PDF-extracted property identifiers
+    parcel_id: Mapped[Optional[str]] = mapped_column(String(100))
+    property_address: Mapped[Optional[str]] = mapped_column(Text)
+    normalized_property_address: Mapped[Optional[str]] = mapped_column(Text)
+    pdf_url: Mapped[Optional[str]] = mapped_column(Text)
+    pdf_path: Mapped[Optional[str]] = mapped_column(Text)
+    ocr_status: Mapped[Optional[str]] = mapped_column(String(30), default='pending')
+    ocr_confidence: Mapped[Optional[float]] = mapped_column(Numeric(5, 4))
+    ocr_extracted_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
     # Match provenance — populated by the loader at insert time
     match_confidence: Mapped[Optional[Decimal]] = mapped_column(Numeric(4, 3), nullable=True)  # 0.000–1.000
-    match_method: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)  # legal_desc | owner_name | llm_verified | address | manual
+    match_method: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)  # parcel_id | normalized_address | legal_desc | owner_name | llm_verified | address | manual
 
     # Load tracking & multi-county
     date_added: Mapped[Optional[date]] = mapped_column(Date, default=date.today, index=True)
@@ -441,12 +438,23 @@ class LegalAndLien(Base):
         Index("idx_legal_record_type", "record_type"),
         Index("idx_legal_filing_date", "filing_date"),
         Index("idx_legal_instrument", "instrument_number"),
+        Index("idx_legal_case_number", "case_number"),
+        Index("idx_legal_parcel_id", "parcel_id"),
+        Index("idx_legal_ocr_status", "ocr_status"),
         Index("idx_legal_meta_data", "meta_data", postgresql_using="gin"),
         Index("idx_legal_match_method", "match_method"),
         CheckConstraint("record_type IN ('Lien', 'Judgment')", name="check_lien_record_type"),
         CheckConstraint(
-            "match_method IN ('parcel_id', 'legal_desc', 'owner_name', 'llm_verified', 'address', 'manual')",
+            "match_method IS NULL OR match_method IN ("
+            "'legal_desc', 'owner_name', 'llm_verified', 'address', "
+            "'manual', 'parcel_id', 'normalized_address')",
             name="check_legal_match_method",
+        ),
+        CheckConstraint(
+            "ocr_status IS NULL OR ocr_status IN ("
+            "'pending', 'downloaded', 'extracted', 'low_confidence', "
+            "'failed_download', 'failed_extraction')",
+            name="check_legal_ocr_status",
         ),
     )
 
@@ -548,6 +556,17 @@ class LegalProceeding(Base):
     # Flexible metadata bucket for type-specific fields
     meta_data: Mapped[Optional[dict]] = mapped_column(JSONB)
 
+    # Court-docket detail enrichment (Stage 2 — Pinellas Eviction/Probate/Divorce).
+    # Populated by the per-engine detail extractor (courtrecords.mypinellasclerk.gov).
+    mailing_address: Mapped[Optional[str]] = mapped_column(Text)  # promoted party addr: Defendant(evic)/Petitioner(div)/PR(probate)
+    docket_detail: Mapped[Optional[dict]] = mapped_column(JSONB)  # full scrape_case() payload
+    balance_due: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 2))  # Financial section Balance Due
+    docket_status: Mapped[Optional[str]] = mapped_column(String(30))  # ok|case_number_missing|not_found|blocked|error
+    # Promoted (queryable) projections of the docket payload — kept alongside docket_detail.
+    court_docket_parties: Mapped[Optional[list]] = mapped_column(JSONB)  # scraped parties[]
+    court_docket_events: Mapped[Optional[list]] = mapped_column(JSONB)   # scraped events[]
+    court_docket_scraped_at: Mapped[Optional[datetime]] = mapped_column(DateTime)  # detail-scrape timestamp (UTC)
+
     # Match provenance
     match_confidence: Mapped[Optional[Decimal]] = mapped_column(Numeric(4, 3), nullable=True)  # 0.000–1.000
     match_method: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)  # legal_desc | owner_name | llm_verified | address | manual
@@ -565,7 +584,13 @@ class LegalProceeding(Base):
         Index("idx_proceeding_filing_date", "filing_date"),
         Index("idx_proceeding_case_number", "case_number"),
         Index("idx_proceeding_meta_data", "meta_data", postgresql_using="gin"),
+        Index("idx_proceeding_docket_status", "docket_status"),
         CheckConstraint("record_type IN ('Probate', 'Eviction', 'Bankruptcy', 'Divorce')", name="check_proceeding_record_type"),
+        CheckConstraint(
+            "docket_status IS NULL OR docket_status IN "
+            "('ok','case_number_missing','not_found','blocked','error')",
+            name="check_proceeding_docket_status",
+        ),
     )
 
     def __repr__(self):
@@ -1384,7 +1409,7 @@ class EnrichedContact(Base):
     raw_response: Mapped[Optional[dict]] = mapped_column(JSONB)
 
     # Source tracking
-    source: Mapped[str] = mapped_column(String(50), nullable=False)   # batch_skip_tracing | idi | pdl | tracerfy
+    source: Mapped[str] = mapped_column(String(50), nullable=False)   # batch_skip_tracing | idi | pdl
     match_success: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     # Which named individual was traced. NULL for legacy single-trace rows
@@ -1395,11 +1420,6 @@ class EnrichedContact(Base):
     traced_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     # Waterfall quality score (0.000–1.000) — set by the waterfall coordinator
     confidence: Mapped[Optional[float]] = mapped_column(Numeric(4, 3), nullable=True)
-    verification_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
-    superseded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    superseded_by_contact_id: Mapped[Optional[int]] = mapped_column(
-        ForeignKey("enriched_contacts.id"), nullable=True
-    )
 
     # Audit
     enriched_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
@@ -1409,12 +1429,7 @@ class EnrichedContact(Base):
     __table_args__ = (
         Index("idx_enriched_match_success", "match_success"),
         Index("idx_enriched_source", "source"),
-        Index("idx_enriched_verification_status", "verification_status"),
-        CheckConstraint("source IN ('batch_skip_tracing', 'idi', 'pdl', 'tracerfy')", name="check_enriched_source"),
-        CheckConstraint(
-            "verification_status IS NULL OR verification_status IN ('valid','invalid','unknown')",
-            name="check_enriched_verification_status",
-        ),
+        CheckConstraint("source IN ('batch_skip_tracing', 'idi', 'pdl')", name="check_enriched_source"),
     )
 
     def __repr__(self):
@@ -2306,7 +2321,7 @@ class LearningCard(Base):
         CheckConstraint(
             "card_type IN ('message_perf', 'deal_pattern', 'ab_result', "
             "'churn_signal', 'pricing_test', 'general', "
-            "'autonomy_summary', 'kill_switch_scorecard', 'win_autopsy')",
+            "'autonomy_summary')",      # fa036 — weekly Cora autonomy scorecard
             name="check_card_type",
         ),
         UniqueConstraint("card_date", "card_type", name="uq_learning_card_date_type"),
@@ -2719,108 +2734,6 @@ class SmsOptIn(Base):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Compliance — T&C / TCPA Consent Audit Trail
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-class ConsentAcceptance(Base):
-    """
-    Granular audit trail for every T&C + TCPA consent interaction.
-    One row per signup/checkout/waitlist submit — NOT deduplicated, because
-    each interaction captures distinct scroll-timing and version data.
-
-    For T&C acceptance:
-      - subscriber_id / phone / email / ip_address / user_agent
-      - terms_version / privacy_version / accepted_at / source_flow
-      - modal_opened_at / modal_scrolled_to_end_at
-      - accepted_text_hash (SHA-256 of rendered text)
-
-    For TCPA marketing consent (optional):
-      - tcpa_consent_text / tcpa_consent_version / tcpa_checked_at
-      - consent_scope / not_condition_of_purchase_ack (must be true)
-    """
-    __tablename__ = "consent_acceptances"
-
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-
-    # ── Identity ──────────────────────────────────────────────────────────────
-    # Linkable to subscriber or waitlist entry after creation
-    subscriber_id: Mapped[Optional[int]] = mapped_column(
-        Integer, ForeignKey("subscribers.id"), nullable=True, index=True
-    )
-    waitlist_entry_id: Mapped[Optional[int]] = mapped_column(
-        BigInteger, ForeignKey("waitlist_entries.id"), nullable=True, index=True
-    )
-    phone: Mapped[Optional[str]] = mapped_column(String(20), nullable=True, index=True)
-    email: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
-
-    # ── T&C acceptance (always required) ──────────────────────────────────────
-    terms_version: Mapped[str] = mapped_column(String(20), nullable=False)
-    privacy_version: Mapped[str] = mapped_column(String(20), nullable=False)
-    accepted_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False,
-        default=lambda: datetime.now(timezone.utc),
-    )
-    source_flow: Mapped[str] = mapped_column(
-        String(30), nullable=False, default="waitlist",
-    )
-    ip_address: Mapped[Optional[str]] = mapped_column(String(45), nullable=True)
-    user_agent: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-
-    # ── Scroll-to-bottom timestamps (T&C modal) ──────────────────────────────
-    modal_opened_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime(timezone=True), nullable=True,
-    )
-    modal_scrolled_to_end_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime(timezone=True), nullable=True,
-    )
-
-    # ── Accepted-text hash (SHA-256 of the exact rendered T&C + Privacy text) ─
-    accepted_text_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-
-    # ── TCPA marketing consent (optional — never a condition of purchase) ─────
-    tcpa_consent_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    tcpa_consent_version: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
-    tcpa_checked_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime(timezone=True), nullable=True,
-    )
-    consent_scope: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
-    not_condition_of_purchase_ack: Mapped[Optional[bool]] = mapped_column(
-        Boolean, nullable=True,
-    )
-
-    # ── Audit ─────────────────────────────────────────────────────────────────
-    county_id: Mapped[Optional[str]] = mapped_column(
-        String(50), nullable=True, default="hillsborough",
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False,
-        default=lambda: datetime.now(timezone.utc),
-    )
-
-    __table_args__ = (
-        CheckConstraint(
-            "source_flow IN ('waitlist','signup','checkout','county_launch','free_signup')",
-            name="ck_consent_source_flow",
-        ),
-        CheckConstraint(
-            "consent_scope IS NULL OR consent_scope IN ('marketing','waitlist_notify','lead_alerts')",
-            name="ck_consent_scope",
-        ),
-        Index("idx_consent_email", "email"),
-        Index("idx_consent_accepted_at", "accepted_at"),
-        Index("idx_consent_subscriber", "subscriber_id"),
-        Index("idx_consent_waitlist", "waitlist_entry_id"),
-    )
-
-    def __repr__(self) -> str:
-        return (
-            f"<ConsentAcceptance(id={self.id}, email={self.email}, "
-            f"flow={self.source_flow}, tcpa={'YES' if self.tcpa_checked_at else 'NO'})>"
-        )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # Agents — Cora LangGraph Audit Log
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2863,7 +2776,6 @@ class AgentDecision(Base):
     approved_by: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
     overridden_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     overridden_by: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
-    override_reason_code: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
     override_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     playbook_id: Mapped[Optional[int]] = mapped_column(
         BigInteger, ForeignKey("cora_playbook.id", ondelete="SET NULL"), nullable=True,
@@ -2880,17 +2792,8 @@ class AgentDecision(Base):
             "'rejected','overridden','recommendation_only')",
             name="check_agent_autonomy_class",
         ),
-        CheckConstraint(
-            "override_reason_code IS NULL OR override_reason_code IN ("
-            "'factual_error','compliance_risk','wrong_audience','bad_timing',"
-            "'low_lead_quality','offer_mismatch','tone_or_brand_risk',"
-            "'duplicate_or_redundant','customer_context_missing',"
-            "'operator_strategy','other')",
-            name="check_agent_override_reason_code",
-        ),
         Index("idx_agent_decisions_graph_started", "graph_name", "started_at"),
         Index("idx_agent_decisions_subscriber_started", "subscriber_id", "started_at"),
-        Index("idx_agent_decisions_override_reason_code", "override_reason_code"),
     )
 
     def __repr__(self):
@@ -3189,35 +3092,6 @@ class CountySource(Base):
         return f"<CountySource(county_id={self.county_id!r}, signal_type={self.signal_type!r})>"
 
 
-class CoraEventQueue(Base):
-    """
-    Durable fallback queue for Cora events published when Redis is unavailable.
-
-    Primary delivery path: Redis Pub/Sub channel "cora:events".
-    This table is the secondary path — events are inserted here when Redis
-    publish fails, then swept by the agents process (listen_postgres sweep loop).
-    The idempotency_key unique constraint prevents double-processing.
-    """
-    __tablename__ = "cora_event_queue"
-
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    event_type: Mapped[str] = mapped_column(Text, nullable=False)
-    subscriber_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
-    idempotency_key: Mapped[Optional[str]] = mapped_column(Text, nullable=True, unique=True)
-    status: Mapped[str] = mapped_column(Text, nullable=False, default="pending", server_default="pending")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-    processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-
-    __table_args__ = (
-        Index("idx_cora_event_queue_status_created", "status", "created_at"),
-    )
-
-    def __repr__(self):
-        return f"<CoraEventQueue(id={self.id}, event_type={self.event_type!r}, status={self.status!r})>"
-
-
 class CountyColumnMapping(Base):
     """
     Column mapping for a given source.  One row per (source, approval event).
@@ -3506,9 +3380,6 @@ class DBPRContact(Base):
     company_name: Mapped[Optional[str]] = mapped_column(String(255))
     company_name_status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
     company_name_scraped_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
-
-    email: Mapped[Optional[str]] = mapped_column(String(200))   # raw email from DBPR file
-    phone: Mapped[Optional[str]] = mapped_column(String(20))    # raw phone from DBPR file
 
     enrichment_status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
     enrichment_attempted_at: Mapped[Optional[datetime]] = mapped_column(DateTime)

@@ -195,7 +195,7 @@ async def _scrape_with_playwright(
             df = await _execute_playwright_code_on_page(page, playwright_code, url, start_str, end_str, county_id)
     else:
         from playwright.async_api import async_playwright
-        # _proxy = None if no_proxy else get_playwright_proxy()
+        _proxy = None if no_proxy else get_playwright_proxy()
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=not headful,
@@ -205,7 +205,7 @@ async def _scrape_with_playwright(
             context = await browser.new_context(
                 user_agent=STEALTH_UA,
                 accept_downloads=True,
-                # proxy=_proxy,
+                proxy=_proxy,
             )
             page = await context.new_page()
             await apply_stealth_to_page(page)
@@ -366,7 +366,7 @@ async def _scrape_pinellas_with_2captcha(
 
     url = source.get("url", "")
     RAW_EVICTIONS_DIR.mkdir(parents=True, exist_ok=True)
-    # _proxy = None if no_proxy else get_playwright_proxy()
+    _proxy = None if no_proxy else get_playwright_proxy()
 
     logger.info("[evictions-captcha] Pinellas direct scrape: %s → %s  url=%s", start_str, end_str, url)
 
@@ -379,7 +379,7 @@ async def _scrape_pinellas_with_2captcha(
         context = await browser.new_context(
             user_agent=STEALTH_UA,
             accept_downloads=True,
-            # proxy=_proxy,
+            proxy=_proxy,
         )
         page = await context.new_page()
         await apply_stealth_to_page(page)
@@ -721,7 +721,7 @@ async def _download_civil_filing_browser(
         browser_kwargs.update(
             user_agent=STEALTH_UA,
             enable_default_extensions=True,
-            # proxy=None if no_proxy else get_browser_use_proxy(),
+            proxy=None if no_proxy else get_browser_use_proxy(),
         )
 
     browser = Browser(**browser_kwargs)
@@ -774,13 +774,16 @@ def download_latest_civil_filing(
     # output_format=excel check runs BEFORE scrape_mode so that the 2captcha path
     # always wins for Pinellas even when the DB config also has scrape_mode set.
     if output_format == "excel":
-        logger.info("[evictions] County '%s' — using direct Playwright + 2captcha path", county_id)
-        return asyncio.run(
-            _scrape_pinellas_with_2captcha(
-                source, county_id, target_date, start_date, end_date,
-                headful=headful, no_proxy=no_proxy,
-            )
-        )
+        # Merged single-session: ONE captcha search exports the filing Excel AND
+        # clicks each case for docket detail (written to <dir>/eviction_*_detail.json).
+        from src.scrappers.court_docket.pinellas.civil_filing import scrape_pinellas_civil_with_detail
+        logger.info("[evictions] County '%s' — Pinellas courtrecords merged scrape+detail", county_id)
+        excel_path, _results = asyncio.run(scrape_pinellas_civil_with_detail(
+            "eviction", ["eviction"], source.get("url", ""),
+            target_date=target_date, start_date=start_date, end_date=end_date,
+            headful=headful, no_proxy=no_proxy, dest_dir=RAW_EVICTIONS_DIR,
+        ))
+        return excel_path
 
     if scrape_mode in ("playwright_only", "playwright_then_ai"):
         logger.info("[evictions] Using playwright mode for '%s'", county_id)
@@ -1056,6 +1059,8 @@ if __name__ == "__main__":
                         help="Run browser in headed (visible) mode for debugging")
     parser.add_argument("--no-proxy", dest="no_proxy", action="store_true", default=False,
                         help="Disable Oxylabs proxy for all requests")
+    parser.add_argument("--skip-docket", dest="skip_docket", action="store_true", default=False,
+                        help="Skip Stage-2 court-docket detail enrichment (Pinellas only)")
     add_load_to_db_arg(parser)
     args = parser.parse_args()
 
@@ -1081,5 +1086,15 @@ if __name__ == "__main__":
             sys.exit(1)
     elif args.load_to_db:
         logger.warning("[evictions] Skipping database load due to scraping failure")
+
+    # Stage 2 — apply docket detail scraped during the merged search (no re-search/captcha).
+    if success and args.load_to_db and args.county_id == "pinellas" and not args.skip_docket:
+        from src.scrappers.court_docket.pinellas.detail_enrichment import apply_detail_from_json
+        _dj = sorted(RAW_EVICTIONS_DIR.glob("eviction_*_detail.json"),
+                     key=lambda p: p.stat().st_mtime, reverse=True)
+        if _dj:
+            apply_detail_from_json("Eviction", _dj[0], county_id=args.county_id)
+        else:
+            logger.warning("[evictions] no docket detail JSON found — skipping detail apply")
 
     sys.exit(0 if success else 1)
