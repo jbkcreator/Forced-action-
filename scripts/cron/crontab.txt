@@ -110,6 +110,11 @@ COUNTY_ID=hillsborough
 # P3. Probate Filings        — 04:50 AM UTC / 12:50 AM EDT / 10:20 AM IST
 50 4 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.probate.probate_engine --load-to-db --county-id pinellas
 
+# P4. Divorce / Dissolution Filings — 04:52 AM UTC / 12:52 AM EDT / 10:22 AM IST
+#     Filters civil daily filings for DR (domestic relations) case types. Same
+#     Pinellas courtrecords portal as evictions/probate — runs --no-proxy.
+52 4 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.divorce.divorce_engine --load-to-db --county-id pinellas --no-proxy
+
 # P5. Liens + Deeds + Judgments — 05:05 AM UTC / 01:05 AM EDT / 10:35 AM IST
 5 5 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.liens.lien_engine --start-date $(date -d "1 day ago" +\%Y-\%m-\%d) --end-date $(date +\%Y-\%m-\%d) --load-to-db --county-id pinellas
 

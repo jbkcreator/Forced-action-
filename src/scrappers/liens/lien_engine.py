@@ -986,9 +986,12 @@ def _load_to_database(county_id: str, t0: float) -> None:
         else:
             logger.info("[DB] No new %s records to load", label)
 
-    # ORI-sourced probate and divorce → legal_proceedings via column bridge
-    _load_ori_legal_proceedings(county_id, PROCESSED_DATA_DIR / "probate", "probate")
-    _load_ori_legal_proceedings(county_id, PROCESSED_DATA_DIR / "divorce", "divorce_filings")
+    # ORI-sourced probate and divorce are intentionally NOT loaded here.
+    # The dedicated probate_engine and divorce_engine (courtrecords portal,
+    # real UCN case numbers + docket detail) now own Pinellas probate/divorce.
+    # Loading the ORI buckets too produced duplicate numeric-case-number rows.
+    # The bucket CSVs are still written by _save_buckets for traceability,
+    # but are no longer ingested into legal_proceedings.
 
 
 def _record_stats(total: int, success: bool, t0: float, county_id: str,

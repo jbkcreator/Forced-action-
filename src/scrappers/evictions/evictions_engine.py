@@ -1089,11 +1089,16 @@ if __name__ == "__main__":
 
     # Stage 2 — apply docket detail scraped during the merged search (no re-search/captcha).
     if success and args.load_to_db and args.county_id == "pinellas" and not args.skip_docket:
-        from src.scrappers.court_docket.pinellas.detail_enrichment import apply_detail_from_json
+        from src.scrappers.court_docket.pinellas.detail_enrichment import (
+            apply_detail_from_json, rescue_unmatched_from_detail,
+        )
         _dj = sorted(RAW_EVICTIONS_DIR.glob("eviction_*_detail.json"),
                      key=lambda p: p.stat().st_mtime, reverse=True)
         if _dj:
             apply_detail_from_json("Eviction", _dj[0], county_id=args.county_id)
+            # Rescue address-less evictions that failed pass-1: re-match them
+            # using the defendant mailing address scraped into the docket detail.
+            rescue_unmatched_from_detail("Eviction", _dj[0], county_id=args.county_id)
         else:
             logger.warning("[evictions] no docket detail JSON found — skipping detail apply")
 

@@ -112,6 +112,15 @@ PROBATE_CASE_PATTERNS = [
     "Trust Administration",
 ]
 
+# Keywords used to select case types in the Pinellas courtrecords #caseTypesList
+# filter during the merged scrape+detail search (scrape_pinellas_civil_with_detail).
+# Each list is matched (case-insensitively) against the live dropdown options.
+PINELLAS_CASE_TYPE_KEYWORDS: dict[str, list[str]] = {
+    "eviction": ["eviction"],
+    "probate": ["estate", "guardianship"],
+    "divorce": ["dissolution"],
+}
+
 # =============================================================================
 # TAX DELINQUENCY CONFIGURATION
 # =============================================================================

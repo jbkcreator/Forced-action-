@@ -308,6 +308,102 @@ def apply_detail_from_json(record_type: str, detail_json_path, county_id: str = 
     return stats
 
 
+def rescue_unmatched_from_detail(record_type: str, detail_json_path,
+                                 county_id: str = "pinellas") -> dict:
+    """Option-A rescue pass (Eviction only).
+
+    The Pinellas eviction filing export carries no property address, so
+    address-less evictions fail pass-1 matching and land in unmatched_records.
+    The docket detail scraped in Stage-2 DOES carry the defendant's mailing
+    address (= the property). Re-feed those quarantined rows through the eviction
+    loader with that address injected, so they now match by address and become
+    real leads — reusing the loader's own thresholds/tiering (>=0.92 matched,
+    0.75-0.92 pending_review). Rows that become leads are flagged matched in
+    unmatched_records so they are not re-rescued. Never raises.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+    import pandas as pd
+
+    stats = {"record_type": record_type, "candidates": 0, "rescued": 0,
+             "still_unmatched": 0, "failed": 0}
+    if record_type != "Eviction":
+        return stats  # only evictions: defendant mailing address == property address
+
+    try:
+        cases = _json.loads(_Path(detail_json_path).read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("[docket-rescue] could not read detail JSON %s: %s", detail_json_path, exc)
+        return stats
+
+    addr_by_case: dict[str, str] = {}
+    for c in cases:
+        cn = c.get("case_number")
+        mailing = _promote_mailing(c.get("parties", []), record_type) if cn else None
+        if cn and mailing and _looks_like_address(mailing):
+            addr_by_case[cn] = mailing
+    if not addr_by_case:
+        return stats
+
+    db = Database()
+    try:
+        with db.session_scope() as s:
+            rows = s.execute(text("""
+                SELECT id, raw_data FROM unmatched_records
+                WHERE source_type = 'evictions' AND county_id = :cty
+                  AND match_status IN ('unmatched', 'pending_review')
+                  AND raw_data->>'CaseNumber' = ANY(:cases)
+            """), {"cty": county_id, "cases": list(addr_by_case.keys())}).fetchall()
+    except Exception as exc:
+        logger.warning("[docket-rescue] could not query unmatched_records: %s", str(exc)[:160])
+        return stats
+    if not rows:
+        return stats
+    stats["candidates"] = len(rows)
+
+    by_case: dict[str, dict] = {}   # one re-feed row per case (rows can be duplicated)
+    for _ur_id, raw in rows:
+        raw = dict(raw or {})
+        cn = raw.get("CaseNumber")
+        if not cn or cn not in addr_by_case or cn in by_case:
+            continue
+        raw["PartyAddress"] = addr_by_case[cn]
+        raw.setdefault("PartyType", "Defendant")
+        by_case[cn] = raw
+    if not by_case:
+        return stats
+    attempted = list(by_case.keys())
+
+    try:
+        df = pd.DataFrame(list(by_case.values()))
+        with db.session_scope() as s:
+            _loader_for(record_type, s, county_id).load_from_dataframe(df, skip_duplicates=True)
+        # Separate session: leads are committed now — flag EVERY quarantine row
+        # for the cases that became leads (a case may have duplicate rows).
+        with db.session_scope() as s:
+            matched_cases = [r[0] for r in s.execute(text("""
+                SELECT case_number FROM legal_proceedings
+                WHERE county_id = :cty AND record_type = 'Eviction'
+                  AND case_number = ANY(:cases)
+            """), {"cty": county_id, "cases": attempted}).fetchall()]
+            if matched_cases:
+                s.execute(text("""
+                    UPDATE unmatched_records
+                    SET match_status = 'matched', match_attempted_at = now()
+                    WHERE source_type = 'evictions' AND county_id = :cty
+                      AND match_status IN ('unmatched', 'pending_review')
+                      AND raw_data->>'CaseNumber' = ANY(:cases)
+                """), {"cty": county_id, "cases": matched_cases})
+            stats["rescued"] = len(matched_cases)
+            stats["still_unmatched"] = len(attempted) - len(matched_cases)
+    except Exception as exc:
+        stats["failed"] += 1
+        logger.warning("[docket-rescue] rescue load failed: %s", str(exc)[:200])
+
+    logger.info("[docket-rescue] %s/%s: %s", county_id, record_type, stats)
+    return stats
+
+
 def enrich_proceedings_detail(
     record_type: str,
     county_id: str = "pinellas",
