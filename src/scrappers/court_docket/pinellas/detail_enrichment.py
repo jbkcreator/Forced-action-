@@ -108,6 +108,68 @@ def _curate(result: dict) -> dict:
     return {k: result.get(k) for k in _DETAIL_KEYS}
 
 
+# ── Second-pass matching ────────────────────────────────────────────────────
+# Pass 1 (loader) matches the filing's party NAME vs properties and inserts the
+# row. Pass 2 (here) matches the scraped mailing_address vs properties to
+# confirm/strengthen that match — agreement boosts match_confidence; a different
+# property is logged as a conflict and the name match is KEPT (mailing addr,
+# esp. divorce petitioner, may legitimately differ from the subject property).
+# Pure-SQL cascade (no LLM/Anthropic cost). Audit recorded in docket_detail.
+_LOADER_BY_TYPE: dict[str, str] = {
+    "Eviction": "EvictionLoader",
+    "Divorce": "DivorceLoader",
+    "Probate": "ProbateLoader",
+}
+_ADDR_CONFIRM_CONFIDENCE = Decimal("0.98")
+
+
+def _loader_for(record_type: str, session, county_id: str):
+    from src.loaders import legal_proceedings as _lp
+    cls = getattr(_lp, _LOADER_BY_TYPE.get(record_type, "EvictionLoader"))
+    return cls(session, county_id=county_id)
+
+
+def _second_pass_address_match(session, lp, mailing: str, record_type: str,
+                               county_id: str) -> Optional[dict]:
+    """Match scraped mailing_address vs properties as a second, independent
+    signal. Agreement with the pass-1 property -> raise match_confidence; a
+    different property -> keep pass-1, flag conflict. Never raises. Returns a
+    small audit dict (stored in docket_detail) or None when not applicable."""
+    if not _looks_like_address(mailing):
+        return None
+    try:
+        from src.loaders._address_utils import split_address
+        loader = _loader_for(record_type, session, county_id)
+        _, city, zipc = split_address(str(mailing))
+        prop, _method, score = loader.find_property_cascade(
+            address=str(mailing), zip_code=zipc, city=city,
+            addr_threshold=loader._thresholds.address_floor,
+        )
+    except Exception as exc:
+        logger.warning("[docket-detail] pass-2 match error (%s): %s",
+                       getattr(lp, "case_number", "?"), str(exc)[:120])
+        return None
+
+    if not prop:
+        return {"result": "no_addr_match"}
+
+    if prop.id == lp.property_id:
+        before = lp.match_confidence
+        if (before or Decimal(0)) < _ADDR_CONFIRM_CONFIDENCE:
+            lp.match_confidence = _ADDR_CONFIRM_CONFIDENCE
+        logger.info("[docket-detail] pass-2 CONFIRM id=%s pid=%s conf %s->%s (addr score=%s)",
+                    lp.id, prop.id, before, lp.match_confidence, score)
+        return {"result": "confirmed", "property_id": prop.id, "addr_score": score,
+                "confidence_before": float(before) if before is not None else None,
+                "confidence_after": float(lp.match_confidence)}
+
+    logger.warning("[docket-detail] pass-2 CONFLICT id=%s name_pid=%s addr_pid=%s "
+                   "(addr score=%s) — keeping name match",
+                   lp.id, lp.property_id, prop.id, score)
+    return {"result": "conflict", "name_property_id": lp.property_id,
+            "addr_property_id": prop.id, "addr_score": score}
+
+
 def _select_candidates(county_id: str, record_type: str, today_only: bool,
                        limit: Optional[int]) -> list[tuple[int, str]]:
     """Return [(id, case_number)] for un-docketed rows with a clean UCN."""
@@ -136,7 +198,8 @@ async def _run(county_id: str, record_type: str, today_only: bool,
     cands = _select_candidates(county_id, record_type, today_only, limit)
     stats = {"record_type": record_type, "candidates": len(cands),
              "ok": 0, "not_found": 0, "case_number_missing": 0,
-             "blocked": 0, "error": 0, "failed": 0}
+             "blocked": 0, "error": 0, "failed": 0,
+             "addr_confirmed": 0, "addr_conflict": 0}
     if not cands:
         logger.info("[docket-detail] %s/%s: no un-docketed rows", county_id, record_type)
         return stats
@@ -155,7 +218,7 @@ async def _run(county_id: str, record_type: str, today_only: bool,
                     if lp is None:
                         continue
                     lp.docket_status = status
-                    lp.docket_detail = _curate(result)
+                    curated = _curate(result)
                     # Promoted queryable projections (alongside the full docket_detail blob).
                     lp.court_docket_parties = result.get("parties") or []
                     lp.court_docket_events = result.get("events") or []
@@ -164,6 +227,14 @@ async def _run(county_id: str, record_type: str, today_only: bool,
                         lp.balance_due = balance
                     if mailing:
                         lp.mailing_address = mailing
+                        sp = _second_pass_address_match(s, lp, mailing, record_type, county_id)
+                        if sp:
+                            curated["second_pass_match"] = sp
+                            if sp.get("result") == "confirmed":
+                                stats["addr_confirmed"] += 1
+                            elif sp.get("result") == "conflict":
+                                stats["addr_conflict"] += 1
+                    lp.docket_detail = curated
                 stats[status] = stats.get(status, 0) + 1
                 logger.info("[docket-detail] [%d/%d] id=%s %s -> %s (parties=%d events=%d)",
                             i, len(cands), row_id, case_number, status,
@@ -187,7 +258,8 @@ def apply_detail_from_json(record_type: str, detail_json_path, county_id: str = 
     import json as _json
     from pathlib import Path as _Path
 
-    stats = {"record_type": record_type, "updated": 0, "skipped_no_row": 0, "failed": 0}
+    stats = {"record_type": record_type, "updated": 0, "skipped_no_row": 0, "failed": 0,
+             "addr_confirmed": 0, "addr_conflict": 0}
     try:
         cases = _json.loads(_Path(detail_json_path).read_text(encoding="utf-8"))
     except Exception as exc:
@@ -212,7 +284,7 @@ def apply_detail_from_json(record_type: str, detail_json_path, county_id: str = 
                     stats["skipped_no_row"] += 1
                     continue
                 lp.docket_status = c.get("status") or "error"
-                lp.docket_detail = _curate(c)
+                curated = _curate(c)
                 lp.court_docket_parties = c.get("parties") or []
                 lp.court_docket_events = c.get("events") or []
                 lp.court_docket_scraped_at = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -220,6 +292,14 @@ def apply_detail_from_json(record_type: str, detail_json_path, county_id: str = 
                     lp.balance_due = balance
                 if mailing:
                     lp.mailing_address = mailing
+                    sp = _second_pass_address_match(s, lp, mailing, record_type, county_id)
+                    if sp:
+                        curated["second_pass_match"] = sp
+                        if sp.get("result") == "confirmed":
+                            stats["addr_confirmed"] += 1
+                        elif sp.get("result") == "conflict":
+                            stats["addr_conflict"] += 1
+                lp.docket_detail = curated
             stats["updated"] += 1
         except Exception as exc:
             stats["failed"] += 1
