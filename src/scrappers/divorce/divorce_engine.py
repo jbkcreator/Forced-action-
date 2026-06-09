@@ -29,6 +29,7 @@ from bs4 import BeautifulSoup
 from config.constants import (
     RAW_DIVORCE_DIR,
     DIVORCE_CASE_PATTERNS,
+    PINELLAS_CASE_TYPE_KEYWORDS,
     CIVIL_FILING_PATTERN,
     CIVIL_FILINGS_URL,
     HILLSCLERK_BASE_URL,
@@ -125,7 +126,7 @@ async def _scrape_with_playwright(
     url = source.get("url", "")
     RAW_DIVORCE_DIR.mkdir(parents=True, exist_ok=True)
 
-    # _proxy = None if no_proxy else get_playwright_proxy()
+    _proxy = None if no_proxy else get_playwright_proxy()
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=not headful,
@@ -133,7 +134,7 @@ async def _scrape_with_playwright(
             args=STEALTH_ARGS,
         )
         context = await browser.new_context(
-            user_agent=STEALTH_UA, accept_downloads=True,  # proxy=_proxy,
+            user_agent=STEALTH_UA, accept_downloads=True, proxy=_proxy,
         )
         page = await context.new_page()
         await apply_stealth_to_page(page)
@@ -200,7 +201,7 @@ async def _download_civil_filing_browser(
         minimum_wait_page_load_time=1.5,
         wait_between_actions=1.0,
         args=STEALTH_ARGS,
-        # proxy=None if no_proxy else get_browser_use_proxy(),
+        proxy=None if no_proxy else get_browser_use_proxy(),
     )
     await browser.start()
     await apply_stealth_to_browser_use(browser)
@@ -241,6 +242,22 @@ def download_latest_civil_filing(
     scrape_mode = source.get("scrape_mode", "")
     output_format = source.get("output_format", "csv")
 
+    # Pinellas courtrecords: deterministic Playwright + 2captcha. Checked BEFORE
+    # scrape_mode (mirrors evictions_engine). Replaces the browser-use AI agent
+    # that could not solve the reCAPTCHA.
+    if output_format == "excel":
+        # Merged single-session: ONE captcha search exports the filing Excel AND
+        # clicks each case for docket detail (written to <dir>/divorce_*_detail.json).
+        from src.scrappers.court_docket.pinellas.civil_filing import scrape_pinellas_civil_with_detail
+        kws = PINELLAS_CASE_TYPE_KEYWORDS.get("divorce", ["dissolution"])
+        logger.info("[divorce] County '%s' — Pinellas courtrecords merged scrape+detail", county_id)
+        excel_path, _results = asyncio.run(scrape_pinellas_civil_with_detail(
+            "divorce", kws, source.get("url", ""),
+            target_date=target_date, headful=headful, no_proxy=no_proxy,
+            dest_dir=RAW_DIVORCE_DIR,
+        ))
+        return excel_path
+
     if scrape_mode == "static_download":
         logger.info("[divorce] Using static_download mode for '%s'", county_id)
         return _static_download(source, target_date)
@@ -264,15 +281,6 @@ def download_latest_civil_filing(
                     headful=headful, no_proxy=no_proxy,
                 )
             )
-
-    if output_format == "excel":
-        logger.info("[divorce] County '%s' uses browser download (output_format=excel)", county_id)
-        return asyncio.run(
-            _download_civil_filing_browser(
-                county_id, source, target_date, RAW_DIVORCE_DIR,
-                headful=headful, no_proxy=no_proxy,
-            )
-        )
 
     # Hillsborough / CSV directory-listing path
     _county = _get_county(county_id)
@@ -366,6 +374,13 @@ def filter_divorce_cases(file_path: Path, county_id: str = "hillsborough") -> pd
 
     logger.info("[divorce] Raw civil filing: %d rows (filter col: '%s')", len(df), style_col)
 
+    # Pinellas courtrecords export: case type already filtered in-browser
+    # (Dissolution Of Marriage). Expand "PETITIONER Vs. RESPONDENT" into
+    # Petitioner/Respondent party rows; skip the pattern re-filter.
+    if "Style/Description" in df.columns:
+        from src.scrappers.court_docket.pinellas.civil_filing import normalize_style_col
+        return normalize_style_col(df, "divorce")
+
     if style_col not in df.columns:
         logger.warning("[divorce] '%s' column not found — columns: %s", style_col, list(df.columns))
         return pd.DataFrame()
@@ -458,6 +473,8 @@ if __name__ == "__main__":
                         help="Run browser in headed (visible) mode for debugging")
     parser.add_argument("--no-proxy", dest="no_proxy", action="store_true", default=False,
                         help="Disable Oxylabs proxy for all requests")
+    parser.add_argument("--skip-docket", dest="skip_docket", action="store_true", default=False,
+                        help="Skip Stage-2 court-docket detail enrichment (Pinellas only)")
     add_load_to_db_arg(parser)
     args = parser.parse_args()
 
@@ -482,5 +499,15 @@ if __name__ == "__main__":
             sys.exit(1)
     elif args.load_to_db:
         logger.warning("[divorce] Skipping DB load due to scraping failure")
+
+    # Stage 2 — apply docket detail scraped during the merged search (no re-search/captcha).
+    if success and args.load_to_db and args.county_id == "pinellas" and not args.skip_docket:
+        from src.scrappers.court_docket.pinellas.detail_enrichment import apply_detail_from_json
+        _dj = sorted(RAW_DIVORCE_DIR.glob("divorce_*_detail.json"),
+                     key=lambda p: p.stat().st_mtime, reverse=True)
+        if _dj:
+            apply_detail_from_json("Divorce", _dj[0], county_id=args.county_id)
+        else:
+            logger.warning("[divorce] no docket detail JSON found — skipping detail apply")
 
     sys.exit(0 if success else 1)

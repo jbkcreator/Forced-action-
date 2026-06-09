@@ -78,14 +78,28 @@ def _parse_money(raw: Optional[str]) -> Optional[Decimal]:
         return None
 
 
+_DATE_ONLY_RE = re.compile(r"^\s*\d{1,2}/\d{1,2}/\d{2,4}\s*$")
+
+
+def _looks_like_address(s: Optional[str]) -> bool:
+    """A real mailing address has letters (street/city/state). Reject DOB / number-
+    only values — some criminal/family party_address cells hold a date of birth."""
+    if not s:
+        return False
+    if _DATE_ONLY_RE.match(s):
+        return False
+    return bool(re.search(r"[A-Za-z]", s))
+
+
 def _promote_mailing(parties: list[dict], record_type: str) -> Optional[str]:
-    """Pick the lead party's mailing address for this record_type, or None."""
+    """Pick the lead party's mailing address for this record_type, or None.
+    Skips party_address values that are a DOB / not a real address."""
     wants = _MAILING_PARTY.get(record_type, [])
     for want in wants:  # priority order
         for p in parties or []:
             ptype = (p.get("party_type") or "").lower()
             addr = p.get("party_address")
-            if want in ptype and addr:
+            if want in ptype and _looks_like_address(addr):
                 return addr
     return None
 
@@ -159,6 +173,58 @@ async def _run(county_id: str, record_type: str, today_only: bool,
                 logger.warning("[docket-detail] [%d/%d] id=%s %s FAILED: %s",
                                i, len(cands), row_id, case_number, str(exc)[:160])
     logger.info("[docket-detail] %s/%s DONE: %s", county_id, record_type, stats)
+    return stats
+
+
+def apply_detail_from_json(record_type: str, detail_json_path, county_id: str = "pinellas") -> dict:
+    """Post-load step for the MERGED daily flow: take the detail JSON the merged
+    scraper wrote (already-scraped, NO re-search, NO captcha) and UPDATE the rows
+    the loader just inserted (matched, docket_status IS NULL) by case_number.
+
+    Only matched rows exist in legal_proceedings, so unmatched grid cases are
+    silently ignored. Never raises — a write hiccup never fails the daily run.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    stats = {"record_type": record_type, "updated": 0, "skipped_no_row": 0, "failed": 0}
+    try:
+        cases = _json.loads(_Path(detail_json_path).read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("[docket-detail] could not read detail JSON %s: %s", detail_json_path, exc)
+        return stats
+
+    db = Database()
+    for c in cases:
+        case_number = c.get("case_number")
+        if not case_number:
+            continue
+        try:
+            mailing = _promote_mailing(c.get("parties", []), record_type)
+            balance = _parse_money(c.get("balance_due"))
+            with db.session_scope() as s:
+                lp = (s.query(LegalProceeding)
+                        .filter(LegalProceeding.county_id == county_id,
+                                LegalProceeding.case_number == case_number,
+                                LegalProceeding.docket_status.is_(None))
+                        .first())
+                if lp is None:
+                    stats["skipped_no_row"] += 1
+                    continue
+                lp.docket_status = c.get("status") or "error"
+                lp.docket_detail = _curate(c)
+                lp.court_docket_parties = c.get("parties") or []
+                lp.court_docket_events = c.get("events") or []
+                lp.court_docket_scraped_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                if balance is not None:
+                    lp.balance_due = balance
+                if mailing:
+                    lp.mailing_address = mailing
+            stats["updated"] += 1
+        except Exception as exc:
+            stats["failed"] += 1
+            logger.warning("[docket-detail] apply %s failed: %s", case_number, str(exc)[:160])
+    logger.info("[docket-detail] apply_detail_from_json %s/%s: %s", county_id, record_type, stats)
     return stats
 
 
