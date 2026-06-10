@@ -144,6 +144,22 @@ if __name__ == "__main__":
     )
     parser = argparse.ArgumentParser(description="Scrape roofing permit incidents")
     parser.add_argument("--county-id", dest="county_id", default="hillsborough", help="County identifier (default: hillsborough)")
+    parser.add_argument("--backfill", action="store_true", help="Classify all permits ever loaded for this county (duplicates are skipped automatically)")
     args = parser.parse_args()
-    n = scrape_roofing_permits(county_id=args.county_id)
+
+    if args.backfill:
+        from src.core.database import get_db_context
+        from sqlalchemy import text
+        with get_db_context() as db:
+            row = db.execute(
+                text("SELECT MIN(issue_date) FROM building_permits WHERE county_id = :cid AND issue_date IS NOT NULL"),
+                {"cid": args.county_id},
+            ).fetchone()
+        earliest = row[0] if row and row[0] else date.today()
+        date_range = (earliest, date.today())
+        logger.info("[backfill] %s: classifying permits from %s to %s", args.county_id, earliest, date.today())
+    else:
+        date_range = None
+
+    n = scrape_roofing_permits(county_id=args.county_id, date_range=date_range)
     print(f"Done — {n} new roofing permit incidents created")

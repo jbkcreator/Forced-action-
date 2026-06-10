@@ -128,6 +128,9 @@ COUNTY_ID=hillsborough
 # P6. Building Permits       — 3x/day at 05:50, 13:50, 21:50 UTC (every 8h, Mon-Sat)
 50 5,13,21 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.permit.permit_engine --start-date $(date -d "1 day ago" +\%Y-\%m-\%d) --end-date $(date +\%Y-\%m-\%d) --load-to-db --county-id pinellas
 
+# P6b. Roofing Permits (classify from building_permits) — Pinellas — 06:22 AM UTC
+22 6 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.roofing_permits.roofing_permit_engine --county-id pinellas
+
 # P7. Foreclosure Auctions   — 06:20 AM UTC daily (every day, not just Mon-Sat)
 20 6 * * * $PROJECT/scripts/cron/run.sh src.scrappers.foreclosures.foreclosure_engine --date $(date +\%Y-\%m-\%d) --load-to-db --county-id pinellas
 
