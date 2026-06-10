@@ -88,13 +88,12 @@ def _null_description_count() -> int:
 
 
 def _monthly_chunks(start: date, end: date):
-    """Yield (chunk_start, chunk_end) one calendar month at a time."""
-    cursor = start.replace(day=1)
+    """Yield (chunk_start, chunk_end) in 7-day windows to avoid Accela portal pagination timeouts."""
+    cursor = start
     while cursor <= end:
-        next_month = (cursor.replace(day=28) + timedelta(days=4)).replace(day=1)
-        chunk_end = min(next_month - timedelta(days=1), end)
+        chunk_end = min(cursor + timedelta(days=6), end)
         yield cursor, chunk_end
-        cursor = next_month
+        cursor = chunk_end + timedelta(days=1)
 
 
 # ---------------------------------------------------------------------------
