@@ -879,8 +879,13 @@ if __name__ == "__main__":
         result = rematch_unmatched(source_type=args.source, limit=args.limit, county_id=args.county_id)
         print(result)
 
-        # LLM tiebreaker as second step (skippable via --skip-llm)
-        if not args.skip_llm:
+        # LLM tiebreaker as second step (skippable via --skip-llm, and disabled
+        # by default when llm_match_enabled=False — the weekly cron run takes
+        # this path, so it stays LLM-free unless explicitly re-enabled).
+        from config.settings import get_settings
+        if not args.skip_llm and not get_settings().llm_match_enabled:
+            logger.info("[rematch] LLM tiebreak skipped — llm_match_enabled=False (use --llm-only to force).")
+        if not args.skip_llm and get_settings().llm_match_enabled:
             llm_limit = min(args.limit, 1000)
             llm_result = llm_tiebreak_pending_review(
                 source_type=args.source,

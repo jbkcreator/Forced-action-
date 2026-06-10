@@ -114,6 +114,7 @@ COUNTY_ID=hillsborough
 35 4 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.evictions.evictions_engine --start-date $(date -d "1 day ago" +\%Y-\%m-\%d) --end-date $(date +\%Y-\%m-\%d) --load-to-db --county-id pinellas --no-proxy
 
 # P3. Probate Filings        — 04:50 AM UTC / 12:50 AM EDT / 10:20 AM IST
+#     Pinellas courtrecords portal — runs --no-proxy (Oxylabs tunnel fails).
 50 4 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.probate.probate_engine --load-to-db --county-id pinellas --no-proxy
 
 # P4. Divorce / Dissolution Filings — 04:52 AM UTC / 12:52 AM EDT / 10:22 AM IST

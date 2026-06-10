@@ -1067,6 +1067,13 @@ class BaseLoader(ABC):
         if current_best is None:
             return None, None
 
+        # LLM tiebreak disabled — hand off to pure score-based _classify_match.
+        # Returning the cascade match with method=None is equivalent to the LLM
+        # being unavailable for every score band (no behavioural special-casing).
+        from config.settings import get_settings
+        if not get_settings().llm_match_enabled and not force:
+            return current_best, None
+
         # High confidence — no LLM needed; preserve cascade-stage method
         if match_score >= HIGH_CONFIDENCE and not force:
             return current_best, None

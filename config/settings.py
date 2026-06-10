@@ -23,6 +23,11 @@ class AppSettings(BaseSettings):
 	firecrawl_api_key: SecretStr = Field(..., env="FIRECRAWL_API_KEY")
 	court_listener_api_key: SecretStr = Field(..., env="COURT_LISTENER_API_KEY")
 
+	# Property-matching LLM tiebreak. When False, borderline name matches
+	# (rapidfuzz 80-94) are NOT sent to Claude; matching falls back to pure
+	# score-based tiering (auto_match / review_min in config/matching.py).
+	llm_match_enabled: bool = Field(default=False, env="LLM_MATCH_ENABLED")
+
 	# Telnyx (phone deliverability sampler — carrier / line-type lookup)
 	telnyx_api_key: Optional[SecretStr] = Field(default=None, env="TELNYX_API_KEY")
 	telnyx_lookup_type: str = Field(default="carrier", env="TELNYX_LOOKUP_TYPE")
