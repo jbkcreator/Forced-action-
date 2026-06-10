@@ -63,8 +63,8 @@ class TaxDelinquencyLoader(BaseLoader):
         "account_number": ("account_number", "Account Number"),
         "alternate_key": ("alternate_key", "Alternate Key"),
         "parcel_number": ("parcel_number", "Parcel Number"),
-        "owner_name": ("owner_name", "Owner", "Owner Name", "Name"),
-        "owner_address": ("owner_address", "Owner Address", "Mailing Address"),
+        "owner_name": ("owner_name", "Owner", "Owner Name", "Name", "Billing Address Name"),
+        "owner_address": ("owner_address", "Owner Address", "Mailing Address", "Billing Address"),
         "property_address": ("property_address", "Property Address", "Address", "Site Address"),
         "certificate_number": ("certificate_number", "Certificate Number", "Cert Number", "Cert No"),
         "certificate_status": ("certificate_status", "Cert Status", "Certificate Status"),
@@ -387,6 +387,24 @@ class TaxDelinquencyLoader(BaseLoader):
         Phase 3 — Bulk upsert matched rows + bulk quarantine unmatched rows.
         """
         logger.info("Loading %d tax delinquency rows (county=%s)", len(df), self.county_id)
+
+        # ── Roll-year split (ADR 0014) ─────────────────────────────────────
+        # Rows from the current tax roll year are installment entries — not yet
+        # delinquent. Exclude them from tax_delinquencies inserts. They are
+        # passed to TaxCollectorEnrichment separately via the upload endpoint.
+        current_roll_year = date.today().year
+        _tax_yr_col = next(
+            (c for c in df.columns if c in {"tax_year", "Tax Yr", "Tax Year"}), None
+        )
+        if _tax_yr_col:
+            current_mask = pd.to_numeric(df[_tax_yr_col], errors="coerce") >= current_roll_year
+            n_current = int(current_mask.sum())
+            if n_current:
+                logger.info(
+                    "Skipping %d current-roll-year rows (Tax Yr >= %d) from tax_delinquencies",
+                    n_current, current_roll_year,
+                )
+            df = df[~current_mask].reset_index(drop=True)
 
         # ── Phase 1a: Warn early if the county has zero properties ───────
         has_properties = self.session.execute(text("""

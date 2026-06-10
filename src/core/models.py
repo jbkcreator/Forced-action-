@@ -172,6 +172,12 @@ class Owner(Base):
     credit_score_tier: Mapped[Optional[str]] = mapped_column(String(50))
     skip_trace_success: Mapped[Optional[bool]] = mapped_column(Boolean, default=False)
 
+    # Direct-mail fallback (fa077): set true when the skip-trace waterfall ends
+    # in a MISS but a usable mailing address exists (tax-collector billing
+    # address, voter mailing address, or appraiser mailing). Consumed by a
+    # future mail-house export — no mail vendor is integrated yet.
+    direct_mail_eligible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+
     # Sunbiz registered agent — populated by Sunbiz Playwright scraper (LLC owners only)
     registered_agent_name: Mapped[Optional[str]] = mapped_column(String(255))
     registered_agent_address: Mapped[Optional[str]] = mapped_column(String(500))
@@ -1467,7 +1473,11 @@ class EnrichedContact(Base):
     raw_response: Mapped[Optional[dict]] = mapped_column(JSONB)
 
     # Source tracking
-    source: Mapped[str] = mapped_column(String(50), nullable=False)   # batch_skip_tracing | idi | pdl
+    # batch_skip_tracing | idi | pdl | tracerfy | tax_collector
+    # 'tax_collector' rows (fa077) carry only mailing_address — the county
+    # tax-bill billing address when it differs from owners.mailing_address.
+    # Per ADR 0013 they are never promoted into owner phone/email columns.
+    source: Mapped[str] = mapped_column(String(50), nullable=False)
     match_success: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     # Which named individual was traced. NULL for legacy single-trace rows
@@ -1487,11 +1497,88 @@ class EnrichedContact(Base):
     __table_args__ = (
         Index("idx_enriched_match_success", "match_success"),
         Index("idx_enriched_source", "source"),
-        CheckConstraint("source IN ('batch_skip_tracing', 'idi', 'pdl')", name="check_enriched_source"),
+        CheckConstraint(
+            "source IN ('batch_skip_tracing', 'idi', 'pdl', 'tracerfy', 'tax_collector')",
+            name="check_enriched_source",
+        ),
     )
 
     def __repr__(self):
         return f"<EnrichedContact(id={self.id}, property_id={self.property_id}, source='{self.source}', match={self.match_success})>"
+
+
+class Voter(Base):
+    """
+    Registered voters matched to a property by residential address (fa077).
+
+    Source: county SOE bulk registry files (Hillsborough "All Eligible Voters"
+    monthly report; FL DOS statewide extract as fallback). Multiple rows per
+    property are intended — they form the household's alternative contact
+    network (alt names, separate mailing addresses, phones, emails).
+
+    Contact-enrichment only: voter rows never feed CDS scoring and their
+    phones/emails are never auto-promoted into owners.* or any send path
+    (ADR 0013 — they bypass the Tracerfy DNC scrub and often belong to
+    non-owner co-residents).
+
+    `phones` accumulates history across monthly loads (list of normalized
+    numbers, newest last); `phone_1` is the current number.
+    """
+    __tablename__ = "voters"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    property_id: Mapped[int] = mapped_column(ForeignKey("properties.id"), nullable=False, index=True)
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+
+    # Source identity
+    source_voter_id: Mapped[str] = mapped_column(String(20), nullable=False)
+
+    # Names
+    voter_name: Mapped[Optional[str]] = mapped_column(String(255), index=True)
+    first_name: Mapped[Optional[str]] = mapped_column(String(100))
+    middle_name: Mapped[Optional[str]] = mapped_column(String(100))
+    last_name: Mapped[Optional[str]] = mapped_column(String(100))
+
+    # Residential (match basis) + mailing (alt contact path; NULL = same as residence)
+    residential_address: Mapped[Optional[str]] = mapped_column(String(500))
+    residential_city: Mapped[Optional[str]] = mapped_column(String(100))
+    residential_zip: Mapped[Optional[str]] = mapped_column(String(10))
+    mailing_address: Mapped[Optional[str]] = mapped_column(String(500))
+
+    # Registration
+    registration_status: Mapped[Optional[str]] = mapped_column(String(10))  # ACT | INA
+    registration_date: Mapped[Optional[date]] = mapped_column(Date)
+
+    # Isolated contact data (ADR 0013)
+    phones: Mapped[Optional[list]] = mapped_column(JSONB, default=list)
+    phone_1: Mapped[Optional[str]] = mapped_column(String(20))
+    email: Mapped[Optional[str]] = mapped_column(String(255))
+
+    meta_data: Mapped[Optional[dict]] = mapped_column(JSONB)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), onupdate=func.now()
+    )
+
+    property: Mapped["Property"] = relationship("Property")
+
+    __table_args__ = (
+        UniqueConstraint("county_id", "source_voter_id", name="uq_voter_county_source_id"),
+        Index("idx_voter_registration_status", "registration_status"),
+        CheckConstraint(
+            "registration_status IN ('ACT', 'INA') OR registration_status IS NULL",
+            name="check_voter_registration_status",
+        ),
+    )
+
+    def __repr__(self):
+        return (
+            f"<Voter(id={self.id}, property_id={self.property_id}, "
+            f"name='{self.voter_name}', status='{self.registration_status}')>"
+        )
 
 
 # ============================================================================

@@ -142,6 +142,24 @@ SIGNAL_SCHEMAS: dict[str, list[str]] = {
         "CaseNumber", "PartyType", "LastName/CompanyName", "FirstName", "MiddleName",
         "FilingDate", "PartyAddress", "Title", "CaseTypeDescription",
     ],
+    "voter_registry": [
+        "source_voter_id",        # county-assigned voter ID
+        "voter_name",             # full name (combined)
+        "first_name",
+        "middle_name",
+        "last_name",
+        "residential_address",    # street line of residential address
+        "residential_city",
+        "residential_zip",
+        "mailing_address",        # full mailing line (or line 1)
+        "mailing_city",
+        "mailing_state",
+        "mailing_zip",
+        "registration_status",    # Active / Inactive / ACT / INA
+        "registration_date",
+        "phone_1",
+        "email",
+    ],
     "property_appraiser": [
         # Identity
         "parcel_id", "owner_name", "mailing_address", "site_address",

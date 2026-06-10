@@ -337,6 +337,15 @@ def run_waterfall(
                         stats.per_provider["pdl"]["hits"] += 1
                     else:
                         stats.misses += 1
+                        # Final miss — flag for direct mail if a mailing address exists
+                        try:
+                            from src.services.direct_mail import flag_direct_mail_eligible
+                            flag_direct_mail_eligible(owner.property_id, session)
+                        except Exception as _dm_err:
+                            logger.warning(
+                                "[Waterfall] direct_mail flag failed for property_id=%d: %s",
+                                owner.property_id, _dm_err,
+                            )
 
                 session.commit()
 
