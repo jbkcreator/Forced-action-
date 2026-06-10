@@ -8,36 +8,41 @@ TaxDelinquencyLoader skips.
 Responsibilities:
   1. Normalize billing address from the upload vs owners.mailing_address.
   2. Where they differ (or owner mailing is NULL), upsert enriched_contacts
-     with source='tax_collector'.
+     with source='tax_collector' (mailing_address only — never a phone/email).
   3. Classify absentee status (Out-of-State / Out-of-County / In-County)
-     from billing address; write owners.absentee_status if NULL or billing
-     address normalizes differently from the stored appraiser value.
-     Never downgrade existing status to NULL.
-  4. Set owners.direct_mail_eligible = true when a usable mailing address
-     exists but skip-trace hasn't produced a phone (handled by direct_mail
-     resolver — this module only flags the billing address as available).
-  5. Trigger CDS rescore for changed property_ids.
+     from billing address; write owners.absentee_status when NULL or when the
+     billing address normalizes differently from the stored value. Never
+     downgrade an existing status to NULL.
+  4. Trigger CDS rescore for changed property_ids.
+
+Note: owners.direct_mail_eligible is intentionally NOT set here — that flag is
+owned by the skip-trace waterfall MISS hook (src/services/direct_mail.py),
+which only flags owners with no resolvable phone (ADR 0013 / Phase 6).
+enriched_contacts has no unique constraint on (property_id, source), so this
+module does a manual select-then-insert/update keyed on property_id.
 """
 
+import json
 import logging
-from datetime import date, datetime, timezone
+import re
+from datetime import datetime, timezone
 from typing import Optional
 
 import pandas as pd
-from sqlalchemy import Integer, String, bindparam, text
+from sqlalchemy import Integer, bindparam, text
 from sqlalchemy.dialects.postgresql import ARRAY, insert as pg_insert
 from sqlalchemy.orm import Session
 
-from src.core.models import EnrichedContact, Owner
-from src.loaders.base import BaseLoader
+from src.core.models import EnrichedContact
 from src.loaders.tax import TaxDelinquencyLoader
 from src.utils.address_normalize import normalize_street_address
 
 logger = logging.getLogger(__name__)
 
-# ZIP codes that belong to each county — used for Out-of-County classification.
-# Loaded lazily from the DB (properties table).
+# Per-county ZIP sets (from properties) — used for Out-of-County classification.
 _COUNTY_ZIPS_CACHE: dict[str, set[str]] = {}
+
+_STATE_ZIP_RE = re.compile(r"\b([A-Z]{2})\s+(\d{5})(?:-\d{4})?\b")
 
 
 def _load_county_zips(session: Session, county_id: str) -> set[str]:
@@ -55,7 +60,10 @@ def _classify_absentee(
     billing_zip: Optional[str],
     county_zips: set[str],
 ) -> Optional[str]:
-    """Return 'Out-of-State', 'Out-of-County', 'In-County', or None."""
+    """Return 'Out-of-State', 'Out-of-County', 'In-County', or None.
+
+    Values match the owners.check_absentee_status CHECK constraint exactly.
+    """
     if not billing_state:
         return None
     state = billing_state.strip().upper()
@@ -68,26 +76,33 @@ def _classify_absentee(
     return "In-County"
 
 
+def _comparison_key(normalized: Optional[str], raw: Optional[str]) -> str:
+    """Address-equality key: normalized street if available, else collapsed raw.
+
+    PO-box / non-street addresses normalize to empty, so fall back to a
+    whitespace-collapsed, lowercased form of the raw string for comparison.
+    """
+    if normalized:
+        return normalized.strip().lower()
+    if raw:
+        return re.sub(r"\s+", " ", str(raw)).strip().lower()
+    return ""
+
+
 def _extract_billing_fields(
-    row: pd.Series,
-    loader: TaxDelinquencyLoader,
+    raw_addr: Optional[str],
 ) -> tuple[Optional[str], Optional[str], Optional[str]]:
-    """Return (normalized_billing_addr, state, zip5) from a tax row."""
-    raw_addr = loader._first_value(row, "owner_address") if "owner_address" in loader.FIELD_ALIASES else None
+    """Return (normalized_billing_addr, state, zip5) parsed from a billing address."""
     if not raw_addr:
         return None, None, None
-
-    # Try to parse state/zip from the address — common format: "123 Main St, Tampa FL 33601"
     state: Optional[str] = None
     zip5: Optional[str] = None
-    import re
-    m = re.search(r'\b([A-Z]{2})\s+(\d{5})\b', str(raw_addr).upper())
+    m = _STATE_ZIP_RE.search(str(raw_addr).upper())
     if m:
         state = m.group(1)
         zip5 = m.group(2)
-
     normalized = normalize_street_address(str(raw_addr))
-    return normalized or None, state, zip5
+    return (normalized or None), state, zip5
 
 
 class TaxCollectorEnrichment:
@@ -101,19 +116,20 @@ class TaxCollectorEnrichment:
 
     def process_upload(self, df: pd.DataFrame) -> dict:
         """
-        Enrich owners and contacts from the tax billing address data.
+        Enrich owners + contacts from tax billing addresses.
 
-        Returns counts: {enriched_contacts, absentee_updated, direct_mail_flagged}.
+        Returns {enriched_contacts, absentee_updated}.
         """
-        if df.empty:
-            return {"enriched_contacts": 0, "absentee_updated": 0, "direct_mail_flagged": 0}
+        empty_result = {"enriched_contacts": 0, "absentee_updated": 0}
+        if df is None or df.empty:
+            return empty_result
 
         logger.info(
             "TaxCollectorEnrichment: processing %d rows for county=%s",
             len(df), self.county_id,
         )
 
-        # Pre-load property IDs for the batch (reuse loader's parcel matching)
+        # Resolve property_ids using the tax loader's parcel pre-load
         parcel_candidates: set[str] = set()
         prepared: list[tuple] = []
         for _, row in df.iterrows():
@@ -121,154 +137,167 @@ class TaxCollectorEnrichment:
             parcel = self._loader._parcel_match_candidate(values)
             if parcel:
                 parcel_candidates.add(parcel)
-            prepared.append((row, values, parcel))
+            prepared.append((values, parcel))
 
         exact_map, norm_map = self._loader._preload_property_ids(parcel_candidates)
 
-        # Resolve property_ids for all rows
-        property_rows: list[tuple[int, pd.Series, dict]] = []
-        for row, values, parcel in prepared:
+        # Build per-property billing payload (last row wins per property_id)
+        billing_by_prop: dict[int, dict] = {}
+        for values, parcel in prepared:
             prop_id: Optional[int] = None
             if parcel:
                 prop_id = exact_map.get(parcel)
                 if not prop_id:
                     prop_id = norm_map.get(self._loader.normalize_parcel_id(parcel))
-            if prop_id:
-                property_rows.append((prop_id, row, values))
+            if not prop_id:
+                continue
+            raw_addr = values.get("owner_address")
+            if not raw_addr:
+                continue
+            # billing_norm may be empty for PO-box / non-street mailing addresses —
+            # those are still valid mailing destinations and common for absentee
+            # owners, so we keep them. The normalized form is only used to compare
+            # against the owner's mailing address.
+            billing_norm, state, zip5 = _extract_billing_fields(raw_addr)
+            billing_by_prop[prop_id] = {
+                "raw_addr": str(raw_addr).strip(),
+                "billing_norm": billing_norm,
+                "state": state,
+                "zip5": zip5,
+                "billing_name": values.get("owner_name"),
+                "tax_year": values.get("tax_year"),
+            }
 
-        if not property_rows:
-            logger.info("TaxCollectorEnrichment: no matched properties in batch")
-            return {"enriched_contacts": 0, "absentee_updated": 0, "direct_mail_flagged": 0}
+        if not billing_by_prop:
+            logger.info("TaxCollectorEnrichment: no matched properties with billing address")
+            return empty_result
 
-        # Bulk-load current owners for affected property_ids
-        prop_ids = list({pid for pid, _, _ in property_rows})
+        prop_ids = list(billing_by_prop.keys())
+
+        # Bulk-load owners for affected properties
         owner_rows = self.session.execute(
             text("""
-                SELECT o.id, o.property_id, o.mailing_address, o.absentee_status,
-                       o.skip_trace_success, o.direct_mail_eligible
-                FROM owners o
-                WHERE o.property_id = ANY(:pids)
+                SELECT id, property_id, mailing_address, absentee_status
+                FROM owners
+                WHERE property_id = ANY(:pids)
             """).bindparams(bindparam("pids", type_=ARRAY(Integer))),
             {"pids": prop_ids},
         ).mappings().all()
         owners_by_prop: dict[int, dict] = {r["property_id"]: dict(r) for r in owner_rows}
 
+        # Pre-load existing tax_collector contacts (no unique constraint → manual upsert)
+        existing_contacts: dict[int, int] = {}
+        for er in self.session.execute(
+            text("""
+                SELECT property_id, MAX(id) AS id
+                FROM enriched_contacts
+                WHERE source = 'tax_collector' AND property_id = ANY(:pids)
+                GROUP BY property_id
+            """).bindparams(bindparam("pids", type_=ARRAY(Integer))),
+            {"pids": prop_ids},
+        ).mappings():
+            existing_contacts[er["property_id"]] = er["id"]
+
         county_zips = _load_county_zips(self.session, self.county_id)
 
-        contacts_to_upsert: list[dict] = []
-        owners_to_update: list[dict] = []
+        contact_inserts: list[dict] = []
+        contact_updates: list[dict] = []
+        owner_updates: list[dict] = []
 
-        for prop_id, row, values in property_rows:
+        for prop_id, payload in billing_by_prop.items():
             owner = owners_by_prop.get(prop_id)
-            if not owner:
-                continue
+            raw_addr = payload["raw_addr"]
+            raw_response = {
+                "billing_name": payload["billing_name"],
+                "tax_year": payload["tax_year"],
+                "raw_address": raw_addr,
+            }
 
-            billing_norm, billing_state, billing_zip = _extract_billing_fields(row, self._loader)
-            if not billing_norm:
-                continue
+            owner_mailing = owner.get("mailing_address") if owner else None
+            billing_key = _comparison_key(payload["billing_norm"], raw_addr)
+            owner_key = (
+                _comparison_key(normalize_street_address(owner_mailing), owner_mailing)
+                if owner_mailing else ""
+            )
 
-            owner_mailing = owner.get("mailing_address") or ""
-            owner_mailing_norm = normalize_street_address(owner_mailing) or ""
-
-            # Only store enriched contact if billing differs from known mailing
-            if billing_norm.lower() != owner_mailing_norm.lower() or not owner_mailing_norm:
-                contacts_to_upsert.append({
-                    "property_id": prop_id,
-                    "county_id": self.county_id,
-                    "source": "tax_collector",
-                    "mailing_address": billing_norm,
-                    "confidence_score": 0.90,
-                    "meta_data": {
-                        "billing_name": values.get("owner_name"),
-                        "tax_year": values.get("tax_year"),
-                        "raw_address": values.get("owner_address"),
-                    },
-                    "created_at": datetime.now(timezone.utc),
-                    "updated_at": datetime.now(timezone.utc),
-                })
+            # Store a tax_collector contact when billing differs from owner mailing
+            # (or owner mailing is unknown). mailing_address holds the full raw
+            # billing line (street/PO box + city/state/zip) for direct mail.
+            if not owner_key or billing_key != owner_key:
+                stored_addr = raw_addr[:255]
+                if prop_id in existing_contacts:
+                    contact_updates.append({
+                        "id": existing_contacts[prop_id],
+                        "mailing_address": stored_addr,
+                        "confidence": 0.90,
+                        "raw_response": json.dumps(raw_response),
+                    })
+                else:
+                    contact_inserts.append({
+                        "property_id": prop_id,
+                        "county_id": self.county_id,
+                        "source": "tax_collector",
+                        "mailing_address": stored_addr,
+                        "match_success": True,
+                        "confidence": 0.90,
+                        "raw_response": raw_response,
+                        "enriched_at": datetime.now(timezone.utc),
+                    })
                 self._affected_property_ids.add(prop_id)
 
-            # Classify absentee
-            new_status = _classify_absentee(billing_state, billing_zip, county_zips)
-            current_status = owner.get("absentee_status")
+            # Absentee classification (only when we have an owner row)
+            if owner:
+                new_status = _classify_absentee(payload["state"], payload["zip5"], county_zips)
+                current_status = owner.get("absentee_status")
+                if new_status and new_status != current_status:
+                    owner_updates.append({
+                        "oid": owner["id"],
+                        "status": new_status,
+                    })
+                    self._affected_property_ids.add(prop_id)
 
-            # Never downgrade existing classification; never write NULL
-            status_changed = new_status and new_status != current_status
-            if status_changed:
-                owners_to_update.append({
-                    "owner_id": owner["id"],
-                    "absentee_status": new_status,
-                    "direct_mail_eligible": True,  # billing address is usable
-                })
-                self._affected_property_ids.add(prop_id)
-            elif not current_status and new_status:
-                owners_to_update.append({
-                    "owner_id": owner["id"],
-                    "absentee_status": new_status,
-                    "direct_mail_eligible": True,
-                })
-                self._affected_property_ids.add(prop_id)
+        if contact_inserts:
+            self.session.execute(pg_insert(EnrichedContact.__table__).values(contact_inserts))
+            self.session.flush()
+        if contact_updates:
+            self.session.execute(
+                text("""
+                    UPDATE enriched_contacts
+                    SET mailing_address = :mailing_address,
+                        confidence = :confidence,
+                        raw_response = CAST(:raw_response AS JSONB),
+                        match_success = true,
+                        enriched_at = now()
+                    WHERE id = :id
+                """),
+                contact_updates,
+            )
+            self.session.flush()
+        if owner_updates:
+            self.session.execute(
+                text("UPDATE owners SET absentee_status = :status WHERE id = :oid"),
+                owner_updates,
+            )
+            self.session.flush()
 
-        # Bulk upsert enriched contacts
-        if contacts_to_upsert:
-            self._upsert_contacts(contacts_to_upsert)
-
-        # Bulk update owners
-        if owners_to_update:
-            self._update_owners(owners_to_update)
-
-        # Trigger CDS rescore for changed properties
         if self._affected_property_ids:
             self._trigger_rescore()
 
         result = {
-            "enriched_contacts": len(contacts_to_upsert),
-            "absentee_updated": len(owners_to_update),
-            "direct_mail_flagged": sum(1 for o in owners_to_update if o.get("direct_mail_eligible")),
+            "enriched_contacts": len(contact_inserts) + len(contact_updates),
+            "absentee_updated": len(owner_updates),
         }
         logger.info("TaxCollectorEnrichment: %s", result)
         return result
 
-    def _upsert_contacts(self, rows: list[dict]) -> None:
-        stmt = pg_insert(EnrichedContact.__table__).values(rows)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["property_id", "source"],
-            set_={
-                "mailing_address":  stmt.excluded.mailing_address,
-                "confidence_score": stmt.excluded.confidence_score,
-                "meta_data":        stmt.excluded.meta_data,
-                "updated_at":       text("now()"),
-            },
-        )
-        try:
-            self.session.execute(stmt)
-            self.session.flush()
-        except Exception as e:
-            logger.error("TaxCollectorEnrichment: contact upsert failed: %s", e)
-            raise
-
-    def _update_owners(self, rows: list[dict]) -> None:
-        for rec in rows:
-            self.session.execute(
-                text("""
-                    UPDATE owners
-                    SET absentee_status = :status,
-                        direct_mail_eligible = :dme
-                    WHERE id = :oid
-                """),
-                {
-                    "status": rec["absentee_status"],
-                    "dme": rec["direct_mail_eligible"],
-                    "oid": rec["owner_id"],
-                },
-            )
-        self.session.flush()
-
     def _trigger_rescore(self) -> None:
         pid_list = list(self._affected_property_ids)
         try:
-            from src.services.cds_engine import rescore_properties
-            rescore_properties(pid_list)
+            from src.services.cds_engine import MultiVerticalScorer
+            scorer = MultiVerticalScorer(self.session)
+            scorer.score_properties_by_ids(
+                pid_list, save_to_db=True, county_id=self.county_id
+            )
             logger.info(
                 "TaxCollectorEnrichment: triggered rescore for %d properties",
                 len(pid_list),

@@ -39,7 +39,7 @@ def resolve_best_mailing_address(property_id: int, session: Session) -> MailingR
             SELECT mailing_address FROM enriched_contacts
             WHERE property_id = :pid AND source = 'tax_collector'
               AND mailing_address IS NOT NULL
-            ORDER BY updated_at DESC NULLS LAST
+            ORDER BY enriched_at DESC NULLS LAST
             LIMIT 1
         """),
         {"pid": property_id},
