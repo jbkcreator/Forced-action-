@@ -28,7 +28,11 @@ def run_enrichment_pipeline(
     county_id: str = "hillsborough",
     limit: int = _DEFAULT_LIMIT,
     today_only: bool = True,
-    **_kwargs,  # absorb legacy args (batchdata_limit, idi_limit, skip_idi, retrace, etc.)
+    tracerfy_only: bool = False,
+    tracerfy_retrace_misses: bool = False,
+    individual_only: bool = False,
+    entity_only: bool = False,
+    **_kwargs,
 ) -> dict:
     """
     Run the multi-provider skip trace waterfall for a county.
@@ -44,7 +48,15 @@ def run_enrichment_pipeline(
     }
 
     try:
-        wf_stats = run_waterfall(county_id=county_id, limit=limit, today_only=today_only)
+        wf_stats = run_waterfall(
+            county_id=county_id,
+            limit=limit,
+            today_only=today_only,
+            tracerfy_only=tracerfy_only,
+            tracerfy_retrace_misses=tracerfy_retrace_misses,
+            individual_only=individual_only,
+            entity_only=entity_only,
+        )
         results["waterfall"] = {
             "total_leads":      wf_stats.total_leads,
             "hits":             wf_stats.hits,
@@ -88,6 +100,14 @@ if __name__ == "__main__":
                         help="Max leads per run (default: 200)")
     parser.add_argument("--all-leads", dest="all_leads", action="store_true",
                         help="Process all un-traced Gold+ leads, not just today's")
+    parser.add_argument("--tracerfy-only", dest="tracerfy_only", action="store_true",
+                        help="Run Tracerfy Tier 1 only — skip BatchData and PDL fallback tiers")
+    parser.add_argument("--tracerfy-retrace-misses", dest="tracerfy_retrace_misses", action="store_true",
+                        help="Re-submit properties with existing tracerfy miss EC rows, updating in-place on hit")
+    parser.add_argument("--individual-only", dest="individual_only", action="store_true",
+                        help="Only process Individual owner_type records")
+    parser.add_argument("--entity-only", dest="entity_only", action="store_true",
+                        help="Only process non-Individual (LLC/Corp/Trust/Estate) records")
     args = parser.parse_args()
 
     try:
@@ -95,6 +115,10 @@ if __name__ == "__main__":
             county_id=args.county_id,
             limit=args.limit,
             today_only=not args.all_leads,
+            tracerfy_only=args.tracerfy_only,
+            tracerfy_retrace_misses=args.tracerfy_retrace_misses,
+            individual_only=args.individual_only,
+            entity_only=args.entity_only,
         )
         wf = stats.get("waterfall", {})
         print(f"  Total leads  : {wf.get('total_leads', 0)}")

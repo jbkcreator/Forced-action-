@@ -202,7 +202,8 @@ def _reverse_geocode_parcel(lat: float, lon: float) -> Optional[str]:
         features = resp.json().get("features", [])
         if not features:
             return None
-        return features[0].get("attributes", {}).get("PARCELID_DSP1")
+        parcel_id = features[0].get("attributes", {}).get("PARCELID_DSP1")
+        return parcel_id.replace("-", "") if parcel_id else None
     except Exception as exc:
         logger.warning("[pinellas_fire] GIS reverse geocode failed (lat=%s lon=%s): %s", lat, lon, exc)
         return None
@@ -309,6 +310,11 @@ def scrape_pinellas_fire_incidents(
                 incident_type="Fire",
                 incident_date=fire_date,
                 county_id=county_id,
+                source_meta={
+                    "cad_incident_number": call["incident_number"],
+                    "cad_code": call["code"],
+                    "cad_type": call["type"],
+                },
             ))
             created += 1
 

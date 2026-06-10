@@ -823,6 +823,9 @@ class Incident(Base):
     crime_types: Mapped[Optional[dict]] = mapped_column(JSONB)
     problem_prop_flag: Mapped[Optional[bool]] = mapped_column(Boolean, default=False)
 
+    # Scraper-specific metadata (structure varies by source)
+    source_meta: Mapped[Optional[dict]] = mapped_column(JSONB)
+
     # Load tracking & multi-county
     date_added: Mapped[Optional[date]] = mapped_column(Date, default=date.today, index=True)
     county_id: Mapped[Optional[str]] = mapped_column(String(50), default='hillsborough', index=True)

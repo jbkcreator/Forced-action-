@@ -307,9 +307,16 @@ def run_once(dry_run: bool = False) -> list[Heartbeat]:
             logger.info("[Heartbeat][DRY] would send:\n%s\n\n%s", subject, body)
             continue
         try:
-            send_alert(subject, body)
-            _record_alerted(b.source_type)
-            logger.info("[Heartbeat] ALERT SENT for %s (age=%s)", b.source_type, b.age_label())
+            sent = send_alert(subject, body)
+            if sent:
+                _record_alerted(b.source_type)
+                logger.info("[Heartbeat] ALERT SENT for %s (age=%s)", b.source_type, b.age_label())
+            else:
+                logger.error(
+                    "[Heartbeat] alert delivery returned False for %s; "
+                    "dedup row NOT recorded so the next tick will retry",
+                    b.source_type,
+                )
         except Exception as exc:
             logger.error("[Heartbeat] failed to send alert for %s: %s", b.source_type, exc)
     return beats

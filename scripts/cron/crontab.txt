@@ -99,7 +99,13 @@ COUNTY_ID=hillsborough
 
 # ── PINELLAS DAILY ────────────────────────────────────────────
 # Staggered +5 min after their Hillsborough counterparts within 04:00–06:30 UTC window.
-# Violations: SKIP — PRR-only, loaded manually.
+
+# P0. Code Violations — Pinellas (multi-source: Accela date-range daily; Click2Gov address-sweep weekly)
+#     Daily: Pinellas County Accela (unincorporated + Largo), last 7 days.
+#     Weekly: St. Pete + Tarpon Springs Click2Gov full address sweep (dedup skips seen records).
+#     Clearwater Accela record enumeration runs weekly Sunday alongside Click2Gov.
+3 4 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.violation.pinellas_violations_engine --sources accela --county-id pinellas
+3 4 * * 0   $PROJECT/scripts/cron/run.sh src.scrappers.violation.pinellas_violations_engine --sources stpete tarpon clearwater --county-id pinellas
 
 # P1. Bankruptcy Filings     — 04:20 AM UTC / 12:20 AM EDT / 09:50 AM IST
 20 4 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.bankruptcy.bankruptcy_engine --lookback 1 --load-to-db --county-id pinellas
