@@ -965,6 +965,61 @@ class DistressScore(Base):
 # 5. M1 — SUBSCRIBER & REVENUE TABLES
 # ============================================================================
 
+class ConsentAcceptance(Base):
+    """
+    Immutable audit record of a user's T&C / privacy (and optional TCPA marketing)
+    consent at a given flow step. One row per acceptance event. Backing table is
+    created by migration fa070_consent_acceptances; this ORM model mirrors it.
+    """
+    __tablename__ = "consent_acceptances"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("subscribers.id"), nullable=True)
+    waitlist_entry_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("waitlist_entries.id"), nullable=True)
+    phone: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    email: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    terms_version: Mapped[str] = mapped_column(String(20), nullable=False)
+    privacy_version: Mapped[str] = mapped_column(String(20), nullable=False)
+    accepted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    source_flow: Mapped[str] = mapped_column(String(30), nullable=False, server_default="waitlist")
+    ip_address: Mapped[Optional[str]] = mapped_column(String(45), nullable=True)
+    user_agent: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    modal_opened_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    modal_scrolled_to_end_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    accepted_text_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+
+    tcpa_consent_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    tcpa_consent_version: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    tcpa_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    consent_scope: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    not_condition_of_purchase_ack: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+
+    county_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, server_default="hillsborough")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        CheckConstraint(
+            "source_flow IN ('waitlist','signup','checkout','county_launch','free_signup')",
+            name="ck_consent_source_flow",
+        ),
+        CheckConstraint(
+            "consent_scope IS NULL OR consent_scope IN ('marketing','waitlist_notify','lead_alerts')",
+            name="ck_consent_scope",
+        ),
+        Index("idx_consent_email", "email"),
+        Index("idx_consent_accepted_at", "accepted_at"),
+        Index("idx_consent_subscriber", "subscriber_id"),
+        Index("idx_consent_waitlist", "waitlist_entry_id"),
+    )
+
+
 class FoundingSubscriberCount(Base):
     """
     Tracks founding subscriber count per tier/vertical/county.
