@@ -49,6 +49,7 @@ from src.core.models import (
     Subscriber,
 )
 from src.loaders.tax import TaxDelinquencyLoader
+from src.loaders.voter_registry import VoterRegistryLoader
 from src.utils.county_config import invalidate_cache
 
 logger = logging.getLogger(__name__)
@@ -218,14 +219,112 @@ def upload_tax_delinquency(
     loader = TaxDelinquencyLoader(db, county_id=county_id)
     matched, updated, unmatched = loader.load_from_dataframe(df)
 
+    # Phase 5: enrich absentee status + billing contacts from the full batch
+    from src.services.tax_collector_enrichment import TaxCollectorEnrichment
+    enrichment = TaxCollectorEnrichment(db, county_id=county_id)
+    enrichment_result = enrichment.process_upload(df)
+
     logger.info(
-        "[Admin] Upload complete: inserted=%d updated=%d unmatched=%d",
-        matched, updated, unmatched,
+        "[Admin] Upload complete: inserted=%d updated=%d unmatched=%d enrichment=%s",
+        matched, updated, unmatched, enrichment_result,
     )
     return {
         "matched": matched,
         "updated": updated,
         "unmatched": unmatched,
+        "total_rows": total_rows,
+        "enrichment": enrichment_result,
+    }
+
+
+@router.post("/upload/voter-registry")
+def upload_voter_registry(
+    file: UploadFile,
+    county_id: str = Form("hillsborough"),
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Upload a Supervisor of Elections voter file (.csv, .txt, or .zip containing .txt).
+
+    Supported formats:
+      - Hillsborough SOE quoted-CSV with header row
+      - FL DOS 38-field tab-delimited .txt (no header — header injected automatically)
+      - .zip archive containing a single .txt/.csv voter file
+
+    Column mapping is applied via ColumnMapper if an approved/pending mapping exists
+    for this county's voter_registry source in county_column_mappings.
+
+    Returns inserted/updated/quarantined counts. Contacts loaded are isolated from
+    auto-send flows per ADR 0013 (TCPA/DNC compliance).
+    """
+    import io as _io
+    import zipfile
+
+    fname = (file.filename or "").lower()
+    if not any(fname.endswith(ext) for ext in (".csv", ".txt", ".zip")):
+        raise HTTPException(status_code=400, detail="File must be .csv, .txt, or .zip")
+
+    raw_bytes = file.file.read()
+
+    if fname.endswith(".zip"):
+        try:
+            with zipfile.ZipFile(_io.BytesIO(raw_bytes)) as zf:
+                inner = [n for n in zf.namelist() if n.lower().endswith((".txt", ".csv"))]
+                if not inner:
+                    raise HTTPException(status_code=400, detail="Zip contains no .txt/.csv files")
+                raw_bytes = zf.read(inner[0])
+                fname = inner[0].lower()
+        except zipfile.BadZipFile:
+            raise HTTPException(status_code=400, detail="Invalid zip archive")
+
+    content = raw_bytes.decode("utf-8", errors="replace")
+
+    try:
+        if fname.endswith(".txt"):
+            df = pd.read_csv(_io.StringIO(content), dtype=str, sep="\t", header=None)
+            df = VoterRegistryLoader.inject_fl_dos_header(df)
+        else:
+            df = pd.read_csv(_io.StringIO(content), dtype=str)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not parse file: {exc}")
+
+    from src.loaders.column_mapper import ColumnMapper, SkipMapping, NeedsMappingError
+    from src.core.models import CountySource
+    src = db.execute(
+        text("SELECT id FROM county_sources WHERE county_id = :cid AND signal_type = 'voter_registry' LIMIT 1"),
+        {"cid": county_id},
+    ).mappings().first()
+    if src is not None:
+        try:
+            mapper = ColumnMapper()
+            col_mapping = mapper.get_or_create("voter_registry", src["id"], df.head(5))
+            df = ColumnMapper.apply(df, col_mapping)
+        except SkipMapping:
+            pass
+        except NeedsMappingError as e:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Column mapping required but LLM failed — create a manual mapping first. ({e})",
+            )
+
+    total_rows = len(df)
+    logger.info(
+        "[Admin] Voter registry upload: %d rows, county=%s, user=%s",
+        total_rows, county_id, _admin.get("sub"),
+    )
+
+    loader = VoterRegistryLoader(db, county_id=county_id)
+    inserted, updated, quarantined = loader.load_from_dataframe(df)
+
+    logger.info(
+        "[Admin] Voter upload complete: inserted=%d updated=%d quarantined=%d",
+        inserted, updated, quarantined,
+    )
+    return {
+        "inserted": inserted,
+        "updated": updated,
+        "quarantined": quarantined,
         "total_rows": total_rows,
     }
 
