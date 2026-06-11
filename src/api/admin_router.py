@@ -285,8 +285,12 @@ def upload_voter_registry(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Could not parse file: {exc}")
 
+    # ColumnMapper is optional for voter files: the loader's alias-based
+    # extraction already understands the Hillsborough SOE and FL DOS column
+    # names directly. If an approved/pending mapping exists we apply it, but
+    # an LLM/mapping failure must NOT block the upload — fall back to the raw
+    # DataFrame and let the loader's aliases do the work.
     from src.loaders.column_mapper import ColumnMapper, SkipMapping, NeedsMappingError
-    from src.core.models import CountySource
     src = db.execute(
         text("SELECT id FROM county_sources WHERE county_id = :cid AND signal_type = 'voter_registry' LIMIT 1"),
         {"cid": county_id},
@@ -296,12 +300,11 @@ def upload_voter_registry(
             mapper = ColumnMapper()
             col_mapping = mapper.get_or_create("voter_registry", src["id"], df.head(5))
             df = ColumnMapper.apply(df, col_mapping)
-        except SkipMapping:
-            pass
-        except NeedsMappingError as e:
-            raise HTTPException(
-                status_code=422,
-                detail=f"Column mapping required but LLM failed — create a manual mapping first. ({e})",
+        except (SkipMapping, NeedsMappingError) as e:
+            logger.info(
+                "[Admin] Voter upload: skipping column mapping (%s) — "
+                "loader handles known SOE/DOS headers directly.",
+                type(e).__name__,
             )
 
     total_rows = len(df)
