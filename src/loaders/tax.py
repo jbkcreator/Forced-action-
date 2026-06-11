@@ -374,6 +374,7 @@ class TaxDelinquencyLoader(BaseLoader):
         self,
         df: pd.DataFrame,
         skip_duplicates: bool = True,
+        parcel_only: bool = False,
     ) -> Tuple[int, int, int]:
         """
         Load tax delinquencies from a DataFrame using bulk upsert.
@@ -385,6 +386,16 @@ class TaxDelinquencyLoader(BaseLoader):
                   classify as matched/updated/unmatched, collect for bulk ops.
 
         Phase 3 — Bulk upsert matched rows + bulk quarantine unmatched rows.
+
+        Args:
+            parcel_only: Bulk fast path. When True, rows that miss the
+                pre-loaded parcel-ID maps are quarantined immediately instead of
+                running the per-row address/owner fuzzy cascade (which issues
+                pg_trgm queries + an LLM tiebreak per row and dominates runtime
+                on large admin uploads). County tax files key on the parcel /
+                account number, so parcel matching alone covers ~99% of rows;
+                the unmatched remainder lands in unmatched_records for later
+                re-match. Default False preserves the cascade for scraper feeds.
         """
         logger.info("Loading %d tax delinquency rows (county=%s)", len(df), self.county_id)
 
@@ -460,8 +471,10 @@ class TaxDelinquencyLoader(BaseLoader):
                     normalized = self.normalize_parcel_id(parcel_number)
                     property_id = normalized_property_map.get(normalized)
 
-            # Stage 2 — Address / owner cascade fallback
-            if not property_id:
+            # Stage 2 — Address / owner cascade fallback (skipped in parcel_only
+            # bulk mode: it runs pg_trgm + LLM per row and is the runtime hot
+            # spot on large uploads; unmatched rows go to quarantine instead).
+            if not property_id and not parcel_only:
                 address = str(
                     values.get("property_address") or values.get("owner_address") or ""
                 ).strip()
@@ -492,10 +505,11 @@ class TaxDelinquencyLoader(BaseLoader):
                         )
 
             if not property_id:
-                logger.warning(
-                    "No property match for parcel: %s (searched as: %s)",
-                    account_number, parcel_number or account_number,
-                )
+                if not parcel_only:
+                    logger.warning(
+                        "No property match for parcel: %s (searched as: %s)",
+                        account_number, parcel_number or account_number,
+                    )
                 unmatched_to_quarantine.append({
                     "source_type": "tax_delinquencies",
                     "raw_row": row.to_dict() if hasattr(row, "to_dict") else dict(row),
@@ -588,13 +602,37 @@ class TaxDelinquencyLoader(BaseLoader):
                     merged[field] = value
         return list(deduped.values())
 
+    @staticmethod
+    def _string_column_limits() -> dict[str, int]:
+        """Map column name -> max length for String(n) columns on the table.
+
+        Source values from county files occasionally exceed the schema width
+        (e.g. a long combined billing address); clipping here prevents a single
+        oversized row from aborting the whole bulk upsert with
+        StringDataRightTruncation.
+        """
+        limits: dict[str, int] = {}
+        for col in TaxDelinquency.__table__.columns:
+            length = getattr(col.type, "length", None)
+            if isinstance(length, int) and length > 0:
+                limits[col.name] = length
+        return limits
+
     def _normalize_upsert_records(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Give every bulk-insert row the same column set."""
+        """Give every bulk-insert row the same column set, clipped to schema widths."""
         columns = self._UPSERT_ALWAYS_FIELDS + self._NULL_SAFE_FIELDS
-        return [
-            {column: rec.get(column) for column in columns}
-            for rec in records
-        ]
+        limits = self._string_column_limits()
+        normalized: list[dict[str, Any]] = []
+        for rec in records:
+            row: dict[str, Any] = {}
+            for column in columns:
+                value = rec.get(column)
+                limit = limits.get(column)
+                if limit is not None and isinstance(value, str) and len(value) > limit:
+                    value = value[:limit]
+                row[column] = value
+            normalized.append(row)
+        return normalized
 
     def _bulk_upsert(self, records: list[dict[str, Any]]) -> None:
         """

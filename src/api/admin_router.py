@@ -216,8 +216,11 @@ def upload_tax_delinquency(
         total_rows, county_id, tax_year, _admin.get("sub"),
     )
 
+    # Bulk admin uploads are parcel-keyed county files — match on parcel/account
+    # only and skip the per-row address/owner+LLM cascade (it dominates runtime
+    # at 28k+ rows). Unmatched rows go to unmatched_records for later re-match.
     loader = TaxDelinquencyLoader(db, county_id=county_id)
-    matched, updated, unmatched = loader.load_from_dataframe(df)
+    matched, updated, unmatched = loader.load_from_dataframe(df, parcel_only=True)
 
     # Phase 5: enrich absentee status + billing contacts from the full batch
     from src.services.tax_collector_enrichment import TaxCollectorEnrichment
