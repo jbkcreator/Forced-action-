@@ -281,11 +281,7 @@ def upload_voter_registry(
     content = raw_bytes.decode("utf-8", errors="replace")
 
     try:
-        if fname.endswith(".txt"):
-            df = pd.read_csv(_io.StringIO(content), dtype=str, sep="\t", header=None)
-            df = VoterRegistryLoader.inject_fl_dos_header(df)
-        else:
-            df = pd.read_csv(_io.StringIO(content), dtype=str)
+        df = VoterRegistryLoader.read_voter_dataframe(content)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Could not parse file: {exc}")
 
