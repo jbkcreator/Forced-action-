@@ -22,7 +22,7 @@ from typing import Optional, Literal
 
 import pandas as pd
 import stripe
-from fastapi import APIRouter, Depends, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Query, UploadFile
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, Field, model_validator
@@ -131,9 +131,27 @@ def admin_login(body: LoginRequest):
     return TokenResponse(access_token=token)
 
 
+def _run_tax_enrichment(county_id: str, df: "pd.DataFrame") -> None:
+    """Run tax-collector absentee/contact enrichment + rescore off the request.
+
+    Opens its own DB session (the request session is closed once the HTTP
+    response is sent). Scheduled via BackgroundTasks so a 16k-property rescore
+    never blocks the upload response past nginx's proxy timeout.
+    """
+    from src.core.database import get_db_context
+    from src.services.tax_collector_enrichment import TaxCollectorEnrichment
+    try:
+        with get_db_context() as session:
+            result = TaxCollectorEnrichment(session, county_id=county_id).process_upload(df)
+        logger.info("[Admin] Tax enrichment (background) complete: %s", result)
+    except Exception:
+        logger.exception("[Admin] Tax enrichment (background) failed for county=%s", county_id)
+
+
 @router.post("/upload/tax-delinquency")
 def upload_tax_delinquency(
     file: UploadFile,
+    background_tasks: BackgroundTasks,
     county_id: str = Form("hillsborough"),
     tax_year: Optional[int] = Form(None),
     _admin: dict = Depends(get_current_admin),
@@ -221,22 +239,24 @@ def upload_tax_delinquency(
     # at 28k+ rows). Unmatched rows go to unmatched_records for later re-match.
     loader = TaxDelinquencyLoader(db, county_id=county_id)
     matched, updated, unmatched = loader.load_from_dataframe(df, parcel_only=True)
+    db.commit()
 
-    # Phase 5: enrich absentee status + billing contacts from the full batch
-    from src.services.tax_collector_enrichment import TaxCollectorEnrichment
-    enrichment = TaxCollectorEnrichment(db, county_id=county_id)
-    enrichment_result = enrichment.process_upload(df)
+    # Phase 5: absentee + billing-contact enrichment (and the CDS rescore it
+    # triggers) runs in the BACKGROUND. On a full county file it touches ~16k
+    # properties and would otherwise push the request past nginx's proxy
+    # timeout (→ a 504 in the browser even though the load succeeded).
+    background_tasks.add_task(_run_tax_enrichment, county_id, df)
 
     logger.info(
-        "[Admin] Upload complete: inserted=%d updated=%d unmatched=%d enrichment=%s",
-        matched, updated, unmatched, enrichment_result,
+        "[Admin] Upload complete: inserted=%d updated=%d unmatched=%d (enrichment queued)",
+        matched, updated, unmatched,
     )
     return {
         "matched": matched,
         "updated": updated,
         "unmatched": unmatched,
         "total_rows": total_rows,
-        "enrichment": enrichment_result,
+        "enrichment": "processing_in_background",
     }
 
 
