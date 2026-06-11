@@ -1171,7 +1171,14 @@ class BaseLoader(ABC):
             return "matched"
         normalized = score / 100.0
         t = self._thresholds
-        if normalized >= t.auto_match:
+        # Owner-name matches use their own auto-match bar (defaults to auto_match).
+        # A county may lower it as a stopgap where LLM verification is unavailable
+        # and the only viable match path is fuzzy owner-name (e.g. probate/divorce).
+        if match_method in (MATCH_METHOD_OWNER_NAME, MATCH_METHOD_OWNER_ZIP, MATCH_METHOD_OWNER_CITY):
+            auto_match = t.owner_name_auto_match
+        else:
+            auto_match = t.auto_match
+        if normalized >= auto_match:
             return "matched"
         if normalized >= t.review_min:
             return "pending_review"

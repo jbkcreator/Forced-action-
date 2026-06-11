@@ -8,6 +8,7 @@ from datetime import date
 from typing import Optional, Tuple
 
 import pandas as pd
+from sqlalchemy import text
 
 from src.loaders.base import BaseLoader
 from src.core.models import BuildingPermit, CountySource
@@ -103,12 +104,23 @@ class BuildingPermitLoader(BaseLoader):
         
         for _, row in df.iterrows():
             record_number = str(row['Record Number']).strip()
-            
-            # Check for duplicates
-            if skip_duplicates and self.check_duplicate(BuildingPermit, {'permit_number': record_number}):
-                logger.debug(f"Skipping duplicate permit: {record_number}")
-                skipped += 1
-                continue
+            description_val = str(row.get('Description') or '').strip() or None
+
+            # Check for duplicates; update description if previously NULL
+            if skip_duplicates:
+                existing_row = self.session.execute(
+                    text("SELECT id, description FROM building_permits WHERE permit_number = :pnum LIMIT 1"),
+                    {"pnum": record_number},
+                ).fetchone()
+                if existing_row:
+                    if existing_row.description is None and description_val:
+                        self.session.execute(
+                            text("UPDATE building_permits SET description = :desc WHERE id = :id"),
+                            {"desc": description_val, "id": existing_row.id},
+                        )
+                        self.session.flush()
+                    skipped += 1
+                    continue
             
             # Skip completed permits — work is done, not a distress signal
             raw_status = str(row.get('Status') or "").lower().strip()
@@ -157,6 +169,7 @@ class BuildingPermitLoader(BaseLoader):
                         expire_date=parsed_expire,
                         is_enforcement_permit=enforcement,
                         county_id=self.county_id,
+                        description=description_val,
                     )
                     
                     if self.safe_add(permit_record):

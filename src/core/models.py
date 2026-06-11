@@ -787,6 +787,7 @@ class BuildingPermit(Base):
     issue_date: Mapped[Optional[datetime]] = mapped_column(Date)
     expire_date: Mapped[Optional[datetime]] = mapped_column(Date)
     status: Mapped[Optional[str]] = mapped_column(String(50))
+    description: Mapped[Optional[str]] = mapped_column(Text)
 
     # Enforcement flag — True for stop work orders, after-the-fact, failed/expired/revoked/suspended
     is_enforcement_permit: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
