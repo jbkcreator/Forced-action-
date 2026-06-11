@@ -432,7 +432,16 @@ class TriangulationService:
         owner_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         now = datetime.now(timezone.utc)
+        logger.info("[Triangulation-Debug] sweep start county=%s dry_run=%s owner_id=%s",
+                    county_id or "all", dry_run, owner_id)
+        fetch_started = datetime.now(timezone.utc)
         rows, voters_by_pid = self._fetch(county_id, owner_id)
+        logger.info(
+            "[Triangulation-Debug] fetch done rows=%d voter_properties=%d elapsed_ms=%d",
+            len(rows),
+            len(voters_by_pid),
+            int((datetime.now(timezone.utc) - fetch_started).total_seconds() * 1000),
+        )
         grouped = self._group_by_property(rows)
         logger.info("[Triangulation] %d EC rows across %d properties (county=%s)",
                     len(rows), len(grouped), county_id or "all")
@@ -446,6 +455,13 @@ class TriangulationService:
             persons, owner_names, anchors, meta_by_number = self._build_evidence(prop_rows)
             if not persons:
                 continue
+            if stats["evaluated"] and stats["evaluated"] % 500 == 0:
+                logger.info(
+                    "[Triangulation-Debug] progress evaluated=%d changed=%d downgrades=%d",
+                    stats["evaluated"],
+                    stats["changed"],
+                    stats["downgrades"],
+                )
             level, detail = compute_corroboration(
                 persons, voters_by_pid.get(pid, []), owner_names, anchors,
                 meta_by_number,
@@ -497,6 +513,7 @@ class TriangulationService:
             })
 
         if updates and not dry_run:
+            logger.info("[Triangulation-Debug] writing_updates count=%d", len(updates))
             self.session.execute(_WRITE_QUERY, updates)
             self.session.commit()
             logger.info("[Triangulation] wrote %d labels (%d changed, %d downgraded)",
