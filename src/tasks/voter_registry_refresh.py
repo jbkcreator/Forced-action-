@@ -21,6 +21,7 @@ import zipfile
 from typing import Optional
 
 import requests
+from sqlalchemy import text
 
 from src.core.database import get_db_context
 from src.utils.http_helpers import requests_get_with_retry
@@ -105,28 +106,35 @@ def _resolve_direct_download(page_url: str) -> Optional[str]:
 def _get_last_processed_key() -> Optional[str]:
     with get_db_context() as session:
         row = session.execute(
-            __import__("sqlalchemy").text("""
-                SELECT meta_data FROM county_sources
+            text("""
+                SELECT special_flags FROM county_sources
                 WHERE county_id = :cid AND signal_type = 'voter_registry'
                 LIMIT 1
             """),
             {"cid": _COUNTY_ID},
         ).mappings().first()
-        if row and row["meta_data"]:
-            return row["meta_data"].get(_STATE_KEY)
+        if row and row["special_flags"]:
+            return row["special_flags"].get(_STATE_KEY)
     return None
 
 
 def _save_last_processed_key(folder_key: str) -> None:
     with get_db_context() as session:
-        session.execute(
-            __import__("sqlalchemy").text("""
+        result = session.execute(
+            text("""
                 UPDATE county_sources
-                SET meta_data = COALESCE(meta_data, '{}'::jsonb) || jsonb_build_object(:k, :v)
+                SET special_flags = COALESCE(special_flags, '{}'::jsonb)
+                                    || jsonb_build_object(:k, :v)
                 WHERE county_id = :cid AND signal_type = 'voter_registry'
             """),
             {"k": _STATE_KEY, "v": folder_key, "cid": _COUNTY_ID},
         )
+        if result.rowcount == 0:
+            logger.warning(
+                "[VoterRefresh] No 'voter_registry' county_sources row for %s — "
+                "last-processed key NOT persisted; cron will re-download next run.",
+                _COUNTY_ID,
+            )
 
 
 def run_voter_registry_refresh(force: bool = False) -> dict:
@@ -176,49 +184,57 @@ def run_voter_registry_refresh(force: bool = False) -> dict:
         logger.error("[VoterRefresh] Could not resolve direct download link from %s", page_url)
         return {"skipped": True, "reason": "no_direct_link", "folder_key": newest_key}
 
+    # Stream the ~440 MB zip to a temp file (not RAM), then bulk-load the
+    # inner .txt via the set-based path (~4 min for 1M rows; the per-row
+    # loader would take days at this scale).
+    import os
+    import tempfile
+
+    from src.loaders.voter_registry import bulk_load_voters_csv
+
     logger.info("[VoterRefresh] Downloading voter zip from %s", direct_url)
+    tmp_path = None
     try:
         resp = requests_get_with_retry(direct_url, timeout=600, stream=True)
         resp.raise_for_status()
-        zip_bytes = resp.content
-    except Exception as e:
-        logger.error("[VoterRefresh] Download failed: %s", e)
-        raise
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+            tmp_path = tmp.name
+            for piece in resp.iter_content(chunk_size=1024 * 1024):
+                tmp.write(piece)
+        logger.info(
+            "[VoterRefresh] Downloaded %d MB to %s",
+            os.path.getsize(tmp_path) // (1024 * 1024), tmp_path,
+        )
 
-    try:
-        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        with zipfile.ZipFile(tmp_path) as zf:
             txt_names = [n for n in zf.namelist() if n.lower().endswith(".txt")]
             if not txt_names:
                 raise ValueError("Zip contains no .txt voter file")
-            txt_bytes = zf.read(txt_names[0])
+            with zf.open(txt_names[0]) as fh:
+                rows_read, upserted, unmatched = bulk_load_voters_csv(
+                    fh, county_id=_COUNTY_ID,
+                )
     except Exception as e:
-        logger.error("[VoterRefresh] Zip extraction failed: %s", e)
+        logger.error("[VoterRefresh] Download/load failed: %s", e)
         raise
-
-    import pandas as pd
-    from src.loaders.voter_registry import VoterRegistryLoader
-
-    content = txt_bytes.decode("utf-8", errors="replace")
-    df = pd.read_csv(io.StringIO(content), dtype=str, sep="\t", header=None)
-    df = VoterRegistryLoader.inject_fl_dos_header(df)
-
-    logger.info("[VoterRefresh] Loaded %d voter rows from %s", len(df), newest_name)
-
-    with get_db_context() as session:
-        loader = VoterRegistryLoader(session, county_id=_COUNTY_ID)
-        inserted, updated, quarantined = loader.load_from_dataframe(df)
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
     _save_last_processed_key(newest_key)
 
     logger.info(
-        "[VoterRefresh] Done — inserted=%d updated=%d quarantined=%d folder=%s",
-        inserted, updated, quarantined, newest_name,
+        "[VoterRefresh] Done — rows_read=%d upserted=%d unmatched=%d folder=%s",
+        rows_read, upserted, unmatched, newest_name,
     )
     return {
         "skipped": False,
-        "inserted": inserted,
-        "updated": updated,
-        "quarantined": quarantined,
+        "rows_read": rows_read,
+        "upserted": upserted,
+        "unmatched": unmatched,
         "folder_key": newest_key,
         "folder_name": newest_name,
     }
