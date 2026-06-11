@@ -194,6 +194,15 @@ class Owner(Base):
     # latest refresh cycle. Unmapped until ADR 0015 (same drift as fa073 cols).
     skip_trace_stale: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
 
+    # Cross-source triangulation evidence (ADR 0015) — written by
+    # src/services/contact_triangulation.py alongside the freshness columns.
+    # Shape: {matched_phone, person, sources: [...], corroboration,
+    #         email_corroboration, matched_email, rule_fired, computed_at,
+    #         prev_label}
+    # DDL applied via scripts/apply_contactability_detail_migration.py
+    # (alembic fa078 file is the record — never `alembic upgrade`).
+    contactability_detail: Mapped[Optional[dict]] = mapped_column(JSONB)
+
     # Sunbiz registered agent — populated by Sunbiz Playwright scraper (LLC owners only)
     registered_agent_name: Mapped[Optional[str]] = mapped_column(String(255))
     registered_agent_address: Mapped[Optional[str]] = mapped_column(String(500))

@@ -135,6 +135,21 @@ def _stamp_confidence(session, property_id: int, source: str, confidence: float)
         session.flush()
 
 
+# ─── Triangulation inline hook ───────────────────────────────────────────────
+
+def _triangulate_owner(session, owner_id: int) -> None:
+    """Recompute triangulation for a single owner after a successful skip-trace write."""
+    settings = get_settings()
+    if not settings.triangulation_enabled:
+        return
+    try:
+        from src.services.contact_triangulation import TriangulationService
+        TriangulationService(session).run_for_owner(owner_id)
+    except Exception:
+        logger.warning("[Waterfall] triangulation recompute failed for owner_id=%d", owner_id,
+                       exc_info=True)
+
+
 # ─── PDL persistence ─────────────────────────────────────────────────────────
 
 def _persist_pdl(session, owner: Owner, result) -> None:
@@ -246,6 +261,7 @@ def run_waterfall(
 
                 if ec and ec.match_success and confidence >= threshold:
                     _stamp_confidence(session, owner.property_id, "tracerfy", confidence)
+                    _triangulate_owner(session, owner.id)
                     stats.hits += 1
                     stats.per_provider["tracerfy"]["hits"] += 1
                 else:
@@ -284,6 +300,7 @@ def run_waterfall(
 
                     if ec and ec.match_success and confidence >= threshold:
                         _stamp_confidence(session, owner.property_id, "batch_skip_tracing", confidence)
+                        _triangulate_owner(session, owner.id)
                         stats.hits += 1
                         stats.per_provider["batchdata"]["hits"] += 1
                     else:
@@ -333,6 +350,7 @@ def run_waterfall(
 
                     if result.success and result.confidence >= threshold:
                         _persist_pdl(session, owner, result)
+                        _triangulate_owner(session, owner.id)
                         stats.hits += 1
                         stats.per_provider["pdl"]["hits"] += 1
                     else:

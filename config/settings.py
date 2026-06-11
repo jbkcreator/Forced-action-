@@ -268,6 +268,15 @@ class AppSettings(BaseSettings):
 		return max(1, min(int(v), 10))
 	pdl_api_key: Optional[SecretStr] = Field(default=None, env="PDL_API_KEY")
 
+	# Cross-source contact triangulation (ADR 0015).
+	# triangulation_enabled — nightly sweep + inline hook compute corroboration
+	# and write contact_info_confidence / contactability_detail.
+	# cds_use_contactability — CDS reads the tiered contact bonus and the sweep
+	# dispatches delta-rescores for changed labels. Keep off until the Stage E
+	# shadow-diff has been reviewed (rollout stage 3).
+	triangulation_enabled: bool = Field(default=False, env="TRIANGULATION_ENABLED")
+	cds_use_contactability: bool = Field(default=False, env="CDS_USE_CONTACTABILITY")
+
 	# Skip trace waterfall behaviour
 	skip_trace_confidence_threshold: float = Field(default=0.70, env="SKIP_TRACE_CONFIDENCE_THRESHOLD")
 	skip_trace_cost_ceiling_cents: int = Field(default=80, env="SKIP_TRACE_COST_CEILING_CENTS")
