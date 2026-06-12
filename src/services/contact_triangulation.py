@@ -283,21 +283,27 @@ _VOTERS_QUERY = text("""
       AND (phone_1 IS NOT NULL OR phones IS NOT NULL OR email IS NOT NULL)
 """)
 
-_WRITE_QUERY = text("""
+# Bulk write via psycopg2 execute_values — one statement per _WRITE_BATCH_SIZE
+# rows, not one per owner (13k single-row round trips ≈ minutes; batched ≈ seconds).
+_WRITE_BATCH_SIZE = 1000
+
+_WRITE_SQL = """
     UPDATE owners AS o SET
         contact_info_confidence       = v.label,
-        contact_info_confidence_score = CAST(v.score AS numeric),
-        contact_last_verified_at      = CAST(v.verified_at AS timestamptz),
-        contact_next_refresh_at       = CAST(v.refresh_at AS timestamptz),
+        contact_info_confidence_score = v.score,
+        contact_last_verified_at      = v.verified_at,
+        contact_next_refresh_at       = v.refresh_at,
         contact_refresh_status        = v.refresh_status,
         contact_refresh_reason        = v.reason,
-        contactability_detail         = CAST(v.detail AS jsonb)
-    FROM (VALUES (:owner_id, :label, :score, :verified_at, :refresh_at,
-                  :refresh_status, :reason, :detail))
+        contactability_detail         = v.detail
+    FROM (VALUES %s)
          AS v(owner_id, label, score, verified_at, refresh_at,
               refresh_status, reason, detail)
     WHERE o.id = v.owner_id
-""")
+"""
+
+_WRITE_TEMPLATE = ("(%s, %s, %s::numeric, %s::timestamptz, %s::timestamptz, "
+                   "%s, %s, %s::jsonb)")
 
 
 class _OwnerView:
@@ -514,8 +520,7 @@ class TriangulationService:
 
         if updates and not dry_run:
             logger.info("[Triangulation-Debug] writing_updates count=%d", len(updates))
-            self.session.execute(_WRITE_QUERY, updates)
-            self.session.commit()
+            self._bulk_write(updates)
             logger.info("[Triangulation] wrote %d labels (%d changed, %d downgraded)",
                         len(updates), stats["changed"], stats["downgrades"])
             # Sweep mode only — the single-owner inline hook (run_for_owner)
@@ -527,6 +532,29 @@ class TriangulationService:
             logger.info("[Triangulation] DRY-RUN: would write %d labels (%d changed) | %s",
                         len(updates), stats["changed"], stats["distribution"])
         return stats
+
+    def _bulk_write(self, updates: List[dict]) -> None:
+        """Batched label write: one execute_values statement per 1000 rows."""
+        import psycopg2.extras
+
+        cursor = self.session.connection().connection.cursor()
+        try:
+            for start in range(0, len(updates), _WRITE_BATCH_SIZE):
+                chunk = updates[start:start + _WRITE_BATCH_SIZE]
+                psycopg2.extras.execute_values(
+                    cursor,
+                    _WRITE_SQL,
+                    [(u["owner_id"], u["label"], u["score"], u["verified_at"],
+                      u["refresh_at"], u["refresh_status"], u["reason"], u["detail"])
+                     for u in chunk],
+                    template=_WRITE_TEMPLATE,
+                    page_size=_WRITE_BATCH_SIZE,
+                )
+                logger.info("[Triangulation] wrote batch %d–%d of %d",
+                            start + 1, start + len(chunk), len(updates))
+        finally:
+            cursor.close()
+        self.session.commit()
 
     def _rescore_if_enabled(self, changed_property_ids: list) -> bool:
         from config.settings import get_settings
