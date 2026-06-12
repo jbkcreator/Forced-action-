@@ -80,6 +80,7 @@ from config.scoring import (
     AGE_DECAY_2Y,
     CONTACT_EMAIL_BONUS,
     CONTACT_PHONE_BONUS,
+    CONTACT_PHONE_BONUS_BY_CONFIDENCE,
     DAYS_OPEN_MODIFIERS,
     EQUITY_BONUS_BY_VERTICAL,
     EQUITY_HIGH_THRESH,
@@ -715,7 +716,15 @@ class MultiVerticalScorer:
         contact_bonus = 0
         if owner:
             if owner.phone_1 or owner.phone_2 or owner.phone_3:
-                contact_bonus += CONTACT_PHONE_BONUS
+                # getattr: bulk path builds owners as SimpleNamespace from a
+                # column list — older bundles may lack the label entirely.
+                confidence = getattr(owner, "contact_info_confidence", None)
+                if settings.cds_use_contactability and confidence:
+                    contact_bonus += CONTACT_PHONE_BONUS_BY_CONFIDENCE.get(
+                        confidence, CONTACT_PHONE_BONUS
+                    )
+                else:
+                    contact_bonus += CONTACT_PHONE_BONUS
             if owner.email_1 or owner.email_2:
                 contact_bonus += CONTACT_EMAIL_BONUS
 
@@ -1002,7 +1011,10 @@ class MultiVerticalScorer:
             "qualified":       qualified,
             "signal_count":    len(signals),
             "distress_types":  list({s["type"] for s in signals}),
-            "factor_scores":   self._build_factor_scores(signals, vertical_results),
+            "factor_scores":   self._build_factor_scores(
+                signals, vertical_results,
+                contact_info_confidence=getattr(owner, "contact_info_confidence", None),
+            ),
             # Skip expensive summary/estimation work for zero-signal properties —
             # these fields are only consumed by the CRM push path (qualified leads).
             "signal_summaries": self._build_signal_summaries(prop) if signals else {},
@@ -1165,7 +1177,8 @@ class MultiVerticalScorer:
             logger.debug("Job value estimation failed for property %s", prop.id, exc_info=True)
             return {"low": 0, "high": 0, "display": "N/A", "method": "error"}
 
-    def _build_factor_scores(self, signals: List[Dict], vertical_results: Dict) -> Dict:
+    def _build_factor_scores(self, signals: List[Dict], vertical_results: Dict,
+                             contact_info_confidence: Optional[str] = None) -> Dict:
         """
         Build the factor_scores JSONB payload with full per-component breakdown.
 
@@ -1212,8 +1225,9 @@ class MultiVerticalScorer:
             }
 
         return {
-            "signals":            signal_list,
-            "vertical_breakdown": vertical_breakdown,
+            "signals":                  signal_list,
+            "vertical_breakdown":       vertical_breakdown,
+            "contact_info_confidence":  contact_info_confidence,
         }
 
     # ── Database persistence ───────────────────────────────────────────────────
@@ -1465,7 +1479,8 @@ class MultiVerticalScorer:
 
         owner_rows = _q("""
             SELECT property_id, owner_name, owner_type, absentee_status, mailing_address,
-                   ownership_years, phone_1, phone_2, phone_3, email_1, email_2
+                   ownership_years, phone_1, phone_2, phone_3, email_1, email_2,
+                   contact_info_confidence
             FROM owners WHERE property_id IN (SELECT unnest(CAST(:ids AS bigint[])))
         """)
         fin_rows = _q("""

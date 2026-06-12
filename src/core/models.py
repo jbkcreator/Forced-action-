@@ -178,6 +178,31 @@ class Owner(Base):
     # future mail-house export — no mail vendor is integrated yet.
     direct_mail_eligible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
 
+    # Contact freshness (fa073) — written by src/services/contact_freshness.py.
+    # Columns existed in the DB since fa073 but were unmapped here, so ORM
+    # writes silently no-opped (ADR 0015). DB-side check constraints:
+    #   contact_info_confidence IN ('high','medium','low','stale')
+    #   contact_refresh_status  IN ('fresh','due','queued','refreshed','failed')
+    contact_info_confidence: Mapped[Optional[str]] = mapped_column(String(20))
+    contact_info_confidence_score: Mapped[Optional[float]] = mapped_column(Numeric(4, 3))
+    contact_last_verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    contact_next_refresh_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    contact_refresh_status: Mapped[Optional[str]] = mapped_column(String(20))
+    contact_refresh_reason: Mapped[Optional[str]] = mapped_column(String(120))
+
+    # Set by the master weekly refresh (fa077) when contact data predates the
+    # latest refresh cycle. Unmapped until ADR 0015 (same drift as fa073 cols).
+    skip_trace_stale: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+
+    # Cross-source triangulation evidence (ADR 0015) — written by
+    # src/services/contact_triangulation.py alongside the freshness columns.
+    # Shape: {matched_phone, person, sources: [...], corroboration,
+    #         email_corroboration, matched_email, rule_fired, computed_at,
+    #         prev_label}
+    # DDL applied via scripts/apply_contactability_detail_migration.py
+    # (alembic fa078 file is the record — never `alembic upgrade`).
+    contactability_detail: Mapped[Optional[dict]] = mapped_column(JSONB)
+
     # Sunbiz registered agent — populated by Sunbiz Playwright scraper (LLC owners only)
     registered_agent_name: Mapped[Optional[str]] = mapped_column(String(255))
     registered_agent_address: Mapped[Optional[str]] = mapped_column(String(500))
@@ -1489,6 +1514,17 @@ class EnrichedContact(Base):
     traced_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     # Waterfall quality score (0.000–1.000) — set by the waterfall coordinator
     confidence: Mapped[Optional[float]] = mapped_column(Numeric(4, 3), nullable=True)
+
+    # Contact verification + supersession chain (fa073) — unmapped until
+    # ADR 0015. verification_status: e.g. 'valid' | 'invalid' (consumed by
+    # contact_freshness). When a re-trace replaces this row's data, the old
+    # row is stamped superseded_at/superseded_by_contact_id instead of being
+    # mutated, preserving the audit trail.
+    verification_status: Mapped[Optional[str]] = mapped_column(String(20))
+    superseded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    superseded_by_contact_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("enriched_contacts.id"), nullable=True
+    )
 
     # Audit
     enriched_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))

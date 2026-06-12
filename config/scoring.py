@@ -193,8 +193,14 @@ ABSENTEE_BONUS = {
 }
 
 # Contact quality bonus
-CONTACT_PHONE_BONUS = 15   # verified phone on Owner record
+CONTACT_PHONE_BONUS = 15   # verified phone on Owner record (flat fallback when flag off)
 CONTACT_EMAIL_BONUS = 10   # verified email on Owner record
+
+# Tiered bonus by contact_info_confidence (ADR 0015).
+# Replaces the flat CONTACT_PHONE_BONUS when CDS_USE_CONTACTABILITY=true and
+# owners.contact_info_confidence is not NULL.  'stale' = 0 (no bonus for
+# numbers we know are unreachable or unverified).
+CONTACT_PHONE_BONUS_BY_CONFIDENCE = {"high": 15, "medium": 10, "low": 5, "stale": 0}
 
 # Equity thresholds — shared across all verticals (rates per vertical in EQUITY_BONUS_BY_VERTICAL)
 EQUITY_HIGH_THRESH = 50   # percent — equity_pct > 50% → full bonus

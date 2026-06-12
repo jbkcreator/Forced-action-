@@ -9,6 +9,11 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from config.triangulation import PACK_CONTACTABLE_LABELS, PACK_MIN_CONTACTABLE_PCT
+
 
 def get_lead_pool(
     zip_code: str,
@@ -22,6 +27,55 @@ def get_lead_pool(
     """
     from src.agents.tools.read_tools import get_lead_pool as _get_lead_pool
     return _get_lead_pool(zip_code=zip_code, vertical=vertical, min_score=min_score, limit=limit)
+
+
+def check_pack_contactability(
+    session: Session,
+    property_ids: List[int],
+) -> Dict[str, Any]:
+    """
+    Validate that a lead pack meets the minimum contactability threshold (ADR 0015).
+
+    Queries owners for the given property_ids, counts how many have a
+    contact_info_confidence in PACK_CONTACTABLE_LABELS ('high' or 'medium'),
+    and returns whether the pack passes the PACK_MIN_CONTACTABLE_PCT gate.
+
+    Returns:
+        {
+            "pct_contactable": float,   # 0.0–1.0
+            "passes": bool,
+            "counts": {"high": n, "medium": n, "low": n, "stale": n, "unknown": n},
+            "total": int,
+        }
+    """
+    if not property_ids:
+        return {"pct_contactable": 0.0, "passes": False, "counts": {}, "total": 0}
+
+    rows = session.execute(
+        text("""
+            SELECT contact_info_confidence, COUNT(*) AS n
+            FROM owners
+            WHERE property_id = ANY(:pids)
+            GROUP BY contact_info_confidence
+        """),
+        {"pids": property_ids},
+    ).fetchall()
+
+    counts: Dict[str, int] = {}
+    for row in rows:
+        label = row.contact_info_confidence or "unknown"
+        counts[label] = counts.get(label, 0) + int(row.n)
+
+    total = sum(counts.values())
+    contactable = sum(counts.get(lbl, 0) for lbl in PACK_CONTACTABLE_LABELS)
+    pct = contactable / total if total > 0 else 0.0
+
+    return {
+        "pct_contactable": round(pct, 4),
+        "passes": pct >= PACK_MIN_CONTACTABLE_PCT,
+        "counts": counts,
+        "total": total,
+    }
 
 
 def get_zip_activity(

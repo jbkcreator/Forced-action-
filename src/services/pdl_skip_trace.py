@@ -11,6 +11,7 @@ import time
 import requests
 
 from config.settings import get_settings
+from src.services.phone_utils import normalize as normalize_phone
 from src.services.skip_trace_result import SkipTraceResult, compute_confidence
 from src.utils.logger import get_logger
 
@@ -75,13 +76,15 @@ def run_pdl_lookup(
         # PDL wraps all person fields under "data"; likelihood is at the top level
         person = resp_json.get("data") or {}
 
-        # mobile_phone is a dedicated field — most reliable
-        mobile = person.get("mobile_phone")
+        # mobile_phone is a dedicated field — most reliable. Normalize to
+        # strict E.164; invalid/junk numbers become None (phone_utils guard).
+        mobile = normalize_phone(person.get("mobile_phone"))
 
-        # phones[] has number + metadata but NO type field; take first that differs from mobile
+        # phones[] has number + metadata but NO type field; take first valid
+        # number that differs from mobile
         landline = None
         for ph in (person.get("phones") or []):
-            num = (ph.get("number") or "").strip()
+            num = normalize_phone(ph.get("number"))
             if num and num != mobile:
                 landline = num
                 break
