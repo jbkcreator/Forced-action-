@@ -4,7 +4,7 @@
 # Install with: bash scripts/cron/install_cron.sh
 #
 # Schedule overview:
-#   Master Parcel    → Quarterly  (1st of Jan, Apr, Jul, Oct @ 01:00 AM UTC)
+#   Master Parcel    → Weekly Sunday @ 01:00 AM UTC (hillsborough) / 02:00 AM UTC (pinellas)
 #   Most scrapers    → Daily (staggered 04:00–06:25 AM UTC / 12:00–2:25 AM EDT / 09:30–11:55 AM IST)
 #   Tax Delinquency  → Weekly Monday @ 06:00 AM UTC (02:00 AM EDT / 11:30 AM IST)
 #   CDS Scoring      → Daily @ 07:00 AM UTC (03:00 AM EDT / 12:30 PM IST)
@@ -15,9 +15,6 @@
 # Date overlap strategy:
 #   Liens/Deeds/Judgments use --start-date 1 day ago (single combined job).
 #   DB deduplication handles any overlap (same record → upsert/skip).
-#
-# Last master run: 2026-02-26 (done manually)
-# Next master run: 2026-04-01
 # ============================================================
 
 SHELL=/bin/bash
@@ -25,9 +22,13 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 PROJECT=/root/Forced-action-
 COUNTY_ID=hillsborough
 
-# ── QUARTERLY ────────────────────────────────────────────────
-# Master Parcel Data (1st of Jan, Apr, Jul, Oct at 01:00 AM UTC)
-0 1 1 1,4,7,10 * $PROJECT/scripts/cron/run.sh src.scrappers.master.master_engine --load-to-db
+# ── WEEKLY: MASTER ───────────────────────────────────────────
+# Master Parcel Data — Sunday 01:00/02:00 AM UTC. Weekly refresh: inserts new
+# parcels, hash-diffs existing rows (updates + needs_rescore / pending_sync /
+# skip_trace_stale flags), stamps last_seen_at for every parcel present in the
+# file. No deletes. Sources update weekly; quarterly loads left stale data.
+0 1 * * 0 $PROJECT/scripts/cron/run.sh src.scrappers.master.master_engine --load-to-db
+0 2 * * 0 COUNTY_ID=pinellas $PROJECT/scripts/cron/run.sh src.scrappers.master.master_engine --county-id pinellas --load-to-db
 
 # ── DAILY ────────────────────────────────────────────────────
 

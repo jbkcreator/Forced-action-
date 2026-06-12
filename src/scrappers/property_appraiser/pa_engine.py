@@ -128,13 +128,16 @@ def _scrape_and_parse(
     """
     from src.scrappers.property_appraiser.pa_scraper import HCPAScraper, PCPAOScraper
     from src.scrappers.property_appraiser.pa_parser import (
-        parse_hcpa_page, parse_pcpao_page, parse_trim_pdf, parse_tax_collector, to_canonical_dataframe
+        parse_hcpa_page, parse_pcpao_page, parse_trim_pdf, to_canonical_dataframe
     )
 
+    _SCRAPER_MAP = {
+        "hcpa":  (HCPAScraper,  parse_hcpa_page),
+        "pcpao": (PCPAOScraper, parse_pcpao_page),
+    }
     parcel_id = prop["parcel_id"]
-    use_pinellas = county_id.lower() == "pinellas"
-    scraper_cls = PCPAOScraper if use_pinellas else HCPAScraper
-    page_parser = parse_pcpao_page if use_pinellas else parse_hcpa_page
+    pa_variant = config.get("pa_scraper", "hcpa")
+    scraper_cls, page_parser = _SCRAPER_MAP.get(pa_variant, (HCPAScraper, parse_hcpa_page))
     try:
         with scraper_cls(config, headful=headful) as scraper:
             raw = scraper.scrape_property(parcel_id)
@@ -146,12 +149,9 @@ def _scrape_and_parse(
             print(f"  hcpa_text  : {len(raw.get('hcpa_text') or '')} chars")
             print(f"  hcpa_html  : {len(raw.get('hcpa_html') or '')} chars")
             print(f"  trim_pdf   : {raw.get('trim_pdf_path')}")
-            print(f"  tax_text   : {len(raw.get('tax_text') or '')} chars")
             print(f"  errors     : {raw.get('errors')}")
             if raw.get("hcpa_text"):
                 print(f"\n--- HCPA TEXT (first 1500 chars) ---\n{(raw['hcpa_text'] or '')[:1500]}")
-            if raw.get("tax_text"):
-                print(f"\n--- TAX TEXT (first 1500 chars) ---\n{(raw['tax_text'] or '')[:1500]}")
 
         if not (raw.get("hcpa_text") or raw.get("hcpa_html")):
             logger.warning(
@@ -171,14 +171,11 @@ def _scrape_and_parse(
                 Path(trim_path).unlink(missing_ok=True)
             except Exception:
                 pass
-        tax = parse_tax_collector(raw.get("tax_text") or "")
-
         if debug:
             print(f"\n--- PARSED HCPA ---\n{hcpa}")
             print(f"\n--- PARSED TRIM ---\n{trim}")
-            print(f"\n--- PARSED TAX  ---\n{tax}")
 
-        if not (hcpa or trim or tax):
+        if not (hcpa or trim):
             logger.warning(
                 "Property appraiser parse produced no data for parcel %s (id=%s)",
                 parcel_id,
@@ -186,7 +183,7 @@ def _scrape_and_parse(
             )
             return None
 
-        df = to_canonical_dataframe(hcpa, trim, tax, parcel_id)
+        df = to_canonical_dataframe(hcpa, trim, parcel_id)
         df["_property_id"] = prop["id"]
 
         if debug:

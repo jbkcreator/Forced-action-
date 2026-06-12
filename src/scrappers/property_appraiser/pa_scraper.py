@@ -45,7 +45,7 @@ _SEL_RESULTS_LINK  = "tbody[data-bind='foreach: results'] tr td.link"
 
 # Detail page selectors — these appear only after clicking a result
 _SEL_TRIM_LINK     = "a:has-text('TRIM'), a[href*='trim'], a:has-text('Download TRIM')"
-_SEL_TAX_LINK      = "a:has-text('Tax Collector'), a[href*='county-taxes'], button:has-text('Tax Collector')"
+
 _SEL_DETAIL_READY  = ".property-info, table.property-details, .parcel-info, div.ng-scope"
 
 _PCPAO_BASE_URL = "https://www.pcpao.gov"
@@ -157,7 +157,6 @@ class HCPAScraper:
             "hcpa_text":     None,
             "hcpa_html":     None,
             "trim_pdf_path": None,
-            "tax_text":      None,
             "errors":        [],
         }
 
@@ -182,13 +181,6 @@ class HCPAScraper:
                 result["errors"].append(f"TRIM: {e}")
 
             time.sleep(self._throttle_s)
-
-            # 6. Click Tax Collector link and scrape that page
-            try:
-                result["tax_text"] = self._click_tax_and_scrape(page)
-            except Exception as e:
-                logger.warning("Tax Collector failed for %s: %s", parcel_id, e)
-                result["errors"].append(f"Tax Collector: {e}")
 
         finally:
             page.close()
@@ -326,36 +318,6 @@ class HCPAScraper:
             logger.info("TRIM download failed for %s: %s", parcel_id, e)
             return None
 
-    # ------------------------------------------------------------------
-    # Step 6: Tax Collector
-    # ------------------------------------------------------------------
-
-    def _click_tax_and_scrape(self, page: Page) -> str:
-        """
-        Click the Tax Collector link on the current detail page.
-        The link redirects through county-taxes.com to a signed county-taxes.net URL.
-        Returns the visible text of the final tax page.
-        """
-        tax_locator = page.locator(_SEL_TAX_LINK).first
-        try:
-            tax_locator.wait_for(state="visible", timeout=5000)
-        except PlaywrightTimeout:
-            logger.debug("Tax Collector link not found on detail page")
-            return ""
-
-        try:
-            tax_locator.click()
-            # Redirect chain: county-taxes.com → Cloudflare → county-taxes.net/{signed-token}
-            # wait_for_url blocks until the final URL matches (skips CF challenge page)
-            page.wait_for_url("*county-taxes.net*", timeout=35000)
-            page.wait_for_timeout(2000)
-            logger.debug("Tax Collector page: %s", page.url)
-            return self._extract_text(page)
-        except Exception as e:
-            logger.warning("Tax Collector navigation failed: %s", e)
-            return ""
-
-
 class PCPAOScraper(HCPAScraper):
     """
     Sync Playwright scraper for Pinellas County Property Appraiser (PCPAO).
@@ -371,7 +333,6 @@ class PCPAOScraper(HCPAScraper):
             "hcpa_text":     None,
             "hcpa_html":     None,
             "trim_pdf_path": None,
-            "tax_text":      None,
             "errors":        [],
         }
 
@@ -394,11 +355,6 @@ class PCPAOScraper(HCPAScraper):
 
             time.sleep(self._throttle_s)
 
-            try:
-                result["tax_text"] = self._click_tax_and_scrape(page)
-            except Exception as e:
-                logger.warning("Pinellas Tax Collector failed for %s: %s", parcel_id, e)
-                result["errors"].append(f"Tax Collector: {e}")
         finally:
             page.close()
 
@@ -623,27 +579,3 @@ class PCPAOScraper(HCPAScraper):
             logger.info("PCPAO TRIM download failed for %s: %s", parcel_id, e)
             return None
 
-    def _click_tax_and_scrape(self, page: Page) -> str:
-        tax_locator = page.locator("a[href*='county-taxes.com'], a:has-text('Tax Bill')").first
-        try:
-            tax_locator.wait_for(state="visible", timeout=5000)
-        except PlaywrightTimeout:
-            logger.debug("PCPAO tax link not found on detail page")
-            return ""
-
-        try:
-            href = tax_locator.get_attribute("href")
-            if href:
-                page.goto(urljoin(_PCPAO_BASE_URL, href), wait_until="domcontentloaded", timeout=20000)
-            else:
-                tax_locator.click()
-            try:
-                page.wait_for_load_state("networkidle", timeout=5000)
-            except PlaywrightTimeout:
-                pass
-            page.wait_for_timeout(1000)
-            logger.debug("Pinellas tax page: %s", page.url)
-            return self._extract_text(page)
-        except Exception as e:
-            logger.warning("PCPAO tax navigation failed: %s", e)
-            return ""

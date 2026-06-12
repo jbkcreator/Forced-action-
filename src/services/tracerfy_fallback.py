@@ -5,6 +5,11 @@ Uses POST /trace/ (batch async, 1 credit/hit = $0.02) rather than
 POST /trace/lookup/ (instant sync, 5 credits/hit = $0.10). We send
 owner name + address so the normal tier applies.
 
+Address-only fallback (address_only_fallback=True): re-submits existing
+miss rows as advanced traces without owner name (2 credits = $0.04). Bypasses name
+parsing failures — useful when AND patterns / ET AL / entity names caused
+the original run to miss.
+
 Flow:
   1. Collect candidates in batches of up to 100
   2. POST to /trace/ with trace_type="normal" → queue_id
@@ -28,10 +33,12 @@ Usage:
   python -m src.services.tracerfy_fallback --balance
 """
 
+import json
 import re
 import time
 import traceback
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Optional
 
 import requests
@@ -198,10 +205,17 @@ def _headers(api_key: str) -> dict:
     }
 
 
-def _submit_trace_batch(records: list[dict], api_key: str) -> tuple[str, int]:
+def _submit_trace_batch(
+    records: list[dict],
+    api_key: str,
+    address_only: bool = False,
+) -> tuple[str, int]:
     """
     POST /trace/ as multipart/form-data.
     Returns (queue_id, estimated_wait_seconds).
+
+    address_only=True uses trace_type="advanced", where Tracerfy identifies
+    the owner from address/city/state without first_name/last_name columns.
 
     Confirmed response shape:
       {"queue_id": 94858, "status": "pending", "rows_uploaded": 3,
@@ -210,20 +224,21 @@ def _submit_trace_batch(records: list[dict], api_key: str) -> tuple[str, int]:
     import json as _json
 
     fields = {
-        "address_column":     "address",
-        "city_column":        "city",
-        "state_column":       "state",
-        "zip_column":         "zip",
-        "first_name_column":  "first_name",
-        "last_name_column":   "last_name",
-        "label_column":       "label",   # owner_id echoed back for reliable result matching
+        "address_column":      "address",
+        "city_column":         "city",
+        "state_column":        "state",
+        "zip_column":          "zip",
+        "label_column":        "label",   # owner_id echoed back for reliable result matching
         "mail_address_column": "address",
-        "mail_city_column":   "city",
-        "mail_state_column":  "state",
-        "mailing_zip_column": "zip",
-        "trace_type":         "normal",
-        "json_data":          _json.dumps(records),
+        "mail_city_column":    "city",
+        "mail_state_column":   "state",
+        "mailing_zip_column":  "zip",
+        "trace_type":          "advanced" if address_only else "normal",
+        "json_data":           _json.dumps(records),
     }
+    if not address_only:
+        fields["first_name_column"] = "first_name"
+        fields["last_name_column"]  = "last_name"
     multipart = {k: (None, v) for k, v in fields.items()}
 
     resp = requests.post(
@@ -249,7 +264,13 @@ def _submit_trace_batch(records: list[dict], api_key: str) -> tuple[str, int]:
     return str(queue_id), estimated_wait
 
 
-def _poll_trace_queue(queue_id: str, api_key: str, estimated_wait: int = 30) -> list[dict]:
+def _poll_trace_queue(
+    queue_id: str,
+    api_key: str,
+    estimated_wait: int = 30,
+    stable_rounds_required: int = 2,
+    max_empty_attempts: int = 120,
+) -> list[dict]:
     """
     Poll GET /queue/:id until it returns a non-empty list, then return the results.
 
@@ -275,7 +296,24 @@ def _poll_trace_queue(queue_id: str, api_key: str, estimated_wait: int = 30) -> 
     stable_rounds = 0
 
     for attempt in range(120):
-        resp = requests.get(url, headers=_headers(api_key), timeout=30)
+        try:
+            resp = requests.get(url, headers=_headers(api_key), timeout=30)
+        except requests.RequestException as e:
+            logger.warning(
+                "[Tracerfy] queue=%s poll failed attempt=%d/%d: %s",
+                queue_id,
+                attempt + 1,
+                max_empty_attempts,
+                e,
+            )
+            if attempt + 1 >= max_empty_attempts:
+                logger.warning(
+                    "[Tracerfy] queue=%s did not return results after poll errors — treating as no-result queue",
+                    queue_id,
+                )
+                return []
+            time.sleep(_POLL_INTERVAL)
+            continue
         if not resp.ok:
             raise RuntimeError(f"Tracerfy GET /queue/ HTTP {resp.status_code}: {resp.text[:300]}")
         results = resp.json()
@@ -283,6 +321,13 @@ def _poll_trace_queue(queue_id: str, api_key: str, estimated_wait: int = 30) -> 
 
         if current_count == 0:
             logger.info("[Tracerfy] queue=%s still empty attempt=%d", queue_id, attempt + 1)
+            if attempt + 1 >= max_empty_attempts:
+                logger.warning(
+                    "[Tracerfy] queue=%s stayed empty after %d attempts — treating as no-result queue",
+                    queue_id,
+                    attempt + 1,
+                )
+                return []
             time.sleep(_POLL_INTERVAL)
             continue
 
@@ -290,7 +335,7 @@ def _poll_trace_queue(queue_id: str, api_key: str, estimated_wait: int = 30) -> 
         # across two consecutive polls before accepting as complete.
         if current_count == last_count:
             stable_rounds += 1
-            if stable_rounds >= 2:
+            if stable_rounds >= stable_rounds_required:
                 logger.info("[Tracerfy] queue=%s stable at %d rows after %d attempts",
                             queue_id, current_count, attempt + 1)
                 return results
@@ -411,6 +456,7 @@ def run_tracerfy_fallback(
     retrace_misses: bool = False,
     individual_only: bool = False,
     entity_only: bool = False,
+    address_only_fallback: bool = False,
 ) -> dict:
     """
     Run Tracerfy batch skip-trace (POST /trace/, 1 credit/hit = $0.02) for Gold+ leads.
@@ -419,6 +465,8 @@ def run_tracerfy_fallback(
     Waterfall mode (owner_ids=[...]): processes a specific list supplied by the orchestrator.
     retrace_misses=True: re-submits properties with existing tracerfy miss EC rows,
       updating them in-place on a hit. Ignores owner_ids when active.
+    address_only_fallback=True: re-submits existing miss rows without owner name
+      (2 credits = $0.04). Bypasses name parsing failures. Ignores owner_ids.
     individual_only / entity_only: restrict to individual or entity owner types.
 
     DNC side-effect: phones with dnc=True or litigator=True are written to
@@ -427,7 +475,8 @@ def run_tracerfy_fallback(
     Returns stats dict.
     """
     settings     = get_settings()
-    cost_per_hit = settings.tracerfy_cost_cents   # 2 cents = $0.02
+    # Address-only traces use advanced mode: 2 credits ($0.04) vs 1 credit for name+address.
+    cost_per_hit = 4 if address_only_fallback else settings.tracerfy_cost_cents
 
     if not settings.tracerfy_api_key:
         logger.warning("TRACERFY_API_KEY not set — Tracerfy skip-trace skipped")
@@ -441,87 +490,400 @@ def run_tracerfy_fallback(
     }
 
     with get_db_context() as session:
-        from sqlalchemy import or_ as sa_or, func as sa_func
         from sqlalchemy import text as sa_text
 
-        if retrace_misses:
+        if address_only_fallback and owner_ids is not None:
+            raw_rows = session.execute(sa_text("""
+                WITH gold_plus AS MATERIALIZED (
+                    SELECT property_id
+                    FROM (
+                        SELECT DISTINCT ON (property_id)
+                            property_id,
+                            lead_tier
+                        FROM distress_scores
+                        WHERE county_id = :county_id
+                        ORDER BY property_id, score_date DESC NULLS LAST, id DESC
+                    ) latest
+                    WHERE lead_tier IN ('Gold', 'Platinum', 'Ultra Platinum')
+                )
+                SELECT DISTINCT ON (o.id)
+                    o.id AS owner_id,
+                    o.property_id,
+                    o.county_id AS owner_county_id,
+                    p.id AS prop_id,
+                    p.address,
+                    p.city,
+                    p.state,
+                    p.zip
+                FROM owners o
+                JOIN properties p ON p.id = o.property_id
+                JOIN gold_plus gp ON gp.property_id = o.property_id
+                WHERE o.id = ANY(:owner_ids)
+                  AND o.county_id = :county_id
+                  AND (o.phone_1 IS NULL OR length(trim(o.phone_1)) = 0)
+                  AND (o.phone_2 IS NULL OR length(trim(o.phone_2)) = 0)
+                  AND (o.phone_3 IS NULL OR length(trim(o.phone_3)) = 0)
+                  AND (o.email_1 IS NULL OR length(trim(o.email_1)) = 0)
+                  AND (o.email_2 IS NULL OR length(trim(o.email_2)) = 0)
+                  AND p.address IS NOT NULL
+                  AND p.address != ''
+                  AND p.zip IS NOT NULL
+                  AND p.zip != ''
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM enriched_contacts ec_success
+                      WHERE ec_success.property_id = o.property_id
+                        AND ec_success.match_success = TRUE
+                  )
+                ORDER BY o.id
+            """), {
+                "county_id": county_id,
+                "owner_ids": owner_ids,
+            }).mappings().all()
+            rows = [
+                (
+                    SimpleNamespace(
+                        id=r["owner_id"],
+                        property_id=r["property_id"],
+                        county_id=r["owner_county_id"],
+                    ),
+                    SimpleNamespace(
+                        id=r["prop_id"],
+                        address=r["address"],
+                        city=r["city"],
+                        state=r["state"],
+                        zip=r["zip"],
+                    ),
+                )
+                for r in raw_rows
+            ]
+
+        elif address_only_fallback:
             # Re-submit properties whose prior Tracerfy run returned no match.
-            # The existing miss EC row is updated in-place on a hit; continued
-            # misses are left unchanged (no duplicate rows inserted).
+            # retrace_misses: resubmit with same name+address (1 credit/hit).
+            # address_only_fallback: resubmit address only in advanced mode, no name.
+            # In both modes the existing miss EC row is updated in-place on a hit.
             type_filter = ""
             if individual_only:
                 type_filter = " AND o.owner_type = 'Individual'"
             elif entity_only:
                 type_filter = " AND o.owner_type != 'Individual'"
 
-            miss_owner_ids = [
-                r[0]
-                for r in session.execute(sa_text(f"""
-                    SELECT DISTINCT o.id
-                    FROM enriched_contacts ec
-                    JOIN owners o ON o.property_id = ec.property_id
-                      AND o.county_id = :county_id
-                    WHERE ec.source = 'tracerfy'
-                      AND ec.match_success = FALSE
-                    {type_filter}
-                    ORDER BY o.id
-                    LIMIT :limit
-                """), {"county_id": county_id, "limit": limit}).fetchall()
-            ]
-            rows = (
-                session.query(Owner, Property)
-                .join(Property, Owner.property_id == Property.id)
-                .filter(Owner.id.in_(miss_owner_ids))
-                .all()
+            # Address-only mode requires a valid property address — guard in SQL
+            # since there is no name fallback if address is blank.
+            addr_filter = (
+                " AND p.address IS NOT NULL AND p.address != ''"
+                " AND p.zip IS NOT NULL AND p.zip != ''"
+            ) if address_only_fallback else ""
+
+            logger.info(
+                "[Tracerfy] Selecting Gold+ tracerfy misses county=%s limit=%d...",
+                county_id, limit,
             )
+            select_started = time.monotonic()
+            raw_rows = session.execute(sa_text(f"""
+                WITH gold_plus AS MATERIALIZED (
+                    SELECT property_id
+                    FROM (
+                        SELECT DISTINCT ON (property_id)
+                            property_id,
+                            lead_tier
+                        FROM distress_scores
+                        WHERE county_id = :county_id
+                        ORDER BY property_id, score_date DESC NULLS LAST, id DESC
+                    ) latest
+                    WHERE lead_tier IN ('Gold', 'Platinum', 'Ultra Platinum')
+                )
+                SELECT DISTINCT ON (o.id)
+                    o.id AS owner_id,
+                    o.property_id,
+                    o.county_id AS owner_county_id,
+                    p.id AS prop_id,
+                    p.address,
+                    p.city,
+                    p.state,
+                    p.zip
+                FROM enriched_contacts ec
+                JOIN owners o ON o.property_id = ec.property_id
+                  AND o.county_id = :county_id
+                JOIN gold_plus gp ON gp.property_id = o.property_id
+                JOIN properties p ON p.id = o.property_id
+                WHERE ec.source = 'tracerfy'
+                  AND ec.match_success = FALSE
+                  AND (o.phone_1 IS NULL OR length(trim(o.phone_1)) = 0)
+                  AND (o.phone_2 IS NULL OR length(trim(o.phone_2)) = 0)
+                  AND (o.phone_3 IS NULL OR length(trim(o.phone_3)) = 0)
+                  AND (o.email_1 IS NULL OR length(trim(o.email_1)) = 0)
+                  AND (o.email_2 IS NULL OR length(trim(o.email_2)) = 0)
+                  AND p.address IS NOT NULL
+                  AND p.address != ''
+                  AND p.zip IS NOT NULL
+                  AND p.zip != ''
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM enriched_contacts ec_success
+                      WHERE ec_success.property_id = o.property_id
+                        AND ec_success.match_success = TRUE
+                  )
+                {type_filter}
+                {addr_filter}
+                ORDER BY o.id
+                LIMIT :limit
+            """), {"county_id": county_id, "limit": limit}).mappings().all()
+            logger.info(
+                "[Tracerfy] Found %d Gold+ tracerfy misses in %.1fs",
+                len(raw_rows), time.monotonic() - select_started,
+            )
+            rows = [
+                (
+                    SimpleNamespace(
+                        id=r["owner_id"],
+                        property_id=r["property_id"],
+                        county_id=r["owner_county_id"],
+                    ),
+                    SimpleNamespace(
+                        id=r["prop_id"],
+                        address=r["address"],
+                        city=r["city"],
+                        state=r["state"],
+                        zip=r["zip"],
+                    ),
+                )
+                for r in raw_rows
+            ]
+
+        elif retrace_misses:
+            type_filter = ""
+            if individual_only:
+                type_filter = " AND o.owner_type = 'Individual'"
+            elif entity_only:
+                type_filter = " AND o.owner_type != 'Individual'"
+
+            logger.info(
+                "[Tracerfy] Selecting Gold+ tracerfy misses county=%s limit=%d...",
+                county_id, limit,
+            )
+            select_started = time.monotonic()
+            raw_rows = session.execute(sa_text(f"""
+                WITH gold_plus AS MATERIALIZED (
+                    SELECT property_id
+                    FROM (
+                        SELECT DISTINCT ON (property_id)
+                            property_id,
+                            lead_tier
+                        FROM distress_scores
+                        WHERE county_id = :county_id
+                        ORDER BY property_id, score_date DESC NULLS LAST, id DESC
+                    ) latest
+                    WHERE lead_tier IN ('Gold', 'Platinum', 'Ultra Platinum')
+                )
+                SELECT DISTINCT ON (o.id)
+                    o.id AS owner_id,
+                    o.property_id,
+                    o.county_id AS owner_county_id,
+                    o.owner_name,
+                    o.owner_type,
+                    o.phone_1,
+                    o.email_1,
+                    o.phone_metadata,
+                    o.managing_members,
+                    o.registered_agent_name,
+                    o.registered_agent_address,
+                    p.id AS prop_id,
+                    p.address,
+                    p.city,
+                    p.state,
+                    p.zip
+                FROM enriched_contacts ec
+                JOIN owners o ON o.property_id = ec.property_id
+                  AND o.county_id = :county_id
+                JOIN gold_plus gp ON gp.property_id = o.property_id
+                JOIN properties p ON p.id = o.property_id
+                WHERE ec.source = 'tracerfy'
+                  AND ec.match_success = FALSE
+                  AND (o.phone_1 IS NULL OR length(trim(o.phone_1)) = 0)
+                  AND (o.phone_2 IS NULL OR length(trim(o.phone_2)) = 0)
+                  AND (o.phone_3 IS NULL OR length(trim(o.phone_3)) = 0)
+                  AND (o.email_1 IS NULL OR length(trim(o.email_1)) = 0)
+                  AND (o.email_2 IS NULL OR length(trim(o.email_2)) = 0)
+                  AND p.address IS NOT NULL
+                  AND p.address != ''
+                  AND p.zip IS NOT NULL
+                  AND p.zip != ''
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM enriched_contacts ec_success
+                      WHERE ec_success.property_id = o.property_id
+                        AND ec_success.match_success = TRUE
+                  )
+                {type_filter}
+                ORDER BY o.id
+                LIMIT :limit
+            """), {"county_id": county_id, "limit": limit}).mappings().all()
+            logger.info(
+                "[Tracerfy] Found %d Gold+ tracerfy misses in %.1fs",
+                len(raw_rows), time.monotonic() - select_started,
+            )
+            rows = [
+                (
+                    SimpleNamespace(
+                        id=r["owner_id"],
+                        property_id=r["property_id"],
+                        county_id=r["owner_county_id"],
+                        owner_name=r["owner_name"],
+                        owner_type=r["owner_type"],
+                        phone_1=r["phone_1"],
+                        email_1=r["email_1"],
+                        phone_metadata=r["phone_metadata"],
+                        managing_members=r["managing_members"],
+                        registered_agent_name=r["registered_agent_name"],
+                        registered_agent_address=r["registered_agent_address"],
+                    ),
+                    SimpleNamespace(
+                        id=r["prop_id"],
+                        address=r["address"],
+                        city=r["city"],
+                        state=r["state"],
+                        zip=r["zip"],
+                    ),
+                )
+                for r in raw_rows
+            ]
 
         elif owner_ids is not None:
-            already_tracerfy = (
-                session.query(EnrichedContact.property_id)
-                .filter(EnrichedContact.source == "tracerfy")
-                .subquery()
-            )
-            rows = (
-                session.query(Owner, Property)
-                .join(Property, Owner.property_id == Property.id)
-                .filter(
-                    Owner.id.in_(owner_ids),
-                    Owner.property_id.notin_(session.query(already_tracerfy)),
+            raw_rows = session.execute(sa_text("""
+                SELECT
+                    o.id AS owner_id,
+                    o.property_id,
+                    o.county_id AS owner_county_id,
+                    o.owner_name,
+                    o.owner_type,
+                    o.phone_1,
+                    o.email_1,
+                    o.phone_metadata,
+                    o.managing_members,
+                    o.registered_agent_name,
+                    o.registered_agent_address,
+                    p.id AS prop_id,
+                    p.address,
+                    p.city,
+                    p.state,
+                    p.zip
+                FROM owners o
+                JOIN properties p ON p.id = o.property_id
+                WHERE o.id = ANY(:owner_ids)
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM enriched_contacts ec
+                      WHERE ec.property_id = o.property_id
+                        AND ec.source = 'tracerfy'
+                  )
+                ORDER BY o.id
+            """), {"owner_ids": owner_ids}).mappings().all()
+            rows = [
+                (
+                    SimpleNamespace(
+                        id=r["owner_id"],
+                        property_id=r["property_id"],
+                        county_id=r["owner_county_id"],
+                        owner_name=r["owner_name"],
+                        owner_type=r["owner_type"],
+                        phone_1=r["phone_1"],
+                        email_1=r["email_1"],
+                        phone_metadata=r["phone_metadata"],
+                        managing_members=r["managing_members"],
+                        registered_agent_name=r["registered_agent_name"],
+                        registered_agent_address=r["registered_agent_address"],
+                    ),
+                    SimpleNamespace(
+                        id=r["prop_id"],
+                        address=r["address"],
+                        city=r["city"],
+                        state=r["state"],
+                        zip=r["zip"],
+                    ),
                 )
-                .all()
-            )
+                for r in raw_rows
+            ]
 
         else:
-            no_phone = sa_or(
-                Owner.phone_1.is_(None),
-                sa_func.length(sa_func.trim(Owner.phone_1)) == 0,
-            )
-            already_tracerfy = (
-                session.query(EnrichedContact.property_id)
-                .filter(EnrichedContact.source == "tracerfy")
-                .subquery()
-            )
-            rows = (
-                session.query(Owner, Property)
-                .join(Property, Owner.property_id == Property.id)
-                .join(DistressScore, DistressScore.property_id == Property.id)
-                .filter(
-                    Owner.county_id == county_id,
-                    no_phone,
-                    Owner.skip_trace_success.is_not(True),
-                    Owner.property_id.notin_(session.query(already_tracerfy)),
-                    DistressScore.lead_tier.in_(("Gold", "Platinum", "Ultra Platinum")),
-                    Property.address.isnot(None),
-                    Property.address != "",
-                    Property.zip.isnot(None),
-                    Property.zip != "",
+            raw_rows = session.execute(sa_text("""
+                WITH gold_plus AS MATERIALIZED (
+                    SELECT property_id
+                    FROM (
+                        SELECT DISTINCT ON (property_id)
+                            property_id,
+                            lead_tier
+                        FROM distress_scores
+                        WHERE county_id = :county_id
+                        ORDER BY property_id, score_date DESC NULLS LAST, id DESC
+                    ) latest
+                    WHERE lead_tier IN ('Gold', 'Platinum', 'Ultra Platinum')
                 )
-                .limit(limit)
-                .all()
-            )
+                SELECT
+                    o.id AS owner_id,
+                    o.property_id,
+                    o.county_id AS owner_county_id,
+                    o.owner_name,
+                    o.owner_type,
+                    o.phone_1,
+                    o.email_1,
+                    o.phone_metadata,
+                    o.managing_members,
+                    o.registered_agent_name,
+                    o.registered_agent_address,
+                    p.id AS prop_id,
+                    p.address,
+                    p.city,
+                    p.state,
+                    p.zip
+                FROM owners o
+                JOIN properties p ON p.id = o.property_id
+                JOIN gold_plus gp ON gp.property_id = o.property_id
+                WHERE o.county_id = :county_id
+                  AND (o.phone_1 IS NULL OR length(trim(o.phone_1)) = 0)
+                  AND o.skip_trace_success IS NOT TRUE
+                  AND p.address IS NOT NULL
+                  AND p.address != ''
+                  AND p.zip IS NOT NULL
+                  AND p.zip != ''
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM enriched_contacts ec
+                      WHERE ec.property_id = o.property_id
+                        AND ec.source = 'tracerfy'
+                  )
+                ORDER BY o.id
+                LIMIT :limit
+            """), {"county_id": county_id, "limit": limit}).mappings().all()
+            rows = [
+                (
+                    SimpleNamespace(
+                        id=r["owner_id"],
+                        property_id=r["property_id"],
+                        county_id=r["owner_county_id"],
+                        owner_name=r["owner_name"],
+                        owner_type=r["owner_type"],
+                        phone_1=r["phone_1"],
+                        email_1=r["email_1"],
+                        phone_metadata=r["phone_metadata"],
+                        managing_members=r["managing_members"],
+                        registered_agent_name=r["registered_agent_name"],
+                        registered_agent_address=r["registered_agent_address"],
+                    ),
+                    SimpleNamespace(
+                        id=r["prop_id"],
+                        address=r["address"],
+                        city=r["city"],
+                        state=r["state"],
+                        zip=r["zip"],
+                    ),
+                )
+                for r in raw_rows
+            ]
 
-        # Post-query type filter (applies to all modes except retrace, which already filtered in SQL)
-        if not retrace_misses:
+        # Post-query type filter (applies to default and owner_ids modes — retrace modes already filter in SQL)
+        if not retrace_misses and not address_only_fallback:
             if individual_only:
                 rows = [(o, p) for o, p in rows if o.owner_type == "Individual" and not _looks_corporate(o.owner_name or "")]
             elif entity_only:
@@ -538,13 +900,15 @@ def run_tracerfy_fallback(
         for owner, prop in rows[:5]:
             logger.info(
                 "[Tracerfy DRY RUN] Would trace: property_id=%d | %s | %s",
-                prop.id, prop.address, owner.owner_name,
+                prop.id, prop.address, getattr(owner, "owner_name", "<address-only>"),
             )
         logger.info("[Tracerfy DRY RUN] Would process %d records. No API call made.", len(rows))
         return stats
 
     # ── Build batches ─────────────────────────────────────────────────────
     # label = owner_id (str) so we can match results back without address parsing
+    address_fallback_skipped_owner_ids: list[int] = []
+    address_fallback_missed_owner_ids: list[int] = []
     for batch_start in range(0, len(rows), _BATCH_SIZE):
         batch = rows[batch_start: batch_start + _BATCH_SIZE]
         batch_num = batch_start // _BATCH_SIZE + 1
@@ -557,9 +921,32 @@ def run_tracerfy_fallback(
             if not prop.address or not prop.zip:
                 stats["no_address"] += 1
                 continue
+
+            if address_only_fallback:
+                # Bypass name resolution — submit property address only.
+                addr = {
+                    "address": prop.address,
+                    "city":    prop.city or "Tampa",
+                    "state":   prop.state or "FL",
+                    "zip":     (prop.zip or "")[:5],
+                }
+                label = str(owner.id)
+                records.append({
+                    "label":   label,
+                    "address": addr["address"],
+                    "city":    addr["city"],
+                    "state":   addr["state"],
+                    "zip":     addr["zip"],
+                })
+                label_map[label] = (owner, prop)
+                address_map[addr["address"].upper().strip()] = (owner, prop)
+                continue
+
             first, last, addr_override, is_traceable = _resolve_trace_subject(owner)
             if not is_traceable:
                 stats["skipped_entity"] += 1
+                if not address_only_fallback:
+                    address_fallback_skipped_owner_ids.append(owner.id)
                 continue
             addr = addr_override or {
                 "address": prop.address,
@@ -588,10 +975,17 @@ def run_tracerfy_fallback(
         logger.info("[Tracerfy] Batch %d: submitting %d records...", batch_num, len(records))
 
         try:
-            queue_id, estimated_wait = _submit_trace_batch(records, api_key)
+            queue_id, estimated_wait = _submit_trace_batch(records, api_key, address_only=address_only_fallback)
             logger.info("[Tracerfy] Batch %d queued — queue_id=%s est_wait=%ds",
                         batch_num, queue_id, estimated_wait)
-            results = _poll_trace_queue(queue_id, api_key, estimated_wait)
+            stable_rounds_required = 8 if address_only_fallback else 2
+            results = _poll_trace_queue(
+                queue_id,
+                api_key,
+                estimated_wait,
+                stable_rounds_required=stable_rounds_required,
+                max_empty_attempts=36 if address_only_fallback else 120,
+            )
         except RuntimeError as e:
             err_msg = str(e)
             logger.error("[Tracerfy] Batch %d failed: %s", batch_num, err_msg)
@@ -609,27 +1003,56 @@ def run_tracerfy_fallback(
             continue
 
         # ── Persist results ───────────────────────────────────────────────
-        hit_ids: set[str] = set()   # owner_id strings that returned a hit
+        hit_ids: set[str] = set()   # owner_id strings that returned a row
+        success_ids: set[str] = set()
         with get_db_context() as session:
             from sqlalchemy import insert as sa_insert
 
             # ── Bulk pre-loads — eliminates N round trips down to 2 ──────────
             all_owner_ids = [int(lbl) for lbl in label_map]
-            owners_by_id: dict[int, Owner] = {
-                o.id: o
-                for o in session.query(Owner).filter(Owner.id.in_(all_owner_ids)).all()
-            }
-            all_property_ids = [o.property_id for o in owners_by_id.values()]
-            existing_ecs: dict[int, EnrichedContact] = {
-                ec.property_id: ec
-                for ec in session.query(EnrichedContact).filter(
-                    EnrichedContact.property_id.in_(all_property_ids),
-                    EnrichedContact.source == "tracerfy",
-                ).all()
-            }
+            preload_rows = session.execute(sa_text("""
+                SELECT
+                    o.id AS owner_id,
+                    o.property_id,
+                    o.county_id,
+                    o.phone_1,
+                    o.email_1,
+                    o.phone_metadata,
+                    ec.id AS ec_id,
+                    ec.match_success AS ec_match_success
+                FROM owners o
+                LEFT JOIN LATERAL (
+                    SELECT id, property_id, match_success
+                    FROM enriched_contacts
+                    WHERE property_id = o.property_id
+                      AND source = 'tracerfy'
+                    ORDER BY enriched_at DESC NULLS LAST, id DESC
+                    LIMIT 1
+                ) ec ON TRUE
+                WHERE o.id = ANY(:ids)
+            """), {"ids": all_owner_ids}).mappings().all()
+            owners_by_id = {}
+            existing_ecs = {}
+            for r in preload_rows:
+                owners_by_id[r["owner_id"]] = SimpleNamespace(
+                    id=r["owner_id"],
+                    property_id=r["property_id"],
+                    county_id=r["county_id"],
+                    phone_1=r["phone_1"],
+                    email_1=r["email_1"],
+                    phone_metadata=r["phone_metadata"],
+                )
+                if r["ec_id"] is not None:
+                    existing_ecs[r["property_id"]] = SimpleNamespace(
+                        id=r["ec_id"],
+                        property_id=r["property_id"],
+                        match_success=r["ec_match_success"],
+                    )
 
             # Accumulate usage log dicts — one bulk insert at end, no per-row flush.
             usage_log_entries: list[dict] = []
+            ec_update_entries: list[dict] = []
+            owner_update_entries: list[dict] = []
             now = datetime.now(timezone.utc)
 
             for row in results:
@@ -657,7 +1080,7 @@ def run_tracerfy_fallback(
 
                     existing = existing_ecs.get(owner.property_id)
 
-                    if existing and not retrace_misses:
+                    if existing and not retrace_misses and not address_only_fallback:
                         stats["already_done"] += 1
                         continue
 
@@ -671,14 +1094,18 @@ def run_tracerfy_fallback(
                         "created_at":  now,
                     })
 
-                    if existing and retrace_misses:
-                        existing.mobile_phone    = parsed["mobile_phone"]
-                        existing.landline        = parsed["landline"]
-                        existing.email           = parsed["email"]
-                        existing.mailing_address = parsed["mailing_address"]
-                        existing.match_success   = parsed["match_success"]
-                        existing.raw_response    = row
-                        existing.enriched_at     = now
+                    if existing and (retrace_misses or address_only_fallback):
+                        ec_update_entries.append({
+                            "mobile_phone": parsed["mobile_phone"],
+                            "landline": parsed["landline"],
+                            "email": parsed["email"],
+                            "mailing_address": parsed["mailing_address"],
+                            "match_success": parsed["match_success"],
+                            "raw_response": json.dumps(row),
+                            "enriched_at": now,
+                            "trace_type": "advanced" if address_only_fallback else "normal",
+                            "ec_id": existing.id,
+                        })
                     else:
                         session.add(EnrichedContact(
                             property_id=owner.property_id,
@@ -688,6 +1115,7 @@ def run_tracerfy_fallback(
                             email=parsed["email"],
                             mailing_address=parsed["mailing_address"],
                             source="tracerfy",
+                            trace_type="advanced" if address_only_fallback else "normal",
                             match_success=parsed["match_success"],
                             raw_response=row,
                             enriched_at=now,
@@ -701,6 +1129,13 @@ def run_tracerfy_fallback(
                         owner.email_1 = parsed["email"]
                     if parsed["match_success"]:
                         owner.skip_trace_success = True
+
+                    if parsed["match_success"]:
+                        owner_update_entries.append({
+                            "phone_1": owner.phone_1,
+                            "email_1": owner.email_1,
+                            "owner_id": owner.id,
+                        })
 
                     dnc_flags = parsed.get("dnc_flags")
                     if dnc_flags:
@@ -723,6 +1158,7 @@ def run_tracerfy_fallback(
                             )
 
                     if parsed["match_success"]:
+                        success_ids.add(label)
                         stats["success"] += 1
                     else:
                         stats["failed"] += 1
@@ -736,8 +1172,76 @@ def run_tracerfy_fallback(
             if usage_log_entries:
                 session.execute(sa_insert(EnrichmentUsageLog), usage_log_entries)
 
+            if ec_update_entries:
+                session.execute(sa_text("""
+                    UPDATE enriched_contacts
+                    SET mobile_phone = :mobile_phone,
+                        landline = :landline,
+                        email = :email,
+                        mailing_address = :mailing_address,
+                        match_success = :match_success,
+                        raw_response = CAST(:raw_response AS JSONB),
+                        enriched_at = :enriched_at,
+                        trace_type = :trace_type
+                    WHERE id = :ec_id
+                """), ec_update_entries)
+
+            if owner_update_entries:
+                session.execute(sa_text("""
+                    UPDATE owners
+                    SET phone_1 = :phone_1,
+                        email_1 = :email_1,
+                        skip_trace_success = TRUE
+                    WHERE id = :owner_id
+                """), owner_update_entries)
+
+            if address_only_fallback:
+                missing_snaps = [
+                    owner_snap
+                    for lbl, (owner_snap, _) in label_map.items()
+                    if lbl not in hit_ids
+                ]
+                if missing_snaps:
+                    session.execute(
+                        sa_insert(EnrichmentUsageLog),
+                        [
+                            {
+                                "vendor":      "tracerfy",
+                                "purpose":     "skip_trace",
+                                "success":     False,
+                                "cost_cents":  0,
+                                "property_id": snap.property_id,
+                                "request_ref": queue_id,
+                                "error":       "address_only_no_row",
+                                "created_at":  now,
+                            }
+                            for snap in missing_snaps
+                        ],
+                    )
+                    new_miss_snaps = [
+                        snap
+                        for snap in missing_snaps
+                        if snap.property_id not in existing_ecs
+                    ]
+                    if new_miss_snaps:
+                        session.execute(
+                            sa_insert(EnrichedContact),
+                            [
+                                {
+                                    "property_id":   snap.property_id,
+                                    "county_id":     snap.county_id or county_id,
+                                    "source":        "tracerfy",
+                                    "trace_type":    "advanced",
+                                    "match_success": False,
+                                    "enriched_at":   now,
+                                }
+                                for snap in new_miss_snaps
+                            ],
+                        )
+                    stats["failed"] += len(missing_snaps)
+
             # ── Bulk-write misses ────────────────────────────────────────────
-            if not retrace_misses:
+            if not retrace_misses and not address_only_fallback:
                 miss_snaps = [
                     owner_snap
                     for lbl, (owner_snap, _) in label_map.items()
@@ -751,6 +1255,7 @@ def run_tracerfy_fallback(
                                 "property_id":   snap.property_id,
                                 "county_id":     snap.county_id or county_id,
                                 "source":        "tracerfy",
+                                "trace_type":    "normal",
                                 "match_success": False,
                                 "enriched_at":   now,
                             }
@@ -776,9 +1281,46 @@ def run_tracerfy_fallback(
 
             session.commit()
 
+        if retrace_misses and not address_only_fallback:
+            address_fallback_missed_owner_ids.extend(
+                int(lbl)
+                for lbl in label_map
+                if lbl not in success_ids
+            )
+
         if batch_start + _BATCH_SIZE < len(rows):
             logger.info("[Tracerfy] Waiting %ds before next batch (rate limit)...", _BATCH_DELAY)
             time.sleep(_BATCH_DELAY)
+
+    if not address_only_fallback and (
+        address_fallback_skipped_owner_ids or address_fallback_missed_owner_ids
+    ):
+        seen_fallback_ids = set()
+        fallback_ids = []
+        for owner_id in address_fallback_skipped_owner_ids + address_fallback_missed_owner_ids:
+            if owner_id not in seen_fallback_ids:
+                fallback_ids.append(owner_id)
+                seen_fallback_ids.add(owner_id)
+        logger.info(
+            "[Tracerfy] Normal trace left %d owner(s); running address-only fallback "
+            "(skipped_name=%d normal_miss=%d)...",
+            len(fallback_ids),
+            len(set(address_fallback_skipped_owner_ids)),
+            len(set(address_fallback_missed_owner_ids)),
+        )
+        fallback_stats = run_tracerfy_fallback(
+            limit=len(fallback_ids),
+            county_id=county_id,
+            owner_ids=fallback_ids,
+            dry_run=False,
+            retrace_misses=False,
+            individual_only=False,
+            entity_only=False,
+            address_only_fallback=True,
+        )
+        stats["success"] += fallback_stats.get("success", 0)
+        stats["failed"] += fallback_stats.get("failed", 0)
+        stats["no_address"] += fallback_stats.get("no_address", 0)
 
     logger.info("=" * 60)
     logger.info("TRACERFY SKIP TRACE COMPLETE")
@@ -813,6 +1355,8 @@ if __name__ == "__main__":
                         help="Only process Individual owner_type records")
     parser.add_argument("--entity-only", dest="entity_only", action="store_true",
                         help="Only process non-Individual (LLC/Corp/Trust/Estate) records")
+    parser.add_argument("--address-only-fallback", dest="address_only_fallback", action="store_true",
+                        help="Re-submit existing miss rows using address-only advanced trace (2 credits = $0.04)")
     args = parser.parse_args()
 
     try:
@@ -827,6 +1371,7 @@ if __name__ == "__main__":
             retrace_misses=args.retrace_misses,
             individual_only=args.individual_only,
             entity_only=args.entity_only,
+            address_only_fallback=args.address_only_fallback,
         )
         sys.exit(0)
     except Exception as e:

@@ -84,6 +84,8 @@ from config.scoring import (
     EQUITY_BONUS_BY_VERTICAL,
     EQUITY_HIGH_THRESH,
     EQUITY_MID_THRESH,
+    LONG_TENURE_YEARS,
+    TENURE_EQUITY_BONUS,
     HCPA_AGE_YEARS,
     HCPA_LONG_TERM_YEARS,
     HCPA_PASSIVE_WEIGHTS,
@@ -626,6 +628,7 @@ class MultiVerticalScorer:
                 "absentee_bonus":        0,
                 "contact_bonus":         0,
                 "equity_bonus":          0,
+                "tenure_bonus":          0,
                 "days_open_mod":         0,
                 "persistence_mod":       0,
                 "prior_viol_mod":        0,
@@ -646,6 +649,7 @@ class MultiVerticalScorer:
                 "absentee_bonus":        0,
                 "contact_bonus":         0,
                 "equity_bonus":          0,
+                "tenure_bonus":          0,
                 "days_open_mod":         0,
                 "persistence_mod":       0,
                 "prior_viol_mod":        0,
@@ -735,19 +739,27 @@ class MultiVerticalScorer:
                     financial.equity_pct, vertical,
                 )
 
+        tenure_bonus = 0
+        if owner and owner.ownership_years is not None:
+            try:
+                if float(owner.ownership_years) >= LONG_TENURE_YEARS:
+                    tenure_bonus = TENURE_EQUITY_BONUS
+            except (TypeError, ValueError):
+                pass
+
         final_score = min(
             primary_score + days_open_mod + persistence_mod + prior_viol_mod
-            + stacking_bonus + absentee_bonus + contact_bonus + equity_bonus,
+            + stacking_bonus + absentee_bonus + contact_bonus + equity_bonus + tenure_bonus,
             float(SCORE_CAP),
         )
 
         logger.debug(
             "    [%s] primary=%s(%.0f) days_open=+%d persistence=+%d prior_viol=+%d"
-            " stack=+%d(%d sigs/%dd) absentee=+%d contact=+%d equity=+%d → %.1f",
+            " stack=+%d(%d sigs/%dd) absentee=+%d contact=+%d equity=+%d tenure=+%d → %.1f",
             vertical, best_type, primary_score,
             days_open_mod, persistence_mod, prior_viol_mod,
             stacking_bonus, signals_within_window, STACKING_WINDOW_DAYS,
-            absentee_bonus, contact_bonus, equity_bonus,
+            absentee_bonus, contact_bonus, equity_bonus, tenure_bonus,
             final_score,
         )
 
@@ -761,6 +773,7 @@ class MultiVerticalScorer:
             "absentee_bonus":        absentee_bonus,
             "contact_bonus":         contact_bonus,
             "equity_bonus":          equity_bonus,
+            "tenure_bonus":          tenure_bonus,
             "days_open_mod":         days_open_mod,
             "persistence_mod":       persistence_mod,
             "prior_viol_mod":        prior_viol_mod,
@@ -1595,6 +1608,13 @@ class MultiVerticalScorer:
             f"LEFT JOIN latest_scores ls ON ls.property_id = t.property_id "
             f"WHERE ls.property_id IS NULL OR t.date_added > ls.score_date"
             for tbl in _SIGNAL_TABLES
+        )
+        # Master-data updates don't create signal rows — the weekly master
+        # refresh sets properties.needs_rescore instead (fa077). The partial
+        # index idx_properties_needs_rescore keeps this branch O(flagged).
+        union_branches += (
+            "\n    UNION ALL\n    "
+            "SELECT p2.id AS property_id FROM properties p2 WHERE p2.needs_rescore"
         )
 
         if county_id:
@@ -2593,6 +2613,31 @@ def main():
                     batch_size=args.batch_size,
                 )
                 session.commit()
+
+                # Master-refresh flags (fa077) are consumed by this run — clear
+                # them so the partial index stays small. A scoring crash above
+                # leaves the flags set, so they're retried on the next run.
+                # Shadow runs must not mutate live state.
+                if not args.shadow:
+                    if this_property_ids is not None:
+                        for i in range(0, len(this_property_ids), 10_000):
+                            session.execute(
+                                sa_text(
+                                    "UPDATE properties SET needs_rescore = FALSE "
+                                    "WHERE id IN (SELECT unnest(CAST(:ids AS bigint[]))) "
+                                    "AND needs_rescore"
+                                ),
+                                {"ids": this_property_ids[i:i + 10_000]},
+                            )
+                    else:
+                        session.execute(
+                            sa_text(
+                                "UPDATE properties SET needs_rescore = FALSE "
+                                "WHERE county_id = :county AND needs_rescore"
+                            ),
+                            {"county": cid},
+                        )
+                    session.commit()
 
                 # Roll up per-county stats into the combined summary.
                 rs_county = getattr(scorer, "_last_run_stats", {}) or {}
