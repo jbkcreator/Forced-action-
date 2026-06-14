@@ -27,7 +27,9 @@ COUNTY_ID=hillsborough
 
 # ── QUARTERLY ────────────────────────────────────────────────
 # Master Parcel Data (1st of Jan, Apr, Jul, Oct at 01:00 AM UTC)
+# Hillsborough at 01:00; Pinellas staggered 30 min later at 01:30.
 0 1 1 1,4,7,10 * $PROJECT/scripts/cron/run.sh src.scrappers.master.master_engine --load-to-db
+30 1 1 1,4,7,10 * $PROJECT/scripts/cron/run.sh src.scrappers.master.master_engine --county-id pinellas --load-to-db
 
 # ── DAILY ────────────────────────────────────────────────────
 

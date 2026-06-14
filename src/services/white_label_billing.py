@@ -9,6 +9,7 @@ Handles:
 """
 
 import logging
+import threading
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -72,8 +73,8 @@ def create_wl_checkout(client_id: int, company_slug: str, admin_email: str,
         line_items=[{"price": _price_id(plan_tier), "quantity": 1}],
         subscription_data=subscription_data,
         metadata={"wl_client_id": str(client_id), "plan_tier": plan_tier},
-        success_url=f"https://app.forcedaction.io/wl/dashboard?checkout=success",
-        cancel_url=f"https://app.forcedaction.io/wl/billing?checkout=cancelled",
+        success_url=f"{s.wl_frontend_base_url}/wl/dashboard?checkout=success",
+        cancel_url=f"{s.wl_frontend_base_url}/wl/billing?checkout=cancelled",
         allow_promotion_codes=True,
     )
     return {"url": session.url, "session_id": session.id}
@@ -82,9 +83,10 @@ def create_wl_checkout(client_id: int, company_slug: str, admin_email: str,
 def create_billing_portal_session(stripe_customer_id: str) -> str:
     """Return a Stripe Billing Portal URL for the client."""
     _init_stripe()
+    s = get_settings()
     session = stripe.billing_portal.Session.create(
         customer=stripe_customer_id,
-        return_url="https://app.forcedaction.io/wl/dashboard/billing",
+        return_url=f"{s.wl_frontend_base_url}/wl/dashboard/billing",
     )
     return session.url
 
@@ -137,6 +139,20 @@ def _client_id_from_obj(obj) -> Optional[int]:
     meta = getattr(obj, "metadata", {}) or {}
     raw = meta.get("wl_client_id")
     return int(raw) if raw else None
+
+
+def _prewarm_clay_for_client(client_id: int, counties: list, verticals: list) -> None:
+    """Pre-warm Clay contractor cache for all county+vertical pairs. Daemon thread only."""
+    from src.services import clay_service
+    from src.core.database import get_db_context
+    for county in (counties or []):
+        for vertical in (verticals or []):
+            try:
+                with get_db_context() as db:
+                    clay_service.get_or_refresh_enrichment(client_id, county, vertical, db)
+                logger.info("[wl_audit] clay_prewarm ok client_id=%d county=%s vertical=%s", client_id, county, vertical)
+            except Exception as exc:
+                logger.warning("[wl_audit] clay_prewarm failed client_id=%d county=%s vertical=%s err=%s", client_id, county, vertical, exc)
 
 
 def _on_checkout_completed(session, db) -> None:
@@ -201,12 +217,28 @@ def _on_checkout_completed(session, db) -> None:
         },
     )
     db.commit()
+    logger.info(
+        "[wl_audit] event=checkout_completed client_id=%d plan=%s sub=%s trial_ends=%s",
+        client_id, plan_tier, sub_id, trial_ends_at,
+    )
 
     send_activation_email(row.admin_email, row.company_name)
     logger.info(
         "[wl_billing] client %d subscribed (plan=%s, trial_ends=%s)",
         client_id, plan_tier, trial_ends_at,
     )
+
+    # Pre-warm Clay contractor cache in the background (non-blocking)
+    config = db.execute(
+        sa_text("SELECT counties_enabled, verticals_enabled FROM white_label_clients WHERE id = :cid"),
+        {"cid": client_id},
+    ).fetchone()
+    if config and (config.counties_enabled or config.verticals_enabled):
+        threading.Thread(
+            target=_prewarm_clay_for_client,
+            args=(client_id, config.counties_enabled or [], config.verticals_enabled or []),
+            daemon=True,
+        ).start()
 
 
 def _on_payment_succeeded(invoice, db) -> None:
@@ -220,6 +252,7 @@ def _on_payment_succeeded(invoice, db) -> None:
         {"cid": customer_id},
     )
     db.commit()
+    logger.info("[wl_audit] event=payment_succeeded customer=%s", customer_id)
 
 
 def _on_payment_failed(invoice, db) -> None:
@@ -239,6 +272,7 @@ def _on_payment_failed(invoice, db) -> None:
         ),
     )
     logger.info("[wl_billing] payment failed for client %d", row.id)
+    logger.info("[wl_audit] event=payment_failed client_id=%d customer=%s", row.id, customer_id)
 
 
 def _on_subscription_updated(subscription, db) -> None:
@@ -260,6 +294,10 @@ def _on_subscription_updated(subscription, db) -> None:
         {"status": new_status, "sub_id": subscription.id, "cid": subscription.customer},
     )
     db.commit()
+    logger.info(
+        "[wl_audit] event=subscription_updated customer=%s sub=%s stripe_status=%s→mapped=%s",
+        subscription.customer, subscription.id, subscription.status, new_status,
+    )
 
 
 def _on_subscription_deleted(subscription, db) -> None:
@@ -286,3 +324,4 @@ def _on_subscription_deleted(subscription, db) -> None:
         body_text="Your white-label subscription has been cancelled. Contact support to reactivate.",
     )
     logger.info("[wl_billing] client %d churned", row.id)
+    logger.info("[wl_audit] event=subscription_deleted client_id=%d customer=%s", row.id, subscription.customer)
