@@ -58,9 +58,9 @@ NA = "N/A"
 ALL_TIERS = ["Ultra Platinum", "Platinum", "Gold", "Silver", "Bronze"]
 
 # Source types surfaced in the Data Quality / freshness tables in addition to
-# daily_report.SCRAPER_ORDER. divorce_filings + code_enforcement are valid
-# scraper_run_stats source_types but are not in the shared SCRAPER_ORDER list.
-DASHBOARD_EXTRA_SOURCES = ["divorce_filings", "code_enforcement"]
+# daily_report.SCRAPER_ORDER. divorce_filings is a valid scraper_run_stats
+# source_type but is not in the shared SCRAPER_ORDER list.
+DASHBOARD_EXTRA_SOURCES = ["divorce_filings"]
 
 # Default future-county pipeline (not yet active). Expansion managed via
 # counties.is_active; these surface as queued rows in Section 2.
@@ -2241,9 +2241,9 @@ def _signal_impact(source_type: str) -> str:
 def _fetch_data_quality_signals(session, run_date: date, county_ids: list[str]) -> list:
     merged = _merge_signal_freshness_dicts([_build_signal_freshness(session, cid) for cid in county_ids])
 
-    # SCRAPER_ORDER is shared with daily_report; surface divorce_filings /
-    # code_enforcement here (valid source_types, absent from that list) without
-    # mutating the import. Staleness comes from scraper_run_stats freshness.
+    # SCRAPER_ORDER is shared with daily_report; surface divorce_filings here
+    # (valid source_type, absent from that list) without mutating the import.
+    # Staleness comes from scraper_run_stats freshness.
     extras = [s for s in DASHBOARD_EXTRA_SOURCES if s not in SCRAPER_ORDER]
     for src in extras:
         if src in merged:
@@ -2360,7 +2360,6 @@ _INGEST_SOURCES: list[tuple] = [
     ("Bankruptcy",               "bankruptcy",      "legal_proceedings", "record_type = 'Bankruptcy'",        ["bankruptcies"],                False, False),
     ("Divorce Filings",          "divorce",         "legal_proceedings", "record_type = 'Divorce'",           ["divorce_filings"],             False, False),
     ("Deeds",                    "deeds",           "deeds",             None,                                ["deeds"],                       False, False),
-    ("Code Enforcement",         None,              None,                None,                                ["code_enforcement"],            False, False),
 ]
 
 
