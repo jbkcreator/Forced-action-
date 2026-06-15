@@ -6,12 +6,14 @@ Goal: show real value within 30 seconds of account creation.
 No auth required for the endpoint — leads are scored/qualified properties.
 """
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import and_, desc, select
 from sqlalchemy.orm import Session
 
 from src.core.models import DistressScore, EnrichedContact, Owner, Property, SentLead, Subscriber
+from src.services import lead_exclusivity
 
 logger = logging.getLogger(__name__)
 
@@ -46,10 +48,16 @@ def get_proof_leads(
 
     where_clauses = [
         Property.county_id == county_id,
-        DistressScore.qualified == True,  # noqa: E712
+        DistressScore.qualified == True,
     ]
     if contact_clause is not None:
         where_clauses.append(contact_clause)
+
+    # Cross-trade exclusivity filter — county-wide (proof feed spans many ZIPs).
+    now = datetime.now(timezone.utc)
+    excl_ids = lead_exclusivity.get_exclusive_property_ids(db, county_id, now)
+    if excl_ids:
+        where_clauses.append(Property.id.not_in(excl_ids))
 
     top = db.execute(
         select(Property, DistressScore)
@@ -197,12 +205,18 @@ def get_blurred_stack(
 
     where_clauses = [
         Property.county_id == county_id,
-        DistressScore.qualified == True,  # noqa: E712
+        DistressScore.qualified == True,
     ]
     if contact_clause is not None:
         where_clauses.append(contact_clause)
     if excluded_ids:
         where_clauses.append(~Property.id.in_(excluded_ids))
+
+    # Cross-trade exclusivity filter — county-wide (proof feed spans many ZIPs).
+    now = datetime.now(timezone.utc)
+    excl_ids = lead_exclusivity.get_exclusive_property_ids(db, county_id, now)
+    if excl_ids:
+        where_clauses.append(Property.id.not_in(excl_ids))
 
     rows = db.execute(
         select(Property, DistressScore)

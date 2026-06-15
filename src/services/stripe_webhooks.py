@@ -34,6 +34,7 @@ from src.core.models import (
     ZipTerritory,
 )
 from src.services.ghl_webhook import push_subscriber_to_ghl
+from src.services import lead_exclusivity
 
 logger = logging.getLogger(__name__)
 
@@ -2700,13 +2701,52 @@ def _on_charge_refunded(charge: dict, db: Session) -> None:
       - Credit-paid purchases of data-surrendered SKUs (transfer/byol): no
         credit clawback — the underlying cost (BatchData lookup) was paid and
         the data can't be unsent. Log the loss; ops can manually adjust.
+      - Lead Pack refunds: handled via payment_intent.succeeded -> lead_pack path.
     """
-    from src.core.models import PremiumPurchase
+    from src.core.models import PremiumPurchase, LeadPackPurchase
+    charge_id = charge.get("id")
+    pi_id = charge.get("payment_intent")
+    
+    # Try PremiumPurchase first
     purchase = _resolve_premium_purchase_from_charge(charge, db)
+    
+    # If not a premium purchase, check if it's a lead pack
+    if purchase is None and pi_id:
+        purchase = db.execute(
+            select(LeadPackPurchase).where(
+                LeadPackPurchase.stripe_payment_intent_id == pi_id
+            )
+        ).scalar_one_or_none()
+        if purchase:
+            if purchase.refunded_at is not None:
+                logger.info("[Refund] LeadPack purchase %d already refunded — skipping", purchase.id)
+                return
+            
+            purchase.status = "refunded"
+            purchase.refunded_at = datetime.now(timezone.utc)
+            purchase.refund_reason = (charge.get("reason") or "unspecified")[:100]
+            db.flush()
+            
+            # Clear exclusivity rows so the properties immediately become
+            # available again for other trades/subscribers.
+            try:
+                from src.services.lead_exclusivity import clear_exclusivity_for_purchase
+                cleared = clear_exclusivity_for_purchase(db, purchase.id, source="lead_pack")
+                if cleared:
+                    logger.info("[Refund] Cleared %d exclusivity rows for LeadPack purchase=%d", cleared, purchase.id)
+            except Exception as exc:
+                logger.error("[Refund] Failed to clear exclusivity rows for purchase=%d: %s", purchase.id, exc)
+            
+            logger.info(
+                "[Refund] LeadPack purchase=%d amount_cents=%d reason=%s",
+                purchase.id, charge.get("amount_refunded", 0), purchase.refund_reason,
+            )
+            return
+    
     if purchase is None:
         # Not one of our premium charges (could be a wallet topup, lead pack, etc.)
-        # Future: extend to handle those if/when their refund handlers land.
-        logger.debug("[Refund] no PremiumPurchase for charge=%s", charge.get("id"))
+        # Lead pack is handled above.
+        logger.debug("[Refund] no PremiumPurchase for charge=%s", charge_id)
         return
 
     if purchase.status == "refunded":
@@ -2886,25 +2926,25 @@ def _on_lead_pack_payment(payment_intent: dict, db: Session) -> None:
         zip_code   = target ZIP
         vertical   = e.g. "roofing"
         county_id  = e.g. "hillsborough"
+    
+    Uses database-backed cross-trade exclusivity (lead_exclusivity table).
     """
     meta = _attr(payment_intent, "metadata") or {}
     if _attr(meta, "product") != "lead_pack":
-        # Not a lead pack payment — silently ignore
         return
 
     stripe_payment_intent_id = _attr(payment_intent, "id")
     feed_uuid  = _attr(meta, "feed_uuid")
     zip_code   = _attr(meta, "zip_code")
     vertical   = _attr(meta, "vertical")
-    county_id  = _attr(meta, "county_id", "hillsborough")
+    county_id  = _attr(meta, "county_id")
 
-    if not all([stripe_payment_intent_id, feed_uuid, zip_code, vertical]):
+    if not all([stripe_payment_intent_id, feed_uuid, zip_code, vertical, county_id]):
         logger.error(
             "[LeadPack] payment_intent.succeeded missing required metadata: %s", meta
         )
         return
 
-    # Idempotency — skip if already processed
     existing = db.execute(
         select(LeadPackPurchase).where(
             LeadPackPurchase.stripe_payment_intent_id == stripe_payment_intent_id
@@ -2916,7 +2956,6 @@ def _on_lead_pack_payment(payment_intent: dict, db: Session) -> None:
         )
         return
 
-    # Find subscriber
     subscriber = db.execute(
         select(Subscriber).where(Subscriber.event_feed_uuid == feed_uuid)
     ).scalar_one_or_none()
@@ -2925,8 +2964,8 @@ def _on_lead_pack_payment(payment_intent: dict, db: Session) -> None:
         return
 
     now = datetime.now(timezone.utc)
+    exclusive_until = now + timedelta(hours=72)
 
-    # Create purchase record
     purchase = LeadPackPurchase(
         subscriber_id=subscriber.id,
         zip_code=zip_code,
@@ -2935,15 +2974,42 @@ def _on_lead_pack_payment(payment_intent: dict, db: Session) -> None:
         stripe_payment_intent_id=stripe_payment_intent_id,
         status="pending",
         purchased_at=now,
-        exclusive_until=now + timedelta(hours=72),
+        exclusive_until=exclusive_until,
     )
     db.add(purchase)
-    db.flush()  # get purchase.id before exclusivity query
+    db.flush()
 
-    # Exclude property_ids already under active exclusivity for this ZIP+vertical
-    active_exclusive_ids = _get_exclusive_property_ids(db, zip_code, vertical, now, exclude_purchase_id=purchase.id)
+    # Defense-in-depth (ADR 0002): the checkout gate already blocks unlaunched
+    # counties, but a PaymentIntent could be created via a stale client or an
+    # API bypass. The charge succeeded, so an unlaunched county is refunded,
+    # not delivered.
+    from src.utils.county_config import is_county_launched
+    if not is_county_launched(county_id, db):
+        purchase.status = "refunded"
+        purchase.refunded_at = now
+        purchase.refund_reason = "county_not_launched"
+        db.flush()
+        try:
+            import stripe
+            stripe.api_key = settings.active_stripe_secret_key.get_secret_value()
+            stripe_refund = stripe.Refund.create(
+                payment_intent=stripe_payment_intent_id,
+                idempotency_key=f"leadpack-refund-{stripe_payment_intent_id}",
+            )
+            purchase.stripe_refund_id = stripe_refund.get("id")
+        except Exception as e:
+            logger.error("[LeadPack] county_not_launched refund failed for %s: %s", stripe_payment_intent_id, e)
+        logger.warning(
+            "[LeadPack] county %s not launched — refunded purchase %s", county_id, purchase.id
+        )
+        return
 
-    # Select top 5 scored properties not already exclusively held
+    lead_filter = [
+        Property.zip == zip_code,
+        Property.county_id == county_id,
+        DistressScore.qualified == True,
+    ]
+
     try:
         score_col = DistressScore.vertical_scores[vertical].as_float()
     except KeyError:
@@ -2953,62 +3019,92 @@ def _on_lead_pack_payment(payment_intent: dict, db: Session) -> None:
 
     from src.core.models import Owner
     from src.utils.lead_filters import has_contact_filter, phone_priority_order
-    lead_filter = [
-        Property.zip == zip_code,
-        Property.county_id == county_id,
-        DistressScore.qualified == True,  # noqa: E712
-    ]
-    if active_exclusive_ids:
-        lead_filter.append(~Property.id.in_(active_exclusive_ids))
     contact_clause = has_contact_filter(settings)
     if contact_clause is not None:
         lead_filter.append(contact_clause)
 
-    top_leads = db.execute(
-        select(Property, DistressScore)
-        .join(DistressScore, DistressScore.property_id == Property.id)
-        .outerjoin(Owner, Owner.property_id == Property.id)
-        .where(and_(*lead_filter))
-        .order_by(*phone_priority_order(score_col))
-        .limit(5)
-    ).all()
+    try:
+        from src.services.lead_exclusivity import (
+            acquire_zip_lock,
+            get_exclusive_property_ids,
+            record_exclusivity,
+            clear_exclusivity_for_purchase,
+        )
 
-    purchase.lead_ids = [prop.id for prop, _ in top_leads]
-    purchase.status = "delivered"
-    purchase.delivered_at = now
+        acquire_zip_lock(db, zip_code, county_id)
 
-    logger.info(
-        "[LeadPack] Delivered purchase %s — %d leads for %s/%s/%s to subscriber %s",
-        purchase.id, len(top_leads), zip_code, vertical, county_id, subscriber.id,
-    )
+        excl = get_exclusive_property_ids(db, county_id, now, zip_code=zip_code)
+        if excl:
+            lead_filter.append(Property.id.not_in(excl))
 
-    if subscriber.email:
-        _send_lead_pack_email(subscriber, purchase, top_leads)
+        top_leads = db.execute(
+            select(Property, DistressScore)
+            .join(DistressScore, DistressScore.property_id == Property.id)
+            .outerjoin(Owner, Owner.property_id == Property.id)
+            .where(and_(*lead_filter))
+            .order_by(*phone_priority_order(score_col))
+            .limit(5)
+        ).all()
 
+        if len(top_leads) < 5:
+            # Set refunded_at BEFORE calling Stripe — the charge.refunded webhook
+            # may fire synchronously/in-parallel, and we need the guard to be visible.
+            purchase.status = "refunded"
+            purchase.refunded_at = now
+            purchase.refund_reason = f"short_pack_{len(top_leads)}_of_5"
+            db.flush()
+            
+            # All-or-nothing: no exclusivity rows written for a short pack.
+            try:
+                import stripe
+                stripe.api_key = settings.active_stripe_secret_key.get_secret_value()
+                stripe_refund = stripe.Refund.create(
+                    payment_intent=stripe_payment_intent_id,
+                    idempotency_key=f"leadpack-refund-{stripe_payment_intent_id}",
+                )
+                purchase.stripe_refund_id = stripe_refund.get("id")
+            except Exception as e:
+                logger.error("[LeadPack] refund failed: %s", e)
+            
+            logger.info(
+                "[LeadPack] Short pack (%d/5) — refunded purchase %s",
+                len(top_leads), purchase.id,
+            )
+            return
 
-def _get_exclusive_property_ids(
-    db: Session,
-    zip_code: str,
-    vertical: str,
-    now: datetime,
-    exclude_purchase_id: Optional[int] = None,
-) -> list[int]:
-    """Return property_ids currently under active exclusivity for a ZIP+vertical."""
-    q = select(LeadPackPurchase).where(
-        LeadPackPurchase.zip_code == zip_code,
-        LeadPackPurchase.vertical == vertical,
-        LeadPackPurchase.exclusive_until > now,
-        LeadPackPurchase.lead_ids != None,  # noqa: E711
-    )
-    if exclude_purchase_id is not None:
-        q = q.where(LeadPackPurchase.id != exclude_purchase_id)
+        purchase.lead_ids = [prop.id for prop, _ in top_leads]
+        purchase.status = "delivered"
+        purchase.delivered_at = now
+        db.flush()
 
-    active_purchases = db.execute(q).scalars().all()
-    exclusive_ids: list[int] = []
-    for p in active_purchases:
-        if p.lead_ids:
-            exclusive_ids.extend(p.lead_ids)
-    return exclusive_ids
+        record_exclusivity(
+            db=db,
+            property_ids=purchase.lead_ids,
+            zip_code=zip_code,
+            county_id=county_id,
+            trade=vertical,
+            source="lead_pack",
+            source_id=purchase.id,
+            exclusive_until=exclusive_until,
+        )
+
+        logger.info(
+            "[LeadPack] Delivered purchase %s — %d leads for %s/%s/%s to subscriber %s",
+            purchase.id, len(top_leads), zip_code, vertical, county_id, subscriber.id,
+        )
+
+        # Email is best-effort — a send failure must NOT roll back a delivered,
+        # exclusivity-locked pack (the buyer can still see leads via the feed).
+        if subscriber.email:
+            try:
+                _send_lead_pack_email(subscriber, purchase, top_leads)
+            except Exception:
+                logger.error("[LeadPack] delivery email failed for purchase %s", purchase.id, exc_info=True)
+
+    except Exception as e:
+        db.rollback()
+        logger.error("[LeadPack] Delivery failed: %s", e, exc_info=True)
+        raise
 
 
 def _send_lead_pack_email(
