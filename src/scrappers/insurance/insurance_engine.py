@@ -19,7 +19,7 @@ import logging
 from datetime import date, timedelta
 from typing import Optional, Tuple, List, Dict
 
-import requests
+from src.utils.http_helpers import requests_get_with_retry
 
 from src.core.database import get_db_context
 from src.core.models import Property, Incident, BuildingPermit
@@ -55,25 +55,42 @@ def _insurance_permit_filter():
     )
 
 
-def _fetch_fema_ia_registrants(state: str, start_date: date) -> List[Dict]:
+_FEMA_BATCH = 1000
+_FEMA_MAX_PAGES = 20
+
+
+def _fetch_fema_ia_registrants(state: str, county_display: str) -> List[Dict]:
     """
-    Fetch FEMA Housing Assistance Owners records for a state (grouped by ZIP).
-    These represent homeowners who received FEMA disaster housing assistance.
+    Fetch FEMA Housing Assistance Owners records for a specific county (grouped by ZIP).
+
+    Filters by both state and county name to avoid pulling 22k+ statewide rows.
+    Paginates with $skip until all pages are collected (county counts: ~1,150–1,500).
+    Returns newest disasters first ($orderby=disasterNumber desc).
     """
     # Build query string manually — requests.params URL-encodes $ which breaks FEMA API
-    url = (
+    base = (
         f"{_FEMA_IA_URL}"
-        f"?$filter=state eq '{state}'"
+        f"?$filter=state eq '{state}' and county eq '{county_display} (County)'"
+        f"&$orderby=disasterNumber desc"
         f"&$select=zipCode,county,city,totalDamage,repairReplaceAmount,validRegistrations"
-        f"&$top=1000&$format=json"
+        f"&$top={_FEMA_BATCH}&$format=json"
     )
-    try:
-        resp = requests.get(url, headers={"Accept": "application/json"}, timeout=20)
-        resp.raise_for_status()
-        return resp.json().get("HousingAssistanceOwners", [])
-    except Exception as e:
-        logger.warning("[insurance] FEMA IA API failed: %s", e, exc_info=True)
-        return []
+    results: List[Dict] = []
+    for page in range(_FEMA_MAX_PAGES):
+        url = base if page == 0 else f"{base}&$skip={page * _FEMA_BATCH}"
+        try:
+            resp = requests_get_with_retry(
+                url, headers={"Accept": "application/json"}, timeout=60
+            )
+            resp.raise_for_status()
+            batch = resp.json().get("HousingAssistanceOwners", [])
+            results.extend(batch)
+            if len(batch) < _FEMA_BATCH:
+                break
+        except Exception as e:
+            logger.warning("[insurance] FEMA IA API failed (page %d): %s", page, e, exc_info=True)
+            break
+    return results
 
 
 def _get_insurance_permits(db, county_id: str, start_date: date, end_date: date) -> List:
@@ -106,8 +123,8 @@ def scrape_insurance_claims(
         Number of new Incident records created.
     """
     config = get_county(county_id)
-    fips = config.get("fips", "")
     state = config.get("state", "FL")
+    county_display = config.get("display_name", county_id.title())
 
     if date_range is None:
         end_date = date.today()
@@ -153,10 +170,10 @@ def scrape_insurance_claims(
         db.commit()
 
         # ── Source 2: FEMA IA registrants → match by ZIP ──────────────────
-        fema_registrants = _fetch_fema_ia_registrants(state, start_date)
+        fema_registrants = _fetch_fema_ia_registrants(state, county_display)
 
-        # FEMA returns ZIPs state-wide; the DB query below scopes by
-        # Property.county_id == county_id so out-of-county ZIPs are filtered.
+        # FEMA is scoped to county by filter; the DB query below also scopes by
+        # Property.county_id == county_id for an extra safety guard.
         affected_zips = set()
         for reg in fema_registrants:
             z = str(reg.get("zipCode", "")).zfill(5)
