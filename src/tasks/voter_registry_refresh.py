@@ -207,10 +207,15 @@ def run_voter_registry_refresh(force: bool = False) -> dict:
         )
 
         with zipfile.ZipFile(tmp_path) as zf:
-            txt_names = [n for n in zf.namelist() if n.lower().endswith(".txt")]
-            if not txt_names:
-                raise ValueError("Zip contains no .txt voter file")
-            with zf.open(txt_names[0]) as fh:
+            data_entries = [
+                i for i in zf.infolist()
+                if i.filename.lower().endswith((".txt", ".csv"))
+            ]
+            if not data_entries:
+                raise ValueError("Zip contains no .txt/.csv voter file")
+            # Largest entry is the voter table (skips ReportCodes.txt etc.).
+            target = max(data_entries, key=lambda i: i.file_size)
+            with zf.open(target.filename) as fh:
                 rows_read, upserted, unmatched = bulk_load_voters_csv(
                     fh, county_id=_COUNTY_ID,
                 )
