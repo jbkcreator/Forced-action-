@@ -267,6 +267,22 @@ class AppSettings(BaseSettings):
 	def _clamp_max_heirs(cls, v: int) -> int:
 		return max(1, min(int(v), 10))
 	pdl_api_key: Optional[SecretStr] = Field(default=None, env="PDL_API_KEY")
+	idi_api_key: Optional[SecretStr] = Field(default=None, env="IDI_API_KEY")
+
+	# Enrichment cascade costs (ADR 0016 / ADR 0017).
+	# batchdata_cost_cents: contracted rate — was wrong at 2¢, corrected to 7¢.
+	# tracerfy_advanced_cost_cents: Address-Only pass (trace_type='advanced').
+	# Set idi_cost_cents once contracted rate is known (currently key-gated).
+	batchdata_cost_cents: int = Field(default=7, env="BATCHDATA_COST_CENTS")
+	tracerfy_advanced_cost_cents: int = Field(default=4, env="TRACERFY_ADVANCED_COST_CENTS")
+
+	# Event-driven cascade master switch (ADR 0016).
+	# False = nightly batch only; True = consumer fires on every gold_lead_scored event.
+	enrichment_cascade_enabled: bool = Field(default=False, env="ENRICHMENT_CASCADE_ENABLED")
+
+	# EnrichmentBatcher flush controls (ADR 0016).
+	enrichment_batch_flush_size: int = Field(default=200, env="ENRICHMENT_BATCH_FLUSH_SIZE")
+	enrichment_batch_flush_seconds: int = Field(default=120, env="ENRICHMENT_BATCH_FLUSH_SECONDS")
 
 	# Cross-source contact triangulation (ADR 0015).
 	# triangulation_enabled — nightly sweep + inline hook compute corroboration

@@ -287,6 +287,17 @@ def run_forever() -> None:
 	stop_event = threading.Event()
 	threads = []
 
+	# Initialise the EnrichmentBatcher (ADR 0016).
+	# The batcher starts its own timer thread; stop_event signals clean shutdown.
+	try:
+		from src.agents.enrichment_consumer import init_batcher
+		init_batcher(stop_event=stop_event)
+		logger.info("ingestion: EnrichmentBatcher initialised")
+	except Exception as _batcher_init_exc:
+		logger.error(
+			"ingestion: failed to initialise EnrichmentBatcher: %s", _batcher_init_exc
+		)
+
 	if settings.agents_event_source_postgres:
 		t = threading.Thread(
 			target=listen_postgres,
