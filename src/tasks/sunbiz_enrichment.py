@@ -131,6 +131,18 @@ def run(
             f"tier_b={stats['tier_b']} county={county_id} dry_run={dry_run}"
         )
         if not owners:
+            if not dry_run:
+                from src.utils.scraper_db_helper import record_scraper_stats
+                record_scraper_stats(
+                    source_type="sunbiz",
+                    total_scraped=0,
+                    matched=0,
+                    unmatched=0,
+                    skipped=0,
+                    run_success=True,
+                    error_type="no_data",
+                    county_id=county_id,
+                )
             return stats
 
         asyncio.run(_run_playwright_batch(owners, dry_run, stats, db, headless=headless))
@@ -140,6 +152,15 @@ def run(
             logger.info(
                 f"[sunbiz_enrichment] committed: enriched={stats['enriched']} "
                 f"skipped={stats['skipped']} failed={stats['failed']}"
+            )
+            from src.utils.scraper_db_helper import record_scraper_stats
+            record_scraper_stats(
+                source_type="sunbiz",
+                total_scraped=stats["processed"],
+                matched=stats["enriched"],
+                unmatched=stats["skipped"] + stats["failed"],
+                skipped=0,
+                county_id=county_id,
             )
 
     return stats
