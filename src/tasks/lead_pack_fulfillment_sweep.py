@@ -47,59 +47,66 @@ _RETRY_AFTER_MINUTES = 15
 _BATCH = 10
 
 
-def _claim_purchase_ids(db, now: datetime) -> list[int]:
-    """
-    Atomically claim up to _BATCH 'enriching' purchases. Stamps
-    enrichment_submitted_at so a concurrent/overlapping sweep skips them
-    (and so a stale claim becomes eligible again after _RETRY_AFTER_MINUTES).
-    """
-    rows = db.execute(
-        sa_text("""
-            SELECT id FROM lead_pack_purchases
-            WHERE status = 'enriching'
-              AND (
-                    enrichment_submitted_at IS NULL
-                 OR enrichment_submitted_at < :stale_before
-              )
-            ORDER BY purchased_at
-            LIMIT :batch
-            FOR UPDATE SKIP LOCKED
-        """),
-        {
-            "stale_before": now - _stale_delta(),
-            "batch": _BATCH,
-        },
-    ).fetchall()
-    ids = [r[0] for r in rows]
-    if ids:
-        db.execute(
-            sa_text("""
-                UPDATE lead_pack_purchases
-                SET enrichment_submitted_at = :now
-                WHERE id = ANY(:ids)
-            """),
-            {"now": now, "ids": ids},
-        )
-    db.commit()
-    return ids
-
-
 def _stale_delta():
     from datetime import timedelta
     return timedelta(minutes=_RETRY_AFTER_MINUTES)
 
 
+def _candidate_ids(db, now: datetime) -> list[int]:
+    """IDs of reserved packs eligible for fulfillment (unclaimed or stale)."""
+    rows = db.execute(
+        sa_text("""
+            SELECT id FROM lead_pack_purchases
+            WHERE status = 'enriching'
+              AND (enrichment_submitted_at IS NULL
+                   OR enrichment_submitted_at < :stale_before)
+            ORDER BY purchased_at
+            LIMIT :batch
+        """),
+        {"stale_before": now - _stale_delta(), "batch": _BATCH},
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def _claim(db, purchase_id: int, now: datetime) -> bool:
+    """
+    Atomically claim ONE purchase for fulfillment. Stamps enrichment_submitted_at
+    only if it's still 'enriching' and unclaimed (or its claim went stale). This
+    is the single guard that serializes the event-driven listener and the cron
+    sweep — whichever calls first wins; the loser gets False and skips. Commits
+    immediately so the row lock isn't held across the long Tracerfy poll.
+    """
+    claimed = db.execute(
+        sa_text("""
+            UPDATE lead_pack_purchases
+            SET enrichment_submitted_at = :now
+            WHERE id = :id
+              AND status = 'enriching'
+              AND (enrichment_submitted_at IS NULL
+                   OR enrichment_submitted_at < :stale_before)
+            RETURNING id
+        """),
+        {"id": purchase_id, "now": now, "stale_before": now - _stale_delta()},
+    ).first()
+    db.commit()
+    return claimed is not None
+
+
 def _fulfill_one(purchase_id: int) -> str:
     """
-    Open a transaction for one reserved purchase and fulfill it. Each purchase
-    runs in its own transaction so one failure can't roll back the others.
+    Claim + fulfill one reserved purchase in its own transaction. The atomic
+    _claim() makes this safe to call from BOTH the cron sweep and the
+    event-driven listener concurrently — only one wins the claim.
     Returns 'delivered' | 'refunded' | 'skipped' | 'error'.
     """
     from src.core.models import LeadPackPurchase
 
+    now = datetime.now(timezone.utc)
     with get_db_context() as db:
+        if not _claim(db, purchase_id, now):
+            return "skipped"
         purchase = db.get(LeadPackPurchase, purchase_id)
-        if purchase is None or purchase.status != "enriching":
+        if purchase is None:
             return "skipped"
         outcome = fulfill_purchase(db, purchase)
         if outcome == "error":
@@ -107,6 +114,51 @@ def _fulfill_one(purchase_id: int) -> str:
         else:
             db.commit()
         return outcome
+
+
+def _fulfill_when_visible(purchase_id: int) -> None:
+    """
+    Daemon-thread target for the event path. The webhook publishes the event
+    BEFORE its own transaction commits, so the row may not yet be visible to a
+    fresh session. Briefly wait for it to appear, then fulfill. The atomic
+    _claim() inside _fulfill_one() still guards against the cron sweep racing us.
+    """
+    import time
+
+    from src.core.models import LeadPackPurchase
+
+    for _ in range(10):  # ~5s of visibility grace for the API commit
+        with get_db_context() as db:
+            if db.get(LeadPackPurchase, purchase_id) is not None:
+                break
+        time.sleep(0.5)
+
+    _fulfill_one(purchase_id)
+
+
+def handle_reserved_event(payload: dict) -> None:
+    """
+    Event-driven entry point (the "always-on listener" path). Invoked by the
+    agents supervisor when a `lead_pack_reserved` event arrives, giving instant
+    fulfillment instead of waiting for the next cron tick. Runs the (potentially
+    multi-minute) Tracerfy poll on a daemon thread so the listener thread is
+    never blocked. The cron sweep remains the durability backstop if the event
+    is dropped (Redis down, agents process restarting).
+    """
+    import threading
+
+    try:
+        purchase_id = int(payload.get("purchase_id"))
+    except (TypeError, ValueError):
+        logger.warning("[LeadPackSweep] lead_pack_reserved missing purchase_id: %s", payload)
+        return
+
+    threading.Thread(
+        target=_fulfill_when_visible,
+        args=(purchase_id,),
+        daemon=True,
+        name=f"leadpack-fulfill-{purchase_id}",
+    ).start()
 
 
 def fulfill_purchase(db, purchase) -> str:
@@ -267,9 +319,11 @@ def run(dry_run: bool = False) -> dict:
         return summary
 
     with get_db_context() as db:
-        ids = _claim_purchase_ids(db, now)
+        ids = _candidate_ids(db, now)
     summary["claimed"] = len(ids)
 
+    # _fulfill_one re-claims each id atomically, so a pack already grabbed by the
+    # event-driven listener simply returns 'skipped' here — no double-processing.
     for pid in ids:
         outcome = _fulfill_one(pid)
         summary[outcome] = summary.get(outcome, 0) + 1

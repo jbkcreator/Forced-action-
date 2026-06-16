@@ -3098,6 +3098,23 @@ def _on_lead_pack_payment(payment_intent: dict, db: Session) -> None:
             purchase.id, len(top_leads), zip_code, vertical, county_id, subscriber.id,
         )
 
+        # Ring the bell: fire an event so the always-on listener fulfills NOW
+        # rather than waiting for the next cron tick. Best-effort — if the bus is
+        # down the lead_pack_fulfillment_sweep cron picks it up within ~2 min.
+        try:
+            from src.agents.events.ingestion import publish_cora_event
+            publish_cora_event({
+                "event_type": "lead_pack_reserved",
+                "subscriber_id": subscriber.id,
+                "payload": {"purchase_id": purchase.id},
+                "idempotency_key": f"leadpack-reserved-{stripe_payment_intent_id}",
+            })
+        except Exception as pub_exc:
+            logger.warning(
+                "[LeadPack] publish lead_pack_reserved failed for purchase %s "
+                "(cron sweep is backstop): %s", purchase.id, pub_exc,
+            )
+
     except Exception as e:
         db.rollback()
         logger.error("[LeadPack] Reservation failed: %s", e, exc_info=True)
