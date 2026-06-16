@@ -433,9 +433,13 @@ def health_check_detailed(db: Session = Depends(get_db)):
 \
 # ---------------------------------------------------------------------------
 
+_PRICING_CACHE_KEY = "pricing:stripe_prices"
+_PRICING_TTL = 86_400  # 24 hours
+
+
 @functools.lru_cache(maxsize=1)
-def _cached_pricing_info() -> dict:
-    """Fetch pricing from Stripe once and cache for the process lifetime."""
+def _fetch_pricing_from_stripe() -> dict:
+    """Fetch all tier prices from Stripe. lru_cache = per-process fallback when Redis is down."""
     _s = get_settings()
     stripe.api_key = _s.active_stripe_secret_key.get_secret_value()
     all_prices = _price_ids()
@@ -461,7 +465,7 @@ def _cached_pricing_info() -> dict:
                     regular_amount = p.unit_amount // 100
                 currency = p.currency
         except Exception as e:
-            logger.error(f"Error retrieving Stripe price for tier '{tier}': {e}", exc_info=True)
+            logger.error("Error retrieving Stripe price for tier '%s': %s", tier, e, exc_info=True)
 
         pricing_info[tier] = {
             "founding_amount": founding_amount,
@@ -471,6 +475,23 @@ def _cached_pricing_info() -> dict:
         }
 
     return pricing_info
+
+
+def _cached_pricing_info() -> dict:
+    """Return pricing, served from Redis (24 h TTL) with per-process lru_cache as fallback."""
+    from src.core.redis_client import redis_available, rget, rset
+
+    if redis_available():
+        cached = rget(_PRICING_CACHE_KEY)
+        if cached:
+            return json.loads(cached)
+
+    result = _fetch_pricing_from_stripe()
+
+    if redis_available():
+        rset(_PRICING_CACHE_KEY, json.dumps(result), ttl_seconds=_PRICING_TTL)
+
+    return result
 
 
 @app.get("/api/pricing")
