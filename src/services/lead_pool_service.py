@@ -20,13 +20,21 @@ def get_lead_pool(
     vertical: Optional[str] = None,
     min_score: int = 0,
     limit: int = 25,
+    exclude_trade: Optional[str] = None,
+    county_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Return scored leads available in a ZIP.
     Delegates to read_tools.get_lead_pool — same query, same return shape.
+
+    Pass exclude_trade + county_id to apply cross-trade exclusivity (so Cora
+    upsell paths never surface a lead already sold to another trade).
     """
     from src.agents.tools.read_tools import get_lead_pool as _get_lead_pool
-    return _get_lead_pool(zip_code=zip_code, vertical=vertical, min_score=min_score, limit=limit)
+    return _get_lead_pool(
+        zip_code=zip_code, vertical=vertical, min_score=min_score, limit=limit,
+        exclude_trade=exclude_trade, county_id=county_id,
+    )
 
 
 def check_pack_contactability(

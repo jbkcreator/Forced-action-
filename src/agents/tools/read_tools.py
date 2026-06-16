@@ -47,6 +47,7 @@ from src.core.models import (
 	SmsOptOut,
 	AbAssignment,
 )
+from src.services import lead_exclusivity
 
 
 @contextmanager
@@ -223,12 +224,18 @@ def get_lead_pool(
 	min_score: int = 0,
 	limit: int = 25,
 	session: Optional[Session] = None,
+	exclude_trade: Optional[str] = None,
+	county_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
 	"""
 	Return scored leads available in a ZIP. Filtered by vertical and minimum
 	score. Results ordered by score descending.
+
+	When exclude_trade and county_id are provided, properties sold to other
+	trades in this ZIP are excluded (cross-trade exclusivity).
 	"""
 	from src.core.models import DistressScore, Property
+	from datetime import datetime, timezone
 
 	with _session(session) as s:
 		q = (
@@ -237,6 +244,16 @@ def get_lead_pool(
 			.filter(Property.zip == zip_code)
 			.filter(DistressScore.final_cds_score >= min_score)
 		)
+
+		# Cross-trade exclusivity filter (requires county_id to scope the lock query)
+		if exclude_trade and county_id:
+			now = datetime.now(timezone.utc)
+			excl_ids = lead_exclusivity.get_exclusive_property_ids(
+				s, county_id, now, zip_code=zip_code, exclude_trade=exclude_trade
+			)
+			if excl_ids:
+				q = q.filter(Property.id.notin_(excl_ids))
+
 		rows = q.order_by(DistressScore.final_cds_score.desc()).limit(limit).all()
 
 		return [

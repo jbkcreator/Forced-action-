@@ -1942,6 +1942,38 @@ class UnmatchedRecord(Base):
 # 8. LEAD PACK PURCHASES
 # ============================================================================
 
+class LeadExclusivity(Base):
+    """
+    Database-backed cross-trade exclusivity for leads.
+    
+    Replaces Redis lead_hold as the authoritative source for exclusivity.
+    Each row represents a property locked for a specific subscriber/trade.
+    """
+    __tablename__ = "lead_exclusivity"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    
+    property_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    zip_code: Mapped[str] = mapped_column(String(10), nullable=False)
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    sold_to_trade: Mapped[str] = mapped_column(String(50), nullable=False)
+    
+    source: Mapped[str] = mapped_column(String(20), nullable=False)  # 'lead_pack' or 'bundle'
+    source_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    
+    exclusive_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("property_id", "source", name="uq_property_source"),
+        CheckConstraint("source IN ('lead_pack', 'bundle')", name="ck_lead_exclusivity_source"),
+        Index("idx_exclusivity_zip_county", "zip_code", "county_id", "exclusive_until"),
+        Index("idx_exclusivity_until", "exclusive_until"),
+    )
+
+
 class LeadPackPurchase(Base):
     """
     Tracks $99 lead pack purchases (5 leads, 72-hour exclusivity).
@@ -1972,14 +2004,19 @@ class LeadPackPurchase(Base):
     # Lifecycle
     status: Mapped[str] = mapped_column(
         String(20), default="pending", nullable=False
-    )  # pending | delivered | expired
-
+    )  # pending | delivered | expired | refunded
+    
     # Timestamps
     purchased_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
     )
-    delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
-    exclusive_until: Mapped[Optional[datetime]] = mapped_column(DateTime)  # purchased_at + 72h
+    delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    exclusive_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # purchased_at + 72h
+    refunded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    # Refund info
+    refund_reason: Mapped[Optional[str]] = mapped_column(String(100))
+    stripe_refund_id: Mapped[Optional[str]] = mapped_column(String(100))
 
     # The 5 selected property IDs (set at purchase time)
     lead_ids: Mapped[Optional[list]] = mapped_column(ARRAY(Integer))
@@ -1989,7 +2026,7 @@ class LeadPackPurchase(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "status IN ('pending', 'delivered', 'expired')",
+            "status IN ('pending', 'delivered', 'expired', 'refunded')",
             name="check_lead_pack_status",
         ),
         Index("idx_lead_pack_zip_vertical", "zip_code", "vertical"),

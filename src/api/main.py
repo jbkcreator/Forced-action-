@@ -35,9 +35,10 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select, and_, or_, desc, func, cast, text, Date, distinct, update
 
 from src.core.database import get_db_context
-from src.core.models import ConsentAcceptance, FoundingSubscriberCount, ZipTerritory, Subscriber, Property, DistressScore, Incident, LeadPackPurchase, ScraperRunStats, EnrichedContact, Owner, SentLead, WaitlistEntry, SmsOptIn, ExpansionCandidate, County
+from src.core.models import ConsentAcceptance, FoundingSubscriberCount, ZipTerritory, Subscriber, Property, DistressScore, Incident, LeadPackPurchase, ScraperRunStats, EnrichedContact, Owner, SentLead, WaitlistEntry, SmsOptIn, ExpansionCandidate, County, LeadExclusivity
 from src.services.stripe_webhooks import handle_webhook
 from src.services.stripe_service import get_price_id_for_checkout, _price_ids
+from src.services import lead_exclusivity
 from config.settings import get_settings
 from config.scoring import VERTICAL_WEIGHTS, for_county
 from config.constants import TIER_DISPLAY
@@ -1661,6 +1662,17 @@ def event_feed(
     if contact_clause is not None:
         filters.append(contact_clause)
 
+    # Cross-trade exclusivity filter — exclude properties sold to other trades.
+    # County-wide (covers ALL the subscriber's locked ZIPs, not just the first);
+    # buyer keeps their own leads via exclude_trade=their vertical.
+    from src.services.lead_exclusivity import get_exclusive_property_ids
+    now = datetime.now(timezone.utc)
+    excl_ids = get_exclusive_property_ids(
+        db, subscriber.county_id, now, exclude_trade=subscriber.vertical
+    )
+    if excl_ids:
+        filters.append(Property.id.not_in(excl_ids))
+
     # Sort order
     _sort = sort if sort in _VALID_SORTS else "score_desc"
     if _sort == "newest":
@@ -2641,6 +2653,14 @@ def sample_leads(
     if contact_clause is not None:
         filters.append(contact_clause)
 
+    # Cross-trade exclusivity filter
+    now = datetime.now(timezone.utc)
+    excl_ids = lead_exclusivity.get_exclusive_property_ids(
+        db, county_id, now, zip_code=zip_code, exclude_trade=vertical
+    )
+    if excl_ids:
+        filters.append(Property.id.not_in(excl_ids))
+
     try:
         rows = db.execute(
             select(Property, DistressScore, Owner)
@@ -2735,6 +2755,10 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, db: Session = Depends(g
     """
     Create a Stripe PaymentIntent for a $99 lead pack.
     Returns { client_secret, publishable_key, amount, currency }.
+    
+    Checkout gates:
+    - ZIP must have at least 5 available qualified leads after exclusivity filtering
+    - Subscriber's vertical must match their subscription
     """
     _s = get_settings()
 
@@ -2755,6 +2779,10 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, db: Session = Depends(g
     if payload.vertical not in VALID_VERTICALS:
         raise HTTPException(status_code=400, detail={"error": "invalid_vertical", "message": f"Unknown vertical '{payload.vertical}'"})
 
+    # Reject if subscriber's vertical doesn't match requested vertical
+    if subscriber.vertical and subscriber.vertical != payload.vertical:
+        raise HTTPException(status_code=400, detail={"error": "vertical_mismatch", "message": f"Your subscription is for {subscriber.vertical}, not {payload.vertical}"})
+
     # Reject if subscriber already owns this ZIP — they get those leads free
     owned = db.execute(
         select(ZipTerritory).where(
@@ -2766,6 +2794,64 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, db: Session = Depends(g
     ).scalar_one_or_none()
     if owned:
         raise HTTPException(status_code=400, detail={"error": "zip_already_owned", "message": "You already receive leads for this ZIP in your feed."})
+
+    # Checkout gate 1: county must be launched (ADR 0002 — derived status).
+    from src.utils.county_config import is_county_launched
+    if not is_county_launched(payload.county_id, db):
+        raise HTTPException(status_code=403, detail={
+            "error": "county_not_launched",
+            "message": "This county is not yet live for lead pack purchases.",
+        })
+
+    # Checkout gates 2 & 3: verify ≥5 available qualified leads exist after
+    # cross-trade exclusivity, and that the pack meets the contactability bar.
+    # Uses the SAME predicate as webhook delivery so the gate cannot lie.
+    from src.services.lead_exclusivity import get_exclusive_property_ids
+    from src.services.lead_pool_service import check_pack_contactability
+    from src.core.models import DistressScore, Owner
+    from src.utils.lead_filters import has_contact_filter, phone_priority_order
+    from datetime import datetime, timezone as tz
+
+    now = datetime.now(tz.utc)
+    excl_ids = get_exclusive_property_ids(db, payload.county_id, now, zip_code=payload.zip_code)
+
+    try:
+        score_col = DistressScore.vertical_scores[payload.vertical].as_float()
+    except KeyError:
+        raise HTTPException(status_code=400, detail={"error": "invalid_vertical", "message": f"Unknown vertical '{payload.vertical}'"})
+
+    filters = [
+        Property.zip == payload.zip_code,
+        Property.county_id == payload.county_id,
+        DistressScore.qualified == True,
+    ]
+    contact_clause = has_contact_filter(_s)
+    if contact_clause is not None:
+        filters.append(contact_clause)
+    if excl_ids:
+        filters.append(Property.id.not_in(excl_ids))
+
+    candidate_ids = db.execute(
+        select(Property.id)
+        .join(DistressScore, DistressScore.property_id == Property.id)
+        .outerjoin(Owner, Owner.property_id == Property.id)
+        .where(and_(*filters))
+        .order_by(*phone_priority_order(score_col))
+        .limit(5)
+    ).scalars().all()
+
+    if len(candidate_ids) < 5:
+        raise HTTPException(status_code=422, detail={
+            "error": "insufficient_leads",
+            "message": f"Only {len(candidate_ids)} qualified leads available for this ZIP/vertical combination",
+        })
+
+    contactability = check_pack_contactability(db, list(candidate_ids))
+    if not contactability["passes"]:
+        raise HTTPException(status_code=422, detail={
+            "error": "insufficient_contactability",
+            "message": f"Lead pack contactability {contactability['pct_contactable']:.0%} is below the required threshold.",
+        })
 
     # Look up price amount from Stripe
     stripe.api_key = _s.active_stripe_secret_key.get_secret_value()
