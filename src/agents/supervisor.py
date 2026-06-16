@@ -88,6 +88,23 @@ def dispatch_event(event: Dict[str, Any]) -> Dict[str, Any]:
 			logger.warning("supervisor: enrichment batcher add failed: %s", _batcher_exc)
 		return _outcome("routed", "enrichment_cascade", decision_id, "ok")
 
+	# Pipeline event routing — Lead Pack Hot-Enrichment (ADR 0018).
+	# lead_pack_reserved is a fulfillment trigger, not a Cora messaging graph:
+	# hand it to the fulfillment worker (which fans out onto a daemon thread so
+	# the listener never blocks on the Tracerfy poll) and return. The cron sweep
+	# remains the durability backstop if this event is dropped.
+	if event_type == "lead_pack_reserved":
+		try:
+			from src.tasks.lead_pack_fulfillment_sweep import handle_reserved_event
+			handle_reserved_event(payload)
+		except Exception as _lp_exc:
+			logger.warning(
+				"supervisor: lead_pack_reserved handoff failed (purchase=%s); "
+				"cron sweep is backstop: %s",
+				payload.get("purchase_id"), _lp_exc,
+			)
+		return _outcome("routed", "lead_pack_fulfillment", decision_id, "ok")
+
 	# Global kill switch
 	if settings.agents_global_kill_switch:
 		reason = "global_kill_switch_enabled"

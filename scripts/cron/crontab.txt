@@ -173,6 +173,12 @@ COUNTY_ID=hillsborough
 # Grace Expiry (ZIP territories + subscribers) — every 15 min
 */15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.grace_expiry
 
+# Lead Pack fulfillment sweep (ADR 0018) — every 2 min. Picks up paid+reserved
+# packs (status='enriching'), runs Tracerfy Hot-Enrichment on the 5 reserved
+# leads, enforces the 100% Quality Floor, then delivers (SentLead + email) or
+# refunds (releasing the reservation). Stale claims self-heal after 15 min.
+*/2 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lead_pack_fulfillment_sweep
+
 # Cora anomaly check — volume + no-answer rate monitor — every 15 min
 */15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.cora_anomaly_check
 

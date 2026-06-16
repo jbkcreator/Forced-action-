@@ -2808,11 +2808,12 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, db: Session = Depends(g
             "message": "This county is not yet live for lead pack purchases.",
         })
 
-    # Checkout gates 2 & 3: verify ≥5 available qualified leads exist after
-    # cross-trade exclusivity, and that the pack meets the contactability bar.
-    # Uses the SAME predicate as webhook delivery so the gate cannot lie.
+    # Checkout gate 2: verify ≥5 available qualified leads (each with a contact
+    # on file) exist after cross-trade exclusivity. Uses the SAME predicate as
+    # the webhook reservation so the gate cannot lie. The authoritative quality
+    # bar is the post-payment 100% Tracerfy Quality Floor (ADR 0018) — there is
+    # deliberately no pre-payment contactability-percentage gate here.
     from src.services.lead_exclusivity import get_exclusive_property_ids
-    from src.services.lead_pool_service import check_pack_contactability
     from src.core.models import DistressScore, Owner
     from src.utils.lead_filters import has_contact_filter, phone_priority_order
     from datetime import datetime, timezone as tz
@@ -2849,13 +2850,6 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, db: Session = Depends(g
         raise HTTPException(status_code=422, detail={
             "error": "insufficient_leads",
             "message": f"Only {len(candidate_ids)} qualified leads available for this ZIP/vertical combination",
-        })
-
-    contactability = check_pack_contactability(db, list(candidate_ids))
-    if not contactability["passes"]:
-        raise HTTPException(status_code=422, detail={
-            "error": "insufficient_contactability",
-            "message": f"Lead pack contactability {contactability['pct_contactable']:.0%} is below the required threshold.",
         })
 
     # Look up price amount from Stripe

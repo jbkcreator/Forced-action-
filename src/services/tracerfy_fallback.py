@@ -35,6 +35,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import requests
+from sqlalchemy.orm import Session
 
 from config.settings import get_settings
 from src.core.database import get_db_context
@@ -400,6 +401,159 @@ def get_tracerfy_balance() -> dict:
     if not resp.ok:
         raise RuntimeError(f"Tracerfy analytics HTTP {resp.status_code}: {resp.text[:300]}")
     return resp.json()
+
+
+# ---------------------------------------------------------------------------
+# Lead Pack Hot-Enrichment (ADR 0018)
+# ---------------------------------------------------------------------------
+
+def hot_enrich_properties(
+    db: "Session",
+    property_ids: list[int],
+    trace_type: str = "advanced",
+) -> dict[int, dict]:
+    """
+    Fresh on-demand Tracerfy trace of a specific set of properties (the 5 leads
+    reserved by a Lead Pack purchase). Returns a per-property contact dict so the
+    caller can apply the 100% Quality Floor.
+
+    Unlike `run_tracerfy_fallback` (nightly, by candidate query), this traces an
+    explicit property_id list, labels each record by property_id, and persists a
+    fresh `EnrichedContact` (source='tracerfy') + owner contact backfill for hits.
+
+    trace_type='advanced' (default) — address-only; Tracerfy identifies the owner,
+    so it works uniformly for individual- and entity-owned properties (best hit
+    rate for the all-or-nothing floor). 'normal' uses owner name + address.
+
+    Returns: {property_id: {"match_success": bool, "mobile_phone", "landline",
+              "email", "mailing_address"}}. Properties with no result row are
+              absent from the dict (caller treats absence as a miss).
+    """
+    from sqlalchemy import text as _text
+
+    if not property_ids:
+        return {}
+
+    settings = get_settings()
+    if not settings.tracerfy_api_key:
+        logger.error("[Tracerfy] hot_enrich: TRACERFY_API_KEY not set")
+        return {}
+    api_key = settings.tracerfy_api_key.get_secret_value()
+
+    rows = (
+        db.query(Owner, Property)
+        .join(Property, Property.id == Owner.property_id)
+        .filter(Owner.property_id.in_(property_ids))
+        .all()
+    )
+    prop_by_id = {prop.id: (owner, prop) for owner, prop in rows}
+
+    records: list[dict] = []
+    for prop_id in property_ids:
+        pair = prop_by_id.get(prop_id)
+        if not pair:
+            continue
+        owner, prop = pair
+        if not prop.address or not prop.zip:
+            continue
+        if trace_type == "advanced":
+            first, last, addr_override = "", "", None
+        else:
+            first, last, addr_override, is_traceable = _resolve_trace_subject(owner)
+            if not is_traceable:
+                continue
+        addr = addr_override or {
+            "address": prop.address,
+            "city":    prop.city or "Tampa",
+            "state":   prop.state or "FL",
+            "zip":     (prop.zip or "")[:5],
+        }
+        records.append({
+            "label":      str(prop_id),
+            "first_name": first,
+            "last_name":  last,
+            "address":    addr["address"],
+            "city":       addr["city"],
+            "state":      addr["state"],
+            "zip":        addr["zip"],
+        })
+
+    if not records:
+        logger.warning("[Tracerfy] hot_enrich: no traceable records for %s", property_ids)
+        return {}
+
+    queue_id, estimated_wait = _submit_trace_batch(records, api_key, trace_type)
+    logger.info(
+        "[Tracerfy] hot_enrich queued %d records — queue_id=%s", len(records), queue_id
+    )
+    results = _poll_trace_queue(queue_id, api_key, estimated_wait)
+
+    out: dict[int, dict] = {}
+    now = datetime.now(timezone.utc)
+    address_map = {r["address"].upper().strip(): int(r["label"]) for r in records}
+
+    for row in results:
+        label = str(row.get("label") or "").strip()
+        if label.isdigit() and int(label) in prop_by_id:
+            prop_id = int(label)
+        else:
+            prop_id = address_map.get((row.get("address") or "").upper().strip())
+        if prop_id is None:
+            continue
+
+        parsed = _parse_trace_row(row)
+        out[prop_id] = parsed
+
+        owner, _prop = prop_by_id[prop_id]
+        try:
+            existing = (
+                db.query(EnrichedContact)
+                .filter(
+                    EnrichedContact.property_id == prop_id,
+                    EnrichedContact.source == "tracerfy",
+                )
+                .first()
+            )
+            if existing:
+                existing.mobile_phone    = parsed["mobile_phone"] or existing.mobile_phone
+                existing.landline        = parsed["landline"] or existing.landline
+                existing.email           = parsed["email"] or existing.email
+                existing.mailing_address = parsed["mailing_address"] or existing.mailing_address
+                existing.match_success   = parsed["match_success"] or existing.match_success
+                existing.raw_response    = dict(row)
+                existing.enriched_at     = now
+            else:
+                db.add(EnrichedContact(
+                    property_id=prop_id,
+                    county_id=owner.county_id,
+                    mobile_phone=parsed["mobile_phone"],
+                    landline=parsed["landline"],
+                    email=parsed["email"],
+                    mailing_address=parsed["mailing_address"],
+                    source="tracerfy",
+                    match_success=parsed["match_success"],
+                    raw_response=dict(row),
+                    enriched_at=now,
+                ))
+
+            if parsed["match_success"]:
+                if parsed["mobile_phone"] and not owner.phone_1:
+                    owner.phone_1 = parsed["mobile_phone"]
+                elif parsed["landline"] and not owner.phone_1:
+                    owner.phone_1 = parsed["landline"]
+                if parsed["email"] and not owner.email_1:
+                    owner.email_1 = parsed["email"]
+                owner.skip_trace_success = True
+        except Exception as exc:
+            logger.error("[Tracerfy] hot_enrich persist error property_id=%d: %s", prop_id, exc)
+
+    db.flush()
+    hits = sum(1 for v in out.values() if v["match_success"])
+    logger.info(
+        "[Tracerfy] hot_enrich complete: %d/%d hits (queue=%s)",
+        hits, len(property_ids), queue_id,
+    )
+    return out
 
 
 # ---------------------------------------------------------------------------
