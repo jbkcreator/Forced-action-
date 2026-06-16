@@ -1,11 +1,14 @@
 """owners.contactability_detail — cross-source triangulation evidence (ADR 0015)
 
 Revision ID: fa078_contactability_detail
-Revises: fa077_master_weekly_refresh
+Revises: (none — standalone branch; DDL applied by scripts/apply_contactability_detail_migration.py)
 
 Record-only migration per house convention: DDL is applied by
 scripts/apply_contactability_detail_migration.py, never `alembic upgrade`
 (multiple heads exist; the script is idempotent).
+
+Note: down_revision was fa077_master_weekly_refresh but that file was never
+committed. Set to None so Alembic can build its revision map.
 """
 from typing import Sequence, Union
 
@@ -14,7 +17,7 @@ from alembic import op
 from sqlalchemy.dialects.postgresql import JSONB
 
 revision: str = "fa078_contactability_detail"
-down_revision: Union[str, None] = "fa077_master_weekly_refresh"
+down_revision: Union[str, None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
