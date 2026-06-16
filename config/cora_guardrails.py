@@ -243,6 +243,20 @@ KILL_SWITCH = {
         "kill_after_red_days": 7,
         "direction": "higher_is_better",
     },
+    "reactivation": {
+        # % of reactivation outreach events that result in a re-subscription
+        # within 7 days. Green ≥5%, yellow 2–5%, red <2%.
+        # No metric data on launch — graph defaults observed_value to 10.0
+        # (healthy) until kill_switch_metric_ingest begins computing it.
+        "green": 5, "yellow": (2, 5), "red": 2,
+        "action": "switch to static copy, reduce outreach frequency",
+        "duration_hours_for_action": 48,
+        "auto_action_type": "fallback_enabled",
+        "fallback_feature_flag": "reactivation_use_static_copy",
+        "requires_approval": False,
+        "kill_after_red_days": 7,
+        "direction": "higher_is_better",
+    },
 }
 
 
