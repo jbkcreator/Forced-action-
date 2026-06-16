@@ -3072,9 +3072,14 @@ def _on_lead_pack_payment(payment_intent: dict, db: Session) -> None:
             )
             return
 
+        # ADR 0018 — RESERVE, don't deliver. The 5 leads are claimed now (under
+        # the advisory lock) so no concurrent buyer can grab them, and their
+        # Cross-Trade Exclusivity is written immediately (72h from payment). The
+        # leads are NOT yet delivered: lead_pack_fulfillment_sweep runs Tracerfy
+        # Hot-Enrichment, enforces the 100% Quality Floor, then delivers (with the
+        # SentLead rows + email) or refunds (releasing this reservation).
         purchase.lead_ids = [prop.id for prop, _ in top_leads]
-        purchase.status = "delivered"
-        purchase.delivered_at = now
+        purchase.status = "enriching"
         db.flush()
 
         record_exclusivity(
@@ -3089,21 +3094,13 @@ def _on_lead_pack_payment(payment_intent: dict, db: Session) -> None:
         )
 
         logger.info(
-            "[LeadPack] Delivered purchase %s — %d leads for %s/%s/%s to subscriber %s",
+            "[LeadPack] Reserved purchase %s — %d leads for %s/%s/%s to subscriber %s; awaiting hot-enrichment",
             purchase.id, len(top_leads), zip_code, vertical, county_id, subscriber.id,
         )
 
-        # Email is best-effort — a send failure must NOT roll back a delivered,
-        # exclusivity-locked pack (the buyer can still see leads via the feed).
-        if subscriber.email:
-            try:
-                _send_lead_pack_email(subscriber, purchase, top_leads)
-            except Exception:
-                logger.error("[LeadPack] delivery email failed for purchase %s", purchase.id, exc_info=True)
-
     except Exception as e:
         db.rollback()
-        logger.error("[LeadPack] Delivery failed: %s", e, exc_info=True)
+        logger.error("[LeadPack] Reservation failed: %s", e, exc_info=True)
         raise
 
 
@@ -3260,4 +3257,34 @@ def _send_lead_pack_email(
             f"— Forced Action Team"
         ),
         body_html=body_html,
+    )
+
+
+def _send_lead_pack_refund_email(
+    subscriber: "Subscriber",
+    purchase: LeadPackPurchase,
+) -> None:
+    """
+    Notify a buyer that their Lead Pack could not clear the Quality Floor and has
+    been fully refunded (ADR 0018). Sent by lead_pack_fulfillment_sweep.
+    """
+    from src.services.email import send_email
+
+    if not subscriber.email:
+        return
+
+    send_email(
+        to=subscriber.email,
+        subject="Your Forced Action Lead Pack — Refunded",
+        body_text=(
+            f"Hi {subscriber.name or 'there'},\n\n"
+            f"We weren't able to confirm fresh contact details for all 5 leads in "
+            f"your pack for ZIP {purchase.zip_code} ({purchase.vertical.title()}), "
+            f"so we did not deliver a partial pack.\n\n"
+            f"Your $99 has been fully refunded — it should appear on your statement "
+            f"within 5–10 business days. No leads were locked to your account.\n\n"
+            f"You're welcome to try again shortly, or reach us at "
+            f"support@forcedaction.io if you'd like help.\n\n"
+            f"— Forced Action Team"
+        ),
     )

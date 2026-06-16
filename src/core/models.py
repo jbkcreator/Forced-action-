@@ -2002,10 +2002,15 @@ class LeadPackPurchase(Base):
     )
 
     # Lifecycle
+    #   pending    — row created, leads not yet reserved (transient)
+    #   enriching  — 5 leads reserved at payment; awaiting Hot-Enrichment (ADR 0018)
+    #   delivered  — Quality Floor cleared, leads handed over
+    #   expired    — non-recoverable selection error (e.g. unknown vertical)
+    #   refunded   — short pack, unlaunched county, or Quality Floor miss
     status: Mapped[str] = mapped_column(
         String(20), default="pending", nullable=False
-    )  # pending | delivered | expired | refunded
-    
+    )
+
     # Timestamps
     purchased_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
@@ -2014,11 +2019,15 @@ class LeadPackPurchase(Base):
     exclusive_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # purchased_at + 72h
     refunded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
+    # Hot-Enrichment (ADR 0018) — post-payment Tracerfy re-trace of the reserved 5.
+    enrichment_submitted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    tracerfy_queue_id: Mapped[Optional[str]] = mapped_column(String(50))
+
     # Refund info
     refund_reason: Mapped[Optional[str]] = mapped_column(String(100))
     stripe_refund_id: Mapped[Optional[str]] = mapped_column(String(100))
 
-    # The 5 selected property IDs (set at purchase time)
+    # The 5 selected property IDs (reserved at payment time)
     lead_ids: Mapped[Optional[list]] = mapped_column(ARRAY(Integer))
 
     # Relationship
@@ -2026,11 +2035,12 @@ class LeadPackPurchase(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "status IN ('pending', 'delivered', 'expired', 'refunded')",
+            "status IN ('pending', 'enriching', 'delivered', 'expired', 'refunded')",
             name="check_lead_pack_status",
         ),
         Index("idx_lead_pack_zip_vertical", "zip_code", "vertical"),
         Index("idx_lead_pack_exclusive_until", "exclusive_until"),
+        Index("idx_lead_pack_status", "status"),
     )
 
     def __repr__(self):

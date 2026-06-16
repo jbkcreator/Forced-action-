@@ -103,7 +103,7 @@ Single `Dockerfile` at project root. `docker-compose.yml` runs `api` and `cora` 
 - **Cron ordering (hard stagger):** scrapers 04:00–06:30 → CDS 07:00 → skip trace 07:30 → GHL sync 08:00.
 - **GHL sync_status:** `pending_sync` → `synced` / `sync_failed`. Never lost.
 - **Alembic has multiple heads** — always target by revision ID, not `head`. Run `alembic heads` first.
-- **Lead Pack MVP status**: Partially sellable. Missing: county launch gate at checkout, minimum 5-lead count enforcement, 80% enrichment threshold check, `SentLead` rows in webhook fulfillment. Zero test coverage for lead pack flow.
+- **Lead Pack flow** (ADR 0018): two-phase. `payment_intent.succeeded` → `_on_lead_pack_payment` RESERVES (advisory lock, selects top-5 un-locked qualified leads, writes `lead_ids` + `lead_exclusivity`, `status='enriching'`, 72h from payment). `lead_pack_fulfillment_sweep` (cron */2) runs Tracerfy Hot-Enrichment (`tracerfy_fallback.hot_enrich_properties`) over the 5, enforces the **100% Quality Floor** (phone OR email, all 5), then delivers (`SentLead` source='lead_pack' + email) or refunds (releases exclusivity + Stripe refund + email). Checkout gates: county launched, ≥5 has-contact leads (422 `insufficient_leads`). No pre-payment % gate — the floor is authoritative. Covered by `tests/test_lead_pack_e2e.py`.
 - Required env: `DATABASE_URL`, `ANTHROPIC_API_KEY`, `REDIS_URL`. Feature-gated: Stripe, GHL, Synthflow, Telnyx, Oxylabs, LangSmith.
 
 ## Implementation Standards
