@@ -25,6 +25,11 @@ if [[ "$1" == *"tax_delinquent_engine"* ]]; then
     TIMEOUT=7200                           # 2 hours for tax scraper
 fi
 
+# Master parcel pipeline: bulk download + ~500k-row load/update (weekly Sunday)
+if [[ "$1" == *"master_engine"* ]]; then
+    TIMEOUT=14400                          # 4 hours (worst-case scrape + convert + load/update)
+fi
+
 mkdir -p "$LOG_DIR" "$STATUS_DIR"
 
 # Block execution for counties that are not yet active

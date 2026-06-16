@@ -139,7 +139,8 @@ def _compute_segment(
         return "wallet_active", f"wallet_active:tier={wallet.wallet_tier}"
 
     # 6. new
-    account_age_days = (now - sub.created_at).days if sub.created_at else 0
+    created = sub.created_at.replace(tzinfo=timezone.utc) if sub.created_at and sub.created_at.tzinfo is None else sub.created_at
+    account_age_days = (now - created).days if created else 0
     if (
         account_age_days < NEW_ACCOUNT_AGE_DAYS
         and (wallet is None or wallet.credits_remaining == 0)

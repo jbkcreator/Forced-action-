@@ -25,6 +25,30 @@ from src.core.database import get_db_context
 
 logger = logging.getLogger(__name__)
 
+_PA_NAME_SUFFIXES = frozenset({"JR", "SR", "II", "III", "IV", "V", "ESQ", "PHD", "MD"})
+
+
+def _normalize_pa_owner_name(name: str) -> str:
+    """
+    Storage-time normalization for all PA sources:
+      "Estate of John Smith"  →  "John Smith"
+      "SMITH, JOHN"           →  "JOHN SMITH"
+      "JOHN SMITH, JR"        →  "JOHN SMITH JR"
+    """
+    if not name:
+        return name
+    name = name.strip()
+    if name.lower().startswith("estate of "):
+        name = name[len("estate of "):].strip()
+    if "," in name:
+        before, after = name.split(",", 1)
+        after_clean = after.strip()
+        if after_clean.upper() in _PA_NAME_SUFFIXES:
+            name = f"{before.strip()} {after_clean}"
+        else:
+            name = f"{after_clean} {before.strip()}"
+    return name
+
 
 class PropertyAppraiserLoader(BaseLoader):
     """
@@ -127,7 +151,7 @@ class PropertyAppraiserLoader(BaseLoader):
         return True
 
     def _upsert_owner(self, prop: Property, row: pd.Series) -> None:
-        owner_name = row.get("owner_name")
+        owner_name = _normalize_pa_owner_name(row.get("owner_name") or "") or None
         mailing_address = row.get("mailing_address")
         site_address = getattr(prop, "address", None)
 
