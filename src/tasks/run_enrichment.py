@@ -1,13 +1,19 @@
 """
-Enrichment queue — M5 (waterfall).
+Enrichment reconciliation sweep — nightly at 07:30 UTC (ADR 0016).
 
-Runs a multi-provider skip trace waterfall: BatchData → IDI → PDL.
-Stops per-lead when confidence >= threshold or cost ceiling is reached.
+Runs the full enrichment cascade as a safety net for any Gold+ lead whose
+gold_lead_scored event was dropped by the event-driven consumer:
+
+  Free Sources (Step 0) → Tracerfy Standard → Tracerfy Address-Only →
+  BatchData → IDI (key-gated) → PDL
+
+Shares the same run_cascade() implementation as the event-driven path so
+the cascade order is never forked between the two paths.
 
 Usage:
   python -m src.tasks.run_enrichment [county_id] [--limit N] [--all-leads]
 
-Cron (daily at 07:30 UTC, after scrapers at 04:00–06:30 and scoring at 07:00):
+Cron (daily at 07:30 UTC, after scrapers 04:00–06:30 and scoring 07:00):
   30 7 * * * cd /path/to/app && python -m src.tasks.run_enrichment hillsborough
 """
 
@@ -35,28 +41,43 @@ def run_enrichment_pipeline(
     **_kwargs,
 ) -> dict:
     """
-    Run the multi-provider skip trace waterfall for a county.
+    Run the enrichment cascade for a county (reconciliation sweep path).
 
-    Returns dict with waterfall stats and combined total_enriched.
+    Normal path: delegates to run_cascade() — the same implementation used
+    by the event-driven consumer (ADR 0016).
+    Special modes (tracerfy_only / retrace_misses / type filters): fall back
+    to run_waterfall() for those admin/debug operations.
+
+    Returns dict with cascade stats and combined total_enriched.
     """
-    from src.services.skip_trace_waterfall import run_waterfall
-
     results = {
         "county_id":  county_id,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "errors":     [],
     }
 
+    use_special_mode = tracerfy_only or tracerfy_retrace_misses or individual_only or entity_only
+
     try:
-        wf_stats = run_waterfall(
-            county_id=county_id,
-            limit=limit,
-            today_only=today_only,
-            tracerfy_only=tracerfy_only,
-            tracerfy_retrace_misses=tracerfy_retrace_misses,
-            individual_only=individual_only,
-            entity_only=entity_only,
-        )
+        if use_special_mode:
+            from src.services.skip_trace_waterfall import run_waterfall
+            wf_stats = run_waterfall(
+                county_id=county_id,
+                limit=limit,
+                today_only=today_only,
+                tracerfy_only=tracerfy_only,
+                tracerfy_retrace_misses=tracerfy_retrace_misses,
+                individual_only=individual_only,
+                entity_only=entity_only,
+            )
+        else:
+            from src.services.skip_trace_waterfall import run_cascade
+            wf_stats = run_cascade(
+                county_id=county_id,
+                limit=limit,
+                today_only=today_only,
+            )
+
         results["waterfall"] = {
             "total_leads":      wf_stats.total_leads,
             "hits":             wf_stats.hits,
@@ -66,17 +87,17 @@ def run_enrichment_pipeline(
         }
         results["total_enriched"] = wf_stats.hits
         logger.info(
-            "[Enrichment] Waterfall done: %d/%d enriched, $%.2f spent",
+            "[Enrichment] Cascade done: %d/%d enriched, $%.2f spent",
             wf_stats.hits, wf_stats.total_leads, wf_stats.total_cost_cents / 100,
         )
     except Exception as exc:
-        logger.error("[Enrichment] Waterfall failed: %s", exc, exc_info=True)
+        logger.error("[Enrichment] Cascade failed: %s", exc, exc_info=True)
         results["errors"].append(str(exc))
         results["total_enriched"] = 0
         send_alert(
-            subject="[Forced Action] Enrichment waterfall crashed",
+            subject="[Forced Action] Enrichment cascade crashed",
             body=(
-                f"Skip trace waterfall failed unexpectedly:\n{exc}\n\n"
+                f"Skip trace cascade failed unexpectedly:\n{exc}\n\n"
                 f"County: {county_id}\n"
                 f"Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n\n"
                 f"Check logs for full traceback."
@@ -94,7 +115,7 @@ def run_enrichment_pipeline(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Skip trace waterfall: BatchData → IDI → PDL")
+    parser = argparse.ArgumentParser(description="Enrichment cascade: Tracerfy → Address-Only → BatchData → IDI → PDL")
     parser.add_argument("county_id", nargs="?", default="hillsborough")
     parser.add_argument("--limit", type=int, default=_DEFAULT_LIMIT,
                         help="Max leads per run (default: 200)")

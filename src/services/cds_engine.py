@@ -1751,10 +1751,13 @@ class MultiVerticalScorer:
 
         Returns a dict with aggregate counters and side-effect queues.
         """
+        _GOLD_PLUS = {"Ultra Platinum", "Platinum", "Gold"}
+
         if not scored_batch:
             return {
                 "new": 0, "updated": 0, "unchanged": 0, "upgraded": 0,
                 "qualified": 0, "ghl_queued": [], "new_gold_records": [],
+                "new_gold_plus_entering": [],
             }
 
         now          = datetime.now(timezone.utc)
@@ -1791,6 +1794,7 @@ class MultiVerticalScorer:
         inserts_data:   List[Dict] = []
         new_count = updated_count = unchanged_count = upgraded_count = qualified_count = 0
         ghl_queued: List[Dict] = []
+        new_gold_plus_entering: List[Dict] = []  # (property_id, county_id, tier, zip, scoring_run_id)
 
         with self._profiler.phase("persist_classify"):
           for sd in scored_batch:
@@ -1823,6 +1827,19 @@ class MultiVerticalScorer:
                 )
                 if upgraded:
                     upgraded_count += 1
+                # Entering Gold+: intraday upgrade from below-Gold to Gold/Platinum/Ultra Platinum.
+                # Separate from flash-scarcity (Gold-only). Gold→Platinum not emitted (already Gold+).
+                if (
+                    lead_tier in _GOLD_PLUS
+                    and prev_tier not in _GOLD_PLUS
+                ):
+                    new_gold_plus_entering.append({
+                        "property_id":   pid,
+                        "county_id":     sd.get("county_id", "hillsborough"),
+                        "lead_tier":     lead_tier,
+                        "zip":           sd.get("zip"),
+                        "scoring_run_id": scoring_run_id,
+                    })
                 score_changed = prev_score != final_score
                 if _GHL_PUSH_ENABLED and (score_changed or not sd.get("ghl_contact_id")):
                     ghl_queued.append(sd)
@@ -1843,6 +1860,19 @@ class MultiVerticalScorer:
                         qualified_count += 1
                     if _GHL_PUSH_ENABLED:
                         ghl_queued.append(sd)
+                    # Entering Gold+: new insert at Gold/Platinum/Ultra Platinum where
+                    # prior tier (if any) was below Gold (or no prior score at all).
+                    if (
+                        lead_tier in _GOLD_PLUS
+                        and (latest_tier is None or latest_tier not in _GOLD_PLUS)
+                    ):
+                        new_gold_plus_entering.append({
+                            "property_id":   pid,
+                            "county_id":     sd.get("county_id", "hillsborough"),
+                            "lead_tier":     lead_tier,
+                            "zip":           sd.get("zip"),
+                            "scoring_run_id": scoring_run_id,
+                        })
 
         # ── 4. Batch UPDATE ───────────────────────────────────────────────
         # Routed through _bulk_update_distress_scores so the N-row UPDATE is
@@ -1907,13 +1937,14 @@ class MultiVerticalScorer:
                             new_gold_records.append((sd, gold_id_map[sd["property_id"]]))
 
         return {
-            "new":              new_count,
-            "updated":          updated_count,
-            "unchanged":        unchanged_count,
-            "upgraded":         upgraded_count,
-            "qualified":        qualified_count,
-            "ghl_queued":       ghl_queued,
-            "new_gold_records": new_gold_records,
+            "new":                    new_count,
+            "updated":                updated_count,
+            "unchanged":              unchanged_count,
+            "upgraded":               upgraded_count,
+            "qualified":              qualified_count,
+            "ghl_queued":             ghl_queued,
+            "new_gold_records":       new_gold_records,
+            "new_gold_plus_entering": new_gold_plus_entering,
         }
 
     def score_all_properties(
@@ -2081,6 +2112,35 @@ class MultiVerticalScorer:
                         "Batch commit failed at property %d: %s",
                         self._total_scored, batch_exc, exc_info=True,
                     )
+
+                # Emit gold_lead_scored events AFTER commit (ADR 0016).
+                # Guard by ENRICHMENT_CASCADE_ENABLED so the nightly batch remains
+                # the sole trigger until the consumer is enabled in ops.
+                # Publish failure must never fail scoring — nightly batch is backstop.
+                if with_signal_batch and result.get("new_gold_plus_entering"):
+                    try:
+                        from config.settings import get_settings as _get_settings
+                        _settings = _get_settings()
+                        if _settings.enrichment_cascade_enabled:
+                            from src.agents.events.ingestion import publish_cora_event
+                            for _entry in result["new_gold_plus_entering"]:
+                                try:
+                                    publish_cora_event({
+                                        "event_type": "gold_lead_scored",
+                                        "payload":    _entry,
+                                        "idempotency_key": (
+                                            f"gold_lead_scored:"
+                                            f"{_entry['property_id']}:"
+                                            f"{_entry['scoring_run_id']}"
+                                        ),
+                                    })
+                                except Exception as _pub_exc:
+                                    logger.warning(
+                                        "gold_lead_scored publish failed property_id=%s: %s",
+                                        _entry.get("property_id"), _pub_exc,
+                                    )
+                    except Exception as _emit_exc:
+                        logger.warning("gold_lead_scored batch emit failed: %s", _emit_exc)
 
             if save_to_db and _GHL_PUSH_ENABLED:
                 with self._profiler.phase("ghl_flush"):

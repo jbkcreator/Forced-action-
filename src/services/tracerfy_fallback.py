@@ -198,10 +198,13 @@ def _headers(api_key: str) -> dict:
     }
 
 
-def _submit_trace_batch(records: list[dict], api_key: str) -> tuple[str, int]:
+def _submit_trace_batch(records: list[dict], api_key: str, trace_type: str = "normal") -> tuple[str, int]:
     """
     POST /trace/ as multipart/form-data.
     Returns (queue_id, estimated_wait_seconds).
+
+    trace_type='normal'   — standard name+address trace (1 credit/hit = $0.02)
+    trace_type='advanced' — address-only trace (2 credits/hit = $0.04); name fields optional
 
     Confirmed response shape:
       {"queue_id": 94858, "status": "pending", "rows_uploaded": 3,
@@ -221,7 +224,7 @@ def _submit_trace_batch(records: list[dict], api_key: str) -> tuple[str, int]:
         "mail_city_column":   "city",
         "mail_state_column":  "state",
         "mailing_zip_column": "zip",
-        "trace_type":         "normal",
+        "trace_type":         trace_type,
         "json_data":          _json.dumps(records),
     }
     multipart = {k: (None, v) for k, v in fields.items()}
@@ -411,23 +414,34 @@ def run_tracerfy_fallback(
     retrace_misses: bool = False,
     individual_only: bool = False,
     entity_only: bool = False,
+    trace_type: str = "normal",
 ) -> dict:
     """
-    Run Tracerfy batch skip-trace (POST /trace/, 1 credit/hit = $0.02) for Gold+ leads.
+    Run Tracerfy batch skip-trace for Gold+ leads.
 
-    Standard mode (owner_ids=None): selects Gold+ candidates not yet Tracerfy-traced.
-    Waterfall mode (owner_ids=[...]): processes a specific list supplied by the orchestrator.
-    retrace_misses=True: re-submits properties with existing tracerfy miss EC rows,
-      updating them in-place on a hit. Ignores owner_ids when active.
-    individual_only / entity_only: restrict to individual or entity owner types.
+    Standard mode (owner_ids=None, trace_type='normal'):
+        Selects Gold+ candidates not yet Tracerfy-traced (1 credit/hit = $0.02).
 
-    DNC side-effect: phones with dnc=True or litigator=True are written to
-    sms_opt_outs(source="tracerfy_dnc") so can_send() blocks them immediately.
+    Waterfall mode (owner_ids=[...]):
+        Processes a specific list supplied by the cascade orchestrator.
 
-    Returns stats dict.
+    Address-Only mode (trace_type='advanced'):
+        Submits address only — skips entity-classification, uses empty names.
+        2 credits/hit ($0.04). Used for Standard misses + entity-skips (ADR 0016).
+        entity_skip_ids is always [] in this mode (already skipping the skip-check).
+
+    retrace_misses=True:
+        Re-submits properties with existing tracerfy miss EC rows, updating them
+        in-place on a hit. When owner_ids is ALSO given, restricts to those IDs.
+
+    Returns stats dict including entity_skip_ids (list of owner_ids skipped because
+    no traceable individual was found — these become Address-Only candidates).
     """
     settings     = get_settings()
-    cost_per_hit = settings.tracerfy_cost_cents   # 2 cents = $0.02
+    cost_per_hit = (
+        settings.tracerfy_advanced_cost_cents if trace_type == "advanced"
+        else settings.tracerfy_cost_cents
+    )
 
     if not settings.tracerfy_api_key:
         logger.warning("TRACERFY_API_KEY not set — Tracerfy skip-trace skipped")
@@ -438,6 +452,7 @@ def run_tracerfy_fallback(
         "total": 0, "success": 0, "failed": 0,
         "no_address": 0, "already_done": 0, "skipped": False,
         "skipped_entity": 0,
+        "entity_skip_ids": [],   # owner_ids skipped due to no traceable individual
     }
 
     with get_db_context() as session:
@@ -448,11 +463,19 @@ def run_tracerfy_fallback(
             # Re-submit properties whose prior Tracerfy run returned no match.
             # The existing miss EC row is updated in-place on a hit; continued
             # misses are left unchanged (no duplicate rows inserted).
+            # When owner_ids is also provided, restrict to those specific IDs
+            # (cascade uses this for Address-Only on specific miss owners).
             type_filter = ""
             if individual_only:
                 type_filter = " AND o.owner_type = 'Individual'"
             elif entity_only:
                 type_filter = " AND o.owner_type != 'Individual'"
+
+            owner_filter = ""
+            params: dict = {"county_id": county_id, "limit": limit}
+            if owner_ids is not None:
+                owner_filter = " AND o.id = ANY(:owner_ids)"
+                params["owner_ids"] = owner_ids
 
             miss_owner_ids = [
                 r[0]
@@ -464,9 +487,10 @@ def run_tracerfy_fallback(
                     WHERE ec.source = 'tracerfy'
                       AND ec.match_success = FALSE
                     {type_filter}
+                    {owner_filter}
                     ORDER BY o.id
                     LIMIT :limit
-                """), {"county_id": county_id, "limit": limit}).fetchall()
+                """), params).fetchall()
             ]
             rows = (
                 session.query(Owner, Property)
@@ -557,10 +581,16 @@ def run_tracerfy_fallback(
             if not prop.address or not prop.zip:
                 stats["no_address"] += 1
                 continue
-            first, last, addr_override, is_traceable = _resolve_trace_subject(owner)
-            if not is_traceable:
-                stats["skipped_entity"] += 1
-                continue
+            if trace_type == "advanced":
+                # Address-Only: skip entity classification; name fields are
+                # optional for the advanced trace type.
+                first, last, addr_override = "", "", None
+            else:
+                first, last, addr_override, is_traceable = _resolve_trace_subject(owner)
+                if not is_traceable:
+                    stats["skipped_entity"] += 1
+                    stats["entity_skip_ids"].append(owner.id)
+                    continue
             addr = addr_override or {
                 "address": prop.address,
                 "city":    prop.city or "Tampa",
@@ -588,7 +618,7 @@ def run_tracerfy_fallback(
         logger.info("[Tracerfy] Batch %d: submitting %d records...", batch_num, len(records))
 
         try:
-            queue_id, estimated_wait = _submit_trace_batch(records, api_key)
+            queue_id, estimated_wait = _submit_trace_batch(records, api_key, trace_type)
             logger.info("[Tracerfy] Batch %d queued — queue_id=%s est_wait=%ds",
                         batch_num, queue_id, estimated_wait)
             results = _poll_trace_queue(queue_id, api_key, estimated_wait)
@@ -671,13 +701,19 @@ def run_tracerfy_fallback(
                         "created_at":  now,
                     })
 
+                    # For Address-Only runs, stamp trace_type in raw_response
+                    # so analytics can distinguish advanced from normal hits.
+                    raw_row = dict(row)
+                    if trace_type == "advanced":
+                        raw_row["trace_type"] = "advanced"
+
                     if existing and retrace_misses:
                         existing.mobile_phone    = parsed["mobile_phone"]
                         existing.landline        = parsed["landline"]
                         existing.email           = parsed["email"]
                         existing.mailing_address = parsed["mailing_address"]
                         existing.match_success   = parsed["match_success"]
-                        existing.raw_response    = row
+                        existing.raw_response    = raw_row
                         existing.enriched_at     = now
                     else:
                         session.add(EnrichedContact(
@@ -689,7 +725,7 @@ def run_tracerfy_fallback(
                             mailing_address=parsed["mailing_address"],
                             source="tracerfy",
                             match_success=parsed["match_success"],
-                            raw_response=row,
+                            raw_response=raw_row,
                             enriched_at=now,
                         ))
 
