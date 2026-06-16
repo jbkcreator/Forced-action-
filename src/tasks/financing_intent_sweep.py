@@ -7,10 +7,11 @@ Usage:
     python -m src.tasks.financing_intent_sweep [options]
 
 Options:
-    --dry-run       Score but do not write to DB (prints summary)
-    --county-id     Restrict sweep to one county
-    --limit N       Stop after scoring N properties
-    --rescore-all   Re-score properties already scored today
+    --dry-run         Score but do not write to DB (prints summary)
+    --county-id       Restrict sweep to one county
+    --limit N         Stop after scoring N properties
+    --rescore-all     Re-score properties already scored today
+    --batch-size N    Properties fetched per DB page (default 500)
 """
 
 from __future__ import annotations
@@ -37,11 +38,12 @@ def main() -> None:
     parser.add_argument("--county-id",   default=None,        help="Restrict to one county")
     parser.add_argument("--limit",       type=int, default=None, help="Max properties to score")
     parser.add_argument("--rescore-all", action="store_true", help="Re-score today's rows")
+    parser.add_argument("--batch-size",  type=int, default=None, help="Properties per DB page (default 500)")
     args = parser.parse_args()
 
     logger.info(
-        "Starting financing_intent_sweep county=%s limit=%s dry_run=%s rescore_all=%s",
-        args.county_id, args.limit, args.dry_run, args.rescore_all,
+        "Starting financing_intent_sweep county=%s limit=%s dry_run=%s rescore_all=%s batch_size=%s",
+        args.county_id, args.limit, args.dry_run, args.rescore_all, args.batch_size,
     )
 
     with get_db_context() as session:
@@ -51,6 +53,7 @@ def main() -> None:
             limit=args.limit,
             dry_run=args.dry_run,
             rescore_all=args.rescore_all,
+            batch_size=args.batch_size,
         )
 
     logger.info("Sweep complete: %s", result)

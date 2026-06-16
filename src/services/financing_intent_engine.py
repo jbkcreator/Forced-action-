@@ -449,6 +449,7 @@ class FinancingIntentScorer:
         limit: Optional[int] = None,
         dry_run: bool = False,
         rescore_all: bool = False,
+        batch_size: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Keyset-paginate properties; batch-fetch 5 signal sources; score in
@@ -457,6 +458,7 @@ class FinancingIntentScorer:
         Returns aggregate stats dict.
         """
         today = date.today()
+        page_size = batch_size if batch_size is not None else BATCH_SIZE
 
         totals: Dict[str, Any] = {
             "checked":   0,
@@ -475,7 +477,7 @@ class FinancingIntentScorer:
                 break
 
             sql    = f"SELECT {_PROP_COLS} FROM properties WHERE id > :last_id"
-            params: Dict[str, Any] = {"last_id": last_id, "n": BATCH_SIZE}
+            params: Dict[str, Any] = {"last_id": last_id, "n": page_size}
             if county_id:
                 sql += " AND county_id = :county"
                 params["county"] = county_id
@@ -550,6 +552,7 @@ def score_properties_for_financing(
     limit: Optional[int] = None,
     dry_run: bool = False,
     rescore_all: bool = False,
+    batch_size: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Score properties for financing intent. Entry point for the CLI task."""
     return FinancingIntentScorer(session).score_properties(
@@ -557,4 +560,5 @@ def score_properties_for_financing(
         limit=limit,
         dry_run=dry_run,
         rescore_all=rescore_all,
+        batch_size=batch_size,
     )
