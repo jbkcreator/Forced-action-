@@ -4951,3 +4951,65 @@ class CampaignDailyAnalytics(Base):
             f"<CampaignDailyAnalytics(campaign={self.campaign_id}, "
             f"date={self.snapshot_date}, open_rate={self.open_rate})>"
         )
+
+
+# ============================================================================
+# FINANCING INTENT SCORING (Sprint S1)
+# ============================================================================
+
+class FinancingIntentScore(Base):
+    """Per-property daily financing-intent score from the S1 scoring engine.
+
+    One row per (property_id, score_date). UPSERT on conflict.
+    """
+
+    __tablename__ = "financing_intent_scores"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    property_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("properties.id"), nullable=False
+    )
+    county_id: Mapped[Optional[str]] = mapped_column(String(50))
+    score_date: Mapped[date] = mapped_column(Date, nullable=False)
+    financing_intent_score: Mapped[Decimal] = mapped_column(Numeric(5, 2), nullable=False)
+    intent_tier: Mapped[str] = mapped_column(String(20), nullable=False)
+    recommended_product: Mapped[Optional[str]] = mapped_column(String(50))
+    signal_flags: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default="{}"
+    )
+    signal_scores: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default="{}"
+    )
+    signal_details: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default="{}"
+    )
+    source_ids: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default="{}"
+    )
+    excluded_reasons: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default="{}"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint("property_id", "score_date", name="uq_fis_property_date"),
+        CheckConstraint(
+            "intent_tier IN ('high', 'medium', 'low')",
+            name="ck_fis_intent_tier",
+        ),
+        Index("idx_fis_property_id", "property_id"),
+        Index("idx_fis_score_date", "score_date"),
+        Index("idx_fis_intent_tier", "intent_tier"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<FinancingIntentScore(property_id={self.property_id}, "
+            f"date={self.score_date}, tier='{self.intent_tier}', "
+            f"score={self.financing_intent_score})>"
+        )
