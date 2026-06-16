@@ -1190,6 +1190,11 @@ class Subscriber(Base):
     is_trial: Mapped[bool] = mapped_column(Boolean, server_default="false", nullable=False, default=False)
     trial_ends_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # ── S0: Reactivation cooldown gate ───────────────────────────────────────
+    last_reactivation_attempt_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     # ── Feed password login (fa061) ──────────────────────────────────────────
     # NULL until the subscriber has a password. event_feed_uuid stays the feed
     # identifier; these gate access behind a session JWT.
@@ -1218,6 +1223,7 @@ class Subscriber(Base):
         Index("idx_subscriber_vertical", "vertical"),
         Index("idx_subscriber_signal_score", "revenue_signal_score"),
         Index("idx_subscribers_icp_channel_key", "icp_channel_key"),
+        Index("idx_subscriber_last_reactivation_at", "last_reactivation_attempt_at"),
         CheckConstraint(
             "tier IN ('free', 'starter', 'pro', 'dominator', 'data_only', 'autopilot_lite', 'autopilot_pro', 'partner', 'annual_lock')",
             name="check_subscriber_tier",
@@ -3037,6 +3043,7 @@ class AgentDecision(Base):
     overridden_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     overridden_by: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
     override_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    override_reason_code: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
     playbook_id: Mapped[Optional[int]] = mapped_column(
         BigInteger, ForeignKey("cora_playbook.id", ondelete="SET NULL"), nullable=True,
     )
@@ -3054,6 +3061,7 @@ class AgentDecision(Base):
         ),
         Index("idx_agent_decisions_graph_started", "graph_name", "started_at"),
         Index("idx_agent_decisions_subscriber_started", "subscriber_id", "started_at"),
+        Index("idx_agent_decisions_override_reason_code", "override_reason_code"),
     )
 
     def __repr__(self):
@@ -3875,6 +3883,34 @@ class WaitlistEntry(Base):
         return (f"<WaitlistEntry(id={self.id}, zip={self.zip_code}, "
                 f"vertical={self.vertical}, type={self.waitlist_type}, "
                 f"status={self.status})>")
+
+
+class GoldPlusZipSnapshot(Base):
+    """
+    Nightly aggregation of new Gold+ lead counts per ZIP, refreshed after CDS scoring.
+    Consumed by sold-out reactivation eligibility as a fast supply gate.
+    """
+    __tablename__ = "gold_plus_zip_snapshots"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    zip_code: Mapped[str] = mapped_column(String(10), nullable=False)
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    snapshot_date: Mapped[date] = mapped_column(Date, nullable=False)
+    gold_plus_lead_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("zip_code", "county_id", "snapshot_date", name="uq_gpzs_zip_county_date"),
+        Index("idx_gpzs_zip_county_date", "zip_code", "county_id", "snapshot_date"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<GoldPlusZipSnapshot(zip={self.zip_code}, county={self.county_id}, "
+            f"date={self.snapshot_date}, count={self.gold_plus_lead_count})>"
+        )
 
 
 # ============================================================================
@@ -4951,3 +4987,28 @@ class CampaignDailyAnalytics(Base):
             f"<CampaignDailyAnalytics(campaign={self.campaign_id}, "
             f"date={self.snapshot_date}, open_rate={self.open_rate})>"
         )
+
+
+class CoraEventQueue(Base):
+    """Durable fallback queue for Cora events when Redis is unavailable (fa072)."""
+
+    __tablename__ = "cora_event_queue"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    event_type: Mapped[str] = mapped_column(Text, nullable=False)
+    subscriber_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    idempotency_key: Mapped[Optional[str]] = mapped_column(Text, nullable=True, unique=True)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="pending")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("idx_cora_event_queue_status_created", "status", "created_at"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<CoraEventQueue(id={self.id}, event_type={self.event_type}, status={self.status})>"
