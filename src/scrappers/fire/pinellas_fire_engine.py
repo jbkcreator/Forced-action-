@@ -47,8 +47,18 @@ _GIS_HEADERS = {
     "User-Agent": "ForcedAction/1.0 (distressed-property-intelligence)",
 }
 
-_FIRE_CODE_PREFIX = "F"
-_FIRE_KEYWORDS = ["fire", "explosion", "arson", "smoke investigation", "structure", "building fire"]
+_FIRE_CODE_PREFIXES = ("F", "H")  # F = Fire dept, H = Hazmat
+_FIRE_TYPE_KEYWORDS = [
+    "fire",        # building fire, structure fire, vehicle fire, brush fire, etc.
+    "explosion",
+    "arson",
+    "smoke",       # smoke investigation, smoke in structure
+    "hazmat",
+    "haz mat",
+    "gas leak",
+    "fuel spill",
+    "chemical",
+]
 _MATCH_THRESHOLD = 75  # rapidfuzz token_sort_ratio minimum
 
 
@@ -70,9 +80,11 @@ def _is_intersection(location: str) -> bool:
 
 def _is_fire_call(call: Dict) -> bool:
     code = call.get("Code", "")
-    if code.startswith(_FIRE_CODE_PREFIX):
-        return True
-    return any(kw in call.get("Type", "").lower() for kw in _FIRE_KEYWORDS)
+    call_type = call.get("Type", "").lower()
+    return (
+        code.startswith(_FIRE_CODE_PREFIXES)
+        and any(kw in call_type for kw in _FIRE_TYPE_KEYWORDS)
+    )
 
 
 def _stamp_received(received_time: str) -> Optional[datetime]:
