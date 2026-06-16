@@ -5072,26 +5072,3 @@ class FinancingIntentScore(Base):
             f"date={self.score_date}, tier='{self.intent_tier}', "
             f"score={self.financing_intent_score})>"
         )
-class CoraEventQueue(Base):
-    """Durable fallback queue for Cora events when Redis is unavailable (fa072)."""
-
-    __tablename__ = "cora_event_queue"
-
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    event_type: Mapped[str] = mapped_column(Text, nullable=False)
-    subscriber_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
-    idempotency_key: Mapped[Optional[str]] = mapped_column(Text, nullable=True, unique=True)
-    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="pending")
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
-    )
-    processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
-    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-
-    __table_args__ = (
-        Index("idx_cora_event_queue_status_created", "status", "created_at"),
-    )
-
-    def __repr__(self) -> str:
-        return f"<CoraEventQueue(id={self.id}, event_type={self.event_type}, status={self.status})>"
