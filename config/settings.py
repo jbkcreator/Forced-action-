@@ -271,6 +271,11 @@ class AppSettings(BaseSettings):
 	# Skip trace waterfall behaviour
 	skip_trace_confidence_threshold: float = Field(default=0.70, env="SKIP_TRACE_CONFIDENCE_THRESHOLD")
 	skip_trace_cost_ceiling_cents: int = Field(default=80, env="SKIP_TRACE_COST_CEILING_CENTS")
+	# Hard per-run spend ceiling for any single skip-trace fallback invocation — a
+	# backstop independent of the dedup ledger so a future bug cannot run up a large
+	# bill. Worst-case projected (every submitted record assumed a hit). Default $10.
+	# Vendor-agnostic so Tracerfy/BatchData/PDL fallbacks share it.
+	skip_trace_max_run_cost_cents: int = Field(default=1000, env="SKIP_TRACE_MAX_RUN_COST_CENTS")
 
 	# SMTP (used by welcome email, payment receipts, grace period alerts)
 	smtp_host: Optional[str] = Field(default=None, env="SMTP_HOST")
