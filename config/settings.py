@@ -267,6 +267,31 @@ class AppSettings(BaseSettings):
 	def _clamp_max_heirs(cls, v: int) -> int:
 		return max(1, min(int(v), 10))
 	pdl_api_key: Optional[SecretStr] = Field(default=None, env="PDL_API_KEY")
+	idi_api_key: Optional[SecretStr] = Field(default=None, env="IDI_API_KEY")
+
+	# Enrichment cascade costs (ADR 0016 / ADR 0017).
+	# batchdata_cost_cents: contracted rate — was wrong at 2¢, corrected to 7¢.
+	# tracerfy_advanced_cost_cents: Address-Only pass (trace_type='advanced').
+	# Set idi_cost_cents once contracted rate is known (currently key-gated).
+	batchdata_cost_cents: int = Field(default=7, env="BATCHDATA_COST_CENTS")
+	tracerfy_advanced_cost_cents: int = Field(default=4, env="TRACERFY_ADVANCED_COST_CENTS")
+
+	# Event-driven cascade master switch (ADR 0016).
+	# False = nightly batch only; True = consumer fires on every gold_lead_scored event.
+	enrichment_cascade_enabled: bool = Field(default=False, env="ENRICHMENT_CASCADE_ENABLED")
+
+	# EnrichmentBatcher flush controls (ADR 0016).
+	enrichment_batch_flush_size: int = Field(default=200, env="ENRICHMENT_BATCH_FLUSH_SIZE")
+	enrichment_batch_flush_seconds: int = Field(default=120, env="ENRICHMENT_BATCH_FLUSH_SECONDS")
+
+	# Cross-source contact triangulation (ADR 0015).
+	# triangulation_enabled — nightly sweep + inline hook compute corroboration
+	# and write contact_info_confidence / contactability_detail.
+	# cds_use_contactability — CDS reads the tiered contact bonus and the sweep
+	# dispatches delta-rescores for changed labels. Keep off until the Stage E
+	# shadow-diff has been reviewed (rollout stage 3).
+	triangulation_enabled: bool = Field(default=False, env="TRIANGULATION_ENABLED")
+	cds_use_contactability: bool = Field(default=False, env="CDS_USE_CONTACTABILITY")
 
 	# Skip trace waterfall behaviour
 	skip_trace_confidence_threshold: float = Field(default=0.70, env="SKIP_TRACE_CONFIDENCE_THRESHOLD")
@@ -473,6 +498,9 @@ class AppSettings(BaseSettings):
 	wl_api_requests_per_day: int = Field(default=10000, env="WL_API_REQUESTS_PER_DAY")
 	# Directory for WL client logo uploads (relative to repo root)
 	wl_logo_upload_dir: str = Field(default="reports/white_label_logos", env="WL_LOGO_UPLOAD_DIR")
+	# Comma-separated extra CORS origins for white-label client frontends.
+	# wl_frontend_base_url is always included; add client-hosted app domains here.
+	wl_allowed_origins: str = Field(default="", env="WL_ALLOWED_ORIGINS")
 	# Clay enrichment API key (for /api/wl/data/contractors)
 	clay_api_key: Optional[SecretStr] = Field(default=None, env="CLAY_API_KEY")
 	clay_api_base: str = Field(default="https://api.clay.com/v1", env="CLAY_API_BASE")

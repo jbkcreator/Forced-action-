@@ -388,6 +388,17 @@ async def run_foreclosure_pipeline(
 
 	if not csv_file:
 		logger.info("No new foreclosure records — nothing to load")
+		from src.utils.scraper_db_helper import record_scraper_stats
+		record_scraper_stats(
+			source_type="foreclosures",
+			total_scraped=0,
+			matched=0,
+			unmatched=0,
+			skipped=0,
+			run_success=True,
+			error_type="no_data",
+			county_id=county_id,
+		)
 		return None
 
 	if load_to_db:
@@ -395,6 +406,16 @@ async def run_foreclosure_pipeline(
 		load_scraped_data_to_db(
 			"foreclosures", csv_file,
 			destination_dir=csv_file.parent.parent,
+			county_id=county_id,
+		)
+	else:
+		from src.utils.scraper_db_helper import record_scraper_stats
+		record_scraper_stats(
+			source_type="foreclosures",
+			total_scraped=0,
+			matched=0,
+			unmatched=0,
+			skipped=0,
 			county_id=county_id,
 		)
 

@@ -4,9 +4,12 @@ Roofing Permit Keyword Filter — M1-F Scraper #5
 SQL classifier on the existing building_permits table.
 No new scraping required — runs entirely on already-loaded permit data.
 
-Matches permits whose permit_type contains roofing-related keywords and
-creates/updates an Incident record (type='roofing_permit') on the linked
-property so the CDS engine can score it.
+Matches permits whose permit_type contains roofing-related keywords.
+For Pinellas, also matches Express Building Permits where the description
+field contains a roofing keyword (Pinellas uses generic permit types;
+roofing details only appear in the Description field).
+Creates an Incident record (type='roofing_permit') on the linked property
+so the CDS engine can score it.
 
 Entry point:
     scrape_roofing_permits(county_id, date_range)
@@ -24,22 +27,41 @@ from src.core.models import BuildingPermit, Property, Incident
 
 logger = logging.getLogger(__name__)
 
-# Keywords that indicate a roofing job
+# Matches against permit_type for all counties (Hillsborough behavior unchanged)
 ROOFING_KEYWORDS = [
-    "roof", "shingle", "tpo", "tile", "fascia",
-    "soffit", "gutters", "flashing", "underlayment",
-    "re-roof", "reroof",
+    "roof", "shingle", "tpo", "tile", "flashing", "underlayment",
+]
+
+# Pinellas only — matched against description when permit_type is an Express permit
+PINELLAS_DESCRIPTION_KEYWORDS = [
+    "roof",        # re-roof, reroof, metal roof, reroof metal
+    "shingle",     # shingle, shingles
+    "tile",
+    "tro",
+    "tpo",
+    "aluminium",
+    "aluminum",
 ]
 
 
-def _keyword_filter():
-    """SQLAlchemy OR filter across all roofing keywords (case-insensitive)."""
-    return or_(
-        *[
-            func.lower(BuildingPermit.permit_type).contains(kw)
-            for kw in ROOFING_KEYWORDS
-        ]
-    )
+def _keyword_filter(county_id: str):
+    """
+    All counties: keyword match on permit_type.
+    Pinellas only: additionally match Express Building Permits where description
+    contains a roofing keyword. The Express Permit guard prevents false positives
+    from non-roofing permits that happen to have matching description text.
+    """
+    type_filters = [func.lower(BuildingPermit.permit_type).contains(kw) for kw in ROOFING_KEYWORDS]
+
+    if county_id == "pinellas":
+        desc_filters = [func.lower(BuildingPermit.description).contains(kw) for kw in PINELLAS_DESCRIPTION_KEYWORDS]
+        express_desc_match = and_(
+            func.lower(BuildingPermit.permit_type).contains("express"),
+            or_(*desc_filters),
+        )
+        return or_(*type_filters, express_desc_match)
+
+    return or_(*type_filters)
 
 
 def scrape_roofing_permits(
@@ -75,7 +97,7 @@ def scrape_roofing_permits(
                     BuildingPermit.county_id == county_id,
                     BuildingPermit.issue_date >= start_date,
                     BuildingPermit.issue_date <= end_date,
-                    _keyword_filter(),
+                    _keyword_filter(county_id),
                 )
             )
         ).scalars().all()
@@ -144,6 +166,22 @@ if __name__ == "__main__":
     )
     parser = argparse.ArgumentParser(description="Scrape roofing permit incidents")
     parser.add_argument("--county-id", dest="county_id", default="hillsborough", help="County identifier (default: hillsborough)")
+    parser.add_argument("--backfill", action="store_true", help="Classify all permits ever loaded for this county (duplicates are skipped automatically)")
     args = parser.parse_args()
-    n = scrape_roofing_permits(county_id=args.county_id)
+
+    if args.backfill:
+        from src.core.database import get_db_context
+        from sqlalchemy import text
+        with get_db_context() as db:
+            row = db.execute(
+                text("SELECT MIN(issue_date) FROM building_permits WHERE county_id = :cid AND issue_date IS NOT NULL"),
+                {"cid": args.county_id},
+            ).fetchone()
+        earliest = row[0] if row and row[0] else date.today()
+        date_range = (earliest, date.today())
+        logger.info("[backfill] %s: classifying permits from %s to %s", args.county_id, earliest, date.today())
+    else:
+        date_range = None
+
+    n = scrape_roofing_permits(county_id=args.county_id, date_range=date_range)
     print(f"Done — {n} new roofing permit incidents created")

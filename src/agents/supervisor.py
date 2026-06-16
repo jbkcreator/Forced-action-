@@ -69,6 +69,42 @@ def dispatch_event(event: Dict[str, Any]) -> Dict[str, Any]:
 	decision_id = event.get("decision_id") or str(uuid.uuid4())
 	idempotency_key = event.get("idempotency_key") or decision_id
 
+	# Pipeline event routing — enrichment cascade (ADR 0016).
+	# gold_lead_scored has no subscriber_id and no compose_and_send path;
+	# hand it to the EnrichmentBatcher and return before EVENT_TO_GRAPH lookup.
+	if event_type == "gold_lead_scored":
+		try:
+			from src.agents.enrichment_consumer import get_batcher
+			batcher = get_batcher()
+			if batcher is not None:
+				batcher.add(payload)
+			else:
+				logger.warning(
+					"supervisor: EnrichmentBatcher not initialized — gold_lead_scored dropped "
+					"(property_id=%s); nightly batch is backstop",
+					payload.get("property_id"),
+				)
+		except Exception as _batcher_exc:
+			logger.warning("supervisor: enrichment batcher add failed: %s", _batcher_exc)
+		return _outcome("routed", "enrichment_cascade", decision_id, "ok")
+
+	# Pipeline event routing — Lead Pack Hot-Enrichment (ADR 0018).
+	# lead_pack_reserved is a fulfillment trigger, not a Cora messaging graph:
+	# hand it to the fulfillment worker (which fans out onto a daemon thread so
+	# the listener never blocks on the Tracerfy poll) and return. The cron sweep
+	# remains the durability backstop if this event is dropped.
+	if event_type == "lead_pack_reserved":
+		try:
+			from src.tasks.lead_pack_fulfillment_sweep import handle_reserved_event
+			handle_reserved_event(payload)
+		except Exception as _lp_exc:
+			logger.warning(
+				"supervisor: lead_pack_reserved handoff failed (purchase=%s); "
+				"cron sweep is backstop: %s",
+				payload.get("purchase_id"), _lp_exc,
+			)
+		return _outcome("routed", "lead_pack_fulfillment", decision_id, "ok")
+
 	# Global kill switch
 	if settings.agents_global_kill_switch:
 		reason = "global_kill_switch_enabled"

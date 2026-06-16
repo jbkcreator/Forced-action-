@@ -1,24 +1,29 @@
 """
-Skip trace waterfall coordinator.
+Skip trace cascade coordinator (v4).
 
-Tier 1: Tracerfy  ($0.25/hit, $0.00/miss) — active when TRACERFY_API_KEY set
-Tier 2: BatchData ($0.02/lookup always)    — active when BATCH_SKIP_TRACING_API_KEY set
-Tier 3: PDL       ($0.28/hit, $0.00/miss)  — active when PDL_API_KEY set
+Cascade order (cheapest → priciest, ADR 0016):
+  Step 0: Free Sources  (voters + tax_collector — seed-only, ADR 0013)
+  Tier 1: Tracerfy Standard    ($0.02/hit, $0.00/miss)
+  Tier 2: Tracerfy Address-Only($0.04/hit, $0.00/miss) — misses + entity-skips
+  Tier 3: BatchData            ($0.07/lookup always)
+  Tier 4: IDI idiCORE          (key-gated, cost TBD when provisioned)
+  Tier 5: PDL                  ($0.28/hit, $0.00/miss — ADR 0017 terminal fallback)
 
 Stop condition: confidence >= skip_trace_confidence_threshold (default 0.70)
 Cost ceiling:   skip_trace_cost_ceiling_cents per lead (default 80 = $0.80)
 
-Worst case: $0.25 + $0.02 + $0.28 = $0.55 — under the ceiling.
+Worst case today (IDI unkeyed): $0.02 + $0.04 + $0.07 + $0.28 = $0.41 — under ceiling.
 
-Tracerfy is Tier 1 because it charges 0 on a miss (no spend on leads it
-can't find) and returns DNC/litigator flags inline on every hit, giving
-compliance data before any send happens.
+Triangulation runs ONCE at cascade end (not per tier) so all sources are
+seen together for best cross-source corroboration (ADR 0015).
 
 Per-provider hit rate and cost tracked via enrichment_usage_log table.
 """
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
+
+from sqlalchemy import text as sa_text
 
 from config.settings import get_settings
 from src.core.database import get_db_context
@@ -29,7 +34,15 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-_PROVIDER_COST_CENTS = {"tracerfy": 2, "batchdata": 2, "pdl": 28}
+_GOLD_PLUS_TIERS = {"Ultra Platinum", "Platinum", "Gold"}
+
+_PROVIDER_COST_CENTS = {
+    "tracerfy":          2,   # $0.02/hit, $0.00/miss
+    "tracerfy_advanced": 4,   # $0.04/hit, $0.00/miss (Address-Only pass)
+    "batchdata":         7,   # $0.07/lookup (always charged)
+    "idi":               0,   # placeholder — update when contracted rate is known
+    "pdl":               28,  # $0.28/hit, $0.00/miss
+}
 
 
 @dataclass
@@ -135,6 +148,21 @@ def _stamp_confidence(session, property_id: int, source: str, confidence: float)
         session.flush()
 
 
+# ─── Triangulation inline hook ───────────────────────────────────────────────
+
+def _triangulate_owner(session, owner_id: int) -> None:
+    """Recompute triangulation for a single owner after a successful skip-trace write."""
+    settings = get_settings()
+    if not settings.triangulation_enabled:
+        return
+    try:
+        from src.services.contact_triangulation import TriangulationService
+        TriangulationService(session).run_for_owner(owner_id)
+    except Exception:
+        logger.warning("[Waterfall] triangulation recompute failed for owner_id=%d", owner_id,
+                       exc_info=True)
+
+
 # ─── PDL persistence ─────────────────────────────────────────────────────────
 
 def _persist_pdl(session, owner: Owner, result) -> None:
@@ -168,7 +196,316 @@ def _persist_pdl(session, owner: Owner, result) -> None:
     session.flush()
 
 
-# ─── Main entry point ────────────────────────────────────────────────────────
+# ─── Shared cascade function ─────────────────────────────────────────────────
+
+def run_cascade(
+    county_id: str = "hillsborough",
+    limit: int = 200,
+    owner_ids: Optional[list] = None,
+    today_only: bool = True,
+) -> "WaterfallStats":
+    """
+    Run the full enrichment cascade for a set of owners (ADR 0016).
+
+    Cascade: Step 0 (free) → Tracerfy Standard → Tracerfy Address-Only →
+             BatchData → IDI (key-gated) → PDL. Hard per-lead cost ceiling.
+
+    owner_ids=None: selects candidates via _select_candidates (nightly batch mode).
+    owner_ids=[...]: processes the given owners directly (event-driven mode).
+
+    Triangulation runs ONCE at cascade end — not per tier (ADR 0015).
+    """
+    from src.services.tracerfy_fallback import run_tracerfy_fallback
+    from src.services.skip_trace import run_skip_trace
+    from src.services.pdl_skip_trace import run_pdl_lookup
+    from src.services.idi_fallback import run_idi_fallback
+
+    settings  = get_settings()
+    ceiling   = settings.skip_trace_cost_ceiling_cents
+    threshold = settings.skip_trace_confidence_threshold
+    stats     = WaterfallStats()
+    for p in ("tracerfy", "tracerfy_advanced", "batchdata", "idi", "pdl"):
+        stats.per_provider[p] = {"attempts": 0, "hits": 0, "cost_cents": 0}
+
+    # ── Candidate selection ───────────────────────────────────────────────────
+    with get_db_context() as session:
+        if owner_ids is not None:
+            candidates = (
+                session.query(Owner)
+                .filter(Owner.id.in_(owner_ids))
+                .all()
+            )
+        else:
+            candidates = _select_candidates(session, county_id, limit, today_only)
+
+    if not candidates:
+        logger.info("[Cascade] No candidates for %s", county_id)
+        return stats
+
+    stats.total_leads = len(candidates)
+    all_owner_ids     = [o.id for o in candidates]
+    logger.info("[Cascade] %d candidates in %s", len(candidates), county_id)
+
+    # ── Step 0: Free Sources ──────────────────────────────────────────────────
+    # Voters are already loaded in the voters table (triangulation reads them).
+    # Tax-collector mailing addresses are in enriched_contacts(source='tax_collector')
+    # from prior tax uploads — nothing to fetch here.
+    # These free sources feed triangulation at cascade end (ADR 0013).
+    logger.debug("[Cascade] Step 0: free sources (voters + tax_collector) → triangulation seed")
+
+    # Per-owner accounting
+    spent_cents: dict[int, int] = {oid: 0 for oid in all_owner_ids}
+    resolved_ids: set[int]      = set()   # confirmed contact, stop cascading
+    hit_owner_ids: set[int]     = set()   # any tier hit (for end triangulation)
+
+    # ── Stage 1: Tracerfy Standard ($0.02/hit) ────────────────────────────────
+    entity_skip_ids: list[int] = []
+
+    if settings.tracerfy_api_key:
+        tracerfy_stats = run_tracerfy_fallback(
+            owner_ids=all_owner_ids,
+            county_id=county_id,
+            trace_type="normal",
+        )
+        entity_skip_ids = tracerfy_stats.get("entity_skip_ids") or []
+
+        with get_db_context() as session:
+            for owner in list(candidates):
+                owner = session.get(Owner, owner.id)
+                if not owner:
+                    continue
+                ec         = _read_ec(session, owner.property_id, "tracerfy")
+                confidence = _confidence_from_ec(owner, ec)
+                cost = _PROVIDER_COST_CENTS["tracerfy"] if (ec and ec.match_success) else 0
+
+                spent_cents[owner.id] += cost
+                stats.total_cost_cents += cost
+                stats.per_provider["tracerfy"]["attempts"] += 1
+                stats.per_provider["tracerfy"]["cost_cents"] += cost
+
+                if ec and ec.match_success and confidence >= threshold:
+                    _stamp_confidence(session, owner.property_id, "tracerfy", confidence)
+                    resolved_ids.add(owner.id)
+                    hit_owner_ids.add(owner.id)
+                    stats.hits += 1
+                    stats.per_provider["tracerfy"]["hits"] += 1
+            session.commit()
+    else:
+        logger.warning("[Cascade] TRACERFY_API_KEY not set — Stage 1 skipped")
+
+    # ── Stage 2: Tracerfy Address-Only ($0.04/hit) ────────────────────────────
+    # Targets: Standard misses + entity-skips (ADR 0016).
+    # Entity-skips → INSERT new EC row; Standard misses → UPDATE existing miss row.
+    with get_db_context() as session:
+        miss_owner_ids: list[int] = [
+            r[0] for r in session.execute(sa_text("""
+                SELECT DISTINCT o.id
+                FROM enriched_contacts ec
+                JOIN owners o ON o.property_id = ec.property_id
+                WHERE ec.source = 'tracerfy'
+                  AND ec.match_success = FALSE
+                  AND o.id = ANY(:oids)
+            """), {"oids": all_owner_ids}).fetchall()
+        ]
+
+    ao_entity_ids = [oid for oid in entity_skip_ids if oid not in resolved_ids]
+    ao_miss_ids   = [oid for oid in miss_owner_ids  if oid not in resolved_ids]
+    ao_candidates = ao_entity_ids + ao_miss_ids
+
+    if ao_candidates and settings.tracerfy_api_key:
+        # Entity-skips: no prior tracerfy row → standard insert path with advanced trace
+        if ao_entity_ids:
+            run_tracerfy_fallback(
+                owner_ids=ao_entity_ids,
+                county_id=county_id,
+                trace_type="advanced",
+            )
+        # Standard misses: update existing miss row on hit
+        if ao_miss_ids:
+            run_tracerfy_fallback(
+                owner_ids=ao_miss_ids,
+                county_id=county_id,
+                trace_type="advanced",
+                retrace_misses=True,
+            )
+
+        with get_db_context() as session:
+            for owner_id in ao_candidates:
+                owner = session.get(Owner, owner_id)
+                if not owner:
+                    continue
+                ec         = _read_ec(session, owner.property_id, "tracerfy")
+                confidence = _confidence_from_ec(owner, ec)
+                # Advanced hit only if the EC row now has match_success=True
+                cost = _PROVIDER_COST_CENTS["tracerfy_advanced"] if (ec and ec.match_success) else 0
+
+                spent_cents[owner_id] = spent_cents.get(owner_id, 0) + cost
+                stats.total_cost_cents += cost
+                stats.per_provider["tracerfy_advanced"]["attempts"] += 1
+                stats.per_provider["tracerfy_advanced"]["cost_cents"] += cost
+
+                if ec and ec.match_success and confidence >= threshold:
+                    _stamp_confidence(session, owner.property_id, "tracerfy", confidence)
+                    resolved_ids.add(owner_id)
+                    hit_owner_ids.add(owner_id)
+                    stats.hits += 1
+                    stats.per_provider["tracerfy_advanced"]["hits"] += 1
+            session.commit()
+
+    # ── Stage 3: BatchData ($0.07/lookup) ─────────────────────────────────────
+    tier3_ids = [
+        oid for oid in all_owner_ids
+        if oid not in resolved_ids
+        and spent_cents.get(oid, 0) + _PROVIDER_COST_CENTS["batchdata"] <= ceiling
+    ]
+
+    if tier3_ids and settings.batch_skip_tracing_api_key:
+        run_skip_trace(owner_ids=tier3_ids, county_id=county_id, today_only=False)
+
+        with get_db_context() as session:
+            for owner_id in tier3_ids:
+                owner = session.get(Owner, owner_id)
+                if not owner:
+                    continue
+                ec         = _read_ec(session, owner.property_id, "batch_skip_tracing")
+                confidence = _confidence_from_ec(owner, ec)
+                cost       = _PROVIDER_COST_CENTS["batchdata"]
+
+                spent_cents[owner_id] = spent_cents.get(owner_id, 0) + cost
+                log_usage(session, vendor="batchdata", purpose="skip_trace",
+                          success=bool(ec and ec.match_success),
+                          cost_cents=cost, property_id=owner.property_id)
+
+                stats.total_cost_cents += cost
+                stats.per_provider["batchdata"]["attempts"] += 1
+                stats.per_provider["batchdata"]["cost_cents"] += cost
+
+                if ec and ec.match_success and confidence >= threshold:
+                    _stamp_confidence(session, owner.property_id, "batch_skip_tracing", confidence)
+                    resolved_ids.add(owner_id)
+                    hit_owner_ids.add(owner_id)
+                    stats.hits += 1
+                    stats.per_provider["batchdata"]["hits"] += 1
+            session.commit()
+    elif tier3_ids:
+        logger.warning("[Cascade] BATCH_SKIP_TRACING_API_KEY not set — Stage 3 skipped")
+
+    # ── Stage 4: IDI idiCORE (key-gated, ADR 0017) ───────────────────────────
+    # IDI cost entry in _PROVIDER_COST_CENTS is 0 until contracted rate is known.
+    # The key guard in run_idi_fallback makes this a safe no-op when unkeyed.
+    tier4_ids = [
+        oid for oid in all_owner_ids
+        if oid not in resolved_ids
+        and spent_cents.get(oid, 0) + _PROVIDER_COST_CENTS["idi"] <= ceiling
+    ]
+
+    if tier4_ids:
+        idi_result = run_idi_fallback(owner_ids=tier4_ids, county_id=county_id)
+        if not idi_result.get("skipped"):
+            with get_db_context() as session:
+                for owner_id in tier4_ids:
+                    owner = session.get(Owner, owner_id)
+                    if not owner:
+                        continue
+                    ec         = _read_ec(session, owner.property_id, "idi")
+                    confidence = _confidence_from_ec(owner, ec)
+                    cost       = _PROVIDER_COST_CENTS["idi"]
+
+                    spent_cents[owner_id] = spent_cents.get(owner_id, 0) + cost
+                    stats.total_cost_cents += cost
+                    stats.per_provider["idi"]["attempts"] += 1
+                    stats.per_provider["idi"]["cost_cents"] += cost
+
+                    if ec and ec.match_success and confidence >= threshold:
+                        _stamp_confidence(session, owner.property_id, "idi", confidence)
+                        resolved_ids.add(owner_id)
+                        hit_owner_ids.add(owner_id)
+                        stats.hits += 1
+                        stats.per_provider["idi"]["hits"] += 1
+                session.commit()
+
+    # ── Stage 5: PDL (terminal fallback, ADR 0017) ───────────────────────────
+    tier5_ids = [
+        oid for oid in all_owner_ids
+        if oid not in resolved_ids
+        and spent_cents.get(oid, 0) + _PROVIDER_COST_CENTS["pdl"] <= ceiling
+    ]
+
+    if tier5_ids:
+        if not settings.pdl_api_key:
+            logger.warning("[Cascade] PDL_API_KEY not set — Stage 5 skipped, %d leads unresolved",
+                           len(tier5_ids))
+            stats.misses += len(tier5_ids)
+        else:
+            with get_db_context() as session:
+                for owner_id in tier5_ids:
+                    owner = session.get(Owner, owner_id)
+                    if not owner:
+                        continue
+                    prop = owner.property
+                    if not prop:
+                        stats.misses += 1
+                        continue
+
+                    first, *rest = (owner.owner_name or "").split(" ", 1)
+                    result = run_pdl_lookup(
+                        first_name=first,
+                        last_name=rest[0] if rest else "",
+                        street=prop.address or "",
+                        city=prop.city or "",
+                        state=prop.state or "FL",
+                        zip_code=prop.zip or "",
+                    )
+
+                    cost = result.cost_cents
+                    log_usage(session, vendor="pdl", purpose="skip_trace",
+                              success=result.success,
+                              cost_cents=cost, property_id=owner.property_id,
+                              error=result.error)
+
+                    spent_cents[owner_id] = spent_cents.get(owner_id, 0) + cost
+                    stats.total_cost_cents += cost
+                    stats.per_provider["pdl"]["attempts"] += 1
+                    stats.per_provider["pdl"]["cost_cents"] += cost
+
+                    if result.success and result.confidence >= threshold:
+                        _persist_pdl(session, owner, result)
+                        resolved_ids.add(owner_id)
+                        hit_owner_ids.add(owner_id)
+                        stats.hits += 1
+                        stats.per_provider["pdl"]["hits"] += 1
+                    else:
+                        stats.misses += 1
+                        try:
+                            from src.services.direct_mail import flag_direct_mail_eligible
+                            flag_direct_mail_eligible(owner.property_id, session)
+                        except Exception as _dm_err:
+                            logger.warning(
+                                "[Cascade] direct_mail flag failed for property_id=%d: %s",
+                                owner.property_id, _dm_err,
+                            )
+                session.commit()
+
+    # ── Triangulation — once at cascade end per hit owner (ADR 0015) ──────────
+    # Called AFTER all stages so every source is visible for cross-source
+    # corroboration. Closes the gap where IDI/Address-Only hits previously
+    # waited for the nightly sweep to get confidence labels.
+    if hit_owner_ids:
+        with get_db_context() as session:
+            for owner_id in hit_owner_ids:
+                _triangulate_owner(session, owner_id)
+            session.commit()
+
+    stats.misses = stats.total_leads - stats.hits
+
+    logger.info(
+        "[Cascade] DONE leads=%d hits=%d misses=%d cost_cents=%d",
+        stats.total_leads, stats.hits, stats.misses, stats.total_cost_cents,
+    )
+    return stats
+
+
+# ─── Legacy entry point ───────────────────────────────────────────────────────
 
 def run_waterfall(
     county_id: str = "hillsborough",
@@ -246,6 +583,7 @@ def run_waterfall(
 
                 if ec and ec.match_success and confidence >= threshold:
                     _stamp_confidence(session, owner.property_id, "tracerfy", confidence)
+                    _triangulate_owner(session, owner.id)
                     stats.hits += 1
                     stats.per_provider["tracerfy"]["hits"] += 1
                 else:
@@ -284,6 +622,7 @@ def run_waterfall(
 
                     if ec and ec.match_success and confidence >= threshold:
                         _stamp_confidence(session, owner.property_id, "batch_skip_tracing", confidence)
+                        _triangulate_owner(session, owner.id)
                         stats.hits += 1
                         stats.per_provider["batchdata"]["hits"] += 1
                     else:
@@ -333,10 +672,20 @@ def run_waterfall(
 
                     if result.success and result.confidence >= threshold:
                         _persist_pdl(session, owner, result)
+                        _triangulate_owner(session, owner.id)
                         stats.hits += 1
                         stats.per_provider["pdl"]["hits"] += 1
                     else:
                         stats.misses += 1
+                        # Final miss — flag for direct mail if a mailing address exists
+                        try:
+                            from src.services.direct_mail import flag_direct_mail_eligible
+                            flag_direct_mail_eligible(owner.property_id, session)
+                        except Exception as _dm_err:
+                            logger.warning(
+                                "[Waterfall] direct_mail flag failed for property_id=%d: %s",
+                                owner.property_id, _dm_err,
+                            )
 
                 session.commit()
 

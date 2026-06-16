@@ -7,6 +7,12 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional
 
+from config.triangulation import (
+    STRONG_AGE_DECAY_FACTOR,
+    STRONG_BASE_BOOST,
+    WEAK_BASE_BOOST,
+    WEAK_CAP_LABEL,
+)
 
 CONFIDENCE_HIGH = "high"
 CONFIDENCE_MEDIUM = "medium"
@@ -73,12 +79,21 @@ def compute_contact_freshness(
     *,
     now: Optional[datetime] = None,
     last_sms_failed_at: Optional[datetime] = None,
+    corroboration: Optional[str] = None,
 ) -> ContactFreshness:
     """
     Convert contact age, provider confidence, and phone metadata into a label.
 
     The labels are conservative because stale contact data creates wasted SMS
     sends and poor lead-sale experiences.
+
+    corroboration (ADR 0015): cross-source triangulation verdict from
+    contact_triangulation.compute_corroboration. "strong" boosts the base
+    score and relaxes age decay (a number independent sources keep confirming
+    decays slower); "weak" boosts slightly but caps the label at
+    WEAK_CAP_LABEL. None/"none" leaves behavior byte-identical to pre-ADR-0015.
+    Hard overrides (missing phone, invalid verification, recent SMS failure)
+    always win — corroboration never resurrects a bounced number.
     """
     now = _aware(now) or _utcnow()
     latest_at = _aware(getattr(latest_contact, "enriched_at", None))
@@ -134,26 +149,38 @@ def compute_contact_freshness(
     elif line_type == "unknown":
         base -= 0.05
 
-    if age_days > 270:
+    if corroboration == "strong":
+        base += STRONG_BASE_BOOST
+    elif corroboration == "weak":
+        base += WEAK_BASE_BOOST
+
+    # Strong corroboration slows the clock: both the score penalty and the
+    # label ladder see the discounted age, so a voter-confirmed number takes
+    # twice as long to decay through medium -> low -> stale.
+    eff_age_days = (
+        age_days * STRONG_AGE_DECAY_FACTOR if corroboration == "strong" else age_days
+    )
+
+    if eff_age_days > 270:
         age_penalty = 0.60
-    elif age_days > 180:
+    elif eff_age_days > 180:
         age_penalty = 0.35
-    elif age_days > 90:
+    elif eff_age_days > 90:
         age_penalty = 0.15
     else:
         age_penalty = 0.0
 
     score = round(max(0.0, min(1.0, base - age_penalty)), 3)
 
-    if age_days > 270 or score < 0.40:
+    if eff_age_days > 270 or score < 0.40:
         level = CONFIDENCE_STALE
         refresh_after = now
         status = "due"
-    elif age_days > 180 or score < 0.60:
+    elif eff_age_days > 180 or score < 0.60:
         level = CONFIDENCE_LOW
         refresh_after = now
         status = "due"
-    elif age_days > 90 or score < 0.80:
+    elif eff_age_days > 90 or score < 0.80:
         level = CONFIDENCE_MEDIUM
         refresh_after = (latest_at or now) + timedelta(days=180)
         status = "fresh"
@@ -161,6 +188,11 @@ def compute_contact_freshness(
         level = CONFIDENCE_HIGH
         refresh_after = (latest_at or now) + timedelta(days=180)
         status = "fresh"
+
+    # Weak corroboration (phone matched but name didn't, historical voter
+    # phone, inactive voter) never mints the top label.
+    if corroboration == "weak" and level == CONFIDENCE_HIGH:
+        level = WEAK_CAP_LABEL
 
     return ContactFreshness(
         level=level,

@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import stripe
-from sqlalchemy import and_, desc, select
+from sqlalchemy import and_, desc, select, text
 from sqlalchemy.orm import Session
 
 from config.revenue_ladder import BUNDLES
@@ -81,16 +81,45 @@ def deliver(bundle_purchase_id: int, db: Session) -> BundlePurchase:
 
     now = datetime.now(timezone.utc)
     bundle_config = BUNDLES.get(purchase.bundle_type, {})
+    has_leads = purchase.bundle_type in ("storm", "zip_booster", "weekend")
 
-    if purchase.bundle_type in ("storm", "zip_booster"):
-        leads_count = bundle_config.get("leads", 10)
+    if has_leads:
+        from src.services.lead_exclusivity import (
+            acquire_zip_lock,
+            record_exclusivity,
+        )
+        # Acquire lock BEFORE selecting leads — prevents TOCTOU race when two
+        # concurrent deliveries try to select+lock the same ZIP+county.
+        acquire_zip_lock(db, purchase.zip_code, purchase.county_id)
+
+        leads_count = bundle_config.get("leads", 5 if purchase.bundle_type == "weekend" else 10)
         leads = _select_top_leads(
             purchase.zip_code, purchase.vertical, purchase.county_id, db,
-            limit=leads_count, exclude_held=True,
+            limit=leads_count, exclude_exclusivity=True,
         )
         purchase.lead_ids = [p.id for p in leads]
-        duration_hours = bundle_config.get("duration_hours", 72)
-        purchase.expires_at = now + timedelta(hours=duration_hours)
+
+        if purchase.bundle_type in ("storm", "zip_booster"):
+            duration_hours = bundle_config.get("duration_hours", 72)
+            purchase.expires_at = now + timedelta(hours=duration_hours)
+        elif purchase.bundle_type == "weekend":
+            days_until_sunday = (6 - now.weekday()) % 7 or 7
+            purchase.expires_at = now + timedelta(days=days_until_sunday)
+
+        purchase.status = "active"
+        db.flush()
+
+        if purchase.lead_ids and purchase.expires_at:
+            record_exclusivity(
+                db=db,
+                property_ids=purchase.lead_ids,
+                zip_code=purchase.zip_code,
+                county_id=purchase.county_id,
+                trade=purchase.vertical,
+                source="bundle",
+                source_id=purchase.id,
+                exclusive_until=purchase.expires_at,
+            )
     elif purchase.bundle_type == "monthly_reload":
         credits = bundle_config.get("credits", 30)
         from src.services.wallet_engine import credit
@@ -103,28 +132,8 @@ def deliver(bundle_purchase_id: int, db: Session) -> BundlePurchase:
         )
         purchase.credits_awarded = credits
         purchase.expires_at = now + timedelta(days=30)
-    elif purchase.bundle_type == "weekend":
-        leads_count = bundle_config.get("leads", 5)
-        leads = _select_top_leads(
-            purchase.zip_code, purchase.vertical, purchase.county_id, db,
-            limit=leads_count, exclude_held=True,
-        )
-        purchase.lead_ids = [p.id for p in leads]
-        # Weekend bundle expires Sunday midnight
-        days_until_sunday = (6 - now.weekday()) % 7 or 7
-        purchase.expires_at = now + timedelta(days=days_until_sunday)
-
-    purchase.status = "active"
-    db.flush()
-
-    # Globally exclusive: lock the delivered leads in Redis until expiry so they
-    # do not surface in any other subscriber's locked-ZIP feed or another bundle
-    # purchase. Skipped gracefully when Redis unavailable.
-    if purchase.lead_ids and purchase.expires_at:
-        from src.services.lead_hold import hold as _hold
-        ttl = max(1, int((purchase.expires_at - now).total_seconds()))
-        for lid in purchase.lead_ids:
-            _hold(lid, purchase.subscriber_id, ttl_seconds=ttl)
+        purchase.status = "active"
+        db.flush()
 
     logger.info("Bundle delivered: purchase=%d type=%s leads=%s", purchase.id, purchase.bundle_type, purchase.lead_ids)
     return purchase
@@ -152,13 +161,13 @@ def _select_top_leads(
     county_id: str,
     db: Session,
     limit: int = 10,
-    exclude_held: bool = False,
+    exclude_exclusivity: bool = False,
 ) -> list:
     """Select top qualified properties for a ZIP×vertical, ordered by vertical score.
 
-    When exclude_held=True, properties currently held in Redis (lead_hold:* keys)
-    are filtered out so the same lead is never sold to two bundles. Falls back
-    to no filtering when Redis is unavailable.
+    When exclude_exclusivity=True, properties currently under active exclusivity
+    in the database (lead_exclusivity table) are filtered out. This replaces the
+    Redis-based lead_hold filtering.
     """
     if not zip_code or not vertical:
         return []
@@ -168,9 +177,9 @@ def _select_top_leads(
         return []
 
     excluded: set = set()
-    if exclude_held:
-        from src.services.lead_hold import get_all_held_lead_ids
-        excluded = get_all_held_lead_ids()
+    if exclude_exclusivity:
+        from src.services.lead_exclusivity import get_exclusive_property_ids
+        excluded = get_exclusive_property_ids(db, county_id, datetime.now(timezone.utc), zip_code=zip_code)
 
     q = (
         select(Property)
@@ -179,7 +188,7 @@ def _select_top_leads(
             and_(
                 Property.zip == zip_code,
                 Property.county_id == county_id,
-                DistressScore.qualified == True,  # noqa: E712
+                DistressScore.qualified == True,
             )
         )
     )

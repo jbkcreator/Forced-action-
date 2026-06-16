@@ -199,3 +199,25 @@ def is_zip_in_county(county_id: str, zip_code: str) -> bool:
         return False
     prefixes = get_county(county_id).get("zip_prefixes") or []
     return zip_code[:3] in prefixes
+
+
+def is_county_launched(county_id: str, db) -> bool:
+    """
+    True if a county is live for selling. Launch status is DERIVED, not stored
+    on `counties` (see ADR 0002):
+
+      - the source county (settings.county_launch_source_county) is launched
+        by definition — it predates the expansion machinery and has no
+        expansion_candidates row, or
+      - an expansion_candidates row exists with status='launched'.
+    """
+    from sqlalchemy import text
+    from config.settings import get_settings
+
+    if county_id == get_settings().county_launch_source_county:
+        return True
+    row = db.execute(
+        text("SELECT 1 FROM expansion_candidates WHERE county_id = :c AND status = 'launched'"),
+        {"c": county_id},
+    ).first()
+    return row is not None

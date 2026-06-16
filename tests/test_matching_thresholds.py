@@ -160,10 +160,24 @@ class TestClassifyMatch:
         """Cross-county sanity — 70% on Hillsborough stays unmatched."""
         assert hills_loader._classify_match(70, "owner_name") == "unmatched"
 
-    def test_pinellas_auto_match_unchanged(self, pinellas_loader):
-        """auto_match=0.92 was NOT loosened — never auto-write weak matches."""
-        assert pinellas_loader._classify_match(91, "owner_name") == "pending_review"
-        assert pinellas_loader._classify_match(92, "owner_name") == "matched"
+    def test_pinellas_owner_name_auto_match_lowered_to_75(self, pinellas_loader):
+        """Stopgap (2026-06-11): owner-name auto-match lowered to 0.75 for Pinellas
+        because LLM verification is disabled and owner-name is the only match path
+        for probate/divorce. Address/legal-desc auto-match stays strict at 0.92."""
+        # Owner-name methods auto-match at >= 75
+        assert pinellas_loader._classify_match(75, "owner_name") == "matched"
+        assert pinellas_loader._classify_match(91, "owner_name") == "matched"
+        assert pinellas_loader._classify_match(74, "owner_name") == "pending_review"
+        assert pinellas_loader._classify_match(75, "owner_name_zip") == "matched"
+        assert pinellas_loader._classify_match(75, "owner_name_city") == "matched"
+        # 65–75 owner-name band is still pending_review (Cora triage)
+        assert pinellas_loader._classify_match(70, "owner_name") == "pending_review"
+
+    def test_pinellas_address_auto_match_unchanged(self, pinellas_loader):
+        """Non-owner-name methods are NOT loosened — auto_match stays 0.92."""
+        assert pinellas_loader._classify_match(91, "address") == "pending_review"
+        assert pinellas_loader._classify_match(91, "legal_desc") == "pending_review"
+        assert pinellas_loader._classify_match(92, "address") == "matched"
 
     # ── LLM-verified override ──────────────────────────────────────────────
 

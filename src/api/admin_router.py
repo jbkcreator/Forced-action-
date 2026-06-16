@@ -22,7 +22,7 @@ from typing import Optional, Literal
 
 import pandas as pd
 import stripe
-from fastapi import APIRouter, Depends, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Query, UploadFile
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, Field, model_validator
@@ -49,6 +49,7 @@ from src.core.models import (
     Subscriber,
 )
 from src.loaders.tax import TaxDelinquencyLoader
+from src.loaders.voter_registry import VoterRegistryLoader
 from src.utils.county_config import invalidate_cache
 
 logger = logging.getLogger(__name__)
@@ -130,9 +131,27 @@ def admin_login(body: LoginRequest):
     return TokenResponse(access_token=token)
 
 
+def _run_tax_enrichment(county_id: str, df: "pd.DataFrame") -> None:
+    """Run tax-collector absentee/contact enrichment + rescore off the request.
+
+    Opens its own DB session (the request session is closed once the HTTP
+    response is sent). Scheduled via BackgroundTasks so a 16k-property rescore
+    never blocks the upload response past nginx's proxy timeout.
+    """
+    from src.core.database import get_db_context
+    from src.services.tax_collector_enrichment import TaxCollectorEnrichment
+    try:
+        with get_db_context() as session:
+            result = TaxCollectorEnrichment(session, county_id=county_id).process_upload(df)
+        logger.info("[Admin] Tax enrichment (background) complete: %s", result)
+    except Exception:
+        logger.exception("[Admin] Tax enrichment (background) failed for county=%s", county_id)
+
+
 @router.post("/upload/tax-delinquency")
 def upload_tax_delinquency(
     file: UploadFile,
+    background_tasks: BackgroundTasks,
     county_id: str = Form("hillsborough"),
     tax_year: Optional[int] = Form(None),
     _admin: dict = Depends(get_current_admin),
@@ -215,11 +234,21 @@ def upload_tax_delinquency(
         total_rows, county_id, tax_year, _admin.get("sub"),
     )
 
+    # Bulk admin uploads are parcel-keyed county files — match on parcel/account
+    # only and skip the per-row address/owner+LLM cascade (it dominates runtime
+    # at 28k+ rows). Unmatched rows go to unmatched_records for later re-match.
     loader = TaxDelinquencyLoader(db, county_id=county_id)
-    matched, updated, unmatched = loader.load_from_dataframe(df)
+    matched, updated, unmatched = loader.load_from_dataframe(df, parcel_only=True)
+    db.commit()
+
+    # Phase 5: absentee + billing-contact enrichment (and the CDS rescore it
+    # triggers) runs in the BACKGROUND. On a full county file it touches ~16k
+    # properties and would otherwise push the request past nginx's proxy
+    # timeout (→ a 504 in the browser even though the load succeeded).
+    background_tasks.add_task(_run_tax_enrichment, county_id, df)
 
     logger.info(
-        "[Admin] Upload complete: inserted=%d updated=%d unmatched=%d",
+        "[Admin] Upload complete: inserted=%d updated=%d unmatched=%d (enrichment queued)",
         matched, updated, unmatched,
     )
     return {
@@ -227,6 +256,106 @@ def upload_tax_delinquency(
         "updated": updated,
         "unmatched": unmatched,
         "total_rows": total_rows,
+        "enrichment": "processing_in_background",
+    }
+
+
+def _select_voter_data_bytes(raw_bytes: bytes, fname: str) -> bytes:
+    """Return the raw voter-file bytes, extracting from a .zip if needed.
+
+    SOE zips can carry several files (e.g. Pinellas ships ReportCodes.txt +
+    FieldDescriptions.pdf alongside the real ActiveVoterData.txt); pick the
+    LARGEST .txt/.csv entry, which is always the voter table.
+    """
+    import io as _io
+    import zipfile
+
+    if not fname.endswith(".zip"):
+        return raw_bytes
+    try:
+        with zipfile.ZipFile(_io.BytesIO(raw_bytes)) as zf:
+            data_entries = [
+                i for i in zf.infolist()
+                if i.filename.lower().endswith((".txt", ".csv"))
+            ]
+            if not data_entries:
+                raise HTTPException(status_code=400, detail="Zip contains no .txt/.csv files")
+            target = max(data_entries, key=lambda i: i.file_size)
+            return zf.read(target.filename)
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="Invalid zip archive")
+
+
+def _run_voter_bulk_load(county_id: str, raw_bytes: bytes, filename: str) -> None:
+    """Background: bulk-load a voter file (set-based path, its own DB sessions).
+
+    Decodes the (already zip-extracted) bytes and streams them through
+    bulk_load_voters_csv — full-county files (~hundreds of k rows) load in a
+    few minutes without blocking the HTTP response (which would otherwise hit
+    nginx's proxy timeout → 504).
+    """
+    import io as _io
+
+    from src.loaders.voter_registry import bulk_load_voters_csv
+    try:
+        content = raw_bytes.decode("utf-8", errors="replace")
+        rows, upserted, unmatched = bulk_load_voters_csv(
+            _io.StringIO(content), county_id=county_id,
+        )
+        logger.info(
+            "[Admin] Voter bulk load (background) complete county=%s file=%s: "
+            "rows=%d matched=%d unmatched=%d",
+            county_id, filename, rows, upserted, unmatched,
+        )
+    except Exception:
+        logger.exception(
+            "[Admin] Voter bulk load (background) failed county=%s file=%s",
+            county_id, filename,
+        )
+
+
+@router.post("/upload/voter-registry")
+def upload_voter_registry(
+    file: UploadFile,
+    background_tasks: BackgroundTasks,
+    county_id: str = Form("hillsborough"),
+    _admin: dict = Depends(get_current_admin),
+):
+    """
+    Upload a Supervisor of Elections voter file (.csv, .txt, or .zip).
+
+    Accepts the FlexRep SOE export (quoted CSV with header, used by both
+    Hillsborough and Pinellas). Large county files (~hundreds of MB / k of rows)
+    are loaded via the set-based bulk path in a BACKGROUND task, so the request
+    returns immediately instead of blocking past nginx's timeout. Voters are
+    matched to properties by residential address; contacts are isolated from
+    auto-send paths per ADR 0013.
+
+    Returns 202-style {status: "processing"} — the load finishes server-side;
+    verify with: SELECT COUNT(*) FROM voters WHERE county_id = '<county>'.
+    """
+    fname = (file.filename or "").lower()
+    if not any(fname.endswith(ext) for ext in (".csv", ".txt", ".zip")):
+        raise HTTPException(status_code=400, detail="File must be .csv, .txt, or .zip")
+
+    raw_bytes = file.file.read()
+    data_bytes = _select_voter_data_bytes(raw_bytes, fname)
+
+    logger.info(
+        "[Admin] Voter registry upload received: file=%s (%d MB) county=%s user=%s — queued",
+        file.filename, len(data_bytes) // (1024 * 1024), county_id, _admin.get("sub"),
+    )
+    background_tasks.add_task(_run_voter_bulk_load, county_id, data_bytes, file.filename or fname)
+
+    return {
+        "status": "processing",
+        "county_id": county_id,
+        "filename": file.filename,
+        "message": (
+            "Upload received. Voter file is loading in the background "
+            f"(county={county_id}). This typically takes 1-4 minutes for a full "
+            "county file; refresh contact stats shortly to see results."
+        ),
     }
 
 
@@ -345,6 +474,20 @@ _HAS_CONTACT = or_(
     Owner.email_2.isnot(None),
 )
 
+# fa079 / item 9.2 — single uniform enrichment definition used across all
+# dashboards: a Gold+ lead is "enriched" only when BOTH a phone AND an email
+# are present. (The OR-based _HAS_CONTACT above stays for the dark-pool view.)
+_HAS_PHONE = or_(
+    Owner.phone_1.isnot(None),
+    Owner.phone_2.isnot(None),
+    Owner.phone_3.isnot(None),
+)
+_HAS_EMAIL = or_(
+    Owner.email_1.isnot(None),
+    Owner.email_2.isnot(None),
+)
+_FULLY_ENRICHED = and_(_HAS_PHONE, _HAS_EMAIL)
+
 
 @router.get("/stats/contact-coverage")
 def contact_coverage_stats(
@@ -396,8 +539,40 @@ def contact_coverage_stats(
     total_contactless = sum(r.contactless for r in zip_rows)
     total_with_contact = sum(r.with_contact for r in zip_rows)
 
+    # Uniform enrichment metric (phone AND email), broken down by tier.
+    enriched_col = case((_FULLY_ENRICHED, 1), else_=0).label("enriched")
+    tier_rows = db.execute(
+        select(
+            latest_sq.c.lead_tier.label("tier"),
+            func.count().label("total"),
+            func.sum(enriched_col).label("enriched"),
+        )
+        .select_from(Property)
+        .join(latest_sq, latest_sq.c.property_id == Property.id)
+        .outerjoin(Owner, Owner.property_id == Property.id)
+        .group_by(latest_sq.c.lead_tier)
+    ).all()
+
+    total_enriched = sum(r.enriched for r in tier_rows)
+
     return {
         "county_id": county_id,
+        # Uniform enrichment definition: phone AND email on a Gold+ lead.
+        "enrichment": {
+            "definition": "phone_and_email",
+            "total_gold_plus": total_qualified,
+            "enriched": total_enriched,
+            "enriched_pct": round(100 * total_enriched / total_qualified, 1) if total_qualified else 0,
+            "by_tier": {
+                r.tier: {
+                    "total": r.total,
+                    "enriched": int(r.enriched or 0),
+                    "enriched_pct": round(100 * (r.enriched or 0) / r.total, 1) if r.total else 0,
+                }
+                for r in tier_rows
+            },
+        },
+        # Dark-pool view (any contact present) — kept for skip-trace targeting.
         "summary": {
             "total_gold_plus": total_qualified,
             "with_contact": total_with_contact,

@@ -875,6 +875,7 @@ def get_leads(
         "limit": limit,
         "total": total,
         "leads": [dict(r._mapping) for r in rows],
+        "sandbox_mode": get_settings().stripe_test_mode,
     }
 
 
@@ -906,7 +907,9 @@ def get_lead_detail(
     ).fetchone()
     if not row:
         raise HTTPException(404, "Lead not found")
-    return dict(row._mapping)
+    result = dict(row._mapping)
+    result["sandbox_mode"] = get_settings().stripe_test_mode
+    return result
 
 
 @router.get("/data/stats")
@@ -932,7 +935,10 @@ def get_stats(client=Depends(_get_data_client), db: Session = Depends(get_db)):
         """),
         params,
     ).fetchall()
-    return [dict(r._mapping) for r in rows]
+    return {
+        "stats": [dict(r._mapping) for r in rows],
+        "sandbox_mode": get_settings().stripe_test_mode,
+    }
 
 
 @router.get("/data/contractors")
@@ -951,7 +957,13 @@ def get_contractors(
         db=db,
         force_refresh=force_refresh,
     )
-    return {"county_id": county_id, "vertical": vertical, "contractors": data, "count": len(data)}
+    return {
+        "county_id": county_id,
+        "vertical": vertical,
+        "contractors": data,
+        "count": len(data),
+        "sandbox_mode": get_settings().stripe_test_mode,
+    }
 
 
 @router.post("/data/deals", status_code=201)

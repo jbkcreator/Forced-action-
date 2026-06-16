@@ -80,6 +80,7 @@ from config.scoring import (
     AGE_DECAY_2Y,
     CONTACT_EMAIL_BONUS,
     CONTACT_PHONE_BONUS,
+    CONTACT_PHONE_BONUS_BY_CONFIDENCE,
     DAYS_OPEN_MODIFIERS,
     EQUITY_BONUS_BY_VERTICAL,
     EQUITY_HIGH_THRESH,
@@ -719,7 +720,15 @@ class MultiVerticalScorer:
         contact_bonus = 0
         if owner:
             if owner.phone_1 or owner.phone_2 or owner.phone_3:
-                contact_bonus += CONTACT_PHONE_BONUS
+                # getattr: bulk path builds owners as SimpleNamespace from a
+                # column list — older bundles may lack the label entirely.
+                confidence = getattr(owner, "contact_info_confidence", None)
+                if settings.cds_use_contactability and confidence:
+                    contact_bonus += CONTACT_PHONE_BONUS_BY_CONFIDENCE.get(
+                        confidence, CONTACT_PHONE_BONUS
+                    )
+                else:
+                    contact_bonus += CONTACT_PHONE_BONUS
             if owner.email_1 or owner.email_2:
                 contact_bonus += CONTACT_EMAIL_BONUS
 
@@ -1015,7 +1024,10 @@ class MultiVerticalScorer:
             "qualified":       qualified,
             "signal_count":    len(signals),
             "distress_types":  list({s["type"] for s in signals}),
-            "factor_scores":   self._build_factor_scores(signals, vertical_results),
+            "factor_scores":   self._build_factor_scores(
+                signals, vertical_results,
+                contact_info_confidence=getattr(owner, "contact_info_confidence", None),
+            ),
             # Skip expensive summary/estimation work for zero-signal properties —
             # these fields are only consumed by the CRM push path (qualified leads).
             "signal_summaries": self._build_signal_summaries(prop) if signals else {},
@@ -1178,7 +1190,8 @@ class MultiVerticalScorer:
             logger.debug("Job value estimation failed for property %s", prop.id, exc_info=True)
             return {"low": 0, "high": 0, "display": "N/A", "method": "error"}
 
-    def _build_factor_scores(self, signals: List[Dict], vertical_results: Dict) -> Dict:
+    def _build_factor_scores(self, signals: List[Dict], vertical_results: Dict,
+                             contact_info_confidence: Optional[str] = None) -> Dict:
         """
         Build the factor_scores JSONB payload with full per-component breakdown.
 
@@ -1225,8 +1238,9 @@ class MultiVerticalScorer:
             }
 
         return {
-            "signals":            signal_list,
-            "vertical_breakdown": vertical_breakdown,
+            "signals":                  signal_list,
+            "vertical_breakdown":       vertical_breakdown,
+            "contact_info_confidence":  contact_info_confidence,
         }
 
     # ── Database persistence ───────────────────────────────────────────────────
@@ -1478,7 +1492,8 @@ class MultiVerticalScorer:
 
         owner_rows = _q("""
             SELECT property_id, owner_name, owner_type, absentee_status, mailing_address,
-                   ownership_years, phone_1, phone_2, phone_3, email_1, email_2
+                   ownership_years, phone_1, phone_2, phone_3, email_1, email_2,
+                   contact_info_confidence
             FROM owners WHERE property_id IN (SELECT unnest(CAST(:ids AS bigint[])))
         """)
         fin_rows = _q("""
@@ -1756,10 +1771,13 @@ class MultiVerticalScorer:
 
         Returns a dict with aggregate counters and side-effect queues.
         """
+        _GOLD_PLUS = {"Ultra Platinum", "Platinum", "Gold"}
+
         if not scored_batch:
             return {
                 "new": 0, "updated": 0, "unchanged": 0, "upgraded": 0,
                 "qualified": 0, "ghl_queued": [], "new_gold_records": [],
+                "new_gold_plus_entering": [],
             }
 
         now          = datetime.now(timezone.utc)
@@ -1796,6 +1814,7 @@ class MultiVerticalScorer:
         inserts_data:   List[Dict] = []
         new_count = updated_count = unchanged_count = upgraded_count = qualified_count = 0
         ghl_queued: List[Dict] = []
+        new_gold_plus_entering: List[Dict] = []  # (property_id, county_id, tier, zip, scoring_run_id)
 
         with self._profiler.phase("persist_classify"):
           for sd in scored_batch:
@@ -1828,6 +1847,19 @@ class MultiVerticalScorer:
                 )
                 if upgraded:
                     upgraded_count += 1
+                # Entering Gold+: intraday upgrade from below-Gold to Gold/Platinum/Ultra Platinum.
+                # Separate from flash-scarcity (Gold-only). Gold→Platinum not emitted (already Gold+).
+                if (
+                    lead_tier in _GOLD_PLUS
+                    and prev_tier not in _GOLD_PLUS
+                ):
+                    new_gold_plus_entering.append({
+                        "property_id":   pid,
+                        "county_id":     sd.get("county_id", "hillsborough"),
+                        "lead_tier":     lead_tier,
+                        "zip":           sd.get("zip"),
+                        "scoring_run_id": scoring_run_id,
+                    })
                 score_changed = prev_score != final_score
                 if _GHL_PUSH_ENABLED and (score_changed or not sd.get("ghl_contact_id")):
                     ghl_queued.append(sd)
@@ -1848,6 +1880,19 @@ class MultiVerticalScorer:
                         qualified_count += 1
                     if _GHL_PUSH_ENABLED:
                         ghl_queued.append(sd)
+                    # Entering Gold+: new insert at Gold/Platinum/Ultra Platinum where
+                    # prior tier (if any) was below Gold (or no prior score at all).
+                    if (
+                        lead_tier in _GOLD_PLUS
+                        and (latest_tier is None or latest_tier not in _GOLD_PLUS)
+                    ):
+                        new_gold_plus_entering.append({
+                            "property_id":   pid,
+                            "county_id":     sd.get("county_id", "hillsborough"),
+                            "lead_tier":     lead_tier,
+                            "zip":           sd.get("zip"),
+                            "scoring_run_id": scoring_run_id,
+                        })
 
         # ── 4. Batch UPDATE ───────────────────────────────────────────────
         # Routed through _bulk_update_distress_scores so the N-row UPDATE is
@@ -1912,13 +1957,14 @@ class MultiVerticalScorer:
                             new_gold_records.append((sd, gold_id_map[sd["property_id"]]))
 
         return {
-            "new":              new_count,
-            "updated":          updated_count,
-            "unchanged":        unchanged_count,
-            "upgraded":         upgraded_count,
-            "qualified":        qualified_count,
-            "ghl_queued":       ghl_queued,
-            "new_gold_records": new_gold_records,
+            "new":                    new_count,
+            "updated":                updated_count,
+            "unchanged":              unchanged_count,
+            "upgraded":               upgraded_count,
+            "qualified":              qualified_count,
+            "ghl_queued":             ghl_queued,
+            "new_gold_records":       new_gold_records,
+            "new_gold_plus_entering": new_gold_plus_entering,
         }
 
     def score_all_properties(
@@ -2086,6 +2132,35 @@ class MultiVerticalScorer:
                         "Batch commit failed at property %d: %s",
                         self._total_scored, batch_exc, exc_info=True,
                     )
+
+                # Emit gold_lead_scored events AFTER commit (ADR 0016).
+                # Guard by ENRICHMENT_CASCADE_ENABLED so the nightly batch remains
+                # the sole trigger until the consumer is enabled in ops.
+                # Publish failure must never fail scoring — nightly batch is backstop.
+                if with_signal_batch and result.get("new_gold_plus_entering"):
+                    try:
+                        from config.settings import get_settings as _get_settings
+                        _settings = _get_settings()
+                        if _settings.enrichment_cascade_enabled:
+                            from src.agents.events.ingestion import publish_cora_event
+                            for _entry in result["new_gold_plus_entering"]:
+                                try:
+                                    publish_cora_event({
+                                        "event_type": "gold_lead_scored",
+                                        "payload":    _entry,
+                                        "idempotency_key": (
+                                            f"gold_lead_scored:"
+                                            f"{_entry['property_id']}:"
+                                            f"{_entry['scoring_run_id']}"
+                                        ),
+                                    })
+                                except Exception as _pub_exc:
+                                    logger.warning(
+                                        "gold_lead_scored publish failed property_id=%s: %s",
+                                        _entry.get("property_id"), _pub_exc,
+                                    )
+                    except Exception as _emit_exc:
+                        logger.warning("gold_lead_scored batch emit failed: %s", _emit_exc)
 
             if save_to_db and _GHL_PUSH_ENABLED:
                 with self._profiler.phase("ghl_flush"):
