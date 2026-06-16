@@ -5,9 +5,15 @@ Returns 1 fully-revealed lead + 2 blurred leads for new signup proof moment.
 Goal: show real value within 30 seconds of account creation.
 No auth required for the endpoint — leads are scored/qualified properties.
 """
+import hashlib
 import logging
 from datetime import datetime, timezone
 from typing import Optional
+
+# Number of leads in the pool. ip_slot = hash(ip) % _POOL_SIZE picks 3
+# consecutive leads starting at that offset, so a single IP always sees
+# the same free preview and reloading never exposes additional leads.
+_POOL_SIZE = 10
 
 from sqlalchemy import and_, desc, select
 from sqlalchemy.orm import Session
@@ -18,11 +24,23 @@ from src.services import lead_exclusivity
 logger = logging.getLogger(__name__)
 
 
+def ip_to_slot(ip: str) -> int:
+    """Deterministic slot 0..(_POOL_SIZE-1) from a client IP.
+
+    Same IP always maps to the same slot so reloading never reveals
+    additional leads. Different IPs spread across the pool so visitors
+    don't all see the same free preview.
+    """
+    digest = hashlib.md5(ip.encode(), usedforsecurity=False).hexdigest()
+    return int(digest, 16) % _POOL_SIZE
+
+
 def get_proof_leads(
     vertical: str,
     county_id: str,
     db: Session,
     feed_uuid: Optional[str] = None,
+    ip_slot: int = 0,
 ) -> dict:
     """
     Return proof moment payload:
@@ -59,17 +77,22 @@ def get_proof_leads(
     if excl_ids:
         where_clauses.append(Property.id.not_in(excl_ids))
 
-    top = db.execute(
+    pool = db.execute(
         select(Property, DistressScore)
         .join(DistressScore, DistressScore.property_id == Property.id)
         .outerjoin(Owner, Owner.property_id == Property.id)
         .where(and_(*where_clauses))
         .order_by(*phone_priority_order(score_col))
-        .limit(3)
+        .limit(_POOL_SIZE + 2)
     ).all()
 
-    if not top:
+    if not pool:
         return {"revealed": None, "blurred": [], "county_id": county_id, "vertical": vertical}
+
+    # Clamp slot so we always have 3 consecutive rows available.
+    max_slot = max(0, len(pool) - 3)
+    slot = min(ip_slot, max_slot)
+    top = pool[slot : slot + 3]
 
     # Resolve which of these top properties this subscriber has paid to unlock
     unlocked_ids: set = set()

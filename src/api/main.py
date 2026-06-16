@@ -4769,6 +4769,7 @@ def lead_hold_status(
 
 @app.get("/api/proof-leads")
 def proof_leads(
+    request: Request,
     vertical: str = "roofing",
     county_id: str = "hillsborough",
     feed_uuid: Optional[str] = Query(default=None),
@@ -4778,11 +4779,14 @@ def proof_leads(
     Return 1 fully revealed + 2 blurred leads for the signup proof moment.
     Requires no auth — used immediately after free account creation.
     """
-    from src.services.proof_moment import get_proof_leads
+    from src.services.proof_moment import get_proof_leads, ip_to_slot
     from src.services.business_events import log_business_event
     if vertical not in VALID_VERTICALS:
         raise HTTPException(status_code=400, detail=f"Invalid vertical. Must be one of: {sorted(VALID_VERTICALS)}")
-    result = get_proof_leads(vertical=vertical, county_id=county_id, db=db, feed_uuid=feed_uuid)
+    xff = request.headers.get("X-Forwarded-For")
+    client_ip = xff.split(",")[0].strip() if xff else (request.client.host if request.client else "0.0.0.0")
+    slot = ip_to_slot(client_ip)
+    result = get_proof_leads(vertical=vertical, county_id=county_id, db=db, feed_uuid=feed_uuid, ip_slot=slot)
     if feed_uuid:
         sub = db.query(Subscriber).filter_by(event_feed_uuid=feed_uuid).first()
         log_business_event(
