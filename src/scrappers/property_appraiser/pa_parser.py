@@ -648,116 +648,21 @@ def _map_trim_fields(raw: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 3. Tax Collector page
-# ---------------------------------------------------------------------------
-
-def parse_tax_collector(text: str) -> dict:
-    """
-    Extract tax payment status and history from county tax collector page text.
-
-    Returns:
-        dict with canonical keys: tax_status, tax_last_paid_amount,
-        tax_last_paid_date, tax_payment_history (list of dicts)
-    """
-    data: dict = {}
-    t = text or ""
-
-    # Current status
-    if re.search(r"paid in full|no amount due", t, re.IGNORECASE):
-        data["tax_status"] = "paid_in_full"
-    elif re.search(r"delinquent|past due|overdue", t, re.IGNORECASE):
-        data["tax_status"] = "delinquent"
-    elif re.search(r"partial|balance due", t, re.IGNORECASE):
-        data["tax_status"] = "partial"
-
-    # Last payment
-    amt = _after_label(t, "Amount Paid") or _after_label(t, "Payment Amount")
-    if amt:
-        data["tax_last_paid_amount"] = _parse_amount(amt)
-
-    pd_str = _after_label(t, "Payment Date") or _after_label(t, "Date Paid")
-    if pd_str:
-        data["tax_last_paid_date"] = _parse_date(pd_str)
-
-    # Payment history rows — parse table-like structure in visible text
-    history = _parse_tax_history_table(t)
-    if history:
-        data["tax_payment_history"] = history
-
-    return data
-
-
-def _parse_tax_history_table(text: str) -> list:
-    """
-    Extract annual tax payment rows from visible text.
-
-    Looks for lines that match patterns like:
-      2024  Annual  $3,421.00  11/27/2024  Receipt# 12345678
-    Returns a list of dicts matching TaxPaymentHistory columns.
-    """
-    rows = []
-    # Pattern: year (4-digit) followed by bill type and dollar amount
-    line_re = re.compile(
-        r"(?P<year>20\d{2})"
-        r".{0,40}"
-        r"(?P<bill_type>Annual|Homestead Penalty|Tangible Personal Property)"
-        r".{0,60}"
-        r"\$?(?P<amount>[\d,]+\.\d{2})"
-        r".{0,80}"
-        r"(?P<date>\d{1,2}/\d{1,2}/\d{4})",
-        re.IGNORECASE,
-    )
-    for m in line_re.finditer(text):
-        row = {
-            "tax_year":   int(m.group("year")),
-            "bill_type":  m.group("bill_type").title(),
-            "amount_paid": _parse_amount(m.group("amount")),
-            "payment_date": _parse_date(m.group("date")),
-        }
-        receipt_m = re.search(r"Receipt\s*#?\s*(\w+)", text[m.start():m.start() + 200], re.IGNORECASE)
-        if receipt_m:
-            row["receipt_number"] = receipt_m.group(1)
-
-        # days_late: relative to Nov 1 early-pay window
-        if row["payment_date"]:
-            nov1 = date(row["tax_year"], 11, 1)
-            row["days_late"] = (row["payment_date"] - nov1).days
-
-        rows.append(row)
-
-    return rows
-
-
-# ---------------------------------------------------------------------------
-# 4. Canonical DataFrame assembly
+# 3. Canonical DataFrame assembly
 # ---------------------------------------------------------------------------
 
 def to_canonical_dataframe(
     hcpa: dict,
     trim: dict,
-    tax: dict,
     parcel_id: str,
 ) -> pd.DataFrame:
     """
-    Merge parsed dicts from all three sources into a single canonical row.
+    Merge HCPA page and TRIM PDF data into a single canonical row.
 
     HCPA is authoritative for property/building fields.
     TRIM supplements/overrides valuation fields (more precise) and adds SOH/exemption.
-    Tax collector adds payment status and history.
     """
     row: dict = {"parcel_id": parcel_id}
-
-    # Merge: HCPA first, then TRIM overwrites valuations (more precise), tax adds status
     row.update(hcpa)
-    row.update(trim)       # TRIM values win for overlapping valuation keys
-    row.update({k: v for k, v in tax.items() if k != "tax_payment_history"})
-
-    # Promote list keys that don't belong in a flat row
-    tax_history = tax.get("tax_payment_history", [])
-
-    df = pd.DataFrame([row])
-    # Attach payment history as a Python list in a special metadata column
-    # that PropertyAppraiserLoader reads and inserts separately.
-    df["_tax_payment_history"] = [tax_history]
-
-    return df
+    row.update(trim)  # TRIM values win for overlapping valuation keys
+    return pd.DataFrame([row])

@@ -9,10 +9,17 @@ per-county prompt files are needed.
 Hillsborough → downloads PARCEL_SPREADSHEET.xls, converts to CSV
 Pinellas     → downloads each table in special_flags['bulk_tables'] directly as CSV
 
+Runs WEEKLY (Sunday 01:00 UTC via cron). The full converted file goes to
+MasterPropertyLoader, which partitions rows by hash-based change detection:
+new parcels are inserted, changed parcels are updated set-based (with
+needs_rescore / pending_sync / skip_trace_stale flags for downstream),
+unchanged parcels only get their last_seen_at stamped. No deletes.
+
 Usage:
     python -m src.scrappers.master.master_engine --county-id hillsborough --headful
     python -m src.scrappers.master.master_engine --county-id pinellas --headful
     python -m src.scrappers.master.master_engine --county-id hillsborough --headful --load-to-db
+    python -m src.scrappers.master.master_engine --skip-download --load-to-db --dry-run
 """
 
 import asyncio
@@ -389,47 +396,17 @@ def discover_and_convert(ref_dir: Path, staging_dir: Path) -> Optional[Path]:
 # DB helpers
 # ---------------------------------------------------------------------------
 
-def get_existing_parcel_ids(county_id: str):
-    from src.core.database import get_db_context
-    from src.core.models import Property
-    with get_db_context() as session:
-        rows = session.query(Property.parcel_id).filter_by(county_id=county_id).all()
-        return {r[0] for r in rows if r[0]}
-
-
-def deduplicate_csv(csv_path: Path, existing_ids: set, out_dir: Path):
-    out_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d")
-    out = out_dir / f"master_new_{ts}.csv"
-    new, dups = 0, 0
-    for i, chunk in enumerate(
-        pd.read_csv(csv_path, chunksize=CHUNK_SIZE, dtype={'folio': str}), start=1
-    ):
-        chunk.columns = chunk.columns.str.upper()
-        col = 'FOLIO' if 'FOLIO' in chunk.columns else chunk.columns[0]
-        before = len(chunk)
-        chunk = chunk[~chunk[col].isin(existing_ids)]
-        dups += before - len(chunk)
-        new += len(chunk)
-        if len(chunk):
-            chunk.to_csv(out, mode='w' if i == 1 else 'a', index=False, header=(i == 1))
-    logger.info(f"Dedup: {new:,} new, {dups:,} skipped")
-    if new == 0:
-        if out.exists():
-            out.unlink()
-        return None, 0
-    return out, new
-
-
-def load_to_database(csv_path: Path, county_id: str):
+def load_to_database(csv_path: Path, county_id: str, dry_run: bool = False,
+                     chunk_size: int = 10_000):
+    """Load the full converted file — the loader partitions rows itself
+    (insert new / update changed / stamp unchanged via hash comparison)."""
     from src.core.database import get_db_context
     from src.loaders.master import MasterPropertyLoader
     with get_db_context() as session:
         loader = MasterPropertyLoader(session, county_id=county_id)
-        inserted, unmatched, skipped = loader.load_from_csv(str(csv_path), skip_duplicates=True, chunksize=10_000)
-        session.commit()
-    logger.info(f"Loaded: {inserted:,} inserted | {unmatched:,} unmatched | {skipped:,} skipped")
-    return inserted, unmatched, skipped
+        stats = loader.load_from_csv(str(csv_path), chunksize=chunk_size, dry_run=dry_run)
+    logger.info(f"Loaded: {stats.summary()}")
+    return stats
 
 
 # ---------------------------------------------------------------------------
@@ -441,6 +418,8 @@ async def run_master_pipeline(
     skip_download: bool = False,
     load_to_db: bool = False,
     headful: bool = False,
+    dry_run: bool = False,
+    chunk_size: int = 10_000,
 ):
     cfg = get_county_config(county_id)
     source = cfg["sources"]["master_data"]
@@ -451,7 +430,7 @@ async def run_master_pipeline(
 
     logger.info("=" * 70)
     logger.info(f"MASTER PIPELINE — {cfg['display_name'].upper()}")
-    logger.info(f"headful={headful}  load_to_db={load_to_db}")
+    logger.info(f"headful={headful}  load_to_db={load_to_db}  dry_run={dry_run}")
     logger.info("=" * 70)
 
     # ── Phase 1: Download ─────────────────────────────────────────────────
@@ -483,7 +462,7 @@ async def run_master_pipeline(
 
         if load_to_db:
             for csv_path in downloaded:
-                load_to_database(csv_path, county_id)
+                load_to_database(csv_path, county_id, dry_run=dry_run, chunk_size=chunk_size)
         else:
             logger.info("Files ready. Run with --load-to-db to load into database.")
         return
@@ -495,19 +474,15 @@ async def run_master_pipeline(
         logger.error(f"No bulk file found in {ref_dir} — download may have failed")
         return
 
-    # ── Phase 3: Deduplicate ──────────────────────────────────────────────
-    existing_ids = get_existing_parcel_ids(county_id)
-    deduped_csv, new_count = deduplicate_csv(converted_csv, existing_ids, staging_dir)
-    if not deduped_csv:
-        logger.info("No new records — database is already up to date.")
-        return
-
-    # ── Phase 4: Load ─────────────────────────────────────────────────────
+    # ── Phase 3: Load ─────────────────────────────────────────────────────
+    # The full file goes to the loader — it partitions rows itself by hash
+    # (insert new / update changed / stamp unchanged), so the old pre-load
+    # dedup pass that dropped existing parcels is gone.
     if load_to_db:
-        load_to_database(deduped_csv, county_id)
+        load_to_database(converted_csv, county_id, dry_run=dry_run, chunk_size=chunk_size)
     else:
-        logger.info(f"Ready: {deduped_csv} ({new_count:,} new records)")
-        logger.info("Run with --load-to-db to insert into database.")
+        logger.info(f"Ready: {converted_csv}")
+        logger.info("Run with --load-to-db to load into database.")
 
 
 if __name__ == "__main__":
@@ -519,6 +494,10 @@ if __name__ == "__main__":
                         help="Load to database after download/conversion")
     parser.add_argument("--headful", action="store_true",
                         help="Run browser in visible (headful) mode")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Classify and report counts but roll back all DB changes")
+    parser.add_argument("--chunk-size", type=int, default=10_000,
+                        help="CSV rows processed per chunk (default 10000)")
 
     args = parser.parse_args()
     asyncio.run(run_master_pipeline(
@@ -526,4 +505,6 @@ if __name__ == "__main__":
         skip_download=args.skip_download,
         load_to_db=args.load_to_db,
         headful=args.headful,
+        dry_run=args.dry_run,
+        chunk_size=args.chunk_size,
     ))

@@ -413,18 +413,28 @@ async def main(args):
     logger.info("Date range: %s → %s", start_str, end_str)
     logger.info("=" * 60)
 
-    playwright_code = source.get("playwright_code")
-    if playwright_code:
-        logger.info("[Main] Using Playwright scrape mode")
-        raw_df = await _scrape_with_playwright(
-            playwright_code, source, start_str, end_str, download_dir,
-            headful=args.headful, county_id=county_id,
-        )
-        if raw_df is None or raw_df.empty:
-            logger.info("[Main] 0 violation records from Playwright — nothing to load")
+    scrape_mode = source.get("scrape_mode", "ai_only")
+    logger.info("[Main] scrape_mode=%s", scrape_mode)
+
+    df = None
+
+    if scrape_mode in ("playwright_only", "playwright_then_ai"):
+        playwright_code = source.get("playwright_code")
+        if playwright_code:
+            raw_df = await _scrape_with_playwright(
+                playwright_code, source, start_str, end_str, download_dir,
+                headful=args.headful, county_id=county_id,
+            )
+            if raw_df is not None and not raw_df.empty:
+                df = _normalize_columns(raw_df.to_dict("records"), source)
+
+        if df is None and scrape_mode == "playwright_only":
+            logger.warning("[Main] playwright_only returned no data — aborting (no AI fallback)")
             return
-        df = _normalize_columns(raw_df.to_dict("records"), source)
-    else:
+
+    if df is None:  # ai_only, or playwright_then_ai falling back to agent
+        if scrape_mode == "playwright_then_ai":
+            logger.info("[Main] Playwright returned no data — falling back to browser-use agent")
         task = build_agent_task(source, start_str, end_str)
         history, _ = await run_browser_agent(task, headful=args.headful)
 

@@ -4,7 +4,7 @@ Lien, Deed & Judgment Data Collection Pipeline — county-agnostic, browser-use 
 Navigates the county clerk's public access portal, performs a date-range Document Type
 search with no type filter (returns all types), downloads the CSV export, then
 normalises county-specific columns and categorises records in Python into
-liens / deeds / judgments / probate and saves them to the appropriate directories.
+liens / deeds / judgments and saves them to the appropriate directories.
 
 County differences are driven entirely by config — no county-specific code here:
   - Column renames:   source["ori_column_map"]          (e.g. DirectName→Grantor)
@@ -91,8 +91,6 @@ _BUCKET_DIRS = {
     "liens":     PROCESSED_LIENS_DIR,
     "deeds":     PROCESSED_DEEDS_DIR,
     "judgments": PROCESSED_JUDGMENTS_DIR,
-    "probate":   PROCESSED_DATA_DIR / "probate",
-    "divorce":   PROCESSED_DATA_DIR / "divorce",
 }
 
 
@@ -513,7 +511,7 @@ def _locate_download(download_dir: Path, start_time: float) -> Optional[Path]:
 # Lien sub-categorisation for the LIEN bucket
 # ---------------------------------------------------------------------------
 # The row_routing on the CountyColumnMapping splits rows into top-level buckets
-# (liens / deeds / judgments / probate / divorce) by raw DocType value. The
+# (liens / deeds / judgments) by raw DocType value. The
 # generic "liens" bucket is then further sub-categorised here, based on party
 # names (HOA vs IRS vs city/county filer vs mechanics).
 # This sub-bucketing relies on per-county filer keywords from county_cfg, so
@@ -598,8 +596,6 @@ def _save_buckets(buckets: dict, county_cfg: dict) -> dict:
         "liens":     f"all_liens_{today_str}.csv",
         "deeds":     f"all_deeds_{today_str}.csv",
         "judgments": f"all_judgments_{today_str}.csv",
-        "probate":   f"all_probate_{today_str}.csv",
-        "divorce":   f"all_divorce_{today_str}.csv",
     }
 
     for bucket, df_bucket in buckets.items():
@@ -675,7 +671,7 @@ async def run_lien_pipeline(
     load_to_db: bool = False,
     no_proxy: bool = False,
 ) -> bool:
-    """County-agnostic lien/deed/judgment/probate scrape for a date range.
+    """County-agnostic lien/deed/judgment scrape for a date range.
 
     Every scrape goes through the browser-use Agent. When the source has
     `cf_bypass_required=true`, the Agent is launched against the warmed Edge
@@ -849,117 +845,6 @@ async def run_lien_pipeline(
 
 
 # ---------------------------------------------------------------------------
-# ORI → legal_proceedings column bridge
-# ---------------------------------------------------------------------------
-
-# Fallback bridge used when no approved CountyColumnMapping exists for the source.
-# Primary path is ColumnMapper (DB-driven, admin-editable via UI).
-_ORI_TO_LEGAL_COLS_FALLBACK = {
-    'Instrument':  'CaseNumber',
-    'Grantor':     'LastName/CompanyName',
-    'RecordDate':  'FilingDate',
-    'Legal':       'PartyAddress',
-}
-
-
-def _load_ori_legal_proceedings(county_id: str, type_dir: Path, data_type: str) -> None:
-    """
-    Load ORI-sourced probate or divorce CSVs into legal_proceedings.
-
-    Column bridge (ORI format → loader format) is resolved from CountyColumnMapping
-    via ColumnMapper, falling back to _ORI_TO_LEGAL_COLS_FALLBACK if no mapping exists.
-
-    ORI exports: Instrument, Grantor, Grantee, RecordDate, Legal
-    Loaders expect: CaseNumber, LastName/CompanyName, FilingDate, PartyAddress
-
-    Writes one scraper_run_stats row per call using data_type as source_type
-    ('probate' or 'divorce_filings'). Without this, Pinellas probate/divorce
-    runs leave no trace and look "missing" in the daily report.
-    """
-    from src.loaders.legal_proceedings import ProbateLoader, DivorceLoader
-    from src.loaders.column_mapper import ColumnMapper, SkipMapping
-    from src.core.database import Database
-    from src.utils.scraper_db_helper import record_scraper_stats
-
-    _loader_map = {'probate': ProbateLoader, 'divorce_filings': DivorceLoader}
-    loader_class = _loader_map[data_type]
-
-    t0 = time.monotonic()
-
-    new_dir = type_dir / "new"
-    csv_files = sorted(new_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True) \
-        if new_dir.exists() else []
-    if not csv_files:
-        logger.info("[DB] No new %s records to load", data_type)
-        record_scraper_stats(
-            source_type=data_type,
-            total_scraped=0, matched=0, unmatched=0, skipped=0, scored=0,
-            run_success=True, error_type='no_data',
-            duration_seconds=round(time.monotonic() - t0, 2),
-            county_id=county_id,
-        )
-        return
-
-    csv_path = csv_files[0]
-    logger.info("[DB] Loading ORI %s: %s", data_type, csv_path)
-
-    try:
-        df = pd.read_csv(csv_path)
-
-        # Resolve column mapping from DB (approved CountyColumnMapping for this liens source)
-        source_id = get_county_config(county_id)["sources"].get("liens", {}).get("source_id")
-        if source_id:
-            try:
-                mapper = ColumnMapper()
-                mapping = mapper.get_or_create(data_type, source_id, df)
-                df = ColumnMapper.apply(df, mapping)
-                logger.info("[DB] Applied ColumnMapper for %s source_id=%s", data_type, source_id)
-            except SkipMapping:
-                logger.warning("[DB] No ColumnMapper schema for %s — using built-in bridge", data_type)
-        else:
-            logger.warning("[DB] No source_id for %s/%s — using built-in bridge", county_id, data_type)
-
-        # Always apply the ORI fallback bridge as a second pass.
-        # ColumnMapper maps raw portal columns (InstrumentNumber → Instrument, DirectName → Grantor).
-        # The divorce/probate CSVs are already in ORI-normalized form (Instrument, Grantor, …)
-        # so ColumnMapper renames nothing, leaving CaseNumber absent. The fallback bridge
-        # converts those ORI names to canonical loader column names regardless.
-        df = df.rename(columns=_ORI_TO_LEGAL_COLS_FALLBACK)
-
-        # Ensure name-part columns exist so loader name-assembly doesn't raise
-        for col in ('FirstName', 'MiddleName'):
-            if col not in df.columns:
-                df[col] = ''
-
-        db = Database()
-        with db.session_scope() as session:
-            loader = loader_class(session, county_id)
-            matched, unmatched, skipped = loader.load_from_dataframe(df, skip_duplicates=True)
-            logger.info("[DB] ORI %s — matched=%d unmatched=%d skipped=%d",
-                        data_type, matched, unmatched, skipped)
-
-        record_scraper_stats(
-            source_type=data_type,
-            total_scraped=matched + unmatched + skipped,
-            matched=matched, unmatched=unmatched, skipped=skipped, scored=0,
-            run_success=True,
-            duration_seconds=round(time.monotonic() - t0, 2),
-            county_id=county_id,
-        )
-
-    except Exception as e:
-        logger.error("[DB] Failed to load ORI %s: %s", data_type, e)
-        record_scraper_stats(
-            source_type=data_type,
-            total_scraped=0, matched=0, unmatched=0, skipped=0, scored=0,
-            run_success=False, error_type='scraper_error',
-            error_message=str(e)[:500],
-            duration_seconds=round(time.monotonic() - t0, 2),
-            county_id=county_id,
-        )
-
-
-# ---------------------------------------------------------------------------
 # DB loader
 # ---------------------------------------------------------------------------
 
@@ -986,19 +871,6 @@ def _load_to_database(county_id: str, t0: float) -> None:
         else:
             logger.info("[DB] No new %s records to load", label)
 
-    # ORI-sourced probate and divorce → legal_proceedings via column bridge.
-    # Pinellas is EXCLUDED: its dedicated probate_engine and divorce_engine
-    # (courtrecords portal, real UCN case numbers + docket detail) own those
-    # signals there, and loading the ORI buckets too produced duplicate
-    # numeric-case-number rows. Other counties (e.g. Hillsborough) still load
-    # ORI probate/divorce as before. The bucket CSVs are always written by
-    # _save_buckets regardless.
-    if county_id != "pinellas":
-        _load_ori_legal_proceedings(county_id, PROCESSED_DATA_DIR / "probate", "probate")
-        _load_ori_legal_proceedings(county_id, PROCESSED_DATA_DIR / "divorce", "divorce_filings")
-    else:
-        logger.info("[DB] Skipping ORI probate/divorce load for pinellas "
-                    "(owned by dedicated court-docket engines)")
 
 
 def _record_stats(total: int, success: bool, t0: float, county_id: str,

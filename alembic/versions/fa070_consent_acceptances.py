@@ -1,8 +1,8 @@
 """
 add_consent_acceptances
 
-Revision ID: fa070
-Revises: fa_tracerfy_source
+Revision ID: fa070_consent_acceptances
+Revises: fa075_incident_source_meta
 Create Date: 2026-06-04 16:30:00.000000
 """
 from typing import Sequence, Union
@@ -12,8 +12,8 @@ import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import JSONB
 
 # revision identifiers, used by Alembic.
-revision: str = "fa070"
-down_revision: Union[str, None] = "fa_tracerfy_source"
+revision: str = "fa070_consent_acceptances"
+down_revision: Union[str, None] = "fa075_incident_source_meta"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -76,11 +76,8 @@ def upgrade() -> None:
     op.create_check_constraint(
         "check_opt_in_source",
         "sms_opt_ins",
-        sa.schema.CheckConstraint(
-            "source IN ('double_opt_in','manual','import','widget','waitlist_form',"
-            "'synthflow_inbound','missed_call_inbound','consent_form')",
-            name="check_opt_in_source",
-        ),
+        "source IN ('double_opt_in','manual','import','widget','waitlist_form',"
+        "'synthflow_inbound','missed_call_inbound','consent_form')",
     )
 
 

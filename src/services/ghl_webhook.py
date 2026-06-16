@@ -593,9 +593,26 @@ def push_subscriber_to_ghl(
                 headers=_headers(),
                 json=contact_payload,
             )
-            contact_id = resp.json().get("contact", {}).get("id")
-            if contact_id:
-                subscriber.ghl_contact_id = contact_id
+            if resp.status_code == 400:
+                dup_id = resp.json().get("meta", {}).get("contactId")
+                if dup_id:
+                    logger.debug(
+                        "[GHL] Subscriber duplicate contact detected (%s), retrying as PUT",
+                        dup_id,
+                    )
+                    put_payload = {k: v for k, v in contact_payload.items() if k != "locationId"}
+                    resp = _ghl_request(
+                        "PUT",
+                        f"{_GHL_BASE}/contacts/{dup_id}",
+                        headers=_headers(),
+                        json=put_payload,
+                    )
+                    contact_id = dup_id
+                    subscriber.ghl_contact_id = dup_id
+            else:
+                contact_id = resp.json().get("contact", {}).get("id")
+                if contact_id:
+                    subscriber.ghl_contact_id = contact_id
 
         if not resp.ok:
             logger.error(

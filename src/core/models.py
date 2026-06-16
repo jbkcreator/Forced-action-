@@ -24,6 +24,7 @@ from sqlalchemy import (
     Index,
     func,
     false as sa_false,
+    text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID as PG_UUID
 from sqlalchemy.orm import DeclarativeBase, relationship, Mapped, mapped_column
@@ -92,6 +93,15 @@ class Property(Base):
     sync_status: Mapped[Optional[str]] = mapped_column(String(20), default="pending")
     last_crm_sync: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
+    # Weekly master refresh (fa077)
+    # source_row_hash: md5 over canonical scraper-sourced values (see
+    # src/loaders/master.py HASH_VERSION). NULL = row predates hash tracking.
+    # last_seen_at: stamped for every parcel present in a master file — kept
+    # unindexed so the weekly full-county stamp UPDATE stays HOT-eligible.
+    source_row_hash: Mapped[Optional[str]] = mapped_column(String(32))
+    last_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    needs_rescore: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
+
     # Audit Timestamps
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
@@ -121,6 +131,7 @@ class Property(Base):
         Index("idx_property_hcpa_refreshed", "hcpa_last_refreshed"),
         Index("idx_property_building_condition", "building_condition"),
         Index("idx_property_building_details", "building_details", postgresql_using="gin"),
+        Index("idx_properties_needs_rescore", "id", postgresql_where=text("needs_rescore")),
         CheckConstraint("sync_status IN ('pending', 'pending_sync', 'synced', 'sync_failed', 'error')", name="check_sync_status"),
     )
 
@@ -171,6 +182,9 @@ class Owner(Base):
     estimated_income: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
     credit_score_tier: Mapped[Optional[str]] = mapped_column(String(50))
     skip_trace_success: Mapped[Optional[bool]] = mapped_column(Boolean, default=False)
+    # Set by the weekly master refresh when owner_name changes for an owner with
+    # prior trace data — phones/emails are kept but belong to the previous owner.
+    skip_trace_stale: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
 
     # Direct-mail fallback (fa077): set true when the skip-trace waterfall ends
     # in a MISS but a usable mailing address exists (tax-collector billing
@@ -233,6 +247,7 @@ class Owner(Base):
         Index("idx_absentee_status", "absentee_status"),
         Index("idx_owner_county_id", "county_id"),
         Index("idx_owner_phone_metadata", "phone_metadata", postgresql_using="gin"),
+        Index("idx_owner_skip_trace_stale", "id", postgresql_where=text("skip_trace_stale")),
         Index("ix_owners_sunbiz_status", "sunbiz_status"),
         Index("ix_owners_managing_members", "managing_members", postgresql_using="gin"),
         CheckConstraint("owner_type IN ('Individual', 'LLC', 'Trust', 'Estate', 'Corporate')", name="check_owner_type"),
@@ -1525,6 +1540,9 @@ class EnrichedContact(Base):
     superseded_by_contact_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("enriched_contacts.id"), nullable=True
     )
+    # Tracerfy distinguishes the API mode used: "normal" (name+address, 1 credit/hit)
+    # vs "advanced" (address-only fallback, 2 credits/hit). NULL for non-Tracerfy rows.
+    trace_type: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
 
     # Audit
     enriched_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
@@ -1534,6 +1552,7 @@ class EnrichedContact(Base):
     __table_args__ = (
         Index("idx_enriched_match_success", "match_success"),
         Index("idx_enriched_source", "source"),
+        Index("idx_ec_trace_type", "trace_type"),
         CheckConstraint(
             "source IN ('batch_skip_tracing', 'idi', 'pdl', 'tracerfy', 'tax_collector')",
             name="check_enriched_source",
