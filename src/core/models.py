@@ -24,6 +24,7 @@ from sqlalchemy import (
     Index,
     func,
     false as sa_false,
+    text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID as PG_UUID
 from sqlalchemy.orm import DeclarativeBase, relationship, Mapped, mapped_column
@@ -92,6 +93,15 @@ class Property(Base):
     sync_status: Mapped[Optional[str]] = mapped_column(String(20), default="pending")
     last_crm_sync: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
+    # Weekly master refresh (fa077)
+    # source_row_hash: md5 over canonical scraper-sourced values (see
+    # src/loaders/master.py HASH_VERSION). NULL = row predates hash tracking.
+    # last_seen_at: stamped for every parcel present in a master file — kept
+    # unindexed so the weekly full-county stamp UPDATE stays HOT-eligible.
+    source_row_hash: Mapped[Optional[str]] = mapped_column(String(32))
+    last_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    needs_rescore: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
+
     # Audit Timestamps
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
@@ -121,6 +131,7 @@ class Property(Base):
         Index("idx_property_hcpa_refreshed", "hcpa_last_refreshed"),
         Index("idx_property_building_condition", "building_condition"),
         Index("idx_property_building_details", "building_details", postgresql_using="gin"),
+        Index("idx_properties_needs_rescore", "id", postgresql_where=text("needs_rescore")),
         CheckConstraint("sync_status IN ('pending', 'pending_sync', 'synced', 'sync_failed', 'error')", name="check_sync_status"),
     )
 
@@ -171,6 +182,9 @@ class Owner(Base):
     estimated_income: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
     credit_score_tier: Mapped[Optional[str]] = mapped_column(String(50))
     skip_trace_success: Mapped[Optional[bool]] = mapped_column(Boolean, default=False)
+    # Set by the weekly master refresh when owner_name changes for an owner with
+    # prior trace data — phones/emails are kept but belong to the previous owner.
+    skip_trace_stale: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
 
     # Direct-mail fallback (fa077): set true when the skip-trace waterfall ends
     # in a MISS but a usable mailing address exists (tax-collector billing
@@ -233,6 +247,7 @@ class Owner(Base):
         Index("idx_absentee_status", "absentee_status"),
         Index("idx_owner_county_id", "county_id"),
         Index("idx_owner_phone_metadata", "phone_metadata", postgresql_using="gin"),
+        Index("idx_owner_skip_trace_stale", "id", postgresql_where=text("skip_trace_stale")),
         Index("ix_owners_sunbiz_status", "sunbiz_status"),
         Index("ix_owners_managing_members", "managing_members", postgresql_using="gin"),
         CheckConstraint("owner_type IN ('Individual', 'LLC', 'Trust', 'Estate', 'Corporate')", name="check_owner_type"),
@@ -1190,6 +1205,11 @@ class Subscriber(Base):
     is_trial: Mapped[bool] = mapped_column(Boolean, server_default="false", nullable=False, default=False)
     trial_ends_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # ── S0: Reactivation cooldown gate ───────────────────────────────────────
+    last_reactivation_attempt_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     # ── Feed password login (fa061) ──────────────────────────────────────────
     # NULL until the subscriber has a password. event_feed_uuid stays the feed
     # identifier; these gate access behind a session JWT.
@@ -1218,6 +1238,7 @@ class Subscriber(Base):
         Index("idx_subscriber_vertical", "vertical"),
         Index("idx_subscriber_signal_score", "revenue_signal_score"),
         Index("idx_subscribers_icp_channel_key", "icp_channel_key"),
+        Index("idx_subscriber_last_reactivation_at", "last_reactivation_attempt_at"),
         CheckConstraint(
             "tier IN ('free', 'starter', 'pro', 'dominator', 'data_only', 'autopilot_lite', 'autopilot_pro', 'partner', 'annual_lock')",
             name="check_subscriber_tier",
@@ -1525,6 +1546,9 @@ class EnrichedContact(Base):
     superseded_by_contact_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("enriched_contacts.id"), nullable=True
     )
+    # Tracerfy distinguishes the API mode used: "normal" (name+address, 1 credit/hit)
+    # vs "advanced" (address-only fallback, 2 credits/hit). NULL for non-Tracerfy rows.
+    trace_type: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
 
     # Audit
     enriched_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
@@ -1534,6 +1558,7 @@ class EnrichedContact(Base):
     __table_args__ = (
         Index("idx_enriched_match_success", "match_success"),
         Index("idx_enriched_source", "source"),
+        Index("idx_ec_trace_type", "trace_type"),
         CheckConstraint(
             "source IN ('batch_skip_tracing', 'idi', 'pdl', 'tracerfy', 'tax_collector')",
             name="check_enriched_source",
@@ -3037,6 +3062,7 @@ class AgentDecision(Base):
     overridden_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     overridden_by: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
     override_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    override_reason_code: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
     playbook_id: Mapped[Optional[int]] = mapped_column(
         BigInteger, ForeignKey("cora_playbook.id", ondelete="SET NULL"), nullable=True,
     )
@@ -3054,6 +3080,7 @@ class AgentDecision(Base):
         ),
         Index("idx_agent_decisions_graph_started", "graph_name", "started_at"),
         Index("idx_agent_decisions_subscriber_started", "subscriber_id", "started_at"),
+        Index("idx_agent_decisions_override_reason_code", "override_reason_code"),
     )
 
     def __repr__(self):
@@ -3877,6 +3904,34 @@ class WaitlistEntry(Base):
                 f"status={self.status})>")
 
 
+class GoldPlusZipSnapshot(Base):
+    """
+    Nightly aggregation of new Gold+ lead counts per ZIP, refreshed after CDS scoring.
+    Consumed by sold-out reactivation eligibility as a fast supply gate.
+    """
+    __tablename__ = "gold_plus_zip_snapshots"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    zip_code: Mapped[str] = mapped_column(String(10), nullable=False)
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    snapshot_date: Mapped[date] = mapped_column(Date, nullable=False)
+    gold_plus_lead_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("zip_code", "county_id", "snapshot_date", name="uq_gpzs_zip_county_date"),
+        Index("idx_gpzs_zip_county_date", "zip_code", "county_id", "snapshot_date"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<GoldPlusZipSnapshot(zip={self.zip_code}, county={self.county_id}, "
+            f"date={self.snapshot_date}, count={self.gold_plus_lead_count})>"
+        )
+
+
 # ============================================================================
 # HCPA ENRICHMENT — TAX PAYMENT HISTORY
 # ============================================================================
@@ -4010,6 +4065,10 @@ class SynthflowCall(Base):
     vertical: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     zip_code: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
     contact_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    call_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, unique=True)
+    transcript_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    recording_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    duration_seconds: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     call_date: Mapped[date] = mapped_column(Date, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
@@ -5013,3 +5072,26 @@ class FinancingIntentScore(Base):
             f"date={self.score_date}, tier='{self.intent_tier}', "
             f"score={self.financing_intent_score})>"
         )
+class CoraEventQueue(Base):
+    """Durable fallback queue for Cora events when Redis is unavailable (fa072)."""
+
+    __tablename__ = "cora_event_queue"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    event_type: Mapped[str] = mapped_column(Text, nullable=False)
+    subscriber_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
+    idempotency_key: Mapped[Optional[str]] = mapped_column(Text, nullable=True, unique=True)
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="pending")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("idx_cora_event_queue_status_created", "status", "created_at"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<CoraEventQueue(id={self.id}, event_type={self.event_type}, status={self.status})>"

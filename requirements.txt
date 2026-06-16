@@ -9,6 +9,7 @@ anthropic>=0.79.0
 playwright>=1.40.0
 playwright-stealth>=2.0.0
 beautifulsoup4>=4.14.3
+pdfplumber>=0.11.0
 browser-use>=0.11.9
 2captcha-python>=1.2.0
 firecrawl-py>=4.15.1

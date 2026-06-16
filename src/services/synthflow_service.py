@@ -220,6 +220,15 @@ def _create_prospect_contact(phone: str, name: str, vertical: str, zip_code: str
         return None
 
 
+def check_call_allowed(phone: str, db, zip_code: str = "") -> bool:
+    """Pre-call compliance gate. Call before initiating any Synthflow outbound call."""
+    from src.services.compliance_gator import validate_outbound
+    result = validate_outbound(phone=phone, channel="voice", db=db, zip_code=zip_code or None)
+    if not result.allowed:
+        logger.info("[Synthflow] call blocked: phone=%s reason=%s", phone, result.reason)
+    return result.allowed
+
+
 def process_call_outcome(
     prospect_phone: str,
     outcome: str,

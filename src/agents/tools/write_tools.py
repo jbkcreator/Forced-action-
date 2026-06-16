@@ -229,6 +229,144 @@ def send_sms(
         }
 
 # ──────────────────────────────────────────────────────────────────────────────
+# send_email
+# ──────────────────────────────────────────────────────────────────────────────
+
+@tool(category="write", idempotent=True)
+def send_email(
+    subscriber_id: int,
+    recipient_email: str,
+    subject: str,
+    body: str,
+    campaign: str,
+    variant_id: Optional[str] = None,
+    decision_id: Optional[str] = None,
+    personalization_context: Optional[Dict[str, Any]] = None,
+    session: Optional[Session] = None,
+) -> Dict[str, Any]:
+    """
+    Send a transactional/marketing email through Mailchimp (SMTP relay) for a
+    Cora graph decision.
+
+    Mirrors the send_sms write tool contract:
+      - Suppression check (cora_suppression)
+      - 24-hour deduplication by (subscriber_id, campaign, variant_id)
+      - Human review gate (cora_review_switch)
+      - MessageOutcome row written with channel='mailchimp'
+      - Calls src.services.email.send_email() for actual delivery
+
+    Returns a dict with keys: sent, reason, subscriber_id, campaign,
+    variant_id, message_outcome_id.
+    """
+    from src.services.cora_suppression import has_active_suppression
+
+    with _session(session) as s:
+        if has_active_suppression(s, subscriber_id):
+            logger.info(
+                "Cora email suppressed subscriber=%s campaign=%s",
+                subscriber_id, campaign,
+            )
+            return {
+                "sent": False,
+                "reason": "cora_suppressed",
+                "subscriber_id": subscriber_id,
+                "campaign": campaign,
+                "variant_id": variant_id,
+                "message_outcome_id": None,
+            }
+
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(hours=24)
+
+        dup_q = (
+            s.query(MessageOutcome)
+            .filter(MessageOutcome.subscriber_id == subscriber_id)
+            .filter(MessageOutcome.template_id == campaign)
+            .filter(MessageOutcome.created_at >= cutoff)
+        )
+        if variant_id:
+            dup_q = dup_q.filter(MessageOutcome.variant_id == variant_id)
+
+        duplicate = dup_q.first()
+        if duplicate is not None:
+            return {
+                "sent": False,
+                "reason": "duplicate",
+                "subscriber_id": subscriber_id,
+                "campaign": campaign,
+                "variant_id": variant_id,
+                "message_outcome_id": duplicate.id,
+            }
+
+        ctx = personalization_context or {}
+
+        from src.services.cora_review_switch import is_review_enabled
+        requires_review = is_review_enabled() and bool(ctx.get("requires_review"))
+
+        outcome = MessageOutcome(
+            subscriber_id=subscriber_id,
+            message_type="email",
+            template_id=campaign,
+            variant_id=variant_id,
+            channel="mailchimp",
+            decision_id=decision_id,
+            send_status="pending_review" if requires_review else "approved",
+            requires_review=requires_review,
+            review_reason=ctx.get("review_reason") if requires_review else None,
+            scheduled_send_at=now,
+            sent_at=now if not requires_review else None,
+            trade_vertical=ctx.get("vertical") or None,
+            county_id=ctx.get("county_id") or None,
+            behavioral_segment=ctx.get("behavioral_segment") or None,
+            revenue_signal_score=ctx.get("revenue_signal_score"),
+            revenue_signal_score_band=ctx.get("revenue_signal_score_band") or None,
+            context_snapshot={
+                **(_safe_snapshot(ctx) or {}),
+                "subject": subject,
+                "recipient_email": recipient_email,
+            },
+        )
+        s.add(outcome)
+        s.flush()
+
+        if requires_review:
+            return {
+                "sent": False,
+                "reason": "pending_review",
+                "subscriber_id": subscriber_id,
+                "campaign": campaign,
+                "variant_id": variant_id,
+                "message_outcome_id": outcome.id,
+            }
+
+        from src.services.email import send_email as _send_email
+        ok = _send_email(to=recipient_email, subject=subject, body_text=body)
+
+        if not ok:
+            outcome.send_status = "failed"
+            return {
+                "sent": False,
+                "reason": "email_send_error",
+                "subscriber_id": subscriber_id,
+                "campaign": campaign,
+                "variant_id": variant_id,
+                "message_outcome_id": outcome.id,
+            }
+
+        outcome.send_status = "sent"
+        outcome.sent_at = datetime.now(timezone.utc)
+
+        return {
+            "sent": True,
+            "reason": "ok",
+            "subscriber_id": subscriber_id,
+            "campaign": campaign,
+            "variant_id": variant_id,
+            "message_outcome_id": outcome.id,
+        }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # log_decision
 # ──────────────────────────────────────────────────────────────────────────────
 

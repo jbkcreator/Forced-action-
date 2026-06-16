@@ -262,11 +262,19 @@ def send_sms(
             body_preview=body[:160],
         )
 
-    # 1. Opt-out suppression
-    if not can_send(to, db):
-        logger.info("SMS suppressed (opt-out): to=%s", to)
-        add_to_dead_letter(to, "opt_out", {"body": body[:160]}, db)
-        _log("suppressed", suppress_reason="opt_out")
+    # 0. Unified compliance gate — DNC, opt-out, quiet hours (replaces can_send + is_quiet_hours)
+    from src.services.compliance_gator import validate_outbound as _compliance_gate
+    _result = _compliance_gate(phone=to, channel="sms", db=db)
+    if not _result.allowed:
+        _dlq_map = {
+            "dnc_or_opted_out": "opt_out",
+            "quiet_hours": "quiet_hours",
+            "invalid_phone": "unresolvable",
+        }
+        _dlq_key: str = _result.reason or ""
+        logger.info("SMS suppressed (%s): to=%s", _result.reason, to)
+        add_to_dead_letter(to, _dlq_map.get(_dlq_key, "opt_out"), {"body": body[:160]}, db)
+        _log("suppressed", suppress_reason=_result.reason)
         return False
 
     # 2. Opt-in gate — marketing requires confirmed consent
@@ -300,15 +308,6 @@ def send_sms(
             add_to_dead_letter(to, "subscriber_sms_frequency_cap", {"body": body[:160]}, db)
             _log("suppressed", suppress_reason="subscriber_sms_frequency_cap")
             return False
-
-    # 5. TCPA quiet hours — no SMS before 8am or after 9pm recipient local time.
-    # Gated behind sms_quiet_hours_enabled so QA + local sandbox runs aren't
-    # blocked overnight; default ON in production.
-    if settings.sms_quiet_hours_enabled and is_quiet_hours(to):
-        logger.info("SMS suppressed (quiet hours): to=%s", to)
-        add_to_dead_letter(to, "quiet_hours", {"body": body[:160]}, db)
-        _log("suppressed", suppress_reason="quiet_hours")
-        return False
 
     # 6. Dry-run path (TELNYX_SMS_ENABLED=false)
     if not settings.telnyx_sms_enabled:

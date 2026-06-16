@@ -209,6 +209,8 @@ EQUITY_MID_THRESH  = 30   # percent — equity_pct 30-50% → half bonus
 EQUITY_BONUS_HIGH  = 20
 EQUITY_BONUS_MID   = 10
 EQUITY_VERTICALS   = {"wholesalers", "fix_flip", "attorneys", "roofing", "restoration", "public_adjusters"}
+LONG_TENURE_YEARS   = 10   # ownership_years >= this → tenure bonus fires
+TENURE_EQUITY_BONUS = 10   # flat bonus, all verticals
 
 # ── Cross-signal stacking ─────────────────────────────────────────────────────
 # Same parcel, 2+ distinct signal types within STACKING_WINDOW_DAYS.

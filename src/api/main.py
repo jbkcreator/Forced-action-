@@ -3679,6 +3679,158 @@ async def synthflow_inbound_webhook(request: Request, db: Session = Depends(get_
 
 
 # ---------------------------------------------------------------------------
+# POST /webhooks/synthflow/call-completed — Transcript + outcome ingestion
+# ---------------------------------------------------------------------------
+
+class SynthflowCallCompletedPayload(BaseModel):
+    call_id: Optional[str] = None
+    prospect_phone: str
+    call_outcome: Optional[str] = None
+    # Expected values: answered | voicemail | no_answer | opt_out | busy | invalid_number
+    transcript_text: Optional[str] = None
+    recording_url: Optional[str] = None
+    duration_seconds: Optional[int] = None
+    zip_code: Optional[str] = None
+    vertical: Optional[str] = None
+
+
+@app.post("/webhooks/synthflow/call-completed", status_code=200)
+async def synthflow_call_completed(
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """
+    Receives completed call data from Synthflow (transcript, outcome, recording).
+    Stores in synthflow_calls and writes to agent_decisions for Cora learning.
+    """
+    from src.services.webhook_log import log_webhook_event
+
+    if not _verify_synthflow_secret(request):
+        log_webhook_event(source="synthflow", event_type="call_completed_auth_failed", status="failed")
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    raw_body = await request.body()
+    try:
+        raw_json = json.loads(raw_body.decode("utf-8") or "{}")
+    except Exception:
+        return {"status": "error", "reason": "invalid_json"}
+
+    try:
+        payload = SynthflowCallCompletedPayload(**raw_json)
+    except Exception:
+        log_webhook_event(source="synthflow", event_type="call_completed_parse_failed", status="failed")
+        return {"status": "error", "reason": "invalid_payload"}
+
+    from src.services.phone_utils import normalize as normalize_phone
+    normalized_phone = normalize_phone(payload.prospect_phone)
+    if not normalized_phone:
+        return {"status": "ignored", "reason": "invalid_phone"}
+
+    # Upsert SynthflowCall
+    from src.core.models import SynthflowCall
+    from datetime import date as date_type
+    if payload.call_id:
+        existing_call = db.execute(
+            text("SELECT id FROM synthflow_calls WHERE call_id = :cid"),
+            {"cid": payload.call_id},
+        ).fetchone()
+        if existing_call:
+            db.execute(
+                text("""
+                    UPDATE synthflow_calls SET
+                        transcript_text  = :transcript,
+                        recording_url    = :recording,
+                        duration_seconds = :duration,
+                        outcome          = :outcome
+                    WHERE call_id = :cid
+                """),
+                {
+                    "transcript": payload.transcript_text,
+                    "recording":  payload.recording_url,
+                    "duration":   payload.duration_seconds,
+                    "outcome":    payload.call_outcome,
+                    "cid":        payload.call_id,
+                },
+            )
+        else:
+            db.add(SynthflowCall(
+                prospect_phone=normalized_phone,
+                outcome=payload.call_outcome,
+                vertical=payload.vertical,
+                zip_code=payload.zip_code,
+                call_date=date_type.today(),
+                call_id=payload.call_id,
+                transcript_text=payload.transcript_text,
+                recording_url=payload.recording_url,
+                duration_seconds=payload.duration_seconds,
+            ))
+    else:
+        db.add(SynthflowCall(
+            prospect_phone=normalized_phone,
+            outcome=payload.call_outcome,
+            vertical=payload.vertical,
+            zip_code=payload.zip_code,
+            call_date=date_type.today(),
+            transcript_text=payload.transcript_text,
+            recording_url=payload.recording_url,
+            duration_seconds=payload.duration_seconds,
+        ))
+
+    # Write to agent_decisions for Cora learning (ORM applies Python-side defaults)
+    # decision_id is always a fresh uuid4 — call_id lives in summary JSONB for correlation.
+    # Idempotency: if call_id is known, skip duplicate via summary->>'call_id' lookup.
+    from uuid import uuid4
+    from src.core.models import AgentDecision
+    existing_decision = None
+    if payload.call_id:
+        existing_decision = db.execute(
+            text("SELECT 1 FROM agent_decisions WHERE summary->>'call_id' = :cid LIMIT 1"),
+            {"cid": payload.call_id},
+        ).fetchone()
+    if not existing_decision:
+        transcript_excerpt = (payload.transcript_text or "")[:500]
+        db.add(AgentDecision(
+            decision_id=str(uuid4()),
+            graph_name="synthflow_ivr",
+            event_type=payload.call_outcome,
+            terminal_status="completed",
+            summary={
+                "call_id":           payload.call_id,
+                "outcome":           payload.call_outcome,
+                "duration_seconds":  payload.duration_seconds,
+                "zip_code":          payload.zip_code,
+                "vertical":          payload.vertical,
+                "transcript_excerpt": transcript_excerpt,
+            },
+            tokens_used=0,
+            cost_usd=0,
+            was_autonomous=False,
+            requires_approval=False,
+        ))
+
+    # IVR opt-out — write to sms_opt_outs (blocks future calls AND SMS)
+    if payload.call_outcome == "opt_out":
+        from src.services.compliance_gator import record_ivr_opt_out
+        record_ivr_opt_out(normalized_phone, db)
+
+    db.commit()
+
+    log_webhook_event(
+        source="synthflow",
+        event_type="call_completed",
+        source_event_id=payload.call_id,
+        status="processed",
+        payload=raw_json,
+        payload_kind="synthflow",
+    )
+    logger.info(
+        "[Synthflow call-completed] phone=%s outcome=%s call_id=%s",
+        normalized_phone, payload.call_outcome, payload.call_id,
+    )
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
 # POST /webhooks/ghl/sample-leads — GHL workflow webhook for sample lead SMS
 # ---------------------------------------------------------------------------
 

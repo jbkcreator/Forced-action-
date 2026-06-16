@@ -30,6 +30,7 @@ from src.agents.graphs.ap_lite_close import run_ap_lite_close as _run_ap_lite_cl
 from src.agents.graphs.fomo import run_fomo as _run_fomo
 from src.agents.graphs.human_close_route import run_human_close_route as _run_human_close_route
 from src.agents.graphs.nws_urgency import run_nws_urgency as _run_nws_urgency
+from src.agents.graphs.reactivation import run_reactivation as _run_reactivation
 from src.agents.graphs.retention import run_retention as _run_retention_inner
 from src.agents.graphs.synthflow_voice_drop import run_synthflow_voice_drop as _run_synthflow_voice_drop
 from src.agents.graphs.wallet_to_lock_close import run_wallet_to_lock_close as _run_wallet_to_lock_close
@@ -97,6 +98,10 @@ EVENT_TO_GRAPH: Dict[str, GraphSpec] = {
 	"nws_storm_alert_active": GraphSpec(
 		graph_name="nws_urgency",
 		runner=_run_nws_urgency,
+	),
+	"reactivation_outreach": GraphSpec(
+		graph_name="reactivation",
+		runner=_run_reactivation,
 	),
 }
 

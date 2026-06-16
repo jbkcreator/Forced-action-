@@ -81,7 +81,7 @@ class AgentsSettings(AppSettings):
 		default=(
 			"fomo,abandonment_wave1,abandonment_wave2,retention,"
 			"wallet_to_lock_close,ap_lite_close,human_close_route,"
-			"synthflow_voice_drop,accelerated_wallet_push"
+			"synthflow_voice_drop,accelerated_wallet_push,reactivation"
 		),
 		env="AGENTS_GRAPHS_ENABLED",
 		description="Comma-separated list of graphs the supervisor may route to",
