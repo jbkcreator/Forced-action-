@@ -2206,6 +2206,13 @@ def get_landing_data(county_id: Optional[str] = Query(default=None), db: Session
     if not county_id:
         raise HTTPException(status_code=400, detail={"error": "county_id_required"})
 
+    from src.core.redis_client import redis_available, rget, rset
+    _cache_key = f"landing_data:{county_id}"
+    if redis_available():
+        cached = rget(_cache_key)
+        if cached:
+            return json.loads(cached)
+
     county = db.execute(
         select(County).where(County.county_id == county_id)
     ).scalar_one_or_none()
@@ -2213,7 +2220,7 @@ def get_landing_data(county_id: Optional[str] = Query(default=None), db: Session
         raise HTTPException(status_code=404, detail={"error": "county_not_found", "county_id": county_id})
 
     if county_id not in _ALLOWED_LANDING_COUNTIES:
-        return {
+        _unavailable = {
             "county_id": county_id,
             "county_name": county.display_name,
             "county_status": "unavailable",
@@ -2225,6 +2232,9 @@ def get_landing_data(county_id: Optional[str] = Query(default=None), db: Session
             "scraper_health": None,
             "coming_soon": None,
         }
+        if redis_available():
+            rset(_cache_key, json.dumps(_unavailable), ttl_seconds=60)
+        return _unavailable
 
     # ── county_status + cta_mode from expansion_candidates ─────────────────
     candidate = db.execute(
@@ -2380,7 +2390,7 @@ def get_landing_data(county_id: Optional[str] = Query(default=None), db: Session
     else:
         scraper_health = None
 
-    return {
+    _result = {
         "county_id": county_id,
         "county_name": county.display_name,
         "county_status": county_status,
@@ -2398,6 +2408,9 @@ def get_landing_data(county_id: Optional[str] = Query(default=None), db: Session
         "scraper_health": scraper_health,
         "coming_soon": coming_soon,
     }
+    if redis_available():
+        rset(_cache_key, json.dumps(_result, default=str), ttl_seconds=300)
+    return _result
 
 
 
