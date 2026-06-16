@@ -186,6 +186,37 @@ class Owner(Base):
     # prior trace data — phones/emails are kept but belong to the previous owner.
     skip_trace_stale: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
 
+    # Direct-mail fallback (fa077): set true when the skip-trace waterfall ends
+    # in a MISS but a usable mailing address exists (tax-collector billing
+    # address, voter mailing address, or appraiser mailing). Consumed by a
+    # future mail-house export — no mail vendor is integrated yet.
+    direct_mail_eligible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+
+    # Contact freshness (fa073) — written by src/services/contact_freshness.py.
+    # Columns existed in the DB since fa073 but were unmapped here, so ORM
+    # writes silently no-opped (ADR 0015). DB-side check constraints:
+    #   contact_info_confidence IN ('high','medium','low','stale')
+    #   contact_refresh_status  IN ('fresh','due','queued','refreshed','failed')
+    contact_info_confidence: Mapped[Optional[str]] = mapped_column(String(20))
+    contact_info_confidence_score: Mapped[Optional[float]] = mapped_column(Numeric(4, 3))
+    contact_last_verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    contact_next_refresh_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    contact_refresh_status: Mapped[Optional[str]] = mapped_column(String(20))
+    contact_refresh_reason: Mapped[Optional[str]] = mapped_column(String(120))
+
+    # Set by the master weekly refresh (fa077) when contact data predates the
+    # latest refresh cycle. Unmapped until ADR 0015 (same drift as fa073 cols).
+    skip_trace_stale: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+
+    # Cross-source triangulation evidence (ADR 0015) — written by
+    # src/services/contact_triangulation.py alongside the freshness columns.
+    # Shape: {matched_phone, person, sources: [...], corroboration,
+    #         email_corroboration, matched_email, rule_fired, computed_at,
+    #         prev_label}
+    # DDL applied via scripts/apply_contactability_detail_migration.py
+    # (alembic fa078 file is the record — never `alembic upgrade`).
+    contactability_detail: Mapped[Optional[dict]] = mapped_column(JSONB)
+
     # Sunbiz registered agent — populated by Sunbiz Playwright scraper (LLC owners only)
     registered_agent_name: Mapped[Optional[str]] = mapped_column(String(255))
     registered_agent_address: Mapped[Optional[str]] = mapped_column(String(500))
@@ -796,6 +827,7 @@ class BuildingPermit(Base):
     issue_date: Mapped[Optional[datetime]] = mapped_column(Date)
     expire_date: Mapped[Optional[datetime]] = mapped_column(Date)
     status: Mapped[Optional[str]] = mapped_column(String(50))
+    description: Mapped[Optional[str]] = mapped_column(Text)
 
     # Enforcement flag — True for stop work orders, after-the-fact, failed/expired/revoked/suspended
     is_enforcement_permit: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
@@ -1482,7 +1514,11 @@ class EnrichedContact(Base):
     raw_response: Mapped[Optional[dict]] = mapped_column(JSONB)
 
     # Source tracking
-    source: Mapped[str] = mapped_column(String(50), nullable=False)   # batch_skip_tracing | idi | pdl
+    # batch_skip_tracing | idi | pdl | tracerfy | tax_collector
+    # 'tax_collector' rows (fa077) carry only mailing_address — the county
+    # tax-bill billing address when it differs from owners.mailing_address.
+    # Per ADR 0013 they are never promoted into owner phone/email columns.
+    source: Mapped[str] = mapped_column(String(50), nullable=False)
     match_success: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     # Which named individual was traced. NULL for legacy single-trace rows
@@ -1494,6 +1530,16 @@ class EnrichedContact(Base):
     # Waterfall quality score (0.000–1.000) — set by the waterfall coordinator
     confidence: Mapped[Optional[float]] = mapped_column(Numeric(4, 3), nullable=True)
 
+    # Contact verification + supersession chain (fa073) — unmapped until
+    # ADR 0015. verification_status: e.g. 'valid' | 'invalid' (consumed by
+    # contact_freshness). When a re-trace replaces this row's data, the old
+    # row is stamped superseded_at/superseded_by_contact_id instead of being
+    # mutated, preserving the audit trail.
+    verification_status: Mapped[Optional[str]] = mapped_column(String(20))
+    superseded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    superseded_by_contact_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("enriched_contacts.id"), nullable=True
+    )
     # Tracerfy distinguishes the API mode used: "normal" (name+address, 1 credit/hit)
     # vs "advanced" (address-only fallback, 2 credits/hit). NULL for non-Tracerfy rows.
     trace_type: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
@@ -1507,11 +1553,88 @@ class EnrichedContact(Base):
         Index("idx_enriched_match_success", "match_success"),
         Index("idx_enriched_source", "source"),
         Index("idx_ec_trace_type", "trace_type"),
-        CheckConstraint("source IN ('batch_skip_tracing', 'idi', 'pdl')", name="check_enriched_source"),
+        CheckConstraint(
+            "source IN ('batch_skip_tracing', 'idi', 'pdl', 'tracerfy', 'tax_collector')",
+            name="check_enriched_source",
+        ),
     )
 
     def __repr__(self):
         return f"<EnrichedContact(id={self.id}, property_id={self.property_id}, source='{self.source}', match={self.match_success})>"
+
+
+class Voter(Base):
+    """
+    Registered voters matched to a property by residential address (fa077).
+
+    Source: county SOE bulk registry files (Hillsborough "All Eligible Voters"
+    monthly report; FL DOS statewide extract as fallback). Multiple rows per
+    property are intended — they form the household's alternative contact
+    network (alt names, separate mailing addresses, phones, emails).
+
+    Contact-enrichment only: voter rows never feed CDS scoring and their
+    phones/emails are never auto-promoted into owners.* or any send path
+    (ADR 0013 — they bypass the Tracerfy DNC scrub and often belong to
+    non-owner co-residents).
+
+    `phones` accumulates history across monthly loads (list of normalized
+    numbers, newest last); `phone_1` is the current number.
+    """
+    __tablename__ = "voters"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    property_id: Mapped[int] = mapped_column(ForeignKey("properties.id"), nullable=False, index=True)
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+
+    # Source identity
+    source_voter_id: Mapped[str] = mapped_column(String(20), nullable=False)
+
+    # Names
+    voter_name: Mapped[Optional[str]] = mapped_column(String(255), index=True)
+    first_name: Mapped[Optional[str]] = mapped_column(String(100))
+    middle_name: Mapped[Optional[str]] = mapped_column(String(100))
+    last_name: Mapped[Optional[str]] = mapped_column(String(100))
+
+    # Residential (match basis) + mailing (alt contact path; NULL = same as residence)
+    residential_address: Mapped[Optional[str]] = mapped_column(String(500))
+    residential_city: Mapped[Optional[str]] = mapped_column(String(100))
+    residential_zip: Mapped[Optional[str]] = mapped_column(String(10))
+    mailing_address: Mapped[Optional[str]] = mapped_column(String(500))
+
+    # Registration
+    registration_status: Mapped[Optional[str]] = mapped_column(String(10))  # ACT | INA
+    registration_date: Mapped[Optional[date]] = mapped_column(Date)
+
+    # Isolated contact data (ADR 0013)
+    phones: Mapped[Optional[list]] = mapped_column(JSONB, default=list)
+    phone_1: Mapped[Optional[str]] = mapped_column(String(20))
+    email: Mapped[Optional[str]] = mapped_column(String(255))
+
+    meta_data: Mapped[Optional[dict]] = mapped_column(JSONB)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), onupdate=func.now()
+    )
+
+    property: Mapped["Property"] = relationship("Property")
+
+    __table_args__ = (
+        UniqueConstraint("county_id", "source_voter_id", name="uq_voter_county_source_id"),
+        Index("idx_voter_registration_status", "registration_status"),
+        CheckConstraint(
+            "registration_status IN ('ACT', 'INA') OR registration_status IS NULL",
+            name="check_voter_registration_status",
+        ),
+    )
+
+    def __repr__(self):
+        return (
+            f"<Voter(id={self.id}, property_id={self.property_id}, "
+            f"name='{self.voter_name}', status='{self.registration_status}')>"
+        )
 
 
 # ============================================================================
@@ -1838,6 +1961,38 @@ class UnmatchedRecord(Base):
 # 8. LEAD PACK PURCHASES
 # ============================================================================
 
+class LeadExclusivity(Base):
+    """
+    Database-backed cross-trade exclusivity for leads.
+    
+    Replaces Redis lead_hold as the authoritative source for exclusivity.
+    Each row represents a property locked for a specific subscriber/trade.
+    """
+    __tablename__ = "lead_exclusivity"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    
+    property_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    zip_code: Mapped[str] = mapped_column(String(10), nullable=False)
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    sold_to_trade: Mapped[str] = mapped_column(String(50), nullable=False)
+    
+    source: Mapped[str] = mapped_column(String(20), nullable=False)  # 'lead_pack' or 'bundle'
+    source_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    
+    exclusive_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("property_id", "source", name="uq_property_source"),
+        CheckConstraint("source IN ('lead_pack', 'bundle')", name="ck_lead_exclusivity_source"),
+        Index("idx_exclusivity_zip_county", "zip_code", "county_id", "exclusive_until"),
+        Index("idx_exclusivity_until", "exclusive_until"),
+    )
+
+
 class LeadPackPurchase(Base):
     """
     Tracks $99 lead pack purchases (5 leads, 72-hour exclusivity).
@@ -1866,18 +2021,32 @@ class LeadPackPurchase(Base):
     )
 
     # Lifecycle
+    #   pending    — row created, leads not yet reserved (transient)
+    #   enriching  — 5 leads reserved at payment; awaiting Hot-Enrichment (ADR 0018)
+    #   delivered  — Quality Floor cleared, leads handed over
+    #   expired    — non-recoverable selection error (e.g. unknown vertical)
+    #   refunded   — short pack, unlaunched county, or Quality Floor miss
     status: Mapped[str] = mapped_column(
         String(20), default="pending", nullable=False
-    )  # pending | delivered | expired
+    )
 
     # Timestamps
     purchased_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
     )
-    delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
-    exclusive_until: Mapped[Optional[datetime]] = mapped_column(DateTime)  # purchased_at + 72h
+    delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    exclusive_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))  # purchased_at + 72h
+    refunded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
-    # The 5 selected property IDs (set at purchase time)
+    # Hot-Enrichment (ADR 0018) — post-payment Tracerfy re-trace of the reserved 5.
+    enrichment_submitted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    tracerfy_queue_id: Mapped[Optional[str]] = mapped_column(String(50))
+
+    # Refund info
+    refund_reason: Mapped[Optional[str]] = mapped_column(String(100))
+    stripe_refund_id: Mapped[Optional[str]] = mapped_column(String(100))
+
+    # The 5 selected property IDs (reserved at payment time)
     lead_ids: Mapped[Optional[list]] = mapped_column(ARRAY(Integer))
 
     # Relationship
@@ -1885,11 +2054,12 @@ class LeadPackPurchase(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "status IN ('pending', 'delivered', 'expired')",
+            "status IN ('pending', 'enriching', 'delivered', 'expired', 'refunded')",
             name="check_lead_pack_status",
         ),
         Index("idx_lead_pack_zip_vertical", "zip_code", "vertical"),
         Index("idx_lead_pack_exclusive_until", "exclusive_until"),
+        Index("idx_lead_pack_status", "status"),
     )
 
     def __repr__(self):
@@ -1924,6 +2094,37 @@ class StripeWebhookEvent(Base):
 
     def __repr__(self):
         return f"<StripeWebhookEvent(event_id={self.event_id}, type={self.event_type})>"
+
+
+class CoraEventQueue(Base):
+    """
+    Durable fallback queue for Cora bus events when Redis is unavailable
+    (fa072). `publish_cora_event` writes here + emits NOTIFY cora_events; the
+    Postgres listener drains pending rows on startup and every 60s.
+
+    The table already exists in the DB; this ORM mapping was missing, which
+    broke the Redis-down fallback path in src/agents/events/ingestion.py.
+    """
+    __tablename__ = "cora_event_queue"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    event_type: Mapped[str] = mapped_column(Text, nullable=False)
+    subscriber_id: Mapped[Optional[int]] = mapped_column(Integer)
+    payload: Mapped[Optional[dict]] = mapped_column(JSONB)
+    idempotency_key: Mapped[Optional[str]] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="pending")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    error: Mapped[Optional[str]] = mapped_column(Text)
+
+    __table_args__ = (
+        Index("idx_cora_event_queue_status", "status", "created_at"),
+    )
+
+    def __repr__(self):
+        return f"<CoraEventQueue(id={self.id}, type={self.event_type}, status={self.status})>"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
