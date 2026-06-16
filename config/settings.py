@@ -493,6 +493,9 @@ class AppSettings(BaseSettings):
 	wl_api_requests_per_day: int = Field(default=10000, env="WL_API_REQUESTS_PER_DAY")
 	# Directory for WL client logo uploads (relative to repo root)
 	wl_logo_upload_dir: str = Field(default="reports/white_label_logos", env="WL_LOGO_UPLOAD_DIR")
+	# Comma-separated extra CORS origins for white-label client frontends.
+	# wl_frontend_base_url is always included; add client-hosted app domains here.
+	wl_allowed_origins: str = Field(default="", env="WL_ALLOWED_ORIGINS")
 	# Clay enrichment API key (for /api/wl/data/contractors)
 	clay_api_key: Optional[SecretStr] = Field(default=None, env="CLAY_API_KEY")
 	clay_api_base: str = Field(default="https://api.clay.com/v1", env="CLAY_API_BASE")

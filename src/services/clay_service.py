@@ -12,6 +12,7 @@ Each request returns a list of contractor objects with fields:
 """
 
 import logging
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -132,6 +133,8 @@ def get_or_refresh_enrichment(
         logger.debug("[clay] serving cached enrichment for client %d %s/%s", client_id, county_id, vertical)
         return existing.data or []
 
+    run_id = str(uuid.uuid4())
+
     # Fetch fresh data from Clay
     fresh_data = enrich_contractors(county_id, vertical)
 
@@ -139,25 +142,27 @@ def get_or_refresh_enrichment(
         db.execute(
             sa_text("""
                 UPDATE white_label_contractor_enrichments
-                   SET data = :data, enriched_at = now()
+                   SET data = :data, clay_run_id = :run_id, enriched_at = now()
                  WHERE id = :id
             """),
-            {"data": fresh_data, "id": existing.id},
+            {"data": fresh_data, "run_id": run_id, "id": existing.id},
         )
     else:
         db.execute(
             sa_text("""
                 INSERT INTO white_label_contractor_enrichments
-                       (client_id, county_id, vertical, data, enriched_at, created_at)
-                VALUES (:cid, :county, :vert, :data, now(), now())
+                       (client_id, county_id, vertical, data, clay_run_id, enriched_at, created_at)
+                VALUES (:cid, :county, :vert, :data, :run_id, now(), now())
                 ON CONFLICT (client_id, county_id, vertical)
-                DO UPDATE SET data = EXCLUDED.data, enriched_at = EXCLUDED.enriched_at
+                DO UPDATE SET data = EXCLUDED.data, clay_run_id = EXCLUDED.clay_run_id,
+                              enriched_at = EXCLUDED.enriched_at
             """),
             {
                 "cid": client_id,
                 "county": county_id,
                 "vert": vertical,
                 "data": fresh_data,
+                "run_id": run_id,
             },
         )
     db.commit()

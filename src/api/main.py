@@ -70,9 +70,14 @@ logger = logging.getLogger(__name__)
 
 
 app = FastAPI(title="Forced Action API", version="1.0.0")
+_s = get_settings()
+_cors_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
+if _s.wl_frontend_base_url and _s.wl_frontend_base_url not in _cors_origins:
+    _cors_origins.append(_s.wl_frontend_base_url)
+_cors_origins.extend(o.strip() for o in _s.wl_allowed_origins.split(",") if o.strip())
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=list(dict.fromkeys(_cors_origins)),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
