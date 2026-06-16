@@ -2077,6 +2077,37 @@ class StripeWebhookEvent(Base):
         return f"<StripeWebhookEvent(event_id={self.event_id}, type={self.event_type})>"
 
 
+class CoraEventQueue(Base):
+    """
+    Durable fallback queue for Cora bus events when Redis is unavailable
+    (fa072). `publish_cora_event` writes here + emits NOTIFY cora_events; the
+    Postgres listener drains pending rows on startup and every 60s.
+
+    The table already exists in the DB; this ORM mapping was missing, which
+    broke the Redis-down fallback path in src/agents/events/ingestion.py.
+    """
+    __tablename__ = "cora_event_queue"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    event_type: Mapped[str] = mapped_column(Text, nullable=False)
+    subscriber_id: Mapped[Optional[int]] = mapped_column(Integer)
+    payload: Mapped[Optional[dict]] = mapped_column(JSONB)
+    idempotency_key: Mapped[Optional[str]] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="pending")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    error: Mapped[Optional[str]] = mapped_column(Text)
+
+    __table_args__ = (
+        Index("idx_cora_event_queue_status", "status", "created_at"),
+    )
+
+    def __repr__(self):
+        return f"<CoraEventQueue(id={self.id}, type={self.event_type}, status={self.status})>"
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Phase 2B Models
 # ══════════════════════════════════════════════════════════════════════════════
