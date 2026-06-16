@@ -615,6 +615,15 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
                 zip_code, vertical, county_id, territory.subscriber_id,
             )
 
+    # Bust zip_availability cache for every (county_id, vertical) pair that was locked.
+    from src.core.redis_client import rdelete
+    _seen_pairs: set = set()
+    for _zip_code in zip_codes:
+        _pair = (county_id, vertical)
+        if _pair not in _seen_pairs:
+            rdelete(f"zip_availability:{county_id}:{vertical}")
+            _seen_pairs.add(_pair)
+
     # ── Push to GHL stage 5 ────────────────────────────────────────────────
     # Pass `db=` so the GHL push's audit row joins the parent transaction —
     # otherwise webhook_log opens its own session that can't see the
@@ -1348,9 +1357,11 @@ def _on_subscription_deleted(subscription: dict, db: Session) -> None:
         )
     ).scalars().all()
 
+    from src.core.redis_client import rdelete as _rdelete
     for territory in territories:
         territory.status = "grace"
         territory.grace_expires_at = grace_expires
+        _rdelete(f"zip_availability:{territory.county_id}:{territory.vertical}")
 
     churn_tag = "churned_founding" if subscriber.founding_member else "churned_regular"
 

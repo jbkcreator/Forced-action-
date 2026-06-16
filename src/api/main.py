@@ -1106,6 +1106,16 @@ def zip_availability(
             detail={"error": "invalid_vertical", "message": f"vertical must be one of: {sorted(VALID_VERTICALS)}"},
         )
 
+    from src.core.redis_client import redis_available, rget, rset
+    _cache_key = f"zip_availability:{county_id}:{vertical}"
+    _CACHE_TTL = 1800  # 30 minutes — data only changes when CDS runs at 07:00
+
+    if redis_available():
+        cached = rget(_cache_key)
+        if cached:
+            return json.loads(cached)
+
+
     try:
         # All distinct ZIPs with property counts
         zip_rows = db.execute(
@@ -1194,11 +1204,16 @@ def zip_availability(
             "waitlist_count": waitlist_map.get(zip_code, 0),
         })
 
-    return {
+    payload = {
         "vertical": vertical,
         "county_id": county_id,
         "zips": result,
     }
+
+    if redis_available():
+        rset(_cache_key, json.dumps(payload), ttl_seconds=_CACHE_TTL)
+
+    return payload
 
 
 # ---------------------------------------------------------------------------
