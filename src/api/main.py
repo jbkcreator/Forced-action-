@@ -512,6 +512,42 @@ def get_pricing_info():
 # POST /api/checkout — Create Stripe checkout session
 # ---------------------------------------------------------------------------
 
+# ── Meta Ads attribution → Stripe metadata (S2) ──────────────────────────────
+# Attribution keys forwarded from the frontend localStorage store into Stripe
+# metadata so the webhook can stamp the subscriber + fire the Meta CAPI Purchase
+# event. The buyer's IP/User-Agent must be captured HERE (the buyer's request),
+# never from the Stripe webhook request (that is Stripe's server).
+_ATTRIBUTION_META_KEYS = (
+    "utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term",
+    "campaign_id", "attribution_token", "fbclid", "ref",
+)
+# Stripe caps each metadata value at 500 chars.
+_MAX_META_VALUE_LEN = 480
+
+
+def _attribution_stripe_metadata(request: Request, attribution: Optional[dict]) -> dict:
+    """Build a compact, non-empty Stripe-metadata dict from buyer attribution.
+
+    Captures buyer IP + User-Agent from the buyer's own request and merges the
+    attribution values the frontend forwarded. Empty values are dropped; the
+    user-agent is truncated to stay under Stripe's 500-char metadata limit.
+    """
+    out: dict = {}
+    attribution = attribution or {}
+    for key in _ATTRIBUTION_META_KEYS:
+        value = attribution.get(key)
+        if value:
+            out[key] = str(value)[:_MAX_META_VALUE_LEN]
+
+    buyer_ip = _client_ip_for_waitlist(request)
+    if buyer_ip and buyer_ip != "unknown":
+        out["buyer_ip"] = buyer_ip[:_MAX_META_VALUE_LEN]
+    user_agent = request.headers.get("user-agent")
+    if user_agent:
+        out["buyer_user_agent"] = user_agent[:_MAX_META_VALUE_LEN]
+    return out
+
+
 class CheckoutRequest(BaseModel):
     tier: str        # starter | pro | dominator
     vertical: str    # roofing | remediation | investor
@@ -519,6 +555,7 @@ class CheckoutRequest(BaseModel):
     zip_codes: list[str] = []  # ZIP territories to lock on purchase
     email: str       # collected before checkout — used to block duplicate subscriptions
     consent_acceptance: Optional[ConsentAcceptanceRequest] = None
+    attribution: Optional[dict] = None  # Meta Ads attribution (utm_*, campaign_id, fbclid, ...)
 
     @field_validator("email")
     @classmethod
@@ -569,7 +606,7 @@ class CheckoutRequest(BaseModel):
 
 
 @app.post("/api/checkout")
-def create_checkout(payload: CheckoutRequest, db: Session = Depends(get_db)):
+def create_checkout(payload: CheckoutRequest, request: Request, db: Session = Depends(get_db)):
 
     _s = get_settings()
     stripe.api_key = _s.active_stripe_secret_key.get_secret_value()
@@ -683,20 +720,24 @@ def create_checkout(payload: CheckoutRequest, db: Session = Depends(get_db)):
         except Exception:
             logger.warning("ConsentAcceptance write failed in checkout (non-fatal):", exc_info=True)
 
+    checkout_metadata = {
+        "tier": payload.tier,
+        "vertical": payload.vertical,
+        "county_id": payload.county_id,
+        "is_founding": str(is_founding),
+        "founding_price_id": price_id if is_founding else "",
+        "zip_codes": ",".join(payload.zip_codes),
+    }
+    # Meta Ads attribution + buyer IP/UA captured from the buyer's request.
+    checkout_metadata.update(_attribution_stripe_metadata(request, payload.attribution))
+
     try:
         session = stripe.checkout.Session.create(
             mode="subscription",
             ui_mode="embedded",
             customer_email=payload.email,   # pre-fills email in Stripe form
             line_items=[{"price": price_id, "quantity": 1}],
-            metadata={
-                "tier": payload.tier,
-                "vertical": payload.vertical,
-                "county_id": payload.county_id,
-                "is_founding": str(is_founding),
-                "founding_price_id": price_id if is_founding else "",
-                "zip_codes": ",".join(payload.zip_codes),
-            },
+            metadata=checkout_metadata,
             return_url=f"{_s.app_base_url}/success?session_id={{CHECKOUT_SESSION_ID}}",
         )
     except stripe.error.CardError as e:
@@ -1595,7 +1636,7 @@ def event_feed(
                         })
         except Exception as exc:
             logger.warning("free-tier unlocked leads query failed for sub=%s: %s",
-                           subscriber.id, exc)
+                           subscriber.id, exc, exc_info=True)
 
         # Free-tier blurred stack — gives the dashboard real content to render
         # instead of a dead empty state. Each card is "Unlock for $4".
@@ -2069,8 +2110,15 @@ def resend_confirmation(payload: ResendConfirmationRequest, db: Session = Depend
         raise HTTPException(status_code=422, detail={"error": "no_email", "message": "No email address on record"})
 
     try:
-        from src.services.stripe_webhooks import _send_welcome_email
-        _send_welcome_email(subscriber)
+        from src.services.email import send_welcome_email
+        from src.services import subscriber_auth as _sub_auth
+        feed_password = None
+        if not subscriber.password_hash:
+            feed_password = _sub_auth.generate_random_password()
+            subscriber.password_hash = _sub_auth.hash_password(feed_password)
+            subscriber.password_set_at = datetime.now(timezone.utc)
+            db.flush()
+        send_welcome_email(subscriber, plaintext_password=feed_password)
     except Exception:
         logger.error("Failed to resend confirmation for feed %s", payload.feed_uuid, exc_info=True)
         raise HTTPException(status_code=500, detail={"error": "send_failed", "message": "Failed to send email"})
@@ -2802,10 +2850,11 @@ class LeadPackCheckoutRequest(BaseModel):
     zip_code: str
     vertical: str
     county_id: str = "hillsborough"
+    attribution: Optional[dict] = None  # Meta Ads attribution (utm_*, campaign_id, fbclid, ...)
 
 
 @app.post("/api/lead-pack/checkout")
-def lead_pack_checkout(payload: LeadPackCheckoutRequest, db: Session = Depends(get_db)):
+def lead_pack_checkout(payload: LeadPackCheckoutRequest, request: Request, db: Session = Depends(get_db)):
     """
     Create a Stripe PaymentIntent for a $99 lead pack.
     Returns { client_secret, publishable_key, amount, currency }.
@@ -2915,17 +2964,21 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, db: Session = Depends(g
         logger.error("Stripe error retrieving lead pack price: %s", exc)
         raise HTTPException(status_code=502, detail={"error": "payment_unavailable", "message": "Could not retrieve price"})
 
+    lead_pack_metadata = {
+        "product":   "lead_pack",
+        "feed_uuid": payload.feed_uuid,
+        "zip_code":  payload.zip_code,
+        "vertical":  payload.vertical,
+        "county_id": payload.county_id,
+    }
+    # Meta Ads attribution + buyer IP/UA captured from the buyer's request.
+    lead_pack_metadata.update(_attribution_stripe_metadata(request, payload.attribution))
+
     try:
         intent = stripe.PaymentIntent.create(
             amount=amount,
             currency=currency,
-            metadata={
-                "product":   "lead_pack",
-                "feed_uuid": payload.feed_uuid,
-                "zip_code":  payload.zip_code,
-                "vertical":  payload.vertical,
-                "county_id": payload.county_id,
-            },
+            metadata=lead_pack_metadata,
             description=f"Lead Pack — {payload.zip_code} / {payload.vertical}",
         )
     except stripe.StripeError as exc:
@@ -5044,10 +5097,11 @@ class BundleCheckoutRequest(BaseModel):
     zip_code: Optional[str] = None
     vertical: Optional[str] = None
     ab_variant: Optional[str] = None
+    attribution: Optional[dict] = None  # Meta Ads attribution (utm_*, campaign_id, fbclid, ...)
 
 
 @app.post("/api/bundle/checkout", status_code=201)
-def bundle_checkout(req: BundleCheckoutRequest, db: Session = Depends(get_db)):
+def bundle_checkout(req: BundleCheckoutRequest, request: Request, db: Session = Depends(get_db)):
     """Create a Stripe PaymentIntent for a bundle purchase.
     Returns { client_secret, publishable_key, amount, currency, bundle_type }.
     """
@@ -5073,6 +5127,7 @@ def bundle_checkout(req: BundleCheckoutRequest, db: Session = Depends(get_db)):
             zip_code=req.zip_code or "",
             vertical=req.vertical or "",
             db=db,
+            extra_metadata=_attribution_stripe_metadata(request, req.attribution),
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -5293,11 +5348,12 @@ class PaymentIntentRequest(BaseModel):
     description: str
     save_card: bool = False
     metadata: Optional[dict] = None
+    attribution: Optional[dict] = None  # Meta Ads attribution (utm_*, campaign_id, fbclid, ...)
 
 
 @app.post("/api/payment-intent", status_code=201)
 def create_payment_intent_endpoint(
-    req: PaymentIntentRequest, db: Session = Depends(get_db)
+    req: PaymentIntentRequest, request: Request, db: Session = Depends(get_db)
 ):
     """Create a Stripe PaymentIntent for the Payment Sheet SDK."""
     from src.services.payment_sheet import create_payment_intent
@@ -5327,6 +5383,9 @@ def create_payment_intent_endpoint(
         except Exception as exc:
             logger.warning("[PaymentIntent] lead hold check failed (non-blocking): %s", exc)
 
+    # Merge buyer attribution / Meta CAPI context; existing product metadata wins.
+    pi_metadata = {**_attribution_stripe_metadata(request, req.attribution), **(req.metadata or {})}
+
     try:
         result = create_payment_intent(
             subscriber_id=sub.id,
@@ -5334,7 +5393,7 @@ def create_payment_intent_endpoint(
             description=req.description,
             save_card=req.save_card,
             db=db,
-            metadata=req.metadata,
+            metadata=pi_metadata,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
@@ -5352,6 +5411,7 @@ class PremiumPurchaseRequest(BaseModel):
     payment_mode: str = Field(..., description="credits | card")
     property_id: Optional[int] = None
     target_address: Optional[str] = Field(default=None, max_length=255)
+    attribution: Optional[dict] = None  # Meta Ads attribution (utm_*, campaign_id, fbclid, ...)
 
     @field_validator("sku")
     @classmethod
@@ -5370,7 +5430,7 @@ class PremiumPurchaseRequest(BaseModel):
 
 @app.post("/api/premium/purchase", status_code=201)
 def premium_purchase_endpoint(
-    req: PremiumPurchaseRequest, db: Session = Depends(get_db)
+    req: PremiumPurchaseRequest, request: Request, db: Session = Depends(get_db)
 ):
     """
     Stage 5 — Premium credit SKU purchase.
@@ -5486,6 +5546,7 @@ def premium_purchase_endpoint(
             save_card=True,
             db=db,
             metadata={
+                **_attribution_stripe_metadata(request, req.attribution),
                 "product": "premium",
                 "sku": req.sku,
                 "property_id": str(req.property_id) if req.property_id else "",

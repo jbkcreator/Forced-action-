@@ -47,6 +47,7 @@ CONVERSION_TYPES: frozenset[str] = frozenset({
     "data_only_save",
     "deal_win_reported",
     "failed_payment_recovered",
+    "lead_pack_purchase",
 })
 
 # ── Scoring weights ───────────────────────────────────────────────────────────
@@ -65,6 +66,7 @@ SCORE_WEIGHTS: dict[str, int] = {
     "data_only_save":            15,
     "deal_win_reported":         25,
     "failed_payment_recovered":   5,
+    "lead_pack_purchase":        10,
     # bonus applied on top of deal_win when deal_size_bucket in ('10_25k','25k_plus')
     "_deal_size_10k_plus_bonus": 20,
 }

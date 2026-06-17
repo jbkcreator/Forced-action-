@@ -69,6 +69,69 @@ def _init_stripe() -> bool:
     return True
 
 
+# Campaign attribution fields stamped from Stripe metadata onto a subscriber.
+_CAMPAIGN_META_FIELDS = (
+    "utm_source",
+    "utm_medium",
+    "utm_campaign",
+    "campaign_id",
+    "attribution_token",
+)
+
+
+def _stamp_campaign_fields(subscriber, meta, db: Session) -> None:
+    """Backfill subscriber campaign fields from Stripe metadata — NULL-only.
+
+    The buyer's attribution (utm_*, campaign_id, fbclid) is stamped into Stripe
+    metadata at checkout/PI creation. Persist it onto the subscriber row so paid
+    checkouts — not just free-signup origins — carry campaign attribution for the
+    ROAS endpoint. Only writes fields that are currently NULL so it never
+    overwrites attribution captured earlier via /api/free-signup. Reads via
+    `_attr` so it works for both plain dicts and Stripe SDK objects.
+    """
+    if meta is None:
+        return
+    changed = False
+    for field in _CAMPAIGN_META_FIELDS:
+        value = _attr(meta, field)
+        if value and getattr(subscriber, field, None) is None:
+            setattr(subscriber, field, value)
+            changed = True
+    if changed:
+        db.flush()
+
+
+def _fire_capi_for_pi(payment_intent, subscriber, source: str, event_id: str, db: Session) -> None:
+    """Fire a Meta CAPI Purchase for a PaymentIntent-based product. Never raises.
+
+    Shared by the lead-unlock / bundle / premium handlers. Reads buyer context
+    (IP/UA + attribution) from the PaymentIntent metadata stamped at creation
+    time, NULL-stamps the subscriber's campaign fields, then reports the event.
+    Isolated in its own try/except so a Meta failure never disturbs fulfillment.
+    """
+    try:
+        meta = _attr(payment_intent, "metadata") or {}
+        _stamp_campaign_fields(subscriber, meta, db)
+        amount_cents = _attr(payment_intent, "amount_received") or _attr(payment_intent, "amount") or 0
+        from src.services.meta_capi_service import fire_purchase_event
+        fire_purchase_event(
+            subscriber=subscriber,
+            amount=round(amount_cents / 100, 2),
+            source=source,
+            request_context={
+                "buyer_ip": _attr(meta, "buyer_ip"),
+                "buyer_user_agent": _attr(meta, "buyer_user_agent"),
+                "fbclid": _attr(meta, "fbclid"),
+                "utm_campaign": _attr(meta, "utm_campaign"),
+                "campaign_id": _attr(meta, "campaign_id"),
+                "currency": (_attr(payment_intent, "currency") or "usd").upper(),
+            },
+            event_id=event_id,
+        )
+    except Exception:
+        logger.warning("Meta CAPI %s purchase failed — non-fatal", source, exc_info=True)
+
+
 def handle_webhook(raw_body: bytes, sig_header: str, db: Session) -> tuple[bool, str]:
     """
     Verify and dispatch a Stripe webhook event.
@@ -723,9 +786,14 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
             subscriber.id, exc_info=True,
         )
 
-    from src.services.segmentation_engine import reclassify_safe
-    from src.services.revenue_signal import ACTION_CHECKOUT_COMPLETED
-    reclassify_safe(subscriber.id, db, action_type=ACTION_CHECKOUT_COMPLETED)
+    # Segmentation is post-activation analytics — never let it abort the handler
+    # before the revenue-attribution + Meta CAPI steps below.
+    try:
+        from src.services.segmentation_engine import reclassify_safe
+        from src.services.revenue_signal import ACTION_CHECKOUT_COMPLETED
+        reclassify_safe(subscriber.id, db, action_type=ACTION_CHECKOUT_COMPLETED)
+    except Exception:
+        logger.warning("checkout: reclassify failed sub=%s — non-fatal", subscriber.id, exc_info=True)
 
     try:
         from src.services.attribution_service import record_conversion_attribution
@@ -741,10 +809,37 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
             subscriber_id=subscriber.id,
             occurred_at=now,
             zip_code=zip_codes[0] if zip_codes else None,
+            revenue_amount=round((session.get("amount_total") or 0) / 100, 2),
             db=db,
         )
     except Exception:
         logger.warning("Attribution recording failed sub=%s", subscriber.id, exc_info=True)
+
+    # ── Meta CAPI (S2): report server-side Purchase ──────────────────────────
+    # Observer only — runs after the subscriber is active, ZIPs are locked, and
+    # attribution is recorded. Stamps campaign fields onto the subscriber when
+    # they're still NULL (never overwriting free-signup attribution), then fires
+    # the Purchase event. Feature-gated and fully isolated: a missing/failed Meta
+    # call must never roll back subscription activation.
+    try:
+        _stamp_campaign_fields(subscriber, meta, db)
+        from src.services.meta_capi_service import fire_purchase_event
+        fire_purchase_event(
+            subscriber=subscriber,
+            amount=round((session.get("amount_total") or 0) / 100, 2),
+            source="subscription",
+            request_context={
+                "buyer_ip": meta.get("buyer_ip"),
+                "buyer_user_agent": meta.get("buyer_user_agent"),
+                "fbclid": meta.get("fbclid"),
+                "utm_campaign": meta.get("utm_campaign"),
+                "campaign_id": meta.get("campaign_id"),
+                "currency": (session.get("currency") or "usd").upper(),
+            },
+            event_id=f"sub_{session.get('id', '')}",
+        )
+    except Exception:
+        logger.warning("Meta CAPI subscription purchase failed sub=%s — non-fatal", subscriber.id, exc_info=True)
 
     # Campaign conversion attribution (B6)
     try:
@@ -1682,23 +1777,27 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
         ).limit(1)
     ).scalar_one_or_none()
 
-    # Audit row — SentLead marks this lead as delivered to this subscriber
+    # Audit row — SentLead marks this lead as delivered to this subscriber.
+    # Uses begin_nested() so a race-condition IntegrityError only rolls back
+    # this savepoint, leaving the outer transaction (and the session) clean.
     try:
-        existing_sent = db.execute(
-            select(SentLead).where(
-                SentLead.subscriber_id == subscriber.id,
-                SentLead.property_id == property_id,
-            )
-        ).scalar_one_or_none()
-        if not existing_sent:
-            db.add(SentLead(
-                subscriber_id=subscriber.id,
-                property_id=property_id,
-                source="lead_unlock_payment",
-                stripe_payment_intent_id=_attr(payment_intent, "id"),
-            ))
-        elif existing_sent and not existing_sent.stripe_payment_intent_id:
-            existing_sent.stripe_payment_intent_id = _attr(payment_intent, "id")
+        with db.begin_nested():
+            existing_sent = db.execute(
+                select(SentLead).where(
+                    SentLead.subscriber_id == subscriber.id,
+                    SentLead.property_id == property_id,
+                )
+            ).scalar_one_or_none()
+            if not existing_sent:
+                db.add(SentLead(
+                    subscriber_id=subscriber.id,
+                    property_id=property_id,
+                    source="lead_unlock_payment",
+                    stripe_payment_intent_id=_attr(payment_intent, "id"),
+                ))
+                db.flush()
+            elif existing_sent and not existing_sent.stripe_payment_intent_id:
+                existing_sent.stripe_payment_intent_id = _attr(payment_intent, "id")
     except (IntegrityError, OperationalError) as exc:
         logger.warning("lead_unlock: SentLead insert failed: %s", exc)
 
@@ -1723,6 +1822,8 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
 
     # Welcome email — deferred from /api/free-signup with intent='unlock'.
     # Sent only on the first unlock so repeat unlocks don't spam the inbox.
+    # Mirrors the checkout handler: generate + email the plaintext password
+    # only if the subscriber doesn't already have one set.
     try:
         first_unlock = db.execute(
             select(func.count()).select_from(SentLead).where(
@@ -1732,7 +1833,21 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
         ).scalar() or 0
         if first_unlock <= 1:
             from src.services.email import send_welcome_email
-            send_welcome_email(subscriber)
+            from src.services import subscriber_auth as _sub_auth
+            feed_password = None
+            if not subscriber.password_hash:
+                try:
+                    feed_password = _sub_auth.generate_random_password()
+                    subscriber.password_hash = _sub_auth.hash_password(feed_password)
+                    subscriber.password_set_at = datetime.now(timezone.utc)
+                    db.flush()
+                except Exception:
+                    feed_password = None
+                    logger.warning(
+                        "lead_unlock: feed password setup failed for sub=%s",
+                        subscriber.id, exc_info=True,
+                    )
+            send_welcome_email(subscriber, plaintext_password=feed_password)
     except Exception as exc:
         logger.warning("lead_unlock: welcome email failed sub=%s: %s",
                        subscriber.id, exc)
@@ -1742,13 +1857,23 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
         subscriber.id, property_id, _attr(payment_intent, "id"),
     )
 
-    from src.services.segmentation_engine import reclassify_safe
-    from src.services.revenue_signal import ACTION_LEAD_UNLOCK_PAID
-    reclassify_safe(
-        subscriber.id, db,
-        action_type=ACTION_LEAD_UNLOCK_PAID,
-        metadata={"property_id": property_id, "score": int(score) if score else None},
-    )
+    # Segmentation is post-fulfillment analytics — never let it abort the handler
+    # before the revenue-attribution + Meta CAPI steps below.
+    try:
+        from src.services.segmentation_engine import reclassify_safe
+        from src.services.revenue_signal import ACTION_LEAD_UNLOCK_PAID
+        _score_value = (
+            int(score.final_cds_score)
+            if score is not None and score.final_cds_score is not None
+            else None
+        )
+        reclassify_safe(
+            subscriber.id, db,
+            action_type=ACTION_LEAD_UNLOCK_PAID,
+            metadata={"property_id": property_id, "score": _score_value},
+        )
+    except Exception:
+        logger.warning("lead_unlock: reclassify failed sub=%s — non-fatal", subscriber.id, exc_info=True)
 
     try:
         from src.services.attribution_service import record_conversion_attribution
@@ -1763,6 +1888,11 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
         )
     except Exception:
         logger.warning("Attribution recording failed sub=%s", subscriber.id, exc_info=True)
+
+    _fire_capi_for_pi(
+        payment_intent, subscriber, "lead_unlock",
+        f"unlock_{_attr(payment_intent, 'id') or ''}", db,
+    )
 
 
 def _send_lead_unlock_email(subscriber, prop, score, owner, enriched) -> None:
@@ -2085,6 +2215,10 @@ def _on_bundle_payment(payment_intent, db: Session) -> None:
     except Exception:
         logger.warning("Attribution recording failed sub=%s", subscriber_id, exc_info=True)
 
+    _sub_bundle = db.get(Subscriber, subscriber_id)
+    if _sub_bundle is not None:
+        _fire_capi_for_pi(payment_intent, _sub_bundle, "bundle", f"bundle_{pi_id}", db)
+
     # Stage 5: record A/B conversion if a variant was assigned
     if ab_variant in ("a", "b"):
         try:
@@ -2189,6 +2323,10 @@ def _on_premium_payment(payment_intent, db: Session) -> None:
         "[Premium] Purchase recorded: id=%d sku=%s subscriber=%d pi=%s",
         purchase.id, sku, subscriber_id, pi_id,
     )
+
+    _sub_premium = db.get(Subscriber, subscriber_id)
+    if _sub_premium is not None:
+        _fire_capi_for_pi(payment_intent, _sub_premium, "premium", f"premium_{pi_id}", db)
 
     # fa017: business event audit trail
     try:
@@ -3124,6 +3262,57 @@ def _on_lead_pack_payment(payment_intent: dict, db: Session) -> None:
             logger.warning(
                 "[LeadPack] publish lead_pack_reserved failed for purchase %s "
                 "(cron sweep is backstop): %s", purchase.id, pub_exc,
+            )
+
+        # ── Revenue attribution + Meta CAPI (S2) ─────────────────────────────
+        # Reaches here only on a confirmed, non-refunded reservation (both refund
+        # branches above already returned). Records revenue in the attribution
+        # ledger for ROAS and reports the Purchase to Meta. Wrapped in its own
+        # try/except so a failure here can NEVER trigger the outer reservation
+        # rollback/raise — CAPI is an observer and money is already captured.
+        try:
+            _amount_cents = _attr(payment_intent, "amount_received") or _attr(payment_intent, "amount") or 0
+            _amount_dollars = round(_amount_cents / 100, 2)
+
+            _stamp_campaign_fields(subscriber, meta if isinstance(meta, dict) else {}, db)
+
+            try:
+                from src.services.attribution_service import record_conversion_attribution
+                record_conversion_attribution(
+                    conversion_type="lead_pack_purchase",
+                    source_table="lead_pack_purchases",
+                    source_event_id=stripe_payment_intent_id,
+                    subscriber_id=subscriber.id,
+                    occurred_at=now,
+                    zip_code=zip_code,
+                    revenue_amount=_amount_dollars,
+                    db=db,
+                )
+            except Exception:
+                logger.warning(
+                    "[LeadPack] attribution recording failed purchase=%s — non-fatal",
+                    purchase.id, exc_info=True,
+                )
+
+            from src.services.meta_capi_service import fire_purchase_event
+            fire_purchase_event(
+                subscriber=subscriber,
+                amount=_amount_dollars,
+                source="lead_pack",
+                request_context={
+                    "buyer_ip": _attr(meta, "buyer_ip"),
+                    "buyer_user_agent": _attr(meta, "buyer_user_agent"),
+                    "fbclid": _attr(meta, "fbclid"),
+                    "utm_campaign": _attr(meta, "utm_campaign"),
+                    "campaign_id": _attr(meta, "campaign_id"),
+                    "currency": (_attr(payment_intent, "currency") or "usd").upper(),
+                },
+                event_id=f"leadpack_{stripe_payment_intent_id}",
+            )
+        except Exception:
+            logger.warning(
+                "[LeadPack] Meta CAPI / attribution block failed purchase=%s — non-fatal",
+                purchase.id, exc_info=True,
             )
 
     except Exception as e:
