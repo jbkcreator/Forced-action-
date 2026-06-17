@@ -867,6 +867,76 @@ def gate_metrics(
     }
 
 
+@router.get("/roas", dependencies=[Depends(get_current_admin)])
+def roas(
+    campaign_id: Optional[str] = Query(None),
+    utm_campaign: Optional[str] = Query(None),
+    start_date: Optional[str] = Query(None, description="ISO date/datetime, inclusive lower bound"),
+    end_date: Optional[str] = Query(None, description="ISO date/datetime, exclusive upper bound"),
+    ad_spend: Optional[float] = Query(None, ge=0, description="Manual ad spend (v1) for ROAS calc"),
+    db: Session = Depends(get_db),
+):
+    """Return revenue grouped by ad campaign (Meta closed-loop, S2).
+
+    Sums `conversion_attribution_events.revenue_amount` joined to subscribers'
+    campaign attribution. ROAS = total_revenue / ad_spend; null when ad_spend is
+    missing or zero. Revenue reflects post-S2 data only — historical conversion
+    rows predate revenue_amount capture.
+    """
+    rows = db.execute(
+        text("""
+            WITH rev AS (
+                SELECT
+                    COALESCE(s.campaign_id, s.utm_campaign, 'unattributed') AS campaign_key,
+                    s.campaign_id,
+                    s.utm_campaign,
+                    cae.revenue_amount
+                FROM conversion_attribution_events cae
+                JOIN subscribers s ON s.id = cae.subscriber_id
+                WHERE cae.revenue_amount IS NOT NULL
+                  AND (:campaign_id  IS NULL OR s.campaign_id  = :campaign_id)
+                  AND (:utm_campaign IS NULL OR s.utm_campaign = :utm_campaign)
+                  AND (:start_date   IS NULL OR cae.occurred_at >= CAST(:start_date AS timestamptz))
+                  AND (:end_date     IS NULL OR cae.occurred_at <  CAST(:end_date   AS timestamptz))
+            )
+            SELECT
+                campaign_key,
+                MIN(campaign_id)  AS campaign_id,
+                MIN(utm_campaign) AS utm_campaign,
+                SUM(revenue_amount) AS total_revenue,
+                COUNT(*)            AS purchase_count
+            FROM rev
+            GROUP BY campaign_key
+            ORDER BY total_revenue DESC
+        """),
+        {
+            "campaign_id": campaign_id,
+            "utm_campaign": utm_campaign,
+            "start_date": start_date,
+            "end_date": end_date,
+        },
+    ).mappings().all()
+
+    spend = float(ad_spend) if ad_spend else 0.0
+    results = []
+    for row in rows:
+        revenue = float(row["total_revenue"] or 0)
+        results.append({
+            "campaign_id": row["campaign_id"],
+            "utm_campaign": row["utm_campaign"],
+            "total_revenue": revenue,
+            "ad_spend": spend,
+            "roas": round(revenue / spend, 4) if spend else None,
+            "purchase_count": int(row["purchase_count"]),
+        })
+
+    logger.info(
+        "roas_query_completed groups=%d campaign_id=%s utm_campaign=%s ad_spend=%s",
+        len(results), campaign_id, utm_campaign, spend,
+    )
+    return results
+
+
 @router.get("/kill-switch-status", dependencies=[Depends(get_current_admin)])
 def kill_switch_status_overview():
     """
