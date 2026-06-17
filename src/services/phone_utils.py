@@ -52,3 +52,44 @@ def normalize(raw: str | None) -> str | None:
     if parsed.country_code != 1:
         return None
     return phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
+
+
+# Closer Cockpit accepts US (+1) and India (+91). Scoped to the Aircall
+# call-capture paths (correlate / webhook dial parse / human-close display)
+# only — the platform-wide US-only guard stays in `normalize` above so SMS,
+# lead matching, skip-trace, and GHL are unaffected.
+_CLOSER_REGIONS = ("US", "IN")
+_CLOSER_COUNTRY_CODES = frozenset({1, 91})
+
+
+def normalize_closer(raw: str | None) -> str | None:
+    """Normalize a phone to E.164 accepting US (+1) or India (+91).
+
+    Honors an explicit international form first (raw carrying its own +cc); a
+    bare national number is parsed as US then IN, so bare 10-digit numbers
+    resolve to US — enter Indian test numbers in +91 E.164 form. Returns None
+    for anything outside {US, India}. The QA allowlist still applies.
+    """
+    if not raw:
+        return None
+
+    allow = _qa_allowlist()
+
+    try:
+        intl = phonenumbers.parse(raw, None)
+        if phonenumbers.is_valid_number(intl):
+            e164 = phonenumbers.format_number(intl, phonenumbers.PhoneNumberFormat.E164)
+            if intl.country_code in _CLOSER_COUNTRY_CODES or e164 in allow:
+                return e164
+    except NumberParseException:
+        pass
+
+    for region in _CLOSER_REGIONS:
+        try:
+            parsed = phonenumbers.parse(raw, region)
+        except NumberParseException:
+            continue
+        if phonenumbers.is_valid_number(parsed) and parsed.country_code in _CLOSER_COUNTRY_CODES:
+            return phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164)
+
+    return None

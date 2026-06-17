@@ -11,6 +11,31 @@ import json
 import pytest
 
 from src.services.closer_call_tagging import _coerce_tags, _extract_json
+from src.services.phone_utils import normalize, normalize_closer
+
+
+# ── Phone normalization: closer-cockpit accepts US + India ──────────────────
+
+def test_normalize_closer_us():
+    assert normalize_closer("813-555-1234") == "+18135551234"
+    assert normalize_closer("+14155552671") == "+14155552671"
+
+
+def test_normalize_closer_india():
+    assert normalize_closer("+91 98765 43210") == "+919876543210"
+    assert normalize_closer("+919876543210") == "+919876543210"
+
+
+def test_normalize_closer_rejects_other_countries():
+    assert normalize_closer("+44 20 7183 8750") is None   # UK
+    assert normalize_closer("not a phone") is None
+    assert normalize_closer(None) is None
+
+
+def test_global_normalize_still_us_only():
+    """The platform-wide guard must remain US-only (India NOT accepted)."""
+    assert normalize("+919876543210") is None
+    assert normalize("813-555-1234") == "+18135551234"
 
 
 # ── Tagging: JSON extraction ────────────────────────────────────────────────

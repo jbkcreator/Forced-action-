@@ -940,7 +940,7 @@ def _handle_aircall_event(etype, data: dict, db) -> None:
     from datetime import datetime, timezone
 
     from src.core.models import CloserCall
-    from src.services.phone_utils import normalize
+    from src.services.phone_utils import normalize_closer as normalize
     from src.services import aircall_client
 
     call_id = str(data.get("id") or data.get("call_id") or "").strip()
@@ -4594,7 +4594,7 @@ def list_human_close(
 
     # Batch-load subscriber name/phone/email for the queue rows (single query, no N+1).
     from src.core.models import Subscriber
-    from src.services.phone_utils import normalize as normalize_phone
+    from src.services.phone_utils import normalize_closer as normalize_phone
     sub_ids = {r.subscriber_id for r in rows}
     sub_lookup: dict[int, tuple] = {}
     if sub_ids:

@@ -27,7 +27,7 @@ from src.api.admin_router import get_current_admin
 from src.api.deps import get_db
 from src.core.models import CloserCall, Subscriber
 from src.services import aircall_client
-from src.services.phone_utils import normalize as normalize_phone
+from src.services.phone_utils import normalize_closer as normalize_phone
 
 logger = logging.getLogger(__name__)
 
