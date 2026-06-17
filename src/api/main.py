@@ -87,11 +87,13 @@ from src.api.attribution_router import router as attribution_router  # noqa: E40
 from src.api.cora_incidents_router import router as cora_incidents_router  # noqa: E402
 from src.api.sms_analytics_router import router as sms_analytics_router  # noqa: E402
 from src.api.operator_crm_router import router as operator_crm_router  # noqa: E402
+from src.api.closer_router import router as closer_router  # noqa: E402
 app.include_router(admin_router)
 app.include_router(attribution_router)
 app.include_router(cora_incidents_router)
 app.include_router(sms_analytics_router)
 app.include_router(operator_crm_router)
+app.include_router(closer_router)
 
 from src.api.chat_router import router as chat_router  # noqa: E402
 app.include_router(chat_router)
@@ -878,6 +880,155 @@ async def stripe_webhook(
             )
 
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# POST /webhooks/aircall — Closer Cockpit call capture (Sprint S1b)
+# Events: call.ended, transcription.created, sentiment.created, topics.created.
+# HMAC-verified, returns 200 fast; updates closer_calls and (on transcript)
+# publishes a Cora event for tagging.
+# ---------------------------------------------------------------------------
+
+def _verify_aircall_signature(raw_body: bytes, signature) -> bool:
+    """HMAC-SHA256(raw_body, webhook_token) == X-Aircall-Signature.
+
+    NOTE: confirm Aircall's exact signing scheme at first live integration.
+    """
+    import hmac
+    import hashlib
+
+    s = get_settings()
+    token = s.aircall_webhook_token.get_secret_value() if s.aircall_webhook_token else None
+    if not token:
+        logger.error("[aircall] webhook token not configured — rejecting event")
+        return False
+    if not signature:
+        return False
+    expected = hmac.new(token.encode(), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+def _aircall_epoch_to_dt(value):
+    from datetime import datetime, timezone
+    try:
+        return datetime.fromtimestamp(int(value), tz=timezone.utc) if value else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _aircall_match_subscriber_by_phone(db, dialed_e164) -> "Optional[int]":
+    """Fallback subscriber match (last 10 digits) when no pending row exists."""
+    from sqlalchemy import text as _text
+
+    if not dialed_e164:
+        return None
+    last10 = "".join(ch for ch in dialed_e164 if ch.isdigit())[-10:]
+    if len(last10) < 10:
+        return None
+    row = db.execute(
+        _text(
+            "SELECT id FROM subscribers "
+            "WHERE right(regexp_replace(coalesce(phone,''), '\\D', '', 'g'), 10) = :last10 "
+            "ORDER BY id LIMIT 1"
+        ),
+        {"last10": last10},
+    ).first()
+    return row[0] if row else None
+
+
+def _handle_aircall_event(etype, data: dict, db) -> None:
+    from datetime import datetime, timezone
+
+    from src.core.models import CloserCall
+    from src.services.phone_utils import normalize
+    from src.services import aircall_client
+
+    call_id = str(data.get("id") or data.get("call_id") or "").strip()
+    if not call_id:
+        return
+
+    row = db.execute(
+        select(CloserCall).where(CloserCall.aircall_call_id == call_id)
+    ).scalar_one_or_none()
+
+    if etype == "call.ended":
+        dialed = normalize(data.get("raw_digits") or data.get("to"))
+        if row is None:
+            sub_id = _aircall_match_subscriber_by_phone(db, dialed)
+            if sub_id is None:
+                logger.warning("[aircall] call.ended unmatched call_id=%s", call_id)
+                return
+            row = CloserCall(aircall_call_id=call_id, subscriber_id=sub_id)
+            db.add(row)
+        user = data.get("user") or {}
+        row.direction = data.get("direction") or row.direction
+        row.dialed_e164 = dialed or row.dialed_e164
+        row.duration_sec = data.get("duration")
+        row.started_at = _aircall_epoch_to_dt(data.get("started_at"))
+        row.ended_at = _aircall_epoch_to_dt(data.get("ended_at"))
+        if user.get("id"):
+            row.closer_aircall_user_id = str(user.get("id"))
+        if user.get("name"):
+            row.closer_name = user.get("name")
+        return
+
+    if row is None:
+        logger.info("[aircall] %s before row exists call_id=%s — skipping", etype, call_id)
+        return
+
+    if etype == "transcription.created":
+        transcript = aircall_client.get_transcription(call_id)
+        if transcript:
+            row.transcript_text = transcript
+            row.transcript_fetched_at = datetime.now(timezone.utc)
+            db.flush()
+            from src.agents.events.ingestion import publish_cora_event
+            publish_cora_event({
+                "event_type": "call_transcribed",
+                "subscriber_id": row.subscriber_id,
+                "payload": {"aircall_call_id": call_id},
+            })
+    elif etype == "sentiment.created":
+        sentiment = aircall_client.get_sentiment(call_id)
+        if sentiment:
+            row.sentiment = sentiment
+    elif etype == "topics.created":
+        topics = aircall_client.get_topics(call_id)
+        if topics is not None:
+            row.topics = topics
+    # other events ignored
+
+
+@app.post("/webhooks/aircall", status_code=200)
+async def aircall_webhook(
+    request: Request,
+    x_aircall_signature: str = Header(None, alias="X-Aircall-Signature"),
+):
+    raw_body = await request.body()
+    if not _verify_aircall_signature(raw_body, x_aircall_signature):
+        raise HTTPException(status_code=401, detail="invalid signature")
+
+    import json as _json
+    try:
+        event = _json.loads(raw_body or b"{}")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="invalid payload")
+
+    etype = event.get("event")
+    data = event.get("data") or {}
+
+    try:
+        with get_db_context() as db:
+            _handle_aircall_event(etype, data, db)
+    except OperationalError:
+        logger.error("[aircall] DB error processing %s", etype, exc_info=True)
+        raise HTTPException(status_code=503, detail="database temporarily unavailable")
+    except Exception:
+        # Signature already verified; log and return 200 so Aircall does not
+        # disable the webhook on a transient handler error (reconciled later).
+        logger.error("[aircall] handler error event=%s", etype, exc_info=True)
+
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
@@ -4440,12 +4591,29 @@ def list_human_close(
         raise HTTPException(status_code=422, detail="status must be open|closed|all")
     q = q.order_by(HumanCloseEscalation.routed_at.desc()).limit(min(limit, 200)).offset(offset)
     rows = db.execute(q).scalars().all()
+
+    # Batch-load subscriber name/phone/email for the queue rows (single query, no N+1).
+    from src.core.models import Subscriber
+    from src.services.phone_utils import normalize as normalize_phone
+    sub_ids = {r.subscriber_id for r in rows}
+    sub_lookup: dict[int, tuple] = {}
+    if sub_ids:
+        for sid, sname, sphone, semail in db.execute(
+            select(Subscriber.id, Subscriber.name, Subscriber.phone, Subscriber.email).where(
+                Subscriber.id.in_(sub_ids)
+            )
+        ).all():
+            sub_lookup[sid] = (sname, normalize_phone(sphone), semail)
+
     return {
         "count": len(rows),
         "items": [
             {
                 "id": r.id,
                 "subscriber_id": r.subscriber_id,
+                "subscriber_name": sub_lookup.get(r.subscriber_id, (None, None, None))[0],
+                "subscriber_phone": sub_lookup.get(r.subscriber_id, (None, None, None))[1],
+                "subscriber_email": sub_lookup.get(r.subscriber_id, (None, None, None))[2],
                 "revenue_signal_score": r.revenue_signal_score,
                 "interactions_count": r.interactions_count,
                 "target_tier": r.target_tier,

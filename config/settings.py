@@ -517,6 +517,14 @@ class AppSettings(BaseSettings):
 	# independently rotatable; falls back to admin_jwt_secret when unset (dev).
 	subscriber_jwt_secret: Optional[SecretStr] = Field(default=None, env="SUBSCRIBER_JWT_SECRET")
 
+	# ── Aircall (Closer Cockpit, S1b) ───────────────────────────────────────
+	# Basic-auth pair for the Aircall REST API (api_id:api_token) and the
+	# signing token used to verify inbound webhook events. All optional so the
+	# app boots without Aircall configured (feature-gated).
+	aircall_api_id: Optional[SecretStr] = Field(default=None, env="AIRCALL_API_ID")
+	aircall_api_token: Optional[SecretStr] = Field(default=None, env="AIRCALL_API_TOKEN")
+	aircall_webhook_token: Optional[SecretStr] = Field(default=None, env="AIRCALL_WEBHOOK_TOKEN")
+
 
 @lru_cache
 def get_settings() -> AppSettings:

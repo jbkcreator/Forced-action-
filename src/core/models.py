@@ -5072,3 +5072,101 @@ class FinancingIntentScore(Base):
             f"date={self.score_date}, tier='{self.intent_tier}', "
             f"score={self.financing_intent_score})>"
         )
+
+
+# ============================================================================
+# Closer Cockpit (Sprint S1b) — Aircall call capture + tagging
+# ============================================================================
+
+class CloserCall(Base):
+    """
+    One Aircall call from a human closer to a subscriber (Sprint S1b).
+
+    Holds the transcript, AI-derived tags (sentiment/topics from Aircall AI
+    Assist; objections/outcome/resolution/follow-ups from Claude via
+    claude_router.call_claude), and the closer's per-call one-tap feedback.
+
+    Deliberately separate from `agent_decisions` (which is Cora-only): a closer
+    call is a human action, not a Cora Touch. See ADR
+    "closer-telemetry-separate-from-agent-decisions".
+    """
+    __tablename__ = "closer_calls"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    # Identity & correlation
+    aircall_call_id: Mapped[str] = mapped_column(String(40), nullable=False, unique=True, index=True)
+    subscriber_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("subscribers.id"), nullable=False, index=True
+    )
+    escalation_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("human_close_escalations.id"), nullable=True
+    )
+    closer_aircall_user_id: Mapped[Optional[str]] = mapped_column(String(40))
+    closer_name: Mapped[Optional[str]] = mapped_column(String(120))
+
+    # Call facts (from call.ended)
+    direction: Mapped[Optional[str]] = mapped_column(String(12))
+    dialed_e164: Mapped[Optional[str]] = mapped_column(String(20))
+    duration_sec: Mapped[Optional[int]] = mapped_column(Integer)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    # Transcript (from transcription.created)
+    transcript_text: Mapped[Optional[str]] = mapped_column(Text)
+    transcript_fetched_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    # AI-derived tags (Aircall: sentiment/topics — Claude: the rest)
+    sentiment: Mapped[Optional[str]] = mapped_column(String(12))
+    topics: Mapped[Optional[list]] = mapped_column(JSONB)
+    objections: Mapped[Optional[list]] = mapped_column(JSONB)
+    objection_resolved: Mapped[Optional[str]] = mapped_column(String(12))
+    call_outcome: Mapped[Optional[str]] = mapped_column(String(30))
+    follow_ups: Mapped[Optional[list]] = mapped_column(JSONB)
+    tagged_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    # Human one-tap feedback (per call)
+    objection_type: Mapped[Optional[str]] = mapped_column(String(40))
+    pitch_variant: Mapped[Optional[str]] = mapped_column(String(40))
+    lead_quality_rating: Mapped[Optional[int]] = mapped_column(Integer)
+    feedback_by: Mapped[Optional[str]] = mapped_column(String(120))
+    feedback_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        Index("idx_closer_calls_subscriber", "subscriber_id"),
+        Index("idx_closer_calls_closer_started", "closer_aircall_user_id", "started_at"),
+        Index("idx_closer_calls_tagged_at", "tagged_at"),
+        CheckConstraint(
+            "lead_quality_rating IS NULL OR (lead_quality_rating BETWEEN 1 AND 5)",
+            name="ck_closer_calls_lead_quality",
+        ),
+        CheckConstraint(
+            "call_outcome IS NULL OR call_outcome IN "
+            "('committed','callback_scheduled','undecided','declined','no_meaningful_conversation')",
+            name="ck_closer_calls_outcome",
+        ),
+        CheckConstraint(
+            "objection_resolved IS NULL OR objection_resolved IN ('resolved','unresolved','none')",
+            name="ck_closer_calls_obj_resolved",
+        ),
+        CheckConstraint(
+            "sentiment IS NULL OR sentiment IN ('positive','neutral','negative','mixed')",
+            name="ck_closer_calls_sentiment",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<CloserCall(id={self.id}, aircall_call_id={self.aircall_call_id}, "
+            f"subscriber_id={self.subscriber_id}, outcome={self.call_outcome})>"
+        )
