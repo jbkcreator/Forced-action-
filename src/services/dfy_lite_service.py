@@ -17,11 +17,7 @@ from typing import Optional
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
-from src.agents.pitch_builder import (
-    MAX_GENERATIONS_PER_PAIR,
-    build_property_pitch_context,
-    generate_pitch_with_claude,
-)
+from src.agents.pitch_builder import MAX_GENERATIONS_PER_PAIR
 from src.core.models import DfyLiteOrder
 
 logger = logging.getLogger(__name__)
@@ -154,12 +150,12 @@ def create_pitch_order(
     request_options: dict,
 ) -> DfyLiteOrder:
     """
-    Full lifecycle: authorize → insert → compile signals → call Claude → mark for review.
+    Authorize and insert a new DFY-Lite order with status Order_Received.
+    Pitch generation is delegated to the Cora dfy_lite_pitch graph via an event.
 
     Raises:
         DfyLitePermissionError — subscriber lacks an authorization path.
         DfyLiteLimitError      — generation limit reached.
-        ValueError             — Claude output was unparseable (re-raised after Pitch_Failed).
     """
     if not can_subscriber_generate_pitch(session, subscriber_id, property_id):
         raise DfyLitePermissionError(
@@ -174,8 +170,6 @@ def create_pitch_order(
         )
 
     now = datetime.now(timezone.utc)
-
-    # Step 1 — insert with Order_Received
     order = DfyLiteOrder(
         subscriber_id=subscriber_id,
         property_id=property_id,
@@ -187,58 +181,12 @@ def create_pitch_order(
         custom_instructions=request_options.get("custom_instructions"),
         pitch_generation_number=count + 1,
         pitch_generation_limit=MAX_GENERATIONS_PER_PAIR,
-        generated_by="claude",
+        generated_by="cora",
         created_at=now,
         updated_at=now,
     )
     session.add(order)
     session.flush()
-
-    # Step 2 — compile context → Signal_Compiled
-    try:
-        context = build_property_pitch_context(session, property_id)
-    except Exception as exc:
-        logger.warning("DFY-Lite signal compilation failed for order %s: %s", order.id, exc)
-        _update_order(session, order.id, status="Signal_Failed", error_reason=str(exc)[:1000])
-        session.commit()
-        raise
-
-    property_snap = {k: v for k, v in (context.get("property") or {}).items() if v is not None}
-    _update_order_jsonb(session, order.id, "Signal_Compiled", "distress_stack_json", context)
-    session.execute(
-        sa.text("""
-            UPDATE dfy_lite_orders
-            SET property_snapshot_json = CAST(:json_val AS JSONB),
-                updated_at             = :now
-            WHERE id = :order_id
-        """),
-        {
-            "json_val": json.dumps(property_snap, default=str),
-            "now": datetime.now(timezone.utc),
-            "order_id": order.id,
-        },
-    )
-    session.flush()
-
-    # Step 3 — call Claude → Pitch_Generated
-    try:
-        generated = generate_pitch_with_claude(
-            context=context,
-            request_options=request_options,
-            subscriber_id=subscriber_id,
-            db=session,
-        )
-    except Exception as exc:
-        logger.warning("DFY-Lite pitch generation failed for order %s: %s", order.id, exc)
-        _update_order(session, order.id, status="Pitch_Failed", error_reason=str(exc)[:1000])
-        session.commit()
-        raise
-
-    _update_order_jsonb(session, order.id, "Pitch_Generated", "generated_outputs_json", generated)
-    session.flush()
-
-    # Step 4 — Needs_Review
-    _update_order(session, order.id, status="Needs_Review")
     session.commit()
     session.refresh(order)
     return order
@@ -429,6 +377,74 @@ def get_order(session: Session, order_id: int, subscriber_id: int) -> dict:
         raise PermissionError(f"Order {order_id} does not belong to subscriber {subscriber_id}")
 
     return _row_to_dict(row)
+
+
+def list_orders_admin(
+    session: Session,
+    status: Optional[str] = None,
+    subscriber_id: Optional[int] = None,
+    page: int = 1,
+    page_size: int = 50,
+) -> dict:
+    """
+    Paginated list of all DFY-Lite orders for the admin dashboard.
+    Joins subscribers and properties for display context.
+    """
+    filters = []
+    params: dict = {}
+
+    if status:
+        filters.append("o.status = :status")
+        params["status"] = status
+    if subscriber_id:
+        filters.append("o.subscriber_id = :sub_id")
+        params["sub_id"] = subscriber_id
+
+    where = ("WHERE " + " AND ".join(filters)) if filters else ""
+    offset = (page - 1) * page_size
+    params["limit"] = page_size
+    params["offset"] = offset
+
+    rows = session.execute(
+        sa.text(f"""
+            SELECT
+                o.id,
+                o.status,
+                o.subscriber_id,
+                s.email          AS subscriber_email,
+                o.property_id,
+                p.address        AS property_address,
+                o.pitch_type,
+                o.target_vertical,
+                o.pitch_generation_number,
+                o.error_reason,
+                o.reviewed_at,
+                o.delivered_at,
+                o.created_at,
+                o.updated_at
+            FROM dfy_lite_orders o
+            JOIN subscribers s ON s.id = o.subscriber_id
+            JOIN properties  p ON p.id = o.property_id
+            {where}
+            ORDER BY o.created_at DESC
+            LIMIT :limit OFFSET :offset
+        """),
+        params,
+    ).mappings().all()
+
+    total_row = session.execute(
+        sa.text(f"""
+            SELECT COUNT(*) FROM dfy_lite_orders o {where}
+        """),
+        {k: v for k, v in params.items() if k not in ("limit", "offset")},
+    ).scalar()
+
+    return {
+        "total":     int(total_row or 0),
+        "page":      page,
+        "page_size": page_size,
+        "orders":    [_row_to_dict(r) for r in rows],
+    }
 
 
 def _row_to_dict(row) -> dict:

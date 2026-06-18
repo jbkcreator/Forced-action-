@@ -125,6 +125,7 @@ def dispatch_event(event: Dict[str, Any]) -> Dict[str, Any]:
 		reason = "global_kill_switch_enabled"
 		logger.info("supervisor drop: %s (event=%s)", reason, event_type)
 		_record_dropped(decision_id, "supervisor", subscriber_id, event_type, reason)
+		_notify_drop(event, decision_id, reason)
 		return _outcome("dropped_kill_switch", None, decision_id, reason)
 
 	# Unknown event type
@@ -133,6 +134,7 @@ def dispatch_event(event: Dict[str, Any]) -> Dict[str, Any]:
 		reason = f"unknown_event_type:{event_type}"
 		logger.warning("supervisor drop: %s", reason)
 		_record_dropped(decision_id, "supervisor", subscriber_id, event_type, reason)
+		_notify_drop(event, decision_id, reason)
 		return _outcome("dropped_unknown_event", None, decision_id, reason)
 
 	# Per-graph kill switch
@@ -140,12 +142,14 @@ def dispatch_event(event: Dict[str, Any]) -> Dict[str, Any]:
 		reason = f"graph_disabled:{spec.graph_name}"
 		logger.info("supervisor drop: %s (event=%s)", reason, event_type)
 		_record_dropped(decision_id, spec.graph_name, subscriber_id, event_type, reason)
+		_notify_drop(event, decision_id, reason)
 		return _outcome("dropped_kill_switch", spec.graph_name, decision_id, reason)
 
 	# Idempotency — if a completed decision already exists for this key, skip.
 	if _already_handled(idempotency_key):
 		reason = "duplicate_idempotency_key"
 		logger.info("supervisor drop: %s key=%s", reason, idempotency_key)
+		_notify_drop(event, decision_id, reason)
 		return _outcome("dropped_duplicate", spec.graph_name, decision_id, reason)
 
 	# Wave 2 needs a decision_id from Wave 1; reject if missing.
@@ -228,6 +232,28 @@ def _record_dropped(
 		)
 	except Exception as exc:   # never let logging break dispatch
 		logger.warning("supervisor: failed to log drop: %s", exc)
+
+
+def _notify_drop(event: Dict[str, Any], decision_id: str, reason: str) -> None:
+	"""
+	If the event declared a result_channel, publish a drop notification so
+	the caller (e.g. quora_miner) can unblock immediately instead of waiting
+	out its full subscribe timeout.
+	"""
+	import json as _json
+	result_channel = event.get("result_channel")
+	if not result_channel:
+		return
+	try:
+		from src.core.redis_client import get_redis, redis_available
+		if redis_available():
+			get_redis().publish(result_channel, _json.dumps({
+				"decision_id":     decision_id,
+				"terminal_status": reason,
+				"write_confirmed": False,
+			}))
+	except Exception as exc:
+		logger.warning("supervisor: drop notification failed (channel=%s): %s", result_channel, exc)
 
 
 def _already_handled(idempotency_key: str) -> bool:

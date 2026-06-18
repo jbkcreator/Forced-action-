@@ -4,7 +4,7 @@ event sources and returns a normalized Event for the supervisor.
 
 Raw shapes the platform currently emits:
 
-	Redis Pub/Sub (channel 'cora:events'):
+	Redis Queue (LPUSH key 'cora:queue', consumed via BRPOP):
 		JSON string:
 		  {"event_type": "...", "subscriber_id": 107, "payload": {...},
 		   "decision_id": "optional"}

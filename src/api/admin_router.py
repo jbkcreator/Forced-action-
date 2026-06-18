@@ -2809,4 +2809,20 @@ def cancel_cora_message(
         "[cora-messages/cancel] id=%s cancelled by %s reason=%r",
         message_id, _admin.get("sub"), body.reason,
     )
+
+
+# ── DFY-Lite order dashboard ──────────────────────────────────────────────────
+
+@router.get("/dfy-lite/orders")
+def admin_dfy_lite_orders(
+    status: Optional[str] = Query(default=None),
+    subscriber_id: Optional[int] = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=100),
+    db: Session = Depends(get_db),
+    _admin: dict = Depends(get_current_admin),
+) -> dict:
+    """Paginated list of all DFY-Lite orders for the admin dashboard."""
+    from src.services.dfy_lite_service import list_orders_admin
+    return list_orders_admin(db, status=status, subscriber_id=subscriber_id, page=page, page_size=page_size)
     return {"ok": True, "id": message_id, "send_status": "cancelled"}

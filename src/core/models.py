@@ -2080,8 +2080,8 @@ class DfyLiteOrder(Base):
     DFY-Lite pitch generation order — one row per pitch request.
 
     Subscribers may generate up to `pitch_generation_limit` pitches per
-    property (default 3). Status lifecycle mirrors the fulfillment dashboard:
-    Order_Received → Signal_Compiled → Pitch_Generated → Needs_Review → Delivered.
+    property (default 3). Status lifecycle:
+    Order_Received → Signal_Compiled → Needs_Review → Delivered.
     """
     __tablename__ = "dfy_lite_orders"
 
@@ -2132,7 +2132,7 @@ class DfyLiteOrder(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "status IN ('Order_Received', 'Signal_Compiled', 'Pitch_Generated', "
+            "status IN ('Order_Received', 'Signal_Compiled', "
             "'Needs_Review', 'Delivered', 'Signal_Failed', 'Pitch_Failed', 'Cancelled')",
             name="ck_dfy_lite_status",
         ),
@@ -3155,6 +3155,74 @@ class AgentDecision(Base):
 
     def __repr__(self):
         return f"<AgentDecision(id={self.decision_id[:8]}, graph={self.graph_name}, status={self.terminal_status})>"
+
+
+class QuoraQuestion(Base):
+    """
+    One row per Quora question that has been classified by Cora.
+    Includes skip decisions — so the same question is never re-classified on
+    future scrape runs. Drives the answer-generation and publishing pipeline.
+    """
+    __tablename__ = "quora_questions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    # ── Quora identity ────────────────────────────────────────────────────────
+    qid: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True, unique=True, index=True)
+    slug: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # ── Scraped signals ───────────────────────────────────────────────────────
+    answer_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    follower_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    view_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    is_locked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_sensitive: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    topics: Mapped[Optional[list]] = mapped_column(ARRAY(Text), nullable=True)
+    created_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # ── Deterministic scoring ─────────────────────────────────────────────────
+    deterministic_score: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    deterministic_reasons: Mapped[Optional[list]] = mapped_column(ARRAY(Text), nullable=True)
+
+    # ── Cora classification ───────────────────────────────────────────────────
+    matched_keyword: Mapped[Optional[str]] = mapped_column(Text, nullable=True, index=True)
+    cora_decision_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    intent_lane: Mapped[Optional[str]] = mapped_column(String(60), nullable=True, index=True)
+    recommended_action: Mapped[Optional[str]] = mapped_column(String(40), nullable=True, index=True)
+    priority_score: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    risk_level: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    cora_classification: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+
+    # ── Answer workflow ───────────────────────────────────────────────────────
+    answer_draft: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    answer_status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="pending", index=True
+    )
+    published_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    quora_answer_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # ── Housekeeping ──────────────────────────────────────────────────────────
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    last_classified_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "answer_status IN ('pending','drafted','skipped','published','failed')",
+            name="check_quora_answer_status",
+        ),
+        Index("idx_quora_questions_action_priority", "recommended_action", "priority_score"),
+    )
+
+    def __repr__(self):
+        return f"<QuoraQuestion(qid={self.qid}, action={self.recommended_action}, status={self.answer_status})>"
 
 
 class VendorCostPause(Base):

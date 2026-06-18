@@ -129,6 +129,9 @@ app.include_router(clay_router)
 from src.api.dfy_lite_router import router as dfy_lite_router  # noqa: E402
 app.include_router(dfy_lite_router)
 
+from src.api.quora_auth_router import router as quora_auth_router  # noqa: E402
+app.include_router(quora_auth_router)
+
 
 # ---------------------------------------------------------------------------
 # Global exception handlers
@@ -4898,6 +4901,7 @@ def admin_dlq(limit: int = 50, db: Session = Depends(get_db)):
 
 @app.get("/api/zip-activity")
 def zip_activity(
+    response: Response,
     zip_code: str,
     vertical: Optional[str] = None,
     county_id: Optional[str] = Query(default=None),
@@ -4922,6 +4926,7 @@ def zip_activity(
         )
     from src.services.urgency_engine import get_active_count
     active_viewers = get_active_count(zip_code, county_id=county_id)
+    response.headers["Cache-Control"] = "public, max-age=10"
     return {
         "zip_code": zip_code,
         "vertical": vertical,
@@ -4975,10 +4980,30 @@ def lead_hold_status(
 
     held_by_self = False
     if feed_uuid:
-        sub = db.execute(
-            select(Subscriber.id).where(Subscriber.event_feed_uuid == feed_uuid)
-        ).scalar_one_or_none()
-        held_by_self = sub is not None and int(sub) == int(holder_id)
+        sub_id = None
+        try:
+            from src.core.redis_client import get_redis, redis_available
+            if redis_available():
+                cached = get_redis().get(f"fa:sub_uuid:{feed_uuid}")
+                if cached:
+                    sub_id = int(cached)
+        except Exception:
+            pass
+
+        if sub_id is None:
+            row = db.execute(
+                select(Subscriber.id).where(Subscriber.event_feed_uuid == feed_uuid)
+            ).scalar_one_or_none()
+            if row is not None:
+                sub_id = int(row)
+                try:
+                    from src.core.redis_client import get_redis, redis_available
+                    if redis_available():
+                        get_redis().setex(f"fa:sub_uuid:{feed_uuid}", 3600, str(sub_id))
+                except Exception:
+                    pass
+
+        held_by_self = sub_id is not None and sub_id == int(holder_id)
 
     return {
         "property_id": property_id,
