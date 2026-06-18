@@ -126,6 +126,9 @@ app.include_router(supplier_intel_router)
 from src.api.clay_router import router as clay_router  # noqa: E402
 app.include_router(clay_router)
 
+from src.api.dfy_lite_router import router as dfy_lite_router  # noqa: E402
+app.include_router(dfy_lite_router)
+
 
 # ---------------------------------------------------------------------------
 # Global exception handlers

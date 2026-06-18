@@ -2075,6 +2075,76 @@ class LeadPackPurchase(Base):
         )
 
 
+class DfyLiteOrder(Base):
+    """
+    DFY-Lite pitch generation order — one row per pitch request.
+
+    Subscribers may generate up to `pitch_generation_limit` pitches per
+    property (default 3). Status lifecycle mirrors the fulfillment dashboard:
+    Order_Received → Signal_Compiled → Pitch_Generated → Needs_Review → Delivered.
+    """
+    __tablename__ = "dfy_lite_orders"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(ForeignKey("subscribers.id"), nullable=False)
+    property_id: Mapped[int] = mapped_column(ForeignKey("properties.id"), nullable=False)
+
+    # Nullable authorization references — whichever path granted access
+    sent_lead_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    source_lead_purchase_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="Order_Received")
+
+    # Subscriber-provided request options
+    pitch_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    offer_angle: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    target_vertical: Mapped[str] = mapped_column(String(50), nullable=False)
+    selected_output_formats: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")
+    custom_instructions: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Snapshots captured at generation time
+    distress_stack_json: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    property_snapshot_json: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    generated_outputs_json: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+
+    # Generation tracking
+    pitch_generation_number: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    pitch_generation_limit: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    generated_by: Mapped[str] = mapped_column(String(30), nullable=False, default="claude")
+
+    # Review & delivery
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    error_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('Order_Received', 'Signal_Compiled', 'Pitch_Generated', "
+            "'Needs_Review', 'Delivered', 'Signal_Failed', 'Pitch_Failed', 'Cancelled')",
+            name="ck_dfy_lite_status",
+        ),
+        Index("idx_dfy_lite_sub_id", "subscriber_id"),
+        Index("idx_dfy_lite_prop_id", "property_id"),
+        Index("idx_dfy_lite_status", "status"),
+        Index("idx_dfy_lite_created_at", "created_at"),
+        Index("idx_dfy_lite_sub_prop", "subscriber_id", "property_id"),
+        Index("idx_dfy_lite_sent_lead", "sent_lead_id"),
+    )
+
+
 class StripeWebhookEvent(Base):
     """
     Idempotency guard for Stripe webhook events.
