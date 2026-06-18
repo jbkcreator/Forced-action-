@@ -23,6 +23,8 @@ from typing import Callable, Dict, Optional
 
 from src.agents.graphs.abandonment import run_wave1 as _run_abandonment_wave1
 from src.agents.graphs.abandonment import run_wave2 as _run_abandonment_wave2
+from src.agents.graphs.dfy_lite_pitch import run_dfy_lite_pitch as _run_dfy_lite_pitch
+from src.agents.graphs.quora_channel import run_quora_channel_from_event as _run_quora_channel
 from src.agents.graphs.accelerated_wallet_push import (
 	run_accelerated_wallet_push as _run_accelerated_wallet_push,
 )
@@ -102,6 +104,14 @@ EVENT_TO_GRAPH: Dict[str, GraphSpec] = {
 	"reactivation_outreach": GraphSpec(
 		graph_name="reactivation",
 		runner=_run_reactivation,
+	),
+	"dfy_lite_pitch_requested": GraphSpec(
+		graph_name="dfy_lite_pitch",
+		runner=_run_dfy_lite_pitch,
+	),
+	"quora_candidate_classify": GraphSpec(
+		graph_name="quora_channel",
+		runner=_run_quora_channel,
 	),
 }
 

@@ -26,6 +26,7 @@ from src.services.dfy_lite_service import (
     create_pitch_order,
     mark_delivered,
     mark_reviewed,
+    update_pitch_outputs,
 )
 
 
@@ -147,7 +148,8 @@ def test_allows_exactly_3_generations(mock_db):
 
 # ── Full order flow ───────────────────────────────────────────────────────────
 
-def test_creates_order_success(mock_db, monkeypatch, request_options, minimal_context, mock_claude):
+def test_creates_order_success(mock_db, monkeypatch, request_options):
+    """create_pitch_order inserts an Order_Received row and commits — no Claude call."""
     monkeypatch.setattr(
         "src.services.dfy_lite_service.can_subscriber_generate_pitch",
         lambda *a, **kw: True,
@@ -155,10 +157,6 @@ def test_creates_order_success(mock_db, monkeypatch, request_options, minimal_co
     monkeypatch.setattr(
         "src.services.dfy_lite_service.count_completed_generations",
         lambda *a, **kw: 0,
-    )
-    monkeypatch.setattr(
-        "src.services.dfy_lite_service.build_property_pitch_context",
-        lambda *a, **kw: minimal_context,
     )
 
     captured_order = {}
@@ -169,66 +167,16 @@ def test_creates_order_success(mock_db, monkeypatch, request_options, minimal_co
 
     mock_db.add = fake_add
     mock_db.flush = MagicMock()
-    mock_db.execute = MagicMock(return_value=MagicMock(scalar=MagicMock(return_value=None)))
     mock_db.commit = MagicMock()
     mock_db.refresh = MagicMock()
 
-    order = create_pitch_order(mock_db, subscriber_id=10, property_id=1, request_options=request_options)
+    create_pitch_order(mock_db, subscriber_id=10, property_id=1, request_options=request_options)
 
-    mock_db.commit.assert_called()
+    mock_db.commit.assert_called_once()
     assert captured_order["order"].pitch_generation_number == 1
     assert captured_order["order"].target_vertical == "roofer"
-
-
-def test_sets_pitch_failed_on_claude_error(mock_db, monkeypatch, request_options, minimal_context):
-    monkeypatch.setattr("src.services.dfy_lite_service.can_subscriber_generate_pitch", lambda *a, **kw: True)
-    monkeypatch.setattr("src.services.dfy_lite_service.count_completed_generations", lambda *a, **kw: 0)
-    monkeypatch.setattr("src.services.dfy_lite_service.build_property_pitch_context", lambda *a, **kw: minimal_context)
-    monkeypatch.setattr(
-        "src.services.dfy_lite_service.generate_pitch_with_claude",
-        lambda *a, **kw: (_ for _ in ()).throw(ValueError("bad JSON")),
-    )
-
-    executed_updates = []
-
-    def fake_add(obj):
-        obj.id = 42
-
-    mock_db.add = fake_add
-    mock_db.flush = MagicMock()
-    mock_db.commit = MagicMock()
-    mock_db.refresh = MagicMock()
-
-    original_execute = MagicMock()
-    mock_db.execute = original_execute
-
-    with pytest.raises(ValueError, match="bad JSON"):
-        create_pitch_order(mock_db, subscriber_id=10, property_id=1, request_options=request_options)
-
-    # confirm commit was called after marking Pitch_Failed
-    mock_db.commit.assert_called()
-
-
-def test_sets_signal_failed_on_context_error(mock_db, monkeypatch, request_options):
-    monkeypatch.setattr("src.services.dfy_lite_service.can_subscriber_generate_pitch", lambda *a, **kw: True)
-    monkeypatch.setattr("src.services.dfy_lite_service.count_completed_generations", lambda *a, **kw: 0)
-    monkeypatch.setattr(
-        "src.services.dfy_lite_service.build_property_pitch_context",
-        lambda *a, **kw: (_ for _ in ()).throw(ValueError("Property not found")),
-    )
-
-    def fake_add(obj):
-        obj.id = 42
-
-    mock_db.add = fake_add
-    mock_db.flush = MagicMock()
-    mock_db.commit = MagicMock()
-    mock_db.execute = MagicMock()
-
-    with pytest.raises(ValueError, match="Property not found"):
-        create_pitch_order(mock_db, subscriber_id=10, property_id=1, request_options=request_options)
-
-    mock_db.commit.assert_called()
+    assert captured_order["order"].status == "Order_Received"
+    assert captured_order["order"].generated_by == "cora"
 
 
 # ── Soft-wording guard ────────────────────────────────────────────────────────

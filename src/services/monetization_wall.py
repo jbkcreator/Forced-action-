@@ -141,27 +141,29 @@ def is_active(session_id: str) -> bool:
     return get_session_state(session_id) is not None
 
 
+_ROI_FRAME_TTL = 600  # 10 minutes — lead count changes only on rescore runs
+
+
 def get_roi_frame(vertical: str, county_id: str, db: Session) -> dict:
     """
     Return ROI framing data for the monetization wall.
     Augments static copy with a live qualified-lead count for credibility.
-
-    The live count is:
-      - UNIQUE properties (a property re-scored on multiple runs counts once)
-      - filtered to this vertical (only properties whose CDS engine output
-        has a non-zero score for the requested vertical qualify as e.g.
-        "qualified roofing leads")
-      - county-scoped
+    Result is cached in Redis for 10 minutes to avoid a COUNT(DISTINCT) JOIN
+    on every session creation.
     """
+    cache_key = f"fa:roi_frame:{vertical}:{county_id}"
+    cached = _safe_redis_op("get_roi_frame.get", lambda r: r.get(cache_key))
+    if cached:
+        try:
+            return json.loads(cached)
+        except (TypeError, ValueError):
+            pass
+
     frame = _ROI_FRAMES.get(vertical, _DEFAULT_ROI).copy()
 
     try:
         from src.core.models import DistressScore, Property
 
-        # `vertical_scores` is a JSONB dict like {"roofing": 72, "investor": 15}.
-        # We filter on `...[vertical] > 0` so properties with no signal for
-        # this vertical are excluded — otherwise an investor-signal-only
-        # property would be counted as a "qualified roofing lead".
         try:
             v_score = DistressScore.vertical_scores[vertical].as_float()
         except (KeyError, TypeError):
@@ -186,4 +188,5 @@ def get_roi_frame(vertical: str, county_id: str, db: Session) -> dict:
 
     frame["vertical"] = vertical
     frame["county_id"] = county_id
+    _safe_redis_op("get_roi_frame.setex", lambda r: r.setex(cache_key, _ROI_FRAME_TTL, json.dumps(frame)))
     return frame

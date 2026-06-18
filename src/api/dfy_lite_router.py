@@ -107,7 +107,7 @@ def _order_to_response(order_dict: dict) -> PitchOrderResponse:
     count = order_dict.get("pitch_generation_number", 1)
     limit = order_dict.get("pitch_generation_limit", MAX_GENERATIONS_PER_PAIR)
     completed = order_dict.get("updated_at") if order_dict.get("status") in (
-        "Pitch_Generated", "Needs_Review", "Delivered"
+        "Needs_Review", "Delivered"
     ) else None
     return PitchOrderResponse(
         order_id=order_dict["id"],
@@ -124,7 +124,7 @@ def _order_to_response(order_dict: dict) -> PitchOrderResponse:
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
-@router.post("/dfy-lite/generate", status_code=201)
+@router.post("/dfy-lite/generate", status_code=202)
 def generate_pitch(
     feed_uuid: str,
     payload: GeneratePitchRequest,
@@ -132,15 +132,16 @@ def generate_pitch(
     _auth=Depends(get_current_subscriber),
 ) -> PitchOrderResponse:
     """
-    Create and run a DFY-Lite pitch order for an unlocked lead.
+    Create a DFY-Lite pitch order and dispatch it to the Cora agent for async generation.
 
-    - 201 on success
+    Returns 202 Accepted immediately — poll GET /order/{order_id} until status = Needs_Review.
+
+    - 202 on accepted
     - 403 if the subscriber does not own/have access to the property
     - 422 if the 3-pitch limit has been reached
-    - 502 if Claude generation fails
     """
-    from sqlalchemy import select, text as sa_text
-    from src.core.models import Subscriber
+    from sqlalchemy import text as sa_text
+    from src.agents.events.ingestion import publish_cora_event
 
     subscriber = db.execute(
         sa_text("SELECT id FROM subscribers WHERE event_feed_uuid = :uuid"),
@@ -151,12 +152,12 @@ def generate_pitch(
     subscriber_id: int = subscriber["id"]
 
     request_options = {
-        "property_id": payload.property_id,
-        "target_vertical": payload.target_vertical,
-        "pitch_type": payload.pitch_type,
-        "offer_angle": payload.offer_angle,
+        "property_id":             payload.property_id,
+        "target_vertical":         payload.target_vertical,
+        "pitch_type":              payload.pitch_type,
+        "offer_angle":             payload.offer_angle,
         "selected_output_formats": payload.selected_output_formats,
-        "custom_instructions": payload.custom_instructions,
+        "custom_instructions":     payload.custom_instructions,
     }
 
     try:
@@ -173,22 +174,26 @@ def generate_pitch(
             status_code=422,
             detail=f"You have reached the {MAX_GENERATIONS_PER_PAIR}-pitch limit for this lead",
         )
-    except ValueError as exc:
-        logger.error("DFY-Lite generation failed for subscriber %s: %s", subscriber_id, exc)
-        raise HTTPException(status_code=502, detail="Pitch generation failed — please try again")
     except Exception as exc:
-        logger.error("DFY-Lite unexpected error for subscriber %s: %s", subscriber_id, exc, exc_info=True)
-        raise HTTPException(status_code=502, detail="Pitch generation failed — please try again")
+        logger.error("DFY-Lite order creation failed for subscriber %s: %s", subscriber_id, exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Order creation failed — please try again")
+
+    publish_cora_event({
+        "event_type":    "dfy_lite_pitch_requested",
+        "subscriber_id": subscriber_id,
+        "payload":       {"order_id": order.id},
+    })
+    logger.info("DFY-Lite order %s queued for subscriber %s", order.id, subscriber_id)
 
     order_dict = {
-        "id": order.id,
-        "status": order.status,
-        "property_id": order.property_id,
+        "id":                      order.id,
+        "status":                  order.status,
+        "property_id":             order.property_id,
         "pitch_generation_number": order.pitch_generation_number,
-        "pitch_generation_limit": order.pitch_generation_limit,
-        "generated_outputs_json": order.generated_outputs_json,
-        "created_at": order.created_at.isoformat() if order.created_at else None,
-        "updated_at": order.updated_at.isoformat() if order.updated_at else None,
+        "pitch_generation_limit":  order.pitch_generation_limit,
+        "generated_outputs_json":  order.generated_outputs_json,
+        "created_at":              order.created_at.isoformat() if order.created_at else None,
+        "updated_at":              order.updated_at.isoformat() if order.updated_at else None,
     }
     return _order_to_response(order_dict)
 

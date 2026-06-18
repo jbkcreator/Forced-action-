@@ -1,0 +1,5 @@
+version: 1
+# Used when Claude is unavailable or classification fails.
+# Returns a safe default — skips rather than guessing.
+body: |
+  Classification unavailable — defaulting to skip.

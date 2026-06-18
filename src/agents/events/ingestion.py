@@ -8,11 +8,11 @@ Priority-list scope:
   - Postgres LISTEN/NOTIFY — works today with the existing DB
   - Cron trigger            — works today via the scheduler entry point
   - Admin API trigger       — works today via the ingest_admin_event helper
-  - Redis Pub/Sub           — active when REDIS_URL is set and
-                              AGENTS_EVENT_SOURCE_REDIS=true.
+  - Redis Queue (LPUSH/BRPOP key "cora:queue") — active when REDIS_URL is set
+                              and AGENTS_EVENT_SOURCE_REDIS=true.
 
 Public event publish API (for use by services/tasks — never dispatch_event directly):
-  publish_cora_event(event)  — Redis primary, Postgres durable fallback.
+  publish_cora_event(event)  — Redis queue primary, Postgres durable fallback.
 
 Production run:
 	python -m scripts.run_agents --serve
@@ -60,11 +60,11 @@ def publish_cora_event(event: Dict[str, Any]) -> None:
 
 	if redis_available():
 		try:
-			get_redis().publish("cora:events", json.dumps(event, default=str))
+			get_redis().lpush("cora:queue", json.dumps(event, default=str))
 			return
 		except Exception as exc:
 			logger.warning(
-				"publish_cora_event: Redis publish failed (%s) — falling back to Postgres", exc
+				"publish_cora_event: Redis lpush failed (%s) — falling back to Postgres", exc
 			)
 
 	_publish_via_postgres(event)
@@ -217,13 +217,22 @@ def listen_postgres(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Redis Pub/Sub listener — scaffolded; dry-runs without REDIS_URL
+# Redis Queue listener — BRPOP on "cora:queue"; dry-runs without REDIS_URL
 # ──────────────────────────────────────────────────────────────────────────────
 
 def listen_redis(
-	channel: str = "cora:events",
+	key: str = "cora:queue",
 	stop_event: Optional[threading.Event] = None,
 ) -> None:
+	"""
+	Blocking BRPOP consumer on the Redis list key "cora:queue".
+
+	Events pushed via LPUSH sit in the list until consumed. BRPOP is atomic —
+	each call dequeues exactly one item; no two workers can receive the same
+	message. Events survive Cora restarts (they wait in the list). They do NOT
+	survive a Redis restart unless AOF/RDB persistence is enabled on the Redis
+	instance — the Postgres cora_event_queue is the durability backstop for that.
+	"""
 	settings = get_agents_settings()
 	if not settings.redis_url:
 		logger.info("listen_redis: REDIS_URL not set — listener disabled (dry-run)")
@@ -237,22 +246,22 @@ def listen_redis(
 
 	stop_event = stop_event or threading.Event()
 	client = redis.from_url(settings.redis_url)
-	pubsub = client.pubsub(ignore_subscribe_messages=True)
-	pubsub.subscribe(channel)
-	logger.info("listen_redis: subscribed to channel=%s", channel)
+	logger.info("listen_redis: polling queue key=%s", key)
 
 	try:
 		while not stop_event.is_set():
-			message = pubsub.get_message(timeout=1.0)
-			if message is None:
+			# BRPOP blocks up to `timeout` seconds then returns None.
+			# timeout=1 keeps the stop_event check responsive.
+			result = client.brpop(key, timeout=1)
+			if result is None:
 				continue
 			try:
-				event = from_redis(message["data"])
+				# result is (key_bytes, value_bytes); value is the JSON payload.
+				event = from_redis(result[1])
 				dispatch_event(event.to_dispatch_dict())
 			except Exception as exc:
 				logger.exception("listen_redis: dispatch failed: %s", exc)
 	finally:
-		pubsub.close()
 		client.close()
 		logger.info("listen_redis: closed")
 
@@ -311,7 +320,7 @@ def run_forever() -> None:
 	if settings.agents_event_source_redis:
 		t = threading.Thread(
 			target=listen_redis,
-			args=("cora:events", stop_event),
+			args=("cora:queue", stop_event),
 			daemon=True,
 			name="cora-listen-redis",
 		)
