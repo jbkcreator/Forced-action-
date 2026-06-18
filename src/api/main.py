@@ -82,6 +82,33 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def affiliate_ref_cookie(request, call_next):
+    """Capture an inbound ?aff= affiliate token into a persistent cookie.
+
+    Fallback only — the SPA captures ?aff client-side and forwards it in the
+    signup body. Uses ?aff (not ?ref, which the peer referral loop owns).
+    Last-touch wins. Validation against a real Affiliate happens at signup.
+    """
+    from src.services.affiliate_engine import (
+        AFFILIATE_COOKIE_NAME,
+        AFFILIATE_COOKIE_MAX_AGE,
+        AFFILIATE_REF_MAX_LEN,
+    )
+    ref = request.query_params.get("aff")
+    response = await call_next(request)
+    if ref:
+        response.set_cookie(
+            key=AFFILIATE_COOKIE_NAME,
+            value=ref[:AFFILIATE_REF_MAX_LEN],
+            max_age=AFFILIATE_COOKIE_MAX_AGE,
+            httponly=True,
+            samesite="lax",
+            path="/",
+        )
+    return response
 from src.api.admin_router import router as admin_router, get_current_admin  # noqa: E402
 from src.api.attribution_router import router as attribution_router  # noqa: E402
 from src.api.cora_incidents_router import router as cora_incidents_router  # noqa: E402
@@ -131,6 +158,8 @@ app.include_router(dfy_lite_router)
 
 from src.api.quora_auth_router import router as quora_auth_router  # noqa: E402
 app.include_router(quora_auth_router)
+from src.api.signals_router import router as signals_router  # noqa: E402
+app.include_router(signals_router)
 
 
 # ---------------------------------------------------------------------------
@@ -4403,6 +4432,46 @@ def proof_wall(
     return {"items": items}
 
 
+# S5: Win-Story Auto-Publisher feed — sanitised proof statements from lead-pack deliveries
+@app.get("/api/proof/win-stories")
+def get_win_stories(
+    limit: int = Query(20, ge=1, le=50),
+    county_id: Optional[str] = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    """
+    Public endpoint — returns recent is_public win_story_assets rows.
+    No PII: county + deal type only. Used by the /wins proof wall page.
+    Pass county_id to filter to a specific county (e.g. hillsborough).
+    """
+    try:
+        rows = db.execute(
+            text("""
+                SELECT id, event_type, county_id, proof_text, created_at
+                FROM win_story_assets
+                WHERE is_public = true
+                  AND (:county IS NULL OR county_id = :county)
+                ORDER BY created_at DESC
+                LIMIT :limit
+            """),
+            {"limit": limit, "county": county_id},
+        ).fetchall()
+    except Exception as exc:
+        logger.error("[win-stories] query failed: %s", exc)
+        raise HTTPException(status_code=503, detail="Database error")
+
+    return [
+        {
+            "id": r.id,
+            "event_type": r.event_type,
+            "county_id": r.county_id,
+            "proof_text": r.proof_text,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in rows
+    ]
+
+
 # ── Stage 5: Annual lock acceptance (deal-win + Day-60 path) ─────────────────
 
 class AnnualAcceptRequest(BaseModel):
@@ -4629,6 +4698,114 @@ def territory_map(
         rset(cache_key, json.dumps(payload), ttl_seconds=60)
 
     return payload
+
+
+class CreateAffiliateRequest(BaseModel):
+    name: str
+    contact_email: Optional[str] = None
+    contact_phone: Optional[str] = None
+    commission_rate: Optional[float] = None
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("name is required")
+        if len(v) > 200:
+            raise ValueError("name must be 200 characters or fewer")
+        return v
+
+    @field_validator("contact_email")
+    @classmethod
+    def _validate_email(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        v = v.strip().lower()
+        if not v:
+            return None
+        if "@" not in v or "." not in v.split("@")[-1]:
+            raise ValueError("contact_email is not a valid email address")
+        return v
+
+    @field_validator("commission_rate")
+    @classmethod
+    def _validate_rate(cls, v: Optional[float]) -> Optional[float]:
+        if v is None:
+            return None
+        if not (0 < v <= 1):
+            raise ValueError("commission_rate must be a fraction between 0 and 1 (e.g. 0.20)")
+        return v
+
+
+@app.post("/api/admin/affiliates", status_code=201)
+def create_affiliate(
+    req: CreateAffiliateRequest,
+    db: Session = Depends(get_db),
+    _admin: dict = Depends(get_current_admin),
+):
+    """Mint an Affiliate with an opaque ref_code (the ?aff= token). Admin only.
+
+    400/422 invalid body, 401/403 auth (get_current_admin), 409 ref_code
+    collision, 500 unexpected.
+    """
+    from src.services.affiliate_engine import mint_affiliate
+    try:
+        aff = mint_affiliate(
+            db,
+            name=req.name,
+            contact_email=req.contact_email,
+            contact_phone=req.contact_phone,
+            commission_rate=req.commission_rate,
+        )
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Could not allocate a unique referral code; please retry")
+    except RuntimeError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Could not allocate a unique referral code; please retry")
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("create_affiliate: database error")
+        raise HTTPException(status_code=500, detail="Failed to create affiliate")
+    except Exception:
+        db.rollback()
+        logger.exception("create_affiliate: unexpected error")
+        raise HTTPException(status_code=500, detail="Failed to create affiliate")
+    return {
+        "id": aff.id,
+        "ref_code": aff.ref_code,
+        "commission_rate": float(aff.commission_rate),
+        "status": aff.status,
+    }
+
+
+@app.get("/api/admin/affiliates/{affiliate_id}/ledger")
+def affiliate_ledger(
+    affiliate_id: int,
+    db: Session = Depends(get_db),
+    _admin: dict = Depends(get_current_admin),
+):
+    """Affiliate payout ledger: running balance + accrual/clawback lines. Admin only.
+
+    401/403 auth, 404 unknown affiliate, 422 bad id, 500 unexpected.
+    """
+    if affiliate_id <= 0:
+        raise HTTPException(status_code=422, detail="affiliate_id must be a positive integer")
+    from src.services.affiliate_engine import get_affiliate_ledger
+    try:
+        exists = db.execute(
+            text("SELECT 1 FROM affiliates WHERE id = :a"), {"a": affiliate_id}
+        ).first()
+        if exists is None:
+            raise HTTPException(status_code=404, detail="Affiliate not found")
+        return get_affiliate_ledger(db, affiliate_id)
+    except HTTPException:
+        raise
+    except SQLAlchemyError:
+        logger.exception("affiliate_ledger: database error affiliate_id=%s", affiliate_id)
+        raise HTTPException(status_code=500, detail="Failed to load affiliate ledger")
 
 
 @app.get("/api/admin/human-close")
@@ -5070,6 +5247,9 @@ class FreeSignupRequest(BaseModel):
     utm_campaign: Optional[str] = None
     campaign_id: Optional[str] = None
     attribution_token: Optional[str] = None
+    # fa081: affiliate ?aff= token, captured client-side and forwarded here.
+    # Distinct from referral_code (the peer credit loop).
+    affiliate_ref: Optional[str] = None
     # Phase 2B: caller hint about what the user is about to do. Suppresses the
     # welcome email when the user is mid-purchase ('upgrade' = paid checkout,
     # 'unlock' = $4 lead unlock). Welcome fires from the relevant payment
@@ -5087,7 +5267,7 @@ class FreeSignupRequest(BaseModel):
 
 
 @app.post("/api/free-signup", status_code=201)
-def free_signup(req: FreeSignupRequest, db: Session = Depends(get_db)):
+def free_signup(req: FreeSignupRequest, request: Request, db: Session = Depends(get_db)):
     """
     Create (or re-use) a free-tier Subscriber keyed by email.
 
@@ -5105,10 +5285,16 @@ def free_signup(req: FreeSignupRequest, db: Session = Depends(get_db)):
         )
 
     from src.services.signup_engine import create_free_account_by_email
+    from src.services.affiliate_engine import AFFILIATE_COOKIE_NAME
 
     # Defer the welcome email when the user is mid-purchase. The corresponding
     # payment webhook handler is responsible for sending the welcome on success.
     defer_welcome = req.intent in ("upgrade", "unlock")
+
+    # Affiliate attribution: the ?aff= token is captured client-side and sent in
+    # the request body (primary). The cookie set by the tracking middleware is a
+    # fallback for any flow that reaches FastAPI directly.
+    affiliate_ref = req.affiliate_ref or request.cookies.get(AFFILIATE_COOKIE_NAME)
 
     # Derive SMS consent from structured consent_acceptance when present.
     tcpa_accepted = bool(req.consent_acceptance and req.consent_acceptance.tcpa_accepted)
@@ -5127,6 +5313,7 @@ def free_signup(req: FreeSignupRequest, db: Session = Depends(get_db)):
         utm_campaign=req.utm_campaign,
         campaign_id=req.campaign_id,
         attribution_token=req.attribution_token,
+        affiliate_ref=affiliate_ref,
         send_welcome=not defer_welcome,
     )
 
@@ -6020,10 +6207,26 @@ def claim_bonus_zip(feed_uuid: str, body: ClaimBonusZipRequest, db: Session = De
             "message": "No bonus ZIP slots available. Refer 5 paying users to earn one.",
         })
 
-    # Validate ZIP is within the subscriber's county (3-digit prefix match)
-    from src.utils.county_config import is_zip_in_county
+    # Validate ZIP is within the subscriber's county.
+    # Primary: 3-digit prefix check against county config (fast, no DB hit).
+    # Fallback: if zip_prefixes is not configured for this county, verify the
+    #           ZIP exists in the properties table for that county instead.
+    from src.utils.county_config import get_county, is_zip_in_county
     try:
-        in_county = is_zip_in_county(subscriber.county_id, body.zip_code)
+        county_cfg = get_county(subscriber.county_id)
+        zip_prefixes = county_cfg.get("zip_prefixes") or []
+        if zip_prefixes:
+            in_county = is_zip_in_county(subscriber.county_id, body.zip_code)
+        else:
+            # zip_prefixes not configured — fall back to properties table
+            in_county = db.execute(
+                text("""
+                    SELECT 1 FROM properties
+                    WHERE zip = :zip AND county_id = :county
+                    LIMIT 1
+                """),
+                {"zip": body.zip_code, "county": subscriber.county_id},
+            ).first() is not None
     except KeyError:
         in_county = True  # unknown county_id — skip strict check rather than 500
 
