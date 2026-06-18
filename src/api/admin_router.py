@@ -2810,3 +2810,49 @@ def cancel_cora_message(
         message_id, _admin.get("sub"), body.reason,
     )
     return {"ok": True, "id": message_id, "send_status": "cancelled"}
+
+
+# ---------------------------------------------------------------------------
+# S5: Revenue Leak Log
+# ---------------------------------------------------------------------------
+
+@router.get("/revenue-leak", dependencies=[Depends(get_current_admin)])
+def get_revenue_leak(
+    county_id: Optional[str] = Query(default=None),
+    limit: int = Query(default=30, ge=1, le=90),
+    db: Session = Depends(get_db),
+):
+    """
+    Returns recent revenue_leak_log rows (nightly per-county aggregates).
+    Each row shows how many Gold+ leads went undelivered >48h and their
+    estimated dollar value, broken down by vertical.
+    """
+    try:
+        rows = db.execute(
+            text("""
+                SELECT log_date,
+                       county_id,
+                       total_leads_leaked,
+                       estimated_dollar_value,
+                       vertical_breakdown
+                FROM revenue_leak_log
+                WHERE (:county IS NULL OR county_id = :county)
+                ORDER BY log_date DESC, county_id
+                LIMIT :limit
+            """),
+            {"county": county_id, "limit": limit},
+        ).fetchall()
+    except Exception as exc:
+        logger.error("[revenue-leak] query failed: %s", exc)
+        raise HTTPException(status_code=503, detail="Database error")
+
+    return [
+        {
+            "log_date": str(r.log_date),
+            "county_id": r.county_id,
+            "total_leads_leaked": r.total_leads_leaked,
+            "estimated_dollar_value": str(r.estimated_dollar_value),
+            "vertical_breakdown": r.vertical_breakdown or {},
+        }
+        for r in rows
+    ]

@@ -5387,3 +5387,78 @@ class CloserCall(Base):
             f"<CloserCall(id={self.id}, aircall_call_id={self.aircall_call_id}, "
             f"subscriber_id={self.subscriber_id}, outcome={self.call_outcome})>"
         )
+
+
+# ============================================================================
+# Sprint S5 — Enhancement Workflows & Self-Growing Loops
+# ============================================================================
+
+class RevenueLeakLog(Base):
+    """
+    Nightly per-county aggregate of Gold+ leads that scored >48 hours ago
+    but have received zero outreach (no SentLead row since the score).
+    Written by src/tasks/revenue_leak.py. One row per (log_date, county_id).
+    """
+    __tablename__ = "revenue_leak_log"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    log_date: Mapped[date] = mapped_column(Date, nullable=False)
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    total_leads_leaked: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    estimated_dollar_value: Mapped[Decimal] = mapped_column(
+        Numeric(14, 2), nullable=False, default=0
+    )
+    vertical_breakdown: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint("log_date", "county_id", name="uq_revenue_leak_day_county"),
+        Index("idx_revenue_leak_date", "log_date"),
+        Index("idx_revenue_leak_county", "county_id"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<RevenueLeakLog(date={self.log_date}, county={self.county_id}, "
+            f"leads={self.total_leads_leaked}, value=${self.estimated_dollar_value})>"
+        )
+
+
+class WinStoryAsset(Base):
+    """
+    Sanitised proof statements auto-published when a lead pack is delivered
+    or (in future) a loan is funded. No PII — county + deal type + amount range only.
+    Written by src/services/win_story_publisher.py.
+    """
+    __tablename__ = "win_story_assets"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    event_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    proof_text: Mapped[str] = mapped_column(Text, nullable=False)
+    amount_range: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
+    is_public: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "event_type IN ('lead_pack', 'loan_funded')",
+            name="ck_win_story_event_type",
+        ),
+        Index("idx_win_story_public_created", "is_public", "created_at"),
+        Index("idx_win_story_county", "county_id"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<WinStoryAsset(id={self.id}, event='{self.event_type}', "
+            f"county='{self.county_id}')>"
+        )

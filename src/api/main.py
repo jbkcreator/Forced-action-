@@ -4427,6 +4427,46 @@ def proof_wall(
     return {"items": items}
 
 
+# S5: Win-Story Auto-Publisher feed — sanitised proof statements from lead-pack deliveries
+@app.get("/api/proof/win-stories")
+def get_win_stories(
+    limit: int = Query(20, ge=1, le=50),
+    county_id: Optional[str] = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    """
+    Public endpoint — returns recent is_public win_story_assets rows.
+    No PII: county + deal type only. Used by the /wins proof wall page.
+    Pass county_id to filter to a specific county (e.g. hillsborough).
+    """
+    try:
+        rows = db.execute(
+            text("""
+                SELECT id, event_type, county_id, proof_text, created_at
+                FROM win_story_assets
+                WHERE is_public = true
+                  AND (:county IS NULL OR county_id = :county)
+                ORDER BY created_at DESC
+                LIMIT :limit
+            """),
+            {"limit": limit, "county": county_id},
+        ).fetchall()
+    except Exception as exc:
+        logger.error("[win-stories] query failed: %s", exc)
+        raise HTTPException(status_code=503, detail="Database error")
+
+    return [
+        {
+            "id": r.id,
+            "event_type": r.event_type,
+            "county_id": r.county_id,
+            "proof_text": r.proof_text,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in rows
+    ]
+
+
 # ── Stage 5: Annual lock acceptance (deal-win + Day-60 path) ─────────────────
 
 class AnnualAcceptRequest(BaseModel):
@@ -6140,10 +6180,26 @@ def claim_bonus_zip(feed_uuid: str, body: ClaimBonusZipRequest, db: Session = De
             "message": "No bonus ZIP slots available. Refer 5 paying users to earn one.",
         })
 
-    # Validate ZIP is within the subscriber's county (3-digit prefix match)
-    from src.utils.county_config import is_zip_in_county
+    # Validate ZIP is within the subscriber's county.
+    # Primary: 3-digit prefix check against county config (fast, no DB hit).
+    # Fallback: if zip_prefixes is not configured for this county, verify the
+    #           ZIP exists in the properties table for that county instead.
+    from src.utils.county_config import get_county, is_zip_in_county
     try:
-        in_county = is_zip_in_county(subscriber.county_id, body.zip_code)
+        county_cfg = get_county(subscriber.county_id)
+        zip_prefixes = county_cfg.get("zip_prefixes") or []
+        if zip_prefixes:
+            in_county = is_zip_in_county(subscriber.county_id, body.zip_code)
+        else:
+            # zip_prefixes not configured — fall back to properties table
+            in_county = db.execute(
+                text("""
+                    SELECT 1 FROM properties
+                    WHERE zip = :zip AND county_id = :county
+                    LIMIT 1
+                """),
+                {"zip": body.zip_code, "county": subscriber.county_id},
+            ).first() is not None
     except KeyError:
         in_county = True  # unknown county_id — skip strict check rather than 500
 
