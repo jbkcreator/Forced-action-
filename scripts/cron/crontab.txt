@@ -510,4 +510,12 @@ COUNTY_ID=hillsborough
 # One-time per county (revenue_pulse_sent_at guard). Reuses run_daily_pulse.
 */15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.county_launch_pulse
 
+# ── AFFILIATE PROGRAM (Stream D) ─────────────────────────────────────────────
+# Monthly affiliate payout — 1st of month 06:00 UTC. Accrues Commission for the
+# PRIOR calendar month (20% of collected subscription revenue per Active Paid
+# Referral, within the 12-month window) and writes Commission Clawback lines for
+# refunded/disputed invoices. Append-only + idempotent (safe to re-run). Records
+# amounts owed in the Payout Ledger only — no Stripe disbursement. See fa081.
+0 6 1 * * $PROJECT/scripts/cron/run.sh src.tasks.affiliate_payout
+
 # === END FORCED-ACTION-PLATFORM ===

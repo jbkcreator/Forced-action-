@@ -11,6 +11,7 @@ All 5 required handlers:
 Entry point: handle_webhook(raw_body, sig_header) — call this from your web framework route.
 """
 
+import json
 import logging
 import time
 import uuid
@@ -868,6 +869,13 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
     except Exception:
         logger.warning("Campaign attribution failed sub=%s", subscriber.id, exc_info=True)
 
+    # Affiliate referral: a paid checkout confirms a pending Affiliate Referral.
+    try:
+        from src.services.affiliate_engine import confirm_referral
+        confirm_referral(db, subscriber.id)
+    except Exception:
+        logger.warning("Affiliate confirm failed sub=%s", subscriber.id, exc_info=True)
+
     logger.info(
         "checkout.session.completed: subscriber=%s tier=%s vertical=%s"
         " founding=%s zips=%s feed_uuid=%s",
@@ -958,6 +966,31 @@ def _on_payment_succeeded(invoice: dict, db: Session) -> None:
         "invoice.payment_succeeded: subscriber=%s billing_date=%s",
         subscriber.id, subscriber.billing_date,
     )
+
+    # Affiliate program: record collected subscription revenue (source of truth
+    # for Commission). One-time charges are ignored by the engine.
+    try:
+        from src.services.affiliate_engine import record_subscription_invoice
+        line = invoice.get("lines", {}).get("data", [{}])[0]
+        period_start = line.get("period", {}).get("start")
+        paid_ts = invoice.get("status_transitions", {}).get("paid_at") or period_start
+        if invoice.get("id") and period_start and paid_ts:
+            record_subscription_invoice(
+                db,
+                stripe_invoice_id=invoice["id"],
+                subscriber_id=subscriber.id,
+                amount_collected_cents=int(invoice.get("amount_paid") or 0),
+                period_month=datetime.fromtimestamp(period_start, tz=timezone.utc).date().replace(day=1),
+                paid_at=datetime.fromtimestamp(paid_ts, tz=timezone.utc),
+                is_subscription=bool(invoice.get("subscription"))
+                or billing_reason in ("subscription_create", "subscription_cycle", "subscription_update"),
+                # Store the PaymentIntent so refunds map back even when the
+                # Stripe API version nulls charge.invoice (2026-02-25+).
+                payment_intent_id=invoice.get("payment_intent")
+                or _resolve_invoice_payment_intent(invoice["id"]),
+            )
+    except Exception:
+        logger.warning("Affiliate invoice capture failed sub=%s", subscriber.id, exc_info=True)
 
     if had_failed_payment:
         try:
@@ -2840,6 +2873,52 @@ def _send_founder_alert(message: str) -> None:
         logger.error("Founder alert failed: %s", exc)
 
 
+def _resolve_invoice_payment_intent(invoice_id: str):
+    """Best-effort: fetch an invoice's PaymentIntent id. Needed only on Stripe
+    API versions where the invoice.payment_succeeded payload omits it
+    (2026-02-25+ exposes it via the expanded `payments` sub-resource)."""
+    if not invoice_id:
+        return None
+    try:
+        from config.settings import settings
+        import stripe as _stripe
+        key = settings.active_stripe_secret_key
+        if not key:
+            return None
+        _stripe.api_key = key.get_secret_value()
+        # json round-trip → plain dict (StripeObject lacks a public .get/.to_dict
+        # in this SDK version)
+        inv = json.loads(str(_stripe.Invoice.retrieve(invoice_id, expand=["payments"])))
+        pays = (inv.get("payments") or {}).get("data") or []
+        if pays:
+            return (pays[0].get("payment") or {}).get("payment_intent")
+    except Exception:
+        logger.warning("Could not resolve payment_intent for invoice=%s", invoice_id, exc_info=True)
+    return None
+
+
+def _affiliate_reverse_from_charge(charge, reason: str, db: Session) -> None:
+    """Mark a captured subscription invoice reversed so the monthly affiliate run
+    writes a Commission Clawback. Version-robust: uses charge.invoice when present
+    (older API), else matches by charge.payment_intent (2026-02-25+, where
+    charge.invoice is null). No-op if the charge isn't a captured subscription invoice.
+    """
+    try:
+        from src.services.affiliate_engine import (
+            mark_invoice_reversed,
+            mark_invoice_reversed_by_payment_intent,
+        )
+        invoice_id = charge.get("invoice") if hasattr(charge, "get") else None
+        if invoice_id:
+            mark_invoice_reversed(db, invoice_id, reason)
+            return
+        pi = charge.get("payment_intent") if hasattr(charge, "get") else None
+        if pi:
+            mark_invoice_reversed_by_payment_intent(db, pi, reason)
+    except Exception:
+        logger.warning("Affiliate invoice reversal failed reason=%s", reason, exc_info=True)
+
+
 def _on_charge_refunded(charge: dict, db: Session) -> None:
     """charge.refunded — flip purchase status, optionally clawback credits.
 
@@ -2855,7 +2934,9 @@ def _on_charge_refunded(charge: dict, db: Session) -> None:
     from src.core.models import PremiumPurchase, LeadPackPurchase
     charge_id = charge.get("id")
     pi_id = charge.get("payment_intent")
-    
+
+    _affiliate_reverse_from_charge(charge, "refund", db)
+
     # Try PremiumPurchase first
     purchase = _resolve_premium_purchase_from_charge(charge, db)
     
@@ -3027,6 +3108,10 @@ def _on_dispute_funds_withdrawn(dispute: dict, db: Session) -> None:
         charge_obj = charge
     else:
         charge_obj = {"id": charge, "payment_intent": dispute.get("payment_intent")}
+
+    # Disputes claw back the same as refunds. Version-robust: invoice id when
+    # present, else matched by charge.payment_intent.
+    _affiliate_reverse_from_charge(charge_obj, "dispute", db)
 
     purchase = _resolve_premium_purchase_from_charge(charge_obj, db)
     if purchase is None:
