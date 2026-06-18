@@ -242,6 +242,20 @@ def fulfill_purchase(db, purchase) -> str:
                     purchase_id, exc_info=True,
                 )
 
+        try:
+            from src.services.win_story_publisher import publish_win_story
+            publish_win_story(
+                "lead_pack",
+                purchase.county_id,
+                db,
+                detail=purchase.vertical,
+            )
+        except Exception:
+            logger.warning(
+                "[LeadPackSweep] win-story publish failed for purchase %s",
+                purchase_id, exc_info=True,
+            )
+
         logger.info(
             "[LeadPackSweep] DELIVERED purchase %s (%d leads) to subscriber %s",
             purchase_id, len(lead_ids), purchase.subscriber_id,

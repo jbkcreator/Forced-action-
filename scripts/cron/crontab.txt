@@ -146,6 +146,12 @@ COUNTY_ID=hillsborough
 # Pinellas stays manual-upload until their SOE confirms delivery method.
 45 4 19-25 * * $PROJECT/scripts/cron/run.sh src.tasks.voter_registry_refresh
 
+# Revenue Leak Score Engine (Sprint S5) — 07:38/07:39 AM UTC Mon-Sat.
+# Counts Gold+ leads scored >48h ago with no SentLead delivery; values and writes to revenue_leak_log.
+# Runs after skip-trace (07:30) so skip-traced contact data is fresh before valuation.
+38 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.revenue_leak hillsborough
+39 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.revenue_leak pinellas
+
 # 17. Lead Quality Monitor — 07:35 AM UTC Mon-Sat (after CDS scoring at 07:00, skip tracing at 07:30)
 #     Snapshots leads sent ~30 days ago; computes Gold+ false-positive rate.
 35 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.lead_quality_monitor $COUNTY_ID
