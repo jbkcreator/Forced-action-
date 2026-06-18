@@ -105,6 +105,21 @@ def dispatch_event(event: Dict[str, Any]) -> Dict[str, Any]:
 			)
 		return _outcome("routed", "lead_pack_fulfillment", decision_id, "ok")
 
+	# Closer Cockpit tagging (ADR closer-telemetry-separate-from-agent-decisions).
+	# call_transcribed is post-call enrichment, NOT a Cora Touch — hand it to the
+	# tagging service and return BEFORE the EVENT_TO_GRAPH lookup / agent_decisions
+	# logging. The nightly retag sweep is the durability backstop.
+	if event_type == "call_transcribed":
+		try:
+			from src.services.closer_call_tagging import tag_closer_call
+			tag_closer_call((payload or {}).get("aircall_call_id"))
+		except Exception as _tag_exc:
+			logger.warning(
+				"supervisor: closer_call tagging failed (call=%s); retag sweep is backstop: %s",
+				(payload or {}).get("aircall_call_id"), _tag_exc,
+			)
+		return _outcome("routed", "closer_call_tagging", decision_id, "ok")
+
 	# Global kill switch
 	if settings.agents_global_kill_switch:
 		reason = "global_kill_switch_enabled"

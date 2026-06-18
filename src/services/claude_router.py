@@ -62,6 +62,7 @@ _TASK_ROUTING: dict[str, str] = {
     "learning_card":         "sonnet",
     "retention_copy":           "sonnet",
     "email_copy":               "sonnet",
+    "closer_call_tagging":      "sonnet",   # Closer Cockpit (S1b) transcript tagging
     "referral_milestone_sms":   "haiku",
     "referral_milestone_email": "sonnet",
     # Concierge Chat
