@@ -1174,7 +1174,8 @@ class Subscriber(Base):
 
     # ── fa017: Signup source attribution ──
     # CHECK constraint (`check_subscriber_signup_source`) enforces allow-list:
-    # direct / landing_page / dbpr_email / cora_sms / missed_call / referral / admin / unknown.
+    # direct / landing_page / dbpr_email / cora_sms / missed_call / referral /
+    # admin / unknown / affiliate (fa081).
     signup_source: Mapped[str] = mapped_column(
         String(30), default="direct", server_default="direct", nullable=False, index=True,
     )
@@ -1183,6 +1184,8 @@ class Subscriber(Base):
     utm_campaign: Mapped[Optional[str]] = mapped_column(String(100))
     campaign_id: Mapped[Optional[str]] = mapped_column(String(50))
     attribution_token: Mapped[Optional[str]] = mapped_column(String(200))
+    # fa081: stamped at registration with the Affiliate's opaque ?ref= token.
+    affiliate_ref: Mapped[Optional[str]] = mapped_column(String(40), index=True)
 
     bundle_purchases = relationship("BundlePurchase", back_populates="subscriber")
 
@@ -3626,6 +3629,150 @@ class PartnerSubscription(Base):
 
     def __repr__(self):
         return f"<PartnerSubscription(sub={self.subscriber_id}, max_zips={self.max_zips})>"
+
+
+# ============================================================================
+# Affiliate Program (Stream D) — external promoters paid a cash Commission.
+# Distinct from ReferralEvent (peer wallet-credit loop) and PartnerSubscription
+# (a subscription tier). See docs/adr/0005 and CONTEXT.md "Affiliate Program".
+# ============================================================================
+
+class Affiliate(Base):
+    """External promoter paid a cash Commission for referred paying subscribers.
+
+    Admin-minted; ref_code is the opaque ?ref= token. commission_rate is
+    per-affiliate, defaulting to 20%.
+    """
+    __tablename__ = "affiliates"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    ref_code: Mapped[str] = mapped_column(String(40), nullable=False, unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    contact_email: Mapped[Optional[str]] = mapped_column(String(255))
+    contact_phone: Mapped[Optional[str]] = mapped_column(String(20))
+    commission_rate: Mapped[Decimal] = mapped_column(
+        Numeric(5, 4), nullable=False, server_default=text("0.20")
+    )
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint("status IN ('active', 'disabled')", name="check_affiliate_status"),
+    )
+
+    def __repr__(self):
+        return f"<Affiliate(ref_code={self.ref_code}, status={self.status})>"
+
+
+class AffiliateReferral(Base):
+    """Confirmed link between a paying Subscriber and the Affiliate who referred
+    them — the unit a Commission is calculated against.
+
+    One affiliate per subscriber (subscriber_id UNIQUE). Stamped pending at
+    registration, flipped active at first paid upgrade.
+    """
+    __tablename__ = "affiliate_referrals"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    affiliate_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("affiliates.id"), nullable=False, index=True
+    )
+    subscriber_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("subscribers.id"), nullable=False, unique=True
+    )
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    attributed_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    paid_tenure_start: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    window_end: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'active', 'expired')",
+            name="check_affiliate_referral_status",
+        ),
+    )
+
+    def __repr__(self):
+        return f"<AffiliateReferral(affiliate={self.affiliate_id}, sub={self.subscriber_id}, status={self.status})>"
+
+
+class SubscriptionInvoice(Base):
+    """A collected recurring-subscription invoice, captured from Stripe.
+
+    Source of truth for Commission accrual — never nominal plan_price. Marked
+    reversed (refund/dispute) so the monthly run can write a clawback.
+    """
+    __tablename__ = "subscription_invoices"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("subscribers.id"), nullable=False, index=True
+    )
+    stripe_invoice_id: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    # fa081: cross-version refund linkage. Stripe API 2026-02-25 nulls
+    # charge.invoice, so refunds are matched back to the invoice by this PI.
+    stripe_payment_intent_id: Mapped[Optional[str]] = mapped_column(String(255), index=True)
+    amount_collected_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    period_month: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    paid_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    reversed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    reversed_reason: Mapped[Optional[str]] = mapped_column(String(20))
+
+    __table_args__ = (
+        CheckConstraint(
+            "reversed_reason IN ('refund', 'dispute')",
+            name="check_subscription_invoice_reversed_reason",
+        ),
+    )
+
+    def __repr__(self):
+        return f"<SubscriptionInvoice(stripe_invoice_id={self.stripe_invoice_id}, cents={self.amount_collected_cents})>"
+
+
+class AffiliatePayoutLedger(Base):
+    """Append-only record of Commission owed: accrual lines plus negative
+    clawback lines. Never mutated — corrections are new offsetting lines.
+
+    UNIQUE(affiliate_referral_id, period_month, line_type) makes the monthly
+    accrual run idempotent on rerun.
+    """
+    __tablename__ = "affiliate_payout_ledger"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    affiliate_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("affiliates.id"), nullable=False, index=True
+    )
+    affiliate_referral_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("affiliate_referrals.id"), nullable=False, index=True
+    )
+    period_month: Mapped[date] = mapped_column(Date, nullable=False)
+    line_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    amount_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_invoice_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("subscription_invoices.id")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "affiliate_referral_id", "period_month", "line_type",
+            name="uq_affiliate_ledger_period_line",
+        ),
+        CheckConstraint(
+            "line_type IN ('accrual', 'clawback')",
+            name="check_affiliate_ledger_line_type",
+        ),
+    )
+
+    def __repr__(self):
+        return f"<AffiliatePayoutLedger(referral={self.affiliate_referral_id}, {self.line_type}, cents={self.amount_cents})>"
 
 
 # ============================================================================

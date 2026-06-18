@@ -82,6 +82,33 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def affiliate_ref_cookie(request, call_next):
+    """Capture an inbound ?aff= affiliate token into a persistent cookie.
+
+    Fallback only — the SPA captures ?aff client-side and forwards it in the
+    signup body. Uses ?aff (not ?ref, which the peer referral loop owns).
+    Last-touch wins. Validation against a real Affiliate happens at signup.
+    """
+    from src.services.affiliate_engine import (
+        AFFILIATE_COOKIE_NAME,
+        AFFILIATE_COOKIE_MAX_AGE,
+        AFFILIATE_REF_MAX_LEN,
+    )
+    ref = request.query_params.get("aff")
+    response = await call_next(request)
+    if ref:
+        response.set_cookie(
+            key=AFFILIATE_COOKIE_NAME,
+            value=ref[:AFFILIATE_REF_MAX_LEN],
+            max_age=AFFILIATE_COOKIE_MAX_AGE,
+            httponly=True,
+            samesite="lax",
+            path="/",
+        )
+    return response
 from src.api.admin_router import router as admin_router, get_current_admin  # noqa: E402
 from src.api.attribution_router import router as attribution_router  # noqa: E402
 from src.api.cora_incidents_router import router as cora_incidents_router  # noqa: E402
@@ -4625,6 +4652,48 @@ def territory_map(
     return payload
 
 
+class CreateAffiliateRequest(BaseModel):
+    name: str
+    contact_email: Optional[str] = None
+    contact_phone: Optional[str] = None
+    commission_rate: Optional[float] = None
+
+
+@app.post("/api/admin/affiliates", status_code=201)
+def create_affiliate(
+    req: CreateAffiliateRequest,
+    db: Session = Depends(get_db),
+    _admin: dict = Depends(get_current_admin),
+):
+    """Mint an Affiliate with an opaque ref_code (the ?ref= token). Admin only."""
+    from src.services.affiliate_engine import mint_affiliate
+    aff = mint_affiliate(
+        db,
+        name=req.name,
+        contact_email=req.contact_email,
+        contact_phone=req.contact_phone,
+        commission_rate=req.commission_rate,
+    )
+    db.commit()
+    return {
+        "id": aff.id,
+        "ref_code": aff.ref_code,
+        "commission_rate": float(aff.commission_rate),
+        "status": aff.status,
+    }
+
+
+@app.get("/api/admin/affiliates/{affiliate_id}/ledger")
+def affiliate_ledger(
+    affiliate_id: int,
+    db: Session = Depends(get_db),
+    _admin: dict = Depends(get_current_admin),
+):
+    """Affiliate payout ledger: running balance + accrual/clawback lines. Admin only."""
+    from src.services.affiliate_engine import get_affiliate_ledger
+    return get_affiliate_ledger(db, affiliate_id)
+
+
 @app.get("/api/admin/human-close")
 def list_human_close(
     status: str = "open",
@@ -5042,6 +5111,9 @@ class FreeSignupRequest(BaseModel):
     utm_campaign: Optional[str] = None
     campaign_id: Optional[str] = None
     attribution_token: Optional[str] = None
+    # fa081: affiliate ?aff= token, captured client-side and forwarded here.
+    # Distinct from referral_code (the peer credit loop).
+    affiliate_ref: Optional[str] = None
     # Phase 2B: caller hint about what the user is about to do. Suppresses the
     # welcome email when the user is mid-purchase ('upgrade' = paid checkout,
     # 'unlock' = $4 lead unlock). Welcome fires from the relevant payment
@@ -5059,7 +5131,7 @@ class FreeSignupRequest(BaseModel):
 
 
 @app.post("/api/free-signup", status_code=201)
-def free_signup(req: FreeSignupRequest, db: Session = Depends(get_db)):
+def free_signup(req: FreeSignupRequest, request: Request, db: Session = Depends(get_db)):
     """
     Create (or re-use) a free-tier Subscriber keyed by email.
 
@@ -5077,10 +5149,16 @@ def free_signup(req: FreeSignupRequest, db: Session = Depends(get_db)):
         )
 
     from src.services.signup_engine import create_free_account_by_email
+    from src.services.affiliate_engine import AFFILIATE_COOKIE_NAME
 
     # Defer the welcome email when the user is mid-purchase. The corresponding
     # payment webhook handler is responsible for sending the welcome on success.
     defer_welcome = req.intent in ("upgrade", "unlock")
+
+    # Affiliate attribution: the ?aff= token is captured client-side and sent in
+    # the request body (primary). The cookie set by the tracking middleware is a
+    # fallback for any flow that reaches FastAPI directly.
+    affiliate_ref = req.affiliate_ref or request.cookies.get(AFFILIATE_COOKIE_NAME)
 
     # Derive SMS consent from structured consent_acceptance when present.
     tcpa_accepted = bool(req.consent_acceptance and req.consent_acceptance.tcpa_accepted)
@@ -5099,6 +5177,7 @@ def free_signup(req: FreeSignupRequest, db: Session = Depends(get_db)):
         utm_campaign=req.utm_campaign,
         campaign_id=req.campaign_id,
         attribution_token=req.attribution_token,
+        affiliate_ref=affiliate_ref,
         send_welcome=not defer_welcome,
     )
 

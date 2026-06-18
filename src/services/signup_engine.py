@@ -37,6 +37,7 @@ ALLOWED_SIGNUP_SOURCES = frozenset({
 	"referral",
 	"admin",
 	"unknown",
+	"affiliate",
 })
 
 
@@ -106,6 +107,7 @@ def create_free_account(
     utm_campaign: Optional[str] = None,
     campaign_id: Optional[str] = None,
     attribution_token: Optional[str] = None,
+    affiliate_ref: Optional[str] = None,
 ) -> Subscriber:
     """Create (or re-use) a free Subscriber keyed by phone number.
 
@@ -172,6 +174,13 @@ def create_free_account(
     except Exception:
         pass  # never block signup on audit-log failure
 
+    if affiliate_ref:
+        try:
+            from src.services.affiliate_engine import attribute_signup
+            attribute_signup(db, sub, affiliate_ref)
+        except Exception as exc:
+            logger.warning("Affiliate attribution failed for subscriber %d: %s", sub.id, exc)
+
     if referral_code:
         try:
             from src.services.referral_engine import process_signup
@@ -215,6 +224,7 @@ def create_free_account_by_email(
 	utm_campaign: Optional[str] = None,
 	campaign_id: Optional[str] = None,
 	attribution_token: Optional[str] = None,
+	affiliate_ref: Optional[str] = None,
 	send_welcome: bool = True,
 ) -> Subscriber:
 	"""
@@ -307,6 +317,13 @@ def create_free_account_by_email(
 		)
 	except Exception:
 		pass
+
+	if affiliate_ref:
+		try:
+			from src.services.affiliate_engine import attribute_signup
+			attribute_signup(db, sub, affiliate_ref)
+		except Exception as exc:
+			logger.warning("Affiliate attribution failed for subscriber %d: %s", sub.id, exc)
 
 	if referral_code:
 		try:
