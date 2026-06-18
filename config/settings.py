@@ -524,6 +524,19 @@ class AppSettings(BaseSettings):
 	aircall_api_id: Optional[SecretStr] = Field(default=None, env="AIRCALL_API_ID")
 	aircall_api_token: Optional[SecretStr] = Field(default=None, env="AIRCALL_API_TOKEN")
 	aircall_webhook_token: Optional[SecretStr] = Field(default=None, env="AIRCALL_WEBHOOK_TOKEN")
+	# ── Meta Conversions API (CAPI) — S2 ────────────────────────────────────
+	# Server-side Purchase reporting for closed-loop Meta ad attribution.
+	# Feature-gated and OFF by default — when disabled, or when pixel_id /
+	# access_token is missing, the CAPI call is skipped safely and never
+	# affects checkout, subscription activation, lead-pack fulfillment, or
+	# Stripe webhook processing. test_event_code is only included in the Meta
+	# payload when meta_capi_test_mode is True.
+	meta_capi_enabled: bool = Field(default=False, env="META_CAPI_ENABLED")
+	meta_capi_test_mode: bool = Field(default=False, env="META_CAPI_TEST_MODE")
+	meta_pixel_id: Optional[str] = Field(default=None, env="META_PIXEL_ID")
+	meta_access_token: Optional[SecretStr] = Field(default=None, env="META_ACCESS_TOKEN")
+	meta_test_event_code: Optional[str] = Field(default=None, env="META_TEST_EVENT_CODE")
+	meta_graph_api_version: str = Field(default="v17.0", env="META_GRAPH_API_VERSION")
 
 
 @lru_cache

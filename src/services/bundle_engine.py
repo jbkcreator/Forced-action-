@@ -40,6 +40,7 @@ def create_payment_intent(
     zip_code: str,
     vertical: str,
     db: Session,
+    extra_metadata: Optional[dict] = None,
 ) -> dict:
     sub = db.get(Subscriber, subscriber_id)
     if not sub:
@@ -54,18 +55,21 @@ def create_payment_intent(
         raise RuntimeError("Stripe not configured")
     stripe.api_key = key.get_secret_value()
 
+    # Buyer attribution / Meta CAPI context is merged first so the core product
+    # keys always win on any (unexpected) collision.
+    pi_metadata = {**(extra_metadata or {}), **{
+        "product": "bundle",
+        "bundle_type": bundle_type,
+        "subscriber_id": str(subscriber_id),
+        "zip_code": zip_code,
+        "vertical": vertical,
+    }}
     pi = stripe.PaymentIntent.create(
         amount=bundle_config["price_cents"],
         currency="usd",
         customer=sub.stripe_customer_id,
         setup_future_usage="off_session",
-        metadata={
-            "product": "bundle",
-            "bundle_type": bundle_type,
-            "subscriber_id": str(subscriber_id),
-            "zip_code": zip_code,
-            "vertical": vertical,
-        },
+        metadata=pi_metadata,
     )
     return {
         "client_secret": pi.client_secret,
