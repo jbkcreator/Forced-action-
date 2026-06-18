@@ -103,3 +103,22 @@ def test_ledger_endpoint_requires_admin(nonpersist_session):
         assert resp.status_code in (401, 403)
     finally:
         app.dependency_overrides.clear()
+
+
+def test_ledger_endpoint_unknown_affiliate_404(nonpersist_session):
+    client, app = _client(nonpersist_session, admin=True)
+    try:
+        resp = client.get("/api/admin/affiliates/999999999/ledger")
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Affiliate not found"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_ledger_endpoint_bad_id_422(nonpersist_session):
+    client, app = _client(nonpersist_session, admin=True)
+    try:
+        resp = client.get("/api/admin/affiliates/0/ledger")
+        assert resp.status_code == 422
+    finally:
+        app.dependency_overrides.clear()

@@ -4658,6 +4658,37 @@ class CreateAffiliateRequest(BaseModel):
     contact_phone: Optional[str] = None
     commission_rate: Optional[float] = None
 
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("name is required")
+        if len(v) > 200:
+            raise ValueError("name must be 200 characters or fewer")
+        return v
+
+    @field_validator("contact_email")
+    @classmethod
+    def _validate_email(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        v = v.strip().lower()
+        if not v:
+            return None
+        if "@" not in v or "." not in v.split("@")[-1]:
+            raise ValueError("contact_email is not a valid email address")
+        return v
+
+    @field_validator("commission_rate")
+    @classmethod
+    def _validate_rate(cls, v: Optional[float]) -> Optional[float]:
+        if v is None:
+            return None
+        if not (0 < v <= 1):
+            raise ValueError("commission_rate must be a fraction between 0 and 1 (e.g. 0.20)")
+        return v
+
 
 @app.post("/api/admin/affiliates", status_code=201)
 def create_affiliate(
@@ -4665,16 +4696,35 @@ def create_affiliate(
     db: Session = Depends(get_db),
     _admin: dict = Depends(get_current_admin),
 ):
-    """Mint an Affiliate with an opaque ref_code (the ?ref= token). Admin only."""
+    """Mint an Affiliate with an opaque ref_code (the ?aff= token). Admin only.
+
+    400/422 invalid body, 401/403 auth (get_current_admin), 409 ref_code
+    collision, 500 unexpected.
+    """
     from src.services.affiliate_engine import mint_affiliate
-    aff = mint_affiliate(
-        db,
-        name=req.name,
-        contact_email=req.contact_email,
-        contact_phone=req.contact_phone,
-        commission_rate=req.commission_rate,
-    )
-    db.commit()
+    try:
+        aff = mint_affiliate(
+            db,
+            name=req.name,
+            contact_email=req.contact_email,
+            contact_phone=req.contact_phone,
+            commission_rate=req.commission_rate,
+        )
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Could not allocate a unique referral code; please retry")
+    except RuntimeError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Could not allocate a unique referral code; please retry")
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("create_affiliate: database error")
+        raise HTTPException(status_code=500, detail="Failed to create affiliate")
+    except Exception:
+        db.rollback()
+        logger.exception("create_affiliate: unexpected error")
+        raise HTTPException(status_code=500, detail="Failed to create affiliate")
     return {
         "id": aff.id,
         "ref_code": aff.ref_code,
@@ -4689,9 +4739,25 @@ def affiliate_ledger(
     db: Session = Depends(get_db),
     _admin: dict = Depends(get_current_admin),
 ):
-    """Affiliate payout ledger: running balance + accrual/clawback lines. Admin only."""
+    """Affiliate payout ledger: running balance + accrual/clawback lines. Admin only.
+
+    401/403 auth, 404 unknown affiliate, 422 bad id, 500 unexpected.
+    """
+    if affiliate_id <= 0:
+        raise HTTPException(status_code=422, detail="affiliate_id must be a positive integer")
     from src.services.affiliate_engine import get_affiliate_ledger
-    return get_affiliate_ledger(db, affiliate_id)
+    try:
+        exists = db.execute(
+            text("SELECT 1 FROM affiliates WHERE id = :a"), {"a": affiliate_id}
+        ).first()
+        if exists is None:
+            raise HTTPException(status_code=404, detail="Affiliate not found")
+        return get_affiliate_ledger(db, affiliate_id)
+    except HTTPException:
+        raise
+    except SQLAlchemyError:
+        logger.exception("affiliate_ledger: database error affiliate_id=%s", affiliate_id)
+        raise HTTPException(status_code=500, detail="Failed to load affiliate ledger")
 
 
 @app.get("/api/admin/human-close")

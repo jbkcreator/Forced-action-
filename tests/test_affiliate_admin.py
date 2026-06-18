@@ -80,3 +80,20 @@ def test_endpoint_requires_admin(nonpersist_session):
         assert resp.status_code in (401, 403)
     finally:
         app.dependency_overrides.clear()
+
+
+@pytest.mark.parametrize("body", [
+    {"name": ""},                              # empty name
+    {"name": "   "},                           # whitespace name
+    {},                                        # missing name
+    {"name": "X", "commission_rate": 2},       # rate > 1
+    {"name": "X", "commission_rate": 0},       # rate not > 0
+    {"name": "X", "contact_email": "not-an-email"},  # bad email
+])
+def test_endpoint_rejects_invalid_body(nonpersist_session, body):
+    client, app = _client(nonpersist_session, admin=True)
+    try:
+        resp = client.post("/api/admin/affiliates", json=body)
+        assert resp.status_code == 422
+    finally:
+        app.dependency_overrides.clear()
