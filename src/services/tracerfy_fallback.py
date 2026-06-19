@@ -89,6 +89,14 @@ _ENTITY_TOKENS = frozenset({
 
 _NAME_SUFFIXES = frozenset({"JR", "JR.", "SR", "SR.", "II", "III", "IV", "ESQ", "ESQ."})
 
+# Surname particles (Spanish/Portuguese/Dutch). Their presence after the first
+# name signals a multi-token / two-surname name we cannot split positionally
+# (the paternal surname is NOT the last token) — those route to Address-Only.
+_SURNAME_PARTICLES = frozenset({
+    "DE", "DEL", "DELA", "LA", "LAS", "LOS", "SAN", "SANTA",
+    "DOS", "DAS", "DA", "DI", "VAN", "VON",
+})
+
 # Strips "ET AL", "ET ALS", "ET AL." from the end of assessor owner names.
 _ET_AL_RE = re.compile(r"\s+ET\s+AL[S.]?\s*$", re.IGNORECASE)
 
@@ -115,6 +123,38 @@ def _parse_name(full_name: str) -> tuple[str, str]:
         return first, last_part.strip()
     parts = name.split(None, 1)
     return (parts[0], parts[1]) if len(parts) > 1 else ("", parts[0] if parts else "")
+
+
+def _split_individual_name(raw: str) -> tuple[str, str, bool]:
+    """
+    Resolve an individual owner name → (first, last, is_traceable).
+
+    Our assessor data is FIRST [MIDDLE...] LAST order. The naive split jams the
+    middle name into the surname slot ("RICHARD JAMES FORSYTH" → "JAMES FORSYTH"),
+    which traces under a wrong surname and misses. Rules:
+
+      - Comma form "LAST, FIRST"        → parse directly (unambiguous).
+      - 1 token                          → surname only.
+      - 2-3 tokens "FIRST [MIDDLE] LAST" → first token + LAST token (drop middle).
+      - 4+ tokens, or a surname particle (DE/DEL/LA...) after the first name →
+        ambiguous (likely two surnames, e.g. Spanish "LUIS LOPEZ MORENO AURIOLES"
+        where the paternal surname is NOT the last token). Return
+        is_traceable=False so the caller routes it to the Tracerfy Address-Only
+        pass (Tracerfy identifies the owner from the address — no name guess).
+    """
+    if "," in raw:
+        first, last = _parse_name(raw)
+        return first, last, True
+    tokens = [t for t in raw.split() if t.upper().rstrip(".") not in _NAME_SUFFIXES]
+    if not tokens:
+        return "", "", False
+    if len(tokens) == 1:
+        return "", tokens[0], True
+    if _SURNAME_PARTICLES.intersection(t.upper() for t in tokens[1:]):
+        return "", "", False
+    if len(tokens) <= 3:
+        return tokens[0], tokens[-1], True
+    return "", "", False
 
 
 def _parse_ra_address(addr: str) -> dict | None:
@@ -196,13 +236,8 @@ def _resolve_trace_subject(owner: "Owner") -> tuple[str, str, dict | None, bool]
             raw = person_part
             break
 
-    first, last = _parse_name(raw)
-    # Strip a leading middle initial from the last-name slot:
-    # "KURT W JOHNSON" → last="W JOHNSON" → ["W", "JOHNSON"] → drop "W"
-    last_parts = last.split(None, 1)
-    if len(last_parts) == 2 and len(last_parts[0]) == 1:
-        last = last_parts[1]
-    return first, last, None, True
+    first, last, is_traceable = _split_individual_name(raw)
+    return first, last, None, is_traceable
 
 
 # ---------------------------------------------------------------------------
@@ -600,6 +635,23 @@ def hot_enrich_properties(
         except Exception as exc:
             logger.error("[Tracerfy] hot_enrich persist error property_id=%d: %s", prop_id, exc)
 
+    # Per-pack cost attribution: emit one usage row per submitted trace so Lead
+    # Pack hot-enrichment spend is measured (property_id + queue ref), not just
+    # estimated. log_usage zeroes cost on a miss (Tracerfy bills per hit only).
+    hit_cost = 4 if trace_type == "advanced" else settings.tracerfy_cost_cents
+    for rec in records:
+        pid = int(rec["label"])
+        log_usage(
+            db,
+            vendor="tracerfy",
+            purpose="lead_pack_hot_enrich",
+            success=bool(out.get(pid, {}).get("match_success")),
+            cost_cents=hit_cost,
+            property_id=pid,
+            target_address=rec["address"],
+            request_ref=str(queue_id),
+        )
+
     db.flush()
     hits = sum(1 for v in out.values() if v["match_success"])
     logger.info(
@@ -623,6 +675,7 @@ def run_tracerfy_fallback(
     entity_only: bool = False,
     address_only_fallback: bool = False,
     force_retrace: bool = False,
+    trace_type: Optional[str] = None,
 ) -> dict:
     """
     Run Tracerfy batch skip-trace (POST /trace/, 1 credit/hit = $0.02) for Gold+ leads.
@@ -636,6 +689,10 @@ def run_tracerfy_fallback(
     individual_only / entity_only: restrict to individual or entity owner types.
     force_retrace=True: bypass the address dedup ledger (deliberate re-verification
       only — normally an address is never submitted twice).
+    trace_type: cascade-facing alias for the submit mode — "normal" (name+address,
+      $0.02) or "advanced" (address-only, $0.04). When provided it sets
+      address_only_fallback accordingly; kept so run_cascade() can express stage
+      intent without depending on the internal boolean.
 
     Duplicate-charge guardrail: every candidate is gated by skip_trace_ledger so a
     normalized address is submitted at most once per mode (one normal, one advanced
@@ -649,6 +706,10 @@ def run_tracerfy_fallback(
     Returns stats dict.
     """
     settings     = get_settings()
+    # Cascade passes trace_type ("normal" | "advanced"); map it onto the internal
+    # address-only flag so both call styles converge on one code path.
+    if trace_type is not None:
+        address_only_fallback = trace_type == "advanced"
     # Address-only traces use advanced mode: 2 credits ($0.04) vs 1 credit for name+address.
     cost_per_hit = 4 if address_only_fallback else settings.tracerfy_cost_cents
 
