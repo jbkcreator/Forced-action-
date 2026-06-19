@@ -3203,7 +3203,10 @@ class QuoraQuestion(Base):
     answer_status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="pending", index=True
     )
+    post_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error_log: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     published_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    posted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     quora_answer_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # ── Housekeeping ──────────────────────────────────────────────────────────
@@ -3226,6 +3229,41 @@ class QuoraQuestion(Base):
 
     def __repr__(self):
         return f"<QuoraQuestion(qid={self.qid}, action={self.recommended_action}, status={self.answer_status})>"
+
+
+class QuoraTopic(Base):
+    """
+    Admin-managed pool of search keywords for the daily Quora organic-answer pipeline.
+    The orchestrator picks one available topic per run using cooldown rotation.
+    """
+    __tablename__ = "quora_topics"
+
+    id:          Mapped[int]               = mapped_column(Integer, primary_key=True, autoincrement=True)
+    keyword:     Mapped[str]               = mapped_column(Text, nullable=False, unique=True)
+    is_active:   Mapped[bool]              = mapped_column(Boolean, nullable=False, default=True)
+    last_run_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at:  Mapped[datetime]          = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    def __repr__(self):
+        return f"<QuoraTopic(id={self.id}, keyword={self.keyword!r}, active={self.is_active})>"
+
+
+class QuoraSettings(Base):
+    """
+    Single-row configuration table for the Quora pipeline (id always = 1).
+    cooldown_days: a topic that ran today cannot be picked again for this many days.
+    Invariant: cooldown_days <= active_topic_count - 1 (enforced at write time).
+    """
+    __tablename__ = "quora_settings"
+
+    id:            Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    cooldown_days: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+
+    def __repr__(self):
+        return f"<QuoraSettings(cooldown_days={self.cooldown_days})>"
 
 
 class VendorCostPause(Base):

@@ -284,8 +284,8 @@ def _save_classified_to_db(
                             :deterministic_score, :deterministic_reasons,
                             :matched_keyword, :cora_decision_id,
                             :intent_lane, :recommended_action, :priority_score,
-                            :risk_level, :cora_classification::jsonb,
-                            :answer_draft::jsonb, :answer_status,
+                            :risk_level, CAST(:cora_classification AS jsonb),
+                            CAST(:answer_draft AS jsonb), :answer_status,
                             :first_seen_at, :last_classified_at
                         )
                         ON CONFLICT (qid) DO UPDATE SET
@@ -453,6 +453,10 @@ if __name__ == "__main__":
     ap.add_argument("--generate-answer-drafts", action="store_true",
                     help="Also generate answer drafts for approved candidates")
     args = ap.parse_args()
+
+    # --generate-answer-drafts requires classification — enable it implicitly
+    if args.generate_answer_drafts:
+        args.classify_with_cora = True
 
     asyncio.run(main(
         keyword=args.keyword,
