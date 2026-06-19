@@ -229,8 +229,8 @@ COUNTY_ID=hillsborough
 # Redis Pub/Sub (transient), so any dropped while the agents listener is down/restarting
 # would never get enriched. This sweep re-runs run_cascade() over today's un-enriched
 # Gold+ leads to catch them. Tracerfy → Address-Only → BatchData → IDI → PDL.
-30 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.run_enrichment hillsborough
-31 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.run_enrichment pinellas
+# 30 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.run_enrichment hillsborough
+# 31 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.run_enrichment pinellas
 
 # ── FINANCING INTENT SCORING (Sprint S1) ─────────────────────
 # Scores properties for hard-money / bridge / renovation / refinance intent.
