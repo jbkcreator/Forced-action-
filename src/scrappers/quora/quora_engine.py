@@ -162,16 +162,23 @@ async def _scrape_query(
     page = await context.new_page()
     captured_records: list[dict] = []
 
+    captured_urls: list[str] = []
+
     async def handle_response(response):
-        if "gql_para_POST" not in response.url:
+        url = response.url
+        captured_urls.append(url)
+        if "gql_para_POST" not in url and "graphql" not in url.lower() and "/api/" not in url.lower():
             return
         try:
             body    = await response.json()
             records = _parse_gql_response(body)
-            captured_records.extend(records)
-            logger.debug(f"[quora] +{len(records)} records (total {len(captured_records)})")
+            if records:
+                captured_records.extend(records)
+                logger.debug(f"[quora] +{len(records)} records via {url} (total {len(captured_records)})")
+            elif dump_raw:
+                logger.debug(f"[quora] 0 records from {url}")
         except Exception as exc:
-            logger.debug(f"[quora] GraphQL parse error: {exc}")
+            logger.debug(f"[quora] GraphQL parse error ({url}): {exc}")
 
     page.on("response", handle_response)
 
@@ -189,8 +196,16 @@ async def _scrape_query(
                 error="Session expired — re-run quora_auth.py",
             )
 
-        await page.wait_for_timeout(2_000)
+        # Wait for initial results to render, then scroll to load more.
+        # GQL (SearchResultsListQuery) fires lazily and may be blocked by
+        # Turnstile — DOM extraction below is the fallback for that case.
+        await _wait_for_search_results(page)
         await _scroll_for_results(page, captured_records, max_results)
+
+        # If GQL yielded nothing after scrolling, give the page one more
+        # moment then hand off to DOM extraction.
+        if not captured_records:
+            await page.wait_for_timeout(2_000)
 
     except Exception as exc:
         logger.error(f"[quora] Error for {query!r}: {exc}")
@@ -200,10 +215,20 @@ async def _scrape_query(
             pass
         return QuoraSearchResponse(query=query, status="error", error=str(exc))
 
+    # DOM fallback — if GQL yielded nothing but the page rendered results,
+    # extract directly from the visible DOM. Gives title + URL (no qid/counts)
+    # which is sufficient for Cora classification.
+    if not captured_records:
+        dom_records = await _extract_from_dom(page, max_results, dump_raw=dump_raw)
+        if dom_records:
+            logger.info(f"[quora] GQL empty — using DOM fallback ({len(dom_records)} records)")
+            captured_records.extend(dom_records)
+
     await page.close()
 
     if dump_raw:
         _dump_to_disk(query, captured_records)
+        _dump_urls(query, captured_urls)
 
     raw_records_out = captured_records if dump_raw else None
     results = []
@@ -221,8 +246,148 @@ async def _scrape_query(
     )
 
 
+async def _extract_from_dom(
+    page: Page, max_results: int, dump_raw: bool = False
+) -> list[dict]:
+    """
+    Extract question titles, URLs, and stats directly from the rendered DOM.
+    Used when GQL interception yields nothing (Turnstile blocked the API call
+    but the page still rendered results visually).
+    Returns records compatible with _record_to_result().
+    """
+    try:
+        payload = await page.evaluate("""(maxResults) => {
+            const seen = new Set();
+            const results = [];
+            const cardHtmlSamples = [];
+
+            // Primary: Quora's own puppeteer test class on question titles
+            const titleEls = document.querySelectorAll('.puppeteer_test_question_title');
+            for (const el of titleEls) {
+                if (results.length >= maxResults) break;
+                const title = (el.innerText || el.textContent || '').trim();
+                if (!title) continue;
+
+                // Walk up to find the question anchor (URL)
+                let node = el;
+                let anchor = null;
+                for (let i = 0; i < 6 && node; i++) {
+                    if (node.tagName === 'A' && node.href && node.href.includes('quora.com/')) {
+                        anchor = node; break;
+                    }
+                    const a = node.querySelector && node.querySelector('a[href*="quora.com/"]');
+                    if (a) { anchor = a; break; }
+                    node = node.parentElement;
+                }
+                const url = anchor ? anchor.href : '';
+                if (!url || seen.has(url)) continue;
+                seen.add(url);
+
+                // Walk up to find the full result card (stats live in a sibling subtree).
+                // Keep climbing until a node's text contains "answer", up to 16 levels.
+                let cardRoot = el;
+                let statsText = '';
+                for (let i = 0; i < 16 && cardRoot.parentElement; i++) {
+                    cardRoot = cardRoot.parentElement;
+                    const t = cardRoot.innerText || cardRoot.textContent || '';
+                    if (/[0-9][\d,]*\s+[Aa]nswers?/.test(t)) {
+                        statsText = t;
+                        break;
+                    }
+                }
+
+                // Parse "N answer(s)" from the card stats row text
+                const answerMatch = statsText.match(/([0-9][\d,]*)\s+[Aa]nswers?/);
+                const answerCount = answerMatch
+                    ? parseInt(answerMatch[1].replace(/,/g, ''), 10) : 0;
+
+                // Follower count: the Follow button uses an animated counter where
+                // a qu-visibility--hidden span holds the stale value and its next
+                // sibling (absolutely positioned, visible) holds the live count.
+                let followerCount = 0;
+                const hiddenCountSpan = cardRoot.querySelector
+                    && cardRoot.querySelector(
+                        'button[aria-pressed] .qu-visibility--hidden');
+                if (hiddenCountSpan && hiddenCountSpan.nextElementSibling) {
+                    const n = parseInt(
+                        (hiddenCountSpan.nextElementSibling.innerText
+                         || hiddenCountSpan.nextElementSibling.textContent
+                         || '').trim(), 10);
+                    if (!isNaN(n)) { followerCount = n; }
+                }
+
+                if (cardHtmlSamples.length < 2) {
+                    cardHtmlSamples.push(cardRoot.outerHTML);
+                }
+
+                results.push({ title, url, answerCount, followerCount });
+            }
+
+            // Fallback: any quora.com link whose text looks like a question
+            if (!results.length) {
+                const anchors = document.querySelectorAll('a[href*="quora.com/"]');
+                for (const a of anchors) {
+                    if (results.length >= maxResults) break;
+                    const href = a.href;
+                    if (/(profile|topic|search|login|settings|about|blog)/.test(href)) continue;
+                    const text = (a.innerText || a.textContent || '').trim();
+                    if (text.length < 15 || seen.has(href)) continue;
+                    seen.add(href);
+                    results.push({ title: text, url: href, answerCount: 0, followerCount: 0 });
+                }
+            }
+
+            return { records: results, cardHtmlSamples };
+        }""", max_results)
+
+        if dump_raw and payload.get("cardHtmlSamples"):
+            _dump_card_html(payload["cardHtmlSamples"])
+
+        return [
+            {
+                "title": r["title"],
+                "url": r["url"],
+                "answerCount": r.get("answerCount", 0),
+                "followerCount": r.get("followerCount", 0),
+            }
+            for r in (payload.get("records") or [])
+            if r.get("title") and r.get("url")
+        ]
+    except Exception as exc:
+        logger.warning(f"[quora] DOM extraction failed: {exc}")
+        return []
+
+
 async def _is_auth_wall(page: Page) -> bool:
     return "/login" in page.url
+
+
+async def _wait_for_search_results(page: Page) -> None:
+    """
+    Wait until Quora search results are present in the DOM.
+    The search page triggers a Cloudflare Turnstile challenge that must
+    resolve before SearchResultsListQuery fires. We wait for actual result
+    elements rather than a fixed timeout so the scrape doesn't start before
+    the GQL response arrives.
+    """
+    # Quora question cards in search results all carry this test class
+    selectors = [
+        ".puppeteer_test_question_title",
+        "[class*='q-box'][class*='qu-pb']",   # outer result card pattern
+        "a[href*='/'][class*='question']",
+    ]
+    for sel in selectors:
+        try:
+            await page.wait_for_selector(sel, state="visible", timeout=15_000)
+            logger.debug(f"[quora] search results visible via selector: {sel}")
+            return
+        except Exception:
+            continue
+
+    # None of the selectors matched — page may still be loading or blocked.
+    # Fall back to a generous fixed wait so the GQL listener has time to fire.
+    logger.warning("[quora] result selectors not found — waiting 10s as fallback")
+    await page.wait_for_timeout(10_000)
 
 
 async def _scroll_for_results(page: Page, records: list, max_results: int) -> None:
@@ -564,6 +729,25 @@ def _result_to_dump_dict(r: QuoraResult) -> dict:
         "cora_classification":          r.cora_classification,
         "cora_answer_draft":            r.cora_answer_draft,
     }
+
+
+def _dump_urls(query: str, urls: list[str]) -> None:
+    _DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    ts   = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+    slug = query[:40].replace(" ", "_").replace("/", "-")
+    path = _DEBUG_DIR / f"response_urls_{slug}_{ts}.txt"
+    path.write_text("\n".join(urls))
+    logger.info(f"[quora] url dump → {path} ({len(urls)} responses captured)")
+
+
+def _dump_card_html(samples: list[str]) -> None:
+    """Save raw card HTML from DOM extraction for selector inspection."""
+    _DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+    path = _DEBUG_DIR / f"dom_card_sample_{ts}.html"
+    separator = "\n\n<!-- ===== CARD BREAK ===== -->\n\n"
+    path.write_text(separator.join(samples), encoding="utf-8")
+    logger.info(f"[quora] card HTML dump → {path} ({len(samples)} cards)")
 
 
 def _dump_to_disk(query: str, raw_records: list[dict]) -> None:

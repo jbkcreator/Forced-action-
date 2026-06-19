@@ -22,7 +22,7 @@ from typing import Optional, Literal
 
 import pandas as pd
 import stripe
-from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, Field, model_validator
@@ -2872,3 +2872,427 @@ def get_revenue_leak(
         }
         for r in rows
     ]
+
+
+# ── Quora answer review queue ─────────────────────────────────────────────────
+
+@router.get("/quora/queue", dependencies=[Depends(get_current_admin)])
+def get_quora_queue(
+    page:      int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    db = Depends(get_db),
+) -> dict:
+    """
+    Paginated list of drafted Quora answers awaiting admin review.
+    Ordered by priority_score DESC so highest-value questions surface first.
+    """
+    offset = (page - 1) * page_size
+    try:
+        rows = db.execute(
+            text("""
+                SELECT id, qid, title, url, intent_lane, priority_score,
+                       risk_level, answer_draft, post_attempts, error_log,
+                       last_classified_at
+                FROM quora_questions
+                WHERE answer_status = 'drafted'
+                ORDER BY priority_score DESC NULLS LAST
+                LIMIT :limit OFFSET :offset
+            """),
+            {"limit": page_size, "offset": offset},
+        ).fetchall()
+
+        total = db.execute(
+            text("SELECT COUNT(*) FROM quora_questions WHERE answer_status = 'drafted'")
+        ).scalar()
+    except Exception as exc:
+        logger.error("[quora-queue] query failed: %s", exc)
+        raise HTTPException(status_code=503, detail="Database error")
+
+    return {
+        "items": [
+            {
+                "id":                 r.id,
+                "qid":                r.qid,
+                "title":              r.title,
+                "url":                r.url,
+                "intent_lane":        r.intent_lane,
+                "priority_score":     r.priority_score,
+                "risk_level":         r.risk_level,
+                "answer_draft":       r.answer_draft or {},
+                "post_attempts":      r.post_attempts,
+                "error_log":          r.error_log,
+                "last_classified_at": r.last_classified_at.isoformat() if r.last_classified_at else None,
+            }
+            for r in rows
+        ],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
+
+
+@router.get("/quora/posted", dependencies=[Depends(get_current_admin)])
+def get_quora_posted(
+    page:      int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=100),
+    db = Depends(get_db),
+) -> dict:
+    """Paginated list of successfully posted Quora answers, newest first."""
+    offset = (page - 1) * page_size
+    try:
+        rows = db.execute(
+            text("""
+                SELECT id, qid, title, url, intent_lane, priority_score,
+                       matched_keyword, quora_answer_id, published_at
+                FROM quora_questions
+                WHERE answer_status = 'published'
+                ORDER BY published_at DESC NULLS LAST
+                LIMIT :limit OFFSET :offset
+            """),
+            {"limit": page_size, "offset": offset},
+        ).fetchall()
+        total = db.execute(
+            text("SELECT COUNT(*) FROM quora_questions WHERE answer_status = 'published'")
+        ).scalar() or 0
+    except Exception as exc:
+        logger.error("[quora-posted] query failed: %s", exc)
+        raise HTTPException(status_code=503, detail="Database error")
+
+    return {
+        "items": [
+            {
+                "id":               r.id,
+                "qid":              r.qid,
+                "title":            r.title,
+                "url":              r.url,
+                "intent_lane":      r.intent_lane,
+                "priority_score":   r.priority_score,
+                "matched_keyword":  r.matched_keyword,
+                "quora_answer_id":  r.quora_answer_id,
+                "published_at":     r.published_at.isoformat() if r.published_at else None,
+            }
+            for r in rows
+        ],
+        "total": total,
+    }
+
+
+@router.patch("/quora/{question_id}/draft", dependencies=[Depends(get_current_admin)])
+def update_quora_draft(
+    question_id: int,
+    body: dict,
+    db = Depends(get_db),
+) -> dict:
+    """
+    Update the answer_markdown inside answer_draft before posting.
+    Only edits the markdown field — preserves utm_links, safety_notes, etc.
+    """
+    new_markdown = body.get("answer_markdown", "").strip()
+    if not new_markdown:
+        raise HTTPException(status_code=400, detail="answer_markdown is required")
+
+    try:
+        result = db.execute(
+            text("""
+                UPDATE quora_questions
+                SET answer_draft = jsonb_set(
+                    COALESCE(answer_draft, '{}'::jsonb),
+                    '{answer_markdown}',
+                    to_jsonb(:markdown::text)
+                )
+                WHERE id = :id AND answer_status = 'drafted'
+                RETURNING id
+            """),
+            {"id": question_id, "markdown": new_markdown},
+        ).fetchone()
+    except Exception as exc:
+        logger.error("[quora-draft] update failed id=%s: %s", question_id, exc)
+        raise HTTPException(status_code=503, detail="Database error")
+
+    if not result:
+        raise HTTPException(status_code=404, detail="Question not found or not in drafted status")
+
+    return {"ok": True, "id": question_id}
+
+
+@router.post("/quora/{question_id}/post", dependencies=[Depends(get_current_admin)])
+async def post_quora_answer(
+    question_id: int,
+    db = Depends(get_db),
+) -> dict:
+    """
+    Trigger Playwright to post the drafted answer to Quora.
+    Runs synchronously — caller waits for confirmation.
+    On success: answer_status → published.
+    On failure: increments post_attempts, records error_log.
+    After 3 failures: answer_status → failed.
+    """
+    from datetime import datetime, timezone as _tz
+    from src.scrappers.quora.quora_poster import post_answer_to_quora, _MAX_POST_ATTEMPTS
+
+    try:
+        row = db.execute(
+            text("""
+                SELECT id, qid, url, answer_draft, post_attempts, matched_keyword
+                FROM quora_questions
+                WHERE id = :id AND answer_status IN ('drafted', 'failed')
+            """),
+            {"id": question_id},
+        ).fetchone()
+    except Exception as exc:
+        logger.error("[quora-post] DB read failed id=%s: %s", question_id, exc)
+        raise HTTPException(status_code=503, detail="Database error")
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Question not found or not in a postable status")
+
+    if row.post_attempts >= _MAX_POST_ATTEMPTS:
+        raise HTTPException(status_code=409, detail="Maximum post attempts reached")
+
+    answer_markdown = (row.answer_draft or {}).get("answer_markdown", "")
+    if not answer_markdown:
+        raise HTTPException(status_code=422, detail="No answer_markdown in draft — edit the draft first")
+
+    # Deterministically append a non-promotional resource footer.
+    # The AI-generated answer contains no platform mention; the footer is
+    # appended here so every post has exactly one consistent resource link.
+    utm_slug = (row.matched_keyword or "quora_organic").lower().replace(" ", "_")
+    qid_str  = str(row.qid) if row.qid else str(question_id)
+    footer = (
+        f"\n\nFor more information on distressed property resources in Florida, "
+        f"visit [Forced Action](https://forcedaction.com/?utm_source=quora"
+        f"&utm_medium=organic_answer&utm_campaign={utm_slug}&utm_content=qid_{qid_str})."
+    )
+    answer_markdown = answer_markdown.rstrip() + footer
+
+    try:
+        import asyncio
+        loop = asyncio.get_event_loop()
+        answer_id = await loop.run_in_executor(
+            None,
+            lambda: post_answer_to_quora(
+                qid=row.qid,
+                question_url=row.url,
+                answer_markdown=answer_markdown,
+            ),
+        )
+        now = datetime.now(tz=_tz.utc)
+        db.execute(
+            text("""
+                UPDATE quora_questions
+                SET answer_status   = 'published',
+                    quora_answer_id = :answer_id,
+                    posted_at       = :now,
+                    error_log       = NULL
+                WHERE id = :id
+            """),
+            {"answer_id": answer_id, "now": now, "id": question_id},
+        )
+        logger.info("[quora-post] published  id=%s  qid=%s  answer_id=%s",
+                    question_id, row.qid, answer_id)
+        return {"ok": True, "id": question_id, "quora_answer_id": answer_id}
+
+    except Exception as exc:
+        error_msg = str(exc)[:1000]
+        new_attempts = row.post_attempts + 1
+        new_status = "failed" if new_attempts >= _MAX_POST_ATTEMPTS else "drafted"
+        try:
+            db.execute(
+                text("""
+                    UPDATE quora_questions
+                    SET post_attempts = :attempts,
+                        error_log     = :error,
+                        answer_status = :status
+                    WHERE id = :id
+                """),
+                {"attempts": new_attempts, "error": error_msg,
+                 "status": new_status, "id": question_id},
+            )
+            db.commit()  # persist failure state before the exception bubbles up
+        except Exception as db_exc:
+            logger.error("[quora-post] failed to record error id=%s: %s", question_id, db_exc)
+
+        logger.error("[quora-post] post failed  id=%s  attempt=%d  error=%s",
+                     question_id, new_attempts, error_msg)
+        raise HTTPException(status_code=502, detail="Quora post failed — see error_log for details")
+
+
+# ── Quora topic management ────────────────────────────────────────────────────
+
+def _clamp_cooldown(db) -> None:
+    """After a topic is deactivated, reduce cooldown_days to stay within the valid range."""
+    try:
+        active_count = db.execute(text(
+            "SELECT COUNT(*) FROM quora_topics WHERE is_active = true"
+        )).scalar() or 0
+        max_cd = max(0, active_count - 1)
+        db.execute(text(
+            "UPDATE quora_settings SET cooldown_days = LEAST(cooldown_days, :max) WHERE id = 1"
+        ), {"max": max_cd})
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
+@router.get("/quora/topics", dependencies=[Depends(get_current_admin)])
+def get_quora_topics(db=Depends(get_db)) -> dict:
+    """List all topics (active + inactive) plus current cooldown settings."""
+    try:
+        rows = db.execute(text("""
+            SELECT id, keyword, is_active, last_run_at, created_at
+            FROM quora_topics
+            ORDER BY created_at ASC
+        """)).fetchall()
+        settings_row = db.execute(text(
+            "SELECT cooldown_days FROM quora_settings WHERE id = 1"
+        )).fetchone()
+    except Exception as exc:
+        logger.error("[quora-topics] query failed: %s", exc)
+        raise HTTPException(status_code=503, detail="Database error")
+
+    cooldown_days = settings_row.cooldown_days if settings_row else 1
+    active_count  = sum(1 for r in rows if r.is_active)
+    max_cooldown  = max(0, active_count - 1)
+
+    return {
+        "items": [
+            {
+                "id":          r.id,
+                "keyword":     r.keyword,
+                "is_active":   r.is_active,
+                "last_run_at": r.last_run_at.isoformat() if r.last_run_at else None,
+                "created_at":  r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ],
+        "cooldown_days": cooldown_days,
+        "active_count":  active_count,
+        "max_cooldown":  max_cooldown,
+    }
+
+
+class _TopicCreate(BaseModel):
+    keyword: str = Field(..., min_length=1, max_length=200)
+
+
+@router.post("/quora/topics", dependencies=[Depends(get_current_admin)])
+def create_quora_topic(body: _TopicCreate, db=Depends(get_db)) -> dict:
+    """Add a keyword to the topic pool. Re-activates it if it was previously deactivated."""
+    keyword = body.keyword.strip()
+    if not keyword:
+        raise HTTPException(status_code=400, detail="keyword must not be blank")
+    try:
+        row = db.execute(text("""
+            INSERT INTO quora_topics (keyword)
+            VALUES (:keyword)
+            ON CONFLICT (keyword) DO UPDATE SET is_active = true
+            RETURNING id, keyword, is_active, last_run_at, created_at
+        """), {"keyword": keyword}).fetchone()
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.error("[quora-topics] insert failed: %s", exc)
+        raise HTTPException(status_code=503, detail="Database error")
+
+    return {
+        "id":          row.id,
+        "keyword":     row.keyword,
+        "is_active":   row.is_active,
+        "last_run_at": row.last_run_at.isoformat() if row.last_run_at else None,
+        "created_at":  row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+@router.delete("/quora/topics/{topic_id}", dependencies=[Depends(get_current_admin)])
+def delete_quora_topic(topic_id: int, db=Depends(get_db)) -> dict:
+    """Soft-deactivate a topic (run history is preserved)."""
+    try:
+        result = db.execute(text(
+            "UPDATE quora_topics SET is_active = false WHERE id = :id"
+        ), {"id": topic_id})
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.error("[quora-topics] deactivate failed: %s", exc)
+        raise HTTPException(status_code=503, detail="Database error")
+
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Topic not found")
+
+    _clamp_cooldown(db)
+    return {"ok": True}
+
+
+class _SettingsUpdate(BaseModel):
+    cooldown_days: int = Field(..., ge=0)
+
+
+@router.put("/quora/settings", dependencies=[Depends(get_current_admin)])
+def update_quora_settings(body: _SettingsUpdate, db=Depends(get_db)) -> dict:
+    """
+    Update cooldown_days. Rejected if it would make a daily run impossible.
+    Rule: cooldown_days must be <= active_topic_count - 1.
+    """
+    active_count = db.execute(text(
+        "SELECT COUNT(*) FROM quora_topics WHERE is_active = true"
+    )).scalar() or 0
+    max_cooldown = max(0, active_count - 1)
+
+    if body.cooldown_days > max_cooldown:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"cooldown_days cannot exceed {max_cooldown} "
+                f"with {active_count} active topic(s). "
+                f"Add more topics or lower the cooldown."
+            ),
+        )
+
+    try:
+        db.execute(text("""
+            INSERT INTO quora_settings (id, cooldown_days) VALUES (1, :days)
+            ON CONFLICT (id) DO UPDATE SET cooldown_days = :days
+        """), {"days": body.cooldown_days})
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.error("[quora-settings] update failed: %s", exc)
+        raise HTTPException(status_code=503, detail="Database error")
+
+    return {"ok": True, "cooldown_days": body.cooldown_days, "max_cooldown": max_cooldown}
+
+
+# ---------------------------------------------------------------------------
+# Quora remote auth — WebSocket browser stream
+# ---------------------------------------------------------------------------
+
+@router.websocket("/quora/auth/ws")
+async def quora_auth_ws(websocket: WebSocket, token: str = Query(...)):
+    """
+    Remote Quora authentication via a streamed headless browser.
+
+    The client sends the admin JWT as a query parameter (WebSocket cannot send
+    Authorization headers). On connect: launches Playwright, navigates to
+    quora.com/login, streams JPEG frames at ~1fps, and forwards click/keyboard
+    actions. Session is captured automatically when login is detected.
+    """
+    try:
+        verify_token(token)
+    except HTTPException:
+        await websocket.close(code=1008)   # Policy violation — bad token
+        return
+
+    await websocket.accept()
+    try:
+        from src.scrappers.quora.quora_auth_ws import run_auth_session
+        await run_auth_session(websocket)
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        logger.error("[quora-auth-ws] unhandled error: %s", exc)
+        try:
+            await websocket.send_text(
+                '{"type":"error","msg":"Internal server error — check server logs."}'
+            )
+        except Exception:
+            pass

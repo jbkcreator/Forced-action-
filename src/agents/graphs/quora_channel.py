@@ -27,6 +27,46 @@ logger = logging.getLogger(__name__)
 GRAPH_NAME = "quora_channel"
 _MIN_PRIORITY_FOR_ANSWER = 70
 
+# ---------------------------------------------------------------------------
+# Tool definitions — force structured output, no JSON parsing needed
+# ---------------------------------------------------------------------------
+
+_CLASSIFY_TOOL = {
+    "name": "submit_classification",
+    "description": "Submit the classification result for a Quora question.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "recommended_action": {
+                "type": "string",
+                "enum": ["generate_answer", "skip"],
+            },
+            "intent_lane": {"type": "string"},
+            "priority_score": {"type": "integer"},
+            "risk_level": {"type": "string", "enum": ["low", "medium", "high"]},
+            "is_relevant": {"type": "boolean"},
+            "is_answerable": {"type": "boolean"},
+            "reasoning": {"type": "string"},
+        },
+        "required": ["recommended_action", "intent_lane", "priority_score",
+                     "risk_level", "is_relevant", "is_answerable"],
+    },
+}
+
+_ANSWER_TOOL = {
+    "name": "submit_answer_draft",
+    "description": "Submit the drafted answer for the Quora question.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "qid":             {"type": "integer"},
+            "answer_status":   {"type": "string", "enum": ["draft_generated"]},
+            "answer_markdown": {"type": "string"},
+        },
+        "required": ["qid", "answer_status", "answer_markdown"],
+    },
+}
+
 
 class QuoraChannelState(TypedDict, total=False):
     # ── Inputs ───────────────────────────────────────────────────────────────
@@ -73,9 +113,10 @@ def _node_classify_question(state: QuoraChannelState) -> Dict[str, Any]:
             system=system,
             max_tokens=512,
             graph_name=GRAPH_NAME,
+            tools=[_CLASSIFY_TOOL],
         )
 
-        classification = _extract_json(result.get("text", ""))
+        classification = result.get("tool_input")
         return {
             "cora_classification": classification,
             "tokens_used": (result.get("input_tokens", 0) or 0) + (result.get("output_tokens", 0) or 0),
@@ -136,11 +177,12 @@ def _node_generate_answer(state: QuoraChannelState) -> Dict[str, Any]:
             task_type="quora_answer",
             messages=[{"role": "user", "content": user}],
             system=system,
-            max_tokens=1024,
+            max_tokens=2048,
             graph_name=GRAPH_NAME,
+            tools=[_ANSWER_TOOL],
         )
 
-        answer_draft = _extract_json(result.get("text", ""))
+        answer_draft = result.get("tool_input")
         prior_tokens = int(state.get("tokens_used", 0) or 0)
         prior_cost   = float(state.get("cost_usd", 0.0) or 0.0)
 
@@ -287,29 +329,3 @@ def run_quora_channel_from_event(
     return result
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _extract_json(text: str) -> Optional[dict]:
-    """Extract a JSON object from Claude's response text."""
-    if not text:
-        return None
-    text = text.strip()
-
-    # Try direct parse first
-    try:
-        return json.loads(text)
-    except (json.JSONDecodeError, ValueError):
-        pass
-
-    # Find first {...} block
-    match = re.search(r"\{[\s\S]*\}", text)
-    if match:
-        try:
-            return json.loads(match.group())
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-    logger.warning("[quora_channel] Could not extract JSON from response: %s", text[:200])
-    return None

@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from anthropic import Anthropic
-from anthropic.types import TextBlock
+from anthropic.types import TextBlock, ToolUseBlock
 from sqlalchemy.orm import Session
 
 from config.settings import settings
@@ -160,15 +160,22 @@ def call_claude_with_usage(
     pause_target: Optional[str] = None,
     db: Optional[Session] = None,
     force_tier: Optional[str] = None,
+    tools: Optional[list[dict]] = None,
+    tool_choice: Optional[dict] = None,
 ) -> dict:
     """
     Same as call_claude() but returns a dict that includes token counts and
     cost alongside the text. Used by Cora graphs that need to track
     per-decision budget consumption.
 
+    Pass `tools` + `tool_choice` to use Anthropic tool use for structured output.
+    When a tool_use block is returned, result['tool_input'] contains the parsed
+    dict and result['text'] is empty.
+
     Returns:
         {
             'text':         str,
+            'tool_input':   dict | None,
             'model':        'haiku' | 'sonnet' | 'opus',
             'input_tokens': int,
             'output_tokens': int,
@@ -198,6 +205,12 @@ def call_claude_with_usage(
         else:
             kwargs["system"] = system
 
+    if tools:
+        kwargs["tools"] = tools
+        kwargs["tool_choice"] = tool_choice or (
+            {"type": "tool", "name": tools[0]["name"]} if len(tools) == 1 else {"type": "auto"}
+        )
+
     # ── Vendor cost pause check (Phase 2) ────────────────────────────────
     resolved_target = pause_target or resolve_pause_target(graph_name=graph_name, task_type=task_type)
     active_pause = get_active_pause(db, "claude", resolved_target) if db and resolved_target else None
@@ -209,6 +222,7 @@ def call_claude_with_usage(
                    blocked_by_pause=True, block_reason=f"pause: {active_pause.reason}")
         return {
             "text": f"[BLOCKED] Vendor cost pause active for '{resolved_target}': {active_pause.reason}",
+            "tool_input": None,
             "model": model_tier,
             "input_tokens": 0,
             "output_tokens": 0,
@@ -218,6 +232,7 @@ def call_claude_with_usage(
     response = client.messages.create(**kwargs)
 
     text = _extract_text(response)
+    tool_input = _extract_tool_input(response)
     _log_usage(response, model_tier, task_type, subscriber_id, db,
                graph_name=graph_name, pause_target=resolved_target)
 
@@ -229,6 +244,7 @@ def call_claude_with_usage(
 
     return {
         "text": text,
+        "tool_input": tool_input,
         "model": model_tier,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
@@ -362,6 +378,13 @@ def _extract_text(response) -> str:
         if isinstance(block, TextBlock):
             return block.text
     return ""
+
+
+def _extract_tool_input(response) -> Optional[dict]:
+    for block in response.content:
+        if isinstance(block, ToolUseBlock):
+            return block.input
+    return None
 
 
 def _log_usage(
