@@ -60,6 +60,7 @@ HEARTBEAT_SLAS: Dict[str, int] = {
     "permits":           1500,
     "roofing_permits":   1500,
     "violations":        1500,
+    "violations_pinellas": 1500,
     "probate":           1500,
     "evictions":         1500,
     "divorce_filings":   1500,
@@ -87,6 +88,7 @@ HEARTBEAT_SLAS: Dict[str, int] = {
 # Keep this in sync with scripts/cron/crontab.txt.
 SOURCE_OFF_DAYS: Dict[str, set] = {
     "violations":       {6},
+    "violations_pinellas": {6},
     "permits":          {6},
     "roofing_permits":  {6},
     "probate":          {6},
