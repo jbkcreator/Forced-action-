@@ -1308,7 +1308,7 @@ def _on_subscription_updated(subscription: dict, db: Session) -> None:
     cancel_at_period_end = subscription.get("cancel_at_period_end", False)
     status_map = {
         "active":   "active",
-        "past_due": "active",   # still active, payment catching up
+        "past_due": "past_due",
         "canceled": "cancelled",
         "unpaid":   "churned",
     }

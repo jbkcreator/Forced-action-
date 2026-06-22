@@ -4861,6 +4861,7 @@ def list_human_close(
                 "closer_assigned": r.closer_assigned,
                 "posted_at": r.posted_at.isoformat() if r.posted_at else None,
                 "post_attempts": r.post_attempts,
+                "context_json": r.context_json,
             }
             for r in rows
         ],
