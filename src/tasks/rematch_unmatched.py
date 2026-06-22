@@ -454,6 +454,48 @@ def _promote_to_destination(
     return False
 
 
+# Static instruction prefix for the LLM tiebreaker. Identical on every batch
+# call, so it is sent as a cache_control system block (see _process_batch) and
+# served from the prompt cache after the first call. Keep this BYTE-STABLE —
+# any change invalidates the cache and re-bills the full prefix.
+_LLM_SYSTEM_PROMPT = """You are a property record matching expert for Florida county records.
+
+IMPORTANT: You are seeing at most 3 candidates per record. The database may contain other equally plausible matches not shown. Assume ambiguity unless the evidence clearly rules out alternatives.
+
+A false confirmation corrupts the property database. A false rejection only delays a match for manual review. When uncertain, always reject.
+
+Process each RECORD in the user message INDEPENDENTLY. Each record's candidates belong ONLY to that record — do not let one record's data influence another's decision.
+
+FOR EACH RECORD, ALL of the following must be true to confirm a match:
+1. The name in MATCH_FIELD is essentially the same person or entity as the owner_name on the property (same person/entity, accounting only for punctuation, word order, and well-known abbreviations like TRE/TRUST/INC/LLC).
+2. The property is in the correct jurisdiction for the record type.
+3. No other shown candidate is equally or more plausible.
+4. No corroborating field (address number, city, zip) directly contradicts the match.
+
+If ANY of the above conditions is not clearly met, set matched=false.
+
+Respond with ONLY a valid JSON array — one element per record, in the same order as the RECORDs in the user message:
+[
+  {
+    "record_id": <integer — must match the RECORD id in the user message>,
+    "matched": true or false,
+    "property_id": <integer property_id if matched, null if not>,
+    "confidence": "high" or "medium" or "low",
+    "reason": "<one sentence>"
+  },
+  ...
+]
+
+Rules:
+- "high": ALL four conditions above are clearly met. Name is essentially identical (not just similar). No contradicting evidence. Use this only when you are certain.
+- "medium": name is plausible but has spelling/abbreviation/truncation ambiguity, jurisdiction is correct, and no other candidate is equally plausible. NOT high because of name uncertainty only.
+- "low": any condition above is not clearly met — set matched=false.
+- NOT "high" if: only the surname matches with no other corroborating detail; address numbers differ; business name only partially overlaps; name is a common surname (e.g. SMITH, JONES, MILLER, JOHNSON) without additional corroboration.
+- CRITICAL: If multiple candidates are equally plausible, you MUST set matched=false and confidence=low. This is never "medium".
+- If matched=false: property_id must be null.
+- Output ONLY the JSON array. No text outside it."""
+
+
 def _build_batch_prompt(batch: list[dict]) -> str:
     """
     Build a single LLM prompt for up to 10 pending_review records.
@@ -517,46 +559,10 @@ def _build_batch_prompt(batch: list[dict]) -> str:
             f"CANDIDATE_PROPERTIES:\n{json.dumps(candidates, indent=2, default=str)}"
         )
 
-    records_block = "\n\n".join(sections)
-
-    return f"""You are a property record matching expert for Florida county records.
-
-IMPORTANT: You are seeing at most 3 candidates per record. The database may contain other equally plausible matches not shown. Assume ambiguity unless the evidence clearly rules out alternatives.
-
-A false confirmation corrupts the property database. A false rejection only delays a match for manual review. When uncertain, always reject.
-
-Process each RECORD below INDEPENDENTLY. Each record's candidates belong ONLY to that record — do not let one record's data influence another's decision.
-
-{records_block}
-
-FOR EACH RECORD, ALL of the following must be true to confirm a match:
-1. The name in MATCH_FIELD is essentially the same person or entity as the owner_name on the property (same person/entity, accounting only for punctuation, word order, and well-known abbreviations like TRE/TRUST/INC/LLC).
-2. The property is in the correct jurisdiction for the record type.
-3. No other shown candidate is equally or more plausible.
-4. No corroborating field (address number, city, zip) directly contradicts the match.
-
-If ANY of the above conditions is not clearly met, set matched=false.
-
-Respond with ONLY a valid JSON array — one element per record, in the same order:
-[
-  {{
-    "record_id": <integer — must match the RECORD id above>,
-    "matched": true or false,
-    "property_id": <integer property_id if matched, null if not>,
-    "confidence": "high" or "medium" or "low",
-    "reason": "<one sentence>"
-  }},
-  ...
-]
-
-Rules:
-- "high": ALL four conditions above are clearly met. Name is essentially identical (not just similar). No contradicting evidence. Use this only when you are certain.
-- "medium": name is plausible but has spelling/abbreviation/truncation ambiguity, jurisdiction is correct, and no other candidate is equally plausible. NOT high because of name uncertainty only.
-- "low": any condition above is not clearly met — set matched=false.
-- NOT "high" if: only the surname matches with no other corroborating detail; address numbers differ; business name only partially overlaps; name is a common surname (e.g. SMITH, JONES, MILLER, JOHNSON) without additional corroboration.
-- CRITICAL: If multiple candidates are equally plausible, you MUST set matched=false and confidence=low. This is never "medium".
-- If matched=false: property_id must be null.
-- Output ONLY the JSON array. No text outside it."""
+    # Only the per-call (dynamic) records go in the user message. All static
+    # instructions live in _LLM_SYSTEM_PROMPT (cached system block) so the
+    # prompt-cache prefix is reused across every batch call. See _process_batch.
+    return "\n\n".join(sections)
 
 
 def llm_tiebreak_pending_review(
@@ -744,10 +750,11 @@ def llm_tiebreak_pending_review(
                     model=model,
                     max_tokens=1024,
                     temperature=0,
-                    system=(
-                        "You are a property record matching expert. "
-                        "Respond ONLY with a valid JSON array. No text outside it."
-                    ),
+                    system=[{
+                        "type": "text",
+                        "text": _LLM_SYSTEM_PROMPT,
+                        "cache_control": {"type": "ephemeral"},
+                    }],
                     messages=[{"role": "user", "content": prompt}],
                 )
                 raw_text = response.content[0].text.strip()
@@ -849,6 +856,268 @@ def llm_tiebreak_pending_review(
     return stats
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# COST-REDUCED PATH — deterministic pre-filter + Message Batches API (50% off)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Tokens stripped before comparing names: legal-form suffixes and connectors
+# that carry no identity signal.
+_NAME_STOP = {
+    "LLC", "INC", "CORP", "CO", "COMPANY", "LP", "LLP", "PA", "PLLC", "PL",
+    "LTD", "TRUST", "TR", "TRE", "TTEE", "TRUSTEE", "TRUSTEES", "EST", "ESTATE",
+    "ASSOCIATION", "ASSN", "ASSOC", "HOA", "CONDOMINIUM", "CONDO", "FOUNDATION",
+    "FUND", "ET", "AL", "ETAL", "THE", "OF", "AT", "AND", "CORPORATION",
+}
+_NAME_ABBREV = {
+    "ASSN": "ASSOCIATION", "ASSOC": "ASSOCIATION", "CONDO": "CONDOMINIUM",
+    "TR": "TRUST", "TRE": "TRUST", "TTEE": "TRUSTEE", "CORP": "CORPORATION",
+}
+
+
+def _norm_tokens(name: Optional[str]) -> frozenset:
+    """Name → frozenset of significant tokens (upper, de-punctuated, abbrevs
+    expanded, legal-form/connector stopwords dropped). Order-independent."""
+    if not name:
+        return frozenset()
+    s = re.sub(r"[^A-Z0-9 ]", " ", str(name).upper())
+    toks = []
+    for t in s.split():
+        t = _NAME_ABBREV.get(t, t)
+        if t and t not in _NAME_STOP and not t.isdigit():
+            toks.append(t)
+    return frozenset(toks)
+
+
+def _owner_name(prop) -> Optional[str]:
+    try:
+        return prop.owner.owner_name if prop and prop.owner else None
+    except Exception:
+        return None
+
+
+def _record_name_fields(rec) -> list:
+    raw = rec.raw_data or {}
+    first = str(raw.get("FirstName") or "").strip()
+    last = str(raw.get("LastName/CompanyName") or "").strip()
+    out = [
+        rec.grantor, raw.get("Grantor"), raw.get("Grantee"),
+        raw.get("Lead Name"), raw.get("lead_name"),
+        (first + " " + last).strip(),
+    ]
+    return [str(x) for x in out if x]
+
+
+def _prefilter_verdict(rec, candidate, alts) -> str:
+    """Deterministic decision before any LLM call. Conservative — only the
+    clearest cases auto-decide; everything else returns 'llm'.
+
+    'confirm' — a record name normalizes EXACTLY to the candidate owner name,
+                has >=2 significant tokens, and no alternative candidate shares
+                that normalized name (unique). Safe auto-match.
+    'reject'  — candidate AND every alternative share ZERO significant tokens
+                with every record name. Spurious — demote to unmatched.
+    'llm'     — anything in between (the genuinely ambiguous middle).
+    """
+    cand_norm = _norm_tokens(_owner_name(candidate))
+    rec_sets = [s for s in (_norm_tokens(n) for n in _record_name_fields(rec)) if s]
+    if not cand_norm or not rec_sets:
+        return "llm"
+    alt_norms = [_norm_tokens(_owner_name(a)) for a in (alts or [])]
+
+    # AUTO-CONFIRM — exact normalized match, >=2 tokens, unique vs alternatives
+    for rs in rec_sets:
+        if len(rs) >= 2 and rs == cand_norm and not any(an == cand_norm for an in alt_norms):
+            return "confirm"
+
+    # AUTO-REJECT — no shared significant token with best candidate OR any alt
+    overlaps = any(rs & cand_norm for rs in rec_sets) or \
+        any(rs & an for rs in rec_sets for an in alt_norms if an)
+    if not overlaps:
+        return "reject"
+
+    return "llm"
+
+
+def _apply_confirm(session, rec, property_id, county_id, dry_run):
+    if dry_run:
+        return
+    _promote_to_destination(session, rec, property_id, county_id)
+    rec.match_status = "matched"
+    rec.matched_property_id = property_id
+    rec.candidate_property_id = None
+    rec.match_attempted_at = datetime.now(timezone.utc)
+
+
+def _apply_reject(session, rec, dry_run):
+    if dry_run:
+        return
+    rec.match_status = "unmatched"
+    rec.candidate_property_id = None
+    rec.match_attempted_at = datetime.now(timezone.utc)
+
+
+def prefilter_and_batch_tiebreak(
+    source_type: Optional[str] = None,
+    limit: int = 5000,
+    county_id: str = "hillsborough",
+    dry_run: bool = False,
+    batch_size: int = 5,
+    model: str = "claude-sonnet-4-6",
+    poll_seconds: int = 30,
+) -> dict:
+    """Cost-reduced pending_review tiebreaker:
+      1. Deterministic pre-filter resolves the clear-cut cases at $0.
+      2. The ambiguous remainder goes to the Message Batches API (50% off).
+    Same promotion/demotion semantics as llm_tiebreak_pending_review.
+    """
+    import time as _time
+    import anthropic as _ant
+    from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
+    from anthropic.types.messages.batch_create_params import Request
+    from config.settings import get_settings
+
+    stats = {
+        "total": 0, "prefilter_confirmed": 0, "prefilter_rejected": 0,
+        "llm_sent": 0, "llm_confirmed": 0, "llm_rejected": 0,
+        "errors": 0, "dry_run": dry_run,
+    }
+
+    settings = get_settings()
+    client = _ant.Anthropic(api_key=settings.anthropic_api_key.get_secret_value())
+
+    with get_db_context() as session:
+        query = session.query(UnmatchedRecord).filter(
+            UnmatchedRecord.match_status == "pending_review",
+            UnmatchedRecord.candidate_property_id.isnot(None),
+            UnmatchedRecord.county_id == county_id,
+        )
+        if source_type:
+            query = query.filter(UnmatchedRecord.source_type == source_type)
+        records = query.order_by(UnmatchedRecord.match_confidence.desc()).limit(limit).all()
+        stats["total"] = len(records)
+        loader = LienLoader(session, county_id=county_id)
+
+        # ── Pass 1: deterministic pre-filter ──────────────────────────────
+        llm_items: list[dict] = []
+        for rec in records:
+            candidate = session.get(Property, rec.candidate_property_id)
+            if not candidate:
+                _apply_reject(session, rec, dry_run)
+                stats["prefilter_rejected"] += 1
+                continue
+            name_for_trgm = (
+                rec.grantor or (rec.raw_data or {}).get("Grantor")
+                or (rec.raw_data or {}).get("LastName/CompanyName")
+                or (rec.raw_data or {}).get("Lead Name") or ""
+            )
+            alts = loader._get_top_owner_candidates_base(str(name_for_trgm), limit=2)
+            verdict = _prefilter_verdict(rec, candidate, alts)
+            if verdict == "confirm":
+                _apply_confirm(session, rec, candidate.id, county_id, dry_run)
+                stats["prefilter_confirmed"] += 1
+            elif verdict == "reject":
+                _apply_reject(session, rec, dry_run)
+                stats["prefilter_rejected"] += 1
+            else:
+                src = rec.source_type or "liens"
+                llm_items.append({
+                    "record_id": rec.id,
+                    "raw_data": rec.raw_data or {},
+                    "candidate_property": candidate,
+                    "trgm_alternatives": alts,
+                    "match_score": int((rec.match_confidence or 0.85) * 100),
+                    "record_type": SOURCE_TYPE_TO_RECORD_TYPE.get(src, "lien_ml"),
+                    "match_field": (
+                        "PartyAddress" if rec.match_method == "address"
+                        else SOURCE_TYPE_TO_MATCH_FIELD.get(src, "Grantor")
+                    ),
+                    "_record": rec,
+                })
+        if not dry_run:
+            session.commit()
+        stats["llm_sent"] = len(llm_items)
+        logger.info(
+            "[prefilter] total=%d confirmed=%d rejected=%d -> LLM=%d",
+            stats["total"], stats["prefilter_confirmed"],
+            stats["prefilter_rejected"], len(llm_items),
+        )
+        if not llm_items:
+            logger.info("[prefilter+batch] done (no LLM needed): %s", stats)
+            return stats
+
+        # ── Pass 2: Message Batches API for the ambiguous remainder ───────
+        chunk_map: dict = {}
+        requests = []
+        for i in range(0, len(llm_items), batch_size):
+            chunk = llm_items[i:i + batch_size]
+            cid = f"chunk-{i // batch_size}"
+            requests.append(Request(
+                custom_id=cid,
+                params=MessageCreateParamsNonStreaming(
+                    model=model,
+                    max_tokens=1024,
+                    temperature=0,
+                    system=[{
+                        "type": "text", "text": _LLM_SYSTEM_PROMPT,
+                        "cache_control": {"type": "ephemeral"},
+                    }],
+                    messages=[{"role": "user", "content": _build_batch_prompt(chunk)}],
+                ),
+            ))
+            chunk_map[cid] = {it["record_id"]: it["_record"] for it in chunk}
+
+        if dry_run:
+            logger.info("[batch] DRY RUN — would submit %d requests (%d records); no batch created.",
+                        len(requests), len(llm_items))
+            return stats
+
+        batch = client.messages.batches.create(requests=requests)
+        logger.info("[batch] submitted id=%s requests=%d — polling every %ds",
+                    batch.id, len(requests), poll_seconds)
+        while True:
+            b = client.messages.batches.retrieve(batch.id)
+            if b.processing_status == "ended":
+                break
+            _time.sleep(poll_seconds)
+
+        for result in client.messages.batches.results(batch.id):
+            recmap = chunk_map.get(result.custom_id, {})
+            if result.result.type != "succeeded":
+                logger.warning("[batch] %s -> %s", result.custom_id, result.result.type)
+                stats["errors"] += len(recmap)
+                continue
+            msg = result.result.message
+            text = next((blk.text for blk in msg.content if blk.type == "text"), "")
+            try:
+                start, end = text.find("["), text.rfind("]")
+                if start == -1 or end == -1:
+                    raise ValueError("no JSON array")
+                decisions = json.loads(text[start:end + 1])
+            except Exception as e:
+                logger.warning("[batch] parse fail %s: %s", result.custom_id, e)
+                stats["errors"] += len(recmap)
+                continue
+            for d in decisions:
+                try:
+                    rid = int(d.get("record_id"))
+                except (TypeError, ValueError):
+                    continue
+                rec = recmap.get(rid)
+                if not rec:
+                    continue
+                if d.get("matched") and d.get("confidence") == "high":
+                    pid = d.get("property_id") or rec.candidate_property_id
+                    _apply_confirm(session, rec, pid, county_id, dry_run)
+                    stats["llm_confirmed"] += 1
+                else:
+                    _apply_reject(session, rec, dry_run)
+                    stats["llm_rejected"] += 1
+        session.commit()
+
+    logger.info("[prefilter+batch] done: %s", stats)
+    return stats
+
+
 if __name__ == "__main__":
     import argparse
     logging.basicConfig(level=logging.INFO)
@@ -862,17 +1131,29 @@ if __name__ == "__main__":
     parser.add_argument("--dry-run", action="store_true", help="Log decisions without writing to DB")
     parser.add_argument("--model", default="claude-sonnet-4-6", help="Anthropic model for LLM tiebreaker")
     parser.add_argument("--batch-size", type=int, default=5, help="Records per LLM API call")
+    parser.add_argument("--batch", action="store_true",
+                        help="Cost-reduced path: deterministic pre-filter + Message Batches API (50%% off)")
     args = parser.parse_args()
 
     if args.llm_only:
-        result = llm_tiebreak_pending_review(
-            source_type=args.source,
-            limit=args.limit,
-            county_id=args.county_id,
-            dry_run=args.dry_run,
-            batch_size=args.batch_size,
-            model=args.model,
-        )
+        if args.batch:
+            result = prefilter_and_batch_tiebreak(
+                source_type=args.source,
+                limit=args.limit,
+                county_id=args.county_id,
+                dry_run=args.dry_run,
+                batch_size=args.batch_size,
+                model=args.model,
+            )
+        else:
+            result = llm_tiebreak_pending_review(
+                source_type=args.source,
+                limit=args.limit,
+                county_id=args.county_id,
+                dry_run=args.dry_run,
+                batch_size=args.batch_size,
+                model=args.model,
+            )
         print(result)
     else:
         # Standard rematch
