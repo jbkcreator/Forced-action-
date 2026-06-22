@@ -316,6 +316,7 @@ def _poll_trace_queue(
     estimated_wait: int = 30,
     stable_rounds_required: int = 2,
     max_empty_attempts: int = 120,
+    min_settle_seconds: int = 30,
 ) -> list[dict]:
     """
     Poll GET /queue/:id until it returns a non-empty list, then return the results.
@@ -332,6 +333,14 @@ def _poll_trace_queue(
     Returns [] when still processing. After initial sleep we retry up to
     60 × 5s = 5 minutes before giving up (treating remaining submitted
     records as misses).
+
+    Completion is NOT a bare count-plateau: Tracerfy streams results in, so an
+    early plateau at a low count is ambiguous. We only accept once the count has
+    been stable for ``stable_rounds_required`` polls AND at least
+    ``min_settle_seconds`` have elapsed since the first non-empty result (the
+    settle clock resets whenever the count grows). This prevents a transient
+    early plateau from being mistaken for a finished queue — the failure mode
+    that previously stranded billed-but-uningested hits.
     """
     url = f"{_TRACE_QUEUE_ENDPOINT}{queue_id}"
 
@@ -340,6 +349,7 @@ def _poll_trace_queue(
 
     last_count = -1
     stable_rounds = 0
+    first_nonempty_at: Optional[float] = None
 
     for attempt in range(120):
         try:
@@ -377,13 +387,22 @@ def _poll_trace_queue(
             time.sleep(_POLL_INTERVAL)
             continue
 
-        # Tracerfy streams results as it processes — wait until count stabilises
-        # across two consecutive polls before accepting as complete.
+        if first_nonempty_at is None:
+            first_nonempty_at = time.monotonic()
+
+        # Tracerfy streams results as it processes — accept only once the count
+        # has held steady AND the settle window has elapsed since first data.
+        # A growing count resets the stability counter (and keeps the settle
+        # clock running), so a transient early plateau cannot be accepted early.
         if current_count == last_count:
             stable_rounds += 1
-            if stable_rounds >= stable_rounds_required:
-                logger.info("[Tracerfy] queue=%s stable at %d rows after %d attempts",
-                            queue_id, current_count, attempt + 1)
+            settled = (time.monotonic() - first_nonempty_at) >= min_settle_seconds
+            if stable_rounds >= stable_rounds_required and settled:
+                logger.info(
+                    "[Tracerfy] queue=%s complete: %d rows stable for %d polls, "
+                    "%ds settle elapsed (attempt=%d)",
+                    queue_id, current_count, stable_rounds, min_settle_seconds, attempt + 1,
+                )
                 return results
         else:
             stable_rounds = 0
@@ -1247,21 +1266,16 @@ def run_tracerfy_fallback(
 
         logger.info("[Tracerfy] Batch %d: submitting %d records...", batch_num, len(batch_records))
 
+        # ── Submit (the billing event) ──────────────────────────────────────
+        # The spend cap is enforced strictly BEFORE this point (above). Once a
+        # batch is submitted, Tracerfy will bill for any hits regardless of what
+        # happens next, so we account its worst-case cost immediately and treat
+        # the queue as something that MUST be drained (Fix C).
         try:
             queue_id, estimated_wait = _submit_trace_batch(batch_records, api_key, address_only=address_only_fallback)
-            logger.info("[Tracerfy] Batch %d queued — queue_id=%s est_wait=%ds",
-                        batch_num, queue_id, estimated_wait)
-            stable_rounds_required = 8 if address_only_fallback else 2
-            results = _poll_trace_queue(
-                queue_id,
-                api_key,
-                estimated_wait,
-                stable_rounds_required=stable_rounds_required,
-                max_empty_attempts=36 if address_only_fallback else 120,
-            )
         except RuntimeError as e:
             err_msg = str(e)
-            logger.error("[Tracerfy] Batch %d failed: %s", batch_num, err_msg)
+            logger.error("[Tracerfy] Batch %d submit failed: %s", batch_num, err_msg)
             if "401" in err_msg or "403" in err_msg or "429" in err_msg:
                 send_alert(
                     subject="[Forced Action] Tracerfy API ERROR",
@@ -1275,8 +1289,31 @@ def run_tracerfy_fallback(
             stats["failed"] += len(batch_records)
             continue
 
-        # The batch was accepted by Tracerfy — count its worst-case cost against the cap.
+        # Submission succeeded → spend is now committed. Record it against the
+        # cap here (not after persist) so the ledger reflects billed spend even
+        # if the poll/persist below fails.
         cap.add(projected_cents)
+        logger.info("[Tracerfy] Batch %d queued — queue_id=%s est_wait=%ds",
+                    batch_num, queue_id, estimated_wait)
+
+        # ── Drain the billed queue. A poll failure must never silently drop
+        # billed hits: log the queue_id at ERROR so it can be recovered. ──────
+        try:
+            results = _poll_trace_queue(
+                queue_id,
+                api_key,
+                estimated_wait,
+                stable_rounds_required=8 if address_only_fallback else 4,
+                max_empty_attempts=36 if address_only_fallback else 120,
+                min_settle_seconds=30,
+            )
+        except RuntimeError as e:
+            logger.error(
+                "[Tracerfy] Batch %d: BILLED queue=%s failed to drain (%s) — hits may be "
+                "uningested. Recover with: python -m scripts.recover_queue_<id> (queue_id=%s)",
+                batch_num, queue_id, e, queue_id,
+            )
+            results = []
 
         # ── Persist results — matched by normalized-address key, fanned to co-owners ──
         hit_keys: set[str] = set()      # trace_keys that returned a row
