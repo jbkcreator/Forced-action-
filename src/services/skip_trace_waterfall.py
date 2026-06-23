@@ -30,6 +30,11 @@ from src.core.database import get_db_context
 from src.core.models import DistressScore, EnrichedContact, Owner, Property
 from src.services.enrichment_log import log_usage
 from src.services.event_bus import emit_event
+from src.services.prospect_service import (
+    best_ec as _best_ec,
+    dedupe_after_cascade,
+    get_or_create_prospect as _get_or_create_prospect,
+)
 from src.services.skip_trace_result import compute_confidence
 from src.utils.logger import get_logger
 
@@ -149,34 +154,6 @@ def _stamp_confidence(session, property_id: int, source: str, confidence: float)
         session.flush()
 
 
-# ─── M2: Prospect helpers ────────────────────────────────────────────────────
-
-def _get_or_create_prospect(session, property_id: int) -> str:
-    """Return prospect_id (UUID str) for property_id, creating if absent."""
-    row = session.execute(sa_text("""
-        INSERT INTO prospects (property_id)
-        VALUES (:pid)
-        ON CONFLICT (property_id) DO NOTHING
-        RETURNING prospect_id
-    """), {"pid": property_id}).fetchone()
-
-    if not row:
-        row = session.execute(sa_text(
-            "SELECT prospect_id FROM prospects WHERE property_id = :pid"
-        ), {"pid": property_id}).fetchone()
-
-    return str(row.prospect_id)
-
-
-def _best_ec(session, property_id: int) -> Optional[EnrichedContact]:
-    """Latest successful enriched_contact row for a property."""
-    return (
-        session.query(EnrichedContact)
-        .filter_by(property_id=property_id, match_success=True)
-        .filter(EnrichedContact.superseded_at.is_(None))
-        .order_by(EnrichedContact.enriched_at.desc())
-        .first()
-    )
 
 
 # ─── Triangulation inline hook ───────────────────────────────────────────────
@@ -578,6 +555,8 @@ def run_cascade(
                     "[Cascade] M2 prospect stamp failed for owner_id=%d property_id=%d",
                     owner_id, property_id, exc_info=True,
                 )
+
+        dedupe_after_cascade(session, list(property_ids.values()))
         session.commit()
 
     logger.info(

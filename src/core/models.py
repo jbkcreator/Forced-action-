@@ -5615,6 +5615,11 @@ class Prospect(Base):
     last_touch_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True,
     )
+    merged_into_id: Mapped[Optional[str]] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("prospects.prospect_id", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("NOW()"),
     )
@@ -5664,10 +5669,10 @@ class ProspectEvent(Base):
         PG_UUID(as_uuid=True), primary_key=True,
         server_default=text("generate_uuidv7()"),
     )
-    prospect_id: Mapped[Optional[str]] = mapped_column(
+    prospect_id: Mapped[str] = mapped_column(
         PG_UUID(as_uuid=True),
         ForeignKey("prospects.prospect_id"),
-        nullable=True,
+        nullable=False,
     )
     event_type: Mapped[str] = mapped_column(String, nullable=False)
     actor: Mapped[str] = mapped_column(String, nullable=False)
@@ -5679,7 +5684,7 @@ class ProspectEvent(Base):
     )
     source_component: Mapped[str] = mapped_column(String, nullable=False)
 
-    prospect: Mapped[Optional["Prospect"]] = relationship(
+    prospect: Mapped["Prospect"] = relationship(
         "Prospect", back_populates="events",
     )
     processed_by: Mapped[List["ProcessedEvent"]] = relationship(
@@ -5737,4 +5742,39 @@ class ProcessedEvent(Base):
         return (
             f"<ProcessedEvent(event_id={self.event_id}, "
             f"consumer='{self.consumer}')>"
+        )
+
+
+class MergeEvent(Base):
+    """
+    Audit log for prospect merges. Surviving prospect absorbs merged prospect.
+    merged_into_id on the merged Prospect row points to the surviving prospect_id.
+    """
+    __tablename__ = "merge_events"
+
+    merge_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True,
+        server_default=text("generate_uuidv7()"),
+    )
+    surviving_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("prospects.prospect_id"),
+        nullable=False,
+    )
+    merged_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("prospects.prospect_id"),
+        nullable=False,
+    )
+    field_decisions: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb"),
+    )
+    merged_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("NOW()"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<MergeEvent(surviving={self.surviving_id}, "
+            f"merged={self.merged_id})>"
         )
