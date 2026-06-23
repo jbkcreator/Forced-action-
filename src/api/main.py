@@ -1705,7 +1705,7 @@ def event_feed(
             "leads": [],
         }
 
-    if subscriber.status not in ("active", "grace", "disputed"):
+    if subscriber.status not in ("active", "grace", "disputed", "past_due"):
         raise HTTPException(status_code=403, detail={"error": "subscription_inactive", "message": "Subscription is not active"})
 
     # 2. Get subscriber's locked ZIP codes
@@ -2190,7 +2190,7 @@ def feed_stats(feed_uuid: str, db: Session = Depends(get_db), _auth=Depends(get_
     if not subscriber:
         raise HTTPException(status_code=404, detail={"error": "not_found", "message": "Feed not found"})
 
-    if subscriber.status not in ("active", "grace", "disputed"):
+    if subscriber.status not in ("active", "grace", "disputed", "past_due"):
         raise HTTPException(status_code=403, detail={"error": "subscription_inactive", "message": "Subscription is not active"})
 
     try:
@@ -3062,7 +3062,7 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, request: Request, db: S
     except OperationalError:
         raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
 
-    if not subscriber or subscriber.status not in ("active", "grace"):
+    if not subscriber or subscriber.status not in ("active", "grace", "past_due"):
         raise HTTPException(status_code=403, detail={"error": "unauthorized", "message": "Active subscription required"})
 
     if payload.vertical not in VALID_VERTICALS:
@@ -3204,7 +3204,7 @@ def auto_mode_checkout(payload: AutoModeCheckoutRequest, db: Session = Depends(g
     except OperationalError:
         raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
 
-    if not subscriber or subscriber.status not in ("active", "grace"):
+    if not subscriber or subscriber.status not in ("active", "grace", "past_due"):
         raise HTTPException(status_code=403, detail={"error": "unauthorized", "message": "Active subscription required"})
 
     # Confirmed policy: do NOT create the Stripe customer inline. Subscriber
@@ -3414,7 +3414,7 @@ def hot_lead_unlock(payload: HotLeadUnlockRequest, db: Session = Depends(get_db)
     ).scalar_one_or_none()
     if not subscriber:
         raise HTTPException(status_code=404, detail="Subscriber not found")
-    if subscriber.status not in ("active", "grace"):
+    if subscriber.status not in ("active", "grace", "past_due"):
         raise HTTPException(status_code=403, detail="Active subscription required")
     if not subscriber.stripe_customer_id:
         raise HTTPException(status_code=400, detail="No Stripe customer linked")
@@ -5495,7 +5495,7 @@ def bundle_checkout(req: BundleCheckoutRequest, request: Request, db: Session = 
     sub = db.execute(
         select(Subscriber).where(Subscriber.event_feed_uuid == req.feed_uuid)
     ).scalar_one_or_none()
-    if not sub or sub.status not in ("active", "grace"):
+    if not sub or sub.status not in ("active", "grace", "past_due"):
         raise HTTPException(status_code=403, detail="Active subscription required")
 
     if not is_available(req.bundle_type, sub.id, db):

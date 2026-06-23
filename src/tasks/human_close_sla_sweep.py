@@ -12,8 +12,8 @@ escalated at 13:00 the previous day (now 25h old) is caught on the first tick.
 import logging
 from datetime import datetime, timedelta, timezone
 
-import requests
-from sqlalchemy import select, text as sa_text
+from src.utils.http_helpers import requests_post_with_retry
+from sqlalchemy import text as sa_text
 
 from config.settings import get_settings
 from src.core.database import get_db_context
@@ -82,8 +82,7 @@ def run() -> None:
             ],
         }
         try:
-            resp = requests.post(webhook, json=payload, timeout=10)
-            resp.raise_for_status()
+            requests_post_with_retry(webhook, json=payload, timeout=10)
             logger.info("[sla_sweep] alerted escalation_id=%d subscriber=%s", row.id, name)
         except Exception:
             logger.error("[sla_sweep] failed to post Slack for escalation_id=%d", row.id, exc_info=True)
