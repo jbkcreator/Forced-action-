@@ -5622,10 +5622,6 @@ class Prospect(Base):
         DateTime(timezone=True), nullable=False, server_default=text("NOW()"),
     )
 
-    enrichment_provenance: Mapped[List["EnrichmentProvenance"]] = relationship(
-        "EnrichmentProvenance", back_populates="prospect",
-        cascade="all, delete-orphan",
-    )
     events: Mapped[List["ProspectEvent"]] = relationship(
         "ProspectEvent", back_populates="prospect",
     )
@@ -5654,57 +5650,6 @@ class Prospect(Base):
             f"state='{self.contactability_state}')>"
         )
 
-
-class EnrichmentProvenance(Base):
-    """
-    One row per field per enrichment source per prospect.
-    Replaces JSONB array — 1NF compliant, auditable to the penny.
-    """
-    __tablename__ = "enrichment_provenance"
-
-    id: Mapped[str] = mapped_column(
-        PG_UUID(as_uuid=True), primary_key=True,
-        server_default=text("generate_uuidv7()"),
-    )
-    prospect_id: Mapped[str] = mapped_column(
-        PG_UUID(as_uuid=True),
-        ForeignKey("prospects.prospect_id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    field_name: Mapped[str] = mapped_column(String, nullable=False)
-    source: Mapped[str] = mapped_column(String, nullable=False)
-    cost_cents: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text("0"),
-    )
-    confidence: Mapped[Optional[Decimal]] = mapped_column(
-        Numeric(5, 4), nullable=True,
-    )
-    acquired_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=text("NOW()"),
-    )
-
-    prospect: Mapped["Prospect"] = relationship(
-        "Prospect", back_populates="enrichment_provenance",
-    )
-
-    __table_args__ = (
-        CheckConstraint(
-            "source IN ('voter','appraiser','tracerfy','batchdata','idi')",
-            name="ck_enrichment_provenance_source",
-        ),
-        CheckConstraint(
-            "confidence IS NULL OR (confidence >= 0 AND confidence <= 1)",
-            name="ck_enrichment_provenance_confidence",
-        ),
-        Index("idx_enrichment_provenance_prospect_id", "prospect_id"),
-    )
-
-    def __repr__(self) -> str:
-        return (
-            f"<EnrichmentProvenance(prospect_id={self.prospect_id}, "
-            f"field='{self.field_name}', source='{self.source}', "
-            f"cost_cents={self.cost_cents})>"
-        )
 
 
 class ProspectEvent(Base):

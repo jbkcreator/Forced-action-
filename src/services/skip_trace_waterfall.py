@@ -29,6 +29,7 @@ from config.settings import get_settings
 from src.core.database import get_db_context
 from src.core.models import DistressScore, EnrichedContact, Owner, Property
 from src.services.enrichment_log import log_usage
+from src.services.event_bus import emit_event
 from src.services.skip_trace_result import compute_confidence
 from src.utils.logger import get_logger
 
@@ -146,6 +147,36 @@ def _stamp_confidence(session, property_id: int, source: str, confidence: float)
     if ec:
         ec.confidence = confidence
         session.flush()
+
+
+# ─── M2: Prospect helpers ────────────────────────────────────────────────────
+
+def _get_or_create_prospect(session, property_id: int) -> str:
+    """Return prospect_id (UUID str) for property_id, creating if absent."""
+    row = session.execute(sa_text("""
+        INSERT INTO prospects (property_id)
+        VALUES (:pid)
+        ON CONFLICT (property_id) DO NOTHING
+        RETURNING prospect_id
+    """), {"pid": property_id}).fetchone()
+
+    if not row:
+        row = session.execute(sa_text(
+            "SELECT prospect_id FROM prospects WHERE property_id = :pid"
+        ), {"pid": property_id}).fetchone()
+
+    return str(row.prospect_id)
+
+
+def _best_ec(session, property_id: int) -> Optional[EnrichedContact]:
+    """Latest successful enriched_contact row for a property."""
+    return (
+        session.query(EnrichedContact)
+        .filter_by(property_id=property_id, match_success=True)
+        .filter(EnrichedContact.superseded_at.is_(None))
+        .order_by(EnrichedContact.enriched_at.desc())
+        .first()
+    )
 
 
 # ─── Triangulation inline hook ───────────────────────────────────────────────
@@ -497,6 +528,57 @@ def run_cascade(
             session.commit()
 
     stats.misses = stats.total_leads - stats.hits
+
+    # ── M2: Prospect creation + contactability stamping + event emission ───────
+    # Runs once after all cascade stages. Uses resolved_ids and spent_cents
+    # which are already computed above — no extra API calls.
+    with get_db_context() as session:
+        property_ids: dict[int, int] = {}   # owner_id → property_id
+        for owner_id in all_owner_ids:
+            owner = session.get(Owner, owner_id)
+            if owner:
+                property_ids[owner_id] = owner.property_id
+
+        for owner_id, property_id in property_ids.items():
+            try:
+                prospect_id = _get_or_create_prospect(session, property_id)
+
+                if owner_id in resolved_ids:
+                    state      = "contactable"
+                    event_type = "enrichment.completed"
+                    ec         = _best_ec(session, property_id)
+                else:
+                    state      = "exhausted"
+                    event_type = "enrichment.failed"
+                    ec         = None
+
+                session.execute(sa_text("""
+                    UPDATE prospects
+                    SET contactability_state = :state, updated_at = NOW()
+                    WHERE prospect_id = :pid
+                """), {"state": state, "pid": prospect_id})
+
+                emit_event(
+                    session,
+                    event_type=event_type,
+                    actor="cascade",
+                    source_component="skip_trace_waterfall",
+                    prospect_id=prospect_id,
+                    payload={
+                        "property_id":        property_id,
+                        "contactability_state": state,
+                        "enriched_contact_id": ec.id if ec else None,
+                        "source":             ec.source if ec else None,
+                        "confidence":         float(ec.confidence) if ec and ec.confidence else None,
+                        "total_cost_cents":   spent_cents.get(owner_id, 0),
+                    },
+                )
+            except Exception:
+                logger.warning(
+                    "[Cascade] M2 prospect stamp failed for owner_id=%d property_id=%d",
+                    owner_id, property_id, exc_info=True,
+                )
+        session.commit()
 
     logger.info(
         "[Cascade] DONE leads=%d hits=%d misses=%d cost_cents=%d",
