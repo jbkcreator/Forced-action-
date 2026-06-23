@@ -309,6 +309,25 @@ def send_sms(
             _log("suppressed", suppress_reason="subscriber_sms_frequency_cap")
             return False
 
+    # 3a. Free-tier weekly outbound text allotment (3 texts/week).
+    # Only applies to free-tier subscribers; wallet holders bypass inside the engine.
+    if message_type == "marketing" and subscriber_id is not None:
+        from sqlalchemy import text as _sa_text
+        from src.services.allotment_engine import consume as _allotment_consume
+        _tier_row = db.execute(
+            _sa_text("SELECT tier FROM subscribers WHERE id = :sid LIMIT 1"),
+            {"sid": subscriber_id},
+        ).fetchone()
+        if _tier_row and _tier_row[0] == "free":
+            if not _allotment_consume(subscriber_id, "outbound_text", db):
+                logger.info(
+                    "SMS suppressed (free_tier_outbound_text_allotment): subscriber_id=%s to=%s",
+                    subscriber_id, to,
+                )
+                add_to_dead_letter(to, "subscriber_sms_frequency_cap", {"body": body[:160]}, db)
+                _log("suppressed", suppress_reason="free_tier_outbound_text_allotment")
+                return False
+
     # 6. Dry-run path (TELNYX_SMS_ENABLED=false)
     if not settings.telnyx_sms_enabled:
         logger.info("[DRY RUN] SMS to=%s body=%r", to, body[:160])

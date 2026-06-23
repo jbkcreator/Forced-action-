@@ -1850,6 +1850,20 @@ def event_feed(
         except Exception:
             pass
 
+        if subscriber.tier == "free" and _blurred_stack and page == 1:
+            try:
+                from src.agents.events.ingestion import publish_cora_event
+                publish_cora_event({
+                    "event_type": "wall_session_abandoned",
+                    "subscriber_id": subscriber.id,
+                    "payload": {
+                        "vertical": subscriber.vertical or "",
+                        "zip_code": subscriber.lock_candidate_zip or "",
+                    },
+                })
+            except Exception:
+                pass
+
         return {
             "feed_uuid": feed_uuid,
             "subscriber": {
@@ -3430,6 +3444,20 @@ def hot_lead_unlock(payload: HotLeadUnlockRequest, db: Session = Depends(get_db)
         raise HTTPException(status_code=400, detail=str(exc))
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
+
+    if subscriber.tier == "free":
+        try:
+            from src.agents.events.ingestion import publish_cora_event
+            publish_cora_event({
+                "event_type": "abandonment_click_no_complete",
+                "subscriber_id": subscriber.id,
+                "payload": {
+                    "lead_id": payload.lead_id,
+                    "vertical": subscriber.vertical or "",
+                },
+            })
+        except Exception:
+            pass
 
     return {"checkout_url": result["url"]}
 
