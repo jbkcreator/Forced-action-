@@ -5778,3 +5778,128 @@ class MergeEvent(Base):
             f"<MergeEvent(surviving={self.surviving_id}, "
             f"merged={self.merged_id})>"
         )
+
+
+# ============================================================================
+# M6 — Lead Quality Truth Engine (verdicts, grade thresholds, cohort rates)
+# ============================================================================
+
+class GradeThreshold(Base):
+    """
+    Tunable grade cut-offs for the Truth Engine (spec §3.1a, config-over-code §190).
+
+    cds_min/cds_max are on the 0–100 scale to match DistressScore.final_cds_score;
+    the spec's original 0–1 values are recorded in `notes`. contactability_min is on
+    the 0–1 scale and stays dormant until contactability rates exist.
+    """
+    __tablename__ = "grade_thresholds"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    grade: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    cds_min: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    cds_max: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    contactability_min: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 4), nullable=True)
+    requires_mobile_consent: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false"),
+    )
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("true"),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("NOW()"),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "grade IN ('Ultra','Platinum','Gold','Silver','Bronze','sub_grade')",
+            name="ck_grade_thresholds_grade",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return f"<GradeThreshold(grade='{self.grade}', cds_min={self.cds_min}, cds_max={self.cds_max})>"
+
+
+class Verdict(Base):
+    """
+    Truth Engine output — one explainable verdict per grading pass (spec §4.5).
+
+    Append-only: a prospect may accrue several verdicts over time; the latest by
+    created_at is the current one. Grade is the Truth Engine grade enum, distinct
+    from DistressScore.lead_tier (M6 grades off the raw CDS score, not the tier).
+    """
+    __tablename__ = "verdicts"
+
+    verdict_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True,
+        server_default=text("generate_uuidv7()"),
+    )
+    prospect_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("prospects.prospect_id"),
+        nullable=False,
+    )
+    grade: Mapped[str] = mapped_column(String, nullable=False)
+    contributing_factors: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb"),
+    )
+    contactability_flag: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false"),
+    )
+    routed_channel: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("NOW()"),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "grade IN ('Ultra','Platinum','Gold','Silver','Bronze','sub_grade')",
+            name="ck_verdicts_grade",
+        ),
+        CheckConstraint(
+            "routed_channel IN ('loan_lane','contractor_subscription','storm_retainer',"
+            "'data_pack_bulk','free_hand_delivered','recycle_suppress')",
+            name="ck_verdicts_routed_channel",
+        ),
+        Index("idx_verdicts_prospect_id", "prospect_id"),
+        Index("idx_verdicts_created_at", "created_at"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<Verdict(prospect_id={self.prospect_id}, grade='{self.grade}', "
+            f"routed_channel='{self.routed_channel}')>"
+        )
+
+
+class CohortRate(Base):
+    """
+    Aggregated contactability per cohort (spec §12.1 cohort fallback).
+
+    Refreshed nightly by src/tasks/cohort_rate_recompute.py. cohort_key is
+    `{cds_lead_tier}|{county_id}|{enrichment_source}` (see config.grading).
+    contactability_rate is NULL until the cohort has any contact attempts.
+    """
+    __tablename__ = "cohort_rates"
+
+    cohort_key: Mapped[str] = mapped_column(String, primary_key=True)
+    contact_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0"),
+    )
+    successful_contacts: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0"),
+    )
+    contactability_rate: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 4), nullable=True)
+    sample_size: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0"),
+    )
+    computed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("NOW()"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<CohortRate(cohort_key='{self.cohort_key}', "
+            f"rate={self.contactability_rate}, n={self.sample_size})>"
+        )
