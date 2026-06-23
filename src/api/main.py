@@ -161,6 +161,9 @@ app.include_router(quora_auth_router)
 from src.api.signals_router import router as signals_router  # noqa: E402
 app.include_router(signals_router)
 
+from src.api.verdict_router import router as verdict_router  # noqa: E402
+app.include_router(verdict_router)
+
 
 # ---------------------------------------------------------------------------
 # Global exception handlers
