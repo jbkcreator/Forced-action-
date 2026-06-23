@@ -11,6 +11,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     Column,
+    Computed,
     Date,
     DateTime,
     ForeignKey,
@@ -5567,4 +5568,228 @@ class WinStoryAsset(Base):
         return (
             f"<WinStoryAsset(id={self.id}, event='{self.event_type}', "
             f"county='{self.county_id}')>"
+        )
+
+
+# ============================================================================
+# 414 S1 — M1 SHARED BACKBONE (fa087)
+# ============================================================================
+
+class Prospect(Base):
+    """
+    Thin UUID bridge over the existing properties hub.
+    Adds contactability state, channel consent, and contact tracking.
+    All identity data (name, address, phone) stays in properties/owners.
+    """
+    __tablename__ = "prospects"
+
+    prospect_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True,
+        server_default=text("generate_uuidv7()"),
+    )
+    property_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("properties.id"), nullable=False, unique=True,
+    )
+    contactability_state: Mapped[str] = mapped_column(
+        String, nullable=False, server_default="unknown",
+    )
+    channel_consent: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb"),
+    )
+    contact_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0"),
+    )
+    successful_contacts: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0"),
+    )
+    contactability_rate: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(5, 4),
+        Computed(
+            "CASE WHEN contact_attempts >= 5 "
+            "THEN successful_contacts::numeric / contact_attempts "
+            "ELSE NULL END",
+            persisted=True,
+        ),
+    )
+    cohort_key: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    last_touch_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("NOW()"),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("NOW()"),
+    )
+
+    enrichment_provenance: Mapped[List["EnrichmentProvenance"]] = relationship(
+        "EnrichmentProvenance", back_populates="prospect",
+        cascade="all, delete-orphan",
+    )
+    events: Mapped[List["ProspectEvent"]] = relationship(
+        "ProspectEvent", back_populates="prospect",
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "contactability_state IN "
+            "('unknown','enriching','contactable','invalid','exhausted')",
+            name="ck_prospects_contactability_state",
+        ),
+        Index("idx_prospects_property_id", "property_id"),
+        Index(
+            "idx_prospects_contactable", "prospect_id",
+            postgresql_where=text("contactability_state = 'contactable'"),
+        ),
+        Index(
+            "idx_prospects_cohort", "cohort_key",
+            postgresql_where=text("cohort_key IS NOT NULL"),
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<Prospect(prospect_id={self.prospect_id}, "
+            f"property_id={self.property_id}, "
+            f"state='{self.contactability_state}')>"
+        )
+
+
+class EnrichmentProvenance(Base):
+    """
+    One row per field per enrichment source per prospect.
+    Replaces JSONB array — 1NF compliant, auditable to the penny.
+    """
+    __tablename__ = "enrichment_provenance"
+
+    id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True,
+        server_default=text("generate_uuidv7()"),
+    )
+    prospect_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("prospects.prospect_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    field_name: Mapped[str] = mapped_column(String, nullable=False)
+    source: Mapped[str] = mapped_column(String, nullable=False)
+    cost_cents: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0"),
+    )
+    confidence: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(5, 4), nullable=True,
+    )
+    acquired_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("NOW()"),
+    )
+
+    prospect: Mapped["Prospect"] = relationship(
+        "Prospect", back_populates="enrichment_provenance",
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "source IN ('voter','appraiser','tracerfy','batchdata','idi')",
+            name="ck_enrichment_provenance_source",
+        ),
+        CheckConstraint(
+            "confidence IS NULL OR (confidence >= 0 AND confidence <= 1)",
+            name="ck_enrichment_provenance_confidence",
+        ),
+        Index("idx_enrichment_provenance_prospect_id", "prospect_id"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<EnrichmentProvenance(prospect_id={self.prospect_id}, "
+            f"field='{self.field_name}', source='{self.source}', "
+            f"cost_cents={self.cost_cents})>"
+        )
+
+
+class ProspectEvent(Base):
+    """
+    Universal event bus — transactional outbox pattern.
+    Written in the same DB transaction as the state change that caused it.
+    Consumers poll via processed_events for idempotent delivery.
+    """
+    __tablename__ = "events"
+
+    event_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True,
+        server_default=text("generate_uuidv7()"),
+    )
+    prospect_id: Mapped[Optional[str]] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("prospects.prospect_id"),
+        nullable=True,
+    )
+    event_type: Mapped[str] = mapped_column(String, nullable=False)
+    actor: Mapped[str] = mapped_column(String, nullable=False)
+    payload: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb"),
+    )
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("NOW()"),
+    )
+    source_component: Mapped[str] = mapped_column(String, nullable=False)
+
+    prospect: Mapped[Optional["Prospect"]] = relationship(
+        "Prospect", back_populates="events",
+    )
+    processed_by: Mapped[List["ProcessedEvent"]] = relationship(
+        "ProcessedEvent", back_populates="event",
+        cascade="all, delete-orphan",
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "event_type IN ("
+            "'prospect.created','enrichment.completed','enrichment.failed',"
+            "'cds.scored','truth.verdict',"
+            "'lane.entry','lane.advance','lane.stall','lane.close',"
+            "'broker.transition',"
+            "'sms.sent','sms.reply',"
+            "'commission.posted',"
+            "'delivery.sent'"
+            ")",
+            name="ck_events_event_type",
+        ),
+        Index("idx_events_prospect_id", "prospect_id"),
+        Index("idx_events_occurred_at", "occurred_at"),
+        Index("idx_events_type", "event_type"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<ProspectEvent(event_id={self.event_id}, "
+            f"type='{self.event_type}', actor='{self.actor}')>"
+        )
+
+
+class ProcessedEvent(Base):
+    """
+    Idempotency guard — tracks which consumers have processed which events.
+    ON CONFLICT DO NOTHING on (event_id, consumer) prevents double-processing.
+    """
+    __tablename__ = "processed_events"
+
+    event_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("events.event_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    consumer: Mapped[str] = mapped_column(String, primary_key=True)
+    processed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("NOW()"),
+    )
+
+    event: Mapped["ProspectEvent"] = relationship(
+        "ProspectEvent", back_populates="processed_by",
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<ProcessedEvent(event_id={self.event_id}, "
+            f"consumer='{self.consumer}')>"
         )
