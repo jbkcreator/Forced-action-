@@ -187,6 +187,12 @@ COUNTY_ID=hillsborough
 10 8 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.daily_report --county $COUNTY_ID
 11 8 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.daily_report --county pinellas
 
+# ── M6 LEAD QUALITY TRUTH ENGINE ─────────────────────────────
+# Cohort contactability-rate recompute (07:45) — before the verdict batch.
+45 7 * * * $PROJECT/scripts/cron/run.sh src.tasks.cohort_rate_recompute
+# Truth Engine verdict batch (08:15) — after CDS scoring, skip-trace, and cohort recompute.
+15 8 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.truth_engine_batch
+
 # ── PLATFORM TASKS ───────────────────────────────────────────
 # Grace Expiry (ZIP territories + subscribers) — every 15 min
 */15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.grace_expiry
