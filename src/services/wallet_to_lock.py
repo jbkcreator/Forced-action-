@@ -160,7 +160,7 @@ def compute_wallet_to_lock_eligibility(db: Session, subscriber) -> tuple[bool, O
 
     Returns (eligible, credits_30d_in_candidate_zip).
     """
-    if not subscriber or subscriber.status != "active":
+    if not subscriber or subscriber.status not in ("active", "past_due"):
         return False, None
     if subscriber.tier in LOCK_OR_ABOVE_TIERS:
         return False, None

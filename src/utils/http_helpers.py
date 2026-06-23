@@ -235,3 +235,42 @@ def requests_get_with_retry(
                 continue
             logger.error(f"HTTP error (not retried): {e}")
             raise
+
+
+def requests_post_with_retry(
+    url: str,
+    max_retries: int = 3,
+    retry_delay: int = 2,
+    **kwargs,
+) -> requests.Response:
+    """
+    requests.post wrapper with automatic retry on transient failures.
+    Same retry policy as requests_get_with_retry — retries on network errors
+    and 429/5xx; does not retry on 4xx client errors.
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.post(url, **kwargs)
+            response.raise_for_status()
+            return response
+        except (requests.Timeout, requests.ConnectionError) as e:
+            if attempt < max_retries:
+                logger.warning(
+                    f"POST attempt {attempt}/{max_retries} failed ({type(e).__name__}): {e}"
+                    f" — retrying in {retry_delay}s..."
+                )
+                time.sleep(retry_delay)
+                continue
+            logger.error(f"All {max_retries} POST attempts exhausted: {e}")
+            raise
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else 0
+            if status in _RETRYABLE_STATUS_CODES and attempt < max_retries:
+                logger.warning(
+                    f"POST attempt {attempt}/{max_retries} got HTTP {status}: {e}"
+                    f" — retrying in {retry_delay}s..."
+                )
+                time.sleep(retry_delay)
+                continue
+            logger.error(f"POST HTTP error (not retried): {e}")
+            raise

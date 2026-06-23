@@ -228,6 +228,7 @@ def handle_webhook(raw_body: bytes, sig_header: str, db: Session) -> tuple[bool,
         "charge.refunded":                _on_charge_refunded,
         "charge.dispute.created":         _on_dispute_created,
         "charge.dispute.funds_withdrawn": _on_dispute_funds_withdrawn,
+        "checkout.session.expired":       _on_checkout_expired,
     }
 
     # Standalone products share this endpoint + signing secret. Check ownership
@@ -1308,7 +1309,7 @@ def _on_subscription_updated(subscription: dict, db: Session) -> None:
     cancel_at_period_end = subscription.get("cancel_at_period_end", False)
     status_map = {
         "active":   "active",
-        "past_due": "active",   # still active, payment catching up
+        "past_due": "past_due",
         "canceled": "cancelled",
         "unpaid":   "churned",
     }
@@ -1328,6 +1329,7 @@ def _on_subscription_updated(subscription: dict, db: Session) -> None:
             new_status = "paused"
 
     # Never overwrite founding_price_id — only update status
+    old_status = subscriber.status
     subscriber.status = new_status
     subscriber.stripe_subscription_id = subscription.get("id", subscriber.stripe_subscription_id)
 
@@ -1335,6 +1337,105 @@ def _on_subscription_updated(subscription: dict, db: Session) -> None:
         "subscription.updated: subscriber=%s stripe_status=%s → local_status=%s cancel_at_period_end=%s",
         subscriber.id, stripe_status, new_status, cancel_at_period_end,
     )
+
+    # Send past_due notification on first transition into past_due
+    if new_status == "past_due" and old_status != "past_due" and subscriber.email:
+        from src.services.email import send_email
+        from config.settings import get_settings
+        import datetime as _dt
+        _settings = get_settings()
+        name = subscriber.name or "there"
+        tier = (subscriber.tier or "starter").title()
+        feed_url = (
+            f"{_settings.app_base_url}/dashboard/{subscriber.event_feed_uuid}"
+            if subscriber.event_feed_uuid else _settings.app_base_url
+        )
+        founding_html = (
+            '<p style="margin:0 0 16px;padding:10px 16px;background:#451a03;'
+            'border:1px solid #92400e;border-radius:8px;color:#fbbf24;font-size:14px;">'
+            "⭐ Founding Member — your locked rate will be permanently lost if your subscription lapses."
+            "</p>"
+            if subscriber.founding_member else ""
+        )
+        body_html = f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/></head>
+<body style="margin:0;padding:0;background:#0f172a;font-family:Inter,Arial,sans-serif;color:#e2e8f0;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f172a;padding:40px 0;">
+    <tr><td align="center">
+      <table width="560" cellpadding="0" cellspacing="0"
+             style="background:#1e293b;border:1px solid rgba(255,255,255,0.08);border-radius:16px;overflow:hidden;max-width:560px;width:100%;">
+        <tr>
+          <td style="padding:32px 40px 24px;border-bottom:1px solid rgba(255,255,255,0.08);">
+            <p style="margin:0;font-size:22px;font-weight:800;color:#ffffff;">
+              Forced <span style="color:#fbbf24;">Action</span>
+            </p>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:32px 40px;">
+            <p style="margin:0 0 24px;padding:12px 16px;background:#450a0a;border:1px solid #7f1d1d;
+                      border-radius:8px;color:#fca5a5;font-size:14px;font-weight:600;">
+              ⚠️ &nbsp;Your subscription is past due
+            </p>
+            <h1 style="margin:0 0 8px;font-size:24px;font-weight:800;color:#ffffff;">
+              Payment still outstanding, {name}.
+            </h1>
+            <p style="margin:0 0 24px;color:#94a3b8;font-size:15px;">
+              Your <strong style="color:#ffffff;">{tier}</strong> subscription has entered past due status.
+              Stripe is automatically retrying your payment — you don't need to do anything if your card is valid.
+            </p>
+            {founding_html}
+            <p style="margin:0 0 8px;font-size:14px;color:#94a3b8;font-weight:600;">What happens next:</p>
+            <ul style="margin:0 0 24px;padding-left:20px;color:#94a3b8;font-size:14px;line-height:1.7;">
+              <li>Stripe will retry your payment over the next several days.</li>
+              <li>You keep full platform access during the retry window.</li>
+              <li>If all retries fail, your subscription will be cancelled and territory locks released.</li>
+            </ul>
+            <p style="margin:0 0 20px;font-size:14px;color:#94a3b8;">
+              To resolve this now, update your payment method:
+            </p>
+            <table cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
+              <tr>
+                <td style="background:#ef4444;border-radius:8px;">
+                  <a href="{feed_url}"
+                     style="display:inline-block;padding:14px 28px;color:#ffffff;font-size:15px;
+                            font-weight:700;text-decoration:none;">
+                    Update Payment Method &rarr;
+                  </a>
+                </td>
+              </tr>
+            </table>
+            <p style="margin:0;font-size:13px;color:#64748b;">
+              Questions? <a href="mailto:support@forcedaction.io" style="color:#fbbf24;text-decoration:none;">support@forcedaction.io</a>
+            </p>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.08);font-size:12px;color:#475569;text-align:center;">
+            Forced Action &mdash; Hillsborough County Property Intelligence
+          </td>
+        </tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>"""
+        body_text = (
+            f"Hi {name},\n\n"
+            f"Your Forced Action {tier} subscription is now past due.\n\n"
+            f"Stripe is automatically retrying your payment. You keep full access during the retry window.\n\n"
+            f"If all retries fail, your subscription will be cancelled and your territory locks released.\n\n"
+            f"To resolve this now, update your payment method:\n{feed_url}\n\n"
+            f"Questions? support@forcedaction.io\n\n"
+            f"— Forced Action Team"
+        )
+        send_email(
+            to=subscriber.email,
+            subject="Your Forced Action subscription is past due",
+            body_text=body_text,
+            body_html=body_html,
+        )
 
     # Send cancellation email when cancel_at is set (scheduled cancellation)
     cancel_at = subscription.get("cancel_at")
@@ -3560,6 +3661,52 @@ def _send_lead_pack_email(
         ),
         body_html=body_html,
     )
+
+
+# ---------------------------------------------------------------------------
+# checkout.session.expired — abandonment signal for hot lead unlock
+# ---------------------------------------------------------------------------
+
+def _on_checkout_expired(session: dict, db: Session) -> None:
+    """
+    Fires when a Stripe checkout session expires without payment.
+    For hot_lead_unlock sessions opened by free-tier subscribers, publish
+    abandonment_click_no_complete to Cora so the retention flow can trigger.
+    Subscription and lead-pack sessions are intentionally ignored here.
+    """
+    meta = session.get("metadata") or {}
+    if meta.get("product") != "hot_lead_unlock":
+        return
+
+    stripe_customer_id = session.get("customer")
+    if not stripe_customer_id:
+        return
+
+    from sqlalchemy import text
+    row = db.execute(
+        text("SELECT id, tier, vertical FROM subscribers WHERE stripe_customer_id = :cid LIMIT 1"),
+        {"cid": stripe_customer_id},
+    ).fetchone()
+    if not row or row[1] != "free":
+        return
+
+    subscriber_id, _, vertical = row
+    lead_id = meta.get("lead_id", "")
+
+    try:
+        from src.agents.events.ingestion import publish_cora_event
+        publish_cora_event({
+            "event_type": "abandonment_click_no_complete",
+            "subscriber_id": subscriber_id,
+            "payload": {
+                "lead_id": lead_id,
+                "vertical": vertical or "",
+            },
+        })
+    except Exception:
+        logger.warning(
+            "abandonment_click_no_complete publish failed: subscriber=%s", subscriber_id,
+        )
 
 
 def _send_lead_pack_refund_email(

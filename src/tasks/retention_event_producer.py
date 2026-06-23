@@ -146,14 +146,14 @@ def run(dry_run: bool = False) -> dict:
                 subs = db.execute(
                     select(Subscriber).where(
                         Subscriber.id.in_(select(WalletBalance.subscriber_id)),
-                        Subscriber.status == "active",
+                        Subscriber.status.in_(("active", "past_due")),
                     )
                 ).scalars().all()
             else:
                 subs = db.execute(
                     select(Subscriber).where(
                         Subscriber.tier == tier,
-                        Subscriber.status == "active",
+                        Subscriber.status.in_(("active", "past_due")),
                     )
                 ).scalars().all()
 

@@ -1248,7 +1248,7 @@ class Subscriber(Base):
             name="check_subscriber_tier",
         ),
         CheckConstraint(
-            "status IN ('active', 'grace', 'churned', 'cancelled', 'paused', 'disputed')",
+            "status IN ('active', 'grace', 'churned', 'cancelled', 'paused', 'disputed', 'past_due')",
             name="check_subscriber_status",
         ),
         CheckConstraint(
@@ -5554,7 +5554,9 @@ class WinStoryAsset(Base):
     county_id: Mapped[str] = mapped_column(String(50), nullable=False)
     proof_text: Mapped[str] = mapped_column(Text, nullable=False)
     amount_range: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
-    is_public: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    is_public: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    approved_by: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    slack_message_ts: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),

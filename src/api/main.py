@@ -36,6 +36,7 @@ from sqlalchemy import select, and_, or_, desc, func, cast, text, Date, distinct
 
 from src.core.database import get_db_context
 from src.core.models import ConsentAcceptance, FoundingSubscriberCount, ZipTerritory, Subscriber, Property, DistressScore, Incident, LeadPackPurchase, ScraperRunStats, EnrichedContact, Owner, SentLead, WaitlistEntry, SmsOptIn, ExpansionCandidate, County, LeadExclusivity
+from src.agents.events.ingestion import publish_cora_event
 from src.services.stripe_webhooks import handle_webhook
 from src.services.stripe_service import get_price_id_for_checkout, _price_ids
 from src.services import lead_exclusivity
@@ -1058,7 +1059,6 @@ def _handle_aircall_event(etype, data: dict, db) -> None:
             row.transcript_text = transcript
             row.transcript_fetched_at = datetime.now(timezone.utc)
             db.flush()
-            from src.agents.events.ingestion import publish_cora_event
             publish_cora_event({
                 "event_type": "call_transcribed",
                 "subscriber_id": row.subscriber_id,
@@ -1705,7 +1705,7 @@ def event_feed(
             "leads": [],
         }
 
-    if subscriber.status not in ("active", "grace", "disputed"):
+    if subscriber.status not in ("active", "grace", "disputed", "past_due"):
         raise HTTPException(status_code=403, detail={"error": "subscription_inactive", "message": "Subscription is not active"})
 
     # 2. Get subscriber's locked ZIP codes
@@ -1849,6 +1849,26 @@ def event_feed(
                 )
         except Exception:
             pass
+
+        if subscriber.tier == "free" and _blurred_stack and page == 1:
+            try:
+                from src.core.redis_client import redis_available, rget, rset
+                _cooldown_key = f"wall_abandon_fired:{subscriber.id}"
+                if not redis_available() or not rget(_cooldown_key):
+                    publish_cora_event({
+                        "event_type": "wall_session_abandoned",
+                        "subscriber_id": subscriber.id,
+                        "payload": {
+                            "vertical": subscriber.vertical or "",
+                            "zip_code": subscriber.lock_candidate_zip or "",
+                        },
+                    })
+                    if redis_available():
+                        rset(_cooldown_key, "1", ttl_seconds=4 * 3600)
+            except Exception:
+                logger.warning(
+                    "wall_session_abandoned publish failed: subscriber=%s", subscriber.id,
+                )
 
         return {
             "feed_uuid": feed_uuid,
@@ -2190,7 +2210,7 @@ def feed_stats(feed_uuid: str, db: Session = Depends(get_db), _auth=Depends(get_
     if not subscriber:
         raise HTTPException(status_code=404, detail={"error": "not_found", "message": "Feed not found"})
 
-    if subscriber.status not in ("active", "grace", "disputed"):
+    if subscriber.status not in ("active", "grace", "disputed", "past_due"):
         raise HTTPException(status_code=403, detail={"error": "subscription_inactive", "message": "Subscription is not active"})
 
     try:
@@ -3062,7 +3082,7 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, request: Request, db: S
     except OperationalError:
         raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
 
-    if not subscriber or subscriber.status not in ("active", "grace"):
+    if not subscriber or subscriber.status not in ("active", "grace", "past_due"):
         raise HTTPException(status_code=403, detail={"error": "unauthorized", "message": "Active subscription required"})
 
     if payload.vertical not in VALID_VERTICALS:
@@ -3204,7 +3224,7 @@ def auto_mode_checkout(payload: AutoModeCheckoutRequest, db: Session = Depends(g
     except OperationalError:
         raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
 
-    if not subscriber or subscriber.status not in ("active", "grace"):
+    if not subscriber or subscriber.status not in ("active", "grace", "past_due"):
         raise HTTPException(status_code=403, detail={"error": "unauthorized", "message": "Active subscription required"})
 
     # Confirmed policy: do NOT create the Stripe customer inline. Subscriber
@@ -3414,7 +3434,7 @@ def hot_lead_unlock(payload: HotLeadUnlockRequest, db: Session = Depends(get_db)
     ).scalar_one_or_none()
     if not subscriber:
         raise HTTPException(status_code=404, detail="Subscriber not found")
-    if subscriber.status not in ("active", "grace"):
+    if subscriber.status not in ("active", "grace", "past_due"):
         raise HTTPException(status_code=403, detail="Active subscription required")
     if not subscriber.stripe_customer_id:
         raise HTTPException(status_code=400, detail="No Stripe customer linked")
@@ -4861,6 +4881,7 @@ def list_human_close(
                 "closer_assigned": r.closer_assigned,
                 "posted_at": r.posted_at.isoformat() if r.posted_at else None,
                 "post_attempts": r.post_attempts,
+                "context_json": r.context_json,
             }
             for r in rows
         ],
@@ -5494,7 +5515,7 @@ def bundle_checkout(req: BundleCheckoutRequest, request: Request, db: Session = 
     sub = db.execute(
         select(Subscriber).where(Subscriber.event_feed_uuid == req.feed_uuid)
     ).scalar_one_or_none()
-    if not sub or sub.status not in ("active", "grace"):
+    if not sub or sub.status not in ("active", "grace", "past_due"):
         raise HTTPException(status_code=403, detail="Active subscription required")
 
     if not is_available(req.bundle_type, sub.id, db):

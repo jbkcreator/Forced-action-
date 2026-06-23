@@ -32,6 +32,8 @@ from langgraph.graph import END, START, StateGraph
 from src.agents.subgraphs.decision_hierarchy import run_decision_hierarchy
 from src.agents.tools.read_tools import get_subscriber_profile
 from src.core.database import get_db_context
+from src.services.allotment_engine import consume as allotment_consume
+from src.services.compliance_gator import validate_outbound
 from src.services.synthflow_client import initiate_call
 from src.services.kill_switch_service import get_cached_metric
 
@@ -76,15 +78,14 @@ class VoiceDropState(TypedDict, total=False):
     followup_sent: bool
     followup_skipped_reason: str
     terminal_status: str
-    failure_reason: str
+    failure_reason: Optional[str]
 
 
 def _node_assemble_context(state: VoiceDropState) -> VoiceDropState:
     from config.settings import get_settings
-    from src.core.models import Subscriber, ManualActionLog
     from sqlalchemy import text
 
-    subscriber_id = state["subscriber_id"]
+    subscriber_id: int = state.get("subscriber_id", 0)
     profile = get_subscriber_profile(subscriber_id)
     if not profile:
         return {"terminal_status": "aborted", "failure_reason": "voice_drop:subscriber_not_found"}
@@ -112,7 +113,6 @@ def _node_assemble_context(state: VoiceDropState) -> VoiceDropState:
     # Dedup: skip if voice drop logged within last 7 days
     try:
         with get_db_context() as db:
-            from sqlalchemy import select
             cutoff = datetime.now(timezone.utc).timestamp() - 7 * 86400
             recent = db.execute(
                 text(
@@ -141,7 +141,7 @@ def _node_hierarchy_check(state: VoiceDropState) -> VoiceDropState:
         return {}
 
     hierarchy = run_decision_hierarchy({
-        "subscriber_id": state["subscriber_id"],
+        "subscriber_id": state.get("subscriber_id", 0),
         "graph_name": GRAPH_NAME,
         "kill_switch_feature": KILL_SWITCH_FEATURE,
         "kill_switch_observed_value": get_cached_metric(KILL_SWITCH_FEATURE),
@@ -152,14 +152,14 @@ def _node_hierarchy_check(state: VoiceDropState) -> VoiceDropState:
         return {
             "action_allowed": False,
             "action_blocked_reason": hierarchy.get("action_blocked_reason", "unknown"),
-            "kill_switch_color": hierarchy.get("kill_switch_color"),
+            "kill_switch_color": hierarchy.get("kill_switch_color") or "",
             "terminal_status": "aborted",
             "failure_reason": hierarchy.get("action_blocked_reason", "hierarchy_blocked"),
         }
 
     return {
         "action_allowed": True,
-        "kill_switch_color": hierarchy.get("kill_switch_color"),
+        "kill_switch_color": hierarchy.get("kill_switch_color") or "",
     }
 
 
@@ -186,11 +186,16 @@ def _node_initiate_drop(state: VoiceDropState) -> VoiceDropState:
         if created_at else 0
     )
 
+    subscriber_id: int = state.get("subscriber_id", 0)
+    decision_id: str = state.get("decision_id", "")
+    phone: str = state.get("phone", "")
+    agent_id: str = state.get("agent_id", "")
+
     context = {
-        "subscriber_id": state["subscriber_id"],
+        "subscriber_id": subscriber_id,
         "subscriber_name": profile.get("name"),
         "vertical": state.get("vertical"),
-        "decision_id": state["decision_id"],
+        "decision_id": decision_id,
         # Revenue recovery variables — empty strings when not a recovery call
         "offer_type": offer_type,
         "offer_label": _OFFER_LABELS.get(offer_type, ""),
@@ -199,9 +204,47 @@ def _node_initiate_drop(state: VoiceDropState) -> VoiceDropState:
         "zip_code": profile.get("territory_zip", ""),
     }
 
+    try:
+        with get_db_context() as db:
+            compliance = validate_outbound(
+                phone=phone,
+                channel="voice",
+                db=db,
+                zip_code=profile.get("territory_zip") or None,
+            )
+            if not compliance.allowed:
+                logger.info(
+                    "voice_drop blocked by compliance gate: subscriber=%s reason=%s",
+                    subscriber_id,
+                    compliance.reason,
+                )
+                return {
+                    "call_id": None,
+                    "sent": False,
+                    "terminal_status": "aborted",
+                    "failure_reason": f"compliance:{compliance.reason}",
+                }
+
+            # Allotment gate — wallet holders are unlimited; free-tier subscribers
+            # are capped at 1 voicemail/week. consume() handles both cases.
+            if not allotment_consume(subscriber_id, "voicemail", db):
+                logger.info(
+                    "voice_drop blocked by allotment cap: subscriber=%s",
+                    subscriber_id,
+                )
+                return {
+                    "call_id": None,
+                    "sent": False,
+                    "terminal_status": "aborted",
+                    "failure_reason": "allotment:voicemail_weekly_cap",
+                }
+    except (KeyError, AttributeError):
+        # compliance or allotment raised unexpectedly — propagate to LangGraph
+        raise
+
     call_id = initiate_call(
-        phone=state["phone"],
-        agent_id=state["agent_id"],
+        phone=phone,
+        agent_id=agent_id,
         context=context,
     )
 
@@ -213,7 +256,7 @@ def _node_initiate_drop(state: VoiceDropState) -> VoiceDropState:
             week_start = today - timedelta(days=today.weekday())
             with get_db_context() as db:
                 log_row = ManualActionLog(
-                    subscriber_id=state["subscriber_id"],
+                    subscriber_id=subscriber_id,
                     action_type=_VOICE_DROP_ACTION_TYPE,
                     week_start=week_start,
                 )
@@ -283,7 +326,7 @@ def _node_followup_sms(state: VoiceDropState) -> VoiceDropState:
                 body=body,
                 db=db,
                 message_type="marketing",
-                subscriber_id=state["subscriber_id"],
+                subscriber_id=state.get("subscriber_id"),
                 task_type="synthflow_voice_drop_followup",
                 campaign=GRAPH_NAME,
                 decision_id=state.get("decision_id"),
@@ -308,7 +351,7 @@ def _node_finalize(state: VoiceDropState) -> VoiceDropState:
     # → synthflow_calls) can't see the dispatch.
     try:
         log_decision(
-            decision_id=state["decision_id"],
+            decision_id=state.get("decision_id", ""),
             graph_name=GRAPH_NAME,
             subscriber_id=state.get("subscriber_id"),
             event_type=state.get("event_type"),
