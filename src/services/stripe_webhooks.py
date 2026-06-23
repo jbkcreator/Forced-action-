@@ -544,6 +544,40 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
 
     db.flush()  # get subscriber.id before ZIP territory inserts
 
+    # ── B1/M9: activate the bridged Customer Account + record MRR ────────────
+    # The only production entrypoint that seeds customer_accounts. Map the tier
+    # to a plan; if the tier isn't in the catalog yet (legacy/founding), skip
+    # activation rather than break checkout. Idempotent on the subscription id
+    # so a stale-replayed checkout never double-counts MRR. Fully defensive —
+    # the S1 ledger must never roll back the proven subscriber-creation path.
+    try:
+        from src.services.revenue_engine import (
+            get_or_create_account, plan_id_for_tier, record_subscription_active,
+        )
+        plan_id = plan_id_for_tier(db, tier)
+        if plan_id is not None:
+            account = get_or_create_account(
+                db, stripe_customer_id=stripe_customer_id, subscriber_id=subscriber.id,
+            )
+            record_subscription_active(
+                db, account,
+                plan_id=plan_id,
+                stripe_subscription_id=stripe_subscription_id,
+                current_period_end=None,
+                stripe_event_id=f"checkout:{stripe_subscription_id}" if stripe_subscription_id else None,
+                now=now,
+            )
+        else:
+            logger.warning(
+                "checkout: no plan mapped for tier=%s — skipping S1 account activation "
+                "(customer=%s)", tier, stripe_customer_id,
+            )
+    except Exception:
+        logger.error(
+            "revenue_engine checkout activation failed for customer %s",
+            stripe_customer_id, exc_info=True,
+        )
+
     # ── Race-free saved-card flag (fa016 followup #20) ───────────────────────
     # We're in the same transaction that just committed the Subscriber row, so
     # there's no race against payment_method.attached / payment_intent.succeeded
@@ -962,6 +996,18 @@ def _on_payment_succeeded(invoice: dict, db: Session) -> None:
     subscriber.recovery_day1_sent = False
     subscriber.recovery_day3_sent = False
 
+    # B1/M9: a cleared invoice restores a past_due Customer Account to active.
+    try:
+        from src.services.revenue_engine import account_by_stripe_customer, record_recovery
+        account = account_by_stripe_customer(db, stripe_customer_id)
+        if account is not None:
+            record_recovery(db, account)
+    except Exception:
+        logger.error(
+            "revenue_engine recovery mirror failed for customer %s",
+            stripe_customer_id, exc_info=True,
+        )
+
     logger.info(
         "invoice.payment_succeeded: subscriber=%s billing_date=%s",
         subscriber.id, subscriber.billing_date,
@@ -1177,6 +1223,20 @@ def _on_payment_failed(invoice: dict, db: Session) -> None:
     subscriber.recovery_day3_sent = False
     db.flush()
 
+    # B1/M9: mark the bridged Customer Account past_due. Do NOT change
+    # subscriber.status — 'grace' is the cancellation state and would forfeit
+    # the ZIP. Defensive: never let the S1 mirror break the legacy path.
+    try:
+        from src.services.revenue_engine import account_by_stripe_customer, record_past_due
+        account = account_by_stripe_customer(db, stripe_customer_id)
+        if account is not None:
+            record_past_due(db, account)
+    except Exception:
+        logger.error(
+            "revenue_engine past_due mirror failed for customer %s",
+            stripe_customer_id, exc_info=True,
+        )
+
     try:
         push_subscriber_to_ghl(subscriber, stage=None, tags=["payment_failed"])
     except Exception:
@@ -1336,6 +1396,37 @@ def _on_subscription_updated(subscription: dict, db: Session) -> None:
         subscriber.id, stripe_status, new_status, cancel_at_period_end,
     )
 
+    # ── B1/M9: record plan-change MRR movement (expansion / contraction) ─────
+    # Only when the subscription is active and the new price maps to a known
+    # plan. record_subscription_active recomputes the run-rate and writes a
+    # movement only if it actually changed (a no-op plan touch records nothing).
+    # Idempotent on (subscription, run-rate) so replays don't double-count.
+    if stripe_status == "active":
+        try:
+            from src.services.revenue_engine import (
+                get_or_create_account, plan_id_for_price, record_subscription_active,
+            )
+            items = (subscription.get("items") or {}).get("data") or []
+            price_id = (items[0].get("price") or {}).get("id") if items else None
+            plan_id = plan_id_for_price(db, price_id)
+            if plan_id is not None:
+                account = get_or_create_account(
+                    db, stripe_customer_id=stripe_customer_id, subscriber_id=subscriber.id,
+                )
+                sub_id = subscription.get("id")
+                record_subscription_active(
+                    db, account,
+                    plan_id=plan_id,
+                    stripe_subscription_id=sub_id,
+                    current_period_end=None,
+                    stripe_event_id=f"subupd:{sub_id}:{plan_id}" if sub_id else None,
+                )
+        except Exception:
+            logger.error(
+                "revenue_engine subscription.updated movement failed for customer %s",
+                stripe_customer_id, exc_info=True,
+            )
+
     # Send cancellation email when cancel_at is set (scheduled cancellation)
     cancel_at = subscription.get("cancel_at")
     if cancel_at and subscriber.email:
@@ -1476,6 +1567,24 @@ def _on_subscription_deleted(subscription: dict, db: Session) -> None:
     subscriber.payment_failed_at = None
     subscriber.recovery_day1_sent = False
     subscriber.recovery_day3_sent = False
+
+    # B1/M9: churn the bridged Customer Account (status -> churned, mrr -> 0,
+    # churn movement). is_involuntary is derived from the account's past_due state.
+    try:
+        from src.services.revenue_engine import account_by_stripe_customer, record_churn
+        account = account_by_stripe_customer(db, stripe_customer_id)
+        if account is not None:
+            sub_id = subscription.get("id")
+            record_churn(
+                db, account,
+                stripe_event_id=f"subdel:{sub_id}" if sub_id else None,
+                effective_at=now,
+            )
+    except Exception:
+        logger.error(
+            "revenue_engine churn mirror failed for customer %s",
+            stripe_customer_id, exc_info=True,
+        )
 
     # Set ZIP territories to grace — they remain locked for 48hr
     territories = db.execute(
