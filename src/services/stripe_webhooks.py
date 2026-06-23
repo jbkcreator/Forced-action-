@@ -228,6 +228,7 @@ def handle_webhook(raw_body: bytes, sig_header: str, db: Session) -> tuple[bool,
         "charge.refunded":                _on_charge_refunded,
         "charge.dispute.created":         _on_dispute_created,
         "charge.dispute.funds_withdrawn": _on_dispute_funds_withdrawn,
+        "checkout.session.expired":       _on_checkout_expired,
     }
 
     # Standalone products share this endpoint + signing secret. Check ownership
@@ -3660,6 +3661,52 @@ def _send_lead_pack_email(
         ),
         body_html=body_html,
     )
+
+
+# ---------------------------------------------------------------------------
+# checkout.session.expired — abandonment signal for hot lead unlock
+# ---------------------------------------------------------------------------
+
+def _on_checkout_expired(session: dict, db: Session) -> None:
+    """
+    Fires when a Stripe checkout session expires without payment.
+    For hot_lead_unlock sessions opened by free-tier subscribers, publish
+    abandonment_click_no_complete to Cora so the retention flow can trigger.
+    Subscription and lead-pack sessions are intentionally ignored here.
+    """
+    meta = session.get("metadata") or {}
+    if meta.get("product") != "hot_lead_unlock":
+        return
+
+    stripe_customer_id = session.get("customer")
+    if not stripe_customer_id:
+        return
+
+    from sqlalchemy import text
+    row = db.execute(
+        text("SELECT id, tier, vertical FROM subscribers WHERE stripe_customer_id = :cid LIMIT 1"),
+        {"cid": stripe_customer_id},
+    ).fetchone()
+    if not row or row[1] != "free":
+        return
+
+    subscriber_id, _, vertical = row
+    lead_id = meta.get("lead_id", "")
+
+    try:
+        from src.agents.events.ingestion import publish_cora_event
+        publish_cora_event({
+            "event_type": "abandonment_click_no_complete",
+            "subscriber_id": subscriber_id,
+            "payload": {
+                "lead_id": lead_id,
+                "vertical": vertical or "",
+            },
+        })
+    except Exception:
+        logger.warning(
+            "abandonment_click_no_complete publish failed: subscriber=%s", subscriber_id,
+        )
 
 
 def _send_lead_pack_refund_email(
