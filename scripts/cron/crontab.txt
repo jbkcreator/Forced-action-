@@ -305,8 +305,13 @@ COUNTY_ID=hillsborough
 # ── HEALTH CHECK — every 4 hours (logs to separate file for monitoring)
 0 2,6,10,14,18,22 * * * $PROJECT/scripts/cron/run.sh src.tasks.health_check
 
-# Unmatched record rematch — Sunday 03:30 AM UTC
+# Standard score-based re-match — Sunday 03:30 UTC (Hillsborough)
 30 3 * * 0 $PROJECT/scripts/cron/run.sh src.tasks.rematch_unmatched
+
+# LLM batch promote of pending_review — staggered >1h apart (each run polls up to 1h)
+# Pinellas 04:00, Hillsborough 05:30 — no overlap, each with its own log file.
+0 4 * * 0  $PROJECT/scripts/cron/run.sh src.tasks.rematch_unmatched --llm-only --batch --county pinellas     --log-name rematch_llm_pinellas
+30 5 * * 0 $PROJECT/scripts/cron/run.sh src.tasks.rematch_unmatched --llm-only --batch --county hillsborough --log-name rematch_llm_hillsborough
 
 # ── DBPR CONTRACTOR REGISTRY ─────────────────────────────────────────────────
 # Weekly file sync — Sunday 02:00 AM UTC (before enrichment jobs start).
