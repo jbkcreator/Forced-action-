@@ -29,6 +29,12 @@ from config.settings import get_settings
 from src.core.database import get_db_context
 from src.core.models import DistressScore, EnrichedContact, Owner, Property
 from src.services.enrichment_log import log_usage
+from src.services.event_bus import emit_event, mark_processed
+from src.services.prospect_service import (
+    best_ec as _best_ec,
+    dedupe_after_cascade,
+    get_or_create_prospect as _get_or_create_prospect,
+)
 from src.services.skip_trace_result import compute_confidence
 from src.utils.logger import get_logger
 
@@ -146,6 +152,8 @@ def _stamp_confidence(session, property_id: int, source: str, confidence: float)
     if ec:
         ec.confidence = confidence
         session.flush()
+
+
 
 
 # ─── Triangulation inline hook ───────────────────────────────────────────────
@@ -498,9 +506,144 @@ def run_cascade(
 
     stats.misses = stats.total_leads - stats.hits
 
+    # ── M2: Prospect creation + contactability stamping + event emission ───────
+    # Runs once after all cascade stages. Uses resolved_ids and spent_cents
+    # which are already computed above — no extra API calls.
+    with get_db_context() as session:
+        property_ids: dict[int, int] = {}   # owner_id → property_id
+        for owner_id in all_owner_ids:
+            owner = session.get(Owner, owner_id)
+            if owner:
+                property_ids[owner_id] = owner.property_id
+
+        for owner_id, property_id in property_ids.items():
+            try:
+                prospect_id = _get_or_create_prospect(session, property_id)
+
+                if owner_id in resolved_ids:
+                    state      = "contactable"
+                    event_type = "enrichment.completed"
+                    ec         = _best_ec(session, property_id)
+                else:
+                    state      = "exhausted"
+                    event_type = "enrichment.failed"
+                    ec         = None
+
+                session.execute(sa_text("""
+                    UPDATE prospects
+                    SET contactability_state = :state, updated_at = NOW()
+                    WHERE prospect_id = :pid
+                """), {"state": state, "pid": prospect_id})
+
+                emit_event(
+                    session,
+                    event_type=event_type,
+                    actor="cascade",
+                    source_component="skip_trace_waterfall",
+                    prospect_id=prospect_id,
+                    payload={
+                        "property_id":        property_id,
+                        "contactability_state": state,
+                        "enriched_contact_id": ec.id if ec else None,
+                        "source":             ec.source if ec else None,
+                        "confidence":         float(ec.confidence) if ec and ec.confidence else None,
+                        "total_cost_cents":   spent_cents.get(owner_id, 0),
+                    },
+                )
+            except Exception:
+                logger.warning(
+                    "[Cascade] M2 prospect stamp failed for owner_id=%d property_id=%d",
+                    owner_id, property_id, exc_info=True,
+                )
+
+        dedupe_after_cascade(session, list(property_ids.values()))
+        session.commit()
+
     logger.info(
         "[Cascade] DONE leads=%d hits=%d misses=%d cost_cents=%d",
         stats.total_leads, stats.hits, stats.misses, stats.total_cost_cents,
+    )
+    return stats
+
+
+# ─── Event-driven entry point ────────────────────────────────────────────────
+
+_CASCADE_CONSUMER = "cascade"
+_EVENT_POLL_LIMIT = 500
+
+
+def consume_prospect_created(county_id: str = "hillsborough") -> WaterfallStats:
+    """
+    Event-driven cascade: poll unprocessed prospect.created events and enrich
+    each eligible property via run_cascade().
+
+    Eligibility guard (same as _select_candidates): owner has no phone and
+    has not been traced by Tracerfy or BatchData. Already-enriched properties
+    are skipped but their events are still marked processed.
+
+    Delivery: at-least-once. Events are marked processed AFTER cascade so a
+    crash mid-run allows the next invocation to re-pick them up. The cascade
+    itself is idempotent (already-traced guard, ON CONFLICT DO NOTHING on
+    prospect insert).
+    """
+    with get_db_context() as session:
+        event_rows = session.execute(sa_text("""
+            SELECT e.event_id,
+                   (e.payload->>'property_id')::int AS property_id
+            FROM events e
+            LEFT JOIN processed_events pe
+                ON pe.event_id = e.event_id
+               AND pe.consumer  = :consumer
+            WHERE e.event_type = 'prospect.created'
+              AND pe.event_id IS NULL
+            ORDER BY e.occurred_at
+            LIMIT :lim
+        """), {"consumer": _CASCADE_CONSUMER, "lim": _EVENT_POLL_LIMIT}).fetchall()
+
+    if not event_rows:
+        logger.info("[Cascade] no unprocessed prospect.created events")
+        return WaterfallStats()
+
+    property_event: dict[int, object] = {r.property_id: r.event_id for r in event_rows}
+    property_ids = list(property_event.keys())
+
+    logger.info("[Cascade] consume_prospect_created — %d events to process", len(event_rows))
+
+    # Translate to owner_ids, applying eligibility guard
+    with get_db_context() as session:
+        owner_rows = session.execute(sa_text("""
+            SELECT o.id AS owner_id, o.property_id
+            FROM owners o
+            JOIN properties pr ON pr.id = o.property_id
+            WHERE o.property_id = ANY(:pids)
+              AND (o.phone_1 IS NULL OR trim(o.phone_1) = '')
+              AND NOT EXISTS (
+                  SELECT 1 FROM enriched_contacts ec
+                  WHERE ec.property_id = o.property_id
+                    AND ec.source IN ('tracerfy', 'batch_skip_tracing')
+              )
+              AND pr.address IS NOT NULL AND pr.address != ''
+              AND pr.zip    IS NOT NULL AND pr.zip    != ''
+        """), {"pids": property_ids}).fetchall()
+
+    owner_ids = [r.owner_id for r in owner_rows]
+
+    stats = WaterfallStats()
+    if owner_ids:
+        stats = run_cascade(owner_ids=owner_ids)
+    else:
+        logger.info("[Cascade] all %d properties already enriched — marking events processed",
+                    len(property_ids))
+
+    # Mark all polled events processed regardless of eligibility
+    with get_db_context() as session:
+        for event_id in property_event.values():
+            mark_processed(session, event_id, _CASCADE_CONSUMER)
+        session.commit()
+
+    logger.info(
+        "[Cascade] consume_prospect_created done — events=%d eligible=%d hits=%d misses=%d",
+        len(event_rows), len(owner_ids), stats.hits, stats.misses,
     )
     return stats
 
