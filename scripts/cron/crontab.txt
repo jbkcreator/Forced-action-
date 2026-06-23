@@ -291,6 +291,12 @@ COUNTY_ID=hillsborough
 0 3 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.referral_forward_pack_task
 
 # ── WEEKLY REPORT ────────────────────────────────────────────
+
+# CDS Tier Conversion Report (E29) — Monday 07:00 UTC. Runs before the autonomy
+# report (08:45) so both land in the same Monday morning digest. 90-day rolling
+# window per county; writes learning_cards + posts to Slack.
+0 7 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.weekly_conversion_report
+
 # Weekly Report — Monday @ 09:00 AM UTC / 05:00 AM EDT / 02:30 PM IST (after GHL sync)
 0 9 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.weekly_report
 
@@ -463,6 +469,10 @@ COUNTY_ID=hillsborough
 
 # Human close retry — nightly 01:30 UTC. Retries failed Slack posts (max 3 attempts).
 30 1 * * * $PROJECT/scripts/cron/run.sh src.tasks.human_close_retry
+
+# Human close SLA sweep — daily 14:00 UTC. Alerts on escalations unclaimed 24–48h after routing.
+# The 24–48h window fires exactly one re-alert per escalation (no repeat noise).
+0 14 * * * $PROJECT/scripts/cron/run.sh src.tasks.human_close_sla_sweep
 
 # Stripe webhook event retention — Sunday 04:00 UTC. Deletes
 # StripeWebhookEvent rows older than 90 days (Stripe retries cap at 30 days,

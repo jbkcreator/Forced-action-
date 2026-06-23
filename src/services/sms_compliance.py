@@ -30,6 +30,7 @@ from sqlalchemy.orm import Session
 from config.settings import settings
 from src.core.models import SmsDeadLetter, SmsOptIn, SmsOptOut, SmsSendLog
 from src.services import phone_utils
+from src.services.allotment_engine import consume as allotment_consume
 from src.services.telnyx_sms import TelnyxSMSError, send_message as telnyx_send_message
 
 logger = logging.getLogger(__name__)
@@ -199,7 +200,13 @@ def add_to_dead_letter(
     Write a failed or blocked SMS event to the dead-letter queue for manual review.
     reason must be one of: opt_out / delivery_failed / error / unresolvable / quiet_hours / no_opt_in
     """
-    valid_reasons = {"opt_out", "delivery_failed", "error", "unresolvable", "quiet_hours", "no_opt_in", "subscriber_sms_frequency_cap"}
+    valid_reasons = {
+        "opt_out", "delivery_failed", "error", "unresolvable",
+        "quiet_hours", "no_opt_in", "subscriber_sms_frequency_cap",
+        "do_not_text_tag",
+        "prospect_not_contactable", "prospect_sms_consent_withdrawn",
+        "free_tier_outbound_text_allotment",
+    }
     if reason not in valid_reasons:
         logger.warning("Invalid DLQ reason '%s' — defaulting to 'error'", reason)
         reason = "error"
@@ -223,6 +230,7 @@ def send_sms(
     campaign: Optional[str] = None,
     variant_id: Optional[str] = None,
     decision_id: Optional[str] = None,
+    prospect_id: Optional[str] = None,
 ) -> bool:
     """
     Central outbound SMS dispatcher.
@@ -260,7 +268,30 @@ def send_sms(
             variant_id=variant_id,
             decision_id=decision_id,
             body_preview=body[:160],
+            prospect_id=prospect_id,
         )
+
+    # P1. Prospect contactability gate — only when sending in context of a prospect
+    if prospect_id:
+        from sqlalchemy import text as sa_text
+        _state_row = db.execute(
+            sa_text("SELECT contactability_state FROM prospects WHERE prospect_id = CAST(:pid AS uuid)"),
+            {"pid": prospect_id},
+        ).fetchone()
+        if not _state_row or _state_row.contactability_state != "contactable":
+            logger.info("SMS suppressed (prospect_not_contactable): prospect_id=%s", prospect_id)
+            add_to_dead_letter(to, "prospect_not_contactable", {"body": body[:160], "prospect_id": prospect_id}, db)
+            _log("suppressed", suppress_reason="prospect_not_contactable")
+            return False
+
+    # P2. Prospect channel consent gate — channel_consent.sms must be explicitly True
+    if prospect_id:
+        from src.services.prospect_service import get_channel_consent
+        if get_channel_consent(db, prospect_id, "sms") is not True:
+            logger.info("SMS suppressed (prospect_sms_consent_withdrawn): prospect_id=%s", prospect_id)
+            add_to_dead_letter(to, "prospect_sms_consent_withdrawn", {"body": body[:160], "prospect_id": prospect_id}, db)
+            _log("suppressed", suppress_reason="prospect_sms_consent_withdrawn")
+            return False
 
     # 0. Unified compliance gate — DNC, opt-out, quiet hours (replaces can_send + is_quiet_hours)
     from src.services.compliance_gator import validate_outbound as _compliance_gate
@@ -274,11 +305,11 @@ def send_sms(
         _dlq_key: str = _result.reason or ""
         logger.info("SMS suppressed (%s): to=%s", _result.reason, to)
         add_to_dead_letter(to, _dlq_map.get(_dlq_key, "opt_out"), {"body": body[:160]}, db)
-        _log("suppressed", suppress_reason=_result.reason)
+        _log("suppressed", suppress_reason=_dlq_map.get(_dlq_key, "opt_out"))
         return False
 
-    # 2. Opt-in gate — marketing requires confirmed consent
-    if message_type == "marketing" and not has_opted_in(to, db):
+    # 2. Opt-in gate — marketing requires confirmed consent (subscribers only; prospects use P2 above)
+    if message_type == "marketing" and not prospect_id and not has_opted_in(to, db):
         logger.info("SMS suppressed (no opt-in): to=%s", to)
         add_to_dead_letter(to, "no_opt_in", {"body": body[:160]}, db)
         _log("suppressed", suppress_reason="no_opt_in")
@@ -297,8 +328,8 @@ def send_sms(
             _log("suppressed", suppress_reason="do_not_text_tag")
             return False
 
-    # 3. Per-subscriber marketing frequency cap — applied globally regardless of campaign.
-    # Transactional, opt_in_prompt, and messages without a known subscriber_id bypass this gate.
+    # 3. Per-subscriber marketing frequency cap and free-tier weekly allotment.
+    # Transactional, opt_in_prompt, and messages without a known subscriber_id bypass both gates.
     if message_type == "marketing" and subscriber_id is not None:
         if _check_marketing_frequency_cap(subscriber_id, db):
             logger.info(
@@ -307,6 +338,15 @@ def send_sms(
             )
             add_to_dead_letter(to, "subscriber_sms_frequency_cap", {"body": body[:160]}, db)
             _log("suppressed", suppress_reason="subscriber_sms_frequency_cap")
+            return False
+
+        if not allotment_consume(subscriber_id, "outbound_text", db):
+            logger.info(
+                "SMS suppressed (free_tier_outbound_text_allotment): subscriber_id=%s to=%s",
+                subscriber_id, to,
+            )
+            add_to_dead_letter(to, "free_tier_outbound_text_allotment", {"body": body[:160]}, db)
+            _log("suppressed", suppress_reason="free_tier_outbound_text_allotment")
             return False
 
     # 6. Dry-run path (TELNYX_SMS_ENABLED=false)

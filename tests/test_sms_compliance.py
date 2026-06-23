@@ -16,6 +16,7 @@ import pytest
 from sqlalchemy import select
 
 import src.services.sms_compliance  # noqa: F401 — ensure module importable
+from src.services.compliance_gator import ComplianceResult
 
 from src.services.sms_compliance import (
     _extract_stop_keyword,
@@ -232,14 +233,10 @@ class TestSendSmsUnit:
 
     def test_quiet_hours_returns_false_and_dlqs_with_correct_reason(self):
         db = MagicMock()
-        with patch("src.services.sms_compliance.can_send", return_value=True), \
-             patch("src.services.sms_compliance.has_opted_in", return_value=True), \
-             patch("src.services.sms_compliance.is_quiet_hours", return_value=True), \
-             patch("src.services.sms_compliance.settings") as mock_s:
-            mock_s.sms_quiet_hours_enabled = True
-            mock_s.telnyx_sandbox = False
-            with patch("src.services.sms_compliance.add_to_dead_letter") as mock_dlq:
-                result = send_sms("+18135550100", "Hello", db, message_type="transactional")
+        _quiet_result = ComplianceResult(allowed=False, reason="quiet_hours")
+        with patch("src.services.compliance_gator.validate_outbound", return_value=_quiet_result), \
+             patch("src.services.sms_compliance.add_to_dead_letter") as mock_dlq:
+            result = send_sms("+18135550100", "Hello", db, message_type="transactional")
         assert result is False
         mock_dlq.assert_called_once()
         _, reason, _ = mock_dlq.call_args[0][:3]
@@ -247,11 +244,12 @@ class TestSendSmsUnit:
 
     def test_dry_run_returns_true_without_telnyx(self):
         db = MagicMock()
-        with patch("src.services.sms_compliance.can_send", return_value=True), \
-             patch("src.services.sms_compliance.is_quiet_hours", return_value=False):
-            with patch("src.services.sms_compliance.settings") as mock_settings:
-                mock_settings.telnyx_sms_enabled = False
-                result = send_sms("+18135550100", "Hello", db)
+        _allowed = ComplianceResult(allowed=True)
+        with patch("src.services.compliance_gator.validate_outbound", return_value=_allowed), \
+             patch("src.services.sms_compliance.has_opted_in", return_value=True), \
+             patch("src.services.sms_compliance.settings") as mock_settings:
+            mock_settings.telnyx_sms_enabled = False
+            result = send_sms("+18135550100", "Hello", db, message_type="transactional")
         assert result is True
 
     def test_telnyx_not_configured_returns_false_and_dlqs(self):
@@ -270,36 +268,38 @@ class TestSendSmsUnit:
 
     def test_telnyx_success_returns_true(self):
         db = MagicMock()
-        with patch("src.services.sms_compliance.can_send", return_value=True), \
-             patch("src.services.sms_compliance.is_quiet_hours", return_value=False):
-            with patch("src.services.sms_compliance.settings") as mock_settings:
-                mock_settings.telnyx_sms_enabled = True
-                mock_settings.telnyx_sms_api_key = "tlnx_key"
-                mock_settings.telnyx_messaging_profile_id = "mp_xxx"
-                mock_settings.telnyx_from_number = "+18005550000"
-                with patch("src.services.sms_compliance.telnyx_send_message") as mock_send:
-                    mock_send.return_value = {
-                        "message_id": "msg_xxx", "status": "queued",
-                        "vendor": "telnyx", "cost_cents": 0,
-                        "sent_at": "2026-05-11T00:00:00",
-                    }
-                    result = send_sms("+18135550100", "Hello", db)
+        _allowed = ComplianceResult(allowed=True)
+        with patch("src.services.compliance_gator.validate_outbound", return_value=_allowed), \
+             patch("src.services.sms_compliance.has_opted_in", return_value=True), \
+             patch("src.services.sms_compliance.settings") as mock_settings:
+            mock_settings.telnyx_sms_enabled = True
+            mock_settings.telnyx_sms_api_key = "tlnx_key"
+            mock_settings.telnyx_messaging_profile_id = "mp_xxx"
+            mock_settings.telnyx_from_number = "+18005550000"
+            with patch("src.services.sms_compliance.telnyx_send_message") as mock_send:
+                mock_send.return_value = {
+                    "message_id": "msg_xxx", "status": "queued",
+                    "vendor": "telnyx", "cost_cents": 0,
+                    "sent_at": "2026-05-11T00:00:00",
+                }
+                result = send_sms("+18135550100", "Hello", db, message_type="transactional")
         assert result is True
 
     def test_telnyx_exception_dlqs_and_returns_false(self):
         from src.services.telnyx_sms import TelnyxSMSError
         db = MagicMock()
-        with patch("src.services.sms_compliance.can_send", return_value=True), \
-             patch("src.services.sms_compliance.is_quiet_hours", return_value=False):
-            with patch("src.services.sms_compliance.settings") as mock_settings:
-                mock_settings.telnyx_sms_enabled = True
-                mock_settings.telnyx_sms_api_key = "tlnx_key"
-                mock_settings.telnyx_messaging_profile_id = "mp_xxx"
-                mock_settings.telnyx_from_number = "+18005550000"
-                with patch("src.services.sms_compliance.telnyx_send_message") as mock_send:
-                    mock_send.side_effect = TelnyxSMSError("Network error")
-                    with patch("src.services.sms_compliance.add_to_dead_letter") as mock_dlq:
-                        result = send_sms("+18135550100", "Hello", db)
+        _allowed = ComplianceResult(allowed=True)
+        with patch("src.services.compliance_gator.validate_outbound", return_value=_allowed), \
+             patch("src.services.sms_compliance.has_opted_in", return_value=True), \
+             patch("src.services.sms_compliance.settings") as mock_settings:
+            mock_settings.telnyx_sms_enabled = True
+            mock_settings.telnyx_sms_api_key = "tlnx_key"
+            mock_settings.telnyx_messaging_profile_id = "mp_xxx"
+            mock_settings.telnyx_from_number = "+18005550000"
+            with patch("src.services.sms_compliance.telnyx_send_message") as mock_send:
+                mock_send.side_effect = TelnyxSMSError("Network error")
+                with patch("src.services.sms_compliance.add_to_dead_letter") as mock_dlq:
+                    result = send_sms("+18135550100", "Hello", db, message_type="transactional")
         assert result is False
         mock_dlq.assert_called_once()
         _, reason, _ = mock_dlq.call_args[0][:3]
@@ -462,8 +462,10 @@ class TestSendSmsMessageTypeGateUnit:
         "telnyx_sandbox": False,
     }
 
+    _allowed = ComplianceResult(allowed=True)
+
     def _dry_run_send(self, db, phone="+18135550100", body="Hi", **kwargs):
-        with patch("src.services.sms_compliance.is_quiet_hours", return_value=False), \
+        with patch("src.services.compliance_gator.validate_outbound", return_value=self._allowed), \
              patch("src.services.sms_compliance.settings") as mock_s:
             mock_s.telnyx_sms_enabled = False
             mock_s.telnyx_sandbox = False
@@ -471,9 +473,8 @@ class TestSendSmsMessageTypeGateUnit:
 
     def test_marketing_no_opt_in_returns_false(self):
         db = MagicMock()
-        with patch("src.services.sms_compliance.can_send", return_value=True), \
+        with patch("src.services.compliance_gator.validate_outbound", return_value=self._allowed), \
              patch("src.services.sms_compliance.has_opted_in", return_value=False), \
-             patch("src.services.sms_compliance.is_quiet_hours", return_value=False), \
              patch("src.services.sms_compliance.add_to_dead_letter") as mock_dlq:
             result = send_sms("+18135550100", "Hello", db, message_type="marketing")
         assert result is False
@@ -483,9 +484,7 @@ class TestSendSmsMessageTypeGateUnit:
 
     def test_transactional_no_opt_in_proceeds_to_dry_run(self):
         db = MagicMock()
-        with patch("src.services.sms_compliance.can_send", return_value=True), \
-             patch("src.services.sms_compliance.has_opted_in", return_value=False), \
-             patch("src.services.sms_compliance.is_quiet_hours", return_value=False), \
+        with patch("src.services.compliance_gator.validate_outbound", return_value=self._allowed), \
              patch("src.services.sms_compliance.settings") as mock_s:
             mock_s.telnyx_sms_enabled = False
             mock_s.telnyx_sandbox = False
@@ -494,9 +493,8 @@ class TestSendSmsMessageTypeGateUnit:
 
     def test_opt_in_prompt_bypasses_opt_in_gate(self):
         db = MagicMock()
-        with patch("src.services.sms_compliance.can_send", return_value=True), \
+        with patch("src.services.compliance_gator.validate_outbound", return_value=self._allowed), \
              patch("src.services.sms_compliance.has_opted_in", return_value=False) as mock_hoi, \
-             patch("src.services.sms_compliance.is_quiet_hours", return_value=False), \
              patch("src.services.sms_compliance.settings") as mock_s:
             mock_s.telnyx_sms_enabled = False
             mock_s.telnyx_sandbox = False
@@ -507,9 +505,8 @@ class TestSendSmsMessageTypeGateUnit:
     def test_invalid_message_type_defaults_to_marketing(self):
         """Unknown message_type falls back to 'marketing' and applies opt-in gate."""
         db = MagicMock()
-        with patch("src.services.sms_compliance.can_send", return_value=True), \
+        with patch("src.services.compliance_gator.validate_outbound", return_value=self._allowed), \
              patch("src.services.sms_compliance.has_opted_in", return_value=False), \
-             patch("src.services.sms_compliance.is_quiet_hours", return_value=False), \
              patch("src.services.sms_compliance.add_to_dead_letter") as mock_dlq:
             result = send_sms("+18135550100", "Hello", db, message_type="unicorn")
         assert result is False
@@ -517,9 +514,10 @@ class TestSendSmsMessageTypeGateUnit:
         assert reason == "no_opt_in"
 
     def test_opt_out_checked_before_opt_in(self):
-        """Gate order: opt-out fires first; opt-in gate never runs if suppressed."""
+        """Gate order: compliance (DNC/opt-out) fires first; opt-in gate never runs if suppressed."""
         db = MagicMock()
-        with patch("src.services.sms_compliance.can_send", return_value=False), \
+        _blocked = ComplianceResult(allowed=False, reason="dnc_or_opted_out")
+        with patch("src.services.compliance_gator.validate_outbound", return_value=_blocked), \
              patch("src.services.sms_compliance.has_opted_in") as mock_hoi, \
              patch("src.services.sms_compliance.add_to_dead_letter"):
             result = send_sms("+18135550100", "Hello", db, message_type="marketing")
@@ -527,24 +525,27 @@ class TestSendSmsMessageTypeGateUnit:
         mock_hoi.assert_not_called()
 
     def test_opt_in_checked_before_quiet_hours(self):
-        """Gate order: opt-in (no consent) fires before quiet-hours check."""
+        """Gate order: compliance allows through, then opt-in (no consent) fires."""
         db = MagicMock()
-        with patch("src.services.sms_compliance.can_send", return_value=True), \
+        with patch("src.services.compliance_gator.validate_outbound", return_value=self._allowed), \
              patch("src.services.sms_compliance.has_opted_in", return_value=False), \
-             patch("src.services.sms_compliance.is_quiet_hours") as mock_qh, \
              patch("src.services.sms_compliance.add_to_dead_letter"):
             result = send_sms("+18135550100", "Hello", db, message_type="marketing")
         assert result is False
-        mock_qh.assert_not_called()
 
 
 class TestSendSmsAuditLogUnit:
     """V3: SmsSendLog written at every send_sms exit point."""
 
     def _call(self, db, *, can=True, opted_in=True, quiet=False, enabled=False, **kwargs):
-        with patch("src.services.sms_compliance.can_send", return_value=can), \
+        if not can:
+            _cr = ComplianceResult(allowed=False, reason="dnc_or_opted_out")
+        elif quiet:
+            _cr = ComplianceResult(allowed=False, reason="quiet_hours")
+        else:
+            _cr = ComplianceResult(allowed=True)
+        with patch("src.services.compliance_gator.validate_outbound", return_value=_cr), \
              patch("src.services.sms_compliance.has_opted_in", return_value=opted_in), \
-             patch("src.services.sms_compliance.is_quiet_hours", return_value=quiet), \
              patch("src.services.sms_compliance.settings") as mock_s:
             mock_s.telnyx_sms_enabled = enabled
             mock_s.telnyx_sandbox = False
@@ -600,8 +601,10 @@ class TestSendSmsAuditLogUnit:
 class TestMessageTypeGateIntegration:
     """Marketing SMS blocked when SmsOptIn row is absent; transactional passes."""
 
+    _allowed = ComplianceResult(allowed=True)
+
     def _dry_run_send(self, db, phone, body, **kwargs):
-        with patch("src.services.sms_compliance.is_quiet_hours", return_value=False), \
+        with patch("src.services.compliance_gator.validate_outbound", return_value=self._allowed), \
              patch("src.services.sms_compliance.settings") as mock_s:
             mock_s.telnyx_sms_enabled = False
             mock_s.telnyx_sandbox = False
@@ -738,10 +741,11 @@ class TestSendOptInPromptV5Unit:
         with patch("src.core.redis_client._get_client", return_value=fake_redis):
             yield
 
+    _allowed = ComplianceResult(allowed=True)
+
     def _dry_run(self, db, phone="+18135550100"):
         with patch("src.services.sms_compliance.has_opted_in", return_value=False), \
-             patch("src.services.sms_compliance.is_quiet_hours", return_value=False), \
-             patch("src.services.sms_compliance.can_send", return_value=True), \
+             patch("src.services.compliance_gator.validate_outbound", return_value=self._allowed), \
              patch("src.services.sms_compliance.settings") as ms:
             ms.telnyx_sms_enabled = False
             ms.telnyx_sandbox = False
@@ -756,8 +760,9 @@ class TestSendOptInPromptV5Unit:
     def test_clears_sentinel_on_send_failure(self, fake_redis):
         from src.services.opt_in_sentinel import _key
         db = MagicMock()
+        _blocked = ComplianceResult(allowed=False, reason="dnc_or_opted_out")
         with patch("src.services.sms_compliance.has_opted_in", return_value=False), \
-             patch("src.services.sms_compliance.can_send", return_value=False), \
+             patch("src.services.compliance_gator.validate_outbound", return_value=_blocked), \
              patch("src.services.sms_compliance.add_to_dead_letter"):
             send_opt_in_prompt("+18135550100", db)
         assert fake_redis.get(_key("+18135550100")) is None
@@ -771,8 +776,10 @@ class TestSendOptInPromptV5Unit:
 
 
 class TestSmsSendLogIntegration:
+    _allowed = ComplianceResult(allowed=True)
+
     def _dry_run_send(self, db, phone, body, **kwargs):
-        with patch("src.services.sms_compliance.is_quiet_hours", return_value=False), \
+        with patch("src.services.compliance_gator.validate_outbound", return_value=self._allowed), \
              patch("src.services.sms_compliance.settings") as mock_s:
             mock_s.telnyx_sms_enabled = False
             mock_s.telnyx_sandbox = False
@@ -795,7 +802,11 @@ class TestSmsSendLogIntegration:
     def test_suppressed_opt_out_writes_log_row(self, fresh_db):
         phone = "+18135550211"
         record_opt_out(phone, "STOP", "inbound_sms", fresh_db)
-        self._dry_run_send(fresh_db, phone, "Hello", message_type="transactional")
+        # Let compliance gate run for real — the phone IS opted out, gate should block it
+        with patch("src.services.sms_compliance.settings") as mock_s:
+            mock_s.telnyx_sms_enabled = False
+            mock_s.telnyx_sandbox = False
+            send_sms(phone, "Hello", fresh_db, message_type="transactional")
         row = fresh_db.execute(
             select(SmsSendLog).where(SmsSendLog.phone == phone)
         ).scalar_one_or_none()
@@ -876,11 +887,14 @@ class TestSmsFrequencyCapUnit:
 
     # ── send_sms gate integration ─────────────────────────────────────────────
 
+    _allowed = ComplianceResult(allowed=True)
+
     def _send(self, db, *, cap_return=False, message_type="marketing", subscriber_id=1, **kwargs):
         """Helper: run send_sms through all gates up to dry-run, controlling the cap check."""
-        with patch("src.services.sms_compliance.can_send", return_value=True), \
+        # Prevent MagicMock db.query().filter().first() from triggering do_not_text gate
+        db.query.return_value.filter.return_value.first.return_value = None
+        with patch("src.services.compliance_gator.validate_outbound", return_value=self._allowed), \
              patch("src.services.sms_compliance.has_opted_in", return_value=True), \
-             patch("src.services.sms_compliance.is_quiet_hours", return_value=False), \
              patch("src.services.sms_compliance._check_marketing_frequency_cap",
                    return_value=cap_return) as mock_cap, \
              patch("src.services.sms_compliance.settings") as mock_s:
@@ -900,9 +914,9 @@ class TestSmsFrequencyCapUnit:
 
     def test_marketing_at_cap_blocked_returns_false(self):
         db = MagicMock()
-        with patch("src.services.sms_compliance.can_send", return_value=True), \
+        db.query.return_value.filter.return_value.first.return_value = None
+        with patch("src.services.compliance_gator.validate_outbound", return_value=self._allowed), \
              patch("src.services.sms_compliance.has_opted_in", return_value=True), \
-             patch("src.services.sms_compliance.is_quiet_hours", return_value=False), \
              patch("src.services.sms_compliance._check_marketing_frequency_cap", return_value=True), \
              patch("src.services.sms_compliance.add_to_dead_letter") as mock_dlq, \
              patch("src.services.sms_compliance.settings") as mock_s:
@@ -918,9 +932,9 @@ class TestSmsFrequencyCapUnit:
     def test_cap_blocked_logs_suppress_reason(self):
         """SmsSendLog row must record suppress_reason='subscriber_sms_frequency_cap'."""
         db = MagicMock()
-        with patch("src.services.sms_compliance.can_send", return_value=True), \
+        db.query.return_value.filter.return_value.first.return_value = None
+        with patch("src.services.compliance_gator.validate_outbound", return_value=self._allowed), \
              patch("src.services.sms_compliance.has_opted_in", return_value=True), \
-             patch("src.services.sms_compliance.is_quiet_hours", return_value=False), \
              patch("src.services.sms_compliance._check_marketing_frequency_cap", return_value=True), \
              patch("src.services.sms_compliance.add_to_dead_letter"), \
              patch("src.services.sms_compliance.settings") as mock_s, \
@@ -950,7 +964,8 @@ class TestSmsFrequencyCapUnit:
     def test_opt_out_still_enforced_before_cap(self):
         """Opt-out check fires before frequency cap — suppressed number never reaches cap check."""
         db = MagicMock()
-        with patch("src.services.sms_compliance.can_send", return_value=False), \
+        _blocked = ComplianceResult(allowed=False, reason="dnc_or_opted_out")
+        with patch("src.services.compliance_gator.validate_outbound", return_value=_blocked), \
              patch("src.services.sms_compliance._check_marketing_frequency_cap") as mock_cap, \
              patch("src.services.sms_compliance.add_to_dead_letter"):
             result = send_sms("+18135550100", "Hello", db,

@@ -7,7 +7,6 @@ when Redis is unavailable (server-only deployment).
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Optional
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -60,7 +59,6 @@ def get_remaining(subscriber_id: int, action: str, db: Session) -> int:
 
 
 def can_perform(subscriber_id: int, action: str, db: Session) -> bool:
-    # Wallet holders are unlimited
     wallet = db.execute(
         select(WalletBalance).where(WalletBalance.subscriber_id == subscriber_id)
     ).scalar_one_or_none()
@@ -70,16 +68,27 @@ def can_perform(subscriber_id: int, action: str, db: Session) -> bool:
 
 
 def consume(subscriber_id: int, action: str, db: Session) -> bool:
-    if not can_perform(subscriber_id, action, db):
-        return False
+    """
+    Attempt to consume one unit of the given action for this subscriber.
 
-    # Wallet holders debit from wallet, not allotment
+    Wallet holders debit from their wallet balance. Free-tier subscribers
+    are gated by the weekly allotment. Any paid subscriber without wallet
+    credits (e.g. a future non-free tier) falls through to the allotment
+    check — callers must NOT add an outer `tier == "free"` guard, as that
+    would bypass this function for paid tiers entirely.
+
+    Returns True if the action is permitted and the usage has been recorded,
+    False if the weekly cap is exhausted.
+    """
     wallet = db.execute(
         select(WalletBalance).where(WalletBalance.subscriber_id == subscriber_id)
     ).scalar_one_or_none()
     if wallet and wallet.credits_remaining > 0:
         from src.services.wallet_engine import debit
         return debit(subscriber_id, action, db)
+
+    if get_remaining(subscriber_id, action, db) <= 0:
+        return False
 
     # Free-tier: increment Redis counter
     from src.core.redis_client import redis_available, rincr
@@ -90,7 +99,6 @@ def consume(subscriber_id: int, action: str, db: Session) -> bool:
 
 def _week_start() -> datetime:
     now = datetime.now(timezone.utc)
-    iso = now.isocalendar()
     # Monday of current ISO week
     day_of_week = now.weekday()  # 0=Monday
     return (now - timedelta(days=day_of_week)).replace(

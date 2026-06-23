@@ -1133,6 +1133,186 @@ def _update_slack_message(candidate: "ExpansionCandidate", reply_text: str) -> N
 
 
 # ===========================================================================
+# WIN-STORY APPROVAL
+# ===========================================================================
+
+
+@router.post("/win-stories/{asset_id}/approve")
+def approve_win_story(
+    asset_id: int,
+    db: Session = Depends(get_db),
+    admin: dict = Depends(get_current_admin),
+):
+    """
+    Approve a staged win-story for public display.
+    Sets is_public=True and records the approver's email.
+    """
+    row = db.execute(
+        sa_text("SELECT id, is_public FROM win_story_assets WHERE id = :id FOR UPDATE"),
+        {"id": asset_id},
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Win-story not found")
+    if row.is_public:
+        return {"ok": True, "detail": "already_public"}
+    db.execute(
+        sa_text("""
+            UPDATE win_story_assets
+               SET is_public = true, approved_by = :by
+             WHERE id = :id
+        """),
+        {"by": admin.get("sub", "admin"), "id": asset_id},
+    )
+    db.commit()
+    logger.info("[WinStory] approved asset_id=%d by=%s", asset_id, admin.get("sub"))
+    return {"ok": True}
+
+
+@router.post("/slack/win-story/interact")
+async def slack_win_story_interact(request: Request, db: Session = Depends(get_db)):
+    """
+    Receives Slack interactive payloads for win-story Approve/Dismiss buttons.
+    Auth: Slack HMAC-SHA256 signature.
+    """
+    raw = await request.body()
+    if not _verify_slack_signature(dict(request.headers), raw):
+        raise HTTPException(status_code=401, detail="Invalid Slack signature")
+
+    try:
+        payload_str = parse_qs(raw.decode("utf-8")).get("payload", ["{}"])[0]
+        payload = json.loads(payload_str)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Malformed payload")
+
+    actions = payload.get("actions", [])
+    if not actions:
+        return _slack_ephemeral("No action in payload.")
+
+    try:
+        action_data = json.loads(actions[0].get("value", "{}"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid action value")
+
+    asset_id = action_data.get("asset_id")
+    action = action_data.get("action")
+    user_id = payload.get("user", {}).get("id", "unknown")
+
+    if not asset_id or action not in ("approve", "dismiss"):
+        raise HTTPException(status_code=400, detail="Invalid action data")
+
+    row = db.execute(
+        sa_text("SELECT id, is_public, proof_text FROM win_story_assets WHERE id = :id FOR UPDATE"),
+        {"id": asset_id},
+    ).fetchone()
+
+    if not row:
+        return _slack_ephemeral(f"Win-story {asset_id} not found.")
+    if row.is_public:
+        return _slack_ephemeral("Already approved.")
+
+    if action == "approve":
+        db.execute(
+            sa_text("""
+                UPDATE win_story_assets
+                   SET is_public = true, approved_by = :by
+                 WHERE id = :id
+            """),
+            {"by": f"slack:{user_id}", "id": asset_id},
+        )
+        db.commit()
+        reply = f":white_check_mark: Win-story approved by <@{user_id}>: _{row.proof_text}_"
+        logger.info("[WinStory] slack-approved asset_id=%d by=%s", asset_id, user_id)
+    else:
+        reply = f":no_entry: Win-story dismissed by <@{user_id}>."
+        logger.info("[WinStory] slack-dismissed asset_id=%d by=%s", asset_id, user_id)
+
+    _update_win_story_slack_message(asset_id, payload, reply)
+    return {"ok": True}
+
+
+def _update_win_story_slack_message(asset_id: int, payload: dict, reply_text: str) -> None:
+    """Replace the Approve/Dismiss buttons with the outcome text."""
+    from config.settings import get_settings
+    s = get_settings()
+    token = s.slack_bot_token
+    channel = (payload.get("channel") or {}).get("id")
+    message_ts = (payload.get("message") or {}).get("ts")
+    if not token or not channel or not message_ts:
+        return
+    try:
+        from slack_sdk import WebClient
+        WebClient(token=token.get_secret_value()).chat_update(
+            channel=channel,
+            ts=message_ts,
+            text=reply_text,
+            blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": reply_text}}],
+        )
+    except Exception as exc:
+        logger.error("[WinStory] chat.update failed for asset_id=%d: %s", asset_id, exc)
+
+
+# ===========================================================================
+# CORA PROMPT EDITOR
+# ===========================================================================
+# GET  /api/admin/prompts              — list graphs + their files
+# GET  /api/admin/prompts/{graph}/{file} — read a yaml file's content
+# PUT  /api/admin/prompts/{graph}/{file} — overwrite a yaml file's content
+
+_PROMPTS_ROOT = Path(__file__).resolve().parents[2] / "src" / "agents" / "prompts"
+_ALLOWED_EXTS = {".yaml", ".yml"}
+
+
+def _resolve_prompt_path(graph: str, filename: str) -> Path:
+    if "/" in graph or "\\" in graph or "/" in filename or "\\" in filename:
+        raise HTTPException(status_code=400, detail="Invalid graph or filename")
+    path = (_PROMPTS_ROOT / graph / filename).resolve()
+    if not str(path).startswith(str(_PROMPTS_ROOT)):
+        raise HTTPException(status_code=400, detail="Invalid path")
+    if path.suffix not in _ALLOWED_EXTS:
+        raise HTTPException(status_code=400, detail="Only .yaml files are editable")
+    return path
+
+
+@router.get("/prompts", dependencies=[Depends(get_current_admin)])
+def list_prompt_graphs():
+    if not _PROMPTS_ROOT.is_dir():
+        return {"graphs": []}
+    graphs = []
+    for graph_dir in sorted(_PROMPTS_ROOT.iterdir()):
+        if not graph_dir.is_dir():
+            continue
+        files = sorted(
+            f.name for f in graph_dir.iterdir()
+            if f.is_file() and f.suffix in _ALLOWED_EXTS
+        )
+        if files:
+            graphs.append({"graph": graph_dir.name, "files": files})
+    return {"graphs": graphs}
+
+
+@router.get("/prompts/{graph}/{filename}", dependencies=[Depends(get_current_admin)])
+def get_prompt_file(graph: str, filename: str):
+    path = _resolve_prompt_path(graph, filename)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    return {"graph": graph, "filename": filename, "content": path.read_text(encoding="utf-8")}
+
+
+class PromptUpdateBody(BaseModel):
+    content: str
+
+
+@router.put("/prompts/{graph}/{filename}", dependencies=[Depends(get_current_admin)])
+def update_prompt_file(graph: str, filename: str, body: PromptUpdateBody):
+    path = _resolve_prompt_path(graph, filename)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    path.write_text(body.content, encoding="utf-8")
+    logger.info("[prompts] updated %s/%s", graph, filename)
+    return {"graph": graph, "filename": filename, "saved": True}
+
+
+# ===========================================================================
 # DEV TOOLS GATE
 # ===========================================================================
 
