@@ -278,7 +278,7 @@ def _on_payment_failed(invoice, db) -> None:
 def _on_subscription_updated(subscription, db) -> None:
     status_map = {
         "active": "active",
-        "past_due": "active",
+        "past_due": "past_due",
         "unpaid": "churned",
         "canceled": "churned",
         "trialing": "active",
