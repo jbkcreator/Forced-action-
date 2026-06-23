@@ -28,6 +28,24 @@ logger = logging.getLogger(__name__)
 # Bronze flowing and is still served; full cut only at churned).
 _SERVED_STATUSES = ("active", "past_due", "free_trial")
 
+# M6 verdict integration (Option B). M6 (the Truth Engine) routes each graded lead
+# to a product channel; M10 only delivers the ones M6 sent to a *contractor*
+# channel. The other channels are someone else's lane:
+#   loan_lane        -> lending product (not contractor delivery)
+#   data_pack_bulk   -> bulk data sale (not 1:1 delivery)
+#   recycle_suppress -> dead/unreachable, do not deliver
+_CONTRACTOR_CHANNELS = frozenset({
+    "contractor_subscription", "storm_retainer", "free_hand_delivered",
+})
+
+
+def is_deliverable_verdict(grade: Optional[str], routed_channel: Optional[str]) -> bool:
+    """True when an M6 verdict is something M10 should deliver to a contractor:
+    a real grade (not the 'sub_grade' reject) routed to a contractor channel."""
+    if not grade or grade == "sub_grade":
+        return False
+    return routed_channel in _CONTRACTOR_CHANNELS
+
 # Plan-tier priority (tie-breaker 1): higher rank wins first call on a lead.
 _TIER_RANK = {
     "dominator": 40,

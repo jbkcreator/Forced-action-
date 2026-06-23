@@ -5,7 +5,9 @@ from datetime import datetime, timezone
 from src.services.lead_delivery import (
     Candidate,
     bucket_for,
+    grade_key,
     headroom,
+    is_deliverable_verdict,
     pick_winner,
     tier_rank,
 )
@@ -69,3 +71,30 @@ def test_tier_rank_ordering():
     assert tier_rank("dominator") > tier_rank("pro") > tier_rank("starter") > tier_rank("free_trial")
     assert tier_rank(None) == 0
     assert tier_rank("unknown") == 0
+
+
+class TestVerdictConsumption:
+    """M6 (Option B): which verdicts M10 delivers, and grade-word mapping."""
+
+    def test_contractor_channels_are_deliverable(self):
+        assert is_deliverable_verdict("Gold", "contractor_subscription")
+        assert is_deliverable_verdict("Platinum", "storm_retainer")
+        assert is_deliverable_verdict("Bronze", "free_hand_delivered")
+
+    def test_non_contractor_channels_not_delivered(self):
+        assert not is_deliverable_verdict("Ultra", "loan_lane")
+        assert not is_deliverable_verdict("Silver", "data_pack_bulk")
+        assert not is_deliverable_verdict("Gold", "recycle_suppress")
+
+    def test_sub_grade_never_delivered(self):
+        assert not is_deliverable_verdict("sub_grade", "free_hand_delivered")
+
+    def test_missing_grade_or_channel(self):
+        assert not is_deliverable_verdict(None, "contractor_subscription")
+        assert not is_deliverable_verdict("Gold", None)
+
+    def test_verdict_grade_maps_to_bucket_key(self):
+        # M6 emits 'Ultra' (not the CDS 'Ultra Platinum'); bucket keys are lowercased
+        assert grade_key("Ultra") == "ultra"
+        assert grade_key("Gold") == "gold"
+        assert grade_key("Bronze") == "bronze"

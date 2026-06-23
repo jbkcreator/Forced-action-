@@ -17,12 +17,61 @@ from typing import Optional
 from sqlalchemy import text
 
 from src.core.database import get_db_context
-from src.services.lead_delivery import Lead, claim
+from src.services.lead_delivery import Lead, claim, is_deliverable_verdict
 
 logger = logging.getLogger(__name__)
 
 # Cap per run so a backlog can't run unbounded; leftover leads are picked up next day.
 _BATCH_LIMIT = 5000
+
+
+def _verdicts_available(db) -> bool:
+    """True once M6 (Truth Engine) has shipped its `verdicts` table. Until then
+    the sweep falls back to grading leads off the CDS tier directly."""
+    return db.execute(text("SELECT to_regclass('verdicts')")).scalar() is not None
+
+
+def _pending_leads_from_verdicts(db, limit: int) -> list[Lead]:
+    """M6-driven source (Option B): the latest verdict per property that M6 routed
+    to a contractor channel and hasn't been delivered yet. Grade comes from the
+    verdict; the trade is still derived from the CDS vertical_scores (M6's
+    routed_channel is a product lane, not a trade). Bridged via prospects.property_id.
+    """
+    rows = db.execute(text("""
+        SELECT DISTINCT ON (pr.property_id)
+               pr.property_id, p.zip, p.county_id, v.grade, v.routed_channel, ds.vertical_scores
+        FROM verdicts v
+        JOIN prospects pr  ON pr.prospect_id = v.prospect_id
+        JOIN properties p  ON p.id = pr.property_id
+        LEFT JOIN deliveries d ON d.property_id = pr.property_id
+        LEFT JOIN LATERAL (
+            SELECT vertical_scores FROM distress_scores
+            WHERE property_id = pr.property_id ORDER BY score_date DESC LIMIT 1
+        ) ds ON TRUE
+        WHERE d.id IS NULL
+          AND p.zip IS NOT NULL AND p.county_id IS NOT NULL
+        ORDER BY pr.property_id, v.created_at DESC
+        LIMIT :lim
+    """), {"lim": limit}).fetchall()
+
+    leads: list[Lead] = []
+    for r in rows:
+        if not is_deliverable_verdict(r.grade, r.routed_channel):
+            continue  # latest verdict is sub_grade or a non-contractor lane
+        verticals = list((r.vertical_scores or {}).keys())
+        if not verticals:
+            continue
+        leads.append(Lead(property_id=r.property_id, zip_code=r.zip, county_id=r.county_id,
+                          grade=r.grade, verticals=verticals))
+    return leads
+
+
+def _select_pending(db, limit: int, source: str) -> tuple[list[Lead], str]:
+    """Pick the lead source: M6 verdicts when available (or forced), else CDS."""
+    use_verdicts = source == "verdict" or (source == "auto" and _verdicts_available(db))
+    if use_verdicts:
+        return _pending_leads_from_verdicts(db, limit), "verdict"
+    return _pending_leads(db, limit), "cds"
 
 
 def _pending_leads(db, limit: int) -> list[Lead]:
@@ -54,15 +103,16 @@ def _pending_leads(db, limit: int) -> list[Lead]:
     return leads
 
 
-def run_lead_delivery_sweep(db=None, *, limit: int = _BATCH_LIMIT) -> dict:
+def run_lead_delivery_sweep(db=None, *, limit: int = _BATCH_LIMIT, source: str = "auto") -> dict:
     """Match + claim every pending lead. Each claim commits in its own short
     transaction so the property-row lock is held briefly and one failure never
-    rolls back the batch. Returns counts {delivered, undelivered}."""
+    rolls back the batch. `source`: 'auto' (verdicts if M6 has shipped, else CDS),
+    'verdict', or 'cds'. Returns counts {delivered, undelivered, source}."""
     own = db is None
     ctx = get_db_context() if own else None
     db = ctx.__enter__() if own else db
     try:
-        leads = _pending_leads(db, limit)
+        leads, src = _select_pending(db, limit, source)
         delivered = undelivered = 0
         for lead in leads:
             try:
@@ -78,9 +128,10 @@ def run_lead_delivery_sweep(db=None, *, limit: int = _BATCH_LIMIT) -> dict:
                 logger.error("lead_delivery_sweep: claim failed for property %s",
                              lead.property_id, exc_info=True)
                 undelivered += 1
-        logger.info("lead_delivery_sweep: %d delivered, %d undelivered (of %d pending)",
-                    delivered, undelivered, len(leads))
-        return {"delivered": delivered, "undelivered": undelivered, "pending": len(leads)}
+        logger.info("lead_delivery_sweep[%s]: %d delivered, %d undelivered (of %d pending)",
+                    src, delivered, undelivered, len(leads))
+        return {"delivered": delivered, "undelivered": undelivered,
+                "pending": len(leads), "source": src}
     finally:
         if own:
             ctx.__exit__(None, None, None)
