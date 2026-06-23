@@ -240,6 +240,16 @@ def record_subscription_active(
 
     if account.converted_at is None and new_mrr > 0:
         account.converted_at = now
+        # M10/B2: record first-touch free→paid attribution at the conversion moment.
+        # Logic lives in lead_delivery; called defensively so attribution can never
+        # roll back the billing/conversion path.
+        try:
+            from src.services.lead_delivery import record_free_to_paid
+            record_free_to_paid(db, account, first_paid_plan=plan.plan_id, converted_at=now)
+        except Exception:
+            logger.error(
+                "free_to_paid attribution failed for account %s", account.account_id, exc_info=True
+            )
 
     account.status = "active"
     account.plan_tier = plan.plan_id

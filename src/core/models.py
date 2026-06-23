@@ -5632,6 +5632,8 @@ class CustomerAccount(Base):
     stripe_subscription_id: Mapped[Optional[str]] = mapped_column(Text)
     current_period_end: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     mrr_cents: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    # M10/B2: per-grade lead credits earned from rejected deliveries (survives cycle reset)
+    lead_credits: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     converted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
@@ -5679,3 +5681,71 @@ class MrrMovement(Base):
 
     def __repr__(self) -> str:
         return f"<MrrMovement(account_id={self.account_id}, type={self.movement_type}, delta={self.delta_cents})>"
+
+
+class Delivery(Base):
+    """M10/B2 — the authoritative record that one graded Lead (a scored property)
+    was assigned to exactly one paying CustomerAccount. Distinct from SentLead
+    (legacy email-send dedup, keyed on subscriber_id). Exclusivity is enforced in
+    the claim transaction, not a hard unique on property_id (keeps shared-delivery
+    a future per-plan option). The (property_id, account_id) unique is the dup-guard.
+    """
+    __tablename__ = "deliveries"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    property_id: Mapped[int] = mapped_column(ForeignKey("properties.id"), nullable=False, index=True)
+    account_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("customer_accounts.account_id"), nullable=False
+    )
+    grade: Mapped[str] = mapped_column(Text, nullable=False)        # distress_scores.lead_tier snapshot
+    vertical: Mapped[str] = mapped_column(Text, nullable=False)     # matched trade
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'delivered'"))
+    rejection_reason: Mapped[Optional[str]] = mapped_column(Text)
+    rejected_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    billing_period_end: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    delivered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    source: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'sweep'"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("property_id", "account_id", name="uq_delivery_property_account"),
+        CheckConstraint("status IN ('delivered','rejected')", name="ck_delivery_status"),
+        CheckConstraint(
+            "rejection_reason IS NULL OR rejection_reason IN "
+            "('disconnected','wrong_party','deceased','duplicate','other')",
+            name="ck_delivery_reason",
+        ),
+        Index("idx_deliveries_account_grade_cycle", "account_id", "grade", "billing_period_end"),
+        Index("idx_deliveries_status", "status"),
+        Index("idx_deliveries_delivered_at", "delivered_at"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<Delivery(property_id={self.property_id}, account_id={self.account_id}, grade={self.grade}, status={self.status})>"
+
+
+class FreeToPaidAttribution(Base):
+    """M10/B2 — first-touch attribution (§12.8): the free Bronze lead that started
+    a contractor's journey to their first paid subscription. One row per account
+    (idempotent). last_free_delivery_id + free_leads_count are stored so a
+    multi-touch model can be derived later without re-instrumenting (NOT built in S1).
+    """
+    __tablename__ = "free_to_paid_attribution"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    account_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("customer_accounts.account_id"), nullable=False
+    )
+    first_free_delivery_id: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("deliveries.id"))
+    last_free_delivery_id: Mapped[Optional[int]] = mapped_column(BigInteger, ForeignKey("deliveries.id"))
+    free_leads_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    converted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    first_paid_plan: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("account_id", name="uq_attribution_account"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<FreeToPaidAttribution(account_id={self.account_id}, free_leads={self.free_leads_count})>"

@@ -137,7 +137,8 @@ def test_stage3_subscription_updated_records_expansion(fresh_db):
     fresh_db.execute(text("""
         INSERT INTO plans (plan_id, name, tier, price_cents, interval, entitlements, stripe_price_id)
         VALUES ('pro','Pro','pro',49900,'monthly', CAST(:ent AS jsonb), 'price_pro')
-        ON CONFLICT (plan_id) DO NOTHING
+        ON CONFLICT (plan_id) DO UPDATE SET
+            price_cents = EXCLUDED.price_cents, stripe_price_id = EXCLUDED.stripe_price_id
     """), {"ent": '{"gold": 50}'})
     sub = _real_checkout_subscriber(fresh_db, stripe_customer="cus_stage3")
     acct = CustomerAccount(
@@ -205,7 +206,8 @@ def test_full_lifecycle_chain_reconciles_to_zero_mrr(fresh_db):
         INSERT INTO plans (plan_id, name, tier, price_cents, interval, entitlements, stripe_price_id)
         VALUES ('starter','Starter','starter',29900,'monthly', CAST(:s AS jsonb), 'price_starter'),
                ('pro','Pro','pro',49900,'monthly', CAST(:p AS jsonb), 'price_pro')
-        ON CONFLICT (plan_id) DO NOTHING
+        ON CONFLICT (plan_id) DO UPDATE SET
+            price_cents = EXCLUDED.price_cents, stripe_price_id = EXCLUDED.stripe_price_id
     """), {"s": '{"gold": 20}', "p": '{"gold": 50}'})
 
     cust = "cus_life"
