@@ -36,8 +36,14 @@ def main() -> int:
     settings = get_settings()
     starter_price_id = settings.stripe_price_starter_regular
 
+    # Entitlement buckets are keyed by M6 verdict grade, lowercased (grade_key):
+    # ultra | platinum | gold | silver | bronze. 'sub_grade' has no bucket — M6 has
+    # already marked it dead, so M10 never delivers it. Counts below are PLACEHOLDERS
+    # to open the full grade pipe end-to-end (every grade has a jar to deliver into);
+    # product sets the real per-tier allowances later — config-over-code, no code change.
     plans = [
         {
+            # Free trial = the free Bronze hand-off only (M6 free_hand_delivered → Bronze).
             "plan_id": "free_trial", "name": "Free Trial", "tier": "free_trial",
             "price_cents": 0, "interval": "trial",
             "entitlements": '{"bronze": 5}', "stripe_price_id": None,
@@ -45,7 +51,8 @@ def main() -> int:
         {
             "plan_id": "starter", "name": "Starter", "tier": "starter",
             "price_cents": 29900, "interval": "monthly",
-            "entitlements": '{"gold": 20}', "stripe_price_id": starter_price_id,
+            "entitlements": '{"ultra": 2, "platinum": 5, "gold": 20, "silver": 50, "bronze": 10}',
+            "stripe_price_id": starter_price_id,
         },
     ]
 

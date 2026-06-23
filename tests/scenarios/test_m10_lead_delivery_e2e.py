@@ -292,6 +292,21 @@ def test_rejection_rate_guardrail(fresh_db):
     assert rejection_rate(fresh_db, acct.account_id) == 0.5
 
 
+def test_ultra_grade_delivers_with_ultra_bucket(fresh_db):
+    """M6 emits grade 'Ultra' (not CDS 'Ultra Platinum'); an account with an
+    'ultra' entitlement bucket must receive it — proves the grade pipe is open
+    end to end after adding the higher-grade buckets to the plan seeds."""
+    _ensure_plans(fresh_db)
+    _, acct = _mk_account(fresh_db, cust="cus_m10_ultra",
+                          entitlement={"ultra": 2, "gold": 20})
+    prop = _mk_property(fresh_db, "M10-ULTRA")
+
+    d = claim(fresh_db, _lead(prop, grade="Ultra"))
+    fresh_db.flush()
+    assert d is not None and d.account_id == acct.account_id
+    assert d.grade == "Ultra"
+
+
 def test_concurrent_claims_deliver_only_once():
     """§12.3 HIGH SEVERITY: two matchers racing the same lead must produce exactly
     one delivery. Uses two independent committed sessions through a barrier so the
