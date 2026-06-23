@@ -30,6 +30,7 @@ from sqlalchemy.orm import Session
 from config.settings import settings
 from src.core.models import SmsDeadLetter, SmsOptIn, SmsOptOut, SmsSendLog
 from src.services import phone_utils
+from src.services.allotment_engine import consume as allotment_consume
 from src.services.telnyx_sms import TelnyxSMSError, send_message as telnyx_send_message
 
 logger = logging.getLogger(__name__)
@@ -199,7 +200,11 @@ def add_to_dead_letter(
     Write a failed or blocked SMS event to the dead-letter queue for manual review.
     reason must be one of: opt_out / delivery_failed / error / unresolvable / quiet_hours / no_opt_in
     """
-    valid_reasons = {"opt_out", "delivery_failed", "error", "unresolvable", "quiet_hours", "no_opt_in", "subscriber_sms_frequency_cap"}
+    valid_reasons = {
+        "opt_out", "delivery_failed", "error", "unresolvable",
+        "quiet_hours", "no_opt_in", "subscriber_sms_frequency_cap",
+        "free_tier_outbound_text_allotment", "do_not_text_tag",
+    }
     if reason not in valid_reasons:
         logger.warning("Invalid DLQ reason '%s' — defaulting to 'error'", reason)
         reason = "error"
@@ -297,8 +302,8 @@ def send_sms(
             _log("suppressed", suppress_reason="do_not_text_tag")
             return False
 
-    # 3. Per-subscriber marketing frequency cap — applied globally regardless of campaign.
-    # Transactional, opt_in_prompt, and messages without a known subscriber_id bypass this gate.
+    # 3. Per-subscriber marketing frequency cap and free-tier weekly allotment.
+    # Transactional, opt_in_prompt, and messages without a known subscriber_id bypass both gates.
     if message_type == "marketing" and subscriber_id is not None:
         if _check_marketing_frequency_cap(subscriber_id, db):
             logger.info(
@@ -309,24 +314,14 @@ def send_sms(
             _log("suppressed", suppress_reason="subscriber_sms_frequency_cap")
             return False
 
-    # 3a. Free-tier weekly outbound text allotment (3 texts/week).
-    # Only applies to free-tier subscribers; wallet holders bypass inside the engine.
-    if message_type == "marketing" and subscriber_id is not None:
-        from sqlalchemy import text as _sa_text
-        from src.services.allotment_engine import consume as _allotment_consume
-        _tier_row = db.execute(
-            _sa_text("SELECT tier FROM subscribers WHERE id = :sid LIMIT 1"),
-            {"sid": subscriber_id},
-        ).fetchone()
-        if _tier_row and _tier_row[0] == "free":
-            if not _allotment_consume(subscriber_id, "outbound_text", db):
-                logger.info(
-                    "SMS suppressed (free_tier_outbound_text_allotment): subscriber_id=%s to=%s",
-                    subscriber_id, to,
-                )
-                add_to_dead_letter(to, "subscriber_sms_frequency_cap", {"body": body[:160]}, db)
-                _log("suppressed", suppress_reason="free_tier_outbound_text_allotment")
-                return False
+        if not allotment_consume(subscriber_id, "outbound_text", db):
+            logger.info(
+                "SMS suppressed (free_tier_outbound_text_allotment): subscriber_id=%s to=%s",
+                subscriber_id, to,
+            )
+            add_to_dead_letter(to, "free_tier_outbound_text_allotment", {"body": body[:160]}, db)
+            _log("suppressed", suppress_reason="free_tier_outbound_text_allotment")
+            return False
 
     # 6. Dry-run path (TELNYX_SMS_ENABLED=false)
     if not settings.telnyx_sms_enabled:

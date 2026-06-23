@@ -32,6 +32,7 @@ from langgraph.graph import END, START, StateGraph
 from src.agents.subgraphs.decision_hierarchy import run_decision_hierarchy
 from src.agents.tools.read_tools import get_subscriber_profile
 from src.core.database import get_db_context
+from src.services.allotment_engine import consume as allotment_consume
 from src.services.compliance_gator import validate_outbound
 from src.services.synthflow_client import initiate_call
 from src.services.kill_switch_service import get_cached_metric
@@ -203,37 +204,30 @@ def _node_initiate_drop(state: VoiceDropState) -> VoiceDropState:
         "zip_code": profile.get("territory_zip", ""),
     }
 
-    with get_db_context() as db:
-        compliance = validate_outbound(
-            phone=phone,
-            channel="voice",
-            db=db,
-            zip_code=profile.get("territory_zip") or None,
-        )
-    if not compliance.allowed:
-        logger.info(
-            "voice_drop blocked by compliance gate: subscriber=%s reason=%s",
-            subscriber_id,
-            compliance.reason,
-        )
-        return {
-            "call_id": None,
-            "sent": False,
-            "terminal_status": "aborted",
-            "failure_reason": f"compliance:{compliance.reason}",
-        }
+    try:
+        with get_db_context() as db:
+            compliance = validate_outbound(
+                phone=phone,
+                channel="voice",
+                db=db,
+                zip_code=profile.get("territory_zip") or None,
+            )
+            if not compliance.allowed:
+                logger.info(
+                    "voice_drop blocked by compliance gate: subscriber=%s reason=%s",
+                    subscriber_id,
+                    compliance.reason,
+                )
+                return {
+                    "call_id": None,
+                    "sent": False,
+                    "terminal_status": "aborted",
+                    "failure_reason": f"compliance:{compliance.reason}",
+                }
 
-    # Allotment gate — free-tier subscribers are capped at 1 voicemail/week.
-    # Wallet holders bypass automatically inside allotment_engine.consume().
-    from sqlalchemy import text as _text
-    from src.services.allotment_engine import consume as _allotment_consume
-    with get_db_context() as db:
-        _tier_row = db.execute(
-            _text("SELECT tier FROM subscribers WHERE id = :sid LIMIT 1"),
-            {"sid": subscriber_id},
-        ).fetchone()
-        if _tier_row and _tier_row[0] == "free":
-            if not _allotment_consume(subscriber_id, "voicemail", db):
+            # Allotment gate — wallet holders are unlimited; free-tier subscribers
+            # are capped at 1 voicemail/week. consume() handles both cases.
+            if not allotment_consume(subscriber_id, "voicemail", db):
                 logger.info(
                     "voice_drop blocked by allotment cap: subscriber=%s",
                     subscriber_id,
@@ -244,6 +238,9 @@ def _node_initiate_drop(state: VoiceDropState) -> VoiceDropState:
                     "terminal_status": "aborted",
                     "failure_reason": "allotment:voicemail_weekly_cap",
                 }
+    except (KeyError, AttributeError):
+        # compliance or allotment raised unexpectedly — propagate to LangGraph
+        raise
 
     call_id = initiate_call(
         phone=phone,

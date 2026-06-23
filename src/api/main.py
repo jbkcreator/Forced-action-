@@ -36,6 +36,7 @@ from sqlalchemy import select, and_, or_, desc, func, cast, text, Date, distinct
 
 from src.core.database import get_db_context
 from src.core.models import ConsentAcceptance, FoundingSubscriberCount, ZipTerritory, Subscriber, Property, DistressScore, Incident, LeadPackPurchase, ScraperRunStats, EnrichedContact, Owner, SentLead, WaitlistEntry, SmsOptIn, ExpansionCandidate, County, LeadExclusivity
+from src.agents.events.ingestion import publish_cora_event
 from src.services.stripe_webhooks import handle_webhook
 from src.services.stripe_service import get_price_id_for_checkout, _price_ids
 from src.services import lead_exclusivity
@@ -1058,7 +1059,6 @@ def _handle_aircall_event(etype, data: dict, db) -> None:
             row.transcript_text = transcript
             row.transcript_fetched_at = datetime.now(timezone.utc)
             db.flush()
-            from src.agents.events.ingestion import publish_cora_event
             publish_cora_event({
                 "event_type": "call_transcribed",
                 "subscriber_id": row.subscriber_id,
@@ -1852,17 +1852,23 @@ def event_feed(
 
         if subscriber.tier == "free" and _blurred_stack and page == 1:
             try:
-                from src.agents.events.ingestion import publish_cora_event
-                publish_cora_event({
-                    "event_type": "wall_session_abandoned",
-                    "subscriber_id": subscriber.id,
-                    "payload": {
-                        "vertical": subscriber.vertical or "",
-                        "zip_code": subscriber.lock_candidate_zip or "",
-                    },
-                })
+                from src.core.redis_client import redis_available, rget, rset
+                _cooldown_key = f"wall_abandon_fired:{subscriber.id}"
+                if not redis_available() or not rget(_cooldown_key):
+                    publish_cora_event({
+                        "event_type": "wall_session_abandoned",
+                        "subscriber_id": subscriber.id,
+                        "payload": {
+                            "vertical": subscriber.vertical or "",
+                            "zip_code": subscriber.lock_candidate_zip or "",
+                        },
+                    })
+                    if redis_available():
+                        rset(_cooldown_key, "1", ttl_seconds=4 * 3600)
             except Exception:
-                pass
+                logger.warning(
+                    "wall_session_abandoned publish failed: subscriber=%s", subscriber.id,
+                )
 
         return {
             "feed_uuid": feed_uuid,
@@ -3444,20 +3450,6 @@ def hot_lead_unlock(payload: HotLeadUnlockRequest, db: Session = Depends(get_db)
         raise HTTPException(status_code=400, detail=str(exc))
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
-
-    if subscriber.tier == "free":
-        try:
-            from src.agents.events.ingestion import publish_cora_event
-            publish_cora_event({
-                "event_type": "abandonment_click_no_complete",
-                "subscriber_id": subscriber.id,
-                "payload": {
-                    "lead_id": payload.lead_id,
-                    "vertical": subscriber.vertical or "",
-                },
-            })
-        except Exception:
-            pass
 
     return {"checkout_url": result["url"]}
 
