@@ -26,6 +26,7 @@ def log_send(
     variant_id: Optional[str] = None,
     decision_id: Optional[str] = None,
     body_preview: Optional[str] = None,
+    prospect_id: Optional[str] = None,
 ) -> None:
     """
     Write one SmsSendLog row. Best-effort — never raises.
@@ -48,9 +49,11 @@ def log_send(
             variant_id=variant_id,
             decision_id=decision_id,
             body_preview=body_preview,
+            prospect_id=prospect_id,
             created_at=datetime.now(timezone.utc),
         )
-        db.add(row)
-        db.flush()
+        with db.begin_nested():
+            db.add(row)
+            db.flush()
     except Exception as exc:
         logger.warning("sms_send_log write failed: %s", exc)

@@ -71,7 +71,14 @@ def run_enrichment_pipeline(
                 entity_only=entity_only,
             )
         else:
-            from src.services.skip_trace_waterfall import run_cascade
+            from src.services.skip_trace_waterfall import consume_prospect_created, run_cascade
+
+            # Event-driven pass: enrich properties whose prospect.created event
+            # was emitted by the seeding cron (07:15). Marks events processed.
+            event_stats = consume_prospect_created(county_id=county_id)
+
+            # Reconciliation sweep: catches any Gold+ property not covered by
+            # the event-driven pass (missed seeding, dropped event, etc.).
             wf_stats = run_cascade(
                 county_id=county_id,
                 limit=limit,
@@ -85,7 +92,14 @@ def run_enrichment_pipeline(
             "total_cost_cents": wf_stats.total_cost_cents,
             "per_provider":     wf_stats.per_provider,
         }
-        results["total_enriched"] = wf_stats.hits
+        if not use_special_mode:
+            results["event_driven"] = {
+                "events_consumed": event_stats.total_leads,
+                "hits":            event_stats.hits,
+                "misses":          event_stats.misses,
+                "cost_cents":      event_stats.total_cost_cents,
+            }
+        results["total_enriched"] = wf_stats.hits + (event_stats.hits if not use_special_mode else 0)
         logger.info(
             "[Enrichment] Cascade done: %d/%d enriched, $%.2f spent",
             wf_stats.hits, wf_stats.total_leads, wf_stats.total_cost_cents / 100,

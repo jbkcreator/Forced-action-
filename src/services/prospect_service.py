@@ -137,6 +137,44 @@ def get_prospect(session, prospect_id: str) -> Optional[dict]:
     }
 
 
+def get_channel_consent(session, prospect_id: str, channel: str) -> "Optional[bool]":
+    """
+    Return the prospect's explicit consent for a channel.
+    True  = explicitly granted
+    False = explicitly withdrawn
+    None  = not set (no record either way — treated as not consented)
+    """
+    row = session.execute(sa_text("""
+        SELECT (channel_consent->>:channel)::boolean AS consent
+        FROM prospects
+        WHERE prospect_id = CAST(:pid AS uuid)
+          AND merged_into_id IS NULL
+    """), {"pid": prospect_id, "channel": channel}).fetchone()
+
+    if not row:
+        return None
+    return row.consent
+
+
+def update_consent(session, prospect_id: str, channel: str, granted: bool) -> None:
+    """
+    Merge {channel: granted} into prospects.channel_consent.
+    Uses JSONB || operator — atomic, no read-modify-write race.
+    """
+    import json
+    session.execute(sa_text("""
+        UPDATE prospects
+        SET channel_consent = channel_consent || CAST(:patch AS jsonb),
+            updated_at = NOW()
+        WHERE prospect_id = CAST(:pid AS uuid)
+    """), {"patch": json.dumps({channel: granted}), "pid": prospect_id})
+
+    logger.info(
+        "[Prospects] consent updated prospect_id=%s channel=%s granted=%s",
+        prospect_id, channel, granted,
+    )
+
+
 def merge_prospects(
     session,
     surviving_id: str,

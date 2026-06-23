@@ -3422,6 +3422,11 @@ class SmsSendLog(Base):
     variant_id: Mapped[Optional[str]] = mapped_column(String(100))
     decision_id: Mapped[Optional[str]] = mapped_column(String(36))
     body_preview: Mapped[Optional[str]] = mapped_column(String(160))
+    prospect_id: Mapped[Optional[str]] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("prospects.prospect_id", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
     )
@@ -3439,6 +3444,7 @@ class SmsSendLog(Base):
         Index("idx_ssl_sub_created", "subscriber_id", "created_at"),
         Index("idx_ssl_outcome_created", "outcome", "created_at"),
         Index("idx_ssl_vendor_msg_id", "vendor_message_id"),
+        Index("idx_sms_send_logs_prospect_id", "prospect_id"),
     )
 
     def __repr__(self):
