@@ -2964,6 +2964,7 @@ def sample_leads(
         Property.zip == zip_code,
         Property.county_id == county_id,
         DistressScore.qualified == True,
+        DistressScore.is_guess_lead.is_(False),  # A2: withhold guess leads from the feed
     ]
     if contact_clause is not None:
         filters.append(contact_clause)
