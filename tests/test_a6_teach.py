@@ -504,3 +504,123 @@ class TestTeachEndpointDelete:
             mock_engine_cls.assert_not_called()
         finally:
             _cleanup(app)
+
+
+# ── Delivered leads endpoint (drives the cockpit Teach panel) ─────────────────
+
+def _row(**kwargs):
+    r = MagicMock()
+    for k, v in kwargs.items():
+        setattr(r, k, v)
+    return r
+
+
+def _mock_session_for_delivered(lead_rows, correction_rows):
+    """Mock session: first execute → delivered leads, second → active corrections."""
+    session = MagicMock()
+    calls = {"n": 0}
+
+    def _execute(stmt, params=None):
+        calls["n"] += 1
+        result = MagicMock()
+        sql = str(stmt)
+        if "cora_training_overrides" in sql:
+            result.fetchall.return_value = correction_rows
+        else:
+            result.fetchall.return_value = lead_rows
+        return result
+
+    session.execute.side_effect = _execute
+    return session
+
+
+class TestDeliveredLeadsEndpoint:
+    def test_returns_leads_with_signals(self, app, mock_admin):
+        lead_rows = [
+            _row(property_id=1, address="1234 Elm St", city="Tampa",
+                 cds_score=71.0, lead_tier="Gold",
+                 signals=["foreclosures", "tax_delinquencies"],
+                 sent_at=datetime(2026, 6, 1, tzinfo=timezone.utc)),
+        ]
+        session = _mock_session_for_delivered(lead_rows, [])
+        client = _make_test_client(app, session, mock_admin)
+        try:
+            resp = client.get(
+                "/api/admin/subscribers/42/delivered-leads",
+                headers={"Authorization": "Bearer test"},
+            )
+            assert resp.status_code == 200
+            body = resp.json()
+            assert body["subscriber_id"] == 42
+            assert body["count"] == 1
+            item = body["items"][0]
+            assert item["property_id"] == 1
+            assert item["address"] == "1234 Elm St"
+            assert item["cds_score"] == 71.0
+            assert item["lead_tier"] == "Gold"
+            assert item["signals"] == ["foreclosures", "tax_delinquencies"]
+            assert item["active_corrections"] == []
+        finally:
+            _cleanup(app)
+
+    def test_attaches_active_corrections_to_right_lead(self, app, mock_admin):
+        lead_rows = [
+            _row(property_id=1, address="1234 Elm St", city="Tampa",
+                 cds_score=71.0, lead_tier="Gold", signals=["foreclosures"],
+                 sent_at=datetime(2026, 6, 1, tzinfo=timezone.utc)),
+            _row(property_id=2, address="88 Oak Ave", city="Tampa",
+                 cds_score=44.0, lead_tier="Silver", signals=[],
+                 sent_at=datetime(2026, 5, 1, tzinfo=timezone.utc)),
+        ]
+        correction_rows = [
+            _row(id=9, subject_id=2, correction_reason="non_residential", signal_type=None),
+        ]
+        session = _mock_session_for_delivered(lead_rows, correction_rows)
+        client = _make_test_client(app, session, mock_admin)
+        try:
+            resp = client.get(
+                "/api/admin/subscribers/42/delivered-leads",
+                headers={"Authorization": "Bearer test"},
+            )
+            assert resp.status_code == 200
+            items = {i["property_id"]: i for i in resp.json()["items"]}
+            assert items[1]["active_corrections"] == []
+            assert items[2]["active_corrections"][0]["id"] == 9
+            assert items[2]["active_corrections"][0]["correction_reason"] == "non_residential"
+        finally:
+            _cleanup(app)
+
+    def test_empty_when_no_leads(self, app, mock_admin):
+        session = _mock_session_for_delivered([], [])
+        client = _make_test_client(app, session, mock_admin)
+        try:
+            resp = client.get(
+                "/api/admin/subscribers/99/delivered-leads",
+                headers={"Authorization": "Bearer test"},
+            )
+            assert resp.status_code == 200
+            body = resp.json()
+            assert body["count"] == 0
+            assert body["items"] == []
+        finally:
+            _cleanup(app)
+
+    def test_null_signals_normalized_to_empty_list(self, app, mock_admin):
+        lead_rows = [
+            _row(property_id=1, address="1234 Elm St", city="Tampa",
+                 cds_score=None, lead_tier=None, signals=None,
+                 sent_at=datetime(2026, 6, 1, tzinfo=timezone.utc)),
+        ]
+        session = _mock_session_for_delivered(lead_rows, [])
+        client = _make_test_client(app, session, mock_admin)
+        try:
+            resp = client.get(
+                "/api/admin/subscribers/42/delivered-leads",
+                headers={"Authorization": "Bearer test"},
+            )
+            assert resp.status_code == 200
+            item = resp.json()["items"][0]
+            assert item["signals"] == []
+            assert item["cds_score"] is None
+        finally:
+            _cleanup(app)

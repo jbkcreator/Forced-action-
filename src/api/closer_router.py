@@ -426,3 +426,82 @@ def delete_teaching_correction(
             )
 
     return _serialize_correction(row)
+
+
+@router.get("/subscribers/{subscriber_id}/delivered-leads")
+def subscriber_delivered_leads(
+    subscriber_id: int,
+    limit: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+    _admin: dict = Depends(get_current_admin),
+):
+    """Leads delivered to a subscriber, newest first, with current score and
+    the signals present (for the Teach panel's wrong_distress picker) plus any
+    active Teaching Corrections already applied (for the undo affordance).
+    """
+    lead_rows = db.execute(
+        text(
+            """
+            SELECT
+                p.id            AS property_id,
+                p.address       AS address,
+                p.city          AS city,
+                ds.final_cds_score AS cds_score,
+                ds.lead_tier    AS lead_tier,
+                ds.distress_types  AS signals,
+                sl.sent_at      AS sent_at
+            FROM sent_leads sl
+            JOIN properties p ON p.id = sl.property_id
+            LEFT JOIN LATERAL (
+                SELECT final_cds_score, lead_tier, distress_types
+                FROM distress_scores
+                WHERE property_id = p.id
+                ORDER BY score_date DESC
+                LIMIT 1
+            ) ds ON TRUE
+            WHERE sl.subscriber_id = :sid
+            ORDER BY sl.sent_at DESC
+            LIMIT :limit
+            """
+        ),
+        {"sid": subscriber_id, "limit": limit},
+    ).fetchall()
+
+    property_ids = [r.property_id for r in lead_rows]
+
+    corrections_by_pid: dict[int, list] = {}
+    if property_ids:
+        corr_rows = db.execute(
+            text(
+                """
+                SELECT id, subject_id, correction_reason, signal_type
+                FROM cora_training_overrides
+                WHERE subject_type = 'property'
+                  AND subject_id = ANY(:pids)
+                  AND dampener_active
+                ORDER BY created_at
+                """
+            ),
+            {"pids": property_ids},
+        ).fetchall()
+        for c in corr_rows:
+            corrections_by_pid.setdefault(c.subject_id, []).append({
+                "id": c.id,
+                "correction_reason": c.correction_reason,
+                "signal_type": c.signal_type,
+            })
+
+    items = []
+    for r in lead_rows:
+        items.append({
+            "property_id": r.property_id,
+            "address": r.address,
+            "city": r.city,
+            "cds_score": float(r.cds_score) if r.cds_score is not None else None,
+            "lead_tier": r.lead_tier,
+            "signals": list(r.signals) if r.signals else [],
+            "sent_at": r.sent_at.isoformat() if r.sent_at else None,
+            "active_corrections": corrections_by_pid.get(r.property_id, []),
+        })
+
+    return {"subscriber_id": subscriber_id, "count": len(items), "items": items}
