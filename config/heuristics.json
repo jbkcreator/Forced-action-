@@ -1,0 +1,36 @@
+{
+  "version": "1.0.0",
+  "description": "Warm-start heuristics from closing desk — 2026-06-24",
+  "signal_weight_deltas": {
+    "wholesalers": {
+      "probate": 5,
+      "judgment_liens": 3,
+      "deed_transfers": -3
+    },
+    "fix_flip": {
+      "foreclosures": 3,
+      "code_violations": -5
+    },
+    "restoration": {},
+    "roofing": {
+      "mechanics_liens": -5
+    },
+    "public_adjusters": {},
+    "attorneys": {
+      "divorce_filings": 5,
+      "judgment_liens": 2
+    }
+  },
+  "delta_bounds": {
+    "min": -15,
+    "max": 15
+  },
+  "tuner_config": {
+    "loss_window_days": 30,
+    "win_window_days": 30,
+    "min_sample_size": 5,
+    "max_delta_per_run": 5,
+    "loss_rate_threshold": 0.70,
+    "win_boost_threshold": 5
+  }
+}

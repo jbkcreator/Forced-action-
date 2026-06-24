@@ -427,6 +427,21 @@ def update_deal_stage(
         note=body.note,
     ))
     db.flush()
+
+    # Phase 3 A1: fire loss autopsy when a deal is manually moved to a loss stage
+    if body.pipeline_stage in ("closed_lost", "declined"):
+        try:
+            from src.services.loss_autopsy import run_loss_autopsy
+            reason = "DECLINED" if body.pipeline_stage == "declined" else "CLOSED_LOST"
+            run_loss_autopsy(
+                property_id=deal.property_id,
+                trigger_reason=reason,
+                db=db,
+                deal_outcome_id=deal_id,
+            )
+        except Exception as exc:
+            logger.warning("[crm_patch] loss autopsy failed deal_id=%d: %s", deal_id, exc)
+
     return {
         "ok":         True,
         "deal_id":    deal_id,

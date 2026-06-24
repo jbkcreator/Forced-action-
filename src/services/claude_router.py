@@ -63,6 +63,7 @@ _TASK_ROUTING: dict[str, str] = {
     "retention_copy":           "sonnet",
     "email_copy":               "sonnet",
     "closer_call_tagging":      "sonnet",   # Closer Cockpit (S1b) transcript tagging
+    "loss_autopsy":             "sonnet",   # Phase 3 A1: Loss Autopsy Engine
     "referral_milestone_sms":   "haiku",
     "referral_milestone_email": "sonnet",
     # Concierge Chat

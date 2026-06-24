@@ -2642,6 +2642,43 @@ class DealOutcome(Base):
         return f"<DealOutcome(id={self.id}, subscriber={self.subscriber_id}, bucket={self.deal_size_bucket})>"
 
 
+class LossAutopsy(Base):
+    """
+    Structured failure retrospective written whenever a lead is marked closed_lost,
+    declined, or ghosts past the 24-hour human-close SLA.  Claude parses
+    multi-source context (transcripts, pricing, distress score) and classifies
+    the loss into a standard taxonomy so A3 / A6 can retune scoring weights.
+    """
+    __tablename__ = "loss_autopsies"
+
+    id: Mapped[object] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
+    property_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("properties.id", ondelete="SET NULL"), nullable=True, index=True)
+    prospect_id: Mapped[Optional[object]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("prospects.prospect_id", ondelete="SET NULL"), nullable=True)
+    deal_outcome_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("deal_outcomes.id", ondelete="SET NULL"), nullable=True)
+    trigger_reason: Mapped[str] = mapped_column(String(50), nullable=False)
+    primary_rejection_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    competitor_rate_delta: Mapped[Optional[float]] = mapped_column(Numeric(8, 4), nullable=True)
+    underwriting_blocker: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    cora_behavior_adjustment: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    raw_context: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    model_response: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    claude_cost_usd: Mapped[Optional[float]] = mapped_column(Numeric(10, 6), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "trigger_reason IN ('CLOSED_LOST','DECLINED','GHOSTED_SLA')",
+            name="ck_loss_autopsy_trigger",
+        ),
+        Index("idx_loss_autopsies_deal_outcome_id", "deal_outcome_id"),
+        Index("idx_loss_autopsies_trigger_reason", "trigger_reason"),
+        Index("idx_loss_autopsies_created_at", "created_at"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<LossAutopsy(id={self.id}, trigger={self.trigger_reason}, reason={self.primary_rejection_reason})>"
+
+
 class SubscriberTag(Base):
     """Tags applied to subscribers for segmentation and filtering."""
     __tablename__ = "subscriber_tags"
@@ -6092,3 +6129,33 @@ class FreeToPaidAttribution(Base):
 
     def __repr__(self) -> str:
         return f"<FreeToPaidAttribution(account_id={self.account_id}, free_leads={self.free_leads_count})>"
+
+
+class ScoringWeightOverride(Base):
+    """A3: Per-(vertical, signal_type) delta applied on top of VERTICAL_WEIGHTS at scoring time.
+
+    Rows seeded from config/heuristics.json (source='seed') and updated nightly
+    by the heuristic tuner job from loss/win autopsy outcomes (source='loss_feedback'/'win_feedback').
+    """
+    __tablename__ = "scoring_weight_overrides"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    vertical: Mapped[str] = mapped_column(String(50), nullable=False)
+    signal_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    delta: Mapped[float] = mapped_column(Numeric(6, 2), nullable=False, server_default=text("0"))
+    source: Mapped[str] = mapped_column(String(30), nullable=False, server_default=text("'seed'"))
+    reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("TRUE"))
+    loss_sample_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    win_sample_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("vertical", "signal_type", name="uq_swo_vertical_signal"),
+        Index("idx_swo_enabled", "enabled"),
+        Index("idx_swo_updated_at", "updated_at"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<ScoringWeightOverride({self.vertical}/{self.signal_type} delta={self.delta} src={self.source})>"

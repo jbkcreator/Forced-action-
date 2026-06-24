@@ -167,6 +167,12 @@ app.include_router(signals_router)
 from src.api.verdict_router import router as verdict_router  # noqa: E402
 app.include_router(verdict_router)
 
+from src.api.loss_autopsy_router import router as loss_autopsy_router  # noqa: E402
+app.include_router(loss_autopsy_router)
+
+from src.api.heuristics_router import router as heuristics_router  # noqa: E402
+app.include_router(heuristics_router)
+
 
 # ---------------------------------------------------------------------------
 # Global exception handlers
@@ -4378,6 +4384,19 @@ def deal_capture(payload: DealCaptureRequest, db: Session = Depends(get_db)):
 
     graphic_url: Optional[str] = None
     annual_offered = False
+
+    # Phase 3 A1: loss autopsy for closed_lost deals (deal_size_bucket == "skip")
+    if payload.deal_size_bucket == "skip":
+        try:
+            from src.services.loss_autopsy import run_loss_autopsy
+            run_loss_autopsy(
+                property_id=outcome.property_id,
+                trigger_reason="CLOSED_LOST",
+                db=db,
+                deal_outcome_id=outcome.id,
+            )
+        except Exception as exc:
+            logger.warning("[DealCapture] loss autopsy failed: %s", exc)
 
     # Stage 5: generate graphic (idempotent, fails-soft)
     if payload.deal_size_bucket != "skip":

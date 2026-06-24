@@ -213,14 +213,15 @@ def merge_prospects(
 
 def dedupe_after_cascade(session, property_ids: list[int]) -> None:
     """
-    Post-cascade mobile dedup: if two active prospects share a validated mobile,
-    merge the newer one into the older (stable IDs survive).
-
-    Sprint 1 scope: mobile match only. APN+name, address, voter ID deferred.
+    Post-cascade dedup across three match keys (older created_at wins):
+      1. Validated mobile phone (enriched_contacts)
+      2. Owner name + mailing address (owners)
+      3. Voter ID — same county_id + source_voter_id on different properties
     """
     if not property_ids:
         return
 
+    # --- Pass 1: Mobile match ---
     rows = session.execute(sa_text("""
         SELECT
             p.prospect_id,
@@ -238,31 +239,108 @@ def dedupe_after_cascade(session, property_ids: list[int]) -> None:
         ORDER BY ec.enriched_at DESC
     """), {"pids": property_ids}).fetchall()
 
-    # Build mobile → earliest prospect map
-    mobile_to_prospect: dict[str, tuple] = {}  # mobile → (prospect_id, created_at)
-    merges: list[tuple[str, str]] = []          # (surviving_id, merged_id)
-
+    mobile_to_prospect: dict[str, tuple] = {}
+    mobile_merges: list[tuple[str, str]] = []
     for row in rows:
         mobile = row.mobile_phone.strip()
-        pid    = str(row.prospect_id)
+        pid = str(row.prospect_id)
         if mobile not in mobile_to_prospect:
             mobile_to_prospect[mobile] = (pid, row.created_at)
         else:
             surviving_pid, surviving_created = mobile_to_prospect[mobile]
-            # Older created_at wins (stable IDs)
             if row.created_at < surviving_created:
-                merges.append((pid, surviving_pid))
+                mobile_merges.append((pid, surviving_pid))
                 mobile_to_prospect[mobile] = (pid, row.created_at)
             else:
-                merges.append((surviving_pid, pid))
+                mobile_merges.append((surviving_pid, pid))
 
-    for surviving_id, merged_id in merges:
+    for surviving_id, merged_id in mobile_merges:
         merge_prospects(
             session,
             surviving_id=surviving_id,
             merged_id=merged_id,
             field_decisions={"reason": "mobile_dedup", "mobile_match": True},
         )
+    if mobile_merges:
+        logger.info("[Prospects] dedupe mobile: %d merge(s)", len(mobile_merges))
 
-    if merges:
-        logger.info("[Prospects] dedupe_after_cascade merged %d duplicate(s)", len(merges))
+    # --- Pass 2: Owner name + mailing address match ---
+    rows = session.execute(sa_text("""
+        SELECT
+            p.prospect_id,
+            p.created_at,
+            o.owner_name,
+            o.mailing_address
+        FROM prospects p
+        JOIN owners o ON o.property_id = p.property_id
+        WHERE p.property_id = ANY(:pids)
+          AND p.merged_into_id IS NULL
+          AND o.owner_name IS NOT NULL AND o.owner_name != ''
+          AND o.mailing_address IS NOT NULL AND o.mailing_address != ''
+    """), {"pids": property_ids}).fetchall()
+
+    def _norm(s: str) -> str:
+        return " ".join(s.lower().strip().split())
+
+    name_addr_map: dict[tuple, tuple] = {}
+    name_addr_merges: list[tuple[str, str]] = []
+    for row in rows:
+        key = (_norm(row.owner_name), _norm(row.mailing_address))
+        pid = str(row.prospect_id)
+        if key not in name_addr_map:
+            name_addr_map[key] = (pid, row.created_at)
+        else:
+            surviving_pid, surviving_created = name_addr_map[key]
+            if row.created_at < surviving_created:
+                name_addr_merges.append((pid, surviving_pid))
+                name_addr_map[key] = (pid, row.created_at)
+            else:
+                name_addr_merges.append((surviving_pid, pid))
+
+    for surviving_id, merged_id in name_addr_merges:
+        merge_prospects(
+            session,
+            surviving_id=surviving_id,
+            merged_id=merged_id,
+            field_decisions={"reason": "name_address_dedup"},
+        )
+    if name_addr_merges:
+        logger.info("[Prospects] dedupe name+address: %d merge(s)", len(name_addr_merges))
+
+    # --- Pass 3: Voter ID match ---
+    # The DB unique constraint uq_voter_county_source_id prevents two properties
+    # from sharing a voter in a healthy system; this pass is a defensive net.
+    rows = session.execute(sa_text("""
+        SELECT DISTINCT
+            p1.prospect_id  AS p1_id,
+            p1.created_at   AS p1_created,
+            p2.prospect_id  AS p2_id,
+            p2.created_at   AS p2_created
+        FROM prospects p1
+        JOIN voters v1 ON v1.property_id = p1.property_id
+        JOIN voters v2 ON v2.county_id = v1.county_id
+                      AND v2.source_voter_id = v1.source_voter_id
+                      AND v2.property_id != v1.property_id
+        JOIN prospects p2 ON p2.property_id = v2.property_id
+        WHERE p1.property_id = ANY(:pids)
+          AND p1.merged_into_id IS NULL
+          AND p2.merged_into_id IS NULL
+          AND p1.prospect_id < p2.prospect_id
+    """), {"pids": property_ids}).fetchall()
+
+    voter_merges: list[tuple[str, str]] = []
+    for row in rows:
+        if row.p1_created <= row.p2_created:
+            voter_merges.append((str(row.p1_id), str(row.p2_id)))
+        else:
+            voter_merges.append((str(row.p2_id), str(row.p1_id)))
+
+    for surviving_id, merged_id in voter_merges:
+        merge_prospects(
+            session,
+            surviving_id=surviving_id,
+            merged_id=merged_id,
+            field_decisions={"reason": "voter_id_dedup"},
+        )
+    if voter_merges:
+        logger.info("[Prospects] dedupe voter ID: %d merge(s)", len(voter_merges))
