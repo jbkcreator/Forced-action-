@@ -234,6 +234,15 @@ COUNTY_ID=hillsborough
 # CDS Scoring Engine         — 07:00 AM UTC Mon-Sat (after all scrapers complete)
 0 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.services.cds_engine --rescore-new-signals
 
+# ── FEEDBACK RITUAL EXPORT (4.3) ─────────────────────────────
+# Closes the Human Feedback Ritual loop: turns admin-reviewed flagged Cora
+# interactions (cora_training_overrides, source='feedback_ritual',
+# review_outcome approved|needs_correction) into a JSONL fine-tuning dataset and
+# flips those rows to queue_status='exported'. Idempotent — only picks up newly
+# reviewed rows. Runs daily 08:20 UTC Mon-Sat, after GHL sync (08:00) so
+# corrections don't wait for the weekly review to land in the dataset.
+20 8 * * 1-6 $PROJECT/scripts/cron/run.sh src.services.feedback_ritual_export
+
 # ── ENRICHMENT RECONCILIATION SWEEP (ADR 0016) ───────────────
 # Skip Tracing — 07:30 AM UTC Mon-Sat, after CDS scoring (07:00), before GHL sync (08:00).
 # Backstop for the event-driven enrichment consumer: gold_lead_scored events ride

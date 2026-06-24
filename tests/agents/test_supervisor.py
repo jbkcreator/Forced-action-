@@ -176,3 +176,21 @@ def test_wave2_with_decision_id_routes_through():
 	assert r["outcome"] == "routed"
 	mock_runner.assert_called_once()
 	assert mock_runner.call_args.kwargs["decision_id"] == "shared-uuid"
+
+
+def test_feedback_ritual_candidate_routes_to_feedback_ritual_processor():
+	with patch("src.agents.supervisor.log_decision"), \
+		 patch("src.agents.supervisor.db") as mock_db, \
+		 patch("src.services.feedback_ritual.process_feedback_ritual_candidate") as mock_process:
+		r = dispatch_event({
+			"event_type": "feedback_ritual_candidate",
+			"payload": {
+				"decision_id": "dec-777",
+				"graph_name": "retention",
+				"terminal_status": "aborted",
+			},
+		})
+
+	assert r["outcome"] == "routed"
+	assert r["graph_name"] == "feedback_ritual"
+	mock_process.assert_called_once_with(mock_db.session, "dec-777", actor="system")

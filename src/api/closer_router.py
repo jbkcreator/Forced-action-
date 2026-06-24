@@ -328,7 +328,7 @@ def create_teaching_correction(
     row = CoraTrainingOverride(
         source="closer_teach",
         subject_type="property",
-        subject_id=req.subject_id,
+        subject_ref=str(req.subject_id),
         closer_call_id=req.closer_call_id,
         correction_reason=req.correction_reason,
         signal_type=req.signal_type,
@@ -349,13 +349,13 @@ def create_teaching_correction(
             existing = db.execute(
                 text(
                     "SELECT * FROM cora_training_overrides "
-                    "WHERE subject_id = :sid AND correction_reason = :reason "
+                    "WHERE subject_ref = :sid AND correction_reason = :reason "
                     "  AND COALESCE(signal_type, '') = COALESCE(:sig, '') "
                     "  AND dampener_active "
                     "LIMIT 1"
                 ),
                 {
-                    "sid": req.subject_id,
+                    "sid": str(req.subject_id),
                     "reason": req.correction_reason,
                     "sig": req.signal_type,
                 },
@@ -474,15 +474,15 @@ def subscriber_delivered_leads(
         corr_rows = db.execute(
             text(
                 """
-                SELECT id, subject_id, correction_reason, signal_type
+                SELECT id, subject_ref AS subject_id, correction_reason, signal_type
                 FROM cora_training_overrides
                 WHERE subject_type = 'property'
-                  AND subject_id = ANY(:pids)
+                  AND subject_ref = ANY(:pids)
                   AND dampener_active
                 ORDER BY created_at
                 """
             ),
-            {"pids": property_ids},
+            {"pids": [str(pid) for pid in property_ids]},
         ).fetchall()
         for c in corr_rows:
             corrections_by_pid.setdefault(c.subject_id, []).append({

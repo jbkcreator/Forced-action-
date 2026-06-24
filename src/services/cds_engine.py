@@ -898,7 +898,7 @@ class MultiVerticalScorer:
         self,
         property_ids: Optional[List[int]] = None,
     ) -> Dict[int, List[Dict]]:
-        """Load all active teaching corrections, keyed by subject_id.
+        """Load all active teaching corrections, keyed by property id.
 
         If property_ids is given, restricts to those IDs (avoids full-table scan
         for targeted single/batch rescores).  Called once per scoring run to avoid
@@ -908,13 +908,13 @@ class MultiVerticalScorer:
         where = "WHERE subject_type = 'property' AND dampener_active = TRUE"
         params: Dict = {}
         if property_ids:
-            where += " AND subject_id = ANY(:pids)"
-            params["pids"] = property_ids
+            where += " AND subject_ref = ANY(:pids)"
+            params["pids"] = [str(pid) for pid in property_ids]
 
         try:
             rows = self.session.execute(
                 sa_text(
-                    f"SELECT subject_id, correction_reason, signal_type, created_at"
+                    f"SELECT subject_ref, correction_reason, signal_type, created_at"
                     f" FROM cora_training_overrides {where}"
                 ),
                 params,
@@ -926,7 +926,7 @@ class MultiVerticalScorer:
 
         result: Dict[int, List[Dict]] = _defaultdict(list)
         for r in rows:
-            result[r.subject_id].append({
+            result[int(r.subject_ref)].append({
                 "correction_reason": r.correction_reason,
                 "signal_type": r.signal_type,
                 "created_at": r.created_at,

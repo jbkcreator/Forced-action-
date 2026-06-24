@@ -332,6 +332,25 @@ class TestTeachEndpointCreate:
         finally:
             _cleanup(app)
 
+    def test_valid_non_residential_stores_property_subject_as_string_ref(self, app, mock_admin):
+        session = _mock_session_for_teach(property_exists=True)
+        client = _make_test_client(app, session, mock_admin)
+        try:
+            with patch("src.api.closer_router.CDSEngine") as mock_engine_cls:
+                mock_engine_cls.return_value.score_properties_by_ids.return_value = []
+                resp = client.post(
+                    "/api/admin/closer/teach",
+                    json={"subject_id": 1, "correction_reason": "non_residential"},
+                    headers={"Authorization": "Bearer test"},
+                )
+            assert resp.status_code == 201
+            saved_row = session.add.call_args.args[0]
+            assert saved_row.subject_type == "property"
+            assert saved_row.subject_ref == "1"
+            assert saved_row.subject_id == 1
+        finally:
+            _cleanup(app)
+
     def test_invalid_reason_returns_422(self, app, mock_admin):
         session = _mock_session_for_teach()
         client = _make_test_client(app, session, mock_admin)

@@ -6117,26 +6117,33 @@ class CoraTrainingOverride(Base):
     # Discriminator — which workflow produced this correction.
     source: Mapped[str] = mapped_column(String(30), nullable=False)
 
-    # Polymorphic subject — A6 fixes subject_type='property'; 4.3 will introduce
-    # its own subject_type when it is built (no migration needed).
+    # Polymorphic subject — stored as an opaque string ref so A6 property ids and
+    # 4.3 agent decision ids can share one queue table.
     subject_type: Mapped[str] = mapped_column(String(30), nullable=False)
-    subject_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    subject_ref: Mapped[str] = mapped_column(String(80), nullable=False)
 
     # Optional provenance: which closer call triggered this correction.
     closer_call_id: Mapped[Optional[int]] = mapped_column(
         Integer, ForeignKey("closer_calls.id", ondelete="SET NULL"), nullable=True
     )
 
-    # Correction details (A6 vocab; 4.3 will add its own reason types).
-    correction_reason: Mapped[str] = mapped_column(String(40), nullable=False)
+    # Correction details. A6 writes these at creation time; 4.3 fills them after
+    # human review, so they may start null for queued feedback ritual rows.
+    correction_reason: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
     signal_type: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
     note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    corrected_output: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # Dampener state — False for bad_contact/other (label-only corrections).
     dampener_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
     # Fine-tuning queue state.
     queue_status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    review_outcome: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    reviewed_by: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    snapshot_payload: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    source_metadata: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
 
     created_by: Mapped[str] = mapped_column(String(120), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -6155,10 +6162,29 @@ class CoraTrainingOverride(Base):
         # Hot-path read: engine fetches active corrections per property at score time.
         Index(
             "idx_cora_overrides_subject_active",
-            "subject_type", "subject_id", "dampener_active",
+            "subject_type", "subject_ref", "dampener_active",
         ),
         # Queue consumer reads pending rows.
         Index("idx_cora_overrides_queue_status", "queue_status"),
+        # A6 duplicate protection: one active property correction per reason/signal.
+        Index(
+            "uq_cora_override_active",
+            "subject_ref",
+            "correction_reason",
+            text("COALESCE(signal_type, '')"),
+            unique=True,
+            postgresql_where=text(
+                "dampener_active AND subject_type = 'property' AND correction_reason IS NOT NULL"
+            ),
+        ),
+        # 4.3 duplicate protection: one queue row per reviewed Cora Touch.
+        Index(
+            "uq_cora_feedback_ritual_subject",
+            "subject_type",
+            "subject_ref",
+            unique=True,
+            postgresql_where=text("source = 'feedback_ritual'"),
+        ),
         CheckConstraint(
             "source IN ('closer_teach', 'feedback_ritual')",
             name="ck_cora_overrides_source",
@@ -6167,11 +6193,31 @@ class CoraTrainingOverride(Base):
             "queue_status IN ('pending', 'exported', 'discarded')",
             name="ck_cora_overrides_queue_status",
         ),
+        CheckConstraint(
+            "review_outcome IS NULL OR review_outcome IN ('approved', 'needs_correction', 'discarded')",
+            name="ck_cora_overrides_review_outcome",
+        ),
     )
 
     def __repr__(self) -> str:
         return (
-            f"<CoraTrainingOverride(id={self.id}, subject={self.subject_type}:{self.subject_id}, "
+            f"<CoraTrainingOverride(id={self.id}, subject={self.subject_type}:{self.subject_ref}, "
             f"reason={self.correction_reason}, active={self.dampener_active}, "
             f"queue={self.queue_status})>"
         )
+
+    @property
+    def subject_id(self):
+        """Backward-compat shim for A6 property corrections."""
+        if self.subject_ref is None:
+            return None
+        if self.subject_type == "property":
+            try:
+                return int(self.subject_ref)
+            except (TypeError, ValueError):
+                return self.subject_ref
+        return self.subject_ref
+
+    @subject_id.setter
+    def subject_id(self, value):
+        self.subject_ref = None if value is None else str(value)

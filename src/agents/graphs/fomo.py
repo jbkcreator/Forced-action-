@@ -39,12 +39,14 @@ from src.agents.context_utils import build_personalization_fields
 from src.agents.prompts.loader import render_fallback_body, render_for_subscriber_auto
 from src.agents.subgraphs.compose_and_send import run_compose_and_send
 from src.agents.subgraphs.decision_hierarchy import run_decision_hierarchy
+from src.agents.tools.write_tools import log_decision
 from src.agents.tools.read_tools import (
 	get_competition_status,
 	get_segment_and_score,
 	get_subscriber_profile,
 	get_zip_activity,
 )
+from src.services.feedback_ritual import publish_feedback_ritual_candidate
 from src.services.kill_switch_service import get_cached_metric
 
 
@@ -97,6 +99,23 @@ class FOMOState(TypedDict, total=False):
 	cost_usd: float
 	terminal_status: str
 	failure_reason: str
+
+
+def _build_review_capture(state: FOMOState) -> dict:
+	payload = state.get("event_payload") or {}
+	return {
+		"raw_input_text": (
+			"competitor_acted_on_lead "
+			f"zip_code={payload.get('zip_code') or ''} "
+			f"vertical={payload.get('vertical') or ''} "
+			f"lead_tier={payload.get('lead_tier') or ''}"
+		).strip(),
+		"generated_output_text": state.get("message_body") or "",
+		"confidence_score": None,
+		"confidence_reason": None,
+		"review_flag": True,
+		"review_flag_reason": state.get("failure_reason") or "fomo_early_abort",
+	}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -277,8 +296,6 @@ def _node_compose_and_send(state: FOMOState) -> FOMOState:
 
 
 def _node_finalize(state: FOMOState) -> FOMOState:
-	from src.agents.tools.write_tools import log_decision
-
 	final_status = state.get("terminal_status") or "completed"
 
 	# Early-abort audit: compose_and_send writes its own log on the happy path;
@@ -294,7 +311,16 @@ def _node_finalize(state: FOMOState) -> FOMOState:
 				terminal_status=final_status,
 				tokens_used=int(state.get("tokens_used", 0) or 0),
 				cost_usd=float(state.get("cost_usd", 0.0) or 0.0),
-				summary={"failure_reason": state.get("failure_reason"), "early_abort": True},
+				summary={
+					"failure_reason": state.get("failure_reason"),
+					"early_abort": True,
+					"review_capture": _build_review_capture(state),
+				},
+			)
+			publish_feedback_ritual_candidate(
+				decision_id=state["decision_id"],
+				graph_name=GRAPH_NAME,
+				terminal_status=final_status,
 			)
 		except Exception:
 			pass
