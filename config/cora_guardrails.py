@@ -176,6 +176,9 @@ KILL_SWITCH = {
         "requires_approval": True,
         "kill_after_red_days": 14,           # longer kill window
         "direction": "higher_is_better",
+        # When no live metric is available (Redis down / metric not yet
+        # ingested), treat as green so Cora can still run retention flows.
+        "no_metric_behavior": "green",
     },
     "sms_reply_rate":      {
         "green": 8,  "yellow": (5, 8),   "red": 5,

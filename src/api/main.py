@@ -172,6 +172,8 @@ app.include_router(loss_autopsy_router)
 
 from src.api.heuristics_router import router as heuristics_router  # noqa: E402
 app.include_router(heuristics_router)
+from src.api.snapshot_router import router as snapshot_router  # noqa: E402
+app.include_router(snapshot_router)
 
 
 # ---------------------------------------------------------------------------
@@ -4384,6 +4386,19 @@ def deal_capture(payload: DealCaptureRequest, db: Session = Depends(get_db)):
 
     graphic_url: Optional[str] = None
     annual_offered = False
+
+    # Phase 3 A5: pre-decision snapshot (captures all 6 vertical scores at routing time)
+    try:
+        from src.services.snapshot_service import capture_snapshot
+        capture_snapshot(
+            property_id=outcome.property_id,
+            db=db,
+            deal_outcome_id=outcome.id,
+            selected_vertical=sub.vertical,
+            outcome_status="lost" if payload.deal_size_bucket == "skip" else "funded",
+        )
+    except Exception as exc:
+        logger.warning("[DealCapture] snapshot capture failed: %s", exc)
 
     # Phase 3 A1: loss autopsy for closed_lost deals (deal_size_bucket == "skip")
     if payload.deal_size_bucket == "skip":

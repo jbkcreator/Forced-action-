@@ -218,6 +218,14 @@ def kill_switch_status(feature: str, observed_value: Optional[float] = None) -> 
 		}
 
 	if observed_value is None:
+		no_metric_behavior = band.get("no_metric_behavior")
+		if no_metric_behavior in _VALID_OVERRIDE_COLORS:
+			return {
+				"feature": feature,
+				"color": no_metric_behavior,
+				"reason": "no_observed_value_using_config_default",
+				"band": band,
+			}
 		return {
 			"feature": feature,
 			"color": "unknown",

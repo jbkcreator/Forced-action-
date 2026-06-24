@@ -2679,6 +2679,67 @@ class LossAutopsy(Base):
         return f"<LossAutopsy(id={self.id}, trigger={self.trigger_reason}, reason={self.primary_rejection_reason})>"
 
 
+class PreDecisionSnapshot(Base):
+    """
+    Pre-routing context snapshot captured at deal_outcome creation time.
+
+    Stores all 6 CDS vertical scores (the roads not taken), the selected vertical,
+    active pricing cohort, Cora graph, and pitch variant so the future A5b
+    counterfactual engine can compare actual vs. alternative paths on resolution.
+
+    Broker fields (broker_id, alternative_brokers) are nullable stubs — wirable
+    when the broker routing layer is built without a schema migration.
+    """
+    __tablename__ = "pre_decision_snapshots"
+
+    id: Mapped[object] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
+    property_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("properties.id", ondelete="SET NULL"), nullable=True)
+    prospect_id: Mapped[Optional[object]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("prospects.prospect_id", ondelete="SET NULL"), nullable=True)
+    deal_outcome_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("deal_outcomes.id", ondelete="SET NULL"), nullable=True)
+
+    snapshot_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    selected_vertical: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    lead_tier: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    final_cds_score: Mapped[Optional[float]] = mapped_column(Numeric(5, 2), nullable=True)
+    distress_types: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+
+    all_vertical_scores: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    runner_up_verticals: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
+
+    pricing_cohort_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    pricing_snapshot: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    cora_graph: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    pitch_variant: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+
+    raw_context: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    outcome_status: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+
+    # Broker stub — populate when broker routing layer is built
+    broker_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    alternative_brokers: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
+
+    counterfactual_run: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("FALSE"))
+    counterfactual_run_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        Index("uq_pds_deal_outcome", "deal_outcome_id", unique=True,
+              postgresql_where=text("deal_outcome_id IS NOT NULL")),
+        Index("idx_pds_property_id", "property_id"),
+        Index("idx_pds_snapshot_ts", "snapshot_ts"),
+        Index("idx_pds_selected_vertical", "selected_vertical"),
+        Index("idx_pds_outcome_status", "outcome_status"),
+        Index("idx_pds_pending_cf", "id",
+              postgresql_where=text("counterfactual_run = FALSE AND outcome_status IS NOT NULL")),
+    )
+
+    def __repr__(self) -> str:
+        return f"<PreDecisionSnapshot(id={self.id}, vertical={self.selected_vertical}, outcome={self.outcome_status})>"
+
+
 class SubscriberTag(Base):
     """Tags applied to subscribers for segmentation and filtering."""
     __tablename__ = "subscriber_tags"
