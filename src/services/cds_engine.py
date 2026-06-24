@@ -2220,7 +2220,14 @@ class MultiVerticalScorer:
                             teaching_corrections=_corrections_by_pid.get(prop.id, []),
                         )
 
-                    if score_data["signal_count"] == 0 or score_data["final_cds_score"] == 0:
+                    # A property with an active Teaching Correction (A6) must be
+                    # persisted even when the dampener drives it to zero — otherwise
+                    # its stale high score remains the latest row and the dampener
+                    # is invisible downstream. Uncorrected zero/no-signal properties
+                    # are still skipped (the nightly run never writes empty rows).
+                    _is_zero = score_data["signal_count"] == 0 or score_data["final_cds_score"] == 0
+                    _is_dampened = bool(_corrections_by_pid.get(prop.id))
+                    if _is_zero and not _is_dampened:
                         no_signal_count += 1
                     else:
                         with_signal_batch.append(score_data)
