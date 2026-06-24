@@ -276,6 +276,23 @@ deal_hits AS (
        AND dlo.deal_date >  se.score_date
        AND dlo.deal_date <= se.score_date + (:outcome_window_days * INTERVAL '1 day')
     GROUP BY se.property_id, se.score_date
+),
+feedback_hits AS (
+    -- score_feedback outcomes from homeowner calls. realized_outcome is
+    -- populated when homeowner outbound calling is wired up (M5 intake).
+    SELECT
+        se.property_id,
+        se.score_date,
+        MAX(CASE WHEN sf.realized_outcome IN ('converted','funded')
+                 THEN 1 ELSE 0 END) AS outcome_positive
+    FROM score_events se
+    JOIN prospects p ON p.property_id = se.property_id
+    JOIN score_feedback sf ON sf.prospect_id = p.prospect_id
+    WHERE sf.realized_outcome IS NOT NULL
+      AND sf.resolved_at IS NOT NULL
+      AND sf.resolved_at > se.score_date
+      AND sf.resolved_at <= se.score_date + (:outcome_window_days * INTERVAL '1 day')
+    GROUP BY se.property_id, se.score_date
 )
 SELECT
     se.property_id,
@@ -283,14 +300,17 @@ SELECT
     LEAST(dh.event_date, fh.event_date) AS event_date,
     dh.event_date                        AS deed_event_date,
     fh.event_date                        AS fc_event_date,
-    dl.event_date                        AS deal_event_date
+    dl.event_date                        AS deal_event_date,
+    fb.outcome_positive                  AS feedback_outcome_positive
 FROM score_events se
-LEFT JOIN deed_hits dh ON dh.property_id = se.property_id AND dh.score_date = se.score_date
-LEFT JOIN fc_hits   fh ON fh.property_id = se.property_id AND fh.score_date = se.score_date
-LEFT JOIN deal_hits dl ON dl.property_id = se.property_id AND dl.score_date = se.score_date
+LEFT JOIN deed_hits     dh ON dh.property_id = se.property_id AND dh.score_date = se.score_date
+LEFT JOIN fc_hits       fh ON fh.property_id = se.property_id AND fh.score_date = se.score_date
+LEFT JOIN deal_hits     dl ON dl.property_id = se.property_id AND dl.score_date = se.score_date
+LEFT JOIN feedback_hits fb ON fb.property_id = se.property_id AND fb.score_date = se.score_date
 WHERE dh.event_date IS NOT NULL
    OR fh.event_date IS NOT NULL
    OR dl.event_date IS NOT NULL
+   OR fb.outcome_positive = 1
 """
 
 
@@ -389,12 +409,15 @@ def build_training_dataset(session, cfg: BuilderConfig) -> Iterable[dict]:
         outcome_event = 0
         outcome_event_date = None
         outcome_deal = 0
+        outcome_feedback = 0
         if outcome is not None:
             if outcome.get("event_date"):
                 outcome_event = 1
                 outcome_event_date = outcome["event_date"]
             if outcome.get("deal_event_date"):
                 outcome_deal = 1
+            if outcome.get("feedback_outcome_positive"):
+                outcome_feedback = 1
 
         vertical_scores = s["vertical_scores"] or {}
 
@@ -433,6 +456,7 @@ def build_training_dataset(session, cfg: BuilderConfig) -> Iterable[dict]:
                 "outcome_event":        outcome_event,
                 "outcome_event_date":   outcome_event_date.isoformat() if outcome_event_date else None,
                 "outcome_deal":         outcome_deal,
+                "outcome_feedback":     outcome_feedback,
             }
 
 
@@ -453,7 +477,7 @@ def _row_columns() -> list[str]:
     for sig in SIGNAL_TYPES:
         base.append(f"has_{sig}")
         base.append(f"recency_{sig}_days")
-    base += ["outcome_event", "outcome_event_date", "outcome_deal"]
+    base += ["outcome_event", "outcome_event_date", "outcome_deal", "outcome_feedback"]
     return base
 
 

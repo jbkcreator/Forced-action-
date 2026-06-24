@@ -6092,3 +6092,69 @@ class FreeToPaidAttribution(Base):
 
     def __repr__(self) -> str:
         return f"<FreeToPaidAttribution(account_id={self.account_id}, free_leads={self.free_leads_count})>"
+
+
+# ============================================================================
+# C2 / M5 — CDS Score Feedback (S1 / 414 Stream A)
+# ============================================================================
+
+
+class ScoreFeedback(Base):
+    """
+    CDS scoring feedback loop — one row per prospect outcome (spec §4.4).
+
+    Records what the model predicted (predicted_tier from the Truth Engine verdict)
+    vs what actually happened on a homeowner call (realized_outcome). Delta is the
+    gap between predicted rate and actual rate — fed to scoring_fit.py for retraining.
+
+    closer_call_id is nullable: homeowner outbound calling is not built yet.
+    It will be populated and wired when that system is implemented.
+
+    Grade names follow GRADE_ORDER from config/grading.py:
+        sub_grade < Bronze < Silver < Gold < Platinum < Ultra
+    Always use 'Ultra' — distress_scores.lead_tier uses the legacy 'Ultra Platinum'.
+    """
+    __tablename__ = "score_feedback"
+
+    score_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("generate_uuidv7()"),
+    )
+    prospect_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("prospects.prospect_id", ondelete="RESTRICT"),
+        nullable=False,
+        unique=True,
+    )
+    closer_call_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    predicted_tier: Mapped[str] = mapped_column(String, nullable=False)
+    predicted_rate: Mapped[Optional[Decimal]] = mapped_column(Numeric(6, 4), nullable=True)
+    realized_outcome: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    delta: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4), nullable=True)
+    scored_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("NOW()"),
+    )
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "predicted_tier IN ('Bronze','Silver','Gold','Platinum','Ultra','sub_grade')",
+            name="ck_score_feedback_predicted_tier",
+        ),
+        CheckConstraint(
+            "realized_outcome IS NULL OR "
+            "realized_outcome IN ('contacted','converted','funded','dead')",
+            name="ck_score_feedback_realized_outcome",
+        ),
+        Index("idx_score_feedback_prospect_id", "prospect_id"),
+        Index("idx_score_feedback_predicted_tier", "predicted_tier"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<ScoreFeedback(prospect_id={self.prospect_id}, "
+            f"predicted_tier='{self.predicted_tier}', outcome='{self.realized_outcome}')>"
+        )

@@ -169,6 +169,9 @@ app.include_router(signals_router)
 from src.api.verdict_router import router as verdict_router  # noqa: E402
 app.include_router(verdict_router)
 
+from src.api.score_feedback_router import router as score_feedback_router  # noqa: E402
+app.include_router(score_feedback_router)
+
 
 # ---------------------------------------------------------------------------
 # Global exception handlers
