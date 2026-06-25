@@ -85,7 +85,9 @@ def _node_assemble_context(state: VoiceDropState) -> VoiceDropState:
     from config.settings import get_settings
     from sqlalchemy import text
 
-    subscriber_id: int = state.get("subscriber_id", 0)
+    subscriber_id = state.get("subscriber_id")
+    if not subscriber_id:
+        return {"terminal_status": "aborted", "failure_reason": "voice_drop:missing_subscriber_id"}
     profile = get_subscriber_profile(subscriber_id)
     if not profile:
         return {"terminal_status": "aborted", "failure_reason": "voice_drop:subscriber_not_found"}
@@ -141,7 +143,7 @@ def _node_hierarchy_check(state: VoiceDropState) -> VoiceDropState:
         return {}
 
     hierarchy = run_decision_hierarchy({
-        "subscriber_id": state.get("subscriber_id", 0),
+        "subscriber_id": state.get("subscriber_id"),
         "graph_name": GRAPH_NAME,
         "kill_switch_feature": KILL_SWITCH_FEATURE,
         "kill_switch_observed_value": get_cached_metric(KILL_SWITCH_FEATURE),
@@ -186,7 +188,7 @@ def _node_initiate_drop(state: VoiceDropState) -> VoiceDropState:
         if created_at else 0
     )
 
-    subscriber_id: int = state.get("subscriber_id", 0)
+    subscriber_id: int = state.get("subscriber_id")  # validated in assemble_context
     decision_id: str = state.get("decision_id", "")
     phone: str = state.get("phone", "")
     agent_id: str = state.get("agent_id", "")
@@ -227,7 +229,17 @@ def _node_initiate_drop(state: VoiceDropState) -> VoiceDropState:
 
             # Allotment gate — wallet holders are unlimited; free-tier subscribers
             # are capped at 1 voicemail/week. consume() handles both cases.
-            if not allotment_consume(subscriber_id, "voicemail", db):
+            # Separate exception from cap rejection: an unexpected error must not
+            # be silently misreported as a weekly-cap hit.
+            try:
+                consumed = allotment_consume(subscriber_id, "voicemail", db)
+            except Exception as exc:
+                logger.error(
+                    "voice_drop allotment_consume raised unexpectedly: subscriber=%s error=%s",
+                    subscriber_id, exc,
+                )
+                raise
+            if consumed is False:
                 logger.info(
                     "voice_drop blocked by allotment cap: subscriber=%s",
                     subscriber_id,
@@ -239,7 +251,7 @@ def _node_initiate_drop(state: VoiceDropState) -> VoiceDropState:
                     "failure_reason": "allotment:voicemail_weekly_cap",
                 }
     except (KeyError, AttributeError):
-        # compliance or allotment raised unexpectedly — propagate to LangGraph
+        # compliance gate raised unexpectedly — propagate to LangGraph
         raise
 
     call_id = initiate_call(

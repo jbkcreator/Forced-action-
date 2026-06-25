@@ -330,7 +330,14 @@ def send_sms(
             return False
 
     # 3. Per-subscriber marketing frequency cap and free-tier weekly allotment.
-    # Transactional, opt_in_prompt, and messages without a known subscriber_id bypass both gates.
+    # Marketing without a subscriber_id (and not a prospect-targeted send) would
+    # bypass the allotment gate entirely. Fail closed rather than silently skip.
+    if message_type == "marketing" and subscriber_id is None and not prospect_id:
+        logger.warning("SMS suppressed (marketing_requires_subscriber_id): to=%s", to)
+        add_to_dead_letter(to, "error", {"body": body[:160], "error": "marketing_without_subscriber_id"}, db)
+        _log("suppressed", suppress_reason="marketing_requires_subscriber_id")
+        return False
+
     if message_type == "marketing" and subscriber_id is not None:
         if _check_marketing_frequency_cap(subscriber_id, db):
             logger.info(
