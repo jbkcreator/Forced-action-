@@ -127,11 +127,14 @@ def dispatch_event(event: Dict[str, Any]) -> Dict[str, Any]:
 	if event_type == "feedback_ritual_candidate":
 		try:
 			from src.services.feedback_ritual import process_feedback_ritual_candidate
-			process_feedback_ritual_candidate(
-				db.session,
-				(payload or {}).get("decision_id"),
-				actor="system",
-			)
+			# db is the Database singleton — it has no .session; open a transactional
+			# scope so the enqueued queue row actually commits (the processor doesn't).
+			with db.session_scope() as _s:
+				process_feedback_ritual_candidate(
+					_s,
+					(payload or {}).get("decision_id"),
+					actor="system",
+				)
 		except Exception as _feedback_exc:
 			logger.warning(
 				"supervisor: feedback ritual enqueue failed (decision=%s): %s",

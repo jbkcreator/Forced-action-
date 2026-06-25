@@ -193,4 +193,6 @@ def test_feedback_ritual_candidate_routes_to_feedback_ritual_processor():
 
 	assert r["outcome"] == "routed"
 	assert r["graph_name"] == "feedback_ritual"
-	mock_process.assert_called_once_with(mock_db.session, "dec-777", actor="system")
+	# Must run inside db.session_scope() (db has no .session) and pass that session.
+	expected_session = mock_db.session_scope.return_value.__enter__.return_value
+	mock_process.assert_called_once_with(expected_session, "dec-777", actor="system")
