@@ -129,15 +129,14 @@ def fulfill(purchase_id: int, db: Session) -> PremiumPurchase:
 
 
 def _fulfill_report_or_brief(purchase: PremiumPurchase, db: Session) -> str:
-    """
-    Generate a property report or lead brief artifact. Pending PDF templates
-    from design, this currently produces a JSON dossier reference and emails
-    the subscriber a link to their dashboard where the artifact will surface.
-    The artifact ref is `report:{property_id}` or `brief:{property_id}`.
-    """
     if not purchase.property_id:
         raise ValueError(f"{purchase.sku} requires property_id")
-    return f"{purchase.sku}:{purchase.property_id}"
+    from src.services.lead_report.report_data import build_report_data
+    from src.services.lead_report.pdf_export import render_lead_report_pdf
+    full = purchase.sku == "report"
+    data = build_report_data(purchase.property_id, db, full=full)
+    path = render_lead_report_pdf(data, purchase.id, full=full)
+    return str(path)
 
 
 def _fulfill_transfer(purchase: PremiumPurchase, db: Session) -> str:

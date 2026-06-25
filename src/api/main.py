@@ -5978,6 +5978,48 @@ def premium_purchase_endpoint(
     }
 
 
+@app.get("/api/premium/{purchase_id}/download")
+def download_premium_report(
+    purchase_id: int,
+    feed_uuid: str,
+    db: Session = Depends(get_db),
+):
+    """Download a delivered report or brief PDF.
+
+    404 on: not found, wrong owner, not a report/brief, past expires_at.
+    409 if status != 'delivered' (pending/failed).
+    """
+    from src.core.models import PremiumPurchase
+
+    purchase = db.get(PremiumPurchase, purchase_id)
+
+    # Ownership mismatch → 404 (never reveal another subscriber's purchase exists)
+    sub = db.execute(
+        select(Subscriber).where(Subscriber.event_feed_uuid == feed_uuid)
+    ).scalar_one_or_none()
+    if sub is None or purchase is None or purchase.subscriber_id != sub.id:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    if purchase.sku not in ("report", "brief"):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    if purchase.status != "delivered":
+        raise HTTPException(status_code=409, detail="Report not ready")
+
+    if not purchase.output_ref:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    output_path = Path(purchase.output_ref)
+    if not output_path.exists():
+        raise HTTPException(status_code=404, detail="Not found")
+
+    return FileResponse(
+        str(output_path),
+        media_type="application/pdf",
+        filename=f"lead-report-{purchase.property_id}.pdf",
+    )
+
+
 # ── Phase 2B: Missed-Call Voice Webhook ──────────────────────────────────────
 
 @app.post("/webhooks/telnyx/voice", include_in_schema=False)

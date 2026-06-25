@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>{{ "Lead Report" if full else "Lead Brief" }} — {{ header.address }}</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, "Segoe UI", Arial, sans-serif; font-size: 10px; color: #1a1a2e; background: #fff; }
+
+  .cover { padding: 28px 24px 20px; border-bottom: 3px solid #1a1a2e; display: flex; justify-content: space-between; align-items: flex-end; }
+  .cover h1 { font-size: 18px; font-weight: 800; }
+  .cover .label { font-size: 11px; color: #6b7280; margin-bottom: 4px; }
+  .cover .meta { font-size: 9px; color: #666; text-align: right; line-height: 1.7; }
+
+  .kpi-bar { display: flex; border-bottom: 1px solid #e5e7eb; }
+  .kpi { flex: 1; padding: 10px 14px; border-right: 1px solid #e5e7eb; }
+  .kpi:last-child { border-right: none; }
+  .kpi-label { font-size: 8px; text-transform: uppercase; letter-spacing: .06em; color: #6b7280; }
+  .kpi-value { font-size: 18px; font-weight: 700; margin-top: 2px; }
+  .kpi-sub { font-size: 8px; color: #9ca3af; }
+
+  .section { margin-top: 16px; }
+  .section-header { background: #1a1a2e; color: #fff; padding: 6px 14px; font-size: 11px; font-weight: 600; letter-spacing: .04em; }
+  .section-body { padding: 10px 14px; border: 1px solid #e5e7eb; border-top: none; }
+
+  .empty-state { background: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 6px; padding: 10px 14px; color: #94a3b8; font-size: 9px; }
+
+  .signal-grid { display: flex; flex-wrap: wrap; gap: 6px; padding: 6px 0; }
+  .signal { padding: 4px 10px; border-radius: 8px; font-size: 8px; font-weight: 600; background: #fef2f2; color: #991b1b; }
+
+  .tier-badge { display: inline-block; padding: 3px 12px; border-radius: 10px; font-size: 10px; font-weight: 700; }
+  .tier-Ultra { background: #fef3c7; color: #92400e; }
+  .tier-Platinum { background: #e0f2fe; color: #0c4a6e; }
+  .tier-Gold { background: #fef9c3; color: #713f12; }
+  .tier-Silver { background: #f1f5f9; color: #475569; }
+  .tier-Bronze { background: #fdf4ff; color: #6b21a8; }
+
+  .kv-table { width: 100%; border-collapse: collapse; margin-top: 4px; }
+  .kv-table tr { border-bottom: 1px solid #f1f5f9; }
+  .kv-table td { padding: 5px 8px; font-size: 9px; }
+  .kv-table td:first-child { color: #6b7280; width: 45%; }
+  .kv-table td:last-child { font-weight: 600; text-align: right; }
+
+  .permits-table { width: 100%; border-collapse: collapse; margin-top: 4px; }
+  .permits-table th { background: #f1f5f9; padding: 5px 8px; text-align: left; font-size: 8px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: #475569; border-bottom: 1px solid #e2e8f0; }
+  .permits-table td { padding: 5px 8px; font-size: 9px; border-bottom: 1px solid #f1f5f9; }
+  .enforcement { color: #dc2626; font-weight: 600; }
+
+  .score-bar-wrap { height: 8px; background: #e5e7eb; border-radius: 4px; margin: 6px 0; }
+  .score-bar { height: 8px; border-radius: 4px; background: linear-gradient(90deg, #16a34a, #ca8a04, #dc2626); }
+
+  .caveat { font-size: 8px; color: #9ca3af; margin-top: 8px; font-style: italic; border-top: 1px solid #f1f5f9; padding-top: 6px; }
+
+  .footer { margin-top: 20px; padding: 8px 14px; border-top: 1px solid #e5e7eb; font-size: 8px; color: #9ca3af; display: flex; justify-content: space-between; }
+</style>
+</head>
+<body>
+
+<!-- Cover -->
+<div class="cover">
+  <div>
+    <p class="label">{{ "Property Report" if full else "Lead Brief" }} — Cora Confidence Dossier</p>
+    <h1>{{ header.address }}</h1>
+    <p style="margin-top:5px;font-size:9px;color:#6b7280;">
+      {{ header.city }}{% if header.city and header.state %}, {% endif %}{{ header.state }} {{ header.zip }}
+      &nbsp;·&nbsp; Parcel: {{ header.parcel_id }}
+    </p>
+    {% if header.owner_name %}
+    <p style="margin-top:4px;font-size:10px;font-weight:600;">{{ header.owner_name }}</p>
+    {% endif %}
+  </div>
+  <div class="meta">
+    Generated {{ header.generated_date }}<br>
+    Forced Action Intelligence<br>
+    <span style="color:#dc2626;font-weight:700;">CONFIDENTIAL</span>
+  </div>
+</div>
+
+<!-- KPI Bar -->
+<div class="kpi-bar">
+  <div class="kpi">
+    <div class="kpi-label">CDS Score</div>
+    <div class="kpi-value">{{ "%.0f"|format(distress.final_cds_score) }}</div>
+    <div class="kpi-sub">Composite Distress Score</div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-label">Lead Tier</div>
+    <div class="kpi-value" style="font-size:14px;">
+      <span class="tier-badge tier-{{ distress.lead_tier }}">{{ distress.lead_tier }}</span>
+    </div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-label">Urgency</div>
+    <div class="kpi-value" style="font-size:14px;">{{ distress.urgency_level or "—" }}</div>
+  </div>
+  {% if equity.assessed_value_mkt %}
+  <div class="kpi">
+    <div class="kpi-label">Est. Equity</div>
+    <div class="kpi-value" style="font-size:13px;">
+      {% if equity.est_equity is not none %}${{ "{:,.0f}".format(equity.est_equity) }}{% else %}N/A{% endif %}
+    </div>
+    <div class="kpi-sub">lien-adjusted</div>
+  </div>
+  {% endif %}
+</div>
+
+<!-- Section 2: Distress Signals -->
+<div class="section">
+  <div class="section-header">2 — Distress Signals</div>
+  <div class="section-body">
+    {% if distress.distress_types %}
+    <div class="signal-grid">
+      {% if distress.distress_types is mapping %}
+        {% for signal, active in distress.distress_types.items() %}
+        {% if active %}<span class="signal">{{ signal | replace("_", " ") | title }}</span>{% endif %}
+        {% endfor %}
+      {% else %}
+        {% for signal in distress.distress_types %}
+        <span class="signal">{{ signal | replace("_", " ") | title }}</span>
+        {% endfor %}
+      {% endif %}
+    </div>
+    {% else %}
+    <p style="color:#9ca3af;font-size:9px;">No distress signals recorded.</p>
+    {% endif %}
+    {% if distress.vertical_scores %}
+    <table class="kv-table" style="margin-top:10px;">
+      <tr><td colspan="2" style="font-weight:700;font-size:9px;padding-bottom:4px;color:#1a1a2e;">Vertical Scores</td></tr>
+      {% for vertical, score in distress.vertical_scores.items() %}
+      <tr>
+        <td>{{ vertical | replace("_", " ") | title }}</td>
+        <td>{{ "%.1f"|format(score) }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% endif %}
+  </div>
+</div>
+
+<!-- Section 3: Equity -->
+<div class="section">
+  <div class="section-header">3 — Equity Profile</div>
+  <div class="section-body">
+    {% if equity.status == "empty" %}
+    <div class="empty-state">No assessed value on record.</div>
+    {% else %}
+    <table class="kv-table">
+      <tr>
+        <td>Assessed Market Value</td>
+        <td>${{ "{:,.0f}".format(equity.assessed_value_mkt) }}</td>
+      </tr>
+      {% if equity.total_lien_amount is not none %}
+      <tr>
+        <td>Total Lien Amount</td>
+        <td>${{ "{:,.0f}".format(equity.total_lien_amount) }}</td>
+      </tr>
+      {% endif %}
+      {% if equity.est_mortgage_bal is not none %}
+      <tr>
+        <td>Est. Mortgage Balance</td>
+        <td>${{ "{:,.0f}".format(equity.est_mortgage_bal) }}</td>
+      </tr>
+      {% endif %}
+      {% if equity.est_equity is not none %}
+      <tr>
+        <td style="font-weight:700;color:#1a1a2e;">Est. Equity (lien-adjusted)</td>
+        <td style="font-weight:700;color:{% if equity.est_equity > 0 %}#16a34a{% else %}#dc2626{% endif %};">
+          ${{ "{:,.0f}".format(equity.est_equity) }}
+          {% if equity.equity_pct is not none %} ({{ "%.1f"|format(equity.equity_pct) }}%){% endif %}
+        </td>
+      </tr>
+      {% endif %}
+    </table>
+    {% if equity.caveat %}
+    <p class="caveat">* Mortgage balance not yet recorded for this property — equity estimate excludes outstanding mortgage debt and may be overstated. Lien amounts shown are from public record only.</p>
+    {% endif %}
+    {% endif %}
+  </div>
+</div>
+
+{% if full %}
+<!-- Section 4: Permits -->
+<div class="section">
+  <div class="section-header">4 — Permit History</div>
+  <div class="section-body">
+    {% if permits.status == "empty" %}
+    <div class="empty-state">No permit records found for this property.</div>
+    {% else %}
+    <table class="permits-table">
+      <thead>
+        <tr>
+          <th>Type</th>
+          <th>Issued</th>
+          <th>Status</th>
+          <th>Description</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for permit in permits.rows %}
+        <tr>
+          <td {% if permit.is_enforcement_permit %}class="enforcement"{% endif %}>{{ permit.permit_type or "—" }}</td>
+          <td>{{ permit.issue_date.strftime("%m/%d/%Y") if permit.issue_date else "—" }}</td>
+          <td>{{ permit.status or "—" }}</td>
+          <td>{{ (permit.description or "")[:60] }}{% if permit.description and permit.description|length > 60 %}…{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+  </div>
+</div>
+
+<!-- Section 5: Contact Validity -->
+<div class="section">
+  <div class="section-header">5 — Contact Validity</div>
+  <div class="section-body">
+    {% if contact_validity.status == "empty" %}
+    <div class="empty-state">Contact data not yet verified for this owner.</div>
+    {% else %}
+    <table class="kv-table">
+      <tr>
+        <td>Confidence Label</td>
+        <td>{{ contact_validity.label | title }}</td>
+      </tr>
+      <tr>
+        <td>Confidence Score</td>
+        <td>{{ contact_validity.score_pct }}%</td>
+      </tr>
+      <tr>
+        <td>Corroborating Sources</td>
+        <td>{{ contact_validity.source_count }}</td>
+      </tr>
+      {% if contact_validity.rule_fired %}
+      <tr>
+        <td>Verification Rule</td>
+        <td>{{ contact_validity.rule_fired | replace("_", " ") | title }}</td>
+      </tr>
+      {% endif %}
+      {% if contact_validity.corroboration %}
+      <tr>
+        <td>Corroboration Detail</td>
+        <td>{{ contact_validity.corroboration }}</td>
+      </tr>
+      {% endif %}
+    </table>
+    <p class="caveat">Contact details (phone, email) are available via the Contact Transfer SKU and are not included in this report.</p>
+    {% endif %}
+  </div>
+</div>
+{% endif %}
+
+<!-- Footer -->
+<div class="footer">
+  <span>Forced Action Intelligence &nbsp;·&nbsp; {{ header.parcel_id }}</span>
+  <span>{{ header.generated_date }} &nbsp;·&nbsp; CONFIDENTIAL — Subscriber Use Only</span>
+</div>
+
+</body>
+</html>
