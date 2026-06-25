@@ -118,6 +118,7 @@ def handle_inbound(from_number: str, body: str, db: Session) -> Optional[str]:
         record_opt_out(from_number, keyword, "twilio_inbound", db)
         logger.info("SMS opt-out recorded: phone=%s keyword=%s", from_number, keyword)
         return _twiml_reply(_OPT_OUT_REPLY)
+    _project_sms_reply(from_number, body, db)
     return None
 
 
@@ -186,6 +187,31 @@ def record_opt_out(
     except Exception:
         logger.warning(
             "record_opt_out: revenue signal update failed for phone=%s",
+            phone, exc_info=True,
+        )
+
+    try:
+        from src.services.subscriber_memory import append_memory_event
+
+        sub_id = _resolve_subscriber_id_for_memory(phone, db)
+        if sub_id is not None:
+            append_memory_event(
+                db,
+                subscriber_id=sub_id,
+                stream_source="SMS",
+                event_type="sms_opt_out",
+                source_event_id=f"sms_opt_out:{phone}:{keyword.upper()[:20]}",
+                source_event_name="inbound_sms.stop",
+                occurred_at=datetime.now(timezone.utc),
+                status="opted_out",
+                summary="Subscriber opted out of SMS",
+                channel="sms",
+                actor={"type": "subscriber", "id": phone},
+                raw={"keyword": keyword.upper()[:20], "source": source},
+            )
+    except Exception:
+        logger.warning(
+            "record_opt_out: subscriber memory projection failed for phone=%s",
             phone, exc_info=True,
         )
 
@@ -485,6 +511,7 @@ def handle_opt_in_reply(from_number: str, body: str, db: Session) -> Optional[st
     word = body.strip().lower().split()[0] if body.strip() else ""
     if word not in _OPT_IN_KEYWORDS:
         return None
+
     from src.services import opt_in_sentinel
     phone = _normalize(from_number) or from_number
     if not opt_in_sentinel.consume_pending(phone):
@@ -495,6 +522,57 @@ def handle_opt_in_reply(from_number: str, body: str, db: Session) -> Optional[st
         "Reply STOP anytime to opt out."
     )
     return _twiml_reply(reply)
+
+
+def _resolve_subscriber_id_for_memory(phone: str, db: Session) -> Optional[int]:
+    row = db.execute(
+        select(SmsOptIn)
+        .where(SmsOptIn.phone == phone)
+        .order_by(SmsOptIn.opted_in_at.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    if row is not None and row.subscriber_id is not None:
+        return row.subscriber_id
+
+    from src.core.models import Subscriber
+
+    sub = db.execute(
+        select(Subscriber).where(Subscriber.phone == phone)
+    ).scalar_one_or_none()
+    return sub.id if sub is not None else None
+
+
+def _project_sms_reply(phone: str, body: str, db: Session) -> None:
+    phone = _normalize(phone)
+    if not phone:
+        return
+
+    try:
+        from src.services.subscriber_memory import append_memory_event
+
+        sub_id = _resolve_subscriber_id_for_memory(phone, db)
+        if sub_id is None:
+            return
+
+        append_memory_event(
+            db,
+            subscriber_id=sub_id,
+            stream_source="SMS",
+            event_type="sms_replied",
+            source_event_id=f"sms_reply:{phone}:{body.strip()[:80]}",
+            source_event_name="inbound_sms.reply",
+            occurred_at=datetime.now(timezone.utc),
+            status="replied",
+            summary="Subscriber replied to SMS",
+            channel="sms",
+            actor={"type": "subscriber", "id": phone},
+            raw={"body": body},
+        )
+    except Exception:
+        logger.warning(
+            "sms reply memory projection failed for phone=%s",
+            phone, exc_info=True,
+        )
 
 
 def check_dnc(phone: str, db: Session) -> bool:

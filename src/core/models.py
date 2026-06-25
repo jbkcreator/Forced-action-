@@ -1846,6 +1846,12 @@ class PlatformDailyStats(Base):
     retention_30d: Mapped[Optional[float]] = mapped_column(Numeric(7, 4), nullable=True)
     cac_paid_channels: Mapped[Optional[float]] = mapped_column(Numeric(10, 2), nullable=True)
 
+    # Stream self-diagnosis metrics (fa102) — fractions 0–1, NULL = not computed
+    enrichment_rate: Mapped[Optional[float]] = mapped_column(Numeric(7, 4), nullable=True)
+    dialable_rate: Mapped[Optional[float]] = mapped_column(Numeric(7, 4), nullable=True)
+    sms_delivery_rate: Mapped[Optional[float]] = mapped_column(Numeric(7, 4), nullable=True)
+    closer_conv_rate: Mapped[Optional[float]] = mapped_column(Numeric(7, 4), nullable=True)
+
     # Audit
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
@@ -2226,9 +2232,110 @@ class CoraEventQueue(Base):
         return f"<CoraEventQueue(id={self.id}, type={self.event_type}, status={self.status})>"
 
 
+class UnifiedSubscriberMemory(Base):
+    """
+    Single audit-spine table aggregating all external-interaction events
+    across every system module (fa096). Every row maps back to a subscriber
+    and carries a standardized JSONB payload with a creation timestamp.
+
+    Stream sources:
+      STRIPE       - checkout, payment, subscription lifecycle events
+      GHL          - outbound FA -> GHL CRM pushes (stage changes, upserts)
+      SMS          - outbound SMS delivery confirmations (Telnyx callbacks)
+      SYNTHFLOW    - Synthflow call logging + outcome tags
+      UNDERWRITING - underwriting milestone changes / financing intent scoring
+    """
+    __tablename__ = "unified_subscriber_memory"
+
+    id: Mapped[str] = mapped_column(
+        PG_UUID, primary_key=True,
+        server_default=text("gen_random_uuid()"),
+    )
+    subscriber_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("subscribers.id"), nullable=False, index=True,
+    )
+    property_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("properties.id"), nullable=True, index=True,
+    )
+    stream_source: Mapped[str] = mapped_column(String(50), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    event_payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "stream_source IN ('STRIPE', 'GHL', 'SMS', 'SYNTHFLOW', 'UNDERWRITING')",
+            name="ck_usm_stream_source",
+        ),
+        Index("idx_usm_subscriber_created", "subscriber_id", "created_at"),
+        Index(
+            "idx_usm_property",
+            "property_id",
+            postgresql_where=text("property_id IS NOT NULL"),
+        ),
+        Index("idx_usm_stream_source", "stream_source", "created_at"),
+        Index("idx_usm_event_type", "event_type"),
+    )
+
+    def __repr__(self):
+        return (
+            f"<UnifiedSubscriberMemory(id={self.id}, sub={self.subscriber_id}, "
+            f"source={self.stream_source}, type={self.event_type})>"
+        )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Phase 2B Models
 # ══════════════════════════════════════════════════════════════════════════════
+
+
+class SubscriberMemorySummary(Base):
+    """Derived current-state snapshot built from unified subscriber memory."""
+    __tablename__ = "subscriber_memory_summary"
+
+    subscriber_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("subscribers.id"), primary_key=True
+    )
+    last_event_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_event_type: Mapped[Optional[str]] = mapped_column(String(100))
+    last_stripe_event_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_stripe_event_type: Mapped[Optional[str]] = mapped_column(String(100))
+    latest_payment_state: Mapped[Optional[str]] = mapped_column(String(100))
+    latest_checkout_state: Mapped[Optional[str]] = mapped_column(String(100))
+    latest_crm_status: Mapped[Optional[str]] = mapped_column(String(100))
+    latest_crm_stage: Mapped[Optional[str]] = mapped_column(String(100))
+    last_sms_event_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_sms_event_type: Mapped[Optional[str]] = mapped_column(String(100))
+    latest_sms_state: Mapped[Optional[str]] = mapped_column(String(100))
+    last_sms_reply_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    sms_opted_out: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    last_voice_event_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_voice_event_type: Mapped[Optional[str]] = mapped_column(String(100))
+    last_underwriting_event_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_underwriting_event_type: Mapped[Optional[str]] = mapped_column(String(100))
+    latest_underwriting_state: Mapped[Optional[str]] = mapped_column(String(100))
+    latest_underwriting_milestone: Mapped[Optional[str]] = mapped_column(String(100))
+    last_lead_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("properties.id"))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        Index("idx_sms_last_event", "last_sms_event_at"),
+        Index("idx_usm_summary_last_event", "last_event_at"),
+    )
+
+    def __repr__(self):
+        return (
+            f"<SubscriberMemorySummary(subscriber_id={self.subscriber_id}, "
+            f"last_event_type={self.last_event_type})>"
+        )
 
 
 class WalletBalance(Base):
@@ -6434,4 +6541,52 @@ class ScoreFeedback(Base):
         return (
             f"<ScoreFeedback(prospect_id={self.prospect_id}, "
             f"predicted_tier='{self.predicted_tier}', outcome='{self.realized_outcome}')>"
+        )
+
+
+class StreamDiagnostics(Base):
+    """Daily stream-health diagnostic log (fa101).
+
+    One open episode per (county_id, metric_name) breach — opened at 3-day streak,
+    updated daily, closed on recovery. Observe-only; auto-actions live in cora_self_healing.
+    """
+
+    __tablename__ = "stream_diagnostics"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    stream: Mapped[str] = mapped_column(String(50), nullable=False)
+    metric_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    severity: Mapped[str] = mapped_column(String(16), nullable=False)
+    observed_value: Mapped[Decimal] = mapped_column(Numeric(10, 4), nullable=False)
+    target_value: Mapped[Decimal] = mapped_column(Numeric(10, 4), nullable=False)
+    baseline_value: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 4), nullable=True)
+    days_below: Mapped[int] = mapped_column(Integer, nullable=False)
+    category: Mapped[str] = mapped_column(String(64), nullable=False)
+    trend_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    recommendations: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    detected_on: Mapped[date] = mapped_column(Date, nullable=False)
+    resolved_on: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("NOW()")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("NOW()")
+    )
+
+    __table_args__ = (
+        CheckConstraint("severity IN ('yellow','red')", name="ck_stream_diag_severity"),
+        UniqueConstraint("county_id", "metric_name", "detected_on", name="uq_stream_diag_episode"),
+        Index(
+            "idx_stream_diag_open",
+            "county_id",
+            "metric_name",
+            postgresql_where=text("resolved_on IS NULL"),
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<StreamDiagnostics(county={self.county_id!r}, metric={self.metric_name!r}, "
+            f"severity={self.severity!r}, detected_on={self.detected_on})>"
         )

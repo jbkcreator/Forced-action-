@@ -33,7 +33,29 @@ READ_TOOL_NAMES = [
 	"get_ab_variant",
 	"get_deal_history",
 	"check_opt_in",
+	"get_subscriber_memory_timeline",
 ]
+
+
+def test_get_subscriber_memory_timeline_wraps_service():
+	"""The read tool is a thin wrapper over the subscriber_memory service."""
+	from unittest.mock import MagicMock, patch
+
+	fake = {
+		"timeline": [{"event_type": "sms_replied", "stream_source": "SMS"}],
+		"summary": {"last_event_type": "sms_replied"},
+	}
+	with patch(
+		"src.services.subscriber_memory.get_subscriber_memory", return_value=fake
+	) as mock_svc:
+		result = read_tools.get_subscriber_memory_timeline(
+			123, limit=5, session=MagicMock()
+		)
+
+	assert result == fake
+	mock_svc.assert_called_once()
+	_, kwargs = mock_svc.call_args
+	assert kwargs.get("limit") == 5
 
 
 # ──────────────────────────────────────────────────────────────────────────────

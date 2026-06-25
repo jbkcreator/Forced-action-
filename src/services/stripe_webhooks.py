@@ -911,6 +911,43 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
     except Exception:
         logger.warning("Affiliate confirm failed sub=%s", subscriber.id, exc_info=True)
 
+    try:
+        from src.services.subscriber_memory import append_memory_event
+
+        occurred_at = now
+        if session.get("created"):
+            try:
+                occurred_at = datetime.fromtimestamp(session["created"], tz=timezone.utc)
+            except Exception:
+                occurred_at = now
+
+        append_memory_event(
+            db,
+            subscriber_id=subscriber.id,
+            stream_source="STRIPE",
+            event_type="checkout_completed",
+            source_event_id=session.get("id") or f"checkout:{stripe_customer_id}",
+            source_event_name="checkout.session.completed",
+            occurred_at=occurred_at,
+            status="completed",
+            summary=f"Subscriber completed checkout for {tier} plan",
+            channel="stripe",
+            actor={"type": "system", "id": "stripe"},
+            raw={
+                "stripe_customer_id": stripe_customer_id,
+                "stripe_subscription_id": stripe_subscription_id,
+                "tier": tier,
+                "vertical": vertical,
+                "county_id": county_id,
+            },
+        )
+    except Exception:
+        logger.warning(
+            "Subscriber memory projection failed for checkout sub=%s",
+            subscriber.id,
+            exc_info=True,
+        )
+
     logger.info(
         "checkout.session.completed: subscriber=%s tier=%s vertical=%s"
         " founding=%s zips=%s feed_uuid=%s",
@@ -1013,6 +1050,34 @@ def _on_payment_succeeded(invoice: dict, db: Session) -> None:
         "invoice.payment_succeeded: subscriber=%s billing_date=%s",
         subscriber.id, subscriber.billing_date,
     )
+
+    try:
+        from src.services.subscriber_memory import append_memory_event
+
+        append_memory_event(
+            db,
+            subscriber_id=subscriber.id,
+            stream_source="STRIPE",
+            event_type="subscription_activated",
+            source_event_id=invoice.get("id") or f"payment_succeeded:{stripe_customer_id}",
+            source_event_name="invoice.payment_succeeded",
+            occurred_at=datetime.now(timezone.utc),
+            status="active",
+            summary="Subscriber subscription active",
+            channel="stripe",
+            actor={"type": "system", "id": "stripe"},
+            raw={
+                "stripe_customer_id": stripe_customer_id,
+                "stripe_invoice_id": invoice.get("id"),
+                "billing_reason": billing_reason,
+            },
+        )
+    except Exception:
+        logger.warning(
+            "Subscriber memory projection failed for payment_succeeded sub=%s",
+            subscriber.id,
+            exc_info=True,
+        )
 
     # Affiliate program: record collected subscription revenue (source of truth
     # for Commission). One-time charges are ignored by the engine.
@@ -1243,6 +1308,33 @@ def _on_payment_failed(invoice: dict, db: Session) -> None:
     except Exception:
         logger.error(
             "GHL payment-failed tag push error for subscriber %s",
+            subscriber.id,
+            exc_info=True,
+        )
+
+    try:
+        from src.services.subscriber_memory import append_memory_event
+
+        append_memory_event(
+            db,
+            subscriber_id=subscriber.id,
+            stream_source="STRIPE",
+            event_type="payment_failed",
+            source_event_id=invoice.get("id") or f"payment_failed:{stripe_customer_id}",
+            source_event_name="invoice.payment_failed",
+            occurred_at=datetime.now(timezone.utc),
+            status="failed",
+            summary="Subscriber payment failed",
+            channel="stripe",
+            actor={"type": "system", "id": "stripe"},
+            raw={
+                "stripe_customer_id": stripe_customer_id,
+                "stripe_invoice_id": invoice.get("id"),
+            },
+        )
+    except Exception:
+        logger.warning(
+            "Subscriber memory projection failed for payment_failed sub=%s",
             subscriber.id,
             exc_info=True,
         )
@@ -1707,6 +1799,33 @@ def _on_subscription_deleted(subscription: dict, db: Session) -> None:
     except Exception:
         logger.error(
             "GHL stage 7 push failed for subscriber %s",
+            subscriber.id,
+            exc_info=True,
+        )
+
+    try:
+        from src.services.subscriber_memory import append_memory_event
+        append_memory_event(
+            db,
+            subscriber_id=subscriber.id,
+            stream_source="STRIPE",
+            event_type="subscription_canceled",
+            source_event_id=subscription.get("id") or f"subscription_deleted:{stripe_customer_id}",
+            source_event_name="customer.subscription.deleted",
+            occurred_at=now,
+            status="canceled",
+            summary="Subscriber subscription canceled",
+            channel="stripe",
+            actor={"type": "system", "id": "stripe"},
+            raw={
+                "stripe_customer_id": stripe_customer_id,
+                "stripe_subscription_id": subscription.get("id"),
+                "grace_expires_at": grace_expires.isoformat(),
+            },
+        )
+    except Exception:
+        logger.warning(
+            "Subscriber memory projection failed for subscription_deleted sub=%s",
             subscriber.id,
             exc_info=True,
         )
