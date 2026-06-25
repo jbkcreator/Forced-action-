@@ -643,3 +643,25 @@ def get_attribution_context(
 			"lock_zips": lock_zips,
 			"deal_history": deal_history,
 		}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 15. Unified subscriber memory (timeline + summary)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@tool(category="read")
+def get_subscriber_memory_timeline(
+	subscriber_id: int,
+	limit: int = 20,
+	session: Optional[Session] = None,
+) -> Dict[str, Any]:
+	"""Return a subscriber's unified memory timeline + current-state summary.
+
+	Reads the cross-channel audit spine (Stripe, GHL, SMS, Synthflow,
+	underwriting). Returns ``{"timeline": [...newest first...], "summary": {...}}``;
+	empty timeline / summary when the subscriber has no events yet.
+	"""
+	from src.services.subscriber_memory import get_subscriber_memory
+
+	with _session(session) as s:
+		return get_subscriber_memory(s, subscriber_id, limit=limit)

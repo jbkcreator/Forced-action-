@@ -540,6 +540,32 @@ def onboard_inbound_caller(
     except Exception as exc:
         logger.warning("[Onboard] welcome SMS failed sub=%d: %s", sub.id, exc)
 
+    try:
+        from src.services.subscriber_memory import append_memory_event
+
+        append_memory_event(
+            db,
+            subscriber_id=sub.id,
+            stream_source="SYNTHFLOW",
+            event_type="voice_signup_captured",
+            source_event_id=call_id or f"voice_signup:{sub.id}:{normalized}",
+            source_event_name="synthflow.inbound_signup",
+            occurred_at=datetime.now(timezone.utc),
+            status="captured",
+            summary="Subscriber captured from Synthflow inbound signup",
+            channel="voice",
+            actor={"type": "subscriber", "id": normalized or phone},
+            call_id=call_id,
+            raw={
+                "zip_code": zip_code,
+                "vertical": vertical,
+                "capture_complete": capture_complete,
+                "source": source,
+            },
+        )
+    except Exception as exc:
+        logger.warning("[Onboard] subscriber memory projection failed sub=%d: %s", sub.id, exc)
+
     return {
         "subscriber_id": sub.id,
         "is_new": is_new,

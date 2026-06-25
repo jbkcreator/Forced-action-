@@ -32,6 +32,8 @@ def _happy_mocks():
 			  return_value=[{"lead_source": "zip:33647", "deal_amount": 12000}]),
 		patch("src.agents.graphs.retention.get_subscriber_territories",
 			  return_value=["33647"]),
+		patch("src.agents.graphs.retention.get_subscriber_memory_timeline",
+			  return_value={"timeline": [], "summary": {}}),
 		patch("src.agents.graphs.retention.get_lead_pool",
 			  return_value=[{"tier": "Gold"}, {"tier": "Gold"}]),
 		patch("src.agents.graphs.retention.get_zip_activity",
@@ -67,6 +69,32 @@ def test_retention_happy_path_sends():
 		_stop(patches)
 	assert r["terminal_status"] == "completed"
 	assert r["sent"] is True
+
+
+def test_assemble_history_surfaces_unified_memory():
+	from src.agents.graphs import retention
+
+	patches = [
+		patch("src.agents.graphs.retention.get_wallet_state",
+			  return_value={"credits_remaining": 5}),
+		patch("src.agents.graphs.retention.get_deal_history", return_value=[]),
+		patch("src.agents.graphs.retention.get_subscriber_territories", return_value=[]),
+		patch("src.agents.graphs.retention.get_subscriber_memory_timeline", return_value={
+			"timeline": [
+				{"event_type": "sms_replied"},
+				{"event_type": "checkout_completed"},
+			],
+			"summary": {"last_event_type": "sms_replied"},
+		}),
+	]
+	_start(patches)
+	try:
+		out = retention._node_assemble_history({"subscriber_id": 107})
+	finally:
+		_stop(patches)
+
+	assert out["memory_summary"] == {"last_event_type": "sms_replied"}
+	assert out["recent_memory_events"] == ["sms_replied", "checkout_completed"]
 
 
 def test_retention_skips_non_active_subscriber():

@@ -575,7 +575,8 @@ def push_subscriber_to_ghl(
     if subscriber_custom_fields:
         contact_payload["customFields"] = subscriber_custom_fields
 
-    contact_id = subscriber.ghl_contact_id
+    existing_contact_id = subscriber.ghl_contact_id
+    contact_id = existing_contact_id
 
     try:
         if contact_id:
@@ -696,4 +697,46 @@ def push_subscriber_to_ghl(
         "[GHL] Subscriber pushed: contact=%s stage=%s tags=%s",
         contact_id, stage, tags,
     )
+    try:
+        from datetime import datetime, timezone
+        from src.services.subscriber_memory import append_memory_event
+
+        if not existing_contact_id and contact_id and db is not None:
+            append_memory_event(
+                db,
+                subscriber_id=subscriber.id,
+                stream_source="GHL",
+                event_type="crm_contact_created",
+                source_event_id=f"ghl_contact:{contact_id}",
+                source_event_name="ghl.contact.upsert",
+                occurred_at=datetime.now(timezone.utc),
+                status="created",
+                summary="Subscriber contact created in GHL",
+                channel="ghl",
+                actor={"type": "system", "id": "ghl"},
+                external_contact_id=contact_id,
+                raw={"tags": tags or []},
+            )
+        if stage is not None and db is not None:
+            append_memory_event(
+                db,
+                subscriber_id=subscriber.id,
+                stream_source="GHL",
+                event_type="crm_stage_changed",
+                source_event_id=f"ghl_stage:{subscriber.id}:{stage}:{contact_id}",
+                source_event_name="ghl.opportunity.stage_changed",
+                occurred_at=datetime.now(timezone.utc),
+                status=str(stage),
+                summary=f"Subscriber moved to GHL stage {stage}",
+                channel="ghl",
+                actor={"type": "system", "id": "ghl"},
+                external_contact_id=contact_id,
+                raw={"tags": tags or [], "stage": stage},
+            )
+    except Exception:
+        logger.warning(
+            "[GHL] subscriber memory projection failed for subscriber=%s",
+            getattr(subscriber, "id", None),
+            exc_info=True,
+        )
     return True

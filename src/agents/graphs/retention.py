@@ -38,6 +38,7 @@ from src.services.kill_switch_service import get_cached_metric
 from src.agents.tools.read_tools import (
 	get_deal_history,
 	get_lead_pool,
+	get_subscriber_memory_timeline,
 	get_subscriber_profile,
 	get_subscriber_territories,
 	get_wallet_state,
@@ -66,6 +67,8 @@ class RetentionState(TypedDict, total=False):
 	top_zip: Optional[str]
 	unclaimed_gold_count: int
 	competing_viewers: int
+	memory_summary: dict
+	recent_memory_events: list
 
 	# Hierarchy
 	action_allowed: bool
@@ -127,10 +130,15 @@ def _node_assemble_history(state: RetentionState) -> RetentionState:
 		if territories:
 			top_zip = territories[0]
 
+	# Unified memory spine — cross-channel interaction history for context.
+	memory = get_subscriber_memory_timeline(sub_id, limit=10)
+
 	return {
 		"wallet_state": wallet,
 		"deal_history": deals,
 		"top_zip": top_zip,
+		"memory_summary": memory.get("summary", {}),
+		"recent_memory_events": [e["event_type"] for e in memory.get("timeline", [])],
 	}
 
 
