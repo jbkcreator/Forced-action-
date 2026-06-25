@@ -12,9 +12,11 @@ Owner phone numbers are intentionally withheld — prospects must subscribe to u
 """
 
 import logging
+from contextlib import nullcontext
 from typing import Optional
 
 from sqlalchemy import select, desc, and_
+from sqlalchemy.orm import Session
 
 from src.core.database import get_db_context
 from src.core.models import DistressScore, Owner, Property
@@ -55,12 +57,14 @@ _VERTICAL_LABELS = {
 }
 
 
-def get_sample_leads(zip_code: str, vertical: str, count: int = 3) -> list[dict]:
+def get_sample_leads(
+    zip_code: str, vertical: str, count: int = 3, session: Optional[Session] = None
+) -> list[dict]:
     """
     Return top `count` Gold+ leads for a ZIP and vertical.
     Owner phone is intentionally excluded — prospects must subscribe to unlock.
     """
-    with get_db_context() as db:
+    with (nullcontext(session) if session is not None else get_db_context()) as db:
         try:
             score_col = DistressScore.vertical_scores[vertical].as_float()
         except KeyError:
@@ -74,6 +78,7 @@ def get_sample_leads(zip_code: str, vertical: str, count: int = 3) -> list[dict]
                 Property.zip == zip_code,
                 DistressScore.lead_tier.in_(GOLD_PLUS_TIERS),
                 DistressScore.qualified == True,
+                DistressScore.is_guess_lead.is_(False),  # A2: withhold guess leads
                 score_col > 0,
             ))
             .order_by(desc(score_col))

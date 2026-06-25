@@ -989,6 +989,14 @@ class DistressScore(Base):
     # Scoring batch identifier — int(UTC epoch) set at start of score_all_properties()
     scoring_run_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
+    # A2 — Lead Confidence gating. lead_confidence is 0.000–1.000 (NULL until A2
+    # runs); is_guess_lead = lead_confidence < MIN_CONFIDENCE_THRESHOLD. Guess
+    # leads are withheld from paid surfaces (feed / Lead Packs / Cora recs).
+    lead_confidence: Mapped[Optional[float]] = mapped_column(Numeric(4, 3))
+    is_guess_lead: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+
     # Relationship
     property: Mapped["Property"] = relationship("Property", back_populates="distress_scores")
 
@@ -1001,6 +1009,13 @@ class DistressScore(Base):
         Index("idx_score_county_id", "county_id"),
         Index("idx_score_distress_types", "distress_types", postgresql_using="gin"),
         Index("idx_score_scoring_run_id", "scoring_run_id"),
+        # Read paths filter `WHERE NOT is_guess_lead` on the hot lead-selection
+        # path; partial index supports the sellable (FALSE) side cheaply.
+        Index(
+            "idx_score_sellable",
+            "final_cds_score",
+            postgresql_where=text("is_guess_lead = false"),
+        ),
         CheckConstraint("urgency_level IN ('Immediate', 'High', 'Medium', 'Low')", name="check_urgency_level"),
         CheckConstraint("lead_tier IN ('Ultra Platinum', 'Platinum', 'Gold', 'Silver', 'Bronze')", name="check_lead_tier"),
     )
@@ -2640,6 +2655,104 @@ class DealOutcome(Base):
 
     def __repr__(self):
         return f"<DealOutcome(id={self.id}, subscriber={self.subscriber_id}, bucket={self.deal_size_bucket})>"
+
+
+class LossAutopsy(Base):
+    """
+    Structured failure retrospective written whenever a lead is marked closed_lost,
+    declined, or ghosts past the 24-hour human-close SLA.  Claude parses
+    multi-source context (transcripts, pricing, distress score) and classifies
+    the loss into a standard taxonomy so A3 / A6 can retune scoring weights.
+    """
+    __tablename__ = "loss_autopsies"
+
+    id: Mapped[object] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
+    property_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("properties.id", ondelete="SET NULL"), nullable=True, index=True)
+    prospect_id: Mapped[Optional[object]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("prospects.prospect_id", ondelete="SET NULL"), nullable=True)
+    deal_outcome_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("deal_outcomes.id", ondelete="SET NULL"), nullable=True)
+    trigger_reason: Mapped[str] = mapped_column(String(50), nullable=False)
+    primary_rejection_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    competitor_rate_delta: Mapped[Optional[float]] = mapped_column(Numeric(8, 4), nullable=True)
+    underwriting_blocker: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    cora_behavior_adjustment: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    raw_context: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    model_response: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    claude_cost_usd: Mapped[Optional[float]] = mapped_column(Numeric(10, 6), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        CheckConstraint(
+            "trigger_reason IN ('CLOSED_LOST','DECLINED','GHOSTED_SLA')",
+            name="ck_loss_autopsy_trigger",
+        ),
+        Index("idx_loss_autopsies_deal_outcome_id", "deal_outcome_id"),
+        Index("idx_loss_autopsies_trigger_reason", "trigger_reason"),
+        Index("idx_loss_autopsies_created_at", "created_at"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<LossAutopsy(id={self.id}, trigger={self.trigger_reason}, reason={self.primary_rejection_reason})>"
+
+
+class PreDecisionSnapshot(Base):
+    """
+    Pre-routing context snapshot captured at deal_outcome creation time.
+
+    Stores all 6 CDS vertical scores (the roads not taken), the selected vertical,
+    active pricing cohort, Cora graph, and pitch variant so the future A5b
+    counterfactual engine can compare actual vs. alternative paths on resolution.
+
+    Broker fields (broker_id, alternative_brokers) are nullable stubs — wirable
+    when the broker routing layer is built without a schema migration.
+    """
+    __tablename__ = "pre_decision_snapshots"
+
+    id: Mapped[object] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
+    property_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("properties.id", ondelete="SET NULL"), nullable=True)
+    prospect_id: Mapped[Optional[object]] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("prospects.prospect_id", ondelete="SET NULL"), nullable=True)
+    deal_outcome_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("deal_outcomes.id", ondelete="SET NULL"), nullable=True)
+
+    snapshot_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    selected_vertical: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    lead_tier: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    final_cds_score: Mapped[Optional[float]] = mapped_column(Numeric(5, 2), nullable=True)
+    distress_types: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+
+    all_vertical_scores: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    runner_up_verticals: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
+
+    pricing_cohort_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    pricing_snapshot: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    cora_graph: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    pitch_variant: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+
+    raw_context: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    outcome_status: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+
+    # Broker stub — populate when broker routing layer is built
+    broker_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    alternative_brokers: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
+
+    counterfactual_run: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("FALSE"))
+    counterfactual_run_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        Index("uq_pds_deal_outcome", "deal_outcome_id", unique=True,
+              postgresql_where=text("deal_outcome_id IS NOT NULL")),
+        Index("idx_pds_property_id", "property_id"),
+        Index("idx_pds_snapshot_ts", "snapshot_ts"),
+        Index("idx_pds_selected_vertical", "selected_vertical"),
+        Index("idx_pds_outcome_status", "outcome_status"),
+        Index("idx_pds_pending_cf", "id",
+              postgresql_where=text("counterfactual_run = FALSE AND outcome_status IS NOT NULL")),
+    )
+
+    def __repr__(self) -> str:
+        return f"<PreDecisionSnapshot(id={self.id}, vertical={self.selected_vertical}, outcome={self.outcome_status})>"
 
 
 class SubscriberTag(Base):
@@ -6221,3 +6334,99 @@ class CoraTrainingOverride(Base):
     @subject_id.setter
     def subject_id(self, value):
         self.subject_ref = None if value is None else str(value)
+
+
+class ScoringWeightOverride(Base):
+    """A3: Per-(vertical, signal_type) delta applied on top of VERTICAL_WEIGHTS at scoring time.
+
+    Rows seeded from config/heuristics.json (source='seed') and updated nightly
+    by the heuristic tuner job from loss/win autopsy outcomes (source='loss_feedback'/'win_feedback').
+    """
+    __tablename__ = "scoring_weight_overrides"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    vertical: Mapped[str] = mapped_column(String(50), nullable=False)
+    signal_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    delta: Mapped[float] = mapped_column(Numeric(6, 2), nullable=False, server_default=text("0"))
+    source: Mapped[str] = mapped_column(String(30), nullable=False, server_default=text("'seed'"))
+    reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("TRUE"))
+    loss_sample_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    win_sample_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("vertical", "signal_type", name="uq_swo_vertical_signal"),
+        Index("idx_swo_enabled", "enabled"),
+        Index("idx_swo_updated_at", "updated_at"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<ScoringWeightOverride({self.vertical}/{self.signal_type} delta={self.delta} src={self.source})>"
+
+
+# ============================================================================
+# C2 / M5 — CDS Score Feedback (S1 / 414 Stream A)
+# ============================================================================
+
+
+class ScoreFeedback(Base):
+    """
+    CDS scoring feedback loop — one row per prospect outcome (spec §4.4).
+
+    Records what the model predicted (predicted_tier from the Truth Engine verdict)
+    vs what actually happened on a homeowner call (realized_outcome). Delta is the
+    gap between predicted rate and actual rate — fed to scoring_fit.py for retraining.
+
+    closer_call_id is nullable: homeowner outbound calling is not built yet.
+    It will be populated and wired when that system is implemented.
+
+    Grade names follow GRADE_ORDER from config/grading.py:
+        sub_grade < Bronze < Silver < Gold < Platinum < Ultra
+    Always use 'Ultra' — distress_scores.lead_tier uses the legacy 'Ultra Platinum'.
+    """
+    __tablename__ = "score_feedback"
+
+    score_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("generate_uuidv7()"),
+    )
+    prospect_id: Mapped[Any] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("prospects.prospect_id", ondelete="RESTRICT"),
+        nullable=False,
+        unique=True,
+    )
+    closer_call_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    predicted_tier: Mapped[str] = mapped_column(String, nullable=False)
+    predicted_rate: Mapped[Optional[Decimal]] = mapped_column(Numeric(6, 4), nullable=True)
+    realized_outcome: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    delta: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4), nullable=True)
+    scored_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("NOW()"),
+    )
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "predicted_tier IN ('Bronze','Silver','Gold','Platinum','Ultra','sub_grade')",
+            name="ck_score_feedback_predicted_tier",
+        ),
+        CheckConstraint(
+            "realized_outcome IS NULL OR "
+            "realized_outcome IN ('contacted','converted','funded','dead')",
+            name="ck_score_feedback_realized_outcome",
+        ),
+        Index("idx_score_feedback_prospect_id", "prospect_id"),
+        Index("idx_score_feedback_predicted_tier", "predicted_tier"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<ScoreFeedback(prospect_id={self.prospect_id}, "
+            f"predicted_tier='{self.predicted_tier}', outcome='{self.realized_outcome}')>"
+        )

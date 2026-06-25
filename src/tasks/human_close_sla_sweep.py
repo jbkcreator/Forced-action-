@@ -23,6 +23,21 @@ setup_logging()
 logger = logging.getLogger(__name__)
 
 
+def _ghosted_property_id(subscriber_id: int, db) -> int | None:
+    """Return the property_id of the subscriber's most recent active deal, if any."""
+    return db.execute(
+        sa_text("""
+            SELECT property_id
+            FROM deal_outcomes
+            WHERE subscriber_id = :sid
+              AND property_id IS NOT NULL
+            ORDER BY created_at DESC
+            LIMIT 1
+        """),
+        {"sid": subscriber_id},
+    ).scalar_one_or_none()
+
+
 def run() -> None:
     settings = get_settings()
     webhook = settings.slack_human_close_webhook
@@ -86,6 +101,29 @@ def run() -> None:
             logger.info("[sla_sweep] alerted escalation_id=%d subscriber=%s", row.id, name)
         except Exception:
             logger.error("[sla_sweep] failed to post Slack for escalation_id=%d", row.id, exc_info=True)
+
+        # Phase 3 A1: fire a GHOSTED_SLA loss autopsy for the subscriber's most recent lead
+        try:
+            from src.services.loss_autopsy import run_loss_autopsy
+            with get_db_context() as autopsy_db:
+                property_id = _ghosted_property_id(row.subscriber_id, autopsy_db)
+                if property_id:
+                    run_loss_autopsy(
+                        property_id=property_id,
+                        trigger_reason="GHOSTED_SLA",
+                        db=autopsy_db,
+                    )
+                else:
+                    logger.info(
+                        "[sla_sweep] no property found for GHOSTED_SLA autopsy subscriber_id=%d",
+                        row.subscriber_id,
+                    )
+        except Exception:
+            logger.warning(
+                "[sla_sweep] GHOSTED_SLA autopsy failed escalation_id=%d subscriber_id=%d",
+                row.id, row.subscriber_id,
+                exc_info=True,
+            )
 
 
 if __name__ == "__main__":

@@ -427,6 +427,37 @@ def update_deal_stage(
         note=body.note,
     ))
     db.flush()
+
+    # Phase 3 A5: pre-decision snapshot (idempotent — captures if not yet recorded)
+    try:
+        from src.services.snapshot_service import capture_snapshot, resolve_snapshot
+        if body.pipeline_stage == "closed_won":
+            capture_snapshot(property_id=deal.property_id, db=db,
+                             deal_outcome_id=deal_id, outcome_status="funded")
+            resolve_snapshot(deal_id, "funded", db)
+        elif body.pipeline_stage in ("closed_lost", "declined"):
+            capture_snapshot(property_id=deal.property_id, db=db,
+                             deal_outcome_id=deal_id, outcome_status="lost")
+            resolve_snapshot(deal_id, "lost", db)
+        else:
+            capture_snapshot(property_id=deal.property_id, db=db, deal_outcome_id=deal_id)
+    except Exception as exc:
+        logger.warning("[crm_patch] snapshot failed deal_id=%d: %s", deal_id, exc)
+
+    # Phase 3 A1: fire loss autopsy when a deal is manually moved to a loss stage
+    if body.pipeline_stage in ("closed_lost", "declined"):
+        try:
+            from src.services.loss_autopsy import run_loss_autopsy
+            reason = "DECLINED" if body.pipeline_stage == "declined" else "CLOSED_LOST"
+            run_loss_autopsy(
+                property_id=deal.property_id,
+                trigger_reason=reason,
+                db=db,
+                deal_outcome_id=deal_id,
+            )
+        except Exception as exc:
+            logger.warning("[crm_patch] loss autopsy failed deal_id=%d: %s", deal_id, exc)
+
     return {
         "ok":         True,
         "deal_id":    deal_id,
