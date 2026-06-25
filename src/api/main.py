@@ -129,9 +129,11 @@ app.include_router(chat_router)
 from src.api.metrics_router import router as metrics_router  # noqa: E402
 from src.api.alert_webhook_router import router as alert_webhook_router  # noqa: E402
 from src.api.revenue_metrics_router import router as revenue_metrics_router  # noqa: E402
+from src.api.admin_leads_router import router as admin_leads_router  # noqa: E402
 app.include_router(metrics_router)
 app.include_router(alert_webhook_router)
 app.include_router(revenue_metrics_router)
+app.include_router(admin_leads_router)
 
 from src.api.bankruptcy_alert_router import router as bankruptcy_alert_router  # noqa: E402
 app.include_router(bankruptcy_alert_router)
@@ -174,6 +176,8 @@ from src.api.heuristics_router import router as heuristics_router  # noqa: E402
 app.include_router(heuristics_router)
 from src.api.snapshot_router import router as snapshot_router  # noqa: E402
 app.include_router(snapshot_router)
+from src.api.score_feedback_router import router as score_feedback_router  # noqa: E402
+app.include_router(score_feedback_router)
 
 
 # ---------------------------------------------------------------------------
@@ -2970,6 +2974,7 @@ def sample_leads(
         Property.zip == zip_code,
         Property.county_id == county_id,
         DistressScore.qualified == True,
+        DistressScore.is_guess_lead.is_(False),  # A2: withhold guess leads from the feed
     ]
     if contact_clause is not None:
         filters.append(contact_clause)

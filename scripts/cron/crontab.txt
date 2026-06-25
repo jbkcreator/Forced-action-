@@ -234,6 +234,16 @@ COUNTY_ID=hillsborough
 # CDS Scoring Engine         — 07:00 AM UTC Mon-Sat (after all scrapers complete)
 0 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.services.cds_engine --rescore-new-signals
 
+# ── LEAD CONFIDENCE (A2) ─────────────────────────────────────
+# A2 guess-lead gate — 07:02 AM UTC Mon-Sat, immediately after CDS scoring (07:00)
+# and before any lead-selling surface is read. CDS writes a fresh distress_scores
+# row per property per day (is_guess_lead defaults FALSE); this pass recomputes
+# Lead Confidence over today's rows and flags is_guess_lead when below threshold,
+# so guess leads are withheld from the feed / Lead Packs / Cora recs and marked
+# direct_mail_eligible. Read-only on the CDS score (ADR 0019). Both counties in
+# one pass (iterates today's rows regardless of county).
+2 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.services.lead_confidence
+
 # ── ENRICHMENT RECONCILIATION SWEEP (ADR 0016) ───────────────
 # Skip Tracing — 07:30 AM UTC Mon-Sat, after CDS scoring (07:00), before GHL sync (08:00).
 # Backstop for the event-driven enrichment consumer: gold_lead_scored events ride

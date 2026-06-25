@@ -243,6 +243,7 @@ def get_lead_pool(
 			.join(Property, Property.id == DistressScore.property_id)
 			.filter(Property.zip == zip_code)
 			.filter(DistressScore.final_cds_score >= min_score)
+			.filter(DistressScore.is_guess_lead.is_(False))  # A2: withhold guess leads
 		)
 
 		# Cross-trade exclusivity filter (requires county_id to scope the lock query)
