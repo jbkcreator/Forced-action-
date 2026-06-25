@@ -11,8 +11,12 @@ For each LLC-owned property pending Sunbiz enrichment, this scraper:
      entity_status, formation_date, managing_members, sunbiz_enriched_at, and
      sunbiz_status.
 
-Falls back to a browser-use AI agent when Playwright raises OR when the parser
-reports status='parser_failed' (Sunbiz layout drift).
+On Playwright failure or parser_failed (layout drift): marks the owner
+parser_failed, increments stats["failed"], and records run_success=False in
+scraper_run_stats so the heartbeat can alert. No browser-use fallback.
+
+No-match (name not found in Sunbiz search results) is not an error — it marks
+the owner not_found and increments stats["skipped"].
 
 Usage:
     python -m src.scrappers.sunbiz.sunbiz_engine
@@ -163,32 +167,22 @@ async def _run_playwright_batch(
                 try:
                     html, snap = await _scrape_entity_detail(page, name)
                 except Exception as e:
-                    logger.warning(f"[Sunbiz] Playwright failed for '{name}': {e} — trying AI fallback")
-                    try:
-                        html, snap = await _ai_fallback(name)
-                    except Exception as ae:
-                        logger.warning(f"[Sunbiz] AI fallback also failed for '{name}': {ae}")
-                        if not dry_run:
-                            _mark_status(session, owner, "parser_failed")
-                        stats["failed"] += 1
-                        continue
+                    logger.warning("[Sunbiz] Playwright failed for '%s': %s", name, e)
+                    if not dry_run:
+                        _mark_status(session, owner, "parser_failed")
+                    stats["failed"] += 1
+                    continue
 
-                # No exact match in Sunbiz search results.
+                # No exact match in Sunbiz search results — not an error.
                 if snap is None:
                     if not dry_run:
                         _mark_status(session, owner, "not_found")
                     stats["skipped"] += 1
                     continue
 
-                # Parser found zero detail sections → AI fallback on layout drift.
+                # Parser could not extract detail sections (layout drift).
                 if snap.status == "parser_failed":
-                    logger.warning(f"[Sunbiz] Parser failed for '{name}' — trying AI fallback")
-                    try:
-                        ai_html, ai_snap = await _ai_fallback(name)
-                        if ai_snap and ai_snap.status != "parser_failed":
-                            html, snap = ai_html, ai_snap
-                    except Exception as ae:
-                        logger.warning(f"[Sunbiz] AI fallback also failed for '{name}': {ae}")
+                    logger.warning("[Sunbiz] Parser failed for '%s' — layout drift", name)
 
                 logger.info(
                     f"[Sunbiz] '{name}' status={snap.status} doc={snap.doc_number} "
@@ -275,42 +269,6 @@ def _mark_status(session: Session, owner: Owner, status: str) -> None:
 
 def _mark_not_an_llc(session: Session, owner: Owner) -> None:
     _mark_status(session, owner, "not_an_llc")
-
-
-# ---------------------------------------------------------------------------
-# AI fallback (browser-use) — fires on Playwright exception OR parser_failed.
-# Asks the agent to return the full detail page HTML so the same pure-function
-# parser (and future reparse jobs) can process it. No bespoke JSON contract
-# with the LLM; the LLM only handles the browser-driving + page-grab steps.
-# ---------------------------------------------------------------------------
-
-async def _ai_fallback(company_name: str) -> Tuple[Optional[str], Optional[SunbizSnapshot]]:
-    from browser_use import Agent, Browser, ChatAnthropic
-
-    task = (
-        f"Go to https://search.sunbiz.org/Inquiry/CorporationSearch/ByName, "
-        f"search for the company named '{company_name}', find the exact matching "
-        f"result row, click into its detail page, and return the COMPLETE raw HTML "
-        f"of the detail page wrapped in <html_payload>...</html_payload> markers. "
-        f"If no exact match exists in the result list, return "
-        f"<html_payload>NO_MATCH</html_payload>."
-    )
-
-    browser = Browser(headless=True, disable_security=True)
-    llm = ChatAnthropic(model="claude-sonnet-4-6")
-    agent = Agent(task=task, llm=llm, browser=browser)
-    result = await agent.run()
-
-    text = str(result)
-    m = re.search(r"<html_payload>([\s\S]*?)</html_payload>", text)
-    if not m:
-        return None, None
-    payload = m.group(1).strip()
-    if payload == "NO_MATCH" or not payload:
-        return None, None
-
-    snap = parse_sunbiz_detail(payload)
-    return payload, snap
 
 
 # ---------------------------------------------------------------------------
@@ -426,13 +384,16 @@ def run_sunbiz_pipeline(
     if not dry_run:
         try:
             from src.utils.scraper_db_helper import record_scraper_stats
+            run_success = stats["failed"] == 0
             record_scraper_stats(
                 source_type="sunbiz",
                 total_scraped=stats["processed"],
                 matched=stats["enriched"],
-                unmatched=stats["skipped"] + stats["failed"],
+                unmatched=stats["skipped"],
                 skipped=0,
-                run_success=True,
+                run_success=run_success,
+                error_type=None if run_success else "scraper_error",
+                error_message=None if run_success else f"{stats['failed']} owner(s) failed Playwright scrape",
                 county_id=county_id,
             )
         except Exception as e:

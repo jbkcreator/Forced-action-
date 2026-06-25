@@ -120,6 +120,7 @@ class Property(Base):
     incidents: Mapped[List["Incident"]] = relationship("Incident", back_populates="property", cascade="all, delete-orphan")
     distress_scores: Mapped[List["DistressScore"]] = relationship("DistressScore", back_populates="property", cascade="all, delete-orphan")
     tax_payment_history: Mapped[List["TaxPaymentHistory"]] = relationship("TaxPaymentHistory", back_populates="property", cascade="all, delete-orphan")
+    underwriting_feedback: Mapped[List["UnderwritingFeedback"]] = relationship("UnderwritingFeedback", back_populates="property", cascade="all, delete-orphan")
 
     # Indexes
     __table_args__ = (
@@ -1026,6 +1027,53 @@ class DistressScore(Base):
 
     def __repr__(self):
         return f"<DistressScore(id={self.id}, property_id={self.property_id}, score={self.final_cds_score}, tier='{self.lead_tier}')>"
+
+
+class UnderwritingFeedback(Base):
+    """
+    Per-property broker underwriting decline record (Sprint 4.6).
+
+    Each row captures one decline reason from a lending partner. The service
+    layer maps reason_code → (vertical, signal_type, delta) nudges and upserts
+    them into scoring_weight_overrides so the CDS engine de-values those signals
+    globally for future properties carrying the same risk variables.
+    """
+    __tablename__ = "underwriting_feedback"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    property_id: Mapped[int] = mapped_column(ForeignKey("properties.id"), nullable=False, index=True)
+    reason_code: Mapped[str] = mapped_column(String(60), nullable=False)
+    reason_detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    lender_id: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    loan_amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2), nullable=True)
+    submitted_by: Mapped[str] = mapped_column(String(80), nullable=False)
+    submitted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    property: Mapped["Property"] = relationship("Property", back_populates="underwriting_feedback")
+
+    __table_args__ = (
+        Index("idx_uw_feedback_property_id", "property_id"),
+        Index("idx_uw_feedback_submitted_at", "submitted_at"),
+        Index("idx_uw_feedback_reason_code", "reason_code"),
+        CheckConstraint(
+            "reason_code IN ("
+            "'ltv_too_high','structural_damage','commercial_zoning','title_defect',"
+            "'flood_zone','environmental_hazard','deferred_maintenance',"
+            "'unpermitted_additions','tenant_occupied','market_saturation'"
+            ")",
+            name="ck_uw_feedback_reason_code",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<UnderwritingFeedback(id={self.id}, property_id={self.property_id},"
+            f" reason_code='{self.reason_code}')>"
+        )
 
 
 # ============================================================================
@@ -2958,6 +3006,34 @@ class SmsOptOut(Base):
 
     def __repr__(self):
         return f"<SmsOptOut(phone={self.phone}, keyword={self.keyword_used})>"
+
+
+class DncPhoneCheck(Base):
+    """Latest Tracerfy DNC result per normalized phone.
+
+    This is the universal freshness source for outbound compliance. Positive
+    DNC/litigator results are enforced through sms_opt_outs; this table tracks
+    when a phone was last proven clean or blocked.
+    """
+    __tablename__ = "dnc_phone_checks"
+
+    phone: Mapped[str] = mapped_column(String(20), primary_key=True)
+    national_dnc: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    litigator: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    source: Mapped[str] = mapped_column(String(40), nullable=False, default="tracerfy_dnc_refresh", server_default="tracerfy_dnc_refresh")
+    raw_result: Mapped[Optional[dict]] = mapped_column(JSONB)
+
+    __table_args__ = (
+        Index("idx_dnc_phone_checks_checked_at", "checked_at"),
+        Index("idx_dnc_phone_checks_clean_fresh", "checked_at", postgresql_where=text("national_dnc = false AND litigator = false")),
+    )
+
+    def __repr__(self):
+        return (
+            f"<DncPhoneCheck(phone={self.phone}, national_dnc={self.national_dnc}, "
+            f"litigator={self.litigator})>"
+        )
 
 
 class SmsDeadLetter(Base):

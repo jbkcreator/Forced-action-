@@ -519,6 +519,93 @@ COUNTY_OVERRIDES: dict[str, dict[str, Any]] = {
 }
 
 
+# ── Underwriting feedback signal nudges (Sprint 4.6) ─────────────────────────
+# Maps each broker decline reason code → list of (vertical, signal_type, delta)
+# tuples. Nudges are written into scoring_weight_overrides (A3 table) so the
+# CDS engine de-values these signals globally for future properties.
+# Deltas are negative (penalty) and bounded by delta_bounds in heuristics.json.
+UNDERWRITING_REASON_SIGNAL_NUDGES: dict[str, list[tuple[str, str, float]]] = {
+    "ltv_too_high": [
+        # High tax/judgment distress drove a strong CDS but equity was too thin
+        ("wholesalers", "tax_delinquencies", -3.0),
+        ("wholesalers", "judgment_liens",    -2.0),
+        ("fix_flip",    "foreclosures",      -3.0),
+        ("fix_flip",    "tax_delinquencies", -2.0),
+        ("attorneys",   "judgment_liens",    -2.0),
+    ],
+    "structural_damage": [
+        # Physical condition made the property unlendable despite distress signals
+        ("restoration", "code_violations",   -4.0),
+        ("restoration", "enforcement_permit", -3.0),
+        ("roofing",     "enforcement_permit", -3.0),
+        ("roofing",     "mechanics_liens",   -2.0),
+        ("fix_flip",    "code_violations",   -3.0),
+    ],
+    "commercial_zoning": [
+        # Investment signals mislead for commercial/mixed-use zoning
+        ("wholesalers", "deed_transfers",    -4.0),
+        ("wholesalers", "tax_delinquencies", -3.0),
+        ("fix_flip",    "deed_transfers",    -4.0),
+        ("fix_flip",    "foreclosures",      -3.0),
+        ("restoration", "code_violations",   -3.0),
+    ],
+    "title_defect": [
+        # Clouded title: legal signal types overstate the opportunity
+        ("wholesalers", "judgment_liens",    -4.0),
+        ("wholesalers", "probate",           -3.0),
+        ("fix_flip",    "judgment_liens",    -3.0),
+        ("attorneys",   "judgment_liens",    -2.0),
+    ],
+    "flood_zone": [
+        # Flood-zone signals inflate restoration/roofing scores unreliably
+        ("restoration",      "insurance_claim", -3.0),
+        ("restoration",      "flood_damage",    -3.0),
+        ("roofing",          "storm_damage",    -3.0),
+        ("roofing",          "flood_damage",    -3.0),
+        ("public_adjusters", "insurance_claim", -2.0),
+        ("fix_flip",         "foreclosures",    -2.0),
+    ],
+    "environmental_hazard": [
+        # Mold/lead/asbestos: code violation signals misrepresent lendability
+        ("restoration", "code_violations",    -4.0),
+        ("restoration", "enforcement_permit", -3.0),
+        ("fix_flip",    "code_violations",    -3.0),
+        ("roofing",     "code_violations",    -2.0),
+    ],
+    "deferred_maintenance": [
+        # Neglect-based signals inflate deal potential; lender sees deal risk
+        ("fix_flip",    "code_violations",  -3.0),
+        ("fix_flip",    "mechanics_liens",  -2.0),
+        ("wholesalers", "code_violations",  -2.0),
+    ],
+    "unpermitted_additions": [
+        # Permit signals backfire: unpermitted work = lender liability
+        ("fix_flip",    "building_permits",   -4.0),
+        ("fix_flip",    "enforcement_permit", -3.0),
+        ("wholesalers", "building_permits",   -3.0),
+        ("restoration", "building_permits",   -2.0),
+    ],
+    "tenant_occupied": [
+        # Occupied property: eviction/foreclosure signals mislead on vacancy
+        ("wholesalers", "evictions",         -4.0),
+        ("wholesalers", "tax_delinquencies", -2.0),
+        ("fix_flip",    "evictions",         -3.0),
+        ("fix_flip",    "foreclosures",      -2.0),
+    ],
+    "market_saturation": [
+        # Too many similar active leads in this zip; dampen broadly
+        ("wholesalers",      "deed_transfers",    -3.0),
+        ("wholesalers",      "probate",           -2.0),
+        ("fix_flip",         "deed_transfers",    -3.0),
+        ("fix_flip",         "foreclosures",      -2.0),
+        ("restoration",      "code_violations",   -2.0),
+        ("roofing",          "enforcement_permit", -2.0),
+        ("public_adjusters", "code_violations",   -2.0),
+        ("attorneys",        "judgment_liens",    -2.0),
+    ],
+}
+
+
 def for_county(county_id: str | None) -> ScoringConfig:
     """Return a ScoringConfig with sparse county overrides applied.
 

@@ -154,12 +154,16 @@ def run(
                 f"skipped={stats['skipped']} failed={stats['failed']}"
             )
             from src.utils.scraper_db_helper import record_scraper_stats
+            run_success = stats["failed"] == 0
             record_scraper_stats(
                 source_type="sunbiz",
                 total_scraped=stats["processed"],
                 matched=stats["enriched"],
-                unmatched=stats["skipped"] + stats["failed"],
+                unmatched=stats["skipped"],
                 skipped=0,
+                run_success=run_success,
+                error_type=None if run_success else "scraper_error",
+                error_message=None if run_success else f"{stats['failed']} owner(s) failed Playwright scrape",
                 county_id=county_id,
             )
 

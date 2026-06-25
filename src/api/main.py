@@ -180,6 +180,8 @@ from src.api.snapshot_router import router as snapshot_router  # noqa: E402
 app.include_router(snapshot_router)
 from src.api.score_feedback_router import router as score_feedback_router  # noqa: E402
 app.include_router(score_feedback_router)
+from src.api.underwriting_router import router as underwriting_router  # noqa: E402
+app.include_router(underwriting_router)
 
 
 # ---------------------------------------------------------------------------

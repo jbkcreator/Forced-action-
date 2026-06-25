@@ -299,13 +299,14 @@ def send_sms(
     if not _result.allowed:
         _dlq_map = {
             "dnc_or_opted_out": "opt_out",
+            "dnc_check_required": "opt_out",
             "quiet_hours": "quiet_hours",
             "invalid_phone": "unresolvable",
         }
         _dlq_key: str = _result.reason or ""
         logger.info("SMS suppressed (%s): to=%s", _result.reason, to)
         add_to_dead_letter(to, _dlq_map.get(_dlq_key, "opt_out"), {"body": body[:160]}, db)
-        _log("suppressed", suppress_reason=_dlq_map.get(_dlq_key, "opt_out"))
+        _log("suppressed", suppress_reason=_dlq_key or _dlq_map.get(_dlq_key, "opt_out"))
         return False
 
     # 2. Opt-in gate — marketing requires confirmed consent (subscribers only; prospects use P2 above)
