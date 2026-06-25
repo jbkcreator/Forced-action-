@@ -1842,6 +1842,12 @@ class PlatformDailyStats(Base):
     retention_30d: Mapped[Optional[float]] = mapped_column(Numeric(7, 4), nullable=True)
     cac_paid_channels: Mapped[Optional[float]] = mapped_column(Numeric(10, 2), nullable=True)
 
+    # Stream self-diagnosis metrics (fa102) — fractions 0–1, NULL = not computed
+    enrichment_rate: Mapped[Optional[float]] = mapped_column(Numeric(7, 4), nullable=True)
+    dialable_rate: Mapped[Optional[float]] = mapped_column(Numeric(7, 4), nullable=True)
+    sms_delivery_rate: Mapped[Optional[float]] = mapped_column(Numeric(7, 4), nullable=True)
+    closer_conv_rate: Mapped[Optional[float]] = mapped_column(Numeric(7, 4), nullable=True)
+
     # Audit
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc), nullable=False
@@ -2241,7 +2247,9 @@ class UnifiedSubscriberMemory(Base):
         PG_UUID, primary_key=True,
         server_default=text("gen_random_uuid()"),
     )
-    subscriber_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    subscriber_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("subscribers.id"), nullable=False, index=True,
+    )
     property_id: Mapped[Optional[int]] = mapped_column(
         Integer, ForeignKey("properties.id"), nullable=True, index=True,
     )
@@ -6397,4 +6405,52 @@ class ScoreFeedback(Base):
         return (
             f"<ScoreFeedback(prospect_id={self.prospect_id}, "
             f"predicted_tier='{self.predicted_tier}', outcome='{self.realized_outcome}')>"
+        )
+
+
+class StreamDiagnostics(Base):
+    """Daily stream-health diagnostic log (fa101).
+
+    One open episode per (county_id, metric_name) breach — opened at 3-day streak,
+    updated daily, closed on recovery. Observe-only; auto-actions live in cora_self_healing.
+    """
+
+    __tablename__ = "stream_diagnostics"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    stream: Mapped[str] = mapped_column(String(50), nullable=False)
+    metric_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    severity: Mapped[str] = mapped_column(String(16), nullable=False)
+    observed_value: Mapped[Decimal] = mapped_column(Numeric(10, 4), nullable=False)
+    target_value: Mapped[Decimal] = mapped_column(Numeric(10, 4), nullable=False)
+    baseline_value: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 4), nullable=True)
+    days_below: Mapped[int] = mapped_column(Integer, nullable=False)
+    category: Mapped[str] = mapped_column(String(64), nullable=False)
+    trend_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    recommendations: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    detected_on: Mapped[date] = mapped_column(Date, nullable=False)
+    resolved_on: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("NOW()")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("NOW()")
+    )
+
+    __table_args__ = (
+        CheckConstraint("severity IN ('yellow','red')", name="ck_stream_diag_severity"),
+        UniqueConstraint("county_id", "metric_name", "detected_on", name="uq_stream_diag_episode"),
+        Index(
+            "idx_stream_diag_open",
+            "county_id",
+            "metric_name",
+            postgresql_where=text("resolved_on IS NULL"),
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<StreamDiagnostics(county={self.county_id!r}, metric={self.metric_name!r}, "
+            f"severity={self.severity!r}, detected_on={self.detected_on})>"
         )

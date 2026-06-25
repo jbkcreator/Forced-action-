@@ -569,4 +569,8 @@ COUNTY_ID=hillsborough
 # amounts owed in the Payout Ledger only — no Stripe disbursement. See fa081.
 0 6 1 * * $PROJECT/scripts/cron/run.sh src.tasks.affiliate_payout
 
+# Stream self-diagnosis (Sprint 4.2) — after CDS at 07:00 and skip-trace at 07:30
+30 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.stream_self_diagnosis --county-id hillsborough
+31 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.stream_self_diagnosis --county-id pinellas
+
 # === END FORCED-ACTION-PLATFORM ===

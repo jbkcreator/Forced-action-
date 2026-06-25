@@ -38,7 +38,7 @@ def get_subscriber_memory(
             LIMIT :limit
             """
         ),
-        {"sid": str(subscriber_id), "limit": limit},
+        {"sid": subscriber_id, "limit": limit},
     ).mappings().all()
 
     timeline = [
@@ -97,6 +97,10 @@ def append_memory_event(
     if db.get(Subscriber, subscriber_id) is None:
         raise ValueError(f"Subscriber {subscriber_id} does not exist")
 
+    # Validate source_event_id (issue #3 — prevent empty/malformed IDs)
+    if not source_event_id or not source_event_id.strip():
+        raise ValueError("source_event_id must be non-empty")
+
     occurred_at = _normalize_dt(occurred_at)
     existing = db.execute(
         select(UnifiedSubscriberMemory).where(
@@ -125,7 +129,7 @@ def append_memory_event(
     }
 
     memory_row = UnifiedSubscriberMemory(
-        subscriber_id=str(subscriber_id),
+        subscriber_id=subscriber_id,
         property_id=lead_id,
         stream_source=stream_source,
         event_type=event_type,
