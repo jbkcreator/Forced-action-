@@ -296,6 +296,202 @@ def test_idempotent_same_day(fresh_db):
 # Internal helpers for lifecycle tests
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# compute_dialable_rate
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_compute_dialable_rate_correct_ratio(fresh_db):
+    """3 owners with phone, 2 have mobile/landline metadata → rate = 0.667."""
+    from src.services.stream_metrics import compute_dialable_rate
+
+    for i, phone_type in enumerate(["mobile", "landline", None]):
+        pid = _seed_property(fresh_db, county_id=_TEST_COUNTY)
+        metadata = f'{{"type": "{phone_type}"}}' if phone_type else None
+        fresh_db.execute(text("""
+            INSERT INTO owners (property_id, phone_1, phone_metadata,
+                                direct_mail_eligible, skip_trace_stale)
+            VALUES (:pid, '+18135550001', cast(:meta as jsonb), false, false)
+        """), {"pid": pid, "meta": metadata})
+
+    fresh_db.flush()
+
+    rate = compute_dialable_rate(fresh_db, _TEST_COUNTY)
+    assert rate is not None
+    assert abs(rate - 2 / 3) < 0.01
+
+
+def test_compute_dialable_rate_none_on_empty(fresh_db):
+    """No owners with phones → returns None."""
+    from src.services.stream_metrics import compute_dialable_rate
+    assert compute_dialable_rate(fresh_db, "county_xyz_no_data") is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# compute_closer_conv_rate
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _seed_subscriber(db, county_id=_TEST_COUNTY):
+    row = db.execute(text("""
+        INSERT INTO subscribers (stripe_customer_id, tier, vertical, county_id,
+                                 founding_member, status, has_saved_card,
+                                 auto_mode_enabled, created_at, updated_at)
+        VALUES (gen_random_uuid()::text, 'free', 'roofing', :cid,
+                false, 'active', false, false, NOW(), NOW())
+        RETURNING id
+    """), {"cid": county_id}).fetchone()
+    return row[0]
+
+
+def test_compute_closer_conv_rate_correct_ratio(fresh_db):
+    """4 calls with outcome, 1 committed → rate = 0.25."""
+    from src.services.stream_metrics import compute_closer_conv_rate
+
+    sub_id = _seed_subscriber(fresh_db)
+    now = datetime.now(timezone.utc)
+
+    for outcome in ["committed", "callback_scheduled", "undecided", "declined"]:
+        fresh_db.execute(text("""
+            INSERT INTO closer_calls (aircall_call_id, subscriber_id, call_outcome,
+                                      started_at, created_at, updated_at)
+            VALUES (gen_random_uuid()::text, :sid, :outcome, :started, NOW(), NOW())
+        """), {"sid": sub_id, "outcome": outcome, "started": now})
+
+    fresh_db.flush()
+
+    rate = compute_closer_conv_rate(fresh_db, _TEST_COUNTY)
+    assert rate is not None
+    assert abs(rate - 0.25) < 0.01
+
+
+def test_compute_closer_conv_rate_none_on_empty(fresh_db):
+    """No calls → returns None."""
+    from src.services.stream_metrics import compute_closer_conv_rate
+    assert compute_closer_conv_rate(fresh_db, "county_xyz_no_data") is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Day-4 update (open episode is updated, not duplicated)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_day4_updates_existing_episode(fresh_db):
+    """Day 4 of breach → existing open episode updated, no new row created."""
+    from src.services.stream_diagnosis import run_metric_lifecycle
+
+    _ensure_stream_diagnostics_table(fresh_db)
+
+    today = date.today()
+    # Seed 4 days below target
+    for d in range(4):
+        _upsert_stats(fresh_db, today - timedelta(days=3 - d), "hillsborough",
+                      enrichment_rate=0.60)
+    fresh_db.flush()
+
+    # Day 3 — open episode
+    run_metric_lifecycle(fresh_db, "hillsborough", "enrichment_rate",
+                         today - timedelta(days=1))
+    # Day 4 — should update, not insert
+    run_metric_lifecycle(fresh_db, "hillsborough", "enrichment_rate", today)
+
+    rows = fresh_db.execute(text("""
+        SELECT days_below FROM stream_diagnostics
+        WHERE county_id='hillsborough' AND metric_name='enrichment_rate'
+    """)).fetchall()
+    assert len(rows) == 1
+    assert rows[0][0] >= 3
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# platform_daily_stats upsert when CDS row absent
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_upsert_stats_creates_row_when_absent(fresh_db):
+    """_upsert_stats inserts a new row when no CDS row exists for that date/county."""
+    today = date.today()
+    county = "test_upsert_absent"
+
+    _upsert_stats(fresh_db, today, county, enrichment_rate=0.75)
+    fresh_db.flush()
+
+    val = fresh_db.execute(text("""
+        SELECT enrichment_rate FROM platform_daily_stats
+        WHERE run_date=:d AND county_id=:cid
+    """), {"d": today, "cid": county}).scalar()
+    assert val is not None
+    assert abs(float(val) - 0.75) < 0.001
+
+
+def test_upsert_stats_updates_existing_cds_row(fresh_db):
+    """_upsert_stats updates metric column on a row CDS already created."""
+    today = date.today()
+    county = "test_upsert_existing"
+
+    # Simulate CDS creating the row first (with metric NULL)
+    fresh_db.execute(text("""
+        INSERT INTO platform_daily_stats
+            (run_date, county_id,
+             signals_scraped, signals_matched, signals_skipped,
+             properties_scored, properties_with_signals, score_runs_total,
+             leads_new, leads_updated, leads_unchanged, leads_qualified, leads_upgraded,
+             tier_ultra_platinum, tier_platinum, tier_gold, tier_silver, tier_bronze,
+             created_at, updated_at)
+        VALUES (:d, :cid, 10,8,2, 50,40,1, 5,3,2,3,1, 1,2,3,4,5, NOW(), NOW())
+        ON CONFLICT DO NOTHING
+    """), {"d": today, "cid": county})
+
+    _upsert_stats(fresh_db, today, county, enrichment_rate=0.82)
+    fresh_db.flush()
+
+    val = fresh_db.execute(text("""
+        SELECT enrichment_rate, signals_scraped FROM platform_daily_stats
+        WHERE run_date=:d AND county_id=:cid
+    """), {"d": today, "cid": county}).fetchone()
+    assert abs(float(val[0]) - 0.82) < 0.001
+    assert val[1] == 10  # CDS columns untouched
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# --dry-run writes nothing
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_dry_run_writes_nothing(fresh_db):
+    """Task run with dry_run=True computes values but writes no rows."""
+    from unittest.mock import patch
+    from src.tasks.stream_self_diagnosis import run
+
+    _ensure_stream_diagnostics_table(fresh_db)
+
+    # Patch get_db_context to yield our rollback session
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _fake_ctx():
+        yield fresh_db
+
+    with patch("src.tasks.stream_self_diagnosis.get_db_context", _fake_ctx):
+        result = run(_TEST_COUNTY, dry_run=True)
+
+    # No platform_daily_stats rows for test county written
+    count = fresh_db.execute(text("""
+        SELECT count(*) FROM platform_daily_stats WHERE county_id=:cid
+    """), {"cid": _TEST_COUNTY}).scalar()
+    assert count == 0
+
+    # No stream_diagnostics rows written
+    count = fresh_db.execute(text("""
+        SELECT count(*) FROM stream_diagnostics WHERE county_id=:cid
+    """), {"cid": _TEST_COUNTY}).scalar()
+    assert count == 0
+
+    # But result still has metric values (computed, not None-only)
+    assert result["county_id"] == _TEST_COUNTY
+    assert len(result["metrics"]) == 4
+    assert all(m["dry_run"] is True for m in result["metrics"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Internal helpers for lifecycle tests
+# ─────────────────────────────────────────────────────────────────────────────
+
 def _ensure_stream_diagnostics_table(db):
     from src.core.models import StreamDiagnostics, Base
     StreamDiagnostics.__table__.create(db.bind, checkfirst=True)
