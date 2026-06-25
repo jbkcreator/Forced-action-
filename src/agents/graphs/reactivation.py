@@ -39,7 +39,9 @@ from src.agents.subgraphs.compose_and_send import run_compose_and_send
 from src.agents.subgraphs.compose_and_send_email import run_compose_and_send_email
 from src.agents.subgraphs.decision_hierarchy import run_decision_hierarchy
 from src.agents.tools.read_tools import get_segment_and_score, get_subscriber_profile
+from src.agents.tools.write_tools import log_decision
 from src.core.database import db
+from src.services.feedback_ritual import publish_feedback_ritual_candidate
 from src.services.kill_switch_service import get_cached_metric
 
 logger = logging.getLogger(__name__)
@@ -89,6 +91,26 @@ class ReactivationState(TypedDict, total=False):
     cost_usd: float
     terminal_status: str
     failure_reason: str
+
+
+def _build_review_capture(state: ReactivationState) -> dict:
+    payload = state.get("event_payload") or {}
+    cohort = payload.get("cohort", "county_live")
+    county_id = payload.get("county_id") or ""
+    zip_code = payload.get("zip_code") or ""
+
+    raw_input_text = f"reactivation_outreach cohort={cohort} county_id={county_id}"
+    if zip_code:
+        raw_input_text = f"{raw_input_text} zip_code={zip_code}"
+
+    return {
+        "raw_input_text": raw_input_text,
+        "generated_output_text": state.get("message_body") or "",
+        "confidence_score": None,
+        "confidence_reason": None,
+        "review_flag": True,
+        "review_flag_reason": state.get("failure_reason") or "reactivation_early_abort",
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -321,8 +343,6 @@ def _node_compose_and_send(state: ReactivationState) -> ReactivationState:
 
 
 def _node_finalize(state: ReactivationState) -> ReactivationState:
-    from src.agents.tools.write_tools import log_decision
-
     final_status = state.get("terminal_status") or "completed"
 
     if state.get("sent"):
@@ -354,7 +374,13 @@ def _node_finalize(state: ReactivationState) -> ReactivationState:
                 summary={
                     "failure_reason": state.get("failure_reason"),
                     "early_abort": True,
+                    "review_capture": _build_review_capture(state),
                 },
+            )
+            publish_feedback_ritual_candidate(
+                decision_id=state["decision_id"],
+                graph_name=GRAPH_NAME,
+                terminal_status=final_status,
             )
         except Exception:
             pass

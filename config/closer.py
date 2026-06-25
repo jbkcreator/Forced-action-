@@ -67,3 +67,53 @@ PITCH_VARIANTS_SET = frozenset(PITCH_VARIANTS)
 CALL_OUTCOMES_SET = frozenset(CALL_OUTCOMES)
 OBJECTION_RESOLUTIONS_SET = frozenset(OBJECTION_RESOLUTIONS)
 SENTIMENTS_SET = frozenset(SENTIMENTS)
+
+
+# ── A6: Closer-to-Cora Teaching Corrections ──────────────────────────────────
+# Controlled vocabulary for Teaching Corrections (see CONTEXT.md → Score Dampener,
+# ADR 0006, ADR 0007).
+
+CORRECTION_REASON_NON_RESIDENTIAL = "non_residential"
+CORRECTION_REASON_OWNER_NOT_MOTIVATED = "owner_not_motivated"
+CORRECTION_REASON_WRONG_DISTRESS = "wrong_distress"
+CORRECTION_REASON_BAD_CONTACT = "bad_contact"
+CORRECTION_REASON_OTHER = "other"
+
+CORRECTION_REASONS: list[str] = [
+    CORRECTION_REASON_NON_RESIDENTIAL,
+    CORRECTION_REASON_OWNER_NOT_MOTIVATED,
+    CORRECTION_REASON_WRONG_DISTRESS,
+    CORRECTION_REASON_BAD_CONTACT,
+    CORRECTION_REASON_OTHER,
+]
+
+CORRECTION_REASONS_SET: frozenset[str] = frozenset(CORRECTION_REASONS)
+
+# Reasons that cause a score dampener to be applied; bad_contact and other are
+# label-only and trigger no suppression in the CDS engine.
+DAMPENING_REASONS_SET: frozenset[str] = frozenset({
+    CORRECTION_REASON_NON_RESIDENTIAL,
+    CORRECTION_REASON_OWNER_NOT_MOTIVATED,
+    CORRECTION_REASON_WRONG_DISTRESS,
+})
+
+# Signal types a closer can flag via wrong_distress — the exhaustive set of
+# signal keys emitted by _collect_signals() in cds_engine.py.
+TEACHABLE_SIGNAL_TYPES: list[str] = [
+    "code_violations",
+    "judgment_liens",
+    "code_lien",
+    "hoa_liens",
+    "mechanics_liens",
+    "irs_tax_liens",
+    "deed_transfers",
+    "probate",
+    "evictions",
+    "bankruptcy",
+    "tax_delinquencies",
+    "foreclosures",
+    "building_permits",
+    "enforcement_permit",
+]
+
+TEACHABLE_SIGNAL_TYPES_SET: frozenset[str] = frozenset(TEACHABLE_SIGNAL_TYPES)

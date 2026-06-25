@@ -120,6 +120,28 @@ def dispatch_event(event: Dict[str, Any]) -> Dict[str, Any]:
 			)
 		return _outcome("routed", "closer_call_tagging", decision_id, "ok")
 
+	# Feedback Ritual capture hook (Sprint 4.3).
+	# feedback_ritual_candidate is queueing/enrichment, not a Cora graph run:
+	# load the finished agent_decisions row and enqueue a shared feedback-ritual
+	# queue row if it qualifies.
+	if event_type == "feedback_ritual_candidate":
+		try:
+			from src.services.feedback_ritual import process_feedback_ritual_candidate
+			# db is the Database singleton — it has no .session; open a transactional
+			# scope so the enqueued queue row actually commits (the processor doesn't).
+			with db.session_scope() as _s:
+				process_feedback_ritual_candidate(
+					_s,
+					(payload or {}).get("decision_id"),
+					actor="system",
+				)
+		except Exception as _feedback_exc:
+			logger.warning(
+				"supervisor: feedback ritual enqueue failed (decision=%s): %s",
+				(payload or {}).get("decision_id"), _feedback_exc,
+			)
+		return _outcome("routed", "feedback_ritual", decision_id, "ok")
+
 	# Global kill switch
 	if settings.agents_global_kill_switch:
 		reason = "global_kill_switch_enabled"
