@@ -989,6 +989,14 @@ class DistressScore(Base):
     # Scoring batch identifier — int(UTC epoch) set at start of score_all_properties()
     scoring_run_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
+    # A2 — Lead Confidence gating. lead_confidence is 0.000–1.000 (NULL until A2
+    # runs); is_guess_lead = lead_confidence < MIN_CONFIDENCE_THRESHOLD. Guess
+    # leads are withheld from paid surfaces (feed / Lead Packs / Cora recs).
+    lead_confidence: Mapped[Optional[float]] = mapped_column(Numeric(4, 3))
+    is_guess_lead: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+
     # Relationship
     property: Mapped["Property"] = relationship("Property", back_populates="distress_scores")
 
@@ -1001,6 +1009,13 @@ class DistressScore(Base):
         Index("idx_score_county_id", "county_id"),
         Index("idx_score_distress_types", "distress_types", postgresql_using="gin"),
         Index("idx_score_scoring_run_id", "scoring_run_id"),
+        # Read paths filter `WHERE NOT is_guess_lead` on the hot lead-selection
+        # path; partial index supports the sellable (FALSE) side cheaply.
+        Index(
+            "idx_score_sellable",
+            "final_cds_score",
+            postgresql_where=text("is_guess_lead = false"),
+        ),
         CheckConstraint("urgency_level IN ('Immediate', 'High', 'Medium', 'Low')", name="check_urgency_level"),
         CheckConstraint("lead_tier IN ('Ultra Platinum', 'Platinum', 'Gold', 'Silver', 'Bronze')", name="check_lead_tier"),
     )

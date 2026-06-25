@@ -3451,6 +3451,7 @@ def _on_lead_pack_payment(payment_intent: dict, db: Session) -> None:
         Property.zip == zip_code,
         Property.county_id == county_id,
         DistressScore.qualified == True,
+        DistressScore.is_guess_lead.is_(False),  # A2: never reserve a guess lead in a paid pack
     ]
 
     try:
