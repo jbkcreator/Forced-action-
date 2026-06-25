@@ -22,7 +22,7 @@ on-demand skip-trace; byol triggers a skip-trace on a user-supplied address
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy.orm import Session
@@ -136,6 +136,7 @@ def _fulfill_report_or_brief(purchase: PremiumPurchase, db: Session) -> str:
     full = purchase.sku == "report"
     data = build_report_data(purchase.property_id, db, full=full)
     path = render_lead_report_pdf(data, purchase.id, full=full)
+    purchase.output_ref_expires_at = datetime.now(timezone.utc) + timedelta(days=7)
     return str(path)
 
 

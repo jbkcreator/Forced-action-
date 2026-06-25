@@ -2998,6 +2998,7 @@ class PremiumPurchase(Base):
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")  # pending|delivered|failed|refunded|disputed
     purchased_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    output_ref_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
     # ── Refund / dispute audit (fa004, 2026-05-04) ──────────────────
     refunded_at: Mapped[Optional[datetime]] = mapped_column(DateTime)

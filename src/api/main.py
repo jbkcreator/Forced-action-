@@ -6006,18 +6006,30 @@ def download_premium_report(
     if purchase.status != "delivered":
         raise HTTPException(status_code=409, detail="Report not ready")
 
+    # Expiration check (issue #1)
+    if purchase.output_ref_expires_at and purchase.output_ref_expires_at < datetime.now(timezone.utc):
+        raise HTTPException(status_code=404, detail="Not found")
+
     if not purchase.output_ref:
         raise HTTPException(status_code=404, detail="Not found")
 
-    output_path = Path(purchase.output_ref)
-    if not output_path.exists():
+    # Path traversal guard (issue #2) — canonicalize and validate
+    output_path = Path(purchase.output_ref).resolve()
+    expected_dir = Path("reports/lead_report").resolve()
+    if not str(output_path).startswith(str(expected_dir)):
+        raise HTTPException(status_code=404, detail="Not found")
+    if not output_path.is_file():
         raise HTTPException(status_code=404, detail="Not found")
 
-    return FileResponse(
-        str(output_path),
-        media_type="application/pdf",
-        filename=f"lead-report-{purchase.property_id}.pdf",
-    )
+    # TOCTOU guard (issue #3) — catch FileNotFoundError at serve time
+    try:
+        return FileResponse(
+            str(output_path),
+            media_type="application/pdf",
+            filename=f"lead-report-{purchase.property_id}.pdf",
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Not found")
 
 
 # ── Phase 2B: Missed-Call Voice Webhook ──────────────────────────────────────

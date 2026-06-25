@@ -8,7 +8,7 @@ Test 7:    download endpoint (owner/non-owner/pending/expired).
 
 import json
 import pytest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from src.core.models import (
     BuildingPermit, DistressScore, Financial, Owner,
@@ -227,5 +227,80 @@ def test_download_endpoint(fresh_db, tmp_path):
         # pending → 409
         resp = client.get(f"/api/premium/{pending.id}/download?feed_uuid={sub.event_feed_uuid}")
         assert resp.status_code == 409
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+# ── test 8 — download enforces expiration ─────────────────────────────────
+
+def test_download_expired_report(fresh_db, tmp_path):
+    """Expired report returns 404 instead of the PDF."""
+    from fastapi.testclient import TestClient
+    from src.api.main import app
+    from src.api.deps import get_db
+    from src.core.models import Subscriber
+    from datetime import datetime, timedelta, timezone
+
+    sub = Subscriber(email="expired@heu.ai", event_feed_uuid="rpt-exp-001",
+                     stripe_customer_id="cus_exp", tier="pro",
+                     vertical="investor", county_id="hillsborough", status="active")
+    fresh_db.add(sub)
+    fresh_db.flush()
+
+    p = _prop(fresh_db, "RPT-T-EXP")
+    report_path = tmp_path / "expired_report.pdf"
+    report_path.write_bytes(b"%PDF expired")
+
+    purchase = PremiumPurchase(
+        subscriber_id=sub.id, sku="report", paid_via="credits",
+        credits_spent=3, property_id=p.id, status="delivered",
+        output_ref=str(report_path),
+        output_ref_expires_at=datetime.now(timezone.utc) - timedelta(hours=1),
+        delivered_at=datetime.now(timezone.utc),
+    )
+    fresh_db.add(purchase)
+    fresh_db.flush()
+
+    app.dependency_overrides[get_db] = lambda: fresh_db
+    client = TestClient(app, raise_server_exceptions=False)
+    try:
+        resp = client.get(f"/api/premium/{purchase.id}/download?feed_uuid={sub.event_feed_uuid}")
+        assert resp.status_code == 404, resp.text
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+# ── test 9 — path traversal is blocked ────────────────────────────────────
+
+def test_download_path_traversal_blocked(fresh_db, tmp_path):
+    """A malicious output_ref outside reports/ returns 404."""
+    from fastapi.testclient import TestClient
+    from src.api.main import app
+    from src.api.deps import get_db
+    from src.core.models import Subscriber
+    from datetime import datetime, timedelta, timezone
+
+    sub = Subscriber(email="traverse@heu.ai", event_feed_uuid="rpt-trv-001",
+                     stripe_customer_id="cus_trv", tier="pro",
+                     vertical="investor", county_id="hillsborough", status="active")
+    fresh_db.add(sub)
+    fresh_db.flush()
+
+    p = _prop(fresh_db, "RPT-T-TRV")
+    purchase = PremiumPurchase(
+        subscriber_id=sub.id, sku="report", paid_via="credits",
+        credits_spent=3, property_id=p.id, status="delivered",
+        output_ref="../../../../etc/passwd",  # malicious path
+        output_ref_expires_at=datetime.now(timezone.utc) + timedelta(days=1),
+        delivered_at=datetime.now(timezone.utc),
+    )
+    fresh_db.add(purchase)
+    fresh_db.flush()
+
+    app.dependency_overrides[get_db] = lambda: fresh_db
+    client = TestClient(app, raise_server_exceptions=False)
+    try:
+        resp = client.get(f"/api/premium/{purchase.id}/download?feed_uuid={sub.event_feed_uuid}")
+        assert resp.status_code == 404, resp.text
     finally:
         app.dependency_overrides.pop(get_db, None)
