@@ -364,8 +364,11 @@ class MultiVerticalScorer:
                     continue
             signals.append({"type": sig_type, "date": lien.filing_date, "amount": lien.amount})
 
-        # 3. Deed transfers — skip nominal/intra-family transfers (< $1,000)
+        # 3. Deed transfers — skip mortgage instruments (a recorded mortgage/refinance
+        #    is debt, not an ownership change) and nominal/intra-family transfers (< $1,000)
         for deed in (prop.deeds or []):
+            if getattr(deed, "mortgage_amount", None) is not None:
+                continue
             if deed.sale_price is not None and deed.sale_price < 1000:
                 continue
             signals.append({"type": "deed_transfers", "date": deed.record_date, "amount": deed.sale_price})
@@ -865,6 +868,8 @@ class MultiVerticalScorer:
         #   2. Deeds with record_date=None in the signal dict (date check fails silently).
         if not _has_recent_deed and prop.deeds:
             for _deed in prop.deeds:
+                if getattr(_deed, "mortgage_amount", None) is not None:
+                    continue  # mortgage instrument, not an ownership transfer
                 if _deed.record_date is None:
                     continue
                 _rd = _deed.record_date.date() if isinstance(_deed.record_date, datetime) else _deed.record_date
@@ -1510,7 +1515,7 @@ class MultiVerticalScorer:
             FROM legal_and_liens WHERE property_id IN (SELECT unnest(CAST(:ids AS bigint[])))
         """)
         deed_rows = _q("""
-            SELECT property_id, sale_price, record_date, deed_type
+            SELECT property_id, sale_price, record_date, deed_type, mortgage_amount
             FROM deeds WHERE property_id IN (SELECT unnest(CAST(:ids AS bigint[])))
         """)
         lp_rows = _q("""

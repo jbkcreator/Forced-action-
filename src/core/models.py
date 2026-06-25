@@ -544,6 +544,10 @@ class Deed(Base):
     # Legal description
     legal_description: Mapped[Optional[str]] = mapped_column(Text)
 
+    # Mortgage/deed-of-trust amount (Sprint 4.4) — populated from `Filing Amt`
+    # column on mortgage-type docs. NULL for non-mortgage deeds.
+    mortgage_amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
+
     # HCPA Enrichment — sale qualification
     sale_qualified: Mapped[Optional[bool]] = mapped_column(Boolean)
     vacant_improved: Mapped[Optional[str]] = mapped_column(String(20))
