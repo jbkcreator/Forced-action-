@@ -53,6 +53,7 @@ from datetime import datetime, date, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from src.services.ghl_webhook import push_lead_to_ghl
+from src.services.heuristic_loader import load_overrides as _load_weight_overrides
 from config.settings import settings
 
 # Can be overridden at runtime via --no-ghl CLI flag; default comes from GHL_PUSH_ENABLED env var
@@ -267,6 +268,8 @@ class MultiVerticalScorer:
         self._total_scored: int = 0
         # Default no-op profiler; CLI replaces with enabled instance under --profile.
         self._profiler: _Profiler = _Profiler(enabled=False)
+        # A3: warm-start priors — additive deltas loaded from scoring_weight_overrides (5-min cache).
+        self._weight_overrides: Dict[tuple, float] = _load_weight_overrides(session)
 
     # ── GHL batch flush ───────────────────────────────────────────────────────
 
@@ -665,7 +668,8 @@ class MultiVerticalScorer:
         best_total = -999
         for sig_type, sig_info in latest_by_type.items():
             sig_date = sig_info["date"]
-            base    = weights[sig_type]
+            _delta  = self._weight_overrides.get((vertical, sig_type), 0.0)
+            base    = max(0, min(100, weights[sig_type] + _delta))
             recency = self._recency_bonus(sig_date)
             decay   = self._age_decay(sig_date)
             total   = base + recency + decay   # decay is negative

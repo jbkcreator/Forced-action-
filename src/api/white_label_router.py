@@ -980,12 +980,13 @@ def submit_deal(
     if req.deal_size_bucket not in valid_buckets:
         raise HTTPException(400, f"deal_size_bucket must be one of: {valid_buckets}")
 
-    db.execute(
+    outcome_id: int = db.execute(
         sa_text("""
             INSERT INTO deal_outcomes
                    (subscriber_id, property_id, deal_size_bucket, deal_amount,
                     pipeline_stage, county_id, trade_vertical, created_at)
             VALUES (NULL, :pid, :bucket, :amount, :stage, :county, :vertical, now())
+            RETURNING id
         """),
         {
             "pid": req.property_id,
@@ -995,7 +996,22 @@ def submit_deal(
             "county": req.county_id,
             "vertical": req.trade_vertical,
         },
-    )
+    ).scalar_one()
+
+    # Phase 3 A1: loss autopsy for closed_lost / declined deals
+    if req.pipeline_stage in ("closed_lost", "declined"):
+        try:
+            from src.services.loss_autopsy import run_loss_autopsy
+            reason = "DECLINED" if req.pipeline_stage == "declined" else "CLOSED_LOST"
+            run_loss_autopsy(
+                property_id=req.property_id,
+                trigger_reason=reason,
+                db=db,
+                deal_outcome_id=outcome_id,
+            )
+        except Exception as exc:
+            logger.warning("[wl_deal] loss autopsy failed property_id=%s: %s", req.property_id, exc)
+
     db.commit()
     return {"message": "Deal recorded"}
 
