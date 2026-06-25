@@ -544,6 +544,10 @@ class Deed(Base):
     # Legal description
     legal_description: Mapped[Optional[str]] = mapped_column(Text)
 
+    # Mortgage/deed-of-trust amount (Sprint 4.4) — populated from `Filing Amt`
+    # column on mortgage-type docs. NULL for non-mortgage deeds.
+    mortgage_amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
+
     # HCPA Enrichment — sale qualification
     sale_qualified: Mapped[Optional[bool]] = mapped_column(Boolean)
     vacant_improved: Mapped[Optional[str]] = mapped_column(String(20))
@@ -3107,6 +3111,7 @@ class PremiumPurchase(Base):
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")  # pending|delivered|failed|refunded|disputed
     purchased_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    output_ref_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
     # ── Refund / dispute audit (fa004, 2026-05-04) ──────────────────
     refunded_at: Mapped[Optional[datetime]] = mapped_column(DateTime)

@@ -577,4 +577,13 @@ COUNTY_ID=hillsborough
 # amounts owed in the Payout Ledger only — no Stripe disbursement. See fa081.
 0 6 1 * * $PROJECT/scripts/cron/run.sh src.tasks.affiliate_payout
 
+# ── EQUITY PROFILE COMPUTE (Sprint 4.4) ──────────────────────────────────────
+# Nightly 03:00 UTC — after HCPA refresh, deed/liens scrapers, and master
+# parcel refresh, but before CDS scoring at 07:00. Aggregates lien amounts
+# from legal_and_liens / tax_delinquencies / code_violations into
+# financials.total_lien_amount, then computes est_equity / equity_pct /
+# total_debt from assessed_value_mkt - (est_mortgage_bal + total_lien_amount).
+0 3 * * * $PROJECT/scripts/cron/run.sh src.tasks.compute_equity_profiles --county-id $COUNTY_ID
+1 3 * * * $PROJECT/scripts/cron/run.sh src.tasks.compute_equity_profiles --county-id pinellas
+
 # === END FORCED-ACTION-PLATFORM ===

@@ -6017,6 +6017,60 @@ def premium_purchase_endpoint(
     }
 
 
+@app.get("/api/premium/{purchase_id}/download")
+def download_premium_report(
+    purchase_id: int,
+    feed_uuid: str,
+    db: Session = Depends(get_db),
+):
+    """Download a delivered report or brief PDF.
+
+    404 on: not found, wrong owner, not a report/brief, past expires_at.
+    409 if status != 'delivered' (pending/failed).
+    """
+    from src.core.models import PremiumPurchase
+
+    purchase = db.get(PremiumPurchase, purchase_id)
+
+    # Ownership mismatch → 404 (never reveal another subscriber's purchase exists)
+    sub = db.execute(
+        select(Subscriber).where(Subscriber.event_feed_uuid == feed_uuid)
+    ).scalar_one_or_none()
+    if sub is None or purchase is None or purchase.subscriber_id != sub.id:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    if purchase.sku not in ("report", "brief"):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    if purchase.status != "delivered":
+        raise HTTPException(status_code=409, detail="Report not ready")
+
+    # Expiration check (issue #1)
+    if purchase.output_ref_expires_at and purchase.output_ref_expires_at < datetime.now(timezone.utc):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    if not purchase.output_ref:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    # Path traversal guard (issue #2) — canonicalize and validate
+    output_path = Path(purchase.output_ref).resolve()
+    expected_dir = Path("reports/lead_report").resolve()
+    if not str(output_path).startswith(str(expected_dir)):
+        raise HTTPException(status_code=404, detail="Not found")
+    if not output_path.is_file():
+        raise HTTPException(status_code=404, detail="Not found")
+
+    # TOCTOU guard (issue #3) — catch FileNotFoundError at serve time
+    try:
+        return FileResponse(
+            str(output_path),
+            media_type="application/pdf",
+            filename=f"lead-report-{purchase.property_id}.pdf",
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Not found")
+
+
 # ── Phase 2B: Missed-Call Voice Webhook ──────────────────────────────────────
 
 @app.post("/webhooks/telnyx/voice", include_in_schema=False)
