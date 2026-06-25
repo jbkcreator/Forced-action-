@@ -134,17 +134,22 @@ def _best_match_confidence(records) -> Optional[float]:
     return max(values) if values else None
 
 
-def build_signal_records(prop, session: Session) -> list[SignalRecord]:
+def build_signal_records(prop, session: Session, scorer=None) -> list[SignalRecord]:
     """Read-only: derive the SignalRecords contributing to a property's score.
 
     Reuses the CDS engine's _collect_signals so A2's notion of "which signals"
     stays identical to what actually scored the lead (resolved-violation skips,
     eviction-direction rules, nominal-deed filtering, hard cutoff), then attaches
     the best per-spoke match_confidence. Does NOT mutate scoring state.
-    """
-    from src.services.cds_engine import MultiVerticalScorer
 
-    raw = MultiVerticalScorer(session)._collect_signals(prop)
+    Pass a shared `scorer` when looping (run_lead_confidence_pass) so the engine
+    is built once, not per property.
+    """
+    if scorer is None:
+        from src.services.cds_engine import MultiVerticalScorer
+        scorer = MultiVerticalScorer(session)
+
+    raw = scorer._collect_signals(prop)
 
     mc_by_spoke = {
         "foreclosures": _best_match_confidence(prop.foreclosures),
@@ -165,7 +170,7 @@ def build_signal_records(prop, session: Session) -> list[SignalRecord]:
     return records
 
 
-def evaluate_lead_confidence(prop, session: Session, *, as_of: Optional[date] = None) -> ConfidenceResult:
+def evaluate_lead_confidence(prop, session: Session, *, as_of: Optional[date] = None, scorer=None) -> ConfidenceResult:
     """Compute Lead Confidence for a property, persist it onto the latest
     distress_scores row, and flag a guess lead for direct mail when a mailing
     address exists. Read-only on the CDS score itself — only the two A2 columns
@@ -174,7 +179,7 @@ def evaluate_lead_confidence(prop, session: Session, *, as_of: Optional[date] = 
     as_of = as_of or date.today()
     thresholds = for_county(getattr(prop, "county_id", None))
 
-    records = build_signal_records(prop, session)
+    records = build_signal_records(prop, session, scorer=scorer)
     result = compute_lead_confidence(records, as_of=as_of, thresholds=thresholds)
 
     session.execute(
@@ -219,7 +224,10 @@ def run_lead_confidence_pass(
     are logged and skipped — a bad lead never aborts the pass. Returns the count
     of properties evaluated.
     """
+    from sqlalchemy.orm import selectinload
+
     from src.core.models import Property
+    from src.services.cds_engine import MultiVerticalScorer
 
     as_of = as_of or date.today()
     if scoring_run_id is not None:
@@ -237,16 +245,37 @@ def run_lead_confidence_pass(
         )
     property_ids = [r[0] for r in rows]
 
+    # ponytail: build the scoring engine once (was per-property) and commit per
+    # chunk so a crash mid-run keeps prior progress and locks aren't held for the
+    # whole 80k-property pass. Bump CHUNK if commit overhead dominates.
+    CHUNK = 500
+    scorer = MultiVerticalScorer(session)
     evaluated = 0
-    for pid in property_ids:
-        prop = session.get(Property, pid)
-        if prop is None:
-            continue
-        try:
-            evaluate_lead_confidence(prop, session, as_of=as_of)
-            evaluated += 1
-        except Exception:
-            logger.error("Lead Confidence eval failed for property_id=%s", pid, exc_info=True)
+    for i in range(0, len(property_ids), CHUNK):
+        chunk = property_ids[i : i + CHUNK]
+        props = (
+            session.query(Property)
+            .filter(Property.id.in_(chunk))
+            .options(
+                selectinload(Property.owner),  # _collect_signals eviction-direction check
+                selectinload(Property.foreclosures),
+                selectinload(Property.code_violations),
+                selectinload(Property.legal_and_liens),
+                selectinload(Property.legal_proceedings),
+                selectinload(Property.deeds),
+                selectinload(Property.tax_delinquencies),
+                selectinload(Property.building_permits),
+            )
+            .all()
+        )
+        for prop in props:
+            try:
+                evaluate_lead_confidence(prop, session, as_of=as_of, scorer=scorer)
+                evaluated += 1
+            except Exception:
+                logger.error("Lead Confidence eval failed for property_id=%s", prop.id, exc_info=True)
+        session.commit()
+
     logger.info("Lead Confidence pass complete: %d properties evaluated", evaluated)
     return evaluated
 
