@@ -18,15 +18,20 @@ from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from config.closer import (
+    CORRECTION_REASONS_SET,
+    CORRECTION_REASON_WRONG_DISTRESS,
+    DAMPENING_REASONS_SET,
     LEAD_QUALITY_MAX,
     LEAD_QUALITY_MIN,
     OBJECTION_TAXONOMY_SET,
     PITCH_VARIANTS_SET,
+    TEACHABLE_SIGNAL_TYPES_SET,
 )
 from src.api.admin_router import get_current_admin
 from src.api.deps import get_db
-from src.core.models import CloserCall, Subscriber
+from src.core.models import CloserCall, CoraTrainingOverride, Subscriber
 from src.services import aircall_client
+from src.services.cds_engine import MultiVerticalScorer as CDSEngine
 from src.services.phone_utils import normalize_closer as normalize_phone
 
 logger = logging.getLogger(__name__)
@@ -249,3 +254,254 @@ def closer_call_recording(
     if not url:
         raise HTTPException(status_code=404, detail="recording not available")
     return {"recording_url": url, "expires_in_sec": ttl}
+
+
+# ── A6: Closer-to-Cora Teaching Interface ────────────────────────────────────
+
+class TeachRequest(BaseModel):
+    subject_id: int
+    correction_reason: str
+    signal_type: Optional[str] = None
+    note: Optional[str] = None
+    closer_call_id: Optional[int] = None
+
+
+def _serialize_correction(row: CoraTrainingOverride) -> dict:
+    return {
+        "id": row.id,
+        "subject_id": row.subject_id,
+        "correction_reason": row.correction_reason,
+        "signal_type": row.signal_type,
+        "dampener_active": row.dampener_active,
+        "queue_status": row.queue_status,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
+@router.post("/closer/teach", status_code=201)
+def create_teaching_correction(
+    req: TeachRequest,
+    response: Response,
+    db: Session = Depends(get_db),
+    admin: dict = Depends(get_current_admin),
+):
+    """Record a Teaching Correction for a mis-scored lead.
+
+    Immediately applies a Score Dampener (for dampening reasons) by synchronously
+    rescoring the property.  Retains the row as a fine-tuning label for future
+    Cora model training.  Idempotent: a duplicate active correction returns 409
+    with the existing row.
+    """
+    if req.correction_reason not in CORRECTION_REASONS_SET:
+        raise HTTPException(
+            status_code=422,
+            detail=f"invalid correction_reason; valid: {sorted(CORRECTION_REASONS_SET)}",
+        )
+
+    if req.correction_reason == CORRECTION_REASON_WRONG_DISTRESS:
+        if not req.signal_type:
+            raise HTTPException(
+                status_code=422,
+                detail="signal_type required for wrong_distress corrections",
+            )
+        if req.signal_type not in TEACHABLE_SIGNAL_TYPES_SET:
+            raise HTTPException(
+                status_code=422,
+                detail=f"invalid signal_type; valid: {sorted(TEACHABLE_SIGNAL_TYPES_SET)}",
+            )
+    elif req.signal_type is not None:
+        raise HTTPException(
+            status_code=422,
+            detail="signal_type is only valid for wrong_distress corrections",
+        )
+
+    # Verify property exists.
+    prop_row = db.execute(
+        text("SELECT 1 FROM properties WHERE id = :pid"),
+        {"pid": req.subject_id},
+    ).first()
+    if prop_row is None:
+        raise HTTPException(status_code=404, detail="property not found")
+
+    dampener_active = req.correction_reason in DAMPENING_REASONS_SET
+
+    row = CoraTrainingOverride(
+        source="closer_teach",
+        subject_type="property",
+        subject_ref=str(req.subject_id),
+        closer_call_id=req.closer_call_id,
+        correction_reason=req.correction_reason,
+        signal_type=req.signal_type,
+        note=req.note,
+        dampener_active=dampener_active,
+        queue_status="pending",
+        created_by=admin.get("sub") or admin.get("email") or "admin",
+    )
+    db.add(row)
+
+    try:
+        db.flush()
+    except Exception as exc:
+        from sqlalchemy.exc import IntegrityError as _IE
+        if isinstance(exc, _IE):
+            db.rollback()
+            # Return the existing active correction.
+            existing = db.execute(
+                text(
+                    "SELECT * FROM cora_training_overrides "
+                    "WHERE subject_ref = :sid AND correction_reason = :reason "
+                    "  AND COALESCE(signal_type, '') = COALESCE(:sig, '') "
+                    "  AND dampener_active "
+                    "LIMIT 1"
+                ),
+                {
+                    "sid": str(req.subject_id),
+                    "reason": req.correction_reason,
+                    "sig": req.signal_type,
+                },
+            ).first()
+            response.status_code = 409
+            if existing:
+                return {"id": existing.id, "detail": "correction already active"}
+            return {"detail": "correction already active"}
+        raise
+
+    db.commit()
+
+    logger.info(
+        "[teach] correction created id=%s property=%s reason=%s signal=%s by=%s",
+        row.id, req.subject_id, req.correction_reason, req.signal_type,
+        row.created_by,
+    )
+
+    if dampener_active:
+        try:
+            engine = CDSEngine(db)
+            engine.score_properties_by_ids([req.subject_id], save_to_db=True)
+            logger.info("[teach] rescore triggered for property=%s", req.subject_id)
+        except Exception:
+            logger.error(
+                "[teach] rescore failed for property=%s after correction=%s",
+                req.subject_id, row.id, exc_info=True,
+            )
+
+    return _serialize_correction(row)
+
+
+@router.delete("/closer/teach/{correction_id}", status_code=200)
+def delete_teaching_correction(
+    correction_id: int,
+    db: Session = Depends(get_db),
+    admin: dict = Depends(get_current_admin),
+):
+    """Undo a Teaching Correction.
+
+    Sets dampener_active=False and queue_status='discarded', then rescores
+    the property so the dampener is lifted immediately.
+    """
+    row = db.get(CoraTrainingOverride, correction_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="correction not found")
+
+    was_dampening = row.dampener_active
+    row.dampener_active = False
+    row.queue_status = "discarded"
+    db.flush()
+    db.commit()
+
+    logger.info(
+        "[teach] correction deleted id=%s property=%s by=%s",
+        correction_id, row.subject_id, admin.get("sub") or admin.get("email"),
+    )
+
+    if was_dampening:
+        try:
+            engine = CDSEngine(db)
+            engine.score_properties_by_ids([row.subject_id], save_to_db=True)
+            logger.info("[teach] rescore triggered for property=%s (undo)", row.subject_id)
+        except Exception:
+            logger.error(
+                "[teach] rescore failed for property=%s after undo correction=%s",
+                row.subject_id, correction_id, exc_info=True,
+            )
+
+    return _serialize_correction(row)
+
+
+@router.get("/subscribers/{subscriber_id}/delivered-leads")
+def subscriber_delivered_leads(
+    subscriber_id: int,
+    limit: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+    _admin: dict = Depends(get_current_admin),
+):
+    """Leads delivered to a subscriber, newest first, with current score and
+    the signals present (for the Teach panel's wrong_distress picker) plus any
+    active Teaching Corrections already applied (for the undo affordance).
+    """
+    lead_rows = db.execute(
+        text(
+            """
+            SELECT
+                p.id            AS property_id,
+                p.address       AS address,
+                p.city          AS city,
+                ds.final_cds_score AS cds_score,
+                ds.lead_tier    AS lead_tier,
+                ds.distress_types  AS signals,
+                sl.sent_at      AS sent_at
+            FROM sent_leads sl
+            JOIN properties p ON p.id = sl.property_id
+            LEFT JOIN LATERAL (
+                SELECT final_cds_score, lead_tier, distress_types
+                FROM distress_scores
+                WHERE property_id = p.id
+                ORDER BY score_date DESC
+                LIMIT 1
+            ) ds ON TRUE
+            WHERE sl.subscriber_id = :sid
+            ORDER BY sl.sent_at DESC
+            LIMIT :limit
+            """
+        ),
+        {"sid": subscriber_id, "limit": limit},
+    ).fetchall()
+
+    property_ids = [r.property_id for r in lead_rows]
+
+    corrections_by_pid: dict[int, list] = {}
+    if property_ids:
+        corr_rows = db.execute(
+            text(
+                """
+                SELECT id, subject_ref AS subject_id, correction_reason, signal_type
+                FROM cora_training_overrides
+                WHERE subject_type = 'property'
+                  AND subject_ref = ANY(:pids)
+                  AND dampener_active
+                ORDER BY created_at
+                """
+            ),
+            {"pids": [str(pid) for pid in property_ids]},
+        ).fetchall()
+        for c in corr_rows:
+            corrections_by_pid.setdefault(c.subject_id, []).append({
+                "id": c.id,
+                "correction_reason": c.correction_reason,
+                "signal_type": c.signal_type,
+            })
+
+    items = []
+    for r in lead_rows:
+        items.append({
+            "property_id": r.property_id,
+            "address": r.address,
+            "city": r.city,
+            "cds_score": float(r.cds_score) if r.cds_score is not None else None,
+            "lead_tier": r.lead_tier,
+            "signals": list(r.signals) if r.signals else [],
+            "sent_at": r.sent_at.isoformat() if r.sent_at else None,
+            "active_corrections": corrections_by_pid.get(r.property_id, []),
+        })
+
+    return {"subscriber_id": subscriber_id, "count": len(items), "items": items}

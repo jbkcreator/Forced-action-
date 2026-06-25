@@ -164,6 +164,19 @@ class DeedLoader(BaseLoader):
                         if pd.isna(legal_desc_val):
                             legal_desc_val = None
 
+                        # Sprint 4.4: extract mortgage amount from Filing Amt column
+                        filing_amt = self.parse_amount(row.get('Filing Amt'))
+                        mortgage_amount = filing_amt
+                        # Only keep mortgage_amount if this is a mortgage-type document
+                        # (deed_type or DocType includes "mortgage" or "deed of trust");
+                        # otherwise NULL it out — the Filing Amt on non-mortgage deeds
+                        # is recording fees, not loan amounts.
+                        doc_type_raw = str(deed_type_val or row.get('DocType') or '').lower()
+                        if mortgage_amount is not None and not any(
+                            kw in doc_type_raw for kw in ['mortgage', 'deed of trust']
+                        ):
+                            mortgage_amount = None
+
                         deed_record = Deed(
                             property_id=property_record.id,
                             instrument_number=instrument,
@@ -177,6 +190,7 @@ class DeedLoader(BaseLoader):
                             book_number=book_number_val,
                             page_number=page_number_val,
                             legal_description=legal_desc_val,
+                            mortgage_amount=mortgage_amount,
                             match_confidence=round(match_score / 100.0, 3),
                             match_method=match_method,
                             county_id=self.county_id,

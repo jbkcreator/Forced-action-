@@ -240,6 +240,110 @@ class _ScoreRef:
         self.id = id_
 
 
+# ── A6: Teaching Correction dampener helpers ──────────────────────────────────
+# Pure functions — no DB access, testable in isolation.
+# Called from MultiVerticalScorer.score_property() when active corrections exist.
+
+def _filter_signals_for_teaching(
+    signals: List[Dict],
+    corrections: List[Dict],
+) -> List[Dict]:
+    """Pre-scoring: drop signals suppressed by active wrong_distress corrections.
+
+    A wrong_distress correction on signal_type=X removes signals of type X whose
+    date is not newer than the correction.  If a newer instance of the same signal
+    exists, the correction has been overtaken (lifts automatically).
+
+    All other correction reasons leave signals intact; vertical zeroing is handled
+    post-scoring by _apply_vertical_dampener().
+    """
+    from config.closer import CORRECTION_REASON_WRONG_DISTRESS
+
+    wrong_corrections = [
+        c for c in corrections
+        if c["correction_reason"] == CORRECTION_REASON_WRONG_DISTRESS
+    ]
+    if not wrong_corrections:
+        return signals
+
+    def _as_date(d):
+        if d is None:
+            return None
+        if isinstance(d, datetime):
+            return d.date()
+        return d
+
+    filtered: List[Dict] = []
+    for sig in signals:
+        keep = True
+        for corr in wrong_corrections:
+            if sig["type"] != corr["signal_type"]:
+                continue
+            sig_date = _as_date(sig.get("date"))
+            corr_date = _as_date(corr["created_at"])
+            if sig_date is None or corr_date is None or sig_date <= corr_date:
+                keep = False
+                break
+            # sig_date > corr_date → newer instance → correction lifts → keep
+        if keep:
+            filtered.append(sig)
+    return filtered
+
+
+def _apply_vertical_dampener(
+    vertical_scores: Dict[str, float],
+    vertical_results: Dict[str, Dict],
+    corrections: List[Dict],
+    signals: List[Dict],
+) -> None:
+    """Post-scoring: zero verticals for non_residential and owner_not_motivated.
+
+    Mutates vertical_scores and vertical_results in place (mirrors existing gate
+    pattern in score_property).  wrong_distress suppression is handled pre-scoring
+    by _filter_signals_for_teaching; bad_contact/other produce no dampener.
+
+    non_residential dominates — if present, all verticals zeroed, short-circuits.
+    owner_not_motivated lifts when any signal is newer than the correction.
+    """
+    from config.closer import (
+        CORRECTION_REASON_NON_RESIDENTIAL,
+        CORRECTION_REASON_OWNER_NOT_MOTIVATED,
+    )
+
+    def _as_date(d):
+        if d is None:
+            return None
+        if isinstance(d, datetime):
+            return d.date()
+        return d
+
+    has_non_residential = any(
+        c["correction_reason"] == CORRECTION_REASON_NON_RESIDENTIAL
+        for c in corrections
+    )
+    if has_non_residential:
+        for v in list(vertical_scores):
+            vertical_scores[v] = 0.0
+            if v in vertical_results:
+                vertical_results[v]["score"] = 0.0
+        return
+
+    for corr in corrections:
+        if corr["correction_reason"] != CORRECTION_REASON_OWNER_NOT_MOTIVATED:
+            continue
+        corr_date = _as_date(corr["created_at"])
+        has_newer = corr_date is not None and any(
+            _as_date(s.get("date")) is not None and _as_date(s.get("date")) > corr_date
+            for s in signals
+        )
+        if has_newer:
+            continue
+        for v in OWNER_OCCUPIED_EXCLUSION_VERTICALS:
+            vertical_scores[v] = 0.0
+            if v in vertical_results:
+                vertical_results[v]["score"] = 0.0
+
+
 class MultiVerticalScorer:
     """
     6-vertical CDS scoring engine.
@@ -367,8 +471,11 @@ class MultiVerticalScorer:
                     continue
             signals.append({"type": sig_type, "date": lien.filing_date, "amount": lien.amount})
 
-        # 3. Deed transfers — skip nominal/intra-family transfers (< $1,000)
+        # 3. Deed transfers — skip mortgage instruments (a recorded mortgage/refinance
+        #    is debt, not an ownership change) and nominal/intra-family transfers (< $1,000)
         for deed in (prop.deeds or []):
+            if getattr(deed, "mortgage_amount", None) is not None:
+                continue
             if deed.sale_price is not None and deed.sale_price < 1000:
                 continue
             signals.append({"type": "deed_transfers", "date": deed.record_date, "amount": deed.sale_price})
@@ -794,11 +901,67 @@ class MultiVerticalScorer:
 
     # ── Score a single property ────────────────────────────────────────────────
 
-    def score_property(self, prop: Property) -> Dict:
+    def _load_all_teaching_corrections(
+        self,
+        property_ids: Optional[List[int]] = None,
+    ) -> Dict[int, List[Dict]]:
+        """Load all active teaching corrections, keyed by property id.
+
+        If property_ids is given, restricts to those IDs (avoids full-table scan
+        for targeted single/batch rescores).  Called once per scoring run to avoid
+        N+1 queries across the property batch.
+        """
+        from collections import defaultdict as _defaultdict
+        where = "WHERE subject_type = 'property' AND dampener_active = TRUE"
+        params: Dict = {}
+        if property_ids:
+            where += " AND subject_ref = ANY(:pids)"
+            params["pids"] = [str(pid) for pid in property_ids]
+
+        try:
+            rows = self.session.execute(
+                sa_text(
+                    f"SELECT subject_ref, correction_reason, signal_type, created_at"
+                    f" FROM cora_training_overrides {where}"
+                ),
+                params,
+            ).fetchall()
+        except Exception:
+            # Table may not exist yet (pre-migration environment) — degrade gracefully.
+            logger.debug("cora_training_overrides not yet available — skipping dampener")
+            return {}
+
+        result: Dict[int, List[Dict]] = _defaultdict(list)
+        for r in rows:
+            result[int(r.subject_ref)].append({
+                "correction_reason": r.correction_reason,
+                "signal_type": r.signal_type,
+                "created_at": r.created_at,
+            })
+        return dict(result)
+
+    def score_property(
+        self,
+        prop: Property,
+        teaching_corrections: Optional[List[Dict]] = None,
+    ) -> Dict:
         """
         Score a property across all 6 verticals with a 2-signal routing gate.
+
+        teaching_corrections: pre-loaded list of active CoraTrainingOverride rows
+        for this property (as dicts).  If None, loads from DB (standalone calls).
+        Pass an empty list to skip DB fetch when no corrections exist for the batch.
         """
+        if teaching_corrections is None:
+            teaching_corrections = self._load_all_teaching_corrections(
+                [prop.id]
+            ).get(prop.id, [])
+
         signals = self._collect_signals(prop)
+
+        # Pre-scoring: filter signals suppressed by wrong_distress corrections.
+        if teaching_corrections:
+            signals = _filter_signals_for_teaching(signals, teaching_corrections)
         owner = prop.owner
         financial = prop.financial
         violations = prop.code_violations or []
@@ -869,6 +1032,8 @@ class MultiVerticalScorer:
         #   2. Deeds with record_date=None in the signal dict (date check fails silently).
         if not _has_recent_deed and prop.deeds:
             for _deed in prop.deeds:
+                if getattr(_deed, "mortgage_amount", None) is not None:
+                    continue  # mortgage instrument, not an ownership transfer
                 if _deed.record_date is None:
                     continue
                 _rd = _deed.record_date.date() if isinstance(_deed.record_date, datetime) else _deed.record_date
@@ -896,6 +1061,13 @@ class MultiVerticalScorer:
                 vertical_scores[v] = 0.0
                 if v in vertical_results:
                     vertical_results[v]["score"] = 0.0
+
+        # Teaching Correction dampener (A6): non_residential / owner_not_motivated.
+        # wrong_distress was already handled pre-scoring via _filter_signals_for_teaching.
+        if teaching_corrections:
+            _apply_vertical_dampener(
+                vertical_scores, vertical_results, teaching_corrections, signals
+            )
 
         # HCPA passive signal bonuses — boost verticals that already have a primary signal.
         # These never act as primary signals; they only add weight when a vertical is already scored.
@@ -1514,7 +1686,7 @@ class MultiVerticalScorer:
             FROM legal_and_liens WHERE property_id IN (SELECT unnest(CAST(:ids AS bigint[])))
         """)
         deed_rows = _q("""
-            SELECT property_id, sale_price, record_date, deed_type
+            SELECT property_id, sale_price, record_date, deed_type, mortgage_amount
             FROM deeds WHERE property_id IN (SELECT unnest(CAST(:ids AS bigint[])))
         """)
         lp_rows = _q("""
@@ -2040,6 +2212,10 @@ class MultiVerticalScorer:
         _targeted = property_ids is not None
         collected_scores: List[Dict] = []   # filled for targeted runs only
 
+        # Preload all active teaching corrections for this run in one query.
+        # Avoids N+1 reads at score_property() time across a 500k-property batch.
+        _corrections_by_pid = self._load_all_teaching_corrections(property_ids)
+
         for batch in self._iter_property_batches(property_ids, county_id, batch_size):
             self._profiler.mark_batch()
             with_signal_batch: List[Dict] = []
@@ -2048,9 +2224,19 @@ class MultiVerticalScorer:
                 self._total_scored += 1
                 try:
                     with self._profiler.phase("score_python"):
-                        score_data = self.score_property(prop)
+                        score_data = self.score_property(
+                            prop,
+                            teaching_corrections=_corrections_by_pid.get(prop.id, []),
+                        )
 
-                    if score_data["signal_count"] == 0 or score_data["final_cds_score"] == 0:
+                    # A property with an active Teaching Correction (A6) must be
+                    # persisted even when the dampener drives it to zero — otherwise
+                    # its stale high score remains the latest row and the dampener
+                    # is invisible downstream. Uncorrected zero/no-signal properties
+                    # are still skipped (the nightly run never writes empty rows).
+                    _is_zero = score_data["signal_count"] == 0 or score_data["final_cds_score"] == 0
+                    _is_dampened = bool(_corrections_by_pid.get(prop.id))
+                    if _is_zero and not _is_dampened:
                         no_signal_count += 1
                     else:
                         with_signal_batch.append(score_data)

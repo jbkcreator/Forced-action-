@@ -34,7 +34,9 @@ from langgraph.graph import END, START, StateGraph
 from src.agents.prompts.loader import render_fallback_body, render_for_subscriber_auto
 from src.agents.subgraphs.compose_and_send import run_compose_and_send
 from src.agents.subgraphs.decision_hierarchy import run_decision_hierarchy
+from src.agents.tools.write_tools import log_decision
 from src.services.kill_switch_service import get_cached_metric
+from src.services.feedback_ritual import publish_feedback_ritual_candidate
 from src.agents.tools.read_tools import (
 	get_deal_history,
 	get_lead_pool,
@@ -89,6 +91,17 @@ class RetentionState(TypedDict, total=False):
 	cost_usd: float
 	terminal_status: str
 	failure_reason: str
+
+
+def _build_review_capture(state: RetentionState) -> dict:
+	return {
+		"raw_input_text": f"retention_summary_due tier={state.get('tier_cohort')}",
+		"generated_output_text": state.get("message_body"),
+		"confidence_score": None,
+		"confidence_reason": None,
+		"review_flag": True,
+		"review_flag_reason": state.get("failure_reason") or "retention_early_abort",
+	}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -274,8 +287,6 @@ def _node_compose_and_send(state: RetentionState) -> RetentionState:
 
 
 def _node_finalize(state: RetentionState) -> RetentionState:
-	from src.agents.tools.write_tools import log_decision
-
 	final_status = state.get("terminal_status") or "completed"
 
 	# If compose_and_send did not run (early abort), we still owe an audit row.
@@ -291,7 +302,16 @@ def _node_finalize(state: RetentionState) -> RetentionState:
 				terminal_status=final_status,
 				tokens_used=int(state.get("tokens_used", 0) or 0),
 				cost_usd=float(state.get("cost_usd", 0.0) or 0.0),
-				summary={"failure_reason": state.get("failure_reason"), "early_abort": True},
+				summary={
+					"failure_reason": state.get("failure_reason"),
+					"early_abort": True,
+					"review_capture": _build_review_capture(state),
+				},
+			)
+			publish_feedback_ritual_candidate(
+				decision_id=state["decision_id"],
+				graph_name=GRAPH_NAME,
+				terminal_status=final_status,
 			)
 		except Exception:
 			# Audit logging must never mask the original outcome.

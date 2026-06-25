@@ -111,6 +111,33 @@ def test_subscriber_not_found_aborts_without_compose():
 	mock_cc.assert_not_called()
 
 
+def test_subscriber_not_found_logs_review_capture_and_publishes_feedback_candidate():
+	with patch("src.agents.graphs.fomo.get_subscriber_profile", return_value={}), \
+		 patch("src.agents.graphs.fomo.publish_feedback_ritual_candidate") as mock_publish, \
+		 patch("src.agents.graphs.fomo.log_decision") as mock_log:
+		r = run_fomo(
+			event_payload=_payload(zip_code="33647", vertical="roofing"),
+			subscriber_id=999999,
+			decision_id="decision-fomo-999999",
+		)
+	assert r["terminal_status"] == "aborted"
+	assert r["failure_reason"] == "fomo:subscriber_not_found"
+	mock_publish.assert_called_once_with(
+		decision_id="decision-fomo-999999",
+		graph_name="fomo",
+		terminal_status="aborted",
+	)
+	summary = mock_log.call_args.kwargs["summary"]
+	assert summary["failure_reason"] == "fomo:subscriber_not_found"
+	assert summary["early_abort"] is True
+	assert summary["review_capture"]["raw_input_text"] == (
+		"competitor_acted_on_lead zip_code=33647 vertical=roofing lead_tier=Gold"
+	)
+	assert summary["review_capture"]["generated_output_text"] == ""
+	assert summary["review_capture"]["review_flag"] is True
+	assert summary["review_capture"]["review_flag_reason"] == "fomo:subscriber_not_found"
+
+
 def test_zip_already_locked_aborts():
 	with patch("src.agents.graphs.fomo.get_subscriber_profile",
 			   return_value={"id": 107, "tier": "starter", "vertical": "roofing", "status": "active"}), \

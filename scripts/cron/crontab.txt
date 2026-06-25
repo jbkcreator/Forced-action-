@@ -244,6 +244,14 @@ COUNTY_ID=hillsborough
 # one pass (iterates today's rows regardless of county).
 2 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.services.lead_confidence
 
+# ── FEEDBACK RITUAL EXPORT (4.3) ─────────────────────────────
+# Closes the Human Feedback Ritual loop: turns admin-reviewed flagged Cora
+# interactions (cora_training_overrides, source='feedback_ritual',
+# review_outcome approved|needs_correction) into a JSONL fine-tuning dataset and
+# flips those rows to queue_status='exported'. Idempotent — only picks up newly
+# reviewed rows. Runs daily 08:20 UTC Mon-Sat, after GHL sync (08:00) so
+# corrections don't wait for the weekly review to land in the dataset.
+20 8 * * 1-6 $PROJECT/scripts/cron/run.sh src.services.feedback_ritual_export
 # ── ENRICHMENT RECONCILIATION SWEEP (ADR 0016) ───────────────
 # Skip Tracing — 07:30 AM UTC Mon-Sat, after CDS scoring (07:00), before GHL sync (08:00).
 # Backstop for the event-driven enrichment consumer: gold_lead_scored events ride
@@ -572,5 +580,13 @@ COUNTY_ID=hillsborough
 # Stream self-diagnosis (Sprint 4.2) — after CDS at 07:00 and skip-trace at 07:30
 30 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.stream_self_diagnosis --county-id hillsborough
 31 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.stream_self_diagnosis --county-id pinellas
+# ── EQUITY PROFILE COMPUTE (Sprint 4.4) ──────────────────────────────────────
+# Nightly 03:00 UTC — after HCPA refresh, deed/liens scrapers, and master
+# parcel refresh, but before CDS scoring at 07:00. Aggregates lien amounts
+# from legal_and_liens / tax_delinquencies / code_violations into
+# financials.total_lien_amount, then computes est_equity / equity_pct /
+# total_debt from assessed_value_mkt - (est_mortgage_bal + total_lien_amount).
+0 3 * * * $PROJECT/scripts/cron/run.sh src.tasks.compute_equity_profiles --county-id $COUNTY_ID
+1 3 * * * $PROJECT/scripts/cron/run.sh src.tasks.compute_equity_profiles --county-id pinellas
 
 # === END FORCED-ACTION-PLATFORM ===

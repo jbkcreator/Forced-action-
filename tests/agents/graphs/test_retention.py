@@ -100,11 +100,18 @@ def test_assemble_history_surfaces_unified_memory():
 def test_retention_skips_non_active_subscriber():
 	with patch("src.agents.graphs.retention.get_subscriber_profile",
 			   return_value={"id": 107, "status": "churned", "tier": "free"}), \
+		 patch("src.agents.graphs.retention.publish_feedback_ritual_candidate") as mock_publish, \
+		 patch("src.agents.graphs.retention.log_decision") as mock_log, \
 		 patch("src.agents.subgraphs.compose_and_send.call_claude_with_usage") as mock_cc:
 		r = run_retention(subscriber_id=107, tier_cohort="wallet")
 	assert r["terminal_status"] == "aborted"
 	assert "status_churned" in r["failure_reason"]
 	mock_cc.assert_not_called()
+	mock_publish.assert_called_once()
+	summary = mock_log.call_args.kwargs["summary"]
+	assert summary["review_capture"]["raw_input_text"] == "retention_summary_due tier=wallet"
+	assert summary["review_capture"]["review_flag"] is True
+	assert summary["review_capture"]["review_flag_reason"] == "retention:status_churned"
 
 
 def test_retention_batch_runs_all_subscribers():

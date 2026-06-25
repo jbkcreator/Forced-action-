@@ -544,6 +544,10 @@ class Deed(Base):
     # Legal description
     legal_description: Mapped[Optional[str]] = mapped_column(Text)
 
+    # Mortgage/deed-of-trust amount (Sprint 4.4) — populated from `Filing Amt`
+    # column on mortgage-type docs. NULL for non-mortgage deeds.
+    mortgage_amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
+
     # HCPA Enrichment — sale qualification
     sale_qualified: Mapped[Optional[bool]] = mapped_column(Boolean)
     vacant_improved: Mapped[Optional[str]] = mapped_column(String(20))
@@ -3214,6 +3218,7 @@ class PremiumPurchase(Base):
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")  # pending|delivered|failed|refunded|disputed
     purchased_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    output_ref_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
     # ── Refund / dispute audit (fa004, 2026-05-04) ──────────────────
     refunded_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
@@ -6314,6 +6319,135 @@ class FreeToPaidAttribution(Base):
         return f"<FreeToPaidAttribution(account_id={self.account_id}, free_leads={self.free_leads_count})>"
 
 
+# ============================================================================
+# A6 — Closer-to-Cora Teaching Interface (Sprint A6)
+# ============================================================================
+
+class CoraTrainingOverride(Base):
+    """
+    Human corrections from the Closer Cockpit Teach action (A6) and future
+    feedback rituals (4.3).  Serves two purposes simultaneously:
+      1. Score Dampener — dampener_active=True suppresses the property's CDS score
+         via type-keyed gate logic in cds_engine.score_property().
+      2. Fine-tuning label queue — queue_status tracks the row from collection
+         through future export to a training pipeline.
+
+    See ADR 0006 (dampener = gate-reuse, not multiplier) and ADR 0007 (shared
+    polymorphic schema, row-as-queue).
+    """
+    __tablename__ = "cora_training_overrides"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    # Discriminator — which workflow produced this correction.
+    source: Mapped[str] = mapped_column(String(30), nullable=False)
+
+    # Polymorphic subject — stored as an opaque string ref so A6 property ids and
+    # 4.3 agent decision ids can share one queue table.
+    subject_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    subject_ref: Mapped[str] = mapped_column(String(80), nullable=False)
+
+    # Optional provenance: which closer call triggered this correction.
+    closer_call_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("closer_calls.id", ondelete="SET NULL"), nullable=True
+    )
+
+    # Correction details. A6 writes these at creation time; 4.3 fills them after
+    # human review, so they may start null for queued feedback ritual rows.
+    correction_reason: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    signal_type: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    corrected_output: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Dampener state — False for bad_contact/other (label-only corrections).
+    dampener_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    # Fine-tuning queue state.
+    queue_status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    review_outcome: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    reviewed_by: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    snapshot_payload: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    source_metadata: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+
+    created_by: Mapped[str] = mapped_column(String(120), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        # Hot-path read: engine fetches active corrections per property at score time.
+        Index(
+            "idx_cora_overrides_subject_active",
+            "subject_type", "subject_ref", "dampener_active",
+        ),
+        # Queue consumer reads pending rows.
+        Index("idx_cora_overrides_queue_status", "queue_status"),
+        # A6 duplicate protection: one active property correction per reason/signal.
+        Index(
+            "uq_cora_override_active",
+            "subject_ref",
+            "correction_reason",
+            text("COALESCE(signal_type, '')"),
+            unique=True,
+            postgresql_where=text(
+                "dampener_active AND subject_type = 'property' AND correction_reason IS NOT NULL"
+            ),
+        ),
+        # 4.3 duplicate protection: one queue row per reviewed Cora Touch.
+        Index(
+            "uq_cora_feedback_ritual_subject",
+            "subject_type",
+            "subject_ref",
+            unique=True,
+            postgresql_where=text("source = 'feedback_ritual'"),
+        ),
+        CheckConstraint(
+            "source IN ('closer_teach', 'feedback_ritual')",
+            name="ck_cora_overrides_source",
+        ),
+        CheckConstraint(
+            "queue_status IN ('pending', 'exported', 'discarded')",
+            name="ck_cora_overrides_queue_status",
+        ),
+        CheckConstraint(
+            "review_outcome IS NULL OR review_outcome IN ('approved', 'needs_correction', 'discarded')",
+            name="ck_cora_overrides_review_outcome",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<CoraTrainingOverride(id={self.id}, subject={self.subject_type}:{self.subject_ref}, "
+            f"reason={self.correction_reason}, active={self.dampener_active}, "
+            f"queue={self.queue_status})>"
+        )
+
+    @property
+    def subject_id(self):
+        """Backward-compat shim for A6 property corrections."""
+        if self.subject_ref is None:
+            return None
+        if self.subject_type == "property":
+            try:
+                return int(self.subject_ref)
+            except (TypeError, ValueError):
+                return self.subject_ref
+        return self.subject_ref
+
+    @subject_id.setter
+    def subject_id(self, value):
+        self.subject_ref = None if value is None else str(value)
+
+
 class ScoringWeightOverride(Base):
     """A3: Per-(vertical, signal_type) delta applied on top of VERTICAL_WEIGHTS at scoring time.
 
@@ -6342,6 +6476,8 @@ class ScoringWeightOverride(Base):
 
     def __repr__(self) -> str:
         return f"<ScoringWeightOverride({self.vertical}/{self.signal_type} delta={self.delta} src={self.source})>"
+
+
 # ============================================================================
 # C2 / M5 — CDS Score Feedback (S1 / 414 Stream A)
 # ============================================================================
