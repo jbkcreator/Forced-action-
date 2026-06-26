@@ -54,6 +54,10 @@ from typing import Any, Dict, List, Optional
 
 from src.services.ghl_webhook import push_lead_to_ghl
 from src.services.heuristic_loader import load_overrides as _load_weight_overrides
+from src.services.macro_signal_multiplier_service import (
+    apply_macro_multiplier,
+    get_macro_distress_multipliers,
+)
 from config.settings import settings
 
 # Can be overridden at runtime via --no-ghl CLI flag; default comes from GHL_PUSH_ENABLED env var
@@ -374,6 +378,9 @@ class MultiVerticalScorer:
         self._profiler: _Profiler = _Profiler(enabled=False)
         # A3: warm-start priors — additive deltas loaded from scoring_weight_overrides (5-min cache).
         self._weight_overrides: Dict[tuple, float] = _load_weight_overrides(session)
+        # A7: macro-signal multipliers — loaded once per scorer instance from macro_signals table.
+        # Empty dict = neutral (no macro data or rate below threshold); no scoring change.
+        self._macro_multipliers: Dict[str, float] = get_macro_distress_multipliers(session)
 
     # ── GHL batch flush ───────────────────────────────────────────────────────
 
@@ -777,6 +784,9 @@ class MultiVerticalScorer:
             sig_date = sig_info["date"]
             _delta  = self._weight_overrides.get((vertical, sig_type), 0.0)
             base    = max(0, min(100, weights[sig_type] + _delta))
+            # A7: macro-signal multiplier (e.g. high mortgage rate boosts foreclosure/
+            # tax_delinquency urgency). Neutral (no-op) when no macro data exists.
+            base    = apply_macro_multiplier(sig_type, base, self._macro_multipliers)
             recency = self._recency_bonus(sig_date)
             decay   = self._age_decay(sig_date)
             total   = base + recency + decay   # decay is negative
@@ -873,13 +883,16 @@ class MultiVerticalScorer:
             float(SCORE_CAP),
         )
 
+        _active_mults = {k: v for k, v in self._macro_multipliers.items() if k in signal_components}
         logger.debug(
             "    [%s] primary=%s(%.0f) days_open=+%d persistence=+%d prior_viol=+%d"
-            " stack=+%d(%d sigs/%dd) absentee=+%d contact=+%d equity=+%d tenure=+%d → %.1f",
+            " stack=+%d(%d sigs/%dd) absentee=+%d contact=+%d equity=+%d tenure=+%d"
+            " macro=%s -> %.1f",
             vertical, best_type, primary_score,
             days_open_mod, persistence_mod, prior_viol_mod,
             stacking_bonus, signals_within_window, STACKING_WINDOW_DAYS,
             absentee_bonus, contact_bonus, equity_bonus, tenure_bonus,
+            _active_mults or "neutral",
             final_score,
         )
 
