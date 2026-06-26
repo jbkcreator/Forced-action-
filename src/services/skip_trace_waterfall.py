@@ -104,6 +104,13 @@ def _select_candidates(session, county_id: str, limit: int, today_only: bool) ->
             Property.address != "",
             Property.zip.isnot(None),
             Property.zip != "",
+            # Exclude owners claimed by the enrichment background loop (Sprint 4.5).
+            # NULL NOT IN ('queued') = NULL in Postgres (falsy), so we must
+            # explicitly allow NULL alongside all non-'queued' values.
+            or_(
+                Owner.contact_refresh_status.is_(None),
+                Owner.contact_refresh_status != "queued",
+            ),
         )
         .order_by(Owner.id)
     )
