@@ -3352,6 +3352,34 @@ class EnrichmentUsageLog(Base):
         return f"<EnrichmentUsageLog(vendor={self.vendor}, purpose={self.purpose}, cost_cents={self.cost_cents})>"
 
 
+class EnrichmentAnomalyLog(Base):
+    """
+    A4 — one row per detected degraded-provider event.
+
+    A provider is "degraded" when its hit rate over a recent time window falls
+    below its configured floor (with a minimum sample guard). Distinct from
+    abnormal spend (Vendor Cost Monitor): a pay-per-hit provider that degrades
+    spends *less*, so the cost monitor cannot see it. Append-only; also acts as
+    the re-alert cooldown source (no separate state file).
+    """
+    __tablename__ = "enrichment_anomaly_log"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False, index=True)   # tracerfy | batchdata
+    detected_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), index=True
+    )
+    observed_hit_rate: Mapped[float] = mapped_column(Numeric(5, 4), nullable=False)
+    floor_hit_rate: Mapped[float] = mapped_column(Numeric(5, 4), nullable=False)
+    sample_size: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    records_affected: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    alert_sent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    def __repr__(self):
+        return (f"<EnrichmentAnomalyLog(provider={self.provider}, "
+                f"observed={self.observed_hit_rate}, floor={self.floor_hit_rate})>")
+
+
 class SmsOptIn(Base):
     """
     TCPA double opt-in records. Tracks explicit consent via "Reply YES" flow.

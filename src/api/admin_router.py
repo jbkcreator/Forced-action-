@@ -593,6 +593,59 @@ def contact_coverage_stats(
 
 
 # ---------------------------------------------------------------------------
+# GET /api/admin/enrichment-health — A4 degraded-provider visibility
+# ---------------------------------------------------------------------------
+
+@router.get("/enrichment-health")
+def enrichment_health(
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """Per-provider live hit rate vs floor (degraded flag) plus recent
+    degraded-provider anomalies. Read model for the Ops 'Provider Health' tab."""
+    from config.settings import get_settings
+    from src.tasks import match_rate_monitor as mrm
+
+    s = get_settings()
+    providers = []
+    for provider, floor in s.enrichment_provider_floors.items():
+        rate, n = mrm.recent_hit_rate(db, provider, s.enrichment_window_hours)
+        health = mrm.evaluate_provider_health(
+            provider, rate, n, floor, min_sample=s.enrichment_min_sample
+        )
+        providers.append({
+            "provider": provider,
+            "hit_rate": rate,
+            "floor": floor,
+            "sample_size": n,
+            "degraded": health["degraded"],
+            "skipped": health["skipped"],
+        })
+
+    rows = db.execute(
+        text(
+            """
+            SELECT provider, detected_at, observed_hit_rate, floor_hit_rate, records_affected
+            FROM enrichment_anomaly_log
+            ORDER BY detected_at DESC
+            LIMIT 20
+            """
+        )
+    ).mappings().all()
+    recent = [
+        {
+            "provider": r["provider"],
+            "detected_at": r["detected_at"].isoformat() if r["detected_at"] else None,
+            "observed_hit_rate": float(r["observed_hit_rate"]),
+            "floor_hit_rate": float(r["floor_hit_rate"]),
+            "records_affected": r["records_affected"],
+        }
+        for r in rows
+    ]
+    return {"providers": providers, "recent_anomalies": recent}
+
+
+# ---------------------------------------------------------------------------
 # GET /api/admin/synthflow/config — Synthflow dashboard data
 # ---------------------------------------------------------------------------
 

@@ -284,6 +284,29 @@ class AppSettings(BaseSettings):
 	enrichment_batch_flush_size: int = Field(default=200, env="ENRICHMENT_BATCH_FLUSH_SIZE")
 	enrichment_batch_flush_seconds: int = Field(default=120, env="ENRICHMENT_BATCH_FLUSH_SECONDS")
 
+	# A4 — degraded-provider detection. A provider is degraded when its hit rate
+	# over `window_hours` falls below its per-provider floor (with a min-sample
+	# guard). Floors are placeholders — replace with real healthy rates pulled
+	# from enrichment_usage_logs before enabling in production.
+	enrichment_anomaly_enabled: bool = Field(default=True, env="ENRICHMENT_ANOMALY_ENABLED")
+	enrichment_window_hours: int = Field(default=48, env="ENRICHMENT_WINDOW_HOURS")
+	enrichment_min_sample: int = Field(default=30, env="ENRICHMENT_MIN_SAMPLE")
+	enrichment_realert_cooldown_hours: int = Field(default=24, env="ENRICHMENT_REALERT_COOLDOWN_HOURS")
+	# Floors = ~40% of each provider's 30-day healthy hit rate (measured
+	# 2026-06-26 from enrichment_usage_logs): tracerfy mean ~0.50, batchdata
+	# mean ~0.035. NOTE: batchdata is a low-volume residual tail with a
+	# near-zero rate — a single zero-hit day at/above min_sample WILL trip the
+	# 0.02 floor (accepted trade-off; kept monitored by deliberate choice).
+	enrichment_provider_floors: dict[str, float] = Field(
+		default_factory=lambda: {"tracerfy": 0.20, "batchdata": 0.02}
+	)
+	# When a provider is flagged degraded, haircut the quality rating
+	# (owners.contact_info_confidence_score — the column CDS reads) of that
+	# provider's hits inside the window, so a degraded batch can't poison
+	# scoring. Feature-flagged + reversible.
+	enrichment_degraded_discount_enabled: bool = Field(default=True, env="ENRICHMENT_DEGRADED_DISCOUNT_ENABLED")
+	enrichment_degraded_confidence_multiplier: float = Field(default=0.55, env="ENRICHMENT_DEGRADED_CONFIDENCE_MULTIPLIER")
+
 	# Cross-source contact triangulation (ADR 0015).
 	# triangulation_enabled — nightly sweep + inline hook compute corroboration
 	# and write contact_info_confidence / contactability_detail.
