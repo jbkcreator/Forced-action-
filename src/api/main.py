@@ -128,6 +128,9 @@ app.include_router(feedback_ritual_router)
 from src.api.chat_router import router as chat_router  # noqa: E402
 app.include_router(chat_router)
 
+from src.api.competitor_benchmark_router import router as competitor_benchmark_router  # noqa: E402
+app.include_router(competitor_benchmark_router)
+
 from src.api.metrics_router import router as metrics_router  # noqa: E402
 from src.api.alert_webhook_router import router as alert_webhook_router  # noqa: E402
 from src.api.revenue_metrics_router import router as revenue_metrics_router  # noqa: E402

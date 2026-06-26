@@ -6666,3 +6666,59 @@ class StreamDiagnostics(Base):
             f"<StreamDiagnostics(county={self.county_id!r}, metric={self.metric_name!r}, "
             f"severity={self.severity!r}, detected_on={self.detected_on})>"
         )
+
+
+class CompetitorRateSheet(Base):
+    """Task 4.8 — a scraped competitor lender rate sheet (one row per scrape).
+
+    Stores published DSCR/private loan terms from public FL lender pages.
+    `high_margin_target` is NOT stored here — it is computed live at report time
+    against forced_action_lender_terms (see src/services/competitor_benchmark.py).
+    """
+    __tablename__ = "competitor_rate_sheets"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    lender_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    product: Mapped[str] = mapped_column(String(24), nullable=False)
+    region: Mapped[Optional[str]] = mapped_column(String(64))  # metro/city tag, NULL = FL-statewide
+    rate_low: Mapped[Optional[float]] = mapped_column(Numeric(6, 3))
+    rate_high: Mapped[Optional[float]] = mapped_column(Numeric(6, 3))
+    max_ltv: Mapped[Optional[float]] = mapped_column(Numeric(5, 2))
+    min_fico: Mapped[Optional[int]] = mapped_column(Integer)
+    min_dscr: Mapped[Optional[float]] = mapped_column(Numeric(4, 2))
+    points: Mapped[Optional[float]] = mapped_column(Numeric(4, 2))
+    prepay: Mapped[Optional[str]] = mapped_column(String(64))
+    term_months: Mapped[Optional[int]] = mapped_column(Integer)
+    hq_location: Mapped[Optional[str]] = mapped_column(String(96))
+    source_url: Mapped[str] = mapped_column(Text, nullable=False)
+    source_adapter: Mapped[str] = mapped_column(String(48), nullable=False)
+    confidence: Mapped[str] = mapped_column(String(16), nullable=False, default="high")
+    raw_text: Mapped[Optional[str]] = mapped_column(Text)
+    captured_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        CheckConstraint("product IN ('dscr','private')", name="check_crs_product"),
+        CheckConstraint("confidence IN ('high','low')", name="check_crs_confidence"),
+        UniqueConstraint("lender_name", "product", "region", "captured_at", name="uq_competitor_rate_sheet"),
+        Index("idx_competitor_rate_sheets_product_region", "product", "region"),
+    )
+
+
+class ForcedActionLenderTerms(Base):
+    """Task 4.8 — Forced Action's own rate card (one row per loan product).
+
+    The comparison baseline for high-margin-target classification. Admin-editable.
+    """
+    __tablename__ = "forced_action_lender_terms"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    product: Mapped[str] = mapped_column(String(24), nullable=False, unique=True)
+    rate: Mapped[float] = mapped_column(Numeric(6, 3), nullable=False)
+    max_ltv: Mapped[float] = mapped_column(Numeric(5, 2), nullable=False)
+    points: Mapped[Optional[float]] = mapped_column(Numeric(4, 2))
+    prepay: Mapped[Optional[str]] = mapped_column(String(64))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        CheckConstraint("product IN ('dscr','private')", name="check_falt_product"),
+    )
