@@ -12,13 +12,14 @@ Timezone: derived from ZIP centroid (FL ZIPs); area-code fallback for unknown.
 """
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from config.settings import get_settings
 from src.services.phone_utils import normalize as normalize_phone
 
 # Area code → IANA timezone. Mirrors sms_compliance._AREA_CODE_TZ.
@@ -63,13 +64,85 @@ def validate_outbound(
     if row:
         return ComplianceResult(allowed=False, reason="dnc_or_opted_out")
 
-    # 2. Quiet hours — 8am to 9pm local time (TCPA requirement)
+    # 2. Universal DNC freshness check. Positive checks should already be in
+    # sms_opt_outs, but we still block if the latest result is positive, absent,
+    # or stale. Owner.phone_metadata is a homeowner-only fallback for legacy rows.
+    settings = get_settings()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=settings.dnc_recheck_days)
+    dnc_status = _latest_dnc_status(db, normalized)
+    if dnc_status is None:
+        dnc_status = _owner_metadata_dnc_status(db, normalized)
+
+    if dnc_status is None:
+        return ComplianceResult(allowed=False, reason="dnc_check_required")
+    if dnc_status["national_dnc"] or dnc_status["litigator"]:
+        return ComplianceResult(allowed=False, reason="dnc_or_opted_out")
+    checked_at = dnc_status.get("checked_at")
+    if checked_at is None or checked_at < cutoff:
+        return ComplianceResult(allowed=False, reason="dnc_check_required")
+
+    # 3. Quiet hours - 8am to 9pm local time (TCPA requirement)
     tz = _resolve_timezone(normalized, zip_code)
     hour = datetime.now(tz).hour
     if hour < 8 or hour >= 21:
         return ComplianceResult(allowed=False, reason="quiet_hours")
 
     return ComplianceResult(allowed=True)
+
+
+def _latest_dnc_status(db: Session, phone: str) -> Optional[dict]:
+    row = db.execute(
+        text("""
+            SELECT national_dnc, litigator, checked_at
+            FROM dnc_phone_checks
+            WHERE phone = :phone
+            LIMIT 1
+        """),
+        {"phone": phone},
+    ).fetchone()
+    if not row:
+        return None
+    mapping = getattr(row, "_mapping", row)
+    return {
+        "national_dnc": bool(mapping["national_dnc"]),
+        "litigator": bool(mapping["litigator"]),
+        "checked_at": _as_aware_utc(mapping["checked_at"]),
+    }
+
+
+def _owner_metadata_dnc_status(db: Session, phone: str) -> Optional[dict]:
+    row = db.execute(
+        text("""
+            SELECT
+                (o.phone_metadata->'phone_1'->>'dnc')::boolean AS national_dnc,
+                (o.phone_metadata->'phone_1'->>'litigator')::boolean AS litigator,
+                (o.phone_metadata->'phone_1'->>'dnc_checked_at')::timestamptz AS checked_at
+            FROM owners o
+            WHERE o.phone_1 = :phone
+              AND o.phone_metadata->'phone_1'->>'dnc_checked_at' IS NOT NULL
+            ORDER BY o.id
+            LIMIT 1
+        """),
+        {"phone": phone},
+    ).fetchone()
+    if not row:
+        return None
+    mapping = getattr(row, "_mapping", row)
+    return {
+        "national_dnc": bool(mapping["national_dnc"]),
+        "litigator": bool(mapping["litigator"]),
+        "checked_at": _as_aware_utc(mapping["checked_at"]),
+    }
+
+
+def _as_aware_utc(value) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def record_ivr_opt_out(phone: str, db: Session) -> None:

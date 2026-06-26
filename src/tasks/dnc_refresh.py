@@ -22,16 +22,18 @@ Usage:
 
 import csv
 import io
+import json
 import time
 import traceback
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import requests
+from sqlalchemy import text as sa_text
 
 from config.settings import get_settings
 from src.core.database import get_db_context
-from src.core.models import DBPRContact, Owner, SmsOptOut
+from src.core.models import Owner, SmsOptOut
 from src.services.enrichment_log import log_usage
 from src.services.phone_utils import normalize as normalize_phone
 from src.utils.logger import setup_logging, get_logger
@@ -42,8 +44,9 @@ logger = get_logger(__name__)
 _TRACERFY_BASE  = "https://tracerfy.com/v1/api"
 _SCRUB_ENDPOINT = f"{_TRACERFY_BASE}/dnc/scrub/"
 _QUEUE_ENDPOINT = f"{_TRACERFY_BASE}/dnc/queue/"
-_BATCH_SIZE     = 500
+_BATCH_SIZE     = 1000
 _POLL_INTERVAL  = 5
+DNC_OPT_OUT_SOURCE = "tracerfy_dnc_refresh"
 
 
 def _headers(api_key: str) -> dict:
@@ -103,15 +106,43 @@ def _poll_queue(queue_id: str, api_key: str) -> list[dict]:
 # Phone collection — one function per target
 # ---------------------------------------------------------------------------
 
-def _collect_owner_phones(session, county_id: str, cutoff: datetime) -> list[tuple]:
-    """Owners with phone_1 stale or never DNC-checked."""
-    from sqlalchemy import text as sa_text
-    sql = sa_text("""
+def _collect_owner_phones(
+    session,
+    county_id: str,
+    cutoff: datetime,
+    source: Optional[str] = None,
+) -> list[tuple]:
+    """Owners with phone_1 stale or never DNC-checked.
+
+    When source is provided, only owner phones represented by a phone-bearing
+    enriched_contacts row with that source are eligible.
+    """
+    source_filter = ""
+    params = {"county_id": county_id, "cutoff": cutoff}
+    if source:
+        source_filter = """
+          AND EXISTS (
+              SELECT 1
+              FROM enriched_contacts ec
+              WHERE ec.property_id = o.property_id
+                AND ec.source = :source
+                AND o.phone_1 IN (ec.mobile_phone, ec.landline)
+          )
+        """
+        params["source"] = source
+
+    sql = sa_text(f"""
         SELECT o.id, o.phone_1
         FROM owners o
         WHERE o.county_id = :county_id
           AND o.phone_1 IS NOT NULL
           AND length(trim(o.phone_1)) > 0
+          AND NOT EXISTS (
+              SELECT 1
+              FROM sms_opt_outs soo
+              WHERE soo.phone = o.phone_1
+          )
+          {source_filter}
           AND (
               o.phone_metadata IS NULL
               OR o.phone_metadata->'phone_1'->>'dnc_checked_at' IS NULL
@@ -119,8 +150,27 @@ def _collect_owner_phones(session, county_id: str, cutoff: datetime) -> list[tup
           )
         ORDER BY o.id
     """)
-    rows = session.execute(sql, {"county_id": county_id, "cutoff": cutoff}).fetchall()
+    rows = session.execute(sql, params).fetchall()
     return [(row[0], row[1]) for row in rows]
+
+
+def _collect_known_suppressed_phones(session) -> set[str]:
+    rows = session.execute(sa_text("SELECT phone FROM sms_opt_outs")).fetchall()
+    return {row[0] for row in rows if row[0]}
+
+
+def _collect_fresh_clean_phones(session, cutoff: datetime) -> set[str]:
+    rows = session.execute(
+        sa_text("""
+            SELECT phone
+            FROM dnc_phone_checks
+            WHERE checked_at >= :cutoff
+              AND national_dnc = false
+              AND litigator = false
+        """),
+        {"cutoff": cutoff},
+    ).fetchall()
+    return {row[0] for row in rows if row[0]}
 
 
 def _collect_dbpr_phones(session, county_id: str) -> list[tuple]:
@@ -153,15 +203,41 @@ def _collect_subscriber_phones(session, county_id: str) -> list[tuple]:
     return [(row[0], row[1]) for row in rows]
 
 
+def _upsert_dnc_phone_check(session, phone: str, national_dnc: bool, litigator: bool, row: dict) -> None:
+    session.execute(
+        sa_text("""
+            INSERT INTO dnc_phone_checks
+                (phone, national_dnc, litigator, checked_at, source, raw_result)
+            VALUES
+                (:phone, :national_dnc, :litigator, :checked_at, :source, CAST(:raw_result AS jsonb))
+            ON CONFLICT (phone) DO UPDATE SET
+                national_dnc = EXCLUDED.national_dnc,
+                litigator = EXCLUDED.litigator,
+                checked_at = EXCLUDED.checked_at,
+                source = EXCLUDED.source,
+                raw_result = EXCLUDED.raw_result
+        """),
+        {
+            "phone": phone,
+            "national_dnc": national_dnc,
+            "litigator": litigator,
+            "checked_at": datetime.now(timezone.utc),
+            "source": DNC_OPT_OUT_SOURCE,
+            "raw_result": json.dumps(row),
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # Persist helpers — per-target post-scrub updates
 # ---------------------------------------------------------------------------
 
 def _update_owner_after_scrub(session, owner_id: int, phone: str,
                                national_dnc: bool, litigator: bool) -> None:
-    """Update phone_metadata.dnc_checked_at on Owner after scrub."""
+    """Mirror explicit Tracerfy DNC result into Owner.phone_metadata."""
     owner = session.get(Owner, owner_id)
     if not owner:
+        logger.warning("[DNCRefresh/owners] Owner id=%d not found during metadata update", owner_id)
         return
     checked_at = datetime.now(timezone.utc).isoformat()
     meta = dict(owner.phone_metadata or {})
@@ -169,6 +245,7 @@ def _update_owner_after_scrub(session, owner_id: int, phone: str,
     phone_1_meta["dnc"]            = national_dnc
     phone_1_meta["litigator"]      = litigator
     phone_1_meta["dnc_checked_at"] = checked_at
+    phone_1_meta["dnc_source"]     = DNC_OPT_OUT_SOURCE
     meta["phone_1"] = phone_1_meta
     owner.phone_metadata = meta
 
@@ -187,38 +264,84 @@ def _run_scrub(
     api_key: str,
     stats: dict,
     update_fn=None,          # optional callback(session, entity_id, phone, dnc, litigator)
+    suppressed_phones: Optional[set[str]] = None,
+    fresh_clean_phones: Optional[set[str]] = None,
 ) -> None:
     """
     Shared DNC scrub pipeline for any target.
-    Normalizes phones, batches to Tracerfy, parses CSV, writes sms_opt_outs.
+
+    All explicit Tracerfy results are written to dnc_phone_checks. Positive
+    DNC/litigator results are also written to sms_opt_outs, which remains the
+    universal enforcement table. Phones already suppressed are never rechecked;
+    fresh clean phones wait for the configured cool-off window before recheck.
     """
-    phone_to_id: dict[str, int] = {}
+    suppressed_phones = suppressed_phones or set()
+    fresh_clean_phones = fresh_clean_phones or set()
+    stats.setdefault("normalize_skipped", 0)
+    stats.setdefault("already_suppressed", 0)
+    stats.setdefault("fresh_clean_skipped", 0)
+    stats.setdefault("unmatched_csv", 0)
+    stats.setdefault("tracerfy_unknown", 0)
+
+    phone_to_ids: dict[str, list[int]] = {}
     for entity_id, raw_phone in rows:
         normalized = normalize_phone(raw_phone)
-        if normalized:
-            phone_to_id[normalized] = entity_id
+        if not normalized:
+            stats["normalize_skipped"] += 1
+            logger.warning(
+                "[DNCRefresh/%s] Skipped id=%d: phone %r failed normalization",
+                label, entity_id, raw_phone,
+            )
+            continue
+        if normalized in suppressed_phones:
+            stats["already_suppressed"] += 1
+            logger.info(
+                "[DNCRefresh/%s] Skipped id=%d phone=%s: already suppressed",
+                label, entity_id, normalized,
+            )
+            continue
+        if normalized in fresh_clean_phones:
+            stats["fresh_clean_skipped"] += 1
+            logger.info(
+                "[DNCRefresh/%s] Skipped id=%d phone=%s: DNC clean check still fresh",
+                label, entity_id, normalized,
+            )
+            continue
+        if normalized in phone_to_ids:
+            logger.warning(
+                "[DNCRefresh/%s] Duplicate phone %s: id=%d shares normalized phone with id(s)=%s",
+                label, normalized, entity_id, phone_to_ids[normalized],
+            )
+        phone_to_ids.setdefault(normalized, []).append(entity_id)
 
-    phones = list(phone_to_id.keys())
+    phones = list(phone_to_ids.keys())
     if not phones:
+        logger.info("[DNCRefresh/%s] No phones need DNC submit after local gates", label)
         return
 
     for batch_start in range(0, len(phones), _BATCH_SIZE):
         batch = phones[batch_start: batch_start + _BATCH_SIZE]
+        batch_set = set(batch)
         batch_num = batch_start // _BATCH_SIZE + 1
         logger.info("[DNCRefresh/%s] Batch %d: submitting %d phones...", label, batch_num, len(batch))
 
         try:
             queue_id = _submit_scrub_batch(batch, api_key)
-            logger.info("[DNCRefresh/%s] Batch %d queued — queue_id=%s", label, batch_num, queue_id)
+            logger.info("[DNCRefresh/%s] Batch %d queued; queue_id=%s", label, batch_num, queue_id)
             results  = _poll_queue(queue_id, api_key)
         except Exception as e:
-            logger.error("[DNCRefresh/%s] Batch %d failed: %s", label, batch_num, e)
+            logger.error(
+                "[DNCRefresh/%s] Batch %d failed: %s; %d phones will retry next run",
+                label, batch_num, e, len(batch),
+            )
             logger.debug(traceback.format_exc())
             stats["failed"] += len(batch)
             continue
 
         if batch_num == 1 and results:
             logger.info("[DNCRefresh/%s] CSV sample: %s", label, results[0])
+
+        returned_phones: set[str] = set()
 
         with get_db_context() as session:
             for row in results:
@@ -228,39 +351,50 @@ def _run_scrub(
 
                 phone = normalize_phone(str(raw_phone).strip())
                 if not phone:
+                    stats["unmatched_csv"] += 1
+                    logger.warning("[DNCRefresh/%s] CSV row has unnormalizable phone: %r", label, raw_phone)
                     continue
 
-                entity_id = phone_to_id.get(phone)
-                if not entity_id:
+                returned_phones.add(phone)
+                entity_ids = phone_to_ids.get(phone)
+                if not entity_ids:
+                    stats["unmatched_csv"] += 1
+                    logger.warning("[DNCRefresh/%s] CSV phone %s was not in submitted batch", label, phone)
                     continue
+
+                _upsert_dnc_phone_check(session, phone, national_dnc, litigator, row)
 
                 if national_dnc:
                     stats["dnc_hits"] += 1
                 if litigator:
                     stats["litigator_hits"] += 1
 
-                # Per-target metadata update (owners only currently)
                 if update_fn:
-                    try:
-                        update_fn(session, entity_id, phone, national_dnc, litigator)
-                    except Exception as e:
-                        logger.warning("[DNCRefresh/%s] metadata update failed id=%d: %s",
-                                       label, entity_id, e)
+                    for entity_id in entity_ids:
+                        try:
+                            update_fn(session, entity_id, phone, national_dnc, litigator)
+                        except Exception as e:
+                            logger.warning(
+                                "[DNCRefresh/%s] metadata update failed id=%d phone=%s: %s",
+                                label, entity_id, phone, e,
+                            )
 
-                # Suppress DNC/litigator phones in sms_opt_outs (all targets)
                 if national_dnc or litigator:
-                    already = session.query(SmsOptOut).filter_by(phone=phone).first()
+                    already = session.execute(
+                        sa_text("SELECT 1 FROM sms_opt_outs WHERE phone = :phone LIMIT 1"),
+                        {"phone": phone},
+                    ).fetchone()
                     if not already:
                         session.add(SmsOptOut(
                             phone=phone,
                             keyword_used="DNC",
-                            source="tracerfy_dnc_refresh",
+                            source=DNC_OPT_OUT_SOURCE,
                             opted_out_at=datetime.now(timezone.utc),
                         ))
                         stats["suppressed"] += 1
                         logger.info(
-                            "[DNCRefresh/%s] Suppressed: phone=%s national_dnc=%s litigator=%s",
-                            label, phone, national_dnc, litigator,
+                            "[DNCRefresh/%s] Suppressed phone=%s national_dnc=%s litigator=%s ids=%s",
+                            label, phone, national_dnc, litigator, entity_ids,
                         )
 
                 log_usage(
@@ -273,6 +407,16 @@ def _run_scrub(
 
             session.commit()
 
+        missing_from_tracerfy = batch_set - returned_phones
+        if missing_from_tracerfy:
+            stats["tracerfy_unknown"] += len(missing_from_tracerfy)
+            for phone in sorted(missing_from_tracerfy):
+                logger.warning(
+                    "[DNCRefresh/%s] Tracerfy returned no data for phone=%s; "
+                    "DNC status unknown, metadata unchanged, will retry next run",
+                    label, phone,
+                )
+
 
 # ---------------------------------------------------------------------------
 # Main entry point
@@ -284,12 +428,15 @@ def run_dnc_refresh(
     dry_run: bool = False,
     limit: Optional[int] = None,
     targets: Optional[list[str]] = None,
+    source: Optional[str] = None,
 ) -> dict:
     """
     Run DNC re-scrub for the specified targets.
 
     targets: list of "owners", "dbpr", "subscribers", or ["all"] for everything.
     Default is all three.
+
+    source: optional enriched_contacts.source filter for owners only.
 
     Owners use per-phone staleness tracking (phone_metadata.dnc_checked_at).
     DBPR and Subscribers run all non-null phones monthly (cron schedule = 31-day window).
@@ -309,8 +456,17 @@ def run_dnc_refresh(
         active = {"owners", "dbpr", "subscribers"}
 
     stats = {
-        "total": 0, "dnc_hits": 0, "litigator_hits": 0,
-        "suppressed": 0, "failed": 0, "skipped": False,
+        "total":             0,
+        "dnc_hits":          0,
+        "litigator_hits":    0,
+        "suppressed":        0,
+        "failed":            0,
+        "normalize_skipped": 0,
+        "already_suppressed": 0,
+        "fresh_clean_skipped": 0,
+        "unmatched_csv":     0,
+        "tracerfy_unknown":  0,
+        "skipped":           False,
     }
 
     logger.info(
@@ -322,8 +478,10 @@ def run_dnc_refresh(
     target_rows: dict[str, list[tuple]] = {}
 
     with get_db_context() as session:
+        suppressed_phones = _collect_known_suppressed_phones(session)
+        fresh_clean_phones = _collect_fresh_clean_phones(session, cutoff)
         if "owners" in active:
-            target_rows["owners"] = _collect_owner_phones(session, county_id, cutoff)
+            target_rows["owners"] = _collect_owner_phones(session, county_id, cutoff, source=source)
         if "dbpr" in active:
             target_rows["dbpr"] = _collect_dbpr_phones(session, county_id)
         if "subscribers" in active:
@@ -354,6 +512,8 @@ def run_dnc_refresh(
             api_key=api_key,
             stats=stats,
             update_fn=_update_owner_after_scrub,
+            suppressed_phones=suppressed_phones,
+            fresh_clean_phones=fresh_clean_phones,
         )
 
     if "dbpr" in active and target_rows.get("dbpr"):
@@ -363,6 +523,8 @@ def run_dnc_refresh(
             api_key=api_key,
             stats=stats,
             update_fn=None,
+            suppressed_phones=suppressed_phones,
+            fresh_clean_phones=fresh_clean_phones,
         )
 
     if "subscribers" in active and target_rows.get("subscribers"):
@@ -372,6 +534,8 @@ def run_dnc_refresh(
             api_key=api_key,
             stats=stats,
             update_fn=None,
+            suppressed_phones=suppressed_phones,
+            fresh_clean_phones=fresh_clean_phones,
         )
 
     logger.info("=" * 60)
@@ -382,6 +546,11 @@ def run_dnc_refresh(
     logger.info("  Litigators      : %d", stats["litigator_hits"])
     logger.info("  Newly suppressed: %d", stats["suppressed"])
     logger.info("  Failed batches  : %d", stats["failed"])
+    logger.info("  Normalize skipped : %d", stats["normalize_skipped"])
+    logger.info("  Already suppressed: %d", stats["already_suppressed"])
+    logger.info("  Fresh clean skip  : %d", stats["fresh_clean_skipped"])
+    logger.info("  Tracerfy unknown  : %d", stats["tracerfy_unknown"])
+    logger.info("  CSV unmatched     : %d", stats["unmatched_csv"])
     logger.info("=" * 60)
 
     return stats
@@ -399,6 +568,8 @@ if __name__ == "__main__":
     parser.add_argument("--county-id", dest="county_id", default="hillsborough")
     parser.add_argument("--targets", default="all",
                         help="Comma-separated targets: owners,dbpr,subscribers or 'all' (default: all)")
+    parser.add_argument("--source", default=None,
+                        help="Optional enriched_contacts.source filter for owners only, e.g. tracerfy or voters")
     parser.add_argument("--days", type=int, default=None,
                         help="Override recheck window in days for owners (default: DNC_RECHECK_DAYS)")
     parser.add_argument("--limit", type=int, default=None,
@@ -416,6 +587,7 @@ if __name__ == "__main__":
             limit=args.limit,
             dry_run=args.dry_run,
             targets=targets,
+            source=args.source,
         )
         sys.exit(0)
     except Exception as e:

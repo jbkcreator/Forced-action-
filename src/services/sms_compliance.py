@@ -325,13 +325,14 @@ def send_sms(
     if not _result.allowed:
         _dlq_map = {
             "dnc_or_opted_out": "opt_out",
+            "dnc_check_required": "opt_out",
             "quiet_hours": "quiet_hours",
             "invalid_phone": "unresolvable",
         }
         _dlq_key: str = _result.reason or ""
         logger.info("SMS suppressed (%s): to=%s", _result.reason, to)
         add_to_dead_letter(to, _dlq_map.get(_dlq_key, "opt_out"), {"body": body[:160]}, db)
-        _log("suppressed", suppress_reason=_dlq_map.get(_dlq_key, "opt_out"))
+        _log("suppressed", suppress_reason=_dlq_key or _dlq_map.get(_dlq_key, "opt_out"))
         return False
 
     # 2. Opt-in gate — marketing requires confirmed consent (subscribers only; prospects use P2 above)
@@ -355,7 +356,14 @@ def send_sms(
             return False
 
     # 3. Per-subscriber marketing frequency cap and free-tier weekly allotment.
-    # Transactional, opt_in_prompt, and messages without a known subscriber_id bypass both gates.
+    # Marketing without a subscriber_id (and not a prospect-targeted send) would
+    # bypass the allotment gate entirely. Fail closed rather than silently skip.
+    if message_type == "marketing" and subscriber_id is None and not prospect_id:
+        logger.warning("SMS suppressed (marketing_requires_subscriber_id): to=%s", to)
+        add_to_dead_letter(to, "error", {"body": body[:160], "error": "marketing_without_subscriber_id"}, db)
+        _log("suppressed", suppress_reason="marketing_requires_subscriber_id")
+        return False
+
     if message_type == "marketing" and subscriber_id is not None:
         if _check_marketing_frequency_cap(subscriber_id, db):
             logger.info(
