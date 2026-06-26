@@ -1,7 +1,7 @@
 # Sprint A7 — External Macro-Signal Ingestion Pipeline
 **Status:** Complete  
-**Completed:** 2026-06-25  
-**Branch:** `feat/sprint-4.6-underwriting-sunbiz`
+**Completed:** 2026-06-26  
+**Branch:** `feat/a7-macro-signals`
 
 ---
 
@@ -206,20 +206,100 @@ PYTHONPATH=. python -m src.tasks.sync_macro_signals --sources fred bls
 
 ## Architecture Notes
 
-- **No CDS integration in this sprint.** The `macro_signals` table is populated and queryable but not yet wired into `cds_engine.py` or `scoring_weight_overrides`. That integration is a separate task.
 - **Loaders are standalone.** They do not inherit `BaseLoader` — they are time-series economic clients, not property-matched data loaders.
 - **FRED is national only.** County-specific equivalents require FHFA (county HPI), BLS LAUS series (`LAUCN{state}{county}0000000003`), and Census ACS5.
 - **FHFA covers county level.** The master CSV includes ZIP5, MSA, county, state, and national rows — the loader filter can be scoped to county FIPS for local precision.
+- **All 4 sources are aggregate/macro data.** None are property-level. They influence how much weight the CDS engine gives to property-level signals, not whether a distress signal exists on a property.
+
+---
+
+## CDS Distress Multiplier Integration
+
+**Completed 2026-06-26 — `feat/a7-macro-signals`**
+
+### How it works
+
+`MultiVerticalScorer.__init__` calls `get_macro_distress_multipliers(session)` once per scorer instantiation. The service reads the latest `MORTGAGE30US` row from `macro_signals`, compares to the 6.5% threshold in `config/macro_signal_rules.json`, and returns a `dict[signal_type, multiplier]`. The CDS engine applies this multiplier in `_score_vertical` after the A3 additive delta and before recency/decay:
+
+```
+base = weights[sig_type] + A3_delta
+base = apply_macro_multiplier(sig_type, base, _macro_multipliers)   # A7
+recency = _recency_bonus(sig_date)
+decay   = _age_decay(sig_date)
+total   = base + recency + decay
+```
+
+When rate is below threshold or DB has no data, `_macro_multipliers` is `{}` (neutral — no scoring change).
+
+### Multiplier config — `config/macro_signal_rules.json`
+
+| Signal type | Multiplier | Condition |
+|---|---|---|
+| `foreclosures` | ×1.10 | mortgage rate ≥ 6.5% |
+| `tax_delinquencies` | ×1.08 | mortgage rate ≥ 6.5% |
+| `loan_lane_refi_risk` | ×1.15 | mortgage rate ≥ 6.5% |
+| All others | ×1.00 (neutral) | always |
+
+`max_multiplier: 1.15` — configured values are clamped so no single rule can exceed this cap.
+
+### E2E test result (property 208833 — 10520 BENEVA DR)
+
+| Vertical | Baseline (6.47% — neutral) | Boosted (7.50% synthetic) |
+|---|---|---|
+| wholesalers | 100.0 | 100.0 |
+| fix_flip | 100.0 | 100.0 |
+| attorneys | 82.0 | **87.5 (+5.5)** |
+| restoration | 53.0 | **56.0 (+3.0)** |
+| roofing | 50.0 | **53.0 (+3.0)** |
+| public_adjusters | 50.0 | **53.0 (+3.0)** |
+
+**Result: PASS** — multiplier activates correctly, boosts configured signal types only, leaves others unchanged.
+
+### New files
+
+| File | Purpose |
+|---|---|
+| `config/macro_signal_rules.json` | Threshold + per-signal multiplier config |
+| `src/services/macro_signal_multiplier_service.py` | `get_macro_distress_multipliers`, `apply_macro_multiplier`, `get_latest_mortgage_rate_context` |
+| `src/services/cds_engine.py` | Modified — load multipliers in `__init__`, apply in `_score_vertical` |
+| `tests/test_macro_signal_multiplier.py` | 27 unit tests (all passing) |
+| `scripts/e2e_macro_multiplier.py` | E2E test — synthetic row insert/score/cleanup/assert |
+
+### Tests added
+
+27 unit tests in `tests/test_macro_signal_multiplier.py`:
+
+| Class | Coverage |
+|---|---|
+| `TestNoMacroData` | Empty DB → neutral |
+| `TestRateBelowThreshold` | Rate < 6.5% → neutral |
+| `TestRateAtThreshold` | Rate = 6.5% → multiplier activates |
+| `TestRateAboveThreshold` | Rate > 6.5% → multiplier activates; clamped to max |
+| `TestSignalSelectivity` | Only configured signal types boosted |
+| `TestConfigFallback` | Missing/malformed config → neutral, never raises |
+| `TestCDSIntegration` | Full chain: DB → multipliers → apply → score delta |
+
+---
+
+## Cron Schedule
+
+Added to `scripts/cron/crontab.txt` — all jobs run at 06:40–06:41 UTC, after scrapers finish (06:30) and before CDS scoring (07:00).
+
+| Source | Schedule | UTC |
+|---|---|---|
+| FRED (mortgage rate) | Every Friday | 06:40 |
+| BLS (unemployment, CPI) | 1st of every month | 06:40 |
+| FHFA (HPI) | 1st of Jan / Apr / Jul / Oct | 06:40 |
+| Census ACS5 | 1st of Jan / Apr / Jul / Oct | 06:41 |
 
 ---
 
 ## Out of Scope (Deferred)
 
-- CDS scoring integration / distress multiplier wiring
-- Cron scheduling for sync task
 - Admin API / UI for signal inspection
 - MLS inventory metrics (no free public API identified)
 - County-level BLS LAUS unemployment series (separate series IDs, not in current registry)
+- FHFA / BLS / Census multiplier rules (only FRED mortgage rate is wired to CDS today)
 
 ---
 
@@ -248,5 +328,11 @@ PYTHONPATH=. python -m src.tasks.sync_macro_signals --sources fred bls
 | `docs/macro_signal_sources_assessment.md` | Created |
 | `tests/macro_signals/test_macro_signals.py` | Created — 43 tests |
 | `tests/test_macro_signals_db.py` | Created — 29 tests |
+| `config/macro_signal_rules.json` | Created — multiplier threshold + config |
+| `src/services/macro_signal_multiplier_service.py` | Created — multiplier service |
+| `src/services/cds_engine.py` | Modified — A7 multiplier applied in `_score_vertical` |
+| `tests/test_macro_signal_multiplier.py` | Created — 27 tests |
+| `scripts/e2e_macro_multiplier.py` | Created — E2E test script |
+| `scripts/cron/crontab.txt` | Modified — macro signal sync cron entries |
 
-**Total: 72 tests passing (43 loader + 29 DB)**
+**Total: 99 tests passing (43 loader + 29 DB + 27 multiplier)**
