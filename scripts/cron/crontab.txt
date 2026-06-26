@@ -230,6 +230,21 @@ COUNTY_ID=hillsborough
 # Gated by CORA_SELF_HEALING_ENABLED. Idempotent — no duplicate actions within breach.
 */15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.alert_rules_check
 
+# ── A7 MACRO SIGNALS ─────────────────────────────────────────
+# Feeds the FRED mortgage-rate → CDS distress multiplier (threshold 6.5%).
+# All jobs run at 06:40 UTC — after scrapers finish (06:30) and before CDS scoring (07:00).
+#
+# FRED (MORTGAGE30US) — every Friday. FRED releases data on Thursday; Friday UTC catches it.
+40 6 * * 5 $PROJECT/scripts/cron/run.sh src.tasks.sync_macro_signals --sources fred
+#
+# BLS (unemployment, CPI, construction employment) — 1st of each month.
+40 6 1 * * $PROJECT/scripts/cron/run.sh src.tasks.sync_macro_signals --sources bls
+#
+# FHFA (House Price Index) + Census ACS5 (vacancy, income, occupancy) — quarterly.
+# 1st of Jan / Apr / Jul / Oct; staggered 1 min apart.
+40 6 1 1,4,7,10 * $PROJECT/scripts/cron/run.sh src.tasks.sync_macro_signals --sources fhfa
+41 6 1 1,4,7,10 * $PROJECT/scripts/cron/run.sh src.tasks.sync_macro_signals --sources census
+
 # ── CDS SCORING ──────────────────────────────────────────────
 # CDS Scoring Engine         — 07:00 AM UTC Mon-Sat (after all scrapers complete)
 0 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.services.cds_engine --rescore-new-signals
