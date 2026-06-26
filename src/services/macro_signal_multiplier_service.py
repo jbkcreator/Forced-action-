@@ -53,7 +53,7 @@ def _rules() -> dict:
 
 
 def get_latest_mortgage_rate_context(session: Session) -> Optional[dict]:
-    """Fetch the most recent mortgage_30y_fixed observation from macro_signals.
+    """Fetch the most recent mortgage_rate_30yr observation from macro_signals.
 
     Returns dict with keys: value (float), observed_at (date), series_id (str).
     Returns None if no row exists.
@@ -62,7 +62,7 @@ def get_latest_mortgage_rate_context(session: Session) -> Optional[dict]:
         text("""
             SELECT value, observed_at, source_series_id
             FROM macro_signals
-            WHERE signal_key = 'mortgage_30y_fixed'
+            WHERE signal_key = 'mortgage_rate_30yr'
               AND source = 'fred'
             ORDER BY observed_at DESC
             LIMIT 1
@@ -91,7 +91,7 @@ def get_macro_distress_multipliers(session: Session) -> dict[str, float]:
     The CDS engine treats a missing key as multiplier = 1.0 (no change).
     """
     rules = _rules()
-    rule = rules.get("mortgage_30y_fixed")
+    rule = rules.get("mortgage_rate_30yr")
     if not rule:
         return _NEUTRAL
 
@@ -111,7 +111,7 @@ def get_macro_distress_multipliers(session: Session) -> dict[str, float]:
         return _NEUTRAL
 
     if ctx is None:
-        logger.debug("[MacroMultiplier] No mortgage_30y_fixed row in macro_signals — neutral")
+        logger.debug("[MacroMultiplier] No mortgage_rate_30yr row in macro_signals — neutral")
         return _NEUTRAL
 
     rate = ctx["value"]

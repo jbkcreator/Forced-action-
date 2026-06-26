@@ -16,9 +16,9 @@ from typing import Optional
 
 from config.settings import get_settings
 from src.core.database import get_db_context
-from src.loaders.macro_signals.bls_client import BLSClient, KNOWN_SERIES as BLS_SERIES
+from src.loaders.macro_signals.bls_client import BLSClient, KNOWN_SERIES as BLS_SERIES, COUNTY_LAUS_SERIES
 from src.loaders.macro_signals.census_client import ACS_VARIABLES, CensusClient
-from src.loaders.macro_signals.fhfa_hpi_loader import fetch_hpi
+from src.loaders.macro_signals.fhfa_hpi_loader import fetch_hpi, download_hpi_master
 from src.loaders.macro_signals.fred_rates_loader import fetch_mortgage_rates
 from src.services.macro_signal_service import upsert_macro_signals
 from src.utils.logger import setup_logging
@@ -41,16 +41,38 @@ def _sync_fred(session) -> dict:
 
 
 def _sync_fhfa(session) -> dict:
-    records = fetch_hpi(
-        levels=["USA or Census Division", "state", "MSA", "county"],
+    # Download once, parse twice:
+    # - purchase-only monthly only exists at Census Division level in hpi_master.csv
+    # - state + MSA data is available at quarterly frequency
+    # County HPI is not in FHFA public downloads; use MSA as proxy in market_pressure_service.
+    raw_csv = download_hpi_master()
+    division_records = fetch_hpi(
+        raw_csv=raw_csv,
+        levels=["USA or Census Division"],
+        frequency="monthly",
         min_year=2020,
     )
-    return upsert_macro_signals(session, records)
+    state_msa_records = fetch_hpi(
+        raw_csv=raw_csv,
+        levels=["State", "MSA"],
+        frequency="quarterly",
+        min_year=2020,
+    )
+    return upsert_macro_signals(session, division_records + state_msa_records)
 
 
 def _sync_bls(session) -> dict:
     client = BLSClient()
     series_ids = list(BLS_SERIES.keys())
+    start_year = max(_CURRENT_YEAR - 5, 2010)
+    records = client.fetch_series(series_ids, start_year=start_year, end_year=_CURRENT_YEAR)
+    return upsert_macro_signals(session, records)
+
+
+def _sync_bls_county(session) -> dict:
+    """Sync BLS LAUS county unemployment rates for target FL counties."""
+    series_ids = list(COUNTY_LAUS_SERIES.values())
+    client = BLSClient()
     start_year = max(_CURRENT_YEAR - 5, 2010)
     records = client.fetch_series(series_ids, start_year=start_year, end_year=_CURRENT_YEAR)
     return upsert_macro_signals(session, records)
@@ -68,10 +90,11 @@ def _sync_census(session) -> dict:
 
 
 _SOURCE_RUNNERS = {
-    "fred":   _sync_fred,
-    "fhfa":   _sync_fhfa,
-    "bls":    _sync_bls,
-    "census": _sync_census,
+    "fred":       _sync_fred,
+    "fhfa":       _sync_fhfa,
+    "bls":        _sync_bls,
+    "bls_county": _sync_bls_county,
+    "census":     _sync_census,
 }
 
 

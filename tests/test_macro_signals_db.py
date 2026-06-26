@@ -217,13 +217,22 @@ class TestPGUpsertDuplicate:
     """Test 2: Duplicate upsert does not create duplicate rows."""
 
     def test_duplicate_does_not_create_second_row(self, fresh_db):
-        rec = _sample_record(signal_key="cpi_all_urban", source="bls")
+        # Use a synthetic key that can never collide with real BLS data already in the DB.
+        rec = _sample_record(
+            signal_key="_test_dedup_synthetic",
+            source="bls",
+            source_series_id="SYNTHETIC_DEDUP_001",
+        )
         upsert_macro_signal(fresh_db, rec)
         upsert_macro_signal(fresh_db, rec)
 
         from sqlalchemy import text as sa_text
         count = fresh_db.execute(
-            sa_text("SELECT COUNT(*) FROM macro_signals WHERE signal_key = 'cpi_all_urban'")
+            sa_text(
+                "SELECT COUNT(*) FROM macro_signals "
+                "WHERE signal_key = '_test_dedup_synthetic' "
+                "  AND source_series_id = 'SYNTHETIC_DEDUP_001'"
+            )
         ).scalar()
         assert count == 1
 

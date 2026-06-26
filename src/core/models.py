@@ -6542,3 +6542,58 @@ class ScoreFeedback(Base):
             f"<ScoreFeedback(prospect_id={self.prospect_id}, "
             f"predicted_tier='{self.predicted_tier}', outcome='{self.realized_outcome}')>"
         )
+
+
+# ============================================================================
+# A7 — Macro Signal
+# ============================================================================
+
+class MacroSignal(Base):
+    """External macroeconomic signal (FRED, FHFA, BLS, Census ACS5).
+
+    One row per (source, signal_key, source_series_id, observed_at,
+    geography_scope, geography_id) observation. Upserted idempotently.
+    """
+    __tablename__ = "macro_signals"
+
+    id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=False),
+        primary_key=True,
+        server_default=text("generate_uuidv7()"),
+    )
+    source:            Mapped[str] = mapped_column(String(30), nullable=False)
+    signal_key:        Mapped[str] = mapped_column(String(80), nullable=False)
+    source_series_id:  Mapped[str] = mapped_column(String(120), nullable=False)
+    value:             Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False)
+    unit:              Mapped[str] = mapped_column(String(30), nullable=False)
+    observed_at:       Mapped[date] = mapped_column(Date, nullable=False)
+    frequency:         Mapped[str] = mapped_column(String(20), nullable=False)
+    geography_scope:   Mapped[str] = mapped_column(String(50), nullable=False)
+    geography_id:      Mapped[str] = mapped_column(String(30), nullable=False)
+    raw_payload:       Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    created_at:        Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at:        Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "source", "signal_key", "source_series_id",
+            "observed_at", "geography_scope", "geography_id",
+            name="uq_macro_signal_observation",
+        ),
+        Index("ix_macro_signals_source", "source"),
+        Index("ix_macro_signals_signal_key", "signal_key"),
+        Index("ix_macro_signals_observed_at", "observed_at"),
+        Index("ix_macro_signals_source_key_date", "source", "signal_key", "observed_at"),
+        Index("ix_macro_signals_geo", "geography_scope", "geography_id"),
+        Index("ix_macro_signals_source_geo", "source", "geography_scope", "geography_id"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<MacroSignal(source={self.source!r}, key={self.signal_key!r}, "
+            f"geo={self.geography_id!r}, obs={self.observed_at})>"
+        )

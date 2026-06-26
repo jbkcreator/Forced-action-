@@ -25,6 +25,8 @@ from __future__ import annotations
 import csv
 import io
 import logging
+import os
+import time
 from datetime import date
 from pathlib import Path
 from typing import Optional
@@ -41,21 +43,49 @@ SAMPLE_OUTPUT_DIR = Path("data/reference/macro_signals_samples")
 # Map FHFA level strings -> normalized geography_scope values
 LEVEL_SCOPE: dict[str, str] = {
     "USA or Census Division": "national_or_division",
-    "state":                  "state",
+    "State":                  "state",
     "MSA":                    "metro",
-    "county":                 "county",
     "ZIP5":                   "zip5",
     "3-Digit ZIP":            "zip3",
     "census_tract":           "tract",
 }
 
+_CACHE_MAX_AGE_SECONDS = 86400  # 24 hours
+
 
 def download_hpi_master(timeout: int = 60) -> str:
-    """Download the FHFA HPI master CSV and return the raw text."""
+    """Download the FHFA HPI master CSV and return the raw text.
+
+    If the env var FHFA_HPI_CACHE_PATH is set and points to a file younger
+    than 24 hours, the cached file is used instead of downloading. On a cache
+    miss the file is downloaded and written to that path for subsequent calls.
+    Leave the env var unset in production/cron to always fetch fresh data.
+    """
+    cache_path_str = os.environ.get("FHFA_HPI_CACHE_PATH")
+    if cache_path_str:
+        cache_path = Path(cache_path_str)
+        if cache_path.exists():
+            age = time.time() - cache_path.stat().st_mtime
+            if age < _CACHE_MAX_AGE_SECONDS:
+                logger.info(
+                    "[FHFA] Using cached CSV from %s (%.0fh old)",
+                    cache_path, age / 3600,
+                )
+                return cache_path.read_text(encoding="utf-8", errors="replace")
+            logger.info("[FHFA] Cache expired (%.0fh old), re-downloading", age / 3600)
+    else:
+        cache_path = None
+
     logger.info("[FHFA] Downloading HPI master CSV from %s", FHFA_MASTER_URL)
     resp = requests_get_with_retry(FHFA_MASTER_URL, timeout=timeout)
     resp.raise_for_status()
     logger.info("[FHFA] Download complete (%d bytes)", len(resp.content))
+
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(resp.text, encoding="utf-8")
+        logger.info("[FHFA] Saved to cache: %s", cache_path)
+
     return resp.text
 
 
@@ -63,6 +93,7 @@ def parse_hpi_master(
     csv_text: str,
     *,
     hpi_flavor: str = "purchase-only",
+    hpi_type: str = "traditional",
     frequency: str = "monthly",
     levels: Optional[list[str]] = None,
     place_ids: Optional[list[str]] = None,
@@ -73,8 +104,11 @@ def parse_hpi_master(
     Args:
         csv_text: Raw CSV content from download_hpi_master().
         hpi_flavor: Filter to "purchase-only" or "all-transactions".
+        hpi_type: Filter to "traditional" or "expanded-data". Defaults to
+            "traditional" to avoid CardinalityViolation when both types share
+            the same geography/date (they'd collide on the unique constraint).
         frequency: Filter to "monthly", "quarterly", or "annual".
-        levels: Geography levels to include (default: all). E.g. ["state", "MSA"].
+        levels: Geography levels to include (default: all). E.g. ["State", "MSA"].
         place_ids: FIPS/ZIP/CBSA codes to include (default: all).
         min_year: Drop records before this year.
 
@@ -88,6 +122,8 @@ def parse_hpi_master(
 
     for row in reader:
         if row.get("hpi_flavor", "").strip() != hpi_flavor:
+            continue
+        if row.get("hpi_type", "").strip() != hpi_type:
             continue
         if row.get("frequency", "").strip() != frequency:
             continue
@@ -160,6 +196,7 @@ def parse_hpi_master(
 def fetch_hpi(
     *,
     hpi_flavor: str = "purchase-only",
+    hpi_type: str = "traditional",
     frequency: str = "monthly",
     levels: Optional[list[str]] = None,
     place_ids: Optional[list[str]] = None,
@@ -175,6 +212,7 @@ def fetch_hpi(
     return parse_hpi_master(
         csv_text,
         hpi_flavor=hpi_flavor,
+        hpi_type=hpi_type,
         frequency=frequency,
         levels=levels,
         place_ids=place_ids,

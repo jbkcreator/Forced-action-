@@ -48,10 +48,10 @@ def _patch_rules(rules: dict):
 
 
 _DEFAULT_RULES = {
-    "mortgage_30y_fixed": {
+    "mortgage_rate_30yr": {
         "source": "fred",
         "series_id": "MORTGAGE30US",
-        "signal_key": "mortgage_30y_fixed",
+        "signal_key": "mortgage_rate_30yr",
         "high_rate_threshold": 6.5,
         "max_multiplier": 1.15,
         "affected_signals": {
@@ -138,8 +138,8 @@ class TestRateAboveThreshold:
     def test_configured_mult_clamped_to_max(self):
         """If config has a multiplier > max_multiplier, it is clamped."""
         rules = {
-            "mortgage_30y_fixed": {
-                **_DEFAULT_RULES["mortgage_30y_fixed"],
+            "mortgage_rate_30yr": {
+                **_DEFAULT_RULES["mortgage_rate_30yr"],
                 "max_multiplier": 1.05,
                 "affected_signals": {"foreclosures": 1.99},  # way over max
             }
@@ -201,7 +201,7 @@ class TestConfigFallback:
 
     def test_missing_affected_signals_returns_neutral(self):
         rules = {
-            "mortgage_30y_fixed": {
+            "mortgage_rate_30yr": {
                 "high_rate_threshold": 6.5,
                 "max_multiplier": 1.15,
                 "affected_signals": {},

@@ -82,6 +82,25 @@ SOURCES: dict[str, dict] = {
                 "geography_scope": "national",
                 "geography_id": "US",
             },
+            # BLS LAUS county unemployment rates — Florida target counties
+            # Series format: LAUCN{state2}{county3}0000000003
+            # Measure 003 = unemployment rate (seasonally adjusted)
+            "LAUCN120570000000003": {
+                "signal_key": "county_unemployment_rate",
+                "description": "Hillsborough County, FL — Unemployment Rate (LAUS)",
+                "unit": "percent",
+                "frequency": "monthly",
+                "geography_scope": "county",
+                "geography_id": "12057",
+            },
+            "LAUCN121030000000003": {
+                "signal_key": "county_unemployment_rate",
+                "description": "Pinellas County, FL — Unemployment Rate (LAUS)",
+                "unit": "percent",
+                "frequency": "monthly",
+                "geography_scope": "county",
+                "geography_id": "12103",
+            },
         },
     },
     "fhfa": {

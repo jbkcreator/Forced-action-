@@ -1,8 +1,8 @@
 {
-  "mortgage_30y_fixed": {
+  "mortgage_rate_30yr": {
     "source": "fred",
     "series_id": "MORTGAGE30US",
-    "signal_key": "mortgage_30y_fixed",
+    "signal_key": "mortgage_rate_30yr",
     "high_rate_threshold": 6.5,
     "max_multiplier": 1.15,
     "affected_signals": {

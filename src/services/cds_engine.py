@@ -54,9 +54,11 @@ from typing import Any, Dict, List, Optional
 
 from src.services.ghl_webhook import push_lead_to_ghl
 from src.services.heuristic_loader import load_overrides as _load_weight_overrides
-from src.services.macro_signal_multiplier_service import (
-    apply_macro_multiplier,
-    get_macro_distress_multipliers,
+from src.services.macro_signal_multiplier_service import apply_macro_multiplier
+from src.services.market_pressure_service import get_county_market_pressure_context
+from src.services.market_timing_config import (
+    compose_market_timing_multipliers,
+    load_market_timing_config,
 )
 from config.settings import settings
 
@@ -121,6 +123,58 @@ from config.scoring import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _preload_county_multipliers(
+    session: "Session",
+    market_timing_config: dict,
+) -> dict[str, dict[str, float]]:
+    """Load and compose unified market timing multipliers for all active counties.
+
+    Called once in MultiVerticalScorer.__init__. Queries active county FIPS from
+    the counties table, fetches market pressure context per county (mortgage rate +
+    FHFA HPI + BLS LAUS unemployment), and composes one unified multiplier dict
+    per county. Results are cached for the lifetime of the scorer instance.
+
+    Returns {county_id: {cds_signal: multiplier}}. Missing or failed counties
+    are excluded — callers fall back to self._macro_multipliers (neutral).
+    """
+    try:
+        rows = session.execute(
+            sa_text(
+                "SELECT county_id, fips FROM counties "
+                "WHERE is_active = TRUE AND fips IS NOT NULL AND fips != ''"
+            )
+        ).fetchall()
+    except Exception as exc:
+        logger.warning("[CDS:MarketTiming] Cannot load county FIPS: %s", exc)
+        return {}
+
+    result: dict[str, dict[str, float]] = {}
+    for row in rows:
+        county_id  = row[0]
+        county_fips = row[1]
+        try:
+            ctx   = get_county_market_pressure_context(session, county_fips)
+            mults = compose_market_timing_multipliers(ctx, market_timing_config)
+            result[county_id] = mults
+            if mults:
+                logger.info(
+                    "[CDS:MarketTiming] %s (%s) — active multipliers: %s",
+                    county_id, county_fips, mults,
+                )
+            else:
+                logger.debug(
+                    "[CDS:MarketTiming] %s (%s) — neutral (no active signals)",
+                    county_id, county_fips,
+                )
+        except Exception as exc:
+            logger.warning(
+                "[CDS:MarketTiming] Market pressure context failed for %s (%s): %s",
+                county_id, county_fips, exc,
+            )
+    return result
+
 
 # ── LegalAndLien.document_type → signal key ───────────────────────────────────
 # All code-lien doc-type variants collapse to a single `code_lien` signal so
@@ -378,9 +432,15 @@ class MultiVerticalScorer:
         self._profiler: _Profiler = _Profiler(enabled=False)
         # A3: warm-start priors — additive deltas loaded from scoring_weight_overrides (5-min cache).
         self._weight_overrides: Dict[tuple, float] = _load_weight_overrides(session)
-        # A7: macro-signal multipliers — loaded once per scorer instance from macro_signals table.
-        # Empty dict = neutral (no macro data or rate below threshold); no scoring change.
-        self._macro_multipliers: Dict[str, float] = get_macro_distress_multipliers(session)
+        # A7: unified market timing multipliers — composed from FRED + FHFA + BLS data.
+        # One context fetch per county at init time; no per-property DB queries during scoring.
+        # Empty dict = neutral (no macro data, config missing, or all pressures below threshold).
+        _market_timing_config = load_market_timing_config()
+        self._county_multipliers: Dict[str, Dict[str, float]] = _preload_county_multipliers(
+            session, _market_timing_config
+        )
+        # Neutral fallback for counties not in the preload set (unknown counties score unaffected).
+        self._macro_multipliers: Dict[str, float] = {}
 
     # ── GHL batch flush ───────────────────────────────────────────────────────
 
@@ -677,6 +737,7 @@ class MultiVerticalScorer:
         violation_count: int = 0,
         persistence_data: Optional[Dict] = None,
         missing_signals: frozenset = frozenset(),
+        multipliers: Optional[Dict[str, float]] = None,
     ) -> Dict:
         """
         Score a single vertical per spec. Returns a result dict.
@@ -777,6 +838,10 @@ class MultiVerticalScorer:
         # Stacking-only signals (incidents) are computed for the component map
         # but are EXCLUDED from primary (best_type) selection — they can never
         # be the primary signal even if their recency-boosted score is higher.
+        # A7: unified market timing multiplier — passed from score_property per county.
+        # Falls back to self._macro_multipliers (neutral {}) when not provided.
+        _mult_dict = multipliers if multipliers is not None else self._macro_multipliers
+
         signal_components: Dict[str, Dict] = {}
         best_type  = None
         best_total = -999
@@ -784,9 +849,9 @@ class MultiVerticalScorer:
             sig_date = sig_info["date"]
             _delta  = self._weight_overrides.get((vertical, sig_type), 0.0)
             base    = max(0, min(100, weights[sig_type] + _delta))
-            # A7: macro-signal multiplier (e.g. high mortgage rate boosts foreclosure/
-            # tax_delinquency urgency). Neutral (no-op) when no macro data exists.
-            base    = apply_macro_multiplier(sig_type, base, self._macro_multipliers)
+            # A7: unified market timing multiplier (FRED + FHFA + BLS — single application).
+            # Neutral (no-op) when no macro data exists or county is unknown.
+            base    = apply_macro_multiplier(sig_type, base, _mult_dict)
             recency = self._recency_bonus(sig_date)
             decay   = self._age_decay(sig_date)
             total   = base + recency + decay   # decay is negative
@@ -883,7 +948,7 @@ class MultiVerticalScorer:
             float(SCORE_CAP),
         )
 
-        _active_mults = {k: v for k, v in self._macro_multipliers.items() if k in signal_components}
+        _active_mults = {k: v for k, v in _mult_dict.items() if k in signal_components}
         logger.debug(
             "    [%s] primary=%s(%.0f) days_open=+%d persistence=+%d prior_viol=+%d"
             " stack=+%d(%d sigs/%dd) absentee=+%d contact=+%d equity=+%d tenure=+%d"
@@ -1004,10 +1069,15 @@ class MultiVerticalScorer:
         _cfg = for_county(prop.county_id)
         _missing = _cfg.missing_signals
 
+        # A7: county-specific unified market timing multipliers (loaded at init, cached).
+        # Falls back to self._macro_multipliers (neutral) for counties not in preload set.
+        _mults = self._county_multipliers.get(prop.county_id, self._macro_multipliers)
+
         vertical_results = {
             v: self._score_vertical(
                 v, signals, owner, financial, violation_count, persistence_data,
                 missing_signals=_missing,
+                multipliers=_mults,
             )
             for v in VERTICAL_WEIGHTS
         }

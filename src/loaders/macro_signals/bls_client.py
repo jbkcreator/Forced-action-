@@ -33,9 +33,19 @@ _SERIES_META = SOURCES["bls"]["series"]
 
 # Well-known series available without needing to navigate the BLS catalog.
 KNOWN_SERIES: dict[str, str] = {
-    "LNS14000000":  "unemployment_rate_national",
-    "CUUR0000SA0":  "cpi_all_urban",
-    "CUSR0000SEHA": "cpi_rent_primary_residence",
+    "LNS14000000":           "unemployment_rate_national",
+    "CUUR0000SA0":           "cpi_all_urban",
+    "CUSR0000SEHA":          "cpi_rent_primary_residence",
+    # LAUS county unemployment rates — FL target counties
+    "LAUCN120570000000003":  "county_unemployment_rate",
+    "LAUCN121030000000003":  "county_unemployment_rate",
+}
+
+# LAUS county unemployment series for Florida target counties (FIPS -> series ID).
+# Format: LAUCN{state2}{county3}0000000003  (measure 003 = unemployment rate)
+COUNTY_LAUS_SERIES: dict[str, str] = {
+    "12057": "LAUCN120570000000003",  # Hillsborough County, FL
+    "12103": "LAUCN121030000000003",  # Pinellas County, FL
 }
 
 
