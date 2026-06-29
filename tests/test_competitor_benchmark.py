@@ -23,6 +23,7 @@ from src.scrappers.competitor_rates.hardmoneyhome import (
     profile_slugs,
 )
 from src.scrappers.competitor_rates.equity_trac import parse_equity_trac
+from src.scrappers.competitor_rates.easy_street import parse_easy_street
 
 _FIX = Path(__file__).parent / "fixtures" / "competitor_rates"
 _FIXTURE = _FIX / "cambridge_dscr.html"
@@ -106,7 +107,7 @@ def test_adapter_registry_is_wired():
 
     assert {a["name"] for a in ADAPTERS} == {
         "cambridge", "dscr_loan_source", "dscr_capital_partners", "hardmoneyhome",
-        "equity_trac",
+        "equity_trac", "easy_street",
     }
     for a in ADAPTERS:
         assert callable(a["fetch"])
@@ -184,6 +185,15 @@ def test_parse_hmh_profile_full_fields():
     assert row.points == 0.75
     assert row.min_fico == 660
     assert row.hq_location == "Bethesda, MD"
+
+
+def test_parse_easy_street_dscr_floor():
+    row = parse_easy_street((_FIX / "easy_street.html").read_text(encoding="utf-8"))
+    assert row.lender_name == "Easy Street Capital"
+    assert row.product == "dscr"
+    assert row.region == "florida"
+    assert row.rate_low == 5.75   # lowest "starting at" (rental DSCR floor)
+    assert row.max_ltv == 80.0
 
 
 def test_parse_equity_trac_uses_bridge_not_rental_teaser():

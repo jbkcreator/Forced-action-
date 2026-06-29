@@ -21,6 +21,10 @@ from src.scrappers.competitor_rates.equity_trac import (
     SOURCE_URL as EQUITY_TRAC_URL,
     fetch_equity_trac,
 )
+from src.scrappers.competitor_rates.easy_street import (
+    SOURCE_URL as EASY_STREET_URL,
+    fetch_easy_street,
+)
 
 # Each adapter: name (== --target value), live fetch fn, source URL, confidence.
 ADAPTERS = [
@@ -34,4 +38,6 @@ ADAPTERS = [
      "source_url": HARDMONEYHOME_URL, "confidence": "high"},
     {"name": "equity_trac", "fetch": fetch_equity_trac,
      "source_url": EQUITY_TRAC_URL, "confidence": "high"},
+    {"name": "easy_street", "fetch": fetch_easy_street,
+     "source_url": EASY_STREET_URL, "confidence": "high"},
 ]
