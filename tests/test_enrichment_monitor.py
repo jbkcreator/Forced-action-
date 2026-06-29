@@ -101,8 +101,8 @@ class TestRunProviderHealthCheck:
         _seed_degraded(fresh_db, vendor, hits=5, misses=35,
                        when=datetime.now(timezone.utc) - timedelta(hours=1))
 
-        with patch("src.tasks.match_rate_monitor.post_incident_alert") as alert:
-            alert.return_value = "ts123"
+        with patch("src.tasks.match_rate_monitor.send_alert") as alert:
+            alert.return_value = True
             results = run_provider_health_check(
                 fresh_db, floors={vendor: 0.25},
                 window_hours=48, min_sample=30, cooldown_hours=24,
@@ -132,8 +132,8 @@ class TestRunProviderHealthCheck:
             fresh_db.add(_log(vendor, False, when))
         fresh_db.flush()
 
-        with patch("src.tasks.match_rate_monitor.post_incident_alert") as alert:
-            alert.return_value = "ts"
+        with patch("src.tasks.match_rate_monitor.send_alert") as alert:
+            alert.return_value = True
             run_provider_health_check(
                 fresh_db, floors={vendor: 0.25}, window_hours=48,
                 min_sample=30, cooldown_hours=24, multiplier=0.5,
@@ -155,8 +155,8 @@ class TestRunProviderHealthCheck:
 
         kwargs = dict(floors={vendor: 0.25}, window_hours=48,
                       min_sample=30, cooldown_hours=24)
-        with patch("src.tasks.match_rate_monitor.post_incident_alert") as alert:
-            alert.return_value = "ts123"
+        with patch("src.tasks.match_rate_monitor.send_alert") as alert:
+            alert.return_value = True
             run_provider_health_check(fresh_db, **kwargs)
             run_provider_health_check(fresh_db, **kwargs)   # within cooldown
 

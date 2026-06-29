@@ -128,6 +128,60 @@ def _alerted_recently(db, provider, cooldown_hours):
     return found is not None
 
 
+def _build_degraded_alert(provider, rate, floor, sample, window_hours, records_affected):
+    """Human-friendly (subject, text_body, html_body) for a degraded provider —
+    plain language, no internal metric names or empty incident fields."""
+    rate_pct, floor_pct = f"{rate:.0%}", f"{floor:.0%}"
+    when = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    subject = f"[Forced Action] Data provider degraded: {provider} ({rate_pct} success vs {floor_pct} floor)"
+    text_body = (
+        f"A paid enrichment provider looks degraded.\n\n"
+        f"  Provider:      {provider}\n"
+        f"  Success rate:  {rate_pct}   (last {window_hours}h, {sample} lookups)\n"
+        f"  Healthy floor: {floor_pct}   (we alert below this)\n\n"
+        f"What it means\n"
+        f"  {provider} is returning successful contact lookups far less often than\n"
+        f"  normal. This usually means an expired or out-of-credit API key, or a\n"
+        f"  provider-side outage.\n\n"
+        f"Action already taken (automatic)\n"
+        f"  {records_affected} lead(s) enriched by this provider were down-rated so the\n"
+        f"  degraded data does not inflate lead scoring.\n\n"
+        f"What to check\n"
+        f"  1. The provider's API key and remaining credits.\n"
+        f"  2. The provider's status page for an outage.\n"
+        f"  3. Admin panel: Ops -> Provider Health.\n\n"
+        f"Detected at {when}.\n"
+    )
+    html_body = f"""<div style="font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;max-width:560px;margin:0 auto;color:#1f2937">
+  <div style="background:#b91c1c;color:#fff;padding:16px 20px;border-radius:8px 8px 0 0">
+    <div style="font-size:12px;letter-spacing:.05em;text-transform:uppercase;opacity:.85">Forced Action &middot; High severity</div>
+    <div style="font-size:20px;font-weight:700;margin-top:4px">Data provider degraded</div>
+  </div>
+  <div style="border:1px solid #e5e7eb;border-top:none;border-radius:0 0 8px 8px;padding:20px">
+    <p style="margin:0 0 16px">A paid enrichment provider is returning successful lookups far less often than normal &mdash; usually an expired/out-of-credit API key or a provider outage.</p>
+    <table style="width:100%;border-collapse:collapse;font-size:14px;margin-bottom:18px">
+      <tr><td style="padding:6px 0;color:#6b7280">Provider</td><td style="padding:6px 0;font-weight:600;text-align:right">{provider}</td></tr>
+      <tr><td style="padding:6px 0;color:#6b7280">Success rate (last {window_hours}h)</td><td style="padding:6px 0;font-weight:700;color:#b91c1c;text-align:right">{rate_pct}</td></tr>
+      <tr><td style="padding:6px 0;color:#6b7280">Healthy floor</td><td style="padding:6px 0;text-align:right">{floor_pct}</td></tr>
+      <tr><td style="padding:6px 0;color:#6b7280">Lookups in window</td><td style="padding:6px 0;text-align:right">{sample}</td></tr>
+      <tr><td style="padding:6px 0;color:#6b7280">Leads auto-down-rated</td><td style="padding:6px 0;font-weight:600;text-align:right">{records_affected}</td></tr>
+    </table>
+    <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;padding:14px 16px;margin-bottom:16px">
+      <div style="font-weight:600;margin-bottom:4px">Already handled automatically</div>
+      <div style="font-size:14px">The {records_affected} affected lead(s) had their contact-quality rating reduced so the degraded data can't inflate lead scoring.</div>
+    </div>
+    <div style="font-weight:600;margin-bottom:6px">What to check</div>
+    <ol style="margin:0 0 16px;padding-left:20px;font-size:14px">
+      <li>The provider's API key and remaining credits.</li>
+      <li>The provider's status page for an outage.</li>
+      <li>Admin panel: Ops &rarr; Provider Health.</li>
+    </ol>
+    <div style="font-size:12px;color:#9ca3af">Detected at {when}</div>
+  </div>
+</div>"""
+    return subject, text_body, html_body
+
+
 def run_provider_health_check(
     db, *, floors=None, window_hours=None, min_sample=None, cooldown_hours=None,
     multiplier=None, discount_enabled=None,
@@ -181,26 +235,28 @@ def run_provider_health_check(
         db.add(row)
         db.flush()
 
-        incident = SimpleNamespace(
-            metric_name=f"enrichment_hit_rate:{provider}",
-            severity="high",
-            observed_value=round(rate, 4),
-            threshold_value=floor,
-            feature_name="enrichment",
+        subject, text_body, html_body = _build_degraded_alert(
+            provider, rate, floor, n, window_hours, affected
         )
+        # Rich Slack card only when Slack is configured; email is the reliable channel.
+        if settings.slack_bot_token and settings.cora_incident_slack_channel:
+            try:
+                post_incident_alert(
+                    SimpleNamespace(
+                        metric_name=f"enrichment_hit_rate:{provider}", severity="high",
+                        observed_value=round(rate, 4), threshold_value=floor,
+                        feature_name="enrichment",
+                    ),
+                    kind="enrichment_degraded",
+                    action_summary=subject,
+                )
+            except Exception:
+                logger.warning("[EnrichmentMonitor] Slack alert failed for %s", provider, exc_info=True)
         try:
-            sent = post_incident_alert(
-                incident,
-                kind="enrichment_degraded",
-                action_summary=(
-                    f"{provider} hit rate {rate:.1%} below floor {floor:.0%} "
-                    f"over last {window_hours}h ({n} attempts). Check vendor API "
-                    f"key/credits and recent enrichment_usage_logs errors."
-                ),
-            )
+            sent = send_alert(subject, text_body, html_body=html_body)
         except Exception:
-            logger.warning("[EnrichmentMonitor] alert send failed for %s", provider, exc_info=True)
-            sent = None
+            logger.warning("[EnrichmentMonitor] email alert failed for %s", provider, exc_info=True)
+            sent = False
         row.alert_sent = bool(sent)
         db.flush()
 
