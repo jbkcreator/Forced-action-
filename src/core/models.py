@@ -1783,7 +1783,8 @@ class ScraperRunStats(Base):
             "'judgments', 'deeds', 'evictions', 'divorce_filings', 'probate', 'bankruptcy',"
             "'violations', 'foreclosures', 'permits', 'tax_delinquencies',"
             "'roofing_permits', 'storm_damage', 'flood_damage', 'insurance_claims', 'fire_incidents',"
-            "'sunbiz', 'property_appraiser', 'dbpr_company'"
+            "'sunbiz', 'property_appraiser', 'dbpr_company',"
+            "'tax_deed_auction', 'vacant_land'"
             ")",
             name="check_run_stats_source_type",
         ),
@@ -6984,3 +6985,94 @@ class CommissionLedgerEntry(Base):
         Index("idx_cl_lane_id", "lane_id"),
         Index("idx_cl_broker_id", "broker_id"),
     )
+# TAX DEED AUCTIONS  (fa103)
+# ============================================================================
+
+class TaxDeedAuction(Base):
+    """
+    Tax deed sale auction listing scraped from realtaxdeed.com.
+
+    One row per (county_id, auction_date, case_number). property_id is NULL
+    when the parcel could not be matched in the properties table.
+    Raw fields from the portal are preserved in raw_fields JSONB.
+    """
+    __tablename__ = "tax_deed_auctions"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    property_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("properties.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    parcel_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    auction_date: Mapped[date] = mapped_column(Date, nullable=False)
+    case_number: Mapped[str] = mapped_column(String(100), nullable=False)
+    certificate_number: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    certificate_year: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    status: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    auction_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    opening_bid: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 2), nullable=True)
+    sold_amount: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 2), nullable=True)
+    sold_to: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    raw_fields: Mapped[Optional[Any]] = mapped_column(JSONB, nullable=True)
+    match_method: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    match_confidence: Mapped[Optional[Decimal]] = mapped_column(Numeric(4, 3), nullable=True)
+    scraped_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    property: Mapped[Optional["Property"]] = relationship("Property", foreign_keys=[property_id])
+
+    __table_args__ = (
+        UniqueConstraint("county_id", "auction_date", "case_number", name="uq_tax_deed_auction"),
+        Index("ix_tax_deed_auctions_county_date", "county_id", "auction_date"),
+        Index("ix_tax_deed_auctions_parcel_id", "parcel_id"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<TaxDeedAuction(county={self.county_id!r}, date={self.auction_date}, "
+            f"case={self.case_number!r}, status={self.status!r})>"
+        )
+
+
+# ============================================================================
+# VACANT PARCELS  (fa103)
+# ============================================================================
+
+class VacantParcel(Base):
+    """
+    Current-state vacancy record for a parcel — one row per (county_id, parcel_id).
+
+    Updated in-place on each scrape run. source_name is 'pcpao' (Pinellas) or
+    'hcpa' (Hillsborough). Only vacancy classification fields are stored here;
+    assessed value, acreage, and owner live in the financials / owners tables.
+    """
+    __tablename__ = "vacant_parcels"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    property_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("properties.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    parcel_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    use_code: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    property_use: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    dor_code: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    source_name: Mapped[str] = mapped_column(String(20), nullable=False)
+    last_verified: Mapped[date] = mapped_column(Date, nullable=False)
+    scraped_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    property: Mapped[Optional["Property"]] = relationship("Property", foreign_keys=[property_id])
+
+    __table_args__ = (
+        UniqueConstraint("county_id", "parcel_id", name="uq_vacant_parcel"),
+        Index("ix_vacant_parcels_county_id", "county_id"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<VacantParcel(county={self.county_id!r}, parcel={self.parcel_id!r}, "
+            f"use={self.use_code!r}, source={self.source_name!r})>"
+        )
