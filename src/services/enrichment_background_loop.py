@@ -51,23 +51,9 @@ def _reset_stuck_queued(session, county_id: str) -> int:
 
 # ── Candidate selection ───────────────────────────────────────────────────────
 
-def _fetch_candidates(session, county_id: str, limit: int) -> list:
-    """
-    Return rows for Gold+ owners that are unenriched and available for processing.
-
-    Excludes:
-    - owners already attempted by Tracerfy or BatchData (EC row exists)
-    - owners currently claimed by a parallel loop run (contact_refresh_status='queued')
-    - is_guess_lead leads (A2 gate: low-confidence, routed to direct mail, not dialable)
-    - owners with no address/zip (cascade would fail anyway)
-    """
-    rows = session.execute(text("""
-        SELECT DISTINCT ON (o.id)
-            o.id          AS owner_id,
-            o.property_id,
-            o.county_id
-        FROM owners o
-        JOIN properties p ON p.id = o.property_id
+# Shared WHERE predicate used by both the read-only (dry-run) and atomic
+# fetch-and-claim paths so the eligibility conditions stay in one place.
+_CANDIDATE_WHERE = """
         WHERE o.county_id = :county_id
           AND (o.phone_1 IS NULL OR trim(o.phone_1) = '')
           AND (o.contact_refresh_status IS NULL
@@ -85,8 +71,52 @@ def _fetch_candidates(session, county_id: str, limit: int) -> list:
               WHERE ec.property_id = o.property_id
                 AND ec.source IN ('tracerfy', 'batch_skip_tracing')
           )
+"""
+
+
+def _fetch_candidates(session, county_id: str, limit: int) -> list:
+    """
+    Read-only candidate fetch — used only for dry-run mode.
+
+    Returns eligible Gold+ owners without claiming (writing) anything.
+    """
+    rows = session.execute(text(f"""
+        SELECT DISTINCT ON (o.id)
+            o.id          AS owner_id,
+            o.property_id,
+            o.county_id
+        FROM owners o
+        JOIN properties p ON p.id = o.property_id
+        {_CANDIDATE_WHERE}
         ORDER BY o.id
         LIMIT :limit
+    """), {"county_id": county_id, "limit": limit}).fetchall()
+    return rows
+
+
+def _fetch_and_claim_candidates(session, county_id: str, limit: int) -> list:
+    """
+    Atomically select and claim up to `limit` eligible Gold+ owners.
+
+    Uses FOR UPDATE SKIP LOCKED inside the subquery so that two concurrent loop
+    invocations can never read the same candidate set — the first writer's lock
+    is visible to the second before either transaction commits.  Returns the
+    claimed rows (already written; caller must commit).
+    """
+    rows = session.execute(text(f"""
+        UPDATE owners
+           SET contact_refresh_status  = 'queued',
+               contact_next_refresh_at = NOW() + INTERVAL '30 minutes'
+         WHERE id IN (
+             SELECT o.id
+             FROM owners o
+             JOIN properties p ON p.id = o.property_id
+             {_CANDIDATE_WHERE}
+             ORDER BY o.id
+             LIMIT :limit
+             FOR UPDATE OF o SKIP LOCKED
+         )
+        RETURNING id AS owner_id, property_id, county_id
     """), {"county_id": county_id, "limit": limit}).fetchall()
     return rows
 
@@ -268,9 +298,9 @@ def run_once(
     Single enrichment pass for one county. Called by cron every 10 minutes.
 
     Flow:
-      1. Reset any owners stuck in 'queued' from a prior crashed run
-      2. Fetch up to `limit` eligible Gold+ owners
-      3. Claim all of them ('queued') to prevent parallel-run overlap
+      1. Reset any owners stuck in 'queued' from a prior crashed run (skipped in dry-run)
+      2+3. Atomically fetch + claim up to `limit` eligible Gold+ owners via
+           FOR UPDATE SKIP LOCKED (dry-run uses read-only fetch, no claim)
       4. Seed phones from voters table (free)
       5. DNC-filter voter-seeded phones
       6. Voter-seeded + DNC-cleared  → emit enrichment.completed, mark 'fresh'
@@ -297,35 +327,33 @@ def run_once(
     owner_ids_claimed: list = []
 
     try:
-        # ── Step 1: self-heal ─────────────────────────────────────────────────
-        with get_db_context() as session:
-            _reset_stuck_queued(session, county_id)
-            session.commit()
+        # ── Step 1: self-heal (skipped in dry-run — no writes allowed) ────────
+        if not dry_run:
+            with get_db_context() as session:
+                _reset_stuck_queued(session, county_id)
+                session.commit()
 
-        # ── Step 2: fetch candidates ──────────────────────────────────────────
+        # ── Steps 2+3: fetch candidates and claim atomically ──────────────────
+        # dry-run uses the read-only path; normal mode atomically selects and
+        # marks rows 'queued' in one statement (FOR UPDATE SKIP LOCKED) so two
+        # concurrent invocations can never claim the same owner.
         with get_db_context() as session:
-            rows = _fetch_candidates(session, county_id, limit)
+            if dry_run:
+                rows = _fetch_candidates(session, county_id, limit)
+            else:
+                rows = _fetch_and_claim_candidates(session, county_id, limit)
+                session.commit()
 
         if not rows:
             logger.info("[EnrichmentLoop] No candidates for county=%s", county_id)
             return stats
 
         stats["candidates"] = len(rows)
-        owner_ids_claimed   = [r.owner_id for r in rows]
+        owner_ids_claimed   = [] if dry_run else [r.owner_id for r in rows]
 
         logger.info(
             "[EnrichmentLoop] %d candidates in county=%s", len(rows), county_id
         )
-
-        # ── Step 3: claim all candidates to prevent parallel overlap ──────────
-        with get_db_context() as session:
-            session.execute(text("""
-                UPDATE owners
-                   SET contact_refresh_status  = 'queued',
-                       contact_next_refresh_at = NOW() + INTERVAL '30 minutes'
-                 WHERE id = ANY(:ids)
-            """), {"ids": owner_ids_claimed})
-            session.commit()
 
         # ── Step 4: voter seeding (free) ──────────────────────────────────────
         seeded_ids: set = set()
