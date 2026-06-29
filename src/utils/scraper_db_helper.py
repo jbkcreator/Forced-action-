@@ -25,6 +25,8 @@ from src.loaders import (
     LisPendensLoader,
     DivorceLoader,
 )
+from src.loaders.tax_deed import TaxDeedAuctionLoader
+from src.loaders.vacant_land import VacantParcelLoader
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +59,8 @@ DATA_TYPE_TO_SOURCE = {
     'tax':              'tax_delinquencies',
     'lis_pendens':      'lis_pendens',
     'divorce_filings':  'divorce_filings',
+    'tax_deed_auction': 'tax_deed_auction',
+    'vacant_land':      'vacant_land',
 }
 
 
@@ -73,6 +77,8 @@ LOADER_MAP = {
     'bankruptcy':       BankruptcyLoader,
     'tax':              TaxDelinquencyLoader,
     'divorce_filings':  DivorceLoader,
+    'tax_deed_auction': TaxDeedAuctionLoader,
+    'vacant_land':      VacantParcelLoader,
 }
 
 

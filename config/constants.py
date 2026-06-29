@@ -41,6 +41,8 @@ RAW_JUDGMENTS_DIR = RAW_DATA_DIR / "judgments"
 RAW_DEEDS_DIR = RAW_DATA_DIR / "deeds"
 RAW_FIRE_DIR = RAW_DATA_DIR / "fire"
 RAW_DIVORCE_DIR = RAW_DATA_DIR / "divorce"
+RAW_TAX_DEED_DIR = RAW_DATA_DIR / "tax_deed_auctions"
+RAW_VACANT_LAND_DIR = RAW_DATA_DIR / "vacant_land"
 
 # Temporary download directory for browser-use (cross-platform)
 TEMP_DOWNLOADS_DIR = Path(tempfile.gettempdir())
