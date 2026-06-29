@@ -31,6 +31,8 @@ DDL = [
     """,
     "CREATE INDEX IF NOT EXISTS ix_enrichment_anomaly_log_provider ON enrichment_anomaly_log (provider)",
     "CREATE INDEX IF NOT EXISTS ix_enrichment_anomaly_log_detected_at ON enrichment_anomaly_log (detected_at)",
+    # Idempotency marker for the degraded-batch discount (each hit discounted once).
+    "ALTER TABLE enrichment_usage_logs ADD COLUMN IF NOT EXISTS quality_discounted BOOLEAN NOT NULL DEFAULT FALSE",
 ]
 
 

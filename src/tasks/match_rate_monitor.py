@@ -74,14 +74,23 @@ def recent_hit_rate(db, provider, hours):
 
 
 def apply_degraded_discount(db, provider, hours, multiplier):
-    """Haircut the quality rating of a degraded provider's batch.
+    """Haircut the quality rating of a degraded provider's batch — idempotently.
 
     Multiplies owners.contact_info_confidence_score (the column CDS reads) by
-    `multiplier` for every paid hit this provider produced inside the window,
-    so a degraded batch can't poison scoring. Returns the number of owner rows
-    discounted. Batch/window-scoped, not per-lead."""
+    `multiplier`, once, for each owner whose paid hit from this provider in the
+    window has not already been discounted. Each processed hit is marked
+    (enrichment_usage_logs.quality_discounted) so a multi-day degradation never
+    re-discounts the same rows and ratchets scores toward zero. The discount
+    lifts naturally when the owner is later re-enriched — triangulation/
+    contact_freshness recomputes contact_info_confidence_score from scratch.
+    Returns the number of owner rows discounted this run. Batch/window-scoped."""
     from sqlalchemy import text
 
+    params = {
+        "mult": multiplier,
+        "vendor": provider,
+        "cutoff": datetime.now(timezone.utc) - timedelta(hours=hours),
+    }
     result = db.execute(
         text(
             """
@@ -89,22 +98,35 @@ def apply_degraded_discount(db, provider, hours, multiplier):
             SET contact_info_confidence_score = contact_info_confidence_score * :mult
             WHERE contact_info_confidence_score IS NOT NULL
               AND property_id IN (
-                  SELECT eul.property_id
+                  SELECT DISTINCT eul.property_id
                   FROM enrichment_usage_logs eul
                   WHERE eul.vendor = :vendor
                     AND eul.success = TRUE
                     AND eul.property_id IS NOT NULL
                     AND eul.created_at >= :cutoff
+                    AND eul.quality_discounted = FALSE
               )
             """
         ),
-        {
-            "mult": multiplier,
-            "vendor": provider,
-            "cutoff": datetime.now(timezone.utc) - timedelta(hours=hours),
-        },
+        params,
     )
-    return result.rowcount
+    affected = result.rowcount
+    # Mark every processed hit so a later cycle can't re-discount these owners.
+    db.execute(
+        text(
+            """
+            UPDATE enrichment_usage_logs
+            SET quality_discounted = TRUE
+            WHERE vendor = :vendor
+              AND success = TRUE
+              AND property_id IS NOT NULL
+              AND created_at >= :cutoff
+              AND quality_discounted = FALSE
+            """
+        ),
+        params,
+    )
+    return affected
 
 
 def _alerted_recently(db, provider, cooldown_hours):

@@ -3342,6 +3342,10 @@ class EnrichmentUsageLog(Base):
     error: Mapped[Optional[str]] = mapped_column(String(255))
     request_ref: Mapped[Optional[str]] = mapped_column(String(100))               # vendor request id, batch id, etc.
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+    # A4: set once this hit's owner has had its quality rating discounted due to
+    # a degraded-provider event, so a multi-day degradation never re-discounts
+    # the same rows (idempotency guard for apply_degraded_discount).
+    quality_discounted: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
 
     __table_args__ = (
         Index("idx_enrichment_purpose_created", "purpose", "created_at"),

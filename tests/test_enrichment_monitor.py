@@ -203,6 +203,21 @@ class TestApplyDegradedDiscount:
         assert float(score(p1)) == pytest.approx(0.400)   # 0.800 * 0.5
         assert float(score(p3)) == pytest.approx(0.900)   # out of window, unchanged
 
+    def test_discount_is_idempotent_across_runs(self, fresh_db):
+        # A multi-day degradation re-runs the discount after each cooldown — the
+        # same owner must NOT be re-discounted (no ratcheting toward zero).
+        vendor = "test_a4_idem"
+        when = datetime.now(timezone.utc) - timedelta(hours=1)
+        pid = _hit_with_owner(fresh_db, vendor, 0.800, when, "A4-IDEM-1")
+
+        first = apply_degraded_discount(fresh_db, vendor, hours=48, multiplier=0.5)
+        second = apply_degraded_discount(fresh_db, vendor, hours=48, multiplier=0.5)
+
+        assert first == 1
+        assert second == 0   # already discounted → nothing to do on the re-run
+        score = fresh_db.query(Owner).filter(Owner.property_id == pid).one().contact_info_confidence_score
+        assert float(score) == pytest.approx(0.400)   # 0.800 × 0.5 once, NOT 0.20
+
 
 # ── Admin endpoint: GET /api/admin/enrichment-health ────────────────────────
 
