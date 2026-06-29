@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Competitor Benchmark — {{ generated_on }}</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 32px; color: #1a1a1a; }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .meta { color: #666; font-size: 13px; margin-bottom: 24px; }
+  table { border-collapse: collapse; width: 100%; margin-bottom: 28px; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #eee; }
+  th { background: #fafafa; font-weight: 600; }
+  .strong { color: #b00020; font-weight: 600; }
+  .soft { color: #b26a00; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; }
+  .pill.strong { background: #fdecef; }
+  .pill.soft { background: #fff4e5; }
+  .empty { color: #888; font-style: italic; }
+  .warn { color: #b26a00; font-size: 12px; }
+</style>
+</head>
+<body>
+  <h1>Competitor Benchmark — High-Margin Targets</h1>
+  <div class="meta">
+    {{ generated_on }} · scanned {{ scanned }} competitor rows · {{ targets|length }} targets
+    {% if errors %}· <span class="warn">{{ errors|length }} adapter error(s)</span>{% endif %}
+  </div>
+
+  <h3>Our Rate Card</h3>
+  <table>
+    <tr><th>Product</th><th>Rate</th><th>Max LTV</th><th>Points</th><th>Prepay</th></tr>
+    {% for p, t in rate_card.items() %}
+    <tr><td>{{ p }}</td><td>{{ t.rate }}%</td><td>{{ t.max_ltv }}%</td>
+        <td>{{ t.points if t.points is not none else '—' }}</td>
+        <td>{{ t.prepay or '—' }}</td></tr>
+    {% endfor %}
+  </table>
+
+  <h3>High-Margin Targets</h3>
+  <table>
+    <tr><th>Lender</th><th>Product</th><th>Region</th><th>Status</th>
+        <th>Rate Δ (bps)</th><th>LTV Δ (pts)</th><th>Their Rate</th><th>Their Max LTV</th></tr>
+    {% for t in targets %}
+    <tr>
+      <td>{{ t.lender }}</td><td>{{ t.product }}</td><td>{{ t.region or 'FL-statewide' }}</td>
+      <td><span class="pill {{ t.status }}">{{ t.status|upper }}</span></td>
+      <td>{{ t.rate_delta_bps if t.rate_delta_bps is not none else '—' }}</td>
+      <td>{{ t.ltv_delta_pts if t.ltv_delta_pts is not none else '—' }}</td>
+      <td>{{ t.competitor_rate if t.competitor_rate is not none else '—' }}</td>
+      <td>{{ t.competitor_max_ltv if t.competitor_max_ltv is not none else '—' }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="8" class="empty">No high-margin targets — no competitor is clearly worse than our terms.</td></tr>
+    {% endfor %}
+  </table>
+</body>
+</html>

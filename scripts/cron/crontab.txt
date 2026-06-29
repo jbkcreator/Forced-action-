@@ -460,6 +460,12 @@ COUNTY_ID=hillsborough
 # Outputs to reports/contractor_benchmark/. Flags AP upsell + AP Pro candidates.
 0 11 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.contractor_benchmark_report
 
+# Task 4.8 — Competitor Benchmark & Rate-Sheet Sweep — Monday 11:30 UTC.
+# Scrapes curated FL DSCR/private lender pages, persists competitor_rate_sheets,
+# flags high-margin targets vs forced_action_lender_terms. National lenders → no
+# --county-id. ~50 hardmoneyhome profile fetches, weekly cadence.
+30 11 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.competitor_benchmark_sweep
+
 # Supplier Intelligence Foundation — monthly reports, 1st of month 08:00 UTC.
 # Generates, renders PDF, and emails report to every active/trialing supplier account.
 # Idempotent: skips accounts already reported this calendar month.

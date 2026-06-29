@@ -144,6 +144,7 @@ SOFT_LAUNCH_RULES = {
     "scraper_duplicate_rate_high",
     "scraper_field_coverage_drop",
     "scraper_filing_date_not_advancing",
+    "parse_match_rate_drop",
 }
 
 
@@ -564,6 +565,79 @@ def _rule_scraper_filing_date_not_advancing(session, today: date) -> Iterable[Tr
         )
 
 
+PARSE_MATCH_RATE_MIN_SAMPLE = 20    # matched+unmatched today before the ratio is meaningful
+PARSE_MATCH_RATE_MIN_BASELINE = 0.30  # ignore sources whose normal match rate is already low
+
+
+def _rule_parse_match_rate_drop(session, today: date) -> Iterable[Trip]:
+    """A public-record parser silently degraded: today's match rate
+    (matched / matched+unmatched) for a source fell <60% of its 7-day average.
+
+    Catches the case the volume rule misses — total_scraped looks normal but the
+    parser stopped extracting usable fields, so records no longer match a
+    property. Per source_type, aggregated across counties (like the volume rule).
+    """
+    def _rate_rows(start, end):
+        return session.query(
+            ScraperRunStats.source_type,
+            func.coalesce(func.sum(ScraperRunStats.matched), 0),
+            func.coalesce(func.sum(ScraperRunStats.unmatched), 0),
+        ).filter(
+            ScraperRunStats.run_date >= start,
+            ScraperRunStats.run_date < end,
+        ).group_by(ScraperRunStats.source_type).all()
+
+    # Today's per-source match rate.
+    today_rows = session.query(
+        ScraperRunStats.source_type,
+        func.coalesce(func.sum(ScraperRunStats.matched), 0),
+        func.coalesce(func.sum(ScraperRunStats.unmatched), 0),
+    ).filter(ScraperRunStats.run_date == today).group_by(ScraperRunStats.source_type).all()
+
+    since = today - timedelta(days=7)
+    # Baseline: average of each prior day's per-source match rate.
+    hist_by_day = session.query(
+        ScraperRunStats.source_type,
+        ScraperRunStats.run_date,
+        func.coalesce(func.sum(ScraperRunStats.matched), 0),
+        func.coalesce(func.sum(ScraperRunStats.unmatched), 0),
+    ).filter(
+        ScraperRunStats.run_date >= since,
+        ScraperRunStats.run_date < today,
+    ).group_by(ScraperRunStats.source_type, ScraperRunStats.run_date).all()
+
+    day_rates: dict[str, list] = defaultdict(list)
+    for source_type, _d, matched, unmatched in hist_by_day:
+        total = (matched or 0) + (unmatched or 0)
+        if total > 0:
+            day_rates[source_type].append((matched or 0) / total)
+
+    for source_type, matched, unmatched in today_rows:
+        total = (matched or 0) + (unmatched or 0)
+        if total < PARSE_MATCH_RATE_MIN_SAMPLE:
+            continue
+        rates = day_rates.get(source_type, [])
+        if len(rates) < 3:
+            continue
+        baseline = sum(rates) / len(rates)
+        if baseline < PARSE_MATCH_RATE_MIN_BASELINE:
+            continue
+        today_rate = (matched or 0) / total
+        if today_rate < 0.6 * baseline:
+            yield Trip(
+                rule="parse_match_rate_drop",
+                observed=f"{today_rate:.1%} ({source_type})",
+                baseline=f"{baseline:.1%} 7d avg",
+                threshold="< 60% of 7d avg",
+                context={
+                    "source_type": source_type,
+                    "matched": int(matched or 0),
+                    "unmatched": int(unmatched or 0),
+                    "date": str(today),
+                },
+            )
+
+
 _RULES = (
     _rule_scraper_volume_drop,
     _rule_gold_plus_volume_drop,
@@ -572,6 +646,7 @@ _RULES = (
     _rule_scraper_duplicate_rate,
     _rule_scraper_field_coverage_drop,
     _rule_scraper_filing_date_not_advancing,
+    _rule_parse_match_rate_drop,
 )
 
 
