@@ -267,14 +267,23 @@ COUNTY_ID=hillsborough
 # reviewed rows. Runs daily 08:20 UTC Mon-Sat, after GHL sync (08:00) so
 # corrections don't wait for the weekly review to land in the dataset.
 20 8 * * 1-6 $PROJECT/scripts/cron/run.sh src.services.feedback_ritual_export
-# ── ENRICHMENT RECONCILIATION SWEEP (ADR 0016) ───────────────
-# Skip Tracing — 07:30 AM UTC Mon-Sat, after CDS scoring (07:00), before GHL sync (08:00).
-# Backstop for the event-driven enrichment consumer: gold_lead_scored events ride
-# Redis Pub/Sub (transient), so any dropped while the agents listener is down/restarting
-# would never get enriched. This sweep re-runs run_cascade() over today's un-enriched
-# Gold+ leads to catch them. Tracerfy → Address-Only → BatchData → IDI → PDL.
-# 30 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.run_enrichment hillsborough
-# 31 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.run_enrichment pinellas
+# ── ENRICHMENT BACKGROUND LOOP (Sprint 4.5) ──────────────────────────────────
+# Continuous skip-trace loop — every 10 min, Mon-Sat, 07:00-23:59 UTC.
+# Polls for newly scored Gold+ properties, seeds free voter-registry phones,
+# DNC-filters seeded contacts, then cascades remaining leads through the paid
+# waterfall (Tracerfy → Address-Only → BatchData → IDI → PDL).
+# Batch size 50/run = up to 144 batches/day per county.
+# is_guess_lead=TRUE leads are skipped (A2 gate: low-confidence, direct-mail path).
+*/10 7-23 * * 1-6 $PROJECT/scripts/cron/run.sh src.services.enrichment_background_loop hillsborough --limit 50
+*/10 7-23 * * 1-6 $PROJECT/scripts/cron/run.sh src.services.enrichment_background_loop pinellas --limit 50
+
+# ── ENRICHMENT RECONCILIATION SWEEP (ADR 0016) ───────────────────────────────
+# Nightly backstop — 07:30 AM UTC Mon-Sat. Catches any Gold+ leads missed by the
+# background loop (e.g. loop was down, leads scored during 00:00-07:00 scraper
+# window). Skips owners already claimed by the loop (contact_refresh_status='queued').
+# Tracerfy → Address-Only → BatchData → IDI → PDL.
+30 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.run_enrichment hillsborough
+31 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.run_enrichment pinellas
 
 # ── FINANCING INTENT SCORING (Sprint S1) ─────────────────────
 # Scores properties for hard-money / bridge / renovation / refinance intent.
