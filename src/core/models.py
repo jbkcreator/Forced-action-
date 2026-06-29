@@ -6810,12 +6810,15 @@ class Broker(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
 
     __table_args__ = (
         CheckConstraint("role = 'broker'", name="ck_brokers_role"),
     )
+
+    def __repr__(self) -> str:
+        return f"<Broker(broker_id={self.broker_id!r}, email={self.email!r}, active={self.is_active})>"
 
 
 class Lender(Base):
@@ -6923,6 +6926,7 @@ class BrokerTransition(Base):
         ),
         Index("idx_bt_lane_id", "lane_id"),
         Index("idx_bt_prospect_id", "prospect_id"),
+        Index("idx_bt_broker_id", "broker_id"),
         Index("idx_bt_lane_occurred", "lane_id", "occurred_at"),
     )
 
