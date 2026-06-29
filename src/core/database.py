@@ -100,13 +100,7 @@ class Database:
         """
         Base.metadata.create_all(bind=self._engine)
 
-    def drop_all_tables(self) -> None:
-        """
-        Drop all tables from the database.
-        WARNING: This will delete all data! Use with extreme caution.
-        """
-        Base.metadata.drop_all(bind=self._engine)
-
+        
     def get_session(self) -> Session:
         """
         Get a new database session.

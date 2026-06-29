@@ -1,0 +1,14 @@
+{
+  "mortgage_rate_30yr": {
+    "source": "fred",
+    "series_id": "MORTGAGE30US",
+    "signal_key": "mortgage_rate_30yr",
+    "high_rate_threshold": 6.5,
+    "max_multiplier": 1.15,
+    "affected_signals": {
+      "foreclosures": 1.10,
+      "tax_delinquencies": 1.08,
+      "loan_lane_refi_risk": 1.15
+    }
+  }
+}

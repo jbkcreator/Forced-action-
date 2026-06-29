@@ -6620,49 +6620,56 @@ class ScoreFeedback(Base):
         )
 
 
-class StreamDiagnostics(Base):
-    """Daily stream-health diagnostic log (fa101).
+# ============================================================================
+# A7 — Macro Signal
+# ============================================================================
 
-    One open episode per (county_id, metric_name) breach — opened at 3-day streak,
-    updated daily, closed on recovery. Observe-only; auto-actions live in cora_self_healing.
+class MacroSignal(Base):
+    """External macroeconomic signal (FRED, FHFA, BLS, Census ACS5).
+
+    One row per (source, signal_key, source_series_id, observed_at,
+    geography_scope, geography_id) observation. Upserted idempotently.
     """
+    __tablename__ = "macro_signals"
 
-    __tablename__ = "stream_diagnostics"
-
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    county_id: Mapped[str] = mapped_column(String(50), nullable=False)
-    stream: Mapped[str] = mapped_column(String(50), nullable=False)
-    metric_name: Mapped[str] = mapped_column(String(64), nullable=False)
-    severity: Mapped[str] = mapped_column(String(16), nullable=False)
-    observed_value: Mapped[Decimal] = mapped_column(Numeric(10, 4), nullable=False)
-    target_value: Mapped[Decimal] = mapped_column(Numeric(10, 4), nullable=False)
-    baseline_value: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 4), nullable=True)
-    days_below: Mapped[int] = mapped_column(Integer, nullable=False)
-    category: Mapped[str] = mapped_column(String(64), nullable=False)
-    trend_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    recommendations: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
-    detected_on: Mapped[date] = mapped_column(Date, nullable=False)
-    resolved_on: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=text("NOW()")
+    id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=False),
+        primary_key=True,
+        server_default=text("generate_uuidv7()"),
     )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=text("NOW()")
+    source:            Mapped[str] = mapped_column(String(30), nullable=False)
+    signal_key:        Mapped[str] = mapped_column(String(80), nullable=False)
+    source_series_id:  Mapped[str] = mapped_column(String(120), nullable=False)
+    value:             Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False)
+    unit:              Mapped[str] = mapped_column(String(30), nullable=False)
+    observed_at:       Mapped[date] = mapped_column(Date, nullable=False)
+    frequency:         Mapped[str] = mapped_column(String(20), nullable=False)
+    geography_scope:   Mapped[str] = mapped_column(String(50), nullable=False)
+    geography_id:      Mapped[str] = mapped_column(String(30), nullable=False)
+    raw_payload:       Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    created_at:        Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at:        Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), onupdate=func.now()
     )
 
     __table_args__ = (
-        CheckConstraint("severity IN ('yellow','red')", name="ck_stream_diag_severity"),
-        UniqueConstraint("county_id", "metric_name", "detected_on", name="uq_stream_diag_episode"),
-        Index(
-            "idx_stream_diag_open",
-            "county_id",
-            "metric_name",
-            postgresql_where=text("resolved_on IS NULL"),
+        UniqueConstraint(
+            "source", "signal_key", "source_series_id",
+            "observed_at", "geography_scope", "geography_id",
+            name="uq_macro_signal_observation",
         ),
+        Index("ix_macro_signals_source", "source"),
+        Index("ix_macro_signals_signal_key", "signal_key"),
+        Index("ix_macro_signals_observed_at", "observed_at"),
+        Index("ix_macro_signals_source_key_date", "source", "signal_key", "observed_at"),
+        Index("ix_macro_signals_geo", "geography_scope", "geography_id"),
+        Index("ix_macro_signals_source_geo", "source", "geography_scope", "geography_id"),
     )
 
     def __repr__(self) -> str:
         return (
-            f"<StreamDiagnostics(county={self.county_id!r}, metric={self.metric_name!r}, "
-            f"severity={self.severity!r}, detected_on={self.detected_on})>"
+            f"<MacroSignal(source={self.source!r}, key={self.signal_key!r}, "
+            f"geo={self.geography_id!r}, obs={self.observed_at})>"
         )

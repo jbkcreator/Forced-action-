@@ -22,6 +22,10 @@ class AppSettings(BaseSettings):
 	anthropic_api_key: SecretStr = Field(..., env="ANTHROPIC_API_KEY")
 	firecrawl_api_key: SecretStr = Field(..., env="FIRECRAWL_API_KEY")
 	court_listener_api_key: SecretStr = Field(..., env="COURT_LISTENER_API_KEY")
+	# FRED (Federal Reserve Economic Data) — free key at https://fred.stlouisfed.org/docs/api/api_key.html
+	fred_api_key: Optional[SecretStr] = Field(default=None, env="FRED_API_KEY")
+	# Census Bureau ACS API — free key at https://api.census.gov/data/key_signup.html
+	census_api_key: Optional[SecretStr] = Field(default=None, env="CENSUS_API_KEY")
 
 	# Property-matching LLM tiebreak. When False, borderline name matches
 	# (rapidfuzz 80-94) are NOT sent to Claude; matching falls back to pure

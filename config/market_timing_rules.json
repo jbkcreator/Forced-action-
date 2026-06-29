@@ -1,0 +1,62 @@
+{
+  "version": "1.0",
+  "description": "Market timing multipliers for Sprint 4.7 Phase 3 CDS integration. Not active until Phase 3 wires market_timing_config.py into cds_engine.py. Pressure labels match market_pressure_service.py output.",
+  "signals": {
+    "mortgage_rate_30yr": {
+      "source": "fred",
+      "signal_key": "mortgage_rate_30yr",
+      "geography_scope": "national",
+      "geography_id": "US",
+      "max_multiplier": 1.15,
+      "pressure_multipliers": {
+        "elevated": {
+          "foreclosures": 1.05,
+          "tax_delinquencies": 1.04,
+          "loan_lane_refi_risk": 1.08
+        },
+        "high": {
+          "foreclosures": 1.10,
+          "tax_delinquencies": 1.08,
+          "loan_lane_refi_risk": 1.15
+        }
+      }
+    },
+    "house_price_index": {
+      "source": "fhfa",
+      "signal_key": "house_price_index",
+      "geography_scope": "metro",
+      "geography_id": "county_msa_proxy",
+      "max_multiplier": 1.15,
+      "pressure_multipliers": {
+        "elevated": {
+          "foreclosures": 1.06,
+          "tax_delinquencies": 1.05,
+          "loan_lane_refi_risk": 1.08
+        },
+        "high": {
+          "foreclosures": 1.12,
+          "tax_delinquencies": 1.10,
+          "loan_lane_refi_risk": 1.15
+        }
+      }
+    },
+    "county_unemployment_rate": {
+      "source": "bls",
+      "signal_key": "county_unemployment_rate",
+      "geography_scope": "county",
+      "geography_id": "county_fips",
+      "max_multiplier": 1.10,
+      "pressure_multipliers": {
+        "rising": {
+          "foreclosures": 1.04,
+          "tax_delinquencies": 1.05
+        },
+        "elevated": {
+          "foreclosures": 1.08,
+          "tax_delinquencies": 1.10,
+          "evictions": 1.05
+        }
+      }
+    }
+  }
+}
