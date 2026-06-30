@@ -301,20 +301,24 @@ def assign_broker_initial(
     db: Session = Depends(get_db),
     _admin: dict = Depends(get_current_admin),
 ):
-    """Initial broker assignment — 409 if lane is already assigned."""
-    row = db.execute(
-        sa_text("SELECT assigned_broker_id FROM lanes WHERE lane_id = CAST(:lid AS uuid)"),
-        {"lid": lane_id},
-    ).fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail="Lane not found.")
-    if row.assigned_broker_id is not None:
-        raise HTTPException(status_code=409, detail="Lane is already assigned to a broker.")
+    """Initial broker assignment — routes through the state machine so broker_transitions
+    and audit events are written consistently with the broker self-claim flow.
+    409 if lane is already assigned or lane/broker is invalid.
+    """
+    from src.services.broker_state_machine import (
+        assign_broker,
+        BrokerNotFound,
+        BrokerInactive,
+    )
+    try:
+        claimed = assign_broker(db, lane_id, body.broker_id, actor="admin")
+    except BrokerNotFound:
+        raise HTTPException(status_code=404, detail="Broker not found.")
+    except BrokerInactive:
+        raise HTTPException(status_code=409, detail="Broker account is inactive.")
 
-    from src.services.loan_lane_service import claim_lane
-    claimed = claim_lane(db, lane_id, body.broker_id)
     if not claimed:
-        raise HTTPException(status_code=409, detail="Lane could not be assigned.")
+        raise HTTPException(status_code=409, detail="Lane is already assigned or not available.")
 
     return {"lane_id": lane_id, "assigned_broker_id": body.broker_id}
 

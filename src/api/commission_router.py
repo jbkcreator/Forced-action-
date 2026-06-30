@@ -63,7 +63,12 @@ def _serialize_entry(row) -> dict:
 
 
 def _resolve_auth(credentials: Optional[HTTPAuthorizationCredentials]) -> tuple[bool, str | None]:
-    """Decode the bearer token; return (is_admin, broker_id)."""
+    """Decode the bearer token; return (is_admin, broker_id).
+
+    Broker tokens are verified with BROKER_JWT_SECRET (type must be broker_access).
+    Admin tokens are verified with ADMIN_JWT_SECRET. A token that decodes under
+    one secret but carries the wrong type is rejected with 401.
+    """
     from jose import JWTError, jwt
     from config.settings import get_settings
 
@@ -71,16 +76,28 @@ def _resolve_auth(credentials: Optional[HTTPAuthorizationCredentials]) -> tuple[
         raise HTTPException(status_code=401, detail="Authentication required.")
 
     token = credentials.credentials
-    settings = get_settings()
-    secret = settings.admin_jwt_secret.get_secret_value() if settings.admin_jwt_secret else ""
+    s = get_settings()
 
+    # Broker path — requires BROKER_JWT_SECRET and broker_access type
+    broker_secret = s.broker_jwt_secret
+    if broker_secret:
+        try:
+            payload = jwt.decode(token, broker_secret.get_secret_value(), algorithms=["HS256"])
+            if payload.get("type") == "broker_access":
+                return False, payload.get("sub")
+        except JWTError:
+            pass
+
+    # Admin path — decode with ADMIN_JWT_SECRET; reject if it carries a broker type
+    admin_secret = s.admin_jwt_secret.get_secret_value() if s.admin_jwt_secret else ""
     try:
-        payload = jwt.decode(token, secret, algorithms=["HS256"])
+        payload = jwt.decode(token, admin_secret, algorithms=["HS256"])
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired token.")
 
     if payload.get("type") == "broker_access":
-        return False, payload.get("sub")
+        raise HTTPException(status_code=401, detail="Invalid token type.")
+
     return True, None
 
 
