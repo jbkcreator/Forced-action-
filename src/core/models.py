@@ -15,6 +15,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Integer,
     LargeBinary as sa_LargeBinary,
     Numeric,
@@ -6765,6 +6766,225 @@ class ForcedActionLenderTerms(Base):
 
 
 # ============================================================================
+# LOAN LANE CORE & BROKER STATE MACHINE (Sprint S1)
+# ============================================================================
+
+class LaneStageConfig(Base):
+    """Config-as-data lane stage definitions. One row per (lane_type, stage_key).
+
+    Editable with no deploy. `allowed_next` is the legal next-stage set;
+    `sms_allowed` gates SMS automation on that stage.
+    """
+
+    __tablename__ = "lane_stage_config"
+
+    lane_type: Mapped[str] = mapped_column(String(50), primary_key=True)
+    stage_key: Mapped[str] = mapped_column(String(50), primary_key=True)
+    display_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    order_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    allowed_next: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    sms_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+
+
+class Broker(Base):
+    """A logged-in platform user (role='broker') who works assigned Loan Lanes.
+
+    Modeled on white_label_users. Self-records work-state transitions; sees only
+    own lanes (RBAC). Distinct from the config funding_broker_terms rate config.
+    """
+
+    __tablename__ = "brokers"
+
+    broker_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=text("generate_uuidv7()")
+    )
+    email: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    password_hash: Mapped[Optional[str]] = mapped_column(String(255))
+    role: Mapped[str] = mapped_column(String(20), nullable=False, server_default=text("'broker'"))
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    reset_token: Mapped[Optional[str]] = mapped_column(String(64), index=True)
+    reset_token_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_login_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("role = 'broker'", name="ck_brokers_role"),
+    )
+
+
+class Lender(Base):
+    """Admin-curated lender reference used by Loan Lane deal tracking."""
+
+    __tablename__ = "lenders"
+
+    lender_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=text("generate_uuidv7()")
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    is_cleared: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class Lane(Base):
+    """Loan Lane funnel record — one per prospect routed to loan_lane channel."""
+
+    __tablename__ = "lanes"
+
+    lane_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=text("generate_uuidv7()")
+    )
+    prospect_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("prospects.prospect_id"), nullable=False
+    )
+    lane_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    loan_program: Mapped[Optional[str]] = mapped_column(String(50))
+    current_stage: Mapped[str] = mapped_column(String(50), nullable=False)
+    outcome: Mapped[str] = mapped_column(
+        String(50), nullable=False, server_default=text("'open'")
+    )
+    assigned_broker_id: Mapped[Optional[str]] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("brokers.broker_id")
+    )
+    lender_id: Mapped[Optional[str]] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("lenders.lender_id")
+    )
+    claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_activity_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    fee_config_flag: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    entered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["lane_type", "current_stage"],
+            ["lane_stage_config.lane_type", "lane_stage_config.stage_key"],
+            name="fk_lanes_stage_config",
+        ),
+        CheckConstraint(
+            "outcome IN ('open','funded','dead','recycled')",
+            name="ck_lanes_outcome",
+        ),
+        Index("idx_lanes_prospect_id", "prospect_id"),
+        Index("idx_lanes_open", "outcome", postgresql_where=text("outcome = 'open'")),
+        Index("idx_lanes_broker", "assigned_broker_id"),
+    )
+
+
+class BrokerTransition(Base):
+    """Append-only broker work-state audit log. Latest row's to_state is current state."""
+
+    __tablename__ = "broker_transitions"
+
+    transition_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=text("generate_uuidv7()")
+    )
+    lane_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("lanes.lane_id"), nullable=False
+    )
+    prospect_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("prospects.prospect_id"), nullable=False
+    )
+    broker_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("brokers.broker_id"), nullable=False
+    )
+    from_state: Mapped[str] = mapped_column(String(50), nullable=False)
+    to_state: Mapped[str] = mapped_column(String(50), nullable=False)
+    reason_code: Mapped[str] = mapped_column(String(100), nullable=False)
+    actor: Mapped[str] = mapped_column(String(255), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "to_state IN ('unassigned','assigned','working','quoted','committed','closed_won','closed_lost')",
+            name="ck_bt_to_state",
+        ),
+        Index("idx_bt_lane_id", "lane_id"),
+        Index("idx_bt_prospect_id", "prospect_id"),
+        Index("idx_bt_lane_occurred", "lane_id", "occurred_at"),
+    )
+
+
+class CommissionSplit(Base):
+    """Config-as-data commission allocation. `parties` is a list of {party, pct}."""
+
+    __tablename__ = "commission_splits"
+
+    split_config_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    parties: Mapped[list] = mapped_column(JSONB, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+
+
+class CommissionLedgerEntry(Base):
+    """Append-only broker-earnings ledger. One row per closed_won transition.
+
+    `gross_amount_cents` is manually entered at close; `net_lines` is the gross
+    allocated per the CommissionSplit. Never UPDATEd except status; disputes post
+    a new offsetting entry. Tracks what brokers EARN — never Stripe billing.
+    """
+
+    __tablename__ = "commission_ledger"
+
+    entry_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, server_default=text("generate_uuidv7()")
+    )
+    prospect_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("prospects.prospect_id"), nullable=False
+    )
+    lane_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("lanes.lane_id"), nullable=False
+    )
+    broker_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("brokers.broker_id"), nullable=False
+    )
+    trigger_transition_id: Mapped[Optional[str]] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("broker_transitions.transition_id"),
+        nullable=True, unique=True,
+    )
+    gross_amount_cents: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    split_config_id: Mapped[str] = mapped_column(
+        String(100), ForeignKey("commission_splits.split_config_id"), nullable=False
+    )
+    net_lines: Mapped[list] = mapped_column(JSONB, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default=text("'posted'")
+    )
+    posted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint("gross_amount_cents >= 0", name="ck_cl_gross_nonneg"),
+        CheckConstraint(
+            "status IN ('posted','disputed','reconciled')", name="ck_cl_status"
+        ),
+        Index("idx_cl_lane_id", "lane_id"),
+        Index("idx_cl_broker_id", "broker_id"),
+    )
 # TAX DEED AUCTIONS  (fa103)
 # ============================================================================
 
