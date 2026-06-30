@@ -4,6 +4,7 @@ Covers broker identity: create, list, get, activate/deactivate.
 Lane assignment and transitions are Layer 2 (broker_transitions).
 """
 import secrets
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import text as sa_text
@@ -42,6 +43,7 @@ def create_broker(
         role="broker",
         is_active=True,
         reset_token=secrets.token_urlsafe(32),
+        reset_token_expires_at=datetime.now(timezone.utc) + timedelta(days=30),
     )
     db.add(broker)
     db.flush()

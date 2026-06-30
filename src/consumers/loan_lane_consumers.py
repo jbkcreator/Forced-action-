@@ -1,12 +1,14 @@
 """Event consumers for the Loan Lane domain — Layer 3E.
 
 Handlers for:
-  broker.transition  → handle_lane_closer    (terminal states → set_lane_outcome)
+  broker.transition  → handle_lane_closer      (terminal states → set_lane_outcome)
   broker.transition  → handle_commission_poster (closed_won → post_commission)
-  truth.verdict      → handle_truth_verdict  (routed_channel=loan_lane → enter_lane)
+
+Lanes are Financing Intent only — seeded from financing_intent_scores via
+property_id. There is no CDS/truth_verdict → lane path.
 
 All handlers are idempotent. They receive a row-like object with
-``event_id``, ``prospect_id``, and ``payload`` attributes.
+``event_id`` and ``payload`` attributes.
 """
 from __future__ import annotations
 
@@ -15,18 +17,6 @@ import logging
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
-
-
-def handle_truth_verdict(session: Session, event_row) -> None:
-    """Create a loan lane when a truth verdict routes to loan_lane channel."""
-    payload = event_row.payload or {}
-    if payload.get("routed_channel") != "loan_lane":
-        return
-
-    from src.services.loan_lane_service import enter_lane
-    prospect_id = str(event_row.prospect_id)
-    lane_id = enter_lane(session, prospect_id)
-    logger.info("[LaneCons] truth_verdict → lane_id=%s prospect_id=%s", lane_id, prospect_id)
 
 
 def handle_lane_closer(session: Session, event_row) -> None:

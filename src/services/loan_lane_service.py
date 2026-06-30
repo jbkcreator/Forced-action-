@@ -11,11 +11,16 @@ import json
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from src.services.event_bus import emit_event
-
 logger = logging.getLogger(__name__)
 
 SOURCE_COMPONENT = "loan_lane"
+
+_STAGE_WORK_STATE_GATE: dict[str, frozenset[str]] = {
+    "quoted":    frozenset({"quoted", "lender_rejected", "committed", "closed_won"}),
+    "committed": frozenset({"committed", "closed_won"}),
+    "funded":    frozenset({"closed_won"}),
+    "dead":      frozenset({"closed_lost"}),
+}
 
 
 def _lowest_stage(session: Session, lane_type: str) -> str:
@@ -35,49 +40,47 @@ def _lowest_stage(session: Session, lane_type: str) -> str:
 
 def enter_lane(
     session: Session,
-    prospect_id: str,
+    property_id: int,
     lane_type: str = "distressed-payoff",
     loan_program: str | None = None,
 ) -> str:
-    """Create a lane at the lowest-order stage / open. Idempotent per (prospect_id, lane_type)."""
+    """Create a lane at the lowest-order stage / open.
+
+    Idempotent — returns the existing lane_id if already entered.
+    Uniqueness enforced per (property_id, lane_type).
+    """
     existing = session.execute(
         text("""
             SELECT lane_id FROM lanes
-            WHERE prospect_id = CAST(:pid AS uuid) AND lane_type = :lt
+            WHERE property_id = :pid AND lane_type = :lt
             LIMIT 1
         """),
-        {"pid": str(prospect_id), "lt": lane_type},
+        {"pid": property_id, "lt": lane_type},
     ).fetchone()
+
     if existing is not None:
         return str(existing.lane_id)
 
     stage = _lowest_stage(session, lane_type)
+
     row = session.execute(
         text("""
-            INSERT INTO lanes (prospect_id, lane_type, loan_program, current_stage)
-            VALUES (CAST(:pid AS uuid), :lt, :program, :stage)
+            INSERT INTO lanes (property_id, lane_type, loan_program, current_stage)
+            VALUES (:pid, :lt, :program, :stage)
             RETURNING lane_id
         """),
-        {"pid": str(prospect_id), "lt": lane_type, "program": loan_program, "stage": stage},
+        {"pid": property_id, "lt": lane_type, "program": loan_program, "stage": stage},
     ).fetchone()
-    lane_id = str(row.lane_id)
 
-    emit_event(
-        session,
-        event_type="lane.entry",
-        actor=SOURCE_COMPONENT,
-        source_component=SOURCE_COMPONENT,
-        prospect_id=prospect_id,
-        payload={"lane_id": lane_id, "lane_type": lane_type, "current_stage": stage},
-    )
-    logger.info("[LoanLane] entered lane_id=%s prospect_id=%s stage=%s", lane_id, prospect_id, stage)
+    lane_id = str(row.lane_id)
+    logger.info("[LoanLane] entered lane_id=%s property_id=%s stage=%s", lane_id, property_id, stage)
     return lane_id
 
 
 def _load_lane(session: Session, lane_id: str):
     return session.execute(
         text("""
-            SELECT lane_id, prospect_id, lane_type, current_stage, outcome,
+            SELECT lane_id, property_id, lane_type, current_stage, outcome,
                    assigned_broker_id, lender_id, claimed_at, last_activity_at
             FROM lanes WHERE lane_id = CAST(:lid AS uuid)
         """),
@@ -115,17 +118,27 @@ def advance_lane(session: Session, lane_id: str, to_stage: str, actor: str) -> N
             f"illegal lane advance: {lane.current_stage!r} → {to_stage!r} (allowed: {allowed})"
         )
 
+    gate = _STAGE_WORK_STATE_GATE.get(to_stage)
+    if gate:
+        ws_row = session.execute(
+            text("""
+                SELECT to_state FROM broker_transitions
+                WHERE lane_id = CAST(:lid AS uuid)
+                ORDER BY occurred_at DESC, transition_id DESC
+                LIMIT 1
+            """),
+            {"lid": str(lane_id)},
+        ).fetchone()
+        current_ws = ws_row.to_state if ws_row else "unassigned"
+        if current_ws not in gate:
+            raise ValueError(
+                f"cannot advance to '{to_stage}': work state must be "
+                f"{' or '.join(sorted(gate))} (currently '{current_ws}')"
+            )
+
     session.execute(
         text("UPDATE lanes SET current_stage = :stage, updated_at = NOW() WHERE lane_id = CAST(:lid AS uuid)"),
         {"stage": to_stage, "lid": str(lane_id)},
-    )
-    emit_event(
-        session,
-        event_type="lane.advance",
-        actor=actor,
-        source_component=SOURCE_COMPONENT,
-        prospect_id=lane.prospect_id,
-        payload={"lane_id": str(lane_id), "from_stage": lane.current_stage, "to_stage": to_stage},
     )
     logger.info("[LoanLane] advanced lane_id=%s %s→%s", lane_id, lane.current_stage, to_stage)
 
@@ -146,14 +159,6 @@ def set_lane_outcome(session: Session, lane_id: str, outcome: str, actor: str = 
             WHERE lane_id = CAST(:lid AS uuid)
         """),
         {"outcome": outcome, "stage": stage, "lid": str(lane_id)},
-    )
-    emit_event(
-        session,
-        event_type="lane.close",
-        actor=actor,
-        source_component=SOURCE_COMPONENT,
-        prospect_id=lane.prospect_id,
-        payload={"lane_id": str(lane_id), "outcome": outcome},
     )
     logger.info("[LoanLane] closed lane_id=%s outcome=%s", lane_id, outcome)
 
@@ -235,42 +240,37 @@ def distress_reason(distress_types, vertical_scores) -> str:
 
 
 def get_pool(session: Session, *, limit: int = 50) -> list[dict]:
-    """Return teasers for open, unclaimed, non-guess loan lanes."""
+    """Return teasers for open, unclaimed loan lanes."""
     rows = session.execute(
         text("""
             SELECT
                 l.lane_id,
-                l.prospect_id,
+                l.property_id,
                 l.current_stage,
                 l.outcome,
                 l.assigned_broker_id,
                 l.lender_id,
                 l.claimed_at,
                 l.last_activity_at,
-                p.property_id,
                 pr.address,
                 pr.city,
                 pr.state,
                 pr.zip,
-                ds.final_cds_score,
-                ds.lead_tier,
-                ds.distress_types,
-                ds.vertical_scores,
-                ds.is_guess_lead
+                fi.financing_intent_score,
+                fi.intent_tier,
+                fi.signal_flags
             FROM lanes l
-            JOIN prospects p ON p.prospect_id = l.prospect_id
-            JOIN properties pr ON pr.id = p.property_id
+            JOIN properties pr ON pr.id = l.property_id
             JOIN LATERAL (
-                SELECT ds.*
-                FROM distress_scores ds
-                WHERE ds.property_id = p.property_id
-                ORDER BY ds.score_date DESC, ds.id DESC
+                SELECT financing_intent_score, intent_tier, signal_flags
+                FROM financing_intent_scores
+                WHERE property_id = l.property_id
+                ORDER BY score_date DESC
                 LIMIT 1
-            ) ds ON true
+            ) fi ON true
             WHERE l.outcome = 'open'
               AND l.assigned_broker_id IS NULL
-              AND ds.is_guess_lead = false
-            ORDER BY ds.final_cds_score DESC NULLS LAST, l.entered_at DESC
+            ORDER BY fi.financing_intent_score DESC NULLS LAST, l.entered_at DESC
             LIMIT :limit
         """),
         {"limit": limit},
@@ -278,7 +278,6 @@ def get_pool(session: Session, *, limit: int = 50) -> list[dict]:
     return [
         {
             "lane_id": str(row.lane_id),
-            "prospect_id": str(row.prospect_id),
             "property_id": row.property_id,
             "address": row.address,
             "city": row.city,
@@ -286,10 +285,9 @@ def get_pool(session: Session, *, limit: int = 50) -> list[dict]:
             "zip": row.zip,
             "current_stage": row.current_stage,
             "outcome": row.outcome,
-            "final_cds_score": float(row.final_cds_score) if row.final_cds_score is not None else None,
-            "lead_tier": row.lead_tier,
-            "distress_reason": distress_reason(row.distress_types, row.vertical_scores),
-            "is_guess_lead": bool(row.is_guess_lead),
+            "financing_intent_score": float(row.financing_intent_score) if row.financing_intent_score is not None else None,
+            "intent_tier": row.intent_tier,
+            "signal_flags": row.signal_flags or {},
             "claimed_at": row.claimed_at,
             "last_activity_at": row.last_activity_at,
         }
@@ -313,7 +311,7 @@ def get_stale_lanes(session: Session, *, days: int = 30) -> list[dict]:
     return [
         {
             "lane_id": str(row.lane_id),
-            "prospect_id": str(row.prospect_id),
+            "property_id": row.property_id,
             "current_stage": row.current_stage,
             "outcome": row.outcome,
             "assigned_broker_id": str(row.assigned_broker_id) if row.assigned_broker_id else None,

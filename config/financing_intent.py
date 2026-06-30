@@ -36,8 +36,10 @@ FRESH_DEED_EXCLUDE_TYPES: frozenset[str] = frozenset({
 
 # ── Active Permit ─────────────────────────────────────────────────────────────
 PERMIT_EXCLUDE_STATUSES: frozenset[str] = frozenset({
-    "complete", "expired", "withdrawn", "revoked",
+    "complete", "completed", "expired", "withdrawn", "revoked",
     "cancel", "cancelled", "awaiting client reply", "waiting on applicant",
+    "finaled", "final", "closed", "closed - withdrawn",
+    "certificate of occupancy", "co issued",
 })
 STRUCTURAL_KEYWORDS: frozenset[str] = frozenset({
     "structural", "building", "addition", "renovation",

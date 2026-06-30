@@ -39,15 +39,51 @@ _optional_bearer = HTTPBearer(auto_error=False)
 
 @router.get("/api/lanes")
 def list_all_lanes(
-    open_only: bool = True,
-    limit: int = Query(default=100, le=500),
+    open_only: bool = Query(default=True),
+    intent_tier: Optional[str] = Query(default=None),
+    work_state: Optional[str] = Query(default=None),
+    stage: Optional[str] = Query(default=None),
+    county: Optional[str] = Query(default=None),
+    lender_id: Optional[str] = Query(default=None),
+    broker_id: Optional[str] = Query(default=None),
+    assigned: Optional[bool] = Query(default=None),
+    stale: Optional[bool] = Query(default=None),
+    contact_filter: Optional[str] = Query(default=None),
+    entered_from: Optional[str] = Query(default=None),
+    entered_to: Optional[str] = Query(default=None),
+    activity_from: Optional[str] = Query(default=None),
+    activity_to: Optional[str] = Query(default=None),
+    sort_by: str = Query(default="entered_at"),
+    sort_dir: str = Query(default="desc"),
+    limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     _admin: dict = Depends(get_current_admin),
 ):
-    """Admin — all lanes."""
-    lanes, total = fetch_lanes(db, open_only=open_only, limit=limit, offset=offset)
-    return {"lanes": lanes, "total": total}
+    """Admin — all lanes with filtering and pagination."""
+    lanes, total = fetch_lanes(
+        db,
+        open_only=open_only,
+        broker_id=broker_id,
+        assigned_only=(assigned is True),
+        unassigned_only=(assigned is False),
+        stale_only=(stale is True),
+        contact_filter=contact_filter,
+        intent_tier=intent_tier,
+        work_state=work_state,
+        stage=stage,
+        county=county,
+        lender_id=lender_id,
+        entered_from=entered_from,
+        entered_to=entered_to,
+        activity_from=activity_from,
+        activity_to=activity_to,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
+        limit=limit,
+        offset=offset,
+    )
+    return {"lanes": lanes, "total": total, "limit": limit, "offset": offset}
 
 
 # ---------------------------------------------------------------------------
@@ -57,19 +93,37 @@ def list_all_lanes(
 
 @router.get("/api/lanes/pool")
 def get_pool(
-    limit: int = Query(default=50, le=200),
+    intent_tier: Optional[str] = Query(default=None),
+    work_state: Optional[str] = Query(default=None),
+    stage: Optional[str] = Query(default=None),
+    county: Optional[str] = Query(default=None),
+    entered_from: Optional[str] = Query(default=None),
+    entered_to: Optional[str] = Query(default=None),
+    sort_by: str = Query(default="intent_score"),
+    sort_dir: str = Query(default="desc"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     broker: dict = Depends(get_current_broker),
 ):
-    """Unclaimed prospect pool — contact fields redacted."""
+    """Unclaimed prospect pool — contact fields redacted, sorted by intent score."""
     lanes, total = fetch_lanes(
         db,
         unassigned_only=True,
         open_only=True,
         redact_contact=True,
+        has_contact=True,
+        intent_tier=intent_tier,
+        stage=stage,
+        county=county,
+        entered_from=entered_from,
+        entered_to=entered_to,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
         limit=limit,
+        offset=offset,
     )
-    return {"lanes": lanes, "total": total}
+    return {"lanes": lanes, "total": total, "limit": limit, "offset": offset}
 
 
 # ---------------------------------------------------------------------------
@@ -263,3 +317,71 @@ def assign_broker_initial(
         raise HTTPException(status_code=409, detail="Lane could not be assigned.")
 
     return {"lane_id": lane_id, "assigned_broker_id": body.broker_id}
+
+
+# ---------------------------------------------------------------------------
+# Admin: POST /api/admin/lanes/seed-pool
+# Seed the broker pool from top financing_intent_scores properties.
+# Idempotent — skips properties that already have a lane.
+# ---------------------------------------------------------------------------
+
+@router.post("/api/admin/lanes/seed-pool")
+def seed_pool_from_financing_intent(
+    limit: int = Query(default=500, le=2000),
+    lane_type: str = Query(default="distressed-payoff"),
+    dry_run: bool = Query(default=False),
+    db: Session = Depends(get_db),
+    _admin: dict = Depends(get_current_admin),
+):
+    """Seed the broker pool from top-scored financing intent properties.
+
+    Pulls the top `limit` properties by latest financing_intent_score that
+    do not yet have a lane, then calls enter_lane() for each.
+    Safe to re-run — already-entered properties are counted as skipped.
+    """
+    from src.services.loan_lane_service import enter_lane
+
+    candidates = db.execute(
+        sa_text("""
+            WITH latest AS (
+                SELECT DISTINCT ON (property_id)
+                    property_id, financing_intent_score, intent_tier
+                FROM financing_intent_scores
+                ORDER BY property_id, score_date DESC
+            )
+            SELECT l.property_id, l.financing_intent_score, l.intent_tier
+            FROM latest l
+            WHERE NOT EXISTS (
+                SELECT 1 FROM lanes ln
+                WHERE ln.property_id = l.property_id
+                  AND ln.lane_type = :lt
+            )
+            ORDER BY l.financing_intent_score DESC
+            LIMIT :lim
+        """),
+        {"lt": lane_type, "lim": limit},
+    ).fetchall()
+
+    if dry_run:
+        return {
+            "dry_run": True,
+            "would_create": len(candidates),
+            "lane_type": lane_type,
+        }
+
+    created = 0
+    errors = 0
+    for row in candidates:
+        try:
+            enter_lane(db, lane_type=lane_type, property_id=row.property_id)
+            created += 1
+        except Exception:
+            errors += 1
+
+    db.commit()
+
+    return {
+        "created": created,
+        "errors": errors,
+        "lane_type": lane_type,
+    }

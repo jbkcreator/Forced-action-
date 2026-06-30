@@ -33,14 +33,13 @@ _COMMISSION_SELECT = """
         cl.status,
         cl.trigger_transition_id,
         cl.posted_at,
-        l.prospect_id,
-        pr.address          AS prospect_address,
-        pr.county_id        AS prospect_county
+        l.property_id,
+        pr.address          AS property_address,
+        pr.county_id        AS property_county
     FROM commission_ledger cl
     LEFT JOIN brokers b     ON b.broker_id = cl.broker_id
     LEFT JOIN lanes l       ON l.lane_id = cl.lane_id
-    LEFT JOIN prospects p   ON p.prospect_id = l.prospect_id
-    LEFT JOIN properties pr ON pr.id = p.property_id
+    LEFT JOIN properties pr ON pr.id = l.property_id
 """
 
 
@@ -55,10 +54,10 @@ def _serialize_entry(row) -> dict:
         "status": row.status,
         "trigger_transition_id": str(row.trigger_transition_id) if row.trigger_transition_id else None,
         "posted_at": row.posted_at.isoformat() if row.posted_at else None,
-        "prospect": {
-            "prospect_id": str(row.prospect_id) if row.prospect_id else None,
-            "address": row.prospect_address,
-            "county": row.prospect_county,
+        "property": {
+            "property_id": str(row.property_id) if row.property_id else None,
+            "address": row.property_address,
+            "county": row.property_county,
         },
     }
 

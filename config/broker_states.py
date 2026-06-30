@@ -18,6 +18,7 @@ BROKER_STATES: frozenset[str] = frozenset({
     "working",
     "quoted",
     "committed",
+    "lender_rejected",
     "closed_won",
     "closed_lost",
 })
@@ -32,14 +33,28 @@ TERMINAL_STATES: frozenset[str] = frozenset({
 # Terminal states map to empty tuples — they cannot transition.
 
 ALLOWED_TRANSITIONS: dict[str, tuple[str, ...]] = {
-    "unassigned":  ("assigned",),
-    "assigned":    ("working", "closed_lost"),
-    "working":     ("quoted", "closed_lost"),
-    "quoted":      ("committed", "closed_lost"),
-    "committed":   ("closed_won", "closed_lost"),
-    "closed_won":  (),
-    "closed_lost": (),
+    "unassigned":       ("assigned",),
+    "assigned":         ("working", "closed_lost"),
+    "working":          ("quoted", "closed_lost"),
+    "quoted":           ("committed", "lender_rejected", "closed_lost"),
+    "committed":        ("closed_won", "closed_lost"),
+    "lender_rejected":  ("quoted", "closed_lost"),
+    "closed_won":       (),
+    "closed_lost":      (),
 }
+
+# ── Ordered state list (for API serialisation) ────────────────────────────────
+
+WORK_STATE_ORDER: tuple[str, ...] = (
+    "unassigned",
+    "assigned",
+    "working",
+    "quoted",
+    "committed",
+    "lender_rejected",
+    "closed_won",
+    "closed_lost",
+)
 
 # ── Reason codes ──────────────────────────────────────────────────────────────
 
@@ -51,7 +66,17 @@ REASON_CODES: frozenset[str] = frozenset({
     "docs_received",
     "funded",
     "lost_other",
+    "lender_declined",
 })
+
+REASON_CODES_BY_STATE: dict[str, tuple[str, ...]] = {
+    "working":         ("no_contact", "qualified"),
+    "quoted":          ("qualified", "price"),
+    "committed":       ("docs_received", "qualified"),
+    "lender_rejected": ("lender_declined",),
+    "closed_won":      ("funded",),
+    "closed_lost":     ("no_contact", "not_interested", "price", "lender_declined", "lost_other"),
+}
 
 # ── Exceptions ────────────────────────────────────────────────────────────────
 
