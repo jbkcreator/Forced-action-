@@ -15,12 +15,12 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from typing import Any, Dict, Optional, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
 from src.agents.prompts.loader import load_prompt, render
+from src.utils.quora_attribution import campaign_slug
 
 logger = logging.getLogger(__name__)
 
@@ -155,9 +155,8 @@ def _node_generate_answer(state: QuoraChannelState) -> Dict[str, Any]:
     compact = {k: v for k, v in candidate.items() if k != "raw_metadata"}
     qid     = candidate.get("qid") or ""
 
-    # Build a URL-safe campaign slug from keyword
-    utm_campaign = re.sub(r"[^a-z0-9]+", "_", keyword.lower()).strip("_")[:50]
-    utm_campaign = f"quora_{utm_campaign}"
+    # Build a URL-safe campaign slug from keyword (shared with the tuning worker)
+    utm_campaign = campaign_slug(keyword)
 
     context = {
         "candidate_json":    json.dumps(compact, default=str, indent=2),

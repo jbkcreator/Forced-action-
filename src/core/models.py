@@ -3583,6 +3583,16 @@ class QuoraTopic(Base):
         default=lambda: datetime.now(timezone.utc),
     )
 
+    # ── Task 5.1 Autonomous Inbound Content Loop (fa-5.1, see docs/adr/0021) ──
+    # Metric columns fold onto quora_topics rather than a separate
+    # scraper_keyword_metrics table; cluster is an enum string, not thread_clusters.
+    cluster:             Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    signup_count:        Mapped[int]           = mapped_column(Integer, nullable=False, server_default="0", default=0)
+    cumulative_spend:    Mapped[Decimal]       = mapped_column(Numeric(10, 4), nullable=False, server_default="0", default=Decimal("0"))
+    performance_score:   Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 4), nullable=True)
+    impression_count:    Mapped[Optional[int]] = mapped_column(Integer, nullable=True)   # no organic source in v1
+    click_through_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)   # no organic source in v1
+
     def __repr__(self):
         return f"<QuoraTopic(id={self.id}, keyword={self.keyword!r}, active={self.is_active})>"
 

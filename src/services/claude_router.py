@@ -55,6 +55,7 @@ _TASK_ROUTING: dict[str, str] = {
     "batch_summarization":"haiku",
     "address_matching":   "haiku",
     "keyword_extraction": "haiku",
+    "keyword_variations": "haiku",   # Task 5.1 content-loop Seed Keyword variations
     # Sonnet — contextual reasoning
     "conversational_close":  "sonnet",
     "complex_reasoning":     "sonnet",
