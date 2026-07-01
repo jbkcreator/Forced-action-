@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 DDL = [
     "ALTER TABLE enriched_contacts ADD COLUMN IF NOT EXISTS outbound_queued_at  TIMESTAMPTZ",
     "ALTER TABLE enriched_contacts ADD COLUMN IF NOT EXISTS first_touch_sent_at TIMESTAMPTZ",
+    "ALTER TABLE enriched_contacts ADD COLUMN IF NOT EXISTS outbound_terminal   BOOLEAN DEFAULT FALSE",
     """
     CREATE INDEX IF NOT EXISTS idx_ec_outbound_queued
         ON enriched_contacts (outbound_queued_at)
@@ -33,7 +34,9 @@ def main() -> None:
     with engine.begin() as conn:
         for stmt in DDL:
             conn.execute(text(stmt))
-    logger.info("fa_outbound_pacing applied: outbound_queued_at + first_touch_sent_at ready")
+    logger.info(
+        "fa_outbound_pacing applied: outbound_queued_at + first_touch_sent_at + outbound_terminal ready"
+    )
 
 
 if __name__ == "__main__":

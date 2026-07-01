@@ -11,9 +11,11 @@ Phase B: Dispatch staged mobile contacts with adaptive pacing.
   - Applies exponential backoff delay between sends
   - At high backpressure (delay >= 60s), processes 1 contact per cron tick;
     the 5-minute interval itself provides the effective inter-batch wait.
-  - Permanent failures (DNC, opt-out, invalid phone) are marked outbound_terminal=TRUE
-    and excluded from future sweeps; transient failures (quiet hours) retry normally.
-  - Each send commits independently so a crash cannot cause duplicate sends.
+  - Each contact is processed in its own short DB session — claim, send, commit.
+    No shared long-lived session across sends or sleeps; no cross-session lock contention.
+  - Confirmed-permanent failures (DNC, opt-out, invalid phone) are marked
+    outbound_terminal=TRUE and excluded from future sweeps.
+  - dnc_check_required is treated as transient — retries until DNC data is refreshed.
 
 Run:
     python -m src.tasks.outbound_pacing_sweep                          # both counties
@@ -50,11 +52,11 @@ _DEFAULT_COUNTIES = ["hillsborough", "pinellas"]
 _DEFAULT_LIMIT = 50
 _PHASE_A_BATCH = 200
 
-# suppress_reason values written by sms_compliance that indicate a permanent failure.
-# These contacts will never be reachable by SMS and must not re-enter the queue.
+# suppress_reason values from sms_compliance that are confirmed permanent.
+# dnc_check_required is intentionally excluded — it means "DNC data missing or stale",
+# not "confirmed on DNC list". Those contacts retry after the monthly dnc_refresh.
 _TERMINAL_SUPPRESS_REASONS = frozenset({
     "dnc_or_opted_out",
-    "dnc_check_required",
     "invalid_phone",
     "unresolvable",
     "prospect_not_contactable",
@@ -139,47 +141,117 @@ def _phase_a(county_id: str, db, dry_run: bool) -> dict:
     return stats
 
 
-def _mark_terminal(contact_id: int) -> None:
-    """Stamp outbound_terminal=TRUE in a separate short-lived session so it commits immediately."""
+def _dispatch_one(contact_id: int, property_id: int, phone: str, county_id: str) -> str:
+    """
+    Claim, send, and commit a single contact in one short DB session.
+
+    Using a per-contact session means the row lock is held only for the duration
+    of this function — never across a time.sleep() call and never concurrently
+    with a second session on the same row.
+
+    Returns: "sent" | "suppressed" | "terminal" | "error"
+    """
     with get_db_context() as db:
-        db.execute(
-            text("UPDATE enriched_contacts SET outbound_terminal = TRUE WHERE id = :cid"),
+        # Re-claim with FOR UPDATE SKIP LOCKED inside this short session.
+        # If another process grabbed it between the batch query and now, skip cleanly.
+        row = db.execute(
+            text("""
+                SELECT id FROM enriched_contacts
+                WHERE id = :cid
+                  AND first_touch_sent_at IS NULL
+                  AND (outbound_terminal IS NULL OR outbound_terminal = FALSE)
+                FOR UPDATE SKIP LOCKED
+            """),
             {"cid": contact_id},
+        ).mappings().first()
+
+        if row is None:
+            return "skipped"
+
+        opt_in_sentinel.mark_pending(phone)
+
+        ok = send_sms(
+            to=phone,
+            body=_first_touch_body(county_id),
+            db=db,
+            message_type="opt_in_prompt",
+            task_type="outbound_first_touch",
         )
 
+        if ok:
+            db.execute(
+                text("UPDATE enriched_contacts SET first_touch_sent_at = :now WHERE id = :cid"),
+                {"cid": contact_id, "now": datetime.now(timezone.utc)},
+            )
+            logger.info(
+                "[OutboundPacing][B] sent contact_id=%d property_id=%d",
+                contact_id, property_id,
+            )
+            return "sent"
 
-def _phase_b(county_id: str, limit: int, db, dry_run: bool) -> dict:
+        # Read suppress_reason written by send_sms() within the same session.
+        log_row = db.execute(
+            text("""
+                SELECT suppress_reason FROM sms_send_logs
+                WHERE phone     = :phone
+                  AND task_type = 'outbound_first_touch'
+                ORDER BY created_at DESC
+                LIMIT 1
+            """),
+            {"phone": phone},
+        ).mappings().first()
+
+        suppress_reason = log_row["suppress_reason"] if log_row else None
+
+        if suppress_reason in _TERMINAL_SUPPRESS_REASONS:
+            db.execute(
+                text("UPDATE enriched_contacts SET outbound_terminal = TRUE WHERE id = :cid"),
+                {"cid": contact_id},
+            )
+            logger.info(
+                "[OutboundPacing][B] terminal contact_id=%d reason=%s",
+                contact_id, suppress_reason,
+            )
+            return "terminal"
+
+        logger.warning(
+            "[OutboundPacing][B] suppressed contact_id=%d phone=%s reason=%s",
+            contact_id, phone, suppress_reason,
+        )
+        return "suppressed"
+
+
+def _phase_b(county_id: str, limit: int, dry_run: bool) -> dict:
     """Dispatch staged mobile contacts with adaptive pacing."""
     stats = {"sent": 0, "suppressed": 0, "terminal": 0, "errors": 0}
 
-    drop_rate = check_outbound_delivery_backpressure(db)
-    pacing_delay = calculate_pacing_delay(drop_rate)
+    # Short read-only session: fetch backpressure and the candidate contact IDs only.
+    # No FOR UPDATE here — each contact is claimed individually inside _dispatch_one().
+    with get_db_context() as db:
+        drop_rate = check_outbound_delivery_backpressure(db)
+        pacing_delay = calculate_pacing_delay(drop_rate)
 
-    # Cap batch size dynamically:
-    # pacing_delay >= 60s → 1 contact per run; 5-min cron interval provides the wait.
-    # pacing_delay <  60s → up to `limit` contacts; time.sleep() paces between sends.
-    max_per_run = 1 if pacing_delay >= 60.0 else limit
+        max_per_run = 1 if pacing_delay >= 60.0 else limit
 
-    logger.info(
-        "[OutboundPacing][B] county=%s drop_rate=%.3f delay=%.1fs max_per_run=%d",
-        county_id, drop_rate, pacing_delay, max_per_run,
-    )
+        logger.info(
+            "[OutboundPacing][B] county=%s drop_rate=%.3f delay=%.1fs max_per_run=%d",
+            county_id, drop_rate, pacing_delay, max_per_run,
+        )
 
-    rows = db.execute(
-        text("""
-            SELECT id, property_id, mobile_phone
-            FROM enriched_contacts
-            WHERE county_id           = :county_id
-              AND mobile_phone        IS NOT NULL
-              AND outbound_queued_at  IS NOT NULL
-              AND first_touch_sent_at IS NULL
-              AND (outbound_terminal IS NULL OR outbound_terminal = FALSE)
-            ORDER BY outbound_queued_at ASC
-            LIMIT :max_per_run
-            FOR UPDATE SKIP LOCKED
-        """),
-        {"county_id": county_id, "max_per_run": max_per_run},
-    ).mappings().all()
+        rows = db.execute(
+            text("""
+                SELECT id, property_id, mobile_phone
+                FROM enriched_contacts
+                WHERE county_id           = :county_id
+                  AND mobile_phone        IS NOT NULL
+                  AND outbound_queued_at  IS NOT NULL
+                  AND first_touch_sent_at IS NULL
+                  AND (outbound_terminal IS NULL OR outbound_terminal = FALSE)
+                ORDER BY outbound_queued_at ASC
+                LIMIT :max_per_run
+            """),
+            {"county_id": county_id, "max_per_run": max_per_run},
+        ).mappings().all()
 
     if not rows:
         return stats
@@ -194,72 +266,19 @@ def _phase_b(county_id: str, limit: int, db, dry_run: bool) -> dict:
                 county_id, contact_id, phone, pacing_delay,
             )
             stats["sent"] += 1
+            if i < len(rows) - 1:
+                time.sleep(pacing_delay)
             continue
 
         try:
-            # Open the opt-in consent window so a YES reply registers as consent.
-            # mark_pending is a no-op when Redis is unavailable — degrades gracefully.
-            opt_in_sentinel.mark_pending(phone)
-
-            # message_type="opt_in_prompt" bypasses the SmsOptIn marketing gate.
-            # Cold contacts have no prior consent record; "marketing" would suppress all sends.
-            # sms_compliance still enforces DNC, opt-out, and quiet hours.
-            ok = send_sms(
-                to=phone,
-                body=_first_touch_body(county_id),
-                db=db,
-                message_type="opt_in_prompt",
-                task_type="outbound_first_touch",
-            )
-
-            if ok:
-                # Commit immediately in a short session — prevents duplicate sends on crash.
-                with get_db_context() as commit_db:
-                    commit_db.execute(
-                        text("""
-                            UPDATE enriched_contacts
-                            SET first_touch_sent_at = :now
-                            WHERE id = :cid
-                        """),
-                        {"cid": contact_id, "now": datetime.now(timezone.utc)},
-                    )
+            outcome = _dispatch_one(contact_id, row["property_id"], phone, county_id)
+            if outcome == "sent":
                 stats["sent"] += 1
-                logger.info(
-                    "[OutboundPacing][B] sent contact_id=%d property_id=%d",
-                    contact_id, row["property_id"],
-                )
-            else:
-                # Determine whether this is a permanent or transient failure by reading
-                # the suppress_reason just written to sms_send_logs by send_sms().
-                log_row = db.execute(
-                    text("""
-                        SELECT suppress_reason
-                        FROM sms_send_logs
-                        WHERE phone    = :phone
-                          AND task_type = 'outbound_first_touch'
-                        ORDER BY created_at DESC
-                        LIMIT 1
-                    """),
-                    {"phone": phone},
-                ).mappings().first()
-
-                suppress_reason = log_row["suppress_reason"] if log_row else None
-
-                if suppress_reason in _TERMINAL_SUPPRESS_REASONS:
-                    _mark_terminal(contact_id)
-                    stats["terminal"] += 1
-                    logger.info(
-                        "[OutboundPacing][B] terminal contact_id=%d reason=%s",
-                        contact_id, suppress_reason,
-                    )
-                else:
-                    # Transient (quiet hours, frequency cap) — leave for retry next sweep.
-                    stats["suppressed"] += 1
-                    logger.warning(
-                        "[OutboundPacing][B] suppressed contact_id=%d phone=%s reason=%s",
-                        contact_id, phone, suppress_reason,
-                    )
-
+            elif outcome == "terminal":
+                stats["terminal"] += 1
+            elif outcome == "suppressed":
+                stats["suppressed"] += 1
+            # "skipped" (grabbed by another process) counts as neither sent nor error
         except Exception as exc:
             stats["errors"] += 1
             logger.error(
@@ -267,7 +286,6 @@ def _phase_b(county_id: str, limit: int, db, dry_run: bool) -> dict:
                 contact_id, exc, exc_info=True,
             )
 
-        # Sleep between sends — skip after the last item in the batch
         if i < len(rows) - 1:
             time.sleep(pacing_delay)
 
@@ -296,8 +314,7 @@ def run(
         with get_db_context() as db:
             a = _phase_a(county_id, db, dry_run)
 
-        with get_db_context() as db:
-            b = _phase_b(county_id, limit, db, dry_run)
+        b = _phase_b(county_id, limit, dry_run)
 
         results[county_id] = {"phase_a": a, "phase_b": b}
 
