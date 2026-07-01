@@ -51,6 +51,7 @@ from src.core.models import (
 from src.loaders.tax import TaxDelinquencyLoader
 from src.loaders.voter_registry import VoterRegistryLoader
 from src.utils.county_config import invalidate_cache
+from src.utils.quora_attribution import campaign_slug, clamp_cooldown as quora_clamp_cooldown
 
 logger = logging.getLogger(__name__)
 
@@ -3289,7 +3290,9 @@ async def post_quora_answer(
     # Deterministically append a non-promotional resource footer.
     # The AI-generated answer contains no platform mention; the footer is
     # appended here so every post has exactly one consistent resource link.
-    utm_slug = (row.matched_keyword or "quora_organic").lower().replace(" ", "_")
+    # Must match autonomous_tuning_worker's lookup exactly (docs/adr/0021) — both
+    # sides go through campaign_slug() so conversions attribute back correctly.
+    utm_slug = campaign_slug(row.matched_keyword) if row.matched_keyword else "quora_organic"
     qid_str  = str(row.qid) if row.qid else str(question_id)
     footer = (
         f"\n\nFor more information on distressed property resources in Florida, "
@@ -3355,13 +3358,7 @@ async def post_quora_answer(
 def _clamp_cooldown(db) -> None:
     """After a topic is deactivated, reduce cooldown_days to stay within the valid range."""
     try:
-        active_count = db.execute(text(
-            "SELECT COUNT(*) FROM quora_topics WHERE is_active = true"
-        )).scalar() or 0
-        max_cd = max(0, active_count - 1)
-        db.execute(text(
-            "UPDATE quora_settings SET cooldown_days = LEAST(cooldown_days, :max) WHERE id = 1"
-        ), {"max": max_cd})
+        quora_clamp_cooldown(db)
         db.commit()
     except Exception:
         db.rollback()

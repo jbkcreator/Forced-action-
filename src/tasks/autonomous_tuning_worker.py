@@ -14,7 +14,7 @@ from decimal import Decimal
 
 from sqlalchemy import text
 
-from src.utils.quora_attribution import campaign_slug
+from src.utils.quora_attribution import campaign_slug, clamp_cooldown
 
 logger = logging.getLogger(__name__)
 
@@ -117,15 +117,20 @@ def tune_scraper_keywords(
             GROUP BY q.matched_keyword
         """), {"cutoff": cutoff}).all()
     }
+    # New acquisitions only — gated on subscriber.created_at (signup), not
+    # invoice.paid_at (billing event), so a long-tenured subscriber's monthly
+    # renewal inside the window is never counted as a fresh win for their
+    # original keyword.
     signups_by_slug = {
         r.slug: r.n
         for r in db.execute(text("""
             SELECT s.utm_campaign AS slug, COUNT(DISTINCT s.id) AS n
             FROM subscribers s
-            WHERE s.utm_campaign IS NOT NULL AND EXISTS (
+            WHERE s.utm_campaign IS NOT NULL
+              AND s.created_at >= :cutoff
+              AND EXISTS (
                 SELECT 1 FROM subscription_invoices si
                 WHERE si.subscriber_id = s.id AND si.reversed_at IS NULL
-                  AND si.paid_at >= :cutoff
             )
             GROUP BY s.utm_campaign
         """), {"cutoff": cutoff}).all()
@@ -157,10 +162,28 @@ def tune_scraper_keywords(
 
     inserted = 0
     if to_expand:
-        new_keywords: list[tuple[str, str | None]] = []
+        # Dedup generated variations within the batch, then drop any that
+        # already exist in quora_topics — only truly-insertable keywords should
+        # size the eviction (INSERT uses ON CONFLICT DO NOTHING, so counting
+        # pre-dedup candidates would evict more active keywords than we backfill).
+        seen: set[str] = set()
+        candidates: list[tuple[str, str | None]] = []
         for _id, kw, cluster in to_expand:
             for variation in generate_variations(kw, cluster, VARIATIONS_PER_WINNER):
-                new_keywords.append((variation, cluster))
+                v = variation.strip()
+                if v and v not in seen:
+                    seen.add(v)
+                    candidates.append((v, cluster))
+
+        if candidates:
+            existing = {
+                r.keyword for r in db.execute(text(
+                    "SELECT keyword FROM quora_topics WHERE keyword = ANY(:kws)"
+                ), {"kws": [kw for kw, _ in candidates]}).all()
+            }
+            new_keywords = [(kw, cl) for kw, cl in candidates if kw not in existing]
+        else:
+            new_keywords = []
 
         # Replace-worst: evict lowest-scoring active keywords to keep under cap.
         remaining = db.execute(text(
@@ -174,12 +197,16 @@ def tune_scraper_keywords(
                        {"ids": evict})
 
         for kw, cluster in new_keywords:
-            # ponytail: ON CONFLICT skip can under-fill vs evictions; fine at v1 volume.
             res = db.execute(text(
                 "INSERT INTO quora_topics (keyword, is_active, cluster, last_run_at) "
                 "VALUES (:kw, TRUE, :cl, NULL) ON CONFLICT (keyword) DO NOTHING"
             ), {"kw": kw, "cl": cluster})
             inserted += res.rowcount or 0
+
+    # Re-clamp cooldown_days against the post-mutation active pool size — the
+    # active-topic-count invariant that quora_s6_orchestrator's DB rotation
+    # picker depends on (docs/adr/0021).
+    clamp_cooldown(db)
 
     summary = {"deactivated": len(to_deactivate), "expanded": len(to_expand),
                "inserted": inserted}
