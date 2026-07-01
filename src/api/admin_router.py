@@ -1437,15 +1437,75 @@ def create_broker_route(body: _CreateBrokerRequest, db: Session = Depends(get_db
     db.commit()
     try:
         from src.services.email import send_email
+        from config.settings import get_settings as _get_settings
+        _s = _get_settings()
+        reset_url = f"{_s.app_base_url}/broker/reset-password/{broker.reset_token}"
+        login_url = f"{_s.app_base_url}/broker/login"
         send_email(
             to=broker.email,
-            subject="You've been invited to the broker portal",
+            subject="You've been invited to the Loan Lane broker portal",
             body_text=(
                 f"Hi {broker.name},\n\n"
-                f"An admin has created a broker account for you.\n"
-                f"Use this token to set your password:\n\n  {broker.reset_token}\n\n"
-                "This token expires in 30 days."
+                f"An admin has created a broker account for you on the Loan Lane portal.\n\n"
+                f"Click the link below to set your password (expires in 30 days):\n\n"
+                f"  {reset_url}\n\n"
+                f"Once your password is set, log in at:\n  {login_url}\n\n"
+                "If you did not expect this invitation, you can safely ignore this email."
             ),
+            body_html=f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/></head>
+<body style="margin:0;padding:0;background:#0f172a;font-family:Inter,Arial,sans-serif;color:#e2e8f0;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f172a;padding:40px 0;">
+    <tr><td align="center">
+      <table width="560" cellpadding="0" cellspacing="0"
+             style="background:#1e293b;border:1px solid rgba(255,255,255,0.08);border-radius:16px;overflow:hidden;max-width:560px;width:100%;">
+        <tr>
+          <td style="padding:28px 40px;border-bottom:1px solid rgba(255,255,255,0.08);">
+            <p style="margin:0;font-size:22px;font-weight:800;color:#ffffff;">
+              Forced <span style="color:#fbbf24;">Action</span>
+              <span style="margin-left:8px;font-size:13px;font-weight:600;color:#94a3b8;">Loan Lane</span>
+            </p>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:32px 40px;">
+            <h1 style="margin:0 0 8px;font-size:24px;font-weight:800;color:#ffffff;">
+              Welcome to the broker portal, {broker.name}.
+            </h1>
+            <p style="margin:0 0 24px;color:#94a3b8;font-size:15px;">
+              An admin has created a broker account for you. Click below to set your password and get started.
+            </p>
+            <table cellpadding="0" cellspacing="0" style="margin-bottom:20px;">
+              <tr>
+                <td style="background:#fbbf24;border-radius:8px;">
+                  <a href="{reset_url}"
+                     style="display:inline-block;padding:14px 28px;color:#0f172a;font-size:15px;font-weight:700;text-decoration:none;">
+                    Set Your Password &rarr;
+                  </a>
+                </td>
+              </tr>
+            </table>
+            <p style="margin:0 0 24px;font-size:13px;color:#64748b;">
+              This link expires in <strong style="color:#94a3b8;">30 days</strong>.
+              After setting your password you can always log in at
+              <a href="{login_url}" style="color:#fbbf24;text-decoration:none;">{login_url}</a>
+            </p>
+            <p style="margin:0;font-size:13px;color:#64748b;">
+              Not expecting this? You can safely ignore this email.
+            </p>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.08);font-size:12px;color:#475569;text-align:center;">
+            Forced Action &mdash; Loan Lane Broker Portal
+          </td>
+        </tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>""",
         )
     except Exception:
         logger.warning("[Admin] mailchimp invite email failed for broker=%s", broker.email)

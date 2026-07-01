@@ -11,8 +11,6 @@ from typing import Any
 from sqlalchemy import text as sa_text
 from sqlalchemy.orm import Session
 
-from src.services.event_bus import emit_event
-
 logger = logging.getLogger(__name__)
 
 _SOURCE = "commission_ledger"
@@ -70,7 +68,7 @@ def post_commission(
 
     tr = session.execute(
         sa_text(
-            "SELECT lane_id, prospect_id, broker_id "
+            "SELECT lane_id, broker_id "
             "FROM broker_transitions "
             "WHERE transition_id = CAST(:tid AS uuid)"
         ),
@@ -84,15 +82,14 @@ def post_commission(
     row = session.execute(
         sa_text("""
             INSERT INTO commission_ledger
-                (prospect_id, lane_id, broker_id, trigger_transition_id,
+                (lane_id, broker_id, trigger_transition_id,
                  gross_amount_cents, split_config_id, net_lines, status)
             VALUES
-                (CAST(:pid AS uuid), CAST(:lid AS uuid), CAST(:bid AS uuid),
+                (CAST(:lid AS uuid), CAST(:bid AS uuid),
                  CAST(:tid AS uuid), :gross, :split, CAST(:nl AS jsonb), 'posted')
             RETURNING entry_id
         """),
         {
-            "pid": str(tr.prospect_id),
             "lid": str(tr.lane_id),
             "bid": str(tr.broker_id),
             "tid": str(trigger_transition_id),
@@ -102,23 +99,6 @@ def post_commission(
         },
     ).fetchone()
     entry_id = str(row.entry_id)
-
-    emit_event(
-        session,
-        event_type="commission.posted",
-        actor=_SOURCE,
-        source_component=_SOURCE,
-        prospect_id=str(tr.prospect_id),
-        payload={
-            "entry_id": entry_id,
-            "lane_id": str(tr.lane_id),
-            "broker_id": str(tr.broker_id),
-            "trigger_transition_id": str(trigger_transition_id),
-            "gross_amount_cents": gross_amount_cents,
-            "split_config_id": split_config_id,
-            "net_lines": net_lines,
-        },
-    )
     logger.info(
         "[CommissionLedger] posted entry_id=%s transition_id=%s gross=%d",
         entry_id, trigger_transition_id, gross_amount_cents,
@@ -145,7 +125,7 @@ def post_offset(session: Session, original_entry_id: str, actor: str = "admin") 
     """
     orig = session.execute(
         sa_text(
-            "SELECT prospect_id, lane_id, broker_id, trigger_transition_id, "
+            "SELECT lane_id, broker_id, trigger_transition_id, "
             "gross_amount_cents, split_config_id, net_lines "
             "FROM commission_ledger WHERE entry_id = CAST(:eid AS uuid)"
         ),
@@ -162,15 +142,14 @@ def post_offset(session: Session, original_entry_id: str, actor: str = "admin") 
     row = session.execute(
         sa_text("""
             INSERT INTO commission_ledger
-                (prospect_id, lane_id, broker_id,
+                (lane_id, broker_id,
                  gross_amount_cents, split_config_id, net_lines, status)
             VALUES
-                (CAST(:pid AS uuid), CAST(:lid AS uuid), CAST(:bid AS uuid),
+                (CAST(:lid AS uuid), CAST(:bid AS uuid),
                  :gross, :split, CAST(:nl AS jsonb), 'posted')
             RETURNING entry_id
         """),
         {
-            "pid": str(orig.prospect_id),
             "lid": str(orig.lane_id),
             "bid": str(orig.broker_id),
             "gross": orig.gross_amount_cents,

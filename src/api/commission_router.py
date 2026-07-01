@@ -34,15 +34,14 @@ _COMMISSION_SELECT = """
         cl.status,
         cl.trigger_transition_id,
         cl.posted_at,
-        l.prospect_id,
+        l.property_id,
         l.fee_config_flag,
-        pr.address          AS prospect_address,
-        pr.county_id        AS prospect_county
+        pr.address          AS property_address,
+        pr.county_id        AS property_county
     FROM commission_ledger cl
     LEFT JOIN brokers b     ON b.broker_id = cl.broker_id
     LEFT JOIN lanes l       ON l.lane_id = cl.lane_id
-    LEFT JOIN prospects p   ON p.prospect_id = l.prospect_id
-    LEFT JOIN properties pr ON pr.id = p.property_id
+    LEFT JOIN properties pr ON pr.id = l.property_id
 """
 
 
@@ -69,14 +68,21 @@ def _serialize_entry(row) -> dict:
         "fee_config_flag": fee_visible,
         "trigger_transition_id": str(row.trigger_transition_id) if row.trigger_transition_id else None,
         "posted_at": row.posted_at.isoformat() if row.posted_at else None,
-        "prospect_id": str(row.prospect_id) if row.prospect_id else None,
-        "prospect_address": row.prospect_address,
-        "prospect_county": row.prospect_county,
+        "property": {
+            "property_id": str(row.property_id) if row.property_id else None,
+            "address": row.property_address,
+            "county": row.property_county,
+        },
     }
 
 
 def _resolve_auth(credentials: Optional[HTTPAuthorizationCredentials]) -> tuple[bool, str | None]:
-    """Decode the bearer token; return (is_admin, broker_id)."""
+    """Decode the bearer token; return (is_admin, broker_id).
+
+    Broker tokens are verified with BROKER_JWT_SECRET (type must be broker_access).
+    Admin tokens are verified with ADMIN_JWT_SECRET. A token that decodes under
+    one secret but carries the wrong type is rejected with 401.
+    """
     from jose import JWTError, jwt
     from config.settings import get_settings
 
@@ -84,16 +90,28 @@ def _resolve_auth(credentials: Optional[HTTPAuthorizationCredentials]) -> tuple[
         raise HTTPException(status_code=401, detail="Authentication required.")
 
     token = credentials.credentials
-    settings = get_settings()
-    secret = settings.admin_jwt_secret.get_secret_value() if settings.admin_jwt_secret else ""
+    s = get_settings()
 
+    # Broker path — requires BROKER_JWT_SECRET and broker_access type
+    broker_secret = s.broker_jwt_secret
+    if broker_secret:
+        try:
+            payload = jwt.decode(token, broker_secret.get_secret_value(), algorithms=["HS256"])
+            if payload.get("type") == "broker_access":
+                return False, payload.get("sub")
+        except JWTError:
+            pass
+
+    # Admin path — decode with ADMIN_JWT_SECRET; reject if it carries a broker type
+    admin_secret = s.admin_jwt_secret.get_secret_value() if s.admin_jwt_secret else ""
     try:
-        payload = jwt.decode(token, secret, algorithms=["HS256"])
+        payload = jwt.decode(token, admin_secret, algorithms=["HS256"])
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired token.")
 
     if payload.get("type") == "broker_access":
-        return False, payload.get("sub")
+        raise HTTPException(status_code=401, detail="Invalid token type.")
+
     return True, None
 
 

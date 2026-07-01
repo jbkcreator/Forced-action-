@@ -1,7 +1,7 @@
 """Broker JWT authentication service — Layer 3C.
 
 Issues HS256 bearer tokens for broker self-service API routes.
-Falls back to ADMIN_JWT_SECRET when BROKER_JWT_SECRET is not set (dev).
+Requires BROKER_JWT_SECRET — does not fall back to ADMIN_JWT_SECRET.
 """
 from __future__ import annotations
 
@@ -29,9 +29,9 @@ _REFRESH_TOKEN_TYPE = "broker_refresh"
 
 def _broker_secret() -> str:
     s = get_settings()
-    secret = getattr(s, "broker_jwt_secret", None) or s.admin_jwt_secret
+    secret = s.broker_jwt_secret
     if not secret:
-        raise HTTPException(status_code=503, detail="Broker auth not configured")
+        raise HTTPException(status_code=503, detail="BROKER_JWT_SECRET is not configured")
     return secret.get_secret_value()
 
 

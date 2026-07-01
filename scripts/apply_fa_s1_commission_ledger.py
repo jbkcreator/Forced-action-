@@ -33,7 +33,6 @@ DDL = [
     """
     CREATE TABLE IF NOT EXISTS commission_ledger (
         entry_id                UUID PRIMARY KEY DEFAULT generate_uuidv7(),
-        prospect_id             UUID NOT NULL REFERENCES prospects(prospect_id),
         lane_id                 UUID NOT NULL REFERENCES lanes(lane_id),
         broker_id               UUID NOT NULL REFERENCES brokers(broker_id),
         trigger_transition_id   UUID UNIQUE REFERENCES broker_transitions(transition_id),

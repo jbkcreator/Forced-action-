@@ -22,8 +22,6 @@ from config.broker_states import (
     InvalidBrokerState,
     validate_transition,
 )
-from src.services.event_bus import emit_event
-
 logger = logging.getLogger(__name__)
 
 _SOURCE = "broker_state_machine"
@@ -48,7 +46,7 @@ IllegalTransition = IllegalBrokerTransition
 def _load_lane(session: Session, lane_id: str):
     return session.execute(
         sa_text("""
-            SELECT lane_id, prospect_id, lane_type, current_stage,
+            SELECT lane_id, property_id, lane_type, current_stage,
                    outcome, assigned_broker_id
             FROM lanes WHERE lane_id = CAST(:lid AS uuid)
         """),
@@ -86,7 +84,6 @@ def _insert_transition(
     session: Session,
     *,
     lane_id: str,
-    prospect_id: Any,
     broker_id: str,
     from_state: str,
     to_state: str,
@@ -96,17 +93,14 @@ def _insert_transition(
     row = session.execute(
         sa_text("""
             INSERT INTO broker_transitions
-                (lane_id, prospect_id, broker_id,
-                 from_state, to_state, reason_code, actor)
+                (lane_id, broker_id, from_state, to_state, reason_code, actor)
             VALUES
-                (CAST(:lane_id AS uuid), CAST(:prospect_id AS uuid),
-                 CAST(:broker_id AS uuid),
+                (CAST(:lane_id AS uuid), CAST(:broker_id AS uuid),
                  :from_state, :to_state, :reason_code, :actor)
             RETURNING transition_id
         """),
         {
             "lane_id": str(lane_id),
-            "prospect_id": str(prospect_id),
             "broker_id": str(broker_id),
             "from_state": from_state,
             "to_state": to_state,
@@ -117,37 +111,6 @@ def _insert_transition(
     return str(row.transition_id)
 
 
-def _emit_transition(
-    session: Session,
-    *,
-    prospect_id: Any,
-    lane_id: str,
-    transition_id: str,
-    broker_id: str,
-    from_state: str,
-    to_state: str,
-    reason_code: str,
-    extra: dict | None = None,
-) -> None:
-    payload: dict[str, Any] = {
-        "lane_id": str(lane_id),
-        "prospect_id": str(prospect_id),
-        "transition_id": transition_id,
-        "broker_id": str(broker_id),
-        "from_state": from_state,
-        "to_state": to_state,
-        "reason_code": reason_code,
-    }
-    if extra:
-        payload.update(extra)
-    emit_event(
-        session,
-        event_type="broker.transition",
-        actor=str(broker_id),
-        source_component=_SOURCE,
-        prospect_id=prospect_id,
-        payload=payload,
-    )
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -172,7 +135,7 @@ def list_transitions(session: Session, lane_id: str) -> list[dict]:
     """Return all broker transitions for a lane, oldest first."""
     rows = session.execute(
         sa_text("""
-            SELECT transition_id, lane_id, prospect_id, broker_id,
+            SELECT transition_id, lane_id, broker_id,
                    from_state, to_state, reason_code, actor, occurred_at
             FROM broker_transitions
             WHERE lane_id = CAST(:lid AS uuid)
@@ -184,7 +147,6 @@ def list_transitions(session: Session, lane_id: str) -> list[dict]:
         {
             "transition_id": str(r.transition_id),
             "lane_id": str(r.lane_id),
-            "prospect_id": str(r.prospect_id),
             "broker_id": str(r.broker_id),
             "from_state": r.from_state,
             "to_state": r.to_state,
@@ -221,7 +183,7 @@ def assign_broker(
              WHERE lane_id = CAST(:lid AS uuid)
                AND assigned_broker_id IS NULL
                AND outcome = 'open'
-            RETURNING lane_id, prospect_id
+            RETURNING lane_id
         """),
         {"lid": str(lane_id), "bid": str(broker_id)},
     ).fetchone()
@@ -232,22 +194,11 @@ def assign_broker(
     tid = _insert_transition(
         session,
         lane_id=str(row.lane_id),
-        prospect_id=row.prospect_id,
         broker_id=broker_id,
         from_state="unassigned",
         to_state="assigned",
         reason_code="qualified",
         actor=_actor,
-    )
-    _emit_transition(
-        session,
-        prospect_id=row.prospect_id,
-        lane_id=str(row.lane_id),
-        transition_id=tid,
-        broker_id=broker_id,
-        from_state="unassigned",
-        to_state="assigned",
-        reason_code="qualified",
     )
     logger.info("[BrokerSM] claimed lane_id=%s broker_id=%s tid=%s", lane_id, broker_id, tid)
     return True
@@ -289,22 +240,11 @@ def reassign_lane(session: Session, lane_id: str, broker_id: str, actor: str) ->
     tid = _insert_transition(
         session,
         lane_id=lane_id,
-        prospect_id=lane.prospect_id,
         broker_id=broker_id,
         from_state=from_state,
         to_state="assigned",
         reason_code="qualified",
         actor=actor,
-    )
-    _emit_transition(
-        session,
-        prospect_id=lane.prospect_id,
-        lane_id=lane_id,
-        transition_id=tid,
-        broker_id=broker_id,
-        from_state=from_state,
-        to_state="assigned",
-        reason_code="qualified",
     )
     logger.info(
         "[BrokerSM] reassigned lane_id=%s broker_id=%s actor=%s from=%s tid=%s",
@@ -356,20 +296,9 @@ def transition(
             f"Broker {broker_id!r} does not own lane {lane_id!r}."
         )
 
-    if to_state == "closed_won":
-        if gross_amount_cents is None or split_config_id is None:
-            raise ClosedWonPayloadRequired(
-                "closed_won requires gross_amount_cents and split_config_id."
-            )
-        if not isinstance(gross_amount_cents, int) or gross_amount_cents < 0:
-            raise InvalidGrossAmount(
-                "gross_amount_cents must be a non-negative integer."
-            )
-
     tid = _insert_transition(
         session,
         lane_id=lane_id,
-        prospect_id=lane.prospect_id,
         broker_id=broker_id,
         from_state=from_state,
         to_state=to_state,
@@ -385,24 +314,6 @@ def transition(
         {"lid": str(lane_id)},
     )
 
-    extra: dict[str, Any] | None = None
-    if to_state == "closed_won":
-        extra = {
-            "gross_amount_cents": gross_amount_cents,
-            "split_config_id": split_config_id,
-        }
-
-    _emit_transition(
-        session,
-        prospect_id=lane.prospect_id,
-        lane_id=lane_id,
-        transition_id=tid,
-        broker_id=broker_id,
-        from_state=from_state,
-        to_state=to_state,
-        reason_code=reason_code,
-        extra=extra,
-    )
     logger.info(
         "[BrokerSM] transition lane_id=%s %s→%s broker_id=%s reason=%s",
         lane_id, from_state, to_state, broker_id, reason_code,

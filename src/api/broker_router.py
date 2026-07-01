@@ -6,6 +6,7 @@ Routes:
   GET  /api/broker/me                           — current broker profile
   POST /api/broker/forgot-password              — trigger password reset email
   POST /api/broker/reset-password               — apply new password from token
+  GET  /api/broker/states                       — work-state machine config (transitions, reason codes)
   GET  /api/broker/lanes                        — list broker's open lanes (LaneObject + BSM extensions)
   POST /api/broker/lanes/{lane_id}/claim        — self-claim an open lane
   POST /api/broker/lanes/{lane_id}/transition   — advance broker work-state
@@ -20,14 +21,17 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import bcrypt
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import text as sa_text
 from sqlalchemy.orm import Session
 
 from config.broker_states import (
+    ALLOWED_TRANSITIONS,
     InvalidBrokerReasonCode,
     InvalidBrokerState,
+    REASON_CODES_BY_STATE,
+    WORK_STATE_ORDER,
     get_allowed_next_states,
 )
 from src.api.deps import get_db
@@ -204,15 +208,73 @@ def forgot_password(body: _ForgotPasswordRequest, db: Session = Depends(get_db))
         db.commit()
         try:
             from src.services.email import send_email
+            from config.settings import get_settings as _get_settings
+            _s = _get_settings()
+            reset_url = f"{_s.app_base_url}/broker/reset-password/{reset_token}"
+            login_url = f"{_s.app_base_url}/broker/login"
             send_email(
                 to=row.email,
                 subject="Reset your broker portal password",
                 body_text=(
                     f"Hi {row.name},\n\n"
-                    f"Use this token to reset your password (valid 24 hours):\n\n"
-                    f"  {reset_token}\n\n"
-                    "If you did not request this, you can safely ignore this email."
+                    f"Click the link below to reset your password (valid 24 hours):\n\n"
+                    f"  {reset_url}\n\n"
+                    f"If you did not request this, you can safely ignore this email."
                 ),
+                body_html=f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/></head>
+<body style="margin:0;padding:0;background:#0f172a;font-family:Inter,Arial,sans-serif;color:#e2e8f0;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f172a;padding:40px 0;">
+    <tr><td align="center">
+      <table width="560" cellpadding="0" cellspacing="0"
+             style="background:#1e293b;border:1px solid rgba(255,255,255,0.08);border-radius:16px;overflow:hidden;max-width:560px;width:100%;">
+        <tr>
+          <td style="padding:28px 40px;border-bottom:1px solid rgba(255,255,255,0.08);">
+            <p style="margin:0;font-size:22px;font-weight:800;color:#ffffff;">
+              Forced <span style="color:#fbbf24;">Action</span>
+              <span style="margin-left:8px;font-size:13px;font-weight:600;color:#94a3b8;">Loan Lane</span>
+            </p>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:32px 40px;">
+            <h1 style="margin:0 0 8px;font-size:24px;font-weight:800;color:#ffffff;">
+              Password reset request
+            </h1>
+            <p style="margin:0 0 24px;color:#94a3b8;font-size:15px;">
+              Hi {row.name}, we received a request to reset your broker portal password.
+              Click the button below — this link is valid for <strong style="color:#ffffff;">24 hours</strong>.
+            </p>
+            <table cellpadding="0" cellspacing="0" style="margin-bottom:20px;">
+              <tr>
+                <td style="background:#fbbf24;border-radius:8px;">
+                  <a href="{reset_url}"
+                     style="display:inline-block;padding:14px 28px;color:#0f172a;font-size:15px;font-weight:700;text-decoration:none;">
+                    Reset My Password &rarr;
+                  </a>
+                </td>
+              </tr>
+            </table>
+            <p style="margin:0 0 16px;font-size:13px;color:#64748b;">
+              After resetting, log in at
+              <a href="{login_url}" style="color:#fbbf24;text-decoration:none;">{login_url}</a>
+            </p>
+            <p style="margin:0;font-size:13px;color:#64748b;">
+              Didn&rsquo;t request this? You can safely ignore this email — your password will not change.
+            </p>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.08);font-size:12px;color:#475569;text-align:center;">
+            Forced Action &mdash; Loan Lane Broker Portal
+          </td>
+        </tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>""",
             )
         except Exception:
             logger.warning("[broker] mailchimp reset email failed for %s", row.email)
@@ -253,6 +315,18 @@ def reset_password(body: _ResetPasswordRequest, db: Session = Depends(get_db)):
     )
     db.commit()
     return {"detail": "Password updated successfully."}
+
+
+# ── State machine config ──────────────────────────────────────────────────────
+
+@router.get("/states")
+def get_broker_states(broker: dict = Depends(get_current_broker)):
+    """Return the broker work-state machine config for UI consumption."""
+    return {
+        "allowed_transitions": {k: list(v) for k, v in ALLOWED_TRANSITIONS.items()},
+        "work_states": list(WORK_STATE_ORDER),
+        "reason_codes_by_state": {k: list(v) for k, v in REASON_CODES_BY_STATE.items()},
+    }
 
 
 # ── Lenders ───────────────────────────────────────────────────────────────────
@@ -393,10 +467,41 @@ def get_transition_history(
 def list_broker_lanes(
     broker: dict = Depends(get_current_broker),
     db: Session = Depends(get_db),
+    intent_tier: Optional[str] = Query(default=None),
+    work_state: Optional[str] = Query(default=None),
+    stage: Optional[str] = Query(default=None),
+    county: Optional[str] = Query(default=None),
+    lender_id: Optional[str] = Query(default=None),
+    entered_from: Optional[str] = Query(default=None),
+    entered_to: Optional[str] = Query(default=None),
+    activity_from: Optional[str] = Query(default=None),
+    activity_to: Optional[str] = Query(default=None),
+    sort_by: str = Query(default="last_activity"),
+    sort_dir: str = Query(default="desc"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
 ):
-    """Open lanes assigned to the calling broker — full LaneObject shape + BSM extensions."""
+    """Broker's own lanes with filtering and pagination."""
     broker_id = broker["broker_id"]
-    lanes, total = fetch_lanes(db, broker_id=broker_id, assigned_only=True, open_only=True)
+    lanes, total = fetch_lanes(
+        db,
+        broker_id=broker_id,
+        assigned_only=True,
+        open_only=False,
+        intent_tier=intent_tier,
+        work_state=work_state,
+        stage=stage,
+        county=county,
+        lender_id=lender_id,
+        entered_from=entered_from,
+        entered_to=entered_to,
+        activity_from=activity_from,
+        activity_to=activity_to,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
+        limit=limit,
+        offset=offset,
+    )
 
     result = []
     for lane in lanes:
@@ -414,4 +519,4 @@ def list_broker_lanes(
             "sms_eligible": sms_ok,
         })
 
-    return {"broker_id": broker_id, "lanes": result, "total": total}
+    return {"broker_id": broker_id, "lanes": result, "total": total, "limit": limit, "offset": offset}
