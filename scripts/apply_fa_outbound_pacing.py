@@ -32,8 +32,16 @@ def main() -> None:
     settings = get_settings()
     engine = create_engine(str(settings.database_url))
     with engine.begin() as conn:
-        for stmt in DDL:
-            conn.execute(text(stmt))
+        for i, stmt in enumerate(DDL, 1):
+            try:
+                conn.execute(text(stmt))
+                logger.info("DDL step %d/%d OK", i, len(DDL))
+            except Exception as exc:
+                logger.error(
+                    "DDL step %d/%d FAILED: %s\n\nStatement:\n%s",
+                    i, len(DDL), exc, stmt.strip(),
+                )
+                raise
     logger.info(
         "fa_outbound_pacing applied: outbound_queued_at + first_touch_sent_at + outbound_terminal ready"
     )

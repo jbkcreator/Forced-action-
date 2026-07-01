@@ -45,21 +45,29 @@ def check_outbound_delivery_backpressure(db: Session) -> float:
     Queries sms_send_logs for outbound_first_touch sends over the last hour.
     Failure rate = (suppressed + failed) / total_attempts.
     Returns 0.0 when sample size < _MIN_SAMPLE_SIZE to prevent premature
-    throttling on low-volume runs.
+    throttling on low-volume runs. Returns 1.0 (maximum backpressure) on any
+    DB error so a measurement failure throttles rather than opens the floodgate.
     """
     window_start = datetime.now(timezone.utc) - timedelta(hours=_BACKPRESSURE_WINDOW_HOURS)
 
-    row = db.execute(
-        text("""
-            SELECT
-                COUNT(*) AS total_attempts,
-                COUNT(*) FILTER (WHERE outcome IN ('suppressed', 'failed')) AS failed
-            FROM sms_send_logs
-            WHERE task_type  = 'outbound_first_touch'
-              AND created_at >= :window_start
-        """),
-        {"window_start": window_start},
-    ).mappings().first()
+    try:
+        row = db.execute(
+            text("""
+                SELECT
+                    COUNT(*) AS total_attempts,
+                    COUNT(*) FILTER (WHERE outcome IN ('suppressed', 'failed')) AS failed
+                FROM sms_send_logs
+                WHERE task_type  = 'outbound_first_touch'
+                  AND created_at >= :window_start
+            """),
+            {"window_start": window_start},
+        ).mappings().first()
+    except Exception as exc:
+        logger.error(
+            "check_outbound_delivery_backpressure: DB query failed — defaulting to max backpressure: %s",
+            exc, exc_info=True,
+        )
+        return 1.0
 
     total_attempts = int(row["total_attempts"] or 0) if row else 0
     failed = int(row["failed"] or 0) if row else 0
@@ -85,7 +93,7 @@ def process_new_outbound_targets(event_payload: dict, db: Session) -> str:
         "staged"      — mobile number staged for paced SMS dispatch
         "direct_mail" — non-mobile, flagged for direct mail
         "unroutable"  — landline/VoIP with no resolvable mailing address; left unrouted for retry
-        "skipped"     — contact not found or already routed (idempotent)
+        "skipped"     — contact not found, already routed, or lost a concurrent write race
     """
     contact_id: int = event_payload["contact_id"]
     property_id: int = event_payload["property_id"]
@@ -105,7 +113,7 @@ def process_new_outbound_targets(event_payload: dict, db: Session) -> str:
         return "skipped"
 
     if carrier_type == "mobile":
-        db.execute(
+        result = db.execute(
             text("""
                 UPDATE enriched_contacts
                 SET outbound_queued_at = :now
@@ -113,6 +121,10 @@ def process_new_outbound_targets(event_payload: dict, db: Session) -> str:
             """),
             {"cid": contact_id, "now": now},
         )
+        if result.rowcount == 0:  # type: ignore[union-attr]
+            # Concurrent writer set outbound_queued_at between our SELECT and UPDATE.
+            logger.debug("outbound_optimizer: race on contact_id=%d — already queued", contact_id)
+            return "skipped"
         logger.info(
             "outbound_optimizer: staged mobile contact_id=%d property_id=%d",
             contact_id, property_id,
@@ -128,7 +140,7 @@ def process_new_outbound_targets(event_payload: dict, db: Session) -> str:
         )
         return "unroutable"
 
-    db.execute(
+    result = db.execute(
         text("""
             UPDATE enriched_contacts
             SET outbound_queued_at = :now
@@ -136,6 +148,9 @@ def process_new_outbound_targets(event_payload: dict, db: Session) -> str:
         """),
         {"cid": contact_id, "now": now},
     )
+    if result.rowcount == 0:  # type: ignore[union-attr]
+        logger.debug("outbound_optimizer: race on contact_id=%d — already queued", contact_id)
+        return "skipped"
     logger.info(
         "outbound_optimizer: direct_mail contact_id=%d property_id=%d carrier=%s",
         contact_id, property_id, carrier_type,
