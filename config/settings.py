@@ -113,6 +113,11 @@ class AppSettings(BaseSettings):
 	stripe_price_dominator_regular: Optional[str] = Field(default=None, env="STRIPE_PRICE_DOMINATOR_REGULAR")
 	stripe_price_lead_pack: Optional[str] = Field(default=None, env="STRIPE_PRICE_LEAD_PACK")
 	stripe_price_hot_lead_unlock: Optional[str] = Field(default=None, env="STRIPE_PRICE_HOT_LEAD_UNLOCK")
+	# Disabled pending fix: successful payment_intent.succeeded for this product
+	# never records a SentLead/delivery row (checkout metadata doesn't propagate
+	# to the PaymentIntent) — a customer can pay $150/$99 with zero fulfillment
+	# record. Keep off until the fix ships.
+	hot_lead_unlock_enabled: bool = Field(default=False, env="HOT_LEAD_UNLOCK_ENABLED")
 	# 2B: Wallet tiers
 	stripe_price_wallet_starter: Optional[str] = Field(default=None, env="STRIPE_PRICE_WALLET_STARTER")
 	stripe_price_wallet_growth: Optional[str] = Field(default=None, env="STRIPE_PRICE_WALLET_GROWTH")

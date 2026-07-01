@@ -2149,16 +2149,19 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
                     SentLead.property_id == property_id,
                 )
             ).scalar_one_or_none()
+            amount_cents = _attr(payment_intent, "amount_received") or _attr(payment_intent, "amount")
             if not existing_sent:
                 db.add(SentLead(
                     subscriber_id=subscriber.id,
                     property_id=property_id,
                     source="lead_unlock_payment",
                     stripe_payment_intent_id=_attr(payment_intent, "id"),
+                    amount_cents=amount_cents,
                 ))
                 db.flush()
             elif existing_sent and not existing_sent.stripe_payment_intent_id:
                 existing_sent.stripe_payment_intent_id = _attr(payment_intent, "id")
+                existing_sent.amount_cents = amount_cents
     except (IntegrityError, OperationalError) as exc:
         logger.warning("lead_unlock: SentLead insert failed: %s", exc)
 
@@ -3537,6 +3540,7 @@ def _on_lead_pack_payment(payment_intent: dict, db: Session) -> None:
         status="pending",
         purchased_at=now,
         exclusive_until=exclusive_until,
+        amount_cents=_attr(payment_intent, "amount_received") or _attr(payment_intent, "amount"),
     )
     db.add(purchase)
     db.flush()

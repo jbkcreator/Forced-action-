@@ -1394,6 +1394,11 @@ class SentLead(Base):
     refund_reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     stripe_refund_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
 
+    # fa109: amount actually captured for this delivery, when paid via a
+    # one-time charge (lead_unlock/lead_pack). NULL for daily_email rows and
+    # for historical rows predating this column.
+    amount_cents: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
     __table_args__ = (
         UniqueConstraint("subscriber_id", "property_id", name="uq_sent_lead"),
         Index("idx_sent_lead_subscriber_sent_at", "subscriber_id", "sent_at"),
@@ -2133,6 +2138,10 @@ class LeadPackPurchase(Base):
 
     # The 5 selected property IDs (reserved at payment time)
     lead_ids: Mapped[Optional[list]] = mapped_column(ARRAY(Integer))
+
+    # fa109: amount actually captured at payment (cents). NULL for historical
+    # rows predating this column.
+    amount_cents: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
     # Relationship
     subscriber: Mapped["Subscriber"] = relationship("Subscriber")
