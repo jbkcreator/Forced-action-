@@ -1366,6 +1366,345 @@ def update_prompt_file(graph: str, filename: str, body: PromptUpdateBody):
 
 
 # ===========================================================================
+# BROKER STATE MACHINE — ADMIN ROUTES (Layer 3C)
+# ===========================================================================
+
+class _ReassignBrokerRequest(BaseModel):
+    broker_id: str
+
+
+@router.post("/lanes/{lane_id}/reassign-broker")
+def reassign_broker(
+    lane_id: str,
+    body: _ReassignBrokerRequest,
+    db: Session = Depends(get_db),
+    _admin: dict = Depends(get_current_admin),
+):
+    """Admin override — forcibly assign a broker to any open lane."""
+    from src.services.broker_state_machine import (
+        LaneNotFound as _LaneNotFound,
+        BrokerNotFound as _BrokerNotFound,
+        BrokerInactive as _BrokerInactive,
+        LaneNotOpen as _LaneNotOpen,
+        reassign_lane as _bsm_reassign,
+    )
+    try:
+        tid = _bsm_reassign(
+            db,
+            lane_id,
+            body.broker_id,
+            actor=_admin.get("sub", "admin"),
+        )
+    except _LaneNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except _BrokerNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except _BrokerInactive as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except _LaneNotOpen as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    return {
+        "lane_id": lane_id,
+        "assigned_broker_id": body.broker_id,
+        "broker_state": "assigned",
+        "transition_id": tid,
+        "status": "reassigned",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Broker management
+# ---------------------------------------------------------------------------
+
+class _CreateBrokerRequest(BaseModel):
+    email: str
+    name: str
+
+
+class _PatchBrokerRequest(BaseModel):
+    is_active: bool
+
+
+@router.post("/brokers", dependencies=[Depends(get_current_admin)])
+def create_broker_route(body: _CreateBrokerRequest, db: Session = Depends(get_db)):
+    """Create a new broker account and send an invite email."""
+    from src.services.broker_admin import BrokerAlreadyExists, create_broker as _create_broker
+    try:
+        broker = _create_broker(db, email=body.email, name=body.name)
+    except BrokerAlreadyExists as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    db.commit()
+    try:
+        from src.services.email import send_email
+        from config.settings import get_settings as _get_settings
+        _s = _get_settings()
+        reset_url = f"{_s.app_base_url}/broker/reset-password/{broker.reset_token}"
+        login_url = f"{_s.app_base_url}/broker/login"
+        send_email(
+            to=broker.email,
+            subject="You've been invited to the Loan Lane broker portal",
+            body_text=(
+                f"Hi {broker.name},\n\n"
+                f"An admin has created a broker account for you on the Loan Lane portal.\n\n"
+                f"Click the link below to set your password (expires in 30 days):\n\n"
+                f"  {reset_url}\n\n"
+                f"Once your password is set, log in at:\n  {login_url}\n\n"
+                "If you did not expect this invitation, you can safely ignore this email."
+            ),
+            body_html=f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/></head>
+<body style="margin:0;padding:0;background:#0f172a;font-family:Inter,Arial,sans-serif;color:#e2e8f0;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#0f172a;padding:40px 0;">
+    <tr><td align="center">
+      <table width="560" cellpadding="0" cellspacing="0"
+             style="background:#1e293b;border:1px solid rgba(255,255,255,0.08);border-radius:16px;overflow:hidden;max-width:560px;width:100%;">
+        <tr>
+          <td style="padding:28px 40px;border-bottom:1px solid rgba(255,255,255,0.08);">
+            <p style="margin:0;font-size:22px;font-weight:800;color:#ffffff;">
+              Forced <span style="color:#fbbf24;">Action</span>
+              <span style="margin-left:8px;font-size:13px;font-weight:600;color:#94a3b8;">Loan Lane</span>
+            </p>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:32px 40px;">
+            <h1 style="margin:0 0 8px;font-size:24px;font-weight:800;color:#ffffff;">
+              Welcome to the broker portal, {broker.name}.
+            </h1>
+            <p style="margin:0 0 24px;color:#94a3b8;font-size:15px;">
+              An admin has created a broker account for you. Click below to set your password and get started.
+            </p>
+            <table cellpadding="0" cellspacing="0" style="margin-bottom:20px;">
+              <tr>
+                <td style="background:#fbbf24;border-radius:8px;">
+                  <a href="{reset_url}"
+                     style="display:inline-block;padding:14px 28px;color:#0f172a;font-size:15px;font-weight:700;text-decoration:none;">
+                    Set Your Password &rarr;
+                  </a>
+                </td>
+              </tr>
+            </table>
+            <p style="margin:0 0 24px;font-size:13px;color:#64748b;">
+              This link expires in <strong style="color:#94a3b8;">30 days</strong>.
+              After setting your password you can always log in at
+              <a href="{login_url}" style="color:#fbbf24;text-decoration:none;">{login_url}</a>
+            </p>
+            <p style="margin:0;font-size:13px;color:#64748b;">
+              Not expecting this? You can safely ignore this email.
+            </p>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.08);font-size:12px;color:#475569;text-align:center;">
+            Forced Action &mdash; Loan Lane Broker Portal
+          </td>
+        </tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>""",
+        )
+    except Exception:
+        logger.warning("[Admin] mailchimp invite email failed for broker=%s", broker.email)
+    return {
+        "broker_id": str(broker.broker_id),
+        "email": broker.email,
+        "name": broker.name,
+        "is_active": broker.is_active,
+        "reset_token": broker.reset_token,
+    }
+
+
+@router.get("/brokers", dependencies=[Depends(get_current_admin)])
+def list_brokers_route(
+    include_inactive: bool = False,
+    db: Session = Depends(get_db),
+):
+    """List all brokers with open and assigned lane counts."""
+    where_clause = "" if include_inactive else "WHERE b.is_active = true"
+    rows = db.execute(
+        text(f"""
+            SELECT
+                b.broker_id, b.email, b.name, b.role, b.is_active, b.created_at,
+                COUNT(l.lane_id) FILTER (WHERE l.outcome = 'open') AS open_lanes,
+                COUNT(l.lane_id) FILTER (
+                    WHERE l.assigned_broker_id IS NOT NULL AND l.outcome = 'open'
+                ) AS assigned_lanes
+            FROM brokers b
+            LEFT JOIN lanes l ON l.assigned_broker_id = b.broker_id
+            {where_clause}
+            GROUP BY b.broker_id, b.email, b.name, b.role, b.is_active, b.created_at
+            ORDER BY b.created_at
+        """)
+    ).fetchall()
+    brokers = [
+        {
+            "broker_id": str(r.broker_id),
+            "email": r.email,
+            "name": r.name,
+            "role": r.role or "broker",
+            "is_active": r.is_active,
+            "open_lanes": int(r.open_lanes or 0),
+            "assigned_lanes": int(r.assigned_lanes or 0),
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in rows
+    ]
+    return {"brokers": brokers, "total": len(brokers)}
+
+
+@router.patch("/brokers/{broker_id}", dependencies=[Depends(get_current_admin)])
+def patch_broker_route(
+    broker_id: str,
+    body: _PatchBrokerRequest,
+    db: Session = Depends(get_db),
+):
+    """Activate or deactivate a broker account."""
+    from src.services.broker_admin import set_broker_active
+    try:
+        broker = set_broker_active(db, broker_id, body.is_active)
+    except Exception as exc:
+        if "not found" in str(exc).lower():
+            raise HTTPException(status_code=404, detail=str(exc))
+        raise
+    return {
+        "broker_id": str(broker.broker_id),
+        "email": broker.email,
+        "name": broker.name,
+        "is_active": broker.is_active,
+    }
+
+
+@router.get("/brokers/{broker_id}/lanes", dependencies=[Depends(get_current_admin)])
+def get_broker_lanes_route(
+    broker_id: str,
+    include_closed: bool = False,
+    db: Session = Depends(get_db),
+):
+    """List lanes assigned to a specific broker."""
+    where_extra = "" if include_closed else "AND l.outcome = 'open'"
+    rows = db.execute(
+        text(f"""
+            SELECT l.lane_id, l.prospect_id, l.lane_type, l.current_stage,
+                   l.outcome, l.claimed_at, l.last_activity_at
+            FROM lanes l
+            WHERE l.assigned_broker_id = CAST(:bid AS uuid)
+            {where_extra}
+            ORDER BY l.last_activity_at DESC NULLS LAST
+        """),
+        {"bid": broker_id},
+    ).fetchall()
+    lanes = [
+        {
+            "lane_id": str(r.lane_id),
+            "prospect_id": str(r.prospect_id),
+            "lane_type": r.lane_type,
+            "current_stage": r.current_stage,
+            "outcome": r.outcome,
+            "claimed_at": r.claimed_at.isoformat() if r.claimed_at else None,
+            "last_activity_at": r.last_activity_at.isoformat() if r.last_activity_at else None,
+        }
+        for r in rows
+    ]
+    return {"broker_id": broker_id, "lanes": lanes, "count": len(lanes)}
+
+
+# ---------------------------------------------------------------------------
+# Lender curation
+# ---------------------------------------------------------------------------
+
+class _CreateLenderRequest(BaseModel):
+    name: str
+
+
+class _PatchLenderRequest(BaseModel):
+    name: Optional[str] = None
+    is_cleared: Optional[bool] = None
+    is_active: Optional[bool] = None
+
+
+@router.get("/lenders", dependencies=[Depends(get_current_admin)])
+def list_lenders_admin(
+    include_inactive: bool = False,
+    db: Session = Depends(get_db),
+):
+    """List lenders for admin curation."""
+    where = "" if include_inactive else "WHERE is_active = true"
+    rows = db.execute(
+        text(
+            f"SELECT lender_id, name, is_cleared, is_active, created_at "
+            f"FROM lenders {where} ORDER BY name"
+        )
+    ).fetchall()
+    return {
+        "lenders": [
+            {
+                "lender_id": str(r.lender_id),
+                "name": r.name,
+                "is_cleared": r.is_cleared,
+                "is_active": r.is_active,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ]
+    }
+
+
+@router.post("/lenders", dependencies=[Depends(get_current_admin)])
+def create_lender_admin(body: _CreateLenderRequest, db: Session = Depends(get_db)):
+    """Create a new lender."""
+    row = db.execute(
+        text(
+            "INSERT INTO lenders (name, is_cleared, is_active) "
+            "VALUES (:name, false, true) "
+            "RETURNING lender_id, name, is_cleared, is_active"
+        ),
+        {"name": body.name.strip()},
+    ).fetchone()
+    db.commit()
+    return {
+        "lender_id": str(row.lender_id),
+        "name": row.name,
+        "is_cleared": row.is_cleared,
+        "is_active": row.is_active,
+    }
+
+
+@router.patch("/lenders/{lender_id}", dependencies=[Depends(get_current_admin)])
+def patch_lender_admin(
+    lender_id: str,
+    body: _PatchLenderRequest,
+    db: Session = Depends(get_db),
+):
+    """Toggle is_cleared / is_active or rename a lender."""
+    updates = body.model_dump(exclude_none=True)
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update.")
+    set_clauses = ", ".join(f"{k} = :{k}" for k in updates)
+    params = {**updates, "lid": lender_id}
+    row = db.execute(
+        text(
+            f"UPDATE lenders SET {set_clauses}, updated_at = NOW() "
+            f"WHERE lender_id = CAST(:lid AS uuid) "
+            f"RETURNING lender_id, name, is_cleared, is_active"
+        ),
+        params,
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Lender not found.")
+    db.commit()
+    return {
+        "lender_id": str(row.lender_id),
+        "name": row.name,
+        "is_cleared": row.is_cleared,
+        "is_active": row.is_active,
+    }
+
+
+# ===========================================================================
 # DEV TOOLS GATE
 # ===========================================================================
 

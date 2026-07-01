@@ -6811,12 +6811,15 @@ class Broker(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, server_default=func.now()
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
 
     __table_args__ = (
         CheckConstraint("role = 'broker'", name="ck_brokers_role"),
     )
+
+    def __repr__(self) -> str:
+        return f"<Broker(broker_id={self.broker_id!r}, email={self.email!r}, active={self.is_active})>"
 
 
 class Lender(Base):
@@ -6839,15 +6842,15 @@ class Lender(Base):
 
 
 class Lane(Base):
-    """Loan Lane funnel record — one per prospect routed to loan_lane channel."""
+    """Loan Lane funnel record — one per property/prospect routed to loan_lane channel."""
 
     __tablename__ = "lanes"
 
     lane_id: Mapped[str] = mapped_column(
         PG_UUID(as_uuid=True), primary_key=True, server_default=text("generate_uuidv7()")
     )
-    prospect_id: Mapped[str] = mapped_column(
-        PG_UUID(as_uuid=True), ForeignKey("prospects.prospect_id"), nullable=False
+    property_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("properties.id", name="fk_lanes_property_id"), nullable=False
     )
     lane_type: Mapped[str] = mapped_column(String(50), nullable=False)
     loan_program: Mapped[Optional[str]] = mapped_column(String(50))
@@ -6886,7 +6889,7 @@ class Lane(Base):
             "outcome IN ('open','funded','dead','recycled')",
             name="ck_lanes_outcome",
         ),
-        Index("idx_lanes_prospect_id", "prospect_id"),
+        UniqueConstraint("property_id", "lane_type", name="uq_lanes_property_lane_type"),
         Index("idx_lanes_open", "outcome", postgresql_where=text("outcome = 'open'")),
         Index("idx_lanes_broker", "assigned_broker_id"),
     )
@@ -6902,9 +6905,6 @@ class BrokerTransition(Base):
     )
     lane_id: Mapped[str] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("lanes.lane_id"), nullable=False
-    )
-    prospect_id: Mapped[str] = mapped_column(
-        PG_UUID(as_uuid=True), ForeignKey("prospects.prospect_id"), nullable=False
     )
     broker_id: Mapped[str] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("brokers.broker_id"), nullable=False
@@ -6923,7 +6923,7 @@ class BrokerTransition(Base):
             name="ck_bt_to_state",
         ),
         Index("idx_bt_lane_id", "lane_id"),
-        Index("idx_bt_prospect_id", "prospect_id"),
+        Index("idx_bt_broker_id", "broker_id"),
         Index("idx_bt_lane_occurred", "lane_id", "occurred_at"),
     )
 
@@ -6951,9 +6951,6 @@ class CommissionLedgerEntry(Base):
 
     entry_id: Mapped[str] = mapped_column(
         PG_UUID(as_uuid=True), primary_key=True, server_default=text("generate_uuidv7()")
-    )
-    prospect_id: Mapped[str] = mapped_column(
-        PG_UUID(as_uuid=True), ForeignKey("prospects.prospect_id"), nullable=False
     )
     lane_id: Mapped[str] = mapped_column(
         PG_UUID(as_uuid=True), ForeignKey("lanes.lane_id"), nullable=False

@@ -185,6 +185,12 @@ from src.api.score_feedback_router import router as score_feedback_router  # noq
 app.include_router(score_feedback_router)
 from src.api.underwriting_router import router as underwriting_router  # noqa: E402
 app.include_router(underwriting_router)
+from src.api.broker_router import router as broker_router  # noqa: E402
+app.include_router(broker_router)
+from src.api.loan_lane_router import router as loan_lane_router  # noqa: E402
+app.include_router(loan_lane_router)
+from src.api.commission_router import router as commission_router  # noqa: E402
+app.include_router(commission_router)
 
 
 # ---------------------------------------------------------------------------
