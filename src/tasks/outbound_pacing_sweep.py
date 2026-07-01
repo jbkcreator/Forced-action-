@@ -4,12 +4,16 @@ Outbound pacing sweep — routes and dispatches first-touch outbound contacts (f
 Phase A: Route newly enriched contacts to the correct outbound channel.
   - Mobile phones    → staged for paced SMS dispatch (sets outbound_queued_at)
   - Landlines / VoIP / unknown → direct mail flag via direct_mail.py
+  - No mailing address found   → left unrouted (outbound_queued_at stays NULL)
 
 Phase B: Dispatch staged mobile contacts with adaptive pacing.
-  - Reads live engagement drop-off from message_outcomes
+  - Reads live delivery failure rate from sms_send_logs (outbound_first_touch)
   - Applies exponential backoff delay between sends
   - At high backpressure (delay >= 60s), processes 1 contact per cron tick;
     the 5-minute interval itself provides the effective inter-batch wait.
+  - Permanent failures (DNC, opt-out, invalid phone) are marked outbound_terminal=TRUE
+    and excluded from future sweeps; transient failures (quiet hours) retry normally.
+  - Each send commits independently so a crash cannot cause duplicate sends.
 
 Run:
     python -m src.tasks.outbound_pacing_sweep                          # both counties
@@ -46,6 +50,17 @@ _DEFAULT_COUNTIES = ["hillsborough", "pinellas"]
 _DEFAULT_LIMIT = 50
 _PHASE_A_BATCH = 200
 
+# suppress_reason values written by sms_compliance that indicate a permanent failure.
+# These contacts will never be reachable by SMS and must not re-enter the queue.
+_TERMINAL_SUPPRESS_REASONS = frozenset({
+    "dnc_or_opted_out",
+    "dnc_check_required",
+    "invalid_phone",
+    "unresolvable",
+    "prospect_not_contactable",
+    "prospect_sms_consent_withdrawn",
+})
+
 _COUNTY_CITY: dict[str, str] = {
     "hillsborough": "Tampa",
     "pinellas":     "Pinellas County",
@@ -64,7 +79,7 @@ def _first_touch_body(county_id: str) -> str:
 
 def _phase_a(county_id: str, db, dry_run: bool) -> dict:
     """Route unprocessed enriched contacts to mobile queue or direct mail."""
-    stats = {"routed_mobile": 0, "routed_direct_mail": 0, "skipped": 0}
+    stats = {"routed_mobile": 0, "routed_direct_mail": 0, "unroutable": 0, "skipped": 0}
 
     rows = db.execute(
         text("""
@@ -73,6 +88,7 @@ def _phase_a(county_id: str, db, dry_run: bool) -> dict:
             WHERE county_id          = :county_id
               AND match_success       = true
               AND outbound_queued_at  IS NULL
+              AND (outbound_terminal IS NULL OR outbound_terminal = FALSE)
               AND (mobile_phone IS NOT NULL OR landline IS NOT NULL)
             ORDER BY enriched_at ASC
             LIMIT :batch
@@ -110,19 +126,31 @@ def _phase_a(county_id: str, db, dry_run: bool) -> dict:
             stats["routed_mobile"] += 1
         elif result == "direct_mail":
             stats["routed_direct_mail"] += 1
+        elif result == "unroutable":
+            stats["unroutable"] += 1
         else:
             stats["skipped"] += 1
 
     logger.info(
-        "[OutboundPacing][A] county=%s mobile=%d direct_mail=%d skipped=%d",
-        county_id, stats["routed_mobile"], stats["routed_direct_mail"], stats["skipped"],
+        "[OutboundPacing][A] county=%s mobile=%d direct_mail=%d unroutable=%d skipped=%d",
+        county_id, stats["routed_mobile"], stats["routed_direct_mail"],
+        stats["unroutable"], stats["skipped"],
     )
     return stats
 
 
+def _mark_terminal(contact_id: int) -> None:
+    """Stamp outbound_terminal=TRUE in a separate short-lived session so it commits immediately."""
+    with get_db_context() as db:
+        db.execute(
+            text("UPDATE enriched_contacts SET outbound_terminal = TRUE WHERE id = :cid"),
+            {"cid": contact_id},
+        )
+
+
 def _phase_b(county_id: str, limit: int, db, dry_run: bool) -> dict:
     """Dispatch staged mobile contacts with adaptive pacing."""
-    stats = {"sent": 0, "suppressed": 0, "errors": 0}
+    stats = {"sent": 0, "suppressed": 0, "terminal": 0, "errors": 0}
 
     drop_rate = check_outbound_delivery_backpressure(db)
     pacing_delay = calculate_pacing_delay(drop_rate)
@@ -145,6 +173,7 @@ def _phase_b(county_id: str, limit: int, db, dry_run: bool) -> dict:
               AND mobile_phone        IS NOT NULL
               AND outbound_queued_at  IS NOT NULL
               AND first_touch_sent_at IS NULL
+              AND (outbound_terminal IS NULL OR outbound_terminal = FALSE)
             ORDER BY outbound_queued_at ASC
             LIMIT :max_per_run
             FOR UPDATE SKIP LOCKED
@@ -156,12 +185,13 @@ def _phase_b(county_id: str, limit: int, db, dry_run: bool) -> dict:
         return stats
 
     for i, row in enumerate(rows):
+        contact_id = row["id"]
         phone = row["mobile_phone"]
 
         if dry_run:
             logger.info(
                 "[OutboundPacing][B][DRY RUN] county=%s contact_id=%d phone=%s delay=%.1fs",
-                county_id, row["id"], phone, pacing_delay,
+                county_id, contact_id, phone, pacing_delay,
             )
             stats["sent"] += 1
             continue
@@ -183,33 +213,58 @@ def _phase_b(county_id: str, limit: int, db, dry_run: bool) -> dict:
             )
 
             if ok:
-                db.execute(
-                    text("""
-                        UPDATE enriched_contacts
-                        SET first_touch_sent_at = :now
-                        WHERE id = :cid
-                    """),
-                    {"cid": row["id"], "now": datetime.now(timezone.utc)},
-                )
+                # Commit immediately in a short session — prevents duplicate sends on crash.
+                with get_db_context() as commit_db:
+                    commit_db.execute(
+                        text("""
+                            UPDATE enriched_contacts
+                            SET first_touch_sent_at = :now
+                            WHERE id = :cid
+                        """),
+                        {"cid": contact_id, "now": datetime.now(timezone.utc)},
+                    )
                 stats["sent"] += 1
                 logger.info(
                     "[OutboundPacing][B] sent contact_id=%d property_id=%d",
-                    row["id"], row["property_id"],
+                    contact_id, row["property_id"],
                 )
             else:
-                # Suppressed by compliance gate (DNC / opt-out / quiet hours).
-                # Do NOT set first_touch_sent_at — quiet-hours contacts retry next sweep.
-                stats["suppressed"] += 1
-                logger.warning(
-                    "[OutboundPacing][B] suppressed contact_id=%d phone=%s",
-                    row["id"], phone,
-                )
+                # Determine whether this is a permanent or transient failure by reading
+                # the suppress_reason just written to sms_send_logs by send_sms().
+                log_row = db.execute(
+                    text("""
+                        SELECT suppress_reason
+                        FROM sms_send_logs
+                        WHERE phone    = :phone
+                          AND task_type = 'outbound_first_touch'
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                    """),
+                    {"phone": phone},
+                ).mappings().first()
+
+                suppress_reason = log_row["suppress_reason"] if log_row else None
+
+                if suppress_reason in _TERMINAL_SUPPRESS_REASONS:
+                    _mark_terminal(contact_id)
+                    stats["terminal"] += 1
+                    logger.info(
+                        "[OutboundPacing][B] terminal contact_id=%d reason=%s",
+                        contact_id, suppress_reason,
+                    )
+                else:
+                    # Transient (quiet hours, frequency cap) — leave for retry next sweep.
+                    stats["suppressed"] += 1
+                    logger.warning(
+                        "[OutboundPacing][B] suppressed contact_id=%d phone=%s reason=%s",
+                        contact_id, phone, suppress_reason,
+                    )
 
         except Exception as exc:
             stats["errors"] += 1
             logger.error(
                 "[OutboundPacing][B] error contact_id=%d: %s",
-                row["id"], exc, exc_info=True,
+                contact_id, exc, exc_info=True,
             )
 
         # Sleep between sends — skip after the last item in the batch
@@ -217,8 +272,8 @@ def _phase_b(county_id: str, limit: int, db, dry_run: bool) -> dict:
             time.sleep(pacing_delay)
 
     logger.info(
-        "[OutboundPacing][B] county=%s sent=%d suppressed=%d errors=%d",
-        county_id, stats["sent"], stats["suppressed"], stats["errors"],
+        "[OutboundPacing][B] county=%s sent=%d suppressed=%d terminal=%d errors=%d",
+        county_id, stats["sent"], stats["suppressed"], stats["terminal"], stats["errors"],
     )
     return stats
 
@@ -272,8 +327,8 @@ if __name__ == "__main__":
         results = run(county_ids=county_ids, limit=args.limit, dry_run=args.dry_run)
         for cid, r in results.items():
             print(f"\n[{cid}]")
-            print(f"  Phase A: mobile={r['phase_a']['routed_mobile']}  direct_mail={r['phase_a']['routed_direct_mail']}")
-            print(f"  Phase B: sent={r['phase_b']['sent']}  suppressed={r['phase_b']['suppressed']}  errors={r['phase_b']['errors']}")
+            print(f"  Phase A: mobile={r['phase_a']['routed_mobile']}  direct_mail={r['phase_a']['routed_direct_mail']}  unroutable={r['phase_a']['unroutable']}")
+            print(f"  Phase B: sent={r['phase_b']['sent']}  suppressed={r['phase_b']['suppressed']}  terminal={r['phase_b']['terminal']}  errors={r['phase_b']['errors']}")
         sys.exit(0)
     except Exception as exc:
         logger.error("[OutboundPacing] crashed: %s", exc, exc_info=True)

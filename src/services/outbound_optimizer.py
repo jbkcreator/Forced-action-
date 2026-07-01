@@ -3,7 +3,7 @@ Outbound optimization service — adaptive pacing and channel routing (fa5.3).
 
 Three public functions:
   calculate_pacing_delay(drop_rate)              — exponential backoff formula
-  check_outbound_delivery_backpressure(db)        — live engagement drop-off rate
+  check_outbound_delivery_backpressure(db)        — live delivery failure rate
   process_new_outbound_targets(event_payload, db) — route contact to channel
 """
 from __future__ import annotations
@@ -40,36 +40,34 @@ def calculate_pacing_delay(drop_rate: float) -> float:
 
 def check_outbound_delivery_backpressure(db: Session) -> float:
     """
-    Return the current SMS conversion drop-off rate as a float in [0.0, 1.0].
+    Return the current outbound delivery failure rate as a float in [0.0, 1.0].
 
-    Queries message_outcomes over the last hour. Engagement = any message with
-    a reply or link click. Returns 0.0 when sample size < _MIN_SAMPLE_SIZE to
-    prevent premature throttling on low-volume runs.
+    Queries sms_send_logs for outbound_first_touch sends over the last hour.
+    Failure rate = (suppressed + failed) / total_attempts.
+    Returns 0.0 when sample size < _MIN_SAMPLE_SIZE to prevent premature
+    throttling on low-volume runs.
     """
     window_start = datetime.now(timezone.utc) - timedelta(hours=_BACKPRESSURE_WINDOW_HOURS)
 
     row = db.execute(
         text("""
             SELECT
-                COUNT(*) FILTER (WHERE send_status = 'sent') AS total_sent,
-                COUNT(*) FILTER (
-                    WHERE send_status = 'sent'
-                      AND (replied_at IS NOT NULL OR clicked_at IS NOT NULL)
-                ) AS engaged
-            FROM message_outcomes
-            WHERE sent_at >= :window_start
-              AND message_type = 'sms'
+                COUNT(*) AS total_attempts,
+                COUNT(*) FILTER (WHERE outcome IN ('suppressed', 'failed')) AS failed
+            FROM sms_send_logs
+            WHERE task_type  = 'outbound_first_touch'
+              AND created_at >= :window_start
         """),
         {"window_start": window_start},
     ).mappings().first()
 
-    total_sent = int(row["total_sent"] or 0) if row else 0
-    engaged = int(row["engaged"] or 0) if row else 0
+    total_attempts = int(row["total_attempts"] or 0) if row else 0
+    failed = int(row["failed"] or 0) if row else 0
 
-    if total_sent < _MIN_SAMPLE_SIZE:
+    if total_attempts < _MIN_SAMPLE_SIZE:
         return 0.0
 
-    return max(0.0, min(1.0, 1.0 - (engaged / total_sent)))
+    return max(0.0, min(1.0, failed / total_attempts))
 
 
 def process_new_outbound_targets(event_payload: dict, db: Session) -> str:
@@ -84,9 +82,10 @@ def process_new_outbound_targets(event_payload: dict, db: Session) -> str:
         }
 
     Returns:
-        "staged"       — mobile number staged for paced SMS dispatch
-        "direct_mail"  — non-mobile, flagged for direct mail
-        "skipped"      — contact not found or already routed (idempotent)
+        "staged"      — mobile number staged for paced SMS dispatch
+        "direct_mail" — non-mobile, flagged for direct mail
+        "unroutable"  — landline/VoIP with no resolvable mailing address; left unrouted for retry
+        "skipped"     — contact not found or already routed (idempotent)
     """
     contact_id: int = event_payload["contact_id"]
     property_id: int = event_payload["property_id"]
@@ -120,8 +119,15 @@ def process_new_outbound_targets(event_payload: dict, db: Session) -> str:
         )
         return "staged"
 
-    # Landline / VoIP / unknown → direct mail
-    flag_direct_mail_eligible(property_id, db)
+    # Landline / VoIP / unknown → direct mail only if a mailing address can be resolved.
+    flagged = flag_direct_mail_eligible(property_id, db)
+    if not flagged:
+        logger.warning(
+            "outbound_optimizer: no mailing address for property_id=%d contact_id=%d — left unrouted",
+            property_id, contact_id,
+        )
+        return "unroutable"
+
     db.execute(
         text("""
             UPDATE enriched_contacts
