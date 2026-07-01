@@ -63,14 +63,26 @@ def enter_lane(
 
     stage = _lowest_stage(session, lane_type)
 
+    # Conflict-safe insert: concurrent callers race on the (property_id, lane_type)
+    # unique constraint. The winner gets the row back; a loser gets no row and
+    # re-selects the existing lane — so this is idempotent under concurrency.
     row = session.execute(
         text("""
             INSERT INTO lanes (property_id, lane_type, loan_program, current_stage)
             VALUES (:pid, :lt, :program, :stage)
+            ON CONFLICT (property_id, lane_type) DO NOTHING
             RETURNING lane_id
         """),
         {"pid": property_id, "lt": lane_type, "program": loan_program, "stage": stage},
     ).fetchone()
+
+    if row is None:
+        existing = session.execute(
+            text("SELECT lane_id FROM lanes WHERE property_id = :pid AND lane_type = :lt"),
+            {"pid": property_id, "lt": lane_type},
+        ).fetchone()
+        logger.info("[LoanLane] enter_lane race — returning existing lane_id=%s", existing.lane_id)
+        return str(existing.lane_id)
 
     lane_id = str(row.lane_id)
     logger.info("[LoanLane] entered lane_id=%s property_id=%s stage=%s", lane_id, property_id, stage)
@@ -137,7 +149,7 @@ def advance_lane(session: Session, lane_id: str, to_stage: str, actor: str) -> N
             )
 
     session.execute(
-        text("UPDATE lanes SET current_stage = :stage, updated_at = NOW() WHERE lane_id = CAST(:lid AS uuid)"),
+        text("UPDATE lanes SET current_stage = :stage, last_activity_at = NOW(), updated_at = NOW() WHERE lane_id = CAST(:lid AS uuid)"),
         {"stage": to_stage, "lid": str(lane_id)},
     )
     logger.info("[LoanLane] advanced lane_id=%s %s→%s", lane_id, lane.current_stage, to_stage)

@@ -113,6 +113,7 @@ def get_pool(
         open_only=True,
         redact_contact=True,
         has_contact=True,
+        exclude_guess_leads=True,
         intent_tier=intent_tier,
         stage=stage,
         county=county,

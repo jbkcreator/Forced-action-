@@ -203,6 +203,11 @@ COUNTY_ID=hillsborough
 # refunds (releasing the reservation). Stale claims self-heal after 15 min.
 */2 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lead_pack_fulfillment_sweep
 
+# Loan Lane event sweep (WS-C) — every 2 min, offset 1 min from lead-pack sweep.
+# Polls broker.transition events → lane_closer (closed_won→funded, closed_lost→
+# dead) + commission_poster (closed_won→post commission). Both idempotent.
+1-59/2 * * * * $PROJECT/scripts/cron/run.sh src.tasks.loan_lane_sweep
+
 # Cora anomaly check — volume + no-answer rate monitor — every 15 min
 */15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.cora_anomaly_check
 

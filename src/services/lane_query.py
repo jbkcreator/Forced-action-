@@ -184,6 +184,7 @@ def fetch_lanes(
     redact_contact: bool = False,
     # contact availability filters
     has_contact: bool = False,          # system gate: phone OR email present (broker pool)
+    exclude_guess_leads: bool = False,  # pool gate: drop leads whose latest score is a guess lead
     contact_filter: str | None = None,  # admin lens: has_phone|has_email|has_both|no_contact
     # user-facing filters
     intent_tier: str | None = None,
@@ -271,6 +272,15 @@ def fetch_lanes(
         params["activity_to"] = activity_to
     if has_contact:
         where_parts.append("EXISTS (SELECT 1 FROM owners _co WHERE _co.property_id = l.property_id AND (_co.phone_1 IS NOT NULL OR _co.email_1 IS NOT NULL))")
+    if exclude_guess_leads:
+        # Latest distress score for the property must not be a guess lead. No score
+        # at all → excluded (mirrors get_pool's inner join). Keyed on l only so it
+        # holds in the COUNT query too.
+        where_parts.append(
+            "COALESCE((SELECT ds.is_guess_lead FROM distress_scores ds "
+            "WHERE ds.property_id = l.property_id "
+            "ORDER BY ds.score_date DESC, ds.id DESC LIMIT 1), true) = false"
+        )
     if contact_filter and contact_filter in _CONTACT_FILTER_SQL:
         where_parts.append(_CONTACT_FILTER_SQL[contact_filter])
 

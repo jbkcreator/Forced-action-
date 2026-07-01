@@ -30,10 +30,12 @@ _COMMISSION_SELECT = """
         b.name              AS broker_name,
         cl.gross_amount_cents,
         cl.net_lines,
+        cl.split_config_id,
         cl.status,
         cl.trigger_transition_id,
         cl.posted_at,
         l.property_id,
+        l.fee_config_flag,
         pr.address          AS property_address,
         pr.county_id        AS property_county
     FROM commission_ledger cl
@@ -44,14 +46,26 @@ _COMMISSION_SELECT = """
 
 
 def _serialize_entry(row) -> dict:
+    """Serialize a commission row to the flat shape the UI binds to.
+
+    Fee gate (§5B/D7): while the lane's fee_config_flag is OFF (pre-RESPA), the
+    money fields (gross_amount_cents, net_lines) are hidden — the row is still
+    returned so it lists/counts, but dollars are null until the flag is ON.
+    """
+    fee_visible = bool(getattr(row, "fee_config_flag", False))
     return {
         "entry_id": str(row.entry_id),
         "lane_id": str(row.lane_id) if row.lane_id else None,
         "broker_id": str(row.broker_id) if row.broker_id else None,
         "broker_name": row.broker_name,
-        "gross_amount_cents": int(row.gross_amount_cents) if row.gross_amount_cents is not None else None,
-        "net_lines": row.net_lines,
+        "gross_amount_cents": (
+            int(row.gross_amount_cents)
+            if fee_visible and row.gross_amount_cents is not None else None
+        ),
+        "net_lines": row.net_lines if fee_visible else None,
+        "split_config_id": getattr(row, "split_config_id", None),
         "status": row.status,
+        "fee_config_flag": fee_visible,
         "trigger_transition_id": str(row.trigger_transition_id) if row.trigger_transition_id else None,
         "posted_at": row.posted_at.isoformat() if row.posted_at else None,
         "property": {
