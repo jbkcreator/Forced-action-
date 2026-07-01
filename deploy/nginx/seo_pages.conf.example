@@ -1,0 +1,33 @@
+# Task 5.2 — Programmatic SEO Engine · Nginx routing
+#
+# Paste these blocks into the server's existing `server { ... }` for the
+# production domain (nginx.conf is server-managed / gitignored). They serve the
+# static pages the weekly compiler writes to SEO_OUTPUT_DIR (default
+# dist/seo/florida) and expose the sitemap at the domain root.
+#
+# Assumes the repo is deployed at /root/Forced-action- (adjust `root` paths).
+# Order matters: put the sitemap `location =` before the SPA catch-all so it
+# isn't swallowed by the React fallback.
+
+# --- sitemap.xml (compiler writes it to dist/seo/sitemap.xml) ---
+location = /sitemap.xml {
+    alias /root/Forced-action-/dist/seo/sitemap.xml;
+    add_header Cache-Control "public, max-age=3600";
+    access_log off;
+}
+
+# --- programmatic SEO pages: /florida/{city}/{topic}/ ---
+# Pages are written as .../{city}/{topic}/index.html. try_files resolves the
+# trailing-slash directory to its index.html, else 404 (never the SPA shell —
+# a retired/absent page must 404, not render the app).
+location /florida/ {
+    root /root/Forced-action-/dist/seo;
+    try_files $uri $uri/index.html =404;
+    add_header Cache-Control "public, max-age=3600";
+}
+
+# NOTE: /florida/ lives under dist/seo/florida/, and `root` (not `alias`) means
+# nginx appends the full URI to root — so /florida/tampa/wholesalers/ maps to
+# /root/Forced-action-/dist/seo/florida/tampa/wholesalers/index.html. Correct.
+#
+# After adding: `nginx -t && systemctl reload nginx`.

@@ -1,0 +1,18 @@
+{% if faq %}
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    {
+      "@type": "Question",
+      "name": {{ faq.title | tojson }},
+      "acceptedAnswer": {
+        "@type": "Answer",
+        "text": {{ (faq.answer_draft.body if faq and faq.answer_draft and faq.answer_draft.body else "") | tojson }}
+      }
+    }
+  ]
+}
+</script>
+{% endif %}

@@ -1,0 +1,13 @@
+{% if faq %}
+<section class="faq" id="faq">
+    <h2>Frequently Asked Questions</h2>
+    <div class="faq-item">
+        <h3>{{ faq.title }}</h3>
+        {% if faq.answer_draft and faq.answer_draft.body %}
+        <div class="faq-answer">
+            <p>{{ faq.answer_draft.body }}</p>
+        </div>
+        {% endif %}
+    </div>
+</section>
+{% endif %}

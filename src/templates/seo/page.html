@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+
+{% block title %}{{ city }}, FL {{ vertical.replace('_', ' ').title() }} &amp; Distressed Homes | Forced Action{% endblock %}
+
+{% block head_extra %}
+{% include "_jsonld.html" %}
+{% endblock %}
+
+{% block content %}
+<main>
+    <h1>{{ city }}, FL {{ vertical.replace('_', ' ').title() }} &amp; Distressed Homes</h1>
+
+    <p class="lead-prose">
+        There are currently <strong>{{ stats.qualified_count }}</strong> distressed properties
+        in {{ city }}, FL qualifying under the {{ vertical.replace('_', ' ') }} investment
+        profile{% if stats.avg_value %}, with an average estimated value of
+        <strong>${{ "{:,.0f}".format(stats.avg_value) }}</strong>{% endif %}.
+        {% if stats.absentee_count %}
+        Of these, <strong>{{ stats.absentee_count }}</strong> are owned by absentee landlords —
+        a strong indicator of motivated-seller opportunity.
+        {% endif %}
+    </p>
+
+    {% include "_stat_cards.html" %}
+    {% include "_signal_sections.html" %}
+    {% include "_faq.html" %}
+
+    <section class="cta">
+        <h2>Access Full Property Data for {{ city }}</h2>
+        <p>Get contact info, ownership details, and investment analysis for every
+           distressed property on this list.</p>
+        <a href="https://app.forcedaction.io/signup" class="cta-button">Get Started Free</a>
+    </section>
+</main>
+{% endblock %}
