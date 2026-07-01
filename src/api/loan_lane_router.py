@@ -147,19 +147,24 @@ def get_lane_detail(
 
     token = credentials.credentials
     settings = get_settings()
-    secret = settings.admin_jwt_secret.get_secret_value() if settings.admin_jwt_secret else ""
+    admin_secret = settings.admin_jwt_secret.get_secret_value() if settings.admin_jwt_secret else ""
+    broker_secret = settings.broker_jwt_secret.get_secret_value() if settings.broker_jwt_secret else ""
 
     is_admin = False
     broker_id: str | None = None
 
     try:
-        payload = jwt.decode(token, secret, algorithms=["HS256"])
+        payload = jwt.decode(token, broker_secret, algorithms=["HS256"])
         if payload.get("type") == "broker_access":
             broker_id = payload.get("sub")
         else:
-            is_admin = True
+            raise JWTError("not a broker token")
     except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid or expired token.")
+        try:
+            payload = jwt.decode(token, admin_secret, algorithms=["HS256"])
+            is_admin = True
+        except JWTError:
+            raise HTTPException(status_code=401, detail="Invalid or expired token.")
 
     lane = fetch_lane(db, lane_id)
     if lane is None:
