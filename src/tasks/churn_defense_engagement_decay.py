@@ -14,9 +14,15 @@ Spec formula (page 8):
     baseline_30day_mean = (views_30 * 0.4 + downloads_30 * 0.6) / (30 / 7)
 
 Cold-start guard is history-based (not account age): an account is only eligible
-to be flagged once it has >= MIN_BASELINE_HISTORY_DAYS of TRACKED engagement and a
-non-zero baseline. This prevents a launch-day false-positive flood (every
-established account has zero tracked events until the frontend listeners ship).
+to be flagged once its first-ever DASHBOARD_VIEW or LEAD_DOWNLOAD (never
+SUBSCRIBER_LOGIN alone) is >= MIN_BASELINE_HISTORY_DAYS old. This prevents a
+launch-day false-positive flood (every established account has zero tracked
+events until the frontend listeners ship) AND prevents flagging an account that
+has only ever logged in and never actually used the dashboard — logging in is
+not engagement, so it must not count toward "has a real baseline to drop from."
+A zero baseline_30day_mean is still flaggable once that history requirement is
+met — a genuinely engaged account gone completely silent is exactly the signal
+this worker exists to catch.
 
 Sends nothing during --dry-run (no snapshot writes, no Claude calls, no GHL).
 
@@ -72,29 +78,42 @@ _AGG_SQL = text("""
     GROUP BY w.subscriber_id
 """)
 
-# Lifetime (unbounded) first-tracked-event per subscriber — deliberately NOT
-# limited to the 30-day window. Used only for the cold-start guard: an event
-# older than 30 days is exactly what proves a subscriber has enough tracked
-# history, but it is excluded from _AGG_SQL by design (that query computes the
-# rolling baseline). Computing "has 30 days of history" from a query that only
-# ever looks back 30 days is a contradiction — this second query exists to
-# avoid that trap.
+# Lifetime (unbounded) first-tracked-ENGAGEMENT-event per subscriber — deliberately
+# NOT limited to the 30-day window, and deliberately excludes SUBSCRIBER_LOGIN.
+#
+# Excluded from the 30-day window: an event older than 30 days is exactly what
+# proves a subscriber has enough tracked history, but it is excluded from
+# _AGG_SQL by design (that query computes the rolling baseline). Computing "has
+# 30 days of history" from a query that only ever looks back 30 days is a
+# contradiction — this second query exists to avoid that trap.
+#
+# Excludes SUBSCRIBER_LOGIN: the decay formula only ever measures DASHBOARD_VIEW
+# and LEAD_DOWNLOAD, never logins. If logins counted toward "has history," a
+# subscriber who logged in once 40 days ago and never once viewed the dashboard
+# or downloaded a lead would pass the history guard with a genuine zero
+# baseline and get flagged as "churned" despite never having been a real user
+# of the product in the first place. Restricting this query to the same two
+# event types the formula actually measures closes that gap.
 _FIRST_TRACKED_SQL = text("""
     SELECT subscriber_id, MIN(processed_at) AS first_event_at
     FROM webhook_events
     WHERE source = 'frontend'
       AND subscriber_id IS NOT NULL
-      AND event_type IN ('DASHBOARD_VIEW', 'LEAD_DOWNLOAD', 'SUBSCRIBER_LOGIN')
+      AND event_type IN ('DASHBOARD_VIEW', 'LEAD_DOWNLOAD')
     GROUP BY subscriber_id
 """)
 
 _POPULATION_SQL = text("SELECT id FROM subscribers WHERE churned_at IS NULL")
 
+# FAILED is excluded here (in addition to CONVERTED) so a transient outreach
+# failure (GHL timeout, pitch-generation error, etc.) does not permanently
+# suppress retries for the full cooldown window — see _fire_retention_outreach
+# and the FAILED assignment in run() below.
 _OPEN_LEADS_SQL = text("""
     SELECT DISTINCT subscriber_id
     FROM churn_defense_leads
     WHERE triggered_at >= now() - make_interval(days => :cooldown)
-      AND outreach_status <> 'CONVERTED'
+      AND outreach_status NOT IN ('CONVERTED', 'FAILED')
 """)
 
 _UPSERT_SNAPSHOT_SQL = text("""
@@ -133,12 +152,15 @@ _SUBSCRIBER_ZIPS_SQL = text(
 def _compute_decay(agg: dict) -> tuple[float, bool]:
     """Return (engagement_decay, is_cold_start) for one subscriber's aggregates.
 
-    is_cold_start is True only when the account has been tracked for less than
-    MIN_BASELINE_HISTORY_DAYS (agg['first_event_at'], from an UNBOUNDED lookup —
-    see _FIRST_TRACKED_SQL). A zero baseline_30day_mean on its own is NOT treated
-    as cold-start: an account tracked for 30+ days with zero activity in the
-    current window is exactly the extreme drop-off case this worker exists to
-    catch, not an absence of data.
+    is_cold_start is True only when the account's first-ever DASHBOARD_VIEW or
+    LEAD_DOWNLOAD (agg['first_event_at'], from an UNBOUNDED, engagement-only
+    lookup — see _FIRST_TRACKED_SQL) is missing or less than
+    MIN_BASELINE_HISTORY_DAYS old. SUBSCRIBER_LOGIN never counts toward this —
+    a login-only account has no real product engagement to have "dropped" from.
+    A zero baseline_30day_mean on its own is NOT treated as cold-start once the
+    history requirement is met: an account with a real, sufficiently old
+    engagement event and zero activity in the current window is exactly the
+    extreme drop-off case this worker exists to catch, not an absence of data.
     """
     views_7 = agg.get("views_7") or 0
     downloads_7 = agg.get("downloads_7") or 0
@@ -355,6 +377,9 @@ def run(dry_run: bool = False) -> dict:
             if _fire_retention_outreach(db, lead):
                 results["ghl_ok"] += 1
             else:
+                # Mark FAILED (not left at STAGED) so _OPEN_LEADS_SQL does not
+                # treat this as "already handled" and block a retry next week.
+                lead.outreach_status = "FAILED"
                 results["ghl_failed"] += 1
 
     logger.info(

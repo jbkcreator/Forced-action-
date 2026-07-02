@@ -1561,7 +1561,10 @@ class ChurnDefenseLead(Base):
     below the threshold. risk_score = 1 - engagement_decay (churn probability).
     outreach_status lifecycle: STAGED -> SEQUENCE_TRIGGERED -> ENGAGED -> CONVERTED
     (the worker writes STAGED then SEQUENCE_TRIGGERED; later states are advanced
-    by downstream GHL callbacks).
+    by downstream GHL callbacks). FAILED is a worker-only terminal state for a
+    row whose pitch/GHL push did not succeed — it is excluded from the open-lead
+    cooldown check (src/tasks/churn_defense_engagement_decay.py) so a transient
+    failure does not block a retry on the next weekly run.
     """
     __tablename__ = "churn_defense_leads"
 

@@ -10,8 +10,17 @@ objects were already created directly (the live deploy uses
 scripts/apply_fa_6_3_churn_defense.py — the alembic CLI is unusable on this
 multi-head tree).
 
+down_revision targets fa096_macro_signals rather than fa_s1_commission_ledger:
+the latter was itself deployed via a standalone script and was never stamped
+into the live alembic_version table, so chaining onto it leaves this migration
+unreachable via `alembic upgrade head` from the DB's actual current position.
+fa096_macro_signals is confirmed (via `alembic heads` and the live
+alembic_version table) to be both a real file in this repo AND one of the
+DB's actual live-stamped heads — this is the closest this multi-head tree
+gets to a real "current head used by dev" for a new migration to extend.
+
 Revision ID: fa_6_3_churn_defense
-Revises:     fa_s1_commission_ledger
+Revises:     fa096_macro_signals
 Create Date: 2026-07-02
 """
 from __future__ import annotations
@@ -20,7 +29,7 @@ from alembic import op
 import sqlalchemy as sa
 
 revision = "fa_6_3_churn_defense"
-down_revision = "fa_s1_commission_ledger"
+down_revision = "fa096_macro_signals"
 branch_labels = None
 depends_on = None
 
