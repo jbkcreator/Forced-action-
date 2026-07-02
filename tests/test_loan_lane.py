@@ -20,7 +20,6 @@ from sqlalchemy import text
 from src.consumers.loan_lane_consumers import (
     handle_commission_poster,
     handle_lane_closer,
-    handle_truth_verdict,
 )
 from src.services.broker_state_machine import (
     IllegalTransition,
@@ -378,23 +377,11 @@ def test_dispute_and_offset(fresh_db):
 # Consumers
 # ---------------------------------------------------------------------------
 
-def test_consumer_verdict_creates_lane(fresh_db):
-    pid = _prospect(fresh_db)
-    with patch("src.services.loan_lane_service.emit_event"):
-        handle_truth_verdict(fresh_db, _event_row(pid, {"routed_channel": "loan_lane"}))
-    count = fresh_db.execute(
-        text("SELECT COUNT(*) FROM lanes WHERE prospect_id = CAST(:p AS uuid)"), {"p": pid}
-    ).scalar()
-    assert count == 1
-
-
-def test_consumer_ignores_non_loan_lane_verdict(fresh_db):
-    pid = _prospect(fresh_db)
-    handle_truth_verdict(fresh_db, _event_row(pid, {"routed_channel": "cash_offer"}))
-    count = fresh_db.execute(
-        text("SELECT COUNT(*) FROM lanes WHERE prospect_id = CAST(:p AS uuid)"), {"p": pid}
-    ).scalar()
-    assert count == 0
+# test_consumer_verdict_creates_lane / test_consumer_ignores_non_loan_lane_verdict
+# removed: handle_truth_verdict was dropped in the spec-v6 refactor (lanes are
+# created from broker events by property_id — "There is no CDS/truth_verdict →
+# lane path", see src/consumers/loan_lane_consumers.py docstring). The tests
+# outlived the code and broke collection of this module on dev.
 
 
 def test_lane_closer_funds_on_closed_won(fresh_db):
