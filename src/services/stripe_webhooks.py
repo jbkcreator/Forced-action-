@@ -2164,7 +2164,6 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
                 )
             ).scalar_one_or_none()
             amount_cents = _attr(payment_intent, "amount_received") or _attr(payment_intent, "amount")
-            is_new_sent = not existing_sent
             if not existing_sent:
                 sent_row = SentLead(
                     subscriber_id=subscriber.id,
@@ -2175,18 +2174,26 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
                 )
                 db.add(sent_row)
                 db.flush()
+                is_first_payment = True
             else:
                 sent_row = existing_sent
-                if not existing_sent.stripe_payment_intent_id:
+                # A row can pre-exist with no payment intent (e.g. delivered
+                # free via the daily digest) and only now be paid for — that
+                # transition from unset to set is a real charge, not a
+                # duplicate, so it must still hit the ledger.
+                is_first_payment = not existing_sent.stripe_payment_intent_id
+                if is_first_payment:
                     existing_sent.stripe_payment_intent_id = _attr(payment_intent, "id")
                     existing_sent.amount_cents = amount_cents
 
-            # Centralized ledger — see src/services/revenue_ledger.py. Only
-            # record on first confirmation of this SentLead row; a re-run
-            # for an already-existing row would be a duplicate charge, not
-            # a new payment, and is already excluded by not having a fresh
-            # amount_cents to report here.
-            if is_new_sent and amount_cents is not None:
+            # Centralized ledger — see src/services/revenue_ledger.py.
+            # Record on the first real payment confirmation for this
+            # SentLead row, whether the row is brand new or was previously
+            # free and is only now being paid for. A re-run against a row
+            # that already has this payment intent is a genuine duplicate
+            # webhook delivery, which record_revenue's own idempotency
+            # (ON CONFLICT on source_table/source_id) absorbs safely.
+            if is_first_payment and amount_cents is not None:
                 from src.services.revenue_ledger import (
                     record_revenue, attribute_enrichment_cost_for_property,
                 )
@@ -3297,7 +3304,7 @@ def _on_charge_refunded(charge: dict, db: Session) -> None:
         the data can't be unsent. Log the loss; ops can manually adjust.
       - Lead Pack refunds: handled via payment_intent.succeeded -> lead_pack path.
     """
-    from src.core.models import PremiumPurchase, LeadPackPurchase
+    from src.core.models import PremiumPurchase, LeadPackPurchase, SentLead
     charge_id = charge.get("id")
     pi_id = charge.get("payment_intent")
 
@@ -3322,7 +3329,25 @@ def _on_charge_refunded(charge: dict, db: Session) -> None:
             purchase.refunded_at = datetime.now(timezone.utc)
             purchase.refund_reason = (charge.get("reason") or "unspecified")[:100]
             db.flush()
-            
+
+            # Revenue was split across up to 5 sent_leads rows at delivery
+            # time (one ledger row per delivered lead, see
+            # lead_pack_fulfillment_sweep.py) — never one row for the
+            # purchase itself — so every sent_leads row tied to this
+            # purchase's payment intent must be marked refunded individually.
+            from src.services.revenue_ledger import mark_ledger_refunded
+            sent_lead_ids = db.execute(
+                select(SentLead.id).where(
+                    SentLead.stripe_payment_intent_id == pi_id,
+                    SentLead.source == "lead_pack",
+                )
+            ).scalars().all()
+            for sent_lead_id in sent_lead_ids:
+                mark_ledger_refunded(
+                    db, source_table="sent_leads", source_id=sent_lead_id,
+                    refunded_at=purchase.refunded_at,
+                )
+
             # Clear exclusivity rows so the properties immediately become
             # available again for other trades/subscribers.
             try:
