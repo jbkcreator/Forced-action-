@@ -225,6 +225,12 @@ def _reverse_invoice_row(db: Session, where_sql: str, params: dict, reason: str,
     invoice.reversed_reason = reason
     db.flush()
     logger.info("Subscription invoice reversed: %s reason=%s", label, reason)
+
+    from src.services.revenue_ledger import mark_ledger_refunded
+    mark_ledger_refunded(
+        db, source_table="subscription_invoices", source_id=invoice.id,
+        refunded_at=invoice.reversed_at,
+    )
     return invoice
 
 

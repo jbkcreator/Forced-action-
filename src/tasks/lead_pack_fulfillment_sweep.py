@@ -210,8 +210,21 @@ def fulfill_purchase(db, purchase) -> str:
         # SentLead rows (source='lead_pack') — marks these leads delivered to
         # this buyer so they're excluded from his own blurred stack / $4 unlocks
         # and counted by the lead-quality monitor.
-        for pid in lead_ids:
-            db.execute(
+        #
+        # Ledger revenue is split evenly across the delivered leads (not one
+        # row for the full purchase) so every ledger row carries a real
+        # property_id — this is what lets cost-joining stay uniform across
+        # every product type, per src/services/revenue_ledger.py. Remainder
+        # cents (if amount_cents doesn't divide evenly) go to the first N
+        # rows so the sum always equals the real amount charged, never more.
+        from src.services.revenue_ledger import (
+            record_revenue, attribute_enrichment_cost_for_property,
+        )
+        total_cents = purchase.amount_cents or 0
+        n_leads = len(lead_ids)
+        base_share, remainder = divmod(total_cents, n_leads)
+        for i, pid in enumerate(lead_ids):
+            sent_row = db.execute(
                 sa_text("""
                     INSERT INTO sent_leads (
                         subscriber_id, property_id, sent_at, source,
@@ -223,6 +236,7 @@ def fulfill_purchase(db, purchase) -> str:
                         sent_at = EXCLUDED.sent_at,
                         source = 'lead_pack',
                         stripe_payment_intent_id = EXCLUDED.stripe_payment_intent_id
+                    RETURNING id
                 """),
                 {
                     "sid": purchase.subscriber_id,
@@ -230,7 +244,16 @@ def fulfill_purchase(db, purchase) -> str:
                     "now": now,
                     "pi": purchase.stripe_payment_intent_id,
                 },
-            )
+            ).fetchone()
+
+            if total_cents > 0 and sent_row:
+                share = base_share + (1 if i < remainder else 0)
+                record_revenue(
+                    db, subscriber_id=purchase.subscriber_id, product_type="lead_pack",
+                    amount_cents=share, source_table="sent_leads",
+                    source_id=sent_row.id, property_id=pid, occurred_at=now,
+                )
+                attribute_enrichment_cost_for_property(db, pid, purchase.subscriber_id)
         db.flush()
 
         if subscriber and subscriber.email:
