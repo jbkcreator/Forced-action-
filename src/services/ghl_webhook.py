@@ -443,6 +443,46 @@ def delete_contact(contact_id: str) -> bool:
         return False
 
 
+def add_contact_note(contact_id: str, body: str) -> bool:
+    """
+    Attach a plain-text note to a GHL contact.
+
+    Used by the churn-defense worker (Task 6.3) to deliver the Pitch
+    Generator's AI-written copy alongside the churn_defense tag — the note
+    only stores the text; the actual send is left to the GHL workflow
+    triggered by the tag.
+
+    Returns True on success, False on any failure. Raises nothing.
+    """
+    if not _is_configured():
+        logger.debug("[GHL] Not configured — skipping contact note")
+        return False
+    if not contact_id or not body:
+        return False
+
+    try:
+        resp = _ghl_request(
+            "POST",
+            f"{_GHL_BASE}/contacts/{contact_id}/notes",
+            headers=_headers(),
+            json={"body": body[:5000]},
+        )
+        if resp.ok:
+            logger.info("[GHL] Note added to contact %s", contact_id)
+            return True
+        logger.warning(
+            "[GHL] Note add HTTP %d for contact %s: %s",
+            resp.status_code, contact_id, resp.text[:200],
+        )
+        return False
+    except RequestException as exc:
+        logger.warning("[GHL] Network error adding note to contact %s: %s", contact_id, exc)
+        return False
+    except Exception:
+        logger.warning("[GHL] Unexpected error adding note to contact %s", contact_id, exc_info=True)
+        return False
+
+
 def push_lead_to_ghl(score_data: Dict) -> Optional[str]:
     """
     Push a scored lead to GHL CRM.

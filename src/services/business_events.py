@@ -58,6 +58,10 @@ BUSINESS_EVENT_TYPES = frozenset({
     "BUNDLE_CHECKOUT_STARTED",
     "BUNDLE_CHECKOUT_BLOCKED",
     "BUNDLE_CHECKOUT_SUCCEEDED",
+    # Task 6.3 — portal-engagement listeners feeding the churn-defense worker.
+    "SUBSCRIBER_LOGIN",
+    "DASHBOARD_VIEW",
+    "LEAD_DOWNLOAD",
 })
 
 
