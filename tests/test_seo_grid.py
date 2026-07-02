@@ -1,5 +1,11 @@
-"""Unit tests for SEO grid pure functions (city_to_slug, vertical_to_slug, is_eligible)."""
-from src.services.seo.grid import city_to_slug, vertical_to_slug, is_eligible, VERTICALS
+"""Unit tests for SEO grid pure functions (city_to_slug, vertical_to_slug, is_eligible, group_city_variants)."""
+from src.services.seo.grid import (
+    VERTICALS,
+    city_to_slug,
+    group_city_variants,
+    is_eligible,
+    vertical_to_slug,
+)
 
 
 # --- is_eligible ---
@@ -73,3 +79,30 @@ def test_verticals_has_six():
 def test_verticals_contains_all_expected():
     expected = {"wholesalers", "fix_flip", "restoration", "roofing", "public_adjusters", "attorneys"}
     assert set(VERTICALS) == expected
+
+
+# --- group_city_variants (city identity = slug; real prod dupes: Tampa/TAMPA etc.) ---
+
+def test_case_variants_merge_into_one_city():
+    out = group_city_variants([("Tampa", 891), ("TAMPA", 254_546)])
+    assert len(out) == 1
+    display, slug, variants = out[0]
+    assert slug == "tampa"
+    assert display == "TAMPA"                    # highest-count spelling wins display
+    assert set(variants) == {"Tampa", "TAMPA"}   # both matched in SQL
+
+
+def test_punctuation_variants_merge():
+    out = group_city_variants([("ST PETERSBURG", 128_651), ("ST. PETERSBURG", 1)])
+    assert len(out) == 1
+    assert out[0][1] == "st-petersburg"
+
+
+def test_distinct_cities_stay_distinct():
+    out = group_city_variants([("Tampa", 100), ("Brandon", 50)])
+    assert {slug for _, slug, _ in out} == {"tampa", "brandon"}
+
+
+def test_blocklisted_pseudo_cities_dropped():
+    out = group_city_variants([("UNINCORPORATED", 107), ("Unincorporated", 1), ("Tampa", 5)])
+    assert [slug for _, slug, _ in out] == ["tampa"]

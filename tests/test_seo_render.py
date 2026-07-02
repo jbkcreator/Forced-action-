@@ -1,7 +1,8 @@
 """Tests for SEO page rendering (render_page, content_hash)."""
 from src.services.seo.render import render_page, content_hash
 
-_FAQ_TITLE = "How do wholesalers find distressed properties in Florida?"
+_FAQ_Q = "How many distressed properties are available in Tampa, FL for wholesalers?"
+_FAQ_A = "There are currently 120 qualifying properties in Tampa."
 
 _SAMPLE = {
     "city": "Tampa",
@@ -10,17 +11,16 @@ _SAMPLE = {
     "topic_slug": "wholesalers",
     "stats": {
         "qualified_count": 120,
-        "avg_value": 215_000.0,
+        "median_value": 215_000.0,
         "ultra_platinum_count": 5,
         "platinum_count": 12,
         "gold_count": 30,
         "absentee_count": 45,
         "city_vs_county_pct": 24.5,
     },
-    "faq": {
-        "title": _FAQ_TITLE,
-        "answer_draft": {"body": "Wholesalers use direct mail and bandit signs to find deals."},
-    },
+    "faq_items": [
+        {"question": _FAQ_Q, "answer": _FAQ_A},
+    ],
     "status": "live",
     "canonical_url": "https://www.forcedaction.com/florida/tampa/wholesalers/",
 }
@@ -50,14 +50,24 @@ def test_render_canonical_url_present():
     assert _SAMPLE["canonical_url"] in html
 
 
-def test_render_faq_title_in_both_visible_and_jsonld():
+def test_render_faq_question_in_both_visible_and_jsonld():
     html = render_page(_SAMPLE)
-    count = html.count(_FAQ_TITLE)
-    assert count >= 2, f"FAQ title should appear in visible FAQ + JSON-LD, found {count} times"
+    count = html.count(_FAQ_Q)
+    assert count >= 2, f"FAQ question should appear in visible FAQ + JSON-LD, found {count} times"
 
 
-def test_render_no_faq_section_when_faq_is_none():
-    data = {**_SAMPLE, "faq": None}
+def test_render_faq_answer_text_appears_in_visible_faq():
+    html = render_page(_SAMPLE)
+    assert _FAQ_A in html, "FAQ answer must render as visible text"
+
+
+def test_render_faq_answer_text_appears_in_jsonld():
+    html = render_page(_SAMPLE)
+    assert f'"text": "{_FAQ_A}"' in html
+
+
+def test_render_no_faq_section_when_no_faq_items():
+    data = {**_SAMPLE, "faq_items": []}
     html = render_page(data)
     assert "FAQPage" not in html
 

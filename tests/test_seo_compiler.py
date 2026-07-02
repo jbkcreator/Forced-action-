@@ -93,28 +93,46 @@ def test_hysteresis_no_op_when_page_never_published():
     assert len(update_calls) == 0
 
 
-# ─── faq ─────────────────────────────────────────────────────────────────────
+# ─── faq (data-driven, ADR 0023 revised) ─────────────────────────────────────
 
-def test_best_faq_returns_none_when_no_results():
-    from src.services.seo.faq import best_faq
+_STATS = {
+    "qualified_count": 8078,
+    "median_value": 215000.0,
+    "ultra_platinum_count": 5,
+    "platinum_count": 12,
+    "gold_count": 30,
+    "absentee_count": 3465,
+    "city_vs_county_pct": 39.2,
+}
 
-    db = MagicMock()
-    db.execute.return_value.mappings.return_value.fetchone.return_value = None
-    assert best_faq(db, "wholesalers") is None
+
+def test_build_faq_uses_real_page_numbers():
+    from src.services.seo.faq import build_faq
+
+    items = build_faq("Tampa", "wholesalers", _STATS)
+    joined = " ".join(i["question"] + " " + i["answer"] for i in items)
+    assert "8,078" in joined          # count is rendered
+    assert "Tampa" in joined          # on-topic for the city
+    assert "wholesalers" in joined    # on-topic for the vertical
+    # every answer is plain text — no leaked markdown or tracking links
+    assert "**" not in joined
+    assert "utm_" not in joined
+    assert "http" not in joined
 
 
-def test_best_faq_returns_dict_when_answer_exists():
-    from src.services.seo.faq import best_faq
+def test_build_faq_omits_value_question_when_no_median_value():
+    from src.services.seo.faq import build_faq
 
-    db = MagicMock()
-    db.execute.return_value.mappings.return_value.fetchone.return_value = {
-        "title": "How to find deals?",
-        "answer_draft": {"body": "Use public records."},
-    }
-    result = best_faq(db, "wholesalers")
-    assert result is not None
-    assert result["title"] == "How to find deals?"
-    assert "answer_draft" in result
+    items = build_faq("Tampa", "wholesalers", {**_STATS, "median_value": 0})
+    assert not any("typical value" in i["question"].lower() for i in items)
+
+
+def test_build_faq_answers_are_plain_strings():
+    from src.services.seo.faq import build_faq
+
+    for item in build_faq("Riverview", "roofing", _STATS):
+        assert isinstance(item["question"], str) and item["question"]
+        assert isinstance(item["answer"], str) and item["answer"]
 
 
 # ─── indexing_api ─────────────────────────────────────────────────────────────

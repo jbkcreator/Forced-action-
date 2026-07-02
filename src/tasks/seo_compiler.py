@@ -14,7 +14,7 @@ from config.settings import get_settings
 from src.core.database import get_db_context
 from src.services.seo.grid import GridCell, discover_cells, all_qualified_counts, is_eligible
 from src.services.seo.stats import gather_page_data
-from src.services.seo.faq import best_faq
+from src.services.seo.faq import build_faq
 from src.services.seo.render import render_page, content_hash
 from src.services.seo.sitemap import build_sitemap
 from src.services.seo import indexing_api
@@ -58,29 +58,31 @@ def compile_all(
     built = retired = skipped = 0
 
     for cell in cells:
-        count = counts.get((cell.city_raw, cell.vertical), 0)
+        count = counts.get((cell.city_slug, cell.vertical), 0)
 
         if not is_eligible(count, floor):
-            _handle_sub_threshold(db, cell, hysteresis, now, write)
+            if _handle_sub_threshold(db, cell, hysteresis, now, write):
+                retired += 1
             skipped += 1
             continue
 
         stats = gather_page_data(
-            db, cell.city_raw, cell.vertical,
-            county_qualified=county_totals.get(cell.vertical),
+            db, cell.variants or (cell.city_raw,), cell.vertical,
+            county_qualified=county_totals.get(cell.vertical, 0),
         )
-        faq = best_faq(db, cell.vertical)
+        display_city = cell.city_raw.title()
+        faq_items = build_faq(display_city, cell.vertical, stats)
 
         url_path = f"/florida/{cell.city_slug}/{cell.topic_slug}/"
         canonical = f"{settings.seo_site_base_url.rstrip('/')}{url_path}"
 
         page_data = {
-            "city": cell.city_raw,
+            "city": display_city,
             "city_slug": cell.city_slug,
             "vertical": cell.vertical,
             "topic_slug": cell.topic_slug,
             "stats": stats,
-            "faq": faq,
+            "faq_items": faq_items,
             "status": "live",
             "canonical_url": canonical,
         }
@@ -128,12 +130,13 @@ def _get_page(db: Session, url_path: str) -> dict | None:
 
 def _handle_sub_threshold(
     db: Session, cell: GridCell, hysteresis: int, now: datetime, write: bool
-) -> None:
-    """Increment below_threshold_runs; retire (noindex) after hysteresis consecutive runs."""
+) -> bool:
+    """Increment below_threshold_runs; retire (noindex) after hysteresis consecutive
+    runs. Returns True when this call retired the page."""
     url_path = f"/florida/{cell.city_slug}/{cell.topic_slug}/"
     existing = _get_page(db, url_path)
     if existing is None:
-        return  # never published — nothing to retire
+        return False  # never published — nothing to retire
 
     new_runs = (existing["below_threshold_runs"] or 0) + 1
 
@@ -149,6 +152,7 @@ def _handle_sub_threshold(
             {"runs": new_runs, "u": url_path, "now": now},
         )
         logger.info("Retired (noindex): %s after %d sub-threshold runs", url_path, new_runs)
+        return True
     else:
         db.execute(
             text("""
@@ -159,6 +163,7 @@ def _handle_sub_threshold(
             """),
             {"runs": new_runs, "u": url_path, "now": now},
         )
+    return False
 
 
 def _touch_page(db: Session, url_path: str, count: int, now: datetime) -> None:

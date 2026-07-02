@@ -6,27 +6,152 @@
     <title>{% block title %}Forced Action{% endblock %}</title>
     <link rel="canonical" href="{{ canonical_url }}">
     {% if status == 'noindex' %}<meta name="robots" content="noindex">{% endif %}
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
     {% block head_extra %}{% endblock %}
     <style>
-        body { font-family: system-ui, sans-serif; max-width: 960px; margin: 0 auto; padding: 1rem 1.5rem; color: #1a1a1a; }
-        h1 { font-size: 1.75rem; margin-bottom: 0.5rem; }
-        h2 { font-size: 1.25rem; margin-top: 2rem; }
-        .lead-prose { font-size: 1.05rem; line-height: 1.6; margin-bottom: 1.5rem; }
-        .stat-cards { display: flex; flex-wrap: wrap; gap: 1rem; margin: 1.5rem 0; }
-        .stat-card { flex: 1 1 140px; border: 1px solid #e5e5e5; border-radius: 8px; padding: 1rem; text-align: center; }
-        .stat-value { display: block; font-size: 1.75rem; font-weight: 700; }
-        .stat-label { display: block; font-size: 0.8rem; color: #666; margin-top: 0.25rem; }
-        table { border-collapse: collapse; width: 100%; margin-top: 0.75rem; }
-        th, td { padding: 0.5rem 0.75rem; border: 1px solid #e5e5e5; text-align: left; }
-        th { background: #f5f5f5; }
-        .faq-item { margin-bottom: 1.25rem; }
-        .faq-item h3 { margin-bottom: 0.35rem; }
-        .cta { background: #0f52ba; color: white; padding: 2rem; border-radius: 8px; text-align: center; margin-top: 2.5rem; }
-        .cta h2, .cta p { color: white; margin: 0 0 0.75rem; }
-        .cta-button { display: inline-block; background: white; color: #0f52ba; padding: 0.75rem 1.5rem; border-radius: 6px; font-weight: 600; text-decoration: none; }
+        /* Design tokens mirror Forced-action-ui/src/config/theme.json (--fa-*).
+           Kept inline because SEO pages are self-contained static files served
+           by Nginx — they can't load the React app's Tailwind bundle. */
+        :root {
+            --fa-primary: #fbbf24;
+            --fa-primary-dark: #f59e0b;
+            --fa-accent: #a855f7;
+            --fa-accent-light: #c084fc;
+            --fa-bg-base: #070b14;
+            --fa-bg-surface: #0f172a;
+            --fa-bg-card: rgba(255,255,255,0.04);
+            --fa-border-default: rgba(255,255,255,0.08);
+            --fa-border-emphasis: rgba(255,255,255,0.12);
+            --fa-text-primary: #ffffff;
+            --fa-text-secondary: #94a3b8;
+            --fa-text-muted: #64748b;
+            --fa-tier-ultra-platinum: #a855f7;
+            --fa-tier-platinum: #fbbf24;
+            --fa-tier-gold: #f59e0b;
+            --fa-radius-lg: 1rem;
+            --fa-radius-md: 0.75rem;
+            --fa-gradient-bg: linear-gradient(135deg, #070b14 0%, #0f172a 30%, #131c33 50%, #0c1322 70%, #070b14 100%);
+            --fa-gradient-text: linear-gradient(135deg, #fbbf24 0%, #f59e0b 40%, #fcd34d 70%, #fbbf24 100%);
+            --fa-gradient-primary-btn: linear-gradient(135deg, #fbbf24, #f59e0b);
+        }
+        * { box-sizing: border-box; }
+        body {
+            font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            background: var(--fa-gradient-bg);
+            background-attachment: fixed;
+            color: var(--fa-text-primary);
+            margin: 0;
+            line-height: 1.6;
+            -webkit-font-smoothing: antialiased;
+        }
+        .fa-shell { max-width: 1040px; margin: 0 auto; padding: 0 1.5rem; }
+
+        /* Header */
+        .fa-header {
+            border-bottom: 1px solid var(--fa-border-default);
+            padding: 1.1rem 0;
+            backdrop-filter: blur(12px);
+        }
+        .fa-header .fa-shell { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+        .fa-logo { font-weight: 800; font-size: 1.15rem; letter-spacing: -0.01em; }
+        .fa-logo .dot { color: var(--fa-primary); }
+        .fa-header-cta {
+            font-size: 0.85rem; font-weight: 600; text-decoration: none;
+            color: #0a0a0a; background: var(--fa-gradient-primary-btn);
+            padding: 0.5rem 1.1rem; border-radius: var(--fa-radius-md);
+        }
+
+        main { padding: 2.5rem 0 1rem; }
+        h1 {
+            font-size: clamp(1.8rem, 4vw, 2.6rem); font-weight: 800;
+            line-height: 1.15; letter-spacing: -0.02em; margin: 0 0 1rem;
+        }
+        h1 .accent {
+            background: var(--fa-gradient-text);
+            -webkit-background-clip: text; background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        h2 { font-size: 1.35rem; font-weight: 700; margin: 2.5rem 0 0.5rem; letter-spacing: -0.01em; }
+        .lead-prose { font-size: 1.1rem; color: var(--fa-text-secondary); margin-bottom: 1.5rem; max-width: 70ch; }
+        .lead-prose strong { color: var(--fa-text-primary); font-weight: 700; }
+
+        /* Stat cards */
+        .stat-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 1rem; margin: 1.75rem 0; }
+        .stat-card {
+            background: var(--fa-bg-card); border: 1px solid var(--fa-border-default);
+            border-radius: var(--fa-radius-lg); padding: 1.35rem 1rem; text-align: center;
+            backdrop-filter: blur(16px);
+        }
+        .stat-value {
+            display: block; font-size: 2rem; font-weight: 800; letter-spacing: -0.02em;
+            background: var(--fa-gradient-text); -webkit-background-clip: text; background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .stat-label { display: block; font-size: 0.78rem; color: var(--fa-text-muted); margin-top: 0.4rem; text-transform: uppercase; letter-spacing: 0.04em; }
+
+        /* Signal breakdown / table */
+        .signal-breakdown { background: var(--fa-bg-card); border: 1px solid var(--fa-border-default); border-radius: var(--fa-radius-lg); padding: 1.5rem; margin-top: 1.25rem; backdrop-filter: blur(16px); }
+        .signal-breakdown h2 { margin-top: 0; }
+        table { border-collapse: collapse; width: 100%; margin-top: 0.5rem; }
+        th, td { padding: 0.65rem 0.9rem; text-align: left; border-bottom: 1px solid var(--fa-border-default); }
+        th { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--fa-text-muted); font-weight: 600; }
+        td { color: var(--fa-text-secondary); }
+        .tier-cell { display: inline-flex; align-items: center; gap: 0.5rem; font-weight: 600; color: var(--fa-text-primary); }
+        .tier-dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+        .tier-ultra-platinum .tier-dot { background: var(--fa-tier-ultra-platinum); }
+        .tier-platinum .tier-dot { background: var(--fa-tier-platinum); }
+        .tier-gold .tier-dot { background: var(--fa-tier-gold); }
+        .comparison-note { margin-top: 1rem; color: var(--fa-text-muted); font-size: 0.9rem; }
+        .comparison-note strong { color: var(--fa-primary); }
+
+        /* FAQ */
+        .faq { margin-top: 1rem; }
+        .faq-item { background: var(--fa-bg-card); border: 1px solid var(--fa-border-default); border-radius: var(--fa-radius-lg); padding: 1.25rem 1.5rem; backdrop-filter: blur(16px); }
+        .faq-item h3 { margin: 0 0 0.5rem; font-size: 1.05rem; font-weight: 700; }
+        .faq-answer { color: var(--fa-text-secondary); }
+        .faq-answer p { margin: 0; white-space: pre-line; }
+
+        /* CTA */
+        .cta {
+            margin-top: 3rem; text-align: center; border-radius: var(--fa-radius-lg);
+            padding: 2.5rem 2rem;
+            background: radial-gradient(circle at 50% 0%, rgba(251,191,36,0.12), rgba(168,85,247,0.06) 60%, transparent),
+                        var(--fa-bg-card);
+            border: 1px solid var(--fa-border-emphasis);
+        }
+        .cta h2 { margin: 0 0 0.6rem; }
+        .cta p { color: var(--fa-text-secondary); margin: 0 auto 1.4rem; max-width: 48ch; }
+        .cta-button {
+            display: inline-block; text-decoration: none; font-weight: 700; font-size: 1rem;
+            color: #0a0a0a; background: var(--fa-gradient-primary-btn);
+            padding: 0.85rem 2rem; border-radius: var(--fa-radius-md);
+            box-shadow: 0 8px 24px rgba(251,191,36,0.2);
+        }
+
+        /* Footer */
+        .fa-footer { border-top: 1px solid var(--fa-border-default); margin-top: 3rem; padding: 2rem 0; color: var(--fa-text-muted); font-size: 0.85rem; }
+        .fa-footer .fa-shell { display: flex; flex-wrap: wrap; gap: 0.5rem 1.5rem; justify-content: space-between; }
+        .fa-footer a { color: var(--fa-text-secondary); text-decoration: none; }
     </style>
 </head>
 <body>
-    {% block content %}{% endblock %}
+    <header class="fa-header">
+        <div class="fa-shell">
+            <span class="fa-logo">Forced Action<span class="dot">.</span></span>
+            <a class="fa-header-cta" href="https://app.forcedaction.io/signup">Get Started</a>
+        </div>
+    </header>
+
+    <div class="fa-shell">
+        {% block content %}{% endblock %}
+    </div>
+
+    <footer class="fa-footer">
+        <div class="fa-shell">
+            <span>&copy; 2026 Forced Action. All rights reserved.</span>
+            <span>AI-powered distressed property intelligence for Florida.</span>
+        </div>
+    </footer>
 </body>
 </html>

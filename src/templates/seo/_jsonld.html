@@ -1,17 +1,18 @@
-{% if faq %}
+{% if faq_items %}
 <script type="application/ld+json">
 {
   "@context": "https://schema.org",
   "@type": "FAQPage",
   "mainEntity": [
-    {
+    {% for item in faq_items %}{
       "@type": "Question",
-      "name": {{ faq.title | tojson }},
+      "name": {{ item.question | tojson }},
       "acceptedAnswer": {
         "@type": "Answer",
-        "text": {{ (faq.answer_draft.body if faq and faq.answer_draft and faq.answer_draft.body else "") | tojson }}
+        "text": {{ item.answer | tojson }}
       }
-    }
+    }{% if not loop.last %},{% endif %}
+    {% endfor %}
   ]
 }
 </script>

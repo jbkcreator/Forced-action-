@@ -8,15 +8,15 @@
 
 {% block content %}
 <main>
-    <h1>{{ city }}, FL {{ vertical.replace('_', ' ').title() }} &amp; Distressed Homes</h1>
+    <h1>{{ city }}, FL <span class="accent">{{ vertical.replace('_', ' ').title() }}</span> &amp; Distressed Homes</h1>
 
     <p class="lead-prose">
-        There are currently <strong>{{ stats.qualified_count }}</strong> distressed properties
+        There are currently <strong>{{ "{:,}".format(stats.qualified_count) }}</strong> distressed properties
         in {{ city }}, FL qualifying under the {{ vertical.replace('_', ' ') }} investment
-        profile{% if stats.avg_value %}, with an average estimated value of
-        <strong>${{ "{:,.0f}".format(stats.avg_value) }}</strong>{% endif %}.
+        profile{% if stats.median_value %}, with a median estimated value of
+        <strong>${{ "{:,.0f}".format(stats.median_value) }}</strong>{% endif %}.
         {% if stats.absentee_count %}
-        Of these, <strong>{{ stats.absentee_count }}</strong> are owned by absentee landlords —
+        Of these, <strong>{{ "{:,}".format(stats.absentee_count) }}</strong> are owned by absentee landlords —
         a strong indicator of motivated-seller opportunity.
         {% endif %}
     </p>

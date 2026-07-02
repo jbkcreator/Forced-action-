@@ -1,8 +1,7 @@
 """End-to-end integration test for the SEO engine against real Postgres.
 
 Exercises the real SQL (CTEs, JSONB casts, joins) that unit tests mock:
-  - grid.qualified_count  (scoped city×vertical count)
-  - stats.gather_page_data (data spine aggregate)
+  - stats.gather_page_data (data spine aggregate, city-scoped CTE)
   - compile_all full path: render → write file → upsert seo_pages → sitemap → idempotent re-run
 
 Uses fresh_db (real shared Postgres, rolled back after test). Skips if no DB.
@@ -15,7 +14,7 @@ import pytest
 from sqlalchemy import text
 
 from src.core.models import Property, DistressScore, Financial, Owner
-from src.services.seo.grid import GridCell, qualified_count
+from src.services.seo.grid import GridCell
 from src.services.seo.stats import gather_page_data
 from src.tasks.seo_compiler import compile_all
 
@@ -51,7 +50,8 @@ def _seed(db, n=_N):
 
 def _cell():
     return GridCell(city_raw=_CITY, city_slug=_CITY_SLUG,
-                    vertical=_VERTICAL, topic_slug="wholesalers")
+                    vertical=_VERTICAL, topic_slug="wholesalers",
+                    variants=(_CITY,))
 
 
 def test_seo_e2e_real_sql_and_compile(fresh_db, tmp_path):
@@ -64,21 +64,17 @@ def test_seo_e2e_real_sql_and_compile(fresh_db, tmp_path):
 
     _seed(fresh_db)
 
-    # ── 1. Real scoped SQL: qualified_count ──
-    cnt = qualified_count(fresh_db, _CITY, _VERTICAL)
-    assert cnt == _N, f"expected {_N} qualified, got {cnt}"
-
-    # ── 2. Real aggregate SQL: gather_page_data ──
-    data = gather_page_data(fresh_db, _CITY, _VERTICAL)
+    # ── 1. Real aggregate SQL: gather_page_data (city-scoped CTE) ──
+    data = gather_page_data(fresh_db, [_CITY], _VERTICAL, county_qualified=_N)
     assert data["qualified_count"] == _N
     assert data["absentee_count"] == _ABSENTEE
     assert data["platinum_count"] == 3
     assert data["gold_count"] == _N - 3
-    assert data["avg_value"] > 200_000
+    assert data["median_value"] > 200_000
 
     # ── 3. Full compile: file + seo_pages row + sitemap ──
     out_dir = tmp_path / "florida"
-    counts = {(_CITY, _VERTICAL): _N}
+    counts = {(_CITY_SLUG, _VERTICAL): _N}
     result = compile_all(
         fresh_db, cells=[_cell()], counts=counts, output_dir=out_dir, write=True,
     )
@@ -128,13 +124,13 @@ def test_seo_e2e_retirement_hysteresis(fresh_db, tmp_path):
 
     _seed(fresh_db)
     out_dir = tmp_path / "florida"
-    live_counts = {(_CITY, _VERTICAL): _N}
+    live_counts = {(_CITY_SLUG, _VERTICAL): _N}
 
     # publish it live
     compile_all(fresh_db, cells=[_cell()], counts=live_counts, output_dir=out_dir, write=True)
 
     # now the cell drops below floor — first sub-threshold run: NOT retired
-    sub_counts = {(_CITY, _VERTICAL): 0}
+    sub_counts = {(_CITY_SLUG, _VERTICAL): 0}
     compile_all(fresh_db, cells=[_cell()], counts=sub_counts, output_dir=out_dir, write=True)
     row = fresh_db.execute(
         text("SELECT status, below_threshold_runs FROM seo_pages WHERE city_slug = :cs"),
@@ -144,7 +140,8 @@ def test_seo_e2e_retirement_hysteresis(fresh_db, tmp_path):
     assert row["below_threshold_runs"] == 1
 
     # second consecutive sub-threshold run: retired (noindex), dropped from sitemap
-    compile_all(fresh_db, cells=[_cell()], counts=sub_counts, output_dir=out_dir, write=True)
+    result = compile_all(fresh_db, cells=[_cell()], counts=sub_counts, output_dir=out_dir, write=True)
+    assert result["retired"] == 1, "summary must count the retirement"
     row = fresh_db.execute(
         text("SELECT status, below_threshold_runs FROM seo_pages WHERE city_slug = :cs"),
         {"cs": _CITY_SLUG},

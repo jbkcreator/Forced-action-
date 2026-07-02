@@ -8,12 +8,12 @@
             </tr>
         </thead>
         <tbody>
-            <tr><td>Ultra Platinum</td><td>{{ stats.ultra_platinum_count }}</td></tr>
-            <tr><td>Platinum</td><td>{{ stats.platinum_count }}</td></tr>
-            <tr><td>Gold</td><td>{{ stats.gold_count }}</td></tr>
+            <tr><td><span class="tier-cell tier-ultra-platinum"><span class="tier-dot"></span>Ultra Platinum</span></td><td>{{ "{:,}".format(stats.ultra_platinum_count) }}</td></tr>
+            <tr><td><span class="tier-cell tier-platinum"><span class="tier-dot"></span>Platinum</span></td><td>{{ "{:,}".format(stats.platinum_count) }}</td></tr>
+            <tr><td><span class="tier-cell tier-gold"><span class="tier-dot"></span>Gold</span></td><td>{{ "{:,}".format(stats.gold_count) }}</td></tr>
         </tbody>
     </table>
-    <p style="margin-top:0.75rem; color:#555; font-size:0.9rem;">
+    <p class="comparison-note">
         {{ city }} represents <strong>{{ stats.city_vs_county_pct }}%</strong>
         of qualifying {{ vertical.replace('_', ' ') }} leads in the county.
     </p>

@@ -1,18 +1,18 @@
 <section class="stat-cards">
     <div class="stat-card">
-        <span class="stat-value">{{ stats.qualified_count }}</span>
+        <span class="stat-value">{{ "{:,}".format(stats.qualified_count) }}</span>
         <span class="stat-label">Qualified Properties</span>
     </div>
     <div class="stat-card">
-        <span class="stat-value">{% if stats.avg_value %}${{ "{:,.0f}".format(stats.avg_value) }}{% else %}N/A{% endif %}</span>
-        <span class="stat-label">Avg. Estimated Value</span>
+        <span class="stat-value">{% if stats.median_value %}${{ "{:,.0f}".format(stats.median_value) }}{% else %}N/A{% endif %}</span>
+        <span class="stat-label">Median Est. Value</span>
     </div>
     <div class="stat-card">
-        <span class="stat-value">{{ stats.ultra_platinum_count + stats.platinum_count }}</span>
+        <span class="stat-value">{{ "{:,}".format(stats.ultra_platinum_count + stats.platinum_count) }}</span>
         <span class="stat-label">High-Priority Leads</span>
     </div>
     <div class="stat-card">
-        <span class="stat-value">{{ stats.absentee_count }}</span>
+        <span class="stat-value">{{ "{:,}".format(stats.absentee_count) }}</span>
         <span class="stat-label">Absentee Owners</span>
     </div>
 </section>

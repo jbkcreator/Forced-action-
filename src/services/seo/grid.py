@@ -15,12 +15,16 @@ VERTICALS: list[str] = [
 # ponytail: hardcoded to live counties; read from DB when 3+ counties active
 _LIVE_COUNTIES = ("hillsborough", "pinellas")
 
+# Pseudo-city values in properties.city that must never become pages.
+_CITY_BLOCKLIST = {"UNINCORPORATED", "UNKNOWN", "N/A", "NA", "NONE"}
+
 
 class GridCell(NamedTuple):
-    city_raw: str
+    city_raw: str                    # display variant (most properties)
     city_slug: str
     vertical: str
     topic_slug: str
+    variants: tuple[str, ...] = ()   # all raw spellings this slug covers, for SQL matching
 
 
 def city_to_slug(city: str) -> str:
@@ -40,53 +44,69 @@ def is_eligible(count: int, floor: int) -> bool:
     return count >= floor
 
 
+def group_city_variants(rows: list[tuple[str, int]]) -> list[tuple[str, str, tuple[str, ...]]]:
+    """Merge raw city spellings that slug identically into one city identity.
+
+    rows: (raw_city, property_count) pairs. Returns (display, slug, variants)
+    per city — display is the highest-count spelling. Same-city case/punctuation
+    variants ('Tampa'/'TAMPA', 'ST PETERSBURG'/'ST. PETERSBURG') would otherwise
+    each mint a page (tampa + tampa-2) and compete against themselves in Google.
+    Blocklisted pseudo-cities are dropped.
+    """
+    by_slug: dict[str, list[tuple[str, int]]] = {}
+    for raw, n in rows:
+        if raw.upper() in _CITY_BLOCKLIST:
+            continue
+        slug = city_to_slug(raw)
+        if not slug:
+            continue
+        by_slug.setdefault(slug, []).append((raw, n))
+
+    out = []
+    for slug, variants in sorted(by_slug.items()):
+        variants.sort(key=lambda v: -v[1])
+        display = variants[0][0]
+        out.append((display, slug, tuple(raw for raw, _ in variants)))
+    return out
+
+
 def discover_cells(db: Session) -> list[GridCell]:
     """Return one GridCell per (city, vertical) from live counties.
 
-    Cities are DB-derived from properties. Slug collisions across distinct city
-    names get a numeric suffix (city-slug-2, city-slug-3, …).
+    City identity = slug: raw spellings that slug identically are one city
+    (see group_city_variants), so a city can never split into competing pages.
     """
     rows = db.execute(
         text("""
-            SELECT DISTINCT TRIM(city) AS city
+            SELECT TRIM(city) AS city, COUNT(*) AS n
             FROM properties
             WHERE county_id = ANY(:counties)
               AND city IS NOT NULL
               AND TRIM(city) != ''
-            ORDER BY 1
+            GROUP BY TRIM(city)
         """),
         {"counties": list(_LIVE_COUNTIES)},
     ).fetchall()
 
     cells: list[GridCell] = []
-    slug_seen: dict[str, int] = {}
-
-    for row in rows:
-        city_raw = row.city
-        base = city_to_slug(city_raw)
-
-        if base in slug_seen:
-            slug_seen[base] += 1
-            city_slug = f"{base}-{slug_seen[base]}"
-        else:
-            slug_seen[base] = 1
-            city_slug = base
-
+    for display, slug, variants in group_city_variants([(r.city, r.n) for r in rows]):
         for vertical in VERTICALS:
             cells.append(GridCell(
-                city_raw=city_raw,
-                city_slug=city_slug,
+                city_raw=display,
+                city_slug=slug,
                 vertical=vertical,
                 topic_slug=vertical_to_slug(vertical),
+                variants=variants,
             ))
-
     return cells
 
 
 def all_qualified_counts(db: Session) -> dict[tuple[str, str], int]:
-    """Return {(city_raw, vertical): count} for all live-county cities × verticals.
+    """Return {(city_slug, vertical): count} for all live-county cities × verticals.
 
-    One query for all cells — no query-in-loop in the compiler.
+    One query for all cells — no query-in-loop in the compiler. Counts for raw
+    spellings of the same city are summed under one slug (same identity rule
+    as discover_cells).
     """
     verticals_sql = ", ".join(f"('{v}')" for v in VERTICALS)
     rows = db.execute(
@@ -113,33 +133,10 @@ def all_qualified_counts(db: Session) -> dict[tuple[str, str], int]:
         {"counties": list(_LIVE_COUNTIES)},
     ).fetchall()
 
-    return {(row.city, row.vertical): row.cnt for row in rows}
-
-
-def qualified_count(db: Session, city: str, vertical: str) -> int:
-    """Count properties with a positive score for the vertical in the given city.
-
-    The latest-per-property sort is scoped to the city's parcels so this is cheap
-    per call (no full distress_scores DISTINCT ON).
-    """
-    row = db.execute(
-        text("""
-            WITH city_ids AS (
-                SELECT id FROM properties
-                WHERE TRIM(city) = :city
-                  AND county_id = ANY(:counties)
-            ),
-            latest AS (
-                SELECT DISTINCT ON (property_id)
-                    property_id, vertical_scores
-                FROM distress_scores
-                WHERE property_id IN (SELECT id FROM city_ids)
-                ORDER BY property_id, score_date DESC
-            )
-            SELECT COUNT(*) AS cnt
-            FROM latest l
-            WHERE (l.vertical_scores ->> :vertical)::float > 0
-        """),
-        {"city": city.strip(), "counties": list(_LIVE_COUNTIES), "vertical": vertical},
-    ).scalar()
-    return int(row or 0)
+    counts: dict[tuple[str, str], int] = {}
+    for row in rows:
+        if row.city.upper() in _CITY_BLOCKLIST:
+            continue
+        key = (city_to_slug(row.city), row.vertical)
+        counts[key] = counts.get(key, 0) + row.cnt
+    return counts

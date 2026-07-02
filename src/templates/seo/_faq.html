@@ -1,13 +1,11 @@
-{% if faq %}
+{% if faq_items %}
 <section class="faq" id="faq">
     <h2>Frequently Asked Questions</h2>
+    {% for item in faq_items %}
     <div class="faq-item">
-        <h3>{{ faq.title }}</h3>
-        {% if faq.answer_draft and faq.answer_draft.body %}
-        <div class="faq-answer">
-            <p>{{ faq.answer_draft.body }}</p>
-        </div>
-        {% endif %}
+        <h3>{{ item.question }}</h3>
+        <div class="faq-answer"><p>{{ item.answer }}</p></div>
     </div>
+    {% endfor %}
 </section>
 {% endif %}
