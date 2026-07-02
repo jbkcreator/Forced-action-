@@ -1087,7 +1087,7 @@ def _on_payment_succeeded(invoice: dict, db: Session) -> None:
         period_start = line.get("period", {}).get("start")
         paid_ts = invoice.get("status_transitions", {}).get("paid_at") or period_start
         if invoice.get("id") and period_start and paid_ts:
-            record_subscription_invoice(
+            recorded_invoice = record_subscription_invoice(
                 db,
                 stripe_invoice_id=invoice["id"],
                 subscriber_id=subscriber.id,
@@ -1101,6 +1101,20 @@ def _on_payment_succeeded(invoice: dict, db: Session) -> None:
                 payment_intent_id=invoice.get("payment_intent")
                 or _resolve_invoice_payment_intent(invoice["id"]),
             )
+            # Centralized ledger (src/services/revenue_ledger.py) — additive,
+            # subscription_invoices remains the affiliate system's own source
+            # of truth untouched. record_revenue is idempotent on
+            # (source_table, source_id), so calling it every time this
+            # webhook fires (including retries of an already-recorded
+            # invoice) is safe.
+            if recorded_invoice is not None and recorded_invoice.amount_collected_cents:
+                from src.services.revenue_ledger import record_revenue
+                record_revenue(
+                    db, subscriber_id=subscriber.id, product_type="subscription",
+                    amount_cents=recorded_invoice.amount_collected_cents,
+                    source_table="subscription_invoices", source_id=recorded_invoice.id,
+                    occurred_at=recorded_invoice.paid_at,
+                )
     except Exception:
         logger.warning("Affiliate invoice capture failed sub=%s", subscriber.id, exc_info=True)
 
@@ -2149,16 +2163,47 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
                     SentLead.property_id == property_id,
                 )
             ).scalar_one_or_none()
+            amount_cents = _attr(payment_intent, "amount_received") or _attr(payment_intent, "amount")
             if not existing_sent:
-                db.add(SentLead(
+                sent_row = SentLead(
                     subscriber_id=subscriber.id,
                     property_id=property_id,
                     source="lead_unlock_payment",
                     stripe_payment_intent_id=_attr(payment_intent, "id"),
-                ))
+                    amount_cents=amount_cents,
+                )
+                db.add(sent_row)
                 db.flush()
-            elif existing_sent and not existing_sent.stripe_payment_intent_id:
-                existing_sent.stripe_payment_intent_id = _attr(payment_intent, "id")
+                is_first_payment = True
+            else:
+                sent_row = existing_sent
+                # A row can pre-exist with no payment intent (e.g. delivered
+                # free via the daily digest) and only now be paid for — that
+                # transition from unset to set is a real charge, not a
+                # duplicate, so it must still hit the ledger.
+                is_first_payment = not existing_sent.stripe_payment_intent_id
+                if is_first_payment:
+                    existing_sent.stripe_payment_intent_id = _attr(payment_intent, "id")
+                    existing_sent.amount_cents = amount_cents
+
+            # Centralized ledger — see src/services/revenue_ledger.py.
+            # Record on the first real payment confirmation for this
+            # SentLead row, whether the row is brand new or was previously
+            # free and is only now being paid for. A re-run against a row
+            # that already has this payment intent is a genuine duplicate
+            # webhook delivery, which record_revenue's own idempotency
+            # (ON CONFLICT on source_table/source_id) absorbs safely.
+            if is_first_payment and amount_cents is not None:
+                from src.services.revenue_ledger import (
+                    record_revenue, attribute_enrichment_cost_for_property,
+                )
+                record_revenue(
+                    db, subscriber_id=subscriber.id, product_type="lead_unlock",
+                    amount_cents=amount_cents, source_table="sent_leads",
+                    source_id=sent_row.id, property_id=property_id,
+                    occurred_at=sent_row.sent_at,
+                )
+                attribute_enrichment_cost_for_property(db, property_id, subscriber.id)
     except (IntegrityError, OperationalError) as exc:
         logger.warning("lead_unlock: SentLead insert failed: %s", exc)
 
@@ -3259,7 +3304,7 @@ def _on_charge_refunded(charge: dict, db: Session) -> None:
         the data can't be unsent. Log the loss; ops can manually adjust.
       - Lead Pack refunds: handled via payment_intent.succeeded -> lead_pack path.
     """
-    from src.core.models import PremiumPurchase, LeadPackPurchase
+    from src.core.models import PremiumPurchase, LeadPackPurchase, SentLead
     charge_id = charge.get("id")
     pi_id = charge.get("payment_intent")
 
@@ -3284,7 +3329,25 @@ def _on_charge_refunded(charge: dict, db: Session) -> None:
             purchase.refunded_at = datetime.now(timezone.utc)
             purchase.refund_reason = (charge.get("reason") or "unspecified")[:100]
             db.flush()
-            
+
+            # Revenue was split across up to 5 sent_leads rows at delivery
+            # time (one ledger row per delivered lead, see
+            # lead_pack_fulfillment_sweep.py) — never one row for the
+            # purchase itself — so every sent_leads row tied to this
+            # purchase's payment intent must be marked refunded individually.
+            from src.services.revenue_ledger import mark_ledger_refunded
+            sent_lead_ids = db.execute(
+                select(SentLead.id).where(
+                    SentLead.stripe_payment_intent_id == pi_id,
+                    SentLead.source == "lead_pack",
+                )
+            ).scalars().all()
+            for sent_lead_id in sent_lead_ids:
+                mark_ledger_refunded(
+                    db, source_table="sent_leads", source_id=sent_lead_id,
+                    refunded_at=purchase.refunded_at,
+                )
+
             # Clear exclusivity rows so the properties immediately become
             # available again for other trades/subscribers.
             try:
@@ -3322,6 +3385,12 @@ def _on_charge_refunded(charge: dict, db: Session) -> None:
     if not purchase.stripe_charge_id and charge.get("id"):
         purchase.stripe_charge_id = charge["id"]
     db.flush()
+
+    from src.services.revenue_ledger import mark_ledger_refunded
+    mark_ledger_refunded(
+        db, source_table="premium_purchases", source_id=purchase.id,
+        refunded_at=purchase.refunded_at,
+    )
 
     if purchase.paid_via == "credits" and purchase.sku not in _DATA_SURRENDERED_SKUS:
         from src.services import wallet_engine
@@ -3537,6 +3606,7 @@ def _on_lead_pack_payment(payment_intent: dict, db: Session) -> None:
         status="pending",
         purchased_at=now,
         exclusive_until=exclusive_until,
+        amount_cents=_attr(payment_intent, "amount_received") or _attr(payment_intent, "amount"),
     )
     db.add(purchase)
     db.flush()

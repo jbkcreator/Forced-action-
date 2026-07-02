@@ -117,6 +117,25 @@ def fulfill(purchase_id: int, db: Session) -> PremiumPurchase:
             "Premium fulfilled: purchase=%d sku=%s subscriber=%d",
             purchase.id, purchase.sku, purchase.subscriber_id,
         )
+
+        # Centralized ledger (src/services/revenue_ledger.py). report/brief
+        # only — transfer/byol aren't wired here: they queue into the batch
+        # skip-trace pipeline with no consumer today (confirmed, no dequeue
+        # job exists), so there's no real fulfillment event to attribute
+        # cost against yet. Card-paid only — credits-paid rows have no cash
+        # amount (the credits were already paid for at wallet top-up time).
+        if purchase.sku in ("report", "brief") and purchase.paid_via == "card" and purchase.amount_cents:
+            from src.services.revenue_ledger import (
+                record_revenue, attribute_enrichment_cost_for_property,
+            )
+            record_revenue(
+                db, subscriber_id=purchase.subscriber_id, product_type=f"premium_{purchase.sku}",
+                amount_cents=purchase.amount_cents, source_table="premium_purchases",
+                source_id=purchase.id, property_id=purchase.property_id,
+                occurred_at=purchase.delivered_at,
+            )
+            if purchase.property_id:
+                attribute_enrichment_cost_for_property(db, purchase.property_id, purchase.subscriber_id)
     except Exception as exc:
         purchase.status = "failed"
         db.flush()

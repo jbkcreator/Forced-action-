@@ -1394,6 +1394,11 @@ class SentLead(Base):
     refund_reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     stripe_refund_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
 
+    # fa109: amount actually captured for this delivery, when paid via a
+    # one-time charge (lead_unlock/lead_pack). NULL for daily_email rows and
+    # for historical rows predating this column.
+    amount_cents: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
     __table_args__ = (
         UniqueConstraint("subscriber_id", "property_id", name="uq_sent_lead"),
         Index("idx_sent_lead_subscriber_sent_at", "subscriber_id", "sent_at"),
@@ -2133,6 +2138,10 @@ class LeadPackPurchase(Base):
 
     # The 5 selected property IDs (reserved at payment time)
     lead_ids: Mapped[Optional[list]] = mapped_column(ARRAY(Integer))
+
+    # fa109: amount actually captured at payment (cents). NULL for historical
+    # rows predating this column.
+    amount_cents: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
     # Relationship
     subscriber: Mapped["Subscriber"] = relationship("Subscriber")
@@ -3384,6 +3393,85 @@ class EnrichmentAnomalyLog(Base):
     def __repr__(self):
         return (f"<EnrichmentAnomalyLog(provider={self.provider}, "
                 f"observed={self.observed_hit_rate}, floor={self.floor_hit_rate})>")
+
+
+class PlatformRevenueLedger(Base):
+    """
+    Centralized revenue ledger — one row per confirmed payment, regardless of
+    product. Written exclusively via src/services/revenue_ledger.py:record_revenue(),
+    never by hand-rolled SQL at each call site. SentLead/LeadPackPurchase/
+    PremiumPurchase/SubscriptionInvoice remain each product's own operational
+    source of truth (idempotency keys, exclusivity windows, refund tracking
+    specific to that product) — this table is a pure additive reporting layer
+    so margin/gating code never needs to know which table a given product's
+    revenue actually lives in.
+    """
+    __tablename__ = "platform_revenue_ledger"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=False, index=True)
+    product_type: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    amount_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Nullable: subscription revenue isn't tied to one property. Per-lead
+    # products (lead_unlock, lead_pack, premium) always set this so cost can
+    # be joined directly via property_id, with no per-product knowledge.
+    property_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("properties.id"), nullable=True, index=True)
+    source_table: Mapped[str] = mapped_column(String(60), nullable=False)
+    source_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    refunded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("source_table", "source_id", name="uq_revenue_ledger_source"),
+    )
+
+    def __repr__(self):
+        return f"<PlatformRevenueLedger(subscriber_id={self.subscriber_id}, product_type={self.product_type}, amount_cents={self.amount_cents})>"
+
+
+class PlatformCostAttribution(Base):
+    """
+    Generalizes "which subscriber does this enrichment cost belong to" the
+    same way for every attribution method — direct purchase (lead_unlock,
+    lead_pack, premium) or the zip-territory multi-vertical collision
+    result (refreshed daily by a scheduled job). computed_for_date is NULL
+    for point-in-time purchase attributions; set (and versioned, never
+    overwritten) for the daily zip-territory refresh, so a report run today
+    and re-run later against the same date give the same answer even after
+    territory ownership shifts.
+    """
+    __tablename__ = "platform_cost_attribution"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    enrichment_usage_log_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("enrichment_usage_logs.id"), nullable=False, index=True
+    )
+    subscriber_id: Mapped[int] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=False, index=True)
+    property_id: Mapped[int] = mapped_column(Integer, ForeignKey("properties.id"), nullable=False, index=True)
+    attribution_method: Mapped[str] = mapped_column(String(40), nullable=False)
+    attributed_cost_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    computed_for_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("idx_cost_attribution_method_date", "attribution_method", "computed_for_date"),
+        # Partial unique indexes (not a single UniqueConstraint including the
+        # nullable computed_for_date) — Postgres treats NULL != NULL, so a
+        # composite constraint would silently allow duplicate direct_purchase
+        # rows (where computed_for_date is always NULL) through.
+        Index(
+            "uq_cost_attribution_direct_purchase", "enrichment_usage_log_id", "subscriber_id",
+            unique=True, postgresql_where=text("attribution_method = 'direct_purchase'"),
+        ),
+        Index(
+            "uq_cost_attribution_zip_territory_daily", "enrichment_usage_log_id", "subscriber_id", "computed_for_date",
+            unique=True, postgresql_where=text("attribution_method = 'zip_territory_highest_vertical'"),
+        ),
+    )
+
+    def __repr__(self):
+        return f"<PlatformCostAttribution(subscriber_id={self.subscriber_id}, method={self.attribution_method}, cost_cents={self.attributed_cost_cents})>"
 
 
 class SmsOptIn(Base):

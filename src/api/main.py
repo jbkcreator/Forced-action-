@@ -3460,6 +3460,11 @@ class HotLeadUnlockRequest(BaseModel):
 @app.post("/api/hot-lead-unlock")
 def hot_lead_unlock(payload: HotLeadUnlockRequest, db: Session = Depends(get_db)):
     """Create a one-time Stripe Checkout Session ($150 or $99 reduced) for hot lead unlock."""
+    if not get_settings().hot_lead_unlock_enabled:
+        raise HTTPException(
+            status_code=503,
+            detail="Hot lead unlock is temporarily unavailable",
+        )
     subscriber = db.execute(
         select(Subscriber).where(Subscriber.event_feed_uuid == payload.feed_uuid)
     ).scalar_one_or_none()
