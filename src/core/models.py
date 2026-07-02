@@ -7171,3 +7171,39 @@ class VacantParcel(Base):
             f"<VacantParcel(county={self.county_id!r}, parcel={self.parcel_id!r}, "
             f"use={self.use_code!r}, source={self.source_name!r})>"
         )
+
+
+# ============================================================================
+# Task 5.2 — Programmatic SEO Engine
+# ============================================================================
+
+class SeoPage(Base):
+    """Per-page state for the programmatic SEO engine.
+
+    One row per (city_slug, topic_slug) cell. Persists content hash and
+    retirement hysteresis between weekly compile_all() runs.
+    """
+    __tablename__ = "seo_pages"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    city_slug: Mapped[str] = mapped_column(Text, nullable=False)
+    topic_slug: Mapped[str] = mapped_column(Text, nullable=False)
+    city_raw: Mapped[str] = mapped_column(Text, nullable=False)
+    vertical: Mapped[str] = mapped_column(Text, nullable=False)
+    url_path: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    content_hash: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    lastmod: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="live")
+    below_threshold_runs: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    qualified_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    first_published_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_built_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("city_slug", "topic_slug", name="uq_seo_pages_cell"),
+        CheckConstraint("status IN ('live', 'noindex', 'retired')", name="ck_seo_pages_status"),
+        Index("idx_seo_pages_status", "status"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<SeoPage(url_path={self.url_path!r}, status={self.status})>"

@@ -1,0 +1,20 @@
+<section class="signal-breakdown">
+    <h2>Lead Quality Breakdown — {{ city }}, FL</h2>
+    <table>
+        <thead>
+            <tr>
+                <th>Tier</th>
+                <th>Properties</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr><td><span class="tier-cell tier-ultra-platinum"><span class="tier-dot"></span>Ultra Platinum</span></td><td>{{ "{:,}".format(stats.ultra_platinum_count) }}</td></tr>
+            <tr><td><span class="tier-cell tier-platinum"><span class="tier-dot"></span>Platinum</span></td><td>{{ "{:,}".format(stats.platinum_count) }}</td></tr>
+            <tr><td><span class="tier-cell tier-gold"><span class="tier-dot"></span>Gold</span></td><td>{{ "{:,}".format(stats.gold_count) }}</td></tr>
+        </tbody>
+    </table>
+    <p class="comparison-note">
+        {{ city }} represents <strong>{{ stats.city_vs_county_pct }}%</strong>
+        of qualifying {{ vertical.replace('_', ' ') }} leads in the county.
+    </p>
+</section>

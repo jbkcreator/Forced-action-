@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+
+{% block title %}{{ city }}, FL {{ vertical.replace('_', ' ').title() }} &amp; Distressed Homes | Forced Action{% endblock %}
+
+{% block meta_description %}{{ "{:,}".format(stats.qualified_count) }} distressed properties in {{ city }}, FL for {{ vertical.replace('_', ' ') }}{% if stats.median_value %} — median value ${{ "{:,.0f}".format(stats.median_value) }}{% endif %}. Live distress data, lead tiers, and absentee-owner counts, updated weekly.{% endblock %}
+
+{% block head_extra %}
+{% include "_jsonld.html" %}
+{% endblock %}
+
+{% block content %}
+<main>
+    <h1>{{ city }}, FL <span class="accent">{{ vertical.replace('_', ' ').title() }}</span> &amp; Distressed Homes</h1>
+
+    <p class="lead-prose">
+        There are currently <strong>{{ "{:,}".format(stats.qualified_count) }}</strong> distressed properties
+        in {{ city }}, FL qualifying under the {{ vertical.replace('_', ' ') }} investment
+        profile{% if stats.median_value %}, with a median estimated value of
+        <strong>${{ "{:,.0f}".format(stats.median_value) }}</strong>{% endif %}.
+        {% if stats.absentee_count %}
+        Of these, <strong>{{ "{:,}".format(stats.absentee_count) }}</strong> are owned by absentee landlords —
+        a strong indicator of motivated-seller opportunity.
+        {% endif %}
+    </p>
+
+    {% include "_stat_cards.html" %}
+    {% include "_signal_sections.html" %}
+    {% include "_faq.html" %}
+
+    {% if sibling_links %}
+    <section class="sibling-links">
+        <h2>More {{ city }} Distressed Property Data</h2>
+        <ul>
+            {% for link in sibling_links %}
+            <li><a href="{{ link.href }}">{{ city }} for {{ link.label }}</a></li>
+            {% endfor %}
+        </ul>
+    </section>
+    {% endif %}
+
+    <section class="cta">
+        <h2>Access Full Property Data for {{ city }}</h2>
+        <p>Get contact info, ownership details, and investment analysis for every
+           distressed property on this list.</p>
+        <a href="https://app.forcedaction.io/signup" class="cta-button">Get Started Free</a>
+    </section>
+</main>
+{% endblock %}

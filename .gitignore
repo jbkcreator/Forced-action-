@@ -5,6 +5,7 @@ __pycache__
 .venv
 *.log
 data/
+dist/
 *.status
 reports/
 nginx.conf
