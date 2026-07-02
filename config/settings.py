@@ -442,6 +442,10 @@ class AppSettings(BaseSettings):
 	admin_password: Optional[SecretStr] = Field(default=None, env="ADMIN_PASSWORD")
 	admin_jwt_secret: Optional[SecretStr] = Field(default=None, env="ADMIN_JWT_SECRET")
 
+	# Broker portal auth — separate secret so broker and admin tokens are independently
+	# rotatable and cannot be cross-accepted. Required when broker portal is in use.
+	broker_jwt_secret: Optional[SecretStr] = Field(default=None, env="BROKER_JWT_SECRET")
+
 	# DB Backup — S3
 	backup_s3_bucket: Optional[str] = Field(default=None, env="BACKUP_S3_BUCKET")
 	backup_s3_prefix: str = Field(default="db-backups", env="BACKUP_S3_PREFIX")

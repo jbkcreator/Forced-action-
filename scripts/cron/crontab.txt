@@ -105,6 +105,13 @@ COUNTY_ID=hillsborough
 # publishes to Cora for classification + answer drafting, upserts to quora_questions.
 35 6 * * * $PROJECT/scripts/cron/run.sh src.tasks.quora_s6_orchestrator
 
+# Autonomous Inbound Content Loop (Task 5.1) — Weekly Sunday @ 09:00 AM UTC.
+# Scores each Quora Seed Keyword over a 30-day window, deactivates losers
+# (>=5 answers, 0 paid signups) and expands winners (LLM variations, pool cap 30,
+# replace-worst). Weekly to match the one-keyword/day scrape throughput. Runs
+# clear of the 04:00–08:00 scrape/CDS/skip-trace/GHL chain. See docs/adr/0021.
+0 9 * * 0 $PROJECT/scripts/cron/run.sh src.tasks.autonomous_tuning_worker
+
 # ── PINELLAS DAILY ────────────────────────────────────────────
 # Staggered +5 min after their Hillsborough counterparts within 04:00–06:30 UTC window.
 
@@ -202,6 +209,11 @@ COUNTY_ID=hillsborough
 # leads, enforces the 100% Quality Floor, then delivers (SentLead + email) or
 # refunds (releasing the reservation). Stale claims self-heal after 15 min.
 */2 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lead_pack_fulfillment_sweep
+
+# Loan Lane event sweep (WS-C) — every 2 min, offset 1 min from lead-pack sweep.
+# Polls broker.transition events → lane_closer (closed_won→funded, closed_lost→
+# dead) + commission_poster (closed_won→post commission). Both idempotent.
+1-59/2 * * * * $PROJECT/scripts/cron/run.sh src.tasks.loan_lane_sweep
 
 # Cora anomaly check — volume + no-answer rate monitor — every 15 min
 */15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.cora_anomaly_check

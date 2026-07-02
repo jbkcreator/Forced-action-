@@ -268,8 +268,9 @@ class FinancingIntentScorer:
             break
 
         # ── Signal 5: Equity Proxy ───────────────────────────────────────────
+        # Stacking-only: only boosts score when at least one other signal fired.
         fin = sigs["financials"]
-        if fin is not None:
+        if fin is not None and scores:
             eq_pct = float(fin.equity_pct) if fin.equity_pct is not None else None
             tenure = int(fin.ownership_years) if fin.ownership_years is not None else None
             no_mtg = fin.est_mortgage_bal is None
@@ -553,12 +554,67 @@ def score_properties_for_financing(
     dry_run: bool = False,
     rescore_all: bool = False,
     batch_size: Optional[int] = None,
+    auto_seed_lanes: bool = True,
 ) -> Dict[str, Any]:
-    """Score properties for financing intent. Entry point for the CLI task."""
-    return FinancingIntentScorer(session).score_properties(
+    """Score properties for financing intent. Entry point for the CLI task.
+
+    When auto_seed_lanes=True (default), newly qualified properties that do not
+    yet have a lane are entered into the broker pool after scoring completes.
+    Pass auto_seed_lanes=False for dry-run scoring passes.
+    """
+    totals = FinancingIntentScorer(session).score_properties(
         county_id=county_id,
         limit=limit,
         dry_run=dry_run,
         rescore_all=rescore_all,
         batch_size=batch_size,
     )
+
+    if not dry_run and auto_seed_lanes and totals.get("scored", 0) > 0:
+        from src.services.loan_lane_service import enter_lane
+        from sqlalchemy import text as _text
+
+        new_candidates = session.execute(
+            _text("""
+                WITH latest AS (
+                    SELECT DISTINCT ON (property_id)
+                        property_id, financing_intent_score
+                    FROM financing_intent_scores
+                    WHERE score_date = CURRENT_DATE
+                    ORDER BY property_id, score_date DESC
+                )
+                SELECT l.property_id
+                FROM latest l
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM lanes ln
+                    WHERE ln.property_id = l.property_id
+                      AND ln.lane_type = 'distressed-payoff'
+                )
+                ORDER BY l.financing_intent_score DESC
+            """),
+        ).fetchall()
+
+        lanes_created = 0
+        for row in new_candidates:
+            try:
+                enter_lane(session, lane_type="distressed-payoff", property_id=row.property_id)
+                lanes_created += 1
+            except Exception:
+                logger.exception("[LoanLane] auto-seed failed property_id=%s", row.property_id)
+
+        if lanes_created:
+            session.commit()
+            logger.info("[LoanLane] auto-seeded %d new lanes from financing intent run", lanes_created)
+
+        totals["lanes_seeded"] = lanes_created
+
+    if not dry_run:
+        try:
+            from src.services.lane_description_service import run_batch
+            desc_counts = run_batch(session)
+            totals["descriptions_generated"] = desc_counts["generated"]
+            totals["descriptions_failed"] = desc_counts["failed"]
+        except Exception:
+            logger.exception("[LaneDesc] batch run failed — descriptions skipped")
+
+    return totals
