@@ -359,27 +359,52 @@ def run(dry_run: bool = False) -> dict:
             )
             return results
 
-        # Snapshot upsert — one batched statement (executemany).
+        # Snapshot upsert — one batched statement (executemany), committed
+        # immediately so this week's engagement data is durably saved
+        # independent of whatever happens during outreach below. GHL tags,
+        # GHL notes, and Claude pitch calls are real external side effects
+        # that cannot be rolled back the way a database write can — a later
+        # failure must never be able to erase already-recorded snapshots.
         if snapshots:
             db.execute(_UPSERT_SNAPSHOT_SQL, snapshots)
+            db.commit()
 
-        # Stage + fire outreach for each flagged subscriber.
+        # Stage + fire outreach for each flagged subscriber. Each subscriber's
+        # outcome is committed individually, immediately after its own
+        # attempt, so no subscriber's recorded outcome depends on any other
+        # subscriber succeeding or failing. Without this, a mid-batch failure
+        # rolls back the whole transaction — including churn_defense_leads
+        # rows for subscribers who were already tagged/noted in GHL for real
+        # moments earlier in the same run — causing them to be silently
+        # re-flagged and re-contacted the following week.
         for sid, engagement_decay in to_flag:
-            risk_score = round(1 - engagement_decay, 3)
-            lead = ChurnDefenseLead(
-                subscriber_id=sid,
-                risk_score=risk_score,
-                outreach_status="STAGED",
-            )
-            db.add(lead)
-            db.flush()  # assign lead.id before the outreach update
+            try:
+                risk_score = round(1 - engagement_decay, 3)
+                lead = ChurnDefenseLead(
+                    subscriber_id=sid,
+                    risk_score=risk_score,
+                    outreach_status="STAGED",
+                )
+                db.add(lead)
+                db.flush()  # assign lead.id before the outreach update
 
-            if _fire_retention_outreach(db, lead):
-                results["ghl_ok"] += 1
-            else:
-                # Mark FAILED (not left at STAGED) so _OPEN_LEADS_SQL does not
-                # treat this as "already handled" and block a retry next week.
-                lead.outreach_status = "FAILED"
+                if _fire_retention_outreach(db, lead):
+                    results["ghl_ok"] += 1
+                else:
+                    # Mark FAILED (not left at STAGED) so _OPEN_LEADS_SQL does
+                    # not treat this as "already handled" and block a retry
+                    # next week.
+                    lead.outreach_status = "FAILED"
+                    results["ghl_failed"] += 1
+
+                db.commit()
+            except Exception as exc:
+                logger.error(
+                    "[ChurnDefense] unexpected error processing subscriber=%d "
+                    "— rolling back and skipping: %s",
+                    sid, exc, exc_info=True,
+                )
+                db.rollback()
                 results["ghl_failed"] += 1
 
     logger.info(
