@@ -4,11 +4,13 @@ Prospect lifecycle: creation, dedup, merge, and canonical read.
 All prospect mutations are exclusive to this module — no other component
 creates or merges prospect records.
 """
+import uuid
 from typing import Optional
 
 from sqlalchemy import text as sa_text
 
 from src.core.models import EnrichedContact
+from src.services.event_bus import emit_event
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -40,6 +42,53 @@ def best_ec(session, property_id: int) -> Optional[EnrichedContact]:
         .order_by(EnrichedContact.enriched_at.desc())
         .first()
     )
+
+
+def mark_contactable_and_emit(
+    session, property_id: int, *, actor: str, source_component: str, cost_cents: int = 0,
+) -> str:
+    """Stamp a property's prospect as contactable and emit enrichment.completed.
+
+    The single "a contact was found" side effect, shared by every path that
+    can resolve one regardless of source or cost: run_cascade()'s paid hits,
+    the voter-seeding step in enrichment_background_loop.py, and
+    EnrichmentRouter's free-fallback hits. Callers are responsible for
+    calling dedupe_after_cascade() once after all hits in a batch are
+    stamped — this function only handles one property at a time.
+
+    There is no corresponding "mark exhausted" helper here: a miss on a
+    free/no-cost path (e.g. the budget gate blocked paid enrichment and the
+    voter cross-match found nothing) is not the same as a paid cascade
+    genuinely exhausting every provider — the former still has real options
+    left once conditions change, and enrichment.failed drives permanent
+    recycle-suppression in truth_engine_batch.py, so only true cascade
+    exhaustion should ever emit it.
+    """
+    prospect_id = get_or_create_prospect(session, property_id)
+    ec = best_ec(session, property_id)
+
+    session.execute(sa_text("""
+        UPDATE prospects
+        SET contactability_state = 'contactable', updated_at = NOW()
+        WHERE prospect_id = :pid
+    """), {"pid": prospect_id})
+
+    emit_event(
+        session,
+        event_type="enrichment.completed",
+        actor=actor,
+        source_component=source_component,
+        prospect_id=uuid.UUID(prospect_id),
+        payload={
+            "property_id":         property_id,
+            "contactability_state": "contactable",
+            "enriched_contact_id": ec.id if ec else None,
+            "source":              ec.source if ec else None,
+            "confidence":          float(ec.confidence) if ec and ec.confidence else None,
+            "total_cost_cents":    cost_cents,
+        },
+    )
+    return prospect_id
 
 
 def get_prospect(session, prospect_id: str) -> Optional[dict]:

@@ -368,6 +368,105 @@ def test_free_match_success_logs_zero_cost(fresh_db):
     assert row.cost_cents == 0
 
 
+# ── Free fallback must be a full replacement path, not just a data write ──
+# (bug: previously only wrote owners.phone_1 + enriched_contacts, and never
+# stamped prospects.contactability_state, emitted enrichment.completed, or
+# ran dedupe_after_cascade — all of which run_cascade()'s own M2 block does
+# for a paid hit.)
+
+def test_free_match_hit_stamps_prospect_and_emits_completed(fresh_db):
+    db = fresh_db
+    from sqlalchemy import text as sa_text
+    prop = _prop(db, "T62-freehit-m2")
+    owner = _owner(db, prop)
+    _voter(db, prop, "8135550010")
+
+    with patch(_GATE_SRC, return_value=_mock_decision(False)):
+        result = EnrichmentRouter().fetch_contact_profile(LeadRecord(property_id=prop.id, owner_id=owner.id), db)
+    assert result["contact_found"] is True
+
+    prospect = db.execute(sa_text(
+        "SELECT prospect_id, contactability_state FROM prospects WHERE property_id = :pid"
+    ), {"pid": prop.id}).fetchone()
+    assert prospect is not None
+    assert prospect.contactability_state == "contactable"
+
+    event = db.execute(sa_text(
+        "SELECT event_type, payload FROM events WHERE prospect_id = :pid AND event_type = 'enrichment.completed'"
+    ), {"pid": prospect.prospect_id}).fetchone()
+    assert event is not None
+    assert event.payload["source"] == "voters"
+    assert event.payload["total_cost_cents"] == 0
+
+
+def test_free_match_miss_does_not_mark_exhausted_or_emit_failed(fresh_db):
+    """A free-fallback miss (budget-blocked, voter registry has nothing) is
+    not the same as a paid cascade exhausting every provider — the lead
+    still has real options once the spend ratio recovers. Marking it
+    exhausted / emitting enrichment.failed would trigger permanent
+    recycle-suppression in truth_engine_batch.py for a lead that hasn't
+    actually run out of options."""
+    db = fresh_db
+    from sqlalchemy import text as sa_text
+    prop = _prop(db, "T62-freemiss-m2")
+    owner = _owner(db, prop)
+
+    with patch(_GATE_SRC, return_value=_mock_decision(False)):
+        result = EnrichmentRouter().fetch_contact_profile(LeadRecord(property_id=prop.id, owner_id=owner.id), db)
+    assert result["contact_found"] is False
+
+    prospect = db.execute(sa_text(
+        "SELECT prospect_id FROM prospects WHERE property_id = :pid"
+    ), {"pid": prop.id}).fetchone()
+    assert prospect is None  # no prospect row created for an unresolved lead
+
+    event = db.execute(sa_text(
+        "SELECT 1 FROM events WHERE event_type = 'enrichment.failed' AND payload->>'property_id' = :pid"
+    ), {"pid": str(prop.id)}).fetchone()
+    assert event is None
+
+
+def test_free_match_hit_runs_dedupe(fresh_db):
+    db = fresh_db
+    prop = _prop(db, "T62-freehit-dedupe")
+    owner = _owner(db, prop)
+    _voter(db, prop, "8135550011")
+
+    with patch(_GATE_SRC, return_value=_mock_decision(False)), \
+         patch("src.services.prospect_service.dedupe_after_cascade") as mock_dedupe:
+        EnrichmentRouter().fetch_contact_profile(LeadRecord(property_id=prop.id, owner_id=owner.id), db)
+        mock_dedupe.assert_called_once_with(db, [prop.id])
+
+
+def test_batch_free_match_hits_stamped_dedupe_called_once_for_batch(fresh_db):
+    db = fresh_db
+    from sqlalchemy import text as sa_text
+    prop_hit = _prop(db, "T62-batchhit-m2")
+    owner_hit = _owner(db, prop_hit)
+    _voter(db, prop_hit, "8135550012")
+    prop_miss = _prop(db, "T62-batchmiss-m2")
+    owner_miss = _owner(db, prop_miss)
+
+    lead_records = [
+        LeadRecord(property_id=prop_hit.id, owner_id=owner_hit.id),
+        LeadRecord(property_id=prop_miss.id, owner_id=owner_miss.id),
+    ]
+    with patch(_GATE_SRC, return_value=_mock_decision(False)), \
+         patch("src.services.prospect_service.dedupe_after_cascade") as mock_dedupe:
+        EnrichmentRouter().fetch_contact_profiles_batch(lead_records, db)
+        mock_dedupe.assert_called_once_with(db, [prop_hit.id])
+
+    hit_prospect = db.execute(sa_text(
+        "SELECT contactability_state FROM prospects WHERE property_id = :pid"
+    ), {"pid": prop_hit.id}).fetchone()
+    assert hit_prospect.contactability_state == "contactable"
+
+    miss_prospect = db.execute(sa_text(
+        "SELECT 1 FROM prospects WHERE property_id = :pid"
+    ), {"pid": prop_miss.id}).fetchone()
+    assert miss_prospect is None
+
+
 # ── EnrichmentRouter.fetch_contact_profiles_batch ──────────────────────────
 
 def test_batch_computes_ratio_once_calls_cascade_once(fresh_db):

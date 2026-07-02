@@ -216,6 +216,13 @@ class EnrichmentRouter:
         free_result = execute_free_voter_registry_cross_match(lead_record, db)
         result["contact_found"] = free_result["found"]
         result["source"] = "free" if free_result["found"] else None
+        if free_result["found"]:
+            from src.services.prospect_service import dedupe_after_cascade, mark_contactable_and_emit
+            mark_contactable_and_emit(
+                db, lead_record.property_id, actor="enrichment_router",
+                source_component="enrichment_router", cost_cents=0,
+            )
+            dedupe_after_cascade(db, [lead_record.property_id])
         _log_decision(
             db, lead_record, detail=detail, provider="voters" if free_result["found"] else None,
             lookup_success=free_result["found"], cost_cents=0,
@@ -291,11 +298,24 @@ class EnrichmentRouter:
             return {"selected_path": detail["selected_path"], "cascade_stats": stats, "free_results": {}}
 
         free_results = {}
+        resolved_property_ids: list[int] = []
         for lr in lead_records:
             free_result = execute_free_voter_registry_cross_match(lr, db)
             free_results[lr.property_id] = free_result
+            if free_result["found"]:
+                from src.services.prospect_service import mark_contactable_and_emit
+                mark_contactable_and_emit(
+                    db, lr.property_id, actor="enrichment_router",
+                    source_component="enrichment_router", cost_cents=0,
+                )
+                resolved_property_ids.append(lr.property_id)
             _log_decision(
                 db, lr, detail=detail, provider="voters" if free_result["found"] else None,
                 lookup_success=free_result["found"], cost_cents=0,
             )
+
+        if resolved_property_ids:
+            from src.services.prospect_service import dedupe_after_cascade
+            dedupe_after_cascade(db, resolved_property_ids)
+
         return {"selected_path": detail["selected_path"], "cascade_stats": None, "free_results": free_results}

@@ -458,7 +458,7 @@ def run_once(
                            AND match_success = TRUE
                            AND superseded_at IS NULL
                            AND source IN (
-                               'tracerfy', 'batch_skip_tracing', 'idi', 'pdl'
+                               'tracerfy', 'batch_skip_tracing', 'idi', 'pdl', 'voters'
                            )
                     """), {"pids": cascade_property_ids}).fetchall()
                 }
