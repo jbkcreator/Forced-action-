@@ -289,6 +289,13 @@ COUNTY_ID=hillsborough
 */10 7-23 * * 1-6 $PROJECT/scripts/cron/run.sh src.services.enrichment_background_loop hillsborough --limit 50
 */10 7-23 * * 1-6 $PROJECT/scripts/cron/run.sh src.services.enrichment_background_loop pinellas --limit 50
 
+# ── OUTBOUND PACING SWEEP (Task 5.3) ─────────────────────────────────────────
+# Routes newly enriched contacts to SMS (mobile) or direct mail (landline/VoIP),
+# then dispatches staged mobile contacts with adaptive pacing based on live SMS
+# delivery failure rate. Both counties per run by default. Idempotent — safe to
+# overlap with itself if a prior run is still finishing.
+*/5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.outbound_pacing_sweep
+
 # ── ENRICHMENT RECONCILIATION SWEEP (ADR 0016) ───────────────────────────────
 # Nightly backstop — 07:30 AM UTC Mon-Sat. Catches any Gold+ leads missed by the
 # background loop (e.g. loop was down, leads scored during 00:00-07:00 scraper
