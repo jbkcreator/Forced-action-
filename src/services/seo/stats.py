@@ -38,7 +38,9 @@ def gather_page_data(
                 SELECT DISTINCT ON (ds.property_id)
                     ds.property_id,
                     ds.vertical_scores,
-                    ds.lead_tier
+                    ds.lead_tier,
+                    ds.qualified,
+                    ds.is_guess_lead
                 FROM distress_scores ds
                 WHERE ds.property_id IN (SELECT id FROM city_ids)
                 ORDER BY ds.property_id, ds.score_date DESC
@@ -52,7 +54,12 @@ def gather_page_data(
                 JOIN properties p ON p.id = l.property_id
                 LEFT JOIN financials f ON f.property_id = p.id
                 LEFT JOIN owners o ON o.property_id = p.id
-                WHERE (l.vertical_scores ->> :vertical)::float > 0
+                -- Same inventory rule as grid.all_qualified_counts: platform
+                -- `qualified` flag + A2 guess-lead gate + vertical relevance —
+                -- on-page numbers must match what a subscriber actually gets.
+                WHERE l.qualified = TRUE
+                  AND l.is_guess_lead = FALSE
+                  AND (l.vertical_scores ->> :vertical)::float > 0
             )
             SELECT
                 COUNT(*)                                                             AS qualified_count,

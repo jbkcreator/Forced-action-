@@ -45,6 +45,20 @@ def _seed(db, n=_N):
             lead_tier="Platinum" if i < 3 else "Gold",
             final_cds_score=70, qualified=True,
         ))
+
+    # Noise rows that must NOT be counted: positive vertical score but not
+    # deliverable inventory (unqualified / A2 guess lead).
+    for suffix, extra in (("UNQ", {"qualified": False}),
+                          ("GUESS", {"qualified": True, "is_guess_lead": True})):
+        p = Property(parcel_id=f"SEOTEST-{suffix}-{uuid.uuid4().hex[:8]}", city=_CITY,
+                     state="FL", county_id="hillsborough", address=f"{suffix} Noise St")
+        db.add(p)
+        db.flush()
+        db.add(DistressScore(
+            property_id=p.id, county_id="hillsborough",
+            vertical_scores={_VERTICAL: 70}, lead_tier="Gold",
+            final_cds_score=70, **extra,
+        ))
     db.flush()
 
 
@@ -114,6 +128,42 @@ def test_seo_e2e_real_sql_and_compile(fresh_db, tmp_path):
     ).mappings().fetchone()
     assert row2["lastmod"] == first_lastmod, "lastmod must be stable on no-op rebuild"
 
+    # ── 5. Missing file on unchanged hash (fresh host / cleared dist) gets
+    #       rewritten — sitemap must never point at a 404 ──
+    page_file.unlink()
+    compile_all(fresh_db, cells=[_cell()], counts=counts, output_dir=out_dir, write=True)
+    assert page_file.exists(), "missing file must be rematerialized even when hash is unchanged"
+    row3 = fresh_db.execute(
+        text("SELECT lastmod FROM seo_pages WHERE city_slug = :cs"),
+        {"cs": _CITY_SLUG},
+    ).mappings().fetchone()
+    assert row3["lastmod"] == first_lastmod, "rematerializing must not bump lastmod"
+
+
+def test_seo_e2e_orphaned_city_retires(fresh_db, tmp_path):
+    """A live page whose cell vanishes from the grid entirely (city renamed /
+    blocklisted / gone) must go through hysteresis → noindex, not live forever."""
+    exists = fresh_db.execute(text("SELECT to_regclass('public.seo_pages')")).scalar()
+    if exists is None:
+        pytest.skip("seo_pages table not applied")
+
+    _seed(fresh_db)
+    out_dir = tmp_path / "florida"
+    live_counts = {(_CITY_SLUG, _VERTICAL): _N}
+    compile_all(fresh_db, cells=[_cell()], counts=live_counts, output_dir=out_dir, write=True)
+
+    # city disappears from discovery: two runs with an empty grid
+    compile_all(fresh_db, cells=[], counts={}, output_dir=out_dir, write=True)
+    compile_all(fresh_db, cells=[], counts={}, output_dir=out_dir, write=True)
+
+    row = fresh_db.execute(
+        text("SELECT status, below_threshold_runs FROM seo_pages WHERE city_slug = :cs"),
+        {"cs": _CITY_SLUG},
+    ).mappings().fetchone()
+    assert row["status"] == "noindex", "orphaned page must retire via hysteresis"
+    sitemap_xml = (out_dir.parent / "sitemap.xml").read_text(encoding="utf-8")
+    assert _CITY_SLUG not in sitemap_xml
+
 
 def test_seo_e2e_retirement_hysteresis(fresh_db, tmp_path):
     exists = fresh_db.execute(
@@ -141,7 +191,8 @@ def test_seo_e2e_retirement_hysteresis(fresh_db, tmp_path):
 
     # second consecutive sub-threshold run: retired (noindex), dropped from sitemap
     result = compile_all(fresh_db, cells=[_cell()], counts=sub_counts, output_dir=out_dir, write=True)
-    assert result["retired"] == 1, "summary must count the retirement"
+    # >= because the orphan sweep may retire other live rows in the shared DB
+    assert result["retired"] >= 1, "summary must count the retirement"
     row = fresh_db.execute(
         text("SELECT status, below_threshold_runs FROM seo_pages WHERE city_slug = :cs"),
         {"cs": _CITY_SLUG},

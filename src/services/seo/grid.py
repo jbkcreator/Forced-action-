@@ -113,7 +113,7 @@ def all_qualified_counts(db: Session) -> dict[tuple[str, str], int]:
         text(f"""
             WITH latest AS (
                 SELECT DISTINCT ON (property_id)
-                    property_id, vertical_scores
+                    property_id, vertical_scores, qualified, is_guess_lead
                 FROM distress_scores
                 ORDER BY property_id, score_date DESC
             )
@@ -127,6 +127,11 @@ def all_qualified_counts(db: Session) -> dict[tuple[str, str], int]:
             WHERE p.county_id = ANY(:counties)
               AND p.city IS NOT NULL
               AND TRIM(p.city) != ''
+              -- qualified = the platform-wide lead definition (cds_engine routing
+              -- threshold); is_guess_lead = A2 low-confidence gate. Pages must
+              -- count only inventory a subscriber would actually receive.
+              AND l.qualified = TRUE
+              AND l.is_guess_lead = FALSE
               AND (l.vertical_scores ->> v.vertical)::float > 0
             GROUP BY TRIM(p.city), v.vertical
         """),

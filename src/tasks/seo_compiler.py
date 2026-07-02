@@ -57,11 +57,13 @@ def compile_all(
     pages = _load_pages(db)
 
     changed_urls: list[str] = []
+    visited_urls: set[str] = set()
     built = retired = skipped = 0
 
     for cell in cells:
         count = counts.get((cell.city_slug, cell.vertical), 0)
         url_path = f"/florida/{cell.city_slug}/{cell.topic_slug}/"
+        visited_urls.add(url_path)
         existing = pages.get(url_path)
 
         if not is_eligible(count, floor):
@@ -82,20 +84,47 @@ def compile_all(
 
         html = render_page(page_data)
         new_hash = content_hash(html)
+        out = output_dir / cell.city_slug / cell.topic_slug / "index.html"
 
         if existing and existing["content_hash"] == new_hash:
+            # Unchanged content — but the file may be missing (fresh host,
+            # cleared dist/). Rewrite it without bumping lastmod, otherwise the
+            # sitemap advertises a URL that 404s.
+            if write and not out.exists():
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_text(html, encoding="utf-8")
             _touch_page(db, url_path, count, now)
             built += 1
             continue
 
         if write:
-            out = output_dir / cell.city_slug / cell.topic_slug / "index.html"
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(html, encoding="utf-8")
 
         _upsert_page(db, cell, url_path, new_hash, count, now, status="live")
         changed_urls.append(url_path)
         built += 1
+
+    # Orphaned pages: live rows whose cell vanished from the grid entirely
+    # (city renamed, blocklisted, or gone from properties). They get the same
+    # hysteresis treatment as a zero-count cell — otherwise they'd stay in the
+    # sitemap forever with their source data gone.
+    for url_path, row in pages.items():
+        if url_path in visited_urls or row["status"] != "live":
+            continue
+        orphan_cell = GridCell(
+            city_raw=row["city_raw"], city_slug=row["city_slug"],
+            vertical=row["vertical"], topic_slug=row["topic_slug"],
+            variants=(row["city_raw"],),
+        )
+        logger.warning("Orphaned page (cell no longer in grid): %s", url_path)
+        if _handle_sub_threshold(
+            db, orphan_cell, row, hysteresis, now, write,
+            settings=settings, counts=counts, floor=floor,
+            county_totals=county_totals, output_dir=output_dir,
+        ):
+            retired += 1
+        skipped += 1
 
     if write:
         build_sitemap(db, output_dir)
