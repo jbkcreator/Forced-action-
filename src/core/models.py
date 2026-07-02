@@ -1522,6 +1522,77 @@ class WebhookEvent(Base):
         )
 
 
+class SubscriberSessionMetrics(Base):
+    """
+    Per-subscriber portal-engagement snapshot (Task 6.3, Phase 6).
+
+    One row per subscriber, upserted each weekly worker run
+    (src/tasks/churn_defense_engagement_decay.py). Rolling counts are recomputed
+    from webhook_events each run (self-correcting) rather than incremented in place.
+    engagement_decay_scalar is the latest computed decay score, clamped to the
+    numeric(3,2) ceiling. auth_intervals_seconds is stored per spec but is not
+    used by the decay formula.
+    """
+    __tablename__ = "subscriber_session_metrics"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("subscribers.id", ondelete="CASCADE"),
+        nullable=False, unique=True, index=True,
+    )
+    last_login_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    dashboard_views_7_day: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    lead_downloads_7_day: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    auth_intervals_seconds: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    engagement_decay_scalar: Mapped[Decimal] = mapped_column(
+        Numeric(3, 2), default=Decimal("1.00"), server_default="1.00", nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    def __repr__(self):
+        return (
+            f"<SubscriberSessionMetrics(subscriber_id={self.subscriber_id}, "
+            f"decay={self.engagement_decay_scalar})>"
+        )
+
+
+class ChurnDefenseLead(Base):
+    """
+    Staged retention-outreach record (Task 6.3, Phase 6).
+
+    One row per firing event: created when a subscriber's engagement_decay drops
+    below the threshold. risk_score = 1 - engagement_decay (churn probability).
+    outreach_status lifecycle: STAGED -> SEQUENCE_TRIGGERED -> ENGAGED -> CONVERTED
+    (the worker writes STAGED then SEQUENCE_TRIGGERED; later states are advanced
+    by downstream GHL callbacks). FAILED is a worker-only terminal state for a
+    row whose pitch/GHL push did not succeed — it is excluded from the open-lead
+    cooldown check (src/tasks/churn_defense_engagement_decay.py) so a transient
+    failure does not block a retry on the next weekly run.
+    """
+    __tablename__ = "churn_defense_leads"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("subscribers.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    risk_score: Mapped[Decimal] = mapped_column(Numeric(4, 3), nullable=False)
+    outreach_status: Mapped[str] = mapped_column(
+        String(50), default="STAGED", server_default="STAGED", nullable=False
+    )
+    triggered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+
+    def __repr__(self):
+        return (
+            f"<ChurnDefenseLead(subscriber_id={self.subscriber_id}, "
+            f"risk={self.risk_score}, status={self.outreach_status!r})>"
+        )
+
+
 class PhoneDeliverabilitySnapshot(Base):
     """
     Daily sample of phone-deliverability quality across Gold+ leads.

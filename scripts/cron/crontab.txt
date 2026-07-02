@@ -438,6 +438,11 @@ COUNTY_ID=hillsborough
 # Computes precision/recall, lead time, and holdout-arm lift from backfilled rows.
 0 13 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.churn_validation_report
 
+# Churn Defense engagement-decay scorer  — weekly Monday 14:00 UTC.
+# Recomputes portal-engagement decay per subscriber from webhook_events; stages
+# churn_defense_leads + fires GHL retention outreach for at-risk accounts.
+0 14 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.churn_defense_engagement_decay
+
 # Pause-resume reminder — daily 11:00 UTC. Sends a transactional SMS to paused
 # subscribers 7 days before their pause_resume_at date so they know leads are
 # about to start flowing again. Idempotency via the ±1d window on resume date.
