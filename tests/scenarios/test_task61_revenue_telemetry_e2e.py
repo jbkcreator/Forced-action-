@@ -19,6 +19,7 @@ Two functions, tested separately because they rest on different evidence:
 """
 
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import text as sa_text
@@ -429,3 +430,86 @@ def test_daily_refresh_is_idempotent_within_same_day(fresh_db):
     r = _row_for(rows, sub.id)
     assert r["territory_attributed_cost_cents"] == 7
     assert r["territory_leads_count"] == 1
+
+
+# ── Webhook handler regression tests ────────────────────────────────────────
+# Unlike the tests above (which seed via helpers mirroring the write paths),
+# these call the real src/services/stripe_webhooks.py handlers directly, to
+# catch ledger-write gaps in the handlers themselves.
+
+def test_lead_pack_refund_marks_every_sent_lead_ledger_row_refunded(fresh_db):
+    """A Lead Pack refund must mark every sent_leads-keyed ledger row for
+    that purchase's payment intent, not just the lead_pack_purchases row —
+    revenue was split across up to 5 sent_leads rows at delivery."""
+    db = fresh_db
+    from src.services.stripe_webhooks import _on_charge_refunded
+
+    sub = _subscriber(db, "cus_t61w_a")
+    props = [_prop(db, f"T61W-refund-{i}") for i in range(5)]
+    purchase = _lead_pack(db, sub, props, total_amount_cents=2000, pi="pi_t61w_refund")
+
+    sent_lead_ids = [
+        row.id for row in db.execute(sa_text(
+            "SELECT id FROM sent_leads WHERE stripe_payment_intent_id = :pi"
+        ), {"pi": "pi_t61w_refund"}).fetchall()
+    ]
+    assert len(sent_lead_ids) == 5
+
+    charge = {"id": "ch_t61w_refund", "payment_intent": "pi_t61w_refund", "reason": "requested_by_customer"}
+    # _resolve_premium_purchase_from_charge is unrelated to this test (this
+    # charge is a Lead Pack, not a PremiumPurchase) but runs unconditionally
+    # first — it's patched out here because premium_purchases.output_ref_
+    # expires_at exists on the ORM model with no matching migration, so any
+    # full-table ORM SELECT against it currently errors in every environment
+    # (pre-existing, unrelated to this fix — flagged separately).
+    with patch("src.services.stripe_webhooks._resolve_premium_purchase_from_charge", return_value=None):
+        _on_charge_refunded(charge, db)
+
+    refunded_count = db.execute(sa_text("""
+        SELECT COUNT(*) FROM platform_revenue_ledger
+        WHERE source_table = 'sent_leads' AND source_id = ANY(:ids) AND refunded_at IS NOT NULL
+    """), {"ids": sent_lead_ids}).scalar()
+    assert refunded_count == 5
+    assert purchase.status == "refunded"
+
+
+def test_lead_unlock_second_payment_on_previously_free_lead_records_revenue(fresh_db):
+    """A SentLead row can pre-exist with no payment intent (e.g. delivered
+    free) and only later be paid for via lead-unlock. That first real
+    payment must still hit the ledger, not just get silently absorbed into
+    the existing row."""
+    db = fresh_db
+    from src.core.models import SentLead
+    from src.services.stripe_webhooks import _on_lead_unlock_payment
+
+    sub = _subscriber(db, "cus_t61w_b")
+    prop = _prop(db, "T61W-freethenpaid")
+    free_sent = SentLead(
+        subscriber_id=sub.id, property_id=prop.id, source="daily_digest",
+        sent_at=_IN, stripe_payment_intent_id=None, amount_cents=None,
+    )
+    db.add(free_sent)
+    db.flush()
+
+    payment_intent = {
+        "id": "pi_t61w_unlock",
+        "customer": "cus_t61w_b",
+        "metadata": {"property_id": str(prop.id)},
+        "amount_received": 500,
+    }
+    with patch("src.services.stripe_webhooks._send_lead_unlock_email"), \
+         patch("src.services.auto_mode.enqueue_action"), \
+         patch("src.services.email.send_welcome_email"):
+        _on_lead_unlock_payment(payment_intent, db)
+
+    db.refresh(free_sent)
+    assert free_sent.stripe_payment_intent_id == "pi_t61w_unlock"
+    assert free_sent.amount_cents == 500
+
+    ledger_row = db.execute(sa_text("""
+        SELECT amount_cents, refunded_at FROM platform_revenue_ledger
+        WHERE source_table = 'sent_leads' AND source_id = :sid
+    """), {"sid": free_sent.id}).fetchone()
+    assert ledger_row is not None
+    assert ledger_row.amount_cents == 500
+    assert ledger_row.refunded_at is None
