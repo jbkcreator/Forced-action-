@@ -132,6 +132,15 @@ def _select_candidates(session, county_id: str, limit: int, today_only: bool) ->
     return q.limit(limit).all()
 
 
+def select_enrichment_candidates(session, county_id: str, limit: int, today_only: bool) -> list:
+    """Public wrapper for _select_candidates — Task 6.2's reconciliation-sweep
+    call site needs the same candidate set _before_ deciding whether to route
+    them through the paid cascade or the free fallback, since run_cascade()'s
+    batch mode (owner_ids=None) otherwise self-selects candidates internally
+    with no hook to intercept them first."""
+    return _select_candidates(session, county_id, limit, today_only)
+
+
 # ─── DB helpers ──────────────────────────────────────────────────────────────
 
 def _read_ec(session, property_id: int, source: str) -> Optional[EnrichedContact]:

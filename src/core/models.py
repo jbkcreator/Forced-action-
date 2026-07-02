@@ -3474,6 +3474,57 @@ class PlatformCostAttribution(Base):
         return f"<PlatformCostAttribution(subscriber_id={self.subscriber_id}, method={self.attribution_method}, cost_cents={self.attributed_cost_cents})>"
 
 
+class AlgorithmicVarianceLog(Base):
+    """
+    Task 6.2 — one row per paid/free enrichment routing decision made by
+    EnrichmentRouter.fetch_contact_profile(). Append-only audit trail for
+    the cost-control gate in front of Tracerfy/BatchData/IDI/PDL.
+    """
+    __tablename__ = "algorithmic_variance_log"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+
+    lead_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    property_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("properties.id"), nullable=True, index=True)
+    subscriber_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=True, index=True)
+    county: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    vertical: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    lead_tier: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+
+    spend_ratio: Mapped[Optional[float]] = mapped_column(Numeric(14, 6), nullable=True)  # NULL when revenue unavailable
+    threshold: Mapped[float] = mapped_column(Numeric(14, 6), nullable=False)
+
+    selected_path: Mapped[str] = mapped_column(String(20), nullable=False)
+    provider: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)  # tracerfy|batchdata|idi|pdl|voters, null if blocked pre-lookup
+
+    paid_lookup_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    routing_reason: Mapped[str] = mapped_column(String(32), nullable=False)
+
+    lookup_success: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    cost_cents: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "selected_path IN ('paid_trace','free_cross_match','blocked','override_paid')",
+            name="check_avl_selected_path",
+        ),
+        CheckConstraint(
+            "routing_reason IN ('spend_ratio_safe','spend_ratio_exceeded',"
+            "'zero_revenue_guard','missing_telemetry_guard','manual_override')",
+            name="check_avl_routing_reason",
+        ),
+        Index("idx_avl_subscriber_created", "subscriber_id", "created_at"),
+        Index("idx_avl_property_created", "property_id", "created_at"),
+    )
+
+    def __repr__(self):
+        return f"<AlgorithmicVarianceLog(path={self.selected_path}, reason={self.routing_reason}, ratio={self.spend_ratio})>"
+
+
 class SmsOptIn(Base):
     """
     TCPA double opt-in records. Tracks explicit consent via "Reply YES" flow.
@@ -4946,7 +4997,7 @@ class MessageVariantTest(Base):
     slot_c_retired_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
     proving_slot: Mapped[Optional[str]] = mapped_column(String(5))
-    proving_baseline_conv_rate: Mapped[Optional[float]] = mapped_column(Numeric(8, 6))
+    proving_baseline_conv_rate: Mapped[Optional[float]] = mapped_column(Numeric(14, 6))
     proving_started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
     created_at: Mapped[datetime] = mapped_column(
@@ -4992,8 +5043,8 @@ class VariantRetirementLog(Base):
     slot: Mapped[str] = mapped_column(String(5), nullable=False)
     old_body: Mapped[Optional[str]] = mapped_column(Text)
     new_body: Mapped[Optional[str]] = mapped_column(Text)
-    old_conversion_rate: Mapped[Optional[float]] = mapped_column(Numeric(8, 6))
-    new_conversion_rate: Mapped[Optional[float]] = mapped_column(Numeric(8, 6))
+    old_conversion_rate: Mapped[Optional[float]] = mapped_column(Numeric(14, 6))
+    new_conversion_rate: Mapped[Optional[float]] = mapped_column(Numeric(14, 6))
     reason: Mapped[Optional[str]] = mapped_column(Text)
     idempotency_key: Mapped[str] = mapped_column(String(120), nullable=False, unique=True)
     created_at: Mapped[datetime] = mapped_column(

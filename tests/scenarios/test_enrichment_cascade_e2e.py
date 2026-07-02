@@ -107,8 +107,8 @@ def _seed_property(session, *, name: str = "JOHN A DOE", is_llc: bool = False,
 
 def _cleanup(property_id: int) -> None:
     with get_db_context() as s:
-        for tbl in ("enrichment_usage_logs", "voters", "enriched_contacts",
-                    "distress_scores", "foreclosures", "owners"):
+        for tbl in ("algorithmic_variance_log", "enrichment_usage_logs", "voters",
+                    "enriched_contacts", "distress_scores", "foreclosures", "owners"):
             s.execute(text(f"DELETE FROM {tbl} WHERE property_id = :p"),  # noqa: S608 — fixed names
                       {"p": property_id})
         s.execute(text("DELETE FROM properties WHERE id = :p"), {"p": property_id})
@@ -686,7 +686,15 @@ def test_supervisor_uninitialized_batcher_drops_cleanly():
 
 def test_full_e2e_gold_event_drives_cascade(seeded):
     """A gold_lead_scored event routes through the supervisor and batcher and
-    reaches run_cascade with the owner_ids resolved from the property_id."""
+    reaches run_cascade with the owner_ids resolved from the property_id.
+
+    This test verifies the dispatch -> batcher -> cascade plumbing, not
+    Task 6.2's budget gate (EnrichmentRouter now sits in front of run_cascade
+    at this call site) — so the gate is forced open here. Without this, the
+    test's outcome would depend on the real platform-wide spend ratio in
+    whatever Postgres instance runs it, which is exactly what Task 6.2's own
+    tests (test_algorithmic_variance_control.py) isolate and cover already.
+    """
     from src.agents.enrichment_consumer import EnrichmentBatcher
     from src.agents.supervisor import dispatch_event
     from src.services.skip_trace_waterfall import WaterfallStats
@@ -699,7 +707,13 @@ def test_full_e2e_gold_event_drives_cascade(seeded):
         return WaterfallStats(total_leads=1, hits=0, misses=1)
 
     stop = threading.Event()
-    with patch(_RUN_CASCADE_SRC, side_effect=_mock_cascade):
+    with patch(_RUN_CASCADE_SRC, side_effect=_mock_cascade), \
+         patch("src.services.enrichment_router.is_paid_enrichment_allowed",
+               return_value=(True, {
+                   "spend_cents": 0, "revenue_cents": 0, "ratio": 0.0, "threshold": 0.25,
+                   "window_days": 30, "routing_reason": "spend_ratio_safe",
+                   "selected_path": "paid_trace", "override_applied": False,
+               })):
         batcher = EnrichmentBatcher(flush_size=1, flush_seconds=9999)
         batcher.start(stop_event=stop)
         try:

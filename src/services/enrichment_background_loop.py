@@ -308,7 +308,8 @@ def run_once(
       8. No voter phone              → paid cascade (Tracerfy → BatchData → PDL)
       9. Update contact_refresh_status for cascade results
     """
-    from src.services.skip_trace_waterfall import WaterfallStats, run_cascade
+    from src.services.skip_trace_waterfall import WaterfallStats
+    from src.services.enrichment_router import EnrichmentRouter, LeadRecord
     from src.services.prospect_service import dedupe_after_cascade
 
     stats = {
@@ -411,22 +412,36 @@ def run_once(
                 dedupe_after_cascade(session, voter_cleared_property_ids)
                 session.commit()
 
-        # ── Step 8: remaining owners (no voter phone) → paid cascade ──────────
+        # ── Step 8: remaining owners (no voter phone) → budget-gated cascade ──
+        # Task 6.2: routed through EnrichmentRouter instead of calling
+        # run_cascade() directly, so paid-provider spend is checked against
+        # the rolling spend/revenue ratio first. On the allowed path this
+        # calls run_cascade() with the exact same arguments as before (a
+        # thin wrapper, not a behavior change); on the blocked path it falls
+        # back to the free voter cross-match per lead instead.
         cascade_owner_ids = [
             r.owner_id for r in rows if r.owner_id not in seeded_ids
         ]
         stats["cascade_attempted"] = len(cascade_owner_ids)
 
         cascade_stats = WaterfallStats()
+        free_fallback_results: dict = {}
         if cascade_owner_ids and not dry_run:
-            cascade_stats = run_cascade(
-                owner_ids=cascade_owner_ids,
-                county_id=county_id,
-            )
+            lead_records = [
+                LeadRecord(property_id=r.property_id, owner_id=r.owner_id, county_id=county_id)
+                for r in rows if r.owner_id in cascade_owner_ids
+            ]
+            with get_db_context() as session:
+                batch_result = EnrichmentRouter().fetch_contact_profiles_batch(lead_records, session)
+                session.commit()
+            if batch_result["cascade_stats"] is not None:
+                cascade_stats = batch_result["cascade_stats"]
+            free_fallback_results = batch_result["free_results"]
 
         stats["cascade_hits"]       = cascade_stats.hits
         stats["cascade_misses"]     = cascade_stats.misses
         stats["cascade_cost_cents"] = cascade_stats.total_cost_cents
+        stats["free_fallback_hits"] = sum(1 for r in free_fallback_results.values() if r["found"])
 
         # ── Step 9: mark cascade owners done (run_cascade doesn't touch ───────
         #            contact_refresh_status)
