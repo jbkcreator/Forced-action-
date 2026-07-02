@@ -71,7 +71,11 @@ def run_enrichment_pipeline(
                 entity_only=entity_only,
             )
         else:
-            from src.services.skip_trace_waterfall import consume_prospect_created, run_cascade
+            from src.services.skip_trace_waterfall import (
+                WaterfallStats, consume_prospect_created, select_enrichment_candidates,
+            )
+            from src.services.enrichment_router import EnrichmentRouter, LeadRecord
+            from src.core.database import get_db_context
 
             # Event-driven pass: enrich properties whose prospect.created event
             # was emitted by the seeding cron (07:15). Marks events processed.
@@ -79,11 +83,31 @@ def run_enrichment_pipeline(
 
             # Reconciliation sweep: catches any Gold+ property not covered by
             # the event-driven pass (missed seeding, dropped event, etc.).
-            wf_stats = run_cascade(
-                county_id=county_id,
-                limit=limit,
-                today_only=today_only,
-            )
+            # Task 6.2: candidates are pre-selected via the same query
+            # run_cascade()'s own batch mode (owner_ids=None) would run
+            # internally, so passing them explicitly here is behaviorally
+            # identical to before, not a change — it's just pre-selected
+            # once so the budget gate can decide paid-vs-free before the
+            # cascade runs, instead of calling run_cascade() unconditionally.
+            with get_db_context() as session:
+                candidates = select_enrichment_candidates(session, county_id, limit, today_only)
+                lead_records = [
+                    LeadRecord(property_id=o.property_id, owner_id=o.id, county_id=county_id)
+                    for o in candidates
+                ]
+                batch_result = EnrichmentRouter().fetch_contact_profiles_batch(lead_records, session)
+                session.commit()
+
+            if batch_result["cascade_stats"] is not None:
+                wf_stats = batch_result["cascade_stats"]
+            else:
+                free_results = batch_result["free_results"]
+                free_hits = sum(1 for r in free_results.values() if r["found"])
+                wf_stats = WaterfallStats(
+                    total_leads=len(lead_records), hits=free_hits,
+                    misses=len(lead_records) - free_hits, total_cost_cents=0,
+                    per_provider={"voters": {"hits": free_hits, "cost_cents": 0}},
+                )
 
         results["waterfall"] = {
             "total_leads":      wf_stats.total_leads,

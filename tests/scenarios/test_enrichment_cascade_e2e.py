@@ -68,6 +68,7 @@ _IDI_SRC       = "src.services.idi_fallback.run_idi_fallback"
 _DIRECTMAIL_SRC = "src.services.direct_mail.flag_direct_mail_eligible"
 _RUN_CASCADE_SRC = "src.services.skip_trace_waterfall.run_cascade"
 _PUBLISH_SRC   = "src.agents.events.ingestion.publish_cora_event"
+_GATE_SRC      = "src.services.enrichment_router.is_paid_enrichment_allowed"
 
 _PHONE_META = {"phone_1": {"score": 85, "reachable": True, "type": "mobile"}}
 
@@ -107,8 +108,18 @@ def _seed_property(session, *, name: str = "JOHN A DOE", is_llc: bool = False,
 
 def _cleanup(property_id: int) -> None:
     with get_db_context() as s:
-        for tbl in ("enrichment_usage_logs", "voters", "enriched_contacts",
-                    "distress_scores", "foreclosures", "owners"):
+        prospect = s.execute(text(
+            "SELECT prospect_id FROM prospects WHERE property_id = :p"
+        ), {"p": property_id}).fetchone()
+        if prospect:
+            s.execute(text(
+                "DELETE FROM processed_events WHERE event_id IN "
+                "(SELECT event_id FROM events WHERE prospect_id = :pid)"
+            ), {"pid": prospect.prospect_id})
+            s.execute(text("DELETE FROM events WHERE prospect_id = :pid"), {"pid": prospect.prospect_id})
+            s.execute(text("DELETE FROM prospects WHERE prospect_id = :pid"), {"pid": prospect.prospect_id})
+        for tbl in ("algorithmic_variance_log", "enrichment_usage_logs", "voters",
+                    "enriched_contacts", "distress_scores", "foreclosures", "owners"):
             s.execute(text(f"DELETE FROM {tbl} WHERE property_id = :p"),  # noqa: S608 — fixed names
                       {"p": property_id})
         s.execute(text("DELETE FROM properties WHERE id = :p"), {"p": property_id})
@@ -686,7 +697,15 @@ def test_supervisor_uninitialized_batcher_drops_cleanly():
 
 def test_full_e2e_gold_event_drives_cascade(seeded):
     """A gold_lead_scored event routes through the supervisor and batcher and
-    reaches run_cascade with the owner_ids resolved from the property_id."""
+    reaches run_cascade with the owner_ids resolved from the property_id.
+
+    This test verifies the dispatch -> batcher -> cascade plumbing, not
+    Task 6.2's budget gate (EnrichmentRouter now sits in front of run_cascade
+    at this call site) — so the gate is forced open here. Without this, the
+    test's outcome would depend on the real platform-wide spend ratio in
+    whatever Postgres instance runs it, which is exactly what Task 6.2's own
+    tests (test_algorithmic_variance_control.py) isolate and cover already.
+    """
     from src.agents.enrichment_consumer import EnrichmentBatcher
     from src.agents.supervisor import dispatch_event
     from src.services.skip_trace_waterfall import WaterfallStats
@@ -699,7 +718,13 @@ def test_full_e2e_gold_event_drives_cascade(seeded):
         return WaterfallStats(total_leads=1, hits=0, misses=1)
 
     stop = threading.Event()
-    with patch(_RUN_CASCADE_SRC, side_effect=_mock_cascade):
+    with patch(_RUN_CASCADE_SRC, side_effect=_mock_cascade), \
+         patch("src.services.enrichment_router.is_paid_enrichment_allowed",
+               return_value=(True, {
+                   "spend_cents": 0, "revenue_cents": 0, "ratio": 0.0, "threshold": 0.25,
+                   "window_days": 30, "routing_reason": "spend_ratio_safe",
+                   "selected_path": "paid_trace", "override_applied": False,
+               })):
         batcher = EnrichmentBatcher(flush_size=1, flush_seconds=9999)
         batcher.start(stop_event=stop)
         try:
@@ -717,3 +742,98 @@ def test_full_e2e_gold_event_drives_cascade(seeded):
     assert len(cascade_calls) == 1
     assert cascade_calls[0]["county_id"] == _COUNTY
     assert oid in cascade_calls[0]["owner_ids"]
+
+
+# ── consume_prospect_created respects the budget gate (Task 6.2) ──────────
+# consume_prospect_created() previously called run_cascade() directly,
+# bypassing EnrichmentRouter entirely — the one cascade-triggering path
+# Task 6.2 missed when it was first wired into the other 3 real call sites.
+#
+# consume_prospect_created()'s own event-polling query has no county_id or
+# date scoping (a pre-existing, separate structural gap, not something this
+# test set out to fix) — it processes ALL globally unprocessed
+# prospect.created events, up to 500 at a time. Running it for real against
+# the shared DB is only safe when the queue is actually empty of unrelated
+# events, so this test asserts that precondition up front and fails loudly
+# instead of silently touching real production owners if it's ever violated.
+
+def test_consume_prospect_created_blocked_uses_free_fallback_not_cascade(seeded):
+    from src.services.event_bus import emit_event
+    from src.services.prospect_service import get_or_create_prospect
+    from src.services.skip_trace_waterfall import consume_prospect_created
+
+    pid, oid = seeded["property_id"], seeded["owner_id"]
+
+    with get_db_context() as s:
+        pending = s.execute(text("""
+            SELECT COUNT(*) FROM events e
+            LEFT JOIN processed_events pe ON pe.event_id = e.event_id AND pe.consumer = 'cascade'
+            WHERE e.event_type = 'prospect.created' AND pe.event_id IS NULL
+        """)).scalar()
+        assert pending == 0, (
+            "real unprocessed prospect.created events exist — refusing to run "
+            "consume_prospect_created() for real, it has no county/date scoping "
+            "and would process them alongside this test's seeded event"
+        )
+
+        prospect_id_str = get_or_create_prospect(s, pid)
+        emit_event(
+            s, event_type="prospect.created", actor="test", source_component="test",
+            prospect_id=uuid.UUID(prospect_id_str), payload={"property_id": pid},
+        )
+        s.commit()
+
+    with patch(_RUN_CASCADE_SRC) as mock_cascade, \
+         patch(_GATE_SRC, return_value=(False, {
+             "spend_cents": 0, "revenue_cents": 0, "ratio": 0.9, "threshold": 0.25,
+             "window_days": 30, "routing_reason": "spend_ratio_exceeded",
+             "selected_path": "blocked", "override_applied": False,
+         })):
+        stats = consume_prospect_created(county_id=_COUNTY)
+        mock_cascade.assert_not_called()
+
+    assert stats.total_leads == 1
+
+
+# ── enrichment_background_loop Step 9 counts free-fallback hits (Task 6.2) ─
+# Step 9's hit-detection query previously only recognized paid sources
+# (tracerfy/batch_skip_tracing/idi/pdl), so a lead resolved via the free
+# voter fallback (source='voters') was marked contact_refresh_status='failed'
+# even though a real contact was found. Steps 1-8 are short-circuited via
+# mocks (unrelated to this fix, and each already has its own coverage) so
+# this test isolates Step 9's query behavior specifically.
+
+def test_step9_marks_free_fallback_hit_as_fresh_not_failed(seeded):
+    from types import SimpleNamespace
+    from src.services.enrichment_background_loop import run_once
+
+    pid, oid = seeded["property_id"], seeded["owner_id"]
+
+    with get_db_context() as s:
+        s.execute(text("""
+            INSERT INTO enriched_contacts (property_id, county_id, source, mobile_phone, match_success, enriched_at)
+            VALUES (:pid, :county_id, 'voters', :phone, TRUE, NOW())
+        """), {"pid": pid, "county_id": _COUNTY, "phone": _PHONE})
+        s.commit()
+
+    claimed_row = SimpleNamespace(owner_id=oid, property_id=pid, county_id=_COUNTY)
+    batch_result = {
+        "selected_path": "blocked", "cascade_stats": None,
+        "free_results": {pid: {"found": True, "source": "voters", "reason": None, "mobile_phone": _PHONE}},
+    }
+
+    with patch("src.services.enrichment_background_loop._reset_stuck_queued", return_value=0), \
+         patch("src.services.enrichment_background_loop._fetch_and_claim_candidates", return_value=[claimed_row]), \
+         patch("src.services.enrichment_background_loop._seed_voters", return_value=set()), \
+         patch("src.services.enrichment_background_loop._filter_dnc", return_value=set()), \
+         patch("src.services.enrichment_router.EnrichmentRouter.fetch_contact_profiles_batch",
+               return_value=batch_result):
+        stats = run_once(county_id=_COUNTY, limit=50, dry_run=False)
+
+    assert stats["free_fallback_hits"] == 1
+
+    with get_db_context() as s:
+        row = s.execute(text(
+            "SELECT contact_refresh_status FROM owners WHERE id = :oid"
+        ), {"oid": oid}).fetchone()
+    assert row.contact_refresh_status == "fresh"

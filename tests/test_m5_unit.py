@@ -76,16 +76,19 @@ class TestBatchDataParseResult:
     """Unit tests for skip_trace._parse_result()."""
 
     def test_mobile_preferred_over_landline(self):
-        person = _make_batchdata_person(mobile="8131111111", landline="8132222222")
+        # _parse_result normalizes every number via phone_utils.normalize (E.164),
+        # so numbers with invalid NANP exchange codes (e.g. "111", "000") are
+        # rejected — these fixtures use valid exchanges deliberately.
+        person = _make_batchdata_person(mobile="8135551111", landline="8132222222")
         result = skip_trace_mod._parse_result(person)
-        assert result["mobile_phone"] == "8131111111"
-        assert result["landline"] == "8132222222"
+        assert result["mobile_phone"] == "+18135551111"
+        assert result["landline"] == "+18132222222"
 
     def test_landline_only_when_no_mobile(self):
         person = _make_batchdata_person(mobile=None, landline="8133333333")
         result = skip_trace_mod._parse_result(person)
         assert result["mobile_phone"] is None
-        assert result["landline"] == "8133333333"
+        assert result["landline"] == "+18133333333"
 
     def test_fallback_to_first_number_when_type_unknown(self):
         person = {
@@ -93,7 +96,7 @@ class TestBatchDataParseResult:
             "emails": [],
         }
         result = skip_trace_mod._parse_result(person)
-        assert result["mobile_phone"] == "8134444444"
+        assert result["mobile_phone"] == "+18134444444"
 
     def test_email_extracted(self):
         person = _make_batchdata_person(email="test@owner.com")
@@ -125,13 +128,13 @@ class TestBatchDataParseResult:
         """Higher-scored phone should be selected as mobile_phone."""
         person = {
             "phoneNumbers": [
-                {"number": "8130000001", "type": "Mobile", "score": 40},
-                {"number": "8130000099", "type": "Mobile", "score": 99},
+                {"number": "8135550001", "type": "Mobile", "score": 40},
+                {"number": "8135550099", "type": "Mobile", "score": 99},
             ],
             "emails": [],
         }
         result = skip_trace_mod._parse_result(person)
-        assert result["mobile_phone"] == "8130000099"
+        assert result["mobile_phone"] == "+18135550099"
 
     def test_empty_phone_list(self):
         person = {"phoneNumbers": [], "emails": [{"email": "x@y.com"}]}
@@ -199,28 +202,6 @@ class TestIdiParseResult:
 # Skip-trace failure alerting
 # ---------------------------------------------------------------------------
 
-def _make_fluent_session(rows):
-    """
-    Build a MagicMock DB session where any chained query call
-    eventually returns `rows` from `.all()`.
-
-    Uses a 'fluent' mock where every method returns the same mock object,
-    so `.query().join().join().filter()...filter().limit().all()` works
-    regardless of chain depth.
-    """
-    q = MagicMock()
-    q.all.return_value = rows
-    q.join.return_value = q
-    q.filter.return_value = q
-    q.limit.return_value = q
-    q.group_by.return_value = q
-    q.subquery.return_value = MagicMock()  # subquery result is just a mock
-
-    session = MagicMock()
-    session.query.return_value = q
-    return session
-
-
 class TestSkipTraceFailureAlerting:
     """Verify that 402/401 BatchData errors trigger ops alerts."""
 
@@ -249,7 +230,7 @@ class TestSkipTraceFailureAlerting:
 
         @contextmanager
         def fake_ctx():
-            yield _make_fluent_session([(owner, prop)])
+            yield _make_filing_aware_session(candidates=[(owner, prop)])
 
         with patch("src.services.skip_trace.get_settings") as mock_settings, \
              patch("src.services.skip_trace.get_db_context", side_effect=fake_ctx), \
@@ -274,7 +255,7 @@ class TestSkipTraceFailureAlerting:
 
         @contextmanager
         def fake_ctx():
-            yield _make_fluent_session([(owner, prop)])
+            yield _make_filing_aware_session(candidates=[(owner, prop)])
 
         with patch("src.services.skip_trace.get_settings") as mock_settings, \
              patch("src.services.skip_trace.get_db_context", side_effect=fake_ctx), \
@@ -458,7 +439,8 @@ def _make_filing_aware_session(
     Build a MagicMock session whose `.all()` returns results in the order
     that run_skip_trace() issues them inside its `with get_db_context()` block:
         1. main candidate query  → (owner, prop) tuples
-        2. probate pre-fetch     → (property_id, name) tuples
+        2. probate pre-fetch     → (property_id, name, meta_data) tuples —
+           meta_data carries the multi-heir list, added alongside name
         3. eviction pre-fetch    → (property_id, name) tuples
         4. divorce pre-fetch     → (property_id, name) tuples
         5. lis pendens pre-fetch → (property_id, name) tuples
@@ -523,7 +505,7 @@ class TestProbateHeirOverride:
         owner, prop = _make_owner(name="JOHN DECEASED"), _make_prop()
         session = _make_filing_aware_session(
             candidates=[(owner, prop)],
-            probate_rows=[(prop.id, "Jane Heir")],
+            probate_rows=[(prop.id, "Jane Heir", None)],
         )
         mock_call, _ = _run_and_capture_payload(session)
 
@@ -538,7 +520,7 @@ class TestProbateHeirOverride:
         prop = _make_prop()
         session = _make_filing_aware_session(
             candidates=[(owner, prop)],
-            probate_rows=[(prop.id, "Mary Beneficiary")],
+            probate_rows=[(prop.id, "Mary Beneficiary", None)],
         )
         mock_call, _ = _run_and_capture_payload(session)
 
@@ -552,7 +534,7 @@ class TestProbateHeirOverride:
         prop = _make_prop()
         session = _make_filing_aware_session(
             candidates=[(owner, prop)],
-            probate_rows=[(prop.id, "ACME HOLDINGS LLC")],
+            probate_rows=[(prop.id, "ACME HOLDINGS LLC", None)],
         )
         mock_call, stats = _run_and_capture_payload(session)
 
@@ -631,7 +613,7 @@ class TestFilingPriorityResolver:
         owner, prop = _make_owner(), _make_prop()
         session = _make_filing_aware_session(
             candidates=[(owner, prop)],
-            probate_rows=[(prop.id, "Probate Heir")],
+            probate_rows=[(prop.id, "Probate Heir", None)],
             eviction_rows=[(prop.id, "Eviction Landlord")],
         )
         mock_call, _ = _run_and_capture_payload(session)

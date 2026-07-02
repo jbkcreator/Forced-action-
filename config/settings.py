@@ -334,6 +334,13 @@ class AppSettings(BaseSettings):
 	# Vendor-agnostic so Tracerfy/BatchData/PDL fallbacks share it.
 	skip_trace_max_run_cost_cents: int = Field(default=1000, env="SKIP_TRACE_MAX_RUN_COST_CENTS")
 
+	# Task 6.2 — Algorithmic Variance Control Layer. Rolling paid-enrichment
+	# spend / captured subscription revenue ratio; at or above this, paid
+	# provider calls are blocked in favor of the free voter-registry cross
+	# match (see src/services/budget_manager.py).
+	enrichment_spend_ratio_threshold: float = Field(default=0.25, env="ENRICHMENT_SPEND_RATIO_THRESHOLD")
+	enrichment_spend_ratio_window_days: int = Field(default=30, env="ENRICHMENT_SPEND_RATIO_WINDOW_DAYS")
+
 	# SMTP (used by welcome email, payment receipts, grace period alerts)
 	smtp_host: Optional[str] = Field(default=None, env="SMTP_HOST")
 	smtp_port: int = Field(default=587, env="SMTP_PORT")

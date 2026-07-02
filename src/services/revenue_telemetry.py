@@ -29,12 +29,69 @@ Read-only throughout: no new tables, no writes, raw sqlalchemy.text() only.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 _CONFIRMED_DELIVERY_PRODUCT_TYPES = ("lead_unlock", "lead_pack", "premium_report", "premium_brief")
+
+
+def compute_platform_enrichment_spend_ratio(
+    db: Session, window_days: int = 30, as_of: Optional[datetime] = None,
+) -> dict:
+    """Task 6.2 dependency — platform-wide rolling ratio: paid enrichment
+    spend / captured subscription revenue, both over the trailing
+    window_days. Reads platform_revenue_ledger (this module's own table),
+    not subscription_invoices directly, so Task 6.2's budget gate is a real
+    dependency on this module rather than a second query against a table it
+    doesn't own.
+
+    revenue_cents is scoped to product_type='subscription' specifically —
+    lead_unlock/lead_pack/premium rows are correctly excluded, matching the
+    task's literal "captured_subscription_revenue" (not total platform
+    revenue).
+
+    as_of defaults to real current time; tests pass a fixed far-future value
+    so the window never overlaps real production enrichment_usage_logs
+    rows — this is a platform-wide aggregate with no grouping key, so
+    unlike Task 6.1's per-subscriber queries there's no way to scope a test
+    assertion away from real background data other than moving the window.
+
+    Returns {spend_cents, revenue_cents, ratio, window_days}. ratio is None
+    when revenue_cents == 0 (undefined — the caller must treat None as the
+    zero/unavailable-revenue edge case, not as a 0.0 ratio).
+    """
+    window_start = (as_of or datetime.now(timezone.utc)) - timedelta(days=window_days)
+
+    row = db.execute(text("""
+        WITH spend AS (
+            SELECT COALESCE(SUM(cost_cents), 0) AS spend_cents
+            FROM enrichment_usage_logs
+            WHERE success = TRUE AND created_at >= :window_start
+        ),
+        revenue AS (
+            SELECT COALESCE(SUM(amount_cents), 0) AS revenue_cents
+            FROM platform_revenue_ledger
+            WHERE product_type = 'subscription'
+              AND refunded_at IS NULL
+              AND occurred_at >= :window_start
+        )
+        SELECT spend.spend_cents, revenue.revenue_cents
+        FROM spend, revenue
+    """), {"window_start": window_start}).fetchone()
+
+    spend_cents = int(row.spend_cents)
+    revenue_cents = int(row.revenue_cents)
+    ratio = (spend_cents / revenue_cents) if revenue_cents > 0 else None
+
+    return {
+        "spend_cents": spend_cents,
+        "revenue_cents": revenue_cents,
+        "ratio": ratio,
+        "window_days": window_days,
+    }
 
 
 def compute_confirmed_delivery_margin(db: Session, frm: datetime, to: datetime) -> list[dict]:

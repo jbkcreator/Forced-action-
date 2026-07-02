@@ -19,6 +19,7 @@ seen together for best cross-source corroboration (ADR 0015).
 
 Per-provider hit rate and cost tracked via enrichment_usage_log table.
 """
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -31,9 +32,9 @@ from src.core.models import DistressScore, EnrichedContact, Owner, Property
 from src.services.enrichment_log import log_usage
 from src.services.event_bus import emit_event, mark_processed
 from src.services.prospect_service import (
-    best_ec as _best_ec,
     dedupe_after_cascade,
     get_or_create_prospect as _get_or_create_prospect,
+    mark_contactable_and_emit,
 )
 from src.services.skip_trace_result import compute_confidence
 from src.utils.logger import get_logger
@@ -130,6 +131,15 @@ def _select_candidates(session, county_id: str, limit: int, today_only: bool) ->
         q = q.filter(gold_plus_today)
 
     return q.limit(limit).all()
+
+
+def select_enrichment_candidates(session, county_id: str, limit: int, today_only: bool) -> list:
+    """Public wrapper for _select_candidates — Task 6.2's reconciliation-sweep
+    call site needs the same candidate set _before_ deciding whether to route
+    them through the paid cascade or the free fallback, since run_cascade()'s
+    batch mode (owner_ids=None) otherwise self-selects candidates internally
+    with no hook to intercept them first."""
+    return _select_candidates(session, county_id, limit, today_only)
 
 
 # ─── DB helpers ──────────────────────────────────────────────────────────────
@@ -525,38 +535,39 @@ def run_cascade(
 
         for owner_id, property_id in property_ids.items():
             try:
-                prospect_id = _get_or_create_prospect(session, property_id)
-
                 if owner_id in resolved_ids:
-                    state      = "contactable"
-                    event_type = "enrichment.completed"
-                    ec         = _best_ec(session, property_id)
+                    mark_contactable_and_emit(
+                        session, property_id, actor="cascade",
+                        source_component="skip_trace_waterfall",
+                        cost_cents=spent_cents.get(owner_id, 0),
+                    )
                 else:
-                    state      = "exhausted"
-                    event_type = "enrichment.failed"
-                    ec         = None
-
-                session.execute(sa_text("""
-                    UPDATE prospects
-                    SET contactability_state = :state, updated_at = NOW()
-                    WHERE prospect_id = :pid
-                """), {"state": state, "pid": prospect_id})
-
-                emit_event(
-                    session,
-                    event_type=event_type,
-                    actor="cascade",
-                    source_component="skip_trace_waterfall",
-                    prospect_id=prospect_id,
-                    payload={
-                        "property_id":        property_id,
-                        "contactability_state": state,
-                        "enriched_contact_id": ec.id if ec else None,
-                        "source":             ec.source if ec else None,
-                        "confidence":         float(ec.confidence) if ec and ec.confidence else None,
-                        "total_cost_cents":   spent_cents.get(owner_id, 0),
-                    },
-                )
+                    # Genuine exhaustion — every paid provider in the cascade
+                    # was tried and none resolved a contact. Not shared with
+                    # mark_contactable_and_emit's callers: a free-fallback
+                    # miss (budget-blocked, only the voter registry tried)
+                    # is not the same as exhausting the real cascade.
+                    prospect_id = _get_or_create_prospect(session, property_id)
+                    session.execute(sa_text("""
+                        UPDATE prospects
+                        SET contactability_state = 'exhausted', updated_at = NOW()
+                        WHERE prospect_id = :pid
+                    """), {"pid": prospect_id})
+                    emit_event(
+                        session,
+                        event_type="enrichment.failed",
+                        actor="cascade",
+                        source_component="skip_trace_waterfall",
+                        prospect_id=uuid.UUID(prospect_id),
+                        payload={
+                            "property_id":         property_id,
+                            "contactability_state": "exhausted",
+                            "enriched_contact_id": None,
+                            "source":              None,
+                            "confidence":          None,
+                            "total_cost_cents":    spent_cents.get(owner_id, 0),
+                        },
+                    )
             except Exception:
                 logger.warning(
                     "[Cascade] M2 prospect stamp failed for owner_id=%d property_id=%d",
@@ -582,7 +593,9 @@ _EVENT_POLL_LIMIT = 500
 def consume_prospect_created(county_id: str = "hillsborough") -> WaterfallStats:
     """
     Event-driven cascade: poll unprocessed prospect.created events and enrich
-    each eligible property via run_cascade().
+    each eligible property through EnrichmentRouter (Task 6.2) — gated on the
+    rolling spend/revenue ratio, same as every other cascade-triggering call
+    site, instead of calling run_cascade() directly.
 
     Eligibility guard (same as _select_candidates): owner has no phone and
     has not been traced by Tracerfy or BatchData. Already-enriched properties
@@ -637,7 +650,24 @@ def consume_prospect_created(county_id: str = "hillsborough") -> WaterfallStats:
 
     stats = WaterfallStats()
     if owner_ids:
-        stats = run_cascade(owner_ids=owner_ids)
+        from src.services.enrichment_router import EnrichmentRouter, LeadRecord
+        lead_records = [
+            LeadRecord(property_id=r.property_id, owner_id=r.owner_id, county_id=county_id)
+            for r in owner_rows
+        ]
+        with get_db_context() as session:
+            batch_result = EnrichmentRouter().fetch_contact_profiles_batch(lead_records, session)
+            session.commit()
+        if batch_result["cascade_stats"] is not None:
+            stats = batch_result["cascade_stats"]
+        else:
+            free_results = batch_result["free_results"]
+            free_hits = sum(1 for r in free_results.values() if r["found"])
+            stats = WaterfallStats(
+                total_leads=len(lead_records), hits=free_hits,
+                misses=len(lead_records) - free_hits, total_cost_cents=0,
+                per_provider={"voters": {"hits": free_hits, "cost_cents": 0}},
+            )
     else:
         logger.info("[Cascade] all %d properties already enriched — marking events processed",
                     len(property_ids))

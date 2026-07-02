@@ -123,11 +123,16 @@ class EnrichmentBatcher:
 
     def _run_cascade_for_batch(self, payloads: list) -> None:
         """
-        Resolve owner_ids from property_ids, group by county_id, call run_cascade.
+        Resolve owner_ids from property_ids, group by county_id, route each
+        county's batch through EnrichmentRouter (Task 6.2) instead of calling
+        run_cascade() directly — gates paid-provider spend against the
+        rolling spend/revenue ratio before this, the third real call site
+        for the cascade (easy to miss since it's the Cora agent runtime, a
+        separate process from the two cron-based callers).
         """
         from sqlalchemy import text as sa_text
         from src.core.database import get_db_context
-        from src.services.skip_trace_waterfall import run_cascade
+        from src.services.enrichment_router import EnrichmentRouter, LeadRecord
 
         property_ids = [int(p["property_id"]) for p in payloads]
 
@@ -139,26 +144,33 @@ class EnrichmentBatcher:
                 WHERE o.property_id = ANY(:pids)
             """), {"pids": property_ids}).fetchall()
 
-        # Group by county_id → list of owner_ids
-        by_county: dict[str, list[int]] = defaultdict(list)
+        # Group by county_id → list of rows
+        by_county: dict[str, list] = defaultdict(list)
         for row in rows:
             cid = row.county_id or "hillsborough"
-            by_county[cid].append(row.owner_id)
+            by_county[cid].append(row)
 
         total_hits = 0
         total_cost = 0
-        for county_id, owner_ids in by_county.items():
+        router = EnrichmentRouter()
+        for county_id, county_rows in by_county.items():
             logger.info(
                 "[EnrichmentBatcher] cascade county=%s owners=%d",
-                county_id, len(owner_ids),
+                county_id, len(county_rows),
             )
+            lead_records = [
+                LeadRecord(property_id=r.property_id, owner_id=r.owner_id, county_id=county_id)
+                for r in county_rows
+            ]
             try:
-                stats = run_cascade(
-                    county_id=county_id,
-                    owner_ids=owner_ids,
-                )
-                total_hits += stats.hits
-                total_cost += stats.total_cost_cents
+                with get_db_context() as session:
+                    batch_result = router.fetch_contact_profiles_batch(lead_records, session)
+                    session.commit()
+                if batch_result["cascade_stats"] is not None:
+                    total_hits += batch_result["cascade_stats"].hits
+                    total_cost += batch_result["cascade_stats"].total_cost_cents
+                else:
+                    total_hits += sum(1 for r in batch_result["free_results"].values() if r["found"])
             except Exception as exc:
                 logger.error(
                     "[EnrichmentBatcher] cascade failed county=%s: %s",
