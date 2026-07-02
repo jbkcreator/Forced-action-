@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}Forced Action{% endblock %}</title>
+    <meta name="description" content="{% block meta_description %}AI-powered distressed property intelligence for Florida.{% endblock %}">
     <link rel="canonical" href="{{ canonical_url }}">
     {% if status == 'noindex' %}<meta name="robots" content="noindex">{% endif %}
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -128,6 +129,16 @@
             padding: 0.85rem 2rem; border-radius: var(--fa-radius-md);
             box-shadow: 0 8px 24px rgba(251,191,36,0.2);
         }
+
+        /* Sibling links */
+        .sibling-links { margin-top: 2rem; }
+        .sibling-links ul { list-style: none; padding: 0; display: flex; flex-wrap: wrap; gap: 0.6rem; }
+        .sibling-links a {
+            display: inline-block; text-decoration: none; color: var(--fa-text-secondary);
+            background: var(--fa-bg-card); border: 1px solid var(--fa-border-default);
+            border-radius: 999px; padding: 0.4rem 1rem; font-size: 0.88rem;
+        }
+        .sibling-links a:hover { color: var(--fa-primary); border-color: var(--fa-border-emphasis); }
 
         /* Footer */
         .fa-footer { border-top: 1px solid var(--fa-border-default); margin-top: 3rem; padding: 2rem 0; color: var(--fa-text-muted); font-size: 0.85rem; }

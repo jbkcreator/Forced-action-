@@ -17,7 +17,6 @@ from src.services.seo.stats import gather_page_data
 from src.services.seo.faq import build_faq
 from src.services.seo.render import render_page, content_hash
 from src.services.seo.sitemap import build_sitemap
-from src.services.seo import indexing_api
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +30,7 @@ def compile_all(
     output_dir: Path | None = None,
     counts: dict | None = None,
 ) -> dict:
-    """Discover → gate → gather → render → write → sitemap → retire → notify.
+    """Discover → gate → gather → render → write → sitemap → retire.
 
     write=False is a dry-run (no files written, no sitemap, used in tests).
     cells/output_dir/counts override the discovered grid, settings dir, and bulk
@@ -54,14 +53,23 @@ def compile_all(
     for (_city, _vertical), _cnt in counts.items():
         county_totals[_vertical] = county_totals.get(_vertical, 0) + _cnt
 
+    # All page state in one query instead of one SELECT per cell.
+    pages = _load_pages(db)
+
     changed_urls: list[str] = []
     built = retired = skipped = 0
 
     for cell in cells:
         count = counts.get((cell.city_slug, cell.vertical), 0)
+        url_path = f"/florida/{cell.city_slug}/{cell.topic_slug}/"
+        existing = pages.get(url_path)
 
         if not is_eligible(count, floor):
-            if _handle_sub_threshold(db, cell, hysteresis, now, write):
+            if _handle_sub_threshold(
+                db, cell, existing, hysteresis, now, write,
+                settings=settings, counts=counts, floor=floor,
+                county_totals=county_totals, output_dir=output_dir,
+            ):
                 retired += 1
             skipped += 1
             continue
@@ -70,26 +78,10 @@ def compile_all(
             db, cell.variants or (cell.city_raw,), cell.vertical,
             county_qualified=county_totals.get(cell.vertical, 0),
         )
-        display_city = cell.city_raw.title()
-        faq_items = build_faq(display_city, cell.vertical, stats)
-
-        url_path = f"/florida/{cell.city_slug}/{cell.topic_slug}/"
-        canonical = f"{settings.seo_site_base_url.rstrip('/')}{url_path}"
-
-        page_data = {
-            "city": display_city,
-            "city_slug": cell.city_slug,
-            "vertical": cell.vertical,
-            "topic_slug": cell.topic_slug,
-            "stats": stats,
-            "faq_items": faq_items,
-            "status": "live",
-            "canonical_url": canonical,
-        }
+        page_data = _page_data(cell, stats, "live", settings, counts, floor)
 
         html = render_page(page_data)
         new_hash = content_hash(html)
-        existing = _get_page(db, url_path)
 
         if existing and existing["content_hash"] == new_hash:
             _touch_page(db, url_path, count, now)
@@ -108,9 +100,6 @@ def compile_all(
     if write:
         build_sitemap(db, output_dir)
 
-    if changed_urls:
-        indexing_api.notify(changed_urls)
-
     logger.info(
         "compile_all done: built=%d retired=%d skipped=%d changed=%d",
         built, retired, skipped, len(changed_urls),
@@ -120,24 +109,63 @@ def compile_all(
 
 # ─── private helpers ──────────────────────────────────────────────────────────
 
-def _get_page(db: Session, url_path: str) -> dict | None:
-    row = db.execute(
-        text("SELECT * FROM seo_pages WHERE url_path = :u"),
-        {"u": url_path},
-    ).mappings().fetchone()
-    return dict(row) if row else None
+def _load_pages(db: Session) -> dict[str, dict]:
+    """All seo_pages rows keyed by url_path — one query for the whole run."""
+    rows = db.execute(text("SELECT * FROM seo_pages")).mappings().fetchall()
+    return {row["url_path"]: dict(row) for row in rows}
+
+
+def _page_data(
+    cell: GridCell, stats: dict, status: str, settings, counts: dict, floor: int,
+) -> dict:
+    """Assemble the template context for one cell (used by live and retire paths)."""
+    display_city = cell.city_raw.title()
+    url_path = f"/florida/{cell.city_slug}/{cell.topic_slug}/"
+
+    # Internal links: this city's OTHER eligible verticals (never link a page
+    # that doesn't exist / is below the floor).
+    siblings = [
+        {
+            "label": v.replace("_", " ").title(),
+            "href": f"/florida/{cell.city_slug}/{v.replace('_', '-')}/",
+        }
+        for v in _sibling_verticals(cell, counts, floor)
+    ]
+
+    return {
+        "city": display_city,
+        "city_slug": cell.city_slug,
+        "vertical": cell.vertical,
+        "topic_slug": cell.topic_slug,
+        "stats": stats,
+        "faq_items": build_faq(display_city, cell.vertical, stats),
+        "sibling_links": siblings,
+        "status": status,
+        "canonical_url": f"{settings.seo_site_base_url.rstrip('/')}{url_path}",
+    }
+
+
+def _sibling_verticals(cell: GridCell, counts: dict, floor: int) -> list[str]:
+    from src.services.seo.grid import VERTICALS
+
+    return [
+        v for v in VERTICALS
+        if v != cell.vertical and counts.get((cell.city_slug, v), 0) >= floor
+    ]
 
 
 def _handle_sub_threshold(
-    db: Session, cell: GridCell, hysteresis: int, now: datetime, write: bool
+    db: Session, cell: GridCell, existing: dict | None,
+    hysteresis: int, now: datetime, write: bool,
+    *, settings, counts: dict, floor: int, county_totals: dict, output_dir: Path,
 ) -> bool:
     """Increment below_threshold_runs; retire (noindex) after hysteresis consecutive
-    runs. Returns True when this call retired the page."""
-    url_path = f"/florida/{cell.city_slug}/{cell.topic_slug}/"
-    existing = _get_page(db, url_path)
+    runs. On retirement the served file is re-rendered WITH the noindex meta —
+    the page stays reachable but tells Google to drop it. Returns True on retire."""
     if existing is None:
         return False  # never published — nothing to retire
 
+    url_path = f"/florida/{cell.city_slug}/{cell.topic_slug}/"
     new_runs = (existing["below_threshold_runs"] or 0) + 1
 
     if new_runs >= hysteresis:
@@ -151,18 +179,27 @@ def _handle_sub_threshold(
             """),
             {"runs": new_runs, "u": url_path, "now": now},
         )
+        if write:
+            stats = gather_page_data(
+                db, cell.variants or (cell.city_raw,), cell.vertical,
+                county_qualified=county_totals.get(cell.vertical, 0),
+            )
+            html = render_page(_page_data(cell, stats, "noindex", settings, counts, floor))
+            out = output_dir / cell.city_slug / cell.topic_slug / "index.html"
+            if out.parent.exists():
+                out.write_text(html, encoding="utf-8")
         logger.info("Retired (noindex): %s after %d sub-threshold runs", url_path, new_runs)
         return True
-    else:
-        db.execute(
-            text("""
-                UPDATE seo_pages
-                   SET below_threshold_runs = :runs,
-                       last_built_at        = :now
-                 WHERE url_path = :u
-            """),
-            {"runs": new_runs, "u": url_path, "now": now},
-        )
+
+    db.execute(
+        text("""
+            UPDATE seo_pages
+               SET below_threshold_runs = :runs,
+                   last_built_at        = :now
+             WHERE url_path = :u
+        """),
+        {"runs": new_runs, "u": url_path, "now": now},
+    )
     return False
 
 
@@ -215,9 +252,30 @@ def _upsert_page(
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    with get_db_context() as db:
-        result = compile_all(db)
-    logger.info("SEO compiler finished: %s", result)
+    try:
+        with get_db_context() as db:
+            result = compile_all(db)
+        logger.info("SEO compiler finished: %s", result)
+    except Exception as exc:
+        logger.error("SEO compiler failed: %s", exc, exc_info=True)
+        _alert_ops(exc)
+        raise
+
+
+def _alert_ops(exc: Exception) -> None:
+    """Email ops on compiler failure — weekly cron dies silently otherwise."""
+    try:
+        from src.services.email import send_email
+
+        recipients = (get_settings().report_recipients or "").split(",")
+        for to in [r.strip() for r in recipients if r.strip()]:
+            send_email(
+                to=to,
+                subject="[Forced Action] SEO compiler FAILED",
+                body_text=f"Weekly seo_compiler run failed: {exc}\n\nCheck cron logs.",
+            )
+    except Exception as mail_exc:
+        logger.error("SEO compiler failure alert could not be sent: %s", mail_exc)
 
 
 if __name__ == "__main__":

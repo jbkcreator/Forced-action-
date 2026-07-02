@@ -16,6 +16,42 @@ _VERTICAL_LABELS = {
     "attorneys": "real-estate attorneys",
 }
 
+# One vertical-specific question per page so the six pages of a city don't all
+# read identically ("scaled content" smell). Answer is composed from the same
+# page stats as everything else.
+_VERTICAL_ANGLE = {
+    "wholesalers": (
+        "Why do absentee owners matter for wholesalers in {city}?",
+        "Absentee owners are more likely to accept off-market cash offers — {absentee:,} "
+        "of {city}'s {count:,} qualifying distressed properties are absentee-owned.",
+    ),
+    "fix_flip": (
+        "Are there fix-and-flip opportunities in {city}, FL right now?",
+        "{count:,} distressed properties in {city} currently match fix-and-flip signals "
+        "such as foreclosure filings, tax delinquency, and code enforcement activity.",
+    ),
+    "restoration": (
+        "How do restoration contractors find damaged properties in {city}?",
+        "Code violations, storm and fire incidents, and insurance-claim activity feed the "
+        "{count:,} qualifying {city} properties on this page — updated weekly.",
+    ),
+    "roofing": (
+        "How many {city} properties show roof-related distress signals?",
+        "{count:,} {city} properties currently match roofing-relevant signals such as "
+        "storm damage, enforcement permits, and insurance claims.",
+    ),
+    "public_adjusters": (
+        "Where do public adjusters find claim opportunities in {city}?",
+        "Storm, flood, fire, and code-violation activity drives the {count:,} qualifying "
+        "{city} properties tracked here, refreshed weekly from public records.",
+    ),
+    "attorneys": (
+        "What legal distress activity is happening in {city}, FL?",
+        "Judgment liens, foreclosures, and probate filings contribute to the {count:,} "
+        "qualifying {city} properties on this page.",
+    ),
+}
+
 
 def _label(vertical: str) -> str:
     return _VERTICAL_LABELS.get(vertical, vertical.replace("_", " "))
@@ -69,5 +105,13 @@ def build_faq(city: str, vertical: str, stats: dict) -> list[dict]:
             f"{city} accounts for {pct}% of all qualifying {label} leads across the county."
         ),
     })
+
+    angle = _VERTICAL_ANGLE.get(vertical)
+    if angle:
+        q, a = angle
+        items.append({
+            "question": q.format(city=city),
+            "answer": a.format(city=city, count=count, absentee=absentee),
+        })
 
     return items

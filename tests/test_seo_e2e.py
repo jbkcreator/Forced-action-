@@ -152,6 +152,10 @@ def test_seo_e2e_retirement_hysteresis(fresh_db, tmp_path):
     sitemap_xml = (out_dir.parent / "sitemap.xml").read_text(encoding="utf-8")
     assert _CITY_SLUG not in sitemap_xml, "retired page must be dropped from sitemap"
 
+    # the served file itself must now carry the noindex meta (re-rendered on retire)
+    retired_html = (out_dir / _CITY_SLUG / "wholesalers" / "index.html").read_text(encoding="utf-8")
+    assert 'content="noindex"' in retired_html, "retired page file must be re-rendered with noindex meta"
+
     # recovery: data returns → back to live, counter reset
     compile_all(fresh_db, cells=[_cell()], counts=live_counts, output_dir=out_dir, write=True)
     row = fresh_db.execute(

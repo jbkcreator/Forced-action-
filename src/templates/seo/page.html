@@ -2,6 +2,8 @@
 
 {% block title %}{{ city }}, FL {{ vertical.replace('_', ' ').title() }} &amp; Distressed Homes | Forced Action{% endblock %}
 
+{% block meta_description %}{{ "{:,}".format(stats.qualified_count) }} distressed properties in {{ city }}, FL for {{ vertical.replace('_', ' ') }}{% if stats.median_value %} — median value ${{ "{:,.0f}".format(stats.median_value) }}{% endif %}. Live distress data, lead tiers, and absentee-owner counts, updated weekly.{% endblock %}
+
 {% block head_extra %}
 {% include "_jsonld.html" %}
 {% endblock %}
@@ -24,6 +26,17 @@
     {% include "_stat_cards.html" %}
     {% include "_signal_sections.html" %}
     {% include "_faq.html" %}
+
+    {% if sibling_links %}
+    <section class="sibling-links">
+        <h2>More {{ city }} Distressed Property Data</h2>
+        <ul>
+            {% for link in sibling_links %}
+            <li><a href="{{ link.href }}">{{ city }} for {{ link.label }}</a></li>
+            {% endfor %}
+        </ul>
+    </section>
+    {% endif %}
 
     <section class="cta">
         <h2>Access Full Property Data for {{ city }}</h2>
