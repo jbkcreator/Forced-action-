@@ -578,7 +578,16 @@ class MultiVerticalScorer:
         for tax in (prop.tax_delinquencies or []):
             if tax.total_amount_due is None and tax.years_delinquent is None:
                 continue
-            sig_date = tax.deed_app_date or tax.date_added
+            # Signal date priority: real event dates, then the FL statutory
+            # delinquency date (April 1 of the year after the tax year), then
+            # the upload date. Without the statutory derivation, rows lacking
+            # certificate dates would date to the upload and a years-old
+            # delinquency would look fresh — evading age decay and the 730-day
+            # hard cutoff, and earning stacking recency it doesn't deserve.
+            sig_date = tax.deed_app_date or tax.issued_date
+            if sig_date is None and tax.tax_year and 1990 <= tax.tax_year <= 2100:
+                sig_date = date(tax.tax_year + 1, 4, 1)
+            sig_date = sig_date or tax.date_added
             signals.append({"type": "tax_delinquencies", "date": sig_date, "amount": tax.total_amount_due})
 
         # 6. Foreclosures — use lis_pendens_date as fallback when filing_date is absent

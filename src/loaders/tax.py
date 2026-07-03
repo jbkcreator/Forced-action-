@@ -310,6 +310,21 @@ class TaxDelinquencyLoader(BaseLoader):
             if parts:
                 values["certificate_data"] = ", ".join(parts)
 
+        # Derive the summary fields the CDS engine and predictability diagnostic
+        # gate on (both skip rows where total_amount_due AND years_delinquent are
+        # null). County source reports ship Face Amount / Account Balance /
+        # Tax Yr — not Total Due / Years Delinquent — so without this the whole
+        # tax_delinquencies signal reads as empty downstream.
+        if "total_amount_due" not in values:
+            derived_amount = values.get("account_balance_amount") or values.get("face_amount")
+            if derived_amount is not None:
+                values["total_amount_due"] = derived_amount
+        if "years_delinquent" not in values:
+            tax_year = values.get("tax_year")
+            current_year = date.today().year
+            if tax_year and 1990 <= tax_year < current_year:
+                values["years_delinquent"] = current_year - tax_year
+
         return values
 
     def _raw_source_data(self, row: pd.Series) -> dict[str, Any]:
