@@ -316,6 +316,13 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
         _on_auto_mode_addon_purchase(session, db)
         return
 
+    # Hot lead unlock is a mode="payment" session fulfilled by
+    # payment_intent.succeeded (metadata travels on the PI via
+    # payment_intent_data) — nothing to do here, and falling through would
+    # log a false "missing required metadata" error.
+    if meta.get("product") == "hot_lead_unlock":
+        return
+
     tier        = meta.get("tier")
     vertical    = meta.get("vertical")
     county_id   = meta.get("county_id")
@@ -1999,6 +2006,13 @@ def _on_payment_intent_succeeded(payment_intent, db: Session) -> None:
         _on_lead_unlock_payment(payment_intent, db)
         # Fall through to card-save so the unlock also triggers the saved-card flow
         _on_card_saved(payment_intent, db)
+    elif product == "hot_lead_unlock":
+        # $150 ($99 reduced) single-lead unlock sold via Checkout Session —
+        # same deliverable as lead_unlock (reveal one lead's contact details),
+        # so it shares the fulfillment handler. Metadata arrives on the PI via
+        # payment_intent_data set in create_hot_lead_unlock_link.
+        logger.info("[PI] routing -> hot_lead_unlock pi=%s", pi_id)
+        _on_lead_unlock_payment(payment_intent, db)
     else:
         logger.info("[PI] routing -> card_save (no product metadata) pi=%s", pi_id)
         _on_card_saved(payment_intent, db)
@@ -2095,7 +2109,9 @@ def _resolve_subscriber_id_from_pi(payment_intent, db: Session) -> Optional[int]
 
 def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
     """
-    Handle a single-lead $2.50–$7 unlock purchase.
+    Handle a single-lead unlock purchase — the $2.50–$7 dashboard unlock
+    (product=lead_unlock) and the $150/$99 hot lead unlock
+    (product=hot_lead_unlock) both land here; the deliverable is identical.
 
     Looks up the subscriber by Stripe customer id, looks up the property by
     metadata.property_id, and emails the full lead details (address, owner

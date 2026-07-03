@@ -341,6 +341,17 @@ def create_hot_lead_unlock_link(
                 "lead_id": lead_id,
                 "reduced_rate": str(reduced),
             },
+            # Session metadata is NOT copied to the PaymentIntent by Stripe.
+            # Fulfillment (_on_payment_intent_succeeded) routes by PI metadata,
+            # so it must be set explicitly here or the payment is treated as a
+            # bare card-save and no delivery record is created.
+            payment_intent_data={
+                "metadata": {
+                    "product": "hot_lead_unlock",
+                    "property_id": lead_id,
+                    "reduced_rate": str(reduced),
+                },
+            },
         )
     except stripe.error.InvalidRequestError as exc:
         logger.warning(
