@@ -20,6 +20,7 @@ from config.broker_states import (
     IllegalBrokerTransition,
     InvalidBrokerReasonCode,
     InvalidBrokerState,
+    requires_close_payload,
     validate_transition,
 )
 logger = logging.getLogger(__name__)
@@ -290,6 +291,16 @@ def transition(
         raise IllegalBrokerTransition(f"Invalid reason_code: {exc}") from exc
     except InvalidBrokerState as exc:
         raise IllegalBrokerTransition(str(exc)) from exc
+
+    if requires_close_payload(to_state):
+        if gross_amount_cents is None or split_config_id is None:
+            raise ClosedWonPayloadRequired(
+                "closed_won requires gross_amount_cents and split_config_id."
+            )
+        if gross_amount_cents <= 0:
+            raise InvalidGrossAmount(
+                f"gross_amount_cents must be positive, got {gross_amount_cents}."
+            )
 
     if str(lane.assigned_broker_id) != str(broker_id):
         raise LaneOwnershipError(
