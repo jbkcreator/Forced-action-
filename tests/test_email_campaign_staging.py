@@ -274,7 +274,7 @@ def _load_migration_upgrade(filename, module_name):
     import importlib.util
     mig_path = os.path.join(
         os.path.dirname(os.path.dirname(__file__)),
-        "alembic", "versions", filename,
+        "legacy", "alembic", "versions", filename,
     )
     spec = importlib.util.spec_from_file_location(module_name, mig_path)
     mod = importlib.util.module_from_spec(spec)

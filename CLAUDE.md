@@ -28,9 +28,8 @@ python -m src.scrappers.foreclosures.foreclosure_engine
 # Rescore all properties
 python -m src.services.cds_engine --rescore-all
 
-# DB migrations (Alembic — multiple heads exist, target by revision ID)
-alembic upgrade <revision_id>
-alembic heads
+# DB migrations (scripts-only — Alembic retired, see docs/adr/0024)
+PYTHONPATH=. python scripts/apply_<name>.py     # apply one idempotent DDL script to the shared DB
 
 # Tests
 pytest tests/                                  # default (excludes scenario)
@@ -81,7 +80,7 @@ Single `Dockerfile` at project root. `docker-compose.yml` runs `api` and `cora` 
 
 - **Language/runtime**: Python 3.11+.
 - **Web framework**: FastAPI (no Flask/Django).
-- **ORM**: SQLAlchemy 2.0 style. **Migrations**: Alembic only — never edit schema by hand.
+- **ORM**: SQLAlchemy 2.0 style. **Migrations**: scripts-only (Alembic retired — ADR 0024). A schema change = (1) update `src/core/models.py` (tests' `create_all` source of truth), (2) write an idempotent `scripts/apply_<name>.py` (`CREATE TABLE IF NOT EXISTS` / `ADD COLUMN IF NOT EXISTS`), (3) run it once against the shared DB. No new alembic revisions; git history + idempotency is the record. Legacy migrations archived under `legacy/alembic/`.
 - **Settings**: Pydantic v2 + pydantic-settings. Never read `os.environ` directly outside `config/settings.py`.
 - **HTTP**: `requests` for sync (`requests_get_with_retry` from `src/utils/http_helpers.py`), `httpx` if async. No `urllib`.
 - **Scraping**: Playwright + playwright-stealth. Browser-use + Anthropic for AI fallback. Firecrawl for static. No Selenium.
@@ -102,7 +101,7 @@ Single `Dockerfile` at project root. `docker-compose.yml` runs `api` and `cora` 
 - **`cds_engine.py` docstring is stale** — always trust `config/scoring.py`.
 - **Cron ordering (hard stagger):** scrapers 04:00–06:30 → CDS 07:00 → skip trace 07:30 → GHL sync 08:00.
 - **GHL sync_status:** `pending_sync` → `synced` / `sync_failed`. Never lost.
-- **Alembic has multiple heads** — always target by revision ID, not `head`. Run `alembic heads` first.
+- **Alembic is retired** (ADR 0024) — schema changes go through `scripts/apply_*.py` against the single shared DB, never new alembic revisions. Old migrations live in `legacy/alembic/`; the orphaned `alembic_version` table is left in place, harmless.
 - **Lead Pack MVP status**: Partially sellable. Missing: county launch gate at checkout, minimum 5-lead count enforcement, 80% enrichment threshold check, `SentLead` rows in webhook fulfillment. Zero test coverage for lead pack flow.
 - Required env: `DATABASE_URL`, `ANTHROPIC_API_KEY`, `REDIS_URL`. Feature-gated: Stripe, GHL, Synthflow, Telnyx, Oxylabs, LangSmith.
 
@@ -130,13 +129,13 @@ Single `Dockerfile` at project root. `docker-compose.yml` runs `api` and `cora` 
 - **Measure before optimising**, but design for efficiency from the start. If a function processes more than ~1k items, its time and space complexity must be considered, not assumed acceptable.
 
 ### Database and SQLAlchemy
-- All DB access must go through SQLAlchemy. Direct `psycopg2` calls or raw connection string queries are forbidden outside Alembic migrations.
+- All DB access must go through SQLAlchemy. Direct `psycopg2` calls or raw connection string queries are forbidden outside `scripts/apply_*.py` migration scripts.
 - **Use `sqlalchemy.text()` for all queries — do not use the SQLAlchemy ORM query API (`select(Model).where(...)`, `session.query(...)`) for data retrieval.** Write SQL directly via `session.execute(text("SELECT ..."), {"param": value})`. ORM is used only for `session.add()` / `session.delete()` on individual model instances and for Alembic schema definitions. Never concatenate user input into `text()` — always use named bind parameters.
 - Minimise round trips: fetch all required data in one query using joins or CTEs rather than issuing multiple sequential queries. Never query inside a loop.
 - Batch writes with `session.execute(insert(Model).values([...]))` when inserting more than ~10 rows. Commit once per batch, not once per row.
 - Filter, sort, and paginate in SQL — not in Python after fetching all rows.
 - Use `with_for_update(skip_locked=True)` for queue-style processing to avoid contention.
-- Index columns that appear in `WHERE`, `ORDER BY`, or `JOIN` clauses on hot paths. Add the index in the Alembic migration alongside the column.
+- Index columns that appear in `WHERE`, `ORDER BY`, or `JOIN` clauses on hot paths. Add the index in the same `scripts/apply_*.py` that adds the column.
 
 ## Self-Maintenance
 
