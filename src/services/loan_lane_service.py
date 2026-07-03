@@ -311,7 +311,7 @@ def get_stale_lanes(session: Session, *, days: int = 30) -> list[dict]:
     """Return open lanes with no activity for the configured window."""
     rows = session.execute(
         text("""
-            SELECT lane_id, prospect_id, current_stage, outcome, assigned_broker_id,
+            SELECT lane_id, property_id, current_stage, outcome, assigned_broker_id,
                    claimed_at, last_activity_at, entered_at
             FROM lanes
             WHERE outcome = 'open'
