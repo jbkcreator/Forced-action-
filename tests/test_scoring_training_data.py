@@ -103,7 +103,8 @@ def _signal_row(property_id, score_date, sig_type, days_before):
     }
 
 
-def _outcome_row(property_id, score_date, *, deed_days=None, fc_days=None, deal_days=None):
+def _outcome_row(property_id, score_date, *, deed_days=None, fc_days=None, deal_days=None,
+                 deal_tier=None):
     deed = score_date + timedelta(days=deed_days) if deed_days is not None else None
     fc   = score_date + timedelta(days=fc_days)   if fc_days   is not None else None
     deal = score_date + timedelta(days=deal_days) if deal_days is not None else None
@@ -121,6 +122,7 @@ def _outcome_row(property_id, score_date, *, deed_days=None, fc_days=None, deal_
         "deed_event_date": deed,
         "fc_event_date":   fc,
         "deal_event_date": deal,
+        "deal_confidence_tier": deal_tier,
     }
 
 
@@ -210,6 +212,25 @@ class TestComposition:
         # No deed/foreclosure → outcome_event=0 but outcome_deal=1.
         assert all(r["outcome_event"] == 0 for r in rows)
         assert all(r["outcome_deal"] == 1 for r in rows)
+
+    def test_deal_outcome_confidence_tier_surfaced(self):
+        """CDE-11 — a deal outcome's confidence tier reaches the training row."""
+        session = _FakeSession([
+            [_score_event()],
+            [],
+            [_outcome_row(100, SCORE_DATE, deal_days=30, deal_tier="public_record_inferred")],
+        ])
+        rows = list(build_training_dataset(session, _cfg()))
+        assert all(r["outcome_deal_confidence_tier"] == "public_record_inferred" for r in rows)
+
+    def test_deal_confidence_tier_none_when_no_deal(self):
+        session = _FakeSession([
+            [_score_event()],
+            [],
+            [_outcome_row(100, SCORE_DATE, fc_days=60)],  # foreclosure, no deal
+        ])
+        rows = list(build_training_dataset(session, _cfg()))
+        assert all(r["outcome_deal_confidence_tier"] is None for r in rows)
 
     def test_stacking_count_only_within_stacking_window(self):
         # foreclosures 30 days back, judgment_liens 200 days back (outside 180d window).
@@ -383,6 +404,15 @@ class TestTimeLeakageGuards:
         assert "d.record_date >  se.score_date" in _OUTCOMES_SQL
         assert "f.filing_date >  se.score_date" in _OUTCOMES_SQL
         assert "dlo.deal_date >  se.score_date" in _OUTCOMES_SQL
+
+    def test_outcome_sql_surfaces_deal_confidence_tier_by_trust(self):
+        from src.services.scoring_training_data import _OUTCOMES_SQL
+        # CDE-11 — the deal outcome's confidence_tier is aggregated highest-trust
+        # first (founder_verified ranks above subscriber_reported above inferred).
+        assert "dlo.confidence_tier" in _OUTCOMES_SQL
+        assert "deal_confidence_tier" in _OUTCOMES_SQL
+        assert "'founder_verified'    THEN 1" in _OUTCOMES_SQL
+        assert "'subscriber_reported' THEN 2" in _OUTCOMES_SQL
 
     def test_signal_sql_uses_leq_score_date(self):
         from src.services.scoring_training_data import _SIGNAL_EVIDENCE_SQL

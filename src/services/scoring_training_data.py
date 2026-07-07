@@ -266,9 +266,20 @@ fc_hits AS (
     GROUP BY se.property_id, se.score_date
 ),
 deal_hits AS (
-    -- deal_outcomes is sparse today (no real subscribers yet). Emit the
-    -- column so the schema is forward-compatible; later re-fits can use it.
-    SELECT se.property_id, se.score_date, MIN(dlo.deal_date) AS event_date
+    -- deal_outcomes now includes public-record-inferred + founder rows (CDE-11).
+    -- Surface the highest-trust confidence_tier among the in-window outcomes so
+    -- the fit can weight by it (founder_verified > subscriber_reported >
+    -- public_record_inferred).
+    SELECT
+        se.property_id,
+        se.score_date,
+        MIN(dlo.deal_date) AS event_date,
+        (ARRAY_AGG(dlo.confidence_tier ORDER BY
+            CASE dlo.confidence_tier
+                WHEN 'founder_verified'    THEN 1
+                WHEN 'subscriber_reported' THEN 2
+                ELSE 3
+            END))[1] AS deal_confidence_tier
     FROM score_events se
     JOIN deal_outcomes dlo
         ON dlo.property_id = se.property_id
@@ -301,6 +312,7 @@ SELECT
     dh.event_date                        AS deed_event_date,
     fh.event_date                        AS fc_event_date,
     dl.event_date                        AS deal_event_date,
+    dl.deal_confidence_tier              AS deal_confidence_tier,
     fb.outcome_positive                  AS feedback_outcome_positive
 FROM score_events se
 LEFT JOIN deed_hits     dh ON dh.property_id = se.property_id AND dh.score_date = se.score_date
@@ -409,6 +421,7 @@ def build_training_dataset(session, cfg: BuilderConfig) -> Iterable[dict]:
         outcome_event = 0
         outcome_event_date = None
         outcome_deal = 0
+        outcome_deal_confidence_tier = None
         outcome_feedback = 0
         if outcome is not None:
             if outcome.get("event_date"):
@@ -416,6 +429,7 @@ def build_training_dataset(session, cfg: BuilderConfig) -> Iterable[dict]:
                 outcome_event_date = outcome["event_date"]
             if outcome.get("deal_event_date"):
                 outcome_deal = 1
+                outcome_deal_confidence_tier = outcome.get("deal_confidence_tier")
             if outcome.get("feedback_outcome_positive"):
                 outcome_feedback = 1
 
@@ -456,6 +470,7 @@ def build_training_dataset(session, cfg: BuilderConfig) -> Iterable[dict]:
                 "outcome_event":        outcome_event,
                 "outcome_event_date":   outcome_event_date.isoformat() if outcome_event_date else None,
                 "outcome_deal":         outcome_deal,
+                "outcome_deal_confidence_tier": outcome_deal_confidence_tier,
                 "outcome_feedback":     outcome_feedback,
             }
 
@@ -477,7 +492,8 @@ def _row_columns() -> list[str]:
     for sig in SIGNAL_TYPES:
         base.append(f"has_{sig}")
         base.append(f"recency_{sig}_days")
-    base += ["outcome_event", "outcome_event_date", "outcome_deal", "outcome_feedback"]
+    base += ["outcome_event", "outcome_event_date", "outcome_deal",
+             "outcome_deal_confidence_tier", "outcome_feedback"]
     return base
 
 
