@@ -32,6 +32,10 @@ router = APIRouter(prefix="/api/admin", tags=["score_feedback"])
 class PostOutcomeRequest(BaseModel):
     prospect_id: str
     outcome: str
+    # B0-02 Outcome Sanity Filter: optional buyer-capacity reason (low_fico /
+    # no_capital). Free text; the service ignores any value outside the
+    # canonical set, so no enum validation here.
+    reason: Optional[str] = None
     closer_call_id: Optional[int] = None
 
     @field_validator("prospect_id")
@@ -65,6 +69,7 @@ def post_outcome_endpoint(
         db,
         prospect_id=req.prospect_id,
         outcome=req.outcome,
+        reason=req.reason,
         closer_call_id=req.closer_call_id,
     )
     if result is None:
