@@ -1,4 +1,6 @@
-"""B0-01 — founder portfolio import (pure helpers; no DB)."""
+"""B0-01 — founder portfolio import (pure helpers + DB orchestrator)."""
+import uuid
+
 import pytest
 
 from src.services import founder_portfolio_import as fpi
@@ -43,3 +45,53 @@ def test_parse_rows_validates_and_flags_bad_rows():
     assert ok[0]["pipeline_stage"] == "closed_won"
     assert ok[0]["vertical"] == "fix_flip"
     assert len(errors) == 3           # empty, bad amount, bad vertical
+
+
+def test_import_portfolio_matches_upserts_and_reports(fresh_db):
+    """Matched row imports as founder_verified w/ property_id; unmatched reported;
+    re-run is idempotent (update, not duplicate)."""
+    from src.core.models import DealOutcome, Property
+
+    uid = uuid.uuid4().hex[:8]
+    parcel = f"FND-{uid}"
+    prop = Property(
+        parcel_id=parcel, address=f"{uid} Founder Way",
+        city="Tampa", state="FL", zip="33607", county_id="hillsborough",
+    )
+    fresh_db.add(prop)
+    fresh_db.flush()
+    fresh_db.commit()
+
+    csv_text = (
+        "parcel_id,address,city,zip,deal_date,profit_amount,outcome,vertical,days_to_close,notes\n"
+        f"{parcel},{uid} Founder Way,Tampa,33607,2024-03-14,18500,won,fix_flip,21,BRRRR\n"
+        f",NOWHERE {uid} nonexistent,Nowhere,00000,2024-04-01,30000,won,wholesalers,,\n"  # unmatched
+    )
+
+    summary = fpi.import_portfolio(fresh_db, csv_text)
+    assert summary["imported"] == 1
+    assert summary["updated"] == 0
+    assert len(summary["unmatched"]) == 1
+    assert not summary["errors"]
+
+    row = fresh_db.execute(
+        DealOutcome.__table__.select().where(DealOutcome.property_id == prop.id)
+    ).mappings().first()
+    assert row["confidence_tier"] == "founder_verified"
+    assert row["outcome_source"] == "founder_import"
+    assert row["subscriber_id"] is None
+    assert row["source_ref"] is not None
+
+    # Re-run same file → idempotent update, no duplicate.
+    summary2 = fpi.import_portfolio(fresh_db, csv_text)
+    assert summary2["imported"] == 0
+    assert summary2["updated"] == 1
+    n = fresh_db.execute(
+        DealOutcome.__table__.select().where(DealOutcome.property_id == prop.id)
+    ).all()
+    assert len(n) == 1
+
+    # cleanup
+    fresh_db.execute(DealOutcome.__table__.delete().where(DealOutcome.property_id == prop.id))
+    fresh_db.delete(prop)
+    fresh_db.commit()

@@ -15,8 +15,9 @@ import csv
 import hashlib
 import io
 import logging
-from datetime import date
 from typing import Optional
+
+from sqlalchemy import text as _sa_text
 
 from config.scoring import VERTICAL_WEIGHTS
 
@@ -114,3 +115,131 @@ def parse_rows(csv_text: str) -> tuple[list[dict], list[dict]]:
             ),
         })
     return ok, errors
+
+
+def _candidate_counties(session, zip_code: Optional[str]) -> list[str]:
+    """Counties to search for a row — those holding its ZIP, else all covered."""
+    if zip_code:
+        rows = session.execute(
+            _sa_text("SELECT DISTINCT county_id FROM properties WHERE zip = :z"),
+            {"z": zip_code},
+        ).scalars().all()
+        if rows:
+            return list(rows)
+    try:
+        from src.utils.county_config import list_counties
+        return list_counties() or ["hillsborough"]
+    except Exception:
+        return ["hillsborough"]
+
+
+_MATCH_LOADER_CLS = None
+
+
+def _matcher(session, county: str):
+    """A matching-only BaseLoader (BaseLoader is abstract; we need only its
+    property-matching cascade, not the load path)."""
+    global _MATCH_LOADER_CLS
+    if _MATCH_LOADER_CLS is None:
+        from src.loaders.base import BaseLoader
+
+        class _MatchLoader(BaseLoader):
+            def load_from_dataframe(self, *a, **k):  # matching only — never loads
+                raise NotImplementedError("founder-import matcher does not load")
+
+        _MATCH_LOADER_CLS = _MatchLoader
+    return _MATCH_LOADER_CLS(session, county)
+
+
+def resolve_property_id(session, row: dict) -> tuple[Optional[int], Optional[int]]:
+    """Resolve a founder row to a parcel via the loaders' cascade.
+
+    Returns (property_id, confidence). property_id is None unless a match meets
+    MIN_MATCH_CONFIDENCE (parcel-id exact = 100). confidence is the best score
+    seen (for reporting) even when below threshold.
+    """
+    best_id: Optional[int] = None
+    best_conf: int = -1
+    for county in _candidate_counties(session, row.get("zip")):
+        loader = _matcher(session, county)
+        prop, _method, conf = loader.find_property_cascade(
+            parcel_id=row.get("parcel_id"),
+            address=row.get("address"),
+            zip_code=row.get("zip"),
+            city=row.get("city"),
+        )
+        if prop and conf is not None and conf > best_conf:
+            best_id, best_conf = prop.id, conf
+
+    if best_id is not None and best_conf >= MIN_MATCH_CONFIDENCE:
+        return best_id, best_conf
+    return None, (best_conf if best_id is not None else None)
+
+
+_UPSERT_SQL = _sa_text("""
+INSERT INTO deal_outcomes
+    (subscriber_id, property_id, deal_size_bucket, deal_amount, deal_date,
+     days_to_close, pipeline_stage, county_id, trade_vertical,
+     confidence_tier, outcome_source, source_ref, created_at)
+VALUES
+    (NULL, :pid, :bucket, :amount, CAST(:ddate AS date),
+     :days, :stage, (SELECT county_id FROM properties WHERE id = :pid), :vertical,
+     'founder_verified', 'founder_import', :sref, NOW())
+ON CONFLICT (source_ref) WHERE source_ref IS NOT NULL DO UPDATE SET
+    property_id      = EXCLUDED.property_id,
+    deal_size_bucket = EXCLUDED.deal_size_bucket,
+    deal_amount      = EXCLUDED.deal_amount,
+    deal_date        = EXCLUDED.deal_date,
+    days_to_close    = EXCLUDED.days_to_close,
+    pipeline_stage   = EXCLUDED.pipeline_stage,
+    county_id        = EXCLUDED.county_id,
+    trade_vertical   = EXCLUDED.trade_vertical
+RETURNING (xmax = 0) AS inserted
+""")
+
+
+def import_portfolio(session, csv_text: str) -> dict:
+    """Parse, match, and upsert a founder portfolio CSV. Fires no side-effects.
+
+    Returns {imported, updated, matched, unmatched:[...], errors:[...]}.
+    Unmatched rows (below MIN_MATCH_CONFIDENCE) are reported, never attached.
+    """
+    ok, errors = parse_rows(csv_text)
+    imported = updated = 0
+    unmatched: list[dict] = []
+
+    for r in ok:
+        pid, conf = resolve_property_id(session, r)
+        if pid is None:
+            unmatched.append({
+                "identifier": r.get("parcel_id") or r.get("address"),
+                "best_confidence": conf,
+            })
+            continue
+        inserted = session.execute(_UPSERT_SQL, {
+            "pid":     pid,
+            "bucket":  r["deal_size_bucket"],
+            "amount":  r["deal_amount"],
+            "ddate":   r["deal_date"],
+            "days":    r["days_to_close"],
+            "stage":   r["pipeline_stage"],
+            "vertical": r["vertical"],
+            "sref":    r["source_ref"],
+        }).scalar()
+        if inserted:
+            imported += 1
+        else:
+            updated += 1
+
+    session.commit()
+    logger.info(
+        "[FounderImport] imported=%d updated=%d unmatched=%d errors=%d",
+        imported, updated, len(unmatched), len(errors),
+    )
+    return {
+        "imported":  imported,
+        "updated":   updated,
+        "matched":   imported + updated,
+        "unmatched": unmatched,
+        "errors":    errors,
+    }
