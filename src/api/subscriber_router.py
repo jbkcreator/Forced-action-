@@ -23,7 +23,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, model_validator
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from src.api.deps import get_db
 from src.core.models import Subscriber
@@ -164,22 +164,31 @@ def verify_magic_link(body: MagicLinkVerifyRequest, request: Request, db=Depends
 
     hashed = auth.hash_magic_link_token(body.token)
     now = datetime.now(timezone.utc)
-    sub = db.execute(
-        select(Subscriber).where(Subscriber.magic_link_hash == hashed)
-    ).scalar_one_or_none()
 
-    if sub is None or sub.magic_link_expires_at is None or sub.magic_link_used_at is not None:
-        raise HTTPException(status_code=400, detail="Invalid or expired link")
-    expires = sub.magic_link_expires_at
-    if expires.tzinfo is None:
-        expires = expires.replace(tzinfo=timezone.utc)
-    if expires < now:
-        raise HTTPException(status_code=400, detail="Invalid or expired link")
-
-    sub.magic_link_used_at = now
-    sub.magic_link_hash = None
+    # Atomic conditional UPDATE (not select-then-write) — closes a TOCTOU
+    # window where two concurrent requests with the same raw token could
+    # both pass a Python-side validity check before either write lands,
+    # letting a single-use link redeem twice. The WHERE clause is checked
+    # and applied by Postgres in one statement, so only one concurrent
+    # caller can ever match the row.
+    row = db.execute(
+        text(
+            """
+            UPDATE subscribers
+            SET magic_link_used_at = :now, magic_link_hash = NULL
+            WHERE magic_link_hash = :hashed
+              AND magic_link_used_at IS NULL
+              AND magic_link_expires_at > :now
+            RETURNING id, event_feed_uuid
+            """
+        ),
+        {"hashed": hashed, "now": now},
+    ).first()
     db.flush()
 
-    logger.info("[subscriber-auth] magic-link verified for sub=%s", sub.id)
-    token = auth.create_access_token(sub.id, sub.event_feed_uuid)
-    return {"access_token": token, "token_type": "bearer", "feed_uuid": sub.event_feed_uuid}
+    if row is None:
+        raise HTTPException(status_code=400, detail="Invalid or expired link")
+
+    logger.info("[subscriber-auth] magic-link verified for sub=%s", row.id)
+    token = auth.create_access_token(row.id, row.event_feed_uuid)
+    return {"access_token": token, "token_type": "bearer", "feed_uuid": row.event_feed_uuid}

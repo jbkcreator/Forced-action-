@@ -156,27 +156,32 @@ def test_login_still_works_as_dormant_fallback(client, fresh_db):
 
 def test_signup_never_calls_generate_random_password(client, fresh_db, monkeypatch):
     """This IS the Definition of Done: a cold signup receives a magic link,
-    never a plaintext password. Force generate_random_password to explode —
-    any live call site would fail this test immediately."""
+    never a plaintext password. Force generate_random_password to explode and
+    drive the REAL signup entrypoint (POST /api/free-signup -> signup_engine.
+    create_free_account_by_email -> the send_welcome branch) — not a hand-built
+    Subscriber row — so this actually fails if a real call site regresses."""
     from src.services import subscriber_auth
+    from sqlalchemy import text as sa_text
 
     def _boom():
         raise AssertionError("generate_random_password must not be called during signup")
 
     monkeypatch.setattr(subscriber_auth, "generate_random_password", _boom)
 
-    captured = {}
-    monkeypatch.setattr(
-        "src.services.subscriber_auth.send_magic_link_email",
-        lambda email, name, raw_token: captured.update(email=email, token=raw_token),
-    )
+    email = f"ml_e_{uuid.uuid4().hex[:6]}@e.com"
+    r = client.post("/api/free-signup", json={
+        "email": email, "vertical": "roofing", "county_id": "hillsborough",
+    })
+    assert r.status_code == 201, r.text
 
-    sub = _make_subscriber(fresh_db, email=f"ml_e_{uuid.uuid4().hex[:6]}@e.com")
-    raw = subscriber_auth.issue_magic_link(sub, fresh_db)
-    assert raw
-
-    r = client.post("/api/subscriber/magic-link/request", json={"email": sub.email})
-    assert r.status_code == 200
+    # A magic link was actually issued (proves issue_magic_link ran on this
+    # real signup path, via send_welcome_email(..., magic_link_url=...)) and
+    # no password was ever set on the row.
+    row = fresh_db.execute(sa_text(
+        "SELECT password_hash, magic_link_hash FROM subscribers WHERE email = :email"
+    ), {"email": email}).first()
+    assert row.password_hash is None
+    assert row.magic_link_hash is not None
 
 
 def test_welcome_email_body_never_contains_a_password(monkeypatch):
