@@ -28,16 +28,20 @@ logger = logging.getLogger(__name__)
 _PA_NAME_SUFFIXES = frozenset({"JR", "SR", "II", "III", "IV", "V", "ESQ", "PHD", "MD"})
 
 
-def _normalize_pa_owner_name(name: str) -> str:
+def _normalize_pa_owner_name(name) -> Optional[str]:
     """
     Storage-time normalization for all PA sources:
       "Estate of John Smith"  →  "John Smith"
       "SMITH, JOHN"           →  "JOHN SMITH"
       "JOHN SMITH, JR"        →  "JOHN SMITH JR"
+
+    Accepts non-str input defensively — a pandas NaN owner_name cell is a
+    `float`, not a str, and `if not name` alone doesn't catch it (NaN is
+    truthy in Python), which used to crash on `name.strip()`.
     """
+    name = BaseLoader.clean_str(name)
     if not name:
         return name
-    name = name.strip()
     if name.lower().startswith("estate of "):
         name = name[len("estate of "):].strip()
     if "," in name:
@@ -151,7 +155,7 @@ class PropertyAppraiserLoader(BaseLoader):
         return True
 
     def _upsert_owner(self, prop: Property, row: pd.Series) -> None:
-        owner_name = _normalize_pa_owner_name(row.get("owner_name") or "") or None
+        owner_name = _normalize_pa_owner_name(row.get("owner_name"))
         mailing_address = row.get("mailing_address")
         site_address = getattr(prop, "address", None)
 
@@ -201,6 +205,8 @@ class PropertyAppraiserLoader(BaseLoader):
         # Sales
         _set_if_present(fin, "last_sale_date",  _date_or_none(row.get("last_sale_date")))
         _set_if_present(fin, "last_sale_price", _float(row.get("last_sale_price")))
+        _set_if_present(fin, "last_sale_qualified",        _bool(row.get("last_sale_qualified")))
+        _set_if_present(fin, "last_sale_vacant_improved",  _str_or_none(row.get("last_sale_vacant_improved")))
 
         # Derived: value_change_yoy
         prior = _float(row.get("prior_year_market_value"))

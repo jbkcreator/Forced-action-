@@ -83,7 +83,7 @@ class Property(Base):
     building_class: Mapped[Optional[str]] = mapped_column(String(5))           # A / B / C / M
     heated_sq_ft: Mapped[Optional[float]] = mapped_column(Numeric(10, 2))      # heated living area; sq_ft may be gross
     subdivision: Mapped[Optional[str]] = mapped_column(String(255))
-    hcpa_neighborhood_code: Mapped[Optional[str]] = mapped_column(String(50))
+    hcpa_neighborhood_code: Mapped[Optional[str]] = mapped_column(String(255))
     building_details: Mapped[Optional[dict]] = mapped_column(JSONB)            # roof, walls, sub-areas, extra features
     hcpa_last_refreshed: Mapped[Optional[datetime]] = mapped_column(DateTime)  # NULL = never enriched
 
@@ -323,6 +323,8 @@ class Financial(Base):
     # Last Sale Information
     last_sale_price: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
     last_sale_date: Mapped[Optional[datetime]] = mapped_column(Date)
+    last_sale_qualified: Mapped[Optional[bool]] = mapped_column(Boolean)
+    last_sale_vacant_improved: Mapped[Optional[str]] = mapped_column(String(20))
     value_change_yoy: Mapped[Optional[float]] = mapped_column(Numeric(5, 2))
 
     # Debt Information (API Gap)
@@ -1860,7 +1862,8 @@ class ScraperRunStats(Base):
             "'violations', 'foreclosures', 'permits', 'tax_delinquencies',"
             "'roofing_permits', 'storm_damage', 'flood_damage', 'insurance_claims', 'fire_incidents',"
             "'sunbiz', 'property_appraiser', 'dbpr_company',"
-            "'tax_deed_auction', 'vacant_land'"
+            "'tax_deed_auction', 'vacant_land',"
+            "'tax_deed_outcomes', 'appraiser_sale_outcomes'"
             ")",
             name="check_run_stats_source_type",
         ),
@@ -2088,7 +2091,7 @@ class UnmatchedRecord(Base):
     match_attempted_at    = mapped_column(DateTime(timezone=True), nullable=True)
     matched_property_id   = mapped_column(Integer, ForeignKey("properties.id"), nullable=True)
     match_confidence      = mapped_column(Numeric(4, 3), nullable=True)        # 0.000–1.000
-    match_method          = mapped_column(String(30), nullable=True)            # address | owner_name | legal_desc | parcel_id
+    match_method          = mapped_column(String(30), nullable=True)            # parcel_id | normalized_address | owner_name_zip | owner_name_city | owner_name | legal_desc | llm_verified
     candidate_property_id = mapped_column(Integer, ForeignKey("properties.id"), nullable=True)
     date_added            = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
@@ -2109,13 +2112,74 @@ class UnmatchedRecord(Base):
             name="check_unmatched_match_status",
         ),
         CheckConstraint(
-            "match_method IN ('address','owner_name','legal_desc','parcel_id') OR match_method IS NULL",
+            # 'address' is a legacy value from before the cascade's stage-2 constant was
+            # renamed to 'normalized_address' — kept for backward compatibility with
+            # existing rows, not written by current code.
+            "match_method IN ('parcel_id','address','normalized_address','owner_name_zip',"
+            "'owner_name_city','owner_name','legal_desc','llm_verified') OR match_method IS NULL",
             name="check_unmatched_match_method",
         ),
     )
 
     def __repr__(self):
         return f"<UnmatchedRecord(id={self.id}, source='{self.source_type}', status='{self.match_status}')>"
+
+
+class OutcomeCandidate(Base):
+    """
+    Canonical staging shape for outcomes mined from already-ingested public
+    records (foreclosure auction results, tax-deed auction results, appraiser
+    sales, etc.) by the Cora Data Engine connectors (src/connectors/).
+
+    Deliberately has no FK to deal_outcomes and nothing writes deal_outcomes
+    rows from here directly — DealOutcome.subscriber_id is NOT NULL today, so
+    a separate label layer promotes rows from here into DealOutcome once that
+    constraint is relaxed for pipeline-sourced (subscriber-less) outcomes.
+    """
+    __tablename__ = "outcome_candidates"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    property_id: Mapped[int] = mapped_column(Integer, ForeignKey("properties.id"), nullable=False, index=True)
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    source_type: Mapped[str] = mapped_column(String(50), nullable=False, index=True)   # matches connector registry source_type
+    source_table: Mapped[str] = mapped_column(String(50), nullable=False)              # e.g. 'foreclosures', 'tax_deed_auctions'
+    source_id: Mapped[int] = mapped_column(Integer, nullable=False)                    # PK of the row in source_table
+    event_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    event_date: Mapped[date] = mapped_column(Date, nullable=False)
+    amount: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 2))
+    counterparty: Mapped[Optional[str]] = mapped_column(String(255))
+    raw_status: Mapped[Optional[str]] = mapped_column(String(100))                     # untranslated source string, for audit
+    match_confidence: Mapped[Optional[Decimal]] = mapped_column(Numeric(4, 3))         # only set when resolve_or_quarantine() was used
+    match_method: Mapped[Optional[str]] = mapped_column(String(30))
+    consumed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))   # set by the (future) label layer
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), onupdate=func.now())
+
+    property = relationship("Property", foreign_keys=[property_id])
+
+    __table_args__ = (
+        # event_date is part of the key (not just source_type/table/id) so a stable
+        # per-property source row (e.g. Financial, overwritten on every appraiser
+        # refresh) can still stage a SEPARATE outcome for each distinct sale date —
+        # otherwise a second qualified sale on the same property would silently
+        # overwrite the first sale's staged outcome instead of creating a new one.
+        UniqueConstraint("source_type", "source_table", "source_id", "event_date", name="uq_outcome_candidate"),
+        Index("ix_outcome_candidates_property", "property_id"),
+        Index(
+            "ix_outcome_candidates_unconsumed",
+            "consumed_at",
+            postgresql_where=text("consumed_at IS NULL"),
+        ),
+        CheckConstraint(
+            "event_type IN ('auction_sold_third_party','auction_reverted_to_lender',"
+            "'auction_cancelled','tax_deed_sold','tax_deed_cancelled','tax_deed_redeemed',"
+            "'qualified_sale','unqualified_sale')",
+            name="check_outcome_candidate_event_type",
+        ),
+    )
+
+    def __repr__(self):
+        return f"<OutcomeCandidate(id={self.id}, source='{self.source_type}', event='{self.event_type}')>"
 
 
 # ============================================================================
