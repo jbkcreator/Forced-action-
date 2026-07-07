@@ -113,9 +113,10 @@ Requirements:
 - Wait for the auction listing to load.
 - Extract ALL auction records visible on the page across all sections (Running, Waiting, Closed/Canceled).
 - For each record capture: case_number, property_address, judgment_amount, parcel_id, auction_type, auction_status, case_detail_url.
+- Also capture, if present on that record: winning_bid (a dollar amount shown next to an "Amount" label, only present when the record shows "Auction Sold") and sold_to (text shown next to a "Sold To" label, only present when "Auction Sold" -- typically "Plaintiff" or "3rd Party Bidder"). Leave both empty if not present.
 - For each case_detail_url, navigate to it and extract plaintiff and defendant party names, then go back.
 - Return ALL records as a single JSON object in this exact format:
-  {{"auctions": [{{"case_number": "", "property_address": "", "judgment_amount": "", "parcel_id": "", "auction_type": "", "auction_status": "", "plaintiff": "", "defendant": "", "case_detail_url": ""}}]}}
+  {{"auctions": [{{"case_number": "", "property_address": "", "judgment_amount": "", "parcel_id": "", "auction_type": "", "auction_status": "", "winning_bid": "", "sold_to": "", "plaintiff": "", "defendant": "", "case_detail_url": ""}}]}}
 - If no auctions are listed for this date, return: {{"auctions": []}}
 - Do not save any files. Return the JSON as your final result.
 - Keep the task under 250 words.
@@ -153,6 +154,9 @@ def _template_task(source: dict, auction_date: dt.date) -> str:
 		"Extract all auction records across all sections (Running, Waiting, Closed/Canceled).\n"
 		"For each record capture: case_number, property_address, judgment_amount, parcel_id, "
 		"auction_type, auction_status, case_detail_url.\n"
+		"Also capture winning_bid (dollar amount next to an \"Amount\" label) and sold_to (text next to "
+		"a \"Sold To\" label, e.g. \"Plaintiff\" or \"3rd Party Bidder\") when present -- only shown for "
+		"records marked \"Auction Sold\". Leave both empty otherwise.\n"
 		"For each case_detail_url, navigate to it and extract plaintiff and defendant names, then go back.\n"
 		'Return all records as JSON: {"auctions": [...]}.\n'
 		'If no auctions exist for this date return: {"auctions": []}.'
@@ -271,6 +275,8 @@ def _parse_agent_result(
 		"parcel_id":        "Parcel ID",
 		"auction_type":     "Auction Type",
 		"auction_status":   "Auction Status",
+		"winning_bid":      "Winning Bid",
+		"sold_to":          "Sold To",
 		"plaintiff":        "Plaintiff",
 		"defendant":        "Defendant",
 		"case_detail_url":  "Case Detail URL",

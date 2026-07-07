@@ -792,6 +792,8 @@ class Foreclosure(Base):
     judgment_amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
     auction_date: Mapped[Optional[datetime]] = mapped_column(DateTime)
     case_status: Mapped[Optional[str]] = mapped_column(String(100))
+    winning_bid: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
+    sold_to: Mapped[Optional[str]] = mapped_column(String(50))   # "Plaintiff" | "3rd Party Bidder" | None
 
     # Match provenance
     match_confidence: Mapped[Optional[Decimal]] = mapped_column(Numeric(4, 3), nullable=True)  # 0.000–1.000
@@ -1863,7 +1865,7 @@ class ScraperRunStats(Base):
             "'roofing_permits', 'storm_damage', 'flood_damage', 'insurance_claims', 'fire_incidents',"
             "'sunbiz', 'property_appraiser', 'dbpr_company',"
             "'tax_deed_auction', 'vacant_land',"
-            "'tax_deed_outcomes', 'appraiser_sale_outcomes'"
+            "'tax_deed_outcomes', 'appraiser_sale_outcomes', 'foreclosure_outcomes'"
             ")",
             name="check_run_stats_source_type",
         ),

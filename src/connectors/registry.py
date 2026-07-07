@@ -49,7 +49,7 @@ OUTCOME_CONNECTORS: dict[str, ConnectorSpec] = {
         cadence="daily, after the foreclosure scraper",
         sla_minutes=1500,
         off_days=frozenset(),
-        enabled=False,
+        enabled=True,
     ),
     "tax_deed_outcomes": ConnectorSpec(
         source_type="tax_deed_outcomes",
