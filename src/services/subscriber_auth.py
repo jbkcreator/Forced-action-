@@ -1,17 +1,22 @@
 """
-Subscriber feed authentication (fa061).
+Subscriber feed authentication (fa061 + magic-link).
 
 Password-login layer for the lead feed. Mirrors src/services/white_label_auth.py:
   - bcrypt password hashing / verification
   - HS256 JWT access token (7-day) for feed sessions
-  - random password generation (emailed in plaintext at signup)
+  - random password generation (legacy — no longer emailed; password login
+    stays available as a dormant fallback for subscribers who already have one)
   - forgot-password reset tokens (sha256-hashed in DB, raw emailed)
+  - magic-link (passwordless) tokens — the primary login path for new
+    subscribers; same raw-token/sha256-hash-in-DB pattern as reset tokens
   - FastAPI dependency `get_current_subscriber` that gates the feed endpoints
 
 Secret: `subscriber_jwt_secret`, falling back to `admin_jwt_secret` (dev).
 
-Security note: signup emails the generated password in plaintext (product
-decision). The hardening path is force-reset-on-first-login; not enabled in v1.
+Security note: signup used to email the generated password in plaintext.
+That path is retired — signup now issues a magic link instead (see
+`issue_magic_link` / `send_magic_link_email`). No code path should generate
+or email a password for a new subscriber.
 """
 
 from __future__ import annotations
@@ -39,6 +44,7 @@ _bearer = HTTPBearer(auto_error=False)
 
 _ACCESS_EXPIRE_DAYS = 7
 _RESET_EXPIRE_HOURS = 2
+_MAGIC_LINK_EXPIRE_MINUTES = 15
 _ALGORITHM = "HS256"
 
 # Human-friendly alphabet — no ambiguous chars (0/O, 1/l/I).
@@ -106,6 +112,67 @@ def hash_reset_token(raw: str) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
+# ── Magic-link (passwordless) helpers ────────────────────────────────────────
+
+def generate_magic_link_token() -> tuple[str, str]:
+    """Return (raw_token, sha256_hex). Store the hash; email the raw token."""
+    raw = secrets.token_urlsafe(32)
+    return raw, hashlib.sha256(raw.encode()).hexdigest()
+
+
+def hash_magic_link_token(raw: str) -> str:
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def issue_magic_link(subscriber: Subscriber, db) -> str:
+    """Generate a fresh single-use magic-link token for `subscriber`, store its
+    hash + expiry on the row, and return the raw token to email.
+
+    Overwrites any previously-issued, unused link (only the newest is valid).
+    Does not commit/flush the session's outer transaction — caller controls that,
+    but this does call db.flush() so the values are visible within the same
+    transaction (mirrors the password-setup call sites this replaces).
+    """
+    raw, hashed = generate_magic_link_token()
+    subscriber.magic_link_hash = hashed
+    subscriber.magic_link_expires_at = datetime.now(timezone.utc) + timedelta(
+        minutes=_MAGIC_LINK_EXPIRE_MINUTES
+    )
+    subscriber.magic_link_used_at = None
+    db.flush()
+    return raw
+
+
+def magic_link_url(raw_token: str) -> str:
+    base = get_settings().app_base_url.rstrip("/")
+    return f"{base}/auth/verify?token={raw_token}"
+
+
+def send_magic_link_email(email: str, name: Optional[str], raw_token: str) -> None:
+    verify_url = magic_link_url(raw_token)
+    greeting = f"Hi {name}," if name else "Hi,"
+    send_email(
+        to=email,
+        subject="Your Forced Action login link",
+        body_text=(
+            f"{greeting}\n\nClick below to access your feed — no password needed:\n"
+            f"{verify_url}\n\n"
+            f"This link expires in {_MAGIC_LINK_EXPIRE_MINUTES} minutes and can only "
+            f"be used once. If you didn't request this, ignore this email.\n\n— Forced Action"
+        ),
+        body_html=(
+            f"<p>{greeting}</p>"
+            f"<p>Click below to access your feed — no password needed:</p>"
+            f"<p><a href='{verify_url}' style='display:inline-block;padding:10px 18px;"
+            f"background:#1a1a2e;color:#fff;text-decoration:none;border-radius:6px;'>"
+            f"Open my feed</a></p>"
+            f"<p style='color:#888;font-size:12px;'>This link expires in "
+            f"{_MAGIC_LINK_EXPIRE_MINUTES} minutes and can only be used once. "
+            f"If you didn't request this, ignore this email.</p>"
+        ),
+    )
+
+
 # ── FastAPI dependency: gate the feed ───────────────────────────────────────────
 
 def get_current_subscriber(
@@ -163,3 +230,4 @@ def send_subscriber_password_reset_email(email: str, name: Optional[str], raw_to
 
 
 RESET_EXPIRE_HOURS = _RESET_EXPIRE_HOURS
+MAGIC_LINK_EXPIRE_MINUTES = _MAGIC_LINK_EXPIRE_MINUTES

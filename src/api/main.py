@@ -2348,13 +2348,8 @@ def resend_confirmation(payload: ResendConfirmationRequest, db: Session = Depend
     try:
         from src.services.email import send_welcome_email
         from src.services import subscriber_auth as _sub_auth
-        feed_password = None
-        if not subscriber.password_hash:
-            feed_password = _sub_auth.generate_random_password()
-            subscriber.password_hash = _sub_auth.hash_password(feed_password)
-            subscriber.password_set_at = datetime.now(timezone.utc)
-            db.flush()
-        send_welcome_email(subscriber, plaintext_password=feed_password)
+        magic_url = _sub_auth.magic_link_url(_sub_auth.issue_magic_link(subscriber, db))
+        send_welcome_email(subscriber, magic_link_url=magic_url)
     except Exception:
         logger.error("Failed to resend confirmation for feed %s", payload.feed_uuid, exc_info=True)
         raise HTTPException(status_code=500, detail={"error": "send_failed", "message": "Failed to send email"})

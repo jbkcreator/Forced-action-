@@ -1290,6 +1290,12 @@ class Subscriber(Base):
     reset_token_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     reset_token_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # ── Magic-link (passwordless) login ──────────────────────────────────────
+    # Single-use, short-lived login link — replaces emailing a plaintext password.
+    magic_link_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    magic_link_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    magic_link_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
     # ── ICP channel attribution (fa066) ──────────────────────────────────────
     # Explicit ICP attribution. Verticals can overlap between ICPs so scoping
     # by vertical alone is unsafe. Default 'contractor' for all existing rows.

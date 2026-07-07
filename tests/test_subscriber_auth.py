@@ -1,13 +1,16 @@
 """
-Unit tests for subscriber feed auth (fa061) — no DB required.
+Unit tests for subscriber feed auth (fa061 + magic-link) — no DB required.
 
 Covers: bcrypt hash/verify, JWT issue/verify (incl. tamper/expiry/wrong-type),
-random password generation, reset-token hashing.
+random password generation, reset-token hashing, magic-link token issuance.
 """
 
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 from jose import jwt
@@ -98,6 +101,43 @@ class TestAccessToken:
         with pytest.raises(Exception) as ei:
             auth.verify_access_token(expired)
         assert getattr(ei.value, "status_code", None) == 401
+
+
+class TestMagicLinkToken:
+    def test_raw_differs_from_hash_and_matches_sha256(self):
+        raw, hashed = auth.generate_magic_link_token()
+        assert raw != hashed
+        assert hashlib.sha256(raw.encode()).hexdigest() == hashed
+        assert auth.hash_magic_link_token(raw) == hashed
+
+    def test_tokens_are_unique(self):
+        tokens = {auth.generate_magic_link_token()[0] for _ in range(50)}
+        assert len(tokens) == 50
+
+
+class TestIssueMagicLink:
+    def test_sets_hash_expiry_and_clears_used_at(self):
+        subscriber = SimpleNamespace(
+            magic_link_hash=None, magic_link_expires_at=None, magic_link_used_at="stale"
+        )
+        db = MagicMock()
+        before = datetime.now(timezone.utc)
+
+        raw = auth.issue_magic_link(subscriber, db)
+
+        assert subscriber.magic_link_hash == hashlib.sha256(raw.encode()).hexdigest()
+        assert subscriber.magic_link_used_at is None
+        assert subscriber.magic_link_expires_at > before
+        assert subscriber.magic_link_expires_at <= before + timedelta(
+            minutes=auth.MAGIC_LINK_EXPIRE_MINUTES + 1
+        )
+        db.flush.assert_called_once()
+
+    def test_url_contains_raw_token(self, monkeypatch):
+        from config.settings import get_settings
+        monkeypatch.setattr(get_settings(), "app_base_url", "https://app.example.com")
+        url = auth.magic_link_url("abc123")
+        assert url == "https://app.example.com/auth/verify?token=abc123"
 
 
 class TestLoginRequestValidation:

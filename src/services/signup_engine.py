@@ -333,22 +333,19 @@ def create_free_account_by_email(
 			logger.warning("Referral processing failed for subscriber %d: %s", sub.id, exc)
 
 	if send_welcome:
-		# fa061 — set a feed login password now and email the plaintext in the
-		# welcome email (only the bcrypt hash is stored; plaintext never logged).
-		# When deferred (intent=upgrade/unlock) the password is left unset here and
-		# generated+emailed by the payment webhook instead.
+		# Magic-link login — issue a fresh one-time link now and email it in
+		# the welcome email. No password is ever generated or emailed.
+		# When deferred (intent=upgrade/unlock) the link is issued by the
+		# payment webhook instead.
 		try:
 			from src.services import subscriber_auth
-			feed_password = subscriber_auth.generate_random_password()
-			sub.password_hash = subscriber_auth.hash_password(feed_password)
-			sub.password_set_at = datetime.now(timezone.utc)
-			db.flush()
+			magic_url = subscriber_auth.magic_link_url(subscriber_auth.issue_magic_link(sub, db))
 		except Exception as exc:
-			feed_password = None
-			logger.warning("Feed password setup failed for subscriber %d: %s", sub.id, exc)
+			magic_url = None
+			logger.warning("Magic-link issuance failed for subscriber %d: %s", sub.id, exc)
 		try:
 			from src.services.email import send_welcome_email
-			send_welcome_email(sub, plaintext_password=feed_password)
+			send_welcome_email(sub, magic_link_url=magic_url)
 		except Exception as exc:
 			logger.warning("Welcome email failed for new subscriber %d: %s", sub.id, exc)
 	else:
