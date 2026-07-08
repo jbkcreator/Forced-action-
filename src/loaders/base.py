@@ -307,32 +307,52 @@ class BaseLoader(ABC):
         return name
     
     @staticmethod
+    def _is_missing_token(value: Any) -> bool:
+        """
+        True for pandas NaN/None AND for the literal strings that a NaN/None
+        turns into once something upstream has already stringified it (e.g.
+        `str(raw.get("field", ""))` on a missing pandas cell yields "nan", not
+        NaN — `pd.isna("nan")` is False, so callers that pre-stringify need
+        this second check or a missing value silently survives as text).
+        """
+        if pd.isna(value):
+            return True
+        return str(value).strip().lower() in ('', 'nan', 'none', 'null')
+
+    @staticmethod
+    def clean_str(value: Any) -> Optional[str]:
+        """Strip a value to a non-empty string, or None if missing/NaN/empty/"nan"-like."""
+        if BaseLoader._is_missing_token(value):
+            return None
+        return str(value).strip()
+
+    @staticmethod
     def parse_amount(amount_str: str) -> Optional[float]:
         """Parse monetary amount from string."""
-        if pd.isna(amount_str) or not amount_str:
+        if BaseLoader._is_missing_token(amount_str):
             return None
-        
+
         # Remove currency symbols and commas
         clean = str(amount_str).replace('$', '').replace(',', '').strip()
-        
+
         try:
             return float(clean)
         except (ValueError, TypeError):
             return None
-    
+
     @staticmethod
     def parse_int(value_str: str) -> Optional[int]:
         """Parse integer from string, handling decimals and invalid values."""
-        if pd.isna(value_str) or not value_str:
+        if BaseLoader._is_missing_token(value_str):
             return None
-        
+
         # Convert to string and clean
         clean = str(value_str).strip()
-        
+
         # Skip non-numeric values
         if not clean or clean in ['U', 'TA', 'N/A', '']:
             return None
-        
+
         try:
             # Try to convert to float first (handles decimal strings like '0.00')
             # Then convert to int
@@ -343,11 +363,11 @@ class BaseLoader(ABC):
             return None
         except (ValueError, TypeError):
             return None
-    
+
     @staticmethod
     def parse_date(date_str: str) -> Optional[datetime]:
         """Parse date from various formats."""
-        if pd.isna(date_str) or not date_str:
+        if BaseLoader._is_missing_token(date_str):
             return None
         
         date_formats = [

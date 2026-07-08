@@ -3,7 +3,13 @@ Tax Deed Auction Loader.
 
 Matches scraped tax_deed_auctions rows to the properties table via the
 parcel_id cascade (exact → normalized → address fallback) and writes
-TaxDeedAuction records. Deduplicates on (county_id, auction_date, case_number).
+TaxDeedAuction records. Deduplicates on (county_id, auction_date, case_number)
+— a re-scrape of an existing case UPDATES status/sold_amount/sold_to/
+opening_bid/certificate_number/raw_fields in place (a case scraped while
+"Scheduled" and re-scraped after the auction resolves is the normal lifecycle
+for this source, not a true duplicate) rather than being skipped outright.
+property_id/match_method/match_confidence are left untouched on update so an
+already-resolved match is never downgraded by a later pass.
 """
 
 import json
@@ -31,8 +37,8 @@ class TaxDeedAuctionLoader(BaseLoader):
         for _, row in df.iterrows():
             raw = dict(row)
 
-            parcel_id = str(raw.get("parcel_id", "")).strip() or None
-            case_number = str(raw.get("case_number", "")).strip()
+            parcel_id = self.clean_str(raw.get("parcel_id"))
+            case_number = self.clean_str(raw.get("case_number")) or ""
             auction_date_raw = raw.get("auction_date", "")
 
             if not case_number:
@@ -41,25 +47,89 @@ class TaxDeedAuctionLoader(BaseLoader):
                 continue
 
             # Parse auction date
-            auction_date_obj = self.parse_date(str(auction_date_raw))
+            auction_date_obj = self.parse_date(auction_date_raw)
             if auction_date_obj is None:
                 logger.warning("Could not parse auction_date %r for case %s", auction_date_raw, case_number)
                 unmatched += 1
                 continue
             auction_date_val: date = auction_date_obj.date() if hasattr(auction_date_obj, "date") else auction_date_obj
 
-            # Dedup check
+            # Parse raw_fields JSON if stored as string (needed for both the
+            # insert path below and the update-on-duplicate path here).
+            raw_fields_val = raw.get("raw_fields")
+            if isinstance(raw_fields_val, str):
+                try:
+                    raw_fields_val = json.loads(raw_fields_val)
+                except (ValueError, TypeError):
+                    raw_fields_val = None
+
+            new_status = self.clean_str(raw.get("status"))
+            new_sold_amount = self.parse_amount(raw.get("sold_amount"))
+            new_sold_to = self.clean_str(raw.get("sold_to"))
+            new_opening_bid = self.parse_amount(raw.get("opening_bid"))
+            new_certificate_number = self.clean_str(raw.get("certificate_number"))
+
+            # Dedup check — update in place rather than skip, since a case's
+            # status/sold_amount/sold_to are only known once the auction
+            # actually resolves, which happens on a later re-scrape of the
+            # same (county_id, auction_date, case_number).
             if skip_duplicates:
                 from sqlalchemy import text as sa_text
                 existing = self.session.execute(
                     sa_text(
-                        "SELECT id FROM tax_deed_auctions "
+                        "SELECT id, property_id, status, sold_amount, sold_to, opening_bid "
+                        "FROM tax_deed_auctions "
                         "WHERE county_id = :cid AND auction_date = :dt AND case_number = :cn"
                     ),
                     {"cid": self.county_id, "dt": auction_date_val, "cn": case_number},
                 ).first()
                 if existing:
-                    skipped += 1
+                    # Only a genuinely new, non-null value counts as "changed" —
+                    # a re-scrape that comes back with a missing field (partial
+                    # page render, transient scrape gap, layout hiccup) must
+                    # never look like new information, let alone overwrite what's
+                    # already on record.
+                    changed = (
+                        (new_status is not None and new_status != existing.status)
+                        or (new_sold_amount is not None and new_sold_amount != existing.sold_amount)
+                        or (new_sold_to is not None and new_sold_to != existing.sold_to)
+                        or (new_opening_bid is not None and new_opening_bid != existing.opening_bid)
+                    )
+                    if changed:
+                        self.session.execute(
+                            sa_text(
+                                "UPDATE tax_deed_auctions SET "
+                                # COALESCE on every field: a NULL from this scrape
+                                # (transient gap, partial render) must never erase
+                                # a previously-captured real value — sold_amount/
+                                # sold_to are the PRIMARY signal the outcome
+                                # connector uses to detect a sale (see
+                                # src/connectors/tax_deed_outcomes.py), so losing
+                                # them here would silently corrupt that signal.
+                                "status = COALESCE(:status, status), "
+                                "sold_amount = COALESCE(:sold_amount, sold_amount), "
+                                "sold_to = COALESCE(:sold_to, sold_to), "
+                                "opening_bid = COALESCE(:opening_bid, opening_bid), "
+                                "certificate_number = COALESCE(:certificate_number, certificate_number), "
+                                "raw_fields = COALESCE(CAST(:raw_fields AS JSONB), raw_fields) "
+                                "WHERE id = :id"
+                            ),
+                            {
+                                "status": new_status,
+                                "sold_amount": new_sold_amount,
+                                "sold_to": new_sold_to,
+                                "opening_bid": new_opening_bid,
+                                "certificate_number": new_certificate_number,
+                                "raw_fields": json.dumps(raw_fields_val) if raw_fields_val is not None else None,
+                                "id": existing.id,
+                            },
+                        )
+                        if existing.property_id:
+                            matched += 1
+                        else:
+                            unmatched += 1
+                    else:
+                        skipped += 1
                     continue
 
             # Property matching — parcel_id first, address fallback
@@ -81,27 +151,19 @@ class TaxDeedAuctionLoader(BaseLoader):
                         match_status="unmatched",
                     )
 
-            # Parse raw_fields JSON if stored as string
-            raw_fields_val = raw.get("raw_fields")
-            if isinstance(raw_fields_val, str):
-                try:
-                    raw_fields_val = json.loads(raw_fields_val)
-                except (ValueError, TypeError):
-                    raw_fields_val = None
-
             record = TaxDeedAuction(
                 property_id=prop.id if prop else None,
                 county_id=self.county_id,
                 parcel_id=parcel_id,
                 auction_date=auction_date_val,
                 case_number=case_number,
-                certificate_number=str(raw.get("certificate_number", "")).strip() or None,
+                certificate_number=new_certificate_number,
                 certificate_year=_to_int(raw.get("certificate_year")),
-                status=str(raw.get("status", "")).strip() or None,
-                auction_type=str(raw.get("auction_type", "")).strip() or None,
-                opening_bid=self.parse_amount(str(raw.get("opening_bid", ""))),
-                sold_amount=self.parse_amount(str(raw.get("sold_amount", ""))),
-                sold_to=str(raw.get("sold_to", "")).strip() or None,
+                status=new_status,
+                auction_type=self.clean_str(raw.get("auction_type")),
+                opening_bid=new_opening_bid,
+                sold_amount=new_sold_amount,
+                sold_to=new_sold_to,
                 raw_fields=raw_fields_val,
                 match_method=match_method,
                 match_confidence=round(match_score / 100.0, 3) if match_score is not None else None,

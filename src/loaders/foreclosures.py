@@ -162,25 +162,51 @@ class ForeclosureLoader(BaseLoader):
                         case_status_raw = row.get('Auction Status')
                         case_status_val = str(case_status_raw).strip() if pd.notna(case_status_raw) else None
 
+                        winning_bid_val = self.parse_amount(row.get('Winning Bid')) if 'Winning Bid' in row else None
+                        sold_to_raw = row.get('Sold To')
+                        sold_to_val = str(sold_to_raw).strip() if pd.notna(sold_to_raw) else None
+
                         # ── Upsert logic ──────────────────────────────────────────
-                        # Case 1: exact case_number already exists → skip (true dup)
+                        # Case 1: exact case_number already exists. case_number
+                        # carries its own unique constraint, so this lookup always
+                        # runs regardless of skip_duplicates. What happens next
+                        # DOES depend on skip_duplicates:
+                        #   True  (default; the only value any real caller passes
+                        #          today) — reconcile in place only if something
+                        #          actually changed (a case scraped while "Waiting"
+                        #          and re-scraped once resolved is the normal
+                        #          lifecycle here, not a true duplicate), else skip.
+                        #   False — caller has opted out of duplicate-skipping
+                        #          entirely, so always reconcile regardless of the
+                        #          changed check (this loader's original contract
+                        #          for that flag).
                         existing_exact = (
                             self.session.query(Foreclosure)
                             .filter_by(case_number=case_number, county_id=self.county_id)
                             .first()
                         )
                         if existing_exact:
-                            if skip_duplicates:
-                                logger.debug(f"Skipping duplicate foreclosure: {case_number}")
+                            changed = (
+                                (auction_date_val and existing_exact.auction_date is None)
+                                or (judgment_amount_val and existing_exact.judgment_amount is None)
+                                or (case_status_val and case_status_val != existing_exact.case_status)
+                                or (winning_bid_val and winning_bid_val != existing_exact.winning_bid)
+                                or (sold_to_val and sold_to_val != existing_exact.sold_to)
+                            )
+                            if skip_duplicates and not changed:
+                                logger.debug(f"Skipping unchanged foreclosure: {case_number}")
                                 skipped += 1
                                 continue
-                            # Update auction fields if not skipping
                             if auction_date_val and existing_exact.auction_date is None:
                                 existing_exact.auction_date = auction_date_val
                             if judgment_amount_val and existing_exact.judgment_amount is None:
                                 existing_exact.judgment_amount = judgment_amount_val
                             if case_status_val:
                                 existing_exact.case_status = case_status_val
+                            if winning_bid_val:
+                                existing_exact.winning_bid = winning_bid_val
+                            if sold_to_val:
+                                existing_exact.sold_to = sold_to_val
                             self.session.flush()
                             matched += 1
                             continue
@@ -203,6 +229,8 @@ class ForeclosureLoader(BaseLoader):
                                     existing_lp.auction_date = auction_date_val
                                     existing_lp.judgment_amount = judgment_amount_val
                                     existing_lp.case_status = case_status_val
+                                    existing_lp.winning_bid = winning_bid_val
+                                    existing_lp.sold_to = sold_to_val
                                     # Only set plaintiff if not already captured from LP record
                                     if plaintiff_val and existing_lp.plaintiff is None:
                                         existing_lp.plaintiff = plaintiff_val
@@ -229,6 +257,8 @@ class ForeclosureLoader(BaseLoader):
                             judgment_amount=judgment_amount_val,
                             auction_date=auction_date_val,
                             case_status=case_status_val,
+                            winning_bid=winning_bid_val,
+                            sold_to=sold_to_val,
                             match_confidence=round(match_score / 100.0, 3),
                             match_method=match_method,
                             county_id=self.county_id,

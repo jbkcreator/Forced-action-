@@ -29,7 +29,8 @@ python -m src.scrappers.foreclosures.foreclosure_engine
 python -m src.services.cds_engine --rescore-all
 
 # DB migrations (scripts-only — Alembic retired, see docs/adr/0024)
-PYTHONPATH=. python scripts/apply_<name>.py     # apply one idempotent DDL script to the shared DB
+PYTHONPATH=. python migrations/apply_<name>.py  # NEW scripts go here; apply one idempotent DDL script to the shared DB
+PYTHONPATH=. python scripts/apply_<name>.py     # pre-existing scripts only — stay in scripts/, do not move
 
 # Tests
 pytest tests/                                  # default (excludes scenario)
@@ -53,6 +54,8 @@ Central `properties` table (~522k parcels). 1:Many → foreclosures, tax_delinqu
 - **Scrapers** (`src/scrappers/`): Playwright + playwright-stealth, AI fallback via browser-use + Anthropic Claude, Firecrawl for static. **Directory spelled `scrappers` (double p).** Proxy (Oxylabs) commented out from all scrapers **except** `foreclosures/`. Fire incidents: Tampa Fire Rescue JSON API (`ncapps.tampagov.net/callsforservice/TFR/GetTFRCallsForService`) — not HCSO portal. Storm/flood/fire use NWS forecast zones from `County.nws_zone` DB column (comma-separated for multi-zone counties, e.g. Hillsborough `FLZ151,FLZ251`). Both Hillsborough and Pinellas are in cron for all weather scrapers.
 
 - **Loaders** (`src/loaders/`): Inherit `BaseLoader` (`base.py`). Property matching waterfall: (1) exact parcel_id, (2) address: ILIKE house# prefix → pg_trgm similarity → rapidfuzz token_sort_ratio ≥75%, (3) owner name: exact ilike → LIKE pattern → pg_trgm ≥75%. Three-tier outcome: ≥0.92 → **matched**; 0.75–0.92 → **pending_review**; <0.75 → **unmatched**. Thresholds in `config/matching.py`. Pinellas stopgap: `review_min=0.65`.
+
+- **Connectors** (`src/connectors/`): Cora Data Engine outcome-mining pipeline. Reads already-ingested, already-matched tables (`foreclosures`, `tax_deed_auctions`, appraiser `financials`, etc.) and stages labeled events into `outcome_candidates` (`OutcomeCandidate` model) — the canonical shape a future label layer promotes into `DealOutcome` once `DealOutcome.subscriber_id` is nullable for pipeline-sourced outcomes. `registry.py` is static per-connector metadata (source_type, cadence, SLA); `runner.py` wraps a connector's run with `record_scraper_stats()` bookkeeping (no new scheduler — connectors are plain `scripts/cron/crontab.txt` entries like every other scraper); `resolve.py` (`resolve_or_quarantine`) is a thin wrapper over `BaseLoader.find_property_cascade`/`quarantine_unmatched` for the rare connector reading a genuinely new raw file (most connectors reuse the `property_id` already set at ingestion and never call this); `outcomes.py` defines `OutcomeCandidateData` + `upsert_outcome_candidate()`.
 
 - **CDS Engine** (`src/services/cds_engine.py`): 6 verticals × 14+ signals. Formula: primary_score + stacking_bonus (STACKING_WINDOW_DAYS=180, cap=60) + absentee/contact/equity bonuses. Stacking-only signals: `insurance_claim`, `fire`, `storm_damage`, `flood_damage`, `building_permits` non-enforcement. Dead lead gate: deed transfer <45 days → zero investment verticals. Tiers: Ultra Platinum(95+) → Platinum(83+) → Gold(57+) → Silver(40+) → Bronze.
 
@@ -80,7 +83,7 @@ Single `Dockerfile` at project root. `docker-compose.yml` runs `api` and `cora` 
 
 - **Language/runtime**: Python 3.11+.
 - **Web framework**: FastAPI (no Flask/Django).
-- **ORM**: SQLAlchemy 2.0 style. **Migrations**: scripts-only (Alembic retired — ADR 0024). A schema change = (1) update `src/core/models.py` (tests' `create_all` source of truth), (2) write an idempotent `scripts/apply_<name>.py` (`CREATE TABLE IF NOT EXISTS` / `ADD COLUMN IF NOT EXISTS`), (3) run it once against the shared DB. No new alembic revisions; git history + idempotency is the record. Legacy migrations archived under `legacy/alembic/`.
+- **ORM**: SQLAlchemy 2.0 style. **Migrations**: scripts-only (Alembic retired — ADR 0024). A schema change = (1) update `src/core/models.py` (tests' `create_all` source of truth), (2) write an idempotent `migrations/apply_<name>.py` (`CREATE TABLE IF NOT EXISTS` / `ADD COLUMN IF NOT EXISTS`), (3) run it once against the shared DB. **New migration scripts go in `migrations/`, not `scripts/`** — the ~200 pre-ADR-0024 scripts already in `scripts/apply_*.py` stay where they are; only new ones move. No new alembic revisions; git history + idempotency is the record. Legacy migrations archived under `legacy/alembic/`.
 - **Settings**: Pydantic v2 + pydantic-settings. Never read `os.environ` directly outside `config/settings.py`.
 - **HTTP**: `requests` for sync (`requests_get_with_retry` from `src/utils/http_helpers.py`), `httpx` if async. No `urllib`.
 - **Scraping**: Playwright + playwright-stealth. Browser-use + Anthropic for AI fallback. Firecrawl for static. No Selenium.
@@ -101,7 +104,7 @@ Single `Dockerfile` at project root. `docker-compose.yml` runs `api` and `cora` 
 - **`cds_engine.py` docstring is stale** — always trust `config/scoring.py`.
 - **Cron ordering (hard stagger):** scrapers 04:00–06:30 → CDS 07:00 → skip trace 07:30 → GHL sync 08:00.
 - **GHL sync_status:** `pending_sync` → `synced` / `sync_failed`. Never lost.
-- **Alembic is retired** (ADR 0024) — schema changes go through `scripts/apply_*.py` against the single shared DB, never new alembic revisions. Old migrations live in `legacy/alembic/`; the orphaned `alembic_version` table is left in place, harmless.
+- **Alembic is retired** (ADR 0024) — schema changes go through an idempotent apply script against the single shared DB, never new alembic revisions. **Write new apply scripts to `migrations/apply_*.py`** (pre-existing ones stay in `scripts/apply_*.py` — do not relocate them). Old migrations live in `legacy/alembic/`; the orphaned `alembic_version` table is left in place, harmless.
 - **Lead Pack MVP status**: Partially sellable. Missing: county launch gate at checkout, minimum 5-lead count enforcement, 80% enrichment threshold check, `SentLead` rows in webhook fulfillment. Zero test coverage for lead pack flow.
 - Required env: `DATABASE_URL`, `ANTHROPIC_API_KEY`, `REDIS_URL`. Feature-gated: Stripe, GHL, Synthflow, Telnyx, Oxylabs, LangSmith.
 
@@ -129,13 +132,13 @@ Single `Dockerfile` at project root. `docker-compose.yml` runs `api` and `cora` 
 - **Measure before optimising**, but design for efficiency from the start. If a function processes more than ~1k items, its time and space complexity must be considered, not assumed acceptable.
 
 ### Database and SQLAlchemy
-- All DB access must go through SQLAlchemy. Direct `psycopg2` calls or raw connection string queries are forbidden outside `scripts/apply_*.py` migration scripts.
+- All DB access must go through SQLAlchemy. Direct `psycopg2` calls or raw connection string queries are forbidden outside migration scripts (`migrations/apply_*.py` for new ones, `scripts/apply_*.py` for the pre-existing set).
 - **Use `sqlalchemy.text()` for all queries — do not use the SQLAlchemy ORM query API (`select(Model).where(...)`, `session.query(...)`) for data retrieval.** Write SQL directly via `session.execute(text("SELECT ..."), {"param": value})`. ORM is used only for `session.add()` / `session.delete()` on individual model instances and for Alembic schema definitions. Never concatenate user input into `text()` — always use named bind parameters.
 - Minimise round trips: fetch all required data in one query using joins or CTEs rather than issuing multiple sequential queries. Never query inside a loop.
 - Batch writes with `session.execute(insert(Model).values([...]))` when inserting more than ~10 rows. Commit once per batch, not once per row.
 - Filter, sort, and paginate in SQL — not in Python after fetching all rows.
 - Use `with_for_update(skip_locked=True)` for queue-style processing to avoid contention.
-- Index columns that appear in `WHERE`, `ORDER BY`, or `JOIN` clauses on hot paths. Add the index in the same `scripts/apply_*.py` that adds the column.
+- Index columns that appear in `WHERE`, `ORDER BY`, or `JOIN` clauses on hot paths. Add the index in the same `migrations/apply_*.py` that adds the column.
 
 ## Self-Maintenance
 
