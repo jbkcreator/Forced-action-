@@ -21,7 +21,7 @@ from typing import Optional
 
 from playwright.sync_api import Page, sync_playwright
 
-from src.utils.http_helpers import STEALTH_ARGS, STEALTH_UA
+from src.utils.http_helpers import STEALTH_ARGS, STEALTH_UA, get_playwright_proxy
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +63,7 @@ def post_answer_to_quora(
             user_agent=STEALTH_UA,
             locale="en-US",
             viewport={"width": 1440, "height": 900},
+            proxy=get_playwright_proxy(),
         )
         try:
             page = context.new_page()

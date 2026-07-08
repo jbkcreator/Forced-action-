@@ -33,7 +33,7 @@ from pathlib import Path
 from fastapi import WebSocket, WebSocketDisconnect
 from playwright.sync_api import sync_playwright
 
-from src.utils.http_helpers import STEALTH_ARGS, STEALTH_UA, get_stealth
+from src.utils.http_helpers import STEALTH_ARGS, STEALTH_UA, get_playwright_proxy, get_stealth
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +122,7 @@ def _playwright_thread(
                 user_agent=STEALTH_UA,
                 locale="en-US",
                 viewport={"width": _BROWSER_W, "height": _BROWSER_H},
+                proxy=get_playwright_proxy(),
             )
             page = context.new_page()
 
