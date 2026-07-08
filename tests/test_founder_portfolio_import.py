@@ -47,6 +47,32 @@ def test_parse_rows_validates_and_flags_bad_rows():
     assert len(errors) == 3           # empty, bad amount, bad vertical
 
 
+def test_lost_deal_gets_skip_bucket():
+    """A lost deal is the 'skip' loss sentinel, not a dollar bucket — so
+    pipeline_stage and deal_size_bucket never contradict each other."""
+    csv_text = (
+        "parcel_id,address,city,zip,deal_date,profit_amount,outcome,vertical,days_to_close,notes\n"
+        ",1 Loss St,Tampa,33607,2024-03-14,0,lost,fix_flip,,walked away\n"
+    )
+    ok, errors = fpi.parse_rows(csv_text)
+    assert not errors
+    assert len(ok) == 1
+    assert ok[0]["pipeline_stage"] == "closed_lost"
+    assert ok[0]["deal_size_bucket"] == "skip"
+
+
+def test_bad_days_to_close_is_a_hard_error():
+    """A present-but-invalid days_to_close errors the row (not silently None)."""
+    csv_text = (
+        "parcel_id,address,city,zip,deal_date,profit_amount,outcome,vertical,days_to_close,notes\n"
+        ",2 Main St,Tampa,33607,2024-03-14,18500,won,fix_flip,soon,\n"
+    )
+    ok, errors = fpi.parse_rows(csv_text)
+    assert not ok
+    assert len(errors) == 1
+    assert "days_to_close" in errors[0]["reason"]
+
+
 def test_import_portfolio_matches_upserts_and_reports(fresh_db):
     """Matched row imports as founder_verified w/ property_id; unmatched reported;
     re-run is idempotent (update, not duplicate)."""

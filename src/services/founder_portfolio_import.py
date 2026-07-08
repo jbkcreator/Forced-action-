@@ -76,9 +76,10 @@ def parse_rows(csv_text: str) -> tuple[list[dict], list[dict]]:
             continue
         try:
             amount = float(row["profit_amount"])
-            if amount != amount:  # NaN
-                raise ValueError("profit_amount is NaN")
         except (ValueError, TypeError):
+            errors.append({"row": i, "reason": f"bad profit_amount {row['profit_amount']!r}"})
+            continue
+        if amount != amount:  # NaN
             errors.append({"row": i, "reason": f"bad profit_amount {row['profit_amount']!r}"})
             continue
         try:
@@ -93,10 +94,20 @@ def parse_rows(csv_text: str) -> tuple[list[dict], list[dict]]:
         if not row["deal_date"]:
             errors.append({"row": i, "reason": "missing deal_date"})
             continue
-        try:
-            days_to_close = int(row["days_to_close"]) if row["days_to_close"] else None
-        except ValueError:
-            days_to_close = None
+        # days_to_close is optional, but a present-yet-invalid value is a hard
+        # error (same treatment as the other fields), not silently dropped.
+        days_to_close = None
+        if row["days_to_close"]:
+            try:
+                days_to_close = int(row["days_to_close"])
+            except ValueError:
+                errors.append({"row": i, "reason": f"bad days_to_close {row['days_to_close']!r}"})
+                continue
+        # A lost deal is the loss sentinel bucket 'skip' regardless of amount —
+        # win_graphic / win_autopsy key on deal_size_bucket == 'skip' to mean
+        # "not a win", so a dollar bucket on a closed_lost row would contradict
+        # pipeline_stage.
+        bucket = "skip" if stage == "closed_lost" else bucket_for_profit(amount)
         ok.append({
             "parcel_id":       row["parcel_id"] or None,
             "address":         row["address"] or None,
@@ -104,7 +115,7 @@ def parse_rows(csv_text: str) -> tuple[list[dict], list[dict]]:
             "zip":             row["zip"] or None,
             "deal_date":       row["deal_date"],
             "deal_amount":     amount,
-            "deal_size_bucket": bucket_for_profit(amount),
+            "deal_size_bucket": bucket,
             "pipeline_stage":  stage,
             "vertical":        vertical,
             "days_to_close":   days_to_close,
@@ -151,15 +162,17 @@ def _matcher(session, county: str):
     return _MATCH_LOADER_CLS(session, county)
 
 
-def resolve_property_id(session, row: dict) -> tuple[Optional[int], Optional[int]]:
+def resolve_property_id(session, row: dict) -> tuple[Optional[int], Optional[int], Optional[str]]:
     """Resolve a founder row to a parcel via the loaders' cascade.
 
-    Returns (property_id, confidence). property_id is None unless a match meets
-    MIN_MATCH_CONFIDENCE (parcel-id exact = 100). confidence is the best score
-    seen (for reporting) even when below threshold.
+    Returns (property_id, confidence, county_id). property_id is None unless a
+    match meets MIN_MATCH_CONFIDENCE (parcel-id exact = 100). confidence is the
+    best score seen (for reporting) even when below threshold. county_id comes
+    from the matched Property, so the caller need not re-query it.
     """
     best_id: Optional[int] = None
     best_conf: int = -1
+    best_county: Optional[str] = None
     for county in _candidate_counties(session, row.get("zip")):
         loader = _matcher(session, county)
         prop, _method, conf = loader.find_property_cascade(
@@ -169,11 +182,11 @@ def resolve_property_id(session, row: dict) -> tuple[Optional[int], Optional[int
             city=row.get("city"),
         )
         if prop and conf is not None and conf > best_conf:
-            best_id, best_conf = prop.id, conf
+            best_id, best_conf, best_county = prop.id, conf, prop.county_id
 
     if best_id is not None and best_conf >= MIN_MATCH_CONFIDENCE:
-        return best_id, best_conf
-    return None, (best_conf if best_id is not None else None)
+        return best_id, best_conf, best_county
+    return None, (best_conf if best_id is not None else None), None
 
 
 _UPSERT_SQL = _sa_text("""
@@ -183,7 +196,7 @@ INSERT INTO deal_outcomes
      confidence_tier, outcome_source, source_ref, created_at)
 VALUES
     (NULL, :pid, :bucket, :amount, CAST(:ddate AS date),
-     :days, :stage, (SELECT county_id FROM properties WHERE id = :pid), :vertical,
+     :days, :stage, :county, :vertical,
      'founder_verified', 'founder_import', :sref, NOW())
 ON CONFLICT (source_ref) WHERE source_ref IS NOT NULL DO UPDATE SET
     property_id      = EXCLUDED.property_id,
@@ -209,7 +222,7 @@ def import_portfolio(session, csv_text: str) -> dict:
     unmatched: list[dict] = []
 
     for r in ok:
-        pid, conf = resolve_property_id(session, r)
+        pid, conf, county = resolve_property_id(session, r)
         if pid is None:
             unmatched.append({
                 "identifier": r.get("parcel_id") or r.get("address"),
@@ -223,6 +236,7 @@ def import_portfolio(session, csv_text: str) -> dict:
             "ddate":   r["deal_date"],
             "days":    r["days_to_close"],
             "stage":   r["pipeline_stage"],
+            "county":  county,
             "vertical": r["vertical"],
             "sref":    r["source_ref"],
         }).scalar()
