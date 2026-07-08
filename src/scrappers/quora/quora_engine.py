@@ -20,7 +20,7 @@ from urllib.parse import quote
 
 from playwright.async_api import Page, async_playwright
 
-from src.utils.http_helpers import STEALTH_ARGS, STEALTH_UA, apply_stealth_to_page
+from src.utils.http_helpers import STEALTH_ARGS, STEALTH_UA, apply_stealth_to_page, get_playwright_proxy
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +141,7 @@ async def scrape_quora(
             user_agent=STEALTH_UA,
             locale="en-US",
             viewport={"width": 1440, "height": 900},
+            proxy=get_playwright_proxy(),
         )
         try:
             for query in queries:
