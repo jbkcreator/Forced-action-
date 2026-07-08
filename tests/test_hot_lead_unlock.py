@@ -162,6 +162,60 @@ class TestHotLeadUnlockFulfillment:
         ).scalars().all()
         assert len(rows) == 1
 
+    def test_repeat_payment_with_new_pi_still_records_revenue(self, fresh_db):
+        """A property already unlocked once (e.g. the cheap $2.50-$7
+        lead_unlock) and later unlocked again via a separate, distinctly
+        priced payment (e.g. the $150 hot lead unlock) must record BOTH
+        charges to the revenue ledger — sent_leads has a hard
+        UniqueConstraint(subscriber_id, property_id), so the second charge
+        must not be silently dropped just because it reuses the first
+        charge's SentLead row."""
+        from src.core.models import PlatformRevenueLedger
+
+        sub, prop, cust = _seed_unlockable_lead(fresh_db)
+        first_pi = f"pi_{uuid.uuid4().hex[:8]}"
+        second_pi = f"pi_{uuid.uuid4().hex[:8]}"
+
+        with _quiet_unlock_side_effects():
+            stripe_webhooks._on_lead_unlock_payment(
+                _hot_lead_pi(first_pi, cust, prop.id, amount=500), fresh_db,
+            )
+            stripe_webhooks._on_lead_unlock_payment(
+                _hot_lead_pi(second_pi, cust, prop.id, amount=15000), fresh_db,
+            )
+
+        # Only one SentLead row can exist (subscriber_id, property_id is
+        # unique) — but it must reflect the latest payment, not the first.
+        sent = fresh_db.execute(
+            select(SentLead).where(
+                SentLead.subscriber_id == sub.id,
+                SentLead.property_id == prop.id,
+            )
+        ).scalar_one()
+        assert sent.stripe_payment_intent_id == second_pi
+        assert sent.amount_cents == 15000
+
+        ledger_rows = fresh_db.execute(
+            select(PlatformRevenueLedger).where(
+                PlatformRevenueLedger.subscriber_id == sub.id,
+                PlatformRevenueLedger.property_id == prop.id,
+            )
+        ).scalars().all()
+        assert {r.amount_cents for r in ledger_rows} == {500, 15000}
+
+        # A retried webhook for the SAME payment_intent must not double-record.
+        with _quiet_unlock_side_effects():
+            stripe_webhooks._on_lead_unlock_payment(
+                _hot_lead_pi(second_pi, cust, prop.id, amount=15000), fresh_db,
+            )
+        ledger_rows_after_retry = fresh_db.execute(
+            select(PlatformRevenueLedger).where(
+                PlatformRevenueLedger.subscriber_id == sub.id,
+                PlatformRevenueLedger.property_id == prop.id,
+            )
+        ).scalars().all()
+        assert len(ledger_rows_after_retry) == 2
+
 
 # ── checkout.session.completed must ignore hot_lead_unlock sessions ─────────
 

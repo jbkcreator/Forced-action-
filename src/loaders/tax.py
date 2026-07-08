@@ -316,7 +316,10 @@ class TaxDelinquencyLoader(BaseLoader):
         # Tax Yr — not Total Due / Years Delinquent — so without this the whole
         # tax_delinquencies signal reads as empty downstream.
         if "total_amount_due" not in values:
-            derived_amount = values.get("account_balance_amount") or values.get("face_amount")
+            if "account_balance_amount" in values:
+                derived_amount = values["account_balance_amount"]
+            else:
+                derived_amount = values.get("face_amount")
             if derived_amount is not None:
                 values["total_amount_due"] = derived_amount
         if "years_delinquent" not in values:
