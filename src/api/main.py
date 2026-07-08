@@ -231,6 +231,67 @@ def health_check(db: Session = Depends(get_db)):
     return {"status": "ok"}
 
 
+_HEALTH_SEVERITY = {"ok": 0, "warning": 1, "degraded": 2, "critical": 3}
+
+
+def _escalate(current: str, candidate: str) -> str:
+    """Raise `current` to `candidate` only if candidate is strictly worse.
+
+    Keeps `overall` monotonically non-decreasing in severity regardless of
+    which order the individual checks run in — a later "warning" (e.g. a
+    scraper reporting no_data) must never downgrade an earlier "degraded"
+    (e.g. Stripe unreachable), and a later "degraded" must still override an
+    earlier "warning".
+    """
+    return candidate if _HEALTH_SEVERITY[candidate] > _HEALTH_SEVERITY[current] else current
+
+
+def _classify_scraper_issues(issue_rows) -> tuple[list, list]:
+    """Split scraper_run_stats rows that aren't a clean success into a real
+    "errors" bucket (actionable) vs a "data_unavailable" bucket (informational
+    only — a confirmed empty day, or a zero-row day with no crash reported).
+
+    error_type='no_data' is always data_unavailable regardless of how
+    run_success was flagged — a few call sites (e.g. the generic
+    ScraperNoDataError handler in scraper_db_helper.load_scraped_data_to_db)
+    defensively mark a confirmed-empty day as run_success=False, but the
+    explicit error_type still means "we checked, there was nothing" — not a
+    crash. Mirrors the identical `error_type != 'no_data'` idiom already used
+    by load_validator.py and subscriber_email.py.
+
+    error_type='export_unavailable' (evictions/probate: the Pinellas Excel
+    export AND the docket-detail fallback both failed) is treated as a real
+    error, not data_unavailable — since the detail-scrape fallback was added,
+    this can now only fire when the site was genuinely unreachable/broken
+    this run, not on an ordinary empty day.
+
+    Args:
+        issue_rows: iterable of objects with .source_type, .error_type,
+            .error_message, .run_date (a date), .run_success attributes.
+
+    Returns:
+        (real_errors, data_unavailable) — each a list of dicts.
+    """
+    real_errors, data_unavailable = [], []
+    for r in issue_rows:
+        entry = {"source": r.source_type, "date": r.run_date.isoformat()}
+        if r.error_type == "no_data":
+            data_unavailable.append({**entry, "reason": "no_data"})
+        elif not r.run_success:
+            real_errors.append({
+                **entry,
+                "error_type": r.error_type or "scraper_error",
+                "message": (r.error_message or "")[:200] or None,
+            })
+        else:
+            # run_success=True, zero rows, and not explicitly marked
+            # no_data (e.g. a scraper that doesn't yet distinguish "nothing
+            # to scan" from "scanned fine") — informational, not a confirmed
+            # crash.
+            data_unavailable.append({**entry, "reason": "zero_rows_unclassified"})
+    return real_errors, data_unavailable
+
+
 @app.get("/health/detailed", include_in_schema=False)
 def health_check_detailed(db: Session = Depends(get_db)):
     """
@@ -238,21 +299,36 @@ def health_check_detailed(db: Session = Depends(get_db)):
 
     Response shape:
       {
-        "status": "ok" | "degraded" | "critical",
+        "status": "ok" | "warning" | "degraded" | "critical",
         "checks": {
           "database":      {"status": "ok"|"error", "detail": ...},
           "stripe":        {"status": "ok"|"unconfigured"|"error", "detail": ...},
           "ghl":           {"status": "ok"|"unconfigured"|"error", "detail": ...},
           "smtp":          {"status": "ok"|"unconfigured"},
           "enrichment":    {"status": "ok"|"unconfigured"|"stale", "last_run": ..., "detail": ...},
-          "scrapers":      {"status": "ok"|"stale"|"failures", "last_run": ..., "failed": [...]},
+          "scrapers":      {"status": "ok"|"stale"|"errors"|"data_unavailable",
+                             "last_run": ..., "errors": [...], "data_unavailable": [...]},
           "scoring":       {"status": "ok"|"stale", "last_scored": ..., "scored_properties": ...},
           "config":        {"status": "ok"|"warnings", "missing_optional": [...]},
         },
         "checked_at": "<ISO timestamp>"
       }
 
-    HTTP 200 for ok/degraded (non-critical issues), 503 only for critical (DB down).
+    Overall status is one of four tiers, worst-wins across all checks:
+      "ok"       — everything nominal.
+      "warning"  — nothing is actually broken; some scraper(s) legitimately
+                   had no data to report (error_type='no_data') or produced
+                   zero rows without an explicit reason. Informational only —
+                   there is no action to take beyond awareness. Never
+                   escalates to "degraded".
+      "degraded" — a real, actionable problem: a scraper actually errored
+                   (run_success=False with an error_type other than
+                   'no_data'), a source has gone stale (no successful run
+                   within its SLA window), or another subsystem
+                   (Stripe/GHL/enrichment/scoring) is failing or unreachable.
+      "critical" — the database itself is unreachable.
+
+    HTTP 200 for ok/warning/degraded, 503 only for critical (DB down).
     """
     settings = get_settings()
     checks = {}
@@ -278,7 +354,7 @@ def health_check_detailed(db: Session = Depends(get_db)):
     # ── 2. Stripe API ──────────────────────────────────────────────────────
     if not settings.active_stripe_secret_key:
         checks["stripe"] = {"status": "unconfigured"}
-        overall = "degraded"
+        overall = _escalate(overall, "degraded")
     else:
         try:
             stripe.api_key = settings.active_stripe_secret_key.get_secret_value()
@@ -287,18 +363,18 @@ def health_check_detailed(db: Session = Depends(get_db)):
             checks["stripe"] = {"status": "ok"}
         except stripe.error.AuthenticationError:
             checks["stripe"] = {"status": "error", "detail": "invalid_api_key"}
-            overall = "degraded"
+            overall = _escalate(overall, "degraded")
         except stripe.error.StripeError:
             checks["stripe"] = {"status": "error", "detail": "stripe_api_error"}
-            overall = "degraded"
+            overall = _escalate(overall, "degraded")
         except Exception:
             checks["stripe"] = {"status": "error", "detail": "unreachable"}
-            overall = "degraded"
+            overall = _escalate(overall, "degraded")
 
     # ── 3. GoHighLevel API ─────────────────────────────────────────────────
     if not settings.ghl_api_key or not settings.ghl_location_id:
         checks["ghl"] = {"status": "unconfigured"}
-        overall = "degraded"
+        overall = _escalate(overall, "degraded")
     else:
         try:
             t0 = time.monotonic()
@@ -315,16 +391,16 @@ def health_check_detailed(db: Session = Depends(get_db)):
                 checks["ghl"] = {"status": "ok", "latency_ms": latency_ms}
             elif resp.status_code == 401:
                 checks["ghl"] = {"status": "error", "detail": "invalid_api_key"}
-                overall = "degraded"
+                overall = _escalate(overall, "degraded")
             else:
                 checks["ghl"] = {"status": "error", "detail": f"http_{resp.status_code}"}
-                overall = "degraded"
+                overall = _escalate(overall, "degraded")
         except _requests.exceptions.Timeout:
             checks["ghl"] = {"status": "error", "detail": "timeout"}
-            overall = "degraded"
+            overall = _escalate(overall, "degraded")
         except Exception:
             checks["ghl"] = {"status": "error", "detail": "unreachable"}
-            overall = "degraded"
+            overall = _escalate(overall, "degraded")
 
     # ── 4. SMTP / Email ────────────────────────────────────────────────────
     if settings.smtp_host and settings.smtp_user:
@@ -340,7 +416,7 @@ def health_check_detailed(db: Session = Depends(get_db)):
     # ── 5. Enrichment pipeline ─────────────────────────────────────────────
     if not settings.batch_skip_tracing_api_key:
         checks["enrichment"] = {"status": "unconfigured", "detail": "BATCH_SKIP_TRACING_API_KEY not set"}
-        overall = "degraded"
+        overall = _escalate(overall, "degraded")
     else:
         try:
             last_enriched = db.execute(
@@ -357,7 +433,7 @@ def health_check_detailed(db: Session = Depends(get_db)):
                 stale_threshold = 72 if _off_cycle else 26
                 status = "ok" if hours_ago < stale_threshold else "stale"
                 if status == "stale":
-                    overall = "degraded"
+                    overall = _escalate(overall, "degraded")
                 checks["enrichment"] = {
                     "status": status,
                     "last_run": last_enriched_utc.isoformat(),
@@ -366,7 +442,7 @@ def health_check_detailed(db: Session = Depends(get_db)):
                 }
         except Exception:
             checks["enrichment"] = {"status": "error"}
-            overall = "degraded"
+            overall = _escalate(overall, "degraded")
 
     # ── 6. Scraper pipeline ────────────────────────────────────────────────
     try:
@@ -377,14 +453,29 @@ def health_check_detailed(db: Session = Depends(get_db)):
             .where(ScraperRunStats.run_success == True)    # noqa: E712
         ).scalar()
 
-        failed_scrapers = db.execute(
-            select(ScraperRunStats.source_type, ScraperRunStats.error_message, ScraperRunStats.run_date)
+        # Every row in the last 2 days that isn't a clean "had data, ran
+        # fine" day — either it errored, or it produced zero rows.
+        # _classify_scraper_issues splits these into a real "errors" bucket
+        # (actionable — escalates overall to "degraded") vs a
+        # "data_unavailable" bucket (informational only — escalates overall
+        # to "warning" at most, never "degraded").
+        issue_rows = db.execute(
+            select(
+                ScraperRunStats.source_type, ScraperRunStats.error_type,
+                ScraperRunStats.error_message, ScraperRunStats.run_date,
+                ScraperRunStats.run_success,
+            )
             .where(
-                ScraperRunStats.run_success == False,      # noqa: E712
+                or_(
+                    ScraperRunStats.run_success == False,      # noqa: E712
+                    ScraperRunStats.total_scraped == 0,
+                ),
                 ScraperRunStats.run_date >= cutoff,
             )
             .order_by(ScraperRunStats.run_date.desc())
         ).all()
+
+        real_errors, data_unavailable = _classify_scraper_issues(issue_rows)
 
         if last_run_date is None:
             scraper_status = "ok"
@@ -396,45 +487,28 @@ def health_check_detailed(db: Session = Depends(get_db)):
             stale_days = 3 if _off_cycle else 1
             scraper_status = "ok" if days_ago <= stale_days else "stale"
             if scraper_status == "stale":
-                overall = "degraded"
+                overall = _escalate(overall, "degraded")
             scraper_detail = {
                 "last_run": last_run_date.isoformat(),
                 "days_ago": days_ago,
             }
 
-        if failed_scrapers:
-            scraper_status = "failures"
-            overall = "degraded"
-            scraper_detail["failed"] = [
-                {"source": r.source_type, "date": r.run_date.isoformat()}
-                for r in failed_scrapers
-            ]
+        if real_errors:
+            scraper_status = "errors"
+            overall = _escalate(overall, "degraded")
+            scraper_detail["errors"] = real_errors
 
-        # Zero-row check — scraper ran and succeeded but returned nothing (silent data gap)
-        zero_row_scrapers = db.execute(
-            select(ScraperRunStats.source_type, ScraperRunStats.run_date)
-            .where(
-                ScraperRunStats.run_success == True,       # noqa: E712
-                ScraperRunStats.total_scraped == 0,
-                ScraperRunStats.run_date >= cutoff,
-            )
-            .order_by(ScraperRunStats.run_date.desc())
-        ).all()
-
-        if zero_row_scrapers:
-            scraper_detail["zero_rows"] = [
-                {"source": r.source_type, "date": r.run_date.isoformat()}
-                for r in zero_row_scrapers
-            ]
+        if data_unavailable:
             if scraper_status == "ok":
-                scraper_status = "zero_rows"
-            overall = "degraded"
+                scraper_status = "data_unavailable"
+            overall = _escalate(overall, "warning")
+            scraper_detail["data_unavailable"] = data_unavailable
 
         checks["scrapers"] = {"status": scraper_status, **scraper_detail}
 
     except Exception:
         checks["scrapers"] = {"status": "error"}
-        overall = "degraded"
+        overall = _escalate(overall, "degraded")
 
     # ── 7. Scoring pipeline ────────────────────────────────────────────────
     try:
@@ -458,7 +532,7 @@ def health_check_detailed(db: Session = Depends(get_db)):
             stale_days = 3 if _off_cycle else 1
             scoring_status = "ok" if days_ago <= stale_days else "stale"
             if scoring_status == "stale":
-                overall = "degraded"
+                overall = _escalate(overall, "degraded")
             checks["scoring"] = {
                 "status": scoring_status,
                 "last_scored": last_scored_date.isoformat(),
@@ -467,7 +541,7 @@ def health_check_detailed(db: Session = Depends(get_db)):
             }
     except Exception:
         checks["scoring"] = {"status": "error"}
-        overall = "degraded"
+        overall = _escalate(overall, "degraded")
 
     # ── 8. Config completeness ─────────────────────────────────────────────
     missing_optional = []

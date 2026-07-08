@@ -262,15 +262,41 @@ def download_latest_probate_filing(
     if output_format == "excel":
         # Merged single-session: ONE captcha search exports the filing Excel AND
         # clicks each case for docket detail (written to <dir>/probate_*_detail.json).
-        from src.scrappers.court_docket.pinellas.civil_filing import scrape_pinellas_civil_with_detail
+        from src.scrappers.court_docket.pinellas.civil_filing import (
+            scrape_pinellas_civil_with_detail, reconstruct_filing_list_from_detail,
+        )
         kws = PINELLAS_CASE_TYPE_KEYWORDS.get("probate", ["estate", "guardianship"])
         logger.info("[probate] County '%s' — Pinellas courtrecords merged scrape+detail", county_id)
-        excel_path, _results = asyncio.run(scrape_pinellas_civil_with_detail(
+        excel_path, results = asyncio.run(scrape_pinellas_civil_with_detail(
             "probate", kws, source.get("url", ""),
             target_date=target_date, headful=headful, no_proxy=no_proxy,
             dest_dir=RAW_PROBATE_DIR,
         ))
-        return excel_path
+        if excel_path is not None:
+            return excel_path
+        # Excel export step failed (site timeout/layout hiccup) but the
+        # click-through docket-detail scrape may still have succeeded —
+        # reconstruct the same raw filing-list shape from it instead of
+        # losing the day's data. NOTE: only eviction's header shape was
+        # live-verified (2026-07-08); probate's single-party "IN RE: ESTATE
+        # OF..." style shares the same scrape_pinellas_civil_with_detail /
+        # normalize_style_col("probate") consumer but wasn't independently
+        # confirmed live — style_plaintiff is expected to carry the full
+        # "IN RE:..." string with style_defendant empty for this case type.
+        fallback_df = reconstruct_filing_list_from_detail(results)
+        if fallback_df.empty:
+            return None
+        RAW_PROBATE_DIR.mkdir(parents=True, exist_ok=True)
+        fallback_path = RAW_PROBATE_DIR / (
+            f"probate_reconstructed_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        )
+        fallback_df.to_excel(fallback_path, index=False)
+        logger.warning(
+            "[probate] Excel export unavailable — reconstructed %d case(s) "
+            "from docket-detail scrape instead: %s",
+            len(fallback_df), fallback_path.name,
+        )
+        return fallback_path
 
     if scrape_mode == "static_download":
         logger.info("[probate] Using static_download mode for '%s'", county_id)
@@ -444,6 +470,27 @@ def run_probate_pipeline(
             target_date=target_date, county_id=county_id,
             headful=headful, no_proxy=no_proxy,
         )
+        if file_path is None:
+            # Pinellas merged scrape+detail found no exportable filing list this
+            # run (Excel export button or post-export grid recheck timed out) —
+            # a real data-collection gap, not a confirmed zero-case day, so this
+            # stays a failure (retried by run.sh, alerted after 3 attempts) but
+            # with a clear, specific reason instead of a NoneType crash trying
+            # to read a file that was never produced.
+            logger.error(
+                "[probate] Pinellas civil filing export unavailable this run "
+                "(Excel export/grid did not load in time) — 0 cases collected"
+            )
+            try:
+                from src.utils.scraper_db_helper import record_scraper_stats
+                record_scraper_stats(
+                    source_type="probate", total_scraped=0, matched=0, unmatched=0, skipped=0,
+                    run_success=False, error_type="export_unavailable",
+                    duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id,
+                )
+            except Exception as _se:
+                logger.warning("[probate] Could not record scraper stats: %s", _se)
+            return False
         df = process_probate_data(file_path, county_id=county_id)
         output_path = save_processed_probate(df, county_id=county_id)
 

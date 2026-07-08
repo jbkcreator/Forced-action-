@@ -118,6 +118,37 @@ async def _scrape_entity_detail(
     return html, snap
 
 
+_SEARCH_NAME_TRUNCATE_SUFFIXES = ("/TTEE", "/TRUSTEE")
+
+
+def _clean_search_name(name: str) -> str:
+    """Strip role/address annotations that aren't part of the actual
+    Sunbiz-registered entity name, so the search term matches a real entity.
+
+    Property records often append a role or mailing annotation to the owner
+    name (e.g. "BKE REALTY INVESTMENTS LLC/TTEE", "WATERS XF LLC C/O ALTUS
+    GROUP") that isn't part of what's actually registered with Sunbiz —
+    searching the raw string returns no results and the search page hangs
+    waiting for a results table that will never populate, until timeout.
+    Only strips well-known, unambiguous suffixes; leaves genuinely ambiguous
+    internal "/" (e.g. ICON FL TAMPA INDUSTRIAL OWNER POOL 5 GA/FL LLC, where
+    "/" is part of the real name) untouched rather than guessing.
+    """
+    cleaned = name
+    upper = cleaned.upper()
+    for suffix in _SEARCH_NAME_TRUNCATE_SUFFIXES:
+        if upper.endswith(suffix):
+            cleaned = cleaned[: -len(suffix)].strip()
+            upper = cleaned.upper()
+            break
+
+    co_idx = upper.find(" C/O ")
+    if co_idx != -1:
+        cleaned = cleaned[:co_idx].strip()
+
+    return cleaned or name
+
+
 async def _run_playwright_batch(
     owners: list,
     dry_run: bool,
@@ -159,13 +190,16 @@ async def _run_playwright_batch(
                     stats["skipped"] += 1
                     continue
 
-                logger.info(f"[Sunbiz] [{idx}/{total}] Searching: {name}")
+                search_name = _clean_search_name(name)
+                if search_name != name:
+                    logger.debug("[Sunbiz] Cleaned search name: '%s' -> '%s'", name, search_name)
+                logger.info(f"[Sunbiz] [{idx}/{total}] Searching: {search_name}")
                 await asyncio.sleep(_DELAY_SECONDS)
 
                 html: Optional[str] = None
                 snap: Optional[SunbizSnapshot] = None
                 try:
-                    html, snap = await _scrape_entity_detail(page, name)
+                    html, snap = await _scrape_entity_detail(page, search_name)
                 except Exception as e:
                     logger.warning("[Sunbiz] Playwright failed for '%s': %s", name, e)
                     if not dry_run:
