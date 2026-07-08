@@ -2873,7 +2873,9 @@ class DealOutcome(Base):
     subscriber_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=True, index=True)
     property_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("properties.id"), index=True)
     # CDE-11 — trust in the outcome LABEL (distinct from A2 Lead Confidence).
-    confidence_tier: Mapped[str] = mapped_column(String(30), nullable=False, server_default=text("'subscriber_reported'"))
+    # Default is the LOWEST tier so an insert that forgets to set it is safe
+    # (never silently high-trust); every real writer sets it explicitly.
+    confidence_tier: Mapped[str] = mapped_column(String(30), nullable=False, server_default=text("'public_record_inferred'"))
     # Finer provenance: subscriber_tap / founder_import / <connector>. Free text.
     outcome_source: Mapped[Optional[str]] = mapped_column(String(50))
     deal_size_bucket: Mapped[Optional[str]] = mapped_column(String(20))  # 5_10k/10_25k/25k_plus/skip

@@ -213,17 +213,21 @@ def test_deal_submission(wl_client_id):
     }, headers={"Authorization": f"Bearer {token}"})
     assert res.status_code == 201
 
-    # Verify row in deal_outcomes
+    # Verify row in deal_outcomes — CDE-11: an ownerless partner deal must be
+    # tagged explicitly (subscriber_reported / white_label), NOT left to the DB
+    # default (which is now the lowest tier, public_record_inferred).
     with get_db_context() as db:
         row = db.execute(
             sa_text("""
-                SELECT 1 FROM deal_outcomes
+                SELECT confidence_tier, outcome_source FROM deal_outcomes
                  WHERE county_id = 'hillsborough' AND trade_vertical = 'roofing'
                    AND deal_size_bucket = '10_25k' AND subscriber_id IS NULL
                  ORDER BY created_at DESC LIMIT 1
             """),
-        ).fetchone()
+        ).mappings().fetchone()
         assert row is not None
+        assert row["confidence_tier"] == "subscriber_reported"
+        assert row["outcome_source"] == "white_label"
 
 
 # ---------------------------------------------------------------------------
