@@ -6868,6 +6868,11 @@ class ScoreFeedback(Base):
     predicted_tier: Mapped[str] = mapped_column(String, nullable=False)
     predicted_rate: Mapped[Optional[Decimal]] = mapped_column(Numeric(6, 4), nullable=True)
     realized_outcome: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    # B0-02 Outcome Sanity Filter: raw buyer-capacity reason on a shielded death
+    # (low_fico / no_capital). NULL for every normal row. The buyer_could_not_act
+    # tag is derived (this column IS NOT NULL); realized_outcome is left NULL so
+    # the row is excluded from all rate/training consumers.
+    buyer_could_not_act_reason: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     delta: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 4), nullable=True)
     scored_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("NOW()"),

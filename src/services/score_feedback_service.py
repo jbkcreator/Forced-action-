@@ -93,16 +93,62 @@ def outcome_from_call_result(call_outcome: str) -> Optional[str]:
     return CALL_OUTCOME_MAP.get(call_outcome)
 
 
+# B0-02 — Outcome Sanity Filter. A death caused by the buyer's inability to act
+# (no credit / no capital) must not teach the model that the lead is bad.
+# 'no_meaningful_conversation' is deliberately excluded — it is ambiguous
+# (buyer disengaged vs. lead genuinely bad) and stays a real 'dead' signal.
+BUYER_CAPACITY_REASONS = frozenset({"low_fico", "no_capital"})
+
+
+def normalize_reason(reason: Optional[str]) -> Optional[str]:
+    """Canonicalise a raw reason for the shield check: trim + lowercase.
+
+    So 'No_Capital', ' low_fico ', 'NO_CAPITAL' all match the canonical set —
+    a case/whitespace variant must never silently fail to shield. Returns None
+    for a blank/None reason.
+    """
+    if not reason:
+        return None
+    normalized = reason.strip().lower()
+    return normalized or None
+
+
+def classify_realized_outcome(
+    outcome: str, reason: Optional[str],
+) -> tuple[Optional[str], Optional[str]]:
+    """Decide what to persist for (outcome, reason).
+
+    Returns (realized_outcome, buyer_could_not_act_reason).
+
+    When a Buyer-Capacity Failure reason accompanies a non-positive outcome, the
+    realized outcome is nulled (the shield) and the normalised reason preserved
+    for autopsy. Otherwise the outcome is written unchanged and no reason is
+    stored. The reason is normalised (trim + lowercase) before matching so a
+    case/whitespace variant of a canonical reason still shields.
+    """
+    normalized = normalize_reason(reason)
+    if normalized in BUYER_CAPACITY_REASONS and outcome not in _POSITIVE_OUTCOMES:
+        return None, normalized
+    return outcome, None
+
+
 def post_outcome(
     session: Session,
     prospect_id: str,
     outcome: str,
+    reason: Optional[str] = None,
     closer_call_id: Optional[int] = None,
 ) -> Optional[dict]:
     """Write or update the score_feedback row for a prospect.
 
     Idempotent per prospect_id — re-posting with a new outcome updates in place.
     Returns None if the prospect does not exist (caller should return 404).
+
+    B0-02 Outcome Sanity Filter: a Buyer-Capacity Failure reason (low_fico /
+    no_capital) on a non-positive outcome shields the lead — realized_outcome is
+    left NULL (so it never reaches a rate/training consumer) and the raw reason
+    is preserved in buyer_could_not_act_reason. Re-posting flips this in either
+    direction (the reason column is set by plain assignment, not COALESCE).
     """
     if outcome not in _VALID_OUTCOMES:
         raise ValueError(f"outcome must be one of {sorted(_VALID_OUTCOMES)}")
@@ -116,38 +162,55 @@ def post_outcome(
 
     predicted_tier, predicted_rate = _fetch_predicted_tier(session, prospect_id)
 
-    realized_rate: float = 1.0 if outcome in _POSITIVE_OUTCOMES else 0.0
+    realized_outcome, reason_stored = classify_realized_outcome(outcome, reason)
+
+    # A reason was supplied but did not trigger the shield — make the gap visible
+    # rather than silently indistinguishable from "no reason given" (the feature
+    # exists to prevent quiet training-set corruption). Not an error: unknown
+    # reasons deliberately fall through to a normal write.
+    if reason and reason_stored is None:
+        logger.warning(
+            "[score_feedback] reason=%r did not match a buyer-capacity shield "
+            "(outcome=%s) — writing outcome unshielded",
+            reason, outcome,
+        )
+
     delta: Optional[float] = None
-    if predicted_rate is not None:
+    if realized_outcome is not None and predicted_rate is not None:
+        realized_rate = 1.0 if realized_outcome in _POSITIVE_OUTCOMES else 0.0
         delta = round(realized_rate - predicted_rate, 4)
 
     row = session.execute(sa_text("""
         INSERT INTO score_feedback
             (prospect_id, closer_call_id, predicted_tier, predicted_rate,
-             realized_outcome, delta, scored_at, resolved_at)
+             realized_outcome, buyer_could_not_act_reason, delta, scored_at, resolved_at)
         VALUES
             (CAST(:pid AS uuid), :ccid, :ptier, :prate,
-             :outcome, :delta, NOW(), NOW())
+             :outcome, :reason, :delta, NOW(), NOW())
         ON CONFLICT (prospect_id) DO UPDATE SET
-            closer_call_id   = COALESCE(EXCLUDED.closer_call_id, score_feedback.closer_call_id),
-            realized_outcome = EXCLUDED.realized_outcome,
-            delta            = EXCLUDED.delta,
-            resolved_at      = EXCLUDED.resolved_at
+            closer_call_id             = COALESCE(EXCLUDED.closer_call_id, score_feedback.closer_call_id),
+            realized_outcome           = EXCLUDED.realized_outcome,
+            buyer_could_not_act_reason = EXCLUDED.buyer_could_not_act_reason,
+            delta                      = EXCLUDED.delta,
+            resolved_at                = EXCLUDED.resolved_at
         RETURNING
             score_id, prospect_id, closer_call_id, predicted_tier,
-            predicted_rate, realized_outcome, delta, scored_at, resolved_at
+            predicted_rate, realized_outcome, buyer_could_not_act_reason,
+            delta, scored_at, resolved_at
     """), {
         "pid":     prospect_id,
         "ccid":    closer_call_id,
         "ptier":   predicted_tier,
         "prate":   float(predicted_rate) if predicted_rate is not None else None,
-        "outcome": outcome,
+        "outcome": realized_outcome,
+        "reason":  reason_stored,
         "delta":   float(delta) if delta is not None else None,
     }).mappings().first()
 
     logger.info(
-        "[score_feedback] posted outcome prospect_id=%s predicted=%s outcome=%s delta=%s",
-        prospect_id, predicted_tier, outcome, delta,
+        "[score_feedback] posted outcome prospect_id=%s predicted=%s outcome=%s "
+        "buyer_could_not_act_reason=%s delta=%s",
+        prospect_id, predicted_tier, realized_outcome, reason_stored, delta,
     )
     return dict(row) if row is not None else None
 
