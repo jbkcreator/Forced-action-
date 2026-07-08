@@ -649,4 +649,28 @@ COUNTY_ID=hillsborough
 # sitemap.xml. No-op if no data changed (hash-diffed). Retire hysteresis = 2 runs.
 30 9 * * 0 $PROJECT/scripts/cron/run.sh src.tasks.seo_compiler
 
+# ── CORA DATA ENGINE — OUTCOME CONNECTORS (PR #111) ─────────────────────────
+# Mines already-ingested, already-matched records for a labeled outcome event
+# and stages it as an OutcomeCandidate. See src/connectors/registry.py for
+# the source-of-truth cadence/SLA metadata these lines implement.
+#
+# foreclosure_outcomes — daily, after the foreclosure scraper (06:15
+# hillsborough / 06:20 pinellas). SLA 1500 min.
+45 6 * * * $PROJECT/scripts/cron/run.sh src.connectors.foreclosure_outcomes --county-id $COUNTY_ID
+46 6 * * * $PROJECT/scripts/cron/run.sh src.connectors.foreclosure_outcomes --county-id pinellas
+
+# appraiser_sale_outcomes — weekly, after the appraiser bulk refresh (07:45
+# hillsborough / 07:46 pinellas). SLA 10140 min (~7 days).
+0 8 * * 0 $PROJECT/scripts/cron/run.sh src.connectors.appraiser_sale_outcomes --county-id $COUNTY_ID
+1 8 * * 0 $PROJECT/scripts/cron/run.sh src.connectors.appraiser_sale_outcomes --county-id pinellas
+
+# tax_deed_outcomes is enabled=True in registry.py but INTENTIONALLY NOT
+# scheduled here yet: its documented cadence is "daily, after the tax-deed
+# scraper", but no tax-deed auction scraper cron entry exists anywhere in
+# this file (scripts/scrape_tax_deed_auctions.py exists as an untracked,
+# not-yet-cron-wired script as of 2026-07-08). Scheduling this connector
+# before that upstream job runs on a real cadence would stage outcomes
+# against stale/empty tax_deed_auctions data and report false "success".
+# Add this once the tax-deed scraper itself has a cron line above.
+
 # === END FORCED-ACTION-PLATFORM ===
