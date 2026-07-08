@@ -3212,6 +3212,9 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, request: Request, db: S
             currency=currency,
             metadata=lead_pack_metadata,
             description=f"Lead Pack — {payload.zip_code} / {payload.vertical}",
+            # Stripe emails an itemized receipt on success (belt-and-suspenders
+            # alongside the account "successful payments" email setting).
+            receipt_email=subscriber.email or None,
         )
     except stripe.StripeError as exc:
         logger.error("Stripe error creating lead pack PaymentIntent: %s", exc)
@@ -3476,6 +3479,7 @@ def hot_lead_unlock(payload: HotLeadUnlockRequest, db: Session = Depends(get_db)
             subscriber_stripe_customer_id=subscriber.stripe_customer_id,
             lead_id=payload.lead_id,
             reduced=payload.reduced,
+            customer_email=subscriber.email,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
