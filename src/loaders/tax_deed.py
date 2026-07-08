@@ -84,18 +84,32 @@ class TaxDeedAuctionLoader(BaseLoader):
                     {"cid": self.county_id, "dt": auction_date_val, "cn": case_number},
                 ).first()
                 if existing:
+                    # Only a genuinely new, non-null value counts as "changed" —
+                    # a re-scrape that comes back with a missing field (partial
+                    # page render, transient scrape gap, layout hiccup) must
+                    # never look like new information, let alone overwrite what's
+                    # already on record.
                     changed = (
-                        new_status != existing.status
-                        or new_sold_amount != existing.sold_amount
-                        or new_sold_to != existing.sold_to
-                        or new_opening_bid != existing.opening_bid
+                        (new_status is not None and new_status != existing.status)
+                        or (new_sold_amount is not None and new_sold_amount != existing.sold_amount)
+                        or (new_sold_to is not None and new_sold_to != existing.sold_to)
+                        or (new_opening_bid is not None and new_opening_bid != existing.opening_bid)
                     )
                     if changed:
                         self.session.execute(
                             sa_text(
                                 "UPDATE tax_deed_auctions SET "
-                                "status = :status, sold_amount = :sold_amount, sold_to = :sold_to, "
-                                "opening_bid = :opening_bid, "
+                                # COALESCE on every field: a NULL from this scrape
+                                # (transient gap, partial render) must never erase
+                                # a previously-captured real value — sold_amount/
+                                # sold_to are the PRIMARY signal the outcome
+                                # connector uses to detect a sale (see
+                                # src/connectors/tax_deed_outcomes.py), so losing
+                                # them here would silently corrupt that signal.
+                                "status = COALESCE(:status, status), "
+                                "sold_amount = COALESCE(:sold_amount, sold_amount), "
+                                "sold_to = COALESCE(:sold_to, sold_to), "
+                                "opening_bid = COALESCE(:opening_bid, opening_bid), "
                                 "certificate_number = COALESCE(:certificate_number, certificate_number), "
                                 "raw_fields = COALESCE(CAST(:raw_fields AS JSONB), raw_fields) "
                                 "WHERE id = :id"

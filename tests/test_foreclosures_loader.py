@@ -91,3 +91,24 @@ class TestForeclosureRescrapeUpdate:
         matched, unmatched, skipped = loader.load_from_dataframe(pd.DataFrame([row]))
         assert skipped == 1
         assert matched == 0
+
+    def test_skip_duplicates_false_always_updates_even_when_unchanged(self, fresh_db):
+        """skip_duplicates=False means the caller opted out of duplicate-
+        skipping entirely — every re-scrape of an existing case must reconcile
+        fields in place regardless of whether anything changed. Regression
+        test: skip_duplicates was silently ignored on the exact-match path,
+        making True and False behave identically."""
+        _mk_property(fresh_db, "FCL-TEST-003")
+        loader = ForeclosureLoader(fresh_db, county_id="hillsborough")
+
+        row = _row(**{"Case Number": "292026CA000003TEST03", "Parcel ID": "FCL-TEST-003",
+                       "Property Address": "FCL-TEST-003 TEST ST"})
+        loader.load_from_dataframe(pd.DataFrame([row]), skip_duplicates=False)
+
+        # Identical row re-loaded with skip_duplicates=False — must still be
+        # treated as an update (matched), never a skip.
+        matched, unmatched, skipped = loader.load_from_dataframe(
+            pd.DataFrame([row]), skip_duplicates=False,
+        )
+        assert skipped == 0
+        assert matched == 1

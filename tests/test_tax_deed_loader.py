@@ -83,6 +83,39 @@ class TestTaxDeedSkipToUpdate:
         assert updated.sold_to == "ABC INVESTMENTS LLC"
         assert updated.property_id == prop.id   # untouched by the update
 
+    def test_partial_rescrape_does_not_erase_existing_sold_fields(self, fresh_db):
+        """A later re-scrape that comes back with a missing sold_amount/sold_to
+        (transient scrape gap, partial page render) must not erase data already
+        captured from an earlier, successful scrape. Regression test for the
+        COALESCE fix on the re-scrape UPDATE path — status/sold_amount/sold_to/
+        opening_bid used to be overwritten unconditionally, including with NULL."""
+        _mk_property(fresh_db, "CDE09-TD-003")
+        loader = TaxDeedAuctionLoader(fresh_db, county_id="hillsborough")
+
+        row = _row(
+            parcel_id="CDE09-TD-003", case_number="TD-2026-TEST-003",
+            status="Sold Third Party", sold_amount="42000", sold_to="ABC INVESTMENTS LLC",
+        )
+        loader.load_from_dataframe(pd.DataFrame([row]))
+
+        # A later re-scrape reports a different status but blank sold_amount/
+        # sold_to (e.g. the detail page didn't render those fields this time).
+        stale_row = _row(
+            parcel_id="CDE09-TD-003", case_number="TD-2026-TEST-003",
+            status="Sold Third Party - Confirmed", sold_amount="", sold_to="",
+        )
+        loader.load_from_dataframe(pd.DataFrame([stale_row]))
+
+        updated = fresh_db.execute(
+            text(
+                "SELECT status, sold_amount, sold_to FROM tax_deed_auctions "
+                "WHERE county_id = 'hillsborough' AND case_number = 'TD-2026-TEST-003'"
+            )
+        ).first()
+        assert updated.status == "Sold Third Party - Confirmed"   # new info applied
+        assert float(updated.sold_amount) == 42000.0               # old value survives
+        assert updated.sold_to == "ABC INVESTMENTS LLC"
+
     def test_identical_rescrape_is_skipped_not_updated(self, fresh_db):
         _mk_property(fresh_db, "CDE09-TD-002")
         loader = TaxDeedAuctionLoader(fresh_db, county_id="hillsborough")

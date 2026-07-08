@@ -20,8 +20,10 @@ SOURCE_OFF_DAYS (that wiring happens at each connector's own go-live, not here
 — see sla_minutes/off_days below, which are the single source of truth wave-1
 copies from so the number never drifts between files).
 
-All entries are `enabled=False` today — none of the four connector modules
-exist yet. This registry only records what's coming and how it will be run.
+Wave-1 connectors (foreclosure_outcomes, tax_deed_outcomes,
+appraiser_sale_outcomes) are `enabled=True` — their modules are deployed and
+running. dor_sale_outcomes stays `enabled=False`: it depends on a DOR raw
+ingestion pipeline that doesn't exist yet.
 """
 from __future__ import annotations
 

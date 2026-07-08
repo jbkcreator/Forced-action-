@@ -167,12 +167,19 @@ class ForeclosureLoader(BaseLoader):
                         sold_to_val = str(sold_to_raw).strip() if pd.notna(sold_to_raw) else None
 
                         # ── Upsert logic ──────────────────────────────────────────
-                        # Case 1: exact case_number already exists → update outcome
-                        # fields in place if they changed (a case scraped while
-                        # "Waiting" and re-scraped once resolved is the normal
-                        # lifecycle here, not a true duplicate), else skip.
-                        # case_number carries its own unique constraint, so this
-                        # lookup always runs regardless of skip_duplicates.
+                        # Case 1: exact case_number already exists. case_number
+                        # carries its own unique constraint, so this lookup always
+                        # runs regardless of skip_duplicates. What happens next
+                        # DOES depend on skip_duplicates:
+                        #   True  (default; the only value any real caller passes
+                        #          today) — reconcile in place only if something
+                        #          actually changed (a case scraped while "Waiting"
+                        #          and re-scraped once resolved is the normal
+                        #          lifecycle here, not a true duplicate), else skip.
+                        #   False — caller has opted out of duplicate-skipping
+                        #          entirely, so always reconcile regardless of the
+                        #          changed check (this loader's original contract
+                        #          for that flag).
                         existing_exact = (
                             self.session.query(Foreclosure)
                             .filter_by(case_number=case_number, county_id=self.county_id)
@@ -186,7 +193,7 @@ class ForeclosureLoader(BaseLoader):
                                 or (winning_bid_val and winning_bid_val != existing_exact.winning_bid)
                                 or (sold_to_val and sold_to_val != existing_exact.sold_to)
                             )
-                            if not changed:
+                            if skip_duplicates and not changed:
                                 logger.debug(f"Skipping unchanged foreclosure: {case_number}")
                                 skipped += 1
                                 continue
