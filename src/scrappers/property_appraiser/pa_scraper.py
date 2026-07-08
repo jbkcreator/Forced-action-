@@ -114,7 +114,7 @@ class HCPAScraper:
             accept_downloads=True,
         )
         try:
-            get_stealth().apply_to_context(self._context)
+            get_stealth().apply_stealth_sync(self._context)
         except Exception:
             pass
 
@@ -366,12 +366,29 @@ class PCPAOScraper(HCPAScraper):
         try:
             detail_url = self._lookup_pcpao_detail_url(public_parcel)
             if detail_url:
-                page.goto(detail_url, wait_until="domcontentloaded", timeout=30000)
-                try:
-                    page.wait_for_load_state("networkidle", timeout=5000)
-                except PlaywrightTimeout:
-                    pass
-                self._wait_for_pcpao_detail(page, parcel_id, public_parcel)
+                # Live-verified 2026-07-08: this direct-navigation path
+                # occasionally (~7% under 5-way concurrent load) returns a
+                # truncated response with no <body> at all — a transient
+                # slow/incomplete server response, not a deterministic site
+                # behavior (isolated re-navigation to the same URL succeeds
+                # immediately). One retry of the navigation absorbs it.
+                for attempt in range(2):
+                    page.goto(detail_url, wait_until="domcontentloaded", timeout=30000)
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=5000)
+                    except PlaywrightTimeout:
+                        pass
+                    try:
+                        self._wait_for_pcpao_detail(page, parcel_id, public_parcel)
+                        break
+                    except PlaywrightTimeout:
+                        if attempt == 0:
+                            logger.debug(
+                                "PCPAO detail not ready on first load for %s — retrying navigation",
+                                parcel_id,
+                            )
+                            continue
+                        raise
                 page.wait_for_timeout(1000)
                 logger.debug("PCPAO detail page loaded via search API: %s", page.url)
                 return True

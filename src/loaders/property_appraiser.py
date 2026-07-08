@@ -274,7 +274,8 @@ class PropertyAppraiserLoader(BaseLoader):
             source_id = county_config.get("sources", {}).get("property_appraiser", {}).get("source_id")
             if not source_id:
                 return None
-            return ColumnMapper.get_or_create("property_appraiser", source_id, df)
+            mapper = ColumnMapper()
+            return mapper.get_or_create("property_appraiser", source_id, df)
         except Exception as e:
             logger.warning("Column mapping failed for county %s: %s", self.county_id, e)
             return None

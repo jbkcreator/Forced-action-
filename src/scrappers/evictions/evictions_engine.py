@@ -776,14 +776,35 @@ def download_latest_civil_filing(
     if output_format == "excel":
         # Merged single-session: ONE captcha search exports the filing Excel AND
         # clicks each case for docket detail (written to <dir>/eviction_*_detail.json).
-        from src.scrappers.court_docket.pinellas.civil_filing import scrape_pinellas_civil_with_detail
+        from src.scrappers.court_docket.pinellas.civil_filing import (
+            scrape_pinellas_civil_with_detail, reconstruct_filing_list_from_detail,
+        )
         logger.info("[evictions] County '%s' — Pinellas courtrecords merged scrape+detail", county_id)
-        excel_path, _results = asyncio.run(scrape_pinellas_civil_with_detail(
+        excel_path, results = asyncio.run(scrape_pinellas_civil_with_detail(
             "eviction", ["eviction"], source.get("url", ""),
             target_date=target_date, start_date=start_date, end_date=end_date,
             headful=headful, no_proxy=no_proxy, dest_dir=RAW_EVICTIONS_DIR,
         ))
-        return excel_path
+        if excel_path is not None:
+            return excel_path
+        # Excel export step failed (site timeout/layout hiccup) but the
+        # click-through docket-detail scrape may still have succeeded —
+        # reconstruct the same raw filing-list shape from it instead of
+        # losing the day's data. Live-verified 2026-07-08.
+        fallback_df = reconstruct_filing_list_from_detail(results)
+        if fallback_df.empty:
+            return None
+        RAW_EVICTIONS_DIR.mkdir(parents=True, exist_ok=True)
+        fallback_path = RAW_EVICTIONS_DIR / (
+            f"eviction_reconstructed_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        )
+        fallback_df.to_excel(fallback_path, index=False)
+        logger.warning(
+            "[evictions] Excel export unavailable — reconstructed %d case(s) "
+            "from docket-detail scrape instead: %s",
+            len(fallback_df), fallback_path.name,
+        )
+        return fallback_path
 
     if scrape_mode in ("playwright_only", "playwright_then_ai"):
         logger.info("[evictions] Using playwright mode for '%s'", county_id)
@@ -992,8 +1013,14 @@ def save_processed_evictions(df: pd.DataFrame, county_id: str = "hillsborough", 
 def run_eviction_pipeline(
     target_date: str = None, county_id: str = "hillsborough", headful: bool = False,
     start_date: str = None, end_date: str = None, no_proxy: bool = False,
-) -> bool:
-    """Full pipeline: download → load → filter → dedup → save. Returns True on success."""
+):
+    """Full pipeline: download → load → filter → dedup → save.
+
+    Returns True when new eviction records were written (caller should load
+    them), "no_data" when the run succeeded but genuinely found zero eviction
+    cases (not a failure — exit code should still be 0, but there is no CSV to
+    load), or False on an actual pipeline failure.
+    """
     t0 = time.monotonic()
     try:
         logger.info(OUTPUT_SEPARATOR)
@@ -1004,6 +1031,27 @@ def run_eviction_pipeline(
             target_date=target_date, county_id=county_id, headful=headful,
             start_date=start_date, end_date=end_date, no_proxy=no_proxy,
         )
+        if file_path is None:
+            # Pinellas merged scrape+detail found no exportable filing list this
+            # run (Excel export button or post-export grid recheck timed out) —
+            # a real data-collection gap, not a confirmed zero-case day, so this
+            # stays a failure (retried by run.sh, alerted after 3 attempts) but
+            # with a clear, specific reason instead of a NoneType crash trying
+            # to read a file that was never produced.
+            logger.error(
+                "[evictions] Pinellas civil filing export unavailable this run "
+                "(Excel export/grid did not load in time) — 0 cases collected"
+            )
+            try:
+                from src.utils.scraper_db_helper import record_scraper_stats
+                record_scraper_stats(
+                    source_type="evictions", total_scraped=0, matched=0, unmatched=0, skipped=0,
+                    run_success=False, error_type="export_unavailable",
+                    duration_seconds=round(time.monotonic() - t0, 2), county_id=county_id,
+                )
+            except Exception as _se:
+                logger.warning("[evictions] Could not record scraper stats: %s", _se)
+            return False
         civil_df = process_civil_data(file_path, county_id=county_id)
         evictions_df = filter_evictions(civil_df, county_id=county_id)
 
@@ -1018,7 +1066,7 @@ def run_eviction_pipeline(
                 )
             except Exception as _se:
                 logger.warning("[evictions] Could not record scraper stats: %s", _se)
-            return False
+            return "no_data"
 
         today = datetime.now().strftime(OUTPUT_DATE_FORMAT)
         output_path = save_processed_evictions(evictions_df, county_id, f"eviction_leads_{today}.csv")
@@ -1064,10 +1112,12 @@ if __name__ == "__main__":
     add_load_to_db_arg(parser)
     args = parser.parse_args()
 
-    success = run_eviction_pipeline(
+    result = run_eviction_pipeline(
         target_date=args.date, county_id=args.county_id, headful=args.headful,
         start_date=args.start_date, end_date=args.end_date, no_proxy=args.no_proxy,
     )
+    success = result is True          # new records were written — proceed to load
+    pipeline_ok = result is not False  # True or "no_data" both count as a clean run
 
     if success and args.load_to_db:
         try:
@@ -1084,8 +1134,10 @@ if __name__ == "__main__":
         except Exception as e:
             logger.error("[evictions] Failed to load data to database: %s", e)
             sys.exit(1)
-    elif args.load_to_db:
+    elif args.load_to_db and not pipeline_ok:
         logger.warning("[evictions] Skipping database load due to scraping failure")
+    elif args.load_to_db:
+        logger.info("[evictions] No new eviction cases today — nothing to load")
 
     # Stage 2 — apply docket detail scraped during the merged search (no re-search/captcha).
     if success and args.load_to_db and args.county_id == "pinellas" and not args.skip_docket:
@@ -1102,4 +1154,4 @@ if __name__ == "__main__":
         else:
             logger.warning("[evictions] no docket detail JSON found — skipping detail apply")
 
-    sys.exit(0 if success else 1)
+    sys.exit(0 if pipeline_ok else 1)

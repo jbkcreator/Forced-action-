@@ -634,3 +634,41 @@ def normalize_style_col(df: pd.DataFrame, record_type: str) -> pd.DataFrame:
     logger.info("[%s] Style normalizer: %d cases -> %d party rows",
                 record_type, len(df), len(result))
     return result
+
+
+def reconstruct_filing_list_from_detail(results: list[dict]) -> pd.DataFrame:
+    """
+    Rebuild the raw civil-filing-list shape (Case Type, Case #, Filed,
+    Style/Description, Status, Judicial Officer) directly from
+    scrape_pinellas_civil_with_detail's per-case detail results, for use when
+    the Excel export step itself failed but the click-through detail scrape
+    succeeded. Produces the SAME raw columns the real Excel export has, so
+    the result flows through normalize_style_col()/downstream filtering
+    exactly as if it came from the Excel export.
+
+    Field mapping verified against a real live eviction scrape (2026-07-08):
+    header carries case_type/date_filed/status/judicial_officer/
+    style_plaintiff/style_defendant for every case with status='ok'.
+    """
+    rows = []
+    for case in results:
+        if case.get("status") != "ok":
+            continue
+        header = case.get("header") or {}
+        plaintiff = (header.get("style_plaintiff") or "").strip()
+        defendant = (header.get("style_defendant") or "").strip()
+        if plaintiff and defendant:
+            style = f"{plaintiff}\nVs.\n{defendant}"
+        else:
+            style = plaintiff or defendant
+        if not style:
+            continue
+        rows.append({
+            "Case Type": header.get("case_type"),
+            "Case #": case.get("case_number"),
+            "Filed": header.get("date_filed"),
+            "Style/Description": style,
+            "Status": header.get("status"),
+            "Judicial Officer": header.get("judicial_officer"),
+        })
+    return pd.DataFrame(rows)
