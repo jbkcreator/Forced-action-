@@ -754,24 +754,20 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
     if is_new_subscriber:
         if subscriber.email:
             from src.services.email import send_welcome_email
-            # fa061 — emit a feed login password only if one wasn't already set
-            # (e.g. free signup that deferred its welcome email). If the subscriber
-            # already has a password, don't reset it — just send the welcome.
-            feed_password = None
+            from src.services import subscriber_auth
+            # Magic-link login — issue a fresh one-time link for the welcome
+            # email. No password is ever generated or emailed.
+            magic_url = None
             try:
-                if not subscriber.password_hash:
-                    from src.services import subscriber_auth
-                    feed_password = subscriber_auth.generate_random_password()
-                    subscriber.password_hash = subscriber_auth.hash_password(feed_password)
-                    subscriber.password_set_at = datetime.now(timezone.utc)
-                    db.flush()
+                raw = subscriber_auth.issue_magic_link(subscriber, db)
+                magic_url = subscriber_auth.magic_link_url(raw)
             except Exception:
-                feed_password = None
+                magic_url = None
                 logger.warning(
-                    "Feed password setup failed for subscriber %s — sending welcome without it",
+                    "Magic-link issuance failed for subscriber %s — sending welcome without it",
                     subscriber.id, exc_info=True,
                 )
-            send_welcome_email(subscriber, plaintext_password=feed_password)
+            send_welcome_email(subscriber, magic_link_url=magic_url)
 
         if subscriber.email and zip_codes:
             try:
@@ -2253,8 +2249,7 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
 
     # Welcome email — deferred from /api/free-signup with intent='unlock'.
     # Sent only on the first unlock so repeat unlocks don't spam the inbox.
-    # Mirrors the checkout handler: generate + email the plaintext password
-    # only if the subscriber doesn't already have one set.
+    # Mirrors the checkout handler: issue a fresh magic link, never a password.
     try:
         first_unlock = db.execute(
             select(func.count()).select_from(SentLead).where(
@@ -2265,20 +2260,17 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
         if first_unlock <= 1:
             from src.services.email import send_welcome_email
             from src.services import subscriber_auth as _sub_auth
-            feed_password = None
-            if not subscriber.password_hash:
-                try:
-                    feed_password = _sub_auth.generate_random_password()
-                    subscriber.password_hash = _sub_auth.hash_password(feed_password)
-                    subscriber.password_set_at = datetime.now(timezone.utc)
-                    db.flush()
-                except Exception:
-                    feed_password = None
-                    logger.warning(
-                        "lead_unlock: feed password setup failed for sub=%s",
-                        subscriber.id, exc_info=True,
-                    )
-            send_welcome_email(subscriber, plaintext_password=feed_password)
+            magic_url = None
+            try:
+                raw = _sub_auth.issue_magic_link(subscriber, db)
+                magic_url = _sub_auth.magic_link_url(raw)
+            except Exception:
+                magic_url = None
+                logger.warning(
+                    "lead_unlock: magic-link issuance failed for sub=%s",
+                    subscriber.id, exc_info=True,
+                )
+            send_welcome_email(subscriber, magic_link_url=magic_url)
     except Exception as exc:
         logger.warning("lead_unlock: welcome email failed sub=%s: %s",
                        subscriber.id, exc)

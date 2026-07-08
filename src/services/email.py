@@ -181,17 +181,18 @@ def send_alert(
     return sent
 
 
-def send_welcome_email(subscriber, plaintext_password: Optional[str] = None) -> None:
+def send_welcome_email(subscriber, magic_link_url: Optional[str] = None) -> None:
     """
     Send the dashboard-link welcome email for any new subscriber (free or paid).
 
     `subscriber` duck-typed: needs .email, .name, .tier, .vertical,
     .founding_member, .event_feed_uuid, .id.
 
-    When `plaintext_password` is provided (fa061), the email includes the
-    subscriber's generated feed password so they can log in at the feed link.
-    SECURITY NOTE: emailing a plaintext password is a deliberate product choice;
-    the hardening path is force-reset-on-first-login (not enabled in v1).
+    When `magic_link_url` is provided, the email includes a one-click,
+    single-use login link instead of a password — no credential is ever
+    generated or emailed. Callers build this URL via
+    `src.services.subscriber_auth.issue_magic_link` + the `/auth/verify?token=`
+    route.
 
     Non-blocking — caller must wrap in try/except if needed.
     """
@@ -221,20 +222,23 @@ def send_welcome_email(subscriber, plaintext_password: Optional[str] = None) -> 
         "\nAs a founding member your rate is locked for as long as you stay subscribed.\n"
         if founding else ""
     )
-    password_block_text = (
-        f"Your login password: {plaintext_password}\n"
-        f"You'll be asked for it the first time you open the feed below. "
-        f"You can change it anytime via 'Forgot password'.\n\n"
-        if plaintext_password else ""
+    # If a magic link is provided, it IS the login mechanism — the primary CTA
+    # must point at it (the plain feed_url requires a session that doesn't
+    # exist yet). Without one (should not happen for new subscribers), the CTA
+    # falls back to the bare feed link.
+    cta_url = magic_link_url or feed_url
+    magic_link_note_text = (
+        "This link expires shortly and can only be used once.\n\n"
+        if magic_link_url else ""
     )
     body_text = (
         f"Hi {name},\n\n"
         f"Welcome to Forced Action.\n"
         f"{founding_line}\n"
         f"Plan: {tier} — {vertical}\n\n"
-        f"{password_block_text}"
-        f"Your private Event Feed is live. Bookmark this link — it's yours alone:\n"
-        f"{feed_url}\n\n"
+        f"Click below to access your private Event Feed — it's yours alone:\n"
+        f"{cta_url}\n\n"
+        f"{magic_link_note_text}"
         f"New distressed property leads matching your territory and vertical will appear "
         f"here automatically as our scrapers run each day.\n\n"
         f"Questions? Reply to this email or reach us at support@forcedaction.io\n\n"
@@ -248,16 +252,10 @@ def send_welcome_email(subscriber, plaintext_password: Optional[str] = None) -> 
         "</p>"
         if founding else ""
     )
-    password_block_html = (
-        '<div style="margin:0 0 24px;padding:14px 18px;background:rgba(148,163,184,0.08);'
-        'border:1px solid rgba(148,163,184,0.2);border-radius:8px;">'
-        '<p style="margin:0 0 4px;font-size:13px;color:#94a3b8;">Your login password</p>'
-        f'<p style="margin:0;font-size:18px;font-weight:700;color:#ffffff;letter-spacing:1px;'
-        f'font-family:monospace;">{plaintext_password}</p>'
-        '<p style="margin:8px 0 0;font-size:12px;color:#64748b;">'
-        "You'll be asked for it when you open your feed. Change it anytime via &ldquo;Forgot password&rdquo;.</p>"
-        "</div>"
-        if plaintext_password else ""
+    magic_link_note_html = (
+        '<p style="margin:-16px 0 24px;font-size:12px;color:#64748b;">'
+        "This link expires shortly and can only be used once.</p>"
+        if magic_link_url else ""
     )
     body_html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -289,14 +287,13 @@ def send_welcome_email(subscriber, plaintext_password: Optional[str] = None) -> 
                 {tier} &middot; {vertical}
               </span>
             </p>
-            {password_block_html}
             <p style="margin:0 0 12px;font-size:14px;color:#94a3b8;">
               Your private feed link — bookmark it:
             </p>
-            <table cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
+            <table cellpadding="0" cellspacing="0" style="margin-bottom:8px;">
               <tr>
                 <td style="background:#fbbf24;border-radius:8px;">
-                  <a href="{feed_url}"
+                  <a href="{cta_url}"
                      style="display:inline-block;padding:14px 28px;color:#0f172a;font-size:15px;
                             font-weight:700;text-decoration:none;">
                     Open My Event Feed &rarr;
@@ -304,6 +301,7 @@ def send_welcome_email(subscriber, plaintext_password: Optional[str] = None) -> 
                 </td>
               </tr>
             </table>
+            {magic_link_note_html}
             <p style="margin:0;font-size:13px;color:#64748b;">
               Questions? Reply to this email or reach us at
               <a href="mailto:support@forcedaction.io" style="color:#fbbf24;text-decoration:none;">

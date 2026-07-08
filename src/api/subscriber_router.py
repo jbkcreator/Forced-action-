@@ -1,10 +1,15 @@
 """
-Subscriber feed auth API (fa061).
+Subscriber feed auth API (fa061 + magic-link).
 
 Endpoints (prefix /api/subscriber):
-  POST /login            — dual mode: {email,password} OR {feed_uuid,password} → JWT
-  POST /forgot-password  — {email} → emails a reset link (always 200, no enumeration)
-  POST /reset-password   — {token,new_password} → sets a new password
+  POST /login                 — dual mode: {email,password} OR {feed_uuid,password} → JWT
+                                 (dormant fallback — kept for subscribers who already
+                                 have a password; no new password is ever issued)
+  POST /forgot-password       — {email} → emails a reset link (always 200, no enumeration)
+  POST /reset-password        — {token,new_password} → sets a new password
+  POST /magic-link/request    — {email} → emails a one-time login link (always
+                                 200, no enumeration)
+  POST /magic-link/verify     — {token} → JWT (same shape as /login)
 
 The returned JWT gates GET /api/feed/{uuid} (+ /stats) via
 subscriber_auth.get_current_subscriber.
@@ -18,7 +23,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, model_validator
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from src.api.deps import get_db
 from src.core.models import Subscriber
@@ -51,6 +56,14 @@ class ForgotPasswordRequest(BaseModel):
 class ResetPasswordRequest(BaseModel):
     token: str
     new_password: str = Field(min_length=8)
+
+
+class MagicLinkRequest(BaseModel):
+    email: str
+
+
+class MagicLinkVerifyRequest(BaseModel):
+    token: str
 
 
 # ── endpoints ──────────────────────────────────────────────────────────────
@@ -124,3 +137,58 @@ def reset_password(body: ResetPasswordRequest, request: Request, db=Depends(get_
 
     logger.info("[subscriber-auth] password reset for sub=%s", sub.id)
     return {"ok": True}
+
+
+@router.post("/magic-link/request")
+def request_magic_link(body: MagicLinkRequest, request: Request, db=Depends(get_db)):
+    enforce_or_429(request, scope="subscriber_magic_request", limit=5, window_seconds=300)
+
+    sub = db.execute(
+        select(Subscriber).where(Subscriber.email == body.email.strip().lower())
+    ).scalar_one_or_none()
+
+    # Always 200 — no account enumeration.
+    if sub is not None and sub.email:
+        try:
+            raw = auth.issue_magic_link(sub, db)
+            auth.send_magic_link_email(sub.email, sub.name, raw)
+        except Exception:
+            logger.warning("[subscriber-auth] magic-link email send failed for sub=%s", sub.id, exc_info=True)
+
+    return {"ok": True}
+
+
+@router.post("/magic-link/verify")
+def verify_magic_link(body: MagicLinkVerifyRequest, request: Request, db=Depends(get_db)):
+    enforce_or_429(request, scope="subscriber_magic_verify", limit=10, window_seconds=300)
+
+    hashed = auth.hash_magic_link_token(body.token)
+    now = datetime.now(timezone.utc)
+
+    # Atomic conditional UPDATE (not select-then-write) — closes a TOCTOU
+    # window where two concurrent requests with the same raw token could
+    # both pass a Python-side validity check before either write lands,
+    # letting a single-use link redeem twice. The WHERE clause is checked
+    # and applied by Postgres in one statement, so only one concurrent
+    # caller can ever match the row.
+    row = db.execute(
+        text(
+            """
+            UPDATE subscribers
+            SET magic_link_used_at = :now, magic_link_hash = NULL
+            WHERE magic_link_hash = :hashed
+              AND magic_link_used_at IS NULL
+              AND magic_link_expires_at > :now
+            RETURNING id, event_feed_uuid
+            """
+        ),
+        {"hashed": hashed, "now": now},
+    ).first()
+    db.flush()
+
+    if row is None:
+        raise HTTPException(status_code=400, detail="Invalid or expired link")
+
+    logger.info("[subscriber-auth] magic-link verified for sub=%s", row.id)
+    token = auth.create_access_token(row.id, row.event_feed_uuid)
+    return {"access_token": token, "token_type": "bearer", "feed_uuid": row.event_feed_uuid}
