@@ -305,6 +305,7 @@ def create_hot_lead_unlock_link(
     subscriber_stripe_customer_id: str,
     lead_id: str,
     reduced: bool = False,
+    customer_email: Optional[str] = None,
 ) -> dict:
     """
     Dynamic one-time Stripe payment link for hot lead unlock.
@@ -351,6 +352,8 @@ def create_hot_lead_unlock_link(
                     "property_id": lead_id,
                     "reduced_rate": str(reduced),
                 },
+                # Stripe emails an itemized receipt on success.
+                **({"receipt_email": customer_email} if customer_email else {}),
             },
         )
     except stripe.error.InvalidRequestError as exc:
