@@ -73,7 +73,25 @@ UGC_TO_ZIPS: dict[str, list[str]] = {
     "FLC101": SAME_TO_ZIPS["012101"],   # Pasco
     "FLC105": SAME_TO_ZIPS["012105"],   # Polk
     "FLC081": SAME_TO_ZIPS["012081"],   # Manatee
+    # Forecast-zone (Z-type) codes for the active counties — these are what
+    # zone-scoped alert fetches (County.nws_zone) return in geocode.UGC.
+    "FLZ151": SAME_TO_ZIPS["012057"],   # Hillsborough (coastal)
+    "FLZ251": SAME_TO_ZIPS["012057"],   # Hillsborough (inland)
+    "FLZ050": SAME_TO_ZIPS["012103"],   # Pinellas
 }
+
+
+def fips_to_zips(fips: str) -> list[str]:
+    """ZIP list for a 5-digit state+county FIPS ('12057'). Empty if unknown."""
+    if not fips:
+        return []
+    return SAME_TO_ZIPS.get("0" + fips.zfill(5), [])
+
+
+def alert_to_zips(alert_properties: dict) -> list[str]:
+    """Resolve a NWS CAP alert's geocode (SAME + UGC) to a deduped ZIP list."""
+    geocode = alert_properties.get("geocode") or {}
+    return expand_codes(geocode.get("SAME") or [], geocode.get("UGC") or [])
 
 
 def expand_codes(same_codes: list[str], ugc_codes: list[str]) -> list[str]:

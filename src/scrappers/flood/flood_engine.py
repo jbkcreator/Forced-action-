@@ -20,6 +20,7 @@ import requests
 
 from src.core.database import get_db_context
 from src.core.models import Property, Incident
+from src.services.nws_same_to_zip import alert_to_zips, fips_to_zips
 from src.utils.county_config import get_county
 from sqlalchemy import select, and_
 
@@ -67,12 +68,14 @@ def _fetch_nfip_claims(state: str, county_fips: str, start_date: date) -> List[s
     NFIP claims data is historical (paid claims, often months behind real-time).
     Useful for catching flood events that didn't trigger an active NWS alert
     or a federal disaster declaration but still produced insurable damage.
+
+    county_fips must be the FULL 5-digit state+county FIPS ('12057') — the
+    NFIP countyCode field is 5-digit; the 3-digit form matches nothing.
     """
-    county_fips_padded = county_fips.zfill(3)
     url = (
         f"{_FEMA_NFIP_CLAIMS_URL}"
         f"?$filter=state eq '{state}'"
-        f" and countyCode eq '{county_fips_padded}'"
+        f" and countyCode eq '{county_fips.zfill(5)}'"
         f" and dateOfLoss ge '{start_date.isoformat()}'"
         f"&$select=reportedZipCode,dateOfLoss"
         f"&$top=1000&$format=json"
@@ -92,7 +95,6 @@ def _fetch_nfip_claims(state: str, county_fips: str, start_date: date) -> List[s
 
 def _fetch_nws_flood_alerts_by_zones(zone_ids: List[str]) -> List[str]:
     """Fetch active NWS flood alerts for specific zone IDs and return affected ZIP codes."""
-    import re
     affected_zips = set()
     for zone_id in zone_ids:
         try:
@@ -107,9 +109,7 @@ def _fetch_nws_flood_alerts_by_zones(zone_ids: List[str]) -> List[str]:
                 event = props.get("event", "")
                 if not any(e in event for e in FLOOD_NWS_EVENTS):
                     continue
-                description = props.get("description", "") or ""
-                zips = re.findall(r"\b(3[3-4]\d{3})\b", description)
-                affected_zips.update(zips)
+                affected_zips.update(alert_to_zips(props))
         except Exception as e:
             logger.warning("[flood] NWS zone fetch failed for %s: %s", zone_id, e)
     return list(affected_zips)
@@ -117,7 +117,6 @@ def _fetch_nws_flood_alerts_by_zones(zone_ids: List[str]) -> List[str]:
 
 def _fetch_nws_flood_alerts(state: str) -> List[str]:
     """Fetch active NWS flood alerts for a state (fallback when no zone IDs configured)."""
-    import re
     affected_zips = set()
     try:
         resp = requests.get(
@@ -132,9 +131,7 @@ def _fetch_nws_flood_alerts(state: str) -> List[str]:
             event = props.get("event", "")
             if not any(e in event for e in FLOOD_NWS_EVENTS):
                 continue
-            description = props.get("description", "") or ""
-            zips = re.findall(r"\b(3[3-4]\d{3})\b", description)
-            affected_zips.update(zips)
+            affected_zips.update(alert_to_zips(props))
     except Exception as e:
         logger.warning("[flood] NWS alerts fetch failed: %s", e, exc_info=True)
     return list(affected_zips)
@@ -158,8 +155,10 @@ def scrape_flood_damage(
     config = get_county(county_id)
     fips = config.get("fips", "")
     state = config.get("state", "FL")
-    zip_prefixes = config.get("zip_prefixes", [])
     nws_zones = config.get("nws_zones", [])
+    # County ZIP set from the SAME/UGC crosswalk — county_config's zip_prefixes
+    # is hardcoded empty, so it must not be used for scoping.
+    county_zip_set = set(fips_to_zips(fips))
 
     if date_range is None:
         end_date = date.today()
@@ -186,22 +185,32 @@ def scrape_flood_damage(
         county_zips = set(nws_zips)  # zone fetch is already county-scoped
     else:
         nws_zips = _fetch_nws_flood_alerts(state)
-        county_zips = {z for z in nws_zips if any(z.startswith(p) for p in zip_prefixes)}
+        county_zips = {z for z in nws_zips if z in county_zip_set}
 
-    # Source 3: FEMA NFIP paid claims (historical flood damage in window)
-    nfip_zips = _fetch_nfip_claims(state, county_fips, start_date)
-    nfip_county_zips = {z for z in nfip_zips if any(z.startswith(p) for p in zip_prefixes)}
+    # Source 3: FEMA NFIP paid claims (historical flood damage in window).
+    # Uses the full 5-digit FIPS — NFIP countyCode is state+county.
+    nfip_zips = _fetch_nfip_claims(state, fips, start_date)
+    nfip_county_zips = {z for z in nfip_zips if z in county_zip_set}
     county_zips.update(nfip_county_zips)
     logger.info("[flood] %s: NFIP claim ZIPs in county=%d (total scraped=%d)",
                 county_id, len(nfip_county_zips), len(nfip_zips))
 
     county_zips = list(county_zips)
 
-    if not has_fema_flood and not county_zips:
+    # A FEMA declaration alone no longer blankets the county (2026-03-18 created
+    # 523k incidents that had to be purged). Declarations are county-level with
+    # no ZIP resolution — incidents require ZIP evidence from NWS or NFIP.
+    if has_fema_flood and not county_zips:
+        logger.warning(
+            "[flood] %s: FEMA declaration active but no ZIP-level evidence "
+            "(NWS/NFIP) — skipping incident creation", county_id,
+        )
+
+    if not county_zips:
         logger.info("[flood] %s: no active flood events — 0 incidents", county_id)
         try:
             from src.utils.scraper_db_helper import record_scraper_stats
-            record_scraper_stats(source_type='flood_damage', total_scraped=0, matched=0, unmatched=0, skipped=0)
+            record_scraper_stats(source_type='flood_damage', total_scraped=0, matched=0, unmatched=0, skipped=0, county_id=county_id)
         except Exception:
             pass
         return 0
@@ -211,19 +220,14 @@ def scrape_flood_damage(
     flood_date = date.today()
 
     with get_db_context() as db:
-        if has_fema_flood:
-            properties = db.execute(
-                select(Property).where(Property.county_id == county_id)
-            ).scalars().all()
-        else:
-            properties = db.execute(
-                select(Property).where(
-                    and_(
-                        Property.county_id == county_id,
-                        Property.zip.in_(county_zips),
-                    )
+        properties = db.execute(
+            select(Property).where(
+                and_(
+                    Property.county_id == county_id,
+                    Property.zip.in_(county_zips),
                 )
-            ).scalars().all()
+            )
+        ).scalars().all()
 
         for prop in properties:
             existing = db.execute(
@@ -252,9 +256,8 @@ def scrape_flood_damage(
         db.commit()
 
     logger.info(
-        "[flood] %s: created=%d duplicate=%d strategy=%s",
-        county_id, created, skipped_duplicate,
-        "fema_county_wide" if has_fema_flood else f"nws_zips({len(county_zips)})",
+        "[flood] %s: created=%d duplicate=%d zips=%d fema_declaration=%s",
+        county_id, created, skipped_duplicate, len(county_zips), has_fema_flood,
     )
     try:
         from src.utils.scraper_db_helper import record_scraper_stats
@@ -264,6 +267,7 @@ def scrape_flood_damage(
             matched=created,
             unmatched=0,
             skipped=skipped_duplicate,
+            county_id=county_id,
         )
     except Exception as stats_err:
         logger.warning("⚠ Could not record scraper stats (non-critical): %s", stats_err)

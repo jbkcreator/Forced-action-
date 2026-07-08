@@ -20,6 +20,7 @@ import requests
 
 from src.core.database import get_db_context
 from src.core.models import Property, Incident
+from src.services.nws_same_to_zip import alert_to_zips
 from src.utils.county_config import get_county
 from sqlalchemy import select, and_
 
@@ -81,18 +82,16 @@ def _fetch_nws_alerts(state: str = "FL") -> List[Dict]:
 
 
 def _extract_affected_zips(alert: Dict) -> List[str]:
-    """Extract ZIP codes from NWS alert geometry or affected zones description."""
-    zips = []
+    """Extract ZIP codes from a NWS alert via the SAME/UGC → ZIP crosswalk."""
     props = alert.get("properties", {})
+    zips = set(alert_to_zips(props))
 
-    # Try geocode/UGC zones — NWS provides FIPS-level county codes
-    # Try to parse ZIPs from the description text
+    # Fallback: explicit ZIPs in the description text (rare, but free to keep)
     description = props.get("description", "") or ""
     import re
-    found_zips = re.findall(r"\b(3[3-4]\d{3})\b", description)  # FL ZIPs 33xxx-34xxx
-    zips.extend(found_zips)
+    zips.update(re.findall(r"\b(3[3-4]\d{3})\b", description))  # FL ZIPs 33xxx-34xxx
 
-    return list(set(zips))
+    return list(zips)
 
 
 def scrape_storm_damage(
