@@ -29,7 +29,10 @@ logger = logging.getLogger(__name__)
 _NWS_ALERTS_URL = "https://api.weather.gov/alerts/active"
 _NWS_ZONE_URL = "https://api.weather.gov/alerts/active/zone/{zone_id}"
 
-# NWS event types that indicate storm/wind/hail damage relevant to roofing
+# NWS event types that indicate storm/wind/hail damage relevant to roofing.
+# Every entry must pass process_alert's _is_qualifying() gate against the
+# default nws_relevant_events config — enforced by
+# tests/test_weather_zip_mapping.py::test_engine_events_pass_qualifying_gate.
 STORM_EVENT_TYPES = [
     "Tornado Warning",
     "Tornado Watch",
@@ -116,6 +119,7 @@ def scrape_storm_damage(
     tagged = 0
     new_alerts = 0
     duplicates = 0
+    non_qualifying = 0
     if qualifying:
         from src.services.nws_webhook import process_alert
         with get_db_context() as db:
@@ -132,10 +136,16 @@ def scrape_storm_damage(
                     tagged += result.get("tagged_count", 0)
                 elif status == "duplicate":
                     duplicates += 1
+                elif status == "skipped":
+                    non_qualifying += 1
+                    logger.warning(
+                        "[storm] alert dropped by process_alert gate: event=%r reason=%s",
+                        props.get("event"), result.get("reason"),
+                    )
 
     logger.info(
-        "[storm] %s: alerts=%d qualifying=%d new=%d duplicate=%d props_tagged=%d",
-        county_id, len(alerts), len(qualifying), new_alerts, duplicates, tagged,
+        "[storm] %s: alerts=%d qualifying=%d new=%d duplicate=%d non_qualifying=%d props_tagged=%d",
+        county_id, len(alerts), len(qualifying), new_alerts, duplicates, non_qualifying, tagged,
     )
     try:
         from src.utils.scraper_db_helper import record_scraper_stats

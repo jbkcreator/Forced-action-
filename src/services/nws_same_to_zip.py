@@ -75,6 +75,13 @@ UGC_TO_ZIPS: dict[str, list[str]] = {
     "FLC081": SAME_TO_ZIPS["012081"],   # Manatee
     # Forecast-zone (Z-type) codes for the active counties — these are what
     # zone-scoped alert fetches (County.nws_zone) return in geocode.UGC.
+    # Known ceiling: crosswalk granularity is county-level, so FLZ151 (coastal
+    # half) and FLZ251 (inland half) both resolve to the full Hillsborough ZIP
+    # list — a zone-scoped alert tags the whole county. Sub-county precision
+    # would need a zone-shapefile→ZIP mapping AND dropping the SAME union in
+    # expand_codes (SAME carries county FIPS, which re-widens to the county
+    # anyway). Impact is bounded: tagger only touches Silver+ properties and
+    # weather signals are stacking-only.
     "FLZ151": SAME_TO_ZIPS["012057"],   # Hillsborough (coastal)
     "FLZ251": SAME_TO_ZIPS["012057"],   # Hillsborough (inland)
     "FLZ050": SAME_TO_ZIPS["012103"],   # Pinellas

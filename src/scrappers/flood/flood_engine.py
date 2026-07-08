@@ -33,14 +33,16 @@ _FEMA_DISASTERS_URL = "https://www.fema.gov/api/open/v2/DisasterDeclarationsSumm
 _FEMA_NFIP_CLAIMS_URL = "https://www.fema.gov/api/open/v2/FimaNfipClaims"
 _NWS_ZONE_URL = "https://api.weather.gov/alerts/active/zone/{zone_id}"
 
+# Warning-tier only — active flooding, damage plausible. Watch/Advisory-tier
+# events (conditions favorable, minor impacts) are deliberately excluded: they
+# don't indicate damage, and process_alert's nws_relevant_events gate would
+# silently drop them anyway. Every entry here must pass _is_qualifying()
+# against the default config — enforced by
+# tests/test_weather_zip_mapping.py::test_engine_events_pass_qualifying_gate.
 FLOOD_NWS_EVENTS = [
     "Flash Flood Warning",
-    "Flash Flood Watch",
     "Flood Warning",
-    "Flood Watch",
-    "Flood Advisory",
     "Coastal Flood Warning",
-    "Coastal Flood Advisory",
     "Areal Flood Warning",
 ]
 
@@ -210,6 +212,7 @@ def scrape_flood_damage(
     tagged = 0
     new_alerts = 0
     duplicates = 0
+    non_qualifying = 0
 
     # Source 2: NWS active flood alerts — idempotent backstop for nws_poll.
     flood_features = _fetch_nws_flood_alerts_by_zones(nws_zones) if nws_zones else []
@@ -229,6 +232,12 @@ def scrape_flood_damage(
                     tagged += result.get("tagged_count", 0)
                 elif status == "duplicate":
                     duplicates += 1
+                elif status == "skipped":
+                    non_qualifying += 1
+                    logger.warning(
+                        "[flood] alert dropped by process_alert gate: event=%r reason=%s",
+                        props.get("event"), result.get("reason"),
+                    )
 
     # Source 3: FEMA NFIP paid claims → synthetic alerts + targeted tagging.
     nfip_claims = _fetch_nfip_claims(state, fips, start_date)
@@ -244,9 +253,9 @@ def scrape_flood_damage(
         )
 
     logger.info(
-        "[flood] %s %s→%s: nws_alerts=%d nfip_claims=%d new=%d duplicate=%d props_tagged=%d",
+        "[flood] %s %s→%s: nws_alerts=%d nfip_claims=%d new=%d duplicate=%d non_qualifying=%d props_tagged=%d",
         county_id, start_date, end_date, len(flood_features), len(nfip_claims),
-        new_alerts, duplicates, tagged,
+        new_alerts, duplicates, non_qualifying, tagged,
     )
     try:
         from src.utils.scraper_db_helper import record_scraper_stats

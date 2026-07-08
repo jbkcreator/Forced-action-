@@ -59,3 +59,19 @@ def test_flood_events_qualify_for_nws_pipeline():
     for ev in STORM_EVENT_TYPES:
         if "Flood" not in ev:
             assert incident_type_for_event(ev) == "storm_damage"
+
+
+def test_engine_events_pass_qualifying_gate():
+    # Engines route alerts through process_alert, whose _is_qualifying() gate
+    # checks nws_relevant_events. Any engine event NOT passing the gate gets
+    # silently dropped (status='skipped') — the "silent zero incidents"
+    # failure class this fix set out to eliminate (PR #113 review, issue 1).
+    from src.services.nws_webhook import _is_qualifying
+    from config.settings import AppSettings
+
+    relevant = AppSettings.model_fields["nws_relevant_events"].default
+    for ev in STORM_EVENT_TYPES + FLOOD_NWS_EVENTS:
+        assert _is_qualifying(ev, relevant), (
+            f"{ev!r} is fetched by an engine but dropped by the "
+            "process_alert gate — add it to nws_relevant_events or remove it"
+        )
