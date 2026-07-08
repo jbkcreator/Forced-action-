@@ -147,13 +147,14 @@ def process_alert(alert_payload: dict, db: Session) -> dict:
     else:
         logger.info("[NWS] storm_pack_enabled=False — skipping storm pack activation")
 
-    # ── 9. Storm signal tagging (storm_damage incidents on distressed props) ──
+    # ── 9. Weather signal tagging (storm/flood incidents on distressed props) ──
     tagged_ids: list = []
     if settings.storm_signal_tagging_enabled and affected_zips:
         try:
             from src.services.storm_signal_tagger import tag_affected_properties
             tagged_ids = tag_affected_properties(
-                affected_zips, alert_id, nws_alert.effective, db
+                affected_zips, alert_id, nws_alert.effective, db,
+                incident_type=incident_type_for_event(event_type),
             )
             _log_event(db, "STORM_SIGNAL_TAGGED", {
                 "alert_id": alert_id,
@@ -205,6 +206,12 @@ def process_alert(alert_payload: dict, db: Session) -> dict:
 # ──────────────────────────────────────────────────────────────────────────────
 # Internal helpers
 # ──────────────────────────────────────────────────────────────────────────────
+
+def incident_type_for_event(event_type: str) -> str:
+    """Map a weather event name to its CDS stacking-signal incident type."""
+    et = (event_type or "").lower()
+    return "flood_damage" if ("flood" in et or "nfip" in et) else "storm_damage"
+
 
 def _is_qualifying(event_type: str, relevant_events: list) -> bool:
     """Check if event_type matches any entry in the configured relevant events list."""

@@ -413,6 +413,11 @@ class AppSettings(BaseSettings):
 	nws_revenue_polling_enabled: bool = Field(default=True, env="NWS_REVENUE_POLLING_ENABLED")
 	storm_pack_enabled: bool = Field(default=True, env="STORM_PACK_ENABLED")
 	nws_cora_urgency_enabled: bool = Field(default=True, env="NWS_CORA_URGENCY_ENABLED")
+	# Referenced by nws_webhook.process_alert steps 9+11 but missing until 2026-07 —
+	# the AttributeError killed signal tagging + rescore on every alert (incidents
+	# from weather stayed at 0 since fa018).
+	storm_signal_tagging_enabled: bool = Field(default=True, env="STORM_SIGNAL_TAGGING_ENABLED")
+	storm_signal_rescore_enabled: bool = Field(default=True, env="STORM_SIGNAL_RESCORE_ENABLED")
 	nws_poll_interval_seconds: int = Field(default=300, env="NWS_POLL_INTERVAL_SECONDS")
 	nws_supported_states: list = Field(default=["FL"], env="NWS_SUPPORTED_STATES")
 	nws_relevant_events: list = Field(default=[

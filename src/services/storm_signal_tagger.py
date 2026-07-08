@@ -33,18 +33,21 @@ def tag_affected_properties(
     effective_dt: Optional[datetime],
     db: Session,
     min_score: float = DEFAULT_MIN_SCORE,
+    incident_type: str = "storm_damage",
 ) -> list[int]:
-    """Insert storm_damage Incident rows for distressed properties in affected ZIPs.
+    """Insert weather Incident rows for distressed properties in affected ZIPs.
 
-    Idempotent: an existing storm_damage incident for the same property whose
-    crime_types JSONB carries this alert_id will not be re-inserted.
+    Idempotent: an existing incident of the same type for the same property
+    whose crime_types JSONB carries this alert_id will not be re-inserted.
 
     Args:
         affected_zips: ZIP codes from the NWS alert (e.g. ["33602", "33647"]).
-        alert_id: NWS @id, stored in Incident.crime_types for dedup.
+        alert_id: NWS @id (or synthetic id, e.g. NFIP), stored in
+            Incident.crime_types for dedup.
         effective_dt: alert effective time; falls back to now() if None.
         db: open Session — caller commits.
         min_score: latest final_cds_score floor (inclusive).
+        incident_type: 'storm_damage' (default) or 'flood_damage'.
 
     Returns:
         List of property IDs newly tagged this call (pre-existing matches
@@ -66,7 +69,7 @@ def tag_affected_properties(
     )
 
     candidates_q = (
-        select(Property.id)
+        select(Property.id, Property.county_id)
         .join(latest_score_subq, latest_score_subq.c.pid == Property.id)
         .join(
             DistressScore,
@@ -80,7 +83,8 @@ def tag_affected_properties(
             DistressScore.final_cds_score >= min_score,
         )
     )
-    candidate_ids = {row[0] for row in db.execute(candidates_q).all()}
+    candidate_county = {row[0]: row[1] for row in db.execute(candidates_q).all()}
+    candidate_ids = set(candidate_county)
 
     if not candidate_ids:
         logger.info(
@@ -91,7 +95,7 @@ def tag_affected_properties(
 
     existing_q = select(Incident.property_id).where(
         Incident.property_id.in_(candidate_ids),
-        Incident.incident_type == "storm_damage",
+        Incident.incident_type == incident_type,
         Incident.crime_types["alert_id"].astext == alert_id,
     )
     existing_ids = {row[0] for row in db.execute(existing_q).all()}
@@ -108,8 +112,9 @@ def tag_affected_properties(
     db.add_all([
         Incident(
             property_id=pid,
-            incident_type="storm_damage",
+            incident_type=incident_type,
             incident_date=incident_date,
+            county_id=candidate_county[pid],
             crime_types=metadata,
         )
         for pid in new_ids

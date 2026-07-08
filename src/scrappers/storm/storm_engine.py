@@ -1,9 +1,12 @@
 """
 Storm Damage Zones — M1-F Scraper #2
 
-Fetches active storm damage alerts from the NOAA/NWS API and matches
-affected ZIP codes against properties in the DB. Creates Incident records
-(incident_type='storm_damage') for all matched properties.
+Hourly backstop for the primary NWS pipeline (src/tasks/nws_poll.py, every
+5 min): fetches active NWS alerts for the county's forecast zones and routes
+each qualifying alert through nws_webhook.process_alert(), which owns
+idempotency (alert_id), NWSAlert storage, ZIP resolution via the SAME/UGC
+crosswalk, and targeted incident tagging (storm_signal_tagger — only
+properties with CDS >= Silver floor get incidents; no county-wide blankets).
 
 Data source: NWS CAP alerts API (public, no key required)
     https://api.weather.gov/alerts/active
@@ -19,10 +22,7 @@ from typing import Optional, Tuple, List, Dict
 import requests
 
 from src.core.database import get_db_context
-from src.core.models import Property, Incident
-from src.services.nws_same_to_zip import alert_to_zips
 from src.utils.county_config import get_county
-from sqlalchemy import select, and_, insert
 
 logger = logging.getLogger(__name__)
 
@@ -81,34 +81,16 @@ def _fetch_nws_alerts(state: str = "FL") -> List[Dict]:
         return []
 
 
-def _extract_affected_zips(alert: Dict) -> List[str]:
-    """Extract ZIP codes from a NWS alert via the SAME/UGC → ZIP crosswalk."""
-    props = alert.get("properties", {})
-    zips = set(alert_to_zips(props))
-
-    # Fallback: explicit ZIPs in the description text (rare, but free to keep)
-    description = props.get("description", "") or ""
-    import re
-    zips.update(re.findall(r"\b(3[3-4]\d{3})\b", description))  # FL ZIPs 33xxx-34xxx
-
-    return list(zips)
-
-
 def scrape_storm_damage(
     county_id: str = "hillsborough",
     date_range: Optional[Tuple[date, date]] = None,  # noqa: ARG001 — interface consistency
 ) -> int:
     """
-    Fetch active NWS storm alerts and create Incident records for all
-    properties in affected ZIP codes.
-
-    Args:
-        county_id:   County to process.
-        date_range:  Unused for live API (always fetches current active alerts).
-                     Accepted for interface consistency.
+    Fetch active NWS storm alerts and route them through process_alert()
+    (idempotent — alerts already handled by the 5-min nws_poll are skipped).
 
     Returns:
-        Number of new Incident records created.
+        Number of properties newly tagged with weather incidents.
     """
     try:
         config = get_county(county_id)
@@ -126,83 +108,48 @@ def scrape_storm_damage(
         logger.info("[storm] %s: no nws_zones configured, falling back to state-level fetch", county_id)
         alerts = _fetch_nws_alerts(state)
 
-    # ZIPs come from alerts. The DB query below scopes by Property.county_id,
-    # so out-of-county ZIPs (state-fallback case) get filtered naturally.
-    affected_zips: set = set()
-    storm_date = date.today()
+    qualifying = [
+        a for a in alerts
+        if any(t in (a.get("properties", {}).get("event") or "") for t in STORM_EVENT_TYPES)
+    ]
 
-    for alert in alerts:
-        props = alert.get("properties", {})
-        event = props.get("event", "")
-        if not any(event_type in event for event_type in STORM_EVENT_TYPES):
-            continue
-
-        affected_zips.update(_extract_affected_zips(alert))
-
-    if not affected_zips:
-        logger.info("[storm] %s: no active storm alerts — 0 incidents", county_id)
-        try:
-            from src.utils.scraper_db_helper import record_scraper_stats
-            record_scraper_stats(source_type='storm_damage', total_scraped=0, matched=0, unmatched=0, skipped=0, county_id=county_id)
-        except Exception:
-            pass
-        return 0
-
-    with get_db_context() as db:
-        prop_ids = db.execute(
-            select(Property.id).where(
-                and_(
-                    Property.county_id == county_id,
-                    Property.zip.in_(affected_zips),
-                )
-            )
-        ).scalars().all()
-
-        existing_ids = set(db.execute(
-            select(Incident.property_id).where(
-                and_(
-                    Incident.incident_type == "storm_damage",
-                    Incident.incident_date == storm_date,
-                    Incident.property_id.in_(prop_ids),
-                )
-            )
-        ).scalars().all()) if prop_ids else set()
-
-        new_ids = [pid for pid in prop_ids if pid not in existing_ids]
-        skipped_duplicate = len(prop_ids) - len(new_ids)
-
-        _BATCH = 5000
-        for i in range(0, len(new_ids), _BATCH):
-            db.execute(insert(Incident).values([
-                {
-                    "property_id": pid,
-                    "incident_type": "storm_damage",
-                    "incident_date": storm_date,
-                    "county_id": county_id,
-                }
-                for pid in new_ids[i:i + _BATCH]
-            ]))
-        created = len(new_ids)
-
-        db.commit()
+    tagged = 0
+    new_alerts = 0
+    duplicates = 0
+    if qualifying:
+        from src.services.nws_webhook import process_alert
+        with get_db_context() as db:
+            for alert in qualifying:
+                props = {**(alert.get("properties") or {}), "id": alert.get("id", "")}
+                try:
+                    result = process_alert(props, db)
+                except Exception as e:
+                    logger.error("[storm] process_alert failed: %s", e)
+                    continue
+                status = result.get("status")
+                if status == "processed":
+                    new_alerts += 1
+                    tagged += result.get("tagged_count", 0)
+                elif status == "duplicate":
+                    duplicates += 1
 
     logger.info(
-        "[storm] %s: created=%d duplicate=%d zips_affected=%d",
-        county_id, created, skipped_duplicate, len(affected_zips),
+        "[storm] %s: alerts=%d qualifying=%d new=%d duplicate=%d props_tagged=%d",
+        county_id, len(alerts), len(qualifying), new_alerts, duplicates, tagged,
     )
     try:
         from src.utils.scraper_db_helper import record_scraper_stats
         record_scraper_stats(
             source_type='storm_damage',
-            total_scraped=created + skipped_duplicate,
-            matched=created,
+            total_scraped=len(qualifying),
+            matched=tagged,
             unmatched=0,
-            skipped=skipped_duplicate,
+            skipped=duplicates,
             county_id=county_id,
         )
     except Exception as stats_err:
         logger.warning("⚠ Could not record scraper stats (non-critical): %s", stats_err)
-    return created
+    return tagged
 
 
 if __name__ == "__main__":
@@ -215,4 +162,4 @@ if __name__ == "__main__":
     parser.add_argument("--county-id", dest="county_id", default="hillsborough", help="County identifier (default: hillsborough)")
     args = parser.parse_args()
     n = scrape_storm_damage(county_id=args.county_id)
-    print(f"Done — {n} storm damage incidents created")
+    print(f"Done — {n} properties tagged with storm damage")
