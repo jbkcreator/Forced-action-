@@ -149,6 +149,33 @@ def _run_tax_enrichment(county_id: str, df: "pd.DataFrame") -> None:
         logger.exception("[Admin] Tax enrichment (background) failed for county=%s", county_id)
 
 
+@router.post("/import/founder-portfolio")
+def import_founder_portfolio(
+    file: UploadFile,
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """B0-01 — import the founder's personal deal history CSV.
+
+    Each row is matched to a known parcel (parcel-id exact, else address >=92);
+    unmatched rows are reported, never attached (ADR 0026). Rows land as
+    founder_verified / founder_import DealOutcomes (subscriber_id NULL) and fire
+    no side-effects. Idempotent by source_ref. Returns
+    {imported, updated, matched, unmatched[], errors[]}.
+    """
+    if not file.filename or not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="File must be a .csv")
+
+    content = file.file.read().decode("utf-8", errors="replace")
+
+    from src.services.founder_portfolio_import import import_portfolio
+    try:
+        return import_portfolio(db, content)
+    except Exception:
+        logger.error("[FounderImport] import failed", exc_info=True)
+        raise HTTPException(status_code=400, detail="Founder portfolio import failed")
+
+
 @router.post("/upload/tax-delinquency")
 def upload_tax_delinquency(
     file: UploadFile,

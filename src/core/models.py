@@ -2878,6 +2878,9 @@ class DealOutcome(Base):
     confidence_tier: Mapped[str] = mapped_column(String(30), nullable=False, server_default=text("'public_record_inferred'"))
     # Finer provenance: subscriber_tap / founder_import / <connector>. Free text.
     outcome_source: Mapped[Optional[str]] = mapped_column(String(50))
+    # B0-01 idempotency key for bulk imports (hash of parcel/address|date|amount).
+    # NULL for subscriber-tap rows. Partial unique index (see __table_args__).
+    source_ref: Mapped[Optional[str]] = mapped_column(String(64))
     deal_size_bucket: Mapped[Optional[str]] = mapped_column(String(20))  # 5_10k/10_25k/25k_plus/skip
     deal_amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
     deal_date: Mapped[Optional[date]] = mapped_column(Date)
@@ -2906,6 +2909,12 @@ class DealOutcome(Base):
         Index("idx_deal_outcome_pipeline_stage", "pipeline_stage"),
         Index("idx_deal_outcomes_county_vertical", "county_id", "trade_vertical"),
         Index("idx_deal_outcomes_confidence_tier", "confidence_tier"),
+        Index(
+            "uq_deal_outcomes_source_ref",
+            "source_ref",
+            unique=True,
+            postgresql_where=text("source_ref IS NOT NULL"),
+        ),
     )
 
     def __repr__(self):
