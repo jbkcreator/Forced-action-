@@ -76,7 +76,15 @@ MIN_WITH_SIGNAL_SAMPLE = 30   # lift below this sample size is noisy
 # polymorphic tables (legal_and_liens, legal_proceedings, incidents, etc.).
 _SIGNAL_SOURCES: dict[str, dict] = {
     "foreclosures":       {"table": "foreclosures",      "date_col": "filing_date",   "where": "TRUE"},
+    # date_expr (optional) overrides "sig.<date_col>" when no single column is
+    # reliably populated. Priority mirrors cds_engine: real event dates, then
+    # the FL statutory delinquency date (April 1 after the tax year), then the
+    # load date — so the diagnostic dates signals the same way scoring does.
     "tax_delinquencies":  {"table": "tax_delinquencies", "date_col": "deed_app_date",
+                           "date_expr": ("COALESCE(sig.deed_app_date, sig.issued_date, "
+                                         "CASE WHEN sig.tax_year BETWEEN 1990 AND 2100 "
+                                         "THEN make_date(sig.tax_year + 1, 4, 1) END, "
+                                         "sig.date_added)"),
                            "where": "total_amount_due IS NOT NULL OR years_delinquent IS NOT NULL"},
     "code_violations":    {"table": "code_violations",   "date_col": "opened_date",   "where": "TRUE"},
     "deed_transfers":     {"table": "deeds",             "date_col": "record_date",
@@ -169,7 +177,7 @@ def _per_signal_sql(signal_cfg: dict) -> str:
     Returns one aggregate row: (n_with, n_without, transacted_with, transacted_without).
     """
     sig_table  = signal_cfg["table"]
-    sig_date   = signal_cfg["date_col"]
+    sig_date   = signal_cfg.get("date_expr") or f"sig.{signal_cfg['date_col']}"
     sig_where  = signal_cfg["where"]
 
     return f"""
@@ -188,8 +196,8 @@ def _per_signal_sql(signal_cfg: dict) -> str:
         FROM scored sc
         JOIN {sig_table} sig
             ON sig.property_id = sc.property_id
-           AND sig.{sig_date}  IS NOT NULL
-           AND sig.{sig_date} <= sc.first_scored_at
+           AND {sig_date}  IS NOT NULL
+           AND {sig_date} <= sc.first_scored_at
         WHERE ({sig_where})
     ),
     deed_hits AS (

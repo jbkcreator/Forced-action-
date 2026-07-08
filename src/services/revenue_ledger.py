@@ -22,6 +22,7 @@ src/tasks/zip_territory_cost_attribution_refresh.py for that path.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from datetime import datetime
 from typing import Optional
@@ -30,6 +31,24 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
+
+
+def stripe_payment_intent_ledger_id(payment_intent_id: str) -> int:
+    """Deterministic 63-bit integer derived from a Stripe payment_intent id.
+
+    Use as source_id (with a dedicated source_table) when the underlying
+    product row doesn't get a fresh primary key per payment — e.g. SentLead
+    has a hard UniqueConstraint(subscriber_id, property_id), so a $2.50
+    lead_unlock and a later $150 hot_lead_unlock on the same property share
+    one SentLead row. Keying the ledger off sent_leads.id would collide: the
+    (source_table, source_id) uniqueness meant to absorb a retried webhook
+    for the SAME charge would instead silently drop the second, genuinely
+    different charge. Hashing the payment_intent id gives every distinct
+    charge its own ledger identity while a retried webhook for the same
+    payment_intent still hashes to the same value, so idempotency holds.
+    """
+    digest = hashlib.sha256(payment_intent_id.encode()).digest()
+    return int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
 
 
 def record_revenue(

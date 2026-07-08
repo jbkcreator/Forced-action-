@@ -316,6 +316,13 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
         _on_auto_mode_addon_purchase(session, db)
         return
 
+    # Hot lead unlock is a mode="payment" session fulfilled by
+    # payment_intent.succeeded (metadata travels on the PI via
+    # payment_intent_data) — nothing to do here, and falling through would
+    # log a false "missing required metadata" error.
+    if meta.get("product") == "hot_lead_unlock":
+        return
+
     tier        = meta.get("tier")
     vertical    = meta.get("vertical")
     county_id   = meta.get("county_id")
@@ -1999,6 +2006,13 @@ def _on_payment_intent_succeeded(payment_intent, db: Session) -> None:
         _on_lead_unlock_payment(payment_intent, db)
         # Fall through to card-save so the unlock also triggers the saved-card flow
         _on_card_saved(payment_intent, db)
+    elif product == "hot_lead_unlock":
+        # $150 ($99 reduced) single-lead unlock sold via Checkout Session —
+        # same deliverable as lead_unlock (reveal one lead's contact details),
+        # so it shares the fulfillment handler. Metadata arrives on the PI via
+        # payment_intent_data set in create_hot_lead_unlock_link.
+        logger.info("[PI] routing -> hot_lead_unlock pi=%s", pi_id)
+        _on_lead_unlock_payment(payment_intent, db)
     else:
         logger.info("[PI] routing -> card_save (no product metadata) pi=%s", pi_id)
         _on_card_saved(payment_intent, db)
@@ -2095,7 +2109,9 @@ def _resolve_subscriber_id_from_pi(payment_intent, db: Session) -> Optional[int]
 
 def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
     """
-    Handle a single-lead $2.50–$7 unlock purchase.
+    Handle a single-lead unlock purchase — the $2.50–$7 dashboard unlock
+    (product=lead_unlock) and the $150/$99 hot lead unlock
+    (product=hot_lead_unlock) both land here; the deliverable is identical.
 
     Looks up the subscriber by Stripe customer id, looks up the property by
     metadata.property_id, and emails the full lead details (address, owner
@@ -2157,6 +2173,7 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
     # this savepoint, leaving the outer transaction (and the session) clean.
     try:
         with db.begin_nested():
+            pi_id = _attr(payment_intent, "id")
             existing_sent = db.execute(
                 select(SentLead).where(
                     SentLead.subscriber_id == subscriber.id,
@@ -2169,38 +2186,46 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
                     subscriber_id=subscriber.id,
                     property_id=property_id,
                     source="lead_unlock_payment",
-                    stripe_payment_intent_id=_attr(payment_intent, "id"),
+                    stripe_payment_intent_id=pi_id,
                     amount_cents=amount_cents,
                 )
                 db.add(sent_row)
                 db.flush()
-                is_first_payment = True
+                is_new_payment = True
             else:
                 sent_row = existing_sent
                 # A row can pre-exist with no payment intent (e.g. delivered
-                # free via the daily digest) and only now be paid for — that
-                # transition from unset to set is a real charge, not a
-                # duplicate, so it must still hit the ledger.
-                is_first_payment = not existing_sent.stripe_payment_intent_id
-                if is_first_payment:
-                    existing_sent.stripe_payment_intent_id = _attr(payment_intent, "id")
+                # free via the daily digest), or with a DIFFERENT payment
+                # intent from an earlier, separately-priced unlock of the same
+                # property (e.g. a $2.50-$7 dashboard unlock followed later by
+                # a $150/$99 hot-lead unlock) — both are real charges, not a
+                # duplicate webhook delivery, and must still hit the ledger.
+                # Only an identical stripe_payment_intent_id means this is a
+                # retried webhook for a charge already recorded.
+                is_new_payment = existing_sent.stripe_payment_intent_id != pi_id
+                if is_new_payment:
+                    existing_sent.stripe_payment_intent_id = pi_id
                     existing_sent.amount_cents = amount_cents
 
             # Centralized ledger — see src/services/revenue_ledger.py.
-            # Record on the first real payment confirmation for this
-            # SentLead row, whether the row is brand new or was previously
-            # free and is only now being paid for. A re-run against a row
-            # that already has this payment intent is a genuine duplicate
-            # webhook delivery, which record_revenue's own idempotency
-            # (ON CONFLICT on source_table/source_id) absorbs safely.
-            if is_first_payment and amount_cents is not None:
+            # SentLead reuses one row per (subscriber, property) across
+            # repeat/upgraded purchases, so source_id can't be sent_row.id —
+            # two distinct charges on the same row would collide under
+            # record_revenue's (source_table, source_id) uniqueness and the
+            # second, genuinely different charge would be silently dropped.
+            # Keying on a hash of the payment_intent id instead gives every
+            # distinct charge its own ledger row while a retried webhook for
+            # the SAME payment_intent still hashes identically, so idempotency
+            # is preserved.
+            if is_new_payment and amount_cents is not None:
                 from src.services.revenue_ledger import (
                     record_revenue, attribute_enrichment_cost_for_property,
+                    stripe_payment_intent_ledger_id,
                 )
                 record_revenue(
                     db, subscriber_id=subscriber.id, product_type="lead_unlock",
-                    amount_cents=amount_cents, source_table="sent_leads",
-                    source_id=sent_row.id, property_id=property_id,
+                    amount_cents=amount_cents, source_table="stripe_payment_intent",
+                    source_id=stripe_payment_intent_ledger_id(pi_id), property_id=property_id,
                     occurred_at=sent_row.sent_at,
                 )
                 attribute_enrichment_cost_for_property(db, property_id, subscriber.id)

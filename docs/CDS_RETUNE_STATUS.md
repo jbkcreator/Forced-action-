@@ -69,6 +69,37 @@
 
 ---
 
+## Checkpoint 2026-07-03 — client asked to schedule the retune
+
+Fresh diagnostic run (30d/60d windows, JSON in session scratchpad; monthly cron
+confirmed installed and producing `data/diag/` snapshots on the server):
+
+- **Trigger criteria: 1 of 3 met.** Only deed_transfers (2.91 @30d / 2.16 @60d)
+  and hoa_liens (1.66 / 1.41) exceed lift 1.5 — need ≥3 signals at 90d. Base
+  event rate 1.31% @30d / 1.81% @60d — needs ≥3% at 90d. Encouraging:
+  foreclosures climbing 0.66→0.84 and irs_tax_liens 1.03→1.25 as the window
+  widens, consistent with the timescale thesis; deed_transfers dominance is
+  fading (2.91→2.16).
+- **Win/loss layer is live but thin: 19 closed outcomes** (10 won / 9 lost;
+  11 linked to scored properties). Not usable as a fit label (Stage C needs
+  ≥30 positives per vertical). Use as a Stage E validation overlay; it becomes
+  a co-label at ~hundreds of outcomes.
+- **Data gaps still blocking signal coverage** (re-verified in prod DB):
+  tax_delinquencies 3 of 50,002 rows have amount/years data; storm_damage /
+  flood_damage zero rows; fire has 1,050 incident rows but only **7** attach to
+  scored properties — the incidents→property matching gap is the bottleneck,
+  not the scraper.
+
+**Agreed schedule:**
+
+| When | What |
+|---|---|
+| Now → mid-July | Fix data gaps: tax-delinquency upload must populate amounts; storm/flood scraper writes; incidents property-matching (fire 1,050→7). These raise the retune ceiling regardless of timing. |
+| Aug 1 | First diagnostic snapshot with a meaningful 90d cohort (scores from Apr 15–May 3). |
+| Sept 1 (unchanged) | Evaluate the 3 trigger criteria on Jun/Jul/Aug snapshots. If green → Stage B (90d) → Stage C fit → Stage E shadow + validation (incl. win/loss overlay) → Stage F cutover. If 1–2 hold → another hand-tune round, re-evaluate +60d. |
+
+---
+
 Working doc for the multi-stage retune triggered by:
 1. **Tier inversion** — Bronze leads convert at 2.34%, Ultra Platinum at 0.91%. The score ranks leads in the opposite direction of conversion.
 2. **Pinellas 94% Ultra Platinum** — the county-aware coverage normalizer was meant to discount Pinellas leads for missing signal types; in practice the label correlates more with "this county doesn't scrape code violations" than with distress.
