@@ -22,7 +22,7 @@ from src.core.database import get_db_context
 from src.core.models import Property, Incident
 from src.services.nws_same_to_zip import alert_to_zips, fips_to_zips
 from src.utils.county_config import get_county
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, insert
 
 logger = logging.getLogger(__name__)
 
@@ -220,8 +220,8 @@ def scrape_flood_damage(
     flood_date = date.today()
 
     with get_db_context() as db:
-        properties = db.execute(
-            select(Property).where(
+        prop_ids = db.execute(
+            select(Property.id).where(
                 and_(
                     Property.county_id == county_id,
                     Property.zip.in_(county_zips),
@@ -229,29 +229,31 @@ def scrape_flood_damage(
             )
         ).scalars().all()
 
-        for prop in properties:
-            existing = db.execute(
-                select(Incident).where(
-                    and_(
-                        Incident.property_id == prop.id,
-                        Incident.incident_type == "flood_damage",
-                        Incident.incident_date == flood_date,
-                    )
+        existing_ids = set(db.execute(
+            select(Incident.property_id).where(
+                and_(
+                    Incident.incident_type == "flood_damage",
+                    Incident.incident_date == flood_date,
+                    Incident.property_id.in_(prop_ids),
                 )
-            ).scalars().first()
-
-            if existing:
-                skipped_duplicate += 1
-                continue
-
-            incident = Incident(
-                property_id=prop.id,
-                incident_type="flood_damage",
-                incident_date=flood_date,
-                county_id=county_id,
             )
-            db.add(incident)
-            created += 1
+        ).scalars().all()) if prop_ids else set()
+
+        new_ids = [pid for pid in prop_ids if pid not in existing_ids]
+        skipped_duplicate = len(prop_ids) - len(new_ids)
+
+        _BATCH = 5000
+        for i in range(0, len(new_ids), _BATCH):
+            db.execute(insert(Incident).values([
+                {
+                    "property_id": pid,
+                    "incident_type": "flood_damage",
+                    "incident_date": flood_date,
+                    "county_id": county_id,
+                }
+                for pid in new_ids[i:i + _BATCH]
+            ]))
+        created = len(new_ids)
 
         db.commit()
 
