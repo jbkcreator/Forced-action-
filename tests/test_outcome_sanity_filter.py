@@ -7,6 +7,7 @@ end-to-end against the real consumers (Postgres-only; skip without DATABASE_URL)
 """
 from datetime import datetime, timedelta, timezone
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
@@ -57,6 +58,19 @@ def test_unknown_reason_is_ignored():
 def test_capacity_reason_on_a_positive_is_ignored():
     """A stray capacity reason must never erase a genuine win."""
     assert classify_realized_outcome("converted", "no_capital") == ("converted", None)
+
+
+@pytest.mark.parametrize("variant", ["No_Capital", " no_capital ", "NO_CAPITAL", "\tLow_FICO\n"])
+def test_case_and_whitespace_variants_still_shield(variant):
+    """A case/whitespace variant of a canonical reason must shield, and the
+    stored reason is normalised — never a silent no-op."""
+    realized, stored = classify_realized_outcome("dead", variant)
+    assert realized is None
+    assert stored == variant.strip().lower()
+
+
+def test_blank_reason_is_treated_as_no_reason():
+    assert classify_realized_outcome("dead", "   ") == ("dead", None)
 
 
 # --- Behavioral, against the real consumers (Postgres-only) ---------------
