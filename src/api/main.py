@@ -265,6 +265,12 @@ def _classify_scraper_issues(issue_rows) -> tuple[list, list]:
     this can now only fire when the site was genuinely unreachable/broken
     this run, not on an ordinary empty day.
 
+    error_type='rate_limited' (sunbiz/property_appraiser circuit breaker
+    tripped after repeated hard timeouts) is always data_unavailable, same as
+    no_data — the source site throttled the session, not a code bug.
+    Untouched items stay in their prior pending state and are picked up by
+    the next cron run, so there's nothing actionable for this alert.
+
     Args:
         issue_rows: iterable of objects with .source_type, .error_type,
             .error_message, .run_date (a date), .run_success attributes.
@@ -277,6 +283,8 @@ def _classify_scraper_issues(issue_rows) -> tuple[list, list]:
         entry = {"source": r.source_type, "date": r.run_date.isoformat()}
         if r.error_type == "no_data":
             data_unavailable.append({**entry, "reason": "no_data"})
+        elif r.error_type == "rate_limited":
+            data_unavailable.append({**entry, "reason": "rate_limited"})
         elif not r.run_success:
             real_errors.append({
                 **entry,
@@ -469,6 +477,7 @@ def health_check_detailed(db: Session = Depends(get_db)):
                 or_(
                     ScraperRunStats.run_success == False,      # noqa: E712
                     ScraperRunStats.total_scraped == 0,
+                    ScraperRunStats.error_type == "rate_limited",
                 ),
                 ScraperRunStats.run_date >= cutoff,
             )

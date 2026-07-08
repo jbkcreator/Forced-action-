@@ -20,6 +20,7 @@ import asyncio
 import logging
 import sys
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,13 +34,19 @@ sys.path.insert(0, str(project_root))
 from src.utils.logger import setup_logging, get_logger
 from src.utils.county_config import get_county_config
 from src.core.database import get_db_context
-from src.core.models import Property, ScraperRunStats
+from src.core.models import Property
 
 setup_logging()
 logger = get_logger(__name__)
 
 _MAX_WORKERS = 5
 _COMMIT_BATCH_SIZE = 100
+
+# If the last N completed scrapes are ALL failures, treat it as HCPA/PCPAO
+# throttling the whole batch rather than N unrelated bad parcels — stop
+# submitting new work and let the remaining properties stay unrefreshed for
+# tomorrow's run instead of grinding through guaranteed timeouts.
+_CIRCUIT_BREAKER_WINDOW = 8
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +253,9 @@ async def run_pa_pipeline(
     # Scrape in thread pool — sync Playwright per thread
     results: list[pd.DataFrame] = []
     errors = 0
+    rate_limited = False
+    remaining_unprocessed = 0
+    recent_outcomes: deque = deque(maxlen=_CIRCUIT_BREAKER_WINDOW)
 
     loop = asyncio.get_event_loop()
     with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
@@ -257,17 +267,36 @@ async def run_pa_pipeline(
             prop = futures[future]
             try:
                 df = future.result()
-                if df is not None:
+                success = df is not None
+                if success:
                     results.append(df)
                 else:
                     errors += 1
             except Exception as e:
                 logger.error("Unexpected error for parcel %s: %s", prop.get("parcel_id"), e)
                 errors += 1
+                success = False
+
+            recent_outcomes.append(success)
+            if len(recent_outcomes) == _CIRCUIT_BREAKER_WINDOW and not any(recent_outcomes):
+                pending = [f for f in futures if not f.done()]
+                if pending:
+                    rate_limited = True
+                    remaining_unprocessed = len(pending)
+                    logger.error(
+                        "PA enrichment: last %d scrapes all failed — HCPA/PCPAO likely "
+                        "throttling this session. Aborting with %d parcel(s) unprocessed; "
+                        "will resume next cron run.",
+                        _CIRCUIT_BREAKER_WINDOW, remaining_unprocessed,
+                    )
+                    for f in pending:
+                        f.cancel()
+                    break
 
     if not results:
         logger.warning("All scrapes failed or returned no data")
-        _log_run_stats(county_id, mode, 0, 0, errors, time.time() - run_start)
+        _log_run_stats(county_id, mode, 0, 0, errors, time.time() - run_start,
+                        rate_limited=rate_limited, remaining_unprocessed=remaining_unprocessed)
         return {"updated": 0, "skipped": 0, "errors": errors, "duration_s": int(time.time() - run_start)}
 
     # Load to DB
@@ -293,43 +322,65 @@ async def run_pa_pipeline(
         updated = len(results)
 
     duration_s = time.time() - run_start
-    _log_run_stats(county_id, mode, updated, skipped, errors, duration_s)
+    _log_run_stats(county_id, mode, updated, skipped, errors, duration_s,
+                    rate_limited=rate_limited, remaining_unprocessed=remaining_unprocessed)
     logger.info("PA enrichment done | updated=%d skipped=%d errors=%d duration=%.1fs",
                 updated, skipped, errors, duration_s)
 
     return {"updated": updated, "skipped": skipped, "errors": errors, "duration_s": int(duration_s)}
 
 
-def _log_run_stats(county_id: str, mode: str, updated: int, skipped: int, errors: int, duration_s: float) -> None:
-    from sqlalchemy.dialects.postgresql import insert as pg_insert
+def _log_run_stats(
+    county_id: str, mode: str, updated: int, skipped: int, errors: int, duration_s: float,
+    rate_limited: bool = False, remaining_unprocessed: int = 0,
+) -> None:
+    from src.utils.scraper_db_helper import record_scraper_stats
 
+    total = updated + skipped + errors
     try:
-        with get_db_context() as session:
-            values = {
-                "county_id":       county_id,
-                "source_type":     "property_appraiser",
-                "run_date":        datetime.now(timezone.utc).date(),
-                "total_scraped":   updated + skipped + errors,
-                "matched":         updated,
-                "skipped":         skipped,
-                "run_success":     errors == 0,
-                "duration_seconds": round(duration_s, 2),
-            }
-            stmt = (
-                pg_insert(ScraperRunStats)
-                .values(**values)
-                .on_conflict_do_update(
-                    constraint="uq_scraper_run_stats",
-                    set_={
-                        "total_scraped":    values["total_scraped"],
-                        "matched":          values["matched"],
-                        "skipped":          values["skipped"],
-                        "run_success":      values["run_success"],
-                        "duration_seconds": values["duration_seconds"],
-                    },
-                )
+        if rate_limited:
+            # Not a code bug — HCPA/PCPAO throttled this session after
+            # repeated hard failures. Untouched properties stay
+            # hcpa_last_refreshed unset/stale and are picked up automatically
+            # by tomorrow's new-only/refresh run.
+            record_scraper_stats(
+                source_type="property_appraiser",
+                total_scraped=total,
+                matched=updated,
+                unmatched=0,
+                skipped=skipped,
+                run_success=True,
+                error_type="rate_limited",
+                error_message=(
+                    f"Circuit breaker tripped after {_CIRCUIT_BREAKER_WINDOW} consecutive "
+                    f"failures — aborted with {remaining_unprocessed} parcel(s) unprocessed; "
+                    f"will resume next run"
+                ),
+                duration_seconds=round(duration_s, 2),
+                county_id=county_id,
             )
-            session.execute(stmt)
+        else:
+            # A handful of properties routinely fail to scrape (a bad parcel,
+            # a one-off page timeout) at this volume — only flag the day when
+            # failures are frequent enough to suggest a real problem, not on
+            # "any single parcel failed."
+            failure_rate = errors / total if total else 0
+            run_success = not (errors >= 3 and failure_rate > 0.15)
+            record_scraper_stats(
+                source_type="property_appraiser",
+                total_scraped=total,
+                matched=updated,
+                unmatched=0,
+                skipped=skipped,
+                run_success=run_success,
+                error_type=None if run_success else "scraper_error",
+                error_message=(
+                    None if run_success else
+                    f"{errors} of {total} parcel(s) failed to scrape ({failure_rate:.0%} failure rate)"
+                ),
+                duration_seconds=round(duration_s, 2),
+                county_id=county_id,
+            )
     except Exception as e:
         logger.warning("Could not log ScraperRunStats: %s", e)
 

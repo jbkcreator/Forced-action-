@@ -50,6 +50,13 @@ SUNBIZ_BASE = "https://search.sunbiz.org"
 
 _DELAY_SECONDS = 1.5  # polite crawl rate between owners
 
+# Consecutive (not spaced-out) hard Playwright timeouts before treating it as
+# Sunbiz throttling the whole session rather than per-owner bad luck. A
+# genuine not_found/parser_failed result resets this counter since the site
+# clearly responded fine.
+_CIRCUIT_BREAKER_THRESHOLD = 4
+_CIRCUIT_BREAKER_BACKOFF_SECONDS = 60
+
 
 # ---------------------------------------------------------------------------
 # Name normalization for exact-match comparison
@@ -59,6 +66,13 @@ def _normalize(name: str) -> str:
     name = name.upper()
     name = name.replace("&", "AND")
     name = re.sub(r"[.,;'\"]", "", name)
+    # "/" and ":" are treated as word separators for comparison purposes only —
+    # Sunbiz's own search route can't handle either character in the query
+    # (see _sanitize_search_term), but the registered entity name itself may
+    # legitimately contain one (e.g. "MATTAMY TAMPA/SARASOTA LLC"), so a result
+    # row's raw text must still normalize the same way as our space-substituted
+    # search term for the exact-match comparison to succeed.
+    name = re.sub(r"[/:]", " ", name)
     name = re.sub(r"\s+", " ", name)
     return name.strip()
 
@@ -118,33 +132,49 @@ async def _scrape_entity_detail(
     return html, snap
 
 
-_SEARCH_NAME_TRUNCATE_SUFFIXES = ("/TTEE", "/TRUSTEE")
+_SEARCH_NAME_TRUNCATE_SUFFIXES_RE = re.compile(
+    r"\s*/\s*(TTEE|TRUSTEE|TR)\s*$", re.IGNORECASE
+)
+
+# search.sunbiz.org's own client-side JS builds the results-page URL by
+# embedding the raw search term into a route path segment
+# (.../SearchResults/EntityName/{term}/Page1) without percent-encoding it.
+# A literal "/" or ":" in the term therefore splits into an extra path
+# segment the ASP.NET route doesn't recognize, and the server returns a
+# generic "resource ... unavailable" page instead of a results table — which
+# looks identical to a slow/unresponsive site from the caller's side (a
+# #search-results wait_for_selector timeout). Confirmed live against
+# search.sunbiz.org for both characters. There is no way to percent-encode
+# around this (verified: %2F is rejected by the route the same way).
+_URL_BREAKING_CHARS_RE = re.compile(r"[/:]")
 
 
 def _clean_search_name(name: str) -> str:
-    """Strip role/address annotations that aren't part of the actual
-    Sunbiz-registered entity name, so the search term matches a real entity.
+    """Build a Sunbiz-searchable term from a raw owner/property name.
 
-    Property records often append a role or mailing annotation to the owner
-    name (e.g. "BKE REALTY INVESTMENTS LLC/TTEE", "WATERS XF LLC C/O ALTUS
-    GROUP") that isn't part of what's actually registered with Sunbiz —
-    searching the raw string returns no results and the search page hangs
-    waiting for a results table that will never populate, until timeout.
-    Only strips well-known, unambiguous suffixes; leaves genuinely ambiguous
-    internal "/" (e.g. ICON FL TAMPA INDUSTRIAL OWNER POOL 5 GA/FL LLC, where
-    "/" is part of the real name) untouched rather than guessing.
+    Two distinct problems, both turning into the exact same symptom (a
+    #search-results timeout that looks like a scraper failure):
+
+    1. Property records often append a role or mailing annotation to the
+       owner name (e.g. "BKE REALTY INVESTMENTS LLC/TTEE", "WATERS XF LLC
+       C/O ALTUS GROUP") that isn't part of what's actually registered with
+       Sunbiz at all. These are stripped outright.
+    2. Any remaining "/" or ":" — whether or not it's part of the real
+       registered name (e.g. "MATTAMY TAMPA/SARASOTA LLC", "SEFFNER
+       GALATIANS 5:22 LLC") — breaks Sunbiz's own search URL routing. These
+       are replaced with a space rather than stripped, since _normalize()
+       applies the same substitution when comparing a result row's name, so
+       the exact-match comparison still succeeds.
     """
-    cleaned = name
+    cleaned = _SEARCH_NAME_TRUNCATE_SUFFIXES_RE.sub("", name).strip()
     upper = cleaned.upper()
-    for suffix in _SEARCH_NAME_TRUNCATE_SUFFIXES:
-        if upper.endswith(suffix):
-            cleaned = cleaned[: -len(suffix)].strip()
-            upper = cleaned.upper()
-            break
 
     co_idx = upper.find(" C/O ")
     if co_idx != -1:
         cleaned = cleaned[:co_idx].strip()
+
+    cleaned = _URL_BREAKING_CHARS_RE.sub(" ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
 
     return cleaned or name
 
@@ -175,6 +205,7 @@ async def _run_playwright_batch(
 
         try:
             total = len(owners)
+            consecutive_timeouts = 0
             for idx, owner in enumerate(owners, 1):
                 stats["processed"] += 1
                 name = owner.owner_name.strip()
@@ -201,11 +232,35 @@ async def _run_playwright_batch(
                 try:
                     html, snap = await _scrape_entity_detail(page, search_name)
                 except Exception as e:
-                    logger.warning("[Sunbiz] Playwright failed for '%s': %s", name, e)
-                    if not dry_run:
-                        _mark_status(session, owner, "parser_failed")
-                    stats["failed"] += 1
-                    continue
+                    consecutive_timeouts += 1
+                    if consecutive_timeouts >= _CIRCUIT_BREAKER_THRESHOLD:
+                        logger.warning(
+                            "[Sunbiz] %d consecutive Playwright failures — Sunbiz likely "
+                            "throttling this session. Backing off %ds and retrying '%s' once.",
+                            consecutive_timeouts, _CIRCUIT_BREAKER_BACKOFF_SECONDS, name,
+                        )
+                        await asyncio.sleep(_CIRCUIT_BREAKER_BACKOFF_SECONDS)
+                        try:
+                            html, snap = await _scrape_entity_detail(page, search_name)
+                            consecutive_timeouts = 0
+                        except Exception as e2:
+                            stats["rate_limited"] = True
+                            stats["remaining_unprocessed"] = total - idx
+                            logger.error(
+                                "[Sunbiz] Still failing after backoff — aborting run with "
+                                "%d owner(s) unprocessed; will resume next cron run. "
+                                "Last error: %s",
+                                stats["remaining_unprocessed"], e2,
+                            )
+                            break
+                    else:
+                        logger.warning("[Sunbiz] Playwright failed for '%s': %s", name, e)
+                        if not dry_run:
+                            _mark_status(session, owner, "parser_failed")
+                        stats["failed"] += 1
+                        continue
+
+                consecutive_timeouts = 0
 
                 # No exact match in Sunbiz search results — not an error.
                 if snap is None:
@@ -239,11 +294,14 @@ async def _run_playwright_batch(
 
     # Structured outcome log consumed by sunbiz_anomaly_check and log aggregators.
     logger.info(
-        "[Sunbiz] batch_complete processed=%d enriched=%d skipped=%d failed=%d",
+        "[Sunbiz] batch_complete processed=%d enriched=%d skipped=%d failed=%d "
+        "rate_limited=%s remaining_unprocessed=%d",
         stats.get("processed", 0),
         stats.get("enriched", 0),
         stats.get("skipped", 0),
         stats.get("failed", 0),
+        stats.get("rate_limited", False),
+        stats.get("remaining_unprocessed", 0),
     )
 
 
@@ -323,7 +381,10 @@ def enrich_llc_owners(
     from sqlalchemy import or_, desc
     from src.core.models import DistressScore
 
-    stats = {"processed": 0, "enriched": 0, "skipped": 0, "failed": 0}
+    stats = {
+        "processed": 0, "enriched": 0, "skipped": 0, "failed": 0,
+        "rate_limited": False, "remaining_unprocessed": 0,
+    }
 
     llc_keywords = ["%LLC%", "%INC%", "%CORP%", "%LLP%", "%PLLC%", "%LTD%"]
 
@@ -418,18 +479,50 @@ def run_sunbiz_pipeline(
     if not dry_run:
         try:
             from src.utils.scraper_db_helper import record_scraper_stats
-            run_success = stats["failed"] == 0
-            record_scraper_stats(
-                source_type="sunbiz",
-                total_scraped=stats["processed"],
-                matched=stats["enriched"],
-                unmatched=stats["skipped"],
-                skipped=0,
-                run_success=run_success,
-                error_type=None if run_success else "scraper_error",
-                error_message=None if run_success else f"{stats['failed']} owner(s) failed Playwright scrape",
-                county_id=county_id,
-            )
+
+            if stats.get("rate_limited"):
+                # Not a code bug — Sunbiz throttled this session after repeated
+                # hard timeouts. Untouched owners stay sunbiz_status='pending'
+                # and are picked up automatically by tomorrow's run, so this is
+                # informational for the health check, not an actionable error.
+                record_scraper_stats(
+                    source_type="sunbiz",
+                    total_scraped=stats["processed"],
+                    matched=stats["enriched"],
+                    unmatched=stats["skipped"],
+                    skipped=0,
+                    run_success=True,
+                    error_type="rate_limited",
+                    error_message=(
+                        f"Circuit breaker tripped after {_CIRCUIT_BREAKER_THRESHOLD} "
+                        f"consecutive timeouts — aborted with "
+                        f"{stats.get('remaining_unprocessed', 0)} owner(s) unprocessed; "
+                        f"will resume next run"
+                    ),
+                    county_id=county_id,
+                )
+            else:
+                # Individual owners routinely have no Sunbiz match, or hit a
+                # one-off Playwright hiccup, at this volume — only flag the
+                # day when failures are frequent enough to suggest a real
+                # problem rather than "any single owner failed."
+                failure_rate = stats["failed"] / stats["processed"] if stats["processed"] else 0
+                run_success = not (stats["failed"] >= 3 and failure_rate > 0.15)
+                record_scraper_stats(
+                    source_type="sunbiz",
+                    total_scraped=stats["processed"],
+                    matched=stats["enriched"],
+                    unmatched=stats["skipped"],
+                    skipped=0,
+                    run_success=run_success,
+                    error_type=None if run_success else "scraper_error",
+                    error_message=(
+                        None if run_success else
+                        f"{stats['failed']} owner(s) failed Playwright scrape "
+                        f"({failure_rate:.0%} failure rate)"
+                    ),
+                    county_id=county_id,
+                )
         except Exception as e:
             logger.warning("[Sunbiz] Could not record scraper stats: %s", e)
 

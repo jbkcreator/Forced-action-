@@ -66,6 +66,17 @@ class TestClassifyScraperIssues:
         assert {d["source"] for d in data_unavailable} == {"evictions", "probate"}
         assert all(d["reason"] == "no_data" for d in data_unavailable)
 
+    def test_rate_limited_is_always_informational_even_when_run_success_true(self):
+        """error_type='rate_limited' (sunbiz/pa_engine circuit breaker tripped
+        after repeated hard timeouts) is a throttled site, not a code bug —
+        never a real error regardless of run_success."""
+        errors, data_unavailable = _classify_scraper_issues([
+            _row("sunbiz", "rate_limited", "aborted with 42 unprocessed", True),
+        ])
+        assert errors == []
+        assert len(data_unavailable) == 1
+        assert data_unavailable[0]["reason"] == "rate_limited"
+
     def test_export_unavailable_is_a_real_error(self):
         """Post the docket-detail reconstruction fallback, export_unavailable
         only fires when the site was genuinely unreachable this run — treated
