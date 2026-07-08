@@ -4368,6 +4368,7 @@ def deal_capture(payload: DealCaptureRequest, db: Session = Depends(get_db)):
     fires the annual-at-deal-win push.
     """
     from src.core.models import DealOutcome
+    from src.services import outcome_confidence
 
     sub = db.execute(
         select(Subscriber).where(Subscriber.event_feed_uuid == payload.feed_uuid)
@@ -4389,27 +4390,14 @@ def deal_capture(payload: DealCaptureRequest, db: Session = Depends(get_db)):
         pipeline_stage="closed_lost" if payload.deal_size_bucket == "skip" else "closed_won",
         county_id=sub.county_id,
         trade_vertical=sub.vertical,
+        confidence_tier=outcome_confidence.SUBSCRIBER_REPORTED,
+        outcome_source="subscriber_tap",
     )
     db.add(outcome)
     db.flush()
 
-    try:
-        from src.services.cora_suppression import create_suppression
-        create_suppression(
-            db,
-            subscriber_id=sub.id,
-            reason="deal_lost" if payload.deal_size_bucket == "skip" else "deal_won",
-            source="deal_capture",
-            source_id=outcome.id,
-            notes="Auto-pause triggered by deal outcome",
-            cancel_reason="deal_outcome_auto_pause",
-        )
-    except Exception as exc:
-        logger.warning("[DealCapture] cora suppression failed: %s", exc)
-
-    graphic_url: Optional[str] = None
-    annual_offered = False
-
+    # Subscriber-agnostic learning-loop autopsies — run for every outcome,
+    # including ownerless (founder / public-record inferred) rows.
     # Phase 3 A5: pre-decision snapshot (captures all 6 vertical scores at routing time)
     try:
         from src.services.snapshot_service import capture_snapshot
@@ -4436,50 +4424,12 @@ def deal_capture(payload: DealCaptureRequest, db: Session = Depends(get_db)):
         except Exception as exc:
             logger.warning("[DealCapture] loss autopsy failed: %s", exc)
 
-    # Stage 5: generate graphic (idempotent, fails-soft)
-    if payload.deal_size_bucket != "skip":
-        try:
-            from src.services.win_graphic import generate as gen_graphic
-            path = gen_graphic(outcome.id, db)
-            if path:
-                graphic_url = f"/api/win-graphic/{outcome.id}"
-        except Exception as exc:
-            logger.warning("[DealCapture] win graphic gen failed: %s", exc)
-
-        try:
-            from src.services.win_autopsy import record_win_autopsy
-            record_win_autopsy(outcome.id, db)
-        except Exception as exc:
-            logger.warning("[DealCapture] win autopsy failed: %s", exc)
-
-    # Stage 5: annual-at-deal-win trigger for $10K+ deals
-    is_big = (payload.deal_amount and payload.deal_amount >= 10000) \
-        or payload.deal_size_bucket in ("10_25k", "25k_plus")
-    if is_big:
-        try:
-            from src.tasks.annual_push import _push_annual_offer  # noqa: F401
-            # We use the existing push helper which sends the email annual offer.
-            # SMS-side push will land once Subscriber.phone column is added.
-            from src.tasks.annual_push import _push_annual_offer
-            if _push_annual_offer(sub, "deal_win_10k", db):
-                annual_offered = True
-        except Exception as exc:
-            logger.warning("[DealCapture] annual push failed: %s", exc)
-
-    try:
-        from src.services.attribution_service import record_conversion_attribution
-        record_conversion_attribution(
-            conversion_type="deal_win_reported",
-            source_table="deal_outcomes",
-            source_event_id=str(outcome.id),
-            subscriber_id=sub.id,
-            occurred_at=datetime.now(timezone.utc),
-            property_id=payload.property_id,
-            deal_size_bucket=payload.deal_size_bucket,
-            db=db,
-        )
-    except Exception:
-        logger.warning("[DealCapture] Attribution recording failed sub=%s", sub.id, exc_info=True)
+    # Subscriber-only side-effects (win graphic, win story, annual push,
+    # attribution, suppression). No-op for ownerless outcomes — CDE-11.
+    from src.services.deal_outcome_effects import record_outcome_side_effects
+    effects = record_outcome_side_effects(outcome, sub, db)
+    graphic_url: Optional[str] = effects["graphic_url"]
+    annual_offered = effects["annual_offered"]
 
     return {
         "ok": True,

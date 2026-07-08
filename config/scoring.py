@@ -642,3 +642,15 @@ def signal_coverage_pct(vertical: str, cfg: ScoringConfig) -> float:
         w for sig, w in weights.items() if sig in cfg.missing_signals
     )
     return max(0.0, (total - missing_weight) / total)
+
+
+# ── Outcome Confidence Tier weights (CDE-11) ──────────────────────────────────
+# Trust multiplier per DealOutcome confidence_tier, consumed by the learning-loop
+# refit (CDE-13). Keys MUST match the deal_outcomes.confidence_tier CHECK values.
+# Starting values — retune here with no data backfill (weights live in config,
+# not on the row). See CONTEXT.md § Outcome Confidence, ADR 0025.
+OUTCOME_CONFIDENCE_WEIGHTS = {
+    "founder_verified":       1.0,
+    "subscriber_reported":    0.7,
+    "public_record_inferred": 0.4,
+}

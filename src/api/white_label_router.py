@@ -984,8 +984,10 @@ def submit_deal(
         sa_text("""
             INSERT INTO deal_outcomes
                    (subscriber_id, property_id, deal_size_bucket, deal_amount,
-                    pipeline_stage, county_id, trade_vertical, created_at)
-            VALUES (NULL, :pid, :bucket, :amount, :stage, :county, :vertical, now())
+                    pipeline_stage, county_id, trade_vertical,
+                    confidence_tier, outcome_source, created_at)
+            VALUES (NULL, :pid, :bucket, :amount, :stage, :county, :vertical,
+                    'subscriber_reported', 'white_label', now())
             RETURNING id
         """),
         {

@@ -2867,8 +2867,20 @@ class DealOutcome(Base):
     __tablename__ = "deal_outcomes"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    subscriber_id: Mapped[int] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=False, index=True)
+    # Nullable: founder-import and public-record-inferred outcomes have no
+    # subscriber (CDE-11, ADR 0025). Subscriber-only side-effects on the
+    # deal-capture path fire only when this is set.
+    subscriber_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=True, index=True)
     property_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("properties.id"), index=True)
+    # CDE-11 — trust in the outcome LABEL (distinct from A2 Lead Confidence).
+    # Default is the LOWEST tier so an insert that forgets to set it is safe
+    # (never silently high-trust); every real writer sets it explicitly.
+    confidence_tier: Mapped[str] = mapped_column(String(30), nullable=False, server_default=text("'public_record_inferred'"))
+    # Finer provenance: subscriber_tap / founder_import / <connector>. Free text.
+    outcome_source: Mapped[Optional[str]] = mapped_column(String(50))
+    # B0-01 idempotency key for bulk imports (hash of parcel/address|date|amount).
+    # NULL for subscriber-tap rows. Partial unique index (see __table_args__).
+    source_ref: Mapped[Optional[str]] = mapped_column(String(64))
     deal_size_bucket: Mapped[Optional[str]] = mapped_column(String(20))  # 5_10k/10_25k/25k_plus/skip
     deal_amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
     deal_date: Mapped[Optional[date]] = mapped_column(Date)
@@ -2890,8 +2902,19 @@ class DealOutcome(Base):
             "pipeline_stage IS NULL OR pipeline_stage IN ('lead','contacted','qualified','proposal','negotiation','closed_won','closed_lost')",
             name="check_deal_pipeline_stage",
         ),
+        CheckConstraint(
+            "confidence_tier IN ('founder_verified','subscriber_reported','public_record_inferred')",
+            name="ck_deal_outcomes_confidence_tier",
+        ),
         Index("idx_deal_outcome_pipeline_stage", "pipeline_stage"),
         Index("idx_deal_outcomes_county_vertical", "county_id", "trade_vertical"),
+        Index("idx_deal_outcomes_confidence_tier", "confidence_tier"),
+        Index(
+            "uq_deal_outcomes_source_ref",
+            "source_ref",
+            unique=True,
+            postgresql_where=text("source_ref IS NOT NULL"),
+        ),
     )
 
     def __repr__(self):
