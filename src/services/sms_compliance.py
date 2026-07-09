@@ -145,6 +145,19 @@ def record_opt_out(
         select(SmsOptOut).where(SmsOptOut.phone == phone)
     ).scalar_one_or_none()
     if existing:
+        # Already suppressed on SMS — still run the email cascade. A phone
+        # opted out before the cross-channel cascade shipped (or whose sibling
+        # email changed since) must not be skipped on every repeat STOP/IVR
+        # opt-out forever (ADR 0028 — an opt-out on any channel blocks every
+        # channel, not just the first time we see it).
+        try:
+            from src.services.email_suppression import suppress_contact
+            suppress_contact(db, phone=phone, source="cascaded_from_sms")
+        except Exception:
+            logger.warning(
+                "record_opt_out: email cascade failed for already-suppressed phone=%s",
+                phone, exc_info=True,
+            )
         return
     db.add(SmsOptOut(
         phone=phone,

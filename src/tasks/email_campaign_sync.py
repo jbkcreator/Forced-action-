@@ -87,11 +87,20 @@ def _sync_lead_statuses(campaign, dry_run: bool) -> dict:
     Pull per-contact statuses from Instantly, update engagement_status,
     and map unsubscribe/hard-bounce to global suppression on DBPRContact.
     """
+    from sqlalchemy import or_
+
     from src.core.database import get_db_context
     from src.core.models import CampaignContact, DBPRContact
     from src.services import instantly_service as instantly
     from src.services.instantly_service import map_lead_status
     from src.services.email_suppression import suppress_contact
+
+    def _suppress_dbpr_contact(db, dc, reported_email, source):
+        # Suppress every address this contact could be sent to — the actual
+        # Instantly-reported lead email plus both DBPR sibling fields — since
+        # campaign sends and eligibility filters both use email OR work_email.
+        for addr in {a for a in (reported_email, dc.email, dc.work_email) if a}:
+            suppress_contact(db, email=addr, source=source)
 
     if not campaign.instantly_campaign_id:
         return {"synced": 0}
@@ -129,9 +138,10 @@ def _sync_lead_statuses(campaign, dry_run: bool) -> dict:
                             .first()
                         )
                     if not cc and email:
-                        # fallback: match by email through DBPRContact
+                        # fallback: match by email through DBPRContact — check
+                        # both fields, since Instantly may have sent to work_email
                         dc = db.query(DBPRContact).filter(
-                            DBPRContact.email.ilike(email)
+                            or_(DBPRContact.email.ilike(email), DBPRContact.work_email.ilike(email))
                         ).first()
                         if dc:
                             cc = (
@@ -154,8 +164,7 @@ def _sync_lead_statuses(campaign, dry_run: bool) -> dict:
                                 dc.is_opted_out = True
                                 dc.updated_at = now
                                 db.add(dc)
-                                if dc.email:
-                                    suppress_contact(db, email=dc.email, source="instantly_sync")
+                                _suppress_dbpr_contact(db, dc, email, source="instantly_sync")
                                 logger.info(
                                     "[Sync] is_opted_out=TRUE for dbpr_contact %d (campaign %d)",
                                     dc.id, campaign.id,
@@ -164,8 +173,7 @@ def _sync_lead_statuses(campaign, dry_run: bool) -> dict:
                                 dc.is_hard_bounced = True
                                 dc.updated_at = now
                                 db.add(dc)
-                                if dc.email:
-                                    suppress_contact(db, email=dc.email, source="instantly_sync")
+                                _suppress_dbpr_contact(db, dc, email, source="instantly_sync")
                                 logger.info(
                                     "[Sync] is_hard_bounced=TRUE for dbpr_contact %d (campaign %d)",
                                     dc.id, campaign.id,

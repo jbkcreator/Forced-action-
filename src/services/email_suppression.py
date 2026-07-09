@@ -36,38 +36,53 @@ def is_email_suppressed(db, email: str) -> bool:
     return row is not None
 
 
+# Matches by last-10-digits after stripping all non-digits, so a normalized
+# E.164 input (+18135551000) still matches a raw/local stored value
+# (8135551000, (813) 555-1000, ...) — DBPR-imported phones aren't guaranteed
+# to be normalized at write time, unlike subscribers.phone.
+def _phone_match_clause(col: str) -> str:
+    return (
+        f"right(regexp_replace({col}, '[^0-9]', '', 'g'), 10) = "
+        f"right(regexp_replace(:p, '[^0-9]', '', 'g'), 10)"
+    )
+
+
 def _resolve_phone_for_email(db, email: str) -> Optional[str]:
     """Find a phone belonging to the same contact as `email`, across the
-    subscriber and DBPR-contact populations."""
+    subscriber and DBPR-contact populations. Always returns a normalized
+    E.164 phone so callers never write a raw/local value into sms_opt_outs."""
     row = db.execute(
         text("SELECT phone FROM subscribers "
              "WHERE lower(email) = :e AND phone IS NOT NULL LIMIT 1"),
         {"e": email},
     ).fetchone()
-    if row and row[0]:
-        return row[0]
-    row = db.execute(
-        text("SELECT phone FROM dbpr_contacts "
-             "WHERE (lower(email) = :e OR lower(work_email) = :e) "
-             "AND phone IS NOT NULL AND phone <> '' LIMIT 1"),
-        {"e": email},
-    ).fetchone()
-    return row[0] if row and row[0] else None
+    if not (row and row[0]):
+        row = db.execute(
+            text("SELECT phone FROM dbpr_contacts "
+                 "WHERE (lower(email) = :e OR lower(work_email) = :e) "
+                 "AND phone IS NOT NULL AND phone <> '' LIMIT 1"),
+            {"e": email},
+        ).fetchone()
+    if not (row and row[0]):
+        return None
+    return normalize_phone(row[0])
 
 
 def _resolve_email_for_phone(db, phone: str) -> Optional[str]:
     """Find an email belonging to the same contact as `phone`, across the
-    subscriber and DBPR-contact populations."""
+    subscriber and DBPR-contact populations. Matches on last-10-digits so a
+    raw/unnormalized stored phone (e.g. DBPR import data) still resolves."""
     row = db.execute(
-        text("SELECT email FROM subscribers "
-             "WHERE phone = :p AND email IS NOT NULL LIMIT 1"),
+        text(f"SELECT email FROM subscribers "
+             f"WHERE {_phone_match_clause('phone')} AND email IS NOT NULL LIMIT 1"),
         {"p": phone},
     ).fetchone()
     if row and row[0]:
         return row[0]
     row = db.execute(
-        text("SELECT COALESCE(NULLIF(email, ''), work_email) AS addr FROM dbpr_contacts "
-             "WHERE phone = :p AND COALESCE(NULLIF(email, ''), work_email) IS NOT NULL LIMIT 1"),
+        text(f"SELECT COALESCE(NULLIF(email, ''), work_email) AS addr FROM dbpr_contacts "
+             f"WHERE {_phone_match_clause('phone')} "
+             f"AND COALESCE(NULLIF(email, ''), work_email) IS NOT NULL LIMIT 1"),
         {"p": phone},
     ).fetchone()
     return row[0] if row and row[0] else None

@@ -19,6 +19,9 @@ UNSUB_EMAIL = "stgsync-unsub@example.com"
 PUSH_EMAIL = "stgsync-push@example.com"
 CAMPAIGN_NAME = "[STAGING TEST] Suppression Sync"
 
+WORK_EMAIL_LICENSE = f"{LICENSE_PREFIX}WORK-1"
+WORK_EMAIL = "stgsync-work@example.com"
+
 
 def _pg_url():
     try:
@@ -42,7 +45,7 @@ def _cleanup():
             db.query(CampaignContact).filter(CampaignContact.campaign_id.in_(camp_ids)).delete(synchronize_session=False)
             db.query(EmailCampaign).filter(EmailCampaign.id.in_(camp_ids)).delete(synchronize_session=False)
         db.query(DBPRContact).filter(DBPRContact.license_number.like(f"{LICENSE_PREFIX}%")).delete(synchronize_session=False)
-        db.query(EmailOptOut).filter(EmailOptOut.email.in_([UNSUB_EMAIL, PUSH_EMAIL])).delete(synchronize_session=False)
+        db.query(EmailOptOut).filter(EmailOptOut.email.in_([UNSUB_EMAIL, PUSH_EMAIL, WORK_EMAIL])).delete(synchronize_session=False)
         db.commit()
 
 
@@ -90,6 +93,51 @@ def test_inbound_unsubscribe_cascades_to_email_opt_outs():
 
     assert opted_out is not None
     assert opted_out.source == "instantly_sync"
+    assert contact.is_opted_out is True
+
+
+def test_inbound_unsubscribe_matches_via_work_email_when_lead_id_absent():
+    """When instantly_lead_id matching fails, the fallback lookup must also
+    check DBPRContact.work_email (not just email) — DBPR sends can target
+    either field — and must suppress the actual reported address."""
+    from src.tasks.email_campaign_sync import _sync_lead_statuses
+
+    with get_db_context() as db:
+        contact = DBPRContact(
+            license_number=WORK_EMAIL_LICENSE,
+            license_type_code="RC",
+            full_name="Work Email Contractor",
+            county_id="hillsborough",
+            vertical="roofing",
+            enrichment_status="enriched",
+            email=None,
+            work_email=WORK_EMAIL,
+        )
+        db.add(contact)
+        db.flush()
+        campaign = EmailCampaign(name=CAMPAIGN_NAME, instantly_campaign_id="inst_camp_stgsync_work", status="active")
+        db.add(campaign)
+        db.flush()
+        db.add(CampaignContact(campaign_id=campaign.id, dbpr_contact_id=contact.id))
+        db.commit()
+        campaign_id = campaign.id
+
+    # No instantly_lead_id on the campaign_contact row, so this must go
+    # through the email-fallback lookup — matched by work_email, not email.
+    fake_page = {
+        "leads": [{"id": None, "email": WORK_EMAIL, "status": "unsubscribed"}],
+        "next_starting_after": None,
+    }
+    with get_db_context() as db:
+        campaign = db.get(EmailCampaign, campaign_id)
+        with patch("src.services.instantly_service.list_leads", return_value=fake_page):
+            _sync_lead_statuses(campaign, dry_run=False)
+
+    with get_db_context() as db:
+        opted_out = db.query(EmailOptOut).filter_by(email=WORK_EMAIL).first()
+        contact = db.query(DBPRContact).filter_by(license_number=WORK_EMAIL_LICENSE).first()
+
+    assert opted_out is not None, "work_email must be suppressed, not silently missed"
     assert contact.is_opted_out is True
 
 
