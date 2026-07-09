@@ -102,3 +102,31 @@ def test_find_candidates_newest_first_and_cap_respected(fresh_db):
 
     capped = non_buyer_nurture.find_candidates(fresh_db, limit=1)
     assert len(capped) == 1
+
+
+def test_record_checkout_abandon_candidate_is_idempotent(fresh_db):
+    non_buyer_nurture.record_checkout_abandon_candidate(fresh_db, "abandoned@example.com")
+    non_buyer_nurture.record_checkout_abandon_candidate(fresh_db, "abandoned@example.com")
+    fresh_db.flush()
+
+    rows = (
+        fresh_db.query(NonBuyerNurtureSequence)
+        .filter_by(email="abandoned@example.com")
+        .all()
+    )
+    assert len(rows) == 1
+    assert rows[0].source == "checkout_abandon"
+    assert rows[0].status == "eligible"
+
+
+def test_find_candidates_surfaces_checkout_abandon_eligible_row(fresh_db):
+    now = datetime.now(timezone.utc)
+    fresh_db.add(NonBuyerNurtureSequence(
+        email="abandon_cand@example.com", source="checkout_abandon",
+        captured_at=now - timedelta(hours=30), status="eligible",
+    ))
+    fresh_db.flush()
+
+    candidates = non_buyer_nurture.find_candidates(fresh_db, limit=10_000)
+    emails = [c["email"] for c in candidates]
+    assert emails.count("abandon_cand@example.com") == 1
