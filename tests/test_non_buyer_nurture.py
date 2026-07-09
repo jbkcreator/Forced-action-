@@ -6,6 +6,7 @@ Real DB (fresh_db), Instantly mocked.
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from unittest.mock import patch
 
 from src.core.models import NonBuyerNurtureSequence, Subscriber
 from src.services import non_buyer_nurture
@@ -130,3 +131,62 @@ def test_find_candidates_surfaces_checkout_abandon_eligible_row(fresh_db):
     candidates = non_buyer_nurture.find_candidates(fresh_db, limit=10_000)
     emails = [c["email"] for c in candidates]
     assert emails.count("abandon_cand@example.com") == 1
+
+
+def test_enroll_marks_enrolled_on_instantly_success(fresh_db):
+    now = datetime.now(timezone.utc)
+    candidate = {
+        "email": "enroll_ok@example.com",
+        "subscriber_id": None,
+        "source": "free_signup",
+        "captured_at": now - timedelta(hours=30),
+    }
+
+    with patch.object(non_buyer_nurture.instantly, "add_leads", return_value={"leads_created": 1}) as mock_add:
+        non_buyer_nurture.enroll(fresh_db, [candidate], campaign_id="camp_123")
+
+    mock_add.assert_called_once()
+    row = fresh_db.query(NonBuyerNurtureSequence).filter_by(email="enroll_ok@example.com").one()
+    assert row.status == "enrolled"
+    assert row.instantly_campaign_id == "camp_123"
+    assert row.enrolled_at is not None
+    assert row.eligible_at is not None
+
+
+def test_enroll_leaves_eligible_on_instantly_failure(fresh_db):
+    now = datetime.now(timezone.utc)
+    candidate = {
+        "email": "enroll_fail@example.com",
+        "subscriber_id": None,
+        "source": "free_signup",
+        "captured_at": now - timedelta(hours=30),
+    }
+
+    with patch.object(non_buyer_nurture.instantly, "add_leads", return_value=None):
+        non_buyer_nurture.enroll(fresh_db, [candidate], campaign_id="camp_123")
+
+    row = fresh_db.query(NonBuyerNurtureSequence).filter_by(email="enroll_fail@example.com").one()
+    assert row.status == "eligible"
+    assert row.enrolled_at is None
+
+
+def test_enroll_updates_existing_eligible_row_not_duplicate(fresh_db):
+    now = datetime.now(timezone.utc)
+    fresh_db.add(NonBuyerNurtureSequence(
+        email="retry@example.com", source="checkout_abandon",
+        captured_at=now - timedelta(hours=30), status="eligible",
+    ))
+    fresh_db.flush()
+
+    candidate = {
+        "email": "retry@example.com",
+        "subscriber_id": None,
+        "source": "checkout_abandon",
+        "captured_at": now - timedelta(hours=30),
+    }
+    with patch.object(non_buyer_nurture.instantly, "add_leads", return_value={"leads_created": 1}):
+        non_buyer_nurture.enroll(fresh_db, [candidate], campaign_id="camp_123")
+
+    rows = fresh_db.query(NonBuyerNurtureSequence).filter_by(email="retry@example.com").all()
+    assert len(rows) == 1
+    assert rows[0].status == "enrolled"

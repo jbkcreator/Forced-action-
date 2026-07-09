@@ -18,6 +18,7 @@ from typing import Optional
 from sqlalchemy import select
 
 from src.core.models import NonBuyerNurtureSequence, Subscriber, WaitlistEntry
+from src.services import instantly_service as instantly
 
 logger = logging.getLogger(__name__)
 
@@ -137,3 +138,47 @@ def find_candidates(db, limit: int = DAILY_CAP) -> list[dict]:
 def _as_utc(dt: datetime) -> datetime:
     """Subscriber.created_at is a naive TIMESTAMP column; treat naive as UTC."""
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def enroll(db, candidates: list[dict], campaign_id: str) -> dict:
+    """
+    Batch-add candidates to the shared nurture campaign in one Instantly call.
+    On success, all candidates are written as 'enrolled'. On failure, they're
+    inserted/left as 'eligible' so the next sweep retries — never fake enrollment.
+    """
+    if not candidates:
+        return {"enrolled": 0, "retried": 0}
+
+    now = datetime.now(timezone.utc)
+    leads = [{"email": c["email"]} for c in candidates]
+    result = instantly.add_leads(campaign_id, leads)
+    succeeded = result is not None
+
+    existing_rows = {
+        row.email: row
+        for row in db.execute(
+            select(NonBuyerNurtureSequence).where(
+                NonBuyerNurtureSequence.email.in_([c["email"] for c in candidates])
+            )
+        ).scalars().all()
+    }
+
+    for c in candidates:
+        row = existing_rows.get(c["email"])
+        if row is None:
+            row = NonBuyerNurtureSequence(
+                email=c["email"],
+                subscriber_id=c["subscriber_id"],
+                source=c["source"],
+                captured_at=c["captured_at"],
+                status="eligible",
+            )
+            db.add(row)
+
+        if succeeded:
+            row.status = "enrolled"
+            row.instantly_campaign_id = campaign_id
+            row.eligible_at = row.eligible_at or now
+            row.enrolled_at = now
+
+    return {"enrolled": len(candidates) if succeeded else 0, "retried": 0 if succeeded else len(candidates)}
