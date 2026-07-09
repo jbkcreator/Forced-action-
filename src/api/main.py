@@ -135,10 +135,12 @@ from src.api.metrics_router import router as metrics_router  # noqa: E402
 from src.api.alert_webhook_router import router as alert_webhook_router  # noqa: E402
 from src.api.revenue_metrics_router import router as revenue_metrics_router  # noqa: E402
 from src.api.admin_leads_router import router as admin_leads_router  # noqa: E402
+from src.api.funnel_analytics_router import router as funnel_analytics_router  # noqa: E402
 app.include_router(metrics_router)
 app.include_router(alert_webhook_router)
 app.include_router(revenue_metrics_router)
 app.include_router(admin_leads_router)
+app.include_router(funnel_analytics_router)
 
 from src.api.bankruptcy_alert_router import router as bankruptcy_alert_router  # noqa: E402
 app.include_router(bankruptcy_alert_router)

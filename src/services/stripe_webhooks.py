@@ -1135,6 +1135,21 @@ def _on_payment_succeeded(invoice: dict, db: Session) -> None:
         except Exception:
             logger.warning("Attribution recording failed sub=%s", subscriber.id, exc_info=True)
 
+    # Funnel analytics: log a rebill event for standard subscription renewals.
+    # Wallet-subscription renewals go through _on_wallet_subscription_invoice
+    # above and are not covered here.
+    if billing_reason and billing_reason != "subscription_create":
+        try:
+            from src.services.business_events import log_business_event
+            log_business_event(
+                "SUBSCRIPTION_RENEWED",
+                subscriber_id=subscriber.id,
+                payload={"invoice_id": invoice.get("id"), "billing_reason": billing_reason},
+                db=db,
+            )
+        except Exception:
+            logger.warning("SUBSCRIPTION_RENEWED business event failed sub=%s", subscriber.id, exc_info=True)
+
     # Send payment receipt email only for renewals, not initial signup
     if subscriber.email and billing_reason != "subscription_create":
         from src.services.email import send_email

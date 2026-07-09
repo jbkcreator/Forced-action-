@@ -62,6 +62,9 @@ BUSINESS_EVENT_TYPES = frozenset({
     "SUBSCRIBER_LOGIN",
     "DASHBOARD_VIEW",
     "LEAD_DOWNLOAD",
+    # Funnel analytics — visits/sample-views/checkout/paid/rebilled stage counts.
+    "SAMPLE_LEADS_VIEWED",
+    "SUBSCRIPTION_RENEWED",
 })
 
 
