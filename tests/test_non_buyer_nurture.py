@@ -252,3 +252,70 @@ def test_mark_converted_idempotent_on_replay(fresh_db):
         non_buyer_nurture.mark_converted(fresh_db, "replay@example.com")
 
     mock_remove.assert_called_once()
+
+
+def test_apply_instantly_status_unsubscribed_is_terminal(fresh_db):
+    now = datetime.now(timezone.utc)
+    fresh_db.add(NonBuyerNurtureSequence(
+        email="unsub@example.com", source="free_signup",
+        captured_at=now - timedelta(hours=30), status="enrolled",
+        instantly_campaign_id="camp_1", instantly_lead_id="lead_3",
+        enrolled_at=now,
+    ))
+    fresh_db.flush()
+
+    non_buyer_nurture.apply_instantly_status(fresh_db, "unsub@example.com", "unsubscribed")
+
+    row = fresh_db.query(NonBuyerNurtureSequence).filter_by(email="unsub@example.com").one()
+    assert row.status == "unsubscribed"
+    assert row.removal_reason == "unsubscribe"
+    assert row.removed_at is not None
+
+
+def test_apply_instantly_status_bounced_is_terminal(fresh_db):
+    now = datetime.now(timezone.utc)
+    fresh_db.add(NonBuyerNurtureSequence(
+        email="bounce@example.com", source="free_signup",
+        captured_at=now - timedelta(hours=30), status="enrolled",
+        instantly_campaign_id="camp_1", instantly_lead_id="lead_4",
+        enrolled_at=now,
+    ))
+    fresh_db.flush()
+
+    non_buyer_nurture.apply_instantly_status(fresh_db, "bounce@example.com", "bounced")
+
+    row = fresh_db.query(NonBuyerNurtureSequence).filter_by(email="bounce@example.com").one()
+    assert row.status == "bounced"
+    assert row.removal_reason == "bounce"
+
+
+def test_apply_instantly_status_backfills_lead_id_without_status_change(fresh_db):
+    now = datetime.now(timezone.utc)
+    fresh_db.add(NonBuyerNurtureSequence(
+        email="active@example.com", source="free_signup",
+        captured_at=now - timedelta(hours=30), status="enrolled",
+        instantly_campaign_id="camp_1", instantly_lead_id=None,
+        enrolled_at=now,
+    ))
+    fresh_db.flush()
+
+    non_buyer_nurture.apply_instantly_status(fresh_db, "active@example.com", "active", instantly_lead_id="lead_5")
+
+    row = fresh_db.query(NonBuyerNurtureSequence).filter_by(email="active@example.com").one()
+    assert row.status == "enrolled"
+    assert row.instantly_lead_id == "lead_5"
+
+
+def test_apply_instantly_status_does_not_downgrade_converted(fresh_db):
+    now = datetime.now(timezone.utc)
+    fresh_db.add(NonBuyerNurtureSequence(
+        email="already_converted@example.com", source="free_signup",
+        captured_at=now - timedelta(hours=30), status="converted",
+        removal_reason="paid_conversion", converted_at=now, removed_at=now,
+    ))
+    fresh_db.flush()
+
+    non_buyer_nurture.apply_instantly_status(fresh_db, "already_converted@example.com", "bounced")
+
+    row = fresh_db.query(NonBuyerNurtureSequence).filter_by(email="already_converted@example.com").one()
+    assert row.status == "converted"

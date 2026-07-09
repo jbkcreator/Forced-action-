@@ -205,3 +205,33 @@ def mark_converted(db, email: str) -> None:
     row.removal_reason = "paid_conversion"
     row.converted_at = now
     row.removed_at = now
+
+
+_TERMINAL_STATUSES = {"converted", "unsubscribed", "bounced", "removed"}
+_TERMINAL_MAP = {"unsubscribed": "unsubscribe", "bounced": "bounce"}
+
+
+def apply_instantly_status(db, email: str, mapped_status: str, instantly_lead_id: Optional[str] = None) -> None:
+    """
+    Sync hook: apply an Instantly-mapped lead status (see
+    instantly_service.map_lead_status) to the nurture row. unsubscribed/
+    bounced are terminal (block re-enrollment via the once-per-email row).
+    Never downgrades an already-terminal row. Also backfills instantly_lead_id.
+    """
+    row = db.execute(
+        select(NonBuyerNurtureSequence).where(NonBuyerNurtureSequence.email == email)
+    ).scalar_one_or_none()
+    if row is None:
+        return
+
+    if instantly_lead_id and not row.instantly_lead_id:
+        row.instantly_lead_id = instantly_lead_id
+
+    if row.status in _TERMINAL_STATUSES:
+        return
+
+    reason = _TERMINAL_MAP.get(mapped_status)
+    if reason:
+        row.status = mapped_status
+        row.removal_reason = reason
+        row.removed_at = datetime.now(timezone.utc)
