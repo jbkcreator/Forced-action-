@@ -21,7 +21,7 @@ from typing import Optional
 
 from playwright.sync_api import Page, sync_playwright
 
-from src.utils.http_helpers import STEALTH_ARGS, STEALTH_UA, get_playwright_proxy
+from src.utils.http_helpers import STEALTH_ARGS, STEALTH_UA, get_playwright_proxy, get_stealth
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +58,7 @@ def post_answer_to_quora(
     with sync_playwright() as pw:
         context = pw.chromium.launch_persistent_context(
             user_data_dir=str(_PROFILE_DIR),
-            headless=False,
+            headless=True,
             args=STEALTH_ARGS,
             user_agent=STEALTH_UA,
             locale="en-US",
@@ -67,6 +67,7 @@ def post_answer_to_quora(
         )
         try:
             page = context.new_page()
+            page.add_init_script(get_stealth().script_payload)
             answer_id = _submit_answer(page, qid, question_url, answer_markdown)
             return answer_id
         except Exception as exc:

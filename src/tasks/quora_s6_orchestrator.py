@@ -117,7 +117,9 @@ async def run_keyword(
 
     logger.info("[orchestrator] keyword=%r  dry_run=%s", keyword, dry_run)
 
-    responses = await scrape_quora([keyword], max_results=_MAX_RESULTS_PER_KEYWORD, dump_raw=False)
+    responses = await scrape_quora(
+        [keyword], max_results=_MAX_RESULTS_PER_KEYWORD, headless=True, dump_raw=False
+    )
 
     summary = {"keyword": keyword, "scraped": 0, "classified": 0,
                "drafted": 0, "skipped": 0, "errors": 0}
