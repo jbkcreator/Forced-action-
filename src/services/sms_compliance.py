@@ -215,6 +215,18 @@ def record_opt_out(
             phone, exc_info=True,
         )
 
+    # Cross-channel cascade: a phone opt-out must also suppress email for the
+    # same contact (ADR 0028 — block every channel). Best-effort: if no sibling
+    # email is on file the helper is a no-op. Never let this block the SMS
+    # suppression write (compliance must win).
+    try:
+        from src.services.email_suppression import suppress_contact
+        suppress_contact(db, phone=phone, source="cascaded_from_sms")
+    except Exception:
+        logger.warning(
+            "record_opt_out: email cascade failed for phone=%s", phone, exc_info=True,
+        )
+
 
 def add_to_dead_letter(
     phone: Optional[str],

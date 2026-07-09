@@ -32,6 +32,8 @@ def send_email(
     body_html: Optional[str] = None,
     attachments: Optional[List[Union[str, Path]]] = None,
     cc: Optional[List[str]] = None,
+    list_unsubscribe_url: Optional[str] = None,
+    db=None,
 ) -> bool:
     """
     Send a transactional email via SMTP.
@@ -53,6 +55,27 @@ def send_email(
 
     if not all([settings.smtp_host, settings.smtp_user, settings.smtp_pass]):
         logger.debug("SMTP not configured — skipping email to %s", to)
+        return False
+
+    # Do-Not-Contact gate. Fail closed: if the suppression check itself errors
+    # (DB blip, pool exhaustion) we do NOT send — sending to a possibly-opted-out
+    # address is the compliance risk. Never let the gate's DB dependency crash
+    # send_email(); it has always been a non-throwing bool. Reuse the caller's
+    # session when given, else open a short-lived one.
+    from src.services.email_suppression import is_email_suppressed
+
+    try:
+        if db is not None:
+            suppressed = is_email_suppressed(db, to)
+        else:
+            from src.core.database import get_db_context
+            with get_db_context() as _db:
+                suppressed = is_email_suppressed(_db, to)
+    except Exception as exc:
+        logger.error("Suppression check failed for %s (%s) — not sending", to, exc)
+        return False
+    if suppressed:
+        logger.info("Email to %s suppressed (opted out) — skipping send", to)
         return False
 
     from_addr = settings.email_from or settings.smtp_user
@@ -98,6 +121,9 @@ def send_email(
         msg["Subject"] = subject
         msg["From"] = from_addr
         msg["To"] = to
+        if list_unsubscribe_url:
+            msg["List-Unsubscribe"] = f"<{list_unsubscribe_url}>"
+            msg["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
         if cc:
             msg["Cc"] = ", ".join(cc)
             # Tell Mandrill to preserve original To/Cc headers for all recipients

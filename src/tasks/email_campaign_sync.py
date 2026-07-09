@@ -91,6 +91,7 @@ def _sync_lead_statuses(campaign, dry_run: bool) -> dict:
     from src.core.models import CampaignContact, DBPRContact
     from src.services import instantly_service as instantly
     from src.services.instantly_service import map_lead_status
+    from src.services.email_suppression import suppress_contact
 
     if not campaign.instantly_campaign_id:
         return {"synced": 0}
@@ -110,7 +111,7 @@ def _sync_lead_statuses(campaign, dry_run: bool) -> dict:
             with get_db_context() as db:
                 for lead in leads:
                     instantly_lead_id = lead.get("id") or lead.get("lead_id")
-                    email = lead.get("email", "").lower()
+                    email = (lead.get("email") or "").lower()
                     raw_status = (
                         lead.get("interest_status")
                         or lead.get("status")
@@ -153,6 +154,8 @@ def _sync_lead_statuses(campaign, dry_run: bool) -> dict:
                                 dc.is_opted_out = True
                                 dc.updated_at = now
                                 db.add(dc)
+                                if dc.email:
+                                    suppress_contact(db, email=dc.email, source="instantly_sync")
                                 logger.info(
                                     "[Sync] is_opted_out=TRUE for dbpr_contact %d (campaign %d)",
                                     dc.id, campaign.id,
@@ -161,6 +164,8 @@ def _sync_lead_statuses(campaign, dry_run: bool) -> dict:
                                 dc.is_hard_bounced = True
                                 dc.updated_at = now
                                 db.add(dc)
+                                if dc.email:
+                                    suppress_contact(db, email=dc.email, source="instantly_sync")
                                 logger.info(
                                     "[Sync] is_hard_bounced=TRUE for dbpr_contact %d (campaign %d)",
                                     dc.id, campaign.id,
@@ -174,6 +179,47 @@ def _sync_lead_statuses(campaign, dry_run: bool) -> dict:
             break
 
     return {"synced": synced}
+
+
+_BLOCKLIST_CHUNK = 100
+
+
+def _sync_outbound_suppressions(dry_run: bool) -> int:
+    """Push not-yet-pushed email_opt_outs rows to Instantly's block list, so
+    it stops contacting addresses we've suppressed (unsubscribe endpoint, SMS
+    STOP cascade, etc — the reverse direction from _sync_lead_statuses).
+
+    Global, once per run (email_opt_outs is a cross-channel table, not
+    campaign-scoped). Uses a durable per-row `pushed_to_instantly` flag rather
+    than a time watermark, so opt-outs created mid-run and failed/partial
+    pushes are retried on the next run instead of being silently dropped."""
+    from sqlalchemy import text
+    from src.core.database import get_db_context
+    from src.services import instantly_service as instantly
+
+    with get_db_context() as db:
+        rows = db.execute(text(
+            "SELECT email FROM email_opt_outs WHERE pushed_to_instantly = false ORDER BY id"
+        )).fetchall()
+        emails = [r[0] for r in rows]
+
+    if not emails:
+        return 0
+    if dry_run:
+        logger.info("[Sync] DRY RUN — would push %d opt-out(s) to Instantly block list", len(emails))
+        return len(emails)
+
+    pushed = 0
+    for i in range(0, len(emails), _BLOCKLIST_CHUNK):
+        chunk = emails[i:i + _BLOCKLIST_CHUNK]
+        if instantly.add_to_block_list(chunk):
+            with get_db_context() as db:
+                db.execute(
+                    text("UPDATE email_opt_outs SET pushed_to_instantly = true WHERE email = ANY(:e)"),
+                    {"e": chunk},
+                )
+            pushed += len(chunk)
+    return pushed
 
 
 def _lifecycle_check(campaign, dry_run: bool) -> None:
@@ -244,7 +290,7 @@ def run(dry_run: bool = False) -> dict:
             .all()
         )
 
-    stats: dict = {"campaigns": len(campaigns), "analytics": 0, "leads_synced": 0, "errors": []}
+    stats: dict = {"campaigns": len(campaigns), "analytics": 0, "leads_synced": 0, "opt_outs_pushed": 0, "errors": []}
 
     for camp in campaigns:
         try:
@@ -273,6 +319,13 @@ def run(dry_run: bool = False) -> dict:
                 if c:
                     c.last_synced_at = datetime.now(timezone.utc)
                     db.add(c)
+
+    # Outbound suppression push — global, once per run (not per campaign).
+    try:
+        stats["opt_outs_pushed"] = _sync_outbound_suppressions(dry_run)
+    except Exception as exc:
+        logger.error("[Sync] Outbound suppression push failed: %s", exc)
+        stats["errors"].append(f"outbound_suppression:{exc}")
 
     if stats["errors"]:
         send_alert(
