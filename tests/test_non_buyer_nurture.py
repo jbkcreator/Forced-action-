@@ -190,3 +190,65 @@ def test_enroll_updates_existing_eligible_row_not_duplicate(fresh_db):
     rows = fresh_db.query(NonBuyerNurtureSequence).filter_by(email="retry@example.com").all()
     assert len(rows) == 1
     assert rows[0].status == "enrolled"
+
+
+def test_mark_converted_removes_lead_and_marks_converted(fresh_db):
+    now = datetime.now(timezone.utc)
+    fresh_db.add(NonBuyerNurtureSequence(
+        email="convert_me@example.com", source="free_signup",
+        captured_at=now - timedelta(hours=30), status="enrolled",
+        instantly_campaign_id="camp_1", instantly_lead_id="lead_1",
+        enrolled_at=now,
+    ))
+    fresh_db.flush()
+
+    with patch.object(non_buyer_nurture.instantly, "remove_lead", return_value=True) as mock_remove:
+        non_buyer_nurture.mark_converted(fresh_db, "convert_me@example.com")
+
+    mock_remove.assert_called_once_with("lead_1")
+    row = fresh_db.query(NonBuyerNurtureSequence).filter_by(email="convert_me@example.com").one()
+    assert row.status == "converted"
+    assert row.removal_reason == "paid_conversion"
+    assert row.converted_at is not None
+    assert row.removed_at is not None
+
+
+def test_mark_converted_without_lead_id_still_converts(fresh_db):
+    now = datetime.now(timezone.utc)
+    fresh_db.add(NonBuyerNurtureSequence(
+        email="convert_nolead@example.com", source="waitlist",
+        captured_at=now - timedelta(hours=30), status="enrolled",
+        instantly_campaign_id="camp_1", instantly_lead_id=None,
+        enrolled_at=now,
+    ))
+    fresh_db.flush()
+
+    with patch.object(non_buyer_nurture.instantly, "remove_lead") as mock_remove:
+        non_buyer_nurture.mark_converted(fresh_db, "convert_nolead@example.com")
+
+    mock_remove.assert_not_called()
+    row = fresh_db.query(NonBuyerNurtureSequence).filter_by(email="convert_nolead@example.com").one()
+    assert row.status == "converted"
+
+
+def test_mark_converted_no_row_is_noop(fresh_db):
+    non_buyer_nurture.mark_converted(fresh_db, "never_enrolled@example.com")
+    row = fresh_db.query(NonBuyerNurtureSequence).filter_by(email="never_enrolled@example.com").one_or_none()
+    assert row is None
+
+
+def test_mark_converted_idempotent_on_replay(fresh_db):
+    now = datetime.now(timezone.utc)
+    fresh_db.add(NonBuyerNurtureSequence(
+        email="replay@example.com", source="free_signup",
+        captured_at=now - timedelta(hours=30), status="enrolled",
+        instantly_campaign_id="camp_1", instantly_lead_id="lead_2",
+        enrolled_at=now,
+    ))
+    fresh_db.flush()
+
+    with patch.object(non_buyer_nurture.instantly, "remove_lead", return_value=True) as mock_remove:
+        non_buyer_nurture.mark_converted(fresh_db, "replay@example.com")
+        non_buyer_nurture.mark_converted(fresh_db, "replay@example.com")
+
+    mock_remove.assert_called_once()

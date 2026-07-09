@@ -182,3 +182,26 @@ def enroll(db, candidates: list[dict], campaign_id: str) -> dict:
             row.enrolled_at = now
 
     return {"enrolled": len(candidates) if succeeded else 0, "retried": 0 if succeeded else len(candidates)}
+
+
+def mark_converted(db, email: str) -> None:
+    """
+    First paid conversion, matched by email. Removes the Instantly lead if
+    known, marks the row 'converted' (terminal — DB suppression wins over
+    remote cleanup). No-op if no row exists (never enrolled) or already
+    converted (idempotent on webhook replay).
+    """
+    row = db.execute(
+        select(NonBuyerNurtureSequence).where(NonBuyerNurtureSequence.email == email)
+    ).scalar_one_or_none()
+    if row is None or row.status == "converted":
+        return
+
+    if row.instantly_lead_id:
+        instantly.remove_lead(row.instantly_lead_id)
+
+    now = datetime.now(timezone.utc)
+    row.status = "converted"
+    row.removal_reason = "paid_conversion"
+    row.converted_at = now
+    row.removed_at = now
