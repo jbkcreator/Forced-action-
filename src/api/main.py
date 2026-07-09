@@ -46,6 +46,7 @@ from config.constants import TIER_DISPLAY
 from src.utils.logger import setup_logging
 from src.services.rate_limit import enforce_or_429
 from src.services.phone_utils import normalize as normalize_phone
+from src.services.founding_gate import evaluate_founding_gate
 from src.api.deps import (
     get_db,
     VALID_TIERS,
@@ -1297,13 +1298,22 @@ def founding_summary(
     total_taken = sum(r.count for r in rows)
     total_remaining = max(0, TOTAL_CAP - total_taken)
 
+    county = db.execute(
+        select(County.founding_price_deadline_at).where(County.county_id == county_id)
+    ).scalar_one_or_none()
+    server_now = datetime.now(timezone.utc)
+    gate = evaluate_founding_gate(remaining_spots=total_remaining, deadline_at=county, now=server_now)
+
     return {
         "vertical": vertical,
         "county_id": county_id,
         "total_cap": TOTAL_CAP,
         "total_taken": total_taken,
         "total_remaining": total_remaining,
-        "founding_available": total_remaining > 0,
+        "founding_available": gate["available"],
+        "server_now": server_now.isoformat(),
+        "founding_price_deadline_at": county.isoformat() if county else None,
+        "deadline_passed": gate["deadline_passed"],
     }
 
 
@@ -1351,6 +1361,12 @@ def founding_spots(
     count = row.count if row else 0
     remaining = max(0, FOUNDING_CAP - count)
 
+    county = db.execute(
+        select(County.founding_price_deadline_at).where(County.county_id == county_id)
+    ).scalar_one_or_none()
+    server_now = datetime.now(timezone.utc)
+    gate = evaluate_founding_gate(remaining_spots=remaining, deadline_at=county, now=server_now)
+
     return {
         "tier": tier,
         "vertical": vertical,
@@ -1358,7 +1374,10 @@ def founding_spots(
         "founding_cap": FOUNDING_CAP,
         "founding_taken": count,
         "founding_remaining": remaining,
-        "founding_available": remaining > 0,
+        "founding_available": gate["available"],
+        "server_now": server_now.isoformat(),
+        "founding_price_deadline_at": county.isoformat() if county else None,
+        "deadline_passed": gate["deadline_passed"],
     }
 
 
@@ -1548,6 +1567,7 @@ def zip_availability(
     lead_counts = {r[0]: r[1] for r in lead_rows}
 
     result = []
+    open_zip_count = 0
     for zip_code in all_zips:
         status = taken_map.get(zip_code)
         if status == "locked":
@@ -1556,18 +1576,25 @@ def zip_availability(
             availability = "grace"
         else:
             availability = "available"
+            open_zip_count += 1
+
+        # lead_count is a value signal, not the scarcity signal (ADR 0029) —
+        # only surfaced for available ZIPs, and only when non-zero.
+        lead_count = lead_counts.get(zip_code, 0) if availability == "available" else 0
 
         result.append({
             "zip_code": zip_code,
             "status": availability,
             "property_count": prop_counts.get(zip_code, 0),
-            "lead_count": lead_counts.get(zip_code, 0),
+            "lead_count": lead_count if lead_count > 0 else None,
             "waitlist_count": waitlist_map.get(zip_code, 0),
         })
 
     payload = {
         "vertical": vertical,
         "county_id": county_id,
+        "total_zip_count": len(all_zips),
+        "open_zip_count": open_zip_count,
         "zips": result,
     }
 
@@ -2752,6 +2779,12 @@ def get_landing_data(county_id: Optional[str] = Query(default=None), db: Session
     else:
         scraper_health = None
 
+    # ── Task 8: featured testimonial + founding deadline (ADR 0029) ────────
+    server_now = datetime.now(timezone.utc)
+    deadline_at = county.founding_price_deadline_at
+    deadline_passed = deadline_at is not None and server_now >= deadline_at
+    deadline_active = deadline_at is not None and not deadline_passed
+
     _result = {
         "county_id": county_id,
         "county_name": county.display_name,
@@ -2769,6 +2802,13 @@ def get_landing_data(county_id: Optional[str] = Query(default=None), db: Session
         "territory_availability": territory_availability,
         "scraper_health": scraper_health,
         "coming_soon": coming_soon,
+        "featured_testimonials": county.landing_featured_testimonials or [],
+        "founding": {
+            "deadline_at": deadline_at.isoformat() if deadline_at else None,
+            "server_now": server_now.isoformat(),
+            "deadline_active": deadline_active,
+            "deadline_passed": deadline_passed,
+        },
     }
     if redis_available():
         rset(_cache_key, json.dumps(_result, default=str), ttl_seconds=300)
