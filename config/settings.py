@@ -94,6 +94,10 @@ class AppSettings(BaseSettings):
 	# Non-buyer nurture — shared Instantly campaign on the dedicated warmed lifecycle domain.
 	non_buyer_nurture_campaign_id: Optional[str] = Field(default=None, env="NON_BUYER_NURTURE_CAMPAIGN_ID")
 
+	# Abandoned-checkout recovery (Task 7). Off by default — the sweep captures
+	# and ages rows but sends nothing until this is enabled after review.
+	checkout_recovery_enabled: bool = Field(default=False, env="CHECKOUT_RECOVERY_ENABLED")
+
 	# Stripe — set STRIPE_TEST_MODE=true to use test credentials/prices instead of live
 	stripe_test_mode: bool = Field(default=False, env="STRIPE_TEST_MODE")
 
