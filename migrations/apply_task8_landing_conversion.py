@@ -1,6 +1,14 @@
 """
-Task 8 landing conversion features (ADR 0029): adds the featured-testimonial
-and founding-price-deadline columns to counties.
+Task 8 landing conversion features (ADR 0029): adds the founding-price-
+deadline column to counties.
+
+The featured-testimonial column is NOT created here — it's owned entirely by
+apply_task8_testimonials_array.py, which creates the plural
+landing_featured_testimonials column from scratch if needed (it no longer
+depends on this script having run first). Keeping that column out of this
+script means the two migrations are independent: either can run alone, in
+any order, on a fresh DB, and the ORM (which only ever knew about the plural
+column) never sees a partially-applied state.
 
 Idempotent (ADD COLUMN IF NOT EXISTS).
 
@@ -15,7 +23,6 @@ from sqlalchemy import text
 from src.core.database import get_db_context
 
 STATEMENTS = [
-    "ALTER TABLE counties ADD COLUMN IF NOT EXISTS landing_featured_testimonial JSONB",
     "ALTER TABLE counties ADD COLUMN IF NOT EXISTS founding_price_deadline_at TIMESTAMPTZ",
 ]
 
@@ -28,8 +35,7 @@ def main() -> int:
         cols = db.execute(text("""
             SELECT column_name FROM information_schema.columns
             WHERE table_name='counties'
-              AND column_name IN ('landing_featured_testimonial', 'founding_price_deadline_at')
-            ORDER BY column_name
+              AND column_name = 'founding_price_deadline_at'
         """)).fetchall()
     print("counties columns present:", [c.column_name for c in cols])
     return 0

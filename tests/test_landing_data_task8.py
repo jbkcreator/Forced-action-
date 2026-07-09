@@ -14,7 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src.api.main import app, get_db
-from src.core.models import County, ExpansionCandidate
+from src.core.models import County, ExpansionCandidate, FoundingSubscriberCount
 
 
 def _rand_county_id() -> str:
@@ -57,7 +57,7 @@ def test_landing_data_returns_testimonials_and_founding_block_when_set(client_wi
 
     assert body["featured_testimonials"] == testimonials
     assert body["founding"]["deadline_passed"] is False
-    assert body["founding"]["deadline_active"] is True
+    assert body["founding"]["founding_available"] is True
 
 
 def test_landing_data_empty_list_when_testimonials_and_deadline_unset(client_with_db, monkeypatch):
@@ -71,5 +71,28 @@ def test_landing_data_empty_list_when_testimonials_and_deadline_unset(client_wit
     body = resp.json()
 
     assert body["featured_testimonials"] == []
-    assert body["founding"]["deadline_active"] is False
+    # No deadline set -> gate falls back to spots-only; no FoundingSubscriberCount
+    # rows for this fresh county means spots are wide open.
+    assert body["founding"]["founding_available"] is True
     assert body["founding"]["deadline_passed"] is False
+
+
+def test_landing_data_founding_available_agrees_with_founding_spots_on_exhaustion(client_with_db, monkeypatch):
+    """The exact gap the PR review flagged: /api/landing-data must not say
+    founding is available when /api/founding-spots would say it's sold out.
+    No deadline involved here — spot exhaustion alone must be reflected."""
+    client, db = client_with_db
+    county_id = _rand_county_id()
+    monkeypatch.setattr("src.api.main._ALLOWED_LANDING_COUNTIES", {county_id})
+    _mk_launched_county(db, county_id)
+    from config.settings import get_settings
+    cap_per_tier = get_settings().founding_spot_limit
+    for tier in ["starter", "pro", "dominator"]:
+        db.add(FoundingSubscriberCount(tier=tier, vertical="roofing", county_id=county_id, count=cap_per_tier))
+    db.flush()
+
+    landing_resp = client.get(f"/api/landing-data?county_id={county_id}&vertical=roofing")
+    summary_resp = client.get(f"/api/founding-summary?vertical=roofing&county_id={county_id}")
+
+    assert landing_resp.json()["founding"]["founding_available"] is False
+    assert summary_resp.json()["founding_available"] is False

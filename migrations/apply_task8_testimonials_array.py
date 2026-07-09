@@ -2,11 +2,16 @@
 Task 8 revision: featured testimonial becomes an ordered array (carousel),
 not a single slot (CONTEXT.md revision 2026-07-09).
 
-Renames counties.landing_featured_testimonial -> landing_featured_testimonials
-and wraps any existing single-object value in a list so old data survives.
+Sole owner of counties.landing_featured_testimonials — creates it from
+scratch if apply_task8_landing_conversion.py never ran (that script no
+longer touches this column), or renames the legacy singular
+landing_featured_testimonial and wraps any existing object value in a list
+if it did. Either way, this script alone is sufficient; the two migrations
+have no run-order dependency on each other.
 
-Idempotent: rename is IF EXISTS; the wrap-in-list UPDATE only touches rows
-still holding a bare object (re-running after the wrap is a no-op).
+Idempotent: rename only fires when the old column exists; the wrap-in-list
+UPDATE only touches rows still holding a bare object (re-running after the
+wrap is a no-op).
 
     PYTHONPATH=. python migrations/apply_task8_testimonials_array.py
 """
