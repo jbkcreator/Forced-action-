@@ -91,6 +91,9 @@ class AppSettings(BaseSettings):
 	instantly_base_url: str = Field(default="https://api.instantly.ai", env="INSTANTLY_BASE_URL")
 	instantly_enabled: bool = Field(default=True, env="INSTANTLY_ENABLED")
 
+	# Non-buyer nurture — shared Instantly campaign on the dedicated warmed lifecycle domain.
+	non_buyer_nurture_campaign_id: Optional[str] = Field(default=None, env="NON_BUYER_NURTURE_CAMPAIGN_ID")
+
 	# Stripe — set STRIPE_TEST_MODE=true to use test credentials/prices instead of live
 	stripe_test_mode: bool = Field(default=False, env="STRIPE_TEST_MODE")
 
