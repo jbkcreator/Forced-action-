@@ -3303,6 +3303,30 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, request: Request, db: S
         logger.error("Stripe error creating lead pack PaymentIntent: %s", exc)
         raise HTTPException(status_code=502, detail={"error": "payment_unavailable", "message": "Could not create payment"})
 
+    # Abandoned-checkout recovery (Task 7): a lead pack has no Stripe Checkout
+    # Session (it's a PaymentIntent), so there's no session.expired signal —
+    # capture the intent now and close it on the success webhook. Best-effort;
+    # never block the checkout response. Messaging is flag-gated in the sweep.
+    if subscriber.email:
+        try:
+            from src.services import checkout_recovery
+            checkout_recovery.start_recovery(
+                db,
+                email=subscriber.email,
+                source="lead_pack",
+                subscriber_id=subscriber.id,
+                phone=subscriber.phone,
+                resume_context={
+                    "kind": "lead_pack",
+                    "feed_uuid": subscriber.event_feed_uuid,
+                    "lead_pack_zip": payload.zip_code,
+                    "vertical": payload.vertical,
+                },
+            )
+            db.commit()
+        except Exception:
+            logger.warning("checkout_recovery lead_pack capture failed for sub=%s", subscriber.id, exc_info=True)
+
     return {
         "client_secret":    intent["client_secret"],
         "publishable_key":  _s.active_stripe_publishable_key,

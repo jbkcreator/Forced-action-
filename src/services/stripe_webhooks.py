@@ -3629,6 +3629,14 @@ def _on_lead_pack_payment(payment_intent: dict, db: Session) -> None:
         logger.error("[LeadPack] No subscriber for feed_uuid %s", feed_uuid)
         return
 
+    # Close any open abandoned-checkout recovery for this lead pack (Task 7).
+    if subscriber.email:
+        try:
+            from src.services import checkout_recovery
+            checkout_recovery.mark_recovered(db, subscriber.email)
+        except Exception:
+            logger.warning("[LeadPack] checkout_recovery mark_recovered failed sub=%s", subscriber.id, exc_info=True)
+
     now = datetime.now(timezone.utc)
     exclusive_until = now + timedelta(hours=72)
 

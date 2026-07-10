@@ -454,3 +454,101 @@ def test_find_pre_payment_candidates_excludes_converted_subscriber():
             with get_db_context() as db:
                 db.query(Subscriber).filter_by(id=sub_id).delete(synchronize_session=False)
                 db.commit()
+
+
+# ── Review fixes: phone-normalize, nurture double-contact gate, lead_pack ──────
+
+def test_start_recovery_normalizes_phone_before_storing():
+    """Standards fix: every phone write must go through phone_utils.normalize."""
+    from src.services import checkout_recovery
+
+    email = _email()
+    try:
+        with get_db_context() as db:
+            checkout_recovery.start_recovery(
+                db, email=email, source="session_expired", phone="(813) 555-0142",
+            )
+            db.commit()
+        with get_db_context() as db:
+            rec = db.query(CheckoutRecovery).filter_by(email=email).first()
+        assert rec.phone == "+18135550142"
+    finally:
+        _cleanup(email)
+
+
+def test_start_recovery_skipped_when_nurture_enrolled():
+    """Spec fix: don't double-contact someone the nurture drip is already sending to."""
+    from src.services import checkout_recovery
+    from src.core.models import NonBuyerNurtureSequence
+    from datetime import datetime, timezone
+
+    email = _email()
+    try:
+        with get_db_context() as db:
+            db.add(NonBuyerNurtureSequence(
+                email=email, source="free_signup",
+                captured_at=datetime.now(timezone.utc), status="enrolled",
+            ))
+            db.commit()
+        with get_db_context() as db:
+            row = checkout_recovery.start_recovery(db, email=email, source="session_expired")
+            db.commit()
+            assert row is None
+        with get_db_context() as db:
+            assert db.query(CheckoutRecovery).filter_by(email=email).first() is None
+    finally:
+        _cleanup(email)
+
+
+def test_start_recovery_skipped_when_nurture_opted_out():
+    """Compliance: never start recovery for a contact who unsubscribed/bounced."""
+    from src.services import checkout_recovery
+    from src.core.models import NonBuyerNurtureSequence
+    from datetime import datetime, timezone
+
+    email = _email()
+    try:
+        with get_db_context() as db:
+            db.add(NonBuyerNurtureSequence(
+                email=email, source="free_signup",
+                captured_at=datetime.now(timezone.utc), status="unsubscribed",
+            ))
+            db.commit()
+        with get_db_context() as db:
+            row = checkout_recovery.start_recovery(db, email=email, source="pre_payment")
+            db.commit()
+            assert row is None
+        with get_db_context() as db:
+            assert db.query(CheckoutRecovery).filter_by(email=email).first() is None
+    finally:
+        _cleanup(email)
+
+
+def test_lead_pack_recovery_does_not_touch_nurture():
+    """lead_pack abandoners are existing paying subscribers, not nurture
+    candidates — recovery must not create/flip a nurture row for them."""
+    from src.services import checkout_recovery
+
+    email = _email()
+    try:
+        with get_db_context() as db:
+            row = checkout_recovery.start_recovery(
+                db, email=email, source="lead_pack",
+                resume_context={"kind": "lead_pack", "feed_uuid": "abc", "lead_pack_zip": "33601"},
+            )
+            db.commit()
+            assert row is not None
+            assert row.source == "lead_pack"
+        with get_db_context() as db:
+            assert db.query(CheckoutRecovery).filter_by(email=email).first() is not None
+            assert db.query(NonBuyerNurtureSequence).filter_by(email=email).first() is None
+    finally:
+        _cleanup(email)
+
+
+def test_build_resume_url_lead_pack_targets_dashboard():
+    from src.services import checkout_recovery as cr
+    url = cr.build_resume_url("https://app.example.com/", {
+        "kind": "lead_pack", "feed_uuid": "feed-123", "lead_pack_zip": "33601",
+    })
+    assert url == "https://app.example.com/dashboard/feed-123?lead_pack_zip=33601"

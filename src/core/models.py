@@ -4956,7 +4956,7 @@ class CheckoutRecovery(Base):
         ForeignKey("subscribers.id", ondelete="SET NULL"), nullable=True, index=True
     )
     phone: Mapped[Optional[str]] = mapped_column(String(20))
-    source: Mapped[str] = mapped_column(String(20), nullable=False)  # session_expired | pre_payment
+    source: Mapped[str] = mapped_column(String(20), nullable=False)  # session_expired | pre_payment | lead_pack
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="active", server_default="active", index=True
     )  # active | recovered | failed
@@ -4979,7 +4979,7 @@ class CheckoutRecovery(Base):
             name="ck_checkout_recovery_status",
         ),
         CheckConstraint(
-            "source IN ('session_expired','pre_payment')",
+            "source IN ('session_expired','pre_payment','lead_pack')",
             name="ck_checkout_recovery_source",
         ),
     )

@@ -23,8 +23,19 @@ from typing import Optional
 from sqlalchemy import select
 
 from src.core.models import CheckoutRecovery, NonBuyerNurtureSequence
+from src.services.phone_utils import normalize as normalize_phone
 
 logger = logging.getLogger(__name__)
+
+# Sources that participate in the non-buyer nurture dedup. lead_pack recovery
+# targets *existing paying subscribers* (a lead pack requires an active sub),
+# who are not nurture candidates — so it neither suppresses nor is gated by
+# the nurture drip.
+_NURTURE_SOURCES = {"session_expired", "pre_payment"}
+# Nurture states that block starting recovery: 'enrolled' = the drip is
+# already contacting them (no double-contact); the terminal states =
+# converted or opted-out (must not contact at all).
+_NURTURE_BLOCKING = {"enrolled", "converted", "unsubscribed", "bounced", "removed"}
 
 # Cadence: first "you left this behind" touch shortly after drop-off, one
 # follow-up a day later, then hand off to nurture. Tunable.
@@ -57,14 +68,23 @@ def next_action(touches_sent: int, started_at: datetime, last_touch_at: Optional
 
 
 def build_resume_url(base_url: str, resume_context: Optional[dict]) -> str:
-    """A link that drops the buyer back onto the funnel with their county/
-    vertical pre-selected (the expired Stripe session can't be reused, so we
-    resume at pricing rather than a dead session URL)."""
+    """A link back to where the buyer dropped off. Lead-pack abandoners are
+    existing subscribers, so they resume on their own dashboard (which is where
+    the lead-pack purchase lives); subscription abandoners resume on the
+    pricing funnel with county/vertical pre-selected (the expired Stripe
+    session can't be reused)."""
     ctx = resume_context or {}
+    base = base_url.rstrip("/")
     from urllib.parse import urlencode
+
+    if ctx.get("kind") == "lead_pack" and ctx.get("feed_uuid"):
+        params = {k: ctx[k] for k in ("lead_pack_zip",) if ctx.get(k)}
+        qs = f"?{urlencode(params)}" if params else ""
+        return f"{base}/dashboard/{ctx['feed_uuid']}{qs}"
+
     params = {k: ctx[k] for k in ("county_id", "vertical") if ctx.get(k)}
     qs = f"?{urlencode(params)}" if params else ""
-    return f"{base_url.rstrip('/')}/{qs}#pricing"
+    return f"{base}/{qs}#pricing"
 
 
 def record_touch(db, row: "CheckoutRecovery", now: Optional[datetime] = None) -> None:
@@ -114,6 +134,7 @@ def start_recovery(
     email = (email or "").strip().lower()
     if not email:
         return None
+    phone = normalize_phone(phone) if phone else None
 
     existing = db.execute(
         select(CheckoutRecovery).where(CheckoutRecovery.email == email)
@@ -121,6 +142,20 @@ def start_recovery(
     if existing is not None:
         # Already active → no-op replay; already closed → don't reopen.
         return existing if existing.status == "active" else None
+
+    participates_in_nurture = source in _NURTURE_SOURCES
+    if participates_in_nurture:
+        nurture = db.execute(
+            select(NonBuyerNurtureSequence).where(NonBuyerNurtureSequence.email == email)
+        ).scalar_one_or_none()
+        if nurture is not None and nurture.status in _NURTURE_BLOCKING:
+            # enrolled → already being contacted by the drip; terminal →
+            # converted or opted-out. Either way, don't start a second contact.
+            logger.info(
+                "[CheckoutRecovery] skip email=%s source=%s (nurture status=%s)",
+                email, source, nurture.status,
+            )
+            return None
 
     row = CheckoutRecovery(
         email=email,
@@ -132,7 +167,8 @@ def start_recovery(
         resume_context=resume_context,
     )
     db.add(row)
-    _suppress_nurture(db, email, subscriber_id)
+    if participates_in_nurture:
+        _suppress_nurture(db, email, subscriber_id)
     logger.info("[CheckoutRecovery] started email=%s source=%s", email, source)
     return row
 

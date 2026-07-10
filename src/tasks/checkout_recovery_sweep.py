@@ -33,7 +33,13 @@ setup_logging()
 logger = get_logger(__name__)
 
 
-def _subject(touch_number: int) -> str:
+def _subject(touch_number: int, source: str) -> str:
+    if source == "lead_pack":
+        return (
+            "Your Forced Action lead pack is waiting"
+            if touch_number == 1
+            else "Still want those leads? Your pack isn't purchased yet"
+        )
     return (
         "You're one step from your Forced Action territory"
         if touch_number == 1
@@ -41,14 +47,23 @@ def _subject(touch_number: int) -> str:
     )
 
 
-def _email_body(resume_url: str, touch_number: int) -> str:
-    lead = (
-        "You started claiming your territory but didn't finish — your ZIP is "
-        "still open for now."
-        if touch_number == 1
-        else "A quick nudge: the ZIP you were about to lock is still available, "
-        "but founding spots are limited."
-    )
+def _email_body(resume_url: str, touch_number: int, source: str) -> str:
+    if source == "lead_pack":
+        lead = (
+            "You started buying a lead pack but didn't finish — those leads are "
+            "still available."
+            if touch_number == 1
+            else "A quick nudge: the lead pack you started is still available, "
+            "but leads get claimed fast."
+        )
+    else:
+        lead = (
+            "You started claiming your territory but didn't finish — your ZIP is "
+            "still open for now."
+            if touch_number == 1
+            else "A quick nudge: the ZIP you were about to lock is still available, "
+            "but founding spots are limited."
+        )
     return (
         f"{lead}\n\n"
         f"Pick up where you left off: {resume_url}\n\n"
@@ -125,6 +140,7 @@ def run_sweep(dry_run: bool = False) -> dict:
             _send_touch(row, touch_number, resume_url)
             checkout_recovery.record_touch(db, row, now)
             sent += 1
+            logger.debug("[recovery-sweep] sent touch#%d email=%s source=%s", touch_number, row.email, row.source)
 
         if sends_on:
             db.commit()
@@ -139,26 +155,27 @@ def _send_touch(row, touch_number: int, resume_url: str) -> None:
     sender enforces opt-in/opt-out, so no consent check is duplicated here)."""
     from src.services.email import send_email
 
+    source = getattr(row, "source", "session_expired")
     try:
         send_email(
             to=row.email,
-            subject=_subject(touch_number),
-            body_text=_email_body(resume_url, touch_number),
+            subject=_subject(touch_number, source),
+            body_text=_email_body(resume_url, touch_number, source),
         )
     except Exception:
         logger.warning("[recovery-sweep] email send failed email=%s", row.email, exc_info=True)
 
     if row.phone:
+        sms_body = (
+            f"Your Forced Action lead pack is still available — finish here: {resume_url}"
+            if source == "lead_pack"
+            else f"Your Forced Action ZIP is still open — finish here: {resume_url}"
+        )
         try:
             from src.services.sms_compliance import send_sms
             from src.core.database import get_db_context
             with get_db_context() as sms_db:
-                send_sms(
-                    row.phone,
-                    f"Your Forced Action ZIP is still open — finish here: {resume_url}",
-                    sms_db,
-                    message_type="marketing",
-                )
+                send_sms(row.phone, sms_body, sms_db, message_type="marketing")
         except Exception:
             logger.warning("[recovery-sweep] sms send failed email=%s", row.email, exc_info=True)
 
