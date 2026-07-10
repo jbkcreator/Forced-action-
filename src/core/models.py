@@ -3292,6 +3292,27 @@ class SmsOptOut(Base):
         return f"<SmsOptOut(phone={self.phone}, keyword={self.keyword_used})>"
 
 
+class EmailOptOut(Base):
+    """
+    Cross-channel suppression list, email side. Sibling of SmsOptOut — any
+    address in this table must never receive outbound email, including
+    transactional (receipts, payment-failed, login links). Cascades to/from
+    sms_opt_outs via src.services.email_suppression.suppress_contact().
+    """
+    __tablename__ = "email_opt_outs"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    email: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    source: Mapped[str] = mapped_column(String(30), nullable=False, default="manual")  # unsubscribe_link/hard_bounce/instantly_sync/manual/cascaded_from_sms
+    # Durable per-row watermark: True once pushed to Instantly's block list.
+    # Unpushed rows are retried every sync run (survives failed/partial pushes).
+    pushed_to_instantly: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    opted_out_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+    def __repr__(self):
+        return f"<EmailOptOut(email={self.email}, source={self.source})>"
+
+
 class DncPhoneCheck(Base):
     """Latest Tracerfy DNC result per normalized phone.
 
@@ -4647,6 +4668,11 @@ class DBPRContact(Base):
     company_name: Mapped[Optional[str]] = mapped_column(String(255))
     company_name_status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
     company_name_scraped_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    # Raw email extracted at load time (pre-Clay-enrichment). Populated by the
+    # loader; distinct from work_email (Clay-sourced) below.
+    email: Mapped[Optional[str]] = mapped_column(String(200))
+    phone: Mapped[Optional[str]] = mapped_column(String(20))
 
     enrichment_status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
     enrichment_attempted_at: Mapped[Optional[datetime]] = mapped_column(DateTime)

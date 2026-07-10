@@ -29,9 +29,11 @@ import time
 from datetime import datetime, timezone
 
 from config.settings import get_settings
+from sqlalchemy import exists, func
+
 from src.core.database import get_db_context
-from src.core.models import DBPRContact
-from src.services.dbpr_email_template import render_subject, render_text, render_html
+from src.core.models import DBPRContact, EmailOptOut
+from src.services.dbpr_email_template import render_subject, render_text, render_html, unsubscribe_url
 from src.services.email import send_email
 from src.utils.logger import setup_logging, get_logger
 
@@ -86,6 +88,10 @@ def run_dbpr_email_sender(
                 DBPRContact.email.isnot(None),
                 DBPRContact.email_status == "not_sent",
                 DBPRContact.subscriber_id.is_(None),
+                ~exists().where(EmailOptOut.email.in_([
+                    func.lower(DBPRContact.email),
+                    func.lower(DBPRContact.work_email),
+                ])),
             )
             .order_by(DBPRContact.created_at.asc())
             .limit(limit)
@@ -126,6 +132,7 @@ def run_dbpr_email_sender(
             subject=subject,
             body_text=body_text,
             body_html=body_html,
+            list_unsubscribe_url=unsubscribe_url(email),
         )
 
         with get_db_context() as db:

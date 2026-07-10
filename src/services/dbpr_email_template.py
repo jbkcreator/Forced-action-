@@ -9,6 +9,7 @@ page with source attribution pre-filled.
 
 from urllib.parse import urlencode
 from config.settings import get_settings
+from src.services.email_unsubscribe import mint_unsubscribe_token
 
 # ---------------------------------------------------------------------------
 # Vertical-specific copy
@@ -75,6 +76,13 @@ def _signup_url(email: str, vertical: str, county_id: str) -> str:
     return f"{base}/signup?{params}"
 
 
+def unsubscribe_url(email: str) -> str:
+    settings = get_settings()
+    base = (settings.app_base_url or "https://app.forcedaction.io").rstrip("/")
+    token = mint_unsubscribe_token(email)
+    return f"{base}/api/email/unsubscribe?token={token}"
+
+
 # ---------------------------------------------------------------------------
 # Subject line
 # ---------------------------------------------------------------------------
@@ -94,7 +102,9 @@ def render_text(full_name: str, vertical: str, county_id: str, email: str) -> st
     first  = _first_name(full_name)
     copy   = _VERTICAL_COPY.get(vertical, _DEFAULT_COPY)
     url    = _signup_url(email, vertical, county_id)
+    unsub  = unsubscribe_url(email)
     county_label = county_id.replace("_", " ").title() if county_id else "Hillsborough"
+    settings = get_settings()
 
     return f"""Hi {first},
 
@@ -112,8 +122,9 @@ No credit card. No sales call.
 --
 Forced Action
 Distressed Property Intelligence for Florida Contractors
+{settings.company_postal_address}
 
-To unsubscribe, reply with UNSUBSCRIBE in the subject line.
+Unsubscribe: {unsub}
 """
 
 
@@ -125,7 +136,9 @@ def render_html(full_name: str, vertical: str, county_id: str, email: str) -> st
     first  = _first_name(full_name)
     copy   = _VERTICAL_COPY.get(vertical, _DEFAULT_COPY)
     url    = _signup_url(email, vertical, county_id)
+    unsub  = unsubscribe_url(email)
     county_label = county_id.replace("_", " ").title() if county_id else "Hillsborough"
+    settings = get_settings()
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -177,8 +190,8 @@ def render_html(full_name: str, vertical: str, county_id: str, email: str) -> st
       <p>
         You&rsquo;re receiving this because you hold an active Florida contractor license
         (License: {vertical.upper() if vertical else "FL"}) in {county_label} County.<br>
-        Forced Action &mdash; Tampa, FL &nbsp;|&nbsp;
-        <a href="mailto:unsubscribe@forcedaction.io?subject=UNSUBSCRIBE">Unsubscribe</a>
+        {settings.company_postal_address} &nbsp;|&nbsp;
+        <a href="{unsub}">Unsubscribe</a>
       </p>
     </div>
   </div>

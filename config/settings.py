@@ -254,6 +254,12 @@ class AppSettings(BaseSettings):
 		description="Public base URL of this app (e.g. https://app.forcedaction.io)",
 	)
 
+	# CAN-SPAM footer requirement — placeholder until client supplies the real one
+	company_postal_address: str = Field(
+		default="Forced Action, Tampa, FL",
+		env="COMPANY_POSTAL_ADDRESS",
+	)
+
 	# Contact enrichment (M1)
 	batch_skip_tracing_api_key: Optional[SecretStr] = Field(default=None, env="BATCH_SKIP_TRACING_API_KEY")
 	whitepages_api_key: Optional[SecretStr] = Field(default=None, env="WHITEPAGES_API_KEY")  # deprecated — no-op, kept to avoid breaking existing .env files
