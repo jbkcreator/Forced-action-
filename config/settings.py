@@ -93,6 +93,8 @@ class AppSettings(BaseSettings):
 
 	# Non-buyer nurture — shared Instantly campaign on the dedicated warmed lifecycle domain.
 	non_buyer_nurture_campaign_id: Optional[str] = Field(default=None, env="NON_BUYER_NURTURE_CAMPAIGN_ID")
+	# Max leads enrolled per daily sweep. Ramp up as the sending domain warms.
+	non_buyer_nurture_daily_cap: int = Field(default=25, env="NON_BUYER_NURTURE_DAILY_CAP")
 
 	# Stripe — set STRIPE_TEST_MODE=true to use test credentials/prices instead of live
 	stripe_test_mode: bool = Field(default=False, env="STRIPE_TEST_MODE")

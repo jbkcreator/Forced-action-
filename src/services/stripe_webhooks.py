@@ -528,7 +528,7 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
             non_buyer_nurture.mark_converted(db, customer_email)
         except Exception:
             logger.warning(
-                "non_buyer_nurture mark_converted failed for email=%s", customer_email, exc_info=True,
+                "non_buyer_nurture mark_converted failed for subscriber=%s", subscriber.id, exc_info=True,
             )
 
     # ── Plan price + trial flags (fa048) ────────────────────────────────────
@@ -4046,7 +4046,7 @@ def _record_nurture_candidate_for_expired_checkout(session: dict, db: Session) -
         from src.services import non_buyer_nurture
         non_buyer_nurture.record_checkout_abandon_candidate(db, email)
     except Exception:
-        logger.warning("non_buyer_nurture capture failed for expired checkout email=%s", email, exc_info=True)
+        logger.warning("non_buyer_nurture capture failed for expired checkout session %s", session.get("id"), exc_info=True)
 
 
 def _send_lead_pack_refund_email(

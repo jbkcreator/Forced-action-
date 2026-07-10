@@ -15,17 +15,67 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 
-from src.core.models import NonBuyerNurtureSequence, Subscriber, WaitlistEntry
+from src.core.models import NonBuyerNurtureSequence
 from src.services import instantly_service as instantly
 
 logger = logging.getLogger(__name__)
 
 CAPTURED_WINDOW_DAYS = 90
 MIN_AGE_HOURS = 24
-# ponytail: fixed daily cap for now, ramp manually with Instantly domain warm-up.
-DAILY_CAP = 25
+
+
+def _daily_cap() -> int:
+    """Enrollment ceiling per sweep. Ramps with Instantly domain warm-up via config."""
+    from config.settings import get_settings
+    return get_settings().non_buyer_nurture_daily_cap
+
+
+# Single-query candidate selection: unions the three sources, dedupes by email
+# (newest capture wins), and excludes any email that is already past 'eligible'
+# in the nurture table (once-per-email) OR belongs to a paying subscriber
+# (no "please buy" mail to someone who already bought — plan §3.2, User Story 5).
+# subscribers.created_at is a naive TIMESTAMP; cast to UTC timestamptz so the
+# UNION type-matches the timestamptz columns.
+_CANDIDATES_SQL = text("""
+WITH raw AS (
+    SELECT s.email                              AS email,
+           s.id                                 AS subscriber_id,
+           'free_signup'                        AS source,
+           (s.created_at AT TIME ZONE 'UTC')    AS captured_at
+    FROM subscribers s
+    WHERE s.tier = 'free'
+      AND s.email IS NOT NULL
+      AND (s.created_at AT TIME ZONE 'UTC') BETWEEN :window_start AND :window_end
+    UNION ALL
+    SELECT w.email, NULL::int, 'waitlist', w.created_at
+    FROM waitlist_entries w
+    WHERE w.created_at BETWEEN :window_start AND :window_end
+    UNION ALL
+    SELECT n.email, n.subscriber_id, n.source, n.captured_at
+    FROM non_buyer_nurture_sequences n
+    WHERE n.status = 'eligible'
+      AND n.captured_at BETWEEN :window_start AND :window_end
+),
+deduped AS (
+    SELECT DISTINCT ON (lower(email)) email, subscriber_id, source, captured_at
+    FROM raw
+    ORDER BY lower(email), captured_at DESC
+)
+SELECT d.email, d.subscriber_id, d.source, d.captured_at
+FROM deduped d
+WHERE NOT EXISTS (
+        SELECT 1 FROM non_buyer_nurture_sequences t
+        WHERE lower(t.email) = lower(d.email) AND t.status <> 'eligible'
+      )
+  AND NOT EXISTS (
+        SELECT 1 FROM subscribers p
+        WHERE lower(p.email) = lower(d.email) AND p.tier <> 'free'
+      )
+ORDER BY d.captured_at DESC
+LIMIT :limit
+""")
 
 
 def record_checkout_abandon_candidate(db, email: str, subscriber_id: Optional[int] = None) -> None:
@@ -34,110 +84,34 @@ def record_checkout_abandon_candidate(db, email: str, subscriber_id: Optional[in
     candidate. checkout_abandon leads have no other source table, so the
     capture point (webhook) writes the row directly.
     """
-    existing = db.execute(
-        select(NonBuyerNurtureSequence).where(NonBuyerNurtureSequence.email == email)
-    ).scalar_one_or_none()
-    if existing:
-        return
-    db.add(NonBuyerNurtureSequence(
-        email=email,
-        subscriber_id=subscriber_id,
-        source="checkout_abandon",
-        captured_at=datetime.now(timezone.utc),
-        status="eligible",
-    ))
+    db.execute(
+        text("""
+            INSERT INTO non_buyer_nurture_sequences (email, subscriber_id, source, captured_at, status)
+            VALUES (:email, :subscriber_id, :source, NOW(), 'eligible')
+            ON CONFLICT (email) DO NOTHING
+        """),
+        {"email": email, "subscriber_id": subscriber_id, "source": "checkout_abandon"},
+    )
 
 
-def find_candidates(db, limit: int = DAILY_CAP) -> list[dict]:
+def find_candidates(db, limit: Optional[int] = None) -> list[dict]:
     """
-    Union free-signup + waitlist (live source tables) + already-recorded
-    checkout_abandon/retry rows (status='eligible' in the nurture table
-    itself), aged between MIN_AGE_HOURS and CAPTURED_WINDOW_DAYS, newest-first,
-    deduped by email, capped at limit.
-
-    Emails that have moved past 'eligible' (enrolled/converted/unsubscribed/
-    bounced/removed) are permanently excluded — the once-per-email rule.
+    Eligible non-buyer candidates from the three sources (free-signup, waitlist,
+    already-recorded checkout-abandon/retry rows), aged between MIN_AGE_HOURS and
+    CAPTURED_WINDOW_DAYS, deduped by email (newest capture wins), newest-first,
+    capped. Excludes once-per-email terminal rows AND any email with a paid
+    subscriber. All filtering/sorting/paging happens in SQL.
     """
     now = datetime.now(timezone.utc)
-    window_start = now - timedelta(days=CAPTURED_WINDOW_DAYS)
-    window_end = now - timedelta(hours=MIN_AGE_HOURS)
-
-    terminal_emails = {
-        row[0]
-        for row in db.execute(
-            select(NonBuyerNurtureSequence.email).where(
-                NonBuyerNurtureSequence.status != "eligible"
-            )
-        ).all()
-    }
-
-    candidates: list[dict] = []
-    seen_emails: set[str] = set()
-
-    eligible_rows = db.execute(
-        select(
-            NonBuyerNurtureSequence.email,
-            NonBuyerNurtureSequence.subscriber_id,
-            NonBuyerNurtureSequence.source,
-            NonBuyerNurtureSequence.captured_at,
-        ).where(
-            NonBuyerNurtureSequence.status == "eligible",
-            NonBuyerNurtureSequence.captured_at >= window_start,
-            NonBuyerNurtureSequence.captured_at <= window_end,
-        )
-    ).all()
-    for email, sub_id, source, captured_at in eligible_rows:
-        seen_emails.add(email)
-        candidates.append({
-            "email": email,
-            "subscriber_id": sub_id,
-            "source": source,
-            "captured_at": captured_at,
-        })
-
-    free_subs = db.execute(
-        select(Subscriber.id, Subscriber.email, Subscriber.created_at).where(
-            Subscriber.tier == "free",
-            Subscriber.email.isnot(None),
-            Subscriber.created_at >= window_start,
-            Subscriber.created_at <= window_end,
-        )
-    ).all()
-    for sub_id, email, created_at in free_subs:
-        if email in terminal_emails or email in seen_emails:
-            continue
-        seen_emails.add(email)
-        candidates.append({
-            "email": email,
-            "subscriber_id": sub_id,
-            "source": "free_signup",
-            "captured_at": created_at,
-        })
-
-    waitlist_rows = db.execute(
-        select(WaitlistEntry.email, WaitlistEntry.created_at).where(
-            WaitlistEntry.created_at >= window_start,
-            WaitlistEntry.created_at <= window_end,
-        )
-    ).all()
-    for email, created_at in waitlist_rows:
-        if email in terminal_emails or email in seen_emails:
-            continue
-        seen_emails.add(email)
-        candidates.append({
-            "email": email,
-            "subscriber_id": None,
-            "source": "waitlist",
-            "captured_at": created_at,
-        })
-
-    candidates.sort(key=lambda c: _as_utc(c["captured_at"]), reverse=True)
-    return candidates[:limit]
-
-
-def _as_utc(dt: datetime) -> datetime:
-    """Subscriber.created_at is a naive TIMESTAMP column; treat naive as UTC."""
-    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    rows = db.execute(_CANDIDATES_SQL, {
+        "window_start": now - timedelta(days=CAPTURED_WINDOW_DAYS),
+        "window_end": now - timedelta(hours=MIN_AGE_HOURS),
+        "limit": limit if limit is not None else _daily_cap(),
+    }).all()
+    return [
+        {"email": r.email, "subscriber_id": r.subscriber_id, "source": r.source, "captured_at": r.captured_at}
+        for r in rows
+    ]
 
 
 def enroll(db, candidates: list[dict], campaign_id: str) -> dict:
@@ -151,7 +125,14 @@ def enroll(db, candidates: list[dict], campaign_id: str) -> dict:
 
     now = datetime.now(timezone.utc)
     leads = [{"email": c["email"]} for c in candidates]
-    result = instantly.add_leads(campaign_id, leads)
+    try:
+        result = instantly.add_leads(campaign_id, leads)
+    except Exception:
+        logger.error(
+            "[NonBuyerNurture] Instantly add_leads failed for campaign %s (%d leads) — "
+            "leaving rows eligible for retry", campaign_id, len(leads), exc_info=True,
+        )
+        result = None
     succeeded = result is not None
 
     existing_rows = {
@@ -198,13 +179,46 @@ def mark_converted(db, email: str) -> None:
         return
 
     if row.instantly_lead_id:
-        instantly.remove_lead(row.instantly_lead_id)
+        try:
+            instantly.remove_lead(row.instantly_lead_id)
+        except Exception:
+            logger.warning(
+                "[NonBuyerNurture] Instantly remove_lead failed for lead %s — "
+                "marking converted anyway (DB suppression wins)", row.instantly_lead_id,
+                exc_info=True,
+            )
 
     now = datetime.now(timezone.utc)
     row.status = "converted"
     row.removal_reason = "paid_conversion"
     row.converted_at = now
     row.removed_at = now
+
+
+def reconcile_conversions(db) -> int:
+    """
+    Repair backstop (plan §3.3): mark any still-enrolled row whose email now
+    belongs to a paying subscriber as converted, in case the paid-conversion
+    webhook was missed. Returns the number reconciled. The webhook is primary;
+    this catches the gaps on the daily sweep.
+    """
+    emails = [
+        r.email
+        for r in db.execute(text("""
+            SELECT n.email
+            FROM non_buyer_nurture_sequences n
+            WHERE n.status = 'enrolled'
+              AND EXISTS (
+                    SELECT 1 FROM subscribers p
+                    WHERE lower(p.email) = lower(n.email) AND p.tier <> 'free'
+                  )
+        """)).all()
+    ]
+    for email in emails:
+        mark_converted(db, email)
+    if emails:
+        logger.info("[NonBuyerNurture] reconcile_conversions: %d enrolled row(s) marked converted", len(emails))
+    return len(emails)
 
 
 _TERMINAL_STATUSES = {"converted", "unsubscribed", "bounced", "removed"}

@@ -13,7 +13,6 @@ from src.services import non_buyer_nurture
 
 
 def _free_subscriber(email, created_at, **kw):
-    now = datetime.now(timezone.utc)
     return Subscriber(
         stripe_customer_id=f"cus_{email}",
         tier="free",
@@ -23,6 +22,21 @@ def _free_subscriber(email, created_at, **kw):
         email=email,
         created_at=created_at,
         event_feed_uuid=f"feed_{email}",
+        **kw,
+    )
+
+
+def _paid_subscriber(email, **kw):
+    now = datetime.now(timezone.utc)
+    return Subscriber(
+        stripe_customer_id=f"cus_paid_{email}",
+        tier="pro",
+        vertical="roofing",
+        county_id="hillsborough",
+        status="active",
+        email=email,
+        created_at=now,
+        event_feed_uuid=f"feed_paid_{email}",
         **kw,
     )
 
@@ -319,3 +333,45 @@ def test_apply_instantly_status_does_not_downgrade_converted(fresh_db):
 
     row = fresh_db.query(NonBuyerNurtureSequence).filter_by(email="already_converted@example.com").one()
     assert row.status == "converted"
+
+
+def test_find_candidates_excludes_email_with_paid_subscriber(fresh_db):
+    now = datetime.now(timezone.utc)
+    # Eligible checkout-abandon candidate — but the same email is now a paying customer.
+    fresh_db.add(NonBuyerNurtureSequence(
+        email="alreadypaid@example.com", source="checkout_abandon",
+        captured_at=now - timedelta(hours=30), status="eligible",
+    ))
+    fresh_db.add(_paid_subscriber("alreadypaid@example.com"))
+    fresh_db.flush()
+
+    candidates = non_buyer_nurture.find_candidates(fresh_db, limit=10_000)
+    emails = {c["email"] for c in candidates}
+    assert "alreadypaid@example.com" not in emails
+
+
+def test_reconcile_conversions_marks_paid_enrolled_rows_converted(fresh_db):
+    now = datetime.now(timezone.utc)
+    # Enrolled lead who has since become a paying subscriber but the webhook missed it.
+    fresh_db.add(NonBuyerNurtureSequence(
+        email="missed@example.com", source="free_signup",
+        captured_at=now - timedelta(hours=30), status="enrolled",
+        instantly_campaign_id="camp_1", instantly_lead_id=None, enrolled_at=now,
+    ))
+    fresh_db.add(_paid_subscriber("missed@example.com"))
+    # Enrolled lead with no paid subscriber — must stay enrolled.
+    fresh_db.add(NonBuyerNurtureSequence(
+        email="stillfree@example.com", source="free_signup",
+        captured_at=now - timedelta(hours=30), status="enrolled",
+        instantly_campaign_id="camp_1", instantly_lead_id=None, enrolled_at=now,
+    ))
+    fresh_db.flush()
+
+    n = non_buyer_nurture.reconcile_conversions(fresh_db)
+
+    assert n >= 1
+    missed = fresh_db.query(NonBuyerNurtureSequence).filter_by(email="missed@example.com").one()
+    assert missed.status == "converted"
+    assert missed.removal_reason == "paid_conversion"
+    still = fresh_db.query(NonBuyerNurtureSequence).filter_by(email="stillfree@example.com").one()
+    assert still.status == "enrolled"

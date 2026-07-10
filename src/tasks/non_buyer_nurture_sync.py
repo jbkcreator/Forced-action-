@@ -89,5 +89,5 @@ if __name__ == "__main__":
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     result = run(dry_run=args.dry_run)
-    print(result)
+    logger.info("[NurtureSync] result: %s", result)
     sys.exit(0 if "error" not in result else 1)
