@@ -1515,6 +1515,7 @@ class WebhookEvent(Base):
 
     __table_args__ = (
         Index("idx_webhook_events_source_processed", "source", "processed_at"),
+        Index("idx_webhook_events_type_processed", "event_type", "processed_at"),
         CheckConstraint(
             "direction IN ('inbound', 'outbound')",
             name="check_webhook_event_direction",

@@ -649,6 +649,71 @@ class TestOnPaymentSucceeded:
         # Should not raise
         _on_payment_succeeded({"customer": "cus_missing"}, db)
 
+    def test_subscription_cycle_logs_renewed_event(self):
+        from src.services.stripe_webhooks import _on_payment_succeeded
+
+        subscriber = _make_subscriber()
+        db = MagicMock()
+        db.execute.return_value.scalar_one_or_none.return_value = subscriber
+
+        invoice = {
+            "id": "in_test123",
+            "customer": "cus_test",
+            "billing_reason": "subscription_cycle",
+            "lines": {"data": [{"period": {"end": 1800000000}}]},
+        }
+
+        with patch("src.services.webhook_log.already_logged", return_value=False), \
+             patch("src.services.business_events.log_business_event") as mock_log:
+            _on_payment_succeeded(invoice, db)
+
+        assert mock_log.called
+        kw = mock_log.call_args.kwargs
+        assert kw["source_event_id"] == "in_test123"
+
+    def test_subscription_update_does_not_log_renewed_event(self):
+        """billing_reason=subscription_update is a plan change, not a renewal —
+        must not inflate the SUBSCRIPTION_RENEWED / 'rebilled' funnel count."""
+        from src.services.stripe_webhooks import _on_payment_succeeded
+
+        subscriber = _make_subscriber()
+        db = MagicMock()
+        db.execute.return_value.scalar_one_or_none.return_value = subscriber
+
+        invoice = {
+            "id": "in_test456",
+            "customer": "cus_test",
+            "billing_reason": "subscription_update",
+            "lines": {"data": [{"period": {"end": 1800000000}}]},
+        }
+
+        with patch("src.services.business_events.log_business_event") as mock_log:
+            _on_payment_succeeded(invoice, db)
+
+        assert not mock_log.called
+
+    def test_renewed_event_skipped_when_already_logged(self):
+        """Guards the multi-worker dedupe race: if another worker already
+        logged SUBSCRIPTION_RENEWED for this invoice id, skip re-logging."""
+        from src.services.stripe_webhooks import _on_payment_succeeded
+
+        subscriber = _make_subscriber()
+        db = MagicMock()
+        db.execute.return_value.scalar_one_or_none.return_value = subscriber
+
+        invoice = {
+            "id": "in_test789",
+            "customer": "cus_test",
+            "billing_reason": "subscription_cycle",
+            "lines": {"data": [{"period": {"end": 1800000000}}]},
+        }
+
+        with patch("src.services.webhook_log.already_logged", return_value=True), \
+             patch("src.services.business_events.log_business_event") as mock_log:
+            _on_payment_succeeded(invoice, db)
+
+        assert not mock_log.called
+
 
 # ---------------------------------------------------------------------------
 # 7. stripe_webhooks — _on_subscription_updated
