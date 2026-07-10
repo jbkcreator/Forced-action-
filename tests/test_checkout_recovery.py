@@ -85,11 +85,20 @@ def _insert_active(db, email, *, touches_sent=0, started_at=None, last_touch_at=
     ))
 
 
+def _mute_capture(monkeypatch):
+    """run_sweep's capture step scans the live Subscriber table; the cadence
+    tests below aren't about capture, so stub it out to keep them from creating
+    recovery rows for real dev-DB subscribers (single shared DB)."""
+    from src.services import checkout_recovery
+    monkeypatch.setattr(checkout_recovery, "find_pre_payment_candidates", lambda db, now=None, limit=200: [])
+
+
 def test_sweep_is_read_only_when_flag_off(monkeypatch):
     from datetime import datetime, timedelta, timezone
     from config.settings import get_settings
     from src.tasks import checkout_recovery_sweep
 
+    _mute_capture(monkeypatch)
     monkeypatch.setattr(get_settings(), "checkout_recovery_enabled", False, raising=False)
     email = _email()
     try:
@@ -113,6 +122,7 @@ def test_sweep_sends_and_advances_when_flag_on(monkeypatch):
     from src.tasks import checkout_recovery_sweep
     import src.services.email as email_mod
 
+    _mute_capture(monkeypatch)
     monkeypatch.setattr(get_settings(), "checkout_recovery_enabled", True, raising=False)
     sent = {}
     monkeypatch.setattr(email_mod, "send_email", lambda **kw: sent.update(kw) or True)
@@ -139,6 +149,7 @@ def test_sweep_fails_exhausted_row_when_flag_on(monkeypatch):
     from config.settings import get_settings
     from src.tasks import checkout_recovery_sweep
 
+    _mute_capture(monkeypatch)
     monkeypatch.setattr(get_settings(), "checkout_recovery_enabled", True, raising=False)
     email = _email()
     try:

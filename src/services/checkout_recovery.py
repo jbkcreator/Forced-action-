@@ -185,6 +185,11 @@ def find_pre_payment_candidates(db, now: Optional[datetime] = None, limit: int =
     than PRE_PAYMENT_MAX_AGE, who don't already have a checkout_recovery row
     (e.g. session_expired already captured them — never double-start). Newest
     first, capped at `limit`.
+
+    Exclusion is a correlated NOT EXISTS and the cap is a SQL LIMIT — the
+    recovery table is never loaded into memory (it grows unbounded as rows
+    close, so an in-Python `email in {all_emails}` set would scale with total
+    history, not the small live window).
     """
     from src.core.models import Subscriber
 
@@ -192,25 +197,33 @@ def find_pre_payment_candidates(db, now: Optional[datetime] = None, limit: int =
     window_start = now - PRE_PAYMENT_MAX_AGE
     window_end = now - PRE_PAYMENT_MIN_AGE
 
-    already_captured = {
-        row[0]
-        for row in db.execute(select(CheckoutRecovery.email)).all()
-    }
+    already_captured = (
+        select(CheckoutRecovery.id)
+        .where(CheckoutRecovery.email == Subscriber.email)
+        .exists()
+    )
 
     rows = db.execute(
-        select(Subscriber.id, Subscriber.email, Subscriber.phone, Subscriber.created_at).where(
+        select(
+            Subscriber.id, Subscriber.email, Subscriber.phone,
+            Subscriber.vertical, Subscriber.county_id, Subscriber.created_at,
+        ).where(
             Subscriber.tier == "free",
             Subscriber.email.isnot(None),
             Subscriber.created_at >= window_start,
             Subscriber.created_at <= window_end,
-        ).order_by(Subscriber.created_at.desc())
+            ~already_captured,
+        ).order_by(Subscriber.created_at.desc()).limit(limit)
     ).all()
 
-    candidates = []
-    for sub_id, email, phone, created_at in rows:
-        if email in already_captured:
-            continue
-        candidates.append({"subscriber_id": sub_id, "email": email, "phone": phone, "created_at": created_at})
-        if len(candidates) >= limit:
-            break
-    return candidates
+    return [
+        {
+            "subscriber_id": r.id,
+            "email": r.email,
+            "phone": r.phone,
+            "vertical": r.vertical,
+            "county_id": r.county_id,
+            "created_at": r.created_at,
+        }
+        for r in rows
+    ]

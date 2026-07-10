@@ -80,6 +80,10 @@ def run_sweep(dry_run: bool = False) -> dict:
                 source="pre_payment",
                 subscriber_id=candidate["subscriber_id"],
                 phone=candidate["phone"],
+                resume_context={
+                    "county_id": candidate.get("county_id"),
+                    "vertical": candidate.get("vertical"),
+                },
             )
             if row is not None:
                 captured += 1
