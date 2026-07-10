@@ -3312,6 +3312,51 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, request: Request, db: S
 
 
 # ---------------------------------------------------------------------------
+# GET /api/upsell/subscription-offer — checkout-time subscription upsell
+# ---------------------------------------------------------------------------
+# Read-only pricing lookup for the "subscribe instead of a one-time Lead Pack"
+# interstitial. Only free-tier subscribers are eligible; accepting re-enters
+# the existing /api/checkout flow unchanged (which already upgrades a
+# pre-provisioned free row in place — see stripe_webhooks._on_checkout_completed).
+
+@app.get("/api/upsell/subscription-offer")
+def subscription_upsell_offer(feed_uuid: str, db: Session = Depends(get_db)):
+    _s = get_settings()
+
+    subscriber = db.execute(
+        select(Subscriber).where(Subscriber.event_feed_uuid == feed_uuid)
+    ).scalar_one_or_none()
+
+    if not subscriber or subscriber.tier != "free":
+        return {"eligible": False}
+
+    try:
+        price_id, is_founding = get_price_id_for_checkout(
+            db, "starter", subscriber.vertical, subscriber.county_id
+        )
+    except ValueError:
+        return {"eligible": False}
+
+    if not price_id or not _s.active_stripe_secret_key:
+        return {"eligible": False}
+
+    stripe.api_key = _s.active_stripe_secret_key.get_secret_value()
+    try:
+        price = stripe.Price.retrieve(price_id)
+    except stripe.StripeError as exc:
+        logger.error("Stripe error retrieving starter price for upsell offer: %s", exc)
+        return {"eligible": False}
+
+    return {
+        "eligible":    True,
+        "tier":        "starter",
+        "is_founding": is_founding,
+        "amount":      price["unit_amount"],
+        "currency":    price["currency"],
+    }
+
+
+# ---------------------------------------------------------------------------
 # POST /api/checkout/auto-mode — Stripe Checkout Session for Auto Mode add-on
 # ---------------------------------------------------------------------------
 # Authed-user pattern (feed_uuid in body). Creates a Stripe subscription
