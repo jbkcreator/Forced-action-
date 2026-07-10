@@ -1,13 +1,21 @@
 """
 Abandoned-checkout recovery sweep (Task 7).
 
-Walks active checkout_recovery rows and, per the cadence in
-checkout_recovery.next_action, either sends the next recovery touch (email +
-optional SMS) or fails the row (handing the contact back to non-buyer nurture).
+Two jobs, one run:
+  1. Capture — finds aged free-tier signups that never reached a Stripe
+     session (checkout_recovery.find_pre_payment_candidates) and starts
+     recovery for them. Runs unconditionally; this is the only place the
+     pre_payment path gets picked up (the session_expired path is captured
+     directly by the checkout.session.expired webhook, not here).
+  2. Cadence — walks active checkout_recovery rows and, per
+     checkout_recovery.next_action, either sends the next recovery touch
+     (email + optional SMS) or fails the row (handing the contact back to
+     non-buyer nurture).
 
-Sends only when settings.checkout_recovery_enabled is true; otherwise it runs
-read-only (logs what it would do, advances nothing) so it can be scheduled
-before messaging is switched on.
+Touch sends and fail-transitions only happen when
+settings.checkout_recovery_enabled is true; otherwise the sweep still
+captures and ages rows but logs what it would send/fail instead of acting, so
+it can be scheduled before messaging is switched on.
 
     python -m src.tasks.checkout_recovery_sweep
     python -m src.tasks.checkout_recovery_sweep --dry-run
@@ -59,8 +67,25 @@ def run_sweep(dry_run: bool = False) -> dict:
     sends_on = settings.checkout_recovery_enabled and not dry_run
     now = datetime.now(timezone.utc)
     sent = failed = skipped = 0
+    captured = 0
 
     with get_db_context() as db:
+        # Capture always runs, independent of the send flag — this is the only
+        # place the pre_payment path (no Stripe session ever created, so no
+        # checkout.session.expired webhook) gets picked up.
+        for candidate in checkout_recovery.find_pre_payment_candidates(db, now=now):
+            row = checkout_recovery.start_recovery(
+                db,
+                email=candidate["email"],
+                source="pre_payment",
+                subscriber_id=candidate["subscriber_id"],
+                phone=candidate["phone"],
+            )
+            if row is not None:
+                captured += 1
+        if captured:
+            db.commit()
+
         rows = db.execute(
             select(CheckoutRecovery).where(CheckoutRecovery.status == "active")
         ).scalars().all()
@@ -100,7 +125,7 @@ def run_sweep(dry_run: bool = False) -> dict:
         if sends_on:
             db.commit()
 
-    result = {"sent": sent, "failed": failed, "skipped": skipped, "sends_enabled": sends_on}
+    result = {"captured": captured, "sent": sent, "failed": failed, "skipped": skipped, "sends_enabled": sends_on}
     logger.info("[recovery-sweep] %s", result)
     return result
 

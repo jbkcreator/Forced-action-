@@ -161,6 +161,31 @@ def test_sweep_fails_exhausted_row_when_flag_on(monkeypatch):
         _cleanup(email)
 
 
+def test_sweep_wires_capture_into_start_recovery(monkeypatch):
+    """Wiring test only — find_pre_payment_candidates is mocked so this can't
+    scan/mutate real Subscriber rows in the shared dev DB (unlike the active-
+    row cadence tests above, this step reads the live Subscriber table, not
+    a test-only one)."""
+    from src.tasks import checkout_recovery_sweep
+    from src.services import checkout_recovery as cr
+
+    email = _email()
+    monkeypatch.setattr(
+        cr, "find_pre_payment_candidates",
+        lambda db, now=None, limit=200: [{"subscriber_id": None, "email": email, "phone": None, "created_at": None}],
+    )
+    try:
+        checkout_recovery_sweep.run_sweep(dry_run=True)
+
+        with get_db_context() as db:
+            rec = db.query(CheckoutRecovery).filter_by(email=email).first()
+        assert rec is not None
+        assert rec.source == "pre_payment"
+        assert rec.status == "active"
+    finally:
+        _cleanup(email)
+
+
 def test_start_recovery_creates_active_row_and_suppresses_nurture():
     from src.services import checkout_recovery
 
@@ -286,3 +311,135 @@ def test_mark_recovered_closes_the_sequence():
         assert rec.closed_at is not None
     finally:
         _cleanup(email)
+
+
+def _mk_free_subscriber(db, email, *, created_at, phone=None):
+    sub = Subscriber(
+        stripe_customer_id=f"cus_prepay_{uuid.uuid4().hex[:8]}",
+        tier="free", vertical="roofing", county_id="hillsborough",
+        event_feed_uuid=f"prepay-{uuid.uuid4().hex[:8]}",
+        email=email, phone=phone, created_at=created_at,
+    )
+    db.add(sub)
+    db.flush()
+    return sub
+
+
+def test_find_pre_payment_candidates_picks_up_aged_free_signup():
+    """The gap this path exists for: openCheckout creates the free row, but the
+    createCheckout call (or the Stripe form itself) never fires — no Stripe
+    session ever exists, so checkout.session.expired never fires either."""
+    from datetime import datetime, timedelta, timezone
+    from src.services import checkout_recovery
+
+    email = _email()
+    sub_id = None
+    try:
+        with get_db_context() as db:
+            sub = _mk_free_subscriber(
+                db, email,
+                created_at=datetime.now(timezone.utc) - timedelta(hours=2),
+                phone="+18135550100",
+            )
+            sub_id = sub.id
+            db.commit()
+
+        with get_db_context() as db:
+            candidates = checkout_recovery.find_pre_payment_candidates(db)
+        matched = next((c for c in candidates if c["email"] == email), None)
+        assert matched is not None
+        assert matched["subscriber_id"] == sub_id
+        assert matched["phone"] == "+18135550100"
+    finally:
+        _cleanup(email)
+        if sub_id is not None:
+            with get_db_context() as db:
+                db.query(Subscriber).filter_by(id=sub_id).delete(synchronize_session=False)
+                db.commit()
+
+
+def test_find_pre_payment_candidates_excludes_too_fresh_signup():
+    """Someone genuinely mid-checkout right now must not be captured yet —
+    only PRE_PAYMENT_MIN_AGE (30min) and older."""
+    from datetime import datetime, timedelta, timezone
+    from src.services import checkout_recovery
+
+    email = _email()
+    sub_id = None
+    try:
+        with get_db_context() as db:
+            sub = _mk_free_subscriber(
+                db, email, created_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+            )
+            sub_id = sub.id
+            db.commit()
+
+        with get_db_context() as db:
+            candidates = checkout_recovery.find_pre_payment_candidates(db)
+        assert email not in {c["email"] for c in candidates}
+    finally:
+        _cleanup(email)
+        if sub_id is not None:
+            with get_db_context() as db:
+                db.query(Subscriber).filter_by(id=sub_id).delete(synchronize_session=False)
+                db.commit()
+
+
+def test_find_pre_payment_candidates_excludes_already_captured_email():
+    """A session_expired capture that already created a checkout_recovery row
+    for this email must not be double-started by the pre_payment sweep."""
+    from datetime import datetime, timedelta, timezone
+    from src.services import checkout_recovery
+
+    email = _email()
+    sub_id = None
+    try:
+        with get_db_context() as db:
+            sub = _mk_free_subscriber(
+                db, email, created_at=datetime.now(timezone.utc) - timedelta(hours=2),
+            )
+            sub_id = sub.id
+            checkout_recovery.start_recovery(db, email=email, source="session_expired")
+            db.commit()
+
+        with get_db_context() as db:
+            candidates = checkout_recovery.find_pre_payment_candidates(db)
+        assert email not in {c["email"] for c in candidates}
+    finally:
+        _cleanup(email)
+        if sub_id is not None:
+            with get_db_context() as db:
+                db.query(Subscriber).filter_by(id=sub_id).delete(synchronize_session=False)
+                db.commit()
+
+
+def test_find_pre_payment_candidates_excludes_converted_subscriber():
+    """A subscriber who upgraded off 'free' is a real conversion, not an
+    abandonment — must never be pulled in."""
+    from datetime import datetime, timedelta, timezone
+    from src.services import checkout_recovery
+
+    email = _email()
+    sub_id = None
+    try:
+        with get_db_context() as db:
+            sub = Subscriber(
+                stripe_customer_id=f"cus_prepay_{uuid.uuid4().hex[:8]}",
+                tier="starter", vertical="roofing", county_id="hillsborough",
+                event_feed_uuid=f"prepay-{uuid.uuid4().hex[:8]}",
+                email=email, created_at=datetime.now(timezone.utc) - timedelta(hours=2),
+            )
+            db.add(sub)
+            db.flush()
+            sub_id = sub.id
+            db.commit()
+
+        with get_db_context() as db:
+            candidates = checkout_recovery.find_pre_payment_candidates(db)
+        assert email not in {c["email"] for c in candidates}
+    finally:
+        _cleanup(email)
+        if sub_id is not None:
+            with get_db_context() as db:
+                db.query(Subscriber).filter_by(id=sub_id).delete(synchronize_session=False)
+                db.commit()
