@@ -673,4 +673,11 @@ COUNTY_ID=hillsborough
 # against stale/empty tax_deed_auctions data and report false "success".
 # Add this once the tax-deed scraper itself has a cron line above.
 
+# Tiered volume guarantee shortfall sweep — INTENTIONALLY NOT scheduled yet.
+# config/guarantees.py TIER_LEAD_QUOTAS are placeholder lead-per-cycle counts
+# pending a business decision; enabling this cron would issue real Stripe
+# balance credits off unconfirmed numbers. Uncomment once TIER_LEAD_QUOTAS is
+# confirmed (and ideally after a --dry-run pass against production data).
+# 0 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.guarantee_shortfall_sweep
+
 # === END FORCED-ACTION-PLATFORM ===
