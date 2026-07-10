@@ -928,7 +928,12 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
             detail={"error": "payment_gateway_error", "message": "Payment gateway error — please try again"},
         )
 
-    return {"client_secret": session.client_secret, "is_founding": is_founding}
+    return {
+        "client_secret": session.client_secret,
+        "session_id": session.id,
+        "amount_total_cents": session.amount_total,
+        "is_founding": is_founding,
+    }
 
 
 # ---------------------------------------------------------------------------
