@@ -4147,6 +4147,12 @@ class County(Base):
     # normalization. Source of truth for per-county address city stripping —
     # replaces the hardcoded Hillsborough list previously in BaseLoader.
     address_city_tokens: Mapped[Optional[list]] = mapped_column(JSONB, default=list)
+    # Task 8 landing conversion features (ADR 0029). Ordered list, rendered as
+    # a carousel — reversed from the original single-slot decision (CONTEXT.md).
+    landing_featured_testimonials: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)
+    founding_price_deadline_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
