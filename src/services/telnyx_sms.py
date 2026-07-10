@@ -58,7 +58,7 @@ def send_message(
     Telnyx routes based on the messaging profile, not the request.
     """
     settings = get_settings()
-    if settings.telnyx_sms_api_key is None:
+    if not settings.telnyx_sms_api_key:
         raise TelnyxSMSError("TELNYX_SMS_API_KEY is not configured")
     if not settings.telnyx_messaging_profile_id:
         raise TelnyxSMSError("TELNYX_MESSAGING_PROFILE_ID is not configured")

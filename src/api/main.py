@@ -3948,6 +3948,20 @@ async def synthflow_webhook(request: Request):
         payload.resolved_call_id, phone, payload.resolved_outcome,
         result.get("contact_id"), result.get("tags_applied"),
     )
+
+    # Speed-to-lead: instantly alert the founder when a prospect asks for a demo
+    if "demo_requested" in (result.get("tags_applied") or []):
+        from src.services.owner_alert import notify_owner
+        notify_owner(
+            subject="Demo requested",
+            body=(
+                f"Prospect asked for a demo on a Synthflow call.\n"
+                f"Name: {payload.prospect_name or v.get('prospect_name') or lead.get('name') or 'unknown'}\n"
+                f"Phone: {phone}\nVertical: {payload.vertical or v.get('vertical') or ''}\n"
+                f"ZIP: {payload.zip_code or v.get('zip_code') or v.get('zip') or ''}"
+            ),
+        )
+
     return {"status": "ok", **result}
 
 
