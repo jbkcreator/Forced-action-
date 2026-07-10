@@ -133,7 +133,24 @@ def enroll(db, candidates: list[dict], campaign_id: str) -> dict:
             "leaving rows eligible for retry", campaign_id, len(leads), exc_info=True,
         )
         result = None
-    succeeded = result is not None
+
+    # Success = Instantly acknowledged the leads (created new OR recognised
+    # existing). A dict with both counts zero means every lead was rejected
+    # (e.g. invalid address) — treat as failure so rows stay eligible and the
+    # next sweep retries, instead of silently marking them enrolled forever.
+    created = (result or {}).get("leads_created", 0) or 0
+    skipped = (result or {}).get("leads_skipped", 0) or 0
+    succeeded = result is not None and (created + skipped) > 0
+
+    # ponytail: batch-level success only — Instantly's add response gives counts,
+    # not per-email results, so a partially-rejected batch still marks all rows
+    # enrolled. The sync task (list_leads) is the per-email reconciler. Warn so
+    # partial acceptance is visible in logs.
+    if succeeded and created < len(leads):
+        logger.warning(
+            "[NonBuyerNurture] partial enroll on campaign %s: %d leads sent, "
+            "created=%d skipped=%d", campaign_id, len(leads), created, skipped,
+        )
 
     existing_rows = {
         row.email: row

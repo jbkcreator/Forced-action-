@@ -375,3 +375,62 @@ def test_reconcile_conversions_marks_paid_enrolled_rows_converted(fresh_db):
     assert missed.removal_reason == "paid_conversion"
     still = fresh_db.query(NonBuyerNurtureSequence).filter_by(email="stillfree@example.com").one()
     assert still.status == "enrolled"
+
+
+def test_enroll_all_rejected_leaves_eligible(fresh_db):
+    # Instantly accepted the request but created 0 and skipped 0 — every address
+    # rejected. Must NOT mark enrolled (else lead is silently lost forever).
+    now = datetime.now(timezone.utc)
+    candidate = {"email": "rejected@example.com", "subscriber_id": None,
+                 "source": "free_signup", "captured_at": now - timedelta(hours=30)}
+
+    with patch.object(non_buyer_nurture.instantly, "add_leads",
+                      return_value={"leads_created": 0, "leads_skipped": 0}):
+        non_buyer_nurture.enroll(fresh_db, [candidate], campaign_id="camp_x")
+
+    row = fresh_db.query(NonBuyerNurtureSequence).filter_by(email="rejected@example.com").one()
+    assert row.status == "eligible"
+    assert row.enrolled_at is None
+
+
+def test_enroll_skipped_existing_counts_as_success(fresh_db):
+    # created=0 but skipped=1 → Instantly already has the lead. Enrolled (not a failure).
+    now = datetime.now(timezone.utc)
+    candidate = {"email": "existing@example.com", "subscriber_id": None,
+                 "source": "free_signup", "captured_at": now - timedelta(hours=30)}
+
+    with patch.object(non_buyer_nurture.instantly, "add_leads",
+                      return_value={"leads_created": 0, "leads_skipped": 1}):
+        non_buyer_nurture.enroll(fresh_db, [candidate], campaign_id="camp_x")
+
+    row = fresh_db.query(NonBuyerNurtureSequence).filter_by(email="existing@example.com").one()
+    assert row.status == "enrolled"
+
+
+def test_enroll_instantly_exception_leaves_eligible(fresh_db):
+    now = datetime.now(timezone.utc)
+    candidate = {"email": "boom@example.com", "subscriber_id": None,
+                 "source": "free_signup", "captured_at": now - timedelta(hours=30)}
+
+    with patch.object(non_buyer_nurture.instantly, "add_leads", side_effect=RuntimeError("Instantly 500")):
+        non_buyer_nurture.enroll(fresh_db, [candidate], campaign_id="camp_x")
+
+    row = fresh_db.query(NonBuyerNurtureSequence).filter_by(email="boom@example.com").one()
+    assert row.status == "eligible"
+    assert row.enrolled_at is None
+
+
+def test_find_candidates_paid_exclusion_is_case_insensitive(fresh_db):
+    # Waitlist/abandon captured with mixed case; paid subscriber lower-case.
+    # Exclusion must match case-insensitively so a payer never gets nurture mail.
+    now = datetime.now(timezone.utc)
+    fresh_db.add(NonBuyerNurtureSequence(
+        email="Mixed.Case@Example.com", source="checkout_abandon",
+        captured_at=now - timedelta(hours=30), status="eligible",
+    ))
+    fresh_db.add(_paid_subscriber("mixed.case@example.com"))
+    fresh_db.flush()
+
+    candidates = non_buyer_nurture.find_candidates(fresh_db, limit=10_000)
+    lowered = {c["email"].lower() for c in candidates}
+    assert "mixed.case@example.com" not in lowered
