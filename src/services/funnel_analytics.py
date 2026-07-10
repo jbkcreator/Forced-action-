@@ -14,6 +14,10 @@ Stage → event_type mapping (v1, see docs/plans funnel-analytics plan):
   checkout_started -> PAYMENT_STARTED      (bundle checkout excluded — separate flow)
   paid             -> PAYMENT_SUCCEEDED
   rebilled         -> SUBSCRIPTION_RENEWED (wallet-subscription renewals excluded — separate flow)
+
+TODO(follow-up): checkout_started currently has no emitter — no backend or
+frontend call site logs PAYMENT_STARTED yet, so this stage will read 0 until
+that's wired up at the Stripe Checkout Session creation call sites.
 """
 
 from __future__ import annotations
@@ -38,6 +42,7 @@ def compute_funnel_counts(db: Session, frm: datetime, to: datetime) -> dict:
         text(
             "SELECT event_type, count(*) AS n FROM webhook_events "
             "WHERE event_type = ANY(:event_types) "
+            "AND source IN ('business', 'frontend') "
             "AND processed_at >= :frm AND processed_at < :to "
             "GROUP BY event_type"
         ),

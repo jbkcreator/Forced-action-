@@ -1135,18 +1135,35 @@ def _on_payment_succeeded(invoice: dict, db: Session) -> None:
         except Exception:
             logger.warning("Attribution recording failed sub=%s", subscriber.id, exc_info=True)
 
-    # Funnel analytics: log a rebill event for standard subscription renewals.
+    # Funnel analytics: log a rebill event for standard subscription renewals
+    # only — billing_reason values other than subscription_cycle (e.g.
+    # subscription_update on a plan change, subscription_threshold, manual)
+    # are not genuine renewals and must not inflate the "rebilled" count.
     # Wallet-subscription renewals go through _on_wallet_subscription_invoice
     # above and are not covered here.
-    if billing_reason and billing_reason != "subscription_create":
+    if billing_reason == "subscription_cycle":
+        invoice_id = invoice.get("id")
         try:
             from src.services.business_events import log_business_event
-            log_business_event(
-                "SUBSCRIPTION_RENEWED",
-                subscriber_id=subscriber.id,
-                payload={"invoice_id": invoice.get("id"), "billing_reason": billing_reason},
-                db=db,
-            )
+            from src.services.webhook_log import already_logged
+            # Guards against the multi-worker race documented above this
+            # handler's dedupe check: two workers can both pass the Stripe
+            # event-level dedupe and run this handler before either commits
+            # the dedupe row, and this audit write has no unique constraint
+            # of its own — so key it to the invoice id explicitly.
+            if invoice_id and already_logged("business", invoice_id):
+                logger.info(
+                    "SUBSCRIPTION_RENEWED already logged for invoice=%s sub=%s — skipping",
+                    invoice_id, subscriber.id,
+                )
+            else:
+                log_business_event(
+                    "SUBSCRIPTION_RENEWED",
+                    subscriber_id=subscriber.id,
+                    payload={"invoice_id": invoice_id, "billing_reason": billing_reason},
+                    source_event_id=invoice_id,
+                    db=db,
+                )
         except Exception:
             logger.warning("SUBSCRIPTION_RENEWED business event failed sub=%s", subscriber.id, exc_info=True)
 

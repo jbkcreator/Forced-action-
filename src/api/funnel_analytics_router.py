@@ -24,21 +24,12 @@ from sqlalchemy.orm import Session
 
 from src.api.admin_router import get_current_admin
 from src.api.deps import get_db as _get_db
+from src.api.deps import parse_iso_date_param as _parse
 from src.services.funnel_analytics import compute_funnel_counts
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/analytics", tags=["funnel-analytics"])
-
-
-def _parse(value: Optional[str], field: str) -> Optional[datetime]:
-    if not value:
-        return None
-    try:
-        dt = datetime.fromisoformat(value)
-    except ValueError:
-        raise HTTPException(status_code=400, detail=f"Invalid {field} date: {value!r}")
-    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 @router.get("/funnel")

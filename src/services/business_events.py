@@ -74,6 +74,7 @@ def log_business_event(
     property_id: Optional[int] = None,
     payload: Optional[Dict[str, Any]] = None,
     source: str = "business",
+    source_event_id: Optional[str] = None,
     db: Optional[Session] = None,
 ) -> None:
     """Non-blocking audit write. Returns None.
@@ -82,6 +83,10 @@ def log_business_event(
     for the /api/business-event endpoint. The underlying WebhookEvent row
     has `status='processed'` by convention since the business action has
     already happened by the time this is called.
+
+    `source_event_id` is optional and lets a caller key this event to an
+    upstream id (e.g. a Stripe invoice id) so `webhook_log.already_logged()`
+    can dedupe repeat writes for the same underlying action.
     """
     if event_type not in BUSINESS_EVENT_TYPES:
         logger.warning(
@@ -99,6 +104,7 @@ def log_business_event(
             property_id=property_id,
             payload=payload,
             payload_kind="generic",  # use generic sanitizer (allow-listed key set)
+            source_event_id=source_event_id,
             db=db,
         )
     except Exception as exc:
