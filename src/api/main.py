@@ -3307,7 +3307,9 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, request: Request, db: S
     # Session (it's a PaymentIntent), so there's no session.expired signal —
     # capture the intent now and close it on the success webhook. Best-effort;
     # never block the checkout response. Messaging is flag-gated in the sweep.
-    if subscriber.email:
+    # Off by default: lead-pack abandoners are existing paying subscribers, so
+    # we don't dun them unless checkout_recovery_lead_pack_enabled is set.
+    if subscriber.email and _s.checkout_recovery_lead_pack_enabled:
         try:
             from src.services import checkout_recovery
             checkout_recovery.start_recovery(
