@@ -180,6 +180,58 @@ class TestUpgradeSettlesOutgoingGuarantee:
         finally:
             _cleanup(fresh_db, sub)
 
+    def test_settles_every_backlogged_closed_period_before_switching(self, fresh_db, client):
+        """A subscriber with several already-closed, never-evaluated cycles
+        (sweep downtime, or guarantees just turned on) must have ALL of them
+        settled before the tier flips — not just the oldest one."""
+        sub = _make_sub(fresh_db, status="active")  # tier="pro" — guaranteed
+        try:
+            with (
+                patch("src.services.stripe_service.switch_subscription_plan", return_value=True),
+                patch("config.settings.AppSettings.active_stripe_price", return_value="price_test_123"),
+                patch(
+                    "src.tasks.guarantee_shortfall_sweep.evaluate_subscriber_guarantee",
+                    side_effect=[
+                        {"shortfall": True, "status": "issued"},
+                        {"shortfall": False, "status": "met"},
+                        {"shortfall": True, "status": "issued"},
+                        None,  # no more closed cycles left to settle
+                    ],
+                ) as mock_evaluate,
+            ):
+                resp = client.post(
+                    "/api/upgrade",
+                    json={"feed_uuid": sub.event_feed_uuid, "tier": "autopilot_pro"},
+                )
+            assert resp.status_code == 200
+            assert resp.json()["tier"] == "autopilot_pro"
+            assert mock_evaluate.call_count == 4
+        finally:
+            _cleanup(fresh_db, sub)
+
+    def test_settlement_loop_has_a_safety_cap(self, fresh_db, client):
+        """evaluate_subscriber_guarantee() should never return non-None
+        forever in practice, but the loop must not hang the request if it
+        somehow did — and the upgrade must still complete."""
+        sub = _make_sub(fresh_db, status="active")
+        try:
+            with (
+                patch("src.services.stripe_service.switch_subscription_plan", return_value=True),
+                patch("config.settings.AppSettings.active_stripe_price", return_value="price_test_123"),
+                patch(
+                    "src.tasks.guarantee_shortfall_sweep.evaluate_subscriber_guarantee",
+                    return_value={"shortfall": False, "status": "met"},
+                ) as mock_evaluate,
+            ):
+                resp = client.post(
+                    "/api/upgrade",
+                    json={"feed_uuid": sub.event_feed_uuid, "tier": "autopilot_pro"},
+                )
+            assert resp.status_code == 200
+            assert mock_evaluate.call_count == 60
+        finally:
+            _cleanup(fresh_db, sub)
+
     def test_unguaranteed_tier_skips_settlement(self, fresh_db, client):
         """A subscriber already off a guaranteed tier (e.g. data_only)
         shouldn't trigger a settlement lookup on every upgrade call."""
