@@ -43,7 +43,7 @@ def _subject(touch_number: int, source: str) -> str:
     )
 
 
-def _email_body(resume_url: str, touch_number: int, source: str) -> str:
+def _email_body(resume_url: str, touch_number: int, source: str, unsubscribe_url: str) -> str:
     if source == "lead_pack":
         lead = (
             "You started buying a lead pack but didn't finish — those leads are "
@@ -63,7 +63,8 @@ def _email_body(resume_url: str, touch_number: int, source: str) -> str:
     return (
         f"{lead}\n\n"
         f"Pick up where you left off: {resume_url}\n\n"
-        f"— Forced Action"
+        f"— Forced Action\n\n"
+        f"Don't want these reminders? Unsubscribe: {unsubscribe_url}"
     )
 
 
@@ -122,12 +123,18 @@ def run_sweep(dry_run: bool = False) -> dict:
                 continue
 
             # Only advance the touch count when a channel actually delivered.
-            # A total failure leaves the row due so the next sweep retries.
-            if _send_touch(row, touch_number, resume_url):
+            if _send_touch(row, touch_number, resume_url, settings.app_base_url):
                 checkout_recovery.record_touch(db, row, now)
                 sent += 1
                 logger.debug("[recovery-sweep] sent touch#%d email=%s source=%s", touch_number, row.email, row.source)
+            elif _is_email_opted_out(db, row.email):
+                # Opted out (unsubscribed) — email will never deliver, so close
+                # the row instead of retrying it every sweep forever.
+                checkout_recovery.mark_failed(db, row.email)
+                failed += 1
+                logger.info("[recovery-sweep] email opted out — closing recovery email=%s", row.email)
             else:
+                # Transient failure (provider down/misconfigured) — leave due.
                 undelivered += 1
                 logger.warning(
                     "[recovery-sweep] touch#%d not delivered (all channels failed) email=%s — leaving due for retry",
@@ -142,25 +149,44 @@ def run_sweep(dry_run: bool = False) -> dict:
     return result
 
 
-def _send_touch(row, touch_number: int, resume_url: str) -> bool:
-    """Email always; SMS best-effort when a phone is on file (the compliant
-    sender enforces opt-in/opt-out, so no consent check is duplicated here).
+def _is_email_opted_out(db, email: str) -> bool:
+    """True if the email is on the global opt-out list — a send will never
+    deliver, so recovery should close the row rather than retry it."""
+    try:
+        from src.services.email_suppression import is_email_suppressed
+        return bool(is_email_suppressed(db, email))
+    except Exception:
+        logger.warning("[recovery-sweep] opt-out check failed email=%s", email, exc_info=True)
+        return False
 
-    Returns True if at least one channel accepted the message. A False return
-    means nothing was delivered (provider down, bad creds, timeout) — the caller
-    must NOT advance the touch count, so the row stays due and the next sweep
-    retries instead of silently burning a recovery attempt."""
+
+def _send_touch(row, touch_number: int, resume_url: str, base_url: str) -> bool:
+    """Email always; SMS best-effort when a phone is on file (the compliant
+    sender enforces opt-in/opt-out).
+
+    Returns True only if a channel ACTUALLY accepted the message. send_email /
+    send_sms return False for non-exceptional declines (SMTP unconfigured,
+    email opted-out, SMS lacking consent/subscriber_id, provider disabled) — we
+    honour that return, not just the absence of an exception, so a declined send
+    never counts as a delivered touch and the row stays due for retry."""
     from src.services.email import send_email
+    from src.services.email_unsubscribe import mint_unsubscribe_token
 
     source = getattr(row, "source", "session_expired")
+
+    # Recovery mail is promotional → must carry a one-click unsubscribe (body +
+    # List-Unsubscribe header). Opting out writes the global opt-out, which the
+    # send_email suppression gate then honours on the next touch.
+    unsubscribe_url = f"{base_url.rstrip('/')}/api/email/unsubscribe?token={mint_unsubscribe_token(row.email)}"
+
     email_ok = False
     try:
-        send_email(
+        email_ok = bool(send_email(
             to=row.email,
             subject=_subject(touch_number, source),
-            body_text=_email_body(resume_url, touch_number, source),
-        )
-        email_ok = True
+            body_text=_email_body(resume_url, touch_number, source, unsubscribe_url),
+            list_unsubscribe_url=unsubscribe_url,
+        ))
     except Exception:
         logger.warning("[recovery-sweep] email send failed email=%s", row.email, exc_info=True)
 
@@ -175,8 +201,12 @@ def _send_touch(row, touch_number: int, resume_url: str) -> bool:
             from src.services.sms_compliance import send_sms
             from src.core.database import get_db_context
             with get_db_context() as sms_db:
-                send_sms(row.phone, sms_body, sms_db, message_type="marketing")
-            sms_ok = True
+                # subscriber_id is required — the compliance sender rejects
+                # marketing SMS without it (returns False, not an exception).
+                sms_ok = bool(send_sms(
+                    row.phone, sms_body, sms_db,
+                    message_type="marketing", subscriber_id=row.subscriber_id,
+                ))
         except Exception:
             logger.warning("[recovery-sweep] sms send failed email=%s", row.email, exc_info=True)
 

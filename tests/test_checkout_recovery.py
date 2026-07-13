@@ -490,3 +490,123 @@ def test_build_resume_url_lead_pack_targets_dashboard():
         "kind": "lead_pack", "feed_uuid": "feed-123", "lead_pack_zip": "33601",
     })
     assert url == "https://app.example.com/dashboard/feed-123?lead_pack_zip=33601"
+
+
+# ── PR #127 fixes: honour real send returns + unsubscribe + opt-out close ──────
+
+def test_send_email_false_leaves_touch_due(monkeypatch):
+    """Issue 1: send_email returning False (non-exceptional decline, e.g. SMTP
+    off) must NOT advance the touch — the row stays due, counted undelivered."""
+    from datetime import datetime, timedelta, timezone
+    from config.settings import get_settings
+    from src.tasks import checkout_recovery_sweep
+    import src.services.email as email_mod
+
+    monkeypatch.setattr(get_settings(), "checkout_recovery_enabled", True, raising=False)
+    monkeypatch.setattr(email_mod, "send_email", lambda **kw: False)  # declined, no exception
+
+    email = _email()
+    try:
+        with get_db_context() as db:
+            _insert_active(db, email, started_at=datetime.now(timezone.utc) - timedelta(hours=3))  # email-only
+            db.commit()
+
+        result = checkout_recovery_sweep.run_sweep()
+
+        with get_db_context() as db:
+            rec = db.query(CheckoutRecovery).filter_by(email=email).first()
+        assert rec.touches_sent == 0
+        assert rec.status == "active"
+        assert result["undelivered"] == 1
+        assert result["sent"] == 0
+    finally:
+        _cleanup(email)
+
+
+def test_both_channels_false_leaves_touch_due(monkeypatch):
+    """Issue 1: email False + SMS False (e.g. marketing SMS with no
+    subscriber_id) → nothing delivered → row stays due, not completed."""
+    from datetime import datetime, timedelta, timezone
+    from config.settings import get_settings
+    from src.tasks import checkout_recovery_sweep
+    import src.services.email as email_mod
+    import src.services.sms_compliance as sms_mod
+
+    monkeypatch.setattr(get_settings(), "checkout_recovery_enabled", True, raising=False)
+    monkeypatch.setattr(email_mod, "send_email", lambda **kw: False)
+    monkeypatch.setattr(sms_mod, "send_sms", lambda *a, **kw: False)  # compliance decline
+
+    email = _email()
+    try:
+        with get_db_context() as db:
+            _insert_active(db, email, phone="+18135550123",
+                           started_at=datetime.now(timezone.utc) - timedelta(hours=3))
+            db.commit()
+
+        result = checkout_recovery_sweep.run_sweep()
+
+        with get_db_context() as db:
+            rec = db.query(CheckoutRecovery).filter_by(email=email).first()
+        assert rec.touches_sent == 0
+        assert rec.status == "active"
+        assert result["undelivered"] == 1
+    finally:
+        _cleanup(email)
+
+
+def test_recovery_email_carries_unsubscribe(monkeypatch):
+    """Issue 2: promotional recovery email must include a signed unsubscribe URL
+    in both the List-Unsubscribe header and the body."""
+    from datetime import datetime, timedelta, timezone
+    from config.settings import get_settings
+    from src.tasks import checkout_recovery_sweep
+    import src.services.email as email_mod
+
+    monkeypatch.setattr(get_settings(), "checkout_recovery_enabled", True, raising=False)
+    captured = {}
+    monkeypatch.setattr(email_mod, "send_email", lambda **kw: captured.update(kw) or True)
+
+    email = _email()
+    try:
+        with get_db_context() as db:
+            _insert_active(db, email, started_at=datetime.now(timezone.utc) - timedelta(hours=3))
+            db.commit()
+
+        checkout_recovery_sweep.run_sweep()
+
+        assert "/api/email/unsubscribe?token=" in captured.get("list_unsubscribe_url", "")
+        assert "Unsubscribe:" in captured.get("body_text", "")
+    finally:
+        _cleanup(email)
+
+
+def test_opted_out_email_closes_row_instead_of_retrying(monkeypatch):
+    """Issue 2: once the email is opted out, don't retry forever — close the
+    recovery row so no further touches are attempted."""
+    from datetime import datetime, timedelta, timezone
+    from config.settings import get_settings
+    from src.core.models import EmailOptOut
+    from src.tasks import checkout_recovery_sweep
+    import src.services.email as email_mod
+
+    monkeypatch.setattr(get_settings(), "checkout_recovery_enabled", True, raising=False)
+    monkeypatch.setattr(email_mod, "send_email", lambda **kw: False)  # suppressed → declined
+
+    email = _email()
+    try:
+        with get_db_context() as db:
+            _insert_active(db, email, started_at=datetime.now(timezone.utc) - timedelta(hours=3))
+            db.add(EmailOptOut(email=email, source="test"))
+            db.commit()
+
+        result = checkout_recovery_sweep.run_sweep()
+
+        with get_db_context() as db:
+            rec = db.query(CheckoutRecovery).filter_by(email=email).first()
+        assert rec.status == "failed"          # closed, not left due
+        assert result["failed"] >= 1
+    finally:
+        _cleanup(email)
+        with get_db_context() as db:
+            db.query(EmailOptOut).filter_by(email=email).delete(synchronize_session=False)
+            db.commit()
