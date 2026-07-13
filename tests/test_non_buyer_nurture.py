@@ -434,3 +434,39 @@ def test_find_candidates_paid_exclusion_is_case_insensitive(fresh_db):
     candidates = non_buyer_nurture.find_candidates(fresh_db, limit=10_000)
     lowered = {c["email"].lower() for c in candidates}
     assert "mixed.case@example.com" not in lowered
+
+
+# --- Issue 2: nurture unsub/bounce writes the global email suppression --------
+
+@pytest.mark.parametrize("mapped,expected", [("unsubscribed", "unsubscribed"), ("bounced", "bounced")])
+def test_apply_instantly_status_writes_global_suppression(fresh_db, mapped, expected):
+    from src.core.models import EmailOptOut
+
+    email = f"{mapped}@example.com"
+    fresh_db.add(NonBuyerNurtureSequence(
+        email=email, source="free_signup",
+        captured_at=datetime.now(timezone.utc), status="enrolled",
+    ))
+    fresh_db.flush()
+
+    non_buyer_nurture.apply_instantly_status(fresh_db, email, mapped, instantly_lead_id="lead_x")
+
+    row = fresh_db.query(NonBuyerNurtureSequence).filter_by(email=email).one()
+    assert row.status == expected  # nurture row still marked terminal
+    opt_out = fresh_db.query(EmailOptOut).filter_by(email=email).one_or_none()
+    assert opt_out is not None  # global opt-out written
+
+
+def test_apply_instantly_status_active_does_not_suppress(fresh_db):
+    from src.core.models import EmailOptOut
+
+    email = "stillactive@example.com"
+    fresh_db.add(NonBuyerNurtureSequence(
+        email=email, source="free_signup",
+        captured_at=datetime.now(timezone.utc), status="enrolled",
+    ))
+    fresh_db.flush()
+
+    non_buyer_nurture.apply_instantly_status(fresh_db, email, "active")
+
+    assert fresh_db.query(EmailOptOut).filter_by(email=email).one_or_none() is None
