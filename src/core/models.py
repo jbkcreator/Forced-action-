@@ -4917,6 +4917,55 @@ class WaitlistEntry(Base):
                 f"status={self.status})>")
 
 
+class NonBuyerNurtureSequence(Base):
+    """
+    One row per email — the per-email suppression/state list for the non-buyer
+    nurture sequence (free-signup / checkout-abandon / waitlist leads who
+    haven't converted). Terminal states block re-enrollment forever (v1: once
+    per email, ever).
+    """
+    __tablename__ = "non_buyer_nurture_sequences"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    email: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    subscriber_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("subscribers.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    source: Mapped[str] = mapped_column(String(20), nullable=False)  # free_signup | checkout_abandon | waitlist
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    instantly_campaign_id: Mapped[Optional[str]] = mapped_column(String(100))
+    instantly_lead_id: Mapped[Optional[str]] = mapped_column(String(100))
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="eligible", server_default="eligible", index=True)
+    eligible_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True)
+    enrolled_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    removed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    removal_reason: Mapped[Optional[str]] = mapped_column(String(40))
+    converted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('eligible','enrolled','converted','unsubscribed','bounced','removed')",
+            name="ck_non_buyer_nurture_status",
+        ),
+        CheckConstraint(
+            "removal_reason IS NULL OR removal_reason IN "
+            "('paid_conversion','unsubscribe','bounce','manual','campaign_removed')",
+            name="ck_non_buyer_nurture_removal_reason",
+        ),
+        CheckConstraint(
+            "source IN ('free_signup','checkout_abandon','waitlist')",
+            name="ck_non_buyer_nurture_source",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return f"<NonBuyerNurtureSequence(id={self.id}, email={self.email}, status={self.status})>"
+
+
 class GoldPlusZipSnapshot(Base):
     """
     Nightly aggregation of new Gold+ lead counts per ZIP, refreshed after CDS scoring.
