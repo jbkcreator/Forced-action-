@@ -610,3 +610,88 @@ def test_opted_out_email_closes_row_instead_of_retrying(monkeypatch):
         with get_db_context() as db:
             db.query(EmailOptOut).filter_by(email=email).delete(synchronize_session=False)
             db.commit()
+
+
+# ── PR #127 follow-up: subscription recovery SMS gets a subscriber_id ──────────
+
+def test_resolve_subscriber_matches_email_and_vertical():
+    from src.services import checkout_recovery as cr
+
+    email = _email()
+    sub_id = None
+    try:
+        with get_db_context() as db:
+            sub = Subscriber(
+                stripe_customer_id=f"cus_res_{uuid.uuid4().hex[:8]}",
+                tier="free", vertical="roofing", county_id="hillsborough",
+                event_feed_uuid=f"res-{uuid.uuid4().hex[:8]}",
+                email=email, phone="+18135550170",
+            )
+            db.add(sub)
+            db.flush()
+            sub_id = sub.id
+            db.commit()
+
+        with get_db_context() as db:
+            rid, rphone = cr.resolve_subscriber(db, email, vertical="roofing", county_id="hillsborough")
+            miss = cr.resolve_subscriber(db, "nobody-" + email)
+        assert rid == sub_id
+        assert rphone == "+18135550170"
+        assert miss == (None, None)
+    finally:
+        _cleanup(email)
+        if sub_id is not None:
+            with get_db_context() as db:
+                db.query(Subscriber).filter_by(id=sub_id).delete(synchronize_session=False)
+                db.commit()
+
+
+def test_consented_recovery_row_delivers_sms(monkeypatch):
+    """PR #127 follow-up: a normal subscription-recovery row that carries a
+    subscriber_id can deliver SMS — the compliance-required id reaches send_sms
+    and the touch is recorded even when email declines."""
+    from datetime import datetime, timedelta, timezone
+    from config.settings import get_settings
+    from src.tasks import checkout_recovery_sweep
+    import src.services.email as email_mod
+    import src.services.sms_compliance as sms_mod
+
+    monkeypatch.setattr(get_settings(), "checkout_recovery_enabled", True, raising=False)
+    monkeypatch.setattr(email_mod, "send_email", lambda **kw: False)  # email unavailable → SMS is the fallback
+    captured = {}
+    monkeypatch.setattr(sms_mod, "send_sms", lambda *a, **kw: captured.update(kw) or True)
+
+    email = _email()
+    sub_id = None
+    try:
+        with get_db_context() as db:
+            sub = Subscriber(
+                stripe_customer_id=f"cus_sms_{uuid.uuid4().hex[:8]}",
+                tier="free", vertical="roofing", county_id="hillsborough",
+                event_feed_uuid=f"sms-{uuid.uuid4().hex[:8]}",
+                email=email, phone="+18135550180",
+            )
+            db.add(sub)
+            db.flush()
+            sub_id = sub.id
+            db.add(CheckoutRecovery(
+                email=email, source="session_expired", status="active",
+                subscriber_id=sub_id, phone="+18135550180",
+                started_at=datetime.now(timezone.utc) - timedelta(hours=3),
+                resume_context={"county_id": "hillsborough", "vertical": "roofing"},
+            ))
+            db.commit()
+
+        result = checkout_recovery_sweep.run_sweep()
+
+        assert captured.get("subscriber_id") == sub_id   # id reached the sender
+        with get_db_context() as db:
+            rec = db.query(CheckoutRecovery).filter_by(email=email).first()
+        assert rec.touches_sent == 1
+        assert result["sent"] == 1
+    finally:
+        _cleanup(email)
+        if sub_id is not None:
+            with get_db_context() as db:
+                db.query(Subscriber).filter_by(id=sub_id).delete(synchronize_session=False)
+                db.commit()

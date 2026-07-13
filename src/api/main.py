@@ -935,10 +935,17 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
     # backstop. Capture always; sends stay behind checkout_recovery_enabled.
     try:
         from src.services import checkout_recovery
+        # Resolve the free-tier subscriber so recovery SMS has the
+        # compliance-required subscriber_id (+ phone) — email-only otherwise.
+        _sid, _sphone = checkout_recovery.resolve_subscriber(
+            db, payload.email, vertical=payload.vertical, county_id=payload.county_id
+        )
         checkout_recovery.start_recovery(
             db,
             email=payload.email,
             source="pre_payment",
+            subscriber_id=_sid,
+            phone=_sphone,
             resume_context={"county_id": payload.county_id, "vertical": payload.vertical},
         )
         db.commit()

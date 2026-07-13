@@ -4102,11 +4102,18 @@ def _start_recovery_for_expired_checkout(session: dict, db: Session) -> None:
     }
     try:
         from src.services import checkout_recovery
+        # Resolve an existing subscriber so recovery SMS has the compliance-
+        # required subscriber_id. Prefer the phone Stripe captured, else the
+        # subscriber's on-file number.
+        _sid, _sphone = checkout_recovery.resolve_subscriber(
+            db, email, vertical=meta.get("vertical"), county_id=meta.get("county_id")
+        )
         checkout_recovery.start_recovery(
             db,
             email=email,
             source="session_expired",
-            phone=details.get("phone"),
+            subscriber_id=_sid,
+            phone=details.get("phone") or _sphone,
             resume_context=resume_context,
         )
     except Exception:

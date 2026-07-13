@@ -47,6 +47,38 @@ SECOND_TOUCH_DELAY = timedelta(hours=24)
 MAX_TOUCHES = 2
 
 
+def resolve_subscriber(db, email: str, *, vertical: Optional[str] = None, county_id: Optional[str] = None) -> tuple[Optional[int], Optional[str]]:
+    """Best-effort match of an abandoned-checkout email to an existing
+    Subscriber, returning (subscriber_id, phone). The compliance SMS sender
+    requires a subscriber_id (it reads consent/opt-out off that row), so
+    recovery SMS can only fire when we resolve one here. Prefers the row for
+    the abandoned vertical/county, else any row for the email; returns
+    (None, None) for a pure prospect with no Subscriber row yet."""
+    from src.core.models import Subscriber
+
+    email = (email or "").strip().lower()
+    if not email:
+        return None, None
+
+    if vertical and county_id:
+        row = db.execute(
+            select(Subscriber.id, Subscriber.phone).where(
+                Subscriber.email == email,
+                Subscriber.vertical == vertical,
+                Subscriber.county_id == county_id,
+            ).limit(1)
+        ).first()
+        if row:
+            return row[0], row[1]
+
+    row = db.execute(
+        select(Subscriber.id, Subscriber.phone)
+        .where(Subscriber.email == email)
+        .order_by(Subscriber.id).limit(1)
+    ).first()
+    return (row[0], row[1]) if row else (None, None)
+
+
 def next_action(touches_sent: int, started_at: datetime, last_touch_at: Optional[datetime], now: datetime) -> Optional[str]:
     """Pure cadence decision for one active row. Returns 'send' (a touch is
     due), 'fail' (all touches sent and the final grace window elapsed with no
