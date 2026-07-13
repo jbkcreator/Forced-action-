@@ -855,6 +855,7 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
                     return None
 
             _co_tcpa = bool(payload.consent_acceptance.tcpa_accepted)
+            _co_voice = bool(payload.consent_acceptance.voice_consent_accepted)
             ca = ConsentAcceptance(
                 email=payload.email,
                 terms_version=payload.consent_acceptance.terms_version or "2026.06",
@@ -871,6 +872,9 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
                 consent_scope="marketing" if _co_tcpa else None,
                 not_condition_of_purchase_ack=_co_tcpa or None,
                 county_id=payload.county_id,
+                voice_consent_text=payload.consent_acceptance.voice_consent_text if _co_voice else None,
+                voice_consent_version=payload.consent_acceptance.voice_consent_version if _co_voice else None,
+                voice_consent_at=datetime.now(timezone.utc) if _co_voice else None,
             )
             db.add(ca)
             db.commit()
@@ -5526,6 +5530,8 @@ def free_signup(req: FreeSignupRequest, request: Request, db: Session = Depends(
                 except (ValueError, TypeError):
                     return None
 
+            voice_consent_accepted = bool(req.consent_acceptance.voice_consent_accepted)
+
             ca = ConsentAcceptance(
                 email=req.email,
                 phone=sub.phone,
@@ -5543,6 +5549,9 @@ def free_signup(req: FreeSignupRequest, request: Request, db: Session = Depends(
                 tcpa_checked_at=datetime.now(timezone.utc) if tcpa_accepted else None,
                 consent_scope="marketing" if tcpa_accepted else None,
                 not_condition_of_purchase_ack=tcpa_accepted or None,
+                voice_consent_text=req.consent_acceptance.voice_consent_text if voice_consent_accepted else None,
+                voice_consent_version=req.consent_acceptance.voice_consent_version if voice_consent_accepted else None,
+                voice_consent_at=datetime.now(timezone.utc) if voice_consent_accepted else None,
             )
             db.add(ca)
             db.commit()

@@ -81,6 +81,11 @@ class ConsentAcceptanceRequest(BaseModel):
     tcpa_accepted: Optional[bool] = Field(default=False, alias="tcpa_accepted")
     tcpa_consent_text: Optional[str] = None
     tcpa_consent_version: Optional[str] = None
+    # B0-06: PEWC voice-call consent — distinct from tcpa_accepted (marketing).
+    # Never a condition of purchase; defaults unchecked (47 CFR 64.1200(f)(9)).
+    voice_consent_accepted: Optional[bool] = Field(default=False, alias="voice_consent_accepted")
+    voice_consent_text: Optional[str] = None
+    voice_consent_version: Optional[str] = None
     user_agent: Optional[str] = None
 
 

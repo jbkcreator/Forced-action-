@@ -1119,6 +1119,11 @@ class ConsentAcceptance(Base):
     consent_scope: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
     not_condition_of_purchase_ack: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
 
+    # ── B0-06: voice-call PEWC consent (distinct from consent_scope='marketing') ──
+    voice_consent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    voice_consent_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    voice_consent_version: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+
     county_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, server_default="hillsborough")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,

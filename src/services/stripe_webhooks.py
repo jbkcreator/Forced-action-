@@ -552,6 +552,24 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
 
     db.flush()  # get subscriber.id before ZIP territory inserts
 
+    # B0-06: link the checkout consent row (written pre-subscriber, no subscriber_id
+    # yet) to the now-created subscriber, matched by email. Idempotent — guarded on
+    # subscriber_id IS NULL so a replayed webhook never re-touches an already-linked row.
+    if customer_email:
+        try:
+            from sqlalchemy import text as _text
+            # Match case-insensitively: checkout stores the email lowercased
+            # (payload validator), but Stripe may echo a different case.
+            db.execute(_text("""
+                UPDATE consent_acceptances SET subscriber_id = :sid
+                WHERE lower(email) = lower(:email) AND subscriber_id IS NULL
+            """), {"sid": subscriber.id, "email": customer_email})
+        except Exception:
+            logger.warning(
+                "consent_acceptances subscriber_id link failed for email=%s (non-fatal)",
+                customer_email, exc_info=True,
+            )
+
     # ── B1/M9: activate the bridged Customer Account + record MRR ────────────
     # The only production entrypoint that seeds customer_accounts. Map the tier
     # to a plan; if the tier isn't in the catalog yet (legacy/founding), skip
