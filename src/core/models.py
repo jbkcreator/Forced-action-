@@ -6732,8 +6732,9 @@ class GuaranteeCredit(Base):
     """Tiered volume guarantee (config/guarantees.py): one row per subscriber
     per evaluated ~30-day cycle, written by
     src/tasks/guarantee_shortfall_sweep.py. The (subscriber_id, period_end)
-    unique constraint is the idempotency guard — re-running the sweep never
-    double-evaluates or double-credits a cycle already recorded here.
+    unique constraint lets a cycle be claimed with a 'pending' row (INSERT ..
+    ON CONFLICT) before Stripe is called — 'pending'/'failed' rows are not
+    terminal and are retried in place rather than skipped.
     """
     __tablename__ = "guarantee_credits"
 
@@ -6747,14 +6748,15 @@ class GuaranteeCredit(Base):
     shortfall: Mapped[int] = mapped_column(Integer, nullable=False)
     credit_cents: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     stripe_balance_txn_id: Mapped[Optional[str]] = mapped_column(String(100))
-    # met (no shortfall) | issued | failed | skipped_no_charge_basis
+    # pending (claimed, Stripe call in flight/retryable) | met (no shortfall)
+    # | issued | failed (retryable) | skipped_no_charge_basis
     status: Mapped[str] = mapped_column(String(30), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     __table_args__ = (
         UniqueConstraint("subscriber_id", "period_end", name="uq_guarantee_credit_subscriber_period"),
         CheckConstraint(
-            "status IN ('met', 'issued', 'failed', 'skipped_no_charge_basis')",
+            "status IN ('pending', 'met', 'issued', 'failed', 'skipped_no_charge_basis')",
             name="ck_guarantee_credit_status",
         ),
         Index("idx_guarantee_credits_subscriber_period", "subscriber_id", "period_end"),

@@ -579,10 +579,16 @@ def get_founding_spots_remaining(
     return max(0, _founding_limit() - row.count)
 
 
-def issue_guarantee_credit(stripe_customer_id: str, credit_cents: int, *, description: str) -> str:
+def issue_guarantee_credit(
+    stripe_customer_id: str, credit_cents: int, *, description: str, idempotency_key: str,
+) -> str:
     """
     Apply a tiered-volume-guarantee shortfall credit to a customer's Stripe
     balance (negative balance transaction = owed less on the next invoice).
+
+    idempotency_key must be deterministic per (subscriber, period) — callers
+    retrying a crashed or failed attempt for the same cycle must pass the same
+    key so Stripe returns the original transaction instead of crediting twice.
 
     Raises RuntimeError if Stripe isn't configured, or stripe.StripeError on
     an API failure — callers decide how to record/report a failed credit.
@@ -596,5 +602,6 @@ def issue_guarantee_credit(stripe_customer_id: str, credit_cents: int, *, descri
         amount=-abs(credit_cents),
         currency="usd",
         description=description,
+        idempotency_key=idempotency_key,
     )
     return txn["id"]

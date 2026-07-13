@@ -150,3 +150,55 @@ class TestUpgradeStatusGuard:
             assert body["current_status"] == "grace"
         finally:
             _cleanup(fresh_db, sub)
+
+
+class TestUpgradeSettlesOutgoingGuarantee:
+    """A subscriber upgrading off a guaranteed tier (starter/pro/dominator)
+    must not silently drop an already-closed guarantee cycle — /api/upgrade
+    settles it before switching sub.tier away from the guaranteed value."""
+
+    def test_guaranteed_tier_settlement_invoked_before_switch(self, fresh_db, client):
+        sub = _make_sub(fresh_db, status="active")  # tier="pro" — guaranteed
+        try:
+            with (
+                patch("src.services.stripe_service.switch_subscription_plan", return_value=True),
+                patch("config.settings.AppSettings.active_stripe_price", return_value="price_test_123"),
+                patch(
+                    "src.tasks.guarantee_shortfall_sweep.evaluate_subscriber_guarantee",
+                    return_value=None,
+                ) as mock_evaluate,
+            ):
+                resp = client.post(
+                    "/api/upgrade",
+                    json={"feed_uuid": sub.event_feed_uuid, "tier": "autopilot_pro"},
+                )
+            assert resp.status_code == 200
+            assert resp.json()["tier"] == "autopilot_pro"
+            mock_evaluate.assert_called_once()
+            called_sub = mock_evaluate.call_args.args[1]
+            assert called_sub.id == sub.id
+        finally:
+            _cleanup(fresh_db, sub)
+
+    def test_unguaranteed_tier_skips_settlement(self, fresh_db, client):
+        """A subscriber already off a guaranteed tier (e.g. data_only)
+        shouldn't trigger a settlement lookup on every upgrade call."""
+        sub = _make_sub(fresh_db, status="active")
+        sub.tier = "data_only"
+        fresh_db.commit()
+        try:
+            with (
+                patch("src.services.stripe_service.switch_subscription_plan", return_value=True),
+                patch("config.settings.AppSettings.active_stripe_price", return_value="price_test_123"),
+                patch(
+                    "src.tasks.guarantee_shortfall_sweep.evaluate_subscriber_guarantee",
+                ) as mock_evaluate,
+            ):
+                resp = client.post(
+                    "/api/upgrade",
+                    json={"feed_uuid": sub.event_feed_uuid, "tier": "partner"},
+                )
+            assert resp.status_code == 200
+            mock_evaluate.assert_not_called()
+        finally:
+            _cleanup(fresh_db, sub)

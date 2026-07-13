@@ -4694,6 +4694,20 @@ def upgrade(req: UpgradeRequest, db: Session = Depends(get_db)):
     if not new_price_id:
         raise HTTPException(status_code=503, detail=f"Stripe price not configured for {req.tier}")
 
+    # Settle any guarantee cycle that already closed on the outgoing tier —
+    # otherwise switching sub.tier off starter/pro/dominator drops it from
+    # the daily sweep's tier filter and the closed cycle is never evaluated.
+    from config.guarantees import TIER_LEAD_QUOTAS
+    from src.tasks.guarantee_shortfall_sweep import evaluate_subscriber_guarantee
+    if sub.tier in TIER_LEAD_QUOTAS:
+        try:
+            evaluate_subscriber_guarantee(db, sub)
+        except Exception:
+            logger.error(
+                "[Upgrade] guarantee settlement failed for sub=%d tier=%s", sub.id, sub.tier,
+                exc_info=True,
+            )
+
     try:
         switch_subscription_plan(sub.stripe_subscription_id, new_price_id, prorate=True)
     except Exception as exc:
