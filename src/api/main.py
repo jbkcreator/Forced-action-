@@ -38,7 +38,7 @@ from src.core.database import get_db_context
 from src.core.models import ConsentAcceptance, FoundingSubscriberCount, ZipTerritory, Subscriber, Property, DistressScore, Incident, LeadPackPurchase, ScraperRunStats, EnrichedContact, Owner, SentLead, WaitlistEntry, SmsOptIn, ExpansionCandidate, County, LeadExclusivity
 from src.agents.events.ingestion import publish_cora_event
 from src.services.stripe_webhooks import handle_webhook
-from src.services.stripe_service import get_price_id_for_checkout, _price_ids
+from src.services.stripe_service import get_price_id_for_checkout, get_price_id_for_preview, _price_ids
 from src.services import lead_exclusivity
 from config.settings import get_settings
 from config.scoring import VERTICAL_WEIGHTS, for_county
@@ -3331,7 +3331,7 @@ def subscription_upsell_offer(feed_uuid: str, db: Session = Depends(get_db)):
         return {"eligible": False}
 
     try:
-        price_id, is_founding = get_price_id_for_checkout(
+        price_id, is_founding = get_price_id_for_preview(
             db, "starter", subscriber.vertical, subscriber.county_id
         )
     except ValueError:
@@ -3348,11 +3348,15 @@ def subscription_upsell_offer(feed_uuid: str, db: Session = Depends(get_db)):
         return {"eligible": False}
 
     return {
-        "eligible":    True,
-        "tier":        "starter",
-        "is_founding": is_founding,
-        "amount":      price["unit_amount"],
-        "currency":    price["currency"],
+        "eligible":         True,
+        "tier":             "starter",
+        "is_founding":      is_founding,
+        "amount":           price["unit_amount"],
+        "currency":         price["currency"],
+        # Price is a snapshot of the current founding count, NOT a reservation.
+        # The actual charge is determined atomically at /api/checkout.
+        # The front-end should treat this as indicative, not guaranteed.
+        "price_guaranteed": False,
     }
 
 
