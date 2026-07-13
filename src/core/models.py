@@ -7511,3 +7511,38 @@ class SeoPage(Base):
 
     def __repr__(self) -> str:
         return f"<SeoPage(url_path={self.url_path!r}, status={self.status})>"
+
+
+class ScoringCutoverLog(Base):
+    """Stage F audit trail + active-weights pointer for the CDS retune loop.
+
+    One row per cutover attempt. The most recent row with ``applied = true`` is
+    the fit artifact the live (non-shadow) scoring engine loads at startup and
+    overlays onto config/scoring.py. Rows with ``applied = false`` record a
+    blocked attempt (Stage E did not PASS, or the artifact carried thin-data
+    coverage warnings) so the decision trail is auditable.
+    """
+    __tablename__ = "scoring_cutover_log"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+    fit_artifact_path: Mapped[str] = mapped_column(Text, nullable=False)
+    validation_status: Mapped[str] = mapped_column(String(8), nullable=False)  # PASS / WARN / FAIL
+    applied: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false",
+    )
+    weights_snapshot: Mapped[Optional[dict]] = mapped_column(JSONB)
+    detail: Mapped[Optional[str]] = mapped_column(Text)
+
+    __table_args__ = (
+        Index("ix_scoring_cutover_log_active", "applied", "created_at"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<ScoringCutoverLog(id={self.id}, status={self.validation_status}, "
+            f"applied={self.applied})>"
+        )

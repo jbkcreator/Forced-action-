@@ -2739,6 +2739,50 @@ def _apply_fit_artifact(path: str, log: logging.Logger) -> None:
     )
 
 
+def _apply_active_fit_artifact(log: logging.Logger) -> None:
+    """Overlay the most recently approved Stage F artifact onto the live
+    VERTICAL_WEIGHTS, if one has been promoted (src/tasks/scoring_cutover.py).
+
+    No-op — keeps the config/scoring.py baseline — when nothing is approved or
+    the artifact file is missing. A missing/unreadable artifact must NEVER abort
+    the daily scoring run, so unlike ``_apply_fit_artifact`` this swallows all
+    failures and falls back to baseline weights.
+    """
+    from pathlib import Path
+
+    from src.core.database import get_db_context
+    from src.tasks.scoring_cutover import active_fit_artifact_path
+
+    try:
+        with get_db_context() as session:
+            path = active_fit_artifact_path(session)
+    except Exception as exc:  # noqa: BLE001 — never abort scoring on pointer read
+        log.warning(
+            "[fit-artifact] could not read active cutover pointer (%s); "
+            "using config/scoring.py baseline weights", exc,
+        )
+        return
+
+    if not path:
+        log.info("[fit-artifact] no approved cutover — using config/scoring.py baseline weights")
+        return
+    if not Path(path).is_file():
+        log.warning(
+            "[fit-artifact] approved artifact %s missing on disk; using baseline weights", path,
+        )
+        return
+    # _apply_fit_artifact sys.exit(2)s on a malformed/corrupt artifact — that is
+    # correct for an operator-supplied --fit-artifact, but here a bad approved
+    # file must NOT take down the daily scoring run. Fall back to baseline.
+    try:
+        _apply_fit_artifact(path, log)
+    except (SystemExit, Exception) as exc:  # noqa: BLE001 — never abort scoring
+        log.error(
+            "[fit-artifact] approved artifact %s failed to apply (%s); "
+            "using config/scoring.py baseline weights", path, exc,
+        )
+
+
 def main():
     """
     Entry point for CLI / cron execution.
@@ -2831,6 +2875,16 @@ def main():
             "Path to a Stage C JSON artifact (data/scoring_fit/<id>.json). "
             "Overrides VERTICAL_WEIGHTS in-memory with the fitted proposals. "
             "Requires --shadow — must not be used against the live tables."
+        ),
+    )
+    parser.add_argument(
+        "--no-active-weights",
+        action="store_true",
+        dest="no_active_weights",
+        help=(
+            "Ignore any Stage F approved cutover and score with the "
+            "config/scoring.py baseline weights only. Live runs otherwise "
+            "auto-apply the latest approved fit artifact."
         ),
     )
     args = parser.parse_args()
@@ -2933,6 +2987,14 @@ def main():
         # below still hits the global because of that earlier declaration.
         _GHL_PUSH_ENABLED = False  # noqa: F841 — global is in scope from earlier
         log.info("[shadow] writing to distress_scores_shadow; GHL push disabled")
+
+    # Stage F — on a live (non-shadow) run, overlay the most recently approved
+    # cutover artifact onto VERTICAL_WEIGHTS. This is what makes the retune loop
+    # automatic: the engine is a fresh batch process, so it picks up newly
+    # approved weights on its next run with no redeploy. config/scoring.py stays
+    # the seed default; --no-active-weights forces it.
+    if not args.shadow and not args.no_active_weights:
+        _apply_active_fit_artifact(log)
 
     try:
         with get_db_context() as session:

@@ -681,4 +681,15 @@ COUNTY_ID=hillsborough
 # against stale/empty tax_deed_auctions data and report false "success".
 # Add this once the tax-deed scraper itself has a cron line above.
 
+# ── CDS SCORING RETUNE (client Q9 — closed loop) ─────────────
+# Weekly Sunday @ 11:00 UTC. Runs B→C→D→E→F end to end: builds the training
+# set, fits per-vertical weights, shadow-rescores, validates, and (only if the
+# Stage E gate PASSes with enough per-vertical data) promotes the new weights to
+# live scoring via scoring_cutover_log. The daily Mon-Sat rescore (07:00) then
+# auto-applies the approved weights on its next run — no redeploy.
+# Sunday is chosen because the daily rescore is Mon-Sat only, so the heavy
+# shadow rescore never contends with live scoring. After master parcel refresh
+# (01:00-02:00) and SEO compiler (09:30); before Monday's conversion report.
+0 11 * * 0 $PROJECT/scripts/cron/run.sh src.tasks.scoring_retune --window-days 90
+
 # === END FORCED-ACTION-PLATFORM ===
