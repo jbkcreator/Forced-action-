@@ -4134,6 +4134,42 @@ class SmsSendLog(Base):
         return f"<SmsSendLog(id={self.id}, phone={self.phone}, outcome={self.outcome})>"
 
 
+class OwnerAlertDispatch(Base):
+    """
+    One row per notify_owner() call — claims an idempotency key so a Stripe/
+    Synthflow webhook retry can't fire the same founder alert twice, and
+    tracks SMS delivery state so a Telnyx "queued" response (accepted, not
+    delivered) can still fall back to email once the delivery-status webhook
+    or the sweep confirms it never landed.
+    """
+    __tablename__ = "owner_alert_dispatch"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    alert_key: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
+    subject: Mapped[str] = mapped_column(String(200), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    telnyx_message_id: Mapped[Optional[str]] = mapped_column(String(80))
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending','sms_sent','sms_delivered','sms_failed','email_sent')",
+            name="check_oad_status",
+        ),
+        Index("idx_oad_telnyx_message_id", "telnyx_message_id"),
+        Index("idx_oad_status_created", "status", "created_at"),
+    )
+
+    def __repr__(self):
+        return f"<OwnerAlertDispatch(alert_key={self.alert_key!r}, status={self.status})>"
+
+
 # ============================================================================
 # COUNTY CONFIGURATION (Admin-managed, replaces counties.json)
 # ============================================================================

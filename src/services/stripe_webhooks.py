@@ -788,6 +788,17 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
                     subscriber.id, exc_info=True,
                 )
 
+        # ── Speed-to-lead: instantly alert the founder of the new signup ────
+        from src.services.owner_alert import notify_owner
+        notify_owner(
+            subject=f"New subscriber — {subscriber.tier} {vertical}",
+            body=(
+                f"New subscriber signed up.\nTier: {subscriber.tier}\nVertical: {vertical}\n"
+                f"County: {county_id}\nZIPs: {', '.join(zip_codes)}\nEmail: {subscriber.email}"
+            ),
+            idempotency_key=f"stripe:{session.get('id', '')}",
+        )
+
         # Stage 12 — schedule the bankruptcy-alert invite (sent T+X min by the
         # invite sweep). Best-effort; never breaks checkout processing.
         try:
@@ -2054,6 +2065,16 @@ def _on_payment_intent_succeeded(payment_intent, db: Session) -> None:
     else:
         logger.info("[PI] routing -> card_save (no product metadata) pi=%s", pi_id)
         _on_card_saved(payment_intent, db)
+
+    # ── Speed-to-lead: instantly alert the founder of the purchase ─────────
+    # Guarded on `product` — the card_save branch above has no product metadata
+    # (e.g. a saved-card/setup event, not a purchase) and must not page Josh.
+    if product:
+        from src.services.owner_alert import notify_owner
+        notify_owner(
+            subject=f"Purchase — {product}",
+            body=f"Product: {product}\nAmount: ${(amount or 0) / 100:.2f}\nPI: {pi_id}\nCustomer: {customer_id}",
+        )
 
     # ── Referral confirmation (any PI-based paid action) ─────────────────
     # checkout.session.completed handles subscription first-payments; this

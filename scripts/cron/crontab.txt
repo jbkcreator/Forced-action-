@@ -681,6 +681,11 @@ COUNTY_ID=hillsborough
 # against stale/empty tax_deed_auctions data and report false "success".
 # Add this once the tax-deed scraper itself has a cron line above.
 
+# ── OWNER ALERT DELIVERY SWEEP (PR #126) ────────────────────────────────────
+# Safety net for notify_owner() speed-to-lead founder alerts: emails the
+# fallback for any owner_alert_dispatch row stuck at status='sms_sent' for
+# 5+ minutes with no Telnyx message.finalized delivery-status callback.
+*/5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.owner_alert_sweep
 # Tiered volume guarantee shortfall sweep — INTENTIONALLY NOT scheduled yet.
 # config/guarantees.py TIER_LEAD_QUOTAS are placeholder lead-per-cycle counts
 # pending a business decision; enabling this cron would issue real Stripe
