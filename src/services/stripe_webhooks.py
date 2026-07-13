@@ -529,7 +529,7 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
             non_buyer_nurture.mark_converted(db, customer_email)
         except Exception:
             logger.warning(
-                "non_buyer_nurture mark_converted failed for email=%s", customer_email, exc_info=True,
+                "non_buyer_nurture mark_converted failed for subscriber=%s", subscriber.id, exc_info=True,
             )
         try:
             from src.services import checkout_recovery
@@ -1152,6 +1152,38 @@ def _on_payment_succeeded(invoice: dict, db: Session) -> None:
             )
         except Exception:
             logger.warning("Attribution recording failed sub=%s", subscriber.id, exc_info=True)
+
+    # Funnel analytics: log a rebill event for standard subscription renewals
+    # only — billing_reason values other than subscription_cycle (e.g.
+    # subscription_update on a plan change, subscription_threshold, manual)
+    # are not genuine renewals and must not inflate the "rebilled" count.
+    # Wallet-subscription renewals go through _on_wallet_subscription_invoice
+    # above and are not covered here.
+    if billing_reason == "subscription_cycle":
+        invoice_id = invoice.get("id")
+        try:
+            from src.services.business_events import log_business_event
+            from src.services.webhook_log import already_logged
+            # Guards against the multi-worker race documented above this
+            # handler's dedupe check: two workers can both pass the Stripe
+            # event-level dedupe and run this handler before either commits
+            # the dedupe row, and this audit write has no unique constraint
+            # of its own — so key it to the invoice id explicitly.
+            if invoice_id and already_logged("business", invoice_id):
+                logger.info(
+                    "SUBSCRIPTION_RENEWED already logged for invoice=%s sub=%s — skipping",
+                    invoice_id, subscriber.id,
+                )
+            else:
+                log_business_event(
+                    "SUBSCRIPTION_RENEWED",
+                    subscriber_id=subscriber.id,
+                    payload={"invoice_id": invoice_id, "billing_reason": billing_reason},
+                    source_event_id=invoice_id,
+                    db=db,
+                )
+        except Exception:
+            logger.warning("SUBSCRIPTION_RENEWED business event failed sub=%s", subscriber.id, exc_info=True)
 
     # Send payment receipt email only for renewals, not initial signup
     if subscriber.email and billing_reason != "subscription_create":
@@ -4078,7 +4110,7 @@ def _start_recovery_for_expired_checkout(session: dict, db: Session) -> None:
             resume_context=resume_context,
         )
     except Exception:
-        logger.warning("checkout_recovery capture failed for expired checkout email=%s", email, exc_info=True)
+        logger.warning("checkout_recovery capture failed for expired checkout session %s", session.get("id"), exc_info=True)
 
 
 def _send_lead_pack_refund_email(

@@ -174,6 +174,82 @@ def get_price_id_for_checkout(
     return price_id, is_founding
 
 
+def get_price_id_for_preview(
+    db: Session,
+    tier: str,
+    vertical: str,
+    county_id: str,
+) -> tuple[str, bool]:
+    """
+    Non-locking read of the founding price for display/preview purposes only.
+
+    Intentionally does NOT use SELECT FOR UPDATE — this is a read-only
+    informational query that must never block concurrent checkout or webhook
+    processing.  The returned price is a snapshot of the current founding count
+    and is NOT guaranteed: if founding slots fill between this call and the
+    subsequent /api/checkout, the checkout will atomically select the (higher)
+    regular price.
+
+    Callers should surface ``price_guaranteed: False`` in their response so the
+    front-end can set appropriate expectations.
+
+    Returns (price_id, is_founding).
+    Raises ValueError for unknown tier or missing price config.
+    Raises OperationalError on DB failure (propagated to caller).
+    """
+    prices = _price_ids()
+    if tier not in prices:
+        raise ValueError(
+            f"Unknown tier '{tier}'. Valid tiers: {list(prices.keys())}"
+        )
+
+    # Partner is flat-rate — no founding mechanic.
+    if tier == "partner":
+        price_id = prices["partner"]["regular"]
+        if not price_id:
+            raise ValueError(
+                "Stripe price_id not configured for partner. "
+                "Set STRIPE_PRICE_PARTNER in env."
+            )
+        return price_id, False
+
+    # Plain SELECT — no FOR UPDATE — so we never hold a row lock during the
+    # subsequent Stripe network call in the offer endpoint.
+    try:
+        row = db.execute(
+            select(FoundingSubscriberCount).where(
+                FoundingSubscriberCount.tier == tier,
+                FoundingSubscriberCount.vertical == vertical,
+                FoundingSubscriberCount.county_id == county_id,
+            )
+        ).scalar_one_or_none()
+    except OperationalError:
+        logger.error(
+            "DB error reading founding count (preview) tier=%s vertical=%s county=%s",
+            tier, vertical, county_id, exc_info=True,
+        )
+        raise
+
+    # If no row exists yet, no founding subscribers have signed up → founding slots open.
+    count = row.count if row is not None else 0
+    is_founding = count < _founding_limit()
+    price_key = "founding" if is_founding else "regular"
+    price_id = prices[tier][price_key]
+
+    if not price_id:
+        raise ValueError(
+            f"Stripe price_id not configured for tier='{tier}' type='{price_key}'. "
+            f"Set STRIPE_PRICE_{tier.upper()}_{price_key.upper()} in env."
+        )
+
+    logger.debug(
+        "Preview price selected (non-locking): tier=%s vertical=%s county=%s "
+        "founding=%s count=%d/%d",
+        tier, vertical, county_id, is_founding, count, _founding_limit(),
+    )
+    return price_id, is_founding
+
+
 def create_subscription_checkout(
     db: Session,
     tier: str,

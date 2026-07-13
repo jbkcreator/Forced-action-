@@ -86,6 +86,37 @@ class TestProofWallPayloadShape:
         assert match["graphic_url"].endswith(f"/api/win-graphic/{deal.id}")
         assert match["days_ago"] == 0
 
+    def test_dedupes_lookalike_cards_same_bucket_vertical_county_day(self, fresh_db):
+        """Five deals with the same bucket/vertical/county closed the same day
+        would otherwise render as five near-identical cards — collapse to one
+        so the wall reads as real variety, not a repeated placeholder."""
+        from src.services.win_graphic import proof_wall_payload
+
+        uid = uuid.uuid4().hex[:8]
+        sub = Subscriber(
+            stripe_customer_id=f"cus_dedupe_{uid}",
+            tier="starter", vertical="roofing", county_id="hillsborough",
+            event_feed_uuid=f"dedupe-{uid}",
+            name="Dedupe Test",
+        )
+        fresh_db.add(sub)
+        fresh_db.flush()
+
+        lookalikes = [
+            DealOutcome(subscriber_id=sub.id, deal_size_bucket="10_25k", deal_amount=15000, deal_date=date.today())
+            for _ in range(5)
+        ]
+        distinct = DealOutcome(subscriber_id=sub.id, deal_size_bucket="5_10k", deal_amount=7000, deal_date=date.today())
+        fresh_db.add_all(lookalikes + [distinct])
+        fresh_db.flush()
+
+        items = proof_wall_payload(fresh_db, limit=50)
+        ids = {i["deal_outcome_id"] for i in items}
+        lookalike_ids = {d.id for d in lookalikes}
+        # Exactly one of the five look-alikes survives; the distinct bucket is untouched.
+        assert len(ids & lookalike_ids) == 1
+        assert distinct.id in ids
+
 
 class TestGenerateGraceful:
     def test_missing_deal_returns_none(self):

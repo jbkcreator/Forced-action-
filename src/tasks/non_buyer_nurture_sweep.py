@@ -42,16 +42,18 @@ def run(dry_run: bool = False) -> dict:
                 logger.info("[NurtureSweep] DRY RUN — would enroll %d candidates", len(candidates))
                 return {"dry_run": True, "candidates": len(candidates), "started_at": started}
 
+            reconciled = non_buyer_nurture.reconcile_conversions(db)
             result = non_buyer_nurture.enroll(db, candidates, campaign_id=campaign_id)
     except Exception as exc:
         logger.error("[NurtureSweep] Sweep crashed: %s", exc, exc_info=True)
         send_alert(subject="[FA] Non-buyer nurture sweep failed", body=str(exc))
         return {"error": str(exc), "started_at": started}
 
-    logger.info("[NurtureSweep] Done. %s", result)
+    logger.info("[NurtureSweep] Done. %s reconciled=%d", result, reconciled)
     return {
         "started_at": started,
         "finished_at": datetime.now(timezone.utc).isoformat(),
+        "reconciled": reconciled,
         **result,
     }
 
@@ -62,5 +64,5 @@ if __name__ == "__main__":
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     result = run(dry_run=args.dry_run)
-    print(result)
+    logger.info("[NurtureSweep] result: %s", result)
     sys.exit(0 if "error" not in result else 1)

@@ -1772,6 +1772,8 @@ class CountyCreateRequest(BaseModel):
     bankruptcy_division: Optional[str] = None
     city_filer_keywords: list[str] = []
     code_lien_type_map: dict = {}
+    landing_featured_testimonials: Optional[list[dict]] = None
+    founding_price_deadline_at: Optional[datetime] = None
 
 
 class CountyUpdateRequest(BaseModel):
@@ -1783,6 +1785,8 @@ class CountyUpdateRequest(BaseModel):
     city_filer_keywords: Optional[list[str]] = None
     code_lien_type_map: Optional[dict] = None
     is_active: Optional[bool] = None
+    landing_featured_testimonials: Optional[list[dict]] = None
+    founding_price_deadline_at: Optional[datetime] = None
 
 
 ScrapeMode = Literal["ai_only", "playwright_only", "playwright_then_ai", "static_download", "api"]
@@ -1836,6 +1840,8 @@ def _county_to_dict(county: County) -> dict:
         "bankruptcy_division": county.bankruptcy_division,
         "city_filer_keywords": county.city_filer_keywords or [],
         "code_lien_type_map":  county.code_lien_type_map or {},
+        "landing_featured_testimonials": county.landing_featured_testimonials or [],
+        "founding_price_deadline_at": county.founding_price_deadline_at.isoformat() if county.founding_price_deadline_at else None,
         "is_active":           county.is_active,
         "created_at":          county.created_at.isoformat() if county.created_at else None,
         "updated_at":          county.updated_at.isoformat() if county.updated_at else None,
@@ -1896,6 +1902,8 @@ def create_county(
         bankruptcy_division=body.bankruptcy_division,
         city_filer_keywords=body.city_filer_keywords,
         code_lien_type_map=body.code_lien_type_map,
+        landing_featured_testimonials=body.landing_featured_testimonials,
+        founding_price_deadline_at=body.founding_price_deadline_at,
         is_active=True,
     )
     db.add(county)
@@ -1929,7 +1937,7 @@ def update_county(
     if not county:
         raise HTTPException(status_code=404, detail=f"County '{county_id}' not found")
 
-    updates = body.model_dump(exclude_none=True)
+    updates = body.model_dump(exclude_unset=True)
     for field, value in updates.items():
         setattr(county, field, value)
 

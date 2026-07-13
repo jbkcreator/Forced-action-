@@ -93,6 +93,8 @@ class AppSettings(BaseSettings):
 
 	# Non-buyer nurture — shared Instantly campaign on the dedicated warmed lifecycle domain.
 	non_buyer_nurture_campaign_id: Optional[str] = Field(default=None, env="NON_BUYER_NURTURE_CAMPAIGN_ID")
+	# Max leads enrolled per daily sweep. Ramp up as the sending domain warms.
+	non_buyer_nurture_daily_cap: int = Field(default=25, env="NON_BUYER_NURTURE_DAILY_CAP")
 
 	# Abandoned-checkout recovery (Task 7). Off by default — the sweep captures
 	# and ages rows but sends nothing until this is enabled after review.
@@ -264,6 +266,12 @@ class AppSettings(BaseSettings):
 		default="http://localhost:8000",
 		env="APP_BASE_URL",
 		description="Public base URL of this app (e.g. https://app.forcedaction.io)",
+	)
+
+	# CAN-SPAM footer requirement — placeholder until client supplies the real one
+	company_postal_address: str = Field(
+		default="Forced Action, Tampa, FL",
+		env="COMPANY_POSTAL_ADDRESS",
 	)
 
 	# Contact enrichment (M1)

@@ -334,6 +334,28 @@ def list_leads(
         return None
 
 
+def add_to_block_list(emails) -> bool:
+    """
+    POST /api/v2/block-lists-entries — add one or more emails to Instantly's
+    own suppression list so it stops contacting addresses we've suppressed.
+    Accepts a single email string or a list; sends all in one request.
+    """
+    if not _is_configured():
+        return False
+    entries = [emails] if isinstance(emails, str) else list(emails)
+    if not entries:
+        return True
+    try:
+        resp = _request("POST", "/api/v2/block-lists-entries", json={"entries": entries})
+        resp.raise_for_status()
+        return True
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        logger.error("[Instantly] add_to_block_list (%d entries) failed: %s", len(entries), exc)
+        return False
+
+
 def remove_lead(lead_id: str) -> bool:
     """DELETE /api/v2/leads/{id}."""
     if not _is_configured():
