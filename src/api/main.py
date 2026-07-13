@@ -928,6 +928,24 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
             detail={"error": "payment_gateway_error", "message": "Payment gateway error — please try again"},
         )
 
+    # Abandoned-cart recovery: a real checkout session now exists but isn't paid.
+    # Capture the pre_payment start here (the reliable signal) — never inferred
+    # from a bare free signup. Completion closes it (_on_checkout_completed →
+    # mark_recovered); if it expires the session_expired webhook is a dedup'd
+    # backstop. Capture always; sends stay behind checkout_recovery_enabled.
+    try:
+        from src.services import checkout_recovery
+        checkout_recovery.start_recovery(
+            db,
+            email=payload.email,
+            source="pre_payment",
+            resume_context={"county_id": payload.county_id, "vertical": payload.vertical},
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.warning("[CheckoutRecovery] pre_payment capture failed (non-fatal)", exc_info=True)
+
     return {
         "client_secret": session.client_secret,
         "session_id": session.id,
@@ -3384,6 +3402,32 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, request: Request, db: S
     except stripe.StripeError as exc:
         logger.error("Stripe error creating lead pack PaymentIntent: %s", exc)
         raise HTTPException(status_code=502, detail={"error": "payment_unavailable", "message": "Could not create payment"})
+
+    # Abandoned-checkout recovery (Task 7): a lead pack has no Stripe Checkout
+    # Session (it's a PaymentIntent), so there's no session.expired signal —
+    # capture the intent now and close it on the success webhook. Best-effort;
+    # never block the checkout response. Messaging is flag-gated in the sweep.
+    # Off by default: lead-pack abandoners are existing paying subscribers, so
+    # we don't dun them unless checkout_recovery_lead_pack_enabled is set.
+    if subscriber.email and _s.checkout_recovery_lead_pack_enabled:
+        try:
+            from src.services import checkout_recovery
+            checkout_recovery.start_recovery(
+                db,
+                email=subscriber.email,
+                source="lead_pack",
+                subscriber_id=subscriber.id,
+                phone=subscriber.phone,
+                resume_context={
+                    "kind": "lead_pack",
+                    "feed_uuid": subscriber.event_feed_uuid,
+                    "lead_pack_zip": payload.zip_code,
+                    "vertical": payload.vertical,
+                },
+            )
+            db.commit()
+        except Exception:
+            logger.warning("checkout_recovery lead_pack capture failed for sub=%s", subscriber.id, exc_info=True)
 
     return {
         "client_secret":    intent["client_secret"],

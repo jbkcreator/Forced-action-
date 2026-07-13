@@ -521,7 +521,8 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
             subscriber.founding_price_id  = founding_price_id
             subscriber.rate_locked_at     = now
 
-    # First paid conversion, matched by email — suppresses non-buyer nurture.
+    # First paid conversion, matched by email — suppresses non-buyer nurture
+    # and closes any in-flight abandoned-checkout recovery (Task 7).
     if customer_email:
         try:
             from src.services import non_buyer_nurture
@@ -529,6 +530,13 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
         except Exception:
             logger.warning(
                 "non_buyer_nurture mark_converted failed for subscriber=%s", subscriber.id, exc_info=True,
+            )
+        try:
+            from src.services import checkout_recovery
+            checkout_recovery.mark_recovered(db, customer_email)
+        except Exception:
+            logger.warning(
+                "checkout_recovery mark_recovered failed for email=%s", customer_email, exc_info=True,
             )
 
     # ── Plan price + trial flags (fa048) ────────────────────────────────────
@@ -3653,6 +3661,14 @@ def _on_lead_pack_payment(payment_intent: dict, db: Session) -> None:
         logger.error("[LeadPack] No subscriber for feed_uuid %s", feed_uuid)
         return
 
+    # Close any open abandoned-checkout recovery for this lead pack (Task 7).
+    if subscriber.email:
+        try:
+            from src.services import checkout_recovery
+            checkout_recovery.mark_recovered(db, subscriber.email)
+        except Exception:
+            logger.warning("[LeadPack] checkout_recovery mark_recovered failed sub=%s", subscriber.id, exc_info=True)
+
     now = datetime.now(timezone.utc)
     exclusive_until = now + timedelta(hours=72)
 
@@ -4029,13 +4045,14 @@ def _on_checkout_expired(session: dict, db: Session) -> None:
     Fires when a Stripe checkout session expires without payment.
     For hot_lead_unlock sessions opened by free-tier subscribers, publish
     abandonment_click_no_complete to Cora so the retention flow can trigger.
-    For every other expired session with a captured email, record it as a
-    non-buyer nurture candidate (source=checkout_abandon) — this is the only
-    capture point for abandoned-checkout leads (no Subscriber row exists yet).
+    For every other expired session with a captured email, start the
+    abandoned-checkout recovery sequence (Task 7). Recovery holds the contact
+    out of the slower non-buyer nurture drip until it fails, so the two never
+    double-contact — this is the capture point for the session-expiry path.
     """
     meta = session.get("metadata") or {}
     if meta.get("product") != "hot_lead_unlock":
-        _record_nurture_candidate_for_expired_checkout(session, db)
+        _start_recovery_for_expired_checkout(session, db)
         return
 
     stripe_customer_id = session.get("customer")
@@ -4069,15 +4086,31 @@ def _on_checkout_expired(session: dict, db: Session) -> None:
         )
 
 
-def _record_nurture_candidate_for_expired_checkout(session: dict, db: Session) -> None:
-    _raw_email = (session.get("customer_details") or {}).get("email") or session.get("customer_email") or ""
-    email = _raw_email.lower().strip()
+def _start_recovery_for_expired_checkout(session: dict, db: Session) -> None:
+    details = session.get("customer_details") or {}
+    email = (details.get("email") or session.get("customer_email") or "").lower().strip()
     if not email:
         return
+    meta = session.get("metadata") or {}
+    # Rebuild enough context to mint a fresh resume-checkout link — the expired
+    # session itself can't be reused.
+    resume_context = {
+        "tier": meta.get("tier"),
+        "vertical": meta.get("vertical"),
+        "county_id": meta.get("county_id"),
+        "zip_codes": [z for z in (meta.get("zip_codes") or "").split(",") if z],
+    }
     try:
-        from src.services import non_buyer_nurture
-        non_buyer_nurture.record_checkout_abandon_candidate(db, email)
+        from src.services import checkout_recovery
+        checkout_recovery.start_recovery(
+            db,
+            email=email,
+            source="session_expired",
+            phone=details.get("phone"),
+            resume_context=resume_context,
+        )
     except Exception:
+        logger.warning("checkout_recovery capture failed for expired checkout email=%s", email, exc_info=True)
         logger.warning("non_buyer_nurture capture failed for expired checkout session %s", session.get("id"), exc_info=True)
 
 
