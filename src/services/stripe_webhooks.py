@@ -2218,8 +2218,14 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
                     record_revenue, attribute_enrichment_cost_for_property,
                     stripe_payment_intent_ledger_id,
                 )
+                # hot_lead_unlock and lead_unlock share this handler (see
+                # docstring) but must be distinguishable in revenue reporting
+                # — the PI's own metadata already tells us which one this is.
+                ledger_product_type = (
+                    "hot_lead_unlock" if _attr(meta, "product") == "hot_lead_unlock" else "lead_unlock"
+                )
                 record_revenue(
-                    db, subscriber_id=subscriber.id, product_type="lead_unlock",
+                    db, subscriber_id=subscriber.id, product_type=ledger_product_type,
                     amount_cents=amount_cents, source_table="stripe_payment_intent",
                     source_id=stripe_payment_intent_ledger_id(pi_id), property_id=property_id,
                     occurred_at=sent_row.sent_at,
