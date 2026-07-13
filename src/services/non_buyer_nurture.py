@@ -266,3 +266,9 @@ def apply_instantly_status(db, email: str, mapped_status: str, instantly_lead_id
         row.status = mapped_status
         row.removal_reason = reason
         row.removed_at = datetime.now(timezone.utc)
+        # This nurture campaign is standalone (no EmailCampaign row), so the
+        # normal campaign-sync suppression path never runs for it. Write the
+        # global opt-out here so an unsubscribe/bounce is honoured across every
+        # email/SMS channel (ADR 0028 block-all), not just this sequence.
+        from src.services.email_suppression import suppress_contact
+        suppress_contact(db, email=email, source="instantly_nurture_sync")
