@@ -14,6 +14,7 @@ from __future__ import annotations
 import uuid
 
 import pytest
+from sqlalchemy import text
 
 from src.core.database import get_db_context
 from src.core.models import CheckoutRecovery, NonBuyerNurtureSequence, Subscriber
@@ -85,20 +86,11 @@ def _insert_active(db, email, *, touches_sent=0, started_at=None, last_touch_at=
     ))
 
 
-def _mute_capture(monkeypatch):
-    """run_sweep's capture step scans the live Subscriber table; the cadence
-    tests below aren't about capture, so stub it out to keep them from creating
-    recovery rows for real dev-DB subscribers (single shared DB)."""
-    from src.services import checkout_recovery
-    monkeypatch.setattr(checkout_recovery, "find_pre_payment_candidates", lambda db, now=None, limit=200: [])
-
-
 def test_sweep_is_read_only_when_flag_off(monkeypatch):
     from datetime import datetime, timedelta, timezone
     from config.settings import get_settings
     from src.tasks import checkout_recovery_sweep
 
-    _mute_capture(monkeypatch)
     monkeypatch.setattr(get_settings(), "checkout_recovery_enabled", False, raising=False)
     email = _email()
     try:
@@ -122,7 +114,6 @@ def test_sweep_sends_and_advances_when_flag_on(monkeypatch):
     from src.tasks import checkout_recovery_sweep
     import src.services.email as email_mod
 
-    _mute_capture(monkeypatch)
     monkeypatch.setattr(get_settings(), "checkout_recovery_enabled", True, raising=False)
     sent = {}
     monkeypatch.setattr(email_mod, "send_email", lambda **kw: sent.update(kw) or True)
@@ -149,7 +140,6 @@ def test_sweep_fails_exhausted_row_when_flag_on(monkeypatch):
     from config.settings import get_settings
     from src.tasks import checkout_recovery_sweep
 
-    _mute_capture(monkeypatch)
     monkeypatch.setattr(get_settings(), "checkout_recovery_enabled", True, raising=False)
     email = _email()
     try:
@@ -172,28 +162,72 @@ def test_sweep_fails_exhausted_row_when_flag_on(monkeypatch):
         _cleanup(email)
 
 
-def test_sweep_wires_capture_into_start_recovery(monkeypatch):
-    """Wiring test only — find_pre_payment_candidates is mocked so this can't
-    scan/mutate real Subscriber rows in the shared dev DB (unlike the active-
-    row cadence tests above, this step reads the live Subscriber table, not
-    a test-only one)."""
+def test_sweep_does_not_advance_when_no_channel_delivers(monkeypatch):
+    """Issue 2: a total send failure must NOT advance the touch count — the row
+    stays due so the next sweep retries instead of burning the attempt."""
+    from datetime import datetime, timedelta, timezone
+    from config.settings import get_settings
     from src.tasks import checkout_recovery_sweep
-    from src.services import checkout_recovery as cr
+    import src.services.email as email_mod
+
+    monkeypatch.setattr(get_settings(), "checkout_recovery_enabled", True, raising=False)
+
+    def _boom(**kw):
+        raise RuntimeError("email provider down")
+    monkeypatch.setattr(email_mod, "send_email", _boom)
 
     email = _email()
-    monkeypatch.setattr(
-        cr, "find_pre_payment_candidates",
-        lambda db, now=None, limit=200: [{"subscriber_id": None, "email": email, "phone": None, "created_at": None}],
-    )
     try:
-        checkout_recovery_sweep.run_sweep(dry_run=True)
+        with get_db_context() as db:
+            _insert_active(db, email, started_at=datetime.now(timezone.utc) - timedelta(hours=3))  # no phone → email-only
+            db.commit()
+
+        result = checkout_recovery_sweep.run_sweep()
 
         with get_db_context() as db:
             rec = db.query(CheckoutRecovery).filter_by(email=email).first()
-        assert rec is not None
-        assert rec.source == "pre_payment"
-        assert rec.status == "active"
+        assert rec.touches_sent == 0        # not advanced
+        assert rec.status == "active"       # still due
+        assert result["undelivered"] == 1
+        assert result["sent"] == 0
     finally:
+        _cleanup(email)
+
+
+def test_sweep_skips_a_row_locked_by_another_worker(monkeypatch):
+    """Issue 3: FOR UPDATE SKIP LOCKED — a row already claimed by a concurrent
+    transaction is skipped, so overlapping cron runs never double-send."""
+    from datetime import datetime, timedelta, timezone
+    from config.settings import get_settings
+    from src.core.database import get_db_session
+    from src.tasks import checkout_recovery_sweep
+    import src.services.email as email_mod
+
+    monkeypatch.setattr(get_settings(), "checkout_recovery_enabled", True, raising=False)
+    calls = []
+    monkeypatch.setattr(email_mod, "send_email", lambda **kw: calls.append(kw.get("to")) or True)
+
+    email = _email()
+    holder = get_db_session()
+    try:
+        with get_db_context() as db:
+            _insert_active(db, email, started_at=datetime.now(timezone.utc) - timedelta(hours=3))
+            db.commit()
+
+        # Simulate a concurrent worker holding the row's lock.
+        holder.execute(
+            text("SELECT id FROM checkout_recovery WHERE email=:e FOR UPDATE"), {"e": email}
+        ).first()
+
+        result = checkout_recovery_sweep.run_sweep()
+
+        assert email not in calls          # skipped, not sent
+        with get_db_context() as db:
+            rec = db.query(CheckoutRecovery).filter_by(email=email).first()
+        assert rec.touches_sent == 0       # untouched by this worker
+    finally:
+        holder.rollback()
+        holder.close()
         _cleanup(email)
 
 
@@ -324,130 +358,34 @@ def test_mark_recovered_closes_the_sequence():
         _cleanup(email)
 
 
-def _mk_free_subscriber(db, email, *, created_at, phone=None):
-    sub = Subscriber(
-        stripe_customer_id=f"cus_prepay_{uuid.uuid4().hex[:8]}",
-        tier="free", vertical="roofing", county_id="hillsborough",
-        event_feed_uuid=f"prepay-{uuid.uuid4().hex[:8]}",
-        email=email, phone=phone, created_at=created_at,
-    )
-    db.add(sub)
-    db.flush()
-    return sub
+def test_sweep_no_longer_captures_bare_free_signups(monkeypatch):
+    """Issue 1: recovery is captured at real checkout-start (/api/checkout),
+    never inferred from a free signup. The sweep must create no recovery row
+    for a free subscriber that never started checkout."""
+    from config.settings import get_settings
+    from src.tasks import checkout_recovery_sweep
 
-
-def test_find_pre_payment_candidates_picks_up_aged_free_signup():
-    """The gap this path exists for: openCheckout creates the free row, but the
-    createCheckout call (or the Stripe form itself) never fires — no Stripe
-    session ever exists, so checkout.session.expired never fires either."""
-    from datetime import datetime, timedelta, timezone
-    from src.services import checkout_recovery
-
-    email = _email()
-    sub_id = None
-    try:
-        with get_db_context() as db:
-            sub = _mk_free_subscriber(
-                db, email,
-                created_at=datetime.now(timezone.utc) - timedelta(hours=2),
-                phone="+18135550100",
-            )
-            sub_id = sub.id
-            db.commit()
-
-        with get_db_context() as db:
-            candidates = checkout_recovery.find_pre_payment_candidates(db)
-        matched = next((c for c in candidates if c["email"] == email), None)
-        assert matched is not None
-        assert matched["subscriber_id"] == sub_id
-        assert matched["phone"] == "+18135550100"
-    finally:
-        _cleanup(email)
-        if sub_id is not None:
-            with get_db_context() as db:
-                db.query(Subscriber).filter_by(id=sub_id).delete(synchronize_session=False)
-                db.commit()
-
-
-def test_find_pre_payment_candidates_excludes_too_fresh_signup():
-    """Someone genuinely mid-checkout right now must not be captured yet —
-    only PRE_PAYMENT_MIN_AGE (30min) and older."""
-    from datetime import datetime, timedelta, timezone
-    from src.services import checkout_recovery
-
-    email = _email()
-    sub_id = None
-    try:
-        with get_db_context() as db:
-            sub = _mk_free_subscriber(
-                db, email, created_at=datetime.now(timezone.utc) - timedelta(minutes=5),
-            )
-            sub_id = sub.id
-            db.commit()
-
-        with get_db_context() as db:
-            candidates = checkout_recovery.find_pre_payment_candidates(db)
-        assert email not in {c["email"] for c in candidates}
-    finally:
-        _cleanup(email)
-        if sub_id is not None:
-            with get_db_context() as db:
-                db.query(Subscriber).filter_by(id=sub_id).delete(synchronize_session=False)
-                db.commit()
-
-
-def test_find_pre_payment_candidates_excludes_already_captured_email():
-    """A session_expired capture that already created a checkout_recovery row
-    for this email must not be double-started by the pre_payment sweep."""
-    from datetime import datetime, timedelta, timezone
-    from src.services import checkout_recovery
-
-    email = _email()
-    sub_id = None
-    try:
-        with get_db_context() as db:
-            sub = _mk_free_subscriber(
-                db, email, created_at=datetime.now(timezone.utc) - timedelta(hours=2),
-            )
-            sub_id = sub.id
-            checkout_recovery.start_recovery(db, email=email, source="session_expired")
-            db.commit()
-
-        with get_db_context() as db:
-            candidates = checkout_recovery.find_pre_payment_candidates(db)
-        assert email not in {c["email"] for c in candidates}
-    finally:
-        _cleanup(email)
-        if sub_id is not None:
-            with get_db_context() as db:
-                db.query(Subscriber).filter_by(id=sub_id).delete(synchronize_session=False)
-                db.commit()
-
-
-def test_find_pre_payment_candidates_excludes_converted_subscriber():
-    """A subscriber who upgraded off 'free' is a real conversion, not an
-    abandonment — must never be pulled in."""
-    from datetime import datetime, timedelta, timezone
-    from src.services import checkout_recovery
-
+    monkeypatch.setattr(get_settings(), "checkout_recovery_enabled", True, raising=False)
     email = _email()
     sub_id = None
     try:
         with get_db_context() as db:
             sub = Subscriber(
-                stripe_customer_id=f"cus_prepay_{uuid.uuid4().hex[:8]}",
-                tier="starter", vertical="roofing", county_id="hillsborough",
-                event_feed_uuid=f"prepay-{uuid.uuid4().hex[:8]}",
-                email=email, created_at=datetime.now(timezone.utc) - timedelta(hours=2),
+                stripe_customer_id=f"cus_free_{uuid.uuid4().hex[:8]}",
+                tier="free", vertical="roofing", county_id="hillsborough",
+                event_feed_uuid=f"free-{uuid.uuid4().hex[:8]}",
+                email=email,
             )
             db.add(sub)
             db.flush()
             sub_id = sub.id
             db.commit()
 
+        checkout_recovery_sweep.run_sweep()
+
         with get_db_context() as db:
-            candidates = checkout_recovery.find_pre_payment_candidates(db)
-        assert email not in {c["email"] for c in candidates}
+            rec = db.query(CheckoutRecovery).filter_by(email=email).first()
+        assert rec is None  # bare free signup is never captured
     finally:
         _cleanup(email)
         if sub_id is not None:

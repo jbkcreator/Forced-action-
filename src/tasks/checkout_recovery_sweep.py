@@ -1,21 +1,17 @@
 """
 Abandoned-checkout recovery sweep (Task 7).
 
-Two jobs, one run:
-  1. Capture — finds aged free-tier signups that never reached a Stripe
-     session (checkout_recovery.find_pre_payment_candidates) and starts
-     recovery for them. Runs unconditionally; this is the only place the
-     pre_payment path gets picked up (the session_expired path is captured
-     directly by the checkout.session.expired webhook, not here).
-  2. Cadence — walks active checkout_recovery rows and, per
-     checkout_recovery.next_action, either sends the next recovery touch
-     (email + optional SMS) or fails the row (handing the contact back to
-     non-buyer nurture).
+Cadence only: walks active checkout_recovery rows and, per
+checkout_recovery.next_action, either sends the next recovery touch (email +
+optional SMS) or fails the row (handing the contact back to non-buyer
+nurture). Capture is NOT done here — rows are created at their real source:
+the pre_payment path at /api/checkout session creation, and the
+session_expired path by the checkout.session.expired webhook.
 
 Touch sends and fail-transitions only happen when
-settings.checkout_recovery_enabled is true; otherwise the sweep still
-captures and ages rows but logs what it would send/fail instead of acting, so
-it can be scheduled before messaging is switched on.
+settings.checkout_recovery_enabled is true; otherwise the sweep logs what it
+would send/fail instead of acting, so it can be scheduled before messaging is
+switched on.
 
     python -m src.tasks.checkout_recovery_sweep
     python -m src.tasks.checkout_recovery_sweep --dry-run
@@ -81,32 +77,20 @@ def run_sweep(dry_run: bool = False) -> dict:
     settings = get_settings()
     sends_on = settings.checkout_recovery_enabled and not dry_run
     now = datetime.now(timezone.utc)
-    sent = failed = skipped = 0
-    captured = 0
+    sent = failed = skipped = undelivered = 0
 
     with get_db_context() as db:
-        # Capture always runs, independent of the send flag — this is the only
-        # place the pre_payment path (no Stripe session ever created, so no
-        # checkout.session.expired webhook) gets picked up.
-        for candidate in checkout_recovery.find_pre_payment_candidates(db, now=now):
-            row = checkout_recovery.start_recovery(
-                db,
-                email=candidate["email"],
-                source="pre_payment",
-                subscriber_id=candidate["subscriber_id"],
-                phone=candidate["phone"],
-                resume_context={
-                    "county_id": candidate.get("county_id"),
-                    "vertical": candidate.get("vertical"),
-                },
-            )
-            if row is not None:
-                captured += 1
-        if captured:
-            db.commit()
-
+        # Claim active rows with FOR UPDATE SKIP LOCKED so overlapping cron runs
+        # never send the same touch twice: a second worker skips the rows this
+        # one holds and picks up the rest. Locks are held until the commit
+        # below — bounded by the small live-recovery window (rows close on
+        # recover/fail), so a per-row lease/outbox would be over-built here.
+        # ponytail: single locked scan, no batching; add a LIMIT + lease only if
+        # the active window ever grows enough that lock-hold-during-send bites.
         rows = db.execute(
-            select(CheckoutRecovery).where(CheckoutRecovery.status == "active")
+            select(CheckoutRecovery)
+            .where(CheckoutRecovery.status == "active")
+            .with_for_update(skip_locked=True)
         ).scalars().all()
 
         for row in rows:
@@ -137,34 +121,50 @@ def run_sweep(dry_run: bool = False) -> dict:
                 skipped += 1
                 continue
 
-            _send_touch(row, touch_number, resume_url)
-            checkout_recovery.record_touch(db, row, now)
-            sent += 1
-            logger.debug("[recovery-sweep] sent touch#%d email=%s source=%s", touch_number, row.email, row.source)
+            # Only advance the touch count when a channel actually delivered.
+            # A total failure leaves the row due so the next sweep retries.
+            if _send_touch(row, touch_number, resume_url):
+                checkout_recovery.record_touch(db, row, now)
+                sent += 1
+                logger.debug("[recovery-sweep] sent touch#%d email=%s source=%s", touch_number, row.email, row.source)
+            else:
+                undelivered += 1
+                logger.warning(
+                    "[recovery-sweep] touch#%d not delivered (all channels failed) email=%s — leaving due for retry",
+                    touch_number, row.email,
+                )
 
         if sends_on:
             db.commit()
 
-    result = {"captured": captured, "sent": sent, "failed": failed, "skipped": skipped, "sends_enabled": sends_on}
+    result = {"sent": sent, "failed": failed, "skipped": skipped, "undelivered": undelivered, "sends_enabled": sends_on}
     logger.info("[recovery-sweep] %s", result)
     return result
 
 
-def _send_touch(row, touch_number: int, resume_url: str) -> None:
+def _send_touch(row, touch_number: int, resume_url: str) -> bool:
     """Email always; SMS best-effort when a phone is on file (the compliant
-    sender enforces opt-in/opt-out, so no consent check is duplicated here)."""
+    sender enforces opt-in/opt-out, so no consent check is duplicated here).
+
+    Returns True if at least one channel accepted the message. A False return
+    means nothing was delivered (provider down, bad creds, timeout) — the caller
+    must NOT advance the touch count, so the row stays due and the next sweep
+    retries instead of silently burning a recovery attempt."""
     from src.services.email import send_email
 
     source = getattr(row, "source", "session_expired")
+    email_ok = False
     try:
         send_email(
             to=row.email,
             subject=_subject(touch_number, source),
             body_text=_email_body(resume_url, touch_number, source),
         )
+        email_ok = True
     except Exception:
         logger.warning("[recovery-sweep] email send failed email=%s", row.email, exc_info=True)
 
+    sms_ok = False
     if row.phone:
         sms_body = (
             f"Your Forced Action lead pack is still available — finish here: {resume_url}"
@@ -176,8 +176,11 @@ def _send_touch(row, touch_number: int, resume_url: str) -> None:
             from src.core.database import get_db_context
             with get_db_context() as sms_db:
                 send_sms(row.phone, sms_body, sms_db, message_type="marketing")
+            sms_ok = True
         except Exception:
             logger.warning("[recovery-sweep] sms send failed email=%s", row.email, exc_info=True)
+
+    return email_ok or sms_ok
 
 
 def main() -> int:

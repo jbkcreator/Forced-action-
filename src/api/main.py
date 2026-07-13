@@ -922,6 +922,24 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
             detail={"error": "payment_gateway_error", "message": "Payment gateway error — please try again"},
         )
 
+    # Abandoned-cart recovery: a real checkout session now exists but isn't paid.
+    # Capture the pre_payment start here (the reliable signal) — never inferred
+    # from a bare free signup. Completion closes it (_on_checkout_completed →
+    # mark_recovered); if it expires the session_expired webhook is a dedup'd
+    # backstop. Capture always; sends stay behind checkout_recovery_enabled.
+    try:
+        from src.services import checkout_recovery
+        checkout_recovery.start_recovery(
+            db,
+            email=payload.email,
+            source="pre_payment",
+            resume_context={"county_id": payload.county_id, "vertical": payload.vertical},
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.warning("[CheckoutRecovery] pre_payment capture failed (non-fatal)", exc_info=True)
+
     return {"client_secret": session.client_secret, "is_founding": is_founding}
 
 

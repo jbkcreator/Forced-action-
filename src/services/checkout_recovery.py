@@ -2,9 +2,12 @@
 Abandoned-checkout recovery — core service (Task 7).
 
 Owns capture, nurture suppression, touch cadence, and terminal transitions for
-the fast "finish your purchase" recovery sequence. Two capture paths feed it:
-a Stripe `checkout.session.expired` webhook (session_expired) and an aged
-pre-checkout intent that never paid (pre_payment).
+the fast "finish your purchase" recovery sequence. Two capture paths feed it,
+both captured at their real source (never inferred from a free signup):
+`pre_payment` — a subscription checkout session was created at /api/checkout
+but not completed; and `session_expired` — a Stripe `checkout.session.expired`
+webhook. pre_payment fires the earlier nudge; session_expired is the backstop
+(dedup keeps them from double-starting the same email).
 
 While a recovery row is `active`, the sibling non_buyer_nurture row is held at
 `in_recovery` so the slower nurture drip never contacts the same person at the
@@ -42,16 +45,6 @@ _NURTURE_BLOCKING = {"enrolled", "converted", "unsubscribed", "bounced", "remove
 FIRST_TOUCH_DELAY = timedelta(hours=1)
 SECOND_TOUCH_DELAY = timedelta(hours=24)
 MAX_TOUCHES = 2
-
-# Pre-payment capture window: a free-tier signup (created at the same moment
-# as a checkout attempt — see useStripeCheckout.openCheckout) that's still
-# 'free' after this long either never reached Stripe or bailed before the
-# session was created (so no checkout.session.expired webhook ever fires —
-# that's the gap this path covers). MIN guards against catching someone still
-# mid-flow; MAX matches non_buyer_nurture's own free-signup window so the two
-# sweeps hand off cleanly instead of racing over the same email.
-PRE_PAYMENT_MIN_AGE = timedelta(minutes=30)
-PRE_PAYMENT_MAX_AGE = timedelta(hours=24)
 
 
 def next_action(touches_sent: int, started_at: datetime, last_touch_at: Optional[datetime], now: datetime) -> Optional[str]:
@@ -215,51 +208,3 @@ def mark_failed(db, email: str) -> None:
     logger.info("[CheckoutRecovery] failed→nurture email=%s", email)
 
 
-def find_pre_payment_candidates(db, now: Optional[datetime] = None, limit: int = 200) -> list[dict]:
-    """
-    Free-tier subscribers still 'free' after PRE_PAYMENT_MIN_AGE, aged less
-    than PRE_PAYMENT_MAX_AGE, who don't already have a checkout_recovery row
-    (e.g. session_expired already captured them — never double-start). Newest
-    first, capped at `limit`.
-
-    Exclusion is a correlated NOT EXISTS and the cap is a SQL LIMIT — the
-    recovery table is never loaded into memory (it grows unbounded as rows
-    close, so an in-Python `email in {all_emails}` set would scale with total
-    history, not the small live window).
-    """
-    from src.core.models import Subscriber
-
-    now = now or datetime.now(timezone.utc)
-    window_start = now - PRE_PAYMENT_MAX_AGE
-    window_end = now - PRE_PAYMENT_MIN_AGE
-
-    already_captured = (
-        select(CheckoutRecovery.id)
-        .where(CheckoutRecovery.email == Subscriber.email)
-        .exists()
-    )
-
-    rows = db.execute(
-        select(
-            Subscriber.id, Subscriber.email, Subscriber.phone,
-            Subscriber.vertical, Subscriber.county_id, Subscriber.created_at,
-        ).where(
-            Subscriber.tier == "free",
-            Subscriber.email.isnot(None),
-            Subscriber.created_at >= window_start,
-            Subscriber.created_at <= window_end,
-            ~already_captured,
-        ).order_by(Subscriber.created_at.desc()).limit(limit)
-    ).all()
-
-    return [
-        {
-            "subscriber_id": r.id,
-            "email": r.email,
-            "phone": r.phone,
-            "vertical": r.vertical,
-            "county_id": r.county_id,
-            "created_at": r.created_at,
-        }
-        for r in rows
-    ]
