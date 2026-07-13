@@ -373,3 +373,46 @@ def fee_surfaces_enabled(session: Session, lane_id: str) -> bool:
         {"lid": str(lane_id)},
     ).fetchone()
     return bool(row and row.fee_config_flag)
+
+
+RESPA_FEE_GATE_WARNING = (
+    "RESPA §8 WARNING: enabling fee_config_flag surfaces referral-fee dollar "
+    "amounts for this lane. Referral fees on consumer-purpose mortgage business "
+    "are prohibited by RESPA Section 8 (12 U.S.C. §2607) — per-violation fines "
+    "and treble-damage civil liability, and switching the flag back off does NOT "
+    "undo fees already charged. Enable only for a deal counsel has confirmed in "
+    "writing to be exempt (e.g. business-purpose) with cleared fee terms."
+)
+
+
+def set_fee_config_flag(session: Session, lane_id: str, enabled: bool, actor: str) -> dict:
+    """Flip the lane's RESPA fee gate (fee_config_flag).
+
+    Deliberately loud: every call — including no-op flips — logs a WARNING with
+    actor and old→new state so there is a durable record of who surfaced fee
+    dollars on which lane. Does not commit; caller owns the transaction.
+    """
+    row = session.execute(
+        text("SELECT fee_config_flag FROM lanes WHERE lane_id = CAST(:lid AS uuid) FOR UPDATE"),
+        {"lid": str(lane_id)},
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"lane not found: {lane_id}")
+
+    previous = bool(row.fee_config_flag)
+    if previous != enabled:
+        session.execute(
+            text("""
+                UPDATE lanes
+                   SET fee_config_flag = :enabled,
+                       updated_at = NOW()
+                 WHERE lane_id = CAST(:lane_id AS uuid)
+            """),
+            {"lane_id": str(lane_id), "enabled": enabled},
+        )
+
+    logger.warning(
+        "[respa-fee-gate] fee_config_flag %s -> %s on lane %s by %s",
+        previous, enabled, lane_id, actor,
+    )
+    return {"lane_id": str(lane_id), "previous": previous, "enabled": enabled}
