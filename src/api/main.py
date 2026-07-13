@@ -1867,6 +1867,9 @@ def event_feed(
                 "wallet_to_lock_eligible": False,
                 "wallet_credits_30d": None,
                 "flash_scarcity_windows": [],
+                "onboarding_completed": subscriber.onboarding_completed,
+                "preferred_property_type": subscriber.preferred_property_type,
+                "investment_budget_band": subscriber.investment_budget_band,
                 **_accelerated_wallet_offer_fields(subscriber, db),
                 **_auto_mode_entitlement_fields(subscriber, db),
                 **_payment_recovery_fields(subscriber),
@@ -2069,6 +2072,9 @@ def event_feed(
                 "wallet_to_lock_eligible": _w2l_eligible_nz,
                 "wallet_credits_30d": _wallet_credits_30d_nz,
                 "flash_scarcity_windows": _flash_windows_nz,
+                "onboarding_completed": subscriber.onboarding_completed,
+                "preferred_property_type": subscriber.preferred_property_type,
+                "investment_budget_band": subscriber.investment_budget_band,
                 **_accelerated_wallet_offer_fields(subscriber, db),
                 **_auto_mode_entitlement_fields(subscriber, db),
                 **_payment_recovery_fields(subscriber),
@@ -2344,6 +2350,9 @@ def event_feed(
             "wallet_to_lock_eligible": _w2l_eligible,
             "wallet_credits_30d": _wallet_credits_30d,
             "flash_scarcity_windows": _flash_windows,
+            "onboarding_completed": subscriber.onboarding_completed,
+            "preferred_property_type": subscriber.preferred_property_type,
+            "investment_budget_band": subscriber.investment_budget_band,
             **_accelerated_wallet_offer_fields(subscriber, db),
             **_payment_recovery_fields(subscriber),
             **_what_you_missed_fields(
@@ -4815,6 +4824,26 @@ def upgrade(req: UpgradeRequest, db: Session = Depends(get_db)):
     new_price_id = settings.active_stripe_price(price_name)
     if not new_price_id:
         raise HTTPException(status_code=503, detail=f"Stripe price not configured for {req.tier}")
+
+    # Settle every guarantee cycle that already closed on the outgoing tier —
+    # otherwise switching sub.tier off starter/pro/dominator drops it from
+    # the daily sweep's tier filter and any closed cycle is never evaluated.
+    # evaluate_subscriber_guarantee() only advances one cycle per call, so a
+    # subscriber sitting on a backlog of several closed cycles (sweep
+    # downtime, or guarantees just enabled for an existing subscriber) needs
+    # it called until no cycle is left to settle, not just once.
+    from config.guarantees import TIER_LEAD_QUOTAS
+    from src.tasks.guarantee_shortfall_sweep import evaluate_subscriber_guarantee
+    if sub.tier in TIER_LEAD_QUOTAS:
+        try:
+            for _ in range(60):  # safety cap — one iteration per closed cycle
+                if evaluate_subscriber_guarantee(db, sub) is None:
+                    break
+        except Exception:
+            logger.error(
+                "[Upgrade] guarantee settlement failed for sub=%d tier=%s", sub.id, sub.tier,
+                exc_info=True,
+            )
 
     try:
         switch_subscription_plan(sub.stripe_subscription_id, new_price_id, prorate=True)

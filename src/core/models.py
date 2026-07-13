@@ -1275,6 +1275,17 @@ class Subscriber(Base):
         Boolean, default=True, server_default="true", nullable=False
     )
 
+    # ── Onboarding preference step ───────────────────────────────────────────
+    # True for pre-existing rows (server_default) so the gate never disrupts
+    # subscribers who signed up before this shipped. New signups set this
+    # False explicitly (src/services/signup_engine.py) so first login shows
+    # the one-screen preference step before the dashboard.
+    onboarding_completed: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default="true", nullable=False
+    )
+    preferred_property_type: Mapped[Optional[str]] = mapped_column(String(50))
+    investment_budget_band: Mapped[Optional[str]] = mapped_column(String(30))
+
     # ── Revenue / churn tracking (fa048) ─────────────────────────────────────
     plan_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)
     churned_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -6797,6 +6808,44 @@ class Delivery(Base):
 
     def __repr__(self) -> str:
         return f"<Delivery(property_id={self.property_id}, account_id={self.account_id}, grade={self.grade}, status={self.status})>"
+
+
+class GuaranteeCredit(Base):
+    """Tiered volume guarantee (config/guarantees.py): one row per subscriber
+    per evaluated ~30-day cycle, written by
+    src/tasks/guarantee_shortfall_sweep.py. The (subscriber_id, period_end)
+    unique constraint lets a cycle be claimed with a 'pending' row (INSERT ..
+    ON CONFLICT) before Stripe is called — 'pending'/'failed' rows are not
+    terminal and are retried in place rather than skipped.
+    """
+    __tablename__ = "guarantee_credits"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=False, index=True)
+    period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    tier: Mapped[str] = mapped_column(String(20), nullable=False)
+    quota: Mapped[int] = mapped_column(Integer, nullable=False)
+    delivered: Mapped[int] = mapped_column(Integer, nullable=False)
+    shortfall: Mapped[int] = mapped_column(Integer, nullable=False)
+    credit_cents: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    stripe_balance_txn_id: Mapped[Optional[str]] = mapped_column(String(100))
+    # pending (claimed, Stripe call in flight/retryable) | met (no shortfall)
+    # | issued | failed (retryable) | skipped_no_charge_basis
+    status: Mapped[str] = mapped_column(String(30), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("subscriber_id", "period_end", name="uq_guarantee_credit_subscriber_period"),
+        CheckConstraint(
+            "status IN ('pending', 'met', 'issued', 'failed', 'skipped_no_charge_basis')",
+            name="ck_guarantee_credit_status",
+        ),
+        Index("idx_guarantee_credits_subscriber_period", "subscriber_id", "period_end"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<GuaranteeCredit(subscriber={self.subscriber_id}, period_end={self.period_end}, status={self.status})>"
 
 
 class FreeToPaidAttribution(Base):
