@@ -46,6 +46,7 @@ from config.constants import TIER_DISPLAY
 from src.utils.logger import setup_logging
 from src.services.rate_limit import enforce_or_429
 from src.services.phone_utils import normalize as normalize_phone
+from src.services.founding_gate import evaluate_founding_gate
 from src.api.deps import (
     get_db,
     VALID_TIERS,
@@ -135,16 +136,21 @@ from src.api.metrics_router import router as metrics_router  # noqa: E402
 from src.api.alert_webhook_router import router as alert_webhook_router  # noqa: E402
 from src.api.revenue_metrics_router import router as revenue_metrics_router  # noqa: E402
 from src.api.admin_leads_router import router as admin_leads_router  # noqa: E402
+from src.api.funnel_analytics_router import router as funnel_analytics_router  # noqa: E402
 app.include_router(metrics_router)
 app.include_router(alert_webhook_router)
 app.include_router(revenue_metrics_router)
 app.include_router(admin_leads_router)
+app.include_router(funnel_analytics_router)
 
 from src.api.bankruptcy_alert_router import router as bankruptcy_alert_router  # noqa: E402
 app.include_router(bankruptcy_alert_router)
 
 from src.api.email_campaign_router import router as email_campaign_router  # noqa: E402
 app.include_router(email_campaign_router)
+
+from src.api.email_unsubscribe_router import router as email_unsubscribe_router  # noqa: E402
+app.include_router(email_unsubscribe_router)
 
 from src.api.subscriber_router import router as subscriber_router  # noqa: E402
 from src.services.subscriber_auth import get_current_subscriber  # noqa: E402
@@ -940,7 +946,12 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
         db.rollback()
         logger.warning("[CheckoutRecovery] pre_payment capture failed (non-fatal)", exc_info=True)
 
-    return {"client_secret": session.client_secret, "is_founding": is_founding}
+    return {
+        "client_secret": session.client_secret,
+        "session_id": session.id,
+        "amount_total_cents": session.amount_total,
+        "is_founding": is_founding,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1277,6 +1288,51 @@ async def stripe_wl_webhook(
 
 
 # ---------------------------------------------------------------------------
+# Shared founding-price state — the single computation behind
+# /api/founding-summary, /api/founding-spots, and /api/landing-data, so all
+# three agree at the same moment (ADR 0029). Total spots are always summed
+# across all tiers for one vertical/county — that's the same grain
+# founding-summary used before this was extracted, just named and reused.
+# ---------------------------------------------------------------------------
+
+_FOUNDING_TIERS = ["starter", "pro", "dominator"]
+
+
+def _county_founding_deadline(db: Session, county_id: str) -> Optional[datetime]:
+    return db.execute(
+        select(County.founding_price_deadline_at).where(County.county_id == county_id)
+    ).scalar_one_or_none()
+
+
+def _founding_state_for_county(db: Session, county_id: str, vertical: str) -> dict:
+    settings = get_settings()
+    total_cap = settings.founding_spot_limit * len(_FOUNDING_TIERS)
+
+    rows = db.execute(
+        select(FoundingSubscriberCount).where(
+            FoundingSubscriberCount.vertical == vertical,
+            FoundingSubscriberCount.county_id == county_id,
+        )
+    ).scalars().all()
+    total_taken = sum(r.count for r in rows)
+    total_remaining = max(0, total_cap - total_taken)
+
+    deadline_at = _county_founding_deadline(db, county_id)
+    server_now = datetime.now(timezone.utc)
+    gate = evaluate_founding_gate(remaining_spots=total_remaining, deadline_at=deadline_at, now=server_now)
+
+    return {
+        "total_cap": total_cap,
+        "total_taken": total_taken,
+        "total_remaining": total_remaining,
+        "server_now": server_now,
+        "deadline_at": deadline_at,
+        "founding_available": gate["available"],
+        "deadline_passed": gate["deadline_passed"],
+    }
+
+
+# ---------------------------------------------------------------------------
 # GET /api/founding-summary — Total spots taken across all tiers for vertical
 # ---------------------------------------------------------------------------
 
@@ -1296,32 +1352,22 @@ def founding_summary(
             detail={"error": "invalid_vertical", "message": f"vertical must be one of: {sorted(VALID_VERTICALS)}"},
         )
 
-    settings = get_settings()
-    FOUNDING_CAP = settings.founding_spot_limit
-    TIERS = ["starter", "pro", "dominator"]
-    TOTAL_CAP = FOUNDING_CAP * len(TIERS)
-
     try:
-        rows = db.execute(
-            select(FoundingSubscriberCount).where(
-                FoundingSubscriberCount.vertical == vertical,
-                FoundingSubscriberCount.county_id == county_id,
-            )
-        ).scalars().all()
+        state = _founding_state_for_county(db, county_id, vertical)
     except OperationalError:
         logger.error("DB error in founding-summary", exc_info=True)
         raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
 
-    total_taken = sum(r.count for r in rows)
-    total_remaining = max(0, TOTAL_CAP - total_taken)
-
     return {
         "vertical": vertical,
         "county_id": county_id,
-        "total_cap": TOTAL_CAP,
-        "total_taken": total_taken,
-        "total_remaining": total_remaining,
-        "founding_available": total_remaining > 0,
+        "total_cap": state["total_cap"],
+        "total_taken": state["total_taken"],
+        "total_remaining": state["total_remaining"],
+        "founding_available": state["founding_available"],
+        "server_now": state["server_now"].isoformat(),
+        "founding_price_deadline_at": state["deadline_at"].isoformat() if state["deadline_at"] else None,
+        "deadline_passed": state["deadline_passed"],
     }
 
 
@@ -1369,6 +1415,10 @@ def founding_spots(
     count = row.count if row else 0
     remaining = max(0, FOUNDING_CAP - count)
 
+    deadline_at = _county_founding_deadline(db, county_id)
+    server_now = datetime.now(timezone.utc)
+    gate = evaluate_founding_gate(remaining_spots=remaining, deadline_at=deadline_at, now=server_now)
+
     return {
         "tier": tier,
         "vertical": vertical,
@@ -1376,7 +1426,10 @@ def founding_spots(
         "founding_cap": FOUNDING_CAP,
         "founding_taken": count,
         "founding_remaining": remaining,
-        "founding_available": remaining > 0,
+        "founding_available": gate["available"],
+        "server_now": server_now.isoformat(),
+        "founding_price_deadline_at": deadline_at.isoformat() if deadline_at else None,
+        "deadline_passed": gate["deadline_passed"],
     }
 
 
@@ -1566,6 +1619,7 @@ def zip_availability(
     lead_counts = {r[0]: r[1] for r in lead_rows}
 
     result = []
+    open_zip_count = 0
     for zip_code in all_zips:
         status = taken_map.get(zip_code)
         if status == "locked":
@@ -1574,18 +1628,25 @@ def zip_availability(
             availability = "grace"
         else:
             availability = "available"
+            open_zip_count += 1
+
+        # lead_count is a value signal, not the scarcity signal (ADR 0029) —
+        # only surfaced for available ZIPs, and only when non-zero.
+        lead_count = lead_counts.get(zip_code, 0) if availability == "available" else 0
 
         result.append({
             "zip_code": zip_code,
             "status": availability,
             "property_count": prop_counts.get(zip_code, 0),
-            "lead_count": lead_counts.get(zip_code, 0),
+            "lead_count": lead_count if lead_count > 0 else None,
             "waitlist_count": waitlist_map.get(zip_code, 0),
         })
 
     payload = {
         "vertical": vertical,
         "county_id": county_id,
+        "total_zip_count": len(all_zips),
+        "open_zip_count": open_zip_count,
         "zips": result,
     }
 
@@ -2571,12 +2632,20 @@ _ALLOWED_LANDING_COUNTIES = {"hillsborough", "pinellas"}
 
 
 @app.get("/api/landing-data")
-def get_landing_data(county_id: Optional[str] = Query(default=None), db: Session = Depends(get_db)):
+def get_landing_data(
+    county_id: Optional[str] = Query(default=None),
+    vertical: str = "roofing",
+    db: Session = Depends(get_db),
+):
     """
     Aggregated county-specific landing page data.
 
     Returns all metrics needed to render the landing page for a single county.
     All counts and queries are filtered by county_id — no global numbers returned.
+
+    `vertical` scopes the founding-price block only (spots are per-vertical);
+    every other field on this response stays county-wide. Defaults to
+    "roofing" to match the other founding endpoints' default.
 
     400  county_id missing
     404  county not found in counties table
@@ -2587,7 +2656,7 @@ def get_landing_data(county_id: Optional[str] = Query(default=None), db: Session
         raise HTTPException(status_code=400, detail={"error": "county_id_required"})
 
     from src.core.redis_client import redis_available, rget, rset
-    _cache_key = f"landing_data:{county_id}"
+    _cache_key = f"landing_data:{county_id}:{vertical}"
     if redis_available():
         cached = rget(_cache_key)
         if cached:
@@ -2770,6 +2839,12 @@ def get_landing_data(county_id: Optional[str] = Query(default=None), db: Session
     else:
         scraper_health = None
 
+    # ── Task 8: featured testimonial + founding deadline (ADR 0029) ────────
+    # Routed through the same _founding_state_for_county() as /api/founding-
+    # summary and /api/founding-spots, so all three agree — including on
+    # spot exhaustion, not just the deadline.
+    founding_state = _founding_state_for_county(db, county_id, vertical)
+
     _result = {
         "county_id": county_id,
         "county_name": county.display_name,
@@ -2787,6 +2862,13 @@ def get_landing_data(county_id: Optional[str] = Query(default=None), db: Session
         "territory_availability": territory_availability,
         "scraper_health": scraper_health,
         "coming_soon": coming_soon,
+        "featured_testimonials": county.landing_featured_testimonials or [],
+        "founding": {
+            "deadline_at": founding_state["deadline_at"].isoformat() if founding_state["deadline_at"] else None,
+            "server_now": founding_state["server_now"].isoformat(),
+            "founding_available": founding_state["founding_available"],
+            "deadline_passed": founding_state["deadline_passed"],
+        },
     }
     if redis_available():
         rset(_cache_key, json.dumps(_result, default=str), ttl_seconds=300)

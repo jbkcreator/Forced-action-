@@ -55,6 +55,17 @@ class TestBusinessEventsWhitelist:
             )
         assert mock_log.call_args.kwargs["source"] == "frontend"
 
+    def test_source_event_id_passed_through(self):
+        from src.services.business_events import log_business_event
+        with patch("src.services.business_events.log_webhook_event") as mock_log:
+            log_business_event(
+                "SUBSCRIPTION_RENEWED",
+                subscriber_id=42,
+                payload={"invoice_id": "in_123"},
+                source_event_id="in_123",
+            )
+        assert mock_log.call_args.kwargs["source_event_id"] == "in_123"
+
 
 class TestBusinessEventsConstant:
     def test_all_spec_events_in_allowlist(self):

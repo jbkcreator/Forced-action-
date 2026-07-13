@@ -13,7 +13,6 @@ from src.services import non_buyer_nurture
 
 
 def _free_subscriber(email, created_at, **kw):
-    now = datetime.now(timezone.utc)
     return Subscriber(
         stripe_customer_id=f"cus_{email}",
         tier="free",
@@ -23,6 +22,21 @@ def _free_subscriber(email, created_at, **kw):
         email=email,
         created_at=created_at,
         event_feed_uuid=f"feed_{email}",
+        **kw,
+    )
+
+
+def _paid_subscriber(email, **kw):
+    now = datetime.now(timezone.utc)
+    return Subscriber(
+        stripe_customer_id=f"cus_paid_{email}",
+        tier="pro",
+        vertical="roofing",
+        county_id="hillsborough",
+        status="active",
+        email=email,
+        created_at=now,
+        event_feed_uuid=f"feed_paid_{email}",
         **kw,
     )
 
@@ -319,3 +333,140 @@ def test_apply_instantly_status_does_not_downgrade_converted(fresh_db):
 
     row = fresh_db.query(NonBuyerNurtureSequence).filter_by(email="already_converted@example.com").one()
     assert row.status == "converted"
+
+
+def test_find_candidates_excludes_email_with_paid_subscriber(fresh_db):
+    now = datetime.now(timezone.utc)
+    # Eligible checkout-abandon candidate — but the same email is now a paying customer.
+    fresh_db.add(NonBuyerNurtureSequence(
+        email="alreadypaid@example.com", source="checkout_abandon",
+        captured_at=now - timedelta(hours=30), status="eligible",
+    ))
+    fresh_db.add(_paid_subscriber("alreadypaid@example.com"))
+    fresh_db.flush()
+
+    candidates = non_buyer_nurture.find_candidates(fresh_db, limit=10_000)
+    emails = {c["email"] for c in candidates}
+    assert "alreadypaid@example.com" not in emails
+
+
+def test_reconcile_conversions_marks_paid_enrolled_rows_converted(fresh_db):
+    now = datetime.now(timezone.utc)
+    # Enrolled lead who has since become a paying subscriber but the webhook missed it.
+    fresh_db.add(NonBuyerNurtureSequence(
+        email="missed@example.com", source="free_signup",
+        captured_at=now - timedelta(hours=30), status="enrolled",
+        instantly_campaign_id="camp_1", instantly_lead_id=None, enrolled_at=now,
+    ))
+    fresh_db.add(_paid_subscriber("missed@example.com"))
+    # Enrolled lead with no paid subscriber — must stay enrolled.
+    fresh_db.add(NonBuyerNurtureSequence(
+        email="stillfree@example.com", source="free_signup",
+        captured_at=now - timedelta(hours=30), status="enrolled",
+        instantly_campaign_id="camp_1", instantly_lead_id=None, enrolled_at=now,
+    ))
+    fresh_db.flush()
+
+    n = non_buyer_nurture.reconcile_conversions(fresh_db)
+
+    assert n >= 1
+    missed = fresh_db.query(NonBuyerNurtureSequence).filter_by(email="missed@example.com").one()
+    assert missed.status == "converted"
+    assert missed.removal_reason == "paid_conversion"
+    still = fresh_db.query(NonBuyerNurtureSequence).filter_by(email="stillfree@example.com").one()
+    assert still.status == "enrolled"
+
+
+def test_enroll_all_rejected_leaves_eligible(fresh_db):
+    # Instantly accepted the request but created 0 and skipped 0 — every address
+    # rejected. Must NOT mark enrolled (else lead is silently lost forever).
+    now = datetime.now(timezone.utc)
+    candidate = {"email": "rejected@example.com", "subscriber_id": None,
+                 "source": "free_signup", "captured_at": now - timedelta(hours=30)}
+
+    with patch.object(non_buyer_nurture.instantly, "add_leads",
+                      return_value={"leads_created": 0, "leads_skipped": 0}):
+        non_buyer_nurture.enroll(fresh_db, [candidate], campaign_id="camp_x")
+
+    row = fresh_db.query(NonBuyerNurtureSequence).filter_by(email="rejected@example.com").one()
+    assert row.status == "eligible"
+    assert row.enrolled_at is None
+
+
+def test_enroll_skipped_existing_counts_as_success(fresh_db):
+    # created=0 but skipped=1 → Instantly already has the lead. Enrolled (not a failure).
+    now = datetime.now(timezone.utc)
+    candidate = {"email": "existing@example.com", "subscriber_id": None,
+                 "source": "free_signup", "captured_at": now - timedelta(hours=30)}
+
+    with patch.object(non_buyer_nurture.instantly, "add_leads",
+                      return_value={"leads_created": 0, "leads_skipped": 1}):
+        non_buyer_nurture.enroll(fresh_db, [candidate], campaign_id="camp_x")
+
+    row = fresh_db.query(NonBuyerNurtureSequence).filter_by(email="existing@example.com").one()
+    assert row.status == "enrolled"
+
+
+def test_enroll_instantly_exception_leaves_eligible(fresh_db):
+    now = datetime.now(timezone.utc)
+    candidate = {"email": "boom@example.com", "subscriber_id": None,
+                 "source": "free_signup", "captured_at": now - timedelta(hours=30)}
+
+    with patch.object(non_buyer_nurture.instantly, "add_leads", side_effect=RuntimeError("Instantly 500")):
+        non_buyer_nurture.enroll(fresh_db, [candidate], campaign_id="camp_x")
+
+    row = fresh_db.query(NonBuyerNurtureSequence).filter_by(email="boom@example.com").one()
+    assert row.status == "eligible"
+    assert row.enrolled_at is None
+
+
+def test_find_candidates_paid_exclusion_is_case_insensitive(fresh_db):
+    # Waitlist/abandon captured with mixed case; paid subscriber lower-case.
+    # Exclusion must match case-insensitively so a payer never gets nurture mail.
+    now = datetime.now(timezone.utc)
+    fresh_db.add(NonBuyerNurtureSequence(
+        email="Mixed.Case@Example.com", source="checkout_abandon",
+        captured_at=now - timedelta(hours=30), status="eligible",
+    ))
+    fresh_db.add(_paid_subscriber("mixed.case@example.com"))
+    fresh_db.flush()
+
+    candidates = non_buyer_nurture.find_candidates(fresh_db, limit=10_000)
+    lowered = {c["email"].lower() for c in candidates}
+    assert "mixed.case@example.com" not in lowered
+
+
+# --- Issue 2: nurture unsub/bounce writes the global email suppression --------
+
+@pytest.mark.parametrize("mapped,expected", [("unsubscribed", "unsubscribed"), ("bounced", "bounced")])
+def test_apply_instantly_status_writes_global_suppression(fresh_db, mapped, expected):
+    from src.core.models import EmailOptOut
+
+    email = f"{mapped}@example.com"
+    fresh_db.add(NonBuyerNurtureSequence(
+        email=email, source="free_signup",
+        captured_at=datetime.now(timezone.utc), status="enrolled",
+    ))
+    fresh_db.flush()
+
+    non_buyer_nurture.apply_instantly_status(fresh_db, email, mapped, instantly_lead_id="lead_x")
+
+    row = fresh_db.query(NonBuyerNurtureSequence).filter_by(email=email).one()
+    assert row.status == expected  # nurture row still marked terminal
+    opt_out = fresh_db.query(EmailOptOut).filter_by(email=email).one_or_none()
+    assert opt_out is not None  # global opt-out written
+
+
+def test_apply_instantly_status_active_does_not_suppress(fresh_db):
+    from src.core.models import EmailOptOut
+
+    email = "stillactive@example.com"
+    fresh_db.add(NonBuyerNurtureSequence(
+        email=email, source="free_signup",
+        captured_at=datetime.now(timezone.utc), status="enrolled",
+    ))
+    fresh_db.flush()
+
+    non_buyer_nurture.apply_instantly_status(fresh_db, email, "active")
+
+    assert fresh_db.query(EmailOptOut).filter_by(email=email).one_or_none() is None
