@@ -786,6 +786,7 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
                 f"New subscriber signed up.\nTier: {subscriber.tier}\nVertical: {vertical}\n"
                 f"County: {county_id}\nZIPs: {', '.join(zip_codes)}\nEmail: {subscriber.email}"
             ),
+            idempotency_key=f"stripe:{session.get('id', '')}",
         )
 
         # Stage 12 — schedule the bankruptcy-alert invite (sent T+X min by the

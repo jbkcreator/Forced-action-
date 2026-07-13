@@ -3960,6 +3960,7 @@ async def synthflow_webhook(request: Request):
                 f"Phone: {phone}\nVertical: {payload.vertical or v.get('vertical') or ''}\n"
                 f"ZIP: {payload.zip_code or v.get('zip_code') or v.get('zip') or ''}"
             ),
+            idempotency_key=f"synthflow:{payload.resolved_call_id}",
         )
 
     return {"status": "ok", **result}
@@ -4489,9 +4490,20 @@ async def telnyx_inbound(request: Request, db: Session = Depends(get_db)):
         payload_kind="telnyx",
     )
 
-    # Only act on inbound message events. Delivery-status callbacks (e.g.
-    # "message.sent", "message.finalized") share the same webhook URL but
-    # don't need handler routing — we just audit-log them above.
+    # Delivery-status callbacks ("message.sent", "message.finalized") share
+    # this webhook URL with inbound messages. They don't need STOP/HELP or
+    # command routing, but "message.finalized" is how we learn whether a
+    # founder alert SMS (owner_alert.notify_owner) actually reached the
+    # carrier, vs. Telnyx merely having accepted/queued it.
+    if event_type == "message.finalized":
+        from src.services.owner_alert import reconcile_delivery_status
+        recipients = payload.get("to") or [{}]
+        delivery_status = (recipients[0] or {}).get("status", "")
+        reconcile_delivery_status(telnyx_message_id=msg_id, delivery_status=delivery_status)
+        return Response(content="", media_type="application/json")
+
+    # Only act on inbound message events — any other callback type is just
+    # audit-logged above.
     if event_type != "message.received":
         return Response(content="", media_type="application/json")
 
