@@ -14,8 +14,10 @@ Import from here instead of defining in main.py or individual routers:
 """
 
 import re
+from datetime import datetime, timezone
 from typing import Optional
 
+from fastapi import HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -30,6 +32,26 @@ from src.core.database import get_db_context
 def get_db():
     with get_db_context() as db:
         yield db
+
+
+# ---------------------------------------------------------------------------
+# Shared query-param parsing
+# Used by: revenue metrics, funnel analytics, and other from/to date-range routes
+# ---------------------------------------------------------------------------
+
+def parse_iso_date_param(value: Optional[str], field: str) -> Optional[datetime]:
+    """Parse an optional ISO date/datetime query param into a tz-aware datetime.
+
+    Raises HTTPException(400) if `value` is non-empty but not valid ISO 8601.
+    Naive datetimes are assumed UTC.
+    """
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid {field} date: {value!r}")
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 # ---------------------------------------------------------------------------

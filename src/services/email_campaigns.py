@@ -13,7 +13,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import HTTPException
-from sqlalchemy import and_, func, or_, text
+from sqlalchemy import and_, exists, func, or_, text
 
 from src.core.database import get_db_context
 from src.core.models import (
@@ -21,6 +21,7 @@ from src.core.models import (
     CampaignDailyAnalytics,
     DBPRContact,
     EmailCampaign,
+    EmailOptOut,
     EmailSequenceTemplate,
 )
 from src.services import email_templates as template_svc
@@ -49,6 +50,7 @@ def _eligibility_filters(
     Core predicate:
       enrichment_status='enriched' AND email IS NOT NULL AND email_verified=TRUE
       AND NOT is_opted_out AND NOT is_hard_bounced AND NOT is_signed_up
+      AND NOT in email_opt_outs (universal cross-channel suppression)
       AND (license_expiry IS NULL OR license_expiry >= today)
       AND vertical matches (if set)
       AND geo filter (county OR zips)
@@ -70,6 +72,12 @@ def _eligibility_filters(
         DBPRContact.is_opted_out.is_(False),
         DBPRContact.is_hard_bounced.is_(False),
         DBPRContact.is_signed_up.is_(False),
+        # Suppress if EITHER the primary email or the work_email fallback is
+        # opted out — Instantly sends to `email or work_email`.
+        ~exists().where(EmailOptOut.email.in_([
+            func.lower(DBPRContact.email),
+            func.lower(DBPRContact.work_email),
+        ])),
         or_(
             DBPRContact.license_expiry.is_(None),
             DBPRContact.license_expiry >= today,

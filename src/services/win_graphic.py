@@ -127,11 +127,19 @@ def proof_wall_payload(db: Session, limit: int = 50, county_id: str | None = Non
     )
     if county_id:
         q = q.where(Subscriber.county_id == county_id)
-    rows = db.execute(q.order_by(DealOutcome.created_at.desc()).limit(limit)).all()
+    # Over-fetch before dedup — several deals can share bucket/vertical/county/day
+    # (a busy day, or test data), which would otherwise render as look-alike
+    # repeated cards. Keep the most recent of each combo, cap to `limit` after.
+    rows = db.execute(q.order_by(DealOutcome.created_at.desc()).limit(limit * 5)).all()
 
     payload: list[dict] = []
+    seen_combos: set[tuple] = set()
     for deal, sub in rows:
         days_ago = (today - deal.deal_date).days if deal.deal_date else None
+        combo = (deal.deal_size_bucket, sub.vertical if sub else None, sub.county_id if sub else None, days_ago)
+        if combo in seen_combos:
+            continue
+        seen_combos.add(combo)
         payload.append({
             "deal_outcome_id": deal.id,
             "deal_size_bucket": deal.deal_size_bucket,
@@ -141,4 +149,6 @@ def proof_wall_payload(db: Session, limit: int = 50, county_id: str | None = Non
             "days_ago": days_ago,
             "graphic_url": f"/api/win-graphic/{deal.id}",
         })
+        if len(payload) >= limit:
+            break
     return payload

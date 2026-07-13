@@ -312,6 +312,36 @@ class TestLeadMethods:
         body = mock_req.call_args[1]["json"]
         assert body["starting_after"] == "abc123"
 
+    @patch("src.services.instantly_service.time.sleep")
+    @patch("src.services.instantly_service.requests.request")
+    def test_add_to_block_list_posts_email(self, mock_req, mock_sleep, monkeypatch):
+        svc = self._setup(monkeypatch)
+        mock_req.return_value = _mock_resp(200, {"id": "block-1"})
+        result = svc.add_to_block_list("blocked@example.com")
+        assert result is True
+        call_args = mock_req.call_args
+        assert call_args[0][0] == "POST"
+        assert "/api/v2/block-lists-entries" in call_args[0][1]
+        assert call_args[1]["json"]["entries"] == ["blocked@example.com"]
+
+    @patch("src.services.instantly_service.time.sleep")
+    @patch("src.services.instantly_service.requests.request")
+    def test_add_to_block_list_posts_list_in_one_call(self, mock_req, mock_sleep, monkeypatch):
+        svc = self._setup(monkeypatch)
+        mock_req.return_value = _mock_resp(200, {"id": "block-batch"})
+        result = svc.add_to_block_list(["a@example.com", "b@example.com"])
+        assert result is True
+        assert mock_req.call_count == 1
+        assert mock_req.call_args[1]["json"]["entries"] == ["a@example.com", "b@example.com"]
+
+    def test_add_to_block_list_returns_false_when_not_configured(self, monkeypatch):
+        monkeypatch.setenv("INSTANTLY_API_KEY", "")
+        monkeypatch.setenv("INSTANTLY_ENABLED", "false")
+        from importlib import reload
+        import config.settings as cs; reload(cs)
+        import src.services.instantly_service as svc; reload(svc)
+        assert svc.add_to_block_list("x@example.com") is False
+
 
 # ---------------------------------------------------------------------------
 # Inbox / warmup
