@@ -288,6 +288,7 @@ def create_free_account_by_email(
 		utm_campaign=(utm_campaign or None) and utm_campaign[:100],
 		campaign_id=(campaign_id or None) and campaign_id[:50],
 		attribution_token=(attribution_token or None) and attribution_token[:200],
+		onboarding_completed=False,
 		created_at=now,
 		updated_at=now,
 	)

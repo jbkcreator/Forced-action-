@@ -17,6 +17,11 @@ After routing, the escalation row is persisted first; Slack post is attempted
 and tracked via posted_at / post_attempts. Failed posts are retried by
 src/tasks/human_close_retry.py (nightly, max 3 attempts).
 
+Every candidate here has already cleared the high-value bar (score >= 85 or
+the $397/hard_money_lenders value gate), so on initial routing a best-effort
+"whale alert" SMS also pages FOUNDER_PHONE directly — one per escalation row,
+no retry (the Slack post + retry sweep remains the durable record).
+
 To claim an escalation: POST /api/admin/human-close/{id}/outcome with your name
 as closer_assigned when setting the outcome.
 
@@ -60,6 +65,8 @@ MAX_CANDIDATES_PER_SWEEP = 10  # enforces top 1-2% intent cap
 # Value gate — route if vertical is explicitly high-value OR target tier price >= floor
 HIGH_VALUE_VERTICALS = frozenset({"hard_money_lenders"})
 HIGH_VALUE_PRICE_FLOOR_CENTS = 39700  # $397
+
+MAX_FOUNDER_SMS_CHARS = 300
 
 _PRICE_BY_TIER: dict = {
     s["name"]: (
@@ -318,6 +325,43 @@ def route_to_slack(candidate: HumanCloseCandidate, context: dict) -> Tuple[bool,
         return False, str(exc)
 
 
+def send_founder_sms(db: Session, candidate: HumanCloseCandidate, context: dict) -> bool:
+    """Best-effort direct SMS to the founder for a whale-tier escalation.
+    No retry — the Slack post (with its own retry sweep) is the durable
+    record; this is just the fast personal heads-up so a whale can be
+    closed personally instead of waiting on the team channel."""
+    phone = settings.founder_phone
+    if not phone:
+        logger.info("human_close: FOUNDER_PHONE not set — skipping whale SMS")
+        return False
+
+    from src.services.sms_compliance import send_sms
+
+    body = (
+        f"Whale alert: {context['name']} (score {context['revenue_signal_score']}/100, "
+        f"{context.get('vertical') or context['target_tier']}). {context.get('dashboard_url') or ''}"
+    )[:MAX_FOUNDER_SMS_CHARS]
+
+    try:
+        sent = send_sms(
+            to=phone,
+            body=body,
+            db=db,
+            message_type="transactional",
+            subscriber_id=candidate.subscriber_id,
+            task_type="human_close_whale_alert",
+            campaign="whale_alert",
+        )
+        if sent:
+            logger.info("human_close: whale SMS sent for sub=%s", candidate.subscriber_id)
+        else:
+            logger.info("human_close: whale SMS suppressed for sub=%s (compliance gate)", candidate.subscriber_id)
+        return bool(sent)
+    except Exception as exc:
+        logger.error("human_close: whale SMS failed for sub=%s: %s", candidate.subscriber_id, exc)
+        return False
+
+
 def record_escalation(
     db: Session,
     candidate: HumanCloseCandidate,
@@ -353,6 +397,7 @@ def route_candidate(db: Session, candidate: HumanCloseCandidate) -> bool:
     """Full routing pipeline for one candidate. Returns True if Slack post succeeded."""
     context = build_context(db, candidate)
     esc = record_escalation(db, candidate, context)
+    send_founder_sms(db, candidate, context)
     success, error_msg = route_to_slack(candidate, context)
     now = datetime.now(timezone.utc)
     esc.post_attempts = (esc.post_attempts or 0) + 1

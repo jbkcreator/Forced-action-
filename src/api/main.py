@@ -38,7 +38,7 @@ from src.core.database import get_db_context
 from src.core.models import ConsentAcceptance, FoundingSubscriberCount, ZipTerritory, Subscriber, Property, DistressScore, Incident, LeadPackPurchase, ScraperRunStats, EnrichedContact, Owner, SentLead, WaitlistEntry, SmsOptIn, ExpansionCandidate, County, LeadExclusivity
 from src.agents.events.ingestion import publish_cora_event
 from src.services.stripe_webhooks import handle_webhook
-from src.services.stripe_service import get_price_id_for_checkout, _price_ids
+from src.services.stripe_service import get_price_id_for_checkout, get_price_id_for_preview, _price_ids
 from src.services import lead_exclusivity
 from config.settings import get_settings
 from config.scoring import VERTICAL_WEIGHTS, for_county
@@ -1867,6 +1867,9 @@ def event_feed(
                 "wallet_to_lock_eligible": False,
                 "wallet_credits_30d": None,
                 "flash_scarcity_windows": [],
+                "onboarding_completed": subscriber.onboarding_completed,
+                "preferred_property_type": subscriber.preferred_property_type,
+                "investment_budget_band": subscriber.investment_budget_band,
                 **_accelerated_wallet_offer_fields(subscriber, db),
                 **_auto_mode_entitlement_fields(subscriber, db),
                 **_payment_recovery_fields(subscriber),
@@ -2069,6 +2072,9 @@ def event_feed(
                 "wallet_to_lock_eligible": _w2l_eligible_nz,
                 "wallet_credits_30d": _wallet_credits_30d_nz,
                 "flash_scarcity_windows": _flash_windows_nz,
+                "onboarding_completed": subscriber.onboarding_completed,
+                "preferred_property_type": subscriber.preferred_property_type,
+                "investment_budget_band": subscriber.investment_budget_band,
                 **_accelerated_wallet_offer_fields(subscriber, db),
                 **_auto_mode_entitlement_fields(subscriber, db),
                 **_payment_recovery_fields(subscriber),
@@ -2344,6 +2350,9 @@ def event_feed(
             "wallet_to_lock_eligible": _w2l_eligible,
             "wallet_credits_30d": _wallet_credits_30d,
             "flash_scarcity_windows": _flash_windows,
+            "onboarding_completed": subscriber.onboarding_completed,
+            "preferred_property_type": subscriber.preferred_property_type,
+            "investment_budget_band": subscriber.investment_budget_band,
             **_accelerated_wallet_offer_fields(subscriber, db),
             **_payment_recovery_fields(subscriber),
             **_what_you_missed_fields(
@@ -3390,6 +3399,55 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, request: Request, db: S
         "publishable_key":  _s.active_stripe_publishable_key,
         "amount":           amount,
         "currency":         currency,
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /api/upsell/subscription-offer — checkout-time subscription upsell
+# ---------------------------------------------------------------------------
+# Read-only pricing lookup for the "subscribe instead of a one-time Lead Pack"
+# interstitial. Only free-tier subscribers are eligible; accepting re-enters
+# the existing /api/checkout flow unchanged (which already upgrades a
+# pre-provisioned free row in place — see stripe_webhooks._on_checkout_completed).
+
+@app.get("/api/upsell/subscription-offer")
+def subscription_upsell_offer(feed_uuid: str, db: Session = Depends(get_db)):
+    _s = get_settings()
+
+    subscriber = db.execute(
+        select(Subscriber).where(Subscriber.event_feed_uuid == feed_uuid)
+    ).scalar_one_or_none()
+
+    if not subscriber or subscriber.tier != "free":
+        return {"eligible": False}
+
+    try:
+        price_id, is_founding = get_price_id_for_preview(
+            db, "starter", subscriber.vertical, subscriber.county_id
+        )
+    except ValueError:
+        return {"eligible": False}
+
+    if not price_id or not _s.active_stripe_secret_key:
+        return {"eligible": False}
+
+    stripe.api_key = _s.active_stripe_secret_key.get_secret_value()
+    try:
+        price = stripe.Price.retrieve(price_id)
+    except stripe.StripeError as exc:
+        logger.error("Stripe error retrieving starter price for upsell offer: %s", exc)
+        return {"eligible": False}
+
+    return {
+        "eligible":         True,
+        "tier":             "starter",
+        "is_founding":      is_founding,
+        "amount":           price["unit_amount"],
+        "currency":         price["currency"],
+        # Price is a snapshot of the current founding count, NOT a reservation.
+        # The actual charge is determined atomically at /api/checkout.
+        # The front-end should treat this as indicative, not guaranteed.
+        "price_guaranteed": False,
     }
 
 
@@ -4792,6 +4850,26 @@ def upgrade(req: UpgradeRequest, db: Session = Depends(get_db)):
     new_price_id = settings.active_stripe_price(price_name)
     if not new_price_id:
         raise HTTPException(status_code=503, detail=f"Stripe price not configured for {req.tier}")
+
+    # Settle every guarantee cycle that already closed on the outgoing tier —
+    # otherwise switching sub.tier off starter/pro/dominator drops it from
+    # the daily sweep's tier filter and any closed cycle is never evaluated.
+    # evaluate_subscriber_guarantee() only advances one cycle per call, so a
+    # subscriber sitting on a backlog of several closed cycles (sweep
+    # downtime, or guarantees just enabled for an existing subscriber) needs
+    # it called until no cycle is left to settle, not just once.
+    from config.guarantees import TIER_LEAD_QUOTAS
+    from src.tasks.guarantee_shortfall_sweep import evaluate_subscriber_guarantee
+    if sub.tier in TIER_LEAD_QUOTAS:
+        try:
+            for _ in range(60):  # safety cap — one iteration per closed cycle
+                if evaluate_subscriber_guarantee(db, sub) is None:
+                    break
+        except Exception:
+            logger.error(
+                "[Upgrade] guarantee settlement failed for sub=%d tier=%s", sub.id, sub.tier,
+                exc_info=True,
+            )
 
     try:
         switch_subscription_plan(sub.stripe_subscription_id, new_price_id, prorate=True)

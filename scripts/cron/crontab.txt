@@ -408,6 +408,14 @@ COUNTY_ID=hillsborough
 # Maps unsubscribe/hard-bounce to global suppression. Auto-completes exhausted campaigns.
 0 22 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.email_campaign_sync
 
+# ── NON-BUYER NURTURE ────────────────────────────────────────────────────────
+# Daily sweep — finds free-signup/checkout-abandon/waitlist non-buyers aged
+# 24h-90d, enrolls up to the daily cap into the shared Instantly campaign.
+# PROD BLOCKER: requires NON_BUYER_NURTURE_CAMPAIGN_ID on a warmed dedicated domain.
+30 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.non_buyer_nurture_sweep
+# Daily sync — pulls per-lead status, maps unsubscribe/bounce to terminal state.
+0 21 * * * $PROJECT/scripts/cron/run.sh src.tasks.non_buyer_nurture_sync
+
 # ── STAGE 5: BUNDLES + AUTOPILOT + ANNUAL ───────────────────────────────────
 # Bundle dispatcher — every hour, contextually offers Weekend / Storm /
 # ZIP Booster / Monthly Reload bundles to wallet subscribers (with A/B pricing)
@@ -678,5 +686,11 @@ COUNTY_ID=hillsborough
 # fallback for any owner_alert_dispatch row stuck at status='sms_sent' for
 # 5+ minutes with no Telnyx message.finalized delivery-status callback.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.owner_alert_sweep
+# Tiered volume guarantee shortfall sweep — INTENTIONALLY NOT scheduled yet.
+# config/guarantees.py TIER_LEAD_QUOTAS are placeholder lead-per-cycle counts
+# pending a business decision; enabling this cron would issue real Stripe
+# balance credits off unconfirmed numbers. Uncomment once TIER_LEAD_QUOTAS is
+# confirmed (and ideally after a --dry-run pass against production data).
+# 0 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.guarantee_shortfall_sweep
 
 # === END FORCED-ACTION-PLATFORM ===

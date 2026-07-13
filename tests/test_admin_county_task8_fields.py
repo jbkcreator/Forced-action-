@@ -66,3 +66,54 @@ def test_admin_can_set_testimonial_and_deadline_via_patch(client_with_db, auth_h
 
     assert body["landing_featured_testimonials"] == testimonials
     assert body["founding_price_deadline_at"] is not None
+
+
+def test_admin_can_set_testimonial_and_deadline_via_create(client_with_db, auth_headers):
+    client, db = client_with_db
+    county_id = _rand_county_id()
+    deadline = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
+    testimonials = [{"quote": "Closed two jobs in a week.", "name": "Sarah M."}]
+
+    resp = client.post(
+        "/api/admin/counties",
+        json={
+            "county_id": county_id,
+            "display_name": "Test County",
+            "landing_featured_testimonials": testimonials,
+            "founding_price_deadline_at": deadline,
+        },
+        headers=auth_headers,
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+
+    assert body["landing_featured_testimonials"] == testimonials
+    assert body["founding_price_deadline_at"] is not None
+
+
+def test_admin_can_clear_deadline_via_patch_null(client_with_db, auth_headers):
+    client, db = client_with_db
+    county_id = _rand_county_id()
+    resp = client.post(
+        "/api/admin/counties",
+        json={"county_id": county_id, "display_name": "Test County"},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 201, resp.text
+
+    deadline = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
+    resp = client.patch(
+        f"/api/admin/counties/{county_id}",
+        json={"founding_price_deadline_at": deadline},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["founding_price_deadline_at"] is not None
+
+    resp = client.patch(
+        f"/api/admin/counties/{county_id}",
+        json={"founding_price_deadline_at": None},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["founding_price_deadline_at"] is None

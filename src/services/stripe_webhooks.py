@@ -521,6 +521,16 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
             subscriber.founding_price_id  = founding_price_id
             subscriber.rate_locked_at     = now
 
+    # First paid conversion, matched by email — suppresses non-buyer nurture.
+    if customer_email:
+        try:
+            from src.services import non_buyer_nurture
+            non_buyer_nurture.mark_converted(db, customer_email)
+        except Exception:
+            logger.warning(
+                "non_buyer_nurture mark_converted failed for subscriber=%s", subscriber.id, exc_info=True,
+            )
+
     # ── Plan price + trial flags (fa048) ────────────────────────────────────
     # amount_total is in cents; represents the charge for this billing period.
     # For active (non-trial) subscriptions this equals the monthly plan price.
@@ -4040,10 +4050,13 @@ def _on_checkout_expired(session: dict, db: Session) -> None:
     Fires when a Stripe checkout session expires without payment.
     For hot_lead_unlock sessions opened by free-tier subscribers, publish
     abandonment_click_no_complete to Cora so the retention flow can trigger.
-    Subscription and lead-pack sessions are intentionally ignored here.
+    For every other expired session with a captured email, record it as a
+    non-buyer nurture candidate (source=checkout_abandon) — this is the only
+    capture point for abandoned-checkout leads (no Subscriber row exists yet).
     """
     meta = session.get("metadata") or {}
     if meta.get("product") != "hot_lead_unlock":
+        _record_nurture_candidate_for_expired_checkout(session, db)
         return
 
     stripe_customer_id = session.get("customer")
@@ -4075,6 +4088,18 @@ def _on_checkout_expired(session: dict, db: Session) -> None:
         logger.warning(
             "abandonment_click_no_complete publish failed: subscriber=%s", subscriber_id,
         )
+
+
+def _record_nurture_candidate_for_expired_checkout(session: dict, db: Session) -> None:
+    _raw_email = (session.get("customer_details") or {}).get("email") or session.get("customer_email") or ""
+    email = _raw_email.lower().strip()
+    if not email:
+        return
+    try:
+        from src.services import non_buyer_nurture
+        non_buyer_nurture.record_checkout_abandon_candidate(db, email)
+    except Exception:
+        logger.warning("non_buyer_nurture capture failed for expired checkout session %s", session.get("id"), exc_info=True)
 
 
 def _send_lead_pack_refund_email(
