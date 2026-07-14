@@ -5744,6 +5744,10 @@ class BankruptcyAlertSubscription(Base):
         ),
         Index("idx_bkalert_sub_status", "status"),
         Index("idx_bkalert_sub_email", "email"),
+        # Case-insensitive lookups — invite _already_subscribed() and the
+        # invite-conversion join both match on LOWER(email); the plain btree
+        # above can't serve those, this functional index can.
+        Index("idx_bkalert_sub_email_lower", text("lower(email)")),
     )
 
     def __repr__(self) -> str:
