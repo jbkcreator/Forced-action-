@@ -370,3 +370,88 @@ class TestSignupSourceAttribution:
         )
         fresh_db.flush()
         assert sub.signup_source == "missed_call"
+
+
+class TestAnnualTestArmSessionSafety:
+    """Regression: _record_annual_test_arm must not poison the caller's
+    session on failure. See PR #132 review — two concurrent /api/free-signup
+    calls for the same subscriber can race on ab_assignments' unique
+    constraint (test_id, subscriber_id); the resulting IntegrityError must be
+    absorbed by a begin_nested() savepoint, not just swallowed, or every
+    later DB op on that session (including the request's final commit) fails
+    with PendingRollbackError.
+
+    Deliberately does NOT use the `fresh_db` fixture: that fixture wraps
+    every test in its own session.begin_nested() for isolation, which would
+    itself act as the savepoint that absorbs the failure — masking the exact
+    bug this test exists to catch. Production's session_scope() (src/core/
+    database.py) has no such wrapper, just a flat transaction with commit()/
+    rollback() at the request boundary, so this test uses a bare session
+    against the same `pg_engine` to match that shape.
+    """
+
+    def test_survives_ab_bookkeeping_failure(self, pg_engine, monkeypatch):
+        import uuid
+        import pytest
+        from sqlalchemy import select
+        from sqlalchemy.orm import sessionmaker
+        from src.services.signup_engine import create_free_account_by_email, _record_annual_test_arm
+        from src.core.models import AbTest, AbAssignment, Subscriber
+
+        if pg_engine is None:
+            pytest.skip("DATABASE_URL not configured — skipping ORM test")
+
+        Session = sessionmaker(bind=pg_engine)
+        db = Session()
+        try:
+            # Use a throwaway test_name — the real annual_at_signup_v1 row
+            # already exists in this DB from actual usage, so reusing it here
+            # would collide.
+            test_name = f"annual_at_signup_v1_test_{uuid.uuid4().hex[:8]}"
+            test = AbTest(
+                test_name=test_name,
+                segment="new_signups",
+                variant_a={"path": "control"},
+                variant_b={"path": "annual_offer_shown"},
+                traffic_pct=100,
+                status="active",
+            )
+            db.add(test)
+            db.flush()
+
+            sub = create_free_account_by_email(
+                email=f"racecondition_{uuid.uuid4().hex[:8]}@example.com", db=db,
+            )
+            db.flush()
+
+            def _duplicate_insert_race(subscriber_id, test_name, arm, db):
+                # Simulates two concurrent requests both passing the "no
+                # existing assignment" check before either has committed.
+                db.add(AbAssignment(test_id=test.id, subscriber_id=subscriber_id, variant=arm))
+                db.flush()
+                db.add(AbAssignment(test_id=test.id, subscriber_id=subscriber_id, variant=arm))
+                db.flush()  # raises IntegrityError — unique (test_id, subscriber_id)
+
+            monkeypatch.setattr("src.services.ab_engine.ANNUAL_SIGNUP_TEST_NAME", test_name)
+            monkeypatch.setattr("src.services.ab_engine.ensure_annual_signup_test", lambda db: test)
+            monkeypatch.setattr("src.services.ab_engine.record_pregenerated_arm", _duplicate_insert_race)
+
+            # Must not raise...
+            _record_annual_test_arm(sub, "variant", db)
+
+            # ...and the session must still be usable afterward — this is
+            # what the rest of free_signup() (consent_acceptance handling)
+            # and session_scope()'s final commit both need. A plain query is
+            # the discriminator here: without begin_nested() wrapping the
+            # call, the swallowed IntegrityError leaves the whole
+            # (savepoint-less) transaction aborted, and this SELECT raises
+            # sqlalchemy.exc.PendingRollbackError (verified against psycopg2 —
+            # a bare db.flush() with no new SQL to emit does NOT surface this,
+            # so it isn't a valid check here; a query or commit is required).
+            reloaded = db.execute(
+                select(Subscriber).where(Subscriber.id == sub.id)
+            ).scalar_one_or_none()
+            assert reloaded is not None
+        finally:
+            db.rollback()
+            db.close()

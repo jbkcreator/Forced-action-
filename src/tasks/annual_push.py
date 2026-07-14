@@ -366,8 +366,9 @@ def switch_to_annual(subscriber_id: int, db: Session) -> bool:
         # toward control's conversion rate so variant-vs-control lift is
         # measurable end-to-end, not just for subscribers who saw it early.
         try:
-            from src.services.ab_engine import ANNUAL_SIGNUP_TEST_NAME, record_outcome
-            record_outcome(subscriber_id, ANNUAL_SIGNUP_TEST_NAME, "converted", db)
+            with db.begin_nested():
+                from src.services.ab_engine import ANNUAL_SIGNUP_TEST_NAME, record_outcome
+                record_outcome(subscriber_id, ANNUAL_SIGNUP_TEST_NAME, "converted", db)
         except Exception as exc:
             logger.warning(
                 "[AnnualAtSignup] A/B record_outcome failed for subscriber=%d: %s",

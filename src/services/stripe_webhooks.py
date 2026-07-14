@@ -977,8 +977,9 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
     # bucketed into at signup (see record_pregenerated_arm in signup_engine).
     if tier == "annual_lock":
         try:
-            from src.services.ab_engine import ANNUAL_SIGNUP_TEST_NAME, record_outcome
-            record_outcome(subscriber.id, ANNUAL_SIGNUP_TEST_NAME, "converted", db)
+            with db.begin_nested():
+                from src.services.ab_engine import ANNUAL_SIGNUP_TEST_NAME, record_outcome
+                record_outcome(subscriber.id, ANNUAL_SIGNUP_TEST_NAME, "converted", db)
         except Exception:
             logger.warning(
                 "[AnnualAtSignup] A/B record_outcome failed for subscriber=%s",

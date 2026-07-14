@@ -212,15 +212,19 @@ def _normalize_phone(raw: Optional[str]) -> Optional[str]:
 def _record_annual_test_arm(sub: Subscriber, annual_test_arm: Optional[str], db: Session) -> None:
 	"""Best-effort: persist the annual-at-signup A/B arm against this
 	subscriber. Never blocks signup — a failure here just means that one
-	subscriber is missing from the experiment's numbers."""
+	subscriber is missing from the experiment's numbers. Wrapped in
+	begin_nested() so a race-condition IntegrityError (e.g. two concurrent
+	signups hitting ab_assignments' unique constraint) only rolls back this
+	savepoint, not the caller's whole transaction."""
 	if not annual_test_arm:
 		return
 	try:
-		from src.services.ab_engine import (
-			ANNUAL_SIGNUP_TEST_NAME, ensure_annual_signup_test, record_pregenerated_arm,
-		)
-		ensure_annual_signup_test(db)
-		record_pregenerated_arm(sub.id, ANNUAL_SIGNUP_TEST_NAME, annual_test_arm, db)
+		with db.begin_nested():
+			from src.services.ab_engine import (
+				ANNUAL_SIGNUP_TEST_NAME, ensure_annual_signup_test, record_pregenerated_arm,
+			)
+			ensure_annual_signup_test(db)
+			record_pregenerated_arm(sub.id, ANNUAL_SIGNUP_TEST_NAME, annual_test_arm, db)
 	except Exception:
 		logger.warning("annual_at_signup_v1 arm recording failed for subscriber %d", sub.id, exc_info=True)
 
