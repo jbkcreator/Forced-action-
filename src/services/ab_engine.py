@@ -283,6 +283,65 @@ def rollback_rollout(test_name: str, db: Session) -> None:
     db.flush()
 
 
+def holdout_verdict(
+    test_name: str,
+    db: Session,
+    *,
+    window_hours: int = 168,
+    min_per_arm: int = 30,
+) -> dict:
+    """Positive-direction verdict for a control-holdout rollout test (ADR 0031/Task 4.1).
+
+    Mirrors should_rollback_rollout's z-test shape but asks the opposite
+    question: does 'variant' beat 'control' by >2σ? Never mutates the test —
+    pure read, called by a scheduled surfacing job, not by any promotion path
+    (promotion stays human-adopted via cora_playbook, per fa036).
+    """
+    test = db.execute(
+        select(AbTest).where(AbTest.test_name == test_name, AbTest.status == "active")
+    ).scalar_one_or_none()
+    if not test:
+        return {"status": "no_test"}
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
+    assignments = db.execute(
+        select(AbAssignment).where(
+            AbAssignment.test_id == test.id,
+            AbAssignment.created_at >= cutoff,
+        )
+    ).scalars().all()
+
+    ctrl = [a for a in assignments if a.variant == "control"]
+    var = [a for a in assignments if a.variant == "variant"]
+    n_ctrl, n_var = len(ctrl), len(var)
+
+    if n_ctrl < min_per_arm or n_var < min_per_arm:
+        return {"status": "insufficient_data", "n_ctrl": n_ctrl, "n_var": n_var, "needed": min_per_arm}
+
+    ctrl_conv = sum(1 for a in ctrl if a.outcome == "converted")
+    var_conv = sum(1 for a in var if a.outcome == "converted")
+    p_ctrl = ctrl_conv / n_ctrl
+    p_var = var_conv / n_var
+    p_pool = (ctrl_conv + var_conv) / (n_ctrl + n_var)
+
+    base = {
+        "n_ctrl": n_ctrl, "n_var": n_var,
+        "control_rate_pct": round(p_ctrl * 100, 2),
+        "variant_rate_pct": round(p_var * 100, 2),
+    }
+
+    if p_pool in (0.0, 1.0):
+        return {**base, "status": "not_significant", "z_score": 0.0}
+
+    se = math.sqrt(p_pool * (1 - p_pool) * (1 / n_ctrl + 1 / n_var))
+    if se == 0:
+        return {**base, "status": "not_significant", "z_score": 0.0}
+
+    z = (p_var - p_ctrl) / se
+    status = "proven" if z > 2.0 else "not_significant"
+    return {**base, "status": status, "z_score": round(z, 3)}
+
+
 def record_outcome(subscriber_id: int, test_name: str, outcome: str, db: Session) -> None:
     test = db.execute(
         select(AbTest).where(AbTest.test_name == test_name)

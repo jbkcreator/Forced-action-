@@ -35,6 +35,7 @@ import yaml
 
 _PROMPTS_ROOT = Path(__file__).resolve().parent
 _AB_CONFIG_PATH = Path(__file__).resolve().parents[3] / "config" / "cora_ab_tests.yaml"
+_HOLDOUT_CONFIG_PATH = Path(__file__).resolve().parents[3] / "config" / "cora_holdout_tests.yaml"
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +115,41 @@ def render_fallback_body(graph: str, context: Dict[str, Any]) -> str:
 # Variant + traffic-split support
 # ─────────────────────────────────────────────────────────────────────────────
 
+@lru_cache(maxsize=1)
+def _load_holdout_config() -> Dict[str, Any]:
+	"""Parse config/cora_holdout_tests.yaml once and cache for the process lifetime."""
+	if not _HOLDOUT_CONFIG_PATH.exists():
+		return {}
+	try:
+		return yaml.safe_load(_HOLDOUT_CONFIG_PATH.read_text(encoding="utf-8")) or {}
+	except Exception as exc:
+		logger.warning("Could not parse cora_holdout_tests.yaml: %s", exc)
+		return {}
+
+
+def get_holdout_config(graph: str) -> Optional[Dict[str, Any]]:
+	"""
+	Return the enabled control-holdout config for the given graph, or None.
+
+	Shape returned (when present):
+	    {
+	      "test_name":  "wallet_push_holdout",
+	      "graph":      "accelerated_wallet_push",
+	      "enabled":    True,
+	      "control_pct": 10,
+	      "segment":    "all",
+	    }
+	"""
+	cfg = _load_holdout_config()
+	for test_name, entry in cfg.items():
+		if not isinstance(entry, dict):
+			continue
+		if entry.get("graph") != graph or not entry.get("enabled"):
+			continue
+		return {"test_name": test_name, **entry}
+	return None
+
+
 def get_traffic_config(graph: str) -> Optional[Dict[str, Any]]:
 	"""
 	Return the enabled A/B test config for the given graph, or None if no
@@ -182,12 +218,52 @@ def render_for_subscriber(
 	  - The subscriber falls outside the traffic_pct sample
 	  - The variant file is missing (logs a warning)
 
+	Frozen control-holdout gate (Task 4.1 — 10% control group): if a holdout
+	test is configured+enabled for this graph (config/cora_holdout_tests.yaml),
+	the subscriber is first assigned a rollout arm via
+	ab_engine.assign_rollout_arm (records BOTH arms, so control's conversion
+	rate becomes measurable). The 'control' arm always gets this frozen base
+	prompt and returns immediately — it never reaches a/b assignment below,
+	which is the isolation the holdout exists to guarantee. Every other case
+	(no holdout configured, or the subscriber landed in 'variant') falls
+	through unchanged to the a/b logic. The holdout's own test_name is a
+	well-known constant that conversion sites pass to
+	ab_engine.record_outcome directly — it never needs threading through
+	message state, so this gate doesn't change the return shape.
+
 	Returns: (system_rendered, user_rendered, variant, test_name)
 	         `variant`   is "a" / "b" / None.
 	         `test_name` is the test name when a test is active for this graph,
 	                      regardless of whether THIS subscriber landed in it
 	                      (useful for attribution / dashboards). None otherwise.
 	"""
+	holdout_cfg = get_holdout_config(graph)
+	if holdout_cfg:
+		try:
+			from src.services.ab_engine import assign_rollout_arm, get_or_create_test
+
+			holdout_test_name = holdout_cfg["test_name"]
+			control_pct = int(holdout_cfg.get("control_pct", 10))
+			get_or_create_test(
+				test_name=holdout_test_name,
+				segment=holdout_cfg.get("segment", "all"),
+				variant_a={"path": "control"},
+				variant_b={"path": "variant"},
+				traffic_pct=100 - control_pct,
+				db=db,
+			)
+			holdout_arm = assign_rollout_arm(subscriber_id, holdout_test_name, db)
+		except Exception as exc:
+			logger.warning(
+				"holdout arm assignment failed for graph=%s sub=%s: %s",
+				graph, subscriber_id, exc,
+			)
+			holdout_arm = None
+
+		if holdout_arm == "control":
+			sys_txt, usr_txt = render_system_and_user(graph, context)
+			return sys_txt, usr_txt, None, None
+
 	cfg = get_traffic_config(graph)
 	if not cfg:
 		sys_txt, usr_txt = render_system_and_user(graph, context)

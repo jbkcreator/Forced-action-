@@ -1,0 +1,25 @@
+# Frozen 10% control holdout registry — Task 4.1 / spec 4.1.
+#
+# Distinct from cora_ab_tests.yaml: an a/b test optimizes copy AMONG variants;
+# a holdout test proves the winning copy beats a NEVER-mutated baseline
+# (the graph's base system.yaml prompt). Reuses ab_engine.assign_rollout_arm,
+# which records BOTH arms so a control conversion rate is measurable.
+#
+# Schema per entry:
+#   graph          required — which graph this holdout attaches to
+#   enabled        required — global on/off switch
+#   control_pct    required — % of eligible subscribers held back to the
+#                              frozen baseline (the rest fall through to
+#                              whatever copy the graph would normally render —
+#                              base prompt or an active a/b variant).
+#   segment        optional — subscriber segment filter ("all" by default)
+#
+# NOTE: assign_rollout_arm's traffic_pct means "% in the 'variant' arm", the
+# INVERSE of control_pct. The loader computes traffic_pct = 100 - control_pct
+# at the one wiring point — this file always expresses intent as control_pct.
+
+wallet_push_holdout:
+  graph:       accelerated_wallet_push
+  enabled:     true
+  control_pct: 10
+  segment:     all

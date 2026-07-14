@@ -155,3 +155,111 @@ class TestAbEngineIntegration:
 
         result = record_pregenerated_arm(1, f"nonexistent_{uuid.uuid4().hex[:8]}", "variant", fresh_db)
         assert result is None
+
+
+class TestHoldoutVerdict:
+    def test_no_test_returns_no_test_status(self, fresh_db):
+        from src.services.ab_engine import holdout_verdict
+
+        result = holdout_verdict(f"nonexistent_holdout_{uuid.uuid4().hex[:8]}", fresh_db)
+        assert result["status"] == "no_test"
+
+    def test_insufficient_data_below_min_per_arm(self, fresh_db):
+        from src.services.ab_engine import assign_rollout_arm, holdout_verdict
+        from src.core.models import Subscriber
+
+        test_name = f"holdout_{uuid.uuid4().hex[:8]}"
+        fresh_db.add(AbTest(
+            test_name=test_name, segment="all",
+            variant_a={"path": "control"}, variant_b={"path": "variant"},
+            traffic_pct=90, status="active",
+        ))
+        fresh_db.flush()
+
+        # Only 5 assignments total — nowhere near min_per_arm=30 default.
+        for i in range(5):
+            uid = uuid.uuid4().hex[:8]
+            sub = Subscriber(
+                stripe_customer_id=f"cus_hv_{uid}", tier="starter", vertical="roofing",
+                county_id="hillsborough", event_feed_uuid=f"hv-uuid-{uid}",
+            )
+            fresh_db.add(sub)
+            fresh_db.flush()
+            assign_rollout_arm(sub.id, test_name, fresh_db)
+
+        result = holdout_verdict(test_name, fresh_db)
+        assert result["status"] == "insufficient_data"
+
+    def test_proven_when_variant_beats_control_significantly(self, fresh_db):
+        """40 control @ 5% conv vs 40 variant @ 40% conv — clear, well-powered win."""
+        from src.services.ab_engine import record_outcome, holdout_verdict
+        from src.core.models import Subscriber, AbAssignment
+
+        test_name = f"holdout_{uuid.uuid4().hex[:8]}"
+        test = AbTest(
+            test_name=test_name, segment="all",
+            variant_a={"path": "control"}, variant_b={"path": "variant"},
+            traffic_pct=90, status="active",
+        )
+        fresh_db.add(test)
+        fresh_db.flush()
+
+        def _seed(arm: str, n: int, n_converted: int):
+            for i in range(n):
+                uid = uuid.uuid4().hex[:8]
+                sub = Subscriber(
+                    stripe_customer_id=f"cus_hv_{uid}", tier="starter", vertical="roofing",
+                    county_id="hillsborough", event_feed_uuid=f"hv-uuid-{uid}",
+                )
+                fresh_db.add(sub)
+                fresh_db.flush()
+                assignment = AbAssignment(
+                    test_id=test.id, subscriber_id=sub.id, variant=arm,
+                    outcome="converted" if i < n_converted else None,
+                )
+                fresh_db.add(assignment)
+            fresh_db.flush()
+
+        _seed("control", 40, 2)   # 5%
+        _seed("variant", 40, 16)  # 40%
+
+        result = holdout_verdict(test_name, fresh_db)
+        assert result["status"] == "proven"
+        assert result["z_score"] > 2.0
+        assert result["control_rate_pct"] == pytest.approx(5.0, abs=0.1)
+        assert result["variant_rate_pct"] == pytest.approx(40.0, abs=0.1)
+
+    def test_not_significant_when_rates_close(self, fresh_db):
+        """40 control @ 30% vs 40 variant @ 32% — well-powered but no real gap."""
+        from src.services.ab_engine import holdout_verdict
+        from src.core.models import Subscriber, AbAssignment
+
+        test_name = f"holdout_{uuid.uuid4().hex[:8]}"
+        test = AbTest(
+            test_name=test_name, segment="all",
+            variant_a={"path": "control"}, variant_b={"path": "variant"},
+            traffic_pct=90, status="active",
+        )
+        fresh_db.add(test)
+        fresh_db.flush()
+
+        def _seed(arm: str, n: int, n_converted: int):
+            for i in range(n):
+                uid = uuid.uuid4().hex[:8]
+                sub = Subscriber(
+                    stripe_customer_id=f"cus_hv_{uid}", tier="starter", vertical="roofing",
+                    county_id="hillsborough", event_feed_uuid=f"hv-uuid-{uid}",
+                )
+                fresh_db.add(sub)
+                fresh_db.flush()
+                fresh_db.add(AbAssignment(
+                    test_id=test.id, subscriber_id=sub.id, variant=arm,
+                    outcome="converted" if i < n_converted else None,
+                ))
+            fresh_db.flush()
+
+        _seed("control", 40, 12)  # 30%
+        _seed("variant", 40, 13)  # 32.5%
+
+        result = holdout_verdict(test_name, fresh_db)
+        assert result["status"] == "not_significant"

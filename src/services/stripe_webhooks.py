@@ -3275,6 +3275,17 @@ def _on_wallet_subscription_invoice(invoice: dict, db: Session) -> None:
     except Exception:
         logger.warning("Attribution recording failed sub=%s", subscriber_id, exc_info=True)
 
+    # Task 4.1 frozen control holdout — wallet activation is the conversion
+    # event for the accelerated_wallet_push sequence. Test name must match
+    # the `test_name` key in config/cora_holdout_tests.yaml. No-op (via
+    # record_outcome's own not-found guard) for subscribers who were never
+    # assigned an arm — i.e. before the holdout existed, or holdout disabled.
+    try:
+        from src.services.ab_engine import record_outcome
+        record_outcome(subscriber_id, "wallet_push_holdout", "converted", db)
+    except Exception as exc:
+        logger.warning("[WalletSub] holdout record_outcome failed sub=%s: %s", subscriber_id, exc)
+
 
 def _on_wallet_subscription_invoice_failed(invoice: dict, db: Session) -> None:
     """Mark a wallet_push_offers row as 'failed' when the first invoice fails.
