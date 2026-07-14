@@ -110,7 +110,9 @@ COUNTY_ID=hillsborough
 # (>=5 answers, 0 paid signups) and expands winners (LLM variations, pool cap 30,
 # replace-worst). Weekly to match the one-keyword/day scrape throughput. Runs
 # clear of the 04:00–08:00 scrape/CDS/skip-trace/GHL chain. See docs/adr/0021.
-0 9 * * 0 $PROJECT/scripts/cron/run.sh src.tasks.autonomous_tuning_worker
+# DISABLED alongside quora_s6_orchestrator — this loop only scores/expands
+# Quora Seed Keywords, which stop moving once the scraper feeding them is off.
+#0 9 * * 0 $PROJECT/scripts/cron/run.sh src.tasks.autonomous_tuning_worker
 
 # ── PINELLAS DAILY ────────────────────────────────────────────
 # Staggered +5 min after their Hillsborough counterparts within 04:00–06:30 UTC window.
