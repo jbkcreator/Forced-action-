@@ -11,6 +11,8 @@ import json
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from src.core.models import LaneFeeConfigAudit
+
 logger = logging.getLogger(__name__)
 
 SOURCE_COMPONENT = "loan_lane"
@@ -388,9 +390,10 @@ RESPA_FEE_GATE_WARNING = (
 def set_fee_config_flag(session: Session, lane_id: str, enabled: bool, actor: str) -> dict:
     """Flip the lane's RESPA fee gate (fee_config_flag).
 
-    Deliberately loud: every call — including no-op flips — logs a WARNING with
-    actor and old→new state so there is a durable record of who surfaced fee
-    dollars on which lane. Does not commit; caller owns the transaction.
+    Deliberately loud: every call — including no-op flips — logs a WARNING and
+    writes a row to lane_fee_config_audit (actor, old->new state) so there is a
+    durable, queryable record of who surfaced fee dollars on which lane. Does
+    not commit; caller owns the transaction.
     """
     row = session.execute(
         text("SELECT fee_config_flag FROM lanes WHERE lane_id = CAST(:lid AS uuid) FOR UPDATE"),
@@ -410,6 +413,13 @@ def set_fee_config_flag(session: Session, lane_id: str, enabled: bool, actor: st
             """),
             {"lane_id": str(lane_id), "enabled": enabled},
         )
+
+    session.add(LaneFeeConfigAudit(
+        lane_id=lane_id,
+        previous_enabled=previous,
+        new_enabled=enabled,
+        actor=actor,
+    ))
 
     logger.warning(
         "[respa-fee-gate] fee_config_flag %s -> %s on lane %s by %s",

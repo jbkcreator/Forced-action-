@@ -38,6 +38,14 @@ def _flag(session, lane_id: str) -> bool:
     ).scalar())
 
 
+def _audit_rows(session, lane_id: str) -> list:
+    return session.execute(
+        text("""SELECT previous_enabled, new_enabled, actor FROM lane_fee_config_audit
+                WHERE lane_id = CAST(:l AS uuid) ORDER BY occurred_at"""),
+        {"l": lane_id},
+    ).fetchall()
+
+
 @pytest.fixture
 def client(fresh_db):
     from fastapi.testclient import TestClient
@@ -78,6 +86,12 @@ def test_enable_with_ack_flips_flag(fresh_db, client):
     assert "RESPA" in body["respa_warning"]
     assert _flag(fresh_db, lane_id) is True
 
+    rows = _audit_rows(fresh_db, lane_id)
+    assert len(rows) == 1
+    assert rows[0].previous_enabled is False
+    assert rows[0].new_enabled is True
+    assert rows[0].actor == "admin:test-admin"
+
 
 def test_disable_needs_no_ack(fresh_db, client):
     lane_id = _lane(fresh_db, _property(fresh_db))
@@ -91,6 +105,19 @@ def test_disable_needs_no_ack(fresh_db, client):
     assert resp.status_code == 200
     assert resp.json()["previous"] is True
     assert _flag(fresh_db, lane_id) is False
+
+    rows = _audit_rows(fresh_db, lane_id)
+    assert len(rows) == 1
+    assert rows[0].previous_enabled is True
+    assert rows[0].new_enabled is False
+
+
+def test_enable_without_ack_writes_no_audit_row(fresh_db, client):
+    lane_id = _lane(fresh_db, _property(fresh_db))
+
+    client.post(f"/api/admin/lanes/{lane_id}/fee-config", json={"enabled": True})
+
+    assert _audit_rows(fresh_db, lane_id) == []
 
 
 def test_unknown_lane_404(client):
