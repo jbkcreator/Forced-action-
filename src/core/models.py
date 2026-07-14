@@ -4995,7 +4995,10 @@ class NonBuyerNurtureSequence(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "status IN ('eligible','enrolled','converted','unsubscribed','bounced','removed')",
+            # 'in_recovery' — held out of nurture while an active checkout-recovery
+            # sequence (Task 7) owns the contact; released back to 'eligible' when
+            # recovery fails. Non-'eligible' → excluded by find_candidates.
+            "status IN ('eligible','in_recovery','enrolled','converted','unsubscribed','bounced','removed')",
             name="ck_non_buyer_nurture_status",
         ),
         CheckConstraint(
@@ -5011,6 +5014,58 @@ class NonBuyerNurtureSequence(Base):
 
     def __repr__(self) -> str:
         return f"<NonBuyerNurtureSequence(id={self.id}, email={self.email}, status={self.status})>"
+
+
+class CheckoutRecovery(Base):
+    """
+    Abandoned-checkout recovery sequence — one row per email (Task 7).
+
+    Covers two drop-off paths: a Stripe checkout session that expired without
+    payment (`session_expired`), and a buyer who provisioned a pre-checkout
+    intent but never paid (`pre_payment`). A fast, high-intent "finish your
+    purchase" sequence — distinct from the slower non-buyer nurture drip. While
+    a row is `active`, the sibling non_buyer_nurture row is held at
+    `in_recovery` so the two flows never double-contact the same person; on
+    `failed` the nurture row is released to `eligible`.
+    """
+    __tablename__ = "checkout_recovery"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    email: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    subscriber_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("subscribers.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    phone: Mapped[Optional[str]] = mapped_column(String(20))
+    source: Mapped[str] = mapped_column(String(20), nullable=False)  # session_expired | pre_payment | lead_pack
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="active", server_default="active", index=True
+    )  # active | recovered | failed
+    touches_sent: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    # Context needed to mint a FRESH resume-checkout link — the expired Stripe
+    # session can't be reused, so recovery rebuilds checkout from these.
+    resume_context: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    first_touch_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_touch_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True)
+    closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('active','recovered','failed')",
+            name="ck_checkout_recovery_status",
+        ),
+        CheckConstraint(
+            "source IN ('session_expired','pre_payment','lead_pack')",
+            name="ck_checkout_recovery_source",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return f"<CheckoutRecovery(id={self.id}, email={self.email}, status={self.status}, touches={self.touches_sent})>"
 
 
 class GoldPlusZipSnapshot(Base):
