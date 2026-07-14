@@ -9,6 +9,7 @@ Routes:
   PATCH /api/lanes/{lane_id}/lender             — broker: set funding lender
   GET  /api/lane-stage-config                   — broker: stage config for dropdown
   POST /api/admin/lanes/{lane_id}/assign-broker — admin: initial broker assignment (unassigned only)
+  POST /api/admin/lanes/{lane_id}/fee-config    — admin: flip the RESPA fee gate (fee_config_flag)
 """
 from __future__ import annotations
 
@@ -327,6 +328,44 @@ def assign_broker_initial(
         raise HTTPException(status_code=409, detail="Lane is already assigned or not available.")
 
     return {"lane_id": lane_id, "assigned_broker_id": body.broker_id}
+
+
+# ---------------------------------------------------------------------------
+# Admin: POST /api/admin/lanes/{lane_id}/fee-config (RESPA fee gate)
+# ---------------------------------------------------------------------------
+
+class _FeeConfigRequest(BaseModel):
+    enabled: bool
+    acknowledge_respa: bool = False
+
+
+@router.post("/api/admin/lanes/{lane_id}/fee-config")
+def set_fee_config(
+    lane_id: str,
+    body: _FeeConfigRequest,
+    db: Session = Depends(get_db),
+    admin: dict = Depends(get_current_admin),
+):
+    """Flip the lane's RESPA fee gate — surfaces/hides commission dollar amounts.
+
+    Enabling requires `acknowledge_respa: true` (422 otherwise): fees must not
+    be surfaced without written counsel sign-off that the deal is RESPA-exempt.
+    Per-lane only — there is intentionally no bulk/global enable. Every flip is
+    WARNING-logged with the acting admin.
+    """
+    from src.services.loan_lane_service import RESPA_FEE_GATE_WARNING, set_fee_config_flag
+
+    if body.enabled and not body.acknowledge_respa:
+        raise HTTPException(status_code=422, detail=RESPA_FEE_GATE_WARNING)
+
+    actor = f"admin:{admin.get('sub', 'unknown')}"
+    try:
+        result = set_fee_config_flag(db, lane_id, body.enabled, actor=actor)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Lane not found.")
+    db.commit()
+
+    return {**result, "respa_warning": RESPA_FEE_GATE_WARNING}
 
 
 # ---------------------------------------------------------------------------

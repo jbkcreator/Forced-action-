@@ -7470,6 +7470,27 @@ class BrokerTransition(Base):
     )
 
 
+class LaneFeeConfigAudit(Base):
+    """Append-only audit log for every fee_config_flag flip (RESPA gate) on a lane."""
+
+    __tablename__ = "lane_fee_config_audit"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    lane_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("lanes.lane_id"), nullable=False
+    )
+    previous_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    new_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    actor: Mapped[str] = mapped_column(String(255), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("idx_lfca_lane_occurred", "lane_id", "occurred_at"),
+    )
+
+
 class CommissionSplit(Base):
     """Config-as-data commission allocation. `parties` is a list of {party, pct}."""
 
