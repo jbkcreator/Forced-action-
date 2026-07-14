@@ -209,6 +209,22 @@ def _normalize_phone(raw: Optional[str]) -> Optional[str]:
 	return None
 
 
+def _record_annual_test_arm(sub: Subscriber, annual_test_arm: Optional[str], db: Session) -> None:
+	"""Best-effort: persist the annual-at-signup A/B arm against this
+	subscriber. Never blocks signup — a failure here just means that one
+	subscriber is missing from the experiment's numbers."""
+	if not annual_test_arm:
+		return
+	try:
+		from src.services.ab_engine import (
+			ANNUAL_SIGNUP_TEST_NAME, ensure_annual_signup_test, record_pregenerated_arm,
+		)
+		ensure_annual_signup_test(db)
+		record_pregenerated_arm(sub.id, ANNUAL_SIGNUP_TEST_NAME, annual_test_arm, db)
+	except Exception:
+		logger.warning("annual_at_signup_v1 arm recording failed for subscriber %d", sub.id, exc_info=True)
+
+
 def create_free_account_by_email(
 	email: str,
 	db: Session,
@@ -226,6 +242,7 @@ def create_free_account_by_email(
 	attribution_token: Optional[str] = None,
 	affiliate_ref: Optional[str] = None,
 	send_welcome: bool = True,
+	annual_test_arm: Optional[str] = None,
 ) -> Subscriber:
 	"""
 	Create (or re-use) a free-tier Subscriber keyed by email.
@@ -235,6 +252,11 @@ def create_free_account_by_email(
 
 	signup_source / utm_*/campaign_id are validated + persisted via
 	`_apply_signup_source` — re-visit doesn't clobber an already-attributed row.
+
+	`annual_test_arm` ("variant"/"control") is the annual-at-signup A/B arm
+	the frontend already bucketed this (still-anonymous) visitor into before
+	a subscriber_id existed — recorded here via record_pregenerated_arm once
+	the row exists. Best-effort; never blocks signup.
 
 	Idempotent on email.
 	"""
@@ -261,6 +283,7 @@ def create_free_account_by_email(
 			attribution_token=attribution_token,
 		)
 		db.flush()
+		_record_annual_test_arm(existing, annual_test_arm, db)
 		logger.info(
 			"free account re-used for email=%s → subscriber=%d (source=%s)",
 			email, existing.id, existing.signup_source,
@@ -296,6 +319,7 @@ def create_free_account_by_email(
 	db.flush()
 
 	_maybe_set_phone_and_opt_in(sub, normalized_phone, sms_consent, db)
+	_record_annual_test_arm(sub, annual_test_arm, db)
 
 	logger.info(
 		"Free account created by email: subscriber=%d email=%s phone=%s consent=%s source=%s",

@@ -149,6 +149,74 @@ def assign_rollout_arm(
     return arm
 
 
+ANNUAL_SIGNUP_TEST_NAME = "annual_at_signup_v1"
+
+
+def ensure_annual_signup_test(db: Session) -> AbTest:
+    """Idempotently register the annual_at_signup_v1 rollout test.
+
+    Called lazily from signup_engine so the test row exists before
+    record_pregenerated_arm tries to look it up. traffic_pct is read from
+    settings.annual_signup_test_traffic_pct (ANNUAL_SIGNUP_TEST_TRAFFIC_PCT
+    env var) — toggleable without a code change — and is still capped to the
+    shared ab_test_traffic_cap guardrail by get_or_create_test, same as every
+    other test registered this way. get_or_create_test re-syncs the DB row's
+    traffic_pct on every call, so changing the env var and restarting is
+    enough to take effect.
+    """
+    from config.settings import settings
+    return get_or_create_test(
+        test_name=ANNUAL_SIGNUP_TEST_NAME,
+        segment="new_signups",
+        variant_a={"path": "control"},
+        variant_b={"path": "annual_offer_shown"},
+        traffic_pct=settings.annual_signup_test_traffic_pct,
+        db=db,
+    )
+
+
+def record_pregenerated_arm(
+    subscriber_id: int,
+    test_name: str,
+    arm: str,
+    db: Session,
+) -> Optional[str]:
+    """Persist a client-precomputed rollout arm for a subscriber.
+
+    Unlike assign_rollout_arm, this does not derive the arm from
+    subscriber_id — it trusts a value the caller already decided before a
+    subscriber_id existed (e.g. an anonymous landing-page visitor bucketed
+    client-side before signing up). Only "variant"/"control" are accepted;
+    anything else is a no-op. Idempotent: an existing assignment for this
+    subscriber is returned unchanged rather than overwritten.
+    """
+    if arm not in ("variant", "control"):
+        return None
+
+    test = db.execute(
+        select(AbTest).where(AbTest.test_name == test_name, AbTest.status == "active")
+    ).scalar_one_or_none()
+    if not test:
+        return None
+
+    existing = db.execute(
+        select(AbAssignment).where(
+            AbAssignment.test_id == test.id,
+            AbAssignment.subscriber_id == subscriber_id,
+        )
+    ).scalar_one_or_none()
+    if existing:
+        return existing.variant
+
+    db.add(AbAssignment(
+        test_id=test.id,
+        subscriber_id=subscriber_id,
+        variant=arm,
+    ))
+    db.flush()
+    return arm
+
+
 def should_rollback_rollout(
     test_name: str,
     db: Session,

@@ -76,6 +76,11 @@ def _price_ids():
             "founding": settings.active_stripe_price("partner"),
             "regular":  settings.active_stripe_price("partner"),
         },
+        # Flat-rate — no founding/regular split, both keys point at the same price.
+        "annual_lock": {
+            "founding": settings.active_stripe_price("annual_lock"),
+            "regular":  settings.active_stripe_price("annual_lock"),
+        },
     }
 
 
@@ -118,6 +123,15 @@ def get_price_id_for_checkout(
         if not price_id:
             raise ValueError("Stripe price_id not configured for partner. Set STRIPE_PRICE_PARTNER in env.")
         logger.info("Checkout price selected: tier=partner vertical=%s county=%s (flat rate)", vertical, county_id)
+        return price_id, False
+
+    # Annual Lock is also flat-rate — no founding mechanic, skip the founding count table
+    # (check_founding_tier constraint blocks inserting 'annual_lock' into that table)
+    if tier == "annual_lock":
+        price_id = prices["annual_lock"]["regular"]
+        if not price_id:
+            raise ValueError("Stripe price_id not configured for annual_lock. Set STRIPE_PRICE_ANNUAL_LOCK in env.")
+        logger.info("Checkout price selected: tier=annual_lock vertical=%s county=%s (flat rate)", vertical, county_id)
         return price_id, False
 
     # Lock the row for this tier/vertical/county

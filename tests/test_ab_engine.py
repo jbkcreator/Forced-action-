@@ -4,6 +4,8 @@ import pytest
 import uuid
 from unittest.mock import MagicMock
 
+from sqlalchemy import select
+
 from src.core.models import AbAssignment, AbTest
 
 
@@ -96,3 +98,60 @@ class TestAbEngineIntegration:
         assert variant == variant2
 
         record_outcome(sub.id, test_name, "converted", fresh_db)
+
+    def test_record_pregenerated_arm(self, fresh_db):
+        from src.services.ab_engine import record_pregenerated_arm
+        from src.core.models import Subscriber
+
+        test_name = f"pregenerated_test_{uuid.uuid4().hex[:8]}"
+        test = AbTest(
+            test_name=test_name,
+            segment="new_signups",
+            variant_a={"path": "control"},
+            variant_b={"path": "annual_offer_shown"},
+            traffic_pct=100,
+            status="active",
+        )
+        fresh_db.add(test)
+        fresh_db.flush()
+
+        uid = uuid.uuid4().hex[:8]
+        sub = Subscriber(
+            stripe_customer_id=f"cus_pregen_{uid}",
+            tier="free",
+            vertical="roofing",
+            county_id="hillsborough",
+            event_feed_uuid=f"pregen-uuid-{uid}",
+        )
+        fresh_db.add(sub)
+        fresh_db.flush()
+
+        # Trusts the caller-supplied arm rather than deriving one.
+        arm = record_pregenerated_arm(sub.id, test_name, "variant", fresh_db)
+        assert arm == "variant"
+
+        # Idempotent — repeat calls (even with a different arm) return the
+        # first recorded assignment unchanged.
+        arm2 = record_pregenerated_arm(sub.id, test_name, "control", fresh_db)
+        assert arm2 == "variant"
+
+        assignment = fresh_db.execute(
+            select(AbAssignment).where(
+                AbAssignment.test_id == test.id,
+                AbAssignment.subscriber_id == sub.id,
+            )
+        ).scalar_one_or_none()
+        assert assignment is not None
+        assert assignment.variant == "variant"
+
+    def test_record_pregenerated_arm_rejects_invalid_arm(self, fresh_db):
+        from src.services.ab_engine import record_pregenerated_arm
+
+        result = record_pregenerated_arm(1, "any_test", "not_a_real_arm", fresh_db)
+        assert result is None
+
+    def test_record_pregenerated_arm_missing_test_returns_none(self, fresh_db):
+        from src.services.ab_engine import record_pregenerated_arm
+
+        result = record_pregenerated_arm(1, f"nonexistent_{uuid.uuid4().hex[:8]}", "variant", fresh_db)
+        assert result is None
