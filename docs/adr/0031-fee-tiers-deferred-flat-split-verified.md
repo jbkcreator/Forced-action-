@@ -1,60 +1,71 @@
-# Fee tiers deferred; flat commission split verified end-to-end
+# Deal-size fee-tier mechanism built; tier numbers deferred to product owner
 
 Task 3.2 asked for tier logic on broker commission splits (vary the
-platform/broker cut by deal size, lender, or another dimension). We **defer all
-tier logic** and instead E2E-verify the existing single flat split.
+platform/broker cut by deal size, lender, or another dimension). We **build the
+full deal-size tier mechanism** and **defer only the tier numbers** (boundaries
+and per-tier percentages), which are a product-owner input we do not have.
 
-Rationale: no signed-off numbers exist to tier against. The only seeded split is
-`platform_50_broker_50`, whose own apply script marks it "PLACEHOLDER (50/50),
-pending business sign-off" (`scripts/apply_fa_s1_commission_ledger.py:54`). There
-is no historical `closed_won` deal-size distribution to derive thresholds from,
-so any cutoff we shipped would be invented fiction in a money path. Tier basis
-was grilled to **deal size** (thresholds on `gross_amount_cents`) as the eventual
-design, but the boundaries and per-tier percentages are a product-owner input we
-do not have.
+Tier basis was grilled to **deal size** (bands on `gross_amount_cents`), not
+lender: lender tiers are combinatorial across lenders/programs and need a mapping
+that does not exist, whereas deal size scales broker economics directly and is a
+handful of rows.
 
-What ships now: a new E2E test
-(`tests/test_loan_lane.py::test_flat_split_posts_correct_net_lines_e2e`)
-that drives the full `enter_lane → assign → … → closed_won` chain through the real
-`handle_commission_poster` consumer and asserts the persisted `net_lines` are the
-correct 50/50 split of gross with no cents lost. `split_config_id` stays
-caller-supplied; `compute_net_lines` / `post_commission` are untouched.
+## What ships
 
-Note: `tests/test_broker_state_machine_e2e.py` is a **pre-v6, dead test file** —
-it patches `emit_event` on modules that no longer emit events and calls
-`enter_lane` with the old `prospect_id`-anchored signature (v6 anchors lanes on
-`property_id`). 10 of its 11 tests already fail on `AttributeError` independent
-of this change. `tests/test_loan_lane.py` is the current, v6-rewritten suite
-(see its module docstring) and is where this new test was added.
+- **Schema (config-as-data):** `commission_splits` gains `min_gross_cents`
+  (NOT NULL default 0) and `max_gross_cents` (nullable = unbounded). A split is a
+  tier scoped to `[min_gross_cents, max_gross_cents)`. A new tier is a new row —
+  no schema change, no deploy. `migrations/apply_fa_s3_fee_tiers.py` (idempotent).
+- **Resolver:** `commission_ledger.resolve_split_config(session, gross)` maps a
+  deal size to a `split_config_id`. Most-specific band wins — highest floor first,
+  then narrowest ceiling — so a real tier beats the catch-all default. Returns
+  None when no tier matches, so the caller can fall back to an explicit split.
+- **Authoritative resolution at the money-write:** `post_commission()` accepts
+  `split_config_id=None` and resolves from `gross_amount_cents`. This is the one
+  place gross → `net_lines` happens, so the ledger always reflects the tier in
+  force when the entry is posted. `broker_state_machine.transition(closed_won)`
+  also resolves (fail-fast: a deal that can't be priced can't close), and the
+  consumer passes an omitted split through.
+- **Numbers deferred, safely:** the existing placeholder `platform_50_broker_50`
+  is set to the catch-all band `[0, +inf)`, so every deal still resolves to 50/50
+  until a PO inserts narrower tiers with signed-off percentages. No invented
+  thresholds enter prod; behavior is unchanged until real tiers land.
+
+Tests: `tests/test_loan_lane.py` — flat-split E2E, resolve-by-size,
+specific-band-beats-catch-all, auto-resolve at `post_commission` (asserts tiered
+`net_lines`), and `closed_won` without an explicit split.
 
 ## Considered Options
 
-- **Ship a deal-size resolver with placeholder thresholds now** — rejected.
-  Hardcoding invented cutoffs (e.g. <$5k / $5k–15k / >$15k) into a commission
-  path bakes fiction into money math and forces a code change the moment the PO
-  supplies real numbers.
-- **Build a range-based resolver skeleton (min/max `gross_amount_cents` columns
-  on `commission_splits`, PO fills rows later)** — deferred, not rejected. This is
-  the recorded upgrade path. Rejected *for now* because it adds a schema column
-  and resolver code with zero rows to resolve against, i.e. dead flexibility until
-  the PO decision lands.
-- **Lender-based tiers** — rejected as the basis: combinatorial across
-  lenders/programs, needs a mapping we do not have. Deal size is the chosen
-  eventual basis.
-- **Defer tiers, E2E-verify the flat split (chosen)** — smallest correct change.
-  The flat path is proven end-to-end; no invented thresholds enter prod.
+- **Ship a resolver with hardcoded placeholder thresholds** — rejected. Invented
+  cutoffs baked into a money path force a code change the moment the PO supplies
+  real numbers, and misstate margin in the meantime.
+- **Defer everything (mechanism + numbers), only E2E-verify the flat split** —
+  rejected. The task's revenue driver is the tier mechanism; a pure deferral
+  delivers zero margin and does not satisfy the request. Only the *numbers*
+  genuinely require the PO.
+- **Lender-based tiers** — rejected as the basis (combinatorial, no mapping).
+- **Build the mechanism, defer only the numbers (chosen)** — the tier machinery
+  is live; adding a fee tier is a one-row insert. The catch-all preserves today's
+  50/50 until the PO's bands and percentages are signed off.
 
 ## Consequences
 
-- No tier resolver exists. Every closed_won deal uses the caller-supplied
-  `split_config_id` (today only `platform_50_broker_50`).
-- **Upgrade path when the PO supplies deal-size bands + per-tier splits:** add the
-  new tiers as `commission_splits` rows via an idempotent
-  `migrations/apply_fa_s3_fee_tiers.py`; add a resolver mapping
-  `gross_amount_cents → split_config_id` (range match), called at
-  `broker_state_machine.transition` before it reads the split. New tiers are new
-  rows, not a schema change to `commission_splits` (its JSONB `parties` already
-  models any split shape).
-- `commission_splits.parties` JSONB shape is confirmed to match what
-  `compute_net_lines` reads (`[{"party", "pct"}]` → `[{"party", "amount_cents"}]`);
-  future seeded rows must follow it.
+- Adding a fee tier is a data operation: insert a `commission_splits` row with a
+  `[min_gross_cents, max_gross_cents)` band and its `parties` percentages. Margin
+  changes with no code or deploy.
+- Overlapping bands resolve deterministically (highest floor, then narrowest
+  ceiling); non-overlapping bands are the intended invariant. The catch-all
+  `[0, +inf)` is the floor that guarantees every deal resolves to *something*.
+- `post_commission` and `transition` resolve independently from the same table.
+  Absent a tier edit in the seconds between close and post they agree; if a tier
+  is edited in that window, the post-time value wins — correct, since that is the
+  money-write. (`ponytail:` acceptable drift; add a persisted resolved-split
+  column on `broker_transitions` only if audit needs close-time and post-time to
+  be provably identical.)
+- `commission_splits.parties` JSONB shape (`[{"party","pct"}]` →
+  `[{"party","amount_cents"}]`) is unchanged; seeded tiers must follow it.
+- `tests/test_broker_state_machine_e2e.py` is a **pre-v6 dead test file** (patches
+  a removed `emit_event`, uses the old `prospect_id` lane signature); 10/11 of its
+  tests already fail independent of this change. `tests/test_loan_lane.py` is the
+  current v6 suite. Left as-is — a separate cleanup ticket.
