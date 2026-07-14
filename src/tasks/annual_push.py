@@ -359,6 +359,22 @@ def switch_to_annual(subscriber_id: int, db: Session) -> bool:
         switch_subscription_plan(sub.stripe_subscription_id, price_id)
         sub.tier = "annual_lock"
         logger.info("Subscriber %d switched to annual_lock", subscriber_id)
+
+        # Annual-at-signup A/B: this subscriber may have been bucketed into
+        # the experiment at signup (control-arm, no offer shown up front) and
+        # is only converting now via the day-60 nudge — that still counts
+        # toward control's conversion rate so variant-vs-control lift is
+        # measurable end-to-end, not just for subscribers who saw it early.
+        try:
+            with db.begin_nested():
+                from src.services.ab_engine import ANNUAL_SIGNUP_TEST_NAME, record_outcome
+                record_outcome(subscriber_id, ANNUAL_SIGNUP_TEST_NAME, "converted", db)
+        except Exception as exc:
+            logger.warning(
+                "[AnnualAtSignup] A/B record_outcome failed for subscriber=%d: %s",
+                subscriber_id, exc,
+            )
+
         return True
     except Exception as exc:
         logger.error("switch_to_annual failed for subscriber %d: %s", subscriber_id, exc)

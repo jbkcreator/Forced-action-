@@ -58,7 +58,7 @@ def parse_iso_date_param(value: Optional[str], field: str) -> Optional[datetime]
 # Validation constants
 # ---------------------------------------------------------------------------
 
-VALID_TIERS: frozenset[str] = frozenset({"starter", "pro", "dominator"})
+VALID_TIERS: frozenset[str] = frozenset({"starter", "pro", "dominator", "annual_lock"})
 VALID_VERTICALS: frozenset[str] = frozenset(VERTICAL_WEIGHTS.keys())
 
 ZIP_RE = re.compile(r"^\d{5}$")

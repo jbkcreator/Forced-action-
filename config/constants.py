@@ -249,5 +249,16 @@ TIER_DISPLAY = {
             "Rate locked forever",
         ],
     },
+    "annual_lock": {
+        "label": "Annual — 2 Months Free",
+        "zip_limit": 1,
+        "features": [
+            "1 ZIP territory",
+            "Daily lead feed",
+            "CDS scoring",
+            "All event types",
+            "Rate locked for a full year",
+        ],
+    },
 }
 

@@ -251,6 +251,11 @@ class AppSettings(BaseSettings):
 	# Founding subscriber spot limit (default 10, changeable without redeploy)
 	founding_spot_limit: int = Field(default=10, env="FOUNDING_SPOT_LIMIT")
 
+	# Annual-at-signup A/B test traffic split (default 10, changeable without
+	# redeploy — edit .env and restart). Still subject to the ab_test_traffic_cap
+	# guardrail (config/cora_guardrails.py) when the test row is registered.
+	annual_signup_test_traffic_pct: int = Field(default=10, env="ANNUAL_SIGNUP_TEST_TRAFFIC_PCT")
+
 	# Grace period after subscription deletion — 7 days lets payment_failure_day5 trigger fire.
 	# Set GRACE_PERIOD_HOURS=0.017 (≈1 min) for rapid local testing.
 	grace_period_hours: float = Field(default=168.0, env="GRACE_PERIOD_HOURS")
