@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import stripe
-from sqlalchemy import select, and_, desc, func
+from sqlalchemy import select, and_, desc, func, text
 from sqlalchemy.dialects.postgresql import array
 from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -3365,10 +3365,36 @@ def _on_charge_refunded(charge: dict, db: Session) -> None:
                     SentLead.source == "lead_pack",
                 )
             ).scalars().all()
+
+            # A partial refund of the overall purchase must prorate across
+            # each lead's own ledger share, not zero every row out — pull
+            # each row's actual original amount (never assume a fixed split
+            # order) and allocate proportionally, giving the remainder to
+            # the smallest share so the parts sum exactly to the refund.
+            per_row_refund_cents: dict[int, int] = {}
+            if sent_lead_ids:
+                ledger_amounts = dict(db.execute(text("""
+                    SELECT source_id, amount_cents FROM platform_revenue_ledger
+                    WHERE source_table = 'sent_leads' AND source_id = ANY(:ids)
+                """), {"ids": list(sent_lead_ids)}).all())
+                total_original = sum(ledger_amounts.values())
+                total_refund = charge.get("amount_refunded") or 0
+                if total_original and 0 < total_refund < total_original:
+                    ordered_ids = sorted(sent_lead_ids, key=lambda sid: -ledger_amounts.get(sid, 0))
+                    allocated = 0
+                    for idx, sid in enumerate(ordered_ids):
+                        if idx == len(ordered_ids) - 1:
+                            share = total_refund - allocated
+                        else:
+                            share = round(ledger_amounts.get(sid, 0) * total_refund / total_original)
+                        allocated += share
+                        per_row_refund_cents[sid] = share
+
             for sent_lead_id in sent_lead_ids:
                 mark_ledger_refunded(
                     db, source_table="sent_leads", source_id=sent_lead_id,
                     refunded_at=purchase.refunded_at,
+                    refunded_amount_cents=per_row_refund_cents.get(sent_lead_id),
                 )
 
             # Clear exclusivity rows so the properties immediately become
@@ -3412,7 +3438,7 @@ def _on_charge_refunded(charge: dict, db: Session) -> None:
     from src.services.revenue_ledger import mark_ledger_refunded
     mark_ledger_refunded(
         db, source_table="premium_purchases", source_id=purchase.id,
-        refunded_at=purchase.refunded_at,
+        refunded_at=purchase.refunded_at, refunded_amount_cents=refund_amount,
     )
 
     if purchase.paid_via == "credits" and purchase.sku not in _DATA_SURRENDERED_SKUS:

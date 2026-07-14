@@ -318,8 +318,10 @@ COUNTY_ID=hillsborough
 # MB2 — Fulfillment verification + revenue heartbeat (subscriptions, lead
 # unlocks, hot-lead unlocks, lead packs, premium, bankruptcy-alert, Loan Lane
 # volume) vs Stripe's own daily total; alerts via ALERT_EMAIL on any mismatch
-# or unfulfilled/delayed item. Runs after stripe_reconcile.
-30 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.revenue_fulfillment_heartbeat
+# or unfulfilled/delayed item. Runs after stripe_reconcile. NOTE: :30 is taken
+# by run_enrichment (below) and revenue_pulse --daily (line ~465) — do not
+# move this back onto :30.
+33 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.revenue_fulfillment_heartbeat
 
 
 # SunBiz LLC Piercing Enrichment — 07:40 AM UTC Mon-Sat (fa031 tiered staleness)

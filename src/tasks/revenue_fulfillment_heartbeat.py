@@ -83,6 +83,37 @@ def _ledger_totals_by_stream(db, day_start_dt: datetime, day_end_dt: datetime) -
     return by_stream
 
 
+def _ledger_net_effect_today(db, day_start_dt: datetime, day_end_dt: datetime) -> dict:
+    """Net ledger effect for the UTC day, symmetric with
+    compute_stripe_net_revenue: gross of every row ORIGINATING today
+    (regardless of current refund status — mirrors Stripe's `type=charge`
+    transactions, always the gross original amount) minus every row's
+    ACTUAL refunded amount for refunds PROCESSED today (regardless of which
+    day the row originated — mirrors Stripe's `type=refund` transactions,
+    which post on the day the refund happens, not the original charge day).
+
+    _ledger_totals_by_stream's "confirmed, not-yet-refunded, by stream" view
+    answers a different question (what's safe to call revenue right now) and
+    is intentionally left alone — this function exists solely so the
+    Stripe-vs-ledger mismatch check compares like with like. A charge from
+    days ago refunded today must reduce today's net here exactly as it
+    reduces today's Stripe net, or every non-same-day refund shows up as a
+    false mismatch.
+    """
+    originated = db.execute(sa_text("""
+        SELECT COALESCE(SUM(amount_cents), 0) AS c FROM platform_revenue_ledger
+        WHERE occurred_at >= :start AND occurred_at < :end
+    """), {"start": day_start_dt, "end": day_end_dt}).scalar_one()
+
+    refunded_today = db.execute(sa_text("""
+        SELECT COALESCE(SUM(COALESCE(refunded_amount_cents, amount_cents)), 0) AS c
+        FROM platform_revenue_ledger
+        WHERE refunded_at >= :start AND refunded_at < :end
+    """), {"start": day_start_dt, "end": day_end_dt}).scalar_one()
+
+    return {"net_cents": int(originated) - int(refunded_today)}
+
+
 def _refunds_disputes(db, day_start_dt: datetime, day_end_dt: datetime) -> dict:
     """Refunds are locally tracked (mark_ledger_refunded, event-driven).
     Disputes have no uniform local column across product tables (only
@@ -152,21 +183,36 @@ def _premium_fulfillment(db, day_start_dt: datetime, day_end_dt: datetime) -> di
     return {"by_status": {r.status: int(r.cnt) for r in rows}}
 
 
-def _unfulfilled_lead_unlock_charges(day_start_dt: datetime, day_end_dt: datetime, db) -> list[dict]:
+def _unfulfilled_lead_unlock_charges(day_start_dt: datetime, day_end_dt: datetime, db) -> dict:
     """Stripe charges for lead_unlock/hot_lead_unlock in the window with no
-    matching sent_leads row.
+    matching platform_revenue_ledger row.
 
     This is the concrete failure mode already present in
     stripe_webhooks.py's _on_lead_unlock_payment: an IntegrityError/
     OperationalError around the SentLead insert is caught and only
     logger.warning'd — when that fires, BOTH the delivery row and the
     ledger row (record_revenue is nested after the SentLead insert in the
-    same block) are silently skipped. The ledger therefore can't reveal this
+    same block) are silently skipped together, so absence from the ledger
+    still means absence from both. The ledger therefore can't reveal this
     gap on its own; only comparing against Stripe's own charge list can.
+
+    Checks platform_revenue_ledger (source_table='stripe_payment_intent',
+    keyed by stripe_payment_intent_ledger_id(pi_id)) rather than
+    sent_leads.stripe_payment_intent_id — SentLead is unique per
+    (subscriber_id, property_id), so a later hot-unlock of a
+    previously-unlocked property overwrites that row's payment_intent id in
+    place (a real, common upgrade path, not an edge case). The ledger's
+    per-charge hash key was built precisely to survive that overwrite, so
+    it's the only reliable place to check delivery without false-flagging
+    every lead_unlock -> hot_lead_unlock upgrade.
+
+    Returns {"charges": [...], "error": str | None} — a fetch failure must
+    show as "could not verify," never as a false "nothing to flag."
     """
     if not _init_stripe():
-        return []
+        return {"charges": [], "error": None}
     import stripe
+    from src.services.revenue_ledger import stripe_payment_intent_ledger_id
 
     day_start, day_end = _utc_day_window(day_start_dt.date())
     flagged: list[dict] = []
@@ -187,8 +233,9 @@ def _unfulfilled_lead_unlock_charges(day_start_dt: datetime, day_end_dt: datetim
                 if not pi_id:
                     continue
                 exists = db.execute(sa_text(
-                    "SELECT 1 FROM sent_leads WHERE stripe_payment_intent_id = :pi LIMIT 1"
-                ), {"pi": pi_id}).first()
+                    "SELECT 1 FROM platform_revenue_ledger "
+                    "WHERE source_table = 'stripe_payment_intent' AND source_id = :sid LIMIT 1"
+                ), {"sid": stripe_payment_intent_ledger_id(pi_id)}).first()
                 if exists is None:
                     flagged.append({
                         "payment_intent_id": pi_id, "amount_cents": charge.amount,
@@ -197,9 +244,10 @@ def _unfulfilled_lead_unlock_charges(day_start_dt: datetime, day_end_dt: datetim
             if not page.has_more:
                 break
             params["starting_after"] = page.data[-1].id
-    except Exception:
+    except Exception as exc:
         logger.error("[RevenueHeartbeat] unfulfilled-charge scan failed", exc_info=True)
-    return flagged
+        return {"charges": [], "error": str(exc)}
+    return {"charges": flagged, "error": None}
 
 
 def _bankruptcy_section(db, day_start_dt: datetime, day_end_dt: datetime) -> dict:
@@ -250,9 +298,10 @@ def build_report(run_date: date) -> dict:
     day_start_dt = datetime(run_date.year, run_date.month, run_date.day, tzinfo=timezone.utc)
     day_end_dt = day_start_dt + timedelta(days=1)
 
-    errors: list[str] = []
+    errors: list[dict] = []
     with get_db_context() as db:
         ledger = _ledger_totals_by_stream(db, day_start_dt, day_end_dt)
+        ledger_net = _ledger_net_effect_today(db, day_start_dt, day_end_dt)
         refunds_disputes = _refunds_disputes(db, day_start_dt, day_end_dt)
         lead_pack = _lead_pack_fulfillment(db, day_start_dt, day_end_dt)
         premium = _premium_fulfillment(db, day_start_dt, day_end_dt)
@@ -262,28 +311,46 @@ def build_report(run_date: date) -> dict:
 
     stripe_net = compute_stripe_net_revenue(run_date)
     if stripe_net["error"]:
-        errors.append(f"Stripe net-revenue fetch failed: {stripe_net['error']}")
+        errors.append({"key": "stripe_net_fetch_failed",
+                        "message": f"Stripe net-revenue fetch failed: {stripe_net['error']}"})
     if bankruptcy["error"]:
-        errors.append(f"Bankruptcy-alert invoice fetch failed: {bankruptcy['error']}")
+        errors.append({"key": "bankruptcy_invoice_fetch_failed",
+                        "message": f"Bankruptcy-alert invoice fetch failed: {bankruptcy['error']}"})
     if refunds_disputes["dispute_fetch_error"]:
-        errors.append(f"Dispute fetch failed: {refunds_disputes['dispute_fetch_error']}")
+        errors.append({"key": "dispute_fetch_failed",
+                        "message": f"Dispute fetch failed: {refunds_disputes['dispute_fetch_error']}"})
+    if unfulfilled["error"]:
+        errors.append({"key": "unfulfilled_scan_failed",
+                        "message": f"Unfulfilled-charge scan failed: {unfulfilled['error']}"})
 
     ledger_total_cents = sum(s["revenue_cents"] for s in ledger.values())
-    known_total_cents = ledger_total_cents + bankruptcy["revenue_cents"]
-    mismatch_cents = stripe_net["stripe_net_cents"] - known_total_cents if stripe_net["configured"] else 0
+    known_net_cents = ledger_net["net_cents"] + bankruptcy["revenue_cents"]
+    mismatch_cents = stripe_net["stripe_net_cents"] - known_net_cents if stripe_net["configured"] else 0
 
     if stripe_net["configured"] and mismatch_cents != 0:
-        errors.append(
-            f"Stripe-vs-ledger mismatch: {_fmt_cents(mismatch_cents)} "
-            "(see STRIPE TOTAL vs INTERNAL LEDGER TOTAL section)"
-        )
+        errors.append({
+            "key": "stripe_ledger_mismatch",
+            "message": f"Stripe-vs-ledger mismatch: {_fmt_cents(mismatch_cents)} "
+                       "(see STRIPE TOTAL vs INTERNAL LEDGER TOTAL section)",
+        })
     if lead_pack["stuck"]:
-        errors.append(f"{len(lead_pack['stuck'])} lead pack purchase(s) stuck past the fulfillment sweep's retry window")
-    if unfulfilled:
-        errors.append(f"{len(unfulfilled)} paid lead-unlock charge(s) with no matching delivery record")
+        stuck_ids = sorted(item["id"] for item in lead_pack["stuck"])
+        errors.append({
+            "key": f"lead_pack_stuck:{stuck_ids}",
+            "message": f"{len(stuck_ids)} lead pack purchase(s) stuck past the fulfillment sweep's retry window",
+        })
+    if unfulfilled["charges"]:
+        pi_ids = sorted(item["payment_intent_id"] for item in unfulfilled["charges"])
+        errors.append({
+            "key": f"unfulfilled_charges:{pi_ids}",
+            "message": f"{len(pi_ids)} paid lead-unlock charge(s) with no matching delivery record",
+        })
     failed_bk_alerts = bankruptcy["alerts_by_status"].get("failed", 0)
     if failed_bk_alerts:
-        errors.append(f"{failed_bk_alerts} bankruptcy filing alert(s) failed to send")
+        errors.append({
+            "key": "bankruptcy_alerts_failed",
+            "message": f"{failed_bk_alerts} bankruptcy filing alert(s) failed to send",
+        })
 
     return {
         "run_date": run_date,
@@ -296,7 +363,7 @@ def build_report(run_date: date) -> dict:
         "unfulfilled_lead_unlock_charges": unfulfilled,
         "refunds_disputes": refunds_disputes,
         "reconciliation": {
-            "known_total_cents": known_total_cents,
+            "known_net_cents": known_net_cents,
             "stripe_net_cents": stripe_net["stripe_net_cents"],
             "stripe_configured": stripe_net["configured"],
             "mismatch_cents": mismatch_cents,
@@ -367,11 +434,13 @@ def write_csv(report: dict, path: Path) -> None:
 
         uf = report["unfulfilled_lead_unlock_charges"]
         w.writerow(["PAID BUT NOT FULFILLED — lead unlock / hot lead unlock"])
-        if uf:
+        if uf["charges"]:
             w.writerow(["Payment Intent", "Product", "Amount", "Customer"])
-            for item in uf:
+            for item in uf["charges"]:
                 w.writerow([item["payment_intent_id"], item["product_type"],
                             _fmt_cents(item["amount_cents"]), item["customer_id"]])
+        elif uf["error"]:
+            w.writerow([f"WARNING: scan failed — {uf['error']}"])
         else:
             w.writerow(["None — every charge matched a delivery record."])
         w.writerow([])
@@ -389,7 +458,8 @@ def write_csv(report: dict, path: Path) -> None:
         if not rec["stripe_configured"]:
             w.writerow(["Stripe not configured — reconciliation skipped."])
         else:
-            w.writerow([f"Known total (ledger + bankruptcy-alert): {_fmt_cents(rec['known_total_cents'])}"])
+            w.writerow([f"Known net effect today (ledger + bankruptcy-alert, net of today's refunds): "
+                        f"{_fmt_cents(rec['known_net_cents'])}"])
             w.writerow([f"Stripe net (charges - refunds, {rec['charge_count']} charge(s)/"
                         f"{rec['refund_count']} refund(s)): {_fmt_cents(rec['stripe_net_cents'])}"])
             w.writerow([f"Mismatch: {_fmt_cents(rec['mismatch_cents'])}"])
@@ -404,7 +474,7 @@ def write_csv(report: dict, path: Path) -> None:
         w.writerow(["EXCEPTIONS"])
         if report["errors"]:
             for err in report["errors"]:
-                w.writerow([f"WARNING: {err}"])
+                w.writerow([f"WARNING: {err['message']}"])
         else:
             w.writerow(["No exceptions."])
 
@@ -413,7 +483,43 @@ def write_csv(report: dict, path: Path) -> None:
 # Alert email
 # ---------------------------------------------------------------------------
 
-def _alert_body(report: dict) -> str:
+_ALERT_COOLDOWN_HOURS = 24
+
+
+def _dedupe_errors_for_alert(db, errors: list[dict], cooldown_hours: int = _ALERT_COOLDOWN_HOURS) -> list[dict]:
+    """Suppress, from the ALERT EMAIL only, any error whose alert_key already
+    fired within cooldown_hours — the CSV report (built from the full,
+    un-deduped `errors`) always lists every exception regardless. A key
+    that includes the specific affected ids (e.g. "unfulfilled_charges:[...]")
+    naturally re-alerts the moment the affected set changes, even while an
+    unrelated, unchanged key is still in cooldown.
+    """
+    if not errors:
+        return []
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=cooldown_hours)
+    keys = [e["key"] for e in errors]
+    recently_alerted = {
+        row.alert_key for row in db.execute(sa_text("""
+            SELECT DISTINCT alert_key FROM revenue_heartbeat_alert_log
+            WHERE alert_key = ANY(:keys) AND alerted_at >= :cutoff
+        """), {"keys": keys, "cutoff": cutoff}).fetchall()
+    }
+    surviving = [e for e in errors if e["key"] not in recently_alerted]
+    # At most a handful of distinct exception types per run — a per-row
+    # insert is simpler and clearer here than a bulk array-cast statement.
+    # No explicit commit: the caller (send_heartbeat_alert, via
+    # get_db_context) owns and commits the transaction — this function only
+    # needs the insert visible to its own read above, which flush() gives it.
+    for e in surviving:
+        db.execute(sa_text(
+            "INSERT INTO revenue_heartbeat_alert_log (alert_key, alerted_at) VALUES (:key, NOW())"
+        ), {"key": e["key"]})
+    if surviving:
+        db.flush()
+    return surviving
+
+
+def _alert_body(report: dict, alert_errors: list[dict]) -> str:
     rec = report["reconciliation"]
     lines = [f"Forced Action — Revenue & Fulfillment Heartbeat — {report['run_date']}", ""]
     lines.append(f"Revenue (ledger streams): {_fmt_cents(report['ledger_total_cents'])}")
@@ -426,9 +532,11 @@ def _alert_body(report: dict) -> str:
                 "reconciliation (e.g. Supplier Intelligence, Phase 1/admin-only)."
             )
     lines.append("")
-    if report["errors"]:
+    if alert_errors:
         lines.append("EXCEPTIONS:")
-        lines.extend(f"  - {e}" for e in report["errors"])
+        lines.extend(f"  - {e['message']}" for e in alert_errors)
+    elif report["errors"]:
+        lines.append(f"No new exceptions (full report has {len(report['errors'])} still-open, in cooldown).")
     else:
         lines.append("No exceptions.")
     return "\n".join(lines)
@@ -437,13 +545,14 @@ def _alert_body(report: dict) -> str:
 def send_heartbeat_alert(report: dict, csv_path: Path) -> bool:
     from src.services.email import send_alert
 
-    rec = report["reconciliation"]
-    has_exceptions = bool(report["errors"]) or (rec["stripe_configured"] and rec["mismatch_cents"] != 0)
+    with get_db_context() as db:
+        alert_errors = _dedupe_errors_for_alert(db, report["errors"])
+
     subject = (
         f"[Revenue Heartbeat] {report['run_date']} — "
-        + ("EXCEPTIONS FOUND" if has_exceptions else "clean")
+        + ("EXCEPTIONS FOUND" if alert_errors else "clean")
     )
-    return send_alert(subject, _alert_body(report), attachments=[csv_path])
+    return send_alert(subject, _alert_body(report, alert_errors), attachments=[csv_path])
 
 
 # ---------------------------------------------------------------------------
@@ -482,7 +591,7 @@ def generate_report(run_date: date, dry_run: bool = False) -> Path:
             logger.error("[RevenueHeartbeat] Failed to send alert email", exc_info=True)
 
     rec = report["reconciliation"]
-    print(
+    logger.info(
         f"\nForced Action Revenue & Fulfillment Heartbeat — {run_date}\n"
         f"  Ledger revenue : {_fmt_cents(report['ledger_total_cents'])}\n"
         f"  Bankruptcy rev : {_fmt_cents(report['bankruptcy']['revenue_cents'])}\n"
@@ -492,7 +601,7 @@ def generate_report(run_date: date, dry_run: bool = False) -> Path:
         f"  Saved          : {output_path}\n"
     )
     for err in report["errors"]:
-        print(f"  WARNING: {err}")
+        logger.warning(f"[RevenueHeartbeat] {err['message']}")
 
     return output_path
 
