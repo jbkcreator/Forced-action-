@@ -490,3 +490,113 @@ class TestInviteSweep:
         assert res.failed == 1
         assert res.gave_up == 0
         assert marks == []  # left 'scheduled' — no status change, retried next sweep
+
+
+# ── alerts._projected_mrr_cents (pure, no DB) ────────────────────────────────
+
+class TestProjectedMrr:
+    def test_active_and_trialing_counted(self):
+        from src.services.bankruptcy_alert.alerts import _projected_mrr_cents
+        assert _projected_mrr_cents({"active": 10, "trialing": 3}) == 13 * 29700
+
+    def test_past_due_and_canceled_excluded(self):
+        from src.services.bankruptcy_alert.alerts import _projected_mrr_cents
+        assert _projected_mrr_cents({"active": 2, "past_due": 5, "canceled": 9}) == 2 * 29700
+
+    def test_empty_counts_zero(self):
+        from src.services.bankruptcy_alert.alerts import _projected_mrr_cents
+        assert _projected_mrr_cents({}) == 0
+
+    def test_status_summary_includes_projected_mrr(self):
+        from src.services.bankruptcy_alert.alerts import status_summary
+        db = MagicMock()
+
+        def execute(stmt, params=None):
+            t = str(stmt)
+            res = MagicMock()
+            if "FROM bankruptcy_alert_subscriptions" in t and "GROUP BY status" in t:
+                res.fetchall.return_value = [
+                    SimpleNamespace(status="active", c=10),
+                    SimpleNamespace(status="trialing", c=3),
+                ]
+            elif "FROM bankruptcy_filing_alerts" in t:
+                res.first.return_value = SimpleNamespace(sent=0, failed=0, last_24h=0)
+            elif "FROM bankruptcy_filings" in t:
+                res.first.return_value = SimpleNamespace(c=0)
+            elif "FROM message_outcomes" in t:
+                res.first.return_value = SimpleNamespace(invites_sent=0, converted=0)
+            return res
+
+        db.execute.side_effect = execute
+        summary = status_summary(db)
+        assert summary["projected_mrr_cents"] == 13 * 29700
+
+
+# ── alerts._paid_mrr_cents (pure, no DB) ─────────────────────────────────────
+
+class TestPaidMrr:
+    def test_active_only_counted(self):
+        from src.services.bankruptcy_alert.alerts import _paid_mrr_cents
+        assert _paid_mrr_cents({"active": 10, "trialing": 3}) == 10 * 29700
+
+    def test_trialing_excluded_not_yet_paid(self):
+        from src.services.bankruptcy_alert.alerts import _paid_mrr_cents
+        assert _paid_mrr_cents({"trialing": 5}) == 0
+
+    def test_empty_counts_zero(self):
+        from src.services.bankruptcy_alert.alerts import _paid_mrr_cents
+        assert _paid_mrr_cents({}) == 0
+
+
+# ── alerts._invite_conversion_stats (mocked DB) ──────────────────────────────
+
+class TestInviteConversionStats:
+    def test_computes_rate_from_sent_and_converted(self):
+        from src.services.bankruptcy_alert.alerts import _invite_conversion_stats
+        db = MagicMock()
+        db.execute.return_value.first.return_value = SimpleNamespace(invites_sent=20, converted=5)
+
+        stats = _invite_conversion_stats(db)
+
+        assert stats["invites_sent"] == 20
+        assert stats["converted"] == 5
+        assert stats["conversion_rate_pct"] == 25.0
+        assert stats["window_days"] == 7
+
+    def test_zero_invites_sent_no_divide_by_zero(self):
+        from src.services.bankruptcy_alert.alerts import _invite_conversion_stats
+        db = MagicMock()
+        db.execute.return_value.first.return_value = SimpleNamespace(invites_sent=0, converted=0)
+
+        stats = _invite_conversion_stats(db)
+
+        assert stats["invites_sent"] == 0
+        assert stats["conversion_rate_pct"] is None
+
+    def test_status_summary_includes_paid_mrr_and_conversion(self):
+        from src.services.bankruptcy_alert.alerts import status_summary
+        db = MagicMock()
+
+        def execute(stmt, params=None):
+            t = str(stmt)
+            res = MagicMock()
+            if "FROM bankruptcy_alert_subscriptions" in t and "GROUP BY status" in t:
+                res.fetchall.return_value = [
+                    SimpleNamespace(status="active", c=10),
+                    SimpleNamespace(status="trialing", c=3),
+                ]
+            elif "FROM bankruptcy_filing_alerts" in t:
+                res.first.return_value = SimpleNamespace(sent=0, failed=0, last_24h=0)
+            elif "FROM bankruptcy_filings" in t:
+                res.first.return_value = SimpleNamespace(c=0)
+            elif "FROM message_outcomes" in t:
+                res.first.return_value = SimpleNamespace(invites_sent=20, converted=5)
+            return res
+
+        db.execute.side_effect = execute
+        summary = status_summary(db)
+
+        assert summary["paid_mrr_cents"] == 10 * 29700
+        assert summary["invite_conversion"]["invites_sent"] == 20
+        assert summary["invite_conversion"]["converted"] == 5
+        assert summary["invite_conversion"]["conversion_rate_pct"] == 25.0

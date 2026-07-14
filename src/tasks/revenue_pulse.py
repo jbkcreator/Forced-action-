@@ -33,7 +33,9 @@ from src.core.models import (
     ChatSession,
     DealOutcome,
     DistressScore,
+    Lane,
     LearningCard,
+    Property,
     Subscriber,
     UserSegment,
     WalletBalance,
@@ -117,6 +119,7 @@ def _compose_daily(db: Session, county_id: str | None = None) -> str:
         )
 
     kill = _kill_switch_status(db, county_id=county_id)
+    lane_count = _lanes_today_count(db, county_id=county_id)
     chat = _chat_metrics_today(db)
     claude_savings = _claude_savings_summary(db)
 
@@ -134,6 +137,7 @@ def _compose_daily(db: Session, county_id: str | None = None) -> str:
     msg = DAILY_PULSE_TEMPLATE.format(
         date=f"{date_str}{county_label}",
         lead_count=lead_count,
+        lanes=lane_count,
         wallet_active=wallet_active,
         top_deal=top_deal_str,
         alert=alert_str,
@@ -435,6 +439,18 @@ def _pick_worst_feature_for_line(features: list) -> dict | None:
     if not candidates:
         return None
     return max(candidates, key=lambda f: (f.get("red_streak") or 0))
+
+
+def _lanes_today_count(db: Session, county_id: str | None = None) -> int:
+    """Return count of lanes created today, optionally scoped to a county."""
+    query = select(func.count(Lane.lane_id)).where(
+        func.date(Lane.created_at) == date.today()
+    )
+    if county_id:
+        query = query.join(Property, Property.id == Lane.property_id).where(
+            Property.county_id == county_id
+        )
+    return db.execute(query).scalar_one_or_none() or 0
 
 
 def _chat_metrics_today(db: Session) -> dict:

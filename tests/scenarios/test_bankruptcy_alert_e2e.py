@@ -388,3 +388,51 @@ def test_scenario_g_not_yet_due_is_skipped(fresh_db):
     # (other tests' rows might be due, but this subscriber's wasn't sent)
     send_calls_for_this = [c for c in send.call_args_list if c.args and c.args[0] == email]
     assert send_calls_for_this == []
+
+
+# ── Scenario H: invite→paid conversion counts ONLY active (paid) subs ─────────
+
+def test_scenario_h_conversion_counts_only_active_paid(fresh_db):
+    """Locks the status='active' filter in _invite_conversion_stats: a
+    same-email bankruptcy signup inside the window counts as a conversion
+    ONLY once it is paid (active) — a trialing signup must NOT count.
+    Delta assertions (not absolute), since the shared DB carries real
+    invite/subscription rows this test can't see or control."""
+    from sqlalchemy import text as sa_text
+    from src.services.bankruptcy_alert.invite import schedule_invite
+    from src.services.bankruptcy_alert.subscription import _on_checkout_completed
+    from src.services.bankruptcy_alert.alerts import _invite_conversion_stats
+
+    base = _invite_conversion_stats(fresh_db)
+
+    # A property subscriber who received (was sent) a bankruptcy invite now.
+    email = f"conv_{uuid.uuid4().hex[:6]}@example.com"
+    sub_id = _make_property_subscriber(fresh_db, email=email)
+    schedule_invite(fresh_db, sub_id)
+    fresh_db.execute(sa_text("""
+        UPDATE message_outcomes SET send_status = 'sent', sent_at = NOW()
+        WHERE subscriber_id = :sid AND template_id = 'bankruptcy_alert_invite'
+    """), {"sid": sub_id})
+    fresh_db.flush()
+
+    after_send = _invite_conversion_stats(fresh_db)
+    assert after_send["invites_sent"] == base["invites_sent"] + 1
+    assert after_send["converted"] == base["converted"]  # no bankruptcy signup yet
+
+    # Same email signs up for bankruptcy — checkout creates a TRIALING row.
+    _on_checkout_completed(
+        _checkout_event(email, "cus_" + uuid.uuid4().hex[:8], "sub_" + uuid.uuid4().hex[:8]),
+        fresh_db,
+    )
+    fresh_db.flush()
+    trialing = _invite_conversion_stats(fresh_db)
+    assert trialing["converted"] == base["converted"]  # trialing is NOT a paid conversion
+
+    # Payment clears → active. Now it counts.
+    fresh_db.execute(sa_text("""
+        UPDATE bankruptcy_alert_subscriptions SET status = 'active'
+        WHERE LOWER(email) = LOWER(:e)
+    """), {"e": email})
+    fresh_db.flush()
+    active = _invite_conversion_stats(fresh_db)
+    assert active["converted"] == base["converted"] + 1
