@@ -26,7 +26,9 @@ Usage:
 Exit codes:
     0 — pipeline ran; Stage F promoted the fit
     1 — pipeline ran; Stage F blocked promotion (not PASS / thin data)
-    2 — an infrastructure stage (B/C/D) failed — nothing promoted
+    2 — an infrastructure stage (B/C/D) failed, Stage F hit bad input
+        (missing/malformed artifact or report), or another run already
+        holds the pipeline lock — nothing promoted
 """
 from __future__ import annotations
 
@@ -34,6 +36,7 @@ import argparse
 import logging
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -43,6 +46,9 @@ logger = logging.getLogger(__name__)
 TRAINING_DIR = Path("data/scoring_training")
 FIT_DIR = Path("data/scoring_fit")
 VALIDATION_DIR = Path("data/validation")
+
+ARTIFACT_RETENTION_DAYS = 180  # ~26 weekly runs of audit history on disk
+_LOCK_KEY = "scoring_retune"
 
 
 def _run(module: str, args: list[str]) -> int:
@@ -72,7 +78,49 @@ def _clear_shadow_table() -> None:
     logger.info("[retune] cleared distress_scores_shadow")
 
 
+def _prune_old_artifacts() -> None:
+    """Best-effort delete of scoring artifacts older than ARTIFACT_RETENTION_DAYS.
+
+    Never raises — a pruning failure must not block the retune run itself.
+    """
+    cutoff = time.time() - ARTIFACT_RETENTION_DAYS * 86400
+    for d in (TRAINING_DIR, FIT_DIR, VALIDATION_DIR):
+        if not d.is_dir():
+            continue
+        for f in d.iterdir():
+            try:
+                if f.is_file() and f.stat().st_mtime < cutoff:
+                    f.unlink()
+            except OSError as exc:
+                logger.warning("[retune] could not prune %s: %s", f, exc)
+
+
 def run_pipeline(*, window_days: int, since: Optional[str], county: Optional[str]) -> int:
+    from sqlalchemy import text
+
+    from src.core.database import get_db_context
+
+    with get_db_context() as lock_session:
+        got_lock = lock_session.execute(
+            text("SELECT pg_try_advisory_lock(hashtext(:k))"), {"k": _LOCK_KEY}
+        ).scalar()
+        if not got_lock:
+            logger.error("[retune] another scoring_retune run already holds the lock — aborting")
+            return 2
+        try:
+            return _run_pipeline_locked(window_days=window_days, since=since, county=county)
+        finally:
+            lock_session.execute(
+                text("SELECT pg_advisory_unlock(hashtext(:k))"), {"k": _LOCK_KEY}
+            )
+
+
+def _run_pipeline_locked(*, window_days: int, since: Optional[str], county: Optional[str]) -> int:
+    try:
+        _prune_old_artifacts()
+    except Exception as exc:  # noqa: BLE001 — pruning must never block the retune run
+        logger.warning("[retune] artifact pruning failed: %s", exc)
+
     run_id = uuid.uuid4().hex[:12]
     training_csv = TRAINING_DIR / f"{run_id}.csv"
     fit_artifact = FIT_DIR / f"{run_id}.json"
@@ -121,11 +169,15 @@ def run_pipeline(*, window_days: int, since: Optional[str], county: Optional[str
 
     # ── Stage F — gated cutover (records + alerts on block) ───────────────
     f_code = _run("src.tasks.scoring_cutover",
-                  ["--fit-artifact", str(fit_artifact), "--report", str(report_json)])
+                  ["--fit-artifact", str(fit_artifact), "--report", str(report_json),
+                   "--run-id", run_id])
     if f_code == 0:
         logger.info("[retune] Stage F promoted the fit — live scoring will pick it up next run")
         return 0
-    logger.warning("[retune] Stage F did not promote (exit=%d)", f_code)
+    if f_code == 2:
+        logger.error("[retune] Stage F failed on bad input (exit=2) — check report/artifact")
+        return 2
+    logger.warning("[retune] Stage F blocked promotion (exit=%d)", f_code)
     return 1
 
 

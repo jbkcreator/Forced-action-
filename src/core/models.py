@@ -7530,15 +7530,16 @@ class ScoringCutoverLog(Base):
         default=lambda: datetime.now(timezone.utc), server_default=func.now(),
     )
     fit_artifact_path: Mapped[str] = mapped_column(Text, nullable=False)
-    validation_status: Mapped[str] = mapped_column(String(8), nullable=False)  # PASS / WARN / FAIL
+    validation_status: Mapped[str] = mapped_column(String(16), nullable=False)  # PASS / WARN / FAIL / UNKNOWN
     applied: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false",
     )
     weights_snapshot: Mapped[Optional[dict]] = mapped_column(JSONB)
     detail: Mapped[Optional[str]] = mapped_column(Text)
+    run_id: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
 
     __table_args__ = (
-        Index("ix_scoring_cutover_log_active", "applied", "created_at"),
+        Index("ix_scoring_cutover_log_active", "applied", text("created_at DESC")),
     )
 
     def __repr__(self) -> str:

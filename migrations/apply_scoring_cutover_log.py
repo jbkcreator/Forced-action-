@@ -27,12 +27,17 @@ DDL = [
         id                SERIAL PRIMARY KEY,
         created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
         fit_artifact_path TEXT        NOT NULL,
-        validation_status VARCHAR(8)  NOT NULL,
+        validation_status VARCHAR(16) NOT NULL,
         applied           BOOLEAN     NOT NULL DEFAULT false,
         weights_snapshot  JSONB,
-        detail            TEXT
+        detail            TEXT,
+        run_id            VARCHAR(20)
     );
     """,
+    # Additive/idempotent for environments where the table already exists
+    # from before validation_status/run_id were widened/added.
+    "ALTER TABLE scoring_cutover_log ALTER COLUMN validation_status TYPE VARCHAR(16);",
+    "ALTER TABLE scoring_cutover_log ADD COLUMN IF NOT EXISTS run_id VARCHAR(20);",
     "CREATE INDEX IF NOT EXISTS ix_scoring_cutover_log_active "
     "ON scoring_cutover_log (applied, created_at DESC);",
 ]

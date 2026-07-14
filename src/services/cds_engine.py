@@ -2783,6 +2783,14 @@ def _apply_active_fit_artifact(log: logging.Logger) -> None:
         )
 
 
+def _should_apply_active_weights(shadow: bool, no_active_weights: bool) -> bool:
+    """Whether a run should overlay the latest approved Stage F artifact.
+
+    Only live (non-shadow) runs without --no-active-weights auto-apply.
+    """
+    return not shadow and not no_active_weights
+
+
 def main():
     """
     Entry point for CLI / cron execution.
@@ -2993,7 +3001,7 @@ def main():
     # automatic: the engine is a fresh batch process, so it picks up newly
     # approved weights on its next run with no redeploy. config/scoring.py stays
     # the seed default; --no-active-weights forces it.
-    if not args.shadow and not args.no_active_weights:
+    if _should_apply_active_weights(args.shadow, args.no_active_weights):
         _apply_active_fit_artifact(log)
 
     try:

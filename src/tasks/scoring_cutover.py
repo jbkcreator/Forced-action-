@@ -91,7 +91,7 @@ def _usable_proposals(artifact: dict) -> tuple[list[dict], list[str]]:
     for p in artifact.get("proposals", []):
         vertical = p.get("vertical", "<unknown>")
         weights = p.get("vertical_weights") or {}
-        has_signal = any(int(w) > 0 for w in weights.values())
+        has_signal = any(float(w) > 0 for w in weights.values())
         if p.get("coverage_warning") or not has_signal:
             dropped.append(vertical)
         else:
@@ -110,7 +110,7 @@ def _alert(subject: str, body: str) -> None:
 
 # ── Promotion ─────────────────────────────────────────────────────────────────
 
-def promote(artifact_path: Path, report: dict) -> int:
+def promote(artifact_path: Path, report: dict, *, run_id: Optional[str] = None) -> int:
     """Decide + record a cutover. Returns a process exit code (0/1)."""
     artifact = _load_json(artifact_path, "fit artifact")
     overall = report.get("overall_status")
@@ -119,7 +119,7 @@ def promote(artifact_path: Path, report: dict) -> int:
         detail = f"validation status {overall!r} != PASS — not promoting"
         logger.warning("[cutover] %s", detail)
         _record(artifact_path, overall or "UNKNOWN", applied=False,
-                 snapshot=None, detail=detail)
+                 snapshot=None, detail=detail, run_id=run_id)
         _alert("CDS cutover blocked", f"{detail}\nartifact={artifact_path}")
         return 1
 
@@ -128,7 +128,8 @@ def promote(artifact_path: Path, report: dict) -> int:
         detail = ("no vertical cleared the data bar (all proposals had "
                   "coverage warnings or zero weights) — not promoting")
         logger.warning("[cutover] %s", detail)
-        _record(artifact_path, overall, applied=False, snapshot=None, detail=detail)
+        _record(artifact_path, overall, applied=False, snapshot=None, detail=detail,
+                 run_id=run_id)
         _alert("CDS cutover blocked", f"{detail}\nartifact={artifact_path}")
         return 1
 
@@ -148,12 +149,12 @@ def promote(artifact_path: Path, report: dict) -> int:
     )
     logger.info("[cutover] %s", detail)
     _record(approved_path, overall, applied=True,
-            snapshot={"proposals": usable}, detail=detail)
+            snapshot={"proposals": usable}, detail=detail, run_id=run_id)
     return 0
 
 
 def _record(artifact_path: Path, status: str, *, applied: bool,
-            snapshot: Optional[dict], detail: str) -> None:
+            snapshot: Optional[dict], detail: str, run_id: Optional[str] = None) -> None:
     with get_db_context() as session:
         session.add(ScoringCutoverLog(
             fit_artifact_path=str(artifact_path),
@@ -161,6 +162,7 @@ def _record(artifact_path: Path, status: str, *, applied: bool,
             applied=applied,
             weights_snapshot=snapshot,
             detail=detail,
+            run_id=run_id,
         ))
         session.commit()
 
@@ -186,6 +188,8 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                    help="Stage E validation report JSON. Omit to re-run Stage E inline.")
     p.add_argument("--window-days", type=int, default=90,
                    help="Outcome window for the inline Stage E run (default 90).")
+    p.add_argument("--run-id", default=None,
+                   help="Orchestrator run id (scoring_retune.py) to stamp on the audit row.")
     return p.parse_args(argv)
 
 
@@ -197,7 +201,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = _parse_args(argv)
     try:
         report = _resolve_report(args)
-        return promote(args.fit_artifact, report)
+        return promote(args.fit_artifact, report, run_id=args.run_id)
     except FileNotFoundError as exc:
         logger.error("[cutover] %s", exc)
         return 2

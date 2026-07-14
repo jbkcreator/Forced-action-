@@ -30,9 +30,9 @@ def _stub_side_effects(monkeypatch):
     records: list[dict] = []
     alerts: list[tuple[str, str]] = []
 
-    def fake_record(path, status, *, applied, snapshot, detail):
-        records.append({"path": str(path), "status": status,
-                        "applied": applied, "snapshot": snapshot, "detail": detail})
+    def fake_record(path, status, *, applied, snapshot, detail, run_id=None):
+        records.append({"path": str(path), "status": status, "applied": applied,
+                        "snapshot": snapshot, "detail": detail, "run_id": run_id})
 
     monkeypatch.setattr(sc, "_record", fake_record)
     monkeypatch.setattr(sc, "_alert", lambda subject, body: alerts.append((subject, body)))
@@ -92,6 +92,14 @@ def test_promote_pass_writes_sanitized_artifact(tmp_path, _stub_side_effects):
     assert approved["dropped_verticals"] == ["thin"]
 
 
+def test_promote_stamps_run_id_on_the_audit_row(tmp_path, _stub_side_effects):
+    art = _write(tmp_path, _artifact(
+        [{"vertical": "good", "vertical_weights": {"foreclosures": 40}}]))
+    code = sc.promote(art, {"overall_status": "PASS"}, run_id="abc123")
+    assert code == 0
+    assert _stub_side_effects["records"][-1]["run_id"] == "abc123"
+
+
 def test_engine_active_apply_survives_corrupt_artifact(tmp_path, monkeypatch):
     """A corrupt approved artifact must fall back to baseline, not abort scoring
     (_apply_fit_artifact sys.exit(2)s on bad JSON — the live path must catch it)."""
@@ -114,6 +122,15 @@ def test_engine_active_apply_survives_corrupt_artifact(tmp_path, monkeypatch):
 
     # Must return cleanly (baseline weights), NOT raise SystemExit.
     cds_engine._apply_active_fit_artifact(logging.getLogger("test"))
+
+
+def test_should_apply_active_weights():
+    from src.services.cds_engine import _should_apply_active_weights as gate
+
+    assert gate(shadow=False, no_active_weights=False) is True
+    assert gate(shadow=True, no_active_weights=False) is False
+    assert gate(shadow=False, no_active_weights=True) is False
+    assert gate(shadow=True, no_active_weights=True) is False
 
 
 if __name__ == "__main__":
