@@ -1,0 +1,26 @@
+[Unit]
+Description=Cora Agents — Forced Action LangGraph Supervisor
+After=network.target fa-api.service
+Wants=fa-api.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/Forced-action-
+Environment="PATH=/root/Forced-action-/.venv/bin"
+EnvironmentFile=/root/Forced-action-/.env
+
+ExecStart=/root/Forced-action-/.venv/bin/python -m src.agents --serve
+
+Restart=always
+RestartSec=10
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cora
+
+[Install]
+WantedBy=multi-user.target
