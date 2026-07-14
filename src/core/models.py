@@ -5762,6 +5762,10 @@ class BankruptcyAlertSubscription(Base):
         ),
         Index("idx_bkalert_sub_status", "status"),
         Index("idx_bkalert_sub_email", "email"),
+        # Case-insensitive lookups — invite _already_subscribed() and the
+        # invite-conversion join both match on LOWER(email); the plain btree
+        # above can't serve those, this functional index can.
+        Index("idx_bkalert_sub_email_lower", text("lower(email)")),
     )
 
     def __repr__(self) -> str:
@@ -7510,7 +7514,13 @@ class LaneFeeConfigAudit(Base):
 
 
 class CommissionSplit(Base):
-    """Config-as-data commission allocation. `parties` is a list of {party, pct}."""
+    """Config-as-data commission allocation. `parties` is a list of {party, pct}.
+
+    Deal-size fee tiers (Task 3.2 / ADR 0031) are rows here, not code: an active
+    split matches a deal when `min_gross_cents <= gross < max_gross_cents`
+    (`max_gross_cents` NULL = unbounded). `resolve_split_config()` picks the
+    highest-floor matching tier. A new tier is a new row — no schema change.
+    """
 
     __tablename__ = "commission_splits"
 
@@ -7518,6 +7528,8 @@ class CommissionSplit(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     parties: Mapped[list] = mapped_column(JSONB, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    min_gross_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    max_gross_cents: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
 
 
 class CommissionLedgerEntry(Base):

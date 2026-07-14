@@ -16,6 +16,32 @@ logger = logging.getLogger(__name__)
 _SOURCE = "commission_ledger"
 
 
+def resolve_split_config(
+    session: Session,
+    gross_amount_cents: int,
+) -> str | None:
+    """Return the split_config_id for a deal of this size, or None if no tier matches.
+
+    A tier matches when min_gross_cents <= gross < max_gross_cents (max NULL =
+    unbounded). When tiers overlap, the most specific wins: highest floor first,
+    then narrowest ceiling — so a real band beats the catch-all [0, +inf) default.
+    Returns None when no active tier covers the amount, letting the caller fall
+    back to an explicit split_config_id.
+    """
+    row = session.execute(
+        sa_text(
+            "SELECT split_config_id FROM commission_splits "
+            "WHERE is_active = true "
+            "AND min_gross_cents <= :gross "
+            "AND (max_gross_cents IS NULL OR :gross < max_gross_cents) "
+            "ORDER BY min_gross_cents DESC, max_gross_cents ASC NULLS LAST "
+            "LIMIT 1"
+        ),
+        {"gross": gross_amount_cents},
+    ).fetchone()
+    return row.split_config_id if row else None
+
+
 def compute_net_lines(
     session: Session,
     gross_amount_cents: int,
@@ -49,12 +75,17 @@ def post_commission(
     session: Session,
     trigger_transition_id: str,
     gross_amount_cents: int,
-    split_config_id: str,
+    split_config_id: str | None = None,
 ) -> str | None:
     """Post a commission entry for a closed_won transition. Idempotent.
 
     Returns the entry_id string on first call; returns None on replay.
     Looks up the transition to get lane_id, prospect_id, broker_id.
+
+    When split_config_id is None, the split is resolved from gross_amount_cents
+    via the deal-size fee tiers (Task 3.2). This is the authoritative resolution
+    point — the split is chosen here, at the money-write, so the ledger always
+    reflects the tier in force when the entry is posted.
     """
     existing = session.execute(
         sa_text(
@@ -65,6 +96,14 @@ def post_commission(
     ).fetchone()
     if existing is not None:
         return None
+
+    if split_config_id is None:
+        split_config_id = resolve_split_config(session, gross_amount_cents)
+    if split_config_id is None:
+        raise ValueError(
+            f"No split_config_id supplied and no fee tier matches "
+            f"gross_amount_cents={gross_amount_cents}."
+        )
 
     tr = session.execute(
         sa_text(

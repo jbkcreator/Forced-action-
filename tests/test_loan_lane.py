@@ -36,6 +36,7 @@ from src.services.commission_ledger import (
     dispute_entry,
     post_commission,
     post_offset,
+    resolve_split_config,
 )
 from src.services.loan_lane_service import (
     advance_lane,
@@ -141,6 +142,27 @@ def _walk_to_closed_won(session, gross_cents: int = 500_000) -> tuple[str, str, 
 
 def _event_row(payload: dict):
     return SimpleNamespace(event_id=uuid.uuid4(), payload=payload)
+
+
+def _seed_tier(session, split_id: str, *, min_cents: int, max_cents: int | None,
+               platform_pct: int, broker_pct: int) -> str:
+    """Insert a deal-size fee tier (Task 3.2). Rolled back with the test savepoint."""
+    import json
+    session.execute(
+        text("""INSERT INTO commission_splits
+                    (split_config_id, name, parties, is_active, min_gross_cents, max_gross_cents)
+                VALUES (:sid, :sid, CAST(:parties AS jsonb), true, :mn, :mx)"""),
+        {
+            "sid": split_id,
+            "parties": json.dumps(
+                [{"party": "platform", "pct": platform_pct},
+                 {"party": "broker", "pct": broker_pct}]
+            ),
+            "mn": min_cents,
+            "mx": max_cents,
+        },
+    )
+    return split_id
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +369,82 @@ def test_post_commission_idempotent(fresh_db):
         {"t": tid},
     ).scalar()
     assert count == 1
+
+
+def test_flat_split_posts_correct_net_lines_e2e(fresh_db):
+    """E2E-verify the flat 50/50 split (Task 3.2). Tiers deferred, ADR 0031."""
+    _lane_id, _broker_id, tid = _walk_to_closed_won(fresh_db, 500_000)
+    payload = {"to_state": "closed_won", "transition_id": tid,
+               "gross_amount_cents": 500_000, "split_config_id": SPLIT}
+    handle_commission_poster(fresh_db, _event_row(payload))
+
+    net_lines = fresh_db.execute(
+        text("SELECT net_lines FROM commission_ledger WHERE trigger_transition_id = CAST(:t AS uuid)"),
+        {"t": tid},
+    ).scalar()
+    by_party = {l["party"]: l["amount_cents"] for l in net_lines}
+    assert by_party == {"platform": 250_000, "broker": 250_000}
+    assert sum(by_party.values()) == 500_000
+
+
+# ---------------------------------------------------------------------------
+# Deal-size fee tiers (Task 3.2 / ADR 0031)
+# ---------------------------------------------------------------------------
+
+def test_resolve_split_picks_tier_by_deal_size(fresh_db):
+    uniq = uuid.uuid4().hex[:8]
+    small = _seed_tier(fresh_db, f"tier_small_{uniq}", min_cents=0, max_cents=1_000_000,
+                       platform_pct=70, broker_pct=30)
+    large = _seed_tier(fresh_db, f"tier_large_{uniq}", min_cents=1_000_000, max_cents=None,
+                       platform_pct=40, broker_pct=60)
+    # Below 1M → small tier; at/above 1M → large tier (min inclusive, max exclusive).
+    assert resolve_split_config(fresh_db, 500_000) == small
+    assert resolve_split_config(fresh_db, 999_999) == small
+    assert resolve_split_config(fresh_db, 1_000_000) == large
+    assert resolve_split_config(fresh_db, 5_000_000) == large
+
+
+def test_resolve_split_prefers_specific_band_over_catch_all(fresh_db):
+    """A real [0, 1M) band beats the platform_50_broker_50 catch-all [0, +inf)."""
+    uniq = uuid.uuid4().hex[:8]
+    small = _seed_tier(fresh_db, f"tier_small_{uniq}", min_cents=0, max_cents=1_000_000,
+                       platform_pct=70, broker_pct=30)
+    assert resolve_split_config(fresh_db, 500_000) == small
+    # Above the specific band, resolution falls through to the catch-all default.
+    assert resolve_split_config(fresh_db, 5_000_000) == SPLIT
+
+
+def test_post_commission_auto_resolves_tier_when_split_omitted(fresh_db):
+    """The ledger reflects the deal-size tier even when no split is passed."""
+    uniq = uuid.uuid4().hex[:8]
+    _seed_tier(fresh_db, f"tier_big_{uniq}", min_cents=1_000_000, max_cents=None,
+               platform_pct=40, broker_pct=60)
+    _lane_id, _broker_id, tid = _walk_to_closed_won(fresh_db, 2_000_000)
+    entry_id = post_commission(fresh_db, tid, 2_000_000, split_config_id=None)
+    assert entry_id is not None
+    row = fresh_db.execute(
+        text("SELECT split_config_id, net_lines FROM commission_ledger "
+             "WHERE entry_id = CAST(:e AS uuid)"),
+        {"e": entry_id},
+    ).fetchone()
+    assert row.split_config_id == f"tier_big_{uniq}"
+    by_party = {l["party"]: l["amount_cents"] for l in row.net_lines}
+    assert by_party == {"platform": 800_000, "broker": 1_200_000}  # 40/60 of $20k
+
+
+def test_transition_closed_won_resolves_tier_without_explicit_split(fresh_db):
+    """closed_won may omit split_config_id when a deal-size tier covers the gross."""
+    uniq = uuid.uuid4().hex[:8]
+    _seed_tier(fresh_db, f"tier_any_{uniq}", min_cents=0, max_cents=None,
+               platform_pct=55, broker_pct=45)
+    lane_id, broker_id = _claimed_lane(fresh_db)
+    transition(fresh_db, lane_id, "working", broker_id, "qualified")
+    transition(fresh_db, lane_id, "quoted", broker_id, "qualified")
+    transition(fresh_db, lane_id, "committed", broker_id, "docs_received")
+    # No split_config_id — must resolve from the seeded tier, not raise.
+    tid = transition(fresh_db, lane_id, "closed_won", broker_id, "funded",
+                     gross_amount_cents=300_000)
+    assert tid is not None
 
 
 def test_dispute_and_offset_are_append_only(fresh_db):

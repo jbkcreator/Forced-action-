@@ -90,7 +90,7 @@ class TestKillSwitchLevelsConfig:
 
 class TestPulseTemplates:
     def test_daily_template_has_placeholders(self):
-        for ph in ("{date}", "{lead_count}", "{wallet_active}", "{top_deal}", "{alert}", "{kill_switch}"):
+        for ph in ("{date}", "{lead_count}", "{lanes}", "{wallet_active}", "{top_deal}", "{alert}", "{kill_switch}"):
             assert ph in DAILY_PULSE_TEMPLATE
 
     def test_weekly_template_has_placeholders(self):
@@ -99,8 +99,9 @@ class TestPulseTemplates:
 
     def test_daily_template_renders(self):
         msg = DAILY_PULSE_TEMPLATE.format(
-            date="4/22", lead_count=5, wallet_active=3,
-            top_deal="$12,000", alert="test alert", kill_switch="GREEN",
+            date="4/22", lead_count=5, lanes=2, wallet_active=3,
+            top_deal="$12,000", alert="test alert", vendor_cost="",
+            kill_switch="GREEN",
         )
         assert "4/22" in msg
         assert "GREEN" in msg
@@ -125,7 +126,7 @@ class TestKillSwitchStatusUnit:
         results = [avg_score, total, churned]
         call_count = [0]
 
-        def side_effect(stmt):
+        def side_effect(stmt, *args, **kwargs):
             idx = call_count[0]
             call_count[0] += 1
             result = MagicMock()
@@ -168,7 +169,7 @@ class TestComposeDailyUnit:
         results = [lead_count, wallet_active, top_deal, latest_card]
         call_count = [0]
 
-        def side_effect(stmt):
+        def side_effect(stmt, *args, **kwargs):
             idx = call_count[0]
             call_count[0] += 1
             result = MagicMock()
@@ -184,10 +185,11 @@ class TestComposeDailyUnit:
         results = [5, 3, None, None, avg_score, total, churned]  # leads, wallets, deal, card, kill params
         call_count = [0]
 
-        def side_effect(stmt):
+        def side_effect(stmt, *args, **kwargs):
             idx = call_count[0]
             call_count[0] += 1
             result = MagicMock()
+            result.first.return_value.action_taken = "no_op"
             result.scalar_one_or_none.return_value = results[idx] if idx < len(results) else None
             return result
 
@@ -205,10 +207,11 @@ class TestComposeDailyUnit:
         results = [7, 3, None, None, 70.0, 10, 1]
         call_count = [0]
 
-        def side_effect(stmt):
+        def side_effect(stmt, *args, **kwargs):
             idx = call_count[0]
             call_count[0] += 1
             result = MagicMock()
+            result.first.return_value.action_taken = "no_op"
             result.scalar_one_or_none.return_value = results[idx] if idx < len(results) else None
             return result
 
@@ -221,16 +224,35 @@ class TestComposeDailyUnit:
         results = [5, 2, None, None, 60.0, 8, 0]
         call_count = [0]
 
-        def side_effect(stmt):
+        def side_effect(stmt, *args, **kwargs):
             idx = call_count[0]
             call_count[0] += 1
             result = MagicMock()
+            result.first.return_value.action_taken = "no_op"
             result.scalar_one_or_none.return_value = results[idx] if idx < len(results) else None
             return result
 
         db.execute.side_effect = side_effect
         msg = _compose_daily(db)
         assert "no deals" in msg.lower()
+
+    def test_contains_lane_count(self):
+        db = MagicMock()
+        # leads, wallets, deal, alert(.first(), ignored), kill_avg, kill_total, kill_churned, lanes
+        results = [5, 2, None, None, 60.0, 8, 0, 4]
+        call_count = [0]
+
+        def side_effect(stmt, *args, **kwargs):
+            idx = call_count[0]
+            call_count[0] += 1
+            result = MagicMock()
+            result.first.return_value.action_taken = "no_op"
+            result.scalar_one_or_none.return_value = results[idx] if idx < len(results) else None
+            return result
+
+        db.execute.side_effect = side_effect
+        msg = _compose_daily(db)
+        assert "4 lanes" in msg
 
 
 # ============================================================================
@@ -249,10 +271,11 @@ class TestRunPulseDryRunUnit:
             results = [5, 3, None, None, 70.0, 10, 1]
             call_count = [0]
 
-            def side_effect(stmt):
+            def side_effect(stmt, *args, **kwargs):
                 idx = call_count[0]
                 call_count[0] += 1
                 result = MagicMock()
+                result.first.return_value.action_taken = "no_op"
                 result.scalar_one_or_none.return_value = results[idx] if idx < len(results) else None
                 return result
 
@@ -275,10 +298,11 @@ class TestRunPulseDryRunUnit:
             results = [2, 0, 10, 70.0, 10, 1, None]
             call_count = [0]
 
-            def side_effect(stmt):
+            def side_effect(stmt, *args, **kwargs):
                 idx = call_count[0]
                 call_count[0] += 1
                 result = MagicMock()
+                result.first.return_value = None
                 result.scalar_one_or_none.return_value = results[idx] if idx < len(results) else None
                 return result
 
@@ -303,10 +327,11 @@ class TestComposeWeeklyUnit:
         results = [new_subs, churned, active, avg_score, total, churned_kill, card]
         call_count = [0]
 
-        def side_effect(stmt):
+        def side_effect(stmt, *args, **kwargs):
             idx = call_count[0]
             call_count[0] += 1
             result = MagicMock()
+            result.first.return_value = None
             result.scalar_one_or_none.return_value = results[idx] if idx < len(results) else None
             return result
 
@@ -347,7 +372,7 @@ class TestKillSwitchYellow:
         results = [avg_score, total, churned]
         call_count = [0]
 
-        def side_effect(stmt):
+        def side_effect(stmt, *args, **kwargs):
             idx = call_count[0]
             call_count[0] += 1
             result = MagicMock()
@@ -431,10 +456,11 @@ class TestRunPulseLiveSend:
         results = [5, 3, None, None, 70.0, 10, 1]
         call_count = [0]
 
-        def side_effect(stmt):
+        def side_effect(stmt, *args, **kwargs):
             idx = call_count[0]
             call_count[0] += 1
             result = MagicMock()
+            result.first.return_value.action_taken = "no_op"
             result.scalar_one_or_none.return_value = results[idx] if idx < len(results) else None
             return result
 
@@ -490,10 +516,11 @@ class TestRevenuePulseVendorCostLine:
         db = MagicMock()
         call_count = [0]
 
-        def side_effect(stmt):
+        def side_effect(stmt, *args, **kwargs):
             idx = call_count[0]
             call_count[0] += 1
             r = MagicMock()
+            r.first.return_value.action_taken = "no_op"
             r.scalar_one_or_none.return_value = results[idx] if idx < len(results) else None
             return r
 
@@ -565,7 +592,7 @@ class TestFormatKillSwitchScorecardLine:
         row.data_json = card_data
         call_count = [0]
 
-        def side_effect(stmt):
+        def side_effect(stmt, *args, **kwargs):
             idx = call_count[0]
             call_count[0] += 1
             result = MagicMock()
