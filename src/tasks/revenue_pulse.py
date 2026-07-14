@@ -444,13 +444,16 @@ def _pick_worst_feature_for_line(features: list) -> dict | None:
 def _lanes_today_count(db: Session, today: date, county_id: str | None = None) -> int:
     """Return count of lanes created today, optionally scoped to a county.
 
-    Range comparison (not func.date()) so a created_at index stays usable —
-    matches the sibling lead_q pattern. Best-effort like the other pulse
-    metrics: a failure degrades to 0 rather than taking down the daily SMS.
+    Range comparison (not func.date()) so a created_at index stays usable.
+    Lane.created_at is timestamptz, so the day boundary is UTC-aware (matching
+    the _chat_metrics_today pattern) — a naive boundary would misbucket rows
+    when the server clock is not UTC. Best-effort like the other pulse metrics:
+    a failure degrades to 0 rather than taking down the daily SMS.
     """
     try:
+        day_start = datetime.combine(today, datetime.min.time(), tzinfo=timezone.utc)
         query = select(func.count(Lane.lane_id)).where(
-            Lane.created_at >= datetime.combine(today, datetime.min.time())
+            Lane.created_at >= day_start
         )
         if county_id:
             query = query.join(Property, Property.id == Lane.property_id).where(

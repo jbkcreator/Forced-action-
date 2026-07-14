@@ -60,9 +60,9 @@ specific-band-beats-catch-all, auto-resolve at `post_commission` (asserts tiered
 - `post_commission` and `transition` resolve independently from the same table.
   Absent a tier edit in the seconds between close and post they agree; if a tier
   is edited in that window, the post-time value wins — correct, since that is the
-  money-write. (`ponytail:` acceptable drift; add a persisted resolved-split
-  column on `broker_transitions` only if audit needs close-time and post-time to
-  be provably identical.)
+  money-write. This drift is acceptable; add a persisted resolved-split column on
+  `broker_transitions` only if audit needs close-time and post-time to be provably
+  identical.
 - `commission_splits.parties` JSONB shape (`[{"party","pct"}]` →
   `[{"party","amount_cents"}]`) is unchanged; seeded tiers must follow it.
 - `tests/test_broker_state_machine_e2e.py` is a **pre-v6 dead test file** (patches
