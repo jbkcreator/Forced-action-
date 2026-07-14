@@ -96,6 +96,15 @@ class AppSettings(BaseSettings):
 	# Max leads enrolled per daily sweep. Ramp up as the sending domain warms.
 	non_buyer_nurture_daily_cap: int = Field(default=25, env="NON_BUYER_NURTURE_DAILY_CAP")
 
+	# Abandoned-checkout recovery (Task 7). Off by default — the sweep captures
+	# and ages rows but sends nothing until this is enabled after review.
+	checkout_recovery_enabled: bool = Field(default=False, env="CHECKOUT_RECOVERY_ENABLED")
+	# Lead-pack recovery targets EXISTING paying subscribers who abandon a $99
+	# add-on — a different (dunning) motion from prospect cart recovery. Off by
+	# default so enabling checkout_recovery_enabled does NOT start emailing
+	# paying customers. Flip only if we deliberately want to dun add-on abandons.
+	checkout_recovery_lead_pack_enabled: bool = Field(default=False, env="CHECKOUT_RECOVERY_LEAD_PACK_ENABLED")
+
 	# Stripe — set STRIPE_TEST_MODE=true to use test credentials/prices instead of live
 	stripe_test_mode: bool = Field(default=False, env="STRIPE_TEST_MODE")
 

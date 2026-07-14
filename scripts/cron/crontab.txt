@@ -416,6 +416,12 @@ COUNTY_ID=hillsborough
 # Daily sync — pulls per-lead status, maps unsubscribe/bounce to terminal state.
 0 21 * * * $PROJECT/scripts/cron/run.sh src.tasks.non_buyer_nurture_sync
 
+# ── ABANDONED-CHECKOUT RECOVERY (Task 7) ─────────────────────────────────────
+# Every 30 min — sends due recovery touches (1st ~1h after drop-off, follow-up
+# ~24h later) and fails exhausted rows back to non-buyer nurture. Read-only
+# until CHECKOUT_RECOVERY_ENABLED=true (captures + ages rows, sends nothing).
+*/30 * * * * $PROJECT/scripts/cron/run.sh src.tasks.checkout_recovery_sweep
+
 # ── STAGE 5: BUNDLES + AUTOPILOT + ANNUAL ───────────────────────────────────
 # Bundle dispatcher — every hour, contextually offers Weekend / Storm /
 # ZIP Booster / Monthly Reload bundles to wallet subscribers (with A/B pricing)
