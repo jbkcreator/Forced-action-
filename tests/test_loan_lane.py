@@ -349,6 +349,22 @@ def test_post_commission_idempotent(fresh_db):
     assert count == 1
 
 
+def test_flat_split_posts_correct_net_lines_e2e(fresh_db):
+    """E2E-verify the flat 50/50 split (Task 3.2). Tiers deferred, ADR 0031."""
+    _lane_id, _broker_id, tid = _walk_to_closed_won(fresh_db, 500_000)
+    payload = {"to_state": "closed_won", "transition_id": tid,
+               "gross_amount_cents": 500_000, "split_config_id": SPLIT}
+    handle_commission_poster(fresh_db, _event_row(payload))
+
+    net_lines = fresh_db.execute(
+        text("SELECT net_lines FROM commission_ledger WHERE trigger_transition_id = CAST(:t AS uuid)"),
+        {"t": tid},
+    ).scalar()
+    by_party = {l["party"]: l["amount_cents"] for l in net_lines}
+    assert by_party == {"platform": 250_000, "broker": 250_000}
+    assert sum(by_party.values()) == 500_000
+
+
 def test_dispute_and_offset_are_append_only(fresh_db):
     _lane_id, _broker_id, tid = _walk_to_closed_won(fresh_db, 400_000)
     entry_id = post_commission(fresh_db, tid, 400_000, SPLIT)
