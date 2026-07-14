@@ -103,7 +103,7 @@ COUNTY_ID=hillsborough
 # Quora S6 organic-answer pipeline — 06:35 AM UTC daily (after load validator).
 # Picks one keyword via DB rotation (quora_topics + cooldown_days), scrapes Quora,
 # publishes to Cora for classification + answer drafting, upserts to quora_questions.
-35 6 * * * $PROJECT/scripts/cron/run.sh src.tasks.quora_s6_orchestrator
+#35 6 * * * $PROJECT/scripts/cron/run.sh src.tasks.quora_s6_orchestrator
 
 # Autonomous Inbound Content Loop (Task 5.1) — Weekly Sunday @ 09:00 AM UTC.
 # Scores each Quora Seed Keyword over a 30-day window, deactivates losers
@@ -315,6 +315,14 @@ COUNTY_ID=hillsborough
 # Daily reconciliation Mon-Sat — catch any subscribers who paid but weren't activated
 15 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.stripe_reconcile
 
+# MB2 — Fulfillment verification + revenue heartbeat (subscriptions, lead
+# unlocks, hot-lead unlocks, lead packs, premium, bankruptcy-alert, Loan Lane
+# volume) vs Stripe's own daily total; alerts via ALERT_EMAIL on any mismatch
+# or unfulfilled/delayed item. Runs after stripe_reconcile. NOTE: :30 is taken
+# by run_enrichment (below) and revenue_pulse --daily (line ~465) — do not
+# move this back onto :30.
+33 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.revenue_fulfillment_heartbeat
+
 
 # SunBiz LLC Piercing Enrichment — 07:40 AM UTC Mon-Sat (fa031 tiered staleness)
 # Tier A: active-lead pending/30d-stale  •  Tier B: cold pending/180d-stale
@@ -415,6 +423,12 @@ COUNTY_ID=hillsborough
 30 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.non_buyer_nurture_sweep
 # Daily sync — pulls per-lead status, maps unsubscribe/bounce to terminal state.
 0 21 * * * $PROJECT/scripts/cron/run.sh src.tasks.non_buyer_nurture_sync
+
+# ── ABANDONED-CHECKOUT RECOVERY (Task 7) ─────────────────────────────────────
+# Every 30 min — sends due recovery touches (1st ~1h after drop-off, follow-up
+# ~24h later) and fails exhausted rows back to non-buyer nurture. Read-only
+# until CHECKOUT_RECOVERY_ENABLED=true (captures + ages rows, sends nothing).
+*/30 * * * * $PROJECT/scripts/cron/run.sh src.tasks.checkout_recovery_sweep
 
 # ── STAGE 5: BUNDLES + AUTOPILOT + ANNUAL ───────────────────────────────────
 # Bundle dispatcher — every hour, contextually offers Weekend / Storm /
@@ -691,5 +705,16 @@ COUNTY_ID=hillsborough
 # shadow rescore never contends with live scoring. After master parcel refresh
 # (01:00-02:00) and SEO compiler (09:30); before Monday's conversion report.
 0 11 * * 0 $PROJECT/scripts/cron/run.sh src.tasks.scoring_retune --window-days 90
+# ── OWNER ALERT DELIVERY SWEEP (PR #126) ────────────────────────────────────
+# Safety net for notify_owner() speed-to-lead founder alerts: emails the
+# fallback for any owner_alert_dispatch row stuck at status='sms_sent' for
+# 5+ minutes with no Telnyx message.finalized delivery-status callback.
+*/5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.owner_alert_sweep
+# Tiered volume guarantee shortfall sweep — INTENTIONALLY NOT scheduled yet.
+# config/guarantees.py TIER_LEAD_QUOTAS are placeholder lead-per-cycle counts
+# pending a business decision; enabling this cron would issue real Stripe
+# balance credits off unconfirmed numbers. Uncomment once TIER_LEAD_QUOTAS is
+# confirmed (and ideally after a --dry-run pass against production data).
+# 0 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.guarantee_shortfall_sweep
 
 # === END FORCED-ACTION-PLATFORM ===

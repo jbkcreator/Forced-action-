@@ -928,6 +928,24 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
             detail={"error": "payment_gateway_error", "message": "Payment gateway error — please try again"},
         )
 
+    # Abandoned-cart recovery: a real checkout session now exists but isn't paid.
+    # Capture the pre_payment start here (the reliable signal) — never inferred
+    # from a bare free signup. Completion closes it (_on_checkout_completed →
+    # mark_recovered); if it expires the session_expired webhook is a dedup'd
+    # backstop. Capture always; sends stay behind checkout_recovery_enabled.
+    try:
+        from src.services import checkout_recovery
+        checkout_recovery.start_recovery(
+            db,
+            email=payload.email,
+            source="pre_payment",
+            resume_context={"county_id": payload.county_id, "vertical": payload.vertical},
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.warning("[CheckoutRecovery] pre_payment capture failed (non-fatal)", exc_info=True)
+
     return {
         "client_secret": session.client_secret,
         "session_id": session.id,
@@ -1867,6 +1885,9 @@ def event_feed(
                 "wallet_to_lock_eligible": False,
                 "wallet_credits_30d": None,
                 "flash_scarcity_windows": [],
+                "onboarding_completed": subscriber.onboarding_completed,
+                "preferred_property_type": subscriber.preferred_property_type,
+                "investment_budget_band": subscriber.investment_budget_band,
                 **_accelerated_wallet_offer_fields(subscriber, db),
                 **_auto_mode_entitlement_fields(subscriber, db),
                 **_payment_recovery_fields(subscriber),
@@ -2069,6 +2090,9 @@ def event_feed(
                 "wallet_to_lock_eligible": _w2l_eligible_nz,
                 "wallet_credits_30d": _wallet_credits_30d_nz,
                 "flash_scarcity_windows": _flash_windows_nz,
+                "onboarding_completed": subscriber.onboarding_completed,
+                "preferred_property_type": subscriber.preferred_property_type,
+                "investment_budget_band": subscriber.investment_budget_band,
                 **_accelerated_wallet_offer_fields(subscriber, db),
                 **_auto_mode_entitlement_fields(subscriber, db),
                 **_payment_recovery_fields(subscriber),
@@ -2344,6 +2368,9 @@ def event_feed(
             "wallet_to_lock_eligible": _w2l_eligible,
             "wallet_credits_30d": _wallet_credits_30d,
             "flash_scarcity_windows": _flash_windows,
+            "onboarding_completed": subscriber.onboarding_completed,
+            "preferred_property_type": subscriber.preferred_property_type,
+            "investment_budget_band": subscriber.investment_budget_band,
             **_accelerated_wallet_offer_fields(subscriber, db),
             **_payment_recovery_fields(subscriber),
             **_what_you_missed_fields(
@@ -3385,6 +3412,32 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, request: Request, db: S
         logger.error("Stripe error creating lead pack PaymentIntent: %s", exc)
         raise HTTPException(status_code=502, detail={"error": "payment_unavailable", "message": "Could not create payment"})
 
+    # Abandoned-checkout recovery (Task 7): a lead pack has no Stripe Checkout
+    # Session (it's a PaymentIntent), so there's no session.expired signal —
+    # capture the intent now and close it on the success webhook. Best-effort;
+    # never block the checkout response. Messaging is flag-gated in the sweep.
+    # Off by default: lead-pack abandoners are existing paying subscribers, so
+    # we don't dun them unless checkout_recovery_lead_pack_enabled is set.
+    if subscriber.email and _s.checkout_recovery_lead_pack_enabled:
+        try:
+            from src.services import checkout_recovery
+            checkout_recovery.start_recovery(
+                db,
+                email=subscriber.email,
+                source="lead_pack",
+                subscriber_id=subscriber.id,
+                phone=subscriber.phone,
+                resume_context={
+                    "kind": "lead_pack",
+                    "feed_uuid": subscriber.event_feed_uuid,
+                    "lead_pack_zip": payload.zip_code,
+                    "vertical": payload.vertical,
+                },
+            )
+            db.commit()
+        except Exception:
+            logger.warning("checkout_recovery lead_pack capture failed for sub=%s", subscriber.id, exc_info=True)
+
     return {
         "client_secret":    intent["client_secret"],
         "publishable_key":  _s.active_stripe_publishable_key,
@@ -3997,6 +4050,21 @@ async def synthflow_webhook(request: Request):
         payload.resolved_call_id, phone, payload.resolved_outcome,
         result.get("contact_id"), result.get("tags_applied"),
     )
+
+    # Speed-to-lead: instantly alert the founder when a prospect asks for a demo
+    if "demo_requested" in (result.get("tags_applied") or []):
+        from src.services.owner_alert import notify_owner
+        notify_owner(
+            subject="Demo requested",
+            body=(
+                f"Prospect asked for a demo on a Synthflow call.\n"
+                f"Name: {payload.prospect_name or v.get('prospect_name') or lead.get('name') or 'unknown'}\n"
+                f"Phone: {phone}\nVertical: {payload.vertical or v.get('vertical') or ''}\n"
+                f"ZIP: {payload.zip_code or v.get('zip_code') or v.get('zip') or ''}"
+            ),
+            idempotency_key=f"synthflow:{payload.resolved_call_id}",
+        )
+
     return {"status": "ok", **result}
 
 
@@ -4524,9 +4592,20 @@ async def telnyx_inbound(request: Request, db: Session = Depends(get_db)):
         payload_kind="telnyx",
     )
 
-    # Only act on inbound message events. Delivery-status callbacks (e.g.
-    # "message.sent", "message.finalized") share the same webhook URL but
-    # don't need handler routing — we just audit-log them above.
+    # Delivery-status callbacks ("message.sent", "message.finalized") share
+    # this webhook URL with inbound messages. They don't need STOP/HELP or
+    # command routing, but "message.finalized" is how we learn whether a
+    # founder alert SMS (owner_alert.notify_owner) actually reached the
+    # carrier, vs. Telnyx merely having accepted/queued it.
+    if event_type == "message.finalized":
+        from src.services.owner_alert import reconcile_delivery_status
+        recipients = payload.get("to") or [{}]
+        delivery_status = (recipients[0] or {}).get("status", "")
+        reconcile_delivery_status(telnyx_message_id=msg_id, delivery_status=delivery_status)
+        return Response(content="", media_type="application/json")
+
+    # Only act on inbound message events — any other callback type is just
+    # audit-logged above.
     if event_type != "message.received":
         return Response(content="", media_type="application/json")
 
@@ -4815,6 +4894,26 @@ def upgrade(req: UpgradeRequest, db: Session = Depends(get_db)):
     new_price_id = settings.active_stripe_price(price_name)
     if not new_price_id:
         raise HTTPException(status_code=503, detail=f"Stripe price not configured for {req.tier}")
+
+    # Settle every guarantee cycle that already closed on the outgoing tier —
+    # otherwise switching sub.tier off starter/pro/dominator drops it from
+    # the daily sweep's tier filter and any closed cycle is never evaluated.
+    # evaluate_subscriber_guarantee() only advances one cycle per call, so a
+    # subscriber sitting on a backlog of several closed cycles (sweep
+    # downtime, or guarantees just enabled for an existing subscriber) needs
+    # it called until no cycle is left to settle, not just once.
+    from config.guarantees import TIER_LEAD_QUOTAS
+    from src.tasks.guarantee_shortfall_sweep import evaluate_subscriber_guarantee
+    if sub.tier in TIER_LEAD_QUOTAS:
+        try:
+            for _ in range(60):  # safety cap — one iteration per closed cycle
+                if evaluate_subscriber_guarantee(db, sub) is None:
+                    break
+        except Exception:
+            logger.error(
+                "[Upgrade] guarantee settlement failed for sub=%d tier=%s", sub.id, sub.tier,
+                exc_info=True,
+            )
 
     try:
         switch_subscription_plan(sub.stripe_subscription_id, new_price_id, prorate=True)

@@ -1275,6 +1275,17 @@ class Subscriber(Base):
         Boolean, default=True, server_default="true", nullable=False
     )
 
+    # ── Onboarding preference step ───────────────────────────────────────────
+    # True for pre-existing rows (server_default) so the gate never disrupts
+    # subscribers who signed up before this shipped. New signups set this
+    # False explicitly (src/services/signup_engine.py) so first login shows
+    # the one-screen preference step before the dashboard.
+    onboarding_completed: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default="true", nullable=False
+    )
+    preferred_property_type: Mapped[Optional[str]] = mapped_column(String(50))
+    investment_budget_band: Mapped[Optional[str]] = mapped_column(String(30))
+
     # ── Revenue / churn tracking (fa048) ─────────────────────────────────────
     plan_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)
     churned_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -3608,6 +3619,11 @@ class PlatformRevenueLedger(Base):
     source_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     refunded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Actual amount refunded, distinct from amount_cents — a partial refund
+    # must not zero out the whole row. NULL for legacy/not-yet-updated
+    # callers; mark_ledger_refunded() defaults it to the full amount_cents
+    # when the caller doesn't know the actual refunded amount.
+    refunded_amount_cents: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     __table_args__ = (
@@ -3616,6 +3632,19 @@ class PlatformRevenueLedger(Base):
 
     def __repr__(self):
         return f"<PlatformRevenueLedger(subscriber_id={self.subscriber_id}, product_type={self.product_type}, amount_cents={self.amount_cents})>"
+
+
+class RevenueHeartbeatAlertLog(Base):
+    """Cooldown log for src/tasks/revenue_fulfillment_heartbeat.py's alert
+    email — a distinct alert_key re-alerts at most once per cooldown window,
+    so an unresolved issue doesn't nag daily. The CSV report always lists
+    every exception regardless of cooldown; this only suppresses the email.
+    """
+    __tablename__ = "revenue_heartbeat_alert_log"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    alert_key: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    alerted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
 class PlatformCostAttribution(Base):
@@ -4121,6 +4150,42 @@ class SmsSendLog(Base):
 
     def __repr__(self):
         return f"<SmsSendLog(id={self.id}, phone={self.phone}, outcome={self.outcome})>"
+
+
+class OwnerAlertDispatch(Base):
+    """
+    One row per notify_owner() call — claims an idempotency key so a Stripe/
+    Synthflow webhook retry can't fire the same founder alert twice, and
+    tracks SMS delivery state so a Telnyx "queued" response (accepted, not
+    delivered) can still fall back to email once the delivery-status webhook
+    or the sweep confirms it never landed.
+    """
+    __tablename__ = "owner_alert_dispatch"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    alert_key: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
+    subject: Mapped[str] = mapped_column(String(200), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    telnyx_message_id: Mapped[Optional[str]] = mapped_column(String(80))
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending','sms_sent','sms_delivered','sms_failed','email_sent')",
+            name="check_oad_status",
+        ),
+        Index("idx_oad_telnyx_message_id", "telnyx_message_id"),
+        Index("idx_oad_status_created", "status", "created_at"),
+    )
+
+    def __repr__(self):
+        return f"<OwnerAlertDispatch(alert_key={self.alert_key!r}, status={self.status})>"
 
 
 # ============================================================================
@@ -4948,7 +5013,10 @@ class NonBuyerNurtureSequence(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "status IN ('eligible','enrolled','converted','unsubscribed','bounced','removed')",
+            # 'in_recovery' — held out of nurture while an active checkout-recovery
+            # sequence (Task 7) owns the contact; released back to 'eligible' when
+            # recovery fails. Non-'eligible' → excluded by find_candidates.
+            "status IN ('eligible','in_recovery','enrolled','converted','unsubscribed','bounced','removed')",
             name="ck_non_buyer_nurture_status",
         ),
         CheckConstraint(
@@ -4964,6 +5032,58 @@ class NonBuyerNurtureSequence(Base):
 
     def __repr__(self) -> str:
         return f"<NonBuyerNurtureSequence(id={self.id}, email={self.email}, status={self.status})>"
+
+
+class CheckoutRecovery(Base):
+    """
+    Abandoned-checkout recovery sequence — one row per email (Task 7).
+
+    Covers two drop-off paths: a Stripe checkout session that expired without
+    payment (`session_expired`), and a buyer who provisioned a pre-checkout
+    intent but never paid (`pre_payment`). A fast, high-intent "finish your
+    purchase" sequence — distinct from the slower non-buyer nurture drip. While
+    a row is `active`, the sibling non_buyer_nurture row is held at
+    `in_recovery` so the two flows never double-contact the same person; on
+    `failed` the nurture row is released to `eligible`.
+    """
+    __tablename__ = "checkout_recovery"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    email: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    subscriber_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("subscribers.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    phone: Mapped[Optional[str]] = mapped_column(String(20))
+    source: Mapped[str] = mapped_column(String(20), nullable=False)  # session_expired | pre_payment | lead_pack
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="active", server_default="active", index=True
+    )  # active | recovered | failed
+    touches_sent: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    # Context needed to mint a FRESH resume-checkout link — the expired Stripe
+    # session can't be reused, so recovery rebuilds checkout from these.
+    resume_context: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    first_touch_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_touch_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True)
+    closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('active','recovered','failed')",
+            name="ck_checkout_recovery_status",
+        ),
+        CheckConstraint(
+            "source IN ('session_expired','pre_payment','lead_pack')",
+            name="ck_checkout_recovery_source",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return f"<CheckoutRecovery(id={self.id}, email={self.email}, status={self.status}, touches={self.touches_sent})>"
 
 
 class GoldPlusZipSnapshot(Base):
@@ -6799,6 +6919,44 @@ class Delivery(Base):
         return f"<Delivery(property_id={self.property_id}, account_id={self.account_id}, grade={self.grade}, status={self.status})>"
 
 
+class GuaranteeCredit(Base):
+    """Tiered volume guarantee (config/guarantees.py): one row per subscriber
+    per evaluated ~30-day cycle, written by
+    src/tasks/guarantee_shortfall_sweep.py. The (subscriber_id, period_end)
+    unique constraint lets a cycle be claimed with a 'pending' row (INSERT ..
+    ON CONFLICT) before Stripe is called — 'pending'/'failed' rows are not
+    terminal and are retried in place rather than skipped.
+    """
+    __tablename__ = "guarantee_credits"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=False, index=True)
+    period_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    period_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    tier: Mapped[str] = mapped_column(String(20), nullable=False)
+    quota: Mapped[int] = mapped_column(Integer, nullable=False)
+    delivered: Mapped[int] = mapped_column(Integer, nullable=False)
+    shortfall: Mapped[int] = mapped_column(Integer, nullable=False)
+    credit_cents: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    stripe_balance_txn_id: Mapped[Optional[str]] = mapped_column(String(100))
+    # pending (claimed, Stripe call in flight/retryable) | met (no shortfall)
+    # | issued | failed (retryable) | skipped_no_charge_basis
+    status: Mapped[str] = mapped_column(String(30), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("subscriber_id", "period_end", name="uq_guarantee_credit_subscriber_period"),
+        CheckConstraint(
+            "status IN ('pending', 'met', 'issued', 'failed', 'skipped_no_charge_basis')",
+            name="ck_guarantee_credit_status",
+        ),
+        Index("idx_guarantee_credits_subscriber_period", "subscriber_id", "period_end"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<GuaranteeCredit(subscriber={self.subscriber_id}, period_end={self.period_end}, status={self.status})>"
+
+
 class FreeToPaidAttribution(Base):
     """M10/B2 — first-touch attribution (§12.8): the free Bronze lead that started
     a contractor's journey to their first paid subscription. One row per account
@@ -7327,6 +7485,27 @@ class BrokerTransition(Base):
         Index("idx_bt_lane_id", "lane_id"),
         Index("idx_bt_broker_id", "broker_id"),
         Index("idx_bt_lane_occurred", "lane_id", "occurred_at"),
+    )
+
+
+class LaneFeeConfigAudit(Base):
+    """Append-only audit log for every fee_config_flag flip (RESPA gate) on a lane."""
+
+    __tablename__ = "lane_fee_config_audit"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    lane_id: Mapped[str] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("lanes.lane_id"), nullable=False
+    )
+    previous_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    new_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    actor: Mapped[str] = mapped_column(String(255), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("idx_lfca_lane_occurred", "lane_id", "occurred_at"),
     )
 
 

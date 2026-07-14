@@ -286,6 +286,73 @@ class TestSlackFailureTracking:
         assert esc.posted_at is not None
 
 
+# ── whale alert SMS ───────────────────────────────────────────────────────────
+
+class TestFounderWhaleSms:
+    def test_no_founder_phone_skips(self, mock_db):
+        from src.services.human_close_routing import send_founder_sms
+        candidate = _make_candidate()
+        context = _make_context()
+
+        with patch("src.services.human_close_routing.settings") as mock_settings:
+            mock_settings.founder_phone = None
+            result = send_founder_sms(mock_db, candidate, context)
+
+        assert result is False
+
+    def test_sends_transactional_sms_to_founder(self, mock_db):
+        from src.services.human_close_routing import send_founder_sms
+        candidate = _make_candidate()
+        context = _make_context()
+
+        with (
+            patch("src.services.human_close_routing.settings") as mock_settings,
+            patch("src.services.sms_compliance.send_sms", return_value=True) as mock_send,
+        ):
+            mock_settings.founder_phone = "+15551234567"
+            result = send_founder_sms(mock_db, candidate, context)
+
+        assert result is True
+        mock_send.assert_called_once()
+        _, kwargs = mock_send.call_args
+        assert kwargs["to"] == "+15551234567"
+        assert kwargs["message_type"] == "transactional"
+        assert kwargs["subscriber_id"] == candidate.subscriber_id
+
+    def test_suppressed_send_returns_false(self, mock_db):
+        from src.services.human_close_routing import send_founder_sms
+        candidate = _make_candidate()
+        context = _make_context()
+
+        with (
+            patch("src.services.human_close_routing.settings") as mock_settings,
+            patch("src.services.sms_compliance.send_sms", return_value=False),
+        ):
+            mock_settings.founder_phone = "+15551234567"
+            result = send_founder_sms(mock_db, candidate, context)
+
+        assert result is False
+
+    def test_route_candidate_pages_founder_alongside_slack(self, mock_db):
+        """route_candidate fires the whale SMS regardless of Slack outcome."""
+        from src.services.human_close_routing import route_candidate
+
+        candidate = _make_candidate()
+        esc = MagicMock()
+        esc.id = 99
+        esc.post_attempts = 0
+
+        with (
+            patch("src.services.human_close_routing.build_context", return_value=_make_context()),
+            patch("src.services.human_close_routing.record_escalation", return_value=esc),
+            patch("src.services.human_close_routing.send_founder_sms", return_value=True) as mock_sms,
+            patch("src.services.human_close_routing.route_to_slack", return_value=(True, None)),
+        ):
+            route_candidate(mock_db, candidate)
+
+        mock_sms.assert_called_once_with(mock_db, candidate, _make_context())
+
+
 # ── retry task ────────────────────────────────────────────────────────────────
 
 class TestRetryTask:
