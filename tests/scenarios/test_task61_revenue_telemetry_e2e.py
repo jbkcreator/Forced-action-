@@ -472,6 +472,117 @@ def test_lead_pack_refund_marks_every_sent_lead_ledger_row_refunded(fresh_db):
     assert refunded_count == 5
     assert purchase.status == "refunded"
 
+    # Full refund: each row's own full original amount is what gets recorded
+    # as refunded — never assumed via a fixed split; matches what the split
+    # actually assigned each row (2000/5 divides evenly here).
+    refunded_amounts = dict(db.execute(sa_text("""
+        SELECT source_id, refunded_amount_cents FROM platform_revenue_ledger
+        WHERE source_table = 'sent_leads' AND source_id = ANY(:ids)
+    """), {"ids": sent_lead_ids}).all())
+    assert sum(refunded_amounts.values()) == 2000
+    assert all(v == 400 for v in refunded_amounts.values())
+
+
+def test_lead_pack_partial_refund_prorates_across_sent_lead_rows(fresh_db):
+    """Regression for the High review finding on PR #129: a PARTIAL refund
+    of a lead-pack purchase must prorate the refunded amount across each
+    lead's own ledger share, not zero every row's full amount_cents. Row
+    order from the DB isn't guaranteed, so this asserts the invariants that
+    must hold regardless of which specific row absorbs a tie-break cent:
+    the parts sum exactly to the refund, and no row is refunded more than
+    it was ever originally worth."""
+    db = fresh_db
+    from src.services.stripe_webhooks import _on_charge_refunded
+
+    sub = _subscriber(db, "cus_t61w_partial")
+    props = [_prop(db, f"T61W-partial-{i}") for i in range(5)]
+    # 2003 doesn't divide evenly by 5 — exercises the remainder-distribution
+    # path on the ORIGINAL split too (base_share=400, first 3 rows get 401).
+    _lead_pack(db, sub, props, total_amount_cents=2003, pi="pi_t61w_partial")
+
+    sent_lead_ids = [
+        row.id for row in db.execute(sa_text(
+            "SELECT id FROM sent_leads WHERE stripe_payment_intent_id = :pi"
+        ), {"pi": "pi_t61w_partial"}).fetchall()
+    ]
+    original_amounts = dict(db.execute(sa_text("""
+        SELECT source_id, amount_cents FROM platform_revenue_ledger
+        WHERE source_table = 'sent_leads' AND source_id = ANY(:ids)
+    """), {"ids": sent_lead_ids}).all())
+    assert sum(original_amounts.values()) == 2003
+
+    charge = {
+        "id": "ch_t61w_partial", "payment_intent": "pi_t61w_partial",
+        "reason": "requested_by_customer", "amount_refunded": 1000,
+    }
+    with patch("src.services.stripe_webhooks._resolve_premium_purchase_from_charge", return_value=None):
+        _on_charge_refunded(charge, db)
+
+    refunded_amounts = dict(db.execute(sa_text("""
+        SELECT source_id, refunded_amount_cents FROM platform_revenue_ledger
+        WHERE source_table = 'sent_leads' AND source_id = ANY(:ids)
+    """), {"ids": sent_lead_ids}).all())
+
+    assert sum(refunded_amounts.values()) == 1000
+    for sid, refunded in refunded_amounts.items():
+        assert 0 <= refunded <= original_amounts[sid]
+
+    # refunded_at is still set on every row regardless of proration — the
+    # gate for "is this row excluded from confirmed revenue" is unchanged,
+    # only the amount netted is now accurate.
+    refunded_at_count = db.execute(sa_text("""
+        SELECT COUNT(*) FROM platform_revenue_ledger
+        WHERE source_table = 'sent_leads' AND source_id = ANY(:ids) AND refunded_at IS NOT NULL
+    """), {"ids": sent_lead_ids}).scalar()
+    assert refunded_at_count == 5
+
+
+def test_premium_purchase_partial_refund_records_actual_amount(fresh_db):
+    """Regression for the High review finding on PR #129: a partial refund
+    of a single premium purchase must record the actual refunded amount,
+    not silently zero the whole original amount_cents from reporting.
+
+    _resolve_premium_purchase_from_charge is patched to a lightweight stand-in
+    (not a real ORM PremiumPurchase instance) — a full-column ORM SELECT
+    against premium_purchases currently errors in every environment because
+    the model has output_ref_expires_at with no matching migration, a
+    pre-existing bug unrelated to this fix (same reason the lead-pack test
+    above patches it out too). This isolates the actual change under test:
+    that the real refunded amount flows into mark_ledger_refunded."""
+    db = fresh_db
+    from types import SimpleNamespace
+    from src.services.stripe_webhooks import _on_charge_refunded
+
+    sub = _subscriber(db, "cus_t61w_premium_partial")
+    prop = _prop(db, "T61W-premium-partial")
+    purchase_id = _premium_purchase(
+        db, sub, sku="report", amount_cents=10000, property_id=prop.id,
+        delivered_at=_IN, stripe_payment_intent_id="pi_t61w_premium_partial",
+    )
+
+    fake_purchase = SimpleNamespace(
+        id=purchase_id, subscriber_id=sub.id, sku="report", paid_via="card",
+        credits_spent=0, status="delivered", stripe_charge_id=None,
+        refund_reason=None, refund_amount_cents=None, refunded_at=None,
+    )
+    charge = {
+        "id": "ch_t61w_premium_partial", "payment_intent": "pi_t61w_premium_partial",
+        "amount_refunded": 3000, "amount": 10000,
+    }
+    with patch("src.services.stripe_webhooks._resolve_premium_purchase_from_charge",
+               return_value=fake_purchase), \
+         patch("src.services.referral_engine.revoke_team_for_subscriber"), \
+         patch("src.services.stripe_webhooks._send_founder_alert"):
+        _on_charge_refunded(charge, db)
+
+    row = db.execute(sa_text("""
+        SELECT refunded_at, refunded_amount_cents FROM platform_revenue_ledger
+        WHERE source_table = 'premium_purchases' AND source_id = :pid
+    """), {"pid": purchase_id}).fetchone()
+    assert row.refunded_at is not None
+    assert row.refunded_amount_cents == 3000
+    assert fake_purchase.status == "refunded"
+
 
 def test_lead_unlock_second_payment_on_previously_free_lead_records_revenue(fresh_db):
     """A SentLead row can pre-exist with no payment intent (e.g. delivered

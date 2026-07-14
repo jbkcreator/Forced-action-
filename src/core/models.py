@@ -3619,6 +3619,11 @@ class PlatformRevenueLedger(Base):
     source_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     refunded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Actual amount refunded, distinct from amount_cents — a partial refund
+    # must not zero out the whole row. NULL for legacy/not-yet-updated
+    # callers; mark_ledger_refunded() defaults it to the full amount_cents
+    # when the caller doesn't know the actual refunded amount.
+    refunded_amount_cents: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     __table_args__ = (
@@ -3627,6 +3632,19 @@ class PlatformRevenueLedger(Base):
 
     def __repr__(self):
         return f"<PlatformRevenueLedger(subscriber_id={self.subscriber_id}, product_type={self.product_type}, amount_cents={self.amount_cents})>"
+
+
+class RevenueHeartbeatAlertLog(Base):
+    """Cooldown log for src/tasks/revenue_fulfillment_heartbeat.py's alert
+    email — a distinct alert_key re-alerts at most once per cooldown window,
+    so an unresolved issue doesn't nag daily. The CSV report always lists
+    every exception regardless of cooldown; this only suppresses the email.
+    """
+    __tablename__ = "revenue_heartbeat_alert_log"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    alert_key: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    alerted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
 class PlatformCostAttribution(Base):

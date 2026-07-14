@@ -315,6 +315,14 @@ COUNTY_ID=hillsborough
 # Daily reconciliation Mon-Sat — catch any subscribers who paid but weren't activated
 15 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.stripe_reconcile
 
+# MB2 — Fulfillment verification + revenue heartbeat (subscriptions, lead
+# unlocks, hot-lead unlocks, lead packs, premium, bankruptcy-alert, Loan Lane
+# volume) vs Stripe's own daily total; alerts via ALERT_EMAIL on any mismatch
+# or unfulfilled/delayed item. Runs after stripe_reconcile. NOTE: :30 is taken
+# by run_enrichment (below) and revenue_pulse --daily (line ~465) — do not
+# move this back onto :30.
+33 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.revenue_fulfillment_heartbeat
+
 
 # SunBiz LLC Piercing Enrichment — 07:40 AM UTC Mon-Sat (fa031 tiered staleness)
 # Tier A: active-lead pending/30d-stale  •  Tier B: cold pending/180d-stale

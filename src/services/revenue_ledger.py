@@ -104,23 +104,32 @@ def mark_ledger_refunded(
     source_table: str,
     source_id: int,
     refunded_at: Optional[datetime] = None,
+    refunded_amount_cents: Optional[int] = None,
 ) -> None:
     """Propagate a refund/reversal to the matching ledger row so revenue
     reporting excludes it (WHERE refunded_at IS NULL), without any consumer
     needing to know which product-specific table the refund actually lives
     on. Best-effort — a failure here must never block the underlying refund
     from processing.
+
+    `refunded_amount_cents`: pass the actual amount refunded (e.g. Stripe's
+    own amount_refunded) when the caller knows it — a partial refund must
+    only net out the refunded portion, not the row's full amount_cents.
+    Callers that don't pass it (or don't know the actual amount) get the
+    prior full-refund-assumed behavior via the COALESCE fallback.
     """
     try:
         db.execute(text("""
             UPDATE platform_revenue_ledger
-            SET refunded_at = :refunded_at
+            SET refunded_at = :refunded_at,
+                refunded_amount_cents = COALESCE(:refunded_amount_cents, amount_cents)
             WHERE source_table = :source_table AND source_id = :source_id
               AND refunded_at IS NULL
         """), {
             "source_table": source_table,
             "source_id": source_id,
             "refunded_at": refunded_at or datetime.now(),
+            "refunded_amount_cents": refunded_amount_cents,
         })
     except Exception:
         logger.warning(

@@ -35,7 +35,7 @@ from typing import Optional
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-_CONFIRMED_DELIVERY_PRODUCT_TYPES = ("lead_unlock", "lead_pack", "premium_report", "premium_brief")
+_CONFIRMED_DELIVERY_PRODUCT_TYPES = ("lead_unlock", "hot_lead_unlock", "lead_pack", "premium_report", "premium_brief")
 
 
 def compute_platform_enrichment_spend_ratio(
