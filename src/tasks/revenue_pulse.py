@@ -119,7 +119,7 @@ def _compose_daily(db: Session, county_id: str | None = None) -> str:
         )
 
     kill = _kill_switch_status(db, county_id=county_id)
-    lane_count = _lanes_today_count(db, county_id=county_id)
+    lane_count = _lanes_today_count(db, today, county_id=county_id)
     chat = _chat_metrics_today(db)
     claude_savings = _claude_savings_summary(db)
 
@@ -441,16 +441,25 @@ def _pick_worst_feature_for_line(features: list) -> dict | None:
     return max(candidates, key=lambda f: (f.get("red_streak") or 0))
 
 
-def _lanes_today_count(db: Session, county_id: str | None = None) -> int:
-    """Return count of lanes created today, optionally scoped to a county."""
-    query = select(func.count(Lane.lane_id)).where(
-        func.date(Lane.created_at) == date.today()
-    )
-    if county_id:
-        query = query.join(Property, Property.id == Lane.property_id).where(
-            Property.county_id == county_id
+def _lanes_today_count(db: Session, today: date, county_id: str | None = None) -> int:
+    """Return count of lanes created today, optionally scoped to a county.
+
+    Range comparison (not func.date()) so a created_at index stays usable —
+    matches the sibling lead_q pattern. Best-effort like the other pulse
+    metrics: a failure degrades to 0 rather than taking down the daily SMS.
+    """
+    try:
+        query = select(func.count(Lane.lane_id)).where(
+            Lane.created_at >= datetime.combine(today, datetime.min.time())
         )
-    return db.execute(query).scalar_one_or_none() or 0
+        if county_id:
+            query = query.join(Property, Property.id == Lane.property_id).where(
+                Property.county_id == county_id
+            )
+        return db.execute(query).scalar_one_or_none() or 0
+    except Exception as exc:
+        logger.warning("[RevenuePulse] lane count failed: %s", exc)
+        return 0
 
 
 def _chat_metrics_today(db: Session) -> dict:

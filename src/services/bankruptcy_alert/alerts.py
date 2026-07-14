@@ -295,11 +295,15 @@ def _paid_mrr_cents(counts_by_status: dict) -> int:
 def _invite_conversion_stats(db: Session, window_days: int = 7) -> dict:
     """Invite → paid-conversion rate.
 
-    Denominator: bankruptcy_alert_invite messages actually sent. Numerator:
-    those whose subscriber's email later appears as a PAID
-    (status='active') bankruptcy_alert_subscriptions row within window_days
-    of the send — mirrors INVITE_GIVE_UP_HOURS' short attribution window
-    rather than crediting an invite for an unrelated signup months later.
+    Counts DISTINCT invited subscribers, not invite rows — a resend to the
+    same person must not inflate either side (one person, one paid signup =
+    one conversion, however many invites they got).
+
+    Denominator: distinct subscribers actually sent a bankruptcy_alert_invite.
+    Numerator: those whose email later appears as a PAID (status='active')
+    bankruptcy_alert_subscriptions row within window_days of any of their
+    sends — mirrors INVITE_GIVE_UP_HOURS' short attribution window rather
+    than crediting an invite for an unrelated signup months later.
 
     Only 'active' (Stripe-charged) counts — a trialing/canceled signup in the
     window is not a paid conversion, matching _paid_mrr_cents' definition of
@@ -310,8 +314,8 @@ def _invite_conversion_stats(db: Session, window_days: int = 7) -> dict:
 
     row = db.execute(sa_text("""
         SELECT
-            COUNT(*) AS invites_sent,
-            COUNT(*) FILTER (
+            COUNT(DISTINCT m.subscriber_id) AS invites_sent,
+            COUNT(DISTINCT m.subscriber_id) FILTER (
                 WHERE EXISTS (
                     SELECT 1 FROM bankruptcy_alert_subscriptions b
                     WHERE LOWER(b.email) = LOWER(s.email)

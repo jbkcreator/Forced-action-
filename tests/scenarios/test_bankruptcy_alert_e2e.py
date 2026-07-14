@@ -436,3 +436,52 @@ def test_scenario_h_conversion_counts_only_active_paid(fresh_db):
     fresh_db.flush()
     active = _invite_conversion_stats(fresh_db)
     assert active["converted"] == base["converted"] + 1
+
+
+def test_scenario_h_resend_not_double_counted(fresh_db):
+    """Locks the DISTINCT-subscriber counting: two sent invites to the SAME
+    person before one paid signup count as one invited + one converted, not
+    two. schedule_invite dedupes today, so the second row is inserted raw to
+    simulate a future resend path."""
+    from sqlalchemy import text as sa_text
+    from src.services.bankruptcy_alert.invite import schedule_invite
+    from src.services.bankruptcy_alert.subscription import _on_checkout_completed
+    from src.services.bankruptcy_alert.alerts import _invite_conversion_stats
+
+    base = _invite_conversion_stats(fresh_db)
+
+    email = f"resend_{uuid.uuid4().hex[:6]}@example.com"
+    sub_id = _make_property_subscriber(fresh_db, email=email)
+    schedule_invite(fresh_db, sub_id)
+    fresh_db.execute(sa_text("""
+        UPDATE message_outcomes SET send_status = 'sent', sent_at = NOW()
+        WHERE subscriber_id = :sid AND template_id = 'bankruptcy_alert_invite'
+    """), {"sid": sub_id})
+    # Second 'sent' invite row for the same subscriber (a resend).
+    fresh_db.execute(sa_text("""
+        INSERT INTO message_outcomes
+            (subscriber_id, message_type, template_id, channel, send_status,
+             requires_review, conversion_within_4h, conversion_within_24h,
+             conversion_within_48h, scheduled_send_at, sent_at, created_at)
+        VALUES (:sid, 'email', 'bankruptcy_alert_invite', 'ses', 'sent',
+                false, false, false, false, NOW(), NOW(), NOW())
+    """), {"sid": sub_id})
+    fresh_db.flush()
+
+    # Two invite rows, one distinct subscriber → invited counts once.
+    after_send = _invite_conversion_stats(fresh_db)
+    assert after_send["invites_sent"] == base["invites_sent"] + 1
+
+    _on_checkout_completed(
+        _checkout_event(email, "cus_" + uuid.uuid4().hex[:8], "sub_" + uuid.uuid4().hex[:8]),
+        fresh_db,
+    )
+    fresh_db.execute(sa_text("""
+        UPDATE bankruptcy_alert_subscriptions SET status = 'active'
+        WHERE LOWER(email) = LOWER(:e)
+    """), {"e": email})
+    fresh_db.flush()
+
+    # One paid signup credited once, despite two invite rows.
+    active = _invite_conversion_stats(fresh_db)
+    assert active["converted"] == base["converted"] + 1
