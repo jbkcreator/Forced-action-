@@ -1,7 +1,7 @@
 [Unit]
 Description=Cora Agents — Forced Action LangGraph Supervisor
-After=network.target fa-api.service
-Wants=fa-api.service
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target
 
 [Service]
 Type=simple
