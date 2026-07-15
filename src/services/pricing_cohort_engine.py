@@ -51,6 +51,12 @@ _PRICE_BOUNDS: dict[str, tuple[int, int]] = {
     "wallet_growth":  (9900, 19900),   # $99–$199/mo
     "wallet_power":   (19900, 24900),  # $199–$249/mo
     "bundle":        (1500, 9900),     # $15–$99 (conservative range)
+    # Block 1 storefront subscription tiers (src/api/deps.py VALID_TIERS).
+    # Bounds mirror the founding→regular price range per tier (stripe_service.py).
+    "starter":       (60000, 110000),  # $600–$1100/mo
+    "pro":           (110000, 190000), # $1100–$1900/mo
+    "dominator":     (200000, 350000), # $2000–$3500/mo
+    "annual_lock":   (197000, 197000), # flat $1970/yr, no founding/regular split
 }
 
 

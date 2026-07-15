@@ -1453,6 +1453,49 @@ def founding_spots(
 
 # _ZIP_RE and _FLORIDA_PREFIXES imported from src.api.deps
 
+_ZIP_PRICING_TIERS = ("starter", "pro", "dominator", "annual_lock")
+
+
+def _cohort_adjusted_pricing(county_id: str, vertical: str, db: Session) -> dict:
+    """Per-tier founding/regular price for this county+vertical, cohort-adjusted.
+
+    Reuses the already-cached Stripe amounts from _cached_pricing_info() — no
+    extra Stripe call. Falls back to the plain Stripe price when no cohort is
+    active for a given tier (pricing_cohort_engine's own fallback behavior).
+    """
+    from src.services.pricing_cohort_engine import get_price_for_subscriber
+
+    base = _cached_pricing_info()
+    pricing: dict = {}
+    for tier in _ZIP_PRICING_TIERS:
+        tier_base = base.get(tier) or {}
+        founding_amount = tier_base.get("founding_amount")
+        regular_amount = tier_base.get("regular_amount")
+
+        adjusted_founding = founding_amount
+        adjusted_regular = regular_amount
+        source = "base_price"
+
+        if founding_amount is not None:
+            cents, source = get_price_for_subscriber(
+                county_id, vertical, tier, founding_amount * 100, db
+            )
+            adjusted_founding = cents // 100
+        if regular_amount is not None:
+            cents, regular_source = get_price_for_subscriber(
+                county_id, vertical, tier, regular_amount * 100, db
+            )
+            adjusted_regular = cents // 100
+            if source == "base_price":
+                source = regular_source
+
+        pricing[tier] = {
+            "founding_amount": adjusted_founding,
+            "regular_amount": adjusted_regular,
+            "price_source": source,
+        }
+    return pricing
+
 
 @app.get("/api/zip-check")
 def zip_check(
@@ -1512,7 +1555,12 @@ def zip_check(
         raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
 
     if territory is None or territory.status == "available":
-        return {"zip_code": zip_code, "vertical": vertical, "status": "available"}
+        return {
+            "zip_code": zip_code,
+            "vertical": vertical,
+            "status": "available",
+            "pricing": _cohort_adjusted_pricing(county_id, vertical, db),
+        }
 
     if territory.status == "grace":
         return {
@@ -1520,6 +1568,7 @@ def zip_check(
             "vertical": vertical,
             "status": "grace",
             "message": "Opening soon — join waitlist",
+            "pricing": _cohort_adjusted_pricing(county_id, vertical, db),
         }
 
     return {
