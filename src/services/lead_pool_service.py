@@ -7,12 +7,58 @@ process boundary). This module exposes the same queries via service functions.
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import text
+from sqlalchemy import and_, exists, or_, text
 from sqlalchemy.orm import Session
 
 from config.triangulation import PACK_CONTACTABLE_LABELS, PACK_MIN_CONTACTABLE_PCT
+
+# ADR 0032 — insurance-distress segment qualifiers. insurance_claim is
+# deliberately excluded: it's the FEMA bulk source reverted from CDS weight 72
+# on 2026-05-06 (config/scoring.py:130) after it auto-qualified ~38k junk leads.
+INSURANCE_DISTRESS_INCIDENT_TYPES = ("storm_damage", "flood_damage")
+INSURANCE_DISTRESS_VERTICALS = ("wholesalers", "fix_flip")
+
+
+def insurance_distress_segment_clause(now: datetime):
+    """
+    SQLAlchemy WHERE clause selecting properties that qualify for the
+    insurance-distress lead segment (ADR 0032): a genuine flip/investment
+    signal (wholesalers or fix_flip >= Silver floor) AND a storm/flood
+    damage incident within STACKING_WINDOW_DAYS.
+
+    Must be used inside a query that already selects from Property joined
+    to DistressScore (for correlation of the Incident EXISTS subquery).
+    """
+    from config.scoring import LEAD_TIER_THRESHOLDS, STACKING_WINDOW_DAYS
+    from src.core.models import DistressScore, Incident, Property
+
+    silver_floor = next(score for score, tier in LEAD_TIER_THRESHOLDS if tier == "Silver")
+    cutoff = now - timedelta(days=STACKING_WINDOW_DAYS)
+
+    return and_(
+        or_(*(
+            DistressScore.vertical_scores[v].as_float() >= silver_floor
+            for v in INSURANCE_DISTRESS_VERTICALS
+        )),
+        exists().where(
+            Incident.property_id == Property.id,
+            Incident.incident_type.in_(INSURANCE_DISTRESS_INCIDENT_TYPES),
+            Incident.incident_date >= cutoff,
+        ),
+    )
+
+
+def apply_segment_filter(filters: List[Any], segment: Optional[str], now: datetime) -> None:
+    """
+    Append the segment-specific WHERE clause to `filters` in place, if any.
+    Single call site for the checkout gate, the webhook reservation, and the
+    availability endpoint so they can never drift apart (ADR 0032 D5).
+    """
+    if segment == "insurance_distress":
+        filters.append(insurance_distress_segment_clause(now))
 
 
 def get_lead_pool(

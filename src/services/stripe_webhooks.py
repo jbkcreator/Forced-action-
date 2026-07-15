@@ -3798,6 +3798,9 @@ def _on_lead_pack_payment(payment_intent: dict, db: Session) -> None:
     if contact_clause is not None:
         lead_filter.append(contact_clause)
 
+    from src.services.lead_pool_service import apply_segment_filter
+    apply_segment_filter(lead_filter, _attr(meta, "segment"), now)
+
     try:
         from src.services.lead_exclusivity import (
             acquire_zip_lock,
