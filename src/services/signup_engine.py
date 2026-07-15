@@ -391,6 +391,24 @@ def create_free_account_by_email(
 	except Exception:
 		logger.warning("Bankruptcy invite scheduling failed for subscriber %d", sub.id, exc_info=True)
 
+	# New-lead <5-min outbound call — only fires if there's a phone to call.
+	# No phone means no SLA clock and nothing for the fallback sweep to chase.
+	try:
+		if sub.phone:
+			from src.agents.events.ingestion import publish_cora_event
+			publish_cora_event({
+				"event_type": "new_lead_signup",
+				"subscriber_id": sub.id,
+				"payload": {
+					"vertical": sub.vertical,
+					"county_id": sub.county_id,
+					"signup_source": sub.signup_source,
+				},
+				"idempotency_key": f"new_lead_signup:{sub.id}",
+			})
+	except Exception:
+		logger.warning("new_lead_signup event publish failed for subscriber %d", sub.id, exc_info=True)
+
 	return sub
 
 

@@ -601,6 +601,13 @@ COUNTY_ID=hillsborough
 # See ADR 0010 for the SLA/detection rationale.
 */2 * * * * $PROJECT/scripts/cron/run.sh src.tasks.synthflow_voice_drop_sweep
 
+# New-lead <5-min outbound call SLA-timeout sweep — every 2 minutes. Fires
+# the owner_alert + Slack fallback if a new-lead signup's voice call hasn't
+# dispatched within the SLA buffer. Runs independent of the agents process —
+# it only reads subscribers/agent_decisions, so it still catches the failure
+# case even if src.agents --serve itself is down.
+*/2 * * * * $PROJECT/scripts/cron/run.sh src.tasks.new_lead_call_sweep
+
 # Stripe recovery sequence (Day 1 + Day 3) — daily 16:00 UTC, after proactive_save at 10:00.
 0 16 * * * $PROJECT/scripts/cron/run.sh src.tasks.stripe_recovery_sweep
 
