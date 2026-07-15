@@ -175,6 +175,35 @@ def ensure_annual_signup_test(db: Session) -> AbTest:
     )
 
 
+FOLLOWUP_CADENCE_TEST_NAME = "followup_cadence_v1"
+
+# arm -> (second_touch_days, third_touch_days). control is today's literal
+# requirement; variant tests a later cadence. assign_rollout_arm() only ever
+# returns the arm label, not this dict, so callers map the label themselves.
+FOLLOWUP_CADENCE_ARMS = {
+    "control": (2, 5),
+    "variant": (3, 6),
+}
+
+
+def ensure_followup_cadence_test(db: Session) -> AbTest:
+    """Idempotently register the followup_cadence_v1 rollout test.
+
+    Called lazily from the auto_mode_followup_sms sweep so the test row
+    exists before assign_rollout_arm looks it up. 10% traffic_pct only
+    controls the variant/control split (both arms get 100% coverage) —
+    see FOLLOWUP_CADENCE_ARMS for the actual day thresholds per arm.
+    """
+    return get_or_create_test(
+        test_name=FOLLOWUP_CADENCE_TEST_NAME,
+        segment="auto_mode_first_touch_no_reply",
+        variant_a={"path": "control", "second_touch_days": 2, "third_touch_days": 5},
+        variant_b={"path": "variant", "second_touch_days": 3, "third_touch_days": 6},
+        traffic_pct=10,
+        db=db,
+    )
+
+
 def record_pregenerated_arm(
     subscriber_id: int,
     test_name: str,

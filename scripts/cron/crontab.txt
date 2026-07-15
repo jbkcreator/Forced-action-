@@ -441,6 +441,10 @@ COUNTY_ID=hillsborough
 # went 24h+ without a reply (tags GHL contact for Synthflow workflow).
 */30 * * * * $PROJECT/scripts/cron/run.sh src.tasks.auto_mode_followup
 
+# Auto Mode follow-up SMS (2nd/3rd touch) — hourly. Day-level cadence
+# thresholds don't need 30-min precision like the VM sweep above.
+0 * * * * $PROJECT/scripts/cron/run.sh src.tasks.auto_mode_followup_sms
+
 # Annual push — daily 08:00 UTC. Covers all triggers:
 # charter_day_7, day_10_14, two_deals, spend_250, deal_win_10k, auto_switch_day_60.
 # Big-deal-win path also fires inline from /api/deal-capture for instant conversion.

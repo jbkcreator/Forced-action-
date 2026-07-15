@@ -214,6 +214,20 @@ def _compose_first_text(prop: Property, owner: Owner) -> str:
     return line[:320]
 
 
+def _compose_second_text() -> str:
+    return (
+        "Hi again — following up on the property we reached out about. "
+        "Still happy to help. Reply YES to learn more or STOP to opt out."
+    )[:320]
+
+
+def _compose_third_text() -> str:
+    return (
+        "Last check-in on this — if timing's off, reply STOP and we'll leave you be. "
+        "Otherwise reply YES anytime."
+    )[:320]
+
+
 def _record_outcome(subscriber_id: int, body: str, db: Session) -> MessageOutcome:
     outcome = MessageOutcome(
         subscriber_id=subscriber_id,
