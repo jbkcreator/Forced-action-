@@ -1883,7 +1883,8 @@ class ScraperRunStats(Base):
             "'roofing_permits', 'storm_damage', 'flood_damage', 'insurance_claims', 'fire_incidents',"
             "'sunbiz', 'property_appraiser', 'dbpr_company',"
             "'tax_deed_auction', 'vacant_land',"
-            "'tax_deed_outcomes', 'appraiser_sale_outcomes', 'foreclosure_outcomes'"
+            "'tax_deed_outcomes', 'appraiser_sale_outcomes', 'foreclosure_outcomes',"
+            "'outcome_label_layer'"
             ")",
             name="check_run_stats_source_type",
         ),
@@ -2151,10 +2152,10 @@ class OutcomeCandidate(Base):
     records (foreclosure auction results, tax-deed auction results, appraiser
     sales, etc.) by the Cora Data Engine connectors (src/connectors/).
 
-    Deliberately has no FK to deal_outcomes and nothing writes deal_outcomes
-    rows from here directly — DealOutcome.subscriber_id is NOT NULL today, so
-    a separate label layer promotes rows from here into DealOutcome once that
-    constraint is relaxed for pipeline-sourced (subscriber-less) outcomes.
+    Deliberately has no FK to deal_outcomes — the label layer (CDE-10,
+    src/connectors/label_layer.py) promotes unconsumed rows into DealOutcome
+    (subscriber_id NULL, confidence_tier public_record_inferred) keyed by a
+    deterministic source_ref, stamping consumed_at here.
     """
     __tablename__ = "outcome_candidates"
 
@@ -2171,7 +2172,7 @@ class OutcomeCandidate(Base):
     raw_status: Mapped[Optional[str]] = mapped_column(String(100))                     # untranslated source string, for audit
     match_confidence: Mapped[Optional[Decimal]] = mapped_column(Numeric(4, 3))         # only set when resolve_or_quarantine() was used
     match_method: Mapped[Optional[str]] = mapped_column(String(30))
-    consumed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))   # set by the (future) label layer
+    consumed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))   # set by the label layer (src/connectors/label_layer.py)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), onupdate=func.now())
 

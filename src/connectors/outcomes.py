@@ -6,11 +6,11 @@ connectors, and the upsert helper that stages it into outcome_candidates
 Every connector's source data looks different today — a raw status string on
 Foreclosure, a structured sold_to/sold_amount pair on TaxDeedAuction, a
 qualified-sale flag on appraiser records. OutcomeCandidate is the one shape
-a future label layer (CDE-10, not built here) will consume uniformly to
-promote rows into DealOutcome once DealOutcome.subscriber_id is made
-nullable for pipeline-sourced (subscriber-less) outcomes — a separate task.
+the label layer (CDE-10, src/connectors/label_layer.py) consumes uniformly
+to promote rows into DealOutcome.
 
-This module deliberately never writes to deal_outcomes.
+This module deliberately never writes to deal_outcomes — that is exclusively
+the label layer's job.
 """
 from __future__ import annotations
 
