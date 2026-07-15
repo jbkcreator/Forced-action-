@@ -150,6 +150,18 @@ def get_holdout_config(graph: str) -> Optional[Dict[str, Any]]:
 	return None
 
 
+def get_holdout_config_by_test_name(test_name: str) -> Optional[Dict[str, Any]]:
+	"""Look up a holdout config by its test_name (the YAML key) rather than
+	by graph — used by the scheduled surfacing job (cora_holdout_check),
+	which iterates AbTest rows and needs each one's conversion_window_days
+	without knowing which graph it belongs to ahead of time."""
+	cfg = _load_holdout_config()
+	entry = cfg.get(test_name)
+	if not isinstance(entry, dict) or not entry.get("enabled"):
+		return None
+	return {"test_name": test_name, **entry}
+
+
 def get_traffic_config(graph: str) -> Optional[Dict[str, Any]]:
 	"""
 	Return the enabled A/B test config for the given graph, or None if no
@@ -240,15 +252,16 @@ def render_for_subscriber(
 	holdout_cfg = get_holdout_config(graph)
 	if holdout_cfg:
 		try:
-			from src.services.ab_engine import assign_rollout_arm, get_or_create_test
+			from src.services.ab_engine import assign_rollout_arm, get_or_create_holdout_test
 
 			holdout_test_name = holdout_cfg["test_name"]
 			control_pct = int(holdout_cfg.get("control_pct", 10))
-			get_or_create_test(
+			# Uncapped on purpose — traffic_pct here is the treatment majority
+			# (100 - control_pct); ab_engine.get_or_create_test's 10% cap would
+			# invert the split. See get_or_create_holdout_test.
+			get_or_create_holdout_test(
 				test_name=holdout_test_name,
 				segment=holdout_cfg.get("segment", "all"),
-				variant_a={"path": "control"},
-				variant_b={"path": "variant"},
 				traffic_pct=100 - control_pct,
 				db=db,
 			)
@@ -327,12 +340,13 @@ def render_for_subscriber_auto(
 
 
 def reset_ab_config_cache() -> None:
-	"""Drop the cached A/B config so the next call re-reads from disk.
+	"""Drop the cached A/B + holdout configs so the next call re-reads from disk.
 
-	Useful in tests, and in the admin UI when editing cora_ab_tests.yaml
-	live without restarting the process.
+	Useful in tests, and in the admin UI when editing cora_ab_tests.yaml or
+	cora_holdout_tests.yaml live without restarting the process.
 	"""
 	_load_ab_config.cache_clear()
+	_load_holdout_config.cache_clear()
 
 
 def validate_ab_config_vs_db(db: Any = None) -> list:

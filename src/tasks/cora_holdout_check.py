@@ -9,8 +9,13 @@ frozen control by >2σ, both arms >=30 assignments) writes:
        source_key) — status stays 'recommended' until a human adopts it via
        the existing admin endpoint. No auto-promotion: the holdout only
        proves the copy beats baseline, adoption is still a human call.
-    2. A LearningCard (card_type='holdout_result') so future Cora decisions
-       see the result.
+    2. A LearningCard (card_type='holdout_result' — its own constrained
+       value, migrations/apply_learning_card_holdout_result.py; NOT
+       'ab_result', which ab_rollback_check.py/cora_attribution_rollback_
+       check.py already write daily — LearningCard has a table-wide
+       UNIQUE(card_date, card_type), so sharing a type risks two unrelated
+       jobs' results silently overwriting each other the same day) so
+       future Cora decisions see the result.
 
 Never mutates the AbTest itself — that's the whole point of a holdout;
 promotion/rollback of the underlying a/b test stays with ab_rollback_check.
@@ -27,6 +32,7 @@ from datetime import date
 
 from sqlalchemy import select
 
+from src.agents.prompts.loader import get_holdout_config_by_test_name
 from src.core.database import get_db_context
 from src.core.models import AbTest, LearningCard
 from src.services.ab_engine import holdout_verdict
@@ -36,7 +42,13 @@ logger = logging.getLogger(__name__)
 
 
 def _write_learning_card(test_name: str, verdict: dict, db) -> None:
-    """Upsert today's holdout_result learning card. (card_date, card_type) is unique."""
+    """Upsert today's holdout_result learning card. (card_date, card_type) is
+    UNIQUE table-wide — matches ab_rollback_check.py/cora_attribution_
+    rollback_check.py's convention exactly: if more than one holdout test
+    proves on the same day, the latest overwrites the day's card (last write
+    wins), it does not error. A per-test action_taken filter here would
+    instead try to INSERT a second row for the same (card_date, card_type)
+    and hit the UNIQUE constraint."""
     today = date.today()
     existing = db.execute(
         select(LearningCard).where(
@@ -53,7 +65,6 @@ def _write_learning_card(test_name: str, verdict: dict, db) -> None:
     if existing:
         existing.summary_text = summary
         existing.data_json = payload
-        existing.action_taken = f"holdout_proven:{test_name}"
     else:
         db.add(LearningCard(
             card_date=today,
@@ -79,7 +90,16 @@ def run(dry_run: bool = False) -> dict:
         for test in holdout_tests:
             stats["checked"] += 1
             try:
-                verdict = holdout_verdict(test.test_name, db)
+                # conversion_window_days is registry-driven (config/cora_holdout_
+                # tests.yaml) — only retention_v1-style "any paid action within
+                # N days" sequences set it; a missing/disabled YAML entry
+                # falls back to holdout_verdict's unbounded default.
+                holdout_cfg = get_holdout_config_by_test_name(test.test_name)
+                conversion_window_days = (holdout_cfg or {}).get("conversion_window_days")
+
+                verdict = holdout_verdict(
+                    test.test_name, db, conversion_window_days=conversion_window_days,
+                )
                 if verdict["status"] != "proven":
                     continue
 
@@ -118,4 +138,4 @@ def run(dry_run: bool = False) -> dict:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     dry = "--dry-run" in sys.argv
-    print(run(dry_run=dry))
+    logger.info("cora_holdout_check result: %s", run(dry_run=dry))

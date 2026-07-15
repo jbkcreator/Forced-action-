@@ -99,6 +99,46 @@ class TestAbEngineIntegration:
 
         record_outcome(sub.id, test_name, "converted", fresh_db)
 
+    def test_holdout_test_traffic_pct_not_capped(self, fresh_db):
+        """get_or_create_holdout_test must NOT apply the ab_test_traffic_cap
+        (10%) that get_or_create_test does — a holdout's traffic_pct is the
+        treatment majority (e.g. 90), not an AI-copy exposure cap. Capping it
+        would invert the split to 90% control."""
+        from src.services.ab_engine import get_or_create_holdout_test
+
+        test_name = f"holdout_cap_{uuid.uuid4().hex[:8]}"
+        test = get_or_create_holdout_test(
+            test_name=test_name, segment="all", traffic_pct=90, db=fresh_db,
+        )
+        assert test.traffic_pct == 90  # not capped down to 10
+
+    def test_holdout_split_is_roughly_control_pct(self, fresh_db):
+        """End-to-end: a holdout registered at traffic_pct=90 must assign
+        ~10% of subscribers to 'control', not ~90%. This is the assertion
+        that catches the traffic-cap inversion."""
+        from src.services.ab_engine import get_or_create_holdout_test, assign_rollout_arm
+        from src.core.models import Subscriber
+
+        test_name = f"holdout_split_{uuid.uuid4().hex[:8]}"
+        get_or_create_holdout_test(
+            test_name=test_name, segment="all", traffic_pct=90, db=fresh_db,
+        )
+
+        control = 0
+        for _ in range(200):
+            u = uuid.uuid4().hex[:8]
+            sub = Subscriber(
+                stripe_customer_id=f"cus_hs_{u}", tier="starter", vertical="roofing",
+                county_id="hillsborough", event_feed_uuid=f"hs-{u}",
+            )
+            fresh_db.add(sub)
+            fresh_db.flush()
+            if assign_rollout_arm(sub.id, test_name, fresh_db) == "control":
+                control += 1
+
+        # ~10% control expected; generous band rules out the ~90% inversion.
+        assert 5 <= control <= 35, f"expected ~10% control, got {control}/200"
+
     def test_record_pregenerated_arm(self, fresh_db):
         from src.services.ab_engine import record_pregenerated_arm
         from src.core.models import Subscriber
@@ -263,3 +303,62 @@ class TestHoldoutVerdict:
 
         result = holdout_verdict(test_name, fresh_db)
         assert result["status"] == "not_significant"
+
+    def test_conversion_window_excludes_late_outcomes(self, fresh_db):
+        """retention_v1's 'any paid action within 7 days' shape: an outcome
+        recorded 10 days after assignment must NOT count toward the
+        conversion rate when conversion_window_days=7, even though
+        outcome == 'converted'."""
+        from datetime import datetime, timedelta, timezone
+        from src.services.ab_engine import holdout_verdict
+        from src.core.models import Subscriber, AbAssignment
+
+        test_name = f"holdout_{uuid.uuid4().hex[:8]}"
+        test = AbTest(
+            test_name=test_name, segment="all",
+            variant_a={"path": "control"}, variant_b={"path": "variant"},
+            traffic_pct=90, status="active",
+        )
+        fresh_db.add(test)
+        fresh_db.flush()
+
+        assigned_at = datetime.now(timezone.utc) - timedelta(days=20)
+
+        def _seed(arm: str, n: int, n_converted_in_window: int, n_converted_late: int = 0):
+            for i in range(n):
+                uid = uuid.uuid4().hex[:8]
+                sub = Subscriber(
+                    stripe_customer_id=f"cus_hv_{uid}", tier="starter", vertical="roofing",
+                    county_id="hillsborough", event_feed_uuid=f"hv-uuid-{uid}",
+                )
+                fresh_db.add(sub)
+                fresh_db.flush()
+                if i < n_converted_in_window:
+                    outcome, outcome_at = "converted", assigned_at + timedelta(days=3)
+                elif i < n_converted_in_window + n_converted_late:
+                    outcome, outcome_at = "converted", assigned_at + timedelta(days=10)
+                else:
+                    outcome, outcome_at = None, None
+                fresh_db.add(AbAssignment(
+                    test_id=test.id, subscriber_id=sub.id, variant=arm,
+                    outcome=outcome, outcome_at=outcome_at, created_at=assigned_at,
+                ))
+            fresh_db.flush()
+
+        # Both arms: 2 converted within the window, 20 converted LATE (day 10).
+        # Unbounded, the late conversions would swamp the signal; windowed,
+        # they must not count at all.
+        _seed("control", 40, n_converted_in_window=2, n_converted_late=20)
+        _seed("variant", 40, n_converted_in_window=2, n_converted_late=20)
+
+        # window_hours must cover the 20-day-old assignments themselves —
+        # this is a separate concept from conversion_window_days, which
+        # bounds the gap between assignment and *outcome*, not how far back
+        # assignments are queried from.
+        result = holdout_verdict(test_name, fresh_db, window_hours=24 * 30, conversion_window_days=7)
+        assert result["control_rate_pct"] == pytest.approx(5.0, abs=0.1)   # 2/40
+        assert result["variant_rate_pct"] == pytest.approx(5.0, abs=0.1)   # 2/40, not 55/40
+
+        # Sanity: without the window, the late conversions DO count.
+        unbounded = holdout_verdict(test_name, fresh_db, window_hours=24 * 30)
+        assert unbounded["control_rate_pct"] == pytest.approx(55.0, abs=0.1)  # 22/40

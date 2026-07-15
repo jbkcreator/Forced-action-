@@ -110,6 +110,44 @@ def ensure_attribution_rollout_test(db: Session) -> AbTest:
     )
 
 
+def get_or_create_holdout_test(
+    test_name: str,
+    segment: str,
+    traffic_pct: int,
+    db: Session,
+) -> AbTest:
+    """Idempotently register a Task 4.1 control-holdout rollout test.
+
+    Distinct from get_or_create_test: it does NOT apply the
+    ab_test_traffic_cap guardrail. That cap limits AI-copy EXPOSURE for
+    message-swap tests (keep experimental copy under X% of a segment); a
+    holdout's traffic_pct is the opposite — the treatment MAJORITY
+    (100 - control_pct, e.g. 90), with the small remainder held out as a
+    frozen control. Capping it would invert the split (90% control, 10%
+    treatment). Syncs traffic_pct on every call so a control_pct change in
+    cora_holdout_tests.yaml takes effect on restart.
+    """
+    existing = db.execute(
+        select(AbTest).where(AbTest.test_name == test_name)
+    ).scalar_one_or_none()
+    if existing:
+        if existing.traffic_pct != traffic_pct:
+            existing.traffic_pct = traffic_pct
+            db.flush()
+        return existing
+    test = AbTest(
+        test_name=test_name,
+        segment=segment,
+        variant_a={"path": "variant"},
+        variant_b={"path": "control"},
+        traffic_pct=traffic_pct,
+        status="active",
+    )
+    db.add(test)
+    db.flush()
+    return test
+
+
 def assign_rollout_arm(
     subscriber_id: int,
     test_name: str,
@@ -289,6 +327,7 @@ def holdout_verdict(
     *,
     window_hours: int = 168,
     min_per_arm: int = 30,
+    conversion_window_days: Optional[int] = None,
 ) -> dict:
     """Positive-direction verdict for a control-holdout rollout test (ADR 0031/Task 4.1).
 
@@ -296,6 +335,16 @@ def holdout_verdict(
     question: does 'variant' beat 'control' by >2σ? Never mutates the test —
     pure read, called by a scheduled surfacing job, not by any promotion path
     (promotion stays human-adopted via cora_playbook, per fa036).
+
+    conversion_window_days: when set, an assignment only counts toward the
+    conversion numerator if outcome_at - created_at falls within this many
+    days (e.g. retention_v1's "any paid action within 7 days" definition).
+    The assignment still counts toward n_ctrl/n_var either way — only
+    whether it counts as a WIN is time-boxed. None (default) preserves the
+    original behavior: any recorded 'converted' outcome counts, unbounded —
+    correct for sequences with a single, immediate conversion event
+    (wallet activation, lead unlock, lock purchase) rather than a rolling
+    "did anything happen after this" window.
     """
     test = db.execute(
         select(AbTest).where(AbTest.test_name == test_name, AbTest.status == "active")
@@ -318,8 +367,21 @@ def holdout_verdict(
     if n_ctrl < min_per_arm or n_var < min_per_arm:
         return {"status": "insufficient_data", "n_ctrl": n_ctrl, "n_var": n_var, "needed": min_per_arm}
 
-    ctrl_conv = sum(1 for a in ctrl if a.outcome == "converted")
-    var_conv = sum(1 for a in var if a.outcome == "converted")
+    def _converted(a) -> bool:
+        if a.outcome != "converted":
+            return False
+        if conversion_window_days is None:
+            return True
+        if a.outcome_at is None:
+            return False
+        # created_at is a naive DateTime column (legacy); outcome_at is
+        # DateTime(timezone=True). Both represent UTC — strip tzinfo before
+        # subtracting so naive/aware datetimes don't raise a TypeError.
+        outcome_at = a.outcome_at.replace(tzinfo=None) if a.outcome_at.tzinfo else a.outcome_at
+        return (outcome_at - a.created_at) <= timedelta(days=conversion_window_days)
+
+    ctrl_conv = sum(1 for a in ctrl if _converted(a))
+    var_conv = sum(1 for a in var if _converted(a))
     p_ctrl = ctrl_conv / n_ctrl
     p_var = var_conv / n_var
     p_pool = (ctrl_conv + var_conv) / (n_ctrl + n_var)
@@ -356,7 +418,27 @@ def record_outcome(subscriber_id: int, test_name: str, outcome: str, db: Session
     ).scalar_one_or_none()
     if assignment:
         assignment.outcome = outcome
+        assignment.outcome_at = datetime.now(timezone.utc)
         db.flush()
+
+
+def record_holdout_conversion(subscriber_id: int, test_name: str, db: Session) -> None:
+    """Best-effort 'converted' outcome for a Task 4.1 control-holdout test.
+
+    Wraps record_outcome with the swallow-and-log guard every conversion
+    site needs, so the four call sites (wallet activation, lead unlock,
+    checkout completion, any-paid-action) don't each re-implement the same
+    try/except. No-op for any subscriber without an assignment on this test
+    (record_outcome's own guard), so it fires safely regardless of whether
+    the subscriber was ever placed in the holdout.
+    """
+    try:
+        record_outcome(subscriber_id, test_name, "converted", db)
+    except Exception:
+        logger.warning(
+            "holdout record_outcome failed test=%s sub=%s", test_name, subscriber_id,
+            exc_info=True,
+        )
 
 
 def should_rollback(test_name: str, db: Session) -> bool:

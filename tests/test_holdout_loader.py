@@ -122,22 +122,23 @@ class TestRenderForSubscriberHoldoutGate:
         assert (sys_txt, usr_txt) == (expected_sys, expected_usr)
 
     def test_no_holdout_configured_is_pure_passthrough(self, fresh_db):
-        """A graph with no entry in cora_holdout_tests.yaml (e.g. 'fomo')
-        must behave identically to the pre-holdout render_for_subscriber:
-        fomo_sms_v1 is enabled=false in cora_ab_tests.yaml, so the expected
-        output is deterministic — base prompt, no variant."""
+        """A graph with no entry in cora_holdout_tests.yaml (e.g.
+        'nws_urgency') must behave identically to the pre-holdout
+        render_for_subscriber: nws_urgency also has no entry in
+        cora_ab_tests.yaml, so the expected output is deterministic —
+        base prompt, no variant."""
         from src.agents.prompts.loader import (
             render_for_subscriber,
             render_system_and_user,
             get_holdout_config,
         )
 
-        assert get_holdout_config("fomo") is None  # sanity: no holdout entry for fomo
+        assert get_holdout_config("nws_urgency") is None  # sanity: no holdout entry
 
         sub = _make_subscriber(fresh_db)
         context = {"first_name": "Test", "zip_code": "33601"}
 
-        result = render_for_subscriber("fomo", sub.id, context, fresh_db)
-        expected_sys, expected_usr = render_system_and_user("fomo", context)
+        result = render_for_subscriber("nws_urgency", sub.id, context, fresh_db)
+        expected_sys, expected_usr = render_system_and_user("nws_urgency", context)
 
         assert result == (expected_sys, expected_usr, None, None)

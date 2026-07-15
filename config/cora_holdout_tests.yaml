@@ -13,6 +13,15 @@
 #                              whatever copy the graph would normally render —
 #                              base prompt or an active a/b variant).
 #   segment        optional — subscriber segment filter ("all" by default)
+#   conversion_window_days
+#                  optional — read by cora_holdout_check (not by the loader
+#                  gate) and passed to ab_engine.holdout_verdict. Bounds the
+#                  gap between assignment and outcome for sequences whose
+#                  conversion is "any paid action within N days" rather than
+#                  one specific, immediate purchase event. Omit for
+#                  sequences with a single discrete conversion event —
+#                  unbounded is correct there (wallet activation, lead
+#                  unlock, lock purchase all convert once, immediately).
 #
 # NOTE: assign_rollout_arm's traffic_pct means "% in the 'variant' arm", the
 # INVERSE of control_pct. The loader computes traffic_pct = 100 - control_pct
@@ -23,3 +32,22 @@ wallet_push_holdout:
   enabled:     true
   control_pct: 10
   segment:     all
+
+fomo_holdout:
+  graph:       fomo
+  enabled:     true
+  control_pct: 10
+  segment:     all
+
+lock_close_holdout:
+  graph:       wallet_to_lock_close
+  enabled:     true
+  control_pct: 10
+  segment:     all
+
+retention_holdout:
+  graph:       retention
+  enabled:     true
+  control_pct: 10
+  segment:     all
+  conversion_window_days: 7
