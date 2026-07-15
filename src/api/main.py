@@ -6732,6 +6732,23 @@ def referral_share_page(referral_code: str, db: Session = Depends(get_db)):
     if not referrer:
         raise HTTPException(status_code=404, detail="Referral link not found")
 
+    try:
+        with db.begin_nested():
+            db.execute(
+                text(
+                    "UPDATE referral_prompt_funnel "
+                    "SET state = 'shared', shared_at = now() "
+                    "WHERE id = ("
+                    "  SELECT id FROM referral_prompt_funnel "
+                    "  WHERE subscriber_id = :sid AND state = 'shown' "
+                    "  ORDER BY prompt_shown_at DESC LIMIT 1"
+                    ")"
+                ),
+                {"sid": referrer.id},
+            )
+    except Exception as exc:
+        logger.warning("[ReferralPrompt] shown->shared advance failed for referrer=%d: %s", referrer.id, exc)
+
     copy_body = get_current_copy(referrer.vertical, db)
     _settings = get_settings()
     base_url = getattr(_settings, "base_url", "")

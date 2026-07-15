@@ -848,6 +848,15 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
                 "[Referral] confirmed: referee=%d event=%d",
                 subscriber.id, event.id,
             )
+            try:
+                with db.begin_nested():
+                    from src.services.referral_prompt_service import mark_confirmed
+                    mark_confirmed(event.referrer_subscriber_id, event.id, db)
+            except Exception:
+                logger.warning(
+                    "[ReferralPrompt] funnel confirm advance failed for event=%d — non-fatal",
+                    event.id, exc_info=True,
+                )
     except Exception:
         logger.error(
             "[Referral] confirm/reward failed for subscriber %d — non-fatal",
@@ -2133,6 +2142,15 @@ def _on_payment_intent_succeeded(payment_intent, db: Session) -> None:
                 subscriber_id, event.id, pi_id, product,
                 event.referrer_subscriber_id, event.confirmed_at,
             )
+            try:
+                with db.begin_nested():
+                    from src.services.referral_prompt_service import mark_confirmed
+                    mark_confirmed(event.referrer_subscriber_id, event.id, db)
+            except Exception:
+                logger.warning(
+                    "[ReferralPrompt] funnel confirm advance failed for event=%d — non-fatal",
+                    event.id, exc_info=True,
+                )
     except Exception as exc:
         logger.error(
             "[Referral] PI-path confirm failed for subscriber %s — non-fatal: %s",

@@ -52,8 +52,10 @@ def _mk_sub_and_prop(fresh_db, *, account_age_days: int = 30, founding: bool = F
 
 
 def _cleanup(fresh_db, sub, prop):
+    from sqlalchemy import text
     fresh_db.execute(DealOutcome.__table__.delete().where(DealOutcome.subscriber_id == sub.id))
     fresh_db.execute(CoraSuppression.__table__.delete().where(CoraSuppression.subscriber_id == sub.id))
+    fresh_db.execute(text("DELETE FROM referral_prompt_funnel WHERE subscriber_id = :sid"), {"sid": sub.id})
     fresh_db.delete(sub)
     fresh_db.delete(prop)
     fresh_db.commit()
