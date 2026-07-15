@@ -1462,6 +1462,15 @@ def _cohort_adjusted_pricing(county_id: str, vertical: str, db: Session) -> dict
     Reuses the already-cached Stripe amounts from _cached_pricing_info() — no
     extra Stripe call. Falls back to the plain Stripe price when no cohort is
     active for a given tier (pricing_cohort_engine's own fallback behavior).
+
+    pricing_cohorts stores exactly one fixed adjusted price per (county_id,
+    trade_vertical, price_type) — not a percentage — so the cohort lookup is
+    only done once per tier, anchored on the regular price. The founding price
+    is then scaled by the base founding/regular ratio so it stays
+    proportionally cheaper than regular instead of collapsing to the same
+    number (calling get_price_for_subscriber a second time with the founding
+    cents would just return the same fixed cohort price again, destroying the
+    founding discount).
     """
     from src.services.pricing_cohort_engine import get_price_for_subscriber
 
@@ -1472,22 +1481,24 @@ def _cohort_adjusted_pricing(county_id: str, vertical: str, db: Session) -> dict
         founding_amount = tier_base.get("founding_amount")
         regular_amount = tier_base.get("regular_amount")
 
-        adjusted_founding = founding_amount
-        adjusted_regular = regular_amount
-        source = "base_price"
+        if regular_amount is None:
+            # No canonical regular price to anchor a cohort lookup on.
+            pricing[tier] = {
+                "founding_amount": founding_amount,
+                "regular_amount": regular_amount,
+                "price_source": "base_price",
+            }
+            continue
 
+        adjusted_regular_cents, source = get_price_for_subscriber(
+            county_id, vertical, tier, regular_amount * 100, db
+        )
+        adjusted_regular = adjusted_regular_cents // 100
+
+        adjusted_founding = None
         if founding_amount is not None:
-            cents, source = get_price_for_subscriber(
-                county_id, vertical, tier, founding_amount * 100, db
-            )
-            adjusted_founding = cents // 100
-        if regular_amount is not None:
-            cents, regular_source = get_price_for_subscriber(
-                county_id, vertical, tier, regular_amount * 100, db
-            )
-            adjusted_regular = cents // 100
-            if source == "base_price":
-                source = regular_source
+            ratio = founding_amount / regular_amount
+            adjusted_founding = round(adjusted_regular * ratio)
 
         pricing[tier] = {
             "founding_amount": adjusted_founding,

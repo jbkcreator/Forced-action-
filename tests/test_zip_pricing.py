@@ -36,6 +36,13 @@ def test_cohort_adjusted_pricing_falls_back_to_base_price():
 
 
 def test_cohort_adjusted_pricing_reflects_active_cohort():
+    """pricing_cohorts stores one FIXED price per (county, vertical, price_type) —
+    not a percentage. get_price_for_subscriber ignores the base_price_cents it's
+    given and returns that fixed cohort price whenever a cohort is active. This
+    test's mock reflects that real behavior (constant return, independent of the
+    cents passed in) — a mock that scales the input instead would mask the bug
+    where founding_amount and regular_amount collapse to the same number.
+    """
     from src.api import main as api_main
 
     fake_base = {
@@ -47,7 +54,7 @@ def test_cohort_adjusted_pricing_reflects_active_cohort():
 
     def fake_get_price(county, vertical, tier, cents, db):
         if tier == "starter":
-            return int(cents * 1.10), "cohort_adjusted"
+            return 88000, "cohort_adjusted"  # fixed cohort price: $880, regardless of cents in
         return cents, "base_price"
 
     with patch.object(api_main, "_cached_pricing_info", return_value=fake_base):
@@ -57,7 +64,12 @@ def test_cohort_adjusted_pricing_reflects_active_cohort():
         ):
             pricing = api_main._cohort_adjusted_pricing("hillsborough", "roofing", db=None)
 
-    assert pricing["starter"]["founding_amount"] == 660  # +10%
+    # Regular anchors directly on the cohort's fixed price.
+    assert pricing["starter"]["regular_amount"] == 880
+    # Founding is scaled by the base 600/800 = 0.75 ratio, NOT equal to regular —
+    # proves founding/regular don't collapse to the same number.
+    assert pricing["starter"]["founding_amount"] == 660  # round(880 * 0.75)
+    assert pricing["starter"]["founding_amount"] != pricing["starter"]["regular_amount"]
     assert pricing["starter"]["price_source"] == "cohort_adjusted"
 
 
