@@ -102,7 +102,7 @@ class TestMaybeSendReferralPromptUnit:
              patch("src.services.sms_compliance.send_sms", return_value=True) as mock_sms, \
              patch("src.services.email.send_email", return_value=True) as mock_email, \
              patch("config.settings.get_settings") as mock_settings:
-            mock_settings.return_value.base_url = "https://app.example.com"
+            mock_settings.return_value.app_base_url = "https://app.example.com"
             result = maybe_send_referral_prompt(
                 sub, mock_db, trigger_type="deal_win",
                 trigger_source_table="deal_outcomes", trigger_source_id=4,

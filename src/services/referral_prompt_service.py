@@ -80,8 +80,7 @@ def maybe_send_referral_prompt(
 
     from config.settings import get_settings
     settings = get_settings()
-    base_url = getattr(settings, "base_url", "")
-    share_url = f"{base_url}/share/{referral_code}"
+    share_url = f"{settings.app_base_url}/share/{referral_code}"
 
     sms_sent = False
     email_sent = False
