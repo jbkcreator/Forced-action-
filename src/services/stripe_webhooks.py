@@ -2096,6 +2096,7 @@ def _on_payment_intent_succeeded(payment_intent, db: Session) -> None:
         notify_owner(
             subject=f"Purchase — {product}",
             body=f"Product: {product}\nAmount: ${(amount or 0) / 100:.2f}\nPI: {pi_id}\nCustomer: {customer_id}",
+            idempotency_key=f"stripe:{pi_id}",
         )
 
     # ── Referral confirmation (any PI-based paid action) ─────────────────
