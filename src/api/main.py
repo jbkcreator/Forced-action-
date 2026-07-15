@@ -41,7 +41,7 @@ from src.services.stripe_webhooks import handle_webhook
 from src.services.stripe_service import get_price_id_for_checkout, get_price_id_for_preview, _price_ids
 from src.services import lead_exclusivity
 from config.settings import get_settings
-from config.scoring import VERTICAL_WEIGHTS, for_county
+from config.scoring import VERTICAL_WEIGHTS, for_county, is_hot_score
 from config.constants import TIER_DISPLAY
 from src.utils.logger import setup_logging
 from src.services.rate_limit import enforce_or_429
@@ -2020,6 +2020,7 @@ def event_feed(
                             "vertical_score": score.vertical_scores.get(subscriber.vertical) if score.vertical_scores else None,
                             "lead_tier": _visible_tier,
                             "urgency": _visible_urgency,
+                            "is_hot": is_hot_score(score.final_cds_score),
                             "distress_types": score.distress_types,
                             "est_job_value": _estimate_lead_job_value(prop, score),
                             "incidents": inc_map.get(prop.id, []),
@@ -2307,6 +2308,7 @@ def event_feed(
             "vertical_score": score.vertical_scores.get(subscriber.vertical) if score.vertical_scores else None,
             "lead_tier": _visible_tier,
             "urgency": _visible_urgency,
+            "is_hot": is_hot_score(score.final_cds_score),
             "distress_types": score.distress_types,
             "est_job_value": _estimate_lead_job_value(prop, score),
             "incidents": incidents_by_prop.get(prop.id, []),
@@ -3734,7 +3736,6 @@ def lead_pack_detail(purchase_id: int, db: Session = Depends(get_db)):
 class HotLeadUnlockRequest(BaseModel):
     feed_uuid: str
     lead_id: str
-    reduced: bool = False
 
 @app.post("/api/hot-lead-unlock")
 def hot_lead_unlock(payload: HotLeadUnlockRequest, db: Session = Depends(get_db)):
@@ -3754,12 +3755,24 @@ def hot_lead_unlock(payload: HotLeadUnlockRequest, db: Session = Depends(get_db)
     if not subscriber.stripe_customer_id:
         raise HTTPException(status_code=400, detail="No Stripe customer linked")
 
+    # Server decides the discount — never trust a client-supplied `reduced`
+    # flag, or any subscriber could force the $99 rate on every unlock.
+    from src.services.flash_scarcity import is_reduced_rate_active
+    prop_zip = None
+    if payload.lead_id.isdigit():
+        prop_zip_row = db.execute(
+            text("SELECT zip FROM properties WHERE id = :property_id"),
+            {"property_id": int(payload.lead_id)},
+        ).mappings().first()
+        prop_zip = prop_zip_row["zip"] if prop_zip_row else None
+    reduced = is_reduced_rate_active(db, subscriber.id, prop_zip)
+
     from src.services.stripe_service import create_hot_lead_unlock_link
     try:
         result = create_hot_lead_unlock_link(
             subscriber_stripe_customer_id=subscriber.stripe_customer_id,
             lead_id=payload.lead_id,
-            reduced=payload.reduced,
+            reduced=reduced,
             customer_email=subscriber.email,
         )
     except ValueError as exc:

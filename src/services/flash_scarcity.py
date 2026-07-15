@@ -149,6 +149,18 @@ def _subscriber_relevant_zips(db: Session, subscriber_id: int) -> list[tuple[str
     return result
 
 
+def is_reduced_rate_active(db: Session, subscriber_id: int, zip_code: Optional[str]) -> bool:
+    """Return True if `zip_code` is inside one of this subscriber's active flash-scarcity windows.
+
+    Single source of truth for "does this subscriber get the $99 reduced
+    hot-lead rate right now" — the server, not the client, decides this.
+    """
+    if not zip_code:
+        return False
+    active_zips = {w["zip_code"] for w in get_active_windows_for_subscriber(db, subscriber_id)}
+    return zip_code in active_zips
+
+
 def get_active_windows_for_subscriber(db: Session, subscriber_id: int) -> list[dict]:
     """Return active flash-scarcity windows for ZIPs this subscriber holds or has been active in."""
     try:

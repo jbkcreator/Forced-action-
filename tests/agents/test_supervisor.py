@@ -196,3 +196,39 @@ def test_feedback_ritual_candidate_routes_to_feedback_ritual_processor():
 	# Must run inside db.session_scope() (db has no .session) and pass that session.
 	expected_session = mock_db.session_scope.return_value.__enter__.return_value
 	mock_process.assert_called_once_with(expected_session, "dec-777", actor="system")
+
+
+def test_unlock_purchased_routes_to_nudge_conversion_recorder():
+	with patch("src.agents.supervisor.log_decision"), \
+		 patch("src.agents.supervisor.db") as mock_db, \
+		 patch("src.services.nudge_conversion.record_nudge_conversion") as mock_record:
+		r = dispatch_event({
+			"event_type": "unlock_purchased",
+			"subscriber_id": 55,
+			"payload": {"property_id": 9001, "product": "hot_lead_unlock", "revenue": 99.0},
+		})
+
+	assert r["outcome"] == "routed"
+	assert r["graph_name"] == "unlock_outcome_recorder"
+	# Must run inside db.session_scope() (db has no .session) and pass that session.
+	expected_session = mock_db.session_scope.return_value.__enter__.return_value
+	mock_record.assert_called_once_with(
+		55, conversion_type="unlock", revenue=99.0, db=expected_session,
+	)
+
+
+def test_unlock_purchased_still_routes_when_recorder_fails():
+	"""A nudge-recording failure must not turn an unlock_purchased event into
+	an unknown_event_type drop — it always short-circuits before that lookup."""
+	with patch("src.agents.supervisor.log_decision"), \
+		 patch("src.agents.supervisor.db") as mock_db, \
+		 patch("src.services.nudge_conversion.record_nudge_conversion",
+			   side_effect=RuntimeError("boom")):
+		r = dispatch_event({
+			"event_type": "unlock_purchased",
+			"subscriber_id": 55,
+			"payload": {"property_id": 9001},
+		})
+
+	assert r["outcome"] == "routed"
+	assert r["graph_name"] == "unlock_outcome_recorder"
