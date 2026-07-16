@@ -5650,6 +5650,9 @@ def free_signup(req: FreeSignupRequest, request: Request, db: Session = Depends(
     Idempotent on email — re-visiting with the same email returns the
     existing subscriber's feed_uuid without creating duplicates.
     """
+    if not get_settings().freemium_funnel_enabled:
+        raise HTTPException(status_code=403, detail="freemium funnel disabled")
+
     if req.vertical not in VALID_VERTICALS:
         raise HTTPException(
             status_code=400,
@@ -5829,6 +5832,9 @@ class WallSessionRequest(BaseModel):
 @app.post("/api/wall/session", status_code=201)
 def create_wall_session(req: WallSessionRequest, db: Session = Depends(get_db)):
     """Create a monetization wall session for a new subscriber."""
+    if not get_settings().freemium_funnel_enabled:
+        raise HTTPException(status_code=403, detail="freemium funnel disabled")
+
     from src.services.monetization_wall import create_session, get_roi_frame
     state = create_session(req.subscriber_id, req.session_id)
     roi = get_roi_frame(req.vertical, req.county_id, db)

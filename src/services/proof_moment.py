@@ -55,6 +55,10 @@ def get_proof_leads(
     fully-enriched form with `unlocked: True`. Without feed_uuid the behavior
     is unchanged.
     """
+    from config.settings import get_settings
+    if not get_settings().freemium_funnel_enabled:
+        return {"revealed": None, "blurred": [], "county_id": county_id, "vertical": vertical}
+
     try:
         score_col = DistressScore.vertical_scores[vertical].as_float()
     except (KeyError, TypeError):
@@ -212,6 +216,10 @@ def get_blurred_stack(
     blurred and no contact info is returned. Frontend renders the "Unlock for $4"
     CTA per card.
     """
+    from config.settings import get_settings
+    if not get_settings().freemium_funnel_enabled:
+        return []
+
     try:
         score_col = DistressScore.vertical_scores[vertical].as_float()
     except (KeyError, TypeError):
