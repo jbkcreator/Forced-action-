@@ -163,7 +163,21 @@ def start_recovery(
     if participates_in_nurture:
         _suppress_nurture(db, email, subscriber_id)
     logger.info("[CheckoutRecovery] started email=%s source=%s", email, source)
+    _alert_founder(email, source, phone)
     return row
+
+
+def _alert_founder(email: str, source: str, phone: Optional[str]) -> None:
+    """B1-04: ping the founder on every new abandonment (subscription or lead
+    pack) so they can personally follow up. Fires once per email (this is only
+    reached on the new-row path, never the no-op replay) and unconditionally —
+    unlike the customer-facing touches this isn't gated by
+    checkout_recovery_enabled, since it sends nothing to the buyer."""
+    from src.services.stripe_webhooks import _send_founder_alert
+    message = f"ABANDONED CHECKOUT: {source} email={email}"
+    if phone:
+        message += f" phone={phone}"
+    _send_founder_alert(message)
 
 
 def _close(db, email: str, status: str) -> Optional[CheckoutRecovery]:

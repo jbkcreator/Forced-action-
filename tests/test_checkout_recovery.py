@@ -75,6 +75,32 @@ def test_build_resume_url():
     assert cr.build_resume_url("https://app.example.com", None) == "https://app.example.com/#pricing"
 
 
+def test_start_recovery_alerts_founder_once(monkeypatch):
+    """B1-04: a new abandonment pings the founder; a replay on the same
+    already-active row does not re-alert."""
+    import src.services.stripe_webhooks as webhooks_mod
+
+    alerts = []
+    monkeypatch.setattr(webhooks_mod, "_send_founder_alert", lambda msg: alerts.append(msg))
+
+    email = _email()
+    try:
+        with get_db_context() as db:
+            from src.services import checkout_recovery as cr
+            cr.start_recovery(db, email=email, source="lead_pack", phone="+18135551234")
+            db.commit()
+        assert len(alerts) == 1
+        assert email in alerts[0]
+        assert "lead_pack" in alerts[0]
+
+        with get_db_context() as db:
+            cr.start_recovery(db, email=email, source="lead_pack", phone="+18135551234")
+            db.commit()
+        assert len(alerts) == 1  # no-op replay: no second alert
+    finally:
+        _cleanup(email)
+
+
 def _insert_active(db, email, *, touches_sent=0, started_at=None, last_touch_at=None, phone=None):
     from datetime import datetime, timezone
     db.add(CheckoutRecovery(
