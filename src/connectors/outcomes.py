@@ -33,9 +33,12 @@ EVENT_TYPE_TAX_DEED_CANCELLED = "tax_deed_cancelled"
 EVENT_TYPE_TAX_DEED_REDEEMED = "tax_deed_redeemed"
 EVENT_TYPE_QUALIFIED_SALE = "qualified_sale"
 EVENT_TYPE_UNQUALIFIED_SALE = "unqualified_sale"
+EVENT_TYPE_PROBATE_SALE = "probate_sale"
+EVENT_TYPE_LIEN_SALE = "lien_sale"
+EVENT_TYPE_DEED_FLIP = "deed_flip"
 
 # Keep in sync with OutcomeCandidate.check_outcome_candidate_event_type (models.py)
-# and scripts/apply_cde09_outcome_candidates_table.py's CHECK constraint.
+# and migrations/apply_cde03_08_event_types.py's CHECK constraint.
 OUTCOME_EVENT_TYPES = frozenset({
     EVENT_TYPE_AUCTION_SOLD_THIRD_PARTY,
     EVENT_TYPE_AUCTION_REVERTED_TO_LENDER,
@@ -45,6 +48,9 @@ OUTCOME_EVENT_TYPES = frozenset({
     EVENT_TYPE_TAX_DEED_REDEEMED,
     EVENT_TYPE_QUALIFIED_SALE,
     EVENT_TYPE_UNQUALIFIED_SALE,
+    EVENT_TYPE_PROBATE_SALE,
+    EVENT_TYPE_LIEN_SALE,
+    EVENT_TYPE_DEED_FLIP,
 })
 
 

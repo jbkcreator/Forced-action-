@@ -2193,7 +2193,7 @@ class OutcomeCandidate(Base):
         CheckConstraint(
             "event_type IN ('auction_sold_third_party','auction_reverted_to_lender',"
             "'auction_cancelled','tax_deed_sold','tax_deed_cancelled','tax_deed_redeemed',"
-            "'qualified_sale','unqualified_sale')",
+            "'qualified_sale','unqualified_sale','probate_sale','lien_sale','deed_flip')",
             name="check_outcome_candidate_event_type",
         ),
     )
