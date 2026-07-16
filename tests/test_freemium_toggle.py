@@ -68,24 +68,24 @@ def test_abandonment_waves_skip_when_off(funnel_off):
     w2.assert_not_called()
 
 
-def test_free_signup_403_when_off(funnel_off):
+def test_free_signup_503_when_off(funnel_off):
     from fastapi import HTTPException
 
     from src.api.main import free_signup
 
     with pytest.raises(HTTPException) as exc:
         free_signup(req=MagicMock(), request=MagicMock(), db=MagicMock())
-    assert exc.value.status_code == 403
+    assert exc.value.status_code == 503
 
 
-def test_wall_session_403_when_off(funnel_off):
+def test_wall_session_503_when_off(funnel_off):
     from fastapi import HTTPException
 
     from src.api.main import create_wall_session
 
     with pytest.raises(HTTPException) as exc:
         create_wall_session(req=MagicMock(), db=MagicMock())
-    assert exc.value.status_code == 403
+    assert exc.value.status_code == 503
 
 
 def test_status_endpoint_off(funnel_off):
@@ -106,7 +106,7 @@ def test_status_endpoint_on_reports_kill_switch(funnel_on):
 
     assert result["master"] is True
     assert result["legs"]["free_signup"]["effective"] == "ON"
-    assert result["legs"]["abandonment"]["effective"] == "DEGRADED"
+    assert result["legs"]["abandonment"]["effective"] == "ON"
     assert result["legs"]["abandonment"]["gates"]["first_payment_rate"] == "red"
 
 
@@ -117,4 +117,4 @@ def test_status_endpoint_survives_kill_switch_failure(funnel_on):
         result = admin_router.freemium_funnel_status()
 
     assert result["legs"]["abandonment"]["gates"]["first_payment_rate"] == "unknown"
-    assert result["legs"]["abandonment"]["effective"] == "DEGRADED"
+    assert result["legs"]["abandonment"]["effective"] == "ON"

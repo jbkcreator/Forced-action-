@@ -1048,10 +1048,9 @@ def kill_switch_status_overview():
 def freemium_funnel_status():
     """
     T-B3-01 launch verification: effective state of every freemium-funnel leg
-    behind the FREEMIUM_FUNNEL_ENABLED master toggle. A leg is ON when the
-    master is ON and no runtime gate degrades it; the abandonment leg also
-    reports its first_payment_rate kill-switch color and the cart-recovery
-    sweep flag.
+    behind the FREEMIUM_FUNNEL_ENABLED master toggle. A leg is ON iff the
+    master is ON; the abandonment leg additionally reports its raw
+    first_payment_rate kill-switch color and the cart-recovery sweep flag.
     """
     from config.settings import get_settings
     from src.services.kill_switch_service import get_cached_metric, get_kill_switch_status
@@ -1067,11 +1066,6 @@ def freemium_funnel_status():
         ks_color = "unknown"
 
     simple = "ON" if master else "OFF"
-    abandonment_effective = (
-        "OFF" if not master
-        else "ON" if ks_color == "green"
-        else "DEGRADED"
-    )
     return {
         "master": master,
         "legs": {
@@ -1080,7 +1074,7 @@ def freemium_funnel_status():
             "monetization_wall": {"effective": simple, "gates": {"master": master}},
             "flash_scarcity": {"effective": simple, "gates": {"master": master}},
             "abandonment": {
-                "effective": abandonment_effective,
+                "effective": simple,
                 "gates": {
                     "master": master,
                     "first_payment_rate": ks_color,
