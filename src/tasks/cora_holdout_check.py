@@ -32,7 +32,7 @@ from datetime import date
 
 from sqlalchemy import select
 
-from src.agents.prompts.loader import get_holdout_config_by_test_name
+from src.agents.prompts.loader import base_prompt_fingerprint, get_holdout_config_by_test_name
 from src.core.database import get_db_context
 from src.core.models import AbTest, LearningCard
 from src.services.ab_engine import holdout_verdict
@@ -96,6 +96,23 @@ def run(dry_run: bool = False) -> dict:
                 # falls back to holdout_verdict's unbounded default.
                 holdout_cfg = get_holdout_config_by_test_name(test.test_name)
                 conversion_window_days = (holdout_cfg or {}).get("conversion_window_days")
+
+                # Frozen-control drift guard (PR #133 review, finding 2). The
+                # control arm renders the graph's live base prompt; if that
+                # prompt was edited after this test was created, the control
+                # condition changed mid-experiment and a "proven" verdict would
+                # mix baselines. Refuse to promote when the current fingerprint
+                # no longer matches the one captured at creation.
+                if holdout_cfg:
+                    stored_fp = (test.variant_b or {}).get("baseline_fingerprint") or ""
+                    current_fp = base_prompt_fingerprint(holdout_cfg["graph"])
+                    if stored_fp and current_fp and stored_fp != current_fp:
+                        logger.warning(
+                            "[HoldoutCheck] baseline drifted for %s — skipping verdict "
+                            "(control copy changed since test creation; start a new test)",
+                            test.test_name,
+                        )
+                        continue
 
                 verdict = holdout_verdict(
                     test.test_name, db, conversion_window_days=conversion_window_days,

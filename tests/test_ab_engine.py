@@ -99,6 +99,42 @@ class TestAbEngineIntegration:
 
         record_outcome(sub.id, test_name, "converted", fresh_db)
 
+    def test_record_outcome_preserves_first_conversion(self, fresh_db):
+        """PR #133 finding 3: record_revenue fires on every paid action, so a
+        second 'converted' call must NOT advance outcome_at past the first
+        conversion (which a time-windowed verdict relies on)."""
+        from src.services.ab_engine import get_or_create_holdout_test, record_outcome
+        from src.core.models import Subscriber, AbAssignment
+        from sqlalchemy import select as _select
+
+        test_name = f"holdout_first_{uuid.uuid4().hex[:8]}"
+        test = get_or_create_holdout_test(
+            test_name=test_name, segment="all", traffic_pct=90, db=fresh_db,
+        )
+        u = uuid.uuid4().hex[:8]
+        sub = Subscriber(
+            stripe_customer_id=f"cus_fc_{u}", tier="starter", vertical="roofing",
+            county_id="hillsborough", event_feed_uuid=f"fc-{u}",
+        )
+        fresh_db.add(sub)
+        fresh_db.flush()
+        fresh_db.add(AbAssignment(test_id=test.id, subscriber_id=sub.id, variant="variant"))
+        fresh_db.flush()
+
+        record_outcome(sub.id, test_name, "converted", fresh_db)
+        row = fresh_db.execute(
+            _select(AbAssignment).where(
+                AbAssignment.test_id == test.id, AbAssignment.subscriber_id == sub.id,
+            )
+        ).scalar_one()
+        first_ts = row.outcome_at
+        assert first_ts is not None
+
+        # Second paid action — must be a no-op on the already-converted row.
+        record_outcome(sub.id, test_name, "converted", fresh_db)
+        fresh_db.refresh(row)
+        assert row.outcome_at == first_ts
+
     def test_holdout_test_traffic_pct_not_capped(self, fresh_db):
         """get_or_create_holdout_test must NOT apply the ab_test_traffic_cap
         (10%) that get_or_create_test does — a holdout's traffic_pct is the
@@ -362,3 +398,54 @@ class TestHoldoutVerdict:
         # Sanity: without the window, the late conversions DO count.
         unbounded = holdout_verdict(test_name, fresh_db, window_hours=24 * 30)
         assert unbounded["control_rate_pct"] == pytest.approx(55.0, abs=0.1)  # 22/40
+
+    def test_immature_assignments_excluded_from_denominator(self, fresh_db):
+        """PR #133 finding 3: assignments whose 7-day window hasn't elapsed
+        must not count in either arm — otherwise recent, not-yet-converted
+        assignments dilute the rate. 40 mature converters + 40 assigned-today
+        (immature) per arm → verdict sees 40/40 = 100%, not 40/80 = 50%."""
+        from datetime import datetime, timedelta, timezone
+        from src.services.ab_engine import holdout_verdict
+        from src.core.models import Subscriber, AbAssignment
+
+        test_name = f"holdout_{uuid.uuid4().hex[:8]}"
+        test = AbTest(
+            test_name=test_name, segment="all",
+            variant_a={"path": "control"}, variant_b={"path": "variant"},
+            traffic_pct=90, status="active",
+        )
+        fresh_db.add(test)
+        fresh_db.flush()
+
+        now = datetime.now(timezone.utc)
+        mature_at = now - timedelta(days=20)   # window fully elapsed
+        fresh_at = now                          # assigned "today" — immature
+
+        def _seed(arm, created_at, n, converted):
+            for i in range(n):
+                uid = uuid.uuid4().hex[:8]
+                sub = Subscriber(
+                    stripe_customer_id=f"cus_im_{uid}", tier="starter", vertical="roofing",
+                    county_id="hillsborough", event_feed_uuid=f"im-{uid}",
+                )
+                fresh_db.add(sub)
+                fresh_db.flush()
+                fresh_db.add(AbAssignment(
+                    test_id=test.id, subscriber_id=sub.id, variant=arm,
+                    outcome="converted" if i < converted else None,
+                    outcome_at=created_at + timedelta(days=1) if i < converted else None,
+                    created_at=created_at,
+                ))
+            fresh_db.flush()
+
+        # Mature: 40/arm all converted. Immature: 40/arm none converted yet.
+        _seed("control", mature_at, 40, 40)
+        _seed("control", fresh_at, 40, 0)
+        _seed("variant", mature_at, 40, 40)
+        _seed("variant", fresh_at, 40, 0)
+
+        result = holdout_verdict(test_name, fresh_db, window_hours=24 * 30, conversion_window_days=7)
+        # Immature 40 excluded → n=40/arm, all converted → 100%, not 50%.
+        assert result["n_ctrl"] == 40
+        assert result["n_var"] == 40
+        assert result["control_rate_pct"] == pytest.approx(100.0, abs=0.1)

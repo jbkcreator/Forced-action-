@@ -141,3 +141,48 @@ def test_dry_run_writes_nothing(fresh_db):
         assert playbook is None
     finally:
         _cleanup(fresh_db, test, sub_ids)
+
+
+def test_baseline_drift_skips_verdict(fresh_db):
+    """PR #133 finding 2: if the graph's base prompt changed since the test
+    was created (stored baseline_fingerprint != current), a proven split must
+    NOT produce a recommendation — the control condition drifted mid-test.
+    Uses the real config name 'wallet_push_holdout' so the drift guard's
+    get_holdout_config_by_test_name lookup resolves to a real graph."""
+    from src.tasks.cora_holdout_check import run
+    from src.core.models import CoraPlaybook, LearningCard
+
+    # A genuinely-winning split, but stored fingerprint is stale → drift.
+    test = AbTest(
+        test_name="wallet_push_holdout", segment="all",
+        variant_a={"path": "variant"},
+        variant_b={"path": "control", "baseline_fingerprint": "STALE_DOES_NOT_MATCH"},
+        traffic_pct=90, status="active",
+    )
+    fresh_db.add(test)
+    fresh_db.flush()
+
+    sub_ids = _seed_subs(fresh_db, 80)
+    created_at = datetime.now(timezone.utc) - timedelta(hours=1)
+    for i in range(40):
+        fresh_db.add(AbAssignment(
+            test_id=test.id, subscriber_id=sub_ids[i], variant="control",
+            outcome="converted" if i < 2 else "no_convert", created_at=created_at,
+        ))
+    for i in range(40):
+        fresh_db.add(AbAssignment(
+            test_id=test.id, subscriber_id=sub_ids[40 + i], variant="variant",
+            outcome="converted" if i < 16 else "no_convert", created_at=created_at,
+        ))
+    fresh_db.flush()
+    fresh_db.commit()
+
+    try:
+        result = run(dry_run=False)
+        assert result["proven"] == 0  # drift → not counted as proven
+        playbook = fresh_db.query(CoraPlaybook).filter_by(
+            source_type="holdout_test", source_id="wallet_push_holdout",
+        ).one_or_none()
+        assert playbook is None
+    finally:
+        _cleanup(fresh_db, test, sub_ids)

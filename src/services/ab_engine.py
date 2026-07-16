@@ -115,6 +115,7 @@ def get_or_create_holdout_test(
     segment: str,
     traffic_pct: int,
     db: Session,
+    baseline_fingerprint: Optional[str] = None,
 ) -> AbTest:
     """Idempotently register a Task 4.1 control-holdout rollout test.
 
@@ -126,6 +127,12 @@ def get_or_create_holdout_test(
     frozen control. Capping it would invert the split (90% control, 10%
     treatment). Syncs traffic_pct on every call so a control_pct change in
     cora_holdout_tests.yaml takes effect on restart.
+
+    baseline_fingerprint: content hash of the graph's base prompt at creation
+    (loader.base_prompt_fingerprint). Stored in variant_b and re-checked by
+    cora_holdout_check so a verdict never promotes on a baseline that drifted
+    mid-experiment. Recorded once at creation and NOT re-synced — that's the
+    point: it captures the baseline the control arm was measured against.
     """
     existing = db.execute(
         select(AbTest).where(AbTest.test_name == test_name)
@@ -139,7 +146,7 @@ def get_or_create_holdout_test(
         test_name=test_name,
         segment=segment,
         variant_a={"path": "variant"},
-        variant_b={"path": "control"},
+        variant_b={"path": "control", "baseline_fingerprint": baseline_fingerprint or ""},
         traffic_pct=traffic_pct,
         status="active",
     )
@@ -362,6 +369,19 @@ def holdout_verdict(
 
     ctrl = [a for a in assignments if a.variant == "control"]
     var = [a for a in assignments if a.variant == "variant"]
+
+    # For a time-windowed conversion definition, only assignments whose full
+    # observation window has elapsed can be judged — a subscriber assigned
+    # yesterday hasn't had 7 days to convert. Counting them dilutes the
+    # denominator (and can dilute arms unequally by timing rather than copy),
+    # so exclude immature assignments from BOTH numerator and denominator.
+    if conversion_window_days is not None:
+        mature_before = (
+            datetime.now(timezone.utc) - timedelta(days=conversion_window_days)
+        ).replace(tzinfo=None)  # created_at is a naive (UTC) column
+        ctrl = [a for a in ctrl if a.created_at <= mature_before]
+        var = [a for a in var if a.created_at <= mature_before]
+
     n_ctrl, n_var = len(ctrl), len(var)
 
     if n_ctrl < min_per_arm or n_var < min_per_arm:
@@ -417,6 +437,13 @@ def record_outcome(subscriber_id: int, test_name: str, outcome: str, db: Session
         )
     ).scalar_one_or_none()
     if assignment:
+        # Preserve the FIRST conversion and its timestamp. record_revenue
+        # fires on every paid action, so without this a repeat purchaser's
+        # outcome_at would advance past a valid early conversion and a
+        # time-windowed verdict (conversion_window_days) would wrongly
+        # exclude them. Once converted, the assignment is terminal here.
+        if assignment.outcome == "converted":
+            return
         assignment.outcome = outcome
         assignment.outcome_at = datetime.now(timezone.utc)
         db.flush()

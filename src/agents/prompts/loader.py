@@ -25,6 +25,8 @@ so the caller can attach attribution to MessageOutcome.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from functools import lru_cache
 from pathlib import Path
@@ -86,6 +88,25 @@ def render_system_and_user(
 		render(data.get("system", ""), context),
 		render(data.get("user", ""), context),
 	)
+
+
+def base_prompt_fingerprint(graph: str) -> str:
+	"""Stable content hash of a graph's base system.yaml (system + user
+	templates, pre-render). Task 4.1: the holdout control arm always renders
+	this base prompt, so a holdout's verdict is only valid while the baseline
+	is unchanged. Recorded at holdout-test creation and re-checked by
+	cora_holdout_check — a mismatch means the baseline drifted mid-experiment
+	and the verdict must not promote on mixed control copy. Returns "" if the
+	prompt can't be loaded (treated as "unknown", never a false match)."""
+	try:
+		data = load_prompt(graph, "system")
+	except Exception:
+		return ""
+	payload = json.dumps(
+		{"system": data.get("system", ""), "user": data.get("user", "")},
+		sort_keys=True,
+	)
+	return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def render_fallback_body(graph: str, context: Dict[str, Any]) -> str:
@@ -250,7 +271,16 @@ def render_for_subscriber(
 	                      (useful for attribution / dashboards). None otherwise.
 	"""
 	holdout_cfg = get_holdout_config(graph)
-	if holdout_cfg:
+	cfg = get_traffic_config(graph)
+
+	# Control-holdout gate (Task 4.1). A holdout only measures something when
+	# the graph ALSO has an active a/b treatment (cfg): without treatment the
+	# 90% "variant" arm renders the same base prompt as the control arm, so
+	# the verdict's z-test compares baseline to baseline and sampling noise
+	# can produce a false "promote". So refuse holdout assignment until a
+	# treatment exists — the holdout activates automatically once the graph's
+	# a/b test is enabled. (PR #133 review, finding 1.)
+	if holdout_cfg and cfg:
 		try:
 			from src.services.ab_engine import assign_rollout_arm, get_or_create_holdout_test
 
@@ -264,6 +294,7 @@ def render_for_subscriber(
 				segment=holdout_cfg.get("segment", "all"),
 				traffic_pct=100 - control_pct,
 				db=db,
+				baseline_fingerprint=base_prompt_fingerprint(graph),
 			)
 			holdout_arm = assign_rollout_arm(subscriber_id, holdout_test_name, db)
 		except Exception as exc:
@@ -277,7 +308,6 @@ def render_for_subscriber(
 			sys_txt, usr_txt = render_system_and_user(graph, context)
 			return sys_txt, usr_txt, None, None
 
-	cfg = get_traffic_config(graph)
 	if not cfg:
 		sys_txt, usr_txt = render_system_and_user(graph, context)
 		return sys_txt, usr_txt, None, None

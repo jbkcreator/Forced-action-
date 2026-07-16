@@ -12,6 +12,7 @@ require editing every graph's import and risk silently breaking those mocks.
 from __future__ import annotations
 
 import uuid
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import select
@@ -30,6 +31,52 @@ class TestGetHoldoutConfig:
         from src.agents.prompts.loader import get_holdout_config
 
         assert get_holdout_config("nonexistent_graph_xyz") is None
+
+
+class TestHoldoutRequiresActiveTreatment:
+    """PR #133 finding 1: a holdout must NOT assign an arm when its graph has
+    no active a/b treatment — the variant arm would render the same base
+    prompt as control, making the verdict a baseline-vs-baseline comparison
+    that noise can false-promote."""
+
+    def test_no_arm_assigned_when_treatment_absent(self):
+        from src.agents.prompts import loader
+        from unittest.mock import MagicMock
+
+        db = MagicMock()
+        with patch.object(loader, "get_holdout_config",
+                          return_value={"test_name": "x_holdout", "graph": "x", "control_pct": 10}), \
+             patch.object(loader, "get_traffic_config", return_value=None), \
+             patch.object(loader, "render_system_and_user", return_value=("s", "u")), \
+             patch("src.services.ab_engine.assign_rollout_arm") as mock_assign, \
+             patch("src.services.ab_engine.get_or_create_holdout_test") as mock_create:
+            loader.render_for_subscriber("x", 1, {}, db)
+
+        mock_assign.assert_not_called()
+        mock_create.assert_not_called()
+
+    def test_arm_assigned_when_treatment_present(self):
+        from src.agents.prompts import loader
+        from unittest.mock import MagicMock
+
+        db = MagicMock()
+        with patch.object(loader, "get_holdout_config",
+                          return_value={"test_name": "x_holdout", "graph": "x", "control_pct": 10}), \
+             patch.object(loader, "get_traffic_config",
+                          return_value={"test_name": "x_ab", "graph": "x", "traffic_pct": 100,
+                                        "variant_a": {}, "variant_b": {}}), \
+             patch.object(loader, "render_system_and_user", return_value=("s", "u")), \
+             patch.object(loader, "render_variant", return_value=("sv", "uv")), \
+             patch.object(loader, "base_prompt_fingerprint", return_value="fp"), \
+             patch("src.services.ab_engine.get_or_create_holdout_test"), \
+             patch("src.services.ab_engine.get_or_create_test"), \
+             patch("src.services.ab_engine.assign_rollout_arm", return_value="control") as mock_assign, \
+             patch("src.services.ab_engine.assign_variant", return_value=None):
+            sys_txt, usr_txt, variant, test_name = loader.render_for_subscriber("x", 1, {}, db)
+
+        mock_assign.assert_called_once()
+        # Control arm → frozen base prompt, no a/b variant surfaced.
+        assert (sys_txt, usr_txt, variant, test_name) == ("s", "u", None, None)
 
 
 def _make_subscriber(fresh_db):

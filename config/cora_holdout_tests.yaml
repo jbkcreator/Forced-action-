@@ -26,26 +26,35 @@
 # NOTE: assign_rollout_arm's traffic_pct means "% in the 'variant' arm", the
 # INVERSE of control_pct. The loader computes traffic_pct = 100 - control_pct
 # at the one wiring point — this file always expresses intent as control_pct.
+#
+# TREATMENT DEPENDENCY: a holdout only measures anything when its graph also
+# has an ACTIVE a/b test in cora_ab_tests.yaml. Without treatment the 90%
+# variant arm renders the same base prompt as control, so the loader gate
+# refuses assignment (no baseline-vs-baseline comparison). An entry can stay
+# enabled here and will activate automatically once the graph's a/b test is
+# turned on. Current a/b state: accelerated_wallet_push = enabled; fomo,
+# retention = disabled; wallet_to_lock_close = no a/b test. So only
+# wallet_push_holdout is live today; the other three are inert-but-armed.
 
-wallet_push_holdout:
+wallet_push_holdout:            # LIVE — accelerated_wallet_push_framing a/b is enabled
   graph:       accelerated_wallet_push
   enabled:     true
   control_pct: 10
   segment:     all
 
-fomo_holdout:
+fomo_holdout:                   # armed; inert until fomo_sms_v1 a/b is enabled
   graph:       fomo
   enabled:     true
   control_pct: 10
   segment:     all
 
-lock_close_holdout:
+lock_close_holdout:             # armed; inert until a wallet_to_lock_close a/b test exists
   graph:       wallet_to_lock_close
   enabled:     true
   control_pct: 10
   segment:     all
 
-retention_holdout:
+retention_holdout:              # armed; inert until retention_sms_v1 a/b is enabled
   graph:       retention
   enabled:     true
   control_pct: 10
