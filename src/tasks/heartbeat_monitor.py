@@ -80,10 +80,10 @@ HEARTBEAT_SLAS: Dict[str, int] = {
     # Cora Data Engine outcome connectors (src/connectors/registry.py is the
     # single source of truth for these sla_minutes/off_days values — copied
     # in here at each connector's go-live, per that file's own convention).
-    "foreclosure_outcomes":    1500,
-    "tax_deed_outcomes":       1500,
-    "appraiser_sale_outcomes": 10_140,
-    "outcome_label_layer":     1500,
+    # foreclosure_outcomes/tax_deed_outcomes/appraiser_sale_outcomes/
+    # outcome_label_layer are added by feat/cde10-label-layer's PR #138, not
+    # here — dor_sale_outcomes (CDE-07) is the only one genuinely new to
+    # this branch.
     "dor_sale_outcomes":       131_040,
 }
 
@@ -114,7 +114,8 @@ SOURCE_OFF_DAYS: Dict[str, set] = {
     "fire_incidents":   {6},
     "flood_damage":     {6},
     "insurance_claims": {6},
-    "tax_deed_outcomes": {6},   # mirrors tax_deed_auction's Sunday off-day
+    # tax_deed_outcomes's off-day entry is added by feat/cde10-label-layer's
+    # PR #138, not here — dor_sale_outcomes has no off-days (monthly cadence).
 }
 
 _WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
