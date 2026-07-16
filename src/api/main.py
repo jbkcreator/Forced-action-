@@ -4856,6 +4856,38 @@ def annual_accept_get(feed_uuid: str, db: Session = Depends(get_db)):
     return annual_accept(AnnualAcceptRequest(feed_uuid=feed_uuid), db)
 
 
+# ── B0-04: Founder-cohort prepay portal (emailed direct link) ───────────────
+
+@app.get("/api/founders/prepay-eligibility")
+def founder_prepay_eligibility(feed_uuid: str, db: Session = Depends(get_db)):
+    """Read-only eligibility check for the founder prepay portal page.
+
+    A founder is eligible to prepay while their founding rate hasn't
+    escalated yet and they haven't already switched to annual_lock via the
+    existing /api/annual/accept flow. Prepaying reuses that same endpoint;
+    this only supplies the display/gating data for the dedicated page.
+    """
+    sub = db.execute(
+        select(Subscriber).where(Subscriber.event_feed_uuid == feed_uuid)
+    ).scalar_one_or_none()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Invalid feed_uuid")
+
+    eligible = bool(
+        sub.founding_member
+        and sub.escalated_at is None
+        and sub.tier != "annual_lock"
+        and sub.stripe_subscription_id
+    )
+    return {
+        "eligible": eligible,
+        "rate_locked_at": sub.rate_locked_at.isoformat() if sub.rate_locked_at else None,
+        "escalated_at": sub.escalated_at.isoformat() if sub.escalated_at else None,
+        "founding_price_id": sub.founding_price_id,
+        "has_active_subscription": bool(sub.stripe_subscription_id),
+    }
+
+
 # ── Stage 5: Tier upgrade (AutoPilot Pro path) ───────────────────────────────
 
 class UpgradeRequest(BaseModel):
