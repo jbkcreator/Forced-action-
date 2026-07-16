@@ -40,8 +40,8 @@ DDL = [
     "'violations','foreclosures','permits','tax_delinquencies','roofing_permits','storm_damage',"
     "'flood_damage','insurance_claims','fire_incidents','sunbiz','property_appraiser','dbpr_company',"
     "'tax_deed_auction','vacant_land','tax_deed_outcomes','appraiser_sale_outcomes',"
-    "'foreclosure_outcomes','outcome_label_layer','dor_sales','deed_flip_outcomes',"
-    "'probate_lien_outcomes'));",
+    "'foreclosure_outcomes','outcome_label_layer','dor_sales','dor_sale_outcomes',"
+    "'deed_flip_outcomes','probate_lien_outcomes'));",
 ]
 
 
