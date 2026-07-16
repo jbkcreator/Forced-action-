@@ -7,7 +7,6 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from src.api.account_router import router
-from src.middleware.tier_gate import require_tier
 from src.services.account_auth import get_current_account
 from src.core.database import get_db
 
