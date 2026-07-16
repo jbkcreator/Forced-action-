@@ -66,6 +66,7 @@ class OutcomeCandidateData:
     amount: Optional[Decimal] = None
     counterparty: Optional[str] = None
     raw_status: Optional[str] = None       # untranslated source string, for audit/debugging
+    raw_payload: Optional[dict] = None     # connector-specific extras (e.g. deed_flip margin/hold/instruments)
     match_confidence: Optional[float] = None   # only set when resolve_or_quarantine() produced this row
     match_method: Optional[str] = None
 
@@ -95,6 +96,7 @@ def upsert_outcome_candidate(session: Session, candidate: OutcomeCandidateData) 
         amount=candidate.amount,
         counterparty=candidate.counterparty,
         raw_status=candidate.raw_status,
+        raw_payload=candidate.raw_payload,
         match_confidence=candidate.match_confidence,
         match_method=candidate.match_method,
         updated_at=func.now(),
@@ -109,6 +111,7 @@ def upsert_outcome_candidate(session: Session, candidate: OutcomeCandidateData) 
             amount=excluded.amount,
             counterparty=excluded.counterparty,
             raw_status=excluded.raw_status,
+            raw_payload=excluded.raw_payload,
             match_confidence=excluded.match_confidence,
             match_method=excluded.match_method,
             updated_at=excluded.updated_at,

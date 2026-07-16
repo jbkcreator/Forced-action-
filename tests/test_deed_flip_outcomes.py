@@ -88,7 +88,7 @@ class TestStageOutcomesPG:
         assert result.errors == 0
 
         rows = fresh_db.execute(
-            text("SELECT event_type, amount, source_id, event_date FROM outcome_candidates "
+            text("SELECT event_type, amount, source_id, event_date, raw_payload FROM outcome_candidates "
                  "WHERE source_type = 'deed_flip_outcomes' AND property_id = :pid"),
             {"pid": prop.id},
         ).fetchall()
@@ -97,6 +97,17 @@ class TestStageOutcomesPG:
         assert rows[0].source_id == acq.id
         assert rows[0].amount == Decimal("220000.00")
         assert rows[0].event_date == date(2026, 9, 1)
+
+        payload = rows[0].raw_payload
+        assert payload["source_ref"] == f"flip:{prop.id}:DFO-001-RESALE"
+        assert payload["acquisition_instrument"] == "DFO-001-ACQ"
+        assert payload["resale_instrument"] == "DFO-001-RESALE"
+        assert payload["purchase_price"] == 150000.0
+        assert payload["resale_price"] == 220000.0
+        assert payload["hold_days"] == (date(2026, 9, 1) - date(2026, 1, 1)).days
+        assert payload["margin"] == 70000.0
+        assert payload["margin_pct"] == round(70000 / 150000 * 100, 2)
+        assert payload["deed_type_raw"] == "Certificate of Title"
 
     def test_quitclaim_resale_emits_nothing(self, fresh_db):
         prop = _mk_property(fresh_db, "DFO-002")

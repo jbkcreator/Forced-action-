@@ -18,6 +18,9 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 DDL = [
+    # raw_payload holds connector-specific extras the flat columns can't carry
+    # (deed_flip stores margin/hold_days/instruments/prices here).
+    "ALTER TABLE outcome_candidates ADD COLUMN IF NOT EXISTS raw_payload JSONB;",
     # Drop the stale auto-named duplicate left over from a pre-CDE-09 create_all
     # run (before the constraint was given an explicit name) -- it still carries
     # the narrower 8-value list and blocks inserts even though the named

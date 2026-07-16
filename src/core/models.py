@@ -2169,6 +2169,7 @@ class OutcomeCandidate(Base):
     amount: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 2))
     counterparty: Mapped[Optional[str]] = mapped_column(String(255))
     raw_status: Mapped[Optional[str]] = mapped_column(String(100))                     # untranslated source string, for audit
+    raw_payload: Mapped[Optional[dict]] = mapped_column(JSONB)                         # connector-specific extras (e.g. deed_flip margin/hold/instruments)
     match_confidence: Mapped[Optional[Decimal]] = mapped_column(Numeric(4, 3))         # only set when resolve_or_quarantine() was used
     match_method: Mapped[Optional[str]] = mapped_column(String(30))
     consumed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))   # set by the (future) label layer
