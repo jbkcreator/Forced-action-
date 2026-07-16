@@ -1890,7 +1890,8 @@ class ScraperRunStats(Base):
             "'sunbiz', 'property_appraiser', 'dbpr_company',"
             "'tax_deed_auction', 'vacant_land',"
             "'tax_deed_outcomes', 'appraiser_sale_outcomes', 'foreclosure_outcomes',"
-            "'outcome_label_layer'"
+            "'outcome_label_layer', 'dor_sales', 'dor_sale_outcomes',"
+            "'deed_flip_outcomes', 'probate_lien_outcomes', 'lis_pendens_outcomes'"
             ")",
             name="check_run_stats_source_type",
         ),
@@ -2201,7 +2202,8 @@ class OutcomeCandidate(Base):
         CheckConstraint(
             "event_type IN ('auction_sold_third_party','auction_reverted_to_lender',"
             "'auction_cancelled','tax_deed_sold','tax_deed_cancelled','tax_deed_redeemed',"
-            "'qualified_sale','unqualified_sale','probate_sale','lien_sale','deed_flip')",
+            "'qualified_sale','unqualified_sale','deed_flip','probate_sale','lien_sale',"
+            "'lp_sold_pre_auction')",
             name="check_outcome_candidate_event_type",
         ),
     )
