@@ -7,7 +7,13 @@ from src.services.entitlement_service import TIER_RANK, get_account_tier
 
 
 def test_tier_rank_ordering():
-    assert TIER_RANK["starter"] < TIER_RANK["investor_pro"] < TIER_RANK["founder"]
+    assert TIER_RANK["free_trial"] < TIER_RANK["starter"] < TIER_RANK["investor_pro"] < TIER_RANK["founder"]
+
+
+def test_investor_pro_is_aliased_onto_the_real_pro_plan():
+    """Live plans.tier data has no investor_pro plan yet — only pro. A real
+    "pro" account must satisfy a require_tier("investor_pro") gate today."""
+    assert TIER_RANK["pro"] == TIER_RANK["investor_pro"]
 
 
 def test_get_account_tier_cache_hit_skips_db():

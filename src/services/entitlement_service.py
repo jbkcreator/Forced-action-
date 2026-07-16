@@ -9,6 +9,14 @@ on every gated request.
 Cache pattern mirrors src/services/kill_switch_service.py, but unlike a
 metric cache this is an authorization check: a Redis miss or outage must fall
 through to a direct DB read, never return an "unknown"/allow default.
+
+Tier vocabulary note: the brief names target tiers STARTER/INVESTOR_PRO/
+FOUNDER, but live `plans.tier` data today only has free_trial/starter/pro —
+investor_pro and founder don't exist as real plans yet (tracked separately:
+founder ties to the B0-04 founder-cohort prepay portal, investor_pro ties to
+Block 5's investor lane). "investor_pro" is aliased onto the real "pro" plan
+below so the gate is usable against live data now; once real investor_pro/
+founder plans are seeded, this file is the only place that needs updating.
 """
 from __future__ import annotations
 
@@ -26,9 +34,11 @@ _REDIS_TTL_SECONDS = 300  # 5 min — short enough that a plan change propagates
 
 # Single source of truth for tier ordering. Add new tiers here only.
 TIER_RANK: dict[str, int] = {
+    "free_trial": 0,
     "starter": 10,
-    "investor_pro": 20,
-    "founder": 30,
+    "pro": 20,
+    "investor_pro": 20,  # alias for the real "pro" plan until a dedicated plan exists
+    "founder": 30,       # no live plan reaches this yet — fails closed until B0-04 seeds one
 }
 
 
