@@ -53,15 +53,18 @@ def get_account_tier(db, account_id) -> Optional[str]:
     "allow" default — a miss always re-checks the source of truth.
     """
     key = f"{_REDIS_PREFIX}{account_id}"
+    redis_up = redis_available()
 
-    if redis_available():
+    if redis_up:
         cached = rget(key)
         if cached is not None:
             return cached
+    else:
+        logger.debug("Redis unavailable, bypassing cache for account_id=%s", account_id)
 
     tier = _fetch_tier_from_db(db, account_id)
 
-    if tier is not None and redis_available():
+    if tier is not None and redis_up:
         rset(key, tier, ttl_seconds=_REDIS_TTL_SECONDS)
 
     return tier
