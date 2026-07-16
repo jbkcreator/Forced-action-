@@ -198,7 +198,7 @@ def verify_magic_link(body: MagicLinkVerifyRequest, request: Request, db=Depends
             WHERE magic_link_hash = :hashed
               AND magic_link_used_at IS NULL
               AND magic_link_expires_at > :now
-            RETURNING id, event_feed_uuid
+            RETURNING id, event_feed_uuid, vertical
             """
         ),
         {"hashed": hashed, "now": now},
@@ -210,7 +210,12 @@ def verify_magic_link(body: MagicLinkVerifyRequest, request: Request, db=Depends
 
     logger.info("[subscriber-auth] magic-link verified for sub=%s", row.id)
     token = auth.create_access_token(row.id, row.event_feed_uuid)
-    return {"access_token": token, "token_type": "bearer", "feed_uuid": row.event_feed_uuid}
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "feed_uuid": row.event_feed_uuid,
+        "vertical": row.vertical,
+    }
 
 
 @router.patch("/onboarding/{feed_uuid}")

@@ -184,6 +184,20 @@ def test_signup_never_calls_generate_random_password(client, fresh_db, monkeypat
     assert row.magic_link_hash is not None
 
 
+def test_free_signup_accepts_investor_vertical(client, fresh_db, monkeypatch):
+    """T-B3-02 routing hook: investor is a legitimate free-signup account
+    type even though the full Block 5 deal-intake destination is not built.
+    """
+    _capture_magic_link_email(monkeypatch)
+
+    email = f"ml_inv_{uuid.uuid4().hex[:6]}@e.com"
+    r = client.post("/api/free-signup", json={
+        "email": email, "vertical": "investor", "county_id": "hillsborough",
+    })
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["vertical"] == "investor"
+
 def test_welcome_email_body_never_contains_a_password(monkeypatch):
     """Regression guard on the email template itself: with a magic link
     supplied, the rendered body must not contain any password-related copy."""
