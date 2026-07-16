@@ -3139,9 +3139,15 @@ class LearningCard(Base):
 
     __table_args__ = (
         CheckConstraint(
+            # kill_switch_scorecard/win_autopsy/conversion_tier_report were
+            # already live in the DB constraint (pre-existing drift from
+            # another feature) — included here so this string matches
+            # reality; see migrations/apply_learning_card_holdout_result.py.
             "card_type IN ('message_perf', 'deal_pattern', 'ab_result', "
             "'churn_signal', 'pricing_test', 'general', "
-            "'autonomy_summary')",      # fa036 — weekly Cora autonomy scorecard
+            "'autonomy_summary', "        # fa036 — weekly Cora autonomy scorecard
+            "'kill_switch_scorecard', 'win_autopsy', 'conversion_tier_report', "
+            "'holdout_result')",          # Task 4.1 — frozen control holdout surfacing
             name="check_card_type",
         ),
         UniqueConstraint("card_date", "card_type", name="uq_learning_card_date_type"),
@@ -3270,6 +3276,10 @@ class AbAssignment(Base):
     subscriber_id: Mapped[int] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=False, index=True)
     variant: Mapped[str] = mapped_column(String(10), nullable=False)  # 'a'/'b' for message-swap tests; 'variant'/'control' for rollout tests
     outcome: Mapped[Optional[str]] = mapped_column(String(30))  # converted/ignored/bounced
+    # When record_outcome set `outcome` — lets a time-windowed holdout verdict
+    # (e.g. "any paid action within 7 days") check outcome_at - created_at
+    # rather than treating any eventual outcome as an unbounded conversion.
+    outcome_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     test = relationship("AbTest", backref="assignments")

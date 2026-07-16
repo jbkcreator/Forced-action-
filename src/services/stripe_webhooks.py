@@ -883,6 +883,16 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
     except Exception:
         logger.warning("Attribution recording failed sub=%s", subscriber.id, exc_info=True)
 
+    # Task 4.1 frozen control holdout — a completed checkout is the
+    # conversion event for the lock_close_v1 sequence. No-op for any
+    # subscriber without a lock_close_holdout AbAssignment (anyone the
+    # wallet_to_lock_close graph never nudged), so this fires safely across
+    # every tier this handler processes, not just ZIP lock upgrades —
+    # matching the per-tier (not per-message) granularity already used
+    # above for attribution/Meta CAPI.
+    from src.services.ab_engine import record_holdout_conversion
+    record_holdout_conversion(subscriber.id, "lock_close_holdout", db)
+
     # ── Meta CAPI (S2): report server-side Purchase ──────────────────────────
     # Observer only — runs after the subscriber is active, ZIPs are locked, and
     # attribution is recorded. Stamps campaign fields onto the subscriber when
@@ -2316,6 +2326,11 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
                     occurred_at=sent_row.sent_at,
                 )
                 attribute_enrichment_cost_for_property(db, property_id, subscriber.id)
+
+                # Task 4.1 frozen control holdout — lead unlock is the
+                # conversion event for the fomo sequence.
+                from src.services.ab_engine import record_holdout_conversion
+                record_holdout_conversion(subscriber.id, "fomo_holdout", db)
     except (IntegrityError, OperationalError) as exc:
         logger.warning("lead_unlock: SentLead insert failed: %s", exc)
 
@@ -3274,6 +3289,13 @@ def _on_wallet_subscription_invoice(invoice: dict, db: Session) -> None:
         )
     except Exception:
         logger.warning("Attribution recording failed sub=%s", subscriber_id, exc_info=True)
+
+    # Task 4.1 frozen control holdout — wallet activation is the conversion
+    # event for the accelerated_wallet_push sequence. Test name matches the
+    # key in config/cora_holdout_tests.yaml; no-op for subscribers never
+    # assigned an arm.
+    from src.services.ab_engine import record_holdout_conversion
+    record_holdout_conversion(subscriber_id, "wallet_push_holdout", db)
 
 
 def _on_wallet_subscription_invoice_failed(invoice: dict, db: Session) -> None:
