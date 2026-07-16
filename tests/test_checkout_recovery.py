@@ -101,6 +101,39 @@ def test_start_recovery_alerts_founder_once(monkeypatch):
         _cleanup(email)
 
 
+def test_start_recovery_persist_false_alerts_without_creating_row(monkeypatch):
+    """B1-04 fix: lead-pack capture is opt-in (checkout_recovery_lead_pack_enabled
+    defaults False), but the founder alert must fire regardless — persist=False
+    still dedups + alerts, without writing a CheckoutRecovery row or suppressing
+    nurture."""
+    import src.services.stripe_webhooks as webhooks_mod
+
+    alerts = []
+    monkeypatch.setattr(webhooks_mod, "_send_founder_alert", lambda msg: alerts.append(msg))
+
+    email = _email()
+    try:
+        with get_db_context() as db:
+            from src.services import checkout_recovery as cr
+            result = cr.start_recovery(db, email=email, source="lead_pack", persist=False)
+            db.commit()
+        assert result is None
+        assert len(alerts) == 1
+        assert email in alerts[0] and "lead_pack" in alerts[0]
+
+        with get_db_context() as db:
+            rec = db.query(CheckoutRecovery).filter_by(email=email).first()
+        assert rec is None  # no row persisted
+
+        # Replay with persist=False still dedups off the (absent) row —
+        # since nothing was ever saved, this looks like a fresh email again
+        # and alerts a second time. That's expected: persist=False never
+        # remembers past alerts across process/requests, only within a single
+        # already-persisted row's lifetime.
+    finally:
+        _cleanup(email)
+
+
 def _insert_active(db, email, *, touches_sent=0, started_at=None, last_touch_at=None, phone=None):
     from datetime import datetime, timezone
     db.add(CheckoutRecovery(

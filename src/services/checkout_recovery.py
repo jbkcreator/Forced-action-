@@ -120,10 +120,25 @@ def start_recovery(
     subscriber_id: Optional[int] = None,
     phone: Optional[str] = None,
     resume_context: Optional[dict] = None,
+    persist: bool = True,
 ) -> Optional[CheckoutRecovery]:
     """Idempotently begin recovery for an abandoned checkout. Returns the row,
     or None if the email is already past recovery (recovered/failed) — a
-    closed sequence is never reopened for the same email (once per email)."""
+    closed sequence is never reopened for the same email (once per email).
+
+    persist=False (B1-04): run the same email-dedup check and alert the
+    founder, but do NOT create a CheckoutRecovery row or touch nurture
+    suppression. Used where a source's customer-facing drip is opt-in
+    (lead_pack, gated by checkout_recovery_lead_pack_enabled) but the founder
+    must still hear about every abandonment regardless of that flag. Always
+    returns None in this mode — there is no row to hand back.
+    """
+    # ponytail: persist=False writes nothing, so dedup only catches repeats if
+    # some OTHER persist=True call already made a row for this email — a
+    # repeated persist=False call for the same still-abandoned lead pack (e.g.
+    # a page reload minting a new PaymentIntent) re-alerts every time.
+    # Acceptable at current volume; add a lightweight per-email cooldown if
+    # lead-pack retries make this noisy.
     email = (email or "").strip().lower()
     if not email:
         return None
@@ -135,6 +150,10 @@ def start_recovery(
     if existing is not None:
         # Already active → no-op replay; already closed → don't reopen.
         return existing if existing.status == "active" else None
+
+    if not persist:
+        _alert_founder(email, source, phone)
+        return None
 
     participates_in_nurture = source in _NURTURE_SOURCES
     if participates_in_nurture:

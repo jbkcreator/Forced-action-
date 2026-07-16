@@ -3,7 +3,7 @@
 **Block:** 1 (Floor / Storefront) · **Bid unit:** brief 1.7 · **Master ID:** `T-B1-04`
 **Owner:** Dev 1 · **Wave:** 2 · **Priority:** P3
 **Scope:** Backend only. No DB migration. No frontend change.
-**Status:** Implemented.
+**Status:** Implemented + audited (post-implementation audit caught and fixed a lead-pack wiring gap — see §7).
 
 ---
 
@@ -67,3 +67,18 @@ None. The alert is an SMS to the founder's personal phone, not a dashboard surfa
 
 - **Alert batching/digest** — per founder's confirmation, not needed now. Add if per-event SMS volume becomes noisy at scale (e.g., roll up into a periodic digest or route through Block 8's action queue instead of a live SMS).
 - **Dashboard visibility of abandoned checkouts** — belongs to Block 8 (Operator Dashboard), not this task.
+
+## 7. Post-implementation audit — finding + fix
+
+A code audit against this spec found the initial implementation didn't fully satisfy §3's "both subscription and lead-pack" decision:
+
+**Gap found:** the lead-pack call to `start_recovery()` at [`main.py:3435`](../../src/api/main.py#L3435) is itself wrapped in `if subscriber.email and _s.checkout_recovery_lead_pack_enabled:`. That flag defaults to `False` ([`config/settings.py:106`](../../config/settings.py#L106)) with no `.env` override in this environment. Since the founder-alert hook lived *inside* `start_recovery()`, and `start_recovery()` was never even called for lead-pack abandonment until that flag was turned on, the founder alert silently never fired for lead packs — the flag was designed to gate the *customer* dunning drip (lead-pack buyers are existing subscribers the founder doesn't want auto-dunned by default), not the founder's own notification.
+
+**Fix applied:**
+- `checkout_recovery.start_recovery()` gained a `persist: bool = True` parameter. When `False`, it still runs the same email-dedup check and still alerts the founder, but skips creating the `CheckoutRecovery` row and skips nurture suppression — preserving the existing "don't auto-dun lead-pack buyers" behavior unchanged.
+- [`main.py:3435`](../../src/api/main.py#L3435) now calls `start_recovery(..., persist=_s.checkout_recovery_lead_pack_enabled)` unconditionally on `subscriber.email` alone — the founder alert fires regardless of the flag; the drip row is only created when the flag is on.
+- New test `test_start_recovery_persist_false_alerts_without_creating_row` covers the `persist=False` path: alert fires, no row is written.
+
+**Known accepted limitation (documented in code, not fixed):** with `persist=False`, nothing is persisted, so repeat calls for the same still-abandoned lead pack (e.g. a page reload minting a new Stripe PaymentIntent before the buyer completes) will re-alert the founder each time — there's no row to dedup against. Marked with a `ponytail:` comment at the `persist=False` branch in `checkout_recovery.py`. Acceptable per the confirmed "noise is not a concern right now" decision; add a lightweight per-email cooldown if lead-pack retry volume makes this noisy in practice.
+
+**Verification:** all fixes validated via a DB-free mocked-session script (real Postgres is not reachable from this environment — confirmed with the user, no connection attempted) covering: new lead-pack alert, no double-alert on replay, new subscription alert, no reopen on closed row, and the `persist=False` fix (alert fires, zero rows created). `pytest --collect-only` confirms both edited files parse and all 20 tests in `test_checkout_recovery.py` collect cleanly; the 3 tests not requiring DB access were run and pass. The DB-backed tests (including both new ones) still need to run on a machine with real Postgres access — see the command given earlier in this conversation.

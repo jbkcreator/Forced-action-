@@ -3432,7 +3432,10 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, request: Request, db: S
     # never block the checkout response. Messaging is flag-gated in the sweep.
     # Off by default: lead-pack abandoners are existing paying subscribers, so
     # we don't dun them unless checkout_recovery_lead_pack_enabled is set.
-    if subscriber.email and _s.checkout_recovery_lead_pack_enabled:
+    # The founder alert (B1-04) is independent of that flag — persist=False
+    # still dedups per email and alerts, it just skips the drip row/nurture
+    # suppression the flag is meant to gate.
+    if subscriber.email:
         try:
             from src.services import checkout_recovery
             checkout_recovery.start_recovery(
@@ -3447,6 +3450,7 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, request: Request, db: S
                     "lead_pack_zip": payload.zip_code,
                     "vertical": payload.vertical,
                 },
+                persist=_s.checkout_recovery_lead_pack_enabled,
             )
             db.commit()
         except Exception:
