@@ -980,20 +980,6 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
             exc_info=True,
         )
 
-    # Annual-at-signup A/B: a checkout completed straight onto annual_lock
-    # counts as a "converted" outcome for whichever arm this subscriber was
-    # bucketed into at signup (see record_pregenerated_arm in signup_engine).
-    if tier == "annual_lock":
-        try:
-            with db.begin_nested():
-                from src.services.ab_engine import ANNUAL_SIGNUP_TEST_NAME, record_outcome
-                record_outcome(subscriber.id, ANNUAL_SIGNUP_TEST_NAME, "converted", db)
-        except Exception:
-            logger.warning(
-                "[AnnualAtSignup] A/B record_outcome failed for subscriber=%s",
-                subscriber.id, exc_info=True,
-            )
-
     logger.info(
         "checkout.session.completed: subscriber=%s tier=%s vertical=%s"
         " founding=%s zips=%s feed_uuid=%s",

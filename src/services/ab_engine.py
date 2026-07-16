@@ -152,29 +152,6 @@ def assign_rollout_arm(
 ANNUAL_SIGNUP_TEST_NAME = "annual_at_signup_v1"
 
 
-def ensure_annual_signup_test(db: Session) -> AbTest:
-    """Idempotently register the annual_at_signup_v1 rollout test.
-
-    Called lazily from signup_engine so the test row exists before
-    record_pregenerated_arm tries to look it up. traffic_pct is read from
-    settings.annual_signup_test_traffic_pct (ANNUAL_SIGNUP_TEST_TRAFFIC_PCT
-    env var) — toggleable without a code change — and is still capped to the
-    shared ab_test_traffic_cap guardrail by get_or_create_test, same as every
-    other test registered this way. get_or_create_test re-syncs the DB row's
-    traffic_pct on every call, so changing the env var and restarting is
-    enough to take effect.
-    """
-    from config.settings import settings
-    return get_or_create_test(
-        test_name=ANNUAL_SIGNUP_TEST_NAME,
-        segment="new_signups",
-        variant_a={"path": "control"},
-        variant_b={"path": "annual_offer_shown"},
-        traffic_pct=settings.annual_signup_test_traffic_pct,
-        db=db,
-    )
-
-
 def record_pregenerated_arm(
     subscriber_id: int,
     test_name: str,

@@ -663,20 +663,6 @@ def get_pricing_info():
     return {"pricing": _cached_pricing_info()}
 
 
-@app.get("/api/experiments/annual-signup")
-def get_annual_signup_experiment_config():
-    """Returns the current annual-at-signup A/B traffic split.
-
-    Deliberately NOT cached (unlike /api/pricing's 24h Redis cache) — this
-    exists specifically so ANNUAL_SIGNUP_TEST_TRAFFIC_PCT can be toggled via
-    .env + a backend restart and take effect on the next landing-page load,
-    without a frontend rebuild/redeploy. The frontend fetches this once per
-    page load (LandingContext) and uses it to bucket the visitor client-side
-    (utils/experiments.js::getAnnualSignupArm) before a subscriber exists.
-    """
-    return {"traffic_pct": get_settings().annual_signup_test_traffic_pct}
-
-
 # ConsentAcceptanceRequest imported from src.api.deps
 
 # ---------------------------------------------------------------------------
@@ -5615,12 +5601,6 @@ class FreeSignupRequest(BaseModel):
     # webhook instead, so abandoned-cart users never get a misleading email.
     intent: Optional[str] = None
     consent_acceptance: Optional[ConsentAcceptanceRequest] = None
-    # annual-at-signup experiment (fa-annual-at-signup): the frontend buckets
-    # anonymous visitors client-side (no subscriber_id exists yet) and reports
-    # the arm it already showed them here so it can be persisted against the
-    # new subscriber. Anything outside the two known arms is dropped rather
-    # than trusted blindly.
-    annual_test_arm: Optional[str] = None
 
     @field_validator("email")
     @classmethod
@@ -5628,13 +5608,6 @@ class FreeSignupRequest(BaseModel):
         v = (v or "").strip().lower()
         if not v or "@" not in v or "." not in v.split("@")[-1]:
             raise ValueError("A valid email is required")
-        return v
-
-    @field_validator("annual_test_arm")
-    @classmethod
-    def _validate_annual_test_arm(cls, v: Optional[str]) -> Optional[str]:
-        if v not in ("variant", "control"):
-            return None
         return v
 
 
@@ -5687,7 +5660,6 @@ def free_signup(req: FreeSignupRequest, request: Request, db: Session = Depends(
         attribution_token=req.attribution_token,
         affiliate_ref=affiliate_ref,
         send_welcome=not defer_welcome,
-        annual_test_arm=req.annual_test_arm,
     )
 
     if req.consent_acceptance and req.consent_acceptance.terms_accepted:
