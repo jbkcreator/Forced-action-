@@ -197,6 +197,8 @@ from src.api.loan_lane_router import router as loan_lane_router  # noqa: E402
 app.include_router(loan_lane_router)
 from src.api.commission_router import router as commission_router  # noqa: E402
 app.include_router(commission_router)
+from src.api.account_router import router as account_router  # noqa: E402
+app.include_router(account_router)
 
 
 # ---------------------------------------------------------------------------
