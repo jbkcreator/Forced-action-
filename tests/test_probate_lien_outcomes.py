@@ -92,7 +92,7 @@ class TestStageOutcomesPG:
         assert result.errors == 0
 
         rows = fresh_db.execute(
-            text("SELECT event_type, amount, counterparty FROM outcome_candidates "
+            text("SELECT event_type, amount, counterparty, raw_payload FROM outcome_candidates "
                  "WHERE source_type = 'probate_lien_outcomes' AND property_id = :pid"),
             {"pid": prop.id},
         ).fetchall()
@@ -100,6 +100,15 @@ class TestStageOutcomesPG:
         assert rows[0].event_type == EVENT_TYPE_PROBATE_SALE
         assert rows[0].counterparty == "PROB-CASE-001"
         assert Decimal(rows[0].amount) == Decimal("150000.00")
+
+        payload = rows[0].raw_payload
+        assert payload["source_ref"] == "probate:PROB-CASE-001:PROB-DEED-001"
+        assert payload["case_number_or_instrument"] == "PROB-CASE-001"
+        assert payload["filing_date"] == "2025-01-01"
+        assert payload["sale_instrument"] == "PROB-DEED-001"
+        assert payload["sale_date"] == "2026-03-01"
+        assert payload["days_filing_to_sale"] == (date(2026, 3, 1) - date(2025, 1, 1)).days
+        assert payload["source_table"] == "legal_proceedings"
 
     def test_probate_no_later_deed_emits_nothing(self, fresh_db):
         prop = _mk_property(fresh_db, "PL-002")

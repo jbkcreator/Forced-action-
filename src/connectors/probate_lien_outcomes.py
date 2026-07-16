@@ -43,15 +43,28 @@ _RESALE_JOIN = (
     "  FROM deeds d"
     "  WHERE d.property_id = s.property_id"
     "    AND d.record_date > s.filing_date"
-    "    AND d.sale_price >= 100"
+    "    AND (d.sale_price IS NULL OR d.sale_price >= 100)"
     "    AND (d.deed_type IS NULL OR d.deed_type NOT ILIKE '%quit%')"
     "  ORDER BY d.record_date ASC LIMIT 1"
     ") r ON true"
 )
 
 
+def _build_payload(row, source_table: str, source_ref_prefix: str) -> dict:
+    return {
+        "source_ref": f"{source_ref_prefix}:{row.source_key}:{row.resale_instrument}",
+        "case_number_or_instrument": row.source_key,
+        "filing_date": row.filing_date.isoformat(),
+        "sale_instrument": row.resale_instrument,
+        "sale_price": float(row.resale_price) if row.resale_price is not None else None,
+        "sale_date": row.resale_date.isoformat(),
+        "days_filing_to_sale": (row.resale_date - row.filing_date).days,
+        "source_table": source_table,
+    }
+
+
 def _stage_rows(session: Session, county_id: str, result: ConnectorRunResult,
-                rows, source_table: str, event_type: str) -> None:
+                rows, source_table: str, event_type: str, source_ref_prefix: str) -> None:
     for row in rows:
         if row.resale_instrument is None:
             result.skipped += 1
@@ -68,6 +81,7 @@ def _stage_rows(session: Session, county_id: str, result: ConnectorRunResult,
                 amount=row.resale_price,
                 counterparty=row.source_key,
                 raw_status=row.resale_instrument,
+                raw_payload=_build_payload(row, source_table, source_ref_prefix),
             )
             upsert_outcome_candidate(session, candidate)
             result.staged += 1
@@ -81,7 +95,7 @@ def stage_outcomes(session: Session, county_id: str) -> ConnectorRunResult:
 
     probate_rows = session.execute(
         text(
-            "SELECT s.id, s.property_id, s.case_number AS source_key, "
+            "SELECT s.id, s.property_id, s.case_number AS source_key, s.filing_date, "
             "r.instrument_number AS resale_instrument, r.record_date AS resale_date, r.sale_price AS resale_price "
             "FROM legal_proceedings s " + _RESALE_JOIN + " "
             "WHERE s.county_id = :cid AND s.record_type = 'Probate' "
@@ -90,11 +104,11 @@ def stage_outcomes(session: Session, county_id: str) -> ConnectorRunResult:
         {"cid": county_id},
     ).fetchall()
     result.total_read += len(probate_rows)
-    _stage_rows(session, county_id, result, probate_rows, "legal_proceedings", EVENT_TYPE_PROBATE_SALE)
+    _stage_rows(session, county_id, result, probate_rows, "legal_proceedings", EVENT_TYPE_PROBATE_SALE, "probate")
 
     lien_rows = session.execute(
         text(
-            "SELECT s.id, s.property_id, s.instrument_number AS source_key, "
+            "SELECT s.id, s.property_id, s.instrument_number AS source_key, s.filing_date, "
             "r.instrument_number AS resale_instrument, r.record_date AS resale_date, r.sale_price AS resale_price "
             "FROM legal_and_liens s " + _RESALE_JOIN + " "
             # Live vocabulary is verbose — 'TAMPA CODE LIENS (TCL)', 'COUNTY CODE LIENS (CCL)' —
@@ -107,11 +121,11 @@ def stage_outcomes(session: Session, county_id: str) -> ConnectorRunResult:
     ).fetchall()
     result.total_read += len(lien_rows)
     lien_property_ids = {row.property_id for row in lien_rows}
-    _stage_rows(session, county_id, result, lien_rows, "legal_and_liens", EVENT_TYPE_LIEN_SALE)
+    _stage_rows(session, county_id, result, lien_rows, "legal_and_liens", EVENT_TYPE_LIEN_SALE, "lien")
 
     violation_rows = session.execute(
         text(
-            "SELECT s.id, s.property_id, s.record_number AS source_key, "
+            "SELECT s.id, s.property_id, s.record_number AS source_key, s.filing_date, "
             "r.instrument_number AS resale_instrument, r.record_date AS resale_date, r.sale_price AS resale_price "
             "FROM (SELECT id, property_id, record_number, opened_date AS filing_date "
             "      FROM code_violations WHERE county_id = :cid AND is_lien = true "
@@ -124,7 +138,7 @@ def stage_outcomes(session: Session, county_id: str) -> ConnectorRunResult:
     # Same property already covered by a TCL/CCL row -- that one wins (one lien_sale per property+resale).
     deduped = [row for row in violation_rows if row.property_id not in lien_property_ids]
     result.skipped += len(violation_rows) - len(deduped)
-    _stage_rows(session, county_id, result, deduped, "code_violations", EVENT_TYPE_LIEN_SALE)
+    _stage_rows(session, county_id, result, deduped, "code_violations", EVENT_TYPE_LIEN_SALE, "lien")
 
     return result
 
