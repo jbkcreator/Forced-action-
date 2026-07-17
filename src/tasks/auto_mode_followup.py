@@ -7,6 +7,10 @@ a Synthflow voicemail by tagging the subscriber's GHL contact with
 `auto_mode_vm`. The actual VM dispatch is handled by a GHL workflow
 (triggered on tag) so we never block on Synthflow latency.
 
+B0-06: this tag-triggered VM dispatch bypasses the synthflow_voice_drop graph's
+gate entirely, so `has_voice_consent()` is checked directly in this job before
+the tag is applied — see docs/adr/0030.
+
 Idempotency: a row's `clicked_at` field is repurposed as a "vm_dispatched_at"
 flag — if already set, we skip the row. (Avoids adding a new column for a
 single-purpose tracker.)
@@ -26,6 +30,7 @@ from sqlalchemy.orm import Session
 from config.settings import settings
 from src.core.database import get_db_context
 from src.core.models import MessageOutcome, Subscriber
+from src.services.compliance_gator import has_voice_consent
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +40,10 @@ _MAX_AGE_HOURS = 96     # don't VM-drop on stale leads (>4 days)
 
 
 def run(dry_run: bool = False) -> dict:
-    stats = {"checked": 0, "vm_triggered": 0, "skipped_already_done": 0, "skipped_replied": 0, "errors": 0}
+    stats = {
+        "checked": 0, "vm_triggered": 0, "skipped_already_done": 0,
+        "skipped_replied": 0, "skipped_no_voice_consent": 0, "errors": 0,
+    }
     now = datetime.now(timezone.utc)
     cutoff_min = now - timedelta(hours=_MAX_AGE_HOURS)
     cutoff_max = now - timedelta(hours=_LOOKBACK_HOURS)
@@ -61,6 +69,17 @@ def run(dry_run: bool = False) -> dict:
 
             sub = outcome.subscriber_id and db.get(Subscriber, outcome.subscriber_id)
             if not sub:
+                continue
+
+            # B0-06: PEWC voice-call opt-in — this VM dispatch fires via a GHL
+            # workflow (tag-triggered), so it never touches the synthflow_voice_drop
+            # gate. Must be checked here instead. See docs/adr/0030.
+            if not has_voice_consent(sub.id, db):
+                logger.info(
+                    "[AutoModeFollowup] blocked by missing voice consent: subscriber=%d outcome=%d",
+                    sub.id, outcome.id,
+                )
+                stats["skipped_no_voice_consent"] += 1
                 continue
 
             if dry_run:

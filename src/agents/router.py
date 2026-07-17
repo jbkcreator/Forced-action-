@@ -31,6 +31,7 @@ from src.agents.graphs.accelerated_wallet_push import (
 from src.agents.graphs.ap_lite_close import run_ap_lite_close as _run_ap_lite_close
 from src.agents.graphs.fomo import run_fomo as _run_fomo
 from src.agents.graphs.human_close_route import run_human_close_route as _run_human_close_route
+from src.agents.graphs.new_lead_voice_call import run_new_lead_voice_call as _run_new_lead_voice_call
 from src.agents.graphs.nws_urgency import run_nws_urgency as _run_nws_urgency
 from src.agents.graphs.reactivation import run_reactivation as _run_reactivation
 from src.agents.graphs.retention import run_retention as _run_retention_inner
@@ -96,6 +97,10 @@ EVENT_TO_GRAPH: Dict[str, GraphSpec] = {
 	"high_intent_no_convert": GraphSpec(
 		graph_name="synthflow_voice_drop",
 		runner=_run_synthflow_voice_drop,
+	),
+	"new_lead_signup": GraphSpec(
+		graph_name="new_lead_voice_call",
+		runner=_run_new_lead_voice_call,
 	),
 	"nws_storm_alert_active": GraphSpec(
 		graph_name="nws_urgency",

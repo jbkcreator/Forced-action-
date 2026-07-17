@@ -35,10 +35,12 @@ class TestRegistryEntries:
         assert OUTCOME_CONNECTORS["dor_sale_outcomes"].enabled is False
 
     def test_built_connectors_enabled(self):
-        # tax_deed_outcomes, appraiser_sale_outcomes, foreclosure_outcomes modules now exist.
+        # tax_deed_outcomes, appraiser_sale_outcomes, foreclosure_outcomes, and the
+        # label layer modules now exist.
         assert OUTCOME_CONNECTORS["tax_deed_outcomes"].enabled is True
         assert OUTCOME_CONNECTORS["appraiser_sale_outcomes"].enabled is True
         assert OUTCOME_CONNECTORS["foreclosure_outcomes"].enabled is True
+        assert OUTCOME_CONNECTORS["outcome_label_layer"].enabled is True
 
     def test_sla_minutes_positive(self):
         for spec in OUTCOME_CONNECTORS.values():
@@ -63,4 +65,5 @@ class TestEnabledConnectors:
     def test_matches_built_modules(self):
         assert set(enabled_connectors().keys()) == {
             "tax_deed_outcomes", "appraiser_sale_outcomes", "foreclosure_outcomes",
+            "outcome_label_layer",
         }

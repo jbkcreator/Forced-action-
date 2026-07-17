@@ -77,6 +77,13 @@ HEARTBEAT_SLAS: Dict[str, int] = {
     "fire_incidents":    1800,
     "flood_damage":      1800,
     "insurance_claims":  1800,
+    # Cora Data Engine outcome connectors (CDE-02/04/06/10) — values copied
+    # from src.connectors.registry.OUTCOME_CONNECTORS, the single source of
+    # truth for sla_minutes/off_days per that module's docstring.
+    "foreclosure_outcomes":    1500,
+    "tax_deed_outcomes":       1500,
+    "appraiser_sale_outcomes": 10_140,   # weekly, after the appraiser bulk refresh
+    "outcome_label_layer":     1500,
 }
 
 # Sources that are intentionally NOT scheduled on certain weekdays. Heartbeat
@@ -106,6 +113,7 @@ SOURCE_OFF_DAYS: Dict[str, set] = {
     "fire_incidents":   {6},
     "flood_damage":     {6},
     "insurance_claims": {6},
+    "tax_deed_outcomes": {6},   # tax-deed scraper/connector are Mon-Sat only
 }
 
 _WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")

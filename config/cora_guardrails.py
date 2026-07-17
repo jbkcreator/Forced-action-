@@ -165,6 +165,19 @@ KILL_SWITCH = {
         "kill_after_red_days": 7,
         "direction": "higher_is_better",
     },
+    "speed_to_lead_call":  {
+        "green": 100, "yellow": (0, 100), "red": 0,  # placeholder — no live metric ingested yet
+        "action": "escalate for manual review",
+        "duration_hours_for_action": 48,
+        "auto_action_type": "human_escalated",
+        "fallback_feature_flag": None,
+        "requires_approval": False,
+        "kill_after_red_days": 7,
+        "direction": "higher_is_better",
+        # No metric computes this yet — treat as green so the new-lead call
+        # graph isn't blocked before a real metric exists to gate on.
+        "no_metric_behavior": "green",
+    },
     "retention_30d":       {
         "green": 70, "yellow": (55, 70), "red": 55,
         "action": "earlier saves, missed-opp summaries",

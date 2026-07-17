@@ -90,6 +90,13 @@ OUTCOME_CONNECTORS: dict[str, ConnectorSpec] = {
         module="src.connectors.probate_lien_outcomes",
         cadence="weekly, after the probate/lien loaders",
         sla_minutes=10_140,
+    "outcome_label_layer": ConnectorSpec(
+        source_type="outcome_label_layer",
+        description="Label layer — promotes staged OutcomeCandidate rows into DealOutcome (CDE-10).",
+        reads_table="outcome_candidates",
+        module="src.connectors.label_layer",
+        cadence="daily, after all outcome connectors have staged",
+        sla_minutes=1500,
         off_days=frozenset(),
         enabled=True,
     ),
