@@ -11,8 +11,15 @@ touch that graph or its sweep at all.
 Flow:
   1. assemble_context — load subscriber, require phone, resolve Synthflow agent
   2. hierarchy_check  — standard decision hierarchy gate (own kill-switch key)
-  3. initiate_call    — compliance gate + call Synthflow API
+  3. initiate_call    — voice-consent (PEWC) gate + compliance gate + call Synthflow API
   4. finalize         — record terminal status, every path
+
+VOICE CONSENT (ADR 0030 / B0-06): before any dispatch, has_voice_consent()
+must confirm a stored PEWC voice-consent record for the subscriber. An
+AI-generated Synthflow voice is an "artificial voice" robocall under the TCPA
+(47 CFR 64.1200(f)(9)) and needs prior express written consent distinct from
+the generic marketing consent. Absent it, the run aborts with
+failure_reason="compliance:voice_consent_required" — fail closed.
 
 KNOWN GAP, by design, not an oversight: compliance_gator.validate_outbound()
 requires a dnc_phone_checks row (populated by the property-owner
@@ -40,7 +47,7 @@ from langgraph.graph import END, START, StateGraph
 from src.agents.subgraphs.decision_hierarchy import run_decision_hierarchy
 from src.agents.tools.read_tools import get_subscriber_profile
 from src.core.database import get_db_context
-from src.services.compliance_gator import validate_outbound
+from src.services.compliance_gator import has_voice_consent, validate_outbound
 from src.services.kill_switch_service import get_cached_metric
 from src.services.synthflow_client import initiate_call
 
@@ -152,6 +159,21 @@ def _node_initiate_call(state: NewLeadCallState) -> NewLeadCallState:
 
     try:
         with get_db_context() as db:
+            # PEWC gate (ADR 0030 / B0-06) — an AI voice call is a robocall
+            # under the TCPA and needs prior express written consent, distinct
+            # from generic marketing consent. Fail closed when it is absent.
+            if not has_voice_consent(subscriber_id, db):
+                logger.info(
+                    "new_lead_call blocked — no voice consent on file: subscriber=%s",
+                    subscriber_id,
+                )
+                return {
+                    "call_id": None,
+                    "sent": False,
+                    "terminal_status": "aborted",
+                    "failure_reason": "compliance:voice_consent_required",
+                }
+
             compliance = validate_outbound(
                 phone=phone,
                 channel="voice",

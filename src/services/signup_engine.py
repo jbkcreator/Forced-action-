@@ -393,18 +393,27 @@ def create_free_account_by_email(
 
 	# New-lead <5-min outbound call — only fires if there's a phone to call.
 	# No phone means no SLA clock and nothing for the fallback sweep to chase.
+	#
+	# Publish AFTER the request transaction commits (publish_after_commit) so
+	# the agents process can never consume the event before the subscriber row
+	# is visible in its own transaction. decision_id is set to the same stable
+	# value as idempotency_key so the supervisor's dedup (which looks up
+	# agent_decisions.decision_id by the idempotency key) actually matches and a
+	# duplicate/fallback-queue delivery cannot place a second call.
 	try:
 		if sub.phone:
-			from src.agents.events.ingestion import publish_cora_event
-			publish_cora_event({
+			from src.agents.events.ingestion import publish_after_commit
+			idempotency_key = f"new_lead_signup:{sub.id}"
+			publish_after_commit(db, {
 				"event_type": "new_lead_signup",
 				"subscriber_id": sub.id,
+				"decision_id": idempotency_key,
 				"payload": {
 					"vertical": sub.vertical,
 					"county_id": sub.county_id,
 					"signup_source": sub.signup_source,
 				},
-				"idempotency_key": f"new_lead_signup:{sub.id}",
+				"idempotency_key": idempotency_key,
 			})
 	except Exception:
 		logger.warning("new_lead_signup event publish failed for subscriber %d", sub.id, exc_info=True)

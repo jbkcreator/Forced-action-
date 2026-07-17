@@ -35,7 +35,7 @@ class _Mocks:
 
 
 def _enter_patches(stack, *, profile=_FAKE_PROFILE, hierarchy=_FAKE_HIERARCHY_ALLOWED,
-                    compliance_allowed=True, call_id="call_abc"):
+                    compliance_allowed=True, call_id="call_abc", voice_consent=True):
     from unittest.mock import MagicMock
 
     from src.services.compliance_gator import ComplianceResult
@@ -49,6 +49,7 @@ def _enter_patches(stack, *, profile=_FAKE_PROFILE, hierarchy=_FAKE_HIERARCHY_AL
     stack.enter_context(patch("src.agents.graphs.new_lead_voice_call.get_subscriber_profile", return_value=profile))
     stack.enter_context(patch("src.agents.graphs.new_lead_voice_call.run_decision_hierarchy", return_value=hierarchy))
     stack.enter_context(patch("src.agents.graphs.new_lead_voice_call.get_cached_metric", return_value=None))
+    stack.enter_context(patch("src.agents.graphs.new_lead_voice_call.has_voice_consent", return_value=voice_consent))
     stack.enter_context(patch("src.agents.graphs.new_lead_voice_call.validate_outbound", return_value=compliance_result))
     mock_call = stack.enter_context(patch("src.agents.graphs.new_lead_voice_call.initiate_call", return_value=call_id))
     mock_log = stack.enter_context(patch("src.agents.tools.write_tools.log_decision"))
@@ -92,6 +93,31 @@ def test_hierarchy_blocked_aborts_before_call():
     assert result["terminal_status"] == "aborted"
     assert result["failure_reason"] == "kill_switch_red"
     mocks.call.assert_not_called()
+
+
+def test_no_voice_consent_aborts_before_call():
+    """PR #140 issue 1: an AI voice call is a robocall under the TCPA (ADR 0030
+    / B0-06). Without a stored PEWC voice-consent record the graph must fail
+    closed and never dispatch — even when DNC/quiet-hours would allow it."""
+    with ExitStack() as stack:
+        mocks = _enter_patches(stack, voice_consent=False)
+        result = run_new_lead_voice_call({}, subscriber_id=555)
+
+    assert result["terminal_status"] == "aborted"
+    assert result["failure_reason"] == "compliance:voice_consent_required"
+    mocks.call.assert_not_called()
+
+
+def test_consent_and_compliance_pass_dispatches_call():
+    """Happy path: with voice consent on file AND DNC/quiet-hours clear, the
+    call dispatches."""
+    with ExitStack() as stack:
+        mocks = _enter_patches(stack, voice_consent=True, compliance_allowed=True)
+        result = run_new_lead_voice_call({}, subscriber_id=555)
+
+    assert result["terminal_status"] == "completed"
+    assert result["sent"] is True
+    mocks.call.assert_called_once()
 
 
 def test_compliance_blocked_aborts_before_call():
@@ -144,6 +170,7 @@ class TestKnownComplianceGap:
              patch("src.agents.graphs.new_lead_voice_call.run_decision_hierarchy", return_value=_FAKE_HIERARCHY_ALLOWED), \
              patch("src.agents.graphs.new_lead_voice_call.get_cached_metric", return_value=None), \
              patch("src.agents.graphs.new_lead_voice_call.get_db_context", side_effect=_fake_db_context), \
+             patch("src.agents.graphs.new_lead_voice_call.has_voice_consent", return_value=True), \
              patch("src.agents.graphs.new_lead_voice_call.initiate_call") as mock_call, \
              patch("src.agents.tools.write_tools.log_decision"):
             result = run_new_lead_voice_call({}, subscriber_id=555)

@@ -59,13 +59,14 @@ class TestNewLeadCallSweep:
         finally:
             _cleanup(fresh_db, sub)
 
-    def test_signup_with_existing_decision_row_is_not_flagged(self, fresh_db):
+    def test_successful_dispatch_row_is_not_flagged(self, fresh_db):
         from src.tasks.new_lead_call_sweep import sweep_stalled_new_lead_calls
 
         sub = _mk_sub(fresh_db, created_at=datetime.now(timezone.utc) - timedelta(minutes=6))
         fresh_db.add(AgentDecision(
             decision_id=str(uuid.uuid4()), graph_name="new_lead_voice_call",
             subscriber_id=sub.id, event_type="new_lead_signup", terminal_status="completed",
+            summary={"sent": True, "call_id": "call_abc"},
         ))
         fresh_db.commit()
 
@@ -78,6 +79,40 @@ class TestNewLeadCallSweep:
             mock_slack.assert_not_called()
         finally:
             _cleanup(fresh_db, sub)
+
+    def test_non_dispatched_decision_rows_still_flag(self, fresh_db):
+        """PR #140 issue 3: the graph writes a decision row for compliance
+        aborts, hierarchy blocks, Synthflow failures and exceptions too. Those
+        are NOT successful dispatches — the fallback must still page the founder.
+        Only terminal_status='completed' AND summary.sent='true' suppresses."""
+        from src.tasks.new_lead_call_sweep import sweep_stalled_new_lead_calls
+
+        non_dispatch_cases = [
+            ("aborted", {"sent": False, "failure_reason": "compliance:dnc_check_required"}),
+            ("aborted", {"sent": False, "failure_reason": "compliance:voice_consent_required"}),
+            ("failed", {"sent": False, "failure_reason": "new_lead_call:initiate_failed"}),
+            # completed row but nothing actually sent (defensive)
+            ("completed", {"sent": False}),
+        ]
+
+        for terminal_status, summary in non_dispatch_cases:
+            sub = _mk_sub(fresh_db, created_at=datetime.now(timezone.utc) - timedelta(minutes=6))
+            fresh_db.add(AgentDecision(
+                decision_id=str(uuid.uuid4()), graph_name="new_lead_voice_call",
+                subscriber_id=sub.id, event_type="new_lead_signup",
+                terminal_status=terminal_status, summary=summary,
+            ))
+            fresh_db.commit()
+
+            try:
+                with patch("src.tasks.new_lead_call_sweep.notify_owner") as mock_notify, \
+                     patch("src.tasks.new_lead_call_sweep.post_incident_alert") as mock_slack:
+                    sweep_stalled_new_lead_calls()
+
+                assert mock_notify.call_count == 1, f"{terminal_status}/{summary} should still page"
+                assert mock_slack.call_count == 1
+            finally:
+                _cleanup(fresh_db, sub)
 
     def test_phone_inbound_signup_is_excluded(self, fresh_db):
         """A phone-inbound signup (missed_call/cora_sms/dbpr_email) never

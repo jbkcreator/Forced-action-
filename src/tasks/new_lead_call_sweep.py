@@ -56,7 +56,15 @@ def sweep_stalled_new_lead_calls() -> int:
                 "  AND s.created_at > now() - make_interval(mins => :lookback_minutes) "
                 "  AND NOT EXISTS ("
                 "      SELECT 1 FROM agent_decisions d "
-                "      WHERE d.subscriber_id = s.id AND d.graph_name = 'new_lead_voice_call'"
+                "      WHERE d.subscriber_id = s.id "
+                "        AND d.graph_name = 'new_lead_voice_call' "
+                # Only a SUCCESSFUL dispatch suppresses the fallback. The graph
+                # writes a decision row for compliance aborts, hierarchy blocks,
+                # Synthflow failures and exceptions too — those must still page
+                # the founder, so we require terminal_status='completed' AND the
+                # summary's sent flag to be true.
+                "        AND d.terminal_status = 'completed' "
+                "        AND d.summary->>'sent' = 'true'"
                 "  )"
             ),
             {
