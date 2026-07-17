@@ -349,6 +349,15 @@ LEAD_TIER_THRESHOLDS = [
     (0,  "Bronze"),
 ]
 
+# Single source of truth for "is this lead Gold+" checks (e.g. hot-lead unlock
+# CTA eligibility) — mirrors the Gold row of LEAD_TIER_THRESHOLDS above.
+GOLD_FLOOR = dict((v, k) for k, v in LEAD_TIER_THRESHOLDS)["Gold"]
+
+
+def is_hot_score(final_cds_score) -> bool:
+    """Return True if a final_cds_score qualifies as Gold+ (hot-lead unlock eligible)."""
+    return (final_cds_score or 0) >= GOLD_FLOOR
+
 # ── Score cap ─────────────────────────────────────────────────────────────────
 SCORE_CAP = 100
 

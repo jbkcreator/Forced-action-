@@ -2464,6 +2464,24 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
     except Exception:
         logger.warning("Attribution recording failed sub=%s", subscriber.id, exc_info=True)
 
+    # Feed the purchase to Cora (D7) — last-touch nudge attribution is stamped
+    # by the supervisor's unlock_purchased branch, not here.
+    try:
+        from src.agents.events.ingestion import publish_cora_event
+        _amount_cents = _attr(payment_intent, "amount_received") or _attr(payment_intent, "amount")
+        publish_cora_event({
+            "event_type": "unlock_purchased",
+            "subscriber_id": subscriber.id,
+            "payload": {
+                "property_id": property_id,
+                "product": _attr(meta, "product") or "lead_unlock",
+                "amount_cents": _amount_cents,
+                "revenue": (_amount_cents / 100) if _amount_cents is not None else None,
+            },
+        })
+    except Exception:
+        logger.warning("lead_unlock: publish_cora_event failed sub=%s", subscriber.id, exc_info=True)
+
     _fire_capi_for_pi(
         payment_intent, subscriber, "lead_unlock",
         f"unlock_{_attr(payment_intent, 'id') or ''}", db,
