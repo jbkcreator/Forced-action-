@@ -206,6 +206,52 @@ class TestPGPromotion:
         assert len(rows) == 1
         assert rows[0].deal_amount == Decimal("181100.00")
 
+    def test_corrected_amount_via_real_upsert_re_promotes(self, fresh_db):
+        # Same scenario as test_reconsumed_candidate_updates_in_place, but
+        # through the real upsert_outcome_candidate() path a connector
+        # actually calls on re-run, not a manual consumed_at=NULL UPDATE.
+        # Regression for PR #150 review finding #1: the conflict-update path
+        # must itself clear consumed_at when a promoted field changes.
+        prop = _mk_property(fresh_db, "CDE10-LL-007")
+        cid = _stage(fresh_db, prop, event_type=EVENT_TYPE_AUCTION_SOLD_THIRD_PARTY,
+                     source_id=9_000_107, amount=Decimal("100000.00"))
+        promote_candidates(fresh_db, "hillsborough")
+        assert _candidate_consumed(fresh_db, cid)
+
+        # Re-run through the real helper with a corrected amount — the source
+        # connector re-staging its own row, not a test-only DB poke.
+        _stage(fresh_db, prop, event_type=EVENT_TYPE_AUCTION_SOLD_THIRD_PARTY,
+               source_id=9_000_107, amount=Decimal("181100.00"))
+        assert not _candidate_consumed(fresh_db, cid)
+
+        promote_candidates(fresh_db, "hillsborough")
+
+        sref = source_ref_for("foreclosure_outcomes", "foreclosures", 9_000_107, date(2026, 6, 15))
+        rows = _outcome_rows(fresh_db, sref)
+        assert len(rows) == 1
+        assert rows[0].deal_amount == Decimal("181100.00")
+        assert _candidate_consumed(fresh_db, cid)
+
+    def test_audit_only_change_via_real_upsert_does_not_reconsume(self, fresh_db):
+        # counterparty/raw_status are audit-only and don't feed the promoted
+        # DealOutcome shape -- a re-stage that only changes those must NOT
+        # clear consumed_at, or the label layer would reprocess every row on
+        # every connector re-run forever.
+        prop = _mk_property(fresh_db, "CDE10-LL-008")
+        cid = _stage(fresh_db, prop, event_type=EVENT_TYPE_AUCTION_SOLD_THIRD_PARTY,
+                     source_id=9_000_108, amount=Decimal("100000.00"))
+        promote_candidates(fresh_db, "hillsborough")
+        assert _candidate_consumed(fresh_db, cid)
+
+        upsert_outcome_candidate(fresh_db, OutcomeCandidateData(
+            property_id=prop.id, county_id="hillsborough",
+            source_type="foreclosure_outcomes", source_table="foreclosures",
+            source_id=9_000_108, event_type=EVENT_TYPE_AUCTION_SOLD_THIRD_PARTY,
+            event_date=date(2026, 6, 15), amount=Decimal("100000.00"),
+            counterparty="CHANGED THIRD PARTY LLC",
+        ))
+        assert _candidate_consumed(fresh_db, cid)
+
     def test_other_county_left_untouched(self, fresh_db):
         prop = _mk_property(fresh_db, "CDE10-LL-006", county_id="pinellas")
         cid = _stage(fresh_db, prop, event_type=EVENT_TYPE_QUALIFIED_SALE,

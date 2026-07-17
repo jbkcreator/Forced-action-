@@ -71,14 +71,22 @@ def classify(qual_cd: str) -> str:
 
 
 def _appraiser_months(session: Session, county_id: str) -> set[tuple[int, date]]:
-    """(property_id, sale-month) pairs the appraiser connector already staged."""
+    """
+    (property_id, sale-month) pairs the appraiser connector already staged
+    as a QUALIFIED sale. Scoped to event_type='qualified_sale' only — the
+    appraiser connector also stages unqualified_sale candidates, and when
+    the two sources disagree (DOR's authoritative QUAL_CD says qualified but
+    the appraiser marked it unqualified), DOR's qualified read must win, not
+    be suppressed as a false "overlap".
+    """
     rows = session.execute(
         text(
             "SELECT property_id, date_trunc('month', event_date)::date "
             "FROM outcome_candidates "
-            "WHERE source_type = 'appraiser_sale_outcomes' AND county_id = :cid"
+            "WHERE source_type = 'appraiser_sale_outcomes' AND event_type = :qualified "
+            "AND county_id = :cid"
         ),
-        {"cid": county_id},
+        {"cid": county_id, "qualified": EVENT_TYPE_QUALIFIED_SALE},
     ).fetchall()
     return {(r[0], r[1]) for r in rows}
 
