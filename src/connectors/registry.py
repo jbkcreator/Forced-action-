@@ -73,6 +73,16 @@ OUTCOME_CONNECTORS: dict[str, ConnectorSpec] = {
         off_days=frozenset(),
         enabled=True,
     ),
+    "outcome_label_layer": ConnectorSpec(
+        source_type="outcome_label_layer",
+        description="Label layer — promotes staged OutcomeCandidate rows into DealOutcome (CDE-10).",
+        reads_table="outcome_candidates",
+        module="src.connectors.label_layer",
+        cadence="daily, after all outcome connectors have staged",
+        sla_minutes=1500,
+        off_days=frozenset(),
+        enabled=True,
+    ),
     "dor_sale_outcomes": ConnectorSpec(
         source_type="dor_sale_outcomes",
         description="Florida DOR statewide sales file — cross-county normalized sales.",

@@ -41,7 +41,7 @@ from src.services.stripe_webhooks import handle_webhook
 from src.services.stripe_service import get_price_id_for_checkout, get_price_id_for_preview, _price_ids
 from src.services import lead_exclusivity
 from config.settings import get_settings
-from config.scoring import VERTICAL_WEIGHTS, for_county
+from config.scoring import VERTICAL_WEIGHTS, for_county, is_hot_score
 from config.constants import TIER_DISPLAY
 from src.utils.logger import setup_logging
 from src.services.rate_limit import enforce_or_429
@@ -54,6 +54,7 @@ from src.api.deps import (
     ZIP_RE as _ZIP_RE,
     FLORIDA_PREFIXES as _FLORIDA_PREFIXES,
     ConsentAcceptanceRequest,
+    resolve_voice_consent as _resolve_voice_consent,
     resolve_phone_with_quality as _resolve_phone_with_quality,
     estimate_lead_job_value as _estimate_lead_job_value,
     visible_tier_fields as _visible_tier_fields,
@@ -990,6 +991,49 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
             status_code=502,
             detail={"error": "payment_gateway_error", "message": "Payment gateway error — please try again"},
         )
+
+    # Written after the session exists so the row can be bound to this exact
+    # checkout via checkout_session_id — an email-only match would let a stale
+    # unlinked row (abandoned checkout, waitlist) get claimed by this subscriber.
+    if payload.consent_acceptance and payload.consent_acceptance.terms_accepted:
+        try:
+            from datetime import datetime
+
+            def _parse_iso_co(s):
+                if not s:
+                    return None
+                try:
+                    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+                except (ValueError, TypeError):
+                    return None
+
+            _co_tcpa = bool(payload.consent_acceptance.tcpa_accepted)
+            _voice = _resolve_voice_consent(payload.consent_acceptance)
+            ca = ConsentAcceptance(
+                email=payload.email,
+                checkout_session_id=session.id,
+                terms_version=payload.consent_acceptance.terms_version or "2026.06",
+                privacy_version=payload.consent_acceptance.privacy_version or "2026.06",
+                accepted_at=datetime.now(timezone.utc),
+                source_flow="checkout",
+                user_agent=payload.consent_acceptance.user_agent,
+                modal_opened_at=_parse_iso_co(payload.consent_acceptance.modal_opened_at),
+                modal_scrolled_to_end_at=_parse_iso_co(payload.consent_acceptance.modal_scrolled_to_end_at),
+                accepted_text_hash=payload.consent_acceptance.accepted_text_hash or "",
+                tcpa_consent_text=payload.consent_acceptance.tcpa_consent_text if _co_tcpa else None,
+                tcpa_consent_version=payload.consent_acceptance.tcpa_consent_version if _co_tcpa else None,
+                tcpa_checked_at=datetime.now(timezone.utc) if _co_tcpa else None,
+                consent_scope="marketing" if _co_tcpa else None,
+                not_condition_of_purchase_ack=_co_tcpa or None,
+                county_id=payload.county_id,
+                voice_consent_text=_voice[0] if _voice else None,
+                voice_consent_version=_voice[1] if _voice else None,
+                voice_consent_at=datetime.now(timezone.utc) if _voice else None,
+            )
+            db.add(ca)
+            db.commit()
+        except Exception:
+            logger.warning("ConsentAcceptance write failed in checkout (non-fatal):", exc_info=True)
 
     # Abandoned-cart recovery: a real checkout session now exists but isn't paid.
     # Capture the pre_payment start here (the reliable signal) — never inferred
@@ -2129,6 +2173,7 @@ def event_feed(
                             "vertical_score": score.vertical_scores.get(subscriber.vertical) if score.vertical_scores else None,
                             "lead_tier": _visible_tier,
                             "urgency": _visible_urgency,
+                            "is_hot": is_hot_score(score.final_cds_score),
                             "distress_types": score.distress_types,
                             "est_job_value": _estimate_lead_job_value(prop, score),
                             "incidents": inc_map.get(prop.id, []),
@@ -2416,6 +2461,7 @@ def event_feed(
             "vertical_score": score.vertical_scores.get(subscriber.vertical) if score.vertical_scores else None,
             "lead_tier": _visible_tier,
             "urgency": _visible_urgency,
+            "is_hot": is_hot_score(score.final_cds_score),
             "distress_types": score.distress_types,
             "est_job_value": _estimate_lead_job_value(prop, score),
             "incidents": incidents_by_prop.get(prop.id, []),
@@ -3392,12 +3438,23 @@ def sample_leads(
 # POST /api/lead-pack/checkout — Create PaymentIntent for a lead pack purchase
 # ---------------------------------------------------------------------------
 
+VALID_LEAD_PACK_SEGMENTS = frozenset({"insurance_distress"})
+
+
 class LeadPackCheckoutRequest(BaseModel):
     feed_uuid: str
     zip_code: str
     vertical: str
     county_id: str = "hillsborough"
+    segment: Optional[str] = None  # e.g. "insurance_distress" (ADR 0032) — server-validated allowlist
     attribution: Optional[dict] = None  # Meta Ads attribution (utm_*, campaign_id, fbclid, ...)
+
+    @field_validator("segment")
+    @classmethod
+    def validate_segment(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in VALID_LEAD_PACK_SEGMENTS:
+            raise ValueError(f"Unknown segment '{v}'. Valid segments: {sorted(VALID_LEAD_PACK_SEGMENTS)}")
+        return v
 
 
 @app.post("/api/lead-pack/checkout")
@@ -3433,17 +3490,23 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, request: Request, db: S
     if subscriber.vertical and subscriber.vertical != payload.vertical:
         raise HTTPException(status_code=400, detail={"error": "vertical_mismatch", "message": f"Your subscription is for {subscriber.vertical}, not {payload.vertical}"})
 
-    # Reject if subscriber already owns this ZIP — they get those leads free
-    owned = db.execute(
-        select(ZipTerritory).where(
-            ZipTerritory.subscriber_id == subscriber.id,
-            ZipTerritory.zip_code == payload.zip_code,
-            ZipTerritory.vertical == payload.vertical,
-            ZipTerritory.status.in_(["locked", "grace"]),
-        )
-    ).scalar_one_or_none()
-    if owned:
-        raise HTTPException(status_code=400, detail={"error": "zip_already_owned", "message": "You already receive leads for this ZIP in your feed."})
+    # Reject if subscriber already owns this ZIP — they get those base leads
+    # free. EXCEPTION: the insurance-distress segment (ADR 0032) is a premium
+    # add-on sold *inside* the subscriber's locked ZIPs, so an owned ZIP is
+    # exactly where it's offered — do not reject it there. Without this, every
+    # pack card from /api/insurance-distress/availability (which only surfaces
+    # locked ZIPs) would 400 with zip_already_owned.
+    if payload.segment != "insurance_distress":
+        owned = db.execute(
+            select(ZipTerritory).where(
+                ZipTerritory.subscriber_id == subscriber.id,
+                ZipTerritory.zip_code == payload.zip_code,
+                ZipTerritory.vertical == payload.vertical,
+                ZipTerritory.status.in_(["locked", "grace"]),
+            )
+        ).scalar_one_or_none()
+        if owned:
+            raise HTTPException(status_code=400, detail={"error": "zip_already_owned", "message": "You already receive leads for this ZIP in your feed."})
 
     # Checkout gate 1: county must be launched (ADR 0002 — derived status).
     from src.utils.county_config import is_county_launched
@@ -3460,7 +3523,7 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, request: Request, db: S
     # deliberately no pre-payment contactability-percentage gate here.
     from src.services.lead_exclusivity import get_exclusive_property_ids
     from src.core.models import DistressScore, Owner
-    from src.utils.lead_filters import has_contact_filter, phone_priority_order
+    from src.utils.lead_filters import phone_priority_order
     from datetime import datetime, timezone as tz
 
     now = datetime.now(tz.utc)
@@ -3471,16 +3534,16 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, request: Request, db: S
     except KeyError:
         raise HTTPException(status_code=400, detail={"error": "invalid_vertical", "message": f"Unknown vertical '{payload.vertical}'"})
 
-    filters = [
-        Property.zip == payload.zip_code,
-        Property.county_id == payload.county_id,
-        DistressScore.qualified == True,
-    ]
-    contact_clause = has_contact_filter(_s)
-    if contact_clause is not None:
-        filters.append(contact_clause)
+    # Same sellability predicate as availability + webhook reservation
+    # (ADR 0032 D5): qualified, non-guess (A2), contactable. Prevents charging
+    # a customer for a pack the webhook would then have to refund.
+    from src.services.lead_pool_service import apply_segment_filter, sellable_lead_filters
+    filters = sellable_lead_filters(_s)
+    filters.append(Property.zip == payload.zip_code)
+    filters.append(Property.county_id == payload.county_id)
     if excl_ids:
         filters.append(Property.id.not_in(excl_ids))
+    apply_segment_filter(filters, payload.segment, now)
 
     candidate_ids = db.execute(
         select(Property.id)
@@ -3497,9 +3560,11 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, request: Request, db: S
             "message": f"Only {len(candidate_ids)} qualified leads available for this ZIP/vertical combination",
         })
 
-    # Look up price amount from Stripe
+    # Look up price amount from Stripe. Segment packs use a premium price
+    # (ADR 0032 D6) — never the base $99 lead-pack price.
     stripe.api_key = _s.active_stripe_secret_key.get_secret_value()
-    price_id = _s.active_stripe_price("lead_pack")
+    price_name = "insurance_distress_pack" if payload.segment == "insurance_distress" else "lead_pack"
+    price_id = _s.active_stripe_price(price_name)
     if not price_id:
         raise HTTPException(status_code=503, detail={"error": "price_not_configured", "message": "Lead pack price not configured"})
 
@@ -3518,6 +3583,8 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, request: Request, db: S
         "vertical":  payload.vertical,
         "county_id": payload.county_id,
     }
+    if payload.segment:
+        lead_pack_metadata["segment"] = payload.segment
     # Meta Ads attribution + buyer IP/UA captured from the buyer's request.
     lead_pack_metadata.update(_attribution_stripe_metadata(request, payload.attribution))
 
@@ -3567,6 +3634,95 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, request: Request, db: S
         "amount":           amount,
         "currency":         currency,
     }
+
+
+# ---------------------------------------------------------------------------
+# GET /api/insurance-distress/availability — pack-card feed surface (ADR 0032 D7/D8)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/insurance-distress/availability")
+def insurance_distress_availability(feed_uuid: str, db: Session = Depends(get_db)):
+    """
+    Per-locked-ZIP insurance-distress qualifying lead count, gated to >=5
+    (min-5, D8) — feeds the feed's pack card ("N storm-damaged flips in
+    {ZIP} — buy pack ${premium}"). Never surfaces a ZIP the buyer can't
+    actually receive a full pack for.
+    """
+    _s = get_settings()
+
+    try:
+        subscriber = db.execute(
+            select(Subscriber).where(Subscriber.event_feed_uuid == feed_uuid)
+        ).scalar_one_or_none()
+    except OperationalError:
+        logger.error("DB error looking up subscriber for insurance-distress availability", exc_info=True)
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
+
+    if not subscriber:
+        raise HTTPException(status_code=404, detail={"error": "not_found", "message": "Feed not found"})
+
+    try:
+        locked_zips = db.execute(
+            select(ZipTerritory.zip_code).where(
+                ZipTerritory.subscriber_id == subscriber.id,
+                ZipTerritory.status.in_(["locked", "grace"]),
+            )
+        ).scalars().all()
+    except OperationalError:
+        logger.error("DB error fetching locked ZIPs for insurance-distress availability", exc_info=True)
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
+
+    empty = {"zips": [], "amount": None, "currency": None}
+    if not locked_zips:
+        return empty
+
+    from src.services.lead_pool_service import apply_segment_filter, sellable_lead_filters
+    from src.services.lead_exclusivity import get_exclusive_property_ids
+    from src.core.models import Owner
+    now = datetime.now(timezone.utc)
+
+    # Same sellability predicate as checkout + webhook reservation (ADR 0032 D5)
+    # so a ZIP is only advertised when its leads can actually be sold and
+    # fulfilled: qualified, non-guess, contactable, not exclusively reserved to
+    # another trade, and matching the insurance-distress segment.
+    avail_filters = sellable_lead_filters(_s)
+    avail_filters.append(Property.zip.in_(locked_zips))
+    avail_filters.append(Property.county_id == subscriber.county_id)
+    apply_segment_filter(avail_filters, "insurance_distress", now)
+
+    try:
+        excl_ids = get_exclusive_property_ids(db, subscriber.county_id, now)
+        if excl_ids:
+            avail_filters.append(Property.id.not_in(excl_ids))
+
+        rows = db.execute(
+            select(Property.zip, func.count(func.distinct(Property.id)))
+            .join(DistressScore, DistressScore.property_id == Property.id)
+            .outerjoin(Owner, Owner.property_id == Property.id)
+            .where(and_(*avail_filters))
+            .group_by(Property.zip)
+        ).all()
+    except OperationalError:
+        logger.error("DB error computing insurance-distress qualifying counts", exc_info=True)
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
+
+    qualifying = [{"zip_code": zip_code, "count": count} for zip_code, count in rows if count >= 5]
+    if not qualifying:
+        return empty
+
+    price_id = _s.active_stripe_price("insurance_distress_pack")
+    if not price_id:
+        return empty
+
+    try:
+        stripe.api_key = _s.active_stripe_secret_key.get_secret_value()
+        price = stripe.Price.retrieve(price_id)
+        amount, currency = price["unit_amount"], price["currency"]
+    except stripe.StripeError as exc:
+        logger.error("Stripe error retrieving insurance_distress_pack price: %s", exc)
+        return empty
+
+    return {"zips": qualifying, "amount": amount, "currency": currency}
 
 
 # ---------------------------------------------------------------------------
@@ -3843,7 +3999,6 @@ def lead_pack_detail(purchase_id: int, db: Session = Depends(get_db)):
 class HotLeadUnlockRequest(BaseModel):
     feed_uuid: str
     lead_id: str
-    reduced: bool = False
 
 @app.post("/api/hot-lead-unlock")
 def hot_lead_unlock(payload: HotLeadUnlockRequest, db: Session = Depends(get_db)):
@@ -3863,12 +4018,24 @@ def hot_lead_unlock(payload: HotLeadUnlockRequest, db: Session = Depends(get_db)
     if not subscriber.stripe_customer_id:
         raise HTTPException(status_code=400, detail="No Stripe customer linked")
 
+    # Server decides the discount — never trust a client-supplied `reduced`
+    # flag, or any subscriber could force the $99 rate on every unlock.
+    from src.services.flash_scarcity import is_reduced_rate_active
+    prop_zip = None
+    if payload.lead_id.isdigit():
+        prop_zip_row = db.execute(
+            text("SELECT zip FROM properties WHERE id = :property_id"),
+            {"property_id": int(payload.lead_id)},
+        ).mappings().first()
+        prop_zip = prop_zip_row["zip"] if prop_zip_row else None
+    reduced = is_reduced_rate_active(db, subscriber.id, prop_zip)
+
     from src.services.stripe_service import create_hot_lead_unlock_link
     try:
         result = create_hot_lead_unlock_link(
             subscriber_stripe_customer_id=subscriber.stripe_customer_id,
             lead_id=payload.lead_id,
-            reduced=payload.reduced,
+            reduced=reduced,
             customer_email=subscriber.email,
         )
     except ValueError as exc:
@@ -5811,6 +5978,8 @@ def free_signup(req: FreeSignupRequest, request: Request, db: Session = Depends(
                 except (ValueError, TypeError):
                     return None
 
+            _voice = _resolve_voice_consent(req.consent_acceptance)
+
             ca = ConsentAcceptance(
                 email=req.email,
                 phone=sub.phone,
@@ -5828,6 +5997,9 @@ def free_signup(req: FreeSignupRequest, request: Request, db: Session = Depends(
                 tcpa_checked_at=datetime.now(timezone.utc) if tcpa_accepted else None,
                 consent_scope="marketing" if tcpa_accepted else None,
                 not_condition_of_purchase_ack=tcpa_accepted or None,
+                voice_consent_text=_voice[0] if _voice else None,
+                voice_consent_version=_voice[1] if _voice else None,
+                voice_consent_at=datetime.now(timezone.utc) if _voice else None,
             )
             db.add(ca)
             db.commit()
@@ -6827,10 +6999,20 @@ def claim_bonus_zip(feed_uuid: str, body: ClaimBonusZipRequest, db: Session = De
 
 
 @app.get("/share/{referral_code}", include_in_schema=False)
-def referral_share_page(referral_code: str, db: Session = Depends(get_db)):
+def referral_share_page(
+    referral_code: str,
+    t: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
     """
     Public referral landing page. Looks up the referrer's vertical and
     renders current weekly forward-pack copy with a signup CTA.
+
+    `t` is a signed prompt-attribution token minted when the proactive referral
+    prompt was sent; it binds this visit to the exact funnel row that generated
+    the link. Visits without a valid token (old links, link-preview crawlers,
+    organic /share/{code} shares) are treated as un-attributed and must not
+    advance any prompt to 'shared'.
     """
     from src.services.forward_pack_renderer import get_current_copy
     from fastapi.responses import HTMLResponse
@@ -6841,10 +7023,38 @@ def referral_share_page(referral_code: str, db: Session = Depends(get_db)):
     if not referrer:
         raise HTTPException(status_code=404, detail="Referral link not found")
 
+    from src.services.signed_links import decode_prompt_attribution_token
+    prompt_funnel_id = decode_prompt_attribution_token(t) if t else None
+    if prompt_funnel_id is not None:
+        try:
+            with db.begin_nested():
+                db.execute(
+                    text(
+                        "UPDATE referral_prompt_funnel "
+                        "SET state = 'shared', shared_at = now() "
+                        "WHERE id = :fid AND subscriber_id = :sid AND state = 'shown'"
+                    ),
+                    {"fid": prompt_funnel_id, "sid": referrer.id},
+                )
+        except Exception as exc:
+            logger.warning(
+                "[ReferralPrompt] shown->shared advance failed for referrer=%d funnel=%s: %s",
+                referrer.id, prompt_funnel_id, exc,
+            )
+    elif t:
+        logger.info(
+            "[ReferralPrompt] /share visit for referrer=%d had an invalid/expired token — un-attributed",
+            referrer.id,
+        )
+
     copy_body = get_current_copy(referrer.vertical, db)
     _settings = get_settings()
     base_url = getattr(_settings, "base_url", "")
+    # Carry the attribution token through signup so a confirmed purchase can be
+    # credited back to the originating prompt (the frontend must forward `pt`).
     signup_url = f"{base_url}/?ref={referral_code}"
+    if t:
+        signup_url = f"{signup_url}&pt={t}"
 
     html = f"""<!doctype html>
 <html lang="en">

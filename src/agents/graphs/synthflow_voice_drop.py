@@ -33,7 +33,7 @@ from src.agents.subgraphs.decision_hierarchy import run_decision_hierarchy
 from src.agents.tools.read_tools import get_subscriber_profile
 from src.core.database import get_db_context
 from src.services.allotment_engine import consume as allotment_consume
-from src.services.compliance_gator import validate_outbound
+from src.services.compliance_gator import validate_outbound, has_voice_consent
 from src.services.synthflow_client import initiate_call
 from src.services.kill_switch_service import get_cached_metric
 
@@ -225,6 +225,20 @@ def _node_initiate_drop(state: VoiceDropState) -> VoiceDropState:
                     "sent": False,
                     "terminal_status": "aborted",
                     "failure_reason": f"compliance:{compliance.reason}",
+                }
+
+            # B0-06: PEWC voice-call opt-in — distinct from the compliance gate
+            # above (DNC/opt-out/quiet-hours). See docs/adr/0030.
+            if not has_voice_consent(subscriber_id, db):
+                logger.info(
+                    "voice_drop blocked by missing voice consent: subscriber=%s",
+                    subscriber_id,
+                )
+                return {
+                    "call_id": None,
+                    "sent": False,
+                    "terminal_status": "aborted",
+                    "failure_reason": "voice_consent_required",
                 }
 
             # Allotment gate — wallet holders are unlimited; free-tier subscribers
