@@ -857,6 +857,88 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
             },
         )
 
+    if payload.consent_acceptance and payload.consent_acceptance.terms_accepted:
+        try:
+            from datetime import datetime
+
+            def _parse_iso_co(s):
+                if not s:
+                    return None
+                try:
+                    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+                except (ValueError, TypeError):
+                    return None
+
+            _co_tcpa = bool(payload.consent_acceptance.tcpa_accepted)
+            ca = ConsentAcceptance(
+                email=payload.email,
+                terms_version=payload.consent_acceptance.terms_version or "2026.06",
+                privacy_version=payload.consent_acceptance.privacy_version or "2026.06",
+                accepted_at=datetime.now(timezone.utc),
+                source_flow="checkout",
+                user_agent=payload.consent_acceptance.user_agent,
+                modal_opened_at=_parse_iso_co(payload.consent_acceptance.modal_opened_at),
+                modal_scrolled_to_end_at=_parse_iso_co(payload.consent_acceptance.modal_scrolled_to_end_at),
+                accepted_text_hash=payload.consent_acceptance.accepted_text_hash or "",
+                tcpa_consent_text=payload.consent_acceptance.tcpa_consent_text if _co_tcpa else None,
+                tcpa_consent_version=payload.consent_acceptance.tcpa_consent_version if _co_tcpa else None,
+                tcpa_checked_at=datetime.now(timezone.utc) if _co_tcpa else None,
+                consent_scope="marketing" if _co_tcpa else None,
+                not_condition_of_purchase_ack=_co_tcpa or None,
+                county_id=payload.county_id,
+            )
+            db.add(ca)
+            db.commit()
+        except Exception:
+            logger.warning("ConsentAcceptance write failed in checkout (non-fatal):", exc_info=True)
+
+    # Cohort-adjusted pricing: /api/zip-check shows the customer a cohort price
+    # when one is active for this county+vertical+tier. Resolve the same cohort
+    # here so checkout charges what was displayed, instead of the fixed price_id.
+    # Anchored on the regular amount (not whichever of founding/regular price_id
+    # was selected above) because pricing_cohorts stores one fixed dollar amount
+    # per (county, vertical, tier) — feeding it the founding cents would just
+    # return that same fixed amount and collapse the founding discount.
+    line_item = {"price": price_id, "quantity": 1}
+    resolved_amount_cents = None
+    cohort_source = "base_price"
+    if payload.tier in _ZIP_PRICING_TIERS:
+        tier_base = _cached_pricing_info().get(payload.tier) or {}
+        regular_amount = tier_base.get("regular_amount")
+        founding_amount = tier_base.get("founding_amount")
+        if regular_amount is not None:
+            from src.services.pricing_cohort_engine import get_price_for_subscriber
+            adjusted_regular_cents, cohort_source = get_price_for_subscriber(
+                payload.county_id, payload.vertical, payload.tier, regular_amount * 100, db
+            )
+            if cohort_source == "cohort_adjusted":
+                if is_founding and founding_amount is not None:
+                    resolved_amount_cents = round(adjusted_regular_cents * (founding_amount / regular_amount))
+                else:
+                    resolved_amount_cents = adjusted_regular_cents
+                try:
+                    stripe_price = stripe.Price.retrieve(price_id)
+                    price_data = {
+                        "currency": stripe_price.currency,
+                        "unit_amount": resolved_amount_cents,
+                        "product": stripe_price.product,
+                    }
+                    if stripe_price.recurring:
+                        price_data["recurring"] = {
+                            "interval": stripe_price.recurring.interval,
+                            "interval_count": stripe_price.recurring.interval_count,
+                        }
+                    line_item = {"price_data": price_data, "quantity": 1}
+                except stripe.error.StripeError:
+                    logger.error(
+                        "Failed to build cohort-adjusted Stripe price for tier=%s county=%s vertical=%s "
+                        "— falling back to base price_id",
+                        payload.tier, payload.county_id, payload.vertical, exc_info=True,
+                    )
+                    resolved_amount_cents = None
+                    cohort_source = "base_price"
+                    line_item = {"price": price_id, "quantity": 1}
+
     checkout_metadata = {
         "tier": payload.tier,
         "vertical": payload.vertical,
@@ -864,6 +946,8 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
         "is_founding": str(is_founding),
         "founding_price_id": price_id if is_founding else "",
         "zip_codes": ",".join(payload.zip_codes),
+        "price_source": cohort_source,
+        "resolved_amount_cents": str(resolved_amount_cents) if resolved_amount_cents is not None else "",
     }
     # Meta Ads attribution + buyer IP/UA captured from the buyer's request.
     checkout_metadata.update(_attribution_stripe_metadata(request, payload.attribution))
@@ -873,7 +957,7 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
             mode="subscription",
             ui_mode="embedded",
             customer_email=payload.email,   # pre-fills email in Stripe form
-            line_items=[{"price": price_id, "quantity": 1}],
+            line_items=[line_item],
             metadata=checkout_metadata,
             return_url=f"{_s.app_base_url}/success?session_id={{CHECKOUT_SESSION_ID}}",
         )
@@ -1462,6 +1546,60 @@ def founding_spots(
 
 # _ZIP_RE and _FLORIDA_PREFIXES imported from src.api.deps
 
+_ZIP_PRICING_TIERS = ("starter", "pro", "dominator", "annual_lock")
+
+
+def _cohort_adjusted_pricing(county_id: str, vertical: str, db: Session) -> dict:
+    """Per-tier founding/regular price for this county+vertical, cohort-adjusted.
+
+    Reuses the already-cached Stripe amounts from _cached_pricing_info() — no
+    extra Stripe call. Falls back to the plain Stripe price when no cohort is
+    active for a given tier (pricing_cohort_engine's own fallback behavior).
+
+    pricing_cohorts stores exactly one fixed adjusted price per (county_id,
+    trade_vertical, price_type) — not a percentage — so the cohort lookup is
+    only done once per tier, anchored on the regular price. The founding price
+    is then scaled by the base founding/regular ratio so it stays
+    proportionally cheaper than regular instead of collapsing to the same
+    number (calling get_price_for_subscriber a second time with the founding
+    cents would just return the same fixed cohort price again, destroying the
+    founding discount).
+    """
+    from src.services.pricing_cohort_engine import get_price_for_subscriber
+
+    base = _cached_pricing_info()
+    pricing: dict = {}
+    for tier in _ZIP_PRICING_TIERS:
+        tier_base = base.get(tier) or {}
+        founding_amount = tier_base.get("founding_amount")
+        regular_amount = tier_base.get("regular_amount")
+
+        if regular_amount is None:
+            # No canonical regular price to anchor a cohort lookup on.
+            pricing[tier] = {
+                "founding_amount": founding_amount,
+                "regular_amount": regular_amount,
+                "price_source": "base_price",
+            }
+            continue
+
+        adjusted_regular_cents, source = get_price_for_subscriber(
+            county_id, vertical, tier, regular_amount * 100, db
+        )
+        adjusted_regular = adjusted_regular_cents // 100
+
+        adjusted_founding = None
+        if founding_amount is not None:
+            ratio = founding_amount / regular_amount
+            adjusted_founding = round(adjusted_regular * ratio)
+
+        pricing[tier] = {
+            "founding_amount": adjusted_founding,
+            "regular_amount": adjusted_regular,
+            "price_source": source,
+        }
+    return pricing
+
 
 @app.get("/api/zip-check")
 def zip_check(
@@ -1521,7 +1659,12 @@ def zip_check(
         raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
 
     if territory is None or territory.status == "available":
-        return {"zip_code": zip_code, "vertical": vertical, "status": "available"}
+        return {
+            "zip_code": zip_code,
+            "vertical": vertical,
+            "status": "available",
+            "pricing": _cohort_adjusted_pricing(county_id, vertical, db),
+        }
 
     if territory.status == "grace":
         return {
@@ -1529,6 +1672,7 @@ def zip_check(
             "vertical": vertical,
             "status": "grace",
             "message": "Opening soon — join waitlist",
+            "pricing": _cohort_adjusted_pricing(county_id, vertical, db),
         }
 
     return {
