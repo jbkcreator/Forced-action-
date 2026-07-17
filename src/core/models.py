@@ -1482,11 +1482,26 @@ class LeadQualitySnapshot(Base):
     # 'resolved' — primary code violations now closed/resolved (false positive)
     outcome = Column(String(20), nullable=False)
 
+    # B1-03 — SLA auto-remediation. delivery_id is set only for entitlement-model
+    # (Block 1 storefront) snapshots; NULL for legacy SentLead-sourced snapshots.
+    delivery_id = Column(BigInteger, ForeignKey("deliveries.id"), nullable=True, index=True)
+    # 'credit_issued'  — reject_delivery() granted a same-grade replacement credit
+    # 'refund_issued'  — a Stripe refund was issued for the paid one-time purchase
+    # 'refund_failed'  — a refund was attempted but Stripe errored
+    # 'not_applicable' — outcome wasn't sold/resolved, or nothing to remediate (e.g. free lead)
+    remediation_action = Column(String(30), nullable=True)
+    remediated_at = Column(DateTime(timezone=True), nullable=True)
+
     __table_args__ = (
         UniqueConstraint("property_id", "subscriber_id", "sent_at",
                          name="uq_lead_quality_snapshot"),
         Index("idx_lqs_snapshot_at", "snapshot_at"),
         Index("idx_lqs_outcome", "outcome"),
+        CheckConstraint(
+            "remediation_action IS NULL OR remediation_action IN "
+            "('credit_issued','refund_issued','refund_failed','not_applicable')",
+            name="ck_lqs_remediation_action",
+        ),
     )
 
     def __repr__(self):
@@ -7051,7 +7066,8 @@ class Delivery(Base):
         CheckConstraint("status IN ('delivered','rejected')", name="ck_delivery_status"),
         CheckConstraint(
             "rejection_reason IS NULL OR rejection_reason IN "
-            "('disconnected','wrong_party','deceased','duplicate','other')",
+            "('disconnected','wrong_party','deceased','duplicate','other',"
+            "'sold_before_delivery','signals_resolved')",
             name="ck_delivery_reason",
         ),
         Index("idx_deliveries_account_grade_cycle", "account_id", "grade", "billing_period_end"),
