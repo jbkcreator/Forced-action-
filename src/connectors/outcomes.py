@@ -36,9 +36,12 @@ EVENT_TYPE_UNQUALIFIED_SALE = "unqualified_sale"
 EVENT_TYPE_PROBATE_SALE = "probate_sale"
 EVENT_TYPE_LIEN_SALE = "lien_sale"
 EVENT_TYPE_DEED_FLIP = "deed_flip"
+EVENT_TYPE_LP_SOLD_PRE_AUCTION = "lp_sold_pre_auction"
 
 # Keep in sync with OutcomeCandidate.check_outcome_candidate_event_type (models.py)
-# and migrations/apply_cde03_08_event_types.py's CHECK constraint.
+# and migrations/apply_cde03_08_event_types.py + apply_cde05_lis_pendens_event_type.py's
+# CHECK constraints (the latter unions with whatever's already there, so either
+# migration script can run in any order without dropping the other's types).
 OUTCOME_EVENT_TYPES = frozenset({
     EVENT_TYPE_AUCTION_SOLD_THIRD_PARTY,
     EVENT_TYPE_AUCTION_REVERTED_TO_LENDER,
@@ -51,6 +54,7 @@ OUTCOME_EVENT_TYPES = frozenset({
     EVENT_TYPE_PROBATE_SALE,
     EVENT_TYPE_LIEN_SALE,
     EVENT_TYPE_DEED_FLIP,
+    EVENT_TYPE_LP_SOLD_PRE_AUCTION,
 })
 
 
@@ -66,7 +70,7 @@ class OutcomeCandidateData:
     amount: Optional[Decimal] = None
     counterparty: Optional[str] = None
     raw_status: Optional[str] = None       # untranslated source string, for audit/debugging
-    raw_payload: Optional[dict] = None     # connector-specific extras (e.g. deed_flip margin/hold/instruments)
+    raw_payload: Optional[dict] = None     # connector-specific extras (e.g. deed_flip margin/hold, lp arc case/sale detail)
     match_confidence: Optional[float] = None   # only set when resolve_or_quarantine() produced this row
     match_method: Optional[str] = None
 
