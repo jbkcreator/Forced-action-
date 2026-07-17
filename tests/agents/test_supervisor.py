@@ -178,6 +178,49 @@ def test_wave2_with_decision_id_routes_through():
 	assert mock_runner.call_args.kwargs["decision_id"] == "shared-uuid"
 
 
+def test_duplicate_new_lead_signup_is_deduped_by_stable_key(fresh_db):
+	"""PR #140 issue 5: signup publishes new_lead_signup with decision_id equal
+	to its idempotency_key, so the supervisor's dedup (which looks up
+	agent_decisions.decision_id by the idempotency key) matches on redelivery
+	and the graph runner never fires a second call for the same lead."""
+	import uuid as _uuid
+
+	from sqlalchemy import text
+
+	from src.core.models import AgentDecision
+
+	stable_key = f"new_lead_signup:{_uuid.uuid4().hex[:8]}"
+	# Simulate the first delivery having already completed: a row whose
+	# decision_id equals the stable idempotency key.
+	fresh_db.add(AgentDecision(
+		decision_id=stable_key, graph_name="new_lead_voice_call",
+		event_type="new_lead_signup", terminal_status="completed",
+		summary={"sent": True},
+	))
+	fresh_db.commit()
+
+	mock_runner, original = _patch_spec_runner(
+		"new_lead_signup", return_value={"terminal_status": "completed"},
+	)
+	try:
+		with patch("src.agents.supervisor.log_decision"):
+			r = dispatch_event({
+				"event_type": "new_lead_signup",
+				"subscriber_id": 42,
+				"decision_id": stable_key,
+				"idempotency_key": stable_key,
+				"payload": {"vertical": "roofing"},
+			})
+	finally:
+		_restore_spec("new_lead_signup", original)
+		fresh_db.execute(text("DELETE FROM agent_decisions WHERE decision_id = :k"),
+		                 {"k": stable_key})
+		fresh_db.commit()
+
+	assert r["outcome"] == "dropped_duplicate"
+	mock_runner.assert_not_called()
+
+
 def test_feedback_ritual_candidate_routes_to_feedback_ritual_processor():
 	with patch("src.agents.supervisor.log_decision"), \
 		 patch("src.agents.supervisor.db") as mock_db, \
