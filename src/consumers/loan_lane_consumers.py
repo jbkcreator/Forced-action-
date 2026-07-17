@@ -57,9 +57,11 @@ def handle_commission_poster(session: Session, event_row) -> None:
 
     transition_id = payload.get("transition_id")
     gross_amount_cents = payload.get("gross_amount_cents")
+    # split_config_id is optional: when omitted, post_commission resolves the
+    # deal-size fee tier from gross_amount_cents (Task 3.2).
     split_config_id = payload.get("split_config_id")
 
-    if not all([transition_id, gross_amount_cents is not None, split_config_id]):
+    if not all([transition_id, gross_amount_cents is not None]):
         logger.warning(
             "[LaneCons] commission_poster missing payload fields: %s", payload
         )

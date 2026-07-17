@@ -93,8 +93,10 @@ def burst_setup(pg_engine):
 
     yield feed_uuid, prop_ids
 
+    from sqlalchemy import text
     cleanup = Session()
     cleanup.query(DealOutcome).filter(DealOutcome.subscriber_id == sub_id).delete()
+    cleanup.execute(text("DELETE FROM referral_prompt_funnel WHERE subscriber_id = :sid"), {"sid": sub_id})
     cleanup.query(Property).filter(Property.id.in_(prop_ids)).delete()
     cleanup.query(Subscriber).filter_by(id=sub_id).delete()
     cleanup.commit()

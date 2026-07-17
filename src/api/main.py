@@ -38,7 +38,7 @@ from src.core.database import get_db_context
 from src.core.models import ConsentAcceptance, FoundingSubscriberCount, ZipTerritory, Subscriber, Property, DistressScore, Incident, LeadPackPurchase, ScraperRunStats, EnrichedContact, Owner, SentLead, WaitlistEntry, SmsOptIn, ExpansionCandidate, County, LeadExclusivity
 from src.agents.events.ingestion import publish_cora_event
 from src.services.stripe_webhooks import handle_webhook
-from src.services.stripe_service import get_price_id_for_checkout, _price_ids
+from src.services.stripe_service import get_price_id_for_checkout, get_price_id_for_preview, _price_ids
 from src.services import lead_exclusivity
 from config.settings import get_settings
 from config.scoring import VERTICAL_WEIGHTS, for_county
@@ -603,7 +603,7 @@ def _fetch_pricing_from_stripe() -> dict:
     all_prices = _price_ids()
 
     pricing_info = {}
-    for tier in ("starter", "pro", "dominator"):
+    for tier in ("starter", "pro", "dominator", "annual_lock"):
         founding_id = all_prices.get(tier, {}).get("founding")
         regular_id = all_prices.get(tier, {}).get("regular")
 
@@ -662,6 +662,20 @@ def get_pricing_info():
     this once at LandingPage mount and passes it through LandingContext.
     """
     return {"pricing": _cached_pricing_info()}
+
+
+@app.get("/api/experiments/annual-signup")
+def get_annual_signup_experiment_config():
+    """Returns the current annual-at-signup A/B traffic split.
+
+    Deliberately NOT cached (unlike /api/pricing's 24h Redis cache) — this
+    exists specifically so ANNUAL_SIGNUP_TEST_TRAFFIC_PCT can be toggled via
+    .env + a backend restart and take effect on the next landing-page load,
+    without a frontend rebuild/redeploy. The frontend fetches this once per
+    page load (LandingContext) and uses it to bucket the visitor client-side
+    (utils/experiments.js::getAnnualSignupArm) before a subscriber exists.
+    """
+    return {"traffic_pct": get_settings().annual_signup_test_traffic_pct}
 
 
 # ConsentAcceptanceRequest imported from src.api.deps
@@ -756,7 +770,7 @@ class CheckoutRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_zip_count(self) -> "CheckoutRequest":
-        limits = {"starter": 1, "pro": 3, "dominator": 10}
+        limits = {"starter": 1, "pro": 3, "dominator": 10, "annual_lock": 1}
         limit = limits.get(self.tier)
         if limit and len(self.zip_codes) != limit:
             raise ValueError(f"{self.tier.title()} plan requires exactly {limit} ZIP code{'s' if limit > 1 else ''}.")
@@ -936,6 +950,24 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
             db.commit()
         except Exception:
             logger.warning("ConsentAcceptance write failed in checkout (non-fatal):", exc_info=True)
+
+    # Abandoned-cart recovery: a real checkout session now exists but isn't paid.
+    # Capture the pre_payment start here (the reliable signal) — never inferred
+    # from a bare free signup. Completion closes it (_on_checkout_completed →
+    # mark_recovered); if it expires the session_expired webhook is a dedup'd
+    # backstop. Capture always; sends stay behind checkout_recovery_enabled.
+    try:
+        from src.services import checkout_recovery
+        checkout_recovery.start_recovery(
+            db,
+            email=payload.email,
+            source="pre_payment",
+            resume_context={"county_id": payload.county_id, "vertical": payload.vertical},
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.warning("[CheckoutRecovery] pre_payment capture failed (non-fatal)", exc_info=True)
 
     return {
         "client_secret": session.client_secret,
@@ -1876,6 +1908,9 @@ def event_feed(
                 "wallet_to_lock_eligible": False,
                 "wallet_credits_30d": None,
                 "flash_scarcity_windows": [],
+                "onboarding_completed": subscriber.onboarding_completed,
+                "preferred_property_type": subscriber.preferred_property_type,
+                "investment_budget_band": subscriber.investment_budget_band,
                 **_accelerated_wallet_offer_fields(subscriber, db),
                 **_auto_mode_entitlement_fields(subscriber, db),
                 **_payment_recovery_fields(subscriber),
@@ -2078,6 +2113,9 @@ def event_feed(
                 "wallet_to_lock_eligible": _w2l_eligible_nz,
                 "wallet_credits_30d": _wallet_credits_30d_nz,
                 "flash_scarcity_windows": _flash_windows_nz,
+                "onboarding_completed": subscriber.onboarding_completed,
+                "preferred_property_type": subscriber.preferred_property_type,
+                "investment_budget_band": subscriber.investment_budget_band,
                 **_accelerated_wallet_offer_fields(subscriber, db),
                 **_auto_mode_entitlement_fields(subscriber, db),
                 **_payment_recovery_fields(subscriber),
@@ -2353,6 +2391,9 @@ def event_feed(
             "wallet_to_lock_eligible": _w2l_eligible,
             "wallet_credits_30d": _wallet_credits_30d,
             "flash_scarcity_windows": _flash_windows,
+            "onboarding_completed": subscriber.onboarding_completed,
+            "preferred_property_type": subscriber.preferred_property_type,
+            "investment_budget_band": subscriber.investment_budget_band,
             **_accelerated_wallet_offer_fields(subscriber, db),
             **_payment_recovery_fields(subscriber),
             **_what_you_missed_fields(
@@ -3394,11 +3435,86 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, request: Request, db: S
         logger.error("Stripe error creating lead pack PaymentIntent: %s", exc)
         raise HTTPException(status_code=502, detail={"error": "payment_unavailable", "message": "Could not create payment"})
 
+    # Abandoned-checkout recovery (Task 7): a lead pack has no Stripe Checkout
+    # Session (it's a PaymentIntent), so there's no session.expired signal —
+    # capture the intent now and close it on the success webhook. Best-effort;
+    # never block the checkout response. Messaging is flag-gated in the sweep.
+    # Off by default: lead-pack abandoners are existing paying subscribers, so
+    # we don't dun them unless checkout_recovery_lead_pack_enabled is set.
+    if subscriber.email and _s.checkout_recovery_lead_pack_enabled:
+        try:
+            from src.services import checkout_recovery
+            checkout_recovery.start_recovery(
+                db,
+                email=subscriber.email,
+                source="lead_pack",
+                subscriber_id=subscriber.id,
+                phone=subscriber.phone,
+                resume_context={
+                    "kind": "lead_pack",
+                    "feed_uuid": subscriber.event_feed_uuid,
+                    "lead_pack_zip": payload.zip_code,
+                    "vertical": payload.vertical,
+                },
+            )
+            db.commit()
+        except Exception:
+            logger.warning("checkout_recovery lead_pack capture failed for sub=%s", subscriber.id, exc_info=True)
+
     return {
         "client_secret":    intent["client_secret"],
         "publishable_key":  _s.active_stripe_publishable_key,
         "amount":           amount,
         "currency":         currency,
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /api/upsell/subscription-offer — checkout-time subscription upsell
+# ---------------------------------------------------------------------------
+# Read-only pricing lookup for the "subscribe instead of a one-time Lead Pack"
+# interstitial. Only free-tier subscribers are eligible; accepting re-enters
+# the existing /api/checkout flow unchanged (which already upgrades a
+# pre-provisioned free row in place — see stripe_webhooks._on_checkout_completed).
+
+@app.get("/api/upsell/subscription-offer")
+def subscription_upsell_offer(feed_uuid: str, db: Session = Depends(get_db)):
+    _s = get_settings()
+
+    subscriber = db.execute(
+        select(Subscriber).where(Subscriber.event_feed_uuid == feed_uuid)
+    ).scalar_one_or_none()
+
+    if not subscriber or subscriber.tier != "free":
+        return {"eligible": False}
+
+    try:
+        price_id, is_founding = get_price_id_for_preview(
+            db, "starter", subscriber.vertical, subscriber.county_id
+        )
+    except ValueError:
+        return {"eligible": False}
+
+    if not price_id or not _s.active_stripe_secret_key:
+        return {"eligible": False}
+
+    stripe.api_key = _s.active_stripe_secret_key.get_secret_value()
+    try:
+        price = stripe.Price.retrieve(price_id)
+    except stripe.StripeError as exc:
+        logger.error("Stripe error retrieving starter price for upsell offer: %s", exc)
+        return {"eligible": False}
+
+    return {
+        "eligible":         True,
+        "tier":             "starter",
+        "is_founding":      is_founding,
+        "amount":           price["unit_amount"],
+        "currency":         price["currency"],
+        # Price is a snapshot of the current founding count, NOT a reservation.
+        # The actual charge is determined atomically at /api/checkout.
+        # The front-end should treat this as indicative, not guaranteed.
+        "price_guaranteed": False,
     }
 
 
@@ -3957,6 +4073,21 @@ async def synthflow_webhook(request: Request):
         payload.resolved_call_id, phone, payload.resolved_outcome,
         result.get("contact_id"), result.get("tags_applied"),
     )
+
+    # Speed-to-lead: instantly alert the founder when a prospect asks for a demo
+    if "demo_requested" in (result.get("tags_applied") or []):
+        from src.services.owner_alert import notify_owner
+        notify_owner(
+            subject="Demo requested",
+            body=(
+                f"Prospect asked for a demo on a Synthflow call.\n"
+                f"Name: {payload.prospect_name or v.get('prospect_name') or lead.get('name') or 'unknown'}\n"
+                f"Phone: {phone}\nVertical: {payload.vertical or v.get('vertical') or ''}\n"
+                f"ZIP: {payload.zip_code or v.get('zip_code') or v.get('zip') or ''}"
+            ),
+            idempotency_key=f"synthflow:{payload.resolved_call_id}",
+        )
+
     return {"status": "ok", **result}
 
 
@@ -4484,9 +4615,20 @@ async def telnyx_inbound(request: Request, db: Session = Depends(get_db)):
         payload_kind="telnyx",
     )
 
-    # Only act on inbound message events. Delivery-status callbacks (e.g.
-    # "message.sent", "message.finalized") share the same webhook URL but
-    # don't need handler routing — we just audit-log them above.
+    # Delivery-status callbacks ("message.sent", "message.finalized") share
+    # this webhook URL with inbound messages. They don't need STOP/HELP or
+    # command routing, but "message.finalized" is how we learn whether a
+    # founder alert SMS (owner_alert.notify_owner) actually reached the
+    # carrier, vs. Telnyx merely having accepted/queued it.
+    if event_type == "message.finalized":
+        from src.services.owner_alert import reconcile_delivery_status
+        recipients = payload.get("to") or [{}]
+        delivery_status = (recipients[0] or {}).get("status", "")
+        reconcile_delivery_status(telnyx_message_id=msg_id, delivery_status=delivery_status)
+        return Response(content="", media_type="application/json")
+
+    # Only act on inbound message events — any other callback type is just
+    # audit-logged above.
     if event_type != "message.received":
         return Response(content="", media_type="application/json")
 
@@ -4775,6 +4917,26 @@ def upgrade(req: UpgradeRequest, db: Session = Depends(get_db)):
     new_price_id = settings.active_stripe_price(price_name)
     if not new_price_id:
         raise HTTPException(status_code=503, detail=f"Stripe price not configured for {req.tier}")
+
+    # Settle every guarantee cycle that already closed on the outgoing tier —
+    # otherwise switching sub.tier off starter/pro/dominator drops it from
+    # the daily sweep's tier filter and any closed cycle is never evaluated.
+    # evaluate_subscriber_guarantee() only advances one cycle per call, so a
+    # subscriber sitting on a backlog of several closed cycles (sweep
+    # downtime, or guarantees just enabled for an existing subscriber) needs
+    # it called until no cycle is left to settle, not just once.
+    from config.guarantees import TIER_LEAD_QUOTAS
+    from src.tasks.guarantee_shortfall_sweep import evaluate_subscriber_guarantee
+    if sub.tier in TIER_LEAD_QUOTAS:
+        try:
+            for _ in range(60):  # safety cap — one iteration per closed cycle
+                if evaluate_subscriber_guarantee(db, sub) is None:
+                    break
+        except Exception:
+            logger.error(
+                "[Upgrade] guarantee settlement failed for sub=%d tier=%s", sub.id, sub.tier,
+                exc_info=True,
+            )
 
     try:
         switch_subscription_plan(sub.stripe_subscription_id, new_price_id, prorate=True)
@@ -5462,6 +5624,12 @@ class FreeSignupRequest(BaseModel):
     # webhook instead, so abandoned-cart users never get a misleading email.
     intent: Optional[str] = None
     consent_acceptance: Optional[ConsentAcceptanceRequest] = None
+    # annual-at-signup experiment (fa-annual-at-signup): the frontend buckets
+    # anonymous visitors client-side (no subscriber_id exists yet) and reports
+    # the arm it already showed them here so it can be persisted against the
+    # new subscriber. Anything outside the two known arms is dropped rather
+    # than trusted blindly.
+    annual_test_arm: Optional[str] = None
 
     @field_validator("email")
     @classmethod
@@ -5469,6 +5637,13 @@ class FreeSignupRequest(BaseModel):
         v = (v or "").strip().lower()
         if not v or "@" not in v or "." not in v.split("@")[-1]:
             raise ValueError("A valid email is required")
+        return v
+
+    @field_validator("annual_test_arm")
+    @classmethod
+    def _validate_annual_test_arm(cls, v: Optional[str]) -> Optional[str]:
+        if v not in ("variant", "control"):
+            return None
         return v
 
 
@@ -5521,6 +5696,7 @@ def free_signup(req: FreeSignupRequest, request: Request, db: Session = Depends(
         attribution_token=req.attribution_token,
         affiliate_ref=affiliate_ref,
         send_welcome=not defer_welcome,
+        annual_test_arm=req.annual_test_arm,
     )
 
     if req.consent_acceptance and req.consent_acceptance.terms_accepted:
@@ -6556,10 +6732,20 @@ def claim_bonus_zip(feed_uuid: str, body: ClaimBonusZipRequest, db: Session = De
 
 
 @app.get("/share/{referral_code}", include_in_schema=False)
-def referral_share_page(referral_code: str, db: Session = Depends(get_db)):
+def referral_share_page(
+    referral_code: str,
+    t: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
     """
     Public referral landing page. Looks up the referrer's vertical and
     renders current weekly forward-pack copy with a signup CTA.
+
+    `t` is a signed prompt-attribution token minted when the proactive referral
+    prompt was sent; it binds this visit to the exact funnel row that generated
+    the link. Visits without a valid token (old links, link-preview crawlers,
+    organic /share/{code} shares) are treated as un-attributed and must not
+    advance any prompt to 'shared'.
     """
     from src.services.forward_pack_renderer import get_current_copy
     from fastapi.responses import HTMLResponse
@@ -6570,10 +6756,38 @@ def referral_share_page(referral_code: str, db: Session = Depends(get_db)):
     if not referrer:
         raise HTTPException(status_code=404, detail="Referral link not found")
 
+    from src.services.signed_links import decode_prompt_attribution_token
+    prompt_funnel_id = decode_prompt_attribution_token(t) if t else None
+    if prompt_funnel_id is not None:
+        try:
+            with db.begin_nested():
+                db.execute(
+                    text(
+                        "UPDATE referral_prompt_funnel "
+                        "SET state = 'shared', shared_at = now() "
+                        "WHERE id = :fid AND subscriber_id = :sid AND state = 'shown'"
+                    ),
+                    {"fid": prompt_funnel_id, "sid": referrer.id},
+                )
+        except Exception as exc:
+            logger.warning(
+                "[ReferralPrompt] shown->shared advance failed for referrer=%d funnel=%s: %s",
+                referrer.id, prompt_funnel_id, exc,
+            )
+    elif t:
+        logger.info(
+            "[ReferralPrompt] /share visit for referrer=%d had an invalid/expired token — un-attributed",
+            referrer.id,
+        )
+
     copy_body = get_current_copy(referrer.vertical, db)
     _settings = get_settings()
     base_url = getattr(_settings, "base_url", "")
+    # Carry the attribution token through signup so a confirmed purchase can be
+    # credited back to the originating prompt (the frontend must forward `pt`).
     signup_url = f"{base_url}/?ref={referral_code}"
+    if t:
+        signup_url = f"{signup_url}&pt={t}"
 
     html = f"""<!doctype html>
 <html lang="en">

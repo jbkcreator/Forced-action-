@@ -66,6 +66,25 @@ class MagicLinkVerifyRequest(BaseModel):
     token: str
 
 
+# Onboarding preference step — kept in sync with Forced-action-ui's
+# OnboardingStep.jsx select options.
+PROPERTY_TYPE_OPTIONS = frozenset({"single_family", "multi_family", "commercial", "land", "other"})
+BUDGET_BAND_OPTIONS = frozenset({"under_50k", "50k_150k", "150k_500k", "500k_plus"})
+
+
+class OnboardingRequest(BaseModel):
+    preferred_property_type: str
+    investment_budget_band: str
+
+    @model_validator(mode="after")
+    def _valid_options(self):
+        if self.preferred_property_type not in PROPERTY_TYPE_OPTIONS:
+            raise ValueError(f"preferred_property_type must be one of {sorted(PROPERTY_TYPE_OPTIONS)}")
+        if self.investment_budget_band not in BUDGET_BAND_OPTIONS:
+            raise ValueError(f"investment_budget_band must be one of {sorted(BUDGET_BAND_OPTIONS)}")
+        return self
+
+
 # ── endpoints ──────────────────────────────────────────────────────────────
 
 @router.post("/login")
@@ -192,3 +211,22 @@ def verify_magic_link(body: MagicLinkVerifyRequest, request: Request, db=Depends
     logger.info("[subscriber-auth] magic-link verified for sub=%s", row.id)
     token = auth.create_access_token(row.id, row.event_feed_uuid)
     return {"access_token": token, "token_type": "bearer", "feed_uuid": row.event_feed_uuid}
+
+
+@router.patch("/onboarding/{feed_uuid}")
+def submit_onboarding(
+    feed_uuid: str,
+    body: OnboardingRequest,
+    db=Depends(get_db),
+    subscriber: Subscriber = Depends(auth.get_current_subscriber),
+):
+    """One-time onboarding preference capture — gates first login until
+    submitted (Subscriber.onboarding_completed, defaults False on new
+    email signups). Idempotent: re-submitting just overwrites the answer."""
+    subscriber.preferred_property_type = body.preferred_property_type
+    subscriber.investment_budget_band = body.investment_budget_band
+    subscriber.onboarding_completed = True
+    db.flush()
+
+    logger.info("[onboarding] preferences captured for sub=%s", subscriber.id)
+    return {"ok": True}

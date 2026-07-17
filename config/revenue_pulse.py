@@ -51,7 +51,7 @@ KILL_SWITCH_METRICS_WEEKLY = [
 MAX_KILL_SWITCH_SCORECARD_CHARS = 80
 
 DAILY_PULSE_TEMPLATE = (
-    "FA {date}: {lead_count} leads | {wallet_active} wallets | {top_deal}\n"
+    "FA {date}: {lead_count} leads | {lanes} lanes | {wallet_active} wallets | {top_deal}\n"
     "Alert: {alert}\n"
     "{vendor_cost}"
     "Signal: {kill_switch}"

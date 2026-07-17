@@ -1,6 +1,7 @@
 # API server
 fastapi>=0.115.0
 uvicorn>=0.30.0
+gunicorn>=23.0.0
 python-multipart>=0.0.9
 stripe>=11.0.0
 

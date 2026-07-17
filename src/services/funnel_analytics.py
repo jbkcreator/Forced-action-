@@ -15,9 +15,9 @@ Stage → event_type mapping (v1, see docs/plans funnel-analytics plan):
   paid             -> PAYMENT_SUCCEEDED
   rebilled         -> SUBSCRIPTION_RENEWED (wallet-subscription renewals excluded — separate flow)
 
-TODO(follow-up): checkout_started currently has no emitter — no backend or
-frontend call site logs PAYMENT_STARTED yet, so this stage will read 0 until
-that's wired up at the Stripe Checkout Session creation call sites.
+checkout_started's PAYMENT_STARTED emitter has fired from the frontend since
+May (FirstSessionWall.jsx, DashboardPage.jsx) via POST /api/business-event —
+the "no emitter yet" note once here was stale, not an open gap.
 """
 
 from __future__ import annotations

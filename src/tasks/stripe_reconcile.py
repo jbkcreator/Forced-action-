@@ -140,6 +140,23 @@ def reconcile_subscriptions(dry_run: bool = False) -> dict:
     return stats
 
 
+def _utc_day_window(as_of=None) -> tuple[int, int]:
+    """UTC day boundaries as epoch seconds, for Stripe's `created` filter.
+
+    Every same-day Stripe pull (fees, net revenue, bankruptcy invoices) must
+    share these exact boundaries — computing `datetime.now()` separately in
+    each one risks a few seconds' drift reclassifying a transaction into the
+    wrong day between two calls in the same run.
+
+    `as_of` accepts a `date` so callers/tests can pin a specific day instead
+    of always using real "now".
+    """
+    from datetime import timezone as _tz, datetime as _dt
+    day = as_of or _dt.now(_tz.utc).date()
+    day_start = int(_dt(day.year, day.month, day.day, tzinfo=_tz.utc).timestamp())
+    return day_start, day_start + 86400
+
+
 def log_stripe_daily_fees(dry_run: bool = False) -> dict:
     """
     Fetch today's Stripe balance transactions, sum processing fees,
@@ -148,14 +165,11 @@ def log_stripe_daily_fees(dry_run: bool = False) -> dict:
     Stripe is alert-only in v1 — no auto-pause is triggered regardless of spend.
     Returns: { "fee_usd": float, "transactions": int, "logged": bool }
     """
-    from datetime import timezone as _tz, datetime as _dt
     if not _init_stripe():
         logger.warning("[StripeReconcile] Stripe not configured — skipping fee logging")
         return {"fee_usd": 0.0, "transactions": 0, "logged": False}
 
-    today = _dt.now(_tz.utc).date()
-    day_start = int(_dt(today.year, today.month, today.day, tzinfo=_tz.utc).timestamp())
-    day_end = day_start + 86400
+    day_start, day_end = _utc_day_window()
 
     total_fee_usd = 0.0
     tx_count = 0
@@ -194,6 +208,114 @@ def log_stripe_daily_fees(dry_run: bool = False) -> dict:
         logger.info("[StripeReconcile] Logged Stripe daily fees: $%.4f (%d tx)", total_fee_usd, tx_count)
 
     return {"fee_usd": total_fee_usd, "transactions": tx_count, "logged": total_fee_usd > 0 and not dry_run}
+
+
+def compute_stripe_net_revenue(as_of=None) -> dict:
+    """Net Stripe settlement for the UTC day: sum of `type=charge` balance
+    transactions PLUS sum of `type=refund` (already negative amounts) — NOT
+    just gross charges.
+
+    A same-day refund does NOT reduce a charge's own balance-transaction
+    amount; Stripe posts it as a separate, negative `type=refund`
+    transaction. platform_revenue_ledger nets out refunded rows via
+    `refunded_at` whenever the `charge.refunded` webhook fires — which is
+    event-driven, not necessarily on the same calendar day as the original
+    charge. So both sides of the revenue_fulfillment_heartbeat comparison
+    are "net effect processed today," not "gross of charges created today"
+    — do not "simplify" this back to charges-only, that reintroduces a
+    false mismatch on every day with a refund.
+
+    Returns: { stripe_net_cents, charge_count, refund_count, configured,
+    error }. `error` is None on success, or the exception string — a fetch
+    failure must show as "could not verify," never as a false $0 day.
+    """
+    if not _init_stripe():
+        return {
+            "stripe_net_cents": 0, "charge_count": 0, "refund_count": 0,
+            "configured": False, "error": None,
+        }
+
+    day_start, day_end = _utc_day_window(as_of)
+    net_cents = 0
+    charge_count = 0
+    refund_count = 0
+    try:
+        for txn_type in ("charge", "refund"):
+            params = {"type": txn_type, "created": {"gte": day_start, "lt": day_end}, "limit": 100}
+            while True:
+                page = stripe.BalanceTransaction.list(**params)
+                for bt in page.data:
+                    net_cents += bt.amount
+                    if txn_type == "charge":
+                        charge_count += 1
+                    else:
+                        refund_count += 1
+                if not page.has_more:
+                    break
+                params["starting_after"] = page.data[-1].id
+    except stripe.error.StripeError as exc:
+        logger.error("[StripeReconcile] Net revenue fetch failed: %s", exc)
+        return {
+            "stripe_net_cents": 0, "charge_count": 0, "refund_count": 0,
+            "configured": True, "error": str(exc),
+        }
+
+    return {
+        "stripe_net_cents": net_cents, "charge_count": charge_count,
+        "refund_count": refund_count, "configured": True, "error": None,
+    }
+
+
+def fetch_bankruptcy_alert_revenue(db, as_of=None) -> dict:
+    """That day's paid Stripe invoice revenue for the bankruptcy-alert
+    product (src/services/bankruptcy_alert/subscription.py).
+
+    bankruptcy_alert_subscriptions is deliberately decoupled from
+    `subscribers` (no FK — see that module's docstring), so this product's
+    payments can't be joined into platform_revenue_ledger without a schema
+    change to a table other systems (Task 6.1/6.2 margin reporting) already
+    rely on. Pull directly from Stripe instead: one paginated Invoice.list
+    for the day, filtered in-process against the locally-known set of this
+    product's subscription ids — platform daily invoice volume is small
+    enough that this is simpler than one Stripe call per subscription.
+
+    Returns: { revenue_cents, invoice_count, configured, error }.
+    """
+    if not _init_stripe():
+        return {"revenue_cents": 0, "invoice_count": 0, "configured": False, "error": None}
+
+    from sqlalchemy import text as sa_text
+    sub_ids = {
+        row[0] for row in db.execute(sa_text(
+            "SELECT stripe_subscription_id FROM bankruptcy_alert_subscriptions "
+            "WHERE stripe_subscription_id IS NOT NULL"
+        )).all()
+    }
+    if not sub_ids:
+        return {"revenue_cents": 0, "invoice_count": 0, "configured": True, "error": None}
+
+    day_start, day_end = _utc_day_window(as_of)
+    revenue_cents = 0
+    invoice_count = 0
+    try:
+        params = {"created": {"gte": day_start, "lt": day_end}, "status": "paid", "limit": 100}
+        while True:
+            page = stripe.Invoice.list(**params)
+            for inv in page.data:
+                if getattr(inv, "subscription", None) in sub_ids:
+                    revenue_cents += getattr(inv, "amount_paid", None) or 0
+                    invoice_count += 1
+            if not page.has_more:
+                break
+            params["starting_after"] = page.data[-1].id
+    except stripe.error.StripeError as exc:
+        logger.error("[StripeReconcile] Bankruptcy-alert invoice fetch failed: %s", exc)
+        return {"revenue_cents": 0, "invoice_count": 0, "configured": True, "error": str(exc)}
+
+    return {
+        "revenue_cents": revenue_cents, "invoice_count": invoice_count,
+        "configured": True, "error": None,
+    }
 
 
 if __name__ == "__main__":

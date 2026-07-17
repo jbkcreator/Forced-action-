@@ -293,13 +293,23 @@ def transition(
         raise IllegalBrokerTransition(str(exc)) from exc
 
     if requires_close_payload(to_state):
-        if gross_amount_cents is None or split_config_id is None:
+        if gross_amount_cents is None:
             raise ClosedWonPayloadRequired(
                 "closed_won requires gross_amount_cents and split_config_id."
             )
         if gross_amount_cents <= 0:
             raise InvalidGrossAmount(
                 f"gross_amount_cents must be positive, got {gross_amount_cents}."
+            )
+        # Deal-size fee tiers (Task 3.2): resolve the split from gross when the
+        # caller does not pin one. Falls back to the required-payload error if no
+        # tier covers the amount, so behavior is unchanged until tiers are seeded.
+        if split_config_id is None:
+            from src.services.commission_ledger import resolve_split_config
+            split_config_id = resolve_split_config(session, gross_amount_cents)
+        if split_config_id is None:
+            raise ClosedWonPayloadRequired(
+                "closed_won requires gross_amount_cents and split_config_id."
             )
 
     if str(lane.assigned_broker_id) != str(broker_id):

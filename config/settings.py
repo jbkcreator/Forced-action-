@@ -91,6 +91,20 @@ class AppSettings(BaseSettings):
 	instantly_base_url: str = Field(default="https://api.instantly.ai", env="INSTANTLY_BASE_URL")
 	instantly_enabled: bool = Field(default=True, env="INSTANTLY_ENABLED")
 
+	# Non-buyer nurture — shared Instantly campaign on the dedicated warmed lifecycle domain.
+	non_buyer_nurture_campaign_id: Optional[str] = Field(default=None, env="NON_BUYER_NURTURE_CAMPAIGN_ID")
+	# Max leads enrolled per daily sweep. Ramp up as the sending domain warms.
+	non_buyer_nurture_daily_cap: int = Field(default=25, env="NON_BUYER_NURTURE_DAILY_CAP")
+
+	# Abandoned-checkout recovery (Task 7). Off by default — the sweep captures
+	# and ages rows but sends nothing until this is enabled after review.
+	checkout_recovery_enabled: bool = Field(default=False, env="CHECKOUT_RECOVERY_ENABLED")
+	# Lead-pack recovery targets EXISTING paying subscribers who abandon a $99
+	# add-on — a different (dunning) motion from prospect cart recovery. Off by
+	# default so enabling checkout_recovery_enabled does NOT start emailing
+	# paying customers. Flip only if we deliberately want to dun add-on abandons.
+	checkout_recovery_lead_pack_enabled: bool = Field(default=False, env="CHECKOUT_RECOVERY_LEAD_PACK_ENABLED")
+
 	# Stripe — set STRIPE_TEST_MODE=true to use test credentials/prices instead of live
 	stripe_test_mode: bool = Field(default=False, env="STRIPE_TEST_MODE")
 
@@ -236,6 +250,11 @@ class AppSettings(BaseSettings):
 
 	# Founding subscriber spot limit (default 10, changeable without redeploy)
 	founding_spot_limit: int = Field(default=10, env="FOUNDING_SPOT_LIMIT")
+
+	# Annual-at-signup A/B test traffic split (default 10, changeable without
+	# redeploy — edit .env and restart). Still subject to the ab_test_traffic_cap
+	# guardrail (config/cora_guardrails.py) when the test row is registered.
+	annual_signup_test_traffic_pct: int = Field(default=10, env="ANNUAL_SIGNUP_TEST_TRAFFIC_PCT")
 
 	# Grace period after subscription deletion — 7 days lets payment_failure_day5 trigger fire.
 	# Set GRACE_PERIOD_HOURS=0.017 (≈1 min) for rapid local testing.

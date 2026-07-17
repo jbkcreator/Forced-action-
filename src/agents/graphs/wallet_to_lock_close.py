@@ -20,17 +20,24 @@ Event envelope (example):
 
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import Any, Dict, Optional, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
 from src.agents.context_utils import build_personalization_fields
-from src.agents.prompts.loader import render_fallback_body, render_system_and_user
+from src.agents.prompts.loader import (
+    render_fallback_body,
+    render_for_subscriber_auto,
+    render_system_and_user,
+)
 from src.agents.subgraphs.compose_and_send import run_compose_and_send
 from src.agents.subgraphs.decision_hierarchy import run_decision_hierarchy
 from src.agents.tools.read_tools import get_segment_and_score, get_subscriber_profile
 from src.services.kill_switch_service import get_cached_metric
+
+logger = logging.getLogger(__name__)
 
 
 GRAPH_NAME = "wallet_to_lock_close"
@@ -161,7 +168,19 @@ def _node_build_compose_context(state: WalletToLockState) -> Dict[str, Any]:
         **personalization,
     }
 
-    system, user = render_system_and_user(GRAPH_NAME, context)
+    # Route through render_for_subscriber_auto so the frozen-control holdout
+    # gate (Task 4.1, lock_close_holdout) assigns + records this subscriber's
+    # arm. This graph runs no a/b test, so for non-control subscribers the
+    # returned prompt is the same base system.yaml render as before — the
+    # call's only added effect is holdout arm assignment/recording. Fails
+    # open to the base prompt so prompt-loading never blocks a send.
+    try:
+        system, user, _variant, _test_name = render_for_subscriber_auto(
+            GRAPH_NAME, state["subscriber_id"], context
+        )
+    except Exception as exc:
+        logger.warning("render_for_subscriber_auto failed for %s: %s", GRAPH_NAME, exc)
+        system, user = render_system_and_user(GRAPH_NAME, context)
     fallback = render_fallback_body(GRAPH_NAME, context)
 
     return {

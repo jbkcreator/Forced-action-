@@ -260,6 +260,86 @@ def recent_alerts(db: Session, *, limit: int = 50) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def _projected_mrr_cents(counts_by_status: dict) -> int:
+    """Projected monthly recurring revenue from active + trialing subscribers.
+
+    Flat-rate product (no per-subscriber discounts today), so this is a
+    straight count × PRICE_MONTHLY_CENTS — not a ledger sum of actually
+    collected payments (past_due/canceled contribute nothing).
+    """
+    from config.bankruptcy_alert_config import PRICE_MONTHLY_CENTS
+
+    billable = counts_by_status.get("active", 0) + counts_by_status.get("trialing", 0)
+    return billable * PRICE_MONTHLY_CENTS
+
+
+def _paid_mrr_cents(counts_by_status: dict) -> int:
+    """One month's recurring revenue from subscribers who have actually paid.
+
+    'active' status is only ever set by a successful Stripe
+    invoice.payment_succeeded webhook (see subscription.py:_on_payment_succeeded),
+    so these are Stripe-verified paying subscribers, not a guess. 'trialing'
+    is excluded: no card has been charged yet.
+
+    This is a monthly run-rate (active_count × one month's price), NOT
+    lifetime revenue collected — a subscriber active for six months counts
+    once here, at one month's price. For true collected-to-date revenue,
+    Stripe/ledger data would be needed (out of scope: this product doesn't
+    write to platform_revenue_ledger, see the plan's decoupling note).
+    """
+    from config.bankruptcy_alert_config import PRICE_MONTHLY_CENTS
+
+    return counts_by_status.get("active", 0) * PRICE_MONTHLY_CENTS
+
+
+def _invite_conversion_stats(db: Session, window_days: int = 7) -> dict:
+    """Invite → paid-conversion rate.
+
+    Counts DISTINCT invited subscribers, not invite rows — a resend to the
+    same person must not inflate either side (one person, one paid signup =
+    one conversion, however many invites they got).
+
+    Denominator: distinct subscribers actually sent a bankruptcy_alert_invite.
+    Numerator: those whose email later appears as a PAID (status='active')
+    bankruptcy_alert_subscriptions row within window_days of any of their
+    sends — mirrors INVITE_GIVE_UP_HOURS' short attribution window rather
+    than crediting an invite for an unrelated signup months later.
+
+    Only 'active' (Stripe-charged) counts — a trialing/canceled signup in the
+    window is not a paid conversion, matching _paid_mrr_cents' definition of
+    real revenue. Attribution is correlational (email match + time proximity),
+    so treat this as a floor estimate, not proven causation.
+    """
+    from config.bankruptcy_alert_config import INVITE_TEMPLATE_ID
+
+    row = db.execute(sa_text("""
+        SELECT
+            COUNT(DISTINCT m.subscriber_id) AS invites_sent,
+            COUNT(DISTINCT m.subscriber_id) FILTER (
+                WHERE EXISTS (
+                    SELECT 1 FROM bankruptcy_alert_subscriptions b
+                    WHERE LOWER(b.email) = LOWER(s.email)
+                      AND b.status = 'active'
+                      AND b.created_at >= m.sent_at
+                      AND b.created_at < m.sent_at + make_interval(days => :window_days)
+                )
+            ) AS converted
+        FROM message_outcomes m
+        JOIN subscribers s ON s.id = m.subscriber_id
+        WHERE m.template_id = :tpl AND m.send_status = 'sent'
+    """), {"tpl": INVITE_TEMPLATE_ID, "window_days": window_days}).first()
+
+    invites_sent = int(row.invites_sent or 0) if row else 0
+    converted = int(row.converted or 0) if row else 0
+
+    return {
+        "invites_sent": invites_sent,
+        "converted": converted,
+        "conversion_rate_pct": round(converted / invites_sent * 100, 1) if invites_sent else None,
+        "window_days": window_days,
+    }
+
+
 def status_summary(db: Session) -> dict:
     """Counts for the /alerts/status endpoint."""
     sub_counts = db.execute(sa_text("""
@@ -276,11 +356,16 @@ def status_summary(db: Session) -> dict:
     """)).first()
     filings_total = db.execute(sa_text("SELECT COUNT(*) AS c FROM bankruptcy_filings")).first()
 
+    subscribers_by_status = {r.status: int(r.c) for r in sub_counts}
+
     return {
-        "subscribers_by_status": {r.status: int(r.c) for r in sub_counts},
-        "subscribers_total": sum(int(r.c) for r in sub_counts),
+        "subscribers_by_status": subscribers_by_status,
+        "subscribers_total": sum(subscribers_by_status.values()),
         "alerts_sent": int(alert_counts.sent or 0) if alert_counts else 0,
         "alerts_failed": int(alert_counts.failed or 0) if alert_counts else 0,
         "alerts_last_24h": int(alert_counts.last_24h or 0) if alert_counts else 0,
         "filings_total": int(filings_total.c or 0) if filings_total else 0,
+        "projected_mrr_cents": _projected_mrr_cents(subscribers_by_status),
+        "paid_mrr_cents": _paid_mrr_cents(subscribers_by_status),
+        "invite_conversion": _invite_conversion_stats(db),
     }

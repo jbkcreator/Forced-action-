@@ -1772,6 +1772,8 @@ class CountyCreateRequest(BaseModel):
     bankruptcy_division: Optional[str] = None
     city_filer_keywords: list[str] = []
     code_lien_type_map: dict = {}
+    landing_featured_testimonials: Optional[list[dict]] = None
+    founding_price_deadline_at: Optional[datetime] = None
 
 
 class CountyUpdateRequest(BaseModel):
@@ -1900,6 +1902,8 @@ def create_county(
         bankruptcy_division=body.bankruptcy_division,
         city_filer_keywords=body.city_filer_keywords,
         code_lien_type_map=body.code_lien_type_map,
+        landing_featured_testimonials=body.landing_featured_testimonials,
+        founding_price_deadline_at=body.founding_price_deadline_at,
         is_active=True,
     )
     db.add(county)
@@ -1933,7 +1937,7 @@ def update_county(
     if not county:
         raise HTTPException(status_code=404, detail=f"County '{county_id}' not found")
 
-    updates = body.model_dump(exclude_none=True)
+    updates = body.model_dump(exclude_unset=True)
     for field, value in updates.items():
         setattr(county, field, value)
 

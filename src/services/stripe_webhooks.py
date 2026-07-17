@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import stripe
-from sqlalchemy import select, and_, desc, func
+from sqlalchemy import select, and_, desc, func, text
 from sqlalchemy.dialects.postgresql import array
 from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -521,6 +521,24 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
             subscriber.founding_price_id  = founding_price_id
             subscriber.rate_locked_at     = now
 
+    # First paid conversion, matched by email — suppresses non-buyer nurture
+    # and closes any in-flight abandoned-checkout recovery (Task 7).
+    if customer_email:
+        try:
+            from src.services import non_buyer_nurture
+            non_buyer_nurture.mark_converted(db, customer_email)
+        except Exception:
+            logger.warning(
+                "non_buyer_nurture mark_converted failed for subscriber=%s", subscriber.id, exc_info=True,
+            )
+        try:
+            from src.services import checkout_recovery
+            checkout_recovery.mark_recovered(db, customer_email)
+        except Exception:
+            logger.warning(
+                "checkout_recovery mark_recovered failed for email=%s", customer_email, exc_info=True,
+            )
+
     # ── Plan price + trial flags (fa048) ────────────────────────────────────
     # amount_total is in cents; represents the charge for this billing period.
     # For active (non-trial) subscriptions this equals the monthly plan price.
@@ -800,6 +818,17 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
                     subscriber.id, exc_info=True,
                 )
 
+        # ── Speed-to-lead: instantly alert the founder of the new signup ────
+        from src.services.owner_alert import notify_owner
+        notify_owner(
+            subject=f"New subscriber — {subscriber.tier} {vertical}",
+            body=(
+                f"New subscriber signed up.\nTier: {subscriber.tier}\nVertical: {vertical}\n"
+                f"County: {county_id}\nZIPs: {', '.join(zip_codes)}\nEmail: {subscriber.email}"
+            ),
+            idempotency_key=f"stripe:{session.get('id', '')}",
+        )
+
         # Stage 12 — schedule the bankruptcy-alert invite (sent T+X min by the
         # invite sweep). Best-effort; never breaks checkout processing.
         try:
@@ -841,6 +870,18 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
                 "[Referral] confirmed: referee=%d event=%d",
                 subscriber.id, event.id,
             )
+            try:
+                with db.begin_nested():
+                    from src.services.referral_prompt_service import mark_confirmed
+                    mark_confirmed(
+                        event.referrer_subscriber_id, event.id, db,
+                        prompt_funnel_id=getattr(event, "prompt_funnel_id", None),
+                    )
+            except Exception:
+                logger.warning(
+                    "[ReferralPrompt] funnel confirm advance failed for event=%d — non-fatal",
+                    event.id, exc_info=True,
+                )
     except Exception:
         logger.error(
             "[Referral] confirm/reward failed for subscriber %d — non-fatal",
@@ -875,6 +916,16 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
         )
     except Exception:
         logger.warning("Attribution recording failed sub=%s", subscriber.id, exc_info=True)
+
+    # Task 4.1 frozen control holdout — a completed checkout is the
+    # conversion event for the lock_close_v1 sequence. No-op for any
+    # subscriber without a lock_close_holdout AbAssignment (anyone the
+    # wallet_to_lock_close graph never nudged), so this fires safely across
+    # every tier this handler processes, not just ZIP lock upgrades —
+    # matching the per-tier (not per-message) granularity already used
+    # above for attribution/Meta CAPI.
+    from src.services.ab_engine import record_holdout_conversion
+    record_holdout_conversion(subscriber.id, "lock_close_holdout", db)
 
     # ── Meta CAPI (S2): report server-side Purchase ──────────────────────────
     # Observer only — runs after the subscriber is active, ZIPs are locked, and
@@ -972,6 +1023,20 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
             subscriber.id,
             exc_info=True,
         )
+
+    # Annual-at-signup A/B: a checkout completed straight onto annual_lock
+    # counts as a "converted" outcome for whichever arm this subscriber was
+    # bucketed into at signup (see record_pregenerated_arm in signup_engine).
+    if tier == "annual_lock":
+        try:
+            with db.begin_nested():
+                from src.services.ab_engine import ANNUAL_SIGNUP_TEST_NAME, record_outcome
+                record_outcome(subscriber.id, ANNUAL_SIGNUP_TEST_NAME, "converted", db)
+        except Exception:
+            logger.warning(
+                "[AnnualAtSignup] A/B record_outcome failed for subscriber=%s",
+                subscriber.id, exc_info=True,
+            )
 
     logger.info(
         "checkout.session.completed: subscriber=%s tier=%s vertical=%s"
@@ -2067,6 +2132,16 @@ def _on_payment_intent_succeeded(payment_intent, db: Session) -> None:
         logger.info("[PI] routing -> card_save (no product metadata) pi=%s", pi_id)
         _on_card_saved(payment_intent, db)
 
+    # ── Speed-to-lead: instantly alert the founder of the purchase ─────────
+    # Guarded on `product` — the card_save branch above has no product metadata
+    # (e.g. a saved-card/setup event, not a purchase) and must not page Josh.
+    if product:
+        from src.services.owner_alert import notify_owner
+        notify_owner(
+            subject=f"Purchase — {product}",
+            body=f"Product: {product}\nAmount: ${(amount or 0) / 100:.2f}\nPI: {pi_id}\nCustomer: {customer_id}",
+        )
+
     # ── Referral confirmation (any PI-based paid action) ─────────────────
     # checkout.session.completed handles subscription first-payments; this
     # branch covers wallet top-ups, premium credits, bundles, lead packs,
@@ -2102,6 +2177,18 @@ def _on_payment_intent_succeeded(payment_intent, db: Session) -> None:
                 subscriber_id, event.id, pi_id, product,
                 event.referrer_subscriber_id, event.confirmed_at,
             )
+            try:
+                with db.begin_nested():
+                    from src.services.referral_prompt_service import mark_confirmed
+                    mark_confirmed(
+                        event.referrer_subscriber_id, event.id, db,
+                        prompt_funnel_id=getattr(event, "prompt_funnel_id", None),
+                    )
+            except Exception:
+                logger.warning(
+                    "[ReferralPrompt] funnel confirm advance failed for event=%d — non-fatal",
+                    event.id, exc_info=True,
+                )
     except Exception as exc:
         logger.error(
             "[Referral] PI-path confirm failed for subscriber %s — non-fatal: %s",
@@ -2272,13 +2359,24 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
                     record_revenue, attribute_enrichment_cost_for_property,
                     stripe_payment_intent_ledger_id,
                 )
+                # hot_lead_unlock and lead_unlock share this handler (see
+                # docstring) but must be distinguishable in revenue reporting
+                # — the PI's own metadata already tells us which one this is.
+                ledger_product_type = (
+                    "hot_lead_unlock" if _attr(meta, "product") == "hot_lead_unlock" else "lead_unlock"
+                )
                 record_revenue(
-                    db, subscriber_id=subscriber.id, product_type="lead_unlock",
+                    db, subscriber_id=subscriber.id, product_type=ledger_product_type,
                     amount_cents=amount_cents, source_table="stripe_payment_intent",
                     source_id=stripe_payment_intent_ledger_id(pi_id), property_id=property_id,
                     occurred_at=sent_row.sent_at,
                 )
                 attribute_enrichment_cost_for_property(db, property_id, subscriber.id)
+
+                # Task 4.1 frozen control holdout — lead unlock is the
+                # conversion event for the fomo sequence.
+                from src.services.ab_engine import record_holdout_conversion
+                record_holdout_conversion(subscriber.id, "fomo_holdout", db)
     except (IntegrityError, OperationalError) as exc:
         logger.warning("lead_unlock: SentLead insert failed: %s", exc)
 
@@ -3238,6 +3336,13 @@ def _on_wallet_subscription_invoice(invoice: dict, db: Session) -> None:
     except Exception:
         logger.warning("Attribution recording failed sub=%s", subscriber_id, exc_info=True)
 
+    # Task 4.1 frozen control holdout — wallet activation is the conversion
+    # event for the accelerated_wallet_push sequence. Test name matches the
+    # key in config/cora_holdout_tests.yaml; no-op for subscribers never
+    # assigned an arm.
+    from src.services.ab_engine import record_holdout_conversion
+    record_holdout_conversion(subscriber_id, "wallet_push_holdout", db)
+
 
 def _on_wallet_subscription_invoice_failed(invoice: dict, db: Session) -> None:
     """Mark a wallet_push_offers row as 'failed' when the first invoice fails.
@@ -3413,10 +3518,36 @@ def _on_charge_refunded(charge: dict, db: Session) -> None:
                     SentLead.source == "lead_pack",
                 )
             ).scalars().all()
+
+            # A partial refund of the overall purchase must prorate across
+            # each lead's own ledger share, not zero every row out — pull
+            # each row's actual original amount (never assume a fixed split
+            # order) and allocate proportionally, giving the remainder to
+            # the smallest share so the parts sum exactly to the refund.
+            per_row_refund_cents: dict[int, int] = {}
+            if sent_lead_ids:
+                ledger_amounts = dict(db.execute(text("""
+                    SELECT source_id, amount_cents FROM platform_revenue_ledger
+                    WHERE source_table = 'sent_leads' AND source_id = ANY(:ids)
+                """), {"ids": list(sent_lead_ids)}).all())
+                total_original = sum(ledger_amounts.values())
+                total_refund = charge.get("amount_refunded") or 0
+                if total_original and 0 < total_refund < total_original:
+                    ordered_ids = sorted(sent_lead_ids, key=lambda sid: -ledger_amounts.get(sid, 0))
+                    allocated = 0
+                    for idx, sid in enumerate(ordered_ids):
+                        if idx == len(ordered_ids) - 1:
+                            share = total_refund - allocated
+                        else:
+                            share = round(ledger_amounts.get(sid, 0) * total_refund / total_original)
+                        allocated += share
+                        per_row_refund_cents[sid] = share
+
             for sent_lead_id in sent_lead_ids:
                 mark_ledger_refunded(
                     db, source_table="sent_leads", source_id=sent_lead_id,
                     refunded_at=purchase.refunded_at,
+                    refunded_amount_cents=per_row_refund_cents.get(sent_lead_id),
                 )
 
             # Clear exclusivity rows so the properties immediately become
@@ -3460,7 +3591,7 @@ def _on_charge_refunded(charge: dict, db: Session) -> None:
     from src.services.revenue_ledger import mark_ledger_refunded
     mark_ledger_refunded(
         db, source_table="premium_purchases", source_id=purchase.id,
-        refunded_at=purchase.refunded_at,
+        refunded_at=purchase.refunded_at, refunded_amount_cents=refund_amount,
     )
 
     if purchase.paid_via == "credits" and purchase.sku not in _DATA_SURRENDERED_SKUS:
@@ -3664,6 +3795,14 @@ def _on_lead_pack_payment(payment_intent: dict, db: Session) -> None:
     if subscriber is None:
         logger.error("[LeadPack] No subscriber for feed_uuid %s", feed_uuid)
         return
+
+    # Close any open abandoned-checkout recovery for this lead pack (Task 7).
+    if subscriber.email:
+        try:
+            from src.services import checkout_recovery
+            checkout_recovery.mark_recovered(db, subscriber.email)
+        except Exception:
+            logger.warning("[LeadPack] checkout_recovery mark_recovered failed sub=%s", subscriber.id, exc_info=True)
 
     now = datetime.now(timezone.utc)
     exclusive_until = now + timedelta(hours=72)
@@ -4041,10 +4180,14 @@ def _on_checkout_expired(session: dict, db: Session) -> None:
     Fires when a Stripe checkout session expires without payment.
     For hot_lead_unlock sessions opened by free-tier subscribers, publish
     abandonment_click_no_complete to Cora so the retention flow can trigger.
-    Subscription and lead-pack sessions are intentionally ignored here.
+    For every other expired session with a captured email, start the
+    abandoned-checkout recovery sequence (Task 7). Recovery holds the contact
+    out of the slower non-buyer nurture drip until it fails, so the two never
+    double-contact — this is the capture point for the session-expiry path.
     """
     meta = session.get("metadata") or {}
     if meta.get("product") != "hot_lead_unlock":
+        _start_recovery_for_expired_checkout(session, db)
         return
 
     stripe_customer_id = session.get("customer")
@@ -4076,6 +4219,34 @@ def _on_checkout_expired(session: dict, db: Session) -> None:
         logger.warning(
             "abandonment_click_no_complete publish failed: subscriber=%s", subscriber_id,
         )
+
+
+def _start_recovery_for_expired_checkout(session: dict, db: Session) -> None:
+    details = session.get("customer_details") or {}
+    email = (details.get("email") or session.get("customer_email") or "").lower().strip()
+    if not email:
+        return
+    meta = session.get("metadata") or {}
+    # Rebuild enough context to mint a fresh resume-checkout link — the expired
+    # session itself can't be reused.
+    resume_context = {
+        "tier": meta.get("tier"),
+        "vertical": meta.get("vertical"),
+        "county_id": meta.get("county_id"),
+        "zip_codes": [z for z in (meta.get("zip_codes") or "").split(",") if z],
+    }
+    try:
+        from src.services import checkout_recovery
+        checkout_recovery.start_recovery(
+            db,
+            email=email,
+            source="session_expired",
+            phone=details.get("phone"),
+            resume_context=resume_context,
+        )
+    except Exception:
+        logger.warning("checkout_recovery capture failed for expired checkout email=%s", email, exc_info=True)
+        logger.warning("non_buyer_nurture capture failed for expired checkout session %s", session.get("id"), exc_info=True)
 
 
 def _send_lead_pack_refund_email(

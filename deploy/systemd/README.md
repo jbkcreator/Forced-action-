@@ -1,64 +1,47 @@
 # systemd unit files — Forced Action
 
-Two long-running services for Stage 1 server deployment.
+Two long-running services on this server: `fa-api` (FastAPI/Uvicorn) and `cora` (LangGraph agents supervisor).
 
 ## Install
 
 Copy the unit files to `/etc/systemd/system/` on the server, reload, enable, start:
 
 ```bash
-sudo cp deploy/systemd/fa-api.service     /etc/systemd/system/
-sudo cp deploy/systemd/fa-agents.service  /etc/systemd/system/
+sudo cp deploy/systemd/fa-api.service  /etc/systemd/system/
+sudo cp deploy/systemd/cora.service    /etc/systemd/system/
 
 sudo systemctl daemon-reload
 
-sudo systemctl enable  fa-api fa-agents
-sudo systemctl start   fa-api fa-agents
+sudo systemctl enable  fa-api cora
+sudo systemctl start   fa-api cora
 ```
 
 ## Prerequisites the units assume
 
-- `/opt/forced-action/` — the checked-out repo
-- `/opt/forced-action/.venv/` — Python virtualenv with requirements installed
-- `/etc/forced-action/env` — the env file (mode 0640, owned by root:forcedaction)
-- `forcedaction` system user + group
-- `/var/log/forced-action/` — created, writable by the user
+- `/root/Forced-action-/` — the checked-out repo
+- `/root/Forced-action-/.venv/` — Python virtualenv with requirements installed
+- `/root/Forced-action-/.env` — the env file
+- Both services run as `root` (matches this server's current setup)
 - Redis + Postgres running on the same box (or reachable via DATABASE_URL / REDIS_URL)
-
-Create user + dirs:
-
-```bash
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin forcedaction
-sudo mkdir -p /opt/forced-action /etc/forced-action /var/log/forced-action
-sudo chown -R forcedaction:forcedaction /opt/forced-action /var/log/forced-action
-sudo chmod 0750 /etc/forced-action
-```
 
 ## Deploying the repo
 
 ```bash
-# First deploy
-sudo -u forcedaction git clone <repo-url> /opt/forced-action
-cd /opt/forced-action
-sudo -u forcedaction python3 -m venv .venv
-sudo -u forcedaction .venv/bin/pip install -r requirements.txt
-
-# Subsequent deploys
-cd /opt/forced-action
-sudo -u forcedaction git pull
-sudo -u forcedaction .venv/bin/pip install -r requirements.txt
-sudo -u forcedaction .venv/bin/python -m alembic upgrade head
-sudo systemctl restart fa-api fa-agents
+cd /root/Forced-action-
+git pull
+.venv/bin/pip install -r requirements.txt
+# Schema changes: run any new migrations/apply_*.py or scripts/apply_*.py directly (Alembic is retired — ADR 0024)
+sudo systemctl restart fa-api cora
 ```
 
 ## Logs
 
 ```bash
 # tail everything
-sudo journalctl -u fa-api -u fa-agents -f
+sudo journalctl -u fa-api -u cora -f
 
 # just agents
-sudo journalctl -u fa-agents -f
+sudo journalctl -u cora -f
 
 # last 100 lines of API
 sudo journalctl -u fa-api -n 100 --no-pager
@@ -68,14 +51,14 @@ sudo journalctl -u fa-api -n 100 --no-pager
 
 ```bash
 systemctl status fa-api
-systemctl status fa-agents
-curl -s http://localhost:8000/         # should respond
+systemctl status cora
+curl -s http://localhost:8000/docs     # should return 200
 ```
 
 ## Stopping
 
 ```bash
-sudo systemctl stop fa-api fa-agents
+sudo systemctl stop fa-api cora
 ```
 
 ## Kill-switch shortcut
@@ -84,9 +67,9 @@ If you need to halt Cora autonomously without touching the service:
 
 ```bash
 # Option 1: flip env flag + restart
-sudo sed -i 's/^AGENTS_GLOBAL_KILL_SWITCH=.*/AGENTS_GLOBAL_KILL_SWITCH=true/' /etc/forced-action/env
-sudo systemctl restart fa-agents
+sudo sed -i 's/^AGENTS_GLOBAL_KILL_SWITCH=.*/AGENTS_GLOBAL_KILL_SWITCH=true/' /root/Forced-action-/.env
+sudo systemctl restart cora
 
 # Option 2: just stop the process (API keeps serving)
-sudo systemctl stop fa-agents
+sudo systemctl stop cora
 ```

@@ -103,14 +103,16 @@ COUNTY_ID=hillsborough
 # Quora S6 organic-answer pipeline — 06:35 AM UTC daily (after load validator).
 # Picks one keyword via DB rotation (quora_topics + cooldown_days), scrapes Quora,
 # publishes to Cora for classification + answer drafting, upserts to quora_questions.
-35 6 * * * $PROJECT/scripts/cron/run.sh src.tasks.quora_s6_orchestrator
+#35 6 * * * $PROJECT/scripts/cron/run.sh src.tasks.quora_s6_orchestrator
 
 # Autonomous Inbound Content Loop (Task 5.1) — Weekly Sunday @ 09:00 AM UTC.
 # Scores each Quora Seed Keyword over a 30-day window, deactivates losers
 # (>=5 answers, 0 paid signups) and expands winners (LLM variations, pool cap 30,
 # replace-worst). Weekly to match the one-keyword/day scrape throughput. Runs
 # clear of the 04:00–08:00 scrape/CDS/skip-trace/GHL chain. See docs/adr/0021.
-0 9 * * 0 $PROJECT/scripts/cron/run.sh src.tasks.autonomous_tuning_worker
+# DISABLED alongside quora_s6_orchestrator — this loop only scores/expands
+# Quora Seed Keywords, which stop moving once the scraper feeding them is off.
+#0 9 * * 0 $PROJECT/scripts/cron/run.sh src.tasks.autonomous_tuning_worker
 
 # ── PINELLAS DAILY ────────────────────────────────────────────
 # Staggered +5 min after their Hillsborough counterparts within 04:00–06:30 UTC window.
@@ -315,6 +317,14 @@ COUNTY_ID=hillsborough
 # Daily reconciliation Mon-Sat — catch any subscribers who paid but weren't activated
 15 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.stripe_reconcile
 
+# MB2 — Fulfillment verification + revenue heartbeat (subscriptions, lead
+# unlocks, hot-lead unlocks, lead packs, premium, bankruptcy-alert, Loan Lane
+# volume) vs Stripe's own daily total; alerts via ALERT_EMAIL on any mismatch
+# or unfulfilled/delayed item. Runs after stripe_reconcile. NOTE: :30 is taken
+# by run_enrichment (below) and revenue_pulse --daily (line ~465) — do not
+# move this back onto :30.
+33 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.revenue_fulfillment_heartbeat
+
 
 # SunBiz LLC Piercing Enrichment — 07:40 AM UTC Mon-Sat (fa031 tiered staleness)
 # Tier A: active-lead pending/30d-stale  •  Tier B: cold pending/180d-stale
@@ -407,6 +417,20 @@ COUNTY_ID=hillsborough
 # Pulls daily analytics snapshots + per-contact engagement status from Instantly.
 # Maps unsubscribe/hard-bounce to global suppression. Auto-completes exhausted campaigns.
 0 22 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.email_campaign_sync
+
+# ── NON-BUYER NURTURE ────────────────────────────────────────────────────────
+# Daily sweep — finds free-signup/checkout-abandon/waitlist non-buyers aged
+# 24h-90d, enrolls up to the daily cap into the shared Instantly campaign.
+# PROD BLOCKER: requires NON_BUYER_NURTURE_CAMPAIGN_ID on a warmed dedicated domain.
+30 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.non_buyer_nurture_sweep
+# Daily sync — pulls per-lead status, maps unsubscribe/bounce to terminal state.
+0 21 * * * $PROJECT/scripts/cron/run.sh src.tasks.non_buyer_nurture_sync
+
+# ── ABANDONED-CHECKOUT RECOVERY (Task 7) ─────────────────────────────────────
+# Every 30 min — sends due recovery touches (1st ~1h after drop-off, follow-up
+# ~24h later) and fails exhausted rows back to non-buyer nurture. Read-only
+# until CHECKOUT_RECOVERY_ENABLED=true (captures + ages rows, sends nothing).
+*/30 * * * * $PROJECT/scripts/cron/run.sh src.tasks.checkout_recovery_sweep
 
 # ── STAGE 5: BUNDLES + AUTOPILOT + ANNUAL ───────────────────────────────────
 # Bundle dispatcher — every hour, contextually offers Weekend / Storm /
@@ -556,6 +580,12 @@ COUNTY_ID=hillsborough
 # SMS + writes a learning_card row.
 0 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.ab_rollback_check
 
+# Frozen control holdout surfacing — daily 09:00 UTC (Task 4.1). Walks
+# active *_holdout AbTests; on a proven verdict (variant beats frozen
+# control >2σ, >=30/arm) writes a cora_playbook recommendation + a
+# holdout_result learning_card. No auto-promote — a human adopts.
+0 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.cora_holdout_check
+
 # Cora attribution rollout monitor — every 2 min. Evaluates cora_attribution_v1
 # rollout arm: if variant conversion rate is >2σ worse than control over a
 # rolling 48h window (>=30/arm), rolls back AbTest.status='rolled_back',
@@ -672,5 +702,27 @@ COUNTY_ID=hillsborough
 # before that upstream job runs on a real cadence would stage outcomes
 # against stale/empty tax_deed_auctions data and report false "success".
 # Add this once the tax-deed scraper itself has a cron line above.
+
+# ── CDS SCORING RETUNE (client Q9 — closed loop) ─────────────
+# Weekly Sunday @ 11:00 UTC. Runs B→C→D→E→F end to end: builds the training
+# set, fits per-vertical weights, shadow-rescores, validates, and (only if the
+# Stage E gate PASSes with enough per-vertical data) promotes the new weights to
+# live scoring via scoring_cutover_log. The daily Mon-Sat rescore (07:00) then
+# auto-applies the approved weights on its next run — no redeploy.
+# Sunday is chosen because the daily rescore is Mon-Sat only, so the heavy
+# shadow rescore never contends with live scoring. After master parcel refresh
+# (01:00-02:00) and SEO compiler (09:30); before Monday's conversion report.
+0 11 * * 0 $PROJECT/scripts/cron/run.sh src.tasks.scoring_retune --window-days 90
+# ── OWNER ALERT DELIVERY SWEEP (PR #126) ────────────────────────────────────
+# Safety net for notify_owner() speed-to-lead founder alerts: emails the
+# fallback for any owner_alert_dispatch row stuck at status='sms_sent' for
+# 5+ minutes with no Telnyx message.finalized delivery-status callback.
+*/5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.owner_alert_sweep
+# Tiered volume guarantee shortfall sweep — INTENTIONALLY NOT scheduled yet.
+# config/guarantees.py TIER_LEAD_QUOTAS are placeholder lead-per-cycle counts
+# pending a business decision; enabling this cron would issue real Stripe
+# balance credits off unconfirmed numbers. Uncomment once TIER_LEAD_QUOTAS is
+# confirmed (and ideally after a --dry-run pass against production data).
+# 0 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.guarantee_shortfall_sweep
 
 # === END FORCED-ACTION-PLATFORM ===
