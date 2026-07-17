@@ -5926,6 +5926,9 @@ def free_signup(req: FreeSignupRequest, request: Request, db: Session = Depends(
     Idempotent on email — re-visiting with the same email returns the
     existing subscriber's feed_uuid without creating duplicates.
     """
+    if not get_settings().freemium_funnel_enabled:
+        raise HTTPException(status_code=503, detail="freemium funnel disabled")
+
     if req.vertical not in VALID_VERTICALS:
         raise HTTPException(
             status_code=400,
@@ -6110,6 +6113,9 @@ class WallSessionRequest(BaseModel):
 @app.post("/api/wall/session", status_code=201)
 def create_wall_session(req: WallSessionRequest, db: Session = Depends(get_db)):
     """Create a monetization wall session for a new subscriber."""
+    if not get_settings().freemium_funnel_enabled:
+        raise HTTPException(status_code=503, detail="freemium funnel disabled")
+
     from src.services.monetization_wall import create_session, get_roi_frame
     state = create_session(req.subscriber_id, req.session_id)
     roi = get_roi_frame(req.vertical, req.county_id, db)
@@ -6403,6 +6409,8 @@ def create_payment_intent_endpoint(
 
     # Acquire a 20-min lead hold for lead_unlock purchases to prevent double-selling
     if req.metadata and req.metadata.get("product") == "lead_unlock":
+        if not get_settings().freemium_funnel_enabled:
+            raise HTTPException(status_code=503, detail="freemium funnel disabled")
         try:
             property_id = int(req.metadata["property_id"])
             from src.services.lead_hold import hold as acquire_hold

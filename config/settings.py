@@ -422,6 +422,13 @@ class AppSettings(BaseSettings):
 	# Auto-flipped to False if Day-35 take_rate < wallet_adoption.floor_pct (12%).
 	accelerated_wallet_push_enabled: bool = Field(default=False, env="ACCELERATED_WALLET_PUSH_ENABLED")
 
+	# Freemium blurred-feed funnel (T-B3-01) — master launch toggle ANDed in
+	# front of every funnel leg: free signup, blurred teaser/proof moment,
+	# monetization wall, flash scarcity, abandonment nudges. Default True:
+	# these flows are already live in prod; per-flow Cora kill-switches
+	# (first_payment_rate) still apply when this is ON.
+	freemium_funnel_enabled: bool = Field(default=True, env="FREEMIUM_FUNNEL_ENABLED")
+
 	# TCPA quiet-hours enforcement (8am–9pm recipient local time).
 	# Set False in dev/staging to send SMS at any hour during testing.
 	sms_quiet_hours_enabled: bool = Field(default=True, env="SMS_QUIET_HOURS_ENABLED")

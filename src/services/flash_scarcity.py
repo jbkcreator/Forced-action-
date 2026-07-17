@@ -68,6 +68,10 @@ def open_window_if_spike(
 
     Returns True if window was opened.
     """
+    from config.settings import get_settings
+    if not get_settings().freemium_funnel_enabled:
+        return False
+
     if not zip_code or not vertical:
         return False
 
