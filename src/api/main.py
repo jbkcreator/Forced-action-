@@ -3294,12 +3294,23 @@ def sample_leads(
 # POST /api/lead-pack/checkout — Create PaymentIntent for a lead pack purchase
 # ---------------------------------------------------------------------------
 
+VALID_LEAD_PACK_SEGMENTS = frozenset({"insurance_distress"})
+
+
 class LeadPackCheckoutRequest(BaseModel):
     feed_uuid: str
     zip_code: str
     vertical: str
     county_id: str = "hillsborough"
+    segment: Optional[str] = None  # e.g. "insurance_distress" (ADR 0032) — server-validated allowlist
     attribution: Optional[dict] = None  # Meta Ads attribution (utm_*, campaign_id, fbclid, ...)
+
+    @field_validator("segment")
+    @classmethod
+    def validate_segment(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in VALID_LEAD_PACK_SEGMENTS:
+            raise ValueError(f"Unknown segment '{v}'. Valid segments: {sorted(VALID_LEAD_PACK_SEGMENTS)}")
+        return v
 
 
 @app.post("/api/lead-pack/checkout")
@@ -3335,17 +3346,23 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, request: Request, db: S
     if subscriber.vertical and subscriber.vertical != payload.vertical:
         raise HTTPException(status_code=400, detail={"error": "vertical_mismatch", "message": f"Your subscription is for {subscriber.vertical}, not {payload.vertical}"})
 
-    # Reject if subscriber already owns this ZIP — they get those leads free
-    owned = db.execute(
-        select(ZipTerritory).where(
-            ZipTerritory.subscriber_id == subscriber.id,
-            ZipTerritory.zip_code == payload.zip_code,
-            ZipTerritory.vertical == payload.vertical,
-            ZipTerritory.status.in_(["locked", "grace"]),
-        )
-    ).scalar_one_or_none()
-    if owned:
-        raise HTTPException(status_code=400, detail={"error": "zip_already_owned", "message": "You already receive leads for this ZIP in your feed."})
+    # Reject if subscriber already owns this ZIP — they get those base leads
+    # free. EXCEPTION: the insurance-distress segment (ADR 0032) is a premium
+    # add-on sold *inside* the subscriber's locked ZIPs, so an owned ZIP is
+    # exactly where it's offered — do not reject it there. Without this, every
+    # pack card from /api/insurance-distress/availability (which only surfaces
+    # locked ZIPs) would 400 with zip_already_owned.
+    if payload.segment != "insurance_distress":
+        owned = db.execute(
+            select(ZipTerritory).where(
+                ZipTerritory.subscriber_id == subscriber.id,
+                ZipTerritory.zip_code == payload.zip_code,
+                ZipTerritory.vertical == payload.vertical,
+                ZipTerritory.status.in_(["locked", "grace"]),
+            )
+        ).scalar_one_or_none()
+        if owned:
+            raise HTTPException(status_code=400, detail={"error": "zip_already_owned", "message": "You already receive leads for this ZIP in your feed."})
 
     # Checkout gate 1: county must be launched (ADR 0002 — derived status).
     from src.utils.county_config import is_county_launched
@@ -3362,7 +3379,7 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, request: Request, db: S
     # deliberately no pre-payment contactability-percentage gate here.
     from src.services.lead_exclusivity import get_exclusive_property_ids
     from src.core.models import DistressScore, Owner
-    from src.utils.lead_filters import has_contact_filter, phone_priority_order
+    from src.utils.lead_filters import phone_priority_order
     from datetime import datetime, timezone as tz
 
     now = datetime.now(tz.utc)
@@ -3373,16 +3390,16 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, request: Request, db: S
     except KeyError:
         raise HTTPException(status_code=400, detail={"error": "invalid_vertical", "message": f"Unknown vertical '{payload.vertical}'"})
 
-    filters = [
-        Property.zip == payload.zip_code,
-        Property.county_id == payload.county_id,
-        DistressScore.qualified == True,
-    ]
-    contact_clause = has_contact_filter(_s)
-    if contact_clause is not None:
-        filters.append(contact_clause)
+    # Same sellability predicate as availability + webhook reservation
+    # (ADR 0032 D5): qualified, non-guess (A2), contactable. Prevents charging
+    # a customer for a pack the webhook would then have to refund.
+    from src.services.lead_pool_service import apply_segment_filter, sellable_lead_filters
+    filters = sellable_lead_filters(_s)
+    filters.append(Property.zip == payload.zip_code)
+    filters.append(Property.county_id == payload.county_id)
     if excl_ids:
         filters.append(Property.id.not_in(excl_ids))
+    apply_segment_filter(filters, payload.segment, now)
 
     candidate_ids = db.execute(
         select(Property.id)
@@ -3399,9 +3416,11 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, request: Request, db: S
             "message": f"Only {len(candidate_ids)} qualified leads available for this ZIP/vertical combination",
         })
 
-    # Look up price amount from Stripe
+    # Look up price amount from Stripe. Segment packs use a premium price
+    # (ADR 0032 D6) — never the base $99 lead-pack price.
     stripe.api_key = _s.active_stripe_secret_key.get_secret_value()
-    price_id = _s.active_stripe_price("lead_pack")
+    price_name = "insurance_distress_pack" if payload.segment == "insurance_distress" else "lead_pack"
+    price_id = _s.active_stripe_price(price_name)
     if not price_id:
         raise HTTPException(status_code=503, detail={"error": "price_not_configured", "message": "Lead pack price not configured"})
 
@@ -3420,6 +3439,8 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, request: Request, db: S
         "vertical":  payload.vertical,
         "county_id": payload.county_id,
     }
+    if payload.segment:
+        lead_pack_metadata["segment"] = payload.segment
     # Meta Ads attribution + buyer IP/UA captured from the buyer's request.
     lead_pack_metadata.update(_attribution_stripe_metadata(request, payload.attribution))
 
@@ -3469,6 +3490,95 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, request: Request, db: S
         "amount":           amount,
         "currency":         currency,
     }
+
+
+# ---------------------------------------------------------------------------
+# GET /api/insurance-distress/availability — pack-card feed surface (ADR 0032 D7/D8)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/insurance-distress/availability")
+def insurance_distress_availability(feed_uuid: str, db: Session = Depends(get_db)):
+    """
+    Per-locked-ZIP insurance-distress qualifying lead count, gated to >=5
+    (min-5, D8) — feeds the feed's pack card ("N storm-damaged flips in
+    {ZIP} — buy pack ${premium}"). Never surfaces a ZIP the buyer can't
+    actually receive a full pack for.
+    """
+    _s = get_settings()
+
+    try:
+        subscriber = db.execute(
+            select(Subscriber).where(Subscriber.event_feed_uuid == feed_uuid)
+        ).scalar_one_or_none()
+    except OperationalError:
+        logger.error("DB error looking up subscriber for insurance-distress availability", exc_info=True)
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
+
+    if not subscriber:
+        raise HTTPException(status_code=404, detail={"error": "not_found", "message": "Feed not found"})
+
+    try:
+        locked_zips = db.execute(
+            select(ZipTerritory.zip_code).where(
+                ZipTerritory.subscriber_id == subscriber.id,
+                ZipTerritory.status.in_(["locked", "grace"]),
+            )
+        ).scalars().all()
+    except OperationalError:
+        logger.error("DB error fetching locked ZIPs for insurance-distress availability", exc_info=True)
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
+
+    empty = {"zips": [], "amount": None, "currency": None}
+    if not locked_zips:
+        return empty
+
+    from src.services.lead_pool_service import apply_segment_filter, sellable_lead_filters
+    from src.services.lead_exclusivity import get_exclusive_property_ids
+    from src.core.models import Owner
+    now = datetime.now(timezone.utc)
+
+    # Same sellability predicate as checkout + webhook reservation (ADR 0032 D5)
+    # so a ZIP is only advertised when its leads can actually be sold and
+    # fulfilled: qualified, non-guess, contactable, not exclusively reserved to
+    # another trade, and matching the insurance-distress segment.
+    avail_filters = sellable_lead_filters(_s)
+    avail_filters.append(Property.zip.in_(locked_zips))
+    avail_filters.append(Property.county_id == subscriber.county_id)
+    apply_segment_filter(avail_filters, "insurance_distress", now)
+
+    try:
+        excl_ids = get_exclusive_property_ids(db, subscriber.county_id, now)
+        if excl_ids:
+            avail_filters.append(Property.id.not_in(excl_ids))
+
+        rows = db.execute(
+            select(Property.zip, func.count(func.distinct(Property.id)))
+            .join(DistressScore, DistressScore.property_id == Property.id)
+            .outerjoin(Owner, Owner.property_id == Property.id)
+            .where(and_(*avail_filters))
+            .group_by(Property.zip)
+        ).all()
+    except OperationalError:
+        logger.error("DB error computing insurance-distress qualifying counts", exc_info=True)
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
+
+    qualifying = [{"zip_code": zip_code, "count": count} for zip_code, count in rows if count >= 5]
+    if not qualifying:
+        return empty
+
+    price_id = _s.active_stripe_price("insurance_distress_pack")
+    if not price_id:
+        return empty
+
+    try:
+        stripe.api_key = _s.active_stripe_secret_key.get_secret_value()
+        price = stripe.Price.retrieve(price_id)
+        amount, currency = price["unit_amount"], price["currency"]
+    except stripe.StripeError as exc:
+        logger.error("Stripe error retrieving insurance_distress_pack price: %s", exc)
+        return empty
+
+    return {"zips": qualifying, "amount": amount, "currency": currency}
 
 
 # ---------------------------------------------------------------------------

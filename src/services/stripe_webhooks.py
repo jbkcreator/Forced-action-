@@ -3864,12 +3864,12 @@ def _on_lead_pack_payment(payment_intent: dict, db: Session) -> None:
         )
         return
 
-    lead_filter = [
-        Property.zip == zip_code,
-        Property.county_id == county_id,
-        DistressScore.qualified == True,
-        DistressScore.is_guess_lead.is_(False),  # A2: never reserve a guess lead in a paid pack
-    ]
+    # Same sellability predicate as the availability feed card and the checkout
+    # gate (ADR 0032 D5): qualified, non-guess (A2), contactable.
+    from src.services.lead_pool_service import apply_segment_filter, sellable_lead_filters
+    lead_filter = sellable_lead_filters(settings)
+    lead_filter.append(Property.zip == zip_code)
+    lead_filter.append(Property.county_id == county_id)
 
     try:
         score_col = DistressScore.vertical_scores[vertical].as_float()
@@ -3879,10 +3879,9 @@ def _on_lead_pack_payment(payment_intent: dict, db: Session) -> None:
         return
 
     from src.core.models import Owner
-    from src.utils.lead_filters import has_contact_filter, phone_priority_order
-    contact_clause = has_contact_filter(settings)
-    if contact_clause is not None:
-        lead_filter.append(contact_clause)
+    from src.utils.lead_filters import phone_priority_order
+
+    apply_segment_filter(lead_filter, _attr(meta, "segment"), now)
 
     try:
         from src.services.lead_exclusivity import (

@@ -126,6 +126,8 @@ class AppSettings(BaseSettings):
 	stripe_price_dominator_founding: Optional[str] = Field(default=None, env="STRIPE_PRICE_DOMINATOR_FOUNDING")
 	stripe_price_dominator_regular: Optional[str] = Field(default=None, env="STRIPE_PRICE_DOMINATOR_REGULAR")
 	stripe_price_lead_pack: Optional[str] = Field(default=None, env="STRIPE_PRICE_LEAD_PACK")
+	# Task 7 / ADR 0032 — premium insurance-distress segment pack. Price set by Josh in Stripe.
+	stripe_price_insurance_distress_pack: Optional[str] = Field(default=None, env="STRIPE_PRICE_INSURANCE_DISTRESS_PACK")
 	stripe_price_hot_lead_unlock: Optional[str] = Field(default=None, env="STRIPE_PRICE_HOT_LEAD_UNLOCK")
 	# Kill switch for the $150/$99 hot lead unlock checkout. Metadata now
 	# propagates to the PaymentIntent (payment_intent_data in
@@ -199,6 +201,7 @@ class AppSettings(BaseSettings):
 	stripe_test_price_dominator_founding: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_DOMINATOR_FOUNDING")
 	stripe_test_price_dominator_regular: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_DOMINATOR_REGULAR")
 	stripe_test_price_lead_pack: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_LEAD_PACK")
+	stripe_test_price_insurance_distress_pack: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_INSURANCE_DISTRESS_PACK")
 	stripe_test_price_hot_lead_unlock: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_HOT_LEAD_UNLOCK")
 	# 2B test prices
 	stripe_test_price_wallet_starter: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_WALLET_STARTER")
