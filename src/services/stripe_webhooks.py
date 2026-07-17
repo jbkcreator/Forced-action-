@@ -570,6 +570,28 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
 
     db.flush()  # get subscriber.id before ZIP territory inserts
 
+    # B0-06: link the checkout consent row (written pre-subscriber, no subscriber_id
+    # yet) to the now-created subscriber, matched by this exact checkout session —
+    # not email, which could also match an old abandoned-checkout/waitlist row for
+    # the same address and wrongly hand its voice consent to this subscriber.
+    # Idempotent — guarded on subscriber_id IS NULL so a replayed webhook never
+    # re-touches an already-linked row.
+    _checkout_session_id = session.get("id")
+    if _checkout_session_id:
+        try:
+            from sqlalchemy import text as _text
+            db.execute(_text("""
+                UPDATE consent_acceptances SET subscriber_id = :sid
+                WHERE checkout_session_id = :session_id
+                  AND source_flow = 'checkout'
+                  AND subscriber_id IS NULL
+            """), {"sid": subscriber.id, "session_id": _checkout_session_id})
+        except Exception:
+            logger.warning(
+                "consent_acceptances subscriber_id link failed for session=%s (non-fatal)",
+                _checkout_session_id, exc_info=True,
+            )
+
     # ── B1/M9: activate the bridged Customer Account + record MRR ────────────
     # The only production entrypoint that seeds customer_accounts. Map the tier
     # to a plan; if the tier isn't in the catalog yet (legacy/founding), skip
@@ -848,6 +870,18 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
                 "[Referral] confirmed: referee=%d event=%d",
                 subscriber.id, event.id,
             )
+            try:
+                with db.begin_nested():
+                    from src.services.referral_prompt_service import mark_confirmed
+                    mark_confirmed(
+                        event.referrer_subscriber_id, event.id, db,
+                        prompt_funnel_id=getattr(event, "prompt_funnel_id", None),
+                    )
+            except Exception:
+                logger.warning(
+                    "[ReferralPrompt] funnel confirm advance failed for event=%d — non-fatal",
+                    event.id, exc_info=True,
+                )
     except Exception:
         logger.error(
             "[Referral] confirm/reward failed for subscriber %d — non-fatal",
@@ -882,6 +916,16 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
         )
     except Exception:
         logger.warning("Attribution recording failed sub=%s", subscriber.id, exc_info=True)
+
+    # Task 4.1 frozen control holdout — a completed checkout is the
+    # conversion event for the lock_close_v1 sequence. No-op for any
+    # subscriber without a lock_close_holdout AbAssignment (anyone the
+    # wallet_to_lock_close graph never nudged), so this fires safely across
+    # every tier this handler processes, not just ZIP lock upgrades —
+    # matching the per-tier (not per-message) granularity already used
+    # above for attribution/Meta CAPI.
+    from src.services.ab_engine import record_holdout_conversion
+    record_holdout_conversion(subscriber.id, "lock_close_holdout", db)
 
     # ── Meta CAPI (S2): report server-side Purchase ──────────────────────────
     # Observer only — runs after the subscriber is active, ZIPs are locked, and
@@ -2119,6 +2163,18 @@ def _on_payment_intent_succeeded(payment_intent, db: Session) -> None:
                 subscriber_id, event.id, pi_id, product,
                 event.referrer_subscriber_id, event.confirmed_at,
             )
+            try:
+                with db.begin_nested():
+                    from src.services.referral_prompt_service import mark_confirmed
+                    mark_confirmed(
+                        event.referrer_subscriber_id, event.id, db,
+                        prompt_funnel_id=getattr(event, "prompt_funnel_id", None),
+                    )
+            except Exception:
+                logger.warning(
+                    "[ReferralPrompt] funnel confirm advance failed for event=%d — non-fatal",
+                    event.id, exc_info=True,
+                )
     except Exception as exc:
         logger.error(
             "[Referral] PI-path confirm failed for subscriber %s — non-fatal: %s",
@@ -2302,6 +2358,11 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
                     occurred_at=sent_row.sent_at,
                 )
                 attribute_enrichment_cost_for_property(db, property_id, subscriber.id)
+
+                # Task 4.1 frozen control holdout — lead unlock is the
+                # conversion event for the fomo sequence.
+                from src.services.ab_engine import record_holdout_conversion
+                record_holdout_conversion(subscriber.id, "fomo_holdout", db)
     except (IntegrityError, OperationalError) as exc:
         logger.warning("lead_unlock: SentLead insert failed: %s", exc)
 
@@ -2388,6 +2449,24 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
         )
     except Exception:
         logger.warning("Attribution recording failed sub=%s", subscriber.id, exc_info=True)
+
+    # Feed the purchase to Cora (D7) — last-touch nudge attribution is stamped
+    # by the supervisor's unlock_purchased branch, not here.
+    try:
+        from src.agents.events.ingestion import publish_cora_event
+        _amount_cents = _attr(payment_intent, "amount_received") or _attr(payment_intent, "amount")
+        publish_cora_event({
+            "event_type": "unlock_purchased",
+            "subscriber_id": subscriber.id,
+            "payload": {
+                "property_id": property_id,
+                "product": _attr(meta, "product") or "lead_unlock",
+                "amount_cents": _amount_cents,
+                "revenue": (_amount_cents / 100) if _amount_cents is not None else None,
+            },
+        })
+    except Exception:
+        logger.warning("lead_unlock: publish_cora_event failed sub=%s", subscriber.id, exc_info=True)
 
     _fire_capi_for_pi(
         payment_intent, subscriber, "lead_unlock",
@@ -3261,6 +3340,13 @@ def _on_wallet_subscription_invoice(invoice: dict, db: Session) -> None:
     except Exception:
         logger.warning("Attribution recording failed sub=%s", subscriber_id, exc_info=True)
 
+    # Task 4.1 frozen control holdout — wallet activation is the conversion
+    # event for the accelerated_wallet_push sequence. Test name matches the
+    # key in config/cora_holdout_tests.yaml; no-op for subscribers never
+    # assigned an arm.
+    from src.services.ab_engine import record_holdout_conversion
+    record_holdout_conversion(subscriber_id, "wallet_push_holdout", db)
+
 
 def _on_wallet_subscription_invoice_failed(invoice: dict, db: Session) -> None:
     """Mark a wallet_push_offers row as 'failed' when the first invoice fails.
@@ -3764,12 +3850,12 @@ def _on_lead_pack_payment(payment_intent: dict, db: Session) -> None:
         )
         return
 
-    lead_filter = [
-        Property.zip == zip_code,
-        Property.county_id == county_id,
-        DistressScore.qualified == True,
-        DistressScore.is_guess_lead.is_(False),  # A2: never reserve a guess lead in a paid pack
-    ]
+    # Same sellability predicate as the availability feed card and the checkout
+    # gate (ADR 0032 D5): qualified, non-guess (A2), contactable.
+    from src.services.lead_pool_service import apply_segment_filter, sellable_lead_filters
+    lead_filter = sellable_lead_filters(settings)
+    lead_filter.append(Property.zip == zip_code)
+    lead_filter.append(Property.county_id == county_id)
 
     try:
         score_col = DistressScore.vertical_scores[vertical].as_float()
@@ -3779,10 +3865,9 @@ def _on_lead_pack_payment(payment_intent: dict, db: Session) -> None:
         return
 
     from src.core.models import Owner
-    from src.utils.lead_filters import has_contact_filter, phone_priority_order
-    contact_clause = has_contact_filter(settings)
-    if contact_clause is not None:
-        lead_filter.append(contact_clause)
+    from src.utils.lead_filters import phone_priority_order
+
+    apply_segment_filter(lead_filter, _attr(meta, "segment"), now)
 
     try:
         from src.services.lead_exclusivity import (

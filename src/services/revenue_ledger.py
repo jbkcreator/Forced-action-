@@ -97,6 +97,18 @@ def record_revenue(
             "[RevenueLedger] record_revenue failed: product_type=%s source_table=%s source_id=%s",
             product_type, source_table, source_id, exc_info=True,
         )
+        return
+
+    # Task 4.1 frozen control holdout — retention_v1's conversion is "any
+    # paid action" (no single dedicated event), so it hooks the one place
+    # every purchase-confirmation path already funnels through (see module
+    # docstring) rather than each individual webhook handler. No-op for any
+    # subscriber without a retention_holdout AbAssignment, so this fires
+    # safely for every product_type, not just retention-nudged subscribers.
+    # holdout_verdict enforces the "within 7 days" window separately via
+    # ab_assignments.outcome_at, not here.
+    from src.services.ab_engine import record_holdout_conversion
+    record_holdout_conversion(subscriber_id, "retention_holdout", db)
 
 
 def mark_ledger_refunded(

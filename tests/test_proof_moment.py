@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.services.proof_moment import _blur_address, get_proof_leads
+from src.services.proof_moment import _blur_address, get_blurred_stack, get_proof_leads
 
 
 # ============================================================================
@@ -201,6 +201,52 @@ class TestGetProofLeadsUnit:
         db = self._make_db(rows=[])
         result = get_proof_leads("nonexistent_vertical", "hillsborough", db)
         assert result["revealed"] is None
+
+
+class TestGetBlurredStackUnit:
+    """Fix B: get_blurred_stack is the ONE place a real, reachable per-lead
+    unlock CTA ships (dashboard `leads[]` is always unlocked=True by design —
+    see Task 6 grill). is_hot here drives BlurredStackSection's $150/$4 CTA."""
+
+    def _row(self, pid, final_cds_score, lead_tier):
+        prop = MagicMock()
+        prop.id = pid
+        prop.address = "100 Elm St"
+        prop.city = "Tampa"
+        prop.state = "FL"
+        prop.zip = "33601"
+        score = MagicMock()
+        score.final_cds_score = final_cds_score
+        score.lead_tier = lead_tier
+        score.urgency_level = "high"
+        score.vertical_scores = {}
+        score.distress_types = {}
+        return (prop, score)
+
+    def _make_db(self, rows):
+        db = MagicMock()
+        already_unlocked_result = MagicMock()
+        already_unlocked_result.scalars.return_value.all.return_value = []
+        rows_result = MagicMock()
+        rows_result.all.return_value = rows
+        db.execute.side_effect = [already_unlocked_result, rows_result]
+        return db
+
+    def test_gold_plus_score_is_hot(self):
+        db = self._make_db([self._row(1, 88.0, "Platinum")])
+        with patch("src.services.proof_moment.lead_exclusivity.get_exclusive_property_ids",
+                   return_value=set()), \
+             patch("src.utils.lead_filters.has_contact_filter", return_value=None):
+            stack = get_blurred_stack(107, "roofing", "hillsborough", db)
+        assert stack[0]["is_hot"] is True
+
+    def test_sub_gold_score_is_not_hot(self):
+        db = self._make_db([self._row(1, 45.0, "Silver")])
+        with patch("src.services.proof_moment.lead_exclusivity.get_exclusive_property_ids",
+                   return_value=set()), \
+             patch("src.utils.lead_filters.has_contact_filter", return_value=None):
+            stack = get_blurred_stack(107, "roofing", "hillsborough", db)
+        assert stack[0]["is_hot"] is False
 
 
 class TestGetProofLeadsUnlockAware:

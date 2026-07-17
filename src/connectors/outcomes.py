@@ -6,11 +6,11 @@ connectors, and the upsert helper that stages it into outcome_candidates
 Every connector's source data looks different today — a raw status string on
 Foreclosure, a structured sold_to/sold_amount pair on TaxDeedAuction, a
 qualified-sale flag on appraiser records. OutcomeCandidate is the one shape
-a future label layer (CDE-10, not built here) will consume uniformly to
-promote rows into DealOutcome once DealOutcome.subscriber_id is made
-nullable for pipeline-sourced (subscriber-less) outcomes — a separate task.
+the label layer (CDE-10, src/connectors/label_layer.py) consumes uniformly
+to promote rows into DealOutcome.
 
-This module deliberately never writes to deal_outcomes.
+This module deliberately never writes to deal_outcomes — that is exclusively
+the label layer's job.
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from datetime import date
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import func
+from sqlalchemy import case, func, or_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -33,9 +33,12 @@ EVENT_TYPE_TAX_DEED_CANCELLED = "tax_deed_cancelled"
 EVENT_TYPE_TAX_DEED_REDEEMED = "tax_deed_redeemed"
 EVENT_TYPE_QUALIFIED_SALE = "qualified_sale"
 EVENT_TYPE_UNQUALIFIED_SALE = "unqualified_sale"
+EVENT_TYPE_PROBATE_SALE = "probate_sale"
+EVENT_TYPE_LIEN_SALE = "lien_sale"
+EVENT_TYPE_DEED_FLIP = "deed_flip"
 
 # Keep in sync with OutcomeCandidate.check_outcome_candidate_event_type (models.py)
-# and scripts/apply_cde09_outcome_candidates_table.py's CHECK constraint.
+# and migrations/apply_cde03_08_event_types.py's CHECK constraint.
 OUTCOME_EVENT_TYPES = frozenset({
     EVENT_TYPE_AUCTION_SOLD_THIRD_PARTY,
     EVENT_TYPE_AUCTION_REVERTED_TO_LENDER,
@@ -45,6 +48,9 @@ OUTCOME_EVENT_TYPES = frozenset({
     EVENT_TYPE_TAX_DEED_REDEEMED,
     EVENT_TYPE_QUALIFIED_SALE,
     EVENT_TYPE_UNQUALIFIED_SALE,
+    EVENT_TYPE_PROBATE_SALE,
+    EVENT_TYPE_LIEN_SALE,
+    EVENT_TYPE_DEED_FLIP,
 })
 
 
@@ -60,6 +66,7 @@ class OutcomeCandidateData:
     amount: Optional[Decimal] = None
     counterparty: Optional[str] = None
     raw_status: Optional[str] = None       # untranslated source string, for audit/debugging
+    raw_payload: Optional[dict] = None     # connector-specific extras (e.g. deed_flip margin/hold/instruments)
     match_confidence: Optional[float] = None   # only set when resolve_or_quarantine() produced this row
     match_method: Optional[str] = None
 
@@ -89,11 +96,26 @@ def upsert_outcome_candidate(session: Session, candidate: OutcomeCandidateData) 
         amount=candidate.amount,
         counterparty=candidate.counterparty,
         raw_status=candidate.raw_status,
+        raw_payload=candidate.raw_payload,
         match_confidence=candidate.match_confidence,
         match_method=candidate.match_method,
         updated_at=func.now(),
     )
     excluded = stmt.excluded
+    # Only property_id/event_type/event_date/amount feed the promoted
+    # DealOutcome row (label_layer._promote_one) — a re-stage that changes one
+    # of these (e.g. a revised winning bid or a corrected terminal status)
+    # must clear consumed_at so the label layer re-promotes it. Any other
+    # field changing (counterparty/raw_status/match_*, audit-only) leaves
+    # consumed_at alone. Unconditionally clearing it on every upsert would
+    # make the label layer reprocess every row on every connector re-run
+    # forever, defeating the point of consumed_at.
+    outcome_changed = or_(
+        OutcomeCandidate.property_id.is_distinct_from(excluded.property_id),
+        OutcomeCandidate.event_type.is_distinct_from(excluded.event_type),
+        OutcomeCandidate.event_date.is_distinct_from(excluded.event_date),
+        OutcomeCandidate.amount.is_distinct_from(excluded.amount),
+    )
     stmt = stmt.on_conflict_do_update(
         constraint="uq_outcome_candidate",
         set_=dict(
@@ -103,9 +125,14 @@ def upsert_outcome_candidate(session: Session, candidate: OutcomeCandidateData) 
             amount=excluded.amount,
             counterparty=excluded.counterparty,
             raw_status=excluded.raw_status,
+            raw_payload=excluded.raw_payload,
             match_confidence=excluded.match_confidence,
             match_method=excluded.match_method,
             updated_at=excluded.updated_at,
+            consumed_at=case(
+                (outcome_changed, None),
+                else_=OutcomeCandidate.consumed_at,
+            ),
         ),
     )
     session.execute(stmt)

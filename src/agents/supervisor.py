@@ -142,6 +142,25 @@ def dispatch_event(event: Dict[str, Any]) -> Dict[str, Any]:
 			)
 		return _outcome("routed", "feedback_ritual", decision_id, "ok")
 
+	# Unlock Placement + Scarcity (spec 3.3, D7): a paid hot-lead/lead unlock
+	# stamps last-touch nudge attribution, not a Cora messaging graph run.
+	if event_type == "unlock_purchased":
+		try:
+			from src.services.nudge_conversion import record_nudge_conversion
+			with db.session_scope() as _s:
+				record_nudge_conversion(
+					subscriber_id,
+					conversion_type="unlock",
+					revenue=(payload or {}).get("revenue"),
+					db=_s,
+				)
+		except Exception as _nudge_exc:
+			logger.warning(
+				"supervisor: unlock nudge conversion failed (sub=%s): %s",
+				subscriber_id, _nudge_exc,
+			)
+		return _outcome("routed", "unlock_outcome_recorder", decision_id, "ok")
+
 	# Global kill switch
 	if settings.agents_global_kill_switch:
 		reason = "global_kill_switch_enabled"
