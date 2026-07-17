@@ -715,6 +715,24 @@ COUNTY_ID=hillsborough
 0 8 * * 0 $PROJECT/scripts/cron/run.sh src.connectors.appraiser_sale_outcomes --county-id $COUNTY_ID
 1 8 * * 0 $PROJECT/scripts/cron/run.sh src.connectors.appraiser_sale_outcomes --county-id pinellas
 
+# deed_flip_outcomes — weekly, after the deed loader (07:45 hillsborough /
+# 07:46 pinellas). SLA 10140 min (~7 days).
+2 8 * * 0 $PROJECT/scripts/cron/run.sh src.connectors.deed_flip_outcomes --county-id $COUNTY_ID
+3 8 * * 0 $PROJECT/scripts/cron/run.sh src.connectors.deed_flip_outcomes --county-id pinellas
+
+# probate_lien_outcomes — weekly, after the probate/lien loaders (07:45
+# hillsborough / 07:46 pinellas). SLA 10140 min (~7 days).
+4 8 * * 0 $PROJECT/scripts/cron/run.sh src.connectors.probate_lien_outcomes --county-id $COUNTY_ID
+5 8 * * 0 $PROJECT/scripts/cron/run.sh src.connectors.probate_lien_outcomes --county-id pinellas
+
+# tax_deed_outcomes is enabled=True in registry.py but INTENTIONALLY NOT
+# scheduled here yet: its documented cadence is "daily, after the tax-deed
+# scraper", but no tax-deed auction scraper cron entry exists anywhere in
+# this file (scripts/scrape_tax_deed_auctions.py exists as an untracked,
+# not-yet-cron-wired script as of 2026-07-08). Scheduling this connector
+# before that upstream job runs on a real cadence would stage outcomes
+# against stale/empty tax_deed_auctions data and report false "success".
+# Add this once the tax-deed scraper itself has a cron line above.
 # tax_deed_outcomes — daily Mon-Sat, after the tax-deed scraper (05:30
 # hillsborough / 05:35 pinellas, entry 10b above). SLA 1500 min, off Sunday
 # (registry off_days={6} — the scraper doesn't run Sundays either).
