@@ -663,6 +663,18 @@ def get_pricing_info():
     return {"pricing": _cached_pricing_info()}
 
 
+@app.get("/api/experiments/annual-signup")
+def get_annual_signup_experiment_config():
+    """Deprecated stub — the annual_at_signup A/B test is retired and annual
+    billing is now shown to 100% of visitors unconditionally. Kept (rather
+    than removed) so already-deployed frontend clients that still call this
+    on every landing-page load (LandingContext) get a 100% response instead
+    of a 404 until the matching frontend change ships. Safe to delete once
+    that frontend no longer calls this endpoint.
+    """
+    return {"traffic_pct": 100}
+
+
 # ConsentAcceptanceRequest imported from src.api.deps
 
 # ---------------------------------------------------------------------------
