@@ -159,7 +159,10 @@ def has_voice_consent(subscriber_id: int, db: Session) -> bool:
         row = db.execute(
             text("""
                 SELECT 1 FROM consent_acceptances
-                WHERE subscriber_id = :sid AND voice_consent_at IS NOT NULL
+                WHERE subscriber_id = :sid
+                  AND voice_consent_at IS NOT NULL
+                  AND voice_consent_text IS NOT NULL
+                  AND voice_consent_version IS NOT NULL
                 LIMIT 1
             """),
             {"sid": subscriber_id},

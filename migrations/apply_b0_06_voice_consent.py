@@ -24,6 +24,9 @@ DDL = [
     "ALTER TABLE consent_acceptances ADD COLUMN IF NOT EXISTS voice_consent_at TIMESTAMPTZ;",
     "ALTER TABLE consent_acceptances ADD COLUMN IF NOT EXISTS voice_consent_text TEXT;",
     "ALTER TABLE consent_acceptances ADD COLUMN IF NOT EXISTS voice_consent_version VARCHAR(30);",
+    "ALTER TABLE consent_acceptances ADD COLUMN IF NOT EXISTS checkout_session_id VARCHAR(255);",
+    "CREATE INDEX IF NOT EXISTS ix_consent_acceptances_checkout_session_id "
+    "ON consent_acceptances (checkout_session_id);",
 ]
 
 

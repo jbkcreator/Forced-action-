@@ -1105,6 +1105,7 @@ class ConsentAcceptance(Base):
     privacy_version: Mapped[str] = mapped_column(String(20), nullable=False)
     accepted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     source_flow: Mapped[str] = mapped_column(String(30), nullable=False, server_default="waitlist")
+    checkout_session_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     ip_address: Mapped[Optional[str]] = mapped_column(String(45), nullable=True)
     user_agent: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
