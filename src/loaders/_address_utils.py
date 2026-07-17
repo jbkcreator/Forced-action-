@@ -19,6 +19,14 @@ from typing import Optional, Tuple
 # the 5-digit prefix because that's what properties.zip stores.
 _ZIP_RE = re.compile(r"\b(\d{5})(?:-\d{4})?\b")
 
+# State-anchored ZIP: "FL 33774" / "FL 33774-1234". This is the reliable form —
+# a 5-digit run immediately after the 2-letter state code is unambiguously the
+# ZIP. Preferred over a bare 5-digit scan because Pinellas beach-city house
+# numbers are themselves 5 digits (e.g. "14339 110TH TER N ... FL 33774"), and a
+# naive first-match scan grabs the house number as the ZIP → bogus ZIP filter →
+# zero property-match candidates → silent 0% match.
+_STATE_ZIP_RE = re.compile(r"\b[A-Z]{2}\s+(\d{5})(?:-\d{4})?\b")
+
 # Two-letter US state abbreviation (we only really expect FL but be tolerant).
 _STATE_RE = re.compile(r"\b([A-Z]{2})\b")
 
@@ -46,6 +54,9 @@ def split_address(addr_str) -> Tuple[Optional[str], Optional[str], Optional[str]
     >>> split_address("123 MAIN ST APT 5 TAMPA FL 33602")
     ('123 MAIN ST APT 5', 'TAMPA', '33602')
 
+    >>> split_address("14339 110TH TER N, LARGO FL 33774")  # 5-digit house no.
+    ('14339 110TH TER N', 'LARGO', '33774')
+
     >>> split_address(None)
     (None, None, None)
 
@@ -60,10 +71,18 @@ def split_address(addr_str) -> Tuple[Optional[str], Optional[str], Optional[str]
         return None, None, None
 
     # ── ZIP (most reliable anchor) ────────────────────────────────────────
+    # Prefer the state-anchored ZIP ("FL 33774"). Fall back to the LAST bare
+    # 5-digit run, and NEVER the leading house number (position 0) — otherwise a
+    # 5-digit house number (common in Pinellas beach cities) is misread as the
+    # ZIP, poisoning the property-match filter.
     zip_code: Optional[str] = None
-    zip_match = _ZIP_RE.search(s)
-    if zip_match:
-        zip_code = zip_match.group(1)
+    state_zip = _STATE_ZIP_RE.search(s)
+    if state_zip:
+        zip_code = state_zip.group(1)
+    else:
+        bare = [m for m in _ZIP_RE.finditer(s) if m.start() != 0]
+        if bare:
+            zip_code = bare[-1].group(1)
 
     # ── City ──────────────────────────────────────────────────────────────
     # Prefer a comma-anchored city; fall back to "...CITY FL ZIP" pattern.
