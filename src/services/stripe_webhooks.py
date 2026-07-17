@@ -851,7 +851,10 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
             try:
                 with db.begin_nested():
                     from src.services.referral_prompt_service import mark_confirmed
-                    mark_confirmed(event.referrer_subscriber_id, event.id, db)
+                    mark_confirmed(
+                        event.referrer_subscriber_id, event.id, db,
+                        prompt_funnel_id=getattr(event, "prompt_funnel_id", None),
+                    )
             except Exception:
                 logger.warning(
                     "[ReferralPrompt] funnel confirm advance failed for event=%d — non-fatal",
@@ -2145,7 +2148,10 @@ def _on_payment_intent_succeeded(payment_intent, db: Session) -> None:
             try:
                 with db.begin_nested():
                     from src.services.referral_prompt_service import mark_confirmed
-                    mark_confirmed(event.referrer_subscriber_id, event.id, db)
+                    mark_confirmed(
+                        event.referrer_subscriber_id, event.id, db,
+                        prompt_funnel_id=getattr(event, "prompt_funnel_id", None),
+                    )
             except Exception:
                 logger.warning(
                     "[ReferralPrompt] funnel confirm advance failed for event=%d — non-fatal",

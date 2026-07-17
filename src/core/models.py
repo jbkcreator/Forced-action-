@@ -3165,6 +3165,11 @@ class ReferralEvent(Base):
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
     reward_type: Mapped[Optional[str]] = mapped_column(String(30))   # credits/free_month/lock_upgrade
     reward_value: Mapped[Optional[str]] = mapped_column(String(50))
+    # Set when the signup arrived via a proactive referral prompt link carrying
+    # a signed attribution token — lets mark_confirmed() credit the exact
+    # referral_prompt_funnel row that drove the conversion. Plain int (the funnel
+    # table is raw-SQL, not an ORM model), nullable for organic/reactive signups.
+    prompt_funnel_id: Mapped[Optional[int]] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
