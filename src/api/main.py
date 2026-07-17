@@ -891,6 +891,53 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
         except Exception:
             logger.warning("ConsentAcceptance write failed in checkout (non-fatal):", exc_info=True)
 
+    # Cohort-adjusted pricing: /api/zip-check shows the customer a cohort price
+    # when one is active for this county+vertical+tier. Resolve the same cohort
+    # here so checkout charges what was displayed, instead of the fixed price_id.
+    # Anchored on the regular amount (not whichever of founding/regular price_id
+    # was selected above) because pricing_cohorts stores one fixed dollar amount
+    # per (county, vertical, tier) — feeding it the founding cents would just
+    # return that same fixed amount and collapse the founding discount.
+    line_item = {"price": price_id, "quantity": 1}
+    resolved_amount_cents = None
+    cohort_source = "base_price"
+    if payload.tier in _ZIP_PRICING_TIERS:
+        tier_base = _cached_pricing_info().get(payload.tier) or {}
+        regular_amount = tier_base.get("regular_amount")
+        founding_amount = tier_base.get("founding_amount")
+        if regular_amount is not None:
+            from src.services.pricing_cohort_engine import get_price_for_subscriber
+            adjusted_regular_cents, cohort_source = get_price_for_subscriber(
+                payload.county_id, payload.vertical, payload.tier, regular_amount * 100, db
+            )
+            if cohort_source == "cohort_adjusted":
+                if is_founding and founding_amount is not None:
+                    resolved_amount_cents = round(adjusted_regular_cents * (founding_amount / regular_amount))
+                else:
+                    resolved_amount_cents = adjusted_regular_cents
+                try:
+                    stripe_price = stripe.Price.retrieve(price_id)
+                    price_data = {
+                        "currency": stripe_price.currency,
+                        "unit_amount": resolved_amount_cents,
+                        "product": stripe_price.product,
+                    }
+                    if stripe_price.recurring:
+                        price_data["recurring"] = {
+                            "interval": stripe_price.recurring.interval,
+                            "interval_count": stripe_price.recurring.interval_count,
+                        }
+                    line_item = {"price_data": price_data, "quantity": 1}
+                except stripe.error.StripeError:
+                    logger.error(
+                        "Failed to build cohort-adjusted Stripe price for tier=%s county=%s vertical=%s "
+                        "— falling back to base price_id",
+                        payload.tier, payload.county_id, payload.vertical, exc_info=True,
+                    )
+                    resolved_amount_cents = None
+                    cohort_source = "base_price"
+                    line_item = {"price": price_id, "quantity": 1}
+
     checkout_metadata = {
         "tier": payload.tier,
         "vertical": payload.vertical,
@@ -898,6 +945,8 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
         "is_founding": str(is_founding),
         "founding_price_id": price_id if is_founding else "",
         "zip_codes": ",".join(payload.zip_codes),
+        "price_source": cohort_source,
+        "resolved_amount_cents": str(resolved_amount_cents) if resolved_amount_cents is not None else "",
     }
     # Meta Ads attribution + buyer IP/UA captured from the buyer's request.
     checkout_metadata.update(_attribution_stripe_metadata(request, payload.attribution))
@@ -907,7 +956,7 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
             mode="subscription",
             ui_mode="embedded",
             customer_email=payload.email,   # pre-fills email in Stripe form
-            line_items=[{"price": price_id, "quantity": 1}],
+            line_items=[line_item],
             metadata=checkout_metadata,
             return_url=f"{_s.app_base_url}/success?session_id={{CHECKOUT_SESSION_ID}}",
         )

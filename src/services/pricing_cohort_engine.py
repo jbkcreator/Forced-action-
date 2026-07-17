@@ -56,7 +56,7 @@ _PRICE_BOUNDS: dict[str, tuple[int, int]] = {
     "starter":       (60000, 110000),  # $600–$1100/mo
     "pro":           (110000, 190000), # $1100–$1900/mo
     "dominator":     (200000, 350000), # $2000–$3500/mo
-    "annual_lock":   (197000, 197000), # flat $1970/yr, no founding/regular split
+    "annual_lock":   (147750, 246250), # +/-25% of the flat $1970/yr rate (guardrail: max_price_adjustment_pct)
 }
 
 
