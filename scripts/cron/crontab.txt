@@ -580,6 +580,12 @@ COUNTY_ID=hillsborough
 # SMS + writes a learning_card row.
 0 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.ab_rollback_check
 
+# Frozen control holdout surfacing — daily 09:00 UTC (Task 4.1). Walks
+# active *_holdout AbTests; on a proven verdict (variant beats frozen
+# control >2σ, >=30/arm) writes a cora_playbook recommendation + a
+# holdout_result learning_card. No auto-promote — a human adopts.
+0 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.cora_holdout_check
+
 # Cora attribution rollout monitor — every 2 min. Evaluates cora_attribution_v1
 # rollout arm: if variant conversion rate is >2σ worse than control over a
 # rolling 48h window (>=30/arm), rolls back AbTest.status='rolled_back',

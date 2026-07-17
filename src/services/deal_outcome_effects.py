@@ -60,6 +60,18 @@ def record_outcome_side_effects(outcome, sub, db) -> dict:
         except Exception as exc:
             logger.warning("[DealOutcomeEffects] win autopsy failed: %s", exc)
 
+        try:
+            with db.begin_nested():
+                from src.services.referral_prompt_service import maybe_send_referral_prompt
+                maybe_send_referral_prompt(
+                    sub, db,
+                    trigger_type="deal_win",
+                    trigger_source_table="deal_outcomes",
+                    trigger_source_id=outcome.id,
+                )
+        except Exception as exc:
+            logger.warning("[DealOutcomeEffects] referral prompt failed: %s", exc)
+
     is_big = (outcome.deal_amount and outcome.deal_amount >= 10000) \
         or outcome.deal_size_bucket in ("10_25k", "25k_plus")
     if is_big and sub is not None:

@@ -1105,6 +1105,7 @@ class ConsentAcceptance(Base):
     privacy_version: Mapped[str] = mapped_column(String(20), nullable=False)
     accepted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     source_flow: Mapped[str] = mapped_column(String(30), nullable=False, server_default="waitlist")
+    checkout_session_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     ip_address: Mapped[Optional[str]] = mapped_column(String(45), nullable=True)
     user_agent: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
@@ -1118,6 +1119,11 @@ class ConsentAcceptance(Base):
     tcpa_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     consent_scope: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
     not_condition_of_purchase_ack: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+
+    # ── B0-06: voice-call PEWC consent (distinct from consent_scope='marketing') ──
+    voice_consent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    voice_consent_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    voice_consent_version: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
 
     county_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, server_default="hillsborough")
     created_at: Mapped[datetime] = mapped_column(
@@ -3139,9 +3145,15 @@ class LearningCard(Base):
 
     __table_args__ = (
         CheckConstraint(
+            # kill_switch_scorecard/win_autopsy/conversion_tier_report were
+            # already live in the DB constraint (pre-existing drift from
+            # another feature) — included here so this string matches
+            # reality; see migrations/apply_learning_card_holdout_result.py.
             "card_type IN ('message_perf', 'deal_pattern', 'ab_result', "
             "'churn_signal', 'pricing_test', 'general', "
-            "'autonomy_summary')",      # fa036 — weekly Cora autonomy scorecard
+            "'autonomy_summary', "        # fa036 — weekly Cora autonomy scorecard
+            "'kill_switch_scorecard', 'win_autopsy', 'conversion_tier_report', "
+            "'holdout_result')",          # Task 4.1 — frozen control holdout surfacing
             name="check_card_type",
         ),
         UniqueConstraint("card_date", "card_type", name="uq_learning_card_date_type"),
@@ -3165,6 +3177,11 @@ class ReferralEvent(Base):
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
     reward_type: Mapped[Optional[str]] = mapped_column(String(30))   # credits/free_month/lock_upgrade
     reward_value: Mapped[Optional[str]] = mapped_column(String(50))
+    # Set when the signup arrived via a proactive referral prompt link carrying
+    # a signed attribution token — lets mark_confirmed() credit the exact
+    # referral_prompt_funnel row that drove the conversion. Plain int (the funnel
+    # table is raw-SQL, not an ORM model), nullable for organic/reactive signups.
+    prompt_funnel_id: Mapped[Optional[int]] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
@@ -3237,6 +3254,47 @@ class ReferralForwardCopy(Base):
         return f"<ReferralForwardCopy(vertical={self.vertical}, week_start={self.week_start})>"
 
 
+class ReferralPromptFunnel(Base):
+    """
+    Proactive referral-prompt funnel: prompt shown -> link shared -> referral confirmed.
+    Schema-only (provisions the table for Base.metadata.create_all() in tests) — all
+    runtime reads/writes go through sqlalchemy.text() raw SQL, not this ORM class.
+    """
+    __tablename__ = "referral_prompt_funnel"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=False, index=True)
+    trigger_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    trigger_source_table: Mapped[str] = mapped_column(String(30), nullable=False)
+    trigger_source_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    referral_code: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    state: Mapped[str] = mapped_column(String(20), nullable=False, default="shown")
+    prompt_shown_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    sms_sent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    email_sent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    shared_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    confirmed_referral_event_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("referral_events.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "trigger_type IN ('deal_win', 'lead_pack_delivery')",
+            name="check_rpf_trigger_type",
+        ),
+        CheckConstraint(
+            "state IN ('shown', 'shared', 'confirmed', 'expired')",
+            name="check_rpf_state",
+        ),
+        UniqueConstraint("trigger_source_table", "trigger_source_id", name="uq_rpf_source"),
+        Index("idx_rpf_subscriber_shown", "subscriber_id", "prompt_shown_at"),
+        Index("idx_rpf_state", "state"),
+    )
+
+    def __repr__(self):
+        return f"<ReferralPromptFunnel(subscriber={self.subscriber_id}, trigger={self.trigger_type}, state={self.state})>"
+
+
 class AbTest(Base):
     """A/B test definition. Cora creates and manages tests within guardrail bounds."""
     __tablename__ = "ab_tests"
@@ -3270,6 +3328,10 @@ class AbAssignment(Base):
     subscriber_id: Mapped[int] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=False, index=True)
     variant: Mapped[str] = mapped_column(String(10), nullable=False)  # 'a'/'b' for message-swap tests; 'variant'/'control' for rollout tests
     outcome: Mapped[Optional[str]] = mapped_column(String(30))  # converted/ignored/bounced
+    # When record_outcome set `outcome` — lets a time-windowed holdout verdict
+    # (e.g. "any paid action within 7 days") check outcome_at - created_at
+    # rather than treating any eventual outcome as an unbounded conversion.
+    outcome_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     test = relationship("AbTest", backref="assignments")

@@ -232,3 +232,53 @@ class TestAutoModeFollowup:
             stats = run(dry_run=False)
         assert stats["vm_triggered"] == 1
         mock_tag.assert_called_once_with("ghl_42", ["auto_mode_vm"])
+
+    def test_blocked_without_voice_consent(self):
+        """B0-06: the tag-triggered VM path must gate on has_voice_consent too."""
+        from src.tasks.auto_mode_followup import run
+
+        outcome = MagicMock(spec=MessageOutcome)
+        outcome.id = 1
+        outcome.replied_at = None
+        outcome.clicked_at = None
+        outcome.subscriber_id = 1
+
+        sub = MagicMock(spec=Subscriber)
+        sub.id = 1
+        sub.ghl_contact_id = "ghl_42"
+
+        with patch("src.tasks.auto_mode_followup.get_db_context") as ctx_mgr, \
+             patch("src.tasks.auto_mode_followup.has_voice_consent", return_value=False), \
+             patch("src.services.synthflow_service._apply_tags_to_contact") as mock_tag:
+            db = MagicMock()
+            ctx_mgr.return_value.__enter__.return_value = db
+            db.execute.return_value.scalars.return_value.all.return_value = [outcome]
+            db.get.return_value = sub
+            stats = run(dry_run=False)
+        assert stats["skipped_no_voice_consent"] == 1
+        assert stats["vm_triggered"] == 0
+        mock_tag.assert_not_called()
+
+    def test_proceeds_with_voice_consent(self):
+        from src.tasks.auto_mode_followup import run
+
+        outcome = MagicMock(spec=MessageOutcome)
+        outcome.id = 1
+        outcome.replied_at = None
+        outcome.clicked_at = None
+        outcome.subscriber_id = 1
+
+        sub = MagicMock(spec=Subscriber)
+        sub.id = 1
+        sub.ghl_contact_id = "ghl_42"
+
+        with patch("src.tasks.auto_mode_followup.get_db_context") as ctx_mgr, \
+             patch("src.tasks.auto_mode_followup.has_voice_consent", return_value=True), \
+             patch("src.services.synthflow_service._apply_tags_to_contact") as mock_tag:
+            db = MagicMock()
+            ctx_mgr.return_value.__enter__.return_value = db
+            db.execute.return_value.scalars.return_value.all.return_value = [outcome]
+            db.get.return_value = sub
+            stats = run(dry_run=False)
+        assert stats["vm_triggered"] == 1
+        mock_tag.assert_called_once_with("ghl_42", ["auto_mode_vm"])

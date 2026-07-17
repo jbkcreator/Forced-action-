@@ -54,6 +54,7 @@ from src.api.deps import (
     ZIP_RE as _ZIP_RE,
     FLORIDA_PREFIXES as _FLORIDA_PREFIXES,
     ConsentAcceptanceRequest,
+    resolve_voice_consent as _resolve_voice_consent,
     resolve_phone_with_quality as _resolve_phone_with_quality,
     estimate_lead_job_value as _estimate_lead_job_value,
     visible_tier_fields as _visible_tier_fields,
@@ -856,41 +857,6 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
             },
         )
 
-    if payload.consent_acceptance and payload.consent_acceptance.terms_accepted:
-        try:
-            from datetime import datetime
-
-            def _parse_iso_co(s):
-                if not s:
-                    return None
-                try:
-                    return datetime.fromisoformat(s.replace("Z", "+00:00"))
-                except (ValueError, TypeError):
-                    return None
-
-            _co_tcpa = bool(payload.consent_acceptance.tcpa_accepted)
-            ca = ConsentAcceptance(
-                email=payload.email,
-                terms_version=payload.consent_acceptance.terms_version or "2026.06",
-                privacy_version=payload.consent_acceptance.privacy_version or "2026.06",
-                accepted_at=datetime.now(timezone.utc),
-                source_flow="checkout",
-                user_agent=payload.consent_acceptance.user_agent,
-                modal_opened_at=_parse_iso_co(payload.consent_acceptance.modal_opened_at),
-                modal_scrolled_to_end_at=_parse_iso_co(payload.consent_acceptance.modal_scrolled_to_end_at),
-                accepted_text_hash=payload.consent_acceptance.accepted_text_hash or "",
-                tcpa_consent_text=payload.consent_acceptance.tcpa_consent_text if _co_tcpa else None,
-                tcpa_consent_version=payload.consent_acceptance.tcpa_consent_version if _co_tcpa else None,
-                tcpa_checked_at=datetime.now(timezone.utc) if _co_tcpa else None,
-                consent_scope="marketing" if _co_tcpa else None,
-                not_condition_of_purchase_ack=_co_tcpa or None,
-                county_id=payload.county_id,
-            )
-            db.add(ca)
-            db.commit()
-        except Exception:
-            logger.warning("ConsentAcceptance write failed in checkout (non-fatal):", exc_info=True)
-
     checkout_metadata = {
         "tier": payload.tier,
         "vertical": payload.vertical,
@@ -941,6 +907,49 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
             status_code=502,
             detail={"error": "payment_gateway_error", "message": "Payment gateway error — please try again"},
         )
+
+    # Written after the session exists so the row can be bound to this exact
+    # checkout via checkout_session_id — an email-only match would let a stale
+    # unlinked row (abandoned checkout, waitlist) get claimed by this subscriber.
+    if payload.consent_acceptance and payload.consent_acceptance.terms_accepted:
+        try:
+            from datetime import datetime
+
+            def _parse_iso_co(s):
+                if not s:
+                    return None
+                try:
+                    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+                except (ValueError, TypeError):
+                    return None
+
+            _co_tcpa = bool(payload.consent_acceptance.tcpa_accepted)
+            _voice = _resolve_voice_consent(payload.consent_acceptance)
+            ca = ConsentAcceptance(
+                email=payload.email,
+                checkout_session_id=session.id,
+                terms_version=payload.consent_acceptance.terms_version or "2026.06",
+                privacy_version=payload.consent_acceptance.privacy_version or "2026.06",
+                accepted_at=datetime.now(timezone.utc),
+                source_flow="checkout",
+                user_agent=payload.consent_acceptance.user_agent,
+                modal_opened_at=_parse_iso_co(payload.consent_acceptance.modal_opened_at),
+                modal_scrolled_to_end_at=_parse_iso_co(payload.consent_acceptance.modal_scrolled_to_end_at),
+                accepted_text_hash=payload.consent_acceptance.accepted_text_hash or "",
+                tcpa_consent_text=payload.consent_acceptance.tcpa_consent_text if _co_tcpa else None,
+                tcpa_consent_version=payload.consent_acceptance.tcpa_consent_version if _co_tcpa else None,
+                tcpa_checked_at=datetime.now(timezone.utc) if _co_tcpa else None,
+                consent_scope="marketing" if _co_tcpa else None,
+                not_condition_of_purchase_ack=_co_tcpa or None,
+                county_id=payload.county_id,
+                voice_consent_text=_voice[0] if _voice else None,
+                voice_consent_version=_voice[1] if _voice else None,
+                voice_consent_at=datetime.now(timezone.utc) if _voice else None,
+            )
+            db.add(ca)
+            db.commit()
+        except Exception:
+            logger.warning("ConsentAcceptance write failed in checkout (non-fatal):", exc_info=True)
 
     # Abandoned-cart recovery: a real checkout session now exists but isn't paid.
     # Capture the pre_payment start here (the reliable signal) — never inferred
@@ -5702,6 +5711,8 @@ def free_signup(req: FreeSignupRequest, request: Request, db: Session = Depends(
                 except (ValueError, TypeError):
                     return None
 
+            _voice = _resolve_voice_consent(req.consent_acceptance)
+
             ca = ConsentAcceptance(
                 email=req.email,
                 phone=sub.phone,
@@ -5719,6 +5730,9 @@ def free_signup(req: FreeSignupRequest, request: Request, db: Session = Depends(
                 tcpa_checked_at=datetime.now(timezone.utc) if tcpa_accepted else None,
                 consent_scope="marketing" if tcpa_accepted else None,
                 not_condition_of_purchase_ack=tcpa_accepted or None,
+                voice_consent_text=_voice[0] if _voice else None,
+                voice_consent_version=_voice[1] if _voice else None,
+                voice_consent_at=datetime.now(timezone.utc) if _voice else None,
             )
             db.add(ca)
             db.commit()
@@ -6718,10 +6732,20 @@ def claim_bonus_zip(feed_uuid: str, body: ClaimBonusZipRequest, db: Session = De
 
 
 @app.get("/share/{referral_code}", include_in_schema=False)
-def referral_share_page(referral_code: str, db: Session = Depends(get_db)):
+def referral_share_page(
+    referral_code: str,
+    t: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
     """
     Public referral landing page. Looks up the referrer's vertical and
     renders current weekly forward-pack copy with a signup CTA.
+
+    `t` is a signed prompt-attribution token minted when the proactive referral
+    prompt was sent; it binds this visit to the exact funnel row that generated
+    the link. Visits without a valid token (old links, link-preview crawlers,
+    organic /share/{code} shares) are treated as un-attributed and must not
+    advance any prompt to 'shared'.
     """
     from src.services.forward_pack_renderer import get_current_copy
     from fastapi.responses import HTMLResponse
@@ -6732,10 +6756,38 @@ def referral_share_page(referral_code: str, db: Session = Depends(get_db)):
     if not referrer:
         raise HTTPException(status_code=404, detail="Referral link not found")
 
+    from src.services.signed_links import decode_prompt_attribution_token
+    prompt_funnel_id = decode_prompt_attribution_token(t) if t else None
+    if prompt_funnel_id is not None:
+        try:
+            with db.begin_nested():
+                db.execute(
+                    text(
+                        "UPDATE referral_prompt_funnel "
+                        "SET state = 'shared', shared_at = now() "
+                        "WHERE id = :fid AND subscriber_id = :sid AND state = 'shown'"
+                    ),
+                    {"fid": prompt_funnel_id, "sid": referrer.id},
+                )
+        except Exception as exc:
+            logger.warning(
+                "[ReferralPrompt] shown->shared advance failed for referrer=%d funnel=%s: %s",
+                referrer.id, prompt_funnel_id, exc,
+            )
+    elif t:
+        logger.info(
+            "[ReferralPrompt] /share visit for referrer=%d had an invalid/expired token — un-attributed",
+            referrer.id,
+        )
+
     copy_body = get_current_copy(referrer.vertical, db)
     _settings = get_settings()
     base_url = getattr(_settings, "base_url", "")
+    # Carry the attribution token through signup so a confirmed purchase can be
+    # credited back to the originating prompt (the frontend must forward `pt`).
     signup_url = f"{base_url}/?ref={referral_code}"
+    if t:
+        signup_url = f"{signup_url}&pt={t}"
 
     html = f"""<!doctype html>
 <html lang="en">
