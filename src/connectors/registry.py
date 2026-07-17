@@ -75,6 +75,38 @@ OUTCOME_CONNECTORS: dict[str, ConnectorSpec] = {
         off_days=frozenset(),
         enabled=True,
     ),
+    "deed_flip_outcomes": ConnectorSpec(
+        source_type="deed_flip_outcomes",
+        description="Distressed-acquire-then-resell deed chains — flip margin and hold time.",
+        reads_table="deeds",
+        module="src.connectors.deed_flip_outcomes",
+        cadence="weekly, after the deed loader",
+        sla_minutes=10_140,
+        off_days=frozenset(),
+        enabled=True,
+    ),
+    "lis_pendens_outcomes": ConnectorSpec(
+        source_type="lis_pendens_outcomes",
+        description="Lis-pendens filings that never reached auction — resolved by a subsequent deed sale.",
+        reads_table="foreclosures",
+        module="src.connectors.lis_pendens_outcomes",
+        # Deeds + lis-pendens both load Mon-Sat 05:00 (crontab.txt item 5) —
+        # daily, not weekly; corrected after review caught the mismatch.
+        cadence="daily Mon-Sat, after the liens/deeds/judgments loader",
+        sla_minutes=1500,
+        off_days=frozenset({6}),
+        enabled=True,
+    ),
+    "probate_lien_outcomes": ConnectorSpec(
+        source_type="probate_lien_outcomes",
+        description="Probate and code-enforcement-lien lifecycles resolved by a subsequent deed sale.",
+        reads_table="legal_proceedings, legal_and_liens, code_violations",
+        module="src.connectors.probate_lien_outcomes",
+        cadence="weekly, after the probate/lien loaders",
+        sla_minutes=10_140,
+        off_days=frozenset(),
+        enabled=True,
+    ),
     "outcome_label_layer": ConnectorSpec(
         source_type="outcome_label_layer",
         description="Label layer — promotes staged OutcomeCandidate rows into DealOutcome (CDE-10).",

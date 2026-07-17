@@ -20,8 +20,10 @@ from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import select
 
+from src.api.main import app, get_db
 from src.core.models import DistressScore, Property, SentLead, Subscriber
 from src.services import stripe_webhooks
 
@@ -237,3 +239,58 @@ class TestEndpointEnabled:
     def test_hot_lead_unlock_enabled_by_default(self):
         from config.settings import AppSettings
         assert AppSettings.model_fields["hot_lead_unlock_enabled"].default is True
+
+
+# ── Fix A: server, not the client, decides the $99 reduced rate ────────────
+
+@pytest.fixture
+def hot_lead_client(fresh_db):
+    app.dependency_overrides[get_db] = lambda: fresh_db
+    try:
+        yield TestClient(app), fresh_db
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+def _seed_subscriber_and_property(db):
+    cust = f"cus_{uuid.uuid4().hex[:8]}"
+    sub = Subscriber(
+        stripe_customer_id=cust, tier="pro", vertical="roofing",
+        county_id="hillsborough", status="active",
+        event_feed_uuid=f"hlu-{uuid.uuid4().hex[:8]}",
+        email=f"{uuid.uuid4().hex[:8]}@example.com",
+    )
+    db.add(sub)
+    prop = Property(parcel_id=f"HLU-{uuid.uuid4().hex[:6]}", zip="33602",
+                    county_id="hillsborough", address="1 Hot Lead St")
+    db.add(prop)
+    db.flush()
+    return sub, prop
+
+
+class TestServerDecidesReducedRate:
+    def test_active_window_gives_reduced_rate(self, hot_lead_client):
+        client, db = hot_lead_client
+        sub, prop = _seed_subscriber_and_property(db)
+        with patch("src.services.flash_scarcity.get_active_windows_for_subscriber",
+                   return_value=[{"zip_code": prop.zip, "vertical": "roofing"}]), \
+             patch("src.services.stripe_service.create_hot_lead_unlock_link",
+                   return_value={"url": "https://stripe.test/cs_1"}) as create:
+            resp = client.post("/api/hot-lead-unlock", json={
+                "feed_uuid": sub.event_feed_uuid, "lead_id": str(prop.id),
+            })
+        assert resp.status_code == 200
+        assert create.call_args.kwargs["reduced"] is True
+
+    def test_no_window_gives_full_rate_even_if_client_requests_reduced(self, hot_lead_client):
+        client, db = hot_lead_client
+        sub, prop = _seed_subscriber_and_property(db)
+        with patch("src.services.flash_scarcity.get_active_windows_for_subscriber", return_value=[]), \
+             patch("src.services.stripe_service.create_hot_lead_unlock_link",
+                   return_value={"url": "https://stripe.test/cs_2"}) as create:
+            resp = client.post("/api/hot-lead-unlock", json={
+                "feed_uuid": sub.event_feed_uuid, "lead_id": str(prop.id),
+                "reduced": True,  # client can no longer force this
+            })
+        assert resp.status_code == 200
+        assert create.call_args.kwargs["reduced"] is False

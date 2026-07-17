@@ -173,7 +173,14 @@ def promote_candidates(session: Session, county_id: str) -> ConnectorRunResult:
             result.errors += 1
             continue
         try:
-            _promote_one(session, row)
+            # SAVEPOINT per row: a DB-level failure (constraint violation, bad
+            # type coercion, etc.) aborts only this row's nested transaction,
+            # not the whole run — otherwise one bad row would poison every
+            # later statement in this session, including the final mark-
+            # consumed UPDATE, silently rolling back rows already logged as
+            # promoted.
+            with session.begin_nested():
+                _promote_one(session, row)
             consumed_ids.append(row.id)
             result.staged += 1
         except Exception:

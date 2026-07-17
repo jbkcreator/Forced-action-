@@ -70,6 +70,31 @@ def publish_cora_event(event: Dict[str, Any]) -> None:
 	_publish_via_postgres(event)
 
 
+def publish_after_commit(session: Any, event: Dict[str, Any]) -> None:
+	"""
+	Publish `event` only after `session` next commits — never inline.
+
+	Signup flushes (not commits) the subscriber inside a request transaction
+	the caller commits later. Publishing inline lets the agents process consume
+	the event and, in its own transaction, fail to see the still-uncommitted
+	subscriber (get_subscriber_profile returns None → aborted run). Deferring
+	to after_commit guarantees the row is durable before any consumer can act.
+	If the transaction rolls back, the event is never published.
+	"""
+	from sqlalchemy import event as sa_event
+
+	def _fire(_session: Any) -> None:
+		try:
+			publish_cora_event(event)
+		except Exception:
+			logger.warning(
+				"publish_after_commit: publish failed for event_type=%s",
+				event.get("event_type"), exc_info=True,
+			)
+
+	sa_event.listen(session, "after_commit", _fire, once=True)
+
+
 def _publish_via_postgres(event: Dict[str, Any]) -> None:
 	"""Insert event into the durable queue table and emit a NOTIFY."""
 	from src.core.database import get_db_context

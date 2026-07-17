@@ -217,3 +217,27 @@ class TestPGPromotion:
         sref = source_ref_for("appraiser_sale_outcomes", "financials", 9_000_106, date(2026, 6, 15))
         assert _outcome_rows(fresh_db, sref) == []
         assert not _candidate_consumed(fresh_db, cid)
+
+    def test_bad_row_does_not_poison_later_rows_in_same_run(self, fresh_db):
+        """A DB-level error on one row (numeric overflow) must not abort the
+        whole session — the per-row SAVEPOINT keeps a later good row
+        promotable in the same run, and leaves the bad row unconsumed for
+        retry rather than silently losing an already-logged promotion."""
+        prop_bad = _mk_property(fresh_db, "CDE10-LL-007A")
+        prop_good = _mk_property(fresh_db, "CDE10-LL-007B")
+
+        # deal_outcomes.deal_amount is NUMERIC(12,2) (max ~9,999,999,999.99);
+        # this amount overflows it at INSERT time — a genuine DB-level error,
+        # not something the per-row try/except alone can isolate without a
+        # SAVEPOINT around it.
+        bad_cid = _stage(fresh_db, prop_bad, event_type=EVENT_TYPE_AUCTION_SOLD_THIRD_PARTY,
+                         source_id=9_000_107, amount=Decimal("99999999999.99"))
+        good_cid = _stage(fresh_db, prop_good, event_type=EVENT_TYPE_AUCTION_SOLD_THIRD_PARTY,
+                          source_id=9_000_108, amount=Decimal("50000.00"))
+
+        promote_candidates(fresh_db, "hillsborough")
+
+        good_sref = source_ref_for("foreclosure_outcomes", "foreclosures", 9_000_108, date(2026, 6, 15))
+        assert len(_outcome_rows(fresh_db, good_sref)) == 1
+        assert _candidate_consumed(fresh_db, good_cid)
+        assert not _candidate_consumed(fresh_db, bad_cid)
