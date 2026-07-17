@@ -120,25 +120,18 @@ def start_recovery(
     subscriber_id: Optional[int] = None,
     phone: Optional[str] = None,
     resume_context: Optional[dict] = None,
-    persist: bool = True,
 ) -> Optional[CheckoutRecovery]:
-    """Idempotently begin recovery for an abandoned checkout. Returns the row,
-    or None if the email is already past recovery (recovered/failed) — a
-    closed sequence is never reopened for the same email (once per email).
+    """Idempotently begin recovery for an abandoned checkout. Returns the row.
 
-    persist=False (B1-04): run the same email-dedup check and alert the
-    founder, but do NOT create a CheckoutRecovery row or touch nurture
-    suppression. Used where a source's customer-facing drip is opt-in
-    (lead_pack, gated by checkout_recovery_lead_pack_enabled) but the founder
-    must still hear about every abandonment regardless of that flag. Always
-    returns None in this mode — there is no row to hand back.
+    Called at checkout-start (session/PaymentIntent just created — not yet
+    paid, not yet abandoned). A still-active row is a no-op replay. A
+    previously closed (recovered/failed) row is reopened for a new episode —
+    email is unique per row, so the same buyer's next abandonment reuses it
+    rather than being silently dropped.
+
+    Does NOT alert the founder — that fires from the recovery sweep once the
+    first touch comes due (i.e. abandonment is actually confirmed), not here.
     """
-    # ponytail: persist=False writes nothing, so dedup only catches repeats if
-    # some OTHER persist=True call already made a row for this email — a
-    # repeated persist=False call for the same still-abandoned lead pack (e.g.
-    # a page reload minting a new PaymentIntent) re-alerts every time.
-    # Acceptable at current volume; add a lightweight per-email cooldown if
-    # lead-pack retries make this noisy.
     email = (email or "").strip().lower()
     if not email:
         return None
@@ -147,13 +140,8 @@ def start_recovery(
     existing = db.execute(
         select(CheckoutRecovery).where(CheckoutRecovery.email == email)
     ).scalar_one_or_none()
-    if existing is not None:
-        # Already active → no-op replay; already closed → don't reopen.
-        return existing if existing.status == "active" else None
-
-    if not persist:
-        _alert_founder(email, source, phone)
-        return None
+    if existing is not None and existing.status == "active":
+        return existing
 
     participates_in_nurture = source in _NURTURE_SOURCES
     if participates_in_nurture:
@@ -169,28 +157,40 @@ def start_recovery(
             )
             return None
 
-    row = CheckoutRecovery(
-        email=email,
-        subscriber_id=subscriber_id,
-        phone=phone,
-        source=source,
-        status="active",
-        touches_sent=0,
-        resume_context=resume_context,
-    )
-    db.add(row)
+    if existing is not None:
+        row = existing
+        row.subscriber_id = subscriber_id
+        row.phone = phone
+        row.source = source
+        row.status = "active"
+        row.touches_sent = 0
+        row.resume_context = resume_context
+        row.started_at = datetime.now(timezone.utc)
+        row.first_touch_at = None
+        row.last_touch_at = None
+        row.closed_at = None
+        row.founder_alerted_at = None
+    else:
+        row = CheckoutRecovery(
+            email=email,
+            subscriber_id=subscriber_id,
+            phone=phone,
+            source=source,
+            status="active",
+            touches_sent=0,
+            resume_context=resume_context,
+        )
+        db.add(row)
     if participates_in_nurture:
         _suppress_nurture(db, email, subscriber_id)
     logger.info("[CheckoutRecovery] started email=%s source=%s", email, source)
-    _alert_founder(email, source, phone)
     return row
 
 
-def _alert_founder(email: str, source: str, phone: Optional[str]) -> None:
-    """B1-04: ping the founder on every new abandonment (subscription or lead
-    pack) so they can personally follow up. Fires once per email (this is only
-    reached on the new-row path, never the no-op replay) and unconditionally —
-    unlike the customer-facing touches this isn't gated by
+def alert_founder(email: str, source: str, phone: Optional[str]) -> None:
+    """B1-04: ping the founder once abandonment is actually confirmed (the
+    recovery sweep's first due touch) so they can personally follow up.
+    Unconditional — unlike the customer-facing touches this isn't gated by
     checkout_recovery_enabled, since it sends nothing to the buyer."""
     from src.services.stripe_webhooks import _send_founder_alert
     message = f"ABANDONED CHECKOUT: {source} email={email}"

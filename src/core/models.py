@@ -5046,11 +5046,14 @@ class NonBuyerNurtureSequence(Base):
 
 class CheckoutRecovery(Base):
     """
-    Abandoned-checkout recovery sequence — one row per email (Task 7).
+    Abandoned-checkout recovery sequence — one row per email (Task 7), reused
+    across episodes: a closed (recovered/failed) row is reopened rather than
+    blocking the next abandonment for that email.
 
-    Covers two drop-off paths: a Stripe checkout session that expired without
-    payment (`session_expired`), and a buyer who provisioned a pre-checkout
-    intent but never paid (`pre_payment`). A fast, high-intent "finish your
+    Covers three drop-off sources: a Stripe checkout session that expired
+    without payment (`session_expired`), a buyer who provisioned a
+    pre-checkout intent but never paid (`pre_payment`), and an abandoned lead
+    pack PaymentIntent (`lead_pack`). A fast, high-intent "finish your
     purchase" sequence — distinct from the slower non-buyer nurture drip. While
     a row is `active`, the sibling non_buyer_nurture row is held at
     `in_recovery` so the two flows never double-contact the same person; on
@@ -5076,6 +5079,10 @@ class CheckoutRecovery(Base):
     first_touch_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     last_touch_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True)
     closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    # B1-04: stamped once the founder SMS fires for this episode (at the first
+    # confirmed-abandonment sweep touch, not at row creation) so retried
+    # sweeps/reopened episodes don't re-alert.
+    founder_alerted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False

@@ -75,9 +75,10 @@ def test_build_resume_url():
     assert cr.build_resume_url("https://app.example.com", None) == "https://app.example.com/#pricing"
 
 
-def test_start_recovery_alerts_founder_once(monkeypatch):
-    """B1-04: a new abandonment pings the founder; a replay on the same
-    already-active row does not re-alert."""
+def test_start_recovery_does_not_alert_founder(monkeypatch):
+    """B1-04 fix (issue 1): the founder alert must not fire at checkout-start —
+    that's before payment success/failure is even known, so it would fire on
+    every successful checkout too. Alerting is the sweep's job."""
     import src.services.stripe_webhooks as webhooks_mod
 
     alerts = []
@@ -89,47 +90,115 @@ def test_start_recovery_alerts_founder_once(monkeypatch):
             from src.services import checkout_recovery as cr
             cr.start_recovery(db, email=email, source="lead_pack", phone="+18135551234")
             db.commit()
-        assert len(alerts) == 1
-        assert email in alerts[0]
-        assert "lead_pack" in alerts[0]
-
-        with get_db_context() as db:
-            cr.start_recovery(db, email=email, source="lead_pack", phone="+18135551234")
-            db.commit()
-        assert len(alerts) == 1  # no-op replay: no second alert
+        assert alerts == []
     finally:
         _cleanup(email)
 
 
-def test_start_recovery_persist_false_alerts_without_creating_row(monkeypatch):
-    """B1-04 fix: lead-pack capture is opt-in (checkout_recovery_lead_pack_enabled
-    defaults False), but the founder alert must fire regardless — persist=False
-    still dedups + alerts, without writing a CheckoutRecovery row or suppressing
-    nurture."""
+def test_start_recovery_reopens_a_closed_row_for_a_new_episode():
+    """B1-04 fix (issue 2): email is unique on checkout_recovery, so a second
+    abandonment for an email that already has a recovered/failed row must
+    reopen that row for a new episode instead of being silently dropped —
+    the common case since lead-pack buyers are existing subscribers who may
+    already have a closed subscription-checkout row."""
+    from src.services import checkout_recovery as cr
+
+    email = _email()
+    try:
+        with get_db_context() as db:
+            cr.start_recovery(db, email=email, source="pre_payment")
+            db.commit()
+        with get_db_context() as db:
+            cr.mark_recovered(db, email)
+            db.commit()
+
+        with get_db_context() as db:
+            row = cr.start_recovery(db, email=email, source="lead_pack", phone="+18135551234")
+            db.commit()
+        assert row is not None
+        assert row.status == "active"
+        assert row.source == "lead_pack"
+        assert row.touches_sent == 0
+        assert row.closed_at is None
+        assert row.founder_alerted_at is None
+
+        with get_db_context() as db:
+            rows = db.query(CheckoutRecovery).filter_by(email=email).all()
+        assert len(rows) == 1  # reused, not duplicated (email is unique)
+    finally:
+        _cleanup(email)
+
+
+def test_sweep_alerts_founder_once_on_first_confirmed_abandonment(monkeypatch):
+    """B1-04 fix: the founder alert fires from the sweep's first due touch
+    (real abandonment — payment success would already have closed the row),
+    not at row creation, and not again on a later sweep run."""
+    from datetime import datetime, timedelta, timezone
+    from config.settings import get_settings
+    from src.tasks import checkout_recovery_sweep
     import src.services.stripe_webhooks as webhooks_mod
 
+    monkeypatch.setattr(get_settings(), "checkout_recovery_enabled", True, raising=False)
     alerts = []
     monkeypatch.setattr(webhooks_mod, "_send_founder_alert", lambda msg: alerts.append(msg))
 
     email = _email()
     try:
         with get_db_context() as db:
-            from src.services import checkout_recovery as cr
-            result = cr.start_recovery(db, email=email, source="lead_pack", persist=False)
+            _insert_active(db, email, started_at=datetime.now(timezone.utc) - timedelta(hours=3))
             db.commit()
-        assert result is None
+
+        checkout_recovery_sweep.run_sweep()
         assert len(alerts) == 1
-        assert email in alerts[0] and "lead_pack" in alerts[0]
+        assert email in alerts[0]
+
+        checkout_recovery_sweep.run_sweep()
+        assert len(alerts) == 1  # not re-alerted on a later sweep
 
         with get_db_context() as db:
             rec = db.query(CheckoutRecovery).filter_by(email=email).first()
-        assert rec is None  # no row persisted
+        assert rec.founder_alerted_at is not None
+    finally:
+        _cleanup(email)
 
-        # Replay with persist=False still dedups off the (absent) row —
-        # since nothing was ever saved, this looks like a fresh email again
-        # and alerts a second time. That's expected: persist=False never
-        # remembers past alerts across process/requests, only within a single
-        # already-persisted row's lifetime.
+
+def test_sweep_alerts_founder_for_lead_pack_even_when_dunning_flag_off(monkeypatch):
+    """B1-04 fix (issue 3): lead-pack customer dunning stays opt-in
+    (checkout_recovery_lead_pack_enabled defaults False), but the founder
+    alert must fire regardless — and exactly once, since the row is now
+    always persisted (no more persist=False no-row path to lose the dedup)."""
+    from datetime import datetime, timedelta, timezone
+    from config.settings import get_settings
+    from src.tasks import checkout_recovery_sweep
+    import src.services.stripe_webhooks as webhooks_mod
+
+    monkeypatch.setattr(get_settings(), "checkout_recovery_enabled", True, raising=False)
+    monkeypatch.setattr(get_settings(), "checkout_recovery_lead_pack_enabled", False, raising=False)
+    alerts = []
+    monkeypatch.setattr(webhooks_mod, "_send_founder_alert", lambda msg: alerts.append(msg))
+
+    email = _email()
+    try:
+        with get_db_context() as db:
+            db.add(CheckoutRecovery(
+                email=email, source="lead_pack", status="active", touches_sent=0,
+                started_at=datetime.now(timezone.utc) - timedelta(hours=3),
+                resume_context={"kind": "lead_pack", "feed_uuid": "abc", "lead_pack_zip": "33601"},
+            ))
+            db.commit()
+
+        checkout_recovery_sweep.run_sweep()
+        assert len(alerts) == 1
+        assert "lead_pack" in alerts[0]
+
+        with get_db_context() as db:
+            rec = db.query(CheckoutRecovery).filter_by(email=email).first()
+        assert rec.touches_sent == 0     # customer-facing send stayed off
+        assert rec.status == "active"
+        assert rec.founder_alerted_at is not None
+
+        checkout_recovery_sweep.run_sweep()
+        assert len(alerts) == 1          # still not re-alerted
     finally:
         _cleanup(email)
 
@@ -146,11 +215,16 @@ def _insert_active(db, email, *, touches_sent=0, started_at=None, last_touch_at=
 
 
 def test_sweep_is_read_only_when_flag_off(monkeypatch):
+    """checkout_recovery_enabled=False mutes customer-facing sends, but the
+    founder alert (independent of that flag) still fires — so it's mocked
+    here rather than left to hit the real Telnyx/SMS path."""
     from datetime import datetime, timedelta, timezone
     from config.settings import get_settings
     from src.tasks import checkout_recovery_sweep
+    import src.services.stripe_webhooks as webhooks_mod
 
     monkeypatch.setattr(get_settings(), "checkout_recovery_enabled", False, raising=False)
+    monkeypatch.setattr(webhooks_mod, "_send_founder_alert", lambda msg: None)
     email = _email()
     try:
         with get_db_context() as db:
@@ -172,8 +246,10 @@ def test_sweep_sends_and_advances_when_flag_on(monkeypatch):
     from config.settings import get_settings
     from src.tasks import checkout_recovery_sweep
     import src.services.email as email_mod
+    import src.services.stripe_webhooks as webhooks_mod
 
     monkeypatch.setattr(get_settings(), "checkout_recovery_enabled", True, raising=False)
+    monkeypatch.setattr(webhooks_mod, "_send_founder_alert", lambda msg: None)
     sent = {}
     monkeypatch.setattr(email_mod, "send_email", lambda **kw: sent.update(kw) or True)
 
@@ -228,8 +304,10 @@ def test_sweep_does_not_advance_when_no_channel_delivers(monkeypatch):
     from config.settings import get_settings
     from src.tasks import checkout_recovery_sweep
     import src.services.email as email_mod
+    import src.services.stripe_webhooks as webhooks_mod
 
     monkeypatch.setattr(get_settings(), "checkout_recovery_enabled", True, raising=False)
+    monkeypatch.setattr(webhooks_mod, "_send_founder_alert", lambda msg: None)
 
     def _boom(**kw):
         raise RuntimeError("email provider down")
