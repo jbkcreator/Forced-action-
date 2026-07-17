@@ -51,6 +51,7 @@ from src.api.deps import (
     get_db,
     VALID_TIERS,
     VALID_VERTICALS,
+    SIGNUP_VERTICALS,
     ZIP_RE as _ZIP_RE,
     FLORIDA_PREFIXES as _FLORIDA_PREFIXES,
     ConsentAcceptanceRequest,
@@ -5931,10 +5932,10 @@ def free_signup(req: FreeSignupRequest, request: Request, db: Session = Depends(
     if not get_settings().freemium_funnel_enabled:
         raise HTTPException(status_code=503, detail="freemium funnel disabled")
 
-    if req.vertical not in VALID_VERTICALS:
+    if req.vertical not in SIGNUP_VERTICALS:
         raise HTTPException(
             status_code=400,
-            detail={"error": "invalid_vertical", "message": f"Must be one of: {sorted(VALID_VERTICALS)}"},
+            detail={"error": "invalid_vertical", "message": f"Must be one of: {sorted(SIGNUP_VERTICALS)}"},
         )
 
     from src.services.signup_engine import create_free_account_by_email
