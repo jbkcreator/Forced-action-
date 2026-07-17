@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 
 from src.api.deps import get_db
 from src.api.main import app
-from src.core.models import DistressScore, Incident, Owner, Property, Subscriber
+from src.core.models import DistressScore, Incident, Owner, Property, Subscriber, ZipTerritory
 
 client = TestClient(app, raise_server_exceptions=False)
 
@@ -127,3 +127,76 @@ class TestSegmentGateAndPricing:
         assert resp.status_code == 200
         mock_settings.active_stripe_price.assert_any_call("insurance_distress_pack")
         mock_stripe.Price.retrieve.assert_called_once_with("price_insurance_distress_pack")
+
+    def test_segment_purchase_allowed_in_owned_zip(self, client_with_db):
+        """PR #139 issue 1: the insurance-distress pack is a premium add-on
+        sold inside the subscriber's OWN locked ZIPs (that's the only place the
+        availability feed card surfaces it). Checkout must not reject it with
+        zip_already_owned the way a plain base-lead pack would."""
+        http, db = client_with_db
+        zip_code = "95203"
+        sub = _mk_subscriber(db, "seg-owned")
+        db.add(ZipTerritory(
+            subscriber_id=sub.id, zip_code=zip_code, vertical="wholesalers",
+            county_id="hillsborough", status="locked",
+        ))
+        db.flush()
+        for i in range(5):
+            _mk_property(db, f"SEG-OWN{i}", zip_code, "hillsborough",
+                         {"wholesalers": 50.0}, has_incident="storm_damage")
+
+        with patch("src.api.main.get_settings") as mock_get_settings, \
+             patch("src.api.main.stripe") as mock_stripe:
+            mock_settings = MagicMock()
+            mock_settings.active_stripe_secret_key.get_secret_value.return_value = "sk_test"
+            mock_settings.active_stripe_price.side_effect = lambda name: f"price_{name}"
+            mock_settings.checkout_recovery_lead_pack_enabled = False
+            mock_get_settings.return_value = mock_settings
+            mock_stripe.Price.retrieve.return_value = {"unit_amount": 29900, "currency": "usd"}
+            mock_stripe.PaymentIntent.create.return_value = {"client_secret": "secret_123"}
+
+            resp = http.post("/api/lead-pack/checkout", json={
+                "feed_uuid": "seg-owned",
+                "zip_code": zip_code,
+                "vertical": "wholesalers",
+                "segment": "insurance_distress",
+            })
+
+        assert resp.status_code == 200
+        mock_stripe.PaymentIntent.create.assert_called_once()
+
+    def test_guess_lead_blocks_checkout_before_paymentintent(self, client_with_db):
+        """PR #139 issue 3: checkout must exclude guess leads with the SAME
+        predicate as the webhook reservation. Five segment matches exist but one
+        is a guess lead — checkout must return insufficient_leads and never
+        create a PaymentIntent (otherwise the webhook charges then refunds)."""
+        http, db = client_with_db
+        zip_code = "95204"
+        _mk_subscriber(db, "seg-guess")
+        for i in range(4):
+            _mk_property(db, f"SEG-G{i}", zip_code, "hillsborough",
+                         {"wholesalers": 50.0}, has_incident="storm_damage")
+        guess = _mk_property(db, "SEG-G4", zip_code, "hillsborough",
+                             {"wholesalers": 50.0}, has_incident="storm_damage")
+        db.query(DistressScore).filter_by(property_id=guess).update({"is_guess_lead": True})
+        db.flush()
+
+        with patch("src.api.main.get_settings") as mock_get_settings, \
+             patch("src.api.main.stripe") as mock_stripe:
+            mock_settings = MagicMock()
+            mock_settings.active_stripe_secret_key.get_secret_value.return_value = "sk_test"
+            mock_settings.active_stripe_price.side_effect = lambda name: f"price_{name}"
+            mock_get_settings.return_value = mock_settings
+            mock_stripe.Price.retrieve.return_value = {"unit_amount": 29900, "currency": "usd"}
+            mock_stripe.PaymentIntent.create.return_value = {"client_secret": "secret_123"}
+
+            resp = http.post("/api/lead-pack/checkout", json={
+                "feed_uuid": "seg-guess",
+                "zip_code": zip_code,
+                "vertical": "wholesalers",
+                "segment": "insurance_distress",
+            })
+
+        assert resp.status_code == 422
+        assert resp.json()["detail"]["error"] == "insufficient_leads"
+        mock_stripe.PaymentIntent.create.assert_not_called()

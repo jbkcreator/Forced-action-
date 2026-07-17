@@ -61,6 +61,38 @@ def apply_segment_filter(filters: List[Any], segment: Optional[str], now: dateti
         filters.append(insurance_distress_segment_clause(now))
 
 
+def sellable_lead_filters(settings: Any) -> List[Any]:
+    """
+    Shared sellability predicate for a lead-pack lead (ADR 0032 D5). Every
+    surface that COUNTS or RESERVES a sellable lead — the availability feed
+    card, the checkout gate, and the webhook reservation — must build on this
+    so they cannot drift and advertise/charge for a lead that later fails to
+    fulfil:
+
+      * DistressScore.qualified — passes the CDS qualification bar.
+      * is_guess_lead is False  — never a guessed/imputed lead in a paid pack (A2).
+      * contactable             — at least one phone/email on Owner (unless debug).
+
+    Cross-trade exclusivity and the segment clause are appended by the caller
+    (they need per-request county/ZIP/now context) via get_exclusive_property_ids
+    and apply_segment_filter.
+
+    The returned filters reference DistressScore and Owner, so the caller's
+    query must join DistressScore and outer-join Owner to Property.
+    """
+    from src.core.models import DistressScore
+    from src.utils.lead_filters import has_contact_filter
+
+    filters: List[Any] = [
+        DistressScore.qualified == True,  # noqa: E712 — SQLAlchemy needs ==, not is
+        DistressScore.is_guess_lead.is_(False),
+    ]
+    contact_clause = has_contact_filter(settings)
+    if contact_clause is not None:
+        filters.append(contact_clause)
+    return filters
+
+
 def get_lead_pool(
     zip_code: str,
     vertical: Optional[str] = None,

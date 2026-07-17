@@ -12,7 +12,15 @@ import pytest
 
 from src.api.deps import get_db
 from src.api.main import app
-from src.core.models import DistressScore, Incident, Owner, Property, Subscriber, ZipTerritory
+from src.core.models import (
+    DistressScore,
+    Incident,
+    LeadExclusivity,
+    Owner,
+    Property,
+    Subscriber,
+    ZipTerritory,
+)
 
 
 @pytest.fixture
@@ -101,6 +109,50 @@ class TestInsuranceDistressAvailability:
             mock_get_settings.return_value = mock_settings
 
             resp = http.get("/api/insurance-distress/availability", params={"feed_uuid": "avail-short"})
+
+        assert resp.status_code == 200
+        assert resp.json()["zips"] == []
+
+    def test_unsellable_leads_are_not_counted(self, client_with_db):
+        """PR #139 issue 2: availability must apply the same sellability
+        predicate as checkout/webhook. Five storm-damaged qualifying leads
+        exist, but one is a guess lead, one is uncontactable, and one is under
+        active cross-trade exclusivity — only two are truly sellable, so the
+        ZIP must NOT surface a pack card."""
+        http, db = client_with_db
+        zip_code = "95403"
+        county = "hillsborough"
+        sub = _mk_subscriber(db, "avail-unsellable", county)
+        _mk_territory(db, sub, zip_code, county)
+
+        # Two clean, sellable leads.
+        _mk_property(db, "AV-C0", zip_code, county, {"wholesalers": 50.0}, has_incident="storm_damage")
+        _mk_property(db, "AV-C1", zip_code, county, {"wholesalers": 50.0}, has_incident="storm_damage")
+
+        # Guess lead — excluded by is_guess_lead predicate.
+        guess = _mk_property(db, "AV-C2", zip_code, county, {"wholesalers": 50.0}, has_incident="storm_damage")
+        db.query(DistressScore).filter_by(property_id=guess).update({"is_guess_lead": True})
+
+        # Uncontactable — no phone/email on Owner.
+        uncontactable = _mk_property(db, "AV-C3", zip_code, county, {"wholesalers": 50.0}, has_incident="storm_damage")
+        db.query(Owner).filter_by(property_id=uncontactable).update({"phone_1": None})
+
+        # Exclusively reserved to another trade.
+        reserved = _mk_property(db, "AV-C4", zip_code, county, {"wholesalers": 50.0}, has_incident="storm_damage")
+        db.add(LeadExclusivity(
+            property_id=reserved, zip_code=zip_code, county_id=county,
+            sold_to_trade="fix_flip", source="lead_pack", source_id=1,
+            exclusive_until=datetime.now(timezone.utc) + timedelta(hours=72),
+        ))
+        db.flush()
+
+        with patch("src.api.main.get_settings") as mock_get_settings:
+            mock_settings = MagicMock()
+            mock_settings.debug = False  # enforce the contactability filter
+            mock_settings.active_stripe_price.return_value = "price_insurance_distress_pack"
+            mock_get_settings.return_value = mock_settings
+
+            resp = http.get("/api/insurance-distress/availability", params={"feed_uuid": "avail-unsellable"})
 
         assert resp.status_code == 200
         assert resp.json()["zips"] == []

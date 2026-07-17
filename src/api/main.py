@@ -3335,17 +3335,23 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, request: Request, db: S
     if subscriber.vertical and subscriber.vertical != payload.vertical:
         raise HTTPException(status_code=400, detail={"error": "vertical_mismatch", "message": f"Your subscription is for {subscriber.vertical}, not {payload.vertical}"})
 
-    # Reject if subscriber already owns this ZIP — they get those leads free
-    owned = db.execute(
-        select(ZipTerritory).where(
-            ZipTerritory.subscriber_id == subscriber.id,
-            ZipTerritory.zip_code == payload.zip_code,
-            ZipTerritory.vertical == payload.vertical,
-            ZipTerritory.status.in_(["locked", "grace"]),
-        )
-    ).scalar_one_or_none()
-    if owned:
-        raise HTTPException(status_code=400, detail={"error": "zip_already_owned", "message": "You already receive leads for this ZIP in your feed."})
+    # Reject if subscriber already owns this ZIP — they get those base leads
+    # free. EXCEPTION: the insurance-distress segment (ADR 0032) is a premium
+    # add-on sold *inside* the subscriber's locked ZIPs, so an owned ZIP is
+    # exactly where it's offered — do not reject it there. Without this, every
+    # pack card from /api/insurance-distress/availability (which only surfaces
+    # locked ZIPs) would 400 with zip_already_owned.
+    if payload.segment != "insurance_distress":
+        owned = db.execute(
+            select(ZipTerritory).where(
+                ZipTerritory.subscriber_id == subscriber.id,
+                ZipTerritory.zip_code == payload.zip_code,
+                ZipTerritory.vertical == payload.vertical,
+                ZipTerritory.status.in_(["locked", "grace"]),
+            )
+        ).scalar_one_or_none()
+        if owned:
+            raise HTTPException(status_code=400, detail={"error": "zip_already_owned", "message": "You already receive leads for this ZIP in your feed."})
 
     # Checkout gate 1: county must be launched (ADR 0002 — derived status).
     from src.utils.county_config import is_county_launched
@@ -3362,7 +3368,7 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, request: Request, db: S
     # deliberately no pre-payment contactability-percentage gate here.
     from src.services.lead_exclusivity import get_exclusive_property_ids
     from src.core.models import DistressScore, Owner
-    from src.utils.lead_filters import has_contact_filter, phone_priority_order
+    from src.utils.lead_filters import phone_priority_order
     from datetime import datetime, timezone as tz
 
     now = datetime.now(tz.utc)
@@ -3373,17 +3379,15 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, request: Request, db: S
     except KeyError:
         raise HTTPException(status_code=400, detail={"error": "invalid_vertical", "message": f"Unknown vertical '{payload.vertical}'"})
 
-    filters = [
-        Property.zip == payload.zip_code,
-        Property.county_id == payload.county_id,
-        DistressScore.qualified == True,
-    ]
-    contact_clause = has_contact_filter(_s)
-    if contact_clause is not None:
-        filters.append(contact_clause)
+    # Same sellability predicate as availability + webhook reservation
+    # (ADR 0032 D5): qualified, non-guess (A2), contactable. Prevents charging
+    # a customer for a pack the webhook would then have to refund.
+    from src.services.lead_pool_service import apply_segment_filter, sellable_lead_filters
+    filters = sellable_lead_filters(_s)
+    filters.append(Property.zip == payload.zip_code)
+    filters.append(Property.county_id == payload.county_id)
     if excl_ids:
         filters.append(Property.id.not_in(excl_ids))
-    from src.services.lead_pool_service import apply_segment_filter
     apply_segment_filter(filters, payload.segment, now)
 
     candidate_ids = db.execute(
@@ -3517,19 +3521,30 @@ def insurance_distress_availability(feed_uuid: str, db: Session = Depends(get_db
     if not locked_zips:
         return empty
 
-    from src.services.lead_pool_service import insurance_distress_segment_clause
+    from src.services.lead_pool_service import apply_segment_filter, sellable_lead_filters
+    from src.services.lead_exclusivity import get_exclusive_property_ids
+    from src.core.models import Owner
     now = datetime.now(timezone.utc)
 
+    # Same sellability predicate as checkout + webhook reservation (ADR 0032 D5)
+    # so a ZIP is only advertised when its leads can actually be sold and
+    # fulfilled: qualified, non-guess, contactable, not exclusively reserved to
+    # another trade, and matching the insurance-distress segment.
+    avail_filters = sellable_lead_filters(_s)
+    avail_filters.append(Property.zip.in_(locked_zips))
+    avail_filters.append(Property.county_id == subscriber.county_id)
+    apply_segment_filter(avail_filters, "insurance_distress", now)
+
     try:
+        excl_ids = get_exclusive_property_ids(db, subscriber.county_id, now)
+        if excl_ids:
+            avail_filters.append(Property.id.not_in(excl_ids))
+
         rows = db.execute(
             select(Property.zip, func.count(func.distinct(Property.id)))
             .join(DistressScore, DistressScore.property_id == Property.id)
-            .where(
-                Property.zip.in_(locked_zips),
-                Property.county_id == subscriber.county_id,
-                DistressScore.qualified == True,
-                insurance_distress_segment_clause(now),
-            )
+            .outerjoin(Owner, Owner.property_id == Property.id)
+            .where(and_(*avail_filters))
             .group_by(Property.zip)
         ).all()
     except OperationalError:
