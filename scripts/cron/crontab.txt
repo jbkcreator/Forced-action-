@@ -725,6 +725,13 @@ COUNTY_ID=hillsborough
 4 8 * * 0 $PROJECT/scripts/cron/run.sh src.connectors.probate_lien_outcomes --county-id $COUNTY_ID
 5 8 * * 0 $PROJECT/scripts/cron/run.sh src.connectors.probate_lien_outcomes --county-id pinellas
 
+# lis_pendens_outcomes — daily Mon-Sat, after the liens/deeds/judgments
+# loader (item 5, 05:00 UTC) which both loads deeds and stamps
+# foreclosures.lis_pendens_date. SLA 1500 min. No Sunday run — deeds/LP
+# don't load Sundays (matches off_days={6} in registry.py).
+50 6 * * 1-6 $PROJECT/scripts/cron/run.sh src.connectors.lis_pendens_outcomes --county-id $COUNTY_ID
+51 6 * * 1-6 $PROJECT/scripts/cron/run.sh src.connectors.lis_pendens_outcomes --county-id pinellas
+
 # tax_deed_outcomes is enabled=True in registry.py but INTENTIONALLY NOT
 # scheduled here yet: its documented cadence is "daily, after the tax-deed
 # scraper", but no tax-deed auction scraper cron entry exists anywhere in

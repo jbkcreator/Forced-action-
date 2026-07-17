@@ -131,6 +131,43 @@ class TestStageOutcomesPG:
         ).first()
         assert row is None
 
+    def test_null_price_deed_alone_is_not_a_resale(self, fresh_db):
+        # Deed loader persists NULL sale_price whenever the source CSV's
+        # SalesPrice is missing (e.g. a non-sale instrument). Must not be
+        # mistaken for a confirmed sale.
+        prop = _mk_property(fresh_db, "LP-008")
+        _mk_lp_foreclosure(fresh_db, prop.id, "LP-CASE-008")
+        _mk_deed(fresh_db, prop.id, "INST-NULLPRICE-008", sale_price=None)
+
+        result = stage_outcomes(fresh_db, "hillsborough")
+        assert result.errors == 0
+
+        row = fresh_db.execute(
+            text("SELECT id FROM outcome_candidates WHERE property_id = :pid"),
+            {"pid": prop.id},
+        ).first()
+        assert row is None
+
+    def test_null_price_deed_does_not_mask_later_real_sale(self, fresh_db):
+        # LIMIT 1 orders by record_date ASC -- a NULL-price instrument earlier
+        # in the chain must not win over (or block) the real sale that follows.
+        prop = _mk_property(fresh_db, "LP-009")
+        _mk_lp_foreclosure(fresh_db, prop.id, "LP-CASE-009")
+        _mk_deed(fresh_db, prop.id, "INST-NULLPRICE-009", sale_price=None, record_date=date(2025, 3, 1))
+        _mk_deed(fresh_db, prop.id, "INST-REAL-009", sale_price=Decimal("195000.00"), record_date=date(2025, 6, 1))
+
+        result = stage_outcomes(fresh_db, "hillsborough")
+        assert result.errors == 0
+
+        row = fresh_db.execute(
+            text("SELECT amount, raw_payload FROM outcome_candidates "
+                 "WHERE source_type = 'lis_pendens_outcomes' AND property_id = :pid"),
+            {"pid": prop.id},
+        ).first()
+        assert row is not None
+        assert row.amount == Decimal("195000.00")
+        assert row.raw_payload["sale_instrument"] == "INST-REAL-009"
+
     def test_row_with_auction_date_is_never_touched(self, fresh_db):
         # This is foreclosure_outcomes.py's territory -- CDE-05 must not stage it.
         prop = _mk_property(fresh_db, "LP-006")

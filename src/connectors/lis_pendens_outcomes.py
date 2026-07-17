@@ -50,7 +50,7 @@ _RESALE_JOIN = (
     "  FROM deeds d"
     "  WHERE d.property_id = f.property_id"
     "    AND d.record_date > f.lis_pendens_date"
-    "    AND (d.sale_price IS NULL OR d.sale_price >= 100)"
+    "    AND d.sale_price >= 100"
     "    AND (d.deed_type IS NULL OR d.deed_type NOT ILIKE '%quit%')"
     "  ORDER BY d.record_date ASC LIMIT 1"
     ") r ON true"
