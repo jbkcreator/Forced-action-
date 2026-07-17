@@ -78,6 +78,22 @@ def test_seed_is_idempotent(seeded):
     assert count == 2
 
 
+def test_rerun_without_price_ids_preserves_existing(seeded):
+    # Review fix #3: a rerun in an env missing the price vars (None) must NOT
+    # null out the mapping already stored — COALESCE keeps it.
+    seed_founder_plans(seeded.connection(), None, None)
+    assert _get_plan(seeded, "founder_monthly")["stripe_price_id"] == MONTHLY_FAKE
+    assert _get_plan(seeded, "founder_annual")["stripe_price_id"] == ANNUAL_FAKE
+
+
+def test_price_resolves_the_correct_founder_interval(seeded):
+    # Review fix #2: the two founder rows must be distinguishable by price id,
+    # so checkout resolves the right interval (not an arbitrary tier LIMIT 1).
+    from src.services.revenue_engine import plan_id_for_price
+    assert plan_id_for_price(seeded, MONTHLY_FAKE) == "founder_monthly"
+    assert plan_id_for_price(seeded, ANNUAL_FAKE) == "founder_annual"
+
+
 @pytest.mark.skip(reason="entitlement_service ships on PR #144, not yet on dev")
 def test_gate_200_for_founder_403_for_lower():
     """Once #144 merges: founder account -> 200 on founder-only surface,

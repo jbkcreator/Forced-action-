@@ -49,7 +49,10 @@ _UPSERT = text("""
         price_cents = EXCLUDED.price_cents,
         interval = EXCLUDED.interval,
         entitlements = EXCLUDED.entitlements,
-        stripe_price_id = EXCLUDED.stripe_price_id,
+        -- Never null out a live price mapping: a rerun in an environment that
+        -- is missing the env var passes NULL, and overwriting would break
+        -- checkout/webhook price->plan resolution. Keep the existing id.
+        stripe_price_id = COALESCE(EXCLUDED.stripe_price_id, plans.stripe_price_id),
         updated_at = now()
 """)
 
