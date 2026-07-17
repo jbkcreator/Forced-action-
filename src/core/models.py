@@ -86,6 +86,11 @@ class Property(Base):
     hcpa_neighborhood_code: Mapped[Optional[str]] = mapped_column(String(255))
     building_details: Mapped[Optional[dict]] = mapped_column(JSONB)            # roof, walls, sub-areas, extra features
     hcpa_last_refreshed: Mapped[Optional[datetime]] = mapped_column(DateTime)  # NULL = never enriched
+    # CDE-07: HCPA STRAP key, verbatim from the master bulk file — byte-identical
+    # to the FL DOR SDF/NAL PARCEL_ID for Hillsborough, giving a deterministic
+    # join to DOR statewide sales files. NULL for counties whose DOR key is
+    # derivable from parcel_id instead (Pinellas: range/section swap transform).
+    strap: Mapped[Optional[str]] = mapped_column(String(30), index=True)
 
     # Multi-county
     county_id: Mapped[Optional[str]] = mapped_column(String(50), default='hillsborough', index=True)
@@ -2210,6 +2215,75 @@ class OutcomeCandidate(Base):
 
     def __repr__(self):
         return f"<OutcomeCandidate(id={self.id}, source='{self.source_type}', event='{self.event_type}')>"
+
+
+class DorSale(Base):
+    """
+    Raw FL DOR SDF (Sale Data File) rows — the statewide standardized sales
+    feed (CDE-07). One row per (county, parcel, recorded sale event) from the
+    per-county CSVs on the DOR data portal; a re-posted roll updates rows in
+    place (this is how a pending QUAL_CD 98/99 gets its final code).
+
+    property_id is resolved at ingestion, set-based: Hillsborough joins
+    properties.strap = parcel_id_dor (verbatim STRAP); Pinellas derives
+    parcel_id_norm via the range/section swap transform and joins
+    properties.parcel_id. Unresolved rows keep property_id NULL here — the SDF
+    carries no address/owner, so the UnmatchedRecord review-queue cascade has
+    nothing extra to work with (a future NAL ingest can re-resolve them).
+    The dor_sale_outcomes connector (CDE-07) reads matched rows and stages
+    OutcomeCandidates.
+    """
+    __tablename__ = "dor_sales"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    co_no: Mapped[int] = mapped_column(Integer, nullable=False)                     # DOR county number (Hillsborough 39, Pinellas 62)
+    parcel_id_dor: Mapped[str] = mapped_column(String(30), nullable=False)          # verbatim SDF PARCEL_ID
+    parcel_id_norm: Mapped[Optional[str]] = mapped_column(String(30))               # derived properties.parcel_id form (Pinellas transform); NULL when not derivable
+    property_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("properties.id"), index=True)
+    match_method: Mapped[Optional[str]] = mapped_column(String(30))                 # 'strap' | 'parcel_transform'
+    state_parcel_id: Mapped[Optional[str]] = mapped_column(String(30))
+    assessment_year: Mapped[Optional[int]] = mapped_column(Integer)
+    dor_uc: Mapped[Optional[str]] = mapped_column(String(10))
+    vi_cd: Mapped[Optional[str]] = mapped_column(String(2))
+    # Natural-key components are '' (never NULL) so the UNIQUE constraint
+    # actually dedupes — Postgres treats NULLs as distinct.
+    or_book: Mapped[str] = mapped_column(String(10), nullable=False, server_default=text("''"))
+    or_page: Mapped[str] = mapped_column(String(10), nullable=False, server_default=text("''"))
+    clerk_no: Mapped[str] = mapped_column(String(30), nullable=False, server_default=text("''"))
+    qual_cd: Mapped[str] = mapped_column(String(5), nullable=False)
+    sal_chg_cd: Mapped[Optional[str]] = mapped_column(String(5))
+    sale_yr: Mapped[int] = mapped_column(Integer, nullable=False)
+    sale_mo: Mapped[int] = mapped_column(Integer, nullable=False)
+    sale_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 2))
+    multi_par_sal: Mapped[Optional[str]] = mapped_column(String(2))
+    roll_tag: Mapped[Optional[str]] = mapped_column(String(20))                     # portal folder, e.g. '2025F'
+    source_file: Mapped[Optional[str]] = mapped_column(String(120))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), onupdate=func.now())
+
+    property: Mapped[Optional["Property"]] = relationship("Property", foreign_keys=[property_id])
+
+    __table_args__ = (
+        UniqueConstraint(
+            "co_no", "parcel_id_dor", "sale_yr", "sale_mo", "clerk_no", "or_book", "or_page",
+            name="uq_dor_sales_natural",
+        ),
+        Index("ix_dor_sales_county_qual", "county_id", "qual_cd"),
+        Index(
+            "ix_dor_sales_unresolved",
+            "county_id",
+            postgresql_where=text("property_id IS NULL"),
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<DorSale(county={self.county_id!r}, parcel={self.parcel_id_dor!r}, "
+            f"{self.sale_yr}-{self.sale_mo:02d}, qual={self.qual_cd!r})>"
+        )
 
 
 # ============================================================================

@@ -754,6 +754,16 @@ COUNTY_ID=hillsborough
 25 8 * * * $PROJECT/scripts/cron/run.sh src.connectors.label_layer --county-id $COUNTY_ID
 26 8 * * * $PROJECT/scripts/cron/run.sh src.connectors.label_layer --county-id pinellas
 
+# dor_sale_outcomes (CDE-07) — monthly, 2nd of month at 09:00/09:01, after the
+# DOR SDF download+ingestion for that period (manual admin upload, not on
+# cron — see src/connectors/dor_sale_outcomes.py). Runs AFTER outcome_label_layer
+# (08:25/08:26) so a same-day DOR ingestion still gets promoted same-day.
+# SLA 131040 min (~91 days + grace — DOR posts 3 rolls/year). enabled=False in
+# registry.py pending go-live decision — this entry is prepared, not yet
+# installed on any real crontab (see report/july-16-report.md).
+0 9 2 * * $PROJECT/scripts/cron/run.sh src.connectors.dor_sale_outcomes --county-id $COUNTY_ID
+1 9 2 * * $PROJECT/scripts/cron/run.sh src.connectors.dor_sale_outcomes --county-id pinellas
+
 # ── CDS SCORING RETUNE (client Q9 — closed loop) ─────────────
 # Weekly Sunday @ 11:00 UTC. Runs B→C→D→E→F end to end: builds the training
 # set, fits per-vertical weights, shadow-rescores, validates, and (only if the

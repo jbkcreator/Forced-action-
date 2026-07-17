@@ -81,6 +81,51 @@ class OutcomeCandidateData:
             )
 
 
+def upsert_outcome_candidates_bulk(session: Session, candidates: list[OutcomeCandidateData]) -> int:
+    """Batch variant of upsert_outcome_candidate — identical conflict semantics,
+    one multi-row statement per _BULK_BATCH instead of one round trip per row.
+    Built for high-volume connectors (DOR stages tens of thousands of
+    qualified sales per roll). Returns the number of rows sent.
+    """
+    _BULK_BATCH = 2_000
+    # Defensive in-batch dedupe on the natural key — a multi-row INSERT that
+    # hits the same key twice raises "cannot affect row a second time".
+    by_key = {
+        (c.source_type, c.source_table, c.source_id, c.event_date): c
+        for c in candidates
+    }
+    rows = [
+        dict(
+            property_id=c.property_id, county_id=c.county_id,
+            source_type=c.source_type, source_table=c.source_table,
+            source_id=c.source_id, event_type=c.event_type,
+            event_date=c.event_date, amount=c.amount,
+            counterparty=c.counterparty, raw_status=c.raw_status,
+            match_confidence=c.match_confidence, match_method=c.match_method,
+        )
+        for c in by_key.values()
+    ]
+    for i in range(0, len(rows), _BULK_BATCH):
+        stmt = pg_insert(OutcomeCandidate).values(rows[i:i + _BULK_BATCH])
+        excluded = stmt.excluded
+        stmt = stmt.on_conflict_do_update(
+            constraint="uq_outcome_candidate",
+            set_=dict(
+                property_id=excluded.property_id,
+                event_type=excluded.event_type,
+                event_date=excluded.event_date,
+                amount=excluded.amount,
+                counterparty=excluded.counterparty,
+                raw_status=excluded.raw_status,
+                match_confidence=excluded.match_confidence,
+                match_method=excluded.match_method,
+                updated_at=func.now(),
+            ),
+        )
+        session.execute(stmt)
+    return len(rows)
+
+
 def upsert_outcome_candidate(session: Session, candidate: OutcomeCandidateData) -> None:
     """
     Upsert one OutcomeCandidate row, keyed on (source_type, source_table,

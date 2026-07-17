@@ -22,8 +22,10 @@ copies from so the number never drifts between files).
 
 Wave-1 connectors (foreclosure_outcomes, tax_deed_outcomes,
 appraiser_sale_outcomes) are `enabled=True` — their modules are deployed and
-running. dor_sale_outcomes stays `enabled=False`: it depends on a DOR raw
-ingestion pipeline that doesn't exist yet.
+running. dor_sales (CDE-07 raw ingestion — 160k+ rows, 99.8% matched) already
+exists and is loaded; dor_sale_outcomes (the outcome connector itself, see
+src/connectors/dor_sale_outcomes.py) stays `enabled=False` until it has been
+run and verified end-to-end — flip to True as the final go-live step.
 """
 from __future__ import annotations
 
@@ -117,11 +119,11 @@ OUTCOME_CONNECTORS: dict[str, ConnectorSpec] = {
     ),
     "dor_sale_outcomes": ConnectorSpec(
         source_type="dor_sale_outcomes",
-        description="Florida DOR statewide sales file — cross-county normalized sales.",
-        reads_table="(new DOR raw ingestion — not yet built)",
+        description="Florida DOR statewide sales file — cross-county normalized qualified sales.",
+        reads_table="dor_sales",
         module="src.connectors.dor_sale_outcomes",
-        cadence="quarterly, per DOR file release",
-        sla_minutes=131_040,  # ~91 days + grace
+        cadence="monthly, after the DOR SDF download (2nd of month)",
+        sla_minutes=131_040,  # ~91 days + grace — DOR posts 3 rolls/year
         off_days=frozenset(),
         enabled=False,
     ),
