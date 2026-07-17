@@ -44,6 +44,7 @@ def _seed_first_touch(fresh_db, sub, phone, *, sent_at):
     outcome = MessageOutcome(
         subscriber_id=sub.id, message_type="sms", template_id="auto_mode_first_text",
         channel="telnyx", sent_at=sent_at,
+        context_snapshot={"phone": phone},
     )
     fresh_db.add(outcome)
     fresh_db.flush()
@@ -99,11 +100,12 @@ class TestAutoModeFollowupSms:
 
         sub, phone = _mk_sub(fresh_db)
         first_touch_sent_at = datetime.now(timezone.utc) - timedelta(days=6)
-        _seed_first_touch(fresh_db, sub, phone, sent_at=first_touch_sent_at)
+        first_touch = _seed_first_touch(fresh_db, sub, phone, sent_at=first_touch_sent_at)
         # Second-touch already fired on a prior sweep run.
         fresh_db.add(MessageOutcome(
             subscriber_id=sub.id, message_type="sms", template_id="auto_mode_second_text",
             channel="telnyx", sent_at=first_touch_sent_at + timedelta(days=2),
+            context_snapshot={"first_touch_id": first_touch.id, "phone": phone},
         ))
         fresh_db.commit()
 

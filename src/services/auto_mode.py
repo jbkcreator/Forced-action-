@@ -173,7 +173,7 @@ def enqueue_action(subscriber_id: int, property_id: int, db: Session) -> dict:
 
     # 2. Send first text — TCPA gate inside send_sms() handles quiet hours.
     body = _compose_first_text(prop, owner)
-    outcome = _record_outcome(subscriber_id, body, db)
+    outcome = _record_outcome(subscriber_id, property_id, owner.phone_1, db)
     result["first_text_outcome_id"] = outcome.id
 
     from src.services.sms_compliance import send_sms
@@ -228,13 +228,16 @@ def _compose_third_text() -> str:
     )[:320]
 
 
-def _record_outcome(subscriber_id: int, body: str, db: Session) -> MessageOutcome:
+def _record_outcome(subscriber_id: int, property_id: int, phone: str, db: Session) -> MessageOutcome:
+    # property_id/phone let the follow-up sweep (auto_mode_followup_sms.py) tell
+    # this lead's first-touch apart from other leads sent to the same subscriber.
     outcome = MessageOutcome(
         subscriber_id=subscriber_id,
         message_type="sms",
         template_id="auto_mode_first_text",
         channel="telnyx",
         sent_at=datetime.now(timezone.utc),
+        context_snapshot={"property_id": property_id, "phone": phone},
     )
     db.add(outcome)
     db.flush()
