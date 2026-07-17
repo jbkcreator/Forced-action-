@@ -715,6 +715,24 @@ COUNTY_ID=hillsborough
 0 8 * * 0 $PROJECT/scripts/cron/run.sh src.connectors.appraiser_sale_outcomes --county-id $COUNTY_ID
 1 8 * * 0 $PROJECT/scripts/cron/run.sh src.connectors.appraiser_sale_outcomes --county-id pinellas
 
+# ── TAX DEED AUCTIONS (scraper) + tax_deed_outcomes (connector) ──────────────
+# Scraper walks the upcoming auction dates (next Thursday + up to 12 ahead) and
+# loads them into tax_deed_auctions. Runs daily just after the foreclosure
+# window so the outcome connector below always has fresh auction rows to mine.
+# Both counties. (Previously unscheduled — the connector was held back to avoid
+# mining stale/empty data; this wires the upstream scraper first, then the
+# connector, in the correct order.)
+50 6 * * * $PROJECT/scripts/cron/run.sh src.scrappers.tax_deed.tax_deed_engine --county-id $COUNTY_ID --walk-dates --load-to-db
+52 6 * * * $PROJECT/scripts/cron/run.sh src.scrappers.tax_deed.tax_deed_engine --county-id pinellas --walk-dates --load-to-db
+#
+# tax_deed_outcomes — daily, AFTER the scraper above (mines already-loaded
+# tax_deed_auctions rows into outcome_candidates). SLA 1500 min (registry.py).
+57 6 * * * $PROJECT/scripts/cron/run.sh src.connectors.tax_deed_outcomes --county-id $COUNTY_ID
+58 6 * * * $PROJECT/scripts/cron/run.sh src.connectors.tax_deed_outcomes --county-id pinellas
+#
+# NOTE: not yet wired into heartbeat_monitor (HEARTBEAT_SLAS / MULTI_COUNTY_SOURCES).
+# Add once both counties are confirmed producing fresh rows on this cadence, so
+# we don't emit false-stale pages before the first scheduled run lands.
 # deed_flip_outcomes — weekly, after the deed loader (07:45 hillsborough /
 # 07:46 pinellas). SLA 10140 min (~7 days).
 2 8 * * 0 $PROJECT/scripts/cron/run.sh src.connectors.deed_flip_outcomes --county-id $COUNTY_ID

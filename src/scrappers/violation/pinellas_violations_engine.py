@@ -755,7 +755,7 @@ def scrape_pinellas_violations(
 
     try:
         record_scraper_stats(
-            source_type="violations_pinellas",
+            source_type="violations",
             county_id=county_id,
             total_scraped=total_scraped,
             matched=total_matched,
