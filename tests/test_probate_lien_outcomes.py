@@ -169,6 +169,35 @@ class TestStageOutcomesPG:
         ).first()
         assert row is None
 
+    def test_mortgage_after_filing_is_not_a_sale(self, fresh_db):
+        # Mortgage/deed-of-trust rows share the deeds table, commonly with a
+        # NULL sale_price -- must never be staged as the resolving sale.
+        prop = _mk_property(fresh_db, "PL-007")
+        _mk_probate(fresh_db, prop.id, "PROB-CASE-007", filing_date=date(2025, 1, 1))
+        _mk_deed(fresh_db, prop.id, "PROB-MTG-007", record_date=date(2025, 6, 1),
+                 sale_price=None, mortgage_amount=Decimal("150000.00"))
+
+        result = stage_outcomes(fresh_db, "test-plo")
+        assert result.errors == 0
+
+        row = fresh_db.execute(
+            text("SELECT id FROM outcome_candidates WHERE property_id = :pid"),
+            {"pid": prop.id},
+        ).first()
+        assert row is None
+
+        # A genuine sale after the mortgage still resolves it.
+        _mk_deed(fresh_db, prop.id, "PROB-DEED-007", record_date=date(2026, 1, 1))
+        result = stage_outcomes(fresh_db, "test-plo")
+        assert result.errors == 0
+
+        rows = fresh_db.execute(
+            text("SELECT raw_status FROM outcome_candidates WHERE property_id = :pid"),
+            {"pid": prop.id},
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0].raw_status == "PROB-DEED-007"
+
     def test_rerun_is_idempotent(self, fresh_db):
         prop = _mk_property(fresh_db, "PL-006")
         _mk_probate(fresh_db, prop.id, "PROB-CASE-006")

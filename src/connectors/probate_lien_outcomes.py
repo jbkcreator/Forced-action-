@@ -37,13 +37,18 @@ SOURCE_TYPE = "probate_lien_outcomes"
 
 # ponytail: '%quit%' ILIKE covers quit/quitclaim/quit claim — same exclusion
 # CDE-03's classify_deed encodes; converge on importing it if divergence appears.
+# mortgage_amount IS NOT NULL marks mortgage/deed-of-trust rows (models.py:551) --
+# those aren't ownership transfers and commonly carry a NULL sale_price, so a
+# NULL/low price alone can't qualify a row; require a real sale_price >= 100
+# and exclude anything the loader flagged as a mortgage document.
 _RESALE_JOIN = (
     "LEFT JOIN LATERAL ("
     "  SELECT d.instrument_number, d.record_date, d.sale_price"
     "  FROM deeds d"
     "  WHERE d.property_id = s.property_id"
     "    AND d.record_date > s.filing_date"
-    "    AND (d.sale_price IS NULL OR d.sale_price >= 100)"
+    "    AND d.sale_price >= 100"
+    "    AND d.mortgage_amount IS NULL"
     "    AND (d.deed_type IS NULL OR d.deed_type NOT ILIKE '%quit%')"
     "  ORDER BY d.record_date ASC LIMIT 1"
     ") r ON true"
