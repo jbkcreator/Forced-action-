@@ -94,10 +94,25 @@ def test_request_then_verify_opens_feed(client, fresh_db, monkeypatch):
     assert r2.status_code == 200, r2.text
     body = r2.json()
     assert body["feed_uuid"] == sub.event_feed_uuid
+    assert body["vertical"] == sub.vertical
     token = body["access_token"]
 
     r3 = client.get(f"/api/feed/{sub.event_feed_uuid}", headers={"Authorization": f"Bearer {token}"})
     assert r3.status_code == 200, r3.text
+
+
+def test_verify_returns_investor_vertical_for_ui_routing(client, fresh_db, monkeypatch):
+    """T-B3-02: the UI's postSignupRoute helper branches on this field to send
+    investor signups to /deals/submit instead of the dashboard."""
+    sub = _make_subscriber(fresh_db, email=f"ml_f_{uuid.uuid4().hex[:6]}@e.com")
+    sub.vertical = "investor"
+    fresh_db.flush()
+    captured = _capture_magic_link_email(monkeypatch)
+
+    client.post("/api/subscriber/magic-link/request", json={"email": sub.email})
+    r = client.post("/api/subscriber/magic-link/verify", json={"token": captured["token"]})
+    assert r.status_code == 200, r.text
+    assert r.json()["vertical"] == "investor"
 
 
 def test_reused_token_rejected(client, fresh_db, monkeypatch):
