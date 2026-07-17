@@ -426,6 +426,42 @@ def enrich_llc_owners(
     return stats
 
 
+def sunbiz_run_verdict(stats: dict) -> Tuple[bool, Optional[str], Optional[str]]:
+    """Single source of truth for a Sunbiz run's health verdict.
+
+    Returns ``(run_success, error_type, error_message)``. Three outcomes:
+
+      - **rate_limited** — Sunbiz throttled the session (circuit breaker tripped
+        on consecutive timeouts). Unprocessed owners keep sunbiz_status='pending'
+        and resume next run, so this is informational: ``run_success=True``.
+      - **broken** — failures are frequent (``failed >= 3`` AND ``> 15%`` rate),
+        i.e. a real site-wide problem: ``run_success=False``.
+      - **healthy** — everything else, including the routine 1-2 no-match /
+        one-off Playwright hiccups seen at ~200 owners/day: ``run_success=True``.
+
+    Both entry points (the ``sunbiz_enrichment`` cron task and this standalone
+    engine) call this, so the verdict can never drift. It did drift before: the
+    cron task used a zero-tolerance ``failed == 0`` rule and false-alarmed every
+    single day while enriching ~198/200 owners.
+    """
+    if stats.get("rate_limited"):
+        return True, "rate_limited", (
+            f"Circuit breaker tripped after {_CIRCUIT_BREAKER_THRESHOLD} "
+            f"consecutive timeouts — aborted with "
+            f"{stats.get('remaining_unprocessed', 0)} owner(s) unprocessed; "
+            f"will resume next run"
+        )
+    processed = stats.get("processed", 0)
+    failed = stats.get("failed", 0)
+    failure_rate = failed / processed if processed else 0
+    if failed >= 3 and failure_rate > 0.15:
+        return False, "scraper_error", (
+            f"{failed} owner(s) failed Playwright scrape "
+            f"({failure_rate:.0%} failure rate)"
+        )
+    return True, None, None
+
+
 def run_sunbiz_pipeline(
     limit: int = 0,
     dry_run: bool = False,
@@ -480,49 +516,18 @@ def run_sunbiz_pipeline(
         try:
             from src.utils.scraper_db_helper import record_scraper_stats
 
-            if stats.get("rate_limited"):
-                # Not a code bug — Sunbiz throttled this session after repeated
-                # hard timeouts. Untouched owners stay sunbiz_status='pending'
-                # and are picked up automatically by tomorrow's run, so this is
-                # informational for the health check, not an actionable error.
-                record_scraper_stats(
-                    source_type="sunbiz",
-                    total_scraped=stats["processed"],
-                    matched=stats["enriched"],
-                    unmatched=stats["skipped"],
-                    skipped=0,
-                    run_success=True,
-                    error_type="rate_limited",
-                    error_message=(
-                        f"Circuit breaker tripped after {_CIRCUIT_BREAKER_THRESHOLD} "
-                        f"consecutive timeouts — aborted with "
-                        f"{stats.get('remaining_unprocessed', 0)} owner(s) unprocessed; "
-                        f"will resume next run"
-                    ),
-                    county_id=county_id,
-                )
-            else:
-                # Individual owners routinely have no Sunbiz match, or hit a
-                # one-off Playwright hiccup, at this volume — only flag the
-                # day when failures are frequent enough to suggest a real
-                # problem rather than "any single owner failed."
-                failure_rate = stats["failed"] / stats["processed"] if stats["processed"] else 0
-                run_success = not (stats["failed"] >= 3 and failure_rate > 0.15)
-                record_scraper_stats(
-                    source_type="sunbiz",
-                    total_scraped=stats["processed"],
-                    matched=stats["enriched"],
-                    unmatched=stats["skipped"],
-                    skipped=0,
-                    run_success=run_success,
-                    error_type=None if run_success else "scraper_error",
-                    error_message=(
-                        None if run_success else
-                        f"{stats['failed']} owner(s) failed Playwright scrape "
-                        f"({failure_rate:.0%} failure rate)"
-                    ),
-                    county_id=county_id,
-                )
+            run_success, error_type, error_message = sunbiz_run_verdict(stats)
+            record_scraper_stats(
+                source_type="sunbiz",
+                total_scraped=stats["processed"],
+                matched=stats["enriched"],
+                unmatched=stats["skipped"],
+                skipped=0,
+                run_success=run_success,
+                error_type=error_type,
+                error_message=error_message,
+                county_id=county_id,
+            )
         except Exception as e:
             logger.warning("[Sunbiz] Could not record scraper stats: %s", e)
 

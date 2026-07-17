@@ -154,7 +154,12 @@ def run(
                 f"skipped={stats['skipped']} failed={stats['failed']}"
             )
             from src.utils.scraper_db_helper import record_scraper_stats
-            run_success = stats["failed"] == 0
+            from src.scrappers.sunbiz.sunbiz_engine import sunbiz_run_verdict
+
+            # Shared verdict with the standalone engine — tolerant of the routine
+            # 1-2 no-match/one-off Playwright failures at 200 owners/day. The old
+            # zero-tolerance `stats["failed"] == 0` rule false-alarmed daily.
+            run_success, error_type, error_message = sunbiz_run_verdict(stats)
             record_scraper_stats(
                 source_type="sunbiz",
                 total_scraped=stats["processed"],
@@ -162,8 +167,8 @@ def run(
                 unmatched=stats["skipped"],
                 skipped=0,
                 run_success=run_success,
-                error_type=None if run_success else "scraper_error",
-                error_message=None if run_success else f"{stats['failed']} owner(s) failed Playwright scrape",
+                error_type=error_type,
+                error_message=error_message,
                 county_id=county_id,
             )
 
