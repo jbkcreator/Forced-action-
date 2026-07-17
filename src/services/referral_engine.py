@@ -46,7 +46,18 @@ def ensure_referral_code(subscriber_id: int, db: Session) -> str:
     return code
 
 
-def process_signup(referee_id: int, referral_code: str, db: Session) -> Optional[ReferralEvent]:
+def process_signup(
+    referee_id: int,
+    referral_code: str,
+    db: Session,
+    prompt_funnel_id: Optional[int] = None,
+) -> Optional[ReferralEvent]:
+    """Record a pending referral for a new signup.
+
+    `prompt_funnel_id` (decoded from the `pt` attribution token on the share
+    link) binds this referral to the exact proactive-prompt funnel row that
+    drove it, so mark_confirmed() credits the right prompt on purchase.
+    """
     referrer = db.execute(
         select(Subscriber).where(Subscriber.referral_code == referral_code)
     ).scalar_one_or_none()
@@ -63,6 +74,7 @@ def process_signup(referee_id: int, referral_code: str, db: Session) -> Optional
         status="pending",
         reward_type="credits",
         reward_value="5",
+        prompt_funnel_id=prompt_funnel_id,
     )
     db.add(event)
     db.flush()

@@ -85,3 +85,58 @@ def decode_landing_token(token: str) -> Optional[dict]:
     if "sub_id" not in payload:
         return None
     return payload
+
+
+_PROMPT_KIND = "referral_prompt"
+
+
+def encode_prompt_attribution_token(funnel_id: int, ttl_days: int = 90) -> Optional[str]:
+    """Sign a referral-prompt attribution token binding a share link to the
+    exact referral_prompt_funnel row that generated it.
+
+    Carries only the funnel row id (no PII). Returns None if no secret is
+    configured, so the caller falls back to a plain, un-attributed share URL
+    instead of crashing.
+    """
+    secret = _secret()
+    if not secret:
+        logger.warning(
+            "encode_prompt_attribution_token: no signing secret — "
+            "share link will be un-attributed",
+        )
+        return None
+    now = datetime.now(timezone.utc)
+    payload = {
+        "pf": int(funnel_id),
+        "kind": _PROMPT_KIND,
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(days=ttl_days)).timestamp()),
+    }
+    try:
+        return jwt.encode(payload, secret, algorithm=_ALG)
+    except Exception as exc:
+        logger.error("encode_prompt_attribution_token failed for funnel=%s: %s", funnel_id, exc)
+        return None
+
+
+def decode_prompt_attribution_token(token: str) -> Optional[int]:
+    """Verify + decode a referral-prompt attribution token. Returns the funnel
+    row id on success, None on bad signature / expired / wrong kind / no secret.
+    """
+    if not token:
+        return None
+    secret = _secret()
+    if not secret:
+        return None
+    try:
+        payload = jwt.decode(token, secret, algorithms=[_ALG])
+    except JWTError as exc:
+        logger.info("decode_prompt_attribution_token rejected: %s", exc)
+        return None
+    if payload.get("kind") != _PROMPT_KIND:
+        return None
+    pf = payload.get("pf")
+    try:
+        return int(pf) if pf is not None else None
+    except (TypeError, ValueError):
+        return None

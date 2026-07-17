@@ -317,6 +317,9 @@ def build_wave1_graph() -> StateGraph:
 
 def run_wave1(event_payload: Dict[str, Any], subscriber_id: int,
 			  decision_id: Optional[str] = None) -> Dict[str, Any]:
+	from config.settings import get_settings
+	if not get_settings().freemium_funnel_enabled:
+		return {"skipped": "freemium_funnel_disabled", "wave": "wave1"}
 	graph = build_wave1_graph().compile()
 	final = graph.invoke({
 		"decision_id": decision_id or str(uuid.uuid4()),
@@ -464,6 +467,9 @@ def run_wave2(event_payload: Dict[str, Any], subscriber_id: int,
 	decision_id must match the Wave 1 decision so the audit log reflects one
 	end-to-end abandonment record.
 	"""
+	from config.settings import get_settings
+	if not get_settings().freemium_funnel_enabled:
+		return {"skipped": "freemium_funnel_disabled", "wave": "wave2"}
 	graph = build_wave2_graph().compile()
 	final = graph.invoke({
 		"decision_id": decision_id,

@@ -178,6 +178,49 @@ def test_wave2_with_decision_id_routes_through():
 	assert mock_runner.call_args.kwargs["decision_id"] == "shared-uuid"
 
 
+def test_duplicate_new_lead_signup_is_deduped_by_stable_key(fresh_db):
+	"""PR #140 issue 5: signup publishes new_lead_signup with decision_id equal
+	to its idempotency_key, so the supervisor's dedup (which looks up
+	agent_decisions.decision_id by the idempotency key) matches on redelivery
+	and the graph runner never fires a second call for the same lead."""
+	import uuid as _uuid
+
+	from sqlalchemy import text
+
+	from src.core.models import AgentDecision
+
+	stable_key = f"new_lead_signup:{_uuid.uuid4().hex[:8]}"
+	# Simulate the first delivery having already completed: a row whose
+	# decision_id equals the stable idempotency key.
+	fresh_db.add(AgentDecision(
+		decision_id=stable_key, graph_name="new_lead_voice_call",
+		event_type="new_lead_signup", terminal_status="completed",
+		summary={"sent": True},
+	))
+	fresh_db.commit()
+
+	mock_runner, original = _patch_spec_runner(
+		"new_lead_signup", return_value={"terminal_status": "completed"},
+	)
+	try:
+		with patch("src.agents.supervisor.log_decision"):
+			r = dispatch_event({
+				"event_type": "new_lead_signup",
+				"subscriber_id": 42,
+				"decision_id": stable_key,
+				"idempotency_key": stable_key,
+				"payload": {"vertical": "roofing"},
+			})
+	finally:
+		_restore_spec("new_lead_signup", original)
+		fresh_db.execute(text("DELETE FROM agent_decisions WHERE decision_id = :k"),
+		                 {"k": stable_key})
+		fresh_db.commit()
+
+	assert r["outcome"] == "dropped_duplicate"
+	mock_runner.assert_not_called()
+
+
 def test_feedback_ritual_candidate_routes_to_feedback_ritual_processor():
 	with patch("src.agents.supervisor.log_decision"), \
 		 patch("src.agents.supervisor.db") as mock_db, \
@@ -196,3 +239,39 @@ def test_feedback_ritual_candidate_routes_to_feedback_ritual_processor():
 	# Must run inside db.session_scope() (db has no .session) and pass that session.
 	expected_session = mock_db.session_scope.return_value.__enter__.return_value
 	mock_process.assert_called_once_with(expected_session, "dec-777", actor="system")
+
+
+def test_unlock_purchased_routes_to_nudge_conversion_recorder():
+	with patch("src.agents.supervisor.log_decision"), \
+		 patch("src.agents.supervisor.db") as mock_db, \
+		 patch("src.services.nudge_conversion.record_nudge_conversion") as mock_record:
+		r = dispatch_event({
+			"event_type": "unlock_purchased",
+			"subscriber_id": 55,
+			"payload": {"property_id": 9001, "product": "hot_lead_unlock", "revenue": 99.0},
+		})
+
+	assert r["outcome"] == "routed"
+	assert r["graph_name"] == "unlock_outcome_recorder"
+	# Must run inside db.session_scope() (db has no .session) and pass that session.
+	expected_session = mock_db.session_scope.return_value.__enter__.return_value
+	mock_record.assert_called_once_with(
+		55, conversion_type="unlock", revenue=99.0, db=expected_session,
+	)
+
+
+def test_unlock_purchased_still_routes_when_recorder_fails():
+	"""A nudge-recording failure must not turn an unlock_purchased event into
+	an unknown_event_type drop — it always short-circuits before that lookup."""
+	with patch("src.agents.supervisor.log_decision"), \
+		 patch("src.agents.supervisor.db") as mock_db, \
+		 patch("src.services.nudge_conversion.record_nudge_conversion",
+			   side_effect=RuntimeError("boom")):
+		r = dispatch_event({
+			"event_type": "unlock_purchased",
+			"subscriber_id": 55,
+			"payload": {"property_id": 9001},
+		})
+
+	assert r["outcome"] == "routed"
+	assert r["graph_name"] == "unlock_outcome_recorder"

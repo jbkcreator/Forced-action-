@@ -11,6 +11,7 @@ IVR opt-out: record_ivr_opt_out() writes to sms_opt_outs with
 Timezone: derived from ZIP centroid (FL ZIPs); area-code fallback for unknown.
 """
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -21,6 +22,8 @@ from sqlalchemy.orm import Session
 
 from config.settings import get_settings
 from src.services.phone_utils import normalize as normalize_phone
+
+logger = logging.getLogger(__name__)
 
 # Area code → IANA timezone. Mirrors sms_compliance._AREA_CODE_TZ.
 # 850 (panhandle) maps to CST — conservative (over-suppresses, avoids TCPA violation).
@@ -143,6 +146,35 @@ def _as_aware_utc(value) -> Optional[datetime]:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
+
+
+def has_voice_consent(subscriber_id: int, db: Session) -> bool:
+    """
+    B0-06: PEWC gate for automated AI voice calls (47 CFR 64.1200(f)(9) +
+    FCC Feb-2024 AI-voice ruling — see docs/adr/0030). Distinct from the
+    generic marketing consent; a subscriber without a stored voice_consent_at
+    row must never receive an automated call.
+    """
+    try:
+        row = db.execute(
+            text("""
+                SELECT 1 FROM consent_acceptances
+                WHERE subscriber_id = :sid
+                  AND voice_consent_at IS NOT NULL
+                  AND voice_consent_text IS NOT NULL
+                  AND voice_consent_version IS NOT NULL
+                LIMIT 1
+            """),
+            {"sid": subscriber_id},
+        ).fetchone()
+    except Exception:
+        # Fail closed — a lookup error must never let an unconsented call fire.
+        logger.error(
+            "has_voice_consent lookup failed for subscriber=%s — blocking call",
+            subscriber_id, exc_info=True,
+        )
+        return False
+    return row is not None
 
 
 def record_ivr_opt_out(phone: str, db: Session) -> None:

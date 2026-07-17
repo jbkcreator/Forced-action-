@@ -279,6 +279,21 @@ def fulfill_purchase(db, purchase) -> str:
                 purchase_id, exc_info=True,
             )
 
+        try:
+            with db.begin_nested():
+                from src.services.referral_prompt_service import maybe_send_referral_prompt
+                maybe_send_referral_prompt(
+                    subscriber, db,
+                    trigger_type="lead_pack_delivery",
+                    trigger_source_table="lead_pack_purchases",
+                    trigger_source_id=purchase.id,
+                )
+        except Exception:
+            logger.warning(
+                "[LeadPackSweep] referral prompt failed for purchase %s",
+                purchase_id, exc_info=True,
+            )
+
         logger.info(
             "[LeadPackSweep] DELIVERED purchase %s (%d leads) to subscriber %s",
             purchase_id, len(lead_ids), purchase.subscriber_id,

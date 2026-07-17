@@ -126,6 +126,34 @@ def test_wave2_early_exit_when_user_already_converted():
 	mock_cc.assert_not_called()
 
 
+def test_wave2_early_exit_when_recent_message_stamped_unlock_conversion():
+	"""D7: a hot-lead unlock between Wave 1 and Wave 2 stamps a
+	message_outcomes row with conversion_type='unlock' (via
+	record_nudge_conversion) — Wave 2 must read that stamp and self-skip,
+	exactly like the has_saved_card path already covered above."""
+	unconverted_profile = {**_FAKE_PROFILE, "has_saved_card": False}
+	with patch("src.agents.graphs.abandonment.get_subscriber_profile",
+			   return_value=unconverted_profile), \
+		 patch("src.agents.graphs.abandonment.get_wallet_state",
+			   return_value={"enrolled": False, "credits_remaining": 0}), \
+		 patch("src.agents.graphs.abandonment.get_zip_activity",
+			   return_value={"active_viewers": 0}), \
+		 patch("src.agents.graphs.abandonment.get_recent_messages",
+			   return_value=[{"conversion_type": "unlock"}]), \
+		 patch("src.agents.graphs.abandonment.get_segment_and_score",
+			   return_value=_FAKE_SEGMENT), \
+		 patch("src.agents.subgraphs.compose_and_send.call_claude_with_usage") as mock_cc:
+		r = run_wave2(
+			event_payload={"lead_tier_viewed": "Gold"},
+			subscriber_id=107,
+			decision_id=str(uuid.uuid4()),
+		)
+	assert r["terminal_status"] == "completed"
+	assert r["wave1_already_converted"] is True
+	assert r["failure_reason"] == "wave2_skipped_user_already_converted"
+	mock_cc.assert_not_called()
+
+
 def test_wave2_sends_when_user_has_not_converted():
 	patches = _happy_mocks() + [
 		patch("src.agents.graphs.abandonment.get_recent_messages", return_value=[]),

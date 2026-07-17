@@ -82,7 +82,43 @@ class ConsentAcceptanceRequest(BaseModel):
     tcpa_accepted: Optional[bool] = Field(default=False, alias="tcpa_accepted")
     tcpa_consent_text: Optional[str] = None
     tcpa_consent_version: Optional[str] = None
+    # B0-06: PEWC voice-call consent — distinct from tcpa_accepted (marketing).
+    # Never a condition of purchase; defaults unchecked (47 CFR 64.1200(f)(9)).
+    voice_consent_accepted: Optional[bool] = Field(default=False, alias="voice_consent_accepted")
+    voice_consent_text: Optional[str] = None
+    voice_consent_version: Optional[str] = None
     user_agent: Optional[str] = None
+
+
+# B0-06: server-owned PEWC voice-call disclosure text, keyed by version. The
+# client only asserts which version it displayed — never trust client-supplied
+# disclosure text, or the audit record can't prove what was actually disclosed.
+VOICE_CONSENT_DISCLOSURES: dict[str, str] = {
+    "2026.06": (
+        "By checking this box, you agree that ForcedAction and its partners may "
+        "contact you using an automated telephone dialing system and/or "
+        "artificial or prerecorded voice at the phone number provided, "
+        "including calls placed by an AI voice assistant, to discuss your "
+        "account and available leads. Consent is not required to purchase. "
+        "Message/data rates may apply."
+    ),
+}
+
+
+def resolve_voice_consent(consent: Optional[ConsentAcceptanceRequest]) -> Optional[tuple[str, str]]:
+    """Validate a client's voice-consent claim against the server-owned registry.
+
+    Returns (disclosure_text, version) if the client asserted acceptance of a
+    recognized version, else None. Callers must treat None as "no voice
+    consent" — never a reason to block the surrounding signup/checkout flow.
+    """
+    if not consent or not consent.voice_consent_accepted:
+        return None
+    version = consent.voice_consent_version
+    text = VOICE_CONSENT_DISCLOSURES.get(version) if version else None
+    if not text:
+        return None
+    return text, version
 
 
 # ---------------------------------------------------------------------------

@@ -67,6 +67,16 @@ COUNTY_ID=hillsborough
 #     Daily cadence ensures Sunday-scheduled auctions are captured the same day.
 15 6 * * * $PROJECT/scripts/cron/run.sh src.scrappers.foreclosures.foreclosure_engine --date $(date +\%Y-\%m-\%d) --load-to-db --county-id $COUNTY_ID
 
+# 10b. Tax Deed Auctions — 05:30/05:35 AM UTC Mon-Sat (registry off_days: Sunday).
+#      Both counties use the same realtaxdeed.com platform (URL from county_sources).
+#      Starts at yesterday's date so just-completed auctions are re-scraped with
+#      their final result (status/sold_amount/sold_to — the loader updates
+#      existing cases in place), then --walk-dates follows next-auction links to
+#      keep the upcoming calendar fresh (max 12 dates). Date format MM/DD/YYYY.
+#      Feeds the tax_deed_outcomes connector at 06:47/06:48 below.
+30 5 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.tax_deed.tax_deed_engine --date $(date -d "1 day ago" +\%m/\%d/\%Y) --walk-dates --load-to-db --county-id $COUNTY_ID
+35 5 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.tax_deed.tax_deed_engine --date $(date -d "1 day ago" +\%m/\%d/\%Y) --walk-dates --load-to-db --county-id pinellas
+
 # 11. Roofing Permits (classify from building_permits) — 06:17 AM UTC / 02:17 AM EDT / 11:47 AM IST
 17 6 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.roofing_permits.roofing_permit_engine --county-id $COUNTY_ID
 
@@ -441,6 +451,10 @@ COUNTY_ID=hillsborough
 # went 24h+ without a reply (tags GHL contact for Synthflow workflow).
 */30 * * * * $PROJECT/scripts/cron/run.sh src.tasks.auto_mode_followup
 
+# Auto Mode follow-up SMS (2nd/3rd touch) — hourly. Day-level cadence
+# thresholds don't need 30-min precision like the VM sweep above.
+0 * * * * $PROJECT/scripts/cron/run.sh src.tasks.auto_mode_followup_sms
+
 # Annual push — daily 08:00 UTC. Covers all triggers:
 # charter_day_7, day_10_14, two_deals, spend_250, deal_win_10k, auto_switch_day_60.
 # Big-deal-win path also fires inline from /api/deal-capture for instant conversion.
@@ -580,6 +594,12 @@ COUNTY_ID=hillsborough
 # SMS + writes a learning_card row.
 0 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.ab_rollback_check
 
+# Frozen control holdout surfacing — daily 09:00 UTC (Task 4.1). Walks
+# active *_holdout AbTests; on a proven verdict (variant beats frozen
+# control >2σ, >=30/arm) writes a cora_playbook recommendation + a
+# holdout_result learning_card. No auto-promote — a human adopts.
+0 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.cora_holdout_check
+
 # Cora attribution rollout monitor — every 2 min. Evaluates cora_attribution_v1
 # rollout arm: if variant conversion rate is >2σ worse than control over a
 # rolling 48h window (>=30/arm), rolls back AbTest.status='rolled_back',
@@ -600,6 +620,13 @@ COUNTY_ID=hillsborough
 # daily decision_id key; 7-day manual_action_log dedup is the terminal guard.
 # See ADR 0010 for the SLA/detection rationale.
 */2 * * * * $PROJECT/scripts/cron/run.sh src.tasks.synthflow_voice_drop_sweep
+
+# New-lead <5-min outbound call SLA-timeout sweep — every 2 minutes. Fires
+# the owner_alert + Slack fallback if a new-lead signup's voice call hasn't
+# dispatched within the SLA buffer. Runs independent of the agents process —
+# it only reads subscribers/agent_decisions, so it still catches the failure
+# case even if src.agents --serve itself is down.
+*/2 * * * * $PROJECT/scripts/cron/run.sh src.tasks.new_lead_call_sweep
 
 # Stripe recovery sequence (Day 1 + Day 3) — daily 16:00 UTC, after proactive_save at 10:00.
 0 16 * * * $PROJECT/scripts/cron/run.sh src.tasks.stripe_recovery_sweep
@@ -688,6 +715,16 @@ COUNTY_ID=hillsborough
 0 8 * * 0 $PROJECT/scripts/cron/run.sh src.connectors.appraiser_sale_outcomes --county-id $COUNTY_ID
 1 8 * * 0 $PROJECT/scripts/cron/run.sh src.connectors.appraiser_sale_outcomes --county-id pinellas
 
+# deed_flip_outcomes — weekly, after the deed loader (07:45 hillsborough /
+# 07:46 pinellas). SLA 10140 min (~7 days).
+2 8 * * 0 $PROJECT/scripts/cron/run.sh src.connectors.deed_flip_outcomes --county-id $COUNTY_ID
+3 8 * * 0 $PROJECT/scripts/cron/run.sh src.connectors.deed_flip_outcomes --county-id pinellas
+
+# probate_lien_outcomes — weekly, after the probate/lien loaders (07:45
+# hillsborough / 07:46 pinellas). SLA 10140 min (~7 days).
+4 8 * * 0 $PROJECT/scripts/cron/run.sh src.connectors.probate_lien_outcomes --county-id $COUNTY_ID
+5 8 * * 0 $PROJECT/scripts/cron/run.sh src.connectors.probate_lien_outcomes --county-id pinellas
+
 # tax_deed_outcomes is enabled=True in registry.py but INTENTIONALLY NOT
 # scheduled here yet: its documented cadence is "daily, after the tax-deed
 # scraper", but no tax-deed auction scraper cron entry exists anywhere in
@@ -696,6 +733,19 @@ COUNTY_ID=hillsborough
 # before that upstream job runs on a real cadence would stage outcomes
 # against stale/empty tax_deed_auctions data and report false "success".
 # Add this once the tax-deed scraper itself has a cron line above.
+# tax_deed_outcomes — daily Mon-Sat, after the tax-deed scraper (05:30
+# hillsborough / 05:35 pinellas, entry 10b above). SLA 1500 min, off Sunday
+# (registry off_days={6} — the scraper doesn't run Sundays either).
+47 6 * * 1-6 $PROJECT/scripts/cron/run.sh src.connectors.tax_deed_outcomes --county-id $COUNTY_ID
+48 6 * * 1-6 $PROJECT/scripts/cron/run.sh src.connectors.tax_deed_outcomes --county-id pinellas
+
+# outcome_label_layer (CDE-10) — daily, every day, AFTER all staging is done
+# for the day: weekday connectors finish by 06:48; the Sunday appraiser
+# connector stages at 08:00-08:01. 08:25 covers both. Promotes unconsumed
+# outcome_candidates into deal_outcomes (subscriber_id NULL,
+# confidence_tier public_record_inferred). SLA 1500 min.
+25 8 * * * $PROJECT/scripts/cron/run.sh src.connectors.label_layer --county-id $COUNTY_ID
+26 8 * * * $PROJECT/scripts/cron/run.sh src.connectors.label_layer --county-id pinellas
 
 # ── CDS SCORING RETUNE (client Q9 — closed loop) ─────────────
 # Weekly Sunday @ 11:00 UTC. Runs B→C→D→E→F end to end: builds the training
