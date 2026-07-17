@@ -8,10 +8,12 @@ nurture). Capture is NOT done here — rows are created at their real source:
 the pre_payment path at /api/checkout session creation, and the
 session_expired path by the checkout.session.expired webhook.
 
-Touch sends and fail-transitions only happen when
-settings.checkout_recovery_enabled is true; otherwise the sweep logs what it
-would send/fail instead of acting, so it can be scheduled before messaging is
-switched on.
+Touch sends and fail-transitions only happen when settings.checkout_recovery_enabled
+is true (and, for lead_pack rows specifically, checkout_recovery_lead_pack_enabled);
+otherwise the sweep logs what it would send/fail instead of acting, so it can be
+scheduled before messaging is switched on. The founder alert (B1-04) fires once per
+episode on the first confirmed-abandonment touch regardless of either flag —
+suppressed only by --dry-run.
 
     python -m src.tasks.checkout_recovery_sweep
     python -m src.tasks.checkout_recovery_sweep --dry-run
@@ -78,6 +80,7 @@ def run_sweep(dry_run: bool = False) -> dict:
     sends_on = settings.checkout_recovery_enabled and not dry_run
     now = datetime.now(timezone.utc)
     sent = failed = skipped = undelivered = 0
+    alerted_founder = False
 
     with get_db_context() as db:
         # Claim active rows with FOR UPDATE SKIP LOCKED so overlapping cron runs
@@ -101,8 +104,24 @@ def run_sweep(dry_run: bool = False) -> dict:
                 skipped += 1
                 continue
 
+            # Founder alert (B1-04): fires once, at the first confirmed
+            # abandonment touch (payment success would already have closed
+            # this row via mark_recovered). Independent of
+            # checkout_recovery_enabled/lead-pack-dunning — it sends nothing
+            # to the buyer — but suppressed on an explicit --dry-run.
+            if not dry_run and row.touches_sent == 0 and row.founder_alerted_at is None:
+                checkout_recovery.alert_founder(row.email, row.source, row.phone)
+                row.founder_alerted_at = now
+                alerted_founder = True
+
+            # lead_pack customer-facing dunning is separately opt-in — the
+            # founder alert above fires regardless of this flag.
+            row_sends_on = sends_on and (
+                row.source != "lead_pack" or settings.checkout_recovery_lead_pack_enabled
+            )
+
             if action == "fail":
-                if not sends_on:
+                if not row_sends_on:
                     logger.info("[recovery-sweep] would FAIL email=%s (flag off/dry-run)", row.email)
                     skipped += 1
                     continue
@@ -113,7 +132,7 @@ def run_sweep(dry_run: bool = False) -> dict:
             # action == "send"
             touch_number = (row.touches_sent or 0) + 1
             resume_url = checkout_recovery.build_resume_url(settings.app_base_url, row.resume_context)
-            if not sends_on:
+            if not row_sends_on:
                 logger.info(
                     "[recovery-sweep] would SEND touch#%d email=%s url=%s (flag off/dry-run)",
                     touch_number, row.email, resume_url,
@@ -134,7 +153,7 @@ def run_sweep(dry_run: bool = False) -> dict:
                     touch_number, row.email,
                 )
 
-        if sends_on:
+        if sends_on or alerted_founder:
             db.commit()
 
     result = {"sent": sent, "failed": failed, "skipped": skipped, "undelivered": undelivered, "sends_enabled": sends_on}

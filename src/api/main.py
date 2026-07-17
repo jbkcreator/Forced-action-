@@ -3606,10 +3606,12 @@ def lead_pack_checkout(payload: LeadPackCheckoutRequest, request: Request, db: S
     # Abandoned-checkout recovery (Task 7): a lead pack has no Stripe Checkout
     # Session (it's a PaymentIntent), so there's no session.expired signal —
     # capture the intent now and close it on the success webhook. Best-effort;
-    # never block the checkout response. Messaging is flag-gated in the sweep.
-    # Off by default: lead-pack abandoners are existing paying subscribers, so
-    # we don't dun them unless checkout_recovery_lead_pack_enabled is set.
-    if subscriber.email and _s.checkout_recovery_lead_pack_enabled:
+    # never block the checkout response. Customer-facing dunning is flag-gated
+    # in the sweep (checkout_recovery_lead_pack_enabled, off by default since
+    # lead-pack abandoners are existing paying subscribers); the founder alert
+    # is independent of that flag and always fires once abandonment is
+    # confirmed.
+    if subscriber.email:
         try:
             from src.services import checkout_recovery
             checkout_recovery.start_recovery(
