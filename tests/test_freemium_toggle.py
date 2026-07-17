@@ -118,3 +118,61 @@ def test_status_endpoint_survives_kill_switch_failure(funnel_on):
 
     assert result["legs"]["abandonment"]["gates"]["first_payment_rate"] == "unknown"
     assert result["legs"]["abandonment"]["effective"] == "ON"
+
+
+def _mk_payment_intent_request(product="lead_unlock", property_id=42):
+    return MagicMock(
+        feed_uuid="fake-feed-uuid",
+        amount_cents=400,
+        description="Unlock lead",
+        save_card=False,
+        metadata={"product": product, "property_id": property_id},
+        attribution=None,
+    )
+
+
+def test_lead_unlock_payment_intent_503_when_off(funnel_off):
+    from fastapi import HTTPException
+
+    from src.api.main import create_payment_intent_endpoint
+
+    db = MagicMock()
+    db.execute.return_value.scalar_one_or_none.return_value = MagicMock(id=1)
+    req = _mk_payment_intent_request()
+
+    with patch("src.services.lead_hold.hold") as mock_hold:
+        with pytest.raises(HTTPException) as exc:
+            create_payment_intent_endpoint(req=req, request=MagicMock(), db=db)
+
+    assert exc.value.status_code == 503
+    mock_hold.assert_not_called()
+
+
+def test_lead_unlock_payment_intent_proceeds_when_on(funnel_on):
+    from src.api.main import create_payment_intent_endpoint
+
+    db = MagicMock()
+    db.execute.return_value.scalar_one_or_none.return_value = MagicMock(id=1)
+    req = _mk_payment_intent_request()
+
+    with patch("src.services.lead_hold.hold", return_value={"held": True}) as mock_hold, \
+         patch("src.services.payment_sheet.create_payment_intent", return_value={"client_secret": "pi_test"}):
+        result = create_payment_intent_endpoint(req=req, request=MagicMock(), db=db)
+
+    mock_hold.assert_called_once()
+    assert result == {"client_secret": "pi_test"}
+
+
+def test_non_lead_unlock_payment_intent_unaffected_when_off(funnel_off):
+    from src.api.main import create_payment_intent_endpoint
+
+    db = MagicMock()
+    db.execute.return_value.scalar_one_or_none.return_value = MagicMock(id=1)
+    req = _mk_payment_intent_request(product="premium_report")
+
+    with patch("src.services.lead_hold.hold") as mock_hold, \
+         patch("src.services.payment_sheet.create_payment_intent", return_value={"client_secret": "pi_test"}):
+        result = create_payment_intent_endpoint(req=req, request=MagicMock(), db=db)
+
+    mock_hold.assert_not_called()
+    assert result == {"client_secret": "pi_test"}

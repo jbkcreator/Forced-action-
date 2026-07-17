@@ -6128,6 +6128,8 @@ def create_payment_intent_endpoint(
 
     # Acquire a 20-min lead hold for lead_unlock purchases to prevent double-selling
     if req.metadata and req.metadata.get("product") == "lead_unlock":
+        if not get_settings().freemium_funnel_enabled:
+            raise HTTPException(status_code=503, detail="freemium funnel disabled")
         try:
             property_id = int(req.metadata["property_id"])
             from src.services.lead_hold import hold as acquire_hold
