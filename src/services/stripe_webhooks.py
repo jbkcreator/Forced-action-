@@ -570,6 +570,28 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
 
     db.flush()  # get subscriber.id before ZIP territory inserts
 
+    # B0-06: link the checkout consent row (written pre-subscriber, no subscriber_id
+    # yet) to the now-created subscriber, matched by this exact checkout session —
+    # not email, which could also match an old abandoned-checkout/waitlist row for
+    # the same address and wrongly hand its voice consent to this subscriber.
+    # Idempotent — guarded on subscriber_id IS NULL so a replayed webhook never
+    # re-touches an already-linked row.
+    _checkout_session_id = session.get("id")
+    if _checkout_session_id:
+        try:
+            from sqlalchemy import text as _text
+            db.execute(_text("""
+                UPDATE consent_acceptances SET subscriber_id = :sid
+                WHERE checkout_session_id = :session_id
+                  AND source_flow = 'checkout'
+                  AND subscriber_id IS NULL
+            """), {"sid": subscriber.id, "session_id": _checkout_session_id})
+        except Exception:
+            logger.warning(
+                "consent_acceptances subscriber_id link failed for session=%s (non-fatal)",
+                _checkout_session_id, exc_info=True,
+            )
+
     # ── B1/M9: activate the bridged Customer Account + record MRR ────────────
     # The only production entrypoint that seeds customer_accounts. Map the tier
     # to a plan; if the tier isn't in the catalog yet (legacy/founding), skip
