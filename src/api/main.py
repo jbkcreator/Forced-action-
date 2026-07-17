@@ -6718,10 +6718,20 @@ def claim_bonus_zip(feed_uuid: str, body: ClaimBonusZipRequest, db: Session = De
 
 
 @app.get("/share/{referral_code}", include_in_schema=False)
-def referral_share_page(referral_code: str, db: Session = Depends(get_db)):
+def referral_share_page(
+    referral_code: str,
+    t: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
     """
     Public referral landing page. Looks up the referrer's vertical and
     renders current weekly forward-pack copy with a signup CTA.
+
+    `t` is a signed prompt-attribution token minted when the proactive referral
+    prompt was sent; it binds this visit to the exact funnel row that generated
+    the link. Visits without a valid token (old links, link-preview crawlers,
+    organic /share/{code} shares) are treated as un-attributed and must not
+    advance any prompt to 'shared'.
     """
     from src.services.forward_pack_renderer import get_current_copy
     from fastapi.responses import HTMLResponse
@@ -6732,10 +6742,38 @@ def referral_share_page(referral_code: str, db: Session = Depends(get_db)):
     if not referrer:
         raise HTTPException(status_code=404, detail="Referral link not found")
 
+    from src.services.signed_links import decode_prompt_attribution_token
+    prompt_funnel_id = decode_prompt_attribution_token(t) if t else None
+    if prompt_funnel_id is not None:
+        try:
+            with db.begin_nested():
+                db.execute(
+                    text(
+                        "UPDATE referral_prompt_funnel "
+                        "SET state = 'shared', shared_at = now() "
+                        "WHERE id = :fid AND subscriber_id = :sid AND state = 'shown'"
+                    ),
+                    {"fid": prompt_funnel_id, "sid": referrer.id},
+                )
+        except Exception as exc:
+            logger.warning(
+                "[ReferralPrompt] shown->shared advance failed for referrer=%d funnel=%s: %s",
+                referrer.id, prompt_funnel_id, exc,
+            )
+    elif t:
+        logger.info(
+            "[ReferralPrompt] /share visit for referrer=%d had an invalid/expired token — un-attributed",
+            referrer.id,
+        )
+
     copy_body = get_current_copy(referrer.vertical, db)
     _settings = get_settings()
     base_url = getattr(_settings, "base_url", "")
+    # Carry the attribution token through signup so a confirmed purchase can be
+    # credited back to the originating prompt (the frontend must forward `pt`).
     signup_url = f"{base_url}/?ref={referral_code}"
+    if t:
+        signup_url = f"{signup_url}&pt={t}"
 
     html = f"""<!doctype html>
 <html lang="en">

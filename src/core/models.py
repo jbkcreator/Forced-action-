@@ -3171,6 +3171,11 @@ class ReferralEvent(Base):
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
     reward_type: Mapped[Optional[str]] = mapped_column(String(30))   # credits/free_month/lock_upgrade
     reward_value: Mapped[Optional[str]] = mapped_column(String(50))
+    # Set when the signup arrived via a proactive referral prompt link carrying
+    # a signed attribution token — lets mark_confirmed() credit the exact
+    # referral_prompt_funnel row that drove the conversion. Plain int (the funnel
+    # table is raw-SQL, not an ORM model), nullable for organic/reactive signups.
+    prompt_funnel_id: Mapped[Optional[int]] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
@@ -3241,6 +3246,47 @@ class ReferralForwardCopy(Base):
 
     def __repr__(self):
         return f"<ReferralForwardCopy(vertical={self.vertical}, week_start={self.week_start})>"
+
+
+class ReferralPromptFunnel(Base):
+    """
+    Proactive referral-prompt funnel: prompt shown -> link shared -> referral confirmed.
+    Schema-only (provisions the table for Base.metadata.create_all() in tests) — all
+    runtime reads/writes go through sqlalchemy.text() raw SQL, not this ORM class.
+    """
+    __tablename__ = "referral_prompt_funnel"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=False, index=True)
+    trigger_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    trigger_source_table: Mapped[str] = mapped_column(String(30), nullable=False)
+    trigger_source_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    referral_code: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    state: Mapped[str] = mapped_column(String(20), nullable=False, default="shown")
+    prompt_shown_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    sms_sent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    email_sent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    shared_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    confirmed_referral_event_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("referral_events.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "trigger_type IN ('deal_win', 'lead_pack_delivery')",
+            name="check_rpf_trigger_type",
+        ),
+        CheckConstraint(
+            "state IN ('shown', 'shared', 'confirmed', 'expired')",
+            name="check_rpf_state",
+        ),
+        UniqueConstraint("trigger_source_table", "trigger_source_id", name="uq_rpf_source"),
+        Index("idx_rpf_subscriber_shown", "subscriber_id", "prompt_shown_at"),
+        Index("idx_rpf_state", "state"),
+    )
+
+    def __repr__(self):
+        return f"<ReferralPromptFunnel(subscriber={self.subscriber_id}, trigger={self.trigger_type}, state={self.state})>"
 
 
 class AbTest(Base):
