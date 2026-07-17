@@ -19,7 +19,7 @@ from datetime import date
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import func
+from sqlalchemy import case, func, or_
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -94,6 +94,20 @@ def upsert_outcome_candidate(session: Session, candidate: OutcomeCandidateData) 
         updated_at=func.now(),
     )
     excluded = stmt.excluded
+    # Only property_id/event_type/event_date/amount feed the promoted
+    # DealOutcome row (label_layer._promote_one) — a re-stage that changes one
+    # of these (e.g. a revised winning bid or a corrected terminal status)
+    # must clear consumed_at so the label layer re-promotes it. Any other
+    # field changing (counterparty/raw_status/match_*, audit-only) leaves
+    # consumed_at alone. Unconditionally clearing it on every upsert would
+    # make the label layer reprocess every row on every connector re-run
+    # forever, defeating the point of consumed_at.
+    outcome_changed = or_(
+        OutcomeCandidate.property_id.is_distinct_from(excluded.property_id),
+        OutcomeCandidate.event_type.is_distinct_from(excluded.event_type),
+        OutcomeCandidate.event_date.is_distinct_from(excluded.event_date),
+        OutcomeCandidate.amount.is_distinct_from(excluded.amount),
+    )
     stmt = stmt.on_conflict_do_update(
         constraint="uq_outcome_candidate",
         set_=dict(
@@ -106,6 +120,10 @@ def upsert_outcome_candidate(session: Session, candidate: OutcomeCandidateData) 
             match_confidence=excluded.match_confidence,
             match_method=excluded.match_method,
             updated_at=excluded.updated_at,
+            consumed_at=case(
+                (outcome_changed, None),
+                else_=OutcomeCandidate.consumed_at,
+            ),
         ),
     )
     session.execute(stmt)
