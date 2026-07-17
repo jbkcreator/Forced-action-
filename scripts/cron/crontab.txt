@@ -67,6 +67,16 @@ COUNTY_ID=hillsborough
 #     Daily cadence ensures Sunday-scheduled auctions are captured the same day.
 15 6 * * * $PROJECT/scripts/cron/run.sh src.scrappers.foreclosures.foreclosure_engine --date $(date +\%Y-\%m-\%d) --load-to-db --county-id $COUNTY_ID
 
+# 10b. Tax Deed Auctions — 05:30/05:35 AM UTC Mon-Sat (registry off_days: Sunday).
+#      Both counties use the same realtaxdeed.com platform (URL from county_sources).
+#      Starts at yesterday's date so just-completed auctions are re-scraped with
+#      their final result (status/sold_amount/sold_to — the loader updates
+#      existing cases in place), then --walk-dates follows next-auction links to
+#      keep the upcoming calendar fresh (max 12 dates). Date format MM/DD/YYYY.
+#      Feeds the tax_deed_outcomes connector at 06:47/06:48 below.
+30 5 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.tax_deed.tax_deed_engine --date $(date -d "1 day ago" +\%m/\%d/\%Y) --walk-dates --load-to-db --county-id $COUNTY_ID
+35 5 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.tax_deed.tax_deed_engine --date $(date -d "1 day ago" +\%m/\%d/\%Y) --walk-dates --load-to-db --county-id pinellas
+
 # 11. Roofing Permits (classify from building_permits) — 06:17 AM UTC / 02:17 AM EDT / 11:47 AM IST
 17 6 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.roofing_permits.roofing_permit_engine --county-id $COUNTY_ID
 
@@ -698,14 +708,19 @@ COUNTY_ID=hillsborough
 0 8 * * 0 $PROJECT/scripts/cron/run.sh src.connectors.appraiser_sale_outcomes --county-id $COUNTY_ID
 1 8 * * 0 $PROJECT/scripts/cron/run.sh src.connectors.appraiser_sale_outcomes --county-id pinellas
 
-# tax_deed_outcomes is enabled=True in registry.py but INTENTIONALLY NOT
-# scheduled here yet: its documented cadence is "daily, after the tax-deed
-# scraper", but no tax-deed auction scraper cron entry exists anywhere in
-# this file (scripts/scrape_tax_deed_auctions.py exists as an untracked,
-# not-yet-cron-wired script as of 2026-07-08). Scheduling this connector
-# before that upstream job runs on a real cadence would stage outcomes
-# against stale/empty tax_deed_auctions data and report false "success".
-# Add this once the tax-deed scraper itself has a cron line above.
+# tax_deed_outcomes — daily Mon-Sat, after the tax-deed scraper (05:30
+# hillsborough / 05:35 pinellas, entry 10b above). SLA 1500 min, off Sunday
+# (registry off_days={6} — the scraper doesn't run Sundays either).
+47 6 * * 1-6 $PROJECT/scripts/cron/run.sh src.connectors.tax_deed_outcomes --county-id $COUNTY_ID
+48 6 * * 1-6 $PROJECT/scripts/cron/run.sh src.connectors.tax_deed_outcomes --county-id pinellas
+
+# outcome_label_layer (CDE-10) — daily, every day, AFTER all staging is done
+# for the day: weekday connectors finish by 06:48; the Sunday appraiser
+# connector stages at 08:00-08:01. 08:25 covers both. Promotes unconsumed
+# outcome_candidates into deal_outcomes (subscriber_id NULL,
+# confidence_tier public_record_inferred). SLA 1500 min.
+25 8 * * * $PROJECT/scripts/cron/run.sh src.connectors.label_layer --county-id $COUNTY_ID
+26 8 * * * $PROJECT/scripts/cron/run.sh src.connectors.label_layer --county-id pinellas
 
 # ── CDS SCORING RETUNE (client Q9 — closed loop) ─────────────
 # Weekly Sunday @ 11:00 UTC. Runs B→C→D→E→F end to end: builds the training
