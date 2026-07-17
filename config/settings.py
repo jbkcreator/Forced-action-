@@ -125,6 +125,8 @@ class AppSettings(BaseSettings):
 	stripe_price_pro_regular: Optional[str] = Field(default=None, env="STRIPE_PRICE_PRO_REGULAR")
 	stripe_price_dominator_founding: Optional[str] = Field(default=None, env="STRIPE_PRICE_DOMINATOR_FOUNDING")
 	stripe_price_dominator_regular: Optional[str] = Field(default=None, env="STRIPE_PRICE_DOMINATOR_REGULAR")
+	stripe_price_founder_monthly: Optional[str] = Field(default=None, env="STRIPE_PRICE_FOUNDER_MONTHLY")
+	stripe_price_founder_annual: Optional[str] = Field(default=None, env="STRIPE_PRICE_FOUNDER_ANNUAL")
 	stripe_price_lead_pack: Optional[str] = Field(default=None, env="STRIPE_PRICE_LEAD_PACK")
 	# Task 7 / ADR 0032 — premium insurance-distress segment pack. Price set by Josh in Stripe.
 	stripe_price_insurance_distress_pack: Optional[str] = Field(default=None, env="STRIPE_PRICE_INSURANCE_DISTRESS_PACK")

@@ -600,9 +600,30 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
     # the S1 ledger must never roll back the proven subscriber-creation path.
     try:
         from src.services.revenue_engine import (
-            get_or_create_account, plan_id_for_tier, record_subscription_active,
+            get_or_create_account, plan_id_for_price, plan_id_for_tier,
+            record_subscription_active,
         )
-        plan_id = plan_id_for_tier(db, tier)
+        # Resolve the plan by the subscription's price id first — the tier alone
+        # is ambiguous when several plans share it (e.g. founder_monthly and
+        # founder_annual both have tier='founder', so a tier-only lookup would
+        # pick one arbitrarily and record the wrong interval/MRR). Fall back to
+        # the tier when the price can't be determined.
+        _price_id = None
+        if stripe_subscription_id:
+            try:
+                _psub = stripe.Subscription.retrieve(
+                    stripe_subscription_id, expand=["items.data.price"]
+                )
+                _pitems = (_psub.get("items") or {}).get("data") or []
+                if _pitems:
+                    _price_id = (_pitems[0].get("price") or {}).get("id")
+            except Exception:
+                logger.warning(
+                    "checkout: could not retrieve subscription %s for price-based "
+                    "plan resolution — falling back to tier", stripe_subscription_id,
+                    exc_info=True,
+                )
+        plan_id = plan_id_for_price(db, _price_id) or plan_id_for_tier(db, tier)
         if plan_id is not None:
             account = get_or_create_account(
                 db, stripe_customer_id=stripe_customer_id, subscriber_id=subscriber.id,
