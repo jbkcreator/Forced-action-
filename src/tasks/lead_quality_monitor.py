@@ -1,7 +1,7 @@
 """
-Lead quality monitor — Gold+ false-positive rate tracking.
+Lead quality monitor — Gold+ false-positive rate tracking + B1-03 SLA auto-remediation.
 
-For each SentLead row sent ~30 days ago, this task checks three signals:
+For each SentLead / Delivery row sent ~30 days ago, this task checks three signals:
   1. Deed transfer since send?    → property already sold   (false positive)
   2. Code violations now resolved? → signals were stale     (false positive)
   3. Still Gold+ qualified?        → score decay check      (borderline)
@@ -12,18 +12,40 @@ Results are stored in lead_quality_snapshots. An ops alert fires immediately
 if the rolling rate exceeds ALERT_THRESHOLD. A full breakdown email is sent
 every Monday regardless of the rate.
 
+B1-03: a 'sold' or 'resolved' outcome now auto-remediates the customer, no
+founder action required —
+  - Delivery (Block 1 storefront, entitlement-model) → reject_delivery() grants
+    a same-grade replacement credit.
+  - SentLead (lead_unlock_payment only — a single $ charge for a single lead) →
+    a full Stripe refund is the correct amount, so it's auto-issued.
+  - SentLead (lead_pack) is deliberately NOT auto-refunded here: one
+    stripe_payment_intent_id is shared across up to 5 leads in a pack (see
+    lead_pack_fulfillment_sweep.py), so a full-PI refund would over-refund the
+    other, good leads in the same purchase. A correct fix needs a per-lead
+    partial refund sourced from platform_revenue_ledger (source_table=
+    'sent_leads'), which is out of scope here — lead_pack quality issues stay
+    on the existing alert-only path until that's built.
+  - Everything else (free-tier daily_email) → not_applicable, alert-only as before.
+
 Run daily after scoring completes (07:30 UTC):
   30 7 * * * cd /path/to/app && python -m src.tasks.lead_quality_monitor
 """
 
 import argparse
 import logging
+from contextlib import nullcontext
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
+import stripe
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from config.settings import settings
 from src.core.database import get_db_context
 from src.core.models import CodeViolation, Deed, DistressScore, LeadQualitySnapshot, SentLead, Subscriber
 from src.services.email import send_alert
+from src.services.lead_delivery import reject_delivery
 from src.tasks.load_validator import _record_alert_sent, _was_recently_alerted
 from config.scoring import PERSISTENCE_RESOLVED_KEYWORDS
 
@@ -144,6 +166,101 @@ def _already_snapshotted(session, property_id: int, subscriber_id: int, sent_at:
     return row is not None
 
 
+# ── B1-03: entitlement-model (Delivery) source rows ──────────────────────────
+
+def _fetch_delivery_rows(session, county_id: str, window_start: datetime, window_end: datetime):
+    """Deliveries (Block 1 storefront) in the snapshot window, still 'delivered'
+    (not already rejected), joined through customer_accounts to reach the
+    subscriber's county filter and subscriber_id for the snapshot row."""
+    return session.execute(text("""
+        SELECT d.id AS delivery_id, d.property_id, d.account_id, d.delivered_at,
+               ca.subscriber_id
+        FROM deliveries d
+        JOIN customer_accounts ca ON ca.account_id = d.account_id
+        JOIN subscribers s ON s.id = ca.subscriber_id
+        WHERE d.delivered_at >= :window_start AND d.delivered_at <= :window_end
+          AND d.status = 'delivered'
+          AND s.county_id = :county_id
+    """), {"window_start": window_start, "window_end": window_end, "county_id": county_id}).fetchall()
+
+
+# ── B1-03: auto-remediation ───────────────────────────────────────────────────
+
+def _auto_refund_sent_lead(session, sent_lead: SentLead, reason: str, now: datetime) -> str:
+    """Issue a full Stripe refund for a stale lead_unlock_payment purchase
+    (one payment_intent = one lead, so a full-PI refund is the correct
+    amount). Mirrors the manual admin refund path in admin_router.py.
+    Returns 'refund_issued' or 'refund_failed'; never raises."""
+    if not settings.active_stripe_secret_key:
+        logger.warning("[LQM] Stripe not configured — cannot auto-refund SentLead %s", sent_lead.id)
+        return "refund_failed"
+
+    stripe.api_key = settings.active_stripe_secret_key.get_secret_value()
+    try:
+        refund = stripe.Refund.create(
+            payment_intent=sent_lead.stripe_payment_intent_id,
+            idempotency_key=f"lqm-refund-{sent_lead.stripe_payment_intent_id}",
+        )
+    except stripe.error.StripeError as exc:
+        logger.error("[LQM] Auto-refund failed for SentLead %s: %s", sent_lead.id, exc)
+        return "refund_failed"
+
+    sent_lead.refunded_at = now
+    sent_lead.refund_reason = reason
+    sent_lead.stripe_refund_id = refund.id
+    logger.info(
+        "[LQM] Auto-refund issued: sent_lead=%s refund=%s reason=%s",
+        sent_lead.id, refund.id, reason,
+    )
+    return "refund_issued"
+
+
+def _remediate(
+    session,
+    outcome: str,
+    *,
+    delivery_id: Optional[int] = None,
+    sent_lead: Optional[SentLead] = None,
+    now: Optional[datetime] = None,
+    dry_run: bool = False,
+) -> tuple[str, Optional[datetime]]:
+    """B1-03: decide + (unless dry_run) perform the auto-remediation for one
+    classified lead. Returns (remediation_action, remediated_at).
+
+    - Delivery-sourced (entitlement/storefront) → reject_delivery() credit.
+    - SentLead-sourced, lead_unlock_payment only, not yet refunded → Stripe
+      refund (a single $ charge for a single lead, so a full-PI refund is the
+      correct amount). lead_pack is intentionally excluded — see module
+      docstring — because its payment_intent is shared across multiple leads.
+    - Everything else (free-tier daily_email, lead_pack, already remediated)
+      → no-op.
+    """
+    if outcome not in ("sold", "resolved"):
+        return "not_applicable", None
+
+    reason = "sold_before_delivery" if outcome == "sold" else "signals_resolved"
+    now = now or datetime.now(timezone.utc)
+
+    if delivery_id is not None:
+        if dry_run:
+            return "credit_issued", now
+        reject_delivery(session, delivery_id, reason, now=now)
+        return "credit_issued", now
+
+    if (
+        sent_lead is not None
+        and sent_lead.source == "lead_unlock_payment"
+        and sent_lead.stripe_payment_intent_id
+        and not sent_lead.refunded_at
+    ):
+        if dry_run:
+            return "refund_issued", now
+        action = _auto_refund_sent_lead(session, sent_lead, reason, now)
+        return action, now
+
+    return "not_applicable", None
+
+
 # ── Aggregate helpers ─────────────────────────────────────────────────────────
 
 def _compute_rate(session, county_id: str, since_days: int = 30) -> dict:
@@ -172,12 +289,21 @@ def _compute_rate(session, county_id: str, since_days: int = 30) -> dict:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def run_lead_quality_monitor(county_id: str = "hillsborough", dry_run: bool = False) -> dict:
+def run_lead_quality_monitor(
+    county_id: str = "hillsborough",
+    dry_run: bool = False,
+    db: Optional[Session] = None,
+) -> dict:
     """
-    Snapshot leads sent ~30 days ago and compute false-positive rate.
+    Snapshot leads sent ~30 days ago, compute false-positive rate, and (B1-03)
+    auto-remediate sold/resolved leads with a replacement credit or refund.
+
+    Args:
+        db: Injected session (used in tests). If None, opens get_db_context().
 
     Returns:
-        dict with keys: snapshotted, false_positive_rate, sold, resolved, decayed, active, alerts_sent
+        dict with keys: snapshotted, false_positive_rate, sold, resolved, decayed,
+        active, alerts_sent, credits_issued, refunds_issued, refunds_failed
     """
     today = date.today()
     now = datetime.now(timezone.utc)
@@ -192,9 +318,60 @@ def run_lead_quality_monitor(county_id: str = "hillsborough", dry_run: bool = Fa
         'false_positive_rate': 0.0,
         'sold': 0, 'resolved': 0, 'decayed': 0, 'active': 0,
         'alerts_sent': 0,
+        'credits_issued': 0, 'refunds_issued': 0, 'refunds_failed': 0,
     }
 
-    with get_db_context() as session:
+    def _process_lead(property_id, subscriber_id, sent_at, *, delivery_id=None, sent_lead=None):
+        """Classify one lead and (unless dry_run) auto-remediate it. Returns the
+        LeadQualitySnapshot to persist, or None if already snapshotted."""
+        if _already_snapshotted(session, property_id, subscriber_id, sent_at):
+            results['skipped_existing'] += 1
+            return None
+
+        score_at_send, tier_at_send, signals_at_send = _get_score_at_send(
+            session, property_id, sent_at
+        )
+        score_now, tier_now = _get_current_score(session, property_id)
+        still_gp = tier_now in GOLD_PLUS_TIERS if tier_now else False
+        has_deed = _check_deed_transfer(session, property_id, sent_at)
+        has_resolved = _check_resolved_signals(session, property_id, sent_at, signals_at_send)
+        outcome = _classify_outcome(still_gp, has_deed, has_resolved)
+
+        remediation_action, remediated_at = _remediate(
+            session, outcome, delivery_id=delivery_id, sent_lead=sent_lead,
+            now=now, dry_run=dry_run,
+        )
+        if remediation_action == "credit_issued":
+            results['credits_issued'] += 1
+        elif remediation_action == "refund_issued":
+            results['refunds_issued'] += 1
+        elif remediation_action == "refund_failed":
+            results['refunds_failed'] += 1
+
+        results[outcome] = results.get(outcome, 0) + 1
+        results['snapshotted'] += 1
+
+        return LeadQualitySnapshot(
+            property_id=property_id,
+            subscriber_id=subscriber_id,
+            county_id=county_id,
+            sent_at=sent_at,
+            snapshot_at=now,
+            score_at_send=score_at_send,
+            tier_at_send=tier_at_send,
+            signals_at_send=signals_at_send,
+            score_at_snapshot=score_now,
+            tier_at_snapshot=tier_now,
+            still_gold_plus=still_gp,
+            has_deed_transfer=has_deed,
+            has_resolved_signals=has_resolved,
+            outcome=outcome,
+            delivery_id=delivery_id,
+            remediation_action=remediation_action,
+            remediated_at=remediated_at,
+        )
+
+    with (nullcontext(db) if db is not None else get_db_context()) as session:
         # Leads in the snapshot window, joined to subscriber county filter
         sent_rows = (
             session.query(SentLead, Subscriber.county_id)
@@ -206,45 +383,26 @@ def run_lead_quality_monitor(county_id: str = "hillsborough", dry_run: bool = Fa
             )
             .all()
         )
+        delivery_rows = _fetch_delivery_rows(session, county_id, window_start, window_end)
 
-        logger.info("[LQM] %d sent leads in snapshot window (%s to %s)",
-                    len(sent_rows), window_start.date(), window_end.date())
+        logger.info(
+            "[LQM] %d sent leads + %d deliveries in snapshot window (%s to %s)",
+            len(sent_rows), len(delivery_rows), window_start.date(), window_end.date(),
+        )
 
         new_snapshots = []
         for sl, _county in sent_rows:
-            if _already_snapshotted(session, sl.property_id, sl.subscriber_id, sl.sent_at):
-                results['skipped_existing'] += 1
-                continue
+            snap = _process_lead(sl.property_id, sl.subscriber_id, sl.sent_at, sent_lead=sl)
+            if snap is not None:
+                new_snapshots.append(snap)
 
-            score_at_send, tier_at_send, signals_at_send = _get_score_at_send(
-                session, sl.property_id, sl.sent_at
+        for row in delivery_rows:
+            snap = _process_lead(
+                row.property_id, row.subscriber_id, row.delivered_at,
+                delivery_id=row.delivery_id,
             )
-            score_now, tier_now = _get_current_score(session, sl.property_id)
-            still_gp = tier_now in GOLD_PLUS_TIERS if tier_now else False
-            has_deed = _check_deed_transfer(session, sl.property_id, sl.sent_at)
-            has_resolved = _check_resolved_signals(
-                session, sl.property_id, sl.sent_at, signals_at_send
-            )
-            outcome = _classify_outcome(still_gp, has_deed, has_resolved)
-
-            new_snapshots.append(LeadQualitySnapshot(
-                property_id=sl.property_id,
-                subscriber_id=sl.subscriber_id,
-                county_id=county_id,
-                sent_at=sl.sent_at,
-                snapshot_at=now,
-                score_at_send=score_at_send,
-                tier_at_send=tier_at_send,
-                signals_at_send=signals_at_send,
-                score_at_snapshot=score_now,
-                tier_at_snapshot=tier_now,
-                still_gold_plus=still_gp,
-                has_deed_transfer=has_deed,
-                has_resolved_signals=has_resolved,
-                outcome=outcome,
-            ))
-            results[outcome] = results.get(outcome, 0) + 1
-            results['snapshotted'] += 1
+            if snap is not None:
+                new_snapshots.append(snap)
 
         if not dry_run and new_snapshots:
             session.bulk_save_objects(new_snapshots)

@@ -126,6 +126,8 @@ class AppSettings(BaseSettings):
 	stripe_price_dominator_founding: Optional[str] = Field(default=None, env="STRIPE_PRICE_DOMINATOR_FOUNDING")
 	stripe_price_dominator_regular: Optional[str] = Field(default=None, env="STRIPE_PRICE_DOMINATOR_REGULAR")
 	stripe_price_lead_pack: Optional[str] = Field(default=None, env="STRIPE_PRICE_LEAD_PACK")
+	# Task 7 / ADR 0032 — premium insurance-distress segment pack. Price set by Josh in Stripe.
+	stripe_price_insurance_distress_pack: Optional[str] = Field(default=None, env="STRIPE_PRICE_INSURANCE_DISTRESS_PACK")
 	stripe_price_hot_lead_unlock: Optional[str] = Field(default=None, env="STRIPE_PRICE_HOT_LEAD_UNLOCK")
 	# Kill switch for the $150/$99 hot lead unlock checkout. Metadata now
 	# propagates to the PaymentIntent (payment_intent_data in
@@ -199,6 +201,7 @@ class AppSettings(BaseSettings):
 	stripe_test_price_dominator_founding: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_DOMINATOR_FOUNDING")
 	stripe_test_price_dominator_regular: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_DOMINATOR_REGULAR")
 	stripe_test_price_lead_pack: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_LEAD_PACK")
+	stripe_test_price_insurance_distress_pack: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_INSURANCE_DISTRESS_PACK")
 	stripe_test_price_hot_lead_unlock: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_HOT_LEAD_UNLOCK")
 	# 2B test prices
 	stripe_test_price_wallet_starter: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_WALLET_STARTER")
@@ -250,11 +253,6 @@ class AppSettings(BaseSettings):
 
 	# Founding subscriber spot limit (default 10, changeable without redeploy)
 	founding_spot_limit: int = Field(default=10, env="FOUNDING_SPOT_LIMIT")
-
-	# Annual-at-signup A/B test traffic split (default 10, changeable without
-	# redeploy — edit .env and restart). Still subject to the ab_test_traffic_cap
-	# guardrail (config/cora_guardrails.py) when the test row is registered.
-	annual_signup_test_traffic_pct: int = Field(default=10, env="ANNUAL_SIGNUP_TEST_TRAFFIC_PCT")
 
 	# Grace period after subscription deletion — 7 days lets payment_failure_day5 trigger fire.
 	# Set GRACE_PERIOD_HOURS=0.017 (≈1 min) for rapid local testing.
@@ -418,6 +416,13 @@ class AppSettings(BaseSettings):
 	# Detector, sweep, Cora graph, and API endpoints all skip when False.
 	# Auto-flipped to False if Day-35 take_rate < wallet_adoption.floor_pct (12%).
 	accelerated_wallet_push_enabled: bool = Field(default=False, env="ACCELERATED_WALLET_PUSH_ENABLED")
+
+	# Freemium blurred-feed funnel (T-B3-01) — master launch toggle ANDed in
+	# front of every funnel leg: free signup, blurred teaser/proof moment,
+	# monetization wall, flash scarcity, abandonment nudges. Default True:
+	# these flows are already live in prod; per-flow Cora kill-switches
+	# (first_payment_rate) still apply when this is ON.
+	freemium_funnel_enabled: bool = Field(default=True, env="FREEMIUM_FUNNEL_ENABLED")
 
 	# TCPA quiet-hours enforcement (8am–9pm recipient local time).
 	# Set False in dev/staging to send SMS at any hour during testing.

@@ -53,6 +53,11 @@ def run_connector(source_type: str, county_id: str, work_fn: WorkFn, dry_run: bo
     per-row and incrementing a counter rather than aborting the loop) and
     return a ConnectorRunResult summarizing what happened. A work_fn that
     raises is treated as a total connector failure — the whole run rolls back.
+    A work_fn that returns normally but reports result.errors > 0 (rows it
+    caught and skipped rather than raising) is also treated as a failed run —
+    the already-committed good rows stay committed, but the run itself must
+    report failure so run.sh's retry/alert logic and the heartbeat both see
+    it, instead of silently retrying the same bad rows forever unnoticed.
 
     Returns 0 on success, 1 on failure — the same convention run.sh already
     expects from every other scraper module.
@@ -79,6 +84,17 @@ def run_connector(source_type: str, county_id: str, work_fn: WorkFn, dry_run: bo
 
     duration = time.monotonic() - start
 
+    if success and result.errors:
+        success = False
+        error_message = (
+            f"{result.errors} row(s) failed to process — see logs for row ids"
+        )
+        logger.error(
+            "[%s] completed with %d per-record errors (county=%s, source=%s) — "
+            "marking run as failed for retry/alert.",
+            source_type, result.errors, county_id, spec.reads_table,
+        )
+
     record_scraper_stats(
         source_type=source_type,
         total_scraped=result.total_read,
@@ -91,11 +107,5 @@ def run_connector(source_type: str, county_id: str, work_fn: WorkFn, dry_run: bo
         duration_seconds=round(duration, 2),
         county_id=county_id,
     )
-
-    if result.errors:
-        logger.warning(
-            "[%s] completed with %d per-record errors (county=%s, source=%s).",
-            source_type, result.errors, county_id, spec.reads_table,
-        )
 
     return 0 if success else 1

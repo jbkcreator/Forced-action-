@@ -147,6 +147,29 @@ class TestEvaluateAndActivate:
             assert result.get("adjusted_cents", 21670) <= 24700  # lock max guardrail
             assert result.get("adjusted_cents", 21670) >= 14700  # lock min guardrail
 
+    def test_annual_lock_positive_adjustment_takes_effect(self):
+        """annual_lock's guardrail bounds must allow real movement off the flat
+        $1970 rate — a fixed (197000, 197000) bound clamps every adjustment
+        back to the same number while still reporting 'activated'."""
+        from src.services.pricing_cohort_engine import evaluate_and_activate
+        db = _db_with_deal_counts(weeks=8, deals=20)
+        result = evaluate_and_activate(
+            "hillsborough", "roofing", "annual_lock", 197000, 10.0, db,
+        )
+        assert result["status"] in ("activated", "updated")
+        assert result["adjusted_cents"] != 197000
+        assert result["adjusted_cents"] == 216700  # 197000 * 1.10
+
+    def test_annual_lock_negative_adjustment_takes_effect(self):
+        from src.services.pricing_cohort_engine import evaluate_and_activate
+        db = _db_with_deal_counts(weeks=8, deals=20)
+        result = evaluate_and_activate(
+            "hillsborough", "roofing", "annual_lock", 197000, -10.0, db,
+        )
+        assert result["status"] in ("activated", "updated")
+        assert result["adjusted_cents"] != 197000
+        assert result["adjusted_cents"] == 177300  # 197000 * 0.90
+
     def test_already_active_no_price_change(self):
         from src.services.pricing_cohort_engine import evaluate_and_activate
         existing = _make_cohort(adjusted_price_cents=21670)
@@ -184,6 +207,15 @@ class TestGetPriceForSubscriber:
         assert price == 19700
         assert source == "base_price"
         db.execute.assert_not_called()
+
+    def test_annual_lock_adjusted_price_not_clamped_to_flat_rate(self):
+        from src.services.pricing_cohort_engine import get_price_for_subscriber
+        cohort = _make_cohort(price_type="annual_lock", adjusted_price_cents=216700)
+        db = MagicMock()
+        db.execute.return_value.first.return_value = cohort
+        price, source = get_price_for_subscriber("hillsborough", "roofing", "annual_lock", 197000, db)
+        assert price == 216700
+        assert source == "cohort_adjusted"
 
     def test_clamped_to_guardrail_bounds(self):
         """Even if the DB has an out-of-bounds price, it gets clamped."""

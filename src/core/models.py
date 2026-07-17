@@ -86,6 +86,11 @@ class Property(Base):
     hcpa_neighborhood_code: Mapped[Optional[str]] = mapped_column(String(255))
     building_details: Mapped[Optional[dict]] = mapped_column(JSONB)            # roof, walls, sub-areas, extra features
     hcpa_last_refreshed: Mapped[Optional[datetime]] = mapped_column(DateTime)  # NULL = never enriched
+    # CDE-07: HCPA STRAP key, verbatim from the master bulk file — byte-identical
+    # to the FL DOR SDF/NAL PARCEL_ID for Hillsborough, giving a deterministic
+    # join to DOR statewide sales files. NULL for counties whose DOR key is
+    # derivable from parcel_id instead (Pinellas: range/section swap transform).
+    strap: Mapped[Optional[str]] = mapped_column(String(30), index=True)
 
     # Multi-county
     county_id: Mapped[Optional[str]] = mapped_column(String(50), default='hillsborough', index=True)
@@ -1105,6 +1110,7 @@ class ConsentAcceptance(Base):
     privacy_version: Mapped[str] = mapped_column(String(20), nullable=False)
     accepted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     source_flow: Mapped[str] = mapped_column(String(30), nullable=False, server_default="waitlist")
+    checkout_session_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     ip_address: Mapped[Optional[str]] = mapped_column(String(45), nullable=True)
     user_agent: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
@@ -1118,6 +1124,11 @@ class ConsentAcceptance(Base):
     tcpa_checked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     consent_scope: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
     not_condition_of_purchase_ack: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+
+    # ── B0-06: voice-call PEWC consent (distinct from consent_scope='marketing') ──
+    voice_consent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    voice_consent_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    voice_consent_version: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
 
     county_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, server_default="hillsborough")
     created_at: Mapped[datetime] = mapped_column(
@@ -1471,11 +1482,26 @@ class LeadQualitySnapshot(Base):
     # 'resolved' — primary code violations now closed/resolved (false positive)
     outcome = Column(String(20), nullable=False)
 
+    # B1-03 — SLA auto-remediation. delivery_id is set only for entitlement-model
+    # (Block 1 storefront) snapshots; NULL for legacy SentLead-sourced snapshots.
+    delivery_id = Column(BigInteger, ForeignKey("deliveries.id"), nullable=True, index=True)
+    # 'credit_issued'  — reject_delivery() granted a same-grade replacement credit
+    # 'refund_issued'  — a Stripe refund was issued for the paid one-time purchase
+    # 'refund_failed'  — a refund was attempted but Stripe errored
+    # 'not_applicable' — outcome wasn't sold/resolved, or nothing to remediate (e.g. free lead)
+    remediation_action = Column(String(30), nullable=True)
+    remediated_at = Column(DateTime(timezone=True), nullable=True)
+
     __table_args__ = (
         UniqueConstraint("property_id", "subscriber_id", "sent_at",
                          name="uq_lead_quality_snapshot"),
         Index("idx_lqs_snapshot_at", "snapshot_at"),
         Index("idx_lqs_outcome", "outcome"),
+        CheckConstraint(
+            "remediation_action IS NULL OR remediation_action IN "
+            "('credit_issued','refund_issued','refund_failed','not_applicable')",
+            name="ck_lqs_remediation_action",
+        ),
     )
 
     def __repr__(self):
@@ -1883,7 +1909,9 @@ class ScraperRunStats(Base):
             "'roofing_permits', 'storm_damage', 'flood_damage', 'insurance_claims', 'fire_incidents',"
             "'sunbiz', 'property_appraiser', 'dbpr_company',"
             "'tax_deed_auction', 'vacant_land',"
-            "'tax_deed_outcomes', 'appraiser_sale_outcomes', 'foreclosure_outcomes'"
+            "'tax_deed_outcomes', 'appraiser_sale_outcomes', 'foreclosure_outcomes',"
+            "'outcome_label_layer', 'dor_sales', 'dor_sale_outcomes',"
+            "'deed_flip_outcomes', 'probate_lien_outcomes', 'lis_pendens_outcomes'"
             ")",
             name="check_run_stats_source_type",
         ),
@@ -2151,10 +2179,10 @@ class OutcomeCandidate(Base):
     records (foreclosure auction results, tax-deed auction results, appraiser
     sales, etc.) by the Cora Data Engine connectors (src/connectors/).
 
-    Deliberately has no FK to deal_outcomes and nothing writes deal_outcomes
-    rows from here directly — DealOutcome.subscriber_id is NOT NULL today, so
-    a separate label layer promotes rows from here into DealOutcome once that
-    constraint is relaxed for pipeline-sourced (subscriber-less) outcomes.
+    Deliberately has no FK to deal_outcomes — the label layer (CDE-10,
+    src/connectors/label_layer.py) promotes unconsumed rows into DealOutcome
+    (subscriber_id NULL, confidence_tier public_record_inferred) keyed by a
+    deterministic source_ref, stamping consumed_at here.
     """
     __tablename__ = "outcome_candidates"
 
@@ -2169,9 +2197,10 @@ class OutcomeCandidate(Base):
     amount: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 2))
     counterparty: Mapped[Optional[str]] = mapped_column(String(255))
     raw_status: Mapped[Optional[str]] = mapped_column(String(100))                     # untranslated source string, for audit
+    raw_payload: Mapped[Optional[dict]] = mapped_column(JSONB)                         # connector-specific extras (e.g. deed_flip margin/hold/instruments)
     match_confidence: Mapped[Optional[Decimal]] = mapped_column(Numeric(4, 3))         # only set when resolve_or_quarantine() was used
     match_method: Mapped[Optional[str]] = mapped_column(String(30))
-    consumed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))   # set by the (future) label layer
+    consumed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))   # set by the label layer (src/connectors/label_layer.py)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), onupdate=func.now())
 
@@ -2193,13 +2222,83 @@ class OutcomeCandidate(Base):
         CheckConstraint(
             "event_type IN ('auction_sold_third_party','auction_reverted_to_lender',"
             "'auction_cancelled','tax_deed_sold','tax_deed_cancelled','tax_deed_redeemed',"
-            "'qualified_sale','unqualified_sale')",
+            "'qualified_sale','unqualified_sale','deed_flip','probate_sale','lien_sale',"
+            "'lp_sold_pre_auction')",
             name="check_outcome_candidate_event_type",
         ),
     )
 
     def __repr__(self):
         return f"<OutcomeCandidate(id={self.id}, source='{self.source_type}', event='{self.event_type}')>"
+
+
+class DorSale(Base):
+    """
+    Raw FL DOR SDF (Sale Data File) rows — the statewide standardized sales
+    feed (CDE-07). One row per (county, parcel, recorded sale event) from the
+    per-county CSVs on the DOR data portal; a re-posted roll updates rows in
+    place (this is how a pending QUAL_CD 98/99 gets its final code).
+
+    property_id is resolved at ingestion, set-based: Hillsborough joins
+    properties.strap = parcel_id_dor (verbatim STRAP); Pinellas derives
+    parcel_id_norm via the range/section swap transform and joins
+    properties.parcel_id. Unresolved rows keep property_id NULL here — the SDF
+    carries no address/owner, so the UnmatchedRecord review-queue cascade has
+    nothing extra to work with (a future NAL ingest can re-resolve them).
+    The dor_sale_outcomes connector (CDE-07) reads matched rows and stages
+    OutcomeCandidates.
+    """
+    __tablename__ = "dor_sales"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    co_no: Mapped[int] = mapped_column(Integer, nullable=False)                     # DOR county number (Hillsborough 39, Pinellas 62)
+    parcel_id_dor: Mapped[str] = mapped_column(String(30), nullable=False)          # verbatim SDF PARCEL_ID
+    parcel_id_norm: Mapped[Optional[str]] = mapped_column(String(30))               # derived properties.parcel_id form (Pinellas transform); NULL when not derivable
+    property_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("properties.id"), index=True)
+    match_method: Mapped[Optional[str]] = mapped_column(String(30))                 # 'strap' | 'parcel_transform'
+    state_parcel_id: Mapped[Optional[str]] = mapped_column(String(30))
+    assessment_year: Mapped[Optional[int]] = mapped_column(Integer)
+    dor_uc: Mapped[Optional[str]] = mapped_column(String(10))
+    vi_cd: Mapped[Optional[str]] = mapped_column(String(2))
+    # Natural-key components are '' (never NULL) so the UNIQUE constraint
+    # actually dedupes — Postgres treats NULLs as distinct.
+    or_book: Mapped[str] = mapped_column(String(10), nullable=False, server_default=text("''"))
+    or_page: Mapped[str] = mapped_column(String(10), nullable=False, server_default=text("''"))
+    clerk_no: Mapped[str] = mapped_column(String(30), nullable=False, server_default=text("''"))
+    qual_cd: Mapped[str] = mapped_column(String(5), nullable=False)
+    sal_chg_cd: Mapped[Optional[str]] = mapped_column(String(5))
+    sale_yr: Mapped[int] = mapped_column(Integer, nullable=False)
+    sale_mo: Mapped[int] = mapped_column(Integer, nullable=False)
+    sale_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(14, 2))
+    multi_par_sal: Mapped[Optional[str]] = mapped_column(String(2))
+    roll_tag: Mapped[Optional[str]] = mapped_column(String(20))                     # portal folder, e.g. '2025F'
+    source_file: Mapped[Optional[str]] = mapped_column(String(120))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), onupdate=func.now())
+
+    property: Mapped[Optional["Property"]] = relationship("Property", foreign_keys=[property_id])
+
+    __table_args__ = (
+        UniqueConstraint(
+            "co_no", "parcel_id_dor", "sale_yr", "sale_mo", "clerk_no", "or_book", "or_page",
+            name="uq_dor_sales_natural",
+        ),
+        Index("ix_dor_sales_county_qual", "county_id", "qual_cd"),
+        Index(
+            "ix_dor_sales_unresolved",
+            "county_id",
+            postgresql_where=text("property_id IS NULL"),
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<DorSale(county={self.county_id!r}, parcel={self.parcel_id_dor!r}, "
+            f"{self.sale_yr}-{self.sale_mo:02d}, qual={self.qual_cd!r})>"
+        )
 
 
 # ============================================================================
@@ -3171,6 +3270,11 @@ class ReferralEvent(Base):
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
     reward_type: Mapped[Optional[str]] = mapped_column(String(30))   # credits/free_month/lock_upgrade
     reward_value: Mapped[Optional[str]] = mapped_column(String(50))
+    # Set when the signup arrived via a proactive referral prompt link carrying
+    # a signed attribution token — lets mark_confirmed() credit the exact
+    # referral_prompt_funnel row that drove the conversion. Plain int (the funnel
+    # table is raw-SQL, not an ORM model), nullable for organic/reactive signups.
+    prompt_funnel_id: Mapped[Optional[int]] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
@@ -3241,6 +3345,47 @@ class ReferralForwardCopy(Base):
 
     def __repr__(self):
         return f"<ReferralForwardCopy(vertical={self.vertical}, week_start={self.week_start})>"
+
+
+class ReferralPromptFunnel(Base):
+    """
+    Proactive referral-prompt funnel: prompt shown -> link shared -> referral confirmed.
+    Schema-only (provisions the table for Base.metadata.create_all() in tests) — all
+    runtime reads/writes go through sqlalchemy.text() raw SQL, not this ORM class.
+    """
+    __tablename__ = "referral_prompt_funnel"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=False, index=True)
+    trigger_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    trigger_source_table: Mapped[str] = mapped_column(String(30), nullable=False)
+    trigger_source_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    referral_code: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    state: Mapped[str] = mapped_column(String(20), nullable=False, default="shown")
+    prompt_shown_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    sms_sent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    email_sent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    shared_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    confirmed_referral_event_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("referral_events.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            "trigger_type IN ('deal_win', 'lead_pack_delivery')",
+            name="check_rpf_trigger_type",
+        ),
+        CheckConstraint(
+            "state IN ('shown', 'shared', 'confirmed', 'expired')",
+            name="check_rpf_state",
+        ),
+        UniqueConstraint("trigger_source_table", "trigger_source_id", name="uq_rpf_source"),
+        Index("idx_rpf_subscriber_shown", "subscriber_id", "prompt_shown_at"),
+        Index("idx_rpf_state", "state"),
+    )
+
+    def __repr__(self):
+        return f"<ReferralPromptFunnel(subscriber={self.subscriber_id}, trigger={self.trigger_type}, state={self.state})>"
 
 
 class AbTest(Base):
@@ -5046,11 +5191,14 @@ class NonBuyerNurtureSequence(Base):
 
 class CheckoutRecovery(Base):
     """
-    Abandoned-checkout recovery sequence — one row per email (Task 7).
+    Abandoned-checkout recovery sequence — one row per email (Task 7), reused
+    across episodes: a closed (recovered/failed) row is reopened rather than
+    blocking the next abandonment for that email.
 
-    Covers two drop-off paths: a Stripe checkout session that expired without
-    payment (`session_expired`), and a buyer who provisioned a pre-checkout
-    intent but never paid (`pre_payment`). A fast, high-intent "finish your
+    Covers three drop-off sources: a Stripe checkout session that expired
+    without payment (`session_expired`), a buyer who provisioned a
+    pre-checkout intent but never paid (`pre_payment`), and an abandoned lead
+    pack PaymentIntent (`lead_pack`). A fast, high-intent "finish your
     purchase" sequence — distinct from the slower non-buyer nurture drip. While
     a row is `active`, the sibling non_buyer_nurture row is held at
     `in_recovery` so the two flows never double-contact the same person; on
@@ -5076,6 +5224,10 @@ class CheckoutRecovery(Base):
     first_touch_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     last_touch_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), index=True)
     closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    # B1-04: stamped once the founder SMS fires for this episode (at the first
+    # confirmed-abandonment sweep touch, not at row creation) so retried
+    # sweeps/reopened episodes don't re-alert.
+    founder_alerted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
@@ -6921,7 +7073,8 @@ class Delivery(Base):
         CheckConstraint("status IN ('delivered','rejected')", name="ck_delivery_status"),
         CheckConstraint(
             "rejection_reason IS NULL OR rejection_reason IN "
-            "('disconnected','wrong_party','deceased','duplicate','other')",
+            "('disconnected','wrong_party','deceased','duplicate','other',"
+            "'sold_before_delivery','signals_resolved')",
             name="ck_delivery_reason",
         ),
         Index("idx_deliveries_account_grade_cycle", "account_id", "grade", "billing_period_end"),

@@ -18,6 +18,7 @@ _POOL_SIZE = 10
 from sqlalchemy import and_, desc, select
 from sqlalchemy.orm import Session
 
+from config.scoring import is_hot_score
 from src.core.models import DistressScore, EnrichedContact, Owner, Property, SentLead, Subscriber
 from src.services import lead_exclusivity
 
@@ -55,6 +56,10 @@ def get_proof_leads(
     fully-enriched form with `unlocked: True`. Without feed_uuid the behavior
     is unchanged.
     """
+    from config.settings import get_settings
+    if not get_settings().freemium_funnel_enabled:
+        return {"revealed": None, "blurred": [], "county_id": county_id, "vertical": vertical}
+
     try:
         score_col = DistressScore.vertical_scores[vertical].as_float()
     except (KeyError, TypeError):
@@ -212,6 +217,10 @@ def get_blurred_stack(
     blurred and no contact info is returned. Frontend renders the "Unlock for $4"
     CTA per card.
     """
+    from config.settings import get_settings
+    if not get_settings().freemium_funnel_enabled:
+        return []
+
     try:
         score_col = DistressScore.vertical_scores[vertical].as_float()
     except (KeyError, TypeError):
@@ -269,6 +278,7 @@ def get_blurred_stack(
             "score": float(score.final_cds_score or 0),
             "vertical_score": float(v_score) if v_score is not None else None,
             "lead_tier": score.lead_tier,
+            "is_hot": is_hot_score(score.final_cds_score),
             "distress_types": distress,
             "urgency_level": score.urgency_level,
             "unlocked": False,
