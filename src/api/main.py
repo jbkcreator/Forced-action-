@@ -722,13 +722,22 @@ def _attribution_stripe_metadata(request: Request, attribution: Optional[dict]) 
 
 
 class CheckoutRequest(BaseModel):
-    tier: str        # starter | pro | dominator
+    tier: str        # starter | pro | dominator | founder
     vertical: str    # roofing | remediation | investor
     county_id: str   # hillsborough
     zip_codes: list[str] = []  # ZIP territories to lock on purchase
     email: str       # collected before checkout — used to block duplicate subscriptions
+    interval: str = "monthly"  # monthly | annual — only meaningful for founder (picks its price)
     consent_acceptance: Optional[ConsentAcceptanceRequest] = None
     attribution: Optional[dict] = None  # Meta Ads attribution (utm_*, campaign_id, fbclid, ...)
+
+    @field_validator("interval")
+    @classmethod
+    def validate_interval(cls, v: str) -> str:
+        v = (v or "monthly").lower().strip()
+        if v not in {"monthly", "annual"}:
+            raise ValueError("interval must be 'monthly' or 'annual'")
+        return v
 
     @field_validator("email")
     @classmethod
@@ -785,7 +794,7 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
     stripe.api_key = _s.active_stripe_secret_key.get_secret_value()
 
     try:
-        price_id, is_founding = get_price_id_for_checkout(db, payload.tier, payload.vertical, payload.county_id)
+        price_id, is_founding = get_price_id_for_checkout(db, payload.tier, payload.vertical, payload.county_id, payload.interval)
     except ValueError as e:
         raise HTTPException(status_code=400, detail={"error": "invalid_configuration", "message": str(e)})
     except OperationalError:
@@ -942,6 +951,7 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
 
     checkout_metadata = {
         "tier": payload.tier,
+        "interval": payload.interval,
         "vertical": payload.vertical,
         "county_id": payload.county_id,
         "is_founding": str(is_founding),

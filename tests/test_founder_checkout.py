@@ -1,0 +1,95 @@
+"""Founder checkout wiring (PR-2) — test-mode verification, no live charge.
+
+Verifies the founder tier is purchasable through the checkout price-resolution
+path without ever calling live Stripe:
+  - get_price_id_for_checkout resolves the correct founder price per interval,
+    straight from the seeded `plans` catalog.
+  - the preview resolver returns the monthly founder price.
+  - CheckoutRequest accepts tier='founder' and validates the interval field.
+  - the subscribers.tier constraint now admits 'founder' (migration applied).
+
+All DB work runs in the rolled-back `fresh_db` transaction.
+"""
+from __future__ import annotations
+
+import pytest
+from sqlalchemy import text
+
+from migrations.apply_founder_plan_seed import seed_founder_plans
+
+M_PRICE = "price_founder_monthly_TESTMODE"
+A_PRICE = "price_founder_annual_TESTMODE"
+
+
+@pytest.fixture
+def founder_seeded(fresh_db):
+    if fresh_db.execute(text("SELECT 1 FROM plans WHERE plan_id='pro'")).fetchone() is None:
+        pytest.skip("no live `pro` plan to copy entitlements from")
+    seed_founder_plans(fresh_db.connection(), M_PRICE, A_PRICE)
+    return fresh_db
+
+
+def test_checkout_resolves_monthly_founder_price(founder_seeded):
+    from src.services.stripe_service import get_price_id_for_checkout
+    price_id, is_founding = get_price_id_for_checkout(
+        founder_seeded, "founder", "roofing", "hillsborough", "monthly"
+    )
+    assert price_id == M_PRICE
+    assert is_founding is False
+
+
+def test_checkout_resolves_annual_founder_price(founder_seeded):
+    from src.services.stripe_service import get_price_id_for_checkout
+    price_id, _ = get_price_id_for_checkout(
+        founder_seeded, "founder", "roofing", "hillsborough", "annual"
+    )
+    assert price_id == A_PRICE
+
+
+def test_checkout_defaults_to_monthly_when_interval_omitted(founder_seeded):
+    from src.services.stripe_service import get_price_id_for_checkout
+    price_id, _ = get_price_id_for_checkout(
+        founder_seeded, "founder", "roofing", "hillsborough"
+    )
+    assert price_id == M_PRICE
+
+
+def test_preview_resolves_founder_monthly(founder_seeded):
+    from src.services.stripe_service import get_price_id_for_preview
+    price_id, _ = get_price_id_for_preview(
+        founder_seeded, "founder", "roofing", "hillsborough"
+    )
+    assert price_id == M_PRICE
+
+
+def test_missing_founder_plan_raises(fresh_db):
+    # No founder rows seeded -> resolution must raise a clear config error,
+    # not silently return None.
+    from src.services.stripe_service import get_price_id_for_checkout
+    fresh_db.execute(text("DELETE FROM plans WHERE plan_id IN ('founder_monthly','founder_annual')"))
+    with pytest.raises(ValueError):
+        get_price_id_for_checkout(fresh_db, "founder", "roofing", "hillsborough", "monthly")
+
+
+def test_checkout_request_accepts_founder_and_interval():
+    from src.api.main import CheckoutRequest
+    req = CheckoutRequest(tier="founder", vertical="roofing", county_id="hillsborough",
+                          email="a@b.com", interval="annual")
+    assert req.tier == "founder"
+    assert req.interval == "annual"
+
+
+def test_checkout_request_rejects_bad_interval():
+    from src.api.main import CheckoutRequest
+    with pytest.raises(Exception):
+        CheckoutRequest(tier="founder", vertical="roofing", county_id="hillsborough",
+                        email="a@b.com", interval="weekly")
+
+
+def test_subscribers_tier_constraint_admits_founder(fresh_db):
+    # Migration apply_founder_subscriber_tier added 'founder' to the CHECK.
+    defn = fresh_db.execute(text(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+        "WHERE conname = 'check_subscriber_tier'"
+    )).scalar_one()
+    assert "'founder'" in defn

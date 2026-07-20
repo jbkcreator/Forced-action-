@@ -1344,7 +1344,7 @@ class Subscriber(Base):
         Index("idx_subscribers_icp_channel_key", "icp_channel_key"),
         Index("idx_subscriber_last_reactivation_at", "last_reactivation_attempt_at"),
         CheckConstraint(
-            "tier IN ('free', 'starter', 'pro', 'dominator', 'data_only', 'autopilot_lite', 'autopilot_pro', 'partner', 'annual_lock')",
+            "tier IN ('free', 'starter', 'pro', 'dominator', 'data_only', 'autopilot_lite', 'autopilot_pro', 'partner', 'annual_lock', 'founder')",
             name="check_subscriber_tier",
         ),
         CheckConstraint(
