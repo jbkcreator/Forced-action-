@@ -400,7 +400,7 @@ def create_hot_lead_unlock_link(
     """
     Dynamic one-time Stripe payment link for hot lead unlock.
     $150 standard. Drops to $99 if unlock rate is low (reduced=True).
-    Expires 48hr after creation.
+    Expires 23hr after creation (Stripe hard-caps checkout expires_at at 24hr).
     Raises RuntimeError if Stripe is not configured.
     Raises ValueError if required price env vars are not set.
     Raises stripe.error.StripeError on Stripe API failure.
@@ -426,7 +426,7 @@ def create_hot_lead_unlock_link(
             line_items=[{"price": price, "quantity": 1}],
             success_url=f"{settings.app_base_url}/leads/{lead_id}?unlocked=true",
             cancel_url=f"{settings.app_base_url}/leads/{lead_id}",
-            expires_at=int(time.time()) + 48 * 3600,  # 48hr expiry
+            expires_at=int(time.time()) + 23 * 3600,  # Stripe caps expires_at at 24hr from creation
             metadata={
                 "product": "hot_lead_unlock",
                 "lead_id": lead_id,
