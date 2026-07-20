@@ -27,7 +27,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from config.settings import settings
-from src.core.models import FoundingSubscriberCount
+from src.core.models import FoundingSubscriberCount, Plan
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +99,7 @@ def get_price_id_for_checkout(
     tier: str,
     vertical: str,
     county_id: str,
+    interval: str = "monthly",
 ) -> tuple[str, bool]:
     """
     Atomically check founding subscriber count and return the correct price_id.
@@ -111,6 +112,24 @@ def get_price_id_for_checkout(
     Raises OperationalError on DB failure (propagated to caller).
     """
     prices = _price_ids()
+
+    # Founder is a flat-rate tier with a monthly/annual split (no founding
+    # mechanic, no ZIP-count pricing). Its two prices live on the seeded
+    # `plans` rows (founder_monthly / founder_annual), so resolve the Stripe
+    # price straight from the catalog by interval rather than from _price_ids.
+    if tier == "founder":
+        plan_id = f"founder_{'annual' if interval == 'annual' else 'monthly'}"
+        price_id = db.execute(
+            select(Plan.stripe_price_id).where(Plan.plan_id == plan_id, Plan.is_active.is_(True))
+        ).scalar_one_or_none()
+        if not price_id:
+            raise ValueError(
+                f"Stripe price_id not configured for {plan_id}. Seed the plan and set "
+                f"STRIPE_PRICE_FOUNDER_{'ANNUAL' if interval == 'annual' else 'MONTHLY'}."
+            )
+        logger.info("Checkout price selected: tier=founder interval=%s (flat rate)", interval)
+        return price_id, False
+
     if tier not in prices:
         raise ValueError(
             f"Unknown tier '{tier}'. Valid tiers: {list(prices.keys())}"
@@ -212,6 +231,19 @@ def get_price_id_for_preview(
     Raises OperationalError on DB failure (propagated to caller).
     """
     prices = _price_ids()
+
+    # Founder is flat-rate; preview shows the monthly price (interval selection
+    # happens at checkout). Resolve from the seeded plans catalog.
+    if tier == "founder":
+        price_id = db.execute(
+            select(Plan.stripe_price_id).where(
+                Plan.plan_id == "founder_monthly", Plan.is_active.is_(True)
+            )
+        ).scalar_one_or_none()
+        if not price_id:
+            raise ValueError("Stripe price_id not configured for founder_monthly.")
+        return price_id, False
+
     if tier not in prices:
         raise ValueError(
             f"Unknown tier '{tier}'. Valid tiers: {list(prices.keys())}"
