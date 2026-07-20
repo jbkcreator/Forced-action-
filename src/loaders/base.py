@@ -487,7 +487,14 @@ class BaseLoader(ABC):
                 prop = (
                     self.session.query(Property)
                     .filter(
-                        sqlfunc.regexp_replace(Property.parcel_id, '[^A-Za-z0-9]', '', 'g') == normalized,
+                        # Must match idx_property_parcel_id_normalized's expression
+                        # EXACTLY (including the upper() wrapper) or Postgres can't
+                        # use the index — without it this silently falls back to a
+                        # parallel sequential scan of the whole properties table
+                        # (~500k rows) on every call. `normalized` is already
+                        # uppercased by normalize_parcel_id() above; the DB side
+                        # was missing the matching upper() until now.
+                        sqlfunc.upper(sqlfunc.regexp_replace(Property.parcel_id, '[^A-Za-z0-9]', '', 'g')) == normalized,
                         Property.county_id == self.county_id,
                     )
                     .first()
