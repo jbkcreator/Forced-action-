@@ -87,6 +87,18 @@ def test_checkout_request_rejects_bad_interval():
                         email="a@b.com", interval="weekly")
 
 
+def test_annual_charge_normalized_to_monthly_mrr():
+    # Review fix: an annual founder charge ($11,000 up front) must be stored as
+    # a monthly run-rate in plan_price, not the raw 12-month charge.
+    from src.services.stripe_webhooks import normalized_monthly_price
+    # $11,000/yr -> ~$916.67/mo
+    assert normalized_monthly_price(1100000, "annual") == round(1100000 / 100 / 12, 2)
+    # monthly is unchanged
+    assert normalized_monthly_price(110000, "monthly") == 1100.00
+    # unknown/blank interval falls back to monthly (historical behavior)
+    assert normalized_monthly_price(110000, "") == 1100.00
+
+
 def test_founder_requires_exactly_ten_zips():
     from src.api.main import CheckoutRequest
     ten = [f"{33600 + i}" for i in range(10)]

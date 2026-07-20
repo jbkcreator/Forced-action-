@@ -39,6 +39,21 @@ from src.services import lead_exclusivity
 
 logger = logging.getLogger(__name__)
 
+# Months prepaid per billing interval — used to normalize a period charge into
+# a monthly run-rate for `Subscriber.plan_price` (read as MRR app-wide).
+_MONTHS_PER_INTERVAL = {"monthly": 1, "annual": 12}
+
+
+def normalized_monthly_price(amount_cents: int, interval: str) -> float:
+    """Convert a period charge (cents) into a monthly dollar run-rate.
+
+    An annual charge is a full year prepaid up front, so its MRR contribution is
+    the charge divided by 12. Unknown intervals fall back to monthly (divide by 1)
+    to preserve the historical behavior.
+    """
+    months = _MONTHS_PER_INTERVAL.get((interval or "monthly").lower(), 1)
+    return round(amount_cents / 100 / months, 2)
+
 
 def _attr(obj, key: str, default=None):
     """Read `key` from a Stripe SDK object or a plain dict.
@@ -540,11 +555,14 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
             )
 
     # ── Plan price + trial flags (fa048) ────────────────────────────────────
-    # amount_total is in cents; represents the charge for this billing period.
-    # For active (non-trial) subscriptions this equals the monthly plan price.
+    # amount_total is in cents = the charge for this billing period. `plan_price`
+    # is read as MONTHLY recurring revenue across the app, so an annual charge
+    # (a full year prepaid up front, e.g. founder annual) must be normalized to a
+    # monthly run-rate — otherwise it inflates MRR ~12x for every annual sub.
+    _interval = (meta.get("interval") or "monthly").lower()
     _amount_total = session.get("amount_total") or 0
     if _amount_total > 0:
-        subscriber.plan_price = round(_amount_total / 100, 2)
+        subscriber.plan_price = normalized_monthly_price(_amount_total, _interval)
     # Trial detection: Stripe sets amount_total=0 when trial_period_days > 0.
     # Retrieve the subscription to get the real price and trial_end.
     if stripe_subscription_id and _amount_total == 0:
@@ -556,7 +574,7 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
             if _items:
                 _unit = (_items[0].get("price") or {}).get("unit_amount") or 0
                 if _unit:
-                    subscriber.plan_price = round(_unit / 100, 2)
+                    subscriber.plan_price = normalized_monthly_price(_unit, _interval)
             _trial_end = _sub.get("trial_end")
             if _trial_end:
                 from datetime import timezone as _tz
