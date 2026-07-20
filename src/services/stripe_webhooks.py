@@ -133,9 +133,14 @@ def _fire_capi_for_pi(payment_intent, subscriber, source: str, event_id: str, db
         logger.warning("Meta CAPI %s purchase failed — non-fatal", source, exc_info=True)
 
 
-def handle_webhook(raw_body: bytes, sig_header: str, db: Session) -> tuple[bool, str]:
+def handle_webhook(raw_body: bytes, sig_header: str, db: Session, background_tasks=None) -> tuple[bool, str]:
     """
     Verify and dispatch a Stripe webhook event.
+
+    `background_tasks` (a FastAPI BackgroundTasks instance, or None) is only
+    used for checkout.session.completed — see _on_checkout_completed's
+    docstring for the fast/deferred split this enables. Every other event
+    type's handler signature is untouched.
 
     Returns (success, message).
     - Raises ValueError on signature verification failure (caller should return 400).
@@ -262,7 +267,10 @@ def handle_webhook(raw_body: bytes, sig_header: str, db: Session) -> tuple[bool,
         return True, "Ignored"
 
     try:
-        handler(data, db)
+        if handler is _on_checkout_completed:
+            handler(data, db, background_tasks=background_tasks)
+        else:
+            handler(data, db)
         # Plant the dedupe row in the SAME transaction as the handler writes,
         # so they commit together. If another listener already committed for
         # this event_id, the unique constraint fires and we treat it as a
@@ -293,13 +301,63 @@ def handle_webhook(raw_body: bytes, sig_header: str, db: Session) -> tuple[bool,
 # 1. checkout.session.completed
 # ---------------------------------------------------------------------------
 
-def _on_checkout_completed(session: dict, db: Session) -> None:
+def _on_checkout_completed(session: dict, db: Session, background_tasks=None) -> None:
     """
-    - Increment founding_subscriber_counts (atomic — already locked by stripe_service at checkout)
-    - Create Subscriber record with rate lock
-    - Lock ZIP territories
-    - Set GHL stage 5
-    - Generate event_feed_uuid
+    FAST PATH — synchronous, runs inside the webhook request's transaction.
+    Must stay short: this is what blocks Stripe's ack, and it's the only part
+    the subscriber's own dashboard depends on becoming visible.
+
+    Does only what's needed for the subscriber to see their upgrade land:
+      - Increment founding_subscriber_counts (atomic — already locked by stripe_service at checkout)
+      - Create/update the Subscriber row (tier, status, Stripe ids, rate lock)
+      - Lock ZIP territories
+      - Bust the ZIP-availability cache
+      - Generate event_feed_uuid (new subscribers only)
+
+    Everything else — GHL sync, welcome/upgrade/first-leads/founder-alert
+    emails, trial+price and saved-card detection (each an extra Stripe API
+    call), referral/segmentation/attribution/A-B-holdout bookkeeping, Meta
+    CAPI, campaign attribution, affiliate confirm, subscriber-memory
+    projection — is genuinely non-critical (none of it gates what the
+    subscriber sees) and is handed off to _checkout_completed_deferred() via
+    `background_tasks`, which runs AFTER the HTTP response to Stripe has
+    already been sent.
+
+    Why this split exists (2026-07-20): this handler used to do all of the
+    above inline, in one ~30+ second synchronous call chain — several
+    sequential external round-trips (Stripe subscription/customer/payment-
+    method retrieves, GHL, two emails, Meta CAPI) blocking one after another.
+    That was slow enough to risk Stripe's own webhook delivery timeout
+    triggering a retry of the whole event, and — the more serious bug this
+    session's debugging uncovered — a failure in ANY one of those unrelated
+    side-effects (a bare `except Exception:` with no `db.rollback()`, e.g. the
+    referral_events.prompt_funnel_id schema-drift incident) left the DB
+    session in Postgres's "current transaction is aborted" state, cascading
+    into every later statement and, if it escaped uncaught, silently rolling
+    back the ENTIRE transaction — including the subscriber tier/ZIP-lock
+    upgrade that had already been staged. Splitting fast-critical from
+    deferred-best-effort fixes both: the fast path commits and Stripe gets
+    acked in well under a second, and nothing in the deferred half can touch
+    an upgrade that's already durably committed.
+
+    `background_tasks` is optional. When None — e.g. called directly from a
+    script, test, or an admin webhook-replay tool rather than the real HTTP
+    route — the deferred work runs inline on the SAME session instead of
+    being scheduled, matching this function's pre-split, fully-synchronous
+    behavior for those callers. (It cannot open a second session and run
+    inline while this fast path's transaction is still uncommitted — a
+    separate connection wouldn't see the subscriber row yet under Postgres's
+    read-committed isolation.)
+
+    No retry: every deferred side-effect below already only ran once with no
+    retry before this split either (a caught exception never retried; only an
+    *uncaught* one triggered Stripe's whole-event redelivery, which is exactly
+    the dangerous behavior removed here). This split doesn't make any of them
+    less reliable than they already were — it just removes the path where a
+    failure in one could corrupt the others or the core upgrade. If retryable
+    delivery for these side-effects is ever needed, that's a separate, bigger
+    piece of work (a durable outbox table + periodic cron sweep, the same
+    shape as `cora_event_queue`'s 60s sweep) — deliberately out of scope here.
 
     Add-on products (auto_mode_addon, etc.) short-circuit at the top — they
     don't create a Subscriber row, they activate an entitlement flag on an
@@ -329,6 +387,10 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
     zip_codes   = [z.strip() for z in meta.get("zip_codes", "").split(",") if z.strip()]
     is_founding = meta.get("is_founding") == "True"
     founding_price_id = meta.get("founding_price_id") or None
+    # Buyer already has an authenticated dashboard session (e.g. a free-tier
+    # subscriber upgrading in-place) — send an upgrade confirmation instead of
+    # the new-subscriber magic-link welcome; they don't need a fresh login link.
+    dashboard_upgrade = meta.get("dashboard_upgrade") == "True"
 
     stripe_customer_id     = session.get("customer")
     stripe_subscription_id = session.get("subscription")
@@ -522,227 +584,29 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
             subscriber.rate_locked_at     = now
 
     # First paid conversion, matched by email — suppresses non-buyer nurture
-    # and closes any in-flight abandoned-checkout recovery (Task 7).
+    # and closes any in-flight abandoned-checkout recovery (Task 7). Each gets
+    # its own savepoint: this runs before the ZIP-lock flush below, so a
+    # failure here must not be able to poison that (see the module-level note
+    # in the docstring above re: db.begin_nested() vs bare try/except).
     if customer_email:
         try:
-            from src.services import non_buyer_nurture
-            non_buyer_nurture.mark_converted(db, customer_email)
+            with db.begin_nested():
+                from src.services import non_buyer_nurture
+                non_buyer_nurture.mark_converted(db, customer_email)
         except Exception:
             logger.warning(
                 "non_buyer_nurture mark_converted failed for subscriber=%s", subscriber.id, exc_info=True,
             )
         try:
-            from src.services import checkout_recovery
-            checkout_recovery.mark_recovered(db, customer_email)
+            with db.begin_nested():
+                from src.services import checkout_recovery
+                checkout_recovery.mark_recovered(db, customer_email)
         except Exception:
             logger.warning(
                 "checkout_recovery mark_recovered failed for email=%s", customer_email, exc_info=True,
             )
 
-    # ── Plan price + trial flags (fa048) ────────────────────────────────────
-    # amount_total is in cents; represents the charge for this billing period.
-    # For active (non-trial) subscriptions this equals the monthly plan price.
-    _amount_total = session.get("amount_total") or 0
-    if _amount_total > 0:
-        subscriber.plan_price = round(_amount_total / 100, 2)
-    # Trial detection: Stripe sets amount_total=0 when trial_period_days > 0.
-    # Retrieve the subscription to get the real price and trial_end.
-    if stripe_subscription_id and _amount_total == 0:
-        try:
-            _sub = stripe.Subscription.retrieve(
-                stripe_subscription_id, expand=["items.data.price"]
-            )
-            _items = (_sub.get("items") or {}).get("data") or []
-            if _items:
-                _unit = (_items[0].get("price") or {}).get("unit_amount") or 0
-                if _unit:
-                    subscriber.plan_price = round(_unit / 100, 2)
-            _trial_end = _sub.get("trial_end")
-            if _trial_end:
-                from datetime import timezone as _tz
-                subscriber.is_trial = True
-                subscriber.trial_ends_at = datetime.fromtimestamp(_trial_end, tz=timezone.utc)
-        except Exception:
-            logger.warning(
-                "checkout.session.completed: could not retrieve subscription %s for trial/price",
-                stripe_subscription_id, exc_info=True,
-            )
-
     db.flush()  # get subscriber.id before ZIP territory inserts
-
-    # B0-06: link the checkout consent row (written pre-subscriber, no subscriber_id
-    # yet) to the now-created subscriber, matched by this exact checkout session —
-    # not email, which could also match an old abandoned-checkout/waitlist row for
-    # the same address and wrongly hand its voice consent to this subscriber.
-    # Idempotent — guarded on subscriber_id IS NULL so a replayed webhook never
-    # re-touches an already-linked row.
-    _checkout_session_id = session.get("id")
-    if _checkout_session_id:
-        try:
-            from sqlalchemy import text as _text
-            db.execute(_text("""
-                UPDATE consent_acceptances SET subscriber_id = :sid
-                WHERE checkout_session_id = :session_id
-                  AND source_flow = 'checkout'
-                  AND subscriber_id IS NULL
-            """), {"sid": subscriber.id, "session_id": _checkout_session_id})
-        except Exception:
-            logger.warning(
-                "consent_acceptances subscriber_id link failed for session=%s (non-fatal)",
-                _checkout_session_id, exc_info=True,
-            )
-
-    # ── B1/M9: activate the bridged Customer Account + record MRR ────────────
-    # The only production entrypoint that seeds customer_accounts. Map the tier
-    # to a plan; if the tier isn't in the catalog yet (legacy/founding), skip
-    # activation rather than break checkout. Idempotent on the subscription id
-    # so a stale-replayed checkout never double-counts MRR. Fully defensive —
-    # the S1 ledger must never roll back the proven subscriber-creation path.
-    try:
-        from src.services.revenue_engine import (
-            get_or_create_account, plan_id_for_price, plan_id_for_tier,
-            record_subscription_active,
-        )
-        # Resolve the plan by the subscription's price id first — the tier alone
-        # is ambiguous when several plans share it (e.g. founder_monthly and
-        # founder_annual both have tier='founder', so a tier-only lookup would
-        # pick one arbitrarily and record the wrong interval/MRR). Fall back to
-        # the tier when the price can't be determined.
-        _price_id = None
-        if stripe_subscription_id:
-            try:
-                _psub = stripe.Subscription.retrieve(
-                    stripe_subscription_id, expand=["items.data.price"]
-                )
-                _pitems = (_psub.get("items") or {}).get("data") or []
-                if _pitems:
-                    _price_id = (_pitems[0].get("price") or {}).get("id")
-            except Exception:
-                logger.warning(
-                    "checkout: could not retrieve subscription %s for price-based "
-                    "plan resolution — falling back to tier", stripe_subscription_id,
-                    exc_info=True,
-                )
-        plan_id = plan_id_for_price(db, _price_id) or plan_id_for_tier(db, tier)
-        if plan_id is not None:
-            account = get_or_create_account(
-                db, stripe_customer_id=stripe_customer_id, subscriber_id=subscriber.id,
-            )
-            record_subscription_active(
-                db, account,
-                plan_id=plan_id,
-                stripe_subscription_id=stripe_subscription_id,
-                current_period_end=None,
-                stripe_event_id=f"checkout:{stripe_subscription_id}" if stripe_subscription_id else None,
-                now=now,
-            )
-        else:
-            logger.warning(
-                "checkout: no plan mapped for tier=%s — skipping S1 account activation "
-                "(customer=%s)", tier, stripe_customer_id,
-            )
-    except Exception:
-        logger.error(
-            "revenue_engine checkout activation failed for customer %s",
-            stripe_customer_id, exc_info=True,
-        )
-
-    # ── Race-free saved-card flag (fa016 followup #20) ───────────────────────
-    # We're in the same transaction that just committed the Subscriber row, so
-    # there's no race against payment_method.attached / payment_intent.succeeded
-    # webhooks running in parallel. Read default_payment_method from the
-    # session's payment_intent (synchronous, in-payload) — fall back to a
-    # Customer.retrieve only if the inline path is missing.
-    if not subscriber.has_saved_card:
-        pm_id = None
-        # 1) Try the session's payment_intent block (present for subscription
-        #    + one-time modes when expand was set; sometimes a bare id).
-        pi_block = session.get("payment_intent") or {}
-        if isinstance(pi_block, dict):
-            pm_id = pi_block.get("payment_method")
-        # 2) Try the session's subscription_details (Basil API shape).
-        if not pm_id:
-            sd = (session.get("parent") or {}).get("subscription_details") or {}
-            if isinstance(sd, dict):
-                pm_id = sd.get("default_payment_method")
-        # 3) Fall back to retrieving the customer once.
-        if not pm_id and stripe_customer_id:
-            try:
-                cust = stripe.Customer.retrieve(stripe_customer_id)
-                pm_id = (cust.get("invoice_settings") or {}).get("default_payment_method")
-            except Exception as exc:
-                logger.warning(
-                    "checkout: customer retrieve failed for %s: %s",
-                    stripe_customer_id, exc,
-                )
-        # 4) Last resort: list attached PMs and take the most recent card.
-        if not pm_id and stripe_customer_id:
-            try:
-                pms = stripe.PaymentMethod.list(customer=stripe_customer_id, type="card", limit=1)
-                if pms.get("data"):
-                    pm_id = pms["data"][0]["id"]
-            except Exception as exc:
-                logger.warning(
-                    "checkout: PM list failed for customer=%s: %s",
-                    stripe_customer_id, exc,
-                )
-
-        if pm_id:
-            subscriber.has_saved_card = True
-            subscriber.stripe_payment_method_id = pm_id
-            db.flush()
-            logger.info(
-                "checkout: saved-card flag set inline — subscriber=%s pm=%s",
-                subscriber.id, pm_id,
-            )
-
-            # If they already had paid activity, the accelerated wallet push
-            # detector becomes eligible the moment has_saved_card flips. Fire
-            # it now — race-free since we're in the same transaction.
-            try:
-                from src.services import wallet_engine
-                eligible = wallet_engine.accelerated_push_eligible(subscriber.id, db)
-                if eligible:
-                    from src.agents.events.ingestion import publish_cora_event
-                    publish_cora_event({
-                        "event_type": "accelerated_wallet_push_eligible",
-                        "subscriber_id": subscriber.id,
-                        "payload": eligible,
-                    })
-            except Exception as exc:
-                logger.warning(
-                    "accelerated_wallet_push from _on_checkout_completed failed sub=%s: %s",
-                    subscriber.id, exc,
-                )
-
-    # ── TCPA opt-in record ─────────────────────────────────────────────────
-    # Stripe Checkout's phone collection field is presented next to the
-    # subscription-purchase consent on the same form. Treat completion as
-    # an opt-in to operational SMS (BALANCE / WALLET / etc) and the
-    # accelerated-wallet-push offer. Only insert if we have a phone AND
-    # no opt-in row exists yet for this subscriber.
-    if customer_phone and subscriber.id:
-        try:
-            from src.core.models import SmsOptIn as _SmsOptIn
-            existing_opt = db.execute(
-                select(_SmsOptIn).where(_SmsOptIn.subscriber_id == subscriber.id)
-            ).scalar_one_or_none()
-            if existing_opt is None:
-                db.add(_SmsOptIn(
-                    phone=customer_phone,
-                    subscriber_id=subscriber.id,
-                    source="widget",
-                    opt_in_message="Stripe Checkout phone collection",
-                    opted_in_at=now,
-                ))
-                db.flush()
-                logger.info(
-                    "SmsOptIn created from Stripe Checkout: subscriber=%s phone=%s",
-                    subscriber.id, customer_phone,
-                )
-        except Exception as exc:
-            # Never block checkout flow on opt-in row insert failures
-            logger.warning("SmsOptIn insert failed for subscriber=%s: %s", subscriber.id, exc)
 
     if not subscriber.id:
         logger.warning(
@@ -791,18 +655,314 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
             rdelete(f"zip_availability:{county_id}:{vertical}")
             _seen_pairs.add(_pair)
 
-    # ── Push to GHL stage 5 ────────────────────────────────────────────────
-    # Pass `db=` so the GHL push's audit row joins the parent transaction —
-    # otherwise webhook_log opens its own session that can't see the
-    # not-yet-committed subscriber row, FK-fails, and we lose the audit.
-    try:
-        push_subscriber_to_ghl(
-            subscriber,
-            stage=5,
-            zip_codes=list(zip_codes),
-            is_founding=is_founding,
-            db=db,
+    logger.info(
+        "checkout.session.completed: fast path done — subscriber=%s tier=%s vertical=%s"
+        " founding=%s zips=%s feed_uuid=%s (deferring GHL/email/CAPI/attribution work)",
+        subscriber.id, tier, vertical, is_founding,
+        zip_codes, subscriber.event_feed_uuid,
+    )
+
+    if background_tasks is not None:
+        background_tasks.add_task(
+            _run_checkout_completed_deferred, subscriber.id, session, is_new_subscriber,
         )
+    else:
+        # No BackgroundTasks available (direct call — script/test/replay tool).
+        # Run on the SAME session, inline, synchronously: matches this
+        # function's behavior before the fast/background split.
+        _checkout_completed_deferred(db, subscriber, session, is_new_subscriber)
+
+
+def _run_checkout_completed_deferred(subscriber_id: int, session: dict, is_new_subscriber: bool) -> None:
+    """
+    FastAPI BackgroundTasks entry point for the deferred half of
+    _on_checkout_completed(). Runs strictly after the HTTP response to Stripe
+    has already been sent (Starlette guarantees background tasks run after
+    the response is transmitted), so it needs its OWN fresh DB session — the
+    request's session is closed by the time this executes, and by now the
+    fast path's subscriber tier/ZIP-lock update is durably committed and
+    visible to this new session.
+
+    Re-fetches the subscriber by id rather than reusing the ORM object built
+    in the request's (now-closed) session — that object belongs to a session
+    that no longer exists.
+
+    One-shot, best-effort, no retry — see the docstring on
+    _on_checkout_completed for why that's an acceptable, unchanged trade-off
+    for everything handled here.
+    """
+    from src.core.database import get_db_context
+
+    try:
+        with get_db_context() as db:
+            subscriber = db.execute(
+                select(Subscriber).where(Subscriber.id == subscriber_id)
+            ).scalar_one_or_none()
+            if subscriber is None:
+                logger.error(
+                    "checkout deferred: subscriber %s not found — cannot run deferred"
+                    " side-effects (fast path should already have created/updated this row)",
+                    subscriber_id,
+                )
+                return
+            _checkout_completed_deferred(db, subscriber, session, is_new_subscriber)
+    except Exception:
+        # Final safety net: nothing inside _checkout_completed_deferred should
+        # escape uncaught (every block below has its own try/except or
+        # begin_nested savepoint), but this background task has no caller to
+        # report to if one does — log it clearly instead of letting it surface
+        # as a bare unhandled-exception trace in the server's background-task
+        # runner.
+        logger.error(
+            "checkout deferred: unhandled failure for subscriber %s", subscriber_id, exc_info=True,
+        )
+
+
+def _checkout_completed_deferred(db: Session, subscriber, session: dict, is_new_subscriber: bool) -> None:
+    """
+    Core deferred logic for checkout.session.completed — everything that is
+    NOT required for the subscriber to see their tier/ZIP upgrade, which the
+    fast path (_on_checkout_completed) already committed before this ever
+    runs. Shared by both the real background-task path
+    (_run_checkout_completed_deferred, fresh session) and the inline fallback
+    _on_checkout_completed uses when called without `background_tasks` (same
+    session — scripts/tests/admin replay).
+
+    Covers: trial/price detection + S1 plan resolution (one merged Stripe
+    subscription retrieve — this used to be two separate, identical calls),
+    consent-row linking, saved-card detection, TCPA opt-in, GHL sync, welcome/
+    upgrade + first-leads + founder-alert emails, partner-tier provisioning,
+    referral confirmation, segmentation, attribution, A/B holdout, Meta CAPI,
+    campaign attribution, affiliate confirm, subscriber-memory projection.
+    """
+    meta = session.get("metadata", {}) or {}
+    tier        = meta.get("tier")
+    vertical    = meta.get("vertical")
+    county_id   = meta.get("county_id")
+    zip_codes   = [z.strip() for z in meta.get("zip_codes", "").split(",") if z.strip()]
+    is_founding = meta.get("is_founding") == "True"
+    dashboard_upgrade = meta.get("dashboard_upgrade") == "True"
+
+    stripe_customer_id     = session.get("customer")
+    stripe_subscription_id = session.get("subscription")
+    _raw_email             = session.get("customer_details", {}).get("email") or ""
+    customer_email         = _raw_email.lower().strip() or None
+    customer_phone         = (session.get("customer_details", {}) or {}).get("phone") or None
+    now = datetime.now(timezone.utc)
+
+    # ── Plan price + trial flags (fa048) + S1 plan resolution ────────────────
+    # amount_total is in cents; represents the charge for this billing period.
+    # For active (non-trial) subscriptions this equals the monthly plan price.
+    _amount_total = session.get("amount_total") or 0
+    if _amount_total > 0:
+        subscriber.plan_price = round(_amount_total / 100, 2)
+
+    # Both trial/price detection AND revenue_engine's price-based plan
+    # resolution used to each make their OWN stripe.Subscription.retrieve call
+    # with the identical expand=["items.data.price"] — one genuinely
+    # duplicated network round-trip. Fetch once here, reuse for both.
+    _sub_expanded = None
+    if stripe_subscription_id:
+        try:
+            _sub_expanded = stripe.Subscription.retrieve(
+                stripe_subscription_id, expand=["items.data.price"]
+            )
+        except Exception:
+            logger.warning(
+                "checkout: could not retrieve subscription %s for trial/price/plan resolution",
+                stripe_subscription_id, exc_info=True,
+            )
+
+    if _sub_expanded is not None and _amount_total == 0:
+        # Trial detection: Stripe sets amount_total=0 when trial_period_days > 0.
+        try:
+            with db.begin_nested():
+                _items = (_sub_expanded.get("items") or {}).get("data") or []
+                if _items:
+                    _unit = (_items[0].get("price") or {}).get("unit_amount") or 0
+                    if _unit:
+                        subscriber.plan_price = round(_unit / 100, 2)
+                _trial_end = _sub_expanded.get("trial_end")
+                if _trial_end:
+                    subscriber.is_trial = True
+                    subscriber.trial_ends_at = datetime.fromtimestamp(_trial_end, tz=timezone.utc)
+        except Exception:
+            logger.warning(
+                "checkout: trial/price extraction failed for subscription %s",
+                stripe_subscription_id, exc_info=True,
+            )
+
+    # B0-06: link the checkout consent row (written pre-subscriber, no subscriber_id
+    # yet) to the now-created subscriber, matched by this exact checkout session —
+    # not email, which could also match an old abandoned-checkout/waitlist row for
+    # the same address and wrongly hand its voice consent to this subscriber.
+    # Idempotent — guarded on subscriber_id IS NULL so a replayed webhook never
+    # re-touches an already-linked row.
+    _checkout_session_id = session.get("id")
+    if _checkout_session_id:
+        try:
+            with db.begin_nested():
+                from sqlalchemy import text as _text
+                db.execute(_text("""
+                    UPDATE consent_acceptances SET subscriber_id = :sid
+                    WHERE checkout_session_id = :session_id
+                      AND source_flow = 'checkout'
+                      AND subscriber_id IS NULL
+                """), {"sid": subscriber.id, "session_id": _checkout_session_id})
+        except Exception:
+            logger.warning(
+                "consent_acceptances subscriber_id link failed for session=%s (non-fatal)",
+                _checkout_session_id, exc_info=True,
+            )
+
+    # ── B1/M9: activate the bridged Customer Account + record MRR ────────────
+    # The only production entrypoint that seeds customer_accounts. Map the tier
+    # to a plan; if the tier isn't in the catalog yet (legacy/founding), skip
+    # activation rather than break checkout. Idempotent on the subscription id
+    # so a stale-replayed checkout never double-counts MRR. Fully defensive —
+    # the S1 ledger must never roll back the proven subscriber-creation path.
+    try:
+        with db.begin_nested():
+            from src.services.revenue_engine import (
+                get_or_create_account, plan_id_for_price, plan_id_for_tier,
+                record_subscription_active,
+            )
+            # Resolve the plan by the subscription's price id first — the tier
+            # alone is ambiguous when several plans share it (e.g.
+            # founder_monthly and founder_annual both have tier='founder', so
+            # a tier-only lookup would pick one arbitrarily and record the
+            # wrong interval/MRR). Fall back to the tier when the price can't
+            # be determined.
+            _price_id = None
+            if _sub_expanded is not None:
+                _pitems = (_sub_expanded.get("items") or {}).get("data") or []
+                if _pitems:
+                    _price_id = (_pitems[0].get("price") or {}).get("id")
+            plan_id = plan_id_for_price(db, _price_id) or plan_id_for_tier(db, tier)
+            if plan_id is not None:
+                account = get_or_create_account(
+                    db, stripe_customer_id=stripe_customer_id, subscriber_id=subscriber.id,
+                )
+                record_subscription_active(
+                    db, account,
+                    plan_id=plan_id,
+                    stripe_subscription_id=stripe_subscription_id,
+                    current_period_end=None,
+                    stripe_event_id=f"checkout:{stripe_subscription_id}" if stripe_subscription_id else None,
+                    now=now,
+                )
+            else:
+                logger.warning(
+                    "checkout: no plan mapped for tier=%s — skipping S1 account activation "
+                    "(customer=%s)", tier, stripe_customer_id,
+                )
+    except Exception:
+        logger.error(
+            "revenue_engine checkout activation failed for customer %s",
+            stripe_customer_id, exc_info=True,
+        )
+
+    # ── Saved-card flag (fa016 followup #20) ─────────────────────────────────
+    # Read default_payment_method from the session's payment_intent
+    # (synchronous, in-payload) — fall back to a Customer.retrieve / PM list
+    # only if the inline path is missing.
+    if not subscriber.has_saved_card:
+        pm_id = None
+        pi_block = session.get("payment_intent") or {}
+        if isinstance(pi_block, dict):
+            pm_id = pi_block.get("payment_method")
+        if not pm_id:
+            sd = (session.get("parent") or {}).get("subscription_details") or {}
+            if isinstance(sd, dict):
+                pm_id = sd.get("default_payment_method")
+        if not pm_id and stripe_customer_id:
+            try:
+                cust = stripe.Customer.retrieve(stripe_customer_id)
+                pm_id = (cust.get("invoice_settings") or {}).get("default_payment_method")
+            except Exception as exc:
+                logger.warning(
+                    "checkout: customer retrieve failed for %s: %s",
+                    stripe_customer_id, exc,
+                )
+        if not pm_id and stripe_customer_id:
+            try:
+                pms = stripe.PaymentMethod.list(customer=stripe_customer_id, type="card", limit=1)
+                if pms.get("data"):
+                    pm_id = pms["data"][0]["id"]
+            except Exception as exc:
+                logger.warning(
+                    "checkout: PM list failed for customer=%s: %s",
+                    stripe_customer_id, exc,
+                )
+
+        if pm_id:
+            try:
+                with db.begin_nested():
+                    subscriber.has_saved_card = True
+                    subscriber.stripe_payment_method_id = pm_id
+                logger.info(
+                    "checkout: saved-card flag set (deferred) — subscriber=%s pm=%s",
+                    subscriber.id, pm_id,
+                )
+                try:
+                    with db.begin_nested():
+                        from src.services import wallet_engine
+                        eligible = wallet_engine.accelerated_push_eligible(subscriber.id, db)
+                        if eligible:
+                            from src.agents.events.ingestion import publish_cora_event
+                            publish_cora_event({
+                                "event_type": "accelerated_wallet_push_eligible",
+                                "subscriber_id": subscriber.id,
+                                "payload": eligible,
+                            })
+                except Exception as exc:
+                    logger.warning(
+                        "accelerated_wallet_push from checkout deferred failed sub=%s: %s",
+                        subscriber.id, exc,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "checkout: saved-card flag update failed sub=%s: %s", subscriber.id, exc,
+                )
+
+    # ── TCPA opt-in record ─────────────────────────────────────────────────
+    # Stripe Checkout's phone collection field is presented next to the
+    # subscription-purchase consent on the same form. Treat completion as
+    # an opt-in to operational SMS (BALANCE / WALLET / etc) and the
+    # accelerated-wallet-push offer. Only insert if we have a phone AND
+    # no opt-in row exists yet for this subscriber.
+    if customer_phone and subscriber.id:
+        try:
+            with db.begin_nested():
+                from src.core.models import SmsOptIn as _SmsOptIn
+                existing_opt = db.execute(
+                    select(_SmsOptIn).where(_SmsOptIn.subscriber_id == subscriber.id)
+                ).scalar_one_or_none()
+                if existing_opt is None:
+                    db.add(_SmsOptIn(
+                        phone=customer_phone,
+                        subscriber_id=subscriber.id,
+                        source="widget",
+                        opt_in_message="Stripe Checkout phone collection",
+                        opted_in_at=now,
+                    ))
+                    logger.info(
+                        "SmsOptIn created from Stripe Checkout: subscriber=%s phone=%s",
+                        subscriber.id, customer_phone,
+                    )
+        except Exception as exc:
+            logger.warning("SmsOptIn insert failed for subscriber=%s: %s", subscriber.id, exc)
+
+    # ── Push to GHL stage 5 ────────────────────────────────────────────────
+    try:
+        with db.begin_nested():
+            push_subscriber_to_ghl(
+                subscriber,
+                stage=5,
+                zip_codes=list(zip_codes),
+                is_founding=is_founding,
+                db=db,
+            )
     except Exception:
         logger.error(
             "GHL push failed for subscriber %s — continuing without CRM sync",
@@ -810,17 +970,29 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
             exc_info=True,
         )
 
-    # ── Welcome email + first leads (new subscribers only) ────────────────
+    # ── Welcome/upgrade email + first leads (new subscribers only) ────────
     # Skipped when we merged onto an existing row — subscriber is already onboarded.
     if is_new_subscriber:
-        if subscriber.email:
+        if subscriber.email and dashboard_upgrade:
+            # Already has dashboard access (e.g. free-tier subscriber upgrading
+            # from their own dashboard) — no magic link needed, just confirm
+            # the plan change.
+            try:
+                from src.services.email import send_upgrade_confirmation_email
+                send_upgrade_confirmation_email(subscriber)
+            except Exception:
+                logger.error(
+                    "Upgrade confirmation email failed for subscriber %s", subscriber.id, exc_info=True,
+                )
+        elif subscriber.email:
             from src.services.email import send_welcome_email
             from src.services import subscriber_auth
             # Magic-link login — issue a fresh one-time link for the welcome
             # email. No password is ever generated or emailed.
             magic_url = None
             try:
-                raw = subscriber_auth.issue_magic_link(subscriber, db)
+                with db.begin_nested():
+                    raw = subscriber_auth.issue_magic_link(subscriber, db)
                 magic_url = subscriber_auth.magic_link_url(raw)
             except Exception:
                 magic_url = None
@@ -828,7 +1000,10 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
                     "Magic-link issuance failed for subscriber %s — sending welcome without it",
                     subscriber.id, exc_info=True,
                 )
-            send_welcome_email(subscriber, magic_link_url=magic_url)
+            try:
+                send_welcome_email(subscriber, magic_link_url=magic_url)
+            except Exception:
+                logger.error("Welcome email failed for subscriber %s", subscriber.id, exc_info=True)
 
         if subscriber.email and zip_codes:
             try:
@@ -840,21 +1015,27 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
                 )
 
         # ── Speed-to-lead: instantly alert the founder of the new signup ────
-        from src.services.owner_alert import notify_owner
-        notify_owner(
-            subject=f"New subscriber — {subscriber.tier} {vertical}",
-            body=(
-                f"New subscriber signed up.\nTier: {subscriber.tier}\nVertical: {vertical}\n"
-                f"County: {county_id}\nZIPs: {', '.join(zip_codes)}\nEmail: {subscriber.email}"
-            ),
-            idempotency_key=f"stripe:{session.get('id', '')}",
-        )
+        try:
+            from src.services.owner_alert import notify_owner
+            notify_owner(
+                subject=f"New subscriber — {subscriber.tier} {vertical}",
+                body=(
+                    f"New subscriber signed up.\nTier: {subscriber.tier}\nVertical: {vertical}\n"
+                    f"County: {county_id}\nZIPs: {', '.join(zip_codes)}\nEmail: {subscriber.email}"
+                ),
+                idempotency_key=f"stripe:{session.get('id', '')}",
+            )
+        except Exception:
+            logger.error(
+                "Founder alert notify_owner failed for subscriber %s", subscriber.id, exc_info=True,
+            )
 
         # Stage 12 — schedule the bankruptcy-alert invite (sent T+X min by the
         # invite sweep). Best-effort; never breaks checkout processing.
         try:
-            from src.services.bankruptcy_alert.invite import schedule_invite
-            schedule_invite(db, subscriber.id)
+            with db.begin_nested():
+                from src.services.bankruptcy_alert.invite import schedule_invite
+                schedule_invite(db, subscriber.id)
         except Exception:
             logger.warning(
                 "Bankruptcy invite scheduling failed for subscriber %s — non-critical",
@@ -864,12 +1045,13 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
     # ── Partner tier: provision multi-ZIP access ──────────────────────────
     # When a subscriber upgrades to the partner tier via checkout, we need to
     # lock all their chosen ZIPs and create the PartnerSubscription audit row.
-    # The ZIP locking loop above already handles individual ZIPs; this call
-    # sets the tier and creates the PartnerSubscription record.
+    # The fast path's ZIP locking loop already handles individual ZIPs; this
+    # call sets the tier and creates the PartnerSubscription record.
     if tier == "partner" and zip_codes:
         try:
-            from src.services.partner_tier import provision_partner_access
-            provision_partner_access(db, subscriber.id, zip_codes, vertical, county_id)
+            with db.begin_nested():
+                from src.services.partner_tier import provision_partner_access
+                provision_partner_access(db, subscriber.id, zip_codes, vertical, county_id)
         except Exception:
             logger.error(
                 "partner provision failed for subscriber %s — non-fatal, tier already set",
@@ -882,27 +1064,36 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
     # ReferralEvent to confirmed and credit the referrer. Idempotent:
     # confirm_purchase only matches pending rows, so a duplicate webhook
     # delivery is a no-op. Best-effort — referral failures must not break
-    # the checkout flow.
+    # anything after it.
+    # Each of these post-activation side-effects gets its own SAVEPOINT
+    # (db.begin_nested()) rather than a bare try/except. A bare except here
+    # only stops the *Python* exception from propagating — it does nothing
+    # about the DB session, which Postgres leaves in "current transaction is
+    # aborted" state after any failed statement. Every subsequent db.execute()
+    # on that same session then fails too, cascading into unrelated "non-fatal"
+    # warnings below. begin_nested() rolls back only to the savepoint on
+    # failure, leaving everything before it intact.
     try:
-        from src.services.referral_engine import confirm_purchase
-        event = confirm_purchase(subscriber.id, db)
-        if event is not None:
-            logger.info(
-                "[Referral] confirmed: referee=%d event=%d",
-                subscriber.id, event.id,
-            )
-            try:
-                with db.begin_nested():
-                    from src.services.referral_prompt_service import mark_confirmed
-                    mark_confirmed(
-                        event.referrer_subscriber_id, event.id, db,
-                        prompt_funnel_id=getattr(event, "prompt_funnel_id", None),
-                    )
-            except Exception:
-                logger.warning(
-                    "[ReferralPrompt] funnel confirm advance failed for event=%d — non-fatal",
-                    event.id, exc_info=True,
+        with db.begin_nested():
+            from src.services.referral_engine import confirm_purchase
+            event = confirm_purchase(subscriber.id, db)
+            if event is not None:
+                logger.info(
+                    "[Referral] confirmed: referee=%d event=%d",
+                    subscriber.id, event.id,
                 )
+                try:
+                    with db.begin_nested():
+                        from src.services.referral_prompt_service import mark_confirmed
+                        mark_confirmed(
+                            event.referrer_subscriber_id, event.id, db,
+                            prompt_funnel_id=getattr(event, "prompt_funnel_id", None),
+                        )
+                except Exception:
+                    logger.warning(
+                        "[ReferralPrompt] funnel confirm advance failed for event=%d — non-fatal",
+                        event.id, exc_info=True,
+                    )
     except Exception:
         logger.error(
             "[Referral] confirm/reward failed for subscriber %d — non-fatal",
@@ -912,29 +1103,31 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
     # Segmentation is post-activation analytics — never let it abort the handler
     # before the revenue-attribution + Meta CAPI steps below.
     try:
-        from src.services.segmentation_engine import reclassify_safe
-        from src.services.revenue_signal import ACTION_CHECKOUT_COMPLETED
-        reclassify_safe(subscriber.id, db, action_type=ACTION_CHECKOUT_COMPLETED)
+        with db.begin_nested():
+            from src.services.segmentation_engine import reclassify_safe
+            from src.services.revenue_signal import ACTION_CHECKOUT_COMPLETED
+            reclassify_safe(subscriber.id, db, action_type=ACTION_CHECKOUT_COMPLETED)
     except Exception:
         logger.warning("checkout: reclassify failed sub=%s — non-fatal", subscriber.id, exc_info=True)
 
     try:
-        from src.services.attribution_service import record_conversion_attribution
-        _tier_conv = {
-            "annual_lock":    "annual_upgrade",
-            "autopilot_lite": "autopilot_lite_upgrade",
-            "autopilot_pro":  "autopilot_pro_upgrade",
-        }
-        record_conversion_attribution(
-            conversion_type=_tier_conv.get(tier, "territory_lock_purchase"),
-            source_table="checkout_sessions",
-            source_event_id=session.get("id", ""),
-            subscriber_id=subscriber.id,
-            occurred_at=now,
-            zip_code=zip_codes[0] if zip_codes else None,
-            revenue_amount=round((session.get("amount_total") or 0) / 100, 2),
-            db=db,
-        )
+        with db.begin_nested():
+            from src.services.attribution_service import record_conversion_attribution
+            _tier_conv = {
+                "annual_lock":    "annual_upgrade",
+                "autopilot_lite": "autopilot_lite_upgrade",
+                "autopilot_pro":  "autopilot_pro_upgrade",
+            }
+            record_conversion_attribution(
+                conversion_type=_tier_conv.get(tier, "territory_lock_purchase"),
+                source_table="checkout_sessions",
+                source_event_id=session.get("id", ""),
+                subscriber_id=subscriber.id,
+                occurred_at=now,
+                zip_code=zip_codes[0] if zip_codes else None,
+                revenue_amount=round((session.get("amount_total") or 0) / 100, 2),
+                db=db,
+            )
     except Exception:
         logger.warning("Attribution recording failed sub=%s", subscriber.id, exc_info=True)
 
@@ -945,17 +1138,22 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
     # every tier this handler processes, not just ZIP lock upgrades —
     # matching the per-tier (not per-message) granularity already used
     # above for attribution/Meta CAPI.
-    from src.services.ab_engine import record_holdout_conversion
-    record_holdout_conversion(subscriber.id, "lock_close_holdout", db)
+    try:
+        with db.begin_nested():
+            from src.services.ab_engine import record_holdout_conversion
+            record_holdout_conversion(subscriber.id, "lock_close_holdout", db)
+    except Exception:
+        logger.warning("checkout: holdout conversion record failed sub=%s — non-fatal", subscriber.id, exc_info=True)
 
     # ── Meta CAPI (S2): report server-side Purchase ──────────────────────────
-    # Observer only — runs after the subscriber is active, ZIPs are locked, and
-    # attribution is recorded. Stamps campaign fields onto the subscriber when
-    # they're still NULL (never overwriting free-signup attribution), then fires
-    # the Purchase event. Feature-gated and fully isolated: a missing/failed Meta
-    # call must never roll back subscription activation.
+    # Observer only — runs after the subscriber is active and ZIPs are locked.
+    # Stamps campaign fields onto the subscriber when they're still NULL
+    # (never overwriting free-signup attribution), then fires the Purchase
+    # event. Feature-gated and fully isolated: a missing/failed Meta call must
+    # never affect anything else here.
     try:
-        _stamp_campaign_fields(subscriber, meta, db)
+        with db.begin_nested():
+            _stamp_campaign_fields(subscriber, meta, db)
         from src.services.meta_capi_service import fire_purchase_event
         fire_purchase_event(
             subscriber=subscriber,
@@ -976,68 +1174,71 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
 
     # Campaign conversion attribution (B6)
     try:
-        from src.services.campaign_attribution import (
-            decode_attribution_token,
-            record_conversion,
-            try_email_fallback,
-        )
-        campaign_token = meta.get("campaign_attribution_token")
-        attributed = False
-        if campaign_token:
-            cc_id = decode_attribution_token(campaign_token)
-            if cc_id:
-                attributed = record_conversion(
-                    db=db,
-                    campaign_contact_id=cc_id,
-                    subscriber_id=subscriber.id,
-                    signed_up_at=now,
-                )
-        if not attributed and customer_email:
-            try_email_fallback(db=db, email=customer_email, subscriber_id=subscriber.id, signed_up_at=now)
-        # Stamp acquisition_source if this was an email campaign signup
-        if attributed and subscriber.acquisition_source != "dbpr_email":
-            subscriber.acquisition_source = "dbpr_email"
-            db.add(subscriber)
+        with db.begin_nested():
+            from src.services.campaign_attribution import (
+                decode_attribution_token,
+                record_conversion,
+                try_email_fallback,
+            )
+            campaign_token = meta.get("campaign_attribution_token")
+            attributed = False
+            if campaign_token:
+                cc_id = decode_attribution_token(campaign_token)
+                if cc_id:
+                    attributed = record_conversion(
+                        db=db,
+                        campaign_contact_id=cc_id,
+                        subscriber_id=subscriber.id,
+                        signed_up_at=now,
+                    )
+            if not attributed and customer_email:
+                try_email_fallback(db=db, email=customer_email, subscriber_id=subscriber.id, signed_up_at=now)
+            # Stamp acquisition_source if this was an email campaign signup
+            if attributed and subscriber.acquisition_source != "dbpr_email":
+                subscriber.acquisition_source = "dbpr_email"
+                db.add(subscriber)
     except Exception:
         logger.warning("Campaign attribution failed sub=%s", subscriber.id, exc_info=True)
 
     # Affiliate referral: a paid checkout confirms a pending Affiliate Referral.
     try:
-        from src.services.affiliate_engine import confirm_referral
-        confirm_referral(db, subscriber.id)
+        with db.begin_nested():
+            from src.services.affiliate_engine import confirm_referral
+            confirm_referral(db, subscriber.id)
     except Exception:
         logger.warning("Affiliate confirm failed sub=%s", subscriber.id, exc_info=True)
 
     try:
-        from src.services.subscriber_memory import append_memory_event
+        with db.begin_nested():
+            from src.services.subscriber_memory import append_memory_event
 
-        occurred_at = now
-        if session.get("created"):
-            try:
-                occurred_at = datetime.fromtimestamp(session["created"], tz=timezone.utc)
-            except Exception:
-                occurred_at = now
+            occurred_at = now
+            if session.get("created"):
+                try:
+                    occurred_at = datetime.fromtimestamp(session["created"], tz=timezone.utc)
+                except Exception:
+                    occurred_at = now
 
-        append_memory_event(
-            db,
-            subscriber_id=subscriber.id,
-            stream_source="STRIPE",
-            event_type="checkout_completed",
-            source_event_id=session.get("id") or f"checkout:{stripe_customer_id}",
-            source_event_name="checkout.session.completed",
-            occurred_at=occurred_at,
-            status="completed",
-            summary=f"Subscriber completed checkout for {tier} plan",
-            channel="stripe",
-            actor={"type": "system", "id": "stripe"},
-            raw={
-                "stripe_customer_id": stripe_customer_id,
-                "stripe_subscription_id": stripe_subscription_id,
-                "tier": tier,
-                "vertical": vertical,
-                "county_id": county_id,
-            },
-        )
+            append_memory_event(
+                db,
+                subscriber_id=subscriber.id,
+                stream_source="STRIPE",
+                event_type="checkout_completed",
+                source_event_id=session.get("id") or f"checkout:{stripe_customer_id}",
+                source_event_name="checkout.session.completed",
+                occurred_at=occurred_at,
+                status="completed",
+                summary=f"Subscriber completed checkout for {tier} plan",
+                channel="stripe",
+                actor={"type": "system", "id": "stripe"},
+                raw={
+                    "stripe_customer_id": stripe_customer_id,
+                    "stripe_subscription_id": stripe_subscription_id,
+                    "tier": tier,
+                    "vertical": vertical,
+                    "county_id": county_id,
+                },
+            )
     except Exception:
         logger.warning(
             "Subscriber memory projection failed for checkout sub=%s",
@@ -1046,10 +1247,8 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
         )
 
     logger.info(
-        "checkout.session.completed: subscriber=%s tier=%s vertical=%s"
-        " founding=%s zips=%s feed_uuid=%s",
-        subscriber.id, tier, vertical, is_founding,
-        zip_codes, subscriber.event_feed_uuid,
+        "checkout.session.completed: deferred work finished — subscriber=%s tier=%s vertical=%s",
+        subscriber.id, tier, vertical,
     )
 
 
