@@ -307,21 +307,38 @@ def _on_checkout_completed(session: dict, db: Session, background_tasks=None) ->
     Must stay short: this is what blocks Stripe's ack, and it's the only part
     the subscriber's own dashboard depends on becoming visible.
 
-    Does only what's needed for the subscriber to see their upgrade land:
+    Does what's needed for the subscriber to see their upgrade land, PLUS
+    anything that must never be silently lost (consent audit trail, revenue
+    accounting) — everything here commits atomically in one transaction:
       - Increment founding_subscriber_counts (atomic — already locked by stripe_service at checkout)
       - Create/update the Subscriber row (tier, status, Stripe ids, rate lock)
       - Lock ZIP territories
       - Bust the ZIP-availability cache
       - Generate event_feed_uuid (new subscribers only)
+      - Trial/price detection + link the checkout consent row to the
+        subscriber + activate the Customer Account/MRR ledger row (B1/M9)
+
+    That last group (consent linking, Customer Account/MRR activation) was
+    originally deferred alongside the marketing/analytics work below, but a
+    2026-07 review caught that this is wrong: FastAPI BackgroundTasks is
+    in-process and non-durable, so a deploy/crash/restart between the
+    webhook's ack and the background task running would silently lose that
+    work forever — and by then the webhook dedupe row has already committed,
+    so Stripe never retries to recover it. A missing consent link undermines
+    audit compliance; a missing MRR row makes revenue reporting silently
+    diverge from active subscribers. Neither is acceptable to lose that way,
+    so both moved into this committed path instead, each behind its own
+    db.begin_nested() savepoint so a failure in one can't poison the
+    subscriber/ZIP-lock commit or the sibling block.
 
     Everything else — GHL sync, welcome/upgrade/first-leads/founder-alert
-    emails, trial+price and saved-card detection (each an extra Stripe API
-    call), referral/segmentation/attribution/A-B-holdout bookkeeping, Meta
-    CAPI, campaign attribution, affiliate confirm, subscriber-memory
-    projection — is genuinely non-critical (none of it gates what the
-    subscriber sees) and is handed off to _checkout_completed_deferred() via
-    `background_tasks`, which runs AFTER the HTTP response to Stripe has
-    already been sent.
+    emails, saved-card detection (an extra Stripe API call), referral/
+    segmentation/attribution/A-B-holdout bookkeeping, Meta CAPI, campaign
+    attribution, affiliate confirm, subscriber-memory projection — genuinely
+    is best-effort (losing one doesn't corrupt an audit trail or a revenue
+    number, just a marketing/analytics side-channel) and is handed off to
+    _checkout_completed_deferred() via `background_tasks`, which runs AFTER
+    the HTTP response to Stripe has already been sent.
 
     Why this split exists (2026-07-20): this handler used to do all of the
     above inline, in one ~30+ second synchronous call chain — several
@@ -615,6 +632,124 @@ def _on_checkout_completed(session: dict, db: Session, background_tasks=None) ->
             stripe_customer_id,
         )
 
+    # ── Plan price + trial flags (fa048) + S1 plan resolution ────────────────
+    # Consent linking and MRR/revenue activation live in the fast, committed
+    # path (not the deferred BackgroundTasks half) because they must not be
+    # lost: BackgroundTasks is in-process and non-durable — a deploy, worker
+    # recycle, or crash between the webhook's ack and the background task
+    # running means it never executes, and the webhook dedupe row has already
+    # committed by then, so Stripe never retries to recover it. A missing
+    # consent link undermines audit compliance; a missing Customer Account/MRR
+    # row makes revenue reporting silently diverge from active subscribers.
+    # Each still gets its own db.begin_nested() savepoint so a failure in one
+    # can't poison the subscriber/ZIP-lock commit or each other.
+    _amount_total = session.get("amount_total") or 0
+    if _amount_total > 0:
+        subscriber.plan_price = round(_amount_total / 100, 2)
+
+    # Trial/price detection AND revenue_engine's price-based plan resolution
+    # below both need the subscription expanded with its price — fetch once,
+    # reuse for both (this used to be two separate, identical Stripe calls).
+    _sub_expanded = None
+    if stripe_subscription_id:
+        try:
+            _sub_expanded = stripe.Subscription.retrieve(
+                stripe_subscription_id, expand=["items.data.price"]
+            )
+        except Exception:
+            logger.warning(
+                "checkout: could not retrieve subscription %s for trial/price/plan resolution",
+                stripe_subscription_id, exc_info=True,
+            )
+
+    if _sub_expanded is not None and _amount_total == 0:
+        # Trial detection: Stripe sets amount_total=0 when trial_period_days > 0.
+        try:
+            with db.begin_nested():
+                _items = (_sub_expanded.get("items") or {}).get("data") or []
+                if _items:
+                    _unit = (_items[0].get("price") or {}).get("unit_amount") or 0
+                    if _unit:
+                        subscriber.plan_price = round(_unit / 100, 2)
+                _trial_end = _sub_expanded.get("trial_end")
+                if _trial_end:
+                    subscriber.is_trial = True
+                    subscriber.trial_ends_at = datetime.fromtimestamp(_trial_end, tz=timezone.utc)
+        except Exception:
+            logger.warning(
+                "checkout: trial/price extraction failed for subscription %s",
+                stripe_subscription_id, exc_info=True,
+            )
+
+    # B0-06: link the checkout consent row (written pre-subscriber, no subscriber_id
+    # yet) to the now-created subscriber, matched by this exact checkout session —
+    # not email, which could also match an old abandoned-checkout/waitlist row for
+    # the same address and wrongly hand its voice consent to this subscriber.
+    # Idempotent — guarded on subscriber_id IS NULL so a replayed webhook never
+    # re-touches an already-linked row.
+    _checkout_session_id = session.get("id")
+    if _checkout_session_id:
+        try:
+            with db.begin_nested():
+                from sqlalchemy import text as _text
+                db.execute(_text("""
+                    UPDATE consent_acceptances SET subscriber_id = :sid
+                    WHERE checkout_session_id = :session_id
+                      AND source_flow = 'checkout'
+                      AND subscriber_id IS NULL
+                """), {"sid": subscriber.id, "session_id": _checkout_session_id})
+        except Exception:
+            logger.warning(
+                "consent_acceptances subscriber_id link failed for session=%s (non-fatal)",
+                _checkout_session_id, exc_info=True,
+            )
+
+    # ── B1/M9: activate the bridged Customer Account + record MRR ────────────
+    # The only production entrypoint that seeds customer_accounts. Map the tier
+    # to a plan; if the tier isn't in the catalog yet (legacy/founding), skip
+    # activation rather than break checkout. Idempotent on the subscription id
+    # so a stale-replayed checkout never double-counts MRR.
+    try:
+        with db.begin_nested():
+            from src.services.revenue_engine import (
+                get_or_create_account, plan_id_for_price, plan_id_for_tier,
+                record_subscription_active,
+            )
+            # Resolve the plan by the subscription's price id first — the tier
+            # alone is ambiguous when several plans share it (e.g.
+            # founder_monthly and founder_annual both have tier='founder', so
+            # a tier-only lookup would pick one arbitrarily and record the
+            # wrong interval/MRR). Fall back to the tier when the price can't
+            # be determined.
+            _price_id = None
+            if _sub_expanded is not None:
+                _pitems = (_sub_expanded.get("items") or {}).get("data") or []
+                if _pitems:
+                    _price_id = (_pitems[0].get("price") or {}).get("id")
+            plan_id = plan_id_for_price(db, _price_id) or plan_id_for_tier(db, tier)
+            if plan_id is not None:
+                account = get_or_create_account(
+                    db, stripe_customer_id=stripe_customer_id, subscriber_id=subscriber.id,
+                )
+                record_subscription_active(
+                    db, account,
+                    plan_id=plan_id,
+                    stripe_subscription_id=stripe_subscription_id,
+                    current_period_end=None,
+                    stripe_event_id=f"checkout:{stripe_subscription_id}" if stripe_subscription_id else None,
+                    now=now,
+                )
+            else:
+                logger.warning(
+                    "checkout: no plan mapped for tier=%s — skipping S1 account activation "
+                    "(customer=%s)", tier, stripe_customer_id,
+                )
+    except Exception:
+        logger.error(
+            "revenue_engine checkout activation failed for customer %s",
+            stripe_customer_id, exc_info=True,
+        )
+
     # ── Lock ZIP territories (same transaction) ────────────────────────────
     for zip_code in zip_codes:
         territory = db.execute(
@@ -728,12 +863,18 @@ def _checkout_completed_deferred(db: Session, subscriber, session: dict, is_new_
     _on_checkout_completed uses when called without `background_tasks` (same
     session — scripts/tests/admin replay).
 
-    Covers: trial/price detection + S1 plan resolution (one merged Stripe
-    subscription retrieve — this used to be two separate, identical calls),
-    consent-row linking, saved-card detection, TCPA opt-in, GHL sync, welcome/
-    upgrade + first-leads + founder-alert emails, partner-tier provisioning,
-    referral confirmation, segmentation, attribution, A/B holdout, Meta CAPI,
-    campaign attribution, affiliate confirm, subscriber-memory projection.
+    Covers: saved-card detection, TCPA opt-in, GHL sync, welcome/upgrade +
+    first-leads + founder-alert emails, partner-tier provisioning, referral
+    confirmation, segmentation, attribution, A/B holdout, Meta CAPI, campaign
+    attribution, affiliate confirm, subscriber-memory projection.
+
+    Trial/price detection, S1 plan resolution, consent-row linking, and
+    Customer Account/MRR activation are NOT here — they moved to the fast,
+    committed path in _on_checkout_completed. BackgroundTasks is in-process
+    and non-durable (lost on a deploy/crash/restart between the webhook ack
+    and this running, with no retry since the dedupe row already committed),
+    which is an acceptable trade-off for the marketing/analytics work below
+    but not for consent audit records or revenue accounting.
     """
     meta = session.get("metadata", {}) or {}
     tier        = meta.get("tier")
@@ -749,118 +890,6 @@ def _checkout_completed_deferred(db: Session, subscriber, session: dict, is_new_
     customer_email         = _raw_email.lower().strip() or None
     customer_phone         = (session.get("customer_details", {}) or {}).get("phone") or None
     now = datetime.now(timezone.utc)
-
-    # ── Plan price + trial flags (fa048) + S1 plan resolution ────────────────
-    # amount_total is in cents; represents the charge for this billing period.
-    # For active (non-trial) subscriptions this equals the monthly plan price.
-    _amount_total = session.get("amount_total") or 0
-    if _amount_total > 0:
-        subscriber.plan_price = round(_amount_total / 100, 2)
-
-    # Both trial/price detection AND revenue_engine's price-based plan
-    # resolution used to each make their OWN stripe.Subscription.retrieve call
-    # with the identical expand=["items.data.price"] — one genuinely
-    # duplicated network round-trip. Fetch once here, reuse for both.
-    _sub_expanded = None
-    if stripe_subscription_id:
-        try:
-            _sub_expanded = stripe.Subscription.retrieve(
-                stripe_subscription_id, expand=["items.data.price"]
-            )
-        except Exception:
-            logger.warning(
-                "checkout: could not retrieve subscription %s for trial/price/plan resolution",
-                stripe_subscription_id, exc_info=True,
-            )
-
-    if _sub_expanded is not None and _amount_total == 0:
-        # Trial detection: Stripe sets amount_total=0 when trial_period_days > 0.
-        try:
-            with db.begin_nested():
-                _items = (_sub_expanded.get("items") or {}).get("data") or []
-                if _items:
-                    _unit = (_items[0].get("price") or {}).get("unit_amount") or 0
-                    if _unit:
-                        subscriber.plan_price = round(_unit / 100, 2)
-                _trial_end = _sub_expanded.get("trial_end")
-                if _trial_end:
-                    subscriber.is_trial = True
-                    subscriber.trial_ends_at = datetime.fromtimestamp(_trial_end, tz=timezone.utc)
-        except Exception:
-            logger.warning(
-                "checkout: trial/price extraction failed for subscription %s",
-                stripe_subscription_id, exc_info=True,
-            )
-
-    # B0-06: link the checkout consent row (written pre-subscriber, no subscriber_id
-    # yet) to the now-created subscriber, matched by this exact checkout session —
-    # not email, which could also match an old abandoned-checkout/waitlist row for
-    # the same address and wrongly hand its voice consent to this subscriber.
-    # Idempotent — guarded on subscriber_id IS NULL so a replayed webhook never
-    # re-touches an already-linked row.
-    _checkout_session_id = session.get("id")
-    if _checkout_session_id:
-        try:
-            with db.begin_nested():
-                from sqlalchemy import text as _text
-                db.execute(_text("""
-                    UPDATE consent_acceptances SET subscriber_id = :sid
-                    WHERE checkout_session_id = :session_id
-                      AND source_flow = 'checkout'
-                      AND subscriber_id IS NULL
-                """), {"sid": subscriber.id, "session_id": _checkout_session_id})
-        except Exception:
-            logger.warning(
-                "consent_acceptances subscriber_id link failed for session=%s (non-fatal)",
-                _checkout_session_id, exc_info=True,
-            )
-
-    # ── B1/M9: activate the bridged Customer Account + record MRR ────────────
-    # The only production entrypoint that seeds customer_accounts. Map the tier
-    # to a plan; if the tier isn't in the catalog yet (legacy/founding), skip
-    # activation rather than break checkout. Idempotent on the subscription id
-    # so a stale-replayed checkout never double-counts MRR. Fully defensive —
-    # the S1 ledger must never roll back the proven subscriber-creation path.
-    try:
-        with db.begin_nested():
-            from src.services.revenue_engine import (
-                get_or_create_account, plan_id_for_price, plan_id_for_tier,
-                record_subscription_active,
-            )
-            # Resolve the plan by the subscription's price id first — the tier
-            # alone is ambiguous when several plans share it (e.g.
-            # founder_monthly and founder_annual both have tier='founder', so
-            # a tier-only lookup would pick one arbitrarily and record the
-            # wrong interval/MRR). Fall back to the tier when the price can't
-            # be determined.
-            _price_id = None
-            if _sub_expanded is not None:
-                _pitems = (_sub_expanded.get("items") or {}).get("data") or []
-                if _pitems:
-                    _price_id = (_pitems[0].get("price") or {}).get("id")
-            plan_id = plan_id_for_price(db, _price_id) or plan_id_for_tier(db, tier)
-            if plan_id is not None:
-                account = get_or_create_account(
-                    db, stripe_customer_id=stripe_customer_id, subscriber_id=subscriber.id,
-                )
-                record_subscription_active(
-                    db, account,
-                    plan_id=plan_id,
-                    stripe_subscription_id=stripe_subscription_id,
-                    current_period_end=None,
-                    stripe_event_id=f"checkout:{stripe_subscription_id}" if stripe_subscription_id else None,
-                    now=now,
-                )
-            else:
-                logger.warning(
-                    "checkout: no plan mapped for tier=%s — skipping S1 account activation "
-                    "(customer=%s)", tier, stripe_customer_id,
-                )
-    except Exception:
-        logger.error(
-            "revenue_engine checkout activation failed for customer %s",
-            stripe_customer_id, exc_info=True,
-        )
 
     # ── Saved-card flag (fa016 followup #20) ─────────────────────────────────
     # Read default_payment_method from the session's payment_intent
