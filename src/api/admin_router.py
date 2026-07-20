@@ -1018,12 +1018,15 @@ def roas(
     return results
 
 
-# Manual-entry channels for marketing_spend — Quora (quora_topics.cumulative_spend)
-# and affiliate (affiliate_payout_ledger) already track real cost and are
-# auto-pulled by the CAC/payback compiler; they are deliberately excluded here
-# to avoid double-entry. Must match the compiler's channel-key vocabulary
-# (COALESCE(subscribers.utm_source, subscribers.signup_source)).
-MANUAL_SPEND_CHANNELS = frozenset({"facebook", "google", "dbpr_email"})
+# Manual-entry channels for marketing_spend. "meta" is the single combined
+# channel for Facebook + Instagram ad spend — the compiler's channel-key
+# normalizes any utm_source of facebook/instagram/fb/ig/meta into this one
+# bucket (revenue_metrics._CHANNEL_KEY_SQL), mirroring how meta_capi_service.py
+# already treats both placements as one Meta integration. Quora
+# (quora_topics.cumulative_spend) and affiliate (affiliate_payout_ledger)
+# already track real cost and are auto-pulled by the CAC/payback compiler;
+# they are deliberately excluded here to avoid double-entry.
+MANUAL_SPEND_CHANNELS = frozenset({"meta", "google", "dbpr_email"})
 
 
 class MarketingSpendCreateRequest(BaseModel):

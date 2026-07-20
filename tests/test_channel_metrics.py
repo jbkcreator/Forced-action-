@@ -6,7 +6,7 @@ marketing_spend rows are isolated from any real committed data in shared
 tables. quora_topics.cumulative_spend and affiliate_payout_ledger have no
 per-window isolation available (see revenue_metrics.compute_channel_metrics
 docstring — a documented approximation), so those two channels are asserted
-loosely (present, non-negative), while facebook/google — driven entirely by
+loosely (present, non-negative), while meta/google — driven entirely by
 mrr_movements + marketing_spend inside the 2099 window — get exact assertions.
 """
 from datetime import date, datetime, timezone
@@ -45,33 +45,58 @@ def _acct(db, sub, *, mrr):
     return a
 
 
-def test_facebook_channel_cac_and_payback(fresh_db):
+def test_meta_channel_cac_and_payback(fresh_db):
     db = fresh_db
     sub = _sub(db, utm_source="facebook")
     acct = _acct(db, sub, mrr=10000)  # $100/mo
     db.add(MrrMovement(account_id=acct.account_id, movement_type="new",
                        delta_cents=10000, mrr_after_cents=10000, effective_at=_IN))
     db.add(MarketingSpend(
-        channel="facebook", period_start=_SPEND_START, period_end=_SPEND_END,
+        channel="meta", period_start=_SPEND_START, period_end=_SPEND_END,
         amount_cents=50000,  # $500 spend, 1 new customer → CAC $500
     ))
     db.flush()
 
     rows = compute_channel_metrics(db, FRM, TO)
-    fb = _channel_row(rows, "facebook")
-    assert fb is not None
-    assert fb["new_customers"] == 1
-    assert fb["revenue_cents"] == 10000
-    assert fb["spend_cents"] == 50000
-    assert fb["cac_cents"] == 50000
-    # avg_mrr_cents is a live snapshot across ALL active facebook-channel
+    meta = _channel_row(rows, "meta")
+    assert meta is not None
+    assert meta["new_customers"] == 1
+    assert meta["revenue_cents"] == 10000
+    assert meta["spend_cents"] == 50000
+    assert meta["cac_cents"] == 50000
+    # avg_mrr_cents is a live snapshot across ALL active meta-channel
     # accounts (mirrors compute_revenue_metrics' un-windowed mrr_cents
     # convention) — not scoped to this test's seed data, so other committed
-    # facebook accounts in the shared dev DB affect the average. Assert
+    # meta accounts in the shared dev DB affect the average. Assert
     # shape/positivity rather than an exact value; cac_cents above is the
     # fully window-scoped, deterministic assertion.
-    assert fb["payback_months"] is not None
-    assert fb["payback_months"] > 0
+    assert meta["payback_months"] is not None
+    assert meta["payback_months"] > 0
+
+
+def test_facebook_and_instagram_utm_source_combine_into_one_meta_channel(fresh_db):
+    # Regression guard: Meta ad placements tag utm_source differently
+    # (facebook vs instagram) but must roll up into ONE combined 'meta'
+    # channel — mirroring how meta_capi_service.py already treats both
+    # placements as a single Meta integration (via the shared fbclid).
+    db = fresh_db
+    fb_sub = _sub(db, utm_source="facebook")
+    ig_sub = _sub(db, utm_source="instagram")
+    fb_acct = _acct(db, fb_sub, mrr=10000)
+    ig_acct = _acct(db, ig_sub, mrr=15000)
+    db.add(MrrMovement(account_id=fb_acct.account_id, movement_type="new",
+                       delta_cents=10000, mrr_after_cents=10000, effective_at=_IN))
+    db.add(MrrMovement(account_id=ig_acct.account_id, movement_type="new",
+                       delta_cents=15000, mrr_after_cents=15000, effective_at=_IN))
+    db.flush()
+
+    rows = compute_channel_metrics(db, FRM, TO)
+    assert _channel_row(rows, "facebook") is None
+    assert _channel_row(rows, "instagram") is None
+    meta = _channel_row(rows, "meta")
+    assert meta is not None
+    assert meta["new_customers"] >= 2
+    assert meta["revenue_cents"] >= 25000
 
 
 def test_no_spend_yields_null_cac(fresh_db):

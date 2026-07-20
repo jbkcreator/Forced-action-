@@ -3,7 +3,8 @@
 **Source of truth for scope:** `tasks/13-07-26/FA-Next-Build-Developer-Brief-FINAL-v3.md` (Block 4, lines 261–284; Section 4 gating; Section 6 anti-overbid).
 **Codebase verified:** dev branch, direct read of services/models/routers (this session).
 **Decisions locked:**
-- **Channel key = `COALESCE(utm_source, signup_source)`** (NOT coarse `signup_source` alone) — paid channels (Meta/Quora/Google) all land as `signup_source='landing_page'` and are only distinguishable by `utm_source`. See §2.8. `signup_source` itself is unchanged (locked 9-value CHECK allow-list); the report's channel *dimension* uses the COALESCE.
+- **Channel key = `COALESCE(utm_source-normalized, signup_source)`** (NOT coarse `signup_source` alone) — paid channels (Meta/Quora/Google) all land as `signup_source='landing_page'` and are only distinguishable by `utm_source`. See §2.8. `signup_source` itself is unchanged (locked 9-value CHECK allow-list); the report's channel *dimension* uses the COALESCE.
+- **Meta normalization (REVISED)**: `utm_source` values `facebook`/`instagram`/`fb`/`ig`/`meta` all collapse into one combined `meta` channel — Facebook and Instagram are both Meta ad placements and must report as a single channel, matching how `meta_capi_service.py` already treats them as one integration (via the shared `fbclid`, which isn't persisted onto `Subscriber` so `utm_source` normalization is the durable equivalent). `MANUAL_SPEND_CHANNELS` in `admin_router.py` uses `meta` (not `facebook`) as the manual-entry channel name.
 - **Spend sourcing = hybrid**: admin manually enters Meta/Google/email spend into a `marketing_spend` table; the compiler **auto-pulls** Quora spend (`quora_topics.cumulative_spend`) and affiliate cost (`affiliate_payout_ledger`) from existing tables — no double-entry.
 - **Admin entry UI** lives in the `Forced-action-ui` admin section (new sub-section next to the existing `RoasDashboard.jsx`).
 - **Report surface = frontend admin UI only (`CacDashboard.jsx` + `GET /api/admin/cac-payback`)** — REVISED. A `daily_dashboard.py` PDF section was considered but dropped: the brief's DoD only requires "the weekly CAC/payback report compiles per channel," it does not mandate a PDF; the admin endpoint + dashboard already satisfy that, and editing the 2,884-line task file + 1,159-line Jinja template was a materially bigger, riskier change for no added requirement. Feeds Block 8 the same way.
@@ -72,7 +73,7 @@ The capture-and-persist pipeline for **#22 is already built end-to-end.** Nothin
 
 | Channel (report row) | Underlying capture | Cost source for CAC |
 |---|---|---|
-| **facebook / meta** | `signup_source=landing_page` + `utm_source=facebook` + `fbclid` (`meta_capi_service.py`) | **Manual** (`marketing_spend`) |
+| **meta** (Facebook + Instagram, combined) | `signup_source=landing_page` + `utm_source∈{facebook,instagram,fb,ig,meta}` normalized → `meta` + `fbclid` (`meta_capi_service.py`) | **Manual** (`marketing_spend`, channel=`meta`) |
 | **google / other paid** | `landing_page` + `utm_source=google` | **Manual** (`marketing_spend`) |
 | **quora** | `landing_page` + `utm_campaign=quora_<slug>` (`quora_attribution.py`) | **Auto** — `quora_topics.cumulative_spend` (models:4102) |
 | **dbpr_email (Instantly)** | `signup_source=dbpr_email`, HMAC token (`campaign_attribution.py`) | **Manual** — Instantly is flat monthly, no per-campaign cost via API; analytics endpoint returns engagement only (`instantly_service.py:127`), no spend field |
@@ -127,10 +128,10 @@ The new-subscriber constructor at `stripe_webhooks.py:491–506` omits `signup_s
 
 ### Phase 2 — Marketing spend ledger (unblocks #23)
 
-Manual entry is only for channels with NO stored cost: **Meta, Google, email/Instantly.** Quora and affiliate are auto-pulled in Phase 3.
+Manual entry is only for channels with NO stored cost: **Meta (combined Facebook+Instagram), Google, email/Instantly.** Quora and affiliate are auto-pulled in Phase 3.
 
 **2.1 New model** — `src/core/models.py`: `MarketingSpend`
-- Columns: `id` BigInteger PK; `channel` String (must match a `utm_source`/`signup_source` value used by the channel key — e.g. `facebook`, `google`, `dbpr_email`); `campaign_key` String nullable (optional `utm_campaign` for finer entry); `period_start` Date, `period_end` Date; `amount_cents` Integer; `currency` String(3) default `usd`; `notes` Text; `created_at`/`updated_at`.
+- Columns: `id` BigInteger PK; `channel` String (must match the compiler's normalized channel-key vocabulary — `meta`, `google`, `dbpr_email`); `campaign_key` String nullable (optional `utm_campaign` for finer entry); `period_start` Date, `period_end` Date; `amount_cents` Integer; `currency` String(3) default `usd`; `notes` Text; `created_at`/`updated_at`.
 - Unique on `(channel, campaign_key, period_start, period_end)` — idempotent entry.
 - `channel` values validated against an allow-list so manual spend joins the compiler's channel key (see §7 — spend-vocabulary risk).
 
@@ -180,7 +181,7 @@ Verified frontend conventions (see §8 for the full map). All admin calls go thr
 - Tabs: `{id:'add', label:'Add Spend', Component: MarketingSpendForm}`, `{id:'cac', label:'CAC / Payback', Component: CacDashboard}`. Each Component receives `token` as a prop.
 
 **4.3 Spend-entry form** — `src/components/admin/MarketingSpendForm.jsx` (mirror `CreateEmailCampaignModal.jsx` form logic, drop the Modal)
-- Single `form` state object + `set(key,val)`; native inputs: `<select>` channel (allow-list: facebook, google, dbpr_email — **only the manual channels**; Quora/affiliate excluded, they're auto), `type="date"` period_start/period_end, `type="number" step="0.01"` amount ($), `type="text"` optional campaign_key + notes.
+- Single `form` state object + `set(key,val)`; native inputs: `<select>` channel (allow-list: `meta` (combined Facebook+Instagram), `google`, `dbpr_email` — **only the manual channels**; Quora/affiliate excluded, they're auto), `type="date"` period_start/period_end, `type="number" step="0.01"` amount ($), `type="text"` optional campaign_key + notes.
 - Inline validation (channel required, amount > 0, period_start ≤ period_end); `handleSubmit` → `createMarketingSpend`; success/error banners (emerald/red) + disabled "Saving…" button, per the existing pattern.
 - Below the form: a table of recent spend rows via `fetchMarketingSpend` (reuse the RoasDashboard table styling), with the auto-sourced Quora/affiliate spend shown read-only + labeled "(auto)".
 
@@ -248,14 +249,14 @@ Per brief Section 6 and verified in code, bill these as **wiring/extension only*
 **Phase 2 — marketing spend store (backend done; FE form pending)**
 - [x] `src/core/models.py` — `MarketingSpend` model
 - [x] `migrations/apply_marketing_spend.py` — idempotent create + unique index; **run against dev DB**
-- [x] `src/api/admin_router.py` — `POST/GET /api/admin/marketing-spend` (allow-list validated: facebook/google/dbpr_email only)
+- [x] `src/api/admin_router.py` — `POST/GET /api/admin/marketing-spend` (allow-list validated: meta/google/dbpr_email only — meta is the combined Facebook+Instagram channel)
 - [ ] `Forced-action-ui/src/api/admin.js` — `createMarketingSpend`, `fetchMarketingSpend`
 - [ ] `Forced-action-ui/.../MarketingSpendForm.jsx` — entry form + recent-rows table
 
 **Phase 3 — CAC compiler (backend done; FE view pending; no PDF)**
 - [x] `src/services/revenue_metrics.py` — `compute_channel_metrics(db, frm, to)` — channel key `COALESCE(utm_source, quora-via-utm_campaign-prefix, signup_source)`; hybrid spend join: manual + Quora (`quora_topics.cumulative_spend`) + affiliate (`affiliate_payout_ledger`)
 - [x] `src/api/admin_router.py` — `GET /api/admin/cac-payback` (wraps the function)
-- [x] `tests/test_channel_metrics.py` — 4 tests, all passing: CAC/payback correctness, null-spend case, Quora regression guard (DoD #2)
+- [x] `tests/test_channel_metrics.py` — 5 tests, all passing: CAC/payback correctness, null-spend case, Quora regression guard, Meta facebook+instagram combine-into-one-channel regression guard (DoD #2)
 - [ ] ~~`src/tasks/daily_dashboard.py` PDF section~~ — DROPPED; admin UI only satisfies the DoD (see decision log)
 - [ ] `Forced-action-ui/src/api/admin.js` — `fetchCacPayback`
 - [ ] `Forced-action-ui/.../CacDashboard.jsx` — CAC/payback table

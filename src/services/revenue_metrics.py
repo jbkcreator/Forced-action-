@@ -132,14 +132,28 @@ def compute_revenue_metrics(db: Session, frm: datetime, to: datetime) -> dict:
     }
 
 
-# Channel dimension for CAC/payback (Block 4 #23). Quora is special-cased:
-# its producer (src/agents/graphs/quora_channel.py, see docs/adr/0021) stamps
-# only utm_campaign ("quora_<slug>"), never utm_source — so without this case
+# Channel dimension for CAC/payback (Block 4 #23).
+#
+# Meta is normalized to one combined 'meta' channel regardless of placement —
+# mirroring how meta_capi_service.py already treats Facebook and Instagram as
+# a single integration (identified there by the shared fbclid click-id, not by
+# platform name). fbclid itself is never persisted onto the subscriber row
+# (only passed transiently to the CAPI call), so utm_source is the only
+# durable signal here; any of facebook/instagram/fb/ig/meta collapse to 'meta'
+# so ad spend entered once against "meta" always matches every placement.
+#
+# Quora is special-cased separately: its producer
+# (src/agents/graphs/quora_channel.py, see docs/adr/0021) stamps only
+# utm_campaign ("quora_<slug>"), never utm_source — so without this case
 # Quora traffic would silently fall through to signup_source='landing_page'
 # and merge with organic/other paid traffic instead of its own row.
-_CHANNEL_KEY_SQL = """
+_META_UTM_SOURCES = ("facebook", "instagram", "fb", "ig", "meta")
+_META_SOURCE_NORMALIZE_SQL = " OR ".join(
+    f"lower(s.utm_source) = '{v}'" for v in _META_UTM_SOURCES
+)
+_CHANNEL_KEY_SQL = f"""
     COALESCE(
-        s.utm_source,
+        CASE WHEN {_META_SOURCE_NORMALIZE_SQL} THEN 'meta' ELSE s.utm_source END,
         CASE WHEN substring(s.utm_campaign from 1 for 6) = 'quora_' THEN 'quora' END,
         s.signup_source,
         'unattributed'
@@ -155,8 +169,8 @@ def compute_channel_metrics(db: Session, frm: datetime, to: datetime) -> list[di
     admin_router.py) or manual spend silently fails to join.
 
     Spend is hybrid, per §8 of the Block 4 plan:
-      - facebook / google / dbpr_email: manually entered, `marketing_spend`,
-        period-scoped.
+      - meta (facebook/instagram, normalized) / google / dbpr_email: manually
+        entered, `marketing_spend`, period-scoped.
       - quora: auto-read from `quora_topics.cumulative_spend` — a running
         total with no period column (Quora doesn't track spend per period),
         so it is attributed as a snapshot to every window queried rather than
