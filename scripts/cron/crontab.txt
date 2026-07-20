@@ -108,7 +108,12 @@ COUNTY_ID=hillsborough
 28 6,14,22 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.insurance.insurance_engine --county-id pinellas
 
 # 16. Load Validator — 06:30 AM UTC Mon-Sat (after all scrapers complete)
-30 6 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.load_validator
+# County passed POSITIONALLY (load_validator reads sys.argv[1]; no --county-id flag).
+30 6 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.load_validator hillsborough --log-name load_validator_hillsborough
+# 16a. Load Validator — Pinellas (+2 min stagger). Without this, Pinellas match-rate
+# regressions go unwatched — the county-wide default is hillsborough only.
+# Distinct --log-name so the two counties don't share one log/.status file.
+32 6 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.load_validator pinellas --log-name load_validator_pinellas
 
 # Quora S6 organic-answer pipeline — 06:35 AM UTC daily (after load validator).
 # Picks one keyword via DB rotation (quora_topics + cooldown_days), scrapes Quora,
