@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional
 
 import requests as _requests
 import stripe
-from fastapi import FastAPI, Header, HTTPException, Request, Depends, Query, Response
+from fastapi import FastAPI, Header, HTTPException, Request, Depends, Query, Response, BackgroundTasks
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
@@ -752,6 +752,26 @@ class CheckoutRequest(BaseModel):
     interval: str = "monthly"  # monthly | annual — only meaningful for founder (picks its price)
     consent_acceptance: Optional[ConsentAcceptanceRequest] = None
     attribution: Optional[dict] = None  # Meta Ads attribution (utm_*, campaign_id, fbclid, ...)
+    # True when the buyer already has an authenticated dashboard session (e.g.
+    # a free-tier subscriber upgrading from their dashboard), as opposed to an
+    # anonymous landing-page visitor who has never seen their dashboard yet.
+    # Tells the webhook to send an upgrade-confirmation email instead of the
+    # new-subscriber magic-link welcome (they don't need a fresh login link).
+    already_has_dashboard_access: bool = False
+    # Relative path Stripe should send the buyer back to after checkout
+    # completes (covers the 3DS-redirect path; the embedded modal's own
+    # onComplete callback is a separate, frontend-only concern). Must be a
+    # same-site relative path — defaults to the marketing /success page.
+    success_return_path: Optional[str] = None
+
+    @field_validator("success_return_path")
+    @classmethod
+    def _validate_success_return_path(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        if not v.startswith("/") or v.startswith("//"):
+            raise ValueError("success_return_path must be a same-site relative path")
+        return v
 
     @field_validator("interval")
     @classmethod
@@ -981,9 +1001,15 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
         "zip_codes": ",".join(payload.zip_codes),
         "price_source": cohort_source,
         "resolved_amount_cents": str(resolved_amount_cents) if resolved_amount_cents is not None else "",
+        "dashboard_upgrade": str(payload.already_has_dashboard_access),
     }
     # Meta Ads attribution + buyer IP/UA captured from the buyer's request.
     checkout_metadata.update(_attribution_stripe_metadata(request, payload.attribution))
+
+    _return_path = payload.success_return_path or "/success?session_id={CHECKOUT_SESSION_ID}"
+    if "{CHECKOUT_SESSION_ID}" not in _return_path:
+        _sep = "&" if "?" in _return_path else "?"
+        _return_path = f"{_return_path}{_sep}session_id={{CHECKOUT_SESSION_ID}}"
 
     try:
         session = stripe.checkout.Session.create(
@@ -992,7 +1018,7 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
             customer_email=payload.email,   # pre-fills email in Stripe form
             line_items=[line_item],
             metadata=checkout_metadata,
-            return_url=f"{_s.app_base_url}/success?session_id={{CHECKOUT_SESSION_ID}}",
+            return_url=f"{_s.app_base_url}{_return_path}",
         )
     except stripe.error.CardError as e:
         logger.warning("Stripe card error: %s", e.user_message)
@@ -1201,6 +1227,7 @@ def log_client_event(req: LogEventRequest):
 @app.post("/webhooks/stripe", status_code=200)
 async def stripe_webhook(
     request: Request,
+    background_tasks: BackgroundTasks,
     stripe_signature: str = Header(None, alias="stripe-signature"),
 ):
     if not stripe_signature:
@@ -1213,7 +1240,7 @@ async def stripe_webhook(
 
     with get_db_context() as db:
         try:
-            handle_webhook(raw_body, stripe_signature, db)
+            handle_webhook(raw_body, stripe_signature, db, background_tasks=background_tasks)
         except ValueError as e:
             logger.warning("Webhook signature/payload rejected: %s", str(e))
             raise HTTPException(
@@ -2064,6 +2091,7 @@ def event_feed(
             "feed_uuid": feed_uuid,
             "subscriber": {
                 "id": subscriber.id,
+                "email": subscriber.email,
                 "tier": subscriber.tier,
                 "vertical": subscriber.vertical,
                 "county_id": subscriber.county_id,
@@ -2270,6 +2298,7 @@ def event_feed(
             "feed_uuid": feed_uuid,
             "subscriber": {
                 "id": subscriber.id,
+                "email": subscriber.email,
                 "tier": subscriber.tier,
                 "vertical": subscriber.vertical,
                 "county_id": subscriber.county_id,
@@ -2548,6 +2577,7 @@ def event_feed(
         "feed_uuid": feed_uuid,
         "subscriber": {
             "id": subscriber.id,
+            "email": subscriber.email,
             "tier": subscriber.tier,
             "vertical": subscriber.vertical,
             "county_id": subscriber.county_id,
