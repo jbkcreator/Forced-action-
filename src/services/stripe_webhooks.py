@@ -39,6 +39,21 @@ from src.services import lead_exclusivity
 
 logger = logging.getLogger(__name__)
 
+# Months prepaid per billing interval — used to normalize a period charge into
+# a monthly run-rate for `Subscriber.plan_price` (read as MRR app-wide).
+_MONTHS_PER_INTERVAL = {"monthly": 1, "annual": 12}
+
+
+def normalized_monthly_price(amount_cents: int, interval: str) -> float:
+    """Convert a period charge (cents) into a monthly dollar run-rate.
+
+    An annual charge is a full year prepaid up front, so its MRR contribution is
+    the charge divided by 12. Unknown intervals fall back to monthly (divide by 1)
+    to preserve the historical behavior.
+    """
+    months = _MONTHS_PER_INTERVAL.get((interval or "monthly").lower(), 1)
+    return round(amount_cents / 100 / months, 2)
+
 
 def _attr(obj, key: str, default=None):
     """Read `key` from a Stripe SDK object or a plain dict.
@@ -89,6 +104,13 @@ def _stamp_campaign_fields(subscriber, meta, db: Session) -> None:
     ROAS endpoint. Only writes fields that are currently NULL so it never
     overwrites attribution captured earlier via /api/free-signup. Reads via
     `_attr` so it works for both plain dicts and Stripe SDK objects.
+
+    `signup_source` is handled separately (not NULL-only, since it has a
+    NOT NULL "direct" default): a still-unattributed subscriber (source in
+    direct/unknown/empty) upgrades to "landing_page" when campaign metadata
+    is present, via the same first-touch rule signup_engine._apply_signup_source
+    uses — so a subscriber who paid before /api/free-signup ran isn't stuck
+    recorded as "direct" even though utm_* is now known.
     """
     if meta is None:
         return
@@ -98,6 +120,11 @@ def _stamp_campaign_fields(subscriber, meta, db: Session) -> None:
         if value and getattr(subscriber, field, None) is None:
             setattr(subscriber, field, value)
             changed = True
+    if (_attr(meta, "utm_source") or _attr(meta, "campaign_id")) and (
+        (subscriber.signup_source or "").strip().lower() in ("", "direct", "unknown")
+    ):
+        subscriber.signup_source = "landing_page"
+        changed = True
     if changed:
         db.flush()
 
@@ -567,6 +594,10 @@ def _on_checkout_completed(session: dict, db: Session, background_tasks=None) ->
     if subscriber is None:
         # Genuinely new subscriber
         is_new_subscriber = True
+        # A buyer who checks out without ever hitting /api/free-signup first
+        # (no pre-provisioned tier='free' row) still carries campaign metadata
+        # on the Stripe session — record it as signup_source now so channel
+        # attribution isn't silently lost to the "direct" default (fa### fix).
         subscriber = Subscriber(
             stripe_customer_id=stripe_customer_id,
             stripe_subscription_id=stripe_subscription_id,
@@ -582,6 +613,7 @@ def _on_checkout_completed(session: dict, db: Session, background_tasks=None) ->
             name=customer_name,
             phone=customer_phone,
             ghl_stage=5,
+            signup_source="landing_page" if (meta.get("utm_source") or meta.get("campaign_id")) else "direct",
         )
         db.add(subscriber)
     else:
@@ -643,9 +675,15 @@ def _on_checkout_completed(session: dict, db: Session, background_tasks=None) ->
     # row makes revenue reporting silently diverge from active subscribers.
     # Each still gets its own db.begin_nested() savepoint so a failure in one
     # can't poison the subscriber/ZIP-lock commit or each other.
+    #
+    # amount_total is in cents = the charge for this billing period. `plan_price`
+    # is read as MONTHLY recurring revenue across the app, so an annual charge
+    # (a full year prepaid up front, e.g. founder annual) must be normalized to a
+    # monthly run-rate — otherwise it inflates MRR ~12x for every annual sub.
+    _interval = (meta.get("interval") or "monthly").lower()
     _amount_total = session.get("amount_total") or 0
     if _amount_total > 0:
-        subscriber.plan_price = round(_amount_total / 100, 2)
+        subscriber.plan_price = normalized_monthly_price(_amount_total, _interval)
 
     # Trial/price detection AND revenue_engine's price-based plan resolution
     # below both need the subscription expanded with its price — fetch once,
@@ -670,7 +708,7 @@ def _on_checkout_completed(session: dict, db: Session, background_tasks=None) ->
                 if _items:
                     _unit = (_items[0].get("price") or {}).get("unit_amount") or 0
                     if _unit:
-                        subscriber.plan_price = round(_unit / 100, 2)
+                        subscriber.plan_price = normalized_monthly_price(_unit, _interval)
                 _trial_end = _sub_expanded.get("trial_end")
                 if _trial_end:
                     subscriber.is_trial = True
@@ -1221,10 +1259,14 @@ def _checkout_completed_deferred(db: Session, subscriber, session: dict, is_new_
                         signed_up_at=now,
                     )
             if not attributed and customer_email:
-                try_email_fallback(db=db, email=customer_email, subscriber_id=subscriber.id, signed_up_at=now)
-            # Stamp acquisition_source if this was an email campaign signup
-            if attributed and subscriber.acquisition_source != "dbpr_email":
-                subscriber.acquisition_source = "dbpr_email"
+                attributed = try_email_fallback(db=db, email=customer_email, subscriber_id=subscriber.id, signed_up_at=now)
+            # Stamp signup_source if this was an email campaign signup. Subscriber
+            # has no `acquisition_source` column (that field only exists on
+            # CustomerAccount) — the previous write here was silently discarded
+            # by SQLAlchemy as a transient attribute. First-touch: only upgrades
+            # a still-unattributed subscriber, matching signup_engine's rule.
+            if attributed and (subscriber.signup_source or "").strip().lower() in ("", "direct", "unknown"):
+                subscriber.signup_source = "dbpr_email"
                 db.add(subscriber)
     except Exception:
         logger.warning("Campaign attribution failed sub=%s", subscriber.id, exc_info=True)

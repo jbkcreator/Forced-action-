@@ -108,6 +108,14 @@ def upsert_outcome_candidates_bulk(session: Session, candidates: list[OutcomeCan
     for i in range(0, len(rows), _BULK_BATCH):
         stmt = pg_insert(OutcomeCandidate).values(rows[i:i + _BULK_BATCH])
         excluded = stmt.excluded
+        # See upsert_outcome_candidate's docstring on outcome_changed below —
+        # identical semantics, batched.
+        outcome_changed = or_(
+            OutcomeCandidate.property_id.is_distinct_from(excluded.property_id),
+            OutcomeCandidate.event_type.is_distinct_from(excluded.event_type),
+            OutcomeCandidate.event_date.is_distinct_from(excluded.event_date),
+            OutcomeCandidate.amount.is_distinct_from(excluded.amount),
+        )
         stmt = stmt.on_conflict_do_update(
             constraint="uq_outcome_candidate",
             set_=dict(
@@ -120,6 +128,10 @@ def upsert_outcome_candidates_bulk(session: Session, candidates: list[OutcomeCan
                 match_confidence=excluded.match_confidence,
                 match_method=excluded.match_method,
                 updated_at=func.now(),
+                consumed_at=case(
+                    (outcome_changed, None),
+                    else_=OutcomeCandidate.consumed_at,
+                ),
             ),
         )
         session.execute(stmt)

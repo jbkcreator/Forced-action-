@@ -94,7 +94,21 @@ def test_price_resolves_the_correct_founder_interval(seeded):
     assert plan_id_for_price(seeded, ANNUAL_FAKE) == "founder_annual"
 
 
-@pytest.mark.skip(reason="entitlement_service ships on PR #144, not yet on dev")
-def test_gate_200_for_founder_403_for_lower():
-    """Once #144 merges: founder account -> 200 on founder-only surface,
-    starter/pro account -> 403. Assert against TIER_RANK via the live gate."""
+def test_gate_resolves_founder_tier_for_a_founder_account(seeded):
+    # entitlement_service now on dev — verify the gate resolves a founder
+    # account to the `founder` tier via the plans.plan_id -> plans.tier join,
+    # and that founder outranks lower tiers (so a founder-only surface passes
+    # for founder and a lower tier is below it).
+    import uuid
+
+    from src.services.entitlement_service import TIER_RANK, get_account_tier
+
+    account_id = uuid.uuid4()
+    seeded.execute(
+        text("INSERT INTO customer_accounts (account_id, plan_tier, status) "
+             "VALUES (:id, 'founder_monthly', 'active')"),
+        {"id": account_id},
+    )
+    assert get_account_tier(seeded, account_id) == "founder"
+    assert TIER_RANK["founder"] > TIER_RANK["pro"]
+    assert TIER_RANK["founder"] > TIER_RANK["starter"]

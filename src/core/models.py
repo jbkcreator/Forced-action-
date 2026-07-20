@@ -1344,7 +1344,7 @@ class Subscriber(Base):
         Index("idx_subscribers_icp_channel_key", "icp_channel_key"),
         Index("idx_subscriber_last_reactivation_at", "last_reactivation_attempt_at"),
         CheckConstraint(
-            "tier IN ('free', 'starter', 'pro', 'dominator', 'data_only', 'autopilot_lite', 'autopilot_pro', 'partner', 'annual_lock')",
+            "tier IN ('free', 'starter', 'pro', 'dominator', 'data_only', 'autopilot_lite', 'autopilot_pro', 'partner', 'annual_lock', 'founder')",
             name="check_subscriber_tier",
         ),
         CheckConstraint(
@@ -7042,6 +7042,46 @@ class MrrMovement(Base):
 
     def __repr__(self) -> str:
         return f"<MrrMovement(account_id={self.account_id}, type={self.movement_type}, delta={self.delta_cents})>"
+
+
+class MarketingSpend(Base):
+    """Manually-entered ad spend, for channels with no stored cost (Block 4).
+
+    Quora (`QuoraTopic.cumulative_spend`) and affiliate commissions
+    (`affiliate_payout_ledger`) already track real cost and are read directly
+    by the CAC/payback compiler — they are NOT entered here. `channel` MUST
+    use the same vocabulary as the compiler's channel key
+    (COALESCE(subscribers.utm_source, subscribers.signup_source)), enforced
+    by the admin route's allow-list, or the spend↔revenue join silently
+    misses and CAC breaks.
+    """
+    __tablename__ = "marketing_spend"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    channel: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    campaign_key: Mapped[Optional[str]] = mapped_column(Text)
+    period_start: Mapped[date] = mapped_column(Date, nullable=False)
+    period_end: Mapped[date] = mapped_column(Date, nullable=False)
+    amount_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    currency: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'usd'"))
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "channel", "campaign_key", "period_start", "period_end",
+            name="uq_marketing_spend_period",
+        ),
+        CheckConstraint("amount_cents >= 0", name="ck_marketing_spend_amount_nonneg"),
+        CheckConstraint("period_end >= period_start", name="ck_marketing_spend_period_order"),
+        Index("idx_marketing_spend_period", "period_start", "period_end"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<MarketingSpend(channel={self.channel}, period={self.period_start}..{self.period_end}, cents={self.amount_cents})>"
 
 
 class Delivery(Base):

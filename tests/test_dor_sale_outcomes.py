@@ -148,6 +148,35 @@ class TestStageOutcomesPG:
         assert len(rows) == 0
         assert result.skipped >= 1
 
+    def test_appraiser_unqualified_does_not_suppress_dor_qualified(self, fresh_db):
+        # Regression for PR #150 review finding #3: DOR's authoritative
+        # QUAL_CD says qualified but the appraiser marked the same
+        # property/month unqualified -- DOR's read must win, not be
+        # discarded as a false "overlap".
+        prop = _mk_property(fresh_db, "DSO-008")
+        fresh_db.execute(
+            text(
+                "INSERT INTO outcome_candidates "
+                "(property_id, county_id, source_type, source_table, source_id, event_type, event_date, amount) "
+                "VALUES (:pid, 'hillsborough', 'appraiser_sale_outcomes', 'financials', :pid, 'unqualified_sale', :d, 1)"
+            ),
+            {"pid": prop.id, "d": date(2026, 3, 15)},
+        )
+        _mk_dor_sale(fresh_db, prop.id, "DSOCLERK008", qual_cd="01", sale_yr=2026, sale_mo=3,
+                     sale_price=Decimal("275000.00"))
+
+        result = stage_outcomes(fresh_db, "hillsborough")
+        assert result.errors == 0
+
+        row = fresh_db.execute(
+            text("SELECT event_type, amount FROM outcome_candidates "
+                 "WHERE source_type = 'dor_sale_outcomes' AND property_id = :pid"),
+            {"pid": prop.id},
+        ).first()
+        assert row is not None
+        assert row.event_type == EVENT_TYPE_QUALIFIED_SALE
+        assert row.amount == Decimal("275000.00")
+
     def test_invalid_sale_mo_is_error_not_staged(self, fresh_db):
         prop = _mk_property(fresh_db, "DSO-006")
         _mk_dor_sale(fresh_db, prop.id, "DSOCLERK006", qual_cd="01", sale_mo=13)

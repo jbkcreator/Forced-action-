@@ -32,9 +32,9 @@ from config.settings import get_settings
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# Monthly founder price in cents. PLACEHOLDER pending the client's confirmed
-# founding rate — overwritten on re-run once the real number is known.
-FOUNDER_MONTHLY_CENTS = 99900
+# Monthly founder price in cents ($1,100/mo, client-confirmed 2026-07-20).
+# Annual = x10 ($11,000/yr, two months free).
+FOUNDER_MONTHLY_CENTS = 110000
 
 _SELECT_PRO_ENTITLEMENTS = text(
     "SELECT entitlements FROM plans WHERE plan_id = 'pro' AND is_active = true LIMIT 1"

@@ -17,6 +17,7 @@ from src.connectors.outcomes import (
     EVENT_TYPE_TAX_DEED_SOLD,
     OutcomeCandidateData,
     upsert_outcome_candidate,
+    upsert_outcome_candidates_bulk,
 )
 from src.core.models import Property
 
@@ -161,3 +162,95 @@ class TestPGUniqueKeyIncludesEventDate:
         ).fetchall()
         assert len(rows) == 1
         assert rows[0].amount == Decimal("999.00")
+
+
+class TestPGConsumedAtResetOnChange:
+    """
+    Regression coverage for PR #150 review finding #1: both upsert paths
+    must clear consumed_at when a re-stage changes a field the label layer
+    promotes (property_id/event_type/event_date/amount), so a source
+    correction (revised price, corrected terminal status) is re-promoted
+    instead of permanently stuck as consumed against a stale value.
+    """
+
+    def test_single_row_upsert_clears_consumed_at_on_amount_change(self, fresh_db):
+        prop = _mk_property(fresh_db, "CDE09-OC-201")
+        candidate = _candidate(property_id=prop.id, source_id=201, amount=Decimal("100.00"))
+        upsert_outcome_candidate(fresh_db, candidate)
+        fresh_db.execute(
+            text("UPDATE outcome_candidates SET consumed_at = NOW() "
+                 "WHERE source_type = :st AND source_table = :tbl AND source_id = 201"),
+            {"st": candidate.source_type, "tbl": candidate.source_table},
+        )
+
+        revised = _candidate(property_id=prop.id, source_id=201, amount=Decimal("999.00"))
+        upsert_outcome_candidate(fresh_db, revised)
+
+        row = fresh_db.execute(
+            text("SELECT consumed_at, amount FROM outcome_candidates "
+                 "WHERE source_type = :st AND source_table = :tbl AND source_id = 201"),
+            {"st": candidate.source_type, "tbl": candidate.source_table},
+        ).first()
+        assert row.consumed_at is None
+        assert row.amount == Decimal("999.00")
+
+    def test_single_row_upsert_keeps_consumed_at_on_audit_only_change(self, fresh_db):
+        prop = _mk_property(fresh_db, "CDE09-OC-202")
+        candidate = _candidate(property_id=prop.id, source_id=202)
+        upsert_outcome_candidate(fresh_db, candidate)
+        fresh_db.execute(
+            text("UPDATE outcome_candidates SET consumed_at = NOW() "
+                 "WHERE source_type = :st AND source_table = :tbl AND source_id = 202"),
+            {"st": candidate.source_type, "tbl": candidate.source_table},
+        )
+
+        same_outcome = _candidate(property_id=prop.id, source_id=202, counterparty="DIFFERENT NAME LLC")
+        upsert_outcome_candidate(fresh_db, same_outcome)
+
+        row = fresh_db.execute(
+            text("SELECT consumed_at FROM outcome_candidates "
+                 "WHERE source_type = :st AND source_table = :tbl AND source_id = 202"),
+            {"st": candidate.source_type, "tbl": candidate.source_table},
+        ).first()
+        assert row.consumed_at is not None
+
+    def test_bulk_upsert_clears_consumed_at_on_amount_change(self, fresh_db):
+        prop = _mk_property(fresh_db, "CDE09-OC-203")
+        first = _candidate(property_id=prop.id, source_id=203, amount=Decimal("100.00"))
+        upsert_outcome_candidates_bulk(fresh_db, [first])
+        fresh_db.execute(
+            text("UPDATE outcome_candidates SET consumed_at = NOW() "
+                 "WHERE source_type = :st AND source_table = :tbl AND source_id = 203"),
+            {"st": first.source_type, "tbl": first.source_table},
+        )
+
+        revised = _candidate(property_id=prop.id, source_id=203, amount=Decimal("999.00"))
+        upsert_outcome_candidates_bulk(fresh_db, [revised])
+
+        row = fresh_db.execute(
+            text("SELECT consumed_at, amount FROM outcome_candidates "
+                 "WHERE source_type = :st AND source_table = :tbl AND source_id = 203"),
+            {"st": first.source_type, "tbl": first.source_table},
+        ).first()
+        assert row.consumed_at is None
+        assert row.amount == Decimal("999.00")
+
+    def test_bulk_upsert_keeps_consumed_at_on_audit_only_change(self, fresh_db):
+        prop = _mk_property(fresh_db, "CDE09-OC-204")
+        first = _candidate(property_id=prop.id, source_id=204)
+        upsert_outcome_candidates_bulk(fresh_db, [first])
+        fresh_db.execute(
+            text("UPDATE outcome_candidates SET consumed_at = NOW() "
+                 "WHERE source_type = :st AND source_table = :tbl AND source_id = 204"),
+            {"st": first.source_type, "tbl": first.source_table},
+        )
+
+        same_outcome = _candidate(property_id=prop.id, source_id=204, counterparty="DIFFERENT NAME LLC")
+        upsert_outcome_candidates_bulk(fresh_db, [same_outcome])
+
+        row = fresh_db.execute(
+            text("SELECT consumed_at FROM outcome_candidates "
+                 "WHERE source_type = :st AND source_table = :tbl AND source_id = 204"),
+            {"st": first.source_type, "tbl": first.source_table},
+        ).first()
+        assert row.consumed_at is not None
