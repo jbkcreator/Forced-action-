@@ -130,3 +130,153 @@ def compute_revenue_metrics(db: Session, frm: datetime, to: datetime) -> dict:
         "cost_per_record_cents": int(cost_per_record_cents),
         "revenue_per_lead_cents": int(revenue_per_lead_cents),
     }
+
+
+# Channel dimension for CAC/payback (Block 4 #23). Quora is special-cased:
+# its producer (src/agents/graphs/quora_channel.py, see docs/adr/0021) stamps
+# only utm_campaign ("quora_<slug>"), never utm_source — so without this case
+# Quora traffic would silently fall through to signup_source='landing_page'
+# and merge with organic/other paid traffic instead of its own row.
+_CHANNEL_KEY_SQL = """
+    COALESCE(
+        s.utm_source,
+        CASE WHEN substring(s.utm_campaign from 1 for 6) = 'quora_' THEN 'quora' END,
+        s.signup_source,
+        'unattributed'
+    )
+"""
+
+
+def compute_channel_metrics(db: Session, frm: datetime, to: datetime) -> list[dict]:
+    """Per-channel CAC / payback rollup for the window [frm, to) (Block 4 #23).
+
+    Channel key: see `_CHANNEL_KEY_SQL`. Must match the vocabulary enforced by
+    the /api/admin/marketing-spend allow-list (MANUAL_SPEND_CHANNELS in
+    admin_router.py) or manual spend silently fails to join.
+
+    Spend is hybrid, per §8 of the Block 4 plan:
+      - facebook / google / dbpr_email: manually entered, `marketing_spend`,
+        period-scoped.
+      - quora: auto-read from `quora_topics.cumulative_spend` — a running
+        total with no period column (Quora doesn't track spend per period),
+        so it is attributed as a snapshot to every window queried rather than
+        split by [frm, to). Documented approximation, not a bug.
+      - affiliate: auto-read from `affiliate_payout_ledger` accrual lines
+        (minus clawbacks), period-scoped via `period_month`.
+      - all other channels: no spend source exists yet → CAC is null.
+
+    payback_months = CAC / avg monthly MRR per new customer on that channel
+    (simple margin proxy — true payback would additionally subtract per-lead
+    COGS from enrichment_usage_logs; documented later refinement, not built
+    here).
+    """
+    p = {"frm": frm, "to": to}
+    frm_date, to_date = frm.date(), to.date()
+
+    new_customers = {
+        r.channel: r.n
+        for r in db.execute(text(f"""
+            SELECT {_CHANNEL_KEY_SQL} AS channel, COUNT(DISTINCT mm.account_id) AS n
+            FROM mrr_movements mm
+            JOIN customer_accounts ca ON ca.account_id = mm.account_id
+            LEFT JOIN subscribers s ON s.id = ca.subscriber_id
+            WHERE mm.movement_type = 'new' AND mm.effective_at >= :frm AND mm.effective_at < :to
+            GROUP BY channel
+        """), p).fetchall()
+    }
+    revenue_cents = {
+        r.channel: r.cents
+        for r in db.execute(text(f"""
+            SELECT {_CHANNEL_KEY_SQL} AS channel, COALESCE(SUM(mm.delta_cents), 0) AS cents
+            FROM mrr_movements mm
+            JOIN customer_accounts ca ON ca.account_id = mm.account_id
+            LEFT JOIN subscribers s ON s.id = ca.subscriber_id
+            WHERE mm.movement_type IN ('new', 'expansion')
+              AND mm.effective_at >= :frm AND mm.effective_at < :to
+            GROUP BY channel
+        """), p).fetchall()
+    }
+    churn = {
+        r.channel: {"churn_cents": r.churn_cents, "churned_count": r.churned_count}
+        for r in db.execute(text(f"""
+            SELECT {_CHANNEL_KEY_SQL} AS channel,
+                   COALESCE(SUM(-mm.delta_cents), 0) AS churn_cents,
+                   COUNT(*) AS churned_count
+            FROM mrr_movements mm
+            JOIN customer_accounts ca ON ca.account_id = mm.account_id
+            LEFT JOIN subscribers s ON s.id = ca.subscriber_id
+            WHERE mm.movement_type = 'churn' AND mm.effective_at >= :frm AND mm.effective_at < :to
+            GROUP BY channel
+        """), p).fetchall()
+    }
+    active_mrr = {
+        r.channel: {"mrr_cents": r.mrr_cents, "active_count": r.active_count}
+        for r in db.execute(text(f"""
+            SELECT {_CHANNEL_KEY_SQL} AS channel,
+                   COALESCE(SUM(ca.mrr_cents), 0) AS mrr_cents,
+                   COUNT(*) AS active_count
+            FROM customer_accounts ca
+            LEFT JOIN subscribers s ON s.id = ca.subscriber_id
+            WHERE ca.status = 'active'
+            GROUP BY channel
+        """), p).fetchall()
+    }
+    manual_spend_cents = {
+        r.channel: r.cents
+        for r in db.execute(text("""
+            SELECT channel, COALESCE(SUM(amount_cents), 0) AS cents
+            FROM marketing_spend
+            WHERE period_end >= :frm_date AND period_start < :to_date
+            GROUP BY channel
+        """), {"frm_date": frm_date, "to_date": to_date}).fetchall()
+    }
+    quora_spend_cents = int(round(
+        (db.execute(text("SELECT COALESCE(SUM(cumulative_spend), 0) FROM quora_topics")).scalar() or 0) * 100
+    ))
+    affiliate_spend_cents = int(
+        db.execute(text("""
+            SELECT COALESCE(SUM(
+                CASE WHEN line_type = 'accrual' THEN amount_cents ELSE -amount_cents END
+            ), 0)
+            FROM affiliate_payout_ledger
+            WHERE period_month >= :frm_date AND period_month < :to_date
+        """), {"frm_date": frm_date, "to_date": to_date}).scalar() or 0
+    )
+
+    channels = set(new_customers) | set(revenue_cents) | set(churn) | set(active_mrr) | set(manual_spend_cents)
+    channels.update({"quora", "affiliate"})
+    channels.discard(None)
+
+    results = []
+    for channel in sorted(channels):
+        new_count = int(new_customers.get(channel, 0))
+        revenue = int(revenue_cents.get(channel, 0))
+        churn_row = churn.get(channel, {"churn_cents": 0, "churned_count": 0})
+        mrr_row = active_mrr.get(channel, {"mrr_cents": 0, "active_count": 0})
+
+        if channel == "quora":
+            spend = quora_spend_cents
+        elif channel == "affiliate":
+            spend = affiliate_spend_cents
+        else:
+            spend = int(manual_spend_cents.get(channel, 0))
+
+        cac_cents = round(spend / new_count) if (spend and new_count) else None
+        avg_mrr_cents = round(mrr_row["mrr_cents"] / mrr_row["active_count"]) if mrr_row["active_count"] else None
+        payback_months = (
+            round(cac_cents / avg_mrr_cents, 2) if (cac_cents and avg_mrr_cents) else None
+        )
+
+        results.append({
+            "channel": channel,
+            "new_customers": new_count,
+            "revenue_cents": revenue,
+            "churn_cents": int(churn_row["churn_cents"]),
+            "churned_count": int(churn_row["churned_count"]),
+            "spend_cents": spend,
+            "cac_cents": cac_cents,
+            "payback_months": payback_months,
+        })
+
+    results.sort(key=lambda r: r["revenue_cents"], reverse=True)
+    return results

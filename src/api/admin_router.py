@@ -16,7 +16,7 @@ import io
 import json
 import logging
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Literal
 
@@ -1016,6 +1016,144 @@ def roas(
         len(results), campaign_id, utm_campaign, spend,
     )
     return results
+
+
+# Manual-entry channels for marketing_spend — Quora (quora_topics.cumulative_spend)
+# and affiliate (affiliate_payout_ledger) already track real cost and are
+# auto-pulled by the CAC/payback compiler; they are deliberately excluded here
+# to avoid double-entry. Must match the compiler's channel-key vocabulary
+# (COALESCE(subscribers.utm_source, subscribers.signup_source)).
+MANUAL_SPEND_CHANNELS = frozenset({"facebook", "google", "dbpr_email"})
+
+
+class MarketingSpendCreateRequest(BaseModel):
+    channel: str
+    campaign_key: Optional[str] = None
+    period_start: date
+    period_end: date
+    amount: float = Field(gt=0, description="Spend in dollars")
+    currency: str = "usd"
+    notes: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_channel_and_period(self) -> "MarketingSpendCreateRequest":
+        if self.channel not in MANUAL_SPEND_CHANNELS:
+            raise ValueError(
+                f"channel must be one of {sorted(MANUAL_SPEND_CHANNELS)} — "
+                "Quora and affiliate spend are auto-sourced, not entered here"
+            )
+        if self.period_end < self.period_start:
+            raise ValueError("period_end must be >= period_start")
+        return self
+
+
+@router.post("/marketing-spend", status_code=201, dependencies=[Depends(get_current_admin)])
+def create_marketing_spend(body: MarketingSpendCreateRequest, db: Session = Depends(get_db)):
+    """Record manually-entered ad spend for a channel/period (Block 4).
+
+    Upserts on (channel, campaign_key, period_start, period_end) — re-submitting
+    the same period updates the amount rather than duplicating the row.
+    """
+    from src.core.models import MarketingSpend
+
+    existing = db.execute(
+        text("""
+            SELECT id FROM marketing_spend
+            WHERE channel = :channel
+              AND campaign_key IS NOT DISTINCT FROM :campaign_key
+              AND period_start = :period_start
+              AND period_end   = :period_end
+        """),
+        {
+            "channel": body.channel,
+            "campaign_key": body.campaign_key,
+            "period_start": body.period_start,
+            "period_end": body.period_end,
+        },
+    ).scalar_one_or_none()
+
+    amount_cents = round(body.amount * 100)
+    if existing:
+        db.execute(
+            text("""
+                UPDATE marketing_spend
+                SET amount_cents = :amount_cents, currency = :currency,
+                    notes = :notes, updated_at = now()
+                WHERE id = :id
+            """),
+            {"amount_cents": amount_cents, "currency": body.currency, "notes": body.notes, "id": existing},
+        )
+        db.commit()
+        logger.info("marketing_spend_updated id=%s channel=%s", existing, body.channel)
+        return {"id": existing, "updated": True}
+
+    row = MarketingSpend(
+        channel=body.channel,
+        campaign_key=body.campaign_key,
+        period_start=body.period_start,
+        period_end=body.period_end,
+        amount_cents=amount_cents,
+        currency=body.currency,
+        notes=body.notes,
+    )
+    db.add(row)
+    db.commit()
+    logger.info("marketing_spend_created id=%s channel=%s amount_cents=%d", row.id, body.channel, amount_cents)
+    return {"id": row.id, "updated": False}
+
+
+@router.get("/marketing-spend", dependencies=[Depends(get_current_admin)])
+def list_marketing_spend(
+    from_date: Optional[str] = Query(None, alias="from"),
+    to_date: Optional[str] = Query(None, alias="to"),
+    db: Session = Depends(get_db),
+):
+    """List manually-entered spend rows overlapping the given window (or all, if omitted)."""
+    rows = db.execute(
+        text("""
+            SELECT id, channel, campaign_key, period_start, period_end,
+                   amount_cents, currency, notes, updated_at
+            FROM marketing_spend
+            WHERE (:from_date IS NULL OR period_end   >= CAST(:from_date AS date))
+              AND (:to_date   IS NULL OR period_start <= CAST(:to_date   AS date))
+            ORDER BY period_start DESC
+        """),
+        {"from_date": from_date, "to_date": to_date},
+    ).mappings().all()
+    return [
+        {
+            "id": r["id"],
+            "channel": r["channel"],
+            "campaign_key": r["campaign_key"],
+            "period_start": r["period_start"].isoformat(),
+            "period_end": r["period_end"].isoformat(),
+            "amount": round(r["amount_cents"] / 100, 2),
+            "currency": r["currency"],
+            "notes": r["notes"],
+            "updated_at": r["updated_at"].isoformat(),
+        }
+        for r in rows
+    ]
+
+
+@router.get("/cac-payback", dependencies=[Depends(get_current_admin)])
+def cac_payback(
+    from_date: str = Query(..., alias="from", description="ISO date, inclusive"),
+    to_date: str = Query(..., alias="to", description="ISO date, exclusive"),
+    db: Session = Depends(get_db),
+):
+    """Per-channel CAC / payback rollup (Block 4 #23).
+
+    Thin wrapper over revenue_metrics.compute_channel_metrics — the single
+    source of truth also used by the daily_dashboard PDF section, so the
+    on-demand view and the scheduled report can never disagree.
+    """
+    from datetime import datetime as _dt
+    from src.services.revenue_metrics import compute_channel_metrics
+
+    frm = _dt.fromisoformat(from_date)
+    to = _dt.fromisoformat(to_date)
+    return compute_channel_metrics(db, frm, to)
 
 
 @router.get("/kill-switch-status", dependencies=[Depends(get_current_admin)])

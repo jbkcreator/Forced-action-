@@ -89,6 +89,13 @@ def _stamp_campaign_fields(subscriber, meta, db: Session) -> None:
     ROAS endpoint. Only writes fields that are currently NULL so it never
     overwrites attribution captured earlier via /api/free-signup. Reads via
     `_attr` so it works for both plain dicts and Stripe SDK objects.
+
+    `signup_source` is handled separately (not NULL-only, since it has a
+    NOT NULL "direct" default): a still-unattributed subscriber (source in
+    direct/unknown/empty) upgrades to "landing_page" when campaign metadata
+    is present, via the same first-touch rule signup_engine._apply_signup_source
+    uses — so a subscriber who paid before /api/free-signup ran isn't stuck
+    recorded as "direct" even though utm_* is now known.
     """
     if meta is None:
         return
@@ -98,6 +105,11 @@ def _stamp_campaign_fields(subscriber, meta, db: Session) -> None:
         if value and getattr(subscriber, field, None) is None:
             setattr(subscriber, field, value)
             changed = True
+    if (_attr(meta, "utm_source") or _attr(meta, "campaign_id")) and (
+        (subscriber.signup_source or "").strip().lower() in ("", "direct", "unknown")
+    ):
+        subscriber.signup_source = "landing_page"
+        changed = True
     if changed:
         db.flush()
 
@@ -488,6 +500,10 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
     if subscriber is None:
         # Genuinely new subscriber
         is_new_subscriber = True
+        # A buyer who checks out without ever hitting /api/free-signup first
+        # (no pre-provisioned tier='free' row) still carries campaign metadata
+        # on the Stripe session — record it as signup_source now so channel
+        # attribution isn't silently lost to the "direct" default (fa### fix).
         subscriber = Subscriber(
             stripe_customer_id=stripe_customer_id,
             stripe_subscription_id=stripe_subscription_id,
@@ -503,6 +519,7 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
             name=customer_name,
             phone=customer_phone,
             ghl_stage=5,
+            signup_source="landing_page" if (meta.get("utm_source") or meta.get("campaign_id")) else "direct",
         )
         db.add(subscriber)
     else:
@@ -994,9 +1011,13 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
                 )
         if not attributed and customer_email:
             try_email_fallback(db=db, email=customer_email, subscriber_id=subscriber.id, signed_up_at=now)
-        # Stamp acquisition_source if this was an email campaign signup
-        if attributed and subscriber.acquisition_source != "dbpr_email":
-            subscriber.acquisition_source = "dbpr_email"
+        # Stamp signup_source if this was an email campaign signup. Subscriber
+        # has no `acquisition_source` column (that field only exists on
+        # CustomerAccount) — the previous write here was silently discarded
+        # by SQLAlchemy as a transient attribute. First-touch: only upgrades
+        # a still-unattributed subscriber, matching signup_engine's rule.
+        if attributed and (subscriber.signup_source or "").strip().lower() in ("", "direct", "unknown"):
+            subscriber.signup_source = "dbpr_email"
             db.add(subscriber)
     except Exception:
         logger.warning("Campaign attribution failed sub=%s", subscriber.id, exc_info=True)
