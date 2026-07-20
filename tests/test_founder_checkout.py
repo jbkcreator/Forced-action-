@@ -73,8 +73,9 @@ def test_missing_founder_plan_raises(fresh_db):
 
 def test_checkout_request_accepts_founder_and_interval():
     from src.api.main import CheckoutRequest
+    ten = [f"{33600 + i}" for i in range(10)]
     req = CheckoutRequest(tier="founder", vertical="roofing", county_id="hillsborough",
-                          email="a@b.com", interval="annual")
+                          email="a@b.com", interval="annual", zip_codes=ten)
     assert req.tier == "founder"
     assert req.interval == "annual"
 
@@ -84,6 +85,17 @@ def test_checkout_request_rejects_bad_interval():
     with pytest.raises(Exception):
         CheckoutRequest(tier="founder", vertical="roofing", county_id="hillsborough",
                         email="a@b.com", interval="weekly")
+
+
+def test_founder_requires_exactly_ten_zips():
+    from src.api.main import CheckoutRequest
+    ten = [f"{33600 + i}" for i in range(10)]
+    ok = CheckoutRequest(tier="founder", vertical="roofing", county_id="hillsborough",
+                         email="a@b.com", zip_codes=ten)
+    assert len(ok.zip_codes) == 10
+    with pytest.raises(Exception):
+        CheckoutRequest(tier="founder", vertical="roofing", county_id="hillsborough",
+                        email="a@b.com", zip_codes=ten[:5])
 
 
 def test_subscribers_tier_constraint_admits_founder(fresh_db):

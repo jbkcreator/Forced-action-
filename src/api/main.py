@@ -635,6 +635,28 @@ def _fetch_pricing_from_stripe() -> dict:
             **TIER_DISPLAY[tier],
         }
 
+    # Founder is a flat premium tier with a monthly/annual split (not
+    # founding/regular). Its amounts are sourced from the seeded `plans` rows —
+    # the single source of truth — so this resolves regardless of Stripe mode.
+    try:
+        from sqlalchemy import create_engine as _ce, text as _t
+        _eng = _ce(_s.database_url)
+        with _eng.connect() as _c:
+            _rows = _c.execute(_t(
+                "SELECT interval, price_cents FROM plans "
+                "WHERE tier = 'founder' AND is_active = true"
+            )).fetchall()
+        _fa = {r.interval: (r.price_cents // 100) for r in _rows}
+        if _fa:
+            pricing_info["founder"] = {
+                "monthly_amount": _fa.get("monthly"),
+                "annual_amount": _fa.get("annual"),
+                "currency": "usd",
+                **TIER_DISPLAY["founder"],
+            }
+    except Exception as e:
+        logger.error("Error building founder pricing from plans: %s", e, exc_info=True)
+
     return pricing_info
 
 
@@ -780,7 +802,7 @@ class CheckoutRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_zip_count(self) -> "CheckoutRequest":
-        limits = {"starter": 1, "pro": 3, "dominator": 10, "annual_lock": 1}
+        limits = {"starter": 1, "pro": 3, "dominator": 10, "annual_lock": 1, "founder": 10}
         limit = limits.get(self.tier)
         if limit and len(self.zip_codes) != limit:
             raise ValueError(f"{self.tier.title()} plan requires exactly {limit} ZIP code{'s' if limit > 1 else ''}.")

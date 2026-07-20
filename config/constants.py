@@ -260,5 +260,17 @@ TIER_DISPLAY = {
             "Rate locked for a full year",
         ],
     },
+    # Placeholder copy — product to supply final founder bullets before launch.
+    # Do not promise unbuilt surfaces (deal-intake / Cora SLA) until they ship.
+    "founder": {
+        "label": "Founder — 10 ZIPs",
+        "zip_limit": 10,
+        "features": [
+            "10 ZIP territories",
+            "Everything in Pro",
+            "Founder-tier priority access",
+            "Rate locked forever",
+        ],
+    },
 }
 
