@@ -99,6 +99,55 @@ def test_facebook_and_instagram_utm_source_combine_into_one_meta_channel(fresh_d
     assert meta["revenue_cents"] >= 25000
 
 
+def test_dbpr_utm_source_joins_dbpr_email_spend(fresh_db):
+    # Regression guard: dbpr_email_template.py's real signup link stamps
+    # utm_source='dbpr' (see _signup_url), while signup_source and manual
+    # spend both use 'dbpr_email'. Without normalization these would never
+    # meet in the same channel row (PR review finding #1).
+    db = fresh_db
+    sub = _sub(db, utm_source="dbpr", signup_source="dbpr_email")
+    acct = _acct(db, sub, mrr=12000)
+    db.add(MrrMovement(account_id=acct.account_id, movement_type="new",
+                       delta_cents=12000, mrr_after_cents=12000, effective_at=_IN))
+    db.add(MarketingSpend(
+        channel="dbpr_email", period_start=_SPEND_START, period_end=_SPEND_END,
+        amount_cents=20000,
+    ))
+    db.flush()
+
+    rows = compute_channel_metrics(db, FRM, TO)
+    assert _channel_row(rows, "dbpr") is None
+    dbpr = _channel_row(rows, "dbpr_email")
+    assert dbpr is not None
+    assert dbpr["new_customers"] == 1
+    assert dbpr["revenue_cents"] == 12000
+    assert dbpr["spend_cents"] == 20000
+    assert dbpr["cac_cents"] == 20000
+
+
+def test_partial_window_prorates_spend(fresh_db):
+    # PR review finding #3: a monthly spend entry queried for a single day
+    # inside that month must NOT charge the full month's amount to that day.
+    db = fresh_db
+    db.add(MarketingSpend(
+        channel="google", period_start=date(2099, 6, 1), period_end=date(2099, 6, 30),
+        amount_cents=300000,  # $3,000 over a 30-day period → $100/day
+    ))
+    db.flush()
+
+    one_day = compute_channel_metrics(db, datetime(2099, 6, 15, tzinfo=timezone.utc),
+                                       datetime(2099, 6, 16, tzinfo=timezone.utc))
+    g = _channel_row(one_day, "google")
+    assert g is not None
+    assert g["spend_cents"] == 10000  # 1/30th of $3,000 = $100
+
+    full_month = compute_channel_metrics(db, datetime(2099, 6, 1, tzinfo=timezone.utc),
+                                          datetime(2099, 7, 1, tzinfo=timezone.utc))
+    g_full = _channel_row(full_month, "google")
+    assert g_full is not None
+    assert g_full["spend_cents"] == 300000  # window fully contains the entry — unchanged
+
+
 def test_no_spend_yields_null_cac(fresh_db):
     db = fresh_db
     sub = _sub(db, utm_source="google")

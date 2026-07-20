@@ -1010,7 +1010,7 @@ def _on_checkout_completed(session: dict, db: Session) -> None:
                     signed_up_at=now,
                 )
         if not attributed and customer_email:
-            try_email_fallback(db=db, email=customer_email, subscriber_id=subscriber.id, signed_up_at=now)
+            attributed = try_email_fallback(db=db, email=customer_email, subscriber_id=subscriber.id, signed_up_at=now)
         # Stamp signup_source if this was an email campaign signup. Subscriber
         # has no `acquisition_source` column (that field only exists on
         # CustomerAccount) — the previous write here was silently discarded

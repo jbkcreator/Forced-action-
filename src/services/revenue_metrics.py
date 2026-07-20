@@ -142,18 +142,26 @@ def compute_revenue_metrics(db: Session, frm: datetime, to: datetime) -> dict:
 # durable signal here; any of facebook/instagram/fb/ig/meta collapse to 'meta'
 # so ad spend entered once against "meta" always matches every placement.
 #
+# DBPR email links (src/services/dbpr_email_template.py:_signup_url) stamp
+# utm_source='dbpr' while signup_source/manual-spend use 'dbpr_email' — without
+# normalizing, real DBPR conversions would group under 'dbpr' and never join
+# the 'dbpr_email' spend entered in marketing_spend.
+#
 # Quora is special-cased separately: its producer
 # (src/agents/graphs/quora_channel.py, see docs/adr/0021) stamps only
 # utm_campaign ("quora_<slug>"), never utm_source — so without this case
 # Quora traffic would silently fall through to signup_source='landing_page'
 # and merge with organic/other paid traffic instead of its own row.
-_META_UTM_SOURCES = ("facebook", "instagram", "fb", "ig", "meta")
-_META_SOURCE_NORMALIZE_SQL = " OR ".join(
-    f"lower(s.utm_source) = '{v}'" for v in _META_UTM_SOURCES
-)
+_UTM_SOURCE_NORMALIZE_SQL = """
+    CASE
+        WHEN lower(s.utm_source) IN ('facebook', 'instagram', 'fb', 'ig', 'meta') THEN 'meta'
+        WHEN lower(s.utm_source) = 'dbpr' THEN 'dbpr_email'
+        ELSE s.utm_source
+    END
+"""
 _CHANNEL_KEY_SQL = f"""
     COALESCE(
-        CASE WHEN {_META_SOURCE_NORMALIZE_SQL} THEN 'meta' ELSE s.utm_source END,
+        {_UTM_SOURCE_NORMALIZE_SQL},
         CASE WHEN substring(s.utm_campaign from 1 for 6) = 'quora_' THEN 'quora' END,
         s.signup_source,
         'unattributed'
@@ -235,10 +243,19 @@ def compute_channel_metrics(db: Session, frm: datetime, to: datetime) -> list[di
             GROUP BY channel
         """), p).fetchall()
     }
+    # Prorate each row by day-overlap with [frm_date, to_date) rather than
+    # charging its full amount to every overlapping window — a monthly entry
+    # queried for a single day would otherwise attribute the whole month's
+    # spend to that one day. period_end is inclusive (ck_marketing_spend_period_order
+    # guarantees period_end >= period_start, so the denominator is always >= 1).
     manual_spend_cents = {
-        r.channel: r.cents
+        r.channel: int(round(r.cents))
         for r in db.execute(text("""
-            SELECT channel, COALESCE(SUM(amount_cents), 0) AS cents
+            SELECT channel, COALESCE(SUM(
+                amount_cents::numeric
+                * GREATEST(0, LEAST(period_end + 1, CAST(:to_date AS date)) - GREATEST(period_start, CAST(:frm_date AS date)))
+                / (period_end - period_start + 1)
+            ), 0) AS cents
             FROM marketing_spend
             WHERE period_end >= :frm_date AND period_start < :to_date
             GROUP BY channel

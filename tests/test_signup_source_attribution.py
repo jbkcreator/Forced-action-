@@ -245,6 +245,28 @@ class TestDbprEmailSignupSourceFix:
         # `acquisition_source` attribute — Subscriber has no such column.
         assert not hasattr(Subscriber, "acquisition_source")
 
+    def test_email_fallback_conversion_sets_signup_source_dbpr_email(self, fresh_db):
+        # PR review finding #2: try_email_fallback()'s return value was
+        # previously discarded, so `attributed` stayed False and this branch
+        # never fired for a forwarded/token-less DBPR conversion (the fallback
+        # path — no campaign_attribution_token on the checkout session).
+        cs_id = f"cs_{uuid.uuid4().hex[:8]}"
+        cust = f"cus_{uuid.uuid4().hex[:8]}"
+        email = f"{uuid.uuid4().hex[:8]}@example.com"
+        event = _checkout_event(cs_id=cs_id, customer=cust, email=email)  # no token
+        with _quiet_subscription_side_effects(), \
+             patch("src.services.campaign_attribution.try_email_fallback",
+                   return_value=True) as fallback:
+            ok, _msg = _post(event, fresh_db)
+            fresh_db.commit()
+        assert ok is True
+        fallback.assert_called_once()
+
+        sub = fresh_db.execute(
+            select(Subscriber).where(Subscriber.stripe_customer_id == cust)
+        ).scalar_one()
+        assert sub.signup_source == "dbpr_email"
+
     def test_attributed_conversion_does_not_clobber_first_touch(self, fresh_db):
         cust = f"cus_{uuid.uuid4().hex[:8]}"
         email = f"{uuid.uuid4().hex[:8]}@example.com"
