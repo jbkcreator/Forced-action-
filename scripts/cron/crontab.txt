@@ -217,6 +217,18 @@ COUNTY_ID=hillsborough
 # Truth Engine verdict batch (08:15) — after CDS scoring, skip-trace, and cohort recompute.
 15 8 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.truth_engine_batch
 
+# ── LEAD DELIVERY (M10/B2) ────────────────────────────────────
+# Lead Delivery Sweep — 08:20 AM UTC Mon-Sat, after the Truth Engine verdict
+# batch (08:15). Matches qualified/verdict-routed leads to entitled, locked-
+# territory accounts and claims them into `deliveries`. source='auto' prefers
+# M6 verdicts once they exist for the day; running after 08:15 (not before)
+# ensures today's verdict batch has already landed before this reads it.
+# Previously missing from cron entirely — see T-B8-01 dashboard investigation
+# (2026-07-21): 83 active accounts + 29k properties with a current qualified
+# score + 44 locked territories existed with zero rows in `deliveries`
+# because this was never scheduled.
+20 8 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.lead_delivery_sweep
+
 # ── PLATFORM TASKS ───────────────────────────────────────────
 # Grace Expiry (ZIP territories + subscribers) — every 15 min
 */15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.grace_expiry
