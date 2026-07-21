@@ -166,6 +166,14 @@ def _query_scraper(session: Session) -> list[ActionItem]:
     return [_scraper_item(r) for r in rows]
 
 
+def _sort_key(item: ActionItem) -> datetime:
+    """created_at coerced to tz-aware UTC. Sources differ: cora/scraper columns
+    are tz-aware, human_close_escalations.routed_at is tz-naive — comparing them
+    raw raises TypeError, so naive values are treated as UTC."""
+    dt = item["created_at"]
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
 def build_action_queue(session: Session) -> dict:
     """Union the three sources, split into lanes, and derive KPI counts."""
     try:
@@ -178,11 +186,11 @@ def build_action_queue(session: Session) -> dict:
 
     approvals = sorted(
         (i for i in items if i["lane"] == "approvals"),
-        key=lambda i: i["created_at"],
+        key=_sort_key,
     )  # oldest-first: stalest approval is most urgent
     failures = sorted(
         (i for i in items if i["lane"] == "failures"),
-        key=lambda i: i["created_at"],
+        key=_sort_key,
         reverse=True,
     )  # newest-first: freshest failure most actionable
 

@@ -193,6 +193,19 @@ class TestOrdering:
 
         assert [i["id"] for i in q["approvals"]] == [1, 2]  # oldest (id1) first
 
+    def test_sorts_mixed_naive_and_aware_created_at(self):
+        # human_close_escalations.routed_at is tz-naive; cora breach_started is
+        # tz-aware. Both land in the approvals lane and must sort without a
+        # "can't compare offset-naive and offset-aware datetimes" TypeError.
+        from src.services.action_queue import build_action_queue
+
+        naive = datetime(2026, 7, 20, 10, 0)  # no tzinfo (like routed_at)
+        q = build_action_queue(_mock_session(
+            cora=[_cora_row(id=1, breach_started=NOW - timedelta(hours=2))],
+            human_close=[_hc_row(id=2, routed_at=naive)],
+        ))
+        assert len(q["approvals"]) == 2  # no crash, both present
+
     def test_failures_newest_first(self):
         from src.services.action_queue import build_action_queue
 
