@@ -57,11 +57,19 @@ def _as_utc(dt: datetime) -> datetime:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
 
-def _period_bounds(db, subscriber_id: int, created_at: datetime) -> tuple[datetime, datetime]:
+def _period_bounds(
+    db, subscriber_id: int, created_at: datetime, floor: datetime | None = None
+) -> tuple[datetime, datetime]:
     """Next cycle for this subscriber to evaluate. An unresolved ('pending'
     or 'failed') cycle is retried in place — a crash or a Stripe outage must
     not be skipped by advancing past it. Otherwise starts where the last
-    terminally-resolved cycle ended, or at signup if never evaluated."""
+    terminally-resolved cycle ended, or at signup if never evaluated.
+
+    `floor` clamps the cycle start no earlier than the point delivery was
+    actually tracked for this subscriber (their bridged customer_account
+    creation). Without it, the first cycle anchors to signup and retroactively
+    bills a backlog of pre-tracking cycles that show 0 delivered simply because
+    the deliveries ledger didn't exist yet."""
     unresolved = db.execute(text("""
         SELECT period_start, period_end FROM guarantee_credits
         WHERE subscriber_id = :sid AND status IN ('pending', 'failed')
@@ -76,6 +84,8 @@ def _period_bounds(db, subscriber_id: int, created_at: datetime) -> tuple[dateti
         ORDER BY period_end DESC LIMIT 1
     """), {"sid": subscriber_id}).scalar()
     start = _as_utc(last_end or created_at)
+    if floor is not None:
+        start = max(start, _as_utc(floor))
     return start, start + timedelta(days=CYCLE_DAYS)
 
 
@@ -171,8 +181,19 @@ def evaluate_subscriber_guarantee(db, sub, *, dry_run: bool = False) -> dict | N
     if not quota:
         return None
 
+    # The guarantee is measured against the deliveries ledger, which only
+    # covers subscribers bridged to a customer_account. A subscriber with no
+    # account has no measurable delivery history — skip rather than treat an
+    # unmeasurable cycle as a 0-delivered shortfall. The account's creation
+    # also floors the cycle start so pre-tracking history isn't back-credited.
+    account_created_at = db.execute(text("""
+        SELECT min(created_at) FROM customer_accounts WHERE subscriber_id = :sid
+    """), {"sid": sub.id}).scalar()
+    if account_created_at is None:
+        return None
+
     now = datetime.now(timezone.utc)
-    start, end = _period_bounds(db, sub.id, sub.created_at)
+    start, end = _period_bounds(db, sub.id, sub.created_at, floor=account_created_at)
     if end > now:
         return None  # cycle not finished yet
 
@@ -239,8 +260,11 @@ def run_guarantee_shortfall_sweep(db=None, *, dry_run: bool = False) -> dict:
         tiers = list(TIER_LEAD_QUOTAS.keys())
         subs = db.execute(text("""
             SELECT id, tier, plan_price, stripe_customer_id, email, name, created_at
-            FROM subscribers
+            FROM subscribers s
             WHERE status = 'active' AND tier = ANY(:tiers)
+              AND EXISTS (
+                SELECT 1 FROM customer_accounts ca WHERE ca.subscriber_id = s.id
+              )
         """), {"tiers": tiers}).fetchall()
 
         for sub in subs:

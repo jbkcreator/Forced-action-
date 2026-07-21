@@ -36,6 +36,37 @@ class TestPeriodBounds:
         assert start == created_at
         assert end == created_at + timedelta(days=CYCLE_DAYS)
 
+    def test_floor_clamps_start_above_signup(self, mock_db):
+        """A floor later than signup (the customer_account creation) must push
+        the cycle start forward, so pre-tracking history isn't back-credited."""
+        from src.tasks.guarantee_shortfall_sweep import _period_bounds, CYCLE_DAYS
+
+        created_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        floor = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        _exec_results(
+            mock_db,
+            MagicMock(first=MagicMock(return_value=None)),
+            MagicMock(scalar=MagicMock(return_value=None)),
+        )
+
+        start, end = _period_bounds(mock_db, 1, created_at, floor=floor)
+
+        assert start == floor
+        assert end == floor + timedelta(days=CYCLE_DAYS)
+
+    def test_subscriber_without_account_is_skipped(self, mock_db):
+        """No bridged customer_account -> delivery is unmeasurable -> skip
+        (must NOT be treated as a 0-delivered shortfall)."""
+        from src.tasks.guarantee_shortfall_sweep import evaluate_subscriber_guarantee
+
+        sub = _make_sub(tier="starter")
+        _exec_results(
+            mock_db,
+            MagicMock(scalar=MagicMock(return_value=None)),  # account_created_at -> None
+        )
+
+        assert evaluate_subscriber_guarantee(mock_db, sub, dry_run=True) is None
+
     def test_naive_created_at_from_postgres_is_normalized(self, mock_db):
         """subscribers.created_at is a naive TIMESTAMP column in Postgres —
         must not raise when compared against an aware datetime downstream."""
