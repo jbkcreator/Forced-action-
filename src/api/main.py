@@ -4085,6 +4085,16 @@ def hot_lead_unlock(payload: HotLeadUnlockRequest, db: Session = Depends(get_db)
     if not subscriber.stripe_customer_id:
         raise HTTPException(status_code=400, detail="No Stripe customer linked")
 
+    # Founder unlock waiver (ADR 0037): founders reveal hot leads at $0 — skip
+    # Stripe entirely and fulfill the reveal directly (same deliverable, no charge).
+    from src.services.entitlement_service import reveal_is_free
+    if reveal_is_free(db, subscriber.id):
+        from src.services.stripe_webhooks import fulfill_founder_comp_reveal
+        if not fulfill_founder_comp_reveal(subscriber, payload.lead_id, db):
+            raise HTTPException(status_code=400, detail="Lead not found")
+        db.commit()
+        return {"comp": True, "revealed": True}
+
     # Server decides the discount — never trust a client-supplied `reduced`
     # flag, or any subscriber could force the $99 rate on every unlock.
     from src.services.flash_scarcity import is_reduced_rate_active
