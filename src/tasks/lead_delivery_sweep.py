@@ -36,6 +36,15 @@ def _pending_leads_from_verdicts(db, limit: int) -> list[Lead]:
     to a contractor channel and hasn't been delivered yet. Grade comes from the
     verdict; the trade is still derived from the CDS vertical_scores (M6's
     routed_channel is a product lane, not a trade). Bridged via prospects.property_id.
+
+    Requires a locked zip_territories match (zip+county+vertical) before a lead
+    is even a candidate. Without this, properties with zero possible match (no
+    territory ever locked in their ZIP) sort to the same position every run
+    (ORDER BY property_id, no delivery row ever written for them) and can
+    permanently fill the LIMIT window once the true candidate count exceeds
+    it, starving reachable leads with a higher property_id. Entitlement/
+    headroom exhaustion is deliberately not filtered here — that's cycle-bound
+    and self-resolves each billing period, unlike a ZIP with no territory.
     """
     rows = db.execute(text("""
         SELECT DISTINCT ON (pr.property_id)
@@ -50,6 +59,14 @@ def _pending_leads_from_verdicts(db, limit: int) -> list[Lead]:
         ) ds ON TRUE
         WHERE d.id IS NULL
           AND p.zip IS NOT NULL AND p.county_id IS NOT NULL
+          AND ds.vertical_scores IS NOT NULL
+          AND EXISTS (
+              SELECT 1 FROM zip_territories zt
+              WHERE zt.zip_code = p.zip
+                AND zt.county_id = p.county_id
+                AND zt.status = 'locked'
+                AND zt.vertical IN (SELECT jsonb_object_keys(ds.vertical_scores))
+          )
         ORDER BY pr.property_id, v.created_at DESC
         LIMIT :lim
     """), {"lim": limit}).fetchall()
@@ -75,7 +92,14 @@ def _select_pending(db, limit: int, source: str) -> tuple[list[Lead], str]:
 
 
 def _pending_leads(db, limit: int) -> list[Lead]:
-    """Latest-scored, qualified properties with no delivery yet → Lead objects."""
+    """Latest-scored, qualified properties with no delivery yet → Lead objects.
+
+    Requires a locked zip_territories match (zip+county+vertical) before a
+    lead is even a candidate — see the docstring on _pending_leads_from_verdicts
+    for why (backlog-starvation guard: an unmatchable property otherwise sorts
+    to the same position on every run and can permanently occupy the LIMIT
+    window once the candidate count exceeds it).
+    """
     rows = db.execute(text("""
         SELECT DISTINCT ON (ds.property_id)
                ds.property_id, p.zip, p.county_id, ds.lead_tier, ds.vertical_scores
@@ -87,6 +111,14 @@ def _pending_leads(db, limit: int) -> list[Lead]:
           AND p.zip IS NOT NULL
           AND p.county_id IS NOT NULL
           AND d.id IS NULL
+          AND ds.vertical_scores IS NOT NULL
+          AND EXISTS (
+              SELECT 1 FROM zip_territories zt
+              WHERE zt.zip_code = p.zip
+                AND zt.county_id = p.county_id
+                AND zt.status = 'locked'
+                AND zt.vertical IN (SELECT jsonb_object_keys(ds.vertical_scores))
+          )
         ORDER BY ds.property_id, ds.score_date DESC
         LIMIT :lim
     """), {"lim": limit}).fetchall()
