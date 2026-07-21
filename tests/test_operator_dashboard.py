@@ -7,7 +7,7 @@ committed data in shared tables.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import text
 
@@ -134,42 +134,54 @@ def test_churn_risk_counts_latest_band_per_subscriber_only(fresh_db):
     assert result["kpis"]["churn_risk"]["value"] - before == 1
 
 
-def test_source_failures_counts_scraper_alerts_in_window(fresh_db):
-    fresh_db.add(ScraperAlertLog(source_type="foreclosures", alert_type="scraper_error", alerted_at=_IN))
-    fresh_db.add(ScraperAlertLog(source_type="deeds", alert_type="zero_records", alerted_at=_IN))
-    fresh_db.add(ScraperAlertLog(source_type="deeds", alert_type="zero_records", alerted_at=_OUT))
+def test_source_failures_counts_scraper_alerts_within_cooldown_window(fresh_db):
+    # Canonical count (action_queue.source_failures) = scraper alerts within the
+    # rolling alert-cooldown window (now - alert_cooldown_hours), NOT the
+    # dashboard from/to window. Assert the delta against real-now timestamps so
+    # the test is independent of the far-future FRM/TO and any shared-DB rows.
+    now = datetime.now(timezone.utc)
+    before = compute_operator_dashboard(fresh_db, FRM, TO)["kpis"]["source_failures"]["value"]
+
+    fresh_db.add(ScraperAlertLog(source_type="foreclosures", alert_type="scraper_error", alerted_at=now))
+    fresh_db.add(ScraperAlertLog(source_type="deeds", alert_type="zero_records", alerted_at=now))
+    fresh_db.add(ScraperAlertLog(source_type="deeds", alert_type="zero_records",
+                                 alerted_at=now - timedelta(hours=48)))  # outside cooldown
     fresh_db.flush()
 
     result = compute_operator_dashboard(fresh_db, FRM, TO)
-    assert result["kpis"]["source_failures"] == {"available": True, "value": 2}
+    assert result["kpis"]["source_failures"]["available"] is True
+    assert result["kpis"]["source_failures"]["value"] - before == 2
 
 
-def test_cora_approvals_waiting_sums_unresolved_incidents_and_escalations(fresh_db):
-    # Also an un-windowed current-state snapshot — assert the delta, not an
-    # absolute count (see test_churn_risk_counts_latest_band_per_subscriber_only).
+def test_cora_approvals_waiting_counts_legal_lane_incidents_only(fresh_db):
+    # Canonical count (action_queue.cora_approvals_waiting) = open cora incidents
+    # in the legal lane (human_escalated / feature_killed) ONLY. Auto-handled
+    # incidents, resolved incidents, and human-close escalations are excluded.
+    # Delta-based (current-state snapshot, shared DB) like churn_risk.
     before = compute_operator_dashboard(fresh_db, FRM, TO)["kpis"]["cora_approvals_waiting"]["value"]
 
     sub = _sub(fresh_db)
 
-    fresh_db.add(CoraIncident(
-        metric_name="dialable_rate", severity="red",
-        observed_value=0.1, threshold_value=0.5,
-        breach_started=_IN, breach_resolved=None,
+    fresh_db.add(CoraIncident(  # counted
+        metric_name="dialable_rate", severity="red", action_taken="human_escalated",
+        observed_value=0.1, threshold_value=0.5, breach_started=_IN, breach_resolved=None,
     ))
-    fresh_db.add(CoraIncident(
-        metric_name="dialable_rate", severity="yellow",
-        observed_value=0.4, threshold_value=0.5,
-        breach_started=_IN, breach_resolved=_IN,
+    fresh_db.add(CoraIncident(  # counted
+        metric_name="reply_rate", severity="red", action_taken="feature_killed",
+        observed_value=0.1, threshold_value=0.5, breach_started=_IN, breach_resolved=None,
     ))
-    fresh_db.add(HumanCloseEscalation(
+    fresh_db.add(CoraIncident(  # NOT counted — auto-handled (ops lane)
+        metric_name="dialable_rate", severity="yellow", action_taken="auto_paused",
+        observed_value=0.4, threshold_value=0.5, breach_started=_IN, breach_resolved=None,
+    ))
+    fresh_db.add(CoraIncident(  # NOT counted — resolved
+        metric_name="dialable_rate", severity="yellow", action_taken="human_escalated",
+        observed_value=0.4, threshold_value=0.5, breach_started=_IN, breach_resolved=_IN,
+    ))
+    fresh_db.add(HumanCloseEscalation(  # NOT counted — human-close excluded from this KPI
         subscriber_id=sub.id, decision_id="dec-1",
         revenue_signal_score=90, interactions_count=3,
         target_tier="pro", channel="sms", outcome=None,
-    ))
-    fresh_db.add(HumanCloseEscalation(
-        subscriber_id=sub.id, decision_id="dec-2",
-        revenue_signal_score=90, interactions_count=3,
-        target_tier="pro", channel="sms", outcome="won",
     ))
     fresh_db.flush()
 

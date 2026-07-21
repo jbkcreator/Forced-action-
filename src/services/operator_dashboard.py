@@ -20,6 +20,10 @@ from datetime import datetime
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from src.services.action_queue import (
+    cora_approvals_waiting as _aq_cora_approvals_waiting,
+    source_failures as _aq_source_failures,
+)
 from src.services.revenue_metrics import compute_revenue_metrics
 
 
@@ -65,33 +69,24 @@ def _kpi_activation(rm: dict) -> dict:
 
 
 def _kpi_source_failures(db: Session, frm: datetime, to: datetime) -> dict:
-    # BOOTSTRAP COUNT — not canonical. T-B8-03 owns the action-queue's 4-source
-    # union (src/services/action_queue.py, once it exists) and is the source of
-    # truth for "source failures" as queue rows. When that lands, replace this
-    # body with a call into its count helper instead of this inline query, so
-    # the KPI tile and the queue never drift apart.
-    n = db.execute(text(
-        "SELECT COUNT(*) FROM scraper_alert_log WHERE alerted_at >= :frm AND alerted_at < :to"
-    ), {"frm": frm, "to": to}).scalar()
-    return {"available": True, "value": int(n or 0)}
+    # Canonical count owned by T-B8-03's action queue. This KPI tile deep-links
+    # into /admin/action-queue?lane=failures&category=source, so it must match
+    # the queue exactly — i.e. scraper alerts open within the rolling cooldown
+    # window, NOT the dashboard's from/to window. frm/to are intentionally
+    # ignored here for that reason.
+    return {"available": True, "value": _aq_source_failures(db)}
 
 
 def _kpi_cora_approvals_waiting(db: Session) -> dict:
-    # BOOTSTRAP COUNT — not canonical, same caveat as _kpi_source_failures
-    # above. T-B8-03's action-queue service is the intended source of truth
-    # for "approvals waiting"; swap this for its count helper once it ships.
-    incidents = db.execute(text(
-        "SELECT COUNT(*) FROM cora_incident WHERE breach_resolved IS NULL"
-    )).scalar()
-    escalations = db.execute(text(
-        "SELECT COUNT(*) FROM human_close_escalations WHERE outcome IS NULL"
-    )).scalar()
+    # Canonical count owned by T-B8-03's action queue. Legal-lane cora incidents
+    # only (human_escalated / feature_killed) — excludes auto-handled incidents
+    # and human-close escalations, matching the approvals lane the KPI links to.
     return {
         "available": True,
-        "value": int(incidents or 0) + int(escalations or 0),
+        "value": _aq_cora_approvals_waiting(db),
         "note": (
-            "cora_incident (unresolved) + human_close_escalations (no outcome) only; "
-            "win-story Slack approvals have no DB-tracked pending state yet (see T-B8-03)"
+            "legal-lane cora only (human_escalated/feature_killed); "
+            "canonical source: action_queue.cora_approvals_waiting"
         ),
     }
 
