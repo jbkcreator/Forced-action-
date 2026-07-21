@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from src.api.admin_router import get_current_admin
@@ -56,4 +57,8 @@ def get_action_queue(
 ) -> dict[str, Any]:
     """Read-time union of pending approvals + source failures across the three
     existing tables. No mutation, no new ledger."""
-    return build_action_queue(db)
+    try:
+        return build_action_queue(db)
+    except SQLAlchemyError:
+        logger.error("[OperatorDashboard] action-queue read failed", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to load action queue")

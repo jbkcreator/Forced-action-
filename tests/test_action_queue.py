@@ -274,3 +274,23 @@ class TestActionQueueEndpoint:
         assert set(body["counts"]) >= {
             "cora_approvals_waiting", "source_failures", "approvals", "failures"
         }
+
+    def test_db_error_returns_500_with_generic_detail(self, client, auth, monkeypatch):
+        from sqlalchemy.exc import SQLAlchemyError
+        from src.api import operator_dashboard_router as mod
+
+        def _boom(session):
+            raise SQLAlchemyError("connection reset")
+        monkeypatch.setattr(mod, "build_action_queue", _boom)
+
+        from src.api.main import app
+        from src.api.deps import get_db
+        app.dependency_overrides[get_db] = lambda: MagicMock()
+        try:
+            resp = client.get(self.ROUTE, headers=auth)
+        finally:
+            app.dependency_overrides.pop(get_db, None)
+
+        assert resp.status_code == 500
+        assert resp.json()["detail"] == "Failed to load action queue"
+        assert "connection reset" not in resp.text  # no internal leak
