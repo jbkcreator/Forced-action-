@@ -40,7 +40,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import text
 
-from config.guarantees import TIER_LEAD_QUOTAS
+from config.guarantees import TIER_LEAD_QUOTAS, DELIVERY_TRACKING_START_UTC
 from src.core.database import get_db_context
 from src.services.email import send_email
 from src.services.stripe_service import issue_guarantee_credit
@@ -66,15 +66,21 @@ def _period_bounds(
     terminally-resolved cycle ended, or at signup if never evaluated.
 
     `floor` clamps the cycle start no earlier than the point delivery was
-    actually tracked for this subscriber (their bridged customer_account
-    creation). Without it, the first cycle anchors to signup and retroactively
-    bills a backlog of pre-tracking cycles that show 0 delivered simply because
-    the deliveries ledger didn't exist yet."""
+    actually tracked (max of the bridged customer_account creation and the
+    deliveries-ledger go-live). Without it, the first cycle anchors to signup
+    and retroactively bills a backlog of pre-tracking cycles that show 0
+    delivered simply because the deliveries ledger didn't exist yet.
+
+    The floor also filters the unresolved lookup: a legacy 'pending'/'failed'
+    row whose period_start predates the floor is NOT handed back for retry —
+    it would recount the same pre-tracking window as a false shortfall. Such
+    rows are terminally resolved out of band by _skip_pretracking_unresolved."""
     unresolved = db.execute(text("""
         SELECT period_start, period_end FROM guarantee_credits
         WHERE subscriber_id = :sid AND status IN ('pending', 'failed')
+          AND (:floor IS NULL OR period_start >= :floor)
         ORDER BY period_end ASC LIMIT 1
-    """), {"sid": subscriber_id}).first()
+    """), {"sid": subscriber_id, "floor": floor}).first()
     if unresolved:
         return _as_utc(unresolved.period_start), _as_utc(unresolved.period_end)
 
@@ -87,6 +93,30 @@ def _period_bounds(
     if floor is not None:
         start = max(start, _as_utc(floor))
     return start, start + timedelta(days=CYCLE_DAYS)
+
+
+def _skip_pretracking_unresolved(db, subscriber_id: int, floor: datetime) -> int:
+    """Terminally resolve any unresolved ('pending'/'failed') guarantee cycle
+    that starts before `floor`. These are legacy periods created before delivery
+    tracking existed; retrying them recounts an all-zero window and issues a
+    false credit. The row is kept (status -> 'skipped_no_charge_basis') so the
+    audit history survives; it is never deleted, and Stripe is never called.
+    Returns the number of rows resolved. No-op-safe under repeat runs."""
+    result = db.execute(text("""
+        UPDATE guarantee_credits
+           SET status = 'skipped_no_charge_basis'
+         WHERE subscriber_id = :sid
+           AND status IN ('pending', 'failed')
+           AND period_start < :floor
+    """), {"sid": subscriber_id, "floor": floor})
+    db.commit()
+    resolved = result.rowcount or 0
+    if resolved:
+        logger.info(
+            "[GuaranteeSweep] skipped %d pre-tracking unresolved cycle(s) for subscriber %s",
+            resolved, subscriber_id,
+        )
+    return resolved
 
 
 def _reserve_period(
@@ -192,8 +222,16 @@ def evaluate_subscriber_guarantee(db, sub, *, dry_run: bool = False) -> dict | N
     if account_created_at is None:
         return None
 
+    # Floor at the later of account creation and the deliveries-ledger go-live:
+    # a delivery can't predate either, so an earlier window would count false
+    # zeros. Legacy unresolved cycles below the floor are terminally skipped
+    # (audit kept) so they can't be retried into a false credit.
+    floor = max(_as_utc(account_created_at), DELIVERY_TRACKING_START_UTC)
+    if not dry_run:
+        _skip_pretracking_unresolved(db, sub.id, floor)
+
     now = datetime.now(timezone.utc)
-    start, end = _period_bounds(db, sub.id, sub.created_at, floor=account_created_at)
+    start, end = _period_bounds(db, sub.id, sub.created_at, floor=floor)
     if end > now:
         return None  # cycle not finished yet
 

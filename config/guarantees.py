@@ -16,3 +16,12 @@ TIER_LEAD_QUOTAS = {
     "pro":       20,
     "dominator": 40,
 }
+
+from datetime import datetime, timezone
+
+# When the deliveries ledger (scripts/apply_fa085_m10_lead_delivery.py) went
+# live. No lead delivery could be recorded before this date, so a guarantee
+# cycle that starts earlier would count unavoidable zero-delivery days as a
+# false shortfall — even for a customer_account created before it. The sweep
+# floors every cycle at max(account_created_at, DELIVERY_TRACKING_START_UTC).
+DELIVERY_TRACKING_START_UTC = datetime(2026, 6, 23, tzinfo=timezone.utc)

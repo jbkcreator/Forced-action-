@@ -143,6 +143,74 @@ class TestPeriodBounds:
         assert end == pending_end
 
 
+class TestDeliveryTrackingFloor:
+    """Review #1/#2: cycles must never start before delivery tracking existed,
+    and legacy unresolved cycles below that floor must not be retried."""
+
+    def test_account_predating_ledger_floors_at_tracking_start(self, mock_db):
+        """An account created before the deliveries ledger must floor the cycle
+        at the ledger go-live, not at account creation — otherwise pre-tracking
+        days count as a false shortfall."""
+        from src.tasks.guarantee_shortfall_sweep import evaluate_subscriber_guarantee
+        from config.guarantees import DELIVERY_TRACKING_START_UTC
+
+        now = datetime.now(timezone.utc)
+        # Account (and signup) both predate the deliveries ledger.
+        sub = _make_sub(tier="starter", created_at=datetime(2026, 1, 1, tzinfo=timezone.utc))
+        mock_db.execute.return_value.scalar.return_value = datetime(2026, 5, 1, tzinfo=timezone.utc)
+
+        bounds = MagicMock(return_value=(now + timedelta(days=1), now + timedelta(days=31)))
+        with patch.multiple(
+            "src.tasks.guarantee_shortfall_sweep",
+            _period_bounds=bounds,
+            _skip_pretracking_unresolved=MagicMock(return_value=0),
+        ):
+            result = evaluate_subscriber_guarantee(mock_db, sub, dry_run=True)
+
+        # Floor passed to _period_bounds is the ledger go-live, not 2026-05-01.
+        assert bounds.call_args.kwargs["floor"] == DELIVERY_TRACKING_START_UTC
+        # The floored first cycle is still open -> nothing evaluated, no credit.
+        assert result is None
+
+    def test_period_bounds_ignores_pre_floor_unresolved(self, mock_db):
+        """A pending/failed row older than the floor is filtered out of the
+        unresolved lookup (the SQL floor guard), so the cursor advances to a
+        fresh cycle anchored at the floor instead of retrying the stale window."""
+        from src.tasks.guarantee_shortfall_sweep import _period_bounds, CYCLE_DAYS
+
+        created_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        floor = datetime(2026, 6, 23, tzinfo=timezone.utc)
+        # DB already filtered the stale pre-floor row -> unresolved lookup empty,
+        # last-resolved lookup empty -> fresh cycle from the floor.
+        _exec_results(
+            mock_db,
+            MagicMock(first=MagicMock(return_value=None)),
+            MagicMock(scalar=MagicMock(return_value=None)),
+        )
+
+        start, end = _period_bounds(mock_db, 1, created_at, floor=floor)
+
+        assert start == floor
+        assert end == floor + timedelta(days=CYCLE_DAYS)
+
+    def test_skip_pretracking_unresolved_marks_and_commits(self, mock_db):
+        """Legacy pre-floor unresolved rows are terminally resolved (audit kept),
+        never retried, never sent to Stripe."""
+        from src.tasks.guarantee_shortfall_sweep import _skip_pretracking_unresolved
+
+        mock_db.execute.return_value.rowcount = 2
+        floor = datetime(2026, 6, 23, tzinfo=timezone.utc)
+
+        resolved = _skip_pretracking_unresolved(mock_db, 1, floor)
+
+        assert resolved == 2
+        mock_db.commit.assert_called_once()
+        sql = mock_db.execute.call_args.args[0].text
+        assert "skipped_no_charge_basis" in sql
+        assert "status IN ('pending', 'failed')" in sql
+        assert "period_start < :floor" in sql
+
+
 class TestDeliveredCount:
     def test_returns_int_from_scalar(self, mock_db):
         from src.tasks.guarantee_shortfall_sweep import _delivered_count
@@ -181,6 +249,9 @@ class TestGuaranteeSweep:
 
         sub = _make_sub(tier="starter")  # quota=10
         mock_db.execute.return_value.fetchall.return_value = [sub]
+        # account_created_at scalar — a real datetime so the floor max() resolves
+        mock_db.execute.return_value.scalar.return_value = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        mock_db.execute.return_value.rowcount = 0  # _skip_pretracking_unresolved no-op
 
         with (
             self._patch_common(delivered=10),
@@ -199,6 +270,9 @@ class TestGuaranteeSweep:
         # starter quota=10, delivered=5 -> shortfall=5, plan_price=$600 -> credit=$300
         sub = _make_sub(tier="starter", plan_price=600)
         mock_db.execute.return_value.fetchall.return_value = [sub]
+        # account_created_at scalar — a real datetime so the floor max() resolves
+        mock_db.execute.return_value.scalar.return_value = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        mock_db.execute.return_value.rowcount = 0  # _skip_pretracking_unresolved no-op
         period_end = datetime(2026, 3, 3, tzinfo=timezone.utc)  # closed, in the past
 
         with (
@@ -233,6 +307,9 @@ class TestGuaranteeSweep:
 
         sub = _make_sub(tier="starter", plan_price=600)
         mock_db.execute.return_value.fetchall.return_value = [sub]
+        # account_created_at scalar — a real datetime so the floor max() resolves
+        mock_db.execute.return_value.scalar.return_value = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        mock_db.execute.return_value.rowcount = 0  # _skip_pretracking_unresolved no-op
 
         with (
             self._patch_common(delivered=5),
@@ -251,6 +328,9 @@ class TestGuaranteeSweep:
 
         sub = _make_sub(tier="starter", plan_price=600, stripe_customer_id=None)
         mock_db.execute.return_value.fetchall.return_value = [sub]
+        # account_created_at scalar — a real datetime so the floor max() resolves
+        mock_db.execute.return_value.scalar.return_value = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        mock_db.execute.return_value.rowcount = 0  # _skip_pretracking_unresolved no-op
 
         with (
             self._patch_common(delivered=5),
@@ -266,6 +346,9 @@ class TestGuaranteeSweep:
 
         sub = _make_sub(tier="starter", plan_price=600)
         mock_db.execute.return_value.fetchall.return_value = [sub]
+        # account_created_at scalar — a real datetime so the floor max() resolves
+        mock_db.execute.return_value.scalar.return_value = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        mock_db.execute.return_value.rowcount = 0  # _skip_pretracking_unresolved no-op
 
         with (
             self._patch_common(delivered=5),
@@ -284,6 +367,9 @@ class TestGuaranteeSweep:
 
         sub = _make_sub(tier="starter", plan_price=600)
         mock_db.execute.return_value.fetchall.return_value = [sub]
+        # account_created_at scalar — a real datetime so the floor max() resolves
+        mock_db.execute.return_value.scalar.return_value = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        mock_db.execute.return_value.rowcount = 0  # _skip_pretracking_unresolved no-op
 
         with (
             self._patch_common(delivered=5, cycle_elapsed=False),
@@ -301,6 +387,9 @@ class TestGuaranteeSweep:
 
         sub = _make_sub(tier="starter", plan_price=600)
         mock_db.execute.return_value.fetchall.return_value = [sub]
+        # account_created_at scalar — a real datetime so the floor max() resolves
+        mock_db.execute.return_value.scalar.return_value = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        mock_db.execute.return_value.rowcount = 0  # _skip_pretracking_unresolved no-op
 
         with (
             self._patch_common(delivered=5, reserve_row_id=None),
@@ -331,6 +420,7 @@ class TestEvaluateSubscriberGuarantee:
 
         now = datetime.now(timezone.utc)
         sub = _make_sub(tier="pro", plan_price=1100)  # quota=20
+        mock_db.execute.return_value.scalar.return_value = datetime(2026, 7, 1, tzinfo=timezone.utc)
 
         with (
             patch.multiple(
@@ -339,6 +429,7 @@ class TestEvaluateSubscriberGuarantee:
                 _delivered_count=MagicMock(return_value=10),
                 _reserve_period=MagicMock(return_value=55),
                 _resolve_period=MagicMock(),
+                _skip_pretracking_unresolved=MagicMock(return_value=0),
             ),
             patch("src.tasks.guarantee_shortfall_sweep.issue_guarantee_credit",
                   return_value="txn_xyz"),
