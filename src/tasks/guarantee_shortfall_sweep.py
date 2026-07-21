@@ -40,7 +40,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import text
 
-from config.guarantees import TIER_LEAD_QUOTAS
+from config.guarantees import TIER_LEAD_QUOTAS, DELIVERY_TRACKING_START_UTC
 from src.core.database import get_db_context
 from src.services.email import send_email
 from src.services.stripe_service import issue_guarantee_credit
@@ -57,16 +57,30 @@ def _as_utc(dt: datetime) -> datetime:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
 
-def _period_bounds(db, subscriber_id: int, created_at: datetime) -> tuple[datetime, datetime]:
+def _period_bounds(
+    db, subscriber_id: int, created_at: datetime, floor: datetime | None = None
+) -> tuple[datetime, datetime]:
     """Next cycle for this subscriber to evaluate. An unresolved ('pending'
     or 'failed') cycle is retried in place — a crash or a Stripe outage must
     not be skipped by advancing past it. Otherwise starts where the last
-    terminally-resolved cycle ended, or at signup if never evaluated."""
+    terminally-resolved cycle ended, or at signup if never evaluated.
+
+    `floor` clamps the cycle start no earlier than the point delivery was
+    actually tracked (max of the bridged customer_account creation and the
+    deliveries-ledger go-live). Without it, the first cycle anchors to signup
+    and retroactively bills a backlog of pre-tracking cycles that show 0
+    delivered simply because the deliveries ledger didn't exist yet.
+
+    The floor also filters the unresolved lookup: a legacy 'pending'/'failed'
+    row whose period_start predates the floor is NOT handed back for retry —
+    it would recount the same pre-tracking window as a false shortfall. Such
+    rows are terminally resolved out of band by _skip_pretracking_unresolved."""
     unresolved = db.execute(text("""
         SELECT period_start, period_end FROM guarantee_credits
         WHERE subscriber_id = :sid AND status IN ('pending', 'failed')
+          AND (:floor IS NULL OR period_start >= :floor)
         ORDER BY period_end ASC LIMIT 1
-    """), {"sid": subscriber_id}).first()
+    """), {"sid": subscriber_id, "floor": floor}).first()
     if unresolved:
         return _as_utc(unresolved.period_start), _as_utc(unresolved.period_end)
 
@@ -76,7 +90,33 @@ def _period_bounds(db, subscriber_id: int, created_at: datetime) -> tuple[dateti
         ORDER BY period_end DESC LIMIT 1
     """), {"sid": subscriber_id}).scalar()
     start = _as_utc(last_end or created_at)
+    if floor is not None:
+        start = max(start, _as_utc(floor))
     return start, start + timedelta(days=CYCLE_DAYS)
+
+
+def _skip_pretracking_unresolved(db, subscriber_id: int, floor: datetime) -> int:
+    """Terminally resolve any unresolved ('pending'/'failed') guarantee cycle
+    that starts before `floor`. These are legacy periods created before delivery
+    tracking existed; retrying them recounts an all-zero window and issues a
+    false credit. The row is kept (status -> 'skipped_no_charge_basis') so the
+    audit history survives; it is never deleted, and Stripe is never called.
+    Returns the number of rows resolved. No-op-safe under repeat runs."""
+    result = db.execute(text("""
+        UPDATE guarantee_credits
+           SET status = 'skipped_no_charge_basis'
+         WHERE subscriber_id = :sid
+           AND status IN ('pending', 'failed')
+           AND period_start < :floor
+    """), {"sid": subscriber_id, "floor": floor})
+    db.commit()
+    resolved = result.rowcount or 0
+    if resolved:
+        logger.info(
+            "[GuaranteeSweep] skipped %d pre-tracking unresolved cycle(s) for subscriber %s",
+            resolved, subscriber_id,
+        )
+    return resolved
 
 
 def _reserve_period(
@@ -171,8 +211,27 @@ def evaluate_subscriber_guarantee(db, sub, *, dry_run: bool = False) -> dict | N
     if not quota:
         return None
 
+    # The guarantee is measured against the deliveries ledger, which only
+    # covers subscribers bridged to a customer_account. A subscriber with no
+    # account has no measurable delivery history — skip rather than treat an
+    # unmeasurable cycle as a 0-delivered shortfall. The account's creation
+    # also floors the cycle start so pre-tracking history isn't back-credited.
+    account_created_at = db.execute(text("""
+        SELECT min(created_at) FROM customer_accounts WHERE subscriber_id = :sid
+    """), {"sid": sub.id}).scalar()
+    if account_created_at is None:
+        return None
+
+    # Floor at the later of account creation and the deliveries-ledger go-live:
+    # a delivery can't predate either, so an earlier window would count false
+    # zeros. Legacy unresolved cycles below the floor are terminally skipped
+    # (audit kept) so they can't be retried into a false credit.
+    floor = max(_as_utc(account_created_at), DELIVERY_TRACKING_START_UTC)
+    if not dry_run:
+        _skip_pretracking_unresolved(db, sub.id, floor)
+
     now = datetime.now(timezone.utc)
-    start, end = _period_bounds(db, sub.id, sub.created_at)
+    start, end = _period_bounds(db, sub.id, sub.created_at, floor=floor)
     if end > now:
         return None  # cycle not finished yet
 
@@ -239,8 +298,11 @@ def run_guarantee_shortfall_sweep(db=None, *, dry_run: bool = False) -> dict:
         tiers = list(TIER_LEAD_QUOTAS.keys())
         subs = db.execute(text("""
             SELECT id, tier, plan_price, stripe_customer_id, email, name, created_at
-            FROM subscribers
+            FROM subscribers s
             WHERE status = 'active' AND tier = ANY(:tiers)
+              AND EXISTS (
+                SELECT 1 FROM customer_accounts ca WHERE ca.subscriber_id = s.id
+              )
         """), {"tiers": tiers}).fetchall()
 
         for sub in subs:
