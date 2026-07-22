@@ -789,35 +789,12 @@ def _on_checkout_completed(session: dict, db: Session, background_tasks=None) ->
         )
 
     # ── Lock ZIP territories (same transaction) ────────────────────────────
+    from src.services.zip_territory import claim_zip_territory
     for zip_code in zip_codes:
-        territory = db.execute(
-            select(ZipTerritory).where(
-                ZipTerritory.zip_code == zip_code,
-                ZipTerritory.vertical == vertical,
-                ZipTerritory.county_id == county_id,
-            ).with_for_update()
-        ).scalar_one_or_none()
-
-        if territory is None:
-            territory = ZipTerritory(
-                zip_code=zip_code,
-                vertical=vertical,
-                county_id=county_id,
-                subscriber_id=subscriber.id,
-                status="locked",
-                locked_at=now,
-            )
-            db.add(territory)
-        elif territory.status in ("available", "grace"):
-            territory.subscriber_id = subscriber.id
-            territory.status = "locked"
-            territory.locked_at = now
-            territory.grace_expires_at = None
-        else:
-            logger.warning(
-                "ZIP %s/%s/%s already locked by subscriber %s — skipping",
-                zip_code, vertical, county_id, territory.subscriber_id,
-            )
+        claim_zip_territory(
+            db, zip_code=zip_code, vertical=vertical, county_id=county_id,
+            subscriber_id=subscriber.id, now=now,
+        )
 
     # Bust zip_availability cache for every (county_id, vertical) pair that was locked.
     from src.core.redis_client import rdelete

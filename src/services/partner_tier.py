@@ -92,35 +92,12 @@ def provision_partner_access(
         existing.max_zips = len(zip_codes)
         existing.deactivated_at = None
 
+    from src.services.zip_territory import claim_zip_territory
     for zc in zip_codes:
-        territory = db.execute(
-            select(ZipTerritory).where(
-                ZipTerritory.zip_code == zc,
-                ZipTerritory.vertical == vertical,
-                ZipTerritory.county_id == county_id,
-            ).with_for_update()
-        ).scalar_one_or_none()
-
-        if territory is None:
-            territory = ZipTerritory(
-                zip_code=zc,
-                vertical=vertical,
-                county_id=county_id,
-                subscriber_id=subscriber_id,
-                status="locked",
-                locked_at=now,
-            )
-            db.add(territory)
-        elif territory.status in ("available", "grace"):
-            territory.subscriber_id = subscriber_id
-            territory.status = "locked"
-            territory.locked_at = now
-            territory.grace_expires_at = None
-        else:
-            logger.warning(
-                "partner_provision: ZIP %s already locked by sub %s — skipping",
-                zc, territory.subscriber_id,
-            )
+        claim_zip_territory(
+            db, zip_code=zc, vertical=vertical, county_id=county_id,
+            subscriber_id=subscriber_id, now=now,
+        )
 
     db.flush()
     logger.info(
