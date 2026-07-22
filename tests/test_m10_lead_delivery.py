@@ -66,9 +66,22 @@ class TestPickWinner:
                               last_delivered_at=datetime(2026, 1, 1, tzinfo=timezone.utc))
         assert pick_winner([fresh, delivered]).account_id == "fresh"
 
+    def test_founder_outranks_dominator(self):
+        # Founder card promises "you see them first" — founder wins the
+        # tier tie-breaker even with less headroom than dominator (ADR 0036).
+        dominator = Candidate("dom", "dominator", headroom=50, last_delivered_at=None)
+        founder = Candidate("founder", "founder", headroom=1, last_delivered_at=None)
+        assert pick_winner([dominator, founder]).account_id == "founder"
+
 
 def test_tier_rank_ordering():
-    assert tier_rank("dominator") > tier_rank("pro") > tier_rank("starter") > tier_rank("free_trial")
+    assert (
+        tier_rank("founder")
+        > tier_rank("dominator")
+        > tier_rank("pro")
+        > tier_rank("starter")
+        > tier_rank("free_trial")
+    )
     assert tier_rank(None) == 0
     assert tier_rank("unknown") == 0
 

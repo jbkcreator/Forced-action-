@@ -55,6 +55,51 @@ def _fetch_tier_from_db(db, account_id) -> Optional[str]:
     return row.tier if row is not None else None
 
 
+def get_subscriber_tier(db, subscriber_id) -> Optional[str]:
+    """Resolve a subscriber's plan tier via the customer_accounts -> plans join.
+
+    The founder tier lives on plans.tier (reached through customer_accounts.plan_tier),
+    not subscribers.tier. Reveal surfaces (wallet unlock, hot-lead unlock) key on
+    subscriber_id, so this is the subscriber-keyed counterpart to
+    `get_account_tier`. Direct DB read (no cache) — reveal paths are low-frequency
+    and must never see a stale "free" answer that would waive/charge incorrectly.
+    """
+    row = db.execute(
+        sa_text("""
+            SELECT p.tier
+              FROM customer_accounts ca
+              JOIN plans p ON p.plan_id = ca.plan_tier
+             WHERE ca.subscriber_id = :subscriber_id
+             LIMIT 1
+        """),
+        {"subscriber_id": subscriber_id},
+    ).fetchone()
+    return row.tier if row is not None else None
+
+
+def reveal_is_free(db, subscriber_id) -> bool:
+    """True when the subscriber's tier waives per-reveal cost. Founder only (ADR 0037).
+
+    Requires the founder's customer_account to be `active` — a past_due/grace/
+    churned founder must fall back to the normal paid-reveal path so a failed
+    or lapsed payment can't be used to keep pulling free hot-lead reveals
+    (PR #163 review comment 2).
+
+    Consulted by the wallet-unlock and hot-lead-unlock surfaces before charging.
+    """
+    row = db.execute(
+        sa_text("""
+            SELECT p.tier, ca.status
+              FROM customer_accounts ca
+              JOIN plans p ON p.plan_id = ca.plan_tier
+             WHERE ca.subscriber_id = :subscriber_id
+             LIMIT 1
+        """),
+        {"subscriber_id": subscriber_id},
+    ).fetchone()
+    return row is not None and row.tier == "founder" and row.status == "active"
+
+
 def get_account_tier(db, account_id) -> Optional[str]:
     """Return the account's plan tier (e.g. "starter"), or None if it has no active plan.
 

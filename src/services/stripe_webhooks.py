@@ -2521,6 +2521,101 @@ def _resolve_subscriber_id_from_pi(payment_intent, db: Session) -> Optional[int]
     return None
 
 
+def fulfill_founder_comp_reveal(subscriber, property_id_raw, db: Session) -> bool:
+    """Reveal a lead to a founder at $0 — the hot-lead-unlock waiver (ADR 0037).
+
+    Same deliverable as a paid hot-lead unlock (SentLead audit row, Auto Mode
+    enqueue, full-details email) but with NO Stripe charge and NO revenue-ledger
+    entry. The SentLead source marks it a founder comp so revenue reporting and
+    dedupe both stay correct. Idempotent per (subscriber, property). Returns True
+    when the reveal was fulfilled, False on a bad property id.
+    """
+    from src.core.models import Property, Owner, DistressScore, EnrichedContact, SentLead
+
+    try:
+        property_id = int(property_id_raw)
+    except (TypeError, ValueError):
+        logger.warning("founder_comp reveal: non-int property_id=%r", property_id_raw)
+        return False
+
+    prop = db.get(Property, property_id)
+    if not prop:
+        logger.warning("founder_comp reveal: property %s not found", property_id)
+        return False
+
+    score = db.execute(
+        select(DistressScore).where(DistressScore.property_id == property_id)
+        .order_by(DistressScore.score_date.desc()).limit(1)
+    ).scalar_one_or_none()
+    owner = db.execute(
+        select(Owner).where(Owner.property_id == property_id).limit(1)
+    ).scalar_one_or_none()
+    enriched = db.execute(
+        select(EnrichedContact).where(
+            EnrichedContact.property_id == property_id,
+            EnrichedContact.match_success == True,  # noqa: E712
+        ).limit(1)
+    ).scalar_one_or_none()
+
+    # First-touch delivery (Auto Mode enqueue, full-details email) must fire
+    # exactly once per (subscriber, property). SentLead has no unique
+    # constraint on (subscriber_id, property_id) — other sources (daily_email,
+    # lead_unlock) legitimately insert multiple rows for the same pair over
+    # time — so a plain check-then-insert can't rely on a constraint to
+    # resolve a race and isn't atomic on its own (two concurrent requests can
+    # both pass the "not exists" check before either commits). A Postgres
+    # transaction-scoped advisory lock serializes concurrent callers for the
+    # same (subscriber, property) without a schema change: the second caller
+    # blocks until the first's transaction ends, then sees the row the first
+    # caller already committed and skips the side effects below
+    # (PR #163 review comment 3).
+    lock_key = f"founder_comp_reveal:{subscriber.id}:{property_id}"
+    db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": lock_key})
+
+    existing = db.execute(
+        select(SentLead).where(
+            SentLead.subscriber_id == subscriber.id,
+            SentLead.property_id == property_id,
+            SentLead.source == "founder_comp_reveal",
+        )
+    ).scalar_one_or_none()
+    is_first_reveal = existing is None
+
+    if is_first_reveal:
+        try:
+            with db.begin_nested():
+                db.add(SentLead(
+                    subscriber_id=subscriber.id,
+                    property_id=property_id,
+                    source="founder_comp_reveal",
+                ))
+                db.flush()
+        except (IntegrityError, OperationalError) as exc:
+            logger.warning("founder_comp reveal: SentLead insert failed: %s", exc)
+    else:
+        logger.info("founder_comp reveal: already delivered sub=%s prop=%s",
+                    subscriber.id, property_id)
+
+    if not is_first_reveal:
+        return True
+
+    try:
+        from src.services.auto_mode import enqueue_action
+        enqueue_action(subscriber.id, property_id, db)
+    except Exception:
+        logger.error("founder_comp reveal: Auto Mode enqueue failed sub=%s prop=%s",
+                     subscriber.id, property_id, exc_info=True)
+
+    try:
+        _send_lead_unlock_email(subscriber, prop, score, owner, enriched)
+    except Exception as exc:
+        logger.error("founder_comp reveal: email send failed: %s", exc, exc_info=True)
+
+    logger.info("founder_comp reveal complete: subscriber=%s property=%s",
+                subscriber.id, property_id)
+    return True
+
+
 def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
     """
     Handle a single-lead unlock purchase — the $2.50–$7 dashboard unlock

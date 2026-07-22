@@ -29,6 +29,40 @@ from src.core.models import Subscriber, WalletBalance, WalletTransaction
 
 logger = logging.getLogger(__name__)
 
+# Reveal actions waived for founders (ADR 0037). A founder never spends credits
+# to reveal a lead; the debit is recorded at $0 instead (see _record_founder_comp).
+_FOUNDER_COMP_ACTIONS = frozenset({"lead_unlock"})
+
+
+def _record_founder_comp(
+    subscriber_id: int,
+    action: str,
+    db: Session,
+    description: str,
+    zip_code: Optional[str],
+) -> bool:
+    """Record a founder's free reveal as a $0 debit (ADR 0037).
+
+    txn_type stays 'debit' (the CHECK constraint forbids new values); amount=0
+    marks it as comped and the 'founder_comp:' description prefix makes it
+    explicit and keeps it out of the exact-match 'lead_unlock' enrollment
+    counters. No balance mutation, no paid-intent side effects.
+    """
+    wallet = get_or_create_wallet(subscriber_id, db, lock=True)
+    txn = WalletTransaction(
+        subscriber_id=subscriber_id,
+        wallet_id=wallet.id,
+        txn_type="debit",
+        amount=0,
+        balance_after=wallet.credits_remaining,
+        description=f"founder_comp:{description or action}",
+        zip_code=zip_code,
+    )
+    db.add(txn)
+    db.flush()
+    logger.info("founder_comp reveal recorded sub=%s action=%s", subscriber_id, action)
+    return True
+
 
 def _select_wallet_for_update(subscriber_id: int, db: Session) -> Optional[WalletBalance]:
     """Read the wallet row with a row-level lock so concurrent mutators serialize."""
@@ -90,6 +124,14 @@ def debit(
     zip_code: if provided, attributed to the transaction for Wallet-to-Lock
     detection. Pass the ZIP of the lead being acted on.
     """
+    # Founder unlock waiver (ADR 0037): the reveal action is free for founders —
+    # record a $0 founder_comp row (keeps history/dedupe/analytics coherent) and
+    # skip the deduction and all paid-intent side effects below.
+    if action in _FOUNDER_COMP_ACTIONS:
+        from src.services.entitlement_service import reveal_is_free
+        if reveal_is_free(db, subscriber_id):
+            return _record_founder_comp(subscriber_id, action, db, description, zip_code)
+
     cost = CREDIT_COSTS.get(action, 1)
     wallet = get_or_create_wallet(subscriber_id, db, lock=True)
     if wallet.credits_remaining < cost:
@@ -229,6 +271,11 @@ def check_enrollment_triggers(subscriber_id: int, db: Session) -> Optional[str]:
     if not sub:
         return None
     if getattr(sub, "wallet_opt_out", False):
+        return None
+    # Founders get unlimited free reveals (ADR 0037) — never a wallet-enrollment
+    # candidate, so their $0 comp reveals cannot trip the upsell thresholds.
+    from src.services.entitlement_service import reveal_is_free
+    if reveal_is_free(db, subscriber_id):
         return None
 
     existing_wallet = db.execute(
