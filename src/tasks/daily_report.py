@@ -674,7 +674,11 @@ def _build_inbound_velocity_section(session) -> dict:
         sync_inbound_response_outcomes,
     )
     try:
-        sync_inbound_response_outcomes(session)
+        # Reconcile writes + commits — keep that off the shared report-building
+        # session (which other, read-only, section builders share) by giving
+        # it its own session. The report read then runs on the passed session.
+        with get_db_context() as sync_session:
+            sync_inbound_response_outcomes(sync_session)
         return get_inbound_velocity_stats(session)
     except Exception:
         logger.warning("_build_inbound_velocity_section failed", exc_info=True)

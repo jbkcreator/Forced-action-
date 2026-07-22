@@ -4709,9 +4709,13 @@ async def synthflow_inbound_webhook(request: Request, db: Session = Depends(get_
     # window. Scoring only — the B11-03 callback trigger consumes this via
     # publish_cora_event and reuses Block 2's consent/compliance gates.
     from src.services.inbound_intent import score_inbound
+    from src.services.phone_utils import normalize as normalize_phone
 
+    # subscribers.phone is stored E.164-normalized, so normalize at this
+    # boundary before scoring — otherwise the known_caller lookup compares a
+    # raw payload string against a normalized column and silently never matches.
     intent = score_inbound(
-        phone=phone,
+        phone=normalize_phone(phone),
         zip_code=payload.resolved_zip,
         vertical=payload.resolved_vertical,
         transcript=payload.resolved_transcript_text,

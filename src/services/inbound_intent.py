@@ -81,6 +81,9 @@ def score_inbound(
     Score an inbound call for high intent. Cheap signals only — this runs
     inside the sub-60s inbound-response window (B11-01).
 
+    `phone` must already be E.164-normalized by the caller (subscribers.phone
+    is stored normalized, so the known_caller lookup is an exact match).
+
     Returns {is_hot, score, matched_signals}. Consent is NOT part of this
     score — TCPA/PEWC gating happens at the callback trigger (B11-03).
     """
