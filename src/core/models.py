@@ -2530,6 +2530,7 @@ class CoraEventQueue(Base):
     subscriber_id: Mapped[Optional[int]] = mapped_column(Integer)
     payload: Mapped[Optional[dict]] = mapped_column(JSONB)
     idempotency_key: Mapped[Optional[str]] = mapped_column(Text)
+    decision_id: Mapped[Optional[str]] = mapped_column(String(36))  # preserved across the fallback path so downstream joins survive Redis-down
     status: Mapped[str] = mapped_column(Text, nullable=False, default="pending")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
