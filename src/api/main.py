@@ -4534,6 +4534,25 @@ class SynthflowInboundPayload(BaseModel):
             return self.call.get("call_id") or self.call.get("id")
         return None
 
+    @property
+    def resolved_intent_slot(self) -> bool:
+        """
+        True when the inbound Synthflow agent's own flow explicitly captured
+        buy-ready intent as a slot (B11-02 signal 5, highest-weighted).
+        Slot name is not yet standardized across flows — check the common
+        candidates the inbound Flow Designer agent may emit.
+        """
+        raw = (
+            self._slot(self.collected_variables, "ready_to_buy", "high_intent", "buy_intent")
+            or self._slot(self.executed_actions, "ready_to_buy", "high_intent", "buy_intent")
+        )
+        return str(raw).strip().lower() in ("yes", "true", "1")
+
+    @property
+    def resolved_transcript_text(self) -> str:
+        from src.services.synthflow_transcript import transcript_to_text
+        return transcript_to_text(self._transcript)
+
 
 def _verify_synthflow_secret(request: Request) -> bool:
     """Accept X-Synthflow-Secret or Authorization: Bearer <secret>."""
@@ -4642,7 +4661,26 @@ async def synthflow_inbound_webhook(request: Request, db: Session = Depends(get_
         call_id, phone, result.get("subscriber_id"),
         result.get("is_new"), result.get("lead_count"), result.get("capture_complete"),
     )
-    return {"status": "ok", **result}
+
+    # Block 11 / B11-01: score for high intent inside the sub-60s inbound
+    # window. Scoring only — the B11-03 callback trigger consumes this via
+    # publish_cora_event and reuses Block 2's consent/compliance gates.
+    from src.services.inbound_intent import score_inbound
+
+    intent = score_inbound(
+        phone=phone,
+        zip_code=payload.resolved_zip,
+        vertical=payload.resolved_vertical,
+        transcript=payload.resolved_transcript_text,
+        intent_slot=payload.resolved_intent_slot,
+        db=db,
+    )
+    logger.info(
+        "[SynthflowInbound] intent score call_id=%s sub=%s score=%d is_hot=%s signals=%s",
+        call_id, result.get("subscriber_id"), intent["score"], intent["is_hot"], intent["matched_signals"],
+    )
+
+    return {"status": "ok", **result, "intent": intent}
 
 
 # ---------------------------------------------------------------------------
