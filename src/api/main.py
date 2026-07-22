@@ -4554,6 +4554,46 @@ class SynthflowInboundPayload(BaseModel):
         return transcript_to_text(self._transcript)
 
 
+def _trigger_hot_inbound_callback(
+    *,
+    intent: Dict[str, Any],
+    subscriber_id: Optional[int],
+    vertical: Optional[str],
+    call_id: Optional[str],
+) -> None:
+    """
+    Block 11 / B11-03: if the inbound scored hot, publish inbound_hot_callback
+    so the Cora process routes it to the EXISTING new_lead_voice_call graph
+    (Block 2) — zero new call code, consent/compliance/kill-switch reused.
+    decision_id=call_id so B11-04 tracking can join webhook -> event -> graph.
+    """
+    if not intent.get("is_hot"):
+        return
+    if not subscriber_id:
+        logger.warning(
+            "[SynthflowInbound] hot inbound with no subscriber_id — callback not triggered call_id=%s",
+            call_id,
+        )
+        return
+
+    from src.agents.events.ingestion import publish_cora_event
+
+    publish_cora_event({
+        "event_type": "inbound_hot_callback",
+        "subscriber_id": subscriber_id,
+        "decision_id": call_id,
+        "payload": {
+            "vertical": vertical,
+            "score": intent.get("score"),
+            "matched_signals": intent.get("matched_signals"),
+        },
+    })
+    logger.info(
+        "[SynthflowInbound] inbound_hot_callback published sub=%s call_id=%s score=%s",
+        subscriber_id, call_id, intent.get("score"),
+    )
+
+
 def _verify_synthflow_secret(request: Request) -> bool:
     """Accept X-Synthflow-Secret or Authorization: Bearer <secret>."""
     settings_obj = get_settings()
@@ -4678,6 +4718,13 @@ async def synthflow_inbound_webhook(request: Request, db: Session = Depends(get_
     logger.info(
         "[SynthflowInbound] intent score call_id=%s sub=%s score=%d is_hot=%s signals=%s",
         call_id, result.get("subscriber_id"), intent["score"], intent["is_hot"], intent["matched_signals"],
+    )
+
+    _trigger_hot_inbound_callback(
+        intent=intent,
+        subscriber_id=result.get("subscriber_id"),
+        vertical=payload.resolved_vertical,
+        call_id=call_id,
     )
 
     return {"status": "ok", **result, "intent": intent}
