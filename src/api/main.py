@@ -5004,7 +5004,12 @@ async def telnyx_inbound(request: Request, db: Session = Depends(get_db)):
 class DealCaptureRequest(BaseModel):
     feed_uuid: str
     property_id: int
-    deal_size_bucket: str  # 5_10k | 10_25k | 25k_plus | skip
+    # T-B13-01: outcome_state is the one-tap card surface (closed/dead/pending).
+    # deal_size_bucket is the legacy field, still accepted for back-compat; one of
+    # the two must be present. dead_reason is required when outcome_state='dead'.
+    outcome_state: Optional[str] = None  # closed | dead | pending
+    dead_reason: Optional[str] = None
+    deal_size_bucket: Optional[str] = None  # 5_10k | 10_25k | 25k_plus | skip
     deal_amount: Optional[float] = None
     days_to_close: Optional[int] = None
 
@@ -5017,7 +5022,7 @@ def deal_capture(payload: DealCaptureRequest, db: Session = Depends(get_db)):
     fires the annual-at-deal-win push.
     """
     from src.core.models import DealOutcome
-    from src.services import outcome_confidence
+    from src.services import outcome_confidence, outcome_reasons
 
     sub = db.execute(
         select(Subscriber).where(Subscriber.event_feed_uuid == payload.feed_uuid)
@@ -5026,8 +5031,41 @@ def deal_capture(payload: DealCaptureRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=403, detail="Invalid feed_uuid")
 
     valid_buckets = {"5_10k", "10_25k", "25k_plus", "skip"}
-    if payload.deal_size_bucket not in valid_buckets:
-        raise HTTPException(status_code=422, detail=f"deal_size_bucket must be one of {valid_buckets}")
+
+    # T-B13-01: the one-tap card posts outcome_state (closed/dead/pending). The
+    # legacy deal_size_bucket path is preserved for back-compat; one of the two
+    # must be present. outcome_state is stored only when the card supplied it, so
+    # legacy rows keep it NULL (and never trip the dead-requires-reason check).
+    dead_reason: Optional[str] = None
+    fault_class: Optional[str] = None
+    stored_outcome_state: Optional[str] = None
+    if payload.outcome_state is not None:
+        if payload.outcome_state not in outcome_reasons.VALID_OUTCOME_STATES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"outcome_state must be one of {sorted(outcome_reasons.VALID_OUTCOME_STATES)}",
+            )
+        state = payload.outcome_state
+        if state == "dead":
+            if payload.dead_reason not in outcome_reasons.VALID_DEAD_REASONS:
+                raise HTTPException(
+                    status_code=422,
+                    detail="dead_reason is required and must be a valid reason when outcome_state is 'dead'",
+                )
+            dead_reason = payload.dead_reason
+            fault_class = outcome_reasons.fault_class_for(dead_reason)
+        if payload.deal_size_bucket is not None and payload.deal_size_bucket not in valid_buckets:
+            raise HTTPException(status_code=422, detail=f"deal_size_bucket must be one of {valid_buckets}")
+        stored_outcome_state = state
+    elif payload.deal_size_bucket in valid_buckets:
+        state = "dead" if payload.deal_size_bucket == "skip" else "closed"
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail="one of outcome_state or deal_size_bucket is required",
+        )
+
+    pipeline_stage = {"closed": "closed_won", "dead": "closed_lost", "pending": "negotiation"}[state]
 
     outcome = DealOutcome(
         subscriber_id=sub.id,
@@ -5036,7 +5074,10 @@ def deal_capture(payload: DealCaptureRequest, db: Session = Depends(get_db)):
         deal_amount=payload.deal_amount,
         deal_date=date.today(),
         days_to_close=payload.days_to_close,
-        pipeline_stage="closed_lost" if payload.deal_size_bucket == "skip" else "closed_won",
+        pipeline_stage=pipeline_stage,
+        outcome_state=stored_outcome_state,
+        dead_reason=dead_reason,
+        reason_fault_class=fault_class,
         county_id=sub.county_id,
         trade_vertical=sub.vertical,
         confidence_tier=outcome_confidence.SUBSCRIBER_REPORTED,
@@ -5045,23 +5086,28 @@ def deal_capture(payload: DealCaptureRequest, db: Session = Depends(get_db)):
     db.add(outcome)
     db.flush()
 
-    # Subscriber-agnostic learning-loop autopsies — run for every outcome,
-    # including ownerless (founder / public-record inferred) rows.
-    # Phase 3 A5: pre-decision snapshot (captures all 6 vertical scores at routing time)
-    try:
-        from src.services.snapshot_service import capture_snapshot
-        capture_snapshot(
-            property_id=outcome.property_id,
-            db=db,
-            deal_outcome_id=outcome.id,
-            selected_vertical=sub.vertical,
-            outcome_status="lost" if payload.deal_size_bucket == "skip" else "funded",
-        )
-    except Exception as exc:
-        logger.warning("[DealCapture] snapshot capture failed: %s", exc)
+    # T-B13-01: pending is a non-terminal tap — record it, but fire no
+    # terminal learning-loop effects (snapshot / autopsy / win side-effects).
+    is_terminal = state != "pending"
 
-    # Phase 3 A1: loss autopsy for closed_lost deals (deal_size_bucket == "skip")
-    if payload.deal_size_bucket == "skip":
+    # Subscriber-agnostic learning-loop autopsies — run for every terminal
+    # outcome, including ownerless (founder / public-record inferred) rows.
+    # Phase 3 A5: pre-decision snapshot (captures all 6 vertical scores at routing time)
+    if is_terminal:
+        try:
+            from src.services.snapshot_service import capture_snapshot
+            capture_snapshot(
+                property_id=outcome.property_id,
+                db=db,
+                deal_outcome_id=outcome.id,
+                selected_vertical=sub.vertical,
+                outcome_status="lost" if state == "dead" else "funded",
+            )
+        except Exception as exc:
+            logger.warning("[DealCapture] snapshot capture failed: %s", exc)
+
+    # Phase 3 A1: loss autopsy for dead outcomes (closed_lost).
+    if state == "dead":
         try:
             from src.services.loss_autopsy import run_loss_autopsy
             run_loss_autopsy(
@@ -5075,10 +5121,13 @@ def deal_capture(payload: DealCaptureRequest, db: Session = Depends(get_db)):
 
     # Subscriber-only side-effects (win graphic, win story, annual push,
     # attribution, suppression). No-op for ownerless outcomes — CDE-11.
-    from src.services.deal_outcome_effects import record_outcome_side_effects
-    effects = record_outcome_side_effects(outcome, sub, db)
-    graphic_url: Optional[str] = effects["graphic_url"]
-    annual_offered = effects["annual_offered"]
+    graphic_url: Optional[str] = None
+    annual_offered = False
+    if is_terminal:
+        from src.services.deal_outcome_effects import record_outcome_side_effects
+        effects = record_outcome_side_effects(outcome, sub, db)
+        graphic_url = effects["graphic_url"]
+        annual_offered = effects["annual_offered"]
 
     return {
         "ok": True,
