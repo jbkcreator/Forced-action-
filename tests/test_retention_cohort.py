@@ -205,3 +205,58 @@ def test_zip_filter_isolates_subscriber_holding_that_zip(fresh_db):
     matching = [c for c in result["cohorts"] if c["cohort_month"] == key]
     assert len(matching) == 1
     assert matching[0]["size"] == 1
+
+
+def test_late_conversion_is_alive_at_m0_not_m1(fresh_db):
+    # Subscriber row created mid-month but doesn't convert to paid (first
+    # 'new' movement) until weeks later — the free-trial-to-paid gap. Aging
+    # must anchor to entered_at, not the calendar signup month, or this looks
+    # dead at M0 and alive at M1 (an impossible 0% -> 100% curve).
+    created_at = COHORT_MONTH + timedelta(days=10)
+    entered_at = COHORT_MONTH + timedelta(days=25)
+    subs = [_sub(fresh_db, created_at=created_at) for _ in range(5)]
+    for sub in subs:
+        acct = _acct(fresh_db, sub)
+        _movement(fresh_db, acct, movement_type="new", at=entered_at)
+
+    result = compute_retention_cohorts(fresh_db, tier="pro")
+    key = COHORT_MONTH.strftime("%Y-%m")  # row still labeled by signup month
+    cohort = next(c for c in result["cohorts"] if c["cohort_month"] == key)
+    m0 = next(c for c in cohort["cells"] if c["m"] == 0)
+    assert m0["alive"] == 5  # alive immediately upon conversion, not dead until M1
+
+
+def test_free_subscriber_upgrading_in_a_later_month_is_not_churned_before_conversion(fresh_db):
+    # Signup month and paid-conversion month can differ entirely (free tier
+    # for a while, upgrade later). Still must not appear dead at M0.
+    created_at = COHORT_MONTH
+    entered_at = COHORT_MONTH + timedelta(days=45)  # converts ~1.5 months later
+    subs = [_sub(fresh_db, created_at=created_at) for _ in range(5)]
+    for sub in subs:
+        acct = _acct(fresh_db, sub)
+        _movement(fresh_db, acct, movement_type="new", at=entered_at)
+
+    result = compute_retention_cohorts(fresh_db, tier="pro")
+    key = COHORT_MONTH.strftime("%Y-%m")
+    cohort = next(c for c in result["cohorts"] if c["cohort_month"] == key)
+    m0 = next(c for c in cohort["cells"] if c["m"] == 0)
+    assert m0["alive"] == 5
+
+
+def test_cohorts_param_returns_exact_requested_count(fresh_db):
+    # cohorts=1 must return only the current calendar month, not the current
+    # month plus the prior one (the off-by-one this regression guards).
+    now = datetime.now(timezone.utc)
+    this_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    prev_month = (this_month - timedelta(days=1)).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    this_month_subs = [_sub(fresh_db, created_at=this_month) for _ in range(5)]
+    prev_month_subs = [_sub(fresh_db, created_at=prev_month) for _ in range(5)]
+    for sub in this_month_subs + prev_month_subs:
+        acct = _acct(fresh_db, sub)
+        _movement(fresh_db, acct, movement_type="new", at=sub.created_at)
+
+    result = compute_retention_cohorts(fresh_db, tier="pro", cohorts=1)
+    keys = {c["cohort_month"] for c in result["cohorts"]}
+    assert this_month.strftime("%Y-%m") in keys
+    assert prev_month.strftime("%Y-%m") not in keys

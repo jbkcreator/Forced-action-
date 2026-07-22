@@ -9,10 +9,16 @@ Paid **logo** retention: subscribers are bucketed by the calendar month of
 `subscribers.status`/`churned_at` — a row can be `status='churned'` with
 `churned_at IS NULL` (see tests/test_reactivation_foundation.py) and free/trial
 exits never set `churned_at` at all, so neither can reliably age a survival
-curve. A subscriber enters the curve at their first `new` movement and is
-"alive" at month N if their net ledger state (new − churn, up to
-created_at + N months) is positive, so append-only reactivations correctly
-re-count as alive instead of freezing dead at first churn.
+curve. A subscriber enters the curve at their first `new` movement
+(`entered_at`) and is "alive" at month N if their net ledger state (new −
+churn, up to `entered_at` + N months) is positive, so append-only
+reactivations correctly re-count as alive instead of freezing dead at first
+churn. Aging is anchored to `entered_at`, not the `cohort_month` row label —
+a subscriber can sign up (created_at) weeks before their first paid movement
+(free trial), and anchoring the clock to the calendar signup month instead of
+the actual paid-entry timestamp produces impossible curves (0% at M0 rising
+to 100% at M1). The cohort *row* is still labeled by signup month for
+readability; only the per-month cutoff math uses `entered_at`.
 
 Channel key reuses `_CHANNEL_KEY_SQL` from revenue_metrics.py verbatim so this
 viewport agrees with the CAC/channel dashboard. ZIP membership is
@@ -78,7 +84,7 @@ def compute_retention_cohorts(
             FROM subscribers s
             JOIN customer_accounts ca ON ca.subscriber_id = s.id
             JOIN mrr_movements mm ON mm.account_id = ca.account_id
-            WHERE s.created_at >= date_trunc('month', now()) - (:cohorts || ' months')::interval
+            WHERE s.created_at >= date_trunc('month', now()) - ((:cohorts - 1) || ' months')::interval
               {where_clause}
             GROUP BY s.id, s.created_at
             HAVING MIN(mm.effective_at) FILTER (WHERE mm.movement_type = 'new') IS NOT NULL
@@ -96,15 +102,15 @@ def compute_retention_cohorts(
                 COALESCE(SUM(
                     CASE WHEN mm.movement_type = 'churn' THEN -1 ELSE 1 END
                 ) FILTER (
-                    WHERE mm.effective_at <= mem.cohort_month + (off.m || ' months')::interval
+                    WHERE mm.effective_at <= mem.entered_at + (off.m || ' months')::interval
                       AND mm.movement_type IN ('new', 'churn')
                 ), 0) AS net_state,
-                (mem.cohort_month + (off.m || ' months')::interval) <= now() AS aged_into
+                (mem.entered_at + (off.m || ' months')::interval) <= now() AS aged_into
             FROM members mem
             JOIN customer_accounts ca ON ca.subscriber_id = mem.subscriber_id
             JOIN mrr_movements mm ON mm.account_id = ca.account_id
             CROSS JOIN offsets off
-            GROUP BY mem.subscriber_id, mem.cohort_month, off.m
+            GROUP BY mem.subscriber_id, mem.cohort_month, mem.entered_at, off.m
         )
         SELECT
             cohort_month,
