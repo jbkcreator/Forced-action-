@@ -152,12 +152,16 @@ def candidates_for(db: Session, lead: Lead) -> list[Candidate]:
     entitled to the lead's grade, and still have headroom this cycle.
     """
     gkey = grade_key(lead.grade)
+    # ca.plan_tier is a FK to plans.plan_id (e.g. 'founder_monthly'), not the
+    # tier bucket name — join plans to resolve the actual tier ('founder') that
+    # tier_rank()/_TIER_RANK understands. See PR #163 review comment 1.
     rows = db.execute(text("""
-        SELECT ca.account_id, ca.plan_tier, ca.lead_entitlement, ca.lead_credits,
+        SELECT ca.account_id, p.tier AS plan_tier, ca.lead_entitlement, ca.lead_credits,
                ca.current_period_end, zt.vertical,
                (SELECT max(d.delivered_at) FROM deliveries d WHERE d.account_id = ca.account_id) AS last_delivered_at
         FROM zip_territories zt
         JOIN customer_accounts ca ON ca.subscriber_id = zt.subscriber_id
+        LEFT JOIN plans p ON p.plan_id = ca.plan_tier
         WHERE zt.zip_code = :zip AND zt.county_id = :county
           AND zt.status = 'locked'
           AND zt.vertical = ANY(:verticals)

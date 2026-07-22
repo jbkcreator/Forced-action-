@@ -11,27 +11,47 @@ from src.core.models import WalletBalance
 
 
 class TestRevealIsFree:
-    def _row(self, tier):
+    def _row(self, tier, status="active"):
         row = MagicMock()
         row.tier = tier
+        row.status = status
         return row
 
     def test_founder_tier_is_free(self):
         from src.services.entitlement_service import reveal_is_free
         db = MagicMock()
-        db.execute.return_value.fetchone.return_value = self._row("founder")
+        db.execute.return_value.fetchone.return_value = self._row("founder", "active")
         assert reveal_is_free(db, 1) is True
 
     def test_pro_tier_is_not_free(self):
         from src.services.entitlement_service import reveal_is_free
         db = MagicMock()
-        db.execute.return_value.fetchone.return_value = self._row("pro")
+        db.execute.return_value.fetchone.return_value = self._row("pro", "active")
         assert reveal_is_free(db, 1) is False
 
     def test_no_account_is_not_free(self):
         from src.services.entitlement_service import reveal_is_free
         db = MagicMock()
         db.execute.return_value.fetchone.return_value = None
+        assert reveal_is_free(db, 1) is False
+
+    def test_founder_grace_is_not_free(self):
+        # PR #163 review comment 2: only a fully active founder gets the waiver.
+        from src.services.entitlement_service import reveal_is_free
+        db = MagicMock()
+        db.execute.return_value.fetchone.return_value = self._row("founder", "grace")
+        assert reveal_is_free(db, 1) is False
+
+    def test_founder_past_due_is_not_free(self):
+        from src.services.entitlement_service import reveal_is_free
+        db = MagicMock()
+        db.execute.return_value.fetchone.return_value = self._row("founder", "past_due")
+        assert reveal_is_free(db, 1) is False
+
+    def test_founder_churned_is_not_free(self):
+        from src.services.entitlement_service import reveal_is_free
+        db = MagicMock()
+        db.execute.return_value.fetchone.return_value = self._row("founder", "churned")
         assert reveal_is_free(db, 1) is False
 
 

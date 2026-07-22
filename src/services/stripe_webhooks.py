@@ -2557,23 +2557,47 @@ def fulfill_founder_comp_reveal(subscriber, property_id_raw, db: Session) -> boo
         ).limit(1)
     ).scalar_one_or_none()
 
-    try:
-        with db.begin_nested():
-            existing = db.execute(
-                select(SentLead).where(
-                    SentLead.subscriber_id == subscriber.id,
-                    SentLead.property_id == property_id,
-                )
-            ).scalar_one_or_none()
-            if not existing:
+    # First-touch delivery (Auto Mode enqueue, full-details email) must fire
+    # exactly once per (subscriber, property). SentLead has no unique
+    # constraint on (subscriber_id, property_id) — other sources (daily_email,
+    # lead_unlock) legitimately insert multiple rows for the same pair over
+    # time — so a plain check-then-insert can't rely on a constraint to
+    # resolve a race and isn't atomic on its own (two concurrent requests can
+    # both pass the "not exists" check before either commits). A Postgres
+    # transaction-scoped advisory lock serializes concurrent callers for the
+    # same (subscriber, property) without a schema change: the second caller
+    # blocks until the first's transaction ends, then sees the row the first
+    # caller already committed and skips the side effects below
+    # (PR #163 review comment 3).
+    lock_key = f"founder_comp_reveal:{subscriber.id}:{property_id}"
+    db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": lock_key})
+
+    existing = db.execute(
+        select(SentLead).where(
+            SentLead.subscriber_id == subscriber.id,
+            SentLead.property_id == property_id,
+            SentLead.source == "founder_comp_reveal",
+        )
+    ).scalar_one_or_none()
+    is_first_reveal = existing is None
+
+    if is_first_reveal:
+        try:
+            with db.begin_nested():
                 db.add(SentLead(
                     subscriber_id=subscriber.id,
                     property_id=property_id,
                     source="founder_comp_reveal",
                 ))
                 db.flush()
-    except (IntegrityError, OperationalError) as exc:
-        logger.warning("founder_comp reveal: SentLead insert failed: %s", exc)
+        except (IntegrityError, OperationalError) as exc:
+            logger.warning("founder_comp reveal: SentLead insert failed: %s", exc)
+    else:
+        logger.info("founder_comp reveal: already delivered sub=%s prop=%s",
+                    subscriber.id, property_id)
+
+    if not is_first_reveal:
+        return True
 
     try:
         from src.services.auto_mode import enqueue_action
