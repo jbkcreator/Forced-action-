@@ -6750,7 +6750,8 @@ class ProspectEvent(Base):
             "'broker.transition',"
             "'sms.sent','sms.reply',"
             "'commission.posted',"
-            "'delivery.sent'"
+            "'delivery.sent',"
+            "'outcome.recorded'"
             ")",
             name="ck_events_event_type",
         ),

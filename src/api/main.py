@@ -5087,40 +5087,66 @@ def deal_capture(payload: DealCaptureRequest, db: Session = Depends(get_db)):
     db.flush()
 
     # T-B13-01: pending is a non-terminal tap — record it, but fire no
-    # terminal learning-loop effects (snapshot / autopsy / win side-effects).
+    # terminal effects (recalculation or interaction feedback).
     is_terminal = state != "pending"
 
-    # Subscriber-agnostic learning-loop autopsies — run for every terminal
-    # outcome, including ownerless (founder / public-record inferred) rows.
-    # Phase 3 A5: pre-decision snapshot (captures all 6 vertical scores at routing time)
+    # T-B13-02: the heavy recalculation consumers (learning-loop snapshot +
+    # loss autopsy, the latter an inline LLM call) are decoupled. Emit ONE
+    # outcome event to the transactional outbox — committed atomically with this
+    # request's DealOutcome write — and let the outcome dispatch sweep fan it
+    # out to the idempotent poll consumers. Keeps the buyer's tap latency off
+    # score recalculation (§7.1). Consumers route on reason_fault_class so only
+    # lead-fault dead outcomes reach scoring; buyer-neutral is score-protected.
     if is_terminal:
-        try:
-            from src.services.snapshot_service import capture_snapshot
-            capture_snapshot(
-                property_id=outcome.property_id,
-                db=db,
-                deal_outcome_id=outcome.id,
-                selected_vertical=sub.vertical,
-                outcome_status="lost" if state == "dead" else "funded",
-            )
-        except Exception as exc:
-            logger.warning("[DealCapture] snapshot capture failed: %s", exc)
+        from sqlalchemy import text as _sa_text
 
-    # Phase 3 A1: loss autopsy for dead outcomes (closed_lost).
-    if state == "dead":
-        try:
-            from src.services.loss_autopsy import run_loss_autopsy
-            run_loss_autopsy(
-                property_id=outcome.property_id,
-                trigger_reason="CLOSED_LOST",
-                db=db,
-                deal_outcome_id=outcome.id,
+        outcome_payload = {
+            "deal_outcome_id": outcome.id,
+            "property_id": outcome.property_id,
+            "subscriber_id": sub.id,
+            "selected_vertical": sub.vertical,
+            "outcome_state": state,
+            "pipeline_stage": pipeline_stage,
+            "dead_reason": dead_reason,
+            "reason_fault_class": fault_class,
+        }
+        # The outbox events table is prospect-scoped (prospect_id NOT NULL).
+        # A subscriber-tap outcome is a delivered lead, so it resolves to a
+        # prospect via property_id; emit the decoupled event in that case.
+        prospect_id = db.execute(
+            _sa_text(
+                "SELECT prospect_id FROM prospects WHERE property_id = :pid "
+                "ORDER BY created_at DESC LIMIT 1"
+            ),
+            {"pid": outcome.property_id},
+        ).scalar()
+        if prospect_id is not None:
+            from src.services.event_bus import emit_event
+            emit_event(
+                db,
+                event_type="outcome.recorded",
+                actor="subscriber_tap",
+                source_component="deal_capture",
+                payload=outcome_payload,
+                prospect_id=prospect_id,
             )
-        except Exception as exc:
-            logger.warning("[DealCapture] loss autopsy failed: %s", exc)
+        else:
+            # No prospect row (e.g. founder/ownerless import) — recalc inline for
+            # this row rather than drop it. Same score-protection routing as the
+            # async consumers.
+            from src.consumers import outcome_consumers
+            try:
+                outcome_consumers.apply_snapshot(db, outcome_payload)
+            except Exception as exc:
+                logger.warning("[DealCapture] inline snapshot failed: %s", exc)
+            try:
+                outcome_consumers.apply_loss_autopsy(db, outcome_payload)
+            except Exception as exc:
+                logger.warning("[DealCapture] inline loss autopsy failed: %s", exc)
 
-    # Subscriber-only side-effects (win graphic, win story, annual push,
-    # attribution, suppression). No-op for ownerless outcomes — CDE-11.
+    # Subscriber-only interaction feedback (win graphic, win story, annual push,
+    # attribution, suppression) — stays inline: it IS the tap's response, not
+    # recalculation. No-op for ownerless outcomes (CDE-11) and non-terminal taps.
     graphic_url: Optional[str] = None
     annual_offered = False
     if is_terminal:

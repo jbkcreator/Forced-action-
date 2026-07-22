@@ -244,6 +244,11 @@ COUNTY_ID=hillsborough
 # dead) + commission_poster (closed_won→post commission). Both idempotent.
 1-59/2 * * * * $PROJECT/scripts/cron/run.sh src.tasks.loan_lane_sweep
 
+# Outcome dispatch sweep (Block 13) — every 2 min. Polls deal_outcome_recorded
+# → outcome_snapshot + outcome_loss_autopsy (dead+lead-fault only). Both
+# idempotent. Decouples the buyer's one-tap outcome from score recalculation.
+1-59/2 * * * * $PROJECT/scripts/cron/run.sh src.tasks.outcome_dispatch_sweep
+
 # Cora anomaly check — volume + no-answer rate monitor — every 15 min
 */15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.cora_anomaly_check
 
