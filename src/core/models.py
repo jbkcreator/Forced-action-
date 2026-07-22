@@ -4007,6 +4007,43 @@ class AgentDecision(Base):
         return f"<AgentDecision(id={self.decision_id[:8]}, graph={self.graph_name}, status={self.terminal_status})>"
 
 
+class InboundResponse(Base):
+    """
+    Block 11 / B11-04 — one row per hot inbound call, tracking time-to-callback.
+
+    t0 = webhook_log.created_at (inbound call arrived), copied at score time.
+    t1 = callback resolution time, backfilled from agent_decisions.completed_at
+    (decision_id == this row's decision_id) once the shared new_lead_voice_call
+    graph run finishes — report-only optimization; no closed loop.
+    """
+    __tablename__ = "inbound_response"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("subscribers.id"), nullable=True, index=True
+    )
+    decision_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)  # == call_id; join key to agent_decisions
+    t0: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    t1: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    score: Mapped[int] = mapped_column(Integer, nullable=False)
+    matched_signals: Mapped[Optional[list]] = mapped_column(JSONB)
+    outcome: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")  # pending|called|consent_blocked|dnc_blocked|failed
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "outcome IN ('pending', 'called', 'consent_blocked', 'dnc_blocked', 'failed')",
+            name="check_inbound_response_outcome",
+        ),
+        Index("idx_inbound_response_created_at", "created_at"),
+    )
+
+    def __repr__(self):
+        return f"<InboundResponse(id={self.id}, decision_id={self.decision_id}, outcome={self.outcome})>"
+
+
 class QuoraQuestion(Base):
     """
     One row per Quora question that has been classified by Cora.

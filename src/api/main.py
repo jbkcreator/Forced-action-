@@ -4632,6 +4632,9 @@ async def synthflow_inbound_webhook(request: Request, db: Session = Depends(get_
     from src.services.signup_engine import onboard_inbound_caller
     from src.services.webhook_log import log_webhook_event
 
+    # Block 11 / B11-01 t0: the sub-60s SLA clock starts here, at webhook receipt.
+    inbound_received_at = datetime.now(timezone.utc)
+
     raw_body = await request.body()
 
     if not _verify_synthflow_secret(request):
@@ -4719,6 +4722,17 @@ async def synthflow_inbound_webhook(request: Request, db: Session = Depends(get_
         "[SynthflowInbound] intent score call_id=%s sub=%s score=%d is_hot=%s signals=%s",
         call_id, result.get("subscriber_id"), intent["score"], intent["is_hot"], intent["matched_signals"],
     )
+
+    if intent["is_hot"]:
+        from src.services.inbound_response_tracking import record_inbound_response
+        record_inbound_response(
+            db=db,
+            subscriber_id=result.get("subscriber_id"),
+            decision_id=call_id,
+            t0=inbound_received_at,
+            score=intent["score"],
+            matched_signals=intent["matched_signals"],
+        )
 
     _trigger_hot_inbound_callback(
         intent=intent,
@@ -5624,6 +5638,28 @@ def affiliate_ledger(
     except SQLAlchemyError:
         logger.exception("affiliate_ledger: database error affiliate_id=%s", affiliate_id)
         raise HTTPException(status_code=500, detail="Failed to load affiliate ledger")
+
+
+@app.get("/api/admin/inbound-velocity")
+def inbound_velocity_stats(
+    db: Session = Depends(get_db),
+    _admin: dict = Depends(get_current_admin),
+):
+    """
+    Block 11 / B11-04 — inbound response-time report. Reconciles any pending
+    rows against agent_decisions, then returns counts, p50/p95 time-to-
+    callback, and outcome rates. Report-only; admin JWT required.
+    """
+    from src.services.inbound_response_tracking import (
+        get_inbound_velocity_stats,
+        sync_inbound_response_outcomes,
+    )
+    try:
+        sync_inbound_response_outcomes(db)
+        return get_inbound_velocity_stats(db)
+    except SQLAlchemyError:
+        logger.exception("inbound_velocity_stats: database error")
+        raise HTTPException(status_code=500, detail="Failed to load inbound velocity stats")
 
 
 @app.get("/api/admin/human-close")
