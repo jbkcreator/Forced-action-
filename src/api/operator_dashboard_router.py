@@ -5,6 +5,7 @@ Read-only surface over existing metrics services/tables, JWT-protected via
 
     GET /api/admin/operator-dashboard/summary?from=&to=   — T-B8-01 KPI aggregation
     GET /api/admin/operator-dashboard/action-queue        — T-B8-03 action queue
+    GET /api/admin/operator-dashboard/retention-cohorts   — T-B8-04 retention cohort viewport
 
 `from`/`to` are ISO dates (or datetimes); when omitted the window defaults
 to the last 30 days, matching /api/revenue/metrics.
@@ -25,6 +26,7 @@ from src.api.deps import get_db as _get_db
 from src.api.deps import parse_iso_date_param as _parse
 from src.services.action_queue import build_action_queue
 from src.services.operator_dashboard import compute_operator_dashboard
+from src.services.retention_cohort import compute_retention_cohorts
 
 logger = logging.getLogger(__name__)
 
@@ -62,3 +64,24 @@ def get_action_queue(
     except SQLAlchemyError:
         logger.error("[OperatorDashboard] action-queue read failed", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to load action queue")
+
+
+@router.get("/retention-cohorts")
+def get_retention_cohorts(
+    channel: Optional[str] = Query(None),
+    tier: Optional[str] = Query(None),
+    zip: Optional[str] = Query(None),  # noqa: A002 — matches query param name
+    months: int = Query(12, ge=1, le=24),
+    cohorts: int = Query(12, ge=1, le=24),
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(_get_db),
+) -> dict[str, Any]:
+    """Paid logo retention grid, filterable by channel/tier/zip (T-B8-04).
+    Read-time only — no new table. See docs/adr/0038."""
+    try:
+        return compute_retention_cohorts(
+            db, channel=channel, tier=tier, zip_code=zip, months=months, cohorts=cohorts
+        )
+    except SQLAlchemyError:
+        logger.error("[OperatorDashboard] retention-cohorts read failed", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to load retention cohorts")
