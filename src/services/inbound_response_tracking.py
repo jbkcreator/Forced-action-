@@ -9,6 +9,7 @@ Report-only optimization — no closed loop. See
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -32,14 +33,14 @@ def record_inbound_response(
         text(
             "INSERT INTO inbound_response "
             "(subscriber_id, decision_id, t0, score, matched_signals, outcome) "
-            "VALUES (:subscriber_id, :decision_id, :t0, :score, :matched_signals, 'pending')"
+            "VALUES (:subscriber_id, :decision_id, :t0, :score, CAST(:matched_signals AS JSONB), 'pending')"
         ),
         {
             "subscriber_id": subscriber_id,
             "decision_id": decision_id,
             "t0": t0,
             "score": score,
-            "matched_signals": matched_signals,
+            "matched_signals": json.dumps(matched_signals),
         },
     )
 
@@ -65,12 +66,17 @@ def sync_inbound_response_outcomes(db: Session, limit: int = 200) -> int:
 
     Returns the number of rows reconciled.
     """
+    # terminal_status (not completed_at) marks a finished run: log_decision only
+    # backfills completed_at on its UPDATE path, and single-log graphs like
+    # new_lead_voice_call INSERT a terminal row with completed_at still NULL.
+    # COALESCE(completed_at, started_at) gives the best available finish time.
     rows = db.execute(
         text(
-            "SELECT ir.id, ad.completed_at, ad.terminal_status, ad.summary->>'failure_reason' "
+            "SELECT ir.id, COALESCE(ad.completed_at, ad.started_at) AS t1, "
+            "       ad.terminal_status, ad.summary->>'failure_reason' AS failure_reason "
             "FROM inbound_response ir "
             "JOIN agent_decisions ad ON ad.decision_id = ir.decision_id "
-            "WHERE ir.outcome = 'pending' AND ad.completed_at IS NOT NULL "
+            "WHERE ir.outcome = 'pending' AND ad.terminal_status IS NOT NULL "
             "LIMIT :limit"
         ),
         {"limit": limit},

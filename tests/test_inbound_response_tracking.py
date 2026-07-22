@@ -6,6 +6,7 @@ Covers:
   - get_inbound_velocity_stats: computes counts/percentiles/rates for the admin endpoint
 """
 
+import json
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
@@ -36,7 +37,7 @@ class TestRecordInboundResponse:
         assert params["decision_id"] == "call-1"
         assert params["t0"] == t0
         assert params["score"] == 65
-        assert params["matched_signals"] == ["intent_slot", "known_caller"]
+        assert json.loads(params["matched_signals"]) == ["intent_slot", "known_caller"]
 
 
 class TestSyncInboundResponseOutcomes:
