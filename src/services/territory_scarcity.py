@@ -18,6 +18,12 @@ from sqlalchemy.orm import Session
 logger = logging.getLogger(__name__)
 
 
+# Most-restrictive-wins precedence when a ZIP's status differs by vertical and
+# no vertical was requested — locked/grace pressure should never be masked by
+# an unrelated vertical happening to still be available.
+_STATUS_PRECEDENCE = {"locked": 0, "grace": 1, "available": 2}
+
+
 def _resolve_county_id(db: Session, zip_code: str, vertical: Optional[str]) -> Optional[str]:
     """Return the county_id a ZIP belongs to, or None if the ZIP is unknown.
 
@@ -35,6 +41,32 @@ def _resolve_county_id(db: Session, zip_code: str, vertical: Optional[str]) -> O
         params,
     ).first()
     return row[0] if row else None
+
+
+def _resolve_zip_status(
+    db: Session, county_id: str, zip_code: str, vertical: Optional[str]
+) -> Optional[str]:
+    """Return the queried ZIP's status.
+
+    When `vertical` is given, the status is unambiguous. When omitted, a ZIP
+    may carry different statuses across verticals — pick the most restrictive
+    (locked > grace > available) rather than an arbitrary row, so the visitor
+    is never shown a falsely-open status.
+    """
+    params: dict = {"county_id": county_id, "zip": zip_code}
+    clause = "WHERE county_id = :county_id AND zip_code = :zip"
+    if vertical:
+        clause += " AND vertical = :vertical"
+        params["vertical"] = vertical
+
+    rows = db.execute(
+        sa_text(f"SELECT DISTINCT status FROM zip_territories {clause}"),
+        params,
+    ).all()
+    if not rows:
+        return None
+    statuses = [r[0] for r in rows]
+    return min(statuses, key=lambda s: _STATUS_PRECEDENCE.get(s, 99))
 
 
 def county_scarcity(
@@ -80,22 +112,16 @@ def county_scarcity(
         if status in counts:
             counts[status] = int(n)
 
-    zip_params = dict(params, zip=zip_code)
-    zip_status_row = db.execute(
-        sa_text(
-            f"""
-            SELECT status FROM zip_territories
-             WHERE county_id = :county_id AND zip_code = :zip{vertical_clause}
-             LIMIT 1
-            """
-        ),
-        zip_params,
-    ).first()
+    zip_status = _resolve_zip_status(db, county_id, zip_code, vertical)
 
     open_count = counts["available"]
-    # A ZIP in grace is not freely lockable — treat it as pressure, not supply.
-    locked_count = counts["locked"] + counts["grace"]
-    total = open_count + locked_count
+    grace_count = counts["grace"]
+    # A ZIP in grace is not freely lockable — pressure, not supply — but it is
+    # NOT the same as hard-locked (it may reopen). Keep locked_count as the
+    # hard-locked-only figure and expose grace_count separately so callers can
+    # label it honestly instead of collapsing both into "locked".
+    locked_count = counts["locked"]
+    total = open_count + locked_count + grace_count
 
     county_name = county_id
     try:
@@ -107,11 +133,12 @@ def county_scarcity(
 
     return {
         "zip_code": zip_code,
-        "zip_status": zip_status_row[0] if zip_status_row else None,
+        "zip_status": zip_status,
         "county_id": county_id,
         "county_name": county_name,
         "vertical": vertical,
         "open_count": open_count,
         "locked_count": locked_count,
+        "grace_count": grace_count,
         "total_count": total,
     }

@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from sqlalchemy import and_, select
+from sqlalchemy import text as sa_text
 from sqlalchemy.orm import Session
 
 from config.scoring import is_hot_score
@@ -61,27 +61,43 @@ def _serialize_deal(prop: Property, score: DistressScore, vertical: str) -> dict
 def _query_top_lead(
     db: Session, vertical: str, *, zip_code: Optional[str] = None
 ) -> Optional[tuple]:
-    try:
-        score_col = DistressScore.vertical_scores[vertical].as_float()
-    except KeyError:
-        return None
+    """Top-scored qualified, non-guess lead for `vertical`, optionally scoped to a ZIP.
 
-    filters = [
-        DistressScore.qualified == True,  # noqa: E712
-        DistressScore.is_guess_lead.is_(False),  # A2: withhold guess leads
-        score_col > 0,
-    ]
+    Returns (Property, DistressScore) ORM instances so `_serialize_deal` can read
+    their relationships unchanged; the *lookup* itself is raw SQL per project rule
+    (CLAUDE.md "Database and SQLAlchemy" — text() for retrieval, ORM only for
+    add/delete). We select just the two primary keys via text(), then load the
+    full instances with session.get(), which is a cheap identity-map fetch.
+    """
+    zip_clause = " AND p.zip = :zip_code" if zip_code else ""
+    params: dict = {"vertical": vertical}
     if zip_code:
-        filters.append(Property.zip == zip_code)
+        params["zip_code"] = zip_code
 
     row = db.execute(
-        select(Property, DistressScore)
-        .join(DistressScore, DistressScore.property_id == Property.id)
-        .where(and_(*filters))
-        .order_by(score_col.desc())
-        .limit(1)
+        sa_text(
+            f"""
+            SELECT p.id AS property_id, ds.id AS score_id
+              FROM properties p
+              JOIN distress_scores ds ON ds.property_id = p.id
+             WHERE ds.qualified = true
+               AND ds.is_guess_lead = false
+               AND (ds.vertical_scores ->> :vertical)::float > 0
+               {zip_clause}
+             ORDER BY (ds.vertical_scores ->> :vertical)::float DESC
+             LIMIT 1
+            """
+        ),
+        params,
     ).first()
-    return row
+    if not row:
+        return None
+
+    prop = db.get(Property, row.property_id)
+    score = db.get(DistressScore, row.score_id)
+    if not prop or not score:
+        return None
+    return prop, score
 
 
 def get_hero_deal(zip_code: str, vertical: str, db: Session) -> dict:

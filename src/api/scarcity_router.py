@@ -32,6 +32,7 @@ class CountyScarcityResponse(BaseModel):
     vertical: Optional[str]
     open_count: int
     locked_count: int
+    grace_count: int
     total_count: int
 
 

@@ -26,21 +26,15 @@ def hero_scored_deal(zip: str, vertical: str = "roofing", db=Depends(get_db)):
                "deal": {...}|None, "nearest_label": str|None, "message": str|None}
     """
     if not ZIP_RE.match(zip):
-        raise HTTPException(
-            status_code=400,
-            detail={"error": "invalid_zip", "message": "ZIP code must be exactly 5 digits"},
-        )
+        raise HTTPException(status_code=400, detail="ZIP code must be exactly 5 digits")
     if vertical not in VALID_VERTICALS:
         raise HTTPException(
             status_code=400,
-            detail={"error": "invalid_vertical", "message": f"vertical must be one of: {sorted(VALID_VERTICALS)}"},
+            detail=f"vertical must be one of: {sorted(VALID_VERTICALS)}",
         )
 
     try:
         return get_hero_deal(zip_code=zip, vertical=vertical, db=db)
     except OperationalError:
         logger.error("DB error in hero scored-deal", exc_info=True)
-        raise HTTPException(
-            status_code=503,
-            detail={"error": "service_unavailable", "message": "Database temporarily unavailable"},
-        )
+        raise HTTPException(status_code=503, detail="Database temporarily unavailable")

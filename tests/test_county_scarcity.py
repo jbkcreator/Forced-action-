@@ -53,8 +53,9 @@ def test_returns_open_and_locked_counts(client_with_db):
     body = resp.json()
 
     assert body["open_count"] == 2
-    # grace counts as pressure alongside locked
-    assert body["locked_count"] == 2
+    # grace is pressure but NOT the same as hard-locked — kept separate
+    assert body["locked_count"] == 1
+    assert body["grace_count"] == 1
     assert body["total_count"] == 4
     assert body["zip_status"] == "available"
     assert body["county_id"] == county
@@ -72,6 +73,20 @@ def test_vertical_scopes_counts(client_with_db):
     body = resp.json()
     assert body["open_count"] == 1
     assert body["locked_count"] == 0
+
+
+def test_ambiguous_zip_status_picks_most_restrictive_when_vertical_omitted(client_with_db):
+    client, db = client_with_db
+    county = _rand_county()
+    z1 = _rand_zip()
+    # Same ZIP, different status per vertical — omitting `vertical` must not
+    # arbitrarily report the ZIP as available just because one vertical is.
+    _mk_territory(db, zip_code=z1, county=county, status="available", vertical="roofing")
+    _mk_territory(db, zip_code=z1, county=county, status="locked", vertical="solar")
+
+    resp = client.get(f"/api/scarcity/county?zip={z1}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["zip_status"] == "locked"
 
 
 def test_unknown_zip_404(client_with_db):
