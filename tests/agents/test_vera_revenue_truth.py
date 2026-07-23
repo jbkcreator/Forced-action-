@@ -328,7 +328,7 @@ def _sample_inputs():
 
 def test_render_revenue_truth_report_shows_the_one_number():
     reconciliation, mrr, payments, refunds_disputes = _sample_inputs()
-    subject, body = render_revenue_truth_report(
+    subject, body, _html = render_revenue_truth_report(
         reconciliation, mrr, 200, payments, refunds_disputes, report_date=date(2026, 7, 23),
     )
     assert "NEW MRR ADDED YESTERDAY: $2.00" in body
@@ -370,7 +370,7 @@ def test_render_revenue_truth_report_surfaces_reconciliation_abstention():
         access_not_paying_details=[], active_subscriptions_by_customer=None,
         stripe_ok=False,
     )
-    subject, body = render_revenue_truth_report(
+    subject, body, _html = render_revenue_truth_report(
         reconciliation, mrr, 200, payments, refunds_disputes, report_date=date(2026, 7, 23),
     )
     assert "STRIPE UNREACHABLE" in body
@@ -383,7 +383,7 @@ def test_render_revenue_truth_report_surfaces_mrr_abstention():
     reconciliation, _mrr, payments, refunds_disputes = _sample_inputs()
     mrr = MrrResult(db_total_cents=20000, active_null_plan_price_count=0,
                      stripe_total_cents=0, drift_cents=0, stripe_ok=False)
-    subject, body = render_revenue_truth_report(
+    subject, body, _html = render_revenue_truth_report(
         reconciliation, mrr, None, payments, refunds_disputes, report_date=date(2026, 7, 23),
     )
     assert "Stripe: UNREACHABLE" in body
@@ -403,7 +403,7 @@ def test_render_revenue_truth_report_surfaces_payments_abstention():
 def test_render_revenue_truth_report_surfaces_refunds_disputes_abstention():
     reconciliation, mrr, payments, _refunds_disputes = _sample_inputs()
     refunds_disputes = RefundsDisputesResult(stripe_ok=False)
-    subject, body = render_revenue_truth_report(
+    subject, body, _html = render_revenue_truth_report(
         reconciliation, mrr, 200, payments, refunds_disputes, report_date=date(2026, 7, 23),
     )
     assert "STRIPE UNREACHABLE — refunds/disputes could not be verified today." in body
@@ -413,7 +413,32 @@ def test_render_revenue_truth_report_surfaces_refunds_disputes_abstention():
 
 def test_render_revenue_truth_report_all_sections_healthy_has_no_unreachable_subject():
     reconciliation, mrr, payments, refunds_disputes = _sample_inputs()
-    subject, _body = render_revenue_truth_report(
+    subject, _body, _html = render_revenue_truth_report(
         reconciliation, mrr, 200, payments, refunds_disputes, report_date=date(2026, 7, 23),
     )
     assert "UNREACHABLE" not in subject
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTML rendering
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_render_revenue_truth_report_html_is_a_fragment_with_the_one_number():
+    reconciliation, mrr, payments, refunds_disputes = _sample_inputs()
+    html_body = render_revenue_truth_report(
+        reconciliation, mrr, 200, payments, refunds_disputes, report_date=date(2026, 7, 23),
+    )[2]
+    assert "<html" not in html_body.lower()  # a fragment, not a full document
+    assert "NEW MRR ADDED YESTERDAY" in html_body
+    assert "$2.00" in html_body
+    assert "cus_4" in html_body  # reconciliation detail table
+    assert "dp_1" in html_body  # dispute detail table
+
+
+def test_render_revenue_truth_report_html_surfaces_abstention_warning():
+    reconciliation, mrr, payments, _refunds_disputes = _sample_inputs()
+    refunds_disputes = RefundsDisputesResult(stripe_ok=False)
+    html_body = render_revenue_truth_report(
+        reconciliation, mrr, 200, payments, refunds_disputes, report_date=date(2026, 7, 23),
+    )[2]
+    assert "STRIPE UNREACHABLE" in html_body

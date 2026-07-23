@@ -32,7 +32,17 @@ from typing import Mapping, Optional
 
 from sqlalchemy import text
 
-from src.agents.vera.checks._shared import report_recipients
+from src.agents.vera.checks._shared import (
+    html_kv_rows,
+    html_headline,
+    html_list,
+    html_note,
+    html_section,
+    html_shell,
+    html_table,
+    html_warning,
+    report_recipients,
+)
 from src.agents.vera.config import FRESHNESS_STATIC, KILL_SWITCH_FEATURE
 from src.agents.vera.db import vera_db
 from src.agents.vera.facts import read_facts, write_fact
@@ -180,7 +190,24 @@ def check_deploy_drift(repo_dir: str = PROD_REPO_DIR) -> dict:
     which we deliberately never run (read-only guarantee). Any migration
     added to dev but not yet pulled to this host is invisible until the next
     deploy — covered by the `behind` drift verdict, not by this list.
+
+    If `repo_dir` doesn't exist on this host (e.g. run outside the real prod
+    server, where PROD_REPO_DIR is hardcoded to /root/Forced-action-), every
+    git command would fail anyway — skipped up front so the report can say
+    *why* the deploy fields are unknown instead of leaving that a mystery.
     """
+    if not Path(repo_dir).is_dir():
+        logger.warning(
+            "[Vera] repo_dir %s not found on this host — skipping deploy-drift check "
+            "(expected when Vera isn't running on the real prod server)",
+            repo_dir,
+        )
+        return {
+            "head_sha": None, "last_good_sha": None, "dev_head_sha": None,
+            "drift": "unknown", "migration_statuses": {}, "pending_migrations": [],
+            "repo_dir": repo_dir, "repo_dir_missing": True,
+        }
+
     head_sha = _run_git(["rev-parse", "HEAD"], cwd=repo_dir)
 
     last_good_sha = None
@@ -218,6 +245,8 @@ def check_deploy_drift(repo_dir: str = PROD_REPO_DIR) -> dict:
         "drift": drift,
         "migration_statuses": migration_statuses,
         "pending_migrations": pending_migrations,
+        "repo_dir": repo_dir,
+        "repo_dir_missing": False,
     }
 
 
@@ -265,6 +294,20 @@ class CronBeat:
 
     def label(self) -> str:
         return f"{self.source_type}/{self.county_id}" if self.county_id else self.source_type
+
+    def age_label(self) -> str:
+        """Human-readable age — same min/h/d thresholds as
+        heartbeat_monitor.Heartbeat.age_label(), reused rather than
+        reinvented, so raw minutes (e.g. 'age=1833 min') never leak into a
+        report a human has to read."""
+        if self.age_minutes is None:
+            return "never run"
+        if self.age_minutes < 120:
+            return f"{self.age_minutes} min"
+        hours = self.age_minutes / 60.0
+        if hours < 48:
+            return f"{hours:.1f}h"
+        return f"{hours / 24:.1f}d"
 
 
 def _last_success(session, source_type: str, county_id: Optional[str]) -> Optional[datetime]:
@@ -454,74 +497,126 @@ def render_live_state_report(
     silent: dict,
     report_date: Optional[date] = None,
     one_number_fact_row: Optional[Mapping] = None,
-) -> tuple[str, str]:
-    """Returns (subject, body). Plain text, numbers first, Vera's voice.
+) -> tuple[str, str, str]:
+    """Returns (subject, body, html_body). Numbers first, Vera's voice.
     Pure — no DB access; `one_number_fact_row` is pre-fetched by the caller
     (run_live_state()) so this function stays testable without a live
     connection. Defaults to None (renders the V3-pending placeholder), which
-    is exactly what every existing caller/test that doesn't pass it gets."""
+    is exactly what every existing caller/test that doesn't pass it gets.
+    Plain text and HTML are built together from the same data so they can't
+    silently drift apart from each other over time."""
     report_date = report_date or datetime.now(timezone.utc).date()
     stale = [b for b in cron_beats if b.is_stale]
     fresh_count = len(cron_beats) - len(stale)
+    one_number_line = _the_one_number_line(one_number_fact_row)
 
+    # ── DEPLOY ────────────────────────────────────────────────────────────
     lines = [
         f"Vera — Live-State Report — {report_date.isoformat()}",
         "=" * 60,
         "",
-        _the_one_number_line(one_number_fact_row),
+        one_number_line,
         "",
         "DEPLOY",
-        f"  Prod HEAD:        {_short(deploy['head_sha'])}",
-        f"  Last good deploy: {_short(deploy['last_good_sha'])}",
-        f"  Dev HEAD:         {_short(deploy['dev_head_sha'])}",
-        f"  Drift:            {deploy['drift']}",
     ]
-
-    if deploy["pending_migrations"]:
-        lines.append(f"  Pending migrations ({len(deploy['pending_migrations'])}):")
-        for name in deploy["pending_migrations"]:
-            lines.append(f"    - {name}: not_applied")
-    else:
-        lines.append("  Pending migrations: none")
-
-    unrecognized = sorted(
-        name for name, status in deploy["migration_statuses"].items() if status == "unrecognized"
-    )
-    if unrecognized:
-        lines.append(
-            "  Unrecognized DDL shape (cannot verify applied/not-applied): "
-            + ", ".join(unrecognized)
+    if deploy.get("repo_dir_missing"):
+        deploy_note = (
+            f"Repo path {deploy.get('repo_dir', '(unknown)')} not found on this host — "
+            "deploy drift cannot be checked from here (expected when Vera isn't running "
+            "on the real prod server; will show real values once cron runs there)."
         )
-    lines.append(
-        "  Note: migration status is DB-verified via information_schema introspection "
-        "of CREATE TABLE IF NOT EXISTS / ADD COLUMN IF NOT EXISTS targets — not a ledger "
-        "lookup (ADR 0024 keeps none). Files using other DDL shapes report 'unrecognized', "
-        "never silently assumed applied."
-    )
+        lines.append(f"  {deploy_note}")
+        deploy_html = html_warning(deploy_note)
+    else:
+        lines += [
+            f"  Prod HEAD:        {_short(deploy['head_sha'])}",
+            f"  Last good deploy: {_short(deploy['last_good_sha'])}",
+            f"  Dev HEAD:         {_short(deploy['dev_head_sha'])}",
+            f"  Drift:            {deploy['drift']}",
+        ]
+        deploy_kv = [
+            ("Prod HEAD", _short(deploy["head_sha"])),
+            ("Last good deploy", _short(deploy["last_good_sha"])),
+            ("Dev HEAD", _short(deploy["dev_head_sha"])),
+            ("Drift", deploy["drift"]),
+        ]
 
+        if deploy["pending_migrations"]:
+            lines.append(f"  Pending migrations ({len(deploy['pending_migrations'])}):")
+            for name in deploy["pending_migrations"]:
+                lines.append(f"    - {name}: not_applied")
+            pending_html = html_list(f"{n}: not_applied" for n in deploy["pending_migrations"])
+        else:
+            lines.append("  Pending migrations: none")
+            pending_html = html_note("Pending migrations: none")
+
+        unrecognized = sorted(
+            name for name, status in deploy["migration_statuses"].items()
+            if status == "unrecognized"
+        )
+        unrecognized_html = ""
+        if unrecognized:
+            lines.append(
+                "  Unrecognized DDL shape (cannot verify applied/not-applied): "
+                + ", ".join(unrecognized)
+            )
+            unrecognized_html = html_note(
+                "Unrecognized DDL shape (cannot verify applied/not-applied): "
+                + ", ".join(unrecognized)
+            )
+
+        migration_note = (
+            "Migration status is DB-verified via information_schema introspection of "
+            "CREATE TABLE IF NOT EXISTS / ADD COLUMN IF NOT EXISTS targets — not a ledger "
+            "lookup (ADR 0024 keeps none). Files using other DDL shapes report "
+            "'unrecognized', never silently assumed applied."
+        )
+        lines.append(f"  Note: {migration_note}")
+        deploy_html = (
+            html_kv_rows(deploy_kv) + pending_html + unrecognized_html + html_note(migration_note)
+        )
+
+    # ── CRON FRESHNESS ────────────────────────────────────────────────────
     lines += ["", "CRON FRESHNESS"]
+    cron_rows_html = []
     if stale:
         for beat in sorted(stale, key=lambda b: b.label()):
-            age = f"{beat.age_minutes} min" if beat.age_minutes is not None else "never run"
+            age = beat.age_label()
             lines.append(
-                f"  STALE  {beat.label():<30} age={age:<12} sla={beat.sla_minutes / 60:.0f}h"
+                f"  STALE  {beat.label():<30} age={age:<10} sla={beat.sla_minutes / 60:.0f}h"
             )
-    lines.append(f"  {fresh_count}/{len(cron_beats)} sources fresh")
+            cron_rows_html.append((beat.label(), age, f"{beat.sla_minutes / 60:.0f}h"))
+    summary_line = f"{fresh_count}/{len(cron_beats)} sources fresh"
+    lines.append(f"  {summary_line}")
+    sla_legend = "SLA = max time allowed since last successful run before a source is flagged stale."
+    lines.append(f"  ({sla_legend})")
 
+    cron_html = ""
+    if cron_rows_html:
+        cron_html += html_table(["Source", "Age", "SLA"], cron_rows_html)
+    cron_html += html_note(summary_line) + html_note(sla_legend)
+
+    # ── SILENT FAILURES ───────────────────────────────────────────────────
     lines += ["", "SILENT FAILURES"]
     if silent["zero_ingest"]:
         lines.append("  Scheduled-but-writing-nothing today:")
         for row in silent["zero_ingest"]:
             lines.append(f"    - {row['source_type']}/{row['county_id']}")
+        zero_ingest_html = html_list(
+            f"{row['source_type']}/{row['county_id']}" for row in silent["zero_ingest"]
+        )
     else:
         lines.append("  Scheduled-but-writing-nothing: none")
+        zero_ingest_html = html_note("Scheduled-but-writing-nothing: none")
 
     if silent["unscheduled"]:
         lines.append("  Enabled-but-unscheduled:")
         for source_type in silent["unscheduled"]:
             lines.append(f"    - {source_type}")
+        unscheduled_html = html_list(silent["unscheduled"])
     else:
         lines.append("  Enabled-but-unscheduled: none")
+        unscheduled_html = html_note("Enabled-but-unscheduled: none")
 
     lines += ["", "— Vera."]
     body = "\n".join(lines)
@@ -530,7 +625,24 @@ def render_live_state_report(
         f"[Vera] Live-State Report {report_date.isoformat()} — "
         f"drift={deploy['drift']}, {len(stale)} stale, {len(silent['zero_ingest'])} zero-ingest"
     )
-    return subject, body
+
+    html_body = html_shell(
+        title="Vera — Live-State Report",
+        subtitle=report_date.isoformat(),
+        body_html=(
+            html_headline("THE ONE NUMBER", one_number_line.split(": ", 1)[-1])
+            + html_section("Deploy", deploy_html)
+            + html_section("Cron Freshness", cron_html)
+            + html_section(
+                "Silent Failures",
+                "<p style=\"color:#94a3b8;font-size:12px;margin:4px 0;\">Scheduled-but-writing-nothing:</p>"
+                + zero_ingest_html
+                + "<p style=\"color:#94a3b8;font-size:12px;margin:8px 0 4px;\">Enabled-but-unscheduled:</p>"
+                + unscheduled_html
+            )
+        ),
+    )
+    return subject, body, html_body
 
 
 def run_live_state() -> int:
@@ -555,7 +667,7 @@ def run_live_state() -> int:
     one_number_rows = read_facts("revenue.mrr.new_yesterday", fresh_only=True, limit=1)
     one_number_fact_row = one_number_rows[0] if one_number_rows else None
 
-    subject, body = render_live_state_report(
+    subject, body, html_body = render_live_state_report(
         deploy, cron_beats, silent, one_number_fact_row=one_number_fact_row,
     )
 
@@ -566,7 +678,7 @@ def run_live_state() -> int:
         logger.info("[Vera] no REPORT_RECIPIENTS configured — report generated but not emailed")
     for addr in recipients:
         try:
-            send_alert(subject, body, to=addr)
+            send_alert(subject, body, html_body=html_body, to=addr)
         except Exception as exc:
             logger.warning("[Vera] failed to send live-state report to %s: %s", addr, exc)
 

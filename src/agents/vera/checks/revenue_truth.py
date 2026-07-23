@@ -34,7 +34,16 @@ from typing import Mapping, Optional
 import stripe
 from sqlalchemy import text
 
-from src.agents.vera.checks._shared import report_recipients
+from src.agents.vera.checks._shared import (
+    html_headline,
+    html_kv_rows,
+    html_note,
+    html_section,
+    html_shell,
+    html_table,
+    html_warning,
+    report_recipients,
+)
 from src.agents.vera.config import FRESHNESS_REVENUE_24H, KILL_SWITCH_FEATURE
 from src.agents.vera.db import vera_db
 from src.agents.vera.facts import read_facts, write_fact
@@ -606,23 +615,30 @@ def render_revenue_truth_report(
     refunds_disputes: RefundsDisputesResult,
     report_date: Optional[date] = None,
 ) -> tuple:
-    """Returns (subject, body). Plain text, numbers first, Vera's voice."""
+    """Returns (subject, body, html_body). Numbers first, Vera's voice.
+    Plain text and HTML are built together from the same data so they can't
+    silently drift apart from each other over time."""
     report_date = report_date or datetime.now(timezone.utc).date()
+
+    if new_yesterday_cents is not None:
+        one_number_value = f"${new_yesterday_cents / 100:,.2f}"
+    else:
+        one_number_value = "no prior day to compare (first run)"
 
     lines = [
         f"Vera — Revenue Truth Report — {report_date.isoformat()}",
         "=" * 60,
         "",
+        f"NEW MRR ADDED YESTERDAY: {one_number_value}",
     ]
 
-    if new_yesterday_cents is not None:
-        lines.append(f"NEW MRR ADDED YESTERDAY: ${new_yesterday_cents / 100:,.2f}")
-    else:
-        lines.append("NEW MRR ADDED YESTERDAY: no prior day to compare (first run)")
-
+    # ── RECONCILIATION ────────────────────────────────────────────────────
     lines += ["", "RECONCILIATION"]
     if not reconciliation.stripe_ok:
         lines.append("  STRIPE UNREACHABLE — this section could not be verified today.")
+        reconciliation_html = html_warning(
+            "STRIPE UNREACHABLE — this section could not be verified today."
+        )
     else:
         lines.append(f"  Paying but no access: {reconciliation.paying_no_access_count}")
         if reconciliation.paying_no_access_sample_ids:
@@ -634,22 +650,59 @@ def render_revenue_truth_report(
                 f"(stripe status: {detail.get('stripe_status')})"
             )
 
+        reconciliation_html = html_kv_rows([
+            ("Paying but no access", reconciliation.paying_no_access_count),
+            ("Access but not paying", reconciliation.access_not_paying_count),
+        ])
+        if reconciliation.paying_no_access_sample_ids:
+            reconciliation_html += html_note(
+                "Paying-but-no-access sample: "
+                + ", ".join(reconciliation.paying_no_access_sample_ids)
+            )
+        if reconciliation.access_not_paying_details:
+            reconciliation_html += html_table(
+                ["Customer", "Reason", "Stripe status"],
+                [
+                    (d["customer_id"], d["reason"], d.get("stripe_status"))
+                    for d in reconciliation.access_not_paying_details
+                ],
+            )
+
+    # ── MRR ───────────────────────────────────────────────────────────────
     lines += ["", "MRR"]
     lines.append(f"  DB: ${mrr.db_total_cents / 100:,.2f}")
+    mrr_kv = [("DB", f"${mrr.db_total_cents / 100:,.2f}")]
     if not mrr.stripe_ok:
         lines.append("  Stripe: UNREACHABLE — MRR drift could not be verified today.")
+        mrr_warning_html = html_warning("Stripe: UNREACHABLE — MRR drift could not be verified today.")
     else:
         lines.append(f"  Stripe: ${mrr.stripe_total_cents / 100:,.2f}")
         lines.append(f"  Drift:  ${mrr.drift_cents / 100:,.2f} (stripe - db)")
+        mrr_kv += [
+            ("Stripe", f"${mrr.stripe_total_cents / 100:,.2f}"),
+            ("Drift (stripe - db)", f"${mrr.drift_cents / 100:,.2f}"),
+        ]
+        mrr_warning_html = ""
     if mrr.active_null_plan_price_count:
         lines.append(
             f"  {mrr.active_null_plan_price_count} active subscriber(s) excluded "
             f"from DB MRR (plan_price is NULL)"
         )
+        null_note_html = html_note(
+            f"{mrr.active_null_plan_price_count} active subscriber(s) excluded from DB MRR "
+            "(plan_price is NULL)"
+        )
+    else:
+        null_note_html = ""
+    mrr_html = html_kv_rows(mrr_kv) + mrr_warning_html + null_note_html
 
+    # ── PAYMENTS TODAY ────────────────────────────────────────────────────
     lines += ["", "PAYMENTS TODAY"]
     if not payments.stripe_ok:
         lines.append("  STRIPE UNREACHABLE — payment activity could not be verified today.")
+        payments_html = html_warning(
+            "STRIPE UNREACHABLE — payment activity could not be verified today."
+        )
     else:
         lines.append(
             f"  New:    {payments.new_count} (${payments.new_amount_cents / 100:,.2f}) "
@@ -658,10 +711,25 @@ def render_revenue_truth_report(
             f"one-time {payments.one_time_count} (${payments.one_time_amount_cents / 100:,.2f})"
         )
         lines.append(f"  Failed: {payments.failed_count} (${payments.failed_amount_cents / 100:,.2f})")
+        payments_html = html_table(
+            ["", "Count", "Amount"],
+            [
+                ("New (total)", payments.new_count, f"${payments.new_amount_cents / 100:,.2f}"),
+                ("— subscription", payments.subscription_count,
+                 f"${payments.subscription_amount_cents / 100:,.2f}"),
+                ("— one-time", payments.one_time_count,
+                 f"${payments.one_time_amount_cents / 100:,.2f}"),
+                ("Failed", payments.failed_count, f"${payments.failed_amount_cents / 100:,.2f}"),
+            ],
+        )
 
+    # ── REFUNDS & DISPUTES ────────────────────────────────────────────────
     lines += ["", "REFUNDS & DISPUTES"]
     if not refunds_disputes.stripe_ok:
         lines.append("  STRIPE UNREACHABLE — refunds/disputes could not be verified today.")
+        refunds_disputes_html = html_warning(
+            "STRIPE UNREACHABLE — refunds/disputes could not be verified today."
+        )
     else:
         lines.append(
             f"  Refunds:  {refunds_disputes.refunds_count} "
@@ -673,6 +741,21 @@ def render_revenue_truth_report(
         )
         for d in refunds_disputes.disputes:
             lines.append(f"    - {d['id']}: ${d['amount'] / 100:,.2f} ({d['reason']})")
+
+        refunds_disputes_html = html_kv_rows([
+            ("Refunds", f"{refunds_disputes.refunds_count} "
+                        f"(${refunds_disputes.refunds_amount_cents / 100:,.2f})"),
+            ("Disputes", f"{refunds_disputes.disputes_count} "
+                         f"(${refunds_disputes.disputes_amount_cents / 100:,.2f})"),
+        ])
+        if refunds_disputes.disputes:
+            refunds_disputes_html += html_table(
+                ["Dispute ID", "Amount", "Reason"],
+                [
+                    (d["id"], f"${d['amount'] / 100:,.2f}", d["reason"])
+                    for d in refunds_disputes.disputes
+                ],
+            )
 
     lines += ["", "— Vera."]
     body = "\n".join(lines)
@@ -693,7 +776,19 @@ def render_revenue_truth_report(
             f"{total_mismatches} reconciliation mismatch(es), "
             f"{refunds_disputes.disputes_count} dispute(s)"
         )
-    return subject, body
+
+    html_body = html_shell(
+        title="Vera — Revenue Truth Report",
+        subtitle=report_date.isoformat(),
+        body_html=(
+            html_headline("NEW MRR ADDED YESTERDAY", one_number_value)
+            + html_section("Reconciliation", reconciliation_html)
+            + html_section("MRR", mrr_html)
+            + html_section("Payments Today", payments_html)
+            + html_section("Refunds & Disputes", refunds_disputes_html)
+        ),
+    )
+    return subject, body, html_body
 
 
 def run_revenue_truth() -> int:
@@ -727,7 +822,7 @@ def run_revenue_truth() -> int:
     _write_payment_activity_facts(payments)
     _write_refunds_disputes_facts(refunds_disputes)
 
-    subject, body = render_revenue_truth_report(
+    subject, body, html_body = render_revenue_truth_report(
         reconciliation, mrr, new_yesterday_cents, payments, refunds_disputes,
     )
 
@@ -738,7 +833,7 @@ def run_revenue_truth() -> int:
         logger.info("[Vera] no REPORT_RECIPIENTS configured — report generated but not emailed")
     for addr in recipients:
         try:
-            send_alert(subject, body, to=addr)
+            send_alert(subject, body, html_body=html_body, to=addr)
         except Exception as exc:
             logger.warning("[Vera] failed to send revenue-truth report to %s: %s", addr, exc)
 

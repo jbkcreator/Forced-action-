@@ -7,7 +7,7 @@ check_deploy_drift() / check_cron_freshness() / check_silent_failures() /
 run_live_state() need a live vera_readonly connection and are exercised via
 `python -m src.agents.vera --live-state` in staging, not here.
 """
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from src.agents.vera.checks.live_state import (
     CronBeat,
@@ -102,13 +102,17 @@ def test_render_live_state_report_includes_the_one_number_placeholder():
     beats = [CronBeat("violations", "hillsborough", 1500, datetime.now(timezone.utc), 10, False)]
     silent = {"zero_ingest": [], "unscheduled": []}
 
-    subject, body = render_live_state_report(deploy, beats, silent, report_date=date(2026, 7, 23))
+    subject, body, html_body = render_live_state_report(
+        deploy, beats, silent, report_date=date(2026, 7, 23),
+    )
 
     assert "THE ONE NUMBER" in body
     assert "pending V3 revenue reconciliation" in body
     assert body.rstrip().endswith("— Vera.")
     assert "drift=in_sync" in subject
     assert "0 stale" in subject
+    assert "<html" not in html_body.lower()  # a fragment, not a full document
+    assert "THE ONE NUMBER" in html_body
 
 
 def test_render_live_state_report_surfaces_stale_and_unrecognized():
@@ -126,7 +130,9 @@ def test_render_live_state_report_surfaces_stale_and_unrecognized():
         "unscheduled": ["insurance_claims"],
     }
 
-    subject, body = render_live_state_report(deploy, [stale_beat], silent, report_date=date(2026, 7, 23))
+    subject, body, html_body = render_live_state_report(
+        deploy, [stale_beat], silent, report_date=date(2026, 7, 23),
+    )
 
     assert "STALE" in body
     assert "violations/pinellas" in body
@@ -135,3 +141,51 @@ def test_render_live_state_report_surfaces_stale_and_unrecognized():
     assert "permits/hillsborough" in body
     assert "insurance_claims" in body
     assert "1 stale" in subject
+    assert "violations/pinellas" in html_body
+    assert "permits/hillsborough" in html_body
+
+
+def test_render_live_state_report_never_run_beat_shows_never_run_not_minutes():
+    deploy = {
+        "head_sha": "a" * 40, "last_good_sha": "a" * 40, "dev_head_sha": "a" * 40,
+        "drift": "in_sync", "pending_migrations": [], "migration_statuses": {},
+    }
+    stale_beat = CronBeat("violations", "pinellas", 1500, None, None, True)
+    silent = {"zero_ingest": [], "unscheduled": []}
+
+    body = render_live_state_report(deploy, [stale_beat], silent, report_date=date(2026, 7, 23))[1]
+    assert "age=never run" in body
+
+
+def test_render_live_state_report_formats_age_in_hours_not_raw_minutes():
+    deploy = {
+        "head_sha": "a" * 40, "last_good_sha": "a" * 40, "dev_head_sha": "a" * 40,
+        "drift": "in_sync", "pending_migrations": [], "migration_statuses": {},
+    }
+    # 1834 minutes ago — should render as ~30.6h, not "1834 min".
+    old = datetime.now(timezone.utc) - timedelta(minutes=1834)
+    stale_beat = CronBeat("probate", "pinellas", 1500, old, 1834, True)
+    silent = {"zero_ingest": [], "unscheduled": []}
+
+    body = render_live_state_report(deploy, [stale_beat], silent, report_date=date(2026, 7, 23))[1]
+    assert "1834 min" not in body
+    assert "30.6h" in body
+    assert "SLA = max time allowed" in body  # the legend line
+
+
+def test_render_live_state_report_explains_missing_repo_dir_instead_of_bare_unknown():
+    deploy = {
+        "head_sha": None, "last_good_sha": None, "dev_head_sha": None,
+        "drift": "unknown", "pending_migrations": [], "migration_statuses": {},
+        "repo_dir": "/root/Forced-action-", "repo_dir_missing": True,
+    }
+    beats = []
+    silent = {"zero_ingest": [], "unscheduled": []}
+
+    body, html_body = render_live_state_report(deploy, beats, silent, report_date=date(2026, 7, 23))[1:]
+
+    assert "not found on this host" in body
+    assert "/root/Forced-action-" in body
+    # The old bare "unknown" wall must not appear alongside the new explanation.
+    assert "Prod HEAD:" not in body
+    assert "not found on this host" in html_body
