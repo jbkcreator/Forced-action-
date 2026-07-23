@@ -5276,6 +5276,33 @@ class GoldPlusZipSnapshot(Base):
         )
 
 
+class DealOfTheDay(Base):
+    """
+    T-B12-07 — Daily exclusive-unlock deal. One row per calendar date, picking
+    the top-CDS qualified lead not yet delivered (no sent_leads row anywhere,
+    never previously featured). 24h exclusive unlock window at STANDARD price
+    (scarcity mechanic, not a discount).
+    """
+    __tablename__ = "deal_of_the_day"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    date: Mapped[date] = mapped_column(Date, nullable=False, unique=True, index=True)
+    lead_id: Mapped[int] = mapped_column(ForeignKey("properties.id"), nullable=False, index=True)
+    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    window_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("date", name="uq_deal_of_the_day_date"),
+        Index("idx_deal_of_the_day_window", "window_start", "window_end"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<DealOfTheDay(date={self.date}, lead_id={self.lead_id})>"
+
+
 # ============================================================================
 # HCPA ENRICHMENT — TAX PAYMENT HISTORY
 # ============================================================================
