@@ -7987,3 +7987,41 @@ class VeraFact(Base):
 
     def __repr__(self) -> str:
         return f"<VeraFact(key={self.fact_key!r}, source={self.source!r}, observed_at={self.observed_at})>"
+
+
+class VeraPromise(Base):
+    """Open commitments Vera tracks (Constitution standing job #3, VERA-v2.2 V4).
+
+    Unlike VeraFact (append-only), a promise is MUTABLE: status flips
+    open -> closed/cancelled and closed_at is stamped when it resolves. Vera
+    writes this via the normal app DB role (like vera_facts) — vera_readonly
+    holds no write grants anywhere. The single writer is
+    src/agents/vera/promises.py:record_promise(); Phase 2's reply-forwarding
+    parser will call that same function unchanged. Nothing else writes here.
+    """
+    __tablename__ = "vera_promises"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    thread_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    owner: Mapped[str] = mapped_column(String(120), nullable=False)
+    source: Mapped[str] = mapped_column(String(60), nullable=False)
+    mrr_at_risk_cents: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="open")
+    due_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+    closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+
+    __table_args__ = (
+        Index("ix_vera_promises_status_due", "status", "due_at"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<VeraPromise(id={self.id}, owner={self.owner!r}, status={self.status!r})>"

@@ -5,16 +5,24 @@ Usage:
     python -m src.agents.vera --health
     python -m src.agents.vera --live-state
     python -m src.agents.vera --revenue-truth
+    python -m src.agents.vera --promise-digest
+    python -m src.agents.vera --seed-check
+    python -m src.agents.vera --add-promise --desc "..." --owner josh [--due-at 2026-08-01]
 
 --health is V1's scaffolding check. --live-state is V2's daily pre-8am
 report (prod-hash vs dev HEAD, cron freshness, deploy/migration drift,
 silent-failure detection — see src.agents.vera.checks.live_state).
 --revenue-truth is V3's daily revenue truth report (two-way Stripe-vs-DB
 subscriber reconciliation, real MRR, new/failed payments, refunds &
-disputes — see src.agents.vera.checks.revenue_truth). A later sub-task (V4)
-adds the promise digest / seeded-discrepancy subcommand, following the same
-pattern: check the vera_global kill switch first, then run read-only checks
-through src.agents.vera.db, then write results via src.agents.vera.facts.
+disputes — see src.agents.vera.checks.revenue_truth). --promise-digest is
+V4's daily promise & discrepancy digest (open/overdue commitments +
+"Doc claims X; live shows Y"), --seed-check is V4's seeded-discrepancy
+acceptance gate, and --add-promise is the interim manual promise-entry path
+until Phase 2 reply-forwarding lands (all three: src.agents.vera.checks
+.discrepancy_digest / src.agents.vera.promises). Every standing job follows
+the same pattern: check the vera_global kill switch first, then run read-only
+checks through src.agents.vera.db, then write results via
+src.agents.vera.facts.
 
 Modeled on src/agents/__main__.py's health-check report shape, but this is a
 fully separate process from that supervisor — no shared runtime, no shared
@@ -101,6 +109,39 @@ def cmd_revenue_truth() -> int:
     return run_revenue_truth()
 
 
+def cmd_promise_digest() -> int:
+    from src.agents.vera.checks.discrepancy_digest import run_discrepancy_digest
+    return run_discrepancy_digest()
+
+
+def cmd_seed_check() -> int:
+    from src.agents.vera.checks.discrepancy_digest import run_seed_check
+    return run_seed_check()
+
+
+def cmd_add_promise(args: argparse.Namespace) -> int:
+    from datetime import datetime, timezone
+
+    from src.agents.vera.promises import record_promise
+
+    due_at = None
+    if args.due_at:
+        due_at = datetime.fromisoformat(args.due_at)
+        if due_at.tzinfo is None:
+            due_at = due_at.replace(tzinfo=timezone.utc)
+
+    promise = record_promise(
+        args.desc,
+        owner=args.owner,
+        source=args.source,
+        thread_id=args.thread_id,
+        mrr_at_risk_cents=args.mrr_at_risk_cents,
+        due_at=due_at,
+    )
+    _line(f"{_OK} recorded promise id={promise.id} owner={promise.owner!r}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m src.agents.vera",
@@ -118,6 +159,27 @@ def main(argv: list[str] | None = None) -> int:
              "reconciliation, real MRR, new/failed payments, refunds & disputes) "
              "and exit",
     )
+    parser.add_argument(
+        "--promise-digest", action="store_true",
+        help="Run the daily promise & discrepancy digest (open/overdue "
+             "commitments + 'Doc claims X; live shows Y') and exit",
+    )
+    parser.add_argument(
+        "--seed-check", action="store_true",
+        help="Run the seeded-discrepancy acceptance check (plant a false "
+             "deploy claim against real state, assert it is caught) and exit",
+    )
+    parser.add_argument(
+        "--add-promise", action="store_true",
+        help="Manually record one promise into vera_promises (interim entry "
+             "path until Phase 2 reply-forwarding lands) and exit",
+    )
+    parser.add_argument("--desc", help="promise text (with --add-promise)")
+    parser.add_argument("--owner", help="promise owner (with --add-promise)")
+    parser.add_argument("--source", default="manual", help="promise source (with --add-promise)")
+    parser.add_argument("--thread-id", help="Opportunity Thread ID (with --add-promise)")
+    parser.add_argument("--mrr-at-risk-cents", type=int, help="MRR at risk in cents (with --add-promise)")
+    parser.add_argument("--due-at", help="ISO due datetime, e.g. 2026-08-01 (with --add-promise)")
     args = parser.parse_args(argv)
 
     setup_logging()
@@ -130,6 +192,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.revenue_truth:
         return cmd_revenue_truth()
+
+    if args.promise_digest:
+        return cmd_promise_digest()
+
+    if args.seed_check:
+        return cmd_seed_check()
+
+    if args.add_promise:
+        if not args.desc or not args.owner:
+            parser.error("--add-promise requires --desc and --owner")
+        return cmd_add_promise(args)
 
     parser.print_help()
     return 2
