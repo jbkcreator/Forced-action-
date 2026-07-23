@@ -26,6 +26,24 @@ logger = logging.getLogger(__name__)
 REFEREE_CREDIT = 10
 TEAM_UNLOCK_THRESHOLD = 3   # confirmed referrals in same county + vertical
 
+# T-B12-06: attribution markers for the origin of a referral. The reward ladder
+# is identical regardless of source — these only tag the ReferralEvent so
+# investor-to-investor referrals are reportable separately from generic ones.
+REFERRAL_SOURCE_GENERIC = "generic"
+REFERRAL_SOURCE_INVESTOR = "investor_to_investor"
+ALLOWED_REFERRAL_SOURCES = frozenset({REFERRAL_SOURCE_GENERIC, REFERRAL_SOURCE_INVESTOR})
+
+
+def _coerce_referral_source(raw: Optional[str]) -> str:
+    """Map an arbitrary input to an allowed referral source, defaulting to generic."""
+    if not raw:
+        return REFERRAL_SOURCE_GENERIC
+    candidate = str(raw).strip().lower()
+    if candidate in ALLOWED_REFERRAL_SOURCES:
+        return candidate
+    logger.warning("referral_source=%r not in allow-list — falling back to 'generic'", raw)
+    return REFERRAL_SOURCE_GENERIC
+
 
 def ensure_referral_code(subscriber_id: int, db: Session) -> str:
     sub = db.get(Subscriber, subscriber_id)
@@ -51,12 +69,17 @@ def process_signup(
     referral_code: str,
     db: Session,
     prompt_funnel_id: Optional[int] = None,
+    referral_source: Optional[str] = None,
 ) -> Optional[ReferralEvent]:
     """Record a pending referral for a new signup.
 
     `prompt_funnel_id` (decoded from the `pt` attribution token on the share
     link) binds this referral to the exact proactive-prompt funnel row that
     drove it, so mark_confirmed() credits the right prompt on purchase.
+
+    `referral_source` (T-B12-06) tags the origin of the ask — 'generic' for the
+    standard referral link, 'investor_to_investor' for the Tier-3 investor ask.
+    Purely for attribution; the reward ladder is unaffected.
     """
     referrer = db.execute(
         select(Subscriber).where(Subscriber.referral_code == referral_code)
@@ -75,6 +98,7 @@ def process_signup(
         reward_type="credits",
         reward_value="5",
         prompt_funnel_id=prompt_funnel_id,
+        referral_source=_coerce_referral_source(referral_source),
     )
     db.add(event)
     db.flush()

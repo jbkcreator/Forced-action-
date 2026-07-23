@@ -3275,6 +3275,11 @@ class ReferralEvent(Base):
     # referral_prompt_funnel row that drove the conversion. Plain int (the funnel
     # table is raw-SQL, not an ORM model), nullable for organic/reactive signups.
     prompt_funnel_id: Mapped[Optional[int]] = mapped_column(Integer)
+    # T-B12-06: attribution marker distinguishing where the referral ask
+    # originated. 'generic' = the standard referral link; 'investor_to_investor'
+    # = the Tier-3-gated "invite a fellow investor" ask. No reward-ladder impact
+    # (rewards are unchanged) — this exists purely for attribution/reporting.
+    referral_source: Mapped[str] = mapped_column(String(30), nullable=False, default="generic", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 

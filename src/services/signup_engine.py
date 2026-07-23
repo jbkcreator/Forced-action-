@@ -108,6 +108,7 @@ def create_free_account(
     campaign_id: Optional[str] = None,
     attribution_token: Optional[str] = None,
     affiliate_ref: Optional[str] = None,
+    referral_source: Optional[str] = None,
 ) -> Subscriber:
     """Create (or re-use) a free Subscriber keyed by phone number.
 
@@ -184,7 +185,7 @@ def create_free_account(
     if referral_code:
         try:
             from src.services.referral_engine import process_signup
-            process_signup(sub.id, referral_code, db)
+            process_signup(sub.id, referral_code, db, referral_source=referral_source)
         except Exception as exc:
             logger.warning("Referral processing failed for subscriber %d: %s", sub.id, exc)
 
@@ -225,6 +226,7 @@ def create_free_account_by_email(
 	campaign_id: Optional[str] = None,
 	attribution_token: Optional[str] = None,
 	affiliate_ref: Optional[str] = None,
+	referral_source: Optional[str] = None,
 	send_welcome: bool = True,
 ) -> Subscriber:
 	"""
@@ -329,7 +331,7 @@ def create_free_account_by_email(
 	if referral_code:
 		try:
 			from src.services.referral_engine import process_signup
-			process_signup(sub.id, referral_code, db)
+			process_signup(sub.id, referral_code, db, referral_source=referral_source)
 		except Exception as exc:
 			logger.warning("Referral processing failed for subscriber %d: %s", sub.id, exc)
 
