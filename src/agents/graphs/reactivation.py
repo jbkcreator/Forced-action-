@@ -9,12 +9,21 @@ Event envelope:
         "event_type": "reactivation_outreach",
         "subscriber_id": 123,
         "payload": {
-            "cohort":    "county_live" | "sold_out",
-            "county_id": "hillsborough",
-            "zip_code":  "33601",       # sold_out only
-            "vertical":  "roofing",     # sold_out only
+            "cohort":         "county_live" | "sold_out" | "tier3_winback",
+            "county_id":      "hillsborough",
+            "zip_code":       "33601",       # sold_out only
+            "vertical":       "roofing",     # sold_out only
+            "winback_branch": "zip_held" | "zip_released",  # tier3_winback only
         },
     }
+
+tier3_winback (T-B12-07, client-locked copy):
+    zip_held     (<30d lapsed, territory still theirs) —
+        "your territory is still yours — 50% off your return month."
+    zip_released (>=30d lapsed, territory released) —
+        5 free credits on reactivation, granted on successful send via
+        src.services.wallet_engine.add_bonus (capped by the credit_bonus_max
+        guardrail like every other bonus grant).
 
 Flow (5 nodes):
     1. assemble_context     — load subscriber profile, determine channel (sms/email)
@@ -49,8 +58,11 @@ logger = logging.getLogger(__name__)
 GRAPH_NAME = "reactivation"
 CAMPAIGN_COUNTY_LIVE = "reactivation_county_live"
 CAMPAIGN_SOLD_OUT = "reactivation_sold_out_zip"
+CAMPAIGN_TIER3_WINBACK = "reactivation_tier3_winback"
 CLAUDE_TASK_TYPE = "sms_copy"
 KILL_SWITCH_FEATURE = "reactivation"
+TIER3_WINBACK_CREDIT_BONUS = 5
+TIER3_WINBACK_CREDIT_REASON = "tier3_winback_reactivation"
 
 
 class ReactivationState(TypedDict, total=False):
@@ -98,10 +110,13 @@ def _build_review_capture(state: ReactivationState) -> dict:
     cohort = payload.get("cohort", "county_live")
     county_id = payload.get("county_id") or ""
     zip_code = payload.get("zip_code") or ""
+    winback_branch = payload.get("winback_branch") or ""
 
     raw_input_text = f"reactivation_outreach cohort={cohort} county_id={county_id}"
     if zip_code:
         raw_input_text = f"{raw_input_text} zip_code={zip_code}"
+    if winback_branch:
+        raw_input_text = f"{raw_input_text} winback_branch={winback_branch}"
 
     return {
         "raw_input_text": raw_input_text,
@@ -191,9 +206,14 @@ def _node_build_compose_context(state: ReactivationState) -> ReactivationState:
     county_id = payload.get("county_id") or profile.get("county_id") or ""
     zip_code = payload.get("zip_code") or ""
     vertical = payload.get("vertical") or profile.get("vertical") or ""
+    winback_branch = payload.get("winback_branch") or ""
     first_name = (profile.get("name") or "there").split()[0]
     channel = state.get("_channel", "sms")
-    campaign = CAMPAIGN_COUNTY_LIVE if cohort == "county_live" else CAMPAIGN_SOLD_OUT
+    campaign = {
+        "county_live": CAMPAIGN_COUNTY_LIVE,
+        "sold_out": CAMPAIGN_SOLD_OUT,
+        "tier3_winback": CAMPAIGN_TIER3_WINBACK,
+    }.get(cohort, CAMPAIGN_COUNTY_LIVE)
 
     render_context = {
         "first_name": first_name,
@@ -202,6 +222,7 @@ def _node_build_compose_context(state: ReactivationState) -> ReactivationState:
         "zip_code": zip_code,
         "vertical": vertical,
         "channel": channel,
+        "winback_branch": winback_branch,
     }
 
     if cohort == "county_live":
@@ -243,7 +264,7 @@ def _node_build_compose_context(state: ReactivationState) -> ReactivationState:
                 f"— Forced Action Team"
             )
             subject = f"{county_id} just launched — new leads are live on Forced Action"
-    else:
+    elif cohort == "sold_out":
         system_prompt = (
             "You are Cora, a concise outbound copywriter for Forced Action — "
             "a distressed property intelligence platform. "
@@ -281,6 +302,56 @@ def _node_build_compose_context(state: ReactivationState) -> ReactivationState:
                 f"— Forced Action Team"
             )
             subject = f"Slot open in {zip_code} — lock it now on Forced Action"
+    else:  # tier3_winback — client-locked copy, do not reword (T-B12-07)
+        system_prompt = (
+            "You are Cora, a concise outbound copywriter for Forced Action — "
+            "a distressed property intelligence platform, writing to a lapsed "
+            "subscriber. Never use emojis. Never use all-caps. Always include "
+            "'Reply STOP to opt out' for SMS. Use the exact locked headline "
+            "provided — do not paraphrase it."
+        )
+        if winback_branch == "zip_held":
+            headline = "Your territory is still yours — 50% off your return month."
+            body_detail = (
+                f"Your {vertical} territory in {county_id} is still locked to you. "
+                f"Come back this month and it's 50% off."
+            )
+        else:
+            headline = "Come back and get 5 free credits on reactivation."
+            body_detail = (
+                f"Your old {vertical} territory in {county_id} has been reassigned, "
+                f"but reactivating now gets you 5 free lead credits."
+            )
+
+        if channel == "sms":
+            user_prompt = (
+                f"Write a reactivation SMS for {first_name}. "
+                f"Lead with this exact locked headline (verbatim, do not rephrase): \"{headline}\" "
+                f"Then add one short supporting sentence: {body_detail} "
+                f"Include this link: https://forcedactionleads.com?reactivate=1 "
+                f"Keep it under 160 characters. End with 'Reply STOP to opt out.'"
+            )
+            fallback_body = (
+                f"{first_name}, {headline} {body_detail} "
+                f"Reactivate: https://forcedactionleads.com?reactivate=1  Reply STOP to opt out."
+            )
+            subject = ""
+        else:
+            user_prompt = (
+                f"Write a reactivation email body for {first_name}. "
+                f"Lead with this exact locked headline (verbatim, do not rephrase): \"{headline}\" "
+                f"Then add supporting copy: {body_detail} "
+                f"Include this link: https://forcedactionleads.com?reactivate=1 "
+                f"Keep it under 200 words. Be direct and professional."
+            )
+            fallback_body = (
+                f"Hi {first_name},\n\n"
+                f"{headline}\n\n"
+                f"{body_detail}\n\n"
+                f"Reactivate: https://forcedactionleads.com?reactivate=1\n\n"
+                f"— Forced Action Team"
+            )
+            subject = headline
 
     return {
         "_campaign": campaign,
@@ -342,6 +413,37 @@ def _node_compose_and_send(state: ReactivationState) -> ReactivationState:
     }
 
 
+def _grant_tier3_winback_credits(subscriber_id: int) -> None:
+    """
+    Grants the 5-free-credit zip_released win-back bonus once per subscriber.
+    Idempotent: skips if a bonus transaction with this reason already exists,
+    so retried/duplicate graph runs never double-credit.
+    """
+    from src.services.wallet_engine import add_bonus
+
+    try:
+        with db.session_scope() as s:
+            existing = s.execute(
+                text(
+                    "SELECT 1 FROM wallet_transactions "
+                    "WHERE subscriber_id = :sid AND txn_type = 'bonus' AND description = :reason "
+                    "LIMIT 1"
+                ),
+                {"sid": subscriber_id, "reason": TIER3_WINBACK_CREDIT_REASON},
+            ).first()
+            if existing:
+                return
+            add_bonus(subscriber_id, TIER3_WINBACK_CREDIT_BONUS, TIER3_WINBACK_CREDIT_REASON, s)
+        logger.info(
+            "reactivation: granted tier3 win-back credits sub_id=%s amount=%s",
+            subscriber_id, TIER3_WINBACK_CREDIT_BONUS,
+        )
+    except Exception:
+        logger.exception(
+            "reactivation: failed to grant tier3 win-back credits sub_id=%s", subscriber_id
+        )
+
+
 def _node_finalize(state: ReactivationState) -> ReactivationState:
     final_status = state.get("terminal_status") or "completed"
 
@@ -360,6 +462,10 @@ def _node_finalize(state: ReactivationState) -> ReactivationState:
                 "reactivation: failed to stamp last_reactivation_attempt_at sub_id=%s",
                 state.get("subscriber_id"),
             )
+
+        payload = state.get("event_payload") or {}
+        if payload.get("cohort") == "tier3_winback" and payload.get("winback_branch") == "zip_released":
+            _grant_tier3_winback_credits(state["subscriber_id"])
 
     if final_status != "completed" or not state.get("sent"):
         try:

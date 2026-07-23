@@ -809,4 +809,12 @@ COUNTY_ID=hillsborough
 # the amounts; run with --dry-run to preview without touching Stripe.
 0 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.guarantee_shortfall_sweep
 
+# T-B12-07 — Deal-of-the-day daily pick (idempotent, one row per date).
+# Runs after CDS scoring so today's top-CDS undelivered lead is available.
+15 7 * * * $PROJECT/scripts/cron/run.sh src.services.deal_of_the_day
+
+# T-B12-07 — Tier3 win-back reactivation sweep (lapsed <30d zip-held /
+# >=30d zip-released branches). Runs alongside the existing S0 cohorts.
+30 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.reactivation_scheduler --cohort tier3_winback
+
 # === END FORCED-ACTION-PLATFORM ===

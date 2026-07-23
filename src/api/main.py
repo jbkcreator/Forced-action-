@@ -120,6 +120,7 @@ from src.api.sms_analytics_router import router as sms_analytics_router  # noqa:
 from src.api.operator_crm_router import router as operator_crm_router  # noqa: E402
 from src.api.closer_router import router as closer_router  # noqa: E402
 from src.api.feedback_ritual_router import router as feedback_ritual_router  # noqa: E402
+from src.api.deal_of_the_day_router import router as deal_of_the_day_router  # noqa: E402
 app.include_router(admin_router)
 app.include_router(attribution_router)
 app.include_router(cora_incidents_router)
@@ -127,6 +128,7 @@ app.include_router(sms_analytics_router)
 app.include_router(operator_crm_router)
 app.include_router(closer_router)
 app.include_router(feedback_ritual_router)
+app.include_router(deal_of_the_day_router)
 
 from src.api.chat_router import router as chat_router  # noqa: E402
 app.include_router(chat_router)
