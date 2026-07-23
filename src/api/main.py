@@ -1903,6 +1903,18 @@ def _compute_save_offer_active(subscriber, db) -> bool:
     return compute_save_offer_active(subscriber, db)
 
 
+def _get_activation_status_safe(subscriber_id: int, db) -> dict:
+    """T-B12-05: surface signup/first-leads-shown/first-unlock timestamps to
+    the dashboard so the 5-min activation window is measurable client-side.
+    Best-effort — never let instrumentation break the feed response."""
+    try:
+        from src.services.activation_tracking import get_activation_status
+        return get_activation_status(subscriber_id, db)
+    except Exception as exc:
+        logger.warning("activation status fetch failed for sub=%s: %s", subscriber_id, exc)
+        return {"signup_time": None, "first_leads_shown_time": None, "first_unlock_time": None}
+
+
 def _payment_recovery_fields(subscriber) -> dict:
     """Surface Stripe failed-payment recovery state to the frontend so the
     dashboard can render a PaymentFailedBanner. Stage is derived client-side
@@ -2270,6 +2282,12 @@ def event_feed(
             logger.warning("blurred_stack failed for sub=%s: %s", subscriber.id, exc)
             _blurred_stack = []
 
+        # T-B12-05: stamp the 5-min activation clock the first time this
+        # unpaid subscriber's dashboard actually rendered real scored leads.
+        if _blurred_stack:
+            from src.services.activation_tracking import stamp_first_leads_shown
+            stamp_first_leads_shown(subscriber.id, db)
+
         try:
             with db.begin_nested():
                 from src.services.business_events import log_business_event
@@ -2330,6 +2348,7 @@ def event_feed(
                 "onboarding_completed": subscriber.onboarding_completed,
                 "preferred_property_type": subscriber.preferred_property_type,
                 "investment_budget_band": subscriber.investment_budget_band,
+                "activation": _get_activation_status_safe(subscriber.id, db),
                 **_accelerated_wallet_offer_fields(subscriber, db),
                 **_auto_mode_entitlement_fields(subscriber, db),
                 **_payment_recovery_fields(subscriber),
@@ -2610,6 +2629,7 @@ def event_feed(
             "onboarding_completed": subscriber.onboarding_completed,
             "preferred_property_type": subscriber.preferred_property_type,
             "investment_budget_band": subscriber.investment_budget_band,
+            "activation": _get_activation_status_safe(subscriber.id, db),
             **_accelerated_wallet_offer_fields(subscriber, db),
             **_payment_recovery_fields(subscriber),
             **_what_you_missed_fields(

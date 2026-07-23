@@ -2599,6 +2599,14 @@ def fulfill_founder_comp_reveal(subscriber, property_id_raw, db: Session) -> boo
     if not is_first_reveal:
         return True
 
+    # T-B12-05: founder comp reveal is a $0 unlock but still IS the
+    # activation event (first contact reveal), so it must stamp the clock.
+    try:
+        from src.services.activation_tracking import stamp_first_unlock
+        stamp_first_unlock(subscriber.id, db)
+    except Exception:
+        logger.warning("founder_comp reveal: activation stamp failed sub=%s", subscriber.id)
+
     try:
         from src.services.auto_mode import enqueue_action
         enqueue_action(subscriber.id, property_id, db)
@@ -2781,6 +2789,11 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
                 SentLead.source == "lead_unlock_payment",
             )
         ).scalar() or 0
+        # T-B12-05: stamp the activation event (first-ever contact unlock)
+        # regardless of welcome-email eligibility above.
+        from src.services.activation_tracking import stamp_first_unlock
+        stamp_first_unlock(subscriber.id, db)
+
         if first_unlock <= 1:
             from src.services.email import send_welcome_email
             from src.services import subscriber_auth as _sub_auth
