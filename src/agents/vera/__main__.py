@@ -3,12 +3,18 @@ Vera — process entry point.
 
 Usage:
     python -m src.agents.vera --health
+    python -m src.agents.vera --live-state
+    python -m src.agents.vera --revenue-truth
 
---health is the only command in V1 (agent scaffolding sub-task). Later
-sub-tasks (V2/V3/V4) add standing-job subcommands (--live-state,
---revenue-truth, etc.), each following the same pattern: check the
-vera_global kill switch first, then run read-only checks through
-src.agents.vera.db, then write results via src.agents.vera.facts.
+--health is V1's scaffolding check. --live-state is V2's daily pre-8am
+report (prod-hash vs dev HEAD, cron freshness, deploy/migration drift,
+silent-failure detection — see src.agents.vera.checks.live_state).
+--revenue-truth is V3's daily revenue truth report (two-way Stripe-vs-DB
+subscriber reconciliation, real MRR, new/failed payments, refunds &
+disputes — see src.agents.vera.checks.revenue_truth). A later sub-task (V4)
+adds the promise digest / seeded-discrepancy subcommand, following the same
+pattern: check the vera_global kill switch first, then run read-only checks
+through src.agents.vera.db, then write results via src.agents.vera.facts.
 
 Modeled on src/agents/__main__.py's health-check report shape, but this is a
 fully separate process from that supervisor — no shared runtime, no shared
@@ -85,18 +91,45 @@ def cmd_health() -> int:
     return 0 if all_ok else 1
 
 
+def cmd_live_state() -> int:
+    from src.agents.vera.checks.live_state import run_live_state
+    return run_live_state()
+
+
+def cmd_revenue_truth() -> int:
+    from src.agents.vera.checks.revenue_truth import run_revenue_truth
+    return run_revenue_truth()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m src.agents.vera",
         description="Vera — truth & verification agent (read-only)",
     )
     parser.add_argument("--health", action="store_true", help="Run scaffolding health check and exit")
+    parser.add_argument(
+        "--live-state", action="store_true",
+        help="Run the daily live-state report (deploy drift, cron freshness, "
+             "silent failures) and exit",
+    )
+    parser.add_argument(
+        "--revenue-truth", action="store_true",
+        help="Run the daily revenue truth report (two-way Stripe-vs-DB "
+             "reconciliation, real MRR, new/failed payments, refunds & disputes) "
+             "and exit",
+    )
     args = parser.parse_args(argv)
 
     setup_logging()
 
     if args.health:
         return cmd_health()
+
+    if args.live_state:
+        return cmd_live_state()
+
+    if args.revenue_truth:
+        return cmd_revenue_truth()
 
     parser.print_help()
     return 2
