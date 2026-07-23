@@ -2057,6 +2057,34 @@ def _accelerated_wallet_offer_fields(subscriber, db) -> dict:
     return out
 
 
+def _outcome_state_by_property(db: Session, subscriber_id: int, property_ids) -> dict:
+    """Block 13: latest subscriber-reported outcome_state per property.
+
+    Latest-wins (max id per property). Drives the "reported" badge on the
+    delivered-lead card so a reported lead reflects its state on reload.
+    Best-effort — a failure here must never break the feed.
+    """
+    ids = [p for p in (property_ids or [])]
+    if not ids:
+        return {}
+    from sqlalchemy import text as _sa_text
+    try:
+        rows = db.execute(
+            _sa_text(
+                "SELECT DISTINCT ON (property_id) property_id, outcome_state "
+                "FROM deal_outcomes "
+                "WHERE subscriber_id = :sid AND property_id = ANY(:pids) "
+                "AND outcome_state IS NOT NULL "
+                "ORDER BY property_id, id DESC"
+            ),
+            {"sid": subscriber_id, "pids": ids},
+        ).fetchall()
+        return {r.property_id: r.outcome_state for r in rows}
+    except Exception as exc:
+        logger.warning("outcome_state map failed for sub=%s: %s", subscriber_id, exc)
+        return {}
+
+
 @app.get("/api/feed/{feed_uuid}")
 def event_feed(
     feed_uuid: str,
@@ -2216,6 +2244,9 @@ def event_feed(
                             "type": inc.incident_type,
                             "date": inc.incident_date.isoformat() if inc.incident_date else None,
                         })
+                    _outcome_map_nz = _outcome_state_by_property(
+                        db, subscriber.id, unlocked_ids_no_zip
+                    )
                     for prop, score, owner in unlocked_rows:
                         owner_phone, owner_phone_quality = _resolve_phone_with_quality(owner)
                         owner_email = (owner.email_1 or owner.email_2) if owner else None
@@ -2245,6 +2276,7 @@ def event_feed(
                             "phone": owner_phone,
                             "phone_quality": owner_phone_quality,
                             "email": owner_email,
+                            "outcome_state": _outcome_map_nz.get(prop.id),
                         })
         except Exception as exc:
             logger.warning("free-tier unlocked leads query failed for sub=%s: %s",
@@ -2502,6 +2534,8 @@ def event_feed(
         county_id=subscriber.county_id,
     )
 
+    outcome_by_prop = _outcome_state_by_property(db, subscriber.id, list(property_ids))
+
     leads = []
     for prop, score, owner in rows:
         is_unlocked = (prop.id in unlocked_ids) or (prop.zip in locked_zip_set)
@@ -2535,6 +2569,7 @@ def event_feed(
             "phone_quality": owner_phone_quality if is_unlocked else None,
             "email": owner_email if is_unlocked else None,
             "portfolio_size": portfolio,
+            "outcome_state": outcome_by_prop.get(prop.id),
         })
 
     from src.core.models import WalletBalance as _WalletBalance
@@ -5067,24 +5102,56 @@ def deal_capture(payload: DealCaptureRequest, db: Session = Depends(get_db)):
 
     pipeline_stage = {"closed": "closed_won", "dead": "closed_lost", "pending": "negotiation"}[state]
 
-    outcome = DealOutcome(
-        subscriber_id=sub.id,
-        property_id=payload.property_id,
-        deal_size_bucket=payload.deal_size_bucket,
-        deal_amount=payload.deal_amount,
-        deal_date=date.today(),
-        days_to_close=payload.days_to_close,
-        pipeline_stage=pipeline_stage,
-        outcome_state=stored_outcome_state,
-        dead_reason=dead_reason,
-        reason_fault_class=fault_class,
-        county_id=sub.county_id,
-        trade_vertical=sub.vertical,
-        confidence_tier=outcome_confidence.SUBSCRIBER_REPORTED,
-        outcome_source="subscriber_tap",
-    )
-    db.add(outcome)
+    # Latest-wins de-dupe: a subscriber re-reporting the same lead updates the
+    # existing subscriber-tap row instead of stacking duplicate outcomes, so the
+    # feed reflects one current outcome per lead (Block 13 follow-up).
+    outcome = db.execute(
+        select(DealOutcome)
+        .where(
+            DealOutcome.subscriber_id == sub.id,
+            DealOutcome.property_id == payload.property_id,
+            DealOutcome.outcome_source == "subscriber_tap",
+        )
+        .order_by(DealOutcome.id.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    is_update = outcome is not None
+    prev_state = outcome.outcome_state if is_update else None
+    if outcome is None:
+        outcome = DealOutcome(
+            subscriber_id=sub.id,
+            property_id=payload.property_id,
+            confidence_tier=outcome_confidence.SUBSCRIBER_REPORTED,
+            outcome_source="subscriber_tap",
+        )
+        db.add(outcome)
+    outcome.deal_size_bucket = payload.deal_size_bucket
+    outcome.deal_amount = payload.deal_amount
+    outcome.deal_date = date.today()
+    outcome.days_to_close = payload.days_to_close
+    outcome.pipeline_stage = pipeline_stage
+    outcome.outcome_state = stored_outcome_state
+    outcome.dead_reason = dead_reason
+    outcome.reason_fault_class = fault_class
+    outcome.county_id = sub.county_id
+    outcome.trade_vertical = sub.vertical
     db.flush()
+
+    # If a de-dupe update changed the outcome, the learning artifacts captured
+    # for the previous outcome are now stale (capture_snapshot is idempotent on
+    # deal_outcome_id and would otherwise keep the old outcome_status forever).
+    # Clear them so the re-emitted event (or the inline fallback below) captures
+    # fresh against the new outcome.
+    if is_update and prev_state != stored_outcome_state:
+        from sqlalchemy import text as _sa_text
+        for _tbl in ("pre_decision_snapshots", "loss_autopsies"):
+            try:
+                db.execute(
+                    _sa_text(f"DELETE FROM {_tbl} WHERE deal_outcome_id = :oid"),
+                    {"oid": outcome.id},
+                )
+            except Exception as exc:
+                logger.warning("[DealCapture] stale %s cleanup failed: %s", _tbl, exc)
 
     # T-B13-01: pending is a non-terminal tap — record it, but fire no
     # terminal effects (recalculation or interaction feedback).
