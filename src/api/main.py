@@ -5994,6 +5994,11 @@ class FreeSignupRequest(BaseModel):
     # fa081: affiliate ?aff= token, captured client-side and forwarded here.
     # Distinct from referral_code (the peer credit loop).
     affiliate_ref: Optional[str] = None
+    # T-B12-06: origin marker for the referral ask, forwarded from the share
+    # link's `rs` query param. 'investor_to_investor' tags the Tier-3 investor
+    # ask; anything else (incl. None) is treated as the generic referral link.
+    # Reward ladder is unchanged — this is attribution only.
+    referral_source: Optional[str] = None
     # Phase 2B: caller hint about what the user is about to do. Suppresses the
     # welcome email when the user is mid-purchase ('upgrade' = paid checkout,
     # 'unlock' = $4 lead unlock). Welcome fires from the relevant payment
@@ -6061,6 +6066,7 @@ def free_signup(req: FreeSignupRequest, request: Request, db: Session = Depends(
         campaign_id=req.campaign_id,
         attribution_token=req.attribution_token,
         affiliate_ref=affiliate_ref,
+        referral_source=req.referral_source,
         send_welcome=not defer_welcome,
     )
 

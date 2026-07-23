@@ -49,6 +49,33 @@ class TestReferralUnit:
         result = process_signup(5, "badcode00", mock_db)
         assert result is None
 
+    def test_referral_source_defaults_to_generic(self, mock_db):
+        from src.services.referral_engine import process_signup, REFERRAL_SOURCE_GENERIC
+        referrer = _make_sub(1, referral_code="testcode1")
+        mock_db.execute.return_value.scalar_one_or_none.return_value = referrer
+        with patch("src.services.wallet_engine.add_bonus"):
+            event = process_signup(9, "testcode1", mock_db)
+        assert event is not None
+        assert event.referral_source == REFERRAL_SOURCE_GENERIC
+
+    def test_investor_referral_source_is_tagged(self, mock_db):
+        from src.services.referral_engine import process_signup, REFERRAL_SOURCE_INVESTOR
+        referrer = _make_sub(1, referral_code="testcode1")
+        mock_db.execute.return_value.scalar_one_or_none.return_value = referrer
+        with patch("src.services.wallet_engine.add_bonus"):
+            event = process_signup(
+                9, "testcode1", mock_db, referral_source="investor_to_investor"
+            )
+        assert event.referral_source == REFERRAL_SOURCE_INVESTOR
+
+    def test_unknown_referral_source_coerced_to_generic(self, mock_db):
+        from src.services.referral_engine import process_signup, REFERRAL_SOURCE_GENERIC
+        referrer = _make_sub(1, referral_code="testcode1")
+        mock_db.execute.return_value.scalar_one_or_none.return_value = referrer
+        with patch("src.services.wallet_engine.add_bonus"):
+            event = process_signup(9, "testcode1", mock_db, referral_source="garbage")
+        assert event.referral_source == REFERRAL_SOURCE_GENERIC
+
 
 class TestReferralIntegration:
     def test_full_referral_flow(self, fresh_db):
