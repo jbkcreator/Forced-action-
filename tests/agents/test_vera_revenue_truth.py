@@ -21,11 +21,30 @@ from src.agents.vera.checks.revenue_truth import (
     _classify_paying_no_access,
     _compute_mrr_delta,
     _day_window_utc,
+    _field,
     _select_prior_day_row,
     _stripe_mrr,
     _summarize_refunds_disputes,
     render_revenue_truth_report,
 )
+
+
+class _BracketOnly:
+    """Mimics the real stripe-python 15.1.0 response object shape: supports
+    __getitem__ (bracket access) but NOT .get() at all — hasattr(obj, 'get')
+    is False on the real SDK objects, and calling .get() raises
+    AttributeError. Confirmed by actually running check_mrr() against a real
+    Stripe test-mode subscription during validation, which crashed outright
+    on item.get("quantity") before _field() was introduced. Any test using
+    plain dicts alone would never catch this — dicts support .get() fine."""
+
+    def __init__(self, data: dict):
+        self._data = data
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+    # Deliberately NO .get() method — this is the point.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -224,6 +243,60 @@ def test_stripe_mrr_normalizes_annual_to_monthly():
 def test_stripe_mrr_skips_malformed_subscriptions():
     subs = {"cus_1": {"items": {"data": []}}}  # no line items — IndexError guarded
     assert _stripe_mrr(subs) == 0
+
+
+def test_stripe_mrr_works_against_bracket_only_object():
+    # Reproduces the exact shape that crashed check_mrr() against real
+    # Stripe data: a subscription-item object with NO .get() method,
+    # only bracket access. quantity is read via _field(), not item.get().
+    item = _BracketOnly({"price": {"unit_amount": 10000, "recurring": {"interval": "monthly"}}})
+    subs = {"cus_1": _BracketOnly({"items": {"data": [item]}})}
+    assert _stripe_mrr(subs) == 10000
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _field() — the fix for stripe-python 15.1.0 objects not supporting .get()
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_field_reads_from_plain_dict():
+    assert _field({"status": "active"}, "status") == "active"
+
+
+def test_field_reads_from_bracket_only_object():
+    assert _field(_BracketOnly({"status": "active"}), "status") == "active"
+
+
+def test_field_returns_default_on_missing_key_for_dict():
+    assert _field({}, "status", "unknown") == "unknown"
+
+
+def test_field_returns_default_on_missing_key_for_bracket_only_object():
+    assert _field(_BracketOnly({}), "status", "unknown") == "unknown"
+
+
+def test_field_returns_default_when_value_is_none():
+    assert _field({"status": None}, "status", "unknown") == "unknown"
+
+
+def test_classify_charges_works_against_bracket_only_objects():
+    # The real production path: check_payment_activity() passes real Stripe
+    # Charge objects (no .get()) into _classify_charges(), not plain dicts.
+    charges = [
+        _BracketOnly({"status": "succeeded", "amount": 5000, "invoice": "in_1"}),
+        _BracketOnly({"status": "failed", "amount": 3000, "invoice": None}),
+    ]
+    result = _classify_charges(charges)
+    assert result.new_count == 1 and result.new_amount_cents == 5000
+    assert result.failed_count == 1 and result.failed_amount_cents == 3000
+    assert result.subscription_count == 1
+
+
+def test_summarize_refunds_disputes_works_against_bracket_only_objects():
+    refunds = [_BracketOnly({"amount": 1000})]
+    disputes = [_BracketOnly({"id": "dp_1", "amount": 2000, "reason": "fraudulent"})]
+    result = _summarize_refunds_disputes(refunds, disputes)
+    assert result.refunds_amount_cents == 1000
+    assert result.disputes == [{"id": "dp_1", "amount": 2000, "reason": "fraudulent"}]
 
 
 # ─────────────────────────────────────────────────────────────────────────────

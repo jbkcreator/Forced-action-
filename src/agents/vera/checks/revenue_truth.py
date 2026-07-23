@@ -104,6 +104,27 @@ def _day_window_utc(as_of: Optional[date] = None) -> tuple[int, int]:
     return int(start.timestamp()), int(end.timestamp())
 
 
+def _field(obj, key: str, default=None):
+    """Safely read a field from either a real Stripe response object or a
+    plain dict (tests use plain dicts).
+
+    Confirmed against the installed stripe-python 15.1.0: its response
+    objects do NOT implement .get() at all — hasattr(sub, 'get') is False,
+    and calling .get() raises AttributeError (it gets routed through
+    __getattr__ looking for a field literally named "get", which doesn't
+    exist). Only bracket access (obj[key]) works, same as it does on a
+    plain dict — so this helper uses that uniformly instead of .get(),
+    which crashed check_mrr() outright the first time this ran against
+    real Stripe data (see VERA-V3-Implementation-Plan.md validation notes).
+    Never call .get() directly on anything that might be a real Stripe
+    object in this module — use this helper."""
+    try:
+        value = obj[key]
+        return default if value is None else value
+    except (KeyError, TypeError):
+        return default
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 3A — Two-way subscriber reconciliation
 # ─────────────────────────────────────────────────────────────────────────────
@@ -177,7 +198,7 @@ def _retrieve_subscription_status(subscription_id: str) -> str:
     row — cheap because it fires on discrepancies, not the whole table."""
     try:
         sub = stripe.Subscription.retrieve(subscription_id)
-        return sub.get("status", "unknown")
+        return _field(sub, "status", "unknown")
     except Exception as exc:
         logger.warning("[Vera] could not retrieve Stripe subscription %s: %s", subscription_id, exc)
         return "lookup_failed"
@@ -301,7 +322,7 @@ def _stripe_mrr(active_subs_by_customer: dict) -> int:
         try:
             item = sub["items"]["data"][0]
             unit_amount = item["price"]["unit_amount"]
-            quantity = item.get("quantity") or 1
+            quantity = _field(item, "quantity", 1) or 1
             interval = item["price"]["recurring"]["interval"]
         except (KeyError, IndexError, TypeError):
             continue
@@ -458,12 +479,12 @@ def _classify_charges(charges: list) -> PaymentActivityResult:
     separate Stripe queries."""
     result = PaymentActivityResult()
     for charge in charges:
-        status = charge.get("status")
-        amount = charge.get("amount") or 0
+        status = _field(charge, "status")
+        amount = _field(charge, "amount", 0) or 0
         if status == "succeeded":
             result.new_count += 1
             result.new_amount_cents += amount
-            if charge.get("invoice"):
+            if _field(charge, "invoice"):
                 result.subscription_count += 1
                 result.subscription_amount_cents += amount
             else:
@@ -531,12 +552,12 @@ def _summarize_refunds_disputes(refunds: list, disputes: list) -> RefundsDispute
     """Pure function — summarizes already-fetched Refund/Dispute objects (or
     plain dicts, for tests)."""
     disputes_detail = [
-        {"id": d.get("id"), "amount": d.get("amount") or 0, "reason": d.get("reason")}
+        {"id": _field(d, "id"), "amount": _field(d, "amount", 0) or 0, "reason": _field(d, "reason")}
         for d in disputes
     ]
     return RefundsDisputesResult(
         refunds_count=len(refunds),
-        refunds_amount_cents=sum((r.get("amount") or 0) for r in refunds),
+        refunds_amount_cents=sum((_field(r, "amount", 0) or 0) for r in refunds),
         disputes_count=len(disputes),
         disputes_amount_cents=sum(d["amount"] for d in disputes_detail),
         disputes=disputes_detail,
