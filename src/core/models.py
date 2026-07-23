@@ -7941,3 +7941,128 @@ class ScoringCutoverLog(Base):
             f"<ScoringCutoverLog(id={self.id}, status={self.validation_status}, "
             f"applied={self.applied})>"
         )
+
+
+# ============================================================================
+# Hunter — Buyer Entity Resolution (HUNTER-01)
+# ============================================================================
+
+class BuyerEntity(Base):
+    """
+    Canonical buyer identity — one row per real person or LLC, collapsed from
+    potentially many `owners` rows (one per property) and `deeds.grantee`
+    mentions via src/services/buyer_entity_resolution.py.
+
+    confidence_score is 0-100 (not the 0.000-1.000 scale used by
+    Deed.match_confidence) — matches Hunter's constitution wording verbatim
+    ("confidence-scored 0-100", "<70 confidence = UNVERIFIED"). Entities below
+    the UNVERIFIED threshold must never surface in a Cora draft.
+
+    IDs are stable across nightly re-runs by design — the resolver matches new
+    deed/owner activity against existing rows here first and only creates a
+    new entity when nothing matches, so downstream references (whale flags,
+    Cell #1's ranked list) never silently break.
+    """
+    __tablename__ = "buyer_entities"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    canonical_name: Mapped[str] = mapped_column(Text, nullable=False)
+    entity_type: Mapped[str] = mapped_column(String(20), nullable=False)   # Individual | LLC | Trust | Corporate
+    primary_mailing_address: Mapped[Optional[str]] = mapped_column(String(255))
+    confidence_score: Mapped[int] = mapped_column(Integer, nullable=False)
+    verification_status: Mapped[str] = mapped_column(String(20), nullable=False, default="unverified")
+    total_purchase_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_cash_volume: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False, default=0)
+    county_id: Mapped[Optional[str]] = mapped_column(String(50), index=True)
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+    last_updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    links: Mapped[List["BuyerEntityLink"]] = relationship(
+        "BuyerEntityLink", back_populates="buyer_entity", cascade="all, delete-orphan",
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "entity_type IN ('Individual', 'LLC', 'Trust', 'Corporate')",
+            name="check_buyer_entity_type",
+        ),
+        CheckConstraint(
+            "verification_status IN ('verified', 'unverified')",
+            name="check_buyer_entity_verification_status",
+        ),
+        CheckConstraint(
+            "confidence_score >= 0 AND confidence_score <= 100",
+            name="check_buyer_entity_confidence_range",
+        ),
+        Index("idx_buyer_entities_confidence", "confidence_score"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<BuyerEntity(id={self.id}, name={self.canonical_name!r}, "
+            f"confidence={self.confidence_score})>"
+        )
+
+
+class BuyerEntityLink(Base):
+    """
+    One row per raw source record (an `owners` row, a `deeds` row via its
+    grantee mention, or a `sunbiz_snapshots` row) resolved onto a
+    `BuyerEntity`. This is the traceability layer Hunter's constitution
+    requires ("every record traceable to source") — a BuyerEntity's identity
+    is never asserted without a path back to the raw rows that produced it.
+
+    `(source_table, source_id)` is unique — each raw record resolves to
+    exactly one buyer entity; a buyer with many properties gets many links
+    pointing at the same buyer_entity_id, not the reverse.
+
+    match_method distinguishes a sourced structural fact
+    (`sunbiz_llc_piercing` — a person named in Owner.managing_members) from an
+    inferred match (`fuzzy_name`, `llm_adjudicated`) so a future audit can tell
+    which links are facts vs. resolver judgment calls.
+    """
+    __tablename__ = "buyer_entity_links"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    buyer_entity_id: Mapped[int] = mapped_column(
+        ForeignKey("buyer_entities.id", ondelete="CASCADE"), nullable=False, index=True,
+    )
+    source_table: Mapped[str] = mapped_column(String(30), nullable=False)   # owners | deeds | sunbiz_snapshots
+    source_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    match_confidence: Mapped[int] = mapped_column(Integer, nullable=False)
+    match_method: Mapped[str] = mapped_column(String(30), nullable=False)
+    linked_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+
+    buyer_entity: Mapped["BuyerEntity"] = relationship("BuyerEntity", back_populates="links")
+
+    __table_args__ = (
+        UniqueConstraint("source_table", "source_id", name="uq_buyer_entity_link_source"),
+        CheckConstraint(
+            "source_table IN ('owners', 'deeds', 'sunbiz_snapshots')",
+            name="check_buyer_entity_link_source_table",
+        ),
+        CheckConstraint(
+            "match_method IN ('sunbiz_llc_piercing', 'exact_name_address', 'fuzzy_name', 'llm_adjudicated', 'manual')",
+            name="check_buyer_entity_link_match_method",
+        ),
+        CheckConstraint(
+            "match_confidence >= 0 AND match_confidence <= 100",
+            name="check_buyer_entity_link_confidence_range",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<BuyerEntityLink(entity_id={self.buyer_entity_id}, "
+            f"source={self.source_table}:{self.source_id}, method={self.match_method!r})>"
+        )
