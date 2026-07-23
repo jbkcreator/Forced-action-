@@ -1361,6 +1361,41 @@ class Subscriber(Base):
         return f"<Subscriber(id={self.id}, email='{self.email}', tier='{self.tier}', founding={self.founding_member})>"
 
 
+class ActivationEvent(Base):
+    """
+    T-B12-05: 5-minute activation funnel timestamps, one row per subscriber.
+
+    signup_time mirrors Subscriber.created_at (stamped at row creation so it
+    survives even if Subscriber.created_at semantics ever change).
+    first_leads_shown_time is stamped the first time the free-tier dashboard
+    renders the 3-5 real scored leads (event_feed's no-locked-zip branch).
+    first_unlock_time is stamped the first time the subscriber unlocks any
+    lead's contact info (paid $4/hot-lead unlock or founder comp reveal) —
+    this is the activation event per the locked decision. Both are
+    set-once (COALESCE-style in code, never overwritten) so "time to first
+    value" and "time to activation" stay measurable against signup_time.
+    """
+    __tablename__ = "activation_events"
+
+    subscriber_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("subscribers.id"), primary_key=True
+    )
+    signup_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    first_leads_shown_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    first_unlock_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    def __repr__(self):
+        return (
+            f"<ActivationEvent(subscriber_id={self.subscriber_id}, "
+            f"shown={self.first_leads_shown_time}, unlocked={self.first_unlock_time})>"
+        )
+
+
 class ZipTerritory(Base):
     """
     ZIP code exclusivity per vertical per county.
