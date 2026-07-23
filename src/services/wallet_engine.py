@@ -181,6 +181,20 @@ def debit(
         action_type=ACTION_WALLET_TXN,
         metadata={"txn_type": "debit", "amount": int(cost), "action": action, "zip_code": zip_code},
     )
+
+    # T-B12-05: a credit-spend lead reveal IS a first-contact-unlock — the
+    # activation event. The Stripe $4 and founder $0 paths already stamp it;
+    # stamp here too so "reached first value" is measurable for the wallet
+    # credit path. Set-once and best-effort — must never break the debit.
+    if action in _FOUNDER_COMP_ACTIONS:
+        try:
+            from src.services.activation_tracking import stamp_first_unlock
+            stamp_first_unlock(subscriber_id, db)
+        except Exception as exc:  # noqa: BLE001 — instrumentation must not break unlock
+            logger.warning(
+                "activation stamp on credit-spend unlock failed sub=%s: %s",
+                subscriber_id, exc,
+            )
     return True
 
 

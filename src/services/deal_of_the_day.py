@@ -177,13 +177,20 @@ def get_current_deal(db: Session) -> dict:
 
 
 def main() -> int:
+    import sys
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+        stream=sys.stdout,
+    )
     parser = argparse.ArgumentParser(description="Pick today's deal-of-the-day")
     parser.add_argument("--dry-run", action="store_true", help="Log the pick without writing")
     args = parser.parse_args()
 
     with get_db_context() as db:
         result = select_deal_of_the_day(db, dry_run=args.dry_run)
-    print(result)
+    logger.info("deal_of_the_day result: %s", result)
     return 0
 
 
