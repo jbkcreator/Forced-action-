@@ -7941,3 +7941,49 @@ class ScoringCutoverLog(Base):
             f"<ScoringCutoverLog(id={self.id}, status={self.validation_status}, "
             f"applied={self.applied})>"
         )
+
+
+class VeraFact(Base):
+    """Vera's facts store — the fleet's single source of verified truth.
+
+    Append-only: a fact is never updated in place, only re-verified with a
+    new row (observed_at DESC gives the current value; older rows are
+    history). Freshness is computed at read time from freshness_class +
+    observed_at rather than expired by a background job — an expired fact
+    reads as "unknown because stale" per Vera's constitution, it isn't
+    deleted.
+
+    Vera is the only writer, and only to this table (Agent Lane v2.2 Part 2 —
+    her immutable core is permanently read-only on every business table; the
+    facts directory is her one designated write target). Written through the
+    normal app DB role, never through vera_readonly (which holds no write
+    grants anywhere, including this table) — see
+    docs/agent-lane-data-access-matrix.md.
+    """
+    __tablename__ = "vera_facts"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    fact_key: Mapped[str] = mapped_column(String(120), nullable=False)
+    fact_value: Mapped[str] = mapped_column(Text, nullable=False)
+    value_numeric: Mapped[Optional[Decimal]] = mapped_column(Numeric, nullable=True)
+    county_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    source: Mapped[str] = mapped_column(String(60), nullable=False)
+    method: Mapped[str] = mapped_column(Text, nullable=False)
+    freshness_class: Mapped[str] = mapped_column(String(20), nullable=False)
+    confidence: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+
+    __table_args__ = (
+        Index("ix_vera_facts_key_observed", "fact_key", text("observed_at DESC")),
+        Index("ix_vera_facts_county", "county_id", postgresql_where=text("county_id IS NOT NULL")),
+    )
+
+    def __repr__(self) -> str:
+        return f"<VeraFact(key={self.fact_key!r}, source={self.source!r}, observed_at={self.observed_at})>"
