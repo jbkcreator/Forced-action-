@@ -66,11 +66,37 @@ class TestPickWinner:
                               last_delivered_at=datetime(2026, 1, 1, tzinfo=timezone.utc))
         assert pick_winner([fresh, delivered]).account_id == "fresh"
 
+    def test_founder_outranks_every_other_real_tier(self):
+        """PR #170 review fix: customer_accounts.plan_tier holds the plan_id
+        ('founder_monthly'/'founder_annual'), not the plans.tier bucket
+        ('founder') — previously absent from _TIER_RANK entirely, so a real
+        Founder account ranked 0 and lost contested leads to pro/starter/
+        even free_trial despite paying the highest price on the platform."""
+        pro = Candidate("pro-acct", "pro", headroom=100, last_delivered_at=None)
+        founder_monthly = Candidate("founder-acct", "founder_monthly", headroom=1, last_delivered_at=None)
+        assert pick_winner([pro, founder_monthly]).account_id == "founder-acct"
+
+    def test_founder_annual_ranks_same_as_founder_monthly(self):
+        monthly = Candidate("m", "founder_monthly", headroom=1, last_delivered_at=None)
+        annual = Candidate("a", "founder_annual", headroom=50, last_delivered_at=None)
+        # Same tier rank -> headroom breaks the tie, same as any other tier.
+        assert pick_winner([monthly, annual]).account_id == "a"
+
 
 def test_tier_rank_ordering():
-    assert tier_rank("dominator") > tier_rank("pro") > tier_rank("starter") > tier_rank("free_trial")
+    assert (
+        tier_rank("founder_monthly")
+        == tier_rank("founder_annual")
+        > tier_rank("dominator")
+        > tier_rank("pro")
+        > tier_rank("starter")
+        > tier_rank("free_trial")
+    )
     assert tier_rank(None) == 0
     assert tier_rank("unknown") == 0
+    # Not the plans.tier bucket value — a lookup keyed by "founder" (rather
+    # than the plan_id "founder_monthly"/"founder_annual") must never match.
+    assert tier_rank("founder") == 0
 
 
 class TestVerdictConsumption:

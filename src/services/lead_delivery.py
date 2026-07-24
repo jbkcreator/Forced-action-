@@ -47,7 +47,23 @@ def is_deliverable_verdict(grade: Optional[str], routed_channel: Optional[str]) 
     return routed_channel in _CONTRACTOR_CHANNELS
 
 # Plan-tier priority (tie-breaker 1): higher rank wins first call on a lead.
+#
+# Keyed on customer_accounts.plan_tier values directly (plan_id, e.g.
+# "founder_monthly"/"founder_annual" — NOT the shared "founder" tier bucket
+# on plans.tier), since that's what candidates_for()'s query reads and what
+# tier_rank() is actually called with below. Do not key this by plans.tier;
+# a lookup keyed by "founder" would never match a real account.
+#
+# founder_monthly/founder_annual rank above "dominator" even though
+# "dominator" isn't a seeded plan yet (not present in `plans` today) —
+# Founder ($1,100/mo or $11,000/yr) is currently the highest-priced real
+# plan (pro=$499/mo, starter=$299/mo), so it must outrank every other real
+# tier. Ranking it above the dominator placeholder keeps relative order
+# intact for whenever dominator is actually seeded, without deciding that
+# future price point here.
 _TIER_RANK = {
+    "founder_monthly": 50,
+    "founder_annual": 50,
     "dominator": 40,
     "pro": 30,
     "starter": 20,

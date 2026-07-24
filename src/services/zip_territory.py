@@ -23,14 +23,25 @@ from sqlalchemy.orm import Session
 logger = logging.getLogger(__name__)
 
 
+class ZipTerritoryUnavailableError(Exception):
+    """Raised when a checkout requested a ZIP that could not be claimed.
+
+    Callers (checkout flow) must treat this as fatal to the whole checkout —
+    never activate a subscription/account for a buyer who didn't actually get
+    every ZIP they paid for. See stripe_webhooks._on_checkout_completed.
+    """
+
+
 def claim_zip_territory(
     db: Session, *, zip_code: str, vertical: str, county_id: str,
     subscriber_id: int, now: datetime,
-) -> None:
+) -> bool:
     """Lock (zip_code, vertical, county_id) to subscriber_id.
 
-    No-ops (with a warning log) if the territory is already locked to a
-    different subscriber. Safe to call repeatedly for the same subscriber.
+    Returns True if subscriber_id now holds the territory, False if it is
+    already locked to a different subscriber (a real caller MUST check this —
+    silently proceeding as if the claim succeeded is the exact TOCTOU bug this
+    module exists to close). Safe to call repeatedly for the same subscriber.
     """
     from src.core.models import ZipTerritory
 
@@ -45,7 +56,7 @@ def claim_zip_territory(
     }).scalar()
 
     if won is not None:
-        return  # claimed outright — first-ever lock of this territory, no race possible
+        return True  # claimed outright — first-ever lock of this territory, no race possible
 
     # Row already existed (we lost the insert race, or it's a pre-existing
     # available/grace/locked row from an earlier cycle) — existing-row
@@ -65,15 +76,20 @@ def claim_zip_territory(
             "ZIP %s/%s/%s: insert lost the race but no row found on re-select — "
             "skipping", zip_code, vertical, county_id,
         )
-        return
+        return False
+
+    if territory.subscriber_id == subscriber_id and territory.status == "locked":
+        return True  # already held by this same subscriber — idempotent re-call
 
     if territory.status in ("available", "grace"):
         territory.subscriber_id = subscriber_id
         territory.status = "locked"
         territory.locked_at = now
         territory.grace_expires_at = None
-    else:
-        logger.warning(
-            "ZIP %s/%s/%s already locked by subscriber %s — skipping",
-            zip_code, vertical, county_id, territory.subscriber_id,
-        )
+        return True
+
+    logger.warning(
+        "ZIP %s/%s/%s already locked by subscriber %s — cannot claim for subscriber %s",
+        zip_code, vertical, county_id, territory.subscriber_id, subscriber_id,
+    )
+    return False

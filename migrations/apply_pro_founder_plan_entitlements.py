@@ -15,6 +15,18 @@ entitlement bucket; these three are scaled off it:
 Only backfills rows that are still empty ({}), so it's safe to re-run and
 won't clobber a value set deliberately after this runs.
 
+ALSO backfills customer_accounts.lead_entitlement for existing accounts
+already on these plans. lead_delivery.bucket_for() reads that column's
+per-account snapshot, not plans.entitlements directly — the snapshot is
+only (re)written by revenue_engine.record_subscription_active(), which
+existing paying accounts won't hit again just because plans.entitlements
+changed here. Without this, updating plans.entitlements alone looks like a
+successful repair in the plans table while every existing Pro/Founder
+account keeps its stale {} snapshot and stays excluded from lead delivery
+until Stripe happens to fire a subscription.updated event. Same
+empty-snapshot-only guard, so a deliberately-customized account entitlement
+is never overwritten.
+
 Usage:
     PYTHONPATH=. python migrations/apply_pro_founder_plan_entitlements.py
 """
@@ -51,6 +63,18 @@ def main() -> None:
                 {"entitlements": json.dumps(entitlements), "plan_id": plan_id},
             )
             logger.info("plan %s: %d row(s) updated", plan_id, result.rowcount)
+
+            # Repair the per-account snapshot too — see module docstring.
+            acct_result = conn.execute(
+                text(
+                    "UPDATE customer_accounts SET lead_entitlement = :entitlements "
+                    "WHERE plan_tier = :plan_id AND lead_entitlement = '{}'::jsonb"
+                ),
+                {"entitlements": json.dumps(entitlements), "plan_id": plan_id},
+            )
+            logger.info(
+                "plan %s: %d existing customer_accounts row(s) repaired", plan_id, acct_result.rowcount
+            )
 
     logger.info("pro_founder_plan_entitlements complete.")
 

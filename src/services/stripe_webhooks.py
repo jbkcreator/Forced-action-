@@ -789,11 +789,30 @@ def _on_checkout_completed(session: dict, db: Session, background_tasks=None) ->
         )
 
     # ── Lock ZIP territories (same transaction) ────────────────────────────
-    from src.services.zip_territory import claim_zip_territory
-    for zip_code in zip_codes:
-        claim_zip_territory(
+    # A buyer paid for exclusive territory on every requested ZIP. If ANY of
+    # them is lost to a concurrent checkout (the exact TOCTOU window
+    # claim_zip_territory closes for a single ZIP, but two buyers can still
+    # each win a subset of a multi-ZIP cart), the whole checkout must fail
+    # rather than activate a paying subscriber who didn't get what they paid
+    # for. Raising here propagates to handle_webhook's outer except, which
+    # rolls back this entire transaction — no subscriber, no account
+    # activation, no MRR record for this event. Stripe already has the charge;
+    # recovering it (refund/cancel/notify) is a deliberate follow-up requiring
+    # product/finance sign-off on the recovery policy, not something to
+    # automate silently here.
+    from src.services.zip_territory import ZipTerritoryUnavailableError, claim_zip_territory
+    unclaimed = [
+        zip_code for zip_code in zip_codes
+        if not claim_zip_territory(
             db, zip_code=zip_code, vertical=vertical, county_id=county_id,
             subscriber_id=subscriber.id, now=now,
+        )
+    ]
+    if unclaimed:
+        raise ZipTerritoryUnavailableError(
+            f"checkout for subscriber={subscriber.id} tier={tier} vertical={vertical} "
+            f"county={county_id} could not claim ZIP(s) {unclaimed} — lost to a concurrent "
+            f"checkout; entire checkout rolled back, requires manual recovery"
         )
 
     # Bust zip_availability cache for every (county_id, vertical) pair that was locked.

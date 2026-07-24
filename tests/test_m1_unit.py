@@ -262,6 +262,33 @@ class TestOnCheckoutCompleted:
         claimed_zips = {c.args[1]["zip"] for c in insert_calls}
         assert claimed_zips == {"33601", "33602"}
 
+    @patch("src.services.zip_territory.claim_zip_territory")
+    @patch("src.services.stripe_webhooks.push_subscriber_to_ghl")
+    def test_zip_lost_to_concurrent_checkout_raises_and_stops_activation(self, mock_ghl, mock_claim):
+        """PR #170 review fix: a buyer requesting 2 ZIPs where a concurrent
+        checkout already claimed one of them must NOT end up an active,
+        billed subscriber missing the territory they paid for. Patching
+        claim_zip_territory directly (rather than replicating the exact,
+        order-sensitive db.execute side_effect sequence other tests in this
+        class use) isolates what this test actually verifies: the new
+        raise-on-any-unclaimed-zip behavior in _on_checkout_completed itself.
+        claim_zip_territory's own True/False contract is covered exhaustively
+        in tests/test_zip_territory.py, including a real two-thread
+        concurrency proof — no need to re-derive it here via mocks.
+        """
+        from src.services.stripe_webhooks import _on_checkout_completed
+        from src.services.zip_territory import ZipTerritoryUnavailableError
+
+        mock_claim.side_effect = [True, False]  # first ZIP wins, second is already taken
+
+        db = MagicMock()
+        db.execute.return_value.scalar_one_or_none.return_value = None
+
+        with pytest.raises(ZipTerritoryUnavailableError):
+            _on_checkout_completed(self._session_data(zip_codes="33601,33602"), db)
+
+        assert mock_claim.call_count == 2  # both attempted — not short-circuited on the first loss
+
     @patch("src.services.checkout_recovery.mark_recovered")
     @patch("src.services.stripe_webhooks.push_subscriber_to_ghl")
     def test_existing_available_territory_gets_locked(self, mock_ghl, mock_mark_recovered):
