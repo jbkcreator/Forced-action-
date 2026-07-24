@@ -82,6 +82,7 @@ def execute_batch(items: list[QueueItem], *, batch_id: str) -> BatchResult:
                 "[Relay] item %d already claimed/moved — skipping (idempotency)",
                 item.id,
             )
+            queue.mark_skipped(item.id, "claim_lost_to_concurrent_run")
             result.skipped += 1
             result.processed_ids.append(item.id)
             continue

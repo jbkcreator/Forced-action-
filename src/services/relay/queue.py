@@ -181,22 +181,34 @@ def approved_batch(limit: int = 50) -> list[QueueItem]:
         return [_row_to_item(dict(r)) for r in rows]
 
 
-def try_claim_for_batch(item_id: int, batch_id: str) -> bool:
-    """Atomically claim an 'approved', unclaimed row for a batch run.
+def try_claim_for_batch(item_id: int, batch_id: str, *, stale_after_minutes: int = 10) -> bool:
+    """Atomically claim an 'approved' row for a batch run.
 
     Guards against a double sweep pickup — e.g. two overlapping cron runs
-    both selecting the same approved row before either dispatches it.
+    both selecting the same approved row before either dispatches it — via
+    the batch_id IS NULL half of the WHERE clause. The staleness half
+    additionally allows reclaiming a row whose PREVIOUS claim never
+    resolved to sent/failed (e.g. the claiming process crashed between
+    the claim and mark_sent/mark_failed) — without it, that row would be
+    permanently stuck in 'approved' with a non-null batch_id, since no
+    future sweep could ever claim it again. stale_after_minutes must stay
+    well above any single dispatch's realistic duration.
+
     Returns True if this call claimed the row, False if it was already
-    claimed (or moved out of 'approved') by another run.
+    claimed by another still-live run (or moved out of 'approved').
     """
     with get_db_context() as session:
         result = session.execute(
             text(
                 "UPDATE relay_approval_queue "
                 "SET batch_id = :batch_id, updated_at = now() "
-                "WHERE id = :id AND status = :approved AND batch_id IS NULL"
+                "WHERE id = :id AND status = :approved "
+                "AND (batch_id IS NULL OR updated_at < now() - make_interval(mins => :stale_after))"
             ),
-            {"batch_id": batch_id, "id": item_id, "approved": STATUS_APPROVED},
+            {
+                "batch_id": batch_id, "id": item_id, "approved": STATUS_APPROVED,
+                "stale_after": stale_after_minutes,
+            },
         )
         return result.rowcount > 0
 

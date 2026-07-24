@@ -1491,6 +1491,17 @@ async def slack_kill_command(request: Request):
         raise HTTPException(status_code=401, detail="Invalid Slack signature")
 
     form = parse_qs(raw.decode("utf-8"))
+
+    # Slack slash commands carry the invoking user as a top-level 'user_id'
+    # field (unlike interactive-component payloads, where it's nested under
+    # payload.user.id) — reuses relay_approvers, the same allowlist that
+    # gates /slack/relay-decision, since killing the fleet is at least as
+    # consequential as approving one send.
+    user_id = form.get("user_id", [""])[0]
+    approvers = settings.relay_approvers
+    if approvers and user_id not in approvers:
+        return _slack_ephemeral("Not authorized to issue kill commands.")
+
     text_arg = form.get("text", [""])[0].strip().upper()
     if text_arg not in ("ALL", "RELAY", "VERA", "HUNTER"):
         return _slack_ephemeral(
