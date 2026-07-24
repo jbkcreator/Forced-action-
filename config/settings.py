@@ -549,6 +549,15 @@ class AppSettings(BaseSettings):
 	relay_slack_channel: str = Field(default="", env="RELAY_SLACK_CHANNEL")
 	relay_approvers: list = Field(default=[], env="RELAY_APPROVERS")
 
+	# Relay email channel (RELAY-v2.2 sub-task R2). relay_instantly_campaign_id
+	# is set once after running `python -m src.services.relay --setup-email-channel`
+	# (see src/services/relay/channels_email.py) — unset means the email
+	# channel is not yet provisioned.
+	relay_instantly_campaign_id: Optional[str] = Field(default=None, env="RELAY_INSTANTLY_CAMPAIGN_ID")
+	relay_instantly_sender_email: str = Field(
+		default="noreply@forcedactionleads.com", env="RELAY_INSTANTLY_SENDER_EMAIL"
+	)
+
 	# Cora self-healing (fa034). Default OFF — must be opted in per environment.
 	# When false, src/tasks/cora_self_healing.py is a no-op (returns 0 without
 	# touching DB/Redis). Rollout: ship code → enable in dev → soak in staging

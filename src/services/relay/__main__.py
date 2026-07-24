@@ -1,17 +1,21 @@
 """
-Relay — process entry point (RELAY-v2.2 sub-task R1).
+Relay — process entry point (RELAY-v2.2 sub-tasks R1 + R2).
 
 Usage:
     python -m src.services.relay --health
     python -m src.services.relay --sweep
     python -m src.services.relay --seed --channel noop --recipient test@example.com --payload-json '{"subject": "Hi"}'
+    python -m src.services.relay --setup-email-channel
 
 --health is R1's scaffolding check. --sweep runs one approval-queue sweep
 (what cron calls every 30 minutes — see scripts/cron/crontab.txt).
 --seed is R1's stand-in for Cora (Phase 2, not yet built): it writes a
 'pending' row via src.services.relay.queue.enqueue() and posts it to Slack
 for approval — the exact same call Cora will make later, so nothing here
-changes when she lands.
+changes when she lands. --setup-email-channel is R2's one-time, idempotent
+setup command: finds or creates the "Relay passthrough" Instantly campaign
+and prints the id to set as RELAY_INSTANTLY_CAMPAIGN_ID in .env — see
+src.services.relay.channels_email and RELAY-R2-Implementation-Plan.md.
 
 Modeled on src/agents/vera/__main__.py's CLI shape, but Relay is a
 deterministic non-agent service (see Locked decision #1 in
@@ -26,6 +30,11 @@ import sys
 import uuid
 
 from src.utils.logger import setup_logging
+
+# Import for its registration side effect only — makes the real 'email'
+# channel available in DISPATCHERS before any --sweep/--seed runs (R1's
+# channels.py ships only the 'noop' test channel).
+import src.services.relay.channels_email  # noqa: F401
 
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
@@ -98,6 +107,51 @@ def cmd_sweep() -> int:
     return 0 if not result.halted else 1
 
 
+def cmd_setup_email_channel() -> int:
+    from config.settings import get_settings
+    from src.services import instantly_service as instantly
+    from src.services.relay.channels_email import PASSTHROUGH_CAMPAIGN_NAME
+
+    settings = get_settings()
+
+    existing = [
+        c for c in instantly.list_campaigns()
+        if c.get("name") == PASSTHROUGH_CAMPAIGN_NAME
+    ]
+    if existing:
+        campaign_id = existing[0].get("id")
+        _line(f"{_OK} found existing passthrough campaign id={campaign_id}")
+    else:
+        schedule = {
+            "schedules": [{
+                "name": "always-on",
+                "timing": {"from": "00:00", "to": "23:59"},
+                "days": {str(i): True for i in range(7)},
+                "timezone": "America/Detroit",
+            }],
+        }
+        sequence_steps = [{
+            "type": "email",
+            "delay": 0,
+            "variants": [{"subject": "{{ra_subject}}", "body": "{{ra_body}}"}],
+        }]
+        result = instantly.create_campaign(
+            name=PASSTHROUGH_CAMPAIGN_NAME,
+            schedule=schedule,
+            sequence_steps=sequence_steps,
+            email_list=[settings.relay_instantly_sender_email],
+        )
+        if not result or not result.get("id"):
+            _line(f"{_FAIL} campaign creation failed — check INSTANTLY_API_KEY/INSTANTLY_ENABLED and logs")
+            return 1
+        campaign_id = result["id"]
+        instantly.activate_campaign(campaign_id)
+        _line(f"{_OK} created + activated passthrough campaign id={campaign_id}")
+
+    _line(f"\nSet this in .env, then restart Relay:\n  RELAY_INSTANTLY_CAMPAIGN_ID={campaign_id}\n")
+    return 0
+
+
 def cmd_seed(args: argparse.Namespace) -> int:
     from src.services.relay import queue as relay_queue
     from src.services.relay.slack_post import post_for_approval
@@ -135,6 +189,10 @@ def main(argv: list[str] | None = None) -> int:
         "--seed", action="store_true",
         help="Seed one 'pending' row and post it to Slack for approval (Cora's Phase 2 stand-in) and exit",
     )
+    parser.add_argument(
+        "--setup-email-channel", action="store_true",
+        help="Find or create the Relay passthrough Instantly campaign and print its id (one-time setup) and exit",
+    )
     parser.add_argument("--channel", default="noop", help="Channel for --seed (default: noop)")
     parser.add_argument("--recipient", help="Recipient for --seed (email/phone)")
     parser.add_argument("--payload-json", help="JSON payload for --seed, e.g. '{\"subject\": \"Hi\"}'")
@@ -154,6 +212,9 @@ def main(argv: list[str] | None = None) -> int:
         if not args.recipient:
             parser.error("--seed requires --recipient")
         return cmd_seed(args)
+
+    if args.setup_email_channel:
+        return cmd_setup_email_channel()
 
     parser.print_help()
     return 2

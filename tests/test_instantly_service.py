@@ -255,6 +255,32 @@ class TestCampaignMethods:
         assert result["id"] == "camp-456"
         assert "/duplicate" in mock_req.call_args[0][1]
 
+    @patch("src.services.instantly_service.time.sleep")
+    @patch("src.services.instantly_service.requests.request")
+    def test_list_campaigns_returns_list_body(self, mock_req, mock_sleep, monkeypatch):
+        svc = self._setup(monkeypatch)
+        mock_req.return_value = _mock_resp(200, [{"id": "camp-1"}, {"id": "camp-2"}])
+        result = svc.list_campaigns()
+        assert result == [{"id": "camp-1"}, {"id": "camp-2"}]
+        assert mock_req.call_args[0][0] == "GET"
+        assert "/api/v2/campaigns" in mock_req.call_args[0][1]
+
+    @patch("src.services.instantly_service.time.sleep")
+    @patch("src.services.instantly_service.requests.request")
+    def test_list_campaigns_unwraps_items_key(self, mock_req, mock_sleep, monkeypatch):
+        svc = self._setup(monkeypatch)
+        mock_req.return_value = _mock_resp(200, {"items": [{"id": "camp-1"}]})
+        result = svc.list_campaigns()
+        assert result == [{"id": "camp-1"}]
+
+    def test_list_campaigns_not_configured_returns_empty(self, monkeypatch):
+        monkeypatch.setenv("INSTANTLY_API_KEY", "")
+        monkeypatch.setenv("INSTANTLY_ENABLED", "true")
+        from importlib import reload
+        import config.settings as cs; reload(cs)
+        import src.services.instantly_service as svc; reload(svc)
+        assert svc.list_campaigns() == []
+
 
 # ---------------------------------------------------------------------------
 # Lead methods (mocked HTTP)

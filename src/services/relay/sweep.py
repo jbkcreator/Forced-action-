@@ -14,6 +14,12 @@ import uuid
 from src.services.relay import queue
 from src.services.relay.engine import BatchResult, execute_batch
 
+# Import for its registration side effect only — makes the real 'email'
+# channel (RELAY-v2.2 R2) available in DISPATCHERS whenever this module is
+# imported directly (e.g. by a caller other than __main__.py, which
+# imports it too).
+import src.services.relay.channels_email  # noqa: F401,E402
+
 logger = logging.getLogger(__name__)
 
 
