@@ -94,19 +94,28 @@ class TestZipValidation:
 
 
 class TestProvisioning:
-    def _make_db(self, subscriber, partner_sub=None, existing_territories=None):
+    def _make_db(self, subscriber, partner_sub=None, wins_insert=True, existing_territories=None):
+        """By default every ZIP wins the atomic INSERT outright (first-ever
+        claim), so the fallback FOR UPDATE select is never reached — matching
+        real behavior for a brand-new territory."""
         db = MagicMock()
         db.get.return_value = subscriber
+        db.execute.return_value.scalar_one_or_none.return_value = partner_sub
+        db.execute.return_value.scalar.return_value = 1 if wins_insert else None
 
-        # partner_sub lookup
-        # territory lookups
-        results = [None] * 10  # default: no existing territory
-        if existing_territories:
-            results = existing_territories
-
-        db.execute.return_value.scalar_one_or_none.side_effect = [partner_sub] + results
+        if not wins_insert:
+            results = [None] * 10  # default: no existing territory on fallback SELECT
+            if existing_territories:
+                results = existing_territories
+            db.execute.return_value.scalar_one_or_none.side_effect = [partner_sub] + results
 
         return db
+
+    def _insert_calls(self, db):
+        return [
+            c for c in db.execute.call_args_list
+            if "INSERT INTO zip_territories" in str(c.args[0])
+        ]
 
     def test_tier_flipped_to_partner(self):
         from src.services.partner_tier import provision_partner_access
@@ -124,23 +133,29 @@ class TestProvisioning:
         added_types = [type(c.args[0]).__name__ for c in db.add.call_args_list]
         assert "PartnerSubscription" in added_types
 
-    def test_creates_zip_territory_if_missing(self):
+    def test_claims_zip_territory_via_atomic_insert_when_missing(self):
+        """First-ever claim of each ZIP — wins the INSERT ... ON CONFLICT DO
+        NOTHING outright, no ORM ZipTerritory add, no race window."""
         from src.services.partner_tier import provision_partner_access
         sub = _make_sub(tier="annual_lock")
         db = self._make_db(sub)
         provision_partner_access(db, 1, ["33647", "33602"], "roofing", "fl_hillsborough")
+
+        insert_calls = self._insert_calls(db)
+        assert len(insert_calls) == 2
+        claimed_zips = {c.args[1]["zip"] for c in insert_calls}
+        assert claimed_zips == {"33647", "33602"}
+        # No ORM ZipTerritory objects added — the atomic insert is raw SQL.
         added_types = [type(c.args[0]).__name__ for c in db.add.call_args_list]
-        assert added_types.count("ZipTerritory") == 2
+        assert "ZipTerritory" not in added_types
 
     def test_locks_existing_available_territory(self):
+        """INSERT ... ON CONFLICT loses (row already exists) → falls back to
+        the FOR UPDATE branch, which locks the pre-existing available row."""
         from src.services.partner_tier import provision_partner_access
-        from src.core.models import ZipTerritory
         sub = _make_sub(tier="annual_lock")
         existing_zt = _make_zt("33647", status="available")
-
-        db = MagicMock()
-        db.get.return_value = sub
-        db.execute.return_value.scalar_one_or_none.side_effect = [None, existing_zt]
+        db = self._make_db(sub, wins_insert=False, existing_territories=[existing_zt])
 
         provision_partner_access(db, 1, ["33647"], "roofing", "fl_hillsborough")
         assert existing_zt.status == "locked"

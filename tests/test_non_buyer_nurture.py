@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from unittest.mock import patch
 
-from src.core.models import NonBuyerNurtureSequence, Subscriber
+from src.core.models import EmailOptOut, NonBuyerNurtureSequence, Subscriber
 from src.services import non_buyer_nurture
 
 
@@ -348,6 +348,31 @@ def test_find_candidates_excludes_email_with_paid_subscriber(fresh_db):
     candidates = non_buyer_nurture.find_candidates(fresh_db, limit=10_000)
     emails = {c["email"] for c in candidates}
     assert "alreadypaid@example.com" not in emails
+
+
+def test_find_candidates_excludes_email_opted_out(fresh_db):
+    # ADR 0028 cross-channel suppression: an SMS opt-out cascades into
+    # email_opt_outs, and that must block nurture enrollment too, not just
+    # the DBPR cold-campaign path.
+    now = datetime.now(timezone.utc)
+    fresh_db.add(_free_subscriber("optedout@example.com", created_at=now - timedelta(hours=30)))
+    fresh_db.add(EmailOptOut(email="optedout@example.com", source="cascaded_from_sms"))
+    fresh_db.flush()
+
+    candidates = non_buyer_nurture.find_candidates(fresh_db, limit=10_000)
+    emails = {c["email"] for c in candidates}
+    assert "optedout@example.com" not in emails
+
+
+def test_find_candidates_opt_out_exclusion_is_case_insensitive(fresh_db):
+    now = datetime.now(timezone.utc)
+    fresh_db.add(_free_subscriber("MixedCase@Example.com", created_at=now - timedelta(hours=30)))
+    fresh_db.add(EmailOptOut(email="mixedcase@example.com", source="unsubscribe_link"))
+    fresh_db.flush()
+
+    candidates = non_buyer_nurture.find_candidates(fresh_db, limit=10_000)
+    emails = {c["email"].lower() for c in candidates}
+    assert "mixedcase@example.com" not in emails
 
 
 def test_reconcile_conversions_marks_paid_enrolled_rows_converted(fresh_db):

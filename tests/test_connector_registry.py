@@ -39,10 +39,6 @@ class TestRegistryEntries:
         }
         assert expected.issubset(OUTCOME_CONNECTORS.keys())
 
-    def test_still_unbuilt_connectors_disabled(self):
-        # dor_sale_outcomes has no module yet.
-        assert OUTCOME_CONNECTORS["dor_sale_outcomes"].enabled is False
-
     def test_built_connectors_enabled(self):
         # tax_deed_outcomes, appraiser_sale_outcomes, foreclosure_outcomes, and the
         # label layer modules now exist.
@@ -50,6 +46,12 @@ class TestRegistryEntries:
         assert OUTCOME_CONNECTORS["appraiser_sale_outcomes"].enabled is True
         assert OUTCOME_CONNECTORS["foreclosure_outcomes"].enabled is True
         assert OUTCOME_CONNECTORS["outcome_label_layer"].enabled is True
+
+    def test_dor_sale_outcomes_enabled(self):
+        # Ran end-to-end for both counties on 2026-07-16 (scraper_run_stats ids
+        # 9804/9854, run_success=True, 78,622 rows staged into outcome_candidates)
+        # — go-live condition met, flipped from the prior enabled=False.
+        assert OUTCOME_CONNECTORS["dor_sale_outcomes"].enabled is True
 
     def test_sla_minutes_positive(self):
         for spec in OUTCOME_CONNECTORS.values():
@@ -75,7 +77,7 @@ class TestEnabledConnectors:
         assert set(enabled_connectors().keys()) == {
             "tax_deed_outcomes", "appraiser_sale_outcomes", "foreclosure_outcomes",
             "outcome_label_layer", "deed_flip_outcomes", "probate_lien_outcomes",
-            "lis_pendens_outcomes",
+            "lis_pendens_outcomes", "dor_sale_outcomes",
         }
 
     def test_every_enabled_connector_has_a_cron_entry(self):

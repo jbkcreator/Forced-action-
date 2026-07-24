@@ -3536,6 +3536,45 @@ class SmsDeadLetter(Base):
         return f"<SmsDeadLetter(id={self.id}, phone={self.phone}, reason={self.reason})>"
 
 
+class CheckoutProvisioningFailure(Base):
+    """
+    Durable recovery queue for a checkout that Stripe completed (charge and
+    subscription both real) but whose ZIP-territory provisioning failed and
+    was rolled back — see stripe_webhooks._on_checkout_completed. Written via
+    its own committed session, deliberately independent of the request's main
+    db session, so it survives that session's rollback. This table is the
+    monitored ops queue: ops must actually cancel/refund the Stripe
+    subscription or re-provision, then mark the row resolved via
+    /api/admin/checkout-provisioning-failures — this table only records the
+    fact and the detail, it does not decide or automate the recovery action.
+    """
+    __tablename__ = "checkout_provisioning_failures"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    stripe_customer_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)
+    stripe_subscription_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)
+    email: Mapped[Optional[str]] = mapped_column(String(255))
+    tier: Mapped[Optional[str]] = mapped_column(String(20))
+    vertical: Mapped[Optional[str]] = mapped_column(String(50))
+    county_id: Mapped[Optional[str]] = mapped_column(String(50))
+    requested_zips: Mapped[Optional[list]] = mapped_column(JSONB)
+    unclaimed_zips: Mapped[Optional[list]] = mapped_column(JSONB)
+    reason: Mapped[str] = mapped_column(String(50), nullable=False, default="zip_territory_unavailable")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="open")  # open | resolved
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    resolved_by: Mapped[Optional[str]] = mapped_column(String(100))
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+
+    __table_args__ = (
+        CheckConstraint("status IN ('open', 'resolved')", name="check_checkout_provisioning_status"),
+        Index("idx_checkout_provisioning_status", "status"),
+    )
+
+    def __repr__(self):
+        return f"<CheckoutProvisioningFailure(id={self.id}, status={self.status}, reason={self.reason})>"
+
+
 class ApiUsageLog(Base):
     """
     Per-call cost tracking for Claude, Twilio, and Stripe API usage.
