@@ -544,6 +544,11 @@ class AppSettings(BaseSettings):
 	slack_bot_token: Optional[SecretStr] = Field(default=None, env="SLACK_BOT_TOKEN")
 	slack_signing_secret: Optional[SecretStr] = Field(default=None, env="SLACK_SIGNING_SECRET")
 
+	# Relay approval queue (RELAY-v2.2 sub-task R1). Reuses slack_bot_token /
+	# slack_signing_secret above — no separate Slack app.
+	relay_slack_channel: str = Field(default="", env="RELAY_SLACK_CHANNEL")
+	relay_approvers: list = Field(default=[], env="RELAY_APPROVERS")
+
 	# Cora self-healing (fa034). Default OFF — must be opted in per environment.
 	# When false, src/tasks/cora_self_healing.py is a no-op (returns 0 without
 	# touching DB/Redis). Rollout: ship code → enable in dev → soak in staging
