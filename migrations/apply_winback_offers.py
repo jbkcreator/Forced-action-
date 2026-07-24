@@ -35,6 +35,13 @@ STATEMENTS = [
     """,
     "CREATE INDEX IF NOT EXISTS ix_winback_offers_token ON winback_offers (token)",
     "CREATE INDEX IF NOT EXISTS idx_winback_offers_subscriber_branch ON winback_offers (subscriber_id, branch)",
+    # PR #172 follow-up review: separate from redeemed_at so a failed credit
+    # grant doesn't look "done" — see WinbackOffer's docstring in models.py.
+    "ALTER TABLE winback_offers ADD COLUMN IF NOT EXISTS credits_granted_at TIMESTAMPTZ",
+    # Reconciliation sweep needs to cheaply find redeemed-but-not-yet-credited
+    # zip_released rows.
+    "CREATE INDEX IF NOT EXISTS idx_winback_offers_pending_credit ON winback_offers "
+    "(branch, redeemed_at) WHERE credits_granted_at IS NULL",
 ]
 
 

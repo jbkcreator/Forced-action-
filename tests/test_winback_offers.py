@@ -100,7 +100,8 @@ class TestGrantWinbackCredits:
     def test_grants_credits_once(self, fresh_db, subscriber):
         from src.services.winback_offers import grant_winback_credits
         from sqlalchemy import text
-        grant_winback_credits(subscriber.id, fresh_db)
+        ok = grant_winback_credits(subscriber.id, fresh_db)
+        assert ok is True
         rows = fresh_db.execute(
             text(
                 "SELECT amount FROM wallet_transactions "
@@ -124,6 +125,103 @@ class TestGrantWinbackCredits:
             {"sid": subscriber.id},
         ).fetchall()
         assert len(rows) == 1
+
+    def test_success_stamps_credits_granted_at_on_the_offer(self, fresh_db, subscriber):
+        from src.services.winback_offers import create_or_reuse_offer, redeem_offer, grant_winback_credits
+        from sqlalchemy import text
+        token = create_or_reuse_offer(subscriber.id, "zip_released", fresh_db)
+        redeem_offer(token, fresh_db)
+        grant_winback_credits(subscriber.id, fresh_db, token=token)
+        row = fresh_db.execute(
+            text("SELECT credits_granted_at FROM winback_offers WHERE token = :t"),
+            {"t": token},
+        ).first()
+        assert row[0] is not None
+
+    def test_failed_grant_returns_false_and_leaves_credits_granted_at_null(
+        self, fresh_db, subscriber, monkeypatch
+    ):
+        """
+        Regression (PR #172 follow-up review): a grant failure must not look
+        like success. redeemed_at (set by redeem_offer, tested separately)
+        proves the reactivation happened and must stay set either way, but
+        credits_granted_at must stay NULL so the reconciliation sweep can
+        find and retry this row.
+        """
+        from src.services.winback_offers import create_or_reuse_offer, redeem_offer, grant_winback_credits
+        from sqlalchemy import text
+        import src.services.wallet_engine as wallet_engine
+
+        def _boom(*a, **kw):
+            raise RuntimeError("simulated wallet failure")
+
+        monkeypatch.setattr(wallet_engine, "add_bonus", _boom)
+
+        token = create_or_reuse_offer(subscriber.id, "zip_released", fresh_db)
+        redeem_offer(token, fresh_db)
+        ok = grant_winback_credits(subscriber.id, fresh_db, token=token)
+
+        assert ok is False
+        row = fresh_db.execute(
+            text("SELECT redeemed_at, credits_granted_at FROM winback_offers WHERE token = :t"),
+            {"t": token},
+        ).first()
+        assert row.redeemed_at is not None  # reactivation is still proven
+        assert row.credits_granted_at is None  # but credit was NOT granted
+        no_credit = fresh_db.execute(
+            text("SELECT 1 FROM wallet_transactions WHERE subscriber_id = :sid"),
+            {"sid": subscriber.id},
+        ).first()
+        assert no_credit is None
+
+
+class TestReconcilePendingCreditGrants:
+    def test_retries_a_redeemed_offer_whose_grant_previously_failed(
+        self, fresh_db, subscriber, monkeypatch
+    ):
+        from src.services.winback_offers import (
+            create_or_reuse_offer, redeem_offer, grant_winback_credits,
+            reconcile_pending_credit_grants,
+        )
+        from sqlalchemy import text
+        import src.services.wallet_engine as wallet_engine
+
+        real_add_bonus = wallet_engine.add_bonus
+        monkeypatch.setattr(wallet_engine, "add_bonus", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom")))
+        token = create_or_reuse_offer(subscriber.id, "zip_released", fresh_db)
+        redeem_offer(token, fresh_db)
+        assert grant_winback_credits(subscriber.id, fresh_db, token=token) is False
+
+        # "Wallet service recovers" — reconciliation should now succeed.
+        monkeypatch.setattr(wallet_engine, "add_bonus", real_add_bonus)
+        result = reconcile_pending_credit_grants(fresh_db)
+
+        assert result["checked"] == 1
+        assert result["granted"] == 1
+        assert result["failed"] == 0
+        row = fresh_db.execute(
+            text("SELECT amount FROM wallet_transactions WHERE subscriber_id = :sid"),
+            {"sid": subscriber.id},
+        ).first()
+        assert row[0] == 5
+
+    def test_does_not_touch_zip_held_offers(self, fresh_db, subscriber):
+        """zip_held never has a credit grant to reconcile — only zip_released does."""
+        from src.services.winback_offers import create_or_reuse_offer, redeem_offer, reconcile_pending_credit_grants
+        token = create_or_reuse_offer(subscriber.id, "zip_held", fresh_db)
+        redeem_offer(token, fresh_db)
+        result = reconcile_pending_credit_grants(fresh_db)
+        assert result["checked"] == 0
+
+    def test_already_credited_offers_are_not_reconsidered(self, fresh_db, subscriber):
+        from src.services.winback_offers import (
+            create_or_reuse_offer, redeem_offer, grant_winback_credits, reconcile_pending_credit_grants,
+        )
+        token = create_or_reuse_offer(subscriber.id, "zip_released", fresh_db)
+        redeem_offer(token, fresh_db)
+        grant_winback_credits(subscriber.id, fresh_db, token=token)  # succeeds normally
+        result = reconcile_pending_credit_grants(fresh_db)
+        assert result["checked"] == 0
 
 
 class TestFullRedemptionFlow:

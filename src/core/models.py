@@ -5358,6 +5358,16 @@ class WinbackOffer(Base):
                       never at send time.
     One-time use: `redeemed_at` is set exactly once; a second redemption
     attempt on the same token is a no-op.
+
+    `redeemed_at` and `credits_granted_at` are deliberately separate columns
+    (PR #172 review fix): the webhook's credit grant is a best-effort side
+    effect that can itself fail (wallet write error, transient DB issue).
+    If `redeemed_at` alone marked completion, a failed grant would still
+    look "done" — the token is spent and a webhook retry finds nothing left
+    to redeem, so the customer paid but never got their credits, with no
+    path to recover. Keeping the two separate lets a periodic reconciliation
+    sweep (`winback_offers.reconcile_pending_credit_grants`) find and retry
+    exactly the rows that redeemed successfully but never got credited.
     """
     __tablename__ = "winback_offers"
 
@@ -5370,6 +5380,7 @@ class WinbackOffer(Base):
     )
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     redeemed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    credits_granted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         Index("idx_winback_offers_subscriber_branch", "subscriber_id", "branch"),

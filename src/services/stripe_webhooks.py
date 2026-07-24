@@ -795,6 +795,17 @@ def _on_checkout_completed(session: dict, db: Session, background_tasks=None) ->
     # coupon on the session itself (see /api/checkout); here we only mark the
     # token redeemed. zip_released never had a discount — its 5-credit grant
     # happens ONLY here, not at message-send time.
+    #
+    # redeem_offer() (sets redeemed_at) and grant_winback_credits() (sets
+    # credits_granted_at) are intentionally NOT wrapped so that a grant
+    # failure rolls back the redemption too — grant_winback_credits already
+    # catches its own exceptions and returns False rather than raising, by
+    # design, so it can never poison this savepoint (PR #172 follow-up
+    # review). A failed grant instead leaves redeemed_at set and
+    # credits_granted_at NULL, which reconcile_pending_credit_grants() (run
+    # periodically, see scripts/cron/crontab.txt) finds and retries — so the
+    # benefit is delayed, never lost, without needing to fail the whole
+    # webhook or block Stripe's ack.
     _winback_token = meta.get("winback_token")
     if _winback_token:
         try:
@@ -802,7 +813,7 @@ def _on_checkout_completed(session: dict, db: Session, background_tasks=None) ->
                 from src.services.winback_offers import redeem_offer, grant_winback_credits
                 redeemed = redeem_offer(_winback_token, db)
                 if redeemed and redeemed["branch"] == "zip_released":
-                    grant_winback_credits(redeemed["subscriber_id"], db)
+                    grant_winback_credits(redeemed["subscriber_id"], db, token=_winback_token)
         except Exception:
             logger.error(
                 "winback offer redemption failed for token=%s customer=%s",
