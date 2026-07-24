@@ -73,6 +73,12 @@ WHERE NOT EXISTS (
         SELECT 1 FROM subscribers p
         WHERE lower(p.email) = lower(d.email) AND p.tier <> 'free'
       )
+  -- Cross-channel Do-Not-Contact (ADR 0028): an SMS/email opt-out anywhere
+  -- must block nurture enrollment too, not just the DBPR cold-campaign path.
+  AND NOT EXISTS (
+        SELECT 1 FROM email_opt_outs eo
+        WHERE lower(eo.email) = lower(d.email)
+      )
 ORDER BY d.captured_at DESC
 LIMIT :limit
 """)
@@ -99,8 +105,10 @@ def find_candidates(db, limit: Optional[int] = None) -> list[dict]:
     Eligible non-buyer candidates from the three sources (free-signup, waitlist,
     already-recorded checkout-abandon/retry rows), aged between MIN_AGE_HOURS and
     CAPTURED_WINDOW_DAYS, deduped by email (newest capture wins), newest-first,
-    capped. Excludes once-per-email terminal rows AND any email with a paid
-    subscriber. All filtering/sorting/paging happens in SQL.
+    capped. Excludes once-per-email terminal rows, any email with a paid
+    subscriber, and any email in email_opt_outs (ADR 0028 cross-channel
+    suppression — an SMS opt-out must block nurture enrollment too). All
+    filtering/sorting/paging happens in SQL.
     """
     now = datetime.now(timezone.utc)
     rows = db.execute(_CANDIDATES_SQL, {

@@ -252,6 +252,11 @@ COUNTY_ID=hillsborough
 # dead) + commission_poster (closed_won→post commission). Both idempotent.
 1-59/2 * * * * $PROJECT/scripts/cron/run.sh src.tasks.loan_lane_sweep
 
+# Outcome dispatch sweep (Block 13) — every 2 min. Polls deal_outcome_recorded
+# → outcome_snapshot + outcome_loss_autopsy (dead+lead-fault only). Both
+# idempotent. Decouples the buyer's one-tap outcome from score recalculation.
+1-59/2 * * * * $PROJECT/scripts/cron/run.sh src.tasks.outcome_dispatch_sweep
+
 # Cora anomaly check — volume + no-answer rate monitor — every 15 min
 */15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.cora_anomaly_check
 
@@ -801,13 +806,14 @@ COUNTY_ID=hillsborough
 # fallback for any owner_alert_dispatch row stuck at status='sms_sent' for
 # 5+ minutes with no Telnyx message.finalized delivery-status callback.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.owner_alert_sweep
-# Tiered volume guarantee shortfall sweep — ENABLED LIVE.
-# Issues real Stripe balance credits when a subscriber's closed cycle is short
-# of config/guarantees.py TIER_LEAD_QUOTAS. Cycles are floored at the
-# deliveries-ledger go-live (DELIVERY_TRACKING_START_UTC) so pre-tracking days
-# never count as a false shortfall. Confirm TIER_LEAD_QUOTAS before relying on
-# the amounts; run with --dry-run to preview without touching Stripe.
-0 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.guarantee_shortfall_sweep
+# Tiered volume guarantee shortfall sweep — INTENTIONALLY NOT scheduled yet.
+# config/guarantees.py TIER_LEAD_QUOTAS are placeholder lead-per-cycle counts
+# pending a business decision; enabling this cron would issue real Stripe
+# balance credits off unconfirmed numbers. Re-enable only once all three are
+# true: (1) lead_delivery_sweep has run one full 30-day cycle with real
+# deliveries landing, (2) a --dry-run credit total has been reviewed and
+# approved in writing, (3) Stripe is confirmed in live mode.
+# 0 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.guarantee_shortfall_sweep
 
 # T-B12-07 — Deal-of-the-day daily pick (idempotent, one row per date).
 # Runs after CDS scoring so today's top-CDS undelivered lead is available.

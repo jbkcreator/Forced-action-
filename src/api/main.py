@@ -7,6 +7,7 @@ Endpoints:
     GET  /api/founding-spots       — Founding countdown for landing page
     GET  /api/zip-check            — ZIP availability checker for landing page
     POST /api/checkout             — Create Stripe checkout session
+    GET  /api/test/starter-checkout-link — TEMP: mints a fresh live Starter checkout link on each visit
     GET  /api/feed/{uuid}          — Event Feed for subscribers (paginated leads, sort, search, filter)
     GET  /api/feed/{uuid}/stats    — Aggregate stats for the subscriber's feed
     POST /api/resend-confirmation  — Re-send welcome/confirmation email by feed_uuid
@@ -18,6 +19,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -27,7 +29,7 @@ import stripe
 from fastapi import FastAPI, Header, HTTPException, Request, Depends, Query, Response, BackgroundTasks
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, RedirectResponse
 
 from pydantic import BaseModel, Field, field_validator, model_validator, EmailStr
 from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
@@ -1054,8 +1056,13 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
         line_items=[line_item],
         metadata=checkout_metadata,
         return_url=f"{_s.app_base_url}{_return_path}",
+        allow_promotion_codes=True,
     )
+    # Stripe rejects a session that sets both `allow_promotion_codes` and
+    # `discounts` — a validated win-back token auto-applies its specific
+    # coupon instead of leaving room for the buyer to type an arbitrary one.
     if winback_discounts:
+        _checkout_kwargs.pop("allow_promotion_codes", None)
         _checkout_kwargs["discounts"] = winback_discounts
 
     try:
@@ -1158,6 +1165,65 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
         "amount_total_cents": session.amount_total,
         "is_founding": is_founding,
     }
+
+
+# ---------------------------------------------------------------------------
+# GET /api/test/starter-checkout-link — E2E test router (temporary)
+#
+# A stable, non-expiring URL for manual click-through testing of the Starter
+# purchase path. Stripe Checkout Session URLs expire (hosted-mode sessions
+# max out at 24h), so a link to this endpoint mints a fresh live session on
+# every visit and redirects into it — the endpoint URL itself never goes stale.
+# Hardcodes tier=starter/vertical=roofing so a query-string caller can't spin
+# up a higher-priced live session; only the ZIP is caller-supplied.
+# Remove once the manual live-checkout E2E test is done.
+# ---------------------------------------------------------------------------
+
+@app.get("/api/test/starter-checkout-link")
+def starter_checkout_test_link(
+    zip_code: str = Query(..., alias="zip"),
+    county_id: str = Query("hillsborough"),
+    db: Session = Depends(get_db),
+):
+    if not _ZIP_RE.match(zip_code):
+        raise HTTPException(status_code=400, detail={"error": "invalid_zip", "message": "zip must be 5 digits"})
+
+    _s = get_settings()
+    stripe.api_key = _s.active_stripe_secret_key.get_secret_value()
+
+    try:
+        price_id, _ = get_price_id_for_checkout(db, "starter", "roofing", county_id, "monthly")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail={"error": "invalid_configuration", "message": str(e)})
+    except OperationalError:
+        logger.error("DB error resolving price for starter test checkout link", exc_info=True)
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
+
+    try:
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            ui_mode="hosted",
+            line_items=[{"price": price_id, "quantity": 1}],
+            allow_promotion_codes=True,
+            phone_number_collection={"enabled": True},
+            success_url=f"{_s.app_base_url}/success?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{_s.app_base_url}/",
+            metadata={
+                "tier": "starter",
+                "vertical": "roofing",
+                "county_id": county_id,
+                "zip_codes": zip_code,
+                "manual_test_link": "true",
+            },
+        )
+    except stripe.error.StripeError as e:
+        logger.error("Stripe error creating starter test checkout link: %s", str(e), exc_info=True)
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "payment_gateway_error", "message": "Payment gateway error — please try again"},
+        )
+
+    return RedirectResponse(url=session.url, status_code=307)
 
 
 # ---------------------------------------------------------------------------
@@ -2107,6 +2173,34 @@ def _accelerated_wallet_offer_fields(subscriber, db) -> dict:
     return out
 
 
+def _outcome_state_by_property(db: Session, subscriber_id: int, property_ids) -> dict:
+    """Block 13: latest subscriber-reported outcome_state per property.
+
+    Latest-wins (max id per property). Drives the "reported" badge on the
+    delivered-lead card so a reported lead reflects its state on reload.
+    Best-effort — a failure here must never break the feed.
+    """
+    ids = [p for p in (property_ids or [])]
+    if not ids:
+        return {}
+    from sqlalchemy import text as _sa_text
+    try:
+        rows = db.execute(
+            _sa_text(
+                "SELECT DISTINCT ON (property_id) property_id, outcome_state "
+                "FROM deal_outcomes "
+                "WHERE subscriber_id = :sid AND property_id = ANY(:pids) "
+                "AND outcome_state IS NOT NULL "
+                "ORDER BY property_id, id DESC"
+            ),
+            {"sid": subscriber_id, "pids": ids},
+        ).fetchall()
+        return {r.property_id: r.outcome_state for r in rows}
+    except Exception as exc:
+        logger.warning("outcome_state map failed for sub=%s: %s", subscriber_id, exc)
+        return {}
+
+
 @app.get("/api/feed/{feed_uuid}")
 def event_feed(
     feed_uuid: str,
@@ -2266,6 +2360,9 @@ def event_feed(
                             "type": inc.incident_type,
                             "date": inc.incident_date.isoformat() if inc.incident_date else None,
                         })
+                    _outcome_map_nz = _outcome_state_by_property(
+                        db, subscriber.id, unlocked_ids_no_zip
+                    )
                     for prop, score, owner in unlocked_rows:
                         owner_phone, owner_phone_quality = _resolve_phone_with_quality(owner)
                         owner_email = (owner.email_1 or owner.email_2) if owner else None
@@ -2295,6 +2392,7 @@ def event_feed(
                             "phone": owner_phone,
                             "phone_quality": owner_phone_quality,
                             "email": owner_email,
+                            "outcome_state": _outcome_map_nz.get(prop.id),
                         })
         except Exception as exc:
             logger.warning("free-tier unlocked leads query failed for sub=%s: %s",
@@ -2559,6 +2657,8 @@ def event_feed(
         county_id=subscriber.county_id,
     )
 
+    outcome_by_prop = _outcome_state_by_property(db, subscriber.id, list(property_ids))
+
     leads = []
     for prop, score, owner in rows:
         is_unlocked = (prop.id in unlocked_ids) or (prop.zip in locked_zip_set)
@@ -2592,6 +2692,7 @@ def event_feed(
             "phone_quality": owner_phone_quality if is_unlocked else None,
             "email": owner_email if is_unlocked else None,
             "portfolio_size": portfolio,
+            "outcome_state": outcome_by_prop.get(prop.id),
         })
 
     from src.core.models import WalletBalance as _WalletBalance
@@ -4602,6 +4703,93 @@ class SynthflowInboundPayload(BaseModel):
             return self.call.get("call_id") or self.call.get("id")
         return None
 
+    @property
+    def resolved_intent_slot(self) -> bool:
+        """
+        True when the inbound Synthflow agent's own flow explicitly captured
+        buy-ready intent as a slot (B11-02 signal 5, highest-weighted).
+        Slot name is not yet standardized across flows — check the common
+        candidates the inbound Flow Designer agent may emit.
+        """
+        raw = (
+            self._slot(self.collected_variables, "ready_to_buy", "high_intent", "buy_intent")
+            or self._slot(self.executed_actions, "ready_to_buy", "high_intent", "buy_intent")
+        )
+        return str(raw).strip().lower() in ("yes", "true", "1")
+
+    @property
+    def resolved_transcript_text(self) -> str:
+        from src.services.synthflow_transcript import transcript_to_text
+        return transcript_to_text(self._transcript)
+
+
+def _trigger_hot_inbound_callback(
+    *,
+    db: Session,
+    intent: Dict[str, Any],
+    subscriber_id: Optional[int],
+    vertical: Optional[str],
+    call_id: str,
+) -> None:
+    """
+    Block 11 / B11-03: if the inbound scored hot, publish inbound_hot_callback
+    so the Cora process routes it to the EXISTING new_lead_voice_call graph
+    (Block 2) — zero new call code, consent/compliance/kill-switch reused.
+    decision_id=call_id so B11-04 tracking can join webhook -> event -> graph.
+
+    Publishes via publish_after_commit (not publish_cora_event directly): the
+    request's own transaction — the new/resolved subscriber, SmsOptIn, and the
+    inbound_response row written just before this call — is not yet committed
+    when this function runs (FastAPI's get_db commits only after the endpoint
+    returns). A fast Redis consumer could otherwise pick up the event and hit
+    get_subscriber_profile before that row is visible, aborting the callback
+    graph with subscriber_not_found. Deferring to after_commit guarantees the
+    event is only published once the row is durable.
+    """
+    if not intent.get("is_hot"):
+        return
+    if not subscriber_id:
+        logger.warning(
+            "[SynthflowInbound] hot inbound with no subscriber_id — callback not triggered call_id=%s",
+            call_id,
+        )
+        return
+
+    from src.agents.events.ingestion import publish_after_commit
+
+    publish_after_commit(db, {
+        "event_type": "inbound_hot_callback",
+        "subscriber_id": subscriber_id,
+        "decision_id": call_id,
+        "payload": {
+            "vertical": vertical,
+            "score": intent.get("score"),
+            "matched_signals": intent.get("matched_signals"),
+        },
+    })
+    logger.info(
+        "[SynthflowInbound] inbound_hot_callback queued for after-commit publish sub=%s call_id=%s score=%s",
+        subscriber_id, call_id, intent.get("score"),
+    )
+
+
+def _resolve_inbound_call_id(payload: "SynthflowInboundPayload", raw_body: bytes) -> str:
+    """
+    Resolve a stable, never-null id for one inbound webhook delivery.
+
+    call_id is optional on the wire, but a hot-inbound response row's
+    decision_id must never be NULL — reconciliation joins on it, and SQL
+    never joins NULL to NULL, so a NULL decision_id stays permanently
+    'pending'. When the provider omits an id, derive a deterministic one
+    from the raw request body: a genuine retry resends an identical body
+    and gets the identical id, so both the webhook idempotency check and
+    downstream B11-04 tracking still work; distinct calls hash distinct.
+    Always exactly 36 chars, matching the decision_id VARCHAR(36) columns.
+    """
+    return payload.resolved_call_id or str(
+        uuid.uuid5(uuid.NAMESPACE_URL, raw_body.decode("utf-8", errors="replace"))
+    )
+
 
 def _verify_synthflow_secret(request: Request) -> bool:
     """Accept X-Synthflow-Secret or Authorization: Bearer <secret>."""
@@ -4641,6 +4829,9 @@ async def synthflow_inbound_webhook(request: Request, db: Session = Depends(get_
     from src.services.signup_engine import onboard_inbound_caller
     from src.services.webhook_log import log_webhook_event
 
+    # Block 11 / B11-01 t0: the sub-60s SLA clock starts here, at webhook receipt.
+    inbound_received_at = datetime.now(timezone.utc)
+
     raw_body = await request.body()
 
     if not _verify_synthflow_secret(request):
@@ -4673,15 +4864,16 @@ async def synthflow_inbound_webhook(request: Request, db: Session = Depends(get_
         logger.error("[SynthflowInbound] payload validation failed: %s", exc)
         return {"status": "error", "reason": "invalid_payload"}
 
-    call_id = payload.resolved_call_id
     phone = payload.resolved_phone
+    call_id = _resolve_inbound_call_id(payload, raw_body)
 
-    # Idempotency: reject replays of the same call_id.
-    if call_id:
-        from src.services.webhook_log import already_logged
-        if already_logged(source="synthflow_inbound", source_event_id=call_id):
-            logger.info("[SynthflowInbound] duplicate call_id=%s — no-op", call_id)
-            return {"status": "duplicate", "call_id": call_id}
+    # Idempotency: reject replays of the same call_id. Unconditional now that
+    # call_id is guaranteed non-None — previously an omitted id bypassed this
+    # check entirely, letting retries enqueue duplicate hot-inbound callbacks.
+    from src.services.webhook_log import already_logged
+    if already_logged(source="synthflow_inbound", source_event_id=call_id):
+        logger.info("[SynthflowInbound] duplicate call_id=%s — no-op", call_id)
+        return {"status": "duplicate", "call_id": call_id}
 
     log_webhook_event(
         source="synthflow_inbound",
@@ -4710,7 +4902,49 @@ async def synthflow_inbound_webhook(request: Request, db: Session = Depends(get_
         call_id, phone, result.get("subscriber_id"),
         result.get("is_new"), result.get("lead_count"), result.get("capture_complete"),
     )
-    return {"status": "ok", **result}
+
+    # Block 11 / B11-01: score for high intent inside the sub-60s inbound
+    # window. Scoring only — the B11-03 callback trigger consumes this via
+    # publish_cora_event and reuses Block 2's consent/compliance gates.
+    from src.services.inbound_intent import score_inbound
+    from src.services.phone_utils import normalize as normalize_phone
+
+    # subscribers.phone is stored E.164-normalized, so normalize at this
+    # boundary before scoring — otherwise the known_caller lookup compares a
+    # raw payload string against a normalized column and silently never matches.
+    intent = score_inbound(
+        phone=normalize_phone(phone),
+        zip_code=payload.resolved_zip,
+        vertical=payload.resolved_vertical,
+        transcript=payload.resolved_transcript_text,
+        intent_slot=payload.resolved_intent_slot,
+        db=db,
+    )
+    logger.info(
+        "[SynthflowInbound] intent score call_id=%s sub=%s score=%d is_hot=%s signals=%s",
+        call_id, result.get("subscriber_id"), intent["score"], intent["is_hot"], intent["matched_signals"],
+    )
+
+    if intent["is_hot"]:
+        from src.services.inbound_response_tracking import record_inbound_response
+        record_inbound_response(
+            db=db,
+            subscriber_id=result.get("subscriber_id"),
+            decision_id=call_id,
+            t0=inbound_received_at,
+            score=intent["score"],
+            matched_signals=intent["matched_signals"],
+        )
+
+    _trigger_hot_inbound_callback(
+        db=db,
+        intent=intent,
+        subscriber_id=result.get("subscriber_id"),
+        vertical=payload.resolved_vertical,
+        call_id=call_id,
+    )
+
+    return {"status": "ok", **result, "intent": intent}
 
 
 # ---------------------------------------------------------------------------
@@ -5072,7 +5306,12 @@ async def telnyx_inbound(request: Request, db: Session = Depends(get_db)):
 class DealCaptureRequest(BaseModel):
     feed_uuid: str
     property_id: int
-    deal_size_bucket: str  # 5_10k | 10_25k | 25k_plus | skip
+    # T-B13-01: outcome_state is the one-tap card surface (closed/dead/pending).
+    # deal_size_bucket is the legacy field, still accepted for back-compat; one of
+    # the two must be present. dead_reason is required when outcome_state='dead'.
+    outcome_state: Optional[str] = None  # closed | dead | pending
+    dead_reason: Optional[str] = None
+    deal_size_bucket: Optional[str] = None  # 5_10k | 10_25k | 25k_plus | skip
     deal_amount: Optional[float] = None
     days_to_close: Optional[int] = None
 
@@ -5085,7 +5324,7 @@ def deal_capture(payload: DealCaptureRequest, db: Session = Depends(get_db)):
     fires the annual-at-deal-win push.
     """
     from src.core.models import DealOutcome
-    from src.services import outcome_confidence
+    from src.services import outcome_confidence, outcome_reasons
 
     sub = db.execute(
         select(Subscriber).where(Subscriber.event_feed_uuid == payload.feed_uuid)
@@ -5094,59 +5333,177 @@ def deal_capture(payload: DealCaptureRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=403, detail="Invalid feed_uuid")
 
     valid_buckets = {"5_10k", "10_25k", "25k_plus", "skip"}
-    if payload.deal_size_bucket not in valid_buckets:
-        raise HTTPException(status_code=422, detail=f"deal_size_bucket must be one of {valid_buckets}")
 
-    outcome = DealOutcome(
-        subscriber_id=sub.id,
-        property_id=payload.property_id,
-        deal_size_bucket=payload.deal_size_bucket,
-        deal_amount=payload.deal_amount,
-        deal_date=date.today(),
-        days_to_close=payload.days_to_close,
-        pipeline_stage="closed_lost" if payload.deal_size_bucket == "skip" else "closed_won",
-        county_id=sub.county_id,
-        trade_vertical=sub.vertical,
-        confidence_tier=outcome_confidence.SUBSCRIBER_REPORTED,
-        outcome_source="subscriber_tap",
-    )
-    db.add(outcome)
+    # T-B13-01: the one-tap card posts outcome_state (closed/dead/pending). The
+    # legacy deal_size_bucket path is preserved for back-compat; one of the two
+    # must be present. outcome_state is stored only when the card supplied it, so
+    # legacy rows keep it NULL (and never trip the dead-requires-reason check).
+    dead_reason: Optional[str] = None
+    fault_class: Optional[str] = None
+    stored_outcome_state: Optional[str] = None
+    if payload.outcome_state is not None:
+        if payload.outcome_state not in outcome_reasons.VALID_OUTCOME_STATES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"outcome_state must be one of {sorted(outcome_reasons.VALID_OUTCOME_STATES)}",
+            )
+        state = payload.outcome_state
+        if state == "dead":
+            if payload.dead_reason not in outcome_reasons.VALID_DEAD_REASONS:
+                raise HTTPException(
+                    status_code=422,
+                    detail="dead_reason is required and must be a valid reason when outcome_state is 'dead'",
+                )
+            dead_reason = payload.dead_reason
+            fault_class = outcome_reasons.fault_class_for(dead_reason)
+        if payload.deal_size_bucket is not None and payload.deal_size_bucket not in valid_buckets:
+            raise HTTPException(status_code=422, detail=f"deal_size_bucket must be one of {valid_buckets}")
+        stored_outcome_state = state
+    elif payload.deal_size_bucket in valid_buckets:
+        state = "dead" if payload.deal_size_bucket == "skip" else "closed"
+        # Legacy clients carry no reason taxonomy. Pre-Block-13, every skip
+        # unconditionally fed the learning loop (snapshot + loss autopsy) — now
+        # that dead outcomes are fault-gated, an unset fault_class would silently
+        # drop legacy submissions from scoring. Preserve the old behavior instead.
+        if state == "dead":
+            fault_class = outcome_reasons.LEAD_FAULT
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail="one of outcome_state or deal_size_bucket is required",
+        )
+
+    pipeline_stage = {"closed": "closed_won", "dead": "closed_lost", "pending": "negotiation"}[state]
+
+    # Latest-wins de-dupe: a subscriber re-reporting the same lead updates the
+    # existing subscriber-tap row instead of stacking duplicate outcomes, so the
+    # feed reflects one current outcome per lead (Block 13 follow-up).
+    outcome = db.execute(
+        select(DealOutcome)
+        .where(
+            DealOutcome.subscriber_id == sub.id,
+            DealOutcome.property_id == payload.property_id,
+            DealOutcome.outcome_source == "subscriber_tap",
+        )
+        .order_by(DealOutcome.id.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    is_update = outcome is not None
+    # pipeline_stage (unlike outcome_state) is always populated, including on
+    # the legacy bucket path, so it's the reliable signal that the outcome
+    # actually changed rather than being re-posted unchanged.
+    prev_pipeline_stage = outcome.pipeline_stage if is_update else None
+    if outcome is None:
+        outcome = DealOutcome(
+            subscriber_id=sub.id,
+            property_id=payload.property_id,
+            confidence_tier=outcome_confidence.SUBSCRIBER_REPORTED,
+            outcome_source="subscriber_tap",
+        )
+        db.add(outcome)
+    outcome.deal_size_bucket = payload.deal_size_bucket
+    outcome.deal_amount = payload.deal_amount
+    outcome.deal_date = date.today()
+    outcome.days_to_close = payload.days_to_close
+    outcome.pipeline_stage = pipeline_stage
+    outcome.outcome_state = stored_outcome_state
+    outcome.dead_reason = dead_reason
+    outcome.reason_fault_class = fault_class
+    outcome.county_id = sub.county_id
+    outcome.trade_vertical = sub.vertical
     db.flush()
 
-    # Subscriber-agnostic learning-loop autopsies — run for every outcome,
-    # including ownerless (founder / public-record inferred) rows.
-    # Phase 3 A5: pre-decision snapshot (captures all 6 vertical scores at routing time)
-    try:
-        from src.services.snapshot_service import capture_snapshot
-        capture_snapshot(
-            property_id=outcome.property_id,
-            db=db,
-            deal_outcome_id=outcome.id,
-            selected_vertical=sub.vertical,
-            outcome_status="lost" if payload.deal_size_bucket == "skip" else "funded",
-        )
-    except Exception as exc:
-        logger.warning("[DealCapture] snapshot capture failed: %s", exc)
+    # If a de-dupe update changed the outcome, the learning artifacts captured
+    # for the previous outcome are now stale (capture_snapshot is idempotent on
+    # deal_outcome_id and would otherwise keep the old outcome_status forever).
+    # Clear them so the re-emitted event (or the inline fallback below) captures
+    # fresh against the new outcome.
+    if is_update and prev_pipeline_stage != pipeline_stage:
+        from sqlalchemy import text as _sa_text
+        for _tbl in ("pre_decision_snapshots", "loss_autopsies"):
+            try:
+                db.execute(
+                    _sa_text(f"DELETE FROM {_tbl} WHERE deal_outcome_id = :oid"),
+                    {"oid": outcome.id},
+                )
+            except Exception as exc:
+                logger.warning("[DealCapture] stale %s cleanup failed: %s", _tbl, exc)
 
-    # Phase 3 A1: loss autopsy for closed_lost deals (deal_size_bucket == "skip")
-    if payload.deal_size_bucket == "skip":
-        try:
-            from src.services.loss_autopsy import run_loss_autopsy
-            run_loss_autopsy(
-                property_id=outcome.property_id,
-                trigger_reason="CLOSED_LOST",
-                db=db,
-                deal_outcome_id=outcome.id,
+    # T-B13-01: pending is a non-terminal tap — record it, but fire no
+    # terminal effects (recalculation or interaction feedback).
+    is_terminal = state != "pending"
+
+    # T-B13-02: the heavy recalculation consumers (learning-loop snapshot +
+    # loss autopsy, the latter an inline LLM call) are decoupled. Emit ONE
+    # outcome event to the transactional outbox — committed atomically with this
+    # request's DealOutcome write — and let the outcome dispatch sweep fan it
+    # out to the idempotent poll consumers. Keeps the buyer's tap latency off
+    # score recalculation (§7.1). Consumers route on reason_fault_class so only
+    # lead-fault dead outcomes reach scoring; buyer-neutral is score-protected.
+    if is_terminal:
+        from sqlalchemy import text as _sa_text
+
+        outcome_payload = {
+            "deal_outcome_id": outcome.id,
+            "property_id": outcome.property_id,
+            "subscriber_id": sub.id,
+            "selected_vertical": sub.vertical,
+            "outcome_state": state,
+            "pipeline_stage": pipeline_stage,
+            "dead_reason": dead_reason,
+            "reason_fault_class": fault_class,
+        }
+        # The outbox events table is prospect-scoped (prospect_id NOT NULL).
+        # A subscriber-tap outcome is a delivered lead, so it resolves to a
+        # prospect via property_id; emit the decoupled event in that case.
+        prospect_id = db.execute(
+            _sa_text(
+                "SELECT prospect_id FROM prospects WHERE property_id = :pid "
+                "ORDER BY created_at DESC LIMIT 1"
+            ),
+            {"pid": outcome.property_id},
+        ).scalar()
+        if prospect_id is not None:
+            from src.services.event_bus import emit_event
+            emit_event(
+                db,
+                event_type="outcome.recorded",
+                actor="subscriber_tap",
+                source_component="deal_capture",
+                payload=outcome_payload,
+                prospect_id=prospect_id,
             )
-        except Exception as exc:
-            logger.warning("[DealCapture] loss autopsy failed: %s", exc)
+        else:
+            # No prospect row (e.g. founder/ownerless import) — recalc inline for
+            # this row rather than drop it. Same score-protection routing as the
+            # async consumers, which now raise on a genuine capture failure
+            # (vs. their own idempotent no-op) — each call gets its own
+            # savepoint so a raised failure only rolls back that attempt, not
+            # this whole request's DealOutcome write (bare try/except would
+            # otherwise leave Postgres's transaction aborted for every later
+            # statement, including this request's own commit).
+            from src.consumers import outcome_consumers
+            try:
+                with db.begin_nested():
+                    outcome_consumers.apply_snapshot(db, outcome_payload)
+            except Exception as exc:
+                logger.warning("[DealCapture] inline snapshot failed: %s", exc)
+            try:
+                with db.begin_nested():
+                    outcome_consumers.apply_loss_autopsy(db, outcome_payload)
+            except Exception as exc:
+                logger.warning("[DealCapture] inline loss autopsy failed: %s", exc)
 
-    # Subscriber-only side-effects (win graphic, win story, annual push,
-    # attribution, suppression). No-op for ownerless outcomes — CDE-11.
-    from src.services.deal_outcome_effects import record_outcome_side_effects
-    effects = record_outcome_side_effects(outcome, sub, db)
-    graphic_url: Optional[str] = effects["graphic_url"]
-    annual_offered = effects["annual_offered"]
+    # Subscriber-only interaction feedback (win graphic, win story, annual push,
+    # attribution, suppression) — stays inline: it IS the tap's response, not
+    # recalculation. No-op for ownerless outcomes (CDE-11) and non-terminal taps.
+    graphic_url: Optional[str] = None
+    annual_offered = False
+    if is_terminal:
+        from src.services.deal_outcome_effects import record_outcome_side_effects
+        effects = record_outcome_side_effects(outcome, sub, db)
+        graphic_url = effects["graphic_url"]
+        annual_offered = effects["annual_offered"]
 
     return {
         "ok": True,
@@ -5609,6 +5966,28 @@ def affiliate_ledger(
         raise HTTPException(status_code=500, detail="Failed to load affiliate ledger")
 
 
+@app.get("/api/admin/inbound-velocity")
+def inbound_velocity_stats(
+    db: Session = Depends(get_db),
+    _admin: dict = Depends(get_current_admin),
+):
+    """
+    Block 11 / B11-04 — inbound response-time report. Reconciles any pending
+    rows against agent_decisions, then returns counts, p50/p95 time-to-
+    callback, and outcome rates. Report-only; admin JWT required.
+    """
+    from src.services.inbound_response_tracking import (
+        get_inbound_velocity_stats,
+        sync_inbound_response_outcomes,
+    )
+    try:
+        sync_inbound_response_outcomes(db)
+        return get_inbound_velocity_stats(db)
+    except SQLAlchemyError:
+        logger.exception("inbound_velocity_stats: database error")
+        raise HTTPException(status_code=500, detail="Failed to load inbound velocity stats")
+
+
 @app.get("/api/admin/human-close")
 def list_human_close(
     status: str = "open",
@@ -5851,6 +6230,81 @@ async def nws_alert(request: Request, db: Session = Depends(get_db)):
 
 
 # ── Phase 2B: Admin DLQ review ────────────────────────────────────────────────
+
+@app.get("/api/admin/checkout-provisioning-failures")
+def admin_checkout_provisioning_failures(
+    status: str = "open",
+    limit: int = 50,
+    db: Session = Depends(get_db),
+    _admin: dict = Depends(get_current_admin),
+):
+    """
+    Durable ops recovery queue: checkouts where Stripe completed the charge
+    and subscription but ZIP-territory provisioning failed and was rolled
+    back (src.services.stripe_webhooks._on_checkout_completed). status=open|
+    resolved|all. Ops must actually cancel/refund/re-provision in Stripe and
+    then resolve the row via the POST below — this endpoint only surfaces
+    the queue, it does not automate recovery.
+    """
+    if status not in ("open", "resolved", "all"):
+        raise HTTPException(status_code=422, detail="status must be open|resolved|all")
+    where_clause = "" if status == "all" else "WHERE status = :status"
+    rows = db.execute(
+        text(
+            "SELECT id, stripe_customer_id, stripe_subscription_id, email, tier, vertical, "
+            "county_id, requested_zips, unclaimed_zips, reason, status, created_at, "
+            "resolved_at, resolved_by, notes "
+            f"FROM checkout_provisioning_failures {where_clause} "
+            "ORDER BY created_at DESC LIMIT :limit"
+        ),
+        {"status": status, "limit": min(limit, 200)},
+    ).mappings().all()
+    return {
+        "count": len(rows),
+        "items": [
+            {
+                **dict(r),
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "resolved_at": r["resolved_at"].isoformat() if r["resolved_at"] else None,
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.post("/api/admin/checkout-provisioning-failures/{failure_id}/resolve")
+def admin_resolve_checkout_provisioning_failure(
+    failure_id: int,
+    notes: Optional[str] = None,
+    db: Session = Depends(get_db),
+    _admin: dict = Depends(get_current_admin),
+):
+    """Mark a checkout-provisioning-failure row resolved after ops has
+    actually handled the Stripe side (refund/cancel/re-provision) — this
+    endpoint does not itself touch Stripe, it only records that a human did."""
+    existing = db.execute(
+        text("SELECT status, resolved_at FROM checkout_provisioning_failures WHERE id = :id"),
+        {"id": failure_id},
+    ).first()
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    if existing.status == "resolved":
+        return {"id": failure_id, "status": "resolved", "resolved_at": existing.resolved_at.isoformat()}
+
+    resolved_at = datetime.now(timezone.utc)
+    resolved_by = _admin.get("sub") if isinstance(_admin, dict) else None
+    db.execute(
+        text(
+            "UPDATE checkout_provisioning_failures "
+            "SET status = 'resolved', resolved_at = :resolved_at, resolved_by = :resolved_by, "
+            "    notes = COALESCE(:notes, notes) "
+            "WHERE id = :id"
+        ),
+        {"resolved_at": resolved_at, "resolved_by": resolved_by, "notes": notes, "id": failure_id},
+    )
+    db.commit()
+    return {"id": failure_id, "status": "resolved", "resolved_at": resolved_at.isoformat()}
+
 
 @app.get("/api/admin/dlq")
 def admin_dlq(limit: int = 50, db: Session = Depends(get_db)):

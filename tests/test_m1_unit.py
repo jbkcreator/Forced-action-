@@ -243,33 +243,85 @@ class TestOnCheckoutCompleted:
 
     @patch("src.services.stripe_webhooks.push_subscriber_to_ghl")
     def test_zip_territories_locked(self, mock_ghl):
+        """Both ZIPs win the atomic INSERT ... ON CONFLICT DO NOTHING outright
+        (first-ever claim, no existing row) — no ORM ZipTerritory add, no
+        fallback SELECT needed. Verified via the raw INSERT statements."""
         from src.services.stripe_webhooks import _on_checkout_completed
 
         db = MagicMock()
         db.execute.return_value.scalar_one_or_none.return_value = None
+        db.execute.return_value.scalar.return_value = 1  # every INSERT wins
 
         _on_checkout_completed(self._session_data(zip_codes="33601,33602"), db)
 
-        # db.add called at least twice (subscriber + 2 territories)
-        assert db.add.call_count >= 3
+        insert_calls = [
+            c for c in db.execute.call_args_list
+            if "INSERT INTO zip_territories" in str(c.args[0])
+        ]
+        assert len(insert_calls) == 2
+        claimed_zips = {c.args[1]["zip"] for c in insert_calls}
+        assert claimed_zips == {"33601", "33602"}
 
+    @patch("src.services.zip_territory.claim_zip_territory")
     @patch("src.services.stripe_webhooks.push_subscriber_to_ghl")
-    def test_existing_available_territory_gets_locked(self, mock_ghl):
+    def test_zip_lost_to_concurrent_checkout_raises_and_stops_activation(self, mock_ghl, mock_claim):
+        """PR #170 review fix: a buyer requesting 2 ZIPs where a concurrent
+        checkout already claimed one of them must NOT end up an active,
+        billed subscriber missing the territory they paid for. Patching
+        claim_zip_territory directly (rather than replicating the exact,
+        order-sensitive db.execute side_effect sequence other tests in this
+        class use) isolates what this test actually verifies: the new
+        raise-on-any-unclaimed-zip behavior in _on_checkout_completed itself.
+        claim_zip_territory's own True/False contract is covered exhaustively
+        in tests/test_zip_territory.py, including a real two-thread
+        concurrency proof — no need to re-derive it here via mocks.
+        """
+        from src.services.stripe_webhooks import _on_checkout_completed
+        from src.services.zip_territory import ZipTerritoryUnavailableError
+
+        mock_claim.side_effect = [True, False]  # first ZIP wins, second is already taken
+
+        db = MagicMock()
+        db.execute.return_value.scalar_one_or_none.return_value = None
+
+        with pytest.raises(ZipTerritoryUnavailableError):
+            _on_checkout_completed(self._session_data(zip_codes="33601,33602"), db)
+
+        assert mock_claim.call_count == 2  # both attempted — not short-circuited on the first loss
+
+    @patch("src.services.checkout_recovery.mark_recovered")
+    @patch("src.services.stripe_webhooks.push_subscriber_to_ghl")
+    def test_existing_available_territory_gets_locked(self, mock_ghl, mock_mark_recovered):
+        """INSERT ... ON CONFLICT loses (row already exists) → falls back to
+        the FOR UPDATE branch, which locks the pre-existing available row.
+
+        Two things are mocked out that are unrelated to what this test
+        verifies but sit in the same call path: `background_tasks` is a real
+        mock so the deferred half (GHL, emails, attribution, ...) is
+        scheduled via `.add_task()` instead of running inline on this same
+        session, and `checkout_recovery.mark_recovered` (its own internal
+        scalar_one_or_none lookup) is stubbed out. Without both, the
+        side_effect sequence below — scoped to just the fast-path checkout +
+        ZIP-lock calls — runs out early and raises StopIteration.
+        """
         from src.services.stripe_webhooks import _on_checkout_completed
 
         territory = _make_territory(status="available")
         subscriber = _make_subscriber(id=99)
 
         db = MagicMock()
-        # founding row → subscriber by stripe_id → subscriber by email → territory
+        db.execute.return_value.scalar.return_value = None  # insert lost the race
+        # founding row → subscriber by stripe_id → subscriber by email →
+        # non_buyer_nurture.mark_converted lookup → territory
         db.execute.return_value.scalar_one_or_none.side_effect = [
             None,        # no founding row
             None,        # no existing subscriber by stripe_customer_id
             None,        # no existing subscriber by email → create new
-            territory,   # existing available territory
+            None,        # non_buyer_nurture.mark_converted — never enrolled
+            territory,   # existing available territory, found on fallback SELECT
         ]
 
-        _on_checkout_completed(self._session_data(zip_codes="33601"), db)
+        _on_checkout_completed(self._session_data(zip_codes="33601"), db, background_tasks=MagicMock())
 
         assert territory.status == "locked"
         assert territory.locked_at is not None

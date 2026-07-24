@@ -663,6 +663,28 @@ def _build_signal_composition(session, run_date: date, county_id: str) -> dict:
     return result
 
 
+def _build_inbound_velocity_section(session) -> dict:
+    """
+    Block 11 / B11-04 — inbound response-time report section. Global metric
+    (not county-scoped): a hot inbound call is a hot inbound regardless of
+    which county its ZIP falls in. Report-only — see SPEC.md ticket 04.
+    """
+    from src.services.inbound_response_tracking import (
+        get_inbound_velocity_stats,
+        sync_inbound_response_outcomes,
+    )
+    try:
+        # Reconcile writes + commits — keep that off the shared report-building
+        # session (which other, read-only, section builders share) by giving
+        # it its own session. The report read then runs on the passed session.
+        with get_db_context() as sync_session:
+            sync_inbound_response_outcomes(sync_session)
+        return get_inbound_velocity_stats(session)
+    except Exception:
+        logger.warning("_build_inbound_velocity_section failed", exc_info=True)
+        return {}
+
+
 def build_report(run_date: date, county_id: str) -> dict:
     errors = []
     with get_db_context() as session:
@@ -678,6 +700,7 @@ def build_report(run_date: date, county_id: str) -> dict:
         signal_composition      = _build_signal_composition(session, run_date, county_id)
         gold_delta              = _build_gold_delta(session, run_date, county_id)
         phone_coverage          = _build_phone_coverage(session, run_date, county_id)
+        inbound_velocity        = _build_inbound_velocity_section(session)
 
     return {
         "run_date":              run_date,
@@ -695,6 +718,7 @@ def build_report(run_date: date, county_id: str) -> dict:
         "signal_composition":    signal_composition,
         "gold_delta":            gold_delta,
         "phone_coverage":        phone_coverage,
+        "inbound_velocity":      inbound_velocity,
         "errors":                errors,
     }
 
@@ -863,6 +887,25 @@ def write_csv(report: dict, path: Path) -> None:
                 w.writerow([f"WARNING: {err}"])
         else:
             w.writerow(["No errors or alerts."])
+        w.writerow([])
+
+        # ── Section 11: Inbound Velocity (Block 11, global — not county-scoped) ──
+        w.writerow(["INBOUND VELOCITY (hot inbound calls, all counties)"])
+        iv = report.get("inbound_velocity") or {}
+        if iv.get("total"):
+            w.writerow(["Metric", "Value"])
+            w.writerow(["Hot inbounds", f"{iv['total']:,}"])
+            w.writerow(["Called", f"{iv['called']:,}"])
+            w.writerow(["Consent blocked", f"{iv['consent_blocked']:,}"])
+            w.writerow(["DNC blocked", f"{iv['dnc_blocked']:,}"])
+            w.writerow(["Failed", f"{iv['failed']:,}"])
+            w.writerow(["Hot-callback rate", f"{iv['hot_callback_rate'] * 100:.1f}%"])
+            p50 = iv.get("p50_seconds")
+            p95 = iv.get("p95_seconds")
+            w.writerow(["p50 time-to-callback", f"{p50:.0f}s" if p50 is not None else "—"])
+            w.writerow(["p95 time-to-callback", f"{p95:.0f}s" if p95 is not None else "—"])
+        else:
+            w.writerow(["No hot inbound calls recorded."])
 
 
 # ---------------------------------------------------------------------------

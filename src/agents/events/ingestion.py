@@ -107,6 +107,7 @@ def _publish_via_postgres(event: Dict[str, Any]) -> None:
 				subscriber_id=event.get("subscriber_id"),
 				payload=event.get("payload") or {},
 				idempotency_key=event.get("idempotency_key"),
+				decision_id=event.get("decision_id"),
 				status="pending",
 			)
 			session.add(row)
@@ -166,6 +167,7 @@ def _sweep_postgres_queue() -> int:
 						"subscriber_id": row.subscriber_id,
 						"payload": row.payload or {},
 						"idempotency_key": row.idempotency_key,
+						"decision_id": row.decision_id,
 					}
 					dispatch_event(event)
 					row.status = "done"

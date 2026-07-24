@@ -2565,6 +2565,7 @@ class CoraEventQueue(Base):
     subscriber_id: Mapped[Optional[int]] = mapped_column(Integer)
     payload: Mapped[Optional[dict]] = mapped_column(JSONB)
     idempotency_key: Mapped[Optional[str]] = mapped_column(Text)
+    decision_id: Mapped[Optional[str]] = mapped_column(String(36))  # preserved across the fallback path so downstream joins survive Redis-down
     status: Mapped[str] = mapped_column(Text, nullable=False, default="pending")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
@@ -3105,6 +3106,15 @@ class DealOutcome(Base):
     lead_source: Mapped[Optional[str]] = mapped_column(String(50))  # which signal drove the lead
     days_to_close: Mapped[Optional[int]] = mapped_column(Integer)
     pipeline_stage: Mapped[Optional[str]] = mapped_column(String(30))  # lead / contacted / qualified / proposal / negotiation / closed_won / closed_lost
+    # T-B13-01 — one-tap buyer outcome on the delivered-lead card.
+    # outcome_state is the buyer-facing tap (closed/dead/pending); pipeline_stage
+    # is the derived stage kept for existing consumers. dead_reason is REQUIRED
+    # when outcome_state='dead' (enforced at the API, mirrored by a check
+    # constraint). reason_fault_class splits dead reasons into lead_fault (feeds
+    # the CDS retune) vs buyer_neutral (score-protected, buyer-side log only).
+    outcome_state: Mapped[Optional[str]] = mapped_column(String(10))  # closed / dead / pending
+    dead_reason: Mapped[Optional[str]] = mapped_column(String(30))
+    reason_fault_class: Mapped[Optional[str]] = mapped_column(String(15))  # lead_fault / buyer_neutral
     # fa056 — Stage 10 pricing cohort activation gate columns
     county_id: Mapped[Optional[str]] = mapped_column(String(50))
     trade_vertical: Mapped[Optional[str]] = mapped_column(String(50))
@@ -3125,6 +3135,20 @@ class DealOutcome(Base):
             name="ck_deal_outcomes_confidence_tier",
         ),
         Index("idx_deal_outcome_pipeline_stage", "pipeline_stage"),
+        # T-B13-01 — buyer outcome tap constraints + retune-routing index.
+        CheckConstraint(
+            "outcome_state IS NULL OR outcome_state IN ('closed','dead','pending')",
+            name="ck_deal_outcomes_outcome_state",
+        ),
+        CheckConstraint(
+            "reason_fault_class IS NULL OR reason_fault_class IN ('lead_fault','buyer_neutral')",
+            name="ck_deal_outcomes_reason_fault_class",
+        ),
+        CheckConstraint(
+            "outcome_state <> 'dead' OR dead_reason IS NOT NULL",
+            name="ck_deal_outcomes_dead_requires_reason",
+        ),
+        Index("idx_deal_outcomes_fault_class", "reason_fault_class"),
         Index("idx_deal_outcomes_county_vertical", "county_id", "trade_vertical"),
         Index("idx_deal_outcomes_confidence_tier", "confidence_tier"),
         Index(
@@ -3573,6 +3597,45 @@ class SmsDeadLetter(Base):
 
     def __repr__(self):
         return f"<SmsDeadLetter(id={self.id}, phone={self.phone}, reason={self.reason})>"
+
+
+class CheckoutProvisioningFailure(Base):
+    """
+    Durable recovery queue for a checkout that Stripe completed (charge and
+    subscription both real) but whose ZIP-territory provisioning failed and
+    was rolled back — see stripe_webhooks._on_checkout_completed. Written via
+    its own committed session, deliberately independent of the request's main
+    db session, so it survives that session's rollback. This table is the
+    monitored ops queue: ops must actually cancel/refund the Stripe
+    subscription or re-provision, then mark the row resolved via
+    /api/admin/checkout-provisioning-failures — this table only records the
+    fact and the detail, it does not decide or automate the recovery action.
+    """
+    __tablename__ = "checkout_provisioning_failures"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    stripe_customer_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)
+    stripe_subscription_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)
+    email: Mapped[Optional[str]] = mapped_column(String(255))
+    tier: Mapped[Optional[str]] = mapped_column(String(20))
+    vertical: Mapped[Optional[str]] = mapped_column(String(50))
+    county_id: Mapped[Optional[str]] = mapped_column(String(50))
+    requested_zips: Mapped[Optional[list]] = mapped_column(JSONB)
+    unclaimed_zips: Mapped[Optional[list]] = mapped_column(JSONB)
+    reason: Mapped[str] = mapped_column(String(50), nullable=False, default="zip_territory_unavailable")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="open")  # open | resolved
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    resolved_by: Mapped[Optional[str]] = mapped_column(String(100))
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+
+    __table_args__ = (
+        CheckConstraint("status IN ('open', 'resolved')", name="check_checkout_provisioning_status"),
+        Index("idx_checkout_provisioning_status", "status"),
+    )
+
+    def __repr__(self):
+        return f"<CheckoutProvisioningFailure(id={self.id}, status={self.status}, reason={self.reason})>"
 
 
 class ApiUsageLog(Base):
@@ -4045,6 +4108,43 @@ class AgentDecision(Base):
 
     def __repr__(self):
         return f"<AgentDecision(id={self.decision_id[:8]}, graph={self.graph_name}, status={self.terminal_status})>"
+
+
+class InboundResponse(Base):
+    """
+    Block 11 / B11-04 — one row per hot inbound call, tracking time-to-callback.
+
+    t0 = webhook_log.created_at (inbound call arrived), copied at score time.
+    t1 = callback resolution time, backfilled from agent_decisions.completed_at
+    (decision_id == this row's decision_id) once the shared new_lead_voice_call
+    graph run finishes — report-only optimization; no closed loop.
+    """
+    __tablename__ = "inbound_response"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("subscribers.id"), nullable=True, index=True
+    )
+    decision_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)  # == call_id; join key to agent_decisions
+    t0: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    t1: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    score: Mapped[int] = mapped_column(Integer, nullable=False)
+    matched_signals: Mapped[Optional[list]] = mapped_column(JSONB)
+    outcome: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")  # pending|called|consent_blocked|dnc_blocked|failed
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "outcome IN ('pending', 'called', 'consent_blocked', 'dnc_blocked', 'failed')",
+            name="check_inbound_response_outcome",
+        ),
+        Index("idx_inbound_response_created_at", "created_at"),
+    )
+
+    def __repr__(self):
+        return f"<InboundResponse(id={self.id}, decision_id={self.decision_id}, outcome={self.outcome})>"
 
 
 class QuoraQuestion(Base):
@@ -6841,7 +6941,8 @@ class ProspectEvent(Base):
             "'broker.transition',"
             "'sms.sent','sms.reply',"
             "'commission.posted',"
-            "'delivery.sent'"
+            "'delivery.sent',"
+            "'outcome.recorded'"
             ")",
             name="ck_events_event_type",
         ),
