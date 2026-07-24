@@ -633,7 +633,7 @@ class AppSettings(BaseSettings):
 	# integration was dropped — unsupported for content pages, was a dead stub.
 	seo_eligibility_floor: int = Field(default=25, env="SEO_ELIGIBILITY_FLOOR")
 	seo_output_dir: str = Field(default="dist/seo/florida", env="SEO_OUTPUT_DIR")
-	seo_site_base_url: str = Field(default="https://www.forcedaction.com", env="SEO_SITE_BASE_URL")
+	seo_site_base_url: str = Field(default="https://forcedactionleads.com", env="SEO_SITE_BASE_URL")
 	seo_retire_hysteresis_runs: int = Field(default=2, env="SEO_RETIRE_HYSTERESIS_RUNS")
 
 
