@@ -342,6 +342,35 @@ def _read_stale_cron() -> list:
     return stale
 
 
+def _revenue_abstained(row: Optional[Mapping]) -> bool:
+    """Pure. A row can exist with no value_numeric — V3's Stripe-outage
+    abstention fact ("stripe unreachable") — which must read the same as no
+    row at all, not as a verified zero."""
+    return row is None or row.get("value_numeric") is None
+
+
+def _compute_unchecked(
+    deploy_drift: Optional[Mapping],
+    paying_no_access: Optional[Mapping],
+    access_not_paying: Optional[Mapping],
+    mrr_drift: Optional[Mapping],
+) -> list[str]:
+    """Pure. Which sections had no fresh, real fact to check (V2/V3 didn't
+    run / went stale, V2 abstained with drift='unknown', or V3 abstained
+    with a Stripe-outage placeholder fact carrying no value_numeric)."""
+    unchecked: list[str] = []
+    drift_value = deploy_drift.get("fact_value") if deploy_drift else None
+    if drift_value in (None, "unknown"):
+        unchecked.append("deploy (V2)")
+    if (
+        _revenue_abstained(paying_no_access)
+        and _revenue_abstained(access_not_paying)
+        and _revenue_abstained(mrr_drift)
+    ):
+        unchecked.append("revenue (V3)")
+    return unchecked
+
+
 def run_discrepancy_digest() -> int:
     """Entry point for `python -m src.agents.vera --promise-digest`."""
     from src.services.kill_switch_service import get_kill_switch_status
@@ -362,14 +391,7 @@ def run_discrepancy_digest() -> int:
     stale_cron = _read_stale_cron()
     promises = open_promises()
 
-    # Which sections had no fresh fact to check (V2/V3 didn't run / went stale,
-    # or V2 abstained with drift='unknown' — repo not on host / git failed).
-    unchecked = []
-    drift_value = deploy_drift.get("fact_value") if deploy_drift else None
-    if drift_value in (None, "unknown"):
-        unchecked.append("deploy (V2)")
-    if paying_no_access is None and access_not_paying is None and mrr_drift is None:
-        unchecked.append("revenue (V3)")
+    unchecked = _compute_unchecked(deploy_drift, paying_no_access, access_not_paying, mrr_drift)
 
     discrepancies = build_discrepancies(
         deploy_drift, pending_migrations, stale_cron,

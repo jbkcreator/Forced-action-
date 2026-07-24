@@ -9,10 +9,12 @@ run_live_state() need a live vera_readonly connection and are exercised via
 """
 from datetime import date, datetime, timedelta, timezone
 
+import src.agents.vera.checks.live_state as live_state
 from src.agents.vera.checks.live_state import (
     CronBeat,
     _classify_drift,
     _extract_migration_targets,
+    _off_day_pairs,
     _scheduled_source_types,
     render_live_state_report,
 )
@@ -171,6 +173,37 @@ def test_render_live_state_report_formats_age_in_hours_not_raw_minutes():
     assert "1834 min" not in body
     assert "30.6h" in body
     assert "SLA = max time allowed" in body  # the legend line
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Regression: PR #173 review — off-day sources must not leave yesterday's
+# stale verdict standing forever (live_state.py:336-384)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_off_day_pairs_includes_multi_county_source_on_its_off_day():
+    # "violations" is off on Sunday (weekday 6) and runs both counties.
+    sunday = datetime(2026, 7, 26, tzinfo=timezone.utc)
+    pairs = _off_day_pairs(sunday)
+    assert ("violations", "hillsborough") in pairs
+    assert ("violations", "pinellas") in pairs
+
+
+def test_off_day_pairs_excludes_source_on_a_scheduled_day():
+    monday = datetime(2026, 7, 27, tzinfo=timezone.utc)
+    pairs = _off_day_pairs(monday)
+    assert not any(source == "violations" for source, _county in pairs)
+
+
+def test_write_off_day_facts_writes_not_scheduled_today_not_stale(monkeypatch):
+    calls = []
+
+    def _fake_write_fact(fact_key, fact_value, **kwargs):
+        calls.append((fact_key, fact_value))
+
+    monkeypatch.setattr(live_state, "write_fact", _fake_write_fact)
+    live_state._write_off_day_facts([("violations", "hillsborough")])
+
+    assert calls == [("cron.violations.freshness", "not_scheduled_today")]
 
 
 def test_render_live_state_report_explains_missing_repo_dir_instead_of_bare_unknown():

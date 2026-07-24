@@ -9,8 +9,11 @@ run_revenue_truth() themselves need a live Stripe key + vera_readonly
 connection and are exercised via `python -m src.agents.vera --revenue-truth`
 in staging, same as V2's DB-touching functions.
 """
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
+from decimal import Decimal
 
+import src.agents.vera.checks.revenue_truth as revenue_truth
 from src.agents.vera.checks.revenue_truth import (
     MrrResult,
     PaymentActivityResult,
@@ -25,6 +28,7 @@ from src.agents.vera.checks.revenue_truth import (
     _select_prior_day_row,
     _stripe_mrr,
     _summarize_refunds_disputes,
+    check_subscriber_reconciliation,
     render_revenue_truth_report,
 )
 
@@ -442,3 +446,152 @@ def test_render_revenue_truth_report_html_surfaces_abstention_warning():
         reconciliation, mrr, 200, payments, refunds_disputes, report_date=date(2026, 7, 23),
     )[2]
     assert "STRIPE UNREACHABLE" in html_body
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Regression: PR #173 review — Stripe outages must never persist as verified
+# zero-valued facts (revenue_truth.py:224-236,265-293,520-542,583-594)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _FactRecorder:
+    """Captures every write_fact() call so fact-writer functions can be
+    tested without a live DB — mirrors the shape facts.write_fact() accepts."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, fact_key, fact_value, *, source, method, freshness_class,
+                 value_numeric=None, county_id=None, confidence=None):
+        self.calls.append({"fact_key": fact_key, "fact_value": fact_value,
+                            "value_numeric": value_numeric})
+
+    def by_key(self, fact_key):
+        return next(c for c in self.calls if c["fact_key"] == fact_key)
+
+
+def test_write_reconciliation_facts_no_zero_on_stripe_outage(monkeypatch):
+    recorder = _FactRecorder()
+    monkeypatch.setattr(revenue_truth, "write_fact", recorder)
+    result = ReconciliationResult(
+        paying_no_access_count=0, paying_no_access_sample_ids=[],
+        access_not_paying_count=0, access_not_paying_sample_ids=[],
+        access_not_paying_details=[], active_subscriptions_by_customer=None,
+        stripe_ok=False,
+    )
+    revenue_truth._write_reconciliation_facts(result)
+    for key in (
+        "revenue.reconciliation.paying_no_access.count",
+        "revenue.reconciliation.access_not_paying.count",
+    ):
+        call = recorder.by_key(key)
+        assert call["value_numeric"] is None
+        assert call["fact_value"] == "stripe unreachable"
+
+
+def test_write_payment_activity_facts_no_zero_on_stripe_outage(monkeypatch):
+    recorder = _FactRecorder()
+    monkeypatch.setattr(revenue_truth, "write_fact", recorder)
+    revenue_truth._write_payment_activity_facts(PaymentActivityResult(stripe_ok=False))
+    for call in recorder.calls:
+        assert call["value_numeric"] is None
+        assert call["fact_value"] == "stripe unreachable"
+    assert len(recorder.calls) == 8
+
+
+def test_write_refunds_disputes_facts_no_zero_on_stripe_outage(monkeypatch):
+    recorder = _FactRecorder()
+    monkeypatch.setattr(revenue_truth, "write_fact", recorder)
+    revenue_truth._write_refunds_disputes_facts(RefundsDisputesResult(stripe_ok=False))
+    for call in recorder.calls:
+        assert call["value_numeric"] is None
+        assert call["fact_value"] == "stripe unreachable"
+    assert len(recorder.calls) == 4
+
+
+def test_write_reconciliation_facts_writes_real_values_when_stripe_ok(monkeypatch):
+    recorder = _FactRecorder()
+    monkeypatch.setattr(revenue_truth, "write_fact", recorder)
+    result = ReconciliationResult(
+        paying_no_access_count=2, paying_no_access_sample_ids=["cus_1"],
+        access_not_paying_count=0, access_not_paying_sample_ids=[],
+        access_not_paying_details=[], active_subscriptions_by_customer={},
+    )
+    revenue_truth._write_reconciliation_facts(result)
+    call = recorder.by_key("revenue.reconciliation.paying_no_access.count")
+    assert call["value_numeric"] == Decimal(2)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Regression: PR #173 review — trial subscribers falsely flagged
+# access_not_paying (revenue_truth.py:152-170,188-202,216-242)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_access_not_paying_does_not_flag_active_trial_subscriber():
+    # Local Subscriber.status is 'active' at checkout even during a trial
+    # (fa048); Stripe's own subscription stays 'trialing'. The entitled set
+    # passed in here must be active MERGED with trialing (what
+    # check_subscriber_reconciliation() now builds) — a trialing-only
+    # customer must not be flagged as a free rider.
+    entitled = {"cus_trial": {"status": "trialing"}}
+    active_db_subscribers = [
+        {"stripe_customer_id": "cus_trial", "stripe_subscription_id": "sub_trial", "status": "active"},
+    ]
+    assert _classify_access_not_paying(entitled, active_db_subscribers) == []
+
+
+def test_access_not_paying_still_flags_customer_absent_from_entitled_set():
+    entitled = {"cus_trial": {"status": "trialing"}}
+    active_db_subscribers = [
+        {"stripe_customer_id": "cus_ghost", "stripe_subscription_id": "sub_ghost", "status": "active"},
+    ]
+    flagged = _classify_access_not_paying(entitled, active_db_subscribers)
+    assert flagged == [{"customer_id": "cus_ghost", "reason": "not_active_in_stripe"}]
+
+
+@contextmanager
+def _fake_session_scope(rows):
+    class _Result:
+        def mappings(self):
+            return self
+
+        def all(self):
+            return rows
+
+    class _Session:
+        def execute(self, *_args, **_kwargs):
+            return _Result()
+
+    yield _Session()
+
+
+def test_check_subscriber_reconciliation_merges_trialing_into_entitled_set(monkeypatch):
+    # End-to-end (with Stripe/DB calls monkeypatched): a subscriber marked
+    # locally active whose only Stripe subscription is 'trialing' must not
+    # be reported as access_not_paying.
+    monkeypatch.setattr(revenue_truth, "_fetch_active_stripe_subscriptions", lambda: {})
+    monkeypatch.setattr(
+        revenue_truth, "_fetch_trialing_stripe_subscriptions",
+        lambda: {"cus_trial": {}},
+    )
+    rows = [
+        {"stripe_customer_id": "cus_trial", "stripe_subscription_id": "sub_trial", "status": "active"},
+    ]
+    monkeypatch.setattr(revenue_truth.vera_db, "session_scope", lambda: _fake_session_scope(rows))
+
+    result = check_subscriber_reconciliation()
+
+    assert result.stripe_ok is True
+    assert result.access_not_paying_count == 0
+
+
+def test_check_subscriber_reconciliation_abstains_when_trialing_pull_fails(monkeypatch):
+    # Trialing pull failing must abstain the whole check, not silently fall
+    # back to active-only (which would resurrect the false-positive bug).
+    monkeypatch.setattr(revenue_truth, "_fetch_active_stripe_subscriptions", lambda: {})
+    monkeypatch.setattr(revenue_truth, "_fetch_trialing_stripe_subscriptions", lambda: None)
+    monkeypatch.setattr(revenue_truth.vera_db, "session_scope", lambda: _fake_session_scope([]))
+
+    result = check_subscriber_reconciliation()
+
+    assert result.stripe_ok is False
+    assert result.access_not_paying_count == 0

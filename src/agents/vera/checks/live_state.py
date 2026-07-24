@@ -361,6 +361,38 @@ def check_cron_freshness(now: Optional[datetime] = None) -> list[CronBeat]:
     return beats
 
 
+def _off_day_pairs(now: Optional[datetime] = None) -> list[tuple[str, Optional[str]]]:
+    """(source_type, county_id) pairs skipped today by SOURCE_OFF_DAYS — the
+    same sources check_cron_freshness() skips over. Pure function, no I/O."""
+    now = now or datetime.now(timezone.utc)
+    today_wd = now.weekday()
+    pairs: list[tuple[str, Optional[str]]] = []
+    for source_type in HEARTBEAT_SLAS:
+        if today_wd not in SOURCE_OFF_DAYS.get(source_type, set()):
+            continue
+        counties = MULTI_COUNTY_SOURCES.get(source_type)
+        county_list = sorted(counties) if counties else [None]
+        for county_id in county_list:
+            pairs.append((source_type, county_id))
+    return pairs
+
+
+def _write_off_day_facts(pairs: list[tuple[str, Optional[str]]]) -> None:
+    """Writes an explicit not_scheduled_today verdict for sources
+    intentionally skipped today. Without this, a source's off-day leaves
+    yesterday's 'stale' fact as the newest row forever — _read_stale_cron()
+    (discrepancy_digest.py) reads the newest row per source regardless of
+    age, so an unscheduled off-day would otherwise keep reporting a stale
+    discrepancy that isn't actionable."""
+    for source_type, county_id in pairs:
+        write_fact(
+            f"cron.{source_type}.freshness", "not_scheduled_today",
+            county_id=county_id, source="scraper_run_stats",
+            method="source on scheduled off-day (SOURCE_OFF_DAYS)",
+            freshness_class=FRESHNESS_STATIC,
+        )
+
+
 def _write_cron_facts(beats: list[CronBeat]) -> None:
     for beat in beats:
         write_fact(
@@ -662,6 +694,7 @@ def run_live_state() -> int:
 
     _write_deploy_facts(deploy)
     _write_cron_facts(cron_beats)
+    _write_off_day_facts(_off_day_pairs())
     _write_silent_failure_facts(silent)
 
     one_number_rows = read_facts("revenue.mrr.new_yesterday", fresh_only=True, limit=1)

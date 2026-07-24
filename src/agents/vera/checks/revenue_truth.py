@@ -149,17 +149,16 @@ class ReconciliationResult:
     stripe_ok: bool = True
 
 
-def _fetch_active_stripe_subscriptions() -> Optional[dict]:
-    """One paginated pull — {stripe_customer_id: subscription}. Reused by both
-    reconciliation directions here and by Stripe-side MRR (check_mrr) — one
-    Stripe call, not two.
+def _fetch_stripe_subscriptions_by_status(status: str) -> Optional[dict]:
+    """One paginated pull — {stripe_customer_id: subscription}. Shared by
+    active (billing) and trialing (access-only) pulls below.
 
     Returns None (not {}) if Stripe isn't configured or the pull failed —
     see _paginate()'s docstring for why that distinction matters."""
     if not _init_stripe():
         logger.error("[Vera] Stripe not configured — cannot check revenue truth")
         return None
-    subs = _paginate(stripe.Subscription.list, status="active", expand=["data.customer"])
+    subs = _paginate(stripe.Subscription.list, status=status, expand=["data.customer"])
     if subs is None:
         return None
     result: dict = {}
@@ -168,6 +167,23 @@ def _fetch_active_stripe_subscriptions() -> Optional[dict]:
         customer_id = customer.id if hasattr(customer, "id") else customer
         result[customer_id] = sub
     return result
+
+
+def _fetch_active_stripe_subscriptions() -> Optional[dict]:
+    """Billable-active subscriptions only. Used for Stripe-side MRR
+    (check_mrr) and for the paying-no-access direction, where 'paying' must
+    mean actually billing, not merely entitled to access."""
+    return _fetch_stripe_subscriptions_by_status("active")
+
+
+def _fetch_trialing_stripe_subscriptions() -> Optional[dict]:
+    """Trialing subscriptions — merged with active for the access-not-paying
+    direction ONLY, never for MRR. checkout.session.completed sets the local
+    Subscriber row to status='active' at checkout even for a trial (fa048),
+    while Stripe keeps the subscription 'trialing' until the trial ends.
+    Without this, every active trial reads as a false access-not-paying
+    free-rider every single day."""
+    return _fetch_stripe_subscriptions_by_status("trialing")
 
 
 def _classify_paying_no_access(active_subs_by_customer: dict, subscriber_by_customer: dict) -> list:
@@ -185,8 +201,13 @@ def _classify_paying_no_access(active_subs_by_customer: dict, subscriber_by_cust
     return flagged
 
 
-def _classify_access_not_paying(active_subs_by_customer: dict, active_db_subscribers: list) -> list:
-    """Pure function. `active_db_subscribers` must already be filtered to
+def _classify_access_not_paying(entitled_subs_by_customer: dict, active_db_subscribers: list) -> list:
+    """Pure function. `entitled_subs_by_customer` must include both
+    Stripe-active AND Stripe-trialing subscriptions — a trial checkout sets
+    the local Subscriber row to status='active' immediately, while Stripe
+    keeps the subscription 'trialing' until it converts, so trialing must
+    count as entitled here (never for MRR/billing, only for this access
+    check). `active_db_subscribers` must already be filtered to
     status == 'active' by the caller — 'grace' is deliberately EXCLUDED here:
     a subscriber in the 48h post-cancellation grace window is expected to no
     longer show as Stripe-active, so flagging it would be a guaranteed false
@@ -197,7 +218,7 @@ def _classify_access_not_paying(active_subs_by_customer: dict, active_db_subscri
         subscription_id = row.get("stripe_subscription_id")
         if not subscription_id:
             flagged.append({"customer_id": customer_id, "reason": "no_stripe_subscription_id"})
-        elif customer_id not in active_subs_by_customer:
+        elif customer_id not in entitled_subs_by_customer:
             flagged.append({"customer_id": customer_id, "reason": "not_active_in_stripe"})
     return flagged
 
@@ -235,11 +256,29 @@ def check_subscriber_reconciliation() -> ReconciliationResult:
             stripe_ok=False,
         )
 
+    trialing_subs_by_customer = _fetch_trialing_stripe_subscriptions()
+    if trialing_subs_by_customer is None:
+        # Can't verify trial entitlement — abstain the whole check rather
+        # than fall back to active-only, which would flag every active
+        # trial subscriber as a false free-rider (the exact bug this fixes).
+        logger.error(
+            "[Vera] Stripe trialing-subscription pull failed — abstaining from "
+            "reconciliation, not reporting a result"
+        )
+        return ReconciliationResult(
+            paying_no_access_count=0, paying_no_access_sample_ids=[],
+            access_not_paying_count=0, access_not_paying_sample_ids=[],
+            access_not_paying_details=[], active_subscriptions_by_customer=None,
+            stripe_ok=False,
+        )
+
+    entitled_subs_by_customer = {**active_subs_by_customer, **trialing_subs_by_customer}
+
     subscriber_by_customer = {row["stripe_customer_id"]: dict(row) for row in rows}
     active_db_subscribers = [dict(row) for row in rows if row["status"] == "active"]
 
     paying_no_access = _classify_paying_no_access(active_subs_by_customer, subscriber_by_customer)
-    access_not_paying = _classify_access_not_paying(active_subs_by_customer, active_db_subscribers)
+    access_not_paying = _classify_access_not_paying(entitled_subs_by_customer, active_db_subscribers)
 
     details = []
     for item in access_not_paying[:SAMPLE_CAP]:
@@ -263,6 +302,24 @@ def check_subscriber_reconciliation() -> ReconciliationResult:
 
 
 def _write_reconciliation_facts(result: ReconciliationResult) -> None:
+    if not result.stripe_ok:
+        # No value_numeric on any of these — a Stripe outage must never be
+        # persisted as "0 mismatches found" (a verified clean reconciliation).
+        # discrepancy_digest._read_stale-style consumers key off value_numeric
+        # being present, same convention as _write_mrr_facts()'s outage branch.
+        for fact_key in (
+            "revenue.reconciliation.paying_no_access.count",
+            "revenue.reconciliation.paying_no_access.sample_ids",
+            "revenue.reconciliation.access_not_paying.count",
+            "revenue.reconciliation.access_not_paying.sample_ids",
+        ):
+            write_fact(
+                fact_key, "stripe unreachable", source="stripe",
+                method="stripe.Subscription.list — pull failed",
+                freshness_class=FRESHNESS_REVENUE_24H,
+            )
+        return
+
     write_fact(
         "revenue.reconciliation.paying_no_access.count", str(result.paying_no_access_count),
         value_numeric=Decimal(result.paying_no_access_count),
@@ -281,14 +338,14 @@ def _write_reconciliation_facts(result: ReconciliationResult) -> None:
         "revenue.reconciliation.access_not_paying.count", str(result.access_not_paying_count),
         value_numeric=Decimal(result.access_not_paying_count),
         source="subscribers",
-        method="Subscriber.status=active cross-referenced against stripe.Subscription.list(status=active)",
+        method="Subscriber.status=active cross-referenced against stripe.Subscription.list(status in (active, trialing))",
         freshness_class=FRESHNESS_REVENUE_24H,
     )
     write_fact(
         "revenue.reconciliation.access_not_paying.sample_ids",
         ",".join(result.access_not_paying_sample_ids) or "none",
         source="subscribers",
-        method="Subscriber.status=active cross-referenced against stripe.Subscription.list(status=active)",
+        method="Subscriber.status=active cross-referenced against stripe.Subscription.list(status in (active, trialing))",
         freshness_class=FRESHNESS_REVENUE_24H,
     )
 
@@ -518,6 +575,28 @@ def check_payment_activity(as_of: Optional[date] = None) -> PaymentActivityResul
 
 
 def _write_payment_activity_facts(result: PaymentActivityResult) -> None:
+    fact_keys = (
+        "revenue.new_payments.count",
+        "revenue.new_payments.amount_cents",
+        "revenue.failed_payments.count",
+        "revenue.failed_payments.amount_cents",
+        "revenue.new_payments.subscription_count",
+        "revenue.new_payments.subscription_amount_cents",
+        "revenue.new_payments.one_time_count",
+        "revenue.new_payments.one_time_amount_cents",
+    )
+    if not result.stripe_ok:
+        # No value_numeric — a Stripe outage must never persist as "0 new
+        # payments today" (a verified clean result). Same convention as
+        # _write_mrr_facts()'s outage branch.
+        for fact_key in fact_keys:
+            write_fact(
+                fact_key, "stripe unreachable", source="stripe",
+                method="stripe.Charge.list — pull failed",
+                freshness_class=FRESHNESS_REVENUE_24H,
+            )
+        return
+
     facts = [
         ("revenue.new_payments.count", result.new_count,
          "stripe.Charge.list(created=today) filtered status=succeeded"),
@@ -590,6 +669,23 @@ def check_refunds_and_disputes(as_of: Optional[date] = None) -> RefundsDisputesR
 
 
 def _write_refunds_disputes_facts(result: RefundsDisputesResult) -> None:
+    fact_keys = (
+        "revenue.refunds.count",
+        "revenue.refunds.amount_cents",
+        "revenue.disputes.count",
+        "revenue.disputes.amount_cents",
+    )
+    if not result.stripe_ok:
+        # No value_numeric — a Stripe outage must never persist as "0
+        # refunds/disputes today" (a verified clean result).
+        for fact_key in fact_keys:
+            write_fact(
+                fact_key, "stripe unreachable", source="stripe",
+                method="stripe.Refund.list/stripe.Dispute.list — pull failed",
+                freshness_class=FRESHNESS_REVENUE_24H,
+            )
+        return
+
     facts = [
         ("revenue.refunds.count", result.refunds_count, "stripe.Refund.list(created=today)"),
         ("revenue.refunds.amount_cents", result.refunds_amount_cents, "stripe.Refund.list(created=today)"),

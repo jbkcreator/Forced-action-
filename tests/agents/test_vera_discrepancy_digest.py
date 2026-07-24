@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 
 from src.agents.vera.checks.discrepancy_digest import (
     Discrepancy,
+    _compute_unchecked,
     build_discrepancies,
     build_promise_digest,
     detect_claim_discrepancy,
@@ -167,3 +168,50 @@ def test_render_empty_state():
     subject, body, _ = render_digest_report(build_promise_digest([]), [], unchecked=[])
     assert "0 discrepancy(ies)" in subject
     assert "none — every checked claim matches live state." in body
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Regression: PR #173 review — a Stripe outage must be reported as "revenue
+# unchecked", never as a clean reconciliation, even though V3 now writes
+# abstention facts (rows exist, but with no value_numeric).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_unchecked_flags_revenue_when_all_facts_are_abstention_rows():
+    # This is exactly what V3 writes after a Stripe outage: rows exist (not
+    # None) but carry no value_numeric ("stripe unreachable").
+    abstained = _fact("stripe unreachable", value_numeric=None)
+    unchecked = _compute_unchecked(
+        deploy_drift=_fact("in_sync"),
+        paying_no_access=abstained,
+        access_not_paying=abstained,
+        mrr_drift=abstained,
+    )
+    assert "revenue (V3)" in unchecked
+
+
+def test_unchecked_flags_revenue_when_facts_are_entirely_missing():
+    unchecked = _compute_unchecked(
+        deploy_drift=_fact("in_sync"),
+        paying_no_access=None, access_not_paying=None, mrr_drift=None,
+    )
+    assert "revenue (V3)" in unchecked
+
+
+def test_unchecked_does_not_flag_revenue_when_any_fact_is_real():
+    unchecked = _compute_unchecked(
+        deploy_drift=_fact("in_sync"),
+        paying_no_access=_fact(value_numeric=0),
+        access_not_paying=None,
+        mrr_drift=None,
+    )
+    assert "revenue (V3)" not in unchecked
+
+
+def test_unchecked_flags_deploy_on_unknown_drift():
+    unchecked = _compute_unchecked(
+        deploy_drift=_fact("unknown"),
+        paying_no_access=_fact(value_numeric=0),
+        access_not_paying=_fact(value_numeric=0),
+        mrr_drift=_fact(value_numeric=0),
+    )
+    assert unchecked == ["deploy (V2)"]
