@@ -5950,6 +5950,81 @@ async def nws_alert(request: Request, db: Session = Depends(get_db)):
 
 # ── Phase 2B: Admin DLQ review ────────────────────────────────────────────────
 
+@app.get("/api/admin/checkout-provisioning-failures")
+def admin_checkout_provisioning_failures(
+    status: str = "open",
+    limit: int = 50,
+    db: Session = Depends(get_db),
+    _admin: dict = Depends(get_current_admin),
+):
+    """
+    Durable ops recovery queue: checkouts where Stripe completed the charge
+    and subscription but ZIP-territory provisioning failed and was rolled
+    back (src.services.stripe_webhooks._on_checkout_completed). status=open|
+    resolved|all. Ops must actually cancel/refund/re-provision in Stripe and
+    then resolve the row via the POST below — this endpoint only surfaces
+    the queue, it does not automate recovery.
+    """
+    if status not in ("open", "resolved", "all"):
+        raise HTTPException(status_code=422, detail="status must be open|resolved|all")
+    where_clause = "" if status == "all" else "WHERE status = :status"
+    rows = db.execute(
+        text(
+            "SELECT id, stripe_customer_id, stripe_subscription_id, email, tier, vertical, "
+            "county_id, requested_zips, unclaimed_zips, reason, status, created_at, "
+            "resolved_at, resolved_by, notes "
+            f"FROM checkout_provisioning_failures {where_clause} "
+            "ORDER BY created_at DESC LIMIT :limit"
+        ),
+        {"status": status, "limit": min(limit, 200)},
+    ).mappings().all()
+    return {
+        "count": len(rows),
+        "items": [
+            {
+                **dict(r),
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "resolved_at": r["resolved_at"].isoformat() if r["resolved_at"] else None,
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.post("/api/admin/checkout-provisioning-failures/{failure_id}/resolve")
+def admin_resolve_checkout_provisioning_failure(
+    failure_id: int,
+    notes: Optional[str] = None,
+    db: Session = Depends(get_db),
+    _admin: dict = Depends(get_current_admin),
+):
+    """Mark a checkout-provisioning-failure row resolved after ops has
+    actually handled the Stripe side (refund/cancel/re-provision) — this
+    endpoint does not itself touch Stripe, it only records that a human did."""
+    existing = db.execute(
+        text("SELECT status, resolved_at FROM checkout_provisioning_failures WHERE id = :id"),
+        {"id": failure_id},
+    ).first()
+    if existing is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    if existing.status == "resolved":
+        return {"id": failure_id, "status": "resolved", "resolved_at": existing.resolved_at.isoformat()}
+
+    resolved_at = datetime.now(timezone.utc)
+    resolved_by = _admin.get("sub") if isinstance(_admin, dict) else None
+    db.execute(
+        text(
+            "UPDATE checkout_provisioning_failures "
+            "SET status = 'resolved', resolved_at = :resolved_at, resolved_by = :resolved_by, "
+            "    notes = COALESCE(:notes, notes) "
+            "WHERE id = :id"
+        ),
+        {"resolved_at": resolved_at, "resolved_by": resolved_by, "notes": notes, "id": failure_id},
+    )
+    db.commit()
+    return {"id": failure_id, "status": "resolved", "resolved_at": resolved_at.isoformat()}
+
+
 @app.get("/api/admin/dlq")
 def admin_dlq(limit: int = 50, db: Session = Depends(get_db)):
     """Return unreviewed SMS dead-letter queue items for admin review."""

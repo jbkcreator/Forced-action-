@@ -796,10 +796,7 @@ def _on_checkout_completed(session: dict, db: Session, background_tasks=None) ->
     # rather than activate a paying subscriber who didn't get what they paid
     # for. Raising here propagates to handle_webhook's outer except, which
     # rolls back this entire transaction — no subscriber, no account
-    # activation, no MRR record for this event. Stripe already has the charge;
-    # recovering it (refund/cancel/notify) is a deliberate follow-up requiring
-    # product/finance sign-off on the recovery policy, not something to
-    # automate silently here.
+    # activation, no MRR record for this event.
     from src.services.zip_territory import ZipTerritoryUnavailableError, claim_zip_territory
     unclaimed = [
         zip_code for zip_code in zip_codes
@@ -809,10 +806,44 @@ def _on_checkout_completed(session: dict, db: Session, background_tasks=None) ->
         )
     ]
     if unclaimed:
+        # Stripe has ALREADY captured this charge and created the subscription
+        # — the DB rollback below undoes our side only. That's not durably
+        # recorded anywhere else (this same `db` session is what's about to
+        # roll back, and the webhook audit row lives on it too), so ops would
+        # otherwise have no reliable way to find this customer at all short of
+        # grepping logs. Write the recovery record on its OWN committed
+        # session — get_db_context() opens a fresh connection, independent of
+        # `db` — so it survives regardless of what happens to this
+        # transaction. Deciding HOW to recover (auto-refund vs. cancel vs.
+        # manual outreach) is a product/finance policy call outside this
+        # fix's scope; making the failure durable, queryable, and actionable
+        # for ops is not.
+        try:
+            from src.core.database import get_db_context
+            from src.core.models import CheckoutProvisioningFailure
+            with get_db_context() as recovery_db:
+                recovery_db.add(CheckoutProvisioningFailure(
+                    stripe_customer_id=stripe_customer_id,
+                    stripe_subscription_id=stripe_subscription_id,
+                    email=customer_email,
+                    tier=tier,
+                    vertical=vertical,
+                    county_id=county_id,
+                    requested_zips=zip_codes,
+                    unclaimed_zips=unclaimed,
+                ))
+        except Exception:
+            logger.critical(
+                "checkout provisioning failure AND its recovery record failed to write — "
+                "customer=%s subscription=%s zips=%s — this customer is now findable only "
+                "via log search, follow up manually",
+                stripe_customer_id, stripe_subscription_id, unclaimed, exc_info=True,
+            )
         raise ZipTerritoryUnavailableError(
             f"checkout for subscriber={subscriber.id} tier={tier} vertical={vertical} "
             f"county={county_id} could not claim ZIP(s) {unclaimed} — lost to a concurrent "
-            f"checkout; entire checkout rolled back, requires manual recovery"
+            f"checkout; entire checkout rolled back, durable recovery record written "
+            f"to checkout_provisioning_failures"
         )
 
     # Bust zip_availability cache for every (county_id, vertical) pair that was locked.
