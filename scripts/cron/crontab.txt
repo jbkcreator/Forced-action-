@@ -365,6 +365,17 @@ COUNTY_ID=hillsborough
 # move this back onto :30.
 33 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.revenue_fulfillment_heartbeat
 
+# Vera — Revenue Truth Report — 07:36 AM UTC daily.
+# Two-way Stripe-vs-Subscriber reconciliation (paying-no-access AND
+# access-not-paying), real MRR (Stripe vs DB), new/failed payments split by
+# subscription vs one-time, refunds & disputes — every number pulled live
+# from Stripe, never from our own webhook log or DB alone. Read-only; runs
+# after stripe_reconcile (07:15) and revenue_fulfillment_heartbeat (07:33,
+# a different check — dollar-total vs ledger, no subscriber ID, can't see
+# failed payments), before Vera's live-state report (07:47) so this run's
+# revenue.mrr.new_yesterday fact is fresh by the time that report reads it.
+# Runs every day (not Mon-Sat only) — Stripe activity doesn't stop on Sunday.
+36 7 * * * $PROJECT/scripts/cron/run.sh src.agents.vera --revenue-truth
 
 # SunBiz LLC Piercing Enrichment — 07:40 AM UTC Mon-Sat (fa031 tiered staleness)
 # Tier A: active-lead pending/30d-stale  •  Tier B: cold pending/180d-stale
@@ -376,6 +387,23 @@ COUNTY_ID=hillsborough
 # Alerts if parser_failed_rate >5% in last 24h (min 10 outcomes).
 # Logs status distribution, enriched count, multi-property LLC group gauge.
 50 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.sunbiz_anomaly_check
+
+# Vera — Live-State Report — 07:47 AM UTC daily.
+# Prod-hash vs dev-HEAD drift, migration applied/not-applied status, cron
+# freshness per (source, county), silent-failure detection (scheduled-but-
+# writing-nothing, enabled-but-unscheduled). Read-only; runs after the CDS/
+# skip-trace chain (07:00/07:30) so today's freshness data is settled, before
+# GHL sync (08:00) and the existing daily ops report (08:10). Emails
+# REPORT_RECIPIENTS; writes every check as a dated row to vera_facts.
+47 7 * * * $PROJECT/scripts/cron/run.sh src.agents.vera --live-state
+
+# Vera — Promise & Discrepancy Digest (VERA-v2.2 sub-task V4) — 07:52 AM UTC daily.
+# Open/overdue promises (owner, age, MRR-at-risk) from vera_promises + a
+# "Doc claims X; live state shows Y" report built by reading the deploy/cron/
+# revenue discrepancy facts V3 (07:36) and V2 (07:47) wrote earlier this run.
+# Read-only; runs after live-state so those facts are fresh. Does NOT re-run
+# V2/V3 checks — it reports their verdicts. Emails REPORT_RECIPIENTS.
+52 7 * * * $PROJECT/scripts/cron/run.sh src.agents.vera --promise-digest
 
 # Contact Freshness Sweep - 07:55 AM UTC Mon-Sat.
 # Re-scores old skip-traced phones as high/medium/low/stale and refreshes the
