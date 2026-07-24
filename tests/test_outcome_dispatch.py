@@ -143,3 +143,127 @@ def test_feeds_scoring_routing():
     assert outcome_consumers._feeds_scoring(
         {"outcome_state": "dead", "reason_fault_class": "buyer_neutral"}) is False
     assert outcome_consumers._feeds_scoring({"outcome_state": "pending"}) is False
+
+
+# ---------------------------------------------------------------------------
+# Review fix regression tests
+# ---------------------------------------------------------------------------
+
+def test_legacy_skip_still_feeds_snapshot_and_autopsy(client, fresh_db):
+    """Legacy deal_size_bucket='skip' carries no reason taxonomy, but must still
+    feed the learning loop — pre-Block-13 behavior, preserved via an implicit
+    lead_fault classification so legacy clients aren't silently dropped from
+    scoring now that dead outcomes are fault-gated."""
+    sub, prop = _mk(fresh_db)
+    _post(client, sub, prop, deal_size_bucket="skip")
+    with patch("src.services.snapshot_service.capture_snapshot") as snap, \
+         patch("src.services.loss_autopsy.run_loss_autopsy") as autopsy:
+        run_sweep(fresh_db)
+    assert snap.call_count == 1
+    assert snap.call_args.kwargs["outcome_status"] == "lost"
+    assert autopsy.call_count == 1
+    _cleanup(fresh_db, sub, prop)
+
+
+def test_legacy_nonskip_bucket_feeds_snapshot_funded(client, fresh_db):
+    """Legacy non-skip bucket (closed) still feeds the snapshot as a win."""
+    sub, prop = _mk(fresh_db)
+    _post(client, sub, prop, deal_size_bucket="5_10k", deal_amount=6000)
+    with patch("src.services.snapshot_service.capture_snapshot") as snap, \
+         patch("src.services.loss_autopsy.run_loss_autopsy") as autopsy:
+        run_sweep(fresh_db)
+    assert snap.call_count == 1
+    assert snap.call_args.kwargs["outcome_status"] == "funded"
+    autopsy.assert_not_called()
+    _cleanup(fresh_db, sub, prop)
+
+
+def test_rapid_closed_then_dead_before_sweep_captures_final_state_only(client, fresh_db):
+    """Reporting closed then dead before the sweep runs must not leave a stale
+    'funded' snapshot behind — only the final (dead) state should be captured,
+    via the consumer's own current-state check (a superseded event is skipped)."""
+    sub, prop = _mk(fresh_db)
+    _post(client, sub, prop, outcome_state="closed", deal_amount=9000)
+    _post(client, sub, prop, outcome_state="dead", dead_reason="wrong_owner")
+    n = fresh_db.execute(
+        text("SELECT count(*) FROM events WHERE event_type='outcome.recorded' "
+             "AND (payload->>'subscriber_id')::int = :s"), {"s": sub.id},
+    ).scalar()
+    assert n == 2, "both taps emit their own event"
+
+    # capture_snapshot runs for real to prove the staleness logic; run_loss_autopsy
+    # is mocked purely to avoid a real LLM call — the final (dead) event is
+    # lead_fault and current, so it does reach the autopsy consumer.
+    with patch("src.services.loss_autopsy.run_loss_autopsy"):
+        run_sweep(fresh_db)
+
+    row = fresh_db.execute(
+        text("SELECT id, pipeline_stage FROM deal_outcomes WHERE subscriber_id=:s"),
+        {"s": sub.id},
+    ).mappings().one()
+    assert row["pipeline_stage"] == "closed_lost"
+
+    snapshots = fresh_db.execute(
+        text("SELECT outcome_status FROM pre_decision_snapshots WHERE deal_outcome_id=:d"),
+        {"d": row["id"]},
+    ).fetchall()
+    assert [s[0] for s in snapshots] == ["lost"], (
+        "the stale 'closed' event must be skipped as superseded, not captured as funded"
+    )
+    _cleanup(fresh_db, sub, prop)
+
+
+def test_rapid_dead_then_closed_before_sweep_captures_final_state_only(client, fresh_db):
+    """Same ordering hazard in the opposite direction: dead then closed before
+    the sweep runs must end with a single 'funded' snapshot, not 'lost'."""
+    sub, prop = _mk(fresh_db)
+    _post(client, sub, prop, outcome_state="dead", dead_reason="wrong_owner")
+    _post(client, sub, prop, outcome_state="closed", deal_amount=9000)
+
+    # The dead event is now stale (superseded by closed) so it never reaches
+    # the autopsy consumer, and closed never calls it either — but mock it
+    # anyway so this test can't accidentally make a real LLM call if that
+    # invariant ever shifts.
+    with patch("src.services.loss_autopsy.run_loss_autopsy"):
+        run_sweep(fresh_db)
+
+    row = fresh_db.execute(
+        text("SELECT id, pipeline_stage FROM deal_outcomes WHERE subscriber_id=:s"),
+        {"s": sub.id},
+    ).mappings().one()
+    assert row["pipeline_stage"] == "closed_won"
+
+    snapshots = fresh_db.execute(
+        text("SELECT outcome_status FROM pre_decision_snapshots WHERE deal_outcome_id=:d"),
+        {"d": row["id"]},
+    ).fetchall()
+    assert [s[0] for s in snapshots] == ["funded"]
+    _cleanup(fresh_db, sub, prop)
+
+
+def test_snapshot_failure_is_retried_not_silently_marked_processed(client, fresh_db):
+    """A genuine capture_snapshot failure (returns None, no existing row) must
+    make poll_and_dispatch record a failure and retry — not mark the event
+    processed as if it had succeeded."""
+    sub, prop = _mk(fresh_db)
+    _post(client, sub, prop, outcome_state="closed", deal_amount=9000)
+
+    with patch("src.services.snapshot_service.capture_snapshot", return_value=None):
+        result = run_sweep(fresh_db)
+    assert result["outcome_snapshot"]["failed"] == 1
+    assert result["outcome_snapshot"]["processed"] == 0
+
+    row = fresh_db.execute(
+        text("SELECT id FROM deal_outcomes WHERE subscriber_id=:s"), {"s": sub.id}
+    ).scalar_one()
+    n_snapshots = fresh_db.execute(
+        text("SELECT count(*) FROM pre_decision_snapshots WHERE deal_outcome_id=:d"),
+        {"d": row},
+    ).scalar()
+    assert n_snapshots == 0, "a failed capture must not be mistaken for a written snapshot"
+
+    # A retry (with the real, working capture_snapshot) now succeeds.
+    with patch("src.services.loss_autopsy.run_loss_autopsy"):
+        result2 = run_sweep(fresh_db)
+    assert result2["outcome_snapshot"]["processed"] == 1
+    _cleanup(fresh_db, sub, prop)

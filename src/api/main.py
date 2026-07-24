@@ -5094,6 +5094,12 @@ def deal_capture(payload: DealCaptureRequest, db: Session = Depends(get_db)):
         stored_outcome_state = state
     elif payload.deal_size_bucket in valid_buckets:
         state = "dead" if payload.deal_size_bucket == "skip" else "closed"
+        # Legacy clients carry no reason taxonomy. Pre-Block-13, every skip
+        # unconditionally fed the learning loop (snapshot + loss autopsy) — now
+        # that dead outcomes are fault-gated, an unset fault_class would silently
+        # drop legacy submissions from scoring. Preserve the old behavior instead.
+        if state == "dead":
+            fault_class = outcome_reasons.LEAD_FAULT
     else:
         raise HTTPException(
             status_code=422,
@@ -5116,7 +5122,10 @@ def deal_capture(payload: DealCaptureRequest, db: Session = Depends(get_db)):
         .limit(1)
     ).scalar_one_or_none()
     is_update = outcome is not None
-    prev_state = outcome.outcome_state if is_update else None
+    # pipeline_stage (unlike outcome_state) is always populated, including on
+    # the legacy bucket path, so it's the reliable signal that the outcome
+    # actually changed rather than being re-posted unchanged.
+    prev_pipeline_stage = outcome.pipeline_stage if is_update else None
     if outcome is None:
         outcome = DealOutcome(
             subscriber_id=sub.id,
@@ -5142,7 +5151,7 @@ def deal_capture(payload: DealCaptureRequest, db: Session = Depends(get_db)):
     # deal_outcome_id and would otherwise keep the old outcome_status forever).
     # Clear them so the re-emitted event (or the inline fallback below) captures
     # fresh against the new outcome.
-    if is_update and prev_state != stored_outcome_state:
+    if is_update and prev_pipeline_stage != pipeline_stage:
         from sqlalchemy import text as _sa_text
         for _tbl in ("pre_decision_snapshots", "loss_autopsies"):
             try:
@@ -5200,14 +5209,21 @@ def deal_capture(payload: DealCaptureRequest, db: Session = Depends(get_db)):
         else:
             # No prospect row (e.g. founder/ownerless import) — recalc inline for
             # this row rather than drop it. Same score-protection routing as the
-            # async consumers.
+            # async consumers, which now raise on a genuine capture failure
+            # (vs. their own idempotent no-op) — each call gets its own
+            # savepoint so a raised failure only rolls back that attempt, not
+            # this whole request's DealOutcome write (bare try/except would
+            # otherwise leave Postgres's transaction aborted for every later
+            # statement, including this request's own commit).
             from src.consumers import outcome_consumers
             try:
-                outcome_consumers.apply_snapshot(db, outcome_payload)
+                with db.begin_nested():
+                    outcome_consumers.apply_snapshot(db, outcome_payload)
             except Exception as exc:
                 logger.warning("[DealCapture] inline snapshot failed: %s", exc)
             try:
-                outcome_consumers.apply_loss_autopsy(db, outcome_payload)
+                with db.begin_nested():
+                    outcome_consumers.apply_loss_autopsy(db, outcome_payload)
             except Exception as exc:
                 logger.warning("[DealCapture] inline loss autopsy failed: %s", exc)
 
