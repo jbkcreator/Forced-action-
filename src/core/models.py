@@ -5343,6 +5343,42 @@ class DealOfTheDay(Base):
         return f"<DealOfTheDay(date={self.date}, lead_id={self.lead_id})>"
 
 
+class WinbackOffer(Base):
+    """
+    T-B12-07 — Tier3 win-back redemption token.
+
+    Created when a tier3_winback reactivation message is SENT (not when it's
+    redeemed) so the outbound link can carry a token that, when it comes back
+    through checkout, proves this specific offer — not just "a message went
+    out" — is what triggers the promised benefit:
+      zip_held     — 50% off the return month (Stripe coupon applied at
+                      checkout session creation, gated on a valid token).
+      zip_released — 5 free credits, granted only when the checkout webhook
+                      redeems the token (i.e. the subscriber actually paid),
+                      never at send time.
+    One-time use: `redeemed_at` is set exactly once; a second redemption
+    attempt on the same token is a no-op.
+    """
+    __tablename__ = "winback_offers"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(ForeignKey("subscribers.id"), nullable=False, index=True)
+    branch: Mapped[str] = mapped_column(String(20), nullable=False)  # zip_held | zip_released
+    token: Mapped[str] = mapped_column(String(43), nullable=False, unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    redeemed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("idx_winback_offers_subscriber_branch", "subscriber_id", "branch"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<WinbackOffer(subscriber_id={self.subscriber_id}, branch={self.branch}, redeemed={self.redeemed_at is not None})>"
+
+
 # ============================================================================
 # HCPA ENRICHMENT — TAX PAYMENT HISTORY
 # ============================================================================

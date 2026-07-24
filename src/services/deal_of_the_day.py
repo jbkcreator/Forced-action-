@@ -134,6 +134,13 @@ def get_current_deal(db: Session) -> dict:
     framing (countdown to window_end), never a discount — unlock is at
     standard price (Stripe hot_lead_unlock price_id, same as any hot lead).
     """
+    # The pick's 24h window does not align with calendar-day boundaries (it
+    # runs from whenever the cron creates it, e.g. 07:15 UTC, to +24h) — a
+    # `date = CURRENT_DATE` filter would make a still-live deal disappear
+    # between midnight and its creation time every day. Query the live window
+    # directly instead; fall back to the most recent expired row so we can
+    # still tell the caller "expired" instead of a bare "empty".
+    now = datetime.now(timezone.utc)
     row = db.execute(text("""
         SELECT dotd.date, dotd.window_start, dotd.window_end,
                p.id AS property_id, p.address, p.city, p.state, p.zip, p.county_id,
@@ -141,18 +148,21 @@ def get_current_deal(db: Session) -> dict:
         FROM deal_of_the_day dotd
         JOIN properties p ON p.id = dotd.lead_id
         LEFT JOIN distress_scores ds ON ds.property_id = p.id
-        WHERE dotd.date = CURRENT_DATE
-        ORDER BY ds.score_date DESC NULLS LAST
+        WHERE dotd.window_start <= :now AND dotd.window_end > :now
+        ORDER BY dotd.window_start DESC
         LIMIT 1
-    """)).first()
+    """), {"now": now}).first()
 
     if not row:
+        recently_expired = db.execute(text("""
+            SELECT 1 FROM deal_of_the_day
+            WHERE window_end <= :now
+            ORDER BY window_end DESC
+            LIMIT 1
+        """), {"now": now}).first()
+        if recently_expired:
+            return {"status": "expired", "deal": None, "message": "Today's exclusive window has closed."}
         return {"status": "empty", "deal": None, "message": "No exclusive deal live right now — check back soon."}
-
-    now = datetime.now(timezone.utc)
-    window_end = row.window_end if row.window_end.tzinfo else row.window_end.replace(tzinfo=timezone.utc)
-    if now >= window_end:
-        return {"status": "expired", "deal": None, "message": "Today's exclusive window has closed."}
 
     dt = row.distress_types
     distress = list(dt.keys()) if isinstance(dt, dict) else (dt or [])

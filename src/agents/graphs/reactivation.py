@@ -61,8 +61,6 @@ CAMPAIGN_SOLD_OUT = "reactivation_sold_out_zip"
 CAMPAIGN_TIER3_WINBACK = "reactivation_tier3_winback"
 CLAUDE_TASK_TYPE = "sms_copy"
 KILL_SWITCH_FEATURE = "reactivation"
-TIER3_WINBACK_CREDIT_BONUS = 5
-TIER3_WINBACK_CREDIT_REASON = "tier3_winback_reactivation"
 
 
 class ReactivationState(TypedDict, total=False):
@@ -310,6 +308,26 @@ def _node_build_compose_context(state: ReactivationState) -> ReactivationState:
             "'Reply STOP to opt out' for SMS. Use the exact locked headline "
             "provided — do not paraphrase it."
         )
+
+        # The 50%-off / 5-credit benefit must only apply on an actual
+        # reactivation, not merely because this message was sent (PR #172
+        # review). Mint a one-time redemption token now and carry it on the
+        # link; the checkout flow validates it (applies the Stripe coupon for
+        # zip_held) and the checkout-completion webhook redeems it (grants
+        # credits for zip_released) — see src.services.winback_offers.
+        reactivate_link = "https://forcedactionleads.com?reactivate=1"
+        try:
+            from src.services.winback_offers import create_or_reuse_offer
+            with db.session_scope() as s:
+                token = create_or_reuse_offer(state["subscriber_id"], winback_branch, s)
+            reactivate_link = f"{reactivate_link}&wt={token}"
+        except Exception:
+            logger.exception(
+                "reactivation: failed to mint winback offer token sub_id=%s branch=%s — "
+                "falling back to an untokenized link (benefit will not auto-apply)",
+                state.get("subscriber_id"), winback_branch,
+            )
+
         if winback_branch == "zip_held":
             headline = "Your territory is still yours — 50% off your return month."
             body_detail = (
@@ -328,12 +346,12 @@ def _node_build_compose_context(state: ReactivationState) -> ReactivationState:
                 f"Write a reactivation SMS for {first_name}. "
                 f"Lead with this exact locked headline (verbatim, do not rephrase): \"{headline}\" "
                 f"Then add one short supporting sentence: {body_detail} "
-                f"Include this link: https://forcedactionleads.com?reactivate=1 "
+                f"Include this link: {reactivate_link} "
                 f"Keep it under 160 characters. End with 'Reply STOP to opt out.'"
             )
             fallback_body = (
                 f"{first_name}, {headline} {body_detail} "
-                f"Reactivate: https://forcedactionleads.com?reactivate=1  Reply STOP to opt out."
+                f"Reactivate: {reactivate_link}  Reply STOP to opt out."
             )
             subject = ""
         else:
@@ -341,14 +359,14 @@ def _node_build_compose_context(state: ReactivationState) -> ReactivationState:
                 f"Write a reactivation email body for {first_name}. "
                 f"Lead with this exact locked headline (verbatim, do not rephrase): \"{headline}\" "
                 f"Then add supporting copy: {body_detail} "
-                f"Include this link: https://forcedactionleads.com?reactivate=1 "
+                f"Include this link: {reactivate_link} "
                 f"Keep it under 200 words. Be direct and professional."
             )
             fallback_body = (
                 f"Hi {first_name},\n\n"
                 f"{headline}\n\n"
                 f"{body_detail}\n\n"
-                f"Reactivate: https://forcedactionleads.com?reactivate=1\n\n"
+                f"Reactivate: {reactivate_link}\n\n"
                 f"— Forced Action Team"
             )
             subject = headline
@@ -413,37 +431,6 @@ def _node_compose_and_send(state: ReactivationState) -> ReactivationState:
     }
 
 
-def _grant_tier3_winback_credits(subscriber_id: int) -> None:
-    """
-    Grants the 5-free-credit zip_released win-back bonus once per subscriber.
-    Idempotent: skips if a bonus transaction with this reason already exists,
-    so retried/duplicate graph runs never double-credit.
-    """
-    from src.services.wallet_engine import add_bonus
-
-    try:
-        with db.session_scope() as s:
-            existing = s.execute(
-                text(
-                    "SELECT 1 FROM wallet_transactions "
-                    "WHERE subscriber_id = :sid AND txn_type = 'bonus' AND description = :reason "
-                    "LIMIT 1"
-                ),
-                {"sid": subscriber_id, "reason": TIER3_WINBACK_CREDIT_REASON},
-            ).first()
-            if existing:
-                return
-            add_bonus(subscriber_id, TIER3_WINBACK_CREDIT_BONUS, TIER3_WINBACK_CREDIT_REASON, s)
-        logger.info(
-            "reactivation: granted tier3 win-back credits sub_id=%s amount=%s",
-            subscriber_id, TIER3_WINBACK_CREDIT_BONUS,
-        )
-    except Exception:
-        logger.exception(
-            "reactivation: failed to grant tier3 win-back credits sub_id=%s", subscriber_id
-        )
-
-
 def _node_finalize(state: ReactivationState) -> ReactivationState:
     final_status = state.get("terminal_status") or "completed"
 
@@ -463,9 +450,14 @@ def _node_finalize(state: ReactivationState) -> ReactivationState:
                 state.get("subscriber_id"),
             )
 
-        payload = state.get("event_payload") or {}
-        if payload.get("cohort") == "tier3_winback" and payload.get("winback_branch") == "zip_released":
-            _grant_tier3_winback_credits(state["subscriber_id"])
+        # NOTE (PR #172 review fix): win-back credits are NO LONGER granted
+        # here on a successful send — a message being dispatched is not a
+        # reactivation. The zip_released credit grant now happens only when
+        # the subscriber's checkout webhook redeems their winback_offers
+        # token (src.services.winback_offers.redeem_offer +
+        # grant_winback_credits, called from stripe_webhooks). The token
+        # itself was minted in _node_build_compose_context when this message
+        # was composed.
 
     if final_status != "completed" or not state.get("sent"):
         try:

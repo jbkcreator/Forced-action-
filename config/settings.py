@@ -186,6 +186,11 @@ class AppSettings(BaseSettings):
 	# Referral Core Loop
 	referral_free_month_coupon_id: Optional[str] = Field(default=None, env="REFERRAL_FREE_MONTH_COUPON_ID")
 
+	# T-B12-07: Tier3 win-back zip_held offer — 50% off the return month.
+	# Applied as a Stripe coupon at checkout session creation when a valid
+	# winback_offers token accompanies the request (PR #172 review fix).
+	winback_50_off_coupon_id: Optional[str] = Field(default=None, env="WINBACK_50_OFF_COUPON_ID")
+
 	# Stage 12: Bankruptcy Filing Alert product ($297/mo). Shares the common
 	# Stripe webhook endpoint + signing secret (active_stripe_webhook_secret) —
 	# events are routed by product in stripe_webhooks.handle_webhook.

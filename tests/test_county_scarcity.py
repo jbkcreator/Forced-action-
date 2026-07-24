@@ -89,6 +89,29 @@ def test_ambiguous_zip_status_picks_most_restrictive_when_vertical_omitted(clien
     assert resp.json()["zip_status"] == "locked"
 
 
+def test_unscoped_totals_do_not_double_count_a_zip_across_verticals(client_with_db):
+    client, db = client_with_db
+    county = _rand_county()
+    ambiguous, plain_open = _rand_zip(), _rand_zip()
+    # ambiguous ZIP: available for roofing, locked for solar — one real ZIP,
+    # two territory rows. Its resolved (most-restrictive) status is locked.
+    _mk_territory(db, zip_code=ambiguous, county=county, status="available", vertical="roofing")
+    _mk_territory(db, zip_code=ambiguous, county=county, status="locked", vertical="solar")
+    _mk_territory(db, zip_code=plain_open, county=county, status="available", vertical="roofing")
+
+    resp = client.get(f"/api/scarcity/county?zip={plain_open}")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+
+    # 2 real ZIPs in this county, not 3 (naive per-status-row counting would
+    # count `ambiguous` once as available AND once as locked).
+    assert body["total_count"] == 2
+    # `ambiguous` resolves to locked (most-restrictive) — it must NOT also be
+    # counted as open just because one of its verticals is available.
+    assert body["open_count"] == 1
+    assert body["locked_count"] == 1
+
+
 def test_unknown_zip_404(client_with_db):
     client, _ = client_with_db
     resp = client.get(f"/api/scarcity/county?zip={_rand_zip()}")

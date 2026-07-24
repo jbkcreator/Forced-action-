@@ -788,6 +788,27 @@ def _on_checkout_completed(session: dict, db: Session, background_tasks=None) ->
             stripe_customer_id, exc_info=True,
         )
 
+    # ── T-B12-07: redeem a win-back offer token, if this checkout carried one ──
+    # (PR #172 review fix) A completed checkout is the only point that proves
+    # an actual reactivation happened — this is where the promised benefit is
+    # finally realized. zip_held's 50%-off was already applied as a Stripe
+    # coupon on the session itself (see /api/checkout); here we only mark the
+    # token redeemed. zip_released never had a discount — its 5-credit grant
+    # happens ONLY here, not at message-send time.
+    _winback_token = meta.get("winback_token")
+    if _winback_token:
+        try:
+            with db.begin_nested():
+                from src.services.winback_offers import redeem_offer, grant_winback_credits
+                redeemed = redeem_offer(_winback_token, db)
+                if redeemed and redeemed["branch"] == "zip_released":
+                    grant_winback_credits(redeemed["subscriber_id"], db)
+        except Exception:
+            logger.error(
+                "winback offer redemption failed for token=%s customer=%s",
+                _winback_token, stripe_customer_id, exc_info=True,
+            )
+
     # ── Lock ZIP territories (same transaction) ────────────────────────────
     for zip_code in zip_codes:
         territory = db.execute(

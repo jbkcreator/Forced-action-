@@ -90,22 +90,48 @@ def county_scarcity(
         return None
 
     params: dict = {"county_id": county_id}
-    vertical_clause = ""
     if vertical:
-        vertical_clause = " AND vertical = :vertical"
-        params["vertical"] = vertical
-
-    rows = db.execute(
-        sa_text(
-            f"""
-            SELECT status, COUNT(DISTINCT zip_code) AS n
-              FROM zip_territories
-             WHERE county_id = :county_id{vertical_clause}
-             GROUP BY status
-            """
-        ),
-        params,
-    ).all()
+        # Scoped to one vertical: each ZIP has at most one row, so a plain
+        # group-by is unambiguous.
+        rows = db.execute(
+            sa_text(
+                """
+                SELECT status, COUNT(DISTINCT zip_code) AS n
+                  FROM zip_territories
+                 WHERE county_id = :county_id AND vertical = :vertical
+                 GROUP BY status
+                """
+            ),
+            {**params, "vertical": vertical},
+        ).all()
+    else:
+        # Unscoped: a ZIP can carry a different status per vertical (e.g.
+        # available for roofing, locked for solar). Counting DISTINCT
+        # zip_code per raw status double-counts that ZIP into both buckets,
+        # inflating total_count past the real number of ZIPs and letting a
+        # ZIP whose resolved status is locked still count as "open". Collapse
+        # to one most-restrictive status per ZIP first, then aggregate.
+        rows = db.execute(
+            sa_text(
+                """
+                WITH resolved AS (
+                    SELECT zip_code,
+                           CASE
+                               WHEN bool_or(status = 'locked') THEN 'locked'
+                               WHEN bool_or(status = 'grace')  THEN 'grace'
+                               ELSE 'available'
+                           END AS resolved_status
+                      FROM zip_territories
+                     WHERE county_id = :county_id
+                     GROUP BY zip_code
+                )
+                SELECT resolved_status AS status, COUNT(*) AS n
+                  FROM resolved
+                 GROUP BY resolved_status
+                """
+            ),
+            params,
+        ).all()
 
     counts = {"available": 0, "locked": 0, "grace": 0}
     for status, n in rows:

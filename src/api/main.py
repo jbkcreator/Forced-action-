@@ -772,6 +772,11 @@ class CheckoutRequest(BaseModel):
     # onComplete callback is a separate, frontend-only concern). Must be a
     # same-site relative path — defaults to the marketing /success page.
     success_return_path: Optional[str] = None
+    # T-B12-07 win-back redemption token (the `wt` param on a reactivation
+    # link — src.services.winback_offers). Validated server-side below; a
+    # missing/expired/already-redeemed token is simply ignored (checkout
+    # proceeds at standard price), never trusted for its face value alone.
+    winback_token: Optional[str] = None
 
     @field_validator("success_return_path")
     @classmethod
@@ -1015,20 +1020,46 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
     # Meta Ads attribution + buyer IP/UA captured from the buyer's request.
     checkout_metadata.update(_attribution_stripe_metadata(request, payload.attribution))
 
+    # T-B12-07 win-back redemption (PR #172 review fix): a token only does
+    # something if it's still live — validate it here rather than trusting
+    # the client's say-so. zip_held gets the 50%-off Stripe coupon applied
+    # to THIS session; zip_released carries no discount (credits are granted
+    # post-payment, in the webhook, when the token is redeemed). An
+    # invalid/expired/already-redeemed token is silently ignored — checkout
+    # still proceeds at standard price rather than failing the purchase.
+    winback_discounts = None
+    if payload.winback_token:
+        from src.services.winback_offers import get_valid_offer
+        offer = get_valid_offer(payload.winback_token, db)
+        if offer:
+            checkout_metadata["winback_token"] = payload.winback_token
+            checkout_metadata["winback_branch"] = offer["branch"]
+            if offer["branch"] == "zip_held" and _s.winback_50_off_coupon_id:
+                winback_discounts = [{"coupon": _s.winback_50_off_coupon_id}]
+            elif offer["branch"] == "zip_held":
+                logger.warning(
+                    "checkout: zip_held winback token valid but WINBACK_50_OFF_COUPON_ID "
+                    "is not configured — proceeding without the discount"
+                )
+
     _return_path = payload.success_return_path or "/success?session_id={CHECKOUT_SESSION_ID}"
     if "{CHECKOUT_SESSION_ID}" not in _return_path:
         _sep = "&" if "?" in _return_path else "?"
         _return_path = f"{_return_path}{_sep}session_id={{CHECKOUT_SESSION_ID}}"
 
+    _checkout_kwargs = dict(
+        mode="subscription",
+        ui_mode="embedded",
+        customer_email=payload.email,   # pre-fills email in Stripe form
+        line_items=[line_item],
+        metadata=checkout_metadata,
+        return_url=f"{_s.app_base_url}{_return_path}",
+    )
+    if winback_discounts:
+        _checkout_kwargs["discounts"] = winback_discounts
+
     try:
-        session = stripe.checkout.Session.create(
-            mode="subscription",
-            ui_mode="embedded",
-            customer_email=payload.email,   # pre-fills email in Stripe form
-            line_items=[line_item],
-            metadata=checkout_metadata,
-            return_url=f"{_s.app_base_url}{_return_path}",
-        )
+        session = stripe.checkout.Session.create(**_checkout_kwargs)
     except stripe.error.CardError as e:
         logger.warning("Stripe card error: %s", e.user_message)
         raise HTTPException(
