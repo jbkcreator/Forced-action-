@@ -3071,6 +3071,15 @@ class DealOutcome(Base):
     lead_source: Mapped[Optional[str]] = mapped_column(String(50))  # which signal drove the lead
     days_to_close: Mapped[Optional[int]] = mapped_column(Integer)
     pipeline_stage: Mapped[Optional[str]] = mapped_column(String(30))  # lead / contacted / qualified / proposal / negotiation / closed_won / closed_lost
+    # T-B13-01 — one-tap buyer outcome on the delivered-lead card.
+    # outcome_state is the buyer-facing tap (closed/dead/pending); pipeline_stage
+    # is the derived stage kept for existing consumers. dead_reason is REQUIRED
+    # when outcome_state='dead' (enforced at the API, mirrored by a check
+    # constraint). reason_fault_class splits dead reasons into lead_fault (feeds
+    # the CDS retune) vs buyer_neutral (score-protected, buyer-side log only).
+    outcome_state: Mapped[Optional[str]] = mapped_column(String(10))  # closed / dead / pending
+    dead_reason: Mapped[Optional[str]] = mapped_column(String(30))
+    reason_fault_class: Mapped[Optional[str]] = mapped_column(String(15))  # lead_fault / buyer_neutral
     # fa056 — Stage 10 pricing cohort activation gate columns
     county_id: Mapped[Optional[str]] = mapped_column(String(50))
     trade_vertical: Mapped[Optional[str]] = mapped_column(String(50))
@@ -3091,6 +3100,20 @@ class DealOutcome(Base):
             name="ck_deal_outcomes_confidence_tier",
         ),
         Index("idx_deal_outcome_pipeline_stage", "pipeline_stage"),
+        # T-B13-01 — buyer outcome tap constraints + retune-routing index.
+        CheckConstraint(
+            "outcome_state IS NULL OR outcome_state IN ('closed','dead','pending')",
+            name="ck_deal_outcomes_outcome_state",
+        ),
+        CheckConstraint(
+            "reason_fault_class IS NULL OR reason_fault_class IN ('lead_fault','buyer_neutral')",
+            name="ck_deal_outcomes_reason_fault_class",
+        ),
+        CheckConstraint(
+            "outcome_state <> 'dead' OR dead_reason IS NOT NULL",
+            name="ck_deal_outcomes_dead_requires_reason",
+        ),
+        Index("idx_deal_outcomes_fault_class", "reason_fault_class"),
         Index("idx_deal_outcomes_county_vertical", "county_id", "trade_vertical"),
         Index("idx_deal_outcomes_confidence_tier", "confidence_tier"),
         Index(
@@ -6804,7 +6827,8 @@ class ProspectEvent(Base):
             "'broker.transition',"
             "'sms.sent','sms.reply',"
             "'commission.posted',"
-            "'delivery.sent'"
+            "'delivery.sent',"
+            "'outcome.recorded'"
             ")",
             name="ck_events_event_type",
         ),

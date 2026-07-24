@@ -2119,6 +2119,34 @@ def _accelerated_wallet_offer_fields(subscriber, db) -> dict:
     return out
 
 
+def _outcome_state_by_property(db: Session, subscriber_id: int, property_ids) -> dict:
+    """Block 13: latest subscriber-reported outcome_state per property.
+
+    Latest-wins (max id per property). Drives the "reported" badge on the
+    delivered-lead card so a reported lead reflects its state on reload.
+    Best-effort — a failure here must never break the feed.
+    """
+    ids = [p for p in (property_ids or [])]
+    if not ids:
+        return {}
+    from sqlalchemy import text as _sa_text
+    try:
+        rows = db.execute(
+            _sa_text(
+                "SELECT DISTINCT ON (property_id) property_id, outcome_state "
+                "FROM deal_outcomes "
+                "WHERE subscriber_id = :sid AND property_id = ANY(:pids) "
+                "AND outcome_state IS NOT NULL "
+                "ORDER BY property_id, id DESC"
+            ),
+            {"sid": subscriber_id, "pids": ids},
+        ).fetchall()
+        return {r.property_id: r.outcome_state for r in rows}
+    except Exception as exc:
+        logger.warning("outcome_state map failed for sub=%s: %s", subscriber_id, exc)
+        return {}
+
+
 @app.get("/api/feed/{feed_uuid}")
 def event_feed(
     feed_uuid: str,
@@ -2278,6 +2306,9 @@ def event_feed(
                             "type": inc.incident_type,
                             "date": inc.incident_date.isoformat() if inc.incident_date else None,
                         })
+                    _outcome_map_nz = _outcome_state_by_property(
+                        db, subscriber.id, unlocked_ids_no_zip
+                    )
                     for prop, score, owner in unlocked_rows:
                         owner_phone, owner_phone_quality = _resolve_phone_with_quality(owner)
                         owner_email = (owner.email_1 or owner.email_2) if owner else None
@@ -2307,6 +2338,7 @@ def event_feed(
                             "phone": owner_phone,
                             "phone_quality": owner_phone_quality,
                             "email": owner_email,
+                            "outcome_state": _outcome_map_nz.get(prop.id),
                         })
         except Exception as exc:
             logger.warning("free-tier unlocked leads query failed for sub=%s: %s",
@@ -2564,6 +2596,8 @@ def event_feed(
         county_id=subscriber.county_id,
     )
 
+    outcome_by_prop = _outcome_state_by_property(db, subscriber.id, list(property_ids))
+
     leads = []
     for prop, score, owner in rows:
         is_unlocked = (prop.id in unlocked_ids) or (prop.zip in locked_zip_set)
@@ -2597,6 +2631,7 @@ def event_feed(
             "phone_quality": owner_phone_quality if is_unlocked else None,
             "email": owner_email if is_unlocked else None,
             "portfolio_size": portfolio,
+            "outcome_state": outcome_by_prop.get(prop.id),
         })
 
     from src.core.models import WalletBalance as _WalletBalance
@@ -5209,7 +5244,12 @@ async def telnyx_inbound(request: Request, db: Session = Depends(get_db)):
 class DealCaptureRequest(BaseModel):
     feed_uuid: str
     property_id: int
-    deal_size_bucket: str  # 5_10k | 10_25k | 25k_plus | skip
+    # T-B13-01: outcome_state is the one-tap card surface (closed/dead/pending).
+    # deal_size_bucket is the legacy field, still accepted for back-compat; one of
+    # the two must be present. dead_reason is required when outcome_state='dead'.
+    outcome_state: Optional[str] = None  # closed | dead | pending
+    dead_reason: Optional[str] = None
+    deal_size_bucket: Optional[str] = None  # 5_10k | 10_25k | 25k_plus | skip
     deal_amount: Optional[float] = None
     days_to_close: Optional[int] = None
 
@@ -5222,7 +5262,7 @@ def deal_capture(payload: DealCaptureRequest, db: Session = Depends(get_db)):
     fires the annual-at-deal-win push.
     """
     from src.core.models import DealOutcome
-    from src.services import outcome_confidence
+    from src.services import outcome_confidence, outcome_reasons
 
     sub = db.execute(
         select(Subscriber).where(Subscriber.event_feed_uuid == payload.feed_uuid)
@@ -5231,59 +5271,177 @@ def deal_capture(payload: DealCaptureRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=403, detail="Invalid feed_uuid")
 
     valid_buckets = {"5_10k", "10_25k", "25k_plus", "skip"}
-    if payload.deal_size_bucket not in valid_buckets:
-        raise HTTPException(status_code=422, detail=f"deal_size_bucket must be one of {valid_buckets}")
 
-    outcome = DealOutcome(
-        subscriber_id=sub.id,
-        property_id=payload.property_id,
-        deal_size_bucket=payload.deal_size_bucket,
-        deal_amount=payload.deal_amount,
-        deal_date=date.today(),
-        days_to_close=payload.days_to_close,
-        pipeline_stage="closed_lost" if payload.deal_size_bucket == "skip" else "closed_won",
-        county_id=sub.county_id,
-        trade_vertical=sub.vertical,
-        confidence_tier=outcome_confidence.SUBSCRIBER_REPORTED,
-        outcome_source="subscriber_tap",
-    )
-    db.add(outcome)
+    # T-B13-01: the one-tap card posts outcome_state (closed/dead/pending). The
+    # legacy deal_size_bucket path is preserved for back-compat; one of the two
+    # must be present. outcome_state is stored only when the card supplied it, so
+    # legacy rows keep it NULL (and never trip the dead-requires-reason check).
+    dead_reason: Optional[str] = None
+    fault_class: Optional[str] = None
+    stored_outcome_state: Optional[str] = None
+    if payload.outcome_state is not None:
+        if payload.outcome_state not in outcome_reasons.VALID_OUTCOME_STATES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"outcome_state must be one of {sorted(outcome_reasons.VALID_OUTCOME_STATES)}",
+            )
+        state = payload.outcome_state
+        if state == "dead":
+            if payload.dead_reason not in outcome_reasons.VALID_DEAD_REASONS:
+                raise HTTPException(
+                    status_code=422,
+                    detail="dead_reason is required and must be a valid reason when outcome_state is 'dead'",
+                )
+            dead_reason = payload.dead_reason
+            fault_class = outcome_reasons.fault_class_for(dead_reason)
+        if payload.deal_size_bucket is not None and payload.deal_size_bucket not in valid_buckets:
+            raise HTTPException(status_code=422, detail=f"deal_size_bucket must be one of {valid_buckets}")
+        stored_outcome_state = state
+    elif payload.deal_size_bucket in valid_buckets:
+        state = "dead" if payload.deal_size_bucket == "skip" else "closed"
+        # Legacy clients carry no reason taxonomy. Pre-Block-13, every skip
+        # unconditionally fed the learning loop (snapshot + loss autopsy) — now
+        # that dead outcomes are fault-gated, an unset fault_class would silently
+        # drop legacy submissions from scoring. Preserve the old behavior instead.
+        if state == "dead":
+            fault_class = outcome_reasons.LEAD_FAULT
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail="one of outcome_state or deal_size_bucket is required",
+        )
+
+    pipeline_stage = {"closed": "closed_won", "dead": "closed_lost", "pending": "negotiation"}[state]
+
+    # Latest-wins de-dupe: a subscriber re-reporting the same lead updates the
+    # existing subscriber-tap row instead of stacking duplicate outcomes, so the
+    # feed reflects one current outcome per lead (Block 13 follow-up).
+    outcome = db.execute(
+        select(DealOutcome)
+        .where(
+            DealOutcome.subscriber_id == sub.id,
+            DealOutcome.property_id == payload.property_id,
+            DealOutcome.outcome_source == "subscriber_tap",
+        )
+        .order_by(DealOutcome.id.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    is_update = outcome is not None
+    # pipeline_stage (unlike outcome_state) is always populated, including on
+    # the legacy bucket path, so it's the reliable signal that the outcome
+    # actually changed rather than being re-posted unchanged.
+    prev_pipeline_stage = outcome.pipeline_stage if is_update else None
+    if outcome is None:
+        outcome = DealOutcome(
+            subscriber_id=sub.id,
+            property_id=payload.property_id,
+            confidence_tier=outcome_confidence.SUBSCRIBER_REPORTED,
+            outcome_source="subscriber_tap",
+        )
+        db.add(outcome)
+    outcome.deal_size_bucket = payload.deal_size_bucket
+    outcome.deal_amount = payload.deal_amount
+    outcome.deal_date = date.today()
+    outcome.days_to_close = payload.days_to_close
+    outcome.pipeline_stage = pipeline_stage
+    outcome.outcome_state = stored_outcome_state
+    outcome.dead_reason = dead_reason
+    outcome.reason_fault_class = fault_class
+    outcome.county_id = sub.county_id
+    outcome.trade_vertical = sub.vertical
     db.flush()
 
-    # Subscriber-agnostic learning-loop autopsies — run for every outcome,
-    # including ownerless (founder / public-record inferred) rows.
-    # Phase 3 A5: pre-decision snapshot (captures all 6 vertical scores at routing time)
-    try:
-        from src.services.snapshot_service import capture_snapshot
-        capture_snapshot(
-            property_id=outcome.property_id,
-            db=db,
-            deal_outcome_id=outcome.id,
-            selected_vertical=sub.vertical,
-            outcome_status="lost" if payload.deal_size_bucket == "skip" else "funded",
-        )
-    except Exception as exc:
-        logger.warning("[DealCapture] snapshot capture failed: %s", exc)
+    # If a de-dupe update changed the outcome, the learning artifacts captured
+    # for the previous outcome are now stale (capture_snapshot is idempotent on
+    # deal_outcome_id and would otherwise keep the old outcome_status forever).
+    # Clear them so the re-emitted event (or the inline fallback below) captures
+    # fresh against the new outcome.
+    if is_update and prev_pipeline_stage != pipeline_stage:
+        from sqlalchemy import text as _sa_text
+        for _tbl in ("pre_decision_snapshots", "loss_autopsies"):
+            try:
+                db.execute(
+                    _sa_text(f"DELETE FROM {_tbl} WHERE deal_outcome_id = :oid"),
+                    {"oid": outcome.id},
+                )
+            except Exception as exc:
+                logger.warning("[DealCapture] stale %s cleanup failed: %s", _tbl, exc)
 
-    # Phase 3 A1: loss autopsy for closed_lost deals (deal_size_bucket == "skip")
-    if payload.deal_size_bucket == "skip":
-        try:
-            from src.services.loss_autopsy import run_loss_autopsy
-            run_loss_autopsy(
-                property_id=outcome.property_id,
-                trigger_reason="CLOSED_LOST",
-                db=db,
-                deal_outcome_id=outcome.id,
+    # T-B13-01: pending is a non-terminal tap — record it, but fire no
+    # terminal effects (recalculation or interaction feedback).
+    is_terminal = state != "pending"
+
+    # T-B13-02: the heavy recalculation consumers (learning-loop snapshot +
+    # loss autopsy, the latter an inline LLM call) are decoupled. Emit ONE
+    # outcome event to the transactional outbox — committed atomically with this
+    # request's DealOutcome write — and let the outcome dispatch sweep fan it
+    # out to the idempotent poll consumers. Keeps the buyer's tap latency off
+    # score recalculation (§7.1). Consumers route on reason_fault_class so only
+    # lead-fault dead outcomes reach scoring; buyer-neutral is score-protected.
+    if is_terminal:
+        from sqlalchemy import text as _sa_text
+
+        outcome_payload = {
+            "deal_outcome_id": outcome.id,
+            "property_id": outcome.property_id,
+            "subscriber_id": sub.id,
+            "selected_vertical": sub.vertical,
+            "outcome_state": state,
+            "pipeline_stage": pipeline_stage,
+            "dead_reason": dead_reason,
+            "reason_fault_class": fault_class,
+        }
+        # The outbox events table is prospect-scoped (prospect_id NOT NULL).
+        # A subscriber-tap outcome is a delivered lead, so it resolves to a
+        # prospect via property_id; emit the decoupled event in that case.
+        prospect_id = db.execute(
+            _sa_text(
+                "SELECT prospect_id FROM prospects WHERE property_id = :pid "
+                "ORDER BY created_at DESC LIMIT 1"
+            ),
+            {"pid": outcome.property_id},
+        ).scalar()
+        if prospect_id is not None:
+            from src.services.event_bus import emit_event
+            emit_event(
+                db,
+                event_type="outcome.recorded",
+                actor="subscriber_tap",
+                source_component="deal_capture",
+                payload=outcome_payload,
+                prospect_id=prospect_id,
             )
-        except Exception as exc:
-            logger.warning("[DealCapture] loss autopsy failed: %s", exc)
+        else:
+            # No prospect row (e.g. founder/ownerless import) — recalc inline for
+            # this row rather than drop it. Same score-protection routing as the
+            # async consumers, which now raise on a genuine capture failure
+            # (vs. their own idempotent no-op) — each call gets its own
+            # savepoint so a raised failure only rolls back that attempt, not
+            # this whole request's DealOutcome write (bare try/except would
+            # otherwise leave Postgres's transaction aborted for every later
+            # statement, including this request's own commit).
+            from src.consumers import outcome_consumers
+            try:
+                with db.begin_nested():
+                    outcome_consumers.apply_snapshot(db, outcome_payload)
+            except Exception as exc:
+                logger.warning("[DealCapture] inline snapshot failed: %s", exc)
+            try:
+                with db.begin_nested():
+                    outcome_consumers.apply_loss_autopsy(db, outcome_payload)
+            except Exception as exc:
+                logger.warning("[DealCapture] inline loss autopsy failed: %s", exc)
 
-    # Subscriber-only side-effects (win graphic, win story, annual push,
-    # attribution, suppression). No-op for ownerless outcomes — CDE-11.
-    from src.services.deal_outcome_effects import record_outcome_side_effects
-    effects = record_outcome_side_effects(outcome, sub, db)
-    graphic_url: Optional[str] = effects["graphic_url"]
-    annual_offered = effects["annual_offered"]
+    # Subscriber-only interaction feedback (win graphic, win story, annual push,
+    # attribution, suppression) — stays inline: it IS the tap's response, not
+    # recalculation. No-op for ownerless outcomes (CDE-11) and non-terminal taps.
+    graphic_url: Optional[str] = None
+    annual_offered = False
+    if is_terminal:
+        from src.services.deal_outcome_effects import record_outcome_side_effects
+        effects = record_outcome_side_effects(outcome, sub, db)
+        graphic_url = effects["graphic_url"]
+        annual_offered = effects["annual_offered"]
 
     return {
         "ok": True,
