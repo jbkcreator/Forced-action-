@@ -7973,6 +7973,21 @@ class BuyerEntity(Base):
     verification_status: Mapped[str] = mapped_column(String(20), nullable=False, default="unverified")
     total_purchase_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     total_cash_volume: Mapped[Decimal] = mapped_column(Numeric(14, 2), nullable=False, default=0)
+
+    # HUNTER-02 (W1) — 3+ purchases in trailing 18 months OR >$500K total cash.
+    # Persisted rather than recomputed on every read since Cell #1's ranked
+    # whale list (W3) needs to query this cheaply and often; refreshed by the
+    # nightly sweep (H3), not on every write to this row.
+    is_whale: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    whale_flagged_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    # Minted once, the moment an entity first qualifies as a whale (per the
+    # dev-split plan §6b — Hunter is first in Phase 1 to need one). Format
+    # OPP-YYYY-##### per docs/plans/agent_lane_phase1_week1_dev_split.md.
+    # Never reassigned even if the entity later drops out of whale status —
+    # it identifies the opportunity, not the current flag state.
+    opportunity_thread_id: Mapped[Optional[str]] = mapped_column(String(20), unique=True)
+
     county_id: Mapped[Optional[str]] = mapped_column(String(50), index=True)
     first_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,
@@ -7990,7 +8005,7 @@ class BuyerEntity(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "entity_type IN ('Individual', 'LLC', 'Trust', 'Corporate')",
+            "entity_type IN ('Individual', 'LLC', 'Trust', 'Corporate', 'Estate')",
             name="check_buyer_entity_type",
         ),
         CheckConstraint(
@@ -8002,6 +8017,7 @@ class BuyerEntity(Base):
             name="check_buyer_entity_confidence_range",
         ),
         Index("idx_buyer_entities_confidence", "confidence_score"),
+        Index("idx_buyer_entities_is_whale", "is_whale", postgresql_where=text("is_whale")),
     )
 
     def __repr__(self) -> str:

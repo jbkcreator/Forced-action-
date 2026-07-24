@@ -37,6 +37,25 @@ SUNBIZ_STRUCTURAL_CONFIDENCE = 97 # fixed — this is a sourced fact (Sunbiz reg
 
 _MIN_BLOCK_TOKEN_LEN = 3  # skip short tokens (initials, "JR", "LLC" residue) as blocking keys — too many false co-occurrences
 
+# A token used by more than this many records is too generic to safely block
+# on — comparing every pair within that group costs O(group_size^2). Confirmed
+# via a real full-scale run: legitimate institutional investors (a REIT's
+# corporate officers, a large FL developer) appear as a managing member on
+# 500-700+ separate LLCs each, and generic words like "FLORIDA" are shared by
+# many more unrelated companies on top of that — comparison groups built from
+# these tokens blew up to 2M+ edges and 17+ minutes on one step alone.
+MAX_BLOCK_FREQUENCY = 500
+
+
+def _token_frequencies(token_sets: Iterable[set[str]]) -> dict[str, int]:
+    """How many records each token appears in, across one full pass — used
+    to identify tokens too generic to block on before any blocks are built."""
+    freq: dict[str, int] = defaultdict(int)
+    for tokens in token_sets:
+        for t in tokens:
+            freq[t] += 1
+    return freq
+
 # Deterministic pairwise-scoring thresholds — see score_candidate_pair.
 NAME_AUTO_MATCH_MIN = 90   # + address agreement (>=ADDRESS_AGREE_MIN) -> exact_name_address
 NAME_FUZZY_MIN = 85        # name alone (no address to corroborate, or address didn't agree) -> fuzzy_name
@@ -241,13 +260,24 @@ def find_structural_edges(
     people who happen to share a common name) get auto-linked at
     structural-tier confidence with zero corroboration. That comparison
     belongs to H2.3's fuzzy+address scoring, not here.
+
+    Tokens appearing in more than MAX_BLOCK_FREQUENCY mentions are excluded
+    as blocking keys entirely (see that constant) — confirmed necessary via
+    a real full-scale run where this step alone took 17 minutes and produced
+    2M+ edges before this cap existed.
     """
     mentions = _controller_mentions(owner_candidates)
+    mention_token_sets = [
+        {t for t in m.person_name_normalized.split(" ") if len(t) >= _MIN_BLOCK_TOKEN_LEN}
+        for m in mentions
+    ]
+    token_freq = _token_frequencies(mention_token_sets)
 
     blocks: dict[str, list[_ControllerMention]] = defaultdict(list)
-    for m in mentions:
-        tokens = {t for t in m.person_name_normalized.split(" ") if len(t) >= _MIN_BLOCK_TOKEN_LEN}
+    for m, tokens in zip(mentions, mention_token_sets):
         for token in tokens:
+            if token_freq[token] > MAX_BLOCK_FREQUENCY:
+                continue  # too generic -- would create a runaway O(n^2) comparison group
             blocks[token].append(m)
 
     edges: list[tuple[CandidateRecord, CandidateRecord, MatchVerdict]] = []
@@ -302,11 +332,22 @@ def block_candidates(
     block per significant token in its normalized name, each combined with
     its ZIP (or None if no address is available — typical for deed-sourced
     candidates whose property has no matching current owner).
+
+    Tokens appearing in more than MAX_BLOCK_FREQUENCY candidates are excluded
+    as blocking keys entirely — the same institutional mega-names that force
+    this cap in find_structural_edges (a REIT's officers, common words like
+    "FLORIDA") apply here too, since this blocks on the same candidate pool.
     """
+    candidates = list(candidates)  # consumed twice below -- must not be a one-shot generator
+    token_sets = [_block_key_tokens(c.normalized_name) for c in candidates]
+    token_freq = _token_frequencies(token_sets)
+
     blocks: dict[tuple[str, Optional[str]], list[CandidateRecord]] = defaultdict(list)
-    for cand in candidates:
+    for cand, tokens in zip(candidates, token_sets):
         zip_code = _extract_zip(cand.mailing_address)
-        for token in _block_key_tokens(cand.normalized_name):
+        for token in tokens:
+            if token_freq[token] > MAX_BLOCK_FREQUENCY:
+                continue
             blocks[(token, zip_code)].append(cand)
     return blocks
 
@@ -864,3 +905,64 @@ def run_incremental(session: Session, county_id: Optional[str] = None) -> dict:
         "conflicts": conflicts,
         "processed": len(new_candidates),
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Portfolio aggregation — shared by H3 (portfolio/cadence reporting) and
+# HUNTER-02's W1 (whale threshold check). Neither H2.1-H2.7 nor the backfill/
+# incremental scripts populate BuyerEntity.total_purchase_count/
+# total_cash_volume, even though the columns exist on the schema from H1 --
+# this is that missing piece.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def refresh_portfolio_aggregates(session: Session, entity_ids: Optional[list[int]] = None) -> int:
+    """
+    Recompute BuyerEntity.total_purchase_count/total_cash_volume from linked
+    deeds, in one SQL statement — never looping per-entity (an entity-by-
+    entity Python loop would be exactly the "query inside a loop" pattern
+    this repo's conventions forbid). Entities with no deed-sourced links are
+    left at their existing value (0 by default) — the aggregation only
+    touches entities that actually have deed history to sum.
+
+    This is an ALL-TIME count/sum, a general portfolio-size summary for
+    H3's reporting. It is NOT the same question as HUNTER-02's whale rule
+    ("3+ purchases in the trailing 18 months") — that's a rolling window,
+    and an all-time count can't answer it (3 purchases spread over 5 years
+    doesn't qualify; W1 runs its own dedicated windowed query for that half
+    of the rule, and reuses total_cash_volume from here for its other half,
+    the >$500K-all-time check).
+
+    entity_ids=None recomputes every entity (used once after the backfill);
+    passing specific IDs scopes the recompute to just those (used by the
+    nightly sweep, which only needs to refresh entities that got a new link
+    this run, not the whole table).
+
+    purchase_count is DISTINCT property_id, not a raw row count, and
+    cash_volume excludes sale_price < $1,000 -- found via the HUNTER-02
+    founder spot-check: multiple deed documents recorded for the same
+    property/date (corrective re-recordings) and $1/$10 nominal-consideration
+    transfers (family, trust) were inflating purchase counts without any
+    real purchase happening.
+    """
+    where_clause = "WHERE bel.buyer_entity_id = ANY(:entity_ids)" if entity_ids else ""
+    result = session.execute(
+        text(f"""
+            UPDATE buyer_entities be
+            SET total_purchase_count = agg.purchase_count,
+                total_cash_volume = agg.cash_volume,
+                last_updated_at = now()
+            FROM (
+                SELECT bel.buyer_entity_id,
+                       COUNT(DISTINCT d.property_id) AS purchase_count,
+                       COALESCE(SUM(d.sale_price) FILTER (WHERE d.sale_price >= 1000), 0) AS cash_volume
+                FROM buyer_entity_links bel
+                JOIN deeds d ON d.id = bel.source_id AND bel.source_table = 'deeds'
+                {where_clause}
+                GROUP BY bel.buyer_entity_id
+            ) agg
+            WHERE be.id = agg.buyer_entity_id
+        """),
+        {"entity_ids": entity_ids} if entity_ids else {},
+    )
+    session.commit()
+    return result.rowcount

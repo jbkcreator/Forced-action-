@@ -778,6 +778,25 @@ COUNTY_ID=hillsborough
 0 9 2 * * $PROJECT/scripts/cron/run.sh src.connectors.dor_sale_outcomes --county-id $COUNTY_ID
 1 9 2 * * $PROJECT/scripts/cron/run.sh src.connectors.dor_sale_outcomes --county-id pinellas
 
+# ── HUNTER-01/02 — BUYER ENTITY RESOLUTION + WHALE DETECTION (H3, W2) ────────
+# Nightly sweep — daily, after outcome_label_layer (08:25/08:26) so the same
+# day's newly-promoted deed activity is available to resolve against. Runs
+# H2's incremental resolver against buyer_entities (never a full re-cluster —
+# entity IDs stay stable), then portfolio aggregation, then whale-flag
+# scoring, in that dependency order. Does not yet write to
+# /shared/facts/enriched/ — see src/tasks/hunter_nightly_sweep.py docstring.
+30 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.hunter_nightly_sweep --county-id $COUNTY_ID
+31 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.hunter_nightly_sweep --county-id pinellas
+
+# Auction-winner fast-follow (W2) — runs just after the nightly sweep as a
+# supplementary <24h latency check on distressed-acquisition deeds
+# specifically (tax deed/certificate of title/sheriff sale), per Hunter's
+# constitution standing run #2. Redundant with the sweep's own whale refresh
+# on a normal night; the real value is catching a fresh auction win before
+# the next scheduled sweep if this entry's cadence is ever tightened.
+35 8 * * * $PROJECT/scripts/cron/run.sh src.connectors.whale_auction_fast_follow --county-id $COUNTY_ID
+36 8 * * * $PROJECT/scripts/cron/run.sh src.connectors.whale_auction_fast_follow --county-id pinellas
+
 # ── CDS SCORING RETUNE (client Q9 — closed loop) ─────────────
 # Weekly Sunday @ 11:00 UTC. Runs B→C→D→E→F end to end: builds the training
 # set, fits per-vertical weights, shadow-rescores, validates, and (only if the
