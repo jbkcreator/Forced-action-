@@ -18,6 +18,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -4544,6 +4545,93 @@ class SynthflowInboundPayload(BaseModel):
             return self.call.get("call_id") or self.call.get("id")
         return None
 
+    @property
+    def resolved_intent_slot(self) -> bool:
+        """
+        True when the inbound Synthflow agent's own flow explicitly captured
+        buy-ready intent as a slot (B11-02 signal 5, highest-weighted).
+        Slot name is not yet standardized across flows — check the common
+        candidates the inbound Flow Designer agent may emit.
+        """
+        raw = (
+            self._slot(self.collected_variables, "ready_to_buy", "high_intent", "buy_intent")
+            or self._slot(self.executed_actions, "ready_to_buy", "high_intent", "buy_intent")
+        )
+        return str(raw).strip().lower() in ("yes", "true", "1")
+
+    @property
+    def resolved_transcript_text(self) -> str:
+        from src.services.synthflow_transcript import transcript_to_text
+        return transcript_to_text(self._transcript)
+
+
+def _trigger_hot_inbound_callback(
+    *,
+    db: Session,
+    intent: Dict[str, Any],
+    subscriber_id: Optional[int],
+    vertical: Optional[str],
+    call_id: str,
+) -> None:
+    """
+    Block 11 / B11-03: if the inbound scored hot, publish inbound_hot_callback
+    so the Cora process routes it to the EXISTING new_lead_voice_call graph
+    (Block 2) — zero new call code, consent/compliance/kill-switch reused.
+    decision_id=call_id so B11-04 tracking can join webhook -> event -> graph.
+
+    Publishes via publish_after_commit (not publish_cora_event directly): the
+    request's own transaction — the new/resolved subscriber, SmsOptIn, and the
+    inbound_response row written just before this call — is not yet committed
+    when this function runs (FastAPI's get_db commits only after the endpoint
+    returns). A fast Redis consumer could otherwise pick up the event and hit
+    get_subscriber_profile before that row is visible, aborting the callback
+    graph with subscriber_not_found. Deferring to after_commit guarantees the
+    event is only published once the row is durable.
+    """
+    if not intent.get("is_hot"):
+        return
+    if not subscriber_id:
+        logger.warning(
+            "[SynthflowInbound] hot inbound with no subscriber_id — callback not triggered call_id=%s",
+            call_id,
+        )
+        return
+
+    from src.agents.events.ingestion import publish_after_commit
+
+    publish_after_commit(db, {
+        "event_type": "inbound_hot_callback",
+        "subscriber_id": subscriber_id,
+        "decision_id": call_id,
+        "payload": {
+            "vertical": vertical,
+            "score": intent.get("score"),
+            "matched_signals": intent.get("matched_signals"),
+        },
+    })
+    logger.info(
+        "[SynthflowInbound] inbound_hot_callback queued for after-commit publish sub=%s call_id=%s score=%s",
+        subscriber_id, call_id, intent.get("score"),
+    )
+
+
+def _resolve_inbound_call_id(payload: "SynthflowInboundPayload", raw_body: bytes) -> str:
+    """
+    Resolve a stable, never-null id for one inbound webhook delivery.
+
+    call_id is optional on the wire, but a hot-inbound response row's
+    decision_id must never be NULL — reconciliation joins on it, and SQL
+    never joins NULL to NULL, so a NULL decision_id stays permanently
+    'pending'. When the provider omits an id, derive a deterministic one
+    from the raw request body: a genuine retry resends an identical body
+    and gets the identical id, so both the webhook idempotency check and
+    downstream B11-04 tracking still work; distinct calls hash distinct.
+    Always exactly 36 chars, matching the decision_id VARCHAR(36) columns.
+    """
+    return payload.resolved_call_id or str(
+        uuid.uuid5(uuid.NAMESPACE_URL, raw_body.decode("utf-8", errors="replace"))
+    )
+
 
 def _verify_synthflow_secret(request: Request) -> bool:
     """Accept X-Synthflow-Secret or Authorization: Bearer <secret>."""
@@ -4583,6 +4671,9 @@ async def synthflow_inbound_webhook(request: Request, db: Session = Depends(get_
     from src.services.signup_engine import onboard_inbound_caller
     from src.services.webhook_log import log_webhook_event
 
+    # Block 11 / B11-01 t0: the sub-60s SLA clock starts here, at webhook receipt.
+    inbound_received_at = datetime.now(timezone.utc)
+
     raw_body = await request.body()
 
     if not _verify_synthflow_secret(request):
@@ -4615,15 +4706,16 @@ async def synthflow_inbound_webhook(request: Request, db: Session = Depends(get_
         logger.error("[SynthflowInbound] payload validation failed: %s", exc)
         return {"status": "error", "reason": "invalid_payload"}
 
-    call_id = payload.resolved_call_id
     phone = payload.resolved_phone
+    call_id = _resolve_inbound_call_id(payload, raw_body)
 
-    # Idempotency: reject replays of the same call_id.
-    if call_id:
-        from src.services.webhook_log import already_logged
-        if already_logged(source="synthflow_inbound", source_event_id=call_id):
-            logger.info("[SynthflowInbound] duplicate call_id=%s — no-op", call_id)
-            return {"status": "duplicate", "call_id": call_id}
+    # Idempotency: reject replays of the same call_id. Unconditional now that
+    # call_id is guaranteed non-None — previously an omitted id bypassed this
+    # check entirely, letting retries enqueue duplicate hot-inbound callbacks.
+    from src.services.webhook_log import already_logged
+    if already_logged(source="synthflow_inbound", source_event_id=call_id):
+        logger.info("[SynthflowInbound] duplicate call_id=%s — no-op", call_id)
+        return {"status": "duplicate", "call_id": call_id}
 
     log_webhook_event(
         source="synthflow_inbound",
@@ -4652,7 +4744,49 @@ async def synthflow_inbound_webhook(request: Request, db: Session = Depends(get_
         call_id, phone, result.get("subscriber_id"),
         result.get("is_new"), result.get("lead_count"), result.get("capture_complete"),
     )
-    return {"status": "ok", **result}
+
+    # Block 11 / B11-01: score for high intent inside the sub-60s inbound
+    # window. Scoring only — the B11-03 callback trigger consumes this via
+    # publish_cora_event and reuses Block 2's consent/compliance gates.
+    from src.services.inbound_intent import score_inbound
+    from src.services.phone_utils import normalize as normalize_phone
+
+    # subscribers.phone is stored E.164-normalized, so normalize at this
+    # boundary before scoring — otherwise the known_caller lookup compares a
+    # raw payload string against a normalized column and silently never matches.
+    intent = score_inbound(
+        phone=normalize_phone(phone),
+        zip_code=payload.resolved_zip,
+        vertical=payload.resolved_vertical,
+        transcript=payload.resolved_transcript_text,
+        intent_slot=payload.resolved_intent_slot,
+        db=db,
+    )
+    logger.info(
+        "[SynthflowInbound] intent score call_id=%s sub=%s score=%d is_hot=%s signals=%s",
+        call_id, result.get("subscriber_id"), intent["score"], intent["is_hot"], intent["matched_signals"],
+    )
+
+    if intent["is_hot"]:
+        from src.services.inbound_response_tracking import record_inbound_response
+        record_inbound_response(
+            db=db,
+            subscriber_id=result.get("subscriber_id"),
+            decision_id=call_id,
+            t0=inbound_received_at,
+            score=intent["score"],
+            matched_signals=intent["matched_signals"],
+        )
+
+    _trigger_hot_inbound_callback(
+        db=db,
+        intent=intent,
+        subscriber_id=result.get("subscriber_id"),
+        vertical=payload.resolved_vertical,
+        call_id=call_id,
+    )
+
+    return {"status": "ok", **result, "intent": intent}
 
 
 # ---------------------------------------------------------------------------
@@ -5549,6 +5683,28 @@ def affiliate_ledger(
     except SQLAlchemyError:
         logger.exception("affiliate_ledger: database error affiliate_id=%s", affiliate_id)
         raise HTTPException(status_code=500, detail="Failed to load affiliate ledger")
+
+
+@app.get("/api/admin/inbound-velocity")
+def inbound_velocity_stats(
+    db: Session = Depends(get_db),
+    _admin: dict = Depends(get_current_admin),
+):
+    """
+    Block 11 / B11-04 — inbound response-time report. Reconciles any pending
+    rows against agent_decisions, then returns counts, p50/p95 time-to-
+    callback, and outcome rates. Report-only; admin JWT required.
+    """
+    from src.services.inbound_response_tracking import (
+        get_inbound_velocity_stats,
+        sync_inbound_response_outcomes,
+    )
+    try:
+        sync_inbound_response_outcomes(db)
+        return get_inbound_velocity_stats(db)
+    except SQLAlchemyError:
+        logger.exception("inbound_velocity_stats: database error")
+        raise HTTPException(status_code=500, detail="Failed to load inbound velocity stats")
 
 
 @app.get("/api/admin/human-close")

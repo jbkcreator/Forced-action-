@@ -102,6 +102,14 @@ EVENT_TO_GRAPH: Dict[str, GraphSpec] = {
 		graph_name="new_lead_voice_call",
 		runner=_run_new_lead_voice_call,
 	),
+	# Block 11 / B11-03 — hot inbound callback. Routed to the SAME graph as
+	# new_lead_signup (Block 2): zero new call code, consent/compliance/
+	# kill-switch all reused as-is. See .scratch/block-11-inbound-velocity/
+	# SPEC.md (ticket 03) for the "bill once, no duplicate" decision.
+	"inbound_hot_callback": GraphSpec(
+		graph_name="new_lead_voice_call",
+		runner=_run_new_lead_voice_call,
+	),
 	"nws_storm_alert_active": GraphSpec(
 		graph_name="nws_urgency",
 		runner=_run_nws_urgency,
