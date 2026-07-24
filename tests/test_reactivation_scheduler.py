@@ -461,49 +461,72 @@ class TestSoldOutCohort:
 # 4. RUN ORCHESTRATOR
 # ═══════════════════════════════════════════════════════════════════════════════
 
+_EMPTY = {"checked": 0, "eligible": 0, "sent": 0, "skipped": 0, "errors": 0}
+
+
 class TestRunOrchestrator:
     _CL_RESULT = {"checked": 3, "eligible": 2, "sent": 2, "skipped": 1, "errors": 0}
     _SO_RESULT = {"checked": 2, "eligible": 1, "sent": 1, "skipped": 1, "errors": 0}
+    _T3_RESULT = {"checked": 1, "eligible": 1, "sent": 1, "skipped": 0, "errors": 0}
 
+    @patch("src.tasks.reactivation_scheduler._run_tier3_winback", return_value=_T3_RESULT)
     @patch("src.tasks.reactivation_scheduler._run_sold_out", return_value=_SO_RESULT)
     @patch("src.tasks.reactivation_scheduler._run_county_live", return_value=_CL_RESULT)
-    def test_run_all_calls_both_cohorts_and_aggregates(self, mock_cl, mock_so):
+    def test_run_all_calls_all_cohorts_and_aggregates(self, mock_cl, mock_so, mock_t3):
         from src.tasks.reactivation_scheduler import run
         result = run(cohort="all", db=MagicMock())
         mock_cl.assert_called_once()
         mock_so.assert_called_once()
-        assert result["sent"] == 3
-        assert result["checked"] == 5
+        mock_t3.assert_called_once()
+        assert result["sent"] == 4
+        assert result["checked"] == 6
 
+    @patch("src.tasks.reactivation_scheduler._run_tier3_winback")
     @patch("src.tasks.reactivation_scheduler._run_sold_out")
     @patch("src.tasks.reactivation_scheduler._run_county_live", return_value=_CL_RESULT)
-    def test_run_county_live_only(self, mock_cl, mock_so):
+    def test_run_county_live_only(self, mock_cl, mock_so, mock_t3):
         from src.tasks.reactivation_scheduler import run
         result = run(cohort="county_live", db=MagicMock())
         assert result["cohort"] == "county_live"
         mock_cl.assert_called_once()
         mock_so.assert_not_called()
+        mock_t3.assert_not_called()
 
+    @patch("src.tasks.reactivation_scheduler._run_tier3_winback")
     @patch("src.tasks.reactivation_scheduler._run_county_live")
     @patch("src.tasks.reactivation_scheduler._run_sold_out", return_value=_SO_RESULT)
-    def test_run_sold_out_only(self, mock_so, mock_cl):
+    def test_run_sold_out_only(self, mock_so, mock_cl, mock_t3):
         from src.tasks.reactivation_scheduler import run
         result = run(cohort="sold_out", db=MagicMock())
         assert result["cohort"] == "sold_out"
         mock_so.assert_called_once()
         mock_cl.assert_not_called()
+        mock_t3.assert_not_called()
 
-    @patch("src.tasks.reactivation_scheduler._run_sold_out", return_value={"checked": 0, "eligible": 0, "sent": 0, "skipped": 0, "errors": 0})
-    @patch("src.tasks.reactivation_scheduler._run_county_live", return_value={"checked": 0, "eligible": 0, "sent": 0, "skipped": 0, "errors": 0})
-    def test_dry_run_flag_set_in_result(self, _cl, _so):
+    @patch("src.tasks.reactivation_scheduler._run_sold_out")
+    @patch("src.tasks.reactivation_scheduler._run_county_live")
+    @patch("src.tasks.reactivation_scheduler._run_tier3_winback", return_value=_T3_RESULT)
+    def test_run_tier3_winback_only(self, mock_t3, mock_cl, mock_so):
+        from src.tasks.reactivation_scheduler import run
+        result = run(cohort="tier3_winback", db=MagicMock())
+        assert result["cohort"] == "tier3_winback"
+        mock_t3.assert_called_once()
+        mock_cl.assert_not_called()
+        mock_so.assert_not_called()
+
+    @patch("src.tasks.reactivation_scheduler._run_tier3_winback", return_value=_EMPTY)
+    @patch("src.tasks.reactivation_scheduler._run_sold_out", return_value=_EMPTY)
+    @patch("src.tasks.reactivation_scheduler._run_county_live", return_value=_EMPTY)
+    def test_dry_run_flag_set_in_result(self, _cl, _so, _t3):
         from src.tasks.reactivation_scheduler import run
         result = run(cohort="all", dry_run=True, db=MagicMock())
         assert result["dry_run"] is True
 
+    @patch("src.tasks.reactivation_scheduler._run_tier3_winback", return_value=_EMPTY)
     @patch("src.tasks.reactivation_scheduler._run_sold_out", return_value={"checked": 2, "eligible": 2, "sent": 2, "skipped": 0, "errors": 0})
     @patch("src.tasks.reactivation_scheduler._run_county_live", return_value=_CL_RESULT)
-    def test_global_limit_splits_correctly_across_cohorts(self, mock_cl, mock_so):
-        """County-live runs first; remaining capacity is forwarded to sold-out."""
+    def test_global_limit_splits_correctly_across_cohorts(self, mock_cl, mock_so, mock_t3):
+        """County-live runs first; remaining capacity is forwarded to sold-out, then tier3."""
         from src.tasks.reactivation_scheduler import run
         run(cohort="all", limit=5, db=MagicMock())
         # county_live received full limit=5
@@ -512,10 +535,14 @@ class TestRunOrchestrator:
         # sold_out received remaining = 5 - 2 (sent by county_live) = 3
         so_limit = mock_so.call_args.args[2]
         assert so_limit == 3
+        # tier3_winback received remaining = 5 - 2 - 2 (sent by sold_out) = 1
+        t3_limit = mock_t3.call_args.args[2]
+        assert t3_limit == 1
 
-    @patch("src.tasks.reactivation_scheduler._run_sold_out", return_value={"checked": 0, "eligible": 0, "sent": 0, "skipped": 0, "errors": 0})
-    @patch("src.tasks.reactivation_scheduler._run_county_live", return_value={"checked": 0, "eligible": 0, "sent": 0, "skipped": 0, "errors": 0})
-    def test_result_contains_all_expected_keys(self, _cl, _so):
+    @patch("src.tasks.reactivation_scheduler._run_tier3_winback", return_value=_EMPTY)
+    @patch("src.tasks.reactivation_scheduler._run_sold_out", return_value=_EMPTY)
+    @patch("src.tasks.reactivation_scheduler._run_county_live", return_value=_EMPTY)
+    def test_result_contains_all_expected_keys(self, _cl, _so, _t3):
         from src.tasks.reactivation_scheduler import run
         result = run(cohort="all", db=MagicMock())
         assert set(result.keys()) == {"cohort", "checked", "eligible", "sent", "skipped", "errors", "dry_run"}

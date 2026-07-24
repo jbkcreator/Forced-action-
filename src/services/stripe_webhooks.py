@@ -788,6 +788,38 @@ def _on_checkout_completed(session: dict, db: Session, background_tasks=None) ->
             stripe_customer_id, exc_info=True,
         )
 
+    # ── T-B12-07: redeem a win-back offer token, if this checkout carried one ──
+    # (PR #172 review fix) A completed checkout is the only point that proves
+    # an actual reactivation happened — this is where the promised benefit is
+    # finally realized. zip_held's 50%-off was already applied as a Stripe
+    # coupon on the session itself (see /api/checkout); here we only mark the
+    # token redeemed. zip_released never had a discount — its 5-credit grant
+    # happens ONLY here, not at message-send time.
+    #
+    # redeem_offer() (sets redeemed_at) and grant_winback_credits() (sets
+    # credits_granted_at) are intentionally NOT wrapped so that a grant
+    # failure rolls back the redemption too — grant_winback_credits already
+    # catches its own exceptions and returns False rather than raising, by
+    # design, so it can never poison this savepoint (PR #172 follow-up
+    # review). A failed grant instead leaves redeemed_at set and
+    # credits_granted_at NULL, which reconcile_pending_credit_grants() (run
+    # periodically, see scripts/cron/crontab.txt) finds and retries — so the
+    # benefit is delayed, never lost, without needing to fail the whole
+    # webhook or block Stripe's ack.
+    _winback_token = meta.get("winback_token")
+    if _winback_token:
+        try:
+            with db.begin_nested():
+                from src.services.winback_offers import redeem_offer, grant_winback_credits
+                redeemed = redeem_offer(_winback_token, db)
+                if redeemed and redeemed["branch"] == "zip_released":
+                    grant_winback_credits(redeemed["subscriber_id"], db, token=_winback_token)
+        except Exception:
+            logger.error(
+                "winback offer redemption failed for token=%s customer=%s",
+                _winback_token, stripe_customer_id, exc_info=True,
+            )
+
     # ── Lock ZIP territories (same transaction) ────────────────────────────
     # A buyer paid for exclusive territory on every requested ZIP. If ANY of
     # them is lost to a concurrent checkout (the exact TOCTOU window
@@ -2626,6 +2658,14 @@ def fulfill_founder_comp_reveal(subscriber, property_id_raw, db: Session) -> boo
     if not is_first_reveal:
         return True
 
+    # T-B12-05: founder comp reveal is a $0 unlock but still IS the
+    # activation event (first contact reveal), so it must stamp the clock.
+    try:
+        from src.services.activation_tracking import stamp_first_unlock
+        stamp_first_unlock(subscriber.id, db)
+    except Exception:
+        logger.warning("founder_comp reveal: activation stamp failed sub=%s", subscriber.id)
+
     try:
         from src.services.auto_mode import enqueue_action
         enqueue_action(subscriber.id, property_id, db)
@@ -2808,6 +2848,11 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
                 SentLead.source == "lead_unlock_payment",
             )
         ).scalar() or 0
+        # T-B12-05: stamp the activation event (first-ever contact unlock)
+        # regardless of welcome-email eligibility above.
+        from src.services.activation_tracking import stamp_first_unlock
+        stamp_first_unlock(subscriber.id, db)
+
         if first_unlock <= 1:
             from src.services.email import send_welcome_email
             from src.services import subscriber_auth as _sub_auth

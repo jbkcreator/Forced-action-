@@ -122,6 +122,7 @@ from src.api.sms_analytics_router import router as sms_analytics_router  # noqa:
 from src.api.operator_crm_router import router as operator_crm_router  # noqa: E402
 from src.api.closer_router import router as closer_router  # noqa: E402
 from src.api.feedback_ritual_router import router as feedback_ritual_router  # noqa: E402
+from src.api.deal_of_the_day_router import router as deal_of_the_day_router  # noqa: E402
 app.include_router(admin_router)
 app.include_router(attribution_router)
 app.include_router(cora_incidents_router)
@@ -129,6 +130,7 @@ app.include_router(sms_analytics_router)
 app.include_router(operator_crm_router)
 app.include_router(closer_router)
 app.include_router(feedback_ritual_router)
+app.include_router(deal_of_the_day_router)
 
 from src.api.chat_router import router as chat_router  # noqa: E402
 app.include_router(chat_router)
@@ -195,6 +197,9 @@ from src.api.snapshot_router import router as snapshot_router  # noqa: E402
 app.include_router(snapshot_router)
 from src.api.score_feedback_router import router as score_feedback_router  # noqa: E402
 app.include_router(score_feedback_router)
+
+from src.api.hero_router import router as hero_router  # noqa: E402
+app.include_router(hero_router)
 from src.api.underwriting_router import router as underwriting_router  # noqa: E402
 app.include_router(underwriting_router)
 from src.api.broker_router import router as broker_router  # noqa: E402
@@ -205,6 +210,8 @@ from src.api.commission_router import router as commission_router  # noqa: E402
 app.include_router(commission_router)
 from src.api.account_router import router as account_router  # noqa: E402
 app.include_router(account_router)
+from src.api.scarcity_router import router as scarcity_router  # noqa: E402
+app.include_router(scarcity_router)
 
 
 # ---------------------------------------------------------------------------
@@ -767,6 +774,11 @@ class CheckoutRequest(BaseModel):
     # onComplete callback is a separate, frontend-only concern). Must be a
     # same-site relative path — defaults to the marketing /success page.
     success_return_path: Optional[str] = None
+    # T-B12-07 win-back redemption token (the `wt` param on a reactivation
+    # link — src.services.winback_offers). Validated server-side below; a
+    # missing/expired/already-redeemed token is simply ignored (checkout
+    # proceeds at standard price), never trusted for its face value alone.
+    winback_token: Optional[str] = None
 
     @field_validator("success_return_path")
     @classmethod
@@ -1010,21 +1022,51 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
     # Meta Ads attribution + buyer IP/UA captured from the buyer's request.
     checkout_metadata.update(_attribution_stripe_metadata(request, payload.attribution))
 
+    # T-B12-07 win-back redemption (PR #172 review fix): a token only does
+    # something if it's still live — validate it here rather than trusting
+    # the client's say-so. zip_held gets the 50%-off Stripe coupon applied
+    # to THIS session; zip_released carries no discount (credits are granted
+    # post-payment, in the webhook, when the token is redeemed). An
+    # invalid/expired/already-redeemed token is silently ignored — checkout
+    # still proceeds at standard price rather than failing the purchase.
+    winback_discounts = None
+    if payload.winback_token:
+        from src.services.winback_offers import get_valid_offer
+        offer = get_valid_offer(payload.winback_token, db)
+        if offer:
+            checkout_metadata["winback_token"] = payload.winback_token
+            checkout_metadata["winback_branch"] = offer["branch"]
+            if offer["branch"] == "zip_held" and _s.winback_50_off_coupon_id:
+                winback_discounts = [{"coupon": _s.winback_50_off_coupon_id}]
+            elif offer["branch"] == "zip_held":
+                logger.warning(
+                    "checkout: zip_held winback token valid but WINBACK_50_OFF_COUPON_ID "
+                    "is not configured — proceeding without the discount"
+                )
+
     _return_path = payload.success_return_path or "/success?session_id={CHECKOUT_SESSION_ID}"
     if "{CHECKOUT_SESSION_ID}" not in _return_path:
         _sep = "&" if "?" in _return_path else "?"
         _return_path = f"{_return_path}{_sep}session_id={{CHECKOUT_SESSION_ID}}"
 
+    _checkout_kwargs = dict(
+        mode="subscription",
+        ui_mode="embedded",
+        customer_email=payload.email,   # pre-fills email in Stripe form
+        line_items=[line_item],
+        metadata=checkout_metadata,
+        return_url=f"{_s.app_base_url}{_return_path}",
+        allow_promotion_codes=True,
+    )
+    # Stripe rejects a session that sets both `allow_promotion_codes` and
+    # `discounts` — a validated win-back token auto-applies its specific
+    # coupon instead of leaving room for the buyer to type an arbitrary one.
+    if winback_discounts:
+        _checkout_kwargs.pop("allow_promotion_codes", None)
+        _checkout_kwargs["discounts"] = winback_discounts
+
     try:
-        session = stripe.checkout.Session.create(
-            mode="subscription",
-            ui_mode="embedded",
-            customer_email=payload.email,   # pre-fills email in Stripe form
-            line_items=[line_item],
-            metadata=checkout_metadata,
-            return_url=f"{_s.app_base_url}{_return_path}",
-            allow_promotion_codes=True,
-        )
+        session = stripe.checkout.Session.create(**_checkout_kwargs)
     except stripe.error.CardError as e:
         logger.warning("Stripe card error: %s", e.user_message)
         raise HTTPException(
@@ -1960,6 +2002,18 @@ def _compute_save_offer_active(subscriber, db) -> bool:
     return compute_save_offer_active(subscriber, db)
 
 
+def _get_activation_status_safe(subscriber_id: int, db) -> dict:
+    """T-B12-05: surface signup/first-leads-shown/first-unlock timestamps to
+    the dashboard so the 5-min activation window is measurable client-side.
+    Best-effort — never let instrumentation break the feed response."""
+    try:
+        from src.services.activation_tracking import get_activation_status
+        return get_activation_status(subscriber_id, db)
+    except Exception as exc:
+        logger.warning("activation status fetch failed for sub=%s: %s", subscriber_id, exc)
+        return {"signup_time": None, "first_leads_shown_time": None, "first_unlock_time": None}
+
+
 def _payment_recovery_fields(subscriber) -> dict:
     """Surface Stripe failed-payment recovery state to the frontend so the
     dashboard can render a PaymentFailedBanner. Stage is derived client-side
@@ -2359,6 +2413,12 @@ def event_feed(
             logger.warning("blurred_stack failed for sub=%s: %s", subscriber.id, exc)
             _blurred_stack = []
 
+        # T-B12-05: stamp the 5-min activation clock the first time this
+        # unpaid subscriber's dashboard actually rendered real scored leads.
+        if _blurred_stack:
+            from src.services.activation_tracking import stamp_first_leads_shown
+            stamp_first_leads_shown(subscriber.id, db)
+
         try:
             with db.begin_nested():
                 from src.services.business_events import log_business_event
@@ -2419,6 +2479,7 @@ def event_feed(
                 "onboarding_completed": subscriber.onboarding_completed,
                 "preferred_property_type": subscriber.preferred_property_type,
                 "investment_budget_band": subscriber.investment_budget_band,
+                "activation": _get_activation_status_safe(subscriber.id, db),
                 **_accelerated_wallet_offer_fields(subscriber, db),
                 **_auto_mode_entitlement_fields(subscriber, db),
                 **_payment_recovery_fields(subscriber),
@@ -2702,6 +2763,7 @@ def event_feed(
             "onboarding_completed": subscriber.onboarding_completed,
             "preferred_property_type": subscriber.preferred_property_type,
             "investment_budget_band": subscriber.investment_budget_band,
+            "activation": _get_activation_status_safe(subscriber.id, db),
             **_accelerated_wallet_offer_fields(subscriber, db),
             **_payment_recovery_fields(subscriber),
             **_what_you_missed_fields(
@@ -6444,6 +6506,11 @@ class FreeSignupRequest(BaseModel):
     # fa081: affiliate ?aff= token, captured client-side and forwarded here.
     # Distinct from referral_code (the peer credit loop).
     affiliate_ref: Optional[str] = None
+    # T-B12-06: origin marker for the referral ask, forwarded from the share
+    # link's `rs` query param. 'investor_to_investor' tags the Tier-3 investor
+    # ask; anything else (incl. None) is treated as the generic referral link.
+    # Reward ladder is unchanged — this is attribution only.
+    referral_source: Optional[str] = None
     # Phase 2B: caller hint about what the user is about to do. Suppresses the
     # welcome email when the user is mid-purchase ('upgrade' = paid checkout,
     # 'unlock' = $4 lead unlock). Welcome fires from the relevant payment
@@ -6511,6 +6578,7 @@ def free_signup(req: FreeSignupRequest, request: Request, db: Session = Depends(
         campaign_id=req.campaign_id,
         attribution_token=req.attribution_token,
         affiliate_ref=affiliate_ref,
+        referral_source=req.referral_source,
         send_welcome=not defer_welcome,
     )
 

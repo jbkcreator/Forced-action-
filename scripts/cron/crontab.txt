@@ -211,6 +211,14 @@ COUNTY_ID=hillsborough
 10 8 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.daily_report --county $COUNTY_ID
 11 8 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.daily_report --county pinellas
 
+# 20b. New-Distress Digest (T-B12-03) — 11:00 AM UTC daily = 7:00 AM America/Detroit
+#      (EDT; drifts to 06:00 EDT-equivalent in EST winter months like every
+#      other fixed-UTC job in this file — see the schedule-overview note at
+#      top). Subscribers get the full new-lead list for their ZIP/vertical
+#      (deduped against sent_leads); waitlist entries get a blurred-teaser
+#      count. Runs after CDS scoring (07:00 UTC) so today's scores are in.
+0 11 * * * $PROJECT/scripts/cron/run.sh src.tasks.new_distress_digest
+
 # ── M6 LEAD QUALITY TRUTH ENGINE ─────────────────────────────
 # Cohort contactability-rate recompute (07:45) — before the verdict batch.
 45 7 * * * $PROJECT/scripts/cron/run.sh src.tasks.cohort_rate_recompute
@@ -806,5 +814,20 @@ COUNTY_ID=hillsborough
 # deliveries landing, (2) a --dry-run credit total has been reviewed and
 # approved in writing, (3) Stripe is confirmed in live mode.
 # 0 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.guarantee_shortfall_sweep
+
+# T-B12-07 — Deal-of-the-day daily pick (idempotent, one row per date).
+# Runs after CDS scoring so today's top-CDS undelivered lead is available.
+15 7 * * * $PROJECT/scripts/cron/run.sh src.services.deal_of_the_day
+
+# T-B12-07 — Tier3 win-back reactivation sweep (lapsed <30d zip-held /
+# >=30d zip-released branches). Runs alongside the existing S0 cohorts.
+30 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.reactivation_scheduler --cohort tier3_winback
+
+# T-B12-07 — Win-back credit-grant reconciliation (PR #172 follow-up review).
+# Retries the zip_released 5-credit grant for offers that redeemed
+# successfully (proof of a real reactivation) but whose grant failed inside
+# the checkout webhook (transient wallet/DB error). Idempotent, cheap;
+# every 15 min is generous relative to how rarely this should fire.
+*/15 * * * * $PROJECT/scripts/cron/run.sh src.services.winback_offers --reconcile
 
 # === END FORCED-ACTION-PLATFORM ===

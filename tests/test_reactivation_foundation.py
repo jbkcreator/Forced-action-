@@ -562,3 +562,61 @@ class TestLifecycleIntegration:
         assert zips["waitlist"] == []
         assert zips["engagement"] == []
         assert zips["wallet"] == []
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 6. TIER3 WIN-BACK ELIGIBILITY (T-B12-07)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestCheckTier3WinbackEligibility:
+    def test_on_cooldown_blocks(self):
+        from src.services.reactivation_eligibility import check_tier3_winback_eligibility
+        sub = _sub(last_reactivation_attempt_at=datetime.now(timezone.utc) - timedelta(hours=6))
+        db = MagicMock()
+        eligible, reason, branch = check_tier3_winback_eligibility(sub, db)
+        assert eligible is False
+        assert reason == "on_cooldown"
+        assert branch is None
+
+    def test_never_subscribed_blocks(self):
+        from src.services.reactivation_eligibility import check_tier3_winback_eligibility
+        sub = _sub(churned_at=None)
+        db = MagicMock()
+        eligible, reason, branch = check_tier3_winback_eligibility(sub, db)
+        assert eligible is False
+        assert reason == "not_lapsed"
+        assert branch is None
+
+    def test_no_contact_info_blocks(self):
+        from src.services.reactivation_eligibility import check_tier3_winback_eligibility
+        sub = _sub(email=None, phone=None, churned_at=datetime.now(timezone.utc) - timedelta(days=10))
+        db = MagicMock()
+        eligible, reason, branch = check_tier3_winback_eligibility(sub, db)
+        assert eligible is False
+        assert reason == "no_contact_info"
+        assert branch is None
+
+    def test_lapsed_under_30d_with_zip_still_held_is_zip_held_branch(self):
+        from src.services.reactivation_eligibility import check_tier3_winback_eligibility
+        sub = _sub(churned_at=datetime.now(timezone.utc) - timedelta(days=10))
+        db = _mock_db(first_return=(1,))  # zip_territories row found → still held
+        eligible, reason, branch = check_tier3_winback_eligibility(sub, db)
+        assert eligible is True
+        assert reason == "eligible"
+        assert branch == "zip_held"
+
+    def test_lapsed_under_30d_with_no_zip_held_is_zip_released_branch(self):
+        from src.services.reactivation_eligibility import check_tier3_winback_eligibility
+        sub = _sub(churned_at=datetime.now(timezone.utc) - timedelta(days=10))
+        db = _mock_db(first_return=None)  # no locked/grace zip_territories row
+        eligible, reason, branch = check_tier3_winback_eligibility(sub, db)
+        assert eligible is True
+        assert branch == "zip_released"
+
+    def test_lapsed_over_30d_is_zip_released_branch_even_if_zip_row_exists(self):
+        from src.services.reactivation_eligibility import check_tier3_winback_eligibility
+        sub = _sub(churned_at=datetime.now(timezone.utc) - timedelta(days=45))
+        db = _mock_db(first_return=(1,))
+        eligible, reason, branch = check_tier3_winback_eligibility(sub, db)
+        assert eligible is True
+        assert branch == "zip_released"

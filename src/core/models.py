@@ -1361,6 +1361,41 @@ class Subscriber(Base):
         return f"<Subscriber(id={self.id}, email='{self.email}', tier='{self.tier}', founding={self.founding_member})>"
 
 
+class ActivationEvent(Base):
+    """
+    T-B12-05: 5-minute activation funnel timestamps, one row per subscriber.
+
+    signup_time mirrors Subscriber.created_at (stamped at row creation so it
+    survives even if Subscriber.created_at semantics ever change).
+    first_leads_shown_time is stamped the first time the free-tier dashboard
+    renders the 3-5 real scored leads (event_feed's no-locked-zip branch).
+    first_unlock_time is stamped the first time the subscriber unlocks any
+    lead's contact info (paid $4/hot-lead unlock or founder comp reveal) —
+    this is the activation event per the locked decision. Both are
+    set-once (COALESCE-style in code, never overwritten) so "time to first
+    value" and "time to activation" stay measurable against signup_time.
+    """
+    __tablename__ = "activation_events"
+
+    subscriber_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("subscribers.id"), primary_key=True
+    )
+    signup_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    first_leads_shown_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    first_unlock_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    def __repr__(self):
+        return (
+            f"<ActivationEvent(subscriber_id={self.subscriber_id}, "
+            f"shown={self.first_leads_shown_time}, unlocked={self.first_unlock_time})>"
+        )
+
+
 class ZipTerritory(Base):
     """
     ZIP code exclusivity per vertical per county.
@@ -3299,6 +3334,11 @@ class ReferralEvent(Base):
     # referral_prompt_funnel row that drove the conversion. Plain int (the funnel
     # table is raw-SQL, not an ORM model), nullable for organic/reactive signups.
     prompt_funnel_id: Mapped[Optional[int]] = mapped_column(Integer)
+    # T-B12-06: attribution marker distinguishing where the referral ask
+    # originated. 'generic' = the standard referral link; 'investor_to_investor'
+    # = the Tier-3-gated "invite a fellow investor" ask. No reward-ladder impact
+    # (rewards are unchanged) — this exists purely for attribution/reporting.
+    referral_source: Mapped[str] = mapped_column(String(30), nullable=False, default="generic", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
@@ -5374,6 +5414,80 @@ class GoldPlusZipSnapshot(Base):
             f"<GoldPlusZipSnapshot(zip={self.zip_code}, county={self.county_id}, "
             f"date={self.snapshot_date}, count={self.gold_plus_lead_count})>"
         )
+
+
+class DealOfTheDay(Base):
+    """
+    T-B12-07 — Daily exclusive-unlock deal. One row per calendar date, picking
+    the top-CDS qualified lead not yet delivered (no sent_leads row anywhere,
+    never previously featured). 24h exclusive unlock window at STANDARD price
+    (scarcity mechanic, not a discount).
+    """
+    __tablename__ = "deal_of_the_day"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    date: Mapped[date] = mapped_column(Date, nullable=False, unique=True, index=True)
+    lead_id: Mapped[int] = mapped_column(ForeignKey("properties.id"), nullable=False, index=True)
+    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    window_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("date", name="uq_deal_of_the_day_date"),
+        Index("idx_deal_of_the_day_window", "window_start", "window_end"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<DealOfTheDay(date={self.date}, lead_id={self.lead_id})>"
+
+
+class WinbackOffer(Base):
+    """
+    T-B12-07 — Tier3 win-back redemption token.
+
+    Created when a tier3_winback reactivation message is SENT (not when it's
+    redeemed) so the outbound link can carry a token that, when it comes back
+    through checkout, proves this specific offer — not just "a message went
+    out" — is what triggers the promised benefit:
+      zip_held     — 50% off the return month (Stripe coupon applied at
+                      checkout session creation, gated on a valid token).
+      zip_released — 5 free credits, granted only when the checkout webhook
+                      redeems the token (i.e. the subscriber actually paid),
+                      never at send time.
+    One-time use: `redeemed_at` is set exactly once; a second redemption
+    attempt on the same token is a no-op.
+
+    `redeemed_at` and `credits_granted_at` are deliberately separate columns
+    (PR #172 review fix): the webhook's credit grant is a best-effort side
+    effect that can itself fail (wallet write error, transient DB issue).
+    If `redeemed_at` alone marked completion, a failed grant would still
+    look "done" — the token is spent and a webhook retry finds nothing left
+    to redeem, so the customer paid but never got their credits, with no
+    path to recover. Keeping the two separate lets a periodic reconciliation
+    sweep (`winback_offers.reconcile_pending_credit_grants`) find and retry
+    exactly the rows that redeemed successfully but never got credited.
+    """
+    __tablename__ = "winback_offers"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(ForeignKey("subscribers.id"), nullable=False, index=True)
+    branch: Mapped[str] = mapped_column(String(20), nullable=False)  # zip_held | zip_released
+    token: Mapped[str] = mapped_column(String(43), nullable=False, unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    redeemed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    credits_granted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("idx_winback_offers_subscriber_branch", "subscriber_id", "branch"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<WinbackOffer(subscriber_id={self.subscriber_id}, branch={self.branch}, redeemed={self.redeemed_at is not None})>"
 
 
 # ============================================================================
