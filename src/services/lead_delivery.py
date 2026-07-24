@@ -47,23 +47,11 @@ def is_deliverable_verdict(grade: Optional[str], routed_channel: Optional[str]) 
     return routed_channel in _CONTRACTOR_CHANNELS
 
 # Plan-tier priority (tie-breaker 1): higher rank wins first call on a lead.
-#
-# Keyed on customer_accounts.plan_tier values directly (plan_id, e.g.
-# "founder_monthly"/"founder_annual" — NOT the shared "founder" tier bucket
-# on plans.tier), since that's what candidates_for()'s query reads and what
-# tier_rank() is actually called with below. Do not key this by plans.tier;
-# a lookup keyed by "founder" would never match a real account.
-#
-# founder_monthly/founder_annual rank above "dominator" even though
-# "dominator" isn't a seeded plan yet (not present in `plans` today) —
-# Founder ($1,100/mo or $11,000/yr) is currently the highest-priced real
-# plan (pro=$499/mo, starter=$299/mo), so it must outrank every other real
-# tier. Ranking it above the dominator placeholder keeps relative order
-# intact for whenever dominator is actually seeded, without deciding that
-# future price point here.
+# `founder` outranks every paid tier — the founder card promises priority
+# hot-lead routing ("you see them first"), so it must win the tie-breaker
+# ahead of dominator. See ADR 0036 (amends 0035).
 _TIER_RANK = {
-    "founder_monthly": 50,
-    "founder_annual": 50,
+    "founder": 50,
     "dominator": 40,
     "pro": 30,
     "starter": 20,
@@ -164,12 +152,16 @@ def candidates_for(db: Session, lead: Lead) -> list[Candidate]:
     entitled to the lead's grade, and still have headroom this cycle.
     """
     gkey = grade_key(lead.grade)
+    # ca.plan_tier is a FK to plans.plan_id (e.g. 'founder_monthly'), not the
+    # tier bucket name — join plans to resolve the actual tier ('founder') that
+    # tier_rank()/_TIER_RANK understands. See PR #163 review comment 1.
     rows = db.execute(text("""
-        SELECT ca.account_id, ca.plan_tier, ca.lead_entitlement, ca.lead_credits,
+        SELECT ca.account_id, p.tier AS plan_tier, ca.lead_entitlement, ca.lead_credits,
                ca.current_period_end, zt.vertical,
                (SELECT max(d.delivered_at) FROM deliveries d WHERE d.account_id = ca.account_id) AS last_delivered_at
         FROM zip_territories zt
         JOIN customer_accounts ca ON ca.subscriber_id = zt.subscriber_id
+        LEFT JOIN plans p ON p.plan_id = ca.plan_tier
         WHERE zt.zip_code = :zip AND zt.county_id = :county
           AND zt.status = 'locked'
           AND zt.vertical = ANY(:verticals)
