@@ -18,6 +18,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -4556,16 +4557,26 @@ class SynthflowInboundPayload(BaseModel):
 
 def _trigger_hot_inbound_callback(
     *,
+    db: Session,
     intent: Dict[str, Any],
     subscriber_id: Optional[int],
     vertical: Optional[str],
-    call_id: Optional[str],
+    call_id: str,
 ) -> None:
     """
     Block 11 / B11-03: if the inbound scored hot, publish inbound_hot_callback
     so the Cora process routes it to the EXISTING new_lead_voice_call graph
     (Block 2) — zero new call code, consent/compliance/kill-switch reused.
     decision_id=call_id so B11-04 tracking can join webhook -> event -> graph.
+
+    Publishes via publish_after_commit (not publish_cora_event directly): the
+    request's own transaction — the new/resolved subscriber, SmsOptIn, and the
+    inbound_response row written just before this call — is not yet committed
+    when this function runs (FastAPI's get_db commits only after the endpoint
+    returns). A fast Redis consumer could otherwise pick up the event and hit
+    get_subscriber_profile before that row is visible, aborting the callback
+    graph with subscriber_not_found. Deferring to after_commit guarantees the
+    event is only published once the row is durable.
     """
     if not intent.get("is_hot"):
         return
@@ -4576,9 +4587,9 @@ def _trigger_hot_inbound_callback(
         )
         return
 
-    from src.agents.events.ingestion import publish_cora_event
+    from src.agents.events.ingestion import publish_after_commit
 
-    publish_cora_event({
+    publish_after_commit(db, {
         "event_type": "inbound_hot_callback",
         "subscriber_id": subscriber_id,
         "decision_id": call_id,
@@ -4589,8 +4600,26 @@ def _trigger_hot_inbound_callback(
         },
     })
     logger.info(
-        "[SynthflowInbound] inbound_hot_callback published sub=%s call_id=%s score=%s",
+        "[SynthflowInbound] inbound_hot_callback queued for after-commit publish sub=%s call_id=%s score=%s",
         subscriber_id, call_id, intent.get("score"),
+    )
+
+
+def _resolve_inbound_call_id(payload: "SynthflowInboundPayload", raw_body: bytes) -> str:
+    """
+    Resolve a stable, never-null id for one inbound webhook delivery.
+
+    call_id is optional on the wire, but a hot-inbound response row's
+    decision_id must never be NULL — reconciliation joins on it, and SQL
+    never joins NULL to NULL, so a NULL decision_id stays permanently
+    'pending'. When the provider omits an id, derive a deterministic one
+    from the raw request body: a genuine retry resends an identical body
+    and gets the identical id, so both the webhook idempotency check and
+    downstream B11-04 tracking still work; distinct calls hash distinct.
+    Always exactly 36 chars, matching the decision_id VARCHAR(36) columns.
+    """
+    return payload.resolved_call_id or str(
+        uuid.uuid5(uuid.NAMESPACE_URL, raw_body.decode("utf-8", errors="replace"))
     )
 
 
@@ -4667,15 +4696,16 @@ async def synthflow_inbound_webhook(request: Request, db: Session = Depends(get_
         logger.error("[SynthflowInbound] payload validation failed: %s", exc)
         return {"status": "error", "reason": "invalid_payload"}
 
-    call_id = payload.resolved_call_id
     phone = payload.resolved_phone
+    call_id = _resolve_inbound_call_id(payload, raw_body)
 
-    # Idempotency: reject replays of the same call_id.
-    if call_id:
-        from src.services.webhook_log import already_logged
-        if already_logged(source="synthflow_inbound", source_event_id=call_id):
-            logger.info("[SynthflowInbound] duplicate call_id=%s — no-op", call_id)
-            return {"status": "duplicate", "call_id": call_id}
+    # Idempotency: reject replays of the same call_id. Unconditional now that
+    # call_id is guaranteed non-None — previously an omitted id bypassed this
+    # check entirely, letting retries enqueue duplicate hot-inbound callbacks.
+    from src.services.webhook_log import already_logged
+    if already_logged(source="synthflow_inbound", source_event_id=call_id):
+        logger.info("[SynthflowInbound] duplicate call_id=%s — no-op", call_id)
+        return {"status": "duplicate", "call_id": call_id}
 
     log_webhook_event(
         source="synthflow_inbound",
@@ -4739,6 +4769,7 @@ async def synthflow_inbound_webhook(request: Request, db: Session = Depends(get_
         )
 
     _trigger_hot_inbound_callback(
+        db=db,
         intent=intent,
         subscriber_id=result.get("subscriber_id"),
         vertical=payload.resolved_vertical,
