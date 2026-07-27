@@ -13,7 +13,7 @@ from sqlalchemy import text
 
 from src.core.models import (
     ChurnPrediction,
-    CoraIncident,
+    LifecycleIncident,
     CustomerAccount,
     HumanCloseEscalation,
     MrrMovement,
@@ -35,7 +35,7 @@ _UNAVAILABLE_KPIS = {
 }
 _AVAILABLE_KPIS = {
     "mrr", "new_accounts", "churn_risk", "leads_delivered",
-    "activation", "source_failures", "cora_approvals_waiting",
+    "activation", "source_failures", "lifecycle_approvals_waiting",
 }
 _HIGH_RISK_COUNT_SQL = text("""
     SELECT COUNT(*) FROM (
@@ -153,28 +153,28 @@ def test_source_failures_counts_scraper_alerts_within_cooldown_window(fresh_db):
     assert result["kpis"]["source_failures"]["value"] - before == 2
 
 
-def test_cora_approvals_waiting_counts_legal_lane_incidents_only(fresh_db):
-    # Canonical count (action_queue.cora_approvals_waiting) = open cora incidents
+def test_lifecycle_approvals_waiting_counts_legal_lane_incidents_only(fresh_db):
+    # Canonical count (action_queue.lifecycle_approvals_waiting) = open lifecycle incidents
     # in the legal lane (human_escalated / feature_killed) ONLY. Auto-handled
     # incidents, resolved incidents, and human-close escalations are excluded.
     # Delta-based (current-state snapshot, shared DB) like churn_risk.
-    before = compute_operator_dashboard(fresh_db, FRM, TO)["kpis"]["cora_approvals_waiting"]["value"]
+    before = compute_operator_dashboard(fresh_db, FRM, TO)["kpis"]["lifecycle_approvals_waiting"]["value"]
 
     sub = _sub(fresh_db)
 
-    fresh_db.add(CoraIncident(  # counted
+    fresh_db.add(LifecycleIncident(  # counted
         metric_name="dialable_rate", severity="red", action_taken="human_escalated",
         observed_value=0.1, threshold_value=0.5, breach_started=_IN, breach_resolved=None,
     ))
-    fresh_db.add(CoraIncident(  # counted
+    fresh_db.add(LifecycleIncident(  # counted
         metric_name="reply_rate", severity="red", action_taken="feature_killed",
         observed_value=0.1, threshold_value=0.5, breach_started=_IN, breach_resolved=None,
     ))
-    fresh_db.add(CoraIncident(  # NOT counted — auto-handled (ops lane)
+    fresh_db.add(LifecycleIncident(  # NOT counted — auto-handled (ops lane)
         metric_name="dialable_rate", severity="yellow", action_taken="auto_paused",
         observed_value=0.4, threshold_value=0.5, breach_started=_IN, breach_resolved=None,
     ))
-    fresh_db.add(CoraIncident(  # NOT counted — resolved
+    fresh_db.add(LifecycleIncident(  # NOT counted — resolved
         metric_name="dialable_rate", severity="yellow", action_taken="human_escalated",
         observed_value=0.4, threshold_value=0.5, breach_started=_IN, breach_resolved=_IN,
     ))
@@ -186,5 +186,5 @@ def test_cora_approvals_waiting_counts_legal_lane_incidents_only(fresh_db):
     fresh_db.flush()
 
     result = compute_operator_dashboard(fresh_db, FRM, TO)
-    assert result["kpis"]["cora_approvals_waiting"]["available"] is True
-    assert result["kpis"]["cora_approvals_waiting"]["value"] - before == 2
+    assert result["kpis"]["lifecycle_approvals_waiting"]["available"] is True
+    assert result["kpis"]["lifecycle_approvals_waiting"]["value"] - before == 2

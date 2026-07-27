@@ -8,7 +8,7 @@ from config.feedback_ritual import (
     FEEDBACK_RITUAL_CONFIDENCE_THRESHOLD,
     FEEDBACK_RITUAL_REASON_CODES,
 )
-from src.core.models import AgentDecision, CoraTrainingOverride
+from src.core.models import AgentDecision, LifecycleTrainingOverride
 
 
 def build_feedback_ritual_snapshot(decision: dict[str, Any]) -> dict[str, Any]:
@@ -78,11 +78,11 @@ def enqueue_feedback_ritual(
 
     subject_ref = decision.get("decision_id")
     existing = (
-        db.query(CoraTrainingOverride)
+        db.query(LifecycleTrainingOverride)
         .filter(
-            CoraTrainingOverride.source == "feedback_ritual",
-            CoraTrainingOverride.subject_type == "agent_decision",
-            CoraTrainingOverride.subject_ref == subject_ref,
+            LifecycleTrainingOverride.source == "feedback_ritual",
+            LifecycleTrainingOverride.subject_type == "agent_decision",
+            LifecycleTrainingOverride.subject_ref == subject_ref,
         )
         .first()
     )
@@ -90,12 +90,12 @@ def enqueue_feedback_ritual(
         return existing
 
     payload = build_feedback_ritual_queue_payload(decision, actor=actor)
-    row = CoraTrainingOverride(**payload)
+    row = LifecycleTrainingOverride(**payload)
     db.add(row)
     return row
 
 
-def serialize_feedback_ritual(row: CoraTrainingOverride) -> dict[str, Any]:
+def serialize_feedback_ritual(row: LifecycleTrainingOverride) -> dict[str, Any]:
     return {
         "id": row.id,
         "source": row.source,
@@ -112,14 +112,14 @@ def serialize_feedback_ritual(row: CoraTrainingOverride) -> dict[str, Any]:
 
 def apply_feedback_ritual_review(
     db,
-    row: CoraTrainingOverride,
+    row: LifecycleTrainingOverride,
     *,
     review_outcome: str,
     correction_reason: str | None,
     corrected_output: str | None,
     note: str | None,
     reviewer: str,
-) -> CoraTrainingOverride:
+) -> LifecycleTrainingOverride:
     if review_outcome not in FEEDBACK_RITUAL_ALLOWED_OUTCOMES:
         raise ValueError("invalid review_outcome")
     if correction_reason is not None and correction_reason not in FEEDBACK_RITUAL_REASON_CODES:
@@ -170,9 +170,9 @@ def publish_feedback_ritual_candidate(
     graph_name: str,
     terminal_status: str | None,
 ) -> None:
-    from src.agents.events.ingestion import publish_cora_event
+    from src.agents.events.ingestion import publish_lifecycle_event
 
-    publish_cora_event({
+    publish_lifecycle_event({
         "event_type": "feedback_ritual_candidate",
         "payload": {
             "decision_id": decision_id,

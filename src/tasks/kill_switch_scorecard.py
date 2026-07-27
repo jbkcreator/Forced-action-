@@ -1,7 +1,7 @@
 """
 Weekly Kill-Switch Scorecard (stages 9-13 reporting layer).
 
-Reads daily platform_daily_stats snapshots + open cora_incident rows and
+Reads daily platform_daily_stats snapshots + open lifecycle_incident rows and
 writes one learning_cards row (card_type='kill_switch_scorecard') per week.
 
 Per feature it reports:
@@ -36,7 +36,7 @@ from typing import Optional
 from sqlalchemy import text as sa_text
 from sqlalchemy.orm import Session
 
-from config.cora_guardrails import KILL_SWITCH
+from config.lifecycle_guardrails import KILL_SWITCH
 from config.settings import get_settings
 from src.core.database import get_db_context
 from src.services.kill_switch_scorecard_data import (
@@ -172,7 +172,7 @@ def _pick_worst_feature(features: list[dict]) -> Optional[dict]:
 
 def _build_footnotes(settings, county_ids: list[str], source_county: str) -> list[str]:
     notes = []
-    if not settings.cora_self_healing_enabled:
+    if not settings.lifecycle_self_healing_enabled:
         notes.append(
             "self-healing engine: disabled — kill-rec annotations unavailable"
         )

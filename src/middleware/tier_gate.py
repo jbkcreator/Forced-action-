@@ -2,7 +2,7 @@
 Centralized entitlement gate (fa B1-02).
 
 One framework-level dependency enforcing per-tier access on non-delivery
-surfaces (deal-intake, Cora SLA, data scope, geographic boundary), reading
+surfaces (deal-intake, Lifecycle SLA, data scope, geographic boundary), reading
 cached CustomerAccount entitlement data. Attach via Depends(require_tier(...))
 on a route signature — never re-implement this check inline in a controller.
 

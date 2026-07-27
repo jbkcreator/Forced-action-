@@ -13,7 +13,7 @@ from src.agents.events.ingestion import publish_after_commit
 
 def test_event_not_published_before_commit(fresh_db):
     event = {"event_type": "new_lead_signup", "subscriber_id": 1, "idempotency_key": "k"}
-    with patch("src.agents.events.ingestion.publish_cora_event") as mock_pub:
+    with patch("src.agents.events.ingestion.publish_lifecycle_event") as mock_pub:
         publish_after_commit(fresh_db, event)
         # Registered but the session has not committed yet.
         mock_pub.assert_not_called()
@@ -24,7 +24,7 @@ def test_event_not_published_before_commit(fresh_db):
 
 def test_event_not_published_on_rollback(fresh_db):
     event = {"event_type": "new_lead_signup", "subscriber_id": 2, "idempotency_key": "k2"}
-    with patch("src.agents.events.ingestion.publish_cora_event") as mock_pub:
+    with patch("src.agents.events.ingestion.publish_lifecycle_event") as mock_pub:
         publish_after_commit(fresh_db, event)
         fresh_db.rollback()
         mock_pub.assert_not_called()
@@ -33,7 +33,7 @@ def test_event_not_published_on_rollback(fresh_db):
 def test_listener_is_one_shot(fresh_db):
     """A single registration fires exactly once, not on every later commit."""
     event = {"event_type": "new_lead_signup", "subscriber_id": 3, "idempotency_key": "k3"}
-    with patch("src.agents.events.ingestion.publish_cora_event") as mock_pub:
+    with patch("src.agents.events.ingestion.publish_lifecycle_event") as mock_pub:
         publish_after_commit(fresh_db, event)
         fresh_db.commit()
         fresh_db.commit()

@@ -32,7 +32,7 @@ from typing import Any, Optional
 from sqlalchemy import text as sa_text
 from sqlalchemy.orm import Session
 
-from config.cora_guardrails import get_guardrail
+from config.lifecycle_guardrails import get_guardrail
 from config.settings import get_settings
 from config.stage10_config import VARIANT_TEST
 
@@ -618,7 +618,7 @@ def _generate_replacement(
         client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
 
         prompt = (
-            f"You are Cora, an AI revenue operator for a distressed property platform.\n\n"
+            f"You are Lifecycle, an AI revenue operator for a distressed property platform.\n\n"
             f"Generate ONE new SMS message variant for the '{sequence_name}' sequence.\n\n"
             f"Retiring variant (conversion rate {loser['conv_rate']:.1%}, sending too few to measure):\n"
             f"{loser['body']}\n\n"

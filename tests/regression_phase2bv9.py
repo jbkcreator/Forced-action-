@@ -116,9 +116,9 @@ class TestDataOnlySaveFlow:
         assert "RESUME" in COMMANDS
 
 
-# ─── Flow 4: Cora Lock Close (ap_lite) ───────────────────────────────────────
+# ─── Flow 4: Lifecycle Lock Close (ap_lite) ───────────────────────────────────────
 
-class TestCoraLockCloseFlow:
+class TestLifecycleLockCloseFlow:
     def test_router_wired(self):
         from src.agents.router import EVENT_TO_GRAPH
         assert "subscriber_crossed_ap_lite_threshold" in EVENT_TO_GRAPH

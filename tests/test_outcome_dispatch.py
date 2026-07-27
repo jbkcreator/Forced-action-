@@ -13,7 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
-from src.core.models import CoraSuppression, DealOutcome, Property, Subscriber
+from src.core.models import LifecycleSuppression, DealOutcome, Property, Subscriber
 from src.consumers import outcome_consumers
 from src.tasks.outcome_dispatch_sweep import run_sweep
 
@@ -56,7 +56,7 @@ def _cleanup(fresh_db, sub, prop):
     fresh_db.execute(text(f"DELETE FROM event_failures WHERE event_id IN ({ev_subq})"), {"s": sub.id})
     fresh_db.execute(text("DELETE FROM events WHERE source_component = 'deal_capture' AND (payload->>'subscriber_id')::int = :s"), {"s": sub.id})
     fresh_db.execute(DealOutcome.__table__.delete().where(DealOutcome.subscriber_id == sub.id))
-    fresh_db.execute(CoraSuppression.__table__.delete().where(CoraSuppression.subscriber_id == sub.id))
+    fresh_db.execute(LifecycleSuppression.__table__.delete().where(LifecycleSuppression.subscriber_id == sub.id))
     fresh_db.execute(text("DELETE FROM referral_prompt_funnel WHERE subscriber_id = :sid"), {"sid": sub.id})
     fresh_db.execute(text("DELETE FROM prospects WHERE property_id = :p"), {"p": prop.id})
     fresh_db.delete(sub)

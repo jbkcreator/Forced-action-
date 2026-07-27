@@ -1,5 +1,5 @@
 """
-Registry of Cora Data Engine outcome connectors.
+Registry of Lifecycle Data Engine outcome connectors.
 
 An "outcome connector" mines an already-ingested, already-matched public
 record (foreclosure auction, tax-deed auction, appraiser sale, etc.) for a

@@ -17,7 +17,7 @@ import stripe
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 
-from config.cora_guardrails import get_guardrail
+from config.lifecycle_guardrails import get_guardrail
 from config.revenue_ladder import (
     CREDIT_COSTS,
     WALLET_AUTO_RELOAD_THRESHOLD,
@@ -162,8 +162,8 @@ def debit(
     try:
         eligible = accelerated_push_eligible(subscriber_id, db)
         if eligible:
-            from src.agents.events.ingestion import publish_cora_event
-            publish_cora_event({
+            from src.agents.events.ingestion import publish_lifecycle_event
+            publish_lifecycle_event({
                 "event_type": "accelerated_wallet_push_eligible",
                 "subscriber_id": subscriber_id,
                 "payload": eligible,

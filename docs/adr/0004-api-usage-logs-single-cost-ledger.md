@@ -9,7 +9,7 @@ Claude API cost is currently tracked in three places:
 
 - `api_usage_logs` — per-call rows (model, tokens, cost, task_type, graph_name), but only
   written when a `db=` session is passed to `call_claude*`. The high-volume paths
-  (`compose_and_send` for the whole Cora fleet, concierge chat, recovery/save email tasks,
+  (`compose_and_send` for the whole Lifecycle fleet, concierge chat, recovery/save email tasks,
   forward-pack renderer) omitted `db=`, so they were never logged.
 - `agent_decisions.cost_usd` / `tokens_used` — a per-decision rollup written by the agent
   graphs from running state totals.

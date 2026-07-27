@@ -229,7 +229,7 @@ class TestReferralPromptIntegration:
         fresh_db.add(outcome)
         fresh_db.flush()
 
-        with patch("src.services.cora_suppression.create_suppression"), \
+        with patch("src.services.lifecycle_suppression.create_suppression"), \
              patch("src.services.win_graphic.generate", return_value=None), \
              patch("src.services.win_autopsy.record_win_autopsy"), \
              patch("src.services.sms_compliance.send_sms", return_value=True) as mock_sms, \
@@ -266,7 +266,7 @@ class TestReferralPromptIntegration:
         fresh_db.add(outcome)
         fresh_db.flush()
 
-        with patch("src.services.cora_suppression.create_suppression"), \
+        with patch("src.services.lifecycle_suppression.create_suppression"), \
              patch("src.services.sms_compliance.send_sms") as mock_sms, \
              patch("src.services.email.send_email") as mock_email:
             record_outcome_side_effects(outcome, sub, fresh_db)

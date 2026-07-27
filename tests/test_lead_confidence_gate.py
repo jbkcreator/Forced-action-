@@ -1,7 +1,7 @@
 """A2 integration — the Guess Lead gate actually suppresses on paid surfaces.
 
 Seeds real Property + DistressScore rows in Postgres (fresh_db, rolled back) and
-asserts a high-scoring guess lead is withheld from the lead pool and the Cora
+asserts a high-scoring guess lead is withheld from the lead pool and the Lifecycle
 sample-leads teaser, while a non-guess lead still sells.
 """
 from datetime import date, datetime, timedelta, timezone

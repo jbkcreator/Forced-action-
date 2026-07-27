@@ -48,7 +48,7 @@ _REJECTION_REASONS = (
 )
 
 _SYSTEM_PROMPT = """\
-You are Cora's Loss Autopsy Engine — an analytical subsystem that learns from every failed \
+You are Lifecycle's Loss Autopsy Engine — an analytical subsystem that learns from every failed \
 lead conversion to prevent scoring decay.
 
 Given the context of a distressed-property lead that did not convert, you must:
@@ -56,7 +56,7 @@ Given the context of a distressed-property lead that did not convert, you must:
 2. Note any competitor rate advantage (as a decimal fraction, e.g. 0.015 = 1.5%) \
    if pricing data suggests a competitor offered a materially better rate.
 3. Record any underwriting blocker verbatim from transcript or notes (LTV, structural damage, etc.).
-4. Prescribe exactly ONE actionable Cora behaviour adjustment for similar future leads.
+4. Prescribe exactly ONE actionable Lifecycle behaviour adjustment for similar future leads.
 
 Always call the record_loss_autopsy tool with your findings. Be specific and evidence-based \
 — reference transcript snippets or signal values when available.
@@ -88,16 +88,16 @@ _AUTOPSY_TOOL: dict = {
                 "type": ["string", "null"],
                 "description": "Verbatim underwriting decline reason from transcript/notes, if any.",
             },
-            "cora_behavior_adjustment": {
+            "lifecycle_behavior_adjustment": {
                 "type": "string",
                 "description": (
-                    "One concrete action Cora should take differently for similar future leads. "
+                    "One concrete action Lifecycle should take differently for similar future leads. "
                     "Start with a verb: e.g. 'Reduce urgency cadence for OWNER_UNRESPONSIVE leads "
                     "with <3 contact attempts by spacing SMS 72h apart.'"
                 ),
             },
         },
-        "required": ["primary_rejection_reason", "cora_behavior_adjustment"],
+        "required": ["primary_rejection_reason", "lifecycle_behavior_adjustment"],
     },
 }
 
@@ -190,7 +190,7 @@ def _gather_pricing_context(county_id: Optional[str], trade_vertical: Optional[s
     return dict(row) if row else {}
 
 
-def _gather_cora_decisions(subscriber_id: Optional[int], db: Session) -> list[dict]:
+def _gather_lifecycle_decisions(subscriber_id: Optional[int], db: Session) -> list[dict]:
     if not subscriber_id:
         return []
     rows = db.execute(
@@ -218,12 +218,12 @@ def _build_context(
         deal.get("trade_vertical"),
         db,
     )
-    decisions = _gather_cora_decisions(deal.get("subscriber_id"), db)
+    decisions = _gather_lifecycle_decisions(deal.get("subscriber_id"), db)
     return _jsonify({
         "property": prop,
         "deal": deal,
         "active_pricing_cohort": pricing,
-        "recent_cora_decisions": decisions,
+        "recent_lifecycle_decisions": decisions,
     })
 
 
@@ -231,7 +231,7 @@ def _format_prompt(trigger_reason: str, context: dict) -> str:
     prop = context.get("property") or {}
     deal = context.get("deal") or {}
     pricing = context.get("active_pricing_cohort") or {}
-    decisions = context.get("recent_cora_decisions") or []
+    decisions = context.get("recent_lifecycle_decisions") or []
 
     sections = [f"## Loss Autopsy Request\nTrigger: {trigger_reason}\n"]
 
@@ -276,7 +276,7 @@ def _format_prompt(trigger_reason: str, context: dict) -> str:
             f"(override: {d.get('override_reason') or 'none'}, at {d.get('started_at')})"
             for d in decisions
         ]
-        sections.append("### Recent Cora Decisions\n" + "\n".join(lines))
+        sections.append("### Recent Lifecycle Decisions\n" + "\n".join(lines))
 
     return "\n\n".join(sections)
 
@@ -348,7 +348,7 @@ def run_loss_autopsy(
         primary_rejection_reason=tool_input.get("primary_rejection_reason"),
         competitor_rate_delta=tool_input.get("competitor_rate_delta"),
         underwriting_blocker=tool_input.get("underwriting_blocker"),
-        cora_behavior_adjustment=tool_input.get("cora_behavior_adjustment"),
+        lifecycle_behavior_adjustment=tool_input.get("lifecycle_behavior_adjustment"),
         raw_context=context,
         model_response={
             "tool_input": tool_input,

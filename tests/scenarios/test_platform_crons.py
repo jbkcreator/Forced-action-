@@ -7,7 +7,7 @@ verifies:
   - Founder SMS (revenue_pulse) hits the outbox when a founder phone is set
   - No real Twilio calls fire (dry-run + sandbox capture)
 
-These scenarios don't exercise the Cora LangGraph layer. They validate
+These scenarios don't exercise the Lifecycle LangGraph layer. They validate
 that the platform cron jobs behave correctly when the scheduler triggers.
 """
 

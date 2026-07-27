@@ -1,6 +1,6 @@
 """Fleet agent identities.
 
-Cora's LangGraph-based autonomous decision runtime lives directly in this
+Lifecycle's LangGraph-based autonomous decision runtime lives directly in this
 package (graphs/, subgraphs/, supervisor.py, router.py — the process started
 by `python -m src.agents --serve`). Other agent identities nested here
 (e.g. hunter/) are NOT part of that runtime and are never imported by it —

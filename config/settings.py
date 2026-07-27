@@ -429,14 +429,14 @@ class AppSettings(BaseSettings):
 	slack_human_close_webhook: Optional[str] = Field(default=None, env="SLACK_HUMAN_CLOSE_WEBHOOK")
 
 	# Accelerated Wallet Push (fa016) — master kill switch.
-	# Detector, sweep, Cora graph, and API endpoints all skip when False.
+	# Detector, sweep, Lifecycle graph, and API endpoints all skip when False.
 	# Auto-flipped to False if Day-35 take_rate < wallet_adoption.floor_pct (12%).
 	accelerated_wallet_push_enabled: bool = Field(default=False, env="ACCELERATED_WALLET_PUSH_ENABLED")
 
 	# Freemium blurred-feed funnel (T-B3-01) — master launch toggle ANDed in
 	# front of every funnel leg: free signup, blurred teaser/proof moment,
 	# monetization wall, flash scarcity, abandonment nudges. Default True:
-	# these flows are already live in prod; per-flow Cora kill-switches
+	# these flows are already live in prod; per-flow Lifecycle kill-switches
 	# (first_payment_rate) still apply when this is ON.
 	freemium_funnel_enabled: bool = Field(default=True, env="FREEMIUM_FUNNEL_ENABLED")
 
@@ -444,21 +444,21 @@ class AppSettings(BaseSettings):
 	# Set False in dev/staging to send SMS at any hour during testing.
 	sms_quiet_hours_enabled: bool = Field(default=True, env="SMS_QUIET_HOURS_ENABLED")
 
-	# Human review of Cora outbound SMS. OFF by default — Cora's messages send
+	# Human review of Lifecycle outbound SMS. OFF by default — Lifecycle's messages send
 	# immediately. This is only the *baseline*; operators flip the switch at
-	# runtime via the admin queue (Redis override, see services/cora_review_switch).
+	# runtime via the admin queue (Redis override, see services/lifecycle_review_switch).
 	# When ON, marketing sends are held as pending_review for manual approve/cancel.
-	cora_human_review_enabled: bool = Field(default=False, env="CORA_HUMAN_REVIEW_ENABLED")
+	lifecycle_human_review_enabled: bool = Field(default=False, env="LIFECYCLE_HUMAN_REVIEW_ENABLED")
 
 	# NWS Weather / Storm Pack (fa018)
 	# nws_weather_enabled      — master kill switch for entire NWS subsystem
-	# nws_revenue_polling_enabled — controls whether poller triggers storm pack / Cora
+	# nws_revenue_polling_enabled — controls whether poller triggers storm pack / Lifecycle
 	# storm_pack_enabled        — controls bundle offer dispatch specifically
-	# nws_cora_urgency_enabled  — controls Cora urgency graph dispatch specifically
+	# nws_lifecycle_urgency_enabled  — controls Lifecycle urgency graph dispatch specifically
 	nws_weather_enabled: bool = Field(default=True, env="NWS_WEATHER_ENABLED")
 	nws_revenue_polling_enabled: bool = Field(default=True, env="NWS_REVENUE_POLLING_ENABLED")
 	storm_pack_enabled: bool = Field(default=True, env="STORM_PACK_ENABLED")
-	nws_cora_urgency_enabled: bool = Field(default=True, env="NWS_CORA_URGENCY_ENABLED")
+	nws_lifecycle_urgency_enabled: bool = Field(default=True, env="NWS_LIFECYCLE_URGENCY_ENABLED")
 	# Referenced by nws_webhook.process_alert steps 9+11 but missing until 2026-07 —
 	# the AttributeError killed signal tagging + rescore on every alert (incidents
 	# from weather stayed at 0 since fa018).
@@ -563,15 +563,15 @@ class AppSettings(BaseSettings):
 	slack_bot_token: Optional[SecretStr] = Field(default=None, env="SLACK_BOT_TOKEN")
 	slack_signing_secret: Optional[SecretStr] = Field(default=None, env="SLACK_SIGNING_SECRET")
 
-	# Cora self-healing (fa034). Default OFF — must be opted in per environment.
-	# When false, src/tasks/cora_self_healing.py is a no-op (returns 0 without
+	# Lifecycle self-healing (fa034). Default OFF — must be opted in per environment.
+	# When false, src/tasks/lifecycle_self_healing.py is a no-op (returns 0 without
 	# touching DB/Redis). Rollout: ship code → enable in dev → soak in staging
 	# → enable in prod after a quiet week.
-	cora_self_healing_enabled: bool = Field(default=False, env="CORA_SELF_HEALING_ENABLED")
-	# Slack channel for Cora incident posts. When unset, post_incident_slack()
+	lifecycle_self_healing_enabled: bool = Field(default=False, env="LIFECYCLE_SELF_HEALING_ENABLED")
+	# Slack channel for Lifecycle incident posts. When unset, post_incident_slack()
 	# falls back to email.send_alert (same path as heartbeat_monitor /
 	# anomaly_pager). Slack-disabled is NEVER a silent failure.
-	cora_incident_slack_channel: Optional[str] = Field(default=None, env="CORA_INCIDENT_SLACK_CHANNEL")
+	lifecycle_incident_slack_channel: Optional[str] = Field(default=None, env="LIFECYCLE_INCIDENT_SLACK_CHANNEL")
 
 	# Stage 10 — Prometheus metrics exposition (fa055).
 	# When true, GET /metrics returns Prometheus text format with kill-switch

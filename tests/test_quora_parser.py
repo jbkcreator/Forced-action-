@@ -9,7 +9,7 @@ Covers:
   - _parse_gql_response
   - _record_to_result (full, minimal, empty, alt fieldnames)
   - score_quora_result (high-priority, low-priority, blocked)
-  - Cora graph wiring (compact input only, no raw GQL, conditional generation)
+  - Lifecycle graph wiring (compact input only, no raw GQL, conditional generation)
 """
 
 import json
@@ -401,8 +401,8 @@ def test_result_optional_fields_default_none():
     assert r.slug is None
     assert r.comment_count is None
     assert r.is_locked is False
-    assert r.cora_classification is None
-    assert r.cora_answer_draft is None
+    assert r.lifecycle_classification is None
+    assert r.lifecycle_answer_draft is None
     assert r.deterministic_score is None
     assert r.deterministic_reasons == []
 
@@ -495,10 +495,10 @@ def test_score_clamped_to_hundred():
 
 
 # ---------------------------------------------------------------------------
-# Cora Quora graph — compact input, no raw GQL, conditional generation
+# Lifecycle Quora graph — compact input, no raw GQL, conditional generation
 # ---------------------------------------------------------------------------
 
-def test_cora_classify_never_receives_raw_metadata():
+def test_lifecycle_classify_never_receives_raw_metadata():
     """The classify node must strip raw_metadata before calling Claude."""
     from src.agents.graphs.quora_channel import _node_classify_question
 
@@ -534,7 +534,7 @@ def test_cora_classify_never_receives_raw_metadata():
                         assert "huge" not in rendered_user
 
 
-def test_cora_classify_compact_input_only():
+def test_lifecycle_classify_compact_input_only():
     """Classify node sends only compact fields, not full GQL dump."""
     from src.agents.graphs.quora_channel import _node_classify_question
 
@@ -560,7 +560,7 @@ def test_cora_classify_compact_input_only():
     assert "should_not_appear" not in sent_content[0]
 
 
-def test_cora_answer_generation_skipped_when_classification_rejects():
+def test_lifecycle_answer_generation_skipped_when_classification_rejects():
     """generate_answer node returns None when classification says skip."""
     from src.agents.graphs.quora_channel import _node_generate_answer
 
@@ -568,7 +568,7 @@ def test_cora_answer_generation_skipped_when_classification_rejects():
         "candidate": {"qid": 1, "title": "Test"},
         "matched_keyword": "foreclosure",
         "generate_answer_drafts": True,
-        "cora_classification": {
+        "lifecycle_classification": {
             "is_relevant": False,
             "is_answerable": False,
             "priority_score": 20,
@@ -576,10 +576,10 @@ def test_cora_answer_generation_skipped_when_classification_rejects():
         },
     }
     result = _node_generate_answer(state)
-    assert result.get("cora_answer_draft") is None
+    assert result.get("lifecycle_answer_draft") is None
 
 
-def test_cora_answer_generation_skipped_below_priority_threshold():
+def test_lifecycle_answer_generation_skipped_below_priority_threshold():
     """generate_answer node returns None when priority_score < 70."""
     from src.agents.graphs.quora_channel import _node_generate_answer
 
@@ -587,7 +587,7 @@ def test_cora_answer_generation_skipped_below_priority_threshold():
         "candidate": {"qid": 1, "title": "Test"},
         "matched_keyword": "foreclosure",
         "generate_answer_drafts": True,
-        "cora_classification": {
+        "lifecycle_classification": {
             "is_relevant": True,
             "is_answerable": True,
             "priority_score": 60,
@@ -595,16 +595,16 @@ def test_cora_answer_generation_skipped_below_priority_threshold():
         },
     }
     result = _node_generate_answer(state)
-    assert result.get("cora_answer_draft") is None
+    assert result.get("lifecycle_answer_draft") is None
 
 
-def test_cora_answer_generation_skipped_when_flag_false():
+def test_lifecycle_answer_generation_skipped_when_flag_false():
     """generate_answer node returns None when generate_answer_drafts=False."""
     from src.agents.graphs.quora_channel import _should_generate, END
 
     state = {
         "generate_answer_drafts": False,
-        "cora_classification": {
+        "lifecycle_classification": {
             "is_relevant": True,
             "is_answerable": True,
             "priority_score": 95,
@@ -614,8 +614,8 @@ def test_cora_answer_generation_skipped_when_flag_false():
     assert _should_generate(state) == END
 
 
-def test_default_command_does_not_publish_cora_event(monkeypatch):
-    """When --classify-with-cora is not set, publish_cora_event is never called."""
+def test_default_command_does_not_publish_lifecycle_event(monkeypatch):
+    """When --classify-with-lifecycle is not set, publish_lifecycle_event is never called."""
     import src.scrappers.quora.quora_miner as miner_mod
 
     published = []
@@ -631,14 +631,14 @@ def test_default_command_does_not_publish_cora_event(monkeypatch):
         keyword="foreclosure florida",
         max_results=5,
         dump_raw=False,
-        classify_with_cora=False,
+        classify_with_lifecycle=False,
         generate_answer_drafts=False,
     ))
     assert len(published) == 0
 
 
 def test_classify_flag_publishes_event_with_correct_fields(monkeypatch):
-    """--classify-with-cora publishes events with decision_id, correct flags, no raw_metadata."""
+    """--classify-with-lifecycle publishes events with decision_id, correct flags, no raw_metadata."""
     import src.scrappers.quora.quora_miner as miner_mod
 
     published_events = []
@@ -662,15 +662,15 @@ def test_classify_flag_publishes_event_with_correct_fields(monkeypatch):
         return [QuoraSearchResponse(query=queries[0], results=[r], status="ok")]
 
     monkeypatch.setattr("src.scrappers.quora.quora_miner.scrape_quora", fake_scrape)
-    monkeypatch.setattr("src.agents.events.ingestion.publish_cora_event", fake_publish)
-    monkeypatch.setattr("src.scrappers.quora.quora_miner._poll_cora_results", fake_poll)
+    monkeypatch.setattr("src.agents.events.ingestion.publish_lifecycle_event", fake_publish)
+    monkeypatch.setattr("src.scrappers.quora.quora_miner._poll_lifecycle_results", fake_poll)
 
     import asyncio
     asyncio.run(miner_mod.main(
         keyword="foreclosure florida",
         max_results=5,
         dump_raw=False,
-        classify_with_cora=True,
+        classify_with_lifecycle=True,
         generate_answer_drafts=False,
     ))
 
@@ -684,7 +684,7 @@ def test_classify_flag_publishes_event_with_correct_fields(monkeypatch):
 
 
 def test_classify_flag_does_not_generate_answers_in_payload(monkeypatch):
-    """--classify-with-cora without --generate-answer-drafts sets flag=False in payload."""
+    """--classify-with-lifecycle without --generate-answer-drafts sets flag=False in payload."""
     import src.scrappers.quora.quora_miner as miner_mod
 
     published_events = []
@@ -707,15 +707,15 @@ def test_classify_flag_does_not_generate_answers_in_payload(monkeypatch):
         return [QuoraSearchResponse(query=queries[0], results=[r], status="ok")]
 
     monkeypatch.setattr("src.scrappers.quora.quora_miner.scrape_quora", fake_scrape)
-    monkeypatch.setattr("src.agents.events.ingestion.publish_cora_event", fake_publish)
-    monkeypatch.setattr("src.scrappers.quora.quora_miner._poll_cora_results", fake_poll)
+    monkeypatch.setattr("src.agents.events.ingestion.publish_lifecycle_event", fake_publish)
+    monkeypatch.setattr("src.scrappers.quora.quora_miner._poll_lifecycle_results", fake_poll)
 
     import asyncio
     asyncio.run(miner_mod.main(
         keyword="tax liens florida",
         max_results=5,
         dump_raw=False,
-        classify_with_cora=True,
+        classify_with_lifecycle=True,
         generate_answer_drafts=False,
     ))
 
@@ -723,7 +723,7 @@ def test_classify_flag_does_not_generate_answers_in_payload(monkeypatch):
 
 
 def test_poll_enriches_results_from_agent_decisions(monkeypatch):
-    """_poll_cora_results fetches from agent_decisions and writes back to QuoraResult."""
+    """_poll_lifecycle_results fetches from agent_decisions and writes back to QuoraResult."""
     import src.scrappers.quora.quora_miner as miner_mod
     from src.scrappers.quora.quora_engine import QuoraResult
 
@@ -737,8 +737,8 @@ def test_poll_enriches_results_from_agent_decisions(monkeypatch):
     decision_id_map = {did: r}
 
     fake_row = (did, "completed", {
-        "cora_classification": {"recommended_action": "generate_answer", "priority_score": 88},
-        "cora_answer_draft":   None,
+        "lifecycle_classification": {"recommended_action": "generate_answer", "priority_score": 88},
+        "lifecycle_answer_draft":   None,
     })
 
     class FakeSession:
@@ -772,10 +772,10 @@ def test_poll_enriches_results_from_agent_decisions(monkeypatch):
 
     _db_mod.get_db_context = lambda: _FakeCtx()
     try:
-        count = asyncio.run(miner_mod._poll_cora_results(decision_id_map, timeout=5, interval=0.1))
+        count = asyncio.run(miner_mod._poll_lifecycle_results(decision_id_map, timeout=5, interval=0.1))
     finally:
         _db_mod.get_db_context = original_gdc
 
     assert count == 1
-    assert r.cora_classification is not None
-    assert r.cora_classification["recommended_action"] == "generate_answer"
+    assert r.lifecycle_classification is not None
+    assert r.lifecycle_classification["recommended_action"] == "generate_answer"

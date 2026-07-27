@@ -7,7 +7,7 @@ come from Aircall natively, so Claude only produces the domain-specific fields.
 
 Runs through claude_router.call_claude (Sonnet tier via task_type) so cost is
 logged to api_usage_logs. Deliberately NOT a LangGraph graph and writes NO
-agent_decisions row — it is post-call enrichment, not a Cora Touch (ADR
+agent_decisions row — it is post-call enrichment, not a Lifecycle Touch (ADR
 "closer-telemetry-separate-from-agent-decisions").
 
 call_claude returns plain text (no tool/JSON mode), so we prompt for strict JSON,

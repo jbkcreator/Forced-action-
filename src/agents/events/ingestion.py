@@ -8,11 +8,11 @@ Priority-list scope:
   - Postgres LISTEN/NOTIFY — works today with the existing DB
   - Cron trigger            — works today via the scheduler entry point
   - Admin API trigger       — works today via the ingest_admin_event helper
-  - Redis Queue (LPUSH/BRPOP key "cora:queue") — active when REDIS_URL is set
+  - Redis Queue (LPUSH/BRPOP key "lifecycle:queue") — active when REDIS_URL is set
                               and AGENTS_EVENT_SOURCE_REDIS=true.
 
 Public event publish API (for use by services/tasks — never dispatch_event directly):
-  publish_cora_event(event)  — Redis queue primary, Postgres durable fallback.
+  publish_lifecycle_event(event)  — Redis queue primary, Postgres durable fallback.
 
 Production run:
 	python -m scripts.run_agents --serve
@@ -46,12 +46,12 @@ logger = logging.getLogger(__name__)
 # Public publish API — call this from services/tasks instead of dispatch_event
 # ──────────────────────────────────────────────────────────────────────────────
 
-def publish_cora_event(event: Dict[str, Any]) -> None:
+def publish_lifecycle_event(event: Dict[str, Any]) -> None:
 	"""
 	Publish an event for async pickup by the agents process.
 
-	Primary path  : Redis Pub/Sub channel "cora:events" (low-latency, <100ms).
-	Fallback path : INSERT into cora_event_queue + NOTIFY cora_events (durable).
+	Primary path  : Redis Pub/Sub channel "lifecycle:events" (low-latency, <100ms).
+	Fallback path : INSERT into lifecycle_event_queue + NOTIFY lifecycle_events (durable).
 
 	Never calls dispatch_event() inline — the API/cron process must never own
 	a graph run. The agents process is the sole consumer.
@@ -60,11 +60,11 @@ def publish_cora_event(event: Dict[str, Any]) -> None:
 
 	if redis_available():
 		try:
-			get_redis().lpush("cora:queue", json.dumps(event, default=str))
+			get_redis().lpush("lifecycle:queue", json.dumps(event, default=str))
 			return
 		except Exception as exc:
 			logger.warning(
-				"publish_cora_event: Redis lpush failed (%s) — falling back to Postgres", exc
+				"publish_lifecycle_event: Redis lpush failed (%s) — falling back to Postgres", exc
 			)
 
 	_publish_via_postgres(event)
@@ -85,7 +85,7 @@ def publish_after_commit(session: Any, event: Dict[str, Any]) -> None:
 
 	def _fire(_session: Any) -> None:
 		try:
-			publish_cora_event(event)
+			publish_lifecycle_event(event)
 		except Exception:
 			logger.warning(
 				"publish_after_commit: publish failed for event_type=%s",
@@ -98,11 +98,11 @@ def publish_after_commit(session: Any, event: Dict[str, Any]) -> None:
 def _publish_via_postgres(event: Dict[str, Any]) -> None:
 	"""Insert event into the durable queue table and emit a NOTIFY."""
 	from src.core.database import get_db_context
-	from src.core.models import CoraEventQueue
+	from src.core.models import LifecycleEventQueue
 
 	try:
 		with get_db_context() as session:
-			row = CoraEventQueue(
+			row = LifecycleEventQueue(
 				event_type=event.get("event_type"),
 				subscriber_id=event.get("subscriber_id"),
 				payload=event.get("payload") or {},
@@ -113,11 +113,11 @@ def _publish_via_postgres(event: Dict[str, Any]) -> None:
 			session.add(row)
 			session.flush()
 			session.execute(
-				text("SELECT pg_notify('cora_events', :payload)"),
+				text("SELECT pg_notify('lifecycle_events', :payload)"),
 				{"payload": json.dumps(event, default=str)},
 			)
 	except Exception as exc:
-		logger.error("publish_cora_event: Postgres fallback also failed: %s", exc)
+		logger.error("publish_lifecycle_event: Postgres fallback also failed: %s", exc)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -135,25 +135,25 @@ def ingest_cron_event(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Postgres LISTEN listener — notifies via NOTIFY cora_events, '<json-body>'
+# Postgres LISTEN listener — notifies via NOTIFY lifecycle_events, '<json-body>'
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _sweep_postgres_queue() -> int:
 	"""
-	Sweep cora_event_queue for pending events and dispatch them.
+	Sweep lifecycle_event_queue for pending events and dispatch them.
 	Called on listener startup and every 60s to catch events published
 	while the listener was offline. Returns the count of events processed.
 	"""
 	from src.core.database import get_db_context
-	from src.core.models import CoraEventQueue
+	from src.core.models import LifecycleEventQueue
 
 	processed = 0
 	try:
 		with get_db_context() as session:
 			rows = (
-				session.query(CoraEventQueue)
-				.filter(CoraEventQueue.status == "pending")
-				.order_by(CoraEventQueue.created_at)
+				session.query(LifecycleEventQueue)
+				.filter(LifecycleEventQueue.status == "pending")
+				.order_by(LifecycleEventQueue.created_at)
 				.with_for_update(skip_locked=True)
 				.limit(100)
 				.all()
@@ -185,17 +185,17 @@ def _sweep_postgres_queue() -> int:
 
 
 def listen_postgres(
-	channel: str = "cora_events",
+	channel: str = "lifecycle_events",
 	stop_event: Optional[threading.Event] = None,
 ) -> None:
 	"""
 	Blocking listener on a Postgres NOTIFY channel.
 
-	On startup: sweeps cora_event_queue for any events published while the
+	On startup: sweeps lifecycle_event_queue for any events published while the
 	listener was offline. Every 60s: re-sweeps for stuck pending rows.
 
 	Senders write:
-		NOTIFY cora_events, '{"event_type":"retention_summary_due", "subscriber_id": 42, "payload": {"tier":"wallet"}}';
+		NOTIFY lifecycle_events, '{"event_type":"retention_summary_due", "subscriber_id": 42, "payload": {"tier":"wallet"}}';
 
 	This handler normalizes the payload via handlers.from_postgres and
 	dispatches to the supervisor.
@@ -244,21 +244,21 @@ def listen_postgres(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Redis Queue listener — BRPOP on "cora:queue"; dry-runs without REDIS_URL
+# Redis Queue listener — BRPOP on "lifecycle:queue"; dry-runs without REDIS_URL
 # ──────────────────────────────────────────────────────────────────────────────
 
 def listen_redis(
-	key: str = "cora:queue",
+	key: str = "lifecycle:queue",
 	stop_event: Optional[threading.Event] = None,
 ) -> None:
 	"""
-	Blocking BRPOP consumer on the Redis list key "cora:queue".
+	Blocking BRPOP consumer on the Redis list key "lifecycle:queue".
 
 	Events pushed via LPUSH sit in the list until consumed. BRPOP is atomic —
 	each call dequeues exactly one item; no two workers can receive the same
-	message. Events survive Cora restarts (they wait in the list). They do NOT
+	message. Events survive Lifecycle restarts (they wait in the list). They do NOT
 	survive a Redis restart unless AOF/RDB persistence is enabled on the Redis
-	instance — the Postgres cora_event_queue is the durability backstop for that.
+	instance — the Postgres lifecycle_event_queue is the durability backstop for that.
 	"""
 	settings = get_agents_settings()
 	if not settings.redis_url:
@@ -337,9 +337,9 @@ def run_forever() -> None:
 	if settings.agents_event_source_postgres:
 		t = threading.Thread(
 			target=listen_postgres,
-			args=("cora_events", stop_event),
+			args=("lifecycle_events", stop_event),
 			daemon=True,
-			name="cora-listen-postgres",
+			name="lifecycle-listen-postgres",
 		)
 		t.start()
 		threads.append(t)
@@ -347,9 +347,9 @@ def run_forever() -> None:
 	if settings.agents_event_source_redis:
 		t = threading.Thread(
 			target=listen_redis,
-			args=("cora:queue", stop_event),
+			args=("lifecycle:queue", stop_event),
 			daemon=True,
-			name="cora-listen-redis",
+			name="lifecycle-listen-redis",
 		)
 		t.start()
 		threads.append(t)

@@ -16,7 +16,7 @@ Finds free-signup subscribers (excludes the separate phone-inbound signup
 path, which never fires this event and would otherwise always look
 "missed") whose signup is 4+ minutes old with no new_lead_voice_call
 agent_decisions row yet, and pages Josh directly (owner_alert.notify_owner)
-plus posts to the ops Slack channel (cora_slack.post_incident_alert) — but
+plus posts to the ops Slack channel (lifecycle_slack.post_incident_alert) — but
 only once per subscriber, checked via owner_alert_dispatch before firing
 either, since post_incident_alert has no idempotency of its own.
 """
@@ -28,7 +28,7 @@ from types import SimpleNamespace
 from sqlalchemy import text
 
 from src.core.database import get_db_context
-from src.services.cora_slack import post_incident_alert
+from src.services.lifecycle_slack import post_incident_alert
 from src.services.owner_alert import notify_owner
 
 logger = logging.getLogger(__name__)
@@ -40,7 +40,7 @@ LOOKBACK_MINUTES = 60    # caps the scan window; older signups already resolved 
 # function, create_free_account/onboard_inbound_caller) — excluding them
 # here, not including free-signup sources, so direct/affiliate/admin/unknown
 # free-signup rows are never wrongly skipped.
-_PHONE_INBOUND_SOURCES = ("missed_call", "cora_sms", "dbpr_email")
+_PHONE_INBOUND_SOURCES = ("missed_call", "lifecycle_sms", "dbpr_email")
 
 
 def sweep_stalled_new_lead_calls() -> int:

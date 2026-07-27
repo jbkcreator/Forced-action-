@@ -106,9 +106,9 @@ def _compose_daily(db: Session, county_id: str | None = None) -> str:
     )
 
     # fa034: the "alert" slot in the daily pulse prefers an unresolved
-    # Cora incident over a learning-card snippet. If no incidents are open,
+    # Lifecycle incident over a learning-card snippet. If no incidents are open,
     # fall back to the latest learning card as before.
-    alert_str = _format_cora_incident_alert(db, county_id=county_id)
+    alert_str = _format_lifecycle_incident_alert(db, county_id=county_id)
     if alert_str is None:
         card = db.execute(
             select(LearningCard).order_by(LearningCard.card_date.desc()).limit(1)
@@ -207,19 +207,19 @@ def _compose_weekly(db: Session, county_id: str | None = None) -> str:
         if len(candidate) <= MAX_DAILY_SMS_CHARS:
             body = candidate
 
-    # fa034: append a one-line Cora incidents summary if there's room.
-    incidents_line = _format_cora_incidents_weekly_summary(db, county_id=county_id)
+    # fa034: append a one-line Lifecycle incidents summary if there's room.
+    incidents_line = _format_lifecycle_incidents_weekly_summary(db, county_id=county_id)
     if incidents_line:
         candidate = f"{body}\nIncidents 7d: {incidents_line}"
         if len(candidate) <= MAX_DAILY_SMS_CHARS:
             body = candidate
 
-    # fa036: append a one-line Cora autonomy summary from the latest
-    # autonomy_summary learning card (written by cora_autonomy_report at
+    # fa036: append a one-line Lifecycle autonomy summary from the latest
+    # autonomy_summary learning card (written by lifecycle_autonomy_report at
     # Monday 08:45 UTC, 15 min before this task at 09:00). Defensively
     # truncated if it would blow the SMS budget — same pattern as the
     # incidents line.
-    autonomy_line = _format_cora_autonomy_weekly_summary(db)
+    autonomy_line = _format_lifecycle_autonomy_weekly_summary(db)
     if autonomy_line:
         candidate = f"{body}\n{autonomy_line}"
         if len(candidate) <= MAX_DAILY_SMS_CHARS:
@@ -237,9 +237,9 @@ def _compose_weekly(db: Session, county_id: str | None = None) -> str:
 
 # ── fa034 helpers — pure raw SQL, no ORM ────────────────────────────────────
 
-def _format_cora_incident_alert(db: Session, county_id: str | None = None) -> str | None:
+def _format_lifecycle_incident_alert(db: Session, county_id: str | None = None) -> str | None:
     """Return a 140-char alert string built from the latest unresolved
-    cora_incident, or None if no incident is open.
+    lifecycle_incident, or None if no incident is open.
 
     Prioritizes severity=red over yellow, then most recent breach_started.
     """
@@ -247,7 +247,7 @@ def _format_cora_incident_alert(db: Session, county_id: str | None = None) -> st
     row = db.execute(sa_text(f"""
         SELECT metric_name, severity, observed_value, threshold_value,
                action_taken, breach_started, county_id
-        FROM cora_incident
+        FROM lifecycle_incident
         WHERE breach_resolved IS NULL
         {county_clause}
         ORDER BY (severity = 'red') DESC, breach_started DESC
@@ -284,7 +284,7 @@ def _format_kill_switch_scorecard(db: Session, county_id: str | None = None) -> 
     Returns None if the metrics list is empty or all metrics are '?' (no data).
     """
     from config.revenue_pulse import KILL_SWITCH_METRICS_WEEKLY, MAX_KILL_SWITCH_SCORECARD_CHARS
-    from src.tasks.cora_self_healing import _grade
+    from src.tasks.lifecycle_self_healing import _grade
     from src.tasks.kill_switch_metric_ingest import get_cached_metric
 
     parts = []
@@ -310,9 +310,9 @@ def _format_kill_switch_scorecard(db: Session, county_id: str | None = None) -> 
     return line
 
 
-def _format_cora_autonomy_weekly_summary(db: Session) -> str | None:
+def _format_lifecycle_autonomy_weekly_summary(db: Session) -> str | None:
     """Return a one-line summary built from the latest autonomy_summary
-    learning card (written by src/tasks/cora_autonomy_report.py), or None
+    learning card (written by src/tasks/lifecycle_autonomy_report.py), or None
     if no card exists yet.
 
     Honest about missing data: null metrics render as 'n/a', not '0' —
@@ -320,8 +320,8 @@ def _format_cora_autonomy_weekly_summary(db: Session) -> str | None:
     instead of faking a feel-good 0%.
 
     Example output:
-        "Cora autonomy: 72% autonomous, 3% overridden, 4 adopted, +2 net playbooks"
-        "Cora autonomy: n/a autonomous, n/a overridden, 0 adopted, +0 net playbooks"
+        "Lifecycle autonomy: 72% autonomous, 3% overridden, 4 adopted, +2 net playbooks"
+        "Lifecycle autonomy: n/a autonomous, n/a overridden, 0 adopted, +0 net playbooks"
     """
     row = db.execute(sa_text("""
         SELECT data_json FROM learning_cards
@@ -338,14 +338,14 @@ def _format_cora_autonomy_weekly_summary(db: Session) -> str | None:
 
     net = d.get("net_new_playbooks", 0)
     return (
-        f"Cora autonomy: {pct(d.get('autonomous_pct'))} autonomous, "
+        f"Lifecycle autonomy: {pct(d.get('autonomous_pct'))} autonomous, "
         f"{pct(d.get('overridden_pct'))} overridden, "
         f"{d.get('recommended_adoptions', 0)} adopted, "
         f"{net:+d} net playbooks"
     )
 
 
-def _format_cora_incidents_weekly_summary(db: Session, county_id: str | None = None) -> str | None:
+def _format_lifecycle_incidents_weekly_summary(db: Session, county_id: str | None = None) -> str | None:
     """Return a one-line counts summary or None if no incident activity
     in the last 7 days.
 
@@ -359,7 +359,7 @@ def _format_cora_incidents_weekly_summary(db: Session, county_id: str | None = N
             COUNT(*) FILTER (WHERE breach_resolved >= NOW() - INTERVAL '7 days') AS resolved_7d,
             COUNT(*) FILTER (WHERE action_taken='feature_killed'
                             AND created_at >= NOW() - INTERVAL '7 days')        AS kill_pending_7d
-        FROM cora_incident
+        FROM lifecycle_incident
         {county_clause}
     """), {"county_id": county_id} if county_id else {}).first()
     if row is None:

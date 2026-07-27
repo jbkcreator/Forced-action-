@@ -3,7 +3,7 @@ Wallet-to-Lock sweep task.
 
 Runs daily at 0 9 * * * (9 AM UTC).
 Finds wallet subscribers with >= 40 credits in a single ZIP over 30 days
-and emits Cora events for Territory Lock close.
+and emits Lifecycle events for Territory Lock close.
 
 Usage:
     python -m src.tasks.wallet_to_lock_sweep [--dry-run]

@@ -52,7 +52,7 @@ Single ledger = every one of these passes `db=` (open own session where none exi
 
 | Call site | task_type | Today | Fix |
 |---|---|---|---|
-| `src/agents/subgraphs/compose_and_send.py:117` (**entire Cora fleet**) | sms_copy / retention_copy | ❌ no db | wrap in `Database().session_scope()`, pass `db`, `graph_name`, `pause_target` (from state) |
+| `src/agents/subgraphs/compose_and_send.py:117` (**entire Lifecycle fleet**) | sms_copy / retention_copy | ❌ no db | wrap in `Database().session_scope()`, pass `db`, `graph_name`, `pause_target` (from state) |
 | `src/services/concierge_chat.py:152` | chat_response | ❌ no db | pass `db=db` (session already in scope) |
 | `src/tasks/proactive_save.py:132` | email_copy | ❌ no db | pass `db=db` |
 | `src/tasks/stripe_recovery_sweep.py:103,171,217` | email_copy | ❌ no db | pass `db=db` |

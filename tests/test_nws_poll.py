@@ -35,13 +35,13 @@ def _qualifying_payload(alert_id="https://api.weather.gov/alerts/urn:test:001"):
 def _mock_settings(
     nws_weather_enabled=True,
     storm_pack_enabled=True,
-    nws_cora_urgency_enabled=True,
+    nws_lifecycle_urgency_enabled=True,
     nws_revenue_polling_enabled=True,
 ):
     s = MagicMock()
     s.nws_weather_enabled = nws_weather_enabled
     s.storm_pack_enabled = storm_pack_enabled
-    s.nws_cora_urgency_enabled = nws_cora_urgency_enabled
+    s.nws_lifecycle_urgency_enabled = nws_lifecycle_urgency_enabled
     s.nws_revenue_polling_enabled = nws_revenue_polling_enabled
     s.nws_relevant_events = [
         "Tornado Warning", "Tornado Watch",
@@ -218,7 +218,7 @@ class TestNWSPollRunner:
         assert stats["polled"] == 0
         assert stats["new_alerts"] == 0
         assert stats["duplicates_skipped"] == 0
-        assert stats["cora_dispatched"] == 0
+        assert stats["lifecycle_dispatched"] == 0
 
     def test_dry_run_fetches_but_does_not_enter_db(self):
         """dry_run=True logs features but never opens a DB session."""

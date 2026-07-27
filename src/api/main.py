@@ -38,7 +38,7 @@ from sqlalchemy import select, and_, or_, desc, func, cast, text, Date, distinct
 
 from src.core.database import get_db_context
 from src.core.models import ConsentAcceptance, FoundingSubscriberCount, ZipTerritory, Subscriber, Property, DistressScore, Incident, LeadPackPurchase, ScraperRunStats, EnrichedContact, Owner, SentLead, WaitlistEntry, SmsOptIn, ExpansionCandidate, County, LeadExclusivity
-from src.agents.events.ingestion import publish_cora_event
+from src.agents.events.ingestion import publish_lifecycle_event
 from src.services.stripe_webhooks import handle_webhook
 from src.services.stripe_service import get_price_id_for_checkout, get_price_id_for_preview, _price_ids
 from src.services import lead_exclusivity
@@ -117,7 +117,7 @@ async def affiliate_ref_cookie(request, call_next):
     return response
 from src.api.admin_router import router as admin_router, get_current_admin  # noqa: E402
 from src.api.attribution_router import router as attribution_router  # noqa: E402
-from src.api.cora_incidents_router import router as cora_incidents_router  # noqa: E402
+from src.api.lifecycle_incidents_router import router as lifecycle_incidents_router  # noqa: E402
 from src.api.sms_analytics_router import router as sms_analytics_router  # noqa: E402
 from src.api.operator_crm_router import router as operator_crm_router  # noqa: E402
 from src.api.closer_router import router as closer_router  # noqa: E402
@@ -125,7 +125,7 @@ from src.api.feedback_ritual_router import router as feedback_ritual_router  # n
 from src.api.deal_of_the_day_router import router as deal_of_the_day_router  # noqa: E402
 app.include_router(admin_router)
 app.include_router(attribution_router)
-app.include_router(cora_incidents_router)
+app.include_router(lifecycle_incidents_router)
 app.include_router(sms_analytics_router)
 app.include_router(operator_crm_router)
 app.include_router(closer_router)
@@ -1378,7 +1378,7 @@ async def stripe_webhook(
 # POST /webhooks/aircall — Closer Cockpit call capture (Sprint S1b)
 # Events: call.ended, transcription.created, sentiment.created, topics.created.
 # HMAC-verified, returns 200 fast; updates closer_calls and (on transcript)
-# publishes a Cora event for tagging.
+# publishes a Lifecycle event for tagging.
 # ---------------------------------------------------------------------------
 
 def _verify_aircall_signature(raw_body: bytes, signature) -> bool:
@@ -1474,7 +1474,7 @@ def _handle_aircall_event(etype, data: dict, db) -> None:
             row.transcript_text = transcript
             row.transcript_fetched_at = datetime.now(timezone.utc)
             db.flush()
-            publish_cora_event({
+            publish_lifecycle_event({
                 "event_type": "call_transcribed",
                 "subscriber_id": row.subscriber_id,
                 "payload": {"aircall_call_id": call_id},
@@ -2435,7 +2435,7 @@ def event_feed(
                 from src.core.redis_client import redis_available, rget, rset
                 _cooldown_key = f"wall_abandon_fired:{subscriber.id}"
                 if not redis_available() or not rget(_cooldown_key):
-                    publish_cora_event({
+                    publish_lifecycle_event({
                         "event_type": "wall_session_abandoned",
                         "subscriber_id": subscriber.id,
                         "payload": {
@@ -4733,11 +4733,11 @@ def _trigger_hot_inbound_callback(
 ) -> None:
     """
     Block 11 / B11-03: if the inbound scored hot, publish inbound_hot_callback
-    so the Cora process routes it to the EXISTING new_lead_voice_call graph
+    so the Lifecycle process routes it to the EXISTING new_lead_voice_call graph
     (Block 2) — zero new call code, consent/compliance/kill-switch reused.
     decision_id=call_id so B11-04 tracking can join webhook -> event -> graph.
 
-    Publishes via publish_after_commit (not publish_cora_event directly): the
+    Publishes via publish_after_commit (not publish_lifecycle_event directly): the
     request's own transaction — the new/resolved subscriber, SmsOptIn, and the
     inbound_response row written just before this call — is not yet committed
     when this function runs (FastAPI's get_db commits only after the endpoint
@@ -4905,7 +4905,7 @@ async def synthflow_inbound_webhook(request: Request, db: Session = Depends(get_
 
     # Block 11 / B11-01: score for high intent inside the sub-60s inbound
     # window. Scoring only — the B11-03 callback trigger consumes this via
-    # publish_cora_event and reuses Block 2's consent/compliance gates.
+    # publish_lifecycle_event and reuses Block 2's consent/compliance gates.
     from src.services.inbound_intent import score_inbound
     from src.services.phone_utils import normalize as normalize_phone
 
@@ -4970,7 +4970,7 @@ async def synthflow_call_completed(
 ):
     """
     Receives completed call data from Synthflow (transcript, outcome, recording).
-    Stores in synthflow_calls and writes to agent_decisions for Cora learning.
+    Stores in synthflow_calls and writes to agent_decisions for Lifecycle learning.
     """
     from src.services.webhook_log import log_webhook_event
 
@@ -5045,7 +5045,7 @@ async def synthflow_call_completed(
             duration_seconds=payload.duration_seconds,
         ))
 
-    # Write to agent_decisions for Cora learning (ORM applies Python-side defaults)
+    # Write to agent_decisions for Lifecycle learning (ORM applies Python-side defaults)
     # decision_id is always a fresh uuid4 — call_id lives in summary JSONB for correlation.
     # Idempotency: if call_id is known, skip duplicate via summary->>'call_id' lookup.
     from uuid import uuid4
@@ -5291,7 +5291,7 @@ async def telnyx_inbound(request: Request, db: Session = Depends(get_db)):
         if reply:
             send_sms(from_number, reply, db, message_type="transactional")
     else:
-        from src.services.cora_suppression import record_generic_sms_reply
+        from src.services.lifecycle_suppression import record_generic_sms_reply
         record_generic_sms_reply(
             db,
             phone=from_number,
@@ -6070,7 +6070,7 @@ def human_close_outcome(
         esc.closer_assigned = closer_assigned
     if outcome in {"won", "lost"}:
         try:
-            from src.services.cora_suppression import create_suppression
+            from src.services.lifecycle_suppression import create_suppression
             create_suppression(
                 db,
                 subscriber_id=esc.subscriber_id,
@@ -6082,7 +6082,7 @@ def human_close_outcome(
                 created_by=closer_assigned,
             )
         except Exception as exc:
-            logger.warning("[HumanClose] cora suppression failed escalation=%s: %s", escalation_id, exc)
+            logger.warning("[HumanClose] lifecycle suppression failed escalation=%s: %s", escalation_id, exc)
     db.flush()
     return {"ok": True, "escalation_id": escalation_id, "outcome": outcome}
 
@@ -6489,7 +6489,7 @@ class FreeSignupRequest(BaseModel):
     name: Optional[str] = None
     referral_code: Optional[str] = None
     # Optional phone + TCPA consent for SMS features. When provided AND
-    # sms_consent=True, signup_engine inserts an SmsOptIn row so Cora can
+    # sms_consent=True, signup_engine inserts an SmsOptIn row so Lifecycle can
     # send marketing SMS (lead alerts, accelerated wallet push, FOMO).
     phone: Optional[str] = None
     sms_consent: bool = False
@@ -6636,7 +6636,7 @@ def free_signup(req: FreeSignupRequest, request: Request, db: Session = Depends(
 
 
 # ── fa017: Landing token resolver ───────────────────────────────────────────
-# Maps a signed HMAC token from a missed-call / DBPR / Cora SMS landing link
+# Maps a signed HMAC token from a missed-call / DBPR / Lifecycle SMS landing link
 # back to the Subscriber's feed_uuid so the frontend can navigate directly to
 # /dashboard/<uuid> without forcing a re-signup. Best-effort: invalid /
 # expired tokens return 410 Gone and the frontend silently falls back to the

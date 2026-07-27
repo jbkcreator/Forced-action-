@@ -7,7 +7,7 @@ services:
     network_mode: host
     restart: unless-stopped
 
-  cora:
+  lifecycle:
     image: forced-action-backend:latest
     command: python -m src.agents --serve
     env_file: .env

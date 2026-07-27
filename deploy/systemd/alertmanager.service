@@ -1,5 +1,5 @@
 [Unit]
-Description=Alertmanager — alert routing for Prometheus (Stage 10 / Cora)
+Description=Alertmanager — alert routing for Prometheus (Stage 10 / Lifecycle)
 Documentation=https://prometheus.io/docs/alerting/latest/alertmanager/
 After=network-online.target prometheus.service
 Wants=network-online.target

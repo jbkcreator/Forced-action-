@@ -40,7 +40,7 @@
 | `src/services/contractor_mrr.py` | `global_contractor_mrr()` + `MRR_ICP_GATE_THRESHOLD` |
 | `src/services/icp_launch_gate.py` | `icp_launch_blocked()` predicate |
 | `src/services/icp_feed.py` | `rei_feed_query()` |
-| `config/cora_guardrails.py` | `EXPANSION_GATES` dict (7 keys) |
+| `config/lifecycle_guardrails.py` | `EXPANSION_GATES` dict (7 keys) |
 | `alembic/versions/fa050_expansion_icp_channels.py` | Migration stub |
 | `scripts/apply_fa050_ddl.py` | DDL apply script |
 
@@ -56,7 +56,7 @@ Tests that need Postgres (JSONB) are marked `@pytest.mark.skipif(not DATABASE_UR
 
 **A1 — EXPANSION_GATES has exactly 7 keys**
 ```python
-from config.cora_guardrails import EXPANSION_GATES
+from config.lifecycle_guardrails import EXPANSION_GATES
 assert len(EXPANSION_GATES) == 7
 assert "free_tier_cost_ratio" in EXPANSION_GATES
 assert "county_profitability" in EXPANSION_GATES
@@ -250,7 +250,7 @@ pytest tests/test_expansion_icp_model.py tests/test_cost_gates.py \
        --co -q 2>&1  # collect-only first
 
 # Static structural checks (inline Python)
-python -c "from config.cora_guardrails import EXPANSION_GATES; print(list(EXPANSION_GATES.keys()))"
+python -c "from config.lifecycle_guardrails import EXPANSION_GATES; print(list(EXPANSION_GATES.keys()))"
 python -c "from src.services.contractor_mrr import MRR_ICP_GATE_THRESHOLD; print(MRR_ICP_GATE_THRESHOLD)"
 python -c "from src.core.models import ExpansionIcpChannel; print(ExpansionIcpChannel.__tablename__)"
 python -c "from src.services.icp_launch_gate import icp_launch_blocked; print('ok')"
@@ -311,7 +311,7 @@ The script uses `CREATE TABLE IF NOT EXISTS` and `ON CONFLICT DO NOTHING`, so re
 ### 8.1 Static / Config Checks (Group A)
 
 ```
-$ python -c "from config.cora_guardrails import EXPANSION_GATES; print(list(EXPANSION_GATES.keys()), len(EXPANSION_GATES))"
+$ python -c "from config.lifecycle_guardrails import EXPANSION_GATES; print(list(EXPANSION_GATES.keys()), len(EXPANSION_GATES))"
 ['first_payment_rate', 'saved_card_rate', 'wallet_adoption', 'lock_conversion',
  'payer_retention_30d', 'free_tier_cost_ratio', 'county_profitability'] 7
 

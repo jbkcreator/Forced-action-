@@ -1,7 +1,7 @@
 """Add 'holdout_result' to learning_cards.check_card_type (Task 4.1).
 
-cora_holdout_check.py needs its own card_type, not 'ab_result' — that value
-is already written daily by ab_rollback_check.py/cora_attribution_rollback_
+lifecycle_holdout_check.py needs its own card_type, not 'ab_result' — that value
+is already written daily by ab_rollback_check.py/lifecycle_attribution_rollback_
 check.py, and learning_cards has a table-wide UNIQUE(card_date, card_type):
 sharing a type risks two unrelated jobs' results overwriting each other the
 same day.

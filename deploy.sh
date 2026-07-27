@@ -27,7 +27,7 @@ rollback() {
     git checkout "$good_sha" || { echo "ROLLBACK FAILED: git checkout $good_sha" >&2; return; }
     "$VENV/pip" install -q -r requirements.txt || echo "ROLLBACK WARNING: pip install failed on rollback" >&2
     systemctl restart fa-api || echo "ROLLBACK WARNING: fa-api restart failed" >&2
-    systemctl restart cora || echo "ROLLBACK WARNING: cora restart failed" >&2
+    systemctl restart lifecycle || echo "ROLLBACK WARNING: lifecycle restart failed" >&2
     echo "== ROLLBACK COMPLETE — prod running $good_sha ==" >&2
 }
 
@@ -67,7 +67,7 @@ done
 echo "== 4/4 install cron + restart services =="
 bash scripts/cron/install_cron.sh > /dev/null || fail "install_cron.sh"
 systemctl restart fa-api || fail "systemctl restart fa-api"
-systemctl restart cora || fail "systemctl restart cora"
+systemctl restart lifecycle || fail "systemctl restart lifecycle"
 
 RESTART_TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 

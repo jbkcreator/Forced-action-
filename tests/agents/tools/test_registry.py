@@ -1,5 +1,5 @@
 """
-Tests for the Cora tool registry.
+Tests for the Lifecycle tool registry.
 
 Covers:
   - @tool decorator valid registration (read / write / gating)
@@ -156,5 +156,5 @@ def test_tool_spec_attached_to_function(isolated_registry):
 		"""A tool."""
 		pass
 
-	assert hasattr(_inspect, "__cora_tool_spec__")
-	assert _inspect.__cora_tool_spec__.name == "_inspect"  # type: ignore[attr-defined]
+	assert hasattr(_inspect, "__lifecycle_tool_spec__")
+	assert _inspect.__lifecycle_tool_spec__.name == "_inspect"  # type: ignore[attr-defined]

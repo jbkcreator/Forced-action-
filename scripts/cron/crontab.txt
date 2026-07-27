@@ -81,7 +81,7 @@ COUNTY_ID=hillsborough
 17 6 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.roofing_permits.roofing_permit_engine --county-id $COUNTY_ID
 
 # NWS revenue alert polling — every 5 minutes, all days (fa018)
-# Autonomous trigger for storm-pack offers and Cora urgency messages.
+# Autonomous trigger for storm-pack offers and Lifecycle urgency messages.
 # Idempotent: same alert_id is never processed twice.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.nws_poll --county-id $COUNTY_ID
 
@@ -117,7 +117,7 @@ COUNTY_ID=hillsborough
 
 # Quora S6 organic-answer pipeline — 06:35 AM UTC daily (after load validator).
 # Picks one keyword via DB rotation (quora_topics + cooldown_days), scrapes Quora,
-# publishes to Cora for classification + answer drafting, upserts to quora_questions.
+# publishes to Lifecycle for classification + answer drafting, upserts to quora_questions.
 #35 6 * * * $PROJECT/scripts/cron/run.sh src.tasks.quora_s6_orchestrator
 
 # Autonomous Inbound Content Loop (Task 5.1) — Weekly Sunday @ 09:00 AM UTC.
@@ -257,31 +257,31 @@ COUNTY_ID=hillsborough
 # idempotent. Decouples the buyer's one-tap outcome from score recalculation.
 1-59/2 * * * * $PROJECT/scripts/cron/run.sh src.tasks.outcome_dispatch_sweep
 
-# Cora anomaly check — volume + no-answer rate monitor — every 15 min
-*/15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.cora_anomaly_check
+# Lifecycle anomaly check — volume + no-answer rate monitor — every 15 min
+*/15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lifecycle_anomaly_check
 
-# Cora self-healing loop (fa034) — every hour at :30. Reads kill-switch
-# metrics + 7-day baselines, opens/maintains/closes cora_incident rows,
+# Lifecycle self-healing loop (fa034) — every hour at :30. Reads kill-switch
+# metrics + 7-day baselines, opens/maintains/closes lifecycle_incident rows,
 # takes safe actions inside guardrails (fallback only — never auto-pricing
 # or auto-kill), escalates to Slack + Revenue Pulse when human review needed.
 # Source of truth: FA-2B-v9-FINAL Self-Healing Ops + Q44 + Q52.
-# Gated by CORA_SELF_HEALING_ENABLED=true (default false). Task is a no-op
+# Gated by LIFECYCLE_SELF_HEALING_ENABLED=true (default false). Task is a no-op
 # when disabled — safe to leave the cron entry in even on environments that
 # haven't opted in yet.
-30 * * * * $PROJECT/scripts/cron/run.sh src.tasks.cora_self_healing
+30 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lifecycle_self_healing
 
 # Stage 10 — Variant Mutation Job (fa055) — every hour at :45 (15 min after self-healing).
 # Runs sigma rollback check, proving-cycle evaluation, and slot retirement/replacement
 # loop for all active message_variant_tests. Also checks rollback triggers for all
-# active pricing_cohorts. Reuses CORA_SELF_HEALING_ENABLED gate — no-op when disabled.
-# Max 3 actions per run (shared guardrail with cora_self_healing).
+# active pricing_cohorts. Reuses LIFECYCLE_SELF_HEALING_ENABLED gate — no-op when disabled.
+# Max 3 actions per run (shared guardrail with lifecycle_self_healing).
 45 * * * * $PROJECT/scripts/cron/run.sh src.tasks.variant_mutation_job
 
 # Stage 10 — Alert Rules Check (fa055) — every 15 min.
 # Evaluates the same conditions as deploy/prometheus/alert_rules.yml but via cron,
 # so self-healing fires correctly even without a running Prometheus/Alertmanager stack.
-# Actions: variant_engine.promote_winner, sigma_rollback, cora_self_healing steps.
-# Gated by CORA_SELF_HEALING_ENABLED. Idempotent — no duplicate actions within breach.
+# Actions: variant_engine.promote_winner, sigma_rollback, lifecycle_self_healing steps.
+# Gated by LIFECYCLE_SELF_HEALING_ENABLED. Idempotent — no duplicate actions within breach.
 */15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.alert_rules_check
 
 # ── A7 MACRO SIGNALS ─────────────────────────────────────────
@@ -308,14 +308,14 @@ COUNTY_ID=hillsborough
 # and before any lead-selling surface is read. CDS writes a fresh distress_scores
 # row per property per day (is_guess_lead defaults FALSE); this pass recomputes
 # Lead Confidence over today's rows and flags is_guess_lead when below threshold,
-# so guess leads are withheld from the feed / Lead Packs / Cora recs and marked
+# so guess leads are withheld from the feed / Lead Packs / Lifecycle recs and marked
 # direct_mail_eligible. Read-only on the CDS score (ADR 0019). Both counties in
 # one pass (iterates today's rows regardless of county).
 2 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.services.lead_confidence
 
 # ── FEEDBACK RITUAL EXPORT (4.3) ─────────────────────────────
-# Closes the Human Feedback Ritual loop: turns admin-reviewed flagged Cora
-# interactions (cora_training_overrides, source='feedback_ritual',
+# Closes the Human Feedback Ritual loop: turns admin-reviewed flagged Lifecycle
+# interactions (lifecycle_training_overrides, source='feedback_ritual',
 # review_outcome approved|needs_correction) into a JSONL fine-tuning dataset and
 # flips those rows to queue_status='exported'. Idempotent — only picks up newly
 # reviewed rows. Runs daily 08:20 UTC Mon-Sat, after GHL sync (08:00) so
@@ -554,17 +554,17 @@ COUNTY_ID=hillsborough
 # Revenue Pulse — daily founder SMS at 07:30 UTC (lead count, wallet actives, top deal/alert, kill switch).
 30 7 * * * $PROJECT/scripts/cron/run.sh src.tasks.revenue_pulse --daily
 
-# Weekly Cora autonomy scorecard (fa036) — Monday 08:45 UTC. Computes 5
-# autonomy metrics over the last 7 days from agent_decisions + cora_playbook,
+# Weekly Lifecycle autonomy scorecard (fa036) — Monday 08:45 UTC. Computes 5
+# autonomy metrics over the last 7 days from agent_decisions + lifecycle_playbook,
 # writes one learning_cards row (card_type='autonomy_summary'), and posts to
-# Slack via cora_slack. Scheduled 15 min before the 09:00 weekly Revenue Pulse
+# Slack via lifecycle_slack. Scheduled 15 min before the 09:00 weekly Revenue Pulse
 # so the pulse can append the latest autonomy summary line.
 # Read-only metric computation — no env gate, safe to leave wired.
-# Source: FA-2B-v9-FINAL §Weekly Cora Autonomy Scorecard.
-45 8 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.cora_autonomy_report
+# Source: FA-2B-v9-FINAL §Weekly Lifecycle Autonomy Scorecard.
+45 8 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.lifecycle_autonomy_report
 
 # Weekly Kill-Switch Scorecard (fa037) — Monday 08:50 UTC. Reads daily
-# platform_daily_stats snapshots + cora_incident; writes one
+# platform_daily_stats snapshots + lifecycle_incident; writes one
 # learning_cards row (card_type='kill_switch_scorecard'); the 09:00 weekly
 # Revenue Pulse appends a compact alarm line. Read-only — no env gate.
 50 8 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.kill_switch_scorecard
@@ -572,7 +572,7 @@ COUNTY_ID=hillsborough
 # Revenue Pulse — weekly founder SMS, Monday 09:00 UTC (revenue est, churn, top learning, KS scorecard).
 0 9 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.revenue_pulse --weekly
 
-# Learning Card job — Sunday midnight UTC. Generates weekly performance cards for Cora's context.
+# Learning Card job — Sunday midnight UTC. Generates weekly performance cards for Lifecycle's context.
 0 0 * * 0 $PROJECT/scripts/cron/run.sh src.tasks.learning_card_job
 
 # Stage 12 — Contractor Benchmark Report — Monday 11:00 UTC.
@@ -605,7 +605,7 @@ COUNTY_ID=hillsborough
 # Retention summaries — daily 16:00 UTC. Emits retention_summary_due per tier cadence.
 0 16 * * * $PROJECT/scripts/cron/run.sh src.tasks.retention_event_producer
 
-# ── CORA GATE OBSERVABILITY ──────────────────────────────────────────────────
+# ── LIFECYCLE GATE OBSERVABILITY ──────────────────────────────────────────────────
 # Kill-switch metric ingest — every 6h at 00:00, 06:00, 12:00, 18:00 UTC.
 # Queries DB for live business metrics (first_payment_rate, retention_30d, etc.)
 # and caches in Redis (25hr TTL) so agent graphs can call kill_switch_status()
@@ -654,16 +654,16 @@ COUNTY_ID=hillsborough
 
 # Frozen control holdout surfacing — daily 09:00 UTC (Task 4.1). Walks
 # active *_holdout AbTests; on a proven verdict (variant beats frozen
-# control >2σ, >=30/arm) writes a cora_playbook recommendation + a
+# control >2σ, >=30/arm) writes a lifecycle_playbook recommendation + a
 # holdout_result learning_card. No auto-promote — a human adopts.
-0 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.cora_holdout_check
+0 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.lifecycle_holdout_check
 
-# Cora attribution rollout monitor — every 2 min. Evaluates cora_attribution_v1
+# Lifecycle attribution rollout monitor — every 2 min. Evaluates lifecycle_attribution_v1
 # rollout arm: if variant conversion rate is >2σ worse than control over a
 # rolling 48h window (>=30/arm), rolls back AbTest.status='rolled_back',
 # fires founder SMS alert, writes learning_card. Fail-safe: no-op below floor.
 # Max detection lag: ~4 min — satisfies the <=5-min rollback DoD requirement.
-*/2 * * * * $PROJECT/scripts/cron/run.sh src.tasks.cora_attribution_rollback_check
+*/2 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lifecycle_attribution_rollback_check
 
 # ── STAGE 6 SWEEPS ───────────────────────────────────────────
 # AP Lite candidate sweep — daily 14:00 UTC. Rolling 7-day window; idempotency
@@ -758,7 +758,7 @@ COUNTY_ID=hillsborough
 # sitemap.xml. No-op if no data changed (hash-diffed). Retire hysteresis = 2 runs.
 30 9 * * 0 $PROJECT/scripts/cron/run.sh src.tasks.seo_compiler
 
-# ── CORA DATA ENGINE — OUTCOME CONNECTORS (PR #111) ─────────────────────────
+# ── LIFECYCLE DATA ENGINE — OUTCOME CONNECTORS (PR #111) ─────────────────────────
 # Mines already-ingested, already-matched records for a labeled outcome event
 # and stages it as an OutcomeCandidate. See src/connectors/registry.py for
 # the source-of-truth cadence/SLA metadata these lines implement.

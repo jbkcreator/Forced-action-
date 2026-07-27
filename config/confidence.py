@@ -10,7 +10,7 @@ of a good record match.
 """
 
 # A lead with Lead Confidence below this is flagged is_guess_lead and withheld
-# from paid surfaces (Lead Feed / Lead Packs / Cora recs).
+# from paid surfaces (Lead Feed / Lead Packs / Lifecycle recs).
 MIN_CONFIDENCE_THRESHOLD = 0.40
 
 # Weighted blend of the two factors. Must sum to 1.0.

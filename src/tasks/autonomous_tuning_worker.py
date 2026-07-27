@@ -112,7 +112,7 @@ def tune_scraper_keywords(
             SELECT q.matched_keyword AS kw, COUNT(*) AS answers,
                    COALESCE(SUM(d.cost_usd), 0) AS spend
             FROM quora_questions q
-            LEFT JOIN agent_decisions d ON d.decision_id = q.cora_decision_id
+            LEFT JOIN agent_decisions d ON d.decision_id = q.lifecycle_decision_id
             WHERE q.posted_at >= :cutoff AND q.matched_keyword IS NOT NULL
             GROUP BY q.matched_keyword
         """), {"cutoff": cutoff}).all()

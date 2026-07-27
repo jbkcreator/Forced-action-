@@ -13,7 +13,7 @@ Plus regression tests for the 2 new event hooks:
   - record_opt_out STOP path
 
 All DB I/O is stubbed via fake sessions — pattern mirrors
-tests/test_cora_self_healing.py and tests/test_cora_autonomy_report.py.
+tests/test_lifecycle_self_healing.py and tests/test_lifecycle_autonomy_report.py.
 """
 
 from __future__ import annotations

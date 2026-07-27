@@ -2,7 +2,7 @@
 Human close routing service.
 
 Identifies high-intent subscribers who have not converted after multiple
-Cora interactions, and routes them to a human closer via Slack.
+Lifecycle interactions, and routes them to a human closer via Slack.
 
 Candidate criteria:
   - revenue_signal_score >= 85
@@ -254,7 +254,7 @@ def build_context(db: Session, candidate: HumanCloseCandidate) -> dict:
         "recommended_action": (
             f"Call within 24h. Lead with {candidate.target_tier} offer. "
             f"Score={candidate.revenue_signal_score}/100. "
-            f"{candidate.interactions_count} Cora touches, no conversion yet."
+            f"{candidate.interactions_count} Lifecycle touches, no conversion yet."
         ),
         "dashboard_url": (
             f"{settings.app_base_url}/dashboard/{sub.event_feed_uuid}"

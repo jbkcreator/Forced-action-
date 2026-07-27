@@ -259,7 +259,7 @@ def subscriber_conversation(
     db: Session = Depends(get_db),
     _admin: dict = Depends(get_current_admin),
 ):
-    """Unified conversation history: outbound Cora SMS (sms_send_logs),
+    """Unified conversation history: outbound Lifecycle SMS (sms_send_logs),
     inbound SMS reply storage (best-effort from sms_opt_outs keyword
     events), and ChatMessage rows (both directions) joined via
     ChatSession.subscriber_id.

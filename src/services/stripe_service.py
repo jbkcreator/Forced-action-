@@ -326,7 +326,7 @@ def create_subscription_checkout(
             payment_method_types=["card"],
             customer_email=customer_email,
             # Collect a phone number on the Stripe payment page so we have it
-            # on file for SMS features (Cora SMS, accelerated wallet push,
+            # on file for SMS features (Lifecycle SMS, accelerated wallet push,
             # etc.). Stripe validates the number and exposes it in
             # session.customer_details.phone on checkout.session.completed.
             phone_number_collection={"enabled": True},

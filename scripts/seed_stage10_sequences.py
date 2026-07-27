@@ -1,7 +1,7 @@
 """
 Stage 10 — Seed initial message_variant_tests rows.
 
-Registers the 3-variant test configuration for each Cora sequence that
+Registers the 3-variant test configuration for each Lifecycle sequence that
 participates in Stage 10 mutation. Safe to re-run (idempotent via
 get_or_create_test).
 

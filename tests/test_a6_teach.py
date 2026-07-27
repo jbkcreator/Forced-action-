@@ -1,5 +1,5 @@
 """
-A6 — Closer-to-Cora Teaching Interface tests.
+A6 — Closer-to-Lifecycle Teaching Interface tests.
 
 TDD vertical slices:
   Step 1: config/closer.py correction vocabulary
@@ -543,7 +543,7 @@ def _mock_session_for_delivered(lead_rows, correction_rows):
         calls["n"] += 1
         result = MagicMock()
         sql = str(stmt)
-        if "cora_training_overrides" in sql:
+        if "lifecycle_training_overrides" in sql:
             result.fetchall.return_value = correction_rows
         else:
             result.fetchall.return_value = lead_rows

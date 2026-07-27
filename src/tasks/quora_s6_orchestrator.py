@@ -106,11 +106,11 @@ async def run_keyword(
     Run the full pipeline for a single keyword.
     Returns a summary dict: {keyword, scraped, published, classified, drafted, skipped, errors}.
     """
-    from src.agents.events.ingestion import publish_cora_event
+    from src.agents.events.ingestion import publish_lifecycle_event
     from src.scrappers.quora.quora_engine import QuoraResult, scrape_quora
     from src.scrappers.quora.quora_miner import (
         _keyword_slug,
-        _poll_cora_results,
+        _poll_lifecycle_results,
         _result_to_candidate_dict,
         _save_classified_to_db,
     )
@@ -142,12 +142,12 @@ async def run_keyword(
             did             = str(uuid.uuid4())
             idempotency_key = f"quora_cla_ans_{r.qid or r.slug or r.position}_{kslug}"
             try:
-                publish_cora_event({
+                publish_lifecycle_event({
                     "event_type":      "quora_candidate_classify",
                     "subscriber_id":   None,
                     "decision_id":     did,
                     "idempotency_key": idempotency_key,
-                    "result_channel":  "cora:quora:results",
+                    "result_channel":  "lifecycle:quora:results",
                     "payload": {
                         "candidate":              _result_to_candidate_dict(r),
                         "matched_keyword":        keyword,
@@ -162,15 +162,15 @@ async def run_keyword(
         if not decision_id_map:
             continue
 
-        enriched = await _poll_cora_results(decision_id_map, timeout=_POLL_TIMEOUT)
+        enriched = await _poll_lifecycle_results(decision_id_map, timeout=_POLL_TIMEOUT)
         summary["classified"] += enriched
 
         saved = _save_classified_to_db(resp.results, keyword, decision_id_map)
 
         for r in resp.results:
-            if r.cora_classification:
-                action = r.cora_classification.get("recommended_action", "skip")
-                if action == "generate_answer" and r.cora_answer_draft:
+            if r.lifecycle_classification:
+                action = r.lifecycle_classification.get("recommended_action", "skip")
+                if action == "generate_answer" and r.lifecycle_answer_draft:
                     summary["drafted"] += 1
                 else:
                     summary["skipped"] += 1
@@ -208,7 +208,7 @@ async def main(dry_run: bool = False) -> None:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Quora S6 daily orchestrator")
     ap.add_argument("--dry-run", action="store_true",
-                    help="Scrape only — skip Cora publishing and DB writes")
+                    help="Scrape only — skip Lifecycle publishing and DB writes")
     args = ap.parse_args()
 
     asyncio.run(main(dry_run=args.dry_run))

@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from src.api.admin_router import get_current_admin
 from src.api.deps import get_db
-from src.core.models import CoraTrainingOverride
+from src.core.models import LifecycleTrainingOverride
 from src.services.feedback_ritual import (
     apply_feedback_ritual_review,
     serialize_feedback_ritual,
@@ -33,12 +33,12 @@ def list_feedback_ritual(
     _: dict = Depends(get_current_admin),
 ):
     rows = (
-        db.query(CoraTrainingOverride)
+        db.query(LifecycleTrainingOverride)
         .filter(
-            CoraTrainingOverride.source == "feedback_ritual",
-            CoraTrainingOverride.queue_status == queue_status,
+            LifecycleTrainingOverride.source == "feedback_ritual",
+            LifecycleTrainingOverride.queue_status == queue_status,
         )
-        .order_by(CoraTrainingOverride.created_at.desc())
+        .order_by(LifecycleTrainingOverride.created_at.desc())
         .limit(limit)
         .offset(offset)
         .all()
@@ -54,7 +54,7 @@ def review_feedback_ritual(
     db: Session = Depends(get_db),
     admin: dict = Depends(get_current_admin),
 ):
-    row = db.get(CoraTrainingOverride, queue_id)
+    row = db.get(LifecycleTrainingOverride, queue_id)
     if row is None or row.source != "feedback_ritual":
         raise HTTPException(status_code=404, detail="feedback ritual row not found")
 
@@ -80,7 +80,7 @@ def get_feedback_ritual(
     db: Session = Depends(get_db),
     _: dict = Depends(get_current_admin),
 ):
-    row = db.get(CoraTrainingOverride, queue_id)
+    row = db.get(LifecycleTrainingOverride, queue_id)
     if row is None or row.source != "feedback_ritual":
         raise HTTPException(status_code=404, detail="feedback ritual row not found")
     return serialize_feedback_ritual(row)

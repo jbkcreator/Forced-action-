@@ -27,7 +27,7 @@ Simulates the complete Stage 10 flow by injecting mock performance data:
   Scenario D — Self-Healing Incident → Variant Promotion:
     1. Create test for 'wallet_push_v1' (the Stage 10 sequence_name)
     2. Inject loser/winner data
-    3. Create a cora_incident row for first_payment_rate in 'red'
+    3. Create a lifecycle_incident row for first_payment_rate in 'red'
     4. Call run_self_healing with the variant_promotion action wired
     5. Assert incident action_taken = 'auto_paused' and slot paused in DB
 

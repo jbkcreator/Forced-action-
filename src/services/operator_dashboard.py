@@ -21,7 +21,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from src.services.action_queue import (
-    cora_approvals_waiting as _aq_cora_approvals_waiting,
+    lifecycle_approvals_waiting as _aq_lifecycle_approvals_waiting,
     source_failures as _aq_source_failures,
 )
 from src.services.revenue_metrics import compute_revenue_metrics
@@ -77,16 +77,16 @@ def _kpi_source_failures(db: Session, frm: datetime, to: datetime) -> dict:
     return {"available": True, "value": _aq_source_failures(db)}
 
 
-def _kpi_cora_approvals_waiting(db: Session) -> dict:
-    # Canonical count owned by T-B8-03's action queue. Legal-lane cora incidents
+def _kpi_lifecycle_approvals_waiting(db: Session) -> dict:
+    # Canonical count owned by T-B8-03's action queue. Legal-lane lifecycle incidents
     # only (human_escalated / feature_killed) — excludes auto-handled incidents
     # and human-close escalations, matching the approvals lane the KPI links to.
     return {
         "available": True,
-        "value": _aq_cora_approvals_waiting(db),
+        "value": _aq_lifecycle_approvals_waiting(db),
         "note": (
-            "legal-lane cora only (human_escalated/feature_killed); "
-            "canonical source: action_queue.cora_approvals_waiting"
+            "legal-lane lifecycle only (human_escalated/feature_killed); "
+            "canonical source: action_queue.lifecycle_approvals_waiting"
         ),
     }
 
@@ -112,6 +112,6 @@ def compute_operator_dashboard(db: Session, frm: datetime, to: datetime) -> dict
             "loans_funded": _unavailable("Block 7 (lender integration tiers) not yet built"),
             "commissions_owed": _unavailable("Block 7 (referral commission ledger) not yet built"),
             "source_failures": _kpi_source_failures(db, frm, to),
-            "cora_approvals_waiting": _kpi_cora_approvals_waiting(db),
+            "lifecycle_approvals_waiting": _kpi_lifecycle_approvals_waiting(db),
         },
     }

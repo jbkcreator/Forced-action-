@@ -6,7 +6,7 @@ Guardrails and thresholds for:
   - Pricing cohort activation (per-trade, per-county)
   - Self-healing incident triggers specific to Stage 10
 
-These supplement (never override) config/cora_guardrails.py.
+These supplement (never override) config/lifecycle_guardrails.py.
 """
 
 # ── 3-Variant Message Mutation ───────────────────────────────────────────────
@@ -71,7 +71,7 @@ PRICING_COHORT = {
 
 # ── Stage 10 Self-Healing Additions ─────────────────────────────────────────
 
-# Extends KILL_SWITCH in cora_guardrails.py with Stage 10-specific knobs.
+# Extends KILL_SWITCH in lifecycle_guardrails.py with Stage 10-specific knobs.
 # Merged into KILL_SWITCH at runtime by self-healing; never replaces it.
 STAGE10_KILL_SWITCH_OVERRIDES = {
     # Override first_payment_rate: enable auto variant promotion in Stage 10.
@@ -92,7 +92,7 @@ PROMETHEUS = {
     # Hardcoded False here is the fallback default; the env var overrides it.
     "enabled": False,
     # Namespace for all Stage 10 Prometheus metrics.
-    "namespace": "cora_stage10",
+    "namespace": "lifecycle_stage10",
     # Labels exposed per variant metric.
     "variant_labels": ["sequence_name", "slot"],
     # Labels exposed per pricing cohort metric.

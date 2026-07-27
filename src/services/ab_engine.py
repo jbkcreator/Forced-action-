@@ -3,7 +3,7 @@ A/B testing engine — deterministic assignment, outcome recording, auto-rollbac
 
 Two assignment functions exist for two different test shapes:
   assign_variant      — message-swap a/b tests; out-of-test traffic → None (unrecorded).
-  assign_rollout_arm  — rollout tests (e.g. cora_attribution_v1); records BOTH arms
+  assign_rollout_arm  — rollout tests (e.g. lifecycle_attribution_v1); records BOTH arms
                         ('variant' / 'control') so control conversion rate is measurable.
 """
 
@@ -16,7 +16,7 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from config.cora_guardrails import get_guardrail, is_within_guardrail
+from config.lifecycle_guardrails import get_guardrail, is_within_guardrail
 from src.core.models import AbAssignment, AbTest
 
 logger = logging.getLogger(__name__)
@@ -91,11 +91,11 @@ def assign_variant(subscriber_id: int, test_name: str, db: Session) -> Optional[
     return variant
 
 
-ATTRIBUTION_ROLLOUT_TEST_NAME = "cora_attribution_v1"
+ATTRIBUTION_ROLLOUT_TEST_NAME = "lifecycle_attribution_v1"
 
 
 def ensure_attribution_rollout_test(db: Session) -> AbTest:
-    """Idempotently register the cora_attribution_v1 rollout test.
+    """Idempotently register the lifecycle_attribution_v1 rollout test.
 
     Called lazily from decision_hierarchy so the test row exists before
     assign_rollout_arm tries to look it up.
@@ -126,11 +126,11 @@ def get_or_create_holdout_test(
     (100 - control_pct, e.g. 90), with the small remainder held out as a
     frozen control. Capping it would invert the split (90% control, 10%
     treatment). Syncs traffic_pct on every call so a control_pct change in
-    cora_holdout_tests.yaml takes effect on restart.
+    lifecycle_holdout_tests.yaml takes effect on restart.
 
     baseline_fingerprint: content hash of the graph's base prompt at creation
     (loader.base_prompt_fingerprint). Stored in variant_b and re-checked by
-    cora_holdout_check so a verdict never promotes on a baseline that drifted
+    lifecycle_holdout_check so a verdict never promotes on a baseline that drifted
     mid-experiment. Recorded once at creation and NOT re-synced — that's the
     point: it captures the baseline the control arm was measured against.
     """
@@ -370,7 +370,7 @@ def holdout_verdict(
     Mirrors should_rollback_rollout's z-test shape but asks the opposite
     question: does 'variant' beat 'control' by >2σ? Never mutates the test —
     pure read, called by a scheduled surfacing job, not by any promotion path
-    (promotion stays human-adopted via cora_playbook, per fa036).
+    (promotion stays human-adopted via lifecycle_playbook, per fa036).
 
     conversion_window_days: when set, an assignment only counts toward the
     conversion numerator if outcome_at - created_at falls within this many
@@ -543,19 +543,19 @@ def complete_test(
     winner: str,
     db: Session,
     *,
-    source_actor: str = "cora",
+    source_actor: str = "lifecycle",
 ) -> None:
     """Close out an A/B test by recording the winner and writing a
-    `cora_playbook` recommendation row.
+    `lifecycle_playbook` recommendation row.
 
     The `source_actor` kwarg attributes who decided the test was over:
-      - 'cora' (default) — called automatically by `ab_rollback_check`
+      - 'lifecycle' (default) — called automatically by `ab_rollback_check`
                            when the Z-test triggers. Drives Metric 5
-                           "net new playbooks Cora authored."
+                           "net new playbooks Lifecycle authored."
       - <operator handle> — called manually from an admin endpoint or
                             an operator script. Attributes the playbook
                             to the real human actor so Metric 5 doesn't
-                            double-count human decisions as Cora's.
+                            double-count human decisions as Lifecycle's.
 
     The playbook row writes through `playbook_writer.upsert_recommendation`,
     which dedupes by source_key (so re-running ab_rollback_check on a
@@ -571,7 +571,7 @@ def complete_test(
     test.ended_at = datetime.now(timezone.utc)
     db.flush()
 
-    # fa036 — write a `cora_playbook` recommendation row for the winning
+    # fa036 — write a `lifecycle_playbook` recommendation row for the winning
     # variant. Status stays 'recommended' until a human adopts via the
     # admin endpoint (no auto-promote — pinned decision #1).
     from src.services.playbook_writer import upsert_recommendation

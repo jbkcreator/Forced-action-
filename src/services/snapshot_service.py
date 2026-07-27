@@ -4,7 +4,7 @@ Captures the full routing context at the moment a deal_outcome is created:
 - All 6 CDS vertical scores (roads not taken)
 - Selected vertical + top-3 runner-ups with score delta
 - Active pricing cohort
-- Last Cora graph decision
+- Last Lifecycle graph decision
 - Last pitch variant from closer_calls
 
 Resolution (funded/lost) is written back via resolve_snapshot() when the deal closes.
@@ -72,7 +72,7 @@ def capture_snapshot(
         all_scores: dict = vertical_data.get("vertical_scores") or {}
         runner_ups = _compute_runner_ups(all_scores, selected_vertical)
 
-        # Resolve subscriber_id for Cora/closer lookups
+        # Resolve subscriber_id for Lifecycle/closer lookups
         subscriber_id: Optional[int] = None
         county_id: Optional[str] = None
         if deal_outcome_id is not None:
@@ -87,7 +87,7 @@ def capture_snapshot(
                     selected_vertical = row["trade_vertical"]
 
         pricing = _gather_pricing(county_id, selected_vertical, db)
-        cora_graph = _gather_cora_graph(subscriber_id, db)
+        lifecycle_graph = _gather_lifecycle_graph(subscriber_id, db)
         closer = _gather_pitch_variant(subscriber_id, db)
 
         raw_context = {
@@ -101,7 +101,7 @@ def capture_snapshot(
             "vertical_scores": all_scores,
             "runner_up_verticals": runner_ups,
             "active_pricing": pricing,
-            "cora_graph": cora_graph,
+            "lifecycle_graph": lifecycle_graph,
             "recent_closer_call": closer,
         }
 
@@ -119,7 +119,7 @@ def capture_snapshot(
             runner_up_verticals=runner_ups or None,
             pricing_cohort_id=pricing.get("id") if pricing else None,
             pricing_snapshot=pricing,
-            cora_graph=cora_graph,
+            lifecycle_graph=lifecycle_graph,
             pitch_variant=closer.get("pitch_variant") if closer else None,
             raw_context=raw_context,
             outcome_status=outcome_status,
@@ -220,8 +220,8 @@ def _gather_pricing(
     }
 
 
-def _gather_cora_graph(subscriber_id: Optional[int], db: Session) -> Optional[str]:
-    """Return the most recently used Cora graph for this subscriber."""
+def _gather_lifecycle_graph(subscriber_id: Optional[int], db: Session) -> Optional[str]:
+    """Return the most recently used Lifecycle graph for this subscriber."""
     if not subscriber_id:
         return None
     row = db.execute(

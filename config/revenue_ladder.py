@@ -19,7 +19,7 @@ REVENUE_LADDER = [
         "label": "Free Signup",
         "price_cents": 0,
         "billing": None,
-        "trigger": "DBPR email / Cora SMS / missed call / referral",
+        "trigger": "DBPR email / Lifecycle SMS / missed call / referral",
         "sold_by": "automated",
     },
     {
@@ -57,7 +57,7 @@ REVENUE_LADDER = [
         "price_cents_range": (7900, 9900),  # $79–$99/mo add-on
         "billing": "monthly",
         "trigger": "Included in Growth/Power wallets; $79–$99 add-on for Starter wallet",
-        "sold_by": "cora",
+        "sold_by": "lifecycle",
         "stripe_price_env": "stripe_price_auto_mode",
     },
     {
@@ -66,8 +66,8 @@ REVENUE_LADDER = [
         "label": "Territory Lock",
         "price_cents": 19700,  # $197/mo
         "billing": "monthly",
-        "trigger": "FOMO + Cora conversational close + scarcity + crowding",
-        "sold_by": "cora",
+        "trigger": "FOMO + Lifecycle conversational close + scarcity + crowding",
+        "sold_by": "lifecycle",
         "stripe_price_env": "stripe_price_territory_lock",
     },
     {
@@ -77,7 +77,7 @@ REVENUE_LADDER = [
         "price_cents": 29900,  # $299/mo
         "billing": "monthly",
         "trigger": "Lock holders with 10+ manual actions/week",
-        "sold_by": "cora",
+        "sold_by": "lifecycle",
         "stripe_price_env": "stripe_price_autopilot_lite",
     },
     {
@@ -87,7 +87,7 @@ REVENUE_LADDER = [
         "price_cents": 49700,  # $497/mo
         "billing": "monthly",
         "trigger": "Lite users 30+ days with high close rate",
-        "sold_by": "cora",
+        "sold_by": "lifecycle",
         "stripe_price_env": "stripe_price_autopilot_pro",
     },
     {
@@ -97,7 +97,7 @@ REVENUE_LADDER = [
         "price_cents": 197000,  # $1,970/yr ($164/mo effective)
         "billing": "annual",
         "trigger": "See ANNUAL_PUSH_TRIGGERS",
-        "sold_by": "cora",
+        "sold_by": "lifecycle",
         "stripe_price_env": "stripe_price_annual_lock",
     },
     {
@@ -107,7 +107,7 @@ REVENUE_LADDER = [
         "price_cents": 9700,  # $97/mo
         "billing": "monthly",
         "trigger": "At-risk (5–7 days inactive) — proactive save offer",
-        "sold_by": "cora",
+        "sold_by": "lifecycle",
         "stripe_price_env": "stripe_price_data_only",
     },
     {
@@ -117,7 +117,7 @@ REVENUE_LADDER = [
         "price_cents": 200000,  # $2,000/mo
         "billing": "monthly",
         "trigger": "Multi-ZIP power users — self-serve page",
-        "sold_by": "cora",
+        "sold_by": "lifecycle",
         "stripe_price_env": "stripe_price_partner",
     },
     {
@@ -216,8 +216,8 @@ BUNDLES = {
 # ── Bundle Contextual Triggers — Stage 5 ─────────────────────────────────────
 # Rules for when bundle_dispatcher proactively offers each bundle. Each rule is
 # evaluated hourly; matching wallet subscribers receive an SMS with a deep link.
-# Margin floor = 60% (cora_guardrails.bundle_pricing). A/B variants are bounded
-# by ±25% of base price (also in cora_guardrails). Each bundle has its own
+# Margin floor = 60% (lifecycle_guardrails.bundle_pricing). A/B variants are bounded
+# by ±25% of base price (also in lifecycle_guardrails). Each bundle has its own
 # A/B test name so retire/promote works independently.
 
 BUNDLE_TRIGGERS = {
@@ -251,7 +251,7 @@ BUNDLE_TRIGGERS = {
 def bundle_pricing_within_guardrail(bundle_type: str, candidate_cents: int) -> bool:
     """
     Returns True if `candidate_cents` is inside ±25% of the bundle's base
-    price (per cora_guardrails.bundle_pricing). Used by ab_engine when
+    price (per lifecycle_guardrails.bundle_pricing). Used by ab_engine when
     seeding pricing variants — variants outside the band are rejected.
     """
     base = BUNDLES.get(bundle_type, {}).get("price_cents")
@@ -272,7 +272,7 @@ ANNUAL_PLAN = {
     "stripe_price_env": "stripe_price_annual_lock",
 }
 
-# Conditions under which Cora auto-pushes the annual offer.
+# Conditions under which Lifecycle auto-pushes the annual offer.
 # ANY of these being true triggers the push.
 ANNUAL_PUSH_TRIGGERS = [
     {"name": "charter_day_7",        "description": "Day 7 for first 50 charter users"},

@@ -65,7 +65,7 @@ def list_snapshots(
             SELECT id, property_id, prospect_id, deal_outcome_id,
                    snapshot_ts, selected_vertical, lead_tier, final_cds_score,
                    distress_types, all_vertical_scores, runner_up_verticals,
-                   pricing_cohort_id, cora_graph, pitch_variant,
+                   pricing_cohort_id, lifecycle_graph, pitch_variant,
                    outcome_status, resolved_at,
                    counterfactual_run, counterfactual_run_at, created_at
             FROM pre_decision_snapshots
@@ -96,7 +96,7 @@ def list_snapshots(
             "all_vertical_scores": r["all_vertical_scores"],
             "runner_up_verticals": r["runner_up_verticals"],
             "pricing_cohort_id":   r["pricing_cohort_id"],
-            "cora_graph":          r["cora_graph"],
+            "lifecycle_graph":          r["lifecycle_graph"],
             "pitch_variant":       r["pitch_variant"],
             "outcome_status":      r["outcome_status"],
             "resolved_at":         r["resolved_at"].isoformat() if r["resolved_at"] else None,
@@ -120,7 +120,7 @@ def get_snapshot(
             SELECT id, property_id, prospect_id, deal_outcome_id,
                    snapshot_ts, selected_vertical, lead_tier, final_cds_score,
                    distress_types, all_vertical_scores, runner_up_verticals,
-                   pricing_cohort_id, pricing_snapshot, cora_graph, pitch_variant,
+                   pricing_cohort_id, pricing_snapshot, lifecycle_graph, pitch_variant,
                    raw_context, outcome_status, resolved_at,
                    broker_id, alternative_brokers,
                    counterfactual_run, counterfactual_run_at, created_at
@@ -147,7 +147,7 @@ def get_snapshot(
         "runner_up_verticals":   row["runner_up_verticals"],
         "pricing_cohort_id":     row["pricing_cohort_id"],
         "pricing_snapshot":      row["pricing_snapshot"],
-        "cora_graph":            row["cora_graph"],
+        "lifecycle_graph":            row["lifecycle_graph"],
         "pitch_variant":         row["pitch_variant"],
         "raw_context":           row["raw_context"],
         "outcome_status":        row["outcome_status"],
