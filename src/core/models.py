@@ -1367,13 +1367,19 @@ class ActivationEvent(Base):
 
     signup_time mirrors Subscriber.created_at (stamped at row creation so it
     survives even if Subscriber.created_at semantics ever change).
+    onboarding_completed_time is stamped when the one-time preference form
+    (PATCH /onboarding/{feed_uuid}) is submitted — the only step that
+    currently sits between signup and first-leads-shown, so this is the one
+    checkpoint that lets "where did they drop off" distinguish "never opened
+    onboarding" from "opened it, never saw a lead" (Section 4.10 gap).
     first_leads_shown_time is stamped the first time the free-tier dashboard
     renders the 3-5 real scored leads (event_feed's no-locked-zip branch).
     first_unlock_time is stamped the first time the subscriber unlocks any
     lead's contact info (paid $4/hot-lead unlock or founder comp reveal) —
-    this is the activation event per the locked decision. Both are
-    set-once (COALESCE-style in code, never overwritten) so "time to first
-    value" and "time to activation" stay measurable against signup_time.
+    this is the activation event per the locked decision. All three post-
+    signup stamps are set-once (COALESCE-style in code, never overwritten) so
+    "time to first value" and "time to activation" stay measurable against
+    signup_time.
     """
     __tablename__ = "activation_events"
 
@@ -1383,6 +1389,7 @@ class ActivationEvent(Base):
     signup_time: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+    onboarding_completed_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     first_leads_shown_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     first_unlock_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
@@ -1392,6 +1399,7 @@ class ActivationEvent(Base):
     def __repr__(self):
         return (
             f"<ActivationEvent(subscriber_id={self.subscriber_id}, "
+            f"onboarded={self.onboarding_completed_time}, "
             f"shown={self.first_leads_shown_time}, unlocked={self.first_unlock_time})>"
         )
 
