@@ -887,6 +887,25 @@ def _on_checkout_completed(session: dict, db: Session, background_tasks=None) ->
             rdelete(f"zip_availability:{county_id}:{vertical}")
             _seen_pairs.add(_pair)
 
+    # Every locked ZIP may have contractors sitting on its sold_out waitlist
+    # from before this buyer claimed it. They were notified when a PRIOR
+    # holder's grace period lapsed and this ZIP briefly opened; now that it's
+    # locked again, mark those non-winners 'lost' so a future release doesn't
+    # re-notify a stale wave. mark_sold_out_losers uses its own session and is
+    # a no-op when there's nothing to mark, so this is safe to call for every
+    # ZIP regardless of whether it ever had a waitlist. Non-fatal — a paying
+    # checkout must never fail because waitlist bookkeeping errored.
+    from src.tasks.sold_out_reactivation import mark_sold_out_losers
+    for _zip_code in zip_codes:
+        try:
+            mark_sold_out_losers(_zip_code, vertical, county_id)
+        except Exception:
+            logger.error(
+                "checkout.session.completed: mark_sold_out_losers failed for "
+                "%s/%s/%s — non-fatal, continuing", _zip_code, vertical, county_id,
+                exc_info=True,
+            )
+
     logger.info(
         "checkout.session.completed: fast path done — subscriber=%s tier=%s vertical=%s"
         " founding=%s zips=%s feed_uuid=%s (deferring GHL/email/CAPI/attribution work)",
