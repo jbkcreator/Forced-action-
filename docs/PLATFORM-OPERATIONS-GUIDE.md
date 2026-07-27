@@ -494,3 +494,80 @@ python -m src.tasks.county_launch_evaluator --dry-run
 ```sql
 UPDATE expansion_candidates SET status='skipped' WHERE county_id='pinellas';
 ```
+
+---
+
+## Relay Execution Service (RELAY-v2.2)
+
+### Overview
+Relay is the deterministic, non-agent send engine (build spec §9.1). Josh
+approves a `relay_approval_queue` row via Slack interactive buttons in
+`RELAY_SLACK_CHANNEL`; a cron sweep every 30 minutes executes all
+`approved` rows as one batch — idempotency keys prevent double-sends,
+execution-time guards (send window, daily ceiling, DNC recheck) gate each
+item, and the row itself becomes the Action Completion Receipt
+(`status='sent'` + `dispatched_at`/`channel`/`thread_id`).
+
+### Required `.env` settings
+```
+RELAY_APPROVERS=["U01ABC123","U02DEF456"]   # Slack user IDs — MUST be JSON-array
+                                             # syntax, same as COUNTY_LAUNCH_APPROVERS
+                                             # above. A plain comma-separated string
+                                             # (RELAY_APPROVERS=U01ABC123,U02DEF456)
+                                             # is NOT valid and crashes the app at
+                                             # startup (pydantic-settings parses list
+                                             # fields as JSON, not CSV).
+RELAY_SLACK_CHANNEL=#agent-daily
+SLACK_BOT_TOKEN=xoxb-...        # reused from County Launch above — no separate app
+SLACK_SIGNING_SECRET=...        # reused from County Launch above
+
+# Email channel (Instantly) — set after running the one-time setup command below
+RELAY_INSTANTLY_CAMPAIGN_ID=
+RELAY_INSTANTLY_SENDER_EMAIL=noreply@forcedactionleads.com
+
+# Execution guards — all optional, shown with defaults
+RELAY_SEND_WINDOW_START=11      # hour, local to RELAY_SEND_WINDOW_TIMEZONE
+RELAY_SEND_WINDOW_END=18
+RELAY_SEND_WINDOW_TIMEZONE=America/New_York
+RELAY_DAILY_CEILING=20          # per channel, per calendar day
+```
+
+### Slack app setup
+Reuses the same Slack app as County Launch (`SLACK_BOT_TOKEN`/`SLACK_SIGNING_SECRET`) —
+no separate app needed.
+1. Enable "Interactivity & Shortcuts" and add a second Request URL:
+   `https://<your-host>/api/admin/slack/relay-decision`
+2. Add a slash command `/relay-kill` with Request URL:
+   `https://<your-host>/api/admin/slack/kill`
+   (usage: `/relay-kill ALL | RELAY | VERA | HUNTER` — sets the fleet-wide
+   kill-switch override, auto-expires after `KILL_OVERRIDE_TTL_SECONDS`, 1 hour default)
+
+### One-time email channel setup
+Before any email can send, the Relay passthrough Instantly campaign must exist:
+```bash
+python -m src.services.relay --setup-email-channel
+```
+Prints the created (or found) campaign id — set it as `RELAY_INSTANTLY_CAMPAIGN_ID`
+in `.env` and restart. Until this is set, the email channel raises
+`RuntimeError` on every send attempt (fails loud, never a false "sent").
+
+### Health check
+```bash
+python -m src.services.relay --health
+```
+Confirms DB connectivity, the `relay_approval_queue` table is reachable,
+kill-switch status, and whether Slack is configured.
+
+### Manual seed (build/test without Cora, which doesn't exist yet)
+```bash
+python -m src.services.relay --seed --channel email \
+  --recipient test@example.com \
+  --payload-json '{"subject": "Hi", "body": "Test message"}'
+```
+Writes a `pending` row and posts it to Slack for approval — the exact same
+call Cora (Phase 2) will make once built.
+
+### Manual sweep (normally runs every 30 min via cron)
+```bash
+python -m src.services.relay --sweep
+```

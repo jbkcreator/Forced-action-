@@ -58,8 +58,9 @@ def test_raises_when_body_missing(monkeypatch):
 
 
 def test_raises_when_add_leads_returns_none(monkeypatch):
-    fake_settings = MagicMock(relay_instantly_campaign_id="camp-1")
+    fake_settings = MagicMock(relay_instantly_campaign_id="camp-1", company_postal_address="123 Main St")
     monkeypatch.setattr(channels_email, "get_settings", lambda: fake_settings)
+    monkeypatch.setattr(channels_email, "unsubscribe_url", lambda email: "https://app.forcedaction.io/unsub")
     monkeypatch.setattr(channels_email.instantly, "add_leads", lambda *a, **k: None)
 
     with pytest.raises(RuntimeError, match="add_leads call failed"):
@@ -69,8 +70,9 @@ def test_raises_when_add_leads_returns_none(monkeypatch):
 def test_fail_loud_on_duplicate_skip(monkeypatch):
     """The core safety assertion: Instantly's silent dedup-skip must never
     be treated as a successful send."""
-    fake_settings = MagicMock(relay_instantly_campaign_id="camp-1")
+    fake_settings = MagicMock(relay_instantly_campaign_id="camp-1", company_postal_address="123 Main St")
     monkeypatch.setattr(channels_email, "get_settings", lambda: fake_settings)
+    monkeypatch.setattr(channels_email, "unsubscribe_url", lambda email: "https://app.forcedaction.io/unsub")
     monkeypatch.setattr(
         channels_email.instantly, "add_leads",
         lambda *a, **k: {"leads_created": 0, "leads_skipped": 1},
@@ -81,8 +83,9 @@ def test_fail_loud_on_duplicate_skip(monkeypatch):
 
 
 def test_raises_when_zero_leads_created_and_zero_skipped(monkeypatch):
-    fake_settings = MagicMock(relay_instantly_campaign_id="camp-1")
+    fake_settings = MagicMock(relay_instantly_campaign_id="camp-1", company_postal_address="123 Main St")
     monkeypatch.setattr(channels_email, "get_settings", lambda: fake_settings)
+    monkeypatch.setattr(channels_email, "unsubscribe_url", lambda email: "https://app.forcedaction.io/unsub")
     monkeypatch.setattr(
         channels_email.instantly, "add_leads",
         lambda *a, **k: {"leads_created": 0, "leads_skipped": 0},
@@ -93,8 +96,9 @@ def test_raises_when_zero_leads_created_and_zero_skipped(monkeypatch):
 
 
 def test_successful_send_passes_subject_and_body_as_merge_vars(monkeypatch):
-    fake_settings = MagicMock(relay_instantly_campaign_id="camp-1")
+    fake_settings = MagicMock(relay_instantly_campaign_id="camp-1", company_postal_address="123 Main St")
     monkeypatch.setattr(channels_email, "get_settings", lambda: fake_settings)
+    monkeypatch.setattr(channels_email, "unsubscribe_url", lambda email: "https://app.forcedaction.io/unsub")
 
     calls = []
 
@@ -110,8 +114,32 @@ def test_successful_send_passes_subject_and_body_as_merge_vars(monkeypatch):
     assert len(calls) == 1
     campaign_id, leads = calls[0]
     assert campaign_id == "camp-1"
-    assert leads == [{
-        "email": "prospect@example.com",
-        "ra_subject": "Congrats on the auction win",
-        "ra_body": "Full drafted body",
-    }]
+    assert len(leads) == 1
+    lead = leads[0]
+    assert lead["email"] == "prospect@example.com"
+    assert lead["ra_subject"] == "Congrats on the auction win"
+    assert lead["ra_body"].startswith("Full drafted body")
+
+
+def test_footer_carries_postal_address_and_unsubscribe_link(monkeypatch):
+    """RELAY-v2.2 R3: every Relay email must carry a functioning unsubscribe
+    link and the company's postal address — CAN-SPAM requires both, and
+    without a real unsubscribe event the sweep's suppression sync
+    (src.services.relay.suppression_sync) never sees anything to suppress."""
+    fake_settings = MagicMock(relay_instantly_campaign_id="camp-1", company_postal_address="123 Main St, Tampa FL")
+    monkeypatch.setattr(channels_email, "get_settings", lambda: fake_settings)
+    monkeypatch.setattr(channels_email, "unsubscribe_url", lambda email: f"https://app.forcedaction.io/unsub?e={email}")
+
+    calls = []
+    monkeypatch.setattr(
+        channels_email.instantly, "add_leads",
+        lambda campaign_id, leads: calls.append(leads) or {"leads_created": 1, "leads_skipped": 0},
+    )
+
+    item = _make_item(payload={"subject": "Hi", "body": "Full drafted body"})
+    channels_email.send_email(item)
+
+    body = calls[0][0]["ra_body"]
+    assert "Full drafted body" in body
+    assert "123 Main St, Tampa FL" in body
+    assert "https://app.forcedaction.io/unsub?e=prospect@example.com" in body

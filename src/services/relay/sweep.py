@@ -13,6 +13,7 @@ import uuid
 
 from src.services.relay import queue
 from src.services.relay.engine import BatchResult, execute_batch
+from src.services.relay.suppression_sync import sync_unsubscribes
 
 # Import for its registration side effect only — makes the real 'email'
 # channel (RELAY-v2.2 R2) available in DISPATCHERS whenever this module is
@@ -26,7 +27,21 @@ logger = logging.getLogger(__name__)
 def run_sweep(*, limit: int = 50) -> BatchResult:
     """Query relay_approval_queue WHERE status='approved', execute them as
     one batch tagged with a fresh batch_id. Returns the BatchResult (also
-    what --sweep prints)."""
+    what --sweep prints).
+
+    Syncs Relay unsubscribes from Instantly first (RELAY-v2.2 R3, client
+    Q1) so a fresh opt-out is already in email_opt_outs before this same
+    tick's guards.evaluate() suppression recheck runs. A dead Instantly API
+    must not stop already-approved sends, so failures here are logged and
+    swallowed rather than propagated.
+    """
+    try:
+        n = sync_unsubscribes()
+        if n:
+            logger.info("[Relay] sweep: synced %d new suppression(s) from Instantly", n)
+    except Exception:
+        logger.error("[Relay] unsubscribe sync failed — continuing to execute batch", exc_info=True)
+
     items = queue.approved_batch(limit=limit)
     if not items:
         logger.info("[Relay] sweep: no approved items")

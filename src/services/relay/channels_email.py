@@ -16,11 +16,18 @@ genuinely sent (build spec §9.1), this module treats any leads_skipped > 0
 as a hard failure (fail loud, confirmed 2026-07-24) rather than a false
 'sent'. This does not solve repeat-contact-to-the-same-recipient — a real
 fix (campaign rotation or remove-then-readd) is deliberately deferred.
+
+RELAY-v2.2 sub-task R3 appends a plain-text unsubscribe footer (postal
+address + one-click link, same unsubscribe_url() the DBPR template uses)
+before every send. Without it a Relay recipient has no way to opt out —
+a CAN-SPAM requirement — and suppression_sync.py's Instantly poll would
+never see a real unsubscribe event to sync back.
 """
 from __future__ import annotations
 
 from config.settings import get_settings
 from src.services import instantly_service as instantly
+from src.services.email_unsubscribe import unsubscribe_url
 from src.services.relay.channels import register
 from src.services.relay.queue import QueueItem
 
@@ -46,6 +53,11 @@ def send_email(item: QueueItem) -> None:
     body = (item.payload or {}).get("body", "")
     if not body:
         raise RuntimeError(f"item {item.id}: payload missing 'body' for email channel")
+
+    body = (
+        f"{body}\n\n--\nForced Action\n{settings.company_postal_address}\n\n"
+        f"Unsubscribe: {unsubscribe_url(item.recipient)}"
+    )
 
     result = instantly.add_leads(campaign_id, [{
         "email": item.recipient,

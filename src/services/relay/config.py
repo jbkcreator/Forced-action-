@@ -30,3 +30,16 @@ SLACK_RELAY_CHANNEL = "#agent-daily"
 # with Slack access) can also clear it early by setting the override to
 # "green" before the TTL elapses.
 KILL_OVERRIDE_TTL_SECONDS = 3600
+
+# Guard verdict outcomes (RELAY-v2.2 sub-task R3). DEFER leaves the row
+# 'approved' and unclaimed for a later sweep; BLOCK marks it STATUS_SKIPPED
+# and it is never retried. See src.services.relay.guards.evaluate().
+GUARD_ALLOW = "allow"
+GUARD_DEFER = "defer"
+GUARD_BLOCK = "block"
+
+# Guard reason strings, written to the queue row's `error` column on BLOCK
+# (via mark_skipped) or logged only on DEFER (see engine.execute_batch()).
+REASON_OUTSIDE_SEND_WINDOW = "outside_send_window"
+REASON_DAILY_CEILING_REACHED = "daily_ceiling_reached"  # suffixed with ":{channel}"
+REASON_SUPPRESSED = "suppressed"  # suffixed with ":{cause}", e.g. "suppressed:email_opt_out"

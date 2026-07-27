@@ -15,11 +15,47 @@ mark_skipped.
 Per CLAUDE.md: all data retrieval uses sqlalchemy.text(), never the ORM
 query API. The RelayApprovalQueueItem ORM model (src.core.models) is used
 only for the single-row INSERT in enqueue().
+
+THE BATCH-INTAKE CONTRACT (RELAY-v2.2 sub-task R4). enqueue() is the one and
+only way a new action enters Relay -- this is that contract, made explicit
+rather than left implicit in the function signature alone:
+
+    Required:
+        idempotency_key: str  -- globally unique. A retry of the same
+                                  proposed action must reuse the same key;
+                                  enqueue() is itself idempotent on this --
+                                  a duplicate key returns the existing row,
+                                  never a duplicate insert (see below).
+        channel: str           -- must have a registered dispatcher
+                                  (src.services.relay.channels.DISPATCHERS)
+                                  by the time the row is approved, or
+                                  execution fails with
+                                  'unknown_channel:{channel}'.
+        recipient: str         -- email address today (or E.164 phone once
+                                  an sms/voice channel registers).
+        payload: dict           -- channel-specific. For channel='email':
+                                  {"subject": str, "body": str} -- both
+                                  read by
+                                  src.services.relay.channels_email.send_email().
+
+    Optional:
+        thread_id: str | None  -- Opportunity Thread ID (OPP-YYYY-#####).
+                                  Nullable in Phase 1 -- no Hunter yet to
+                                  mint one (dev split §6b). Stamped onto the
+                                  completion receipt unchanged if supplied.
+
+THE COMPLETION RECEIPT is the same row, read back after execution
+(RelayApprovalQueueItem.status/dispatched_at/channel/thread_id -- no
+separate receipt table):
+    status == 'sent'   -- the only success state.
+    dispatched_at      -- sent timestamp, set only by mark_sent().
+    channel, thread_id -- unchanged from intake.
+'approved' is not complete; 'sent' with a populated dispatched_at is.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import text
@@ -213,34 +249,82 @@ def try_claim_for_batch(item_id: int, batch_id: str, *, stale_after_minutes: int
         return result.rowcount > 0
 
 
+def sent_counts_today(now: datetime, *, timezone_name: str) -> dict[str, int]:
+    """Per-channel count of rows already 'sent' since midnight in
+    `timezone_name` (RELAY-v2.2 sub-task R3). One query per batch; the
+    caller (engine.execute_batch) increments the returned dict in memory
+    as the batch sends, so a single batch cannot exceed the ceiling
+    between queries."""
+    from zoneinfo import ZoneInfo
+
+    local_midnight = now.astimezone(ZoneInfo(timezone_name)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    day_start_utc = local_midnight.astimezone(timezone.utc)
+    with get_db_context() as session:
+        rows = session.execute(
+            text(
+                "SELECT channel, count(*) AS n FROM relay_approval_queue "
+                "WHERE status = :status AND dispatched_at >= :day_start "
+                "GROUP BY channel"
+            ),
+            {"status": STATUS_SENT, "day_start": day_start_utc},
+        ).mappings().all()
+        return {r["channel"]: r["n"] for r in rows}
+
+
 def mark_sent(item_id: int) -> None:
+    """Transitions a claimed row to 'sent' -- guarded to only ever leave
+    'approved', for the same reason mark_skipped() is guarded (see its
+    docstring): both callers only reach this right after a same-run
+    try_claim_for_batch() success, so status is still 'approved' at this
+    point in the normal path, but the guard is what stops a second,
+    concurrent dispatch of the same row (e.g. a slow send outliving
+    try_claim_for_batch's stale-claim window and getting reclaimed by
+    another sweep) from silently overwriting a completed receipt."""
     with get_db_context() as session:
         session.execute(
             text(
                 "UPDATE relay_approval_queue SET status = :status, "
-                "dispatched_at = now(), updated_at = now() WHERE id = :id"
+                "dispatched_at = now(), updated_at = now() "
+                "WHERE id = :id AND status = :approved"
             ),
-            {"status": STATUS_SENT, "id": item_id},
+            {"status": STATUS_SENT, "id": item_id, "approved": STATUS_APPROVED},
         )
 
 
 def mark_failed(item_id: int, error: str) -> None:
+    """Transitions a claimed row to 'failed' -- guarded identically to
+    mark_sent()/mark_skipped(), same reasoning."""
     with get_db_context() as session:
         session.execute(
             text(
                 "UPDATE relay_approval_queue SET status = :status, "
-                "error = :error, updated_at = now() WHERE id = :id"
+                "error = :error, updated_at = now() "
+                "WHERE id = :id AND status = :approved"
             ),
-            {"status": STATUS_FAILED, "error": error, "id": item_id},
+            {"status": STATUS_FAILED, "error": error, "id": item_id, "approved": STATUS_APPROVED},
         )
 
 
 def mark_skipped(item_id: int, reason: str) -> None:
+    """Transitions an 'approved' row to 'skipped' -- guarded so a row that
+    has already reached a terminal state (sent/failed/skipped) can never be
+    downgraded. Without this guard, calling mark_skipped() on a row an
+    earlier run already sent (e.g. a crashed sweep re-picking up the same
+    id, or engine.execute_batch's own "claim_lost_to_concurrent_run" path
+    firing after the row already completed) silently corrupts the
+    completion receipt from 'sent' back to 'skipped' -- found by RELAY-v2.2
+    R4's real-Postgres forced-retry test, which the in-memory fake-backend
+    idempotency test (test_relay_engine.py) could not catch, since that
+    fake models 'sent' and 'skipped' as two independent dicts rather than
+    one mutually-exclusive status column."""
     with get_db_context() as session:
         session.execute(
             text(
                 "UPDATE relay_approval_queue SET status = :status, "
-                "error = :error, updated_at = now() WHERE id = :id"
+                "error = :error, updated_at = now() "
+                "WHERE id = :id AND status = :approved"
             ),
-            {"status": STATUS_SKIPPED, "error": reason, "id": item_id},
+            {"status": STATUS_SKIPPED, "error": reason, "id": item_id, "approved": STATUS_APPROVED},
         )

@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
-from src.services.relay import queue
+from config.settings import get_settings
+from src.services.relay import guards, queue
 from src.services.relay.channels import DISPATCHERS
 from src.services.relay.config import KILL_SWITCH_FEATURE
 from src.services.relay.queue import QueueItem
@@ -32,6 +34,7 @@ class BatchResult:
     sent: int = 0
     skipped: int = 0
     failed: int = 0
+    deferred: int = 0
     halted: bool = False
     processed_ids: list[int] = field(default_factory=list)
 
@@ -41,7 +44,7 @@ def _kill_switch_is_red() -> bool:
     return status.get("color") == "red"
 
 
-def execute_batch(items: list[QueueItem], *, batch_id: str) -> BatchResult:
+def execute_batch(items: list[QueueItem], *, batch_id: str, now: datetime | None = None) -> BatchResult:
     """Execute a batch of already-approved queue rows deterministically.
 
     Each item must already be status='approved' (the caller — the cron
@@ -50,11 +53,19 @@ def execute_batch(items: list[QueueItem], *, batch_id: str) -> BatchResult:
       1. Re-check the relay_global kill switch; on red, stop immediately.
          Undispatched items are left untouched (still 'approved',
          unclaimed) so the next sweep tick safely resumes them.
-      2. Atomically claim the row for this batch_id. If another run
+      2. Run guards.evaluate() (RELAY-v2.2 sub-task R3) — send window,
+         daily ceiling, execution-time suppression recheck. DEFER leaves
+         the row untouched (still 'approved', unclaimed) for a later
+         sweep; BLOCK marks it 'skipped', terminal.
+      3. Atomically claim the row for this batch_id. If another run
          already claimed it, skip without dispatching (idempotency).
-      3. Dispatch via the registered channel handler. An unknown channel,
+      4. Dispatch via the registered channel handler. An unknown channel,
          or any exception the handler raises, marks the item 'failed' and
          moves on — one bad item never aborts the batch.
+
+    `now` defaults to the real clock; tests inject a fixed value so guard
+    behavior (and every pre-R3 test unrelated to guards) doesn't depend on
+    what time of day the suite happens to run.
     """
     result = BatchResult()
 
@@ -66,6 +77,10 @@ def execute_batch(items: list[QueueItem], *, batch_id: str) -> BatchResult:
         result.halted = True
         return result
 
+    now = now if now is not None else datetime.now(timezone.utc)
+    settings = get_settings()
+    sent_today = queue.sent_counts_today(now, timezone_name=settings.relay_send_window_timezone)
+
     for item in items:
         if _kill_switch_is_red():
             remaining = len(items) - len(result.processed_ids)
@@ -76,6 +91,18 @@ def execute_batch(items: list[QueueItem], *, batch_id: str) -> BatchResult:
             )
             result.halted = True
             break
+
+        verdict = guards.evaluate(item, now=now, sent_today=sent_today)
+        if verdict.outcome == guards.DEFER:
+            logger.info("[Relay] item %d deferred: %s", item.id, verdict.reason)
+            result.deferred += 1
+            continue
+        if verdict.outcome == guards.BLOCK:
+            queue.mark_skipped(item.id, verdict.reason)
+            logger.warning("[Relay] item %d blocked: %s", item.id, verdict.reason)
+            result.skipped += 1
+            result.processed_ids.append(item.id)
+            continue
 
         if not queue.try_claim_for_batch(item.id, batch_id):
             logger.info(
@@ -110,6 +137,7 @@ def execute_batch(items: list[QueueItem], *, batch_id: str) -> BatchResult:
         else:
             queue.mark_sent(item.id)
             result.sent += 1
+            sent_today[item.channel] = sent_today.get(item.channel, 0) + 1
         result.processed_ids.append(item.id)
 
     return result

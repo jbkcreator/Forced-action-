@@ -12,11 +12,31 @@ used on staging.
 """
 from __future__ import annotations
 
+import inspect
 from dataclasses import fields
 from datetime import datetime, timezone
 
 from src.services.relay import queue as relay_queue
 from src.services.relay.queue import QueueItem
+
+
+def test_enqueue_signature_matches_documented_contract():
+    """RELAY-v2.2 sub-task R4: enqueue()'s parameter list IS the
+    batch-intake contract (see the module docstring). If a future change
+    adds, removes, or renames a parameter, this must fail loudly rather
+    than let the contract doc silently drift from the real function."""
+    sig = inspect.signature(relay_queue.enqueue)
+    params = sig.parameters
+
+    assert set(params) == {"idempotency_key", "channel", "recipient", "payload", "thread_id"}
+
+    required = {name for name, p in params.items() if p.default is inspect.Parameter.empty}
+    assert required == {"idempotency_key", "channel", "recipient", "payload"}
+    assert params["thread_id"].default is None
+
+    # All keyword-only (enqueue is called with kwargs everywhere -- __main__.py,
+    # this contract doc, and Cora's future call site all rely on that).
+    assert all(p.kind == inspect.Parameter.KEYWORD_ONLY for p in params.values())
 
 
 def test_columns_sql_matches_dataclass_fields():

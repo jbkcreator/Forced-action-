@@ -10,11 +10,19 @@ per-item failure isolation.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from src.services.relay import engine as relay_engine
 from src.services.relay.queue import QueueItem
+
+# Fixed, in-send-window instant (14:00 ET) so these pre-R3 tests never
+# depend on what time of day the suite happens to run (RELAY-v2.2 R3
+# introduced a send-window guard; see test_relay_guards.py for its own
+# coverage). 20 is the default daily ceiling — well above anything these
+# small batches send.
+_IN_WINDOW_NOW = datetime(2026, 7, 27, 14, 0, tzinfo=ZoneInfo("America/New_York")).astimezone(timezone.utc)
 
 
 def _make_item(item_id: int, channel: str = "fake") -> QueueItem:
@@ -68,6 +76,10 @@ def fake_backend(monkeypatch):
     monkeypatch.setattr(relay_engine.queue, "mark_sent", backend.mark_sent)
     monkeypatch.setattr(relay_engine.queue, "mark_failed", backend.mark_failed)
     monkeypatch.setattr(relay_engine.queue, "mark_skipped", backend.mark_skipped)
+    # RELAY-v2.2 R3: execute_batch now queries today's per-channel sent count
+    # up front. No DB in these pre-R3 tests, so stub it empty (no channel is
+    # anywhere near its ceiling).
+    monkeypatch.setattr(relay_engine.queue, "sent_counts_today", lambda now, **kw: {})
     return backend
 
 
@@ -83,7 +95,7 @@ def test_batch_dispatches_all_items(fake_backend, green_kill_switch, monkeypatch
     monkeypatch.setitem(relay_engine.DISPATCHERS, "fake", lambda item: calls.append(item.id))
     items = [_make_item(1), _make_item(2)]
 
-    result = relay_engine.execute_batch(items, batch_id="b1")
+    result = relay_engine.execute_batch(items, batch_id="b1", now=_IN_WINDOW_NOW)
 
     assert result.sent == 2
     assert result.failed == 0
@@ -100,8 +112,8 @@ def test_idempotency_skips_already_claimed_item(fake_backend, green_kill_switch,
     monkeypatch.setitem(relay_engine.DISPATCHERS, "fake", lambda item: calls.append(item.id))
     item = _make_item(1)
 
-    first = relay_engine.execute_batch([item], batch_id="b1")
-    second = relay_engine.execute_batch([item], batch_id="b2")  # simulates a re-pickup
+    first = relay_engine.execute_batch([item], batch_id="b1", now=_IN_WINDOW_NOW)
+    second = relay_engine.execute_batch([item], batch_id="b2", now=_IN_WINDOW_NOW)  # simulates a re-pickup
 
     assert first.sent == 1
     assert second.sent == 0
@@ -133,7 +145,9 @@ def test_kill_switch_halts_mid_batch(fake_backend, monkeypatch):
     calls = []
     monkeypatch.setitem(relay_engine.DISPATCHERS, "fake", lambda item: calls.append(item.id))
 
-    result = relay_engine.execute_batch([_make_item(1), _make_item(2)], batch_id="b1")
+    result = relay_engine.execute_batch(
+        [_make_item(1), _make_item(2)], batch_id="b1", now=_IN_WINDOW_NOW
+    )
 
     assert result.sent == 1
     assert result.halted is True
@@ -149,7 +163,7 @@ def test_failure_isolation_one_bad_item_does_not_abort_batch(fake_backend, green
     monkeypatch.setitem(relay_engine.DISPATCHERS, "fake_ok", lambda item: None)
 
     items = [_make_item(1, channel="fake"), _make_item(2, channel="fake_ok")]
-    result = relay_engine.execute_batch(items, batch_id="b1")
+    result = relay_engine.execute_batch(items, batch_id="b1", now=_IN_WINDOW_NOW)
 
     assert result.failed == 1
     assert result.sent == 1
@@ -160,7 +174,65 @@ def test_failure_isolation_one_bad_item_does_not_abort_batch(fake_backend, green
 def test_unknown_channel_marks_failed_without_dispatch(fake_backend, green_kill_switch):
     item = _make_item(1, channel="does_not_exist")
 
-    result = relay_engine.execute_batch([item], batch_id="b1")
+    result = relay_engine.execute_batch([item], batch_id="b1", now=_IN_WINDOW_NOW)
 
     assert result.failed == 1
     assert fake_backend.failed[1] == "unknown_channel:does_not_exist"
+
+
+# ---------------------------------------------------------------------------
+# RELAY-v2.2 sub-task R3 — guard wiring
+# ---------------------------------------------------------------------------
+
+def test_deferred_item_never_claimed_or_dispatched(fake_backend, green_kill_switch, monkeypatch):
+    """DEFER must leave the row completely untouched -- never claimed,
+    never dispatched -- so the next sweep treats it as brand new."""
+    calls = []
+    monkeypatch.setitem(relay_engine.DISPATCHERS, "fake", lambda item: calls.append(item.id))
+    monkeypatch.setattr(
+        relay_engine.guards, "evaluate",
+        lambda item, **kw: relay_engine.guards.Verdict(relay_engine.guards.DEFER, "outside_send_window"),
+    )
+
+    result = relay_engine.execute_batch([_make_item(1)], batch_id="b1", now=_IN_WINDOW_NOW)
+
+    assert result.deferred == 1
+    assert result.sent == 0
+    assert calls == []
+    assert fake_backend.claimed == set()
+    assert 1 not in fake_backend.skipped
+
+
+def test_blocked_item_marked_skipped_never_claimed(fake_backend, green_kill_switch, monkeypatch):
+    """BLOCK is terminal -- marked skipped with the guard's reason, never
+    claimed, never dispatched, never retried."""
+    calls = []
+    monkeypatch.setitem(relay_engine.DISPATCHERS, "fake", lambda item: calls.append(item.id))
+    monkeypatch.setattr(
+        relay_engine.guards, "evaluate",
+        lambda item, **kw: relay_engine.guards.Verdict(relay_engine.guards.BLOCK, "suppressed:email_opt_out"),
+    )
+
+    result = relay_engine.execute_batch([_make_item(1)], batch_id="b1", now=_IN_WINDOW_NOW)
+
+    assert result.skipped == 1
+    assert calls == []
+    assert fake_backend.claimed == set()
+    assert fake_backend.skipped[1] == "suppressed:email_opt_out"
+
+
+def test_ceiling_increments_in_memory_across_the_batch(fake_backend, green_kill_switch, monkeypatch):
+    """Real guards.evaluate (not mocked): starting one send below the
+    default ceiling of 20, item 1 sends and pushes the in-memory count to
+    the ceiling; items 2 and 3 must defer without ever touching the DB
+    again mid-batch."""
+    monkeypatch.setattr(relay_engine.queue, "sent_counts_today", lambda now, **kw: {"fake": 19})
+    calls = []
+    monkeypatch.setitem(relay_engine.DISPATCHERS, "fake", lambda item: calls.append(item.id))
+
+    items = [_make_item(1), _make_item(2), _make_item(3)]
+    result = relay_engine.execute_batch(items, batch_id="b1", now=_IN_WINDOW_NOW)
+
+    assert result.sent == 1
+    assert result.deferred == 2
+    assert calls == [1]
