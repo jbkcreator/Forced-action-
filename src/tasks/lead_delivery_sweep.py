@@ -6,6 +6,9 @@ the derived undelivered pool (no row) and are re-tried on the next run — so a 
 held today because nobody covers its ZIP is delivered automatically the day a
 contractor locks that territory.
 
+Each successful claim also emails the receiving contractor (best-effort — a
+notification failure never fails the delivery, which is already committed).
+
     python -m src.tasks.lead_delivery_sweep
 """
 
@@ -135,6 +138,20 @@ def _pending_leads(db, limit: int) -> list[Lead]:
     return leads
 
 
+def _notify(db, delivery_id: int) -> bool:
+    """Tell the contractor a lead landed. Best-effort: the delivery is already
+    committed and its entitlement spent, so a notification failure must never
+    fail the sweep."""
+    from src.services.delivery_notifier import notify_delivery
+
+    try:
+        return notify_delivery(db, delivery_id)
+    except Exception:
+        logger.error("lead_delivery_sweep: notify failed for delivery %s",
+                     delivery_id, exc_info=True)
+        return False
+
+
 def run_lead_delivery_sweep(db=None, *, limit: int = _BATCH_LIMIT, source: str = "auto") -> dict:
     """Match + claim every pending lead. Each claim commits in its own short
     transaction so the property-row lock is held briefly and one failure never
@@ -145,13 +162,18 @@ def run_lead_delivery_sweep(db=None, *, limit: int = _BATCH_LIMIT, source: str =
     db = ctx.__enter__() if own else db
     try:
         leads, src = _select_pending(db, limit, source)
-        delivered = undelivered = 0
+        delivered = undelivered = notified = 0
         for lead in leads:
             try:
                 d = claim(db, lead)
                 if d is not None:
+                    # Read the id while the instance is still populated from the
+                    # flush inside claim(); commit expires it otherwise.
+                    delivery_id = d.id
                     db.commit()
                     delivered += 1
+                    if _notify(db, delivery_id):
+                        notified += 1
                 else:
                     db.rollback()  # release the property lock; lead stays in pool
                     undelivered += 1
@@ -160,9 +182,9 @@ def run_lead_delivery_sweep(db=None, *, limit: int = _BATCH_LIMIT, source: str =
                 logger.error("lead_delivery_sweep: claim failed for property %s",
                              lead.property_id, exc_info=True)
                 undelivered += 1
-        logger.info("lead_delivery_sweep[%s]: %d delivered, %d undelivered (of %d pending)",
-                    src, delivered, undelivered, len(leads))
-        return {"delivered": delivered, "undelivered": undelivered,
+        logger.info("lead_delivery_sweep[%s]: %d delivered (%d notified), %d undelivered "
+                    "(of %d pending)", src, delivered, notified, undelivered, len(leads))
+        return {"delivered": delivered, "notified": notified, "undelivered": undelivered,
                 "pending": len(leads), "source": src}
     finally:
         if own:

@@ -761,14 +761,37 @@ class TestSoldOutReactivation:
 
         assert result["fired"] == 0
 
-    def test_reactivate_for_zip_skips_when_no_sms_key(self):
+    def test_reactivate_for_zip_emails_when_no_sms_key(self):
+        """No Telnyx key must not silence the waitlist — email is the only channel
+        most entries have, and SMS is unavailable until 10DLC clears."""
         from src.tasks.sold_out_reactivation import reactivate_for_zip
 
-        with patch("src.tasks.sold_out_reactivation.get_settings") as mock_settings:
+        e1 = _entry(phone_e164="+18135550001", sms_opt_in=True,
+                    waitlist_type="sold_out", email="withphone@test.com")
+        e2 = _entry(phone_e164=None, sms_opt_in=False,
+                    waitlist_type="sold_out", email="emailonly@test.com")
+
+        db = MagicMock()
+        db.execute.return_value.scalars.return_value.all.return_value = [e1, e2]
+
+        with (
+            patch("src.tasks.sold_out_reactivation.get_db_context") as mock_ctx,
+            patch("src.tasks.sold_out_reactivation.get_settings") as mock_settings,
+            patch("src.tasks.sold_out_reactivation.send_sms") as mock_sms,
+            patch("src.tasks.sold_out_reactivation.send_email",
+                  return_value=True) as mock_email,
+        ):
             mock_settings.return_value.telnyx_sms_api_key = None
+            mock_ctx.return_value.__enter__ = lambda s: db
+            mock_ctx.return_value.__exit__ = MagicMock(return_value=False)
+
             result = reactivate_for_zip("33601", "roofing", "hillsborough")
 
-        assert result.get("skipped") is True
+        assert result.get("skipped") is None      # no longer a hard skip
+        assert mock_sms.call_count == 0           # SMS unavailable
+        assert mock_email.call_count == 2         # both entries emailed
+        assert result["email"] == 2
+        assert result["fired"] == 2
 
     def test_mark_sold_out_losers_marks_notified_entries_lost(self):
         from src.tasks.sold_out_reactivation import mark_sold_out_losers
@@ -1009,6 +1032,62 @@ class TestIntegrationHooks:
             "grace_expiry.py must call reactivate_for_zip after releasing a ZIP"
         )
         assert "sold_out_reactivation" in source
+
+    def test_grace_expiry_notifies_released_zip_after_commit(self):
+        """Each released territory triggers exactly one waitlist notification,
+        and only after the releasing transaction has committed — announcing a
+        free ZIP before the release is durable would be a lie under rollback."""
+        import src.tasks.grace_expiry as ge
+
+        order: list[str] = []
+        db = MagicMock()
+        db.execute.return_value.scalars.return_value.all.return_value = []
+
+        ctx = MagicMock()
+        ctx.__enter__ = lambda s: db
+        ctx.__exit__ = lambda s, *a: order.append("commit") or False
+
+        def fake_expire(_db, released_out=None):
+            if released_out is not None:
+                released_out.append(("33601", "roofing", "hillsborough"))
+            return 1
+
+        with (
+            patch("src.tasks.grace_expiry.get_db_context", return_value=ctx),
+            patch("src.tasks.grace_expiry.expire_zip_grace_periods", side_effect=fake_expire),
+            patch("src.tasks.grace_expiry.expire_subscriber_grace_periods", return_value=0),
+            patch("src.tasks.grace_expiry.reactivate_for_zip",
+                  side_effect=lambda *a: order.append("notify") or {"fired": 1}) as mock_react,
+        ):
+            ge.run_grace_expiry()
+
+        mock_react.assert_called_once_with("33601", "roofing", "hillsborough")
+        assert order == ["commit", "notify"]
+
+    def test_grace_expiry_survives_notification_failure(self):
+        """A waitlist send blowing up must not fail the expiry run — the release
+        is already committed."""
+        import src.tasks.grace_expiry as ge
+
+        db = MagicMock()
+        db.execute.return_value.scalars.return_value.all.return_value = []
+        ctx = MagicMock()
+        ctx.__enter__ = lambda s: db
+        ctx.__exit__ = MagicMock(return_value=False)
+
+        def fake_expire(_db, released_out=None):
+            if released_out is not None:
+                released_out.append(("33601", "roofing", "hillsborough"))
+            return 1
+
+        with (
+            patch("src.tasks.grace_expiry.get_db_context", return_value=ctx),
+            patch("src.tasks.grace_expiry.expire_zip_grace_periods", side_effect=fake_expire),
+            patch("src.tasks.grace_expiry.expire_subscriber_grace_periods", return_value=0),
+            patch("src.tasks.grace_expiry.reactivate_for_zip",
+                  side_effect=RuntimeError("telnyx down")),
+        ):
+            ge.run_grace_expiry()  # must not raise
 
     def test_stripe_webhooks_calls_mark_sold_out_losers(self):
         """Verify stripe_webhooks.py imports and calls mark_sold_out_losers."""
