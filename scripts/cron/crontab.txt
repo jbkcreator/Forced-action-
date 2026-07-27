@@ -118,7 +118,7 @@ COUNTY_ID=hillsborough
 # Quora S6 organic-answer pipeline — 06:35 AM UTC daily (after load validator).
 # Picks one keyword via DB rotation (quora_topics + cooldown_days), scrapes Quora,
 # publishes to Cora for classification + answer drafting, upserts to quora_questions.
-#35 6 * * * $PROJECT/scripts/cron/run.sh src.tasks.quora_s6_orchestrator
+35 6 * * * $PROJECT/scripts/cron/run.sh src.tasks.quora_s6_orchestrator
 
 # Autonomous Inbound Content Loop (Task 5.1) — Weekly Sunday @ 09:00 AM UTC.
 # Scores each Quora Seed Keyword over a 30-day window, deactivates losers
@@ -127,7 +127,7 @@ COUNTY_ID=hillsborough
 # clear of the 04:00–08:00 scrape/CDS/skip-trace/GHL chain. See docs/adr/0021.
 # DISABLED alongside quora_s6_orchestrator — this loop only scores/expands
 # Quora Seed Keywords, which stop moving once the scraper feeding them is off.
-#0 9 * * 0 $PROJECT/scripts/cron/run.sh src.tasks.autonomous_tuning_worker
+0 9 * * 0 $PROJECT/scripts/cron/run.sh src.tasks.autonomous_tuning_worker
 
 # ── PINELLAS DAILY ────────────────────────────────────────────
 # Staggered +5 min after their Hillsborough counterparts within 04:00–06:30 UTC window.
@@ -268,21 +268,21 @@ COUNTY_ID=hillsborough
 # Gated by CORA_SELF_HEALING_ENABLED=true (default false). Task is a no-op
 # when disabled — safe to leave the cron entry in even on environments that
 # haven't opted in yet.
-30 * * * * $PROJECT/scripts/cron/run.sh src.tasks.cora_self_healing
+30 * * * * $PROJECT/scripts/cron/run.sh src.tasks.cora_self_healing --dry-run
 
 # Stage 10 — Variant Mutation Job (fa055) — every hour at :45 (15 min after self-healing).
 # Runs sigma rollback check, proving-cycle evaluation, and slot retirement/replacement
 # loop for all active message_variant_tests. Also checks rollback triggers for all
 # active pricing_cohorts. Reuses CORA_SELF_HEALING_ENABLED gate — no-op when disabled.
 # Max 3 actions per run (shared guardrail with cora_self_healing).
-45 * * * * $PROJECT/scripts/cron/run.sh src.tasks.variant_mutation_job
+45 * * * * $PROJECT/scripts/cron/run.sh src.tasks.variant_mutation_job --dry-run
 
 # Stage 10 — Alert Rules Check (fa055) — every 15 min.
 # Evaluates the same conditions as deploy/prometheus/alert_rules.yml but via cron,
 # so self-healing fires correctly even without a running Prometheus/Alertmanager stack.
 # Actions: variant_engine.promote_winner, sigma_rollback, cora_self_healing steps.
 # Gated by CORA_SELF_HEALING_ENABLED. Idempotent — no duplicate actions within breach.
-*/15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.alert_rules_check
+*/15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.alert_rules_check --dry-run
 
 # ── A7 MACRO SIGNALS ─────────────────────────────────────────
 # Feeds the FRED mortgage-rate → CDS distress multiplier (threshold 6.5%).
