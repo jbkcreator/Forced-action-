@@ -40,7 +40,7 @@ def test_at_least_once_delivery_and_dedup(fresh_db):
     calls = []
     result = poll_and_dispatch_fleet(
         fresh_db, "dedup_consumer", ["booking.created"],
-        lambda s, r: calls.append(r.id),
+        lambda s, r: calls.append(r.event_id),
     )
     fresh_db.commit()
     assert result["processed"] == 1
@@ -49,7 +49,7 @@ def test_at_least_once_delivery_and_dedup(fresh_db):
     # second poll: already processed for this consumer, must not re-dispatch
     result2 = poll_and_dispatch_fleet(
         fresh_db, "dedup_consumer", ["booking.created"],
-        lambda s, r: calls.append(r.id),
+        lambda s, r: calls.append(r.event_id),
     )
     assert result2["processed"] == 0
     assert len(calls) == 1

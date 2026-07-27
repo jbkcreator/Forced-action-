@@ -54,7 +54,7 @@ def poll_and_dispatch_fleet(
     results = {"processed": 0, "skipped": 0, "failed": 0, "permanently_failed": 0}
 
     rows = session.execute(sa_text("""
-        SELECT e.id, e.id AS event_id, e.event_type, e.priority, e.source_component,
+        SELECT e.id AS event_id, e.event_type, e.priority, e.source_component,
                e.subscriber_id, e.opportunity_thread_id, e.payload, e.occurred_at
         FROM fleet_events e
         LEFT JOIN fleet_processed_events pe
