@@ -812,34 +812,19 @@ def load_existing_entity_candidates(
     return result
 
 
-def run_incremental(session: Session, county_id: Optional[str] = None) -> dict:
+def cluster_against_anchors(
+    combined: list[CandidateRecord],
+) -> tuple[list[list[CandidateRecord]], list[int], dict]:
     """
-    Nightly-safe incremental resolution: match new/changed owners/deeds rows
-    (only_unresolved=True) against EXISTING buyer_entities first — via their
-    denormalized canonical_name/primary_mailing_address, run through the
-    identical blocking/scoring/clustering pipeline the backfill uses — rather
-    than re-clustering the world. Existing entity IDs never change: a new
-    record either attaches to one via a new BuyerEntityLink, or (matching
-    nothing existing) forms a brand new entity, exactly as the backfill does
-    for first-time records. Commits once at the end.
-
-    A cluster touching 2+ existing entities is a potential MERGE case (e.g.
-    a new Sunbiz filing reveals two previously-separate entities share an
-    owner) — deliberately NOT auto-merged, since collapsing established
-    entity IDs risks breaking whatever already references them (whale
-    flags, Cell #1's list). Flagged and left unresolved for manual review
-    instead of guessing.
+    Shared structural+blocking+scoring+clustering pass over a combined set
+    of new/unresolved CandidateRecords plus existing buyer_entities anchors
+    (see load_existing_entity_candidates). Used by both run_incremental
+    (H2.7) and run_backfill (H2.6) so "does this new record match something
+    that already exists" is answered identically in both places rather than
+    two divergent implementations. Returns (relevant_clusters, confidences,
+    evidence_index) -- relevant_clusters excludes pure-anchor singletons
+    (existing entities matching nothing new need no action).
     """
-    new_candidates = list(extract_candidates(session, only_unresolved=True))
-    if county_id:
-        new_candidates = [c for c in new_candidates if c.county_id == county_id]
-
-    if not new_candidates:
-        return {"new_entities": 0, "new_links": 0, "conflicts": 0, "processed": 0}
-
-    existing_entities = load_existing_entity_candidates(session, county_id=county_id)
-    combined = new_candidates + existing_entities
-
     structural_edges = find_structural_edges(combined)
     blocks = block_candidates(combined)
     scored = score_blocked_pairs(blocks)
@@ -857,7 +842,32 @@ def run_incremental(session: Session, county_id: Optional[str] = None) -> dict:
     relevant_clusters = clusters + new_singletons
     confidences = compute_cluster_confidences(relevant_clusters, all_edges)
     evidence_index = build_evidence_index(all_edges)
+    return relevant_clusters, confidences, evidence_index
 
+
+def attach_or_create_entities(
+    session: Session,
+    relevant_clusters: list[list[CandidateRecord]],
+    confidences: list[int],
+    evidence_index: dict,
+) -> dict:
+    """
+    Shared per-cluster materialization for H2.6/H2.7: a cluster touching
+    exactly one existing buyer_entities anchor attaches its new records to
+    that entity via a new BuyerEntityLink (existing entity IDs never
+    change); a cluster touching zero anchors becomes a brand new entity.
+
+    A cluster touching 2+ existing entities is a potential MERGE case (e.g.
+    a new Sunbiz filing reveals two previously-separate entities share an
+    owner) — deliberately NOT auto-merged, since collapsing established
+    entity IDs risks breaking whatever already references them (whale
+    flags, Cell #1's list). Flagged and left unresolved for manual review
+    instead of guessing.
+
+    Does not commit -- callers control the commit/batch boundary (H2.7
+    commits once; H2.6's backfill commits every _ENTITY_COMMIT_BATCH
+    clusters against the shared production DB).
+    """
     new_entities_created = 0
     new_links_created = 0
     conflicts = 0
@@ -870,7 +880,7 @@ def run_incremental(session: Session, county_id: Optional[str] = None) -> dict:
 
         if len(entity_anchors) > 1:
             logger.warning(
-                "run_incremental: cluster touches %d existing entities (ids=%s) -- "
+                "attach_or_create_entities: cluster touches %d existing entities (ids=%s) -- "
                 "potential merge, not auto-resolving; new records left unresolved: %s",
                 len(entity_anchors), [a.source_id for a in entity_anchors],
                 [(r.source_table, r.source_id) for r in new_records],
@@ -898,13 +908,47 @@ def run_incremental(session: Session, county_id: Optional[str] = None) -> dict:
             ))
             new_links_created += 1
 
-    session.commit()
     return {
         "new_entities": new_entities_created,
         "new_links": new_links_created,
         "conflicts": conflicts,
-        "processed": len(new_candidates),
     }
+
+
+def run_incremental(session: Session, county_id: Optional[str] = None) -> dict:
+    """
+    Nightly-safe incremental resolution: match new/changed owners/deeds rows
+    (only_unresolved=True) against EXISTING buyer_entities first — via their
+    denormalized canonical_name/primary_mailing_address, run through the
+    identical blocking/scoring/clustering pipeline the backfill uses — rather
+    than re-clustering the world. Existing entity IDs never change: a new
+    record either attaches to one via a new BuyerEntityLink, or (matching
+    nothing existing) forms a brand new entity, exactly as the backfill does
+    for first-time records. Commits once at the end.
+    """
+    new_candidates = list(extract_candidates(session, only_unresolved=True))
+    if county_id:
+        new_candidates = [c for c in new_candidates if c.county_id == county_id]
+
+    if not new_candidates:
+        return {"new_entities": 0, "new_links": 0, "conflicts": 0, "processed": 0}
+
+    # Anchors are loaded across ALL counties, never scoped to county_id --
+    # a buyer entity isn't bound to one county. Scoping this to the cron's
+    # county would make a cross-county repeat buyer (already resolved in
+    # Hillsborough, say) invisible when their next purchase shows up in
+    # Pinellas, producing a duplicate entity instead of a link onto the
+    # existing one -- confirmed as a real production bug via a
+    # same-owner-two-counties fixture (see tests/scenarios/
+    # test_hunter_resolution_fixes.py).
+    existing_entities = load_existing_entity_candidates(session, county_id=None)
+    combined = new_candidates + existing_entities
+
+    relevant_clusters, confidences, evidence_index = cluster_against_anchors(combined)
+    stats = attach_or_create_entities(session, relevant_clusters, confidences, evidence_index)
+
+    session.commit()
+    return {**stats, "processed": len(new_candidates)}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -943,6 +987,16 @@ def refresh_portfolio_aggregates(session: Session, entity_ids: Optional[list[int
     property/date (corrective re-recordings) and $1/$10 nominal-consideration
     transfers (family, trust) were inflating purchase counts without any
     real purchase happening.
+
+    Both figures are computed from ONE canonical deed per
+    (buyer_entity_id, property_id) -- the most recently recorded one, ties
+    broken by id -- picked via DISTINCT ON before the count/sum. Without
+    this, a corrective re-recording (a second deeds row for the same
+    property, same sale) would still be counted once by
+    COUNT(DISTINCT property_id) but its sale_price would be summed AGAIN
+    on top of the original row's, inflating total_cash_volume and risking a
+    false whale flag on a duplicated consideration amount rather than a
+    real second purchase.
     """
     where_clause = "WHERE bel.buyer_entity_id = ANY(:entity_ids)" if entity_ids else ""
     result = session.execute(
@@ -952,13 +1006,20 @@ def refresh_portfolio_aggregates(session: Session, entity_ids: Optional[list[int
                 total_cash_volume = agg.cash_volume,
                 last_updated_at = now()
             FROM (
-                SELECT bel.buyer_entity_id,
-                       COUNT(DISTINCT d.property_id) AS purchase_count,
-                       COALESCE(SUM(d.sale_price) FILTER (WHERE d.sale_price >= 1000), 0) AS cash_volume
-                FROM buyer_entity_links bel
-                JOIN deeds d ON d.id = bel.source_id AND bel.source_table = 'deeds'
-                {where_clause}
-                GROUP BY bel.buyer_entity_id
+                SELECT canonical.buyer_entity_id,
+                       COUNT(*) AS purchase_count,
+                       COALESCE(SUM(canonical.sale_price) FILTER (WHERE canonical.sale_price >= 1000), 0) AS cash_volume
+                FROM (
+                    SELECT DISTINCT ON (bel.buyer_entity_id, d.property_id)
+                           bel.buyer_entity_id,
+                           d.property_id,
+                           d.sale_price
+                    FROM buyer_entity_links bel
+                    JOIN deeds d ON d.id = bel.source_id AND bel.source_table = 'deeds'
+                    {where_clause}
+                    ORDER BY bel.buyer_entity_id, d.property_id, d.record_date DESC NULLS LAST, d.id DESC
+                ) canonical
+                GROUP BY canonical.buyer_entity_id
             ) agg
             WHERE be.id = agg.buyer_entity_id
         """),

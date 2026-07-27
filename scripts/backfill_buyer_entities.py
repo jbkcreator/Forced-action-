@@ -12,6 +12,21 @@ shared with the nightly incremental sweep (H2.7) rather than duplicated here.
 Checks the Hunter kill switch before running (redis-cli SET
 kill_switch_override:hunter_global red EX 3600 halts it).
 
+Resumable by construction: only_unresolved=True (via extract_candidates)
+means every invocation -- the first, and any rerun after an interruption --
+only pulls owners/deeds rows with no existing buyer_entity_links row yet.
+Already-linked rows from prior committed batches are loaded instead as
+existing-entity ANCHORS (load_existing_entity_candidates) and matched
+against via the same cluster_against_anchors/attach_or_create_entities pair
+run_incremental (H2.7) uses -- a cluster touching exactly one anchor
+attaches to it, never creating a duplicate entity or re-inserting an
+already-committed link. On a from-scratch run (empty buyer_entities table)
+this is behaviorally identical to a full unscoped extraction, since nothing
+is linked yet. Confirmed as a real bug in the prior always-full-rescan
+version: rerunning after any committed batch hit a unique-constraint
+violation on buyer_entity_links(source_table, source_id) for every row that
+batch had already inserted.
+
 Commits in batches of _ENTITY_COMMIT_BATCH clusters, not as one transaction
 for the whole run -- there's no separate staging DB in this platform, so
 this writes against the same shared DB live traffic uses. A crash mid-run
@@ -27,30 +42,21 @@ from __future__ import annotations
 import argparse
 import logging
 
-from sqlalchemy import insert
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-_LINK_INSERT_BATCH = 1000
 _ENTITY_COMMIT_BATCH = 2000  # commit every N clusters -- see run_backfill docstring on why this isn't one giant transaction
 
 
 def run_backfill(county_id=None, dry_run: bool = False) -> None:
     from src.agents.hunter.kill_switch import hunter_halted
     from src.core.database import get_db_context
-    from src.core.models import BuyerEntityLink
     from src.services.buyer_entity_resolution import (
-        _new_entity_from_cluster,
-        _record_key,
-        block_candidates,
-        build_clusters,
-        build_evidence_index,
-        compute_cluster_confidences,
+        _ENTITY_ANCHOR_TABLE,
+        attach_or_create_entities,
+        cluster_against_anchors,
         extract_candidates,
-        find_singletons,
-        find_structural_edges,
-        score_blocked_pairs,
+        load_existing_entity_candidates,
     )
 
     if hunter_halted():
@@ -58,47 +64,44 @@ def run_backfill(county_id=None, dry_run: bool = False) -> None:
         return
 
     with get_db_context() as session:
-        logger.info("Extracting candidates%s...", f" (county={county_id})" if county_id else "")
-        candidates = list(extract_candidates(session, only_unresolved=False))
+        logger.info("Extracting unresolved candidates%s...", f" (county={county_id})" if county_id else "")
+        candidates = list(extract_candidates(session, only_unresolved=True))
         if county_id:
             candidates = [c for c in candidates if c.county_id == county_id]
-        logger.info("Extracted %d candidates.", len(candidates))
+        logger.info("Extracted %d unresolved candidates.", len(candidates))
 
-        logger.info("Finding structural (Sunbiz) edges...")
-        structural_edges = find_structural_edges(candidates)
-        logger.info("Found %d structural edges.", len(structural_edges))
+        if not candidates:
+            logger.info("Nothing unresolved -- backfill already complete (or nothing to do).")
+            return
 
-        logger.info("Blocking + scoring...")
-        blocks = block_candidates(candidates)
-        scored = score_blocked_pairs(blocks)
-        n_ambiguous = sum(1 for _, _, v in scored if v.method == "ambiguous")
-        logger.info(
-            "Scored %d pairs (%d ambiguous — left UNMATCHED, no LLM call; "
-            "never merge on uncertain evidence)...",
-            len(scored), n_ambiguous,
+        logger.info("Loading existing buyer_entities as anchors...")
+        # Anchors are loaded across ALL counties, matching run_incremental's
+        # policy (H2.7) -- a buyer entity isn't bound to one county, and on
+        # a resumed run these anchors are exactly the entities prior batches
+        # already committed.
+        existing_entities = load_existing_entity_candidates(session, county_id=None)
+        logger.info("Loaded %d existing entity anchors.", len(existing_entities))
+        combined = candidates + existing_entities
+
+        logger.info("Finding structural edges, blocking, scoring, clustering...")
+        relevant_clusters, confidences, evidence_index = cluster_against_anchors(combined)
+
+        would_create = sum(
+            1 for c in relevant_clusters
+            if not any(r.source_table == _ENTITY_ANCHOR_TABLE for r in c)
         )
-
-        # No LLM tie-break: ambiguous verdicts already carry is_match=False
-        # (score_candidate_pair's own return value), so filtering scored
-        # directly for is_match already excludes them -- nothing else needed.
-        all_edges = structural_edges + [e for e in scored if e[2].is_match]
-        logger.info("Total confirmed match edges: %d", len(all_edges))
-
-        clusters = build_clusters(all_edges)
-        singletons = find_singletons(candidates, clusters)
-        all_clusters = clusters + singletons
-        logger.info(
-            "Assembled %d clusters (%d multi-record, %d singleton).",
-            len(all_clusters), len(clusters), len(singletons),
+        would_attach = len(relevant_clusters) - would_create
+        total_links = sum(
+            len([r for r in c if r.source_table != _ENTITY_ANCHOR_TABLE]) for c in relevant_clusters
         )
-
-        confidences = compute_cluster_confidences(all_clusters, all_edges)
-        evidence_index = build_evidence_index(all_edges)
-        total_links = sum(len(c) for c in all_clusters)
+        logger.info(
+            "Assembled %d clusters needing action (%d new entities, %d attaching to an "
+            "existing entity, %d links total).",
+            len(relevant_clusters), would_create, would_attach, total_links,
+        )
 
         if dry_run:
-            logger.info("[DRY RUN] Would insert %d buyer_entities.", len(all_clusters))
-            logger.info("[DRY RUN] Would insert %d buyer_entity_links.", total_links)
+            logger.info("[DRY RUN] No writes performed.")
             return
 
         # Committed in batches of _ENTITY_COMMIT_BATCH clusters, NOT one
@@ -107,49 +110,33 @@ def run_backfill(county_id=None, dry_run: bool = False) -> None:
         # platform), and a single multi-hour transaction would hold back
         # Postgres vacuum for the whole database for that entire duration.
         # A crash mid-run only loses the current uncommitted batch (up to
-        # _ENTITY_COMMIT_BATCH clusters), not the whole run.
+        # _ENTITY_COMMIT_BATCH clusters); rerunning picks up exactly where
+        # it left off via the only_unresolved/anchor-matching above.
         total_entities_inserted = 0
         total_links_inserted = 0
-        n_clusters = len(all_clusters)
+        total_conflicts = 0
+        n_clusters = len(relevant_clusters)
 
         for batch_start in range(0, n_clusters, _ENTITY_COMMIT_BATCH):
-            batch_clusters = all_clusters[batch_start:batch_start + _ENTITY_COMMIT_BATCH]
+            batch_clusters = relevant_clusters[batch_start:batch_start + _ENTITY_COMMIT_BATCH]
             batch_confidences = confidences[batch_start:batch_start + _ENTITY_COMMIT_BATCH]
 
-            batch_entities = [
-                _new_entity_from_cluster(cluster, conf) for cluster, conf in zip(batch_clusters, batch_confidences)
-            ]
-            session.add_all(batch_entities)
-            session.flush()  # populates entity.id on every new row in this batch
-
-            link_rows = []
-            for cluster, entity in zip(batch_clusters, batch_entities):
-                for rec in cluster:
-                    method, confidence = evidence_index.get(_record_key(rec), ("manual", 100))
-                    link_rows.append({
-                        "buyer_entity_id": entity.id,
-                        "source_table": rec.source_table,
-                        "source_id": rec.source_id,
-                        "match_confidence": confidence,
-                        "match_method": method,
-                    })
-
-            for i in range(0, len(link_rows), _LINK_INSERT_BATCH):
-                session.execute(insert(BuyerEntityLink).values(link_rows[i:i + _LINK_INSERT_BATCH]))
-
+            stats = attach_or_create_entities(session, batch_clusters, batch_confidences, evidence_index)
             session.commit()
-            total_entities_inserted += len(batch_entities)
-            total_links_inserted += len(link_rows)
+
+            total_entities_inserted += stats["new_entities"]
+            total_links_inserted += stats["new_links"]
+            total_conflicts += stats["conflicts"]
             logger.info(
-                "Committed: %d/%d clusters (%.1f%%) — %d entities, %d links so far.",
+                "Committed: %d/%d clusters (%.1f%%) — %d entities, %d links, %d conflicts so far.",
                 min(batch_start + _ENTITY_COMMIT_BATCH, n_clusters), n_clusters,
                 100 * min(batch_start + _ENTITY_COMMIT_BATCH, n_clusters) / n_clusters,
-                total_entities_inserted, total_links_inserted,
+                total_entities_inserted, total_links_inserted, total_conflicts,
             )
 
         logger.info(
-            "Backfill complete: %d buyer_entities and %d buyer_entity_links inserted total.",
-            total_entities_inserted, total_links_inserted,
+            "Backfill complete: %d buyer_entities and %d buyer_entity_links inserted, %d conflicts left unresolved.",
+            total_entities_inserted, total_links_inserted, total_conflicts,
         )
 
 

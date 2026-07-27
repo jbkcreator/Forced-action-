@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 
+from src.agents.hunter.kill_switch import hunter_halted
 from src.core.database import get_db_context
 from src.services.buyer_entity_resolution import refresh_portfolio_aggregates, run_incremental
 from src.services.whale_detection import refresh_whale_flags
@@ -40,6 +41,16 @@ logger = get_logger(__name__)
 
 
 def run_sweep(county_id: str = "hillsborough") -> dict:
+    # Checked before any read/write -- an operator's "STOP Hunter"
+    # (redis-cli SET kill_switch_override:hunter_global red EX 3600) must
+    # halt this cron-triggered writer within one cycle, per Hunter's
+    # constitution. Previously only the one-time backfill script checked
+    # this; the nightly sweep (and whale_auction_fast_follow.py) ran
+    # unconditionally regardless of an active halt.
+    if hunter_halted():
+        logger.warning("[HunterNightlySweep] Hunter kill switch active -- skipping sweep, no DB mutation.")
+        return {"county_id": county_id, "halted": True}
+
     with get_db_context() as session:
         resolution_stats = run_incremental(session, county_id=county_id)
         portfolio_entities_refreshed = refresh_portfolio_aggregates(session)

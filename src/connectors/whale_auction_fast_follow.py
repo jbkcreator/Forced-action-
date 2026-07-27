@@ -47,6 +47,7 @@ from datetime import date, timedelta
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from src.agents.hunter.kill_switch import hunter_halted
 from src.connectors.deed_flip_outcomes import DISTRESSED_KEYWORDS
 from src.services.whale_detection import refresh_whale_flags
 
@@ -106,6 +107,18 @@ def run_whale_fast_follow(session: Session, county_id: str) -> dict:
     Re-score whale status for any entity that just picked up a fresh
     distressed-acquisition deed. Returns a summary dict for logging/tests.
     """
+    # Checked first -- this is a cron-triggered writer (refresh_whale_flags
+    # mutates buyer_entities), so an active "STOP Hunter" override must halt
+    # it before any read/write, same as the nightly sweep and the backfill
+    # script.
+    if hunter_halted():
+        logger.warning(
+            "whale_auction_fast_follow[%s]: Hunter kill switch active -- skipping, no DB mutation.",
+            county_id,
+        )
+        return {"examined": 0, "rescored_entities": 0, "new_buyers": 0, "repeat_buyers": 0,
+                "classifications": {}, "stale": 0, "halted": True}
+
     # Examine the WIDER window so a deed can still be seen once it's past
     # STALE_LATENCY_DAYS -- otherwise it ages out of the query before the
     # staleness check below ever runs on it.
