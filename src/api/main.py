@@ -2011,7 +2011,10 @@ def _get_activation_status_safe(subscriber_id: int, db) -> dict:
         return get_activation_status(subscriber_id, db)
     except Exception as exc:
         logger.warning("activation status fetch failed for sub=%s: %s", subscriber_id, exc)
-        return {"signup_time": None, "first_leads_shown_time": None, "first_unlock_time": None}
+        return {
+            "signup_time": None, "onboarding_completed_time": None,
+            "first_leads_shown_time": None, "first_unlock_time": None,
+        }
 
 
 def _payment_recovery_fields(subscriber) -> dict:
