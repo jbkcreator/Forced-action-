@@ -39,6 +39,21 @@ def test_render_no_noindex_when_live():
     assert "noindex" not in html
 
 
+def test_render_no_pixel_when_meta_pixel_id_unset():
+    html = render_page(_SAMPLE)
+    assert "fbevents.js" not in html
+    assert "facebook.com/tr" not in html
+
+
+def test_render_includes_pixel_when_meta_pixel_id_set():
+    data = {**_SAMPLE, "meta_pixel_id": "123456789"}
+    html = render_page(data)
+    assert "fbevents.js" in html
+    assert "fbq('init', '123456789')" in html
+    assert "fbq('track', 'PageView')" in html
+    assert "facebook.com/tr?id=123456789" in html
+
+
 def test_render_noindex_meta_when_status_noindex():
     data = {**_SAMPLE, "status": "noindex"}
     html = render_page(data)

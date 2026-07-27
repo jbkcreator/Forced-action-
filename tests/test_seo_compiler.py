@@ -139,3 +139,30 @@ def test_build_faq_answers_are_plain_strings():
     for item in build_faq("Riverview", "roofing", _STATS):
         assert isinstance(item["question"], str) and item["question"]
         assert isinstance(item["answer"], str) and item["answer"]
+
+
+# ─── page context ────────────────────────────────────────────────────────────
+
+def test_page_data_passes_through_meta_pixel_id():
+    """SEO pages must carry the same client-side pixel ID as the app (metaPixel.js)."""
+    from src.tasks.seo_compiler import _page_data
+
+    settings = MagicMock()
+    settings.seo_site_base_url = "https://forcedactionleads.com"
+    settings.meta_pixel_id = "999888777"
+
+    data = _page_data(_cell(), _STATS, "live", settings, {}, 25)
+
+    assert data["meta_pixel_id"] == "999888777"
+
+
+def test_page_data_meta_pixel_id_none_when_unset():
+    from src.tasks.seo_compiler import _page_data
+
+    settings = MagicMock()
+    settings.seo_site_base_url = "https://forcedactionleads.com"
+    settings.meta_pixel_id = None
+
+    data = _page_data(_cell(), _STATS, "live", settings, {}, 25)
+
+    assert data["meta_pixel_id"] is None

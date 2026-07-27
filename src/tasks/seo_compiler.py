@@ -171,6 +171,9 @@ def _page_data(
         "sibling_links": siblings,
         "status": status,
         "canonical_url": f"{settings.seo_site_base_url.rstrip('/')}{url_path}",
+        # Client-side retargeting pixel — no-ops in the template if unset,
+        # same gating as the frontend's VITE_META_PIXEL_ID (src/utils/metaPixel.js).
+        "meta_pixel_id": settings.meta_pixel_id,
     }
 
 
