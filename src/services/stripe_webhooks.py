@@ -788,36 +788,95 @@ def _on_checkout_completed(session: dict, db: Session, background_tasks=None) ->
             stripe_customer_id, exc_info=True,
         )
 
-    # ── Lock ZIP territories (same transaction) ────────────────────────────
-    for zip_code in zip_codes:
-        territory = db.execute(
-            select(ZipTerritory).where(
-                ZipTerritory.zip_code == zip_code,
-                ZipTerritory.vertical == vertical,
-                ZipTerritory.county_id == county_id,
-            ).with_for_update()
-        ).scalar_one_or_none()
+    # ── T-B12-07: redeem a win-back offer token, if this checkout carried one ──
+    # (PR #172 review fix) A completed checkout is the only point that proves
+    # an actual reactivation happened — this is where the promised benefit is
+    # finally realized. zip_held's 50%-off was already applied as a Stripe
+    # coupon on the session itself (see /api/checkout); here we only mark the
+    # token redeemed. zip_released never had a discount — its 5-credit grant
+    # happens ONLY here, not at message-send time.
+    #
+    # redeem_offer() (sets redeemed_at) and grant_winback_credits() (sets
+    # credits_granted_at) are intentionally NOT wrapped so that a grant
+    # failure rolls back the redemption too — grant_winback_credits already
+    # catches its own exceptions and returns False rather than raising, by
+    # design, so it can never poison this savepoint (PR #172 follow-up
+    # review). A failed grant instead leaves redeemed_at set and
+    # credits_granted_at NULL, which reconcile_pending_credit_grants() (run
+    # periodically, see scripts/cron/crontab.txt) finds and retries — so the
+    # benefit is delayed, never lost, without needing to fail the whole
+    # webhook or block Stripe's ack.
+    _winback_token = meta.get("winback_token")
+    if _winback_token:
+        try:
+            with db.begin_nested():
+                from src.services.winback_offers import redeem_offer, grant_winback_credits
+                redeemed = redeem_offer(_winback_token, db)
+                if redeemed and redeemed["branch"] == "zip_released":
+                    grant_winback_credits(redeemed["subscriber_id"], db, token=_winback_token)
+        except Exception:
+            logger.error(
+                "winback offer redemption failed for token=%s customer=%s",
+                _winback_token, stripe_customer_id, exc_info=True,
+            )
 
-        if territory is None:
-            territory = ZipTerritory(
-                zip_code=zip_code,
-                vertical=vertical,
-                county_id=county_id,
-                subscriber_id=subscriber.id,
-                status="locked",
-                locked_at=now,
+    # ── Lock ZIP territories (same transaction) ────────────────────────────
+    # A buyer paid for exclusive territory on every requested ZIP. If ANY of
+    # them is lost to a concurrent checkout (the exact TOCTOU window
+    # claim_zip_territory closes for a single ZIP, but two buyers can still
+    # each win a subset of a multi-ZIP cart), the whole checkout must fail
+    # rather than activate a paying subscriber who didn't get what they paid
+    # for. Raising here propagates to handle_webhook's outer except, which
+    # rolls back this entire transaction — no subscriber, no account
+    # activation, no MRR record for this event.
+    from src.services.zip_territory import ZipTerritoryUnavailableError, claim_zip_territory
+    unclaimed = [
+        zip_code for zip_code in zip_codes
+        if not claim_zip_territory(
+            db, zip_code=zip_code, vertical=vertical, county_id=county_id,
+            subscriber_id=subscriber.id, now=now,
+        )
+    ]
+    if unclaimed:
+        # Stripe has ALREADY captured this charge and created the subscription
+        # — the DB rollback below undoes our side only. That's not durably
+        # recorded anywhere else (this same `db` session is what's about to
+        # roll back, and the webhook audit row lives on it too), so ops would
+        # otherwise have no reliable way to find this customer at all short of
+        # grepping logs. Write the recovery record on its OWN committed
+        # session — get_db_context() opens a fresh connection, independent of
+        # `db` — so it survives regardless of what happens to this
+        # transaction. Deciding HOW to recover (auto-refund vs. cancel vs.
+        # manual outreach) is a product/finance policy call outside this
+        # fix's scope; making the failure durable, queryable, and actionable
+        # for ops is not.
+        try:
+            from src.core.database import get_db_context
+            from src.core.models import CheckoutProvisioningFailure
+            with get_db_context() as recovery_db:
+                recovery_db.add(CheckoutProvisioningFailure(
+                    stripe_customer_id=stripe_customer_id,
+                    stripe_subscription_id=stripe_subscription_id,
+                    email=customer_email,
+                    tier=tier,
+                    vertical=vertical,
+                    county_id=county_id,
+                    requested_zips=zip_codes,
+                    unclaimed_zips=unclaimed,
+                ))
+        except Exception:
+            logger.critical(
+                "checkout provisioning failure AND its recovery record failed to write — "
+                "customer=%s subscription=%s zips=%s — this customer is now findable only "
+                "via log search, follow up manually",
+                stripe_customer_id, stripe_subscription_id, unclaimed, exc_info=True,
             )
-            db.add(territory)
-        elif territory.status in ("available", "grace"):
-            territory.subscriber_id = subscriber.id
-            territory.status = "locked"
-            territory.locked_at = now
-            territory.grace_expires_at = None
-        else:
-            logger.warning(
-                "ZIP %s/%s/%s already locked by subscriber %s — skipping",
-                zip_code, vertical, county_id, territory.subscriber_id,
-            )
+        raise ZipTerritoryUnavailableError(
+            f"checkout for subscriber={subscriber.id} tier={tier} vertical={vertical} "
+            f"county={county_id} could not claim ZIP(s) {unclaimed} — lost to a concurrent "
+            f"checkout; entire checkout rolled back, durable recovery record written "
+            f"to checkout_provisioning_failures"
+        )
 
     # Bust zip_availability cache for every (county_id, vertical) pair that was locked.
     from src.core.redis_client import rdelete
@@ -2599,6 +2658,14 @@ def fulfill_founder_comp_reveal(subscriber, property_id_raw, db: Session) -> boo
     if not is_first_reveal:
         return True
 
+    # T-B12-05: founder comp reveal is a $0 unlock but still IS the
+    # activation event (first contact reveal), so it must stamp the clock.
+    try:
+        from src.services.activation_tracking import stamp_first_unlock
+        stamp_first_unlock(subscriber.id, db)
+    except Exception:
+        logger.warning("founder_comp reveal: activation stamp failed sub=%s", subscriber.id)
+
     try:
         from src.services.auto_mode import enqueue_action
         enqueue_action(subscriber.id, property_id, db)
@@ -2781,6 +2848,11 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
                 SentLead.source == "lead_unlock_payment",
             )
         ).scalar() or 0
+        # T-B12-05: stamp the activation event (first-ever contact unlock)
+        # regardless of welcome-email eligibility above.
+        from src.services.activation_tracking import stamp_first_unlock
+        stamp_first_unlock(subscriber.id, db)
+
         if first_unlock <= 1:
             from src.services.email import send_welcome_email
             from src.services import subscriber_auth as _sub_auth

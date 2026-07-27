@@ -91,9 +91,14 @@ class AppSettings(BaseSettings):
 	instantly_base_url: str = Field(default="https://api.instantly.ai", env="INSTANTLY_BASE_URL")
 	instantly_enabled: bool = Field(default=True, env="INSTANTLY_ENABLED")
 
-	# Non-buyer nurture — shared Instantly campaign on the dedicated warmed lifecycle domain.
+	# Non-buyer nurture — shared Instantly campaign. Per the 2026-07-22 domain
+	# decision this shares the same warmed mailbox as the DBPR cold campaign
+	# (leads@forcedactionleads.com), not a separate dedicated domain — see
+	# scripts/create_non_buyer_nurture_campaign.py's DOMAIN DECISION note.
 	non_buyer_nurture_campaign_id: Optional[str] = Field(default=None, env="NON_BUYER_NURTURE_CAMPAIGN_ID")
-	# Max leads enrolled per daily sweep. Ramp up as the sending domain warms.
+	# Max leads enrolled per daily sweep. NOT netted against the DBPR cold
+	# campaign's own daily_limit on the same mailbox — set both together so
+	# their sum stays under the mailbox's overall send ceiling.
 	non_buyer_nurture_daily_cap: int = Field(default=25, env="NON_BUYER_NURTURE_DAILY_CAP")
 
 	# Abandoned-checkout recovery (Task 7). Off by default — the sweep captures
@@ -186,6 +191,11 @@ class AppSettings(BaseSettings):
 	# Referral Core Loop
 	referral_free_month_coupon_id: Optional[str] = Field(default=None, env="REFERRAL_FREE_MONTH_COUPON_ID")
 
+	# T-B12-07: Tier3 win-back zip_held offer — 50% off the return month.
+	# Applied as a Stripe coupon at checkout session creation when a valid
+	# winback_offers token accompanies the request (PR #172 review fix).
+	winback_50_off_coupon_id: Optional[str] = Field(default=None, env="WINBACK_50_OFF_COUPON_ID")
+
 	# Stage 12: Bankruptcy Filing Alert product ($297/mo). Shares the common
 	# Stripe webhook endpoint + signing secret (active_stripe_webhook_secret) —
 	# events are routed by product in stripe_webhooks.handle_webhook.
@@ -202,6 +212,10 @@ class AppSettings(BaseSettings):
 	stripe_test_price_pro_regular: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_PRO_REGULAR")
 	stripe_test_price_dominator_founding: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_DOMINATOR_FOUNDING")
 	stripe_test_price_dominator_regular: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_DOMINATOR_REGULAR")
+	# Not read by get_price_id_for_checkout (founder resolves via plans.stripe_price_id,
+	# not this env var) — kept for mapping-table parity with every other tier only.
+	stripe_test_price_founder_monthly: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_FOUNDER_MONTHLY")
+	stripe_test_price_founder_annual: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_FOUNDER_ANNUAL")
 	stripe_test_price_lead_pack: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_LEAD_PACK")
 	stripe_test_price_insurance_distress_pack: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_INSURANCE_DISTRESS_PACK")
 	stripe_test_price_hot_lead_unlock: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_HOT_LEAD_UNLOCK")
@@ -638,7 +652,7 @@ class AppSettings(BaseSettings):
 	# integration was dropped — unsupported for content pages, was a dead stub.
 	seo_eligibility_floor: int = Field(default=25, env="SEO_ELIGIBILITY_FLOOR")
 	seo_output_dir: str = Field(default="dist/seo/florida", env="SEO_OUTPUT_DIR")
-	seo_site_base_url: str = Field(default="https://www.forcedaction.com", env="SEO_SITE_BASE_URL")
+	seo_site_base_url: str = Field(default="https://forcedactionleads.com", env="SEO_SITE_BASE_URL")
 	seo_retire_hysteresis_runs: int = Field(default=2, env="SEO_RETIRE_HYSTERESIS_RUNS")
 
 

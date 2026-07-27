@@ -30,6 +30,17 @@ sold-out ZIP supply gate
     this vertical AND (b) not recorded as sold in lead_quality_snapshots.
     Uses gold_plus_zip_snapshots as a fast pre-filter; falls back to a direct
     distress_scores query if the snapshot is stale or absent.
+
+tier3 win-back lapsed window (T-B12-07)
+    Lapsed = churned_at IS NOT NULL. Age is measured from churned_at, not
+    last_reactivation_attempt_at. Two branches, gated on age at churned_at:
+      <30d  — "zip_held":     ZipTerritory row for this subscriber still
+              in ('locked', 'grace') for any of their prior ZIPs. The
+              territory has not yet been released to another subscriber.
+      >=30d — "zip_released": no ZipTerritory row still held by this
+              subscriber (status flipped to 'available' or reassigned).
+    Uses the same on_cooldown / past_subscriber / contact-info gates as the
+    other two cohorts.
 """
 
 import logging
@@ -47,6 +58,7 @@ DORMANT_DAYS = 30
 CONTACT_COOLDOWN_DAYS = 14
 REACTIVATION_COOLDOWN_DAYS = 3
 SUPPLY_STALENESS_DAYS = 1
+WINBACK_ZIP_HELD_WINDOW_DAYS = 30
 
 
 # ── Lifecycle predicates ──────────────────────────────────────────────────────
@@ -277,3 +289,51 @@ def check_sold_out_zip_eligibility(
         return False, f"no_supply:{zip_code}"
 
     return True, "eligible"
+
+
+# ── Tier3 win-back (T-B12-07) ─────────────────────────────────────────────────
+
+def _zip_still_held(subscriber_id: int, db: Session) -> bool:
+    """True if the subscriber still holds at least one locked/grace ZIP."""
+    row = db.execute(text("""
+        SELECT 1 FROM zip_territories
+        WHERE subscriber_id = :sid AND status IN ('locked', 'grace')
+        LIMIT 1
+    """), {"sid": subscriber_id}).first()
+    return row is not None
+
+
+def check_tier3_winback_eligibility(
+    subscriber: Subscriber,
+    db: Session,
+) -> tuple[bool, str, Optional[str]]:
+    """
+    Returns (eligible, reason, branch) for Tier3 win-back reactivation.
+
+    branch is "zip_held" (<30d lapsed, territory still theirs) or
+    "zip_released" (>=30d lapsed, territory reassigned/available) — None
+    when not eligible.
+
+    A subscriber is eligible when they:
+      - are not on reactivation cooldown
+      - are a past paid subscriber with churned_at set (lapsed, not just dormant)
+      - have a phone or email on file
+    """
+    if on_cooldown(subscriber):
+        return False, "on_cooldown", None
+
+    if not is_past_subscriber(subscriber):
+        return False, "not_lapsed", None
+
+    if not subscriber.email and not subscriber.phone:
+        return False, "no_contact_info", None
+
+    churned_at = subscriber.churned_at
+    if churned_at.tzinfo is None:
+        churned_at = churned_at.replace(tzinfo=timezone.utc)
+    lapsed_days = (datetime.now(timezone.utc) - churned_at).days
+
+    if lapsed_days < WINBACK_ZIP_HELD_WINDOW_DAYS and _zip_still_held(subscriber.id, db):
+        return True, "eligible", "zip_held"
+
+    return True, "eligible", "zip_released"

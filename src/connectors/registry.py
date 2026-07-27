@@ -24,8 +24,9 @@ Wave-1 connectors (foreclosure_outcomes, tax_deed_outcomes,
 appraiser_sale_outcomes) are `enabled=True` — their modules are deployed and
 running. dor_sales (CDE-07 raw ingestion — 160k+ rows, 99.8% matched) already
 exists and is loaded; dor_sale_outcomes (the outcome connector itself, see
-src/connectors/dor_sale_outcomes.py) stays `enabled=False` until it has been
-run and verified end-to-end — flip to True as the final go-live step.
+src/connectors/dor_sale_outcomes.py) ran end-to-end for both counties on
+2026-07-16 (`scraper_run_stats` ids 9804/9854, run_success=True, 78,622 rows
+staged into outcome_candidates) and is now `enabled=True`.
 """
 from __future__ import annotations
 
@@ -125,7 +126,7 @@ OUTCOME_CONNECTORS: dict[str, ConnectorSpec] = {
         cadence="monthly, after the DOR SDF download (2nd of month)",
         sla_minutes=131_040,  # ~91 days + grace — DOR posts 3 rolls/year
         off_days=frozenset(),
-        enabled=False,
+        enabled=True,
     ),
 }
 

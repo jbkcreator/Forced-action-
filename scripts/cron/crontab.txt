@@ -211,6 +211,14 @@ COUNTY_ID=hillsborough
 10 8 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.daily_report --county $COUNTY_ID
 11 8 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.daily_report --county pinellas
 
+# 20b. New-Distress Digest (T-B12-03) — 11:00 AM UTC daily = 7:00 AM America/Detroit
+#      (EDT; drifts to 06:00 EDT-equivalent in EST winter months like every
+#      other fixed-UTC job in this file — see the schedule-overview note at
+#      top). Subscribers get the full new-lead list for their ZIP/vertical
+#      (deduped against sent_leads); waitlist entries get a blurred-teaser
+#      count. Runs after CDS scoring (07:00 UTC) so today's scores are in.
+0 11 * * * $PROJECT/scripts/cron/run.sh src.tasks.new_distress_digest
+
 # ── M6 LEAD QUALITY TRUTH ENGINE ─────────────────────────────
 # Cohort contactability-rate recompute (07:45) — before the verdict batch.
 45 7 * * * $PROJECT/scripts/cron/run.sh src.tasks.cohort_rate_recompute
@@ -243,6 +251,11 @@ COUNTY_ID=hillsborough
 # Polls broker.transition events → lane_closer (closed_won→funded, closed_lost→
 # dead) + commission_poster (closed_won→post commission). Both idempotent.
 1-59/2 * * * * $PROJECT/scripts/cron/run.sh src.tasks.loan_lane_sweep
+
+# Outcome dispatch sweep (Block 13) — every 2 min. Polls deal_outcome_recorded
+# → outcome_snapshot + outcome_loss_autopsy (dead+lead-fault only). Both
+# idempotent. Decouples the buyer's one-tap outcome from score recalculation.
+1-59/2 * * * * $PROJECT/scripts/cron/run.sh src.tasks.outcome_dispatch_sweep
 
 # Cora anomaly check — volume + no-answer rate monitor — every 15 min
 */15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.cora_anomaly_check
@@ -352,6 +365,17 @@ COUNTY_ID=hillsborough
 # move this back onto :30.
 33 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.revenue_fulfillment_heartbeat
 
+# Vera — Revenue Truth Report — 07:36 AM UTC daily.
+# Two-way Stripe-vs-Subscriber reconciliation (paying-no-access AND
+# access-not-paying), real MRR (Stripe vs DB), new/failed payments split by
+# subscription vs one-time, refunds & disputes — every number pulled live
+# from Stripe, never from our own webhook log or DB alone. Read-only; runs
+# after stripe_reconcile (07:15) and revenue_fulfillment_heartbeat (07:33,
+# a different check — dollar-total vs ledger, no subscriber ID, can't see
+# failed payments), before Vera's live-state report (07:47) so this run's
+# revenue.mrr.new_yesterday fact is fresh by the time that report reads it.
+# Runs every day (not Mon-Sat only) — Stripe activity doesn't stop on Sunday.
+36 7 * * * $PROJECT/scripts/cron/run.sh src.agents.vera --revenue-truth
 
 # SunBiz LLC Piercing Enrichment — 07:40 AM UTC Mon-Sat (fa031 tiered staleness)
 # Tier A: active-lead pending/30d-stale  •  Tier B: cold pending/180d-stale
@@ -363,6 +387,23 @@ COUNTY_ID=hillsborough
 # Alerts if parser_failed_rate >5% in last 24h (min 10 outcomes).
 # Logs status distribution, enriched count, multi-property LLC group gauge.
 50 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.tasks.sunbiz_anomaly_check
+
+# Vera — Live-State Report — 07:47 AM UTC daily.
+# Prod-hash vs dev-HEAD drift, migration applied/not-applied status, cron
+# freshness per (source, county), silent-failure detection (scheduled-but-
+# writing-nothing, enabled-but-unscheduled). Read-only; runs after the CDS/
+# skip-trace chain (07:00/07:30) so today's freshness data is settled, before
+# GHL sync (08:00) and the existing daily ops report (08:10). Emails
+# REPORT_RECIPIENTS; writes every check as a dated row to vera_facts.
+47 7 * * * $PROJECT/scripts/cron/run.sh src.agents.vera --live-state
+
+# Vera — Promise & Discrepancy Digest (VERA-v2.2 sub-task V4) — 07:52 AM UTC daily.
+# Open/overdue promises (owner, age, MRR-at-risk) from vera_promises + a
+# "Doc claims X; live state shows Y" report built by reading the deploy/cron/
+# revenue discrepancy facts V3 (07:36) and V2 (07:47) wrote earlier this run.
+# Read-only; runs after live-state so those facts are fresh. Does NOT re-run
+# V2/V3 checks — it reports their verdicts. Emails REPORT_RECIPIENTS.
+52 7 * * * $PROJECT/scripts/cron/run.sh src.agents.vera --promise-digest
 
 # Contact Freshness Sweep - 07:55 AM UTC Mon-Sat.
 # Re-scores old skip-traced phones as high/medium/low/stale and refreshes the
@@ -812,12 +853,28 @@ COUNTY_ID=hillsborough
 # fallback for any owner_alert_dispatch row stuck at status='sms_sent' for
 # 5+ minutes with no Telnyx message.finalized delivery-status callback.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.owner_alert_sweep
-# Tiered volume guarantee shortfall sweep — ENABLED LIVE.
-# Issues real Stripe balance credits when a subscriber's closed cycle is short
-# of config/guarantees.py TIER_LEAD_QUOTAS. Cycles are floored at the
-# deliveries-ledger go-live (DELIVERY_TRACKING_START_UTC) so pre-tracking days
-# never count as a false shortfall. Confirm TIER_LEAD_QUOTAS before relying on
-# the amounts; run with --dry-run to preview without touching Stripe.
-0 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.guarantee_shortfall_sweep
+# Tiered volume guarantee shortfall sweep — INTENTIONALLY NOT scheduled yet.
+# config/guarantees.py TIER_LEAD_QUOTAS are placeholder lead-per-cycle counts
+# pending a business decision; enabling this cron would issue real Stripe
+# balance credits off unconfirmed numbers. Re-enable only once all three are
+# true: (1) lead_delivery_sweep has run one full 30-day cycle with real
+# deliveries landing, (2) a --dry-run credit total has been reviewed and
+# approved in writing, (3) Stripe is confirmed in live mode.
+# 0 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.guarantee_shortfall_sweep
+
+# T-B12-07 — Deal-of-the-day daily pick (idempotent, one row per date).
+# Runs after CDS scoring so today's top-CDS undelivered lead is available.
+15 7 * * * $PROJECT/scripts/cron/run.sh src.services.deal_of_the_day
+
+# T-B12-07 — Tier3 win-back reactivation sweep (lapsed <30d zip-held /
+# >=30d zip-released branches). Runs alongside the existing S0 cohorts.
+30 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.reactivation_scheduler --cohort tier3_winback
+
+# T-B12-07 — Win-back credit-grant reconciliation (PR #172 follow-up review).
+# Retries the zip_released 5-credit grant for offers that redeemed
+# successfully (proof of a real reactivation) but whose grant failed inside
+# the checkout webhook (transient wallet/DB error). Idempotent, cheap;
+# every 15 min is generous relative to how rarely this should fire.
+*/15 * * * * $PROJECT/scripts/cron/run.sh src.services.winback_offers --reconcile
 
 # === END FORCED-ACTION-PLATFORM ===

@@ -1361,6 +1361,41 @@ class Subscriber(Base):
         return f"<Subscriber(id={self.id}, email='{self.email}', tier='{self.tier}', founding={self.founding_member})>"
 
 
+class ActivationEvent(Base):
+    """
+    T-B12-05: 5-minute activation funnel timestamps, one row per subscriber.
+
+    signup_time mirrors Subscriber.created_at (stamped at row creation so it
+    survives even if Subscriber.created_at semantics ever change).
+    first_leads_shown_time is stamped the first time the free-tier dashboard
+    renders the 3-5 real scored leads (event_feed's no-locked-zip branch).
+    first_unlock_time is stamped the first time the subscriber unlocks any
+    lead's contact info (paid $4/hot-lead unlock or founder comp reveal) —
+    this is the activation event per the locked decision. Both are
+    set-once (COALESCE-style in code, never overwritten) so "time to first
+    value" and "time to activation" stay measurable against signup_time.
+    """
+    __tablename__ = "activation_events"
+
+    subscriber_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("subscribers.id"), primary_key=True
+    )
+    signup_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    first_leads_shown_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    first_unlock_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    def __repr__(self):
+        return (
+            f"<ActivationEvent(subscriber_id={self.subscriber_id}, "
+            f"shown={self.first_leads_shown_time}, unlocked={self.first_unlock_time})>"
+        )
+
+
 class ZipTerritory(Base):
     """
     ZIP code exclusivity per vertical per county.
@@ -2530,6 +2565,7 @@ class CoraEventQueue(Base):
     subscriber_id: Mapped[Optional[int]] = mapped_column(Integer)
     payload: Mapped[Optional[dict]] = mapped_column(JSONB)
     idempotency_key: Mapped[Optional[str]] = mapped_column(Text)
+    decision_id: Mapped[Optional[str]] = mapped_column(String(36))  # preserved across the fallback path so downstream joins survive Redis-down
     status: Mapped[str] = mapped_column(Text, nullable=False, default="pending")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
@@ -3070,6 +3106,15 @@ class DealOutcome(Base):
     lead_source: Mapped[Optional[str]] = mapped_column(String(50))  # which signal drove the lead
     days_to_close: Mapped[Optional[int]] = mapped_column(Integer)
     pipeline_stage: Mapped[Optional[str]] = mapped_column(String(30))  # lead / contacted / qualified / proposal / negotiation / closed_won / closed_lost
+    # T-B13-01 — one-tap buyer outcome on the delivered-lead card.
+    # outcome_state is the buyer-facing tap (closed/dead/pending); pipeline_stage
+    # is the derived stage kept for existing consumers. dead_reason is REQUIRED
+    # when outcome_state='dead' (enforced at the API, mirrored by a check
+    # constraint). reason_fault_class splits dead reasons into lead_fault (feeds
+    # the CDS retune) vs buyer_neutral (score-protected, buyer-side log only).
+    outcome_state: Mapped[Optional[str]] = mapped_column(String(10))  # closed / dead / pending
+    dead_reason: Mapped[Optional[str]] = mapped_column(String(30))
+    reason_fault_class: Mapped[Optional[str]] = mapped_column(String(15))  # lead_fault / buyer_neutral
     # fa056 — Stage 10 pricing cohort activation gate columns
     county_id: Mapped[Optional[str]] = mapped_column(String(50))
     trade_vertical: Mapped[Optional[str]] = mapped_column(String(50))
@@ -3090,6 +3135,20 @@ class DealOutcome(Base):
             name="ck_deal_outcomes_confidence_tier",
         ),
         Index("idx_deal_outcome_pipeline_stage", "pipeline_stage"),
+        # T-B13-01 — buyer outcome tap constraints + retune-routing index.
+        CheckConstraint(
+            "outcome_state IS NULL OR outcome_state IN ('closed','dead','pending')",
+            name="ck_deal_outcomes_outcome_state",
+        ),
+        CheckConstraint(
+            "reason_fault_class IS NULL OR reason_fault_class IN ('lead_fault','buyer_neutral')",
+            name="ck_deal_outcomes_reason_fault_class",
+        ),
+        CheckConstraint(
+            "outcome_state <> 'dead' OR dead_reason IS NOT NULL",
+            name="ck_deal_outcomes_dead_requires_reason",
+        ),
+        Index("idx_deal_outcomes_fault_class", "reason_fault_class"),
         Index("idx_deal_outcomes_county_vertical", "county_id", "trade_vertical"),
         Index("idx_deal_outcomes_confidence_tier", "confidence_tier"),
         Index(
@@ -3275,6 +3334,11 @@ class ReferralEvent(Base):
     # referral_prompt_funnel row that drove the conversion. Plain int (the funnel
     # table is raw-SQL, not an ORM model), nullable for organic/reactive signups.
     prompt_funnel_id: Mapped[Optional[int]] = mapped_column(Integer)
+    # T-B12-06: attribution marker distinguishing where the referral ask
+    # originated. 'generic' = the standard referral link; 'investor_to_investor'
+    # = the Tier-3-gated "invite a fellow investor" ask. No reward-ladder impact
+    # (rewards are unchanged) — this exists purely for attribution/reporting.
+    referral_source: Mapped[str] = mapped_column(String(30), nullable=False, default="generic", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
@@ -3533,6 +3597,45 @@ class SmsDeadLetter(Base):
 
     def __repr__(self):
         return f"<SmsDeadLetter(id={self.id}, phone={self.phone}, reason={self.reason})>"
+
+
+class CheckoutProvisioningFailure(Base):
+    """
+    Durable recovery queue for a checkout that Stripe completed (charge and
+    subscription both real) but whose ZIP-territory provisioning failed and
+    was rolled back — see stripe_webhooks._on_checkout_completed. Written via
+    its own committed session, deliberately independent of the request's main
+    db session, so it survives that session's rollback. This table is the
+    monitored ops queue: ops must actually cancel/refund the Stripe
+    subscription or re-provision, then mark the row resolved via
+    /api/admin/checkout-provisioning-failures — this table only records the
+    fact and the detail, it does not decide or automate the recovery action.
+    """
+    __tablename__ = "checkout_provisioning_failures"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    stripe_customer_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)
+    stripe_subscription_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)
+    email: Mapped[Optional[str]] = mapped_column(String(255))
+    tier: Mapped[Optional[str]] = mapped_column(String(20))
+    vertical: Mapped[Optional[str]] = mapped_column(String(50))
+    county_id: Mapped[Optional[str]] = mapped_column(String(50))
+    requested_zips: Mapped[Optional[list]] = mapped_column(JSONB)
+    unclaimed_zips: Mapped[Optional[list]] = mapped_column(JSONB)
+    reason: Mapped[str] = mapped_column(String(50), nullable=False, default="zip_territory_unavailable")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="open")  # open | resolved
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    resolved_by: Mapped[Optional[str]] = mapped_column(String(100))
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+
+    __table_args__ = (
+        CheckConstraint("status IN ('open', 'resolved')", name="check_checkout_provisioning_status"),
+        Index("idx_checkout_provisioning_status", "status"),
+    )
+
+    def __repr__(self):
+        return f"<CheckoutProvisioningFailure(id={self.id}, status={self.status}, reason={self.reason})>"
 
 
 class ApiUsageLog(Base):
@@ -4005,6 +4108,43 @@ class AgentDecision(Base):
 
     def __repr__(self):
         return f"<AgentDecision(id={self.decision_id[:8]}, graph={self.graph_name}, status={self.terminal_status})>"
+
+
+class InboundResponse(Base):
+    """
+    Block 11 / B11-04 — one row per hot inbound call, tracking time-to-callback.
+
+    t0 = webhook_log.created_at (inbound call arrived), copied at score time.
+    t1 = callback resolution time, backfilled from agent_decisions.completed_at
+    (decision_id == this row's decision_id) once the shared new_lead_voice_call
+    graph run finishes — report-only optimization; no closed loop.
+    """
+    __tablename__ = "inbound_response"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("subscribers.id"), nullable=True, index=True
+    )
+    decision_id: Mapped[Optional[str]] = mapped_column(String(36), index=True)  # == call_id; join key to agent_decisions
+    t0: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    t1: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    score: Mapped[int] = mapped_column(Integer, nullable=False)
+    matched_signals: Mapped[Optional[list]] = mapped_column(JSONB)
+    outcome: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")  # pending|called|consent_blocked|dnc_blocked|failed
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "outcome IN ('pending', 'called', 'consent_blocked', 'dnc_blocked', 'failed')",
+            name="check_inbound_response_outcome",
+        ),
+        Index("idx_inbound_response_created_at", "created_at"),
+    )
+
+    def __repr__(self):
+        return f"<InboundResponse(id={self.id}, decision_id={self.decision_id}, outcome={self.outcome})>"
 
 
 class QuoraQuestion(Base):
@@ -5274,6 +5414,80 @@ class GoldPlusZipSnapshot(Base):
             f"<GoldPlusZipSnapshot(zip={self.zip_code}, county={self.county_id}, "
             f"date={self.snapshot_date}, count={self.gold_plus_lead_count})>"
         )
+
+
+class DealOfTheDay(Base):
+    """
+    T-B12-07 — Daily exclusive-unlock deal. One row per calendar date, picking
+    the top-CDS qualified lead not yet delivered (no sent_leads row anywhere,
+    never previously featured). 24h exclusive unlock window at STANDARD price
+    (scarcity mechanic, not a discount).
+    """
+    __tablename__ = "deal_of_the_day"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    date: Mapped[date] = mapped_column(Date, nullable=False, unique=True, index=True)
+    lead_id: Mapped[int] = mapped_column(ForeignKey("properties.id"), nullable=False, index=True)
+    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    window_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("date", name="uq_deal_of_the_day_date"),
+        Index("idx_deal_of_the_day_window", "window_start", "window_end"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<DealOfTheDay(date={self.date}, lead_id={self.lead_id})>"
+
+
+class WinbackOffer(Base):
+    """
+    T-B12-07 — Tier3 win-back redemption token.
+
+    Created when a tier3_winback reactivation message is SENT (not when it's
+    redeemed) so the outbound link can carry a token that, when it comes back
+    through checkout, proves this specific offer — not just "a message went
+    out" — is what triggers the promised benefit:
+      zip_held     — 50% off the return month (Stripe coupon applied at
+                      checkout session creation, gated on a valid token).
+      zip_released — 5 free credits, granted only when the checkout webhook
+                      redeems the token (i.e. the subscriber actually paid),
+                      never at send time.
+    One-time use: `redeemed_at` is set exactly once; a second redemption
+    attempt on the same token is a no-op.
+
+    `redeemed_at` and `credits_granted_at` are deliberately separate columns
+    (PR #172 review fix): the webhook's credit grant is a best-effort side
+    effect that can itself fail (wallet write error, transient DB issue).
+    If `redeemed_at` alone marked completion, a failed grant would still
+    look "done" — the token is spent and a webhook retry finds nothing left
+    to redeem, so the customer paid but never got their credits, with no
+    path to recover. Keeping the two separate lets a periodic reconciliation
+    sweep (`winback_offers.reconcile_pending_credit_grants`) find and retry
+    exactly the rows that redeemed successfully but never got credited.
+    """
+    __tablename__ = "winback_offers"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(ForeignKey("subscribers.id"), nullable=False, index=True)
+    branch: Mapped[str] = mapped_column(String(20), nullable=False)  # zip_held | zip_released
+    token: Mapped[str] = mapped_column(String(43), nullable=False, unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    redeemed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    credits_granted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("idx_winback_offers_subscriber_branch", "subscriber_id", "branch"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<WinbackOffer(subscriber_id={self.subscriber_id}, branch={self.branch}, redeemed={self.redeemed_at is not None})>"
 
 
 # ============================================================================
@@ -6727,7 +6941,8 @@ class ProspectEvent(Base):
             "'broker.transition',"
             "'sms.sent','sms.reply',"
             "'commission.posted',"
-            "'delivery.sent'"
+            "'delivery.sent',"
+            "'outcome.recorded'"
             ")",
             name="ck_events_event_type",
         ),
