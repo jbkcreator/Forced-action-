@@ -166,3 +166,34 @@ def test_page_data_meta_pixel_id_none_when_unset():
     data = _page_data(_cell(), _STATS, "live", settings, {}, 25)
 
     assert data["meta_pixel_id"] is None
+
+
+def test_page_data_cta_url_points_at_app_root_not_signup():
+    """/signup does not exist in the React router — CTA must target the app
+    root with utm params, not a 404."""
+    from src.tasks.seo_compiler import _page_data
+
+    settings = MagicMock()
+    settings.seo_site_base_url = "https://forcedactionleads.com"
+    settings.app_base_url = "https://app.forcedaction.io"
+    settings.meta_pixel_id = None
+
+    data = _page_data(_cell(vertical="wholesalers"), _STATS, "live", settings, {}, 25)
+
+    assert data["app_cta_url"] == (
+        "https://app.forcedaction.io/?utm_source=seo&utm_medium=organic&utm_campaign=wholesalers"
+    )
+    assert "/signup" not in data["app_cta_url"]
+
+
+def test_page_data_cta_url_strips_trailing_slash_on_base_url():
+    from src.tasks.seo_compiler import _page_data
+
+    settings = MagicMock()
+    settings.seo_site_base_url = "https://forcedactionleads.com"
+    settings.app_base_url = "https://app.forcedaction.io/"
+    settings.meta_pixel_id = None
+
+    data = _page_data(_cell(), _STATS, "live", settings, {}, 25)
+
+    assert data["app_cta_url"].startswith("https://app.forcedaction.io/?")

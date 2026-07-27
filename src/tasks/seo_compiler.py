@@ -174,6 +174,14 @@ def _page_data(
         # Client-side retargeting pixel — no-ops in the template if unset,
         # same gating as the frontend's VITE_META_PIXEL_ID (src/utils/metaPixel.js).
         "meta_pixel_id": settings.meta_pixel_id,
+        # CTA target — the app's root route (LandingPage), NOT /signup: the
+        # React router (Forced-action-ui/src/App.jsx) has no /signup route,
+        # so that link 404'd via the catch-all NotFoundPage. utm params keep
+        # attribution alive into LandingContext (which reads them from the URL).
+        "app_cta_url": (
+            f"{settings.app_base_url.rstrip('/')}/"
+            f"?utm_source=seo&utm_medium=organic&utm_campaign={cell.topic_slug}"
+        ),
     }
 
 
