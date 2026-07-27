@@ -75,6 +75,13 @@ BUDGET_BAND_OPTIONS = frozenset({"under_50k", "50k_150k", "150k_500k", "500k_plu
 class OnboardingRequest(BaseModel):
     preferred_property_type: str
     investment_budget_band: str
+    # Section 7.3 — the one optional referral ask: "who is one good
+    # contractor you know in a county we haven't opened yet?" All-or-nothing:
+    # either both name and county are given, or neither (company is the only
+    # truly optional piece within the referral itself).
+    referral_prospect_name: Optional[str] = None
+    referral_prospect_company: Optional[str] = None
+    referral_target_county_id: Optional[str] = None
 
     @model_validator(mode="after")
     def _valid_options(self):
@@ -82,6 +89,11 @@ class OnboardingRequest(BaseModel):
             raise ValueError(f"preferred_property_type must be one of {sorted(PROPERTY_TYPE_OPTIONS)}")
         if self.investment_budget_band not in BUDGET_BAND_OPTIONS:
             raise ValueError(f"investment_budget_band must be one of {sorted(BUDGET_BAND_OPTIONS)}")
+        if bool(self.referral_prospect_name) != bool(self.referral_target_county_id):
+            raise ValueError(
+                "referral_prospect_name and referral_target_county_id must be "
+                "given together, or both omitted"
+            )
         return self
 
 
@@ -235,6 +247,20 @@ def submit_onboarding(
 
     from src.services.activation_tracking import stamp_onboarding_completed
     stamp_onboarding_completed(subscriber.id, db)
+
+    if body.referral_prospect_name and body.referral_target_county_id:
+        from src.core.models import ReferralProspect
+        db.add(ReferralProspect(
+            referring_subscriber_id=subscriber.id,
+            prospect_name=body.referral_prospect_name,
+            prospect_company=body.referral_prospect_company,
+            target_county_id=body.referral_target_county_id,
+        ))
+        db.flush()
+        logger.info(
+            "[onboarding] referral prospect captured sub=%s target_county=%s",
+            subscriber.id, body.referral_target_county_id,
+        )
 
     logger.info("[onboarding] preferences captured for sub=%s", subscriber.id)
     return {"ok": True}
