@@ -1099,6 +1099,117 @@ class TestIntegrationHooks:
         )
         assert "sold_out_reactivation" in source
 
+    def test_mark_sold_out_losers_runs_only_after_webhook_commit(self):
+        """PR #175 review fix: mark_sold_out_losers commits its own session, so
+        it must never run inside the still-uncommitted checkout transaction —
+        a later rollback would leave the ZIP unlocked but the waitlist rows
+        permanently marked 'lost'. Verifies the call happens strictly after
+        handle_webhook's db.commit(), with the ZIPs _on_checkout_completed
+        queued via locked_zips_out."""
+        import src.services.stripe_webhooks as sw
+
+        order: list[str] = []
+        db = MagicMock()
+        db.execute.return_value.scalar_one_or_none.return_value = None  # no dedupe row yet
+        db.commit.side_effect = lambda: order.append("commit")
+
+        fake_event = {
+            "type": "checkout.session.completed",
+            "id": "evt_test_1",
+            "created": __import__("time").time(),
+            "data": {"object": {}},
+        }
+
+        def fake_checkout_handler(data, db, background_tasks=None, locked_zips_out=None):
+            if locked_zips_out is not None:
+                locked_zips_out.append(("33601", "roofing", "hillsborough"))
+
+        with (
+            patch("stripe.Webhook.construct_event", return_value=fake_event),
+            patch.object(sw, "_init_stripe", return_value=True),
+            patch.object(sw, "_on_checkout_completed", side_effect=fake_checkout_handler),
+            patch("src.services.webhook_log.log_webhook_event"),
+            patch.object(sw, "_mark_sold_out_losers_for",
+                         side_effect=lambda zips: order.append(("mark", tuple(zips)))) as mock_mark,
+        ):
+            with patch.object(type(sw.settings), "active_stripe_webhook_secret", new_callable=lambda: property(lambda self: MagicMock(get_secret_value=lambda: "whsec_test"))):
+                success, msg = sw.handle_webhook(b"{}", "sig", db)
+
+        assert success is True
+        assert order == ["commit", ("mark", (("33601", "roofing", "hillsborough"),))]
+        mock_mark.assert_called_once()
+
+    def test_mark_sold_out_losers_not_called_if_commit_fails(self):
+        """A DB failure during the dedupe-row commit must not still mark
+        waitlist losers — the ZIP lock in that same transaction never became
+        durable, so nothing should be marked."""
+        import src.services.stripe_webhooks as sw
+        from sqlalchemy.exc import OperationalError
+
+        db = MagicMock()
+        db.execute.return_value.scalar_one_or_none.return_value = None
+        db.commit.side_effect = OperationalError("stmt", {}, Exception("db gone"))
+
+        fake_event = {
+            "type": "checkout.session.completed",
+            "id": "evt_test_2",
+            "created": __import__("time").time(),
+            "data": {"object": {}},
+        }
+
+        def fake_checkout_handler(data, db, background_tasks=None, locked_zips_out=None):
+            if locked_zips_out is not None:
+                locked_zips_out.append(("33601", "roofing", "hillsborough"))
+
+        with (
+            patch("stripe.Webhook.construct_event", return_value=fake_event),
+            patch.object(sw, "_init_stripe", return_value=True),
+            patch.object(sw, "_on_checkout_completed", side_effect=fake_checkout_handler),
+            patch("src.services.webhook_log.log_webhook_event"),
+            patch.object(sw, "_mark_sold_out_losers_for") as mock_mark,
+        ):
+            with patch.object(type(sw.settings), "active_stripe_webhook_secret", new_callable=lambda: property(lambda self: MagicMock(get_secret_value=lambda: "whsec_test"))):
+                with pytest.raises(OperationalError):
+                    sw.handle_webhook(b"{}", "sig", db)
+
+        mock_mark.assert_not_called()
+
+    def test_mark_sold_out_losers_still_runs_on_dedupe_race_loss(self):
+        """Losing the dedupe-insert race means another listener already
+        committed this event's writes (including the ZIP lock) for real —
+        so marking losers is still correct even though THIS transaction
+        rolled back."""
+        import src.services.stripe_webhooks as sw
+
+        db = MagicMock()
+        db.execute.return_value.scalar_one_or_none.return_value = None
+        db.commit.side_effect = IntegrityError("stmt", {}, Exception("dup"))
+
+        fake_event = {
+            "type": "checkout.session.completed",
+            "id": "evt_test_3",
+            "created": __import__("time").time(),
+            "data": {"object": {}},
+        }
+
+        def fake_checkout_handler(data, db, background_tasks=None, locked_zips_out=None):
+            if locked_zips_out is not None:
+                locked_zips_out.append(("33601", "roofing", "hillsborough"))
+
+        with (
+            patch("stripe.Webhook.construct_event", return_value=fake_event),
+            patch.object(sw, "_init_stripe", return_value=True),
+            patch.object(sw, "_on_checkout_completed", side_effect=fake_checkout_handler),
+            patch("src.services.webhook_log.log_webhook_event"),
+            patch.object(sw, "_mark_sold_out_losers_for") as mock_mark,
+        ):
+            with patch.object(type(sw.settings), "active_stripe_webhook_secret", new_callable=lambda: property(lambda self: MagicMock(get_secret_value=lambda: "whsec_test"))):
+                success, msg = sw.handle_webhook(b"{}", "sig", db)
+
+        assert success is True
+        assert msg == "OK (lost dedupe race)"
+        mock_mark.assert_called_once_with([("33601", "roofing", "hillsborough")])
+
     def test_grace_expiry_reactivation_wrapped_in_try_except(self):
         """reactivate_for_zip call in grace_expiry should be non-fatal."""
         import inspect, ast, textwrap

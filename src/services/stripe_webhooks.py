@@ -160,6 +160,30 @@ def _fire_capi_for_pi(payment_intent, subscriber, source: str, event_id: str, db
         logger.warning("Meta CAPI %s purchase failed — non-fatal", source, exc_info=True)
 
 
+def _mark_sold_out_losers_for(locked_zips: list) -> None:
+    """Run mark_sold_out_losers for each (zip, vertical, county) tuple a
+    checkout locked — called only after the checkout's own transaction has
+    durably committed (see handle_webhook / _on_checkout_completed).
+
+    mark_sold_out_losers uses its own committing session and is a no-op when
+    there's nothing to mark, so this is safe to call for every ZIP regardless
+    of whether it ever had a waitlist. Non-fatal — a paying checkout must
+    never fail because post-commit waitlist bookkeeping errored.
+    """
+    if not locked_zips:
+        return
+    from src.tasks.sold_out_reactivation import mark_sold_out_losers
+    for zip_code, vertical, county_id in locked_zips:
+        try:
+            mark_sold_out_losers(zip_code, vertical, county_id)
+        except Exception:
+            logger.error(
+                "checkout.session.completed: mark_sold_out_losers failed for "
+                "%s/%s/%s — non-fatal, continuing", zip_code, vertical, county_id,
+                exc_info=True,
+            )
+
+
 def handle_webhook(raw_body: bytes, sig_header: str, db: Session, background_tasks=None) -> tuple[bool, str]:
     """
     Verify and dispatch a Stripe webhook event.
@@ -293,9 +317,10 @@ def handle_webhook(raw_body: bytes, sig_header: str, db: Session, background_tas
         logger.debug("Unhandled Stripe event type: %s", event_type)
         return True, "Ignored"
 
+    locked_zips: list = []
     try:
         if handler is _on_checkout_completed:
-            handler(data, db, background_tasks=background_tasks)
+            handler(data, db, background_tasks=background_tasks, locked_zips_out=locked_zips)
         else:
             handler(data, db)
         # Plant the dedupe row in the SAME transaction as the handler writes,
@@ -312,7 +337,15 @@ def handle_webhook(raw_body: bytes, sig_header: str, db: Session, background_tas
                 "Stripe event %s dedupe insert lost the race — handler still ran successfully",
                 event_id,
             )
+            # The ZIP locks landed for real (via the listener that won the
+            # race) even though THIS transaction rolled back — safe to mark
+            # losers now, same as the clean-commit path below.
+            _mark_sold_out_losers_for(locked_zips)
             return True, "OK (lost dedupe race)"
+        # Only now — after this transaction (ZIP locks included) is durably
+        # committed — is it safe to permanently mark waitlist losers. See the
+        # comment in _on_checkout_completed for why this can't run earlier.
+        _mark_sold_out_losers_for(locked_zips)
         return True, "OK"
     except (OperationalError, SQLAlchemyError):
         db.rollback()
@@ -328,7 +361,10 @@ def handle_webhook(raw_body: bytes, sig_header: str, db: Session, background_tas
 # 1. checkout.session.completed
 # ---------------------------------------------------------------------------
 
-def _on_checkout_completed(session: dict, db: Session, background_tasks=None) -> None:
+def _on_checkout_completed(
+    session: dict, db: Session, background_tasks=None,
+    locked_zips_out: Optional[list] = None,
+) -> None:
     """
     FAST PATH — synchronous, runs inside the webhook request's transaction.
     Must stay short: this is what blocks Stripe's ack, and it's the only part
@@ -891,20 +927,19 @@ def _on_checkout_completed(session: dict, db: Session, background_tasks=None) ->
     # from before this buyer claimed it. They were notified when a PRIOR
     # holder's grace period lapsed and this ZIP briefly opened; now that it's
     # locked again, mark those non-winners 'lost' so a future release doesn't
-    # re-notify a stale wave. mark_sold_out_losers uses its own session and is
-    # a no-op when there's nothing to mark, so this is safe to call for every
-    # ZIP regardless of whether it ever had a waitlist. Non-fatal — a paying
-    # checkout must never fail because waitlist bookkeeping errored.
-    from src.tasks.sold_out_reactivation import mark_sold_out_losers
-    for _zip_code in zip_codes:
-        try:
-            mark_sold_out_losers(_zip_code, vertical, county_id)
-        except Exception:
-            logger.error(
-                "checkout.session.completed: mark_sold_out_losers failed for "
-                "%s/%s/%s — non-fatal, continuing", _zip_code, vertical, county_id,
-                exc_info=True,
-            )
+    # re-notify a stale wave.
+    #
+    # mark_sold_out_losers commits its OWN session immediately — it must not
+    # run inside this still-uncommitted transaction. If this checkout later
+    # rolled back (e.g. a DB failure while committing the dedupe row in
+    # handle_webhook), the ZIP lock above would be undone but the waitlist
+    # rows would already be durably marked 'lost', permanently discarding a
+    # waitlist wave for a ZIP that's actually still available (PR #175 review).
+    # So we only collect which ZIPs were locked here; the caller
+    # (handle_webhook) runs mark_sold_out_losers after ITS commit succeeds.
+    if locked_zips_out is not None:
+        for _zip_code in zip_codes:
+            locked_zips_out.append((_zip_code, vertical, county_id))
 
     logger.info(
         "checkout.session.completed: fast path done — subscriber=%s tier=%s vertical=%s"
