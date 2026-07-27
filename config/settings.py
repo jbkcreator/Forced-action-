@@ -526,6 +526,20 @@ class AppSettings(BaseSettings):
 		description="Max overflow connections beyond pool_size"
 	)
 
+	# Vera (Agent Lane) — read-only audit role connection
+	vera_database_url: str = Field(
+		default="",
+		env="VERA_DATABASE_URL",
+		description="Read-only Postgres DSN for the Vera audit agent (vera_readonly role). "
+		"Empty until the role is provisioned via migrations/apply_vera_readonly_role.py."
+	)
+	vera_db_password: Optional[SecretStr] = Field(
+		default=None,
+		env="VERA_DB_PASSWORD",
+		description="Password to set on the vera_readonly role. Only read by "
+		"migrations/apply_vera_readonly_role.py at provisioning time; not used at runtime."
+	)
+
 	# County Launch Automation
 	county_launch_source_county: str = Field(default="hillsborough", env="COUNTY_LAUNCH_SOURCE_COUNTY")
 	county_launch_approvers: list = Field(default=[], env="COUNTY_LAUNCH_APPROVERS")
