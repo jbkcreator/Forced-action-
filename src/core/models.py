@@ -1361,6 +1361,41 @@ class Subscriber(Base):
         return f"<Subscriber(id={self.id}, email='{self.email}', tier='{self.tier}', founding={self.founding_member})>"
 
 
+class ActivationEvent(Base):
+    """
+    T-B12-05: 5-minute activation funnel timestamps, one row per subscriber.
+
+    signup_time mirrors Subscriber.created_at (stamped at row creation so it
+    survives even if Subscriber.created_at semantics ever change).
+    first_leads_shown_time is stamped the first time the free-tier dashboard
+    renders the 3-5 real scored leads (event_feed's no-locked-zip branch).
+    first_unlock_time is stamped the first time the subscriber unlocks any
+    lead's contact info (paid $4/hot-lead unlock or founder comp reveal) —
+    this is the activation event per the locked decision. Both are
+    set-once (COALESCE-style in code, never overwritten) so "time to first
+    value" and "time to activation" stay measurable against signup_time.
+    """
+    __tablename__ = "activation_events"
+
+    subscriber_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("subscribers.id"), primary_key=True
+    )
+    signup_time: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    first_leads_shown_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    first_unlock_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    def __repr__(self):
+        return (
+            f"<ActivationEvent(subscriber_id={self.subscriber_id}, "
+            f"shown={self.first_leads_shown_time}, unlocked={self.first_unlock_time})>"
+        )
+
+
 class ZipTerritory(Base):
     """
     ZIP code exclusivity per vertical per county.
@@ -3071,6 +3106,15 @@ class DealOutcome(Base):
     lead_source: Mapped[Optional[str]] = mapped_column(String(50))  # which signal drove the lead
     days_to_close: Mapped[Optional[int]] = mapped_column(Integer)
     pipeline_stage: Mapped[Optional[str]] = mapped_column(String(30))  # lead / contacted / qualified / proposal / negotiation / closed_won / closed_lost
+    # T-B13-01 — one-tap buyer outcome on the delivered-lead card.
+    # outcome_state is the buyer-facing tap (closed/dead/pending); pipeline_stage
+    # is the derived stage kept for existing consumers. dead_reason is REQUIRED
+    # when outcome_state='dead' (enforced at the API, mirrored by a check
+    # constraint). reason_fault_class splits dead reasons into lead_fault (feeds
+    # the CDS retune) vs buyer_neutral (score-protected, buyer-side log only).
+    outcome_state: Mapped[Optional[str]] = mapped_column(String(10))  # closed / dead / pending
+    dead_reason: Mapped[Optional[str]] = mapped_column(String(30))
+    reason_fault_class: Mapped[Optional[str]] = mapped_column(String(15))  # lead_fault / buyer_neutral
     # fa056 — Stage 10 pricing cohort activation gate columns
     county_id: Mapped[Optional[str]] = mapped_column(String(50))
     trade_vertical: Mapped[Optional[str]] = mapped_column(String(50))
@@ -3091,6 +3135,20 @@ class DealOutcome(Base):
             name="ck_deal_outcomes_confidence_tier",
         ),
         Index("idx_deal_outcome_pipeline_stage", "pipeline_stage"),
+        # T-B13-01 — buyer outcome tap constraints + retune-routing index.
+        CheckConstraint(
+            "outcome_state IS NULL OR outcome_state IN ('closed','dead','pending')",
+            name="ck_deal_outcomes_outcome_state",
+        ),
+        CheckConstraint(
+            "reason_fault_class IS NULL OR reason_fault_class IN ('lead_fault','buyer_neutral')",
+            name="ck_deal_outcomes_reason_fault_class",
+        ),
+        CheckConstraint(
+            "outcome_state <> 'dead' OR dead_reason IS NOT NULL",
+            name="ck_deal_outcomes_dead_requires_reason",
+        ),
+        Index("idx_deal_outcomes_fault_class", "reason_fault_class"),
         Index("idx_deal_outcomes_county_vertical", "county_id", "trade_vertical"),
         Index("idx_deal_outcomes_confidence_tier", "confidence_tier"),
         Index(
@@ -3276,6 +3334,11 @@ class ReferralEvent(Base):
     # referral_prompt_funnel row that drove the conversion. Plain int (the funnel
     # table is raw-SQL, not an ORM model), nullable for organic/reactive signups.
     prompt_funnel_id: Mapped[Optional[int]] = mapped_column(Integer)
+    # T-B12-06: attribution marker distinguishing where the referral ask
+    # originated. 'generic' = the standard referral link; 'investor_to_investor'
+    # = the Tier-3-gated "invite a fellow investor" ask. No reward-ladder impact
+    # (rewards are unchanged) — this exists purely for attribution/reporting.
+    referral_source: Mapped[str] = mapped_column(String(30), nullable=False, default="generic", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
 
@@ -5353,6 +5416,80 @@ class GoldPlusZipSnapshot(Base):
         )
 
 
+class DealOfTheDay(Base):
+    """
+    T-B12-07 — Daily exclusive-unlock deal. One row per calendar date, picking
+    the top-CDS qualified lead not yet delivered (no sent_leads row anywhere,
+    never previously featured). 24h exclusive unlock window at STANDARD price
+    (scarcity mechanic, not a discount).
+    """
+    __tablename__ = "deal_of_the_day"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    date: Mapped[date] = mapped_column(Date, nullable=False, unique=True, index=True)
+    lead_id: Mapped[int] = mapped_column(ForeignKey("properties.id"), nullable=False, index=True)
+    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    window_end: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("date", name="uq_deal_of_the_day_date"),
+        Index("idx_deal_of_the_day_window", "window_start", "window_end"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<DealOfTheDay(date={self.date}, lead_id={self.lead_id})>"
+
+
+class WinbackOffer(Base):
+    """
+    T-B12-07 — Tier3 win-back redemption token.
+
+    Created when a tier3_winback reactivation message is SENT (not when it's
+    redeemed) so the outbound link can carry a token that, when it comes back
+    through checkout, proves this specific offer — not just "a message went
+    out" — is what triggers the promised benefit:
+      zip_held     — 50% off the return month (Stripe coupon applied at
+                      checkout session creation, gated on a valid token).
+      zip_released — 5 free credits, granted only when the checkout webhook
+                      redeems the token (i.e. the subscriber actually paid),
+                      never at send time.
+    One-time use: `redeemed_at` is set exactly once; a second redemption
+    attempt on the same token is a no-op.
+
+    `redeemed_at` and `credits_granted_at` are deliberately separate columns
+    (PR #172 review fix): the webhook's credit grant is a best-effort side
+    effect that can itself fail (wallet write error, transient DB issue).
+    If `redeemed_at` alone marked completion, a failed grant would still
+    look "done" — the token is spent and a webhook retry finds nothing left
+    to redeem, so the customer paid but never got their credits, with no
+    path to recover. Keeping the two separate lets a periodic reconciliation
+    sweep (`winback_offers.reconcile_pending_credit_grants`) find and retry
+    exactly the rows that redeemed successfully but never got credited.
+    """
+    __tablename__ = "winback_offers"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    subscriber_id: Mapped[int] = mapped_column(ForeignKey("subscribers.id"), nullable=False, index=True)
+    branch: Mapped[str] = mapped_column(String(20), nullable=False)  # zip_held | zip_released
+    token: Mapped[str] = mapped_column(String(43), nullable=False, unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    redeemed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    credits_granted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("idx_winback_offers_subscriber_branch", "subscriber_id", "branch"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<WinbackOffer(subscriber_id={self.subscriber_id}, branch={self.branch}, redeemed={self.redeemed_at is not None})>"
+
+
 # ============================================================================
 # HCPA ENRICHMENT — TAX PAYMENT HISTORY
 # ============================================================================
@@ -6804,7 +6941,8 @@ class ProspectEvent(Base):
             "'broker.transition',"
             "'sms.sent','sms.reply',"
             "'commission.posted',"
-            "'delivery.sent'"
+            "'delivery.sent',"
+            "'outcome.recorded'"
             ")",
             name="ck_events_event_type",
         ),
@@ -8081,3 +8219,87 @@ class RelayApprovalQueueItem(Base):
             f"<RelayApprovalQueueItem(id={self.id}, status={self.status}, "
             f"channel={self.channel})>"
         )
+
+
+class VeraFact(Base):
+    """Vera's facts store — the fleet's single source of verified truth.
+
+    Append-only: a fact is never updated in place, only re-verified with a
+    new row (observed_at DESC gives the current value; older rows are
+    history). Freshness is computed at read time from freshness_class +
+    observed_at rather than expired by a background job — an expired fact
+    reads as "unknown because stale" per Vera's constitution, it isn't
+    deleted.
+
+    Vera is the only writer, and only to this table (Agent Lane v2.2 Part 2 —
+    her immutable core is permanently read-only on every business table; the
+    facts directory is her one designated write target). Written through the
+    normal app DB role, never through vera_readonly (which holds no write
+    grants anywhere, including this table) — see
+    docs/agent-lane-data-access-matrix.md.
+    """
+    __tablename__ = "vera_facts"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    fact_key: Mapped[str] = mapped_column(String(120), nullable=False)
+    fact_value: Mapped[str] = mapped_column(Text, nullable=False)
+    value_numeric: Mapped[Optional[Decimal]] = mapped_column(Numeric, nullable=True)
+    county_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    source: Mapped[str] = mapped_column(String(60), nullable=False)
+    method: Mapped[str] = mapped_column(Text, nullable=False)
+    freshness_class: Mapped[str] = mapped_column(String(20), nullable=False)
+    confidence: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+
+    __table_args__ = (
+        Index("ix_vera_facts_key_observed", "fact_key", text("observed_at DESC")),
+        Index("ix_vera_facts_county", "county_id", postgresql_where=text("county_id IS NOT NULL")),
+    )
+
+    def __repr__(self) -> str:
+        return f"<VeraFact(key={self.fact_key!r}, source={self.source!r}, observed_at={self.observed_at})>"
+
+
+class VeraPromise(Base):
+    """Open commitments Vera tracks (Constitution standing job #3, VERA-v2.2 V4).
+
+    Unlike VeraFact (append-only), a promise is MUTABLE: status flips
+    open -> closed/cancelled and closed_at is stamped when it resolves. Vera
+    writes this via the normal app DB role (like vera_facts) — vera_readonly
+    holds no write grants anywhere. The single writer is
+    src/agents/vera/promises.py:record_promise(); Phase 2's reply-forwarding
+    parser will call that same function unchanged. Nothing else writes here.
+    """
+    __tablename__ = "vera_promises"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    thread_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    owner: Mapped[str] = mapped_column(String(120), nullable=False)
+    source: Mapped[str] = mapped_column(String(60), nullable=False)
+    mrr_at_risk_cents: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="open")
+    due_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+    closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+
+    __table_args__ = (
+        Index("ix_vera_promises_status_due", "status", "due_at"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<VeraPromise(id={self.id}, owner={self.owner!r}, status={self.status!r})>"

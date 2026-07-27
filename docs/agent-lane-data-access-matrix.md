@@ -1,22 +1,21 @@
-# Agent Lane — Data Access Matrix
+# Agent Lane — Data-Access Matrix
 
-One-page reference: which DB role each Agent Lane component reads/writes,
-and which tables. Per build spec §1.1.12 ("Data-access matrix, structurally
-enforced ... a one-page table in the repo").
+Per Agent Lane v2.2 §1.1.12 ("Data-access matrix, structurally enforced ... a
+one-page table in the repo"). One row per agent-facing DB role. Updated by
+whoever ships that role's provisioning migration — append, don't restructure.
 
-**Note on this file's history:** this file was created fresh on the RELAY
-task branch (`feature/relay-v2.2-execution-service`) because VERA's own
-version of this file (added on `feature/vera-v2.2-truth-verification-agent`)
-is not yet merged into `dev` at the time RELAY started. Per the dev split's
-own guidance (§6b: "whoever finishes their DB-role subtask first ... should
-start the doc; whoever picks up the other adds their row"), RELAY started
-it here. When Vera's branch merges, this file will need a small manual
-merge to combine both components' rows — expected, not an error.
+| Agent | DB role | Read | Write | Provisioned by |
+|---|---|---|---|---|
+| Vera | `vera_readonly` | SELECT on all tables/sequences, schema `public` (incl. future tables via default privileges) | **None, anywhere** — no INSERT/UPDATE/DELETE/DDL grants; session-level `default_transaction_read_only=on` as a second, independent guard | `migrations/apply_vera_readonly_role.py` |
+| Vera (facts writer) | app role (`DATABASE_URL`) | n/a (write-only path) | `vera_facts` only — the one table Vera's code ever writes to, via `src.agents.vera.facts.write_fact()` | `migrations/apply_vera_facts.py` |
+| Hunter | *(not yet provisioned)* | — | — | HUNTER-01, when built |
+| Relay | Normal app DB role (`src.core.database.get_db_context`) — no dedicated read-only role, unlike Vera | `relay_approval_queue` (its own table); suppression tables at R3 (`EmailOptOut`, `SmsOptOut`, `CoraSuppression`, `DncPhoneCheck`) | `relay_approval_queue` only | `migrations/apply_relay_approval_queue.py` |
 
-| Component | DB role | Reads | Writes |
-|---|---|---|---|
-| **Relay** (RELAY-v2.2 R1) | Normal app DB role (`src.core.database.get_db_context`) — no dedicated read-only role, unlike Vera | `relay_approval_queue` (its own table); suppression tables at R3 (`EmailOptOut`, `SmsOptOut`, `CoraSuppression`, `DncPhoneCheck`) | `relay_approval_queue` only |
-| **Vera** (VERA-v2.2, separate branch — not yet merged) | `vera_readonly` (SELECT-only across all tables) for checks; normal app role for the one designated write target | Everything (read-only) | `vera_facts`, `vera_promises` only |
+**Enforcement note:** Vera's two rows are deliberately separate roles, not
+one role with mixed grants — a bug in Vera's read-path code cannot reach a
+write grant that doesn't exist on that connection, and the fact-write path
+is scoped to exactly one table regardless of what the read connection can
+see.
 
 ## Relay's table
 
@@ -30,7 +29,7 @@ merge to combine both components' rows — expected, not an error.
 
 ## Adding a row
 
-Whichever Agent Lane component's DB-role subtask lands next (Hunter, or
-Vera once merged) adds its own row to the table above. Do not remove or
-restructure existing rows without confirming with whoever owns that
+Whichever Agent Lane component's DB-role subtask lands next (Hunter) adds
+its own row to the table above, following the same format. Do not remove
+or restructure existing rows without confirming with whoever owns that
 component's branch.

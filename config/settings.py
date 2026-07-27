@@ -191,6 +191,11 @@ class AppSettings(BaseSettings):
 	# Referral Core Loop
 	referral_free_month_coupon_id: Optional[str] = Field(default=None, env="REFERRAL_FREE_MONTH_COUPON_ID")
 
+	# T-B12-07: Tier3 win-back zip_held offer — 50% off the return month.
+	# Applied as a Stripe coupon at checkout session creation when a valid
+	# winback_offers token accompanies the request (PR #172 review fix).
+	winback_50_off_coupon_id: Optional[str] = Field(default=None, env="WINBACK_50_OFF_COUPON_ID")
+
 	# Stage 12: Bankruptcy Filing Alert product ($297/mo). Shares the common
 	# Stripe webhook endpoint + signing secret (active_stripe_webhook_secret) —
 	# events are routed by product in stripe_webhooks.handle_webhook.
@@ -535,6 +540,20 @@ class AppSettings(BaseSettings):
 		description="Max overflow connections beyond pool_size"
 	)
 
+	# Vera (Agent Lane) — read-only audit role connection
+	vera_database_url: str = Field(
+		default="",
+		env="VERA_DATABASE_URL",
+		description="Read-only Postgres DSN for the Vera audit agent (vera_readonly role). "
+		"Empty until the role is provisioned via migrations/apply_vera_readonly_role.py."
+	)
+	vera_db_password: Optional[SecretStr] = Field(
+		default=None,
+		env="VERA_DB_PASSWORD",
+		description="Password to set on the vera_readonly role. Only read by "
+		"migrations/apply_vera_readonly_role.py at provisioning time; not used at runtime."
+	)
+
 	# County Launch Automation
 	county_launch_source_county: str = Field(default="hillsborough", env="COUNTY_LAUNCH_SOURCE_COUNTY")
 	county_launch_approvers: list = Field(default=[], env="COUNTY_LAUNCH_APPROVERS")
@@ -647,7 +666,7 @@ class AppSettings(BaseSettings):
 	# integration was dropped — unsupported for content pages, was a dead stub.
 	seo_eligibility_floor: int = Field(default=25, env="SEO_ELIGIBILITY_FLOOR")
 	seo_output_dir: str = Field(default="dist/seo/florida", env="SEO_OUTPUT_DIR")
-	seo_site_base_url: str = Field(default="https://www.forcedaction.com", env="SEO_SITE_BASE_URL")
+	seo_site_base_url: str = Field(default="https://forcedactionleads.com", env="SEO_SITE_BASE_URL")
 	seo_retire_hysteresis_runs: int = Field(default=2, env="SEO_RETIRE_HYSTERESIS_RUNS")
 
 
