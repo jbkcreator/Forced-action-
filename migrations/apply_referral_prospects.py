@@ -36,6 +36,15 @@ INDEXES = [
     "ON referral_prospects (target_county_id)",
 ]
 
+# One row per (subscriber, county) — a retried/resubmitted onboarding PATCH
+# updates the existing row instead of stacking duplicate prospects.
+CONSTRAINT_NAME = "uq_referral_prospects_subscriber_county"
+ADD_UNIQUE_CONSTRAINT = f"""
+ALTER TABLE referral_prospects
+ADD CONSTRAINT {CONSTRAINT_NAME}
+UNIQUE (referring_subscriber_id, target_county_id)
+"""
+
 
 def main() -> None:
     db = Database()
@@ -43,6 +52,9 @@ def main() -> None:
         s.execute(text(DDL))
         for stmt in INDEXES:
             s.execute(text(stmt))
+        # ADD CONSTRAINT has no IF NOT EXISTS — drop-then-add keeps it idempotent.
+        s.execute(text(f"ALTER TABLE referral_prospects DROP CONSTRAINT IF EXISTS {CONSTRAINT_NAME}"))
+        s.execute(text(ADD_UNIQUE_CONSTRAINT))
     logger.info("referral_prospects table applied.")
 
 

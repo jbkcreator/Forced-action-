@@ -5296,6 +5296,10 @@ class ReferralProspect(Base):
     This is a lightweight lead list, not a notify-on-launch subscription —
     "so when a county launches, its first outreach list already exists"
     means ops pulls these rows for that county, not an automated SMS/email.
+
+    One row per (referring_subscriber_id, target_county_id): a subscriber
+    referring the same county twice (retry, resubmit) updates the existing
+    row rather than stacking duplicates — see submit_onboarding's upsert.
     """
     __tablename__ = "referral_prospects"
 
@@ -5308,6 +5312,13 @@ class ReferralProspect(Base):
     target_county_id: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "referring_subscriber_id", "target_county_id",
+            name="uq_referral_prospects_subscriber_county",
+        ),
     )
 
     def __repr__(self) -> str:

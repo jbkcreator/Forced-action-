@@ -4,6 +4,18 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
+def _eligible_county_db_responses(existing_prospect=None):
+    """db.execute side_effect sequence for a referral county that passes
+    both eligibility checks: (1) not already launched, (2) a known
+    not-yet-launched expansion candidate. Third call is the existing-row
+    lookup for the upsert — None inserts, a MagicMock updates it."""
+    return [
+        MagicMock(**{"scalar_one_or_none.return_value": None}),      # not in counties table
+        MagicMock(**{"scalar_one_or_none.return_value": "queued"}),  # eligible expansion candidate
+        MagicMock(**{"scalar_one_or_none.return_value": existing_prospect}),  # existing ReferralProspect?
+    ]
+
+
 class TestOnboardingRequestValidation:
     def test_valid_options_accepted(self):
         from src.api.subscriber_router import OnboardingRequest
@@ -118,12 +130,14 @@ class TestSubmitOnboardingEndpoint:
 
     def test_patch_creates_referral_prospect_when_given(self, mock_db):
         """Section 7.3: submitting name + county writes a ReferralProspect
-        attached to the referring subscriber."""
+        attached to the referring subscriber, once the county passes the
+        eligibility checks (not launched, is a known upcoming candidate)."""
         from fastapi.testclient import TestClient
         from src.api.main import app, get_db
         from src.services.subscriber_auth import get_current_subscriber
 
         subscriber = MagicMock(id=7, onboarding_completed=False)
+        mock_db.execute.side_effect = _eligible_county_db_responses()
 
         app.dependency_overrides[get_db] = lambda: mock_db
         app.dependency_overrides[get_current_subscriber] = lambda: subscriber
@@ -151,6 +165,142 @@ class TestSubmitOnboardingEndpoint:
         assert added.prospect_name == "Dana Roofing"
         assert added.prospect_company == "Dana Roofing LLC"
         assert added.target_county_id == "polk"
+
+    def test_patch_referral_updates_existing_row_not_duplicate(self, mock_db):
+        """PR #178 review fix: a retried/resubmitted PATCH for the same
+        (subscriber, county) must update the existing row, not insert a
+        second one."""
+        from fastapi.testclient import TestClient
+        from src.api.main import app, get_db
+        from src.services.subscriber_auth import get_current_subscriber
+
+        subscriber = MagicMock(id=7, onboarding_completed=False)
+        existing_row = MagicMock()
+        mock_db.execute.side_effect = _eligible_county_db_responses(existing_prospect=existing_row)
+
+        app.dependency_overrides[get_db] = lambda: mock_db
+        app.dependency_overrides[get_current_subscriber] = lambda: subscriber
+        try:
+            client = TestClient(app)
+            with patch("src.services.activation_tracking.stamp_onboarding_completed"):
+                resp = client.patch(
+                    "/api/subscriber/onboarding/feed-uuid-abc",
+                    json={
+                        "preferred_property_type": "multi_family",
+                        "investment_budget_band": "150k_500k",
+                        "referral_prospect_name": "Dana Roofing Updated",
+                        "referral_target_county_id": "polk",
+                    },
+                )
+        finally:
+            app.dependency_overrides.pop(get_db, None)
+            app.dependency_overrides.pop(get_current_subscriber, None)
+
+        assert resp.status_code == 200
+        mock_db.add.assert_not_called()
+        assert existing_row.prospect_name == "Dana Roofing Updated"
+
+    def test_patch_referral_rejects_already_launched_county(self, mock_db):
+        """PR #178 review fix: a county that already has an active County row
+        must be rejected — the ask is for counties not yet opened."""
+        from fastapi.testclient import TestClient
+        from src.api.main import app, get_db
+        from src.services.subscriber_auth import get_current_subscriber
+
+        subscriber = MagicMock(id=7, onboarding_completed=False)
+        mock_db.execute.side_effect = [MagicMock(**{"scalar_one_or_none.return_value": 1})]
+
+        app.dependency_overrides[get_db] = lambda: mock_db
+        app.dependency_overrides[get_current_subscriber] = lambda: subscriber
+        try:
+            client = TestClient(app)
+            with patch("src.services.activation_tracking.stamp_onboarding_completed"):
+                resp = client.patch(
+                "/api/subscriber/onboarding/feed-uuid-abc",
+                json={
+                    "preferred_property_type": "multi_family",
+                    "investment_budget_band": "150k_500k",
+                    "referral_prospect_name": "Dana Roofing",
+                    "referral_target_county_id": "hillsborough",
+                },
+            )
+        finally:
+            app.dependency_overrides.pop(get_db, None)
+            app.dependency_overrides.pop(get_current_subscriber, None)
+
+        assert resp.status_code == 422
+        assert resp.json()["detail"]["error"] == "county_already_launched"
+        mock_db.add.assert_not_called()
+
+    def test_patch_referral_rejects_unknown_county(self, mock_db):
+        """PR #178 review fix: a county with no expansion_candidates row at
+        all (typo, made-up name) must be rejected, not silently stored."""
+        from fastapi.testclient import TestClient
+        from src.api.main import app, get_db
+        from src.services.subscriber_auth import get_current_subscriber
+
+        subscriber = MagicMock(id=7, onboarding_completed=False)
+        mock_db.execute.side_effect = [
+            MagicMock(**{"scalar_one_or_none.return_value": None}),   # not launched
+            MagicMock(**{"scalar_one_or_none.return_value": None}),   # no expansion_candidates row
+        ]
+
+        app.dependency_overrides[get_db] = lambda: mock_db
+        app.dependency_overrides[get_current_subscriber] = lambda: subscriber
+        try:
+            client = TestClient(app)
+            with patch("src.services.activation_tracking.stamp_onboarding_completed"):
+                resp = client.patch(
+                "/api/subscriber/onboarding/feed-uuid-abc",
+                json={
+                    "preferred_property_type": "multi_family",
+                    "investment_budget_band": "150k_500k",
+                    "referral_prospect_name": "Dana Roofing",
+                    "referral_target_county_id": "not_a_real_county",
+                },
+            )
+        finally:
+            app.dependency_overrides.pop(get_db, None)
+            app.dependency_overrides.pop(get_current_subscriber, None)
+
+        assert resp.status_code == 422
+        assert resp.json()["detail"]["error"] == "unknown_county"
+        mock_db.add.assert_not_called()
+
+    def test_patch_referral_rejects_already_launched_status_county(self, mock_db):
+        """An expansion_candidates row stuck at status='launched' must also
+        be rejected, not just a missing row."""
+        from fastapi.testclient import TestClient
+        from src.api.main import app, get_db
+        from src.services.subscriber_auth import get_current_subscriber
+
+        subscriber = MagicMock(id=7, onboarding_completed=False)
+        mock_db.execute.side_effect = [
+            MagicMock(**{"scalar_one_or_none.return_value": None}),          # not in counties table
+            MagicMock(**{"scalar_one_or_none.return_value": "launched"}),    # candidate already launched
+        ]
+
+        app.dependency_overrides[get_db] = lambda: mock_db
+        app.dependency_overrides[get_current_subscriber] = lambda: subscriber
+        try:
+            client = TestClient(app)
+            with patch("src.services.activation_tracking.stamp_onboarding_completed"):
+                resp = client.patch(
+                "/api/subscriber/onboarding/feed-uuid-abc",
+                json={
+                    "preferred_property_type": "multi_family",
+                    "investment_budget_band": "150k_500k",
+                    "referral_prospect_name": "Dana Roofing",
+                    "referral_target_county_id": "polk",
+                },
+            )
+        finally:
+            app.dependency_overrides.pop(get_db, None)
+            app.dependency_overrides.pop(get_current_subscriber, None)
+
+        assert resp.status_code == 422
+        assert resp.json()["detail"]["error"] == "unknown_county"
+        mock_db.add.assert_not_called()
 
     def test_patch_no_referral_prospect_when_omitted(self, mock_db):
         """No referral fields submitted → no ReferralProspect row created."""
@@ -183,6 +333,7 @@ class TestSubmitOnboardingEndpoint:
         from src.services.subscriber_auth import get_current_subscriber
 
         subscriber = MagicMock(id=7, onboarding_completed=False)
+        mock_db.execute.side_effect = _eligible_county_db_responses()
 
         app.dependency_overrides[get_db] = lambda: mock_db
         app.dependency_overrides[get_current_subscriber] = lambda: subscriber

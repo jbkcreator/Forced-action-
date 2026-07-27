@@ -230,6 +230,76 @@ def verify_magic_link(body: MagicLinkVerifyRequest, request: Request, db=Depends
     }
 
 
+def _reject_if_ineligible_referral_county(db, county_id: str) -> None:
+    """Section 7.3 must only accept a county "we haven't opened yet" — reject
+    a typo/unknown county, and reject one that's already launched (a County
+    row exists for it). Eligible = present in expansion_candidates and not
+    yet launched (queued/approved/launching)."""
+    from src.core.models import County, ExpansionCandidate
+
+    already_launched = db.execute(
+        select(County.id).where(County.county_id == county_id)
+    ).scalar_one_or_none()
+    if already_launched is not None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "county_already_launched",
+                "message": f"{county_id} is already launched — the referral ask is for counties we haven't opened yet.",
+            },
+        )
+
+    candidate_status = db.execute(
+        select(ExpansionCandidate.status).where(ExpansionCandidate.county_id == county_id)
+    ).scalar_one_or_none()
+    if candidate_status not in ("queued", "approved", "launching"):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "unknown_county",
+                "message": f"{county_id} is not a recognized upcoming county.",
+            },
+        )
+
+
+def _upsert_referral_prospect(db, subscriber_id: int, body: "OnboardingRequest") -> None:
+    """One row per (subscriber, county) — a retried/resubmitted onboarding
+    PATCH updates the existing row instead of stacking duplicate prospects
+    (uq_referral_prospects_subscriber_county)."""
+    from src.core.models import ReferralProspect
+
+    _reject_if_ineligible_referral_county(db, body.referral_target_county_id)
+
+    existing = db.execute(
+        select(ReferralProspect).where(
+            ReferralProspect.referring_subscriber_id == subscriber_id,
+            ReferralProspect.target_county_id == body.referral_target_county_id,
+        )
+    ).scalar_one_or_none()
+
+    if existing is not None:
+        existing.prospect_name = body.referral_prospect_name
+        existing.prospect_company = body.referral_prospect_company
+        db.flush()
+        logger.info(
+            "[onboarding] referral prospect updated sub=%s target_county=%s",
+            subscriber_id, body.referral_target_county_id,
+        )
+        return
+
+    db.add(ReferralProspect(
+        referring_subscriber_id=subscriber_id,
+        prospect_name=body.referral_prospect_name,
+        prospect_company=body.referral_prospect_company,
+        target_county_id=body.referral_target_county_id,
+    ))
+    db.flush()
+    logger.info(
+        "[onboarding] referral prospect captured sub=%s target_county=%s",
+        subscriber_id, body.referral_target_county_id,
+    )
+
+
 @router.patch("/onboarding/{feed_uuid}")
 def submit_onboarding(
     feed_uuid: str,
@@ -249,18 +319,7 @@ def submit_onboarding(
     stamp_onboarding_completed(subscriber.id, db)
 
     if body.referral_prospect_name and body.referral_target_county_id:
-        from src.core.models import ReferralProspect
-        db.add(ReferralProspect(
-            referring_subscriber_id=subscriber.id,
-            prospect_name=body.referral_prospect_name,
-            prospect_company=body.referral_prospect_company,
-            target_county_id=body.referral_target_county_id,
-        ))
-        db.flush()
-        logger.info(
-            "[onboarding] referral prospect captured sub=%s target_county=%s",
-            subscriber.id, body.referral_target_county_id,
-        )
+        _upsert_referral_prospect(db, subscriber.id, body)
 
     logger.info("[onboarding] preferences captured for sub=%s", subscriber.id)
     return {"ok": True}
