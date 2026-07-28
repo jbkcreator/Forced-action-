@@ -2276,6 +2276,27 @@ def _on_subscription_deleted(subscription: dict, db: Session) -> None:
         )
 
     try:
+        from src.services.fleet_event_bus import PRIORITY_URGENT, emit_fleet_event
+        emit_fleet_event(
+            db,
+            event_type="subscription.cancelled",
+            source_component="stripe_webhooks",
+            priority=PRIORITY_URGENT,
+            subscriber_id=subscriber.id,
+            payload={
+                "stripe_customer_id": stripe_customer_id,
+                "stripe_subscription_id": subscription.get("id"),
+                "churn_tag": churn_tag,
+            },
+        )
+    except Exception:
+        logger.warning(
+            "fleet event emit failed for subscription.cancelled subscriber=%s",
+            subscriber.id,
+            exc_info=True,
+        )
+
+    try:
         from src.services.subscriber_memory import append_memory_event
         append_memory_event(
             db,
