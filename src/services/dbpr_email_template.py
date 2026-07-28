@@ -9,7 +9,7 @@ page with source attribution pre-filled.
 
 from urllib.parse import urlencode
 from config.settings import get_settings
-from src.services.email_unsubscribe import mint_unsubscribe_token
+from src.services.email_unsubscribe import unsubscribe_url
 
 # ---------------------------------------------------------------------------
 # Vertical-specific copy
@@ -74,13 +74,6 @@ def _signup_url(email: str, vertical: str, county_id: str) -> str:
         "utm_campaign": "contractor_outreach",
     })
     return f"{base}/signup?{params}"
-
-
-def unsubscribe_url(email: str) -> str:
-    settings = get_settings()
-    base = (settings.app_base_url or "https://app.forcedaction.io").rstrip("/")
-    token = mint_unsubscribe_token(email)
-    return f"{base}/api/email/unsubscribe?token={token}"
 
 
 # ---------------------------------------------------------------------------

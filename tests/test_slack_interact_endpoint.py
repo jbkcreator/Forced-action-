@@ -43,19 +43,27 @@ def _make_payload(user_id: str, candidate_id: int, action: str) -> dict:
 
 @pytest.fixture
 def app_and_client(monkeypatch):
+    # Patches src.api.admin_router's own imported 'settings' name, not
+    # config.settings.settings directly — test_instantly_service.py's
+    # reload(config.settings) calls elsewhere in the session rebind
+    # config.settings.settings to a brand-new object each time, which
+    # desyncs from whatever object admin_router.py already captured via
+    # `from config.settings import settings` at its own first import.
+    # Patching admin_router's binding directly is immune to that (see the
+    # 2026-07-24 impl-audit fix that surfaced this via test_relay_slack_endpoints.py).
     monkeypatch.setattr(
-        "config.settings.settings.slack_signing_secret",
+        "src.api.admin_router.settings.slack_signing_secret",
         MagicMock(get_secret_value=lambda: "test-signing-secret"),
     )
     monkeypatch.setattr(
-        "config.settings.settings.county_launch_approvers",
+        "src.api.admin_router.settings.county_launch_approvers",
         ["U_APPROVER"],
     )
     monkeypatch.setattr(
-        "config.settings.settings.slack_bot_token",
+        "src.api.admin_router.settings.slack_bot_token",
         MagicMock(get_secret_value=lambda: "xoxb-test"),
     )
-    monkeypatch.setattr("config.settings.settings.county_launch_slack_channel", "#expansion")
+    monkeypatch.setattr("src.api.admin_router.settings.county_launch_slack_channel", "#expansion")
 
     from src.api.main import app
     return app, TestClient(app)

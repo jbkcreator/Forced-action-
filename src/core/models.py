@@ -8208,6 +8208,69 @@ class ScoringCutoverLog(Base):
         )
 
 
+class RelayApprovalQueueItem(Base):
+    """One proposed outreach action awaiting (or past) Josh's approval
+    (RELAY-v2.2 sub-task R1).
+
+    This table IS "Josh's queue": Cora (Phase 2) will write ``pending`` rows
+    here; R1 seeds rows directly (``python -m src.services.relay --seed``)
+    to build/prove the engine now — same schema, zero change when Cora
+    lands. A pending row is posted to Slack as an interactive
+    approve/reject message; the button press (signature-verified webhook)
+    flips status to ``approved``/``rejected``. The Relay cron sweep then
+    reads ``approved`` rows as a batch and executes them.
+
+    ``idempotency_key`` is UNIQUE — the no-double-send guarantee: a retry,
+    a crash-resume, or the sweep re-selecting an already-dispatched row is
+    a no-op, and the row is marked ``skipped``, never re-sent. R1 writes
+    this row throughout its lifecycle; R4 reuses the same row as the
+    Action Completion Receipt (dispatched_at/channel/thread_id/status).
+    Written via the normal app DB role; vera_readonly holds SELECT only
+    (audits approved-vs-sent), granted conditionally by the migration in
+    case that role does not exist yet in this environment.
+    """
+    __tablename__ = "relay_approval_queue"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    idempotency_key: Mapped[str] = mapped_column(String(120), nullable=False, unique=True)
+    batch_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    thread_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)  # OPP-YYYY-#####
+    channel: Mapped[str] = mapped_column(String(30), nullable=False)  # noop (R1); email/sms (R2)
+    recipient: Mapped[str] = mapped_column(Text, nullable=False)  # phone via phone_utils.normalize
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)  # subject/body/etc — exactly what's proposed/approved
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    # pending | approved | rejected | sent | failed | skipped
+    slack_message_ts: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    decided_by: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    dispatched_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        Index("ix_relay_approval_queue_status", "status"),
+        Index("ix_relay_approval_queue_batch_status", "batch_id", "status"),
+        CheckConstraint(
+            "status IN ('pending', 'approved', 'rejected', 'sent', 'failed', 'skipped')",
+            name="ck_relay_approval_queue_status",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<RelayApprovalQueueItem(id={self.id}, status={self.status}, "
+            f"channel={self.channel})>"
+        )
+
+
 # ============================================================================
 # Hunter — Buyer Entity Resolution (HUNTER-01)
 # ============================================================================

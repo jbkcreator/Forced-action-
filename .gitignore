@@ -15,3 +15,5 @@ src/static/
 venv/
 .claude/
 ext_tasks/
+tasks/New-agent-lane/csv/
+.worktrees/

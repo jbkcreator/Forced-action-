@@ -574,6 +574,31 @@ class AppSettings(BaseSettings):
 	slack_bot_token: Optional[SecretStr] = Field(default=None, env="SLACK_BOT_TOKEN")
 	slack_signing_secret: Optional[SecretStr] = Field(default=None, env="SLACK_SIGNING_SECRET")
 
+	# Relay approval queue (RELAY-v2.2 sub-task R1). Reuses slack_bot_token /
+	# slack_signing_secret above — no separate Slack app.
+	relay_slack_channel: str = Field(default="", env="RELAY_SLACK_CHANNEL")
+	relay_approvers: list = Field(default=[], env="RELAY_APPROVERS")
+
+	# Relay email channel (RELAY-v2.2 sub-task R2). relay_instantly_campaign_id
+	# is set once after running `python -m src.services.relay --setup-email-channel`
+	# (see src/services/relay/channels_email.py) — unset means the email
+	# channel is not yet provisioned.
+	relay_instantly_campaign_id: Optional[str] = Field(default=None, env="RELAY_INSTANTLY_CAMPAIGN_ID")
+	relay_instantly_sender_email: str = Field(
+		default="noreply@forcedactionleads.com", env="RELAY_INSTANTLY_SENDER_EMAIL"
+	)
+
+	# Relay execution guards (RELAY-v2.2 sub-task R3). Send window is a
+	# DELIVERABILITY control, not a legal one -- CAN-SPAM places no time
+	# restriction on commercial email. 11:00-18:00 ET is inside 08:00-18:00
+	# local for every continental US timezone, so Relay needs no per-recipient
+	# timezone data. Set start=0/end=24 to disable.
+	relay_send_window_start: int = Field(default=11, env="RELAY_SEND_WINDOW_START")
+	relay_send_window_end: int = Field(default=18, env="RELAY_SEND_WINDOW_END")
+	relay_send_window_timezone: str = Field(default="America/New_York", env="RELAY_SEND_WINDOW_TIMEZONE")
+	# Per-channel sends per calendar day (build spec §9.1: "Gmail 20/day").
+	relay_daily_ceiling: int = Field(default=20, env="RELAY_DAILY_CEILING")
+
 	# Lifecycle self-healing (fa034). Default OFF — must be opted in per environment.
 	# When false, src/tasks/lifecycle_self_healing.py is a no-op (returns 0 without
 	# touching DB/Redis). Rollout: ship code → enable in dev → soak in staging

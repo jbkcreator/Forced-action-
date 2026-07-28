@@ -276,6 +276,29 @@ def duplicate_campaign(campaign_id: str) -> Optional[dict]:
         return None
 
 
+def list_campaigns(status: Optional[str] = None) -> list[dict]:
+    """
+    GET /api/v2/campaigns
+    status — optional filter, e.g. "ACTIVE"/"PAUSED" (Instantly's enum).
+    Returns list of campaign dicts, [] on failure or when not configured.
+    """
+    if not _is_configured():
+        return []
+    params: dict[str, Any] = {}
+    if status:
+        params["status"] = status
+    try:
+        resp = _request("GET", "/api/v2/campaigns", params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, list) else data.get("items", data.get("data", []))
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        logger.error("[Instantly] list_campaigns failed: %s", exc)
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Lead (contact) methods
 # ---------------------------------------------------------------------------

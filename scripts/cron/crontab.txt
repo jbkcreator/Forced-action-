@@ -862,6 +862,17 @@ COUNTY_ID=hillsborough
 # approved in writing, (3) Stripe is confirmed in live mode.
 # 0 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.guarantee_shortfall_sweep
 
+# ── AGENT LANE: RELAY ────────────────────────────────────────────────────────
+# Relay approval-queue sweep — every 30 minutes. Reads relay_approval_queue
+# rows Josh approved via Slack (RELAY-v2.2 R1) and executes them as one
+# deterministic batch — no AI in this path. Mirrors auto_mode_followup's
+# cron-sweep cadence/shape above. Quiet-hours, per-channel daily ceilings,
+# and execution-time DNC recheck (R3) run on every tick via guards.evaluate().
+# Email channel (Instantly, R2) is registered but inert until
+# RELAY_INSTANTLY_CAMPAIGN_ID is configured — see --setup-email-channel.
+# Ops reference: docs/PLATFORM-OPERATIONS-GUIDE.md ("Relay Execution Service").
+*/30 * * * * $PROJECT/scripts/cron/run.sh src.services.relay --sweep
+
 # T-B12-07 — Deal-of-the-day daily pick (idempotent, one row per date).
 # Runs after CDS scoring so today's top-CDS undelivered lead is available.
 15 7 * * * $PROJECT/scripts/cron/run.sh src.services.deal_of_the_day

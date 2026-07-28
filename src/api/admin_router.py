@@ -1396,6 +1396,139 @@ def _update_slack_message(candidate: "ExpansionCandidate", reply_text: str) -> N
 
 
 # ===========================================================================
+# RELAY — APPROVAL QUEUE DECISION + KILL COMMAND (RELAY-v2.2 sub-task R1)
+# ===========================================================================
+
+def _relay_approver_authorized(user_id: str) -> bool:
+    """Fail CLOSED: an empty/unset RELAY_APPROVERS means NOBODY is
+    authorized, not everybody (PR #179 review finding #3). The previous
+    per-endpoint checks (`if approvers and user_id not in approvers`)
+    short-circuited to a no-op when `approvers` was the default empty
+    list, silently accepting any Slack workspace member as an approver
+    (a valid Slack signature only proves the request came from Slack for
+    this app -- it says nothing about which workspace member sent it).
+    Shared by both /slack/relay-decision and /slack/kill so the fix lives
+    in one place rather than two easily-desynced copies."""
+    approvers = settings.relay_approvers
+    return bool(approvers) and user_id in approvers
+
+
+def _update_relay_slack_message(slack_message_ts: str, reply_text: str) -> None:
+    """Replace the Approve/Reject buttons with the decision outcome, in
+    place. Mirrors _update_slack_message's county-launch pattern."""
+    token = settings.slack_bot_token
+    channel = settings.relay_slack_channel
+    if not token or not channel or not slack_message_ts:
+        return
+    try:
+        from slack_sdk import WebClient
+        client = WebClient(token=token.get_secret_value())
+        client.chat_update(
+            channel=channel,
+            ts=slack_message_ts,
+            text=reply_text,
+            blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": reply_text}}],
+        )
+    except Exception as exc:
+        logger.error("[RelayInteract] chat.update failed: %s", exc)
+
+
+@router.post("/slack/relay-decision")
+async def slack_relay_decision(request: Request):
+    """
+    Receives Slack interactive component payloads for Relay approval-queue
+    Approve/Reject buttons (build spec §1.1.13 tap surface).
+    Auth: Slack HMAC-SHA256 signature (no JWT — Slack signature IS the auth).
+    """
+    from src.services.relay import queue as relay_queue
+
+    raw = await request.body()
+    if not _verify_slack_signature(dict(request.headers), raw):
+        raise HTTPException(status_code=401, detail="Invalid Slack signature")
+
+    try:
+        payload_str = parse_qs(raw.decode("utf-8")).get("payload", ["{}"])[0]
+        payload = json.loads(payload_str)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Malformed payload")
+
+    user_id = payload.get("user", {}).get("id", "")
+    if not _relay_approver_authorized(user_id):
+        return _slack_ephemeral("Not authorized to approve Relay sends.")
+
+    actions = payload.get("actions", [])
+    if not actions:
+        return _slack_ephemeral("No action found in payload.")
+
+    try:
+        action_data = json.loads(actions[0].get("value", "{}"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid action value")
+
+    item_id = action_data.get("item_id")
+    action = action_data.get("action")
+    if not item_id or action not in ("approve", "reject"):
+        raise HTTPException(status_code=400, detail="Invalid action data")
+
+    item = relay_queue.record_decision(item_id, approved=(action == "approve"), decided_by=user_id)
+    if item is None:
+        return _slack_ephemeral(f"Item #{item_id} was already decided (not still pending).")
+
+    reply_text = (
+        f":white_check_mark: Approved by <@{user_id}>."
+        if action == "approve"
+        else f":no_entry: Rejected by <@{user_id}>."
+    )
+    if item.slack_message_ts:
+        _update_relay_slack_message(item.slack_message_ts, reply_text)
+
+    return {"ok": True}
+
+
+@router.post("/slack/kill")
+async def slack_kill_command(request: Request):
+    """
+    Slack slash command: '/relay-kill ALL' or '/relay-kill RELAY' (also
+    accepts VERA/HUNTER, same <agent>_global convention). Sets the shared
+    Redis kill-switch override that src.services.kill_switch_service reads
+    fleet-wide — build spec §9.1: "the kill command instantly."
+
+    Slash-command bodies are plain form-encoded (NOT wrapped in a "payload"
+    field like interactive-component callbacks) — parsed directly here.
+    """
+    from src.core.redis_client import rset
+    from src.services.relay.config import KILL_OVERRIDE_TTL_SECONDS
+
+    raw = await request.body()
+    if not _verify_slack_signature(dict(request.headers), raw):
+        raise HTTPException(status_code=401, detail="Invalid Slack signature")
+
+    form = parse_qs(raw.decode("utf-8"))
+
+    # Slack slash commands carry the invoking user as a top-level 'user_id'
+    # field (unlike interactive-component payloads, where it's nested under
+    # payload.user.id) — reuses relay_approvers, the same allowlist that
+    # gates /slack/relay-decision, since killing the fleet is at least as
+    # consequential as approving one send.
+    user_id = form.get("user_id", [""])[0]
+    if not _relay_approver_authorized(user_id):
+        return _slack_ephemeral("Not authorized to issue kill commands.")
+
+    text_arg = form.get("text", [""])[0].strip().upper()
+    if text_arg not in ("ALL", "RELAY", "VERA", "HUNTER"):
+        return _slack_ephemeral(
+            "Usage: /relay-kill ALL | RELAY | VERA | HUNTER"
+        )
+
+    feature = "global" if text_arg == "ALL" else f"{text_arg.lower()}_global"
+    rset(f"kill_switch_override:{feature}", "red", ttl_seconds=KILL_OVERRIDE_TTL_SECONDS)
+    return _slack_ephemeral(
+        f"\U0001F6D1 STOP {text_arg} — kill switch RED for "
+        f"{KILL_OVERRIDE_TTL_SECONDS // 60} min. Auto-clears on expiry."
+    )
+
+
+# ===========================================================================
 # WIN-STORY APPROVAL
 # ===========================================================================
 
