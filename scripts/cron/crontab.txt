@@ -877,4 +877,12 @@ COUNTY_ID=hillsborough
 # every 15 min is generous relative to how rarely this should fire.
 */15 * * * * $PROJECT/scripts/cron/run.sh src.services.winback_offers --reconcile
 
+# Monthly DNC re-scrub — subscribers target (Section 2.5 voice-compliance
+# gate: self-signup phones never get a dnc_phone_checks row today, blocking
+# all outbound voice to them). Tracerfy is already the vendor (same account
+# used for skip-trace) — this just adds the missing target. Cost: $0.02/phone
+# checked, ~$0.02/mo per new signup at current volume. INTENTIONALLY
+# COMMENTED OUT — awaiting sign-off before first run.
+# 0 2 1 * * $PROJECT/scripts/cron/run.sh src.tasks.dnc_refresh --targets subscribers
+
 # === END FORCED-ACTION-PLATFORM ===
