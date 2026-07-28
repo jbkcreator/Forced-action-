@@ -206,6 +206,7 @@ def _node_persist(state: OutreachState) -> OutreachState:
         contact_phone=state.get("contact_phone"),
     )
     store.append_draft(record)
+    store.index_contact_email(state.get("contact_email"), buyer_entity["opportunity_thread_id"])
     opportunity_state.mark_targeted(buyer_entity["opportunity_thread_id"], reason="draft_created")
 
     fleet_event = contracts.make_fleet_event(

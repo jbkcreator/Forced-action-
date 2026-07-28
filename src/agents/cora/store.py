@@ -227,19 +227,47 @@ def has_duplicate_actionable_draft(opportunity_thread_id: str, cell_id: str) -> 
     return len(read_active_drafts(opportunity_thread_id=opportunity_thread_id, cell_id=cell_id)) > 0
 
 
+_EMAIL_INDEX_PREFIX = "cora:email_thread_index:"
+
+
+def index_contact_email(contact_email: Optional[str], opportunity_thread_id: str) -> None:
+    """
+    Write-time index: O(1) lookup accelerator for find_opportunity_thread_id_by_email,
+    called once per draft at persist time (outreach.py._node_persist). No TTL —
+    a contact_email -> opportunity_thread_id mapping doesn't go stale on its own;
+    it's a pure performance cache over the JSON-Lines file (the source of truth),
+    never the only place this mapping is recorded. A miss here always falls back
+    to the file scan, so a cold Redis / a draft written before this index existed
+    is still found correctly, just slower.
+    """
+    if not contact_email:
+        return
+    from src.core.redis_client import get_redis, redis_available
+    if not redis_available():
+        return
+    get_redis().set(f"{_EMAIL_INDEX_PREFIX}{contact_email.strip().lower()}", opportunity_thread_id)
+
+
 def find_opportunity_thread_id_by_email(contact_email: str) -> Optional[str]:
     """
     Reply-matching lookup: which opportunity_thread_id did we send TO this
-    address? Scans every draft (not thread-filtered — the whole point is we
-    don't know the thread yet), matches on contact_email, and returns the
-    most recently created match. Case-insensitive, since email addresses are.
-    None if no draft was ever sent to this address — the caller (the reply
-    pipeline) treats that as unmatched and routes to manual_review, same as
-    an unresolvable opportunity_thread_id today.
+    address? Checks the Redis index first (O(1)); on a miss, falls back to
+    scanning every draft (not thread-filtered — the whole point is we don't
+    know the thread yet) and returns the most recently created match.
+    Case-insensitive, since email addresses are. None if no draft was ever
+    sent to this address — the caller (the reply pipeline, or the mailbox
+    poller upstream of it) treats that as unmatched.
     """
     if not contact_email:
         return None
     needle = contact_email.strip().lower()
+
+    from src.core.redis_client import get_redis, redis_available
+    if redis_available():
+        indexed = get_redis().get(f"{_EMAIL_INDEX_PREFIX}{needle}")
+        if indexed:
+            return indexed
+
     matches = [r for r in read_drafts() if (r.get("contact_email") or "").strip().lower() == needle]
     if not matches:
         return None
@@ -344,6 +372,8 @@ class ReplyRecord:
     received_at: str
     intent: Optional[str] = None
     subtype: Optional[str] = None
+    response_subject: Optional[str] = None
+    response_body: Optional[str] = None
     response_draft_id: Optional[str] = None
     status: ReplyStatus = "manual_review"
     created_at: str = field(default_factory=lambda: _now().isoformat())

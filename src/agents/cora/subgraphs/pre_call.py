@@ -37,6 +37,7 @@ class PreCallState(TypedDict, total=False):
     recommended_offer: str
     likely_objections: List[Dict[str, str]]
     booking_link: Optional[str]
+    payment_link: Optional[str]
 
     # ── Output ────────────────────────────────────────────────────────────────
     brief_id: Optional[str]
@@ -44,25 +45,35 @@ class PreCallState(TypedDict, total=False):
     terminal_status: str
 
 
-def _node_gather_context(state: PreCallState) -> PreCallState:
-    from config.cora_objection_library import get_objections_for_avenue
+def _make_node_gather_context(db: Optional[Session]):
+    def _node_gather_context(state: PreCallState) -> PreCallState:
+        from config.cora_objection_library import get_objections_for_avenue
 
-    conversation = store.read_conversation(state["opportunity_thread_id"])
-    replies = store.read_replies(state["opportunity_thread_id"])
-    current_intent = replies[-1].get("intent") if replies else None
+        conversation = store.read_conversation(state["opportunity_thread_id"])
+        replies = store.read_replies(state["opportunity_thread_id"])
+        current_intent = replies[-1].get("intent") if replies else None
 
-    recommendation = contracts.recommend_offer_stub(state["buyer_entity"])
-    avenue = next((d["record"].get("avenue") for d in conversation if d["kind"] == "draft"), None)
-    likely_objections = get_objections_for_avenue(avenue or "")
-    resolved = offer_links.resolve_offer_link(recommendation["offer"])
+        recommendation = contracts.recommend_offer_stub(state["buyer_entity"])
+        avenue = next((d["record"].get("avenue") for d in conversation if d["kind"] == "draft"), None)
+        likely_objections = get_objections_for_avenue(avenue or "")
+        # buyer_entity + db required here too — same reason as offer_links.py's
+        # own docstring: founder_tier's real Stripe checkout only resolves when
+        # both are supplied; omitting them (as this used to) silently falls
+        # through to the "unbuilt" branch for every offer, founder_tier included.
+        resolved = offer_links.resolve_offer_link(
+            recommendation["offer"], buyer_entity=state["buyer_entity"], db=db,
+        )
 
-    return {
-        "conversation": conversation,
-        "current_intent": current_intent,
-        "recommended_offer": recommendation["offer"],
-        "likely_objections": likely_objections,
-        "booking_link": resolved.booking_link,
-    }
+        return {
+            "conversation": conversation,
+            "current_intent": current_intent,
+            "recommended_offer": recommendation["offer"],
+            "likely_objections": likely_objections,
+            "booking_link": resolved.booking_link,
+            "payment_link": resolved.payment_link,
+        }
+
+    return _node_gather_context
 
 
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
@@ -137,7 +148,7 @@ def _build_brief_content(
         "pricing_context": None,  # available only once REVINT/price-band data exists
         "suggested_opening": suggested_opening,
         "call_objective": call_objective,
-        "relevant_links": {"booking_link": state.get("booking_link")},
+        "relevant_links": {"booking_link": state.get("booking_link"), "payment_link": state.get("payment_link")},
     }
 
 
@@ -158,10 +169,10 @@ def _node_persist(state: PreCallState) -> PreCallState:
 
 
 def build_pre_call_graph(db: Optional[Session] = None) -> StateGraph:
-    # `db` is captured by closure into compose_brief, never placed in graph
-    # state — see outreach.py's build_outreach_graph for why.
+    # `db` is captured by closure into gather_context and compose_brief,
+    # never placed in graph state — see outreach.py's build_outreach_graph for why.
     g = StateGraph(PreCallState)
-    g.add_node("gather_context", _node_gather_context)
+    g.add_node("gather_context", _make_node_gather_context(db))
     g.add_node("compose_brief", _make_node_compose_brief(db))
     g.add_node("persist", _node_persist)
 

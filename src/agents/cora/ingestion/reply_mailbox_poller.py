@@ -2,6 +2,8 @@
 Real reply-mailbox ingestion via the Gmail API — a service account +
 domain-wide delegation impersonating the monitored Google Workspace mailbox.
 
+Full layered design: docs/plans/cora_reply_mailbox_ingestion_reliability_design.md
+
 One-time setup outside this codebase (see docs/plans/cora_cold_outreach_completion_report.md
 for the full checklist): a Google Cloud project with the Gmail API enabled,
 a service account with a downloaded JSON key, and that service account's
@@ -11,25 +13,41 @@ this scope:
 
     https://www.googleapis.com/auth/gmail.readonly
 
-Deliberately read-only. Cora never marks a message read, moves it, or
-modifies it in any way — the Gmail API has no way to do that under this
-scope, and this module doesn't request a broader one. Dedup against
-re-ingesting the same message on the next poll is tracked entirely on
-Cora's own side (a Redis set of already-seen Gmail message ids), not by
-mutating the mailbox.
+Deliberately read-only, deliberately not gmail.modify — that scope also
+grants send capability, and Cora must never be able to send, even at the
+credential level. Because of that, this module can never mark a message
+read, so `is:unread` alone is not a usable long-term signal (a message
+never leaves it) — see the watermark layer below, which is what actually
+bounds cost instead.
 
-Requires config/settings.py:
-    CORA_GMAIL_SERVICE_ACCOUNT_KEY_PATH  - path to the service account JSON key file
-    CORA_REPLY_MAILBOX_ADDRESS           - the Workspace address to impersonate
-
-Publishes each new message as a real reply.received event via
-reply_stub_producer's exact payload shape — opportunity_thread_id is left
-None here; src.agents.cora.subgraphs.reply.py's _node_match_thread resolves
-it downstream by matching from_address against store.find_opportunity_
-thread_id_by_email. This module's only job is: list unread mail, decode it,
-hand it off. Once a real mailbox exists, only this module needed to change
-— reply.py and everything else was already built and tested against the
-same payload shape via reply_stub_producer.
+Layers, in the order a message passes through them:
+  1. Watermark (this file: _poll_via_history / _bootstrap_poll) — bounds
+     WHAT gets fetched from Gmail at all. Primary: users.history.list with
+     a saved startHistoryId cursor (Gmail's own incremental change-log).
+     Fallback: a bounded search (after:<last-good-timestamp>) used only when
+     the cursor has gone stale (Gmail retains history ~1 week) or on the
+     very first run, after which a fresh historyId is captured to resume
+     incremental mode.
+  2. Category/sender filter (_UNREAD_REPLY_QUERY) — excludes Gmail's own
+     Updates/Promotions/Social/Forums tabs and anything from google.com
+     (Workspace's own system notifications — confirmed live, see the design
+     doc for the false-positive this caught).
+  3. Relevance filter (_process_candidate_message) — checks
+     store.find_opportunity_thread_id_by_email(from_address) BEFORE
+     publishing. No match -> logged, marked seen, never queued (a message
+     Cora never drafted to is not queue/store noise). Match -> the resolved
+     opportunity_thread_id is passed directly in the payload, so reply.py's
+     own matching step doesn't repeat the same lookup.
+  4. Seen-cache (_already_seen/_mark_seen) — short TTL (48h), NOT permanent.
+     Its only remaining job is covering the deliberate overlap window the
+     bootstrap fallback re-examines; the watermark (layer 1) is what
+     prevents unbounded re-scanning now, so this no longer needs to
+     remember forever.
+  5-6. Queue + worker dedup — idempotency_key is derived from the stable
+     Gmail message_id (via reply_stub_producer's idempotency_key override),
+     not from a re-stamped processing-time timestamp, so a message that
+     somehow gets reprocessed within the worker's own dedup TTL is still
+     recognized as a duplicate.
 """
 from __future__ import annotations
 
@@ -38,17 +56,23 @@ import logging
 import re
 import threading
 from email.utils import parseaddr
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+from src.agents.cora import queue
 from src.agents.cora.ingestion.reply_stub_producer import produce_stub_reply
-from src.agents.cora.store import now
+from src.agents.cora.store import find_opportunity_thread_id_by_email, now
 
 logger = logging.getLogger(__name__)
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 DEFAULT_INTERVAL_SECONDS = 3 * 60
+PAGE_SIZE = 100
+
 _SEEN_KEY_PREFIX = "cora:gmail:seen:"
-_SEEN_TTL_SECONDS = 30 * 24 * 3600  # 30 days — long enough that a slow poll gap never re-ingests
+_SEEN_TTL_SECONDS = 48 * 3600  # 48h — covers the overlap window only; the watermark bounds re-scanning, not this.
+
+_WATERMARK_HISTORY_ID_KEY = "cora:gmail:watermark:history_id"
+_WATERMARK_TIMESTAMP_KEY = "cora:gmail:watermark:timestamp"
 
 # category:primary excludes Gmail's own Updates/Promotions/Social/Forums tabs,
 # where Workspace/Google system mail (storage alerts, admin notices, etc.)
@@ -83,6 +107,8 @@ def _build_gmail_service() -> Optional[Any]:
         return None
 
 
+# ── Layer 4: short-TTL seen-cache (overlap-window guard only) ────────────────
+
 def _already_seen(message_id: str) -> bool:
     from src.core.redis_client import get_redis, redis_available
 
@@ -97,6 +123,44 @@ def _mark_seen(message_id: str) -> None:
     if not redis_available():
         return
     get_redis().set(f"{_SEEN_KEY_PREFIX}{message_id}", "1", ex=_SEEN_TTL_SECONDS)
+
+
+# ── Layer 1: watermark storage ────────────────────────────────────────────────
+
+def _get_saved_history_id() -> Optional[str]:
+    from src.core.redis_client import get_redis, redis_available
+
+    if not redis_available():
+        return None
+    return get_redis().get(_WATERMARK_HISTORY_ID_KEY)
+
+
+def _save_history_id(history_id: str) -> None:
+    from src.core.redis_client import get_redis, redis_available
+
+    if not redis_available() or not history_id:
+        return
+    get_redis().set(_WATERMARK_HISTORY_ID_KEY, history_id)
+
+
+def _get_fallback_timestamp() -> Optional[int]:
+    from src.core.redis_client import get_redis, redis_available
+
+    if not redis_available():
+        return None
+    raw = get_redis().get(_WATERMARK_TIMESTAMP_KEY)
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _save_fallback_timestamp(epoch_seconds: int) -> None:
+    from src.core.redis_client import get_redis, redis_available
+
+    if not redis_available():
+        return
+    get_redis().set(_WATERMARK_TIMESTAMP_KEY, str(int(epoch_seconds)))
 
 
 def _header(headers: List[Dict[str, str]], name: str) -> str:
@@ -122,47 +186,149 @@ def _decode_body(part: Dict[str, Any]) -> str:
     return ""
 
 
-def poll_once(max_results: int = 20) -> int:
-    """Fetches unread messages not yet seen, publishes each as a real reply.received event. Returns count published."""
-    service = _build_gmail_service()
-    if service is None:
-        return 0
+# ── Layer 3: relevance filter + publish ───────────────────────────────────────
+
+def _process_candidate_message(service: Any, message_id: str) -> bool:
+    """Fetch, relevance-filter, publish if it matches a known contact_email. Returns True if published."""
+    if _already_seen(message_id):
+        return False
 
     try:
-        response = service.users().messages().list(
-            userId="me", q=_UNREAD_REPLY_QUERY, maxResults=max_results,
-        ).execute()
-    except Exception:
-        logger.exception("reply_mailbox_poller: failed to list messages")
-        return 0
+        message = service.users().messages().get(userId="me", id=message_id, format="full").execute()
+        headers = message.get("payload", {}).get("headers", [])
+        _, from_address = parseaddr(_header(headers, "From"))
+        subject = _header(headers, "Subject")
+        body_text = _decode_body(message.get("payload", {}))
 
-    published = 0
-    for msg_ref in response.get("messages", []):
-        message_id = msg_ref["id"]
-        if _already_seen(message_id):
-            continue
-        try:
-            message = service.users().messages().get(userId="me", id=message_id, format="full").execute()
-            headers = message.get("payload", {}).get("headers", [])
-            _, from_address = parseaddr(_header(headers, "From"))
-            subject = _header(headers, "Subject")
-            body_text = _decode_body(message.get("payload", {}))
+        thread_id = find_opportunity_thread_id_by_email(from_address)
+        _mark_seen(message_id)  # mark seen regardless of match — either way, don't reconsider it
 
-            produce_stub_reply({
-                "opportunity_thread_id": None,
+        if thread_id is None:
+            logger.warning(
+                "reply_mailbox_poller: unmatched sender=%s subject=%r message_id=%s — not queued, no draft was ever sent to this address",
+                from_address, subject[:80], message_id,
+            )
+            return False
+
+        idempotency_key = queue.make_idempotency_key("reply.received", thread_id, f"gmail:{message_id}")
+        produce_stub_reply(
+            {
+                "opportunity_thread_id": thread_id,
                 "from_address": from_address,
                 "subject": subject,
                 "body_text": body_text,
                 "received_at": now().isoformat(),
                 "raw_headers": {h["name"]: h["value"] for h in headers},
-            })
-            _mark_seen(message_id)
-            published += 1
-        except Exception:
-            logger.exception("reply_mailbox_poller: failed to process message id=%s — will retry next poll", message_id)
+            },
+            idempotency_key=idempotency_key,
+        )
+        return True
+    except Exception:
+        logger.exception("reply_mailbox_poller: failed to process message id=%s — will retry next poll", message_id)
+        return False
 
+
+# ── Layer 1: fetch paths ──────────────────────────────────────────────────────
+
+def _poll_via_history(service: Any, history_id: str) -> Tuple[int, Optional[str]]:
+    """Primary path. Returns (published_count, newest_history_id). Raises on a stale/invalid cursor."""
+    published = 0
+    page_token = None
+    newest_history_id = history_id
+
+    while True:
+        request = service.users().history().list(
+            userId="me", startHistoryId=history_id, historyTypes=["messageAdded"],
+            pageToken=page_token, maxResults=PAGE_SIZE,
+        )
+        response = request.execute()
+        newest_history_id = response.get("historyId", newest_history_id)
+
+        for record in response.get("history", []):
+            for added in record.get("messagesAdded", []):
+                message_id = added.get("message", {}).get("id")
+                if message_id and _process_candidate_message(service, message_id):
+                    published += 1
+
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+
+    return published, newest_history_id
+
+
+def _bootstrap_poll(service: Any, since_timestamp: Optional[int]) -> Tuple[int, Optional[str]]:
+    """
+    Fallback path — first ever run, or the saved historyId cursor expired.
+    Bounded search-based catch-up, then captures a fresh historyId to resume
+    incremental (_poll_via_history) mode on the next call.
+    """
+    published = 0
+    page_token = None
+    query = _UNREAD_REPLY_QUERY
+    if since_timestamp:
+        query = f"{query} after:{since_timestamp}"
+
+    while True:
+        response = service.users().messages().list(
+            userId="me", q=query, pageToken=page_token, maxResults=PAGE_SIZE,
+        ).execute()
+
+        for msg_ref in response.get("messages", []):
+            if _process_candidate_message(service, msg_ref["id"]):
+                published += 1
+
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+
+    try:
+        profile = service.users().getProfile(userId="me").execute()
+        fresh_history_id = profile.get("historyId")
+    except Exception:
+        logger.exception("reply_mailbox_poller: failed to fetch a fresh historyId after bootstrap — will bootstrap again next poll")
+        fresh_history_id = None
+
+    return published, fresh_history_id
+
+
+def poll_once() -> int:
+    """Runs one poll cycle. Returns the number of reply.received events published."""
+    service = _build_gmail_service()
+    if service is None:
+        return 0
+
+    history_id = _get_saved_history_id()
+    poll_started_at = int(now().timestamp())
+
+    if history_id:
+        try:
+            published, new_history_id = _poll_via_history(service, history_id)
+            _save_history_id(new_history_id)
+            _save_fallback_timestamp(poll_started_at)
+            if published:
+                logger.info("reply_mailbox_poller: published %d reply.received event(s) via history", published)
+            return published
+        except Exception as exc:
+            status = getattr(getattr(exc, "resp", None), "status", None)
+            if status == 404:
+                logger.warning("reply_mailbox_poller: history cursor expired/invalid — falling back to a bounded catch-up poll")
+            else:
+                logger.exception("reply_mailbox_poller: history.list failed")
+                return 0
+
+    # Bootstrap: no cursor yet (first run), or the cursor just expired above.
+    fallback_timestamp = _get_fallback_timestamp()
+    try:
+        published, fresh_history_id = _bootstrap_poll(service, fallback_timestamp)
+    except Exception:
+        logger.exception("reply_mailbox_poller: bootstrap poll failed")
+        return 0
+
+    _save_history_id(fresh_history_id)
+    _save_fallback_timestamp(poll_started_at)
     if published:
-        logger.info("reply_mailbox_poller: published %d reply.received event(s)", published)
+        logger.info("reply_mailbox_poller: published %d reply.received event(s) via bootstrap catch-up", published)
     return published
 
 

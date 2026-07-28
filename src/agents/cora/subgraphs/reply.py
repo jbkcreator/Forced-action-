@@ -275,6 +275,8 @@ def _make_node_persist(db: Optional[Session]):
             received_at=state.get("received_at", ""),
             intent=state.get("intent"),
             subtype=state.get("subtype"),
+            response_subject=state.get("response_subject"),
+            response_body=state.get("response_body"),
             status=state.get("status", "manual_review"),
         )
         store.append_reply(record)

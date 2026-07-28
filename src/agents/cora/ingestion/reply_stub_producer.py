@@ -34,16 +34,26 @@ logger = logging.getLogger(__name__)
 REQUIRED_FIELDS = ("from_address", "subject", "body_text", "received_at")
 
 
-def produce_stub_reply(payload: Dict[str, Any]) -> Optional[str]:
+def produce_stub_reply(payload: Dict[str, Any], idempotency_key: Optional[str] = None) -> Optional[str]:
+    """
+    idempotency_key: pass an explicit, stable key when the caller has one
+    (e.g. reply_mailbox_poller.py, keyed off the real Gmail message_id) —
+    that key must never change across reprocessing of the SAME source
+    message, or the worker's own dedup can't recognize a duplicate. The
+    default derived from from_address:received_at is only stable for
+    synthetic/manual payloads (tests, backfill) where received_at is fixed
+    at call time, not re-stamped on every processing attempt.
+    """
     missing = [f for f in REQUIRED_FIELDS if not payload.get(f)]
     if missing:
         raise ValueError(f"reply_stub_producer: payload missing required field(s): {missing}")
 
-    idempotency_key = queue.make_idempotency_key(
-        "reply.received",
-        payload.get("opportunity_thread_id"),
-        f"{payload['from_address']}:{payload['received_at']}",
-    )
+    if idempotency_key is None:
+        idempotency_key = queue.make_idempotency_key(
+            "reply.received",
+            payload.get("opportunity_thread_id"),
+            f"{payload['from_address']}:{payload['received_at']}",
+        )
     message_id = queue.publish("reply.received", payload, idempotency_key=idempotency_key)
     logger.info(
         "reply_stub_producer: published reply.received from=%s thread=%s message_id=%s",
