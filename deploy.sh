@@ -22,7 +22,7 @@ restart_agent_service() {
     elif systemctl list-unit-files cora.service &>/dev/null; then
         systemctl restart cora
     else
-        echo "restart_agent_service: neither lifecycle.service nor cora.service is installed" >&2
+        echo "restart_agent_service: lifecycle.service is not installed" >&2
         return 1
     fi
 }
