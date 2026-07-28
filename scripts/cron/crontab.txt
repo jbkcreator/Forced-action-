@@ -895,7 +895,7 @@ COUNTY_ID=hillsborough
 # Cost: $0.02/phone/run, all non-null subscriber phones re-scrubbed each run
 # (no per-phone staleness tracking). 56 phones today = ~$1.12/run, ~$2.24/mo.
 # Verified via: PYTHONPATH=. python -m src.tasks.dnc_refresh --targets subscribers --dry-run
-# INTENTIONALLY COMMENTED OUT — awaiting sign-off before first run.
-# 0 2 1,15 * * $PROJECT/scripts/cron/run.sh src.tasks.dnc_refresh --targets subscribers
+# Sign-off received — enabled 2026-07-28.
+0 2 1,15 * * $PROJECT/scripts/cron/run.sh src.tasks.dnc_refresh --targets subscribers
 
 # === END FORCED-ACTION-PLATFORM ===
