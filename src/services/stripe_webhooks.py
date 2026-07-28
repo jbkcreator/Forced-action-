@@ -1159,7 +1159,7 @@ def _checkout_completed_deferred(db: Session, subscriber, session: dict, is_new_
             # the plan change.
             try:
                 from src.services.email import send_upgrade_confirmation_email
-                send_upgrade_confirmation_email(subscriber)
+                send_upgrade_confirmation_email(subscriber, db=db)
             except Exception:
                 logger.error(
                     "Upgrade confirmation email failed for subscriber %s", subscriber.id, exc_info=True,
@@ -1167,13 +1167,14 @@ def _checkout_completed_deferred(db: Session, subscriber, session: dict, is_new_
         elif subscriber.email:
             from src.services.email import send_welcome_email
             from src.services import subscriber_auth
+            from src.services.activation_tracking import stamp_welcome_email_sent
             # Magic-link login — issue a fresh one-time link for the welcome
             # email. No password is ever generated or emailed.
             magic_url = None
             try:
-                with db.begin_nested():
-                    raw = subscriber_auth.issue_magic_link(subscriber, db)
-                magic_url = subscriber_auth.magic_link_url(raw)
+                magic_url = subscriber_auth.issue_magic_link_url_with_retry(
+                    subscriber, db, context="paid_checkout_welcome"
+                )
             except Exception:
                 magic_url = None
                 logger.warning(
@@ -1181,7 +1182,8 @@ def _checkout_completed_deferred(db: Session, subscriber, session: dict, is_new_
                     subscriber.id, exc_info=True,
                 )
             try:
-                send_welcome_email(subscriber, magic_link_url=magic_url)
+                send_welcome_email(subscriber, magic_link_url=magic_url, db=db)
+                stamp_welcome_email_sent(subscriber.id, db)
             except Exception:
                 logger.error("Welcome email failed for subscriber %s", subscriber.id, exc_info=True)
 
@@ -2910,17 +2912,20 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
         if first_unlock <= 1:
             from src.services.email import send_welcome_email
             from src.services import subscriber_auth as _sub_auth
+            from src.services.activation_tracking import stamp_welcome_email_sent
             magic_url = None
             try:
-                raw = _sub_auth.issue_magic_link(subscriber, db)
-                magic_url = _sub_auth.magic_link_url(raw)
+                magic_url = _sub_auth.issue_magic_link_url_with_retry(
+                    subscriber, db, context="lead_unlock_welcome"
+                )
             except Exception:
                 magic_url = None
                 logger.warning(
-                    "lead_unlock: magic-link issuance failed for sub=%s",
+                    "lead_unlock: magic-link issuance helper failed for sub=%s",
                     subscriber.id, exc_info=True,
                 )
-            send_welcome_email(subscriber, magic_link_url=magic_url)
+            send_welcome_email(subscriber, magic_link_url=magic_url, db=db)
+            stamp_welcome_email_sent(subscriber.id, db)
     except Exception as exc:
         logger.warning("lead_unlock: welcome email failed sub=%s: %s",
                        subscriber.id, exc)

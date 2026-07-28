@@ -148,7 +148,7 @@ def test_forgot_then_reset_flow(client, fresh_db, monkeypatch):
     # Capture the raw reset token by intercepting the email send.
     captured = {}
 
-    def fake_reset_email(email, name, raw_token):
+    def fake_reset_email(email, name, raw_token, **kwargs):
         captured["token"] = raw_token
     monkeypatch.setattr(
         "src.services.subscriber_auth.send_subscriber_password_reset_email", fake_reset_email

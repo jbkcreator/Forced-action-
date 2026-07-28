@@ -15,11 +15,16 @@ Endpoints:
 """
 
 import functools
+import base64
+import hashlib
+import hmac
 import json
 import logging
+import math
 import re
 import time
 import uuid
+from urllib.parse import parse_qsl
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -40,6 +45,7 @@ from src.core.database import get_db_context
 from src.core.models import ConsentAcceptance, FoundingSubscriberCount, ZipTerritory, Subscriber, Property, DistressScore, Incident, LeadPackPurchase, ScraperRunStats, EnrichedContact, Owner, SentLead, WaitlistEntry, SmsOptIn, ExpansionCandidate, County, LeadExclusivity
 from src.agents.events.ingestion import publish_lifecycle_event
 from src.services.stripe_webhooks import handle_webhook
+from src.services.transactional_email_tracking import record_mandrill_event
 from src.services.stripe_service import get_price_id_for_checkout, get_price_id_for_preview, _price_ids
 from src.services import lead_exclusivity
 from config.settings import get_settings
@@ -88,6 +94,86 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _haversine_miles(a: tuple[float, float], b: tuple[float, float]) -> float:
+    """Approximate great-circle distance between two lat/lon points."""
+    lat1, lon1 = a
+    lat2, lon2 = b
+    r = 3958.8
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    h = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(math.radians(lat1))
+        * math.cos(math.radians(lat2))
+        * math.sin(dlon / 2) ** 2
+    )
+    return 2 * r * math.asin(math.sqrt(h))
+
+
+def _zip_has_sellable_inventory(db: Session, zip_code: str, vertical: str, county_id: str) -> bool:
+    """Whether a ZIP/vertical currently clears the lead-pack sellability floor."""
+    from src.services.lead_exclusivity import get_exclusive_property_ids
+    from src.services.lead_pool_service import sellable_lead_filters
+    from src.utils.lead_filters import phone_priority_order
+
+    now = datetime.now(timezone.utc)
+    excl_ids = get_exclusive_property_ids(db, county_id, now, zip_code=zip_code)
+    score_col = DistressScore.vertical_scores[vertical].as_float()
+    filters = sellable_lead_filters(_s)
+    filters.append(Property.zip == zip_code)
+    filters.append(Property.county_id == county_id)
+    if excl_ids:
+        filters.append(Property.id.not_in(excl_ids))
+
+    candidate_ids = db.execute(
+        select(Property.id)
+        .join(DistressScore, DistressScore.property_id == Property.id)
+        .outerjoin(Owner, Owner.property_id == Property.id)
+        .where(and_(*filters))
+        .order_by(*phone_priority_order(score_col))
+        .limit(5)
+    ).scalars().all()
+    return len(candidate_ids) >= 5
+
+
+def _find_adjacent_zip_suggestion(db: Session, zip_code: str, vertical: str, county_id: str) -> Optional[dict]:
+    """Return the nearest same-county available ZIP that still clears the inventory floor."""
+    from src.utils.zip_centroids import get_county_zip_centroids
+
+    origin = get_county_zip_centroids(county_id).get(zip_code)
+    if origin is None:
+        return None
+
+    centroids = get_county_zip_centroids(county_id)
+    territory_rows = db.execute(
+        select(ZipTerritory.zip_code, ZipTerritory.status).where(
+            ZipTerritory.vertical == vertical,
+            ZipTerritory.county_id == county_id,
+        )
+    ).all()
+    status_by_zip = {row[0]: row[1] for row in territory_rows}
+
+    best: Optional[dict] = None
+    for candidate_zip, coords in centroids.items():
+        if candidate_zip == zip_code:
+            continue
+        if status_by_zip.get(candidate_zip, "available") != "available":
+            continue
+
+        miles = _haversine_miles(origin, coords)
+        if miles > 10:
+            continue
+        if not _zip_has_sellable_inventory(db, candidate_zip, vertical, county_id):
+            continue
+
+        if best is None or miles < best["distance_miles"]:
+            best = {
+                "zip_code": candidate_zip,
+                "distance_miles": round(miles, 1),
+            }
+    return best
 
 
 @app.middleware("http")
@@ -250,6 +336,75 @@ def health_check(db: Session = Depends(get_db)):
     except Exception:
         raise HTTPException(status_code=503, detail="db_unavailable")
     return {"status": "ok"}
+
+
+def _verify_mandrill_signature(raw_body: bytes, signature: Optional[str], request: Request) -> bool:
+    """Verify Mandrill's webhook signature against the configured key."""
+    settings = get_settings()
+    key = settings.mandrill_webhook_key.get_secret_value() if settings.mandrill_webhook_key else None
+    if not key:
+        logger.error("[mandrill] webhook key not configured - rejecting event")
+        return False
+    if not signature:
+        return False
+
+    pieces = [str(request.url).split("?", 1)[0]]
+    for k, v in sorted(parse_qsl(raw_body.decode("utf-8"), keep_blank_values=True)):
+        pieces.extend([k, v])
+    signed_data = "".join(pieces).encode("utf-8")
+    digest = hmac.new(key.encode("utf-8"), signed_data, hashlib.sha1).digest()
+    expected = base64.b64encode(digest).decode("utf-8")
+    return hmac.compare_digest(expected, signature)
+
+
+@app.post("/webhooks/mandrill", status_code=200, include_in_schema=False)
+async def mandrill_webhook(
+    request: Request,
+    x_mandrill_signature: Optional[str] = Header(None, alias="x-mandrill-signature"),
+):
+    raw_body = await request.body()
+    if not _verify_mandrill_signature(raw_body, x_mandrill_signature, request):
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "webhook_invalid", "message": "Invalid Mandrill signature"},
+        )
+
+    form = dict(parse_qsl(raw_body.decode("utf-8"), keep_blank_values=True))
+    try:
+        events = json.loads(form.get("mandrill_events") or "[]")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "webhook_invalid", "message": "Invalid mandrill_events payload"},
+        ) from exc
+
+    if not isinstance(events, list):
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "webhook_invalid", "message": "mandrill_events must be a JSON array"},
+        )
+
+    with get_db_context() as db:
+        try:
+            for event in events:
+                if isinstance(event, dict):
+                    record_mandrill_event(db, event)
+            db.commit()
+        except OperationalError:
+            logger.error("DB error processing Mandrill webhook", exc_info=True)
+            raise HTTPException(
+                status_code=503,
+                detail={"error": "service_unavailable", "message": "Database temporarily unavailable"},
+            )
+        except Exception as exc:
+            db.rollback()
+            logger.error("Unhandled Mandrill webhook handler error", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail={"error": "internal_server_error", "message": f"Webhook processing failed: {exc}"},
+            )
+
+    return {"status": "ok", "processed": len(events)}
 
 
 _HEALTH_SEVERITY = {"ok": 0, "warning": 1, "degraded": 2, "critical": 3}
@@ -1841,11 +1996,13 @@ def zip_check(
             "pricing": _cohort_adjusted_pricing(county_id, vertical, db),
         }
 
+    suggestion = _find_adjacent_zip_suggestion(db, zip_code, vertical, county_id)
     return {
         "zip_code": zip_code,
         "vertical": vertical,
         "status": "taken",
         "message": "This ZIP is locked by another subscriber",
+        "adjacent_zip_suggestion": suggestion,
     }
 
 
@@ -2916,7 +3073,7 @@ def resend_confirmation(payload: ResendConfirmationRequest, db: Session = Depend
         from src.services.email import send_welcome_email
         from src.services import subscriber_auth as _sub_auth
         magic_url = _sub_auth.magic_link_url(_sub_auth.issue_magic_link(subscriber, db))
-        send_welcome_email(subscriber, magic_link_url=magic_url)
+        send_welcome_email(subscriber, magic_link_url=magic_url, db=db)
     except Exception:
         logger.error("Failed to resend confirmation for feed %s", payload.feed_uuid, exc_info=True)
         raise HTTPException(status_code=500, detail={"error": "send_failed", "message": "Failed to send email"})

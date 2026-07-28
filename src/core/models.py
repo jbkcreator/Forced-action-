@@ -1389,6 +1389,8 @@ class ActivationEvent(Base):
     signup_time: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+    welcome_email_sent_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    magic_link_redeemed_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     onboarding_completed_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     first_leads_shown_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     first_unlock_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
@@ -1397,11 +1399,13 @@ class ActivationEvent(Base):
     )
 
     def __repr__(self):
-        return (
-            f"<ActivationEvent(subscriber_id={self.subscriber_id}, "
-            f"onboarded={self.onboarding_completed_time}, "
-            f"shown={self.first_leads_shown_time}, unlocked={self.first_unlock_time})>"
-        )
+            return (
+                f"<ActivationEvent(subscriber_id={self.subscriber_id}, "
+                f"welcome_sent={self.welcome_email_sent_time}, "
+                f"magic_redeemed={self.magic_link_redeemed_time}, "
+                f"onboarded={self.onboarding_completed_time}, "
+                f"shown={self.first_leads_shown_time}, unlocked={self.first_unlock_time})>"
+            )
 
 
 class ZipTerritory(Base):
@@ -3012,6 +3016,9 @@ class MessageOutcome(Base):
     template_id: Mapped[Optional[str]] = mapped_column(String(100))
     variant_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)  # A/B test variant
     channel: Mapped[Optional[str]] = mapped_column(String(50))  # twilio/ses/synthflow
+    recipient_email: Mapped[Optional[str]] = mapped_column(String(255), index=True)
+    provider_message_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)
+    failure_reason: Mapped[Optional[str]] = mapped_column(String(255))
     sent_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     opened_at: Mapped[Optional[datetime]] = mapped_column(DateTime)

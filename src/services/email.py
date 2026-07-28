@@ -25,6 +25,25 @@ from config.settings import get_settings
 logger = logging.getLogger(__name__)
 
 
+def _create_message_outcome(db, *, to: str, tracking: dict):
+    from datetime import datetime, timezone
+    from src.core.models import MessageOutcome
+
+    outcome = MessageOutcome(
+        subscriber_id=tracking.get("subscriber_id"),
+        message_type="email",
+        template_id=tracking.get("template_id"),
+        channel=tracking.get("channel") or "mandrill",
+        recipient_email=to.strip().lower(),
+        sent_at=datetime.now(timezone.utc),
+        send_status="pending",
+        context_snapshot=tracking.get("context_snapshot"),
+    )
+    db.add(outcome)
+    db.flush()
+    return outcome
+
+
 def send_email(
     to: str,
     subject: str,
@@ -33,6 +52,8 @@ def send_email(
     attachments: Optional[List[Union[str, Path]]] = None,
     cc: Optional[List[str]] = None,
     list_unsubscribe_url: Optional[str] = None,
+    headers: Optional[dict[str, str]] = None,
+    tracking: Optional[dict] = None,
     db=None,
 ) -> bool:
     """
@@ -207,7 +228,7 @@ def send_alert(
     return sent
 
 
-def send_welcome_email(subscriber, magic_link_url: Optional[str] = None) -> None:
+def send_welcome_email(subscriber, magic_link_url: Optional[str] = None, db=None) -> None:
     """
     Send the dashboard-link welcome email for any new subscriber (free or paid).
 
@@ -349,16 +370,30 @@ def send_welcome_email(subscriber, magic_link_url: Optional[str] = None) -> None
 </body>
 </html>"""
 
-    send_email(
+    sent = send_email(
         to=subscriber.email,
         subject=subject,
         body_text=body_text,
         body_html=body_html,
     )
+    if sent and db is not None:
+        from src.services.transactional_email_tracking import log_transactional_email_send
+        log_transactional_email_send(
+            db,
+            recipient_email=subscriber.email,
+            subscriber_id=subscriber.id,
+            template_id="welcome_email",
+            context_snapshot={
+                "magic_link_included": bool(magic_link_url),
+                "tier": subscriber.tier,
+                "vertical": subscriber.vertical,
+                "founding_member": bool(subscriber.founding_member),
+            },
+        )
     logger.info("Welcome email sent → %s (subscriber=%s)", subscriber.email, subscriber.id)
 
 
-def send_upgrade_confirmation_email(subscriber) -> None:
+def send_upgrade_confirmation_email(subscriber, db=None) -> None:
     """
     Confirm a plan upgrade for a subscriber who already has dashboard access
     (e.g. a free-tier subscriber upgrading from their own dashboard).
@@ -474,10 +509,23 @@ def send_upgrade_confirmation_email(subscriber) -> None:
 </body>
 </html>"""
 
-    send_email(
+    sent = send_email(
         to=subscriber.email,
         subject=subject,
         body_text=body_text,
         body_html=body_html,
     )
+    if sent and db is not None:
+        from src.services.transactional_email_tracking import log_transactional_email_send
+        log_transactional_email_send(
+            db,
+            recipient_email=subscriber.email,
+            subscriber_id=subscriber.id,
+            template_id="upgrade_confirmation_email",
+            context_snapshot={
+                "tier": subscriber.tier,
+                "vertical": subscriber.vertical,
+                "founding_member": bool(subscriber.founding_member),
+            },
+        )
     logger.info("Upgrade confirmation email sent → %s (subscriber=%s)", subscriber.email, subscriber.id)

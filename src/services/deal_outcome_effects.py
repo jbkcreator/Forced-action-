@@ -60,6 +60,14 @@ def record_outcome_side_effects(outcome, sub, db) -> dict:
         except Exception as exc:
             logger.warning("[DealOutcomeEffects] win autopsy failed: %s", exc)
 
+    is_big = (outcome.deal_amount and outcome.deal_amount >= 10000) \
+        or outcome.deal_size_bucket in ("10_25k", "25k_plus")
+
+    # Big wins get the merged testimonial+referral email instead (sent
+    # asynchronously by deal_win_social_proof via the outcome.recorded
+    # consumer) — sending this prompt too would mean two emails for one win.
+    # Small wins still get the plain referral prompt they always got.
+    if not is_skip and not is_big:
         try:
             with db.begin_nested():
                 from src.services.referral_prompt_service import maybe_send_referral_prompt
@@ -72,8 +80,6 @@ def record_outcome_side_effects(outcome, sub, db) -> dict:
         except Exception as exc:
             logger.warning("[DealOutcomeEffects] referral prompt failed: %s", exc)
 
-    is_big = (outcome.deal_amount and outcome.deal_amount >= 10000) \
-        or outcome.deal_size_bucket in ("10_25k", "25k_plus")
     if is_big and sub is not None:
         try:
             from src.tasks.annual_push import _push_annual_offer
