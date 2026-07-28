@@ -10,15 +10,65 @@ from tests.agents.cora.conftest import classify_result, compose_result
 from tests.agents.cora.fixtures.replies import REPLIES
 
 
-def _seed_parent_draft(thread_id: str, cell_id: str = "cell_1_founder_tier_blitz") -> None:
+def _seed_parent_draft(thread_id: str, cell_id: str = "founder_tier_blitz", contact_email: str = None) -> None:
     store.append_draft(store.OutboundDraftRecord(
         draft_id=store.new_draft_id(), opportunity_thread_id=thread_id, buyer_entity_id=1,
         cell_id=cell_id, offer="founder_tier", avenue="flippers", angle="scarcity_seat_number",
         subject="Founding seat", body="Noticed your purchases.", facts_used=[], source_refs=[],
-        recommended_channel="email", confidence_score=90,
+        recommended_channel="email", confidence_score=90, contact_email=contact_email,
     ))
     opportunity_state.mark_targeted(thread_id)
     opportunity_state.mark_touched(thread_id)
+
+
+def test_match_thread_resolves_by_contact_email_when_thread_id_unknown(not_suppressed_db, mock_claude):
+    thread_id = "OPP-EMAIL-MATCH"
+    _seed_parent_draft(thread_id, contact_email="prospect@example.com")
+    mock_claude.side_effect = [classify_result("TIMING", "NOT_NOW"), compose_result("Re:", "No worries, following up later.")]
+
+    result = reply.run_reply(
+        {
+            "opportunity_thread_id": None, "from_address": "prospect@example.com",
+            "subject": "Re:", "body_text": "not now", "received_at": store.now().isoformat(),
+        },
+        db=not_suppressed_db,
+    )
+    assert result["terminal_status"] == "completed"
+    assert result["reject_reason"] is None
+    record = store.read_replies()[-1]
+    assert record["opportunity_thread_id"] == thread_id
+
+
+def test_match_thread_unmatched_email_goes_to_manual_review(not_suppressed_db, mock_claude):
+    result = reply.run_reply(
+        {
+            "opportunity_thread_id": None, "from_address": "never-drafted@example.com",
+            "subject": "Re:", "body_text": "who is this", "received_at": store.now().isoformat(),
+        },
+        db=not_suppressed_db,
+    )
+    assert result["reject_reason"] == "manual_review"
+    mock_claude.assert_not_called()
+
+
+def test_find_opportunity_thread_id_by_email_case_insensitive_and_most_recent():
+    store.append_draft(store.OutboundDraftRecord(
+        draft_id=store.new_draft_id(), opportunity_thread_id="OPP-OLD", buyer_entity_id=1,
+        cell_id="founder_tier_blitz", offer="founder_tier", avenue="flippers", angle="scarcity_seat_number",
+        subject="s", body="b", facts_used=[], source_refs=[], recommended_channel="email",
+        confidence_score=90, contact_email="Prospect@Example.com",
+        created_at="2026-01-01T00:00:00+00:00",
+    ))
+    store.append_draft(store.OutboundDraftRecord(
+        draft_id=store.new_draft_id(), opportunity_thread_id="OPP-NEW", buyer_entity_id=1,
+        cell_id="founder_tier_blitz", offer="founder_tier", avenue="flippers", angle="scarcity_seat_number",
+        subject="s", body="b", facts_used=[], source_refs=[], recommended_channel="email",
+        confidence_score=90, contact_email="prospect@example.com",
+        created_at="2026-06-01T00:00:00+00:00",
+    ))
+    assert store.find_opportunity_thread_id_by_email("PROSPECT@EXAMPLE.COM") == "OPP-NEW"
+    assert store.find_opportunity_thread_id_by_email("nobody@example.com") is None
+    assert store.find_opportunity_thread_id_by_email("") is None
 
 
 # Acceptance item 6: classify 10 seeded replies.
@@ -94,6 +144,84 @@ def test_unsubscribe_triggers_real_suppression_write_path(not_suppressed_db, moc
     assert result["terminal_status"] == "completed"
     suppress_mock.assert_called_once_with(not_suppressed_db, email="unsub@example.com", source="cora_reply_unsubscribe")
     assert opportunity_state.current_status(thread_id) == "closed"
+
+
+def test_booking_request_reply_triggers_call_booked_event(mock_claude):
+    from src.agents.cora import queue
+
+    thread_id = "OPP-TEST-BOOKING"
+    _seed_parent_draft(thread_id)
+    mock_claude.side_effect = [
+        classify_result("INTERESTED", "BOOKING_REQUEST"),
+        compose_result("Re:", "Great — here's the booking link."),
+    ]
+
+    db = MagicMock()
+    fake_row = {"id": 1, "opportunity_thread_id": thread_id, "confidence_score": 90, "county_id": "hillsborough"}
+    db.execute.return_value.mappings.return_value.first.return_value = fake_row
+
+    result = reply.run_reply(
+        {
+            "opportunity_thread_id": thread_id, "from_address": "prospect@example.com",
+            "subject": "Re:", "body_text": "Yes let's talk this week", "received_at": store.now().isoformat(),
+        },
+        db=db,
+    )
+    assert result["terminal_status"] == "completed"
+    assert result["subtype"] == "BOOKING_REQUEST"
+
+    published = queue.read_batch("test-consumer", count=10, block_ms=200)
+    assert len(published) == 1
+    assert published[0].event_type == "call.booked"
+    assert published[0].payload["opportunity_thread_id"] == thread_id
+    assert published[0].payload["buyer_entity"]["opportunity_thread_id"] == thread_id
+    assert published[0].payload["scheduled_for"] is None
+    queue.ack(published[0].message_id)
+
+
+def test_non_booking_reply_never_publishes_call_booked(not_suppressed_db, mock_claude):
+    from src.agents.cora import queue
+
+    thread_id = "OPP-TEST-NONBOOKING"
+    _seed_parent_draft(thread_id)
+    mock_claude.side_effect = [
+        classify_result("INTERESTED", None),
+        compose_result("Re:", "Tell me more."),
+    ]
+    reply.run_reply(
+        {
+            "opportunity_thread_id": thread_id, "from_address": "prospect@example.com",
+            "subject": "Re:", "body_text": "tell me more", "received_at": store.now().isoformat(),
+        },
+        db=not_suppressed_db,
+    )
+    published = queue.read_batch("test-consumer-2", count=10, block_ms=200)
+    assert published == []
+
+
+def test_unresolvable_buyer_entity_skips_call_booked_without_crashing(mock_claude):
+    from src.agents.cora import queue
+
+    thread_id = "OPP-TEST-BOOKING-UNRESOLVABLE"
+    _seed_parent_draft(thread_id)
+    mock_claude.side_effect = [
+        classify_result("INTERESTED", "BOOKING_REQUEST"),
+        compose_result("Re:", "Great — here's the booking link."),
+    ]
+
+    db = MagicMock()
+    db.execute.return_value.mappings.return_value.first.return_value = None  # no matching buyer_entities row
+
+    result = reply.run_reply(
+        {
+            "opportunity_thread_id": thread_id, "from_address": "prospect@example.com",
+            "subject": "Re:", "body_text": "Yes let's talk", "received_at": store.now().isoformat(),
+        },
+        db=db,
+    )
+    assert result["terminal_status"] == "completed"  # persisting the reply must still succeed
+    published = queue.read_batch("test-consumer-3", count=10, block_ms=200)
+    assert published == []
 
 
 @pytest.mark.integration

@@ -8,8 +8,9 @@ Score components, each normalized to [0, 1] then weighted:
     src.services.whale_ranking.get_ranked_whales() output.
   - catalyst_freshness: derived from acquisition_velocity / whale_flagged_at
     recency — a fresher "why_now" catalyst ranks higher.
-  - auction_recency: placeholder weight, populated once Cell #2's fast-follow
-    feed is wired into target_producer.py.
+  - auction_recency: decays over ~14 days from latest_auction_deed_date, when
+    present (Cell #2 rows only — Cell #1 rows have no auction event, so this
+    contributes 0.0 for them, same as before Cell #2 existed).
   - purchase_activity: total_purchase_count alone (distinct from cash volume).
   - estimated_value: total_cash_volume, log-scaled so a single huge outlier
     doesn't dominate the ranking.
@@ -56,11 +57,27 @@ def _catalyst_freshness(whale_flagged_at: Optional[str]) -> float:
     return max(0.0, 1.0 - (days_ago / 90))  # decays to 0 over ~90 days
 
 
+def _auction_recency(latest_auction_deed_date: Optional[str]) -> float:
+    if not latest_auction_deed_date:
+        return 0.0
+    try:
+        deed_date = datetime.fromisoformat(str(latest_auction_deed_date))
+        if deed_date.tzinfo is None:
+            deed_date = deed_date.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return 0.0
+    days_ago = (datetime.now(timezone.utc) - deed_date).days
+    if days_ago < 0:
+        return 1.0
+    return max(0.0, 1.0 - (days_ago / 14))  # decays to 0 over ~14 days — a fast-follow signal, not a slow one
+
+
 def score_ranked_whale(ranked_whale: Dict[str, Any]) -> float:
-    """ranked_whale is one dict from whale_ranking.get_ranked_whales()'s output."""
+    """ranked_whale is one dict from whale_ranking.get_ranked_whales()'s output,
+    or from read_tools.get_recent_auction_fast_follow_whales() (Cell #2)."""
     whale_score = _normalize_count(ranked_whale.get("total_purchase_count"), cap=10)
     catalyst = _catalyst_freshness(ranked_whale.get("whale_flagged_at"))
-    auction_recency = 0.0  # populated once Cell #2's fast-follow feed is wired in
+    auction_recency = _auction_recency(ranked_whale.get("latest_auction_deed_date"))
     purchase_activity = _normalize_count(ranked_whale.get("total_purchase_count"), cap=20)
     estimated_value = _normalize_value_log(ranked_whale.get("total_cash_volume"))
 

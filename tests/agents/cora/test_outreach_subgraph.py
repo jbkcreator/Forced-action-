@@ -10,7 +10,7 @@ from src.agents.cora.subgraphs import outreach
 from tests.agents.cora.conftest import compose_result
 from tests.agents.cora.fixtures.whales import WHALES, facts_for
 
-CELL_ID = "cell_1_founder_tier_blitz"
+CELL_ID = "founder_tier_blitz"
 
 
 def _run(whale, db, mock_claude, *, contact_email="prospect@example.com", **extra):

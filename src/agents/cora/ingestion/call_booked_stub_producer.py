@@ -1,9 +1,12 @@
 """
-call.booked producer — C4's input stub, same caveat as reply_stub_producer.py:
-no confirmed real calendar/booking-webhook integration yet. Everything
-downstream (pre_call.py, the brief, the store) is real.
+call.booked producer — manual/CLI path only now. The real trigger is
+src.agents.cora.subgraphs.reply.py's own _publish_call_booked, fired the
+moment a reply classifies as BOOKING_REQUEST — Cora has no external
+calendar-confirmation webhook, so a prospect's own "yes let's talk" reply is
+the realest signal available. This module still exists for manually
+producing a call.booked event outside that flow (tests, CLI, backfill).
 
-Documented stub payload shape (matches src.agents.cora.contracts.CallBookedStubPayload):
+Documented payload shape (matches src.agents.cora.contracts.CallBookedStubPayload):
     {
         "opportunity_thread_id": str,
         "call_booked_at": str (ISO-8601),

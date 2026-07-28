@@ -169,6 +169,8 @@ class OutboundDraftRecord:
     published: bool = False
     is_followup: bool = False
     followup_sequence: Optional[int] = None
+    contact_email: Optional[str] = None
+    contact_phone: Optional[str] = None
 
 
 _DRAFTS_FILE = DATA_DIR / "outbound_drafts.jsonl"
@@ -223,6 +225,26 @@ def read_active_drafts(
 
 def has_duplicate_actionable_draft(opportunity_thread_id: str, cell_id: str) -> bool:
     return len(read_active_drafts(opportunity_thread_id=opportunity_thread_id, cell_id=cell_id)) > 0
+
+
+def find_opportunity_thread_id_by_email(contact_email: str) -> Optional[str]:
+    """
+    Reply-matching lookup: which opportunity_thread_id did we send TO this
+    address? Scans every draft (not thread-filtered — the whole point is we
+    don't know the thread yet), matches on contact_email, and returns the
+    most recently created match. Case-insensitive, since email addresses are.
+    None if no draft was ever sent to this address — the caller (the reply
+    pipeline) treats that as unmatched and routes to manual_review, same as
+    an unresolvable opportunity_thread_id today.
+    """
+    if not contact_email:
+        return None
+    needle = contact_email.strip().lower()
+    matches = [r for r in read_drafts() if (r.get("contact_email") or "").strip().lower() == needle]
+    if not matches:
+        return None
+    matches.sort(key=lambda r: r.get("created_at", ""), reverse=True)
+    return matches[0].get("opportunity_thread_id")
 
 
 def expire_stale_drafts() -> int:

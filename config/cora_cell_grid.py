@@ -8,10 +8,14 @@ CELL_GRID is the lookup Cora's validation/drafting code resolves cell_id
 against — the taxonomy is the single source of truth, nothing re-declares
 these strings elsewhere.
 
-Only cell_1_founder_tier_blitz is exercised end-to-end at launch (Hunter's
-whale_ranking.get_ranked_whales() feeds it directly). cell_2/cell_3 entries
-exist and validate now so the taxonomy doesn't need reshaping when their
-producers (auction fast-follow, win-back sweep) come online.
+Cell IDs are named for what they are, not for their position in the
+originating brief (that document numbered them Cell #1/#2/#3 — a section
+label, not a naming scheme).
+
+Only founder_tier_blitz is exercised end-to-end at launch (Hunter's
+whale_ranking.get_ranked_whales() feeds it directly). auction_fast_follow/
+win_back entries exist and validate now so the taxonomy doesn't need
+reshaping when their producers come online.
 """
 from __future__ import annotations
 
@@ -24,7 +28,7 @@ class Cell(TypedDict):
     avenue: str
     angle: str
     label: str
-    source_cell: Optional[str]  # which launch cell (Cell #1/#2/#3) this belongs to
+    launch_group: Optional[str]  # groups avenue variants of the same launch cohort, e.g. founder_tier_blitz + founder_tier_blitz_bh
 
 
 OFFERS = (
@@ -47,42 +51,42 @@ ANGLES = (
     "scarcity_seat_number",       # founder-tier numbered-seat framing
     "why_now_catalyst",           # fresh filing/lien/auction date framing
     "portfolio_recognition",      # "we noticed your N purchases" framing
-    "auction_congrats",           # Cell #2 fast-follow framing
-    "win_back_offer",             # Cell #3 lapsed/abandoned framing
+    "auction_congrats",           # auction-winner fast-follow framing
+    "win_back_offer",             # lapsed/abandoned win-back framing
 )
 
 CELL_GRID: dict[str, Cell] = {
-    "cell_1_founder_tier_blitz": {
-        "cell_id": "cell_1_founder_tier_blitz",
+    "founder_tier_blitz": {
+        "cell_id": "founder_tier_blitz",
         "offer": "founder_tier",
         "avenue": "flippers",
         "angle": "scarcity_seat_number",
         "label": "Founder-Tier Blitz — numbered seats, whale entities",
-        "source_cell": "cell_1",
+        "launch_group": "founder_tier_blitz",
     },
-    "cell_1_founder_tier_blitz_bh": {
-        "cell_id": "cell_1_founder_tier_blitz_bh",
+    "founder_tier_blitz_bh": {
+        "cell_id": "founder_tier_blitz_bh",
         "offer": "founder_tier",
         "avenue": "buy_and_hold",
         "angle": "portfolio_recognition",
         "label": "Founder-Tier Blitz — numbered seats, buy-and-hold whales",
-        "source_cell": "cell_1",
+        "launch_group": "founder_tier_blitz",
     },
-    "cell_2_auction_fast_follow": {
-        "cell_id": "cell_2_auction_fast_follow",
+    "auction_fast_follow": {
+        "cell_id": "auction_fast_follow",
         "offer": "core_subscription",
         "avenue": "flippers",
         "angle": "auction_congrats",
         "label": "Auction-winner fast-follow — congrats + next month's auctions",
-        "source_cell": "cell_2",
+        "launch_group": "auction_fast_follow",
     },
-    "cell_3_win_back": {
-        "cell_id": "cell_3_win_back",
+    "win_back": {
+        "cell_id": "win_back",
         "offer": "core_subscription",
         "avenue": "wholesalers",
         "angle": "win_back_offer",
         "label": "Win-back sweep — lapsed subs / abandoned checkouts",
-        "source_cell": "cell_3",
+        "launch_group": "win_back",
     },
     "hard_money_intro_lenders": {
         "cell_id": "hard_money_intro_lenders",
@@ -90,7 +94,7 @@ CELL_GRID: dict[str, Cell] = {
         "avenue": "lender_types",
         "angle": "why_now_catalyst",
         "label": "Hard-money intro — lead handoff only, no fee mechanics (RESPA-gated)",
-        "source_cell": None,
+        "launch_group": None,
     },
 }
 

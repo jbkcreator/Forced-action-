@@ -11,7 +11,7 @@ from tests.agents.cora.fixtures.whales import WHALES
 def _seed_conversation(thread_id: str) -> None:
     store.append_draft(store.OutboundDraftRecord(
         draft_id=store.new_draft_id(), opportunity_thread_id=thread_id, buyer_entity_id=1,
-        cell_id="cell_1_founder_tier_blitz", offer="founder_tier", avenue="flippers",
+        cell_id="founder_tier_blitz", offer="founder_tier", avenue="flippers",
         angle="scarcity_seat_number", subject="Founding seat", body="Noticed your purchases.",
         facts_used=[], source_refs=[], recommended_channel="email", confidence_score=90,
     ))

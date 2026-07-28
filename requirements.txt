@@ -74,3 +74,9 @@ scikit-learn>=1.5.0
 prometheus_client>=0.21.0
 
 openpyxl>=3.1.0
+
+# Cora reply-mailbox ingestion (Gmail API, service account + domain-wide
+# delegation) — already present transitively before this was added; pinned
+# explicitly since Cora now depends on them directly.
+google-api-python-client>=2.180.0
+google-auth>=2.40.0

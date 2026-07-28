@@ -59,9 +59,22 @@ class ReplyState(TypedDict, total=False):
 
 
 def _node_match_thread(state: ReplyState) -> ReplyState:
+    """
+    A real inbound reply arrives with only a from_address — the producer
+    doesn't know which opportunity_thread_id it belongs to. Resolves it by
+    matching from_address against every draft's contact_email
+    (store.find_opportunity_thread_id_by_email); unmatched goes to
+    manual_review, never guessed. A caller that already knows the
+    opportunity_thread_id (tests, backfill, the seeded-reply fixtures) can
+    still supply it directly and skip this lookup.
+    """
     reply_id = store.new_reply_id()
-    if not state.get("opportunity_thread_id"):
-        return {"reply_id": reply_id, "status": "manual_review"}
+    thread_id = state.get("opportunity_thread_id")
+    if not thread_id:
+        thread_id = store.find_opportunity_thread_id_by_email(state.get("from_address", ""))
+        if not thread_id:
+            return {"reply_id": reply_id, "status": "manual_review"}
+        return {"reply_id": reply_id, "opportunity_thread_id": thread_id}
     return {"reply_id": reply_id}
 
 
@@ -210,36 +223,83 @@ def _make_node_compose_response(db: Optional[Session]):
     return _node_compose_response
 
 
-def _node_persist(state: ReplyState) -> ReplyState:
-    record = store.ReplyRecord(
-        reply_id=state["reply_id"],
-        opportunity_thread_id=state.get("opportunity_thread_id"),
-        from_address=state.get("from_address", ""),
-        subject=state.get("subject", ""),
-        body_text=state.get("body_text", ""),
-        received_at=state.get("received_at", ""),
-        intent=state.get("intent"),
-        subtype=state.get("subtype"),
-        status=state.get("status", "manual_review"),
-    )
-    store.append_reply(record)
+def _publish_call_booked(opportunity_thread_id: str, db: Optional[Session]) -> None:
+    """
+    Real trigger for C4's call.booked event — a prospect replying with
+    BOOKING_REQUEST *is* Cora's own booking signal, since Cora has no real
+    calendar-confirmation webhook of its own (its booking_link is a static
+    Calendly URL, not something that reports back a scheduled_for time).
+    Deliberately NOT wired to src.api.main.py's Synthflow demo_requested
+    webhook — that fires for property-owner/lead calls in the OLD Lifecycle
+    GHL pipeline, a different population than Cora's Hunter buyer_entities,
+    with no path back to an opportunity_thread_id at all.
+    scheduled_for is left None for the same reason — there is no real
+    calendar confirmation to read one from yet.
+    """
+    if db is None:
+        logger.warning("reply.persist: no db session available — cannot publish call.booked for thread_id=%s", opportunity_thread_id)
+        return
 
-    if state.get("status") == "pending_approval" and state.get("opportunity_thread_id"):
-        opportunity_state.mark_replied(state["opportunity_thread_id"], reason="reply_received")
-        fleet_event = contracts.make_fleet_event(
-            "action.ready", state["opportunity_thread_id"], reply_id=state["reply_id"],
+    from src.agents.cora import queue
+    from src.agents.cora.tools.read_tools import get_buyer_entity_by_opportunity_thread_id
+
+    try:
+        buyer_entity = get_buyer_entity_by_opportunity_thread_id(db, opportunity_thread_id)
+        if buyer_entity is None:
+            logger.warning("reply.persist: opportunity_thread_id=%s not resolvable — skipping call.booked", opportunity_thread_id)
+            return
+
+        call_booked_at = store.now().isoformat()
+        payload = {
+            "opportunity_thread_id": opportunity_thread_id,
+            "call_booked_at": call_booked_at,
+            "rep": None,
+            "scheduled_for": None,
+            "buyer_entity": buyer_entity,
+        }
+        idempotency_key = queue.make_idempotency_key("call.booked", opportunity_thread_id, call_booked_at)
+        queue.publish("call.booked", payload, idempotency_key=idempotency_key)
+        logger.info("reply.persist: published call.booked for thread_id=%s (BOOKING_REQUEST reply)", opportunity_thread_id)
+    except Exception:
+        logger.exception("reply.persist: failed to publish call.booked for thread_id=%s", opportunity_thread_id)
+
+
+def _make_node_persist(db: Optional[Session]):
+    def _node_persist(state: ReplyState) -> ReplyState:
+        record = store.ReplyRecord(
+            reply_id=state["reply_id"],
+            opportunity_thread_id=state.get("opportunity_thread_id"),
+            from_address=state.get("from_address", ""),
+            subject=state.get("subject", ""),
+            body_text=state.get("body_text", ""),
+            received_at=state.get("received_at", ""),
+            intent=state.get("intent"),
+            subtype=state.get("subtype"),
+            status=state.get("status", "manual_review"),
         )
-        contracts.emit_fleet_event_stub(fleet_event)
+        store.append_reply(record)
 
-    status = state.get("status", "manual_review")
-    # Reaching persist without an uncaught exception IS the graph's success
-    # case, regardless of business status — manual_review/suppressed are
-    # legitimate outcomes, not graph failures. main_graph._node_route reads
-    # terminal_status generically across all three subgraphs.
-    return {
-        "terminal_status": "completed",
-        "reject_reason": status if status != "pending_approval" else None,
-    }
+        if state.get("status") == "pending_approval" and state.get("opportunity_thread_id"):
+            opportunity_state.mark_replied(state["opportunity_thread_id"], reason="reply_received")
+            fleet_event = contracts.make_fleet_event(
+                "action.ready", state["opportunity_thread_id"], reply_id=state["reply_id"],
+            )
+            contracts.emit_fleet_event_stub(fleet_event)
+
+            if state.get("subtype") == "BOOKING_REQUEST":
+                _publish_call_booked(state["opportunity_thread_id"], db)
+
+        status = state.get("status", "manual_review")
+        # Reaching persist without an uncaught exception IS the graph's success
+        # case, regardless of business status — manual_review/suppressed are
+        # legitimate outcomes, not graph failures. main_graph._node_route reads
+        # terminal_status generically across all three subgraphs.
+        return {
+            "terminal_status": "completed",
+            "reject_reason": status if status != "pending_approval" else None,
+        }
+
+    return _node_persist
 
 
 def _after_match(state: ReplyState) -> str:
@@ -262,7 +322,7 @@ def build_reply_graph(db: Optional[Session] = None) -> StateGraph:
     g.add_node("load_conversation", _node_load_conversation)
     g.add_node("classify_intent", _make_node_classify_intent(db))
     g.add_node("compose_response", _make_node_compose_response(db))
-    g.add_node("persist", _node_persist)
+    g.add_node("persist", _make_node_persist(db))
 
     g.add_edge(START, "match_thread")
     g.add_conditional_edges("match_thread", _after_match, {"load_conversation": "load_conversation", "persist": "persist"})

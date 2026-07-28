@@ -23,8 +23,8 @@ def test_every_cell_tags_are_in_the_taxonomy():
         assert cell["angle"] in ANGLES
 
 
-def test_cell_1_founder_tier_blitz_shape():
-    cell = get_cell("cell_1_founder_tier_blitz")
+def test_founder_tier_blitz_shape():
+    cell = get_cell("founder_tier_blitz")
     assert cell["offer"] == "founder_tier"
     assert cell["avenue"] == "flippers"
     assert cell["angle"] == "scarcity_seat_number"

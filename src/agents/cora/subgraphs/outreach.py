@@ -165,11 +165,17 @@ def _make_node_compose(db: Optional[Session]):
     return _node_compose
 
 
-def _node_resolve_links(state: OutreachState) -> OutreachState:
-    if state.get("terminal_status"):
-        return {}
-    resolved = offer_links.resolve_offer_link(state["offer"], customer_email=state.get("contact_email"))
-    return {"booking_link": resolved.booking_link, "payment_link": resolved.payment_link}
+def _make_node_resolve_links(db: Optional[Session]):
+    def _node_resolve_links(state: OutreachState) -> OutreachState:
+        if state.get("terminal_status"):
+            return {}
+        resolved = offer_links.resolve_offer_link(
+            state["offer"], buyer_entity=state["buyer_entity"], db=db,
+            customer_email=state.get("contact_email"),
+        )
+        return {"booking_link": resolved.booking_link, "payment_link": resolved.payment_link}
+
+    return _node_resolve_links
 
 
 def _node_persist(state: OutreachState) -> OutreachState:
@@ -196,6 +202,8 @@ def _node_persist(state: OutreachState) -> OutreachState:
         payment_link=state.get("payment_link"),
         is_followup=bool(state.get("is_followup", False)),
         followup_sequence=state.get("followup_sequence"),
+        contact_email=state.get("contact_email"),
+        contact_phone=state.get("contact_phone"),
     )
     store.append_draft(record)
     opportunity_state.mark_targeted(buyer_entity["opportunity_thread_id"], reason="draft_created")
@@ -224,7 +232,7 @@ def build_outreach_graph(db: Optional[Session] = None) -> StateGraph:
     g = StateGraph(OutreachState)
     g.add_node("gate", _make_node_gate(db))
     g.add_node("compose", _make_node_compose(db))
-    g.add_node("resolve_links", _node_resolve_links)
+    g.add_node("resolve_links", _make_node_resolve_links(db))
     g.add_node("persist", _node_persist)
 
     g.add_edge(START, "gate")

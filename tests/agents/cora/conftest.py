@@ -51,6 +51,23 @@ def _cora_isolated_store(tmp_path, monkeypatch) -> Iterator[None]:
     yield
 
 
+@pytest.fixture(autouse=True)
+def _no_real_stripe_calls(monkeypatch) -> Iterator[None]:
+    """
+    offer_links.py's founder_tier path calls the REAL stripe SDK
+    (stripe.checkout.Session.create) directly — this repo's Stripe
+    integration is LIVE in the shared .env, not sandboxed. Default every
+    test to a fake Stripe response so nothing here can hit the real API by
+    accident; a test that explicitly wants to exercise the real call can
+    override this fixture's targets directly.
+    """
+    fake_session = MagicMock()
+    fake_session.url = "https://checkout.stripe.com/test-fake"
+    monkeypatch.setattr("stripe.checkout.Session.create", MagicMock(return_value=fake_session))
+    monkeypatch.setattr("src.services.stripe_service._init_stripe", lambda: True)
+    yield
+
+
 @pytest.fixture
 def not_suppressed_db():
     db = MagicMock()
