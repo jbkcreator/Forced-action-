@@ -5048,6 +5048,8 @@ class DBPRContact(Base):
     # loader; distinct from work_email (Clay-sourced) below.
     email: Mapped[Optional[str]] = mapped_column(String(200))
     phone: Mapped[Optional[str]] = mapped_column(String(20))
+    mobile_phone: Mapped[Optional[str]] = mapped_column(String(20))
+    landline_phone: Mapped[Optional[str]] = mapped_column(String(20))
 
     enrichment_status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
     enrichment_attempted_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
