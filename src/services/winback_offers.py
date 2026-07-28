@@ -38,6 +38,71 @@ OFFER_VALIDITY_DAYS = 14
 TIER3_WINBACK_CREDIT_BONUS = 5
 TIER3_WINBACK_CREDIT_REASON = "tier3_winback_reactivation"
 
+# Founder-tier zip_held substitute for the 50%-off coupon (wayfinder map
+# notion-pending-tasks, tickets F1/F2/F3): a one-time +14-day extension of
+# the still-held territory's grace window, granted immediately rather than
+# on checkout redemption (there is nothing to redeem — it's not a discount).
+FOUNDER_GRACE_EXTENSION_DAYS = 14
+
+
+def grant_founder_grace_extension(subscriber_id: int, db: Session) -> bool:
+    """
+    Extends every 'grace'-status ZipTerritory row still held by this
+    subscriber by FOUNDER_GRACE_EXTENSION_DAYS, and stamps
+    Subscriber.founder_grace_extension_granted_at so a retried scheduler
+    run — or the subscriber lapsing into zip_held eligibility a second
+    time — never grants it twice (one-time, lifetime).
+
+    Caller must have already confirmed subscriber.tier == 'founder' and the
+    zip_held branch. Returns False (no-op) if the subscriber already
+    received this grant, or if no grace-status territory is found to
+    extend. Does not commit — caller controls the transaction.
+    """
+    already_granted = db.execute(
+        text(
+            "SELECT 1 FROM subscribers "
+            "WHERE id = :sid AND founder_grace_extension_granted_at IS NOT NULL"
+        ),
+        {"sid": subscriber_id},
+    ).first()
+    if already_granted:
+        logger.info(
+            "winback_offers: founder grace extension already granted sub_id=%s — skipping",
+            subscriber_id,
+        )
+        return False
+
+    now = datetime.now(timezone.utc)
+    result = db.execute(
+        text(
+            """
+            UPDATE zip_territories
+               SET grace_expires_at = grace_expires_at + make_interval(days => :extend_days)
+             WHERE subscriber_id = :sid AND status = 'grace'
+            RETURNING id
+            """
+        ),
+        {"sid": subscriber_id, "extend_days": FOUNDER_GRACE_EXTENSION_DAYS},
+    ).fetchall()
+    if not result:
+        logger.info(
+            "winback_offers: no grace-status territory found to extend sub_id=%s — skipping",
+            subscriber_id,
+        )
+        return False
+
+    db.execute(
+        text(
+            "UPDATE subscribers SET founder_grace_extension_granted_at = :now WHERE id = :sid"
+        ),
+        {"sid": subscriber_id, "now": now},
+    )
+    logger.info(
+        "winback_offers: granted founder grace extension sub_id=%s territories=%s days=%s",
+        subscriber_id, len(result), FOUNDER_GRACE_EXTENSION_DAYS,
+    )
+    return True
+
 
 def create_or_reuse_offer(subscriber_id: int, branch: str, db: Session) -> str:
     """

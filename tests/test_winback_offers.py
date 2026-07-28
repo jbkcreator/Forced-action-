@@ -224,6 +224,114 @@ class TestReconcilePendingCreditGrants:
         assert result["checked"] == 0
 
 
+class TestGrantFounderGraceExtension:
+    """
+    Founder-tier (tier == 'founder') zip_held substitute for the 50%-off
+    coupon — a one-time +14-day territory grace extension, granted
+    immediately rather than on checkout redemption (wayfinder map
+    notion-pending-tasks, tickets F1/F2/F3).
+    """
+
+    @pytest.fixture
+    def founder_subscriber(self, fresh_db):
+        sub = Subscriber(
+            email="founder-winback-test@example.com",
+            tier="founder",
+            status="churned",
+            vertical="roofing",
+            county_id="hillsborough",
+            stripe_customer_id="cus_founder_winback_test",
+        )
+        fresh_db.add(sub)
+        fresh_db.flush()
+        return sub
+
+    @pytest.fixture
+    def grace_territory(self, fresh_db, founder_subscriber):
+        from src.core.models import ZipTerritory
+        expires = datetime.now(timezone.utc) + timedelta(days=5)
+        terr = ZipTerritory(
+            zip_code="99901",
+            vertical="roofing",
+            county_id="test_founder_grace_county",
+            subscriber_id=founder_subscriber.id,
+            status="grace",
+            grace_expires_at=expires,
+        )
+        fresh_db.add(terr)
+        fresh_db.flush()
+        return terr
+
+    def test_extends_grace_expires_at_by_14_days(
+        self, fresh_db, founder_subscriber, grace_territory
+    ):
+        from src.services.winback_offers import grant_founder_grace_extension
+        original_expiry = grace_territory.grace_expires_at.replace(tzinfo=None)
+        ok = grant_founder_grace_extension(founder_subscriber.id, fresh_db)
+        fresh_db.flush()
+        fresh_db.refresh(grace_territory)
+        assert ok is True
+        assert grace_territory.grace_expires_at == original_expiry + timedelta(days=14)
+
+    def test_stamps_founder_grace_extension_granted_at(
+        self, fresh_db, founder_subscriber, grace_territory
+    ):
+        from src.services.winback_offers import grant_founder_grace_extension
+        grant_founder_grace_extension(founder_subscriber.id, fresh_db)
+        fresh_db.flush()
+        fresh_db.refresh(founder_subscriber)
+        assert founder_subscriber.founder_grace_extension_granted_at is not None
+
+    def test_one_time_only_second_call_is_a_no_op(
+        self, fresh_db, founder_subscriber, grace_territory
+    ):
+        from src.services.winback_offers import grant_founder_grace_extension
+        first_ok = grant_founder_grace_extension(founder_subscriber.id, fresh_db)
+        fresh_db.flush()
+        fresh_db.refresh(grace_territory)
+        expiry_after_first = grace_territory.grace_expires_at
+
+        second_ok = grant_founder_grace_extension(founder_subscriber.id, fresh_db)
+        fresh_db.flush()
+        fresh_db.refresh(grace_territory)
+
+        assert first_ok is True
+        assert second_ok is False
+        assert grace_territory.grace_expires_at == expiry_after_first  # unchanged
+
+    def test_no_grace_territory_is_a_no_op(self, fresh_db, founder_subscriber):
+        from src.services.winback_offers import grant_founder_grace_extension
+        ok = grant_founder_grace_extension(founder_subscriber.id, fresh_db)
+        fresh_db.flush()
+        fresh_db.refresh(founder_subscriber)
+        assert ok is False
+        assert founder_subscriber.founder_grace_extension_granted_at is None
+
+    def test_only_extends_grace_status_rows_not_locked(
+        self, fresh_db, founder_subscriber, grace_territory
+    ):
+        """A founder may hold both a grace-status and a locked-status
+        territory (different ZIPs) — only the grace one is at risk, so only
+        it should move."""
+        from src.core.models import ZipTerritory
+        from src.services.winback_offers import grant_founder_grace_extension
+
+        locked = ZipTerritory(
+            zip_code="99902",
+            vertical="roofing",
+            county_id="test_founder_grace_county",
+            subscriber_id=founder_subscriber.id,
+            status="locked",
+        )
+        fresh_db.add(locked)
+        fresh_db.flush()
+
+        grant_founder_grace_extension(founder_subscriber.id, fresh_db)
+        fresh_db.flush()
+        fresh_db.refresh(locked)
+        assert locked.grace_expires_at is None  # untouched — never had a grace window
+
+
 class TestFullRedemptionFlow:
     """End-to-end: mint at send time, redeem at checkout — credits only land on redemption."""
 

@@ -1201,6 +1201,12 @@ class Subscriber(Base):
     rate_locked_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     escalated_at: Mapped[Optional[datetime]] = mapped_column(DateTime)     # set when 6-month founding rate expires
 
+    # Founder-tier (tier == 'founder') zip_held win-back benefit — a one-time,
+    # +14-day territory grace extension in place of the standard 50%-off
+    # coupon (founders don't get discounted). Live-state only: applies while
+    # currently tier == 'founder'; not tied to founding_member/founding rate.
+    founder_grace_extension_granted_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
     # Subscription state
     status: Mapped[str] = mapped_column(String(20), default='active', nullable=False)  # active | grace | churned | cancelled
     billing_date: Mapped[Optional[datetime]] = mapped_column(DateTime)
