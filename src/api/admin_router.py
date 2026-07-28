@@ -1399,6 +1399,20 @@ def _update_slack_message(candidate: "ExpansionCandidate", reply_text: str) -> N
 # RELAY — APPROVAL QUEUE DECISION + KILL COMMAND (RELAY-v2.2 sub-task R1)
 # ===========================================================================
 
+def _relay_approver_authorized(user_id: str) -> bool:
+    """Fail CLOSED: an empty/unset RELAY_APPROVERS means NOBODY is
+    authorized, not everybody (PR #179 review finding #3). The previous
+    per-endpoint checks (`if approvers and user_id not in approvers`)
+    short-circuited to a no-op when `approvers` was the default empty
+    list, silently accepting any Slack workspace member as an approver
+    (a valid Slack signature only proves the request came from Slack for
+    this app -- it says nothing about which workspace member sent it).
+    Shared by both /slack/relay-decision and /slack/kill so the fix lives
+    in one place rather than two easily-desynced copies."""
+    approvers = settings.relay_approvers
+    return bool(approvers) and user_id in approvers
+
+
 def _update_relay_slack_message(slack_message_ts: str, reply_text: str) -> None:
     """Replace the Approve/Reject buttons with the decision outcome, in
     place. Mirrors _update_slack_message's county-launch pattern."""
@@ -1439,8 +1453,7 @@ async def slack_relay_decision(request: Request):
         raise HTTPException(status_code=400, detail="Malformed payload")
 
     user_id = payload.get("user", {}).get("id", "")
-    approvers = settings.relay_approvers
-    if approvers and user_id not in approvers:
+    if not _relay_approver_authorized(user_id):
         return _slack_ephemeral("Not authorized to approve Relay sends.")
 
     actions = payload.get("actions", [])
@@ -1498,8 +1511,7 @@ async def slack_kill_command(request: Request):
     # gates /slack/relay-decision, since killing the fleet is at least as
     # consequential as approving one send.
     user_id = form.get("user_id", [""])[0]
-    approvers = settings.relay_approvers
-    if approvers and user_id not in approvers:
+    if not _relay_approver_authorized(user_id):
         return _slack_ephemeral("Not authorized to issue kill commands.")
 
     text_arg = form.get("text", [""])[0].strip().upper()

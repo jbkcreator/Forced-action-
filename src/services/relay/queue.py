@@ -251,10 +251,14 @@ def try_claim_for_batch(item_id: int, batch_id: str, *, stale_after_minutes: int
 
 def sent_counts_today(now: datetime, *, timezone_name: str) -> dict[str, int]:
     """Per-channel count of rows already 'sent' since midnight in
-    `timezone_name` (RELAY-v2.2 sub-task R3). One query per batch; the
-    caller (engine.execute_batch) increments the returned dict in memory
-    as the batch sends, so a single batch cannot exceed the ceiling
-    between queries."""
+    `timezone_name`. Reporting only -- NOT the daily-ceiling enforcement
+    mechanism (see PR #179 review finding #2: a per-batch local snapshot
+    like this one cannot enforce a cap across concurrent workers, since
+    two overlapping sweeps would each read the same snapshot and neither
+    would see the other's in-flight sends). The real-time ceiling gate is
+    src.services.relay.guards.reserve_daily_slot(), an atomic Redis
+    counter. This function remains for dashboards/audits that want the
+    actual historical sent count."""
     from zoneinfo import ZoneInfo
 
     local_midnight = now.astimezone(ZoneInfo(timezone_name)).replace(
@@ -273,37 +277,42 @@ def sent_counts_today(now: datetime, *, timezone_name: str) -> dict[str, int]:
         return {r["channel"]: r["n"] for r in rows}
 
 
-def mark_sent(item_id: int) -> None:
-    """Transitions a claimed row to 'sent' -- guarded to only ever leave
-    'approved', for the same reason mark_skipped() is guarded (see its
-    docstring): both callers only reach this right after a same-run
-    try_claim_for_batch() success, so status is still 'approved' at this
-    point in the normal path, but the guard is what stops a second,
-    concurrent dispatch of the same row (e.g. a slow send outliving
-    try_claim_for_batch's stale-claim window and getting reclaimed by
-    another sweep) from silently overwriting a completed receipt."""
+def mark_sent(item_id: int, *, batch_id: str) -> None:
+    """Transitions a claimed row to 'sent' -- guarded on both
+    'status = approved' AND 'batch_id = <this worker's batch_id>' (PR #179
+    review finding #1). The status guard alone isn't sufficient: if a
+    dispatch runs long enough to outlive try_claim_for_batch's staleness
+    window, a DIFFERENT worker can legitimately reclaim the same row as
+    stale and dispatch it again while the first dispatch is still in
+    flight. Requiring the caller's own batch_id to still match means only
+    whichever worker currently owns the row can finalize it -- the other
+    worker's call simply no-ops (0 rows match) instead of silently
+    overwriting a completed receipt."""
     with get_db_context() as session:
         session.execute(
             text(
                 "UPDATE relay_approval_queue SET status = :status, "
                 "dispatched_at = now(), updated_at = now() "
-                "WHERE id = :id AND status = :approved"
+                "WHERE id = :id AND status = :approved AND batch_id = :batch_id"
             ),
-            {"status": STATUS_SENT, "id": item_id, "approved": STATUS_APPROVED},
+            {"status": STATUS_SENT, "id": item_id, "approved": STATUS_APPROVED, "batch_id": batch_id},
         )
 
 
-def mark_failed(item_id: int, error: str) -> None:
+def mark_failed(item_id: int, error: str, *, batch_id: str) -> None:
     """Transitions a claimed row to 'failed' -- guarded identically to
-    mark_sent()/mark_skipped(), same reasoning."""
+    mark_sent(), same reasoning."""
     with get_db_context() as session:
         session.execute(
             text(
                 "UPDATE relay_approval_queue SET status = :status, "
                 "error = :error, updated_at = now() "
-                "WHERE id = :id AND status = :approved"
+                "WHERE id = :id AND status = :approved AND batch_id = :batch_id"
             ),
-            {"status": STATUS_FAILED, "error": error, "id": item_id, "approved": STATUS_APPROVED},
+            {
+                "status": STATUS_FAILED, "error": error, "id": item_id,
+                "approved": STATUS_APPROVED, "batch_id": batch_id,
+            },
         )
 
 

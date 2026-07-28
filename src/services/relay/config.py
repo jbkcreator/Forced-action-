@@ -40,6 +40,9 @@ GUARD_BLOCK = "block"
 
 # Guard reason strings, written to the queue row's `error` column on BLOCK
 # (via mark_skipped) or logged only on DEFER (see engine.execute_batch()).
+# The daily-ceiling reason is logged directly in engine.py rather than kept
+# here -- reserve_daily_slot() returns a plain bool, not a Verdict, since PR
+# #179's fix moved the ceiling out of evaluate() into its own atomic
+# reserve/release step (see guards.py).
 REASON_OUTSIDE_SEND_WINDOW = "outside_send_window"
-REASON_DAILY_CEILING_REACHED = "daily_ceiling_reached"  # suffixed with ":{channel}"
 REASON_SUPPRESSED = "suppressed"  # suffixed with ":{cause}", e.g. "suppressed:email_opt_out"

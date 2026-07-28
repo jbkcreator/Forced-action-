@@ -129,6 +129,21 @@ def rincr(key: str, ttl_seconds: Optional[int] = None) -> int:
         return 0
 
 
+def rdecr(key: str) -> int:
+    """Atomic DECR, mirroring rincr(). Used to release a reservation taken
+    via rincr() that ultimately went unused (e.g. RELAY-v2.2 R3's daily-
+    ceiling slot, refunded on a lost claim or failed dispatch). Returns 0
+    on a Redis failure, same convention as rincr()."""
+    client = _get_client()
+    if client is None:
+        return 0
+    try:
+        return client.decr(key)
+    except Exception as exc:
+        logger.warning("Redis rdecr failed for %s: %s", key, exc)
+        return 0
+
+
 def rdelete(key: str) -> None:
     client = _get_client()
     if client is None:

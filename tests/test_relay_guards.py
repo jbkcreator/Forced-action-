@@ -1,16 +1,23 @@
 """
-Tests for src.services.relay.guards (RELAY-v2.2 sub-task R3).
+Tests for src.services.relay.guards (RELAY-v2.2 sub-task R3; ceiling
+reworked for the PR #179 review fix).
 
-evaluate() is a pure function over an injected clock (`now`) and an injected
-per-channel send count (`sent_today`) for the window/ceiling checks, so those
-cases need no DB and no clock mocking. The suppression check is the only
-DB-touching branch; it's exercised by monkeypatching
-`is_email_suppressed` directly (the same no-real-DB convention used in
-test_relay_queue.py) rather than mocking get_db_context.
+evaluate() is a pure function over an injected clock (`now`) for the window
+check, so those cases need no DB and no clock mocking. The suppression check
+is the only DB-touching branch in evaluate(); it's exercised by
+monkeypatching `is_email_suppressed` directly (the same no-real-DB
+convention used in test_relay_queue.py) rather than mocking get_db_context.
+
+reserve_daily_slot()/release_daily_slot() are exercised here by
+monkeypatching `rincr`/`rdecr` directly (unit-level, no real Redis needed) --
+the real-Redis concurrent-reservation proof lives in
+test_relay_concurrency.py, since that's what actually demonstrates the fix
+(two truly concurrent callers can't both get past the ceiling).
 """
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
 from src.services.relay import guards
@@ -45,20 +52,20 @@ def _make_item(channel: str = "email", recipient: str = "prospect@example.com") 
 def test_inside_window_allows(monkeypatch):
     monkeypatch.setattr(guards, "is_email_suppressed", lambda db, email: False)
     item = _make_item()
-    verdict = guards.evaluate(item, now=_et(2026, 7, 27, 14), sent_today={})
+    verdict = guards.evaluate(item, now=_et(2026, 7, 27, 14))
     assert verdict.outcome == guards.ALLOW
 
 
 def test_before_window_defers():
     item = _make_item()
-    verdict = guards.evaluate(item, now=_et(2026, 7, 27, 9), sent_today={})
+    verdict = guards.evaluate(item, now=_et(2026, 7, 27, 9))
     assert verdict.outcome == guards.DEFER
     assert verdict.reason == "outside_send_window"
 
 
 def test_after_window_defers():
     item = _make_item()
-    verdict = guards.evaluate(item, now=_et(2026, 7, 27, 19), sent_today={})
+    verdict = guards.evaluate(item, now=_et(2026, 7, 27, 19))
     assert verdict.outcome == guards.DEFER
     assert verdict.reason == "outside_send_window"
 
@@ -69,32 +76,14 @@ def test_window_respects_dst(monkeypatch):
     monkeypatch.setattr(guards, "is_email_suppressed", lambda db, email: False)
     item = _make_item()
     for now in (_et(2026, 1, 15, 14), _et(2026, 7, 15, 14)):
-        verdict = guards.evaluate(item, now=now, sent_today={})
+        verdict = guards.evaluate(item, now=now)
         assert verdict.outcome == guards.ALLOW
-
-
-def test_ceiling_reached_defers(monkeypatch):
-    monkeypatch.setattr(guards, "is_email_suppressed", lambda db, email: False)
-    item = _make_item(channel="email")
-    verdict = guards.evaluate(item, now=_et(2026, 7, 27, 14), sent_today={"email": 20})
-    assert verdict.outcome == guards.DEFER
-    assert verdict.reason == "daily_ceiling_reached:email"
-
-
-def test_ceiling_is_per_channel(monkeypatch):
-    monkeypatch.setattr(guards, "is_email_suppressed", lambda db, email: False)
-    item = _make_item(channel="sms")
-    verdict = guards.evaluate(item, now=_et(2026, 7, 27, 14), sent_today={"email": 20})
-    # sms isn't at its ceiling; falls through to the suppression check, which
-    # for sms goes through validate_outbound (not mocked here) -- assert we
-    # at least got past the ceiling guard, not blocked by it.
-    assert verdict.reason != "daily_ceiling_reached:sms"
 
 
 def test_suppressed_email_blocks(monkeypatch):
     monkeypatch.setattr(guards, "is_email_suppressed", lambda db, email: True)
     item = _make_item(channel="email")
-    verdict = guards.evaluate(item, now=_et(2026, 7, 27, 14), sent_today={})
+    verdict = guards.evaluate(item, now=_et(2026, 7, 27, 14))
     assert verdict.outcome == guards.BLOCK
     assert verdict.reason == "suppressed:email_opt_out"
 
@@ -109,19 +98,7 @@ def test_window_checked_before_db(monkeypatch):
         lambda db, email: calls.append(1) or False,
     )
     item = _make_item()
-    guards.evaluate(item, now=_et(2026, 7, 27, 9), sent_today={})
-    assert calls == []
-
-
-def test_ceiling_checked_before_suppression(monkeypatch):
-    """A ceiling-blocked item must also never touch is_email_suppressed."""
-    calls = []
-    monkeypatch.setattr(
-        guards, "is_email_suppressed",
-        lambda db, email: calls.append(1) or False,
-    )
-    item = _make_item(channel="email")
-    guards.evaluate(item, now=_et(2026, 7, 27, 14), sent_today={"email": 20})
+    guards.evaluate(item, now=_et(2026, 7, 27, 9))
     assert calls == []
 
 
@@ -132,6 +109,59 @@ def test_noop_channel_allows_without_suppression_check(monkeypatch):
         lambda db, email: calls.append(1) or False,
     )
     item = _make_item(channel="noop")
-    verdict = guards.evaluate(item, now=_et(2026, 7, 27, 14), sent_today={})
+    verdict = guards.evaluate(item, now=_et(2026, 7, 27, 14))
     assert verdict.outcome == guards.ALLOW
     assert calls == []  # 'noop' branch in _suppression_reason never calls is_email_suppressed
+
+
+# ---------------------------------------------------------------------------
+# RELAY-v2.2 PR #179 review fix — atomic daily-ceiling reservation
+# ---------------------------------------------------------------------------
+
+def _fake_settings(ceiling: int = 20):
+    return MagicMock(
+        relay_send_window_timezone="America/New_York",
+        relay_daily_ceiling=ceiling,
+    )
+
+
+def test_reserve_allows_under_ceiling(monkeypatch):
+    monkeypatch.setattr(guards, "rincr", lambda key, ttl_seconds=None: 5)
+    assert guards.reserve_daily_slot("email", _et(2026, 7, 27, 14), _fake_settings(20)) is True
+
+
+def test_reserve_allows_the_exact_ceiling_count(monkeypatch):
+    """The Nth reservation when ceiling=N is the last one PERMITTED (matches
+    the original >= semantics: up to and including the ceiling count is
+    allowed; only the (N+1)th is denied)."""
+    monkeypatch.setattr(guards, "rincr", lambda key, ttl_seconds=None: 20)
+    assert guards.reserve_daily_slot("email", _et(2026, 7, 27, 14), _fake_settings(20)) is True
+
+
+def test_reserve_denies_over_ceiling(monkeypatch):
+    monkeypatch.setattr(guards, "rincr", lambda key, ttl_seconds=None: 21)
+    assert guards.reserve_daily_slot("email", _et(2026, 7, 27, 14), _fake_settings(20)) is False
+
+
+def test_reserve_fails_closed_when_redis_unavailable(monkeypatch):
+    """rincr() returns 0 ONLY on a Redis failure (a real INCR can never
+    return 0) -- reserve_daily_slot() must treat that as "no slot", not
+    "plenty of room", since deferring is always safe and silently
+    exceeding the ceiling is not."""
+    monkeypatch.setattr(guards, "rincr", lambda key, ttl_seconds=None: 0)
+    assert guards.reserve_daily_slot("email", _et(2026, 7, 27, 14), _fake_settings(20)) is False
+
+
+def test_reserve_key_is_scoped_by_channel_and_local_date(monkeypatch):
+    seen_keys = []
+    monkeypatch.setattr(guards, "rincr", lambda key, ttl_seconds=None: seen_keys.append(key) or 1)
+    guards.reserve_daily_slot("email", _et(2026, 7, 27, 14), _fake_settings(20))
+    guards.reserve_daily_slot("sms", _et(2026, 7, 27, 14), _fake_settings(20))
+    assert seen_keys == ["relay_daily_sent:email:2026-07-27", "relay_daily_sent:sms:2026-07-27"]
+
+
+def test_release_decrements_the_same_key(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(guards, "rdecr", lambda key: seen.setdefault("key", key))
+    guards.release_daily_slot("email", _et(2026, 7, 27, 14), _fake_settings(20))
+    assert seen["key"] == "relay_daily_sent:email:2026-07-27"

@@ -1,17 +1,26 @@
 """
-Relay execution engine (RELAY-v2.2 sub-task R1).
+Relay execution engine (RELAY-v2.2 sub-task R1; reworked for PR #179
+review findings #1 and #2).
 
 execute_batch() is RELAY's core: it takes a list of already-approved
 relay_approval_queue rows and dispatches each one exactly, deterministically,
 with no model in the path (build spec §9.1: "No model in the execution
 path — no drift, no interpretation, no agent ever touching a prospect").
 
-Two safety guarantees, both DB-enforced rather than in-memory:
+Three safety guarantees, all DB/Redis-enforced rather than in-memory:
   1. Kill command — checked before the batch and before every single item;
      halts within one cycle (build spec §9.1).
   2. Idempotency — a row is only dispatched if try_claim_for_batch()
      atomically claims it as 'approved' and unclaimed; this holds even if
-     two sweep runs overlap or a run is retried mid-batch.
+     two sweep runs overlap or a run is retried mid-batch. A lost claim
+     leaves the row completely untouched (never marked 'skipped') so the
+     winning worker's eventual mark_sent()/mark_failed() -- guarded on
+     that worker's own batch_id -- is never silently overwritten.
+  3. Daily ceiling — reserved atomically per item via
+     guards.reserve_daily_slot() BEFORE the row is claimed, so concurrent
+     workers can never jointly exceed the configured per-channel cap. A
+     reservation that ends up unused (lost claim, failed dispatch) is
+     refunded via guards.release_daily_slot().
 """
 from __future__ import annotations
 
@@ -53,15 +62,24 @@ def execute_batch(items: list[QueueItem], *, batch_id: str, now: datetime | None
       1. Re-check the relay_global kill switch; on red, stop immediately.
          Undispatched items are left untouched (still 'approved',
          unclaimed) so the next sweep tick safely resumes them.
-      2. Run guards.evaluate() (RELAY-v2.2 sub-task R3) — send window,
-         daily ceiling, execution-time suppression recheck. DEFER leaves
-         the row untouched (still 'approved', unclaimed) for a later
-         sweep; BLOCK marks it 'skipped', terminal.
-      3. Atomically claim the row for this batch_id. If another run
-         already claimed it, skip without dispatching (idempotency).
-      4. Dispatch via the registered channel handler. An unknown channel,
-         or any exception the handler raises, marks the item 'failed' and
-         moves on — one bad item never aborts the batch.
+      2. Run guards.evaluate() — send window, execution-time suppression
+         recheck. DEFER leaves the row untouched (still 'approved',
+         unclaimed) for a later sweep; BLOCK marks it 'skipped', terminal.
+      3. Atomically reserve one of today's per-channel send slots
+         (guards.reserve_daily_slot(), PR #179 review finding #2) BEFORE
+         claiming the row — the ceiling is shared state across every
+         concurrent worker, so it must be reserved before, not after, a
+         claim that might turn out to be lost.
+      4. Atomically claim the row for this batch_id. If another run
+         already claimed it, the row is left completely untouched (PR #179
+         review finding #1 — it is never marked 'skipped'; either the
+         owning worker finishes it correctly, or it becomes reclaimable
+         once try_claim_for_batch's staleness window elapses) and the
+         reservation from step 3 is refunded.
+      5. Dispatch via the registered channel handler. An unknown channel,
+         or any exception the handler raises, marks the item 'failed'
+         (guarded on this worker's own batch_id, per finding #1) and
+         refunds the reservation — one bad item never aborts the batch.
 
     `now` defaults to the real clock; tests inject a fixed value so guard
     behavior (and every pre-R3 test unrelated to guards) doesn't depend on
@@ -79,7 +97,6 @@ def execute_batch(items: list[QueueItem], *, batch_id: str, now: datetime | None
 
     now = now if now is not None else datetime.now(timezone.utc)
     settings = get_settings()
-    sent_today = queue.sent_counts_today(now, timezone_name=settings.relay_send_window_timezone)
 
     for item in items:
         if _kill_switch_is_red():
@@ -92,7 +109,7 @@ def execute_batch(items: list[QueueItem], *, batch_id: str, now: datetime | None
             result.halted = True
             break
 
-        verdict = guards.evaluate(item, now=now, sent_today=sent_today)
+        verdict = guards.evaluate(item, now=now)
         if verdict.outcome == guards.DEFER:
             logger.info("[Relay] item %d deferred: %s", item.id, verdict.reason)
             result.deferred += 1
@@ -104,19 +121,28 @@ def execute_batch(items: list[QueueItem], *, batch_id: str, now: datetime | None
             result.processed_ids.append(item.id)
             continue
 
+        if not guards.reserve_daily_slot(item.channel, now, settings):
+            logger.info(
+                "[Relay] item %d deferred: daily ceiling reached (or Redis unavailable) for channel %s",
+                item.id, item.channel,
+            )
+            result.deferred += 1
+            continue
+
         if not queue.try_claim_for_batch(item.id, batch_id):
             logger.info(
-                "[Relay] item %d already claimed/moved — skipping (idempotency)",
+                "[Relay] item %d already claimed/moved — leaving untouched for its owner (idempotency)",
                 item.id,
             )
-            queue.mark_skipped(item.id, "claim_lost_to_concurrent_run")
+            guards.release_daily_slot(item.channel, now, settings)
             result.skipped += 1
             result.processed_ids.append(item.id)
             continue
 
         dispatcher = DISPATCHERS.get(item.channel)
         if dispatcher is None:
-            queue.mark_failed(item.id, f"unknown_channel:{item.channel}")
+            guards.release_daily_slot(item.channel, now, settings)
+            queue.mark_failed(item.id, f"unknown_channel:{item.channel}", batch_id=batch_id)
             logger.error(
                 "[Relay] item %d has unknown channel %r — marked failed",
                 item.id, item.channel,
@@ -128,16 +154,16 @@ def execute_batch(items: list[QueueItem], *, batch_id: str, now: datetime | None
         try:
             dispatcher(item)
         except Exception as exc:
-            queue.mark_failed(item.id, str(exc))
+            guards.release_daily_slot(item.channel, now, settings)
+            queue.mark_failed(item.id, str(exc), batch_id=batch_id)
             logger.error(
                 "[Relay] item %d dispatch failed on channel %r: %s",
                 item.id, item.channel, exc, exc_info=True,
             )
             result.failed += 1
         else:
-            queue.mark_sent(item.id)
+            queue.mark_sent(item.id, batch_id=batch_id)
             result.sent += 1
-            sent_today[item.channel] = sent_today.get(item.channel, 0) + 1
         result.processed_ids.append(item.id)
 
     return result

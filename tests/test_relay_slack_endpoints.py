@@ -222,6 +222,41 @@ def test_kill_invalid_arg_returns_usage(app_client, monkeypatch):
     mock_rset.assert_not_called()
 
 
+# ---------------------------------------------------------------------------
+# PR #179 review finding #3 — empty RELAY_APPROVERS must fail CLOSED, not
+# fail open. Every test above uses app_client's ["U_APPROVER"] fixture, so
+# none of them ever covered the actual default (unset) production
+# configuration -- these are new, targeted specifically at that gap.
+# ---------------------------------------------------------------------------
+
+def test_empty_approvers_rejects_every_user_on_decision(app_client, monkeypatch):
+    """The default RELAY_APPROVERS=[] must NOT mean 'anyone is authorized' --
+    it must mean nobody is, until the list is explicitly configured."""
+    monkeypatch.setattr("src.api.admin_router.settings.relay_approvers", [])
+    mock_record_decision = MagicMock()
+    monkeypatch.setattr("src.services.relay.queue.record_decision", mock_record_decision)
+
+    resp = _post_decision(app_client, _interactive_payload("U_ANYONE", 1, "approve"))
+
+    assert resp.status_code == 200
+    assert "Not authorized" in resp.json()["text"]
+    mock_record_decision.assert_not_called()
+
+
+def test_empty_approvers_rejects_every_user_on_kill(app_client, monkeypatch):
+    """Same fail-closed requirement for the kill command -- an unconfigured
+    approver list must not let any workspace member halt the fleet."""
+    monkeypatch.setattr("src.api.admin_router.settings.relay_approvers", [])
+    mock_rset = MagicMock()
+    monkeypatch.setattr("src.core.redis_client.rset", mock_rset)
+
+    resp = _post_kill(app_client, "ALL", user_id="U_ANYONE")
+
+    assert resp.status_code == 200
+    assert "Not authorized" in resp.json()["text"]
+    mock_rset.assert_not_called()
+
+
 def test_kill_invalid_signature_returns_401(app_client):
     resp = _post_kill(app_client, "ALL", bad_sig=True)
     assert resp.status_code == 401
