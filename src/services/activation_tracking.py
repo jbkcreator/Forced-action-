@@ -83,12 +83,39 @@ def stamp_first_unlock(subscriber_id: int, db: Session) -> None:
         )
 
 
+def stamp_onboarding_completed(subscriber_id: int, db: Session) -> None:
+    """Set-once stamp for the one-time preference form (PATCH /onboarding).
+
+    The only step between signup and first_leads_shown_time — without this,
+    "never opened onboarding" and "opened it, never saw a lead" were the same
+    NULL in the funnel data (Section 4.10 gap)."""
+    try:
+        with db.begin_nested():
+            _ensure_row(subscriber_id, db)
+            db.execute(
+                text(
+                    """
+                    UPDATE activation_events
+                    SET onboarding_completed_time = now()
+                    WHERE subscriber_id = :subscriber_id
+                      AND onboarding_completed_time IS NULL
+                    """
+                ),
+                {"subscriber_id": subscriber_id},
+            )
+    except Exception as exc:  # noqa: BLE001 — instrumentation must not break onboarding submit
+        logger.warning(
+            "activation_tracking: onboarding_completed stamp failed for subscriber=%s: %s",
+            subscriber_id, exc,
+        )
+
+
 def get_activation_status(subscriber_id: int, db: Session) -> dict:
     """Return the activation timestamps for a subscriber, or all-None if no row yet."""
     row = db.execute(
         text(
             """
-            SELECT signup_time, first_leads_shown_time, first_unlock_time
+            SELECT signup_time, onboarding_completed_time, first_leads_shown_time, first_unlock_time
             FROM activation_events
             WHERE subscriber_id = :subscriber_id
             """
@@ -97,10 +124,14 @@ def get_activation_status(subscriber_id: int, db: Session) -> dict:
     ).mappings().first()
 
     if not row:
-        return {"signup_time": None, "first_leads_shown_time": None, "first_unlock_time": None}
+        return {
+            "signup_time": None, "onboarding_completed_time": None,
+            "first_leads_shown_time": None, "first_unlock_time": None,
+        }
 
     return {
         "signup_time": row["signup_time"].isoformat() if row["signup_time"] else None,
+        "onboarding_completed_time": row["onboarding_completed_time"].isoformat() if row["onboarding_completed_time"] else None,
         "first_leads_shown_time": row["first_leads_shown_time"].isoformat() if row["first_leads_shown_time"] else None,
         "first_unlock_time": row["first_unlock_time"].isoformat() if row["first_unlock_time"] else None,
     }

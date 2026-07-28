@@ -1,5 +1,5 @@
 """Unit tests for the onboarding preference step (PATCH /api/subscriber/onboarding/{feed_uuid})."""
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -51,6 +51,34 @@ class TestSubmitOnboardingEndpoint:
         assert subscriber.investment_budget_band == "150k_500k"
         assert subscriber.onboarding_completed is True
         mock_db.flush.assert_called_once()
+
+    def test_patch_stamps_onboarding_completed_activation_event(self, mock_db):
+        """Section 4.10: the onboarding submit must stamp activation_events
+        so the funnel can tell 'never onboarded' apart from 'onboarded, never
+        saw a lead'."""
+        from fastapi.testclient import TestClient
+        from src.api.main import app, get_db
+        from src.services.subscriber_auth import get_current_subscriber
+
+        subscriber = MagicMock(id=7, onboarding_completed=False)
+
+        app.dependency_overrides[get_db] = lambda: mock_db
+        app.dependency_overrides[get_current_subscriber] = lambda: subscriber
+        try:
+            client = TestClient(app)
+            with patch(
+                "src.services.activation_tracking.stamp_onboarding_completed"
+            ) as mock_stamp:
+                resp = client.patch(
+                    "/api/subscriber/onboarding/feed-uuid-abc",
+                    json={"preferred_property_type": "multi_family", "investment_budget_band": "150k_500k"},
+                )
+        finally:
+            app.dependency_overrides.pop(get_db, None)
+            app.dependency_overrides.pop(get_current_subscriber, None)
+
+        assert resp.status_code == 200
+        mock_stamp.assert_called_once_with(7, mock_db)
 
     def test_patch_rejects_invalid_choice_422(self, mock_db):
         from fastapi.testclient import TestClient

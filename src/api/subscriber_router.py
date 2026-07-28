@@ -233,5 +233,8 @@ def submit_onboarding(
     subscriber.onboarding_completed = True
     db.flush()
 
+    from src.services.activation_tracking import stamp_onboarding_completed
+    stamp_onboarding_completed(subscriber.id, db)
+
     logger.info("[onboarding] preferences captured for sub=%s", subscriber.id)
     return {"ok": True}
