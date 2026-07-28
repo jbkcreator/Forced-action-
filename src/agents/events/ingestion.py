@@ -41,6 +41,12 @@ from src.agents.supervisor import dispatch_event
 
 logger = logging.getLogger(__name__)
 
+# Pre-rename queue key. listen_redis BRPOPs this alongside "lifecycle:queue"
+# for one release so events already queued under the old key at deploy time
+# (nothing pushes here anymore post-rename) get drained instead of stranded.
+# Drop once prod is confirmed to have no lingering "cora:queue" traffic.
+_LEGACY_REDIS_QUEUE_KEY = "cora:queue"
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Public publish API — call this from services/tasks instead of dispatch_event
@@ -259,6 +265,11 @@ def listen_redis(
 	message. Events survive Lifecycle restarts (they wait in the list). They do NOT
 	survive a Redis restart unless AOF/RDB persistence is enabled on the Redis
 	instance — the Postgres lifecycle_event_queue is the durability backstop for that.
+
+	Also drains the pre-rename "cora:queue" key for one release, so events that
+	were already sitting there at deploy time (nothing pushes to it anymore)
+	get processed instead of silently stranded. BRPOP checks keys in the order
+	given, so "lifecycle:queue" is preferred once it has traffic.
 	"""
 	settings = get_agents_settings()
 	if not settings.redis_url:
@@ -277,13 +288,18 @@ def listen_redis(
 
 	try:
 		while not stop_event.is_set():
-			# BRPOP blocks up to `timeout` seconds then returns None.
+			# BRPOP blocks up to `timeout` seconds then returns None. Passing
+			# both keys drains the legacy queue during the rename transition;
 			# timeout=1 keeps the stop_event check responsive.
-			result = client.brpop(key, timeout=1)
+			result = client.brpop([key, _LEGACY_REDIS_QUEUE_KEY], timeout=1)
 			if result is None:
 				continue
 			try:
 				# result is (key_bytes, value_bytes); value is the JSON payload.
+				popped_key = result[0]
+				popped_key = popped_key.decode() if isinstance(popped_key, bytes) else popped_key
+				if popped_key == _LEGACY_REDIS_QUEUE_KEY:
+					logger.warning("listen_redis: drained event from legacy queue key=%s", _LEGACY_REDIS_QUEUE_KEY)
 				event = from_redis(result[1])
 				dispatch_event(event.to_dispatch_dict())
 			except Exception as exc:

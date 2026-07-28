@@ -4,7 +4,7 @@ from functools import lru_cache
 
 from typing import Optional
 
-from pydantic import AnyUrl, Field, SecretStr, PostgresDsn, field_validator
+from pydantic import AliasChoices, AnyUrl, Field, SecretStr, PostgresDsn, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -448,7 +448,13 @@ class AppSettings(BaseSettings):
 	# immediately. This is only the *baseline*; operators flip the switch at
 	# runtime via the admin queue (Redis override, see services/lifecycle_review_switch).
 	# When ON, marketing sends are held as pending_review for manual approve/cancel.
-	lifecycle_human_review_enabled: bool = Field(default=False, env="LIFECYCLE_HUMAN_REVIEW_ENABLED")
+	# Falls back to the pre-rename CORA_HUMAN_REVIEW_ENABLED name for one
+	# release so existing prod overrides don't silently reset to the default
+	# on deploy — drop the fallback once prod .env is confirmed migrated.
+	lifecycle_human_review_enabled: bool = Field(
+		default=False,
+		validation_alias=AliasChoices("LIFECYCLE_HUMAN_REVIEW_ENABLED", "CORA_HUMAN_REVIEW_ENABLED"),
+	)
 
 	# NWS Weather / Storm Pack (fa018)
 	# nws_weather_enabled      — master kill switch for entire NWS subsystem
@@ -458,7 +464,12 @@ class AppSettings(BaseSettings):
 	nws_weather_enabled: bool = Field(default=True, env="NWS_WEATHER_ENABLED")
 	nws_revenue_polling_enabled: bool = Field(default=True, env="NWS_REVENUE_POLLING_ENABLED")
 	storm_pack_enabled: bool = Field(default=True, env="STORM_PACK_ENABLED")
-	nws_lifecycle_urgency_enabled: bool = Field(default=True, env="NWS_LIFECYCLE_URGENCY_ENABLED")
+	# Falls back to the pre-rename NWS_CORA_URGENCY_ENABLED name for one release
+	# — same rationale as lifecycle_human_review_enabled above.
+	nws_lifecycle_urgency_enabled: bool = Field(
+		default=True,
+		validation_alias=AliasChoices("NWS_LIFECYCLE_URGENCY_ENABLED", "NWS_CORA_URGENCY_ENABLED"),
+	)
 	# Referenced by nws_webhook.process_alert steps 9+11 but missing until 2026-07 —
 	# the AttributeError killed signal tagging + rescore on every alert (incidents
 	# from weather stayed at 0 since fa018).
@@ -567,7 +578,12 @@ class AppSettings(BaseSettings):
 	# When false, src/tasks/lifecycle_self_healing.py is a no-op (returns 0 without
 	# touching DB/Redis). Rollout: ship code → enable in dev → soak in staging
 	# → enable in prod after a quiet week.
-	lifecycle_self_healing_enabled: bool = Field(default=False, env="LIFECYCLE_SELF_HEALING_ENABLED")
+	# Falls back to the pre-rename CORA_SELF_HEALING_ENABLED name for one
+	# release — same rationale as lifecycle_human_review_enabled above.
+	lifecycle_self_healing_enabled: bool = Field(
+		default=False,
+		validation_alias=AliasChoices("LIFECYCLE_SELF_HEALING_ENABLED", "CORA_SELF_HEALING_ENABLED"),
+	)
 	# Slack channel for Lifecycle incident posts. When unset, post_incident_slack()
 	# falls back to email.send_alert (same path as heartbeat_monitor /
 	# anomaly_pager). Slack-disabled is NEVER a silent failure.
