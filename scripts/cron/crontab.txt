@@ -117,8 +117,8 @@ COUNTY_ID=hillsborough
 
 # Quora S6 organic-answer pipeline — 06:35 AM UTC daily (after load validator).
 # Picks one keyword via DB rotation (quora_topics + cooldown_days), scrapes Quora,
-# publishes to Lifecycle for classification + answer drafting, upserts to quora_questions.
-#35 6 * * * $PROJECT/scripts/cron/run.sh src.tasks.quora_s6_orchestrator
+# publishes to Cora for classification + answer drafting, upserts to quora_questions.
+35 6 * * * $PROJECT/scripts/cron/run.sh src.tasks.quora_s6_orchestrator
 
 # Autonomous Inbound Content Loop (Task 5.1) — Weekly Sunday @ 09:00 AM UTC.
 # Scores each Quora Seed Keyword over a 30-day window, deactivates losers
@@ -127,7 +127,7 @@ COUNTY_ID=hillsborough
 # clear of the 04:00–08:00 scrape/CDS/skip-trace/GHL chain. See docs/adr/0021.
 # DISABLED alongside quora_s6_orchestrator — this loop only scores/expands
 # Quora Seed Keywords, which stop moving once the scraper feeding them is off.
-#0 9 * * 0 $PROJECT/scripts/cron/run.sh src.tasks.autonomous_tuning_worker
+0 9 * * 0 $PROJECT/scripts/cron/run.sh src.tasks.autonomous_tuning_worker
 
 # ── PINELLAS DAILY ────────────────────────────────────────────
 # Staggered +5 min after their Hillsborough counterparts within 04:00–06:30 UTC window.
