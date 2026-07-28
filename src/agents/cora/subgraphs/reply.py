@@ -58,35 +58,41 @@ class ReplyState(TypedDict, total=False):
     reject_reason: Optional[str]
 
 
-def _node_match_thread(state: ReplyState) -> ReplyState:
-    """
-    A real inbound reply arrives with only a from_address — the producer
-    doesn't know which opportunity_thread_id it belongs to. Resolves it by
-    matching from_address against every draft's contact_email
-    (store.find_opportunity_thread_id_by_email); unmatched goes to
-    manual_review, never guessed. A caller that already knows the
-    opportunity_thread_id (tests, backfill, the seeded-reply fixtures) can
-    still supply it directly and skip this lookup.
-    """
-    reply_id = store.new_reply_id()
-    thread_id = state.get("opportunity_thread_id")
-    if not thread_id:
-        thread_id = store.find_opportunity_thread_id_by_email(state.get("from_address", ""))
+def _make_node_match_thread(db: Optional[Session]):
+    def _node_match_thread(state: ReplyState) -> ReplyState:
+        """
+        A real inbound reply arrives with only a from_address — the producer
+        doesn't know which opportunity_thread_id it belongs to. Resolves it by
+        matching from_address against every draft's contact_email
+        (store.find_opportunity_thread_id_by_email); unmatched goes to
+        manual_review, never guessed. A caller that already knows the
+        opportunity_thread_id (tests, backfill, the seeded-reply fixtures) can
+        still supply it directly and skip this lookup.
+        """
+        reply_id = store.new_reply_id()
+        thread_id = state.get("opportunity_thread_id")
         if not thread_id:
-            return {"reply_id": reply_id, "status": "manual_review"}
-        return {"reply_id": reply_id, "opportunity_thread_id": thread_id}
-    return {"reply_id": reply_id}
+            thread_id = store.find_opportunity_thread_id_by_email(db, state.get("from_address", ""))
+            if not thread_id:
+                return {"reply_id": reply_id, "status": "manual_review"}
+            return {"reply_id": reply_id, "opportunity_thread_id": thread_id}
+        return {"reply_id": reply_id}
+
+    return _node_match_thread
 
 
-def _node_load_conversation(state: ReplyState) -> ReplyState:
-    if state.get("status") == "manual_review":
-        return {}
-    conversation = store.read_conversation(state["opportunity_thread_id"])
-    if not conversation:
-        # A thread_id was supplied but Cora has no record of ever drafting to
-        # it — treat as unmatched rather than guessing.
-        return {"status": "manual_review"}
-    return {"conversation": conversation}
+def _make_node_load_conversation(db: Optional[Session]):
+    def _node_load_conversation(state: ReplyState) -> ReplyState:
+        if state.get("status") == "manual_review":
+            return {}
+        conversation = store.read_conversation(db, state["opportunity_thread_id"])
+        if not conversation:
+            # A thread_id was supplied but Cora has no record of ever drafting to
+            # it — treat as unmatched rather than guessing.
+            return {"status": "manual_review"}
+        return {"conversation": conversation}
+
+    return _node_load_conversation
 
 
 _CLASSIFY_SCHEMA = {
@@ -320,8 +326,8 @@ def build_reply_graph(db: Optional[Session] = None) -> StateGraph:
     # `db` is captured by closure into the nodes that need it, never placed in
     # graph state — see outreach.py's build_outreach_graph for why.
     g = StateGraph(ReplyState)
-    g.add_node("match_thread", _node_match_thread)
-    g.add_node("load_conversation", _node_load_conversation)
+    g.add_node("match_thread", _make_node_match_thread(db))
+    g.add_node("load_conversation", _make_node_load_conversation(db))
     g.add_node("classify_intent", _make_node_classify_intent(db))
     g.add_node("compose_response", _make_node_compose_response(db))
     g.add_node("persist", _make_node_persist(db))

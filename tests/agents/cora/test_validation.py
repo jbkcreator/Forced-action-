@@ -71,7 +71,7 @@ def test_suppressed_email_rejects(suppressed_db):
 
 def test_duplicate_actionable_draft_rejects(not_suppressed_db):
     whale = WHALES[0]
-    store.append_draft(store.OutboundDraftRecord(
+    store.append_draft(not_suppressed_db, store.OutboundDraftRecord(
         draft_id=store.new_draft_id(), opportunity_thread_id=whale["opportunity_thread_id"],
         buyer_entity_id=whale["id"], cell_id="founder_tier_blitz", offer="founder_tier",
         avenue="flippers", angle="scarcity_seat_number", subject="s", body="b",
@@ -88,7 +88,7 @@ def test_duplicate_actionable_draft_rejects(not_suppressed_db):
 
 def test_is_followup_bypasses_duplicate_check(not_suppressed_db):
     whale = WHALES[0]
-    store.append_draft(store.OutboundDraftRecord(
+    store.append_draft(not_suppressed_db, store.OutboundDraftRecord(
         draft_id=store.new_draft_id(), opportunity_thread_id=whale["opportunity_thread_id"],
         buyer_entity_id=whale["id"], cell_id="founder_tier_blitz", offer="founder_tier",
         avenue="flippers", angle="scarcity_seat_number", subject="s", body="b",

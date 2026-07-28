@@ -178,44 +178,47 @@ def _make_node_resolve_links(db: Optional[Session]):
     return _node_resolve_links
 
 
-def _node_persist(state: OutreachState) -> OutreachState:
-    if state.get("terminal_status"):
-        return {"terminal_status": state.get("terminal_status", "rejected")}
+def _make_node_persist(db: Optional[Session]):
+    def _node_persist(state: OutreachState) -> OutreachState:
+        if state.get("terminal_status"):
+            return {"terminal_status": state.get("terminal_status", "rejected")}
 
-    buyer_entity = state["buyer_entity"]
-    draft_id = store.new_draft_id()
-    record = store.OutboundDraftRecord(
-        draft_id=draft_id,
-        opportunity_thread_id=buyer_entity["opportunity_thread_id"],
-        buyer_entity_id=buyer_entity["id"],
-        cell_id=state["cell_id"],
-        offer=state["offer"],
-        avenue=state["avenue"],
-        angle=state["angle"],
-        subject=state["subject"],
-        body=state["body"],
-        facts_used=state.get("facts_used", []),
-        source_refs=[f.get("source_ref") for f in state.get("facts_used", [])],
-        recommended_channel=state["recommended_channel"],
-        confidence_score=int(buyer_entity.get("confidence_score", 0) or 0),
-        booking_link=state.get("booking_link"),
-        payment_link=state.get("payment_link"),
-        is_followup=bool(state.get("is_followup", False)),
-        followup_sequence=state.get("followup_sequence"),
-        contact_email=state.get("contact_email"),
-        contact_phone=state.get("contact_phone"),
-    )
-    store.append_draft(record)
-    store.index_contact_email(state.get("contact_email"), buyer_entity["opportunity_thread_id"])
-    opportunity_state.mark_targeted(buyer_entity["opportunity_thread_id"], reason="draft_created")
+        buyer_entity = state["buyer_entity"]
+        draft_id = store.new_draft_id()
+        record = store.OutboundDraftRecord(
+            draft_id=draft_id,
+            opportunity_thread_id=buyer_entity["opportunity_thread_id"],
+            buyer_entity_id=buyer_entity["id"],
+            cell_id=state["cell_id"],
+            offer=state["offer"],
+            avenue=state["avenue"],
+            angle=state["angle"],
+            subject=state["subject"],
+            body=state["body"],
+            facts_used=state.get("facts_used", []),
+            source_refs=[f.get("source_ref") for f in state.get("facts_used", [])],
+            recommended_channel=state["recommended_channel"],
+            confidence_score=int(buyer_entity.get("confidence_score", 0) or 0),
+            booking_link=state.get("booking_link"),
+            payment_link=state.get("payment_link"),
+            is_followup=bool(state.get("is_followup", False)),
+            followup_sequence=state.get("followup_sequence"),
+            contact_email=state.get("contact_email"),
+            contact_phone=state.get("contact_phone"),
+        )
+        store.append_draft(db, record)
+        store.index_contact_email(state.get("contact_email"), buyer_entity["opportunity_thread_id"])
+        opportunity_state.mark_targeted(buyer_entity["opportunity_thread_id"], reason="draft_created")
 
-    fleet_event = contracts.make_fleet_event(
-        "action.ready", buyer_entity["opportunity_thread_id"], draft_id=draft_id,
-    )
-    contracts.emit_fleet_event_stub(fleet_event)
-    store.mark_draft_published(draft_id)
+        fleet_event = contracts.make_fleet_event(
+            "action.ready", buyer_entity["opportunity_thread_id"], draft_id=draft_id,
+        )
+        contracts.emit_fleet_event_stub(fleet_event)
+        store.mark_draft_published(db, draft_id)
 
-    return {"draft_id": draft_id, "terminal_status": "completed"}
+        return {"draft_id": draft_id, "terminal_status": "completed"}
+
+    return _node_persist
 
 
 def _after_gate(state: OutreachState) -> str:
@@ -234,7 +237,7 @@ def build_outreach_graph(db: Optional[Session] = None) -> StateGraph:
     g.add_node("gate", _make_node_gate(db))
     g.add_node("compose", _make_node_compose(db))
     g.add_node("resolve_links", _make_node_resolve_links(db))
-    g.add_node("persist", _node_persist)
+    g.add_node("persist", _make_node_persist(db))
 
     g.add_edge(START, "gate")
     g.add_conditional_edges("gate", _after_gate, {"compose": "compose", "persist": "persist"})

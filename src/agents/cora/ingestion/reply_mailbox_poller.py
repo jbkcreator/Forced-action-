@@ -58,6 +58,8 @@ import threading
 from email.utils import parseaddr
 from typing import Any, Dict, List, Optional, Tuple
 
+from sqlalchemy.orm import Session
+
 from src.agents.cora import queue
 from src.agents.cora.ingestion.reply_stub_producer import produce_stub_reply
 from src.agents.cora.store import find_opportunity_thread_id_by_email, now
@@ -188,7 +190,7 @@ def _decode_body(part: Dict[str, Any]) -> str:
 
 # ── Layer 3: relevance filter + publish ───────────────────────────────────────
 
-def _process_candidate_message(service: Any, message_id: str) -> bool:
+def _process_candidate_message(service: Any, message_id: str, db: Session) -> bool:
     """Fetch, relevance-filter, publish if it matches a known contact_email. Returns True if published."""
     if _already_seen(message_id):
         return False
@@ -200,7 +202,7 @@ def _process_candidate_message(service: Any, message_id: str) -> bool:
         subject = _header(headers, "Subject")
         body_text = _decode_body(message.get("payload", {}))
 
-        thread_id = find_opportunity_thread_id_by_email(from_address)
+        thread_id = find_opportunity_thread_id_by_email(db, from_address)
         _mark_seen(message_id)  # mark seen regardless of match — either way, don't reconsider it
 
         if thread_id is None:
@@ -230,7 +232,7 @@ def _process_candidate_message(service: Any, message_id: str) -> bool:
 
 # ── Layer 1: fetch paths ──────────────────────────────────────────────────────
 
-def _poll_via_history(service: Any, history_id: str) -> Tuple[int, Optional[str]]:
+def _poll_via_history(service: Any, history_id: str, db: Session) -> Tuple[int, Optional[str]]:
     """Primary path. Returns (published_count, newest_history_id). Raises on a stale/invalid cursor."""
     published = 0
     page_token = None
@@ -247,7 +249,7 @@ def _poll_via_history(service: Any, history_id: str) -> Tuple[int, Optional[str]
         for record in response.get("history", []):
             for added in record.get("messagesAdded", []):
                 message_id = added.get("message", {}).get("id")
-                if message_id and _process_candidate_message(service, message_id):
+                if message_id and _process_candidate_message(service, message_id, db):
                     published += 1
 
         page_token = response.get("nextPageToken")
@@ -257,7 +259,7 @@ def _poll_via_history(service: Any, history_id: str) -> Tuple[int, Optional[str]
     return published, newest_history_id
 
 
-def _bootstrap_poll(service: Any, since_timestamp: Optional[int]) -> Tuple[int, Optional[str]]:
+def _bootstrap_poll(service: Any, since_timestamp: Optional[int], db: Session) -> Tuple[int, Optional[str]]:
     """
     Fallback path — first ever run, or the saved historyId cursor expired.
     Bounded search-based catch-up, then captures a fresh historyId to resume
@@ -275,7 +277,7 @@ def _bootstrap_poll(service: Any, since_timestamp: Optional[int]) -> Tuple[int, 
         ).execute()
 
         for msg_ref in response.get("messages", []):
-            if _process_candidate_message(service, msg_ref["id"]):
+            if _process_candidate_message(service, msg_ref["id"], db):
                 published += 1
 
         page_token = response.get("nextPageToken")
@@ -292,7 +294,7 @@ def _bootstrap_poll(service: Any, since_timestamp: Optional[int]) -> Tuple[int, 
     return published, fresh_history_id
 
 
-def poll_once() -> int:
+def poll_once(db: Session) -> int:
     """Runs one poll cycle. Returns the number of reply.received events published."""
     service = _build_gmail_service()
     if service is None:
@@ -303,7 +305,7 @@ def poll_once() -> int:
 
     if history_id:
         try:
-            published, new_history_id = _poll_via_history(service, history_id)
+            published, new_history_id = _poll_via_history(service, history_id, db)
             _save_history_id(new_history_id)
             _save_fallback_timestamp(poll_started_at)
             if published:
@@ -320,7 +322,7 @@ def poll_once() -> int:
     # Bootstrap: no cursor yet (first run), or the cursor just expired above.
     fallback_timestamp = _get_fallback_timestamp()
     try:
-        published, fresh_history_id = _bootstrap_poll(service, fallback_timestamp)
+        published, fresh_history_id = _bootstrap_poll(service, fallback_timestamp, db)
     except Exception:
         logger.exception("reply_mailbox_poller: bootstrap poll failed")
         return 0
@@ -333,10 +335,13 @@ def poll_once() -> int:
 
 
 def run_periodic(stop_event: threading.Event, interval_seconds: int = DEFAULT_INTERVAL_SECONDS) -> None:
+    from src.core.database import get_db_context
+
     logger.info("reply_mailbox_poller: starting periodic poll every %ds", interval_seconds)
     while not stop_event.is_set():
         try:
-            poll_once()
+            with get_db_context() as db:
+                poll_once(db)
         except Exception:
             logger.exception("reply_mailbox_poller: poll failed — will retry next interval")
         stop_event.wait(interval_seconds)

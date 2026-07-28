@@ -25,8 +25,8 @@ def _fake_message(message_id: str, from_addr: str, subject: str, body_text: str)
     }
 
 
-def _seed_draft_for(thread_id: str, contact_email: str) -> None:
-    store.append_draft(store.OutboundDraftRecord(
+def _seed_draft_for(db, thread_id: str, contact_email: str) -> None:
+    store.append_draft(db, store.OutboundDraftRecord(
         draft_id=store.new_draft_id(), opportunity_thread_id=thread_id, buyer_entity_id=1,
         cell_id="founder_tier_blitz", offer="founder_tier", avenue="flippers", angle="scarcity_seat_number",
         subject="s", body="b", facts_used=[], source_refs=[], recommended_channel="email",
@@ -42,15 +42,15 @@ def _mock_service_with_search(list_response: dict, profile_history_id: str = "99
     return service
 
 
-def test_not_configured_returns_zero_without_error(monkeypatch):
+def test_not_configured_returns_zero_without_error(fresh_db, monkeypatch):
     monkeypatch.setattr(poller, "_build_gmail_service", lambda: None)
-    assert poller.poll_once() == 0
+    assert poller.poll_once(fresh_db) == 0
 
 
 # ── Layer 1: watermark / fetch path selection ────────────────────────────────
 
-def test_first_run_with_no_saved_history_id_uses_bootstrap(monkeypatch):
-    _seed_draft_for("OPP-BOOT-1", "prospect@example.com")
+def test_first_run_with_no_saved_history_id_uses_bootstrap(fresh_db, monkeypatch):
+    _seed_draft_for(fresh_db, "OPP-BOOT-1", "prospect@example.com")
     service = _mock_service_with_search(
         {"messages": [{"id": "msg-1"}]}, profile_history_id="hid-fresh",
     )
@@ -60,15 +60,15 @@ def test_first_run_with_no_saved_history_id_uses_bootstrap(monkeypatch):
     monkeypatch.setattr(poller, "_build_gmail_service", lambda: service)
 
     assert poller._get_saved_history_id() is None
-    published = poller.poll_once()
+    published = poller.poll_once(fresh_db)
 
     assert published == 1
     service.users.return_value.history.assert_not_called()
     assert poller._get_saved_history_id() == "hid-fresh"
 
 
-def test_second_run_with_saved_history_id_uses_history_path(monkeypatch):
-    _seed_draft_for("OPP-HIST-1", "prospect@example.com")
+def test_second_run_with_saved_history_id_uses_history_path(fresh_db, monkeypatch):
+    _seed_draft_for(fresh_db, "OPP-HIST-1", "prospect@example.com")
     poller._save_history_id("hid-existing")
 
     service = MagicMock()
@@ -81,15 +81,15 @@ def test_second_run_with_saved_history_id_uses_history_path(monkeypatch):
     )
     monkeypatch.setattr(poller, "_build_gmail_service", lambda: service)
 
-    published = poller.poll_once()
+    published = poller.poll_once(fresh_db)
 
     assert published == 1
     service.users.return_value.messages.return_value.list.assert_not_called()  # never used the search path
     assert poller._get_saved_history_id() == "hid-next"
 
 
-def test_stale_history_cursor_falls_back_to_bootstrap(monkeypatch):
-    _seed_draft_for("OPP-STALE-1", "prospect@example.com")
+def test_stale_history_cursor_falls_back_to_bootstrap(fresh_db, monkeypatch):
+    _seed_draft_for(fresh_db, "OPP-STALE-1", "prospect@example.com")
     poller._save_history_id("hid-stale")
 
     class _FakeHttpError(Exception):
@@ -107,15 +107,15 @@ def test_stale_history_cursor_falls_back_to_bootstrap(monkeypatch):
     service.users.return_value.getProfile.return_value.execute.return_value = {"historyId": "hid-recovered"}
     monkeypatch.setattr(poller, "_build_gmail_service", lambda: service)
 
-    published = poller.poll_once()
+    published = poller.poll_once(fresh_db)
 
     assert published == 1
     assert poller._get_saved_history_id() == "hid-recovered"
 
 
-def test_history_poll_paginates_across_multiple_pages(monkeypatch):
-    _seed_draft_for("OPP-PAGE-1", "a@example.com")
-    _seed_draft_for("OPP-PAGE-2", "b@example.com")
+def test_history_poll_paginates_across_multiple_pages(fresh_db, monkeypatch):
+    _seed_draft_for(fresh_db, "OPP-PAGE-1", "a@example.com")
+    _seed_draft_for(fresh_db, "OPP-PAGE-2", "b@example.com")
     poller._save_history_id("hid-existing")
 
     service = MagicMock()
@@ -135,7 +135,7 @@ def test_history_poll_paginates_across_multiple_pages(monkeypatch):
     service.users.return_value.messages.return_value.get.side_effect = _get
     monkeypatch.setattr(poller, "_build_gmail_service", lambda: service)
 
-    published = poller.poll_once()
+    published = poller.poll_once(fresh_db)
 
     assert published == 2
     assert poller._get_saved_history_id() == "hid-final"
@@ -143,29 +143,29 @@ def test_history_poll_paginates_across_multiple_pages(monkeypatch):
 
 # ── Layer 3: relevance filter ─────────────────────────────────────────────────
 
-def test_unmatched_sender_is_not_queued(monkeypatch):
+def test_unmatched_sender_is_not_queued(fresh_db, monkeypatch):
     service = _mock_service_with_search({"messages": [{"id": "msg-spam"}]})
     service.users.return_value.messages.return_value.get.return_value.execute.return_value = _fake_message(
         "msg-spam", "spammer@eventfeeds.com", "Josh - specifics", "buy my list"
     )
     monkeypatch.setattr(poller, "_build_gmail_service", lambda: service)
 
-    published = poller.poll_once()
+    published = poller.poll_once(fresh_db)
 
     assert published == 0
     seen = queue.read_batch("test-consumer", count=10, block_ms=200)
     assert seen == []
 
 
-def test_matched_sender_publishes_with_resolved_thread_id(monkeypatch):
-    _seed_draft_for("OPP-MATCH-1", "prospect@example.com")
+def test_matched_sender_publishes_with_resolved_thread_id(fresh_db, monkeypatch):
+    _seed_draft_for(fresh_db, "OPP-MATCH-1", "prospect@example.com")
     service = _mock_service_with_search({"messages": [{"id": "msg-real"}]})
     service.users.return_value.messages.return_value.get.return_value.execute.return_value = _fake_message(
         "msg-real", "prospect@example.com", "Re: Founding seat", "Yes let's talk"
     )
     monkeypatch.setattr(poller, "_build_gmail_service", lambda: service)
 
-    published = poller.poll_once()
+    published = poller.poll_once(fresh_db)
     assert published == 1
 
     seen = queue.read_batch("test-consumer-2", count=10, block_ms=200)
@@ -176,34 +176,34 @@ def test_matched_sender_publishes_with_resolved_thread_id(monkeypatch):
 
 # ── Layer 4: seen-cache dedup ──────────────────────────────────────────────────
 
-def test_already_seen_message_is_not_reprocessed(monkeypatch):
-    _seed_draft_for("OPP-SEEN-1", "prospect@example.com")
+def test_already_seen_message_is_not_reprocessed(fresh_db, monkeypatch):
+    _seed_draft_for(fresh_db, "OPP-SEEN-1", "prospect@example.com")
     service = _mock_service_with_search({"messages": [{"id": "msg-dup"}]})
     service.users.return_value.messages.return_value.get.return_value.execute.return_value = _fake_message(
         "msg-dup", "prospect@example.com", "Re:", "hi"
     )
     monkeypatch.setattr(poller, "_build_gmail_service", lambda: service)
 
-    first = poller.poll_once()
+    first = poller.poll_once(fresh_db)
     assert first == 1
     queue.read_batch("drain", count=10, block_ms=200)
 
     # A genuine re-delivery of the same Gmail message_id — the seen-cache
     # (not the watermark) is what must catch this one.
-    assert poller._process_candidate_message(service, "msg-dup") is False
+    assert poller._process_candidate_message(service, "msg-dup", fresh_db) is False
 
 
 # ── Layer 5/6: stable idempotency key ─────────────────────────────────────────
 
-def test_idempotency_key_derived_from_stable_message_id_not_processing_time(monkeypatch):
-    _seed_draft_for("OPP-IDEMP-1", "prospect@example.com")
+def test_idempotency_key_derived_from_stable_message_id_not_processing_time(fresh_db, monkeypatch):
+    _seed_draft_for(fresh_db, "OPP-IDEMP-1", "prospect@example.com")
     service = _mock_service_with_search({"messages": [{"id": "msg-stable"}]})
     service.users.return_value.messages.return_value.get.return_value.execute.return_value = _fake_message(
         "msg-stable", "prospect@example.com", "Re:", "hello"
     )
     monkeypatch.setattr(poller, "_build_gmail_service", lambda: service)
 
-    poller.poll_once()
+    poller.poll_once(fresh_db)
     published = queue.read_batch("test-consumer-3", count=10, block_ms=200)
     assert len(published) == 1
     expected_key = queue.make_idempotency_key("reply.received", "OPP-IDEMP-1", "gmail:msg-stable")
@@ -212,8 +212,8 @@ def test_idempotency_key_derived_from_stable_message_id_not_processing_time(monk
 
 # ── Resilience: one bad message never blocks the rest of the batch ──────────
 
-def test_a_processing_failure_on_one_message_does_not_block_others(monkeypatch):
-    _seed_draft_for("OPP-RESIL-1", "good@example.com")
+def test_a_processing_failure_on_one_message_does_not_block_others(fresh_db, monkeypatch):
+    _seed_draft_for(fresh_db, "OPP-RESIL-1", "good@example.com")
     service = _mock_service_with_search({"messages": [{"id": "bad-1"}, {"id": "good-1"}]})
 
     def _get(userId, id, format):
@@ -226,7 +226,7 @@ def test_a_processing_failure_on_one_message_does_not_block_others(monkeypatch):
     service.users.return_value.messages.return_value.get.side_effect = _get
     monkeypatch.setattr(poller, "_build_gmail_service", lambda: service)
 
-    published = poller.poll_once()
+    published = poller.poll_once(fresh_db)
     assert published == 1
 
     seen = queue.read_batch("test-consumer-4", count=10, block_ms=200)

@@ -38,9 +38,9 @@ def get_ranked_whales(session: Session, limit: int = 25, county_id: Optional[str
     return _get_ranked_whales(session, limit=limit, county_id=county_id)
 
 
-def get_prior_conversation(opportunity_thread_id: str) -> List[Dict[str, Any]]:
+def get_prior_conversation(session: Session, opportunity_thread_id: str) -> List[Dict[str, Any]]:
     """Cora's own prior drafts + replies for a thread — never a subscriber-keyed lookup."""
-    return store.read_conversation(opportunity_thread_id)
+    return store.read_conversation(session, opportunity_thread_id)
 
 
 def get_recent_auction_fast_follow_whales(

@@ -50,7 +50,7 @@ def test_draft_carries_correct_cell_tags(not_suppressed_db, mock_claude):
     whale = WHALES[0]
     result = _run(whale, not_suppressed_db, mock_claude)
     cell = get_cell(CELL_ID)
-    draft = store.read_drafts(opportunity_thread_id=whale["opportunity_thread_id"])[0]
+    draft = store.read_drafts(not_suppressed_db, opportunity_thread_id=whale["opportunity_thread_id"])[0]
     assert draft["offer"] == cell["offer"]
     assert draft["avenue"] == cell["avenue"]
     assert draft["angle"] == cell["angle"]
@@ -61,7 +61,7 @@ def test_draft_carries_correct_cell_tags(not_suppressed_db, mock_claude):
 def test_draft_carries_correct_opportunity_thread_id(not_suppressed_db, mock_claude):
     whale = WHALES[1]
     _run(whale, not_suppressed_db, mock_claude)
-    draft = store.read_drafts(opportunity_thread_id=whale["opportunity_thread_id"])[0]
+    draft = store.read_drafts(not_suppressed_db, opportunity_thread_id=whale["opportunity_thread_id"])[0]
     assert draft["opportunity_thread_id"] == whale["opportunity_thread_id"]
 
 
@@ -80,7 +80,7 @@ def test_draft_link_resolution(not_suppressed_db, mock_claude, monkeypatch):
         db=not_suppressed_db,
     )
     assert result["terminal_status"] == "completed"
-    draft = store.read_drafts(opportunity_thread_id=whale["opportunity_thread_id"])[0]
+    draft = store.read_drafts(not_suppressed_db, opportunity_thread_id=whale["opportunity_thread_id"])[0]
     assert draft["booking_link"] == "https://calendly.com/test-rep"
     assert draft["payment_link"] is None
 
@@ -91,7 +91,7 @@ def test_suppressed_target_produces_no_draft(suppressed_db, mock_claude):
     result = _run(whale, suppressed_db, mock_claude)
     assert result["terminal_status"] == "rejected"
     assert result["reject_reason"] == "suppressed"
-    assert store.read_drafts(opportunity_thread_id=whale["opportunity_thread_id"]) == []
+    assert store.read_drafts(suppressed_db, opportunity_thread_id=whale["opportunity_thread_id"]) == []
 
 
 # Acceptance item 8: below-threshold Hunter record rejected.
@@ -110,25 +110,29 @@ def test_duplicate_draft_attempt_is_rejected_not_duplicated(not_suppressed_db, m
     second = _run(whale, not_suppressed_db, mock_claude)
     assert second["terminal_status"] == "rejected"
     assert second["reject_reason"] == "duplicate_actionable"
-    assert len(store.read_drafts(opportunity_thread_id=whale["opportunity_thread_id"])) == 1
+    assert len(store.read_drafts(not_suppressed_db, opportunity_thread_id=whale["opportunity_thread_id"])) == 1
 
 
 # Acceptance item 12: draft older than 72h is treated as expired at read time.
 def test_draft_older_than_72h_is_expired(not_suppressed_db, mock_claude):
+    from sqlalchemy import text
+
     whale = WHALES[5]
-    _run(whale, not_suppressed_db, mock_claude)
-    draft = store.read_drafts(opportunity_thread_id=whale["opportunity_thread_id"])[0]
+    result = _run(whale, not_suppressed_db, mock_claude)
+    draft = store.read_drafts(not_suppressed_db, opportunity_thread_id=whale["opportunity_thread_id"])[0]
     assert store.is_draft_expired(draft) is False
 
-    backdated = dict(draft)
-    backdated["created_at"] = (store.parse_dt(draft["created_at"]) - timedelta(hours=73)).isoformat()
-    store._append_line(store._DRAFTS_FILE, backdated)  # "last line wins" — same draft_id
-    refreshed = store.read_drafts(opportunity_thread_id=whale["opportunity_thread_id"])[0]
+    backdated_at = store.parse_dt(draft["created_at"]) - timedelta(hours=73)
+    not_suppressed_db.execute(
+        text("UPDATE outbound_drafts SET created_at = :created_at WHERE draft_id = :draft_id"),
+        {"created_at": backdated_at, "draft_id": result["draft_id"]},
+    )
+    refreshed = store.read_drafts(not_suppressed_db, opportunity_thread_id=whale["opportunity_thread_id"])[0]
     assert store.is_draft_expired(refreshed) is True
 
-    expired_count = store.expire_stale_drafts()
+    expired_count = store.expire_stale_drafts(not_suppressed_db)
     assert expired_count == 1
-    final = store.read_drafts(opportunity_thread_id=whale["opportunity_thread_id"])[0]
+    final = store.read_drafts(not_suppressed_db, opportunity_thread_id=whale["opportunity_thread_id"])[0]
     assert final["status"] == "expired"
 
 
@@ -173,7 +177,7 @@ def test_real_claude_draft_grounds_facts_no_invention(fresh_db):
         db=fresh_db,
     )
     assert result["terminal_status"] == "completed", result
-    draft = store.read_drafts(opportunity_thread_id=whale["opportunity_thread_id"])[0]
+    draft = store.read_drafts(fresh_db, opportunity_thread_id=whale["opportunity_thread_id"])[0]
     assert draft["subject"]
     assert draft["body"]
     # Best-effort containment: at least one fact value shows up verbatim in the copy.

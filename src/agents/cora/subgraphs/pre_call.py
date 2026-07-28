@@ -49,7 +49,7 @@ def _make_node_gather_context(db: Optional[Session]):
     def _node_gather_context(state: PreCallState) -> PreCallState:
         from config.cora_objection_library import get_objections_for_avenue
 
-        conversation = store.read_conversation(state["opportunity_thread_id"])
+        conversation = store.read_conversation(db, state["opportunity_thread_id"])
         replies = store.read_replies(state["opportunity_thread_id"])
         current_intent = replies[-1].get("intent") if replies else None
 

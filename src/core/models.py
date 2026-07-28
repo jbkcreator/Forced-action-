@@ -8494,3 +8494,60 @@ class VeraPromise(Base):
 
     def __repr__(self) -> str:
         return f"<VeraPromise(id={self.id}, owner={self.owner!r}, status={self.status!r})>"
+
+
+class OutboundDraft(Base):
+    """One Cora cold-outreach draft — send-free, always pending human review.
+
+    Was an interim append-only JSON-Lines file (src/agents/cora/store.py) for
+    as long as this build ran alongside the unmerged Cora->Lifecycle rename
+    branch (risk of a models.py merge conflict). That rename is now merged
+    and its DB migration run — this table replaces that interim store.
+
+    Unlike the old file store's "append a new line per transition" pattern,
+    status changes here are plain UPDATEs — draft_id is a real primary key,
+    not a de-duplication key applied at read time. Nothing in the app layer
+    ever needed the full transition history, only the current state per
+    draft_id, so this is the simpler, idiomatic shape for a real table.
+    """
+    __tablename__ = "outbound_drafts"
+
+    draft_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    opportunity_thread_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    buyer_entity_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    cell_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    offer: Mapped[str] = mapped_column(String(50), nullable=False)
+    avenue: Mapped[str] = mapped_column(String(50), nullable=False)
+    angle: Mapped[str] = mapped_column(String(50), nullable=False)
+    subject: Mapped[str] = mapped_column(Text, nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    facts_used: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    source_refs: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    recommended_channel: Mapped[str] = mapped_column(String(20), nullable=False)
+    confidence_score: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="draft")
+    booking_link: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    payment_link: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    reject_reason: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+    schema_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    published: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_followup: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    followup_sequence: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    contact_email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    contact_phone: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+
+    __table_args__ = (
+        Index("ix_outbound_drafts_thread_cell_status", "opportunity_thread_id", "cell_id", "status"),
+        Index("ix_outbound_drafts_contact_email", "contact_email"),
+        CheckConstraint(
+            "status IN ('draft', 'rejected', 'expired', 'superseded', 'approved_pending_send')",
+            name="ck_outbound_drafts_status",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return f"<OutboundDraft(draft_id={self.draft_id!r}, thread={self.opportunity_thread_id!r}, status={self.status!r})>"

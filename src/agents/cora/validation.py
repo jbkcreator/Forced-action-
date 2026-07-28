@@ -129,7 +129,7 @@ def validate_can_draft(
     if (
         not is_followup
         and opportunity_thread_id
-        and store.has_duplicate_actionable_draft(opportunity_thread_id, cell_id)
+        and store.has_duplicate_actionable_draft(db, opportunity_thread_id, cell_id)
     ):
         return DraftValidationResult(allowed=False, reject_reason="duplicate_actionable")
 

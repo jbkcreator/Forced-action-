@@ -44,7 +44,6 @@ def _cora_isolated_store(tmp_path, monkeypatch) -> Iterator[None]:
 
     data_dir = tmp_path / "cora_data"
     monkeypatch.setattr(store, "DATA_DIR", data_dir)
-    monkeypatch.setattr(store, "_DRAFTS_FILE", data_dir / "outbound_drafts.jsonl")
     monkeypatch.setattr(store, "_OPPORTUNITY_STATE_FILE", data_dir / "opportunity_state.jsonl")
     monkeypatch.setattr(store, "_REPLIES_FILE", data_dir / "replies.jsonl")
     monkeypatch.setattr(store, "_PRE_CALL_BRIEFS_FILE", data_dir / "pre_call_briefs.jsonl")
@@ -69,17 +68,23 @@ def _no_real_stripe_calls(monkeypatch) -> Iterator[None]:
 
 
 @pytest.fixture
-def not_suppressed_db():
-    db = MagicMock()
-    db.execute.return_value.fetchone.return_value = None
-    return db
+def not_suppressed_db(fresh_db, monkeypatch):
+    """
+    Real Postgres session (rolled back after the test) — store.py's draft
+    functions now run real SQL against outbound_drafts, so a MagicMock can
+    no longer round-trip a real INSERT/SELECT. Suppression is redirected to
+    a plain function stub rather than a real email_opt_outs row, since real
+    prospect emails used across these tests never exist there anyway and
+    this repo's DATABASE_URL points at the shared prod DB.
+    """
+    monkeypatch.setattr("src.services.email_suppression.is_email_suppressed", lambda db, email: False)
+    return fresh_db
 
 
 @pytest.fixture
-def suppressed_db():
-    db = MagicMock()
-    db.execute.return_value.fetchone.return_value = (1,)
-    return db
+def suppressed_db(fresh_db, monkeypatch):
+    monkeypatch.setattr("src.services.email_suppression.is_email_suppressed", lambda db, email: True)
+    return fresh_db
 
 
 @pytest.fixture

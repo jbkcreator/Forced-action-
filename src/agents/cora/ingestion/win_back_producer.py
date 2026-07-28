@@ -115,7 +115,7 @@ def produce_win_back_targets(db: Session, limit: int = 25) -> List[str]:
             continue
 
         thread_id = _subscriber_thread_id(sub.id)
-        if store.has_duplicate_actionable_draft(thread_id, WIN_BACK_CELL_ID):
+        if store.has_duplicate_actionable_draft(db, thread_id, WIN_BACK_CELL_ID):
             continue
 
         buyer_entity = {

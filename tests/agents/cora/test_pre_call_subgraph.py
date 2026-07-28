@@ -8,8 +8,8 @@ from tests.agents.cora.conftest import brief_result
 from tests.agents.cora.fixtures.whales import WHALES
 
 
-def _seed_conversation(thread_id: str) -> None:
-    store.append_draft(store.OutboundDraftRecord(
+def _seed_conversation(db, thread_id: str) -> None:
+    store.append_draft(db, store.OutboundDraftRecord(
         draft_id=store.new_draft_id(), opportunity_thread_id=thread_id, buyer_entity_id=1,
         cell_id="founder_tier_blitz", offer="founder_tier", avenue="flippers",
         angle="scarcity_seat_number", subject="Founding seat", body="Noticed your purchases.",
@@ -26,7 +26,7 @@ def _seed_conversation(thread_id: str) -> None:
 def test_booked_call_produces_complete_brief(not_suppressed_db, mock_claude):
     whale = WHALES[0]
     thread_id = whale["opportunity_thread_id"]
-    _seed_conversation(thread_id)
+    _seed_conversation(not_suppressed_db, thread_id)
     mock_claude.return_value = brief_result(
         "Hey, saw you've been active lately — got a minute?", "Confirm interest and book next step.",
     )
@@ -55,10 +55,36 @@ def test_booked_call_produces_complete_brief(not_suppressed_db, mock_claude):
     assert len(content["prior_messages_and_replies"]) == 2  # 1 draft + 1 reply
 
 
+# Live-caught bug (2026-07-28): gather_context called resolve_offer_link()
+# without buyer_entity/db, so founder_tier's real Stripe link never reached
+# the brief, and relevant_links never carried payment_link at all. Fixed —
+# this pins both parts of the fix.
+def test_brief_includes_real_payment_link_for_founder_tier(not_suppressed_db, mock_claude):
+    whale = dict(WHALES[0], is_whale=True)
+    thread_id = whale["opportunity_thread_id"]
+    _seed_conversation(not_suppressed_db, thread_id)
+    mock_claude.return_value = brief_result("opening", "objective")
+
+    result = pre_call.run_pre_call(
+        {
+            "opportunity_thread_id": thread_id, "call_booked_at": store.now().isoformat(),
+            "rep": "test-rep", "scheduled_for": store.now().isoformat(), "buyer_entity": whale,
+        },
+        db=not_suppressed_db,
+    )
+
+    assert result["terminal_status"] == "completed"
+    brief = store.read_pre_call_briefs(opportunity_thread_id=thread_id)[0]
+    content = brief["content"]
+    assert content["recommended_offer"] == "founder_tier"
+    assert "payment_link" in content["relevant_links"]
+    assert content["relevant_links"]["payment_link"] == "https://checkout.stripe.com/test-fake"
+
+
 def test_brief_survives_claude_failure_with_empty_opening(not_suppressed_db, mock_claude):
     whale = WHALES[1]
     thread_id = whale["opportunity_thread_id"]
-    _seed_conversation(thread_id)
+    _seed_conversation(not_suppressed_db, thread_id)
     mock_claude.side_effect = RuntimeError("simulated Claude outage")
 
     result = pre_call.run_pre_call(
@@ -78,7 +104,7 @@ def test_brief_survives_claude_failure_with_empty_opening(not_suppressed_db, moc
 def test_real_claude_brief_generation(fresh_db):
     whale = WHALES[2]
     thread_id = whale["opportunity_thread_id"]
-    _seed_conversation(thread_id)
+    _seed_conversation(fresh_db, thread_id)
     result = pre_call.run_pre_call(
         {
             "opportunity_thread_id": thread_id, "call_booked_at": store.now().isoformat(),

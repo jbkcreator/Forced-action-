@@ -1,30 +1,28 @@
 """
-Cora's business-record store — interim, file-based, append-only.
+Cora's business-record store.
 
-No new Postgres tables/migrations are permitted on this branch (a separate,
-unreviewed rename branch touches src/core/models.py at 148 scattered lines;
-adding a table here risks a real merge conflict later). This store is the
-documented stand-in for the eventual OutboundDraft/Reply/PreCallBrief tables
-— see docs/plans/cora_v2_2_interim_build_decisions.md for the full rationale.
+OutboundDraft lives in the real `outbound_drafts` Postgres table
+(src/core/models.py, migrations/apply_outbound_draft.py) — status
+transitions are plain UPDATEs, draft_id is a real primary key. Reply,
+PreCallBrief, and opportunity-state are still the original interim,
+file-based, append-only JSON-Lines store; migrating those wasn't asked for
+and nothing in the app layer needed their full transition history, so they
+stay as-is for now.
 
-Design, deliberately mirroring existing patterns rather than inventing new
-ones:
+Design for the JSON-Lines records (Reply/PreCallBrief/opportunity-state),
+deliberately mirroring existing patterns rather than inventing new ones:
   - Append-only JSON Lines, one record per line, under data/cora/ (already
-    gitignored — see .gitignore's `data/` entry — so this never enters git
-    history regardless of the rename-branch situation).
+    gitignored — see .gitignore's `data/` entry).
   - "Last line for a given id wins" — a status transition is a *new*
     appended line carrying the same id, never an in-place rewrite. Safe
-    against partial writes; maps cleanly onto a future UPDATE statement.
+    against partial writes.
   - Staleness is computed at READ time from a fixed max-age constant, never
     a persisted expires_at column — exact shape of
     src.agents.vera.facts.is_stale(freshness_class, observed_at). Cora never
     writes to vera_facts; this is Cora's own, separate constant.
   - Concurrency: a single in-process threading.Lock per file. NOT race-safe
-    across multiple processes/replicas — the best available substitute
-    given a real DB unique constraint (the insert-then-catch-IntegrityError
-    pattern used elsewhere, e.g. src/services/owner_alert.py:_claim_alert)
-    isn't available without a migration. Documented limitation, closeable
-    once a real table exists.
+    across multiple processes/replicas — documented limitation, unrelated to
+    OutboundDraft (which uses real DB semantics instead).
 """
 from __future__ import annotations
 
@@ -173,31 +171,68 @@ class OutboundDraftRecord:
     contact_phone: Optional[str] = None
 
 
-_DRAFTS_FILE = DATA_DIR / "outbound_drafts.jsonl"
-
-
-def append_draft(record: OutboundDraftRecord) -> None:
-    _append_line(_DRAFTS_FILE, asdict(record))
-
-
 def new_draft_id() -> str:
     return str(uuid.uuid4())
 
 
+def _draft_row_to_dict(row: Any) -> Dict[str, Any]:
+    d = dict(row)
+    if d.get("created_at") is not None:
+        d["created_at"] = d["created_at"].isoformat() if hasattr(d["created_at"], "isoformat") else d["created_at"]
+    return d
+
+
+_DRAFT_COLUMNS = (
+    "draft_id, opportunity_thread_id, buyer_entity_id, cell_id, offer, avenue, angle, "
+    "subject, body, facts_used, source_refs, recommended_channel, confidence_score, "
+    "status, booking_link, payment_link, reject_reason, created_at, schema_version, "
+    "published, is_followup, followup_sequence, contact_email, contact_phone"
+)
+
+
+def append_draft(db: Any, record: OutboundDraftRecord) -> None:
+    from sqlalchemy import text
+    db.execute(
+        text(f"""
+            INSERT INTO outbound_drafts ({_DRAFT_COLUMNS})
+            VALUES (
+                :draft_id, :opportunity_thread_id, :buyer_entity_id, :cell_id, :offer, :avenue, :angle,
+                :subject, :body, :facts_used, :source_refs, :recommended_channel, :confidence_score,
+                :status, :booking_link, :payment_link, :reject_reason, :created_at, :schema_version,
+                :published, :is_followup, :followup_sequence, :contact_email, :contact_phone
+            )
+        """),
+        {
+            **asdict(record),
+            "facts_used": json.dumps(record.facts_used),
+            "source_refs": json.dumps(record.source_refs),
+        },
+    )
+
+
 def read_drafts(
+    db: Any,
     opportunity_thread_id: Optional[str] = None,
     cell_id: Optional[str] = None,
     status: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    latest = _read_latest_by_id(_DRAFTS_FILE, "draft_id")
-    rows = list(latest.values())
+    from sqlalchemy import text
+    clauses, params = [], {}
     if opportunity_thread_id is not None:
-        rows = [r for r in rows if r.get("opportunity_thread_id") == opportunity_thread_id]
+        clauses.append("opportunity_thread_id = :opportunity_thread_id")
+        params["opportunity_thread_id"] = opportunity_thread_id
     if cell_id is not None:
-        rows = [r for r in rows if r.get("cell_id") == cell_id]
+        clauses.append("cell_id = :cell_id")
+        params["cell_id"] = cell_id
     if status is not None:
-        rows = [r for r in rows if r.get("status") == status]
-    return rows
+        clauses.append("status = :status")
+        params["status"] = status
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    rows = db.execute(
+        text(f"SELECT {_DRAFT_COLUMNS} FROM outbound_drafts {where} ORDER BY created_at ASC"),
+        params,
+    ).mappings().all()
+    return [_draft_row_to_dict(r) for r in rows]
 
 
 def is_draft_expired(draft: Dict[str, Any]) -> bool:
@@ -208,11 +243,12 @@ def is_draft_expired(draft: Dict[str, Any]) -> bool:
 
 
 def read_active_drafts(
+    db: Any,
     opportunity_thread_id: Optional[str] = None,
     cell_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """'Active' == status in {draft, approved_pending_send} and not expired."""
-    rows = read_drafts(opportunity_thread_id=opportunity_thread_id, cell_id=cell_id)
+    rows = read_drafts(db, opportunity_thread_id=opportunity_thread_id, cell_id=cell_id)
     active = []
     for r in rows:
         if r.get("status") not in ("draft", "approved_pending_send"):
@@ -223,8 +259,8 @@ def read_active_drafts(
     return active
 
 
-def has_duplicate_actionable_draft(opportunity_thread_id: str, cell_id: str) -> bool:
-    return len(read_active_drafts(opportunity_thread_id=opportunity_thread_id, cell_id=cell_id)) > 0
+def has_duplicate_actionable_draft(db: Any, opportunity_thread_id: str, cell_id: str) -> bool:
+    return len(read_active_drafts(db, opportunity_thread_id=opportunity_thread_id, cell_id=cell_id)) > 0
 
 
 _EMAIL_INDEX_PREFIX = "cora:email_thread_index:"
@@ -248,15 +284,15 @@ def index_contact_email(contact_email: Optional[str], opportunity_thread_id: str
     get_redis().set(f"{_EMAIL_INDEX_PREFIX}{contact_email.strip().lower()}", opportunity_thread_id)
 
 
-def find_opportunity_thread_id_by_email(contact_email: str) -> Optional[str]:
+def find_opportunity_thread_id_by_email(db: Any, contact_email: str) -> Optional[str]:
     """
     Reply-matching lookup: which opportunity_thread_id did we send TO this
     address? Checks the Redis index first (O(1)); on a miss, falls back to
-    scanning every draft (not thread-filtered — the whole point is we don't
-    know the thread yet) and returns the most recently created match.
-    Case-insensitive, since email addresses are. None if no draft was ever
-    sent to this address — the caller (the reply pipeline, or the mailbox
-    poller upstream of it) treats that as unmatched.
+    a DB query (not thread-filtered — the whole point is we don't know the
+    thread yet) and returns the most recently created match. Case-insensitive,
+    since email addresses are. None if no draft was ever sent to this address
+    — the caller (the reply pipeline, or the mailbox poller upstream of it)
+    treats that as unmatched.
     """
     if not contact_email:
         return None
@@ -268,37 +304,37 @@ def find_opportunity_thread_id_by_email(contact_email: str) -> Optional[str]:
         if indexed:
             return indexed
 
-    matches = [r for r in read_drafts() if (r.get("contact_email") or "").strip().lower() == needle]
-    if not matches:
-        return None
-    matches.sort(key=lambda r: r.get("created_at", ""), reverse=True)
-    return matches[0].get("opportunity_thread_id")
+    from sqlalchemy import text
+    row = db.execute(
+        text(
+            "SELECT opportunity_thread_id FROM outbound_drafts "
+            "WHERE lower(contact_email) = :needle ORDER BY created_at DESC LIMIT 1"
+        ),
+        {"needle": needle},
+    ).first()
+    return row[0] if row else None
 
 
-def expire_stale_drafts() -> int:
-    """Append an 'expired' transition line for any active draft past DRAFT_MAX_AGE_HOURS."""
-    latest = _read_latest_by_id(_DRAFTS_FILE, "draft_id")
-    count = 0
-    for rec in latest.values():
-        if rec.get("status") not in ("draft", "approved_pending_send"):
-            continue
-        if not is_draft_expired(rec):
-            continue
-        expired = dict(rec)
-        expired["status"] = "expired"
-        _append_line(_DRAFTS_FILE, expired)
-        count += 1
-    return count
+def expire_stale_drafts(db: Any) -> int:
+    """Marks every active draft past DRAFT_MAX_AGE_HOURS as 'expired'. Returns the count updated."""
+    from sqlalchemy import text
+    result = db.execute(
+        text(
+            "UPDATE outbound_drafts SET status = 'expired' "
+            "WHERE status IN ('draft', 'approved_pending_send') "
+            "AND created_at < now() - make_interval(hours => :max_age_hours)"
+        ),
+        {"max_age_hours": DRAFT_MAX_AGE_HOURS},
+    )
+    return result.rowcount
 
 
-def mark_draft_published(draft_id: str) -> None:
-    latest = _read_latest_by_id(_DRAFTS_FILE, "draft_id")
-    rec = latest.get(draft_id)
-    if rec is None:
-        return
-    updated = dict(rec)
-    updated["published"] = True
-    _append_line(_DRAFTS_FILE, updated)
+def mark_draft_published(db: Any, draft_id: str) -> None:
+    from sqlalchemy import text
+    db.execute(
+        text("UPDATE outbound_drafts SET published = true WHERE draft_id = :draft_id"),
+        {"draft_id": draft_id},
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -397,11 +433,11 @@ def read_replies(opportunity_thread_id: Optional[str] = None) -> List[Dict[str, 
     return rows
 
 
-def read_conversation(opportunity_thread_id: str) -> List[Dict[str, Any]]:
+def read_conversation(db: Any, opportunity_thread_id: str) -> List[Dict[str, Any]]:
     """Prior drafts + replies for a thread, ordered by time — 'load prior conversation'."""
     drafts = [
         {"kind": "draft", "at": d.get("created_at"), "record": d}
-        for d in read_drafts(opportunity_thread_id=opportunity_thread_id)
+        for d in read_drafts(db, opportunity_thread_id=opportunity_thread_id)
     ]
     replies = [
         {"kind": "reply", "at": r.get("received_at"), "record": r}
@@ -450,7 +486,7 @@ def read_pre_call_briefs(opportunity_thread_id: Optional[str] = None) -> List[Di
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _reset_store_for_tests() -> None:
-    """Deletes all jsonl files under DATA_DIR. Test-harness use only."""
-    for f in (_DRAFTS_FILE, _OPPORTUNITY_STATE_FILE, _REPLIES_FILE, _PRE_CALL_BRIEFS_FILE):
+    """Deletes all jsonl files under DATA_DIR. Test-harness use only. Drafts live in Postgres now — cleared via the fresh_db rollback, not here."""
+    for f in (_OPPORTUNITY_STATE_FILE, _REPLIES_FILE, _PRE_CALL_BRIEFS_FILE):
         if f.exists():
             f.unlink()

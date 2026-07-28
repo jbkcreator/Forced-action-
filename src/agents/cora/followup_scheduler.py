@@ -76,9 +76,9 @@ def _anchor_for(db: Session, opportunity_thread_id: str, parent_draft: Dict[str,
     return _dispatched_at(db, opportunity_thread_id) or parent_draft.get("created_at")
 
 
-def _next_due_sequence(opportunity_thread_id: str, anchor_iso: str) -> Optional[int]:
+def _next_due_sequence(db: Session, opportunity_thread_id: str, anchor_iso: str) -> Optional[int]:
     followups = [
-        d for d in store.read_drafts(opportunity_thread_id=opportunity_thread_id)
+        d for d in store.read_drafts(db, opportunity_thread_id=opportunity_thread_id)
         if d.get("is_followup")
     ]
     sent_sequences = {d.get("followup_sequence") for d in followups if d.get("followup_sequence") is not None}
@@ -100,9 +100,9 @@ def _next_due_sequence(opportunity_thread_id: str, anchor_iso: str) -> Optional[
     return None
 
 
-def _parent_draft(opportunity_thread_id: str) -> Optional[Dict[str, Any]]:
+def _parent_draft(db: Session, opportunity_thread_id: str) -> Optional[Dict[str, Any]]:
     non_followups = [
-        d for d in store.read_drafts(opportunity_thread_id=opportunity_thread_id)
+        d for d in store.read_drafts(db, opportunity_thread_id=opportunity_thread_id)
         if not d.get("is_followup")
     ]
     if not non_followups:
@@ -119,7 +119,7 @@ def run_followup_sweep(db: Session) -> List[Dict[str, Any]]:
         if not opportunity_state.is_awaiting_reply(opportunity_thread_id):
             continue  # raced with a reply/state change since list_opportunities_by_status ran
 
-        parent = _parent_draft(opportunity_thread_id)
+        parent = _parent_draft(db, opportunity_thread_id)
         if parent is None:
             logger.warning(
                 "followup_scheduler: thread=%s is 'touched' but has no parent draft on file — skipping",
@@ -131,7 +131,7 @@ def run_followup_sweep(db: Session) -> List[Dict[str, Any]]:
         if anchor is None:
             continue
 
-        sequence = _next_due_sequence(opportunity_thread_id, anchor)
+        sequence = _next_due_sequence(db, opportunity_thread_id, anchor)
         if sequence is None:
             continue
 

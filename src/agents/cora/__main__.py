@@ -58,8 +58,10 @@ def _cmd_produce_targets() -> None:
 
 def _cmd_poll_mailbox() -> None:
     from src.agents.cora.ingestion.reply_mailbox_poller import poll_once
+    from src.core.database import get_db_context
 
-    published = poll_once()
+    with get_db_context() as db:
+        published = poll_once(db)
     print(f"reply_mailbox_poller: published {published} reply.received event(s)")
 
 

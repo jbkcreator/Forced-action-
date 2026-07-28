@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from unittest.mock import MagicMock
-
 from src.agents.cora import queue, store
 from src.agents.cora.ingestion import target_producer
 from tests.agents.cora.fixtures.whales import WHALES
@@ -12,12 +10,12 @@ def _stub_contact_and_entity(monkeypatch, whale):
     monkeypatch.setattr(target_producer, "get_contact_channel", lambda db, bid: {"email": "x@example.com", "phone": None})
 
 
-def test_produce_auction_fast_follow_targets_publishes_a_correctly_shaped_event(monkeypatch):
+def test_produce_auction_fast_follow_targets_publishes_a_correctly_shaped_event(fresh_db, monkeypatch):
     whale = dict(WHALES[0], latest_auction_deed_date="2026-07-20")
     _stub_contact_and_entity(monkeypatch, whale)
     monkeypatch.setattr(target_producer, "get_recent_auction_fast_follow_whales", lambda db, **kw: [whale])
 
-    produced = target_producer.produce_auction_fast_follow_targets(MagicMock())
+    produced = target_producer.produce_auction_fast_follow_targets(fresh_db)
     assert produced == [whale["opportunity_thread_id"]]
 
     published = queue.read_batch("test-consumer", count=10, block_ms=200)
@@ -27,7 +25,7 @@ def test_produce_auction_fast_follow_targets_publishes_a_correctly_shaped_event(
     queue.ack(published[0].message_id)
 
 
-def test_produce_auction_fast_follow_targets_skips_thread_with_active_draft(monkeypatch):
+def test_produce_auction_fast_follow_targets_skips_thread_with_active_draft(fresh_db, monkeypatch):
     # This producer's only dedup is store.has_duplicate_actionable_draft — the
     # idempotency_key set at publish time is consumed by the WORKER, not here,
     # so re-sweeping with no draft yet persisted legitimately republishes.
@@ -35,7 +33,7 @@ def test_produce_auction_fast_follow_targets_skips_thread_with_active_draft(monk
     _stub_contact_and_entity(monkeypatch, whale)
     monkeypatch.setattr(target_producer, "get_recent_auction_fast_follow_whales", lambda db, **kw: [whale])
 
-    store.append_draft(store.OutboundDraftRecord(
+    store.append_draft(fresh_db, store.OutboundDraftRecord(
         draft_id=store.new_draft_id(), opportunity_thread_id=whale["opportunity_thread_id"],
         buyer_entity_id=whale["id"], cell_id="auction_fast_follow", offer="core_subscription",
         avenue="flippers", angle="auction_congrats", subject="s", body="b",
@@ -43,16 +41,16 @@ def test_produce_auction_fast_follow_targets_skips_thread_with_active_draft(monk
         confidence_score=whale["confidence_score"],
     ))
 
-    produced = target_producer.produce_auction_fast_follow_targets(MagicMock())
+    produced = target_producer.produce_auction_fast_follow_targets(fresh_db)
     assert produced == []
 
 
-def test_produce_auction_fast_follow_targets_skips_unresolvable_entity(monkeypatch):
+def test_produce_auction_fast_follow_targets_skips_unresolvable_entity(fresh_db, monkeypatch):
     whale = dict(WHALES[1], latest_auction_deed_date="2026-07-21")
     monkeypatch.setattr(target_producer, "get_recent_auction_fast_follow_whales", lambda db, **kw: [whale])
     monkeypatch.setattr(target_producer, "get_buyer_entity_by_opportunity_thread_id", lambda db, tid: None)
 
-    produced = target_producer.produce_auction_fast_follow_targets(MagicMock())
+    produced = target_producer.produce_auction_fast_follow_targets(fresh_db)
     assert produced == []
 
 

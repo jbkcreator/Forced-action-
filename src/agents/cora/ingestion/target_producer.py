@@ -98,7 +98,7 @@ def _produce_from_rows(db: Session, cell_id: str, scored: List[Dict[str, Any]]) 
         thread_id = row.get("opportunity_thread_id")
         if not thread_id:
             continue
-        if store.has_duplicate_actionable_draft(thread_id, cell_id):
+        if store.has_duplicate_actionable_draft(db, thread_id, cell_id):
             continue
 
         buyer_entity = get_buyer_entity_by_opportunity_thread_id(db, thread_id)
