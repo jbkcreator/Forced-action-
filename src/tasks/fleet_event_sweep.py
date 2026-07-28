@@ -28,8 +28,9 @@ import logging
 from src.core.database import get_db_context
 from src.services.fleet_event_bus import FLEET_EVENT_TYPES
 from src.services.fleet_event_consumer import poll_and_dispatch_fleet
+from src.utils.logger import setup_logging
 
-logging.basicConfig(level=logging.INFO)
+setup_logging()
 logger = logging.getLogger(__name__)
 
 _ALL_EVENT_TYPES = sorted(FLEET_EVENT_TYPES)
