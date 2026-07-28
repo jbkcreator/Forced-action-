@@ -8,7 +8,7 @@ Covers the four sprint verify criteria:
      double-send if it already fired).
   3. A lead that replied -> no follow-up fires. Verified two ways: a mocked
      replied_at, AND driving the real inbound-reply code path
-     (cora_suppression.record_generic_sms_reply) since a prior sprint item's
+     (lifecycle_suppression.record_generic_sms_reply) since a prior sprint item's
      mocked test missed a real nuance that only a live/real-path test caught.
   4. A lead suppressed by the compliance layer -> follow-up is suppressed
      (send_sms returns False) but the audit trail (MessageOutcome row) is
@@ -146,9 +146,9 @@ class TestAutoModeFollowupSms:
         idealized assumption; the actual Telnyx inbound webhook attaches a
         reply to the newest unreplied sms MessageOutcome for the subscriber,
         not necessarily the row a sweep is evaluating. Drive the real
-        cora_suppression.record_generic_sms_reply() code path to prove the
+        lifecycle_suppression.record_generic_sms_reply() code path to prove the
         sweep's reply-check holds under real semantics."""
-        from src.services.cora_suppression import record_generic_sms_reply
+        from src.services.lifecycle_suppression import record_generic_sms_reply
         from src.tasks.auto_mode_followup_sms import run
 
         sub, phone = _mk_sub(fresh_db)
@@ -167,7 +167,7 @@ class TestAutoModeFollowupSms:
                 run(dry_run=False)
             mock_sms.assert_not_called()
         finally:
-            fresh_db.execute(text("DELETE FROM cora_suppressions WHERE subscriber_id = :sid"), {"sid": sub.id})
+            fresh_db.execute(text("DELETE FROM lifecycle_suppressions WHERE subscriber_id = :sid"), {"sid": sub.id})
             _cleanup(fresh_db, sub)
 
     def test_compliance_suppressed_still_logs_outcome(self, fresh_db):

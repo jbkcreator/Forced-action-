@@ -61,7 +61,7 @@ class TestBuildLockCtaUrl:
         with patch("src.services.wallet_to_lock.settings") as mock_settings:
             mock_settings.app_base_url = "https://app.example.io"
             url = build_lock_cta_url(1, "33647")
-        assert "cora_lock_close" in url
+        assert "lifecycle_lock_close" in url
 
 
 class TestEmitEvent:

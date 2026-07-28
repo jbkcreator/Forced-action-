@@ -15,7 +15,7 @@ from typing import Optional
 
 from sqlalchemy import asc, select
 
-from config.cora_guardrails import EXPANSION_GATES, KILL_SWITCH
+from config.lifecycle_guardrails import EXPANSION_GATES, KILL_SWITCH
 from config.settings import settings
 from src.core.database import get_db_context
 from src.core.models import CountyLaunchAudit, ExpansionCandidate

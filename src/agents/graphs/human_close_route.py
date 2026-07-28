@@ -1,7 +1,7 @@
 """
 Human close routing graph.
 
-Triggered when escalate_to_human_closer fires (inline from Cora when
+Triggered when escalate_to_human_closer fires (inline from Lifecycle when
 terminal_status='escalated', or via HumanCloseSweep cron weekday 1 PM UTC).
 
 Does NOT send an SMS. Routes to human via Slack and logs to agent_decisions.
@@ -136,7 +136,7 @@ def _node_finalize(state: HumanCloseState) -> HumanCloseState:
                 "routed": state.get("routed"),
                 "failure_reason": state.get("failure_reason"),
             },
-            # fa036 — human close routing is Cora handing the lead to a
+            # fa036 — human close routing is Lifecycle handing the lead to a
             # human closer. Classify as approval_required so Metric 1
             # (% autonomous) doesn't double-count it as autonomous.
             # HumanCloseEscalation.outcome (won/lost/no_response) is

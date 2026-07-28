@@ -469,7 +469,7 @@ class ScoringConfig:
     missing_signals:                    frozenset = field(default_factory=frozenset)
     # Stopgap for the cross-county calibration retune: counties whose tier
     # distribution is not yet trustworthy (e.g. Pinellas pre-refit) set this
-    # to "internal" so the feed API, GHL webhook, and Cora prompts suppress
+    # to "internal" so the feed API, GHL webhook, and Lifecycle prompts suppress
     # the tier label. "public" = expose tier downstream as normal.
     tier_visibility:                    str = "public"
 
@@ -521,7 +521,7 @@ COUNTY_OVERRIDES: dict[str, dict[str, Any]] = {
         # Tier labels suppressed downstream until the cross-county
         # calibration retune lands. The score itself is still written to
         # distress_scores.lead_tier for internal analytics; only the
-        # subscriber-facing surfaces (feed API, GHL contact, Cora SMS)
+        # subscriber-facing surfaces (feed API, GHL contact, Lifecycle SMS)
         # omit the label.
         "tier_visibility": "internal",
     },

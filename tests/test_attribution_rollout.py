@@ -1,6 +1,6 @@
 """
 Attribution rollout — assign_rollout_arm, should_rollback_rollout, and
-the cora_attribution_rollback_check task.
+the lifecycle_attribution_rollback_check task.
 
 Tests:
   1. Determinism — same subscriber always gets same arm.
@@ -125,10 +125,10 @@ class TestAssignRolloutArmUnit:
         mock_db.add = MagicMock()
         mock_db.flush = MagicMock()
 
-        arm1 = assign_rollout_arm(42, "cora_attribution_v1", mock_db)
+        arm1 = assign_rollout_arm(42, "lifecycle_attribution_v1", mock_db)
 
         mock_db.execute.return_value.scalar_one_or_none.side_effect = [test, None]
-        arm2 = assign_rollout_arm(42, "cora_attribution_v1", mock_db)
+        arm2 = assign_rollout_arm(42, "lifecycle_attribution_v1", mock_db)
 
         assert arm1 == arm2
         assert arm1 in ("variant", "control")
@@ -137,7 +137,7 @@ class TestAssignRolloutArmUnit:
         from src.services.ab_engine import assign_rollout_arm
 
         mock_db.execute.return_value.scalar_one_or_none.return_value = None
-        result = assign_rollout_arm(1, "cora_attribution_v1", mock_db)
+        result = assign_rollout_arm(1, "lifecycle_attribution_v1", mock_db)
         assert result is None
 
     def test_full_traffic_pct_both_arms_possible(self, mock_db):
@@ -250,7 +250,7 @@ def test_below_floor_no_rollback(fresh_db):
 
 def test_clear_loser_triggers_rollback(fresh_db):
     """variant 2% vs control 30%, n=100/arm → >2σ → rollback fires."""
-    from src.tasks.cora_attribution_rollback_check import run as rollback_run
+    from src.tasks.lifecycle_attribution_rollback_check import run as rollback_run
 
     # Patch the test name inside the task to use our seeded test
     test, sub_ids = _seed_rollout_test(
@@ -258,7 +258,7 @@ def test_clear_loser_triggers_rollback(fresh_db):
     )
     try:
         with (
-            patch("src.tasks.cora_attribution_rollback_check.ATTRIBUTION_ROLLOUT_TEST_NAME", test.test_name),
+            patch("src.tasks.lifecycle_attribution_rollback_check.ATTRIBUTION_ROLLOUT_TEST_NAME", test.test_name),
             patch("src.services.ab_engine.ATTRIBUTION_ROLLOUT_TEST_NAME", test.test_name),
             patch("src.services.stripe_webhooks._send_founder_alert") as mock_alert,
         ):
@@ -276,14 +276,14 @@ def test_clear_loser_triggers_rollback(fresh_db):
 
 def test_dry_run_leaves_test_active(fresh_db):
     """dry_run=True → test stays active, no alert."""
-    from src.tasks.cora_attribution_rollback_check import run as rollback_run
+    from src.tasks.lifecycle_attribution_rollback_check import run as rollback_run
 
     test, sub_ids = _seed_rollout_test(
         fresh_db, n_ctrl=100, n_var=100, ctrl_conv_rate=0.30, var_conv_rate=0.02
     )
     try:
         with (
-            patch("src.tasks.cora_attribution_rollback_check.ATTRIBUTION_ROLLOUT_TEST_NAME", test.test_name),
+            patch("src.tasks.lifecycle_attribution_rollback_check.ATTRIBUTION_ROLLOUT_TEST_NAME", test.test_name),
             patch("src.services.ab_engine.ATTRIBUTION_ROLLOUT_TEST_NAME", test.test_name),
             patch("src.services.stripe_webhooks._send_founder_alert") as mock_alert,
         ):

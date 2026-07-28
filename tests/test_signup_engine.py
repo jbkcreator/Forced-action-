@@ -342,7 +342,7 @@ class TestSignupSourceAttribution:
         assert a.signup_source == "dbpr_email"
         # Second visit on a different channel — should keep dbpr_email.
         b = create_free_account_by_email(
-            email="firsttouch@example.com", db=fresh_db, signup_source="cora_sms",
+            email="firsttouch@example.com", db=fresh_db, signup_source="lifecycle_sms",
         )
         fresh_db.flush()
         assert b.id == a.id

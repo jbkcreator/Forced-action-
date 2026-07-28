@@ -68,11 +68,11 @@ class QuoraResult:
     viewer_should_show_write_answer: Optional[bool] = None
     viewer_cant_answer: Optional[bool]            = None
     is_user_limited_distro: Optional[bool]        = None
-    # ── Scoring / Cora ────────────────────────────────────────────────────────
+    # ── Scoring / Lifecycle ────────────────────────────────────────────────────────
     deterministic_score: Optional[int]            = None
     deterministic_reasons: list[str]              = field(default_factory=list)
-    cora_classification: Optional[dict]           = None
-    cora_answer_draft: Optional[dict]             = None
+    lifecycle_classification: Optional[dict]           = None
+    lifecycle_answer_draft: Optional[dict]             = None
     # ── Raw payload ───────────────────────────────────────────────────────────
     raw_metadata: Optional[dict]                  = None
 
@@ -218,7 +218,7 @@ async def _scrape_query(
 
     # DOM fallback — if GQL yielded nothing but the page rendered results,
     # extract directly from the visible DOM. Gives title + URL (no qid/counts)
-    # which is sufficient for Cora classification.
+    # which is sufficient for Lifecycle classification.
     if not captured_records:
         dom_records = await _extract_from_dom(page, max_results, dump_raw=dump_raw)
         if dom_records:
@@ -727,8 +727,8 @@ def _result_to_dump_dict(r: QuoraResult) -> dict:
         "top_answer_author_credentials": r.top_answer_author_credentials,
         "deterministic_score":          r.deterministic_score,
         "deterministic_reasons":        r.deterministic_reasons,
-        "cora_classification":          r.cora_classification,
-        "cora_answer_draft":            r.cora_answer_draft,
+        "lifecycle_classification":          r.lifecycle_classification,
+        "lifecycle_answer_draft":            r.lifecycle_answer_draft,
     }
 
 

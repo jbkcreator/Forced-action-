@@ -1,6 +1,6 @@
 """Apply CDE-09 — outcome_candidates staging table.
 
-Canonical shape the Cora Data Engine's outcome connectors (src/connectors/)
+Canonical shape the Lifecycle Data Engine's outcome connectors (src/connectors/)
 write into: a labeled event mined from an already-ingested, already-matched
 public record (foreclosure auction result, tax-deed auction result, appraiser
 sale, etc.), keyed back to its source row for traceability. Deliberately not

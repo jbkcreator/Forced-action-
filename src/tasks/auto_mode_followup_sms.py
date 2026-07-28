@@ -12,7 +12,7 @@ variant), using the existing vertical-agnostic compliance pipe
 (`sms_compliance.send_sms`) — zero changes to that file.
 
 Reply detection is subscriber-level, not thread-level: the real inbound-SMS
-webhook (`cora_suppression.record_generic_sms_reply`) stamps `replied_at` on
+webhook (`lifecycle_suppression.record_generic_sms_reply`) stamps `replied_at` on
 the newest unreplied `message_outcomes` row of `message_type='sms'` for a
 subscriber, not necessarily the row this sweep is evaluating. So "no reply"
 here means no sms MessageOutcome row for this subscriber, sent at/after

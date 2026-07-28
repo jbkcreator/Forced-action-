@@ -32,7 +32,7 @@ def record_outcome_side_effects(outcome, sub, db) -> dict:
     is_skip = outcome.deal_size_bucket == "skip"
 
     try:
-        from src.services.cora_suppression import create_suppression
+        from src.services.lifecycle_suppression import create_suppression
         create_suppression(
             db,
             subscriber_id=outcome.subscriber_id,
@@ -43,7 +43,7 @@ def record_outcome_side_effects(outcome, sub, db) -> dict:
             cancel_reason="deal_outcome_auto_pause",
         )
     except Exception as exc:
-        logger.warning("[DealOutcomeEffects] cora suppression failed: %s", exc)
+        logger.warning("[DealOutcomeEffects] lifecycle suppression failed: %s", exc)
 
     if not is_skip:
         try:

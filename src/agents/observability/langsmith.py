@@ -1,5 +1,5 @@
 """
-LangSmith tracing configuration for Cora agents.
+LangSmith tracing configuration for Lifecycle agents.
 
 Configures LangSmith SDK to trace Anthropic calls.
 Requires: LANGSMITH_API_KEY, LANGSMITH_PROJECT, LANGSMITH_TRACING=true

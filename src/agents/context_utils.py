@@ -1,5 +1,5 @@
 """
-Personalization context utilities for Cora SMS graphs.
+Personalization context utilities for Lifecycle SMS graphs.
 
 Pure Python — no I/O, no DB calls. Transforms raw segment/score/recency
 values into the semantic labels Sonnet prompts need to produce materially
@@ -94,7 +94,7 @@ def build_personalization_fields(
 ) -> dict:
     """
     Return a flat dict of personalization fields ready to merge into a
-    Cora render context. Accepts the dicts from get_subscriber_profile and
+    Lifecycle render context. Accepts the dicts from get_subscriber_profile and
     get_segment_and_score (both may be empty — defaults are safe).
 
     Pass attribution_data=get_attribution_context(...) to include Stage 8

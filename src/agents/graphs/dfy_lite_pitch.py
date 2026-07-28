@@ -1,5 +1,5 @@
 """
-DFY-Lite Pitch graph — Cora runtime fulfillment for subscriber-triggered pitch generation.
+DFY-Lite Pitch graph — Lifecycle runtime fulfillment for subscriber-triggered pitch generation.
 
 Triggered by : dfy_lite_pitch_requested
 Event payload : {"order_id": <int>}  — the dfy_lite_orders row to process
@@ -34,7 +34,7 @@ KILL_SWITCH_FEATURE = "dfy_lite_pitch"
 
 
 class DfyLitePitchState(TypedDict, total=False):
-    # Standard Cora fields
+    # Standard Lifecycle fields
     decision_id: str
     subscriber_id: int
     event_type: str

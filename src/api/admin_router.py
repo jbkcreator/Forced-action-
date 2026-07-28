@@ -1165,7 +1165,7 @@ def kill_switch_status_overview():
     Return current kill-switch colour + cached observed metric for every
     configured feature. Requires kill_switch_metric_ingest cron to have run.
     """
-    from config.cora_guardrails import KILL_SWITCH
+    from config.lifecycle_guardrails import KILL_SWITCH
     from src.services.kill_switch_service import get_cached_metric, get_kill_switch_status as kill_switch_status
 
     results = []
@@ -1515,7 +1515,7 @@ def _update_win_story_slack_message(asset_id: int, payload: dict, reply_text: st
 
 
 # ===========================================================================
-# CORA PROMPT EDITOR
+# LIFECYCLE PROMPT EDITOR
 # ===========================================================================
 # GET  /api/admin/prompts              — list graphs + their files
 # GET  /api/admin/prompts/{graph}/{file} — read a yaml file's content
@@ -2986,7 +2986,7 @@ def get_owner_sunbiz_detail(
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# fa036 — Cora playbook lifecycle + autonomy summary endpoints
+# fa036 — Lifecycle playbook lifecycle + autonomy summary endpoints
 # ─────────────────────────────────────────────────────────────────────────
 
 class _PlaybookActionBody(BaseModel):
@@ -2996,13 +2996,13 @@ class _PlaybookActionBody(BaseModel):
                                   description="Optional free-text reason (rejection only)")
 
 
-@router.post("/cora-playbook/{playbook_id}/adopt")
-def adopt_cora_playbook(
+@router.post("/lifecycle-playbook/{playbook_id}/adopt")
+def adopt_lifecycle_playbook(
     playbook_id: int,
     body: _PlaybookActionBody,
     _admin: dict = Depends(get_current_admin),
 ):
-    """Adopt a Cora-authored recommendation. Transitions
+    """Adopt a Lifecycle-authored recommendation. Transitions
     `recommended` → `adopted`. Idempotent: re-adopting an already-adopted
     playbook does nothing and returns the existing state.
     """
@@ -3015,12 +3015,12 @@ def adopt_cora_playbook(
         )
         if not ok:
             row = db.execute(text(
-                "SELECT status FROM cora_playbook WHERE id = :id"
+                "SELECT status FROM lifecycle_playbook WHERE id = :id"
             ), {"id": playbook_id}).first()
             if row is None:
                 raise HTTPException(status_code=404, detail={
                     "error": "not_found",
-                    "message": f"cora_playbook id={playbook_id} not found",
+                    "message": f"lifecycle_playbook id={playbook_id} not found",
                 })
             return {
                 "ok": True, "id": playbook_id, "status": row.status,
@@ -3029,13 +3029,13 @@ def adopt_cora_playbook(
         return {"ok": True, "id": playbook_id, "status": "adopted"}
 
 
-@router.post("/cora-playbook/{playbook_id}/reject")
-def reject_cora_playbook(
+@router.post("/lifecycle-playbook/{playbook_id}/reject")
+def reject_lifecycle_playbook(
     playbook_id: int,
     body: _PlaybookActionBody,
     _admin: dict = Depends(get_current_admin),
 ):
-    """Reject a Cora-authored recommendation. `recommended` → `rejected`.
+    """Reject a Lifecycle-authored recommendation. `recommended` → `rejected`.
     `body.reason` is optional but recommended for the audit log.
     """
     from src.services.playbook_writer import transition_status
@@ -3047,12 +3047,12 @@ def reject_cora_playbook(
         )
         if not ok:
             row = db.execute(text(
-                "SELECT status FROM cora_playbook WHERE id = :id"
+                "SELECT status FROM lifecycle_playbook WHERE id = :id"
             ), {"id": playbook_id}).first()
             if row is None:
                 raise HTTPException(status_code=404, detail={
                     "error": "not_found",
-                    "message": f"cora_playbook id={playbook_id} not found",
+                    "message": f"lifecycle_playbook id={playbook_id} not found",
                 })
             return {
                 "ok": True, "id": playbook_id, "status": row.status,
@@ -3061,8 +3061,8 @@ def reject_cora_playbook(
         return {"ok": True, "id": playbook_id, "status": "rejected"}
 
 
-@router.post("/cora-playbook/{playbook_id}/retire")
-def retire_cora_playbook(
+@router.post("/lifecycle-playbook/{playbook_id}/retire")
+def retire_lifecycle_playbook(
     playbook_id: int,
     body: _PlaybookActionBody,
     _admin: dict = Depends(get_current_admin),
@@ -3080,12 +3080,12 @@ def retire_cora_playbook(
         )
         if not ok:
             row = db.execute(text(
-                "SELECT status FROM cora_playbook WHERE id = :id"
+                "SELECT status FROM lifecycle_playbook WHERE id = :id"
             ), {"id": playbook_id}).first()
             if row is None:
                 raise HTTPException(status_code=404, detail={
                     "error": "not_found",
-                    "message": f"cora_playbook id={playbook_id} not found",
+                    "message": f"lifecycle_playbook id={playbook_id} not found",
                 })
             return {
                 "ok": True, "id": playbook_id, "status": row.status,
@@ -3094,16 +3094,16 @@ def retire_cora_playbook(
         return {"ok": True, "id": playbook_id, "status": "retired"}
 
 
-@router.get("/cora-autonomy")
-def get_cora_autonomy_summary(
+@router.get("/lifecycle-autonomy")
+def get_lifecycle_autonomy_summary(
     weeks: int = Query(default=8, ge=1, le=52,
                        description="Number of weekly snapshots to return"),
     _admin: dict = Depends(get_current_admin),
 ):
-    """Return the latest weekly Cora autonomy scorecard plus prior weeks
+    """Return the latest weekly Lifecycle autonomy scorecard plus prior weeks
     for trend inspection. Driven by `learning_cards` rows with
     `card_type='autonomy_summary'`, written by
-    `src/tasks/cora_autonomy_report.py` Monday 08:45 UTC.
+    `src/tasks/lifecycle_autonomy_report.py` Monday 08:45 UTC.
     """
     with get_db_context() as db:
         rows = db.execute(text("""
@@ -3131,25 +3131,25 @@ def get_cora_autonomy_summary(
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# fa036 — Cora Playbook list (read endpoint — adopt/reject/retire above)
+# fa036 — Lifecycle Playbook list (read endpoint — adopt/reject/retire above)
 # ─────────────────────────────────────────────────────────────────────────
 
 
-@router.get("/cora-playbooks")
-def list_cora_playbooks(
+@router.get("/lifecycle-playbooks")
+def list_lifecycle_playbooks(
     status: str = Query(default="recommended"),
     limit: int = Query(default=50, ge=1, le=200),
     _admin: dict = Depends(get_current_admin),
 ):
-    """List cora_playbook rows filtered by status. Used by admin Playbook
+    """List lifecycle_playbook rows filtered by status. Used by admin Playbook
     Recommendations UI to surface items that need adopt/reject action."""
-    from src.core.models import CoraPlaybook
+    from src.core.models import LifecyclePlaybook
 
     with get_db_context() as db:
         rows = db.execute(
-            select(CoraPlaybook)
-            .where(CoraPlaybook.status == status)
-            .order_by(CoraPlaybook.authored_at.desc())
+            select(LifecyclePlaybook)
+            .where(LifecyclePlaybook.status == status)
+            .order_by(LifecyclePlaybook.authored_at.desc())
             .limit(limit)
         ).scalars().all()
 
@@ -3303,42 +3303,42 @@ def get_storm_packs(
 
 
 # ---------------------------------------------------------------------------
-# GET  /api/admin/cora-messages/review-switch   — read current switch state
-# POST /api/admin/cora-messages/review-switch   — turn human review on/off
+# GET  /api/admin/lifecycle-messages/review-switch   — read current switch state
+# POST /api/admin/lifecycle-messages/review-switch   — turn human review on/off
 # ---------------------------------------------------------------------------
 
 class _ReviewSwitchBody(BaseModel):
     enabled: bool
 
 
-@router.get("/cora-messages/review-switch")
-def get_cora_review_switch(
+@router.get("/lifecycle-messages/review-switch")
+def get_lifecycle_review_switch(
     _admin: dict = Depends(get_current_admin),
 ):
     """
-    Return whether human review of outbound Cora messages is currently ON.
+    Return whether human review of outbound Lifecycle messages is currently ON.
 
-    When ON, Cora's outbound marketing SMS are held in the pending-review
+    When ON, Lifecycle's outbound marketing SMS are held in the pending-review
     queue for manual approve/cancel. When OFF (the default) they send
     immediately.
     """
-    from src.services.cora_review_switch import is_review_enabled
+    from src.services.lifecycle_review_switch import is_review_enabled
     return {"ok": True, "enabled": is_review_enabled()}
 
 
-@router.post("/cora-messages/review-switch")
-def set_cora_review_switch(
+@router.post("/lifecycle-messages/review-switch")
+def set_lifecycle_review_switch(
     body: _ReviewSwitchBody,
     _admin: dict = Depends(get_current_admin),
 ):
     """
-    Turn human review of outbound Cora messages on or off at runtime.
+    Turn human review of outbound Lifecycle messages on or off at runtime.
 
     Takes effect immediately for all subsequent sends — no redeploy. Turning
     it OFF does not auto-send messages already sitting in the queue; clear
     those with approve/cancel.
     """
-    from src.services.cora_review_switch import set_review_enabled
+    from src.services.lifecycle_review_switch import set_review_enabled
     try:
         enabled = set_review_enabled(body.enabled, actor=_admin.get("sub"))
     except RuntimeError as exc:
@@ -3346,18 +3346,18 @@ def set_cora_review_switch(
     return {"ok": True, "enabled": enabled}
 
 
-@router.get("/cora-messages/pending")
-def list_pending_cora_messages(
+@router.get("/lifecycle-messages/pending")
+def list_pending_lifecycle_messages(
     limit: int = Query(default=100, ge=1, le=500),
     _admin: dict = Depends(get_current_admin),
     db: Session = Depends(get_db),
 ):
     """
-    Return Cora SMS messages waiting for manual review.
+    Return Lifecycle SMS messages waiting for manual review.
 
-    Cora writes outbound-message audit rows to message_outcomes. Messages held
+    Lifecycle writes outbound-message audit rows to message_outcomes. Messages held
     for review have send_status='pending_review' and requires_review=true; the
-    composed SMS body is stored in context_snapshot['body'] by the Cora write
+    composed SMS body is stored in context_snapshot['body'] by the Lifecycle write
     tool.
     Used by the admin UI to surface messages that may need manual review.
 
@@ -3423,7 +3423,7 @@ def list_pending_cora_messages(
             {"limit": limit},
         ).scalar()
     except Exception as exc:
-        logger.error("[cora-messages/pending] query failed: %s", exc)
+        logger.error("[lifecycle-messages/pending] query failed: %s", exc)
         raise HTTPException(status_code=503, detail="Failed to fetch pending messages")
 
     return {
@@ -3434,23 +3434,23 @@ def list_pending_cora_messages(
 
 
 # ---------------------------------------------------------------------------
-# POST /api/admin/cora-messages/{id}/approve
-# POST /api/admin/cora-messages/{id}/cancel
+# POST /api/admin/lifecycle-messages/{id}/approve
+# POST /api/admin/lifecycle-messages/{id}/cancel
 # ---------------------------------------------------------------------------
 
 class _MessageReviewBody(BaseModel):
     reason: Optional[str] = Field(default=None, max_length=255)
 
 
-@router.post("/cora-messages/{message_id}/approve")
-def approve_cora_message(
+@router.post("/lifecycle-messages/{message_id}/approve")
+def approve_lifecycle_message(
     message_id: int,
     body: _MessageReviewBody,
     _admin: dict = Depends(get_current_admin),
     db: Session = Depends(get_db),
 ):
     """
-    Approve a pending-review Cora SMS message — and send it immediately.
+    Approve a pending-review Lifecycle SMS message — and send it immediately.
 
     Marks the row approved (approved_by / approved_at), then dispatches the
     held body to the recipient through the compliance-gated outbound path.
@@ -3476,7 +3476,7 @@ def approve_cora_message(
             {"id": message_id},
         ).fetchone()
     except Exception as exc:
-        logger.error("[cora-messages/approve] fetch failed id=%s: %s", message_id, exc)
+        logger.error("[lifecycle-messages/approve] fetch failed id=%s: %s", message_id, exc)
         raise HTTPException(status_code=503, detail="Database error")
 
     if row is None:
@@ -3531,25 +3531,25 @@ def approve_cora_message(
         )
         db.commit()
     except Exception as exc:
-        logger.error("[cora-messages/approve] send/update failed id=%s: %s", message_id, exc)
+        logger.error("[lifecycle-messages/approve] send/update failed id=%s: %s", message_id, exc)
         raise HTTPException(status_code=503, detail="Failed to approve and send message")
 
     logger.info(
-        "[cora-messages/approve] id=%s approved by %s → %s",
+        "[lifecycle-messages/approve] id=%s approved by %s → %s",
         message_id, _admin.get("sub"), final_status,
     )
     return {"ok": True, "id": message_id, "send_status": final_status}
 
 
-@router.post("/cora-messages/{message_id}/cancel")
-def cancel_cora_message(
+@router.post("/lifecycle-messages/{message_id}/cancel")
+def cancel_lifecycle_message(
     message_id: int,
     body: _MessageReviewBody,
     _admin: dict = Depends(get_current_admin),
     db: Session = Depends(get_db),
 ):
     """
-    Cancel a pending-review Cora SMS message.
+    Cancel a pending-review Lifecycle SMS message.
     Sets send_status='cancelled', cancelled_by, cancelled_at, and optionally cancel_reason.
     Returns 404 if the message does not exist, 409 if it is not pending_review.
     """
@@ -3563,7 +3563,7 @@ def cancel_cora_message(
             {"id": message_id},
         ).fetchone()
     except Exception as exc:
-        logger.error("[cora-messages/cancel] fetch failed id=%s: %s", message_id, exc)
+        logger.error("[lifecycle-messages/cancel] fetch failed id=%s: %s", message_id, exc)
         raise HTTPException(status_code=503, detail="Database error")
 
     if row is None:
@@ -3592,11 +3592,11 @@ def cancel_cora_message(
         )
         db.commit()
     except Exception as exc:
-        logger.error("[cora-messages/cancel] update failed id=%s: %s", message_id, exc)
+        logger.error("[lifecycle-messages/cancel] update failed id=%s: %s", message_id, exc)
         raise HTTPException(status_code=503, detail="Failed to cancel message")
 
     logger.info(
-        "[cora-messages/cancel] id=%s cancelled by %s reason=%r",
+        "[lifecycle-messages/cancel] id=%s cancelled by %s reason=%r",
         message_id, _admin.get("sub"), body.reason,
     )
 

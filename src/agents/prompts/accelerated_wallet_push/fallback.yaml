@@ -1,4 +1,4 @@
-# Static fallback — used when Cora is rate-limited or kill_switch_color
+# Static fallback — used when Lifecycle is rate-limited or kill_switch_color
 # is yellow. No LLM call. The body deliberately leads with the price so
 # the subscriber understands this is a PAID monthly subscription, not
 # a free reward.

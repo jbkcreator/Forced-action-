@@ -15,7 +15,7 @@ Triggers (ANY fires the push):
 Stage 5 changes:
   - 30-day duplicate-offer suppression via MessageOutcome lookback.
   - Each push now writes a MessageOutcome(template_id='annual_offer_<trigger>')
-    so the suppression check + Cora attribution have ground truth.
+    so the suppression check + Lifecycle attribution have ground truth.
   - The deal-capture path imports `_push_annual_offer` directly to fire
     the deal_win_10k trigger inline (no daily-cron lag for big deals).
   - The 60-day auto-switch trigger runs the same `run_annual_push` loop;
@@ -224,7 +224,7 @@ def _push_annual_offer(sub: Subscriber, trigger: str, db: Session) -> bool:
     """Send annual offer. Returns True if dispatched successfully.
 
     Stage 5: also writes a MessageOutcome row (template_id='annual_offer_<trigger>')
-    so the 30-day suppression guard + Cora attribution have ground truth.
+    so the 30-day suppression guard + Lifecycle attribution have ground truth.
     """
     if not sub.email:
         logger.debug("No email for subscriber %d - annual push skipped", sub.id)

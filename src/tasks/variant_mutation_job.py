@@ -10,15 +10,15 @@ Scheduled task that runs the full A/B mutation + pricing cohort check cycle:
 
   2. evaluate_all_cohorts   — check rollback triggers on all active pricing cohorts
 
-Rate limits (inherited from cora_guardrails CORA_SELF_HEALING):
+Rate limits (inherited from lifecycle_guardrails LIFECYCLE_SELF_HEALING):
   - max_actions_per_run: 3 (shared; this job counts against the same budget)
 
 Usage:
     python -m src.tasks.variant_mutation_job
     python -m src.tasks.variant_mutation_job --dry-run
 
-Schedule: run hourly (after cora_self_healing, before revenue_pulse).
-Gate: CORA_SELF_HEALING_ENABLED env var (reuses the same flag as self-healing).
+Schedule: run hourly (after lifecycle_self_healing, before revenue_pulse).
+Gate: LIFECYCLE_SELF_HEALING_ENABLED env var (reuses the same flag as self-healing).
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ from typing import Optional
 
 from sqlalchemy import text as sa_text
 
-from config.cora_guardrails import CORA_SELF_HEALING
+from config.lifecycle_guardrails import LIFECYCLE_SELF_HEALING
 from config.settings import get_settings
 from src.core.database import get_db_context
 from src.services.pricing_cohort_engine import evaluate_all_cohorts
@@ -57,7 +57,7 @@ def run_variant_mutation(dry_run: bool = False) -> dict:
     Returns a summary dict.
     """
     actions_taken = 0
-    max_actions = CORA_SELF_HEALING["max_actions_per_run"]
+    max_actions = LIFECYCLE_SELF_HEALING["max_actions_per_run"]
     per_sequence: dict = {}
     cohort_results: list = []
 
@@ -124,8 +124,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     dry_run = "--dry-run" in args
 
     settings = get_settings()
-    if not settings.cora_self_healing_enabled:
-        logger.info("[variant-mutation-job] disabled via CORA_SELF_HEALING_ENABLED — exiting")
+    if not settings.lifecycle_self_healing_enabled:
+        logger.info("[variant-mutation-job] disabled via LIFECYCLE_SELF_HEALING_ENABLED — exiting")
         return 0
 
     summary = run_variant_mutation(dry_run=dry_run)

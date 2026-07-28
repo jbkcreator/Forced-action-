@@ -5,7 +5,7 @@ src/tasks/new_lead_call_sweep.py.
 Covers the sweep's half of verify criterion 2 (fallback fires on failure
 within SLA): a stalled new-lead signup (no matching agent_decisions row)
 gets both a direct page (owner_alert.notify_owner) and a Slack post
-(cora_slack.post_incident_alert), exactly once, with the phone-inbound
+(lifecycle_slack.post_incident_alert), exactly once, with the phone-inbound
 signup path correctly excluded from ever being flagged.
 """
 import uuid
@@ -115,7 +115,7 @@ class TestNewLeadCallSweep:
                 _cleanup(fresh_db, sub)
 
     def test_phone_inbound_signup_is_excluded(self, fresh_db):
-        """A phone-inbound signup (missed_call/cora_sms/dbpr_email) never
+        """A phone-inbound signup (missed_call/lifecycle_sms/dbpr_email) never
         fires new_lead_signup at all — the sweep must not treat it as a
         stalled call, or every phone-inbound lead would falsely alert."""
         from src.tasks.new_lead_call_sweep import sweep_stalled_new_lead_calls

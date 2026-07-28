@@ -45,6 +45,6 @@ class TestGrade:
 
 class TestEngineReexport:
     def test_engine_grade_is_reexport(self):
-        """cora_self_healing._grade is the same function as kill_switch_grade.grade."""
-        from src.tasks.cora_self_healing import _grade
+        """lifecycle_self_healing._grade is the same function as kill_switch_grade.grade."""
+        from src.tasks.lifecycle_self_healing import _grade
         assert _grade is grade

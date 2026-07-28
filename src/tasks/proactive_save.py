@@ -211,7 +211,7 @@ def _send_save_offer(sub: Subscriber, trigger: str, db) -> bool:
         )
         subject, body_text = _parse_email(result["text"])
     except Exception as exc:
-        logger.warning("[ProactiveSave] Cora composition failed for sub=%d, using fallback: %s", sub.id, exc)
+        logger.warning("[ProactiveSave] Lifecycle composition failed for sub=%d, using fallback: %s", sub.id, exc)
 
     if not subject or not body_text:
         trigger_line = (

@@ -1,7 +1,7 @@
 """
 Enrichment event consumer (ADR 0016).
 
-Drains gold_lead_scored events from the Cora event bus, batches them by
+Drains gold_lead_scored events from the Lifecycle event bus, batches them by
 county_id, and calls run_cascade() for each batch.
 
 Design decisions:
@@ -127,7 +127,7 @@ class EnrichmentBatcher:
         county's batch through EnrichmentRouter (Task 6.2) instead of calling
         run_cascade() directly — gates paid-provider spend against the
         rolling spend/revenue ratio before this, the third real call site
-        for the cascade (easy to miss since it's the Cora agent runtime, a
+        for the cascade (easy to miss since it's the Lifecycle agent runtime, a
         separate process from the two cron-based callers).
         """
         from sqlalchemy import text as sa_text

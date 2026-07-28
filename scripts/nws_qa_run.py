@@ -7,7 +7,7 @@ Calls production code directly (no HTTP layer required).
 Usage:
     python -m scripts.nws_qa_run                     # full run
     python -m scripts.nws_qa_run --cleanup            # delete QA rows after run
-    python -m scripts.nws_qa_run --skip-cora          # skip Cora urgency (no Claude/Twilio)
+    python -m scripts.nws_qa_run --skip-lifecycle          # skip Lifecycle urgency (no Claude/Twilio)
 
 What this covers:
     1.  Feature flag verification
@@ -19,7 +19,7 @@ What this covers:
     7.  nws_alerts row creation + fields check
     8.  Redis storm_active flag + TTL check
     9.  Storm Pack eligibility + STORM_PACK_ELIGIBLE event
-    10. Cora urgency dispatch + agent_decisions row
+    10. Lifecycle urgency dispatch + agent_decisions row
     11. Duplicate alert protection (same alert_id)
     12. Non-qualifying event skip (Frost Advisory)
     13. Feature-flag-off behavior (storm_pack_enabled=False)
@@ -129,7 +129,7 @@ report = {
     "subscriber":       {},
     "live_poll":        {},
     "sim_alert":        {},
-    "cora":             {},
+    "lifecycle":             {},
     "duplicate":        {},
     "non_qualifying":   {},
     "flag_off":         {},
@@ -161,8 +161,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cleanup",    action="store_true",
                         help="Delete QA nws_alerts rows after the run")
-    parser.add_argument("--skip-cora", action="store_true",
-                        help="Skip Cora urgency dispatch (avoids Claude/Twilio calls)")
+    parser.add_argument("--skip-lifecycle", action="store_true",
+                        help="Skip Lifecycle urgency dispatch (avoids Claude/Twilio calls)")
     args = parser.parse_args()
 
     settings = get_settings()
@@ -177,7 +177,7 @@ def main():
         "NWS_WEATHER_ENABLED":        settings.nws_weather_enabled,
         "NWS_REVENUE_POLLING_ENABLED": settings.nws_revenue_polling_enabled,
         "STORM_PACK_ENABLED":          settings.storm_pack_enabled,
-        "NWS_CORA_URGENCY_ENABLED":    settings.nws_cora_urgency_enabled,
+        "NWS_LIFECYCLE_URGENCY_ENABLED":    settings.nws_lifecycle_urgency_enabled,
     }
     for name, val in nws_flags.items():
         ok = check(f"{name} = {val}", val)
@@ -369,7 +369,7 @@ def main():
     with get_db_context() as db:
         alert_row = db.execute(text("""
             SELECT alert_id, event, affected_zips::text, same_codes::text,
-                   storm_pack_triggered, cora_urgency_sent, subscriber_count,
+                   storm_pack_triggered, lifecycle_urgency_sent, subscriber_count,
                    raw_payload IS NOT NULL AS has_raw_payload,
                    processed_at
             FROM nws_alerts
@@ -388,8 +388,8 @@ def main():
             check("storm_pack_triggered = False (QA mode, no real subscribers notified)",
                   am["storm_pack_triggered"] is False,
                   f"got: {am['storm_pack_triggered']}")
-            check("cora_urgency_sent = False (not yet dispatched)",
-                  am["cora_urgency_sent"] is False)
+            check("lifecycle_urgency_sent = False (not yet dispatched)",
+                  am["lifecycle_urgency_sent"] is False)
             print(f"  {INFO}  same_codes   : {am['same_codes']}")
             print(f"  {INFO}  processed_at : {am['processed_at']}")
 
@@ -490,10 +490,10 @@ def main():
         }
 
     # ==========================================================================
-    # STEP 9 -- Cora urgency dispatch
+    # STEP 9 -- Lifecycle urgency dispatch
     # ==========================================================================
-    sep("STEP 9: CORA URGENCY DISPATCH")
-    cora_result = {
+    sep("STEP 9: LIFECYCLE URGENCY DISPATCH")
+    lifecycle_result = {
         "eligible_leads_found":  lead_count > 0,
         "graph_ran":             False,
         "agent_decisions_row":   False,
@@ -501,22 +501,22 @@ def main():
         "copy_data_grounded":    None,
     }
 
-    if args.skip_cora:
-        print(f"  {SKIP}  --skip-cora flag set -- skipping Cora dispatch")
-        print(f"  {INFO}  To test Cora: re-run without --skip-cora")
+    if args.skip_lifecycle:
+        print(f"  {SKIP}  --skip-lifecycle flag set -- skipping Lifecycle dispatch")
+        print(f"  {INFO}  To test Lifecycle: re-run without --skip-lifecycle")
         print(f"         (requires ANTHROPIC_API_KEY and Twilio credentials)")
-    elif not settings.nws_cora_urgency_enabled:
-        print(f"  {SKIP}  NWS_CORA_URGENCY_ENABLED=False -- skipping")
+    elif not settings.nws_lifecycle_urgency_enabled:
+        print(f"  {SKIP}  NWS_LIFECYCLE_URGENCY_ENABLED=False -- skipping")
     elif lead_count == 0:
-        print(f"  {INFO}  No Gold+ leads in ZIP {CHOSEN_ZIP} -- Cora correctly skips")
-        cora_result["reason"] = "no_eligible_leads"
+        print(f"  {INFO}  No Gold+ leads in ZIP {CHOSEN_ZIP} -- Lifecycle correctly skips")
+        lifecycle_result["reason"] = "no_eligible_leads"
     else:
-        print(f"  {INFO}  Dispatching Cora urgency for sub={CHOSEN_SUB_ID}, "
+        print(f"  {INFO}  Dispatching Lifecycle urgency for sub={CHOSEN_SUB_ID}, "
               f"zip={CHOSEN_ZIP}, leads={lead_count}")
         try:
-            from src.tasks.nws_poll import _dispatch_cora_urgency
+            from src.tasks.nws_poll import _dispatch_lifecycle_urgency
             with get_db_context() as db:
-                dispatched = _dispatch_cora_urgency(
+                dispatched = _dispatch_lifecycle_urgency(
                     alert_id   = qa_id,
                     event_type = "Severe Thunderstorm Warning",
                     headline   = "Severe Thunderstorm Warning issued for Hillsborough County",
@@ -525,8 +525,8 @@ def main():
                     affected_zips = affected_zips,
                     db         = db,
                 )
-            print(f"  {INFO}  _dispatch_cora_urgency returned: {dispatched} dispatched")
-            cora_result["graph_ran"] = dispatched > 0
+            print(f"  {INFO}  _dispatch_lifecycle_urgency returned: {dispatched} dispatched")
+            lifecycle_result["graph_ran"] = dispatched > 0
 
             # Check agent_decisions
             with get_db_context() as db:
@@ -542,8 +542,8 @@ def main():
 
                 if ad:
                     adm = dict(ad._mapping)
-                    cora_result["agent_decisions_row"] = True
-                    cora_result["terminal_status"]     = adm["terminal_status"]
+                    lifecycle_result["agent_decisions_row"] = True
+                    lifecycle_result["terminal_status"]     = adm["terminal_status"]
                     check("agent_decisions row created for nws_urgency",
                           True, f"status={adm['terminal_status']}")
                     check("terminal_status = completed",
@@ -555,8 +555,8 @@ def main():
                     print(f"  {INFO}  summary     : {str(adm['summary'])[:120]}")
 
                     if adm["terminal_status"] == "completed":
-                        cora_result["message_sent"] = True
-                        cora_result["copy_data_grounded"] = "verify manually -- see agent_decisions.summary"
+                        lifecycle_result["message_sent"] = True
+                        lifecycle_result["copy_data_grounded"] = "verify manually -- see agent_decisions.summary"
                 else:
                     check("agent_decisions row created for nws_urgency", False,
                           "row not found")
@@ -564,21 +564,21 @@ def main():
                               "src/agents/graphs/nws_urgency.py:_node_finalize", "medium",
                               "Check log_decision() call in finalize node")
 
-            # Check nws_alerts.cora_urgency_sent
+            # Check nws_alerts.lifecycle_urgency_sent
             with get_db_context() as db:
                 cus = db.execute(text("""
-                    SELECT cora_urgency_sent FROM nws_alerts WHERE alert_id = :aid
+                    SELECT lifecycle_urgency_sent FROM nws_alerts WHERE alert_id = :aid
                 """), {"aid": qa_id}).scalar()
-                check("nws_alerts.cora_urgency_sent = True after dispatch",
+                check("nws_alerts.lifecycle_urgency_sent = True after dispatch",
                       cus is True, f"got: {cus}")
 
         except Exception as e:
-            print(f"  {FAIL}  Cora dispatch raised exception: {e}")
+            print(f"  {FAIL}  Lifecycle dispatch raised exception: {e}")
             traceback.print_exc()
-            add_issue(f"Cora urgency dispatch failed: {e}",
-                      "src/tasks/nws_poll.py:_dispatch_cora_urgency", "high", str(e))
+            add_issue(f"Lifecycle urgency dispatch failed: {e}",
+                      "src/tasks/nws_poll.py:_dispatch_lifecycle_urgency", "high", str(e))
 
-    report["cora"] = cora_result
+    report["lifecycle"] = lifecycle_result
 
     # ==========================================================================
     # STEP 10 -- Duplicate alert protection
@@ -689,7 +689,7 @@ def main():
     sep("STEP 13: FINAL STATE VERIFICATION")
     with get_db_context() as db:
         final_alerts = db.execute(text("""
-            SELECT alert_id, event, storm_pack_triggered, cora_urgency_sent,
+            SELECT alert_id, event, storm_pack_triggered, lifecycle_urgency_sent,
                    subscriber_count, processed_at
             FROM nws_alerts
             WHERE alert_id = ANY(:ids)
@@ -701,7 +701,7 @@ def main():
             fm = dict(fa._mapping)
             print(f"    alert_id={str(fm['alert_id'])[:60]}")
             print(f"      storm_triggered={fm['storm_pack_triggered']}  "
-                  f"cora_sent={fm['cora_urgency_sent']}  "
+                  f"lifecycle_sent={fm['lifecycle_urgency_sent']}  "
                   f"sub_count={fm['subscriber_count']}")
 
         # Count new NWS webhook events during this QA run
@@ -773,9 +773,9 @@ def main():
     print(f"   Gold+ leads in zip      : {sa.get('gold_plus_leads_in_zip', 0)}")
 
     print("""
-5. CORA URGENCY RESULT
+5. LIFECYCLE URGENCY RESULT
 -----------------------""")
-    cr = report["cora"]
+    cr = report["lifecycle"]
     print(f"   eligible_leads_found : {cr.get('eligible_leads_found', False)}")
     print(f"   graph_ran            : {cr.get('graph_ran', False)}")
     print(f"   message_sent/queued  : {cr.get('message_sent', False)}")
@@ -791,7 +791,7 @@ def main():
     print(f"   duplicate_status_returned : {dp.get('duplicate_status_returned', False)}")
     print(f"   single_db_row_enforced    : {dp.get('single_db_row', False)}")
     print(f"   duplicate_offer_prevented : yes (no second _activate_storm_packs call)")
-    print(f"   duplicate_cora_prevented  : yes (agent_decisions dedup query in place)")
+    print(f"   duplicate_lifecycle_prevented  : yes (agent_decisions dedup query in place)")
 
     print("""
 7. NON-QUALIFYING EVENT
@@ -834,17 +834,17 @@ def main():
         and ff.get("storm_packs_not_triggered")
     )
 
-    cora_tested = cr.get("graph_ran") or args.skip_cora
-    if all_pass and cora_tested:
+    lifecycle_tested = cr.get("graph_ran") or args.skip_lifecycle
+    if all_pass and lifecycle_tested:
         print("   FULLY END-TO-END TESTABLE")
         print("   All core paths verified: ingestion, idempotency, ZIP resolution,")
         print("   event logging, flag gating, duplicate protection, non-qualifying skip.")
-        if args.skip_cora:
-            print("   NOTE: Cora urgency path skipped (--skip-cora). Re-run without flag")
+        if args.skip_lifecycle:
+            print("   NOTE: Lifecycle urgency path skipped (--skip-lifecycle). Re-run without flag")
             print("         to verify Claude SMS copy and agent_decisions row.")
     elif all_pass:
         print("   PARTIALLY TESTABLE")
-        print("   All infrastructure paths pass. Cora urgency path requires")
+        print("   All infrastructure paths pass. Lifecycle urgency path requires")
         print("   ANTHROPIC_API_KEY + Twilio to test SMS delivery end-to-end.")
     else:
         print("   ISSUES FOUND -- see section 9")
@@ -858,7 +858,7 @@ MANUAL VERIFICATION QUERIES (run in psql or your DB client):
 -------------------------------------------------------------
 -- Full nws_alerts table
 SELECT alert_id, event, affected_zips::text, storm_pack_triggered,
-       cora_urgency_sent, subscriber_count, processed_at
+       lifecycle_urgency_sent, subscriber_count, processed_at
 FROM nws_alerts ORDER BY processed_at DESC LIMIT 10;
 
 -- NWS business events
@@ -866,7 +866,7 @@ SELECT source, event_type, payload_summary::text, created_at
 FROM webhook_events WHERE source = 'nws'
 ORDER BY created_at DESC LIMIT 20;
 
--- Cora urgency decisions
+-- Lifecycle urgency decisions
 SELECT decision_id, subscriber_id, terminal_status, tokens_used,
        cost_usd, summary::text, started_at
 FROM agent_decisions WHERE graph_name = 'nws_urgency'

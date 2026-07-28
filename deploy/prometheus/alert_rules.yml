@@ -1,13 +1,13 @@
 groups:
-  - name: cora_stage10_business_metrics
+  - name: lifecycle_stage10_business_metrics
     interval: 60s
     rules:
 
       # ── First-payment rate ─────────────────────────────────────────────────
       # Fires when < 25% for 48 continuous hours.
       # Triggers: variant_engine.promote_winner("wallet_push_v1")
-      - alert: CoraFirstPaymentRateLow
-        expr: cora_first_payment_rate < 25
+      - alert: LifecycleFirstPaymentRateLow
+        expr: lifecycle_first_payment_rate < 25
         for: 48h
         labels:
           severity: critical
@@ -15,13 +15,13 @@ groups:
         annotations:
           summary: "First-payment rate below 25% for 48h"
           description: >
-            cora_first_payment_rate = {{ $value | humanize }}%.
+            lifecycle_first_payment_rate = {{ $value | humanize }}%.
             Stage 10 self-healing will auto-pause the losing wallet_push_v1 variant
-            and promote the winner. Incident logged in cora_incident.
+            and promote the winner. Incident logged in lifecycle_incident.
 
       # ── Lock conversion ────────────────────────────────────────────────────
-      - alert: CoraLockConversionLow
-        expr: cora_lock_conversion < 3
+      - alert: LifecycleLockConversionLow
+        expr: lifecycle_lock_conversion < 3
         for: 48h
         labels:
           severity: warning
@@ -29,12 +29,12 @@ groups:
         annotations:
           summary: "Lock conversion below 3% for 48h"
           description: >
-            cora_lock_conversion = {{ $value | humanize }}%.
+            lifecycle_lock_conversion = {{ $value | humanize }}%.
             Self-healing will activate lock_close_use_fallback kill-switch flag.
 
       # ── Wallet adoption ────────────────────────────────────────────────────
-      - alert: CoraWalletAdoptionLow
-        expr: cora_wallet_adoption < 10
+      - alert: LifecycleWalletAdoptionLow
+        expr: lifecycle_wallet_adoption < 10
         for: 48h
         labels:
           severity: warning
@@ -42,12 +42,12 @@ groups:
         annotations:
           summary: "Wallet adoption below 10% for 48h"
           description: >
-            cora_wallet_adoption = {{ $value | humanize }}%.
+            lifecycle_wallet_adoption = {{ $value | humanize }}%.
             Self-healing will activate accelerated_wallet_push_paused fallback.
 
       # ── SMS reply rate ─────────────────────────────────────────────────────
-      - alert: CoraSMSReplyRateLow
-        expr: cora_sms_reply_rate < 5
+      - alert: LifecycleSMSReplyRateLow
+        expr: lifecycle_sms_reply_rate < 5
         for: 48h
         labels:
           severity: warning
@@ -55,12 +55,12 @@ groups:
         annotations:
           summary: "SMS reply rate below 5% for 48h"
           description: >
-            cora_sms_reply_rate = {{ $value | humanize }}%.
-            Self-healing will activate cora_use_static_copy fallback.
+            lifecycle_sms_reply_rate = {{ $value | humanize }}%.
+            Self-healing will activate lifecycle_use_static_copy fallback.
 
       # ── Offer acceptance rate ──────────────────────────────────────────────
-      - alert: CoraOfferAcceptanceRateLow
-        expr: cora_offer_acceptance_rate < 10
+      - alert: LifecycleOfferAcceptanceRateLow
+        expr: lifecycle_offer_acceptance_rate < 10
         for: 48h
         labels:
           severity: warning
@@ -68,10 +68,10 @@ groups:
         annotations:
           summary: "Offer acceptance rate below 10% for 48h"
           description: >
-            cora_offer_acceptance_rate = {{ $value | humanize }}%.
+            lifecycle_offer_acceptance_rate = {{ $value | humanize }}%.
             Self-healing will activate offer_use_baseline_template fallback.
 
-  - name: cora_stage10_variant_health
+  - name: lifecycle_stage10_variant_health
     interval: 60s
     rules:
 
@@ -80,15 +80,15 @@ groups:
       # best active slot for the same sequence.
       # The alert_rules_check cron job evaluates this independently via
       # check_sigma_rollback(); this rule fires the Alertmanager webhook path.
-      - alert: CoraVariantSigmaRollback
+      - alert: LifecycleVariantSigmaRollback
         expr: >
           (
-            cora_variant_conv_rate
+            lifecycle_variant_conv_rate
               / on(sequence_name) group_left
-            max by(sequence_name) (cora_variant_conv_rate)
+            max by(sequence_name) (lifecycle_variant_conv_rate)
           ) < 0.3
-          and cora_variant_sends > 30
-          and cora_variant_slot_active == 1
+          and lifecycle_variant_sends > 30
+          and lifecycle_variant_slot_active == 1
         for: 0m
         labels:
           severity: warning
@@ -101,10 +101,10 @@ groups:
 
       # ── Variant sends stalled ──────────────────────────────────────────────
       # Fires when an active slot has had zero sends in the last 24h.
-      - alert: CoraVariantSendsStalled
+      - alert: LifecycleVariantSendsStalled
         expr: >
-          increase(cora_variant_sends[24h]) == 0
-          and cora_variant_slot_active == 1
+          increase(lifecycle_variant_sends[24h]) == 0
+          and lifecycle_variant_slot_active == 1
         for: 0m
         labels:
           severity: info

@@ -1,5 +1,5 @@
 [Unit]
-Description=Prometheus — time-series monitoring (Stage 10 / Cora metrics)
+Description=Prometheus — time-series monitoring (Stage 10 / Lifecycle metrics)
 Documentation=https://prometheus.io/docs/introduction/overview/
 After=network-online.target
 Wants=network-online.target

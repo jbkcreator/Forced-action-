@@ -7,17 +7,17 @@ so self-healing fires from cron even when Prometheus/Alertmanager are not
 running (e.g. local dev, single-server deploys).
 
 Actions taken when a rule fires:
-  CoraFirstPaymentRateLow  → variant_engine.promote_winner("wallet_push_v1")
-  CoraVariantSigmaRollback → variant_engine.check_sigma_rollback per active sequence
-  CoraLockConversionLow    → cora_self_healing step for lock_conversion
-  CoraWalletAdoptionLow    → cora_self_healing step for wallet_adoption
-  CoraSMSReplyRateLow      → cora_self_healing step for sms_reply_rate
+  LifecycleFirstPaymentRateLow  → variant_engine.promote_winner("wallet_push_v1")
+  LifecycleVariantSigmaRollback → variant_engine.check_sigma_rollback per active sequence
+  LifecycleLockConversionLow    → lifecycle_self_healing step for lock_conversion
+  LifecycleWalletAdoptionLow    → lifecycle_self_healing step for wallet_adoption
+  LifecycleSMSReplyRateLow      → lifecycle_self_healing step for sms_reply_rate
 
-Idempotency: every action delegates to variant_engine or cora_self_healing,
+Idempotency: every action delegates to variant_engine or lifecycle_self_healing,
 both of which use Postgres-backed idempotency keys or open-incident guards.
 Re-running within the same breach window is always a no-op.
 
-Gate: CORA_SELF_HEALING_ENABLED env var (same as self-healing). No-op when
+Gate: LIFECYCLE_SELF_HEALING_ENABLED env var (same as self-healing). No-op when
 disabled.
 
 Usage:
@@ -34,7 +34,7 @@ from typing import Optional
 
 from sqlalchemy import text as sa_text
 
-from config.cora_guardrails import KILL_SWITCH, get_effective_kill_switch
+from config.lifecycle_guardrails import KILL_SWITCH, get_effective_kill_switch
 from config.settings import get_settings
 from src.core.database import get_db_context
 from src.tasks.kill_switch_metric_ingest import get_cached_metric
@@ -45,35 +45,35 @@ logger = logging.getLogger(__name__)
 
 ALERT_RULES = [
     {
-        "name": "CoraFirstPaymentRateLow",
+        "name": "LifecycleFirstPaymentRateLow",
         "metric": "first_payment_rate",
         "threshold": 25,
         "duration_hours": 48,
         "action": "variant_promote",
     },
     {
-        "name": "CoraLockConversionLow",
+        "name": "LifecycleLockConversionLow",
         "metric": "lock_conversion",
         "threshold": 3,
         "duration_hours": 48,
         "action": "self_healing",
     },
     {
-        "name": "CoraWalletAdoptionLow",
+        "name": "LifecycleWalletAdoptionLow",
         "metric": "wallet_adoption",
         "threshold": 10,
         "duration_hours": 48,
         "action": "self_healing",
     },
     {
-        "name": "CoraSMSReplyRateLow",
+        "name": "LifecycleSMSReplyRateLow",
         "metric": "sms_reply_rate",
         "threshold": 5,
         "duration_hours": 48,
         "action": "self_healing",
     },
     {
-        "name": "CoraOfferAcceptanceRateLow",
+        "name": "LifecycleOfferAcceptanceRateLow",
         "metric": "offer_acceptance_rate",
         "threshold": 10,
         "duration_hours": 48,
@@ -83,9 +83,9 @@ ALERT_RULES = [
 
 
 def _breach_open_longer_than(db, metric_name: str, duration_hours: float) -> bool:
-    """Return True if an open cora_incident for metric_name is older than duration_hours."""
+    """Return True if an open lifecycle_incident for metric_name is older than duration_hours."""
     row = db.execute(sa_text("""
-        SELECT breach_started FROM cora_incident
+        SELECT breach_started FROM lifecycle_incident
         WHERE metric_name = :metric
           AND breach_resolved IS NULL
         ORDER BY breach_started DESC
@@ -150,7 +150,7 @@ def _fire_variant_promote(rule_name: str, db) -> dict:
 
 
 def _fire_self_healing(rule_name: str, metric_name: str, db) -> dict:
-    from src.tasks.cora_self_healing import (
+    from src.tasks.lifecycle_self_healing import (
         _process_metric, _Counters, _count_today_kill_recommendations,
     )
     settings = get_settings()
@@ -223,8 +223,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     dry_run = "--dry-run" in args
 
     settings = get_settings()
-    if not settings.cora_self_healing_enabled:
-        logger.info("[alert-rules] disabled via CORA_SELF_HEALING_ENABLED — exiting")
+    if not settings.lifecycle_self_healing_enabled:
+        logger.info("[alert-rules] disabled via LIFECYCLE_SELF_HEALING_ENABLED — exiting")
         return 0
 
     summary = run_alert_rules_check(dry_run=dry_run)

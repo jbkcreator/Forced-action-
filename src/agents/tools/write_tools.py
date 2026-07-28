@@ -1,5 +1,5 @@
 """
-Write tools for Cora graphs — priority-list scope.
+Write tools for Lifecycle graphs — priority-list scope.
 
 Only two write tools are needed to close the four priority-list LangGraph
 items (supervisor, FOMO, abandonment, retention):
@@ -73,24 +73,24 @@ def send_sms(
     session: Optional[Session] = None,
 ) -> Dict[str, Any]:
     """
-    Create a MessageOutcome row for every Cora SMS.
+    Create a MessageOutcome row for every Lifecycle SMS.
 
     If the message requires human review, it is stored as pending_review and is
     not sent immediately. If it does not require review, it is sent immediately
     through sms_compliance.send_sms().
     """
-    from src.services.cora_suppression import has_active_suppression
+    from src.services.lifecycle_suppression import has_active_suppression
 
     with _session(session) as s:
         if message_type != "transactional" and has_active_suppression(s, subscriber_id):
             logger.info(
-                "Cora SMS suppressed by active cora_suppression subscriber=%s campaign=%s",
+                "Lifecycle SMS suppressed by active lifecycle_suppression subscriber=%s campaign=%s",
                 subscriber_id,
                 campaign,
             )
             return {
                 "sent": False,
-                "reason": "cora_suppressed",
+                "reason": "lifecycle_suppressed",
                 "subscriber_id": subscriber_id,
                 "campaign": campaign,
                 "variant_id": variant_id,
@@ -144,10 +144,10 @@ def send_sms(
         # Hold for human review ONLY when the operator has flipped the
         # human-review switch ON. Default is OFF → messages send immediately
         # (we do not hold every marketing send waiting on approval). When the
-        # switch is ON, Cora's outbound marketing — and anything a graph
+        # switch is ON, Lifecycle's outbound marketing — and anything a graph
         # explicitly flags via ctx['requires_review'] — is queued for approve/
         # cancel. Transactional sends (receipts, opt-in prompts) never hold.
-        from src.services.cora_review_switch import is_review_enabled
+        from src.services.lifecycle_review_switch import is_review_enabled
 
         requires_review = is_review_enabled() and (
             message_type == "marketing" or bool(ctx.get("requires_review"))
@@ -246,29 +246,29 @@ def send_email(
 ) -> Dict[str, Any]:
     """
     Send a transactional/marketing email through Mailchimp (SMTP relay) for a
-    Cora graph decision.
+    Lifecycle graph decision.
 
     Mirrors the send_sms write tool contract:
-      - Suppression check (cora_suppression)
+      - Suppression check (lifecycle_suppression)
       - 24-hour deduplication by (subscriber_id, campaign, variant_id)
-      - Human review gate (cora_review_switch)
+      - Human review gate (lifecycle_review_switch)
       - MessageOutcome row written with channel='mailchimp'
       - Calls src.services.email.send_email() for actual delivery
 
     Returns a dict with keys: sent, reason, subscriber_id, campaign,
     variant_id, message_outcome_id.
     """
-    from src.services.cora_suppression import has_active_suppression
+    from src.services.lifecycle_suppression import has_active_suppression
 
     with _session(session) as s:
         if has_active_suppression(s, subscriber_id):
             logger.info(
-                "Cora email suppressed subscriber=%s campaign=%s",
+                "Lifecycle email suppressed subscriber=%s campaign=%s",
                 subscriber_id, campaign,
             )
             return {
                 "sent": False,
-                "reason": "cora_suppressed",
+                "reason": "lifecycle_suppressed",
                 "subscriber_id": subscriber_id,
                 "campaign": campaign,
                 "variant_id": variant_id,
@@ -300,7 +300,7 @@ def send_email(
 
         ctx = personalization_context or {}
 
-        from src.services.cora_review_switch import is_review_enabled
+        from src.services.lifecycle_review_switch import is_review_enabled
         requires_review = is_review_enabled() and bool(ctx.get("requires_review"))
 
         outcome = MessageOutcome(
@@ -420,7 +420,7 @@ def log_decision(
 	  - approved_at / by:  set when a human approves a previously-pending decision.
 	  - overridden_at / by / reason_code / reason: set when a human reverses an
 	                                      autonomous decision.
-	  - playbook_id:       optional link to the cora_playbook that drove this decision.
+	  - playbook_id:       optional link to the lifecycle_playbook that drove this decision.
 
 	Returns the final persisted state of the row.
 	"""

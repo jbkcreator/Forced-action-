@@ -24,7 +24,7 @@ Flow (6 nodes):
 	4. compose_and_send         — delegates to the shared subgraph
 	5. finalize                 — record final summary into state for tests
 
-Returns a CoraState-shaped dict ready for assertion / logging.
+Returns a LifecycleState-shaped dict ready for assertion / logging.
 """
 
 from __future__ import annotations

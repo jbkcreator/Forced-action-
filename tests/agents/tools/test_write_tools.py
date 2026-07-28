@@ -106,7 +106,7 @@ def test_send_sms_returns_duplicate_when_recent_send_exists():
 	assert result["message_outcome_id"] == 17
 
 
-def test_send_sms_returns_suppressed_when_cora_paused():
+def test_send_sms_returns_suppressed_when_lifecycle_paused():
 	opt_in = MagicMock(phone="+15555550000")
 	sess = _mock_query_returning(opt_in=opt_in, duplicate=None)
 	sess.execute.return_value.first.return_value = (1,)
@@ -120,7 +120,7 @@ def test_send_sms_returns_suppressed_when_cora_paused():
 	)
 
 	assert result["sent"] is False
-	assert result["reason"] == "cora_suppressed"
+	assert result["reason"] == "lifecycle_suppressed"
 	assert result["message_outcome_id"] is None
 	sess.add.assert_not_called()
 
@@ -129,7 +129,7 @@ def test_send_sms_returns_block_when_compliance_fails():
 	opt_in = MagicMock(phone="+15555550000")
 	sess = _mock_query_returning(opt_in=opt_in, duplicate=None)
 
-	with patch("src.services.cora_review_switch.is_review_enabled", return_value=False), \
+	with patch("src.services.lifecycle_review_switch.is_review_enabled", return_value=False), \
 		_patch_sms_compliance_send(False):
 		result = write_tools.send_sms(
 			subscriber_id=42,
@@ -146,7 +146,7 @@ def test_send_sms_happy_path_writes_message_outcome():
 	opt_in = MagicMock(phone="+15555550000")
 	sess = _mock_query_returning(opt_in=opt_in, duplicate=None)
 
-	with patch("src.services.cora_review_switch.is_review_enabled", return_value=False), \
+	with patch("src.services.lifecycle_review_switch.is_review_enabled", return_value=False), \
 		_patch_sms_compliance_send(True):
 		result = write_tools.send_sms(
 			subscriber_id=42,

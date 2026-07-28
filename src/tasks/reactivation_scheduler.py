@@ -22,7 +22,7 @@ from typing import Optional
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from src.agents.events.ingestion import publish_cora_event
+from src.agents.events.ingestion import publish_lifecycle_event
 from src.core.database import get_db_context
 from src.services.geo_interest import (
     get_subscribers_interested_in_county,
@@ -58,8 +58,8 @@ def _dispatch(
     winback_branch: Optional[str] = None,
 ) -> bool:
     """
-    Publish a reactivation_outreach Cora event for a subscriber.
-    Cora's reactivation graph selects the channel, composes, sends, and logs.
+    Publish a reactivation_outreach Lifecycle event for a subscriber.
+    Lifecycle's reactivation graph selects the channel, composes, sends, and logs.
     Returns True if the event was published (or would have been in dry_run).
     """
     if dry_run:
@@ -71,7 +71,7 @@ def _dispatch(
         return True
 
     try:
-        publish_cora_event({
+        publish_lifecycle_event({
             "event_type": "reactivation_outreach",
             "subscriber_id": sub.id,
             "payload": {

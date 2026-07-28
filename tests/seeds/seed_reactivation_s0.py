@@ -398,7 +398,7 @@ def do_cleanup() -> None:
             })
             print(f"  [restore] expansion_candidate county={SEED_COUNTY} → status={original['status']}")
 
-        # 1. Subscriber — delete Cora-generated rows that FK to subscriber first
+        # 1. Subscriber — delete Lifecycle-generated rows that FK to subscriber first
         if state.get("subscriber_created") and state.get("subscriber_id"):
             sid = state["subscriber_id"]
             db.execute(text("DELETE FROM message_outcomes WHERE subscriber_id = :id"), {"id": sid})

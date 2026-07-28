@@ -1,5 +1,5 @@
 """
-Run-wrapper for Cora Data Engine outcome connectors.
+Run-wrapper for Lifecycle Data Engine outcome connectors.
 
 Cron already gives failure isolation (every scraper/task is its own line in
 scripts/cron/crontab.txt, run as a separate OS process via

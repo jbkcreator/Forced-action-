@@ -1,5 +1,5 @@
 """
-Cora Supervisor — entry point for every autonomous decision.
+Lifecycle Supervisor — entry point for every autonomous decision.
 
 Takes a normalized Event, routes it to the right graph via src/agents/router.py,
 enforces global + per-graph kill switches, enforces idempotency by
@@ -89,7 +89,7 @@ def dispatch_event(event: Dict[str, Any]) -> Dict[str, Any]:
 		return _outcome("routed", "enrichment_cascade", decision_id, "ok")
 
 	# Pipeline event routing — Lead Pack Hot-Enrichment (ADR 0018).
-	# lead_pack_reserved is a fulfillment trigger, not a Cora messaging graph:
+	# lead_pack_reserved is a fulfillment trigger, not a Lifecycle messaging graph:
 	# hand it to the fulfillment worker (which fans out onto a daemon thread so
 	# the listener never blocks on the Tracerfy poll) and return. The cron sweep
 	# remains the durability backstop if this event is dropped.
@@ -106,7 +106,7 @@ def dispatch_event(event: Dict[str, Any]) -> Dict[str, Any]:
 		return _outcome("routed", "lead_pack_fulfillment", decision_id, "ok")
 
 	# Closer Cockpit tagging (ADR closer-telemetry-separate-from-agent-decisions).
-	# call_transcribed is post-call enrichment, NOT a Cora Touch — hand it to the
+	# call_transcribed is post-call enrichment, NOT a Lifecycle Touch — hand it to the
 	# tagging service and return BEFORE the EVENT_TO_GRAPH lookup / agent_decisions
 	# logging. The nightly retag sweep is the durability backstop.
 	if event_type == "call_transcribed":
@@ -121,7 +121,7 @@ def dispatch_event(event: Dict[str, Any]) -> Dict[str, Any]:
 		return _outcome("routed", "closer_call_tagging", decision_id, "ok")
 
 	# Feedback Ritual capture hook (Sprint 4.3).
-	# feedback_ritual_candidate is queueing/enrichment, not a Cora graph run:
+	# feedback_ritual_candidate is queueing/enrichment, not a Lifecycle graph run:
 	# load the finished agent_decisions row and enqueue a shared feedback-ritual
 	# queue row if it qualifies.
 	if event_type == "feedback_ritual_candidate":
@@ -143,7 +143,7 @@ def dispatch_event(event: Dict[str, Any]) -> Dict[str, Any]:
 		return _outcome("routed", "feedback_ritual", decision_id, "ok")
 
 	# Unlock Placement + Scarcity (spec 3.3, D7): a paid hot-lead/lead unlock
-	# stamps last-touch nudge attribution, not a Cora messaging graph run.
+	# stamps last-touch nudge attribution, not a Lifecycle messaging graph run.
 	if event_type == "unlock_purchased":
 		try:
 			from src.services.nudge_conversion import record_nudge_conversion

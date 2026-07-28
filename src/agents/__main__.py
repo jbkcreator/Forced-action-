@@ -1,5 +1,5 @@
 """
-Cora Agents — process entry point.
+Lifecycle Agents — process entry point.
 
 Usage:
     python -m src.agents                # show help
@@ -8,8 +8,8 @@ Usage:
     python -m src.agents --health       # run health checks and exit (0 = healthy)
 
 The supervisor blocks until SIGINT / SIGTERM. It starts two daemon threads:
-    - Redis Pub/Sub listener on channel "cora:events"
-    - Postgres LISTEN listener on channel "cora_events"
+    - Redis Pub/Sub listener on channel "lifecycle:events"
+    - Postgres LISTEN listener on channel "lifecycle_events"
 
 Both are controlled by AGENTS_EVENT_SOURCE_REDIS / AGENTS_EVENT_SOURCE_POSTGRES.
 """
@@ -70,7 +70,7 @@ def _run_health_checks(*, fatal_on_error: bool = True) -> bool:
     checks_passed = 0
     checks_failed = 0
 
-    _banner("Cora Agents — startup health check")
+    _banner("Lifecycle Agents — startup health check")
 
     # ── 1. Config ─────────────────────────────────────────────────────────────
     _section("Configuration")
@@ -128,7 +128,7 @@ def _run_health_checks(*, fatal_on_error: bool = True) -> bool:
     _section("Postgres LISTEN/NOTIFY")
     if settings.agents_event_source_postgres:
         _check("Postgres listener enabled", True, critical=False)
-        _line(f"  {_INFO} Channel: cora_events  |  queue sweep: 60s interval")
+        _line(f"  {_INFO} Channel: lifecycle_events  |  queue sweep: 60s interval")
     else:
         _line(f"  {_WARN} Postgres listener disabled (AGENTS_EVENT_SOURCE_POSTGRES=false)")
 
@@ -277,7 +277,7 @@ def cmd_serve() -> int:
     settings = get_agents_settings()
 
     logger.info(
-        "Starting Cora Agents supervisor | graphs=%s | redis=%s | postgres=%s",
+        "Starting Lifecycle Agents supervisor | graphs=%s | redis=%s | postgres=%s",
         settings.agents_graphs_enabled,
         settings.agents_event_source_redis,
         settings.agents_event_source_postgres,
@@ -302,7 +302,7 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(
         prog="python -m src.agents",
-        description="Cora Agents — autonomous decision supervisor",
+        description="Lifecycle Agents — autonomous decision supervisor",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"

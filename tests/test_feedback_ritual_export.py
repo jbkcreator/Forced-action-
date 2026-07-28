@@ -2,7 +2,7 @@
 import json
 from datetime import datetime, timezone
 
-from src.core.models import CoraTrainingOverride
+from src.core.models import LifecycleTrainingOverride
 from src.services.feedback_ritual_export import (
     build_export_example,
     run_feedback_ritual_export,
@@ -23,7 +23,7 @@ def _snapshot(**over):
 
 
 class TestBuildExportExample:
-    def test_approved_uses_cora_output_as_label(self):
+    def test_approved_uses_lifecycle_output_as_label(self):
         row = {
             "subject_ref": "dec-1",
             "review_outcome": "approved",
@@ -70,7 +70,7 @@ class TestBuildExportExample:
 
 
 def _mk_row(db, ref, *, outcome, queue_status="pending", corrected=None, snap=None):
-    row = CoraTrainingOverride(
+    row = LifecycleTrainingOverride(
         source="feedback_ritual",
         subject_type="agent_decision",
         subject_ref=ref,

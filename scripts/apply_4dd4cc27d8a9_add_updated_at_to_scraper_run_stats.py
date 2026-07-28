@@ -191,7 +191,7 @@ ALTER TABLE nws_alerts ALTER COLUMN county_id DROP DEFAULT;
 
 ALTER TABLE nws_alerts ALTER COLUMN storm_pack_triggered DROP DEFAULT;
 
-ALTER TABLE nws_alerts ALTER COLUMN cora_urgency_sent DROP DEFAULT;
+ALTER TABLE nws_alerts ALTER COLUMN lifecycle_urgency_sent DROP DEFAULT;
 
 ALTER TABLE nws_alerts ALTER COLUMN subscriber_count DROP DEFAULT;
 

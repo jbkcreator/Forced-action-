@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 GRAPH_NAME = "synthflow_voice_drop"
 # Gate on lock_conversion: this voice drop is a high-intent conversion-recovery
 # call, and lock_conversion's documented remediation is "live-data close, voice
-# drop, urgency" (config/cora_guardrails.py) — the same metric fomo gates on.
+# drop, urgency" (config/lifecycle_guardrails.py) — the same metric fomo gates on.
 # The prior value "synthflow_voice_drop" was neither in the KILL_SWITCH config
 # nor computed by kill_switch_metric_ingest, so the gate always resolved to
 # 'unknown' → fail-safe RED → every dispatch aborted before initiating a call.
@@ -371,7 +371,7 @@ def _node_finalize(state: VoiceDropState) -> VoiceDropState:
 
     final_status = state.get("terminal_status") or ("completed" if state.get("sent") else "failed")
 
-    # Unlike the other Cora graphs, this flow has no compose_and_send node that
+    # Unlike the other Lifecycle graphs, this flow has no compose_and_send node that
     # logs on the happy path — so we own the agent_decisions row on EVERY path.
     # Without it there is no audit trail and the DoD SLA query (agent_decisions
     # → synthflow_calls) can't see the dispatch.

@@ -253,21 +253,21 @@ class TestCallClaudeUnit:
         _, kwargs = self._patched_call(
             "sms_copy",
             [{"role": "user", "content": "hi"}],
-            system="You are Cora.",
+            system="You are Lifecycle.",
         )
-        assert kwargs["system"] == "You are Cora."
+        assert kwargs["system"] == "You are Lifecycle."
 
     def test_system_prompt_wrapped_with_cache_control_when_cache_true(self):
         _, kwargs = self._patched_call(
             "conversational_close",
             [{"role": "user", "content": "hi"}],
-            system="You are Cora.",
+            system="You are Lifecycle.",
             cache_system=True,
         )
         assert isinstance(kwargs["system"], list)
         block = kwargs["system"][0]
         assert block["type"] == "text"
-        assert block["text"] == "You are Cora."
+        assert block["text"] == "You are Lifecycle."
         assert block["cache_control"] == {"type": "ephemeral"}
 
     def test_no_system_prompt_omits_system_key(self):

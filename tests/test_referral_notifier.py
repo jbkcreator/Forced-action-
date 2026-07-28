@@ -1,5 +1,5 @@
 """
-Unit tests for referral_notifier — Cora-composed SMS + email for milestone events.
+Unit tests for referral_notifier — Lifecycle-composed SMS + email for milestone events.
 
 Covers:
 - All 3 milestone types (per_referral, free_month_3, lock_slot_5)

@@ -14,7 +14,7 @@ alerting:
         - targets: ["localhost:9093"]
 
 scrape_configs:
-  - job_name: "cora_stage10"
+  - job_name: "lifecycle_stage10"
     metrics_path: "/metrics"
     static_configs:
       - targets: ["localhost:8000"]

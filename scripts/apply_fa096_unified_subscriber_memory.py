@@ -48,7 +48,7 @@ DDL = [
         END IF;
     END $$;
     """,
-    # ── 3. Index: subscriber_id + created_at (Cora's hot path) ───────────────
+    # ── 3. Index: subscriber_id + created_at (Lifecycle's hot path) ───────────────
     """
     CREATE INDEX IF NOT EXISTS idx_usm_subscriber_created
         ON unified_subscriber_memory (subscriber_id, created_at DESC);

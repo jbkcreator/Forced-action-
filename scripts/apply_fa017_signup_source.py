@@ -37,7 +37,7 @@ ALTER TABLE subscribers ALTER COLUMN signup_source SET NOT NULL;
 
 ALTER TABLE subscribers ALTER COLUMN signup_source SET DEFAULT 'direct';
 
-ALTER TABLE subscribers ADD CONSTRAINT check_subscriber_signup_source CHECK (signup_source IN ('direct','landing_page','dbpr_email','cora_sms','missed_call','referral','admin','unknown'));
+ALTER TABLE subscribers ADD CONSTRAINT check_subscriber_signup_source CHECK (signup_source IN ('direct','landing_page','dbpr_email','lifecycle_sms','missed_call','referral','admin','unknown'));
 
 CREATE INDEX idx_subscriber_signup_source ON subscribers (signup_source);
 """

@@ -1,7 +1,7 @@
 """
-Tool registry for Cora graphs.
+Tool registry for Lifecycle graphs.
 
-Every callable a LangGraph node can invoke on behalf of Cora is a "tool".
+Every callable a LangGraph node can invoke on behalf of Lifecycle is a "tool".
 Tools are declared with the @tool decorator, which:
 
   1. Validates category + idempotency declarations at registration time
@@ -64,7 +64,7 @@ def tool(
 	name: Optional[str] = None,
 ) -> Callable[[F], F]:
 	"""
-	Register a function as a Cora tool.
+	Register a function as a Lifecycle tool.
 
 	Args:
 		category: "read", "write", or "gating"
@@ -117,7 +117,7 @@ def tool(
 		TOOL_REGISTRY[tool_name] = spec
 
 		# Attach spec to the function for introspection.
-		fn.__cora_tool_spec__ = spec  # type: ignore[attr-defined]
+		fn.__lifecycle_tool_spec__ = spec  # type: ignore[attr-defined]
 		return fn
 
 	return decorator

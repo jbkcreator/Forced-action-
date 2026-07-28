@@ -1,25 +1,25 @@
 """
-Quora search miner — CLI wrapper around quora_engine + Cora Quora graph.
+Quora search miner — CLI wrapper around quora_engine + Lifecycle Quora graph.
 
 Usage:
     # Scrape + parse + deterministic score only
     python -m src.scrappers.quora.quora_miner --keyword "foreclosures florida" --dump-raw
 
-    # Add Cora classification (publishes to event queue, polls for results)
-    python -m src.scrappers.quora.quora_miner --keyword "foreclosures florida" --dump-raw --classify-with-cora
+    # Add Lifecycle classification (publishes to event queue, polls for results)
+    python -m src.scrappers.quora.quora_miner --keyword "foreclosures florida" --dump-raw --classify-with-lifecycle
 
     # Add answer draft generation
-    python -m src.scrappers.quora.quora_miner --keyword "foreclosures florida" --dump-raw --classify-with-cora --generate-answer-drafts
+    python -m src.scrappers.quora.quora_miner --keyword "foreclosures florida" --dump-raw --classify-with-lifecycle --generate-answer-drafts
 
---classify-with-cora:
-    Publishes one `quora_candidate_classify` event per result to the Cora event
+--classify-with-lifecycle:
+    Publishes one `quora_candidate_classify` event per result to the Lifecycle event
     queue (Redis primary, Postgres fallback). Each event carries a pre-generated
-    decision_id. After Cora processes each event it dispatches a result back to
-    the `cora:quora:results` Redis channel keyed by decision_id. The miner
+    decision_id. After Lifecycle processes each event it dispatches a result back to
+    the `lifecycle:quora:results` Redis channel keyed by decision_id. The miner
     subscribes to that channel and collects results inline, falling back to DB
     polling if Redis is unavailable.
 
-    Requires the Cora agents process to be running:
+    Requires the Lifecycle agents process to be running:
         python -m src.agents --serve
 """
 
@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT   = Path(__file__).resolve().parents[3]
 _DEBUG_DIR      = _PROJECT_ROOT / "data" / "debug" / "quora"
-_POLL_TIMEOUT   = 120   # seconds to wait for Cora before giving up
+_POLL_TIMEOUT   = 120   # seconds to wait for Lifecycle before giving up
 _POLL_INTERVAL  = 3.0   # seconds between DB polls
 
 
@@ -54,7 +54,7 @@ _POLL_INTERVAL  = 3.0   # seconds between DB polls
 # ---------------------------------------------------------------------------
 
 def _result_to_candidate_dict(r: QuoraResult) -> dict:
-    """Compact dict sent to Cora — no raw_metadata."""
+    """Compact dict sent to Lifecycle — no raw_metadata."""
     return {
         "qid":                   r.qid,
         "title":                 r.title,
@@ -79,13 +79,13 @@ def _keyword_slug(keyword: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", keyword.lower()).strip("_")
 
 
-async def _poll_cora_results(
+async def _poll_lifecycle_results(
     decision_id_map: dict[str, QuoraResult],
     timeout: int = _POLL_TIMEOUT,
     interval: float = _POLL_INTERVAL,
 ) -> int:
     """
-    Subscribe to cora:quora:results Redis channel and collect results keyed by
+    Subscribe to lifecycle:quora:results Redis channel and collect results keyed by
     decision_id. Falls back to DB polling when Redis is unavailable. Enriches
     each QuoraResult in-place; returns the count successfully enriched.
     """
@@ -93,7 +93,7 @@ async def _poll_cora_results(
 
     if not redis_available():
         logger.warning("[miner] Redis unavailable — falling back to DB poll")
-        return await _poll_cora_results_db(decision_id_map, timeout, interval)
+        return await _poll_lifecycle_results_db(decision_id_map, timeout, interval)
 
     pending = set(decision_id_map.keys())
     loop    = asyncio.get_event_loop()
@@ -101,7 +101,7 @@ async def _poll_cora_results(
     def _subscribe_and_collect() -> dict[str, dict]:
         client = get_redis()
         pubsub = client.pubsub(ignore_subscribe_messages=True)
-        pubsub.subscribe("cora:quora:results")
+        pubsub.subscribe("lifecycle:quora:results")
 
         collected: dict[str, dict] = {}
         deadline = time.monotonic() + timeout
@@ -116,10 +116,10 @@ async def _poll_cora_results(
                         collected[did] = data
                         status = data.get("terminal_status", "completed")
                         if status in ("completed", "classify_failed", "answer_failed"):
-                            logger.info("[miner] cora result received  decision_id=%s  qid=%s",
+                            logger.info("[miner] lifecycle result received  decision_id=%s  qid=%s",
                                         did, data.get("qid"))
                         else:
-                            logger.warning("[miner] cora dropped  decision_id=%s  reason=%s",
+                            logger.warning("[miner] lifecycle dropped  decision_id=%s  reason=%s",
                                            did, status)
                 except Exception:
                     pass
@@ -128,7 +128,7 @@ async def _poll_cora_results(
         pubsub.close()
         return collected
 
-    print(f"  Subscribing to cora:quora:results for {len(pending)} result(s) "
+    print(f"  Subscribing to lifecycle:quora:results for {len(pending)} result(s) "
           f"(timeout={timeout}s)…", flush=True)
 
     collected = await loop.run_in_executor(None, _subscribe_and_collect)
@@ -137,18 +137,18 @@ async def _poll_cora_results(
     for did, data in collected.items():
         r = decision_id_map.get(did)
         if r:
-            r.cora_classification = data.get("cora_classification")
-            r.cora_answer_draft   = data.get("cora_answer_draft")
+            r.lifecycle_classification = data.get("lifecycle_classification")
+            r.lifecycle_answer_draft   = data.get("lifecycle_answer_draft")
             enriched += 1
 
     if len(collected) < len(pending):
-        logger.warning("[miner] %d/%d result(s) timed out — cora_classification will be null",
+        logger.warning("[miner] %d/%d result(s) timed out — lifecycle_classification will be null",
                        len(pending) - len(collected), len(decision_id_map))
 
     return enriched
 
 
-async def _poll_cora_results_db(
+async def _poll_lifecycle_results_db(
     decision_id_map: dict[str, QuoraResult],
     timeout: int = _POLL_TIMEOUT,
     interval: float = _POLL_INTERVAL,
@@ -181,11 +181,11 @@ async def _poll_cora_results_db(
                 result = decision_id_map.get(did)
                 if result and did in pending:
                     summary = row[2] or {}
-                    result.cora_classification = summary.get("cora_classification")
-                    result.cora_answer_draft   = summary.get("cora_answer_draft")
+                    result.lifecycle_classification = summary.get("lifecycle_classification")
+                    result.lifecycle_answer_draft   = summary.get("lifecycle_answer_draft")
                     pending.discard(did)
                     enriched += 1
-                    logger.info("[miner] cora result received  decision_id=%s  qid=%s", did, result.qid)
+                    logger.info("[miner] lifecycle result received  decision_id=%s  qid=%s", did, result.qid)
 
         except Exception as exc:
             logger.error("[miner] poll query failed: %s", exc)
@@ -194,7 +194,7 @@ async def _poll_cora_results_db(
             await asyncio.sleep(interval)
 
     if pending:
-        logger.warning("[miner] %d/%d result(s) timed out — cora_classification will be null",
+        logger.warning("[miner] %d/%d result(s) timed out — lifecycle_classification will be null",
                        len(pending), len(decision_id_map))
 
     return enriched
@@ -206,9 +206,9 @@ def _save_classified_to_db(
     decision_id_map: dict[str, QuoraResult],
 ) -> int:
     """
-    Upsert all Cora-classified results into quora_questions.
+    Upsert all Lifecycle-classified results into quora_questions.
     Uses qid as the conflict key. On conflict, updates classification fields
-    and last_classified_at so re-runs reflect the latest Cora decision.
+    and last_classified_at so re-runs reflect the latest Lifecycle decision.
     Returns the number of rows upserted.
     """
     from datetime import timezone as _tz
@@ -218,16 +218,16 @@ def _save_classified_to_db(
     # Build reverse map: QuoraResult → decision_id
     result_to_did = {id(v): k for k, v in decision_id_map.items()}
 
-    classified = [r for r in results if r.cora_classification is not None]
+    classified = [r for r in results if r.lifecycle_classification is not None]
     if not classified:
         return 0
 
     now = _dt.now(tz=_tz.utc)
     rows = []
     for r in classified:
-        cl = r.cora_classification or {}
+        cl = r.lifecycle_classification or {}
         action = cl.get("recommended_action", "skip")
-        if action == "generate_answer" and r.cora_answer_draft:
+        if action == "generate_answer" and r.lifecycle_answer_draft:
             status = "drafted"
         elif action == "generate_answer":
             status = "pending"
@@ -249,13 +249,13 @@ def _save_classified_to_db(
             "deterministic_score":   r.deterministic_score,
             "deterministic_reasons": r.deterministic_reasons or [],
             "matched_keyword":       keyword,
-            "cora_decision_id":      result_to_did.get(id(r)),
+            "lifecycle_decision_id":      result_to_did.get(id(r)),
             "intent_lane":           cl.get("intent_lane"),
             "recommended_action":    action,
             "priority_score":        cl.get("priority_score"),
             "risk_level":            cl.get("risk_level"),
-            "cora_classification":   json.dumps(cl),
-            "answer_draft":          json.dumps(r.cora_answer_draft) if r.cora_answer_draft else None,
+            "lifecycle_classification":   json.dumps(cl),
+            "answer_draft":          json.dumps(r.lifecycle_answer_draft) if r.lifecycle_answer_draft else None,
             "answer_status":         status,
             "first_seen_at":         now,
             "last_classified_at":    now,
@@ -272,9 +272,9 @@ def _save_classified_to_db(
                             answer_count, follower_count, view_count,
                             is_locked, is_sensitive, topics, created_time,
                             deterministic_score, deterministic_reasons,
-                            matched_keyword, cora_decision_id,
+                            matched_keyword, lifecycle_decision_id,
                             intent_lane, recommended_action, priority_score,
-                            risk_level, cora_classification,
+                            risk_level, lifecycle_classification,
                             answer_draft, answer_status,
                             first_seen_at, last_classified_at
                         ) VALUES (
@@ -282,20 +282,20 @@ def _save_classified_to_db(
                             :answer_count, :follower_count, :view_count,
                             :is_locked, :is_sensitive, :topics, :created_time,
                             :deterministic_score, :deterministic_reasons,
-                            :matched_keyword, :cora_decision_id,
+                            :matched_keyword, :lifecycle_decision_id,
                             :intent_lane, :recommended_action, :priority_score,
-                            :risk_level, CAST(:cora_classification AS jsonb),
+                            :risk_level, CAST(:lifecycle_classification AS jsonb),
                             CAST(:answer_draft AS jsonb), :answer_status,
                             :first_seen_at, :last_classified_at
                         )
                         ON CONFLICT (qid) DO UPDATE SET
                             matched_keyword      = EXCLUDED.matched_keyword,
-                            cora_decision_id     = EXCLUDED.cora_decision_id,
+                            lifecycle_decision_id     = EXCLUDED.lifecycle_decision_id,
                             intent_lane          = EXCLUDED.intent_lane,
                             recommended_action   = EXCLUDED.recommended_action,
                             priority_score       = EXCLUDED.priority_score,
                             risk_level           = EXCLUDED.risk_level,
-                            cora_classification  = EXCLUDED.cora_classification,
+                            lifecycle_classification  = EXCLUDED.lifecycle_classification,
                             answer_draft         = COALESCE(EXCLUDED.answer_draft, quora_questions.answer_draft),
                             answer_status        = CASE
                                 WHEN quora_questions.answer_status IN ('published', 'failed')
@@ -327,7 +327,7 @@ def _overwrite_parsed_dump(keyword: str, results: list[QuoraResult]) -> None:
         return
     path = matches[0]
     path.write_text(json.dumps([_result_to_dump_dict(r) for r in results], indent=2, default=str))
-    logger.info("[miner] updated parsed dump with Cora output → %s", path)
+    logger.info("[miner] updated parsed dump with Lifecycle output → %s", path)
 
 
 # ---------------------------------------------------------------------------
@@ -338,12 +338,12 @@ async def main(
     keyword: str,
     max_results: int,
     dump_raw: bool,
-    classify_with_cora: bool,
+    classify_with_lifecycle: bool,
     generate_answer_drafts: bool,
 ) -> None:
     logger.info(
         "Querying Quora: %r  max=%d  dump_raw=%s  classify=%s  answers=%s",
-        keyword, max_results, dump_raw, classify_with_cora, generate_answer_drafts,
+        keyword, max_results, dump_raw, classify_with_lifecycle, generate_answer_drafts,
     )
 
     responses = await scrape_quora([keyword], max_results=max_results, dump_raw=dump_raw)
@@ -358,9 +358,9 @@ async def main(
 
         print(f"Results: {len(resp.results)}")
 
-        # ── Cora classification via event queue ───────────────────────────────
-        if classify_with_cora and resp.results:
-            from src.agents.events.ingestion import publish_cora_event
+        # ── Lifecycle classification via event queue ───────────────────────────────
+        if classify_with_lifecycle and resp.results:
+            from src.agents.events.ingestion import publish_lifecycle_event
 
             kslug          = _keyword_slug(keyword)
             decision_id_map: dict[str, QuoraResult] = {}
@@ -370,12 +370,12 @@ async def main(
                 did             = str(uuid.uuid4())
                 idempotency_key = f"quora_{kind}_{r.qid or r.slug or r.position}_{kslug}"
                 try:
-                    publish_cora_event({
+                    publish_lifecycle_event({
                         "event_type":      "quora_candidate_classify",
                         "subscriber_id":   None,
                         "decision_id":     did,
                         "idempotency_key": idempotency_key,
-                        "result_channel":  "cora:quora:results",
+                        "result_channel":  "lifecycle:quora:results",
                         "payload": {
                             "candidate":              _result_to_candidate_dict(r),
                             "matched_keyword":        keyword,
@@ -386,11 +386,11 @@ async def main(
                 except Exception as exc:
                     logger.error("[miner] publish failed qid=%s: %s", r.qid, exc)
 
-            print(f"\n  Cora: {len(decision_id_map)}/{len(resp.results)} events published.")
+            print(f"\n  Lifecycle: {len(decision_id_map)}/{len(resp.results)} events published.")
 
             if decision_id_map:
-                enriched = await _poll_cora_results(decision_id_map)
-                print(f"  Cora: {enriched}/{len(decision_id_map)} classified.")
+                enriched = await _poll_lifecycle_results(decision_id_map)
+                print(f"  Lifecycle: {enriched}/{len(decision_id_map)} classified.")
 
                 saved = _save_classified_to_db(resp.results, keyword, decision_id_map)
                 print(f"  DB:   {saved} question(s) upserted to quora_questions.")
@@ -426,14 +426,14 @@ async def main(
             if r.top_answer_snippet:
                 print(f"          \"{r.top_answer_snippet[:140]}\"")
 
-            if r.cora_classification:
-                cl = r.cora_classification
-                print(f"        Cora: {cl.get('recommended_action','?')} | "
+            if r.lifecycle_classification:
+                cl = r.lifecycle_classification
+                print(f"        Lifecycle: {cl.get('recommended_action','?')} | "
                       f"priority={cl.get('priority_score','?')} | "
                       f"lane={cl.get('intent_lane','?')} | "
                       f"risk={cl.get('risk_level','?')}")
-            if r.cora_answer_draft:
-                print(f"        Answer draft: {r.cora_answer_draft.get('answer_status','?')}")
+            if r.lifecycle_answer_draft:
+                print(f"        Answer draft: {r.lifecycle_answer_draft.get('answer_status','?')}")
 
         if dump_raw:
             print(f"\nDumps saved to data/debug/quora/")
@@ -448,20 +448,20 @@ if __name__ == "__main__":
     ap.add_argument("--keyword",                required=True)
     ap.add_argument("--max-results",            type=int, default=20)
     ap.add_argument("--dump-raw",               action="store_true")
-    ap.add_argument("--classify-with-cora",     action="store_true",
-                    help="Publish to Cora event queue and poll for classification results")
+    ap.add_argument("--classify-with-lifecycle",     action="store_true",
+                    help="Publish to Lifecycle event queue and poll for classification results")
     ap.add_argument("--generate-answer-drafts", action="store_true",
                     help="Also generate answer drafts for approved candidates")
     args = ap.parse_args()
 
     # --generate-answer-drafts requires classification — enable it implicitly
     if args.generate_answer_drafts:
-        args.classify_with_cora = True
+        args.classify_with_lifecycle = True
 
     asyncio.run(main(
         keyword=args.keyword,
         max_results=args.max_results,
         dump_raw=args.dump_raw,
-        classify_with_cora=args.classify_with_cora,
+        classify_with_lifecycle=args.classify_with_lifecycle,
         generate_answer_drafts=args.generate_answer_drafts,
     ))

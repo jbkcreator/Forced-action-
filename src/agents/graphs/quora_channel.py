@@ -1,5 +1,5 @@
 """
-Cora / LangGraph graph for the Quora organic-answer workflow.
+Lifecycle / LangGraph graph for the Quora organic-answer workflow.
 
 Two logical nodes:
     classify_question  — decides if a question is worth answering and how
@@ -75,10 +75,10 @@ class QuoraChannelState(TypedDict, total=False):
     generate_answer_drafts: bool
 
     # ── Intermediate ─────────────────────────────────────────────────────────
-    cora_classification: Optional[dict]
+    lifecycle_classification: Optional[dict]
 
     # ── Outputs ───────────────────────────────────────────────────────────────
-    cora_answer_draft: Optional[dict]
+    lifecycle_answer_draft: Optional[dict]
     tokens_used: int
     cost_usd: float
     terminal_status: str
@@ -118,7 +118,7 @@ def _node_classify_question(state: QuoraChannelState) -> Dict[str, Any]:
 
         classification = result.get("tool_input")
         return {
-            "cora_classification": classification,
+            "lifecycle_classification": classification,
             "tokens_used": (result.get("input_tokens", 0) or 0) + (result.get("output_tokens", 0) or 0),
             "cost_usd":    result.get("cost_usd", 0.0) or 0.0,
         }
@@ -126,7 +126,7 @@ def _node_classify_question(state: QuoraChannelState) -> Dict[str, Any]:
     except Exception as exc:
         logger.error("[quora_channel] classify_question failed: %s", exc)
         return {
-            "cora_classification": None,
+            "lifecycle_classification": None,
             "terminal_status":     "classify_failed",
             "failure_reason":      str(exc),
         }
@@ -140,7 +140,7 @@ def _node_generate_answer(state: QuoraChannelState) -> Dict[str, Any]:
     if state.get("terminal_status"):
         return {}
 
-    classification = state.get("cora_classification") or {}
+    classification = state.get("lifecycle_classification") or {}
     candidate      = state.get("candidate") or {}
     keyword        = state.get("matched_keyword") or ""
 
@@ -150,7 +150,7 @@ def _node_generate_answer(state: QuoraChannelState) -> Dict[str, Any]:
         and classification.get("recommended_action") == "generate_answer"
         and int(classification.get("priority_score", 0)) >= _MIN_PRIORITY_FOR_ANSWER
     ):
-        return {"cora_answer_draft": None}
+        return {"lifecycle_answer_draft": None}
 
     compact = {k: v for k, v in candidate.items() if k != "raw_metadata"}
     qid     = candidate.get("qid") or ""
@@ -186,7 +186,7 @@ def _node_generate_answer(state: QuoraChannelState) -> Dict[str, Any]:
         prior_cost   = float(state.get("cost_usd", 0.0) or 0.0)
 
         return {
-            "cora_answer_draft": answer_draft,
+            "lifecycle_answer_draft": answer_draft,
             "tokens_used":  prior_tokens + (result.get("input_tokens", 0) or 0) + (result.get("output_tokens", 0) or 0),
             "cost_usd":     prior_cost + (result.get("cost_usd", 0.0) or 0.0),
         }
@@ -194,7 +194,7 @@ def _node_generate_answer(state: QuoraChannelState) -> Dict[str, Any]:
     except Exception as exc:
         logger.error("[quora_channel] generate_answer failed: %s", exc)
         return {
-            "cora_answer_draft": None,
+            "lifecycle_answer_draft": None,
             "terminal_status":   "answer_failed",
             "failure_reason":    str(exc),
         }
@@ -211,7 +211,7 @@ def _should_generate(state: QuoraChannelState) -> str:
     if not state.get("generate_answer_drafts"):
         return END
 
-    classification = state.get("cora_classification") or {}
+    classification = state.get("lifecycle_classification") or {}
     if (
         classification.get("is_relevant")
         and classification.get("is_answerable")
@@ -247,7 +247,7 @@ def run_quora_channel(
     Run the Quora channel graph for a single candidate question.
 
     candidate must be a plain dict (QuoraResult fields, no raw_metadata).
-    Returns the final state dict with cora_classification and optionally cora_answer_draft.
+    Returns the final state dict with lifecycle_classification and optionally lifecycle_answer_draft.
     """
     graph = build_quora_channel_graph().compile()
     final = graph.invoke({
@@ -286,8 +286,8 @@ def run_quora_channel_from_event(
     summary = {
         "qid":                 candidate.get("qid"),
         "matched_keyword":     matched_keyword,
-        "cora_classification": result.get("cora_classification"),
-        "cora_answer_draft":   result.get("cora_answer_draft"),
+        "lifecycle_classification": result.get("lifecycle_classification"),
+        "lifecycle_answer_draft":   result.get("lifecycle_answer_draft"),
         "failure_reason":      result.get("failure_reason"),
     }
 
@@ -314,13 +314,13 @@ def run_quora_channel_from_event(
     try:
         from src.core.redis_client import get_redis, redis_available
         if redis_available():
-            get_redis().publish("cora:quora:results", json.dumps({
+            get_redis().publish("lifecycle:quora:results", json.dumps({
                 "decision_id":         decision_id,
                 "qid":                 candidate.get("qid"),
                 "terminal_status":     result.get("terminal_status") or "completed",
                 "write_confirmed":     write_confirmed,
-                "cora_classification": result.get("cora_classification"),
-                "cora_answer_draft":   result.get("cora_answer_draft"),
+                "lifecycle_classification": result.get("lifecycle_classification"),
+                "lifecycle_answer_draft":   result.get("lifecycle_answer_draft"),
             }, default=str))
     except Exception as exc:
         logger.warning("[quora_channel] Redis dispatch failed: %s", exc)

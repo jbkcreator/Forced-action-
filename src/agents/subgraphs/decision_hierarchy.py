@@ -1,5 +1,5 @@
 """
-decision_hierarchy_check — the 6-step gate every Cora action passes through.
+decision_hierarchy_check — the 6-step gate every Lifecycle action passes through.
 
 Composed purely from gating + read tools. No Claude calls.
 
@@ -167,7 +167,7 @@ def _node_assign_ab_variant(state: DecisionHierarchyState) -> DecisionHierarchyS
 
 
 def _node_assign_rollout_arm(state: DecisionHierarchyState) -> DecisionHierarchyState:
-	"""Step 5b — assign the subscriber to a rollout arm for cora_attribution_v1.
+	"""Step 5b — assign the subscriber to a rollout arm for lifecycle_attribution_v1.
 
 	Eligibility = subscriber has a non-empty attribution context (revenue signal
 	score or recent conversion events). The context is fetched here rather than

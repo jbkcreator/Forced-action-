@@ -23,7 +23,7 @@ deed -- true when this connector runs after the nightly sweep's portfolio
 aggregation step, per crontab.txt's stagger (08:30 sweep, 08:35 fast-follow);
 this connector does not re-aggregate itself.
 
-Latency SLA (Hunter's constitution, standing run #2): must reach Cora's
+Latency SLA (Hunter's constitution, standing run #2): must reach Lifecycle's
 queue within 24h of the event. A deed still unresolved after
 STALE_LATENCY_DAYS is logged as a stale-run warning, not silently retried
 forever — H2.7 running more often, not this connector, is the actual fix

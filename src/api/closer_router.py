@@ -29,7 +29,7 @@ from config.closer import (
 )
 from src.api.admin_router import get_current_admin
 from src.api.deps import get_db
-from src.core.models import CloserCall, CoraTrainingOverride, Subscriber
+from src.core.models import CloserCall, LifecycleTrainingOverride, Subscriber
 from src.services import aircall_client
 from src.services.cds_engine import MultiVerticalScorer as CDSEngine
 from src.services.phone_utils import normalize_closer as normalize_phone
@@ -256,7 +256,7 @@ def closer_call_recording(
     return {"recording_url": url, "expires_in_sec": ttl}
 
 
-# ── A6: Closer-to-Cora Teaching Interface ────────────────────────────────────
+# ── A6: Closer-to-Lifecycle Teaching Interface ────────────────────────────────────
 
 class TeachRequest(BaseModel):
     subject_id: int
@@ -266,7 +266,7 @@ class TeachRequest(BaseModel):
     closer_call_id: Optional[int] = None
 
 
-def _serialize_correction(row: CoraTrainingOverride) -> dict:
+def _serialize_correction(row: LifecycleTrainingOverride) -> dict:
     return {
         "id": row.id,
         "subject_id": row.subject_id,
@@ -289,7 +289,7 @@ def create_teaching_correction(
 
     Immediately applies a Score Dampener (for dampening reasons) by synchronously
     rescoring the property.  Retains the row as a fine-tuning label for future
-    Cora model training.  Idempotent: a duplicate active correction returns 409
+    Lifecycle model training.  Idempotent: a duplicate active correction returns 409
     with the existing row.
     """
     if req.correction_reason not in CORRECTION_REASONS_SET:
@@ -325,7 +325,7 @@ def create_teaching_correction(
 
     dampener_active = req.correction_reason in DAMPENING_REASONS_SET
 
-    row = CoraTrainingOverride(
+    row = LifecycleTrainingOverride(
         source="closer_teach",
         subject_type="property",
         subject_ref=str(req.subject_id),
@@ -348,7 +348,7 @@ def create_teaching_correction(
             # Return the existing active correction.
             existing = db.execute(
                 text(
-                    "SELECT * FROM cora_training_overrides "
+                    "SELECT * FROM lifecycle_training_overrides "
                     "WHERE subject_ref = :sid AND correction_reason = :reason "
                     "  AND COALESCE(signal_type, '') = COALESCE(:sig, '') "
                     "  AND dampener_active "
@@ -399,7 +399,7 @@ def delete_teaching_correction(
     Sets dampener_active=False and queue_status='discarded', then rescores
     the property so the dampener is lifted immediately.
     """
-    row = db.get(CoraTrainingOverride, correction_id)
+    row = db.get(LifecycleTrainingOverride, correction_id)
     if row is None:
         raise HTTPException(status_code=404, detail="correction not found")
 
@@ -475,7 +475,7 @@ def subscriber_delivered_leads(
             text(
                 """
                 SELECT id, subject_ref AS subject_id, correction_reason, signal_type
-                FROM cora_training_overrides
+                FROM lifecycle_training_overrides
                 WHERE subject_type = 'property'
                   AND subject_ref = ANY(:pids)
                   AND dampener_active

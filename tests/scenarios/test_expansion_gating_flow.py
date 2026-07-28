@@ -23,7 +23,7 @@ from unittest.mock import patch
 import pytest
 from sqlalchemy import text
 
-from config.cora_guardrails import EXPANSION_GATES
+from config.lifecycle_guardrails import EXPANSION_GATES
 from src.services.contractor_mrr import MRR_ICP_GATE_THRESHOLD
 from src.services.icp_launch_gate import icp_launch_blocked
 from src.tasks.county_launch_evaluator import _GATE_TO_REDIS, _build_gate_snapshot

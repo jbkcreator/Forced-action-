@@ -1,5 +1,5 @@
 """
-Event → Graph routing for the Cora supervisor.
+Event → Graph routing for the Lifecycle supervisor.
 
 Adding a new graph is one entry in EVENT_TO_GRAPH plus the graph module
 itself. Registration is at import time; the supervisor reads this dict on

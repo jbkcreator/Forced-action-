@@ -548,8 +548,8 @@ class TriangulationService:
     def _publish_sweep_event(county_id, stats: dict, now: datetime,
                              scoring_delta_dispatched: bool) -> None:
         try:
-            from src.agents.events.ingestion import publish_cora_event
-            publish_cora_event({
+            from src.agents.events.ingestion import publish_lifecycle_event
+            publish_lifecycle_event({
                 "event_type": "contactability_sweep_completed",
                 "payload": {
                     "county_id": county_id,
@@ -562,7 +562,7 @@ class TriangulationService:
                 },
             })
         except Exception:
-            logger.warning("[Triangulation] Cora event publish failed", exc_info=True)
+            logger.warning("[Triangulation] Lifecycle event publish failed", exc_info=True)
 
     def run_for_owner(self, owner_id: int) -> Optional[Dict[str, Any]]:
         """Single-owner recompute — the waterfall inline hook (PR4 wiring)."""

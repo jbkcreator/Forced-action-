@@ -7,9 +7,9 @@ Cross-referenced against: `docs/2B-PENDING-IMPLEMENTATION.md` (state at 2026-04-
 
 ## 1. What this document actually is
 
-A **commercial architecture spec**, not a product spec. It defines the monetization engine, Cora (the autonomous revenue operator), guardrails, conversion funnel math, and a 3-wave build sequence to reach **$100K MRR in 9–14 weeks** (base case). v9 is the successor to v7/v8 — the canonical implementation target.
+A **commercial architecture spec**, not a product spec. It defines the monetization engine, Lifecycle (the autonomous revenue operator), guardrails, conversion funnel math, and a 3-wave build sequence to reach **$100K MRR in 9–14 weeks** (base case). v9 is the successor to v7/v8 — the canonical implementation target.
 
-**One-line mission:** *Monetize intent earlier, convert spend into defaults faster, let Cora change offers, routing, and automation based on behavior.*
+**One-line mission:** *Monetize intent earlier, convert spend into defaults faster, let Lifecycle change offers, routing, and automation based on behavior.*
 
 **Core stack it assumes:**
 - Claude API (Haiku/Sonnet/Opus routing + prompt caching + batch)
@@ -26,8 +26,8 @@ A **commercial architecture spec**, not a product spec. It defines the monetizat
 
 From `docs/2B-PENDING-IMPLEMENTATION.md` (state at 2026-04-22):
 - **33 of 41 items complete** (runtime services, webhooks, cron jobs)
-- **6 partial** (Auto Mode, Redis infra, landing page, DBPR, Cora SMS close, compliance)
-- **4 not built** — all LangGraph-dependent: **LangGraph Supervisor, FOMO Engine, Cora Conversational Close, Abandonment Pressure SMS, Retention Summaries**
+- **6 partial** (Auto Mode, Redis infra, landing page, DBPR, Lifecycle SMS close, compliance)
+- **4 not built** — all LangGraph-dependent: **LangGraph Supervisor, FOMO Engine, Lifecycle Conversational Close, Abandonment Pressure SMS, Retention Summaries**
 
 ### Already done (matches v9 spec)
 
@@ -35,8 +35,8 @@ Revenue ladder config · wallet engine ($49/99/199) · 8-bucket segmentation · 
 
 ### v9 adds/tightens that are NOT yet built
 
-1. **Cora Guardrail Ranges** as runtime config + enforcement (price ranges, discount caps, rollback triggers) — config exists but enforcement hooks into A/B, pricing, urgency windows aren't wired
-2. **Cora Conversational Lock Close** — Sonnet contextual SMS with live ZIP data, lead counts, competitor activity, revenue signal score
+1. **Lifecycle Guardrail Ranges** as runtime config + enforcement (price ranges, discount caps, rollback triggers) — config exists but enforcement hooks into A/B, pricing, urgency windows aren't wired
+2. **Lifecycle Conversational Lock Close** — Sonnet contextual SMS with live ZIP data, lead counts, competitor activity, revenue signal score
 3. **Synthflow outbound voice drop** — only inbound missed-call exists
 4. **Stripe Failed Payment Recovery** 3-step SMS (Day 1/3/5 → downgrade to $97)
 5. **First-session monetization wall frontend** — countdown timer (backend exists)
@@ -62,7 +62,7 @@ Revenue ladder config · wallet engine ($49/99/199) · 8-bucket segmentation · 
 
 ### Revenue ladder (12 steps)
 
-Free → Proof Moment → Paid Unlock ($2.50–7) → Wallet (auto) → Auto Mode → Territory Lock ($197) → AP Lite ($299) → AP Pro ($497) → Annual ($1,970/yr) → Data-Only save ($97) → Partner ($2,000) → White-Label ($2.5–5K). Each step has an explicit **trigger** and **sold-by** (product vs. Cora vs. automated). Everything below paid unlock is scaffolding for the rest.
+Free → Proof Moment → Paid Unlock ($2.50–7) → Wallet (auto) → Auto Mode → Territory Lock ($197) → AP Lite ($299) → AP Pro ($497) → Annual ($1,970/yr) → Data-Only save ($97) → Partner ($2,000) → White-Label ($2.5–5K). Each step has an explicit **trigger** and **sold-by** (product vs. Lifecycle vs. automated). Everything below paid unlock is scaffolding for the rest.
 
 ### Conversion funnel math (the $100K stack)
 
@@ -81,7 +81,7 @@ Base case demands:
 
 If signup→first-payment lands at 15% instead of 30%, Week 14 MRR drops from ~$100K to ~$55K. **This single rate is the biggest assumption.**
 
-### Cora Guardrails (runtime bounds, not prompts)
+### Lifecycle Guardrails (runtime bounds, not prompts)
 
 | Decision | Allowed Range | Rollback Trigger |
 |---|---|---|
@@ -113,7 +113,7 @@ Every feature gets a 4-week window. 7 red days after adjustment → kill/pivot. 
 6. Free-tier cost ratio ≤40% of revenue
 7. County profitability net positive monthly
 
-All gates must be green before expansion ICP channels activate (**≥$50K contractor MRR required**). Cora cannot override.
+All gates must be green before expansion ICP channels activate (**≥$50K contractor MRR required**). Lifecycle cannot override.
 
 ---
 
@@ -146,7 +146,7 @@ Still needs provisioning:
 
 - `message_outcomes` — every SMS with conversion attribution (4h/24h/48h windows)
 - `deal_outcomes` — one-tap deal-size capture (<$10K / $10–25K / $25K+ / skip)
-- `learning_cards` — Sunday midnight aggregation, read at start of every Cora decision tree
+- `learning_cards` — Sunday midnight aggregation, read at start of every Lifecycle decision tree
 - `referral_events` — chain tracking + milestone counters (1 / 3 / 5 refs)
 - `processed_events` — Stripe webhook dedup (idempotency key)
 - STOP dead-letter queue — Redis with manual review fallback
@@ -168,7 +168,7 @@ The doc ends with 52 unanswered engineering questions — **do not start Wave 2 
 ## 8. Documentation to produce
 
 1. **Delta analysis** — map each of the 41 items in `2B-PENDING-IMPLEMENTATION.md` onto v9 section numbers (this doc is the diff).
-2. **Guardrail enforcement matrix** — for each Cora autonomous decision, which service/module enforces the bound and where the rollback trigger fires.
+2. **Guardrail enforcement matrix** — for each Lifecycle autonomous decision, which service/module enforces the bound and where the rollback trigger fires.
 3. **Funnel instrumentation plan** — every conversion rate in §3 must have a query + Revenue Pulse line + Slack alert on Red threshold.
 4. **Cron inventory** — 5 cron jobs wired, 4+ more needed (gate monitor 6h, vendor cost daily, ad creative weekly, script mutation, churn prediction nightly, kill-switch weekly).
 5. **Webhook inventory** — Twilio inbound/voice, NWS, Stripe (payment_intent.succeeded, invoice.payment_failed, subscription.updated), Synthflow inbound/outbound, Slack interactive.
@@ -186,7 +186,7 @@ The spec's financial model rests on a **30% free→paid conversion assumption th
 
 # 10. Complete Example Flow — One User, End to End
 
-This traces a real user from DBPR list to annual upgrade, showing every system component, the database tables they write, and the Cora decisions at each step. Times are wall-clock from first contact.
+This traces a real user from DBPR list to annual upgrade, showing every system component, the database tables they write, and the Lifecycle decisions at each step. Times are wall-clock from first contact.
 
 ## T+0: Outbound acquisition
 
@@ -198,7 +198,7 @@ This traces a real user from DBPR list to annual upgrade, showing every system c
 3. Twilio sends: *"Mike — 3 new foreclosures in 33647 this week. Reply YES for a free look."*
 4. Row written: `message_outcomes(subscriber_id=null, phone, variant_id, sent_at, campaign='dbpr_roofing_v4')`.
 
-**Services touched:** DBPR loader, Cora supervisor (LangGraph), Claude Haiku router, A/B engine, Twilio outbound, compliance pre-check (opt-in state).
+**Services touched:** DBPR loader, Lifecycle supervisor (LangGraph), Claude Haiku router, A/B engine, Twilio outbound, compliance pre-check (opt-in state).
 
 ## T+5 min: Reply → Signup
 
@@ -232,7 +232,7 @@ Mike stares at the blurred leads. The countdown ticks. Frontend polls `GET /api/
 
 Redis TTL on `wall:abandon:{sid}` expires at 10 min. n8n picks up the expiry event (or LangGraph scheduler).
 
-1. Cora supervisor reads Mike's session state (clicked proof, no payment), plus live ZIP data (2 other contractors viewing this ZIP right now).
+1. Lifecycle supervisor reads Mike's session state (clicked proof, no payment), plus live ZIP data (2 other contractors viewing this ZIP right now).
 2. Haiku generates abandonment SMS: *"Mike — 2 roofers are looking at 33647 right now. The Smith Dr lead expires in 30 min. Unlock: [link]"*
 3. Twilio sends. `message_outcomes` row written with `campaign='abandonment_wave1'`.
 
@@ -257,7 +257,7 @@ Mike views another lead within the 10-min bonus window.
 
 1. Credit balance check → 0 unlocks remaining. Redis bonus key still live.
 2. Wallet engine detects: saved-card + repeated ZIP interest + 70%-of-typical-wallet-usage pattern → **Accelerated Wallet Push** fires.
-3. Cora (Haiku) sends: *"Mike — you've looked at 2 roofs in 33647 in 15 min. $49/mo gets you 20 unlocks. Your card is ready — reply WALLET to activate."*
+3. Lifecycle (Haiku) sends: *"Mike — you've looked at 2 roofs in 33647 in 15 min. $49/mo gets you 20 unlocks. Your card is ready — reply WALLET to activate."*
 4. Mike replies `WALLET`. SMS command dispatcher routes → wallet enrollment → Stripe subscription created at $49/mo → 2 bonus credits awarded (within the 10-min window).
 
 **State:** Starter Wallet active. 22 credits. Segment → `wallet_active`. Score → 44.
@@ -272,7 +272,7 @@ NWS CAP feed fires a Severe Thunderstorm warning for FIPS 12057.
 
 1. `POST /webhooks/nws/alert` → `storm_active:33647` Redis key, 72h TTL.
 2. Within 2 hours, scrapers surface 6 new storm-damage roofs in 33647.
-3. Cora detects: Mike is wallet-active in this ZIP. Fires the *"I Found You a Deal"* SMS with 20-min reservation: *"Mike — storm hit 33647 last night. I'm holding a Gold lead for you for 20 min. [link]"*
+3. Lifecycle detects: Mike is wallet-active in this ZIP. Fires the *"I Found You a Deal"* SMS with 20-min reservation: *"Mike — storm hit 33647 last night. I'm holding a Gold lead for you for 20 min. [link]"*
 4. Redis `lead_hold:{lead_id}={subscriber_id}` with 20-min TTL blocks other wallet users from this lead.
 5. Storm Pack bundle ($39, 10 leads) also becomes available in affected ZIPs. Banner in dashboard.
 
@@ -289,14 +289,14 @@ Annual push cron runs at 8 AM UTC. Mike matches Trigger #1 (Day 7 charter cohort
 
 Wallet engine counts: 40+ credits spent, 22 in ZIP 33647. Segmentation promotes Mike → `lock_candidate`.
 
-**Cora Conversational Lock Close (v9 new, Sonnet, not yet built):**
+**Lifecycle Conversational Lock Close (v9 new, Sonnet, not yet built):**
 
 1. LangGraph supervisor assembles context: live ZIP 33647 data (14 active leads, 3 Gold-tier, 2 other contractors viewing), Mike's spend rate ($67 in 14 days), revenue signal score (72), competitor timing (last lock sold in adjacent ZIP 2 days ago).
 2. Sonnet (not Haiku — synchronous, $0.003/call per Q37) generates the close:
 
    *"Mike — you've spent $67 in 33647 this month. 3 Gold leads came up yesterday and I watched one get contacted by someone else. Territory Lock is $197/mo — exclusive access to every new lead in 33647, nobody else. One deal pays for a year. Reply LOCK."*
 
-3. Message goes via Twilio. Stored in `message_outcomes` with `sent_by='cora_sonnet_close'`, variant_id.
+3. Message goes via Twilio. Stored in `message_outcomes` with `sent_by='lifecycle_sonnet_close'`, variant_id.
 
 ## T+14 days + 2 min: No reply — Voice Drop
 
@@ -315,7 +315,7 @@ Mike replies `LOCK`. SMS dispatcher → Payment Sheet deep link → Apple Pay �
 
 Mike has 34 manual skip-trace actions this week. AP Lite upsell fires (10+ manual actions threshold).
 
-1. Cora: *"Mike — you've done 34 skip-traces this week. AP Lite does that automatically plus first-text and voicemail — $299/mo. Reply LITE."*
+1. Lifecycle: *"Mike — you've done 34 skip-traces this week. AP Lite does that automatically plus first-text and voicemail — $299/mo. Reply LITE."*
 2. Mike converts. Stripe sub upgraded. Auto Mode flag flipped. `queue_action()` now queues real jobs (once LangGraph layer exists).
 
 ## T+45 days: Deal Win → Annual Push
@@ -326,7 +326,7 @@ Mike one-taps the Deal-Size Capture form: *$10–25K bucket, 18 days to close*.
 2. Trigger cascade:
    - Annual push re-fires at deal-win moment with ROI frame: *"Mike — $18K job just closed from a $4 lead. Annual Lock = 1 job pays for 10 years. [link]"*
    - Deal-win graphic generated (Claude HTML → image) → social proof wall.
-3. Revenue signal score → 94. Already locked, so no further upsell. Score feeds back into Cora's trade-benchmark outputs.
+3. Revenue signal score → 94. Already locked, so no further upsell. Score feeds back into Lifecycle's trade-benchmark outputs.
 
 Mike accepts annual. Stripe subscription updated (from $197/mo monthly → $1,970/yr), prorated credit. `subscription_events(old_plan='lock_monthly', new_plan='lock_annual')`.
 
@@ -342,13 +342,13 @@ For every other Lock holder who hasn't taken annual, the Day-60 cron fires the a
    - A/B results → preliminary winner on the $197 vs $217 Lock price test.
    - Churn signals → 3 at-risk users flagged (5–7 days inactive).
 2. Row written: `learning_cards(card_date, card_type, payload_json)`.
-3. Cora reads this card at the start of every decision tree the following week.
+3. Lifecycle reads this card at the start of every decision tree the following week.
 
 ## T+120 days: At-risk save
 
 Mike goes 6 days without activity. Predictive churn scoring (nightly, not yet built) flags him at risk.
 
-1. Cora sends: *"Mike — 7 Gold leads came through 33647 this week that you didn't touch. $97/mo Data-Only keeps you alerted without the full lock. Or pause 60 days — your choice."*
+1. Lifecycle sends: *"Mike — 7 Gold leads came through 33647 this week that you didn't touch. $97/mo Data-Only keeps you alerted without the full lock. Or pause 60 days — your choice."*
 2. If Mike accepts `DATAONLY`, Stripe downgrade. If he engages without replying, flag cleared. If he replies `PAUSE`, 60-day subscription pause.
 
 ## T+continuous: Kill-switch monitoring
@@ -370,9 +370,9 @@ Josh taps → T+0 waitlist SMS wave, T+2 Clay enrichment, T+4 landing page auto-
 
 ---
 
-## 11. Cora decision hierarchy (summary)
+## 11. Lifecycle decision hierarchy (summary)
 
-For every autonomous decision, Cora consults in order:
+For every autonomous decision, Lifecycle consults in order:
 
 1. **Hard guardrails** (§3) — if the action is out of range, abort or escalate.
 2. **Current Learning Card** (latest Sunday aggregate).
@@ -389,7 +389,7 @@ Any action outside these bounds surfaces in Revenue Pulse for Josh's one-tap app
 
 - **Wave 1 backend is 80% done.** Frontend, LangGraph, and the conversational layer are the gap.
 - **The monetization wall → abandonment pressure → accelerated wallet push → conversational lock close** chain is what makes or breaks the $100K target. Instrument it end-to-end from Day 1.
-- **Cora is runtime-configured bounds + LangGraph decisions, not magic.** Every autonomous action has a numeric guardrail and a rollback trigger.
+- **Lifecycle is runtime-configured bounds + LangGraph decisions, not magic.** Every autonomous action has a numeric guardrail and a rollback trigger.
 - **Four signal tables are the whole intelligence substrate** (`message_outcomes`, `deal_outcomes`, `learning_cards`, `referral_events`). They exist — just keep writing to them.
 - **The 20 gaps in §2 are the build backlog.** Order by Wave (1 > 2 > 3) and by the Hari Priority ranking in the source doc.
 
@@ -432,19 +432,19 @@ Each table below defines a class of components, what they do in the platform, wh
 | Urgency Engine | Per-lead TTL window (10–60 min guardrail) + "X contractors viewing" ZIP counter | FOMO on every strong lead | Critical | Low | Redis sorted sets, frontend poll |
 | Dynamic Flash Scarcity | Gold lead spike in non-locked ZIP → SMS to wallet users within 60 min | Event-driven conversion to lock | High | Med | Redis pub/sub, LangGraph, Twilio |
 | FOMO Engine | Competitor acts on lead → SMS to non-locked user within 60 sec | Primary lock-conversion lever | Critical | High | Redis pub/sub, LangGraph (pending), Twilio |
-| Proactive Save ("What You Would Have Missed") | 5–7 days inactive → offer Data-Only or PAUSE before cancel | Churn prevention | High | Med | Cron, Cora, Twilio |
+| Proactive Save ("What You Would Have Missed") | 5–7 days inactive → offer Data-Only or PAUSE before cancel | Churn prevention | High | Med | Cron, Lifecycle, Twilio |
 | Annual Push Triggers | Day 7 charter / Day 10–14 / 2 deals / $250 spend / $10K+ deal-win / Day 60 auto-switch | Cash flow + churn prevention | High | Med | Daily cron, Stripe sub update |
-| Deal-Win Annual Push | User confirms $10K+ job → immediate annual offer with ROI frame | Highest-conversion annual moment | High | Low | Deal-capture webhook, Cora |
+| Deal-Win Annual Push | User confirms $10K+ job → immediate annual offer with ROI frame | Highest-conversion annual moment | High | Low | Deal-capture webhook, Lifecycle |
 
-## 13.3 Cora Intelligence Layer
+## 13.3 Lifecycle Intelligence Layer
 
 | Item | What it is | Used for / with what | Importance | Complexity | Tech stack |
 |---|---|---|---|---|---|
-| LangGraph Supervisor | Agentic state machine that routes every Cora decision | Central brain for all autonomous actions | Critical | High | LangGraph, langgraph-checkpoint-postgres, DO Docker |
+| LangGraph Supervisor | Agentic state machine that routes every Lifecycle decision | Central brain for all autonomous actions | Critical | High | LangGraph, langgraph-checkpoint-postgres, DO Docker |
 | Claude Router (Haiku / Sonnet / Opus) | Cost-aware model selection (target 75–80% Haiku) | Every AI call in the platform | Critical | Med | Anthropic SDK, LangSmith |
 | Prompt Caching | cache_control on repeated system prompts (>80% hit target) | 30–40% API cost reduction | High | Low | Anthropic SDK |
-| Cora Conversational Lock Close | Sonnet message using live ZIP data + lead counts + competitor activity + score | Primary lock-conversion message | Critical | High | Claude Sonnet, LangGraph, Redis live data |
-| Cora SMS (outbound generic) | Context-aware messaging across all trade/county/behavior combinations | Every outbound proactive SMS | Critical | Med | Claude, Twilio, LangGraph |
+| Lifecycle Conversational Lock Close | Sonnet message using live ZIP data + lead counts + competitor activity + score | Primary lock-conversion message | Critical | High | Claude Sonnet, LangGraph, Redis live data |
+| Lifecycle SMS (outbound generic) | Context-aware messaging across all trade/county/behavior combinations | Every outbound proactive SMS | Critical | Med | Claude, Twilio, LangGraph |
 | Synthflow Voice Drop | 20-sec personalized VM to high-intent non-converters (score >70, 48 hr no convert) | Two-channel conversion insurance | High | Med | Synthflow outbound API, LangGraph |
 | Synthflow Missed-Call Signup | Inbound missed call → auto free-tier account + welcome SMS | Zero-friction acquisition path | Med | Low | Synthflow inbound webhook |
 | Revenue Signal Score (0–100) | RFM-weighted score: spend / engagement / wallet / interaction / ZIP competition | Drives urgency, upsell timing, closer routing | Critical | Low | Postgres, scheduled recompute |
@@ -453,13 +453,13 @@ Each table below defines a class of components, what they do in the platform, wh
 | A/B Offer Engine | Deterministic variant assignment, 10% traffic cap, 2σ rollback | Tests offers / copy / timing / pricing within guardrails | High | Med | Postgres, md5 hash, two-proportion z-test |
 | Dynamic Script Mutation | Retire lowest-of-3 SMS variant after 200 sends; Haiku generates replacement | Self-improving copy loop | Med | High | LangGraph, Claude Haiku |
 | Predictive Churn Scoring | Nightly score on behavioral signals; save offer 2–3 days before going inactive | Proactive retention | Med | High | Postgres, LangGraph nightly job |
-| Thin Human Backup Closer | Commission-only closer receives Cora-flagged leads (score >85, 3+ interactions, $397+ deals) | Conversion insurance on hottest 1–2% | Med | Low | GHL / Slack / SMS routing |
+| Thin Human Backup Closer | Commission-only closer receives Lifecycle-flagged leads (score >85, 3+ interactions, $397+ deals) | Conversion insurance on hottest 1–2% | Med | Low | GHL / Slack / SMS routing |
 
 ## 13.4 Guardrails & Control Plane
 
 | Item | What it is | Used for / with what | Importance | Complexity | Tech stack |
 |---|---|---|---|---|---|
-| Cora Guardrail Ranges | Runtime config: 13 numeric bounds on every autonomous decision | Every Cora action is gated here first | Critical | Low | YAML / Postgres config, enforced in services |
+| Lifecycle Guardrail Ranges | Runtime config: 13 numeric bounds on every autonomous decision | Every Lifecycle action is gated here first | Critical | Low | YAML / Postgres config, enforced in services |
 | Kill-Switch Discipline | 9 metrics scored Green/Yellow/Red weekly; 7 red days → auto-kill feature/channel | Prevents runaway losers | Critical | Med | n8n, Postgres aggregation, Slack |
 | 7 Expansion Gates | Hard thresholds: first-payment, saved-card, wallet, lock conv, retention, cost ratio, county profit | Blocks all expansion until all green | Critical | Med | n8n 6-hr poll, Postgres, Slack 1-tap |
 | Rollback Criteria | Per-feature success metric + deadline; revert to simpler version on miss | Kills v9 additions that don't pay | High | Low | Metric aggregation + feature flags |
@@ -471,9 +471,9 @@ Each table below defines a class of components, what they do in the platform, wh
 
 | Item | What it is | Used for / with what | Importance | Complexity | Tech stack |
 |---|---|---|---|---|---|
-| `message_outcomes` | Every SMS logged with variant, campaign, 4h/24h/48h conversion attribution | Ground truth for A/B + Cora learning | Critical | Low | Postgres |
+| `message_outcomes` | Every SMS logged with variant, campaign, 4h/24h/48h conversion attribution | Ground truth for A/B + Lifecycle learning | Critical | Low | Postgres |
 | `deal_outcomes` | One-tap deal-size capture: bucket, amount, days-to-close | Drives annual push, cohort pricing, benchmarks | Critical | Low | Postgres + FastAPI endpoint |
-| `learning_cards` | Sunday-midnight aggregated summary of the week's outcomes | Read at start of every Cora decision tree | Critical | Med | Postgres, LangGraph Sunday job |
+| `learning_cards` | Sunday-midnight aggregated summary of the week's outcomes | Read at start of every Lifecycle decision tree | Critical | Med | Postgres, LangGraph Sunday job |
 | `referral_events` | Referral chain state: pending → confirmed → rewarded | Milestone escalation, leaderboard | High | Low | Postgres + Redis sorted set |
 | `processed_events` | Stripe webhook dedup by event_id | Webhook idempotency (non-negotiable) | Critical | Low | Postgres unique constraint |
 | STOP Dead-Letter Queue | Opt-out keywords captured; failed opt-outs surface for manual review | TCPA compliance guarantee | Critical | Low | Redis list + admin endpoint |
@@ -484,7 +484,7 @@ Each table below defines a class of components, what they do in the platform, wh
 | Item | What it is | Used for / with what | Importance | Complexity | Tech stack |
 |---|---|---|---|---|---|
 | Twilio Inbound Webhook | Signature-verified webhook for STOP + product commands + YES opt-in | Every inbound SMS | Critical | Low | Twilio, FastAPI |
-| Twilio Outbound | All proactive SMS sending | Every Cora decision that messages a user | Critical | Low | Twilio, compliance gate |
+| Twilio Outbound | All proactive SMS sending | Every Lifecycle decision that messages a user | Critical | Low | Twilio, compliance gate |
 | Twilio A2P 10DLC | Brand + campaign registration for deliverability | Required before any scale outbound | Critical | Low (process-wise) | Twilio console submission — **2–4 wk lead time** |
 | SMS Product Commands | LOCK, BOOST, AUTO ON/OFF, PAUSE, BALANCE, TOPUP, REPORT, YEARLY, SAVE CARD | Self-serve actions by SMS | High | Low | Twilio inbound, keyword dispatcher |
 | NWS CAP Webhook | National Weather Service alert → storm flag + scraper trigger + Storm Pack | Event-driven monetization on weather | High | Low | NWS ATOM feed, FastAPI webhook, Redis TTL |

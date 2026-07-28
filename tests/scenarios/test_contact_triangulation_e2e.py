@@ -8,7 +8,7 @@ written.  All seeded rows are deleted in teardown.
 
 Coverage:
   - sweep writes label + contactability_detail (strong corroboration path)
-  - aggregate Cora event published once per sweep, house payload shape
+  - aggregate Lifecycle event published once per sweep, house payload shape
   - dry-run writes nothing, publishes nothing
   - contradiction → downgrade → contact_refresh_status='due' (plan step 8)
   - waterfall inline hook: writes label, never publishes; no-op when disabled
@@ -52,7 +52,7 @@ pytestmark = pytest.mark.scenario
 _PHONE = "+18135551234"
 _OTHER_PHONE = "+18139998888"
 _COUNTY = "ztest-triang"          # sentinel — scopes the sweep to seeded rows only
-_PUBLISH_TARGET = "src.agents.events.ingestion.publish_cora_event"
+_PUBLISH_TARGET = "src.agents.events.ingestion.publish_lifecycle_event"
 
 
 def _utcnow_naive() -> datetime:
@@ -182,7 +182,7 @@ def test_sweep_writes_label_and_detail(seeded):
 
 
 @require_fa078
-def test_sweep_publishes_aggregate_cora_event(seeded):
+def test_sweep_publishes_aggregate_lifecycle_event(seeded):
     with patch(_PUBLISH_TARGET) as mock_publish:
         _sweep()
 

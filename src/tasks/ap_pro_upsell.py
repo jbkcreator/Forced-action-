@@ -87,7 +87,7 @@ def _static_ap_body(name: str, rate_pct: int, upgrade_url: str, feed_url: str) -
         f"AutoPilot Pro adds:\n"
         f"  - 5-touch outbound sequences per lead\n"
         f"  - Premium routing (Immediate-tier leads first)\n"
-        f"  - Appointment setting handled by Cora\n\n"
+        f"  - Appointment setting handled by Lifecycle\n\n"
         f"Upgrade:  {upgrade_url}\n"
         f"Dashboard: {feed_url}\n\n"
         f"- Forced Action Team"
@@ -127,7 +127,7 @@ def _send_offer(sub: Subscriber, close_rate: float, db: Session) -> bool:
         )
         subject, body_text = _parse_email(result["text"])
     except Exception as exc:
-        logger.warning("[APProUpsell] Cora composition failed for sub=%d, using fallback: %s", sub.id, exc)
+        logger.warning("[APProUpsell] Lifecycle composition failed for sub=%d, using fallback: %s", sub.id, exc)
 
     if not subject or not body_text:
         subject = _STATIC_AP_SUBJECT

@@ -41,7 +41,7 @@ The capture-and-persist pipeline for **#22 is already built end-to-end.** Nothin
 - Emits business events `SIGNUP_COMPLETED`, `SIGNUP_SOURCE_ATTRIBUTED`; hands off to `affiliate_engine.attribute_signup` and `referral_engine.process_signup`.
 
 ### 2.2 Storage — `src/core/models.py`
-- **`Subscriber`** (lines 1259–1272): `signup_source` String(30) NOT NULL, indexed, CHECK allow-list `{direct, landing_page, dbpr_email, cora_sms, missed_call, referral, admin, unknown, affiliate}`; `utm_source/medium/campaign`, `campaign_id`, `attribution_token`, `affiliate_ref` (indexed). **No `acquisition_source` column** on Subscriber (only `CustomerAccount` has one).
+- **`Subscriber`** (lines 1259–1272): `signup_source` String(30) NOT NULL, indexed, CHECK allow-list `{direct, landing_page, dbpr_email, lifecycle_sms, missed_call, referral, admin, unknown, affiliate}`; `utm_source/medium/campaign`, `campaign_id`, `attribution_token`, `affiliate_ref` (indexed). **No `acquisition_source` column** on Subscriber (only `CustomerAccount` has one).
 - **`conversion_attribution_events`** (lines 2837–2901): revenue per conversion + 8 internal product dimensions, `revenue_amount`, `occurred_at`, unique on `(source_table, source_event_id)`.
 - **`free_to_paid_attribution`** (lines 7127–7148): first-touch free→paid per account.
 - **`CustomerAccount.acquisition_source`** Text (line 6989) — free text, **no writer** in traced paths.
@@ -67,7 +67,7 @@ The capture-and-persist pipeline for **#22 is already built end-to-end.** Nothin
 
 ### 2.8 Signup sources — the complete map (verified in code)
 
-`signup_source` allow-list ([signup_engine.py:31-41](../../src/services/signup_engine.py#L31), DB CHECK-enforced): `direct, landing_page, dbpr_email, cora_sms, missed_call, referral, admin, unknown, affiliate`.
+`signup_source` allow-list ([signup_engine.py:31-41](../../src/services/signup_engine.py#L31), DB CHECK-enforced): `direct, landing_page, dbpr_email, lifecycle_sms, missed_call, referral, admin, unknown, affiliate`.
 
 **Critical:** paid ad channels do NOT get their own `signup_source` — they all land as `landing_page` and are only distinguishable via `utm_source`/`utm_campaign`. Hence the channel key is `COALESCE(utm_source, signup_source)`.
 
@@ -79,7 +79,7 @@ The capture-and-persist pipeline for **#22 is already built end-to-end.** Nothin
 | **dbpr_email (Instantly)** | `signup_source=dbpr_email`, HMAC token (`campaign_attribution.py`) | **Manual** — Instantly is flat monthly, no per-campaign cost via API; analytics endpoint returns engagement only (`instantly_service.py:127`), no spend field |
 | **affiliate** | `signup_source=affiliate`, `?aff=` (`affiliate_engine.py:116`) | **Auto** — `affiliate_payout_ledger` (real per-signup commissions) |
 | **referral** | `signup_source=referral`, `?ref=` (`referral_engine.py`) | None (wallet-credit reward, not cash) |
-| **cora_sms** | `signup_source=cora_sms` link (`cora_sms_sender.py`) | Telnyx cost in `api_usage_logs` (opex, not marketing) |
+| **lifecycle_sms** | `signup_source=lifecycle_sms` link (`lifecycle_sms_sender.py`) | Telnyx cost in `api_usage_logs` (opex, not marketing) |
 | **missed_call** | `signup_source=missed_call`, inbound voice (`onboard_inbound_caller`) | Synthflow/voice opex |
 | **landing_page / direct / unknown** | organic / typed-in / no params | None |
 

@@ -1,5 +1,5 @@
 """
-Prompt template loader for Cora graphs.
+Prompt template loader for Lifecycle graphs.
 
 Reads YAML files under src/agents/prompts/<graph>/. Caches parsed YAML so
 repeated calls inside the same process do not re-hit the filesystem.
@@ -13,9 +13,9 @@ A/B variant support
 A graph can define `variant_a.yaml` and `variant_b.yaml` alongside its
 `system.yaml`. Each variant file overrides the `user` (and optionally
 `system`) block of the base template. Traffic splits are configured in
-`config/cora_ab_tests.yaml` and routed through `src/services/ab_engine.py`
+`config/lifecycle_ab_tests.yaml` and routed through `src/services/ab_engine.py`
 so the same subscriber always sees the same variant (deterministic MD5
-hash assignment, capped by `cora_guardrails.ab_test_traffic_cap`).
+hash assignment, capped by `lifecycle_guardrails.ab_test_traffic_cap`).
 
 The high-level helper `render_for_subscriber(graph, subscriber_id, context, db)`
 encapsulates the full flow: read config → assign/lookup variant → render
@@ -36,8 +36,8 @@ import yaml
 
 
 _PROMPTS_ROOT = Path(__file__).resolve().parent
-_AB_CONFIG_PATH = Path(__file__).resolve().parents[3] / "config" / "cora_ab_tests.yaml"
-_HOLDOUT_CONFIG_PATH = Path(__file__).resolve().parents[3] / "config" / "cora_holdout_tests.yaml"
+_AB_CONFIG_PATH = Path(__file__).resolve().parents[3] / "config" / "lifecycle_ab_tests.yaml"
+_HOLDOUT_CONFIG_PATH = Path(__file__).resolve().parents[3] / "config" / "lifecycle_holdout_tests.yaml"
 
 logger = logging.getLogger(__name__)
 
@@ -58,13 +58,13 @@ def _load_raw(graph: str, name: str) -> Dict[str, Any]:
 
 @lru_cache(maxsize=1)
 def _load_ab_config() -> Dict[str, Any]:
-	"""Parse config/cora_ab_tests.yaml once and cache for the process lifetime."""
+	"""Parse config/lifecycle_ab_tests.yaml once and cache for the process lifetime."""
 	if not _AB_CONFIG_PATH.exists():
 		return {}
 	try:
 		return yaml.safe_load(_AB_CONFIG_PATH.read_text(encoding="utf-8")) or {}
 	except Exception as exc:
-		logger.warning("Could not parse cora_ab_tests.yaml: %s", exc)
+		logger.warning("Could not parse lifecycle_ab_tests.yaml: %s", exc)
 		return {}
 
 
@@ -95,7 +95,7 @@ def base_prompt_fingerprint(graph: str) -> str:
 	templates, pre-render). Task 4.1: the holdout control arm always renders
 	this base prompt, so a holdout's verdict is only valid while the baseline
 	is unchanged. Recorded at holdout-test creation and re-checked by
-	cora_holdout_check — a mismatch means the baseline drifted mid-experiment
+	lifecycle_holdout_check — a mismatch means the baseline drifted mid-experiment
 	and the verdict must not promote on mixed control copy. Returns "" if the
 	prompt can't be loaded (treated as "unknown", never a false match)."""
 	try:
@@ -138,13 +138,13 @@ def render_fallback_body(graph: str, context: Dict[str, Any]) -> str:
 
 @lru_cache(maxsize=1)
 def _load_holdout_config() -> Dict[str, Any]:
-	"""Parse config/cora_holdout_tests.yaml once and cache for the process lifetime."""
+	"""Parse config/lifecycle_holdout_tests.yaml once and cache for the process lifetime."""
 	if not _HOLDOUT_CONFIG_PATH.exists():
 		return {}
 	try:
 		return yaml.safe_load(_HOLDOUT_CONFIG_PATH.read_text(encoding="utf-8")) or {}
 	except Exception as exc:
-		logger.warning("Could not parse cora_holdout_tests.yaml: %s", exc)
+		logger.warning("Could not parse lifecycle_holdout_tests.yaml: %s", exc)
 		return {}
 
 
@@ -173,7 +173,7 @@ def get_holdout_config(graph: str) -> Optional[Dict[str, Any]]:
 
 def get_holdout_config_by_test_name(test_name: str) -> Optional[Dict[str, Any]]:
 	"""Look up a holdout config by its test_name (the YAML key) rather than
-	by graph — used by the scheduled surfacing job (cora_holdout_check),
+	by graph — used by the scheduled surfacing job (lifecycle_holdout_check),
 	which iterates AbTest rows and needs each one's conversion_window_days
 	without knowing which graph it belongs to ahead of time."""
 	cfg = _load_holdout_config()
@@ -252,7 +252,7 @@ def render_for_subscriber(
 	  - The variant file is missing (logs a warning)
 
 	Frozen control-holdout gate (Task 4.1 — 10% control group): if a holdout
-	test is configured+enabled for this graph (config/cora_holdout_tests.yaml),
+	test is configured+enabled for this graph (config/lifecycle_holdout_tests.yaml),
 	the subscriber is first assigned a rollout arm via
 	ab_engine.assign_rollout_arm (records BOTH arms, so control's conversion
 	rate becomes measurable). The 'control' arm always gets this frozen base
@@ -372,8 +372,8 @@ def render_for_subscriber_auto(
 def reset_ab_config_cache() -> None:
 	"""Drop the cached A/B + holdout configs so the next call re-reads from disk.
 
-	Useful in tests, and in the admin UI when editing cora_ab_tests.yaml or
-	cora_holdout_tests.yaml live without restarting the process.
+	Useful in tests, and in the admin UI when editing lifecycle_ab_tests.yaml or
+	lifecycle_holdout_tests.yaml live without restarting the process.
 	"""
 	_load_ab_config.cache_clear()
 	_load_holdout_config.cache_clear()

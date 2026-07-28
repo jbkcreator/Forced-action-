@@ -1,23 +1,23 @@
 """
-Stage 10 — Alertmanager → Cora webhook receiver.
+Stage 10 — Alertmanager → Lifecycle webhook receiver.
 
 Alertmanager POSTs to this endpoint when a firing alert matches a receiver
 rule. The handler:
 
   1. Validates the shared secret (PROMETHEUS_ALERT_WEBHOOK_SECRET in .env).
   2. Parses the Alertmanager JSON payload (standard v2 format).
-  3. Dispatches each firing alert to the appropriate Cora action:
+  3. Dispatches each firing alert to the appropriate Lifecycle action:
 
-     alert_name == "CoraFirstPaymentRateLow"
+     alert_name == "LifecycleFirstPaymentRateLow"
        → variant_engine.promote_winner(sequence="wallet_push_v1")
 
-     alert_name == "CoraVariantSigmaRollback"
+     alert_name == "LifecycleVariantSigmaRollback"
        → variant_engine.check_sigma_rollback(sequence from label)
 
-     alert_name == "CoraLockConversionLow" | "CoraWalletAdoptionLow"
-       → cora_self_healing._process_metric (writes incident, fallback if eligible)
+     alert_name == "LifecycleLockConversionLow" | "LifecycleWalletAdoptionLow"
+       → lifecycle_self_healing._process_metric (writes incident, fallback if eligible)
 
-  4. Logs every action to Postgres (cora_incident or variant_retirement_log)
+  4. Logs every action to Postgres (lifecycle_incident or variant_retirement_log)
      via the existing engines — no direct writes here.
 
   5. Returns 200 with a JSON summary. Alertmanager marks the webhook as
@@ -68,17 +68,17 @@ def _verify_secret(request: Request) -> None:
 # ── alert dispatch ────────────────────────────────────────────────────────────
 
 _KNOWN_ALERT_NAMES = {
-    "CoraFirstPaymentRateLow",
-    "CoraLockConversionLow",
-    "CoraWalletAdoptionLow",
-    "CoraVariantSigmaRollback",
-    "CoraSMSReplyRateLow",
-    "CoraOfferAcceptanceRateLow",
+    "LifecycleFirstPaymentRateLow",
+    "LifecycleLockConversionLow",
+    "LifecycleWalletAdoptionLow",
+    "LifecycleVariantSigmaRollback",
+    "LifecycleSMSReplyRateLow",
+    "LifecycleOfferAcceptanceRateLow",
 }
 
 
 def _dispatch_alert(alert: dict, db: Session) -> dict:
-    """Route a single Alertmanager alert to the appropriate Cora action.
+    """Route a single Alertmanager alert to the appropriate Lifecycle action.
 
     Returns a dict describing what was done.
     """
@@ -88,20 +88,20 @@ def _dispatch_alert(alert: dict, db: Session) -> dict:
     if status != "firing":
         return {"alert": name, "action": "skipped_resolved"}
 
-    if name == "CoraFirstPaymentRateLow":
+    if name == "LifecycleFirstPaymentRateLow":
         return _handle_first_payment_low(db)
 
-    if name == "CoraVariantSigmaRollback":
+    if name == "LifecycleVariantSigmaRollback":
         sequence = alert.get("labels", {}).get("sequence_name", "")
         return _handle_sigma_rollback(sequence, db)
 
-    if name in ("CoraLockConversionLow", "CoraWalletAdoptionLow",
-                "CoraSMSReplyRateLow", "CoraOfferAcceptanceRateLow"):
+    if name in ("LifecycleLockConversionLow", "LifecycleWalletAdoptionLow",
+                "LifecycleSMSReplyRateLow", "LifecycleOfferAcceptanceRateLow"):
         metric_map = {
-            "CoraLockConversionLow": "lock_conversion",
-            "CoraWalletAdoptionLow": "wallet_adoption",
-            "CoraSMSReplyRateLow": "sms_reply_rate",
-            "CoraOfferAcceptanceRateLow": "offer_acceptance_rate",
+            "LifecycleLockConversionLow": "lock_conversion",
+            "LifecycleWalletAdoptionLow": "wallet_adoption",
+            "LifecycleSMSReplyRateLow": "sms_reply_rate",
+            "LifecycleOfferAcceptanceRateLow": "offer_acceptance_rate",
         }
         metric = metric_map[name]
         return _handle_metric_breach(metric, db)
@@ -119,7 +119,7 @@ def _handle_first_payment_low(db: Session) -> dict:
 
     result = promote_winner(sequence, db)
     logger.info("[alert-webhook] first_payment_rate low → promote_winner: %s", result)
-    return {"alert": "CoraFirstPaymentRateLow", "action": "variant_promoted", "detail": result}
+    return {"alert": "LifecycleFirstPaymentRateLow", "action": "variant_promoted", "detail": result}
 
 
 def _handle_sigma_rollback(sequence_name: str, db: Session) -> dict:
@@ -127,12 +127,12 @@ def _handle_sigma_rollback(sequence_name: str, db: Session) -> dict:
     from src.services.variant_engine import check_sigma_rollback
 
     if not sequence_name:
-        return {"alert": "CoraVariantSigmaRollback", "action": "skipped_no_sequence"}
+        return {"alert": "LifecycleVariantSigmaRollback", "action": "skipped_no_sequence"}
 
     result = check_sigma_rollback(sequence_name, db)
     logger.info("[alert-webhook] sigma-rollback seq=%s: %s", sequence_name, result)
     return {
-        "alert": "CoraVariantSigmaRollback",
+        "alert": "LifecycleVariantSigmaRollback",
         "action": "sigma_rollback_checked",
         "sequence": sequence_name,
         "detail": result,
@@ -141,7 +141,7 @@ def _handle_sigma_rollback(sequence_name: str, db: Session) -> dict:
 
 def _handle_metric_breach(metric_name: str, db: Session) -> dict:
     """Generic kill-switch metric breach → run one self-healing step."""
-    from src.tasks.cora_self_healing import _process_metric, _Counters, _count_today_kill_recommendations
+    from src.tasks.lifecycle_self_healing import _process_metric, _Counters, _count_today_kill_recommendations
     from config.settings import get_settings
 
     settings = get_settings()
@@ -168,7 +168,7 @@ async def receive_alertmanager_webhook(
     db: Session = Depends(_get_db),
     _auth: None = Depends(_verify_secret),
 ):
-    """Receive Alertmanager v2 webhook payload and dispatch Cora actions."""
+    """Receive Alertmanager v2 webhook payload and dispatch Lifecycle actions."""
     try:
         body = await request.json()
     except Exception:
@@ -208,7 +208,7 @@ async def test_alert_dispatch(
 ):
     """Simulate a firing alert without going through Alertmanager.
 
-    Body: {"alertname": "CoraFirstPaymentRateLow"}
+    Body: {"alertname": "LifecycleFirstPaymentRateLow"}
     Returns the same response as the real webhook.
     """
     settings = get_settings()

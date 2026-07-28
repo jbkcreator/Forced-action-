@@ -21,7 +21,7 @@ Endpoint coverage (14 routes):
 
 Strategy:
   - Use FastAPI dependency_overrides to swap the `get_db` session for a
-    MagicMock, matching the pattern in test_cora_incidents_api.py.
+    MagicMock, matching the pattern in test_lifecycle_incidents_api.py.
   - The hot-queue endpoint and the do_not_text suppression test need real
     SQL (Postgres INTERVAL, real SubscriberTag table joins). Those are
     gated on the `fresh_db` fixture and skip when DATABASE_URL is not
@@ -209,7 +209,7 @@ class TestHotQueue:
         assert r.status_code == 200
         assert r.json() == {"items": []}
 
-    def test_queue_decorates_with_cool_down_days(self, client, auth, mock_session):
+    def test_queue_delifecycletes_with_cool_down_days(self, client, auth, mock_session):
         old = datetime.now(timezone.utc) - timedelta(days=12)
         mock_session.execute.return_value.fetchall.return_value = [
             _row(id=101, last_significant_action_at=old),
