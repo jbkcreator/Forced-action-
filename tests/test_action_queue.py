@@ -6,7 +6,7 @@ count helpers) and the GET /api/admin/operator-dashboard/action-queue route.
 
 Repo convention: raw SQL via sa_text; the DB session is a MagicMock whose
 .execute(...).mappings().all() returns supplied rows, one result per query
-in call order (cora, human_close, scraper).
+in call order (lifecycle, human_close, scraper).
 """
 
 from __future__ import annotations
@@ -47,18 +47,18 @@ def _result(rows):
     return r
 
 
-def _mock_session(*, cora=None, human_close=None, scraper=None):
-    """Session whose execute() yields cora, then human_close, then scraper."""
+def _mock_session(*, lifecycle=None, human_close=None, scraper=None):
+    """Session whose execute() yields lifecycle, then human_close, then scraper."""
     sess = MagicMock()
     sess.execute.side_effect = [
-        _result(cora or []),
+        _result(lifecycle or []),
         _result(human_close or []),
         _result(scraper or []),
     ]
     return sess
 
 
-def _cora_row(**o):
+def _lifecycle_row(**o):
     base = {
         "id": 1,
         "metric_name": "match_rate",
@@ -98,15 +98,15 @@ def _scraper_row(**o):
     return base
 
 
-class TestCoraMapping:
+class TestLifecycleMapping:
     def test_open_human_escalated_becomes_legal_approval(self):
         from src.services.action_queue import build_action_queue
 
-        q = build_action_queue(_mock_session(cora=[_cora_row()]))
+        q = build_action_queue(_mock_session(lifecycle=[_lifecycle_row()]))
 
         assert len(q["approvals"]) == 1
         item = q["approvals"][0]
-        assert item["source"] == "cora"
+        assert item["source"] == "lifecycle"
         assert item["type"] == "approval"
         assert item["lane"] == "approvals"
         assert item["category"] == "legal"
@@ -117,7 +117,7 @@ class TestCoraMapping:
         from src.services.action_queue import build_action_queue
 
         q = build_action_queue(_mock_session(
-            cora=[_cora_row(id=2, action_taken="auto_paused", severity="yellow")]
+            lifecycle=[_lifecycle_row(id=2, action_taken="auto_paused", severity="yellow")]
         ))
 
         assert q["approvals"] == []
@@ -127,12 +127,12 @@ class TestCoraMapping:
         assert item["category"] == "ops"
         assert item["lane"] == "failures"
 
-    def test_resolved_and_closed_cora_excluded(self):
+    def test_resolved_and_closed_lifecycle_excluded(self):
         from src.services.action_queue import build_action_queue
 
         # action_taken='resolved' is filtered in SQL; simulate SQL already
         # excluding it by passing no rows (breach_resolved set / resolved).
-        q = build_action_queue(_mock_session(cora=[]))
+        q = build_action_queue(_mock_session(lifecycle=[]))
         assert q["approvals"] == []
         assert q["failures"] == []
 
@@ -187,21 +187,21 @@ class TestOrdering:
     def test_approvals_oldest_first(self):
         from src.services.action_queue import build_action_queue
 
-        old = _cora_row(id=1, breach_started=NOW - timedelta(days=2))
-        new = _cora_row(id=2, breach_started=NOW - timedelta(hours=1))
-        q = build_action_queue(_mock_session(cora=[new, old]))
+        old = _lifecycle_row(id=1, breach_started=NOW - timedelta(days=2))
+        new = _lifecycle_row(id=2, breach_started=NOW - timedelta(hours=1))
+        q = build_action_queue(_mock_session(lifecycle=[new, old]))
 
         assert [i["id"] for i in q["approvals"]] == [1, 2]  # oldest (id1) first
 
     def test_sorts_mixed_naive_and_aware_created_at(self):
-        # human_close_escalations.routed_at is tz-naive; cora breach_started is
+        # human_close_escalations.routed_at is tz-naive; lifecycle breach_started is
         # tz-aware. Both land in the approvals lane and must sort without a
         # "can't compare offset-naive and offset-aware datetimes" TypeError.
         from src.services.action_queue import build_action_queue
 
         naive = datetime(2026, 7, 20, 10, 0)  # no tzinfo (like routed_at)
         q = build_action_queue(_mock_session(
-            cora=[_cora_row(id=1, breach_started=NOW - timedelta(hours=2))],
+            lifecycle=[_lifecycle_row(id=1, breach_started=NOW - timedelta(hours=2))],
             human_close=[_hc_row(id=2, routed_at=naive)],
         ))
         assert len(q["approvals"]) == 2  # no crash, both present
@@ -217,26 +217,26 @@ class TestOrdering:
 
 
 class TestCounts:
-    def test_cora_approvals_waiting_excludes_ops_and_human_close(self):
+    def test_lifecycle_approvals_waiting_excludes_ops_and_human_close(self):
         from src.services.action_queue import build_action_queue
 
         q = build_action_queue(_mock_session(
-            cora=[
-                _cora_row(id=1, action_taken="human_escalated"),   # legal → counted
-                _cora_row(id=2, action_taken="auto_paused"),       # ops → not counted
+            lifecycle=[
+                _lifecycle_row(id=1, action_taken="human_escalated"),   # legal → counted
+                _lifecycle_row(id=2, action_taken="auto_paused"),       # ops → not counted
             ],
             human_close=[_hc_row(id=10)],                          # deal → not counted
             scraper=[_scraper_row(id=20)],                         # source failure
         ))
 
-        assert q["counts"]["cora_approvals_waiting"] == 1
+        assert q["counts"]["lifecycle_approvals_waiting"] == 1
         assert q["counts"]["source_failures"] == 1
 
     def test_counts_match_lane_lengths_no_drift(self):
         from src.services.action_queue import build_action_queue
 
         q = build_action_queue(_mock_session(
-            cora=[_cora_row(id=1, action_taken="feature_killed")],
+            lifecycle=[_lifecycle_row(id=1, action_taken="feature_killed")],
             human_close=[_hc_row(id=10)],
             scraper=[_scraper_row(id=20)],
         ))
@@ -251,9 +251,9 @@ def _scalar_session(value):
 
 
 class TestCanonicalHelpers:
-    def test_cora_approvals_waiting_helper_returns_count(self):
-        from src.services.action_queue import cora_approvals_waiting
-        assert cora_approvals_waiting(_scalar_session(3)) == 3
+    def test_lifecycle_approvals_waiting_helper_returns_count(self):
+        from src.services.action_queue import lifecycle_approvals_waiting
+        assert lifecycle_approvals_waiting(_scalar_session(3)) == 3
 
     def test_source_failures_helper_returns_count(self):
         from src.services.action_queue import source_failures
@@ -270,7 +270,7 @@ class TestActionQueueEndpoint:
         from src.api import operator_dashboard_router as mod
         canned = {"approvals": [], "failures": [],
                   "counts": {"approvals": 0, "failures": 0,
-                             "cora_approvals_waiting": 0, "source_failures": 0}}
+                             "lifecycle_approvals_waiting": 0, "source_failures": 0}}
         monkeypatch.setattr(mod, "build_action_queue", lambda session: canned)
 
         from src.api.main import app
@@ -285,7 +285,7 @@ class TestActionQueueEndpoint:
         body = resp.json()
         assert set(body) == {"approvals", "failures", "counts"}
         assert set(body["counts"]) >= {
-            "cora_approvals_waiting", "source_failures", "approvals", "failures"
+            "lifecycle_approvals_waiting", "source_failures", "approvals", "failures"
         }
 
     def test_db_error_returns_500_with_generic_detail(self, client, auth, monkeypatch):

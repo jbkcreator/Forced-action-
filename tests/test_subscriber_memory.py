@@ -462,7 +462,7 @@ def test_onboard_inbound_caller_projects_voice_signup_captured(fresh_db):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Cora read path — get_subscriber_memory
+# Lifecycle read path — get_subscriber_memory
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _append(db, sub_id, *, source, etype, eid, occurred_at, status, summary):

@@ -8,7 +8,7 @@ Delivery is best-effort: if no subscriber is connected at publish time the
 message is lost (raw Pub/Sub semantics). A SETNX dedup lock prevents
 double-delivery when multiple worker replicas are running.
 
-Both SMS and email are composed by Cora (Claude) for each milestone event.
+Both SMS and email are composed by Lifecycle (Claude) for each milestone event.
 Static templates are kept as fallbacks if Claude is unavailable.
 """
 
@@ -73,7 +73,7 @@ def publish(payload: dict) -> None:
 
 
 def _compose_sms(msg_type: str, payload: dict, name: str, db=None) -> str:
-    """Return Cora-composed SMS copy, falling back to static template on any failure."""
+    """Return Lifecycle-composed SMS copy, falling back to static template on any failure."""
     n = payload.get("n_total", 0)
     share_url = payload.get("share_url", "")
 
@@ -103,7 +103,7 @@ def _compose_sms(msg_type: str, payload: dict, name: str, db=None) -> str:
 
 def _compose_email(msg_type: str, payload: dict, name: str, db=None) -> tuple[str, str]:
     """
-    Return (subject, body) Cora-composed email copy.
+    Return (subject, body) Lifecycle-composed email copy.
     Falls back to static template on any failure. Returns ('', '') if msg_type unknown.
     """
     if msg_type not in _EMAIL_FALLBACKS:

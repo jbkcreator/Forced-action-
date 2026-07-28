@@ -30,7 +30,7 @@ def _mock_db(
     vertical_scores=None,
     subscriber_row=None,
     pricing_row=None,
-    cora_graph=None,
+    lifecycle_graph=None,
     closer_row=None,
     rowcount=1,
 ):
@@ -67,9 +67,9 @@ def _mock_db(
         result.mappings.return_value.one_or_none.return_value = pricing_row
         return result
 
-    def _scalar_cora():
+    def _scalar_lifecycle():
         result = MagicMock()
-        result.scalar_one_or_none.return_value = cora_graph
+        result.scalar_one_or_none.return_value = lifecycle_graph
         return result
 
     def _one_or_none_closer():
@@ -82,7 +82,7 @@ def _mock_db(
         _one_or_none_score(),       # _gather_vertical_scores
         _one_or_none_subscriber(),  # subscriber_id lookup
         _one_or_none_pricing(),     # _gather_pricing
-        _scalar_cora(),             # _gather_cora_graph
+        _scalar_lifecycle(),             # _gather_lifecycle_graph
         _one_or_none_closer(),      # _gather_pitch_variant
     ]
     exec_result = MagicMock()

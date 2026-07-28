@@ -225,7 +225,7 @@ def _node_build_compose_context(state: ReactivationState) -> ReactivationState:
 
     if cohort == "county_live":
         system_prompt = (
-            "You are Cora, a concise outbound copywriter for Forced Action — "
+            "You are Lifecycle, a concise outbound copywriter for Forced Action — "
             "a distressed property intelligence platform. "
             "Write a short, urgent, professional reactivation message. "
             "Never use emojis. Never use all-caps. Always include 'Reply STOP to opt out' for SMS."
@@ -264,7 +264,7 @@ def _node_build_compose_context(state: ReactivationState) -> ReactivationState:
             subject = f"{county_id} just launched — new leads are live on Forced Action"
     elif cohort == "sold_out":
         system_prompt = (
-            "You are Cora, a concise outbound copywriter for Forced Action — "
+            "You are Lifecycle, a concise outbound copywriter for Forced Action — "
             "a distressed property intelligence platform. "
             "Write a short, urgent, scarcity-driven reactivation message. "
             "Never use emojis. Never use all-caps. Always include 'Reply STOP to opt out' for SMS."
@@ -302,7 +302,7 @@ def _node_build_compose_context(state: ReactivationState) -> ReactivationState:
             subject = f"Slot open in {zip_code} — lock it now on Forced Action"
     else:  # tier3_winback — client-locked copy, do not reword (T-B12-07)
         system_prompt = (
-            "You are Cora, a concise outbound copywriter for Forced Action — "
+            "You are Lifecycle, a concise outbound copywriter for Forced Action — "
             "a distressed property intelligence platform, writing to a lapsed "
             "subscriber. Never use emojis. Never use all-caps. Always include "
             "'Reply STOP to opt out' for SMS. Use the exact locked headline "

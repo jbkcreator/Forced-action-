@@ -4,15 +4,15 @@
 
 ---
 
-## Key Concepts — Cora, Monetization Wall, FOMO
+## Key Concepts — Lifecycle, Monetization Wall, FOMO
 
 Three terms used heavily throughout this document and the v9 spec. Read these first before the numbered sections.
 
-### Cora
+### Lifecycle
 
-Cora is the name given to the **autonomous revenue operator** in this platform. She is not a person and not a single service — she is the collective intelligence layer responsible for every proactive commercial decision the platform makes without founder involvement.
+Lifecycle is the name given to the **autonomous revenue operator** in this platform. She is not a person and not a single service — she is the collective intelligence layer responsible for every proactive commercial decision the platform makes without founder involvement.
 
-Cora is composed of:
+Lifecycle is composed of:
 
 - **Brain** — the LangGraph supervisor and all sub-graphs
 - **Hands** — the tool layer (thin wrappers over the platform's existing services)
@@ -20,7 +20,7 @@ Cora is composed of:
 - **Memory** — the weekly `learning_cards`, `message_outcomes`, and `deal_outcomes` tables
 - **Voice** — Claude Haiku, Sonnet, and Opus routed by task through the Claude router
 
-Cora composes and sends every proactive message, makes autonomous decisions inside the guardrail ranges, runs A/B tests, retires losing variants, and escalates anything outside her bounds to the founder through the Revenue Pulse. The v9 spec targets a founder workload of roughly 15 minutes per week — Cora is what makes that number possible.
+Lifecycle composes and sends every proactive message, makes autonomous decisions inside the guardrail ranges, runs A/B tests, retires losing variants, and escalates anything outside her bounds to the founder through the Revenue Pulse. The v9 spec targets a founder workload of roughly 15 minutes per week — Lifecycle is what makes that number possible.
 
 ### Monetization Wall
 
@@ -58,17 +58,17 @@ The underlying logic is: the moment a competitor demonstrates the ZIP is hot, th
 
 ### How They Connect
 
-**Cora is the operator. The monetization wall is Cora's first move on every new user. FOMO is how Cora turns one contractor's action into another contractor's conversion.** These three are the spine of the commercial engine — everything else in this document describes the scaffolding that lets them run.
+**Lifecycle is the operator. The monetization wall is Lifecycle's first move on every new user. FOMO is how Lifecycle turns one contractor's action into another contractor's conversion.** These three are the spine of the commercial engine — everything else in this document describes the scaffolding that lets them run.
 
 ---
 
 ## 1. What LangGraph Does in the Platform
 
-LangGraph is Cora's brain. Every **autonomous** decision the platform makes — not the user-initiated ones, but the ones the platform initiates on its own — runs through a LangGraph graph.
+LangGraph is Lifecycle's brain. Every **autonomous** decision the platform makes — not the user-initiated ones, but the ones the platform initiates on its own — runs through a LangGraph graph.
 
 A user-initiated action (a contractor tapping "unlock lead," a Stripe payment webhook firing, an inbound STOP message) is handled synchronously by the FastAPI process the way it is today. LangGraph does not touch those paths.
 
-A Cora-initiated action (a conversational lock close message, a FOMO nudge when a competitor acts, an abandonment SMS at 12 minutes of no payment, a weekly retention summary, an Auto Mode execution) starts with an event, enters the supervisor, and runs through a graph that:
+A Lifecycle-initiated action (a conversational lock close message, a FOMO nudge when a competitor acts, an abandonment SMS at 12 minutes of no payment, a weekly retention summary, an Auto Mode execution) starts with an event, enters the supervisor, and runs through a graph that:
 
 1. **Assembles live context** — subscriber segment, revenue signal score, wallet state, ZIP activity, competitor timing, latest learning card, active A/B variant
 2. **Checks the six-step decision hierarchy** — hard guardrails → current learning card → live Redis state → subscriber segment and score → active A/B variant → kill-switch colour for the feature
@@ -78,7 +78,7 @@ A Cora-initiated action (a conversational lock close message, a FOMO nudge when 
 6. **Executes the action** — calls the same tools that FastAPI calls (send SMS, create PaymentIntent, update subscription, write a row)
 7. **Writes its own outcome** — every fired action records to `message_outcomes`, `deal_outcomes`, or the agent audit log so the next Sunday's learning card can see what worked
 
-The key property of LangGraph for this platform is **suspend and resume**. A graph that sends an SMS and then waits 10 minutes for the user to click-or-not is a single graph with a suspension point — not two separate systems with a shared database state. This matters because most of Cora's work is *conversational over time*, not *one-shot on a trigger*.
+The key property of LangGraph for this platform is **suspend and resume**. A graph that sends an SMS and then waits 10 minutes for the user to click-or-not is a single graph with a suspension point — not two separate systems with a shared database state. This matters because most of Lifecycle's work is *conversational over time*, not *one-shot on a trigger*.
 
 ---
 
@@ -87,7 +87,7 @@ The key property of LangGraph for this platform is **suspend and resume**. A gra
 Three properties make LangGraph the right framework for this layer:
 
 - **Stateful graphs with Postgres checkpointing.** Every decision's intermediate state is persisted. If the worker crashes mid-decision, the next worker picks up at the last checkpoint — no double-charge, no double-SMS, no orphaned state.
-- **Human-readable flow.** A graph is a set of nodes and edges. Someone reading the code can see the entire decision flow visually. This matters for a system where the founder needs to audit *why* Cora made a particular call.
+- **Human-readable flow.** A graph is a set of nodes and edges. Someone reading the code can see the entire decision flow visually. This matters for a system where the founder needs to audit *why* Lifecycle made a particular call.
 - **Native tool-calling and streaming.** Tools are Python functions with typed signatures. Claude's tool-use response is parsed into structured calls against those functions without boilerplate. Streaming lets us watch a decision unfold in LangSmith during development.
 
 Alternatives we rejected: a pile of Celery tasks (no checkpointing, no conversational state), a bespoke state machine (reinventing every wheel LangGraph ships), plain function-chained agents (no suspend/resume, hard to audit).
@@ -100,7 +100,7 @@ Before any graph fires an action, it consults these six things in order. A "no" 
 
 | Step | Question | If no |
 |---|---|---|
-| 1. Hard guardrails | Is the proposed action within Cora's numeric bounds (price range, discount cap, urgency window, A/B traffic cap)? | Abort. Escalate via Revenue Pulse. |
+| 1. Hard guardrails | Is the proposed action within Lifecycle's numeric bounds (price range, discount cap, urgency window, A/B traffic cap)? | Abort. Escalate via Revenue Pulse. |
 | 2. Learning card | Does the latest Sunday learning card indicate this action is currently working? | Fall back to the safer previous-best action. |
 | 3. Live Redis state | Is the user in a cooling-off window? Storm flag active? Lead already on hold? | Respect the state. Skip or delay. |
 | 4. Subscriber segment and score | Does this segment/score actually warrant this action? | Swap to a more appropriate action for the segment. |
@@ -129,7 +129,7 @@ The entry point. Receives an event from any source (Redis Pub/Sub, Postgres trig
 
 ---
 
-### 4.2 Cora Conversational Lock Close Graph
+### 4.2 Lifecycle Conversational Lock Close Graph
 
 Fires when a wallet-active subscriber with a lock_candidate bucket hits the trigger (40+ credits in one ZIP, revenue signal score ≥ 72, no lock yet). This is the Sonnet conversational close — the highest-value graph in the platform.
 
@@ -354,7 +354,7 @@ The rule of thumb: if the decision needs **live context assembly and Claude comp
 
 ## 10. Observability
 
-- Every graph run produces a LangSmith trace. Traces are keyed by subscriber ID so debugging "why did Cora do X for user Y" is one search.
+- Every graph run produces a LangSmith trace. Traces are keyed by subscriber ID so debugging "why did Lifecycle do X for user Y" is one search.
 - Every fired action writes a row to the agent audit log (separate from `message_outcomes`, which is outcome-focused).
 - Prometheus metrics: graphs started, graphs completed, graphs failed, tokens used per graph, latency per graph.
 - Per-feature kill switch: a single config flag can disable any graph at runtime without a deploy.
@@ -363,7 +363,7 @@ The rule of thumb: if the decision needs **live context assembly and Claude comp
 
 ## 11. Summary
 
-LangGraph handles Cora's autonomous decisions. Everything else stays where it is. The initial Phase 2B scope is:
+LangGraph handles Lifecycle's autonomous decisions. Everything else stays where it is. The initial Phase 2B scope is:
 
 - **6 graphs** (Supervisor, Lock Close, FOMO, Abandonment, Retention, Auto Mode)
 - **48 nodes** across those graphs
@@ -371,6 +371,6 @@ LangGraph handles Cora's autonomous decisions. Everything else stays where it is
 - **29 tools** wrapping existing services
 - **5 event sources** feeding into the Supervisor
 
-This scope closes all 4 PENDING items and completes the 2 LangGraph-dependent PARTIAL items (Auto Mode automation, Cora SMS Conversational Close) in one engineering block.
+This scope closes all 4 PENDING items and completes the 2 LangGraph-dependent PARTIAL items (Auto Mode automation, Lifecycle SMS Conversational Close) in one engineering block.
 
 Architecture — process topology, deployment, repo layout, config split, failure modes, and testing — is the next document.

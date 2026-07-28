@@ -20,7 +20,7 @@ GRAPH_TO_PAUSE_TARGET: dict[str, str] = {
     "nws_poll": "nws_poll",
     "synthflow_voice_drop": "synthflow_voice_drop",
     "learning_card": "learning_card",
-    "cora_anomaly_check": "cora_anomaly_check",
+    "lifecycle_anomaly_check": "lifecycle_anomaly_check",
     "human_close_routing": "human_close_routing",
     "referral_milestone": "referral_milestone",
 }

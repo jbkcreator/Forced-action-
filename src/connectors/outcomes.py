@@ -1,5 +1,5 @@
 """
-Canonical outcome-candidate shape for the Cora Data Engine's outcome
+Canonical outcome-candidate shape for the Lifecycle Data Engine's outcome
 connectors, and the upsert helper that stages it into outcome_candidates
 (src/core/models.py:OutcomeCandidate).
 

@@ -71,7 +71,7 @@ curl -X POST /api/admin/icp-channels/hard_money_lender/activate \
 
 Every non-contractor ICP must clear **8 gates** before activation:
 
-**7 platform Expansion Gates** (from `config/cora_guardrails.py:EXPANSION_GATES`):
+**7 platform Expansion Gates** (from `config/lifecycle_guardrails.py:EXPANSION_GATES`):
 | Gate | Threshold |
 |------|-----------|
 | first_payment_rate | ≥ 30% |
@@ -166,7 +166,7 @@ These are intentionally deferred:
 
 1. **Public ICP landing pages** (`/rei-investors`) — Phase 1 is admin-only management
 2. **Per-ICP Stripe prices** — Phase 1 uses existing tier pricing
-3. **Cora message sequences per ICP** — Phase 1 channels use shared sequences with vertical filtering
+3. **Lifecycle message sequences per ICP** — Phase 1 channels use shared sequences with vertical filtering
 4. **Synthflow per-ICP agents** — separate taxonomy, not changed here
 5. **Per-ICP signup flow** — Phase 1 subscribers attribute to an ICP at signup but the public flow is still vertical-based
 

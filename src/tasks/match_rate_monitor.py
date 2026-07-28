@@ -22,7 +22,7 @@ from pathlib import Path
 
 from src.core.database import get_db_context
 from src.core.models import EnrichedContact, EnrichmentAnomalyLog
-from src.services.cora_slack import post_incident_alert
+from src.services.lifecycle_slack import post_incident_alert
 from src.services.email import send_alert
 
 logger = logging.getLogger(__name__)
@@ -261,7 +261,7 @@ def run_provider_health_check(
             provider, rate, floor, n, window_hours, affected
         )
         # Rich Slack card only when Slack is configured; email is the reliable channel.
-        if settings.slack_bot_token and settings.cora_incident_slack_channel:
+        if settings.slack_bot_token and settings.lifecycle_incident_slack_channel:
             try:
                 post_incident_alert(
                     SimpleNamespace(

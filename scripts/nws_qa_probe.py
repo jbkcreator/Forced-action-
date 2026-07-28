@@ -45,7 +45,7 @@ def main():
         "NWS_WEATHER_ENABLED":         settings.nws_weather_enabled,
         "NWS_REVENUE_POLLING_ENABLED":  settings.nws_revenue_polling_enabled,
         "STORM_PACK_ENABLED":           settings.storm_pack_enabled,
-        "NWS_CORA_URGENCY_ENABLED":     settings.nws_cora_urgency_enabled,
+        "NWS_LIFECYCLE_URGENCY_ENABLED":     settings.nws_lifecycle_urgency_enabled,
         "NWS_POLL_INTERVAL_SECONDS":    settings.nws_poll_interval_seconds,
         "NWS_SUPPORTED_STATES":         settings.nws_supported_states,
         "NWS_RELEVANT_EVENTS (count)":  len(settings.nws_relevant_events),
@@ -159,7 +159,7 @@ def main():
 
             if not lead_rows:
                 print(f"  NOTE: No Gold+ leads in ZIP {chosen['zip_code']}.")
-                print("        Cora urgency will correctly skip (lead_count=0).")
+                print("        Lifecycle urgency will correctly skip (lead_count=0).")
             else:
                 print(f"  Found {len(lead_rows)} Gold+ leads:")
                 for lr in lead_rows:
@@ -174,7 +174,7 @@ def main():
         try:
             alert_rows = db.execute(text("""
                 SELECT alert_id, event, affected_zips::text,
-                       storm_pack_triggered, cora_urgency_sent,
+                       storm_pack_triggered, lifecycle_urgency_sent,
                        subscriber_count, processed_at
                 FROM nws_alerts
                 ORDER BY processed_at DESC
@@ -189,7 +189,7 @@ def main():
                         f"  alert_id : {str(m3['alert_id'])[:70]}"
                         f"\n    event            : {m3['event']}"
                         f"\n    storm_triggered  : {m3['storm_pack_triggered']}"
-                        f"\n    cora_sent        : {m3['cora_urgency_sent']}"
+                        f"\n    lifecycle_sent        : {m3['lifecycle_urgency_sent']}"
                         f"\n    subscriber_count : {m3['subscriber_count']}"
                         f"\n    affected_zips    : {str(m3['affected_zips'])[:80]}"
                         f"\n    processed_at     : {m3['processed_at']}"

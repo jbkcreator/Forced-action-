@@ -36,7 +36,7 @@ reset_clock = clock.reset
 # ──────────────────────────────────────────────────────────────────────────────
 
 def dispatch(event: Dict[str, Any]) -> Dict[str, Any]:
-	"""Route an event through the Cora supervisor. Returns the supervisor outcome dict."""
+	"""Route an event through the Lifecycle supervisor. Returns the supervisor outcome dict."""
 	from src.agents.supervisor import dispatch_event
 	return dispatch_event(event)
 

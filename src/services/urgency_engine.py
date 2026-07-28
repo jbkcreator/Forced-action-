@@ -9,7 +9,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from config.cora_guardrails import get_guardrail
+from config.lifecycle_guardrails import get_guardrail
 from src.core.redis_client import redis_available, rdelete, rget, rset
 
 logger = logging.getLogger(__name__)

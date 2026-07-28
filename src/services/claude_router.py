@@ -15,7 +15,7 @@ Cost tracking:
 
 Prompt caching:
     Pass cache=True on any system prompt that is reused across many calls
-    (e.g. Cora persona prompt, ZIP stats context). Anthropic caches blocks
+    (e.g. Lifecycle persona prompt, ZIP stats context). Anthropic caches blocks
     >= 1024 tokens for 5 minutes; cache hits cost ~10% of normal input price.
 
 LangSmith Tracing:
@@ -168,7 +168,7 @@ def call_claude_with_usage(
 ) -> dict:
     """
     Same as call_claude() but returns a dict that includes token counts and
-    cost alongside the text. Used by Cora graphs that need to track
+    cost alongside the text. Used by Lifecycle graphs that need to track
     per-decision budget consumption.
 
     Pass `tools` + `tool_choice` to use Anthropic tool use for structured output.

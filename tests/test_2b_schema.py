@@ -123,51 +123,51 @@ class TestRevenueladderConfig:
         assert CREDIT_COSTS["transfer"] == 26
 
 
-class TestCoraGuardrailsConfig:
+class TestLifecycleGuardrailsConfig:
     def test_guardrails_has_13_rules(self):
-        from config.cora_guardrails import GUARDRAILS
+        from config.lifecycle_guardrails import GUARDRAILS
         assert len(GUARDRAILS) == 13
 
     def test_expansion_gates_has_7(self):
-        from config.cora_guardrails import EXPANSION_GATES
+        from config.lifecycle_guardrails import EXPANSION_GATES
         assert len(EXPANSION_GATES) == 7
 
     def test_kill_switch_has_9_metrics(self):
-        from config.cora_guardrails import KILL_SWITCH
+        from config.lifecycle_guardrails import KILL_SWITCH
         assert len(KILL_SWITCH) == 9
 
     def test_lock_pricing_range(self):
-        from config.cora_guardrails import GUARDRAILS
+        from config.lifecycle_guardrails import GUARDRAILS
         g = GUARDRAILS["lock_pricing"]
         assert g["min_cents"] == 14700
         assert g["max_cents"] == 24700
 
     def test_discount_hard_limit(self):
-        from config.cora_guardrails import GUARDRAILS
+        from config.lifecycle_guardrails import GUARDRAILS
         g = GUARDRAILS["discount_max"]
         assert g["max_pct"] == 20
         assert g["hard_limit"] is True
 
     def test_is_within_guardrail_accepts_valid(self):
-        from config.cora_guardrails import is_within_guardrail
+        from config.lifecycle_guardrails import is_within_guardrail
         assert is_within_guardrail("lock_pricing", 19700) is True
         assert is_within_guardrail("discount_max", 15) is True
         assert is_within_guardrail("credit_bonus_max", 5) is True
 
     def test_is_within_guardrail_rejects_invalid(self):
-        from config.cora_guardrails import is_within_guardrail
+        from config.lifecycle_guardrails import is_within_guardrail
         assert is_within_guardrail("lock_pricing", 30000) is False
         assert is_within_guardrail("discount_max", 25) is False
         assert is_within_guardrail("credit_bonus_max", 15) is False
 
     def test_get_guardrail(self):
-        from config.cora_guardrails import get_guardrail
+        from config.lifecycle_guardrails import get_guardrail
         g = get_guardrail("urgency_window")
         assert g["min_minutes"] == 10
         assert g["max_minutes"] == 60
 
     def test_get_guardrail_missing_raises(self):
-        from config.cora_guardrails import get_guardrail
+        from config.lifecycle_guardrails import get_guardrail
         with pytest.raises(KeyError):
             get_guardrail("nonexistent_guardrail")
 

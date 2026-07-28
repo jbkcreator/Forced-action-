@@ -1,14 +1,14 @@
 """
 T-B8-03 Operator Dashboard — Action Queue.
 
-Read-time union over three existing tables (cora_incident, human_close_escalations,
+Read-time union over three existing tables (lifecycle_incident, human_close_escalations,
 scraper_alert_log). No persistence, no new ledger. Maps each pending row to a
 common ActionItem and splits into two lanes:
 
   - approvals  — things awaiting a human decision (legal | deal)
   - failures   — FYI, no in-queue action (ops | source)
 
-Also exports canonical count helpers (cora_approvals_waiting, source_failures)
+Also exports canonical count helpers (lifecycle_approvals_waiting, source_failures)
 that B8-01's /summary calls, so the KPI cards and this queue never diverge.
 """
 
@@ -33,7 +33,7 @@ Severity = Literal["red", "yellow", "info"]
 class ActionItem(TypedDict):
     """One row in the action queue, normalised across all three sources."""
     type: Literal["approval", "source_failure"]
-    source: Literal["cora", "human_close", "scraper"]
+    source: Literal["lifecycle", "human_close", "scraper"]
     category: Category
     lane: Lane
     id: int
@@ -54,19 +54,19 @@ _SCRAPER_SEVERITY: dict[str, Severity] = {
     "health_check": "info",
 }
 
-# Cora action_taken buckets (breach_resolved IS NULL is the open predicate).
+# Lifecycle action_taken buckets (breach_resolved IS NULL is the open predicate).
 # Explicit allow-lists: a future/unknown action_taken is excluded, not silently
 # dumped into the failures lane.
-_CORA_LEGAL = ("human_escalated", "feature_killed")   # approvals lane
-_CORA_OPS = ("auto_paused", "fallback_enabled", "no_op")  # failures lane
-_CORA_SELECTED = _CORA_LEGAL + _CORA_OPS
+_LIFECYCLE_LEGAL = ("human_escalated", "feature_killed")   # approvals lane
+_LIFECYCLE_OPS = ("auto_paused", "fallback_enabled", "no_op")  # failures lane
+_LIFECYCLE_SELECTED = _LIFECYCLE_LEGAL + _LIFECYCLE_OPS
 
 
-def _cora_item(row: dict) -> ActionItem:
-    legal = row["action_taken"] in _CORA_LEGAL
+def _lifecycle_item(row: dict) -> ActionItem:
+    legal = row["action_taken"] in _LIFECYCLE_LEGAL
     return ActionItem(
         type="approval" if legal else "source_failure",
-        source="cora",
+        source="lifecycle",
         category="legal" if legal else "ops",
         lane="approvals" if legal else "failures",
         id=row["id"],
@@ -76,7 +76,7 @@ def _cora_item(row: dict) -> ActionItem:
         created_at=row["breach_started"],
         amount_cents=None,
         county_id=row.get("county_id"),
-        action_url="/admin/cora?tab=incidents",
+        action_url="/admin/lifecycle?tab=incidents",
     )
 
 
@@ -124,20 +124,20 @@ def _scraper_cutoff() -> datetime:
     return datetime.now(timezone.utc) - timedelta(hours=hours)
 
 
-def _query_cora(session: Session) -> list[ActionItem]:
+def _query_lifecycle(session: Session) -> list[ActionItem]:
     rows = session.execute(
         sa_text(
             """
             SELECT id, metric_name, feature_name, county_id, severity,
                    action_taken, root_cause, breach_started
-            FROM cora_incident
+            FROM lifecycle_incident
             WHERE breach_resolved IS NULL
               AND action_taken IN :selected
             """
         ).bindparams(bindparam("selected", expanding=True)),
-        {"selected": list(_CORA_SELECTED)},
+        {"selected": list(_LIFECYCLE_SELECTED)},
     ).mappings().all()
-    return [_cora_item(r) for r in rows]
+    return [_lifecycle_item(r) for r in rows]
 
 
 def _query_human_close(session: Session) -> list[ActionItem]:
@@ -167,7 +167,7 @@ def _query_scraper(session: Session) -> list[ActionItem]:
 
 
 def _sort_key(item: ActionItem) -> datetime:
-    """created_at coerced to tz-aware UTC. Sources differ: cora/scraper columns
+    """created_at coerced to tz-aware UTC. Sources differ: lifecycle/scraper columns
     are tz-aware, human_close_escalations.routed_at is tz-naive — comparing them
     raw raises TypeError, so naive values are treated as UTC."""
     dt = item["created_at"]
@@ -178,7 +178,7 @@ def build_action_queue(session: Session) -> dict:
     """Union the three sources, split into lanes, and derive KPI counts."""
     try:
         items: list[ActionItem] = (
-            _query_cora(session) + _query_human_close(session) + _query_scraper(session)
+            _query_lifecycle(session) + _query_human_close(session) + _query_scraper(session)
         )
     except SQLAlchemyError:
         logger.error("[ActionQueue] failed to read source tables", exc_info=True)
@@ -199,8 +199,8 @@ def build_action_queue(session: Session) -> dict:
     counts = {
         "approvals": len(approvals),
         "failures": len(failures),
-        "cora_approvals_waiting": sum(
-            1 for i in approvals if i["source"] == "cora" and i["category"] == "legal"
+        "lifecycle_approvals_waiting": sum(
+            1 for i in approvals if i["source"] == "lifecycle" and i["category"] == "legal"
         ),
         "source_failures": sum(1 for i in failures if i["source"] == "scraper"),
     }
@@ -209,19 +209,19 @@ def build_action_queue(session: Session) -> dict:
 
 # ── Canonical count helpers (B8-01's /summary calls these) ────────────────────
 
-def cora_approvals_waiting(session: Session) -> int:
-    """Open cora incidents awaiting a human decision (legal lane only) —
+def lifecycle_approvals_waiting(session: Session) -> int:
+    """Open lifecycle incidents awaiting a human decision (legal lane only) —
     excludes auto-handled incidents and human-close escalations."""
     try:
         return int(session.execute(sa_text(
             """
-            SELECT COUNT(*) FROM cora_incident
+            SELECT COUNT(*) FROM lifecycle_incident
             WHERE breach_resolved IS NULL
               AND action_taken IN ('human_escalated', 'feature_killed')
             """
         )).scalar_one())
     except SQLAlchemyError:
-        logger.error("[ActionQueue] cora_approvals_waiting query failed", exc_info=True)
+        logger.error("[ActionQueue] lifecycle_approvals_waiting query failed", exc_info=True)
         raise
 
 

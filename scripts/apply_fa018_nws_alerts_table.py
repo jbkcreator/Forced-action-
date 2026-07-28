@@ -39,7 +39,7 @@ CREATE TABLE nws_alerts (
     ends TIMESTAMP WITH TIME ZONE, 
     county_id VARCHAR(50) DEFAULT 'hillsborough' NOT NULL, 
     storm_pack_triggered BOOLEAN DEFAULT 'false' NOT NULL, 
-    cora_urgency_sent BOOLEAN DEFAULT 'false' NOT NULL, 
+    lifecycle_urgency_sent BOOLEAN DEFAULT 'false' NOT NULL, 
     subscriber_count INTEGER DEFAULT '0' NOT NULL, 
     raw_payload JSONB, 
     processed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW() NOT NULL, 

@@ -1,4 +1,4 @@
-"""Win autopsy memory cards for Cora's counterfactual learning layer."""
+"""Win autopsy memory cards for Lifecycle's counterfactual learning layer."""
 
 from __future__ import annotations
 
@@ -165,7 +165,7 @@ def record_win_autopsy(deal_outcome_id: int, db: Session) -> Optional[LearningCa
     Append one closed-won deal snapshot into today's win_autopsy learning card.
 
     Loss autopsies ask why a conversion failed. This mirrors that loop for wins
-    so Cora can reuse positive patterns in future prioritization.
+    so Lifecycle can reuse positive patterns in future prioritization.
     """
     deal = db.get(DealOutcome, deal_outcome_id)
     if deal is None or deal.deal_size_bucket == "skip":

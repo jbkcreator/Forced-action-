@@ -102,7 +102,7 @@ def _notify_slack_draft(asset: WinStoryAsset) -> Optional[str]:
     settings = get_settings()
 
     token = settings.slack_bot_token
-    channel = settings.cora_incident_slack_channel
+    channel = settings.lifecycle_incident_slack_channel
     if not token or not channel:
         logger.info("[WinStory] Slack not configured — skipping draft notification")
         return None

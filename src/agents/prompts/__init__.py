@@ -1,1 +1,1 @@
-"""Prompt templates for Cora graphs — YAML files organized per graph."""
+"""Prompt templates for Lifecycle graphs — YAML files organized per graph."""

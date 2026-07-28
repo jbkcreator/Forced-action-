@@ -11,7 +11,7 @@ total assignments (with at least 10 in each arm). When triggered:
     1. complete_test(test_name, winner='b') — flips status='completed'
     2. Founder SMS alert via _send_founder_alert
     3. Append a learning_cards row (card_type='ab_result') so future
-       Cora decisions see the lesson learned.
+       Lifecycle decisions see the lesson learned.
 
 Run via: python -m src.tasks.ab_rollback_check [--dry-run]
 Cron:    0 9 * * *   (daily 09:00 UTC, before the Revenue Pulse Monday SMS)

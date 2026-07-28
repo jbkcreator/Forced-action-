@@ -246,7 +246,7 @@ def _complete_voter_lead(session, owner_id: int, property_id: int) -> None:
     """
     For voter-seeded owners that skip the paid cascade, emit the same
     enrichment.completed event and prospect update that run_cascade()'s M2
-    block emits — so Cora and the lead pack surface see the contact as resolved.
+    block emits — so Lifecycle and the lead pack surface see the contact as resolved.
     """
     from src.services.prospect_service import (
         best_ec as _best_ec,

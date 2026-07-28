@@ -1,5 +1,5 @@
 """
-Ranked whale list + Hunter->Cora data contract (HUNTER-02, W3).
+Ranked whale list + Hunter->Lifecycle data contract (HUNTER-02, W3).
 
 Cell #1 ("25 biggest whales") input, produced the moment an entity carries
 is_whale=true (src/services/whale_detection.py) -- ranked by purchase count,
@@ -7,8 +7,8 @@ then cash volume, matching the plan's ordering. Per the client's Q2 answer
 ("there is no investor or buyer roster in the platform"), this function *is*
 that roster.
 
-Contract shape: RankedWhale below is the full Hunter->Cora handoff --
-every field a future Cora graph can rely on existing, none it must derive
+Contract shape: RankedWhale below is the full Hunter->Lifecycle handoff --
+every field a future Lifecycle graph can rely on existing, none it must derive
 itself. Fields:
   - canonical_name / entity_type / county_id       -- who
   - total_purchase_count / total_cash_volume        -- portfolio summary
@@ -100,8 +100,8 @@ def _why_now(recent_count: int, total_cash_volume: Decimal, last_deed_type: Opti
 
 def get_ranked_whales(session: Session, limit: int = DEFAULT_LIMIT, county_id: Optional[str] = None) -> list[dict]:
     """
-    The ranked "N biggest whales" list, in the Hunter->Cora contract shape.
-    Read-only, no writes -- safe to call as often as Cora needs it.
+    The ranked "N biggest whales" list, in the Hunter->Lifecycle contract shape.
+    Read-only, no writes -- safe to call as often as Lifecycle needs it.
     """
     county_filter = "AND be.county_id = :county_id" if county_id else ""
     rows = session.execute(

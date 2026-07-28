@@ -1,5 +1,5 @@
 """
-Cora Agents runtime configuration.
+Lifecycle Agents runtime configuration.
 
 Inherits from AppSettings so every shared key (DATABASE_URL, REDIS_URL,
 ANTHROPIC_API_KEY, Stripe, Twilio, guardrails, etc.) is available unchanged.

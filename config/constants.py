@@ -261,7 +261,7 @@ TIER_DISPLAY = {
         ],
     },
     # Placeholder copy — product to supply final founder bullets before launch.
-    # Do not promise unbuilt surfaces (deal-intake / Cora SLA) until they ship.
+    # Do not promise unbuilt surfaces (deal-intake / Lifecycle SLA) until they ship.
     "founder": {
         "label": "Founder — 10 ZIPs",
         "zip_limit": 10,

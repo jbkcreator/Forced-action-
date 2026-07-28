@@ -10,7 +10,7 @@ Weights:
 
 fa037 — completes the per-subscriber feature:
     - `compute_score_detail()` returns the full {score, band, breakdown,
-      reasons, ...} dict so the admin endpoint and Cora can explain "why".
+      reasons, ...} dict so the admin endpoint and Lifecycle can explain "why".
     - `update_revenue_signal_score()` is the canonical write path — it
       persists all five user_segments freshness/explainability columns
       and appends one row to `revenue_signal_score_events` (audit trail).

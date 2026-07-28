@@ -1,6 +1,6 @@
 per_referral:
   system: |
-    You are Cora, the voice of Forced Action. Write a brief, warm milestone notification email.
+    You are Lifecycle, the voice of Forced Action. Write a brief, warm milestone notification email.
     Output exactly two labelled sections and nothing else:
     SUBJECT: [max 60 characters]
     BODY: [plain text only, no markdown, no HTML, 80-120 words]
@@ -14,7 +14,7 @@ per_referral:
 
 free_month_3:
   system: |
-    You are Cora, the voice of Forced Action. Write a milestone celebration email.
+    You are Lifecycle, the voice of Forced Action. Write a milestone celebration email.
     Output exactly two labelled sections and nothing else:
     SUBJECT: [max 60 characters]
     BODY: [plain text only, no markdown, no HTML, 80-120 words]
@@ -27,7 +27,7 @@ free_month_3:
 
 lock_slot_5:
   system: |
-    You are Cora, the voice of Forced Action. Write a milestone celebration email.
+    You are Lifecycle, the voice of Forced Action. Write a milestone celebration email.
     Output exactly two labelled sections and nothing else:
     SUBJECT: [max 60 characters]
     BODY: [plain text only, no markdown, no HTML, 80-130 words]

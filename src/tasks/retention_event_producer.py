@@ -80,7 +80,7 @@ def _is_high_churn_risk(db: Session, subscriber_id: int) -> bool:
 
 
 def _last_engagement(db: Session, subscriber_id: int) -> Optional[datetime]:
-    """Return sent_at of most recent Cora message for this subscriber."""
+    """Return sent_at of most recent Lifecycle message for this subscriber."""
     row = db.execute(
         select(MessageOutcome.sent_at)
         .where(MessageOutcome.subscriber_id == subscriber_id)
@@ -105,7 +105,7 @@ def _mark_deduplicated(subscriber_id: int) -> None:
 
 
 def _emit_event(subscriber_id: int, tier: str, window_days: int) -> None:
-    from src.agents.events.ingestion import publish_cora_event
+    from src.agents.events.ingestion import publish_lifecycle_event
     from src.agents.events.types import Event
 
     evt = Event(
@@ -117,7 +117,7 @@ def _emit_event(subscriber_id: int, tier: str, window_days: int) -> None:
         idempotency_key=f"retention:{subscriber_id}:{datetime.now(timezone.utc).date().strftime(RETENTION_IDEMPOTENCY_WINDOW)}",
     )
     try:
-        publish_cora_event(evt.to_dispatch_dict())
+        publish_lifecycle_event(evt.to_dispatch_dict())
     except Exception as exc:
         logger.error("retention_event_producer emit failed sub=%s: %s", subscriber_id, exc)
 

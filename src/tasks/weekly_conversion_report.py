@@ -4,7 +4,7 @@ Weekly CDS tier-by-tier conversion report (E29).
 Runs Mondays 07:00 UTC — before the autonomy report (08:45) so both land in
 the same Monday morning digest. Produces a tier breakdown for Hillsborough and
 Pinellas over a rolling 90-day window, writes one combined learning_cards row
-per run, and posts a compact summary to the Cora incident Slack channel.
+per run, and posts a compact summary to the Lifecycle incident Slack channel.
 
 Usage:
     python -m src.tasks.weekly_conversion_report
@@ -49,7 +49,7 @@ def _post_slack(text: str) -> None:
     from config.settings import get_settings
     s = get_settings()
     token = s.slack_bot_token
-    channel = s.cora_incident_slack_channel
+    channel = s.lifecycle_incident_slack_channel
     if not token or not channel:
         return
     try:

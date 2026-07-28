@@ -18,7 +18,7 @@ Vera is the Agent Lane's truth-and-verification agent — her one job is to inde
 
 **Agent scaffolding**
 
-Vera now runs as her own process (`python -m src.agents.vera`), entirely separate from the existing Cora/Lifecycle agent runtime — no shared code path, no shared event loop. A health check (`--health`) confirms her database connection, her facts table, and her kill-switch gate are all reachable before any standing job runs.
+Vera now runs as her own process (`python -m src.agents.vera`), entirely separate from the existing Lifecycle/Lifecycle agent runtime — no shared code path, no shared event loop. A health check (`--health`) confirms her database connection, her facts table, and her kill-switch gate are all reachable before any standing job runs.
 
 **Read-only database role**
 

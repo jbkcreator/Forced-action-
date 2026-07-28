@@ -917,7 +917,7 @@ class NWSAlert(Base):
     """
     Idempotent store for NWS CAP alerts processed by the platform.
     One row per unique NWS alert ID — prevents duplicate storm-pack triggers
-    and Cora urgency messages across poll cycles.
+    and Lifecycle urgency messages across poll cycles.
     """
     __tablename__ = "nws_alerts"
 
@@ -950,7 +950,7 @@ class NWSAlert(Base):
     # Platform tracking
     county_id: Mapped[str] = mapped_column(String(50), default="hillsborough", index=True)
     storm_pack_triggered: Mapped[bool] = mapped_column(Boolean, default=False)
-    cora_urgency_sent: Mapped[bool] = mapped_column(Boolean, default=False)
+    lifecycle_urgency_sent: Mapped[bool] = mapped_column(Boolean, default=False)
     subscriber_count: Mapped[int] = mapped_column(Integer, default=0)
 
     # Full raw properties payload for debugging/audit
@@ -1006,7 +1006,7 @@ class DistressScore(Base):
 
     # A2 — Lead Confidence gating. lead_confidence is 0.000–1.000 (NULL until A2
     # runs); is_guess_lead = lead_confidence < MIN_CONFIDENCE_THRESHOLD. Guess
-    # leads are withheld from paid surfaces (feed / Lead Packs / Cora recs).
+    # leads are withheld from paid surfaces (feed / Lead Packs / Lifecycle recs).
     lead_confidence: Mapped[Optional[float]] = mapped_column(Numeric(4, 3))
     is_guess_lead: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
@@ -1258,7 +1258,7 @@ class Subscriber(Base):
 
     # ── fa017: Signup source attribution ──
     # CHECK constraint (`check_subscriber_signup_source`) enforces allow-list:
-    # direct / landing_page / dbpr_email / cora_sms / missed_call / referral /
+    # direct / landing_page / dbpr_email / lifecycle_sms / missed_call / referral /
     # admin / unknown / affiliate (fa081).
     signup_source: Mapped[str] = mapped_column(
         String(30), default="direct", server_default="direct", nullable=False, index=True,
@@ -1367,13 +1367,19 @@ class ActivationEvent(Base):
 
     signup_time mirrors Subscriber.created_at (stamped at row creation so it
     survives even if Subscriber.created_at semantics ever change).
+    onboarding_completed_time is stamped when the one-time preference form
+    (PATCH /onboarding/{feed_uuid}) is submitted — the only step that
+    currently sits between signup and first-leads-shown, so this is the one
+    checkpoint that lets "where did they drop off" distinguish "never opened
+    onboarding" from "opened it, never saw a lead" (Section 4.10 gap).
     first_leads_shown_time is stamped the first time the free-tier dashboard
     renders the 3-5 real scored leads (event_feed's no-locked-zip branch).
     first_unlock_time is stamped the first time the subscriber unlocks any
     lead's contact info (paid $4/hot-lead unlock or founder comp reveal) —
-    this is the activation event per the locked decision. Both are
-    set-once (COALESCE-style in code, never overwritten) so "time to first
-    value" and "time to activation" stay measurable against signup_time.
+    this is the activation event per the locked decision. All three post-
+    signup stamps are set-once (COALESCE-style in code, never overwritten) so
+    "time to first value" and "time to activation" stay measurable against
+    signup_time.
     """
     __tablename__ = "activation_events"
 
@@ -1383,6 +1389,7 @@ class ActivationEvent(Base):
     signup_time: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+    onboarding_completed_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     first_leads_shown_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     first_unlock_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
@@ -1392,6 +1399,7 @@ class ActivationEvent(Base):
     def __repr__(self):
         return (
             f"<ActivationEvent(subscriber_id={self.subscriber_id}, "
+            f"onboarded={self.onboarding_completed_time}, "
             f"shown={self.first_leads_shown_time}, unlocked={self.first_unlock_time})>"
         )
 
@@ -2042,9 +2050,9 @@ class PlatformDailyStats(Base):
     tier_silver: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     tier_bronze: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
-    # ── Cora self-healing baseline snapshots (fa034 + fa035) ─────────────────
+    # ── Lifecycle self-healing baseline snapshots (fa034 + fa035) ─────────────────
     # Daily metric values written by kill_switch_metric_ingest after the
-    # ks_metric_* Redis cache is updated. Read by cora_self_healing.compute_baseline
+    # ks_metric_* Redis cache is updated. Read by lifecycle_self_healing.compute_baseline
     # to derive a 7-day rolling mean per metric. NULL = "no data for this day"
     # (pre-deploy rows, or metric not computable for this county).
     # NUMERIC(7,4): admits 0-999.9999 — percent values are stored in 0-100
@@ -2087,20 +2095,20 @@ class PlatformDailyStats(Base):
         )
 
 
-class CoraIncident(Base):
-    """Cora self-healing incident ledger (fa034).
+class LifecycleIncident(Base):
+    """Lifecycle self-healing incident ledger (fa034).
 
     One row per (metric, county, feature) breach. Opened by
-    `src/tasks/cora_self_healing.py` when a metric crosses its yellow/red
+    `src/tasks/lifecycle_self_healing.py` when a metric crosses its yellow/red
     threshold; updated when duration passes action triggers; closed when
     the metric recovers.
 
     Runtime never instantiates this model directly — every read/write in
-    cora_self_healing.py and the revenue_pulse extension uses raw SQL via
+    lifecycle_self_healing.py and the revenue_pulse extension uses raw SQL via
     `sa_text(...)` (per repo convention). This declaration exists only so
     Alembic autogenerate stays consistent with the live schema.
     """
-    __tablename__ = "cora_incident"
+    __tablename__ = "lifecycle_incident"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
 
@@ -2136,21 +2144,21 @@ class CoraIncident(Base):
     )
 
     __table_args__ = (
-        CheckConstraint("severity IN ('yellow','red')", name="check_cora_incident_severity"),
+        CheckConstraint("severity IN ('yellow','red')", name="check_lifecycle_incident_severity"),
         CheckConstraint(
             "action_taken IN ('no_op','fallback_enabled','auto_paused',"
             "'human_escalated','feature_killed','resolved')",
-            name="check_cora_incident_action",
+            name="check_lifecycle_incident_action",
         ),
-        # Partial indexes (idx_cora_incident_metric_open, idx_cora_incident_unresolved)
+        # Partial indexes (idx_lifecycle_incident_metric_open, idx_lifecycle_incident_unresolved)
         # are created via raw SQL in fa034 and not declared here, so autogenerate
         # doesn't try to recreate them.
-        Index("idx_cora_incident_breach_started", "breach_started"),
+        Index("idx_lifecycle_incident_breach_started", "breach_started"),
     )
 
     def __repr__(self):
         return (
-            f"<CoraIncident(id={self.id}, metric={self.metric_name}, "
+            f"<LifecycleIncident(id={self.id}, metric={self.metric_name}, "
             f"severity={self.severity}, action={self.action_taken}, "
             f"resolved={self.breach_resolved is not None})>"
         )
@@ -2212,7 +2220,7 @@ class OutcomeCandidate(Base):
     """
     Canonical staging shape for outcomes mined from already-ingested public
     records (foreclosure auction results, tax-deed auction results, appraiser
-    sales, etc.) by the Cora Data Engine connectors (src/connectors/).
+    sales, etc.) by the Lifecycle Data Engine connectors (src/connectors/).
 
     Deliberately has no FK to deal_outcomes — the label layer (CDE-10,
     src/connectors/label_layer.py) promotes unconsumed rows into DealOutcome
@@ -2549,16 +2557,16 @@ class StripeWebhookEvent(Base):
         return f"<StripeWebhookEvent(event_id={self.event_id}, type={self.event_type})>"
 
 
-class CoraEventQueue(Base):
+class LifecycleEventQueue(Base):
     """
-    Durable fallback queue for Cora bus events when Redis is unavailable
-    (fa072). `publish_cora_event` writes here + emits NOTIFY cora_events; the
+    Durable fallback queue for Lifecycle bus events when Redis is unavailable
+    (fa072). `publish_lifecycle_event` writes here + emits NOTIFY lifecycle_events; the
     Postgres listener drains pending rows on startup and every 60s.
 
     The table already exists in the DB; this ORM mapping was missing, which
     broke the Redis-down fallback path in src/agents/events/ingestion.py.
     """
-    __tablename__ = "cora_event_queue"
+    __tablename__ = "lifecycle_event_queue"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     event_type: Mapped[str] = mapped_column(Text, nullable=False)
@@ -2574,11 +2582,11 @@ class CoraEventQueue(Base):
     error: Mapped[Optional[str]] = mapped_column(Text)
 
     __table_args__ = (
-        Index("idx_cora_event_queue_status", "status", "created_at"),
+        Index("idx_lifecycle_event_queue_status", "status", "created_at"),
     )
 
     def __repr__(self):
-        return f"<CoraEventQueue(id={self.id}, type={self.event_type}, status={self.status})>"
+        return f"<LifecycleEventQueue(id={self.id}, type={self.event_type}, status={self.status})>"
 
 
 class UnifiedSubscriberMemory(Base):
@@ -2994,7 +3002,7 @@ class ChurnPrediction(Base):
 class MessageOutcome(Base):
     """
     Tracks every outbound message (SMS, email, voice) and its conversion attribution.
-    Ground truth for all Cora learning — must log from Day 1.
+    Ground truth for all Lifecycle learning — must log from Day 1.
     """
     __tablename__ = "message_outcomes"
 
@@ -3029,7 +3037,7 @@ class MessageOutcome(Base):
     cancelled_by = Column(String(100), nullable=True)
     cancel_reason = Column(String(255), nullable=True)
 
-    # link back to Cora decision
+    # link back to Lifecycle decision
     decision_id = Column(String(36), nullable=True, index=True)
 
     trade_vertical: Mapped[Optional[str]] = mapped_column(String(50))
@@ -3052,12 +3060,12 @@ class MessageOutcome(Base):
         return f"<MessageOutcome(id={self.id}, type={self.message_type}, conversion={self.conversion_type})>"
 
 
-class CoraSuppression(Base):
+class LifecycleSuppression(Base):
     """
-    Active subscriber-level stop for Cora-led outbound touches.
+    Active subscriber-level stop for Lifecycle-led outbound touches.
     Compliance messages still flow through their own SMS gates.
     """
-    __tablename__ = "cora_suppressions"
+    __tablename__ = "lifecycle_suppressions"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     subscriber_id: Mapped[int] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=False, index=True)
@@ -3070,12 +3078,12 @@ class CoraSuppression(Base):
     notes: Mapped[Optional[str]] = mapped_column(String(255))
 
     __table_args__ = (
-        Index("idx_cora_suppression_active_sub", "subscriber_id", "is_active"),
-        Index("idx_cora_suppression_reason", "reason"),
+        Index("idx_lifecycle_suppression_active_sub", "subscriber_id", "is_active"),
+        Index("idx_lifecycle_suppression_reason", "reason"),
     )
 
     def __repr__(self):
-        return f"<CoraSuppression(sub={self.subscriber_id}, reason={self.reason}, active={self.is_active})>"
+        return f"<LifecycleSuppression(sub={self.subscriber_id}, reason={self.reason}, active={self.is_active})>"
 
 
 class DealOutcome(Base):
@@ -3180,7 +3188,7 @@ class LossAutopsy(Base):
     primary_rejection_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     competitor_rate_delta: Mapped[Optional[float]] = mapped_column(Numeric(8, 4), nullable=True)
     underwriting_blocker: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    cora_behavior_adjustment: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    lifecycle_behavior_adjustment: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     raw_context: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
     model_response: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
     claude_cost_usd: Mapped[Optional[float]] = mapped_column(Numeric(10, 6), nullable=True)
@@ -3205,7 +3213,7 @@ class PreDecisionSnapshot(Base):
     Pre-routing context snapshot captured at deal_outcome creation time.
 
     Stores all 6 CDS vertical scores (the roads not taken), the selected vertical,
-    active pricing cohort, Cora graph, and pitch variant so the future A5b
+    active pricing cohort, Lifecycle graph, and pitch variant so the future A5b
     counterfactual engine can compare actual vs. alternative paths on resolution.
 
     Broker fields (broker_id, alternative_brokers) are nullable stubs — wirable
@@ -3229,7 +3237,7 @@ class PreDecisionSnapshot(Base):
 
     pricing_cohort_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     pricing_snapshot: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
-    cora_graph: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    lifecycle_graph: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     pitch_variant: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
 
     raw_context: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
@@ -3282,8 +3290,8 @@ class SubscriberTag(Base):
         return f"<SubscriberTag(id={self.id}, subscriber_id={self.subscriber_id}, tag='{self.tag}')>"
 class LearningCard(Base):
     """
-    Weekly Cora learning summary. Sunday midnight LangGraph job writes one card
-    per type. Cora reads the most recent cards at the start of every decision tree.
+    Weekly Lifecycle learning summary. Sunday midnight LangGraph job writes one card
+    per type. Lifecycle reads the most recent cards at the start of every decision tree.
     """
     __tablename__ = "learning_cards"
 
@@ -3292,7 +3300,7 @@ class LearningCard(Base):
     card_type: Mapped[str] = mapped_column(String(30), nullable=False)
     summary_text: Mapped[str] = mapped_column(Text, nullable=False)
     data_json: Mapped[Optional[dict]] = mapped_column(JSONB)        # raw metrics
-    action_taken: Mapped[Optional[str]] = mapped_column(String(255))  # what Cora did
+    action_taken: Mapped[Optional[str]] = mapped_column(String(255))  # what Lifecycle did
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     __table_args__ = (
@@ -3303,7 +3311,7 @@ class LearningCard(Base):
             # reality; see migrations/apply_learning_card_holdout_result.py.
             "card_type IN ('message_perf', 'deal_pattern', 'ab_result', "
             "'churn_signal', 'pricing_test', 'general', "
-            "'autonomy_summary', "        # fa036 — weekly Cora autonomy scorecard
+            "'autonomy_summary', "        # fa036 — weekly Lifecycle autonomy scorecard
             "'kill_switch_scorecard', 'win_autopsy', 'conversion_tier_report', "
             "'holdout_result')",          # Task 4.1 — frozen control holdout surfacing
             name="check_card_type",
@@ -3453,7 +3461,7 @@ class ReferralPromptFunnel(Base):
 
 
 class AbTest(Base):
-    """A/B test definition. Cora creates and manages tests within guardrail bounds."""
+    """A/B test definition. Lifecycle creates and manages tests within guardrail bounds."""
     __tablename__ = "ab_tests"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
@@ -4042,14 +4050,14 @@ class SmsOptIn(Base):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Agents — Cora LangGraph Audit Log
+# Agents — Lifecycle LangGraph Audit Log
 # ══════════════════════════════════════════════════════════════════════════════
 
 
 class AgentDecision(Base):
     """
-    One row per Cora graph decision. Separate from message_outcomes (which is
-    outcome-focused). This is the "why did Cora do X for user Y" audit table —
+    One row per Lifecycle graph decision. Separate from message_outcomes (which is
+    outcome-focused). This is the "why did Lifecycle do X for user Y" audit table —
     the first stop for any operational question about autonomous behaviour.
     """
     __tablename__ = "agent_decisions"
@@ -4076,7 +4084,7 @@ class AgentDecision(Base):
     #   never cleared. Metric 2 ("% overridden among autonomous") queries on this
     #   instead of the current autonomy_class so rows that flipped to 'overridden'
     #   still count in the denominator.
-    # playbook_id: nullable link to the cora_playbook row that drove this decision.
+    # playbook_id: nullable link to the lifecycle_playbook row that drove this decision.
     autonomy_class: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     was_autonomous: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     requires_approval: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -4087,7 +4095,7 @@ class AgentDecision(Base):
     override_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     override_reason_code: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
     playbook_id: Mapped[Optional[int]] = mapped_column(
-        BigInteger, ForeignKey("cora_playbook.id", ondelete="SET NULL"), nullable=True,
+        BigInteger, ForeignKey("lifecycle_playbook.id", ondelete="SET NULL"), nullable=True,
     )
 
     __table_args__ = (
@@ -4149,7 +4157,7 @@ class InboundResponse(Base):
 
 class QuoraQuestion(Base):
     """
-    One row per Quora question that has been classified by Cora.
+    One row per Quora question that has been classified by Lifecycle.
     Includes skip decisions — so the same question is never re-classified on
     future scrape runs. Drives the answer-generation and publishing pipeline.
     """
@@ -4176,14 +4184,14 @@ class QuoraQuestion(Base):
     deterministic_score: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     deterministic_reasons: Mapped[Optional[list]] = mapped_column(ARRAY(Text), nullable=True)
 
-    # ── Cora classification ───────────────────────────────────────────────────
+    # ── Lifecycle classification ───────────────────────────────────────────────────
     matched_keyword: Mapped[Optional[str]] = mapped_column(Text, nullable=True, index=True)
-    cora_decision_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    lifecycle_decision_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
     intent_lane: Mapped[Optional[str]] = mapped_column(String(60), nullable=True, index=True)
     recommended_action: Mapped[Optional[str]] = mapped_column(String(40), nullable=True, index=True)
     priority_score: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     risk_level: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
-    cora_classification: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    lifecycle_classification: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
 
     # ── Answer workflow ───────────────────────────────────────────────────────
     answer_draft: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
@@ -4313,10 +4321,10 @@ class VendorCostPause(Base):
         return f"<VendorCostPause(vendor={self.vendor}, pause_target={self.pause_target}, status={self.status})>"
 
       
-class CoraPlaybook(Base):
-    """Cora-recommended pattern lifecycle (fa036).
+class LifecyclePlaybook(Base):
+    """Lifecycle-recommended pattern lifecycle (fa036).
 
-    One row per Cora-authored recommendation (A/B winner promotion, kill
+    One row per Lifecycle-authored recommendation (A/B winner promotion, kill
     recommendation, future explicit recommendations). Lifecycle:
         recommended → adopted   (human approves via admin endpoint)
                     → rejected  (human declines)
@@ -4324,22 +4332,22 @@ class CoraPlaybook(Base):
 
     Runtime never instantiates this model — every read/write goes through
     raw SQL via `sa_text` (per repo convention) in `src/services/playbook_writer.py`,
-    `src/api/admin_router.py`, and `src/tasks/cora_autonomy_report.py`. The
+    `src/api/admin_router.py`, and `src/tasks/lifecycle_autonomy_report.py`. The
     declaration exists for Alembic autogenerate consistency.
 
     The `source_key` column + the partial-unique index on it prevent
     duplicate recommendations from the same A/B test or metric breach
-    (see `idx_cora_playbook_source_key_unique` in fa036). NULL source_key
+    (see `idx_lifecycle_playbook_source_key_unique` in fa036). NULL source_key
     is allowed and uncounted by the index.
     """
-    __tablename__ = "cora_playbook"
+    __tablename__ = "lifecycle_playbook"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(120), nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     pattern_json: Mapped[dict] = mapped_column(JSONB, nullable=False)
 
-    # authored_by: 'cora' for autonomous paths; <operator handle> for manual.
+    # authored_by: 'lifecycle' for autonomous paths; <operator handle> for manual.
     # The ab_engine.complete_test source_actor kwarg carries this through.
     authored_by: Mapped[str] = mapped_column(String(80), nullable=False)
     authored_at: Mapped[datetime] = mapped_column(
@@ -4384,18 +4392,18 @@ class CoraPlaybook(Base):
     __table_args__ = (
         CheckConstraint(
             "status IN ('recommended','adopted','rejected','retired')",
-            name="check_cora_playbook_status",
+            name="check_lifecycle_playbook_status",
         ),
         # Non-unique indexes mirror fa036. The unique partial index on
         # source_key is created via raw SQL in the migration, not declared
         # here, so autogenerate doesn't try to re-create it.
-        Index("idx_cora_playbook_status", "status"),
-        Index("idx_cora_playbook_authored", "authored_by", "authored_at"),
+        Index("idx_lifecycle_playbook_status", "status"),
+        Index("idx_lifecycle_playbook_authored", "authored_by", "authored_at"),
     )
 
     def __repr__(self):
         return (
-            f"<CoraPlaybook(id={self.id}, name={self.name}, "
+            f"<LifecyclePlaybook(id={self.id}, name={self.name}, "
             f"status={self.status}, authored_by={self.authored_by})>"
         )
 
@@ -5275,6 +5283,48 @@ class WaitlistEntry(Base):
         return (f"<WaitlistEntry(id={self.id}, zip={self.zip_code}, "
                 f"vertical={self.vertical}, type={self.waitlist_type}, "
                 f"status={self.status})>")
+
+
+class ReferralProspect(Base):
+    """
+    Section 7.3 — the one-question referral ask inside onboarding: "who is
+    one good contractor you know in a county we haven't opened yet?"
+
+    Deliberately NOT a WaitlistEntry: the referring subscriber gives a name,
+    company, and target county for someone else — they don't have that
+    person's email or phone, which WaitlistEntry requires (nullable=False).
+    This is a lightweight lead list, not a notify-on-launch subscription —
+    "so when a county launches, its first outreach list already exists"
+    means ops pulls these rows for that county, not an automated SMS/email.
+
+    One row per (referring_subscriber_id, target_county_id): a subscriber
+    referring the same county twice (retry, resubmit) updates the existing
+    row rather than stacking duplicates — see submit_onboarding's upsert.
+    """
+    __tablename__ = "referral_prospects"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    referring_subscriber_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("subscribers.id"), nullable=False, index=True
+    )
+    prospect_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    prospect_company: Mapped[Optional[str]] = mapped_column(String(120))
+    target_county_id: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "referring_subscriber_id", "target_county_id",
+            name="uq_referral_prospects_subscriber_county",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (f"<ReferralProspect(id={self.id}, "
+                f"referring_subscriber_id={self.referring_subscriber_id}, "
+                f"target_county_id={self.target_county_id!r})>")
 
 
 class NonBuyerNurtureSequence(Base):
@@ -6648,8 +6698,8 @@ class CloserCall(Base):
     Assist; objections/outcome/resolution/follow-ups from Claude via
     claude_router.call_claude), and the closer's per-call one-tap feedback.
 
-    Deliberately separate from `agent_decisions` (which is Cora-only): a closer
-    call is a human action, not a Cora Touch. See ADR
+    Deliberately separate from `agent_decisions` (which is Lifecycle-only): a closer
+    call is a human action, not a Lifecycle Touch. See ADR
     "closer-telemetry-separate-from-agent-decisions".
     """
     __tablename__ = "closer_calls"
@@ -7407,10 +7457,10 @@ class FreeToPaidAttribution(Base):
 
 
 # ============================================================================
-# A6 — Closer-to-Cora Teaching Interface (Sprint A6)
+# A6 — Closer-to-Lifecycle Teaching Interface (Sprint A6)
 # ============================================================================
 
-class CoraTrainingOverride(Base):
+class LifecycleTrainingOverride(Base):
     """
     Human corrections from the Closer Cockpit Teach action (A6) and future
     feedback rituals (4.3).  Serves two purposes simultaneously:
@@ -7422,7 +7472,7 @@ class CoraTrainingOverride(Base):
     See ADR 0006 (dampener = gate-reuse, not multiplier) and ADR 0007 (shared
     polymorphic schema, row-as-queue).
     """
-    __tablename__ = "cora_training_overrides"
+    __tablename__ = "lifecycle_training_overrides"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
 
@@ -7473,14 +7523,14 @@ class CoraTrainingOverride(Base):
     __table_args__ = (
         # Hot-path read: engine fetches active corrections per property at score time.
         Index(
-            "idx_cora_overrides_subject_active",
+            "idx_lifecycle_overrides_subject_active",
             "subject_type", "subject_ref", "dampener_active",
         ),
         # Queue consumer reads pending rows.
-        Index("idx_cora_overrides_queue_status", "queue_status"),
+        Index("idx_lifecycle_overrides_queue_status", "queue_status"),
         # A6 duplicate protection: one active property correction per reason/signal.
         Index(
-            "uq_cora_override_active",
+            "uq_lifecycle_override_active",
             "subject_ref",
             "correction_reason",
             text("COALESCE(signal_type, '')"),
@@ -7489,9 +7539,9 @@ class CoraTrainingOverride(Base):
                 "dampener_active AND subject_type = 'property' AND correction_reason IS NOT NULL"
             ),
         ),
-        # 4.3 duplicate protection: one queue row per reviewed Cora Touch.
+        # 4.3 duplicate protection: one queue row per reviewed Lifecycle Touch.
         Index(
-            "uq_cora_feedback_ritual_subject",
+            "uq_lifecycle_feedback_ritual_subject",
             "subject_type",
             "subject_ref",
             unique=True,
@@ -7499,21 +7549,21 @@ class CoraTrainingOverride(Base):
         ),
         CheckConstraint(
             "source IN ('closer_teach', 'feedback_ritual')",
-            name="ck_cora_overrides_source",
+            name="ck_lifecycle_overrides_source",
         ),
         CheckConstraint(
             "queue_status IN ('pending', 'exported', 'discarded')",
-            name="ck_cora_overrides_queue_status",
+            name="ck_lifecycle_overrides_queue_status",
         ),
         CheckConstraint(
             "review_outcome IS NULL OR review_outcome IN ('approved', 'needs_correction', 'discarded')",
-            name="ck_cora_overrides_review_outcome",
+            name="ck_lifecycle_overrides_review_outcome",
         ),
     )
 
     def __repr__(self) -> str:
         return (
-            f"<CoraTrainingOverride(id={self.id}, subject={self.subject_type}:{self.subject_ref}, "
+            f"<LifecycleTrainingOverride(id={self.id}, subject={self.subject_type}:{self.subject_ref}, "
             f"reason={self.correction_reason}, active={self.dampener_active}, "
             f"queue={self.queue_status})>"
         )
@@ -8234,7 +8284,7 @@ class BuyerEntity(Base):
     confidence_score is 0-100 (not the 0.000-1.000 scale used by
     Deed.match_confidence) — matches Hunter's constitution wording verbatim
     ("confidence-scored 0-100", "<70 confidence = UNVERIFIED"). Entities below
-    the UNVERIFIED threshold must never surface in a Cora draft.
+    the UNVERIFIED threshold must never surface in a Lifecycle draft.
 
     IDs are stable across nightly re-runs by design — the resolver matches new
     deed/owner activity against existing rows here first and only creates a

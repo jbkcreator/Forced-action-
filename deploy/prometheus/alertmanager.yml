@@ -1,6 +1,6 @@
 global:
   resolve_timeout: 5m
-  # Slack fallback (matches existing cora_incident_slack_channel pattern)
+  # Slack fallback (matches existing lifecycle_incident_slack_channel pattern)
   slack_api_url: "https://hooks.slack.com/services/REPLACE_ME"
 
 route:
@@ -8,14 +8,14 @@ route:
   group_wait: 30s
   group_interval: 5m
   repeat_interval: 4h       # matches alert_cooldown_hours in settings.py
-  receiver: "cora_webhook"
+  receiver: "lifecycle_webhook"
 
   routes:
     # Critical alerts (first_payment_rate) fire immediately — no group wait
     - match:
         severity: critical
       group_wait: 0s
-      receiver: "cora_webhook_critical"
+      receiver: "lifecycle_webhook_critical"
 
     # Info-level alerts only go to Slack, not the auto-action webhook
     - match:
@@ -24,7 +24,7 @@ route:
 
 receivers:
   # Primary: POST to FastAPI alert webhook (triggers auto-pause/promote)
-  - name: "cora_webhook"
+  - name: "lifecycle_webhook"
     webhook_configs:
       - url: "http://localhost:8000/webhooks/alerts/prometheus"
         send_resolved: false
@@ -34,7 +34,7 @@ receivers:
         max_alerts: 10
 
   # Critical path: same webhook, zero retries (fire-and-forget with instant dispatch)
-  - name: "cora_webhook_critical"
+  - name: "lifecycle_webhook_critical"
     webhook_configs:
       - url: "http://localhost:8000/webhooks/alerts/prometheus"
         send_resolved: false
@@ -44,14 +44,14 @@ receivers:
         max_alerts: 5
     # Also send to Slack for human visibility
     slack_configs:
-      - channel: "#cora-incidents"
+      - channel: "#lifecycle-incidents"
         title: "CRITICAL: {{ .CommonAnnotations.summary }}"
         text: "{{ .CommonAnnotations.description }}"
 
   # Info / stale-sends: Slack only, no auto-action
   - name: "slack_only"
     slack_configs:
-      - channel: "#cora-incidents"
+      - channel: "#lifecycle-incidents"
         title: "{{ .CommonAnnotations.summary }}"
         text: "{{ .CommonAnnotations.description }}"
 

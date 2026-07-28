@@ -170,7 +170,7 @@ class TestClassifyMatch:
         assert pinellas_loader._classify_match(74, "owner_name") == "pending_review"
         assert pinellas_loader._classify_match(75, "owner_name_zip") == "matched"
         assert pinellas_loader._classify_match(75, "owner_name_city") == "matched"
-        # 65–75 owner-name band is still pending_review (Cora triage)
+        # 65–75 owner-name band is still pending_review (Lifecycle triage)
         assert pinellas_loader._classify_match(70, "owner_name") == "pending_review"
 
     def test_pinellas_address_auto_match_unchanged(self, pinellas_loader):

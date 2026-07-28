@@ -26,7 +26,7 @@ route (where blocking I/O would stall the event loop for other requests).
 Deliberately bypasses src.services.sms_compliance's quiet-hours/DNC gate: this
 is a self-notification to the operator's own verified number about his own
 business event, not a TCPA-regulated consumer message, and the task requires
-firing at any hour. src.tasks.revenue_pulse / cora_anomaly_check use the
+firing at any hour. src.tasks.revenue_pulse / lifecycle_anomaly_check use the
 compliant path instead — that's the right tradeoff for their routine digests,
 not for this same-moment alert.
 

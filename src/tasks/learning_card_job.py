@@ -1,7 +1,7 @@
 """
 Learning Card Job — Sunday midnight cron.
 
-Generates weekly performance summary cards for Cora's decision context.
+Generates weekly performance summary cards for Lifecycle's decision context.
 Cron: 0 0 * * 0 (Sunday midnight UTC)
 
 Usage:
@@ -198,7 +198,7 @@ def _upsert_card(
 
 
 def _prime_cache(card: LearningCard) -> None:
-    """Write-through so Cora's next read hits Redis, not Postgres."""
+    """Write-through so Lifecycle's next read hits Redis, not Postgres."""
     from src.core.redis_client import rset
 
     payload = {

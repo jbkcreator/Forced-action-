@@ -1,6 +1,6 @@
-# LangGraph Architecture — Cora's Runtime
+# LangGraph Architecture — Lifecycle's Runtime
 
-**Purpose:** Detailed architecture for Cora's LangGraph layer. This is the "how" document. Preceded by `LANGGRAPH-PLATFORM-ROLE.md` (the "what"). Informed by `2B-V9-ORIENTATION.md` (the spec) and `client 2b report.md` (current state).
+**Purpose:** Detailed architecture for Lifecycle's LangGraph layer. This is the "how" document. Preceded by `LANGGRAPH-PLATFORM-ROLE.md` (the "what"). Informed by `2B-V9-ORIENTATION.md` (the spec) and `client 2b report.md` (current state).
 
 **Status — as-built (synced to `src/agents/`).** The original launch plan in this doc was implemented and has since grown. Current runtime: **10 graphs** (not 5), **Telnyx** for SMS (not Twilio), and post-launch self-healing / playbook / autonomy layers (see §12.3). Part 16 is the original week-by-week build plan, retained for history.
 
@@ -77,7 +77,7 @@ Monorepo. Agents live under `src/agents/`. Existing `src/` code (API, services, 
 
 ```
 src/
-├── agents/                        # Cora's runtime — new
+├── agents/                        # Lifecycle's runtime — new
 │   ├── __init__.py
 │   ├── supervisor.py              # Entry point: python -m src.agents.supervisor
 │   ├── router.py                  # Event → subgraph routing table
@@ -180,7 +180,7 @@ config/settings.py         config/agents.py
 - `STRIPE_SECRET_KEY`
 - `TELNYX_API_KEY`, `TELNYX_MESSAGING_PROFILE_ID`, `TELNYX_FROM_NUMBER` (SMS; migrated off Twilio 2026-05)
 - `SYNTHFLOW_API_KEY` (for outbound voice drop)
-- All Cora guardrail config (already loaded as config)
+- All Lifecycle guardrail config (already loaded as config)
 - All Stripe price IDs
 - `APP_BASE_URL` (for links in SMS)
 
@@ -212,10 +212,10 @@ The agents process **refuses to start** if any of its required keys are missing 
 
 ### 4.1 Graph State
 
-All graphs use a shared base state (`CoraState`) with optional extension fields per graph. This is a TypedDict, enforced at type-check time.
+All graphs use a shared base state (`LifecycleState`) with optional extension fields per graph. This is a TypedDict, enforced at type-check time.
 
 ```python
-class CoraState(TypedDict):
+class LifecycleState(TypedDict):
     # Identifiers
     decision_id: str              # UUID, primary key in audit log
     subscriber_id: int
@@ -252,7 +252,7 @@ class CoraState(TypedDict):
     failure_reason: str | None
 ```
 
-Each graph extends this with its own fields as needed — `FOMOState(CoraState)` adds `competitor_event_id` and `next_best_subscriber_id`, for instance.
+Each graph extends this with its own fields as needed — `FOMOState(LifecycleState)` adds `competitor_event_id` and `next_best_subscriber_id`, for instance.
 
 ### 4.2 Tool Registry
 
@@ -266,7 +266,7 @@ def tool(
     idempotent: bool,
     requires_compliance: bool = False,
 ):
-    """Register a function as a Cora tool."""
+    """Register a function as a Lifecycle tool."""
     ...
 
 # src/agents/tools/write_tools.py
@@ -318,8 +318,8 @@ Admin API ──────┘                                        Route to 
 
 | Source | Transport | Example event | Latency budget |
 |---|---|---|---|
-| Redis Pub/Sub | Redis channel `cora:events` | `competitor_acted_on_lead` | <100ms to supervisor |
-| Postgres LISTEN/NOTIFY | Channel `cora_events` | `subscriber_crossed_lock_threshold` | <500ms |
+| Redis Pub/Sub | Redis channel `lifecycle:events` | `competitor_acted_on_lead` | <100ms to supervisor |
+| Postgres LISTEN/NOTIFY | Channel `lifecycle_events` | `subscriber_crossed_lock_threshold` | <500ms |
 | Cron (APScheduler in-process) | Timer | `retention_summary_weekly_wallet` | Not latency-sensitive |
 | Admin API (FastAPI → DB) | DB poll every 10s | `manual_override_run_save_flow` | <10s |
 
@@ -456,7 +456,7 @@ Two layers is intentional. The graph check is fast and composable. The tool chec
 
 ### 9.2 Audit Log
 
-Separate from checkpoints, the agents layer writes an **agent audit log** to Postgres with one row per decision — not per node. This is the table a human reads to answer "why did Cora do X for user Y."
+Separate from checkpoints, the agents layer writes an **agent audit log** to Postgres with one row per decision — not per node. This is the table a human reads to answer "why did Lifecycle do X for user Y."
 
 ```
 agent_decisions:
@@ -488,7 +488,7 @@ Every graph takes an `idempotency_key` in its input event. Before starting a new
 |---|---|---|
 | Trace | LangSmith | "Walk me through this one decision" |
 | Metrics | Prometheus + Grafana | "How is the system doing this hour" |
-| Audit | `agent_decisions` table | "Why did Cora do X for user Y two weeks ago" |
+| Audit | `agent_decisions` table | "Why did Lifecycle do X for user Y two weeks ago" |
 
 ### 10.2 LangSmith Traces
 
@@ -502,22 +502,22 @@ Exposed by the agents container on an internal port, scraped alongside the API c
 
 | Metric | Type | Labels |
 |---|---|---|
-| `cora_graph_started_total` | counter | `graph` |
-| `cora_graph_completed_total` | counter | `graph`, `terminal_status` |
-| `cora_graph_duration_seconds` | histogram | `graph` |
-| `cora_graph_tokens_used` | histogram | `graph`, `model` |
-| `cora_graph_cost_usd` | histogram | `graph` |
-| `cora_tool_calls_total` | counter | `tool`, `success` |
-| `cora_compliance_blocks_total` | counter | `reason` |
-| `cora_guardrail_blocks_total` | counter | `decision_type`, `reason` |
-| `cora_kill_switch_fallbacks_total` | counter | `graph` |
-| `cora_budget_circuit_breaker_fires_total` | counter | `graph` |
+| `lifecycle_graph_started_total` | counter | `graph` |
+| `lifecycle_graph_completed_total` | counter | `graph`, `terminal_status` |
+| `lifecycle_graph_duration_seconds` | histogram | `graph` |
+| `lifecycle_graph_tokens_used` | histogram | `graph`, `model` |
+| `lifecycle_graph_cost_usd` | histogram | `graph` |
+| `lifecycle_tool_calls_total` | counter | `tool`, `success` |
+| `lifecycle_compliance_blocks_total` | counter | `reason` |
+| `lifecycle_guardrail_blocks_total` | counter | `decision_type`, `reason` |
+| `lifecycle_kill_switch_fallbacks_total` | counter | `graph` |
+| `lifecycle_budget_circuit_breaker_fires_total` | counter | `graph` |
 
 **Alerts:**
 
-- `cora_budget_circuit_breaker_fires_total > 0 over 5 min` → page
-- `cora_graph_completed_total{terminal_status="failed"} / cora_graph_started_total > 5%` → warn
-- `cora_compliance_blocks_total{reason="no_opt_in"} > 10/hr` → warn (possible logic bug firing SMS at unconsented users)
+- `lifecycle_budget_circuit_breaker_fires_total > 0 over 5 min` → page
+- `lifecycle_graph_completed_total{terminal_status="failed"} / lifecycle_graph_started_total > 5%` → warn
+- `lifecycle_compliance_blocks_total{reason="no_opt_in"} > 10/hr` → warn (possible logic bug firing SMS at unconsented users)
 
 ---
 
@@ -561,7 +561,7 @@ Three levels, all readable at runtime:
 |---|---|---|
 | Global | `AGENTS_GLOBAL_KILL_SWITCH=true` | Supervisor stops routing any events — agents container idles |
 | Per-graph | `AGENTS_GRAPHS_ENABLED=<list>` | Supervisor drops events for disabled graphs |
-| Per-feature | Existing Cora guardrail kill-switch (per feature, per color) | Graph reads color and falls back to simpler path |
+| Per-feature | Existing Lifecycle guardrail kill-switch (per feature, per color) | Graph reads color and falls back to simpler path |
 
 ### 12.2 Budget Circuit Breaker
 
@@ -585,7 +585,7 @@ Both processes write to the same tables. Clear ownership prevents races and sile
 |---|---|---|---|
 | `subscribers` | Profile changes, preferences, tier on explicit user action | Tier changes on autonomous upgrade | **Mixed** — lock columns by convention. API owns identity columns; agents own tier, segment, flags set by autonomous decisions. |
 | `wallet_transactions` | Every purchase, every Stripe webhook | Auto-reload, bonus credits, referral reward | Mixed — all writes are append-only, so races are benign |
-| `message_outcomes` | — | Every outbound message Cora sends | **Agents** |
+| `message_outcomes` | — | Every outbound message Lifecycle sends | **Agents** |
 | `deal_outcomes` | User-submitted deal captures | — | **API** |
 | `learning_cards` | — | Sunday cron (runs inside agents process) | **Agents** |
 | `referral_events` | New referral on signup | Mark confirmed/rewarded on paid conversion | Mixed — distinct lifecycle states, no overlap |
@@ -689,7 +689,7 @@ Ordered steps to get from current state to Phase 2B LangGraph launch.
 5. Eval suite with real Claude, gated on staging
 
 ### Week 4: Additional Graphs + Hardening
-1. Build Cora Conversational Lock Close graph (the one Sonnet graph)
+1. Build Lifecycle Conversational Lock Close graph (the one Sonnet graph)
 2. Build Auto Mode Execution graph
 3. Failure-mode drills in staging (kill Redis, kill Postgres, fire bad prompts)
 4. Dry-run all graphs for 48 hours in staging with production data

@@ -105,7 +105,7 @@ def get_lead_pool(
     Return scored leads available in a ZIP.
     Delegates to read_tools.get_lead_pool — same query, same return shape.
 
-    Pass exclude_trade + county_id to apply cross-trade exclusivity (so Cora
+    Pass exclude_trade + county_id to apply cross-trade exclusivity (so Lifecycle
     upsell paths never surface a lead already sold to another trade).
     """
     from src.agents.tools.read_tools import get_lead_pool as _get_lead_pool

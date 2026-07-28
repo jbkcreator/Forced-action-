@@ -1,4 +1,4 @@
-"""Tool registry and tool implementations for Cora graphs."""
+"""Tool registry and tool implementations for Lifecycle graphs."""
 
 from src.agents.tools.registry import (
 	TOOL_REGISTRY,

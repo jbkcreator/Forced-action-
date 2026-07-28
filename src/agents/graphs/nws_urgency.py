@@ -20,7 +20,7 @@ Flow (5 nodes — mirrors fomo.py):
     2. hierarchy_check       — shared decision_hierarchy subgraph
     3. build_compose_context — render prompt templates
     4. compose_and_send      — shared compose_and_send subgraph
-    5. finalize              — agent_decisions log + mark nws_alerts.cora_urgency_sent
+    5. finalize              — agent_decisions log + mark nws_alerts.lifecycle_urgency_sent
 """
 
 from __future__ import annotations
@@ -217,7 +217,7 @@ def _node_finalize(state: NWSUrgencyState) -> NWSUrgencyState:
         except Exception:
             pass
 
-    # Mark nws_alerts.cora_urgency_sent + log URGENCY_MESSAGE_SENT
+    # Mark nws_alerts.lifecycle_urgency_sent + log URGENCY_MESSAGE_SENT
     if state.get("sent"):
         payload = state.get("event_payload") or {}
         alert_id = payload.get("alert_id")
@@ -231,7 +231,7 @@ def _node_finalize(state: NWSUrgencyState) -> NWSUrgencyState:
                     db.execute(
                         update(NWSAlert)
                         .where(NWSAlert.alert_id == alert_id)
-                        .values(cora_urgency_sent=True)
+                        .values(lifecycle_urgency_sent=True)
                     )
                     _log_event(db, "URGENCY_MESSAGE_SENT", {
                         "alert_id": alert_id,

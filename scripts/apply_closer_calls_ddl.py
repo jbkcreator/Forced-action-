@@ -1,7 +1,7 @@
 """Apply fa080 — closer_calls table (Closer Cockpit, Sprint S1b).
 
 Creates the closer_calls table that backs Aircall call capture + tagging +
-per-call closer feedback. Deliberately separate from agent_decisions (Cora-only).
+per-call closer feedback. Deliberately separate from agent_decisions (Lifecycle-only).
 See CLOSER_COCKPIT_BACKEND_DESIGN.md.
 
 Idempotent (IF NOT EXISTS throughout). Alembic CLI is unusable on this repo's

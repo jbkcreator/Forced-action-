@@ -67,7 +67,7 @@ _PDL_SRC       = "src.services.pdl_skip_trace.run_pdl_lookup"
 _IDI_SRC       = "src.services.idi_fallback.run_idi_fallback"
 _DIRECTMAIL_SRC = "src.services.direct_mail.flag_direct_mail_eligible"
 _RUN_CASCADE_SRC = "src.services.skip_trace_waterfall.run_cascade"
-_PUBLISH_SRC   = "src.agents.events.ingestion.publish_cora_event"
+_PUBLISH_SRC   = "src.agents.events.ingestion.publish_lifecycle_event"
 _GATE_SRC      = "src.services.enrichment_router.is_paid_enrichment_allowed"
 
 _PHONE_META = {"phone_1": {"score": 85, "reachable": True, "type": "mobile"}}

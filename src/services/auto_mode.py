@@ -2,7 +2,7 @@
 Auto Mode — Stage 5.
 
 When a wallet subscriber's `auto_mode_enabled` flag is on (or they're on a
-Growth/Power tier where Auto Mode is included), Cora performs three actions
+Growth/Power tier where Auto Mode is included), Lifecycle performs three actions
 on every newly delivered lead:
 
   1. Auto skip-trace the property owner (so a phone number exists)

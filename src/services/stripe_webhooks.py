@@ -160,6 +160,30 @@ def _fire_capi_for_pi(payment_intent, subscriber, source: str, event_id: str, db
         logger.warning("Meta CAPI %s purchase failed — non-fatal", source, exc_info=True)
 
 
+def _mark_sold_out_losers_for(locked_zips: list) -> None:
+    """Run mark_sold_out_losers for each (zip, vertical, county) tuple a
+    checkout locked — called only after the checkout's own transaction has
+    durably committed (see handle_webhook / _on_checkout_completed).
+
+    mark_sold_out_losers uses its own committing session and is a no-op when
+    there's nothing to mark, so this is safe to call for every ZIP regardless
+    of whether it ever had a waitlist. Non-fatal — a paying checkout must
+    never fail because post-commit waitlist bookkeeping errored.
+    """
+    if not locked_zips:
+        return
+    from src.tasks.sold_out_reactivation import mark_sold_out_losers
+    for zip_code, vertical, county_id in locked_zips:
+        try:
+            mark_sold_out_losers(zip_code, vertical, county_id)
+        except Exception:
+            logger.error(
+                "checkout.session.completed: mark_sold_out_losers failed for "
+                "%s/%s/%s — non-fatal, continuing", zip_code, vertical, county_id,
+                exc_info=True,
+            )
+
+
 def handle_webhook(raw_body: bytes, sig_header: str, db: Session, background_tasks=None) -> tuple[bool, str]:
     """
     Verify and dispatch a Stripe webhook event.
@@ -293,9 +317,10 @@ def handle_webhook(raw_body: bytes, sig_header: str, db: Session, background_tas
         logger.debug("Unhandled Stripe event type: %s", event_type)
         return True, "Ignored"
 
+    locked_zips: list = []
     try:
         if handler is _on_checkout_completed:
-            handler(data, db, background_tasks=background_tasks)
+            handler(data, db, background_tasks=background_tasks, locked_zips_out=locked_zips)
         else:
             handler(data, db)
         # Plant the dedupe row in the SAME transaction as the handler writes,
@@ -312,7 +337,15 @@ def handle_webhook(raw_body: bytes, sig_header: str, db: Session, background_tas
                 "Stripe event %s dedupe insert lost the race — handler still ran successfully",
                 event_id,
             )
+            # The ZIP locks landed for real (via the listener that won the
+            # race) even though THIS transaction rolled back — safe to mark
+            # losers now, same as the clean-commit path below.
+            _mark_sold_out_losers_for(locked_zips)
             return True, "OK (lost dedupe race)"
+        # Only now — after this transaction (ZIP locks included) is durably
+        # committed — is it safe to permanently mark waitlist losers. See the
+        # comment in _on_checkout_completed for why this can't run earlier.
+        _mark_sold_out_losers_for(locked_zips)
         return True, "OK"
     except (OperationalError, SQLAlchemyError):
         db.rollback()
@@ -328,7 +361,10 @@ def handle_webhook(raw_body: bytes, sig_header: str, db: Session, background_tas
 # 1. checkout.session.completed
 # ---------------------------------------------------------------------------
 
-def _on_checkout_completed(session: dict, db: Session, background_tasks=None) -> None:
+def _on_checkout_completed(
+    session: dict, db: Session, background_tasks=None,
+    locked_zips_out: Optional[list] = None,
+) -> None:
     """
     FAST PATH — synchronous, runs inside the webhook request's transaction.
     Must stay short: this is what blocks Stripe's ack, and it's the only part
@@ -401,7 +437,7 @@ def _on_checkout_completed(session: dict, db: Session, background_tasks=None) ->
     failure in one could corrupt the others or the core upgrade. If retryable
     delivery for these side-effects is ever needed, that's a separate, bigger
     piece of work (a durable outbox table + periodic cron sweep, the same
-    shape as `cora_event_queue`'s 60s sweep) — deliberately out of scope here.
+    shape as `lifecycle_event_queue`'s 60s sweep) — deliberately out of scope here.
 
     Add-on products (auto_mode_addon, etc.) short-circuit at the top — they
     don't create a Subscriber row, they activate an entitlement flag on an
@@ -887,6 +923,24 @@ def _on_checkout_completed(session: dict, db: Session, background_tasks=None) ->
             rdelete(f"zip_availability:{county_id}:{vertical}")
             _seen_pairs.add(_pair)
 
+    # Every locked ZIP may have contractors sitting on its sold_out waitlist
+    # from before this buyer claimed it. They were notified when a PRIOR
+    # holder's grace period lapsed and this ZIP briefly opened; now that it's
+    # locked again, mark those non-winners 'lost' so a future release doesn't
+    # re-notify a stale wave.
+    #
+    # mark_sold_out_losers commits its OWN session immediately — it must not
+    # run inside this still-uncommitted transaction. If this checkout later
+    # rolled back (e.g. a DB failure while committing the dedupe row in
+    # handle_webhook), the ZIP lock above would be undone but the waitlist
+    # rows would already be durably marked 'lost', permanently discarding a
+    # waitlist wave for a ZIP that's actually still available (PR #175 review).
+    # So we only collect which ZIPs were locked here; the caller
+    # (handle_webhook) runs mark_sold_out_losers after ITS commit succeeds.
+    if locked_zips_out is not None:
+        for _zip_code in zip_codes:
+            locked_zips_out.append((_zip_code, vertical, county_id))
+
     logger.info(
         "checkout.session.completed: fast path done — subscriber=%s tier=%s vertical=%s"
         " founding=%s zips=%s feed_uuid=%s (deferring GHL/email/CAPI/attribution work)",
@@ -1035,8 +1089,8 @@ def _checkout_completed_deferred(db: Session, subscriber, session: dict, is_new_
                         from src.services import wallet_engine
                         eligible = wallet_engine.accelerated_push_eligible(subscriber.id, db)
                         if eligible:
-                            from src.agents.events.ingestion import publish_cora_event
-                            publish_cora_event({
+                            from src.agents.events.ingestion import publish_lifecycle_event
+                            publish_lifecycle_event({
                                 "event_type": "accelerated_wallet_push_eligible",
                                 "subscriber_id": subscriber.id,
                                 "payload": eligible,
@@ -2908,12 +2962,12 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
     except Exception:
         logger.warning("Attribution recording failed sub=%s", subscriber.id, exc_info=True)
 
-    # Feed the purchase to Cora (D7) — last-touch nudge attribution is stamped
+    # Feed the purchase to Lifecycle (D7) — last-touch nudge attribution is stamped
     # by the supervisor's unlock_purchased branch, not here.
     try:
-        from src.agents.events.ingestion import publish_cora_event
+        from src.agents.events.ingestion import publish_lifecycle_event
         _amount_cents = _attr(payment_intent, "amount_received") or _attr(payment_intent, "amount")
-        publish_cora_event({
+        publish_lifecycle_event({
             "event_type": "unlock_purchased",
             "subscriber_id": subscriber.id,
             "payload": {
@@ -2924,7 +2978,7 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
             },
         })
     except Exception:
-        logger.warning("lead_unlock: publish_cora_event failed sub=%s", subscriber.id, exc_info=True)
+        logger.warning("lead_unlock: publish_lifecycle_event failed sub=%s", subscriber.id, exc_info=True)
 
     _fire_capi_for_pi(
         payment_intent, subscriber, "lead_unlock",
@@ -3084,14 +3138,14 @@ def _on_card_saved(payment_intent, db: Session) -> None:
             except Exception:
                 pass
             try:
-                from src.agents.events.ingestion import publish_cora_event
-                publish_cora_event({
+                from src.agents.events.ingestion import publish_lifecycle_event
+                publish_lifecycle_event({
                     "event_type": "accelerated_wallet_push_eligible",
                     "subscriber_id": subscriber.id,
                     "payload": eligible,
                 })
             except Exception as _pub_exc:
-                logger.warning("publish_cora_event failed sub=%s: %s", subscriber.id, _pub_exc)
+                logger.warning("publish_lifecycle_event failed sub=%s: %s", subscriber.id, _pub_exc)
     except Exception as exc:
         logger.warning("accelerated_wallet_push from _on_card_saved failed sub=%s: %s",
                        subscriber.id, exc)
@@ -3184,14 +3238,14 @@ def _on_payment_method_attached(pm: dict, db: Session) -> None:
             except Exception:
                 pass
             try:
-                from src.agents.events.ingestion import publish_cora_event
-                publish_cora_event({
+                from src.agents.events.ingestion import publish_lifecycle_event
+                publish_lifecycle_event({
                     "event_type": "accelerated_wallet_push_eligible",
                     "subscriber_id": subscriber.id,
                     "payload": eligible,
                 })
             except Exception as _pub_exc:
-                logger.warning("publish_cora_event failed sub=%s: %s", subscriber.id, _pub_exc)
+                logger.warning("publish_lifecycle_event failed sub=%s: %s", subscriber.id, _pub_exc)
     except Exception as exc:
         logger.warning("accelerated_wallet_push from pm.attached failed sub=%s: %s",
                        subscriber.id, exc)
@@ -3388,7 +3442,7 @@ def _on_premium_payment(payment_intent, db: Session) -> None:
     # check silently fails on the "paid intent" gate. Run it again here so a
     # premium purchase with a freshly saved card reliably dispatches.
     try:
-        from src.agents.events.ingestion import publish_cora_event
+        from src.agents.events.ingestion import publish_lifecycle_event
         from src.services import wallet_engine
         eligible = wallet_engine.accelerated_push_eligible(subscriber_id, db)
         if eligible:
@@ -3404,8 +3458,8 @@ def _on_premium_payment(payment_intent, db: Session) -> None:
                 )
             except Exception:
                 pass
-            from src.agents.events.ingestion import publish_cora_event
-            publish_cora_event({
+            from src.agents.events.ingestion import publish_lifecycle_event
+            publish_lifecycle_event({
                 "event_type": "accelerated_wallet_push_eligible",
                 "subscriber_id": subscriber_id,
                 "payload": eligible,
@@ -3430,8 +3484,8 @@ def _on_premium_payment(payment_intent, db: Session) -> None:
                 )
             except Exception:
                 pass
-            from src.agents.events.ingestion import publish_cora_event
-            publish_cora_event({
+            from src.agents.events.ingestion import publish_lifecycle_event
+            publish_lifecycle_event({
                 "event_type": "accelerated_wallet_push_eligible",
                 "subscriber_id": subscriber_id,
                 "payload": eligible,
@@ -3745,7 +3799,7 @@ def _on_wallet_subscription_invoice(invoice: dict, db: Session) -> None:
             subscription_id,
         )
 
-    # Transactional confirmation SMS (bypasses Cora — not marketing)
+    # Transactional confirmation SMS (bypasses Lifecycle — not marketing)
     try:
         from src.services.sms_compliance import send_sms as _send_sms
         if sub.phone:
@@ -3800,7 +3854,7 @@ def _on_wallet_subscription_invoice(invoice: dict, db: Session) -> None:
 
     # Task 4.1 frozen control holdout — wallet activation is the conversion
     # event for the accelerated_wallet_push sequence. Test name matches the
-    # key in config/cora_holdout_tests.yaml; no-op for subscribers never
+    # key in config/lifecycle_holdout_tests.yaml; no-op for subscribers never
     # assigned an arm.
     from src.services.ab_engine import record_holdout_conversion
     record_holdout_conversion(subscriber_id, "wallet_push_holdout", db)
@@ -4406,8 +4460,8 @@ def _on_lead_pack_payment(payment_intent: dict, db: Session) -> None:
         # rather than waiting for the next cron tick. Best-effort — if the bus is
         # down the lead_pack_fulfillment_sweep cron picks it up within ~2 min.
         try:
-            from src.agents.events.ingestion import publish_cora_event
-            publish_cora_event({
+            from src.agents.events.ingestion import publish_lifecycle_event
+            publish_lifecycle_event({
                 "event_type": "lead_pack_reserved",
                 "subscriber_id": subscriber.id,
                 "payload": {"purchase_id": purchase.id},
@@ -4640,7 +4694,7 @@ def _on_checkout_expired(session: dict, db: Session) -> None:
     """
     Fires when a Stripe checkout session expires without payment.
     For hot_lead_unlock sessions opened by free-tier subscribers, publish
-    abandonment_click_no_complete to Cora so the retention flow can trigger.
+    abandonment_click_no_complete to Lifecycle so the retention flow can trigger.
     For every other expired session with a captured email, start the
     abandoned-checkout recovery sequence (Task 7). Recovery holds the contact
     out of the slower non-buyer nurture drip until it fails, so the two never
@@ -4667,8 +4721,8 @@ def _on_checkout_expired(session: dict, db: Session) -> None:
     lead_id = meta.get("lead_id", "")
 
     try:
-        from src.agents.events.ingestion import publish_cora_event
-        publish_cora_event({
+        from src.agents.events.ingestion import publish_lifecycle_event
+        publish_lifecycle_event({
             "event_type": "abandonment_click_no_complete",
             "subscriber_id": subscriber_id,
             "payload": {

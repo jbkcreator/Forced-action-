@@ -2,7 +2,7 @@
 Stage A — tier_visibility stopgap.
 
 Pinellas tier labels are hidden from subscriber-facing surfaces (feed API,
-GHL contact custom fields/tags, Cora SMS prompts) until the cross-county
+GHL contact custom fields/tags, Lifecycle SMS prompts) until the cross-county
 calibration retune lands. These tests pin the suppression contract so a
 future config edit can't silently re-expose the broken labels.
 """
@@ -179,10 +179,10 @@ class TestGHLTierSuppression:
 
 
 # ---------------------------------------------------------------------------
-# Cora prompt context — tier_visibility suppression
+# Lifecycle prompt context — tier_visibility suppression
 # ---------------------------------------------------------------------------
 
-class TestCoraFOMOTierSuppression:
+class TestLifecycleFOMOTierSuppression:
 
     def _fomo_state(self, county_id, lead_tier="Ultra Platinum"):
         return {
@@ -234,7 +234,7 @@ class TestCoraFOMOTierSuppression:
         assert _TIER_SUPPRESSED_PHRASE in ctx["competitor_signal"]
 
 
-class TestCoraAbandonmentTierSuppression:
+class TestLifecycleAbandonmentTierSuppression:
 
     def _w2_state(self, county_id, lead_tier_viewed="Gold"):
         return {

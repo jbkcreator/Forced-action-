@@ -272,7 +272,7 @@ tbody td { padding: 3.5px 6px; color: #334155; }
       All <strong>{{ demo_active_total }} active subscriber{{ '' if demo_active_total == 1 else 's' }}</strong>
       shown are non-production (dev/seed) records &mdash; so every
       <strong>subscriber, revenue (MRR / LTV / churn / trial), cohort, engagement</strong> and
-      <strong>Cora autonomy</strong> figure below is demo data for layout/QA only
+      <strong>Lifecycle autonomy</strong> figure below is demo data for layout/QA only
       ({{ demo_subscriber_count }} added by <code>seed_demo_metrics.py</code>).
       Do not treat as real performance.
     </div>
@@ -899,10 +899,10 @@ tbody td { padding: 3.5px 6px; color: #334155; }
 </div>
 
 
-<!-- =============================== S8: CORA SYSTEM STATUS =============================== -->
+<!-- =============================== S8: LIFECYCLE SYSTEM STATUS =============================== -->
 <div class="section">
-  <h2>8 &mdash; Cora System Status{% if demo_data_active %}<span class="test-inline">AUTONOMY = TEST DATA</span>{% endif %}</h2>
-  {% set cm = cora_metrics %}
+  <h2>8 &mdash; Lifecycle System Status{% if demo_data_active %}<span class="test-inline">AUTONOMY = TEST DATA</span>{% endif %}</h2>
+  {% set cm = lifecycle_metrics %}
   <div class="kpi-grid g5" style="margin-bottom:9px;">
     <div class="kpi kpi-blue">
       <div class="val">{{ cm.autonomy_pct }}</div>
@@ -967,7 +967,7 @@ tbody td { padding: 3.5px 6px; color: #334155; }
   </div>
 
   <hr class="divider"/>
-  <h3>Cora Decisions - Today by Graph</h3>
+  <h3>Lifecycle Decisions - Today by Graph</h3>
   {% if cm.decision_stats %}
   <table>
     <thead><tr>
@@ -991,7 +991,7 @@ tbody td { padding: 3.5px 6px; color: #334155; }
     </tbody>
   </table>
   {% else %}
-  <div class="na" style="font-size:8.5px; padding:5px 0;">No Cora decisions recorded today</div>
+  <div class="na" style="font-size:8.5px; padding:5px 0;">No Lifecycle decisions recorded today</div>
   {% endif %}
 </div>
 
@@ -1014,13 +1014,13 @@ tbody td { padding: 3.5px 6px; color: #334155; }
       <td class="r">{{ inc.observed }}</td>
       <td class="r">{{ inc.threshold }}</td>
       <td style="font-size:7.5px;">{{ inc.action }}</td>
-      <td style="font-size:7.5px;">Cora</td>
+      <td style="font-size:7.5px;">Lifecycle</td>
     </tr>
     {% endfor %}
     </tbody>
   </table>
   {% else %}
-  <div class="alert-none">No open Cora incidents</div>
+  <div class="alert-none">No open Lifecycle incidents</div>
   {% endif %}
 
   {% set stale_signals = quality_signals | selectattr('health', 'ne', 'ok') | list %}

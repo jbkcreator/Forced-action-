@@ -32,7 +32,7 @@ ALLOWED_SIGNUP_SOURCES = frozenset({
 	"direct",
 	"landing_page",
 	"dbpr_email",
-	"cora_sms",
+	"lifecycle_sms",
 	"missed_call",
 	"referral",
 	"admin",
@@ -71,7 +71,7 @@ def _apply_signup_source(
 	- A freshly created Subscriber (signup_source unset OR 'direct'/'unknown')
 	  accepts whatever the caller provided.
 	- An existing Subscriber that already has a 'real' source (referral,
-	  dbpr_email, cora_sms, missed_call, landing_page) is NOT overwritten
+	  dbpr_email, lifecycle_sms, missed_call, landing_page) is NOT overwritten
 	  on a re-visit — first-touch attribution wins.
 	- utm_*/campaign_id/attribution_token are always backfilled when missing
 	  but never clobbered.

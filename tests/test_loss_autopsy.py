@@ -24,7 +24,7 @@ _TOOL_INPUT = {
     "primary_rejection_reason": "PRICING_TOO_HIGH",
     "competitor_rate_delta": 0.015,
     "underwriting_blocker": None,
-    "cora_behavior_adjustment": "Reduce price by 10% for Gold leads in Hillsborough.",
+    "lifecycle_behavior_adjustment": "Reduce price by 10% for Gold leads in Hillsborough.",
 }
 
 
@@ -52,7 +52,7 @@ def test_run_loss_autopsy_writes_row(db):
     assert result.primary_rejection_reason == "PRICING_TOO_HIGH"
     assert float(result.competitor_rate_delta) == pytest.approx(0.015)
     assert result.underwriting_blocker is None
-    assert "Reduce price" in result.cora_behavior_adjustment
+    assert "Reduce price" in result.lifecycle_behavior_adjustment
     db.add.assert_called_once_with(result)
     db.flush.assert_called_once()
 

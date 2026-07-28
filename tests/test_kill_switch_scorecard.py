@@ -11,7 +11,7 @@ import pytest
 def _make_settings(source="hillsborough", self_healing=True):
     s = MagicMock()
     s.county_launch_source_county = source
-    s.cora_self_healing_enabled = self_healing
+    s.lifecycle_self_healing_enabled = self_healing
     return s
 
 
@@ -334,7 +334,7 @@ class TestAlarmLine:
         )
         # Return each metric's exact green threshold — green for both
         # higher_is_better (>=green) AND lower_is_better (<=green) directions.
-        from config.cora_guardrails import KILL_SWITCH
+        from config.lifecycle_guardrails import KILL_SWITCH
 
         def green_value(metric, county_id=None):
             cfg = KILL_SWITCH.get(metric)

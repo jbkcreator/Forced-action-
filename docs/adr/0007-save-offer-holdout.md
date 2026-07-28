@@ -41,4 +41,4 @@ of an unfalsifiable one.
   rows carry uncontaminated outcome labels.
 - Business sign-off recorded: withholding the offer from ~10% of at-risk
   subscribers is an accepted cost for clean measurement.
-- Pattern mirrors the Cora 10% shadow holdout (ADR 0005).
+- Pattern mirrors the Lifecycle 10% shadow holdout (ADR 0005).

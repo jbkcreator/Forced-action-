@@ -1,5 +1,5 @@
 """
-Tests for the 12 Cora read tools.
+Tests for the 12 Lifecycle read tools.
 
 These tests verify that each tool:
   - Is registered with category='read'

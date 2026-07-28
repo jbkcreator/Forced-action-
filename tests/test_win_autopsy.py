@@ -5,7 +5,7 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
-from src.core.models import CoraSuppression, DealOutcome, DistressScore, Owner, Property, Subscriber
+from src.core.models import LifecycleSuppression, DealOutcome, DistressScore, Owner, Property, Subscriber
 
 
 @pytest.fixture(scope="module")
@@ -42,7 +42,7 @@ def _mk_sub_and_prop(fresh_db):
 def _cleanup(fresh_db, sub, prop):
     from sqlalchemy import text
     fresh_db.execute(DealOutcome.__table__.delete().where(DealOutcome.subscriber_id == sub.id))
-    fresh_db.execute(CoraSuppression.__table__.delete().where(CoraSuppression.subscriber_id == sub.id))
+    fresh_db.execute(LifecycleSuppression.__table__.delete().where(LifecycleSuppression.subscriber_id == sub.id))
     fresh_db.execute(text("DELETE FROM referral_prompt_funnel WHERE subscriber_id = :sid"), {"sid": sub.id})
     fresh_db.delete(sub)
     fresh_db.delete(prop)

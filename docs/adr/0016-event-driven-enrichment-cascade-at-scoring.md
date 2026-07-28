@@ -3,9 +3,9 @@
 The enrichment skip-trace cascade runs as a standing, automated stage triggered
 when a property *enters* Gold+ at scoring time, rather than as the legacy daily
 batch (`run_enrichment.py` at 07:30). The scoring persist path publishes a
-`gold_lead_scored` event via `publish_cora_event` (durable: Redis + the
-`cora_event_queue` Postgres fallback); a dedicated enrichment consumer — **not**
-a Cora subscriber graph and **not** in `EVENT_TO_GRAPH` — drains events, batches
+`gold_lead_scored` event via `publish_lifecycle_event` (durable: Redis + the
+`lifecycle_event_queue` Postgres fallback); a dedicated enrichment consumer — **not**
+a Lifecycle subscriber graph and **not** in `EVENT_TO_GRAPH` — drains events, batches
 per provider, and runs the shared cascade function.
 
 ## Considered Options

@@ -4,7 +4,7 @@ NWS Revenue Alert Poller — autonomous 5-minute poll of api.weather.gov.
 Replaces the manual-webhook dependency for the storm-pack revenue trigger.
 Fetches active alerts for all configured counties, delegates each alert to
 process_alert() (which owns idempotency, ZIP resolution, Redis flags, SMS, and
-logging), then dispatches Cora urgency messages for qualifying subscribers.
+logging), then dispatches Lifecycle urgency messages for qualifying subscribers.
 
 Usage:
     python -m src.tasks.nws_poll
@@ -70,18 +70,18 @@ def _fetch_alerts_for_zones(zone_ids: list) -> list:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Cora urgency dispatch
+# Lifecycle urgency dispatch
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _dispatch_cora_urgency(alert_id: str, event_type: str, headline: str,
+def _dispatch_lifecycle_urgency(alert_id: str, event_type: str, headline: str,
                             area_desc: str, expires: str, affected_zips: list,
                             db) -> int:
     """
     For each active subscriber with locked territories in affected ZIPs and
-    at least one Gold+ lead in those ZIPs, dispatch a Cora urgency message —
+    at least one Gold+ lead in those ZIPs, dispatch a Lifecycle urgency message —
     unless already sent for this alert+subscriber combination.
 
-    Returns number of Cora messages dispatched.
+    Returns number of Lifecycle messages dispatched.
     """
     from sqlalchemy import select, and_, func as sa_func
     from src.core.models import (
@@ -147,7 +147,7 @@ def _dispatch_cora_urgency(alert_id: str, event_type: str, headline: str,
             already_sent = None
 
         if already_sent:
-            logger.debug("[NWSPoll] Cora urgency already sent sub=%d alert=%s", sub.id, alert_id[:40])
+            logger.debug("[NWSPoll] Lifecycle urgency already sent sub=%d alert=%s", sub.id, alert_id[:40])
             continue
 
         payload = {
@@ -169,18 +169,18 @@ def _dispatch_cora_urgency(alert_id: str, event_type: str, headline: str,
             if (result or {}).get("terminal_status") == "completed":
                 dispatched += 1
                 logger.info(
-                    "[NWSPoll] Cora urgency dispatched: sub=%d, leads=%d, alert=%s",
+                    "[NWSPoll] Lifecycle urgency dispatched: sub=%d, leads=%d, alert=%s",
                     sub.id, lead_count, alert_id[:40],
                 )
             else:
                 logger.warning(
-                    "[NWSPoll] Cora urgency non-completed: sub=%d status=%s reason=%s",
+                    "[NWSPoll] Lifecycle urgency non-completed: sub=%d status=%s reason=%s",
                     sub.id,
                     (result or {}).get("terminal_status"),
                     (result or {}).get("failure_reason"),
                 )
         except Exception as e:
-            logger.warning("[NWSPoll] Cora urgency dispatch failed sub=%d: %s", sub.id, e)
+            logger.warning("[NWSPoll] Lifecycle urgency dispatch failed sub=%d: %s", sub.id, e)
 
     return dispatched
 
@@ -203,7 +203,7 @@ def run_nws_poll(county_id: str = "hillsborough", dry_run: bool = False) -> dict
         "duplicates_skipped": 0,
         "non_qualifying_skipped": 0,
         "errors": 0,
-        "cora_dispatched": 0,
+        "lifecycle_dispatched": 0,
     }
 
     if not settings.nws_weather_enabled:
@@ -267,15 +267,15 @@ def run_nws_poll(county_id: str = "hillsborough", dry_run: bool = False) -> dict
             elif status == "skipped":
                 stats["non_qualifying_skipped"] += 1
 
-    # Cora urgency dispatch — outside the main DB session to avoid long transactions
+    # Lifecycle urgency dispatch — outside the main DB session to avoid long transactions
     if (
         new_alert_ids
         and settings.nws_revenue_polling_enabled
-        and settings.nws_cora_urgency_enabled
+        and settings.nws_lifecycle_urgency_enabled
     ):
         with get_db_context() as db:
             for alert in new_alert_ids:
-                count = _dispatch_cora_urgency(
+                count = _dispatch_lifecycle_urgency(
                     alert_id=alert["alert_id"],
                     event_type=alert["event"],
                     headline=alert["headline"],
@@ -284,12 +284,12 @@ def run_nws_poll(county_id: str = "hillsborough", dry_run: bool = False) -> dict
                     affected_zips=alert["affected_zips"],
                     db=db,
                 )
-                stats["cora_dispatched"] += count
+                stats["lifecycle_dispatched"] += count
 
     logger.info(
-        "[NWSPoll] Complete — polled=%d new=%d dupe=%d skip=%d cora=%d errors=%d",
+        "[NWSPoll] Complete — polled=%d new=%d dupe=%d skip=%d lifecycle=%d errors=%d",
         stats["polled"], stats["new_alerts"], stats["duplicates_skipped"],
-        stats["non_qualifying_skipped"], stats["cora_dispatched"], stats["errors"],
+        stats["non_qualifying_skipped"], stats["lifecycle_dispatched"], stats["errors"],
     )
     return stats
 

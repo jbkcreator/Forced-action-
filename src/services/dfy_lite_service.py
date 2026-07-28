@@ -151,7 +151,7 @@ def create_pitch_order(
 ) -> DfyLiteOrder:
     """
     Authorize and insert a new DFY-Lite order with status Order_Received.
-    Pitch generation is delegated to the Cora dfy_lite_pitch graph via an event.
+    Pitch generation is delegated to the Lifecycle dfy_lite_pitch graph via an event.
 
     Raises:
         DfyLitePermissionError — subscriber lacks an authorization path.
@@ -181,7 +181,7 @@ def create_pitch_order(
         custom_instructions=request_options.get("custom_instructions"),
         pitch_generation_number=count + 1,
         pitch_generation_limit=MAX_GENERATIONS_PER_PAIR,
-        generated_by="cora",
+        generated_by="lifecycle",
         created_at=now,
         updated_at=now,
     )

@@ -19,7 +19,7 @@ PUBLIC_RECORD_INFERRED = "public_record_inferred"
 TIERS = frozenset(OUTCOME_CONFIDENCE_WEIGHTS)
 
 # The only sources that are NOT public-record inferred. Everything else — every
-# Cora Data Engine connector, plus any source we haven't seen — is inferred by
+# Lifecycle Data Engine connector, plus any source we haven't seen — is inferred by
 # nature, so the default is the lowest trust tier (safe, needs no edit per
 # connector).
 _SOURCE_TIERS = {

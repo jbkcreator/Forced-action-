@@ -34,7 +34,7 @@ with get_db_context() as db:
     print()
     print("--- NWS_ALERTS TABLE ---")
     alerts = db.execute(text(
-        "SELECT alert_id, event, storm_pack_triggered, cora_urgency_sent, "
+        "SELECT alert_id, event, storm_pack_triggered, lifecycle_urgency_sent, "
         "subscriber_count, processed_at FROM nws_alerts ORDER BY processed_at DESC LIMIT 5"
     )).fetchall()
     if not alerts:

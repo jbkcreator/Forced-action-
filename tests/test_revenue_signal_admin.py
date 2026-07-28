@@ -1,7 +1,7 @@
 """
 fa037 — HTTP-layer tests for GET /api/admin/subscribers/{id}/revenue-signal.
 
-Mirrors the pattern in tests/test_cora_autonomy_admin_endpoints.py:
+Mirrors the pattern in tests/test_lifecycle_autonomy_admin_endpoints.py:
   - JWT-protected (no token → 401/403)
   - happy path returns the full payload + history
   - missing subscriber → 404

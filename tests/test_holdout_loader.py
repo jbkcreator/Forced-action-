@@ -169,10 +169,10 @@ class TestRenderForSubscriberHoldoutGate:
         assert (sys_txt, usr_txt) == (expected_sys, expected_usr)
 
     def test_no_holdout_configured_is_pure_passthrough(self, fresh_db):
-        """A graph with no entry in cora_holdout_tests.yaml (e.g.
+        """A graph with no entry in lifecycle_holdout_tests.yaml (e.g.
         'nws_urgency') must behave identically to the pre-holdout
         render_for_subscriber: nws_urgency also has no entry in
-        cora_ab_tests.yaml, so the expected output is deterministic —
+        lifecycle_ab_tests.yaml, so the expected output is deterministic —
         base prompt, no variant."""
         from src.agents.prompts.loader import (
             render_for_subscriber,
