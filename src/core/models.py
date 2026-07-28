@@ -5285,6 +5285,48 @@ class WaitlistEntry(Base):
                 f"status={self.status})>")
 
 
+class ReferralProspect(Base):
+    """
+    Section 7.3 — the one-question referral ask inside onboarding: "who is
+    one good contractor you know in a county we haven't opened yet?"
+
+    Deliberately NOT a WaitlistEntry: the referring subscriber gives a name,
+    company, and target county for someone else — they don't have that
+    person's email or phone, which WaitlistEntry requires (nullable=False).
+    This is a lightweight lead list, not a notify-on-launch subscription —
+    "so when a county launches, its first outreach list already exists"
+    means ops pulls these rows for that county, not an automated SMS/email.
+
+    One row per (referring_subscriber_id, target_county_id): a subscriber
+    referring the same county twice (retry, resubmit) updates the existing
+    row rather than stacking duplicates — see submit_onboarding's upsert.
+    """
+    __tablename__ = "referral_prospects"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    referring_subscriber_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("subscribers.id"), nullable=False, index=True
+    )
+    prospect_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    prospect_company: Mapped[Optional[str]] = mapped_column(String(120))
+    target_county_id: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "referring_subscriber_id", "target_county_id",
+            name="uq_referral_prospects_subscriber_county",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (f"<ReferralProspect(id={self.id}, "
+                f"referring_subscriber_id={self.referring_subscriber_id}, "
+                f"target_county_id={self.target_county_id!r})>")
+
+
 class NonBuyerNurtureSequence(Base):
     """
     One row per email — the per-email suppression/state list for the non-buyer
