@@ -190,8 +190,21 @@ def _decode_body(part: Dict[str, Any]) -> str:
 
 # ── Layer 3: relevance filter + publish ───────────────────────────────────────
 
-def _process_candidate_message(service: Any, message_id: str, db: Session) -> bool:
-    """Fetch, relevance-filter, publish if it matches a known contact_email. Returns True if published."""
+def _process_candidate_message(service: Any, message_id: str, db: Session) -> Optional[bool]:
+    """
+    Fetch, relevance-filter, publish if it matches a known contact_email.
+
+    Returns:
+        True  - published successfully. Safe to mark seen, safe to let the
+                caller advance the watermark past this message.
+        False - handled terminally with nothing to publish (already seen, or
+                an unmatched sender). Also safe to advance the watermark past.
+        None  - a retryable failure (queue.publish() unavailable, or a
+                transient error fetching/processing the message). The caller
+                MUST NOT advance the watermark past this message, or it can
+                never be reconsidered — Gmail's history API only returns
+                items after the saved cursor.
+    """
     if _already_seen(message_id):
         return False
 
@@ -203,17 +216,17 @@ def _process_candidate_message(service: Any, message_id: str, db: Session) -> bo
         body_text = _decode_body(message.get("payload", {}))
 
         thread_id = find_opportunity_thread_id_by_email(db, from_address)
-        _mark_seen(message_id)  # mark seen regardless of match — either way, don't reconsider it
 
         if thread_id is None:
             logger.warning(
                 "reply_mailbox_poller: unmatched sender=%s subject=%r message_id=%s — not queued, no draft was ever sent to this address",
                 from_address, subject[:80], message_id,
             )
+            _mark_seen(message_id)
             return False
 
         idempotency_key = queue.make_idempotency_key("reply.received", thread_id, f"gmail:{message_id}")
-        produce_stub_reply(
+        queued_message_id = produce_stub_reply(
             {
                 "opportunity_thread_id": thread_id,
                 "from_address": from_address,
@@ -224,17 +237,30 @@ def _process_candidate_message(service: Any, message_id: str, db: Session) -> bo
             },
             idempotency_key=idempotency_key,
         )
+        if queued_message_id is None:
+            logger.warning(
+                "reply_mailbox_poller: publish failed (queue unavailable) for message_id=%s — "
+                "will retry next poll, not marking seen",
+                message_id,
+            )
+            return None
+
+        _mark_seen(message_id)  # only now — after a confirmed successful publish
         return True
     except Exception:
         logger.exception("reply_mailbox_poller: failed to process message id=%s — will retry next poll", message_id)
-        return False
+        return None
 
 
 # ── Layer 1: fetch paths ──────────────────────────────────────────────────────
 
-def _poll_via_history(service: Any, history_id: str, db: Session) -> Tuple[int, Optional[str]]:
-    """Primary path. Returns (published_count, newest_history_id). Raises on a stale/invalid cursor."""
+def _poll_via_history(service: Any, history_id: str, db: Session) -> Tuple[int, Optional[str], bool]:
+    """
+    Primary path. Returns (published_count, newest_history_id, had_retryable_failure).
+    Raises on a stale/invalid cursor.
+    """
     published = 0
+    had_retryable_failure = False
     page_token = None
     newest_history_id = history_id
 
@@ -249,23 +275,36 @@ def _poll_via_history(service: Any, history_id: str, db: Session) -> Tuple[int, 
         for record in response.get("history", []):
             for added in record.get("messagesAdded", []):
                 message_id = added.get("message", {}).get("id")
-                if message_id and _process_candidate_message(service, message_id, db):
+                if not message_id:
+                    continue
+                result = _process_candidate_message(service, message_id, db)
+                if result is True:
                     published += 1
+                elif result is None:
+                    had_retryable_failure = True
 
         page_token = response.get("nextPageToken")
         if not page_token:
             break
 
-    return published, newest_history_id
+    return published, newest_history_id, had_retryable_failure
 
 
-def _bootstrap_poll(service: Any, since_timestamp: Optional[int], db: Session) -> Tuple[int, Optional[str]]:
+def _bootstrap_poll(service: Any, since_timestamp: Optional[int], db: Session) -> Tuple[int, Optional[str], bool]:
     """
     Fallback path — first ever run, or the saved historyId cursor expired.
     Bounded search-based catch-up, then captures a fresh historyId to resume
     incremental (_poll_via_history) mode on the next call.
+
+    Returns (published_count, fresh_history_id, had_retryable_failure). When
+    had_retryable_failure is True, fresh_history_id is always None and the
+    caller must NOT save it or the fallback timestamp — bootstrapping again
+    from the same since_timestamp next poll is what lets the failed
+    message(s) be retried, since this query is a re-runnable search, not an
+    incremental cursor.
     """
     published = 0
+    had_retryable_failure = False
     page_token = None
     query = _UNREAD_REPLY_QUERY
     if since_timestamp:
@@ -277,12 +316,18 @@ def _bootstrap_poll(service: Any, since_timestamp: Optional[int], db: Session) -
         ).execute()
 
         for msg_ref in response.get("messages", []):
-            if _process_candidate_message(service, msg_ref["id"], db):
+            result = _process_candidate_message(service, msg_ref["id"], db)
+            if result is True:
                 published += 1
+            elif result is None:
+                had_retryable_failure = True
 
         page_token = response.get("nextPageToken")
         if not page_token:
             break
+
+    if had_retryable_failure:
+        return published, None, True
 
     try:
         profile = service.users().getProfile(userId="me").execute()
@@ -291,7 +336,7 @@ def _bootstrap_poll(service: Any, since_timestamp: Optional[int], db: Session) -
         logger.exception("reply_mailbox_poller: failed to fetch a fresh historyId after bootstrap — will bootstrap again next poll")
         fresh_history_id = None
 
-    return published, fresh_history_id
+    return published, fresh_history_id, False
 
 
 def poll_once(db: Session) -> int:
@@ -305,9 +350,15 @@ def poll_once(db: Session) -> int:
 
     if history_id:
         try:
-            published, new_history_id = _poll_via_history(service, history_id, db)
-            _save_history_id(new_history_id)
-            _save_fallback_timestamp(poll_started_at)
+            published, new_history_id, had_retryable_failure = _poll_via_history(service, history_id, db)
+            if had_retryable_failure:
+                logger.warning(
+                    "reply_mailbox_poller: retryable failure during history poll — watermark held at %s, will retry next poll",
+                    history_id,
+                )
+            else:
+                _save_history_id(new_history_id)
+                _save_fallback_timestamp(poll_started_at)
             if published:
                 logger.info("reply_mailbox_poller: published %d reply.received event(s) via history", published)
             return published
@@ -322,13 +373,18 @@ def poll_once(db: Session) -> int:
     # Bootstrap: no cursor yet (first run), or the cursor just expired above.
     fallback_timestamp = _get_fallback_timestamp()
     try:
-        published, fresh_history_id = _bootstrap_poll(service, fallback_timestamp, db)
+        published, fresh_history_id, had_retryable_failure = _bootstrap_poll(service, fallback_timestamp, db)
     except Exception:
         logger.exception("reply_mailbox_poller: bootstrap poll failed")
         return 0
 
-    _save_history_id(fresh_history_id)
-    _save_fallback_timestamp(poll_started_at)
+    if had_retryable_failure:
+        logger.warning(
+            "reply_mailbox_poller: retryable failure during bootstrap catch-up — cursor held back, will retry next poll",
+        )
+    else:
+        _save_history_id(fresh_history_id)
+        _save_fallback_timestamp(poll_started_at)
     if published:
         logger.info("reply_mailbox_poller: published %d reply.received event(s) via bootstrap catch-up", published)
     return published

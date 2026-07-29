@@ -155,12 +155,14 @@ def _make_node_classify_intent(db: Optional[Session]):
 
 def _make_handle_unsubscribe(db: Optional[Session]):
     def _handle_unsubscribe(state: ReplyState) -> ReplyState:
+        # Deliberately no try/except here: suppress_contact() is a compliance
+        # write, not a best-effort side-effect. If it fails, the exception
+        # must propagate all the way to worker.py's _process_one, which
+        # leaves the event unacked for Redis Streams to redeliver — a failed
+        # opt-out must be retried, never silently treated as done.
         if db is not None:
-            try:
-                from src.services.email_suppression import suppress_contact
-                suppress_contact(db, email=state.get("from_address"), source="cora_reply_unsubscribe")
-            except Exception as exc:  # noqa: BLE001
-                logger.error("reply.unsubscribe: suppression write failed: %s", exc)
+            from src.services.email_suppression import suppress_contact
+            suppress_contact(db, email=state.get("from_address"), source="cora_reply_unsubscribe")
         if state.get("opportunity_thread_id"):
             opportunity_state.mark_closed(state["opportunity_thread_id"], reason="unsubscribed")
         return {"status": "suppressed"}

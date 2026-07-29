@@ -173,6 +173,37 @@ def test_unsubscribe_triggers_real_suppression_write_path(not_suppressed_db, moc
     assert opportunity_state.current_status(thread_id) == "closed"
 
 
+# PR #180 finding: a failed suppression write must never be silently treated
+# as a completed opt-out — that's a compliance gap, not a best-effort nicety.
+# The fix removed the try/except around suppress_contact() so the exception
+# propagates all the way to worker.py's _process_one, which leaves the event
+# unacked for Redis Streams to redeliver instead of acking a false success.
+def test_unsubscribe_suppression_failure_propagates_and_does_not_complete(not_suppressed_db, mock_claude, monkeypatch):
+    def _boom(db, email, source):
+        raise RuntimeError("simulated suppression write failure")
+
+    monkeypatch.setattr("src.services.email_suppression.suppress_contact", _boom)
+
+    thread_id = "OPP-TEST-UNSUB-FAIL"
+    _seed_parent_draft(not_suppressed_db, thread_id)
+    mock_claude.side_effect = [classify_result("HOSTILE", "UNSUBSCRIBE")]
+
+    with pytest.raises(RuntimeError, match="simulated suppression write failure"):
+        reply.run_reply(
+            {
+                "opportunity_thread_id": thread_id, "from_address": "unsub-fail@example.com",
+                "subject": "Re:", "body_text": "unsubscribe me", "received_at": store.now().isoformat(),
+            },
+            db=not_suppressed_db,
+        )
+
+    # The graph never reached persist, so no reply record exists claiming a
+    # false "suppressed"/"completed" outcome, and the thread was never
+    # incorrectly marked closed.
+    assert store.read_replies(opportunity_thread_id=thread_id) == []
+    assert opportunity_state.current_status(thread_id) != "closed"
+
+
 def test_booking_request_reply_triggers_call_booked_event(fresh_db, mock_claude, monkeypatch):
     from src.agents.cora import queue
 

@@ -234,6 +234,108 @@ def test_a_processing_failure_on_one_message_does_not_block_others(fresh_db, mon
     assert seen[0].payload["from_address"] == "good@example.com"
 
 
+# ── PR #180 finding: a publish failure (e.g. Redis unavailable) must never be
+# treated the same as "handled" — the message must not be marked seen, and
+# the watermark must not advance past it, or it can never be reconsidered. ──
+
+def test_process_candidate_message_returns_none_on_publish_failure(fresh_db, monkeypatch):
+    _seed_draft_for(fresh_db, "OPP-REDISDOWN-UNIT", "prospect@example.com")
+    service = MagicMock()
+    service.users.return_value.messages.return_value.get.return_value.execute.return_value = _fake_message(
+        "msg-unit-1", "prospect@example.com", "Re:", "hello"
+    )
+    monkeypatch.setattr(poller, "produce_stub_reply", lambda payload, idempotency_key=None: None)
+
+    result = poller._process_candidate_message(service, "msg-unit-1", fresh_db)
+
+    assert result is None
+    assert poller._already_seen("msg-unit-1") is False
+
+
+def test_publish_failure_holds_watermark_in_bootstrap_mode(fresh_db, monkeypatch):
+    _seed_draft_for(fresh_db, "OPP-REDISDOWN-BOOT", "prospect@example.com")
+    service = _mock_service_with_search(
+        {"messages": [{"id": "msg-boot-down"}]}, profile_history_id="hid-must-not-be-saved",
+    )
+    service.users.return_value.messages.return_value.get.return_value.execute.return_value = _fake_message(
+        "msg-boot-down", "prospect@example.com", "Re:", "hello"
+    )
+    monkeypatch.setattr(poller, "_build_gmail_service", lambda: service)
+    monkeypatch.setattr(poller, "produce_stub_reply", lambda payload, idempotency_key=None: None)
+
+    assert poller._get_saved_history_id() is None
+    published = poller.poll_once(fresh_db)
+
+    assert published == 0
+    # A fresh cursor must NOT be saved — doing so would skip past this
+    # message on the incremental history path next poll.
+    assert poller._get_saved_history_id() is None
+    assert poller._already_seen("msg-boot-down") is False
+    seen = queue.read_batch("test-consumer-redisdown-boot", count=10, block_ms=200)
+    assert seen == []
+
+
+def test_publish_failure_holds_watermark_in_history_mode(fresh_db, monkeypatch):
+    _seed_draft_for(fresh_db, "OPP-REDISDOWN-HIST", "prospect@example.com")
+    poller._save_history_id("hid-before-failure")
+
+    service = MagicMock()
+    service.users.return_value.history.return_value.list.return_value.execute.return_value = {
+        "historyId": "hid-after-failure",
+        "history": [{"messagesAdded": [{"message": {"id": "msg-hist-down"}}]}],
+    }
+    service.users.return_value.messages.return_value.get.return_value.execute.return_value = _fake_message(
+        "msg-hist-down", "prospect@example.com", "Re:", "hello"
+    )
+    monkeypatch.setattr(poller, "_build_gmail_service", lambda: service)
+    monkeypatch.setattr(poller, "produce_stub_reply", lambda payload, idempotency_key=None: None)
+
+    published = poller.poll_once(fresh_db)
+
+    assert published == 0
+    # The OLD cursor must be preserved, not advanced to hid-after-failure —
+    # otherwise history.list would never return this message again.
+    assert poller._get_saved_history_id() == "hid-before-failure"
+    assert poller._already_seen("msg-hist-down") is False
+
+
+def test_one_publish_failure_does_not_block_other_messages_in_same_poll(fresh_db, monkeypatch):
+    _seed_draft_for(fresh_db, "OPP-REDISDOWN-MIXED", "good@example.com")
+    _seed_draft_for(fresh_db, "OPP-REDISDOWN-MIXED-2", "also-good@example.com")
+    service = _mock_service_with_search(
+        {"messages": [{"id": "msg-fail"}, {"id": "msg-ok"}]}, profile_history_id="hid-must-not-be-saved",
+    )
+
+    def _get(userId, id, format):
+        result = MagicMock()
+        result.execute.return_value = (
+            _fake_message("msg-fail", "good@example.com", "Re:", "one")
+            if id == "msg-fail" else _fake_message("msg-ok", "also-good@example.com", "Re:", "two")
+        )
+        return result
+
+    service.users.return_value.messages.return_value.get.side_effect = _get
+
+    def _publish_side_effect(payload, idempotency_key=None):
+        if payload["from_address"] == "good@example.com":
+            return None  # simulated publish failure for this one message only
+        return queue.publish("reply.received", payload, idempotency_key=idempotency_key)
+
+    monkeypatch.setattr(poller, "_build_gmail_service", lambda: service)
+    monkeypatch.setattr(poller, "produce_stub_reply", _publish_side_effect)
+
+    published = poller.poll_once(fresh_db)
+
+    # Only the message that actually published counts, and the watermark is
+    # held back for the WHOLE cycle so the failed one gets retried — the
+    # already-seen guard (not the watermark) is what prevents the successful
+    # one from being reprocessed on the next poll.
+    assert published == 1
+    assert poller._get_saved_history_id() is None
+    assert poller._already_seen("msg-fail") is False
+    assert poller._already_seen("msg-ok") is True
+
+
 # ── MIME decoding (unchanged by the redesign) ────────────────────────────────
 
 def test_decode_body_walks_multipart_preferring_plain_text():
