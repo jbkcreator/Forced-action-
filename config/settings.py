@@ -245,6 +245,13 @@ class AppSettings(BaseSettings):
 
 	clay_dbpr_webhook_url: Optional[str] = Field(default=None, env="CLAY_DBPR_WEBHOOK_URL")
 
+	# Cora reply-mailbox ingestion (Gmail API, service account + domain-wide
+	# delegation, gmail.readonly scope only). Both must be set for
+	# src.agents.cora.ingestion.reply_mailbox_poller to activate — absent
+	# either one, it silently no-ops every poll rather than raising.
+	cora_gmail_service_account_key_path: Optional[str] = Field(default=None, env="CORA_GMAIL_SERVICE_ACCOUNT_KEY_PATH")
+	cora_reply_mailbox_address: Optional[str] = Field(default=None, env="CORA_REPLY_MAILBOX_ADDRESS")
+
 
 	# ── Mode-aware helpers ────────────────────────────────────────────────────
 	# Use these everywhere instead of accessing live/test fields directly.
