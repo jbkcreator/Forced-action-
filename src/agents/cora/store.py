@@ -433,6 +433,23 @@ def read_replies(opportunity_thread_id: Optional[str] = None) -> List[Dict[str, 
     return rows
 
 
+def mark_reply_published(reply_id: str) -> None:
+    """
+    Flips a persisted ReplyRecord's `published` flag to True — used only for a
+    BOOKING_REQUEST reply whose call.booked publish failed at persist time and
+    was later retried successfully (see reply.py's retry_unpublished_call_booked).
+    Append-only + latest-line-wins-by-id (same convention as every other
+    JSON-lines record in this store), so this is a full re-append of the
+    record with one field changed, not an in-place edit.
+    """
+    latest = _read_latest_by_id(_REPLIES_FILE, "reply_id")
+    record = latest.get(reply_id)
+    if record is None:
+        return
+    record["published"] = True
+    _append_line(_REPLIES_FILE, record)
+
+
 def read_conversation(db: Any, opportunity_thread_id: str) -> List[Dict[str, Any]]:
     """Prior drafts + replies for a thread, ordered by time — 'load prior conversation'."""
     drafts = [
