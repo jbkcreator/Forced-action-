@@ -3475,10 +3475,23 @@ class AbTest(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     winner: Mapped[Optional[str]] = mapped_column(String(10))  # 'a' / 'b'
+    # Price-band experiment metadata (REVINT-v2.2 I3)
+    hypothesis: Mapped[Optional[str]] = mapped_column(Text)
+    offer: Mapped[Optional[str]] = mapped_column(String(60))
+    audience: Mapped[Optional[str]] = mapped_column(String(100))
+    control_price_cents: Mapped[Optional[int]] = mapped_column(Integer)
+    test_price_cents: Mapped[Optional[int]] = mapped_column(Integer)
+    min_sample: Mapped[Optional[int]] = mapped_column(Integer)
+    success_metric: Mapped[Optional[str]] = mapped_column(String(60))
+    verdict: Mapped[Optional[str]] = mapped_column(String(20))  # control_wins | test_wins | inconclusive
 
     __table_args__ = (
         CheckConstraint("status IN ('active', 'completed', 'rolled_back')", name="check_ab_test_status"),
         CheckConstraint("traffic_pct BETWEEN 1 AND 100", name="check_ab_traffic_pct"),
+        CheckConstraint(
+            "verdict IS NULL OR verdict IN ('control_wins', 'test_wins', 'inconclusive')",
+            name="check_ab_test_verdict",
+        ),
     )
 
     def __repr__(self):
@@ -3505,6 +3518,49 @@ class AbAssignment(Base):
     __table_args__ = (
         UniqueConstraint("test_id", "subscriber_id", name="uq_ab_assignment"),
     )
+
+
+class PriceAssignment(Base):
+    """Source of truth for an assigned price through the entire offer chain.
+
+    A new row is created whenever a price is (re-)assigned for a given
+    opportunity_thread_id + offer combination.  The previous row is flipped to
+    status='superseded'.  Only one 'active' row should exist per thread+offer
+    pair at any time (enforced by assign_price service logic, not a DB
+    constraint, to keep supersede writes cheap).
+    """
+    __tablename__ = "price_assignments"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    opportunity_thread_id: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    offer: Mapped[str] = mapped_column(String(60), nullable=False)
+    assigned_price_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False, default="usd")
+    ab_assignment_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("ab_assignments.id"))
+    price_band_floor_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    price_band_ceiling_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    band_validated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    assigned_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+    )
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('active', 'superseded', 'expired')",
+            name="check_price_assignment_status",
+        ),
+        Index("ix_price_assignments_thread_offer_status", "opportunity_thread_id", "offer", "status"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<PriceAssignment(thread={self.opportunity_thread_id}, offer={self.offer}, "
+            f"price={self.assigned_price_cents}, status={self.status})>"
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════

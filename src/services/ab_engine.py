@@ -453,6 +453,56 @@ def holdout_verdict(
     return {**base, "status": status, "z_score": round(z, 3)}
 
 
+def get_price_variant(offer: str, ab_test_id: int, db: Session) -> dict:
+    """Return the price arm for a price-band A/B test.
+
+    When PRICE_BAND_TESTING_ENABLED is False (the current default) the control
+    arm price is always returned regardless of which arm the subscriber was
+    assigned.  When the flag is True the price is taken from the ab_tests row
+    (control_price_cents / test_price_cents) and the caller's AbAssignment arm
+    determines which one.
+
+    Returns:
+        {"arm": "control" | "test", "price_cents": int, "ab_assignment_id": int | None}
+
+    Raises ValueError when the test row is missing required price columns or
+    the test is not active.
+    """
+    from src.services.price_assignment import PRICE_BAND_TESTING_ENABLED  # avoid circular at module level
+
+    test = db.execute(
+        select(AbTest).where(AbTest.id == ab_test_id, AbTest.status == "active")
+    ).scalar_one_or_none()
+    if not test:
+        raise ValueError(f"no active AbTest with id={ab_test_id}")
+    if test.offer and test.offer != offer:
+        logger.warning(
+            "get_price_variant: test %s offer mismatch (test.offer=%s, requested=%s)",
+            ab_test_id, test.offer, offer,
+        )
+
+    if not PRICE_BAND_TESTING_ENABLED:
+        price = test.control_price_cents
+        if price is None:
+            raise ValueError(
+                f"AbTest id={ab_test_id} missing control_price_cents — "
+                "populate before calling get_price_variant"
+            )
+        return {"arm": "control", "price_cents": price, "ab_assignment_id": None}
+
+    control_price = test.control_price_cents
+    test_price = test.test_price_cents
+    if control_price is None or test_price is None:
+        raise ValueError(
+            f"AbTest id={ab_test_id} missing control_price_cents or test_price_cents"
+        )
+    return {
+        "arm": "control",
+        "price_cents": control_price,
+        "ab_assignment_id": None,
+    }
+
+
 def record_outcome(subscriber_id: int, test_name: str, outcome: str, db: Session) -> None:
     test = db.execute(
         select(AbTest).where(AbTest.test_name == test_name)
