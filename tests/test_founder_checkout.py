@@ -16,6 +16,7 @@ import pytest
 from sqlalchemy import text
 
 from migrations.apply_founder_plan_seed import seed_founder_plans
+from src.core.models import County, FoundingSubscriberCount
 
 M_PRICE = "price_founder_monthly_TESTMODE"
 A_PRICE = "price_founder_annual_TESTMODE"
@@ -69,6 +70,48 @@ def test_missing_founder_plan_raises(fresh_db):
     fresh_db.execute(text("DELETE FROM plans WHERE plan_id IN ('founder_monthly','founder_annual')"))
     with pytest.raises(ValueError):
         get_price_id_for_checkout(fresh_db, "founder", "roofing", "hillsborough", "monthly")
+
+
+def test_checkout_uses_regular_price_when_founding_deadline_passed(fresh_db, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from src.services.stripe_service import get_price_id_for_checkout
+
+    county_id = "deadline_test_county"
+    fresh_db.add(
+        County(
+            county_id=county_id,
+            display_name="Deadline Test County",
+            founding_price_deadline_at=datetime.now(timezone.utc) - timedelta(days=1),
+        )
+    )
+    fresh_db.add(
+        FoundingSubscriberCount(
+            tier="starter",
+            vertical="roofing",
+            county_id=county_id,
+            count=0,
+        )
+    )
+    fresh_db.flush()
+
+    monkeypatch.setattr("src.services.stripe_service._founding_limit", lambda: 10)
+    monkeypatch.setattr(
+        "src.services.stripe_service._price_ids",
+        lambda: {
+            "starter": {"founding": "price_founding_deadline", "regular": "price_regular_deadline"},
+            "pro": {"founding": "price_pro_founding", "regular": "price_pro_regular"},
+            "dominator": {"founding": "price_dom_founding", "regular": "price_dom_regular"},
+            "partner": {"founding": "price_partner", "regular": "price_partner"},
+            "annual_lock": {"founding": "price_annual_lock", "regular": "price_annual_lock"},
+        },
+    )
+
+    price_id, is_founding = get_price_id_for_checkout(
+        fresh_db, "starter", "roofing", county_id, "monthly"
+    )
+
+    assert price_id == "price_regular_deadline"
+    assert is_founding is False
 
 
 def test_checkout_request_accepts_founder_and_interval():
