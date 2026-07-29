@@ -30,7 +30,6 @@ def test_cora_graphs_in_seat_map():
 def test_rollup_month_aggregates_cora_compute(fresh_db):
     _seed_api_usage(fresh_db, "cora_outreach", 0.50, "2099-07-15T10:00:00+00:00")
     _seed_api_usage(fresh_db, "cora_reply",    0.25, "2099-07-20T10:00:00+00:00")
-    fresh_db.commit()
 
     result = rollup_month(fresh_db, date(2099, 7, 1))
 
@@ -41,7 +40,6 @@ def test_rollup_month_aggregates_cora_compute(fresh_db):
 def test_rollup_month_lifecycle_compute(fresh_db):
     _seed_api_usage(fresh_db, "fomo",      0.10, "2099-07-10T10:00:00+00:00")
     _seed_api_usage(fresh_db, "retention", 0.20, "2099-07-11T10:00:00+00:00")
-    fresh_db.commit()
 
     result = rollup_month(fresh_db, date(2099, 7, 1))
 
@@ -52,7 +50,6 @@ def test_rollup_month_lifecycle_compute(fresh_db):
 def test_rollup_month_net_contribution_formula(fresh_db):
     """net_contribution = attributed_gp - compute - data - founder_minutes."""
     _seed_api_usage(fresh_db, "cora_outreach", 1.00, "2099-07-05T10:00:00+00:00")
-    fresh_db.commit()
 
     result = rollup_month(fresh_db, date(2099, 7, 1))
     cora_row = next(r for r in result if r["seat"] == "cora")

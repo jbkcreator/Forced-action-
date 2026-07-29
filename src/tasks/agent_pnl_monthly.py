@@ -41,7 +41,8 @@ def run(
 
         rows = rollup_month(session, period_month)
         _upsert_rows(session, rows)
-        session.commit()
+        if owns_session:
+            session.commit()
 
         body = build_monthly_email(rows, period_month)
         _send_report(subject=f"Agent Fleet P&L — {period_month.strftime('%B %Y')}", body=body)

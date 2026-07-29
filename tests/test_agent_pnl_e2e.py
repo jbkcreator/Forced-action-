@@ -27,7 +27,6 @@ def _seed(db) -> None:
         INSERT INTO agent_manual_cost_entries (seat, period_month, vendor, amount_cents, description)
         VALUES ('dev_shop', '2099-11-01', 'test_vendor', 500, 'contractor invoice test')
     """))
-    db.commit()
 
 
 def test_e2e_pnl_rows_written(fresh_db):
