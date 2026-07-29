@@ -500,6 +500,12 @@ COUNTY_ID=hillsborough
 # until CHECKOUT_RECOVERY_ENABLED=true (captures + ages rows, sends nothing).
 */30 * * * * $PROJECT/scripts/cron/run.sh src.tasks.checkout_recovery_sweep
 
+# ── AGENT P&L MONTHLY REPORT (QUALITY-v2.2 Q2) ───────────────────────────────
+# 1st of each month at 08:00 UTC — rolls up the prior month's P&L for all 6
+# seats (vera/cora/hunter/relay/dev_shop/lifecycle), upserts into agent_pnl,
+# emails plain-text summary to ALERT_EMAIL.
+0 8 1 * * $PROJECT/scripts/cron/run.sh src.tasks.agent_pnl_monthly
+
 # ── STAGE 5: BUNDLES + AUTOPILOT + ANNUAL ───────────────────────────────────
 # Bundle dispatcher — every hour, contextually offers Weekend / Storm /
 # ZIP Booster / Monthly Reload bundles to wallet subscribers (with A/B pricing)
