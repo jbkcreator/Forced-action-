@@ -359,11 +359,17 @@ def _node_build_compose_context(state: ReactivationState) -> ReactivationState:
                     state.get("subscriber_id"), winback_branch,
                 )
 
-        if is_founder_zip_held:
+        if is_founder_zip_held and founder_grace_granted:
             headline = "Your territory is still yours — we've extended your grace period by 14 days."
             body_detail = (
                 f"As a founding-tier member, your {vertical} territory in {county_id} "
                 f"is still locked to you, and we've added 14 extra days before it opens up."
+            )
+        elif is_founder_zip_held:
+            headline = "Your territory may still be available — reactivate now to keep it."
+            body_detail = (
+                f"Your founding-tier {vertical} territory in {county_id} was not extended, "
+                f"so reactivate now if you want to keep your spot."
             )
         elif winback_branch == "zip_held":
             headline = "Your territory is still yours — 50% off your return month."

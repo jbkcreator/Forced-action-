@@ -58,14 +58,24 @@ def grant_founder_grace_extension(subscriber_id: int, db: Session) -> bool:
     received this grant, or if no grace-status territory is found to
     extend. Does not commit — caller controls the transaction.
     """
-    already_granted = db.execute(
+    subscriber_row = db.execute(
         text(
-            "SELECT 1 FROM subscribers "
-            "WHERE id = :sid AND founder_grace_extension_granted_at IS NOT NULL"
+            """
+            SELECT founder_grace_extension_granted_at
+              FROM subscribers
+             WHERE id = :sid
+             FOR UPDATE
+            """
         ),
         {"sid": subscriber_id},
     ).first()
-    if already_granted:
+    if subscriber_row is None:
+        logger.info(
+            "winback_offers: subscriber missing for founder grace extension sub_id=%s",
+            subscriber_id,
+        )
+        return False
+    if subscriber_row.founder_grace_extension_granted_at is not None:
         logger.info(
             "winback_offers: founder grace extension already granted sub_id=%s — skipping",
             subscriber_id,
@@ -78,7 +88,9 @@ def grant_founder_grace_extension(subscriber_id: int, db: Session) -> bool:
             """
             UPDATE zip_territories
                SET grace_expires_at = grace_expires_at + make_interval(days => :extend_days)
-             WHERE subscriber_id = :sid AND status = 'grace'
+             WHERE subscriber_id = :sid
+               AND status = 'grace'
+               AND grace_expires_at IS NOT NULL
             RETURNING id
             """
         ),
@@ -93,7 +105,12 @@ def grant_founder_grace_extension(subscriber_id: int, db: Session) -> bool:
 
     db.execute(
         text(
-            "UPDATE subscribers SET founder_grace_extension_granted_at = :now WHERE id = :sid"
+            """
+            UPDATE subscribers
+               SET founder_grace_extension_granted_at = :now
+             WHERE id = :sid
+               AND founder_grace_extension_granted_at IS NULL
+            """
         ),
         {"sid": subscriber_id, "now": now},
     )

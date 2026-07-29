@@ -105,4 +105,15 @@ class TestFounderZipHeldGetsGraceExtension:
             MagicMock(side_effect=RuntimeError("db boom")),
         )
         result = _node_build_compose_context(_base_state("founder", "zip_held"))
-        assert "extended your grace period by 14 days" in result["_fallback_body"]
+        assert "extended your grace period by 14 days" not in result["_fallback_body"]
+        assert "reactivate now to keep it" in result["_fallback_body"]
+
+    def test_no_eligible_grace_territory_uses_truthful_non_extension_copy(self, monkeypatch):
+        import src.services.winback_offers as winback_offers
+        monkeypatch.setattr(
+            winback_offers, "grant_founder_grace_extension",
+            MagicMock(return_value=False),
+        )
+        result = _node_build_compose_context(_base_state("founder", "zip_held"))
+        assert "extended your grace period by 14 days" not in result["_fallback_body"]
+        assert "reactivate now to keep it" in result["_fallback_body"]

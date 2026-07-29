@@ -9,9 +9,12 @@ Covers the actual redemption mechanism the review flagged as missing:
   - the zip_released credit grant only happens via redemption, and is itself
     idempotent (never double-credits)
 """
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from sqlalchemy import text
+from sqlalchemy.orm import sessionmaker
 
 from src.core.models import Subscriber
 
@@ -330,6 +333,118 @@ class TestGrantFounderGraceExtension:
         fresh_db.flush()
         fresh_db.refresh(locked)
         assert locked.grace_expires_at is None  # untouched — never had a grace window
+
+    def test_locked_only_territory_does_not_stamp_or_extend(self, fresh_db, founder_subscriber):
+        from src.core.models import ZipTerritory
+        from src.services.winback_offers import grant_founder_grace_extension
+
+        locked = ZipTerritory(
+            zip_code="99903",
+            vertical="roofing",
+            county_id="test_founder_grace_county",
+            subscriber_id=founder_subscriber.id,
+            status="locked",
+        )
+        fresh_db.add(locked)
+        fresh_db.flush()
+
+        ok = grant_founder_grace_extension(founder_subscriber.id, fresh_db)
+        fresh_db.flush()
+        fresh_db.refresh(founder_subscriber)
+        fresh_db.refresh(locked)
+
+        assert ok is False
+        assert founder_subscriber.founder_grace_extension_granted_at is None
+        assert locked.grace_expires_at is None
+
+
+@pytest.fixture
+def founder_concurrency_setup(pg_engine):
+    if pg_engine is None:
+        pytest.skip("DATABASE_URL not configured")
+
+    from src.core.models import Subscriber, ZipTerritory
+
+    Session = sessionmaker(bind=pg_engine)
+    seed = Session()
+    sub = Subscriber(
+        email="founder-concurrency@example.com",
+        tier="founder",
+        status="churned",
+        vertical="roofing",
+        county_id="hillsborough",
+        stripe_customer_id="cus_founder_concurrency",
+    )
+    seed.add(sub)
+    seed.flush()
+    territory = ZipTerritory(
+        zip_code="99911",
+        vertical="roofing",
+        county_id="test_founder_grace_county",
+        subscriber_id=sub.id,
+        status="grace",
+        grace_expires_at=datetime.now(timezone.utc) + timedelta(days=5),
+    )
+    seed.add(territory)
+    seed.flush()
+    sub_id = sub.id
+    territory_id = territory.id
+    original_expiry = territory.grace_expires_at.replace(tzinfo=None)
+    seed.commit()
+    seed.close()
+
+    yield sub_id, territory_id, original_expiry, Session
+
+    cleanup = Session()
+    cleanup.execute(text("DELETE FROM zip_territories WHERE id = :tid"), {"tid": territory_id})
+    cleanup.execute(text("DELETE FROM subscribers WHERE id = :sid"), {"sid": sub_id})
+    cleanup.commit()
+    cleanup.close()
+
+
+def test_founder_grace_extension_is_atomic_under_concurrency(founder_concurrency_setup):
+    from src.services.winback_offers import grant_founder_grace_extension
+
+    sub_id, territory_id, original_expiry, Session = founder_concurrency_setup
+    results = [None, None]
+    errors = []
+    barrier = threading.Barrier(2)
+
+    def worker(idx: int) -> None:
+        session = Session()
+        try:
+            barrier.wait()
+            results[idx] = grant_founder_grace_extension(sub_id, session)
+            session.commit()
+        except Exception as exc:
+            session.rollback()
+            errors.append(exc)
+        finally:
+            session.close()
+
+    t1 = threading.Thread(target=worker, args=(0,))
+    t2 = threading.Thread(target=worker, args=(1,))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    assert not errors
+    assert sorted(results) == [False, True]
+
+    verify = Session()
+    territory = verify.execute(
+        text("SELECT grace_expires_at FROM zip_territories WHERE id = :tid"),
+        {"tid": territory_id},
+    ).first()
+    subscriber = verify.execute(
+        text("SELECT founder_grace_extension_granted_at FROM subscribers WHERE id = :sid"),
+        {"sid": sub_id},
+    ).first()
+    verify.close()
+
+    assert territory.grace_expires_at == original_expiry + timedelta(days=14)
+    assert subscriber.founder_grace_extension_granted_at is not None
 
 
 class TestFullRedemptionFlow:
