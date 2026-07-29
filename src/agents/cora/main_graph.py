@@ -2,9 +2,10 @@
 Cora's main graph — deterministic routing only, no LLM.
 
     route (plain dict lookup on event_type)
-        target.ready   -> Outreach subgraph
-        reply.received -> Reply subgraph
-        call.booked    -> Pre-call subgraph
+        target.ready    -> Outreach subgraph
+        reply.received  -> Reply subgraph
+        call.booked     -> Pre-call subgraph
+        call.completed  -> Post-call recap subgraph (THROUGH-v2.2 T3)
 
 Compiled with checkpointer=PostgresSaver, thread_id=opportunity_thread_id
 (via src.agents.cora.checkpointer.run_with_checkpoint) — see that module's
@@ -25,6 +26,7 @@ from typing import Any, Callable, Dict, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from src.agents.cora.subgraphs.outreach import run_outreach
+from src.agents.cora.subgraphs.post_call_recap import run_post_call_recap
 from src.agents.cora.subgraphs.pre_call import run_pre_call
 from src.agents.cora.subgraphs.reply import run_reply
 
@@ -44,6 +46,7 @@ EVENT_ROUTES: Dict[str, Callable[..., Dict[str, Any]]] = {
     "target.ready": run_outreach,
     "reply.received": run_reply,
     "call.booked": run_pre_call,
+    "call.completed": run_post_call_recap,
 }
 
 

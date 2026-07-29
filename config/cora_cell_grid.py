@@ -53,6 +53,7 @@ ANGLES = (
     "portfolio_recognition",      # "we noticed your N purchases" framing
     "auction_congrats",           # auction-winner fast-follow framing
     "win_back_offer",             # lapsed/abandoned win-back framing
+    "post_call_recap",            # follow-up after a completed call
 )
 
 CELL_GRID: dict[str, Cell] = {
@@ -94,6 +95,14 @@ CELL_GRID: dict[str, Cell] = {
         "avenue": "lender_types",
         "angle": "why_now_catalyst",
         "label": "Hard-money intro — lead handoff only, no fee mechanics (RESPA-gated)",
+        "launch_group": None,
+    },
+    "post_call_recap": {
+        "cell_id": "post_call_recap",
+        "offer": "core_subscription",
+        "avenue": "flippers",
+        "angle": "post_call_recap",
+        "label": "Post-call recap — follow-up draft after a completed call, offer TBD per-call context",
         "launch_group": None,
     },
 }

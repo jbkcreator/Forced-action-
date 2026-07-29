@@ -337,6 +337,22 @@ def mark_draft_published(db: Any, draft_id: str) -> None:
     )
 
 
+def mark_draft_status(db: Any, draft_id: str, status: DraftStatus, reject_reason: Optional[str] = None) -> None:
+    """Additive helper — nothing before THROUGH-v2.2 ever needed to flip a
+    draft's status directly (mark_draft_published only toggles the separate
+    `published` bool). Used by THROUGH's batch-approval decisions.py to move
+    a draft to 'approved_pending_send' on approval or 'rejected' on an
+    exception-reject within a batch."""
+    from sqlalchemy import text
+    db.execute(
+        text(
+            "UPDATE outbound_drafts SET status = :status, reject_reason = :reject_reason "
+            "WHERE draft_id = :draft_id"
+        ),
+        {"status": status, "reject_reason": reject_reason, "draft_id": draft_id},
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Opportunity state machine
 # ─────────────────────────────────────────────────────────────────────────────
