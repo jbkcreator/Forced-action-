@@ -5,6 +5,7 @@ Implements the Hub-and-Spoke architecture with properties as the central hub.
 
 from datetime import date, datetime, timezone
 from decimal import Decimal
+from enum import Enum
 from typing import Any, List, Optional
 
 from sqlalchemy import (
@@ -8553,3 +8554,305 @@ class OutboundDraft(Base):
 
     def __repr__(self) -> str:
         return f"<OutboundDraft(draft_id={self.draft_id!r}, thread={self.opportunity_thread_id!r}, status={self.status!r})>"
+
+
+# ============================================================================
+# REVINT-v2.2 — VERTICAL AUTOPILOT
+# ============================================================================
+
+class VerticalCandidatePacket(Base):
+    """
+    Stores the 6-dimension fit evaluation for a candidate vertical.
+
+    Created by vertical_autopilot.score_vertical(). A packet with
+    total_score >= VERTICAL_FIT_THRESHOLD and legal_status="approved"
+    is eligible for a probe run.
+    """
+    __tablename__ = "vertical_candidate_packets"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    vertical_name: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+
+    # Per-dimension binary scores (0 or 1)
+    dim1_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    dim2_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    dim3_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    dim4_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    dim5_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    dim6_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # Legal gate
+    legal_status: Mapped[str] = mapped_column(String(30), nullable=False)     # "approved" | "blocked" | "pending_review"
+    eligible_for_probe: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    # Dimension-level evidence (dim → detail dict)
+    evidence: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+
+    # Lifecycle
+    status: Mapped[str] = mapped_column(
+        String(30), nullable=False, default="candidate"
+    )  # "candidate" | "probing" | "won" | "killed" | "pending_legal"
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    probes: Mapped[List["VerticalProbe"]] = relationship(
+        "VerticalProbe", back_populates="packet", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "legal_status IN ('approved','blocked','pending_review')",
+            name="ck_vcp_legal_status",
+        ),
+        CheckConstraint(
+            "status IN ('candidate','probing','won','killed','pending_legal')",
+            name="ck_vcp_status",
+        ),
+        Index("idx_vcp_status", "status"),
+        Index("idx_vcp_vertical_name", "vertical_name"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<VerticalCandidatePacket(id={self.id}, vertical={self.vertical_name!r}, "
+            f"score={self.total_score}/6, status={self.status!r})>"
+        )
+
+
+class VerticalProbe(Base):
+    """
+    Tracks a single probe run for a candidate vertical.
+
+    Compliance pre-flight fields are set before sends begin; reply_rate is
+    updated as replies come in; verdict is recorded in VerticalVerdict.
+    """
+    __tablename__ = "vertical_probes"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    vertical_candidate_packet_id: Mapped[int] = mapped_column(
+        ForeignKey("vertical_candidate_packets.id"), nullable=False, index=True
+    )
+    vertical_name: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
+
+    # Volume counters
+    sends_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    reply_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    reply_rate: Mapped[float] = mapped_column(Numeric(6, 4), nullable=False, default=0.0)
+
+    # Compliance pre-flight checks
+    tcpa_preflight_passed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    suppression_checked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    touch_collision_checked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    frequency_cap_checked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    quiet_hours_checked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    channel_limits_checked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    kill_switch_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    completion_receipt: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    # Timestamps
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="running"
+    )  # "running" | "completed" | "killed" | "aborted"
+
+    packet: Mapped["VerticalCandidatePacket"] = relationship(
+        "VerticalCandidatePacket", back_populates="probes"
+    )
+    verdicts: Mapped[List["VerticalVerdict"]] = relationship(
+        "VerticalVerdict", back_populates="probe", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('running','completed','killed','aborted')",
+            name="ck_vprobe_status",
+        ),
+        Index("idx_vprobe_status", "status"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<VerticalProbe(id={self.id}, vertical={self.vertical_name!r}, "
+            f"sends={self.sends_count}, reply_rate={self.reply_rate}, status={self.status!r})>"
+        )
+
+
+class VerticalVerdict(Base):
+    """
+    Final ruling on a vertical probe — won, killed, or running (pending Josh).
+
+    presell_confirmed gates entry into the dev queue.
+    package_generated is auto-True on won verdicts.
+    handoff_payload carries the sell+clone deferred payload when clone is
+    deferred until county_2.
+    """
+    __tablename__ = "vertical_verdicts"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    vertical_probe_id: Mapped[int] = mapped_column(
+        ForeignKey("vertical_probes.id"), nullable=False, index=True
+    )
+    vertical_candidate_packet_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    vertical_name: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+
+    verdict: Mapped[str] = mapped_column(String(20), nullable=False)  # "won" | "killed" | "running"
+    verdict_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+    rule_fired: Mapped[str] = mapped_column(String(60), nullable=False)
+    # e.g. "reply_rate_gt_8pct" | "reply_rate_lt_3pct" | "min_sample_josh_ruling"
+    reply_rate_at_verdict: Mapped[float] = mapped_column(Numeric(6, 4), nullable=False, default=0.0)
+
+    # Downstream gates
+    presell_confirmed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    package_generated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    package_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    clone_status: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
+    # e.g. "deferred_until_county_2" on won
+    source_county: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    handoff_payload: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+
+    probe: Mapped["VerticalProbe"] = relationship("VerticalProbe", back_populates="verdicts")
+
+    __table_args__ = (
+        CheckConstraint(
+            "verdict IN ('won','killed','running')",
+            name="ck_vverdict_verdict",
+        ),
+        Index("idx_vverdict_verdict", "verdict"),
+        Index("idx_vverdict_vertical_name", "vertical_name"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<VerticalVerdict(id={self.id}, vertical={self.vertical_name!r}, "
+            f"verdict={self.verdict!r}, rule={self.rule_fired!r})>"
+        )
+
+
+# ============================================================================
+# REVINT-I1: Revenue Intelligence — Opportunity Scoring
+# ============================================================================
+
+
+class RevenueType(str, Enum):
+    SUBSCRIPTION = "subscription"
+    ONE_TIME = "one_time"
+    USAGE_BASED = "usage_based"
+    PILOT = "pilot"
+    # NOTE: referral_fee calculation is DISABLED until RESPA clearance is confirmed.
+    # lender_intro actions should NOT trigger financial projections until legal sign-off.
+    REFERRAL_FEE = "referral_fee"
+    LICENSING = "licensing"
+
+
+class OpportunityScore(Base):
+    """
+    NBRA (Net Business Return per Action) scoring record for one opportunity.
+
+    `nbra_score` = expected_retained_gross_profit_cents / josh_minutes_required.
+    Automated actions (is_automated=True) carry josh_minutes_required=0 and
+    nbra_score=None — they bypass the NBRA queue and go to Relay directly.
+
+    segment values: "whale" | "auction_winner" | "lapsed_subscriber" | "default"
+    billing_interval values: "monthly" | "annual" | None (for non-subscription types)
+    """
+    __tablename__ = "opportunity_scores"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # OPP-YYYY-##### format; matches BuyerEntity.opportunity_thread_id
+    opportunity_thread_id: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    buyer_entity_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    segment: Mapped[str] = mapped_column(String(30), nullable=False)
+    revenue_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    billing_interval: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    expected_revenue_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    expected_mrr_cents: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    expected_retained_gross_profit_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    p_reply: Mapped[float] = mapped_column(Numeric(6, 4), nullable=False)
+    p_close: Mapped[float] = mapped_column(Numeric(6, 4), nullable=False)
+    time_to_cash_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    josh_minutes_required: Mapped[float] = mapped_column(Numeric(8, 2), nullable=False)
+    # None when is_automated=True (josh_minutes_required == 0, never in NBRA denominator)
+    nbra_score: Mapped[Optional[float]] = mapped_column(Numeric(12, 4), nullable=True)
+    source_action_type: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
+    # Automated actions bypass NBRA queue and route directly to Relay
+    is_automated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        Index("ix_opp_scores_thread_id", "opportunity_thread_id"),
+        Index("ix_opp_scores_buyer_entity", "buyer_entity_id"),
+        Index("ix_opp_scores_segment_nbra", "segment", "nbra_score"),
+        CheckConstraint(
+            "segment IN ('whale','auction_winner','lapsed_subscriber','default')",
+            name="ck_opp_scores_segment",
+        ),
+        CheckConstraint(
+            "billing_interval IN ('monthly','annual') OR billing_interval IS NULL",
+            name="ck_opp_scores_billing_interval",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<OpportunityScore(id={self.id!r}, thread={self.opportunity_thread_id!r}, "
+            f"segment={self.segment!r}, nbra={self.nbra_score!r})>"
+        )
+
+
+class OpportunityScoreHistory(Base):
+    """
+    Immutable audit trail — one row per recalculation of an OpportunityScore.
+    Never updated after insert; written by calibration_service and scoring service.
+    """
+    __tablename__ = "opportunity_score_history"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    opportunity_score_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("opportunity_scores.id", ondelete="CASCADE"), nullable=False, index=True,
+    )
+    opportunity_thread_id: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    snapshot_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+    p_reply: Mapped[float] = mapped_column(Numeric(6, 4), nullable=False)
+    p_close: Mapped[float] = mapped_column(Numeric(6, 4), nullable=False)
+    time_to_cash_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    nbra_score: Mapped[float] = mapped_column(Numeric(12, 4), nullable=False)
+    reason: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+
+    __table_args__ = (
+        Index("ix_opp_score_history_score_id", "opportunity_score_id"),
+        Index("ix_opp_score_history_thread_id", "opportunity_thread_id"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<OpportunityScoreHistory(id={self.id!r}, score_id={self.opportunity_score_id!r}, "
+            f"snapshot_at={self.snapshot_at!r})>"
+        )
