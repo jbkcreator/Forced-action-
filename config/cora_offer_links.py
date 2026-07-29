@@ -92,6 +92,21 @@ OFFER_LINKS: dict[str, OfferLinkConfig] = {
         "calendar_settings_attr": None,
         "requires_existing_subscriber": False,
     },
+    "single_ZIP_pack": {
+        "offer": "single_ZIP_pack",
+        "link_kind": "checkout",
+        "stripe_price_env": "stripe_price_lead_pack",
+        "calendar_settings_attr": None,
+        # Requires subscriber context for pack-style checkout — resolves to None for cold prospects.
+        "requires_existing_subscriber": True,
+    },
+    "concierge_wedge": {
+        "offer": "concierge_wedge",
+        "link_kind": "booking",
+        "stripe_price_env": None,
+        "calendar_settings_attr": "demo_calendly_url",
+        "requires_existing_subscriber": False,
+    },
 }
 
 
