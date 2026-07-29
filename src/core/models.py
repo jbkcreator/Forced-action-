@@ -19,6 +19,7 @@ from sqlalchemy import (
     Integer,
     LargeBinary as sa_LargeBinary,
     Numeric,
+    SmallInteger,
     String,
     Text,
     UniqueConstraint,
@@ -8444,3 +8445,71 @@ class VeraPromise(Base):
 
     def __repr__(self) -> str:
         return f"<VeraPromise(id={self.id}, owner={self.owner!r}, status={self.status!r})>"
+
+
+# ---------------------------------------------------------------------------
+# QUALITY-v2.2 Q1 — Fleet event-trigger dispatcher
+# Deliberately separate from ProspectEvent/ProcessedEvent/EventFailure:
+# those tables require a NOT NULL prospect_id FK and enumerate a closed set
+# of prospect-lifecycle event types — neither fits a fleet-wide event (a
+# Stripe cancellation or a Dev-Shop finding has no prospect_id). These tables
+# also add a priority column for deadline-aware preemption (spec §9.5).
+# ---------------------------------------------------------------------------
+
+class FleetEvent(Base):
+    __tablename__ = "fleet_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    event_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    priority: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=100)
+    source_component: Mapped[str] = mapped_column(String(60), nullable=False)
+    subscriber_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("subscribers.id"))
+    opportunity_thread_id: Mapped[Optional[str]] = mapped_column(String(20))
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("NOW()"),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("NOW()"),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "event_type IN ('filing.new','payment.received','reply.received',"
+            "'booking.created','subscription.cancelled','source.failure')",
+            name="ck_fleet_events_event_type",
+        ),
+        CheckConstraint("priority >= 0", name="ck_fleet_events_priority"),
+        Index("idx_fleet_events_type", "event_type"),
+        Index("idx_fleet_events_priority_occurred", "priority", "occurred_at"),
+        Index("idx_fleet_events_subscriber", "subscriber_id"),
+    )
+
+
+class FleetProcessedEvent(Base):
+    __tablename__ = "fleet_processed_events"
+
+    event_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("fleet_events.id", ondelete="CASCADE"), primary_key=True,
+    )
+    consumer: Mapped[str] = mapped_column(String(100), primary_key=True)
+    processed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("NOW()"),
+    )
+
+
+class FleetEventFailure(Base):
+    __tablename__ = "fleet_event_failures"
+
+    event_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("fleet_events.id", ondelete="CASCADE"), primary_key=True,
+    )
+    consumer: Mapped[str] = mapped_column(String(100), primary_key=True)
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[Optional[str]] = mapped_column(Text)
+    failed_permanently: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    last_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        Index("idx_fleet_event_failures_consumer_permanent", "consumer", "failed_permanently"),
+    )
