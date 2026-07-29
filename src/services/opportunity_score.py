@@ -164,9 +164,19 @@ def get_or_create_score(
 
     existing = db.execute(
         text(
-            "SELECT id FROM opportunity_scores WHERE opportunity_thread_id = :tid LIMIT 1"
+            """
+            SELECT id FROM opportunity_scores
+            WHERE opportunity_thread_id = :tid
+              AND source_action_type IS NOT DISTINCT FROM :action_type
+              AND revenue_type = :rev_type
+            LIMIT 1
+            """
         ),
-        {"tid": opportunity_thread_id},
+        {
+            "tid": opportunity_thread_id,
+            "action_type": source_action_type,
+            "rev_type": revenue_type.value,
+        },
     ).fetchone()
 
     if existing:
@@ -219,9 +229,39 @@ def recalculate_score(
     josh_minutes = _estimate_josh_minutes(db, score.source_action_type, score.is_automated)
     nbra = compute_nbra_score(score.expected_retained_gross_profit_cents, josh_minutes)
 
-    score.p_reply = priors["p_reply"]
-    score.p_close = priors["p_close"]
-    score.time_to_cash_days = priors["time_to_cash_days"]
+    history_rows = db.execute(
+        text(
+            """
+            SELECT p_reply, p_close, time_to_cash_days
+            FROM opportunity_score_history
+            WHERE opportunity_thread_id = :tid
+              AND opportunity_score_id IN (
+                  SELECT id FROM opportunity_scores
+                  WHERE opportunity_thread_id = :tid
+                    AND source_action_type IS NOT DISTINCT FROM :action_type
+              )
+            ORDER BY snapshot_at DESC
+            LIMIT 50
+            """
+        ),
+        {
+            "tid": score.opportunity_thread_id,
+            "action_type": score.source_action_type,
+        },
+    ).fetchall()
+
+    if len(history_rows) >= ACTUALS_MIN_SAMPLES:
+        p_reply_val = statistics.mean(float(r[0]) for r in history_rows)
+        p_close_val = statistics.mean(float(r[1]) for r in history_rows)
+        ttc_val = round(statistics.mean(float(r[2]) for r in history_rows))
+    else:
+        p_reply_val = priors["p_reply"]
+        p_close_val = priors["p_close"]
+        ttc_val = priors["time_to_cash_days"]
+
+    score.p_reply = p_reply_val
+    score.p_close = p_close_val
+    score.time_to_cash_days = ttc_val
     score.josh_minutes_required = josh_minutes
     score.nbra_score = nbra
     score.updated_at = datetime.now(timezone.utc)
@@ -230,9 +270,9 @@ def recalculate_score(
         opportunity_score_id=score.id,
         opportunity_thread_id=score.opportunity_thread_id,
         snapshot_at=datetime.now(timezone.utc),
-        p_reply=float(score.p_reply),
-        p_close=float(score.p_close),
-        time_to_cash_days=score.time_to_cash_days,
+        p_reply=p_reply_val,
+        p_close=p_close_val,
+        time_to_cash_days=ttc_val,
         nbra_score=float(nbra) if nbra is not None else 0.0,
         reason=reason,
     )

@@ -21,7 +21,8 @@ def recommend_offer_for_entity(buyer_entity: Dict[str, Any]) -> OfferRecommendat
         buyer_entity: Dict with prospect/entity signals. Expected keys (all
             optional — missing keys degrade gracefully to lower-priority rules):
             - is_whale (bool)
-            - entity_links (list[str])
+            - entity_links (list[dict]) — each dict must have a ``source_table`` key;
+              auction-winner detection checks ``source_table == "auction_records"``
             - is_auction_winner (bool)
             - has_active_subscription (bool)
             - had_prior_subscription (bool)

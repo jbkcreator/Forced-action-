@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 from typing import List
 
-from sqlalchemy import text
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from src.core.models import OpportunityScore
@@ -36,28 +36,16 @@ def get_ranked_queue(
     Rows with nbra_score IS NULL (should not occur for manual actions, but
     guarded) are excluded — only scores with a computable NBRA rank.
     """
-    rows = db.execute(
-        text(
-            """
-            SELECT id
-            FROM opportunity_scores
-            WHERE is_automated = FALSE
-              AND nbra_score IS NOT NULL
-            ORDER BY nbra_score DESC
-            LIMIT :lim
-            """
-        ),
-        {"lim": limit},
-    ).fetchall()
+    result_rows = db.execute(
+        select(OpportunityScore)
+        .where(OpportunityScore.is_automated == False)  # noqa: E712
+        .where(OpportunityScore.nbra_score.is_not(None))
+        .order_by(OpportunityScore.nbra_score.desc())
+        .limit(limit)
+    ).scalars().all()
 
-    ids = [r[0] for r in rows]
-    if not ids:
-        return []
-
-    scores = [db.get(OpportunityScore, sid) for sid in ids]
-    result = [s for s in scores if s is not None]
-    logger.info("nbra_engine: ranked queue size=%d (limit=%d)", len(result), limit)
-    return result
+    logger.info("nbra_engine: ranked queue size=%d (limit=%d)", len(result_rows), limit)
+    return list(result_rows)
 
 
 def get_automated_actions(
@@ -68,24 +56,12 @@ def get_automated_actions(
     Returns is_automated=True OpportunityScore rows.
     These bypass the NBRA queue and go directly to Relay.
     """
-    rows = db.execute(
-        text(
-            """
-            SELECT id
-            FROM opportunity_scores
-            WHERE is_automated = TRUE
-            ORDER BY created_at ASC
-            LIMIT :lim
-            """
-        ),
-        {"lim": limit},
-    ).fetchall()
+    result_rows = db.execute(
+        select(OpportunityScore)
+        .where(OpportunityScore.is_automated == True)  # noqa: E712
+        .order_by(OpportunityScore.created_at.asc())
+        .limit(limit)
+    ).scalars().all()
 
-    ids = [r[0] for r in rows]
-    if not ids:
-        return []
-
-    scores = [db.get(OpportunityScore, sid) for sid in ids]
-    result = [s for s in scores if s is not None]
-    logger.info("nbra_engine: automated actions size=%d (limit=%d)", len(result), limit)
-    return result
+    logger.info("nbra_engine: automated actions size=%d (limit=%d)", len(result_rows), limit)
+    return list(result_rows)

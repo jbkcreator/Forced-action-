@@ -8860,6 +8860,10 @@ class OpportunityScore(Base):
     )
 
     __table_args__ = (
+        UniqueConstraint(
+            "opportunity_thread_id", "source_action_type", "revenue_type",
+            name="uq_opportunity_score_action",
+        ),
         Index("ix_opp_scores_thread_id", "opportunity_thread_id"),
         Index("ix_opp_scores_buyer_entity", "buyer_entity_id"),
         Index("ix_opp_scores_segment_nbra", "segment", "nbra_score"),

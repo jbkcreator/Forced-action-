@@ -63,6 +63,7 @@ _DDL = [
     """,
     "CREATE INDEX IF NOT EXISTS ix_opp_score_history_score_id  ON opportunity_score_history(opportunity_score_id)",
     "CREATE INDEX IF NOT EXISTS ix_opp_score_history_thread_id ON opportunity_score_history(opportunity_thread_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_opportunity_score_action ON opportunity_scores(opportunity_thread_id, source_action_type, revenue_type)",
 ]
 
 

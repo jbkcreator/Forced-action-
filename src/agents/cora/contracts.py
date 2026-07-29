@@ -81,16 +81,22 @@ def recommend_offer(buyer_entity: Dict[str, Any]) -> OfferRecommendation:
         }
 
     # Priority 2 — auction winner → single ZIP pack
-    entity_links: list[str] = buyer_entity.get("entity_links", [])
-    if "BuyerEntityLink" in entity_links and buyer_entity.get("is_auction_winner"):
+    # entity_links is list[dict] with source_table, source_id, match_method keys.
+    entity_links: list[Any] = buyer_entity.get("entity_links", [])
+    is_auction_winner = any(
+        (isinstance(link, dict) and link.get("source_table") == "auction_records")
+        or (hasattr(link, "source_table") and link.source_table == "auction_records")
+        for link in entity_links
+    )
+    if is_auction_winner and buyer_entity.get("is_auction_winner"):
         return {
             "offer": "single_ZIP_pack",
-            "reason": "BuyerEntityLink auction winner",
+            "reason": "auction_records entity link + is_auction_winner",
             "confidence": 0.75,
             "rule_priority": 2,
             "fallback_offer": "core_subscription",
             "matched_rule_id": "auction_winner_zip_pack",
-            "signals_used": ["BuyerEntityLink", "is_auction_winner"],
+            "signals_used": ["source_table:auction_records", "is_auction_winner"],
             "config_version": config_version,
             "alternative_offer": "core_subscription",
         }
