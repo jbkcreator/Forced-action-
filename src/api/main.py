@@ -7697,6 +7697,114 @@ h1{{font-size:1.5rem}}a.cta{{display:inline-block;margin-top:24px;padding:12px 2
 
 
 # ---------------------------------------------------------------------------
+# POST /api/vertical/probe
+# POST /api/vertical/presell-confirm
+# GET  /api/vertical/verdict/{verdict_id}
+# ---------------------------------------------------------------------------
+
+class _VerticalProbeRequest(BaseModel):
+    vertical_candidate_packet_id: int
+
+
+class _PresellConfirmRequest(BaseModel):
+    verdict_id: int
+
+
+@app.post("/api/vertical/probe")
+def api_vertical_probe(
+    payload: _VerticalProbeRequest,
+    db: Session = Depends(get_db),
+):
+    """Run probe loop for a VerticalCandidatePacket. Idempotent per packet per day."""
+    from src.services.vertical_autopilot import run_probe
+    try:
+        probe = run_probe(payload.vertical_candidate_packet_id, db)
+        db.commit()
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"error": "probe_error", "message": str(exc)})
+    except OperationalError:
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
+    except Exception:
+        logger.error("api_vertical_probe: unexpected error", exc_info=True)
+        raise HTTPException(status_code=500, detail={"error": "internal_error", "message": "Probe failed unexpectedly"})
+
+    return {
+        "probe_id": probe.id,
+        "vertical_name": probe.vertical_name,
+        "status": probe.status,
+        "sends_count": probe.sends_count,
+        "reply_count": probe.reply_count,
+        "reply_rate": float(probe.reply_rate),
+        "idempotency_key": probe.idempotency_key,
+        "started_at": probe.started_at.isoformat() if probe.started_at else None,
+        "completed_at": probe.completed_at.isoformat() if probe.completed_at else None,
+    }
+
+
+@app.post("/api/vertical/presell-confirm")
+def api_vertical_presell_confirm(
+    payload: _PresellConfirmRequest,
+    db: Session = Depends(get_db),
+):
+    """Confirm presell for a VerticalVerdict. Unblocks dev queue entry."""
+    from src.services.vertical_autopilot import confirm_presell
+    try:
+        verdict = confirm_presell(payload.verdict_id, db)
+        db.commit()
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail={"error": "not_found", "message": str(exc)})
+    except OperationalError:
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
+    except Exception:
+        logger.error("api_vertical_presell_confirm: unexpected error", exc_info=True)
+        raise HTTPException(status_code=500, detail={"error": "internal_error", "message": "Confirm presell failed unexpectedly"})
+
+    return {
+        "verdict_id": verdict.id,
+        "vertical_name": verdict.vertical_name,
+        "presell_confirmed": verdict.presell_confirmed,
+        "verdict": verdict.verdict,
+        "package_id": verdict.package_id,
+    }
+
+
+@app.get("/api/vertical/verdict/{verdict_id}")
+def api_vertical_verdict(
+    verdict_id: int,
+    db: Session = Depends(get_db),
+):
+    """Return a VerticalVerdict by ID."""
+    from sqlalchemy import select as _select
+    from src.core.models import VerticalVerdict
+    try:
+        verdict = db.execute(
+            _select(VerticalVerdict).where(VerticalVerdict.id == verdict_id)
+        ).scalar_one_or_none()
+    except OperationalError:
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
+
+    if verdict is None:
+        raise HTTPException(status_code=404, detail={"error": "not_found", "message": "Verdict not found"})
+
+    return {
+        "id": verdict.id,
+        "vertical_name": verdict.vertical_name,
+        "vertical_probe_id": verdict.vertical_probe_id,
+        "vertical_candidate_packet_id": verdict.vertical_candidate_packet_id,
+        "verdict": verdict.verdict,
+        "verdict_at": verdict.verdict_at.isoformat() if verdict.verdict_at else None,
+        "rule_fired": verdict.rule_fired,
+        "reply_rate_at_verdict": float(verdict.reply_rate_at_verdict),
+        "presell_confirmed": verdict.presell_confirmed,
+        "package_generated": verdict.package_generated,
+        "package_id": verdict.package_id,
+        "clone_status": verdict.clone_status,
+        "source_county": verdict.source_county,
+        "handoff_payload": verdict.handoff_payload,
+    }
+
+
+# ---------------------------------------------------------------------------
 # SPA catch-all — must be LAST so it never shadows /api/* or /webhooks/*
 # Handles any client-side route (e.g. /dashboard/:uuid/settings, /proof-wall)
 # that the browser requests directly on reload or deep-link.
