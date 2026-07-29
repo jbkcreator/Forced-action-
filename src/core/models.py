@@ -3822,10 +3822,12 @@ class EnrichmentUsageLog(Base):
     # a degraded-provider event, so a multi-day degradation never re-discounts
     # the same rows (idempotency guard for apply_degraded_discount).
     quality_discounted: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
+    caller: Mapped[Optional[str]] = mapped_column(String(40))   # QUALITY-v2.2 Q2: seat name for P&L attribution
 
     __table_args__ = (
         Index("idx_enrichment_purpose_created", "purpose", "created_at"),
         Index("idx_enrichment_vendor_created", "vendor", "created_at"),
+        Index("idx_enrichment_caller", "caller", postgresql_where=text("caller IS NOT NULL")),
     )
 
     def __repr__(self):
@@ -3891,9 +3893,11 @@ class PlatformRevenueLedger(Base):
     # when the caller doesn't know the actual refunded amount.
     refunded_amount_cents: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    opportunity_thread_id: Mapped[Optional[str]] = mapped_column(String(20))   # QUALITY-v2.2 Q2: links revenue to an agent-driven thread
 
     __table_args__ = (
         UniqueConstraint("source_table", "source_id", name="uq_revenue_ledger_source"),
+        Index("idx_revenue_ledger_thread", "opportunity_thread_id", postgresql_where=text("opportunity_thread_id IS NOT NULL")),
     )
 
     def __repr__(self):
@@ -8553,3 +8557,68 @@ class OutboundDraft(Base):
 
     def __repr__(self) -> str:
         return f"<OutboundDraft(draft_id={self.draft_id!r}, thread={self.opportunity_thread_id!r}, status={self.status!r})>"
+
+
+# ── QUALITY-v2.2 Q2 — Agent P&L Ledger ────────────────────────────────────────
+
+class AgentPnl(Base):
+    """Per-seat, per-month P&L ledger (QUALITY-v2.2 Q2).
+
+    One row per (seat, period_month), written by src/tasks/agent_pnl_monthly.py.
+    Never updated after close — a later refund posts in the month it occurs
+    (decision C4). Primary key is the natural key; no autoincrement id.
+    """
+    __tablename__ = "agent_pnl"
+
+    seat: Mapped[str] = mapped_column(String(20), primary_key=True)
+    period_month: Mapped[date] = mapped_column(Date, primary_key=True)
+    attributed_gp_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    compute_cost_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    data_cost_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    founder_minutes_cost_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    net_contribution_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    binding_constraint: Mapped[Optional[str]] = mapped_column(String(40))
+    approval_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    queue_dwell_median_minutes: Mapped[Optional[float]] = mapped_column(Numeric(8, 2))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=text("NOW()"))
+
+    __table_args__ = (
+        CheckConstraint(
+            "seat IN ('vera','cora','hunter','relay','dev_shop','lifecycle')",
+            name="ck_agent_pnl_seat",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return f"<AgentPnl(seat={self.seat!r}, month={self.period_month!r}, net={self.net_contribution_cents})>"
+
+
+class AgentManualCostEntry(Base):
+    """Manually-entered costs with no automated source (QUALITY-v2.2 Q2).
+
+    Used for Dev Shop contractor invoices, Instantly flat-plan cost, Synthflow.
+    Distinct from marketing_spend — that table's channel must map to utm_source
+    for the CAC compiler; adding non-CAC entries there silently breaks it.
+    """
+    __tablename__ = "agent_manual_cost_entries"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    seat: Mapped[str] = mapped_column(String(20), nullable=False)
+    period_month: Mapped[date] = mapped_column(Date, nullable=False)
+    vendor: Mapped[str] = mapped_column(String(40), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text)
+    amount_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    entered_by: Mapped[str] = mapped_column(String(100), nullable=False, server_default=text("'admin'"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=text("NOW()"))
+
+    __table_args__ = (
+        CheckConstraint(
+            "seat IN ('vera','cora','hunter','relay','dev_shop','lifecycle')",
+            name="ck_agent_manual_seat",
+        ),
+        CheckConstraint("amount_cents >= 0", name="ck_agent_manual_amount_nonneg"),
+        Index("idx_agent_manual_seat_month", "seat", "period_month"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<AgentManualCostEntry(seat={self.seat!r}, vendor={self.vendor!r}, cents={self.amount_cents})>"
