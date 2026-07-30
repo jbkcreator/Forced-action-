@@ -29,7 +29,6 @@ logger = logging.getLogger(__name__)
 
 MAX_BATCH_SIZE = 10
 DEFAULT_INTERVAL_SECONDS = 15 * 60
-STALE_BATCH_MAX_AGE_HOURS = 24
 
 
 def _has_pending_batch(db: Any) -> bool:
@@ -105,23 +104,60 @@ def build_batch(db: Any) -> Dict[str, Any]:
     }
 
 
+def _notify_batch_expired(batch_id: str, item_count: int, expiry_hours: int) -> None:
+    from config.settings import get_settings
+    settings = get_settings()
+    token = settings.slack_bot_token
+    channel = settings.cora_throughput_slack_channel
+    if not token or not channel:
+        return
+    try:
+        from slack_sdk import WebClient
+        WebClient(token=token.get_secret_value()).chat_postMessage(
+            channel=channel,
+            text=(
+                f":hourglass_flowing_sand: *Cora batch expired* — batch `{batch_id[:8]}` "
+                f"({item_count} draft(s)) sat pending for {expiry_hours}h and has been re-queued. "
+                f"Drafts will appear in the next batch."
+            ),
+        )
+    except Exception as exc:
+        logger.warning("[Through] batch expiry Slack notification failed: %s", exc)
+
+
 def expire_stale_batches(db: Any) -> int:
     """
-    Default-action timer (T2) — a batch left 'pending' past
-    STALE_BATCH_MAX_AGE_HOURS auto-expires. Its still-'included' items need
-    no explicit change: they were never moved off outbound_drafts
-    status='draft' in the first place (only an approve/reject decision ever
-    changes that), so they are automatically eligible for the next
-    build_batch() pass once this one is no longer 'pending'.
+    Default-action timer (T2) — a batch left 'pending' past CORA_BATCH_EXPIRY_HOURS
+    (default 72h, env-overridable) auto-expires. Its still-'included' items need
+    no explicit change: they were never moved off outbound_drafts status='draft'
+    (only an approve/reject decision ever changes that), so they are automatically
+    eligible for the next build_batch() pass. A Slack nudge is posted so the
+    founder knows a batch was re-queued.
     """
-    result = db.execute(
+    from config.settings import get_settings
+    expiry_hours = get_settings().cora_batch_expiry_hours
+
+    rows = db.execute(
         text(
             "UPDATE cora_draft_batches SET status = 'expired' "
-            "WHERE status = 'pending' AND created_at < now() - make_interval(hours => :max_age_hours)"
+            "WHERE status = 'pending' AND created_at < now() - make_interval(hours => :max_age_hours) "
+            "RETURNING batch_id"
         ),
-        {"max_age_hours": STALE_BATCH_MAX_AGE_HOURS},
-    )
-    return result.rowcount
+        {"max_age_hours": expiry_hours},
+    ).fetchall()
+
+    for row in rows:
+        item_count = db.execute(
+            text("SELECT COUNT(*) FROM cora_batch_items WHERE batch_id = :bid"),
+            {"bid": row.batch_id},
+        ).scalar() or 0
+        _notify_batch_expired(row.batch_id, item_count, expiry_hours)
+        logger.info(
+            "cora_throughput.builder: batch %s expired after %dh (%d items re-queued)",
+            row.batch_id, expiry_hours, item_count,
+        )
+
+    return len(rows)
 
 
 def run_periodic(stop_event: threading.Event, interval_seconds: int = DEFAULT_INTERVAL_SECONDS) -> None:

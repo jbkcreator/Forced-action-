@@ -592,6 +592,7 @@ class AppSettings(BaseSettings):
 	# is a different review surface than Relay's per-item send approvals.
 	cora_throughput_slack_channel: str = Field(default="", env="CORA_THROUGHPUT_SLACK_CHANNEL")
 	cora_throughput_approvers: list = Field(default=[], env="CORA_THROUGHPUT_APPROVERS")
+	cora_batch_expiry_hours: int = Field(default=72, env="CORA_BATCH_EXPIRY_HOURS", description="Hours before a pending Cora draft batch auto-expires. Override via env var.")
 
 	# Relay email channel (RELAY-v2.2 sub-task R2). relay_instantly_campaign_id
 	# is set once after running `python -m src.services.relay --setup-email-channel`

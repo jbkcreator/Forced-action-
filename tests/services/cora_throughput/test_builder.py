@@ -95,7 +95,7 @@ def test_expire_stale_batches_expires_old_pending_batch(fresh_db):
     fresh_db.execute(
         text(
             "INSERT INTO cora_draft_batches (batch_id, status, created_at) "
-            "VALUES ('BATCH-STALE-1', 'pending', now() - interval '25 hours')"
+            "VALUES ('BATCH-STALE-1', 'pending', now() - interval '73 hours')"
         ),
     )
     fresh_db.execute(
