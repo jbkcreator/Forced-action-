@@ -72,7 +72,7 @@ class TestGhlStagePushSubscriber:
         mock_settings.ghl_cf_fa_zip = None
         mock_settings.ghl_cf_fa_founding = None
         mock_settings.ghl_cf_fa_dashboard_url = None
-        mock_settings.app_base_url = "https://app.forcedaction.io"
+        mock_settings.app_base_url = "https://app.forcedactionleads.com"
 
     def test_stage_5_uses_paid_subscriber_id(self):
         """Stage 5 should map to GHL_STAGE_PAID_SUBSCRIBER."""

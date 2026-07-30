@@ -57,6 +57,6 @@ def unsubscribe_url(email: str) -> str:
     R3) so Relay's outbound emails can mint the same link without importing
     a DBPR-specific template module."""
     settings = get_settings()
-    base = (settings.app_base_url or "https://app.forcedaction.io").rstrip("/")
+    base = (settings.app_base_url or "https://app.forcedactionleads.com").rstrip("/")
     token = mint_unsubscribe_token(email)
     return f"{base}/api/email/unsubscribe?token={token}"

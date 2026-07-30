@@ -233,7 +233,7 @@ def _node_build_compose_context(state: FOMOState) -> Dict[str, Any]:
 		"lead_specific_detail": (
 			f"{zip_activity.get('active_viewers', 0)} more viewers active in {payload.get('zip_code', '')}"
 		),
-		"unlock_link": f"https://app.forcedaction.io/feed/{profile.get('id')}",
+		"unlock_link": f"https://app.forcedactionleads.com/feed/{profile.get('id')}",
 		"prompt_version": "fomo_v2",
 		# fa038 personalization fields
 		**personalization,

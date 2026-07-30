@@ -5051,8 +5051,22 @@ class DBPRContact(Base):
     mobile_phone: Mapped[Optional[str]] = mapped_column(String(20))
     landline_phone: Mapped[Optional[str]] = mapped_column(String(20))
 
-    enrichment_status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    enrichment_status: Mapped[str] = mapped_column(String(30), nullable=False, default="pending")
     enrichment_attempted_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+    # Tracerfy submission tracking — set when a batch trace is submitted and
+    # billed, cleared once the queue result is polled and persisted. Lets a
+    # crashed/interrupted run resume polling an already-paid-for submission
+    # instead of resubmitting it (enrichment_status alone can't distinguish
+    # "never submitted" from "submitted, awaiting poll").
+    tracerfy_queue_id: Mapped[Optional[str]] = mapped_column(String(50))
+
+    # Which trace_type the in-flight tracerfy_queue_id was submitted as
+    # ('normal' or 'advanced') — persisted alongside the queue_id so a
+    # resumed/crashed run knows how to interpret a miss on resolution
+    # (normal miss -> retry address-only; advanced miss -> terminal failed),
+    # without re-deriving it from enrichment_status alone.
+    tracerfy_mode: Mapped[Optional[str]] = mapped_column(String(10))
 
     # Clay enrichment provenance (fa062)
     email_source: Mapped[Optional[str]] = mapped_column(String(20))  # clay|batchdata|raw
@@ -5091,7 +5105,8 @@ class DBPRContact(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "enrichment_status IN ('pending', 'enriched', 'failed', 'skipped')",
+            "enrichment_status IN ('pending', 'enriched', 'failed', 'skipped', "
+            "'tracerfy_submitted', 'awaiting_address_only')",
             name="check_dbpr_enrichment_status",
         ),
         CheckConstraint(

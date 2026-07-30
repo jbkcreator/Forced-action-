@@ -492,7 +492,7 @@ def render_lead_email(
             </p>
             <p style="margin:0;">
               You're receiving this because you're subscribed to the {vertical_label} vertical.
-              <a href="{_settings.app_base_url}" style="color:#475569;text-decoration:none;">forcedaction.io</a>
+              <a href="{_settings.app_base_url}" style="color:#475569;text-decoration:none;">forcedactionleads.com</a>
             </p>
           </td>
         </tr>

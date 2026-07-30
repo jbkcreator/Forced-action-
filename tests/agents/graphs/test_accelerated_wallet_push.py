@@ -44,7 +44,7 @@ def _payload(**overrides):
         "missed_leads": 3,
         "zip_code": "33647",
         "reason": "saved_card_paid_intent",
-        "cta_url": "https://app.forcedaction.io/dashboard/u?wallet_offer=accept",
+        "cta_url": "https://app.forcedactionleads.com/dashboard/u?wallet_offer=accept",
     }
     p.update(overrides)
     return p

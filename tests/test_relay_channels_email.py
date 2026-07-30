@@ -60,7 +60,7 @@ def test_raises_when_body_missing(monkeypatch):
 def test_raises_when_add_leads_returns_none(monkeypatch):
     fake_settings = MagicMock(relay_instantly_campaign_id="camp-1", company_postal_address="123 Main St")
     monkeypatch.setattr(channels_email, "get_settings", lambda: fake_settings)
-    monkeypatch.setattr(channels_email, "unsubscribe_url", lambda email: "https://app.forcedaction.io/unsub")
+    monkeypatch.setattr(channels_email, "unsubscribe_url", lambda email: "https://app.forcedactionleads.com/unsub")
     monkeypatch.setattr(channels_email.instantly, "add_leads", lambda *a, **k: None)
 
     with pytest.raises(RuntimeError, match="add_leads call failed"):
@@ -72,7 +72,7 @@ def test_fail_loud_on_duplicate_skip(monkeypatch):
     be treated as a successful send."""
     fake_settings = MagicMock(relay_instantly_campaign_id="camp-1", company_postal_address="123 Main St")
     monkeypatch.setattr(channels_email, "get_settings", lambda: fake_settings)
-    monkeypatch.setattr(channels_email, "unsubscribe_url", lambda email: "https://app.forcedaction.io/unsub")
+    monkeypatch.setattr(channels_email, "unsubscribe_url", lambda email: "https://app.forcedactionleads.com/unsub")
     monkeypatch.setattr(
         channels_email.instantly, "add_leads",
         lambda *a, **k: {"leads_created": 0, "leads_skipped": 1},
@@ -85,7 +85,7 @@ def test_fail_loud_on_duplicate_skip(monkeypatch):
 def test_raises_when_zero_leads_created_and_zero_skipped(monkeypatch):
     fake_settings = MagicMock(relay_instantly_campaign_id="camp-1", company_postal_address="123 Main St")
     monkeypatch.setattr(channels_email, "get_settings", lambda: fake_settings)
-    monkeypatch.setattr(channels_email, "unsubscribe_url", lambda email: "https://app.forcedaction.io/unsub")
+    monkeypatch.setattr(channels_email, "unsubscribe_url", lambda email: "https://app.forcedactionleads.com/unsub")
     monkeypatch.setattr(
         channels_email.instantly, "add_leads",
         lambda *a, **k: {"leads_created": 0, "leads_skipped": 0},
@@ -98,7 +98,7 @@ def test_raises_when_zero_leads_created_and_zero_skipped(monkeypatch):
 def test_successful_send_passes_subject_and_body_as_merge_vars(monkeypatch):
     fake_settings = MagicMock(relay_instantly_campaign_id="camp-1", company_postal_address="123 Main St")
     monkeypatch.setattr(channels_email, "get_settings", lambda: fake_settings)
-    monkeypatch.setattr(channels_email, "unsubscribe_url", lambda email: "https://app.forcedaction.io/unsub")
+    monkeypatch.setattr(channels_email, "unsubscribe_url", lambda email: "https://app.forcedactionleads.com/unsub")
 
     calls = []
 
@@ -128,7 +128,7 @@ def test_footer_carries_postal_address_and_unsubscribe_link(monkeypatch):
     (src.services.relay.suppression_sync) never sees anything to suppress."""
     fake_settings = MagicMock(relay_instantly_campaign_id="camp-1", company_postal_address="123 Main St, Tampa FL")
     monkeypatch.setattr(channels_email, "get_settings", lambda: fake_settings)
-    monkeypatch.setattr(channels_email, "unsubscribe_url", lambda email: f"https://app.forcedaction.io/unsub?e={email}")
+    monkeypatch.setattr(channels_email, "unsubscribe_url", lambda email: f"https://app.forcedactionleads.com/unsub?e={email}")
 
     calls = []
     monkeypatch.setattr(
@@ -142,4 +142,4 @@ def test_footer_carries_postal_address_and_unsubscribe_link(monkeypatch):
     body = calls[0][0]["ra_body"]
     assert "Full drafted body" in body
     assert "123 Main St, Tampa FL" in body
-    assert "https://app.forcedaction.io/unsub?e=prospect@example.com" in body
+    assert "https://app.forcedactionleads.com/unsub?e=prospect@example.com" in body

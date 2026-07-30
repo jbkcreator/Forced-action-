@@ -475,9 +475,20 @@ SLACK_SIGNING_SECRET=...
 1. Create a Slack app at api.slack.com/apps.
 2. Add `chat:write` bot scope.
 3. Enable "Interactivity & Shortcuts" and set Request URL to:
-   `https://<your-host>/api/admin/slack/county-launch/interact`
+   `https://<your-host>/api/admin/slack/interact`
+   (the single shared Interactivity endpoint — see note below.)
 4. Install to workspace. Copy Bot User OAuth Token → `SLACK_BOT_TOKEN`.
 5. Copy Signing Secret → `SLACK_SIGNING_SECRET`.
+
+> **Slack allows exactly one Interactivity Request URL per app.**
+> `POST /api/admin/slack/interact` is that single URL — it dispatches
+> internally (on the clicked button's `action_id`) to County Launch, Relay
+> approval, and Win-Story approval. Do NOT point Interactivity at any of
+> `/slack/county-launch/interact`, `/slack/relay-decision`, or
+> `/slack/win-story/interact` directly — those three still exist as
+> deprecated aliases for backward compatibility, but only one of them can
+> ever be Slack's actual configured URL at a time, silently breaking the
+> other two.
 
 ### Adding a candidate county
 ```sql
@@ -535,12 +546,15 @@ RELAY_DAILY_CEILING=20          # per channel, per calendar day
 ### Slack app setup
 Reuses the same Slack app as County Launch (`SLACK_BOT_TOKEN`/`SLACK_SIGNING_SECRET`) —
 no separate app needed.
-1. Enable "Interactivity & Shortcuts" and add a second Request URL:
-   `https://<your-host>/api/admin/slack/relay-decision`
+1. Interactivity is already covered by the single `/api/admin/slack/interact`
+   Request URL set up under County Launch above — Relay's Approve/Reject
+   buttons dispatch through that same endpoint, nothing further to add here.
 2. Add a slash command `/relay-kill` with Request URL:
    `https://<your-host>/api/admin/slack/kill`
    (usage: `/relay-kill ALL | RELAY | VERA | HUNTER` — sets the fleet-wide
    kill-switch override, auto-expires after `KILL_OVERRIDE_TTL_SECONDS`, 1 hour default)
+   Slash commands get their own Request URL slot in Slack, separate from
+   Interactivity, so this one is unaffected by the single-URL constraint above.
 
 ### One-time email channel setup
 Before any email can send, the Relay passthrough Instantly campaign must exist:

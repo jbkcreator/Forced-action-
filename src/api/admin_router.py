@@ -689,14 +689,23 @@ def synthflow_config(_admin: dict = Depends(get_current_admin)):
     import yaml
 
     agents = []
-    for fname in ["finetuner_roofing_agent.json", "finetuner_remediation_agent.json"]:
+    for fname in [
+        "finetuner_roofing_agent.json",
+        "finetuner_remediation_agent.json",
+        "finetuner_revenue_recovery_agent.json",
+    ]:
         p = _CONFIG_DIR / fname
         if not p.exists():
             continue
         data = json.loads(p.read_text(encoding="utf-8"))
         cfg = data.get("configuration", {})
         meta = data.get("source_metadata", {})
-        vertical = "roofing" if "roofing" in fname else "remediation"
+        if "roofing" in fname:
+            vertical = "roofing"
+        elif "remediation" in fname:
+            vertical = "remediation"
+        else:
+            vertical = "revenue_recovery"
         agents.append({
             "vertical": vertical,
             "agent_id": meta.get("agent_id"),
@@ -713,7 +722,11 @@ def synthflow_config(_admin: dict = Depends(get_current_admin)):
 
     campaigns = []
     prompts = []
-    for fname in ["synthflow_roofing_agent.yaml", "synthflow_remediation_agent.yaml"]:
+    for fname in [
+        "synthflow_roofing_agent.yaml",
+        "synthflow_remediation_agent.yaml",
+        "synthflow_revenue_recovery_agent.yaml",
+    ]:
         p = _CONFIG_DIR / "prompts" / fname
         if not p.exists():
             continue
@@ -1291,25 +1304,64 @@ def _slack_ephemeral(text: str) -> dict:
     return {"response_type": "ephemeral", "text": text}
 
 
-@router.post("/slack/county-launch/interact")
-async def slack_county_launch_interact(request: Request, db: Session = Depends(get_db)):
+def _parse_slack_interactive_payload(raw: bytes) -> dict:
+    """Shared by every Block Kit button endpoint below (not /slack/kill,
+    which is a slash command with a differently-shaped body)."""
+    try:
+        payload_str = parse_qs(raw.decode("utf-8")).get("payload", ["{}"])[0]
+        return json.loads(payload_str)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Malformed payload")
+
+
+@router.post("/slack/interact")
+async def slack_interact(request: Request, db: Session = Depends(get_db)):
     """
-    Receives Slack interactive component payloads for county-launch approval buttons.
+    Single Interactivity Request URL for every Slack Block Kit button in
+    this app. Slack allows exactly one Interactivity Request URL per app —
+    county-launch, relay-decision, and win-story previously each tried to
+    register their own, which meant at most one of the three was ever
+    actually reachable from Slack. This endpoint is the one Request URL
+    Slack's Interactivity setting should point at; it dispatches on the
+    clicked button's action_id.
     Auth: Slack HMAC-SHA256 signature (no JWT — Slack signature IS the auth).
     """
     raw = await request.body()
     if not _verify_slack_signature(dict(request.headers), raw):
         raise HTTPException(status_code=401, detail="Invalid Slack signature")
 
-    try:
-        payload_str = parse_qs(raw.decode("utf-8")).get("payload", ["{}"])[0]
-        payload = json.loads(payload_str)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Malformed payload")
+    payload = _parse_slack_interactive_payload(raw)
+    actions = payload.get("actions", [])
+    action_id = actions[0].get("action_id") if actions else None
 
+    if action_id == "county_launch_decision":
+        return _handle_county_launch_interact(payload, db)
+    if action_id in ("approve", "reject"):
+        return _handle_relay_decision(payload)
+    if action_id in ("approve_win_story", "dismiss_win_story"):
+        return _handle_win_story_interact(payload, db)
+
+    return _slack_ephemeral(f"Unrecognized action: {action_id}")
+
+
+@router.post("/slack/county-launch/interact")
+async def slack_county_launch_interact(request: Request, db: Session = Depends(get_db)):
+    """Deprecated individual URL — kept as an alias until the Slack app's
+    Interactivity Request URL is cut over to /slack/interact."""
+    raw = await request.body()
+    if not _verify_slack_signature(dict(request.headers), raw):
+        raise HTTPException(status_code=401, detail="Invalid Slack signature")
+    return _handle_county_launch_interact(_parse_slack_interactive_payload(raw), db)
+
+
+def _handle_county_launch_interact(payload: dict, db: Session) -> dict:
+    """Approve/Skip a county-launch candidate."""
     user_id = payload.get("user", {}).get("id", "")
     approvers = settings.county_launch_approvers
-    if approvers and user_id not in approvers:
+    # Fail CLOSED: an empty/unset COUNTY_LAUNCH_APPROVERS must mean nobody is
+    # authorized, not everybody — this endpoint hadn't received the fix
+    # already applied to _relay_approver_authorized (PR #179 finding #3).
+    if not approvers or user_id not in approvers:
         return _slack_ephemeral("Not authorized to approve county launches.")
 
     actions = payload.get("actions", [])
@@ -1435,22 +1487,18 @@ def _update_relay_slack_message(slack_message_ts: str, reply_text: str) -> None:
 
 @router.post("/slack/relay-decision")
 async def slack_relay_decision(request: Request):
-    """
-    Receives Slack interactive component payloads for Relay approval-queue
-    Approve/Reject buttons (build spec §1.1.13 tap surface).
-    Auth: Slack HMAC-SHA256 signature (no JWT — Slack signature IS the auth).
-    """
-    from src.services.relay import queue as relay_queue
-
+    """Deprecated individual URL — kept as an alias until the Slack app's
+    Interactivity Request URL is cut over to /slack/interact."""
     raw = await request.body()
     if not _verify_slack_signature(dict(request.headers), raw):
         raise HTTPException(status_code=401, detail="Invalid Slack signature")
+    return _handle_relay_decision(_parse_slack_interactive_payload(raw))
 
-    try:
-        payload_str = parse_qs(raw.decode("utf-8")).get("payload", ["{}"])[0]
-        payload = json.loads(payload_str)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Malformed payload")
+
+def _handle_relay_decision(payload: dict) -> dict:
+    """Approve/Reject a pending Relay approval-queue item (build spec
+    §1.1.13 tap surface)."""
+    from src.services.relay import queue as relay_queue
 
     user_id = payload.get("user", {}).get("id", "")
     if not _relay_approver_authorized(user_id):
@@ -1544,7 +1592,7 @@ def approve_win_story(
     Sets is_public=True and records the approver's email.
     """
     row = db.execute(
-        sa_text("SELECT id, is_public FROM win_story_assets WHERE id = :id FOR UPDATE"),
+        text("SELECT id, is_public FROM win_story_assets WHERE id = :id FOR UPDATE"),
         {"id": asset_id},
     ).fetchone()
     if not row:
@@ -1552,7 +1600,7 @@ def approve_win_story(
     if row.is_public:
         return {"ok": True, "detail": "already_public"}
     db.execute(
-        sa_text("""
+        text("""
             UPDATE win_story_assets
                SET is_public = true, approved_by = :by
              WHERE id = :id
@@ -1566,20 +1614,16 @@ def approve_win_story(
 
 @router.post("/slack/win-story/interact")
 async def slack_win_story_interact(request: Request, db: Session = Depends(get_db)):
-    """
-    Receives Slack interactive payloads for win-story Approve/Dismiss buttons.
-    Auth: Slack HMAC-SHA256 signature.
-    """
+    """Deprecated individual URL — kept as an alias until the Slack app's
+    Interactivity Request URL is cut over to /slack/interact."""
     raw = await request.body()
     if not _verify_slack_signature(dict(request.headers), raw):
         raise HTTPException(status_code=401, detail="Invalid Slack signature")
+    return _handle_win_story_interact(_parse_slack_interactive_payload(raw), db)
 
-    try:
-        payload_str = parse_qs(raw.decode("utf-8")).get("payload", ["{}"])[0]
-        payload = json.loads(payload_str)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Malformed payload")
 
+def _handle_win_story_interact(payload: dict, db: Session) -> dict:
+    """Approve/Dismiss a staged win-story asset."""
     actions = payload.get("actions", [])
     if not actions:
         return _slack_ephemeral("No action in payload.")
@@ -1597,7 +1641,7 @@ async def slack_win_story_interact(request: Request, db: Session = Depends(get_d
         raise HTTPException(status_code=400, detail="Invalid action data")
 
     row = db.execute(
-        sa_text("SELECT id, is_public, proof_text FROM win_story_assets WHERE id = :id FOR UPDATE"),
+        text("SELECT id, is_public, proof_text FROM win_story_assets WHERE id = :id FOR UPDATE"),
         {"id": asset_id},
     ).fetchone()
 
@@ -1608,7 +1652,7 @@ async def slack_win_story_interact(request: Request, db: Session = Depends(get_d
 
     if action == "approve":
         db.execute(
-            sa_text("""
+            text("""
                 UPDATE win_story_assets
                    SET is_public = true, approved_by = :by
                  WHERE id = :id

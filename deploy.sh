@@ -9,6 +9,15 @@ VENV="$PROJECT_DIR/.venv/bin"
 LAST_GOOD_FILE="$PROJECT_DIR/.last-good-deploy"
 LIFECYCLE_UNIT_SRC="$PROJECT_DIR/deploy/systemd/lifecycle.service"
 LIFECYCLE_UNIT_DST="/etc/systemd/system/lifecycle.service"
+# Cora (Agent Lane cold-outreach worker) — installed as cora.service. This
+# filename previously belonged to the pre-PR#177 Lifecycle unit, which this
+# script used to actively stop+disable on every deploy (a "retire legacy
+# cora unit" step). That retirement step is gone now that cora.service is
+# the current, intentional name for the cold-outreach worker — the rename
+# migration has already run against prod (lifecycle_* tables confirmed live),
+# so the old pre-rename unit this step targeted should not exist anymore.
+CORA_UNIT_SRC="$PROJECT_DIR/deploy/systemd/cora.service"
+CORA_UNIT_DST="/etc/systemd/system/cora.service"
 
 cd "$PROJECT_DIR"
 
@@ -45,6 +54,12 @@ rollback() {
     "$VENV/pip" install -q -r requirements.txt || echo "ROLLBACK WARNING: pip install failed on rollback" >&2
     systemctl restart fa-api || echo "ROLLBACK WARNING: fa-api restart failed" >&2
     restart_agent_service || echo "ROLLBACK WARNING: agent service restart failed" >&2
+    # Best-effort: a rollback target predating today's cora.service (cold-outreach
+    # worker) content won't have this unit yet, which is expected and not a
+    # rollback failure.
+    if systemctl list-unit-files cora.service &>/dev/null; then
+        systemctl restart cora || echo "ROLLBACK WARNING: cora restart failed" >&2
+    fi
     echo "== ROLLBACK COMPLETE — prod running $good_sha ==" >&2
     echo "NOTE: if $good_sha predates the cora->lifecycle DB rename, schema and code are now mismatched — this deploy cannot undo a completed DB rename. Manual DB recovery required." >&2
 }
@@ -65,7 +80,7 @@ AFTER=$(git rev-parse HEAD)
 echo "== 2/7 install deps =="
 "$VENV/pip" install -q -r requirements.txt || fail "pip install -r requirements.txt"
 
-echo "== 3/7 install/enable lifecycle systemd unit =="
+echo "== 3/7 install/enable lifecycle + cora systemd units =="
 # Must succeed BEFORE any DB migration runs: the rename migration below drops
 # cora_* schema objects, and if the lifecycle.service unit isn't installed the
 # restart in step 5 fails against a database that no longer matches the old
@@ -78,6 +93,16 @@ if ! cmp -s "$LIFECYCLE_UNIT_SRC" "$LIFECYCLE_UNIT_DST" 2>/dev/null; then
     systemctl daemon-reload || fail "systemctl daemon-reload"
 fi
 systemctl enable lifecycle || fail "systemctl enable lifecycle"
+
+# Cora cold-outreach worker — separate long-running daemon, own unit file.
+if [ ! -f "$CORA_UNIT_SRC" ]; then
+    fail "cora.service unit file not found at $CORA_UNIT_SRC"
+fi
+if ! cmp -s "$CORA_UNIT_SRC" "$CORA_UNIT_DST" 2>/dev/null; then
+    cp "$CORA_UNIT_SRC" "$CORA_UNIT_DST" || fail "install cora.service"
+    systemctl daemon-reload || fail "systemctl daemon-reload"
+fi
+systemctl enable cora || fail "systemctl enable cora"
 
 echo "== 4/7 run pending migrations =="
 # ponytail: "pending" = migration files newly added by this pull (ADR 0024 keeps
@@ -100,16 +125,14 @@ echo "== 5/7 install cron + restart services =="
 bash scripts/cron/install_cron.sh > /dev/null || fail "install_cron.sh"
 systemctl restart fa-api || fail "systemctl restart fa-api"
 systemctl restart lifecycle || fail "systemctl restart lifecycle"
+systemctl restart cora || fail "systemctl restart cora"
 
 RESTART_TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-echo "== 6/7 verify lifecycle health, retire legacy cora unit =="
+echo "== 6/7 verify lifecycle + cora health =="
 sleep 2
 systemctl is-active --quiet lifecycle || fail "lifecycle service not active after restart"
-if systemctl list-unit-files cora.service &>/dev/null; then
-    systemctl stop cora || echo "WARNING: failed to stop legacy cora.service" >&2
-    systemctl disable cora || echo "WARNING: failed to disable legacy cora.service" >&2
-fi
+systemctl is-active --quiet cora || fail "cora service not active after restart"
 
 echo "== 7/7 refresh Prometheus/Alertmanager config (if installed) =="
 # Best-effort — only runs on boxes where Prometheus is actually deployed.
@@ -126,7 +149,17 @@ if [ -d /etc/prometheus ]; then
     systemctl reload prometheus || fail "systemctl reload prometheus"
 fi
 if [ -d /etc/alertmanager ]; then
-    cp deploy/prometheus/alertmanager.yml /etc/alertmanager/alertmanager.yml || fail "copy alertmanager.yml"
+    # Render, don't copy: alertmanager.yml carries placeholder tokens for the
+    # webhook auth secret and the Slack incoming-webhook URL. A plain cp would
+    # overwrite the live config with those git-committed placeholders on every
+    # deploy, silently downgrading webhook auth and killing Slack delivery.
+    AM_WEBHOOK_SECRET=$(grep -E '^PROMETHEUS_ALERT_WEBHOOK_SECRET=' "$PROJECT_DIR/.env" | cut -d'=' -f2- | tr -d '"' | tr -d "'")
+    AM_SLACK_WEBHOOK_URL=$(grep -E '^ALERTMANAGER_SLACK_WEBHOOK_URL=' "$PROJECT_DIR/.env" | cut -d'=' -f2- | tr -d '"' | tr -d "'")
+    [ -z "$AM_WEBHOOK_SECRET" ] && fail "PROMETHEUS_ALERT_WEBHOOK_SECRET not found in $PROJECT_DIR/.env"
+    [ -z "$AM_SLACK_WEBHOOK_URL" ] && fail "ALERTMANAGER_SLACK_WEBHOOK_URL not found in $PROJECT_DIR/.env"
+    sed -e "s|prom-wh-s3cr3t-fa-stage10|${AM_WEBHOOK_SECRET}|g" \
+        -e "s|https://hooks.slack.com/services/REPLACE_ME|${AM_SLACK_WEBHOOK_URL}|g" \
+        deploy/prometheus/alertmanager.yml > /etc/alertmanager/alertmanager.yml || fail "render alertmanager.yml"
     systemctl reload alertmanager || fail "systemctl reload alertmanager"
 fi
 

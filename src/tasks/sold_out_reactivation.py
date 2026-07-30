@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 
 def _claim_url(zip_code: str) -> str:
-    return f"https://forcedaction.io?zip={zip_code}"
+    return f"https://forcedactionleads.com?zip={zip_code}"
 
 
 def _send_waitlist_email(entry, zip_code: str, vertical: str,

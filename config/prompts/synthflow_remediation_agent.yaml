@@ -29,7 +29,7 @@ voicemail_action: "leave_message"
 
 # ── Webhook (post-call) ───────────────────────────────────────
 webhook:
-  url: "https://YOUR_DOMAIN/webhooks/synthflow"
+  url: "https://forcedactionleads.com/webhooks/synthflow"
   method: POST
 
 # ── Tools ────────────────────────────────────────────────────
@@ -40,7 +40,7 @@ tools:
       for the restoration/remediation vertical. Call this BEFORE the bridge
       line so [X] is accurate.
     method: GET
-    url: "https://YOUR_DOMAIN/api/synthflow/lead-count"
+    url: "https://forcedactionleads.com/api/synthflow/lead-count"
     parameters:
       zip_code:
         type: string

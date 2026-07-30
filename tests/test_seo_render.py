@@ -57,10 +57,10 @@ def test_render_includes_pixel_when_meta_pixel_id_set():
 def test_render_cta_uses_app_cta_url_not_signup_path():
     """The React app has no /signup route — that link 404's via the catch-all.
     Both CTAs (header + page body) must use the resolved app_cta_url instead."""
-    data = {**_SAMPLE, "app_cta_url": "https://app.forcedaction.io/?utm_source=seo&utm_medium=organic&utm_campaign=wholesalers"}
+    data = {**_SAMPLE, "app_cta_url": "https://app.forcedactionleads.com/?utm_source=seo&utm_medium=organic&utm_campaign=wholesalers"}
     html = render_page(data)
     assert "/signup" not in html
-    assert html.count('href="https://app.forcedaction.io/?utm_source=seo&amp;utm_medium=organic&amp;utm_campaign=wholesalers"') == 2
+    assert html.count('href="https://app.forcedactionleads.com/?utm_source=seo&amp;utm_medium=organic&amp;utm_campaign=wholesalers"') == 2
 
 
 def test_render_noindex_meta_when_status_noindex():

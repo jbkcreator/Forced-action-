@@ -27,13 +27,19 @@ AM_CONFIG_DIR="/etc/alertmanager"
 AM_DATA_DIR="/var/lib/alertmanager"
 ARCH="linux-amd64"
 
-# ── Load PROMETHEUS_ALERT_WEBHOOK_SECRET from .env ────────────────────────────
+# ── Load PROMETHEUS_ALERT_WEBHOOK_SECRET + ALERTMANAGER_SLACK_WEBHOOK_URL from .env ──
 WEBHOOK_SECRET=""
+SLACK_WEBHOOK_URL=""
 if [ -f "$PROJECT_DIR/.env" ]; then
     WEBHOOK_SECRET=$(grep -E '^PROMETHEUS_ALERT_WEBHOOK_SECRET=' "$PROJECT_DIR/.env" | cut -d'=' -f2- | tr -d '"' | tr -d "'")
+    SLACK_WEBHOOK_URL=$(grep -E '^ALERTMANAGER_SLACK_WEBHOOK_URL=' "$PROJECT_DIR/.env" | cut -d'=' -f2- | tr -d '"' | tr -d "'")
 fi
 if [ -z "$WEBHOOK_SECRET" ]; then
     echo "ERROR: PROMETHEUS_ALERT_WEBHOOK_SECRET not found in $PROJECT_DIR/.env"
+    exit 1
+fi
+if [ -z "$SLACK_WEBHOOK_URL" ]; then
+    echo "ERROR: ALERTMANAGER_SLACK_WEBHOOK_URL not found in $PROJECT_DIR/.env"
     exit 1
 fi
 
@@ -90,9 +96,10 @@ cp "$PROJECT_DIR/deploy/prometheus/prometheus.yml" "$PROM_CONFIG_DIR/prometheus.
 cp "$PROJECT_DIR/deploy/prometheus/alert_rules.yml" "$PROM_CONFIG_DIR/rules/alert_rules.yml"
 chown -R "$PROM_USER:$PROM_USER" "$PROM_CONFIG_DIR"
 
-# ── 6. Write Alertmanager config (inject webhook secret) ──────────────────────
-echo "[7/9] Writing Alertmanager config (with webhook secret)..."
-sed "s|prom-wh-s3cr3t-fa-stage10|${WEBHOOK_SECRET}|g" \
+# ── 6. Write Alertmanager config (inject webhook secret + Slack URL) ──────────
+echo "[7/9] Writing Alertmanager config (with webhook secret + Slack URL)..."
+sed -e "s|prom-wh-s3cr3t-fa-stage10|${WEBHOOK_SECRET}|g" \
+    -e "s|https://hooks.slack.com/services/REPLACE_ME|${SLACK_WEBHOOK_URL}|g" \
     "$PROJECT_DIR/deploy/prometheus/alertmanager.yml" > "$AM_CONFIG_DIR/alertmanager.yml"
 chown "$PROM_USER:$PROM_USER" "$AM_CONFIG_DIR/alertmanager.yml"
 

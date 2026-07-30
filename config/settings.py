@@ -291,7 +291,7 @@ class AppSettings(BaseSettings):
 	app_base_url: str = Field(
 		default="http://localhost:8000",
 		env="APP_BASE_URL",
-		description="Public base URL of this app (e.g. https://app.forcedaction.io)",
+		description="Public base URL of this app (e.g. https://app.forcedactionleads.com)",
 	)
 
 	# CAN-SPAM footer requirement — placeholder until client supplies the real one
@@ -644,7 +644,7 @@ class AppSettings(BaseSettings):
 	stripe_test_price_wl_premium: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_WL_PREMIUM")
 	# Public base URL of the React frontend — used to build links in WL emails
 	# (verify-email, password reset, invites, login). Dev default points at the
-	# Vite dev server; set WL_FRONTEND_BASE_URL=https://app.forcedaction.io in prod.
+	# Vite dev server; set WL_FRONTEND_BASE_URL=https://app.forcedactionleads.com in prod.
 	wl_frontend_base_url: str = Field(default="http://localhost:5173", env="WL_FRONTEND_BASE_URL")
 	# Separate webhook secret for the /webhooks/stripe/white-label endpoint
 	wl_stripe_webhook_secret: Optional[SecretStr] = Field(default=None, env="WL_STRIPE_WEBHOOK_SECRET")
