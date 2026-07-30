@@ -428,8 +428,8 @@ class AppSettings(BaseSettings):
 	# Human close routing (Phase A)
 	slack_human_close_webhook: Optional[str] = Field(default=None, env="SLACK_HUMAN_CLOSE_WEBHOOK")
 
-	# Fleet event dead-letter alerting (QUALITY-v2.2 Q1)
-	lifecycle_incidents_webhook: Optional[str] = Field(default=None, env="LIFECYCLE_INCIDENTS_WEBHOOK")
+	# Lifecycle / fleet incident Slack channel (QUALITY-v2.2 Q1 dead-letter alerting)
+	lifecycle_incident_slack_channel: Optional[str] = Field(default=None, env="LIFECYCLE_INCIDENT_SLACK_CHANNEL")
 
 	# Accelerated Wallet Push (fa016) — master kill switch.
 	# Detector, sweep, Cora graph, and API endpoints all skip when False.

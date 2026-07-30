@@ -19,7 +19,6 @@ import logging
 from datetime import datetime, timezone
 from typing import Callable
 
-import requests
 from sqlalchemy import text as sa_text
 
 from src.services.fleet_event_bus import is_processed, mark_processed
@@ -29,18 +28,31 @@ logger = logging.getLogger(__name__)
 
 def _alert_dead_letter(event_id: int, consumer: str, error_msg: str) -> None:
     from config.settings import get_settings
-    webhook = get_settings().lifecycle_incidents_webhook
-    if not webhook:
+    settings = get_settings()
+    token = settings.slack_bot_token
+    channel = settings.lifecycle_incident_slack_channel
+    if not token or not channel:
         logger.warning(
-            "[FleetEventConsumer] dead-letter alert skipped (LIFECYCLE_INCIDENTS_WEBHOOK not set): "
-            "event_id=%s consumer=%s", event_id, consumer,
+            "[FleetEventConsumer] dead-letter alert skipped (SLACK_BOT_TOKEN or "
+            "LIFECYCLE_INCIDENT_SLACK_CHANNEL not set): event_id=%s consumer=%s",
+            event_id, consumer,
         )
         return
     try:
-        requests.post(
-            webhook,
-            json={"text": f":skull: *Fleet dead letter* — event `{event_id}` consumer `{consumer}` exhausted retries.\n```{error_msg[:300]}```"},
-            timeout=5,
+        from slack_sdk import WebClient
+        WebClient(token=token.get_secret_value()).chat_postMessage(
+            channel=channel,
+            text=f":skull: *Fleet dead letter* — event `{event_id}` consumer `{consumer}` exhausted retries.",
+            blocks=[
+                {"type": "header", "text": {"type": "plain_text", "text": ":skull: Fleet dead letter"}},
+                {"type": "section", "fields": [
+                    {"type": "mrkdwn", "text": f"*Event ID*\n{event_id}"},
+                    {"type": "mrkdwn", "text": f"*Consumer*\n{consumer}"},
+                ]},
+                {"type": "context", "elements": [
+                    {"type": "mrkdwn", "text": error_msg[:300]},
+                ]},
+            ],
         )
     except Exception as exc:
         logger.error("[FleetEventConsumer] dead-letter Slack alert failed: %s", exc)
