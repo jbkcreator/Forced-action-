@@ -60,9 +60,9 @@ class AgentsSettings(AppSettings):
 		),
 	)
 	founder_minute_rate_cents: int = Field(
-		default=100,
+		default=417,
 		env="FOUNDER_MINUTE_RATE_CENTS",
-		description="Cents per founder-minute for the P&L formula. Default: $1.00/min.",
+		description="Cents per founder-minute for the P&L formula. $4.17/min ($250/hr), ratified by Josh.",
 	)
 
 	# ── LangSmith tracing ─────────────────────────────────────────────────────
