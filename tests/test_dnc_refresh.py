@@ -118,3 +118,62 @@ def test_collect_owner_phones_does_not_join_enriched_contacts_without_source():
 
     assert "FROM enriched_contacts ec" not in session.sql
     assert "source" not in session.params
+
+
+# ---------------------------------------------------------------------------
+# _reenqueue_dnc_blocked_subscriber_calls
+# ---------------------------------------------------------------------------
+
+class _ReenqueueSession:
+    """Fake session that returns configurable rows from execute()."""
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def execute(self, sql, params=None):
+        return _Rows(self._rows)
+
+
+def test_reenqueue_dispatches_for_dnc_blocked_subscriber_with_clean_result():
+    session = _ReenqueueSession([(42, "+18135550200")])
+
+    published = []
+    with patch("src.agents.events.ingestion.publish_lifecycle_event", side_effect=published.append):
+        count = dnc_refresh._reenqueue_dnc_blocked_subscriber_calls(session)
+
+    assert count == 1
+    assert published[0]["event_type"] == "new_lead_signup"
+    assert published[0]["subscriber_id"] == 42
+    assert published[0]["source"] == "dnc_refresh_retry"
+
+
+def test_reenqueue_returns_zero_when_no_blocked_decisions():
+    session = _ReenqueueSession([])
+
+    with patch("src.agents.events.ingestion.publish_lifecycle_event") as pub:
+        count = dnc_refresh._reenqueue_dnc_blocked_subscriber_calls(session)
+
+    assert count == 0
+    pub.assert_not_called()
+
+
+def test_reenqueue_continues_after_publish_failure():
+    """A single publish error must not abort re-enqueue for remaining subscribers."""
+    session = _ReenqueueSession([
+        (10, "+18135550201"),
+        (11, "+18135550202"),
+    ])
+
+    call_count = 0
+
+    def _flaky(event):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise RuntimeError("Redis unavailable")
+
+    with patch("src.agents.events.ingestion.publish_lifecycle_event", side_effect=_flaky):
+        count = dnc_refresh._reenqueue_dnc_blocked_subscriber_calls(session)
+
+    # subscriber 10 failed, subscriber 11 succeeded — count reflects successes only
+    assert count == 1
