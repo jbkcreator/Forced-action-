@@ -705,6 +705,7 @@ def run_live_state() -> int:
     )
 
     from src.services.email import send_alert
+    from src.services.vera_slack import post_vera_report
 
     recipients = report_recipients()
     if not recipients:
@@ -714,6 +715,8 @@ def run_live_state() -> int:
             send_alert(subject, body, html_body=html_body, to=addr)
         except Exception as exc:
             logger.warning("[Vera] failed to send live-state report to %s: %s", addr, exc)
+
+    post_vera_report(subject, body)
 
     stale_count = sum(1 for b in cron_beats if b.is_stale)
     logger.info(
