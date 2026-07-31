@@ -387,6 +387,10 @@ class AppSettings(BaseSettings):
 	smtp_pass: Optional[SecretStr] = Field(default=None, env="SMTP_PASS")
 	email_from: Optional[str] = Field(default=None, env="EMAIL_FROM")  # falls back to smtp_user if not set
 	alert_email: Optional[str] = Field(default=None, env="ALERT_EMAIL")  # ops alert recipient
+	# QUALITY-v2.2 Q4 — dedicated inbox for the mail-probe canary (decision
+	# F11). Falls back to ALERT_EMAIL if unset — but a dedicated address is
+	# recommended: this probe sends one email every 5 minutes (288/day).
+	canary_mail_to: Optional[str] = Field(default=None, env="CANARY_MAIL_TO")
 	report_recipients: Optional[str] = Field(default=None, env="REPORT_RECIPIENTS")  # comma-separated emails for daily/weekly reports
 	report_cc_recipients: Optional[str] = Field(default=None, env="REPORT_CC_RECIPIENTS")  # CC'd on every non-CC recipient send (visibility/confirmation)
 
