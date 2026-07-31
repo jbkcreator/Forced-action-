@@ -12,7 +12,7 @@ from src.services.relay import sweep
 
 def test_sweep_returns_empty_result_with_no_approved_items(monkeypatch):
     monkeypatch.setattr(sweep, "sync_unsubscribes", lambda: 0)
-    monkeypatch.setattr(sweep.queue, "approved_batch", lambda limit=50: [])
+    monkeypatch.setattr(sweep.queue, "approved_batch", lambda limit=50, venture_key=None: [])
 
     result = sweep.run_sweep()
 
@@ -23,7 +23,7 @@ def test_sweep_returns_empty_result_with_no_approved_items(monkeypatch):
 def test_sweep_calls_sync_before_execute(monkeypatch):
     order = []
     monkeypatch.setattr(sweep, "sync_unsubscribes", lambda: order.append("sync") or 0)
-    monkeypatch.setattr(sweep.queue, "approved_batch", lambda limit=50: order.append("query") or [])
+    monkeypatch.setattr(sweep.queue, "approved_batch", lambda limit=50, venture_key=None: order.append("query") or [])
 
     sweep.run_sweep()
 
@@ -36,7 +36,7 @@ def test_sync_failure_does_not_stop_the_batch(monkeypatch):
         raise RuntimeError("Instantly API down")
 
     monkeypatch.setattr(sweep, "sync_unsubscribes", _raiser)
-    monkeypatch.setattr(sweep.queue, "approved_batch", lambda limit=50: [])
+    monkeypatch.setattr(sweep.queue, "approved_batch", lambda limit=50, venture_key=None: [])
 
     result = sweep.run_sweep()  # must not raise
 

@@ -11,9 +11,11 @@ from __future__ import annotations
 import logging
 import uuid
 
+from config.venture_template import DEFAULT_VENTURE_KEY
 from src.services.relay import queue
 from src.services.relay.engine import BatchResult, execute_batch
 from src.services.relay.suppression_sync import sync_unsubscribes
+from src.utils.venture_config import get_venture_config
 
 # Import for its registration side effect only — makes the real 'email'
 # channel (RELAY-v2.2 R2) available in DISPATCHERS whenever this module is
@@ -24,7 +26,7 @@ import src.services.relay.channels_email  # noqa: F401,E402
 logger = logging.getLogger(__name__)
 
 
-def run_sweep(*, limit: int = 50) -> BatchResult:
+def run_sweep(*, limit: int = 50, venture_key: str = DEFAULT_VENTURE_KEY) -> BatchResult:
     """Query relay_approval_queue WHERE status='approved', execute them as
     one batch tagged with a fresh batch_id. Returns the BatchResult (also
     what --sweep prints).
@@ -34,6 +36,12 @@ def run_sweep(*, limit: int = 50) -> BatchResult:
     tick's guards.evaluate() suppression recheck runs. A dead Instantly API
     must not stop already-approved sends, so failures here are logged and
     swallowed rather than propagated.
+
+    One sweep run covers exactly one venture (CLONE-v2.2 / CL3): the batch
+    is filtered to that venture's rows and executed under that venture's
+    resolved config, because the send window, daily ceiling and kill-switch
+    key all differ per venture. A second venture means a second cron line
+    (`--sweep --venture <key>`), not a wider batch.
     """
     try:
         n = sync_unsubscribes()
@@ -42,11 +50,15 @@ def run_sweep(*, limit: int = 50) -> BatchResult:
     except Exception:
         logger.error("[Relay] unsubscribe sync failed — continuing to execute batch", exc_info=True)
 
-    items = queue.approved_batch(limit=limit)
+    items = queue.approved_batch(limit=limit, venture_key=venture_key)
     if not items:
-        logger.info("[Relay] sweep: no approved items")
+        logger.info("[Relay] sweep: no approved items for venture %s", venture_key)
         return BatchResult()
 
+    venture = get_venture_config(venture_key)
     batch_id = f"batch-{uuid.uuid4().hex[:12]}"
-    logger.info("[Relay] sweep: executing %d approved item(s) as %s", len(items), batch_id)
-    return execute_batch(items, batch_id=batch_id)
+    logger.info(
+        "[Relay] sweep: executing %d approved item(s) for venture %s as %s",
+        len(items), venture_key, batch_id,
+    )
+    return execute_batch(items, batch_id=batch_id, venture=venture)

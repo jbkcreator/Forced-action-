@@ -1,0 +1,244 @@
+"""
+CLONE-v2.2 CL3 — src/utils/venture_config.py.
+
+These tests deliberately NEVER commit. get_venture_config() accepts the
+session it should read on, so every row here lives inside fresh_db's nested
+transaction and disappears on rollback — no teardown helper, and no chance of
+a `ventures` row leaking into later runs (the failure mode CL2's rollup test
+hit when it committed inside the test body).
+
+The cache is module-level state shared across tests, so `clean_cache`
+autouse-flushes it before and after each one.
+"""
+
+from __future__ import annotations
+
+import uuid
+
+import pytest
+from sqlalchemy import text
+
+from config.settings import get_settings
+from config.venture_template import DEFAULT_KILL_SWITCH_FEATURE, DEFAULT_VENTURE_KEY
+from src.utils import venture_config
+from src.utils.venture_config import get_venture_config, invalidate_cache
+
+
+@pytest.fixture(autouse=True)
+def clean_cache():
+    invalidate_cache()
+    yield
+    invalidate_cache()
+
+
+def _insert_venture(db, venture_key: str, **overrides) -> None:
+    params = {
+        "venture_key": venture_key,
+        "display_name": f"Display {venture_key}",
+        "brand_name": f"Brand {venture_key}",
+        "postal_address": None,
+        "state": "TX",
+        "bankruptcy_court_code": "txnb",
+        "default_bankruptcy_division": "4:",
+        "template_county_id": None,
+        "relay_slack_channel": "#venture-approvals",
+        "relay_instantly_campaign_id": "camp_abc",
+        "relay_instantly_sender_email": "hello@venture.example",
+        "relay_send_window_start": 9,
+        "relay_send_window_end": 17,
+        "relay_send_window_timezone": "America/Chicago",
+        "relay_daily_ceiling": 42,
+        "kill_switch_feature": "relay_venture_two",
+        "is_active": True,
+    }
+    params.update(overrides)
+    db.execute(text("""
+        INSERT INTO ventures (
+            venture_key, display_name, brand_name, postal_address, state,
+            bankruptcy_court_code, default_bankruptcy_division, template_county_id,
+            relay_slack_channel, relay_approvers, relay_instantly_campaign_id,
+            relay_instantly_sender_email, relay_send_window_start,
+            relay_send_window_end, relay_send_window_timezone, relay_daily_ceiling,
+            kill_switch_feature, is_active
+        )
+        VALUES (
+            :venture_key, :display_name, :brand_name, :postal_address, :state,
+            :bankruptcy_court_code, :default_bankruptcy_division, :template_county_id,
+            :relay_slack_channel, '["U_ONE"]'::jsonb, :relay_instantly_campaign_id,
+            :relay_instantly_sender_email, :relay_send_window_start,
+            :relay_send_window_end, :relay_send_window_timezone, :relay_daily_ceiling,
+            :kill_switch_feature, :is_active
+        )
+    """), params)
+
+
+def test_db_row_wins_over_env(fresh_db):
+    key = f"vc_{uuid.uuid4().hex[:8]}"
+    _insert_venture(fresh_db, key)
+
+    cfg = get_venture_config(key, session=fresh_db)
+
+    assert cfg.venture_key == key
+    assert cfg.brand_name == f"Brand {key}"
+    assert cfg.state == "TX"
+    assert cfg.bankruptcy_court_code == "txnb"
+    assert cfg.default_bankruptcy_division == "4:"
+    assert cfg.relay_slack_channel == "#venture-approvals"
+    assert cfg.relay_approvers == ("U_ONE",)
+    assert cfg.relay_instantly_campaign_id == "camp_abc"
+    assert cfg.relay_send_window_start == 9
+    assert cfg.relay_send_window_end == 17
+    assert cfg.relay_send_window_timezone == "America/Chicago"
+    assert cfg.relay_daily_ceiling == 42
+    assert cfg.kill_switch_feature == "relay_venture_two"
+
+
+def test_unknown_venture_falls_back_to_env(fresh_db):
+    """A key with no row must resolve, not raise — Relay has to keep sending
+    through a config-resolution problem."""
+    settings = get_settings()
+
+    cfg = get_venture_config(f"missing_{uuid.uuid4().hex[:8]}", session=fresh_db)
+
+    assert cfg.state == "FL"
+    assert cfg.bankruptcy_court_code == "flmb"
+    assert cfg.kill_switch_feature == DEFAULT_KILL_SWITCH_FEATURE
+    assert cfg.relay_send_window_start == settings.relay_send_window_start
+    assert cfg.relay_send_window_end == settings.relay_send_window_end
+    assert cfg.relay_send_window_timezone == settings.relay_send_window_timezone
+    assert cfg.relay_daily_ceiling == settings.relay_daily_ceiling
+    assert cfg.relay_slack_channel == settings.relay_slack_channel
+    assert cfg.postal_address == settings.company_postal_address
+
+
+def test_inactive_venture_falls_back_to_env(fresh_db):
+    """A deactivated venture must not keep governing sends."""
+    key = f"vc_{uuid.uuid4().hex[:8]}"
+    _insert_venture(fresh_db, key, is_active=False)
+
+    cfg = get_venture_config(key, session=fresh_db)
+
+    assert cfg.state == "FL"  # env fallback, not the row's 'TX'
+    assert cfg.relay_daily_ceiling == get_settings().relay_daily_ceiling
+
+
+def test_null_row_columns_fall_back_to_env_per_field(fresh_db):
+    """A venture that has not provisioned its Slack channel or Instantly
+    campaign yet still resolves to a usable config."""
+    key = f"vc_{uuid.uuid4().hex[:8]}"
+    settings = get_settings()
+    _insert_venture(
+        fresh_db, key,
+        relay_slack_channel=None,
+        relay_instantly_campaign_id=None,
+        relay_instantly_sender_email=None,
+        postal_address=None,
+    )
+
+    cfg = get_venture_config(key, session=fresh_db)
+
+    assert cfg.state == "TX"  # the row still wins where it has values
+    assert cfg.relay_slack_channel == settings.relay_slack_channel
+    assert cfg.relay_instantly_campaign_id == settings.relay_instantly_campaign_id
+    assert cfg.relay_instantly_sender_email == settings.relay_instantly_sender_email
+    assert cfg.postal_address == settings.company_postal_address
+
+
+def test_seeded_venture_one_matches_env(fresh_db):
+    """The migration's venture #1 row must resolve to the same send window,
+    ceiling and court the pre-CL3 code read straight off settings — this is
+    the day-one no-op guarantee."""
+    settings = get_settings()
+
+    cfg = get_venture_config(DEFAULT_VENTURE_KEY, session=fresh_db)
+
+    assert cfg.relay_send_window_start == settings.relay_send_window_start
+    assert cfg.relay_send_window_end == settings.relay_send_window_end
+    assert cfg.relay_send_window_timezone == settings.relay_send_window_timezone
+    assert cfg.relay_daily_ceiling == settings.relay_daily_ceiling
+    assert cfg.state == "FL"
+    assert cfg.bankruptcy_court_code == "flmb"
+    assert cfg.default_bankruptcy_division == "8:"
+    assert cfg.kill_switch_feature == DEFAULT_KILL_SWITCH_FEATURE
+
+
+def test_second_call_is_served_from_cache(fresh_db):
+    key = f"vc_{uuid.uuid4().hex[:8]}"
+    _insert_venture(fresh_db, key)
+    first = get_venture_config(key, session=fresh_db)
+
+    calls: list[str] = []
+    original = venture_config._load_from_db
+    venture_config._load_from_db = lambda k, session=None: calls.append(k) or original(k, session=session)
+    try:
+        second = get_venture_config(key, session=fresh_db)
+    finally:
+        venture_config._load_from_db = original
+
+    assert calls == []          # never re-read
+    assert second is first      # same cached object
+
+
+def test_invalidate_cache_forces_a_reread(fresh_db):
+    key = f"vc_{uuid.uuid4().hex[:8]}"
+    _insert_venture(fresh_db, key, relay_daily_ceiling=42)
+    assert get_venture_config(key, session=fresh_db).relay_daily_ceiling == 42
+
+    fresh_db.execute(
+        text("UPDATE ventures SET relay_daily_ceiling = 7 WHERE venture_key = :k"),
+        {"k": key},
+    )
+    assert get_venture_config(key, session=fresh_db).relay_daily_ceiling == 42  # still cached
+
+    invalidate_cache(key)
+    assert get_venture_config(key, session=fresh_db).relay_daily_ceiling == 7
+
+
+def test_invalidate_one_venture_leaves_the_others_cached(fresh_db):
+    first, second = f"vc_a_{uuid.uuid4().hex[:6]}", f"vc_b_{uuid.uuid4().hex[:6]}"
+    _insert_venture(fresh_db, first)
+    _insert_venture(fresh_db, second)
+    get_venture_config(first, session=fresh_db)
+    get_venture_config(second, session=fresh_db)
+
+    invalidate_cache(first)
+
+    assert first not in venture_config._config_cache
+    assert second in venture_config._config_cache
+
+
+def test_two_ventures_resolve_independently(fresh_db):
+    first, second = f"vc_a_{uuid.uuid4().hex[:6]}", f"vc_b_{uuid.uuid4().hex[:6]}"
+    _insert_venture(fresh_db, first, state="TX", relay_daily_ceiling=42)
+    _insert_venture(fresh_db, second, state="GA", relay_daily_ceiling=5)
+
+    cfg_a = get_venture_config(first, session=fresh_db)
+    cfg_b = get_venture_config(second, session=fresh_db)
+
+    assert (cfg_a.state, cfg_a.relay_daily_ceiling) == ("TX", 42)
+    assert (cfg_b.state, cfg_b.relay_daily_ceiling) == ("GA", 5)
+
+
+def test_config_is_immutable():
+    """The cached object is shared across callers, so nothing may mutate it."""
+    from dataclasses import FrozenInstanceError
+
+    cfg = get_venture_config("no_such_venture_for_immutability_check")
+    with pytest.raises(FrozenInstanceError):
+        cfg.relay_daily_ceiling = 999  # type: ignore[misc]
+
+
+def test_db_failure_falls_back_to_env(monkeypatch, fresh_db):
+    """A broken query must not take Relay down with it."""
+    class _Boom:
+        def execute(self, *args, **kwargs):
+            raise RuntimeError("connection reset")
+
+    cfg = venture_config._load_from_db("anything", session=_Boom())
+
+    assert cfg.state == "FL"
+    assert cfg.relay_daily_ceiling == get_settings().relay_daily_ceiling
+
+
+def test_list_ventures_includes_the_seeded_venture_one():
+    assert DEFAULT_VENTURE_KEY in venture_config.list_ventures()

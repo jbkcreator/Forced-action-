@@ -876,6 +876,12 @@ COUNTY_ID=hillsborough
 # Email channel (Instantly, R2) is registered but inert until
 # RELAY_INSTANTLY_CAMPAIGN_ID is configured — see --setup-email-channel.
 # Ops reference: docs/PLATFORM-OPERATIONS-GUIDE.md ("Relay Execution Service").
+# ONE SWEEP RUN = ONE VENTURE (CLONE-v2.2 / CL3). This line covers venture #1
+# (--venture defaults to hillsborough_distress). Send window, daily ceiling,
+# Slack channel and kill-switch key are all per-venture, so a second venture
+# needs its own line rather than a wider batch — uncomment and set the key
+# after provisioning it (docs/venture-onboarding.md):
+#   */30 * * * * $PROJECT/scripts/cron/run.sh src.services.relay --sweep --venture venture_two
 */30 * * * * $PROJECT/scripts/cron/run.sh src.services.relay --sweep
 
 # T-B12-07 — Deal-of-the-day daily pick (idempotent, one row per date).
