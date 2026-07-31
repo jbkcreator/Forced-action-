@@ -642,6 +642,11 @@ class AppSettings(BaseSettings):
 	# anomaly_pager). Slack-disabled is NEVER a silent failure.
 	lifecycle_incident_slack_channel: Optional[str] = Field(default=None, env="LIFECYCLE_INCIDENT_SLACK_CHANNEL")
 
+	# QUALITY-v2.2 Q3 — handoff-contract auto-reject notifications (decision D2:
+	# "auto-reject triggers a Slack message to Josh"). Reuses slack_bot_token
+	# above, same convention as relay_slack_channel/lifecycle_incident_slack_channel.
+	quality_contracts_slack_channel: Optional[str] = Field(default=None, env="QUALITY_CONTRACTS_SLACK_CHANNEL")
+
 	# Stage 10 — Prometheus metrics exposition (fa055).
 	# When true, GET /metrics returns Prometheus text format with kill-switch
 	# business metrics and variant slot performance.
