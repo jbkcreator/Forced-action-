@@ -2280,16 +2280,24 @@ def event_feed(
     if subscriber.status not in ("active", "grace", "disputed", "past_due"):
         raise HTTPException(status_code=403, detail={"error": "subscription_inactive", "message": "Subscription is not active"})
 
-    # 2. Get subscriber's locked ZIP codes
+    # 2. Get subscriber's locked ZIP codes (demo accounts see all county ZIPs)
     try:
-        locked_zips = db.execute(
-            select(ZipTerritory.zip_code).where(
-                and_(
-                    ZipTerritory.subscriber_id == subscriber.id,
-                    ZipTerritory.status.in_(["locked", "grace"]),
+        if subscriber.is_demo:
+            locked_zips = db.execute(
+                select(Property.zip).where(
+                    Property.county_id == subscriber.county_id,
+                    Property.zip.isnot(None),
+                ).distinct()
+            ).scalars().all()
+        else:
+            locked_zips = db.execute(
+                select(ZipTerritory.zip_code).where(
+                    and_(
+                        ZipTerritory.subscriber_id == subscriber.id,
+                        ZipTerritory.status.in_(["locked", "grace"]),
+                    )
                 )
-            )
-        ).scalars().all()
+            ).scalars().all()
     except OperationalError:
         logger.error("DB error fetching locked ZIPs for feed", exc_info=True)
         raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
@@ -2811,14 +2819,22 @@ def feed_stats(feed_uuid: str, db: Session = Depends(get_db), _auth=Depends(get_
         raise HTTPException(status_code=403, detail={"error": "subscription_inactive", "message": "Subscription is not active"})
 
     try:
-        locked_zips = db.execute(
-            select(ZipTerritory.zip_code).where(
-                and_(
-                    ZipTerritory.subscriber_id == subscriber.id,
-                    ZipTerritory.status.in_(["locked", "grace"]),
+        if subscriber.is_demo:
+            locked_zips = db.execute(
+                select(Property.zip).where(
+                    Property.county_id == subscriber.county_id,
+                    Property.zip.isnot(None),
+                ).distinct()
+            ).scalars().all()
+        else:
+            locked_zips = db.execute(
+                select(ZipTerritory.zip_code).where(
+                    and_(
+                        ZipTerritory.subscriber_id == subscriber.id,
+                        ZipTerritory.status.in_(["locked", "grace"]),
+                    )
                 )
-            )
-        ).scalars().all()
+            ).scalars().all()
     except OperationalError:
         raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
 
@@ -3891,12 +3907,20 @@ def insurance_distress_availability(feed_uuid: str, db: Session = Depends(get_db
         raise HTTPException(status_code=404, detail={"error": "not_found", "message": "Feed not found"})
 
     try:
-        locked_zips = db.execute(
-            select(ZipTerritory.zip_code).where(
-                ZipTerritory.subscriber_id == subscriber.id,
-                ZipTerritory.status.in_(["locked", "grace"]),
-            )
-        ).scalars().all()
+        if subscriber.is_demo:
+            locked_zips = db.execute(
+                select(Property.zip).where(
+                    Property.county_id == subscriber.county_id,
+                    Property.zip.isnot(None),
+                ).distinct()
+            ).scalars().all()
+        else:
+            locked_zips = db.execute(
+                select(ZipTerritory.zip_code).where(
+                    ZipTerritory.subscriber_id == subscriber.id,
+                    ZipTerritory.status.in_(["locked", "grace"]),
+                )
+            ).scalars().all()
     except OperationalError:
         logger.error("DB error fetching locked ZIPs for insurance-distress availability", exc_info=True)
         raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
