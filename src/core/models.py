@@ -3963,6 +3963,65 @@ class PlatformCostAttribution(Base):
         return f"<PlatformCostAttribution(subscriber_id={self.subscriber_id}, method={self.attribution_method}, cost_cents={self.attributed_cost_cents})>"
 
 
+class GridCellPnl(Base):
+    """
+    CLONE-v2.2 CL2 — per-grid-cell P&L rollup, generalizing
+    PlatformRevenueLedger/PlatformCostAttribution's additive-rollup pattern
+    down from product/subscriber level to the cell level. A "cell" is
+    county_id x distress_type x buyer_vertical x offer_step — distress_type
+    is a signal key from config/scoring.py:VERTICAL_WEIGHTS[buyer_vertical]
+    (e.g. 'foreclosures', 'tax_delinquencies'), buyer_vertical is one of the
+    6 keys of VERTICAL_WEIGHTS itself, and offer_step is a `name` from
+    config/revenue_ladder.py:REVENUE_LADDER.
+
+    One row per (cell, period). Written exclusively via
+    src/services/grid_cell_pnl.py:upsert_cell_pnl(), which sums
+    platform_revenue_ledger and platform_cost_attribution for the period —
+    this table never accepts a hand-written revenue/cost figure, matching
+    the existing ledger's "one writer" convention. Re-running the rollup for
+    an already-computed period overwrites that row (period P&L is a
+    point-in-time recomputation, not an append-only event), unlike the
+    underlying ledgers themselves.
+    """
+    __tablename__ = "grid_cell_pnl"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    distress_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    buyer_vertical: Mapped[str] = mapped_column(String(50), nullable=False)
+    offer_step: Mapped[str] = mapped_column(String(50), nullable=False)
+    period_start: Mapped[date] = mapped_column(Date, nullable=False)
+    period_end: Mapped[date] = mapped_column(Date, nullable=False)
+
+    revenue_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    cost_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    # Additive-rollup convention: stored, not computed on read, so a report
+    # run today and re-run later against the same period give the same
+    # answer even if revenue_cents/cost_cents' underlying source rows later
+    # gain refunds (PlatformRevenueLedger keeps refunded rows in place).
+    contribution_margin_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    deal_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+
+    computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "county_id", "distress_type", "buyer_vertical", "offer_step",
+            "period_start", "period_end",
+            name="uq_grid_cell_pnl_cell_period",
+        ),
+        Index("idx_grid_cell_pnl_cell", "county_id", "distress_type", "buyer_vertical", "offer_step"),
+        Index("idx_grid_cell_pnl_period", "period_start", "period_end"),
+    )
+
+    def __repr__(self):
+        return (
+            f"<GridCellPnl(cell={self.county_id}/{self.distress_type}/{self.buyer_vertical}/{self.offer_step}, "
+            f"period={self.period_start}..{self.period_end}, margin_cents={self.contribution_margin_cents})>"
+        )
+
+
 class AlgorithmicVarianceLog(Base):
     """
     Task 6.2 — one row per paid/free enrichment routing decision made by
@@ -5754,6 +5813,78 @@ class DealPipelineEvent(Base):
 
     def __repr__(self) -> str:
         return f"<DealPipelineEvent(deal={self.deal_id}, {self.from_stage}->{self.to_stage})>"
+
+
+class GoldenCloseChain(Base):
+    """
+    CLONE-v2.2 CL2 — one row per closed deal, holding the full winning
+    chain (first signal -> enrichment -> first outreach -> objections
+    handled -> call -> proposal -> payment -> account expansion) as a
+    portable, queryable record so a second venture spun up off this same
+    agent fleet inherits proven patterns instead of starting from a blank
+    slate.
+
+    Deliberately denormalized (chain_stages JSONB) rather than requiring a
+    consumer to re-join deal_outcomes/deal_pipeline_events/closer_calls/
+    message_outcomes/platform_revenue_ledger itself — those remain each
+    stage's own source of truth; this table is a point-in-time assembled
+    snapshot, same relationship LifecyclePlaybook has to the tables it
+    summarizes.
+
+    schema_version + venture exist so this can later reconcile with
+    LEARN-v2.2 / L4's own golden-close data model without a breaking
+    migration: a second venture (or a schema revision from L4) adds a new
+    `venture` value / bumps `schema_version` rather than needing a new
+    table. NOT built against an agreed L4 schema yet — this is CL2's own
+    working shape, built in the absence of one, per CLONE-v2.2 lead
+    guidance.
+    """
+    __tablename__ = "golden_close_chains"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    deal_id: Mapped[int] = mapped_column(Integer, ForeignKey("deal_outcomes.id"), nullable=False, index=True)
+    venture: Mapped[str] = mapped_column(String(60), nullable=False, server_default=text("'hillsborough_distress'"))
+    schema_version: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+
+    subscriber_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=True, index=True)
+    property_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("properties.id"), nullable=True, index=True)
+    county_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    distress_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    buyer_vertical: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    offer_step: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+
+    deal_amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2), nullable=True)
+    days_to_close: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    # Ordered list of {stage, occurred_at, source_table, source_id, summary}
+    # dicts — 'first_signal','enrichment','first_outreach','objection_handled',
+    # 'call','proposal','payment','account_expansion'. Not every deal has
+    # every stage (e.g. no objections raised); consumers should not assume a
+    # fixed length.
+    chain_stages: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+
+    status: Mapped[str] = mapped_column(String(20), nullable=False, server_default=text("'draft'"))
+    authored_by: Mapped[str] = mapped_column(String(120), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('draft','verified','promoted_to_playbook','retired')",
+            name="check_golden_close_chain_status",
+        ),
+        Index(
+            "uq_golden_close_chains_deal_venture", "deal_id", "venture",
+            unique=True,
+        ),
+        Index("idx_golden_close_chains_cell", "county_id", "distress_type", "buyer_vertical", "offer_step"),
+        Index("idx_golden_close_chains_venture_status", "venture", "status"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<GoldenCloseChain(deal_id={self.deal_id}, venture={self.venture}, status={self.status})>"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
