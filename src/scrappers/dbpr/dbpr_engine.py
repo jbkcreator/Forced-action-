@@ -69,6 +69,7 @@ _LICENSE_TO_VERTICAL: dict[str, str] = {
     "RMC": "hvac",             # Registered mechanical
     "MRSA": "remediation",
     "MRSR": "remediation",
+    "CVC": "solar",
 }
 
 # TSV column positions (0-indexed) — confirmed from sample data

@@ -141,7 +141,7 @@ def _run_batchdata_stage(
         except RuntimeError as e:
             err_msg = str(e)
             logger.error("[DBPREnrich] BatchData batch %d failed: %s", batch_num, err_msg)
-            if "401" in err_msg or "402" in err_msg:
+            if "401" in err_msg or "402" in err_msg or "403" in err_msg:
                 from src.services.email import send_alert
                 send_alert(
                     subject="[Forced Action] DBPR enrichment: BatchData credential error",
@@ -150,10 +150,13 @@ def _run_batchdata_stage(
                         f"Check BATCH_SKIP_TRACING_API_KEY and BatchData credit balance."
                     ),
                 )
+                # Vendor never actually evaluated this batch — leave rows
+                # pending so the next run retries them, instead of
+                # recording a false "no match".
                 break
             for c in index_map:
                 _mark(c.id, "failed", now)
-                stats["failed"] += len(index_map)
+                stats["failed"] += 1
             continue
 
         # Persist results
@@ -177,9 +180,12 @@ def _run_batchdata_stage(
 
                     if parsed["match_success"]:
                         if parsed.get("mobile_phone"):
+                            contact.mobile_phone = parsed["mobile_phone"]
                             contact.phone = parsed["mobile_phone"]
-                        elif parsed.get("landline"):
-                            contact.phone = parsed["landline"]
+                        if parsed.get("landline"):
+                            contact.landline_phone = parsed["landline"]
+                            if not parsed.get("mobile_phone"):
+                                contact.phone = parsed["landline"]
                         if parsed.get("email"):
                             contact.email = parsed["email"]
                         contact.enrichment_status = "enriched"
@@ -275,7 +281,7 @@ def _run_idi_stage(
             results = _call_idi(searches, api_key)
         except RuntimeError as e:
             logger.error("[DBPREnrich] IDI batch %d failed: %s", batch_num, e)
-            if "401" in str(e) or "402" in str(e):
+            if "401" in str(e) or "402" in str(e) or "403" in str(e):
                 break
             stats["failed"] += len(searches)
             continue
@@ -300,9 +306,12 @@ def _run_idi_stage(
 
                     if parsed["match_success"]:
                         if parsed.get("mobile_phone"):
+                            contact.mobile_phone = parsed["mobile_phone"]
                             contact.phone = parsed["mobile_phone"]
-                        elif parsed.get("landline"):
-                            contact.phone = parsed["landline"]
+                        if parsed.get("landline"):
+                            contact.landline_phone = parsed["landline"]
+                            if not parsed.get("mobile_phone"):
+                                contact.phone = parsed["landline"]
                         if parsed.get("email"):
                             contact.email = parsed["email"]
                         contact.enrichment_status = "enriched"

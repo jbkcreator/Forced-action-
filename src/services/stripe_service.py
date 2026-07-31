@@ -19,6 +19,7 @@ Founding rate is selected atomically at checkout and locked forever.
 
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 import stripe
@@ -27,7 +28,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from config.settings import settings
-from src.core.models import FoundingSubscriberCount, Plan
+from src.core.models import County, FoundingSubscriberCount, Plan
 
 logger = logging.getLogger(__name__)
 
@@ -190,7 +191,12 @@ def get_price_id_for_checkout(
             )
             raise
 
-    is_founding = row.count < _founding_limit()
+    deadline_at = db.execute(
+        select(County.founding_price_deadline_at).where(County.county_id == county_id)
+    ).scalar_one_or_none()
+    is_founding = row.count < _founding_limit() and (
+        deadline_at is None or deadline_at > datetime.now(timezone.utc)
+    )
     price_key = "founding" if is_founding else "regular"
     price_id = prices[tier][price_key]
 
@@ -201,8 +207,8 @@ def get_price_id_for_checkout(
         )
 
     logger.info(
-        "Checkout price selected: tier=%s vertical=%s county=%s founding=%s count=%d/%d",
-        tier, vertical, county_id, is_founding, row.count, _founding_limit(),
+        "Checkout price selected: tier=%s vertical=%s county=%s founding=%s count=%d/%d deadline_at=%s",
+        tier, vertical, county_id, is_founding, row.count, _founding_limit(), deadline_at,
     )
     return price_id, is_founding
 

@@ -6,7 +6,9 @@ Generates per-contractor benchmark reports in two formats:
   PDF  — printable benchmark card per trade/county group (Jinja2 + Playwright)
 
 Both outputs are written to reports/contractor_benchmark/ with a 30-day
-retention window (same pattern as daily_dashboard.py).
+retention window (same pattern as daily_dashboard.py). The PDF is also
+emailed to ALERT_EMAIL (same recipient/pattern as qa_sample_email.py) unless
+--csv-only is passed.
 
 Usage:
     python -m src.tasks.contractor_benchmark_report
@@ -41,6 +43,7 @@ from src.services.contractor_benchmark import (
     GroupBenchmark,
     compute_benchmark_report,
 )
+from src.services.email import send_email
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +182,32 @@ def write_pdf(report: BenchmarkReport, output_path: Path) -> Path:
     return output_path
 
 
+# ── Email delivery ────────────────────────────────────────────────────────────
+
+def _email_report(pdf_path: Path, window_days: int) -> bool:
+    """Email the weekly benchmark PDF to ALERT_EMAIL. Returns True on success."""
+    settings = get_settings()
+    if not settings.alert_email:
+        logger.warning("[benchmark-report] ALERT_EMAIL not configured — skipping send")
+        return False
+
+    ok = send_email(
+        to=settings.alert_email,
+        subject=f"Contractor Benchmark Report — {date.today().isoformat()}",
+        body_text=(
+            f"This week's contractor benchmark report is attached "
+            f"(last {window_days} days, close rate/deal size/revenue vs. trade+county peers).\n\n"
+            f"— Forced Action"
+        ),
+        attachments=[pdf_path],
+    )
+    if ok:
+        logger.info("[benchmark-report] Emailed to %s", settings.alert_email)
+    else:
+        logger.warning("[benchmark-report] Email send failed")
+    return ok
+
+
 # ── Retention cleanup ─────────────────────────────────────────────────────────
 
 def _purge_old_reports() -> None:
@@ -240,6 +269,7 @@ def run_benchmark_report(
     if not csv_only:
         try:
             write_pdf(report, pdf_path)
+            summary["emailed"] = _email_report(pdf_path, window_days)
         except Exception:
             logger.exception("[benchmark-report] PDF generation failed — CSV still written")
             summary["pdf_error"] = "see logs"
