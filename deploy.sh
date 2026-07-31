@@ -96,6 +96,17 @@ for script in "${PENDING[@]:-}"; do
     PYTHONPATH="$PROJECT_DIR" "$VENV/python" "$script" || fail "migration $script"
 done
 
+# Re-grant after every migration run so vera_readonly can see any new tables.
+# ALTER DEFAULT PRIVILEGES only covers tables created by the role that ran it;
+# new tables from a different grantor slip through. This one-liner closes that gap.
+PYTHONPATH="$PROJECT_DIR" "$VENV/python" -c "
+from src.core.database import get_db_context
+from sqlalchemy import text
+with get_db_context() as db:
+    db.execute(text('GRANT SELECT ON ALL TABLES IN SCHEMA public TO vera_readonly'))
+    db.commit()
+" || echo "WARNING: vera_readonly re-grant failed (non-fatal)"
+
 echo "== 5/7 install cron + restart services =="
 bash scripts/cron/install_cron.sh > /dev/null || fail "install_cron.sh"
 systemctl restart fa-api || fail "systemctl restart fa-api"
