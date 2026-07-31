@@ -180,12 +180,16 @@ def record_batch_decision(
 
 def record_standing_order_decision(db: Any, standing_order_id: int, action: str, decided_by: str) -> Dict[str, Any]:
     """
-    action: "ratify_standing_order" | "decline_standing_order".
+    action: "ratify_standing_order" | "decline_standing_order"
+            | "archive_standing_order".
     Ratifying flips the row `active=true` — builder.py's next batch-
     construction pass will then auto-approve matching drafts (see
     builder._active_standing_order_cell_ids). Declining deletes the row
     entirely, allowing a future clean approval streak to propose again
     rather than being permanently blocked by one declined proposal.
+    Archiving (monthly-digest prune) deletes an already-active row — same
+    reasoning as decline: the cell_id can re-earn a proposal after 5 more
+    clean approvals rather than being locked out forever.
     """
     row = db.execute(
         text("SELECT slack_message_ts FROM cora_standing_orders WHERE id = :id"), {"id": standing_order_id},
@@ -212,5 +216,14 @@ def record_standing_order_decision(db: Any, standing_order_id: int, action: str,
         if result.rowcount == 0:
             return {"ok": False, "reason": "already_decided_or_not_found"}
         return {"ok": True, "action": "decline_standing_order", "standing_order_id": standing_order_id, "slack_message_ts": slack_message_ts}
+
+    if action == "archive_standing_order":
+        result = db.execute(
+            text("DELETE FROM cora_standing_orders WHERE id = :id AND active = true"),
+            {"id": standing_order_id},
+        )
+        if result.rowcount == 0:
+            return {"ok": False, "reason": "not_active_or_not_found"}
+        return {"ok": True, "action": "archive_standing_order", "standing_order_id": standing_order_id, "slack_message_ts": slack_message_ts}
 
     return {"ok": False, "reason": "unknown_action"}

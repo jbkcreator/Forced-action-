@@ -143,13 +143,15 @@ def compile_standing_orders(db: Any) -> Dict[str, Any]:
         if len(outcomes) < STREAK_THRESHOLD or any(o != "approved" for o in outcomes):
             continue
 
+        approval_count = sum(1 for o in outcomes if o == "approved")
         rule_text = f"Auto-approve future '{cell_id}' drafts without batch review"
         row = db.execute(
             text(
-                "INSERT INTO cora_standing_orders (cell_id, rule_text, active) "
-                "VALUES (:cell_id, :rule_text, false) RETURNING id"
+                "INSERT INTO cora_standing_orders "
+                "(cell_id, rule_text, active, approval_count_at_proposal) "
+                "VALUES (:cell_id, :rule_text, false, :count) RETURNING id"
             ),
-            {"cell_id": cell_id, "rule_text": rule_text},
+            {"cell_id": cell_id, "rule_text": rule_text, "count": approval_count},
         ).first()
         standing_order_id = row[0]
         slack_message_ts = _post_standing_order_proposal(standing_order_id, cell_id, rule_text)
@@ -161,6 +163,22 @@ def compile_standing_orders(db: Any) -> Dict[str, Any]:
         proposed.append({"standing_order_id": standing_order_id, "cell_id": cell_id})
 
     return {"proposed": proposed}
+
+
+def list_active_standing_orders(db: Any) -> List[Dict[str, Any]]:
+    """All currently-active (ratified) standing orders — feeds the monthly
+    prune digest. active=true means ratified; active=false rows are pending
+    proposals and are excluded here."""
+    rows = db.execute(
+        text(
+            "SELECT id, cell_id, rule_text, created_by, created_at, "
+            "       approval_count_at_proposal "
+            "FROM cora_standing_orders "
+            "WHERE active = true "
+            "ORDER BY created_at ASC"
+        )
+    ).mappings().all()
+    return [dict(r) for r in rows]
 
 
 def run_periodic(stop_event, interval_seconds: int = 30 * 60) -> None:

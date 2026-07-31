@@ -8630,6 +8630,9 @@ class CoraStandingOrder(Base):
     )
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     slack_message_ts: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    approval_count_at_proposal: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
 
     __table_args__ = (
         Index("ix_cora_standing_orders_cell_id_active", "cell_id", "active"),

@@ -1535,7 +1535,11 @@ async def slack_cora_batch_interact(request: Request, db: Session = Depends(get_
 
     action = action_data.get("action")
 
-    if action in ("ratify_standing_order", "decline_standing_order"):
+    if action == "keep_standing_order":
+        # Monthly-digest "Keep" button — inaction means keep. Ack only.
+        return {"ok": True}
+
+    if action in ("ratify_standing_order", "decline_standing_order", "archive_standing_order"):
         standing_order_id = action_data.get("standing_order_id")
         if not standing_order_id:
             raise HTTPException(status_code=400, detail="Invalid action data")
@@ -1543,11 +1547,11 @@ async def slack_cora_batch_interact(request: Request, db: Session = Depends(get_
         db.commit()
         if not result.get("ok"):
             return _slack_ephemeral(f"Standing order #{standing_order_id}: {result.get('reason', 'could not be decided')}.")
-        reply_text = (
-            f":white_check_mark: Standing order ratified by <@{user_id}>."
-            if action == "ratify_standing_order"
-            else f":no_entry: Standing order declined by <@{user_id}>."
-        )
+        reply_text = {
+            "ratify_standing_order": f":white_check_mark: Standing order ratified by <@{user_id}>.",
+            "decline_standing_order": f":no_entry: Standing order declined by <@{user_id}>.",
+            "archive_standing_order": f":wastebasket: Standing order archived by <@{user_id}>.",
+        }[action]
         if result.get("slack_message_ts"):
             through_slack.update_batch_slack_message(result["slack_message_ts"], reply_text)
         return {"ok": True}
