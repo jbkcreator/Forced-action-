@@ -6,9 +6,10 @@ Covers:
   2. OpportunityScore — actuals calibration (cold-start vs rolling mean)
   3. NBRA queue ordering and automated-action exclusion
   4. Offer recommendation rules (auction winner, whale, default fallback)
-  5. PriceAssignment — band validation and RESPA gate
+  5. PriceAssignment — band validation, RESPA gate, and floor drift guard
   6. Vertical Autopilot — dim5 and legal gate
-  7. Probe loop — presell gate and package generation
+  7. Probe loop — presell gate, package generation, sample floors, send ceiling,
+     awaiting_ruling state, idempotency retry on aborted probes
 """
 
 from __future__ import annotations
@@ -294,7 +295,9 @@ class TestPriceAssignment:
 class TestPriceVariant:
     def _make_test(self, db, test_name: str, traffic_pct: int = 100) -> "AbTest":
         from src.core.models import AbTest
+        from src.services.price_assignment import PRICE_BANDS
 
+        band = PRICE_BANDS["core_subscription"]
         test = AbTest(
             test_name=test_name,
             variant_a={},
@@ -302,8 +305,8 @@ class TestPriceVariant:
             traffic_pct=traffic_pct,
             status="active",
             offer="core_subscription",
-            control_price_cents=19700,
-            test_price_cents=24700,
+            control_price_cents=band["floor"],
+            test_price_cents=(band["floor"] + band["ceiling"]) // 2,
         )
         db.add(test)
         db.flush()
@@ -318,8 +321,9 @@ class TestPriceVariant:
         pa_mod.PRICE_BAND_TESTING_ENABLED = False
         try:
             test = self._make_test(fresh_db, "price_variant_flag_off")
+            from src.services.price_assignment import PRICE_BANDS
             result = get_price_variant("core_subscription", test.id, "OPP-2026-00040", fresh_db)
-            assert result == {"arm": "control", "price_cents": 19700, "ab_assignment_id": None}
+            assert result == {"arm": "control", "price_cents": PRICE_BANDS["core_subscription"]["floor"], "ab_assignment_id": None}
         finally:
             pa_mod.PRICE_BAND_TESTING_ENABLED = orig
 
@@ -366,10 +370,12 @@ class TestPriceVariant:
                 result = get_price_variant("core_subscription", test.id, thread_id, fresh_db)
                 arms_seen.add(result["arm"])
                 assert result["ab_assignment_id"] is not None
+                from src.services.price_assignment import PRICE_BANDS
+                band = PRICE_BANDS["core_subscription"]
                 if result["arm"] == "test":
-                    assert result["price_cents"] == 24700
+                    assert result["price_cents"] == (band["floor"] + band["ceiling"]) // 2
                 else:
-                    assert result["price_cents"] == 19700
+                    assert result["price_cents"] == band["floor"]
 
             assert arms_seen == {"control", "test"}, (
                 f"expected both arms to appear across 20 threads at traffic_pct=100, got only {arms_seen}"
@@ -463,9 +469,9 @@ class TestProbeLoop:
         return packet
 
     def _stub_sends_winning(self, probe, db) -> None:
-        """Simulates >8% reply rate (18/20 = 90%)."""
-        probe.sends_count = 20
-        probe.reply_count = 18
+        """Simulates >8% reply rate (100/100 = 100%) at or above PROBE_MIN_SAMPLE_WIN."""
+        probe.sends_count = 100
+        probe.reply_count = 100
         probe.completion_receipt = True
 
     def test_probe_win_presell_confirmed_false(self, fresh_db):
@@ -537,3 +543,172 @@ class TestProbeLoop:
             select(VerticalVerdict).where(VerticalVerdict.vertical_candidate_packet_id == packet.id)
         ).scalar_one_or_none()
         assert verdict is None
+
+    def test_aborted_probe_retries_on_same_day(self, fresh_db):
+        """Idempotency fix: a kill-switch abort must reuse the existing row on retry,
+        not fail with a unique-key violation."""
+        from src.services.vertical_autopilot import run_probe
+
+        packet = self._make_eligible_packet(fresh_db)
+
+        # First call: compliance fails → aborted
+        with patch("src.services.vertical_autopilot._run_compliance_preflight", return_value=False):
+            probe1 = run_probe(packet.id, fresh_db)
+        assert probe1.status == "aborted"
+
+        # Second call same day: should reuse the row and succeed (send stub raises NotImplementedError)
+        with patch("src.services.vertical_autopilot._run_compliance_preflight", return_value=True):
+            with pytest.raises(NotImplementedError):
+                run_probe(packet.id, fresh_db)
+
+        # Must be same probe row, not a second insert
+        from sqlalchemy import select
+        rows = fresh_db.execute(
+            select(VerticalProbe).where(VerticalProbe.vertical_candidate_packet_id == packet.id)
+        ).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].id == probe1.id
+
+    def test_compliance_flags_are_null_after_preflight_stub(self, fresh_db):
+        """Stub preflight must write NULL, not True, for all individual checks."""
+        from src.services.vertical_autopilot import run_probe
+
+        packet = self._make_eligible_packet(fresh_db)
+
+        with patch("src.services.vertical_autopilot._run_compliance_preflight", return_value=True):
+            with pytest.raises(NotImplementedError):
+                run_probe(packet.id, fresh_db)
+
+        from sqlalchemy import select
+        probe = fresh_db.execute(
+            select(VerticalProbe).where(VerticalProbe.vertical_candidate_packet_id == packet.id)
+        ).scalar_one()
+        assert probe.tcpa_preflight_passed is None
+        assert probe.suppression_checked is None
+        assert probe.quiet_hours_checked is None
+
+    def _stub_sends_low_reply(self, probe, db) -> None:
+        """Simulates <3% reply rate (0/20 = 0%)."""
+        probe.sends_count = 20
+        probe.reply_count = 0
+        probe.completion_receipt = True
+
+    def test_below_kill_floor_verdict_is_running(self, fresh_db):
+        """With cumulative sends below PROBE_MIN_SAMPLE_KILL, a sub-3% rate stays 'running'."""
+        from src.services.vertical_autopilot import run_probe
+        import src.services.vertical_autopilot as va_mod
+
+        packet = self._make_eligible_packet(fresh_db)
+
+        with patch("src.services.vertical_autopilot._execute_sends", side_effect=self._stub_sends_low_reply), \
+             patch("src.services.vertical_autopilot._run_compliance_preflight", return_value=True):
+            probe = run_probe(packet.id, fresh_db)
+
+        from sqlalchemy import select
+        verdict = fresh_db.execute(
+            select(VerticalVerdict).where(VerticalVerdict.vertical_probe_id == probe.id)
+        ).scalar_one()
+        assert verdict.verdict == "running"
+        assert verdict.rule_fired == "below_min_sample"
+
+    def test_at_kill_floor_auto_kill_disabled_gives_awaiting_ruling(self, fresh_db):
+        """With auto-kill disabled and sample floor met, sub-3% → awaiting_ruling."""
+        from src.services.vertical_autopilot import evaluate_verdict
+
+        packet = self._make_eligible_packet(fresh_db)
+
+        probe = VerticalProbe(
+            vertical_candidate_packet_id=packet.id,
+            vertical_name=packet.vertical_name,
+            idempotency_key="test-awaiting-ruling",
+            status="completed",
+            sends_count=200,
+            reply_count=3,  # 1.5% — below 3% threshold
+            reply_rate=0.015,
+            started_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(timezone.utc),
+        )
+        fresh_db.add(probe)
+        fresh_db.flush()
+
+        import src.services.vertical_autopilot as va_mod
+        orig = va_mod.VERTICAL_AUTO_KILL_ENABLED
+        va_mod.VERTICAL_AUTO_KILL_ENABLED = False
+        try:
+            verdict = evaluate_verdict(probe, fresh_db, cumulative_sends=200)
+        finally:
+            va_mod.VERTICAL_AUTO_KILL_ENABLED = orig
+
+        assert verdict.verdict == "awaiting_ruling"
+        assert "auto_kill_disabled" in verdict.rule_fired
+
+    def test_send_ceiling_blocks_new_run(self, fresh_db):
+        """Packet at PROBE_SEND_CEILING must raise and set packet status awaiting_ruling."""
+        from src.services.vertical_autopilot import run_probe
+        from config.vertical_fit_rubric import PROBE_SEND_CEILING
+
+        packet = self._make_eligible_packet(fresh_db)
+
+        # Pre-populate completed probe with sends at ceiling
+        probe = VerticalProbe(
+            vertical_candidate_packet_id=packet.id,
+            vertical_name=packet.vertical_name,
+            idempotency_key="ceiling-probe",
+            status="completed",
+            sends_count=PROBE_SEND_CEILING,
+            reply_count=12,
+            reply_rate=0.03,
+            started_at=datetime.now(timezone.utc),
+            completed_at=datetime.now(timezone.utc),
+        )
+        fresh_db.add(probe)
+        fresh_db.flush()
+
+        with pytest.raises(ValueError, match="send ceiling"):
+            run_probe(packet.id, fresh_db)
+
+        fresh_db.refresh(packet)
+        assert packet.status == "awaiting_ruling"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. Price band drift guard — floors must match live prices
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestPriceBandDrift:
+    """Band floors must equal the live price so the flag-off path is a no-op.
+
+    Covers the three offers with a confirmed canonical constant.
+    The two [FILL] offers (insurance_distress_pack) are excluded until
+    the client confirms their live prices.
+    """
+
+    def test_founder_tier_floor_equals_live_price(self):
+        from src.services.price_assignment import PRICE_BANDS
+
+        # Live price constant from migrations/apply_founder_plan_seed.py
+        FOUNDER_MONTHLY_CENTS = 110000
+        assert PRICE_BANDS["founder_tier"]["floor"] == FOUNDER_MONTHLY_CENTS, (
+            f"founder_tier band floor ({PRICE_BANDS['founder_tier']['floor']}) "
+            f"does not match live price ({FOUNDER_MONTHLY_CENTS}). "
+            "Update the band floor to match before flipping PRICE_BAND_TESTING_ENABLED."
+        )
+
+    def test_core_subscription_floor_equals_live_price(self):
+        from src.services.price_assignment import PRICE_BANDS
+
+        # Live price from scripts/seed_s1_plans.py
+        STARTER_MONTHLY_CENTS = 29900
+        assert PRICE_BANDS["core_subscription"]["floor"] == STARTER_MONTHLY_CENTS, (
+            f"core_subscription band floor ({PRICE_BANDS['core_subscription']['floor']}) "
+            f"does not match live price ({STARTER_MONTHLY_CENTS})."
+        )
+
+    def test_bankruptcy_alert_floor_equals_live_price(self):
+        from src.services.price_assignment import PRICE_BANDS
+        from config.bankruptcy_alert_config import PRICE_MONTHLY_CENTS as BANKRUPTCY_LIVE
+
+        assert PRICE_BANDS["bankruptcy_alert"]["floor"] == BANKRUPTCY_LIVE, (
+            f"bankruptcy_alert band floor ({PRICE_BANDS['bankruptcy_alert']['floor']}) "
+            f"does not match live price ({BANKRUPTCY_LIVE})."
+        )

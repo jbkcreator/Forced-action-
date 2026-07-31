@@ -8678,7 +8678,7 @@ class VerticalCandidatePacket(Base):
             name="ck_vcp_legal_status",
         ),
         CheckConstraint(
-            "status IN ('candidate','probing','won','killed','pending_legal')",
+            "status IN ('candidate','probing','won','killed','pending_legal','awaiting_ruling')",
             name="ck_vcp_status",
         ),
         Index("idx_vcp_status", "status"),
@@ -8713,14 +8713,15 @@ class VerticalProbe(Base):
     reply_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     reply_rate: Mapped[float] = mapped_column(Numeric(6, 4), nullable=False, default=0.0)
 
-    # Compliance pre-flight checks
-    tcpa_preflight_passed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    suppression_checked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    touch_collision_checked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    frequency_cap_checked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    quiet_hours_checked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    channel_limits_checked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    kill_switch_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Compliance pre-flight checks — NULL means not yet checked (stub); True/False = checked result.
+    # Stubs must write NULL, not True, so persisted rows don't claim a check that never ran.
+    tcpa_preflight_passed: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    suppression_checked: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    touch_collision_checked: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    frequency_cap_checked: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    quiet_hours_checked: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    channel_limits_checked: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    kill_switch_active: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     completion_receipt: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     # Timestamps
@@ -8775,7 +8776,7 @@ class VerticalVerdict(Base):
     vertical_candidate_packet_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     vertical_name: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
 
-    verdict: Mapped[str] = mapped_column(String(20), nullable=False)  # "won" | "killed" | "running"
+    verdict: Mapped[str] = mapped_column(String(20), nullable=False)  # "won" | "killed" | "running" | "awaiting_ruling"
     verdict_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
@@ -8798,7 +8799,7 @@ class VerticalVerdict(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "verdict IN ('won','killed','running')",
+            "verdict IN ('won','killed','running','awaiting_ruling')",
             name="ck_vverdict_verdict",
         ),
         Index("idx_vverdict_verdict", "verdict"),

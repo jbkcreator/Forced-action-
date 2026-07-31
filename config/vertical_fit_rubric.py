@@ -36,10 +36,24 @@ LEGAL_RISK_BLOCKLIST_CATEGORIES = [
 # ── Probe verdict thresholds ───────────────────────────────────────────────────
 PROBE_KILL_THRESHOLD = 0.03   # <3% reply rate → killed
 PROBE_WIN_THRESHOLD = 0.08    # >8% reply rate → won
-# 3–8% → running (continue to min sample, then Josh ruling)
+# 3–8% → running (below sample floor) or awaiting_ruling (at/above floor)
 
-PROBE_MIN_SAMPLE = 30  # max sends per probe run
-PROBE_AUTO_DOUBLE_ON_WIN = True
+PROBE_MAX_SENDS_PER_RUN = 30  # blast-radius cap for a single probe execution
+
+# Minimum cumulative sends (across all probes for a packet) before kill/win
+# verdicts may fire.  Below this the verdict stays "running".
+# Asymmetric: killing is irreversible; winning routes to confirm_presell (manual gate).
+PROBE_MIN_SAMPLE_KILL = 200
+PROBE_MIN_SAMPLE_WIN = 100
+
+# Hard send ceiling per packet.  run_probe refuses to start a new run once this
+# total is reached and packet status is "awaiting_ruling".
+# Quoted directly from the client: "off four hundred it's signal".
+PROBE_SEND_CEILING = 400
+
+# When False every sub-3% result routes to awaiting_ruling regardless of sample,
+# rather than auto-killing.  Flip only after the client ratifies the thresholds.
+VERTICAL_AUTO_KILL_ENABLED: bool = False
 
 # ── Dim 5: Buyer evidence signals ─────────────────────────────────────────────
 

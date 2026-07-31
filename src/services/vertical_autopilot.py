@@ -31,8 +31,13 @@ from config.vertical_fit_rubric import (
     MIN_MONTHLY_RECORDS,
     MONEY_EVIDENCE_SIGNALS,
     PROBE_KILL_THRESHOLD,
+    PROBE_MAX_SENDS_PER_RUN,
+    PROBE_MIN_SAMPLE_KILL,
+    PROBE_MIN_SAMPLE_WIN,
+    PROBE_SEND_CEILING,
     PROBE_WIN_THRESHOLD,
     URGENCY_EVIDENCE_SIGNALS,
+    VERTICAL_AUTO_KILL_ENABLED,
     VERTICAL_FIT_THRESHOLD,
 )
 from src.core.models import VerticalCandidatePacket, VerticalProbe, VerticalVerdict
@@ -201,15 +206,14 @@ _PACKAGES_DIR = os.path.join(
 
 
 def _run_compliance_preflight(probe: VerticalProbe) -> bool:
-    """Populate compliance check flags. Returns False if kill switch is active."""
-    from src.services.kill_switch_service import get_kill_switch_status
+    """Gate on kill switch; mark individual compliance checks NULL (not yet wired).
 
-    probe.suppression_checked = True
-    probe.tcpa_preflight_passed = True
-    probe.touch_collision_checked = True
-    probe.frequency_cap_checked = True
-    probe.quiet_hours_checked = True
-    probe.channel_limits_checked = True
+    Each boolean column is NULL until the real check is wired to its service
+    (suppression list, TCPA, quiet-hours, etc.).  Writing NULL prevents the DB
+    row from claiming a check passed when nothing was evaluated.  The kill-switch
+    lookup is the only live check; all others are deferred until Relay is wired.
+    """
+    from src.services.kill_switch_service import get_kill_switch_status
 
     ks = get_kill_switch_status("vertical_probe")
     if ks.get("color") == "red":
@@ -221,6 +225,7 @@ def _run_compliance_preflight(probe: VerticalProbe) -> bool:
         return False
 
     probe.kill_switch_active = False
+    # remaining preflight columns stay NULL until each check is wired to its service
     return True
 
 
@@ -238,39 +243,64 @@ def _execute_sends(probe: VerticalProbe, db: Session) -> None:
     )
 
 
+def _cumulative_sends(packet_id: int, db: Session) -> tuple[int, int]:
+    """Return (total_sends, total_replies) across all completed probes for a packet."""
+    row = db.execute(
+        text(
+            "SELECT COALESCE(SUM(sends_count), 0), COALESCE(SUM(reply_count), 0) "
+            "FROM vertical_probes "
+            "WHERE vertical_candidate_packet_id = :pid AND status = 'completed'"
+        ),
+        {"pid": packet_id},
+    ).one()
+    return int(row[0]), int(row[1])
+
+
 def run_probe(vertical_candidate_packet_id: int, db: Session) -> VerticalProbe:
-    """Orchestrate a single probe run (≤30 sends) for a candidate packet.
+    """Orchestrate a single probe run (≤PROBE_MAX_SENDS_PER_RUN sends) for a candidate packet.
 
-    Steps: load → compliance preflight → idempotency → create probe →
-    execute sends → compute reply rate → update probe → evaluate verdict.
+    Steps: load → ceiling check → compliance preflight → idempotency →
+    create/reuse probe → execute sends → compute cumulative reply rate →
+    update probe → evaluate verdict.
     """
-    # 1. Load candidate packet
-    packet = db.execute(
-        text("SELECT * FROM vertical_candidate_packets WHERE id = :id"),
-        {"id": vertical_candidate_packet_id},
-    ).first()
-    if packet is None:
-        raise ValueError(f"VerticalCandidatePacket {vertical_candidate_packet_id} not found")
-
-    # Re-fetch as ORM object for relationship access
     from sqlalchemy import select as _select
+
+    # 1. Load candidate packet
     packet_obj: VerticalCandidatePacket = db.execute(
         _select(VerticalCandidatePacket).where(
             VerticalCandidatePacket.id == vertical_candidate_packet_id
         )
-    ).scalar_one()
+    ).scalar_one_or_none()
+    if packet_obj is None:
+        raise ValueError(f"VerticalCandidatePacket {vertical_candidate_packet_id} not found")
 
     if not packet_obj.eligible_for_probe:
         raise ValueError("Candidate not eligible for probe")
 
-    # 3. Generate idempotency key
+    # 2. Hard send-ceiling — refuse to start once cumulative sends reach PROBE_SEND_CEILING
+    prior_sends, _ = _cumulative_sends(packet_obj.id, db)
+    if prior_sends >= PROBE_SEND_CEILING:
+        logger.info(
+            "vertical_autopilot: packet %d at send ceiling (%d) — holding at awaiting_ruling",
+            packet_obj.id, prior_sends,
+        )
+        if packet_obj.status != "awaiting_ruling":
+            packet_obj.status = "awaiting_ruling"
+            db.flush()
+        raise ValueError(
+            f"Packet {packet_obj.id} has reached the {PROBE_SEND_CEILING}-send ceiling; "
+            "awaiting founder ruling before further probing."
+        )
+
+    # 3. Idempotency key (date-scoped per packet)
     idem_key = f"probe-{packet_obj.id}-{datetime.now(timezone.utc).date()}"
 
-    # 4. Check idempotency — return existing non-aborted probe
+    # 4. Check idempotency — reuse existing probe including aborted (re-run preflight)
     existing = db.execute(
         _select(VerticalProbe).where(VerticalProbe.idempotency_key == idem_key)
     ).scalar_one_or_none()
-    if existing and existing.status != "aborted":
+
+    if existing and existing.status not in ("aborted",):
         logger.info(
             "vertical_autopilot: idempotency hit for key=%s — returning existing probe %d",
             idem_key,
@@ -278,18 +308,30 @@ def run_probe(vertical_candidate_packet_id: int, db: Session) -> VerticalProbe:
         )
         return existing
 
-    # 5. Create probe record
-    probe = VerticalProbe(
-        vertical_candidate_packet_id=packet_obj.id,
-        vertical_name=packet_obj.vertical_name,
-        idempotency_key=idem_key,
-        status="running",
-        started_at=datetime.now(timezone.utc),
-    )
-    db.add(probe)
-    db.flush()
+    if existing and existing.status == "aborted":
+        # Reuse the row rather than inserting a second row with the same key.
+        probe = existing
+        probe.status = "running"
+        probe.started_at = datetime.now(timezone.utc)
+        probe.completed_at = None
+        db.flush()
+        logger.info(
+            "vertical_autopilot: retrying aborted probe %d for key=%s",
+            probe.id, idem_key,
+        )
+    else:
+        # 5. Create new probe record
+        probe = VerticalProbe(
+            vertical_candidate_packet_id=packet_obj.id,
+            vertical_name=packet_obj.vertical_name,
+            idempotency_key=idem_key,
+            status="running",
+            started_at=datetime.now(timezone.utc),
+        )
+        db.add(probe)
+        db.flush()
 
-    # 2. Compliance preflight
+    # 6. Compliance preflight
     preflight_passed = _run_compliance_preflight(probe)
     if not preflight_passed:
         probe.status = "aborted"
@@ -300,49 +342,70 @@ def run_probe(vertical_candidate_packet_id: int, db: Session) -> VerticalProbe:
         )
         return probe
 
-    # 6. Execute sends (stub)
+    # 7. Execute sends (stub — raises NotImplementedError outside tests)
     _execute_sends(probe, db)
     db.flush()
 
-    # 7. Compute reply rate
-    if probe.sends_count > 0:
-        probe.reply_rate = float(probe.reply_count) / float(probe.sends_count)
-    else:
-        probe.reply_rate = 0.0
+    # 8. Compute reply rate on cumulative basis across all completed probes + this run
+    prior_sends_now, prior_replies = _cumulative_sends(packet_obj.id, db)
+    total_sends = prior_sends_now + probe.sends_count
+    total_replies = prior_replies + probe.reply_count
+    probe.reply_rate = float(total_replies) / float(total_sends) if total_sends > 0 else 0.0
 
-    # 8. Update probe
+    # 9. Mark probe complete
     probe.completed_at = datetime.now(timezone.utc)
     probe.status = "completed"
     db.flush()
 
     logger.info(
-        "vertical_autopilot: probe %d completed vertical=%r reply_rate=%.4f",
-        probe.id,
-        probe.vertical_name,
-        probe.reply_rate,
+        "vertical_autopilot: probe %d completed vertical=%r "
+        "run_sends=%d cumulative_sends=%d reply_rate=%.4f",
+        probe.id, probe.vertical_name, probe.sends_count, total_sends, probe.reply_rate,
     )
 
-    # 9. Evaluate verdict
-    evaluate_verdict(probe, db)
+    # 10. Evaluate verdict using cumulative totals
+    evaluate_verdict(probe, db, cumulative_sends=total_sends)
 
     return probe
 
 
-def evaluate_verdict(probe: VerticalProbe, db: Session) -> VerticalVerdict:
-    """Evaluate probe reply rate against rubric thresholds and persist a VerticalVerdict."""
+def evaluate_verdict(
+    probe: VerticalProbe,
+    db: Session,
+    cumulative_sends: int = 0,
+) -> VerticalVerdict:
+    """Evaluate probe reply rate against rubric thresholds and persist a VerticalVerdict.
+
+    Verdict logic (evaluated in order):
+      1. If cumulative_sends < PROBE_MIN_SAMPLE_WIN and rate > WIN_THRESHOLD → still running
+         (not enough data to declare a win).
+      2. If rate > WIN_THRESHOLD and cumulative_sends >= PROBE_MIN_SAMPLE_WIN → won.
+      3. If rate < KILL_THRESHOLD and cumulative_sends >= PROBE_MIN_SAMPLE_KILL
+         and VERTICAL_AUTO_KILL_ENABLED → killed.
+      4. If rate < KILL_THRESHOLD but auto-kill is disabled OR below kill floor → awaiting_ruling.
+      5. 3–8% gray band at or above kill floor → awaiting_ruling (founder must rule).
+      6. Below any floor → running (keep collecting data).
+    """
     from sqlalchemy import select as _select
 
     reply_rate = float(probe.reply_rate)
+    at_kill_floor = cumulative_sends >= PROBE_MIN_SAMPLE_KILL
+    at_win_floor = cumulative_sends >= PROBE_MIN_SAMPLE_WIN
 
-    if reply_rate < PROBE_KILL_THRESHOLD:
-        verdict_val = "killed"
-        rule = "reply_rate_lt_3pct"
-    elif reply_rate > PROBE_WIN_THRESHOLD:
+    if reply_rate > PROBE_WIN_THRESHOLD and at_win_floor:
         verdict_val = "won"
-        rule = "reply_rate_gt_8pct"
+        rule = "reply_rate_gt_8pct_at_min_sample"
+    elif reply_rate < PROBE_KILL_THRESHOLD and at_kill_floor and VERTICAL_AUTO_KILL_ENABLED:
+        verdict_val = "killed"
+        rule = "reply_rate_lt_3pct_at_min_sample"
+    elif at_kill_floor and reply_rate < PROBE_WIN_THRESHOLD:
+        # Gray band (3–8%) at floor, or sub-3% with auto-kill disabled — founder rules.
+        verdict_val = "awaiting_ruling"
+        rule = "gray_band_at_min_sample" if reply_rate >= PROBE_KILL_THRESHOLD else "below_kill_threshold_auto_kill_disabled"
     else:
+        # Below sample floor — keep collecting.
         verdict_val = "running"
-        rule = "min_sample_josh_ruling"
+        rule = "below_min_sample"
 
     packet_obj: VerticalCandidatePacket = db.execute(
         _select(VerticalCandidatePacket).where(
@@ -368,19 +431,26 @@ def evaluate_verdict(probe: VerticalProbe, db: Session) -> VerticalVerdict:
         packet_obj.status = "killed"
         db.flush()
         logger.info(
-            "vertical_autopilot: verdict=killed for vertical=%r probe=%d",
-            probe.vertical_name,
-            probe.id,
+            "vertical_autopilot: verdict=killed vertical=%r probe=%d cumulative_sends=%d",
+            probe.vertical_name, probe.id, cumulative_sends,
         )
     elif verdict_val == "won":
         _on_won(verdict, packet_obj, db)
+    elif verdict_val == "awaiting_ruling":
+        packet_obj.status = "awaiting_ruling"
+        db.flush()
+        logger.info(
+            "vertical_autopilot: verdict=awaiting_ruling vertical=%r probe=%d "
+            "cumulative_sends=%d reply_rate=%.4f rule=%s",
+            probe.vertical_name, probe.id, cumulative_sends, reply_rate, rule,
+        )
     else:
         packet_obj.status = "probing"
         db.flush()
         logger.info(
-            "vertical_autopilot: verdict=running for vertical=%r probe=%d — continue probing",
-            probe.vertical_name,
-            probe.id,
+            "vertical_autopilot: verdict=running vertical=%r probe=%d "
+            "cumulative_sends=%d — continue probing",
+            probe.vertical_name, probe.id, cumulative_sends,
         )
 
     return verdict

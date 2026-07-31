@@ -4,6 +4,17 @@ Feature flag PRICE_BAND_TESTING_ENABLED is hardcoded False until Josh
 ratifies the real floor/ceiling values.  When False, assign_price always
 uses the band floor regardless of requested_price_cents.
 
+INVARIANT: every band floor must equal the live price for that offer so
+that the flag-off path is a no-op (charges exactly what it charges today).
+A pytest in tests/test_revint.py::TestPriceBandDrift enforces this for
+offers that have a canonical constant — see that class for details.
+
+Two offer floors are still [FILL] — awaiting client confirmation of the
+live prices for single_ZIP_pack and insurance_distress_pack before they
+can be set correctly:
+  - single_ZIP_pack: is this the same product as the $99 LEAD_PACK_PRICE?
+  - insurance_distress_pack: confirm live price before enabling the flag.
+
 Excluded from all price bands (no customer-facing price; RESPA gate):
   hard_money_intro, lender_intro
 """
@@ -26,12 +37,12 @@ PRICE_BAND_TESTING_ENABLED: bool = False  # flip only after Josh ratifies bands
 # ── Price bands (all values in cents) ────────────────────────────────────────
 
 PRICE_BANDS: dict[str, dict[str, int]] = {
-    "founder_tier":            {"floor": 90000,  "ceiling": 120000},
-    "core_subscription":       {"floor": 19700,  "ceiling": 29700},
-    # single_ZIP_pack removed — not a distinct offer (= core_subscription at
-    # Starter/1-ZIP resolution; ZIP sizing is a ladder/Lifecycle decision).
-    "insurance_distress_pack": {"floor": 14700,  "ceiling": 24700},
-    "bankruptcy_alert":        {"floor": 24700,  "ceiling": 34700},
+    # floor = live price so flag-off is a no-op (charges exactly what it charges today)
+    "founder_tier":            {"floor": 110000, "ceiling": 130000},  # live: $1,100/mo
+    "core_subscription":       {"floor": 29900,  "ceiling": 39900},   # live: $299/mo (plans.price_cents)
+    "bankruptcy_alert":        {"floor": 29700,  "ceiling": 39700},   # live: $297/mo (bankruptcy_alert_config.PRICE_MONTHLY_CENTS)
+    # [FILL] floor unconfirmed — client must ratify live price before flag flip
+    "insurance_distress_pack": {"floor": 14700,  "ceiling": 24700},   # [FILL] confirm live price
     # hard_money_intro: EXCLUDED — no customer-facing price (RESPA gate)
     # lender_intro:     EXCLUDED — no customer-facing price (RESPA gate)
 }
