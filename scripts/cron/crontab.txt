@@ -854,12 +854,12 @@ COUNTY_ID=hillsborough
 # 5+ minutes with no Telnyx message.finalized delivery-status callback.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.owner_alert_sweep
 # Tiered volume guarantee shortfall sweep — INTENTIONALLY NOT scheduled yet.
-# config/guarantees.py TIER_LEAD_QUOTAS are placeholder lead-per-cycle counts
-# pending a business decision; enabling this cron would issue real Stripe
-# balance credits off unconfirmed numbers. Re-enable only once all three are
-# true: (1) lead_delivery_sweep has run one full 30-day cycle with real
-# deliveries landing, (2) a --dry-run credit total has been reviewed and
-# approved in writing, (3) Stripe is confirmed in live mode.
+# Quotas confirmed (starter 15 / pro 40 / founder 40 per 30-day cycle) but
+# enabling this cron would issue real Stripe balance credits before we have a
+# full cycle of verified delivery data. Re-enable only once all three are true:
+# (1) lead_delivery_sweep has run one full 30-day cycle with real deliveries
+# landing, (2) a --dry-run credit total has been reviewed and approved in
+# writing by Josh, (3) Stripe is confirmed in live mode.
 # 0 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.guarantee_shortfall_sweep
 
 # ── AGENT LANE: RELAY ────────────────────────────────────────────────────────
