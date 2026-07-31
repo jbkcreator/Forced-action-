@@ -1,7 +1,9 @@
-"""Create demo subscriber accounts for sales demos.
+"""Create the single demo subscriber account for sales demos.
 
-Creates two accounts — one per county — both with is_demo=True so the feed
-endpoint serves all county ZIPs without requiring locked zip_territories rows.
+Creates one account (Hillsborough) with is_demo=True so the feed endpoint
+serves all county ZIPs. A county-switcher dropdown on the dashboard lets the
+account toggle to Pinellas without a second login.
+
 Safe to re-run: skips creation if email already exists.
 
 Usage (on prod server):
@@ -22,14 +24,9 @@ from src.core.models import Subscriber
 
 DEMO_ACCOUNTS = [
     {
-        "email": "demo-hillsborough@forcedaction.io",
-        "name": "Demo Account — Hillsborough",
+        "email": "demo@forcedaction.io",
+        "name": "Forced Action Demo",
         "county_id": "hillsborough",
-    },
-    {
-        "email": "demo-pinellas@forcedaction.io",
-        "name": "Demo Account — Pinellas",
-        "county_id": "pinellas",
     },
 ]
 
