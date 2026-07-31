@@ -135,7 +135,13 @@ def forgot_password(body: ForgotPasswordRequest, request: Request, db=Depends(ge
         sub.reset_token_expires_at = datetime.now(timezone.utc) + timedelta(hours=auth.RESET_EXPIRE_HOURS)
         db.flush()
         try:
-            auth.send_subscriber_password_reset_email(sub.email, sub.name, raw)
+            auth.send_subscriber_password_reset_email(
+                sub.email,
+                sub.name,
+                raw,
+                db=db,
+                subscriber_id=sub.id,
+            )
         except Exception:
             logger.warning("[subscriber-auth] reset email send failed for sub=%s", sub.id, exc_info=True)
 
@@ -182,7 +188,13 @@ def request_magic_link(body: MagicLinkRequest, request: Request, db=Depends(get_
     if sub is not None and sub.email:
         try:
             raw = auth.issue_magic_link(sub, db)
-            auth.send_magic_link_email(sub.email, sub.name, raw)
+            auth.send_magic_link_email(
+                sub.email,
+                sub.name,
+                raw,
+                db=db,
+                subscriber_id=sub.id,
+            )
         except Exception:
             logger.warning("[subscriber-auth] magic-link email send failed for sub=%s", sub.id, exc_info=True)
 
@@ -219,6 +231,12 @@ def verify_magic_link(body: MagicLinkVerifyRequest, request: Request, db=Depends
 
     if row is None:
         raise HTTPException(status_code=400, detail="Invalid or expired link")
+
+    try:
+        from src.services.activation_tracking import stamp_magic_link_redeemed
+        stamp_magic_link_redeemed(row.id, db)
+    except Exception:
+        logger.warning("[subscriber-auth] activation stamp failed for redeemed magic link sub=%s", row.id, exc_info=True)
 
     logger.info("[subscriber-auth] magic-link verified for sub=%s", row.id)
     token = auth.create_access_token(row.id, row.event_feed_uuid)

@@ -360,6 +360,93 @@ def _build_signal_freshness(session, county_id: str) -> dict:
     return freshness
 
 
+def _build_signup_source_breakdown(session, friday: date, county_id: str) -> list[dict]:
+    """Trailing-30-day funnel by raw signup_source."""
+    window_end = datetime.combine(friday + timedelta(days=1), datetime.min.time())
+    window_start = window_end - timedelta(days=30)
+
+    free_rows = session.execute(
+        sa_text(
+            """
+            SELECT COALESCE(signup_source, 'unknown') AS signup_source, COUNT(*) AS free_signups
+            FROM subscribers
+            WHERE county_id = :county_id
+              AND created_at >= :window_start
+              AND created_at < :window_end
+              AND tier = 'free'
+            GROUP BY COALESCE(signup_source, 'unknown')
+            """
+        ),
+        {"county_id": county_id, "window_start": window_start, "window_end": window_end},
+    ).fetchall()
+
+    paid_rows = session.execute(
+        sa_text(
+            """
+            SELECT COALESCE(s.signup_source, 'unknown') AS signup_source, COUNT(*) AS paid_conversions
+            FROM customer_accounts ca
+            LEFT JOIN subscribers s ON s.id = ca.subscriber_id
+            WHERE s.county_id = :county_id
+              AND ca.converted_at >= :window_start
+              AND ca.converted_at < :window_end
+            GROUP BY COALESCE(s.signup_source, 'unknown')
+            """
+        ),
+        {"county_id": county_id, "window_start": window_start, "window_end": window_end},
+    ).fetchall()
+
+    free_map = {row.signup_source: int(row.free_signups) for row in free_rows}
+    paid_map = {row.signup_source: int(row.paid_conversions) for row in paid_rows}
+
+    breakdown = []
+    for signup_source in sorted(set(free_map) | set(paid_map)):
+        free_signups = free_map.get(signup_source, 0)
+        paid_conversions = paid_map.get(signup_source, 0)
+        breakdown.append(
+            {
+                "signup_source": signup_source,
+                "free_signups": free_signups,
+                "paid_conversions": paid_conversions,
+                "paid_conversion_rate": round((paid_conversions / free_signups) * 100, 1) if free_signups else None,
+            }
+        )
+
+    breakdown.sort(key=lambda row: (row["paid_conversions"], row["free_signups"]), reverse=True)
+    return breakdown
+
+
+def _build_activation_dropoff(session, friday: date, county_id: str) -> dict:
+    """Trailing-30-day paid onboarding funnel counts."""
+    window_end = datetime.combine(friday + timedelta(days=1), datetime.min.time())
+    window_start = window_end - timedelta(days=30)
+    row = session.execute(
+        sa_text(
+            """
+            SELECT
+                COUNT(*) AS paid_signups,
+                COUNT(*) FILTER (WHERE ae.welcome_email_sent_time IS NOT NULL) AS welcome_email_sent,
+                COUNT(*) FILTER (WHERE ae.magic_link_redeemed_time IS NOT NULL) AS magic_link_redeemed,
+                COUNT(*) FILTER (WHERE ae.onboarding_completed_time IS NOT NULL) AS onboarding_completed,
+                COUNT(*) FILTER (WHERE ae.first_unlock_time IS NOT NULL) AS first_unlock
+            FROM subscribers s
+            LEFT JOIN activation_events ae ON ae.subscriber_id = s.id
+            WHERE s.county_id = :county_id
+              AND s.created_at >= :window_start
+              AND s.created_at < :window_end
+              AND s.tier <> 'free'
+            """
+        ),
+        {"county_id": county_id, "window_start": window_start, "window_end": window_end},
+    ).mappings().one()
+    return {
+        "paid_signups": int(row["paid_signups"] or 0),
+        "welcome_email_sent": int(row["welcome_email_sent"] or 0),
+        "magic_link_redeemed": int(row["magic_link_redeemed"] or 0),
+        "onboarding_completed": int(row["onboarding_completed"] or 0),
+        "first_unlock": int(row["first_unlock"] or 0),
+    }
+
+
 def build_report(week_ending: date, county_id: str) -> dict:
     monday, friday = _week_range(week_ending)
     errors = []
@@ -372,6 +459,8 @@ def build_report(week_ending: date, county_id: str) -> dict:
         daily_totals        = _build_daily_scraper_totals(session, monday, friday, county_id)
         vertical_breakdown  = _build_vertical_breakdown(session, monday, friday, county_id)
         signal_freshness    = _build_signal_freshness(session, county_id)
+        signup_source_breakdown = _build_signup_source_breakdown(session, friday, county_id)
+        activation_dropoff = _build_activation_dropoff(session, friday, county_id)
 
     return {
         "week_start":         monday,
@@ -386,6 +475,8 @@ def build_report(week_ending: date, county_id: str) -> dict:
         "tiers":              tiers,
         "vertical_breakdown": vertical_breakdown,
         "signal_freshness":   signal_freshness,
+        "signup_source_breakdown": signup_source_breakdown,
+        "activation_dropoff": activation_dropoff,
         "errors":             errors,
     }
 
@@ -475,6 +566,23 @@ def write_csv(report: dict, path: Path) -> None:
         w.writerow([])
 
         # ── Section 7: Alerts ─────────────────────────────────────────────
+        w.writerow(["SIGNUP SOURCE BREAKDOWN (TRAILING 30 DAYS)"])
+        w.writerow(["Signup Source", "Free Signups", "Paid Conversions", "Paid Conversion Rate"])
+        for row in report.get("signup_source_breakdown", []):
+            rate = f"{row['paid_conversion_rate']:.1f}%" if row["paid_conversion_rate"] is not None else "-"
+            w.writerow([row["signup_source"], row["free_signups"], row["paid_conversions"], rate])
+        w.writerow([])
+
+        dropoff = report.get("activation_dropoff", {})
+        w.writerow(["PAID ONBOARDING FUNNEL (TRAILING 30 DAYS)"])
+        w.writerow(["Checkpoint", "Count"])
+        w.writerow(["Paid signups", dropoff.get("paid_signups", 0)])
+        w.writerow(["Welcome email sent", dropoff.get("welcome_email_sent", 0)])
+        w.writerow(["Magic link redeemed", dropoff.get("magic_link_redeemed", 0)])
+        w.writerow(["Onboarding completed", dropoff.get("onboarding_completed", 0)])
+        w.writerow(["First unlock", dropoff.get("first_unlock", 0)])
+        w.writerow([])
+
         w.writerow(["ALERTS"])
         if report["errors"]:
             for err in report["errors"]:

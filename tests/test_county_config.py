@@ -175,6 +175,18 @@ class TestZipCheckValidation:
         result = zip_check(zip_code="33601", vertical="roofing", county_id="hillsborough", db=db)
         assert result["status"] == "taken"
 
+    def test_taken_zip_surfaces_adjacent_zip_suggestion(self):
+        from src.api.main import zip_check
+        territory = MagicMock()
+        territory.status = "locked"
+        db = MagicMock()
+        db.execute.return_value.scalar.return_value = 100
+        db.execute.return_value.scalar_one_or_none.return_value = territory
+        with patch("src.api.main._find_adjacent_zip_suggestion", return_value={"zip_code": "33610", "distance_miles": 3.2}):
+            result = zip_check(zip_code="33601", vertical="roofing", county_id="hillsborough", db=db)
+        assert result["status"] == "taken"
+        assert result["adjacent_zip_suggestion"]["zip_code"] == "33610"
+
     def test_grace_zip_returns_grace(self):
         from src.api.main import zip_check
         territory = MagicMock()
