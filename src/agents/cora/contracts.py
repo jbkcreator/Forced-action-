@@ -18,7 +18,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, TypedDict
 
-from config.cora_guardrails import CONCIERGE_ELIGIBLE_SIGNALS, OFFER_RULE_CONFIG
+from config.revint_offer_rules import CONCIERGE_ELIGIBLE_SIGNALS, OFFER_RULE_CONFIG
 
 logger = logging.getLogger(__name__)
 

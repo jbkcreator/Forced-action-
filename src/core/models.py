@@ -3499,12 +3499,19 @@ class AbTest(Base):
 
 
 class AbAssignment(Base):
-    """Individual subscriber assignment to an A/B test variant."""
+    """Individual assignment to an A/B test variant — keyed on EITHER an
+    existing subscriber (message-swap/rollout tests) OR a cold opportunity
+    thread (REVINT-v2.2 I3 price-band tests, which run on Cora prospects
+    before they're ever a subscriber). Exactly one of subscriber_id /
+    opportunity_thread_id is set per row — enforced by check_ab_assignment_key_xor.
+    """
     __tablename__ = "ab_assignments"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     test_id: Mapped[int] = mapped_column(Integer, ForeignKey("ab_tests.id"), nullable=False, index=True)
-    subscriber_id: Mapped[int] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=False, index=True)
+    subscriber_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("subscribers.id"), index=True)
+    # OPP-YYYY-##### format; matches BuyerEntity.opportunity_thread_id / OpportunityScore.opportunity_thread_id.
+    opportunity_thread_id: Mapped[Optional[str]] = mapped_column(String(20), index=True)
     variant: Mapped[str] = mapped_column(String(10), nullable=False)  # 'a'/'b' for message-swap tests; 'variant'/'control' for rollout tests
     outcome: Mapped[Optional[str]] = mapped_column(String(30))  # converted/ignored/bounced
     # When record_outcome set `outcome` — lets a time-windowed holdout verdict
@@ -3517,6 +3524,11 @@ class AbAssignment(Base):
 
     __table_args__ = (
         UniqueConstraint("test_id", "subscriber_id", name="uq_ab_assignment"),
+        UniqueConstraint("test_id", "opportunity_thread_id", name="uq_ab_assignment_thread"),
+        CheckConstraint(
+            "(subscriber_id IS NOT NULL) != (opportunity_thread_id IS NOT NULL)",
+            name="check_ab_assignment_key_xor",
+        ),
     )
 
 

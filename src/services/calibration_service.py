@@ -90,7 +90,15 @@ def _compute_segment(
     avg_p_close = float(predicted[0] or 0)
     avg_time_to_cash = float(predicted[1] or 0)
 
-    # Actual close rate: history rows with reason='closed' this month / sample_size
+    # Actual close rate: of the scores CREATED this month (same cohort as
+    # sample_size above), how many have EVER closed by the time this report
+    # runs. Deliberately cohorted on s.created_at, not h.snapshot_at — a
+    # closure snapshot can land in a later month than the score's own
+    # creation month for any deal with a multi-month sales cycle. Filtering
+    # on snapshot month instead (the prior version of this query) let an
+    # earlier cohort's closures inflate this month's numerator without ever
+    # counting toward this month's denominator, producing close rates over
+    # 100%.
     closed_count = db.execute(
         text(
             """
@@ -99,7 +107,7 @@ def _compute_segment(
             JOIN opportunity_scores s ON s.id = h.opportunity_score_id
             WHERE s.segment = :seg
               AND lower(h.reason) = 'closed'
-              AND date_trunc('month', h.snapshot_at) =
+              AND date_trunc('month', s.created_at) =
                   make_date(:yr, :mo, 1)::timestamptz
             """
         ),
@@ -109,6 +117,7 @@ def _compute_segment(
     actual_close_rate = float(closed_count) / sample_size if sample_size else 0.0
 
     # Actual time-to-cash: median snapshot_at - created_at for closed records
+    # created this month (same cohort fix as closed_count above).
     actual_ttc_row = db.execute(
         text(
             """
@@ -119,7 +128,7 @@ def _compute_segment(
             JOIN opportunity_scores s ON s.id = h.opportunity_score_id
             WHERE s.segment = :seg
               AND lower(h.reason) = 'closed'
-              AND date_trunc('month', h.snapshot_at) =
+              AND date_trunc('month', s.created_at) =
                   make_date(:yr, :mo, 1)::timestamptz
             """
         ),

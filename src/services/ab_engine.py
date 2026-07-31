@@ -59,6 +59,16 @@ def get_or_create_test(
     return test
 
 
+def _deterministic_variant(test: AbTest, key: str) -> Optional[str]:
+    """Pure hash + traffic-cap decision shared by every assign_variant*()
+    entry point — same key always maps to the same arm (or the same
+    out-of-test None), independent of which identity column stores it."""
+    h = int(hashlib.md5(f"{test.test_name}{key}".encode()).hexdigest(), 16) % 100
+    if h >= test.traffic_pct:
+        return None
+    return "a" if h % 2 == 0 else "b"
+
+
 def assign_variant(subscriber_id: int, test_name: str, db: Session) -> Optional[str]:
     test = db.execute(
         select(AbTest).where(AbTest.test_name == test_name, AbTest.status == "active")
@@ -75,15 +85,46 @@ def assign_variant(subscriber_id: int, test_name: str, db: Session) -> Optional[
     if existing:
         return existing.variant
 
-    # Deterministic hash — same subscriber always gets same variant
-    h = int(hashlib.md5(f"{test_name}{subscriber_id}".encode()).hexdigest(), 16) % 100
-    if h >= test.traffic_pct:
+    variant = _deterministic_variant(test, str(subscriber_id))
+    if variant is None:
         return None
 
-    variant = "a" if h % 2 == 0 else "b"
     assignment = AbAssignment(
         test_id=test.id,
         subscriber_id=subscriber_id,
+        variant=variant,
+    )
+    db.add(assignment)
+    db.flush()
+    return variant
+
+
+def assign_variant_by_thread(opportunity_thread_id: str, test_name: str, db: Session) -> Optional[str]:
+    """Same deterministic assignment as assign_variant(), keyed on Hunter's
+    opportunity_thread_id instead of subscriber_id — for price-band tests
+    (REVINT-v2.2 I3) run on cold Cora prospects who aren't subscribers yet."""
+    test = db.execute(
+        select(AbTest).where(AbTest.test_name == test_name, AbTest.status == "active")
+    ).scalar_one_or_none()
+    if not test:
+        return None
+
+    existing = db.execute(
+        select(AbAssignment).where(
+            AbAssignment.test_id == test.id,
+            AbAssignment.opportunity_thread_id == opportunity_thread_id,
+        )
+    ).scalar_one_or_none()
+    if existing:
+        return existing.variant
+
+    variant = _deterministic_variant(test, opportunity_thread_id)
+    if variant is None:
+        return None
+
+    assignment = AbAssignment(
+        test_id=test.id,
+        opportunity_thread_id=opportunity_thread_id,
         variant=variant,
     )
     db.add(assignment)
@@ -453,14 +494,18 @@ def holdout_verdict(
     return {**base, "status": status, "z_score": round(z, 3)}
 
 
-def get_price_variant(offer: str, ab_test_id: int, db: Session) -> dict:
-    """Return the price arm for a price-band A/B test.
+def get_price_variant(offer: str, ab_test_id: int, opportunity_thread_id: str, db: Session) -> dict:
+    """Return the price arm for a price-band A/B test, for one opportunity thread.
 
     When PRICE_BAND_TESTING_ENABLED is False (the current default) the control
-    arm price is always returned regardless of which arm the subscriber was
-    assigned.  When the flag is True the price is taken from the ab_tests row
-    (control_price_cents / test_price_cents) and the caller's AbAssignment arm
-    determines which one.
+    arm price is always returned and no AbAssignment is created — matching
+    price_assignment.assign_price()'s own flag-off behavior. When the flag is
+    True, opportunity_thread_id is deterministically assigned an arm via
+    assign_variant_by_thread() (variant "a" -> control, "b" -> test, matching
+    AbTest's variant_a/variant_b naming), and that arm's price is returned
+    together with the real, persisted AbAssignment id — out-of-test traffic
+    (assign_variant_by_thread returns None) falls back to the unrecorded
+    control price, same as assign_variant()'s existing message-swap tests.
 
     Returns:
         {"arm": "control" | "test", "price_cents": int, "ab_assignment_id": int | None}
@@ -481,26 +526,38 @@ def get_price_variant(offer: str, ab_test_id: int, db: Session) -> dict:
             ab_test_id, test.offer, offer,
         )
 
-    if not PRICE_BAND_TESTING_ENABLED:
-        price = test.control_price_cents
-        if price is None:
-            raise ValueError(
-                f"AbTest id={ab_test_id} missing control_price_cents — "
-                "populate before calling get_price_variant"
-            )
-        return {"arm": "control", "price_cents": price, "ab_assignment_id": None}
-
     control_price = test.control_price_cents
-    test_price = test.test_price_cents
-    if control_price is None or test_price is None:
+    if control_price is None:
         raise ValueError(
-            f"AbTest id={ab_test_id} missing control_price_cents or test_price_cents"
+            f"AbTest id={ab_test_id} missing control_price_cents — "
+            "populate before calling get_price_variant"
         )
-    return {
-        "arm": "control",
-        "price_cents": control_price,
-        "ab_assignment_id": None,
-    }
+
+    if not PRICE_BAND_TESTING_ENABLED:
+        return {"arm": "control", "price_cents": control_price, "ab_assignment_id": None}
+
+    test_price = test.test_price_cents
+    if test_price is None:
+        raise ValueError(
+            f"AbTest id={ab_test_id} missing test_price_cents"
+        )
+
+    arm_variant = assign_variant_by_thread(opportunity_thread_id, test.test_name, db)
+    if arm_variant is None:
+        # Out-of-test traffic (traffic_pct cap) — unrecorded control, same
+        # convention assign_variant() already uses for message-swap tests.
+        return {"arm": "control", "price_cents": control_price, "ab_assignment_id": None}
+
+    assignment = db.execute(
+        select(AbAssignment).where(
+            AbAssignment.test_id == test.id,
+            AbAssignment.opportunity_thread_id == opportunity_thread_id,
+        )
+    ).scalar_one()
+
+    if arm_variant == "b":
+        return {"arm": "test", "price_cents": test_price, "ab_assignment_id": assignment.id}
+    return {"arm": "control", "price_cents": control_price, "ab_assignment_id": assignment.id}
 
 
 def record_outcome(subscriber_id: int, test_name: str, outcome: str, db: Session) -> None:

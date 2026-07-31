@@ -7714,6 +7714,7 @@ class _PresellConfirmRequest(BaseModel):
 def api_vertical_probe(
     payload: _VerticalProbeRequest,
     db: Session = Depends(get_db),
+    _admin: dict = Depends(get_current_admin),
 ):
     """Run probe loop for a VerticalCandidatePacket. Idempotent per packet per day."""
     from src.services.vertical_autopilot import run_probe
@@ -7745,6 +7746,7 @@ def api_vertical_probe(
 def api_vertical_presell_confirm(
     payload: _PresellConfirmRequest,
     db: Session = Depends(get_db),
+    _admin: dict = Depends(get_current_admin),
 ):
     """Confirm presell for a VerticalVerdict. Unblocks dev queue entry."""
     from src.services.vertical_autopilot import confirm_presell
@@ -7772,6 +7774,7 @@ def api_vertical_presell_confirm(
 def api_vertical_verdict(
     verdict_id: int,
     db: Session = Depends(get_db),
+    _admin: dict = Depends(get_current_admin),
 ):
     """Return a VerticalVerdict by ID."""
     from sqlalchemy import select as _select

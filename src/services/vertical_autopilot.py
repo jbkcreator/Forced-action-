@@ -225,18 +225,16 @@ def _run_compliance_preflight(probe: VerticalProbe) -> bool:
 
 
 def _execute_sends(probe: VerticalProbe, db: Session) -> None:
-    """Stub send executor. Real Relay integration deferred. Sets sends/reply counts."""
-    # Configurable via env for tests; defaults simulate a 10% reply rate on 20 sends.
-    sends = int(os.environ.get("PROBE_STUB_SENDS", "20"))
-    replies = int(os.environ.get("PROBE_STUB_REPLIES", "2"))
-    probe.sends_count = sends
-    probe.reply_count = replies
-    probe.completion_receipt = True
-    logger.info(
-        "vertical_autopilot: _execute_sends stub vertical=%r sends=%d replies=%d",
-        probe.vertical_name,
-        sends,
-        replies,
+    """Real Relay/result-ingestion integration is not wired yet.
+
+    No production configuration may fabricate a reply rate: this must be
+    monkeypatched in tests (see tests/test_revint.py's TestProbeLoop) and
+    raises unconditionally otherwise, so run_probe() can never produce a
+    completed/"won" verdict from a real caller until Relay lands.
+    """
+    raise NotImplementedError(
+        "vertical_autopilot._execute_sends: no real send/reply ingestion exists yet — "
+        "wire this to Relay before calling run_probe() outside tests"
     )
 
 
