@@ -63,13 +63,13 @@ def main() -> None:
                     is_demo, founding_member, event_feed_uuid,
                     email, name, password_hash,
                     has_saved_card, auto_mode_enabled, onboarding_completed,
-                    created_at, updated_at
+                    is_test, created_at, updated_at
                 ) VALUES (
                     :cid, :tier, :vertical, :county, 'active',
                     true, false, :feed_uuid,
                     :email, :name, :password_hash,
                     false, false, true,
-                    NOW(), NOW()
+                    true, NOW(), NOW()
                 )
             """), {
                 "cid": f"demo_{acct['county_id']}",
