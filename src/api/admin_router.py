@@ -149,6 +149,42 @@ def _run_tax_enrichment(county_id: str, df: "pd.DataFrame") -> None:
         logger.exception("[Admin] Tax enrichment (background) failed for county=%s", county_id)
 
 
+@router.post("/entitlements/resync")
+def resync_entitlements(
+    plan_id: Optional[str] = None,
+    dry_run: bool = False,
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """Re-propagate `plans.entitlements` onto stale per-account snapshots.
+
+    The snapshot is only written at subscription-activation time, so a plan-catalog
+    edit leaves existing accounts stale and silently excluded from lead delivery.
+    Run this after any catalog change made outside the seed scripts. Scope with
+    `plan_id` to limit the blast radius; `dry_run` reports drift without writing.
+    Returns {drifted, updated, dry_run, plans[]}.
+    """
+    from src.services.entitlement_sync import resync_lead_entitlements
+
+    try:
+        result = resync_lead_entitlements(
+            db, plan_ids=[plan_id] if plan_id else None, dry_run=dry_run
+        )
+        if not dry_run:
+            db.commit()
+    except Exception:
+        db.rollback()
+        logger.error("[Admin] entitlement resync failed", exc_info=True)
+        raise HTTPException(status_code=500, detail="Entitlement resync failed")
+
+    return {
+        "drifted": len(result.drifted),
+        "updated": result.updated,
+        "dry_run": result.dry_run,
+        "plans": sorted(result.plan_ids),
+    }
+
+
 @router.post("/import/founder-portfolio")
 def import_founder_portfolio(
     file: UploadFile,
