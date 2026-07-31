@@ -617,7 +617,7 @@ def _fetch_pricing_from_stripe() -> dict:
     all_prices = _price_ids()
 
     pricing_info = {}
-    for tier in ("starter", "pro", "dominator", "annual_lock"):
+    for tier in ("starter", "pro", "founder", "annual_lock"):
         founding_id = all_prices.get(tier, {}).get("founding")
         regular_id = all_prices.get(tier, {}).get("regular")
 
@@ -755,7 +755,7 @@ def _attribution_stripe_metadata(request: Request, attribution: Optional[dict]) 
 
 
 class CheckoutRequest(BaseModel):
-    tier: str        # starter | pro | dominator | founder
+    tier: str        # starter | pro | founder | annual_lock
     vertical: str    # roofing | remediation | investor
     county_id: str   # hillsborough
     zip_codes: list[str] = []  # ZIP territories to lock on purchase
@@ -838,7 +838,7 @@ class CheckoutRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_zip_count(self) -> "CheckoutRequest":
-        limits = {"starter": 1, "pro": 3, "dominator": 10, "annual_lock": 1, "founder": 10}
+        limits = {"starter": 1, "pro": 3, "annual_lock": 1, "founder": 10}
         limit = limits.get(self.tier)
         if limit and len(self.zip_codes) != limit:
             raise ValueError(f"{self.tier.title()} plan requires exactly {limit} ZIP code{'s' if limit > 1 else ''}.")
@@ -1568,7 +1568,7 @@ async def stripe_wl_webhook(
 # founding-summary used before this was extracted, just named and reused.
 # ---------------------------------------------------------------------------
 
-_FOUNDING_TIERS = ["starter", "pro", "dominator"]
+_FOUNDING_TIERS = ["starter", "pro", "founder"]
 
 
 def _county_founding_deadline(db: Session, county_id: str) -> Optional[datetime]:
@@ -1712,7 +1712,7 @@ def founding_spots(
 
 # _ZIP_RE and _FLORIDA_PREFIXES imported from src.api.deps
 
-_ZIP_PRICING_TIERS = ("starter", "pro", "dominator", "annual_lock")
+_ZIP_PRICING_TIERS = ("starter", "pro", "founder", "annual_lock")
 
 
 def _cohort_adjusted_pricing(county_id: str, vertical: str, db: Session) -> dict:
@@ -5713,7 +5713,7 @@ def upgrade(req: UpgradeRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=503, detail=f"Stripe price not configured for {req.tier}")
 
     # Settle every guarantee cycle that already closed on the outgoing tier —
-    # otherwise switching sub.tier off starter/pro/dominator drops it from
+    # otherwise switching sub.tier off starter/pro/founder drops it from
     # the daily sweep's tier filter and any closed cycle is never evaluated.
     # evaluate_subscriber_guarantee() only advances one cycle per call, so a
     # subscriber sitting on a backlog of several closed cycles (sweep

@@ -1160,7 +1160,7 @@ class FoundingSubscriberCount(Base):
     __tablename__ = "founding_subscriber_counts"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    tier: Mapped[str] = mapped_column(String(20), nullable=False)          # starter | pro | dominator
+    tier: Mapped[str] = mapped_column(String(20), nullable=False)          # starter | pro | founder
     vertical: Mapped[str] = mapped_column(String(50), nullable=False)      # roofing | remediation | investor
     county_id: Mapped[str] = mapped_column(String(50), nullable=False)
     count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -1172,7 +1172,7 @@ class FoundingSubscriberCount(Base):
     __table_args__ = (
         UniqueConstraint("tier", "vertical", "county_id", name="uq_founding_tier_vertical_county"),
         Index("idx_founding_county_id", "county_id"),
-        CheckConstraint("tier IN ('starter', 'pro', 'dominator')", name="check_founding_tier"),
+        CheckConstraint("tier IN ('starter', 'pro', 'founder')", name="check_founding_tier"),
     )
 
     def __repr__(self):
@@ -1192,7 +1192,7 @@ class Subscriber(Base):
     stripe_subscription_id: Mapped[Optional[str]] = mapped_column(String(100), unique=True, index=True)
 
     # Plan details
-    tier: Mapped[str] = mapped_column(String(20), nullable=False)          # starter | pro | dominator
+    tier: Mapped[str] = mapped_column(String(20), nullable=False)          # starter | pro | founder | annual_lock
     vertical: Mapped[str] = mapped_column(String(50), nullable=False)      # roofing | remediation | investor
     county_id: Mapped[str] = mapped_column(String(50), nullable=False)
 
@@ -1345,7 +1345,7 @@ class Subscriber(Base):
         Index("idx_subscribers_icp_channel_key", "icp_channel_key"),
         Index("idx_subscriber_last_reactivation_at", "last_reactivation_attempt_at"),
         CheckConstraint(
-            "tier IN ('free', 'starter', 'pro', 'dominator', 'data_only', 'autopilot_lite', 'autopilot_pro', 'partner', 'annual_lock', 'founder')",
+            "tier IN ('free', 'starter', 'pro', 'data_only', 'autopilot_lite', 'autopilot_pro', 'partner', 'annual_lock', 'founder')",
             name="check_subscriber_tier",
         ),
         CheckConstraint(

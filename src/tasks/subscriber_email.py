@@ -38,7 +38,6 @@ GOLD_PLUS_TIERS = {"Ultra Platinum", "Platinum", "Gold"}
 TIER_LEAD_LIMIT = {
     "starter":    5,
     "pro":       10,
-    "dominator": 20,
     "agency":    20,
 }
 DEFAULT_LEAD_LIMIT = 10

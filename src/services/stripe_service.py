@@ -68,10 +68,6 @@ def _price_ids():
             "founding": settings.active_stripe_price("pro_founding"),
             "regular":  settings.active_stripe_price("pro_regular"),
         },
-        "dominator": {
-            "founding": settings.active_stripe_price("dominator_founding"),
-            "regular":  settings.active_stripe_price("dominator_regular"),
-        },
         "partner": {
             "founding": settings.active_stripe_price("partner"),
             "regular":  settings.active_stripe_price("partner"),
