@@ -1529,6 +1529,110 @@ async def slack_kill_command(request: Request):
 
 
 # ===========================================================================
+# THROUGH T4 — STANDING ORDER RATIFY / DECLINE / ARCHIVE (Slack interact)
+# ===========================================================================
+
+
+def _update_so_slack_message(slack_message_ts: str, reply_text: str) -> None:
+    """Edit the standing-order proposal Slack message in place after Josh acts."""
+    from config.settings import get_settings as _gs
+    settings = _gs()
+    token = settings.slack_bot_token
+    channel = settings.relay_slack_channel
+    if not token or not channel or not slack_message_ts:
+        return
+    try:
+        from slack_sdk import WebClient
+        client = WebClient(token=token.get_secret_value())
+        client.chat_update(
+            channel=channel,
+            ts=slack_message_ts,
+            text=reply_text,
+            blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": reply_text}}],
+        )
+    except Exception as exc:
+        logger.error("[SOInteract] chat.update failed: %s", exc)
+
+
+@router.post("/slack/standing-order/interact")
+async def slack_standing_order_interact(request: Request):
+    """
+    Handles Slack interactive-component payloads for Standing Order proposals
+    (THROUGH-v2.2 T4). Accepts: ratify, decline (proposal buttons) and
+    archive, keep (monthly digest buttons).
+
+    Auth: same Slack HMAC-SHA256 + relay_approvers allowlist as
+    /slack/relay-decision — standing order ratification is at least as
+    consequential as approving a single send.
+    """
+    from src.services.standing_order_compiler import (
+        record_ratify,
+        record_decline,
+        record_archive,
+    )
+
+    raw = await request.body()
+    if not _verify_slack_signature(dict(request.headers), raw):
+        raise HTTPException(status_code=401, detail="Invalid Slack signature")
+
+    try:
+        payload_str = parse_qs(raw.decode("utf-8")).get("payload", ["{}"])[0]
+        payload = json.loads(payload_str)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Malformed payload")
+
+    user_id = payload.get("user", {}).get("id", "")
+    if not _relay_approver_authorized(user_id):
+        return _slack_ephemeral("Not authorized to manage standing orders.")
+
+    actions = payload.get("actions", [])
+    if not actions:
+        return _slack_ephemeral("No action found in payload.")
+
+    try:
+        action_data = json.loads(actions[0].get("value", "{}"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid action value")
+
+    so_id = action_data.get("so_id")
+    action = action_data.get("action")
+    if not so_id or action not in ("ratify", "decline", "archive", "keep"):
+        raise HTTPException(status_code=400, detail="Invalid standing order action")
+
+    original_ts = payload.get("message", {}).get("ts", "")
+
+    if action == "ratify":
+        updated = record_ratify(so_id, ratified_by=user_id)
+        reply = (
+            f":white_check_mark: Standing Order #{so_id} *ratified* by <@{user_id}>. "
+            f"Future matching actions will skip individual review."
+            if updated
+            else f":warning: Standing Order #{so_id} was already decided."
+        )
+    elif action == "decline":
+        updated = record_decline(so_id, declined_by=user_id)
+        reply = (
+            f":no_entry: Standing Order #{so_id} *declined* by <@{user_id}>."
+            if updated
+            else f":warning: Standing Order #{so_id} was already decided."
+        )
+    elif action == "archive":
+        updated = record_archive(so_id)
+        reply = (
+            f":wastebasket: Standing Order #{so_id} *archived*."
+            if updated
+            else f":warning: Standing Order #{so_id} was not in 'ratified' state."
+        )
+    else:  # keep
+        reply = f":white_check_mark: Standing Order #{so_id} kept active."
+
+    if original_ts:
+        _update_so_slack_message(original_ts, reply)
+
+    return {"ok": True}
+
+
+# ===========================================================================
 # WIN-STORY APPROVAL
 # ===========================================================================
 

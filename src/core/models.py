@@ -8559,3 +8559,59 @@ class OutboundDraft(Base):
 
     def __repr__(self) -> str:
         return f"<OutboundDraft(draft_id={self.draft_id!r}, thread={self.opportunity_thread_id!r}, status={self.status!r})>"
+
+
+# ============================================================================
+# THROUGH-v2.2 — Standing-Order Compiler (T4)
+# ============================================================================
+
+class StandingOrder(Base):
+    """A ratified rule that lets future relay actions of the same
+    action_type + vertical bypass Josh's per-item review queue and route
+    directly to Relay execution — provided all hard gates (DNC, suppression,
+    TCPA, price floor) still pass.
+
+    Lifecycle: proposed (compiler fires) → ratified | declined (Josh's Slack
+    tap) → archived (monthly digest prune). A unique constraint on
+    (action_type, vertical) prevents duplicate proposals — the compiler
+    checks for an existing non-declined row before creating a new one.
+
+    status values:
+      proposed  — Slack message posted, awaiting Josh
+      ratified  — active; future matching actions skip the review queue
+      declined  — Josh rejected this proposal; compiler will re-propose after
+                  5 more approvals accumulate beyond the declined threshold
+      archived  — manually pruned via monthly digest; no longer active
+    """
+    __tablename__ = "standing_orders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    action_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    vertical: Mapped[str] = mapped_column(String(80), nullable=False)
+    template_id: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    conditions: Mapped[list] = mapped_column(JSONB, nullable=False, default=list, server_default="[]")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="proposed")
+    proposed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+    ratified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    declined_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    archived_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    ratified_by: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    slack_message_ts: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    approval_count_at_proposal: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        UniqueConstraint("action_type", "vertical", name="uq_standing_orders_action_vertical"),
+        Index("ix_standing_orders_status", "status"),
+        CheckConstraint(
+            "status IN ('proposed', 'ratified', 'declined', 'archived')",
+            name="ck_standing_orders_status",
+        ),
+    )
