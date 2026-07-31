@@ -19,6 +19,7 @@ from sqlalchemy import (
     Integer,
     LargeBinary as sa_LargeBinary,
     Numeric,
+    SmallInteger,
     String,
     Text,
     UniqueConstraint,
@@ -8086,12 +8087,25 @@ class TaxDeedAuction(Base):
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
     )
 
+    # HUNTER-05 (H5) — per-auction winner-resolution outcome, distinct from
+    # match_method above (which is deed-loader property-matching provenance,
+    # not buyer-identity resolution). NULL = not yet processed by
+    # src/agents/hunter/auction_resolution.py. 'provisional' satisfies the
+    # <24h processing SLA without asserting a verified identity — see that
+    # module's docstring for why processing and verification are tracked
+    # separately.
+    buyer_resolution_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+
     property: Mapped[Optional["Property"]] = relationship("Property", foreign_keys=[property_id])
 
     __table_args__ = (
         UniqueConstraint("county_id", "auction_date", "case_number", name="uq_tax_deed_auction"),
         Index("ix_tax_deed_auctions_county_date", "county_id", "auction_date"),
         Index("ix_tax_deed_auctions_parcel_id", "parcel_id"),
+        CheckConstraint(
+            "buyer_resolution_status IS NULL OR buyer_resolution_status IN ('verified', 'provisional', 'ambiguous')",
+            name="check_tax_deed_buyer_resolution_status",
+        ),
     )
 
     def __repr__(self) -> str:
@@ -8324,6 +8338,35 @@ class BuyerEntity(Base):
     # it identifies the opportunity, not the current flag state.
     opportunity_thread_id: Mapped[Optional[str]] = mapped_column(String(20), unique=True)
 
+    # HUNTER-03 (H3) — behavioral investor-type classification, distinct from
+    # entity_type above (legal structure). buyer_type_evidence/rule_version
+    # persist the raw counts and rule generation a label was produced under,
+    # for audit -- a label + confidence number alone isn't reviewable.
+    # Populated by src/agents/hunter/buyer_type_classification.py, which
+    # reads portfolio_evidence below rather than re-deriving it.
+    buyer_type: Mapped[Optional[str]] = mapped_column(String(20))
+    buyer_type_confidence: Mapped[Optional[int]] = mapped_column(Integer)
+    buyer_type_classified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    buyer_type_evidence: Mapped[Optional[Any]] = mapped_column(JSONB)
+    buyer_type_rule_version: Mapped[Optional[int]] = mapped_column(SmallInteger)
+
+    # HUNTER-04 (H4) — rolling purchase cadence, estimated acquisition
+    # capacity, financing pattern, and average hold-time, populated by
+    # src/agents/hunter/portfolio_profiling.py. financing_signal is a 3-state
+    # signal ('cash_inferred' | 'financed' | 'unknown') computed per
+    # acquisition then majority-voted onto the entity -- 'unknown' (no
+    # correlated mortgage deed found, or too little history to judge) never
+    # boosts estimated_annual_acquisition_capacity's multiplier the way a
+    # positive 'cash_inferred' signal does. portfolio_evidence carries the
+    # full bucketed evidence (acquisition/exit/still-held counts by window)
+    # that H3's classifier reads directly.
+    cadence_purchases_per_year: Mapped[Optional[Decimal]] = mapped_column(Numeric(6, 2))
+    estimated_annual_acquisition_capacity: Mapped[Optional[int]] = mapped_column(Integer)
+    financing_signal: Mapped[Optional[str]] = mapped_column(String(20))
+    avg_hold_days: Mapped[Optional[int]] = mapped_column(Integer)
+    portfolio_profiled_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    portfolio_evidence: Mapped[Optional[Any]] = mapped_column(JSONB)
+
     county_id: Mapped[Optional[str]] = mapped_column(String(50), index=True)
     first_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,
@@ -8352,8 +8395,21 @@ class BuyerEntity(Base):
             "confidence_score >= 0 AND confidence_score <= 100",
             name="check_buyer_entity_confidence_range",
         ),
+        CheckConstraint(
+            "buyer_type IS NULL OR buyer_type IN ('flipper', 'buy-and-hold', 'wholesaler', 'institutional')",
+            name="check_buyer_entity_buyer_type",
+        ),
+        CheckConstraint(
+            "buyer_type_confidence IS NULL OR (buyer_type_confidence >= 0 AND buyer_type_confidence <= 100)",
+            name="check_buyer_entity_buyer_type_confidence",
+        ),
+        CheckConstraint(
+            "financing_signal IS NULL OR financing_signal IN ('cash_inferred', 'financed', 'unknown')",
+            name="check_buyer_entity_financing_signal",
+        ),
         Index("idx_buyer_entities_confidence", "confidence_score"),
         Index("idx_buyer_entities_is_whale", "is_whale", postgresql_where=text("is_whale")),
+        Index("idx_buyer_entities_buyer_type", "buyer_type", postgresql_where=text("buyer_type IS NOT NULL")),
     )
 
     def __repr__(self) -> str:
@@ -8400,11 +8456,12 @@ class BuyerEntityLink(Base):
     __table_args__ = (
         UniqueConstraint("source_table", "source_id", name="uq_buyer_entity_link_source"),
         CheckConstraint(
-            "source_table IN ('owners', 'deeds', 'sunbiz_snapshots')",
+            "source_table IN ('owners', 'deeds', 'sunbiz_snapshots', 'tax_deed_auctions')",
             name="check_buyer_entity_link_source_table",
         ),
         CheckConstraint(
-            "match_method IN ('sunbiz_llc_piercing', 'exact_name_address', 'fuzzy_name', 'llm_adjudicated', 'manual')",
+            "match_method IN ('sunbiz_llc_piercing', 'exact_name_address', 'fuzzy_name', 'llm_adjudicated', 'manual', "
+            "'exact_name_only', 'auction_name_only_unverified')",
             name="check_buyer_entity_link_match_method",
         ),
         CheckConstraint(

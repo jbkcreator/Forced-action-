@@ -819,13 +819,16 @@ COUNTY_ID=hillsborough
 0 9 2 * * $PROJECT/scripts/cron/run.sh src.connectors.dor_sale_outcomes --county-id $COUNTY_ID
 1 9 2 * * $PROJECT/scripts/cron/run.sh src.connectors.dor_sale_outcomes --county-id pinellas
 
-# ── HUNTER-01/02 — BUYER ENTITY RESOLUTION + WHALE DETECTION (H3, W2) ────────
+# ── HUNTER-01/02/03/04 — BUYER ENTITY RESOLUTION + WHALE DETECTION +
+# BUYER-TYPE CLASSIFICATION + PORTFOLIO PROFILING (H3, W2) ───────────────────
 # Nightly sweep — daily, after outcome_label_layer (08:25/08:26) so the same
 # day's newly-promoted deed activity is available to resolve against. Runs
 # H2's incremental resolver against buyer_entities (never a full re-cluster —
-# entity IDs stay stable), then portfolio aggregation, then whale-flag
-# scoring, in that dependency order. Does not yet write to
-# /shared/facts/enriched/ — see src/tasks/hunter_nightly_sweep.py docstring.
+# entity IDs stay stable), then portfolio aggregation, whale-flag scoring,
+# portfolio profiling (HUNTER-04: cadence/capacity/hold-time), and buyer-type
+# classification (HUNTER-03), in that dependency order, scoped to just the
+# entities this run's resolution step actually touched. Does not yet write
+# to /shared/facts/enriched/ — see src/tasks/hunter_nightly_sweep.py docstring.
 30 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.hunter_nightly_sweep --county-id $COUNTY_ID
 31 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.hunter_nightly_sweep --county-id pinellas
 
@@ -837,6 +840,15 @@ COUNTY_ID=hillsborough
 # the next scheduled sweep if this entry's cadence is ever tightened.
 35 8 * * * $PROJECT/scripts/cron/run.sh src.connectors.whale_auction_fast_follow --county-id $COUNTY_ID
 36 8 * * * $PROJECT/scripts/cron/run.sh src.connectors.whale_auction_fast_follow --county-id pinellas
+
+# HUNTER-05 — direct tax-deed-auction-winner resolution. Separate from the
+# nightly sweep above (triggered by new tax_deed_auctions.sold_to rows, not a
+# buyer_entities-wide rescan); staggered just after the fast-follow entries.
+# Foreclosure winners are NOT resolved here — Foreclosure.sold_to carries no
+# real bidder identity (see src/agents/hunter/auction_resolution.py's
+# docstring), so they stay on the fast-follow proxy above permanently.
+40 8 * * * $PROJECT/scripts/cron/run.sh src.agents.hunter.auction_resolution --county-id $COUNTY_ID
+41 8 * * * $PROJECT/scripts/cron/run.sh src.agents.hunter.auction_resolution --county-id pinellas
 
 # ── CDS SCORING RETUNE (client Q9 — closed loop) ─────────────
 # Weekly Sunday @ 11:00 UTC. Runs B→C→D→E→F end to end: builds the training

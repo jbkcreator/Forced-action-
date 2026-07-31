@@ -871,6 +871,13 @@ def attach_or_create_entities(
     new_entities_created = 0
     new_links_created = 0
     conflicts = 0
+    # HUNTER-04/05 (H3/H4's nightly incremental wiring) need to know exactly
+    # which entities this run touched, so downstream profiling/classification
+    # steps can scope to entity_ids instead of re-scanning the whole table
+    # every night -- see hunter_nightly_sweep.py. A set, not a list: the same
+    # entity can be touched by more than one cluster in one run (e.g. two
+    # separate new deeds both attaching to the same existing entity).
+    changed_entity_ids: set[int] = set()
 
     for cluster, confidence in zip(relevant_clusters, confidences):
         entity_anchors = [r for r in cluster if r.source_table == _ENTITY_ANCHOR_TABLE]
@@ -897,6 +904,7 @@ def attach_or_create_entities(
             entity_id = entity.id
             new_entities_created += 1
 
+        changed_entity_ids.add(entity_id)
         for rec in new_records:
             method, link_confidence = evidence_index.get(_record_key(rec), ("manual", 100))
             session.execute(insert(BuyerEntityLink).values(
@@ -912,6 +920,7 @@ def attach_or_create_entities(
         "new_entities": new_entities_created,
         "new_links": new_links_created,
         "conflicts": conflicts,
+        "changed_entity_ids": sorted(changed_entity_ids),
     }
 
 
@@ -925,13 +934,18 @@ def run_incremental(session: Session, county_id: Optional[str] = None) -> dict:
     record either attaches to one via a new BuyerEntityLink, or (matching
     nothing existing) forms a brand new entity, exactly as the backfill does
     for first-time records. Commits once at the end.
+
+    Returned stats include changed_entity_ids — every buyer_entity_id this
+    run created or attached a new link to — so callers (hunter_nightly_sweep.py)
+    can scope downstream profiling/classification to just what changed instead
+    of re-scanning the whole buyer_entities table every run.
     """
     new_candidates = list(extract_candidates(session, only_unresolved=True))
     if county_id:
         new_candidates = [c for c in new_candidates if c.county_id == county_id]
 
     if not new_candidates:
-        return {"new_entities": 0, "new_links": 0, "conflicts": 0, "processed": 0}
+        return {"new_entities": 0, "new_links": 0, "conflicts": 0, "processed": 0, "changed_entity_ids": []}
 
     # Anchors are loaded across ALL counties, never scoped to county_id --
     # a buyer entity isn't bound to one county. Scoping this to the cron's
