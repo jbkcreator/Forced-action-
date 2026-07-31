@@ -30,6 +30,7 @@ import time
 from datetime import date
 from typing import Any, Dict, List, Optional
 
+from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 from src.agents.cora import fallback_ranking, queue, store
@@ -39,6 +40,8 @@ from src.agents.cora.tools.read_tools import (
     get_ranked_whales,
     get_recent_auction_fast_follow_whales,
 )
+from src.agents.contracts import hunter_to_cora
+from src.agents.hunter.gating import UNVERIFIED_FLOOR
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +110,30 @@ def _produce_from_rows(db: Session, cell_id: str, scored: List[Dict[str, Any]]) 
             continue
 
         contact = get_contact_channel(db, buyer_entity["id"])
+        handoff_input = {
+            **row,
+            "entity_type": buyer_entity.get("entity_type"),
+            "contact_channel": "phone" if contact.get("phone") else ("email" if contact.get("email") else "none"),
+            "contact_confidence": contact.get("contact_confidence") or 0,
+        }
+        try:
+            handoff = hunter_to_cora.validate_handoff(handoff_input)
+        except ValidationError as exc:
+            errors = [f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors()]
+            hunter_to_cora.reject_handoff(db, handoff_input, errors)
+            logger.warning("target_producer: thread_id=%s Hunter->Cora handoff rejected: %s", thread_id, errors)
+            continue
+        if not hunter_to_cora.is_handoff_citable(handoff):
+            hunter_to_cora.reject_handoff(
+                db, handoff_input,
+                [f"confidence_score: {handoff.confidence_score} < {UNVERIFIED_FLOOR} (UNVERIFIED_FLOOR)"],
+            )
+            logger.warning(
+                "target_producer: thread_id=%s below UNVERIFIED_FLOOR (confidence=%d) — not surfaced to Cora",
+                thread_id, handoff.confidence_score,
+            )
+            continue
+
         payload = {
             "buyer_entity": buyer_entity,
             "cell_id": cell_id,
