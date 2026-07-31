@@ -134,21 +134,19 @@ def maybe_send_deal_win_social_proof_prompt(subscriber, outcome, db) -> bool:
             subject="Big win - can we feature it?",
             body_text=body_text,
             body_html=body_html,
-            db=db,
-        )
-        if email_sent:
-            log_transactional_email_send(
-                db,
-                recipient_email=subscriber.email,
-                subscriber_id=subscriber.id,
-                template_id="deal_win_social_proof_email",
-                context_snapshot={
+            tracking={
+                "subscriber_id": subscriber.id,
+                "template_id": "deal_win_social_proof_email",
+                "channel": "mandrill",
+                "context_snapshot": {
                     "deal_outcome_id": outcome.id,
                     "deal_amount": float(outcome.deal_amount) if getattr(outcome, "deal_amount", None) else None,
                     "deal_size_bucket": outcome.deal_size_bucket,
                     "share_url": share_url,
                 },
-            )
+            },
+            db=db,
+        )
     finally:
         try:
             _mark_send_status(funnel_id, False, email_sent, db)

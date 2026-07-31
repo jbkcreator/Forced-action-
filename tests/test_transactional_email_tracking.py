@@ -3,7 +3,10 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select, text
 
 from src.core.models import EmailOptOut, MessageOutcome, SmsOptOut, Subscriber
-from src.services.subscriber_auth import send_magic_link_email
+from src.services.subscriber_auth import (
+    send_magic_link_email,
+    send_subscriber_password_reset_email,
+)
 from src.services.transactional_email_tracking import record_mandrill_event
 
 
@@ -30,25 +33,94 @@ def _ensure_message_outcome_email_tracking_columns(db) -> None:
     db.flush()
 
 
-def test_send_magic_link_email_logs_message_outcome(fresh_db, monkeypatch):
+def _capture_send_email(monkeypatch, target: str):
+    """Patch send_email in `target` module to capture kwargs and return True."""
+    captured = {}
+
+    def _fake(**kwargs):
+        captured.update(kwargs)
+        return True
+
+    monkeypatch.setattr(f"{target}.send_email", _fake)
+    return captured
+
+
+def test_send_magic_link_email_passes_tracking_to_send_email(fresh_db, monkeypatch):
     _ensure_message_outcome_email_tracking_columns(fresh_db)
     sub = _make_subscriber(fresh_db, email="magic-track@example.com")
-    monkeypatch.setattr("src.services.subscriber_auth.send_email", lambda **kwargs: True)
+    captured = _capture_send_email(monkeypatch, "src.services.subscriber_auth")
 
-    send_magic_link_email(
-        sub.email,
-        sub.name,
-        "raw-token",
-        db=fresh_db,
-        subscriber_id=sub.id,
+    result = send_magic_link_email(
+        sub.email, sub.name, "raw-token", db=fresh_db, subscriber_id=sub.id,
     )
+
+    assert result is True
+    assert captured["db"] is fresh_db
+    assert captured["tracking"]["template_id"] == "magic_link_email"
+    assert captured["tracking"]["subscriber_id"] == sub.id
+
+
+def test_send_password_reset_email_passes_tracking_to_send_email(fresh_db, monkeypatch):
+    _ensure_message_outcome_email_tracking_columns(fresh_db)
+    sub = _make_subscriber(fresh_db, email="reset-track@example.com", phone="+18135550220")
+    captured = _capture_send_email(monkeypatch, "src.services.subscriber_auth")
+
+    result = send_subscriber_password_reset_email(
+        sub.email, sub.name, "raw-token", db=fresh_db, subscriber_id=sub.id,
+    )
+
+    assert result is True
+    assert captured["db"] is fresh_db
+    assert captured["tracking"]["template_id"] == "password_reset_email"
+    assert captured["tracking"]["subscriber_id"] == sub.id
+
+
+def test_send_email_emits_metadata_header_with_precreated_outcome(fresh_db, monkeypatch):
+    """The correlation path: send_email creates the outcome pre-send and stamps
+    its id onto the message as X-MC-Metadata."""
+    from config.settings import get_settings
+    import src.services.email as email_mod
+
+    _ensure_message_outcome_email_tracking_columns(fresh_db)
+    sub = _make_subscriber(fresh_db, email="meta-header@example.com")
+
+    s = get_settings()
+    monkeypatch.setattr(s, "smtp_host", "smtp.test", raising=False)
+    monkeypatch.setattr(s, "smtp_user", "u", raising=False)
+
+    class _Secret:
+        def get_secret_value(self):
+            return "pw"
+
+    monkeypatch.setattr(s, "smtp_pass", _Secret(), raising=False)
+    monkeypatch.setattr(email_mod, "get_settings", lambda: s)
+    monkeypatch.setattr("src.services.email_suppression.is_email_suppressed", lambda db, to: False)
+
+    sent_payloads = {}
+
+    class _FakeSMTP:
+        def __init__(self, *a, **k): ...
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def starttls(self): ...
+        def login(self, *a): ...
+        def sendmail(self, frm, to, body): sent_payloads["body"] = body
+
+    monkeypatch.setattr(email_mod.smtplib, "SMTP", _FakeSMTP)
+
+    ok = email_mod.send_email(
+        to=sub.email, subject="s", body_text="b",
+        tracking={"subscriber_id": sub.id, "template_id": "welcome_email", "channel": "mandrill"},
+        db=fresh_db,
+    )
+    assert ok is True
 
     outcome = fresh_db.execute(
         select(MessageOutcome).where(MessageOutcome.recipient_email == sub.email)
     ).scalar_one()
-    assert outcome.subscriber_id == sub.id
-    assert outcome.template_id == "magic_link_email"
     assert outcome.send_status == "sent"
+    assert "X-MC-Metadata" in sent_payloads["body"]
+    assert str(outcome.id) in sent_payloads["body"]
 
 
 def test_hard_bounce_suppresses_contact(fresh_db):

@@ -177,7 +177,7 @@ def send_magic_link_email(
     *,
     db=None,
     subscriber_id: Optional[int] = None,
-) -> None:
+) -> bool:
     verify_url = magic_link_url(raw_token)
     greeting = f"Hi {name}," if name else "Hi,"
     sent = send_email(
@@ -199,15 +199,15 @@ def send_magic_link_email(
             f"{_MAGIC_LINK_EXPIRE_MINUTES} minutes and can only be used once. "
             f"If you didn't request this, ignore this email.</p>"
         ),
+        tracking={
+            "subscriber_id": subscriber_id,
+            "template_id": "magic_link_email",
+            "channel": "mandrill",
+            "context_snapshot": {"expires_in_minutes": _MAGIC_LINK_EXPIRE_MINUTES},
+        },
+        db=db,
     )
-    if sent and db is not None:
-        log_transactional_email_send(
-            db,
-            recipient_email=email,
-            subscriber_id=subscriber_id,
-            template_id="magic_link_email",
-            context_snapshot={"expires_in_minutes": _MAGIC_LINK_EXPIRE_MINUTES},
-        )
+    return sent
 
 
 # ── FastAPI dependency: gate the feed ───────────────────────────────────────────
@@ -249,7 +249,7 @@ def send_subscriber_password_reset_email(
     *,
     db=None,
     subscriber_id: Optional[int] = None,
-) -> None:
+) -> bool:
     base = get_settings().app_base_url.rstrip("/")
     reset_url = f"{base}/reset-password/{raw_token}"
     greeting = f"Hi {name}," if name else "Hi,"
@@ -270,15 +270,15 @@ def send_subscriber_password_reset_email(
             f"<p style='color:#888;font-size:12px;'>Link expires in {_RESET_EXPIRE_HOURS} hours. "
             f"If you didn't request this, ignore this email.</p>"
         ),
+        tracking={
+            "subscriber_id": subscriber_id,
+            "template_id": "password_reset_email",
+            "channel": "mandrill",
+            "context_snapshot": {"expires_in_hours": _RESET_EXPIRE_HOURS},
+        },
+        db=db,
     )
-    if sent and db is not None:
-        log_transactional_email_send(
-            db,
-            recipient_email=email,
-            subscriber_id=subscriber_id,
-            template_id="password_reset_email",
-            context_snapshot={"expires_in_hours": _RESET_EXPIRE_HOURS},
-        )
+    return sent
 
 
 RESET_EXPIRE_HOURS = _RESET_EXPIRE_HOURS

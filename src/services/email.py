@@ -36,7 +36,10 @@ def _create_message_outcome(db, *, to: str, tracking: dict):
         channel=tracking.get("channel") or "mandrill",
         recipient_email=to.strip().lower(),
         sent_at=datetime.now(timezone.utc),
-        send_status="pending",
+        # Pre-send row; flips to 'sent' on SMTP accept, 'failed' on error.
+        # Must be a value allowed by the check_mo_send_status constraint
+        # ('pending' is NOT allowed — see apply_fa060).
+        send_status="scheduled",
         context_snapshot=tracking.get("context_snapshot"),
     )
     db.add(outcome)
