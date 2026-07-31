@@ -275,7 +275,7 @@ class AppSettings(BaseSettings):
 		return getattr(self, f"stripe_price_{name}", None)
 
 	# Founding subscriber spot limit (default 10, changeable without redeploy)
-	founding_spot_limit: int = Field(default=10, env="FOUNDING_SPOT_LIMIT")
+	founding_spot_limit: int = Field(default=25, env="FOUNDING_SPOT_LIMIT")
 
 	# Grace period after subscription deletion — 7 days lets payment_failure_day5 trigger fire.
 	# Set GRACE_PERIOD_HOURS=0.017 (≈1 min) for rapid local testing.

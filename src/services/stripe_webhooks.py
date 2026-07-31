@@ -578,7 +578,7 @@ def _on_checkout_completed(
             )
             db.add(row)
             db.flush()
-        row.count += 1
+        row.count += len(zip_codes)
         if row.count == settings.founding_spot_limit:
             logger.info(
                 "FOUNDING LIMIT REACHED: tier=%s vertical=%s county=%s"
