@@ -102,6 +102,20 @@ def send_email(
     from_addr = settings.email_from or settings.smtp_user
     password = settings.smtp_pass.get_secret_value()
 
+    # Attribution: create the MessageOutcome BEFORE sending so its id can ride
+    # along as Mandrill metadata (X-MC-Metadata). The webhook resolves events
+    # back to this exact send by that id — never by "latest email for
+    # recipient", which mis-attributes out-of-order bounce callbacks.
+    outcome = None
+    if tracking is not None and db is not None:
+        try:
+            from src.services.transactional_email_tracking import _email_tracking_columns_ready
+            if _email_tracking_columns_ready(db):
+                outcome = _create_message_outcome(db, to=to, tracking=tracking)
+        except Exception as exc:
+            logger.warning("Could not create MessageOutcome for %s: %s", to, exc)
+            outcome = None
+
     try:
         # Use mixed multipart whenever attachments are present; alternative
         # body lives nested inside.
@@ -151,16 +165,34 @@ def send_email(
             # instead of rewriting To: per-recipient (default ESP behaviour).
             msg["X-MC-PreserveRecipients"] = "true"
 
+        # Mandrill echoes X-MC-Metadata back on every webhook event as
+        # msg.metadata — this is how a bounce/open/click is matched to the
+        # exact send that produced it.
+        if outcome is not None:
+            import json as _json
+            msg["X-MC-Metadata"] = _json.dumps({"message_outcome_id": outcome.id})
+
         all_recipients = [to] + (cc or [])
         with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=10) as server:
             server.starttls()
             server.login(settings.smtp_user, password)
             server.sendmail(from_addr, all_recipients, msg.as_string())
 
+        if outcome is not None:
+            outcome.send_status = "sent"
+            db.flush()
+
         logger.info("Email sent → %s cc=%s | %s", to, cc or [], subject)
         return True
 
     except Exception as exc:
+        if outcome is not None:
+            try:
+                outcome.send_status = "failed"
+                outcome.failure_reason = "smtp_send_error"
+                db.flush()
+            except Exception:
+                pass
         logger.error("Failed to send email to %s (%s): %s", to, subject, exc)
         # Fire ops alert — but only if this isn't already an alert email (avoid loops)
         if settings.alert_email and to != settings.alert_email:
@@ -228,7 +260,7 @@ def send_alert(
     return sent
 
 
-def send_welcome_email(subscriber, magic_link_url: Optional[str] = None, db=None) -> None:
+def send_welcome_email(subscriber, magic_link_url: Optional[str] = None, db=None) -> bool:
     """
     Send the dashboard-link welcome email for any new subscriber (free or paid).
 
@@ -242,9 +274,14 @@ def send_welcome_email(subscriber, magic_link_url: Optional[str] = None, db=None
     route.
 
     Non-blocking — caller must wrap in try/except if needed.
+
+    Returns True only if the email was actually accepted by SMTP. Callers MUST
+    gate stamp_welcome_email_sent() on this — stamping unconditionally marks a
+    welcome email "sent" even when SMTP was down or the recipient suppressed,
+    which then pages ops to chase a subscriber who never got a login link.
     """
     if not subscriber.email:
-        return
+        return False
 
     _settings = get_settings()
 
@@ -375,25 +412,27 @@ def send_welcome_email(subscriber, magic_link_url: Optional[str] = None, db=None
         subject=subject,
         body_text=body_text,
         body_html=body_html,
-    )
-    if sent and db is not None:
-        from src.services.transactional_email_tracking import log_transactional_email_send
-        log_transactional_email_send(
-            db,
-            recipient_email=subscriber.email,
-            subscriber_id=subscriber.id,
-            template_id="welcome_email",
-            context_snapshot={
+        tracking={
+            "subscriber_id": subscriber.id,
+            "template_id": "welcome_email",
+            "channel": "mandrill",
+            "context_snapshot": {
                 "magic_link_included": bool(magic_link_url),
                 "tier": subscriber.tier,
                 "vertical": subscriber.vertical,
                 "founding_member": bool(subscriber.founding_member),
             },
-        )
-    logger.info("Welcome email sent → %s (subscriber=%s)", subscriber.email, subscriber.id)
+        },
+        db=db,
+    )
+    if sent:
+        logger.info("Welcome email sent → %s (subscriber=%s)", subscriber.email, subscriber.id)
+    else:
+        logger.warning("Welcome email NOT sent → %s (subscriber=%s)", subscriber.email, subscriber.id)
+    return sent
 
 
-def send_upgrade_confirmation_email(subscriber, db=None) -> None:
+def send_upgrade_confirmation_email(subscriber, db=None) -> bool:
     """
     Confirm a plan upgrade for a subscriber who already has dashboard access
     (e.g. a free-tier subscriber upgrading from their own dashboard).
@@ -409,7 +448,7 @@ def send_upgrade_confirmation_email(subscriber, db=None) -> None:
     Non-blocking — caller must wrap in try/except if needed.
     """
     if not subscriber.email:
-        return
+        return False
 
     _settings = get_settings()
 
@@ -514,18 +553,20 @@ def send_upgrade_confirmation_email(subscriber, db=None) -> None:
         subject=subject,
         body_text=body_text,
         body_html=body_html,
-    )
-    if sent and db is not None:
-        from src.services.transactional_email_tracking import log_transactional_email_send
-        log_transactional_email_send(
-            db,
-            recipient_email=subscriber.email,
-            subscriber_id=subscriber.id,
-            template_id="upgrade_confirmation_email",
-            context_snapshot={
+        tracking={
+            "subscriber_id": subscriber.id,
+            "template_id": "upgrade_confirmation_email",
+            "channel": "mandrill",
+            "context_snapshot": {
                 "tier": subscriber.tier,
                 "vertical": subscriber.vertical,
                 "founding_member": bool(subscriber.founding_member),
             },
-        )
-    logger.info("Upgrade confirmation email sent → %s (subscriber=%s)", subscriber.email, subscriber.id)
+        },
+        db=db,
+    )
+    if sent:
+        logger.info("Upgrade confirmation email sent → %s (subscriber=%s)", subscriber.email, subscriber.id)
+    else:
+        logger.warning("Upgrade confirmation email NOT sent → %s (subscriber=%s)", subscriber.email, subscriber.id)
+    return sent

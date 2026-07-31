@@ -351,8 +351,10 @@ def create_free_account_by_email(
 		try:
 			from src.services.activation_tracking import stamp_welcome_email_sent
 			from src.services.email import send_welcome_email
-			send_welcome_email(sub, magic_link_url=magic_url, db=db)
-			stamp_welcome_email_sent(sub.id, db)
+			if send_welcome_email(sub, magic_link_url=magic_url, db=db):
+				stamp_welcome_email_sent(sub.id, db)
+			else:
+				logger.warning("Welcome email not sent for subscriber %d — not stamping welcome_email_sent", sub.id)
 		except Exception as exc:
 			logger.warning("Welcome email failed for new subscriber %d: %s", sub.id, exc)
 	else:

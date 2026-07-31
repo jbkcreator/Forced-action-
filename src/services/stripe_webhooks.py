@@ -1182,8 +1182,10 @@ def _checkout_completed_deferred(db: Session, subscriber, session: dict, is_new_
                     subscriber.id, exc_info=True,
                 )
             try:
-                send_welcome_email(subscriber, magic_link_url=magic_url, db=db)
-                stamp_welcome_email_sent(subscriber.id, db)
+                if send_welcome_email(subscriber, magic_link_url=magic_url, db=db):
+                    stamp_welcome_email_sent(subscriber.id, db)
+                else:
+                    logger.warning("Welcome email not sent for subscriber %s — not stamping welcome_email_sent", subscriber.id)
             except Exception:
                 logger.error("Welcome email failed for subscriber %s", subscriber.id, exc_info=True)
 
@@ -2924,8 +2926,10 @@ def _on_lead_unlock_payment(payment_intent: dict, db: Session) -> None:
                     "lead_unlock: magic-link issuance helper failed for sub=%s",
                     subscriber.id, exc_info=True,
                 )
-            send_welcome_email(subscriber, magic_link_url=magic_url, db=db)
-            stamp_welcome_email_sent(subscriber.id, db)
+            if send_welcome_email(subscriber, magic_link_url=magic_url, db=db):
+                stamp_welcome_email_sent(subscriber.id, db)
+            else:
+                logger.warning("lead_unlock: welcome email not sent sub=%s — not stamping", subscriber.id)
     except Exception as exc:
         logger.warning("lead_unlock: welcome email failed sub=%s: %s",
                        subscriber.id, exc)

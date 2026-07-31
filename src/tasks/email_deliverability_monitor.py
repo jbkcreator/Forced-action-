@@ -337,8 +337,17 @@ def run_and_page(
                 logger.info("[deliverability_monitor][DRY] would send subject=%s\n%s", trip.email_subject(), trip.email_body())
                 continue
             try:
-                send_alert(trip.email_subject(), trip.email_body())
-                _record_paged(session, trip.rule, county_id)
+                # Only record the dedup page if the alert actually went out.
+                # send_alert() returns False (does not raise) when no channel is
+                # configured or delivery fails — recording anyway would suppress
+                # retries for the whole dedup window while no operator was paged.
+                if send_alert(trip.email_subject(), trip.email_body()):
+                    _record_paged(session, trip.rule, county_id)
+                else:
+                    logger.error(
+                        "[deliverability_monitor] alert for %s NOT delivered — leaving eligible for next run",
+                        trip.rule,
+                    )
             except Exception as exc:
                 logger.error("[deliverability_monitor] failed to send alert for %s: %s", trip.rule, exc)
         session.commit()

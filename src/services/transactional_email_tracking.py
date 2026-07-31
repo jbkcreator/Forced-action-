@@ -73,6 +73,28 @@ def _latest_outcome_for_email(db, email: str) -> Optional[MessageOutcome]:
     ).scalar_one_or_none()
 
 
+def _outcome_by_provider_id(db, provider_message_id: str) -> Optional[MessageOutcome]:
+    if not _email_tracking_columns_ready(db):
+        return None
+    return db.execute(
+        select(MessageOutcome)
+        .where(
+            MessageOutcome.message_type == "email",
+            MessageOutcome.provider_message_id == provider_message_id,
+        )
+        .order_by(MessageOutcome.sent_at.desc(), MessageOutcome.id.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+
+# Events for which a last-resort "latest email for this recipient" match is
+# acceptable — engagement only. Failure events (bounces, complaints) must NEVER
+# fall back to latest: an out-of-order soft-bounce callback would then overwrite
+# whichever row was logged most recently, so several bounces collapse onto one
+# row and the 3-bounce suppression threshold is never reached.
+_LATEST_FALLBACK_EVENTS = {"open", "click"}
+
+
 def record_mandrill_event(db, event: dict) -> None:
     event_type = event.get("event") or ""
     msg = event.get("msg") or {}
@@ -85,12 +107,18 @@ def record_mandrill_event(db, event: dict) -> None:
     outcome = None
     metadata = msg.get("metadata") or {}
     outcome_id = metadata.get("message_outcome_id")
+    # 1. Exact match by the metadata id we stamped at send time.
     if columns_ready and outcome_id:
         try:
             outcome = db.get(MessageOutcome, int(outcome_id))
         except Exception:
             outcome = None
-    if columns_ready and outcome is None:
+    # 2. Fallback to the provider's own message id (stored by an earlier event
+    #    for this same send) — handles events that arrive without metadata.
+    if columns_ready and outcome is None and provider_message_id:
+        outcome = _outcome_by_provider_id(db, provider_message_id)
+    # 3. Engagement-only last resort. Never for failure metrics (see above).
+    if columns_ready and outcome is None and event_type in _LATEST_FALLBACK_EVENTS:
         outcome = _latest_outcome_for_email(db, email)
     if outcome is not None:
         outcome.provider_message_id = provider_message_id or outcome.provider_message_id

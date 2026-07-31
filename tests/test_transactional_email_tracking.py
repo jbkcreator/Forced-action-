@@ -127,3 +127,87 @@ def test_third_soft_bounce_within_seven_days_suppresses_contact(fresh_db):
         select(EmailOptOut).where(EmailOptOut.email == sub.email)
     ).scalar_one()
     assert email_opt_out.source == "mandrill_soft_bounce_threshold"
+
+
+def _add_outcome(db, sub, *, provider_id=None, failure=None, sent_at=None):
+    from datetime import datetime as _dt, timezone as _tz
+    o = MessageOutcome(
+        subscriber_id=sub.id,
+        message_type="email",
+        template_id="welcome_email",
+        channel="mandrill",
+        recipient_email=sub.email,
+        provider_message_id=provider_id,
+        failure_reason=failure,
+        sent_at=sent_at or _dt.now(_tz.utc),
+        send_status="sent",
+    )
+    db.add(o)
+    db.flush()
+    return o
+
+
+def test_metadata_targets_exact_send_not_latest(fresh_db):
+    """Two sends to one recipient; a soft-bounce with metadata must mark ITS
+    own row, never the most recently logged one (the old latest-email bug)."""
+    _ensure_message_outcome_email_tracking_columns(fresh_db)
+    sub = _make_subscriber(fresh_db, email="attr-a@example.com", phone="+18135550210")
+    first = _add_outcome(fresh_db, sub, sent_at=datetime.now(timezone.utc) - timedelta(hours=2))
+    latest = _add_outcome(fresh_db, sub, sent_at=datetime.now(timezone.utc))
+
+    # Out-of-order: the FIRST send bounces after the second was already logged.
+    record_mandrill_event(
+        fresh_db,
+        {"event": "soft_bounce",
+         "msg": {"email": sub.email, "_id": "mdr_a1",
+                 "metadata": {"message_outcome_id": first.id}}},
+    )
+
+    fresh_db.refresh(first)
+    fresh_db.refresh(latest)
+    assert first.failure_reason == "soft_bounce"
+    assert latest.failure_reason is None  # NOT overwritten
+
+
+def test_provider_message_id_fallback_resolves_later_event(fresh_db):
+    """A second event without metadata resolves by the provider _id stored on
+    the first (metadata-matched) event."""
+    _ensure_message_outcome_email_tracking_columns(fresh_db)
+    sub = _make_subscriber(fresh_db, email="attr-b@example.com", phone="+18135550211")
+    outcome = _add_outcome(fresh_db, sub)
+
+    # 1st event carries metadata → stamps provider_message_id on the row.
+    record_mandrill_event(
+        fresh_db,
+        {"event": "open",
+         "msg": {"email": sub.email, "_id": "mdr_b1",
+                 "metadata": {"message_outcome_id": outcome.id}}},
+    )
+    # 2nd event has NO metadata but the same provider _id → resolves by it.
+    record_mandrill_event(
+        fresh_db,
+        {"event": "click", "msg": {"email": sub.email, "_id": "mdr_b1"}},
+    )
+
+    fresh_db.refresh(outcome)
+    assert outcome.opened_at is not None
+    assert outcome.clicked_at is not None
+
+
+def test_unattributable_soft_bounce_does_not_touch_latest(fresh_db):
+    """A soft-bounce with no metadata and no matching provider id must NOT fall
+    back to the latest email row for this recipient."""
+    _ensure_message_outcome_email_tracking_columns(fresh_db)
+    sub = _make_subscriber(fresh_db, email="attr-c@example.com", phone="+18135550212")
+    latest = _add_outcome(fresh_db, sub)
+
+    record_mandrill_event(
+        fresh_db,
+        {"event": "soft_bounce", "msg": {"email": sub.email, "_id": "mdr_unknown"}},
+    )
+
+    fresh_db.refresh(latest)
+    assert latest.failure_reason is None
+    assert fresh_db.execute(
+        select(EmailOptOut).where(EmailOptOut.email == sub.email)
+    ).scalar_one_or_none() is None
