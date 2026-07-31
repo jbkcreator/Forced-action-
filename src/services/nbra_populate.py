@@ -54,7 +54,6 @@ SUBSCRIPTION_HORIZON_MONTHS = 12
 REVENUE_TYPE_BY_OFFER: dict[str, RevenueType] = {
     "founder_tier": RevenueType.SUBSCRIPTION,
     "core_subscription": RevenueType.SUBSCRIPTION,
-    "single_ZIP_pack": RevenueType.ONE_TIME,
     "lead_packs": RevenueType.ONE_TIME,
     "insurance_distress_pack": RevenueType.ONE_TIME,
     "bankruptcy_alert": RevenueType.ONE_TIME,
@@ -74,7 +73,6 @@ PLAN_ID_BY_OFFER: dict[str, str] = {
 ACTION_TYPE_BY_OFFER: dict[str, str] = {
     "founder_tier": "call_outreach",
     "core_subscription": "email_outreach",
-    "single_ZIP_pack": "email_outreach",
     "lead_packs": "email_outreach",
     "insurance_distress_pack": "email_outreach",
     "bankruptcy_alert": "email_outreach",

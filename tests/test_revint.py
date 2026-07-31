@@ -196,7 +196,10 @@ class TestNBRAQueue:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestRecommendOffer:
-    def test_auction_winner_returns_single_zip_pack(self):
+    def test_auction_winner_returns_core_subscription(self):
+        # single-ZIP is not a distinct offer — an auction winner is pitched
+        # core_subscription; ZIP sizing / $197 territory upsell is decided
+        # downstream (revenue ladder / Lifecycle), not by the recommender.
         from src.agents.cora.contracts import recommend_offer
 
         entity = {
@@ -205,8 +208,8 @@ class TestRecommendOffer:
             "entity_links": [{"source_table": "auction_records", "source_id": 1}],
         }
         rec = recommend_offer(entity)
-        assert rec["offer"] == "single_ZIP_pack"
-        assert rec["matched_rule_id"] == "auction_winner_zip_pack"
+        assert rec["offer"] == "core_subscription"
+        assert rec["matched_rule_id"] == "auction_winner_core_subscription"
 
     def test_whale_beats_auction_winner(self):
         from src.agents.cora.contracts import recommend_offer

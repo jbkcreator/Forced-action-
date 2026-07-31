@@ -80,8 +80,15 @@ def recommend_offer(buyer_entity: Dict[str, Any]) -> OfferRecommendation:
             "alternative_offer": "core_subscription",
         }
 
-    # Priority 2 — auction winner → single ZIP pack
+    # Priority 2 — auction winner → core subscription
     # entity_links is list[dict] with source_table, source_id, match_method keys.
+    # NOTE: this rule previously returned "single_ZIP_pack". Per the settled
+    # product model (section 5.4), single-ZIP is NOT a distinct offer — it is
+    # core_subscription at its Starter (zip_limit=1) resolution. ZIP quantity
+    # and the flat $197/ZIP territory_lock upsell are a conversion-time /
+    # Lifecycle decision (config/revenue_ladder.py step 6), not an offer the
+    # per-prospect recommender emits. So an auction winner is pitched
+    # core_subscription; territory sizing is decided downstream.
     entity_links: list[Any] = buyer_entity.get("entity_links", [])
     is_auction_winner = any(
         (isinstance(link, dict) and link.get("source_table") == "auction_records")
@@ -90,15 +97,15 @@ def recommend_offer(buyer_entity: Dict[str, Any]) -> OfferRecommendation:
     )
     if is_auction_winner and buyer_entity.get("is_auction_winner"):
         return {
-            "offer": "single_ZIP_pack",
+            "offer": "core_subscription",
             "reason": "auction_records entity link + is_auction_winner",
             "confidence": 0.75,
             "rule_priority": 2,
-            "fallback_offer": "core_subscription",
-            "matched_rule_id": "auction_winner_zip_pack",
+            "fallback_offer": "lead_packs",
+            "matched_rule_id": "auction_winner_core_subscription",
             "signals_used": ["source_table:auction_records", "is_auction_winner"],
             "config_version": config_version,
-            "alternative_offer": "core_subscription",
+            "alternative_offer": "lead_packs",
         }
 
     # Priority 3 — lapsed subscriber win-back

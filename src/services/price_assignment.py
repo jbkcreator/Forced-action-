@@ -28,7 +28,8 @@ PRICE_BAND_TESTING_ENABLED: bool = False  # flip only after Josh ratifies bands
 PRICE_BANDS: dict[str, dict[str, int]] = {
     "founder_tier":            {"floor": 90000,  "ceiling": 120000},
     "core_subscription":       {"floor": 19700,  "ceiling": 29700},
-    "single_ZIP_pack":         {"floor": 14900,  "ceiling": 24900},
+    # single_ZIP_pack removed — not a distinct offer (= core_subscription at
+    # Starter/1-ZIP resolution; ZIP sizing is a ladder/Lifecycle decision).
     "insurance_distress_pack": {"floor": 14700,  "ceiling": 24700},
     "bankruptcy_alert":        {"floor": 24700,  "ceiling": 34700},
     # hard_money_intro: EXCLUDED — no customer-facing price (RESPA gate)
