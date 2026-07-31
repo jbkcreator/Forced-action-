@@ -1,12 +1,14 @@
 """
-Shared writer for `lifecycle_playbook` recommendations (fa036).
+Shared writer for `lifecycle_playbook` recommendations (fa036, widened CLONE-v2.2).
 
-Centralises the source-key dedupe + author-attribution rules so every Lifecycle
-write path (ab_engine.complete_test, lifecycle_self_healing kill-recommendation,
-future explicit recommendations) goes through the same helper. The unique
-partial index `idx_lifecycle_playbook_source_key_unique` enforces the dedupe at
-the DB level; this helper just calls INSERT … ON CONFLICT DO NOTHING so
-re-running the upstream task (e.g. ab_rollback_check on day 2 for an
+Centralises the source-key dedupe + author-attribution rules so every write
+path into this table — Lifecycle's (ab_engine.complete_test,
+lifecycle_self_healing kill-recommendation, lifecycle_holdout_check) and any
+other agent's (Vera/Cora/Hunter/fleet-wide, via the `agent_domain` and
+`entry_kind` kwargs added in CLONE-v2.2) — goes through the same helper. The
+unique partial index `idx_lifecycle_playbook_source_key_unique` enforces the
+dedupe at the DB level; this helper just calls INSERT … ON CONFLICT DO NOTHING
+so re-running the upstream task (e.g. ab_rollback_check on day 2 for an
 already-recommended test) silently skips.
 
 All DB I/O is raw SQL via sa_text — repo convention.
@@ -30,10 +32,12 @@ def upsert_recommendation(
     name: str,
     description: str,
     pattern: dict,
-    source_type: str,           # 'ab_test' | 'self_healing_kill' | future...
+    source_type: str,           # 'ab_test' | 'self_healing_kill' | 'holdout_test' | future...
     source_id: str,
     authored_by: str,           # 'lifecycle' for autonomous paths; <operator handle> for manual
     decision_id: Optional[str] = None,
+    agent_domain: str = "lifecycle",   # CLONE-v2.2: 'lifecycle' | 'vera' | 'cora' | 'hunter' | 'fleet'
+    entry_kind: str = "playbook",      # 'playbook' | 'anti_playbook'
 ) -> Optional[int]:
     """INSERT a `lifecycle_playbook` row idempotently keyed by source_key.
 
@@ -54,22 +58,45 @@ def upsert_recommendation(
                     The Metric 5 ("net new playbooks Lifecycle authored")
                     aggregation filters on `authored_by = 'lifecycle'`.
       decision_id:  optional link to the triggering `agent_decisions` row.
+      agent_domain: which agent/domain authored this entry. Defaults to
+                    'lifecycle' so every existing caller (ab_engine,
+                    lifecycle_self_healing, lifecycle_holdout_check) is
+                    byte-identical in behavior — same source_key format,
+                    same dedupe. Non-'lifecycle' domains (Vera/Cora/Hunter/
+                    fleet-wide) get their agent_domain prefixed into
+                    source_key so their namespace can never collide with
+                    Lifecycle's or each other's, without needing to touch
+                    the existing unique index (still just source_key).
+      entry_kind:   'playbook' (proven pattern) or 'anti_playbook'
+                    (documented failure) — see docs/constitutions/*.md's
+                    "playbooks at 3+ proofs; anti-playbooks at 3+ failures."
 
     The dedupe contract:
-      Two calls with the same (source_type, source_id) → only ONE row exists.
-      The second call returns None.
+      Two calls with the same (agent_domain, source_type, source_id) → only
+      ONE row exists for non-'lifecycle' domains. For 'lifecycle' (the
+      default), the contract is unchanged from before this was widened:
+      same (source_type, source_id) → only ONE row. The second call
+      returns None either way.
     """
-    source_key = f"{source_type}:{source_id}"
+    if entry_kind not in ("playbook", "anti_playbook"):
+        raise ValueError(f"entry_kind must be 'playbook' or 'anti_playbook', got {entry_kind!r}")
+
+    source_key = (
+        f"{source_type}:{source_id}" if agent_domain == "lifecycle"
+        else f"{agent_domain}:{source_type}:{source_id}"
+    )
     row = session.execute(sa_text("""
         INSERT INTO lifecycle_playbook (
             name, description, pattern_json,
             authored_by, authored_at, status,
             source_type, source_id, source_key,
+            agent_domain, entry_kind,
             decision_id, created_at, updated_at
         ) VALUES (
             :name, :description, CAST(:pattern AS jsonb),
             :authored_by, NOW(), 'recommended',
             :source_type, :source_id, :source_key,
+            :agent_domain, :entry_kind,
             :decision_id, NOW(), NOW()
         )
         ON CONFLICT (source_key) WHERE source_key IS NOT NULL
@@ -83,6 +110,8 @@ def upsert_recommendation(
         "source_type":  source_type,
         "source_id":    source_id,
         "source_key":   source_key,
+        "agent_domain": agent_domain,
+        "entry_kind":   entry_kind,
         "decision_id":  decision_id,
     }).first()
 
