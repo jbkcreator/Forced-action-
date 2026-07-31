@@ -4,7 +4,7 @@ from functools import lru_cache
 
 from typing import Optional
 
-from pydantic import AliasChoices, AnyUrl, Field, SecretStr, PostgresDsn, field_validator
+from pydantic import AliasChoices, AnyUrl, Field, SecretStr, PostgresDsn, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -122,6 +122,17 @@ class AppSettings(BaseSettings):
 	stripe_test_secret_key: Optional[SecretStr] = Field(default=None, env="STRIPE_TEST_SECRET_KEY")
 	stripe_test_webhook_secret: Optional[SecretStr] = Field(default=None, env="STRIPE_TEST_WEBHOOK_SECRET")
 	stripe_test_publishable_key: Optional[str] = Field(default=None, env="STRIPE_TEST_PUBLISHABLE_KEY")
+
+	@model_validator(mode="after")
+	def _guard_stripe_live_mode_key(self) -> "AppSettings":
+		if not self.stripe_test_mode and self.stripe_secret_key:
+			raw = self.stripe_secret_key.get_secret_value()
+			if raw.startswith("sk_test_"):
+				raise ValueError(
+					"STRIPE_SECRET_KEY starts with sk_test_ but STRIPE_TEST_MODE=false. "
+					"Set STRIPE_TEST_MODE=true or use the live key."
+				)
+		return self
 
 	# Live price IDs
 	stripe_price_starter_founding: Optional[str] = Field(default=None, env="STRIPE_PRICE_STARTER_FOUNDING")

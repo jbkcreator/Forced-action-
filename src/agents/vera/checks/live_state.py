@@ -505,21 +505,18 @@ def _the_one_number_line(one_number_fact_row: Optional[Mapping] = None) -> str:
     exercised directly by render_live_state_report()'s own tests, which
     must not require a live DB connection — see run_live_state() for the
     read_facts() call that supplies this parameter in production."""
-    placeholder = "THE ONE NUMBER — new MRR added yesterday: — (pending V3 revenue reconciliation)"
+    placeholder = "THE ONE NUMBER — cash cleared all time: — (pending V3 revenue reconciliation)"
     if one_number_fact_row is None:
         return placeholder
     value = one_number_fact_row.get("value_numeric")
     if value is not None:
         try:
-            return f"THE ONE NUMBER — new MRR added yesterday: ${float(value) / 100:,.2f}"
+            return f"THE ONE NUMBER — cash cleared, all time: ${float(value) / 100:,.2f}"
         except (TypeError, ValueError):
             pass
-    # Fresh fact exists but carries no numeric delta (e.g. V3's first-ever run,
-    # with no prior day to diff against) — show its own text, not the
-    # V3-hasn't-run placeholder, since that would misstate the situation.
     fact_value = one_number_fact_row.get("fact_value")
     if fact_value:
-        return f"THE ONE NUMBER — new MRR added yesterday: {fact_value}"
+        return f"THE ONE NUMBER — cash cleared, all time: {fact_value}"
     return placeholder
 
 
@@ -697,7 +694,7 @@ def run_live_state() -> int:
     _write_off_day_facts(_off_day_pairs())
     _write_silent_failure_facts(silent)
 
-    one_number_rows = read_facts("revenue.mrr.new_yesterday", fresh_only=True, limit=1)
+    one_number_rows = read_facts("revenue.cash_cleared_all_time", fresh_only=True, limit=1)
     one_number_fact_row = one_number_rows[0] if one_number_rows else None
 
     subject, body, html_body = render_live_state_report(

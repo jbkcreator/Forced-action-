@@ -55,6 +55,9 @@ logger = logging.getLogger(__name__)
 # accounts) this is headroom, not a real constraint.
 SAMPLE_CAP = 20
 
+def _is_test_subscriber(row: dict) -> bool:
+    return bool(row.get("is_test"))
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Stripe plumbing — same pattern as stripe_reconcile.py / stripe_webhooks.py /
@@ -145,6 +148,7 @@ class ReconciliationResult:
     access_not_paying_count: int
     access_not_paying_sample_ids: list
     access_not_paying_details: list
+    test_accounts_excluded: int = 0
     active_subscriptions_by_customer: Optional[dict] = field(default_factory=dict)
     stripe_ok: bool = True
 
@@ -239,7 +243,7 @@ def check_subscriber_reconciliation() -> ReconciliationResult:
 
     with vera_db.session_scope() as session:
         rows = session.execute(
-            text("SELECT stripe_customer_id, stripe_subscription_id, status FROM subscribers")
+            text("SELECT stripe_customer_id, stripe_subscription_id, status, is_test FROM subscribers")
         ).mappings().all()
 
     if active_subs_by_customer is None:
@@ -252,8 +256,8 @@ def check_subscriber_reconciliation() -> ReconciliationResult:
         return ReconciliationResult(
             paying_no_access_count=0, paying_no_access_sample_ids=[],
             access_not_paying_count=0, access_not_paying_sample_ids=[],
-            access_not_paying_details=[], active_subscriptions_by_customer=None,
-            stripe_ok=False,
+            access_not_paying_details=[], test_accounts_excluded=0,
+            active_subscriptions_by_customer=None, stripe_ok=False,
         )
 
     trialing_subs_by_customer = _fetch_trialing_stripe_subscriptions()
@@ -268,14 +272,18 @@ def check_subscriber_reconciliation() -> ReconciliationResult:
         return ReconciliationResult(
             paying_no_access_count=0, paying_no_access_sample_ids=[],
             access_not_paying_count=0, access_not_paying_sample_ids=[],
-            access_not_paying_details=[], active_subscriptions_by_customer=None,
-            stripe_ok=False,
+            access_not_paying_details=[], test_accounts_excluded=0,
+            active_subscriptions_by_customer=None, stripe_ok=False,
         )
 
     entitled_subs_by_customer = {**active_subs_by_customer, **trialing_subs_by_customer}
 
-    subscriber_by_customer = {row["stripe_customer_id"]: dict(row) for row in rows}
-    active_db_subscribers = [dict(row) for row in rows if row["status"] == "active"]
+    all_rows = [dict(row) for row in rows]
+    real_rows = [r for r in all_rows if not _is_test_subscriber(r)]
+    test_count = len(all_rows) - len(real_rows)
+
+    subscriber_by_customer = {r["stripe_customer_id"]: r for r in real_rows}
+    active_db_subscribers = [r for r in real_rows if r["status"] == "active"]
 
     paying_no_access = _classify_paying_no_access(active_subs_by_customer, subscriber_by_customer)
     access_not_paying = _classify_access_not_paying(entitled_subs_by_customer, active_db_subscribers)
@@ -297,6 +305,7 @@ def check_subscriber_reconciliation() -> ReconciliationResult:
         access_not_paying_count=len(access_not_paying),
         access_not_paying_sample_ids=[d["customer_id"] for d in access_not_paying[:SAMPLE_CAP]],
         access_not_paying_details=details,
+        test_accounts_excluded=test_count,
         active_subscriptions_by_customer=active_subs_by_customer,
     )
 
@@ -700,6 +709,39 @@ def _write_refunds_disputes_facts(result: RefundsDisputesResult) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 3E — Cash cleared, all time (live Stripe only)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def check_cash_cleared_all_time() -> Optional[int]:
+    """Sum of all succeeded charges ever in live Stripe, in cents.
+    Returns None if Stripe is unreachable — never fabricates $0."""
+    if not _init_stripe():
+        logger.error("[Vera] Stripe not configured — cannot check cash cleared all time")
+        return None
+    charges = _paginate(stripe.Charge.list, paid=True)
+    if charges is None:
+        logger.error("[Vera] Stripe charge pull failed — abstaining from cash cleared check")
+        return None
+    return sum((_field(c, "amount", 0) or 0) for c in charges if _field(c, "status") == "succeeded")
+
+
+def _write_cash_cleared_fact(total_cents: Optional[int]) -> None:
+    if total_cents is None:
+        write_fact(
+            "revenue.cash_cleared_all_time", "stripe unreachable", source="stripe",
+            method="stripe.Charge.list(paid=True) — pull failed",
+            freshness_class=FRESHNESS_REVENUE_24H,
+        )
+        return
+    write_fact(
+        "revenue.cash_cleared_all_time", str(total_cents),
+        value_numeric=Decimal(total_cents), source="stripe",
+        method="sum of succeeded charges, all time, live Stripe",
+        freshness_class=FRESHNESS_REVENUE_24H,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Report renderer + delivery + orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -709,6 +751,7 @@ def render_revenue_truth_report(
     new_yesterday_cents: Optional[int],
     payments: PaymentActivityResult,
     refunds_disputes: RefundsDisputesResult,
+    cash_cleared_cents: Optional[int] = None,
     report_date: Optional[date] = None,
 ) -> tuple:
     """Returns (subject, body, html_body). Numbers first, Vera's voice.
@@ -716,25 +759,34 @@ def render_revenue_truth_report(
     silently drift apart from each other over time."""
     report_date = report_date or datetime.now(timezone.utc).date()
 
-    if new_yesterday_cents is not None:
-        one_number_value = f"${new_yesterday_cents / 100:,.2f}"
+    if cash_cleared_cents is not None:
+        cash_cleared_value = f"${cash_cleared_cents / 100:,.2f}"
     else:
-        one_number_value = "no prior day to compare (first run)"
+        cash_cleared_value = "stripe unreachable"
 
     lines = [
         f"Vera — Revenue Truth Report — {report_date.isoformat()}",
         "=" * 60,
         "",
-        f"NEW MRR ADDED YESTERDAY: {one_number_value}",
+        f"CASH CLEARED, ALL TIME: {cash_cleared_value}",
     ]
 
     # ── RECONCILIATION ────────────────────────────────────────────────────
     lines += ["", "RECONCILIATION"]
+    if reconciliation.test_accounts_excluded:
+        lines.append(
+            f"  ({reconciliation.test_accounts_excluded} internal/test accounts excluded — "
+            "labeled test, not counted as mismatches)"
+        )
     if not reconciliation.stripe_ok:
         lines.append("  STRIPE UNREACHABLE — this section could not be verified today.")
         reconciliation_html = html_warning(
             "STRIPE UNREACHABLE — this section could not be verified today."
         )
+        if reconciliation.test_accounts_excluded:
+            reconciliation_html += html_note(
+                f"{reconciliation.test_accounts_excluded} internal/test accounts excluded from reconciliation."
+            )
     else:
         lines.append(f"  Paying but no access: {reconciliation.paying_no_access_count}")
         if reconciliation.paying_no_access_sample_ids:
@@ -749,6 +801,7 @@ def render_revenue_truth_report(
         reconciliation_html = html_kv_rows([
             ("Paying but no access", reconciliation.paying_no_access_count),
             ("Access but not paying", reconciliation.access_not_paying_count),
+            ("Internal/test accounts (excluded)", reconciliation.test_accounts_excluded),
         ])
         if reconciliation.paying_no_access_sample_ids:
             reconciliation_html += html_note(
@@ -877,7 +930,7 @@ def render_revenue_truth_report(
         title="Vera — Revenue Truth Report",
         subtitle=report_date.isoformat(),
         body_html=(
-            html_headline("NEW MRR ADDED YESTERDAY", one_number_value)
+            html_headline("CASH CLEARED, ALL TIME", cash_cleared_value)
             + html_section("Reconciliation", reconciliation_html)
             + html_section("MRR", mrr_html)
             + html_section("Payments Today", payments_html)
@@ -912,14 +965,17 @@ def run_revenue_truth() -> int:
 
     payments = check_payment_activity()
     refunds_disputes = check_refunds_and_disputes()
+    cash_cleared_cents = check_cash_cleared_all_time()
 
     _write_reconciliation_facts(reconciliation)
     _write_mrr_facts(mrr, new_yesterday_cents)
     _write_payment_activity_facts(payments)
     _write_refunds_disputes_facts(refunds_disputes)
+    _write_cash_cleared_fact(cash_cleared_cents)
 
     subject, body, html_body = render_revenue_truth_report(
         reconciliation, mrr, new_yesterday_cents, payments, refunds_disputes,
+        cash_cleared_cents=cash_cleared_cents,
     )
 
     from src.services.email import send_alert
