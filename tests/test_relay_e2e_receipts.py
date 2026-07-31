@@ -114,6 +114,7 @@ def test_forced_retry_does_not_double_send(relay_db, monkeypatch):
         channel="email",
         recipient="prospect@example.com",
         payload={"subject": "Hi", "body": "Hello"},
+        thread_id="OPP-2026-00077",
     )
     relay_queue.record_decision(item.id, approved=True, decided_by="U_TEST")
 
@@ -190,6 +191,7 @@ def test_mark_sent_refuses_to_finalize_under_the_wrong_batch_id(relay_db):
         channel="email",
         recipient="prospect@example.com",
         payload={"subject": "Hi", "body": "Hello"},
+        thread_id="OPP-2026-00088",
     )
     relay_queue.record_decision(item.id, approved=True, decided_by="U_TEST")
     relay_queue.try_claim_for_batch(item.id, "batch_real_owner")
