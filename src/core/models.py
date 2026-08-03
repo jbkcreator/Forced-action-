@@ -4738,6 +4738,24 @@ class Venture(Base):
         String(60), nullable=False, server_default="relay_global"
     )
 
+    # Autonomous venture ladder (CLONE-v2.2 / CL4). Which rung of
+    # radar -> probe -> pilot -> unit_economics -> cell -> spin_up -> portfolio
+    # this venture currently occupies. Advanced only by
+    # src/services/venture_ladder.py:advance(), which refuses on any red gate
+    # and writes a venture_ladder_events audit row for every decision.
+    #
+    # A radar-stage candidate is a real row here with is_active=false: the
+    # CL3 resolver falls back to env settings for an inactive venture, so an
+    # unproven candidate structurally cannot govern sends. That gives one
+    # identity and one join key from radar all the way to portfolio, with no
+    # separate candidate table and no promotion step.
+    ladder_stage: Mapped[str] = mapped_column(
+        String(30), nullable=False, server_default="radar"
+    )
+    ladder_entered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
     is_active: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default=sa_true()
     )
@@ -4762,11 +4780,131 @@ class Venture(Base):
             name="ck_ventures_send_window_order",
         ),
         CheckConstraint("relay_daily_ceiling > 0", name="ck_ventures_daily_ceiling"),
+        CheckConstraint(
+            "ladder_stage IN ('radar', 'probe', 'pilot', 'unit_economics', "
+            "'cell', 'spin_up', 'portfolio')",
+            name="ck_ventures_ladder_stage",
+        ),
         Index("idx_ventures_is_active", "is_active"),
+        Index("idx_ventures_ladder_stage", "ladder_stage"),
     )
 
     def __repr__(self):
         return f"<Venture(venture_key={self.venture_key!r}, display_name={self.display_name!r})>"
+
+
+class VentureLadderEvidence(Base):
+    """One recorded fact backing a venture's advance up the ladder (CL4).
+
+    Deliberately one table typed by `evidence_type` rather than a table per
+    kind: every rung needs to record something (a market score, a reachable
+    scrape sample, a presell commitment), the gates only ever count rows and
+    sum a JSONB field, and a new evidence kind must not need a migration.
+    Same idiom as src/connectors/outcomes.py's OutcomeCandidate payload.
+
+    Presell commitments are `evidence_type='presell_commitment'` with a
+    payload of {kind, amount_cents, stripe_payment_intent_id, contact_ref}.
+    `kind` distinguishes deposit/first_month/saved_card and the accepted set
+    lives in config/venture_ladder.py:PRESELL_ACCEPTED_KINDS, so changing
+    what counts as demand evidence is a config edit, not a schema change.
+
+    `verified` is what separates a claim from evidence. Only a row set true
+    by a machine check — a Stripe webhook confirming the deposit actually
+    settled — counts toward a gate; a hand-entered row stays false and is
+    ignored. That is what makes the presell gate autonomous.
+    """
+    __tablename__ = "venture_ladder_evidence"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    venture_key: Mapped[str] = mapped_column(
+        String(60), ForeignKey("ventures.venture_key"), nullable=False
+    )
+    # The rung this evidence was gathered for — kept so a later replay can
+    # tell "probe-stage scrape sample" from a re-sample taken at spin_up.
+    stage: Mapped[str] = mapped_column(String(30), nullable=False)
+    evidence_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    payload: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    # Idempotency handle for machine-recorded evidence: the Stripe
+    # PaymentIntent id for a deposit, the source URL for a scrape sample.
+    # UNIQUE per venture so a webhook retry cannot inflate a presell count.
+    source_ref: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    verified: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_false()
+    )
+    recorded_by: Mapped[str] = mapped_column(String(120), nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+
+    __table_args__ = (
+        Index("ix_venture_ladder_evidence_key_type", "venture_key", "evidence_type"),
+        UniqueConstraint(
+            "venture_key", "evidence_type", "source_ref",
+            name="uq_venture_ladder_evidence_source_ref",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<VentureLadderEvidence(venture_key={self.venture_key!r}, "
+            f"type={self.evidence_type!r}, verified={self.verified})>"
+        )
+
+
+class VentureLadderEvent(Base):
+    """Append-only audit of every ladder decision (CL4).
+
+    Written on advance, on a refused advance, and on an auto-double. Never
+    updated, never deleted.
+
+    `gate_results` stores the computed value, threshold and colour of every
+    gate at decision time, so a doubling or a promotion is reconstructable
+    months later without re-running the queries against data that has since
+    moved. It is also the idempotency source for auto-double: "has this
+    venture already doubled today / within the cooldown" is answered by
+    selecting the last `auto_double` row, not by a Redis flag that expires
+    independently of the ceiling it guards.
+    """
+    __tablename__ = "venture_ladder_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    venture_key: Mapped[str] = mapped_column(
+        String(60), ForeignKey("ventures.venture_key"), nullable=False
+    )
+    from_stage: Mapped[str] = mapped_column(String(30), nullable=False)
+    # Equal to from_stage on a 'blocked' decision and on 'auto_double' —
+    # neither moves the venture.
+    to_stage: Mapped[str] = mapped_column(String(30), nullable=False)
+    decision: Mapped[str] = mapped_column(String(20), nullable=False)
+    gate_results: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    blocked_reasons: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    actor: Mapped[str] = mapped_column(String(120), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+
+    __table_args__ = (
+        Index("ix_venture_ladder_events_key_created", "venture_key", "created_at"),
+        Index("ix_venture_ladder_events_key_decision", "venture_key", "decision"),
+        CheckConstraint(
+            "decision IN ('advanced', 'blocked', 'auto_double', 'demoted')",
+            name="ck_venture_ladder_events_decision",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<VentureLadderEvent(venture_key={self.venture_key!r}, "
+            f"{self.from_stage!r}->{self.to_stage!r}, decision={self.decision!r})>"
+        )
 
 
 # ============================================================================
@@ -8579,6 +8717,11 @@ class RelayApprovalQueueItem(Base):
         Index("ix_relay_approval_queue_status", "status"),
         Index("ix_relay_approval_queue_batch_status", "batch_id", "status"),
         Index("ix_relay_approval_queue_venture_status", "venture_key", "status"),
+        # CL4: venture_ladder.cell_reply_rates() joins outbound_drafts to this
+        # table on (thread_id, venture_key) to count only items that were
+        # really dispatched, so the reply rate the auto-double rule scales on
+        # is never inflated by approved-but-unsent drafts.
+        Index("ix_relay_approval_queue_thread_venture", "thread_id", "venture_key"),
         CheckConstraint(
             "status IN ('pending', 'approved', 'rejected', 'sent', 'failed', 'skipped')",
             name="ck_relay_approval_queue_status",
@@ -8836,6 +8979,16 @@ class OutboundDraft(Base):
     draft_id: Mapped[str] = mapped_column(String(36), primary_key=True)
     opportunity_thread_id: Mapped[str] = mapped_column(String(64), nullable=False)
     buyer_entity_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Which venture produced this draft (CL4). relay_approval_queue already
+    # carries venture_key, but a draft is created before a queue row exists
+    # and the per-cell reply rate must be attributable without depending on
+    # a downstream join that may never happen (rejected drafts never queue).
+    venture_key: Mapped[str] = mapped_column(
+        String(60),
+        ForeignKey("ventures.venture_key"),
+        nullable=False,
+        server_default="hillsborough_distress",
+    )
     cell_id: Mapped[str] = mapped_column(String(50), nullable=False)
     offer: Mapped[str] = mapped_column(String(50), nullable=False)
     avenue: Mapped[str] = mapped_column(String(50), nullable=False)
@@ -8860,10 +9013,23 @@ class OutboundDraft(Base):
     followup_sequence: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     contact_email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     contact_phone: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    # Reply timestamp (CL4). Cora's canonical opportunity state lives in the
+    # append-only file store (src/agents/cora/store.py); this is a dual-write
+    # from opportunity_state.mark_replied() so reply rate is answerable in
+    # SQL, per (venture_key, cell_id), from one indexed table.
+    #
+    # The file store cannot serve that query: it is gitignored, guarded by a
+    # single-process threading.Lock, and read by de-duplicating transitions
+    # at read time. Scaling send volume off a number derived that way is a
+    # correctness bug, so the auto-double rule reads this column instead.
+    replied_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     __table_args__ = (
         Index("ix_outbound_drafts_thread_cell_status", "opportunity_thread_id", "cell_id", "status"),
         Index("ix_outbound_drafts_contact_email", "contact_email"),
+        Index("ix_outbound_drafts_venture_cell_created", "venture_key", "cell_id", "created_at"),
         CheckConstraint(
             "status IN ('draft', 'rejected', 'expired', 'superseded', 'approved_pending_send')",
             name="ck_outbound_drafts_status",
