@@ -21,7 +21,7 @@ from typing import Callable
 
 from sqlalchemy import text as sa_text
 
-from src.services.fleet_event_bus import is_processed, mark_processed
+from src.services.fleet_event_bus import mark_processed
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +85,7 @@ def poll_and_dispatch_fleet(
     """
     results = {"processed": 0, "skipped": 0, "failed": 0, "permanently_failed": 0}
 
-    rows = session.execute(sa_text("""
+    _POLL_SQL = sa_text("""
         SELECT e.id AS event_id, e.event_type, e.priority, e.source_component,
                e.subscriber_id, e.opportunity_thread_id, e.payload, e.occurred_at
         FROM fleet_events e
@@ -97,26 +97,16 @@ def poll_and_dispatch_fleet(
           AND pe.event_id IS NULL
           AND (ef.event_id IS NULL OR ef.failed_permanently = FALSE)
         ORDER BY e.priority ASC, e.occurred_at ASC
-        LIMIT :batch_size
+        LIMIT 1
         FOR UPDATE OF e SKIP LOCKED
-    """), {
-        "consumer":   consumer,
-        "types":      event_types,
-        "batch_size": batch_size,
-    }).fetchall()
+    """)
 
-    if not rows:
-        logger.debug("[FleetEventConsumer:%s] no pending events", consumer)
-        return results
+    for _ in range(batch_size):
+        row = session.execute(_POLL_SQL, {"consumer": consumer, "types": event_types}).fetchone()
+        if row is None:
+            break
 
-    logger.info("[FleetEventConsumer:%s] dispatching %d event(s)", consumer, len(rows))
-
-    for row in rows:
         event_id = row.event_id
-
-        if is_processed(session, event_id, consumer):
-            results["skipped"] += 1
-            continue
 
         try:
             handler(session, row)
@@ -136,6 +126,9 @@ def poll_and_dispatch_fleet(
                 "[FleetEventConsumer:%s] event_id=%s failed (attempt recorded): %s",
                 consumer, event_id, exc,
             )
+
+    if not any(results.values()):
+        logger.debug("[FleetEventConsumer:%s] no pending events", consumer)
 
     logger.info(
         "[FleetEventConsumer:%s] done — processed=%d skipped=%d failed=%d permanent=%d",
