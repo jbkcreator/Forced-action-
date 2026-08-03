@@ -30,6 +30,7 @@ import time
 from datetime import date
 from typing import Any, Dict, List, Optional
 
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from config.venture_ladder import AUTO_DOUBLE_CELL_MAX_MULTIPLIER
@@ -209,6 +210,29 @@ def _truncate_scored_rows_per_venture(
     return kept
 
 
+def _fleet_fetch_size(db: Session, cell_id: str, limit: int) -> int:
+    """SQL LIMIT for a fleet-wide sweep = sum of every active venture's (limit × multiplier).
+
+    Guarantees the result set is large enough that _truncate_scored_rows_per_venture
+    can satisfy each venture's full cap regardless of ranking interleave.
+    Falls back to limit × AUTO_DOUBLE_CELL_MAX_MULTIPLIER on any DB error.
+    # ponytail: one SELECT + N savepoint reads; upgrade to a single aggregating
+    # query if active-venture count grows large enough to matter.
+    """
+    try:
+        rows = db.execute(
+            text("SELECT venture_key FROM ventures WHERE is_active = true")
+        ).fetchall()
+        total = sum(_cell_multiplier(db, r.venture_key, cell_id) for r in rows)
+        return max(limit, limit * total)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "target_producer: could not compute fleet fetch size for cell=%s — falling back to %dx",
+            cell_id, AUTO_DOUBLE_CELL_MAX_MULTIPLIER, exc_info=True,
+        )
+        return limit * AUTO_DOUBLE_CELL_MAX_MULTIPLIER
+
+
 def produce_targets(db: Session, limit: int = 25, county_id: Optional[str] = None) -> List[str]:
     """founder_tier_blitz cell. Returns the opportunity_thread_ids actually published this pass (skips ones with an active draft already)."""
     if county_id is not None:
@@ -219,7 +243,7 @@ def produce_targets(db: Session, limit: int = 25, county_id: Optional[str] = Non
         # Fleet-wide: over-fetch by the largest possible per-venture
         # multiplier, then truncate per-venture below — see
         # _truncate_scored_rows_per_venture's docstring.
-        ranked = get_ranked_whales(db, limit=limit * AUTO_DOUBLE_CELL_MAX_MULTIPLIER, county_id=None)
+        ranked = get_ranked_whales(db, limit=_fleet_fetch_size(db, FOUNDER_TIER_BLITZ_CELL_ID, limit), county_id=None)
         scored = _truncate_scored_rows_per_venture(
             db, FOUNDER_TIER_BLITZ_CELL_ID, limit, fallback_ranking.rank_targets(ranked)
         )
@@ -244,7 +268,7 @@ def produce_auction_fast_follow_targets(
         scored = fallback_ranking.rank_targets(rows)
     else:
         rows = get_recent_auction_fast_follow_whales(
-            db, lookback_days=lookback_days, limit=limit * AUTO_DOUBLE_CELL_MAX_MULTIPLIER, county_id=None
+            db, lookback_days=lookback_days, limit=_fleet_fetch_size(db, AUCTION_FAST_FOLLOW_CELL_ID, limit), county_id=None
         )
         scored = _truncate_scored_rows_per_venture(
             db, AUCTION_FAST_FOLLOW_CELL_ID, limit, fallback_ranking.rank_targets(rows)

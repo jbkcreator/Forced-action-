@@ -266,6 +266,52 @@ def test_produce_targets_fleet_wide_sweep_applies_the_non_default_ventures_own_m
     assert by_venture.get(DEFAULT_VENTURE_KEY, 0) == limit * default_multiplier
 
 
+def test_produce_targets_fleet_wide_fetch_size_covers_all_ventures_caps(
+    fresh_db, monkeypatch
+):
+    """Regression: fleet SQL LIMIT must be sum(multipliers)*limit, not MAX_MULTIPLIER*limit.
+
+    With default-venture rows ranked first, the old MAX_MULTIPLIER*limit fetch window fills
+    entirely with default rows and the second venture receives zero candidates despite having
+    earned a 4x multiplier. The sum-based fetch extends the window to include second rows.
+    """
+    from config.venture_ladder import AUTO_DOUBLE_CELL_MAX_MULTIPLIER
+
+    venture_key, county_id = _make_venture(fresh_db, ladder_stage="cell")
+    _seed_cell_auto_doubles(fresh_db, venture_key, target_producer.FOUNDER_TIER_BLITZ_CELL_ID, count=2)
+
+    limit = 3
+    # Fill the old fetch window with default-venture rows only, then append second-venture rows.
+    max_fetch_old = limit * AUTO_DOUBLE_CELL_MAX_MULTIPLIER  # = 12
+    default_rows = [_fake_row(f"OPP-FFSZ-DEF-{i:03d}", "hillsborough") for i in range(max_fetch_old)]
+    second_rows = [_fake_row(f"OPP-FFSZ-SEC-{i:03d}", county_id) for i in range(limit * 4)]
+    all_rows = default_rows + second_rows
+
+    # Honor the limit kwarg — mirrors what the SQL LIMIT clause does.
+    monkeypatch.setattr(target_producer, "get_ranked_whales", lambda db, **kw: all_rows[: kw["limit"]])
+
+    def _fake_buyer_entity(db, tid):
+        cid = county_id if "SEC" in tid else "hillsborough"
+        return {"id": 1, "opportunity_thread_id": tid, "county_id": cid, "confidence_score": 90}
+
+    monkeypatch.setattr(target_producer, "get_buyer_entity_by_opportunity_thread_id", _fake_buyer_entity)
+    monkeypatch.setattr(target_producer, "get_contact_channel", lambda db, bid: {"email": "x@example.com", "phone": None})
+
+    target_producer.produce_targets(fresh_db, limit=limit)
+
+    published = queue.read_batch("test-consumer", count=100, block_ms=200)
+    second_count = sum(1 for m in published if m.payload["venture_key"] == venture_key)
+    for m in published:
+        queue.ack(m.message_id)
+
+    # With the old MAX_MULTIPLIER fetch: all 12 slots occupied by default rows →
+    # second_count == 0. With the sum-based fetch (1+4)*3=15: second rows enter
+    # the window → second_count > 0.
+    assert second_count > 0, (
+        "second venture got 0 targets — fleet fetch size must be sum(multipliers)*limit"
+    )
+
+
 def test_produce_auction_fast_follow_targets_fleet_wide_sweep_applies_the_non_default_ventures_own_multiplier(
     fresh_db, monkeypatch
 ):
