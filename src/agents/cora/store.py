@@ -46,7 +46,13 @@ CORA_FACT_MAX_AGE_HOURS: Dict[str, int] = {
     "generic": 24 * 30,          # anything without a declared class — 30 days
 }
 
-DraftStatus = Literal["draft", "rejected", "expired", "superseded", "approved_pending_send"]
+# "pending_channel_support": approved by the founder, but the draft's channel has
+# no registered Relay dispatcher yet (today: sms). Parked off 'draft' so the batch
+# builder stops re-selecting it every sweep; retryable once the dispatcher lands.
+DraftStatus = Literal[
+    "draft", "rejected", "expired", "superseded", "approved_pending_send",
+    "pending_channel_support",
+]
 OpportunityStatus = Literal["targeted", "touched", "replied", "call", "proposal", "closed"]
 ReplyStatus = Literal["pending_approval", "manual_review", "suppressed"]
 

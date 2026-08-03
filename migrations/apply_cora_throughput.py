@@ -67,6 +67,16 @@ ADD_STANDING_ORDERS_SLACK_TS_SQL = (
     "ALTER TABLE cora_standing_orders ADD COLUMN IF NOT EXISTS slack_message_ts VARCHAR(32)"
 )
 
+# standing_order_compiler.propose_standing_order() writes this and the digest
+# reads it back. Added as an ALTER rather than in CREATE_STANDING_ORDERS_SQL
+# because that statement is CREATE TABLE IF NOT EXISTS — on any database where
+# the table already exists it is a no-op, so a column added only there would
+# never land and every proposal INSERT would fail on UndefinedColumn.
+ADD_STANDING_ORDERS_APPROVAL_COUNT_SQL = (
+    "ALTER TABLE cora_standing_orders "
+    "ADD COLUMN IF NOT EXISTS approval_count_at_proposal INTEGER NOT NULL DEFAULT 0"
+)
+
 CREATE_INDEX_BATCH_ITEMS_BATCH_SQL = (
     "CREATE INDEX IF NOT EXISTS ix_cora_batch_items_batch_id ON cora_batch_items (batch_id)"
 )
@@ -85,6 +95,7 @@ def main() -> None:
         db.execute(text(CREATE_BATCH_ITEMS_SQL))
         db.execute(text(CREATE_STANDING_ORDERS_SQL))
         db.execute(text(ADD_STANDING_ORDERS_SLACK_TS_SQL))
+        db.execute(text(ADD_STANDING_ORDERS_APPROVAL_COUNT_SQL))
         db.execute(text(CREATE_INDEX_BATCH_ITEMS_BATCH_SQL))
         db.execute(text(CREATE_INDEX_BATCH_ITEMS_DRAFT_SQL))
         db.execute(text(CREATE_INDEX_STANDING_ORDERS_CELL_ACTIVE_SQL))

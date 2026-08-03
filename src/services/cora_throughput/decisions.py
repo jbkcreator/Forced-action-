@@ -149,10 +149,20 @@ def record_batch_decision(
     if action == "reject_item":
         if not draft_id:
             return {"ok": False, "reason": "draft_id_required"}
+        # A stale Slack Reject button on an expired/decided batch must never
+        # overwrite a draft that has since been approved in a replacement batch.
+        # Checked in Python for the clean caller-facing reason, and again as an
+        # EXISTS in the UPDATE so the batch can't transition between the two.
+        if batch["status"] != "pending":
+            return {"ok": False, "reason": "batch_already_decided"}
         result = db.execute(
             text(
                 "UPDATE cora_batch_items SET decision = 'exception_rejected', decided_at = now() "
-                "WHERE batch_id = :batch_id AND draft_id = :draft_id AND decision = 'included'"
+                "WHERE batch_id = :batch_id AND draft_id = :draft_id AND decision = 'included' "
+                "  AND EXISTS ("
+                "    SELECT 1 FROM cora_draft_batches"
+                "    WHERE batch_id = :batch_id AND status = 'pending'"
+                "  )"
             ),
             {"batch_id": batch_id, "draft_id": draft_id},
         )
@@ -172,11 +182,26 @@ def record_batch_decision(
                 continue
             if _enqueue_to_relay(item, decided_by):
                 store.mark_draft_status(db, item["draft_id"], "approved_pending_send")
-                db.execute(
-                    text("UPDATE cora_batch_items SET decided_at = now() WHERE id = :id"),
-                    {"id": item["item_id"]},
-                )
                 approved_count += 1
+            elif item["recommended_channel"] not in _RELAY_SUPPORTED_CHANNELS:
+                # Channel has no Relay dispatcher yet. Park the draft off
+                # status='draft' so builder.build_batch() stops re-selecting it
+                # every sweep and re-showing it to the founder forever.
+                # A missing-recipient skip is deliberately NOT parked here — that
+                # is an enrichment gap on a supported channel, and its prior
+                # behaviour (draft untouched, retried next sweep) is unchanged.
+                store.mark_draft_status(db, item["draft_id"], "pending_channel_support")
+            else:
+                continue
+            # decision stays 'included' — the standing-order compiler derives
+            # approved-vs-expired from decision + the parent batch's final status
+            # (see standing_order_compiler._outcome query), so this value must
+            # not change. ck_cora_batch_items_decision also permits only
+            # 'included' / 'exception_rejected'.
+            db.execute(
+                text("UPDATE cora_batch_items SET decided_at = now() WHERE id = :id"),
+                {"id": item["item_id"]},
+            )
 
         rejected_count = sum(1 for i in items if i["decision"] == "exception_rejected")
         new_status = "partial" if rejected_count > 0 else "approved"

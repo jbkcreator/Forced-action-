@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from sqlalchemy import text
 
+from src.agents.cora import store
 from src.services.cora_throughput import decisions
 from tests.services.cora_throughput.conftest import fake_queue_item, seed_draft
 
@@ -138,9 +139,8 @@ def test_record_batch_decision_batch_not_found(fresh_db):
 
 
 def test_sms_draft_is_skipped_not_enqueued(fresh_db, monkeypatch):
-    """SMS channel has no Relay dispatcher — must be skipped, not enqueued.
-    The draft stays at approved_pending_send (retrievable for retry) rather
-    than being marked failed by an unknown_channel Relay error."""
+    """SMS channel has no Relay dispatcher — must be skipped, not enqueued, and
+    parked at 'pending_channel_support' so the builder stops re-selecting it."""
     enqueue_calls = []
     monkeypatch.setattr(decisions.relay_queue, "enqueue", lambda **kw: (enqueue_calls.append(kw), fake_queue_item())[1])
     monkeypatch.setattr(decisions.relay_queue, "record_decision", lambda *a, **k: None)
@@ -163,10 +163,69 @@ def test_sms_draft_is_skipped_not_enqueued(fresh_db, monkeypatch):
     assert enqueue_calls[0]["idempotency_key"] == "cora_draft:DRAFT-EMAIL-1"
     # approved_count reflects only successfully enqueued items
     assert result["approved_count"] == 1
-    # SMS draft was not corrupted — still approved_pending_send (not failed)
+    # SMS draft is parked, NOT left at 'draft' — otherwise build_batch() re-selects
+    # it every sweep and the founder approves the same draft forever.
     from sqlalchemy import text as _t
     sms_status = fresh_db.execute(_t("SELECT status FROM outbound_drafts WHERE draft_id='DRAFT-SMS-1'")).scalar()
-    assert sms_status == "approved_pending_send"
+    assert sms_status == "pending_channel_support"
+    # And it must not come back in the builder's eligible pool.
+    eligible_ids = {d["draft_id"] for d in store.read_drafts(fresh_db, status="draft")}
+    assert "DRAFT-SMS-1" not in eligible_ids
+
+
+def test_missing_recipient_on_supported_channel_is_not_parked_as_channel_problem(fresh_db, monkeypatch):
+    """An email draft with no address is an enrichment gap, not a channel gap.
+    It must keep its prior behaviour (left at 'draft'), not be mislabelled
+    'pending_channel_support' — which is reserved for channels Relay can't send."""
+    from sqlalchemy import text as _t
+
+    monkeypatch.setattr(decisions.relay_queue, "enqueue", lambda **kw: fake_queue_item())
+    monkeypatch.setattr(decisions.relay_queue, "record_decision", lambda *a, **k: None)
+
+    fresh_db.execute(_t("INSERT INTO cora_draft_batches (batch_id, status) VALUES ('BATCH-NORECIP', 'pending')"))
+    seed_draft(fresh_db, "DRAFT-NORECIP-2", channel="email", contact_email=None, contact_phone=None)
+    fresh_db.execute(
+        _t("INSERT INTO cora_batch_items (batch_id, draft_id, decision) "
+           "VALUES ('BATCH-NORECIP', 'DRAFT-NORECIP-2', 'included')")
+    )
+
+    result = decisions.record_batch_decision(fresh_db, "BATCH-NORECIP", "approve_all", decided_by="U123")
+
+    assert result["approved_count"] == 0
+    assert _draft_status(fresh_db, "DRAFT-NORECIP-2") == "draft"
+
+
+def test_stale_reject_on_expired_batch_cannot_undo_a_later_approval(fresh_db, monkeypatch):
+    """Reviewer regression case: batch A expires, the same draft is approved in
+    replacement batch B, then batch A's still-live Slack Reject button is tapped.
+    That stale action must change nothing."""
+    from sqlalchemy import text as _t
+
+    monkeypatch.setattr(decisions.relay_queue, "enqueue", lambda **kw: fake_queue_item())
+    monkeypatch.setattr(decisions.relay_queue, "record_decision", lambda *a, **k: None)
+
+    # Batch A holds the draft, then expires without a decision.
+    _make_batch_with_items(fresh_db, "BATCH-STALE-A", ["DRAFT-STALE-1"])
+    fresh_db.execute(_t("UPDATE cora_draft_batches SET status = 'expired' WHERE batch_id = 'BATCH-STALE-A'"))
+
+    # Batch B picks the same draft up and is approved.
+    fresh_db.execute(_t("INSERT INTO cora_draft_batches (batch_id, status) VALUES ('BATCH-STALE-B', 'pending')"))
+    fresh_db.execute(
+        _t("INSERT INTO cora_batch_items (batch_id, draft_id, decision) "
+           "VALUES ('BATCH-STALE-B', 'DRAFT-STALE-1', 'included')")
+    )
+    decisions.record_batch_decision(fresh_db, "BATCH-STALE-B", "approve_all", decided_by="U123")
+    assert _draft_status(fresh_db, "DRAFT-STALE-1") == "approved_pending_send"
+
+    # Now the stale Reject on expired batch A.
+    result = decisions.record_batch_decision(
+        fresh_db, "BATCH-STALE-A", "reject_item", decided_by="U999", draft_id="DRAFT-STALE-1",
+    )
+
+    assert result == {"ok": False, "reason": "batch_already_decided"}
+    # The approval survives — this is the corruption the guard exists to prevent.
+    assert _draft_status(fresh_db, "DRAFT-STALE-1") == "approved_pending_send"
+    assert _item_decision(fresh_db, "BATCH-STALE-A", "DRAFT-STALE-1") == "included"
 
 
 def test_auto_approve_draft_skips_sms_channel(fresh_db, monkeypatch):
