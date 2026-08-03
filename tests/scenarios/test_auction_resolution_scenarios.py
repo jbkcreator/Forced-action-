@@ -15,6 +15,10 @@ Coverage:
   - a still-unprocessed auction past the 24h SLA is flagged stale;
     'provisional'/'ambiguous' do NOT count as stale (processing != verified)
   - the kill switch halts this connector with no DB mutation
+  - a scraper correction to sold_to (via TaxDeedAuctionLoader) after an
+    auction was already resolved clears buyer_resolution_status + the old
+    buyer_entity_links row, so a rerun re-attaches to the CORRECTED winner
+    instead of staying permanently pinned to the old one
 
 Run:
     pytest tests/scenarios/test_auction_resolution_scenarios.py -v -m scenario
@@ -25,6 +29,7 @@ import uuid
 from datetime import date, timedelta
 from unittest.mock import patch
 
+import pandas as pd
 import pytest
 from sqlalchemy import delete, text
 
@@ -34,6 +39,7 @@ from src.agents.hunter.auction_resolution import (
 )
 from src.core.database import get_db_context
 from src.core.models import BuyerEntity, BuyerEntityLink, TaxDeedAuction
+from src.loaders.tax_deed import TaxDeedAuctionLoader
 
 pytestmark = pytest.mark.scenario
 
@@ -236,6 +242,71 @@ def test_provisional_status_does_not_count_as_stale():
             assert not any(s["id"] == auction.id for s in stale)
     finally:
         _cleanup([new_entity_id] if new_entity_id else [], [auction.id] if auction else [])
+
+
+def test_sold_to_correction_resolves_to_new_buyer_not_old():
+    """A later re-scrape that CORRECTS tax_deed_auctions.sold_to (via the
+    real loader, not a direct DB write) after the auction was already
+    resolved must not leave it permanently attributed to the old winner:
+    the loader's update must clear buyer_resolution_status + the stale link,
+    so rerunning resolve_tax_deed_winners re-attaches to the corrected buyer."""
+    entity_a = entity_b = auction = None
+    try:
+        with get_db_context() as session:
+            suffix = _uid()
+            entity_a = _mk_entity(session, f"ZQX OLD WINNER {suffix}")
+            entity_b = _mk_entity(session, f"ZQX NEW WINNER {suffix}")
+            auction = _mk_auction(session, entity_a.canonical_name)
+            session.commit()
+
+            resolve_tax_deed_winners(session, _COUNTY)
+            link = session.execute(
+                text("SELECT buyer_entity_id FROM buyer_entity_links "
+                     "WHERE source_table = 'tax_deed_auctions' AND source_id = :id"),
+                {"id": auction.id},
+            ).one()
+            assert link.buyer_entity_id == entity_a.id
+
+            # Scraper correction: a later re-scrape of the same case reports a
+            # different winner. Goes through the real loader, not a raw UPDATE,
+            # since this is the exact path the review found broken.
+            loader = TaxDeedAuctionLoader(session, county_id=_COUNTY)
+            df = pd.DataFrame([{
+                "parcel_id": "", "case_number": auction.case_number,
+                "auction_date": auction.auction_date.strftime("%m/%d/%Y"),
+                "certificate_number": "", "certificate_year": "",
+                "status": "", "auction_type": "", "opening_bid": "",
+                "sold_amount": "", "sold_to": entity_b.canonical_name, "raw_fields": "",
+            }])
+            loader.load_from_dataframe(df)
+            session.commit()
+
+            corrected = session.execute(
+                text("SELECT buyer_resolution_status, sold_to FROM tax_deed_auctions WHERE id = :id"),
+                {"id": auction.id},
+            ).one()
+            assert corrected.sold_to == entity_b.canonical_name
+            assert corrected.buyer_resolution_status is None, \
+                "status must be reset so the resolver re-examines this row"
+
+            stale_link_count = session.execute(
+                text("SELECT COUNT(*) FROM buyer_entity_links "
+                     "WHERE source_table = 'tax_deed_auctions' AND source_id = :id"),
+                {"id": auction.id},
+            ).scalar()
+            assert stale_link_count == 0, "the old link to entity_a must be cleared, not left dangling"
+
+            resolve_tax_deed_winners(session, _COUNTY)
+
+            links_after = session.execute(
+                text("SELECT buyer_entity_id FROM buyer_entity_links "
+                     "WHERE source_table = 'tax_deed_auctions' AND source_id = :id"),
+                {"id": auction.id},
+            ).fetchall()
+            assert len(links_after) == 1, "must not end up linked to both the old and new buyer"
+            assert links_after[0].buyer_entity_id == entity_b.id
+    finally:
+        _cleanup([e.id for e in (entity_a, entity_b) if e], [auction.id] if auction else [])
 
 
 def test_kill_switch_halts_with_no_mutation():

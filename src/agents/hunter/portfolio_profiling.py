@@ -168,19 +168,36 @@ def _stream_property_groups(
         ]
 
 
-def _find_exit(acq_index: int, group: list[DeedRow]) -> Optional[DeedRow]:
+def _find_exit(acq_index: int, group: list[DeedRow]) -> tuple[Optional[DeedRow], set[int]]:
     """First later deed on the property that qualifies as a real transfer --
     skips over (never stops at) mortgages/liens/corrective rows in between,
     matching deed_flip_outcomes.find_flip_pairs's `continue`-not-`break` style
-    for excluded rows."""
+    for excluded rows.
+
+    A later qualifying deed still linked to the SAME buyer_entity_id as the
+    acquisition is not a resale -- deeds carry no stable transaction identity
+    (a corrective/re-recorded deed gets its own instrument_number, same as a
+    real transfer), so a repeat of the acquiring entity here is the
+    signature of a corrective re-recording of THIS SAME acquisition, not the
+    entity selling to itself. These rows are returned as `duplicate_ids` so
+    the caller can skip them entirely rather than minting a second, bogus
+    acquisition event for the same purchase (see
+    buyer_entity_resolution.refresh_portfolio_aggregates's docstring for the
+    same corrective-re-recording failure mode, handled there via a DISTINCT
+    ON canonical-row pick instead, since that function's shape doesn't need
+    exit/hold-time evidence)."""
     acq = group[acq_index]
+    duplicate_ids: set[int] = set()
     for later in group[acq_index + 1:]:
         if later.record_date <= acq.record_date:
             continue
         if not _qualifies_as_transfer(later.deed_type, later.sale_price):
             continue
-        return later
-    return None
+        if later.buyer_entity_id is not None and later.buyer_entity_id == acq.buyer_entity_id:
+            duplicate_ids.add(later.id)
+            continue
+        return later, duplicate_ids
+    return None, duplicate_ids
 
 
 def _financing_state(acq: DeedRow, group: list[DeedRow]) -> str:
@@ -238,14 +255,23 @@ def compute_acquisition_evidence(
     evidence_by_entity: dict[int, list[AcquisitionEvidence]] = defaultdict(list)
 
     for group in _stream_property_groups(session, property_ids):
+        # Corrective/re-recorded deeds for an already-open acquisition are
+        # collected here (by _find_exit, as it scans forward for that
+        # acquisition's real exit) and must not be visited as their own
+        # acquisition when the outer loop reaches them -- see _find_exit's
+        # docstring.
+        duplicate_ids: set[int] = set()
         for i, row in enumerate(group):
+            if row.id in duplicate_ids:
+                continue
             if row.buyer_entity_id is None:
                 continue
             if entity_filter is not None and row.buyer_entity_id not in entity_filter:
                 continue
             if not _qualifies_as_transfer(row.deed_type, row.sale_price):
                 continue
-            exit_row = _find_exit(i, group)
+            exit_row, row_duplicate_ids = _find_exit(i, group)
+            duplicate_ids |= row_duplicate_ids
             hold_days = (exit_row.record_date - row.record_date).days if exit_row else None
             evidence_by_entity[row.buyer_entity_id].append(AcquisitionEvidence(
                 property_id=row.property_id,

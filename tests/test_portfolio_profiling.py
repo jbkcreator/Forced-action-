@@ -91,20 +91,53 @@ class TestFindExit:
             _mk_row(2, 100, date(2026, 1, 2), deed_type="Mortgage"),
             _mk_row(3, 100, date(2026, 6, 1), deed_type="Warranty Deed"),
         ]
-        exit_row = _find_exit(0, group)
+        exit_row, duplicate_ids = _find_exit(0, group)
         assert exit_row is not None
         assert exit_row.id == 3
+        assert duplicate_ids == set()
 
     def test_no_exit_when_still_held(self):
         group = [_mk_row(1, 100, date(2026, 1, 1))]
-        assert _find_exit(0, group) is None
+        exit_row, duplicate_ids = _find_exit(0, group)
+        assert exit_row is None
+        assert duplicate_ids == set()
 
     def test_quitclaim_resale_not_treated_as_exit(self):
         group = [
             _mk_row(1, 100, date(2026, 1, 1)),
             _mk_row(2, 100, date(2026, 2, 1), deed_type="Quit Claim Deed"),
         ]
-        assert _find_exit(0, group) is None
+        exit_row, duplicate_ids = _find_exit(0, group)
+        assert exit_row is None
+        assert duplicate_ids == set()
+
+    def test_same_buyer_later_deed_not_treated_as_exit(self):
+        """A second warranty deed for the same buyer_entity_id on the same
+        property (a corrective/re-recorded document -- deeds carry no stable
+        transaction identity) must not be mistaken for a resale, and must be
+        reported back as a duplicate to skip, not a fresh acquisition."""
+        group = [
+            _mk_row(1, 100, date(2026, 1, 1), buyer_entity_id=7),
+            _mk_row(2, 100, date(2026, 1, 3), buyer_entity_id=7),
+        ]
+        exit_row, duplicate_ids = _find_exit(0, group)
+        assert exit_row is None
+        assert duplicate_ids == {2}
+
+    def test_real_exit_to_different_buyer_after_same_buyer_correction(self):
+        """A corrective re-recording (same buyer) followed by a genuine resale
+        to a different buyer: the correction must be skipped as a duplicate,
+        and the different-buyer deed after it must still resolve as the real
+        exit."""
+        group = [
+            _mk_row(1, 100, date(2026, 1, 1), buyer_entity_id=7),
+            _mk_row(2, 100, date(2026, 1, 3), buyer_entity_id=7),
+            _mk_row(3, 100, date(2026, 6, 1), buyer_entity_id=9),
+        ]
+        exit_row, duplicate_ids = _find_exit(0, group)
+        assert exit_row is not None
+        assert exit_row.id == 3
+        assert duplicate_ids == {2}
 
 
 class TestFinancingState:

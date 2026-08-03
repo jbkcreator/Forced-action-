@@ -261,3 +261,89 @@ def test_empty_entity_ids_is_a_no_op_not_full_table():
     with get_db_context() as session:
         assert refresh_portfolio_profiling(session, entity_ids=[]) == 0
         assert classify_buyer_types(session, entity_ids=[]) == 0
+
+
+def test_corrective_rerecording_not_treated_as_flip():
+    """Two warranty deeds recorded for the SAME buyer_entity_id on the SAME
+    property days apart -- a corrective/re-recorded deed, not a real second
+    transaction -- must not be read as (acquisition -> flip-exit) plus a
+    second still-held acquisition. It's one acquisition, still held, with no
+    flip evidence at all."""
+    entity = deed_a = deed_b = prop = None
+    try:
+        with get_db_context() as session:
+            entity = _mk_entity(session)
+            prop = _mk_property(session, "ZQX-CORRECTIVE")
+            deed_a = _mk_deed(
+                session, prop.id, f"ZQX-CORRECTIVE-ORIG-{_uid()}",
+                record_date=date(2026, 1, 1), sale_price=150_000,
+            )
+            deed_b = _mk_deed(
+                session, prop.id, f"ZQX-CORRECTIVE-REREC-{_uid()}",
+                record_date=date(2026, 1, 3), sale_price=150_000,
+            )
+            _link(session, entity.id, deed_a.id)
+            _link(session, entity.id, deed_b.id)
+            session.commit()
+
+            refresh_portfolio_profiling(session, entity_ids=[entity.id])
+
+            row = session.execute(
+                text("SELECT avg_hold_days, portfolio_evidence FROM buyer_entities WHERE id = :id"),
+                {"id": entity.id},
+            ).one()
+            assert row.avg_hold_days is None  # no completed exit -- still held
+            assert row.portfolio_evidence["acquisition_count"] == 1  # not double-counted
+            assert row.portfolio_evidence["exit_count"] == 0
+            assert row.portfolio_evidence["exit_within_730_days"] == 0
+            assert row.portfolio_evidence["still_held_count"] == 1
+    finally:
+        _cleanup(
+            [entity.id] if entity else [],
+            [d.id for d in (deed_a, deed_b) if d],
+            [prop.id] if prop else [],
+        )
+
+
+def test_corrective_rerecording_then_real_exit_to_different_buyer():
+    """A corrective re-recording (same buyer) followed by a genuine resale to
+    a DIFFERENT buyer entity must still resolve as one flip -- the
+    correction must not eat the real exit or spawn its own acquisition."""
+    entity_a = entity_b = deed_orig = deed_rerec = deed_resale = prop = None
+    try:
+        with get_db_context() as session:
+            entity_a = _mk_entity(session)
+            entity_b = _mk_entity(session)
+            prop = _mk_property(session, "ZQX-CORRECTIVE-EXIT")
+            deed_orig = _mk_deed(
+                session, prop.id, f"ZQX-CORRECTIVE-EXIT-ORIG-{_uid()}",
+                record_date=date(2026, 1, 1), sale_price=150_000,
+            )
+            deed_rerec = _mk_deed(
+                session, prop.id, f"ZQX-CORRECTIVE-EXIT-REREC-{_uid()}",
+                record_date=date(2026, 1, 3), sale_price=150_000,
+            )
+            deed_resale = _mk_deed(
+                session, prop.id, f"ZQX-CORRECTIVE-EXIT-RESALE-{_uid()}",
+                record_date=date(2026, 3, 1), sale_price=200_000,
+            )
+            _link(session, entity_a.id, deed_orig.id)
+            _link(session, entity_a.id, deed_rerec.id)
+            _link(session, entity_b.id, deed_resale.id)
+            session.commit()
+
+            refresh_portfolio_profiling(session, entity_ids=[entity_a.id])
+
+            row = session.execute(
+                text("SELECT avg_hold_days, portfolio_evidence FROM buyer_entities WHERE id = :id"),
+                {"id": entity_a.id},
+            ).one()
+            assert row.avg_hold_days == (date(2026, 3, 1) - date(2026, 1, 1)).days
+            assert row.portfolio_evidence["acquisition_count"] == 1
+            assert row.portfolio_evidence["exit_count"] == 1
+    finally:
+        _cleanup(
+            [e.id for e in (entity_a, entity_b) if e],
+            [d.id for d in (deed_orig, deed_rerec, deed_resale) if d],
+            [prop.id] if prop else [],
+        )
