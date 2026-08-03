@@ -18,6 +18,7 @@ def _cmd_serve() -> None:
     from src.agents.cora.ingestion import reply_mailbox_poller
     from src.agents.cora.ingestion.target_producer import run_periodic
     from src.agents.cora.queue import ensure_group
+    from src.agents.cora.subgraphs import reply as reply_subgraph
     from src.agents.cora.worker import Worker
 
     ensure_group()
@@ -32,6 +33,11 @@ def _cmd_serve() -> None:
     )
     mailbox_thread.start()
 
+    call_booked_retry_thread = threading.Thread(
+        target=reply_subgraph.run_periodic, args=(stop_event,), daemon=True, name="cora-call-booked-retry",
+    )
+    call_booked_retry_thread.start()
+
     worker = Worker()
     worker.install_signal_handlers()
     try:
@@ -40,6 +46,7 @@ def _cmd_serve() -> None:
         stop_event.set()
         producer_thread.join(timeout=5)
         mailbox_thread.join(timeout=5)
+        call_booked_retry_thread.join(timeout=5)
 
 
 def _cmd_produce_targets() -> None:

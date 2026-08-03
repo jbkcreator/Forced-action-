@@ -46,7 +46,13 @@ CORA_FACT_MAX_AGE_HOURS: Dict[str, int] = {
     "generic": 24 * 30,          # anything without a declared class — 30 days
 }
 
-DraftStatus = Literal["draft", "rejected", "expired", "superseded", "approved_pending_send"]
+# "pending_channel_support": approved by the founder, but the draft's channel has
+# no registered Relay dispatcher yet (today: sms). Parked off 'draft' so the batch
+# builder stops re-selecting it every sweep; retryable once the dispatcher lands.
+DraftStatus = Literal[
+    "draft", "rejected", "expired", "superseded", "approved_pending_send",
+    "pending_channel_support",
+]
 OpportunityStatus = Literal["targeted", "touched", "replied", "call", "proposal", "closed"]
 ReplyStatus = Literal["pending_approval", "manual_review", "suppressed"]
 
@@ -337,6 +343,22 @@ def mark_draft_published(db: Any, draft_id: str) -> None:
     )
 
 
+def mark_draft_status(db: Any, draft_id: str, status: DraftStatus, reject_reason: Optional[str] = None) -> None:
+    """Additive helper — nothing before THROUGH-v2.2 ever needed to flip a
+    draft's status directly (mark_draft_published only toggles the separate
+    `published` bool). Used by THROUGH's batch-approval decisions.py to move
+    a draft to 'approved_pending_send' on approval or 'rejected' on an
+    exception-reject within a batch."""
+    from sqlalchemy import text
+    db.execute(
+        text(
+            "UPDATE outbound_drafts SET status = :status, reject_reason = :reject_reason "
+            "WHERE draft_id = :draft_id"
+        ),
+        {"status": status, "reject_reason": reject_reason, "draft_id": draft_id},
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Opportunity state machine
 # ─────────────────────────────────────────────────────────────────────────────
@@ -431,6 +453,23 @@ def read_replies(opportunity_thread_id: Optional[str] = None) -> List[Dict[str, 
         rows = [r for r in rows if r.get("opportunity_thread_id") == opportunity_thread_id]
     rows.sort(key=lambda r: r.get("received_at") or "")
     return rows
+
+
+def mark_reply_published(reply_id: str) -> None:
+    """
+    Flips a persisted ReplyRecord's `published` flag to True — used only for a
+    BOOKING_REQUEST reply whose call.booked publish failed at persist time and
+    was later retried successfully (see reply.py's retry_unpublished_call_booked).
+    Append-only + latest-line-wins-by-id (same convention as every other
+    JSON-lines record in this store), so this is a full re-append of the
+    record with one field changed, not an in-place edit.
+    """
+    latest = _read_latest_by_id(_REPLIES_FILE, "reply_id")
+    record = latest.get(reply_id)
+    if record is None:
+        return
+    record["published"] = True
+    _append_line(_REPLIES_FILE, record)
 
 
 def read_conversation(db: Any, opportunity_thread_id: str) -> List[Dict[str, Any]]:

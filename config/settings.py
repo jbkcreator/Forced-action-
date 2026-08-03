@@ -595,6 +595,14 @@ class AppSettings(BaseSettings):
 	relay_slack_channel: str = Field(default="", env="RELAY_SLACK_CHANNEL")
 	relay_approvers: list = Field(default=[], env="RELAY_APPROVERS")
 
+	# THROUGH-v2.2 batch-approval layer. Reuses slack_bot_token/slack_signing_secret
+	# above — no separate Slack app. Deliberately its own channel/approver list,
+	# not relay_slack_channel/relay_approvers — a batch of N cold-outreach drafts
+	# is a different review surface than Relay's per-item send approvals.
+	cora_throughput_slack_channel: str = Field(default="", env="CORA_THROUGHPUT_SLACK_CHANNEL")
+	cora_throughput_approvers: list = Field(default=[], env="CORA_THROUGHPUT_APPROVERS")
+	cora_batch_expiry_hours: int = Field(default=72, env="CORA_BATCH_EXPIRY_HOURS", description="Hours before a pending Cora draft batch auto-expires. Override via env var.")
+
 	# Relay email channel (RELAY-v2.2 sub-task R2). relay_instantly_campaign_id
 	# is set once after running `python -m src.services.relay --setup-email-channel`
 	# (see src/services/relay/channels_email.py) — unset means the email

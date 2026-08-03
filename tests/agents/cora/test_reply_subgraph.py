@@ -286,6 +286,88 @@ def test_unresolvable_buyer_entity_skips_call_booked_without_crashing(fresh_db, 
     assert published == []
 
 
+# PR #180-adjacent finding: _publish_call_booked used to swallow both a failed
+# queue.publish() (returns None, doesn't raise) and any other exception behind
+# a bare log line, permanently dropping the booking signal with nothing to
+# retry it. The fix persists `published=False` instead of raising (raising
+# would re-run the whole graph and mint a duplicate ReplyRecord), and a
+# separate sweep (retry_unpublished_call_booked) retries it later without
+# touching classify/compose.
+def test_call_booked_publish_failure_persists_unpublished_without_raising(fresh_db, mock_claude, monkeypatch):
+    thread_id = "OPP-TEST-BOOKING-PUBLISH-FAIL"
+    _seed_parent_draft(fresh_db, thread_id)
+    mock_claude.side_effect = [
+        classify_result("INTERESTED", "BOOKING_REQUEST"),
+        compose_result("Re:", "Great — here's the booking link."),
+    ]
+    fake_row = {"id": 1, "opportunity_thread_id": thread_id, "confidence_score": 90, "county_id": "hillsborough"}
+    monkeypatch.setattr(
+        "src.agents.cora.tools.read_tools.get_buyer_entity_by_opportunity_thread_id",
+        lambda db, tid: fake_row,
+    )
+    monkeypatch.setattr("src.agents.cora.queue.publish", lambda *a, **k: None)  # simulated Redis outage
+
+    result = reply.run_reply(
+        {
+            "opportunity_thread_id": thread_id, "from_address": "prospect@example.com",
+            "subject": "Re:", "body_text": "Yes let's talk", "received_at": store.now().isoformat(),
+        },
+        db=fresh_db,
+    )
+
+    assert result["terminal_status"] == "completed"  # the reply itself must still persist
+    record = store.read_replies(opportunity_thread_id=thread_id)[0]
+    assert record["published"] is False
+    assert len(store.read_replies(opportunity_thread_id=thread_id)) == 1  # no duplicate record from a "retry"
+
+
+def test_retry_unpublished_call_booked_republishes_and_marks_published(fresh_db, mock_claude, monkeypatch):
+    from src.agents.cora import queue
+
+    thread_id = "OPP-TEST-BOOKING-RETRY"
+    _seed_parent_draft(fresh_db, thread_id)
+    mock_claude.side_effect = [
+        classify_result("INTERESTED", "BOOKING_REQUEST"),
+        compose_result("Re:", "Great — here's the booking link."),
+    ]
+    fake_row = {"id": 1, "opportunity_thread_id": thread_id, "confidence_score": 90, "county_id": "hillsborough"}
+    monkeypatch.setattr(
+        "src.agents.cora.tools.read_tools.get_buyer_entity_by_opportunity_thread_id",
+        lambda db, tid: fake_row,
+    )
+    real_publish = queue.publish
+    monkeypatch.setattr(queue, "publish", lambda *a, **k: None)  # fails on the first attempt
+
+    reply.run_reply(
+        {
+            "opportunity_thread_id": thread_id, "from_address": "prospect@example.com",
+            "subject": "Re:", "body_text": "Yes let's talk", "received_at": store.now().isoformat(),
+        },
+        db=fresh_db,
+    )
+    before = store.read_replies(opportunity_thread_id=thread_id)[0]
+    assert before["published"] is False
+
+    monkeypatch.setattr(queue, "publish", real_publish)  # restore — only this one attribute, buyer_entity patch stays
+    retried = reply.retry_unpublished_call_booked(fresh_db)
+
+    assert retried == 1
+    after = store.read_replies(opportunity_thread_id=thread_id)[0]
+    assert after["published"] is True
+    # No second reply record was created — the sweep only updates the
+    # existing one, never re-runs match_thread/classify/compose.
+    assert len(store.read_replies(opportunity_thread_id=thread_id)) == 1
+
+    published = queue.read_batch("test-consumer-retry", count=10, block_ms=200)
+    assert len(published) == 1
+    assert published[0].event_type == "call.booked"
+    # Reusing received_at as call_booked_at means a retry's idempotency_key
+    # is identical to the original failed attempt's — never a fresh one.
+    expected_key = queue.make_idempotency_key("call.booked", thread_id, before["received_at"])
+    assert published[0].idempotency_key == expected_key
+    queue.ack(published[0].message_id)
+
+
 @pytest.mark.integration
 def test_real_claude_classification_on_seeded_replies(fresh_db):
     """Real Claude classification against all 10 seeded replies — no mocking."""

@@ -15,3 +15,12 @@ services:
     restart: unless-stopped
     depends_on:
       - api
+
+  cora_throughput:
+    image: forced-action-backend:latest
+    command: python -m src.services.cora_throughput --serve
+    env_file: .env
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - api
