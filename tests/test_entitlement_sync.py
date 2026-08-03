@@ -198,3 +198,69 @@ def test_multiple_plans_repaired_in_one_pass(db):
     assert result.plan_ids == {"pro", "starter"}
     assert _snapshot_of(db, pro_account) == PRO
     assert _snapshot_of(db, starter_account) == STARTER
+
+
+def test_concurrent_plan_change_is_not_clobbered(db, monkeypatch):
+    """Finding 2: a subscription change committed between the drift SELECT and the
+    UPDATE must not have the old plan's entitlements stamped onto it.
+
+    Simulates the Stripe webhook (`record_subscription_active`) landing in the gap
+    by mutating the account's plan_tier + snapshot after drift is computed but
+    before the write runs.
+    """
+    import src.services.entitlement_sync as sync_mod
+
+    _seed_plan(db, "starter", STARTER)
+    _seed_plan(db, "pro", PRO)
+    # Drifted on starter — this is what the SELECT will see.
+    account_id = _seed_account(db, "starter", {})
+
+    real_find = sync_mod.find_entitlement_drift
+
+    def find_then_upgrade(session, **kwargs):
+        drift = real_find(session, **kwargs)
+        # The webhook lands here: account moves to pro and gets pro's snapshot.
+        session.execute(
+            text(
+                "UPDATE customer_accounts SET plan_tier = 'pro', lead_entitlement = :snap "
+                "WHERE account_id = :aid"
+            ),
+            {"snap": json.dumps(PRO), "aid": account_id},
+        )
+        return drift
+
+    monkeypatch.setattr(sync_mod, "find_entitlement_drift", find_then_upgrade)
+
+    result = sync_mod.resync_lead_entitlements(db)
+
+    # The stale starter write must not land — the row no longer matches plan_tier.
+    assert _snapshot_of(db, account_id) == PRO
+    assert result.updated == 0
+
+
+def test_plan_guard_still_updates_matching_rows(db, monkeypatch):
+    """The plan_tier guard must not break the normal path: an account that did not
+    change plan is still repaired."""
+    import src.services.entitlement_sync as sync_mod
+
+    _seed_plan(db, "pro", PRO)
+    stays = _seed_account(db, "pro", {})
+    moves = _seed_account(db, "pro", {})
+
+    real_find = sync_mod.find_entitlement_drift
+
+    def find_then_move_one(session, **kwargs):
+        drift = real_find(session, **kwargs)
+        session.execute(
+            text("UPDATE customer_accounts SET plan_tier = 'starter' WHERE account_id = :aid"),
+            {"aid": moves},
+        )
+        return drift
+
+    monkeypatch.setattr(sync_mod, "find_entitlement_drift", find_then_move_one)
+
+    result = sync_mod.resync_lead_entitlements(db)
+
+    assert _snapshot_of(db, stays) == PRO   # untouched account repaired
+    assert _snapshot_of(db, moves) == {}    # moved account skipped, not stamped
+    assert result.updated == 1              # count reflects only the real write

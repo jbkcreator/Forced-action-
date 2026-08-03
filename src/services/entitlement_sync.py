@@ -155,18 +155,36 @@ def resync_lead_entitlements(
 
     updated = 0
     for plan_id, rows in by_plan.items():
+        # `plan_tier = :plan_id` re-checks the premise the SELECT established.
+        # record_subscription_active() writes plan_tier and lead_entitlement
+        # together, so an account whose subscription changed between the read
+        # and this write no longer matches and keeps the correct snapshot its
+        # new plan already gave it — instead of being stamped with the old
+        # plan's entitlements. Skipped rows are simply absent from rowcount.
         stmt = text(
             "UPDATE customer_accounts SET lead_entitlement = :entitlements "
-            "WHERE account_id IN :account_ids"
+            "WHERE account_id IN :account_ids AND plan_tier = :plan_id"
         ).bindparams(bindparam("account_ids", expanding=True))
         result = db.execute(
             stmt,
             {
                 "entitlements": json.dumps(rows[0].catalog),
                 "account_ids": [row.account_id for row in rows],
+                "plan_id": plan_id,
             },
         )
-        updated += result.rowcount if result.rowcount and result.rowcount > 0 else len(rows)
+        # Trust rowcount — a short count now means a concurrent plan change was
+        # correctly skipped, so falling back to len(rows) would over-report.
+        if result.rowcount is not None and result.rowcount >= 0:
+            updated += result.rowcount
+            if result.rowcount < len(rows):
+                logger.info(
+                    "entitlement_sync: plan=%s expected %d row(s), updated %d — "
+                    "%d account(s) changed plan concurrently and were skipped",
+                    plan_id, len(rows), result.rowcount, len(rows) - result.rowcount,
+                )
+        else:
+            updated += len(rows)
 
     db.flush()
     logger.info(
