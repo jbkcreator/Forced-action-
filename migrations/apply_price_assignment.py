@@ -1,4 +1,12 @@
-"""Create price_assignments table and add price-experiment metadata columns to ab_tests.
+"""Create price_assignments table.
+
+SUPERSEDED IN PART: this originally also added price-experiment metadata
+columns directly to ab_tests (Lifecycle's table). That coupled Agent Lane's
+price-band tests to Lifecycle's schema/blast radius — see
+migrations/apply_agent_lane_experiments.py and
+migrations/apply_agent_lane_experiment_separation_cleanup.py, which create
+Agent Lane's own agent_lane_experiments table and remove these columns from
+ab_tests instead. Only the price_assignments table creation remains here.
 
 Idempotent. Usage:
     PYTHONPATH=. python migrations/apply_price_assignment.py
@@ -8,7 +16,10 @@ from sqlalchemy import text
 from src.core.database import Database
 
 DDL = [
-    # New price_assignments table
+    # New price_assignments table. experiment_assignment_id's FK target
+    # (agent_lane_experiment_assignments) is added by
+    # migrations/apply_agent_lane_experiments.py, which also renames this
+    # column from its original ab_assignment_id.
     """
     CREATE TABLE IF NOT EXISTS price_assignments (
         id                      SERIAL PRIMARY KEY,
@@ -16,7 +27,7 @@ DDL = [
         offer                   VARCHAR(60)  NOT NULL,
         assigned_price_cents    INTEGER      NOT NULL,
         currency                VARCHAR(3)   NOT NULL DEFAULT 'usd',
-        ab_assignment_id        INTEGER      REFERENCES ab_assignments(id),
+        experiment_assignment_id INTEGER,
         price_band_floor_cents  INTEGER      NOT NULL,
         price_band_ceiling_cents INTEGER     NOT NULL,
         band_validated          BOOLEAN      NOT NULL DEFAULT FALSE,
@@ -31,31 +42,6 @@ DDL = [
     "ON price_assignments (opportunity_thread_id, offer, status)",
     "CREATE INDEX IF NOT EXISTS ix_price_assignments_opportunity_thread_id "
     "ON price_assignments (opportunity_thread_id)",
-
-    # Experiment metadata columns on ab_tests
-    "ALTER TABLE ab_tests ADD COLUMN IF NOT EXISTS hypothesis TEXT",
-    "ALTER TABLE ab_tests ADD COLUMN IF NOT EXISTS offer VARCHAR(60)",
-    "ALTER TABLE ab_tests ADD COLUMN IF NOT EXISTS audience VARCHAR(100)",
-    "ALTER TABLE ab_tests ADD COLUMN IF NOT EXISTS control_price_cents INTEGER",
-    "ALTER TABLE ab_tests ADD COLUMN IF NOT EXISTS test_price_cents INTEGER",
-    "ALTER TABLE ab_tests ADD COLUMN IF NOT EXISTS min_sample INTEGER",
-    "ALTER TABLE ab_tests ADD COLUMN IF NOT EXISTS success_metric VARCHAR(60)",
-    "ALTER TABLE ab_tests ADD COLUMN IF NOT EXISTS verdict VARCHAR(20)",
-
-    # Verdict check constraint (safe to run repeatedly via DO block)
-    """
-    DO $$
-    BEGIN
-        IF NOT EXISTS (
-            SELECT 1 FROM information_schema.table_constraints
-            WHERE table_name = 'ab_tests'
-              AND constraint_name = 'check_ab_test_verdict'
-        ) THEN
-            ALTER TABLE ab_tests ADD CONSTRAINT check_ab_test_verdict
-                CHECK (verdict IS NULL OR verdict IN ('control_wins', 'test_wins', 'inconclusive'));
-        END IF;
-    END$$
-    """,
 ]
 
 

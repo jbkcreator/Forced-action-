@@ -3475,23 +3475,10 @@ class AbTest(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     winner: Mapped[Optional[str]] = mapped_column(String(10))  # 'a' / 'b'
-    # Price-band experiment metadata (REVINT-v2.2 I3)
-    hypothesis: Mapped[Optional[str]] = mapped_column(Text)
-    offer: Mapped[Optional[str]] = mapped_column(String(60))
-    audience: Mapped[Optional[str]] = mapped_column(String(100))
-    control_price_cents: Mapped[Optional[int]] = mapped_column(Integer)
-    test_price_cents: Mapped[Optional[int]] = mapped_column(Integer)
-    min_sample: Mapped[Optional[int]] = mapped_column(Integer)
-    success_metric: Mapped[Optional[str]] = mapped_column(String(60))
-    verdict: Mapped[Optional[str]] = mapped_column(String(20))  # control_wins | test_wins | inconclusive
 
     __table_args__ = (
         CheckConstraint("status IN ('active', 'completed', 'rolled_back')", name="check_ab_test_status"),
         CheckConstraint("traffic_pct BETWEEN 1 AND 100", name="check_ab_traffic_pct"),
-        CheckConstraint(
-            "verdict IS NULL OR verdict IN ('control_wins', 'test_wins', 'inconclusive')",
-            name="check_ab_test_verdict",
-        ),
     )
 
     def __repr__(self):
@@ -3499,19 +3486,12 @@ class AbTest(Base):
 
 
 class AbAssignment(Base):
-    """Individual assignment to an A/B test variant — keyed on EITHER an
-    existing subscriber (message-swap/rollout tests) OR a cold opportunity
-    thread (REVINT-v2.2 I3 price-band tests, which run on Cora prospects
-    before they're ever a subscriber). Exactly one of subscriber_id /
-    opportunity_thread_id is set per row — enforced by check_ab_assignment_key_xor.
-    """
+    """Individual subscriber assignment to an A/B test variant."""
     __tablename__ = "ab_assignments"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     test_id: Mapped[int] = mapped_column(Integer, ForeignKey("ab_tests.id"), nullable=False, index=True)
-    subscriber_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("subscribers.id"), index=True)
-    # OPP-YYYY-##### format; matches BuyerEntity.opportunity_thread_id / OpportunityScore.opportunity_thread_id.
-    opportunity_thread_id: Mapped[Optional[str]] = mapped_column(String(20), index=True)
+    subscriber_id: Mapped[int] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=False, index=True)
     variant: Mapped[str] = mapped_column(String(10), nullable=False)  # 'a'/'b' for message-swap tests; 'variant'/'control' for rollout tests
     outcome: Mapped[Optional[str]] = mapped_column(String(30))  # converted/ignored/bounced
     # When record_outcome set `outcome` — lets a time-windowed holdout verdict
@@ -3524,11 +3504,82 @@ class AbAssignment(Base):
 
     __table_args__ = (
         UniqueConstraint("test_id", "subscriber_id", name="uq_ab_assignment"),
-        UniqueConstraint("test_id", "opportunity_thread_id", name="uq_ab_assignment_thread"),
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Agent Lane Experiment Models
+# ══════════════════════════════════════════════════════════════════════════════
+# Agent Lane's own experiment registry — pre-customer/cold-outbound tests
+# (Cora, REVINT price-band tests, Hunter's vertical autopilot, LEARN).
+# Deliberately separate from AbTest/AbAssignment above: those are Lifecycle's
+# (post-customer/subscriber) tables. Agent Lane and Lifecycle are two
+# different engines (pre- vs post-customer outreach) — sharing one
+# experiment table would couple their schemas and blast radius (e.g.
+# ab_rollback_check walks every active AbTest with no name filter, so any
+# row inserted there is already subject to Lifecycle's own rollback math).
+# See docs/agent-lane-data-access-matrix.md.
+
+class AgentLaneExperiment(Base):
+    """Agent Lane's experiment definition — the registry Cora/REVINT/Hunter/LEARN
+    register tests against. Same field shape REVINT-v2.2 originally added to
+    AbTest, ported to its own table rather than grafted onto Lifecycle's."""
+    __tablename__ = "agent_lane_experiments"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    test_name: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
+    hypothesis: Mapped[Optional[str]] = mapped_column(Text)
+    audience: Mapped[Optional[str]] = mapped_column(String(100))
+    offer: Mapped[Optional[str]] = mapped_column(String(60))
+    variant_a: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    variant_b: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    control_price_cents: Mapped[Optional[int]] = mapped_column(Integer)
+    test_price_cents: Mapped[Optional[int]] = mapped_column(Integer)
+    traffic_pct: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
+    min_sample: Mapped[Optional[int]] = mapped_column(Integer)
+    success_metric: Mapped[Optional[str]] = mapped_column(String(60))
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
+    verdict: Mapped[Optional[str]] = mapped_column(String(20))  # control_wins | test_wins | inconclusive
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    winner: Mapped[Optional[str]] = mapped_column(String(10))  # 'a' / 'b'
+
+    __table_args__ = (
+        CheckConstraint("status IN ('active', 'completed', 'rolled_back')", name="check_agent_lane_experiment_status"),
+        CheckConstraint("traffic_pct BETWEEN 1 AND 100", name="check_agent_lane_experiment_traffic_pct"),
         CheckConstraint(
-            "(subscriber_id IS NOT NULL) != (opportunity_thread_id IS NOT NULL)",
-            name="check_ab_assignment_key_xor",
+            "verdict IS NULL OR verdict IN ('control_wins', 'test_wins', 'inconclusive')",
+            name="check_agent_lane_experiment_verdict",
         ),
+    )
+
+    def __repr__(self):
+        return f"<AgentLaneExperiment(name={self.test_name}, status={self.status})>"
+
+
+class AgentLaneExperimentAssignment(Base):
+    """An opportunity's assignment to an Agent Lane experiment arm.
+
+    Keyed ONLY on opportunity_thread_id — never subscriber_id. Agent Lane is
+    pre-customer by definition; an assignment for someone who's already a
+    subscriber belongs on Lifecycle's AbAssignment instead. This removes the
+    need for an XOR constraint entirely (unlike AbAssignment previously on
+    this branch, which needed one only because a single table was being
+    asked to serve two domains)."""
+    __tablename__ = "agent_lane_experiment_assignments"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    test_id: Mapped[int] = mapped_column(Integer, ForeignKey("agent_lane_experiments.id"), nullable=False, index=True)
+    opportunity_thread_id: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    variant: Mapped[str] = mapped_column(String(10), nullable=False)
+    outcome: Mapped[Optional[str]] = mapped_column(String(30))
+    outcome_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    test = relationship("AgentLaneExperiment", backref="assignments")
+
+    __table_args__ = (
+        UniqueConstraint("test_id", "opportunity_thread_id", name="uq_agent_lane_experiment_assignment"),
     )
 
 
@@ -3548,7 +3599,9 @@ class PriceAssignment(Base):
     offer: Mapped[str] = mapped_column(String(60), nullable=False)
     assigned_price_cents: Mapped[int] = mapped_column(Integer, nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False, default="usd")
-    ab_assignment_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("ab_assignments.id"))
+    experiment_assignment_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("agent_lane_experiment_assignments.id")
+    )
     price_band_floor_cents: Mapped[int] = mapped_column(Integer, nullable=False)
     price_band_ceiling_cents: Mapped[int] = mapped_column(Integer, nullable=False)
     band_validated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)

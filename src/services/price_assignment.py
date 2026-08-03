@@ -57,7 +57,7 @@ def assign_price(
     offer: str,
     requested_price_cents: int,
     db: Session,
-    ab_assignment_id: Optional[int] = None,
+    experiment_assignment_id: Optional[int] = None,
 ) -> PriceAssignment:
     """Assign a validated price to an opportunity thread for a given offer.
 
@@ -68,6 +68,10 @@ def assign_price(
 
     Supersedes any existing active PriceAssignment for the same
     thread + offer before committing the new one.
+
+    experiment_assignment_id: the id of the AgentLaneExperimentAssignment
+    row (src/services/agent_lane_experiment_engine.py) this price came
+    from, if any — not a Lifecycle AbAssignment id.
     """
     if offer in _RESPA_EXCLUDED:
         raise ValueError(
@@ -111,7 +115,7 @@ def assign_price(
         offer=offer,
         assigned_price_cents=effective_price,
         currency="usd",
-        ab_assignment_id=ab_assignment_id,
+        experiment_assignment_id=experiment_assignment_id,
         price_band_floor_cents=floor_cents,
         price_band_ceiling_cents=ceiling_cents,
         band_validated=band_validated,
@@ -123,8 +127,8 @@ def assign_price(
     db.flush()
 
     logger.info(
-        "price_assignment: thread=%s offer=%s price=%d band_validated=%s ab_id=%s",
-        opportunity_thread_id, offer, effective_price, band_validated, ab_assignment_id,
+        "price_assignment: thread=%s offer=%s price=%d band_validated=%s experiment_assignment_id=%s",
+        opportunity_thread_id, offer, effective_price, band_validated, experiment_assignment_id,
     )
     return assignment
 

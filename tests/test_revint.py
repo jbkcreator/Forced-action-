@@ -293,12 +293,12 @@ class TestPriceAssignment:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestPriceVariant:
-    def _make_test(self, db, test_name: str, traffic_pct: int = 100) -> "AbTest":
-        from src.core.models import AbTest
+    def _make_test(self, db, test_name: str, traffic_pct: int = 100) -> "AgentLaneExperiment":
+        from src.core.models import AgentLaneExperiment
         from src.services.price_assignment import PRICE_BANDS
 
         band = PRICE_BANDS["core_subscription"]
-        test = AbTest(
+        experiment = AgentLaneExperiment(
             test_name=test_name,
             variant_a={},
             variant_b={},
@@ -308,44 +308,43 @@ class TestPriceVariant:
             control_price_cents=band["floor"],
             test_price_cents=(band["floor"] + band["ceiling"]) // 2,
         )
-        db.add(test)
+        db.add(experiment)
         db.flush()
-        return test
+        return experiment
 
     def test_flag_disabled_returns_control_with_no_assignment(self, fresh_db):
-        import src.services.ab_engine as ab_mod
         import src.services.price_assignment as pa_mod
-        from src.services.ab_engine import get_price_variant
+        from src.services.agent_lane_experiment_engine import get_price_variant
 
         orig = pa_mod.PRICE_BAND_TESTING_ENABLED
         pa_mod.PRICE_BAND_TESTING_ENABLED = False
         try:
-            test = self._make_test(fresh_db, "price_variant_flag_off")
+            experiment = self._make_test(fresh_db, "price_variant_flag_off")
             from src.services.price_assignment import PRICE_BANDS
-            result = get_price_variant("core_subscription", test.id, "OPP-2026-00040", fresh_db)
-            assert result == {"arm": "control", "price_cents": PRICE_BANDS["core_subscription"]["floor"], "ab_assignment_id": None}
+            result = get_price_variant("core_subscription", experiment.id, "OPP-2026-00040", fresh_db)
+            assert result == {"arm": "control", "price_cents": PRICE_BANDS["core_subscription"]["floor"], "experiment_assignment_id": None}
         finally:
             pa_mod.PRICE_BAND_TESTING_ENABLED = orig
 
     def test_deterministic_assignment_is_stable_across_calls(self, fresh_db):
         import src.services.price_assignment as pa_mod
-        from src.services.ab_engine import get_price_variant
+        from src.services.agent_lane_experiment_engine import get_price_variant
 
         orig = pa_mod.PRICE_BAND_TESTING_ENABLED
         pa_mod.PRICE_BAND_TESTING_ENABLED = True
         try:
-            test = self._make_test(fresh_db, "price_variant_stable")
-            first = get_price_variant("core_subscription", test.id, "OPP-2026-00041", fresh_db)
-            second = get_price_variant("core_subscription", test.id, "OPP-2026-00041", fresh_db)
+            experiment = self._make_test(fresh_db, "price_variant_stable")
+            first = get_price_variant("core_subscription", experiment.id, "OPP-2026-00041", fresh_db)
+            second = get_price_variant("core_subscription", experiment.id, "OPP-2026-00041", fresh_db)
             assert first == second
-            assert first["ab_assignment_id"] is not None
+            assert first["experiment_assignment_id"] is not None
 
             from sqlalchemy import select
-            from src.core.models import AbAssignment
+            from src.core.models import AgentLaneExperimentAssignment
             rows = fresh_db.execute(
-                select(AbAssignment).where(
-                    AbAssignment.test_id == test.id,
-                    AbAssignment.opportunity_thread_id == "OPP-2026-00041",
+                select(AgentLaneExperimentAssignment).where(
+                    AgentLaneExperimentAssignment.test_id == experiment.id,
+                    AgentLaneExperimentAssignment.opportunity_thread_id == "OPP-2026-00041",
                 )
             ).scalars().all()
             assert len(rows) == 1  # second call reused the existing row, didn't duplicate it
@@ -355,21 +354,21 @@ class TestPriceVariant:
     def test_both_arms_reachable_with_correct_prices_and_real_assignment_ids(self, fresh_db):
         """At traffic_pct=100 every thread is in-test; across enough distinct
         threads both the control and test arm must appear, each carrying its
-        own price and a real, persisted AbAssignment id — the exact defect
+        own price and a real, persisted assignment id — the exact defect
         the review flagged (100% of prospects silently got control)."""
         import src.services.price_assignment as pa_mod
-        from src.services.ab_engine import get_price_variant
+        from src.services.agent_lane_experiment_engine import get_price_variant
 
         orig = pa_mod.PRICE_BAND_TESTING_ENABLED
         pa_mod.PRICE_BAND_TESTING_ENABLED = True
         try:
-            test = self._make_test(fresh_db, "price_variant_both_arms")
+            experiment = self._make_test(fresh_db, "price_variant_both_arms")
             arms_seen = set()
             for i in range(20):
                 thread_id = f"OPP-2026-001{i:02d}"
-                result = get_price_variant("core_subscription", test.id, thread_id, fresh_db)
+                result = get_price_variant("core_subscription", experiment.id, thread_id, fresh_db)
                 arms_seen.add(result["arm"])
-                assert result["ab_assignment_id"] is not None
+                assert result["experiment_assignment_id"] is not None
                 from src.services.price_assignment import PRICE_BANDS
                 band = PRICE_BANDS["core_subscription"]
                 if result["arm"] == "test":
@@ -384,24 +383,24 @@ class TestPriceVariant:
             pa_mod.PRICE_BAND_TESTING_ENABLED = orig
 
     def test_end_to_end_feeds_assign_price(self, fresh_db):
-        """get_price_variant()'s ab_assignment_id must round-trip correctly
-        into assign_price()'s PriceAssignment row."""
+        """get_price_variant()'s experiment_assignment_id must round-trip
+        correctly into assign_price()'s PriceAssignment row."""
         import src.services.price_assignment as pa_mod
-        from src.services.ab_engine import get_price_variant
+        from src.services.agent_lane_experiment_engine import get_price_variant
         from src.services.price_assignment import assign_price
 
         orig = pa_mod.PRICE_BAND_TESTING_ENABLED
         pa_mod.PRICE_BAND_TESTING_ENABLED = True
         try:
-            test = self._make_test(fresh_db, "price_variant_e2e")
-            variant = get_price_variant("core_subscription", test.id, "OPP-2026-00099", fresh_db)
+            experiment = self._make_test(fresh_db, "price_variant_e2e")
+            variant = get_price_variant("core_subscription", experiment.id, "OPP-2026-00099", fresh_db)
 
             assignment = assign_price(
                 "OPP-2026-00099", "core_subscription", variant["price_cents"], fresh_db,
-                ab_assignment_id=variant["ab_assignment_id"],
+                experiment_assignment_id=variant["experiment_assignment_id"],
             )
             assert assignment.assigned_price_cents == variant["price_cents"]
-            assert assignment.ab_assignment_id == variant["ab_assignment_id"]
+            assert assignment.experiment_assignment_id == variant["experiment_assignment_id"]
         finally:
             pa_mod.PRICE_BAND_TESTING_ENABLED = orig
 

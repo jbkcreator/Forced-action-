@@ -60,9 +60,8 @@ def get_or_create_test(
 
 
 def _deterministic_variant(test: AbTest, key: str) -> Optional[str]:
-    """Pure hash + traffic-cap decision shared by every assign_variant*()
-    entry point — same key always maps to the same arm (or the same
-    out-of-test None), independent of which identity column stores it."""
+    """Pure hash + traffic-cap decision — same key always maps to the same
+    arm (or the same out-of-test None)."""
     h = int(hashlib.md5(f"{test.test_name}{key}".encode()).hexdigest(), 16) % 100
     if h >= test.traffic_pct:
         return None
@@ -99,37 +98,14 @@ def assign_variant(subscriber_id: int, test_name: str, db: Session) -> Optional[
     return variant
 
 
-def assign_variant_by_thread(opportunity_thread_id: str, test_name: str, db: Session) -> Optional[str]:
-    """Same deterministic assignment as assign_variant(), keyed on Hunter's
-    opportunity_thread_id instead of subscriber_id — for price-band tests
-    (REVINT-v2.2 I3) run on cold Cora prospects who aren't subscribers yet."""
-    test = db.execute(
-        select(AbTest).where(AbTest.test_name == test_name, AbTest.status == "active")
-    ).scalar_one_or_none()
-    if not test:
-        return None
-
-    existing = db.execute(
-        select(AbAssignment).where(
-            AbAssignment.test_id == test.id,
-            AbAssignment.opportunity_thread_id == opportunity_thread_id,
-        )
-    ).scalar_one_or_none()
-    if existing:
-        return existing.variant
-
-    variant = _deterministic_variant(test, opportunity_thread_id)
-    if variant is None:
-        return None
-
-    assignment = AbAssignment(
-        test_id=test.id,
-        opportunity_thread_id=opportunity_thread_id,
-        variant=variant,
-    )
-    db.add(assignment)
-    db.flush()
-    return variant
+# NOTE: cold, pre-customer arm assignment (assign_variant_by_thread) and
+# price-band arm selection (get_price_variant) used to live here, keyed on
+# opportunity_thread_id instead of subscriber_id. They've moved to
+# src/services/agent_lane_experiment_engine.py, targeting
+# AgentLaneExperiment/AgentLaneExperimentAssignment instead of this
+# module's AbTest/AbAssignment — this module is Lifecycle's
+# (post-customer/subscriber) engine; Agent Lane (pre-customer) has its own.
+# See docs/agent-lane-data-access-matrix.md.
 
 
 ATTRIBUTION_ROLLOUT_TEST_NAME = "lifecycle_attribution_v1"
