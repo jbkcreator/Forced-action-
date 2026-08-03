@@ -15,6 +15,15 @@ the repair unnecessary: call it after any write to the `plans` catalog.
 Only accounts whose snapshot actually differs from their plan are written, so the
 sync is idempotent and a clean run issues no UPDATE at all.
 
+Every account snapshot is treated as catalog-managed, because
+`record_subscription_active()` is the only writer of `lead_entitlement` and it
+copies the catalog verbatim — no admin endpoint, override column, or other path
+can currently produce a deliberately-divergent per-account value. If per-account
+custom entitlements are ever introduced, this sync needs an explicit opt-out
+(a provenance flag or catalog-version marker) BEFORE that feature ships:
+otherwise the first resync after a catalog edit will overwrite them. A stale
+non-empty snapshot and a hand-tuned one are indistinguishable without it.
+
     python -m src.services.entitlement_sync --dry-run
     python -m src.services.entitlement_sync --plan pro --plan founder_monthly
 """
