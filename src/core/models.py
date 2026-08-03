@@ -20,6 +20,7 @@ from sqlalchemy import (
     Integer,
     LargeBinary as sa_LargeBinary,
     Numeric,
+    SmallInteger,
     String,
     Text,
     UniqueConstraint,
@@ -1309,6 +1310,7 @@ class Subscriber(Base):
     churned_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     is_trial: Mapped[bool] = mapped_column(Boolean, server_default="false", nullable=False, default=False)
     trial_ends_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    is_demo: Mapped[bool] = mapped_column(Boolean, server_default="false", nullable=False, default=False)
 
     # ── S0: Reactivation cooldown gate ───────────────────────────────────────
     last_reactivation_attempt_at: Mapped[Optional[datetime]] = mapped_column(
@@ -4132,6 +4134,65 @@ class PlatformCostAttribution(Base):
         return f"<PlatformCostAttribution(subscriber_id={self.subscriber_id}, method={self.attribution_method}, cost_cents={self.attributed_cost_cents})>"
 
 
+class GridCellPnl(Base):
+    """
+    CLONE-v2.2 CL2 — per-grid-cell P&L rollup, generalizing
+    PlatformRevenueLedger/PlatformCostAttribution's additive-rollup pattern
+    down from product/subscriber level to the cell level. A "cell" is
+    county_id x distress_type x buyer_vertical x offer_step — distress_type
+    is a signal key from config/scoring.py:VERTICAL_WEIGHTS[buyer_vertical]
+    (e.g. 'foreclosures', 'tax_delinquencies'), buyer_vertical is one of the
+    6 keys of VERTICAL_WEIGHTS itself, and offer_step is a `name` from
+    config/revenue_ladder.py:REVENUE_LADDER.
+
+    One row per (cell, period). Written exclusively via
+    src/services/grid_cell_pnl.py:upsert_cell_pnl(), which sums
+    platform_revenue_ledger and platform_cost_attribution for the period —
+    this table never accepts a hand-written revenue/cost figure, matching
+    the existing ledger's "one writer" convention. Re-running the rollup for
+    an already-computed period overwrites that row (period P&L is a
+    point-in-time recomputation, not an append-only event), unlike the
+    underlying ledgers themselves.
+    """
+    __tablename__ = "grid_cell_pnl"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    distress_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    buyer_vertical: Mapped[str] = mapped_column(String(50), nullable=False)
+    offer_step: Mapped[str] = mapped_column(String(50), nullable=False)
+    period_start: Mapped[date] = mapped_column(Date, nullable=False)
+    period_end: Mapped[date] = mapped_column(Date, nullable=False)
+
+    revenue_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    cost_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    # Additive-rollup convention: stored, not computed on read, so a report
+    # run today and re-run later against the same period give the same
+    # answer even if revenue_cents/cost_cents' underlying source rows later
+    # gain refunds (PlatformRevenueLedger keeps refunded rows in place).
+    contribution_margin_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default=text("0"))
+    deal_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+
+    computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "county_id", "distress_type", "buyer_vertical", "offer_step",
+            "period_start", "period_end",
+            name="uq_grid_cell_pnl_cell_period",
+        ),
+        Index("idx_grid_cell_pnl_cell", "county_id", "distress_type", "buyer_vertical", "offer_step"),
+        Index("idx_grid_cell_pnl_period", "period_start", "period_end"),
+    )
+
+    def __repr__(self):
+        return (
+            f"<GridCellPnl(cell={self.county_id}/{self.distress_type}/{self.buyer_vertical}/{self.offer_step}, "
+            f"period={self.period_start}..{self.period_end}, margin_cents={self.contribution_margin_cents})>"
+        )
+
+
 class AlgorithmicVarianceLog(Base):
     """
     Task 6.2 — one row per paid/free enrichment routing decision made by
@@ -5990,6 +6051,78 @@ class DealPipelineEvent(Base):
 
     def __repr__(self) -> str:
         return f"<DealPipelineEvent(deal={self.deal_id}, {self.from_stage}->{self.to_stage})>"
+
+
+class GoldenCloseChain(Base):
+    """
+    CLONE-v2.2 CL2 — one row per closed deal, holding the full winning
+    chain (first signal -> enrichment -> first outreach -> objections
+    handled -> call -> proposal -> payment -> account expansion) as a
+    portable, queryable record so a second venture spun up off this same
+    agent fleet inherits proven patterns instead of starting from a blank
+    slate.
+
+    Deliberately denormalized (chain_stages JSONB) rather than requiring a
+    consumer to re-join deal_outcomes/deal_pipeline_events/closer_calls/
+    message_outcomes/platform_revenue_ledger itself — those remain each
+    stage's own source of truth; this table is a point-in-time assembled
+    snapshot, same relationship LifecyclePlaybook has to the tables it
+    summarizes.
+
+    schema_version + venture exist so this can later reconcile with
+    LEARN-v2.2 / L4's own golden-close data model without a breaking
+    migration: a second venture (or a schema revision from L4) adds a new
+    `venture` value / bumps `schema_version` rather than needing a new
+    table. NOT built against an agreed L4 schema yet — this is CL2's own
+    working shape, built in the absence of one, per CLONE-v2.2 lead
+    guidance.
+    """
+    __tablename__ = "golden_close_chains"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    deal_id: Mapped[int] = mapped_column(Integer, ForeignKey("deal_outcomes.id"), nullable=False, index=True)
+    venture: Mapped[str] = mapped_column(String(60), nullable=False, server_default=text("'hillsborough_distress'"))
+    schema_version: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+
+    subscriber_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("subscribers.id"), nullable=True, index=True)
+    property_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("properties.id"), nullable=True, index=True)
+    county_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    distress_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    buyer_vertical: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    offer_step: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+
+    deal_amount: Mapped[Optional[float]] = mapped_column(Numeric(12, 2), nullable=True)
+    days_to_close: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    # Ordered list of {stage, occurred_at, source_table, source_id, summary}
+    # dicts — 'first_signal','enrichment','first_outreach','objection_handled',
+    # 'call','proposal','payment','account_expansion'. Not every deal has
+    # every stage (e.g. no objections raised); consumers should not assume a
+    # fixed length.
+    chain_stages: Mapped[list] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+
+    status: Mapped[str] = mapped_column(String(20), nullable=False, server_default=text("'draft'"))
+    authored_by: Mapped[str] = mapped_column(String(120), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('draft','verified','promoted_to_playbook','retired')",
+            name="check_golden_close_chain_status",
+        ),
+        Index(
+            "uq_golden_close_chains_deal_venture", "deal_id", "venture",
+            unique=True,
+        ),
+        Index("idx_golden_close_chains_cell", "county_id", "distress_type", "buyer_vertical", "offer_step"),
+        Index("idx_golden_close_chains_venture_status", "venture", "status"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<GoldenCloseChain(deal_id={self.deal_id}, venture={self.venture}, status={self.status})>"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -8322,12 +8455,25 @@ class TaxDeedAuction(Base):
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
     )
 
+    # HUNTER-05 (H5) — per-auction winner-resolution outcome, distinct from
+    # match_method above (which is deed-loader property-matching provenance,
+    # not buyer-identity resolution). NULL = not yet processed by
+    # src/agents/hunter/auction_resolution.py. 'provisional' satisfies the
+    # <24h processing SLA without asserting a verified identity — see that
+    # module's docstring for why processing and verification are tracked
+    # separately.
+    buyer_resolution_status: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+
     property: Mapped[Optional["Property"]] = relationship("Property", foreign_keys=[property_id])
 
     __table_args__ = (
         UniqueConstraint("county_id", "auction_date", "case_number", name="uq_tax_deed_auction"),
         Index("ix_tax_deed_auctions_county_date", "county_id", "auction_date"),
         Index("ix_tax_deed_auctions_parcel_id", "parcel_id"),
+        CheckConstraint(
+            "buyer_resolution_status IS NULL OR buyer_resolution_status IN ('verified', 'provisional', 'ambiguous')",
+            name="check_tax_deed_buyer_resolution_status",
+        ),
     )
 
     def __repr__(self) -> str:
@@ -8560,6 +8706,35 @@ class BuyerEntity(Base):
     # it identifies the opportunity, not the current flag state.
     opportunity_thread_id: Mapped[Optional[str]] = mapped_column(String(20), unique=True)
 
+    # HUNTER-03 (H3) — behavioral investor-type classification, distinct from
+    # entity_type above (legal structure). buyer_type_evidence/rule_version
+    # persist the raw counts and rule generation a label was produced under,
+    # for audit -- a label + confidence number alone isn't reviewable.
+    # Populated by src/agents/hunter/buyer_type_classification.py, which
+    # reads portfolio_evidence below rather than re-deriving it.
+    buyer_type: Mapped[Optional[str]] = mapped_column(String(20))
+    buyer_type_confidence: Mapped[Optional[int]] = mapped_column(Integer)
+    buyer_type_classified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    buyer_type_evidence: Mapped[Optional[Any]] = mapped_column(JSONB)
+    buyer_type_rule_version: Mapped[Optional[int]] = mapped_column(SmallInteger)
+
+    # HUNTER-04 (H4) — rolling purchase cadence, estimated acquisition
+    # capacity, financing pattern, and average hold-time, populated by
+    # src/agents/hunter/portfolio_profiling.py. financing_signal is a 3-state
+    # signal ('cash_inferred' | 'financed' | 'unknown') computed per
+    # acquisition then majority-voted onto the entity -- 'unknown' (no
+    # correlated mortgage deed found, or too little history to judge) never
+    # boosts estimated_annual_acquisition_capacity's multiplier the way a
+    # positive 'cash_inferred' signal does. portfolio_evidence carries the
+    # full bucketed evidence (acquisition/exit/still-held counts by window)
+    # that H3's classifier reads directly.
+    cadence_purchases_per_year: Mapped[Optional[Decimal]] = mapped_column(Numeric(6, 2))
+    estimated_annual_acquisition_capacity: Mapped[Optional[int]] = mapped_column(Integer)
+    financing_signal: Mapped[Optional[str]] = mapped_column(String(20))
+    avg_hold_days: Mapped[Optional[int]] = mapped_column(Integer)
+    portfolio_profiled_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    portfolio_evidence: Mapped[Optional[Any]] = mapped_column(JSONB)
+
     county_id: Mapped[Optional[str]] = mapped_column(String(50), index=True)
     first_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,
@@ -8588,8 +8763,21 @@ class BuyerEntity(Base):
             "confidence_score >= 0 AND confidence_score <= 100",
             name="check_buyer_entity_confidence_range",
         ),
+        CheckConstraint(
+            "buyer_type IS NULL OR buyer_type IN ('flipper', 'buy-and-hold', 'wholesaler', 'institutional')",
+            name="check_buyer_entity_buyer_type",
+        ),
+        CheckConstraint(
+            "buyer_type_confidence IS NULL OR (buyer_type_confidence >= 0 AND buyer_type_confidence <= 100)",
+            name="check_buyer_entity_buyer_type_confidence",
+        ),
+        CheckConstraint(
+            "financing_signal IS NULL OR financing_signal IN ('cash_inferred', 'financed', 'unknown')",
+            name="check_buyer_entity_financing_signal",
+        ),
         Index("idx_buyer_entities_confidence", "confidence_score"),
         Index("idx_buyer_entities_is_whale", "is_whale", postgresql_where=text("is_whale")),
+        Index("idx_buyer_entities_buyer_type", "buyer_type", postgresql_where=text("buyer_type IS NOT NULL")),
     )
 
     def __repr__(self) -> str:
@@ -8636,11 +8824,12 @@ class BuyerEntityLink(Base):
     __table_args__ = (
         UniqueConstraint("source_table", "source_id", name="uq_buyer_entity_link_source"),
         CheckConstraint(
-            "source_table IN ('owners', 'deeds', 'sunbiz_snapshots')",
+            "source_table IN ('owners', 'deeds', 'sunbiz_snapshots', 'tax_deed_auctions')",
             name="check_buyer_entity_link_source_table",
         ),
         CheckConstraint(
-            "match_method IN ('sunbiz_llc_piercing', 'exact_name_address', 'fuzzy_name', 'llm_adjudicated', 'manual')",
+            "match_method IN ('sunbiz_llc_piercing', 'exact_name_address', 'fuzzy_name', 'llm_adjudicated', 'manual', "
+            "'exact_name_only', 'auction_name_only_unverified')",
             name="check_buyer_entity_link_match_method",
         ),
         CheckConstraint(

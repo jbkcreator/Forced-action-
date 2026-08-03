@@ -2312,6 +2312,7 @@ def event_feed(
     min_score: Optional[float] = Query(default=None, ge=0.0, le=100.0),
     incident_type: Optional[str] = Query(default=None),
     search: Optional[str] = Query(default=None, max_length=100),
+    county: Optional[str] = Query(default=None),
     db: Session = Depends(get_db),
     _auth=Depends(get_current_subscriber),
 ):
@@ -2333,6 +2334,9 @@ def event_feed(
 
     if not subscriber:
         raise HTTPException(status_code=404, detail={"error": "not_found", "message": "Feed not found"})
+
+    # Demo accounts can switch county via ?county= param; regular subscribers always use their own.
+    effective_county_id = county if (subscriber.is_demo and county) else subscriber.county_id
 
     if subscriber.status == "paused":
         return {
@@ -2379,16 +2383,24 @@ def event_feed(
     if subscriber.status not in ("active", "grace", "disputed", "past_due"):
         raise HTTPException(status_code=403, detail={"error": "subscription_inactive", "message": "Subscription is not active"})
 
-    # 2. Get subscriber's locked ZIP codes
+    # 2. Get subscriber's locked ZIP codes (demo accounts see all county ZIPs)
     try:
-        locked_zips = db.execute(
-            select(ZipTerritory.zip_code).where(
-                and_(
-                    ZipTerritory.subscriber_id == subscriber.id,
-                    ZipTerritory.status.in_(["locked", "grace"]),
+        if subscriber.is_demo:
+            locked_zips = db.execute(
+                select(Property.zip).where(
+                    Property.county_id == effective_county_id,
+                    Property.zip.isnot(None),
+                ).distinct()
+            ).scalars().all()
+        else:
+            locked_zips = db.execute(
+                select(ZipTerritory.zip_code).where(
+                    and_(
+                        ZipTerritory.subscriber_id == subscriber.id,
+                        ZipTerritory.status.in_(["locked", "grace"]),
+                    )
                 )
-            )
-        ).scalars().all()
+            ).scalars().all()
     except OperationalError:
         logger.error("DB error fetching locked ZIPs for feed", exc_info=True)
         raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
@@ -2509,7 +2521,7 @@ def event_feed(
             with db.begin_nested():
                 from src.services.proof_moment import get_blurred_stack as _get_blurred_stack
                 _blurred_stack = _get_blurred_stack(
-                    subscriber.id, subscriber.vertical, subscriber.county_id, db, limit=5,
+                    subscriber.id, subscriber.vertical, effective_county_id, db, limit=5,
                 )
         except Exception as exc:
             logger.warning("blurred_stack failed for sub=%s: %s", subscriber.id, exc)
@@ -2560,6 +2572,8 @@ def event_feed(
                 "tier": subscriber.tier,
                 "vertical": subscriber.vertical,
                 "county_id": subscriber.county_id,
+                "active_county_id": effective_county_id,
+                "is_demo": subscriber.is_demo,
                 "locked_zips": [],
                 "founding_member": subscriber.founding_member,
                 "status": subscriber.status,
@@ -2610,7 +2624,7 @@ def event_feed(
 
     filters = [
         Property.zip.in_(locked_zips),
-        Property.county_id == subscriber.county_id,
+        Property.county_id == effective_county_id,
         DistressScore.qualified == True,
     ]
 
@@ -2643,7 +2657,7 @@ def event_feed(
     from src.services.lead_exclusivity import get_exclusive_property_ids
     now = datetime.now(timezone.utc)
     excl_ids = get_exclusive_property_ids(
-        db, subscriber.county_id, now, exclude_trade=subscriber.vertical
+        db, effective_county_id, now, exclude_trade=subscriber.vertical
     )
     if excl_ids:
         filters.append(Property.id.not_in(excl_ids))
@@ -2756,7 +2770,7 @@ def event_feed(
     _portfolio_map = portfolio_sizes_for_names(
         db,
         (owner.owner_name for _, _, owner in rows if owner),
-        county_id=subscriber.county_id,
+        county_id=effective_county_id,
     )
 
     outcome_by_prop = _outcome_state_by_property(db, subscriber.id, list(property_ids))
@@ -2843,6 +2857,8 @@ def event_feed(
             "tier": subscriber.tier,
             "vertical": subscriber.vertical,
             "county_id": subscriber.county_id,
+            "active_county_id": effective_county_id,
+            "is_demo": subscriber.is_demo,
             "locked_zips": list(locked_zips),
             "founding_member": subscriber.founding_member,
             "status": subscriber.status,
@@ -2910,14 +2926,22 @@ def feed_stats(feed_uuid: str, db: Session = Depends(get_db), _auth=Depends(get_
         raise HTTPException(status_code=403, detail={"error": "subscription_inactive", "message": "Subscription is not active"})
 
     try:
-        locked_zips = db.execute(
-            select(ZipTerritory.zip_code).where(
-                and_(
-                    ZipTerritory.subscriber_id == subscriber.id,
-                    ZipTerritory.status.in_(["locked", "grace"]),
+        if subscriber.is_demo:
+            locked_zips = db.execute(
+                select(Property.zip).where(
+                    Property.county_id == subscriber.county_id,
+                    Property.zip.isnot(None),
+                ).distinct()
+            ).scalars().all()
+        else:
+            locked_zips = db.execute(
+                select(ZipTerritory.zip_code).where(
+                    and_(
+                        ZipTerritory.subscriber_id == subscriber.id,
+                        ZipTerritory.status.in_(["locked", "grace"]),
+                    )
                 )
-            )
-        ).scalars().all()
+            ).scalars().all()
     except OperationalError:
         raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
 
@@ -3990,12 +4014,20 @@ def insurance_distress_availability(feed_uuid: str, db: Session = Depends(get_db
         raise HTTPException(status_code=404, detail={"error": "not_found", "message": "Feed not found"})
 
     try:
-        locked_zips = db.execute(
-            select(ZipTerritory.zip_code).where(
-                ZipTerritory.subscriber_id == subscriber.id,
-                ZipTerritory.status.in_(["locked", "grace"]),
-            )
-        ).scalars().all()
+        if subscriber.is_demo:
+            locked_zips = db.execute(
+                select(Property.zip).where(
+                    Property.county_id == subscriber.county_id,
+                    Property.zip.isnot(None),
+                ).distinct()
+            ).scalars().all()
+        else:
+            locked_zips = db.execute(
+                select(ZipTerritory.zip_code).where(
+                    ZipTerritory.subscriber_id == subscriber.id,
+                    ZipTerritory.status.in_(["locked", "grace"]),
+                )
+            ).scalars().all()
     except OperationalError:
         logger.error("DB error fetching locked ZIPs for insurance-distress availability", exc_info=True)
         raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
