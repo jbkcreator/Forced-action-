@@ -38,6 +38,8 @@ def upsert_recommendation(
     decision_id: Optional[str] = None,
     agent_domain: str = "lifecycle",   # CLONE-v2.2: 'lifecycle' | 'vera' | 'cora' | 'hunter' | 'fleet'
     entry_kind: str = "playbook",      # 'playbook' | 'anti_playbook'
+    confidence: Optional[int] = None,  # LEARN-v2.2: 0-100
+    scope: Optional[dict] = None,      # LEARN-v2.2: e.g. {"buyer_type": "...", "offer": "..."}
 ) -> Optional[int]:
     """INSERT a `lifecycle_playbook` row idempotently keyed by source_key.
 
@@ -70,6 +72,15 @@ def upsert_recommendation(
       entry_kind:   'playbook' (proven pattern) or 'anti_playbook'
                     (documented failure) — see docs/constitutions/*.md's
                     "playbooks at 3+ proofs; anti-playbooks at 3+ failures."
+      confidence:   LEARN-v2.2 — 0-100, how strongly the evidence supports
+                    this entry. None (default) leaves it unset; not every
+                    caller has a confidence score to give.
+      scope:        LEARN-v2.2 — portability dimensions this entry applies
+                    to (e.g. {"buyer_type": "buy_and_hold", "offer":
+                    "founder_tier"}) — the spec's "prospect / vertical /
+                    county / offer / fleet" portability score. None
+                    (default) leaves it unset — a fleet-wide entry with no
+                    narrower scope.
 
     The dedupe contract:
       Two calls with the same (agent_domain, source_type, source_id) → only
@@ -90,13 +101,13 @@ def upsert_recommendation(
             name, description, pattern_json,
             authored_by, authored_at, status,
             source_type, source_id, source_key,
-            agent_domain, entry_kind,
+            agent_domain, entry_kind, confidence, scope, version,
             decision_id, created_at, updated_at
         ) VALUES (
             :name, :description, CAST(:pattern AS jsonb),
             :authored_by, NOW(), 'recommended',
             :source_type, :source_id, :source_key,
-            :agent_domain, :entry_kind,
+            :agent_domain, :entry_kind, :confidence, CAST(:scope AS jsonb), 1,
             :decision_id, NOW(), NOW()
         )
         ON CONFLICT (source_key) WHERE source_key IS NOT NULL
@@ -112,6 +123,8 @@ def upsert_recommendation(
         "source_key":   source_key,
         "agent_domain": agent_domain,
         "entry_kind":   entry_kind,
+        "confidence":   confidence,
+        "scope":        json.dumps(scope) if scope is not None else None,
         "decision_id":  decision_id,
     }).first()
 
@@ -177,4 +190,47 @@ def transition_status(
             f"to_status must be one of 'adopted','rejected','retired', got {to_status!r}"
         )
 
+    return result.rowcount > 0
+
+
+def supersede_recommendation(
+    session: Session,
+    old_id: int,
+    new_id: int,
+) -> bool:
+    """Mark an older lesson as superseded by a newer, validated version.
+
+    LEARN-v2.2 Layer 4 (Step 11) — memory pruning building block. Preserves
+    audit history (old_id's row is never deleted or overwritten) rather
+    than losing the superseded content. Only transitions from
+    'recommended' or 'adopted' — a row already 'rejected'/'retired' is a
+    closed decision, not something a later experiment should silently
+    override.
+    """
+    result = session.execute(sa_text("""
+        UPDATE lifecycle_playbook
+        SET status            = 'superseded',
+            superseded_by_id  = :new_id,
+            updated_at        = NOW()
+        WHERE id = :old_id AND status IN ('recommended', 'adopted')
+    """), {"old_id": old_id, "new_id": new_id})
+    return result.rowcount > 0
+
+
+def mark_contradicted(session: Session, playbook_id: int) -> bool:
+    """Mark a lesson as contradicted by accumulated counter-evidence.
+
+    LEARN-v2.2 Layer 4 (Step 11) — distinct from transition_status's
+    'rejected' (a human's judgment call): 'contradicted' is the automatic,
+    threshold-driven outcome per the fleet constitutions' "anti-playbooks
+    at 3+ failures" rule (docs/constitutions/*.md) — the caller (a
+    scheduled pruning job) is responsible for deciding the threshold was
+    met; this just records the terminal state once it has.
+    """
+    result = session.execute(sa_text("""
+        UPDATE lifecycle_playbook
+        SET status      = 'contradicted',
+            updated_at  = NOW()
+        WHERE id = :id AND status IN ('recommended', 'adopted')
+    """), {"id": playbook_id})
     return result.rowcount > 0

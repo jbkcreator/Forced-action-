@@ -52,6 +52,10 @@ _RESPA_EXCLUDED: frozenset[str] = frozenset({"hard_money_intro", "lender_intro"}
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+def is_respa_excluded(offer: str) -> bool:
+    """True for offers with no customer-facing price to test (RESPA gate)."""
+    return offer in _RESPA_EXCLUDED
+
 def assign_price(
     opportunity_thread_id: str,
     offer: str,

@@ -3596,6 +3596,46 @@ class AgentLaneExperimentAssignment(Base):
     )
 
 
+class ExperimentDecisionSnapshot(Base):
+    """Immutable record of what was known and chosen at the moment an
+    opportunity was assigned to an Agent Lane experiment arm (LEARN-v2.2
+    Layer 1, Step 3).
+
+    Captured once, at assignment time — not updated afterward. Layer 2's
+    attribution join (Step 6) and Layer 4's Golden CLOSE chains (Step 12)
+    both walk backward from this row. leading_alternative is the
+    counterfactual the spec calls for: the offer/angle NOT chosen (e.g.
+    "offered subscription over pack"), recorded here because it's only
+    knowable at decision time, before the outcome exists.
+
+    buyer_type / target_characteristics are nullable and expected to be
+    NULL until Hunter's buyer-type classification (feat/hunter-03-04-05-
+    buyer-profiling) merges — degrade gracefully rather than block on it.
+    """
+    __tablename__ = "experiment_decision_snapshots"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    test_id: Mapped[int] = mapped_column(Integer, ForeignKey("agent_lane_experiments.id"), nullable=False, index=True)
+    opportunity_thread_id: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    assigned_variant: Mapped[str] = mapped_column(String(10), nullable=False)
+    message_angle: Mapped[Optional[str]] = mapped_column(String(100))
+    offer: Mapped[Optional[str]] = mapped_column(String(60))
+    buyer_type: Mapped[Optional[str]] = mapped_column(String(30))
+    target_characteristics: Mapped[Optional[dict]] = mapped_column(JSONB)
+    chosen_action: Mapped[Optional[str]] = mapped_column(String(60))
+    leading_alternative: Mapped[Optional[str]] = mapped_column(String(60))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    test = relationship("AgentLaneExperiment", backref="decision_snapshots")
+
+    __table_args__ = (
+        UniqueConstraint("test_id", "opportunity_thread_id", name="uq_experiment_decision_snapshot"),
+    )
+
+    def __repr__(self):
+        return f"<ExperimentDecisionSnapshot(test_id={self.test_id}, thread={self.opportunity_thread_id}, variant={self.assigned_variant})>"
+
+
 class PriceAssignment(Base):
     """Source of truth for an assigned price through the entire offer chain.
 
@@ -4533,6 +4573,29 @@ class LifecyclePlaybook(Base):
     agent_domain: Mapped[str] = mapped_column(String(40), nullable=False, server_default=text("'lifecycle'"))
     entry_kind: Mapped[str] = mapped_column(String(20), nullable=False, server_default=text("'playbook'"))
 
+    # LEARN-v2.2 Layer 4 (Step 11) — lesson versioning/confidence/portability
+    # on top of CLONE-v2.2's fleet-wide widening above, rather than a
+    # parallel table: CL1 already made this the fleet's one shared
+    # playbook/anti-playbook library (docs/constitutions/*.md), so LEARN
+    # extends it further instead of re-fragmenting fleet knowledge into a
+    # second store. All nullable/defaulted — every pre-existing row and
+    # caller is unaffected.
+    confidence: Mapped[Optional[int]] = mapped_column(Integer)  # 0-100
+    version: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+    # scope: portability dimensions this lesson applies to, e.g.
+    # {"buyer_type": "buy_and_hold", "offer": "founder_tier"} — the spec's
+    # "prospect / vertical / county / offer / fleet" portability score,
+    # kept as a flexible bag rather than fixed columns since the dimension
+    # set is expected to grow.
+    scope: Mapped[Optional[dict]] = mapped_column(JSONB)
+    # Self-referential supersession chain: when a newer, validated version
+    # replaces this one, this row's status flips to 'superseded' and
+    # superseded_by_id points at the replacement — preserving audit history
+    # rather than overwriting in place.
+    superseded_by_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("lifecycle_playbook.id", ondelete="SET NULL")
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc), nullable=False,
@@ -4546,12 +4609,16 @@ class LifecyclePlaybook(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "status IN ('recommended','adopted','rejected','retired')",
+            "status IN ('recommended','adopted','rejected','retired','superseded','contradicted')",
             name="check_lifecycle_playbook_status",
         ),
         CheckConstraint(
             "entry_kind IN ('playbook','anti_playbook')",
             name="check_lifecycle_playbook_entry_kind",
+        ),
+        CheckConstraint(
+            "confidence IS NULL OR confidence BETWEEN 0 AND 100",
+            name="check_lifecycle_playbook_confidence",
         ),
         # Non-unique indexes mirror fa036. The unique partial index on
         # source_key is created via raw SQL in the migration, not declared

@@ -41,6 +41,8 @@ class OutreachState(TypedDict, total=False):
     avenue: str
     angle: str
     recommended_channel: str
+    price_cents: Optional[int]              # None when the offer has no price band (RESPA-excluded/unconfigured)
+    experiment_assignment_id: Optional[int]
 
     # ── Compose outputs ──────────────────────────────────────────────────────
     subject: str
@@ -92,6 +94,41 @@ def _make_node_gate(db: Optional[Session]):
     return _node_gate
 
 
+def _make_node_price_variant(db: Optional[Session]):
+    def _node_price_variant(state: OutreachState) -> OutreachState:
+        if state.get("terminal_status"):
+            return {}
+
+        from src.services.agent_lane_experiment_engine import (
+            ensure_price_band_experiment,
+            get_price_variant,
+            record_decision_snapshot,
+        )
+
+        buyer_entity = state["buyer_entity"]
+        offer = state["offer"]
+        experiment = ensure_price_band_experiment(offer, db)
+        if experiment is None:
+            # No price band for this offer (RESPA-excluded/unconfigured) —
+            # no price fact for compose, nothing to attribute later.
+            return {"price_cents": None, "experiment_assignment_id": None}
+
+        thread_id = buyer_entity["opportunity_thread_id"]
+        variant = get_price_variant(offer, experiment.id, thread_id, db)
+        record_decision_snapshot(
+            thread_id, experiment.test_name, db,
+            message_angle=state.get("angle"),
+            offer=offer,
+            chosen_action=f"draft_{offer}_cell_{state['cell_id']}",
+        )
+        return {
+            "price_cents": variant["price_cents"],
+            "experiment_assignment_id": variant["experiment_assignment_id"],
+        }
+
+    return _node_price_variant
+
+
 def _build_prompt(state: OutreachState) -> tuple[str, str]:
     buyer_entity = state["buyer_entity"]
     facts_lines = "\n".join(
@@ -110,9 +147,12 @@ def _build_prompt(state: OutreachState) -> tuple[str, str]:
         "the angle genuinely needs more. Output exactly two lines: 'SUBJECT: <subject>' then "
         "'BODY: <body>'."
     )
+    price_cents = state.get("price_cents")
+    price_line = f"Price: ${price_cents / 100:,.0f}/mo\n" if price_cents is not None else ""
     user = (
         f"Recipient: {buyer_entity.get('canonical_name')}\n"
         f"Offer: {state['offer']}\n"
+        f"{price_line}"
         f"Avenue: {state['avenue']}\n"
         f"Angle: {state['angle']}\n"
         f"Facts you may use:\n{facts_lines or '(none)'}\n"
@@ -205,6 +245,8 @@ def _make_node_persist(db: Optional[Session]):
             followup_sequence=state.get("followup_sequence"),
             contact_email=state.get("contact_email"),
             contact_phone=state.get("contact_phone"),
+            price_cents=state.get("price_cents"),
+            experiment_assignment_id=state.get("experiment_assignment_id"),
         )
         store.append_draft(db, record)
         store.index_contact_email(state.get("contact_email"), buyer_entity["opportunity_thread_id"])
@@ -222,6 +264,10 @@ def _make_node_persist(db: Optional[Session]):
 
 
 def _after_gate(state: OutreachState) -> str:
+    return "persist" if state.get("terminal_status") else "price_variant"
+
+
+def _after_price_variant(state: OutreachState) -> str:
     return "persist" if state.get("terminal_status") else "compose"
 
 
@@ -235,12 +281,14 @@ def build_outreach_graph(db: Optional[Session] = None) -> StateGraph:
     # parent graph's checkpointer can apply to nodes invoked underneath it.
     g = StateGraph(OutreachState)
     g.add_node("gate", _make_node_gate(db))
+    g.add_node("price_variant", _make_node_price_variant(db))
     g.add_node("compose", _make_node_compose(db))
     g.add_node("resolve_links", _make_node_resolve_links(db))
     g.add_node("persist", _make_node_persist(db))
 
     g.add_edge(START, "gate")
-    g.add_conditional_edges("gate", _after_gate, {"compose": "compose", "persist": "persist"})
+    g.add_conditional_edges("gate", _after_gate, {"price_variant": "price_variant", "persist": "persist"})
+    g.add_conditional_edges("price_variant", _after_price_variant, {"compose": "compose", "persist": "persist"})
     g.add_conditional_edges("compose", _after_compose, {"resolve_links": "resolve_links", "persist": "persist"})
     g.add_edge("resolve_links", "persist")
     g.add_edge("persist", END)

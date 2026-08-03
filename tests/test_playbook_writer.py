@@ -15,7 +15,11 @@ import uuid
 import pytest
 
 from src.core.models import LifecyclePlaybook
-from src.services.playbook_writer import upsert_recommendation
+from src.services.playbook_writer import (
+    mark_contradicted,
+    supersede_recommendation,
+    upsert_recommendation,
+)
 
 
 def _cleanup(db, source_id: str) -> None:
@@ -150,3 +154,129 @@ def test_anti_playbook_category_holds_three_plus_documented_failures(fresh_db):
     finally:
         for sid in failure_source_ids:
             _cleanup(fresh_db, sid)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LEARN-v2.2 Layer 4 (Step 11) — lesson versioning/confidence/scope,
+# supersede_recommendation(), mark_contradicted()
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_confidence_and_scope_default_to_null_version_defaults_to_one(fresh_db):
+    source_id = f"lesson_default_{uuid.uuid4().hex[:8]}"
+    try:
+        new_id = upsert_recommendation(
+            fresh_db,
+            name="no confidence/scope given", description="baseline call, no new kwargs",
+            pattern={}, source_type="ab_test", source_id=source_id, authored_by="lifecycle",
+        )
+        row = fresh_db.query(LifecyclePlaybook).filter_by(id=new_id).one()
+        assert row.confidence is None
+        assert row.scope is None
+        assert row.version == 1
+        assert row.superseded_by_id is None
+    finally:
+        _cleanup(fresh_db, source_id)
+
+
+def test_confidence_and_scope_persist_when_given(fresh_db):
+    source_id = f"lesson_scoped_{uuid.uuid4().hex[:8]}"
+    try:
+        new_id = upsert_recommendation(
+            fresh_db,
+            name="ROI framing wins for buy-and-hold",
+            description="ROI-focused messaging outperforms urgency framing",
+            pattern={"angle": "roi"}, source_type="experiment_verdict", source_id=source_id,
+            authored_by="fleet", agent_domain="fleet", entry_kind="playbook",
+            confidence=82, scope={"buyer_type": "buy_and_hold", "offer": "founder_tier"},
+        )
+        row = fresh_db.query(LifecyclePlaybook).filter_by(id=new_id).one()
+        assert row.confidence == 82
+        assert row.scope == {"buyer_type": "buy_and_hold", "offer": "founder_tier"}
+    finally:
+        _cleanup(fresh_db, source_id)
+
+
+def test_confidence_out_of_range_rejected_by_db_constraint(fresh_db):
+    source_id = f"lesson_badconf_{uuid.uuid4().hex[:8]}"
+    with pytest.raises(Exception):
+        upsert_recommendation(
+            fresh_db,
+            name="bad confidence", description="should violate check constraint",
+            pattern={}, source_type="ab_test", source_id=source_id, authored_by="lifecycle",
+            confidence=150,
+        )
+    fresh_db.rollback()
+
+
+def test_supersede_recommendation_marks_old_row_and_links_replacement(fresh_db):
+    old_source_id = f"lesson_old_{uuid.uuid4().hex[:8]}"
+    new_source_id = f"lesson_new_{uuid.uuid4().hex[:8]}"
+    try:
+        old_id = upsert_recommendation(
+            fresh_db,
+            name="urgency framing (v1)", description="superseded by a later, better-evidenced angle",
+            pattern={"angle": "urgency"}, source_type="experiment_verdict", source_id=old_source_id,
+            authored_by="fleet", agent_domain="fleet",
+        )
+        new_id = upsert_recommendation(
+            fresh_db,
+            name="roi framing (v2)", description="beat urgency framing on a larger sample",
+            pattern={"angle": "roi"}, source_type="experiment_verdict", source_id=new_source_id,
+            authored_by="fleet", agent_domain="fleet",
+        )
+
+        updated = supersede_recommendation(fresh_db, old_id, new_id)
+        assert updated is True
+
+        old_row = fresh_db.query(LifecyclePlaybook).filter_by(id=old_id).one()
+        assert old_row.status == "superseded"
+        assert old_row.superseded_by_id == new_id
+    finally:
+        _cleanup(fresh_db, old_source_id)
+        _cleanup(fresh_db, new_source_id)
+
+
+def test_supersede_recommendation_no_op_on_already_terminal_row(fresh_db):
+    """A rejected/retired row is a closed human decision — a later
+    experiment superseding it silently would hide that it was overridden."""
+    source_id = f"lesson_terminal_{uuid.uuid4().hex[:8]}"
+    try:
+        old_id = upsert_recommendation(
+            fresh_db,
+            name="already rejected", description="human already said no",
+            pattern={}, source_type="experiment_verdict", source_id=source_id,
+            authored_by="fleet", agent_domain="fleet",
+        )
+        fresh_db.execute(
+            LifecyclePlaybook.__table__.update()
+            .where(LifecyclePlaybook.id == old_id)
+            .values(status="rejected")
+        )
+        fresh_db.flush()
+
+        updated = supersede_recommendation(fresh_db, old_id, new_id=999999)
+        assert updated is False
+
+        row = fresh_db.query(LifecyclePlaybook).filter_by(id=old_id).one()
+        assert row.status == "rejected"
+        assert row.superseded_by_id is None
+    finally:
+        _cleanup(fresh_db, source_id)
+
+
+def test_mark_contradicted_sets_terminal_state(fresh_db):
+    source_id = f"lesson_contradicted_{uuid.uuid4().hex[:8]}"
+    try:
+        new_id = upsert_recommendation(
+            fresh_db,
+            name="claim later contradicted", description="3+ counter-instances found",
+            pattern={}, source_type="experiment_verdict", source_id=source_id,
+            authored_by="fleet", agent_domain="fleet",
+        )
+        updated = mark_contradicted(fresh_db, new_id)
+        assert updated is True
+
+        row = fresh_db.query(LifecyclePlaybook).filter_by(id=new_id).one()
+        assert row.status == "contradicted"
+    finally:
+        _cleanup(fresh_db, source_id)

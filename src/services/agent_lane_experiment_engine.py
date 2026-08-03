@@ -26,7 +26,11 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from config.agent_lane_guardrails import get_guardrail
-from src.core.models import AgentLaneExperiment, AgentLaneExperimentAssignment
+from src.core.models import (
+    AgentLaneExperiment,
+    AgentLaneExperimentAssignment,
+    ExperimentDecisionSnapshot,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +83,40 @@ def get_or_create_experiment(
     db.add(experiment)
     db.flush()
     return experiment
+
+
+def ensure_price_band_experiment(offer: str, db: Session) -> Optional[AgentLaneExperiment]:
+    """Lazily get-or-create the price-band AgentLaneExperiment for a given
+    offer, per src.services.price_assignment.PRICE_BANDS. Mirrors
+    ab_engine.py's ensure_annual_signup_test()/ensure_attribution_rollout_test()
+    lazy-registration pattern.
+
+    Returns None (never raises) for RESPA-excluded offers (hard_money_intro,
+    lender_intro — no customer-facing price to test) and for any offer with
+    no configured band — callers should treat None as "no price fact for
+    this draft," not an error; a config gap here shouldn't block a whole
+    outreach draft.
+    """
+    from src.services.price_assignment import PRICE_BANDS, is_respa_excluded
+
+    if is_respa_excluded(offer):
+        return None
+    band = PRICE_BANDS.get(offer)
+    if band is None:
+        return None
+
+    return get_or_create_experiment(
+        test_name=f"price_band_{offer}",
+        variant_a={"price": "control"},
+        variant_b={"price": "test"},
+        traffic_pct=10,
+        db=db,
+        offer=offer,
+        audience="cora_cold_outbound",
+        hypothesis=f"A price near the band ceiling converts better than the floor for {offer}",
+        control_price_cents=band["floor"],
+        test_price_cents=(band["floor"] + band["ceiling"]) // 2,
+    )
 
 
 def _deterministic_variant(experiment: AgentLaneExperiment, key: str) -> Optional[str]:
@@ -199,6 +237,72 @@ def get_price_variant(offer: str, experiment_id: int, opportunity_thread_id: str
         "price_cents": control_price,
         "experiment_assignment_id": assignment.id if assignment else None,
     }
+
+
+def record_decision_snapshot(
+    opportunity_thread_id: str,
+    test_name: str,
+    db: Session,
+    *,
+    message_angle: Optional[str] = None,
+    offer: Optional[str] = None,
+    buyer_type: Optional[str] = None,
+    target_characteristics: Optional[dict] = None,
+    chosen_action: Optional[str] = None,
+    leading_alternative: Optional[str] = None,
+) -> Optional[ExperimentDecisionSnapshot]:
+    """Record what was known and chosen at the moment this opportunity was
+    assigned to an experiment arm (LEARN-v2.2 Layer 1, Step 3).
+
+    Requires an existing assignment (call assign_variant_by_thread() or
+    get_price_variant() first) — this captures the assignment's context,
+    it doesn't create one. Idempotent: a second call for the same
+    (test, thread) returns the existing snapshot unchanged rather than
+    overwriting it — the snapshot is meant to be immutable once taken.
+
+    buyer_type/target_characteristics are expected to be None until
+    Hunter's buyer-type classification (feat/hunter-03-04-05-buyer-
+    profiling) merges — callers should pass what they have and leave the
+    rest None rather than block on that branch landing.
+    """
+    experiment = db.execute(
+        select(AgentLaneExperiment).where(AgentLaneExperiment.test_name == test_name)
+    ).scalar_one_or_none()
+    if not experiment:
+        return None
+
+    assignment = db.execute(
+        select(AgentLaneExperimentAssignment).where(
+            AgentLaneExperimentAssignment.test_id == experiment.id,
+            AgentLaneExperimentAssignment.opportunity_thread_id == opportunity_thread_id,
+        )
+    ).scalar_one_or_none()
+    if not assignment:
+        return None
+
+    existing = db.execute(
+        select(ExperimentDecisionSnapshot).where(
+            ExperimentDecisionSnapshot.test_id == experiment.id,
+            ExperimentDecisionSnapshot.opportunity_thread_id == opportunity_thread_id,
+        )
+    ).scalar_one_or_none()
+    if existing:
+        return existing
+
+    snapshot = ExperimentDecisionSnapshot(
+        test_id=experiment.id,
+        opportunity_thread_id=opportunity_thread_id,
+        assigned_variant=assignment.variant,
+        message_angle=message_angle,
+        offer=offer,
+        buyer_type=buyer_type,
+        target_characteristics=target_characteristics,
+        chosen_action=chosen_action,
+        leading_alternative=leading_alternative,
+    )
+    db.add(snapshot)
+    db.flush()
+    return snapshot
 
 
 def record_outcome(opportunity_thread_id: str, test_name: str, outcome: str, db: Session) -> None:
