@@ -78,7 +78,8 @@ def _get_contact(suffix: str) -> dict:
         return dict(row)
 
 
-def _trace_row(address="123 Test St", zip_="33601", mobile=None, landline=None, email=None):
+def _trace_row(address="123 Test St", zip_="33601", mobile=None, landline=None, email=None,
+               first_name=None, last_name=None):
     row = {"address": address, "zip": zip_, "city": "Tampa", "state": "FL"}
     if mobile:
         row["primary_phone"] = mobile
@@ -88,7 +89,31 @@ def _trace_row(address="123 Test St", zip_="33601", mobile=None, landline=None, 
         row["primary_phone_type"] = "Landline"
     if email:
         row["email_1"] = email
+    if first_name is not None:
+        row["first_name"] = first_name
+    if last_name is not None:
+        row["last_name"] = last_name
     return row
+
+
+def _make_contact_named(suffix: str, vertical: str, full_name: str,
+                         address: str = "123 Test St", zip_code: str = "33601",
+                         county_id: str = "stgtracerfy_test") -> None:
+    with get_db_context() as db:
+        db.add(DBPRContact(
+            license_number=f"{LICENSE_PREFIX}{suffix}",
+            license_type_code="CCC",
+            full_name=full_name,
+            address=address,
+            city="Tampa",
+            state="FL",
+            zip_code=zip_code,
+            county_id=county_id,
+            vertical=vertical,
+            enrichment_status="pending",
+            created_at=datetime.now(timezone.utc),
+        ))
+        db.commit()
 
 
 MODULE = "src.tasks.dbpr_tracerfy_enrichment"
@@ -272,3 +297,49 @@ def test_dry_run_makes_no_api_call_and_no_writes():
     mock_submit.assert_not_called()
     result = _get_contact("dry1")
     assert result["enrichment_status"] == "pending"
+
+
+def test_shared_address_contacts_matched_by_name_not_swapped():
+    """Two contractor licenses at the same mailing address must each get
+    their own result, not one contact's phone copied onto both."""
+    _make_contact_named("shareA", "roofing", "ALPHA, ANNA")
+    _make_contact_named("shareB", "roofing", "BETA, BOB")
+
+    rows = [
+        _trace_row(mobile="+18135551111", first_name="Anna", last_name="Alpha"),
+        _trace_row(mobile="+18135552222", first_name="Bob", last_name="Beta"),
+    ]
+
+    with patch(f"{MODULE}._submit_trace_batch", return_value=("Qshare", 0)):
+        with patch(f"{MODULE}._poll_trace_queue", return_value=rows):
+            from src.tasks.dbpr_tracerfy_enrichment import run_dbpr_tracerfy_enrichment
+            run_dbpr_tracerfy_enrichment(verticals=["roofing"], county_id="stgtracerfy_test")
+
+    alpha = _get_contact("shareA")
+    beta = _get_contact("shareB")
+    assert alpha["enrichment_status"] == "enriched"
+    assert alpha["mobile_phone"] == "+18135551111"
+    assert beta["enrichment_status"] == "enriched"
+    assert beta["mobile_phone"] == "+18135552222"
+
+
+def test_shared_address_ambiguous_result_left_unmatched():
+    """A result row at a shared address whose name matches neither contact
+    must not be written to either — both fall through to the miss path
+    instead of guessing."""
+    _make_contact_named("ambigA", "roofing", "GAMMA, GRACE")
+    _make_contact_named("ambigB", "roofing", "DELTA, DAVE")
+
+    rows = [_trace_row(mobile="+18135553333", first_name="Nobody", last_name="Unknown")]
+
+    with patch(f"{MODULE}._submit_trace_batch", return_value=("Qambig", 0)):
+        with patch(f"{MODULE}._poll_trace_queue", return_value=rows):
+            from src.tasks.dbpr_tracerfy_enrichment import run_dbpr_tracerfy_enrichment
+            run_dbpr_tracerfy_enrichment(verticals=["roofing"], county_id="stgtracerfy_test")
+
+    gamma = _get_contact("ambigA")
+    dave = _get_contact("ambigB")
+    assert gamma["mobile_phone"] is None
+    assert dave["mobile_phone"] is None
+    assert gamma["enrichment_status"] == "awaiting_address_only"
+    assert dave["enrichment_status"] == "awaiting_address_only"

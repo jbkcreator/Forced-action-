@@ -12,6 +12,16 @@ allowed pending/enriched/failed/skipped and rejected writes without this).
 Idempotent: ADD COLUMN IF NOT EXISTS; the constraint is dropped and
 recreated unconditionally each run (Postgres has no ADD CONSTRAINT IF NOT
 EXISTS equivalent for CHECK), which is a no-op if it already matches.
+
+The CHECK constraint list below is kept in sync with the superset also
+written by apply_dbpr_tracerfy_address_fallback.py (which adds
+'awaiting_address_only'). These two scripts run alphabetically
+(address_fallback before queue_id) and each unconditionally drops +
+recreates the same constraint, so whichever runs last wins — if this file
+only listed its own statuses, re-running it after address_fallback would
+silently drop 'awaiting_address_only' support and break any batch that
+persists that status. Both scripts must list the full status set so the
+end state is the same regardless of run order.
 """
 import sys
 
@@ -35,7 +45,10 @@ def main() -> int:
         db.execute(text("""
             ALTER TABLE dbpr_contacts
             ADD CONSTRAINT check_dbpr_enrichment_status
-            CHECK (enrichment_status IN ('pending', 'enriched', 'failed', 'skipped', 'tracerfy_submitted'))
+            CHECK (enrichment_status IN (
+                'pending', 'enriched', 'failed', 'skipped',
+                'tracerfy_submitted', 'awaiting_address_only'
+            ))
         """))
         db.commit()
         print("apply_dbpr_tracerfy_queue_id: column ensured, enrichment_status constraint extended")

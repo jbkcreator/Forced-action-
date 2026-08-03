@@ -97,15 +97,27 @@ def _build_record(contact: dict) -> dict:
 # Persist a resolved batch of (contacts submitted, results returned)
 # ---------------------------------------------------------------------------
 
+def _name_key(full_name: str) -> tuple[str, str]:
+    first, last = _split_name(full_name)
+    return (first or "").strip().casefold(), (last or "").strip().casefold()
+
+
 def _persist_batch_results(db: Session, contacts: list[dict], results: list[dict], mode: str) -> dict:
     """
     Match results back to contacts by building-level trace_key(address, zip)
-    — the queue endpoint does not echo our `label`, so this is the only
-    reliable join (mirrors tracerfy_fallback.run_tracerfy_fallback's
-    property/owner matching). Logs cost per contact (one Tracerfy record =
-    one submitted contact = one potential billed hit), not per unique key,
-    since contacts sharing an address were each submitted as separate
-    records.
+    PLUS normalized (first, last) name — the queue endpoint does not echo our
+    `label`, so this is the most specific join available (mirrors
+    tracerfy_fallback.run_tracerfy_fallback's property/owner matching).
+    Multiple contractor licenses can legitimately share a mailing address;
+    matching on address alone would write one contact's phone/email onto
+    every contact at that address. The name component is checked first; if a
+    result's address key has exactly one submitted contact (the common case),
+    that contact is used regardless of name match. If it has more than one
+    and none of their names match the result, the row is left unmatched
+    (falls through to the "no matching result" miss handling below) rather
+    than guessed at random. Logs cost per contact (one Tracerfy record = one
+    submitted contact = one potential billed hit), not per unique key, since
+    contacts sharing an address were each submitted as separate records.
 
     `mode` decides what a miss means: a 'normal' miss is eligible for an
     address-only retry (-> awaiting_address_only); an 'advanced' miss has
@@ -115,11 +127,15 @@ def _persist_batch_results(db: Session, contacts: list[dict], results: list[dict
     stats = {"success": 0, "failed": 0}
     miss_status = _STATUS_AWAITING_ADDRESS_ONLY if mode == _MODE_NORMAL else _STATUS_FAILED
 
-    key_map: dict[str, list[dict]] = {}
+    key_map: dict[tuple[str, str, str], list[dict]] = {}
+    addr_map: dict[str, list[dict]] = {}
     for c in contacts:
-        key = trace_key(c["address"], c["zip_code"])
-        if key:
-            key_map.setdefault(key, []).append(c)
+        addr_key = trace_key(c["address"], c["zip_code"])
+        if not addr_key:
+            continue
+        first, last = _name_key(c["full_name"])
+        key_map.setdefault((addr_key, first, last), []).append(c)
+        addr_map.setdefault(addr_key, []).append(c)
 
     matched_ids: set[int] = set()
 
@@ -149,21 +165,35 @@ def _persist_batch_results(db: Session, contacts: list[dict], results: list[dict
         })
 
     for row in results:
-        rkey = trace_key(row.get("address"), row.get("zip"))
-        targets = key_map.get(rkey)
+        addr_key = trace_key(row.get("address"), row.get("zip"))
+        row_first = (row.get("first_name") or "").strip().casefold()
+        row_last = (row.get("last_name") or "").strip().casefold()
+
+        targets = key_map.get((addr_key, row_first, row_last))
         if not targets:
-            logger.warning(
-                "[DBPRTracerfy] Unmatched result row (no address-key match): addr=%r zip=%r",
-                row.get("address"), row.get("zip"),
-            )
-            continue
+            candidates = addr_map.get(addr_key)
+            if candidates and len(candidates) == 1:
+                targets = candidates
+            elif candidates:
+                logger.warning(
+                    "[DBPRTracerfy] Ambiguous result row: name %r %r matches none of "
+                    "%d contacts sharing address-key %r — left unmatched",
+                    row.get("first_name"), row.get("last_name"), len(candidates), addr_key,
+                )
+                continue
+            else:
+                logger.warning(
+                    "[DBPRTracerfy] Unmatched result row (no address-key match): addr=%r zip=%r",
+                    row.get("address"), row.get("zip"),
+                )
+                continue
 
         parsed = _parse_trace_row(row)
         for contact in targets:
             matched_ids.add(contact["id"])
             log_usage(
                 db=db, vendor="tracerfy", purpose="skip_trace",
-                success=parsed["match_success"], target_address=rkey,
+                success=parsed["match_success"], target_address=addr_key,
             )
             _write_contact(contact, parsed["match_success"], parsed)
             if parsed["match_success"]:
