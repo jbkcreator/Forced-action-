@@ -38,7 +38,7 @@ from typing import Optional
 from sqlalchemy import text
 
 from config.settings import get_settings
-from config.venture_ladder import TERMINAL_STAGE
+from config.venture_ladder import AUTO_DOUBLE_ELIGIBLE_STAGES, TERMINAL_STAGE
 from src.core.database import get_db_context
 from src.services import venture_ladder
 
@@ -194,14 +194,39 @@ def evaluate_venture(
         venture_ladder.advance(db, venture_key, actor=ACTOR)
 
     # Auto-double is independent of advancement: a venture sitting at `cell`
-    # for months should still scale on a good reply rate.
-    if auto_double and not dry_run:
+    # for months should still scale on a good reply rate. Gated on the stage
+    # the venture was AT BEFORE this evaluation (evaluation.current_stage,
+    # never result["to_stage"]) — a venture that just advanced into `cell`
+    # this run has not yet proven anything at that rung and waits for the next
+    # pass. `maybe_auto_double`/`maybe_auto_double_cell` re-check is_active and
+    # stage themselves (defence in depth); the check here just avoids the
+    # query entirely for a venture that plainly does not qualify.
+    auto_double_notes: list[str] = []
+    if auto_double and not dry_run and evaluation.current_stage in AUTO_DOUBLE_ELIGIBLE_STAGES:
         outcome = venture_ladder.maybe_auto_double(db, venture_key, actor=ACTOR)
         if outcome.fired:
-            result["auto_double"] = (
+            auto_double_notes.append(
                 f"ceiling {outcome.previous_ceiling} -> {outcome.new_ceiling} "
                 f"({outcome.reason})"
             )
+
+        # Per-cell scaling shifts the target-production mix toward whatever is
+        # working (src/services/venture_ladder.py:cell_production_multipliers);
+        # it never touches the ceiling above. Only cells with traffic in the
+        # window come back from cell_reply_rates, so this never calls
+        # maybe_auto_double_cell for a cell with nothing to measure.
+        for cell_id in venture_ladder.cell_reply_rates(db, venture_key):
+            cell_outcome = venture_ladder.maybe_auto_double_cell(
+                db, venture_key, cell_id, actor=ACTOR
+            )
+            if cell_outcome.fired:
+                auto_double_notes.append(
+                    f"cell {cell_id} {cell_outcome.previous_multiplier}x -> "
+                    f"{cell_outcome.new_multiplier}x ({cell_outcome.reason})"
+                )
+
+    if auto_double_notes:
+        result["auto_double"] = "; ".join(auto_double_notes)
 
     return result
 

@@ -229,6 +229,17 @@ AUTO_DOUBLE_MAX_SEND_FAILURE_PCT = 2.0
 # Per-cell production multiplier bounds, for the cell-level rule.
 AUTO_DOUBLE_CELL_MAX_MULTIPLIER = 4
 
+# Stages at which auto-double (venture-level ceiling OR cell-level production
+# multiplier) may fire. Below `cell` a venture has not yet proven it can hold a
+# reply rate worth scaling — the evaluator runs maybe_auto_double() /
+# maybe_auto_double_cell() for every venture on every pass regardless of
+# whether it is clear to ADVANCE, so this is the guard that stops a pilot- or
+# unit_economics-stage venture from having its send volume scaled up before it
+# has cleared the gates that say scaling is safe.
+AUTO_DOUBLE_ELIGIBLE_STAGES: frozenset[str] = frozenset(
+    LADDER_STAGES[LADDER_STAGES.index("cell"):]
+)
+
 # ── Gate thresholds ──────────────────────────────────────────────────────────
 # Shape mirrors EXPANSION_GATES, extended with the two fields that machine
 # lacks:
@@ -498,6 +509,10 @@ def validate_ladder_config() -> list[str]:
         problems.append(
             "AUTO_DOUBLE_COOLDOWN_DAYS below 1 allows repeated same-day doublings "
             "on a warming domain"
+        )
+    if "cell" not in AUTO_DOUBLE_ELIGIBLE_STAGES or not AUTO_DOUBLE_ELIGIBLE_STAGES:
+        problems.append(
+            "AUTO_DOUBLE_ELIGIBLE_STAGES must include 'cell' and everything above it"
         )
 
     return problems

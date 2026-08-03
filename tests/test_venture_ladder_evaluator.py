@@ -13,12 +13,13 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import text
 
-from config.venture_ladder import EVIDENCE_MARKET_SCORE
+from config.venture_ladder import AUTO_DOUBLE_MIN_SAMPLE, EVIDENCE_MARKET_SCORE
 from src.services import venture_ladder
 from src.tasks import venture_ladder_evaluator as evaluator
 
@@ -71,6 +72,75 @@ def _stage(db, key: str) -> str:
     return db.execute(
         text("SELECT ladder_stage FROM ventures WHERE venture_key = :k"), {"k": key}
     ).scalar_one()
+
+
+def _activate_at_cell(db, key: str) -> None:
+    db.execute(
+        text("UPDATE ventures SET is_active = true, ladder_stage = 'cell' WHERE venture_key = :k"),
+        {"k": key},
+    )
+    db.flush()
+
+
+def _seed_traffic(db, venture_key: str, *, sends: int, replies: int, cell_id: str = "founder_tier_blitz") -> None:
+    """Dispatched queue rows plus matching drafts — mirrors
+    tests/test_venture_ladder.py's helper of the same name. Both are needed:
+    cell_reply_rates() only counts a draft whose thread has a dispatched
+    relay_approval_queue row."""
+    now = datetime.now(timezone.utc)
+    queue_rows = []
+    draft_rows = []
+    for n in range(sends):
+        thread_id = f"OPP-EVAL-{venture_key}-{cell_id}-{n:05d}"
+        dispatched_at = now - timedelta(days=1, minutes=n)
+        queue_rows.append({
+            "idempotency_key": f"eval-{venture_key}-{cell_id}-{n}",
+            "venture_key": venture_key,
+            "batch_id": f"eval-batch-{n % 3}",
+            "thread_id": thread_id,
+            "channel": "email",
+            "recipient": f"t{n}@test.invalid",
+            "payload": json.dumps({"subject": "t"}),
+            "dispatched_at": dispatched_at,
+        })
+        draft_rows.append({
+            "draft_id": str(uuid.uuid4()),
+            "opportunity_thread_id": thread_id,
+            "venture_key": venture_key,
+            "cell_id": cell_id,
+            "created_at": dispatched_at,
+            "replied_at": dispatched_at + timedelta(hours=1) if n < replies else None,
+        })
+
+    db.execute(
+        text("""
+            INSERT INTO relay_approval_queue (
+                idempotency_key, venture_key, batch_id, thread_id, channel,
+                recipient, payload, status, dispatched_at
+            ) VALUES (
+                :idempotency_key, :venture_key, :batch_id, :thread_id, :channel,
+                :recipient, CAST(:payload AS jsonb), 'sent', :dispatched_at
+            )
+        """),
+        queue_rows,
+    )
+    db.execute(
+        text("""
+            INSERT INTO outbound_drafts (
+                draft_id, opportunity_thread_id, buyer_entity_id, venture_key,
+                cell_id, offer, avenue, angle, subject, body, facts_used,
+                source_refs, recommended_channel, confidence_score, status,
+                schema_version, published, is_followup, created_at, replied_at
+            ) VALUES (
+                :draft_id, :opportunity_thread_id, 1, :venture_key,
+                :cell_id, 'founder_tier', 'flippers', 'scarcity_seat_number',
+                's', 'b', '[]'::jsonb, '[]'::jsonb, 'email', 80,
+                'approved_pending_send', 1, false, false, :created_at, :replied_at
+            )
+        """),
+        draft_rows,
+    )
+    db.flush()
 
 
 # ── advancement ──────────────────────────────────────────────────────────────
@@ -192,6 +262,80 @@ def test_cell_to_spin_up_advances_when_explicitly_released(
 
 def test_only_cell_to_spin_up_is_release_gated():
     assert evaluator.HUMAN_RELEASED_TRANSITIONS == frozenset({("cell", "spin_up")})
+
+
+# ── auto-double wiring ───────────────────────────────────────────────────────
+
+
+def test_auto_double_is_skipped_below_the_cell_stage(cl4_db, radar_venture):
+    """The evaluator calls maybe_auto_double() for every venture on every
+    pass — a radar-stage venture with a qualifying reply rate (seeded here
+    directly, bypassing the ladder) must not have its ceiling touched."""
+    sends = AUTO_DOUBLE_MIN_SAMPLE
+    _seed_traffic(cl4_db, radar_venture, sends=sends, replies=int(sends * 0.15))
+
+    result = evaluator.evaluate_venture(
+        cl4_db, radar_venture,
+        dry_run=False, advance_spin_up=False, auto_double=True,
+    )
+    assert result["auto_double"] is None
+    assert cl4_db.execute(
+        text("SELECT COUNT(*) FROM venture_ladder_events WHERE venture_key = :k AND decision = 'auto_double'"),
+        {"k": radar_venture},
+    ).scalar_one() == 0
+
+
+def test_evaluator_fires_venture_and_cell_auto_double_at_cell_stage(cl4_db, radar_venture):
+    """Issue: maybe_auto_double_cell() was implemented but nothing in
+    production ever called it, so per-cell scaling was a no-op. An active
+    venture sitting at `cell` with a qualifying cell must get both the
+    venture ceiling doubled AND that cell's production multiplier raised."""
+    _activate_at_cell(cl4_db, radar_venture)
+    sends = AUTO_DOUBLE_MIN_SAMPLE
+    _seed_traffic(cl4_db, radar_venture, sends=sends, replies=int(sends * 0.15))
+
+    result = evaluator.evaluate_venture(
+        cl4_db, radar_venture,
+        dry_run=False, advance_spin_up=False, auto_double=True,
+    )
+
+    assert result["auto_double"] is not None
+    assert "ceiling" in result["auto_double"]
+    assert "cell founder_tier_blitz" in result["auto_double"]
+
+    from config.venture_ladder import AUTO_DOUBLE_MULTIPLIER
+
+    # 20 is ventures.relay_daily_ceiling's server_default — radar_venture never
+    # sets it explicitly, so a doubling from there confirms the venture-level
+    # rule actually fired (not just reported a note).
+    stored_ceiling = cl4_db.execute(
+        text("SELECT relay_daily_ceiling FROM ventures WHERE venture_key = :k"),
+        {"k": radar_venture},
+    ).scalar_one()
+    assert stored_ceiling == 20 * AUTO_DOUBLE_MULTIPLIER
+
+    multipliers = venture_ladder.cell_production_multipliers(cl4_db, radar_venture)
+    assert multipliers.get("founder_tier_blitz") == AUTO_DOUBLE_MULTIPLIER
+
+
+def test_evaluator_does_not_double_a_cell_with_no_traffic(cl4_db, radar_venture):
+    """cell_reply_rates() only returns cells with sends in the window, so a
+    cell with nothing to measure must never be passed to
+    maybe_auto_double_cell() at all — not merely declined by it."""
+    _activate_at_cell(cl4_db, radar_venture)
+
+    result = evaluator.evaluate_venture(
+        cl4_db, radar_venture,
+        dry_run=False, advance_spin_up=False, auto_double=True,
+    )
+    assert result["auto_double"] is None
+    assert cl4_db.execute(
+        text(
+            "SELECT COUNT(*) FROM venture_ladder_events "
+            "WHERE venture_key = :k AND decision = 'auto_double'"
+        ),
+        {"k": radar_venture},
+    ).scalar_one() == 0
 
 
 # ── fleet resilience ─────────────────────────────────────────────────────────

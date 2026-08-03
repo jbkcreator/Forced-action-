@@ -193,6 +193,27 @@ def new_draft_id() -> str:
     return str(uuid.uuid4())
 
 
+def venture_key_for_county(db: Any, county_id: Optional[str]) -> str:
+    """The venture `county_id` belongs to, or DEFAULT_VENTURE_KEY if unresolvable.
+
+    Draft-persistence call sites (outreach.py, post_call_recap.py) must call
+    this rather than trust OutboundDraftRecord.venture_key's default. Per-cell
+    and per-venture reply rate is read off the venture_key column
+    (src/services/venture_ladder.py:cell_reply_rates), and a second venture's
+    drafts that silently defaulted to venture #1 would have a permanently
+    empty reply rate — and could never advance the cell rung or auto-double.
+    """
+    if not county_id:
+        return DEFAULT_VENTURE_KEY
+    from sqlalchemy import text
+
+    row = db.execute(
+        text("SELECT venture_key FROM counties WHERE county_id = :county_id"),
+        {"county_id": county_id},
+    ).first()
+    return row.venture_key if row and row.venture_key else DEFAULT_VENTURE_KEY
+
+
 def _draft_row_to_dict(row: Any) -> Dict[str, Any]:
     d = dict(row)
     if d.get("created_at") is not None:

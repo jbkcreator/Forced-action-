@@ -185,6 +185,23 @@ def stub_venture(ladder_db):
     return key
 
 
+@pytest.fixture
+def cell_stage_venture(ladder_db, stub_venture):
+    """`stub_venture`, activated and set to the `cell` rung.
+
+    Auto-double's real precondition (an active venture at `cell` or later) —
+    a radar candidate's is_active=false / stage='radar' shape is deliberately
+    wrong for these tests, since maybe_auto_double()/maybe_auto_double_cell()
+    must refuse to scale anything below that.
+    """
+    ladder_db.execute(
+        text("UPDATE ventures SET is_active = true, ladder_stage = 'cell' WHERE venture_key = :k"),
+        {"k": stub_venture},
+    )
+    ladder_db.flush()
+    return stub_venture
+
+
 def _set_stage(db, venture_key: str, stage: str) -> None:
     db.execute(
         text("UPDATE ventures SET ladder_stage = :stage WHERE venture_key = :key"),
@@ -395,6 +412,56 @@ def test_terminal_stage_cannot_advance(ladder_db, stub_venture):
 def test_unknown_venture_raises(ladder_db):
     with pytest.raises(LookupError):
         venture_ladder.evaluate(ladder_db, "no_such_venture_at_all")
+
+
+def test_advancing_into_portfolio_activates_the_venture(ladder_db, stub_venture):
+    """A candidate must not be able to reach portfolio — the explicit go-live
+    rung — while still resolving to the CL3 env fallback. Without this, a
+    promoted venture would send using the DEFAULT venture's campaign, sender
+    and kill-switch instead of its own."""
+    _set_stage(ladder_db, stub_venture, "spin_up")
+    assert ladder_db.execute(
+        text("SELECT is_active FROM ventures WHERE venture_key = :k"),
+        {"k": stub_venture},
+    ).scalar_one() is False
+
+    result = venture_ladder.advance(ladder_db, stub_venture, actor="test", force=True)
+    assert result.current_stage == TERMINAL_STAGE
+
+    assert ladder_db.execute(
+        text("SELECT is_active FROM ventures WHERE venture_key = :k"),
+        {"k": stub_venture},
+    ).scalar_one() is True
+
+
+def test_advancing_between_earlier_rungs_does_not_activate(ladder_db, stub_venture):
+    """Only the spin_up -> portfolio transition activates — every earlier rung
+    leaves a candidate exactly as inactive as it started."""
+    _seed_market_score(ladder_db, stub_venture)
+    result = venture_ladder.advance(ladder_db, stub_venture, actor="test")
+    assert result.current_stage == "probe"
+
+    assert ladder_db.execute(
+        text("SELECT is_active FROM ventures WHERE venture_key = :k"),
+        {"k": stub_venture},
+    ).scalar_one() is False
+
+
+def test_advance_never_deactivates_an_already_active_venture(ladder_db, stub_venture):
+    """`is_active OR :activate` must never flip an already-active venture back
+    off on a non-portfolio transition."""
+    ladder_db.execute(
+        text("UPDATE ventures SET is_active = true WHERE venture_key = :k"),
+        {"k": stub_venture},
+    )
+    ladder_db.flush()
+    _seed_market_score(ladder_db, stub_venture)
+    venture_ladder.advance(ladder_db, stub_venture, actor="test")
+
+    assert ladder_db.execute(
+        text("SELECT is_active FROM ventures WHERE venture_key = :k"),
+        {"k": stub_venture},
+    ).scalar_one() is True
 
 
 def test_county_overlap_gate_blocks_a_territory_collision(ladder_db, stub_venture):
@@ -627,6 +694,34 @@ def test_presell_commitments_without_a_customer_id_fall_back_to_contact_ref(
     assert status.satisfied
 
 
+def test_presell_commitments_without_either_identity_field_still_count_as_distinct(
+    ladder_db, stub_venture
+):
+    """Regression: `customer or f"contact:{...}" or f"row:{index}"` always
+    produced a truthy "contact:" string (the prefix alone is non-empty), so
+    every commitment missing BOTH stripe_customer_id and contact_ref collapsed
+    into that one bucket and the row/index fallback could never be reached.
+    Five genuinely distinct, verified commitments with neither field (but
+    distinct source_refs, i.e. distinct payment sources) must count as five
+    distinct buyers, not one."""
+    for index in range(PRESELL_MIN_COMMITMENTS):
+        venture_ladder.record_evidence(
+            ladder_db, stub_venture,
+            evidence_type=EVIDENCE_PRESELL_COMMITMENT, stage="probe",
+            payload={
+                "kind": "deposit",
+                "amount_cents": (PRESELL_MIN_AMOUNT_CENTS // PRESELL_MIN_COMMITMENTS) + 1,
+            },
+            source_ref=f"pi_no_identity_{index}", verified=True, recorded_by="test",
+        )
+    ladder_db.flush()
+
+    status = venture_ladder.presell_gate_status(ladder_db, stub_venture)
+    assert status.verified_count == PRESELL_MIN_COMMITMENTS
+    assert status.satisfied
+    assert venture_ladder.presell_gate_blocked(ladder_db, stub_venture) == []
+
+
 def test_evidence_source_ref_is_idempotent(ladder_db, stub_venture):
     """A Stripe webhook retry must not inflate a presell count."""
     first = venture_ladder.record_evidence(
@@ -660,41 +755,85 @@ def test_evidence_without_source_ref_is_repeatable(ladder_db, stub_venture):
 # ── auto-double ──────────────────────────────────────────────────────────────
 
 
-def test_auto_double_fires_above_the_reply_rate_threshold(ladder_db, stub_venture):
+def test_auto_double_fires_above_the_reply_rate_threshold(ladder_db, cell_stage_venture):
     sends = AUTO_DOUBLE_MIN_SAMPLE
     replies = int(sends * (AUTO_DOUBLE_REPLY_RATE_PCT + 5) / 100)
-    _seed_traffic(ladder_db, stub_venture, sends=sends, replies=replies)
+    _seed_traffic(ladder_db, cell_stage_venture, sends=sends, replies=replies)
 
-    result = venture_ladder.maybe_auto_double(ladder_db, stub_venture)
+    result = venture_ladder.maybe_auto_double(ladder_db, cell_stage_venture)
     assert result.fired
     assert result.previous_ceiling == 20
     assert result.new_ceiling == 20 * AUTO_DOUBLE_MULTIPLIER
 
     stored = ladder_db.execute(
         text("SELECT relay_daily_ceiling FROM ventures WHERE venture_key = :k"),
-        {"k": stub_venture},
+        {"k": cell_stage_venture},
     ).scalar_one()
     assert stored == 20 * AUTO_DOUBLE_MULTIPLIER
 
 
-def test_auto_double_audits_the_decision(ladder_db, stub_venture):
+def test_auto_double_audits_the_decision(ladder_db, cell_stage_venture):
     sends = AUTO_DOUBLE_MIN_SAMPLE
-    _seed_traffic(ladder_db, stub_venture, sends=sends, replies=int(sends * 0.15))
-    venture_ladder.maybe_auto_double(ladder_db, stub_venture)
+    _seed_traffic(ladder_db, cell_stage_venture, sends=sends, replies=int(sends * 0.15))
+    venture_ladder.maybe_auto_double(ladder_db, cell_stage_venture)
 
     row = ladder_db.execute(
         text("""
             SELECT decision, gate_results FROM venture_ladder_events
             WHERE venture_key = :k AND decision = 'auto_double'
         """),
-        {"k": stub_venture},
+        {"k": cell_stage_venture},
     ).one()
     assert row.gate_results["scope"] == "venture"
     assert row.gate_results["previous_ceiling"] == 20
     assert row.gate_results["new_ceiling"] == 40
 
 
-def test_auto_double_flushes_the_venture_config_cache(ladder_db, stub_venture):
+def test_auto_double_declines_an_inactive_venture_even_at_cell_stage(ladder_db, stub_venture):
+    """is_active=false is what a radar candidate looks like even if its
+    ladder_stage was somehow bumped to 'cell' without going through
+    venture_provisioning (which sets is_active on its own) — scaling a venture
+    Relay does not even resolve to is meaningless."""
+    _set_stage(ladder_db, stub_venture, "cell")
+    sends = AUTO_DOUBLE_MIN_SAMPLE
+    _seed_traffic(ladder_db, stub_venture, sends=sends, replies=int(sends * 0.15))
+
+    result = venture_ladder.maybe_auto_double(ladder_db, stub_venture)
+    assert not result.fired
+    assert "not active" in result.reason
+    assert ladder_db.execute(
+        text("SELECT relay_daily_ceiling FROM ventures WHERE venture_key = :k"),
+        {"k": stub_venture},
+    ).scalar_one() == 20
+
+
+@pytest.mark.parametrize("stage", ["radar", "probe", "pilot", "unit_economics"])
+def test_auto_double_declines_an_active_venture_below_cell_stage(
+    ladder_db, stub_venture, stage
+):
+    """The evaluator calls maybe_auto_double() for every venture every run
+    regardless of what rung it is clear to advance to — a pilot- or
+    unit_economics-stage venture with 200 qualifying sends and an 8%+ reply
+    rate must not have its ceiling doubled before it has proven it can hold
+    that rate at all."""
+    ladder_db.execute(
+        text("UPDATE ventures SET is_active = true WHERE venture_key = :k"),
+        {"k": stub_venture},
+    )
+    _set_stage(ladder_db, stub_venture, stage)
+    sends = AUTO_DOUBLE_MIN_SAMPLE
+    _seed_traffic(ladder_db, stub_venture, sends=sends, replies=int(sends * 0.15))
+
+    result = venture_ladder.maybe_auto_double(ladder_db, stub_venture)
+    assert not result.fired
+    assert "below 'cell'" in result.reason
+    assert ladder_db.execute(
+        text("SELECT relay_daily_ceiling FROM ventures WHERE venture_key = :k"),
+        {"k": stub_venture},
+    ).scalar_one() == 20
+
+
+def test_auto_double_flushes_the_venture_config_cache(ladder_db, cell_stage_venture):
     """A raised ceiling must take effect immediately.
 
     ventures is read through a 5-minute cache; without the flush the new ceiling
@@ -703,139 +842,130 @@ def test_auto_double_flushes_the_venture_config_cache(ladder_db, stub_venture):
     """
     from src.utils import venture_config
 
-    # The resolver only reads ACTIVE rows — an inactive radar candidate
-    # deliberately falls through to env settings, so a ceiling change on one
-    # would be invisible to it by design. Only a live venture has a cache entry
-    # worth invalidating.
-    ladder_db.execute(
-        text("UPDATE ventures SET is_active = true WHERE venture_key = :k"),
-        {"k": stub_venture},
-    )
-    ladder_db.flush()
-    venture_config.invalidate_cache(stub_venture)
+    venture_config.invalidate_cache(cell_stage_venture)
 
     sends = AUTO_DOUBLE_MIN_SAMPLE
-    _seed_traffic(ladder_db, stub_venture, sends=sends, replies=int(sends * 0.15))
+    _seed_traffic(ladder_db, cell_stage_venture, sends=sends, replies=int(sends * 0.15))
 
     # Warm the cache with the pre-double ceiling.
-    before = venture_config.get_venture_config(stub_venture, session=ladder_db)
+    before = venture_config.get_venture_config(cell_stage_venture, session=ladder_db)
     assert before.relay_daily_ceiling == 20
 
-    result = venture_ladder.maybe_auto_double(ladder_db, stub_venture)
+    result = venture_ladder.maybe_auto_double(ladder_db, cell_stage_venture)
     assert result.fired
 
-    after = venture_config.get_venture_config(stub_venture, session=ladder_db)
+    after = venture_config.get_venture_config(cell_stage_venture, session=ladder_db)
     assert after.relay_daily_ceiling == 20 * AUTO_DOUBLE_MULTIPLIER
 
 
 def test_auto_double_cache_flush_failure_does_not_lose_the_ceiling(
-    ladder_db, stub_venture, monkeypatch
+    ladder_db, cell_stage_venture, monkeypatch
 ):
     """A cache-flush problem must never roll back a ceiling change that already
     succeeded — the write is the important half."""
     sends = AUTO_DOUBLE_MIN_SAMPLE
-    _seed_traffic(ladder_db, stub_venture, sends=sends, replies=int(sends * 0.15))
+    _seed_traffic(ladder_db, cell_stage_venture, sends=sends, replies=int(sends * 0.15))
 
     def _boom(_key=None):
         raise RuntimeError("cache backend unavailable")
 
     monkeypatch.setattr("src.utils.venture_config.invalidate_cache", _boom)
 
-    result = venture_ladder.maybe_auto_double(ladder_db, stub_venture)
+    result = venture_ladder.maybe_auto_double(ladder_db, cell_stage_venture)
     assert result.fired
     assert ladder_db.execute(
         text("SELECT relay_daily_ceiling FROM ventures WHERE venture_key = :k"),
-        {"k": stub_venture},
+        {"k": cell_stage_venture},
     ).scalar_one() == 20 * AUTO_DOUBLE_MULTIPLIER
 
 
-def test_auto_double_does_not_fire_below_minimum_sample(ladder_db, stub_venture):
+def test_auto_double_does_not_fire_below_minimum_sample(ladder_db, cell_stage_venture):
     """8% of a dozen sends is one reply — noise, not signal."""
     sends = AUTO_DOUBLE_MIN_SAMPLE - 1
-    _seed_traffic(ladder_db, stub_venture, sends=sends, replies=sends)  # 100% reply rate
+    _seed_traffic(ladder_db, cell_stage_venture, sends=sends, replies=sends)  # 100% reply rate
 
-    result = venture_ladder.maybe_auto_double(ladder_db, stub_venture)
+    result = venture_ladder.maybe_auto_double(ladder_db, cell_stage_venture)
     assert not result.fired
     assert "sample too small" in result.reason
     assert ladder_db.execute(
         text("SELECT relay_daily_ceiling FROM ventures WHERE venture_key = :k"),
-        {"k": stub_venture},
+        {"k": cell_stage_venture},
     ).scalar_one() == 20
 
 
-def test_auto_double_does_not_fire_at_or_below_threshold(ladder_db, stub_venture):
+def test_auto_double_does_not_fire_at_or_below_threshold(ladder_db, cell_stage_venture):
     sends = AUTO_DOUBLE_MIN_SAMPLE
     replies = int(sends * AUTO_DOUBLE_REPLY_RATE_PCT / 100)  # exactly 8%
-    _seed_traffic(ladder_db, stub_venture, sends=sends, replies=replies)
+    _seed_traffic(ladder_db, cell_stage_venture, sends=sends, replies=replies)
 
-    result = venture_ladder.maybe_auto_double(ladder_db, stub_venture)
+    result = venture_ladder.maybe_auto_double(ladder_db, cell_stage_venture)
     assert not result.fired
     assert "does not exceed" in result.reason
 
 
-def test_auto_double_respects_the_cooldown(ladder_db, stub_venture):
+def test_auto_double_respects_the_cooldown(ladder_db, cell_stage_venture):
     """Doubling twice in a week on a warming domain is how a sender gets
     blacklisted, and lowering the number back does not undo it."""
     sends = AUTO_DOUBLE_MIN_SAMPLE
-    _seed_traffic(ladder_db, stub_venture, sends=sends, replies=int(sends * 0.15))
+    _seed_traffic(ladder_db, cell_stage_venture, sends=sends, replies=int(sends * 0.15))
 
-    first = venture_ladder.maybe_auto_double(ladder_db, stub_venture)
+    first = venture_ladder.maybe_auto_double(ladder_db, cell_stage_venture)
     assert first.fired
 
-    second = venture_ladder.maybe_auto_double(ladder_db, stub_venture)
+    second = venture_ladder.maybe_auto_double(ladder_db, cell_stage_venture)
     assert not second.fired
     assert "cooldown" in second.reason
     assert ladder_db.execute(
         text("SELECT relay_daily_ceiling FROM ventures WHERE venture_key = :k"),
-        {"k": stub_venture},
+        {"k": cell_stage_venture},
     ).scalar_one() == first.new_ceiling
 
 
-def test_auto_double_fires_again_once_the_cooldown_elapses(ladder_db, stub_venture):
+def test_auto_double_fires_again_once_the_cooldown_elapses(ladder_db, cell_stage_venture):
     sends = AUTO_DOUBLE_MIN_SAMPLE
-    _seed_traffic(ladder_db, stub_venture, sends=sends, replies=int(sends * 0.15))
+    _seed_traffic(ladder_db, cell_stage_venture, sends=sends, replies=int(sends * 0.15))
 
-    first = venture_ladder.maybe_auto_double(ladder_db, stub_venture)
+    first = venture_ladder.maybe_auto_double(ladder_db, cell_stage_venture)
     assert first.fired
 
     later = datetime.now(timezone.utc) + timedelta(days=AUTO_DOUBLE_COOLDOWN_DAYS + 1)
-    second = venture_ladder.maybe_auto_double(ladder_db, stub_venture, now=later)
+    second = venture_ladder.maybe_auto_double(ladder_db, cell_stage_venture, now=later)
     assert second.fired
     assert second.new_ceiling == first.new_ceiling * AUTO_DOUBLE_MULTIPLIER
 
 
-def test_auto_double_is_bounded_by_the_max_ceiling(ladder_db, stub_venture):
+def test_auto_double_is_bounded_by_the_max_ceiling(ladder_db, cell_stage_venture):
     ladder_db.execute(
         text("UPDATE ventures SET relay_daily_ceiling = :c WHERE venture_key = :k"),
-        {"c": AUTO_DOUBLE_MAX_CEILING, "k": stub_venture},
+        {"c": AUTO_DOUBLE_MAX_CEILING, "k": cell_stage_venture},
     )
     sends = AUTO_DOUBLE_MIN_SAMPLE
-    _seed_traffic(ladder_db, stub_venture, sends=sends, replies=int(sends * 0.15))
+    _seed_traffic(ladder_db, cell_stage_venture, sends=sends, replies=int(sends * 0.15))
 
-    result = venture_ladder.maybe_auto_double(ladder_db, stub_venture)
+    result = venture_ladder.maybe_auto_double(ladder_db, cell_stage_venture)
     assert not result.fired
     assert "cap" in result.reason
 
 
-def test_auto_double_clamps_rather_than_overshooting_the_cap(ladder_db, stub_venture):
+def test_auto_double_clamps_rather_than_overshooting_the_cap(ladder_db, cell_stage_venture):
     just_under = AUTO_DOUBLE_MAX_CEILING - 1
     ladder_db.execute(
         text("UPDATE ventures SET relay_daily_ceiling = :c WHERE venture_key = :k"),
-        {"c": just_under, "k": stub_venture},
+        {"c": just_under, "k": cell_stage_venture},
     )
     sends = AUTO_DOUBLE_MIN_SAMPLE
-    _seed_traffic(ladder_db, stub_venture, sends=sends, replies=int(sends * 0.15))
+    _seed_traffic(ladder_db, cell_stage_venture, sends=sends, replies=int(sends * 0.15))
 
-    result = venture_ladder.maybe_auto_double(ladder_db, stub_venture)
+    result = venture_ladder.maybe_auto_double(ladder_db, cell_stage_venture)
     assert result.fired
     assert result.new_ceiling == AUTO_DOUBLE_MAX_CEILING
 
 
-def test_auto_double_blocked_by_send_failures(ladder_db, stub_venture):
+def test_auto_double_blocked_by_send_failures(ladder_db, cell_stage_venture):
     """A high reply rate next to a high failure rate means the list is dirty,
     not that the copy is good."""
     sends = AUTO_DOUBLE_MIN_SAMPLE
-    _seed_traffic(ladder_db, stub_venture, sends=sends, replies=int(sends * 0.15))
+    _seed_traffic(ladder_db, cell_stage_venture, sends=sends, replies=int(sends * 0.15))
     # Flip a tenth of the dispatched rows to failed — far above the 2% cap.
     ladder_db.execute(
         text("""
@@ -846,11 +976,11 @@ def test_auto_double_blocked_by_send_failures(ladder_db, stub_venture):
                   WHERE venture_key = :k ORDER BY id LIMIT :n
               )
         """),
-        {"k": stub_venture, "n": max(1, sends // 10)},
+        {"k": cell_stage_venture, "n": max(1, sends // 10)},
     )
     ladder_db.flush()
 
-    result = venture_ladder.maybe_auto_double(ladder_db, stub_venture)
+    result = venture_ladder.maybe_auto_double(ladder_db, cell_stage_venture)
     assert not result.fired
     assert "failure rate" in result.reason
 
@@ -885,58 +1015,82 @@ def test_cell_reply_rates_only_count_dispatched_drafts(ladder_db, stub_venture):
 # ── per-cell auto-double ─────────────────────────────────────────────────────
 
 
-def test_cell_auto_double_raises_only_that_cells_multiplier(ladder_db, stub_venture):
+def test_cell_auto_double_raises_only_that_cells_multiplier(ladder_db, cell_stage_venture):
     sends = AUTO_DOUBLE_MIN_SAMPLE
     _seed_traffic(
-        ladder_db, stub_venture, sends=sends, replies=int(sends * 0.15),
+        ladder_db, cell_stage_venture, sends=sends, replies=int(sends * 0.15),
         cell_id="founder_tier_blitz",
     )
 
     result = venture_ladder.maybe_auto_double_cell(
-        ladder_db, stub_venture, "founder_tier_blitz"
+        ladder_db, cell_stage_venture, "founder_tier_blitz"
     )
     assert result.fired
     assert result.previous_multiplier == 1
     assert result.new_multiplier == AUTO_DOUBLE_MULTIPLIER
 
-    multipliers = venture_ladder.cell_production_multipliers(ladder_db, stub_venture)
+    multipliers = venture_ladder.cell_production_multipliers(ladder_db, cell_stage_venture)
     assert multipliers == {"founder_tier_blitz": AUTO_DOUBLE_MULTIPLIER}
 
 
-def test_cell_auto_double_does_not_touch_the_venture_ceiling(ladder_db, stub_venture):
+def test_cell_auto_double_does_not_touch_the_venture_ceiling(ladder_db, cell_stage_venture):
     """The cell rule is a production knob. There is exactly one send cap in this
     system and the mix shift happens underneath it."""
     sends = AUTO_DOUBLE_MIN_SAMPLE
-    _seed_traffic(ladder_db, stub_venture, sends=sends, replies=int(sends * 0.15))
+    _seed_traffic(ladder_db, cell_stage_venture, sends=sends, replies=int(sends * 0.15))
 
-    venture_ladder.maybe_auto_double_cell(ladder_db, stub_venture, "founder_tier_blitz")
+    venture_ladder.maybe_auto_double_cell(ladder_db, cell_stage_venture, "founder_tier_blitz")
     assert ladder_db.execute(
         text("SELECT relay_daily_ceiling FROM ventures WHERE venture_key = :k"),
-        {"k": stub_venture},
+        {"k": cell_stage_venture},
     ).scalar_one() == 20
 
 
-def test_cell_auto_double_respects_its_own_cooldown(ladder_db, stub_venture):
+def test_cell_auto_double_respects_its_own_cooldown(ladder_db, cell_stage_venture):
     sends = AUTO_DOUBLE_MIN_SAMPLE
-    _seed_traffic(ladder_db, stub_venture, sends=sends, replies=int(sends * 0.15))
+    _seed_traffic(ladder_db, cell_stage_venture, sends=sends, replies=int(sends * 0.15))
 
     assert venture_ladder.maybe_auto_double_cell(
-        ladder_db, stub_venture, "founder_tier_blitz"
+        ladder_db, cell_stage_venture, "founder_tier_blitz"
     ).fired
     second = venture_ladder.maybe_auto_double_cell(
-        ladder_db, stub_venture, "founder_tier_blitz"
+        ladder_db, cell_stage_venture, "founder_tier_blitz"
     )
     assert not second.fired
     assert "cooldown" in second.reason
 
 
-def test_cell_auto_double_declines_an_unknown_cell(ladder_db, stub_venture):
+def test_cell_auto_double_declines_an_unknown_cell(ladder_db, cell_stage_venture):
+    sends = AUTO_DOUBLE_MIN_SAMPLE
+    _seed_traffic(ladder_db, cell_stage_venture, sends=sends, replies=int(sends * 0.15))
+
+    result = venture_ladder.maybe_auto_double_cell(ladder_db, cell_stage_venture, "no_such_cell")
+    assert not result.fired
+    assert "sample too small" in result.reason
+
+
+def test_cell_auto_double_declines_an_inactive_venture(ladder_db, stub_venture):
+    _set_stage(ladder_db, stub_venture, "cell")
     sends = AUTO_DOUBLE_MIN_SAMPLE
     _seed_traffic(ladder_db, stub_venture, sends=sends, replies=int(sends * 0.15))
 
-    result = venture_ladder.maybe_auto_double_cell(ladder_db, stub_venture, "no_such_cell")
+    result = venture_ladder.maybe_auto_double_cell(ladder_db, stub_venture, "founder_tier_blitz")
     assert not result.fired
-    assert "sample too small" in result.reason
+    assert "not active" in result.reason
+
+
+def test_cell_auto_double_declines_before_the_cell_stage(ladder_db, stub_venture):
+    ladder_db.execute(
+        text("UPDATE ventures SET is_active = true WHERE venture_key = :k"),
+        {"k": stub_venture},
+    )
+    _set_stage(ladder_db, stub_venture, "pilot")
+    sends = AUTO_DOUBLE_MIN_SAMPLE
+    _seed_traffic(ladder_db, stub_venture, sends=sends, replies=int(sends * 0.15))
+
+    result = venture_ladder.maybe_auto_double_cell(ladder_db, stub_venture, "founder_tier_blitz")
+    assert not result.fired
+    assert "below 'cell'" in result.reason
 
 
 # ── Clone-Pack wiring ────────────────────────────────────────────────────────

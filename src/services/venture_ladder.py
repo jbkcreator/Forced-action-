@@ -47,6 +47,7 @@ from sqlalchemy.orm import Session
 from config.venture_ladder import (
     AUTO_DOUBLE_CELL_MAX_MULTIPLIER,
     AUTO_DOUBLE_COOLDOWN_DAYS,
+    AUTO_DOUBLE_ELIGIBLE_STAGES,
     AUTO_DOUBLE_MAX_CEILING,
     AUTO_DOUBLE_MAX_SEND_FAILURE_PCT,
     AUTO_DOUBLE_MIN_SAMPLE,
@@ -587,6 +588,7 @@ SELECT
     e.payload->>'amount_cents'       AS amount_cents,
     e.payload->>'stripe_customer_id' AS stripe_customer_id,
     e.payload->>'contact_ref'        AS contact_ref,
+    e.source_ref,
     e.verified,
     e.recorded_at >= now() - make_interval(days => :max_age) AS in_date,
     EXISTS (
@@ -661,8 +663,21 @@ def presell_gate_status(db: Session, venture_key: str) -> PresellStatus:
             )
             continue
 
+        # Explicit branches, not `customer or f"contact:{...}" or f"row:{index}"` —
+        # that chain always produced a truthy "contact:" string (the prefix makes
+        # it non-empty even with nothing after the colon), so every commitment
+        # missing BOTH fields collapsed into that one bucket and the row/index
+        # fallback could never be reached.
         customer = (row.stripe_customer_id or "").strip()
-        identity = customer or f"contact:{(row.contact_ref or '').strip()}" or f"row:{index}"
+        contact = (row.contact_ref or "").strip()
+        if customer:
+            identity = f"stripe:{customer}"
+        elif contact:
+            identity = f"contact:{contact}"
+        elif row.source_ref:
+            identity = f"source:{row.source_ref}"
+        else:
+            identity = f"row:{index}"
         if identity in seen:
             rejected.append(
                 "second commitment from a customer already counted ignored — "
@@ -811,19 +826,32 @@ def advance(
         )
         return evaluation
 
+    # Reaching TERMINAL_STAGE (portfolio) is the explicitly-approved go-live
+    # transition — the venture is folded into fleet reporting as a real
+    # business from here. A venture that reached this rung without ever going
+    # through venture_provisioning --apply (which sets is_active=true itself)
+    # would otherwise pass every rung, including spin_up, while still resolving
+    # to the CL3 env fallback: Relay would send using the DEFAULT venture's
+    # campaign/sender/kill-switch instead of this one's own, which is exactly
+    # the cross-venture-sending failure the ladder exists to prevent.
+    # `is_active OR :activate` never DEACTIVATES a venture that was already on.
+    activates = evaluation.next_stage == TERMINAL_STAGE
     db.execute(
         text("""
             UPDATE ventures
-            SET ladder_stage = :to_stage, ladder_entered_at = now()
+            SET ladder_stage = :to_stage,
+                ladder_entered_at = now(),
+                is_active = is_active OR :activate
             WHERE venture_key = :key
         """),
-        {"key": venture_key, "to_stage": evaluation.next_stage},
+        {"key": venture_key, "to_stage": evaluation.next_stage, "activate": activates},
     )
     _invalidate(venture_key)
 
     logger.info(
-        "[venture_ladder] %s advanced %s -> %s by %s",
+        "[venture_ladder] %s advanced %s -> %s by %s%s",
         venture_key, evaluation.current_stage, evaluation.next_stage, recorded_actor,
+        " (activated)" if activates else "",
     )
     return LadderEvaluation(
         venture_key=venture_key,
@@ -923,6 +951,31 @@ def _cooldown_remaining_days(
     return round(AUTO_DOUBLE_COOLDOWN_DAYS - elapsed_days, 2)
 
 
+def _ineligible_for_auto_double(row) -> Optional[str]:
+    """None if this venture may be considered for auto-double at all, else the
+    reason it may not.
+
+    The evaluator calls maybe_auto_double()/maybe_auto_double_cell() for every
+    venture on every pass regardless of what rung it is clear to ADVANCE to —
+    without this, a pilot- or unit_economics-stage venture with a qualifying
+    reply rate would have its send volume (or a cell's production count)
+    scaled up before it cleared the gates that say scaling is safe. `cell` is
+    literally the rung named for "auto-double lives here" (config/venture_ladder
+    .py:CLONE_PACK_IO), so eligibility starts there. `is_active` is a second,
+    independent check: an inactive row is a radar candidate that got advanced
+    without ever going through venture_provisioning (which sets is_active on
+    its own), and scaling a venture Relay does not even resolve is meaningless.
+    """
+    if not row.is_active:
+        return "venture is not active — auto-double does not apply to a radar candidate"
+    if row.ladder_stage not in AUTO_DOUBLE_ELIGIBLE_STAGES:
+        return (
+            f"venture is at stage {row.ladder_stage!r}, below 'cell' — it has not "
+            "yet cleared the gates that say scaling is safe"
+        )
+    return None
+
+
 def _send_failure_pct(db: Session, venture_key: str) -> Optional[float]:
     row = db.execute(
         text(_CELL_STAGE_METRICS),
@@ -976,6 +1029,14 @@ def maybe_auto_double(
     """
     now = now or datetime.now(timezone.utc)
     row = _ladder_row(db, venture_key)
+
+    ineligible = _ineligible_for_auto_double(row)
+    if ineligible is not None:
+        logger.info("[venture_ladder] auto-double declined for %s: %s", venture_key, ineligible)
+        return AutoDoubleResult(
+            venture_key=venture_key, fired=False, reason=ineligible,
+            previous_ceiling=row.relay_daily_ceiling,
+        )
 
     stats = cell_reply_rates(db, venture_key, window_days=AUTO_DOUBLE_WINDOW_DAYS)
     sends = sum(cell.sends for cell in stats.values())
@@ -1103,6 +1164,17 @@ def maybe_auto_double_cell(
     """
     now = now or datetime.now(timezone.utc)
     row = _ladder_row(db, venture_key)
+
+    ineligible = _ineligible_for_auto_double(row)
+    if ineligible is not None:
+        logger.info(
+            "[venture_ladder] cell auto-double declined for %s/%s: %s",
+            venture_key, cell_id, ineligible,
+        )
+        return AutoDoubleResult(
+            venture_key=venture_key, fired=False, reason=ineligible, scope="cell",
+            cell_id=cell_id,
+        )
 
     stats = cell_reply_rates(db, venture_key, window_days=AUTO_DOUBLE_WINDOW_DAYS)
     cell = stats.get(cell_id)

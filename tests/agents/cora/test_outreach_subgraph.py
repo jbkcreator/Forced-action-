@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import uuid
 from datetime import timedelta
 
 import pytest
+from sqlalchemy import text
 
 from config.cora_cell_grid import get_cell
+from config.venture_template import DEFAULT_VENTURE_KEY
 from src.agents.cora import store
 from src.agents.cora.subgraphs import outreach
 from tests.agents.cora.conftest import compose_result
@@ -162,6 +165,103 @@ def test_invalid_cell_id_fails(not_suppressed_db, mock_claude):
     )
     assert result["terminal_status"] == "failed"
     assert result["reject_reason"] == "invalid_cell_id"
+
+
+# ── venture_key attribution (CLONE-v2.2 / CL4) ──────────────────────────────
+
+
+def test_draft_is_attributed_to_the_targets_own_venture_not_the_default(
+    not_suppressed_db, mock_claude
+):
+    """Issue: OutboundDraftRecord.venture_key defaulted to the primary venture
+    because no draft-creation path ever passed one, so a second venture's
+    drafts (and its reply rate — cell_reply_rates, which auto-double reads)
+    were silently misattributed."""
+    venture_key = f"test_outreach_{uuid.uuid4().hex[:8]}"
+    county_id = f"{venture_key}_county"
+    not_suppressed_db.execute(
+        text("INSERT INTO ventures (venture_key, display_name, brand_name, is_active) "
+             "VALUES (:k, 'Second Venture', 'Second Venture', true)"),
+        {"k": venture_key},
+    )
+    not_suppressed_db.execute(
+        text("INSERT INTO counties (county_id, display_name, venture_key, zip_prefixes, is_active) "
+             "VALUES (:c, 'Second County', :k, '[]'::jsonb, true)"),
+        {"c": county_id, "k": venture_key},
+    )
+    not_suppressed_db.flush()
+
+    whale = dict(WHALES[2], county_id=county_id)
+    result = _run(whale, not_suppressed_db, mock_claude)
+    assert result["terminal_status"] == "completed"
+
+    draft = store.read_drafts(not_suppressed_db, opportunity_thread_id=whale["opportunity_thread_id"])[0]
+    assert draft["venture_key"] == venture_key
+
+
+def test_second_venture_reply_rate_is_not_attributed_to_the_default_venture(
+    not_suppressed_db, mock_claude
+):
+    """End-to-end: a second-venture target drafted, dispatched, and replied to
+    must show up in ITS venture's cell_reply_rates() and not the default
+    venture's — that per-venture number is what auto-double scales on."""
+    from src.services import venture_ladder
+
+    venture_key = f"test_outreach_{uuid.uuid4().hex[:8]}"
+    county_id = f"{venture_key}_county"
+    not_suppressed_db.execute(
+        text("INSERT INTO ventures (venture_key, display_name, brand_name, is_active) "
+             "VALUES (:k, 'Second Venture', 'Second Venture', true)"),
+        {"k": venture_key},
+    )
+    not_suppressed_db.execute(
+        text("INSERT INTO counties (county_id, display_name, venture_key, zip_prefixes, is_active) "
+             "VALUES (:c, 'Second County', :k, '[]'::jsonb, true)"),
+        {"c": county_id, "k": venture_key},
+    )
+    not_suppressed_db.flush()
+
+    whale = dict(WHALES[3], county_id=county_id)
+    result = _run(whale, not_suppressed_db, mock_claude)
+    assert result["terminal_status"] == "completed"
+
+    not_suppressed_db.execute(
+        text("""
+            INSERT INTO relay_approval_queue (
+                idempotency_key, venture_key, thread_id, channel, recipient,
+                payload, status, dispatched_at
+            ) VALUES (
+                :idem, :k, :thread_id, 'email', 'prospect@example.com',
+                '{}'::jsonb, 'sent', now()
+            )
+        """),
+        {
+            "idem": f"idem-{venture_key}",
+            "k": venture_key,
+            "thread_id": whale["opportunity_thread_id"],
+        },
+    )
+    not_suppressed_db.execute(
+        text("UPDATE outbound_drafts SET replied_at = now() WHERE draft_id = :d"),
+        {"d": result["draft_id"]},
+    )
+    not_suppressed_db.flush()
+
+    stats = venture_ladder.cell_reply_rates(not_suppressed_db, venture_key)
+    assert stats[CELL_ID].sends == 1
+    assert stats[CELL_ID].replies == 1
+
+    # Not attributed to the default venture: cell_reply_rates() is a real DB
+    # query with unrelated production rows already in it, so assert directly
+    # against this thread rather than the venture's aggregate count.
+    leaked = not_suppressed_db.execute(
+        text("""
+            SELECT COUNT(*) FROM outbound_drafts
+            WHERE opportunity_thread_id = :t AND venture_key = :default_key
+        """),
+        {"t": whale["opportunity_thread_id"], "default_key": DEFAULT_VENTURE_KEY},
+    ).scalar_one()
+    assert leaked == 0
 
 
 @pytest.mark.integration

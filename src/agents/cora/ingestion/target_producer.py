@@ -39,6 +39,7 @@ from src.agents.cora.tools.read_tools import (
     get_ranked_whales,
     get_recent_auction_fast_follow_whales,
 )
+from src.services import venture_ladder
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +114,13 @@ def _produce_from_rows(db: Session, cell_id: str, scored: List[Dict[str, Any]]) 
             "facts_used": _facts_for(row),
             "contact_email": contact.get("email"),
             "contact_phone": contact.get("phone"),
+            # Attached per-row from the target's OWN county, not the call's
+            # county_id filter — a fleet-wide sweep (county_id=None) can return
+            # targets belonging to different ventures in the same pass, and
+            # outreach.py's persist node trusts this rather than falling back to
+            # venture #1's key (see store.venture_key_for_county's docstring on
+            # why that silent default is a production bug, not a cosmetic one).
+            "venture_key": store.venture_key_for_county(db, buyer_entity.get("county_id")),
         }
         message_id = queue.publish("target.ready", payload, idempotency_key=_idempotency_key(cell_id, thread_id))
         if message_id is not None:
@@ -120,12 +128,48 @@ def _produce_from_rows(db: Session, cell_id: str, scored: List[Dict[str, Any]]) 
     return produced
 
 
+def _cell_production_limit(db: Session, county_id: Optional[str], cell_id: str, limit: int) -> tuple[int, int]:
+    """`limit`, scaled by this call's venture's recorded cell-level auto-double
+    (src/services/venture_ladder.py:cell_production_multipliers). Returns
+    (scaled_limit, multiplier) so callers can log what happened.
+
+    Scoped by the call's OWN county_id filter, not per-row: a single call is
+    one venture's sweep when county_id is given, and DEFAULT_VENTURE_KEY (the
+    pre-CL3 single-venture behaviour) when it is not — a mixed fleet-wide batch
+    has no single multiplier to apply.
+
+    Wrapped in a savepoint and defaults to no scaling (1x) on any failure —
+    e.g. the CL4 migration (venture_ladder_events) not yet applied in this
+    environment. A bare try/except without begin_nested() would leave the
+    surrounding transaction aborted for every statement after it (the ranked-
+    whales query included), so a missing CL4 table would silently stop target
+    production rather than just skip the multiplier.
+    """
+    try:
+        with db.begin_nested():
+            venture_key = store.venture_key_for_county(db, county_id)
+            multiplier = venture_ladder.cell_production_multipliers(db, venture_key).get(cell_id, 1)
+        return limit * multiplier, multiplier
+    except Exception:  # noqa: BLE001 — a missing multiplier must never block target production
+        logger.warning(
+            "target_producer: could not resolve the cell production multiplier for "
+            "cell=%s county_id=%s — producing at the unscaled limit (%d)",
+            cell_id, county_id, limit, exc_info=True,
+        )
+        return limit, 1
+
+
 def produce_targets(db: Session, limit: int = 25, county_id: Optional[str] = None) -> List[str]:
     """founder_tier_blitz cell. Returns the opportunity_thread_ids actually published this pass (skips ones with an active draft already)."""
-    ranked = get_ranked_whales(db, limit=limit, county_id=county_id)
+    scaled_limit, multiplier = _cell_production_limit(db, county_id, FOUNDER_TIER_BLITZ_CELL_ID, limit)
+    ranked = get_ranked_whales(db, limit=scaled_limit, county_id=county_id)
     scored = fallback_ranking.rank_targets(ranked)
     produced = _produce_from_rows(db, FOUNDER_TIER_BLITZ_CELL_ID, scored)
-    logger.info("target_producer: cell=%s produced %d target.ready event(s) out of %d ranked", FOUNDER_TIER_BLITZ_CELL_ID, len(produced), len(scored))
+    logger.info(
+        "target_producer: cell=%s produced %d target.ready event(s) out of %d ranked "
+        "(limit=%d, cell multiplier=%dx)",
+        FOUNDER_TIER_BLITZ_CELL_ID, len(produced), len(scored), scaled_limit, multiplier,
+    )
     return produced
 
 
@@ -133,10 +177,15 @@ def produce_auction_fast_follow_targets(
     db: Session, limit: int = 25, county_id: Optional[str] = None, lookback_days: int = 7,
 ) -> List[str]:
     """auction_fast_follow cell. Read-only; never triggers whale_auction_fast_follow.py's own write path."""
-    rows = get_recent_auction_fast_follow_whales(db, lookback_days=lookback_days, limit=limit, county_id=county_id)
+    scaled_limit, multiplier = _cell_production_limit(db, county_id, AUCTION_FAST_FOLLOW_CELL_ID, limit)
+    rows = get_recent_auction_fast_follow_whales(db, lookback_days=lookback_days, limit=scaled_limit, county_id=county_id)
     scored = fallback_ranking.rank_targets(rows)
     produced = _produce_from_rows(db, AUCTION_FAST_FOLLOW_CELL_ID, scored)
-    logger.info("target_producer: cell=%s produced %d target.ready event(s) out of %d candidates", AUCTION_FAST_FOLLOW_CELL_ID, len(produced), len(scored))
+    logger.info(
+        "target_producer: cell=%s produced %d target.ready event(s) out of %d candidates "
+        "(limit=%d, cell multiplier=%dx)",
+        AUCTION_FAST_FOLLOW_CELL_ID, len(produced), len(scored), scaled_limit, multiplier,
+    )
     return produced
 
 

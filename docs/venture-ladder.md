@@ -61,7 +61,14 @@ Two of these are live reads, not documentation:
 **A radar candidate is an inactive `ventures` row.** That is not bookkeeping: the
 CL3 resolver falls back to env settings for an inactive venture, so an unproven
 candidate structurally cannot govern real sends. One identity and one join key
-all the way up, no promotion step.
+all the way up.
+
+**`advance()` activates the venture on the `spin_up → portfolio` transition** —
+the explicitly-approved go-live rung. `is_active OR :activate` in the same
+`UPDATE` as the stage change, so a candidate that reaches portfolio without
+ever going through `venture_provisioning --apply` (which sets `is_active` on
+its own) still ends up resolving to its own Relay identity rather than
+silently falling back to venture #1's.
 
 ## Gate colours
 
@@ -127,8 +134,11 @@ depositing five times — those are five legitimately distinct PaymentIntents. T
 headcount is therefore computed over unique customers, and only the first
 commitment per customer contributes to the total, so repeat deposits cannot
 clear the money threshold either. A commitment with no `stripe_customer_id`
-falls back to `contact_ref` rather than collapsing every such row into one
-bucket.
+falls back to `contact_ref`, then to its own `source_ref`, rather than
+collapsing every such row into one bucket — the identity is built in explicit
+branches (Stripe customer → non-empty contact ref → source ref), not a bare
+`customer or f"contact:{...}"` chain, since the `"contact:"` prefix alone made
+that chain always truthy and unreachable past the first fallback.
 
 The exclusion is scoped to *other* ventures: someone who only ever subscribed to
 **this** venture is still valid demand for it.
@@ -171,6 +181,25 @@ response.
 
 There is exactly **one** send cap in this system. The cell rule shifts the mix
 underneath it; it is not a second ceiling.
+
+**Eligibility gates both levels first.** Neither rule looks at reply rate at
+all until the venture is `is_active` AND at `cell` or later
+(`AUTO_DOUBLE_ELIGIBLE_STAGES` in `config/venture_ladder.py`) — the evaluator
+calls `maybe_auto_double()`/`maybe_auto_double_cell()` for every venture on
+every pass regardless of what rung it is clear to *advance* to, so without
+this a pilot- or unit_economics-stage venture with a qualifying reply rate
+could have its ceiling (or a cell's production count) scaled up before it
+cleared the gates that say scaling is safe. Checked in the service functions
+themselves (never just the evaluator), so nothing that calls them directly —
+the acceptance harness included — can skip it either.
+
+The cell-level rule is wired into the evaluator too: it calls
+`maybe_auto_double_cell()` for every cell `cell_reply_rates()` returns traffic
+for, and `target_producer.produce_targets()` /
+`produce_auction_fast_follow_targets()` multiply their `limit` by
+`cell_production_multipliers()` before ranking — the multiplier is scoped to
+the call's own `county_id` (one venture's sweep), or `DEFAULT_VENTURE_KEY` when
+`county_id` is unset (the pre-CL3, fleet-wide sweep).
 
 Every guard is load-bearing:
 
