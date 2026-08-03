@@ -307,7 +307,7 @@ class TestFallbackVariation:
             "first_name": "Mike",
             "zip_code": "33647",
             "active_lead_count": 8,
-            "unlock_link": "https://app.forcedaction.io/feed/1",
+            "unlock_link": "https://app.forcedactionleads.com/feed/1",
         }
         default_ctx = {**roofing_ctx, "vertical": "wholesalers"}
 
@@ -326,7 +326,7 @@ class TestFallbackVariation:
             "first_name": "Sarah",
             "zip_code": "34638",
             "active_lead_count": 5,
-            "unlock_link": "https://app.forcedaction.io/feed/2",
+            "unlock_link": "https://app.forcedactionleads.com/feed/2",
         }
         default_ctx = {**attorney_ctx, "vertical": "wholesalers"}
 
@@ -344,7 +344,7 @@ class TestFallbackVariation:
             "first_name": "John",
             "zip_code": "33701",
             "active_lead_count": 4,
-            "unlock_link": "https://app.forcedaction.io/feed/3",
+            "unlock_link": "https://app.forcedactionleads.com/feed/3",
         }
         default_ctx = {**pa_ctx, "vertical": "wholesalers"}
 

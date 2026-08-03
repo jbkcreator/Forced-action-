@@ -30,7 +30,7 @@ voicemail_action: "leave_message"
 
 # ── Webhook (post-call) ───────────────────────────────────────
 webhook:
-  url: "https://YOUR_DOMAIN/webhooks/synthflow"
+  url: "https://forcedactionleads.com/webhooks/synthflow"
   method: POST
 
 # ── Tools ────────────────────────────────────────────────────
@@ -42,7 +42,7 @@ tools:
       bridge — so the count is fresh. ZIP and vertical are pre-loaded from
       variables; do NOT ask the subscriber for them.
     method: GET
-    url: "https://YOUR_DOMAIN/api/synthflow/lead-count"
+    url: "https://forcedactionleads.com/api/synthflow/lead-count"
     parameters:
       zip_code:
         type: string

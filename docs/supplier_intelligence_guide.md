@@ -107,7 +107,7 @@ No separate webhook secret. Supplier Intelligence events are identified by `meta
    }
    ```
 2. Response includes `access_token` (UUID) — share with supplier for dashboard access
-3. Dashboard URL: `https://app.forcedaction.io/supplier/{access_token}`
+3. Dashboard URL: `https://app.forcedactionleads.com/supplier/{access_token}`
 4. Create Stripe checkout to activate subscription (or set up manually in Stripe dashboard)
 
 ---

@@ -7,7 +7,6 @@ Endpoints:
     GET  /api/founding-spots       — Founding countdown for landing page
     GET  /api/zip-check            — ZIP availability checker for landing page
     POST /api/checkout             — Create Stripe checkout session
-    GET  /api/test/starter-checkout-link — TEMP: mints a fresh live Starter checkout link on each visit
     GET  /api/feed/{uuid}          — Event Feed for subscribers (paginated leads, sort, search, filter)
     GET  /api/feed/{uuid}/stats    — Aggregate stats for the subscriber's feed
     POST /api/resend-confirmation  — Re-send welcome/confirmation email by feed_uuid
@@ -1322,65 +1321,6 @@ def create_checkout(payload: CheckoutRequest, request: Request, db: Session = De
         "amount_total_cents": session.amount_total,
         "is_founding": is_founding,
     }
-
-
-# ---------------------------------------------------------------------------
-# GET /api/test/starter-checkout-link — E2E test router (temporary)
-#
-# A stable, non-expiring URL for manual click-through testing of the Starter
-# purchase path. Stripe Checkout Session URLs expire (hosted-mode sessions
-# max out at 24h), so a link to this endpoint mints a fresh live session on
-# every visit and redirects into it — the endpoint URL itself never goes stale.
-# Hardcodes tier=starter/vertical=roofing so a query-string caller can't spin
-# up a higher-priced live session; only the ZIP is caller-supplied.
-# Remove once the manual live-checkout E2E test is done.
-# ---------------------------------------------------------------------------
-
-@app.get("/api/test/starter-checkout-link")
-def starter_checkout_test_link(
-    zip_code: str = Query(..., alias="zip"),
-    county_id: str = Query("hillsborough"),
-    db: Session = Depends(get_db),
-):
-    if not _ZIP_RE.match(zip_code):
-        raise HTTPException(status_code=400, detail={"error": "invalid_zip", "message": "zip must be 5 digits"})
-
-    _s = get_settings()
-    stripe.api_key = _s.active_stripe_secret_key.get_secret_value()
-
-    try:
-        price_id, _ = get_price_id_for_checkout(db, "starter", "roofing", county_id, "monthly")
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail={"error": "invalid_configuration", "message": str(e)})
-    except OperationalError:
-        logger.error("DB error resolving price for starter test checkout link", exc_info=True)
-        raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
-
-    try:
-        session = stripe.checkout.Session.create(
-            mode="subscription",
-            ui_mode="hosted",
-            line_items=[{"price": price_id, "quantity": 1}],
-            allow_promotion_codes=True,
-            phone_number_collection={"enabled": True},
-            success_url=f"{_s.app_base_url}/success?session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{_s.app_base_url}/",
-            metadata={
-                "tier": "starter",
-                "vertical": "roofing",
-                "county_id": county_id,
-                "zip_codes": zip_code,
-                "manual_test_link": "true",
-            },
-        )
-    except stripe.error.StripeError as e:
-        logger.error("Stripe error creating starter test checkout link: %s", str(e), exc_info=True)
-        raise HTTPException(
-            status_code=502,
-            detail={"error": "payment_gateway_error", "message": "Payment gateway error — please try again"},
-        )
-
-    return RedirectResponse(url=session.url, status_code=307)
 
 
 # ---------------------------------------------------------------------------
@@ -7006,7 +6946,7 @@ def wallet_topup_endpoint(
     if sub.status == "disputed":
         raise HTTPException(
             status_code=403,
-            detail="Account on hold for review. Email support@forcedaction.io.",
+            detail="Account on hold for review. Email support@forcedactionleads.com.",
         )
 
     credits = WALLET_TOPUP_PACKAGES[req.amount_cents]
@@ -7273,7 +7213,7 @@ def premium_purchase_endpoint(
     if sub.status == "disputed":
         raise HTTPException(
             status_code=403,
-            detail="Account on hold for review. Email support@forcedaction.io.",
+            detail="Account on hold for review. Email support@forcedactionleads.com.",
         )
 
     cfg = PREMIUM_CREDITS[req.sku]

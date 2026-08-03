@@ -145,7 +145,7 @@ def _node_build_compose_context(state: NWSUrgencyState) -> Dict[str, Any]:
         "alert_headline": payload.get("headline", payload.get("event", "")),
         "area_desc": payload.get("area_desc", "")[:300],
         "alert_expires": payload.get("expires", ""),
-        "unlock_link": f"https://app.forcedaction.io/feed/{profile.get('id')}",
+        "unlock_link": f"https://app.forcedactionleads.com/feed/{profile.get('id')}",
         "revenue_signal_score": state.get("revenue_signal_score", 0),
     }
 

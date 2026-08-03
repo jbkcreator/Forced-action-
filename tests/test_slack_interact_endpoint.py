@@ -141,6 +141,18 @@ def test_replay_attack_rejected(app_client):
     assert resp.status_code == 401
 
 
+def test_empty_approvers_rejects_every_user(app_client, monkeypatch):
+    """The default COUNTY_LAUNCH_APPROVERS=[] must NOT mean 'anyone is
+    authorized' -- it must mean nobody is, until the list is explicitly
+    configured. Mirrors tests/test_relay_slack_endpoints.py's equivalent
+    coverage for RELAY_APPROVERS (PR #179 finding #3), which this endpoint
+    hadn't received until the /slack/interact merge fixed the fail-open bug."""
+    monkeypatch.setattr("src.api.admin_router.settings.county_launch_approvers", [])
+    resp = _make_signed_request(app_client, _make_payload("U_ANYONE", 1, "approve"))
+    assert resp.status_code == 200
+    assert "Not authorized" in resp.json()["text"]
+
+
 def test_double_click_idempotent(app_and_client, monkeypatch):
     app, client = app_and_client
     candidate = MagicMock()

@@ -328,7 +328,7 @@ def send_welcome_email(subscriber, magic_link_url: Optional[str] = None, db=None
         f"{magic_link_note_text}"
         f"New distressed property leads matching your territory and vertical will appear "
         f"here automatically as our scrapers run each day.\n\n"
-        f"Questions? Reply to this email or reach us at support@forcedaction.io\n\n"
+        f"Questions? Reply to this email or reach us at support@forcedactionleads.com\n\n"
         f"— Forced Action Team"
     )
 
@@ -391,8 +391,8 @@ def send_welcome_email(subscriber, magic_link_url: Optional[str] = None, db=None
             {magic_link_note_html}
             <p style="margin:0;font-size:13px;color:#64748b;">
               Questions? Reply to this email or reach us at
-              <a href="mailto:support@forcedaction.io" style="color:#fbbf24;text-decoration:none;">
-                support@forcedaction.io
+              <a href="mailto:support@forcedactionleads.com" style="color:#fbbf24;text-decoration:none;">
+                support@forcedactionleads.com
               </a>
             </p>
           </td>
@@ -401,7 +401,7 @@ def send_welcome_email(subscriber, magic_link_url: Optional[str] = None, db=None
           <td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.08);
                      font-size:12px;color:#475569;text-align:center;">
             Forced Action &mdash; Hillsborough County Property Intelligence<br/>
-            <a href="{_settings.app_base_url}" style="color:#475569;">forcedaction.io</a>
+            <a href="{_settings.app_base_url}" style="color:#475569;">forcedactionleads.com</a>
           </td>
         </tr>
       </table>
@@ -478,7 +478,7 @@ def send_upgrade_confirmation_email(subscriber, db=None) -> bool:
         f"{founding_line}\n"
         f"Your new territory is locked and new leads will start appearing in your feed:\n"
         f"{feed_url}\n\n"
-        f"Questions? Reply to this email or reach us at support@forcedaction.io\n\n"
+        f"Questions? Reply to this email or reach us at support@forcedactionleads.com\n\n"
         f"— Forced Action Team"
     )
 
@@ -532,8 +532,8 @@ def send_upgrade_confirmation_email(subscriber, db=None) -> bool:
             </table>
             <p style="margin:0;font-size:13px;color:#64748b;">
               Questions? Reply to this email or reach us at
-              <a href="mailto:support@forcedaction.io" style="color:#fbbf24;text-decoration:none;">
-                support@forcedaction.io
+              <a href="mailto:support@forcedactionleads.com" style="color:#fbbf24;text-decoration:none;">
+                support@forcedactionleads.com
               </a>
             </p>
           </td>
@@ -542,7 +542,7 @@ def send_upgrade_confirmation_email(subscriber, db=None) -> bool:
           <td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.08);
                      font-size:12px;color:#475569;text-align:center;">
             Forced Action &mdash; Hillsborough County Property Intelligence<br/>
-            <a href="{_settings.app_base_url}" style="color:#475569;">forcedaction.io</a>
+            <a href="{_settings.app_base_url}" style="color:#475569;">forcedactionleads.com</a>
           </td>
         </tr>
       </table>

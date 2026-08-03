@@ -119,7 +119,7 @@ def _send_day1(sub: Subscriber, db) -> None:
             f"We weren't able to process your Forced Action payment. "
             f"Update your card to keep your territories locked:\n\n"
             f"{feed_url}\n\n"
-            f"Questions? support@forcedaction.io\n\n— Forced Action Team"
+            f"Questions? support@forcedactionleads.com\n\n— Forced Action Team"
         )
 
     send_email(to=sub.email, subject=subject, body_text=body_text)
@@ -237,7 +237,7 @@ def _send_day5(sub: Subscriber, db) -> None:
             f"Our Data-Only plan lets you keep your territory and full property data feed "
             f"at just ${price}/mo — no enrichment fees, cancel anytime.\n\n"
             f"Switch now:\n{feed_url}\n\n"
-            f"Questions? support@forcedaction.io\n\n— Forced Action Team"
+            f"Questions? support@forcedactionleads.com\n\n— Forced Action Team"
         )
 
     send_email(to=sub.email, subject=subject, body_text=body_text)

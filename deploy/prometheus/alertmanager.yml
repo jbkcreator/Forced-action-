@@ -1,6 +1,8 @@
 global:
   resolve_timeout: 5m
-  # Slack fallback (matches existing lifecycle_incident_slack_channel pattern)
+  # Placeholder — rendered from ALERTMANAGER_SLACK_WEBHOOK_URL (.env) by
+  # deploy.sh / scripts/install_prometheus.sh. Never edit this file in place
+  # on a server; edit here and redeploy, or the next deploy overwrites it.
   slack_api_url: "https://hooks.slack.com/services/REPLACE_ME"
 
 route:
@@ -30,6 +32,7 @@ receivers:
         send_resolved: false
         http_config:
           authorization:
+            # Placeholder — rendered from PROMETHEUS_ALERT_WEBHOOK_SECRET (.env).
             credentials: "prom-wh-s3cr3t-fa-stage10"
         max_alerts: 10
 
