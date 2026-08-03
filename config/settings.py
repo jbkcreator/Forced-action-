@@ -600,6 +600,13 @@ class AppSettings(BaseSettings):
 	cora_throughput_approvers: list = Field(default=[], env="CORA_THROUGHPUT_APPROVERS")
 	cora_batch_expiry_hours: int = Field(default=72, env="CORA_BATCH_EXPIRY_HOURS", description="Hours before a pending Cora draft batch auto-expires. Override via env var.")
 
+	# LEARN-v2.2 Layer 4 (Step 12) — lesson-hygiene sweep digest. Reuses
+	# slack_bot_token above. Deliberately its own channel, not
+	# county_launch_slack_channel — a lesson-hygiene digest is not a
+	# county-launch approval and posting it there would surface in the wrong
+	# review surface.
+	learning_hygiene_slack_channel: str = Field(default="", env="LEARNING_HYGIENE_SLACK_CHANNEL")
+
 	# Relay email channel (RELAY-v2.2 sub-task R2). relay_instantly_campaign_id
 	# is set once after running `python -m src.services.relay --setup-email-channel`
 	# (see src/services/relay/channels_email.py) — unset means the email

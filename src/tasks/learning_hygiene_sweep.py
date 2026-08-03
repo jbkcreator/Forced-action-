@@ -34,8 +34,6 @@ from typing import Optional
 from config.learning_hygiene import (
     HYGIENE_EXCLUDED_KINDS,
     HYGIENE_MEASURABLE_DOMAINS,
-    RUN_BLAST_RADIUS_EXCEEDED,
-    RUN_EVIDENCE_UNAVAILABLE,
     RUN_OK,
     RUN_SCHEMA_NOT_READY,
     VERDICT_CONTRADICT,
@@ -53,13 +51,6 @@ from src.core.database import get_db_context
 from src.services.learning_hygiene import HygieneReport, sweep
 
 logger = logging.getLogger(__name__)
-
-# Run statuses that mean "the sweep refused to act", not "the sweep found
-# nothing to do". These must reach a human — a silent refusal is how a broken
-# feed goes unnoticed for a month.
-_ALERTING_RUN_STATUSES = frozenset({
-    RUN_SCHEMA_NOT_READY, RUN_EVIDENCE_UNAVAILABLE, RUN_BLAST_RADIUS_EXCEEDED,
-})
 
 _VERDICT_LABELS: dict[str, str] = {
     VERDICT_CONTRADICT: "contradicted (proven wrong)",
@@ -154,11 +145,11 @@ def _post_digest(digest: str) -> None:
     """Best-effort Slack post. A failed digest must never fail the sweep."""
     settings = get_settings()
     token = settings.slack_bot_token
-    channel = settings.county_launch_slack_channel
+    channel = settings.learning_hygiene_slack_channel
 
     if not token or not channel:
         logger.info(
-            "[LessonHygiene] SLACK_BOT_TOKEN or COUNTY_LAUNCH_SLACK_CHANNEL unset "
+            "[LessonHygiene] SLACK_BOT_TOKEN or LEARNING_HYGIENE_SLACK_CHANNEL unset "
             "— digest logged only"
         )
         return
@@ -188,7 +179,11 @@ def run(
     digest = format_digest(report)
     logger.info("[LessonHygiene] digest:\n%s", digest)
 
-    if post_digest and (report.run_status in _ALERTING_RUN_STATUSES or report.actions):
+    # Always post, not just on a refusal or a mutation. The unmeasurable/
+    # excluded/orphaned counts leading the digest are the whole point of
+    # surfacing this daily — buried in a log instead of a channel, they are
+    # exactly the invisible gap this job exists to prevent.
+    if post_digest:
         _post_digest(digest)
 
     return report.as_dict()

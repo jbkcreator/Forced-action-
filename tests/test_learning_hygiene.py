@@ -25,9 +25,11 @@ import pytest
 from sqlalchemy import text as sa_text
 
 from config import learning_hygiene as cfg
+from config.settings import get_settings
 from src.services import learning_hygiene as svc
 from src.services.learning_hygiene import LessonStats, decide
-from src.tasks.learning_hygiene_sweep import _VERDICT_LABELS, format_digest
+from src.tasks import learning_hygiene_sweep as task_mod
+from src.tasks.learning_hygiene_sweep import _VERDICT_LABELS, format_digest, run
 
 NOW = datetime(2026, 8, 3, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -748,12 +750,25 @@ class TestSweep:
 
     def test_blast_radius_refusal_mutates_nothing(self, learn_db):
         """A run that wants to retire most of the measurable corpus is a bug
-        report, not a result."""
+        report, not a result.
+
+        This is a shared dev DB other work touches concurrently, so the test
+        computes its own margin from a measured baseline rather than assuming
+        today's ambient row count — inserting comfortably more than
+        20% of (baseline + inserted) would ever allow through, at any
+        plausible ambient scale.
+        """
+        baseline = svc.sweep(learn_db, dry_run=True)
+        baseline_measurable = baseline.measurable_population
+
+        n = max(cfg.BLAST_RADIUS_MIN + 2, int(baseline_measurable * 0.5) + 10)
+        suffix = uuid.uuid4().hex[:8]
         lessons = []
-        for i in range(cfg.BLAST_RADIUS_MIN + 2):
-            _insert_ab_test(learn_db, f"hygiene_blast_{i}")
+        for i in range(n):
+            test_name = f"hygiene_blast_{suffix}_{i}"
+            _insert_ab_test(learn_db, test_name)
             lesson = _insert_lesson(
-                learn_db, name=f"blast_{i}", source_id=f"hygiene_blast_{i}",
+                learn_db, name=f"blast_{suffix}_{i}", source_id=test_name,
             )
             for _ in range(3):
                 _insert_decision(
@@ -780,18 +795,30 @@ class TestSweep:
         assert any("not attempted" in n for n in report.notes)
 
     def test_orphaned_lessons_do_not_inflate_the_blast_radius_budget(self, learn_db):
-        """The 7 test-pollution rows in the shared DB are orphaned. If they
-        counted toward the measurable population they would enlarge the
-        mutation budget for lessons that do have evidence."""
-        for i in range(20):
+        """Orphaned lessons (the 7 test-pollution rows in the shared DB among
+        them) must never enlarge the mutation budget for lessons that do have
+        evidence.
+
+        Asserted as a delta against a measured baseline, not an absolute
+        count — this is a shared dev DB other work touches concurrently, and
+        the invariant under test is "orphaned inserts don't move the
+        measurable count", which a baseline delta proves regardless of
+        whatever else is in the corpus today.
+        """
+        baseline = svc.sweep(learn_db, dry_run=True)
+        baseline_measurable = baseline.measurable_population
+        baseline_orphaned = baseline.counts.get(cfg.VERDICT_SKIP_ORPHANED_SOURCE, 0)
+
+        for _ in range(20):
+            suffix = uuid.uuid4().hex[:8]
             _insert_lesson(
-                learn_db, name=f"orph_{i}", source_id=f"orphan_missing_{i}",
+                learn_db, name=f"orph_{suffix}", source_id=f"orphan_missing_{suffix}",
             )
         learn_db.flush()
 
         report = svc.sweep(learn_db, dry_run=True)
-        assert report.counts.get(cfg.VERDICT_SKIP_ORPHANED_SOURCE, 0) >= 20
-        assert report.measurable_population < report.counts[cfg.VERDICT_SKIP_ORPHANED_SOURCE]
+        assert report.counts.get(cfg.VERDICT_SKIP_ORPHANED_SOURCE, 0) >= baseline_orphaned + 20
+        assert report.measurable_population == baseline_measurable
 
 
 class TestDigest:
@@ -823,3 +850,70 @@ class TestDigest:
         digest = format_digest(report)
         assert "apply_lifecycle_playbook_lessons_versioning.py" in digest
         assert "Nothing was touched" in digest
+
+
+class TestDigestPosting:
+    """Regression tests for two bugs an audit pass caught before push:
+
+    1. _post_digest read settings.county_launch_slack_channel — a
+       copy-paste leftover from mirroring county_launch_evaluator.py's
+       pattern. Posting a lesson-hygiene digest into the county-launch
+       approval channel is a wrong-audience bug, not a cosmetic one.
+    2. run() only posted to Slack when report.actions was non-empty or the
+       run_status was alerting. On the actual shared DB today (all 7 lessons
+       orphaned, nothing acting, RUN_OK), that condition is never met, so the
+       "not covered by this sweep" counts — the ones this job's whole
+       argument says must surface or the follow-up ticket never gets filed —
+       were silently buried in a log line instead of reaching the channel.
+    """
+
+    def test_digest_channel_is_its_own_setting_not_county_launch(self, monkeypatch):
+        settings = get_settings()
+        monkeypatch.setattr(settings, "learning_hygiene_slack_channel", "#lesson-hygiene")
+        monkeypatch.setattr(settings, "county_launch_slack_channel", "#county-launch")
+
+        from unittest.mock import MagicMock
+
+        fake_client = MagicMock()
+        fake_module = MagicMock()
+        fake_module.WebClient.return_value = fake_client
+        monkeypatch.setitem(__import__("sys").modules, "slack_sdk", fake_module)
+
+        from pydantic import SecretStr
+        monkeypatch.setattr(settings, "slack_bot_token", SecretStr("xoxb-test"))
+
+        task_mod._post_digest("hello")
+
+        fake_client.chat_postMessage.assert_called_once()
+        assert fake_client.chat_postMessage.call_args.kwargs["channel"] == "#lesson-hygiene"
+
+    def test_no_channel_configured_logs_only_and_never_raises(self, monkeypatch):
+        settings = get_settings()
+        monkeypatch.setattr(settings, "learning_hygiene_slack_channel", "")
+        task_mod._post_digest("hello")  # must not raise
+
+    def test_run_posts_even_when_nothing_acted_and_status_is_ok(self, monkeypatch, learn_db):
+        """The exact bug: RUN_OK + empty actions must still post, because
+        that is the state the live shared DB is in today."""
+        calls = []
+        monkeypatch.setattr(task_mod, "_post_digest", lambda digest: calls.append(digest))
+        monkeypatch.setattr(
+            task_mod, "get_db_context",
+            lambda: __import__("contextlib").nullcontext(learn_db),
+        )
+
+        result = run(dry_run=True, post_digest=True)
+
+        assert result["run_status"] == cfg.RUN_OK
+        assert calls, "digest must post even when run_status is OK and nothing acted"
+
+    def test_run_does_not_post_when_post_digest_false(self, monkeypatch, learn_db):
+        calls = []
+        monkeypatch.setattr(task_mod, "_post_digest", lambda digest: calls.append(digest))
+        monkeypatch.setattr(
+            task_mod, "get_db_context",
+            lambda: __import__("contextlib").nullcontext(learn_db),
+        )
+
+        run(dry_run=True, post_digest=False)
+        assert not calls
