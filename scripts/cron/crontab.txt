@@ -828,6 +828,12 @@ COUNTY_ID=hillsborough
 30 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.hunter_nightly_sweep --county-id $COUNTY_ID
 31 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.hunter_nightly_sweep --county-id pinellas
 
+# NBRA opportunity-score population (REVINT I1) — fills opportunity_scores from
+# freshly-refreshed whale flags so get_ranked_queue() has rows to rank. Must run
+# AFTER hunter_nightly_sweep (above) which updates whale flags.
+32 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.nbra_populate_sweep --county-id $COUNTY_ID
+33 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.nbra_populate_sweep --county-id pinellas
+
 # Auction-winner fast-follow (W2) — runs just after the nightly sweep as a
 # supplementary <24h latency check on distressed-acquisition deeds
 # specifically (tax deed/certificate of title/sheriff sale), per Hunter's
