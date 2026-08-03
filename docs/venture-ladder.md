@@ -196,10 +196,21 @@ the acceptance harness included — can skip it either.
 The cell-level rule is wired into the evaluator too: it calls
 `maybe_auto_double_cell()` for every cell `cell_reply_rates()` returns traffic
 for, and `target_producer.produce_targets()` /
-`produce_auction_fast_follow_targets()` multiply their `limit` by
-`cell_production_multipliers()` before ranking — the multiplier is scoped to
-the call's own `county_id` (one venture's sweep), or `DEFAULT_VENTURE_KEY` when
-`county_id` is unset (the pre-CL3, fleet-wide sweep).
+`produce_auction_fast_follow_targets()` scale their `limit` by
+`cell_production_multipliers()`.
+
+**Two different mechanisms depending on `county_id`.** When `county_id` scopes
+the call to one venture's sweep, `limit` is scaled up front by that venture's
+own multiplier — simple. The only production caller (`run_periodic()`,
+`--produce-targets`) never passes `county_id`, though, so it must not read
+`DEFAULT_VENTURE_KEY`'s multiplier and call it done — that would silently
+never apply a non-default venture's recorded cell auto-double at all. Instead,
+the fleet-wide call over-fetches by the largest possible multiplier
+(`AUTO_DOUBLE_CELL_MAX_MULTIPLIER`), ranks once, then
+`_truncate_scored_rows_per_venture()` keeps up to `limit * multiplier` rows
+**per venture** (each row's venture resolved from its own `county_id`, exactly
+like `_produce_from_rows`' per-row `venture_key` attribution) rather than
+applying one number to the whole shared, multi-venture pool.
 
 Every guard is load-bearing:
 

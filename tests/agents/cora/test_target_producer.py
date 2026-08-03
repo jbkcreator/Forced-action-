@@ -5,9 +5,23 @@ import uuid
 
 from sqlalchemy import text
 
+from config.venture_template import DEFAULT_VENTURE_KEY
 from src.agents.cora import queue, store
 from src.agents.cora.ingestion import target_producer
 from tests.agents.cora.fixtures.whales import WHALES
+
+
+def _seed_cell_auto_doubles(db, venture_key: str, cell_id: str, count: int) -> None:
+    for _ in range(count):
+        db.execute(
+            text("""
+                INSERT INTO venture_ladder_events (
+                    venture_key, from_stage, to_stage, decision, gate_results, actor
+                ) VALUES (:k, 'cell', 'cell', 'auto_double', CAST(:payload AS jsonb), 'test')
+            """),
+            {"k": venture_key, "payload": json.dumps({"scope": "cell", "cell_id": cell_id})},
+        )
+    db.flush()
 
 
 def _stub_contact_and_entity(monkeypatch, whale):
@@ -152,19 +166,7 @@ def test_produce_targets_applies_the_cell_production_multiplier_to_the_limit(
     production. Two recorded cell-level auto-doubles for founder_tier_blitz
     means a 2**2 = 4x multiplier."""
     venture_key, county_id = _make_venture(fresh_db, ladder_stage="cell")
-    for _ in range(2):
-        fresh_db.execute(
-            text("""
-                INSERT INTO venture_ladder_events (
-                    venture_key, from_stage, to_stage, decision, gate_results, actor
-                ) VALUES (:k, 'cell', 'cell', 'auto_double', CAST(:payload AS jsonb), 'test')
-            """),
-            {
-                "k": venture_key,
-                "payload": json.dumps({"scope": "cell", "cell_id": "founder_tier_blitz"}),
-            },
-        )
-    fresh_db.flush()
+    _seed_cell_auto_doubles(fresh_db, venture_key, "founder_tier_blitz", count=2)
 
     captured: dict = {}
 
@@ -193,3 +195,115 @@ def test_produce_targets_uses_1x_multiplier_for_a_venture_with_no_auto_doubles(
 
     target_producer.produce_targets(fresh_db, limit=25, county_id=county_id)
     assert captured["limit"] == 25
+
+
+# ── fleet-wide (scheduled) sweep applies EACH venture's own multiplier ──────
+#
+# Regression: run_periodic()/--produce-targets (the only production callers)
+# always call produce_targets()/produce_auction_fast_follow_targets() with
+# county_id=None. Before this, that meant _cell_production_limit resolved
+# None -> DEFAULT_VENTURE_KEY and read ONLY that venture's multiplier — a
+# non-default venture's own recorded cell auto-double was silently never
+# read by the scheduled process at all, even though a county_id-scoped call
+# (as in the tests above) correctly picked it up. These drive the actual
+# `produce_targets(fresh_db)` / `produce_auction_fast_follow_targets(fresh_db)`
+# entry points the scheduler uses — no county_id passed anywhere.
+
+
+def _fake_row(thread_id: str, county_id: str) -> dict:
+    return {
+        "opportunity_thread_id": thread_id,
+        "county_id": county_id,
+        "total_purchase_count": 5,
+        "total_cash_volume": 100_000.0,
+        "whale_flagged_at": None,
+    }
+
+
+def test_produce_targets_fleet_wide_sweep_applies_the_non_default_ventures_own_multiplier(
+    fresh_db, monkeypatch
+):
+    from src.services import venture_ladder as vl
+
+    venture_key, county_id = _make_venture(fresh_db, ladder_stage="cell")
+    _seed_cell_auto_doubles(fresh_db, venture_key, target_producer.FOUNDER_TIER_BLITZ_CELL_ID, count=2)
+
+    second_multiplier = vl.cell_production_multipliers(fresh_db, venture_key).get(
+        target_producer.FOUNDER_TIER_BLITZ_CELL_ID, 1
+    )
+    assert second_multiplier == 4  # sanity: the two seeded doublings took effect
+    default_multiplier = vl.cell_production_multipliers(fresh_db, DEFAULT_VENTURE_KEY).get(
+        target_producer.FOUNDER_TIER_BLITZ_CELL_ID, 1
+    )
+
+    limit = 3
+    # Over-supply BOTH ventures past the highest possible cap
+    # (limit * AUTO_DOUBLE_CELL_MAX_MULTIPLIER) so the multiplier cap binds,
+    # not the row count.
+    supply_per_venture = limit * 5
+    fake_rows = (
+        [_fake_row(f"OPP-DEFAULT-{i:03d}", "hillsborough") for i in range(supply_per_venture)]
+        + [_fake_row(f"OPP-SECOND-{i:03d}", county_id) for i in range(supply_per_venture)]
+    )
+    monkeypatch.setattr(target_producer, "get_ranked_whales", lambda db, **kw: fake_rows)
+
+    def _fake_buyer_entity(db, tid):
+        cid = county_id if tid.startswith("OPP-SECOND") else "hillsborough"
+        return {"id": 1, "opportunity_thread_id": tid, "county_id": cid, "confidence_score": 90}
+
+    monkeypatch.setattr(target_producer, "get_buyer_entity_by_opportunity_thread_id", _fake_buyer_entity)
+    monkeypatch.setattr(target_producer, "get_contact_channel", lambda db, bid: {"email": "x@example.com", "phone": None})
+
+    target_producer.produce_targets(fresh_db, limit=limit)  # county_id=None — the real scheduler's call shape
+
+    published = queue.read_batch("test-consumer", count=100, block_ms=200)
+    by_venture: dict = {}
+    for msg in published:
+        by_venture[msg.payload["venture_key"]] = by_venture.get(msg.payload["venture_key"], 0) + 1
+        queue.ack(msg.message_id)
+
+    assert by_venture.get(venture_key, 0) == limit * second_multiplier
+    assert by_venture.get(DEFAULT_VENTURE_KEY, 0) == limit * default_multiplier
+
+
+def test_produce_auction_fast_follow_targets_fleet_wide_sweep_applies_the_non_default_ventures_own_multiplier(
+    fresh_db, monkeypatch
+):
+    from src.services import venture_ladder as vl
+
+    venture_key, county_id = _make_venture(fresh_db, ladder_stage="cell")
+    _seed_cell_auto_doubles(fresh_db, venture_key, target_producer.AUCTION_FAST_FOLLOW_CELL_ID, count=1)
+
+    second_multiplier = vl.cell_production_multipliers(fresh_db, venture_key).get(
+        target_producer.AUCTION_FAST_FOLLOW_CELL_ID, 1
+    )
+    assert second_multiplier == 2
+    default_multiplier = vl.cell_production_multipliers(fresh_db, DEFAULT_VENTURE_KEY).get(
+        target_producer.AUCTION_FAST_FOLLOW_CELL_ID, 1
+    )
+
+    limit = 2
+    supply_per_venture = limit * 5
+    fake_rows = (
+        [_fake_row(f"OPP-AFF-DEFAULT-{i:03d}", "hillsborough") for i in range(supply_per_venture)]
+        + [_fake_row(f"OPP-AFF-SECOND-{i:03d}", county_id) for i in range(supply_per_venture)]
+    )
+    monkeypatch.setattr(target_producer, "get_recent_auction_fast_follow_whales", lambda db, **kw: fake_rows)
+
+    def _fake_buyer_entity(db, tid):
+        cid = county_id if tid.startswith("OPP-AFF-SECOND") else "hillsborough"
+        return {"id": 1, "opportunity_thread_id": tid, "county_id": cid, "confidence_score": 90}
+
+    monkeypatch.setattr(target_producer, "get_buyer_entity_by_opportunity_thread_id", _fake_buyer_entity)
+    monkeypatch.setattr(target_producer, "get_contact_channel", lambda db, bid: {"email": "x@example.com", "phone": None})
+
+    target_producer.produce_auction_fast_follow_targets(fresh_db, limit=limit)  # county_id=None
+
+    published = queue.read_batch("test-consumer", count=100, block_ms=200)
+    by_venture: dict = {}
+    for msg in published:
+        by_venture[msg.payload["venture_key"]] = by_venture.get(msg.payload["venture_key"], 0) + 1
+        queue.ack(msg.message_id)
+
+    assert by_venture.get(venture_key, 0) == limit * second_multiplier
+    assert by_venture.get(DEFAULT_VENTURE_KEY, 0) == limit * default_multiplier
