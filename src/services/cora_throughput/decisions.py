@@ -56,15 +56,32 @@ def _get_batch_items_with_drafts(db: Any, batch_id: str) -> List[Dict[str, Any]]
     return [dict(r) for r in rows]
 
 
+_RELAY_SUPPORTED_CHANNELS = frozenset({"email"})
+
+
 def _enqueue_to_relay(item: Dict[str, Any], decided_by: str) -> bool:
     """Returns True if a Relay queue item was enqueued+approved, False if
-    skipped (e.g. no recipient for the draft's channel — logged, not raised,
+    skipped (e.g. no recipient, or unsupported channel — logged, not raised,
     since one bad draft in a batch must never block the rest)."""
-    recipient = item["contact_email"] if item["recommended_channel"] == "email" else item["contact_phone"]
+    channel = item["recommended_channel"]
+    if channel not in _RELAY_SUPPORTED_CHANNELS:
+        # SMS (and any future channel) has no registered Relay dispatcher yet.
+        # Enqueuing it would cause Relay to immediately mark it failed with
+        # unknown_channel:<channel>, producing misleading approval outcomes.
+        # Block here until the dispatcher is wired; draft stays in approved_pending_send
+        # state so it can be retried when the dispatcher lands.
+        logger.warning(
+            "cora_throughput.decisions: draft %s channel=%r not yet supported by Relay — "
+            "skipping enqueue until dispatcher is registered",
+            item["draft_id"], channel,
+        )
+        return False
+
+    recipient = item["contact_email"] if channel == "email" else item["contact_phone"]
     if not recipient:
         logger.warning(
             "cora_throughput.decisions: draft %s has no recipient for channel=%s — skipping Relay enqueue",
-            item["draft_id"], item["recommended_channel"],
+            item["draft_id"], channel,
         )
         return False
 
