@@ -4457,10 +4457,17 @@ class VendorCostPause(Base):
 
       
 class LifecyclePlaybook(Base):
-    """Lifecycle-recommended pattern lifecycle (fa036).
+    """Fleet-wide playbook / anti-playbook table (fa036, widened CLONE-v2.2).
 
-    One row per Lifecycle-authored recommendation (A/B winner promotion, kill
-    recommendation, future explicit recommendations). Lifecycle:
+    One row per authored recommendation — originally Lifecycle-only (A/B
+    winner promotion, kill recommendation), now open to any agent/domain via
+    `agent_domain` ('lifecycle' | 'vera' | 'cora' | 'hunter' | 'fleet') and to
+    either polarity via `entry_kind` ('playbook' | 'anti_playbook'), per the
+    fleet constitutions' "playbooks at 3+ proofs, anti-playbooks at 3+
+    failures, inherited at birth" rule (docs/constitutions/*.md). The table
+    name and existing columns are unchanged — this is a widening, not a
+    replacement; every pre-existing row defaults to agent_domain='lifecycle',
+    entry_kind='playbook'. Status lifecycle unchanged:
         recommended → adopted   (human approves via admin endpoint)
                     → rejected  (human declines)
                     → retired   (previously-adopted playbook is disabled)
@@ -4471,9 +4478,10 @@ class LifecyclePlaybook(Base):
     declaration exists for Alembic autogenerate consistency.
 
     The `source_key` column + the partial-unique index on it prevent
-    duplicate recommendations from the same A/B test or metric breach
-    (see `idx_lifecycle_playbook_source_key_unique` in fa036). NULL source_key
-    is allowed and uncounted by the index.
+    duplicate recommendations from the same source within the same
+    agent_domain (see `idx_lifecycle_playbook_source_key_unique` in fa036,
+    widened by migrations/apply_lifecycle_playbook_fleet_widen.py to key on
+    agent_domain too). NULL source_key is allowed and uncounted by the index.
     """
     __tablename__ = "lifecycle_playbook"
 
@@ -4513,6 +4521,18 @@ class LifecyclePlaybook(Base):
     source_id: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
     source_key: Mapped[Optional[str]] = mapped_column(String(160), nullable=True)
 
+    # CLONE-v2.2 widening — this table now serves the whole fleet, not just
+    # Lifecycle. agent_domain identifies which agent/domain authored the
+    # entry ('lifecycle' | 'vera' | 'cora' | 'hunter' | 'fleet' for
+    # cross-agent entries); default 'lifecycle' preserves every existing row
+    # and every pre-widening caller's behavior unchanged. entry_kind splits
+    # playbook (proven pattern, 3+ proofs per the fleet constitutions) from
+    # anti_playbook (documented failure, 3+ instances) — same table, same
+    # dedupe machinery, per docs/constitutions/*.md's "Playbooks at 3+
+    # proofs; anti-playbooks at 3+ failures; inherited at birth."
+    agent_domain: Mapped[str] = mapped_column(String(40), nullable=False, server_default=text("'lifecycle'"))
+    entry_kind: Mapped[str] = mapped_column(String(20), nullable=False, server_default=text("'playbook'"))
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc), nullable=False,
@@ -4529,11 +4549,16 @@ class LifecyclePlaybook(Base):
             "status IN ('recommended','adopted','rejected','retired')",
             name="check_lifecycle_playbook_status",
         ),
+        CheckConstraint(
+            "entry_kind IN ('playbook','anti_playbook')",
+            name="check_lifecycle_playbook_entry_kind",
+        ),
         # Non-unique indexes mirror fa036. The unique partial index on
         # source_key is created via raw SQL in the migration, not declared
         # here, so autogenerate doesn't try to re-create it.
         Index("idx_lifecycle_playbook_status", "status"),
         Index("idx_lifecycle_playbook_authored", "authored_by", "authored_at"),
+        Index("idx_lifecycle_playbook_agent_domain_kind", "agent_domain", "entry_kind", "status"),
     )
 
     def __repr__(self):
