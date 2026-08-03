@@ -135,3 +135,55 @@ def test_auto_approve_draft_skips_when_no_recipient(fresh_db, monkeypatch):
 def test_record_batch_decision_batch_not_found(fresh_db):
     result = decisions.record_batch_decision(fresh_db, "BATCH-DOES-NOT-EXIST", "approve_all", decided_by="U123")
     assert result == {"ok": False, "reason": "batch_not_found"}
+
+
+def test_sms_draft_is_skipped_not_enqueued(fresh_db, monkeypatch):
+    """SMS channel has no Relay dispatcher — must be skipped, not enqueued.
+    The draft stays at approved_pending_send (retrievable for retry) rather
+    than being marked failed by an unknown_channel Relay error."""
+    enqueue_calls = []
+    monkeypatch.setattr(decisions.relay_queue, "enqueue", lambda **kw: (enqueue_calls.append(kw), fake_queue_item())[1])
+    monkeypatch.setattr(decisions.relay_queue, "record_decision", lambda *a, **k: None)
+
+    # Batch with one email draft (should enqueue) and one SMS draft (should skip)
+    from sqlalchemy import text
+    fresh_db.execute(text("INSERT INTO cora_draft_batches (batch_id, status) VALUES ('BATCH-SMS-1', 'pending')"))
+    seed_draft(fresh_db, "DRAFT-EMAIL-1", channel="email", contact_email="a@b.com")
+    seed_draft(fresh_db, "DRAFT-SMS-1", channel="sms", contact_phone="+18135550001", contact_email=None)
+    for draft_id in ("DRAFT-EMAIL-1", "DRAFT-SMS-1"):
+        fresh_db.execute(
+            text("INSERT INTO cora_batch_items (batch_id, draft_id, decision) VALUES ('BATCH-SMS-1', :d, 'included')"),
+            {"d": draft_id},
+        )
+
+    result = decisions.record_batch_decision(fresh_db, "BATCH-SMS-1", "approve_all", decided_by="U123")
+
+    # Only the email draft reaches Relay
+    assert len(enqueue_calls) == 1
+    assert enqueue_calls[0]["idempotency_key"] == "cora_draft:DRAFT-EMAIL-1"
+    # approved_count reflects only successfully enqueued items
+    assert result["approved_count"] == 1
+    # SMS draft was not corrupted — still approved_pending_send (not failed)
+    from sqlalchemy import text as _t
+    sms_status = fresh_db.execute(_t("SELECT status FROM outbound_drafts WHERE draft_id='DRAFT-SMS-1'")).scalar()
+    assert sms_status == "approved_pending_send"
+
+
+def test_auto_approve_draft_skips_sms_channel(fresh_db, monkeypatch):
+    """auto_approve_draft must also respect the channel guard."""
+    enqueue_calls = []
+    monkeypatch.setattr(decisions.relay_queue, "enqueue", lambda **kw: (enqueue_calls.append(kw), fake_queue_item())[1])
+    monkeypatch.setattr(decisions.relay_queue, "record_decision", lambda *a, **k: None)
+
+    seed_draft(fresh_db, "DRAFT-AUTO-SMS-1", channel="sms", contact_phone="+18135550002", contact_email=None)
+    draft = {
+        "draft_id": "DRAFT-AUTO-SMS-1", "opportunity_thread_id": "OPP-AUTO-SMS-1",
+        "recommended_channel": "sms", "subject": "s", "body": "b",
+        "contact_email": None, "contact_phone": "+18135550002",
+        "booking_link": None, "payment_link": None, "cell_id": "founder_tier_blitz",
+    }
+
+    result = decisions.auto_approve_draft(fresh_db, draft)
+
+    assert result is False
+    assert enqueue_calls == []
