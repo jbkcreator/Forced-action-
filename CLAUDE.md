@@ -70,11 +70,19 @@ Central `properties` table (~522k parcels). 1:Many → foreclosures, tax_delinqu
 ### County Config
 County config is **DB-backed** via `counties` + `county_sources` tables — **not** `config/counties.json`. Read via `src/utils/county_config.py:get_county(county_id)` (5-min cache). `County.nws_zone` supports comma-separated values for multi-zone counties. Hillsborough: `FLZ151,FLZ251`. Pinellas: `FLZ050`.
 
+### Venture Config (CLONE-v2.2 / CL3)
+A **venture** is one business on this fleet: its Relay sending identity (Slack channel, Instantly campaign, sender, send window, daily ceiling, kill-switch key, brand) plus its geography (state, bankruptcy court) and its counties. One row per venture in `ventures`; every county belongs to one via `counties.venture_key`, and every Relay queue row via `relay_approval_queue.venture_key`. Venture #1 is `hillsborough_distress`.
+
+Read via `src/utils/venture_config.py:get_venture_config(venture_key)` (5-min cache) — **never query `ventures` directly**. Missing/inactive row, or any NULL column, falls back to the matching `config/settings.py` value, so venture #1 is unchanged from pre-CL3. `county_config` derives `state` and `court` from the venture (both were hardcoded to Florida before CL3).
+
+Relay is per-venture end to end: `run_sweep(venture_key=...)` filters the batch, the daily-ceiling Redis key is `relay_daily_sent:{venture}:{channel}:{date}`, and the Slack channel / Instantly campaign / footer brand come from the item's venture. **One sweep run = one venture** (a batch is homogeneous) — a second venture needs its own `--sweep --venture <key>` cron line and its own Instantly passthrough campaign. Onboard a new venture with `python -m src.services.venture_provisioning` (`--emit-template` → `--dry-run` → `--apply`); `playwright_code` is never cloned between counties and column mappings are opt-in. Runbook: `docs/venture-onboarding.md`.
+
 ### Configuration (`config/`)
 - `settings.py`: Pydantic BaseSettings from `.env`, accessed via `get_settings()`.
 - `agents.py`: `AgentsSettings(AppSettings)` — LangGraph-specific keys. `AGENTS_EVENT_SOURCE_REDIS=true`, `AGENTS_EVENT_SOURCE_POSTGRES=true` required for full event routing.
 - `scoring.py`: CDS weights/thresholds — source of truth (not cds_engine.py docstring).
 - `matching.py`: match thresholds.
+- `venture_template.py`: `DEFAULT_VENTURE_KEY`, the copy-and-fill `VENTURE_TEMPLATE`, and `validate_venture_config()`.
 
 ### Deployment
 Single `Dockerfile` at project root. `docker-compose.yml` runs `api` and `lifecycle` as two services from the same image with `network_mode: host` (Postgres + Redis run on the host). Nginx serves React SPA static files and proxies `/api/` + `/webhooks/` to FastAPI on port 8000.

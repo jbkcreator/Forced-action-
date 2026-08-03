@@ -15,6 +15,7 @@ import logging
 from config.settings import get_settings
 from src.services.relay import queue
 from src.services.relay.queue import QueueItem
+from src.utils.venture_config import get_venture_config
 
 logger = logging.getLogger(__name__)
 
@@ -32,16 +33,22 @@ def _summary_text(item: QueueItem) -> str:
 def post_for_approval(item: QueueItem) -> None:
     """Post an interactive Approve/Reject Slack message for a pending item.
 
-    No-ops (logs and returns) if Slack isn't configured for Relay — this
-    keeps --seed usable in local/dev environments without a live Slack app.
+    The channel comes from the item's venture (CLONE-v2.2 / CL3) so each
+    venture's approvals land in its own channel — one shared channel would
+    make it impossible to tell whose prospect an approve button belongs to.
+    The bot token stays fleet-wide (one Slack app, per RELAY-v2.2 R1).
+
+    No-ops (logs and returns) if Slack isn't configured — this keeps --seed
+    usable in local/dev environments without a live Slack app.
     """
     settings = get_settings()
     token = settings.slack_bot_token
-    channel = settings.relay_slack_channel
+    channel = get_venture_config(item.venture_key).relay_slack_channel
     if not token or not channel:
         logger.info(
-            "[Relay] Slack not configured (relay_slack_channel/slack_bot_token "
-            "unset) — item %d stays pending without a posted message", item.id,
+            "[Relay] Slack not configured for venture %s (no slack channel or "
+            "bot token) — item %d stays pending without a posted message",
+            item.venture_key, item.id,
         )
         return
 

@@ -28,6 +28,7 @@ from sqlalchemy import (
     Index,
     func,
     false as sa_false,
+    true as sa_true,
     text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID as PG_UUID
@@ -4713,6 +4714,122 @@ class OwnerAlertDispatch(Base):
 
 
 # ============================================================================
+# VENTURE CONFIGURATION (CLONE-v2.2 / CL3)
+# ============================================================================
+
+class Venture(Base):
+    """
+    One row per business running on this agent fleet.
+
+    A venture owns a Relay sending identity (Slack approval channel,
+    Instantly campaign, sender address, send window, daily ceiling, kill
+    switch) and a geography (state, bankruptcy court, and the set of
+    `counties` rows pointing back here via counties.venture_key). Before
+    CL3 every one of these was a single-valued env global in
+    config/settings.py, which is what made a second venture impossible
+    without code changes.
+
+    Venture #1 is 'hillsborough_distress'. Every venture_key column added
+    by CL3 defaults to it and the CL3 migration seeds this row from the
+    current env values, so a deployment that never creates a second
+    venture behaves exactly as it did before.
+
+    Read at runtime through src/utils/venture_config.py:get_venture_config()
+    (5-minute cache, falls back to config/settings.py when no row exists),
+    never by querying this table directly. config/venture_template.py is
+    the copy-and-fill template; src/services/venture_provisioning.py turns
+    a filled-in copy into rows.
+    """
+    __tablename__ = "ventures"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    venture_key: Mapped[str] = mapped_column(String(60), unique=True, nullable=False)
+    display_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    # Name rendered in the CAN-SPAM footer of every Relay email this
+    # venture sends — replaces the hardcoded "Forced Action" literal that
+    # used to live in src/services/relay/channels_email.py.
+    brand_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    postal_address: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Geography. `state` is read by the flood/insurance/storm scrapers for
+    # NWS + FEMA lookups; the court fields by bankruptcy_engine. Both were
+    # hardcoded to Florida in county_config.py before CL3.
+    state: Mapped[str] = mapped_column(String(2), nullable=False, server_default="FL")
+    bankruptcy_court_code: Mapped[str] = mapped_column(
+        String(10), nullable=False, server_default="flmb"
+    )
+    default_bankruptcy_division: Mapped[str] = mapped_column(
+        String(10), nullable=False, server_default="8:"
+    )
+    # County whose county_sources rows new counties in this venture clone
+    # from (see src/services/venture_provisioning.clone_county_sources).
+    template_county_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+
+    # Relay approval surface.
+    relay_slack_channel: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    relay_approvers: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+
+    # Relay email channel. Each venture needs its own Instantly passthrough
+    # campaign — sharing one would cross-contaminate Instantly's
+    # duplicate-contact guard (docs/adr/0011).
+    relay_instantly_campaign_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    relay_instantly_sender_email: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+
+    # Relay execution guards.
+    relay_send_window_start: Mapped[int] = mapped_column(
+        SmallInteger, nullable=False, server_default=text("11")
+    )
+    relay_send_window_end: Mapped[int] = mapped_column(
+        SmallInteger, nullable=False, server_default=text("18")
+    )
+    relay_send_window_timezone: Mapped[str] = mapped_column(
+        String(60), nullable=False, server_default="America/New_York"
+    )
+    relay_daily_ceiling: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("20")
+    )
+    # Kill-switch feature key checked before every batch and every item.
+    # 'relay_global' shares the fleet-wide Relay stop; a venture-specific
+    # key stops just that venture. The fleet-wide 'global' override takes
+    # precedence over both.
+    kill_switch_feature: Mapped[str] = mapped_column(
+        String(60), nullable=False, server_default="relay_global"
+    )
+
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=sa_true()
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "relay_send_window_start >= 0 AND relay_send_window_start <= 24",
+            name="ck_ventures_send_window_start",
+        ),
+        CheckConstraint(
+            "relay_send_window_end >= 0 AND relay_send_window_end <= 24",
+            name="ck_ventures_send_window_end",
+        ),
+        CheckConstraint(
+            "relay_send_window_start < relay_send_window_end",
+            name="ck_ventures_send_window_order",
+        ),
+        CheckConstraint("relay_daily_ceiling > 0", name="ck_ventures_daily_ceiling"),
+        Index("idx_ventures_is_active", "is_active"),
+    )
+
+    def __repr__(self):
+        return f"<Venture(venture_key={self.venture_key!r}, display_name={self.display_name!r})>"
+
+
+# ============================================================================
 # COUNTY CONFIGURATION (Admin-managed, replaces counties.json)
 # ============================================================================
 
@@ -4726,10 +4843,24 @@ class County(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     county_id: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
     display_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    # Which venture this county belongs to (CLONE-v2.2 / CL3). Pre-CL3 rows
+    # are backfilled to venture #1 by the column default.
+    venture_key: Mapped[str] = mapped_column(
+        String(60),
+        ForeignKey("ventures.venture_key"),
+        nullable=False,
+        server_default="hillsborough_distress",
+    )
     fips: Mapped[Optional[str]] = mapped_column(String(10))
     nws_zone: Mapped[Optional[str]] = mapped_column(String(20))
     parcel_id_format: Mapped[Optional[str]] = mapped_column(String(20), default="folio")
     bankruptcy_division: Mapped[Optional[str]] = mapped_column(String(10))
+    # 3-digit ZIP prefixes belonging to this county, consumed by
+    # county_config.is_zip_in_county(). Empty means "not configured" — the
+    # one caller (src/api/main.py) then falls back to the properties table.
+    zip_prefixes: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
     city_filer_keywords: Mapped[Optional[dict]] = mapped_column(JSONB, default=list)
     code_lien_type_map: Mapped[Optional[dict]] = mapped_column(JSONB, default=dict)
     # Lowercase city/CDP tokens stripped from address suffixes during
@@ -4757,6 +4888,7 @@ class County(Base):
     __table_args__ = (
         Index("idx_counties_county_id", "county_id"),
         Index("idx_counties_is_active", "is_active"),
+        Index("idx_counties_venture_key", "venture_key"),
     )
 
     def __repr__(self):
@@ -8556,6 +8688,16 @@ class RelayApprovalQueueItem(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     idempotency_key: Mapped[str] = mapped_column(String(120), nullable=False, unique=True)
+    # Which venture proposed this action (CLONE-v2.2 / CL3). Scopes the
+    # sweep's batch, the Slack channel it is posted to, the Instantly
+    # campaign it sends through, and the daily-ceiling counter — without it
+    # two ventures would share one send cap and one approval channel.
+    venture_key: Mapped[str] = mapped_column(
+        String(60),
+        ForeignKey("ventures.venture_key"),
+        nullable=False,
+        server_default="hillsborough_distress",
+    )
     batch_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     thread_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)  # OPP-YYYY-#####
     channel: Mapped[str] = mapped_column(String(30), nullable=False)  # noop (R1); email/sms (R2)
@@ -8581,6 +8723,7 @@ class RelayApprovalQueueItem(Base):
     __table_args__ = (
         Index("ix_relay_approval_queue_status", "status"),
         Index("ix_relay_approval_queue_batch_status", "batch_id", "status"),
+        Index("ix_relay_approval_queue_venture_status", "venture_key", "status"),
         CheckConstraint(
             "status IN ('pending', 'approved', 'rejected', 'sent', 'failed', 'skipped')",
             name="ck_relay_approval_queue_status",
