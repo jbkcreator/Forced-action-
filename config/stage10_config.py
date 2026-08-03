@@ -44,7 +44,7 @@ PRICING_COHORT = {
     "rollback_trigger_sigma": 2.0,
     # Allowed price types for cohort overrides.
     # "lock"/"wallet_*"/"bundle" belong to the Wallet/Territory-Lock revenue-ladder
-    # funnel (config/revenue_ladder.py). "starter"/"pro"/"dominator"/"annual_lock"
+    # funnel (config/revenue_ladder.py). "starter"/"pro"/"founder"/"annual_lock"
     # are the separate Block 1 storefront subscription tiers (src/api/deps.py
     # VALID_TIERS) — distinct product, same generic cohort mechanism.
     "allowed_price_types": [
@@ -55,7 +55,6 @@ PRICING_COHORT = {
         "bundle",
         "starter",
         "pro",
-        "dominator",
         "annual_lock",
     ],
     # Allowed trade verticals for cohort overrides.

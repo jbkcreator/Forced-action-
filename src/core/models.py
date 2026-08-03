@@ -5,6 +5,7 @@ Implements the Hub-and-Spoke architecture with properties as the central hub.
 
 from datetime import date, datetime, timezone
 from decimal import Decimal
+from enum import Enum
 from typing import Any, List, Optional
 
 from sqlalchemy import (
@@ -1159,7 +1160,7 @@ class FoundingSubscriberCount(Base):
     __tablename__ = "founding_subscriber_counts"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    tier: Mapped[str] = mapped_column(String(20), nullable=False)          # starter | pro | dominator
+    tier: Mapped[str] = mapped_column(String(20), nullable=False)          # starter | pro | founder
     vertical: Mapped[str] = mapped_column(String(50), nullable=False)      # roofing | remediation | investor
     county_id: Mapped[str] = mapped_column(String(50), nullable=False)
     count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -1171,7 +1172,7 @@ class FoundingSubscriberCount(Base):
     __table_args__ = (
         UniqueConstraint("tier", "vertical", "county_id", name="uq_founding_tier_vertical_county"),
         Index("idx_founding_county_id", "county_id"),
-        CheckConstraint("tier IN ('starter', 'pro', 'dominator')", name="check_founding_tier"),
+        CheckConstraint("tier IN ('starter', 'pro', 'founder')", name="check_founding_tier"),
     )
 
     def __repr__(self):
@@ -1191,7 +1192,7 @@ class Subscriber(Base):
     stripe_subscription_id: Mapped[Optional[str]] = mapped_column(String(100), unique=True, index=True)
 
     # Plan details
-    tier: Mapped[str] = mapped_column(String(20), nullable=False)          # starter | pro | dominator
+    tier: Mapped[str] = mapped_column(String(20), nullable=False)          # starter | pro | founder | annual_lock
     vertical: Mapped[str] = mapped_column(String(50), nullable=False)      # roofing | remediation | investor
     county_id: Mapped[str] = mapped_column(String(50), nullable=False)
 
@@ -1350,7 +1351,7 @@ class Subscriber(Base):
         Index("idx_subscribers_icp_channel_key", "icp_channel_key"),
         Index("idx_subscriber_last_reactivation_at", "last_reactivation_attempt_at"),
         CheckConstraint(
-            "tier IN ('free', 'starter', 'pro', 'dominator', 'data_only', 'autopilot_lite', 'autopilot_pro', 'partner', 'annual_lock', 'founder')",
+            "tier IN ('free', 'starter', 'pro', 'data_only', 'autopilot_lite', 'autopilot_pro', 'partner', 'annual_lock', 'founder')",
             name="check_subscriber_tier",
         ),
         CheckConstraint(
@@ -3517,6 +3518,127 @@ class AbAssignment(Base):
     __table_args__ = (
         UniqueConstraint("test_id", "subscriber_id", name="uq_ab_assignment"),
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Agent Lane Experiment Models
+# ══════════════════════════════════════════════════════════════════════════════
+# Agent Lane's own experiment registry — pre-customer/cold-outbound tests
+# (Cora, REVINT price-band tests, Hunter's vertical autopilot, LEARN).
+# Deliberately separate from AbTest/AbAssignment above: those are Lifecycle's
+# (post-customer/subscriber) tables. Agent Lane and Lifecycle are two
+# different engines (pre- vs post-customer outreach) — sharing one
+# experiment table would couple their schemas and blast radius (e.g.
+# ab_rollback_check walks every active AbTest with no name filter, so any
+# row inserted there is already subject to Lifecycle's own rollback math).
+# See docs/agent-lane-data-access-matrix.md.
+
+class AgentLaneExperiment(Base):
+    """Agent Lane's experiment definition — the registry Cora/REVINT/Hunter/LEARN
+    register tests against. Same field shape REVINT-v2.2 originally added to
+    AbTest, ported to its own table rather than grafted onto Lifecycle's."""
+    __tablename__ = "agent_lane_experiments"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    test_name: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
+    hypothesis: Mapped[Optional[str]] = mapped_column(Text)
+    audience: Mapped[Optional[str]] = mapped_column(String(100))
+    offer: Mapped[Optional[str]] = mapped_column(String(60))
+    variant_a: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    variant_b: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    control_price_cents: Mapped[Optional[int]] = mapped_column(Integer)
+    test_price_cents: Mapped[Optional[int]] = mapped_column(Integer)
+    traffic_pct: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
+    min_sample: Mapped[Optional[int]] = mapped_column(Integer)
+    success_metric: Mapped[Optional[str]] = mapped_column(String(60))
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
+    verdict: Mapped[Optional[str]] = mapped_column(String(20))  # control_wins | test_wins | inconclusive
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    winner: Mapped[Optional[str]] = mapped_column(String(10))  # 'a' / 'b'
+
+    __table_args__ = (
+        CheckConstraint("status IN ('active', 'completed', 'rolled_back')", name="check_agent_lane_experiment_status"),
+        CheckConstraint("traffic_pct BETWEEN 1 AND 100", name="check_agent_lane_experiment_traffic_pct"),
+        CheckConstraint(
+            "verdict IS NULL OR verdict IN ('control_wins', 'test_wins', 'inconclusive')",
+            name="check_agent_lane_experiment_verdict",
+        ),
+    )
+
+    def __repr__(self):
+        return f"<AgentLaneExperiment(name={self.test_name}, status={self.status})>"
+
+
+class AgentLaneExperimentAssignment(Base):
+    """An opportunity's assignment to an Agent Lane experiment arm.
+
+    Keyed ONLY on opportunity_thread_id — never subscriber_id. Agent Lane is
+    pre-customer by definition; an assignment for someone who's already a
+    subscriber belongs on Lifecycle's AbAssignment instead. This removes the
+    need for an XOR constraint entirely (unlike AbAssignment previously on
+    this branch, which needed one only because a single table was being
+    asked to serve two domains)."""
+    __tablename__ = "agent_lane_experiment_assignments"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    test_id: Mapped[int] = mapped_column(Integer, ForeignKey("agent_lane_experiments.id"), nullable=False, index=True)
+    opportunity_thread_id: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    variant: Mapped[str] = mapped_column(String(10), nullable=False)
+    outcome: Mapped[Optional[str]] = mapped_column(String(30))
+    outcome_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    test = relationship("AgentLaneExperiment", backref="assignments")
+
+    __table_args__ = (
+        UniqueConstraint("test_id", "opportunity_thread_id", name="uq_agent_lane_experiment_assignment"),
+    )
+
+
+class PriceAssignment(Base):
+    """Source of truth for an assigned price through the entire offer chain.
+
+    A new row is created whenever a price is (re-)assigned for a given
+    opportunity_thread_id + offer combination.  The previous row is flipped to
+    status='superseded'.  Only one 'active' row should exist per thread+offer
+    pair at any time (enforced by assign_price service logic, not a DB
+    constraint, to keep supersede writes cheap).
+    """
+    __tablename__ = "price_assignments"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    opportunity_thread_id: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    offer: Mapped[str] = mapped_column(String(60), nullable=False)
+    assigned_price_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False, default="usd")
+    experiment_assignment_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("agent_lane_experiment_assignments.id")
+    )
+    price_band_floor_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    price_band_ceiling_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    band_validated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    assigned_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+    )
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('active', 'superseded', 'expired')",
+            name="check_price_assignment_status",
+        ),
+        Index("ix_price_assignments_thread_offer_status", "opportunity_thread_id", "offer", "status"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<PriceAssignment(thread={self.opportunity_thread_id}, offer={self.offer}, "
+            f"price={self.assigned_price_cents}, status={self.status})>"
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -8567,6 +8689,317 @@ class OutboundDraft(Base):
     def __repr__(self) -> str:
         return f"<OutboundDraft(draft_id={self.draft_id!r}, thread={self.opportunity_thread_id!r}, status={self.status!r})>"
 
+
+# ============================================================================
+# REVINT-v2.2 — VERTICAL AUTOPILOT
+# ============================================================================
+
+class VerticalCandidatePacket(Base):
+    """
+    Stores the 6-dimension fit evaluation for a candidate vertical.
+
+    Created by vertical_autopilot.score_vertical(). A packet with
+    total_score >= VERTICAL_FIT_THRESHOLD and legal_status="approved"
+    is eligible for a probe run.
+    """
+    __tablename__ = "vertical_candidate_packets"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    vertical_name: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+
+    # Per-dimension binary scores (0 or 1)
+    dim1_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    dim2_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    dim3_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    dim4_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    dim5_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    dim6_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_score: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # Legal gate
+    legal_status: Mapped[str] = mapped_column(String(30), nullable=False)     # "approved" | "blocked" | "pending_review"
+    eligible_for_probe: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    # Dimension-level evidence (dim → detail dict)
+    evidence: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+
+    # Lifecycle
+    status: Mapped[str] = mapped_column(
+        String(30), nullable=False, default="candidate"
+    )  # "candidate" | "probing" | "won" | "killed" | "pending_legal"
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    probes: Mapped[List["VerticalProbe"]] = relationship(
+        "VerticalProbe", back_populates="packet", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "legal_status IN ('approved','blocked','pending_review')",
+            name="ck_vcp_legal_status",
+        ),
+        CheckConstraint(
+            "status IN ('candidate','probing','won','killed','pending_legal','awaiting_ruling')",
+            name="ck_vcp_status",
+        ),
+        Index("idx_vcp_status", "status"),
+        Index("idx_vcp_vertical_name", "vertical_name"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<VerticalCandidatePacket(id={self.id}, vertical={self.vertical_name!r}, "
+            f"score={self.total_score}/6, status={self.status!r})>"
+        )
+
+
+class VerticalProbe(Base):
+    """
+    Tracks a single probe run for a candidate vertical.
+
+    Compliance pre-flight fields are set before sends begin; reply_rate is
+    updated as replies come in; verdict is recorded in VerticalVerdict.
+    """
+    __tablename__ = "vertical_probes"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    vertical_candidate_packet_id: Mapped[int] = mapped_column(
+        ForeignKey("vertical_candidate_packets.id"), nullable=False, index=True
+    )
+    vertical_name: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
+
+    # Volume counters
+    sends_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    reply_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    reply_rate: Mapped[float] = mapped_column(Numeric(6, 4), nullable=False, default=0.0)
+
+    # Compliance pre-flight checks — NULL means not yet checked (stub); True/False = checked result.
+    # Stubs must write NULL, not True, so persisted rows don't claim a check that never ran.
+    tcpa_preflight_passed: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    suppression_checked: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    touch_collision_checked: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    frequency_cap_checked: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    quiet_hours_checked: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    channel_limits_checked: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    kill_switch_active: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    completion_receipt: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    # Timestamps
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="running"
+    )  # "running" | "completed" | "killed" | "aborted"
+
+    packet: Mapped["VerticalCandidatePacket"] = relationship(
+        "VerticalCandidatePacket", back_populates="probes"
+    )
+    verdicts: Mapped[List["VerticalVerdict"]] = relationship(
+        "VerticalVerdict", back_populates="probe", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('running','completed','killed','aborted')",
+            name="ck_vprobe_status",
+        ),
+        Index("idx_vprobe_status", "status"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<VerticalProbe(id={self.id}, vertical={self.vertical_name!r}, "
+            f"sends={self.sends_count}, reply_rate={self.reply_rate}, status={self.status!r})>"
+        )
+
+
+class VerticalVerdict(Base):
+    """
+    Final ruling on a vertical probe — won, killed, or running (pending Josh).
+
+    presell_confirmed gates entry into the dev queue.
+    package_generated is auto-True on won verdicts.
+    handoff_payload carries the sell+clone deferred payload when clone is
+    deferred until county_2.
+    """
+    __tablename__ = "vertical_verdicts"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    vertical_probe_id: Mapped[int] = mapped_column(
+        ForeignKey("vertical_probes.id"), nullable=False, index=True
+    )
+    vertical_candidate_packet_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    vertical_name: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+
+    verdict: Mapped[str] = mapped_column(String(20), nullable=False)  # "won" | "killed" | "running" | "awaiting_ruling"
+    verdict_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+    rule_fired: Mapped[str] = mapped_column(String(60), nullable=False)
+    # e.g. "reply_rate_gt_8pct" | "reply_rate_lt_3pct" | "min_sample_josh_ruling"
+    reply_rate_at_verdict: Mapped[float] = mapped_column(Numeric(6, 4), nullable=False, default=0.0)
+
+    # Downstream gates
+    presell_confirmed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    package_generated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    package_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    clone_status: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
+    # e.g. "deferred_until_county_2" on won
+    source_county: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    handoff_payload: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+
+    probe: Mapped["VerticalProbe"] = relationship("VerticalProbe", back_populates="verdicts")
+
+    __table_args__ = (
+        CheckConstraint(
+            "verdict IN ('won','killed','running','awaiting_ruling')",
+            name="ck_vverdict_verdict",
+        ),
+        Index("idx_vverdict_verdict", "verdict"),
+        Index("idx_vverdict_vertical_name", "vertical_name"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<VerticalVerdict(id={self.id}, vertical={self.vertical_name!r}, "
+            f"verdict={self.verdict!r}, rule={self.rule_fired!r})>"
+        )
+
+
+# ============================================================================
+# REVINT-I1: Revenue Intelligence — Opportunity Scoring
+# ============================================================================
+
+
+class RevenueType(str, Enum):
+    SUBSCRIPTION = "subscription"
+    ONE_TIME = "one_time"
+    USAGE_BASED = "usage_based"
+    PILOT = "pilot"
+    # NOTE: referral_fee calculation is DISABLED until RESPA clearance is confirmed.
+    # lender_intro actions should NOT trigger financial projections until legal sign-off.
+    REFERRAL_FEE = "referral_fee"
+    LICENSING = "licensing"
+
+
+class OpportunityScore(Base):
+    """
+    NBRA (Net Business Return per Action) scoring record for one opportunity.
+
+    `nbra_score` = expected_retained_gross_profit_cents / josh_minutes_required.
+    Automated actions (is_automated=True) carry josh_minutes_required=0 and
+    nbra_score=None — they bypass the NBRA queue and go to Relay directly.
+
+    segment values: "whale" | "auction_winner" | "lapsed_subscriber" | "default"
+    billing_interval values: "monthly" | "annual" | None (for non-subscription types)
+    """
+    __tablename__ = "opportunity_scores"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # OPP-YYYY-##### format; matches BuyerEntity.opportunity_thread_id
+    opportunity_thread_id: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    buyer_entity_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    segment: Mapped[str] = mapped_column(String(30), nullable=False)
+    revenue_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    billing_interval: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    expected_revenue_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    expected_mrr_cents: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    expected_retained_gross_profit_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    p_reply: Mapped[float] = mapped_column(Numeric(6, 4), nullable=False)
+    p_close: Mapped[float] = mapped_column(Numeric(6, 4), nullable=False)
+    time_to_cash_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    josh_minutes_required: Mapped[float] = mapped_column(Numeric(8, 2), nullable=False)
+    # None when is_automated=True (josh_minutes_required == 0, never in NBRA denominator)
+    nbra_score: Mapped[Optional[float]] = mapped_column(Numeric(12, 4), nullable=True)
+    source_action_type: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
+    # Automated actions bypass NBRA queue and route directly to Relay
+    is_automated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "opportunity_thread_id", "source_action_type", "revenue_type",
+            name="uq_opportunity_score_action",
+        ),
+        Index("ix_opp_scores_thread_id", "opportunity_thread_id"),
+        Index("ix_opp_scores_buyer_entity", "buyer_entity_id"),
+        Index("ix_opp_scores_segment_nbra", "segment", "nbra_score"),
+        CheckConstraint(
+            "segment IN ('whale','auction_winner','lapsed_subscriber','default')",
+            name="ck_opp_scores_segment",
+        ),
+        CheckConstraint(
+            "billing_interval IN ('monthly','annual') OR billing_interval IS NULL",
+            name="ck_opp_scores_billing_interval",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<OpportunityScore(id={self.id!r}, thread={self.opportunity_thread_id!r}, "
+            f"segment={self.segment!r}, nbra={self.nbra_score!r})>"
+        )
+
+
+class OpportunityScoreHistory(Base):
+    """
+    Immutable audit trail — one row per recalculation of an OpportunityScore.
+    Never updated after insert; written by calibration_service and scoring service.
+    """
+    __tablename__ = "opportunity_score_history"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    opportunity_score_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("opportunity_scores.id", ondelete="CASCADE"), nullable=False, index=True,
+    )
+    opportunity_thread_id: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
+    snapshot_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+    p_reply: Mapped[float] = mapped_column(Numeric(6, 4), nullable=False)
+    p_close: Mapped[float] = mapped_column(Numeric(6, 4), nullable=False)
+    time_to_cash_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    nbra_score: Mapped[float] = mapped_column(Numeric(12, 4), nullable=False)
+    reason: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+
+    __table_args__ = (
+        Index("ix_opp_score_history_score_id", "opportunity_score_id"),
+        Index("ix_opp_score_history_thread_id", "opportunity_thread_id"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<OpportunityScoreHistory(id={self.id!r}, score_id={self.opportunity_score_id!r}, "
+            f"snapshot_at={self.snapshot_at!r})>"
+        )
+
+
+# ============================================================================
+# THROUGH-v2.2 — CORA BATCH APPROVAL
+# ============================================================================
 
 class CoraDraftBatch(Base):
     """One THROUGH-v2.2 batch shown to Josh in Slack for one-tap approval —

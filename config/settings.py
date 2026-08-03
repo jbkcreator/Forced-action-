@@ -136,8 +136,6 @@ class AppSettings(BaseSettings):
 	stripe_price_starter_regular: Optional[str] = Field(default=None, env="STRIPE_PRICE_STARTER_REGULAR")
 	stripe_price_pro_founding: Optional[str] = Field(default=None, env="STRIPE_PRICE_PRO_FOUNDING")
 	stripe_price_pro_regular: Optional[str] = Field(default=None, env="STRIPE_PRICE_PRO_REGULAR")
-	stripe_price_dominator_founding: Optional[str] = Field(default=None, env="STRIPE_PRICE_DOMINATOR_FOUNDING")
-	stripe_price_dominator_regular: Optional[str] = Field(default=None, env="STRIPE_PRICE_DOMINATOR_REGULAR")
 	stripe_price_founder_monthly: Optional[str] = Field(default=None, env="STRIPE_PRICE_FOUNDER_MONTHLY")
 	stripe_price_founder_annual: Optional[str] = Field(default=None, env="STRIPE_PRICE_FOUNDER_ANNUAL")
 	stripe_price_lead_pack: Optional[str] = Field(default=None, env="STRIPE_PRICE_LEAD_PACK")
@@ -218,8 +216,6 @@ class AppSettings(BaseSettings):
 	stripe_test_price_starter_regular: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_STARTER_REGULAR")
 	stripe_test_price_pro_founding: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_PRO_FOUNDING")
 	stripe_test_price_pro_regular: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_PRO_REGULAR")
-	stripe_test_price_dominator_founding: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_DOMINATOR_FOUNDING")
-	stripe_test_price_dominator_regular: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_DOMINATOR_REGULAR")
 	# Not read by get_price_id_for_checkout (founder resolves via plans.stripe_price_id,
 	# not this env var) — kept for mapping-table parity with every other tier only.
 	stripe_test_price_founder_monthly: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_FOUNDER_MONTHLY")

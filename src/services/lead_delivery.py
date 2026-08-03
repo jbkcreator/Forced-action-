@@ -52,7 +52,6 @@ def is_deliverable_verdict(grade: Optional[str], routed_channel: Optional[str]) 
 # ahead of dominator. See ADR 0036 (amends 0035).
 _TIER_RANK = {
     "founder": 50,
-    "dominator": 40,
     "pro": 30,
     "starter": 20,
     "free_trial": 10,

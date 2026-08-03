@@ -772,7 +772,7 @@ def _fetch_pricing_from_stripe() -> dict:
     all_prices = _price_ids()
 
     pricing_info = {}
-    for tier in ("starter", "pro", "dominator", "annual_lock"):
+    for tier in ("starter", "pro", "founder", "annual_lock"):
         founding_id = all_prices.get(tier, {}).get("founding")
         regular_id = all_prices.get(tier, {}).get("regular")
 
@@ -910,7 +910,7 @@ def _attribution_stripe_metadata(request: Request, attribution: Optional[dict]) 
 
 
 class CheckoutRequest(BaseModel):
-    tier: str        # starter | pro | dominator | founder
+    tier: str        # starter | pro | founder | annual_lock
     vertical: str    # roofing | remediation | investor
     county_id: str   # hillsborough
     zip_codes: list[str] = []  # ZIP territories to lock on purchase
@@ -993,7 +993,7 @@ class CheckoutRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_zip_count(self) -> "CheckoutRequest":
-        limits = {"starter": 1, "pro": 3, "dominator": 10, "annual_lock": 1, "founder": 10}
+        limits = {"starter": 1, "pro": 3, "annual_lock": 1, "founder": 10}
         limit = limits.get(self.tier)
         if limit and len(self.zip_codes) != limit:
             raise ValueError(f"{self.tier.title()} plan requires exactly {limit} ZIP code{'s' if limit > 1 else ''}.")
@@ -1723,7 +1723,7 @@ async def stripe_wl_webhook(
 # founding-summary used before this was extracted, just named and reused.
 # ---------------------------------------------------------------------------
 
-_FOUNDING_TIERS = ["starter", "pro", "dominator"]
+_FOUNDING_TIERS = ["starter", "pro", "founder"]
 
 
 def _county_founding_deadline(db: Session, county_id: str) -> Optional[datetime]:
@@ -1867,7 +1867,7 @@ def founding_spots(
 
 # _ZIP_RE and _FLORIDA_PREFIXES imported from src.api.deps
 
-_ZIP_PRICING_TIERS = ("starter", "pro", "dominator", "annual_lock")
+_ZIP_PRICING_TIERS = ("starter", "pro", "founder", "annual_lock")
 
 
 def _cohort_adjusted_pricing(county_id: str, vertical: str, db: Session) -> dict:
@@ -5870,7 +5870,7 @@ def upgrade(req: UpgradeRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=503, detail=f"Stripe price not configured for {req.tier}")
 
     # Settle every guarantee cycle that already closed on the outgoing tier —
-    # otherwise switching sub.tier off starter/pro/dominator drops it from
+    # otherwise switching sub.tier off starter/pro/founder drops it from
     # the daily sweep's tier filter and any closed cycle is never evaluated.
     # evaluate_subscriber_guarantee() only advances one cycle per call, so a
     # subscriber sitting on a backlog of several closed cycles (sweep
@@ -7851,6 +7851,117 @@ h1{{font-size:1.5rem}}a.cta{{display:inline-block;margin-top:24px;padding:12px 2
 </body>
 </html>"""
     return HTMLResponse(content=html)
+
+
+# ---------------------------------------------------------------------------
+# POST /api/vertical/probe
+# POST /api/vertical/presell-confirm
+# GET  /api/vertical/verdict/{verdict_id}
+# ---------------------------------------------------------------------------
+
+class _VerticalProbeRequest(BaseModel):
+    vertical_candidate_packet_id: int
+
+
+class _PresellConfirmRequest(BaseModel):
+    verdict_id: int
+
+
+@app.post("/api/vertical/probe")
+def api_vertical_probe(
+    payload: _VerticalProbeRequest,
+    db: Session = Depends(get_db),
+    _admin: dict = Depends(get_current_admin),
+):
+    """Run probe loop for a VerticalCandidatePacket. Idempotent per packet per day."""
+    from src.services.vertical_autopilot import run_probe
+    try:
+        probe = run_probe(payload.vertical_candidate_packet_id, db)
+        db.commit()
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"error": "probe_error", "message": str(exc)})
+    except OperationalError:
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
+    except Exception:
+        logger.error("api_vertical_probe: unexpected error", exc_info=True)
+        raise HTTPException(status_code=500, detail={"error": "internal_error", "message": "Probe failed unexpectedly"})
+
+    return {
+        "probe_id": probe.id,
+        "vertical_name": probe.vertical_name,
+        "status": probe.status,
+        "sends_count": probe.sends_count,
+        "reply_count": probe.reply_count,
+        "reply_rate": float(probe.reply_rate),
+        "idempotency_key": probe.idempotency_key,
+        "started_at": probe.started_at.isoformat() if probe.started_at else None,
+        "completed_at": probe.completed_at.isoformat() if probe.completed_at else None,
+    }
+
+
+@app.post("/api/vertical/presell-confirm")
+def api_vertical_presell_confirm(
+    payload: _PresellConfirmRequest,
+    db: Session = Depends(get_db),
+    _admin: dict = Depends(get_current_admin),
+):
+    """Confirm presell for a VerticalVerdict. Unblocks dev queue entry."""
+    from src.services.vertical_autopilot import confirm_presell
+    try:
+        verdict = confirm_presell(payload.verdict_id, db)
+        db.commit()
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail={"error": "not_found", "message": str(exc)})
+    except OperationalError:
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
+    except Exception:
+        logger.error("api_vertical_presell_confirm: unexpected error", exc_info=True)
+        raise HTTPException(status_code=500, detail={"error": "internal_error", "message": "Confirm presell failed unexpectedly"})
+
+    return {
+        "verdict_id": verdict.id,
+        "vertical_name": verdict.vertical_name,
+        "presell_confirmed": verdict.presell_confirmed,
+        "verdict": verdict.verdict,
+        "package_id": verdict.package_id,
+    }
+
+
+@app.get("/api/vertical/verdict/{verdict_id}")
+def api_vertical_verdict(
+    verdict_id: int,
+    db: Session = Depends(get_db),
+    _admin: dict = Depends(get_current_admin),
+):
+    """Return a VerticalVerdict by ID."""
+    from sqlalchemy import select as _select
+    from src.core.models import VerticalVerdict
+    try:
+        verdict = db.execute(
+            _select(VerticalVerdict).where(VerticalVerdict.id == verdict_id)
+        ).scalar_one_or_none()
+    except OperationalError:
+        raise HTTPException(status_code=503, detail={"error": "service_unavailable", "message": "Database temporarily unavailable"})
+
+    if verdict is None:
+        raise HTTPException(status_code=404, detail={"error": "not_found", "message": "Verdict not found"})
+
+    return {
+        "id": verdict.id,
+        "vertical_name": verdict.vertical_name,
+        "vertical_probe_id": verdict.vertical_probe_id,
+        "vertical_candidate_packet_id": verdict.vertical_candidate_packet_id,
+        "verdict": verdict.verdict,
+        "verdict_at": verdict.verdict_at.isoformat() if verdict.verdict_at else None,
+        "rule_fired": verdict.rule_fired,
+        "reply_rate_at_verdict": float(verdict.reply_rate_at_verdict),
+        "presell_confirmed": verdict.presell_confirmed,
+        "package_generated": verdict.package_generated,
+        "package_id": verdict.package_id,
+        "clone_status": verdict.clone_status,
+        "source_county": verdict.source_county,
+        "handoff_payload": verdict.handoff_payload,
+    }
 
 
 # ---------------------------------------------------------------------------

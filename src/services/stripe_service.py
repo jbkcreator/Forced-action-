@@ -6,12 +6,12 @@ Handles:
   - Checkout session creation
   - One-time payments (lead pack, hot lead unlock)
 
-Pricing table:
-  Tier        | Founding | Regular | Future (6mo)
-  ------------|----------|---------|-------------
-  starter     | $600/mo  | $800/mo | $1,100/mo
-  pro         | $1,100   | $1,500  | $1,900
-  dominator   | $2,000   | $2,800  | $3,500
+Pricing table (live rates — founding rate = current live rate for all tiers):
+  Tier        | Live/Founding | Regular (future)
+  ------------|---------------|------------------
+  starter     | $299/mo       | TBD
+  pro         | $499/mo       | TBD
+  founder     | $1,100/mo     | —
 
 Every product has TWO Stripe price objects: founding_price_id + regular_price_id.
 Founding rate is selected atomically at checkout and locked forever.
@@ -68,10 +68,6 @@ def _price_ids():
         "pro": {
             "founding": settings.active_stripe_price("pro_founding"),
             "regular":  settings.active_stripe_price("pro_regular"),
-        },
-        "dominator": {
-            "founding": settings.active_stripe_price("dominator_founding"),
-            "regular":  settings.active_stripe_price("dominator_regular"),
         },
         "partner": {
             "founding": settings.active_stripe_price("partner"),
