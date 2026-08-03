@@ -107,43 +107,14 @@ def enqueue(
     recipient: str,
     payload: dict,
     thread_id: Optional[str] = None,
-    skip_contract_validation: bool = False,
 ) -> QueueItem:
-    """Write a new 'pending' row. Called by Cora/THROUGH (Phase 2) and by
-    R1's --seed CLI today.
-
-    QUALITY-v2.2 Q3: every call is validated against
-    src.agents.contracts.cora_to_relay.CoraRelayHandoff before anything is
-    written -- an incomplete handoff (missing thread_id, an unregistered
-    channel, empty subject/body) is rejected here instead of landing
-    'pending' and only failing at dispatch time (the exact gap R4's audit
-    found). skip_contract_validation exists ONLY for R1's --seed CLI, an
-    explicit founder/dev manual-testing tool that has always allowed
-    thread_id to be omitted -- every other caller is validated by default.
+    """Write a new 'pending' row. Called by Cora (Phase 2) and by R1's
+    --seed CLI today — identical call, zero code change when Cora lands.
 
     If idempotency_key already exists (e.g. a caller retries the same
     proposed action), returns the existing row instead of raising or
     creating a duplicate.
     """
-    if not skip_contract_validation:
-        from pydantic import ValidationError
-
-        from src.agents.contracts.cora_to_relay import reject_handoff, validate_handoff
-
-        try:
-            validate_handoff(
-                idempotency_key=idempotency_key, channel=channel, recipient=recipient,
-                payload=payload, thread_id=thread_id,
-            )
-        except ValidationError as exc:
-            errors = [f"{'.'.join(str(p) for p in e['loc']) or '<handoff>'}: {e['msg']}" for e in exc.errors()]
-            with get_db_context() as reject_session:
-                rejected = reject_handoff(
-                    reject_session, idempotency_key=idempotency_key,
-                    errors=errors, payload_snapshot=payload or {},
-                )
-            raise rejected from exc
-
     try:
         with get_db_context() as session:
             item = RelayApprovalQueueItem(
