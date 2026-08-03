@@ -18,7 +18,7 @@ import logging
 import secrets
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional, Literal
+from typing import Any, Dict, List, Optional, Literal
 
 import pandas as pd
 import stripe
@@ -1483,6 +1483,218 @@ async def slack_relay_decision(request: Request):
         _update_relay_slack_message(item.slack_message_ts, reply_text)
 
     return {"ok": True}
+
+
+# ===========================================================================
+# THROUGH-v2.2 — BATCH-APPROVAL SLACK INTERACTION (T1)
+# ===========================================================================
+
+def _through_approver_authorized(user_id: str) -> bool:
+    """Fail CLOSED, same reasoning as _relay_approver_authorized: an empty/
+    unset CORA_THROUGHPUT_APPROVERS means nobody is authorized, not
+    everybody."""
+    approvers = settings.cora_throughput_approvers
+    return bool(approvers) and user_id in approvers
+
+
+@router.post("/slack/cora-batch/interact")
+async def slack_cora_batch_interact(request: Request, db: Session = Depends(get_db)):
+    """
+    Receives Slack interactive component payloads for THROUGH-v2.2's batch
+    review ("Approve Batch" / per-item "Reject") and standing-order
+    proposals ("Ratify" / "Decline") — two different action families on the
+    same endpoint, distinguished by whether the button's value carries a
+    batch_id or a standing_order_id.
+    Auth: Slack HMAC-SHA256 signature (no JWT — Slack signature IS the auth).
+    """
+    from src.services.cora_throughput import batch_slack as through_slack
+    from src.services.cora_throughput.decisions import record_batch_decision, record_standing_order_decision
+
+    raw = await request.body()
+    if not _verify_slack_signature(dict(request.headers), raw):
+        raise HTTPException(status_code=401, detail="Invalid Slack signature")
+
+    try:
+        payload_str = parse_qs(raw.decode("utf-8")).get("payload", ["{}"])[0]
+        payload = json.loads(payload_str)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Malformed payload")
+
+    user_id = payload.get("user", {}).get("id", "")
+    if not _through_approver_authorized(user_id):
+        return _slack_ephemeral("Not authorized to approve Cora batches.")
+
+    actions = payload.get("actions", [])
+    if not actions:
+        return _slack_ephemeral("No action found in payload.")
+
+    try:
+        action_data = json.loads(actions[0].get("value", "{}"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid action value")
+
+    action = action_data.get("action")
+
+    if action == "keep_standing_order":
+        # Monthly-digest "Keep" button — inaction means keep. Ack only.
+        return {"ok": True}
+
+    if action in ("ratify_standing_order", "decline_standing_order", "archive_standing_order"):
+        standing_order_id = action_data.get("standing_order_id")
+        if not standing_order_id:
+            raise HTTPException(status_code=400, detail="Invalid action data")
+        result = record_standing_order_decision(db, standing_order_id, action, decided_by=user_id)
+        db.commit()
+        if not result.get("ok"):
+            return _slack_ephemeral(f"Standing order #{standing_order_id}: {result.get('reason', 'could not be decided')}.")
+        reply_text = {
+            "ratify_standing_order": f":white_check_mark: Standing order ratified by <@{user_id}>.",
+            "decline_standing_order": f":no_entry: Standing order declined by <@{user_id}>.",
+            "archive_standing_order": f":wastebasket: Standing order archived by <@{user_id}>.",
+        }[action]
+        if result.get("slack_message_ts"):
+            through_slack.update_batch_slack_message(result["slack_message_ts"], reply_text)
+        return {"ok": True}
+
+    batch_id = action_data.get("batch_id")
+    draft_id = action_data.get("draft_id")
+    if not batch_id or action not in ("approve_all", "reject_item"):
+        raise HTTPException(status_code=400, detail="Invalid action data")
+
+    result = record_batch_decision(db, batch_id, action, decided_by=user_id, draft_id=draft_id)
+    db.commit()
+
+    if not result.get("ok"):
+        return _slack_ephemeral(f"Batch {batch_id[:8]}: {result.get('reason', 'could not be decided')}.")
+
+    slack_message_ts_row = db.execute(
+        text("SELECT slack_message_ts FROM cora_draft_batches WHERE batch_id = :batch_id"),
+        {"batch_id": batch_id},
+    ).first()
+    slack_message_ts = slack_message_ts_row[0] if slack_message_ts_row else None
+
+    if action == "approve_all":
+        reply_text = (
+            f":white_check_mark: Batch approved by <@{user_id}> — "
+            f"{result['approved_count']} sent to Relay, {result['rejected_count']} exception-rejected."
+        )
+    else:
+        reply_text = f":no_entry: Draft `{draft_id[:8]}` exception-rejected by <@{user_id}> — rest of the batch still open."
+
+    if slack_message_ts:
+        through_slack.update_batch_slack_message(slack_message_ts, reply_text)
+
+    return {"ok": True}
+
+
+# ===========================================================================
+# THROUGH-v2.2 — QUEUE VISIBILITY (read-only — all decisions happen in Slack)
+# ===========================================================================
+
+@router.get("/cora-batches")
+def get_cora_batches(
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    Read-only visibility into THROUGH-v2.2's batch queue and standing orders
+    — approve/reject/ratify/decline only ever happen via the Slack tap
+    (POST /admin/slack/cora-batch/interact). This endpoint has no mutation
+    path, deliberately: the founder-facing "one tap" flow stays in Slack.
+    """
+    batches = db.execute(
+        text(
+            """
+            SELECT b.batch_id, b.status, b.created_at, b.decided_by, b.decided_at,
+                   (SELECT count(*) FROM cora_batch_items WHERE cora_batch_items.batch_id = b.batch_id) AS item_count,
+                   (SELECT count(*) FROM cora_batch_items
+                    WHERE cora_batch_items.batch_id = b.batch_id AND cora_batch_items.decision = 'exception_rejected') AS rejected_count
+            FROM cora_draft_batches b
+            ORDER BY b.created_at DESC
+            LIMIT 20
+            """
+        )
+    ).mappings().all()
+
+    standing_orders = db.execute(
+        text(
+            "SELECT id, cell_id, rule_text, active, created_by, created_at "
+            "FROM cora_standing_orders ORDER BY created_at DESC LIMIT 20"
+        )
+    ).mappings().all()
+
+    return {
+        "batches": [dict(r) for r in batches],
+        "standing_orders": [dict(r) for r in standing_orders],
+    }
+
+
+# ===========================================================================
+# THROUGH-v2.2 — CLOSING COCKPIT (T3)
+# ===========================================================================
+
+@router.get("/closing-cockpit/{opportunity_thread_id}")
+def get_closing_cockpit(
+    opportunity_thread_id: str,
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    One-screen call-time reference: prospect identity, latest pre-call brief
+    (objections/recommended offer/pricing/links — already built by Cora's
+    pre_call subgraph, no new brief logic here), and best-effort call
+    history. The SynthflowCall/CloserCall join is phone-based, not an FK —
+    none exists linking either table back to opportunity_thread_id — so a
+    miss here means "no match found," never an error.
+    """
+    from src.agents.cora import store
+    from src.agents.cora.tools.read_tools import get_buyer_entity_by_opportunity_thread_id, get_contact_channel
+    from src.services.phone_utils import normalize as normalize_phone
+
+    buyer_entity = get_buyer_entity_by_opportunity_thread_id(db, opportunity_thread_id)
+    if buyer_entity is None:
+        raise HTTPException(status_code=404, detail="Opportunity thread not found")
+
+    briefs = sorted(
+        store.read_pre_call_briefs(opportunity_thread_id=opportunity_thread_id),
+        key=lambda b: b.get("created_at") or "",
+    )
+    latest_brief = briefs[-1] if briefs else None
+
+    contact = get_contact_channel(db, buyer_entity["id"])
+    normalized_phone = normalize_phone(contact.get("phone"))
+
+    synthflow_calls: List[Dict[str, Any]] = []
+    closer_calls: List[Dict[str, Any]] = []
+    if normalized_phone:
+        synthflow_rows = db.execute(
+            text(
+                "SELECT id, outcome, vertical, call_date, duration_seconds, recording_url "
+                "FROM synthflow_calls WHERE prospect_phone = :phone ORDER BY call_date DESC LIMIT 10"
+            ),
+            {"phone": normalized_phone},
+        ).mappings().all()
+        synthflow_calls = [dict(r) for r in synthflow_rows]
+
+        closer_rows = db.execute(
+            text(
+                "SELECT id, closer_name, direction, started_at, ended_at, call_outcome, "
+                "sentiment, objections, objection_resolved "
+                "FROM closer_calls WHERE dialed_e164 = :phone ORDER BY started_at DESC LIMIT 10"
+            ),
+            {"phone": normalized_phone},
+        ).mappings().all()
+        closer_calls = [dict(r) for r in closer_rows]
+
+    return {
+        "opportunity_thread_id": opportunity_thread_id,
+        "buyer_entity": buyer_entity,
+        "contact": {"email": contact.get("email"), "phone": normalized_phone},
+        "pre_call_brief": latest_brief.get("content") if latest_brief else None,
+        "call_history_match": "phone" if normalized_phone else "none",
+        "synthflow_calls": synthflow_calls,
+        "closer_calls": closer_calls,
+    }
 
 
 @router.post("/slack/kill")

@@ -1202,6 +1202,12 @@ class Subscriber(Base):
     rate_locked_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     escalated_at: Mapped[Optional[datetime]] = mapped_column(DateTime)     # set when 6-month founding rate expires
 
+    # Founder-tier (tier == 'founder') zip_held win-back benefit — a one-time,
+    # +14-day territory grace extension in place of the standard 50%-off
+    # coupon (founders don't get discounted). Live-state only: applies while
+    # currently tier == 'founder'; not tied to founding_member/founding rate.
+    founder_grace_extension_granted_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
     # Subscription state
     status: Mapped[str] = mapped_column(String(20), default='active', nullable=False)  # active | grace | churned | cancelled
     billing_date: Mapped[Optional[datetime]] = mapped_column(DateTime)
@@ -1390,6 +1396,8 @@ class ActivationEvent(Base):
     signup_time: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+    welcome_email_sent_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    magic_link_redeemed_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     onboarding_completed_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     first_leads_shown_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     first_unlock_time: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
@@ -1398,11 +1406,13 @@ class ActivationEvent(Base):
     )
 
     def __repr__(self):
-        return (
-            f"<ActivationEvent(subscriber_id={self.subscriber_id}, "
-            f"onboarded={self.onboarding_completed_time}, "
-            f"shown={self.first_leads_shown_time}, unlocked={self.first_unlock_time})>"
-        )
+            return (
+                f"<ActivationEvent(subscriber_id={self.subscriber_id}, "
+                f"welcome_sent={self.welcome_email_sent_time}, "
+                f"magic_redeemed={self.magic_link_redeemed_time}, "
+                f"onboarded={self.onboarding_completed_time}, "
+                f"shown={self.first_leads_shown_time}, unlocked={self.first_unlock_time})>"
+            )
 
 
 class ZipTerritory(Base):
@@ -3013,6 +3023,9 @@ class MessageOutcome(Base):
     template_id: Mapped[Optional[str]] = mapped_column(String(100))
     variant_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)  # A/B test variant
     channel: Mapped[Optional[str]] = mapped_column(String(50))  # twilio/ses/synthflow
+    recipient_email: Mapped[Optional[str]] = mapped_column(String(255), index=True)
+    provider_message_id: Mapped[Optional[str]] = mapped_column(String(100), index=True)
+    failure_reason: Mapped[Optional[str]] = mapped_column(String(255))
     sent_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
     opened_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
@@ -8982,3 +8995,96 @@ class OpportunityScoreHistory(Base):
             f"<OpportunityScoreHistory(id={self.id!r}, score_id={self.opportunity_score_id!r}, "
             f"snapshot_at={self.snapshot_at!r})>"
         )
+
+
+# ============================================================================
+# THROUGH-v2.2 — CORA BATCH APPROVAL
+# ============================================================================
+
+class CoraDraftBatch(Base):
+    """One THROUGH-v2.2 batch shown to Josh in Slack for one-tap approval —
+    the founder-facing layer between Cora's drafts and Relay's execution
+    queue. Separate from RelayApprovalQueueItem.batch_id, which groups rows
+    claimed together by one execution run, a different concept entirely."""
+    __tablename__ = "cora_draft_batches"
+
+    batch_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+    slack_message_ts: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    slack_channel: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    decided_by: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'approved', 'rejected', 'partial', 'expired')",
+            name="ck_cora_draft_batches_status",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return f"<CoraDraftBatch(batch_id={self.batch_id!r}, status={self.status!r})>"
+
+
+class CoraBatchItem(Base):
+    """One draft's membership + individual decision within a CoraDraftBatch —
+    what THROUGH-v2.2's standing-order compiler (T4) mines for approval
+    history, grouped by outbound_drafts.cell_id."""
+    __tablename__ = "cora_batch_items"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    batch_id: Mapped[str] = mapped_column(String(36), ForeignKey("cora_draft_batches.batch_id"), nullable=False)
+    draft_id: Mapped[str] = mapped_column(String(36), ForeignKey("outbound_drafts.draft_id"), nullable=False)
+    decision: Mapped[str] = mapped_column(String(20), nullable=False, default="included")
+    decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+
+    __table_args__ = (
+        Index("ix_cora_batch_items_batch_id", "batch_id"),
+        Index("ix_cora_batch_items_draft_id", "draft_id"),
+        UniqueConstraint("batch_id", "draft_id", name="uq_cora_batch_items_batch_draft"),
+        CheckConstraint(
+            "decision IN ('included', 'exception_rejected')",
+            name="ck_cora_batch_items_decision",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return f"<CoraBatchItem(batch_id={self.batch_id!r}, draft_id={self.draft_id!r}, decision={self.decision!r})>"
+
+
+class CoraStandingOrder(Base):
+    """A founder-ratified rule (THROUGH-v2.2 T4) letting future drafts of a
+    given cell_id auto-approve without a Slack tap, once the same action has
+    been approved cleanly (no exception-rejects) enough times in a row.
+    No 'existing amendment-diff mechanism' was found anywhere in this repo
+    to build on top of — this is genuinely new, not a reuse."""
+    __tablename__ = "cora_standing_orders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    cell_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    rule_text: Mapped[str] = mapped_column(Text, nullable=False)
+    created_by: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    slack_message_ts: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    approval_count_at_proposal: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+
+    __table_args__ = (
+        Index("ix_cora_standing_orders_cell_id_active", "cell_id", "active"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<CoraStandingOrder(cell_id={self.cell_id!r}, active={self.active!r})>"

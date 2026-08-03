@@ -20,6 +20,7 @@ import logging
 
 from src.consumers.outcome_consumers import (
     handle_outcome_loss_autopsy,
+    handle_outcome_social_proof_prompt,
     handle_outcome_snapshot,
 )
 from src.core.database import get_db_context
@@ -36,7 +37,17 @@ def run_sweep(session) -> dict:
     """Poll outcome.recorded for both consumers. Returns per-consumer counts."""
     snapshot = poll_and_dispatch(session, "outcome_snapshot", _EVENT_TYPES, handle_outcome_snapshot)
     autopsy = poll_and_dispatch(session, "outcome_loss_autopsy", _EVENT_TYPES, handle_outcome_loss_autopsy)
-    return {"outcome_snapshot": snapshot, "outcome_loss_autopsy": autopsy}
+    social_proof = poll_and_dispatch(
+        session,
+        "outcome_social_proof_prompt",
+        _EVENT_TYPES,
+        handle_outcome_social_proof_prompt,
+    )
+    return {
+        "outcome_snapshot": snapshot,
+        "outcome_loss_autopsy": autopsy,
+        "outcome_social_proof_prompt": social_proof,
+    }
 
 
 def main() -> None:

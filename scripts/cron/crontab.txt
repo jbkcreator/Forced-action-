@@ -893,4 +893,30 @@ COUNTY_ID=hillsborough
 # every 15 min is generous relative to how rarely this should fire.
 */15 * * * * $PROJECT/scripts/cron/run.sh src.services.winback_offers --reconcile
 
+# THROUGH-v2.2 T4 — Monthly standing-order digest. 1st of each month, 9am:
+# posts every active auto-approval rule to Slack with Keep/Archive buttons so
+# Josh can prune. Inaction = keep (no auto-expire).
+0 9 1 * * $PROJECT/scripts/cron/run.sh src.services.cora_throughput.standing_order_digest
+
+# DNC re-scrub — subscribers target (Section 2.5 voice-compliance gate:
+# self-signup phones never get a dnc_phone_checks row today, so every outbound
+# voice call to them fail-closes with reason='dnc_check_required' in
+# compliance_gator.py). Tracerfy is already the vendor (same account used for
+# skip-trace); this just adds the target that was never scheduled.
+#
+# Runs 1st AND 15th, NOT monthly. compliance_gator.py:74,84 blocks when
+# checked_at is older than settings.dnc_recheck_days (default 30). A
+# once-monthly run leaves a 31-day gap in 31-day months, so the check would go
+# stale ~1 day before its own refresh and silently block all voice dispatch
+# for that day, 7 months a year. Twice-monthly keeps the worst-case gap at 16
+# days — comfortably inside the window. Do NOT raise DNC_RECHECK_DAYS to
+# compensate: the FTC safe harbour is 31 days, so 30 is deliberately
+# conservative.
+#
+# Cost: $0.02/phone/run, all non-null subscriber phones re-scrubbed each run
+# (no per-phone staleness tracking). 56 phones today = ~$1.12/run, ~$2.24/mo.
+# Verified via: PYTHONPATH=. python -m src.tasks.dnc_refresh --targets subscribers --dry-run
+# Sign-off received — enabled 2026-07-28.
+0 2 1,15 * * $PROJECT/scripts/cron/run.sh src.tasks.dnc_refresh --targets subscribers
+
 # === END FORCED-ACTION-PLATFORM ===

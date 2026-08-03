@@ -304,3 +304,20 @@ class CallBookedStubPayload(TypedDict):
     call_booked_at: str
     rep: Optional[str]
     scheduled_for: Optional[str]
+
+
+class CallCompletedStubPayload(TypedDict):
+    """
+    Input shape for a completed-call trigger (THROUGH-v2.2 T3's post-call
+    auto-drafter). Deliberately a stub, same treatment as ReplyStubPayload —
+    which vendor (a dedicated Synthflow webhook, a dedicated Aircall webhook,
+    or something else) actually calls post_call_producer.produce_post_call_event
+    with real data is an unconfirmed, deferred integration decision. Everything
+    downstream of the producer (the post_call_recap subgraph, drafting,
+    persistence, THROUGH's batch pipeline) is real.
+    """
+    opportunity_thread_id: str
+    transcript_text: Optional[str]
+    call_outcome: Optional[str]
+    duration_seconds: Optional[int]
+    completed_at: str

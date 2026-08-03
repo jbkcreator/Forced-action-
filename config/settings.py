@@ -1,6 +1,7 @@
 """Application configuration powered by Pydantic settings."""
 
 from functools import lru_cache
+from datetime import date
 
 from typing import Optional
 
@@ -104,6 +105,13 @@ class AppSettings(BaseSettings):
 	# Abandoned-checkout recovery (Task 7). Off by default — the sweep captures
 	# and ages rows but sends nothing until this is enabled after review.
 	checkout_recovery_enabled: bool = Field(default=False, env="CHECKOUT_RECOVERY_ENABLED")
+	# E3 — only prompt for testimonial/referral asks on deal wins recorded after
+	# the feature's go-live date. Closed ticket explicitly deferred historical
+	# backfill; default to the implementation ship date.
+	deal_win_testimonial_go_live_at: date = Field(
+		default=date(2026, 7, 28),
+		env="DEAL_WIN_TESTIMONIAL_GO_LIVE_AT",
+	)
 	# Lead-pack recovery targets EXISTING paying subscribers who abandon a $99
 	# add-on — a different (dunning) motion from prospect cart recovery. Off by
 	# default so enabling checkout_recovery_enabled does NOT start emailing
@@ -388,6 +396,7 @@ class AppSettings(BaseSettings):
 	smtp_port: int = Field(default=587, env="SMTP_PORT")
 	smtp_user: Optional[str] = Field(default=None, env="SMTP_USER")
 	smtp_pass: Optional[SecretStr] = Field(default=None, env="SMTP_PASS")
+	mandrill_webhook_key: Optional[SecretStr] = Field(default=None, env="MANDRILL_WEBHOOK_KEY")
 	email_from: Optional[str] = Field(default=None, env="EMAIL_FROM")  # falls back to smtp_user if not set
 	alert_email: Optional[str] = Field(default=None, env="ALERT_EMAIL")  # ops alert recipient
 	report_recipients: Optional[str] = Field(default=None, env="REPORT_RECIPIENTS")  # comma-separated emails for daily/weekly reports
@@ -581,6 +590,14 @@ class AppSettings(BaseSettings):
 	# slack_signing_secret above — no separate Slack app.
 	relay_slack_channel: str = Field(default="", env="RELAY_SLACK_CHANNEL")
 	relay_approvers: list = Field(default=[], env="RELAY_APPROVERS")
+
+	# THROUGH-v2.2 batch-approval layer. Reuses slack_bot_token/slack_signing_secret
+	# above — no separate Slack app. Deliberately its own channel/approver list,
+	# not relay_slack_channel/relay_approvers — a batch of N cold-outreach drafts
+	# is a different review surface than Relay's per-item send approvals.
+	cora_throughput_slack_channel: str = Field(default="", env="CORA_THROUGHPUT_SLACK_CHANNEL")
+	cora_throughput_approvers: list = Field(default=[], env="CORA_THROUGHPUT_APPROVERS")
+	cora_batch_expiry_hours: int = Field(default=72, env="CORA_BATCH_EXPIRY_HOURS", description="Hours before a pending Cora draft batch auto-expires. Override via env var.")
 
 	# Relay email channel (RELAY-v2.2 sub-task R2). relay_instantly_campaign_id
 	# is set once after running `python -m src.services.relay --setup-email-channel`
