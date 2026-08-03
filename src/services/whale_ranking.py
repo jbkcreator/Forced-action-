@@ -63,6 +63,9 @@ class RankedWhale:
     opportunity_thread_id: Optional[str]
     canonical_name: str
     entity_type: str
+    confidence_score: int          # 0-100; the field gating.is_citable() gates on.
+                                    # Was missing entirely before QUALITY-v2.2 Q3 — nothing
+                                    # downstream could apply the citability gate without it.
     county_id: Optional[str]
     total_purchase_count: int
     total_cash_volume: Decimal
@@ -149,6 +152,7 @@ def get_ranked_whales(session: Session, limit: int = DEFAULT_LIMIT, county_id: O
                 ORDER BY bel.buyer_entity_id, d.record_date DESC NULLS LAST
             )
             SELECT be.id, be.opportunity_thread_id, be.canonical_name, be.entity_type,
+                   be.confidence_score,
                    be.county_id, be.total_purchase_count, be.total_cash_volume,
                    be.whale_flagged_at,
                    COALESCE(bc.has_phone, false) AS has_phone,
@@ -184,6 +188,7 @@ def get_ranked_whales(session: Session, limit: int = DEFAULT_LIMIT, county_id: O
             opportunity_thread_id=r.opportunity_thread_id,
             canonical_name=r.canonical_name,
             entity_type=r.entity_type,
+            confidence_score=r.confidence_score,
             county_id=r.county_id,
             total_purchase_count=r.total_purchase_count,
             total_cash_volume=r.total_cash_volume,
