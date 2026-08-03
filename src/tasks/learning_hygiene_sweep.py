@@ -119,20 +119,54 @@ def format_digest(report: HygieneReport) -> str:
     for verdict, count in sorted(report.counts.items(), key=lambda kv: -kv[1]):
         lines.append(f"  • {count} × {_VERDICT_LABELS.get(verdict, verdict)}")
 
-    applied = [a for a in report.actions if a.get("applied")]
-    if applied:
-        lines.append(f"*Mutated* ({len(applied)}):")
-        for action in applied:
+    # Bucketed by outcome, not just "applied or not" — a real (--apply) run
+    # can have some lessons succeed and one throw partway through (each
+    # lesson is its own savepoint, so one failure never aborts the rest).
+    # Grouping only on "applied" truthy would put successes in *Mutated* and
+    # silently drop the failure from the digest text entirely — visible only
+    # in server logs, which is exactly the "buried in a log" failure mode
+    # this job exists to avoid for lessons themselves. errored is checked
+    # first since it is mutually exclusive with the others by construction
+    # (see _apply: the except branch returns before "applied" or
+    # "skipped_reason" is touched).
+    mutated, failed, planned, noop = [], [], [], []
+    for action in report.actions:
+        if action.get("error"):
+            failed.append(action)
+        elif action.get("applied"):
+            mutated.append(action)
+        elif action.get("skipped_reason") == "dry_run":
+            planned.append(action)
+        else:
+            noop.append(action)
+
+    if failed:
+        lines.append(f"❌ *Failed to apply* ({len(failed)}) — needs investigation:")
+        for action in failed:
+            lines.append(
+                f"  • [{action['verdict']}] lesson {action['lesson_id']} "
+                f"`{action['lesson_name']}` — {action.get('error')}"
+            )
+    if mutated:
+        lines.append(f"*Mutated* ({len(mutated)}):")
+        for action in mutated:
             lines.append(
                 f"  • [{action['verdict']}] lesson {action['lesson_id']} "
                 f"`{action['lesson_name']}` — {action['reason']}"
             )
-    elif report.actions:
-        lines.append(f"*Would mutate* ({len(report.actions)}):")
-        for action in report.actions:
+    if planned:
+        lines.append(f"*Would mutate* ({len(planned)}):")
+        for action in planned:
             lines.append(
                 f"  • [{action['verdict']}] lesson {action['lesson_id']} "
                 f"`{action['lesson_name']}` — {action['reason']}"
+            )
+    if noop:
+        lines.append(f"*Attempted, no-op* ({len(noop)}) — already handled concurrently:")
+        for action in noop:
+            lines.append(
+                f"  • [{action['verdict']}] lesson {action['lesson_id']} "
+                f"`{action['lesson_name']}` — {action.get('skipped_reason')}"
             )
 
     for note in report.notes:

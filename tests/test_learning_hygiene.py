@@ -708,6 +708,45 @@ class TestSweep:
         assert audit.summary["evidence"]["contradictions"] == 3
         assert audit.summary["thresholds"]["contradiction_min_count"] == 3
 
+    def test_one_lesson_erroring_does_not_abort_or_taint_another(self, learn_db, monkeypatch):
+        """A savepoint per lesson means one failure must not roll back a
+        sibling's successful mutation in the same run, and must not leave the
+        failed lesson half-changed."""
+        good = self._contradicted_lesson(learn_db, name="ab_winner:good")
+        bad = self._contradicted_lesson(learn_db, name="ab_winner:bad")
+
+        real_mark_contradicted = svc.mark_contradicted
+
+        def _boom(session, playbook_id):
+            if playbook_id == bad:
+                raise RuntimeError("simulated failure")
+            return real_mark_contradicted(session, playbook_id)
+
+        monkeypatch.setattr(svc, "mark_contradicted", _boom)
+
+        report = svc.sweep(learn_db, dry_run=False)
+
+        good_action = next(a for a in report.actions if a["lesson_id"] == good)
+        bad_action = next(a for a in report.actions if a["lesson_id"] == bad)
+        assert good_action["applied"] is True
+        assert bad_action["applied"] is False
+        assert "simulated failure" in bad_action["error"]
+
+        statuses = dict(learn_db.execute(sa_text(
+            "SELECT id, status FROM lifecycle_playbook WHERE id = ANY(:ids)"
+        ), {"ids": [good, bad]}).all())
+        assert statuses[good] == "contradicted"
+        assert statuses[bad] == "adopted"
+
+        # The failed lesson must not have a stray audit row from a
+        # half-completed savepoint — ROLLBACK TO SAVEPOINT undoes the
+        # INSERT along with the tool's UPDATE.
+        bad_audit = learn_db.execute(sa_text("""
+            SELECT count(*) FROM agent_decisions
+            WHERE playbook_id = :id AND graph_name = :graph
+        """), {"id": bad, "graph": cfg.HYGIENE_GRAPH_NAME}).scalar()
+        assert bad_audit == 0
+
     def test_rerunning_is_idempotent(self, learn_db):
         lesson = self._contradicted_lesson(learn_db)
         svc.sweep(learn_db, dry_run=False)
@@ -836,6 +875,51 @@ class TestDigest:
         assert "Not covered by this sweep" in digest
         assert "412 unmeasurable" in digest
         assert digest.index("412 unmeasurable") < digest.index("Verdicts")
+
+    def test_a_failed_action_is_never_dropped_by_a_successful_one(self):
+        """Regression: grouping solely on truthy 'applied' put any successes
+        in *Mutated* and, since the code took an if/elif, silently dropped a
+        same-run failure from the digest text entirely — visible only in
+        server logs. One success must never hide another lesson's failure."""
+        report = svc.HygieneReport(
+            run_status=cfg.RUN_OK,
+            dry_run=False,
+            schema=svc.SchemaReadiness(ready=True),
+            feed=svc.FeedHealth("ok", 10, NOW),
+            actions=[
+                {
+                    "lesson_id": 1, "lesson_name": "ok_one",
+                    "verdict": cfg.VERDICT_CONTRADICT, "reason": "3 contradictions",
+                    "applied": True,
+                },
+                {
+                    "lesson_id": 2, "lesson_name": "broken_one",
+                    "verdict": cfg.VERDICT_CONTRADICT, "reason": "3 contradictions",
+                    "applied": False, "error": "connection reset",
+                },
+            ],
+        )
+        digest = format_digest(report)
+        assert "broken_one" in digest
+        assert "Failed to apply" in digest
+        assert "ok_one" in digest
+        assert "Mutated" in digest
+
+    def test_dry_run_planned_actions_do_not_hide_behind_a_mutated_entry(self):
+        report = svc.HygieneReport(
+            run_status=cfg.RUN_OK,
+            dry_run=True,
+            schema=svc.SchemaReadiness(ready=True),
+            feed=svc.FeedHealth("ok", 10, NOW),
+            actions=[{
+                "lesson_id": 3, "lesson_name": "would_do_this",
+                "verdict": cfg.VERDICT_SUPERSEDE, "reason": "newer scope match",
+                "applied": False, "skipped_reason": "dry_run",
+            }],
+        )
+        digest = format_digest(report)
+        assert "would_do_this" in digest
+        assert "Would mutate" in digest
 
     def test_schema_refusal_names_the_migration(self):
         report = svc.HygieneReport(
