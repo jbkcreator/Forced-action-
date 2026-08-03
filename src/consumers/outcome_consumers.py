@@ -22,6 +22,7 @@ import logging
 from sqlalchemy import text as sa_text
 from sqlalchemy.orm import Session
 
+from src.core.models import DealOutcome, Subscriber
 from src.services import outcome_reasons
 
 logger = logging.getLogger(__name__)
@@ -184,3 +185,30 @@ def handle_outcome_snapshot(session: Session, event_row) -> None:
 def handle_outcome_loss_autopsy(session: Session, event_row) -> None:
     """Poll-consumer wrapper around apply_loss_autopsy."""
     apply_loss_autopsy(session, event_row.payload or {})
+
+
+def handle_outcome_social_proof_prompt(session: Session, event_row) -> None:
+    """Send the merged testimonial+referral ask for current big-win outcomes."""
+    payload = event_row.payload or {}
+    if payload.get("outcome_state") != "closed":
+        return
+    if not _is_current(session, payload):
+        logger.info(
+            "[OutcomeCons] social proof skipped (superseded by a newer outcome) deal_outcome_id=%s",
+            payload.get("deal_outcome_id"),
+        )
+        return
+
+    outcome_id = payload.get("deal_outcome_id")
+    subscriber_id = payload.get("subscriber_id")
+    if not outcome_id or not subscriber_id:
+        return
+
+    outcome = session.get(DealOutcome, outcome_id)
+    subscriber = session.get(Subscriber, subscriber_id)
+    if outcome is None or subscriber is None:
+        return
+
+    from src.services.deal_win_social_proof import maybe_send_deal_win_social_proof_prompt
+
+    maybe_send_deal_win_social_proof_prompt(subscriber, outcome, session)

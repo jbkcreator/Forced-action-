@@ -15,7 +15,7 @@ Event envelope (example):
             "price_cents":      4900,
             "missed_leads":     3,
             "reason":           "saved_card_paid_intent",
-            "cta_url":          "https://app.forcedaction.io/dashboard/<uuid>?wallet_offer=accept",
+            "cta_url":          "https://app.forcedactionleads.com/dashboard/<uuid>?wallet_offer=accept",
         },
     }
 

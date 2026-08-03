@@ -9,7 +9,7 @@ and duplicate revision IDs** (`fa062`, `fa063`, `fa103` each defined twice). The
 graph is corrupt — `alembic upgrade head` cannot run, and the live
 `alembic_version` table already holds three stamped rows from the multi-head
 state. In practice Alembic was already dead: nothing runs `alembic upgrade` at
-deploy (Docker/compose only launch uvicorn + the Cora agents), tests build their
+deploy (Docker/compose only launch uvicorn + the Lifecycle agents), tests build their
 schema from `Base.metadata.create_all()` off `src/core/models.py`, and every
 recent schema change was applied through hand-written idempotent
 `scripts/apply_*.py` DDL against the single shared Postgres. This ADR ratifies

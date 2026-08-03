@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS pre_decision_snapshots (
     runner_up_verticals JSONB,
     pricing_cohort_id   INTEGER,
     pricing_snapshot    JSONB,
-    cora_graph          VARCHAR(100),
+    lifecycle_graph          VARCHAR(100),
     pitch_variant       VARCHAR(100),
     raw_context         JSONB,
     resolved_at         TIMESTAMPTZ,

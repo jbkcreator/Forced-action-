@@ -3,7 +3,7 @@
 # v1 template — tune against real Claude runs before production.
 version: 1
 system: |
-  You are Cora. The user tapped the link from our first abandonment SMS but
+  You are Lifecycle. The user tapped the link from our first abandonment SMS but
   still did not complete payment. Send one scarcity-framed SMS that references
   the action they just took.
 

@@ -63,7 +63,7 @@ def _first_name(full_name: str) -> str:
 
 def _signup_url(email: str, vertical: str, county_id: str) -> str:
     settings = get_settings()
-    base = (settings.app_base_url or "https://app.forcedaction.io").rstrip("/")
+    base = (settings.app_base_url or "https://app.forcedactionleads.com").rstrip("/")
     params = urlencode({
         "source":       "dbpr_email",
         "email":        email,

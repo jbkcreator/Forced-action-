@@ -1,10 +1,11 @@
 """Application configuration powered by Pydantic settings."""
 
 from functools import lru_cache
+from datetime import date
 
 from typing import Optional
 
-from pydantic import AnyUrl, Field, SecretStr, PostgresDsn, field_validator
+from pydantic import AliasChoices, AnyUrl, Field, SecretStr, PostgresDsn, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -104,6 +105,13 @@ class AppSettings(BaseSettings):
 	# Abandoned-checkout recovery (Task 7). Off by default — the sweep captures
 	# and ages rows but sends nothing until this is enabled after review.
 	checkout_recovery_enabled: bool = Field(default=False, env="CHECKOUT_RECOVERY_ENABLED")
+	# E3 — only prompt for testimonial/referral asks on deal wins recorded after
+	# the feature's go-live date. Closed ticket explicitly deferred historical
+	# backfill; default to the implementation ship date.
+	deal_win_testimonial_go_live_at: date = Field(
+		default=date(2026, 7, 28),
+		env="DEAL_WIN_TESTIMONIAL_GO_LIVE_AT",
+	)
 	# Lead-pack recovery targets EXISTING paying subscribers who abandon a $99
 	# add-on — a different (dunning) motion from prospect cart recovery. Off by
 	# default so enabling checkout_recovery_enabled does NOT start emailing
@@ -128,8 +136,6 @@ class AppSettings(BaseSettings):
 	stripe_price_starter_regular: Optional[str] = Field(default=None, env="STRIPE_PRICE_STARTER_REGULAR")
 	stripe_price_pro_founding: Optional[str] = Field(default=None, env="STRIPE_PRICE_PRO_FOUNDING")
 	stripe_price_pro_regular: Optional[str] = Field(default=None, env="STRIPE_PRICE_PRO_REGULAR")
-	stripe_price_dominator_founding: Optional[str] = Field(default=None, env="STRIPE_PRICE_DOMINATOR_FOUNDING")
-	stripe_price_dominator_regular: Optional[str] = Field(default=None, env="STRIPE_PRICE_DOMINATOR_REGULAR")
 	stripe_price_founder_monthly: Optional[str] = Field(default=None, env="STRIPE_PRICE_FOUNDER_MONTHLY")
 	stripe_price_founder_annual: Optional[str] = Field(default=None, env="STRIPE_PRICE_FOUNDER_ANNUAL")
 	stripe_price_lead_pack: Optional[str] = Field(default=None, env="STRIPE_PRICE_LEAD_PACK")
@@ -210,8 +216,6 @@ class AppSettings(BaseSettings):
 	stripe_test_price_starter_regular: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_STARTER_REGULAR")
 	stripe_test_price_pro_founding: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_PRO_FOUNDING")
 	stripe_test_price_pro_regular: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_PRO_REGULAR")
-	stripe_test_price_dominator_founding: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_DOMINATOR_FOUNDING")
-	stripe_test_price_dominator_regular: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_DOMINATOR_REGULAR")
 	# Not read by get_price_id_for_checkout (founder resolves via plans.stripe_price_id,
 	# not this env var) — kept for mapping-table parity with every other tier only.
 	stripe_test_price_founder_monthly: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_FOUNDER_MONTHLY")
@@ -245,6 +249,13 @@ class AppSettings(BaseSettings):
 
 	clay_dbpr_webhook_url: Optional[str] = Field(default=None, env="CLAY_DBPR_WEBHOOK_URL")
 
+	# Cora reply-mailbox ingestion (Gmail API, service account + domain-wide
+	# delegation, gmail.readonly scope only). Both must be set for
+	# src.agents.cora.ingestion.reply_mailbox_poller to activate — absent
+	# either one, it silently no-ops every poll rather than raising.
+	cora_gmail_service_account_key_path: Optional[str] = Field(default=None, env="CORA_GMAIL_SERVICE_ACCOUNT_KEY_PATH")
+	cora_reply_mailbox_address: Optional[str] = Field(default=None, env="CORA_REPLY_MAILBOX_ADDRESS")
+
 
 	# ── Mode-aware helpers ────────────────────────────────────────────────────
 	# Use these everywhere instead of accessing live/test fields directly.
@@ -268,7 +279,7 @@ class AppSettings(BaseSettings):
 		return getattr(self, f"stripe_price_{name}", None)
 
 	# Founding subscriber spot limit (default 10, changeable without redeploy)
-	founding_spot_limit: int = Field(default=10, env="FOUNDING_SPOT_LIMIT")
+	founding_spot_limit: int = Field(default=25, env="FOUNDING_SPOT_LIMIT")
 
 	# Grace period after subscription deletion — 7 days lets payment_failure_day5 trigger fire.
 	# Set GRACE_PERIOD_HOURS=0.017 (≈1 min) for rapid local testing.
@@ -284,7 +295,7 @@ class AppSettings(BaseSettings):
 	app_base_url: str = Field(
 		default="http://localhost:8000",
 		env="APP_BASE_URL",
-		description="Public base URL of this app (e.g. https://app.forcedaction.io)",
+		description="Public base URL of this app (e.g. https://app.forcedactionleads.com)",
 	)
 
 	# CAN-SPAM footer requirement — placeholder until client supplies the real one
@@ -385,6 +396,7 @@ class AppSettings(BaseSettings):
 	smtp_port: int = Field(default=587, env="SMTP_PORT")
 	smtp_user: Optional[str] = Field(default=None, env="SMTP_USER")
 	smtp_pass: Optional[SecretStr] = Field(default=None, env="SMTP_PASS")
+	mandrill_webhook_key: Optional[SecretStr] = Field(default=None, env="MANDRILL_WEBHOOK_KEY")
 	email_from: Optional[str] = Field(default=None, env="EMAIL_FROM")  # falls back to smtp_user if not set
 	alert_email: Optional[str] = Field(default=None, env="ALERT_EMAIL")  # ops alert recipient
 	# QUALITY-v2.2 Q4 — dedicated inbox for the mail-probe canary (decision
@@ -436,14 +448,14 @@ class AppSettings(BaseSettings):
 	lifecycle_incident_slack_channel: Optional[str] = Field(default=None, env="LIFECYCLE_INCIDENT_SLACK_CHANNEL")
 
 	# Accelerated Wallet Push (fa016) — master kill switch.
-	# Detector, sweep, Cora graph, and API endpoints all skip when False.
+	# Detector, sweep, Lifecycle graph, and API endpoints all skip when False.
 	# Auto-flipped to False if Day-35 take_rate < wallet_adoption.floor_pct (12%).
 	accelerated_wallet_push_enabled: bool = Field(default=False, env="ACCELERATED_WALLET_PUSH_ENABLED")
 
 	# Freemium blurred-feed funnel (T-B3-01) — master launch toggle ANDed in
 	# front of every funnel leg: free signup, blurred teaser/proof moment,
 	# monetization wall, flash scarcity, abandonment nudges. Default True:
-	# these flows are already live in prod; per-flow Cora kill-switches
+	# these flows are already live in prod; per-flow Lifecycle kill-switches
 	# (first_payment_rate) still apply when this is ON.
 	freemium_funnel_enabled: bool = Field(default=True, env="FREEMIUM_FUNNEL_ENABLED")
 
@@ -451,21 +463,32 @@ class AppSettings(BaseSettings):
 	# Set False in dev/staging to send SMS at any hour during testing.
 	sms_quiet_hours_enabled: bool = Field(default=True, env="SMS_QUIET_HOURS_ENABLED")
 
-	# Human review of Cora outbound SMS. OFF by default — Cora's messages send
+	# Human review of Lifecycle outbound SMS. OFF by default — Lifecycle's messages send
 	# immediately. This is only the *baseline*; operators flip the switch at
-	# runtime via the admin queue (Redis override, see services/cora_review_switch).
+	# runtime via the admin queue (Redis override, see services/lifecycle_review_switch).
 	# When ON, marketing sends are held as pending_review for manual approve/cancel.
-	cora_human_review_enabled: bool = Field(default=False, env="CORA_HUMAN_REVIEW_ENABLED")
+	# Falls back to the pre-rename CORA_HUMAN_REVIEW_ENABLED name for one
+	# release so existing prod overrides don't silently reset to the default
+	# on deploy — drop the fallback once prod .env is confirmed migrated.
+	lifecycle_human_review_enabled: bool = Field(
+		default=False,
+		validation_alias=AliasChoices("LIFECYCLE_HUMAN_REVIEW_ENABLED", "CORA_HUMAN_REVIEW_ENABLED"),
+	)
 
 	# NWS Weather / Storm Pack (fa018)
 	# nws_weather_enabled      — master kill switch for entire NWS subsystem
-	# nws_revenue_polling_enabled — controls whether poller triggers storm pack / Cora
+	# nws_revenue_polling_enabled — controls whether poller triggers storm pack / Lifecycle
 	# storm_pack_enabled        — controls bundle offer dispatch specifically
-	# nws_cora_urgency_enabled  — controls Cora urgency graph dispatch specifically
+	# nws_lifecycle_urgency_enabled  — controls Lifecycle urgency graph dispatch specifically
 	nws_weather_enabled: bool = Field(default=True, env="NWS_WEATHER_ENABLED")
 	nws_revenue_polling_enabled: bool = Field(default=True, env="NWS_REVENUE_POLLING_ENABLED")
 	storm_pack_enabled: bool = Field(default=True, env="STORM_PACK_ENABLED")
-	nws_cora_urgency_enabled: bool = Field(default=True, env="NWS_CORA_URGENCY_ENABLED")
+	# Falls back to the pre-rename NWS_CORA_URGENCY_ENABLED name for one release
+	# — same rationale as lifecycle_human_review_enabled above.
+	nws_lifecycle_urgency_enabled: bool = Field(
+		default=True,
+		validation_alias=AliasChoices("NWS_LIFECYCLE_URGENCY_ENABLED", "NWS_CORA_URGENCY_ENABLED"),
+	)
 	# Referenced by nws_webhook.process_alert steps 9+11 but missing until 2026-07 —
 	# the AttributeError killed signal tagging + rescore on every alert (incidents
 	# from weather stayed at 0 since fa018).
@@ -569,11 +592,20 @@ class AppSettings(BaseSettings):
 	county_launch_reminder_days: int = Field(default=7, env="COUNTY_LAUNCH_REMINDER_DAYS")
 	slack_bot_token: Optional[SecretStr] = Field(default=None, env="SLACK_BOT_TOKEN")
 	slack_signing_secret: Optional[SecretStr] = Field(default=None, env="SLACK_SIGNING_SECRET")
+	vera_slack_channel: Optional[str] = Field(default=None, env="VERA_SLACK_CHANNEL")
 
 	# Relay approval queue (RELAY-v2.2 sub-task R1). Reuses slack_bot_token /
 	# slack_signing_secret above — no separate Slack app.
 	relay_slack_channel: str = Field(default="", env="RELAY_SLACK_CHANNEL")
 	relay_approvers: list = Field(default=[], env="RELAY_APPROVERS")
+
+	# THROUGH-v2.2 batch-approval layer. Reuses slack_bot_token/slack_signing_secret
+	# above — no separate Slack app. Deliberately its own channel/approver list,
+	# not relay_slack_channel/relay_approvers — a batch of N cold-outreach drafts
+	# is a different review surface than Relay's per-item send approvals.
+	cora_throughput_slack_channel: str = Field(default="", env="CORA_THROUGHPUT_SLACK_CHANNEL")
+	cora_throughput_approvers: list = Field(default=[], env="CORA_THROUGHPUT_APPROVERS")
+	cora_batch_expiry_hours: int = Field(default=72, env="CORA_BATCH_EXPIRY_HOURS", description="Hours before a pending Cora draft batch auto-expires. Override via env var.")
 
 	# Relay email channel (RELAY-v2.2 sub-task R2). relay_instantly_campaign_id
 	# is set once after running `python -m src.services.relay --setup-email-channel`
@@ -595,15 +627,20 @@ class AppSettings(BaseSettings):
 	# Per-channel sends per calendar day (build spec §9.1: "Gmail 20/day").
 	relay_daily_ceiling: int = Field(default=20, env="RELAY_DAILY_CEILING")
 
-	# Cora self-healing (fa034). Default OFF — must be opted in per environment.
-	# When false, src/tasks/cora_self_healing.py is a no-op (returns 0 without
+	# Lifecycle self-healing (fa034). Default OFF — must be opted in per environment.
+	# When false, src/tasks/lifecycle_self_healing.py is a no-op (returns 0 without
 	# touching DB/Redis). Rollout: ship code → enable in dev → soak in staging
 	# → enable in prod after a quiet week.
-	cora_self_healing_enabled: bool = Field(default=False, env="CORA_SELF_HEALING_ENABLED")
-	# Slack channel for Cora incident posts. When unset, post_incident_slack()
+	# Falls back to the pre-rename CORA_SELF_HEALING_ENABLED name for one
+	# release — same rationale as lifecycle_human_review_enabled above.
+	lifecycle_self_healing_enabled: bool = Field(
+		default=False,
+		validation_alias=AliasChoices("LIFECYCLE_SELF_HEALING_ENABLED", "CORA_SELF_HEALING_ENABLED"),
+	)
+	# Slack channel for Lifecycle incident posts. When unset, post_incident_slack()
 	# falls back to email.send_alert (same path as heartbeat_monitor /
 	# anomaly_pager). Slack-disabled is NEVER a silent failure.
-	cora_incident_slack_channel: Optional[str] = Field(default=None, env="CORA_INCIDENT_SLACK_CHANNEL")
+	lifecycle_incident_slack_channel: Optional[str] = Field(default=None, env="LIFECYCLE_INCIDENT_SLACK_CHANNEL")
 
 	# Stage 10 — Prometheus metrics exposition (fa055).
 	# When true, GET /metrics returns Prometheus text format with kill-switch
@@ -628,7 +665,7 @@ class AppSettings(BaseSettings):
 	stripe_test_price_wl_premium: Optional[str] = Field(default=None, env="STRIPE_TEST_PRICE_WL_PREMIUM")
 	# Public base URL of the React frontend — used to build links in WL emails
 	# (verify-email, password reset, invites, login). Dev default points at the
-	# Vite dev server; set WL_FRONTEND_BASE_URL=https://app.forcedaction.io in prod.
+	# Vite dev server; set WL_FRONTEND_BASE_URL=https://app.forcedactionleads.com in prod.
 	wl_frontend_base_url: str = Field(default="http://localhost:5173", env="WL_FRONTEND_BASE_URL")
 	# Separate webhook secret for the /webhooks/stripe/white-label endpoint
 	wl_stripe_webhook_secret: Optional[SecretStr] = Field(default=None, env="WL_STRIPE_WEBHOOK_SECRET")

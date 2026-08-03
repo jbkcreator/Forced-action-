@@ -1,7 +1,7 @@
 """
 Nudge Conversion — D7: last-touch attribution stamp for `message_outcomes`.
 
-`record_nudge_conversion()` finds the most recent qualifying Cora send for a
+`record_nudge_conversion()` finds the most recent qualifying Lifecycle send for a
 subscriber (sent, not already converted, within 48h of the given purchase)
 and stamps it as the touch that drove the conversion. This is separate from
 `attribution_service.record_conversion_attribution()` (revenue-signal scoring

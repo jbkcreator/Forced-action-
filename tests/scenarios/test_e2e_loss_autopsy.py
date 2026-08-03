@@ -120,7 +120,7 @@ def test_t1_admin_trigger_ghosted_sla(admin_headers, real_property_id):
     assert body["primary_rejection_reason"] in _VALID_REJECTION_REASONS, (
         f"Unexpected reason: {body['primary_rejection_reason']}"
     )
-    assert body["cora_behavior_adjustment"], "cora_behavior_adjustment must be non-empty"
+    assert body["lifecycle_behavior_adjustment"], "lifecycle_behavior_adjustment must be non-empty"
     assert body["claude_cost_usd"] is not None and body["claude_cost_usd"] > 0
 
     # Verify DB row

@@ -25,28 +25,36 @@ never see a real unsubscribe event to sync back.
 """
 from __future__ import annotations
 
-from config.settings import get_settings
 from src.services import instantly_service as instantly
 from src.services.email_unsubscribe import unsubscribe_url
 from src.services.relay.channels import register
 from src.services.relay.queue import QueueItem
+from src.utils.venture_config import get_venture_config
 
 PASSTHROUGH_CAMPAIGN_NAME = "Relay Passthrough (RELAY-v2.2 R2)"
 
 
 def send_email(item: QueueItem) -> None:
-    """Dispatch one approved item through the Relay passthrough campaign.
+    """Dispatch one approved item through its venture's passthrough campaign.
 
     Raises on any failure (including a duplicate-contact skip) so the
     engine records the item as 'failed' — never a false 'sent'.
+
+    Campaign, brand name and postal address are resolved per venture
+    (CLONE-v2.2 / CL3). Each venture needs its OWN passthrough campaign:
+    Instantly's duplicate-contact guard is per-campaign, so sharing one
+    across ventures would make venture B's first email to a prospect look
+    like a repeat of venture A's and fail.
     """
-    settings = get_settings()
-    campaign_id = settings.relay_instantly_campaign_id
+    venture = get_venture_config(item.venture_key)
+    campaign_id = venture.relay_instantly_campaign_id
     if not campaign_id:
         raise RuntimeError(
-            "RELAY_INSTANTLY_CAMPAIGN_ID not configured — run "
-            "`python -m src.services.relay --setup-email-channel` once, "
-            "then set the printed campaign id in .env"
+            f"item {item.id}: no Instantly campaign for venture "
+            f"{item.venture_key!r} — run `python -m src.services.relay "
+            f"--setup-email-channel` once for it, then set the printed id on "
+            f"the venture's ventures.relay_instantly_campaign_id (or, for "
+            f"venture #1, RELAY_INSTANTLY_CAMPAIGN_ID in .env)"
         )
 
     subject = (item.payload or {}).get("subject", "")
@@ -55,7 +63,7 @@ def send_email(item: QueueItem) -> None:
         raise RuntimeError(f"item {item.id}: payload missing 'body' for email channel")
 
     body = (
-        f"{body}\n\n--\nForced Action\n{settings.company_postal_address}\n\n"
+        f"{body}\n\n--\n{venture.brand_name}\n{venture.postal_address}\n\n"
         f"Unsubscribe: {unsubscribe_url(item.recipient)}"
     )
 
@@ -71,7 +79,7 @@ def send_email(item: QueueItem) -> None:
     if result.get("leads_skipped", 0):
         raise RuntimeError(
             f"item {item.id}: Instantly skipped {item.recipient} — already a "
-            f"member of the Relay passthrough campaign (duplicate-contact "
+            f"member of venture {item.venture_key}'s passthrough campaign (duplicate-contact "
             f"guard; a genuine repeat send needs a rotated/new campaign — "
             f"not yet built, see RELAY-R2-Implementation-Plan.md Locked decision #2)"
         )

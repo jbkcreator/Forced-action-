@@ -108,7 +108,7 @@ def _seed_keyword(db, keyword, cluster, *, answers, spend_each, paid_signups, no
         ))
         db.add(QuoraQuestion(
             url=f"https://quora.com/{keyword}/{i}", title=f"q{i}",
-            matched_keyword=keyword, cora_decision_id=did,
+            matched_keyword=keyword, lifecycle_decision_id=did,
             answer_status="published", posted_at=posted,
         ))
 

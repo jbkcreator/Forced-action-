@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-AI-powered distressed property intelligence platform for Hillsborough County, FL. Scrapes public records (foreclosures, tax delinquencies, liens, code violations, permits, probate, evictions, bankruptcy, sunbiz, fire/flood/storm, insurance, divorce, roofing permits, property appraiser), loads into PostgreSQL hub-and-spoke DB centered on `properties`, scores via 6 buyer verticals, pushes leads to GoHighLevel + Synthflow, monetized via Stripe through FastAPI. Phase 2B adds LangGraph-driven Cora agent runtime for retention/FOMO/abandonment flows.
+AI-powered distressed property intelligence platform for Hillsborough County, FL. Scrapes public records (foreclosures, tax delinquencies, liens, code violations, permits, probate, evictions, bankruptcy, sunbiz, fire/flood/storm, insurance, divorce, roofing permits, property appraiser), loads into PostgreSQL hub-and-spoke DB centered on `properties`, scores via 6 buyer verticals, pushes leads to GoHighLevel + Synthflow, monetized via Stripe through FastAPI. Phase 2B adds LangGraph-driven Lifecycle agent runtime for retention/FOMO/abandonment flows.
 
 ## Common Commands
 
@@ -12,15 +12,15 @@ AI-powered distressed property intelligence platform for Hillsborough County, FL
 # API server
 uvicorn src.api.main:app --reload --port 8000
 
-# Cora agents (separate process — must run alongside API)
+# Lifecycle agents (separate process — must run alongside API)
 python -m src.agents --serve          # production
 python -m src.agents --health         # pre-flight check
 python -m src.agents --migrate        # run LangGraph checkpoint migration
 
-# Docker (production — both API + Cora share same image)
+# Docker (production — both API + Lifecycle share same image)
 docker compose build
 docker compose up -d
-docker compose logs -f cora
+docker compose logs -f lifecycle
 
 # Run a single scraper
 python -m src.scrappers.foreclosures.foreclosure_engine
@@ -35,7 +35,7 @@ PYTHONPATH=. python scripts/apply_<name>.py     # pre-existing scripts only — 
 # Tests
 pytest tests/                                  # default (excludes scenario)
 pytest -m scenario                             # opt-in sandbox e2e
-pytest -m scenario_cora                        # Cora/LangGraph scenarios
+pytest -m scenario_lifecycle                        # Lifecycle/LangGraph scenarios
 pytest tests/test_foo.py::test_specific_function
 ```
 
@@ -47,7 +47,7 @@ Scrapers (`src/scrappers/`) → CSV/DataFrame → Loaders (`src/loaders/`) → P
 **CDS = Composite Distress Score.** Scores 0–100 across 6 verticals. `config/scoring.py` is source of truth — `cds_engine.py` docstring is stale (wrong stacking window/cap/equity scope).
 
 ### Hub-and-Spoke Database
-Central `properties` table (~522k parcels). 1:Many → foreclosures, tax_delinquencies, code_violations, legal_and_liens, building_permits, legal_proceedings, incidents, deeds, **tax_payment_history**. 1:1 → owners, financials. Scoring → `distress_scores` (one row per property per day, JSONB `vertical_scores`). `cora_event_queue` — durable fallback table for Cora events published when Redis is unavailable (fa072). All ORM models in `src/core/models.py`.
+Central `properties` table (~522k parcels). 1:Many → foreclosures, tax_delinquencies, code_violations, legal_and_liens, building_permits, legal_proceedings, incidents, deeds, **tax_payment_history**. 1:1 → owners, financials. Scoring → `distress_scores` (one row per property per day, JSONB `vertical_scores`). `lifecycle_event_queue` — durable fallback table for Lifecycle events published when Redis is unavailable (fa072). All ORM models in `src/core/models.py`.
 
 ### Subsystems
 
@@ -55,7 +55,7 @@ Central `properties` table (~522k parcels). 1:Many → foreclosures, tax_delinqu
 
 - **Loaders** (`src/loaders/`): Inherit `BaseLoader` (`base.py`). Property matching waterfall: (1) exact parcel_id, (2) address: ILIKE house# prefix → pg_trgm similarity → rapidfuzz token_sort_ratio ≥75%, (3) owner name: exact ilike → LIKE pattern → pg_trgm ≥75%. Three-tier outcome: ≥0.92 → **matched**; 0.75–0.92 → **pending_review**; <0.75 → **unmatched**. Thresholds in `config/matching.py`. Pinellas stopgap: `review_min=0.65`.
 
-- **Connectors** (`src/connectors/`): Cora Data Engine outcome-mining pipeline. Reads already-ingested, already-matched tables (`foreclosures`, `tax_deed_auctions`, appraiser `financials`, etc.) and stages labeled events into `outcome_candidates` (`OutcomeCandidate` model). `label_layer.py` (CDE-10) then promotes unconsumed candidates into `DealOutcome` (subscriber_id NULL, confidence_tier `public_record_inferred`, deterministic `source_ref` idempotency, terminal events only — cancelled/unqualified are consumed without promotion) and routes through the CDE-11 `deal_outcome_effects` seam. `registry.py` is static per-connector metadata (source_type, cadence, SLA); `runner.py` wraps a connector's run with `record_scraper_stats()` bookkeeping (no new scheduler — connectors are plain `scripts/cron/crontab.txt` entries like every other scraper); `resolve.py` (`resolve_or_quarantine`) is a thin wrapper over `BaseLoader.find_property_cascade`/`quarantine_unmatched` for the rare connector reading a genuinely new raw file (most connectors reuse the `property_id` already set at ingestion and never call this); `outcomes.py` defines `OutcomeCandidateData` + `upsert_outcome_candidate()`.
+- **Connectors** (`src/connectors/`): Lifecycle Data Engine outcome-mining pipeline. Reads already-ingested, already-matched tables (`foreclosures`, `tax_deed_auctions`, appraiser `financials`, etc.) and stages labeled events into `outcome_candidates` (`OutcomeCandidate` model). `label_layer.py` (CDE-10) then promotes unconsumed candidates into `DealOutcome` (subscriber_id NULL, confidence_tier `public_record_inferred`, deterministic `source_ref` idempotency, terminal events only — cancelled/unqualified are consumed without promotion) and routes through the CDE-11 `deal_outcome_effects` seam. `registry.py` is static per-connector metadata (source_type, cadence, SLA); `runner.py` wraps a connector's run with `record_scraper_stats()` bookkeeping (no new scheduler — connectors are plain `scripts/cron/crontab.txt` entries like every other scraper); `resolve.py` (`resolve_or_quarantine`) is a thin wrapper over `BaseLoader.find_property_cascade`/`quarantine_unmatched` for the rare connector reading a genuinely new raw file (most connectors reuse the `property_id` already set at ingestion and never call this); `outcomes.py` defines `OutcomeCandidateData` + `upsert_outcome_candidate()`.
 
 - **CDS Engine** (`src/services/cds_engine.py`): 6 verticals × 14+ signals. Formula: primary_score + stacking_bonus (STACKING_WINDOW_DAYS=180, cap=60) + absentee/contact/equity bonuses. Stacking-only signals: `insurance_claim`, `fire`, `storm_damage`, `flood_damage`, `building_permits` non-enforcement. Dead lead gate: deed transfer <45 days → zero investment verticals. Tiers: Ultra Platinum(95+) → Platinum(83+) → Gold(57+) → Silver(40+) → Bronze.
 
@@ -63,21 +63,29 @@ Central `properties` table (~522k parcels). 1:Many → foreclosures, tax_delinqu
 
 - **Services** (`src/services/`): `stripe_service.py` = outgoing. `stripe_webhooks.py` = incoming. `kill_switch_service.py` — `get_cached_metric()` + `get_kill_switch_status()` for non-agents code (use this, never import from `src.agents.tools` in services). `lead_pool_service.py` — `get_lead_pool()` + `get_zip_activity()` wrappers for API use. Skip-trace waterfall: Tracerfy → BatchData → PDL. **`_on_checkout_completed` (2026-07-20) is split fast/deferred**: the fast, synchronous half (subscriber tier/status update, ZIP-lock, founding count) commits and lets Stripe's ack return quickly; everything non-critical (GHL push, welcome/upgrade/first-leads/founder-alert emails, trial+saved-card Stripe lookups, referral/segmentation/attribution/A-B-holdout/Meta-CAPI/campaign-attribution/affiliate/subscriber-memory bookkeeping) runs in `_checkout_completed_deferred()`, scheduled via FastAPI `BackgroundTasks` from `handle_webhook()`/`stripe_webhook()` so it executes after the response is sent. One-shot, best-effort, no retry by design — see the docstring on `_on_checkout_completed` for the full rationale (this fixed both a ~30s+ webhook latency and a cascading-transaction-abort bug where one failed best-effort side-effect, missing `db.rollback()`, could silently roll back the whole subscriber upgrade). Every deferred DB-touching block uses `db.begin_nested()` (savepoints), not bare `try/except` — a bare except stops the Python exception but leaves Postgres's transaction aborted for every later statement. `background_tasks=None` (any non-HTTP caller — scripts, tests, admin replay) runs the deferred half inline on the same session instead, unchanged from pre-split behavior.
 
-- **Agents** (`src/agents/`): LangGraph (Cora) runtime. **Runs as a separate process/container from FastAPI.** Entry point: `python -m src.agents --serve`. API and Cora communicate **exclusively** through Redis Queue (`cora:queue` key, LPUSH/BRPOP) and Postgres NOTIFY (`cora_events` channel). **Never call `dispatch_event()` directly from API/services/tasks** — use `publish_cora_event()` from `src.agents.events.ingestion`. If Redis is unavailable, events fall back to `cora_event_queue` Postgres table with 60s sweep. Supervisor routes events via dict lookup (`src/agents/router.py`). 10 graphs. Kill switch colors: green=send, yellow=fallback template, red=block. All decisions logged to `agent_decisions`. Guardrails in `config/cora_guardrails.py`. `kill_switch_metric_ingest.get_cached_metric` re-exports from `kill_switch_service` — import from service layer, not tasks.
+- **Agents** (`src/agents/`): LangGraph (Lifecycle) runtime. **Runs as a separate process/container from FastAPI.** Entry point: `python -m src.agents --serve`. API and Lifecycle communicate **exclusively** through Redis Queue (`lifecycle:queue` key, LPUSH/BRPOP) and Postgres NOTIFY (`lifecycle_events` channel). **Never call `dispatch_event()` directly from API/services/tasks** — use `publish_lifecycle_event()` from `src.agents.events.ingestion`. If Redis is unavailable, events fall back to `lifecycle_event_queue` Postgres table with 60s sweep. Supervisor routes events via dict lookup (`src/agents/router.py`). 10 graphs. Kill switch colors: green=send, yellow=fallback template, red=block. All decisions logged to `agent_decisions`. Guardrails in `config/lifecycle_guardrails.py`. `kill_switch_metric_ingest.get_cached_metric` re-exports from `kill_switch_service` — import from service layer, not tasks.
 
 - **Tasks** (`src/tasks/`): Scheduled jobs. `daily_report.py` — CSV ops report (runs 08:10 UTC for both Hillsborough and Pinellas). `daily_dashboard.py` — 10-section PDF (23:30 UTC Mon-Sat), separate from daily_report. `dnc_refresh` — monthly Tracerfy DNC re-scrub.
 
 ### County Config
 County config is **DB-backed** via `counties` + `county_sources` tables — **not** `config/counties.json`. Read via `src/utils/county_config.py:get_county(county_id)` (5-min cache). `County.nws_zone` supports comma-separated values for multi-zone counties. Hillsborough: `FLZ151,FLZ251`. Pinellas: `FLZ050`.
 
+### Venture Config (CLONE-v2.2 / CL3)
+A **venture** is one business on this fleet: its Relay sending identity (Slack channel, Instantly campaign, sender, send window, daily ceiling, kill-switch key, brand) plus its geography (state, bankruptcy court) and its counties. One row per venture in `ventures`; every county belongs to one via `counties.venture_key`, and every Relay queue row via `relay_approval_queue.venture_key`. Venture #1 is `hillsborough_distress`.
+
+Read via `src/utils/venture_config.py:get_venture_config(venture_key)` (5-min cache) — **never query `ventures` directly**. Missing/inactive row, or any NULL column, falls back to the matching `config/settings.py` value, so venture #1 is unchanged from pre-CL3. `county_config` derives `state` and `court` from the venture (both were hardcoded to Florida before CL3).
+
+Relay is per-venture end to end: `run_sweep(venture_key=...)` filters the batch, the daily-ceiling Redis key is `relay_daily_sent:{venture}:{channel}:{date}`, and the Slack channel / Instantly campaign / footer brand come from the item's venture. **One sweep run = one venture** (a batch is homogeneous) — a second venture needs its own `--sweep --venture <key>` cron line and its own Instantly passthrough campaign. Onboard a new venture with `python -m src.services.venture_provisioning` (`--emit-template` → `--dry-run` → `--apply`); `playwright_code` is never cloned between counties and column mappings are opt-in. Runbook: `docs/venture-onboarding.md`.
+
 ### Configuration (`config/`)
 - `settings.py`: Pydantic BaseSettings from `.env`, accessed via `get_settings()`.
 - `agents.py`: `AgentsSettings(AppSettings)` — LangGraph-specific keys. `AGENTS_EVENT_SOURCE_REDIS=true`, `AGENTS_EVENT_SOURCE_POSTGRES=true` required for full event routing.
 - `scoring.py`: CDS weights/thresholds — source of truth (not cds_engine.py docstring).
 - `matching.py`: match thresholds.
+- `venture_template.py`: `DEFAULT_VENTURE_KEY`, the copy-and-fill `VENTURE_TEMPLATE`, and `validate_venture_config()`.
 
 ### Deployment
-Single `Dockerfile` at project root. `docker-compose.yml` runs `api` and `cora` as two services from the same image with `network_mode: host` (Postgres + Redis run on the host). Nginx serves React SPA static files and proxies `/api/` + `/webhooks/` to FastAPI on port 8000.
+Single `Dockerfile` at project root. `docker-compose.yml` runs `api` and `lifecycle` as two services from the same image with `network_mode: host` (Postgres + Redis run on the host). Nginx serves React SPA static files and proxies `/api/` + `/webhooks/` to FastAPI on port 8000.
 
 ## Tooling Rules (strict)
 
@@ -89,12 +97,12 @@ Single `Dockerfile` at project root. `docker-compose.yml` runs `api` and `cora` 
 - **Scraping**: Playwright + playwright-stealth. Browser-use + Anthropic for AI fallback. Firecrawl for static. No Selenium.
 - **Fuzzy matching**: rapidfuzz. No fuzzywuzzy.
 - **Agents**: LangGraph 1.x with Postgres checkpointer. LangSmith for tracing. No raw Anthropic SDK loops for agent flows.
-- **Cora event dispatch**: `publish_cora_event(event_dict)` from `src.agents.events.ingestion` — never `dispatch_event()` from API/services/tasks.
+- **Lifecycle event dispatch**: `publish_lifecycle_event(event_dict)` from `src.agents.events.ingestion` — never `dispatch_event()` from API/services/tasks.
 - **SMS**: Telnyx. All sends via `src/services/sms_compliance.send_sms` with explicit `message_type`. **Voice/AI calls**: Synthflow.
 - **Phone numbers**: every read/write of a phone column MUST go through `src/services/phone_utils.normalize`.
 - **Payments**: Stripe SDK ≥11. All webhook handlers in `src/services/stripe_webhooks.py`.
 - **Cache/rate-limit**: Redis (server). Use `fakeredis` in tests/sandbox.
-- **Testing**: pytest only. Markers: `scenario`, `scenario_cora`, `scenario_platform`, `scenario_chat`. Unit tests in `tests/`, scenario in `tests/scenarios/`, agents in `tests/agents/`.
+- **Testing**: pytest only. Markers: `scenario`, `scenario_lifecycle`, `scenario_platform`, `scenario_chat`. Unit tests in `tests/`, scenario in `tests/scenarios/`, agents in `tests/agents/`.
 - **Logging**: stdlib `logging` via `config/logging.yaml`. No `print()` in `src/`.
 
 ## Important Notes

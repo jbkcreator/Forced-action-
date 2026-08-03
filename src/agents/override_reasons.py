@@ -1,4 +1,4 @@
-"""Structured reason codes for human overrides of Cora decisions."""
+"""Structured reason codes for human overrides of Lifecycle decisions."""
 
 from __future__ import annotations
 

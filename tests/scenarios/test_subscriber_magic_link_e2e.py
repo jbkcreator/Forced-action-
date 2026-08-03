@@ -71,7 +71,7 @@ def _make_subscriber(fresh_db, *, email, status="active"):
 def _capture_magic_link_email(monkeypatch):
     captured = {}
 
-    def fake_send(email, name, raw_token):
+    def fake_send(email, name, raw_token, **kwargs):
         captured["email"] = email
         captured["token"] = raw_token
 
@@ -82,6 +82,16 @@ def _capture_magic_link_email(monkeypatch):
 # ── request → verify → feed ─────────────────────────────────────────────────
 
 def test_request_then_verify_opens_feed(client, fresh_db, monkeypatch):
+    from sqlalchemy import text as sa_text
+
+    fresh_db.execute(sa_text(
+        "ALTER TABLE activation_events ADD COLUMN IF NOT EXISTS welcome_email_sent_time TIMESTAMPTZ"
+    ))
+    fresh_db.execute(sa_text(
+        "ALTER TABLE activation_events ADD COLUMN IF NOT EXISTS magic_link_redeemed_time TIMESTAMPTZ"
+    ))
+    fresh_db.flush()
+
     sub = _make_subscriber(fresh_db, email=f"ml_a_{uuid.uuid4().hex[:6]}@e.com")
     captured = _capture_magic_link_email(monkeypatch)
 
@@ -99,6 +109,12 @@ def test_request_then_verify_opens_feed(client, fresh_db, monkeypatch):
 
     r3 = client.get(f"/api/feed/{sub.event_feed_uuid}", headers={"Authorization": f"Bearer {token}"})
     assert r3.status_code == 200, r3.text
+
+    stamped = fresh_db.execute(
+        sa_text("SELECT magic_link_redeemed_time FROM activation_events WHERE subscriber_id = :id"),
+        {"id": sub.id},
+    ).scalar_one_or_none()
+    assert stamped is not None
 
 
 def test_verify_returns_investor_vertical_for_ui_routing(client, fresh_db, monkeypatch):

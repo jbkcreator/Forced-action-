@@ -57,7 +57,7 @@ CONTRACTOR_VERTICALS = (
 ABOVE_BENCHMARK_THRESHOLD = 1.20   # 20% above avg → above_benchmark
 BELOW_BENCHMARK_THRESHOLD = 0.80   # 20% below avg → below_benchmark
 MIN_GROUP_SIZE = 2                  # peer groups smaller than this = no benchmark
-AP_UPSELL_TIERS = frozenset(["starter", "pro", "dominator"])   # eligible for AP upsell
+AP_UPSELL_TIERS = frozenset(["starter", "pro"])   # eligible for AP upsell
 AP_PRO_EXCLUSION = frozenset(["autopilot_pro", "annual_lock"])  # already at the top
 
 

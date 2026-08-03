@@ -923,6 +923,7 @@ def run_revenue_truth() -> int:
     )
 
     from src.services.email import send_alert
+    from src.services.vera_slack import post_vera_report
 
     recipients = report_recipients()
     if not recipients:
@@ -932,6 +933,8 @@ def run_revenue_truth() -> int:
             send_alert(subject, body, html_body=html_body, to=addr)
         except Exception as exc:
             logger.warning("[Vera] failed to send revenue-truth report to %s: %s", addr, exc)
+
+    post_vera_report(subject, body)
 
     logger.info(
         "[Vera] revenue truth report complete: paying_no_access=%d access_not_paying=%d "

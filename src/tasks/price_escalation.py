@@ -32,7 +32,6 @@ logger = logging.getLogger(__name__)
 _REGULAR_PRICE_ATTR = {
     "starter":   "stripe_price_starter_regular",
     "pro":       "stripe_price_pro_regular",
-    "dominator": "stripe_price_dominator_regular",
 }
 
 _SIX_MONTHS = timedelta(days=183)
@@ -227,8 +226,8 @@ def run_price_escalation(dry_run: bool = False) -> dict:
 
             <p style="margin:0;font-size:13px;color:#64748b;">
               Questions? Reply to this email or reach us at
-              <a href="mailto:support@forcedaction.io" style="color:#fbbf24;text-decoration:none;">
-                support@forcedaction.io
+              <a href="mailto:support@forcedactionleads.com" style="color:#fbbf24;text-decoration:none;">
+                support@forcedactionleads.com
               </a>
             </p>
           </td>
@@ -262,7 +261,7 @@ def run_price_escalation(dry_run: bool = False) -> dict:
                             f"Your ZIP territories and lead access remain unchanged — "
                             f"only the price updates.\n\n"
                             f"Access your lead feed:\n{dashboard_url}\n\n"
-                            f"Questions? support@forcedaction.io\n\n"
+                            f"Questions? support@forcedactionleads.com\n\n"
                             f"— Forced Action Team"
                         ),
                         body_html=body_html,

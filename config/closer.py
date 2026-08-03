@@ -69,7 +69,7 @@ OBJECTION_RESOLUTIONS_SET = frozenset(OBJECTION_RESOLUTIONS)
 SENTIMENTS_SET = frozenset(SENTIMENTS)
 
 
-# ── A6: Closer-to-Cora Teaching Corrections ──────────────────────────────────
+# ── A6: Closer-to-Lifecycle Teaching Corrections ──────────────────────────────────
 # Controlled vocabulary for Teaching Corrections (see CONTEXT.md → Score Dampener,
 # ADR 0006, ADR 0007).
 

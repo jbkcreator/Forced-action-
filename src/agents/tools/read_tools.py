@@ -1,5 +1,5 @@
 """
-Read tools for Cora graphs.
+Read tools for Lifecycle graphs.
 
 These are the 12 read-only queries graphs use to assemble decision context.
 Every tool here is a thin wrapper over existing platform services or a
@@ -183,7 +183,7 @@ def get_zip_activity(
 ) -> Dict[str, Any]:
 	"""
 	Live activity snapshot for a ZIP — active urgency-window count plus
-	recent message-send volume from Cora into this ZIP's subscribers.
+	recent message-send volume from Lifecycle into this ZIP's subscribers.
 
 	The urgency count comes from Redis (via urgency_engine.get_active_count)
 	and degrades gracefully when Redis is down.
@@ -409,11 +409,11 @@ def get_guardrail(name: str) -> Dict[str, Any]:
 	"""
 	Return the numeric bound config for a named guardrail.
 
-	Valid names are the keys in config/cora_guardrails.py GUARDRAILS.
+	Valid names are the keys in config/lifecycle_guardrails.py GUARDRAILS.
 	Returns an empty dict for unknown names (graphs treat absence as
 	"fall back to conservative default").
 	"""
-	from config.cora_guardrails import GUARDRAILS
+	from config.lifecycle_guardrails import GUARDRAILS
 
 	return dict(GUARDRAILS.get(name, {}))
 
@@ -570,7 +570,7 @@ def get_attribution_context(
 	  - Last 5 deal_outcomes
 	  - Active (locked) zip_territories
 
-	Returns a dict safe for merging into Cora personalization context.
+	Returns a dict safe for merging into Lifecycle personalization context.
 	All DB access is raw SQL.
 	"""
 	from sqlalchemy import text as sa_text

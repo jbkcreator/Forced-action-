@@ -238,17 +238,6 @@ TIER_DISPLAY = {
             "Rate locked forever",
         ],
     },
-    "dominator": {
-        "label": "Dominator — 10 ZIPs",
-        "zip_limit": 10,
-        "features": [
-            "Unlimited ZIPs in county",
-            "First-access lead delivery",
-            "Skip-traced phone numbers",
-            "Dedicated account manager",
-            "Rate locked forever",
-        ],
-    },
     "annual_lock": {
         "label": "Annual — 2 Months Free",
         "zip_limit": 1,
@@ -261,7 +250,7 @@ TIER_DISPLAY = {
         ],
     },
     # Placeholder copy — product to supply final founder bullets before launch.
-    # Do not promise unbuilt surfaces (deal-intake / Cora SLA) until they ship.
+    # Do not promise unbuilt surfaces (deal-intake / Lifecycle SLA) until they ship.
     "founder": {
         "label": "Founder — 10 ZIPs",
         "zip_limit": 10,

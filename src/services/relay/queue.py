@@ -61,6 +61,7 @@ from typing import Optional
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
+from config.venture_template import DEFAULT_VENTURE_KEY
 from src.core.database import get_db_context
 from src.core.models import RelayApprovalQueueItem
 from src.services.relay.config import (
@@ -90,6 +91,11 @@ class QueueItem:
     error: Optional[str]
     dispatched_at: Optional[datetime]
     created_at: datetime
+    # Which venture proposed this action (CLONE-v2.2 / CL3). Defaulted, and
+    # last in the field order, so every existing construction of QueueItem
+    # keeps working unchanged; _COLUMNS_SQL below picks the column up
+    # automatically from the dataclass fields.
+    venture_key: str = DEFAULT_VENTURE_KEY
 
 
 _QUEUE_ITEM_COLUMNS = tuple(f.name for f in fields(QueueItem))
@@ -107,6 +113,7 @@ def enqueue(
     recipient: str,
     payload: dict,
     thread_id: Optional[str] = None,
+    venture_key: str = DEFAULT_VENTURE_KEY,
 ) -> QueueItem:
     """Write a new 'pending' row. Called by Cora (Phase 2) and by R1's
     --seed CLI today — identical call, zero code change when Cora lands.
@@ -114,6 +121,10 @@ def enqueue(
     If idempotency_key already exists (e.g. a caller retries the same
     proposed action), returns the existing row instead of raising or
     creating a duplicate.
+
+    `venture_key` decides which Slack channel this is posted to, which
+    Instantly campaign it sends through, and whose daily ceiling it counts
+    against — see src/utils/venture_config.py.
     """
     try:
         with get_db_context() as session:
@@ -124,6 +135,7 @@ def enqueue(
                 payload=payload,
                 thread_id=thread_id,
                 status=STATUS_PENDING,
+                venture_key=venture_key,
             )
             session.add(item)
             session.flush()
@@ -203,16 +215,29 @@ def record_decision(item_id: int, *, approved: bool, decided_by: str) -> Optiona
     return get_item(item_id)
 
 
-def approved_batch(limit: int = 50) -> list[QueueItem]:
+def approved_batch(limit: int = 50, *, venture_key: Optional[str] = None) -> list[QueueItem]:
     """All status='approved' rows, oldest first — what the cron sweep
-    hands to the execution engine."""
+    hands to the execution engine.
+
+    `venture_key=None` returns every venture's rows (the pre-CL3 behavior,
+    kept so any caller that does not care about ventures is unaffected).
+    Pass a key to restrict the batch to one venture, which the sweep does —
+    a batch must be homogeneous, since one resolved VentureConfig governs
+    the send window, ceiling and channel for every item in it.
+    """
+    where = "status = :status"
+    params: dict = {"status": STATUS_APPROVED, "limit": limit}
+    if venture_key is not None:
+        where += " AND venture_key = :venture_key"
+        params["venture_key"] = venture_key
+
     with get_db_context() as session:
         rows = session.execute(
             text(
                 f"SELECT {_COLUMNS_SQL} FROM relay_approval_queue "
-                "WHERE status = :status ORDER BY created_at ASC LIMIT :limit"
+                f"WHERE {where} ORDER BY created_at ASC LIMIT :limit"
             ),
-            {"status": STATUS_APPROVED, "limit": limit},
+            params,
         ).mappings().all()
         return [_row_to_item(dict(r)) for r in rows]
 
@@ -251,10 +276,14 @@ def try_claim_for_batch(item_id: int, batch_id: str, *, stale_after_minutes: int
 
 def sent_counts_today(now: datetime, *, timezone_name: str) -> dict[str, int]:
     """Per-channel count of rows already 'sent' since midnight in
-    `timezone_name` (RELAY-v2.2 sub-task R3). One query per batch; the
-    caller (engine.execute_batch) increments the returned dict in memory
-    as the batch sends, so a single batch cannot exceed the ceiling
-    between queries."""
+    `timezone_name`. Reporting only -- NOT the daily-ceiling enforcement
+    mechanism (see PR #179 review finding #2: a per-batch local snapshot
+    like this one cannot enforce a cap across concurrent workers, since
+    two overlapping sweeps would each read the same snapshot and neither
+    would see the other's in-flight sends). The real-time ceiling gate is
+    src.services.relay.guards.reserve_daily_slot(), an atomic Redis
+    counter. This function remains for dashboards/audits that want the
+    actual historical sent count."""
     from zoneinfo import ZoneInfo
 
     local_midnight = now.astimezone(ZoneInfo(timezone_name)).replace(
@@ -273,37 +302,42 @@ def sent_counts_today(now: datetime, *, timezone_name: str) -> dict[str, int]:
         return {r["channel"]: r["n"] for r in rows}
 
 
-def mark_sent(item_id: int) -> None:
-    """Transitions a claimed row to 'sent' -- guarded to only ever leave
-    'approved', for the same reason mark_skipped() is guarded (see its
-    docstring): both callers only reach this right after a same-run
-    try_claim_for_batch() success, so status is still 'approved' at this
-    point in the normal path, but the guard is what stops a second,
-    concurrent dispatch of the same row (e.g. a slow send outliving
-    try_claim_for_batch's stale-claim window and getting reclaimed by
-    another sweep) from silently overwriting a completed receipt."""
+def mark_sent(item_id: int, *, batch_id: str) -> None:
+    """Transitions a claimed row to 'sent' -- guarded on both
+    'status = approved' AND 'batch_id = <this worker's batch_id>' (PR #179
+    review finding #1). The status guard alone isn't sufficient: if a
+    dispatch runs long enough to outlive try_claim_for_batch's staleness
+    window, a DIFFERENT worker can legitimately reclaim the same row as
+    stale and dispatch it again while the first dispatch is still in
+    flight. Requiring the caller's own batch_id to still match means only
+    whichever worker currently owns the row can finalize it -- the other
+    worker's call simply no-ops (0 rows match) instead of silently
+    overwriting a completed receipt."""
     with get_db_context() as session:
         session.execute(
             text(
                 "UPDATE relay_approval_queue SET status = :status, "
                 "dispatched_at = now(), updated_at = now() "
-                "WHERE id = :id AND status = :approved"
+                "WHERE id = :id AND status = :approved AND batch_id = :batch_id"
             ),
-            {"status": STATUS_SENT, "id": item_id, "approved": STATUS_APPROVED},
+            {"status": STATUS_SENT, "id": item_id, "approved": STATUS_APPROVED, "batch_id": batch_id},
         )
 
 
-def mark_failed(item_id: int, error: str) -> None:
+def mark_failed(item_id: int, error: str, *, batch_id: str) -> None:
     """Transitions a claimed row to 'failed' -- guarded identically to
-    mark_sent()/mark_skipped(), same reasoning."""
+    mark_sent(), same reasoning."""
     with get_db_context() as session:
         session.execute(
             text(
                 "UPDATE relay_approval_queue SET status = :status, "
                 "error = :error, updated_at = now() "
-                "WHERE id = :id AND status = :approved"
+                "WHERE id = :id AND status = :approved AND batch_id = :batch_id"
             ),
-            {"status": STATUS_FAILED, "error": error, "id": item_id, "approved": STATUS_APPROVED},
+            {
+                "status": STATUS_FAILED, "error": error, "id": item_id,
+                "approved": STATUS_APPROVED, "batch_id": batch_id,
+            },
         )
 
 

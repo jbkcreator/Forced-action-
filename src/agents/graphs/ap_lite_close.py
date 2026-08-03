@@ -13,7 +13,7 @@ Event envelope (example):
             "weekly_actions": 14,
             "threshold": 10,
             "week": "2026-W18",
-            "cta_url": "https://app.forcedaction.io/dashboard/<uuid>?upgrade=autopilot_lite",
+            "cta_url": "https://app.forcedactionleads.com/dashboard/<uuid>?upgrade=autopilot_lite",
         },
     }
 """

@@ -1,12 +1,12 @@
 """
-Shared state TypedDicts for Cora graphs.
+Shared state TypedDicts for Lifecycle graphs.
 
-Every graph carries CoraState (or a subclass of it) through its nodes.
+Every graph carries LifecycleState (or a subclass of it) through its nodes.
 LangGraph uses these TypedDicts to type-check node inputs/outputs and to
 serialize state to the Postgres checkpoint store.
 
 Per-graph subclasses live alongside their graph module (e.g. FOMOState in
-src/agents/graphs/fomo.py) and add graph-specific fields on top of CoraState.
+src/agents/graphs/fomo.py) and add graph-specific fields on top of LifecycleState.
 """
 
 from typing import Literal, Optional, TypedDict
@@ -16,9 +16,9 @@ TerminalStatus = Literal["completed", "aborted", "escalated", "failed"]
 KillSwitchColor = Literal["green", "yellow", "red"]
 
 
-class CoraState(TypedDict, total=False):
+class LifecycleState(TypedDict, total=False):
 	"""
-	Base state for every Cora decision.
+	Base state for every Lifecycle decision.
 
 	`total=False` means every field is optional. Graphs populate the subset
 	they need; missing fields default to absent (not None). This keeps

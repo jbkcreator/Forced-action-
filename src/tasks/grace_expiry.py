@@ -10,6 +10,9 @@ What it does
 1. Find zip_territories WHERE status='grace' AND grace_expires_at <= NOW()
    → Set status='available', clear subscriber_id / locked_at / grace_expires_at
    → If waitlist_emails is non-empty, fire a notification email per queued address
+     (legacy array — superseded by waitlist_entries, kept for rows still on it)
+   → Fire the sold-out waitlist notification for every released territory, so
+     WaitlistEntry(waitlist_type='sold_out') rows are told the ZIP just freed up
    → Log an "expansion alert" if the ZIP was the last locked territory in that
      county+vertical (meaning the market just opened up again)
 
@@ -21,7 +24,7 @@ Both steps run inside a single transaction so a crash mid-way is safe to retry.
 
 import logging
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Optional
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -29,6 +32,7 @@ from sqlalchemy.orm import Session
 from src.core.database import get_db_context
 from src.core.models import Subscriber, ZipTerritory
 from src.services.email import send_email
+from src.tasks.sold_out_reactivation import reactivate_for_zip
 
 logger = logging.getLogger(__name__)
 
@@ -130,8 +134,8 @@ def _send_waitlist_email(zip_code: str, vertical: str, county_id: str, emails: L
 
             <p style="margin:0;font-size:13px;color:#64748b;">
               Questions? Reply to this email or reach us at
-              <a href="mailto:support@forcedaction.io" style="color:#fbbf24;text-decoration:none;">
-                support@forcedaction.io
+              <a href="mailto:support@forcedactionleads.com" style="color:#fbbf24;text-decoration:none;">
+                support@forcedactionleads.com
               </a>
             </p>
           </td>
@@ -142,7 +146,7 @@ def _send_waitlist_email(zip_code: str, vertical: str, county_id: str, emails: L
           <td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.08);
                      font-size:12px;color:#475569;text-align:center;">
             Forced Action &mdash; Hillsborough County Property Intelligence<br/>
-            <a href="{app_base_url}" style="color:#475569;">forcedaction.io</a>
+            <a href="{app_base_url}" style="color:#475569;">forcedactionleads.com</a>
           </td>
         </tr>
 
@@ -160,10 +164,14 @@ def _send_waitlist_email(zip_code: str, vertical: str, county_id: str, emails: L
 # Core expiry logic
 # ---------------------------------------------------------------------------
 
-def expire_zip_grace_periods(db: Session) -> int:
+def expire_zip_grace_periods(db: Session, released_out: Optional[list] = None) -> int:
     """
     Release ZIP territories whose grace window has closed.
     Returns the count of territories released.
+
+    When `released_out` is given, each released territory is appended to it as a
+    (zip_code, vertical, county_id) tuple so the caller can fire the sold-out
+    waitlist notification *after* this transaction commits — see run_grace_expiry.
     """
     now = datetime.now(timezone.utc)
 
@@ -189,6 +197,8 @@ def expire_zip_grace_periods(db: Session) -> int:
         territory.waitlist_emails = []
 
         released += 1
+        if released_out is not None:
+            released_out.append((zip_code, vertical, county_id))
         logger.info(
             f"ZIP released: {zip_code}/{vertical}/{county_id} "
             f"waitlist={len(waitlist)}"
@@ -240,13 +250,38 @@ def expire_subscriber_grace_periods(db: Session) -> int:
 # ---------------------------------------------------------------------------
 
 def run_grace_expiry() -> None:
-    """Run both expiry passes in a single transaction."""
+    """Run both expiry passes in a single transaction, then notify waitlists.
+
+    The sold-out waitlist notification runs *after* the transaction commits:
+    reactivate_for_zip opens its own session, so firing it inside this one would
+    have it contend with the FOR UPDATE locks still held on the released rows —
+    and would announce a ZIP as free before that release was durable.
+    """
+    released: list[tuple[str, str, str]] = []
+
     with get_db_context() as db:
-        zips_released = expire_zip_grace_periods(db)
+        zips_released = expire_zip_grace_periods(db, released_out=released)
         subs_churned = expire_subscriber_grace_periods(db)
         # get_db_context commits on clean exit
         logger.info(
             f"grace_expiry complete: zips_released={zips_released} subs_churned={subs_churned}"
+        )
+
+    notified = 0
+    for zip_code, vertical, county_id in released:
+        try:
+            result = reactivate_for_zip(zip_code, vertical, county_id)
+            notified += int(result.get("fired", 0) or 0)
+        except Exception:
+            logger.error(
+                "grace_expiry: sold-out waitlist notify failed for %s/%s/%s",
+                zip_code, vertical, county_id, exc_info=True,
+            )
+
+    if released:
+        logger.info(
+            f"grace_expiry: sold-out waitlist notified={notified} "
+            f"across {len(released)} released territories"
         )
 
 

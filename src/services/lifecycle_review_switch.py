@@ -1,0 +1,98 @@
+"""
+Lifecycle human-review switch — runtime on/off for intercepting outbound SMS.
+
+When ON, outbound Lifecycle marketing SMS are held as `pending_review` for manual
+approve/cancel in the admin queue. When OFF (the default), Lifecycle's messages send
+immediately and nothing is held.
+
+State precedence (mirrors the kill_switch_override pattern in gating_tools):
+    1. Redis key 'lifecycle_human_review:enabled' ('1' / '0') — runtime operator toggle
+    2. Legacy Redis key 'cora_human_review:enabled'           — pre-rename toggle, migrated on first read
+    3. settings.lifecycle_human_review_enabled                — env baseline default
+
+Redis is the runtime source of truth so an operator can flip review on or off
+from the admin UI without a redeploy. The key is persistent (no TTL) — the
+switch stays exactly where the operator left it. If Redis is unavailable the
+settings baseline applies, which defaults to OFF — the safe direction
+(send the message, never silently hold it waiting on a human who isn't there).
+
+The Cora->Lifecycle rename moved the Redis key from 'cora_human_review:enabled'
+to 'lifecycle_human_review:enabled' with no data migration, so a prod operator
+override made under the old key would silently stop applying. is_review_enabled
+falls back to the legacy key and copies its value onto the new key so every
+later read (and the admin UI) settles on the new key going forward. Drop the
+legacy fallback once prod is confirmed to have moved off the old key.
+"""
+
+import logging
+
+from config.settings import settings
+from src.core.redis_client import get_redis, redis_available
+
+logger = logging.getLogger(__name__)
+
+_KEY = "lifecycle_human_review:enabled"
+_LEGACY_KEY = "cora_human_review:enabled"
+
+
+def is_review_enabled() -> bool:
+    """
+    Return True if outbound Lifecycle messages should be held for human review.
+
+    Reads the Redis runtime override first; falls back to the legacy
+    'cora_human_review:enabled' key (migrating its value onto the new key so
+    subsequent reads skip this fallback); then to the env baseline
+    (settings.lifecycle_human_review_enabled, default False) when Redis has no
+    value set at all or is unavailable.
+    """
+    if redis_available():
+        try:
+            client = get_redis()
+            raw = client.get(_KEY)
+            if raw is None:
+                legacy_raw = client.get(_LEGACY_KEY)
+                if legacy_raw is not None:
+                    val = legacy_raw.decode() if isinstance(legacy_raw, bytes) else legacy_raw
+                    logger.warning(
+                        "lifecycle_review_switch: migrating legacy key %s (%s) -> %s",
+                        _LEGACY_KEY, val, _KEY,
+                    )
+                    client.set(_KEY, val)
+                    raw = val
+            if raw is not None:
+                # decode_responses=True → str; guard bytes just in case.
+                val = raw.decode() if isinstance(raw, bytes) else raw
+                return val == "1"
+        except Exception as exc:
+            logger.warning("lifecycle_review_switch read failed, using baseline: %s", exc)
+    return bool(settings.lifecycle_human_review_enabled)
+
+
+def set_review_enabled(enabled: bool, actor: str | None = None) -> bool:
+    """
+    Turn the human-review switch on or off at runtime.
+
+    Writes a persistent (no-TTL) Redis key so the switch survives until an
+    operator changes it. Returns the value that is now in effect.
+
+    Raises RuntimeError if Redis is unavailable — the toggle is meaningless
+    without a runtime store, and we must not silently no-op an operator action.
+    """
+    if not redis_available():
+        raise RuntimeError(
+            "Redis unavailable — cannot persist the Lifecycle human-review switch."
+        )
+    try:
+        # Persistent SET (no expiry) — rset() always attaches a TTL, so write
+        # through the raw client here.
+        get_redis().set(_KEY, "1" if enabled else "0")
+    except Exception as exc:
+        logger.error("lifecycle_review_switch write failed: %s", exc)
+        raise RuntimeError("Failed to persist the Lifecycle human-review switch.") from exc
+
+    logger.info(
+        "Lifecycle human-review switch set to %s by %s",
+        "ON" if enabled else "OFF",
+        actor or "unknown",
+    )
+    return enabled

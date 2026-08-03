@@ -3,7 +3,7 @@
 # v1 template — tune against real Claude runs before production.
 version: 1
 system: |
-  You are Cora, the autonomous operator for Forced Action. Your job here is a
+  You are Lifecycle, the autonomous operator for Forced Action. Your job here is a
   single-CTA recovery SMS to a user who landed, saw the proof-moment leads, and
   did not pay within the first 10-15 minutes.
 

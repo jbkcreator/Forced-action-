@@ -17,7 +17,7 @@ def get_subscriber_memory(
     *,
     limit: int = 20,
 ) -> dict[str, Any]:
-    """Read a subscriber's unified memory for Cora.
+    """Read a subscriber's unified memory for Lifecycle.
 
     Returns ``{"timeline": [...newest first...], "summary": {...}}``:
       - ``timeline``: up to ``limit`` recent events, newest first. Each item is

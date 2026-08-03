@@ -923,8 +923,8 @@ def _fetch_enrichment_rate(session, run_date: date, county_ids: list[str]) -> st
         return NA
 
 
-def _fetch_cora_autonomy(session, run_date: date | None = None) -> str:
-    """True platform autonomy for finalized Cora decisions in the trailing 7 days.
+def _fetch_lifecycle_autonomy(session, run_date: date | None = None) -> str:
+    """True platform autonomy for finalized Lifecycle decisions in the trailing 7 days.
 
     Numerator: completed decisions that stayed fully autonomous.
     Denominator: all finalized decisions, including approval-required,
@@ -956,7 +956,7 @@ def _fetch_cora_autonomy(session, run_date: date | None = None) -> str:
             return _pct(row[1], row[0])
         return NA
     except Exception as exc:
-        logger.warning("_fetch_cora_autonomy failed: %s", exc)
+        logger.warning("_fetch_lifecycle_autonomy failed: %s", exc)
         return NA
 
 
@@ -1104,9 +1104,9 @@ def _fetch_exec_summary_rows(session, run_date: date, county_ids: list[str]) -> 
     churn_rate = f"{int(churn_val or 0) / max(1, active + int(churn_val or 0)) * 100:.1f}%" if active + int(churn_val or 0) > 0 else NA
     results.append(("Churn Rate (30-day)", churn_rate, "—", churn_rate, churn_rate, "<5%", "", ""))
 
-    # Cora Autonomy
-    auto = _fetch_cora_autonomy(session, run_date)
-    results.append(("Cora Platform Autonomy", auto, "7d window", "—", auto, "95%+", "", ""))
+    # Lifecycle Autonomy
+    auto = _fetch_lifecycle_autonomy(session, run_date)
+    results.append(("Lifecycle Platform Autonomy", auto, "7d window", "—", auto, "95%+", "", ""))
 
     return [
         {"metric": r[0], "today": r[1], "this_week": r[2], "monthly_pace": r[3], "target": r[4], "trend": r[5], "status": r[6], "notes": r[7]}
@@ -1530,7 +1530,7 @@ def _fetch_engagement_by_cohort(session, county_ids: list[str]) -> dict:
     """Engagement band per active-subscriber cohort over the last 30 days.
 
     Signals (existing tables — no new infra): message_outcomes
-    (opened/clicked/replied/delivered, populated by Cora SMS + any email-event
+    (opened/clicked/replied/delivered, populated by Lifecycle SMS + any email-event
     capture), sent_leads (delivery), deal_outcomes (deals reported).
 
     Banding per subscriber:
@@ -1971,7 +1971,7 @@ def _fetch_subs_by_vertical(session, county_ids: list[str]) -> list:
         return []
 
 
-def _fetch_cora_decision_stats(session, run_date: date) -> list:
+def _fetch_lifecycle_decision_stats(session, run_date: date) -> list:
     try:
         rows = session.execute(
             text("""
@@ -2014,18 +2014,18 @@ def _fetch_cora_decision_stats(session, run_date: date) -> list:
             })
         return result
     except Exception as exc:
-        logger.warning("_fetch_cora_decision_stats failed: %s", exc)
+        logger.warning("_fetch_lifecycle_decision_stats failed: %s", exc)
         return []
 
 
-def _fetch_cora_metrics(session, run_date: date) -> dict:
+def _fetch_lifecycle_metrics(session, run_date: date) -> dict:
     week_start = run_date - timedelta(days=run_date.weekday())
     result: dict = {
-        "autonomy_pct": _fetch_cora_autonomy(session, run_date),
+        "autonomy_pct": _fetch_lifecycle_autonomy(session, run_date),
         "api_cost_today": NA, "api_cost_by_service": [], "api_cost_week": NA,
         "ab_active_count": NA, "ab_completed_recent": [],
         "open_incidents_red": 0, "open_incidents_yellow": 0,
-        "decision_stats": _fetch_cora_decision_stats(session, run_date),
+        "decision_stats": _fetch_lifecycle_decision_stats(session, run_date),
     }
     try:
         cost_rows = session.execute(
@@ -2036,7 +2036,7 @@ def _fetch_cora_metrics(session, run_date: date) -> dict:
         result["api_cost_by_service"] = [{"service": r[0], "cost": f"${float(r[1] or 0):.4f}"} for r in cost_rows]
         result["api_cost_week"] = f"${float(session.execute(text('SELECT SUM(cost_usd) FROM api_usage_logs WHERE date(created_at) >= :ws'), {'ws': str(week_start)}).scalar() or 0):.4f}"
     except Exception as exc:
-        logger.warning("_fetch_cora_metrics api_cost failed: %s", exc)
+        logger.warning("_fetch_lifecycle_metrics api_cost failed: %s", exc)
     try:
         result["ab_active_count"] = int(session.execute(text("SELECT COUNT(*) FROM ab_tests WHERE status = 'active'")).scalar() or 0)
         ab_recent = session.execute(
@@ -2044,15 +2044,15 @@ def _fetch_cora_metrics(session, run_date: date) -> dict:
         ).fetchall()
         result["ab_completed_recent"] = [{"name": r[0], "winner": r[1] or NA, "ended": str(r[2])[:10] if r[2] else NA} for r in ab_recent]
     except Exception as exc:
-        logger.warning("_fetch_cora_metrics ab_tests failed: %s", exc)
+        logger.warning("_fetch_lifecycle_metrics ab_tests failed: %s", exc)
     try:
-        for sev, cnt in session.execute(text("SELECT severity, COUNT(*) FROM cora_incident WHERE breach_resolved IS NULL GROUP BY severity")).fetchall():
+        for sev, cnt in session.execute(text("SELECT severity, COUNT(*) FROM lifecycle_incident WHERE breach_resolved IS NULL GROUP BY severity")).fetchall():
             if sev == "red":
                 result["open_incidents_red"] = int(cnt)
             elif sev == "yellow":
                 result["open_incidents_yellow"] = int(cnt)
     except Exception as exc:
-        logger.warning("_fetch_cora_metrics incidents failed: %s", exc)
+        logger.warning("_fetch_lifecycle_metrics incidents failed: %s", exc)
     return result
 
 
@@ -2086,14 +2086,14 @@ def _fetch_open_incidents(session) -> list:
     try:
         with session.begin_nested():
             rows = session.execute(
-                text(f"SELECT {base_cols}, root_cause FROM cora_incident WHERE breach_resolved IS NULL {order}")
+                text(f"SELECT {base_cols}, root_cause FROM lifecycle_incident WHERE breach_resolved IS NULL {order}")
             ).fetchall()
         return _build(rows, has_root=True)
     except Exception as exc:
         logger.info("_fetch_open_incidents: root_cause column unavailable, deriving fallback (%s)", exc)
     try:
         rows = session.execute(
-            text(f"SELECT {base_cols} FROM cora_incident WHERE breach_resolved IS NULL {order}")
+            text(f"SELECT {base_cols} FROM lifecycle_incident WHERE breach_resolved IS NULL {order}")
         ).fetchall()
         return _build(rows, has_root=False)
     except Exception as exc:
@@ -2572,7 +2572,7 @@ def collect_dashboard_data(session, run_date: date) -> dict:
     avg_cds_today = _fetch_avg_cds(session, run_date, active_counties)
     active_subs = _fetch_active_subscriber_count(session, active_counties)
     enrichment_rate = _fetch_enrichment_rate(session, run_date, active_counties)
-    cora_autonomy = _fetch_cora_autonomy(session, run_date)
+    lifecycle_autonomy = _fetch_lifecycle_autonomy(session, run_date)
     subscriber_metrics = _fetch_subscriber_metrics(session, active_counties)
 
     exec_summary = {
@@ -2585,7 +2585,7 @@ def collect_dashboard_data(session, run_date: date) -> dict:
         "avg_cds": avg_cds_today,
         "active_subscribers": active_subs,
         "enrichment_rate": enrichment_rate,
-        "cora_autonomy": cora_autonomy,
+        "lifecycle_autonomy": lifecycle_autonomy,
         "mrr": subscriber_metrics.get("mrr", NA),
         "churn_rate_30d": subscriber_metrics.get("churn_rate_30d", NA),
         "total_scraped": total_scraped,
@@ -2644,7 +2644,7 @@ def collect_dashboard_data(session, run_date: date) -> dict:
 
     # Demo-data guard: seeded subscribers carry a 'seed_demo_' stripe_customer_id
     # prefix (scripts/seed_demo_metrics.py). When present, the report renders a
-    # TEST-DATA banner so subscriber / revenue / Cora figures are never mistaken
+    # TEST-DATA banner so subscriber / revenue / Lifecycle figures are never mistaken
     # for production — there are no real subscribers yet.
     try:
         demo_subscriber_count = int(session.execute(
@@ -2707,7 +2707,7 @@ def collect_dashboard_data(session, run_date: date) -> dict:
         "conversion_funnel": conversion_funnel,
         "cohort_breakdown": _fetch_cohort_breakdown(session, active_counties),
         "cohort_ext": cohort_ext,
-        "cora_metrics": _fetch_cora_metrics(session, run_date),
+        "lifecycle_metrics": _fetch_lifecycle_metrics(session, run_date),
         "open_incidents": _fetch_open_incidents(session),
         "quality_signals": _fetch_data_quality_signals(session, run_date, active_counties),
         "signal_freshness": signal_freshness,

@@ -20,10 +20,14 @@ Event envelope:
 tier3_winback (T-B12-07, client-locked copy):
     zip_held     (<30d lapsed, territory still theirs) —
         "your territory is still yours — 50% off your return month."
+        Exception: tier == 'founder' subscribers never get this discount —
+        they get a one-time +14-day territory grace extension instead
+        (src.services.winback_offers.grant_founder_grace_extension; see
+        wayfinder map notion-pending-tasks, tickets F1/F2/F3).
     zip_released (>=30d lapsed, territory released) —
         5 free credits on reactivation, granted on successful send via
         src.services.wallet_engine.add_bonus (capped by the credit_bonus_max
-        guardrail like every other bonus grant).
+        guardrail like every other bonus grant). No founder exception here.
 
 Flow (5 nodes):
     1. assemble_context     — load subscriber profile, determine channel (sms/email)
@@ -225,7 +229,7 @@ def _node_build_compose_context(state: ReactivationState) -> ReactivationState:
 
     if cohort == "county_live":
         system_prompt = (
-            "You are Cora, a concise outbound copywriter for Forced Action — "
+            "You are Lifecycle, a concise outbound copywriter for Forced Action — "
             "a distressed property intelligence platform. "
             "Write a short, urgent, professional reactivation message. "
             "Never use emojis. Never use all-caps. Always include 'Reply STOP to opt out' for SMS."
@@ -264,7 +268,7 @@ def _node_build_compose_context(state: ReactivationState) -> ReactivationState:
             subject = f"{county_id} just launched — new leads are live on Forced Action"
     elif cohort == "sold_out":
         system_prompt = (
-            "You are Cora, a concise outbound copywriter for Forced Action — "
+            "You are Lifecycle, a concise outbound copywriter for Forced Action — "
             "a distressed property intelligence platform. "
             "Write a short, urgent, scarcity-driven reactivation message. "
             "Never use emojis. Never use all-caps. Always include 'Reply STOP to opt out' for SMS."
@@ -302,33 +306,72 @@ def _node_build_compose_context(state: ReactivationState) -> ReactivationState:
             subject = f"Slot open in {zip_code} — lock it now on Forced Action"
     else:  # tier3_winback — client-locked copy, do not reword (T-B12-07)
         system_prompt = (
-            "You are Cora, a concise outbound copywriter for Forced Action — "
+            "You are Lifecycle, a concise outbound copywriter for Forced Action — "
             "a distressed property intelligence platform, writing to a lapsed "
             "subscriber. Never use emojis. Never use all-caps. Always include "
             "'Reply STOP to opt out' for SMS. Use the exact locked headline "
             "provided — do not paraphrase it."
         )
 
-        # The 50%-off / 5-credit benefit must only apply on an actual
-        # reactivation, not merely because this message was sent (PR #172
-        # review). Mint a one-time redemption token now and carry it on the
-        # link; the checkout flow validates it (applies the Stripe coupon for
-        # zip_held) and the checkout-completion webhook redeems it (grants
-        # credits for zip_released) — see src.services.winback_offers.
-        reactivate_link = "https://forcedactionleads.com?reactivate=1"
-        try:
-            from src.services.winback_offers import create_or_reuse_offer
-            with db.session_scope() as s:
-                token = create_or_reuse_offer(state["subscriber_id"], winback_branch, s)
-            reactivate_link = f"{reactivate_link}&wt={token}"
-        except Exception:
-            logger.exception(
-                "reactivation: failed to mint winback offer token sub_id=%s branch=%s — "
-                "falling back to an untokenized link (benefit will not auto-apply)",
-                state.get("subscriber_id"), winback_branch,
-            )
+        # Founders (tier == 'founder') don't get the zip_held discount —
+        # wayfinder map notion-pending-tasks, tickets F1/F2/F3: they get a
+        # one-time +14-day territory grace extension instead, granted
+        # immediately (nothing to redeem at checkout, unlike the coupon).
+        is_founder_zip_held = (
+            winback_branch == "zip_held" and profile.get("tier") == "founder"
+        )
 
-        if winback_branch == "zip_held":
+        reactivate_link = "https://forcedactionleads.com?reactivate=1"
+        founder_grace_granted = False
+        if is_founder_zip_held:
+            try:
+                from src.services.winback_offers import grant_founder_grace_extension
+                with db.session_scope() as s:
+                    founder_grace_granted = grant_founder_grace_extension(
+                        state["subscriber_id"], s
+                    )
+            except Exception:
+                logger.exception(
+                    "reactivation: failed to grant founder grace extension sub_id=%s",
+                    state.get("subscriber_id"),
+                )
+            else:
+                logger.info(
+                    "reactivation: founder grace extension grant=%s sub_id=%s",
+                    founder_grace_granted, state.get("subscriber_id"),
+                )
+        else:
+            # The 50%-off / 5-credit benefit must only apply on an actual
+            # reactivation, not merely because this message was sent (PR #172
+            # review). Mint a one-time redemption token now and carry it on the
+            # link; the checkout flow validates it (applies the Stripe coupon for
+            # zip_held) and the checkout-completion webhook redeems it (grants
+            # credits for zip_released) — see src.services.winback_offers.
+            try:
+                from src.services.winback_offers import create_or_reuse_offer
+                with db.session_scope() as s:
+                    token = create_or_reuse_offer(state["subscriber_id"], winback_branch, s)
+                reactivate_link = f"{reactivate_link}&wt={token}"
+            except Exception:
+                logger.exception(
+                    "reactivation: failed to mint winback offer token sub_id=%s branch=%s — "
+                    "falling back to an untokenized link (benefit will not auto-apply)",
+                    state.get("subscriber_id"), winback_branch,
+                )
+
+        if is_founder_zip_held and founder_grace_granted:
+            headline = "Your territory is still yours — we've extended your grace period by 14 days."
+            body_detail = (
+                f"As a founding-tier member, your {vertical} territory in {county_id} "
+                f"is still locked to you, and we've added 14 extra days before it opens up."
+            )
+        elif is_founder_zip_held:
+            headline = "Your territory may still be available — reactivate now to keep it."
+            body_detail = (
+                f"Your founding-tier {vertical} territory in {county_id} was not extended, "
+                f"so reactivate now if you want to keep your spot."
+            )
+        elif winback_branch == "zip_held":
             headline = "Your territory is still yours — 50% off your return month."
             body_detail = (
                 f"Your {vertical} territory in {county_id} is still locked to you. "

@@ -199,7 +199,7 @@ def compute_wallet_to_lock_eligibility(db: Session, subscriber) -> tuple[bool, O
 def build_lock_cta_url(subscriber_id: int, zip_code: str) -> str:
     """Build pre-filled Territory Lock checkout URL for SMS CTA."""
     base = settings.app_base_url.rstrip("/")
-    return f"{base}/checkout?tier=annual_lock&zip={zip_code}&sub={subscriber_id}&utm=cora_lock_close"
+    return f"{base}/checkout?tier=annual_lock&zip={zip_code}&sub={subscriber_id}&utm=lifecycle_lock_close"
 
 
 def emit_event(
@@ -210,8 +210,8 @@ def emit_event(
     uncontacted_count: int = 0,
     tier_breakdown: dict = None,
 ) -> None:
-    """Emit subscriber_crossed_lock_threshold event to Cora supervisor."""
-    from src.agents.events.ingestion import publish_cora_event
+    """Emit subscriber_crossed_lock_threshold event to Lifecycle supervisor."""
+    from src.agents.events.ingestion import publish_lifecycle_event
     from src.agents.events.types import Event
 
     yyyymm = datetime.now(timezone.utc).strftime(LOCK_IDEMPOTENCY_WINDOW)
@@ -236,7 +236,7 @@ def emit_event(
         idempotency_key=f"wal2lock:{subscriber_id}:{zip_code}:{yyyymm}",
     )
     try:
-        publish_cora_event(evt.to_dispatch_dict())
+        publish_lifecycle_event(evt.to_dispatch_dict())
     except Exception as exc:
         logger.error(
             "wallet_to_lock emit_event failed sub=%s zip=%s: %s",

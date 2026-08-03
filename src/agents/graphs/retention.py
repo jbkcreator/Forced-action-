@@ -225,7 +225,7 @@ def _node_build_context(state: RetentionState) -> RetentionState:
 		"top_zip": state.get("top_zip") or "your area",
 		"unclaimed_gold_count": state.get("unclaimed_gold_count", 0),
 		"competing_viewers": state.get("competing_viewers", 0),
-		"action_link": f"https://app.forcedaction.io/feed/{profile.get('id')}",
+		"action_link": f"https://app.forcedactionleads.com/feed/{profile.get('id')}",
 	}
 
 	system, user, variant, test_name = render_for_subscriber_auto(

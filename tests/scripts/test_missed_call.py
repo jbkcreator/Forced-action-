@@ -30,7 +30,7 @@ with get_db_context() as db:
 print("=" * 50)
 print("STEP 2 — token resolution (TOKEN_RESOLVED)")
 print("=" * 50)
-token = encode_landing_token(sub_id, 'cora_sms', ttl_hours=72)
+token = encode_landing_token(sub_id, 'lifecycle_sms', ttl_hours=72)
 print('token (first 40 chars):', token[:40] if token else "NONE — check LANDING_TOKEN_SECRET")
 assert token, "encode_landing_token returned None — LANDING_TOKEN_SECRET not set"
 
@@ -46,7 +46,7 @@ print('feed_uuid     :', data["feed_uuid"])
 print('subscriber_id :', data["subscriber_id"])
 print('signup_source :', data["signup_source"])
 assert data["feed_uuid"] == feed_uuid, "feed_uuid mismatch"
-assert data["signup_source"] == "cora_sms", "signup_source mismatch"
+assert data["signup_source"] == "lifecycle_sms", "signup_source mismatch"
 print("PASS\n")
 
 # ── Step 3: proof moment ──────────────────────────────────────────────────────

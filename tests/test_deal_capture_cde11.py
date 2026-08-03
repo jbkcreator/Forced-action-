@@ -6,7 +6,7 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
-from src.core.models import CoraSuppression, DealOutcome, Property, Subscriber
+from src.core.models import LifecycleSuppression, DealOutcome, Property, Subscriber
 
 
 @pytest.fixture(scope="module")
@@ -38,7 +38,7 @@ def _mk_sub_and_prop(fresh_db):
 def _cleanup(fresh_db, sub, prop):
     from sqlalchemy import text
     fresh_db.execute(DealOutcome.__table__.delete().where(DealOutcome.subscriber_id == sub.id))
-    fresh_db.execute(CoraSuppression.__table__.delete().where(CoraSuppression.subscriber_id == sub.id))
+    fresh_db.execute(LifecycleSuppression.__table__.delete().where(LifecycleSuppression.subscriber_id == sub.id))
     fresh_db.execute(text("DELETE FROM referral_prompt_funnel WHERE subscriber_id = :sid"), {"sid": sub.id})
     fresh_db.delete(sub)
     fresh_db.delete(prop)
@@ -90,7 +90,7 @@ def test_ownerless_outcome_fires_no_subscriber_side_effects(fresh_db):
     fresh_db.add(outcome)
     fresh_db.flush()
 
-    with patch("src.services.cora_suppression.create_suppression") as mock_suppress, \
+    with patch("src.services.lifecycle_suppression.create_suppression") as mock_suppress, \
          patch("src.services.win_graphic.generate") as mock_graphic, \
          patch("src.tasks.annual_push._push_annual_offer") as mock_annual, \
          patch("src.services.attribution_service.record_conversion_attribution") as mock_attr:

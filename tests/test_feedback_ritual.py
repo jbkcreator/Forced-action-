@@ -6,7 +6,7 @@ from uuid import uuid4
 import pytest
 
 
-def test_suspicious_cora_touch_builds_feedback_ritual_snapshot():
+def test_suspicious_lifecycle_touch_builds_feedback_ritual_snapshot():
     from src.services.feedback_ritual import build_feedback_ritual_snapshot
 
     decision = {
@@ -39,7 +39,7 @@ def test_suspicious_cora_touch_builds_feedback_ritual_snapshot():
     assert snapshot["summary_review_capture"] == decision["summary"]["review_capture"]
 
 
-def test_aborted_cora_touch_is_marked_for_feedback_ritual_queue():
+def test_aborted_lifecycle_touch_is_marked_for_feedback_ritual_queue():
     from src.services.feedback_ritual import should_queue_feedback_ritual
 
     should_queue, metadata = should_queue_feedback_ritual(
@@ -55,7 +55,7 @@ def test_aborted_cora_touch_is_marked_for_feedback_ritual_queue():
     assert metadata["queue_reason"] == "terminal_status:aborted"
 
 
-def test_suspicious_cora_touch_builds_queue_payload_for_shared_override_table():
+def test_suspicious_lifecycle_touch_builds_queue_payload_for_shared_override_table():
     from src.services.feedback_ritual import build_feedback_ritual_queue_payload
 
     decision = {
@@ -89,7 +89,7 @@ def test_suspicious_cora_touch_builds_queue_payload_for_shared_override_table():
     assert payload["source_metadata"]["queue_reason"] == "terminal_status:aborted"
 
 
-def test_low_confidence_cora_touch_is_marked_for_feedback_ritual_queue():
+def test_low_confidence_lifecycle_touch_is_marked_for_feedback_ritual_queue():
     from src.services.feedback_ritual import should_queue_feedback_ritual
 
     should_queue, metadata = should_queue_feedback_ritual(
@@ -109,7 +109,7 @@ def test_low_confidence_cora_touch_is_marked_for_feedback_ritual_queue():
     assert metadata["queue_reason"] == "confidence_score:0.41"
 
 
-def test_review_flagged_cora_touch_is_marked_for_feedback_ritual_queue():
+def test_review_flagged_lifecycle_touch_is_marked_for_feedback_ritual_queue():
     from src.services.feedback_ritual import should_queue_feedback_ritual
 
     should_queue, metadata = should_queue_feedback_ritual(
@@ -222,7 +222,7 @@ def test_process_feedback_ritual_candidate_loads_decision_and_enqueues_when_susp
     assert saved_row.source == "feedback_ritual"
 
 
-def test_publish_feedback_ritual_candidate_emits_cora_event(monkeypatch):
+def test_publish_feedback_ritual_candidate_emits_lifecycle_event(monkeypatch):
     from src.services.feedback_ritual import publish_feedback_ritual_candidate
 
     published = {}
@@ -231,7 +231,7 @@ def test_publish_feedback_ritual_candidate_emits_cora_event(monkeypatch):
         published.update(event)
 
     monkeypatch.setattr(
-        "src.agents.events.ingestion.publish_cora_event",
+        "src.agents.events.ingestion.publish_lifecycle_event",
         fake_publish,
     )
 
@@ -249,7 +249,7 @@ def test_publish_feedback_ritual_candidate_emits_cora_event(monkeypatch):
 
 def test_feedback_ritual_persists_queue_row_from_logged_agent_decision(fresh_db):
     from src.agents.tools.write_tools import log_decision
-    from src.core.models import CoraTrainingOverride
+    from src.core.models import LifecycleTrainingOverride
     from src.services.feedback_ritual import process_feedback_ritual_candidate
 
     decision_id = str(uuid4())
@@ -281,9 +281,9 @@ def test_feedback_ritual_persists_queue_row_from_logged_agent_decision(fresh_db)
 
     assert created is not None
     saved_row = (
-        fresh_db.query(CoraTrainingOverride)
-        .filter(CoraTrainingOverride.source == "feedback_ritual")
-        .filter(CoraTrainingOverride.subject_ref == decision_id)
+        fresh_db.query(LifecycleTrainingOverride)
+        .filter(LifecycleTrainingOverride.source == "feedback_ritual")
+        .filter(LifecycleTrainingOverride.subject_ref == decision_id)
         .one()
     )
     assert saved_row.subject_type == "agent_decision"

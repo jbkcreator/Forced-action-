@@ -38,7 +38,6 @@ GOLD_PLUS_TIERS = {"Ultra Platinum", "Platinum", "Gold"}
 TIER_LEAD_LIMIT = {
     "starter":    5,
     "pro":       10,
-    "dominator": 20,
     "agency":    20,
 }
 DEFAULT_LEAD_LIMIT = 10
@@ -492,7 +491,7 @@ def render_lead_email(
             </p>
             <p style="margin:0;">
               You're receiving this because you're subscribed to the {vertical_label} vertical.
-              <a href="{_settings.app_base_url}" style="color:#475569;text-decoration:none;">forcedaction.io</a>
+              <a href="{_settings.app_base_url}" style="color:#475569;text-decoration:none;">forcedactionleads.com</a>
             </p>
           </td>
         </tr>

@@ -196,7 +196,7 @@ def _wave1_build_context(state: AbandonmentState) -> AbandonmentState:
 		"minutes_since_session_start": payload.get("minutes_elapsed", 12),
 		"gold_lead_count": zip_activity.get("active_viewers", 0),
 		"wall_countdown_minutes": payload.get("wall_countdown_minutes", 3),
-		"unlock_link": f"https://app.forcedaction.io/feed/{profile.get('id')}",
+		"unlock_link": f"https://app.forcedactionleads.com/feed/{profile.get('id')}",
 		"prompt_version": "abandonment_w1_v2",
 		# fa038 personalization fields
 		**personalization,
@@ -382,7 +382,7 @@ def _wave2_build_context(state: AbandonmentState) -> AbandonmentState:
 		"lead_tier_viewed": _tier_viewed,
 		"other_viewers_count": zip_activity.get("active_viewers", 0),
 		"wall_countdown_minutes": payload.get("wall_countdown_minutes", 2),
-		"unlock_link": f"https://app.forcedaction.io/feed/{profile.get('id')}",
+		"unlock_link": f"https://app.forcedactionleads.com/feed/{profile.get('id')}",
 		"prompt_version": "abandonment_w2_v2",
 		# fa038 personalization fields
 		**personalization,

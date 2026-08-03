@@ -38,7 +38,7 @@ Fire a founder SMS alert whenever a checkout (subscription or lead pack) is aban
 
 1. **[`src/services/checkout_recovery.py`](../../src/services/checkout_recovery.py)** — `start_recovery()`:
    - After `db.add(row)` (new-row path only — never on the "already active" no-op replay at the `existing is not None` early return), call a new `_alert_founder(email, source, phone)`.
-   - `_alert_founder()` lazy-imports `_send_founder_alert` from `src.services.stripe_webhooks` inside the function body — mirrors the existing lazy-import pattern already used in `cora_attribution_rollback_check.py` and `ab_rollback_check.py`, avoiding a circular import (since `stripe_webhooks.py` also lazy-imports `checkout_recovery` at call time).
+   - `_alert_founder()` lazy-imports `_send_founder_alert` from `src.services.stripe_webhooks` inside the function body — mirrors the existing lazy-import pattern already used in `lifecycle_attribution_rollback_check.py` and `ab_rollback_check.py`, avoiding a circular import (since `stripe_webhooks.py` also lazy-imports `checkout_recovery` at call time).
    - Message format follows the existing one-liner convention (`"REFUND: ...", "DISPUTE: ..."`):
      `f"ABANDONED CHECKOUT: {source} email={email}"` (+ `" phone={phone}"` if present). Truncated to 320 chars by `_send_founder_alert` itself.
    - Fires **unconditionally** — not gated by `checkout_recovery_enabled` / `checkout_recovery_lead_pack_enabled` (those flags control customer-facing sends only; the founder alert sends nothing to the buyer, and `_send_founder_alert` already no-ops safely if `FOUNDER_PHONE` isn't configured).

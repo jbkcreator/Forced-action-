@@ -212,7 +212,7 @@ def test_faq_shortcut_skips_claude(db):
         turn = handle_user_turn(session_id, "how much does it cost?", db)
 
     assert not mock_call.called
-    assert "pricing" in turn.content.lower() or "support@forcedaction.ai" in turn.content
+    assert "pricing" in turn.content.lower() or "support@forcedactionleads.com" in turn.content
 
 
 def test_cache_hit_skips_claude(db):

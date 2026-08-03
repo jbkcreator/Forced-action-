@@ -6,12 +6,12 @@ Handles:
   - Checkout session creation
   - One-time payments (lead pack, hot lead unlock)
 
-Pricing table:
-  Tier        | Founding | Regular | Future (6mo)
-  ------------|----------|---------|-------------
-  starter     | $600/mo  | $800/mo | $1,100/mo
-  pro         | $1,100   | $1,500  | $1,900
-  dominator   | $2,000   | $2,800  | $3,500
+Pricing table (live rates — founding rate = current live rate for all tiers):
+  Tier        | Live/Founding | Regular (future)
+  ------------|---------------|------------------
+  starter     | $299/mo       | TBD
+  pro         | $499/mo       | TBD
+  founder     | $1,100/mo     | —
 
 Every product has TWO Stripe price objects: founding_price_id + regular_price_id.
 Founding rate is selected atomically at checkout and locked forever.
@@ -19,6 +19,7 @@ Founding rate is selected atomically at checkout and locked forever.
 
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 import stripe
@@ -27,7 +28,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from config.settings import settings
-from src.core.models import FoundingSubscriberCount, Plan
+from src.core.models import County, FoundingSubscriberCount, Plan
 
 logger = logging.getLogger(__name__)
 
@@ -67,10 +68,6 @@ def _price_ids():
         "pro": {
             "founding": settings.active_stripe_price("pro_founding"),
             "regular":  settings.active_stripe_price("pro_regular"),
-        },
-        "dominator": {
-            "founding": settings.active_stripe_price("dominator_founding"),
-            "regular":  settings.active_stripe_price("dominator_regular"),
         },
         "partner": {
             "founding": settings.active_stripe_price("partner"),
@@ -190,7 +187,12 @@ def get_price_id_for_checkout(
             )
             raise
 
-    is_founding = row.count < _founding_limit()
+    deadline_at = db.execute(
+        select(County.founding_price_deadline_at).where(County.county_id == county_id)
+    ).scalar_one_or_none()
+    is_founding = row.count < _founding_limit() and (
+        deadline_at is None or deadline_at > datetime.now(timezone.utc)
+    )
     price_key = "founding" if is_founding else "regular"
     price_id = prices[tier][price_key]
 
@@ -201,8 +203,8 @@ def get_price_id_for_checkout(
         )
 
     logger.info(
-        "Checkout price selected: tier=%s vertical=%s county=%s founding=%s count=%d/%d",
-        tier, vertical, county_id, is_founding, row.count, _founding_limit(),
+        "Checkout price selected: tier=%s vertical=%s county=%s founding=%s count=%d/%d deadline_at=%s",
+        tier, vertical, county_id, is_founding, row.count, _founding_limit(), deadline_at,
     )
     return price_id, is_founding
 
@@ -326,7 +328,7 @@ def create_subscription_checkout(
             payment_method_types=["card"],
             customer_email=customer_email,
             # Collect a phone number on the Stripe payment page so we have it
-            # on file for SMS features (Cora SMS, accelerated wallet push,
+            # on file for SMS features (Lifecycle SMS, accelerated wallet push,
             # etc.). Stripe validates the number and exposes it in
             # session.customer_details.phone on checkout.session.completed.
             phone_number_collection={"enabled": True},

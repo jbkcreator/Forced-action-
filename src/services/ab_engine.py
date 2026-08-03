@@ -3,7 +3,7 @@ A/B testing engine — deterministic assignment, outcome recording, auto-rollbac
 
 Two assignment functions exist for two different test shapes:
   assign_variant      — message-swap a/b tests; out-of-test traffic → None (unrecorded).
-  assign_rollout_arm  — rollout tests (e.g. cora_attribution_v1); records BOTH arms
+  assign_rollout_arm  — rollout tests (e.g. lifecycle_attribution_v1); records BOTH arms
                         ('variant' / 'control') so control conversion rate is measurable.
 """
 
@@ -16,7 +16,7 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from config.cora_guardrails import get_guardrail, is_within_guardrail
+from config.lifecycle_guardrails import get_guardrail, is_within_guardrail
 from src.core.models import AbAssignment, AbTest
 
 logger = logging.getLogger(__name__)
@@ -59,6 +59,15 @@ def get_or_create_test(
     return test
 
 
+def _deterministic_variant(test: AbTest, key: str) -> Optional[str]:
+    """Pure hash + traffic-cap decision — same key always maps to the same
+    arm (or the same out-of-test None)."""
+    h = int(hashlib.md5(f"{test.test_name}{key}".encode()).hexdigest(), 16) % 100
+    if h >= test.traffic_pct:
+        return None
+    return "a" if h % 2 == 0 else "b"
+
+
 def assign_variant(subscriber_id: int, test_name: str, db: Session) -> Optional[str]:
     test = db.execute(
         select(AbTest).where(AbTest.test_name == test_name, AbTest.status == "active")
@@ -75,12 +84,10 @@ def assign_variant(subscriber_id: int, test_name: str, db: Session) -> Optional[
     if existing:
         return existing.variant
 
-    # Deterministic hash — same subscriber always gets same variant
-    h = int(hashlib.md5(f"{test_name}{subscriber_id}".encode()).hexdigest(), 16) % 100
-    if h >= test.traffic_pct:
+    variant = _deterministic_variant(test, str(subscriber_id))
+    if variant is None:
         return None
 
-    variant = "a" if h % 2 == 0 else "b"
     assignment = AbAssignment(
         test_id=test.id,
         subscriber_id=subscriber_id,
@@ -91,11 +98,21 @@ def assign_variant(subscriber_id: int, test_name: str, db: Session) -> Optional[
     return variant
 
 
-ATTRIBUTION_ROLLOUT_TEST_NAME = "cora_attribution_v1"
+# NOTE: cold, pre-customer arm assignment (assign_variant_by_thread) and
+# price-band arm selection (get_price_variant) used to live here, keyed on
+# opportunity_thread_id instead of subscriber_id. They've moved to
+# src/services/agent_lane_experiment_engine.py, targeting
+# AgentLaneExperiment/AgentLaneExperimentAssignment instead of this
+# module's AbTest/AbAssignment — this module is Lifecycle's
+# (post-customer/subscriber) engine; Agent Lane (pre-customer) has its own.
+# See docs/agent-lane-data-access-matrix.md.
+
+
+ATTRIBUTION_ROLLOUT_TEST_NAME = "lifecycle_attribution_v1"
 
 
 def ensure_attribution_rollout_test(db: Session) -> AbTest:
-    """Idempotently register the cora_attribution_v1 rollout test.
+    """Idempotently register the lifecycle_attribution_v1 rollout test.
 
     Called lazily from decision_hierarchy so the test row exists before
     assign_rollout_arm tries to look it up.
@@ -126,11 +143,11 @@ def get_or_create_holdout_test(
     (100 - control_pct, e.g. 90), with the small remainder held out as a
     frozen control. Capping it would invert the split (90% control, 10%
     treatment). Syncs traffic_pct on every call so a control_pct change in
-    cora_holdout_tests.yaml takes effect on restart.
+    lifecycle_holdout_tests.yaml takes effect on restart.
 
     baseline_fingerprint: content hash of the graph's base prompt at creation
     (loader.base_prompt_fingerprint). Stored in variant_b and re-checked by
-    cora_holdout_check so a verdict never promotes on a baseline that drifted
+    lifecycle_holdout_check so a verdict never promotes on a baseline that drifted
     mid-experiment. Recorded once at creation and NOT re-synced — that's the
     point: it captures the baseline the control arm was measured against.
     """
@@ -370,7 +387,7 @@ def holdout_verdict(
     Mirrors should_rollback_rollout's z-test shape but asks the opposite
     question: does 'variant' beat 'control' by >2σ? Never mutates the test —
     pure read, called by a scheduled surfacing job, not by any promotion path
-    (promotion stays human-adopted via cora_playbook, per fa036).
+    (promotion stays human-adopted via lifecycle_playbook, per fa036).
 
     conversion_window_days: when set, an assignment only counts toward the
     conversion numerator if outcome_at - created_at falls within this many
@@ -451,6 +468,72 @@ def holdout_verdict(
     z = (p_var - p_ctrl) / se
     status = "proven" if z > 2.0 else "not_significant"
     return {**base, "status": status, "z_score": round(z, 3)}
+
+
+def get_price_variant(offer: str, ab_test_id: int, opportunity_thread_id: str, db: Session) -> dict:
+    """Return the price arm for a price-band A/B test, for one opportunity thread.
+
+    When PRICE_BAND_TESTING_ENABLED is False (the current default) the control
+    arm price is always returned and no AbAssignment is created — matching
+    price_assignment.assign_price()'s own flag-off behavior. When the flag is
+    True, opportunity_thread_id is deterministically assigned an arm via
+    assign_variant_by_thread() (variant "a" -> control, "b" -> test, matching
+    AbTest's variant_a/variant_b naming), and that arm's price is returned
+    together with the real, persisted AbAssignment id — out-of-test traffic
+    (assign_variant_by_thread returns None) falls back to the unrecorded
+    control price, same as assign_variant()'s existing message-swap tests.
+
+    Returns:
+        {"arm": "control" | "test", "price_cents": int, "ab_assignment_id": int | None}
+
+    Raises ValueError when the test row is missing required price columns or
+    the test is not active.
+    """
+    from src.services.price_assignment import PRICE_BAND_TESTING_ENABLED  # avoid circular at module level
+
+    test = db.execute(
+        select(AbTest).where(AbTest.id == ab_test_id, AbTest.status == "active")
+    ).scalar_one_or_none()
+    if not test:
+        raise ValueError(f"no active AbTest with id={ab_test_id}")
+    if test.offer and test.offer != offer:
+        logger.warning(
+            "get_price_variant: test %s offer mismatch (test.offer=%s, requested=%s)",
+            ab_test_id, test.offer, offer,
+        )
+
+    control_price = test.control_price_cents
+    if control_price is None:
+        raise ValueError(
+            f"AbTest id={ab_test_id} missing control_price_cents — "
+            "populate before calling get_price_variant"
+        )
+
+    if not PRICE_BAND_TESTING_ENABLED:
+        return {"arm": "control", "price_cents": control_price, "ab_assignment_id": None}
+
+    test_price = test.test_price_cents
+    if test_price is None:
+        raise ValueError(
+            f"AbTest id={ab_test_id} missing test_price_cents"
+        )
+
+    arm_variant = assign_variant_by_thread(opportunity_thread_id, test.test_name, db)
+    if arm_variant is None:
+        # Out-of-test traffic (traffic_pct cap) — unrecorded control, same
+        # convention assign_variant() already uses for message-swap tests.
+        return {"arm": "control", "price_cents": control_price, "ab_assignment_id": None}
+
+    assignment = db.execute(
+        select(AbAssignment).where(
+            AbAssignment.test_id == test.id,
+            AbAssignment.opportunity_thread_id == opportunity_thread_id,
+        )
+    ).scalar_one()
+
+    if arm_variant == "b":
+        return {"arm": "test", "price_cents": test_price, "ab_assignment_id": assignment.id}
+    return {"arm": "control", "price_cents": control_price, "ab_assignment_id": assignment.id}
 
 
 def record_outcome(subscriber_id: int, test_name: str, outcome: str, db: Session) -> None:
@@ -543,19 +626,19 @@ def complete_test(
     winner: str,
     db: Session,
     *,
-    source_actor: str = "cora",
+    source_actor: str = "lifecycle",
 ) -> None:
     """Close out an A/B test by recording the winner and writing a
-    `cora_playbook` recommendation row.
+    `lifecycle_playbook` recommendation row.
 
     The `source_actor` kwarg attributes who decided the test was over:
-      - 'cora' (default) — called automatically by `ab_rollback_check`
+      - 'lifecycle' (default) — called automatically by `ab_rollback_check`
                            when the Z-test triggers. Drives Metric 5
-                           "net new playbooks Cora authored."
+                           "net new playbooks Lifecycle authored."
       - <operator handle> — called manually from an admin endpoint or
                             an operator script. Attributes the playbook
                             to the real human actor so Metric 5 doesn't
-                            double-count human decisions as Cora's.
+                            double-count human decisions as Lifecycle's.
 
     The playbook row writes through `playbook_writer.upsert_recommendation`,
     which dedupes by source_key (so re-running ab_rollback_check on a
@@ -571,7 +654,7 @@ def complete_test(
     test.ended_at = datetime.now(timezone.utc)
     db.flush()
 
-    # fa036 — write a `cora_playbook` recommendation row for the winning
+    # fa036 — write a `lifecycle_playbook` recommendation row for the winning
     # variant. Status stays 'recommended' until a human adopts via the
     # admin endpoint (no auto-promote — pinned decision #1).
     from src.services.playbook_writer import upsert_recommendation

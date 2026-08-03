@@ -197,7 +197,7 @@ The JSON snapshots become the time-series record of "when did each signal turn p
 
 | Stage | Scope | Code | Run / Cutover |
 |---|---|---|---|
-| **A — Tier-visibility stopgap** | Config flag + suppression in feed API, GHL webhook, Cora prompts | ✅ Done | ✅ Live (Pinellas hidden) |
+| **A — Tier-visibility stopgap** | Config flag + suppression in feed API, GHL webhook, Lifecycle prompts | ✅ Done | ✅ Live (Pinellas hidden) |
 | **B — Training dataset builder** | `src/services/scoring_training_data.py`, CSV output, per-county NaN mask | ✅ Done | ✅ Run once (96,408 rows, 30d window) |
 | **C — Per-vertical fit** | `src/services/scoring_fit.py`, logistic regression, `coefs_to_knobs` mapper, JSON artifact | ✅ Done | ✅ Run once — AUC 0.77 but deed_transfers-dominated, not cutover-ready |
 | **D — Engine reframe** | Removed `signal_coverage_pct` multiplier; `_score_vertical` now skips signals in `cfg.missing_signals` | ✅ Done | ✅ Ready to deploy (no rescore required to take effect) |

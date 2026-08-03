@@ -1,5 +1,5 @@
 [Unit]
-Description=Cora Agents — Forced Action LangGraph Supervisor
+Description=Cora Agent — Forced Action Cold-Outreach Worker
 After=network-online.target postgresql.service redis-server.service
 Wants=network-online.target
 
@@ -10,7 +10,7 @@ WorkingDirectory=/root/Forced-action-
 Environment="PATH=/root/Forced-action-/.venv/bin"
 EnvironmentFile=/root/Forced-action-/.env
 
-ExecStart=/root/Forced-action-/.venv/bin/python -m src.agents --serve
+ExecStart=/root/Forced-action-/.venv/bin/python -m src.agents.cora --serve
 
 Restart=always
 RestartSec=10

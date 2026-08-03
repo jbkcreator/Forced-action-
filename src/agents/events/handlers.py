@@ -4,12 +4,12 @@ event sources and returns a normalized Event for the supervisor.
 
 Raw shapes the platform currently emits:
 
-	Redis Queue (LPUSH key 'cora:queue', consumed via BRPOP):
+	Redis Queue (LPUSH key 'lifecycle:queue', consumed via BRPOP):
 		JSON string:
 		  {"event_type": "...", "subscriber_id": 107, "payload": {...},
 		   "decision_id": "optional"}
 
-	Postgres LISTEN/NOTIFY (channel 'cora_events'):
+	Postgres LISTEN/NOTIFY (channel 'lifecycle_events'):
 		Same JSON string as Redis — senders must match envelope shape.
 
 	Cron:

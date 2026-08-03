@@ -41,7 +41,7 @@ def _row_to_dict(r) -> dict:
         "primary_rejection_reason": r.primary_rejection_reason,
         "competitor_rate_delta": float(r.competitor_rate_delta) if r.competitor_rate_delta is not None else None,
         "underwriting_blocker": r.underwriting_blocker,
-        "cora_behavior_adjustment": r.cora_behavior_adjustment,
+        "lifecycle_behavior_adjustment": r.lifecycle_behavior_adjustment,
         "claude_cost_usd": float(r.claude_cost_usd) if r.claude_cost_usd is not None else None,
         "created_at": r.created_at.isoformat() if r.created_at else None,
     }
@@ -85,7 +85,7 @@ def trigger_loss_autopsy(
         "primary_rejection_reason": autopsy.primary_rejection_reason,
         "competitor_rate_delta": float(autopsy.competitor_rate_delta) if autopsy.competitor_rate_delta is not None else None,
         "underwriting_blocker": autopsy.underwriting_blocker,
-        "cora_behavior_adjustment": autopsy.cora_behavior_adjustment,
+        "lifecycle_behavior_adjustment": autopsy.lifecycle_behavior_adjustment,
         "claude_cost_usd": float(autopsy.claude_cost_usd) if autopsy.claude_cost_usd is not None else None,
     }
 
@@ -124,7 +124,7 @@ def list_loss_autopsies(
         sa_text(
             f"SELECT id, property_id, prospect_id, deal_outcome_id, trigger_reason, "
             f"primary_rejection_reason, competitor_rate_delta, underwriting_blocker, "
-            f"cora_behavior_adjustment, claude_cost_usd, created_at "
+            f"lifecycle_behavior_adjustment, claude_cost_usd, created_at "
             f"FROM loss_autopsies{clause} "
             f"ORDER BY created_at DESC LIMIT :limit OFFSET :offset"
         ),
@@ -144,7 +144,7 @@ def get_loss_autopsy(
         sa_text(
             "SELECT id, property_id, prospect_id, deal_outcome_id, trigger_reason, "
             "primary_rejection_reason, competitor_rate_delta, underwriting_blocker, "
-            "cora_behavior_adjustment, raw_context, model_response, claude_cost_usd, created_at "
+            "lifecycle_behavior_adjustment, raw_context, model_response, claude_cost_usd, created_at "
             "FROM loss_autopsies WHERE id = :aid"
         ),
         {"aid": autopsy_id},
@@ -161,7 +161,7 @@ def get_loss_autopsy(
         "primary_rejection_reason": row["primary_rejection_reason"],
         "competitor_rate_delta": float(row["competitor_rate_delta"]) if row["competitor_rate_delta"] is not None else None,
         "underwriting_blocker": row["underwriting_blocker"],
-        "cora_behavior_adjustment": row["cora_behavior_adjustment"],
+        "lifecycle_behavior_adjustment": row["lifecycle_behavior_adjustment"],
         "raw_context": row["raw_context"],
         "model_response": row["model_response"],
         "claude_cost_usd": float(row["claude_cost_usd"]) if row["claude_cost_usd"] is not None else None,

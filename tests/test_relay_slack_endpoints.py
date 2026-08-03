@@ -21,6 +21,7 @@ from urllib.parse import urlencode
 import pytest
 from fastapi.testclient import TestClient
 
+from config.venture_template import DEFAULT_VENTURE_KEY
 from src.services.relay.queue import QueueItem
 
 
@@ -31,13 +32,15 @@ def _sign(body: bytes, secret: str, ts_offset: int = 0) -> tuple[str, str]:
     return ts, sig
 
 
-def _make_item(item_id=1, status="pending", slack_message_ts=None) -> QueueItem:
+def _make_item(item_id=1, status="pending", slack_message_ts=None,
+               venture_key=DEFAULT_VENTURE_KEY) -> QueueItem:
     return QueueItem(
         id=item_id, idempotency_key=f"key-{item_id}", batch_id=None, thread_id=None,
         channel="noop", recipient="prospect@example.com",
         payload={"subject": "Hi", "body": "Hello"}, status=status,
         slack_message_ts=slack_message_ts, decided_by=None, decided_at=None,
         error=None, dispatched_at=None, created_at=datetime.now(timezone.utc),
+        venture_key=venture_key,
     )
 
 
@@ -119,6 +122,7 @@ def _post_kill(client, text: str, user_id: str = "U_APPROVER", ts_offset: int = 
 def test_approve_flips_row_and_updates_message(app_client, monkeypatch):
     approved_item = _make_item(status="approved", slack_message_ts="123.456")
     mock_record_decision = MagicMock(return_value=approved_item)
+    monkeypatch.setattr("src.services.relay.queue.get_item", MagicMock(return_value=_make_item()))
     monkeypatch.setattr("src.services.relay.queue.record_decision", mock_record_decision)
     monkeypatch.setattr("src.api.admin_router._update_relay_slack_message", MagicMock())
 
@@ -132,6 +136,7 @@ def test_approve_flips_row_and_updates_message(app_client, monkeypatch):
 def test_reject_calls_record_decision_with_approved_false(app_client, monkeypatch):
     rejected_item = _make_item(status="rejected", slack_message_ts="123.456")
     mock_record_decision = MagicMock(return_value=rejected_item)
+    monkeypatch.setattr("src.services.relay.queue.get_item", MagicMock(return_value=_make_item()))
     monkeypatch.setattr("src.services.relay.queue.record_decision", mock_record_decision)
     monkeypatch.setattr("src.api.admin_router._update_relay_slack_message", MagicMock())
 
@@ -165,6 +170,7 @@ def test_replay_attack_rejected(app_client):
 def test_double_click_returns_already_decided(app_client, monkeypatch):
     # record_decision returns None when the row was not still 'pending' —
     # the WHERE status='pending' guard didn't match a second decision attempt.
+    monkeypatch.setattr("src.services.relay.queue.get_item", MagicMock(return_value=_make_item()))
     monkeypatch.setattr("src.services.relay.queue.record_decision", MagicMock(return_value=None))
 
     resp = _post_decision(app_client, _interactive_payload("U_APPROVER", 1, "approve"))
@@ -219,6 +225,41 @@ def test_kill_invalid_arg_returns_usage(app_client, monkeypatch):
 
     assert resp.status_code == 200
     assert "Usage" in resp.json()["text"]
+    mock_rset.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# PR #179 review finding #3 — empty RELAY_APPROVERS must fail CLOSED, not
+# fail open. Every test above uses app_client's ["U_APPROVER"] fixture, so
+# none of them ever covered the actual default (unset) production
+# configuration -- these are new, targeted specifically at that gap.
+# ---------------------------------------------------------------------------
+
+def test_empty_approvers_rejects_every_user_on_decision(app_client, monkeypatch):
+    """The default RELAY_APPROVERS=[] must NOT mean 'anyone is authorized' --
+    it must mean nobody is, until the list is explicitly configured."""
+    monkeypatch.setattr("src.api.admin_router.settings.relay_approvers", [])
+    mock_record_decision = MagicMock()
+    monkeypatch.setattr("src.services.relay.queue.record_decision", mock_record_decision)
+
+    resp = _post_decision(app_client, _interactive_payload("U_ANYONE", 1, "approve"))
+
+    assert resp.status_code == 200
+    assert "Not authorized" in resp.json()["text"]
+    mock_record_decision.assert_not_called()
+
+
+def test_empty_approvers_rejects_every_user_on_kill(app_client, monkeypatch):
+    """Same fail-closed requirement for the kill command -- an unconfigured
+    approver list must not let any workspace member halt the fleet."""
+    monkeypatch.setattr("src.api.admin_router.settings.relay_approvers", [])
+    mock_rset = MagicMock()
+    monkeypatch.setattr("src.core.redis_client.rset", mock_rset)
+
+    resp = _post_kill(app_client, "ALL", user_id="U_ANYONE")
+
+    assert resp.status_code == 200
+    assert "Not authorized" in resp.json()["text"]
     mock_rset.assert_not_called()
 
 

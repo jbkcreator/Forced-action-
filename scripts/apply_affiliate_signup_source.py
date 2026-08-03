@@ -11,7 +11,7 @@ from sqlalchemy import create_engine, text
 from config.settings import get_settings
 
 _ALLOWED = (
-    "direct", "landing_page", "dbpr_email", "cora_sms",
+    "direct", "landing_page", "dbpr_email", "lifecycle_sms",
     "missed_call", "referral", "admin", "unknown", "affiliate",
 )
 

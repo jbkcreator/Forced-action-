@@ -116,8 +116,14 @@ def reconcile_subscriptions(dry_run: bool = False) -> dict:
 
                 # Replay the checkout handler
                 session_dict = checkout_session.to_dict_recursive() if hasattr(checkout_session, "to_dict_recursive") else dict(checkout_session)
-                _on_checkout_completed(session_dict, db)
+                locked_zips: list = []
+                _on_checkout_completed(session_dict, db, locked_zips_out=locked_zips)
                 db.commit()
+                # Same ordering requirement as the live webhook path (PR #175
+                # review) — only mark waitlist losers once the ZIP locks are
+                # durably committed, never inside the same transaction.
+                from src.services.stripe_webhooks import _mark_sold_out_losers_for
+                _mark_sold_out_losers_for(locked_zips)
 
                 logger.info(
                     "RECONCILED: customer %s activated via checkout session %s",

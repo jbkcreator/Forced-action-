@@ -3,7 +3,7 @@
 Two things under test:
   1. _trigger_hot_inbound_callback (src.api.main) publishes inbound_hot_callback
      only when the inbound scored hot AND resolved to a subscriber, and does so
-     via publish_after_commit (not publish_cora_event directly) so the event
+     via publish_after_commit (not publish_lifecycle_event directly) so the event
      is never picked up before the request's own transaction commits.
   2. router.EVENT_TO_GRAPH routes inbound_hot_callback to the SAME runner/graph
      as new_lead_signup — zero new call code (ticket 03 decision).

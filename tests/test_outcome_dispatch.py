@@ -13,7 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
-from src.core.models import CoraSuppression, DealOutcome, Property, Subscriber
+from src.core.models import LifecycleSuppression, DealOutcome, Property, Subscriber
 from src.consumers import outcome_consumers
 from src.tasks.outcome_dispatch_sweep import run_sweep
 
@@ -56,7 +56,7 @@ def _cleanup(fresh_db, sub, prop):
     fresh_db.execute(text(f"DELETE FROM event_failures WHERE event_id IN ({ev_subq})"), {"s": sub.id})
     fresh_db.execute(text("DELETE FROM events WHERE source_component = 'deal_capture' AND (payload->>'subscriber_id')::int = :s"), {"s": sub.id})
     fresh_db.execute(DealOutcome.__table__.delete().where(DealOutcome.subscriber_id == sub.id))
-    fresh_db.execute(CoraSuppression.__table__.delete().where(CoraSuppression.subscriber_id == sub.id))
+    fresh_db.execute(LifecycleSuppression.__table__.delete().where(LifecycleSuppression.subscriber_id == sub.id))
     fresh_db.execute(text("DELETE FROM referral_prompt_funnel WHERE subscriber_id = :sid"), {"sid": sub.id})
     fresh_db.execute(text("DELETE FROM prospects WHERE property_id = :p"), {"p": prop.id})
     fresh_db.delete(sub)
@@ -103,11 +103,30 @@ def test_sweep_dispatches_closed_to_snapshot(client, fresh_db):
     sub, prop = _mk(fresh_db)
     _post(client, sub, prop, outcome_state="closed", deal_amount=8000)
     with patch("src.services.snapshot_service.capture_snapshot") as snap, \
-         patch("src.services.loss_autopsy.run_loss_autopsy") as autopsy:
+         patch("src.services.loss_autopsy.run_loss_autopsy") as autopsy, \
+         patch("src.services.deal_win_social_proof.maybe_send_deal_win_social_proof_prompt") as social:
         run_sweep(fresh_db)
     assert snap.call_count == 1
     assert snap.call_args.kwargs["outcome_status"] == "funded"
     autopsy.assert_not_called()  # closed is not a loss
+    social.assert_not_called()
+    _cleanup(fresh_db, sub, prop)
+
+
+def test_sweep_dispatches_big_win_to_social_proof_prompt(client, fresh_db):
+    sub, prop = _mk(fresh_db)
+    with patch("src.services.lifecycle_suppression.create_suppression"), \
+         patch("src.tasks.annual_push._push_annual_offer", return_value=False):
+        _post(client, sub, prop, outcome_state="closed", deal_amount=15000)
+    with patch("src.services.snapshot_service.capture_snapshot"), \
+         patch("src.services.loss_autopsy.run_loss_autopsy"), \
+         patch("src.services.deal_win_social_proof.maybe_send_deal_win_social_proof_prompt") as social:
+        run_sweep(fresh_db)
+    assert social.call_count >= 1
+    assert any(
+        call.args[0].id == sub.id and call.args[1].subscriber_id == sub.id
+        for call in social.call_args_list
+    )
     _cleanup(fresh_db, sub, prop)
 
 

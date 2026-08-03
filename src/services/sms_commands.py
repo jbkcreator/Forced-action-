@@ -83,7 +83,7 @@ def _find_subscriber(phone: str, db: Session) -> Optional[Subscriber]:
     Resolution order (TCPA-aware):
       1. `SmsOptIn` — canonical opt-in record. Only consenting users return here.
       2. `Subscriber.phone` (fa016) — direct E.164 column; covers subscribers
-         created via missed-call / Cora SMS / DBPR email flows that set phone
+         created via missed-call / Lifecycle SMS / DBPR email flows that set phone
          on the row but may not have an explicit SmsOptIn yet (transactional).
     """
     if not phone:
@@ -134,7 +134,7 @@ def _handle_auto_on(sub: Subscriber, db: Session) -> str:
     from src.services.auto_mode import toggle
     try:
         toggle(sub.id, True, db)
-        return "Auto Mode ON. Cora will act on your behalf within your settings."[:_MAX_SMS_LEN]
+        return "Auto Mode ON. Lifecycle will act on your behalf within your settings."[:_MAX_SMS_LEN]
     except PermissionError as exc:
         return (
             f"{exc}. Visit your dashboard Settings to upgrade your wallet "

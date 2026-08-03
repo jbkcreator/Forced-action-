@@ -5,6 +5,11 @@ All Instantly I/O is mocked — no real API calls. Focuses on the two
 safety-critical behaviors: refusing to send when unconfigured, and
 "fail loud" on Instantly's duplicate-contact skip (a leads_skipped > 0
 response must raise, never be treated as a successful send).
+
+Since CLONE-v2.2 / CL3 the campaign id, brand name and postal address come
+from the item's venture (src/utils/venture_config.py) rather than straight off
+config/settings.py, so these patch `get_venture_config` where they used to
+patch `get_settings`.
 """
 from __future__ import annotations
 
@@ -13,12 +18,17 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from config.venture_template import DEFAULT_VENTURE_KEY
 from src.services.relay import channels_email
 from src.services.relay.channels import DISPATCHERS
 from src.services.relay.queue import QueueItem
 
 
-def _make_item(payload: dict | None = None, recipient: str = "prospect@example.com") -> QueueItem:
+def _make_item(
+    payload: dict | None = None,
+    recipient: str = "prospect@example.com",
+    venture_key: str = DEFAULT_VENTURE_KEY,
+) -> QueueItem:
     return QueueItem(
         id=1,
         idempotency_key="key-1",
@@ -34,7 +44,25 @@ def _make_item(payload: dict | None = None, recipient: str = "prospect@example.c
         error=None,
         dispatched_at=None,
         created_at=datetime.now(timezone.utc),
+        venture_key=venture_key,
     )
+
+
+def _patch_venture(
+    monkeypatch,
+    *,
+    campaign_id: str | None = "camp-1",
+    postal_address: str = "123 Main St",
+    brand_name: str = "Forced Action",
+):
+    venture = MagicMock(
+        venture_key=DEFAULT_VENTURE_KEY,
+        relay_instantly_campaign_id=campaign_id,
+        postal_address=postal_address,
+        brand_name=brand_name,
+    )
+    monkeypatch.setattr(channels_email, "get_venture_config", lambda key: venture)
+    return venture
 
 
 def test_email_is_registered_in_dispatchers():
@@ -42,25 +70,22 @@ def test_email_is_registered_in_dispatchers():
 
 
 def test_raises_when_campaign_id_not_configured(monkeypatch):
-    fake_settings = MagicMock(relay_instantly_campaign_id=None)
-    monkeypatch.setattr(channels_email, "get_settings", lambda: fake_settings)
+    _patch_venture(monkeypatch, campaign_id=None)
 
-    with pytest.raises(RuntimeError, match="RELAY_INSTANTLY_CAMPAIGN_ID"):
+    with pytest.raises(RuntimeError, match="no Instantly campaign for venture"):
         channels_email.send_email(_make_item())
 
 
 def test_raises_when_body_missing(monkeypatch):
-    fake_settings = MagicMock(relay_instantly_campaign_id="camp-1")
-    monkeypatch.setattr(channels_email, "get_settings", lambda: fake_settings)
+    _patch_venture(monkeypatch)
 
     with pytest.raises(RuntimeError, match="missing 'body'"):
         channels_email.send_email(_make_item(payload={"subject": "Hi"}))
 
 
 def test_raises_when_add_leads_returns_none(monkeypatch):
-    fake_settings = MagicMock(relay_instantly_campaign_id="camp-1", company_postal_address="123 Main St")
-    monkeypatch.setattr(channels_email, "get_settings", lambda: fake_settings)
-    monkeypatch.setattr(channels_email, "unsubscribe_url", lambda email: "https://app.forcedaction.io/unsub")
+    _patch_venture(monkeypatch)
+    monkeypatch.setattr(channels_email, "unsubscribe_url", lambda email: "https://app.forcedactionleads.com/unsub")
     monkeypatch.setattr(channels_email.instantly, "add_leads", lambda *a, **k: None)
 
     with pytest.raises(RuntimeError, match="add_leads call failed"):
@@ -70,9 +95,8 @@ def test_raises_when_add_leads_returns_none(monkeypatch):
 def test_fail_loud_on_duplicate_skip(monkeypatch):
     """The core safety assertion: Instantly's silent dedup-skip must never
     be treated as a successful send."""
-    fake_settings = MagicMock(relay_instantly_campaign_id="camp-1", company_postal_address="123 Main St")
-    monkeypatch.setattr(channels_email, "get_settings", lambda: fake_settings)
-    monkeypatch.setattr(channels_email, "unsubscribe_url", lambda email: "https://app.forcedaction.io/unsub")
+    _patch_venture(monkeypatch)
+    monkeypatch.setattr(channels_email, "unsubscribe_url", lambda email: "https://app.forcedactionleads.com/unsub")
     monkeypatch.setattr(
         channels_email.instantly, "add_leads",
         lambda *a, **k: {"leads_created": 0, "leads_skipped": 1},
@@ -83,9 +107,8 @@ def test_fail_loud_on_duplicate_skip(monkeypatch):
 
 
 def test_raises_when_zero_leads_created_and_zero_skipped(monkeypatch):
-    fake_settings = MagicMock(relay_instantly_campaign_id="camp-1", company_postal_address="123 Main St")
-    monkeypatch.setattr(channels_email, "get_settings", lambda: fake_settings)
-    monkeypatch.setattr(channels_email, "unsubscribe_url", lambda email: "https://app.forcedaction.io/unsub")
+    _patch_venture(monkeypatch)
+    monkeypatch.setattr(channels_email, "unsubscribe_url", lambda email: "https://app.forcedactionleads.com/unsub")
     monkeypatch.setattr(
         channels_email.instantly, "add_leads",
         lambda *a, **k: {"leads_created": 0, "leads_skipped": 0},
@@ -96,9 +119,8 @@ def test_raises_when_zero_leads_created_and_zero_skipped(monkeypatch):
 
 
 def test_successful_send_passes_subject_and_body_as_merge_vars(monkeypatch):
-    fake_settings = MagicMock(relay_instantly_campaign_id="camp-1", company_postal_address="123 Main St")
-    monkeypatch.setattr(channels_email, "get_settings", lambda: fake_settings)
-    monkeypatch.setattr(channels_email, "unsubscribe_url", lambda email: "https://app.forcedaction.io/unsub")
+    _patch_venture(monkeypatch)
+    monkeypatch.setattr(channels_email, "unsubscribe_url", lambda email: "https://app.forcedactionleads.com/unsub")
 
     calls = []
 
@@ -126,9 +148,8 @@ def test_footer_carries_postal_address_and_unsubscribe_link(monkeypatch):
     link and the company's postal address — CAN-SPAM requires both, and
     without a real unsubscribe event the sweep's suppression sync
     (src.services.relay.suppression_sync) never sees anything to suppress."""
-    fake_settings = MagicMock(relay_instantly_campaign_id="camp-1", company_postal_address="123 Main St, Tampa FL")
-    monkeypatch.setattr(channels_email, "get_settings", lambda: fake_settings)
-    monkeypatch.setattr(channels_email, "unsubscribe_url", lambda email: f"https://app.forcedaction.io/unsub?e={email}")
+    _patch_venture(monkeypatch, postal_address="123 Main St, Tampa FL")
+    monkeypatch.setattr(channels_email, "unsubscribe_url", lambda email: f"https://app.forcedactionleads.com/unsub?e={email}")
 
     calls = []
     monkeypatch.setattr(
@@ -142,4 +163,55 @@ def test_footer_carries_postal_address_and_unsubscribe_link(monkeypatch):
     body = calls[0][0]["ra_body"]
     assert "Full drafted body" in body
     assert "123 Main St, Tampa FL" in body
-    assert "https://app.forcedaction.io/unsub?e=prospect@example.com" in body
+    assert "https://app.forcedactionleads.com/unsub?e=prospect@example.com" in body
+
+
+def test_footer_brand_and_campaign_come_from_the_item_venture(monkeypatch):
+    """CLONE-v2.2 / CL3: the footer's operating name and the campaign sent
+    through are the venture's, not a hardcoded 'Forced Action' / one global
+    campaign id — a second venture must sign its own emails and use its own
+    Instantly campaign."""
+    _patch_venture(
+        monkeypatch,
+        campaign_id="camp-venture-two",
+        brand_name="Venture Two LLC",
+        postal_address="9 Elm St, Austin TX",
+    )
+    monkeypatch.setattr(channels_email, "unsubscribe_url", lambda email: "https://app.forcedactionleads.com/unsub")
+
+    calls = []
+    monkeypatch.setattr(
+        channels_email.instantly, "add_leads",
+        lambda campaign_id, leads: calls.append((campaign_id, leads)) or {"leads_created": 1, "leads_skipped": 0},
+    )
+
+    channels_email.send_email(_make_item(venture_key="venture_two"))
+
+    campaign_id, leads = calls[0]
+    assert campaign_id == "camp-venture-two"
+    body = leads[0]["ra_body"]
+    assert "Venture Two LLC" in body
+    assert "9 Elm St, Austin TX" in body
+    assert "Forced Action" not in body
+
+
+def test_venture_config_is_resolved_for_the_items_own_venture(monkeypatch):
+    """The lookup key must be the item's venture, not a default — otherwise
+    every venture would send through venture #1's campaign."""
+    seen: list[str] = []
+    venture = MagicMock(
+        relay_instantly_campaign_id="camp-x", postal_address="addr", brand_name="Brand",
+    )
+    monkeypatch.setattr(
+        channels_email, "get_venture_config",
+        lambda key: seen.append(key) or venture,
+    )
+    monkeypatch.setattr(channels_email, "unsubscribe_url", lambda email: "https://u")
+    monkeypatch.setattr(
+        channels_email.instantly, "add_leads",
+        lambda *a, **k: {"leads_created": 1, "leads_skipped": 0},
+    )
+
+    channels_email.send_email(_make_item(venture_key="venture_two"))
+
+    assert seen == ["venture_two"]

@@ -5,21 +5,21 @@ Reuses the existing, generic src.services.kill_switch_service rather than
 building Hunter its own stop mechanism. That service's manual-override path
 (src/agents/tools/gating_tools.py:kill_switch_status) checks the Redis keys
 `kill_switch_override:global` and `kill_switch_override:{feature}`
-UNCONDITIONALLY, before it ever looks at Cora's metric-threshold
-config.cora_guardrails.KILL_SWITCH dict — so Josh's manual "STOP ALL" /
+UNCONDITIONALLY, before it ever looks at Lifecycle's metric-threshold
+config.lifecycle_guardrails.KILL_SWITCH dict — so Josh's manual "STOP ALL" /
 "STOP Hunter" already works against this feature key with zero changes to
-that Cora-specific config file:
+that Lifecycle-specific config file:
 
     redis-cli SET kill_switch_override:global red EX 3600        # STOP ALL
     redis-cli SET kill_switch_override:hunter_global red EX 3600 # STOP Hunter
 
 "hunter_global" is deliberately NOT registered in
-config.cora_guardrails.KILL_SWITCH — Hunter has no metric-threshold guardrail,
+config.lifecycle_guardrails.KILL_SWITCH — Hunter has no metric-threshold guardrail,
 only a manual on/off, and that file's entries assume auto-triggered
 metric bands (green/yellow/red numeric thresholds, auto_action_type,
 fallback_feature_flag, ...) that don't apply here. The consequence: with no
 override active, get_kill_switch_status("hunter_global") returns
-color="unknown" (unregistered feature) rather than "green". Unlike Cora's
+color="unknown" (unregistered feature) rather than "green". Unlike Lifecycle's
 graphs — where "unknown" correctly fails safe to red because it usually
 signals a misconfigured metric — for Hunter "unknown" is the EXPECTED
 steady state (no metric was ever supposed to exist), so this module treats

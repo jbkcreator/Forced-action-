@@ -3,7 +3,7 @@ AP Lite upgrade sweep task.
 
 Runs daily at 0 14 * * * (2 PM UTC). Finds territory_lock subscribers
 who performed >= 10 manual actions in the trailing 7 days and emits
-Cora AP Lite upsell events. Idempotency key is bucketed by ISO week,
+Lifecycle AP Lite upsell events. Idempotency key is bucketed by ISO week,
 so each subscriber fires at most once per calendar week even though
 the sweep runs every day.
 
@@ -47,7 +47,7 @@ def count_actions_trailing_7d(db: Session, subscriber_id: int) -> int:
 
 
 def _emit_event(subscriber_id: int, actions_count: int, window_end: date) -> None:
-    from src.agents.events.ingestion import publish_cora_event
+    from src.agents.events.ingestion import publish_lifecycle_event
     from src.agents.events.types import Event
 
     iso_week = window_end.strftime(AP_LITE_IDEMPOTENCY_WINDOW)
@@ -64,7 +64,7 @@ def _emit_event(subscriber_id: int, actions_count: int, window_end: date) -> Non
         idempotency_key=f"aplite:{subscriber_id}:{iso_week}",
     )
     try:
-        publish_cora_event(evt.to_dispatch_dict())
+        publish_lifecycle_event(evt.to_dispatch_dict())
     except Exception as exc:
         logger.error("ap_lite_sweep emit failed sub=%s: %s", subscriber_id, exc)
 

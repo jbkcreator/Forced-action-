@@ -16,7 +16,7 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from config.cora_guardrails import EXPANSION_GATES
+from config.lifecycle_guardrails import EXPANSION_GATES
 from config.settings import settings
 from src.core.models import ExpansionIcpChannel
 from src.services.contractor_mrr import MRR_ICP_GATE_THRESHOLD, global_contractor_mrr

@@ -132,7 +132,7 @@ def generate_pitch(
     _auth=Depends(get_current_subscriber),
 ) -> PitchOrderResponse:
     """
-    Create a DFY-Lite pitch order and dispatch it to the Cora agent for async generation.
+    Create a DFY-Lite pitch order and dispatch it to the Lifecycle agent for async generation.
 
     Returns 202 Accepted immediately — poll GET /order/{order_id} until status = Needs_Review.
 
@@ -141,7 +141,7 @@ def generate_pitch(
     - 422 if the 3-pitch limit has been reached
     """
     from sqlalchemy import text as sa_text
-    from src.agents.events.ingestion import publish_cora_event
+    from src.agents.events.ingestion import publish_lifecycle_event
 
     subscriber = db.execute(
         sa_text("SELECT id FROM subscribers WHERE event_feed_uuid = :uuid"),
@@ -178,7 +178,7 @@ def generate_pitch(
         logger.error("DFY-Lite order creation failed for subscriber %s: %s", subscriber_id, exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Order creation failed — please try again")
 
-    publish_cora_event({
+    publish_lifecycle_event({
         "event_type":    "dfy_lite_pitch_requested",
         "subscriber_id": subscriber_id,
         "payload":       {"order_id": order.id},

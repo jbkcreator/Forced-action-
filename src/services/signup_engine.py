@@ -32,7 +32,7 @@ ALLOWED_SIGNUP_SOURCES = frozenset({
 	"direct",
 	"landing_page",
 	"dbpr_email",
-	"cora_sms",
+	"lifecycle_sms",
 	"missed_call",
 	"referral",
 	"admin",
@@ -71,7 +71,7 @@ def _apply_signup_source(
 	- A freshly created Subscriber (signup_source unset OR 'direct'/'unknown')
 	  accepts whatever the caller provided.
 	- An existing Subscriber that already has a 'real' source (referral,
-	  dbpr_email, cora_sms, missed_call, landing_page) is NOT overwritten
+	  dbpr_email, lifecycle_sms, missed_call, landing_page) is NOT overwritten
 	  on a re-visit — first-touch attribution wins.
 	- utm_*/campaign_id/attribution_token are always backfilled when missing
 	  but never clobbered.
@@ -342,13 +342,19 @@ def create_free_account_by_email(
 		# payment webhook instead.
 		try:
 			from src.services import subscriber_auth
-			magic_url = subscriber_auth.magic_link_url(subscriber_auth.issue_magic_link(sub, db))
+			magic_url = subscriber_auth.issue_magic_link_url_with_retry(
+				sub, db, context="free_signup_welcome"
+			)
 		except Exception as exc:
 			magic_url = None
-			logger.warning("Magic-link issuance failed for subscriber %d: %s", sub.id, exc)
+			logger.warning("Magic-link issuance helper failed for subscriber %d: %s", sub.id, exc)
 		try:
+			from src.services.activation_tracking import stamp_welcome_email_sent
 			from src.services.email import send_welcome_email
-			send_welcome_email(sub, magic_link_url=magic_url)
+			if send_welcome_email(sub, magic_link_url=magic_url, db=db):
+				stamp_welcome_email_sent(sub.id, db)
+			else:
+				logger.warning("Welcome email not sent for subscriber %d — not stamping welcome_email_sent", sub.id)
 		except Exception as exc:
 			logger.warning("Welcome email failed for new subscriber %d: %s", sub.id, exc)
 	else:

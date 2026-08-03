@@ -23,7 +23,7 @@ from tests.scenarios.helpers import (
 )
 
 
-pytestmark = pytest.mark.scenario_cora
+pytestmark = pytest.mark.scenario_lifecycle
 
 
 def test_seed_subscriber_creates_active_subscriber(seed_subscriber):
@@ -60,7 +60,7 @@ def test_dispatch_routes_unknown_event(seed_subscriber):
 
 def test_fomo_scenario_writes_audit(seed_subscriber):
 	"""
-	Minimal Cora scenario: seed subscriber, dispatch FOMO event, assert
+	Minimal Lifecycle scenario: seed subscriber, dispatch FOMO event, assert
 	agent_decisions. Claude mocked, send_sms goes through the dry-run path.
 	"""
 	sub = seed_subscriber(name="Mike Harness", vertical="public_adjusters")

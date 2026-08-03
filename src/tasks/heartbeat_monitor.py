@@ -77,7 +77,7 @@ HEARTBEAT_SLAS: Dict[str, int] = {
     "fire_incidents":    1800,
     "flood_damage":      1800,
     "insurance_claims":  1800,
-    # Cora Data Engine outcome connectors (src/connectors/registry.py is the
+    # Lifecycle Data Engine outcome connectors (src/connectors/registry.py is the
     # single source of truth for these sla_minutes/off_days values — copied
     # in here at each connector's go-live, per that file's own convention).
     "foreclosure_outcomes":    1500,

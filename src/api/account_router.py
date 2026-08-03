@@ -2,7 +2,7 @@
 Reference route for the centralized entitlement gate (fa B1-02).
 
 Exists only to prove require_tier() end-to-end against a real HTTP route.
-Real non-delivery surfaces (deal-intake, Cora SLA, data scope, geo boundary)
+Real non-delivery surfaces (deal-intake, Lifecycle SLA, data scope, geo boundary)
 attach the same Depends(require_tier(...)) pattern on their own routers as
 those are built — they do not extend this file.
 """

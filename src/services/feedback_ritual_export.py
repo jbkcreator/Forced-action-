@@ -1,13 +1,13 @@
 """Feedback Ritual fine-tuning export (closes the 4.3 loop).
 
-After an admin reviews a flagged Cora interaction (services/feedback_ritual.py),
-the row sits in cora_training_overrides with source='feedback_ritual',
+After an admin reviews a flagged Lifecycle interaction (services/feedback_ritual.py),
+the row sits in lifecycle_training_overrides with source='feedback_ritual',
 queue_status='pending', and a review_outcome. This module turns reviewed,
 useful rows into a fine-tuning dataset and marks them exported — the step the
 spec calls "directly updates the agent's fine-tuning training dataset".
 
 Exportable rows (review_outcome):
-  - approved          → the label IS Cora's own output (reinforce good behaviour)
+  - approved          → the label IS Lifecycle's own output (reinforce good behaviour)
   - needs_correction  → the label is the admin's corrected_output
   - discarded         → never exported
 A row missing the text needed to build a (input, output) pair is skipped and
@@ -43,7 +43,7 @@ _SELECT_REVIEWED_SQL = text(
     """
     SELECT id, subject_ref, review_outcome, correction_reason,
            corrected_output, snapshot_payload
-    FROM cora_training_overrides
+    FROM lifecycle_training_overrides
     WHERE source = 'feedback_ritual'
       AND queue_status = 'pending'
       AND review_outcome IN ('approved', 'needs_correction')
@@ -52,7 +52,7 @@ _SELECT_REVIEWED_SQL = text(
 )
 
 _MARK_EXPORTED_SQL = text(
-    "UPDATE cora_training_overrides SET queue_status = 'exported' "
+    "UPDATE lifecycle_training_overrides SET queue_status = 'exported' "
     "WHERE id = ANY(:ids)"
 )
 

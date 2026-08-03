@@ -9,16 +9,16 @@ the PEWC gate blocks first):
     POST /webhooks/synthflow/inbound (real FastAPI TestClient, real DB)
       -> score_inbound flags hot (intent_slot signal)
       -> inbound_response row written (t0)
-      -> publish_cora_event falls back to Postgres (Redis is down in this env)
-         -> real INSERT into cora_event_queue
-    _sweep_postgres_queue() (the REAL Cora-process consumer function)
+      -> publish_lifecycle_event falls back to Postgres (Redis is down in this env)
+         -> real INSERT into lifecycle_event_queue
+    _sweep_postgres_queue() (the REAL Lifecycle-process consumer function)
       -> dispatch_event -> router -> new_lead_voice_call graph (Block 2, real)
       -> aborts at the PEWC voice-consent gate (no consent_acceptances row for
          a brand-new caller) -> real agent_decisions row
     sync_inbound_response_outcomes() (real)
       -> inbound_response.t1/outcome backfilled to 'consent_blocked'
 
-Marker: scenario_cora (opt-in, hits real DB + real graph). Every row this
+Marker: scenario_lifecycle (opt-in, hits real DB + real graph). Every row this
 test creates is deleted in a finally block, keyed off the unique phone
 number generated per run.
 """
@@ -33,7 +33,7 @@ from fastapi.testclient import TestClient
 
 from config.settings import get_settings
 
-pytestmark = pytest.mark.scenario_cora
+pytestmark = pytest.mark.scenario_lifecycle
 
 
 def _unique_e2e_phone() -> str:
@@ -73,11 +73,11 @@ _SUBSCRIBER_ID_TABLES = (
     "churn_predictions", "platform_cost_attribution", "chat_sessions",
     "revenue_signal_score_events", "conversion_attribution_events",
     "customer_accounts", "subscriber_memory_summary", "subscriber_notes",
-    "subscriber_tags", "cora_suppressions", "subscriber_session_metrics",
+    "subscriber_tags", "lifecycle_suppressions", "subscriber_session_metrics",
     "churn_defense_leads", "guarantee_credits", "consent_acceptances",
     "algorithmic_variance_log", "referral_prompt_funnel",
     "non_buyer_nurture_sequences", "checkout_recovery", "inbound_response",
-    "cora_event_queue",
+    "lifecycle_event_queue",
 )
 
 
@@ -148,24 +148,24 @@ class TestBlock11InboundVelocityE2E:
             assert ir_row.outcome == "pending"
 
             # 2. Event landed in the real Postgres fallback queue (Redis is down
-            #    in this env, so publish_cora_event took the durable path for real).
+            #    in this env, so publish_lifecycle_event took the durable path for real).
             with e2e_engine.connect() as conn:
                 queue_row = conn.execute(
                     text(
                         "SELECT event_type, subscriber_id, status, decision_id "
-                        "FROM cora_event_queue WHERE decision_id = :cid "
+                        "FROM lifecycle_event_queue WHERE decision_id = :cid "
                         "ORDER BY created_at DESC LIMIT 1"
                     ),
                     {"cid": call_id},
                 ).first()
-            assert queue_row is not None, "inbound_hot_callback was not enqueued in cora_event_queue"
+            assert queue_row is not None, "inbound_hot_callback was not enqueued in lifecycle_event_queue"
             assert queue_row.event_type == "inbound_hot_callback"
             assert queue_row.subscriber_id == subscriber_id
             assert queue_row.status == "pending"
             # The decision_id-preservation fix: call_id survives the Postgres fallback.
             assert queue_row.decision_id == call_id
 
-            # 3. Drive the REAL Cora consumer function (same one the agents
+            # 3. Drive the REAL Lifecycle consumer function (same one the agents
             #    process runs every 60s) — no mocking of router/graph/DB.
             from src.agents.events.ingestion import _sweep_postgres_queue
             processed = _sweep_postgres_queue()
@@ -186,9 +186,9 @@ class TestBlock11InboundVelocityE2E:
 
             # Environment hazard, not a code defect: DATABASE_URL here is a
             # single shared Postgres instance, and any other already-running
-            # Cora agents process (e.g. one deployed from unmerged `dev`,
+            # Lifecycle agents process (e.g. one deployed from unmerged `dev`,
             # which has no "inbound_hot_callback" entry in EVENT_TO_GRAPH yet)
-            # listens on the same cora_events NOTIFY channel and can win the
+            # listens on the same lifecycle_events NOTIFY channel and can win the
             # race to dispatch this event before our own _sweep_postgres_queue()
             # call above does. That shows up as graph_name="supervisor" with
             # drop_reason "unknown_event_type:inbound_hot_callback" — proving
@@ -202,7 +202,7 @@ class TestBlock11InboundVelocityE2E:
             summary = decision_row.summary or {}
             if decision_row.graph_name != "new_lead_voice_call" and summary.get("drop_reason") == "unknown_event_type:inbound_hot_callback":
                 pytest.skip(
-                    "Another already-running Cora consumer (older/unmerged code) won the race "
+                    "Another already-running Lifecycle consumer (older/unmerged code) won the race "
                     "to dispatch this event via the shared Postgres NOTIFY channel before our own "
                     "sweep call — a pre-merge shared-DB timing artifact, not a defect in this branch."
                 )

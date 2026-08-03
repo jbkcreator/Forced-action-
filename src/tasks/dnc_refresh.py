@@ -254,6 +254,62 @@ def _update_owner_after_scrub(session, owner_id: int, phone: str,
 # DNC suppression via sms_opt_outs (handled in the shared loop) is sufficient.
 
 
+def _reenqueue_dnc_blocked_subscriber_calls(session) -> int:
+    """
+    Re-dispatch new_lead_signup for subscribers whose signup voice call was
+    previously blocked by compliance:dnc_check_required and who now have a
+    fresh clean DNC row. Called once after the subscribers scrub completes.
+
+    Guards:
+    - phone must be clean in dnc_phone_checks (national_dnc=false, litigator=false)
+    - phone must not be in sms_opt_outs
+    - subscriber must have no completed new_lead_voice_call decision
+    """
+    from src.agents.events.ingestion import publish_lifecycle_event
+
+    rows = session.execute(sa_text("""
+        SELECT DISTINCT ad.subscriber_id, s.phone
+        FROM agent_decisions ad
+        JOIN subscribers s ON s.id = ad.subscriber_id
+        JOIN dnc_phone_checks dpc ON dpc.phone = s.phone
+        WHERE ad.graph_name = 'new_lead_voice_call'
+          AND ad.terminal_status = 'aborted'
+          AND ad.summary->>'failure_reason' = 'compliance:dnc_check_required'
+          AND dpc.national_dnc = false
+          AND dpc.litigator = false
+          AND NOT EXISTS (
+              SELECT 1 FROM agent_decisions ad2
+              WHERE ad2.subscriber_id = ad.subscriber_id
+                AND ad2.graph_name = 'new_lead_voice_call'
+                AND ad2.terminal_status = 'completed'
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM sms_opt_outs soo
+              WHERE soo.phone = s.phone
+          )
+    """)).fetchall()
+
+    count = 0
+    for subscriber_id, phone in rows:
+        try:
+            publish_lifecycle_event({
+                "event_type": "new_lead_signup",
+                "subscriber_id": subscriber_id,
+                "source": "dnc_refresh_retry",
+            })
+            count += 1
+            logger.info(
+                "[DNCRefresh/subscribers] Re-enqueued new_lead_signup subscriber_id=%d phone=%s",
+                subscriber_id, phone,
+            )
+        except Exception as e:
+            logger.warning(
+                "[DNCRefresh/subscribers] Re-enqueue failed subscriber_id=%d: %s",
+                subscriber_id, e,
+            )
+    return count
+
+
 # ---------------------------------------------------------------------------
 # Shared scrub pipeline
 # ---------------------------------------------------------------------------
@@ -456,17 +512,18 @@ def run_dnc_refresh(
         active = {"owners", "dbpr", "subscribers"}
 
     stats = {
-        "total":             0,
-        "dnc_hits":          0,
-        "litigator_hits":    0,
-        "suppressed":        0,
-        "failed":            0,
-        "normalize_skipped": 0,
-        "already_suppressed": 0,
-        "fresh_clean_skipped": 0,
-        "unmatched_csv":     0,
-        "tracerfy_unknown":  0,
-        "skipped":           False,
+        "total":                 0,
+        "dnc_hits":              0,
+        "litigator_hits":        0,
+        "suppressed":            0,
+        "failed":                0,
+        "normalize_skipped":     0,
+        "already_suppressed":    0,
+        "fresh_clean_skipped":   0,
+        "unmatched_csv":         0,
+        "tracerfy_unknown":      0,
+        "requeued_signup_calls": 0,
+        "skipped":               False,
     }
 
     logger.info(
@@ -537,6 +594,13 @@ def run_dnc_refresh(
             suppressed_phones=suppressed_phones,
             fresh_clean_phones=fresh_clean_phones,
         )
+        with get_db_context() as session:
+            stats["requeued_signup_calls"] = _reenqueue_dnc_blocked_subscriber_calls(session)
+        if stats["requeued_signup_calls"]:
+            logger.info(
+                "[DNCRefresh/subscribers] Re-enqueued %d DNC-unblocked signup calls",
+                stats["requeued_signup_calls"],
+            )
 
     logger.info("=" * 60)
     logger.info("DNC REFRESH COMPLETE")
@@ -551,6 +615,7 @@ def run_dnc_refresh(
     logger.info("  Fresh clean skip  : %d", stats["fresh_clean_skipped"])
     logger.info("  Tracerfy unknown  : %d", stats["tracerfy_unknown"])
     logger.info("  CSV unmatched     : %d", stats["unmatched_csv"])
+    logger.info("  Requeued signups  : %d", stats["requeued_signup_calls"])
     logger.info("=" * 60)
 
     return stats

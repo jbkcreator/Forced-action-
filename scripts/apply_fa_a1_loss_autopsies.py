@@ -26,7 +26,7 @@ _DDL = [
         primary_rejection_reason TEXT,
         competitor_rate_delta    NUMERIC(8,4),
         underwriting_blocker     TEXT,
-        cora_behavior_adjustment TEXT,
+        lifecycle_behavior_adjustment TEXT,
         raw_context              JSONB NOT NULL DEFAULT '{}'::jsonb,
         model_response           JSONB NOT NULL DEFAULT '{}'::jsonb,
         claude_cost_usd          NUMERIC(10,6),

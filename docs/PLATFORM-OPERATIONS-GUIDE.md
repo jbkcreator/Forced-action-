@@ -32,13 +32,13 @@ These aren't "features that fire" — they're the tables and YAML / Python confi
 
 ### 1.5 Segmentation + revenue signal score
 **Lives at:** `config/scoring.py` (weights) + `src/services/segmentation_engine.py` + `src/services/revenue_signal.py`.
-**How it works in production:** Event-driven — every time a subscriber takes a significant action (unlock, signup, deal capture, wallet enrollment, saved-card save) the classifier re-runs and writes to `user_segments`. Revenue signal score is computed on the same cadence using five weighted inputs (spend velocity, engagement recency, wallet/lock status, lead interaction rate, ZIP competition). Every Cora graph reads both at its first node.
+**How it works in production:** Event-driven — every time a subscriber takes a significant action (unlock, signup, deal capture, wallet enrollment, saved-card save) the classifier re-runs and writes to `user_segments`. Revenue signal score is computed on the same cadence using five weighted inputs (spend velocity, engagement recency, wallet/lock status, lead interaction rate, ZIP competition). Every Lifecycle graph reads both at its first node.
 **Chains with:** every LangGraph graph, FOMO routing (finds next-best-fit subscriber), Retention summaries (picks tier cohorts).
 
-### 1.6 Cora guardrail config
-**Lives at:** `config/cora_guardrails.py` — 13 numerical bounds, 7 expansion gates, 9 kill-switch metrics.
-**How it works in production:** Read by the `guardrail_check` and `kill_switch_status` gating tools. Every Cora decision checks bounds before composing — a proposed $300/mo Lock price gets rejected at `guardrail_check` because the max is $247. Changes to bounds require a config update + agents restart, on purpose (guardrails are policy, not runtime-mutable).
-**Chains with:** every autonomous Cora decision.
+### 1.6 Lifecycle guardrail config
+**Lives at:** `config/lifecycle_guardrails.py` — 13 numerical bounds, 7 expansion gates, 9 kill-switch metrics.
+**How it works in production:** Read by the `guardrail_check` and `kill_switch_status` gating tools. Every Lifecycle decision checks bounds before composing — a proposed $300/mo Lock price gets rejected at `guardrail_check` because the max is $247. Changes to bounds require a config update + agents restart, on purpose (guardrails are policy, not runtime-mutable).
+**Chains with:** every autonomous Lifecycle decision.
 
 ### 1.7 Claude routing + prompt caching + batch + cost tracking
 **Lives at:** `src/services/claude_router.py`.
@@ -52,8 +52,8 @@ These aren't "features that fire" — they're the tables and YAML / Python confi
 
 ### 1.9 Learning card schema
 **Lives at:** `src/core/models.py::LearningCard` + `alembic/versions/m3n4o5p6q7r8_*.py`.
-**How it works in production:** The `learning_cards` table has a `(card_date, card_type)` unique constraint — Sunday job upserts; Cora graphs query by type ("give me the latest `message_perf` card") and inject the JSONB payload into prompt context. Cards never delete — 52 weeks of history accumulates.
-**Chains with:** Learning card Sunday cron (§2.5), every Cora decision (reads latest card at decision-hierarchy step).
+**How it works in production:** The `learning_cards` table has a `(card_date, card_type)` unique constraint — Sunday job upserts; Lifecycle graphs query by type ("give me the latest `message_perf` card") and inject the JSONB payload into prompt context. Cards never delete — 52 weeks of history accumulates.
+**Chains with:** Learning card Sunday cron (§2.5), every Lifecycle decision (reads latest card at decision-hierarchy step).
 
 ### 1.10 Launch compliance baseline
 **Lives at:** `src/services/sms_compliance.py` + `src/core/models.py::SmsOptIn/SmsOptOut/SmsDeadLetter`.
@@ -113,7 +113,7 @@ Every cron reads from the DB, acts on matching rows, and writes results back. No
 1. Runs 4 generators in sequence: message performance · deal patterns · A/B results · churn signals.
 2. Each generator queries the past 7 days, aggregates, and upserts one row into `learning_cards` keyed on `(card_date, card_type)`.
 3. Minimum-sample thresholds prevent noisy cards (e.g., at least 10 messages before emitting a `message_perf` card).
-4. Cora graphs read these cards at the start of every decision tree during the following week.
+4. Lifecycle graphs read these cards at the start of every decision tree during the following week.
 **How it adds to existing:** Creates the feedback loop — outbound SMS this week affects outbound SMS next week.
 
 ---
@@ -274,7 +274,7 @@ These fire when a subscriber's state crosses a threshold. No user tap, no cron, 
 
 ### 5.2 Revenue signal score recompute
 **Trigger:** Same events as segmentation + a nightly full-refresh cron.
-**Real-world flow:** Score computed from 5 weighted inputs, written back to `user_segments.revenue_signal_score`. Any Cora graph reading the score gets the latest value.
+**Real-world flow:** Score computed from 5 weighted inputs, written back to `user_segments.revenue_signal_score`. Any Lifecycle graph reading the score gets the latest value.
 
 ### 5.3 Wallet auto-enrollment
 **Trigger:** 5 independent paths checked on every significant event.
@@ -296,7 +296,7 @@ On enrollment: Stripe subscription created, 20/50/120 credits granted, welcome S
 
 ### 5.6 Accelerated wallet push
 **Trigger:** Saved-card user crosses 70% of wallet capacity in 14 days.
-**Real-world flow:** Daily sweep flags the subscriber for next-tier upsell. Cora's next outbound to them (any campaign) references the tier upgrade.
+**Real-world flow:** Daily sweep flags the subscriber for next-tier upsell. Lifecycle's next outbound to them (any campaign) references the tier upgrade.
 
 ### 5.7 Saved-card bonus credits
 **Trigger:** Purchase inside a 10-min window after card-save event.
@@ -331,7 +331,7 @@ On enrollment: Stripe subscription created, 20/50/120 credits granted, welcome S
 
 ---
 
-## Section 7 — Cora LangGraph layer (autonomous decisions)
+## Section 7 — Lifecycle LangGraph layer (autonomous decisions)
 
 ### 7.1 LangGraph supervisor setup
 **Entry point:** `src/agents/supervisor.py::dispatch_event`.
@@ -344,22 +344,22 @@ On enrollment: Stripe subscription created, 20/50/120 credits granted, welcome S
 
 ### 7.2 FOMO engine
 **Entry point:** `competitor_acted_on_lead` event → FOMO graph.
-**Real-world flow:** Within 60 seconds of a competitor contacting a Gold lead in a non-locked ZIP, Cora identifies the next-best-fit wallet-active subscriber (highest revenue signal score in segment), composes a Haiku-generated SMS with live ZIP data, and dispatches through the compliance gate. User sees: "Mike, another contractor just contacted a Gold lead in 33647. 2 more Gold leads are still open. [link]"
+**Real-world flow:** Within 60 seconds of a competitor contacting a Gold lead in a non-locked ZIP, Lifecycle identifies the next-best-fit wallet-active subscriber (highest revenue signal score in segment), composes a Haiku-generated SMS with live ZIP data, and dispatches through the compliance gate. User sees: "Mike, another contractor just contacted a Gold lead in 33647. 2 more Gold leads are still open. [link]"
 
 ### 7.3 Abandonment pressure SMS flow
 **Entry points:** `wall_session_abandoned` (Wave 1) and `abandonment_click_no_complete` (Wave 2).
 **Real-world flow:**
-- **Wave 1:** 10–15 min after wall opens with no payment → Cora composes a single-CTA SMS referencing live ZIP scarcity. Schedules Wave 2 intent in Redis.
-- **Wave 2:** User taps the Wave 1 link but doesn't pay within ~20 min → Cora composes a scarcity-framed follow-up. If the user paid between waves, Wave 2 exits silently.
+- **Wave 1:** 10–15 min after wall opens with no payment → Lifecycle composes a single-CTA SMS referencing live ZIP scarcity. Schedules Wave 2 intent in Redis.
+- **Wave 2:** User taps the Wave 1 link but doesn't pay within ~20 min → Lifecycle composes a scarcity-framed follow-up. If the user paid between waves, Wave 2 exits silently.
 
-### 7.4 Cora SMS outbound
+### 7.4 Lifecycle SMS outbound
 **Mechanism:** `send_sms` write tool in the agents layer.
-**Real-world flow:** Every proactive SMS Cora sends runs through this tool — phone resolution, 24-hour idempotency check (don't send the same campaign-variant twice), compliance gate, Twilio dispatch, `message_outcomes` row inserted with attribution windows set.
+**Real-world flow:** Every proactive SMS Lifecycle sends runs through this tool — phone resolution, 24-hour idempotency check (don't send the same campaign-variant twice), compliance gate, Twilio dispatch, `message_outcomes` row inserted with attribution windows set.
 
 ### 7.5 A/B offer testing within guardrails
 **Mechanism:** `ab_variant_assign` gating tool.
 **Real-world flow:**
-1. When Cora proposes a message, it first assigns the subscriber to a variant via deterministic md5 hash (same user always on same variant).
+1. When Lifecycle proposes a message, it first assigns the subscriber to a variant via deterministic md5 hash (same user always on same variant).
 2. Traffic is capped at 10% of segment — outside the cap the user sees the control.
 3. `record_outcome()` called from the Stripe webhook when the user converts.
 4. A nightly `should_rollback()` check runs a two-proportion z-test; losing variants are auto-retired after 200 sends with a >2σ deficit.
@@ -379,7 +379,7 @@ On enrollment: Stripe subscription created, 20/50/120 credits granted, welcome S
 
 ## Section 9 — How items chain together in a real user journey
 
-A composite of most of the above: **Mike the roofer** from first contact to paying subscriber to Cora-driven lock holder.
+A composite of most of the above: **Mike the roofer** from first contact to paying subscriber to Lifecycle-driven lock holder.
 
 | Time | Event | Items triggered |
 |---|---|---|
@@ -400,7 +400,7 @@ A composite of most of the above: **Mike the roofer** from first contact to payi
 | T+12 min | Wallet engine auto-enrolls Mike in Starter ($49/mo) | §5.3 |
 | T+4 days | A storm hits 33647. NWS webhook fires | §3.1 |
 | T+4 days | Storm Pack banner appears in Mike's dashboard | §4.9 |
-| T+4 days | Cora sends storm SMS through compliance gate | §1.10, §7.4 |
+| T+4 days | Lifecycle sends storm SMS through compliance gate | §1.10, §7.4 |
 | T+7 days | Day 7 annual push cron fires for charter cohort | §2.1 |
 | T+14 days | Mike has spent 40+ credits in 33647 → segment flips to `lock_candidate` | §5.1 |
 | T+14 days | Competitor contacts a Gold lead in 33647. FOMO graph fires within 60s | §7.2 |
@@ -422,7 +422,7 @@ Every arrow in that timeline is code that already exists (or is scheduled to exi
 
 **Before Phase 2B:** the platform was a scoring engine + Stripe Checkout + basic email/SMS notifications. Users signed up once, got periodic lead digests, canceled or renewed manually.
 
-**After Phase 2B:** the platform is an autonomous commercial engine. The same scoring output feeds proof moments, bundle availability, storm packs, FOMO triggers, retention summaries. Stripe Checkout is supplemented by Payment Sheet one-taps. One-off renewals become 5-path wallet auto-enrollment + auto-reload. Email-only nurture becomes cron + event + agent-driven multi-channel dispatch. Every outbound message flows through one compliance gate. Every autonomous decision writes to a shared audit log. Every week a learning card rewrites Cora's next-week behaviour.
+**After Phase 2B:** the platform is an autonomous commercial engine. The same scoring output feeds proof moments, bundle availability, storm packs, FOMO triggers, retention summaries. Stripe Checkout is supplemented by Payment Sheet one-taps. One-off renewals become 5-path wallet auto-enrollment + auto-reload. Email-only nurture becomes cron + event + agent-driven multi-channel dispatch. Every outbound message flows through one compliance gate. Every autonomous decision writes to a shared audit log. Every week a learning card rewrites Lifecycle's next-week behaviour.
 
 Concretely, 12 new tables, 5 new crons, 4 new webhook handlers, 7 new API endpoints, 10 inbound SMS commands, 1 agents process, 6 LangGraph graphs, 19 agent tools, 7 prompt templates. None of these replaced existing code — they compose on top of it.
 
@@ -432,7 +432,7 @@ Concretely, 12 new tables, 5 new crons, 4 new webhook handlers, 7 new API endpoi
 
 | Item | What unlocks it |
 |---|---|
-| Cora Conversational Lock Close (Sonnet live data) | Wave 2 LangGraph pass |
+| Lifecycle Conversational Lock Close (Sonnet live data) | Wave 2 LangGraph pass |
 | Synthflow voice drop | Wave 2 + Synthflow outbound API wired |
 | Dynamic Flash Scarcity SMS | Wave 2 |
 | Dynamic Script Mutation | Wave 3 |
@@ -475,9 +475,20 @@ SLACK_SIGNING_SECRET=...
 1. Create a Slack app at api.slack.com/apps.
 2. Add `chat:write` bot scope.
 3. Enable "Interactivity & Shortcuts" and set Request URL to:
-   `https://<your-host>/api/admin/slack/county-launch/interact`
+   `https://<your-host>/api/admin/slack/interact`
+   (the single shared Interactivity endpoint — see note below.)
 4. Install to workspace. Copy Bot User OAuth Token → `SLACK_BOT_TOKEN`.
 5. Copy Signing Secret → `SLACK_SIGNING_SECRET`.
+
+> **Slack allows exactly one Interactivity Request URL per app.**
+> `POST /api/admin/slack/interact` is that single URL — it dispatches
+> internally (on the clicked button's `action_id`) to County Launch, Relay
+> approval, and Win-Story approval. Do NOT point Interactivity at any of
+> `/slack/county-launch/interact`, `/slack/relay-decision`, or
+> `/slack/win-story/interact` directly — those three still exist as
+> deprecated aliases for backward compatibility, but only one of them can
+> ever be Slack's actual configured URL at a time, silently breaking the
+> other two.
 
 ### Adding a candidate county
 ```sql
@@ -535,12 +546,15 @@ RELAY_DAILY_CEILING=20          # per channel, per calendar day
 ### Slack app setup
 Reuses the same Slack app as County Launch (`SLACK_BOT_TOKEN`/`SLACK_SIGNING_SECRET`) —
 no separate app needed.
-1. Enable "Interactivity & Shortcuts" and add a second Request URL:
-   `https://<your-host>/api/admin/slack/relay-decision`
+1. Interactivity is already covered by the single `/api/admin/slack/interact`
+   Request URL set up under County Launch above — Relay's Approve/Reject
+   buttons dispatch through that same endpoint, nothing further to add here.
 2. Add a slash command `/relay-kill` with Request URL:
    `https://<your-host>/api/admin/slack/kill`
    (usage: `/relay-kill ALL | RELAY | VERA | HUNTER` — sets the fleet-wide
    kill-switch override, auto-expires after `KILL_OVERRIDE_TTL_SECONDS`, 1 hour default)
+   Slash commands get their own Request URL slot in Slack, separate from
+   Interactivity, so this one is unaffected by the single-URL constraint above.
 
 ### One-time email channel setup
 Before any email can send, the Relay passthrough Instantly campaign must exist:

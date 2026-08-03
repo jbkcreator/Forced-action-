@@ -3,7 +3,7 @@ Stage 10 — Trade + County Pricing Cohort Engine (fa055).
 
 Enables per-trade-vertical and per-county pricing adjustments that activate
 only after 6+ weeks of deal data. Every adjustment is constrained within
-guardrail bounds (config/cora_guardrails.py) and logged to pricing_cohorts.
+guardrail bounds (config/lifecycle_guardrails.py) and logged to pricing_cohorts.
 
 Activation gate:
   - >= 6 distinct weeks with deal_outcomes rows for (county_id, trade_vertical)
@@ -36,7 +36,7 @@ from typing import Any, Optional
 from sqlalchemy import text as sa_text
 from sqlalchemy.orm import Session
 
-from config.cora_guardrails import GUARDRAILS, get_guardrail
+from config.lifecycle_guardrails import GUARDRAILS, get_guardrail
 from config.stage10_config import PRICING_COHORT
 
 logger = logging.getLogger(__name__)
@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 # ── guardrail helpers ─────────────────────────────────────────────────────────
 
-# Hard bounds per price_type (cents). Derived from cora_guardrails.py.
+# Hard bounds per price_type (cents). Derived from lifecycle_guardrails.py.
 _PRICE_BOUNDS: dict[str, tuple[int, int]] = {
     "lock":          (14700, 24700),   # $147–$247/mo
     "wallet_starter": (3900, 9900),    # $39–$99/mo
@@ -52,10 +52,10 @@ _PRICE_BOUNDS: dict[str, tuple[int, int]] = {
     "wallet_power":   (19900, 24900),  # $199–$249/mo
     "bundle":        (1500, 9900),     # $15–$99 (conservative range)
     # Block 1 storefront subscription tiers (src/api/deps.py VALID_TIERS).
-    # Bounds mirror the founding→regular price range per tier (stripe_service.py).
-    "starter":       (60000, 110000),  # $600–$1100/mo
-    "pro":           (110000, 190000), # $1100–$1900/mo
-    "dominator":     (200000, 350000), # $2000–$3500/mo
+    # Floor = live/founding price. Ceiling = upper guardrail for future regular rate.
+    "starter":       (29900, 110000),  # $299–$1100/mo
+    "pro":           (49900, 190000),  # $499–$1900/mo
+    "founder":       (110000, 130000), # $1100–$1300/mo
     "annual_lock":   (147750, 246250), # +/-25% of the flat $1970/yr rate (guardrail: max_price_adjustment_pct)
 }
 

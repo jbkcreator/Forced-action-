@@ -1,21 +1,21 @@
 """
 Stage 10 — Prometheus /metrics exposition endpoint.
 
-Exposes Cora kill-switch business metrics and 3-variant A/B slot performance
+Exposes Lifecycle kill-switch business metrics and 3-variant A/B slot performance
 in Prometheus text format so Alertmanager can scrape them.
 
 Metrics emitted:
-  cora_first_payment_rate        — % free→paid in 30d (kill-switch)
-  cora_saved_card_rate           — % payers with saved card
-  cora_wallet_adoption           — % payers with wallet
-  cora_lock_conversion           — % wallet→lock
-  cora_retention_30d             — 30-day payer retention
-  cora_sms_reply_rate            — % marketing SMS replied
-  cora_offer_acceptance_rate     — % wallet-push offers accepted
-  cora_variant_sends             — sends per (sequence, slot)
-  cora_variant_conversions       — conversions per (sequence, slot)
-  cora_variant_conv_rate         — conversion rate per (sequence, slot)
-  cora_pricing_cohort_active     — 1 if cohort active, 0 otherwise
+  lifecycle_first_payment_rate        — % free→paid in 30d (kill-switch)
+  lifecycle_saved_card_rate           — % payers with saved card
+  lifecycle_wallet_adoption           — % payers with wallet
+  lifecycle_lock_conversion           — % wallet→lock
+  lifecycle_retention_30d             — 30-day payer retention
+  lifecycle_sms_reply_rate            — % marketing SMS replied
+  lifecycle_offer_acceptance_rate     — % wallet-push offers accepted
+  lifecycle_variant_sends             — sends per (sequence, slot)
+  lifecycle_variant_conversions       — conversions per (sequence, slot)
+  lifecycle_variant_conv_rate         — conversion rate per (sequence, slot)
+  lifecycle_pricing_cohort_active     — 1 if cohort active, 0 otherwise
 
 Values are read from Redis (kill-switch cache) and Postgres (variant tests,
 cohorts). Each scrape rebuilds the registry — no background threads.
@@ -69,8 +69,8 @@ def prometheus_metrics(db: Session = Depends(_get_db)):
         val = get_cached_metric(metric_name)
         if val is not None:
             g = Gauge(
-                f"cora_{metric_name}",
-                f"Cora kill-switch metric: {metric_name}",
+                f"lifecycle_{metric_name}",
+                f"Lifecycle kill-switch metric: {metric_name}",
                 registry=reg,
             )
             g.set(val)
@@ -89,25 +89,25 @@ def prometheus_metrics(db: Session = Depends(_get_db)):
         """)).fetchall()
 
         sends_g = Gauge(
-            "cora_variant_sends",
+            "lifecycle_variant_sends",
             "Total sends per variant slot",
             ["sequence_name", "slot"],
             registry=reg,
         )
         convs_g = Gauge(
-            "cora_variant_conversions",
+            "lifecycle_variant_conversions",
             "Total conversions per variant slot",
             ["sequence_name", "slot"],
             registry=reg,
         )
         rate_g = Gauge(
-            "cora_variant_conv_rate",
+            "lifecycle_variant_conv_rate",
             "Conversion rate per variant slot (0.0–1.0)",
             ["sequence_name", "slot"],
             registry=reg,
         )
         active_g = Gauge(
-            "cora_variant_slot_active",
+            "lifecycle_variant_slot_active",
             "1 if slot is active, 0 if retired",
             ["sequence_name", "slot"],
             registry=reg,
@@ -137,7 +137,7 @@ def prometheus_metrics(db: Session = Depends(_get_db)):
         """)).fetchall()
 
         cohort_g = Gauge(
-            "cora_pricing_cohort_active",
+            "lifecycle_pricing_cohort_active",
             "1 if pricing cohort is active, 0 if pending/rolled_back",
             ["county_id", "trade_vertical", "price_type"],
             registry=reg,

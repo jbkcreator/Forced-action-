@@ -176,7 +176,7 @@ def test_creates_order_success(mock_db, monkeypatch, request_options):
     assert captured_order["order"].pitch_generation_number == 1
     assert captured_order["order"].target_vertical == "roofer"
     assert captured_order["order"].status == "Order_Received"
-    assert captured_order["order"].generated_by == "cora"
+    assert captured_order["order"].generated_by == "lifecycle"
 
 
 # ── Soft-wording guard ────────────────────────────────────────────────────────

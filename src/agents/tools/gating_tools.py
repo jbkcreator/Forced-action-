@@ -1,5 +1,5 @@
 """
-Gating tools for Cora graphs.
+Gating tools for Lifecycle graphs.
 
 These five tools are the safety layer. Every autonomous decision consults
 them before acting:
@@ -46,14 +46,14 @@ def guardrail_check(decision_type: str, proposed_value: float) -> Dict[str, Any]
 	Return {'allowed': bool, 'reason': str, 'bound': dict} for a proposed
 	autonomous decision.
 
-	decision_type must be a key in config.cora_guardrails.GUARDRAILS.
+	decision_type must be a key in config.lifecycle_guardrails.GUARDRAILS.
 	proposed_value is the number being evaluated (cents for pricing,
 	percent for discounts, credits for bonuses, minutes for windows).
 
 	Unknown decision_type → allowed=False with reason 'unknown_guardrail'
 	(fail-safe — never allow a decision we can't validate).
 	"""
-	from config.cora_guardrails import GUARDRAILS, is_within_guardrail
+	from config.lifecycle_guardrails import GUARDRAILS, is_within_guardrail
 
 	if decision_type not in GUARDRAILS:
 		return {
@@ -170,7 +170,7 @@ def compliance_check(
 def kill_switch_status(feature: str, observed_value: Optional[float] = None) -> Dict[str, Any]:
 	"""
 	Return the Green/Yellow/Red colour for a feature, based on the current
-	observed metric value against config.cora_guardrails.KILL_SWITCH
+	observed metric value against config.lifecycle_guardrails.KILL_SWITCH
 	thresholds.
 
 	If observed_value is None we return the config band only ('unknown'
@@ -206,7 +206,7 @@ def kill_switch_status(feature: str, observed_value: Optional[float] = None) -> 
 				"observed_value": observed_value,
 			}
 
-	from config.cora_guardrails import KILL_SWITCH
+	from config.lifecycle_guardrails import KILL_SWITCH
 
 	band = KILL_SWITCH.get(feature)
 	if band is None:

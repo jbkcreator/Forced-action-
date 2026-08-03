@@ -1,7 +1,7 @@
 """
 Kill-switch metric ingest.
 
-Computes observable metrics from the DB that feed into the Cora decision
+Computes observable metrics from the DB that feed into the Lifecycle decision
 hierarchy kill-switch gate. Results are cached in Redis (25hr TTL) so agents
 can call kill_switch_status(feature, observed_value) with live data.
 
@@ -16,7 +16,7 @@ Metrics computed:
   county_profitability  — 1.0 if any active paying subscribers in county, else 0.0 (v1 proxy)
   claude_cost_per_decision — avg AgentDecision.cost_usd × 100
 
-Known gaps (kept as None so cora_self_healing treats them fail-safe):
+Known gaps (kept as None so lifecycle_self_healing treats them fail-safe):
   cac_paid_channels    — no ad-spend ledger yet
   sms_cost_per_signup  — Telnyx doesn't expose per-send cost on MessageOutcome
 
@@ -26,7 +26,7 @@ cost) are intentionally excluded — optimistic v1 gap documented in the ADR.
 
 fa034: After computing the dict, this task also writes a row to
 platform_daily_stats (one row per (run_date, county_id)) so the
-src/tasks/cora_self_healing.py task can compute a 7-day rolling baseline
+src/tasks/lifecycle_self_healing.py task can compute a 7-day rolling baseline
 per metric via the compute_baseline() helper exported from this module.
 
 Cron: 0 6 * * * (6:00 UTC daily, before retention cron at 16:00)
@@ -399,7 +399,7 @@ def compute_baseline(
     """Return the rolling mean of `metric_name` over the last `window_days`
     rows in platform_daily_stats for the given county. None if no data.
 
-    Used by src/tasks/cora_self_healing.py to compare current observed
+    Used by src/tasks/lifecycle_self_healing.py to compare current observed
     values against trend, not just absolute thresholds. Raw SQL only.
     """
     col = _BASELINE_COLUMNS.get(metric_name)
@@ -425,7 +425,7 @@ def _check_accelerated_wallet_push_floor(db, take_rate: Optional[float]) -> Opti
     Returns the color set ('red' | 'green'), or None if the check did not run
     (no offers yet or feature not enabled).
     """
-    from config.cora_guardrails import KILL_SWITCH
+    from config.lifecycle_guardrails import KILL_SWITCH
 
     cfg = KILL_SWITCH.get("wallet_adoption", {})
     floor_pct = cfg.get("floor_pct", 12)
@@ -492,7 +492,7 @@ def run_kill_switch_metric_ingest(dry_run: bool = False) -> dict:
                 if feature.startswith("_"):
                     continue
                 _cache_metric(feature, value, county_id=county_id)
-                # Legacy no-prefix key — source county only (Cora graphs read this).
+                # Legacy no-prefix key — source county only (Lifecycle graphs read this).
                 if county_id == source_county:
                     _cache_metric(feature, value)
         logger.info(

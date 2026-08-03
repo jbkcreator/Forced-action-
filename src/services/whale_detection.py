@@ -1,9 +1,19 @@
 """
 Whale detection (HUNTER-02, W1).
 
-Flags a BuyerEntity as a whale — 3+ purchases in the trailing 18 months, OR
->$500K total cash volume — per Hunter's constitution standing run #3.
+Flags a BuyerEntity as a whale by entity type:
+  - LLC / Corporate: 3+ purchases in the trailing 18 months OR >$500K total
+    cash volume.
+  - Individual / Trust: 3+ purchases AND >$500K total cash volume (both).
 Pure aggregate query, no model of any kind: this never needed one.
+
+The entity-type split (INDIVIDUAL_REQUIRES_BOTH) exists because the original
+OR-for-everyone rule flagged 2,339 "whales" of which ~92% were homeowners who
+had merely sold one expensive home — a single deed plus an all-time cash-volume
+sum over $500K. Requiring BOTH signals for Individual/Trust collapses that to
+~156 real repeat investors (~86% LLC/Corporate). See CONTEXT.md "Whale (REVINT
+sense)". Set INDIVIDUAL_REQUIRES_BOTH = False to restore the legacy OR-for-all
+behavior.
 
 Reuses BuyerEntity.total_cash_volume (populated by
 src/services/buyer_entity_resolution.refresh_portfolio_aggregates, an
@@ -36,6 +46,11 @@ logger = logging.getLogger(__name__)
 WHALE_MIN_PURCHASES = 3
 WHALE_PURCHASE_WINDOW_DAYS = 548  # ~18 months
 WHALE_MIN_CASH_VOLUME = 500_000
+
+# Individual/Trust entities must satisfy BOTH the purchase-count AND cash-volume
+# tests; LLC/Corporate keep the looser OR. Flip to False for legacy OR-for-all.
+INDIVIDUAL_REQUIRES_BOTH = True
+_OR_ENTITY_TYPES = ("LLC", "Corporate")
 
 # Nominal-consideration floor ($1/$10/$0 family, trust, and corrective
 # re-recordings of the same transaction) — same convention already used
@@ -86,6 +101,23 @@ def refresh_whale_flags(session: Session, entity_ids: Optional[list[int]] = None
     buyer_entities table on every nightly sweep).
     """
     entity_filter = "WHERE be.id = ANY(:entity_ids)" if entity_ids else ""
+
+    # LLC/Corporate always qualify on OR; Individual/Trust require both signals
+    # only when the split is enabled (else they fall through to the same OR).
+    hit_purchases = "COALESCE(rp.recent_count, 0) >= :min_purchases"
+    hit_volume = "be.total_cash_volume > :min_cash_volume"
+    or_rule = f"({hit_purchases} OR {hit_volume})"
+    and_rule = f"({hit_purchases} AND {hit_volume})"
+    if INDIVIDUAL_REQUIRES_BOTH:
+        # _OR_ENTITY_TYPES is a code constant (never user input) — safe to inline.
+        or_types_sql = ", ".join(f"'{t}'" for t in _OR_ENTITY_TYPES)
+        qualifies_expr = (
+            f"CASE WHEN be.entity_type IN ({or_types_sql}) "
+            f"THEN {or_rule} ELSE {and_rule} END"
+        )
+    else:
+        qualifies_expr = or_rule
+
     result = session.execute(
         text(f"""
             WITH recent_purchases AS (
@@ -99,8 +131,7 @@ def refresh_whale_flags(session: Session, entity_ids: Optional[list[int]] = None
             whale_status AS (
                 SELECT be.id,
                        be.is_whale AS was_whale,
-                       (COALESCE(rp.recent_count, 0) >= :min_purchases
-                            OR be.total_cash_volume > :min_cash_volume) AS qualifies
+                       {qualifies_expr} AS qualifies
                 FROM buyer_entities be
                 LEFT JOIN recent_purchases rp ON rp.buyer_entity_id = be.id
                 {entity_filter}

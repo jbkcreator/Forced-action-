@@ -1,12 +1,12 @@
 """
 Shared Green/Yellow/Red grading for kill-switch metrics.
 
-Extracted from cora_self_healing._grade so the scorecard and the engine
+Extracted from lifecycle_self_healing._grade so the scorecard and the engine
 use identical logic. The engine re-exports this function — no behavior change.
 """
 from typing import Optional
 
-from config.cora_guardrails import KILL_SWITCH
+from config.lifecycle_guardrails import KILL_SWITCH
 
 
 def grade(metric_name: str, observed: Optional[float]) -> str:

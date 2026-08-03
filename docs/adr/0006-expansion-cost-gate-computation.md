@@ -5,7 +5,7 @@ Status: Proposed
 
 ## Context
 
-Two of the seven **Expansion Gates** (`config/cora_guardrails.py:EXPANSION_GATES`)
+Two of the seven **Expansion Gates** (`config/lifecycle_guardrails.py:EXPANSION_GATES`)
 are cost-based:
 
 - `free_tier_cost_ratio` — free-tier cost ≤ 40% of revenue
@@ -75,7 +75,7 @@ Graded `lower_is_better` against the existing KILL_SWITCH thresholds
 
 **In scope** (variable, ledger-tracked, subscriber-attributable): Claude API
 (exact), Telnyx SMS (where ledger rows exist; otherwise approximated at the
-flat $0.004/segment rate already referenced in `cora_guardrails.py`).
+flat $0.004/segment rate already referenced in `lifecycle_guardrails.py`).
 
 **Out of scope** (documented, not in v1): `subscriber_id IS NULL` shared cost,
 scraping/proxy cost, fixed infra and headcount. Consequence: both gates are

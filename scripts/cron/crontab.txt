@@ -81,7 +81,7 @@ COUNTY_ID=hillsborough
 17 6 * * 1-6 $PROJECT/scripts/cron/run.sh src.scrappers.roofing_permits.roofing_permit_engine --county-id $COUNTY_ID
 
 # NWS revenue alert polling — every 5 minutes, all days (fa018)
-# Autonomous trigger for storm-pack offers and Cora urgency messages.
+# Autonomous trigger for storm-pack offers and Lifecycle urgency messages.
 # Idempotent: same alert_id is never processed twice.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.nws_poll --county-id $COUNTY_ID
 
@@ -118,16 +118,16 @@ COUNTY_ID=hillsborough
 # Quora S6 organic-answer pipeline — 06:35 AM UTC daily (after load validator).
 # Picks one keyword via DB rotation (quora_topics + cooldown_days), scrapes Quora,
 # publishes to Cora for classification + answer drafting, upserts to quora_questions.
-#35 6 * * * $PROJECT/scripts/cron/run.sh src.tasks.quora_s6_orchestrator
+35 6 * * * $PROJECT/scripts/cron/run.sh src.tasks.quora_s6_orchestrator
 
 # Autonomous Inbound Content Loop (Task 5.1) — Weekly Sunday @ 09:00 AM UTC.
 # Scores each Quora Seed Keyword over a 30-day window, deactivates losers
 # (>=5 answers, 0 paid signups) and expands winners (LLM variations, pool cap 30,
 # replace-worst). Weekly to match the one-keyword/day scrape throughput. Runs
 # clear of the 04:00–08:00 scrape/CDS/skip-trace/GHL chain. See docs/adr/0021.
-# DISABLED alongside quora_s6_orchestrator — this loop only scores/expands
-# Quora Seed Keywords, which stop moving once the scraper feeding them is off.
-#0 9 * * 0 $PROJECT/scripts/cron/run.sh src.tasks.autonomous_tuning_worker
+# Active — depends on quora_s6_orchestrator being live (line above, also active).
+# Only scores/expands Quora Seed Keywords; safe to disable by commenting out quora_s6_orchestrator first.
+0 9 * * 0 $PROJECT/scripts/cron/run.sh src.tasks.autonomous_tuning_worker
 
 # ── PINELLAS DAILY ────────────────────────────────────────────
 # Staggered +5 min after their Hillsborough counterparts within 04:00–06:30 UTC window.
@@ -271,31 +271,31 @@ COUNTY_ID=hillsborough
 # in the same tick.
 0-59/2 * * * * $PROJECT/scripts/cron/run.sh src.tasks.fleet_event_sweep
 
-# Cora anomaly check — volume + no-answer rate monitor — every 15 min
-*/15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.cora_anomaly_check
+# Lifecycle anomaly check — volume + no-answer rate monitor — every 15 min
+*/15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lifecycle_anomaly_check
 
-# Cora self-healing loop (fa034) — every hour at :30. Reads kill-switch
-# metrics + 7-day baselines, opens/maintains/closes cora_incident rows,
+# Lifecycle self-healing loop (fa034) — every hour at :30. Reads kill-switch
+# metrics + 7-day baselines, opens/maintains/closes lifecycle_incident rows,
 # takes safe actions inside guardrails (fallback only — never auto-pricing
 # or auto-kill), escalates to Slack + Revenue Pulse when human review needed.
 # Source of truth: FA-2B-v9-FINAL Self-Healing Ops + Q44 + Q52.
-# Gated by CORA_SELF_HEALING_ENABLED=true (default false). Task is a no-op
+# Gated by LIFECYCLE_SELF_HEALING_ENABLED=true (default false). Task is a no-op
 # when disabled — safe to leave the cron entry in even on environments that
 # haven't opted in yet.
-30 * * * * $PROJECT/scripts/cron/run.sh src.tasks.cora_self_healing
+30 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lifecycle_self_healing
 
 # Stage 10 — Variant Mutation Job (fa055) — every hour at :45 (15 min after self-healing).
 # Runs sigma rollback check, proving-cycle evaluation, and slot retirement/replacement
 # loop for all active message_variant_tests. Also checks rollback triggers for all
-# active pricing_cohorts. Reuses CORA_SELF_HEALING_ENABLED gate — no-op when disabled.
-# Max 3 actions per run (shared guardrail with cora_self_healing).
+# active pricing_cohorts. Reuses LIFECYCLE_SELF_HEALING_ENABLED gate — no-op when disabled.
+# Max 3 actions per run (shared guardrail with lifecycle_self_healing).
 45 * * * * $PROJECT/scripts/cron/run.sh src.tasks.variant_mutation_job
 
 # Stage 10 — Alert Rules Check (fa055) — every 15 min.
 # Evaluates the same conditions as deploy/prometheus/alert_rules.yml but via cron,
 # so self-healing fires correctly even without a running Prometheus/Alertmanager stack.
-# Actions: variant_engine.promote_winner, sigma_rollback, cora_self_healing steps.
-# Gated by CORA_SELF_HEALING_ENABLED. Idempotent — no duplicate actions within breach.
+# Actions: variant_engine.promote_winner, sigma_rollback, lifecycle_self_healing steps.
+# Gated by LIFECYCLE_SELF_HEALING_ENABLED. Idempotent — no duplicate actions within breach.
 */15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.alert_rules_check
 
 # ── A7 MACRO SIGNALS ─────────────────────────────────────────
@@ -322,14 +322,14 @@ COUNTY_ID=hillsborough
 # and before any lead-selling surface is read. CDS writes a fresh distress_scores
 # row per property per day (is_guess_lead defaults FALSE); this pass recomputes
 # Lead Confidence over today's rows and flags is_guess_lead when below threshold,
-# so guess leads are withheld from the feed / Lead Packs / Cora recs and marked
+# so guess leads are withheld from the feed / Lead Packs / Lifecycle recs and marked
 # direct_mail_eligible. Read-only on the CDS score (ADR 0019). Both counties in
 # one pass (iterates today's rows regardless of county).
 2 7 * * 1-6 $PROJECT/scripts/cron/run.sh src.services.lead_confidence
 
 # ── FEEDBACK RITUAL EXPORT (4.3) ─────────────────────────────
-# Closes the Human Feedback Ritual loop: turns admin-reviewed flagged Cora
-# interactions (cora_training_overrides, source='feedback_ritual',
+# Closes the Human Feedback Ritual loop: turns admin-reviewed flagged Lifecycle
+# interactions (lifecycle_training_overrides, source='feedback_ritual',
 # review_outcome approved|needs_correction) into a JSONL fine-tuning dataset and
 # flips those rows to queue_status='exported'. Idempotent — only picks up newly
 # reviewed rows. Runs daily 08:20 UTC Mon-Sat, after GHL sync (08:00) so
@@ -568,17 +568,17 @@ COUNTY_ID=hillsborough
 # Revenue Pulse — daily founder SMS at 07:30 UTC (lead count, wallet actives, top deal/alert, kill switch).
 30 7 * * * $PROJECT/scripts/cron/run.sh src.tasks.revenue_pulse --daily
 
-# Weekly Cora autonomy scorecard (fa036) — Monday 08:45 UTC. Computes 5
-# autonomy metrics over the last 7 days from agent_decisions + cora_playbook,
+# Weekly Lifecycle autonomy scorecard (fa036) — Monday 08:45 UTC. Computes 5
+# autonomy metrics over the last 7 days from agent_decisions + lifecycle_playbook,
 # writes one learning_cards row (card_type='autonomy_summary'), and posts to
-# Slack via cora_slack. Scheduled 15 min before the 09:00 weekly Revenue Pulse
+# Slack via lifecycle_slack. Scheduled 15 min before the 09:00 weekly Revenue Pulse
 # so the pulse can append the latest autonomy summary line.
 # Read-only metric computation — no env gate, safe to leave wired.
-# Source: FA-2B-v9-FINAL §Weekly Cora Autonomy Scorecard.
-45 8 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.cora_autonomy_report
+# Source: FA-2B-v9-FINAL §Weekly Lifecycle Autonomy Scorecard.
+45 8 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.lifecycle_autonomy_report
 
 # Weekly Kill-Switch Scorecard (fa037) — Monday 08:50 UTC. Reads daily
-# platform_daily_stats snapshots + cora_incident; writes one
+# platform_daily_stats snapshots + lifecycle_incident; writes one
 # learning_cards row (card_type='kill_switch_scorecard'); the 09:00 weekly
 # Revenue Pulse appends a compact alarm line. Read-only — no env gate.
 50 8 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.kill_switch_scorecard
@@ -586,7 +586,7 @@ COUNTY_ID=hillsborough
 # Revenue Pulse — weekly founder SMS, Monday 09:00 UTC (revenue est, churn, top learning, KS scorecard).
 0 9 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.revenue_pulse --weekly
 
-# Learning Card job — Sunday midnight UTC. Generates weekly performance cards for Cora's context.
+# Learning Card job — Sunday midnight UTC. Generates weekly performance cards for Lifecycle's context.
 0 0 * * 0 $PROJECT/scripts/cron/run.sh src.tasks.learning_card_job
 
 # Stage 12 — Contractor Benchmark Report — Monday 11:00 UTC.
@@ -619,7 +619,7 @@ COUNTY_ID=hillsborough
 # Retention summaries — daily 16:00 UTC. Emits retention_summary_due per tier cadence.
 0 16 * * * $PROJECT/scripts/cron/run.sh src.tasks.retention_event_producer
 
-# ── CORA GATE OBSERVABILITY ──────────────────────────────────────────────────
+# ── LIFECYCLE GATE OBSERVABILITY ──────────────────────────────────────────────────
 # Kill-switch metric ingest — every 6h at 00:00, 06:00, 12:00, 18:00 UTC.
 # Queries DB for live business metrics (first_payment_rate, retention_30d, etc.)
 # and caches in Redis (25hr TTL) so agent graphs can call kill_switch_status()
@@ -668,16 +668,16 @@ COUNTY_ID=hillsborough
 
 # Frozen control holdout surfacing — daily 09:00 UTC (Task 4.1). Walks
 # active *_holdout AbTests; on a proven verdict (variant beats frozen
-# control >2σ, >=30/arm) writes a cora_playbook recommendation + a
+# control >2σ, >=30/arm) writes a lifecycle_playbook recommendation + a
 # holdout_result learning_card. No auto-promote — a human adopts.
-0 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.cora_holdout_check
+0 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.lifecycle_holdout_check
 
-# Cora attribution rollout monitor — every 2 min. Evaluates cora_attribution_v1
+# Lifecycle attribution rollout monitor — every 2 min. Evaluates lifecycle_attribution_v1
 # rollout arm: if variant conversion rate is >2σ worse than control over a
 # rolling 48h window (>=30/arm), rolls back AbTest.status='rolled_back',
 # fires founder SMS alert, writes learning_card. Fail-safe: no-op below floor.
 # Max detection lag: ~4 min — satisfies the <=5-min rollback DoD requirement.
-*/2 * * * * $PROJECT/scripts/cron/run.sh src.tasks.cora_attribution_rollback_check
+*/2 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lifecycle_attribution_rollback_check
 
 # ── STAGE 6 SWEEPS ───────────────────────────────────────────
 # AP Lite candidate sweep — daily 14:00 UTC. Rolling 7-day window; idempotency
@@ -772,7 +772,7 @@ COUNTY_ID=hillsborough
 # sitemap.xml. No-op if no data changed (hash-diffed). Retire hysteresis = 2 runs.
 30 9 * * 0 $PROJECT/scripts/cron/run.sh src.tasks.seo_compiler
 
-# ── CORA DATA ENGINE — OUTCOME CONNECTORS (PR #111) ─────────────────────────
+# ── LIFECYCLE DATA ENGINE — OUTCOME CONNECTORS (PR #111) ─────────────────────────
 # Mines already-ingested, already-matched records for a labeled outcome event
 # and stages it as an OutcomeCandidate. See src/connectors/registry.py for
 # the source-of-truth cadence/SLA metadata these lines implement.
@@ -827,21 +827,29 @@ COUNTY_ID=hillsborough
 # DOR SDF download+ingestion for that period (manual admin upload, not on
 # cron — see src/connectors/dor_sale_outcomes.py). Runs AFTER outcome_label_layer
 # (08:25/08:26) so a same-day DOR ingestion still gets promoted same-day.
-# SLA 131040 min (~91 days + grace — DOR posts 3 rolls/year). enabled=False in
-# registry.py pending go-live decision — this entry is prepared, not yet
-# installed on any real crontab (see report/july-16-report.md).
+# SLA 131040 min (~91 days + grace — DOR posts 3 rolls/year). enabled=True in
+# registry.py as of PR #170 — connector is live and this cron entry is active.
 0 9 2 * * $PROJECT/scripts/cron/run.sh src.connectors.dor_sale_outcomes --county-id $COUNTY_ID
 1 9 2 * * $PROJECT/scripts/cron/run.sh src.connectors.dor_sale_outcomes --county-id pinellas
 
-# ── HUNTER-01/02 — BUYER ENTITY RESOLUTION + WHALE DETECTION (H3, W2) ────────
+# ── HUNTER-01/02/03/04 — BUYER ENTITY RESOLUTION + WHALE DETECTION +
+# BUYER-TYPE CLASSIFICATION + PORTFOLIO PROFILING (H3, W2) ───────────────────
 # Nightly sweep — daily, after outcome_label_layer (08:25/08:26) so the same
 # day's newly-promoted deed activity is available to resolve against. Runs
 # H2's incremental resolver against buyer_entities (never a full re-cluster —
-# entity IDs stay stable), then portfolio aggregation, then whale-flag
-# scoring, in that dependency order. Does not yet write to
-# /shared/facts/enriched/ — see src/tasks/hunter_nightly_sweep.py docstring.
+# entity IDs stay stable), then portfolio aggregation, whale-flag scoring,
+# portfolio profiling (HUNTER-04: cadence/capacity/hold-time), and buyer-type
+# classification (HUNTER-03), in that dependency order, scoped to just the
+# entities this run's resolution step actually touched. Does not yet write
+# to /shared/facts/enriched/ — see src/tasks/hunter_nightly_sweep.py docstring.
 30 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.hunter_nightly_sweep --county-id $COUNTY_ID
 31 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.hunter_nightly_sweep --county-id pinellas
+
+# NBRA opportunity-score population (REVINT I1) — fills opportunity_scores from
+# freshly-refreshed whale flags so get_ranked_queue() has rows to rank. Must run
+# AFTER hunter_nightly_sweep (above) which updates whale flags.
+32 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.nbra_populate_sweep --county-id $COUNTY_ID
+33 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.nbra_populate_sweep --county-id pinellas
 
 # Auction-winner fast-follow (W2) — runs just after the nightly sweep as a
 # supplementary <24h latency check on distressed-acquisition deeds
@@ -851,6 +859,15 @@ COUNTY_ID=hillsborough
 # the next scheduled sweep if this entry's cadence is ever tightened.
 35 8 * * * $PROJECT/scripts/cron/run.sh src.connectors.whale_auction_fast_follow --county-id $COUNTY_ID
 36 8 * * * $PROJECT/scripts/cron/run.sh src.connectors.whale_auction_fast_follow --county-id pinellas
+
+# HUNTER-05 — direct tax-deed-auction-winner resolution. Separate from the
+# nightly sweep above (triggered by new tax_deed_auctions.sold_to rows, not a
+# buyer_entities-wide rescan); staggered just after the fast-follow entries.
+# Foreclosure winners are NOT resolved here — Foreclosure.sold_to carries no
+# real bidder identity (see src/agents/hunter/auction_resolution.py's
+# docstring), so they stay on the fast-follow proxy above permanently.
+40 8 * * * $PROJECT/scripts/cron/run.sh src.agents.hunter.auction_resolution --county-id $COUNTY_ID
+41 8 * * * $PROJECT/scripts/cron/run.sh src.agents.hunter.auction_resolution --county-id pinellas
 
 # ── CDS SCORING RETUNE (client Q9 — closed loop) ─────────────
 # Weekly Sunday @ 11:00 UTC. Runs B→C→D→E→F end to end: builds the training
@@ -868,12 +885,12 @@ COUNTY_ID=hillsborough
 # 5+ minutes with no Telnyx message.finalized delivery-status callback.
 */5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.owner_alert_sweep
 # Tiered volume guarantee shortfall sweep — INTENTIONALLY NOT scheduled yet.
-# config/guarantees.py TIER_LEAD_QUOTAS are placeholder lead-per-cycle counts
-# pending a business decision; enabling this cron would issue real Stripe
-# balance credits off unconfirmed numbers. Re-enable only once all three are
-# true: (1) lead_delivery_sweep has run one full 30-day cycle with real
-# deliveries landing, (2) a --dry-run credit total has been reviewed and
-# approved in writing, (3) Stripe is confirmed in live mode.
+# Quotas confirmed (starter 15 / pro 40 / founder 40 per 30-day cycle) but
+# enabling this cron would issue real Stripe balance credits before we have a
+# full cycle of verified delivery data. Re-enable only once all three are true:
+# (1) lead_delivery_sweep has run one full 30-day cycle with real deliveries
+# landing, (2) a --dry-run credit total has been reviewed and approved in
+# writing by Josh, (3) Stripe is confirmed in live mode.
 # 0 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.guarantee_shortfall_sweep
 
 # ── AGENT LANE: RELAY ────────────────────────────────────────────────────────
@@ -885,6 +902,12 @@ COUNTY_ID=hillsborough
 # Email channel (Instantly, R2) is registered but inert until
 # RELAY_INSTANTLY_CAMPAIGN_ID is configured — see --setup-email-channel.
 # Ops reference: docs/PLATFORM-OPERATIONS-GUIDE.md ("Relay Execution Service").
+# ONE SWEEP RUN = ONE VENTURE (CLONE-v2.2 / CL3). This line covers venture #1
+# (--venture defaults to hillsborough_distress). Send window, daily ceiling,
+# Slack channel and kill-switch key are all per-venture, so a second venture
+# needs its own line rather than a wider batch — uncomment and set the key
+# after provisioning it (docs/venture-onboarding.md):
+#   */30 * * * * $PROJECT/scripts/cron/run.sh src.services.relay --sweep --venture venture_two
 */30 * * * * $PROJECT/scripts/cron/run.sh src.services.relay --sweep
 
 # T-B12-07 — Deal-of-the-day daily pick (idempotent, one row per date).
@@ -901,5 +924,31 @@ COUNTY_ID=hillsborough
 # the checkout webhook (transient wallet/DB error). Idempotent, cheap;
 # every 15 min is generous relative to how rarely this should fire.
 */15 * * * * $PROJECT/scripts/cron/run.sh src.services.winback_offers --reconcile
+
+# THROUGH-v2.2 T4 — Monthly standing-order digest. 1st of each month, 9am:
+# posts every active auto-approval rule to Slack with Keep/Archive buttons so
+# Josh can prune. Inaction = keep (no auto-expire).
+0 9 1 * * $PROJECT/scripts/cron/run.sh src.services.cora_throughput.standing_order_digest
+
+# DNC re-scrub — subscribers target (Section 2.5 voice-compliance gate:
+# self-signup phones never get a dnc_phone_checks row today, so every outbound
+# voice call to them fail-closes with reason='dnc_check_required' in
+# compliance_gator.py). Tracerfy is already the vendor (same account used for
+# skip-trace); this just adds the target that was never scheduled.
+#
+# Runs 1st AND 15th, NOT monthly. compliance_gator.py:74,84 blocks when
+# checked_at is older than settings.dnc_recheck_days (default 30). A
+# once-monthly run leaves a 31-day gap in 31-day months, so the check would go
+# stale ~1 day before its own refresh and silently block all voice dispatch
+# for that day, 7 months a year. Twice-monthly keeps the worst-case gap at 16
+# days — comfortably inside the window. Do NOT raise DNC_RECHECK_DAYS to
+# compensate: the FTC safe harbour is 31 days, so 30 is deliberately
+# conservative.
+#
+# Cost: $0.02/phone/run, all non-null subscriber phones re-scrubbed each run
+# (no per-phone staleness tracking). 56 phones today = ~$1.12/run, ~$2.24/mo.
+# Verified via: PYTHONPATH=. python -m src.tasks.dnc_refresh --targets subscribers --dry-run
+# Sign-off received — enabled 2026-07-28.
+0 2 1,15 * * $PROJECT/scripts/cron/run.sh src.tasks.dnc_refresh --targets subscribers
 
 # === END FORCED-ACTION-PLATFORM ===

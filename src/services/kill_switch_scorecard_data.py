@@ -4,7 +4,7 @@ Read-only helpers for the weekly Kill-Switch Scorecard.
 Provides:
   consecutive_red_days  — true pure-red trailing streak from daily snapshots
   latest_color          — current color (snapshot or Redis fallback)
-  open_incident_for     — open cora_incident row for a (metric, county)
+  open_incident_for     — open lifecycle_incident row for a (metric, county)
 """
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from typing import Optional, Any
 from sqlalchemy import text as sa_text
 from sqlalchemy.orm import Session
 
-from config.cora_guardrails import KILL_SWITCH
+from config.lifecycle_guardrails import KILL_SWITCH
 from src.services.kill_switch_grade import grade
 from src.tasks.kill_switch_metric_ingest import _BASELINE_COLUMNS, get_cached_metric
 
@@ -92,7 +92,7 @@ def open_incident_for(
     metric_name: str,
     county_id: str,
 ) -> Optional[Any]:
-    """Return the open cora_incident row for (metric_name, county_id), or None.
+    """Return the open lifecycle_incident row for (metric_name, county_id), or None.
 
     Raw SQL only. Used by the scorecard to annotate kill-rec state.
     """
@@ -100,7 +100,7 @@ def open_incident_for(
         SELECT id, metric_name, county_id, severity,
                observed_value, threshold_value, breach_started,
                action_taken
-        FROM cora_incident
+        FROM lifecycle_incident
         WHERE metric_name = :metric
           AND county_id = :county
           AND breach_resolved IS NULL

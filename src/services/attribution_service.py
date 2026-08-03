@@ -444,7 +444,7 @@ def record_conversion_attribution(
         subscriber_id, conversion_type, old_score, new_score, band, attribution_event_id,
     )
 
-    # Mark the subscriber's active cora_attribution_v1 assignment as converted
+    # Mark the subscriber's active lifecycle_attribution_v1 assignment as converted
     # so the rollout monitor can compute per-arm conversion rates.
     try:
         from src.services.ab_engine import (

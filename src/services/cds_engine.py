@@ -413,7 +413,7 @@ class MultiVerticalScorer:
 
     # Live destination table. Shadow rescore runs (Stage E of the cross-county
     # retune) swap this to "distress_scores_shadow" so the live feed, GHL push,
-    # and Cora flows are unaffected while the proposed weights are being
+    # and Lifecycle flows are unaffected while the proposed weights are being
     # evaluated. The schema of the two tables is identical (see migration
     # fa032_distress_scores_shadow.py), so every SQL string below references
     # this attribute via f-strings and routes transparently.
@@ -1009,13 +1009,13 @@ class MultiVerticalScorer:
             rows = self.session.execute(
                 sa_text(
                     f"SELECT subject_ref, correction_reason, signal_type, created_at"
-                    f" FROM cora_training_overrides {where}"
+                    f" FROM lifecycle_training_overrides {where}"
                 ),
                 params,
             ).fetchall()
         except Exception:
             # Table may not exist yet (pre-migration environment) — degrade gracefully.
-            logger.debug("cora_training_overrides not yet available — skipping dampener")
+            logger.debug("lifecycle_training_overrides not yet available — skipping dampener")
             return {}
 
         result: Dict[int, List[Dict]] = _defaultdict(list)
@@ -1035,7 +1035,7 @@ class MultiVerticalScorer:
         """
         Score a property across all 6 verticals with a 2-signal routing gate.
 
-        teaching_corrections: pre-loaded list of active CoraTrainingOverride rows
+        teaching_corrections: pre-loaded list of active LifecycleTrainingOverride rows
         for this property (as dicts).  If None, loads from DB (standalone calls).
         Pass an empty list to skip DB fetch when no corrections exist for the batch.
         """
@@ -2424,10 +2424,10 @@ class MultiVerticalScorer:
                         from config.settings import get_settings as _get_settings
                         _settings = _get_settings()
                         if _settings.enrichment_cascade_enabled:
-                            from src.agents.events.ingestion import publish_cora_event
+                            from src.agents.events.ingestion import publish_lifecycle_event
                             for _entry in result["new_gold_plus_entering"]:
                                 try:
-                                    publish_cora_event({
+                                    publish_lifecycle_event({
                                         "event_type": "gold_lead_scored",
                                         "payload":    _entry,
                                         "idempotency_key": (
