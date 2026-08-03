@@ -4,8 +4,14 @@ Tests for src.services.relay.sweep (RELAY-v2.2 sub-tasks R1 + R3).
 R3 addition under test: run_sweep() calls sync_unsubscribes() before
 execute_batch(), and a failure in that sync must never stop already-approved
 items from being sent.
+
+PR #195 review addition: run_sweep() must refuse to execute a batch for a
+deactivated venture (ventures.is_active = false) rather than dispatch its
+approved items under whatever config it resolves to.
 """
 from __future__ import annotations
+
+from types import SimpleNamespace
 
 from src.services.relay import sweep
 
@@ -54,3 +60,51 @@ def test_sweep_syncs_unsubscribes_for_its_own_venture(monkeypatch):
     sweep.run_sweep(venture_key="venture_two")
 
     assert seen == ["venture_two"]
+
+
+def test_sweep_refuses_to_execute_for_a_deactivated_venture(monkeypatch):
+    """PR #195 review: a deactivated venture (is_active=false) must never
+    reach execute_batch, regardless of what its resolved config looks like
+    -- this is the independent second gate on top of venture_config.py
+    resolving a disabled config for it."""
+    monkeypatch.setattr(sweep, "sync_unsubscribes", lambda venture_key=None: 0)
+    monkeypatch.setattr(
+        sweep.queue, "approved_batch",
+        lambda limit=50, venture_key=None: [SimpleNamespace(id=1)],
+    )
+    monkeypatch.setattr(
+        sweep, "get_venture_config",
+        lambda key: SimpleNamespace(is_active=False, venture_key=key),
+    )
+    executed: list = []
+    monkeypatch.setattr(sweep, "execute_batch", lambda *a, **k: executed.append((a, k)))
+
+    result = sweep.run_sweep(venture_key="venture_deactivated")
+
+    assert executed == []  # never reached
+    assert result.halted is True
+    assert result.sent == 0
+
+
+def test_sweep_still_executes_for_an_active_venture(monkeypatch):
+    """Sanity check for the guard above: an active venture's batch must
+    still reach execute_batch unchanged."""
+    monkeypatch.setattr(sweep, "sync_unsubscribes", lambda venture_key=None: 0)
+    monkeypatch.setattr(
+        sweep.queue, "approved_batch",
+        lambda limit=50, venture_key=None: [SimpleNamespace(id=1)],
+    )
+    monkeypatch.setattr(
+        sweep, "get_venture_config",
+        lambda key: SimpleNamespace(is_active=True, venture_key=key),
+    )
+    executed: list = []
+    monkeypatch.setattr(
+        sweep, "execute_batch",
+        lambda items, *, batch_id, venture=None: executed.append(items) or sweep.BatchResult(sent=1),
+    )
+
+    result = sweep.run_sweep(venture_key="venture_active")
+
+    assert len(executed) == 1
+    assert result.sent == 1

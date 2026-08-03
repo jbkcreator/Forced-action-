@@ -119,10 +119,16 @@ mapping UI before a loader will use it.
 
 ## Deactivating a venture
 
-Set `ventures.is_active = false`. The resolver then falls back to env settings
-for that key rather than continuing to honour the row, which stops the venture
-governing sends. Its `counties` rows are untouched — deactivate those
-separately (`DELETE /api/admin/counties/{id}`) if the scrapers should stop too.
+Set `ventures.is_active = false`. The resolver treats this as a distinct case
+from a missing row: it resolves to a disabled config (no Instantly campaign or
+sender, `is_active=False`) rather than falling back to env settings — the env
+fallback is venture #1's real Instantly identity, and a deactivated venture
+must stop, not silently borrow venture #1's outbound identity. `run_sweep()`
+also refuses to execute a batch for a deactivated venture as a second,
+independent gate, so any items still `approved` at deactivation time are left
+untouched rather than dispatched. Its `counties` rows are untouched —
+deactivate those separately (`DELETE /api/admin/counties/{id}`) if the
+scrapers should stop too.
 
 ## Assigning an existing county to a venture
 

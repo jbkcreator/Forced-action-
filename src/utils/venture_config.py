@@ -13,12 +13,18 @@ it plays the same role one level up: county_config resolves a county, this
 resolves the venture that county belongs to.
 
 WHY THE ENV FALLBACK. Every field here existed before CL3 as a single-valued
-env global in config/settings.py. When no `ventures` row matches (an
-environment where the CL3 migration has not run yet, or a venture_key with
-no row), get_venture_config() synthesizes the config from those same
-settings rather than raising. That is what makes CL3 a no-op on day one: the
-Relay send path reads a VentureConfig whose values are byte-identical to the
-settings it read directly before.
+env global in config/settings.py. When NO `ventures` row exists for a key at
+all (an environment where the CL3 migration has not run yet, or a genuinely
+unknown venture_key), get_venture_config() synthesizes the config from those
+same settings rather than raising. That is what makes CL3 a no-op on day one:
+the Relay send path reads a VentureConfig whose values are byte-identical to
+the settings it read directly before.
+
+A row that EXISTS but has is_active=false is a different case, deliberately
+NOT routed through the env fallback (PR #195 review): that venture was
+provisioned and is being intentionally stopped, so it resolves to a disabled
+config with no Instantly campaign/sender instead of inheriting venture #1's
+env-backed identity — see _disabled_config().
 
 Attribute names are chosen to match what src/services/relay/guards.py and
 engine.py already read off the settings object (relay_send_window_start,
@@ -75,10 +81,15 @@ class VentureConfig:
     relay_send_window_timezone: str
     relay_daily_ceiling: int
     kill_switch_feature: str
+    is_active: bool = True
 
 
 def _from_settings(venture_key: str) -> VentureConfig:
-    """Build a VentureConfig from config/settings.py — the pre-CL3 values."""
+    """Build a VentureConfig from config/settings.py — the pre-CL3 values.
+
+    Only reached when NO `ventures` row exists for venture_key at all (an
+    unmigrated environment, or a genuinely unknown key) — never for a row
+    that exists but is deactivated. See _disabled_config() for that case."""
     from config.settings import get_settings
 
     settings = get_settings()
@@ -100,6 +111,7 @@ def _from_settings(venture_key: str) -> VentureConfig:
         relay_send_window_timezone=settings.relay_send_window_timezone,
         relay_daily_ceiling=settings.relay_daily_ceiling,
         kill_switch_feature=DEFAULT_KILL_SWITCH_FEATURE,
+        is_active=True,
     )
 
 
@@ -148,6 +160,43 @@ def _from_row(row) -> VentureConfig:
         relay_send_window_timezone=row.relay_send_window_timezone,
         relay_daily_ceiling=row.relay_daily_ceiling,
         kill_switch_feature=row.kill_switch_feature,
+        is_active=True,
+    )
+
+
+def _disabled_config(row) -> VentureConfig:
+    """Build a VentureConfig for a venture whose row exists but has
+    is_active=false.
+
+    Deactivating a venture must stop it, full stop — not hand its sends to
+    a different one. relay_instantly_campaign_id/relay_instantly_sender_email
+    are forced to None/"" (never resolved from the row OR from settings, even
+    for the default venture) so send_email() fails closed on this venture's
+    own queued items. Geography/branding fields are left as the row has them
+    since they carry no send-dispatch risk and an operator re-activating the
+    venture later still needs them intact. is_active=False additionally lets
+    run_sweep() refuse the whole batch before even reaching execute_batch —
+    two independent gates rather than relying on the campaign id alone.
+    """
+    return VentureConfig(
+        venture_key=row.venture_key,
+        display_name=row.display_name,
+        brand_name=row.brand_name,
+        postal_address=row.postal_address,
+        state=row.state,
+        bankruptcy_court_code=row.bankruptcy_court_code,
+        default_bankruptcy_division=row.default_bankruptcy_division,
+        template_county_id=row.template_county_id,
+        relay_slack_channel=row.relay_slack_channel or "",
+        relay_approvers=tuple(row.relay_approvers or ()),
+        relay_instantly_campaign_id=None,
+        relay_instantly_sender_email="",
+        relay_send_window_start=row.relay_send_window_start,
+        relay_send_window_end=row.relay_send_window_end,
+        relay_send_window_timezone=row.relay_send_window_timezone,
+        relay_daily_ceiling=row.relay_daily_ceiling,
+        kill_switch_feature=row.kill_switch_feature,
+        is_active=False,
     )
 
 
@@ -157,18 +206,25 @@ _SELECT_VENTURE = """
            relay_slack_channel, relay_approvers, relay_instantly_campaign_id,
            relay_instantly_sender_email, relay_send_window_start,
            relay_send_window_end, relay_send_window_timezone,
-           relay_daily_ceiling, kill_switch_feature
+           relay_daily_ceiling, kill_switch_feature, is_active
     FROM ventures
-    WHERE venture_key = :key AND is_active = true
+    WHERE venture_key = :key
 """
 
 
 def _load_from_db(venture_key: str, session=None) -> VentureConfig:
     """Read one venture, or fall back to settings.
 
-    Never raises: a missing row, an inactive venture, or a `ventures` table
-    that does not exist yet (pre-migration) all resolve to the settings-based
-    config. Relay must keep sending through a config-resolution problem.
+    Never raises: a missing row or a `ventures` table that does not exist
+    yet (pre-migration) resolve to the settings-based config so Relay keeps
+    sending through a config-resolution problem. A row that DOES exist but
+    is deactivated is a different case — that venture was provisioned and is
+    being deliberately stopped, so it must resolve to a disabled config
+    (_disabled_config) rather than being treated as "unconfigured" and
+    inheriting venture #1's settings-backed Instantly identity. Distinguishing
+    these two is exactly the PR #195 review fix: the previous query filtered
+    `WHERE ... AND is_active = true`, so a deactivated row simply never
+    matched and fell into the same branch as a missing row.
     """
     from sqlalchemy import text
 
@@ -189,10 +245,18 @@ def _load_from_db(venture_key: str, session=None) -> VentureConfig:
 
     if row is None:
         logger.info(
-            "[venture_config] no active ventures row for %r — using env settings",
+            "[venture_config] no ventures row for %r — using env settings",
             venture_key,
         )
         return _from_settings(venture_key)
+
+    if not row.is_active:
+        logger.warning(
+            "[venture_config] venture %r is deactivated — resolving to a "
+            "disabled config (no Instantly campaign/sender) instead of "
+            "falling back to env settings", venture_key,
+        )
+        return _disabled_config(row)
 
     return _from_row(row)
 

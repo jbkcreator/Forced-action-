@@ -112,15 +112,48 @@ def test_unknown_venture_falls_back_to_env(fresh_db):
     assert cfg.postal_address == settings.company_postal_address
 
 
-def test_inactive_venture_falls_back_to_env(fresh_db):
-    """A deactivated venture must not keep governing sends."""
+def test_inactive_venture_resolves_to_a_disabled_config(fresh_db):
+    """A deactivated venture must not keep governing sends -- and, per the
+    PR #195 review finding, must NOT silently fall back to venture #1's
+    env-backed Instantly identity either (the old bug: is_active=false
+    rows missed _SELECT_VENTURE's `AND is_active = true` filter and were
+    treated exactly like a missing row). Geography/branding are kept from
+    the row -- they carry no send-dispatch risk and an operator
+    re-activating the venture later still needs them intact."""
     key = f"vc_{uuid.uuid4().hex[:8]}"
-    _insert_venture(fresh_db, key, is_active=False)
+    _insert_venture(fresh_db, key, is_active=False, state="TX")
 
     cfg = get_venture_config(key, session=fresh_db)
 
-    assert cfg.state == "FL"  # env fallback, not the row's 'TX'
-    assert cfg.relay_daily_ceiling == get_settings().relay_daily_ceiling
+    assert cfg.is_active is False
+    assert cfg.state == "TX"  # kept from the row, not env-fallback 'FL'
+    assert cfg.relay_instantly_campaign_id is None
+    assert cfg.relay_instantly_sender_email == ""
+
+
+def test_deactivating_the_default_venture_also_clears_its_instantly_identity(fresh_db):
+    """Even venture #1 must stop sending when deactivated -- is_default
+    only controls the MISSING-value fallback in _from_row(); a deactivated
+    row skips _from_row() entirely and never reaches that fallback."""
+    fresh_db.execute(
+        text("UPDATE ventures SET is_active = false WHERE venture_key = :vk"),
+        {"vk": DEFAULT_VENTURE_KEY},
+    )
+
+    cfg = get_venture_config(DEFAULT_VENTURE_KEY, session=fresh_db)
+
+    assert cfg.is_active is False
+    assert cfg.relay_instantly_campaign_id is None
+    assert cfg.relay_instantly_sender_email == ""
+
+
+def test_missing_row_still_resolves_active_via_env_fallback(fresh_db):
+    """A venture_key with NO row at all (unmigrated env, unknown key) is a
+    different case from a deactivated row -- it must keep the pre-CL3
+    env-fallback behavior, is_active=True included."""
+    cfg = get_venture_config(f"missing_{uuid.uuid4().hex[:8]}", session=fresh_db)
+
+    assert cfg.is_active is True
 
 
 def test_null_row_columns_fall_back_to_env_per_field(fresh_db):

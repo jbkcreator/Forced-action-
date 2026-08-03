@@ -193,6 +193,66 @@ def test_sweep_defaults_to_venture_one(monkeypatch):
     assert captured["venture_key"] == DEFAULT_VENTURE_KEY
 
 
+def test_deactivated_venture_never_sends_its_approved_email_item(fresh_db, monkeypatch):
+    """PR #195 review: deactivating a venture (ventures.is_active = false)
+    must not route its already-approved email items through ANY Instantly
+    campaign -- not its own (it's supposed to be off) and not venture #1's
+    (the old bug: an inactive row missed _SELECT_VENTURE's
+    `AND is_active = true` filter, so it fell through to the same branch as
+    a missing row and inherited venture #1's env-backed campaign/sender).
+
+    Full path exercised end to end: a real committed venture + queue row,
+    through the real run_sweep()/execute_batch()/send_email() chain, with
+    only the actual Instantly HTTP call mocked.
+    """
+    suffix = uuid.uuid4().hex[:8]
+    venture_key = f"vs_dead_{suffix}"
+    idempotency_key = f"vs-dead-key-{suffix}"
+    try:
+        fresh_db.execute(text("""
+            INSERT INTO ventures (
+                venture_key, display_name, brand_name, relay_instantly_campaign_id,
+                relay_instantly_sender_email, is_active
+            )
+            VALUES (:vk, 'Dead Venture', 'Dead Venture', 'camp-dead-venture',
+                    'dead@venture.example', false)
+        """), {"vk": venture_key})
+        fresh_db.execute(text("""
+            INSERT INTO relay_approval_queue (
+                idempotency_key, channel, recipient, payload, status, venture_key
+            )
+            VALUES (:ik, 'email', 'prospect@example.com',
+                    '{"subject": "Hi", "body": "hello"}'::jsonb, 'approved', :vk)
+        """), {"ik": idempotency_key, "vk": venture_key})
+        fresh_db.commit()
+        venture_config.invalidate_cache(venture_key)
+
+        add_leads_calls: list = []
+        monkeypatch.setattr(
+            "src.services.instantly_service.add_leads",
+            lambda *a, **k: add_leads_calls.append(a) or {"leads_created": 1, "leads_skipped": 0},
+        )
+
+        result = sweep.run_sweep(venture_key=venture_key)
+
+        assert add_leads_calls == []  # no Instantly send was attempted
+        assert result.halted is True
+
+        status = fresh_db.execute(
+            text("SELECT status FROM relay_approval_queue WHERE idempotency_key = :ik"),
+            {"ik": idempotency_key},
+        ).scalar_one()
+        assert status == "approved"  # left completely untouched
+    finally:
+        fresh_db.execute(
+            text("DELETE FROM relay_approval_queue WHERE idempotency_key = :ik"),
+            {"ik": idempotency_key},
+        )
+        fresh_db.execute(text("DELETE FROM ventures WHERE venture_key = :vk"), {"vk": venture_key})
+        fresh_db.commit()
+        venture_config.invalidate_cache(venture_key)
+
+
 # ---------------------------------------------------------------------------
 # Engine: kill switch key comes from the venture
 # ---------------------------------------------------------------------------

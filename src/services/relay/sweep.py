@@ -45,6 +45,13 @@ def run_sweep(*, limit: int = 50, venture_key: str = DEFAULT_VENTURE_KEY) -> Bat
     resolved config, because the send window, daily ceiling and kill-switch
     key all differ per venture. A second venture means a second cron line
     (`--sweep --venture <key>`), not a wider batch.
+
+    PR #195 review: a deactivated venture (ventures.is_active = false) must
+    refuse the whole batch rather than execute it. This is the second,
+    independent gate — src.utils.venture_config already resolves a
+    deactivated venture to a config with no Instantly campaign/sender, but
+    checking is_active here too means an approved item is never even handed
+    to execute_batch for a venture that is supposed to be off.
     """
     try:
         n = sync_unsubscribes(venture_key=venture_key)
@@ -59,6 +66,17 @@ def run_sweep(*, limit: int = 50, venture_key: str = DEFAULT_VENTURE_KEY) -> Bat
         return BatchResult()
 
     venture = get_venture_config(venture_key)
+    if not venture.is_active:
+        logger.warning(
+            "[Relay] sweep: venture %s is deactivated — refusing to execute "
+            "%d approved item(s); left untouched for a human to resolve "
+            "(reactivate the venture or cancel the items)",
+            venture_key, len(items),
+        )
+        result = BatchResult()
+        result.halted = True
+        return result
+
     batch_id = f"batch-{uuid.uuid4().hex[:12]}"
     logger.info(
         "[Relay] sweep: executing %d approved item(s) for venture %s as %s",
