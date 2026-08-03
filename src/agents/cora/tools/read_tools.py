@@ -96,20 +96,15 @@ def get_recent_auction_fast_follow_whales(
     return [dict(row) for row in rows]
 
 
-def get_contact_channel(session: Session, buyer_entity_id: int) -> Dict[str, Optional[Any]]:
+def get_contact_channel(session: Session, buyer_entity_id: int) -> Dict[str, Optional[str]]:
     """
     Best-effort contact info for a buyer entity, via its linked owner rows.
-    Returns {"email": ..., "phone": ..., "contact_confidence": ...} — any may
-    be None. contact_confidence (QUALITY-v2.2 Q3 fix) is
-    buyer_entity_links.match_confidence for whichever linked owner row was
-    picked (already used to ORDER BY here, but previously dropped before
-    reaching the caller — a real gap: the Hunter->Cora contract requires
-    contact-channel confidence and this was the one place it was silently lost).
+    Returns {"email": ..., "phone": ...} — either may be None.
     """
     row = session.execute(
         text(
             """
-            SELECT o.email_1, o.phone_1, bel.match_confidence AS contact_confidence
+            SELECT o.email_1, o.phone_1
             FROM buyer_entity_links bel
             JOIN owners o ON bel.source_table = 'owners' AND bel.source_id = o.id
             WHERE bel.buyer_entity_id = :buyer_entity_id
@@ -120,9 +115,5 @@ def get_contact_channel(session: Session, buyer_entity_id: int) -> Dict[str, Opt
         {"buyer_entity_id": buyer_entity_id},
     ).mappings().first()
     if not row:
-        return {"email": None, "phone": None, "contact_confidence": None}
-    return {
-        "email": row.get("email_1"),
-        "phone": row.get("phone_1"),
-        "contact_confidence": row.get("contact_confidence"),
-    }
+        return {"email": None, "phone": None}
+    return {"email": row.get("email_1"), "phone": row.get("phone_1")}

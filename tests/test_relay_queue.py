@@ -21,29 +21,21 @@ from src.services.relay.queue import QueueItem
 
 
 def test_enqueue_signature_matches_documented_contract():
-    """RELAY-v2.2 sub-task R4 / QUALITY-v2.2 Q3: enqueue()'s parameter list
-    IS the batch-intake contract (see the module docstring). If a future
-    change adds, removes, or renames a parameter, this must fail loudly
-    rather than let the contract doc silently drift from the real function.
-
-    skip_contract_validation was added by QUALITY-v2.2 Q3 -- an explicit,
-    default-off escape hatch for R1's --seed CLI only (see queue.py's
-    enqueue() docstring)."""
+    """RELAY-v2.2 sub-task R4: enqueue()'s parameter list IS the
+    batch-intake contract (see the module docstring). If a future change
+    adds, removes, or renames a parameter, this must fail loudly rather
+    than let the contract doc silently drift from the real function."""
     sig = inspect.signature(relay_queue.enqueue)
     params = sig.parameters
 
-    assert set(params) == {
-        "idempotency_key", "channel", "recipient", "payload", "thread_id",
-        "skip_contract_validation",
-    }
+    assert set(params) == {"idempotency_key", "channel", "recipient", "payload", "thread_id"}
 
     required = {name for name, p in params.items() if p.default is inspect.Parameter.empty}
     assert required == {"idempotency_key", "channel", "recipient", "payload"}
     assert params["thread_id"].default is None
-    assert params["skip_contract_validation"].default is False
 
     # All keyword-only (enqueue is called with kwargs everywhere -- __main__.py,
-    # this contract doc, and Cora/THROUGH's call sites all rely on that).
+    # this contract doc, and Cora's future call site all rely on that).
     assert all(p.kind == inspect.Parameter.KEYWORD_ONLY for p in params.values())
 
 
