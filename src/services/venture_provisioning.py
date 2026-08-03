@@ -81,9 +81,18 @@ def clone_county_sources(
     in the returned `missing_urls` so the caller can report them rather than
     let a scraper quietly hit the wrong county's portal.
 
-    Returns {"cloned": n, "skipped": n, "missing_urls": [signal_type, ...]}.
-    `skipped` counts source rows the destination already had (ON CONFLICT),
-    which is what makes a re-run a no-op.
+    `missing_signals` is a separate list: REQUIRED_SIGNAL_TYPES the template
+    county has no active source row for at all, so nothing is cloned for
+    them regardless of `url_overrides`. Computing this only from
+    `template_rows` (as `missing_urls` does) would silently under-report —
+    a template missing an entire signal_type produces no row to loop over,
+    so a partially-configured template county would otherwise come back
+    with `missing_urls: []` and read as fully healthy.
+
+    Returns {"cloned": n, "skipped": n, "missing_urls": [signal_type, ...],
+    "missing_signals": [signal_type, ...]}. `skipped` counts source rows the
+    destination already had (ON CONFLICT), which is what makes a re-run a
+    no-op.
     """
     overrides = url_overrides or {}
 
@@ -97,12 +106,24 @@ def clone_county_sources(
         {"from_county": from_county_id},
     ).mappings().all()
 
+    template_signal_types = {row["signal_type"] for row in template_rows}
+    missing_signals = sorted(set(REQUIRED_SIGNAL_TYPES) - template_signal_types)
+    if missing_signals:
+        logger.warning(
+            "[venture] template county %s has no active source for required "
+            "signal type(s) %s — county %s will have no source for them either",
+            from_county_id, missing_signals, to_county_id,
+        )
+
     if not template_rows:
         logger.warning(
             "[venture] template county %s has no active sources — nothing to clone to %s",
             from_county_id, to_county_id,
         )
-        return {"cloned": 0, "skipped": 0, "missing_urls": list(REQUIRED_SIGNAL_TYPES)}
+        return {
+            "cloned": 0, "skipped": 0, "missing_urls": [],
+            "missing_signals": missing_signals,
+        }
 
     missing_urls = [
         row["signal_type"] for row in template_rows
@@ -166,7 +187,10 @@ def clone_county_sources(
         "%d without a URL override)",
         cloned, from_county_id, to_county_id, skipped, len(missing_urls),
     )
-    return {"cloned": cloned, "skipped": skipped, "missing_urls": missing_urls}
+    return {
+        "cloned": cloned, "skipped": skipped, "missing_urls": missing_urls,
+        "missing_signals": missing_signals,
+    }
 
 
 def clone_column_mappings(
@@ -354,6 +378,26 @@ def provision_venture(
     report: dict[str, Any] = {"venture_key": venture_key, "counties": {}}
 
     for county in counties or []:
+        county_id = county["county_id"]
+
+        # _INSERT_COUNTY is ON CONFLICT (county_id) DO NOTHING, which makes a
+        # re-run for THIS venture idempotent — but says nothing about a
+        # county_id that already belongs to a DIFFERENT venture. Without this
+        # check an operator's copy-paste mistake would leave that county
+        # attached to its original owner while still falling through to
+        # clone_county_sources() below and mixing this venture's template
+        # sources into it, corrupting the other venture's scraper config.
+        existing_owner = session.execute(
+            text("SELECT venture_key FROM counties WHERE county_id = :cid"),
+            {"cid": county_id},
+        ).scalar()
+        if existing_owner is not None and existing_owner != venture_key:
+            raise ValueError(
+                f"county_id {county_id!r} already belongs to venture "
+                f"{existing_owner!r} — refusing to attach it to {venture_key!r} "
+                f"or clone sources into it"
+            )
+
         county_params = {
             key: county.get(key, default)
             for key, default in COUNTY_TEMPLATE.items()
@@ -364,7 +408,6 @@ def provision_venture(
             county_params[json_field] = json.dumps(county_params.get(json_field) or [])
 
         inserted = session.execute(text(_INSERT_COUNTY), county_params).rowcount
-        county_id = county["county_id"]
         county_report: dict[str, Any] = {"county_created": bool(inserted)}
 
         if template_county_id:

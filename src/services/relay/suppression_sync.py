@@ -14,6 +14,13 @@ seen by that sync. suppress_contact() cascades email_opt_outs -> sms_opt_outs
 (ADR 0028), which is what satisfies the client's Q1 cross-contamination
 requirement: a Relay opt-out also stops the Lifecycle runtime.
 
+CLONE-v2.2 / CL3: each venture sends through its own Instantly campaign, so
+the unsubscribe pull is scoped to the calling venture's campaign id
+(src.utils.venture_config), not the fleet-wide settings value. Reading only
+settings.relay_instantly_campaign_id here would mean venture B's
+unsubscribes/bounces never reach email_opt_outs, and the execution guard has
+nothing local to suppress them with before venture B's next sweep sends.
+
 ponytail: re-reads every lead in the campaign each sweep. At the 20/day
 ceiling the campaign holds ~600 leads/month = ~6 pages -- fine. Switch to an
 Instantly unsubscribe webhook, or track a last-synced cursor, if this ever
@@ -23,24 +30,24 @@ from __future__ import annotations
 
 import logging
 
-from config.settings import get_settings
+from config.venture_template import DEFAULT_VENTURE_KEY
 from src.core.database import get_db_context
 from src.services import instantly_service as instantly
 from src.services.instantly_service import map_lead_status
 from src.services.email_suppression import suppress_contact
+from src.utils.venture_config import get_venture_config
 
 logger = logging.getLogger(__name__)
 
 _SUPPRESS_ON_STATUS = {"unsubscribed", "bounced"}
 
 
-def sync_unsubscribes() -> int:
-    """Pull unsubscribed/bounced leads from the Relay passthrough campaign
-    into email_opt_outs (cascading to sms_opt_outs). Returns the number of
-    leads suppressed this run. No-op (returns 0) if the email channel isn't
-    configured yet."""
-    settings = get_settings()
-    campaign_id = settings.relay_instantly_campaign_id
+def sync_unsubscribes(venture_key: str = DEFAULT_VENTURE_KEY) -> int:
+    """Pull unsubscribed/bounced leads from `venture_key`'s Relay passthrough
+    campaign into email_opt_outs (cascading to sms_opt_outs). Returns the
+    number of leads suppressed this run. No-op (returns 0) if that venture's
+    email channel isn't configured yet."""
+    campaign_id = get_venture_config(venture_key).relay_instantly_campaign_id
     if not campaign_id:
         return 0
 

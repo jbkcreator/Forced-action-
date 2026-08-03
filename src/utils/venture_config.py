@@ -106,11 +106,24 @@ def _from_settings(venture_key: str) -> VentureConfig:
 def _from_row(row) -> VentureConfig:
     """Build a VentureConfig from a `ventures` row, falling back to settings
     for any nullable column the row leaves unset — a venture that has not
-    provisioned its own Slack channel or Instantly campaign yet still
-    resolves to a usable config instead of None."""
+    provisioned its own Slack channel yet still resolves to a usable config
+    instead of None.
+
+    The Instantly campaign id and sender email are the exception: those two
+    fields are this venture's outbound identity, and RELAY_INSTANTLY_* in
+    settings is venture #1's identity specifically (the CL3 migration seeds
+    it from that same env var). Falling back to it for any OTHER venture
+    would silently route that venture's email through venture #1's campaign
+    and from-address — cross-venture sends and false duplicate-contact
+    failures (Instantly's dedup guard is campaign-scoped). Only the default
+    venture may resolve those two fields from settings; every other venture
+    with no row value stays unset so send_email()/cmd_setup_email_channel()
+    fail closed instead.
+    """
     from config.settings import get_settings
 
     settings = get_settings()
+    is_default_venture = row.venture_key == DEFAULT_VENTURE_KEY
     return VentureConfig(
         venture_key=row.venture_key,
         display_name=row.display_name,
@@ -123,10 +136,12 @@ def _from_row(row) -> VentureConfig:
         relay_slack_channel=row.relay_slack_channel or settings.relay_slack_channel,
         relay_approvers=tuple(row.relay_approvers or settings.relay_approvers or ()),
         relay_instantly_campaign_id=(
-            row.relay_instantly_campaign_id or settings.relay_instantly_campaign_id
+            row.relay_instantly_campaign_id
+            or (settings.relay_instantly_campaign_id if is_default_venture else None)
         ),
         relay_instantly_sender_email=(
-            row.relay_instantly_sender_email or settings.relay_instantly_sender_email
+            row.relay_instantly_sender_email
+            or (settings.relay_instantly_sender_email if is_default_venture else "")
         ),
         relay_send_window_start=row.relay_send_window_start,
         relay_send_window_end=row.relay_send_window_end,

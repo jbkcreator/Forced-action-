@@ -13,7 +13,7 @@ import uuid
 import pytest
 from sqlalchemy import text
 
-from config.venture_template import COUNTY_TEMPLATE, new_venture_config
+from config.venture_template import COUNTY_TEMPLATE, REQUIRED_SIGNAL_TYPES, new_venture_config
 from src.services.venture_provisioning import (
     clone_column_mappings,
     clone_county_sources,
@@ -189,8 +189,31 @@ def test_clone_from_a_county_with_no_sources_reports_everything_missing(fresh_db
     result = clone_county_sources(fresh_db, from_county_id=empty, to_county_id=dest)
 
     assert result["cloned"] == 0
-    assert result["missing_urls"]  # every required signal is unfulfilled
+    assert result["missing_urls"] == []  # nothing to clone, so no override gap either
+    assert result["missing_signals"] == sorted(REQUIRED_SIGNAL_TYPES)
     assert _sources(fresh_db, dest) == {}
+
+
+def test_clone_reports_required_signal_types_missing_from_the_template(fresh_db, template_county):
+    """template_county only has active rows for 'foreclosures' and 'permits'.
+    A partially-configured template must surface every REQUIRED_SIGNAL_TYPES
+    entry it never had a row for at all -- missing_urls alone (which only
+    inspects the rows that DO exist) would silently miss these and report
+    missing_urls: [] even though whole signal pipelines were never cloned."""
+    dest = f"dest_{template_county['suffix']}"
+    _make_county(fresh_db, dest, template_county["venture_key"])
+
+    result = clone_county_sources(
+        fresh_db,
+        from_county_id=template_county["county_id"],
+        to_county_id=dest,
+        url_overrides={"foreclosures": "https://dest.example/fc", "permits": "https://dest.example/permits"},
+    )
+
+    expected_missing = sorted(set(REQUIRED_SIGNAL_TYPES) - {"foreclosures", "permits"})
+    assert result["missing_urls"] == []  # both existing sources got their override
+    assert result["missing_signals"] == expected_missing
+    assert expected_missing  # sanity: the template really is only partial
 
 
 def test_clone_column_mappings_lands_unapproved(fresh_db, template_county):
@@ -362,6 +385,54 @@ def test_provision_venture_rejects_duplicate_county_ids(fresh_db):
     county = {"county_id": "dupco", "display_name": "Dup County"}
     with pytest.raises(ValueError, match="duplicate county_id"):
         provision_venture(fresh_db, venture_cfg=cfg, counties=[county, dict(county)])
+
+
+def test_provision_venture_refuses_a_county_owned_by_another_venture(fresh_db, template_county):
+    """ON CONFLICT (county_id) DO NOTHING makes a re-run for the SAME venture
+    idempotent, but silently no-ops the county insert for an operator's
+    copy-paste mistake too -- without this guard, provisioning would then
+    fall through to clone_county_sources() and mix this venture's template
+    sources into a county that still belongs to a different venture."""
+    other_venture_key = f"vp_other_{template_county['suffix']}"
+    stolen_county = f"stolen_{template_county['suffix']}"
+    fresh_db.execute(text("""
+        INSERT INTO ventures (venture_key, display_name, brand_name)
+        VALUES (:vk, 'Other Venture', 'Other Venture')
+    """), {"vk": other_venture_key})
+    _make_county(fresh_db, stolen_county, other_venture_key)
+
+    cfg = new_venture_config(
+        venture_key=f"vp_{template_county['suffix']}",
+        display_name="V2", brand_name="V2",
+        template_county_id=template_county["county_id"],
+    )
+
+    with pytest.raises(ValueError, match="already belongs to venture"):
+        provision_venture(
+            fresh_db, venture_cfg=cfg,
+            counties=[{"county_id": stolen_county, "display_name": "Stolen County"}],
+        )
+
+    # Nothing was cloned into the other venture's county.
+    assert _sources(fresh_db, stolen_county) == {}
+
+
+def test_provision_venture_same_venture_rerun_on_existing_county_is_unaffected(fresh_db, template_county):
+    """The new ownership check must not break the existing idempotent-rerun
+    guarantee for the venture that actually owns the county."""
+    dest = f"dest_{template_county['suffix']}"
+    cfg = new_venture_config(
+        venture_key=template_county["venture_key"], display_name="V1", brand_name="V1",
+        template_county_id=template_county["county_id"],
+    )
+    counties = [{"county_id": dest, "display_name": "Dest County"}]
+
+    first = provision_venture(fresh_db, venture_cfg=cfg, counties=counties)
+    second = provision_venture(fresh_db, venture_cfg=cfg, counties=counties)
+
+    assert first["counties"][dest]["county_created"] is True
+    assert second["counties"][dest]["county_created"] is False
+    assert second["counties"][dest]["cloned"] == 0
 
 
 def test_provision_venture_without_a_template_county_says_so(fresh_db):

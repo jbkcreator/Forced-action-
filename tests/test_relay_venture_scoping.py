@@ -162,7 +162,7 @@ def test_sweep_passes_only_that_ventures_items_and_config(monkeypatch, two_ventu
     first, second = two_ventures["keys"]
     captured: dict = {}
 
-    monkeypatch.setattr(sweep, "sync_unsubscribes", lambda: 0)
+    monkeypatch.setattr(sweep, "sync_unsubscribes", lambda venture_key=None: 0)
     monkeypatch.setattr(
         sweep, "execute_batch",
         lambda items, *, batch_id, venture=None: captured.update(
@@ -182,7 +182,7 @@ def test_sweep_passes_only_that_ventures_items_and_config(monkeypatch, two_ventu
 
 def test_sweep_defaults_to_venture_one(monkeypatch):
     captured: dict = {}
-    monkeypatch.setattr(sweep, "sync_unsubscribes", lambda: 0)
+    monkeypatch.setattr(sweep, "sync_unsubscribes", lambda venture_key=None: 0)
     monkeypatch.setattr(
         sweep.queue, "approved_batch",
         lambda limit=50, venture_key=None: captured.update(venture_key=venture_key) or [],

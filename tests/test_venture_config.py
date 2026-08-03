@@ -14,6 +14,7 @@ autouse-flushes it before and after each one.
 from __future__ import annotations
 
 import uuid
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import text
@@ -123,8 +124,8 @@ def test_inactive_venture_falls_back_to_env(fresh_db):
 
 
 def test_null_row_columns_fall_back_to_env_per_field(fresh_db):
-    """A venture that has not provisioned its Slack channel or Instantly
-    campaign yet still resolves to a usable config."""
+    """A venture that has not provisioned its Slack channel yet still
+    resolves to a usable config from settings."""
     key = f"vc_{uuid.uuid4().hex[:8]}"
     settings = get_settings()
     _insert_venture(
@@ -139,9 +140,67 @@ def test_null_row_columns_fall_back_to_env_per_field(fresh_db):
 
     assert cfg.state == "TX"  # the row still wins where it has values
     assert cfg.relay_slack_channel == settings.relay_slack_channel
+    assert cfg.postal_address == settings.company_postal_address
+
+
+def test_non_default_venture_never_falls_back_to_env_instantly_identity(monkeypatch, fresh_db):
+    """A non-default venture with no Instantly campaign/sender configured
+    must NOT inherit venture #1's RELAY_INSTANTLY_* env values — those are
+    venture #1's outbound identity specifically. Sharing them would route
+    this venture's email through venture #1's campaign (cross-venture sends,
+    false duplicate-contact failures) instead of failing closed.
+
+    Settings is monkeypatched with definitely-truthy env values (rather than
+    relying on whatever the real .env happens to set) so this assertion is
+    deterministic regardless of local dev configuration."""
+    import config.settings as settings_module
+
+    fake_settings = SimpleNamespace(
+        relay_instantly_campaign_id="camp-venture-one-env",
+        relay_instantly_sender_email="one@venture-one.example",
+        company_postal_address="1 Env St",
+        relay_slack_channel="#env-approvals",
+        relay_approvers=["U_ENV"],
+        relay_send_window_start=8,
+        relay_send_window_end=20,
+        relay_send_window_timezone="America/New_York",
+        relay_daily_ceiling=99,
+    )
+    monkeypatch.setattr(settings_module, "get_settings", lambda: fake_settings)
+
+    key = f"vc_{uuid.uuid4().hex[:8]}"
+    _insert_venture(
+        fresh_db, key,
+        relay_instantly_campaign_id=None,
+        relay_instantly_sender_email=None,
+    )
+
+    cfg = get_venture_config(key, session=fresh_db)
+
+    assert cfg.relay_instantly_campaign_id is None
+    assert cfg.relay_instantly_sender_email == ""
+
+
+def test_default_venture_still_falls_back_to_env_instantly_identity(fresh_db):
+    """Venture #1 keeps the pre-CL3 env-fallback behavior — this is what
+    makes CL3 a no-op on day one for the existing venture. Updates the
+    migration-seeded venture #1 row in place (it already exists) rather than
+    inserting a second one, which would violate the venture_key uniqueness
+    constraint."""
+    settings = get_settings()
+    fresh_db.execute(
+        text("""
+            UPDATE ventures
+            SET relay_instantly_campaign_id = NULL, relay_instantly_sender_email = NULL
+            WHERE venture_key = :vk
+        """),
+        {"vk": DEFAULT_VENTURE_KEY},
+    )
+
+    cfg = get_venture_config(DEFAULT_VENTURE_KEY, session=fresh_db)
+
     assert cfg.relay_instantly_campaign_id == settings.relay_instantly_campaign_id
     assert cfg.relay_instantly_sender_email == settings.relay_instantly_sender_email
-    assert cfg.postal_address == settings.company_postal_address
 
 
 def test_seeded_venture_one_matches_env(fresh_db):

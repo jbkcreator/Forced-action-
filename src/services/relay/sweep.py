@@ -33,9 +33,12 @@ def run_sweep(*, limit: int = 50, venture_key: str = DEFAULT_VENTURE_KEY) -> Bat
 
     Syncs Relay unsubscribes from Instantly first (RELAY-v2.2 R3, client
     Q1) so a fresh opt-out is already in email_opt_outs before this same
-    tick's guards.evaluate() suppression recheck runs. A dead Instantly API
-    must not stop already-approved sends, so failures here are logged and
-    swallowed rather than propagated.
+    tick's guards.evaluate() suppression recheck runs. Scoped to this same
+    venture_key (CLONE-v2.2 / CL3) since each venture sends through its own
+    Instantly campaign — syncing the wrong one would leave a venture's real
+    unsubscribes unsuppressed. A dead Instantly API must not stop
+    already-approved sends, so failures here are logged and swallowed rather
+    than propagated.
 
     One sweep run covers exactly one venture (CLONE-v2.2 / CL3): the batch
     is filtered to that venture's rows and executed under that venture's
@@ -44,7 +47,7 @@ def run_sweep(*, limit: int = 50, venture_key: str = DEFAULT_VENTURE_KEY) -> Bat
     (`--sweep --venture <key>`), not a wider batch.
     """
     try:
-        n = sync_unsubscribes()
+        n = sync_unsubscribes(venture_key=venture_key)
         if n:
             logger.info("[Relay] sweep: synced %d new suppression(s) from Instantly", n)
     except Exception:
