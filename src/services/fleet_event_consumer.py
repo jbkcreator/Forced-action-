@@ -85,6 +85,8 @@ def poll_and_dispatch_fleet(
     """
     results = {"processed": 0, "skipped": 0, "failed": 0, "permanently_failed": 0}
 
+    # One event per transaction: re-query with LIMIT 1 FOR UPDATE SKIP LOCKED each iteration
+    # so the lock is released after each commit and concurrent sweeps can never claim the same row.
     _POLL_SQL = sa_text("""
         SELECT e.id AS event_id, e.event_type, e.priority, e.source_component,
                e.subscriber_id, e.opportunity_thread_id, e.payload, e.occurred_at
