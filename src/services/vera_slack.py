@@ -49,11 +49,15 @@ def post_vera_report(
     subject: str,
     body: str,
     blocks: Optional[list] = None,
+    fallback_to_email: bool = True,
 ) -> Optional[str]:
     """Post a Vera report to #vera-verification.
 
     Returns the Slack message timestamp on success, "email" when the email
     fallback fired, or None when nothing could be sent. Never raises.
+
+    Pass fallback_to_email=False when the caller has already emailed all
+    recipients — prevents a duplicate alert email when Slack is unconfigured.
     """
     settings = get_settings()
     token = settings.slack_bot_token
@@ -84,6 +88,10 @@ def post_vera_report(
                 )
             except Exception:
                 logger.warning("[vera_slack] Slack post raised — falling back to email", exc_info=True)
+
+    if not fallback_to_email:
+        logger.debug("[vera_slack] Slack unavailable and fallback_to_email=False — skipping alert email")
+        return None
 
     # Email fallback — same path as heartbeat_monitor / lifecycle_slack.
     try:
