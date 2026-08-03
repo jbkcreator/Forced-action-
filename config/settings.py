@@ -585,6 +585,7 @@ class AppSettings(BaseSettings):
 	county_launch_reminder_days: int = Field(default=7, env="COUNTY_LAUNCH_REMINDER_DAYS")
 	slack_bot_token: Optional[SecretStr] = Field(default=None, env="SLACK_BOT_TOKEN")
 	slack_signing_secret: Optional[SecretStr] = Field(default=None, env="SLACK_SIGNING_SECRET")
+	vera_slack_channel: Optional[str] = Field(default=None, env="VERA_SLACK_CHANNEL")
 
 	# Relay approval queue (RELAY-v2.2 sub-task R1). Reuses slack_bot_token /
 	# slack_signing_secret above — no separate Slack app.
