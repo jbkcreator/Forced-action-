@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from pydantic import ValidationError
 
@@ -31,6 +33,18 @@ def test_low_confidence_is_not_citable_but_still_structurally_valid():
     row = {**_BASE_ROW, "confidence_score": 40}
     handoff = validate_handoff(row)
     assert is_handoff_citable(handoff) is False  # gating.UNVERIFIED_FLOOR = 70
+
+
+def test_stale_whale_is_not_citable_even_with_high_confidence():
+    """spec §1.1.8: stale gold is barred. A whale_flagged_at over 90 days
+    old must be rejected regardless of confidence_score -- a previously
+    qualified whale must not stay citable indefinitely just because nothing
+    re-checks its age."""
+    stale_flagged_at = datetime.now(timezone.utc) - timedelta(days=120)
+    row = {**_BASE_ROW, "confidence_score": 95, "whale_flagged_at": stale_flagged_at}
+    handoff = validate_handoff(row)
+    assert handoff.freshness_class == "stale"
+    assert is_handoff_citable(handoff) is False
 
 
 def test_bad_thread_id_format_rejected():

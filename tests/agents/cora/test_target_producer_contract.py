@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from src.agents.cora.tools.read_tools import get_contact_channel
@@ -46,6 +47,33 @@ def test_low_confidence_row_is_rejected_not_published(fresh_db):
     row = fresh_db.execute(
         text("SELECT boundary FROM handoff_rejections WHERE reference_id = :r ORDER BY id DESC LIMIT 1"),
         {"r": "OPP-2026-00050"},
+    ).mappings().first()
+    assert row["boundary"] == "hunter_to_cora"
+
+
+def test_stale_whale_row_is_rejected_not_published(fresh_db):
+    """spec §1.1.8 (stale gold is barred): a whale_flagged_at over 90 days
+    old must never reach queue.publish even with a confidence_score well
+    above UNVERIFIED_FLOOR -- freshness is a publication gate, not just an
+    informational label."""
+    stale_row = _row("OPP-2026-00052", confidence=90)
+    stale_row["whale_flagged_at"] = datetime.now(timezone.utc) - timedelta(days=120)
+
+    with patch("src.agents.cora.ingestion.target_producer.store.has_duplicate_actionable_draft", return_value=False), \
+         patch("src.agents.cora.ingestion.target_producer.get_buyer_entity_by_opportunity_thread_id",
+               return_value={"id": 3, "entity_type": "LLC"}), \
+         patch("src.agents.cora.ingestion.target_producer.get_contact_channel",
+               return_value={"email": None, "phone": "+15551234567", "contact_confidence": 80}), \
+         patch("src.agents.cora.ingestion.target_producer.queue.publish") as mock_publish:
+        produced = _produce_from_rows(fresh_db, "founder_tier_blitz", [stale_row])
+
+    assert produced == []
+    mock_publish.assert_not_called()
+
+    from sqlalchemy import text
+    row = fresh_db.execute(
+        text("SELECT boundary FROM handoff_rejections WHERE reference_id = :r ORDER BY id DESC LIMIT 1"),
+        {"r": "OPP-2026-00052"},
     ).mappings().first()
     assert row["boundary"] == "hunter_to_cora"
 
