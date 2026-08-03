@@ -92,6 +92,17 @@ OFFER_LINKS: dict[str, OfferLinkConfig] = {
         "calendar_settings_attr": None,
         "requires_existing_subscriber": False,
     },
+    # NOTE: "single_ZIP_pack" removed — single-ZIP is not a distinct offer, it
+    # is core_subscription at Starter (zip_limit=1) resolution (section 5.4).
+    # ZIP quantity / $197 territory_lock upsell live in the revenue ladder, not
+    # the offer catalog. The recommender no longer emits single_ZIP_pack.
+    "concierge_wedge": {
+        "offer": "concierge_wedge",
+        "link_kind": "booking",
+        "stripe_price_env": None,
+        "calendar_settings_attr": "demo_calendly_url",
+        "requires_existing_subscriber": False,
+    },
 }
 
 

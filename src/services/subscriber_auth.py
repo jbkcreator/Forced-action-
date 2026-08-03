@@ -36,7 +36,8 @@ from sqlalchemy import select
 from config.settings import get_settings
 from src.core.database import get_db
 from src.core.models import Subscriber
-from src.services.email import send_email
+from src.services.email import send_alert, send_email
+from src.services.transactional_email_tracking import log_transactional_email_send
 
 logger = logging.getLogger(__name__)
 
@@ -143,15 +144,43 @@ def issue_magic_link(subscriber: Subscriber, db) -> str:
     return raw
 
 
+def issue_magic_link_url_with_retry(subscriber: Subscriber, db, *, context: str) -> Optional[str]:
+    """Issue a magic-link URL, retrying once and alerting ops on repeated failure."""
+    for attempt in (1, 2):
+        try:
+            return magic_link_url(issue_magic_link(subscriber, db))
+        except Exception as exc:
+            logger.warning(
+                "[subscriber-auth] magic-link issuance failed sub=%s context=%s attempt=%s: %s",
+                subscriber.id, context, attempt, exc,
+            )
+    send_alert(
+        subject=f"[FA] Magic-link issuance failed ({context})",
+        body=(
+            f"Subscriber id={subscriber.id} email={subscriber.email}\n"
+            f"Context: {context}\n"
+            "Retry failed twice. The payer may be stuck behind a login wall."
+        ),
+    )
+    return None
+
+
 def magic_link_url(raw_token: str) -> str:
     base = get_settings().app_base_url.rstrip("/")
     return f"{base}/auth/verify?token={raw_token}"
 
 
-def send_magic_link_email(email: str, name: Optional[str], raw_token: str) -> None:
+def send_magic_link_email(
+    email: str,
+    name: Optional[str],
+    raw_token: str,
+    *,
+    db=None,
+    subscriber_id: Optional[int] = None,
+) -> bool:
     verify_url = magic_link_url(raw_token)
     greeting = f"Hi {name}," if name else "Hi,"
-    send_email(
+    sent = send_email(
         to=email,
         subject="Your Forced Action login link",
         body_text=(
@@ -170,7 +199,15 @@ def send_magic_link_email(email: str, name: Optional[str], raw_token: str) -> No
             f"{_MAGIC_LINK_EXPIRE_MINUTES} minutes and can only be used once. "
             f"If you didn't request this, ignore this email.</p>"
         ),
+        tracking={
+            "subscriber_id": subscriber_id,
+            "template_id": "magic_link_email",
+            "channel": "mandrill",
+            "context_snapshot": {"expires_in_minutes": _MAGIC_LINK_EXPIRE_MINUTES},
+        },
+        db=db,
     )
+    return sent
 
 
 # ── FastAPI dependency: gate the feed ───────────────────────────────────────────
@@ -205,11 +242,18 @@ def get_current_subscriber(
 
 # ── Email ────────────────────────────────────────────────────────────────────
 
-def send_subscriber_password_reset_email(email: str, name: Optional[str], raw_token: str) -> None:
+def send_subscriber_password_reset_email(
+    email: str,
+    name: Optional[str],
+    raw_token: str,
+    *,
+    db=None,
+    subscriber_id: Optional[int] = None,
+) -> bool:
     base = get_settings().app_base_url.rstrip("/")
     reset_url = f"{base}/reset-password/{raw_token}"
     greeting = f"Hi {name}," if name else "Hi,"
-    send_email(
+    sent = send_email(
         to=email,
         subject="Reset your Forced Action feed password",
         body_text=(
@@ -226,7 +270,15 @@ def send_subscriber_password_reset_email(email: str, name: Optional[str], raw_to
             f"<p style='color:#888;font-size:12px;'>Link expires in {_RESET_EXPIRE_HOURS} hours. "
             f"If you didn't request this, ignore this email.</p>"
         ),
+        tracking={
+            "subscriber_id": subscriber_id,
+            "template_id": "password_reset_email",
+            "channel": "mandrill",
+            "context_snapshot": {"expires_in_hours": _RESET_EXPIRE_HOURS},
+        },
+        db=db,
     )
+    return sent
 
 
 RESET_EXPIRE_HOURS = _RESET_EXPIRE_HOURS

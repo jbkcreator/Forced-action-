@@ -1,0 +1,26 @@
+[Unit]
+Description=Cora Throughput — batch builder and standing-order compiler
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/Forced-action-
+Environment="PATH=/root/Forced-action-/.venv/bin"
+EnvironmentFile=/root/Forced-action-/.env
+
+ExecStart=/root/Forced-action-/.venv/bin/python -m src.services.cora_throughput --serve
+
+Restart=always
+RestartSec=10
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cora_throughput
+
+[Install]
+WantedBy=multi-user.target

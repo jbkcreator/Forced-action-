@@ -32,7 +32,6 @@ logger = logging.getLogger(__name__)
 _REGULAR_PRICE_ATTR = {
     "starter":   "stripe_price_starter_regular",
     "pro":       "stripe_price_pro_regular",
-    "dominator": "stripe_price_dominator_regular",
 }
 
 _SIX_MONTHS = timedelta(days=183)

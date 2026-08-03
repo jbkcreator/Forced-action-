@@ -59,6 +59,15 @@ def get_or_create_test(
     return test
 
 
+def _deterministic_variant(test: AbTest, key: str) -> Optional[str]:
+    """Pure hash + traffic-cap decision — same key always maps to the same
+    arm (or the same out-of-test None)."""
+    h = int(hashlib.md5(f"{test.test_name}{key}".encode()).hexdigest(), 16) % 100
+    if h >= test.traffic_pct:
+        return None
+    return "a" if h % 2 == 0 else "b"
+
+
 def assign_variant(subscriber_id: int, test_name: str, db: Session) -> Optional[str]:
     test = db.execute(
         select(AbTest).where(AbTest.test_name == test_name, AbTest.status == "active")
@@ -75,12 +84,10 @@ def assign_variant(subscriber_id: int, test_name: str, db: Session) -> Optional[
     if existing:
         return existing.variant
 
-    # Deterministic hash — same subscriber always gets same variant
-    h = int(hashlib.md5(f"{test_name}{subscriber_id}".encode()).hexdigest(), 16) % 100
-    if h >= test.traffic_pct:
+    variant = _deterministic_variant(test, str(subscriber_id))
+    if variant is None:
         return None
 
-    variant = "a" if h % 2 == 0 else "b"
     assignment = AbAssignment(
         test_id=test.id,
         subscriber_id=subscriber_id,
@@ -89,6 +96,16 @@ def assign_variant(subscriber_id: int, test_name: str, db: Session) -> Optional[
     db.add(assignment)
     db.flush()
     return variant
+
+
+# NOTE: cold, pre-customer arm assignment (assign_variant_by_thread) and
+# price-band arm selection (get_price_variant) used to live here, keyed on
+# opportunity_thread_id instead of subscriber_id. They've moved to
+# src/services/agent_lane_experiment_engine.py, targeting
+# AgentLaneExperiment/AgentLaneExperimentAssignment instead of this
+# module's AbTest/AbAssignment — this module is Lifecycle's
+# (post-customer/subscriber) engine; Agent Lane (pre-customer) has its own.
+# See docs/agent-lane-data-access-matrix.md.
 
 
 ATTRIBUTION_ROLLOUT_TEST_NAME = "lifecycle_attribution_v1"
@@ -451,6 +468,72 @@ def holdout_verdict(
     z = (p_var - p_ctrl) / se
     status = "proven" if z > 2.0 else "not_significant"
     return {**base, "status": status, "z_score": round(z, 3)}
+
+
+def get_price_variant(offer: str, ab_test_id: int, opportunity_thread_id: str, db: Session) -> dict:
+    """Return the price arm for a price-band A/B test, for one opportunity thread.
+
+    When PRICE_BAND_TESTING_ENABLED is False (the current default) the control
+    arm price is always returned and no AbAssignment is created — matching
+    price_assignment.assign_price()'s own flag-off behavior. When the flag is
+    True, opportunity_thread_id is deterministically assigned an arm via
+    assign_variant_by_thread() (variant "a" -> control, "b" -> test, matching
+    AbTest's variant_a/variant_b naming), and that arm's price is returned
+    together with the real, persisted AbAssignment id — out-of-test traffic
+    (assign_variant_by_thread returns None) falls back to the unrecorded
+    control price, same as assign_variant()'s existing message-swap tests.
+
+    Returns:
+        {"arm": "control" | "test", "price_cents": int, "ab_assignment_id": int | None}
+
+    Raises ValueError when the test row is missing required price columns or
+    the test is not active.
+    """
+    from src.services.price_assignment import PRICE_BAND_TESTING_ENABLED  # avoid circular at module level
+
+    test = db.execute(
+        select(AbTest).where(AbTest.id == ab_test_id, AbTest.status == "active")
+    ).scalar_one_or_none()
+    if not test:
+        raise ValueError(f"no active AbTest with id={ab_test_id}")
+    if test.offer and test.offer != offer:
+        logger.warning(
+            "get_price_variant: test %s offer mismatch (test.offer=%s, requested=%s)",
+            ab_test_id, test.offer, offer,
+        )
+
+    control_price = test.control_price_cents
+    if control_price is None:
+        raise ValueError(
+            f"AbTest id={ab_test_id} missing control_price_cents — "
+            "populate before calling get_price_variant"
+        )
+
+    if not PRICE_BAND_TESTING_ENABLED:
+        return {"arm": "control", "price_cents": control_price, "ab_assignment_id": None}
+
+    test_price = test.test_price_cents
+    if test_price is None:
+        raise ValueError(
+            f"AbTest id={ab_test_id} missing test_price_cents"
+        )
+
+    arm_variant = assign_variant_by_thread(opportunity_thread_id, test.test_name, db)
+    if arm_variant is None:
+        # Out-of-test traffic (traffic_pct cap) — unrecorded control, same
+        # convention assign_variant() already uses for message-swap tests.
+        return {"arm": "control", "price_cents": control_price, "ab_assignment_id": None}
+
+    assignment = db.execute(
+        select(AbAssignment).where(
+            AbAssignment.test_id == test.id,
+            AbAssignment.opportunity_thread_id == opportunity_thread_id,
+        )
+    ).scalar_one()
+
+    if arm_variant == "b":
+        return {"arm": "test", "price_cents": test_price, "ab_assignment_id": assignment.id}
+    return {"arm": "control", "price_cents": control_price, "ab_assignment_id": assignment.id}
 
 
 def record_outcome(subscriber_id: int, test_name: str, outcome: str, db: Session) -> None:

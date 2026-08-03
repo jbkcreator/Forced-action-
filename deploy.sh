@@ -18,6 +18,8 @@ LIFECYCLE_UNIT_DST="/etc/systemd/system/lifecycle.service"
 # so the old pre-rename unit this step targeted should not exist anymore.
 CORA_UNIT_SRC="$PROJECT_DIR/deploy/systemd/cora.service"
 CORA_UNIT_DST="/etc/systemd/system/cora.service"
+THROUGHPUT_UNIT_SRC="$PROJECT_DIR/deploy/systemd/cora_throughput.service"
+THROUGHPUT_UNIT_DST="/etc/systemd/system/cora_throughput.service"
 
 cd "$PROJECT_DIR"
 
@@ -123,6 +125,17 @@ done
 
 echo "== 5/7 install cron + restart services =="
 bash scripts/cron/install_cron.sh > /dev/null || fail "install_cron.sh"
+
+# Install cora_throughput unit if not already present or changed
+if [ ! -f "$THROUGHPUT_UNIT_SRC" ]; then
+    fail "cora_throughput.service unit file not found at $THROUGHPUT_UNIT_SRC"
+fi
+if ! cmp -s "$THROUGHPUT_UNIT_SRC" "$THROUGHPUT_UNIT_DST" 2>/dev/null; then
+    cp "$THROUGHPUT_UNIT_SRC" "$THROUGHPUT_UNIT_DST" || fail "install cora_throughput.service"
+    systemctl daemon-reload || fail "systemctl daemon-reload (cora_throughput)"
+fi
+systemctl enable cora_throughput || fail "systemctl enable cora_throughput"
+
 systemctl restart fa-api || fail "systemctl restart fa-api"
 systemctl restart lifecycle || fail "systemctl restart lifecycle"
 systemctl restart cora || fail "systemctl restart cora"
@@ -133,6 +146,18 @@ echo "== 6/7 verify lifecycle + cora health =="
 sleep 2
 systemctl is-active --quiet lifecycle || fail "lifecycle service not active after restart"
 systemctl is-active --quiet cora || fail "cora service not active after restart"
+systemctl restart cora_throughput || fail "systemctl restart cora_throughput"
+
+RESTART_TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+echo "== 6/7 verify service health, retire legacy cora unit =="
+sleep 2
+systemctl is-active --quiet lifecycle || fail "lifecycle service not active after restart"
+systemctl is-active --quiet cora_throughput || fail "cora_throughput service not active after restart"
+if systemctl list-unit-files cora.service &>/dev/null; then
+    systemctl stop cora || echo "WARNING: failed to stop legacy cora.service" >&2
+    systemctl disable cora || echo "WARNING: failed to disable legacy cora.service" >&2
+fi
 
 echo "== 7/7 refresh Prometheus/Alertmanager config (if installed) =="
 # Best-effort — only runs on boxes where Prometheus is actually deployed.

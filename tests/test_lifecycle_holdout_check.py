@@ -4,17 +4,37 @@ Task 4.1 — lifecycle_holdout_check scheduled task.
 Iterates active `*_holdout` AbTest rows, calls ab_engine.holdout_verdict,
 and on a 'proven' verdict writes a lifecycle_playbook recommendation (human
 adopts via the existing admin flow — no auto-promote) + a LearningCard.
-Mirrors tests/test_attribution_rollout.py's integration style.
+
+run() opens its OWN database session via get_db_context() (see
+src/tasks/lifecycle_holdout_check.py) — a separate real connection from a
+plain caller's point of view, since a second connection can't see another
+session's uncommitted rows under normal transaction isolation. The
+_use_test_session fixture below patches that call to reuse THIS test's
+fresh_db session instead, so seeding, running, and asserting all happen
+inside one rolled-back nested transaction — no real commits against the
+database, and no manual row-by-row cleanup required.
 """
 
 from __future__ import annotations
 
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 import pytest
 
-from src.core.models import AbAssignment, AbTest, Subscriber
+from src.core.models import AbAssignment, AbTest, LearningCard, LifecyclePlaybook, Subscriber
+
+
+@pytest.fixture(autouse=True)
+def _use_test_session(fresh_db):
+    @contextmanager
+    def _fake_db_context():
+        yield fresh_db
+
+    with patch("src.tasks.lifecycle_holdout_check.get_db_context", _fake_db_context):
+        yield
 
 
 def _seed_subs(db, n: int) -> list[int]:
@@ -66,81 +86,58 @@ def _seed_holdout_test(
             created_at=created_at,
         ))
     db.flush()
-    db.commit()
     return test, sub_ids
-
-
-def _cleanup(db, test: AbTest, sub_ids: list[int]) -> None:
-    from src.core.models import LearningCard, LifecyclePlaybook
-    db.query(AbAssignment).filter_by(test_id=test.id).delete()
-    db.query(LifecyclePlaybook).filter_by(source_type="holdout_test", source_id=test.test_name).delete()
-    db.query(LearningCard).filter_by(card_type="holdout_result").delete()
-    db.query(AbTest).filter_by(id=test.id).delete()
-    db.query(Subscriber).filter(Subscriber.id.in_(sub_ids)).delete(synchronize_session=False)
-    db.commit()
 
 
 def test_proven_verdict_writes_playbook_and_learning_card(fresh_db):
     """40/arm, variant 40% vs control 5% — clear, well-powered win."""
     from src.tasks.lifecycle_holdout_check import run
-    from src.core.models import LifecyclePlaybook, LearningCard
 
     test, sub_ids = _seed_holdout_test(
         fresh_db, n_ctrl=40, n_var=40, ctrl_conv_rate=0.05, var_conv_rate=0.40,
     )
-    try:
-        result = run(dry_run=False)
-        assert result["checked"] >= 1
+    result = run(dry_run=False)
+    assert result["checked"] >= 1
 
-        playbook = fresh_db.query(LifecyclePlaybook).filter_by(
-            source_type="holdout_test", source_id=test.test_name,
-        ).one_or_none()
-        assert playbook is not None
-        assert playbook.status == "recommended"
-        assert playbook.authored_by == "lifecycle"
+    playbook = fresh_db.query(LifecyclePlaybook).filter_by(
+        source_type="holdout_test", source_id=test.test_name,
+    ).one_or_none()
+    assert playbook is not None
+    assert playbook.status == "recommended"
+    assert playbook.authored_by == "lifecycle"
 
-        card = fresh_db.query(LearningCard).filter_by(card_type="holdout_result").one_or_none()
-        assert card is not None
-        assert test.test_name in card.summary_text
-    finally:
-        _cleanup(fresh_db, test, sub_ids)
+    card = fresh_db.query(LearningCard).filter_by(card_type="holdout_result").one_or_none()
+    assert card is not None
+    assert test.test_name in card.summary_text
 
 
 def test_not_proven_writes_nothing(fresh_db):
     """Rates too close — must not write a recommendation or learning card."""
     from src.tasks.lifecycle_holdout_check import run
-    from src.core.models import LifecyclePlaybook
 
     test, sub_ids = _seed_holdout_test(
         fresh_db, n_ctrl=40, n_var=40, ctrl_conv_rate=0.30, var_conv_rate=0.32,
     )
-    try:
-        run(dry_run=False)
-        playbook = fresh_db.query(LifecyclePlaybook).filter_by(
-            source_type="holdout_test", source_id=test.test_name,
-        ).one_or_none()
-        assert playbook is None
-    finally:
-        _cleanup(fresh_db, test, sub_ids)
+    run(dry_run=False)
+    playbook = fresh_db.query(LifecyclePlaybook).filter_by(
+        source_type="holdout_test", source_id=test.test_name,
+    ).one_or_none()
+    assert playbook is None
 
 
 def test_dry_run_writes_nothing(fresh_db):
     """dry_run=True must never write, even on a proven verdict."""
     from src.tasks.lifecycle_holdout_check import run
-    from src.core.models import LifecyclePlaybook
 
     test, sub_ids = _seed_holdout_test(
         fresh_db, n_ctrl=40, n_var=40, ctrl_conv_rate=0.05, var_conv_rate=0.40,
     )
-    try:
-        result = run(dry_run=True)
-        assert result["proven"] == 0
-        playbook = fresh_db.query(LifecyclePlaybook).filter_by(
-            source_type="holdout_test", source_id=test.test_name,
-        ).one_or_none()
-        assert playbook is None
-    finally:
-        _cleanup(fresh_db, test, sub_ids)
+    result = run(dry_run=True)
+    assert result["proven"] == 0
+    playbook = fresh_db.query(LifecyclePlaybook).filter_by(
+        source_type="holdout_test", source_id=test.test_name,
+    ).one_or_none()
+    assert playbook is None
 
 
 def test_baseline_drift_skips_verdict(fresh_db):
@@ -150,7 +147,6 @@ def test_baseline_drift_skips_verdict(fresh_db):
     Uses the real config name 'wallet_push_holdout' so the drift guard's
     get_holdout_config_by_test_name lookup resolves to a real graph."""
     from src.tasks.lifecycle_holdout_check import run
-    from src.core.models import LifecyclePlaybook, LearningCard
 
     # A genuinely-winning split, but stored fingerprint is stale → drift.
     test = AbTest(
@@ -175,14 +171,10 @@ def test_baseline_drift_skips_verdict(fresh_db):
             outcome="converted" if i < 16 else "no_convert", created_at=created_at,
         ))
     fresh_db.flush()
-    fresh_db.commit()
 
-    try:
-        result = run(dry_run=False)
-        assert result["proven"] == 0  # drift → not counted as proven
-        playbook = fresh_db.query(LifecyclePlaybook).filter_by(
-            source_type="holdout_test", source_id="wallet_push_holdout",
-        ).one_or_none()
-        assert playbook is None
-    finally:
-        _cleanup(fresh_db, test, sub_ids)
+    result = run(dry_run=False)
+    assert result["proven"] == 0  # drift → not counted as proven
+    playbook = fresh_db.query(LifecyclePlaybook).filter_by(
+        source_type="holdout_test", source_id="wallet_push_holdout",
+    ).one_or_none()
+    assert playbook is None

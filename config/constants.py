@@ -238,17 +238,6 @@ TIER_DISPLAY = {
             "Rate locked forever",
         ],
     },
-    "dominator": {
-        "label": "Dominator — 10 ZIPs",
-        "zip_limit": 10,
-        "features": [
-            "Unlimited ZIPs in county",
-            "First-access lead delivery",
-            "Skip-traced phone numbers",
-            "Dedicated account manager",
-            "Rate locked forever",
-        ],
-    },
     "annual_lock": {
         "label": "Annual — 2 Months Free",
         "zip_limit": 1,

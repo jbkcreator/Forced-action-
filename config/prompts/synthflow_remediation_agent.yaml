@@ -64,8 +64,9 @@ variables:
 # ── First message ─────────────────────────────────────────────
 first_message: >
   Hi, is this {{prospect_name}}? Great — my name is Alex, calling from
-  Forced Action. I have something quick that might be worth 30 seconds if
-  you're in water damage or fire remediation in Tampa. Is now a good time?
+  Forced Action, and this call may be recorded. I have something quick that
+  might be worth 30 seconds if you're in water damage or fire remediation
+  in Tampa. Is now a good time?
 
 # ── System prompt ─────────────────────────────────────────────
 system_prompt: |

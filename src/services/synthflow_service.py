@@ -117,7 +117,7 @@ def get_live_lead_count(zip_code: str, vertical: str, county_id: str = "hillsbor
                 FoundingSubscriberCount.county_id == county_id,
             )
         ).scalar() or 0
-        tiers = ["starter", "pro", "dominator"]
+        tiers = ["starter", "pro", "founder"]
         total_founding_cap = _founding_limit() * len(tiers)
         founding_spots_remaining = max(0, total_founding_cap - founding_rows)
 

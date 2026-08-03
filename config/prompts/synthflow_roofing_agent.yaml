@@ -64,8 +64,9 @@ variables:
 # ── First message (spoken immediately when prospect picks up) ──
 first_message: >
   Hi, is this {{prospect_name}}? Great — my name is Alex, I'm calling from
-  Forced Action. I have something quick that might be worth 30 seconds of
-  your time if you're a roofing contractor in Tampa. Is now okay?
+  Forced Action, and this call may be recorded. I have something quick that
+  might be worth 30 seconds of your time if you're a roofing contractor in
+  Tampa. Is now okay?
 
 # ── System prompt ─────────────────────────────────────────────
 # Paste this entire block into the "System Prompt" field in Finetuner.ai.

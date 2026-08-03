@@ -71,9 +71,9 @@ variables:
 
 # ── First message ─────────────────────────────────────────────
 first_message: >
-  Hi, is this {{subscriber_name}}? Hey — this is Alex from Forced Action.
-  You were looking at the {{offer_label}} earlier and I just wanted to
-  reach out real quick. Do you have 60 seconds?
+  Hi, is this {{subscriber_name}}? Hey — this is Alex from Forced Action,
+  and this call may be recorded. You were looking at the {{offer_label}}
+  earlier and I just wanted to reach out real quick. Do you have 60 seconds?
 
 # ── System prompt ─────────────────────────────────────────────
 system_prompt: |
