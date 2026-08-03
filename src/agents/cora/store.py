@@ -34,6 +34,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
+from config.venture_template import DEFAULT_VENTURE_KEY
+
 DATA_DIR = Path(__file__).resolve().parents[3] / "data" / "cora"
 
 DRAFT_MAX_AGE_HOURS = 72
@@ -175,6 +177,16 @@ class OutboundDraftRecord:
     followup_sequence: Optional[int] = None
     contact_email: Optional[str] = None
     contact_phone: Optional[str] = None
+    # Which venture produced this draft (CLONE-v2.2 / CL4). Defaults to venture
+    # #1, so nothing about the existing single-venture path changes.
+    #
+    # It has to be written here rather than inferred downstream: per-cell and
+    # per-venture reply rate is read off this column
+    # (src/services/venture_ladder.py:cell_reply_rates), and that number is what
+    # the auto-double rule scales real sending volume on. A second venture whose
+    # drafts all carried venture #1's key would have a permanently empty reply
+    # rate and could never scale.
+    venture_key: str = DEFAULT_VENTURE_KEY
 
 
 def new_draft_id() -> str:
@@ -192,7 +204,8 @@ _DRAFT_COLUMNS = (
     "draft_id, opportunity_thread_id, buyer_entity_id, cell_id, offer, avenue, angle, "
     "subject, body, facts_used, source_refs, recommended_channel, confidence_score, "
     "status, booking_link, payment_link, reject_reason, created_at, schema_version, "
-    "published, is_followup, followup_sequence, contact_email, contact_phone"
+    "published, is_followup, followup_sequence, contact_email, contact_phone, "
+    "venture_key"
 )
 
 
@@ -205,7 +218,8 @@ def append_draft(db: Any, record: OutboundDraftRecord) -> None:
                 :draft_id, :opportunity_thread_id, :buyer_entity_id, :cell_id, :offer, :avenue, :angle,
                 :subject, :body, :facts_used, :source_refs, :recommended_channel, :confidence_score,
                 :status, :booking_link, :payment_link, :reject_reason, :created_at, :schema_version,
-                :published, :is_followup, :followup_sequence, :contact_email, :contact_phone
+                :published, :is_followup, :followup_sequence, :contact_email, :contact_phone,
+                :venture_key
             )
         """),
         {

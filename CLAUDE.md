@@ -65,7 +65,7 @@ Central `properties` table (~522k parcels). 1:Many → foreclosures, tax_delinqu
 
 - **Agents** (`src/agents/`): LangGraph (Lifecycle) runtime. **Runs as a separate process/container from FastAPI.** Entry point: `python -m src.agents --serve`. API and Lifecycle communicate **exclusively** through Redis Queue (`lifecycle:queue` key, LPUSH/BRPOP) and Postgres NOTIFY (`lifecycle_events` channel). **Never call `dispatch_event()` directly from API/services/tasks** — use `publish_lifecycle_event()` from `src.agents.events.ingestion`. If Redis is unavailable, events fall back to `lifecycle_event_queue` Postgres table with 60s sweep. Supervisor routes events via dict lookup (`src/agents/router.py`). 10 graphs. Kill switch colors: green=send, yellow=fallback template, red=block. All decisions logged to `agent_decisions`. Guardrails in `config/lifecycle_guardrails.py`. `kill_switch_metric_ingest.get_cached_metric` re-exports from `kill_switch_service` — import from service layer, not tasks.
 
-- **Tasks** (`src/tasks/`): Scheduled jobs. `daily_report.py` — CSV ops report (runs 08:10 UTC for both Hillsborough and Pinellas). `daily_dashboard.py` — 10-section PDF (23:30 UTC Mon-Sat), separate from daily_report. `dnc_refresh` — monthly Tracerfy DNC re-scrub.
+- **Tasks** (`src/tasks/`): Scheduled jobs. `daily_report.py` — CSV ops report (runs 08:10 UTC for both Hillsborough and Pinellas). `daily_dashboard.py` — 10-section PDF (23:30 UTC Mon-Sat), separate from daily_report. `dnc_refresh` — monthly Tracerfy DNC re-scrub. `venture_ladder_evaluator.py` — daily 09:30 UTC venture-ladder walk (CL4).
 
 ### County Config
 County config is **DB-backed** via `counties` + `county_sources` tables — **not** `config/counties.json`. Read via `src/utils/county_config.py:get_county(county_id)` (5-min cache). `County.nws_zone` supports comma-separated values for multi-zone counties. Hillsborough: `FLZ151,FLZ251`. Pinellas: `FLZ050`.
@@ -77,12 +77,20 @@ Read via `src/utils/venture_config.py:get_venture_config(venture_key)` (5-min ca
 
 Relay is per-venture end to end: `run_sweep(venture_key=...)` filters the batch, the daily-ceiling Redis key is `relay_daily_sent:{venture}:{channel}:{date}`, and the Slack channel / Instantly campaign / footer brand come from the item's venture. **One sweep run = one venture** (a batch is homogeneous) — a second venture needs its own `--sweep --venture <key>` cron line and its own Instantly passthrough campaign. Onboard a new venture with `python -m src.services.venture_provisioning` (`--emit-template` → `--dry-run` → `--apply`); `playwright_code` is never cloned between counties and column mappings are opt-in. Runbook: `docs/venture-onboarding.md`.
 
+### Venture Ladder (CLONE-v2.2 / CL4)
+Seven-rung state machine over `ventures.ladder_stage`: `radar → probe → pilot → unit_economics → cell → spin_up → portfolio`. Venture #1 is seeded at `portfolio`. **A radar candidate is a real `ventures` row with `is_active=false`** — the CL3 resolver falls back to env settings for an inactive venture, so an unproven candidate structurally cannot govern sends.
+
+`src/services/venture_ladder.py` = `evaluate` / `advance` / `presell_gate_blocked` / `maybe_auto_double` / `maybe_auto_double_cell` / `cell_reply_rates` / `record_evidence`. `src/services/clone_pack.py:assemble()` = the read-only "can this venture run?" object. `src/tasks/venture_ladder_evaluator.py` = cron driver (09:30 UTC) — **`cell → spin_up` is never advanced unattended** (needs `--advance-spin-up`; spin-up spends real money). Acceptance PASS/FAIL: `python scripts/harness/venture_spinup_acceptance.py` (one always-rolled-back transaction).
+
+**Every gate declares `no_metric_behavior`** and `_gate_color()` honours it — never a blanket red for a missing metric. This is ADR 0006's lesson: `EXPANSION_GATES` treats `None` as red, requires all-green, and has therefore never permitted a launch. Gates are also named for what they measure (`send_failure_pct` not `bounce_pct`; `platform_cost_per_acquisition_usd` not `cac_usd`) — per-venture bounce and ad-spend data do not exist. Presell evidence = **refundable Stripe deposit**, `verified` only by machine check; accepted kinds in config. Auto-double is two knobs: venture-level doubles `relay_daily_ceiling` (the only real send cap), cell-level doubles a cell's target *production* count. Cooldown/idempotency read `venture_ladder_events`, never a Redis flag. See ADR 0033 + `docs/venture-ladder.md`.
+
 ### Configuration (`config/`)
 - `settings.py`: Pydantic BaseSettings from `.env`, accessed via `get_settings()`.
 - `agents.py`: `AgentsSettings(AppSettings)` — LangGraph-specific keys. `AGENTS_EVENT_SOURCE_REDIS=true`, `AGENTS_EVENT_SOURCE_POSTGRES=true` required for full event routing.
 - `scoring.py`: CDS weights/thresholds — source of truth (not cds_engine.py docstring).
 - `matching.py`: match thresholds.
 - `venture_template.py`: `DEFAULT_VENTURE_KEY`, the copy-and-fill `VENTURE_TEMPLATE`, and `validate_venture_config()`.
+- `venture_ladder.py`: `LADDER_STAGES`, per-stage `STAGE_GATES` (each with `direction` + `no_metric_behavior`), presell + auto-double constants, `validate_ladder_config()`.
 
 ### Deployment
 Single `Dockerfile` at project root. `docker-compose.yml` runs `api` and `lifecycle` as two services from the same image with `network_mode: host` (Postgres + Redis run on the host). Nginx serves React SPA static files and proxies `/api/` + `/webhooks/` to FastAPI on port 8000.
