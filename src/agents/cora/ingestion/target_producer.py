@@ -30,8 +30,10 @@ import time
 from datetime import date
 from typing import Any, Dict, List, Optional
 
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from config.venture_ladder import AUTO_DOUBLE_CELL_MAX_MULTIPLIER
 from src.agents.cora import fallback_ranking, queue, store
 from src.agents.cora.tools.read_tools import (
     get_buyer_entity_by_opportunity_thread_id,
@@ -39,6 +41,7 @@ from src.agents.cora.tools.read_tools import (
     get_ranked_whales,
     get_recent_auction_fast_follow_whales,
 )
+from src.services import venture_ladder
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +116,13 @@ def _produce_from_rows(db: Session, cell_id: str, scored: List[Dict[str, Any]]) 
             "facts_used": _facts_for(row),
             "contact_email": contact.get("email"),
             "contact_phone": contact.get("phone"),
+            # Attached per-row from the target's OWN county, not the call's
+            # county_id filter — a fleet-wide sweep (county_id=None) can return
+            # targets belonging to different ventures in the same pass, and
+            # outreach.py's persist node trusts this rather than falling back to
+            # venture #1's key (see store.venture_key_for_county's docstring on
+            # why that silent default is a production bug, not a cosmetic one).
+            "venture_key": store.venture_key_for_county(db, buyer_entity.get("county_id")),
         }
         message_id = queue.publish("target.ready", payload, idempotency_key=_idempotency_key(cell_id, thread_id))
         if message_id is not None:
@@ -120,12 +130,129 @@ def _produce_from_rows(db: Session, cell_id: str, scored: List[Dict[str, Any]]) 
     return produced
 
 
+def _cell_multiplier(db: Session, venture_key: str, cell_id: str) -> int:
+    """This venture's recorded cell-level auto-double multiplier for `cell_id`
+    (src/services/venture_ladder.py:cell_production_multipliers), defaulting
+    to 1x on any failure — e.g. the CL4 migration (venture_ladder_events) not
+    yet applied in this environment.
+
+    Wrapped in a savepoint: a bare try/except without begin_nested() would
+    leave the surrounding transaction aborted for every statement after it
+    (the ranked-whales query included), so a missing CL4 table would silently
+    stop target production rather than just skip the multiplier.
+    """
+    try:
+        with db.begin_nested():
+            return venture_ladder.cell_production_multipliers(db, venture_key).get(cell_id, 1)
+    except Exception:  # noqa: BLE001 — a missing multiplier must never block target production
+        logger.warning(
+            "target_producer: could not resolve the cell production multiplier for "
+            "venture=%s cell=%s — using 1x", venture_key, cell_id, exc_info=True,
+        )
+        return 1
+
+
+def _cell_production_limit(db: Session, county_id: Optional[str], cell_id: str, limit: int) -> tuple[int, int]:
+    """`limit`, scaled by the ONE venture this call is scoped to.
+
+    Only correct when `county_id` scopes the call to a single venture: the
+    scheduled sweep (county_id=None) has no single venture to read a
+    multiplier for, and must go through _truncate_scored_rows_per_venture()
+    instead, which applies each represented venture's OWN multiplier rather
+    than reading DEFAULT_VENTURE_KEY's and calling it done.
+    """
+    venture_key = store.venture_key_for_county(db, county_id)
+    multiplier = _cell_multiplier(db, venture_key, cell_id)
+    return limit * multiplier, multiplier
+
+
+def _truncate_scored_rows_per_venture(
+    db: Session, cell_id: str, default_limit: int, scored: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Keep up to `default_limit * multiplier` rows PER VENTURE, in ranked
+    order, instead of one multiplier applied to the whole (possibly
+    multi-venture) fleet-wide batch.
+
+    The scheduled sweep (run_periodic(), --produce-targets) calls the
+    producers with county_id=None — a single shared ranked pool spanning
+    every venture's buyer entities, with no per-venture segregation in the
+    SQL LIMIT. Reading DEFAULT_VENTURE_KEY's multiplier and applying it to
+    that whole pool (the pre-fix behaviour) meant a non-default venture's
+    recorded cell auto-double was never read at all. This truncates
+    per-venture AFTER ranking instead — each row's venture is resolved from
+    its OWN county_id (never the call's), exactly like _produce_from_rows'
+    per-row venture_key attribution. `scored` must already be over-fetched
+    (see produce_targets/produce_auction_fast_follow_targets) so a
+    higher-multiplier venture's rows are not lost to the SQL-level LIMIT
+    before this ever sees them.
+    """
+    venture_cache: Dict[Optional[str], str] = {}
+    cap_cache: Dict[str, int] = {}
+    kept_count: Dict[str, int] = {}
+    kept: List[Dict[str, Any]] = []
+
+    for row in scored:
+        county_id = row.get("county_id")
+        venture_key = venture_cache.get(county_id)
+        if venture_key is None:
+            venture_key = store.venture_key_for_county(db, county_id)
+            venture_cache[county_id] = venture_key
+
+        cap = cap_cache.get(venture_key)
+        if cap is None:
+            cap = default_limit * _cell_multiplier(db, venture_key, cell_id)
+            cap_cache[venture_key] = cap
+
+        if kept_count.get(venture_key, 0) < cap:
+            kept.append(row)
+            kept_count[venture_key] = kept_count.get(venture_key, 0) + 1
+
+    return kept
+
+
+def _fleet_fetch_size(db: Session, cell_id: str, limit: int) -> int:
+    """SQL LIMIT for a fleet-wide sweep = sum of every active venture's (limit × multiplier).
+
+    Guarantees the result set is large enough that _truncate_scored_rows_per_venture
+    can satisfy each venture's full cap regardless of ranking interleave.
+    Falls back to limit × AUTO_DOUBLE_CELL_MAX_MULTIPLIER on any DB error.
+    # ponytail: one SELECT + N savepoint reads; upgrade to a single aggregating
+    # query if active-venture count grows large enough to matter.
+    """
+    try:
+        rows = db.execute(
+            text("SELECT venture_key FROM ventures WHERE is_active = true")
+        ).fetchall()
+        total = sum(_cell_multiplier(db, r.venture_key, cell_id) for r in rows)
+        return max(limit, limit * total)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "target_producer: could not compute fleet fetch size for cell=%s — falling back to %dx",
+            cell_id, AUTO_DOUBLE_CELL_MAX_MULTIPLIER, exc_info=True,
+        )
+        return limit * AUTO_DOUBLE_CELL_MAX_MULTIPLIER
+
+
 def produce_targets(db: Session, limit: int = 25, county_id: Optional[str] = None) -> List[str]:
     """founder_tier_blitz cell. Returns the opportunity_thread_ids actually published this pass (skips ones with an active draft already)."""
-    ranked = get_ranked_whales(db, limit=limit, county_id=county_id)
-    scored = fallback_ranking.rank_targets(ranked)
+    if county_id is not None:
+        scaled_limit, multiplier = _cell_production_limit(db, county_id, FOUNDER_TIER_BLITZ_CELL_ID, limit)
+        ranked = get_ranked_whales(db, limit=scaled_limit, county_id=county_id)
+        scored = fallback_ranking.rank_targets(ranked)
+    else:
+        # Fleet-wide: over-fetch by the largest possible per-venture
+        # multiplier, then truncate per-venture below — see
+        # _truncate_scored_rows_per_venture's docstring.
+        ranked = get_ranked_whales(db, limit=_fleet_fetch_size(db, FOUNDER_TIER_BLITZ_CELL_ID, limit), county_id=None)
+        scored = _truncate_scored_rows_per_venture(
+            db, FOUNDER_TIER_BLITZ_CELL_ID, limit, fallback_ranking.rank_targets(ranked)
+        )
+
     produced = _produce_from_rows(db, FOUNDER_TIER_BLITZ_CELL_ID, scored)
-    logger.info("target_producer: cell=%s produced %d target.ready event(s) out of %d ranked", FOUNDER_TIER_BLITZ_CELL_ID, len(produced), len(scored))
+    logger.info(
+        "target_producer: cell=%s produced %d target.ready event(s) out of %d ranked",
+        FOUNDER_TIER_BLITZ_CELL_ID, len(produced), len(scored),
+    )
     return produced
 
 
@@ -133,10 +260,25 @@ def produce_auction_fast_follow_targets(
     db: Session, limit: int = 25, county_id: Optional[str] = None, lookback_days: int = 7,
 ) -> List[str]:
     """auction_fast_follow cell. Read-only; never triggers whale_auction_fast_follow.py's own write path."""
-    rows = get_recent_auction_fast_follow_whales(db, lookback_days=lookback_days, limit=limit, county_id=county_id)
-    scored = fallback_ranking.rank_targets(rows)
+    if county_id is not None:
+        scaled_limit, multiplier = _cell_production_limit(db, county_id, AUCTION_FAST_FOLLOW_CELL_ID, limit)
+        rows = get_recent_auction_fast_follow_whales(
+            db, lookback_days=lookback_days, limit=scaled_limit, county_id=county_id
+        )
+        scored = fallback_ranking.rank_targets(rows)
+    else:
+        rows = get_recent_auction_fast_follow_whales(
+            db, lookback_days=lookback_days, limit=_fleet_fetch_size(db, AUCTION_FAST_FOLLOW_CELL_ID, limit), county_id=None
+        )
+        scored = _truncate_scored_rows_per_venture(
+            db, AUCTION_FAST_FOLLOW_CELL_ID, limit, fallback_ranking.rank_targets(rows)
+        )
+
     produced = _produce_from_rows(db, AUCTION_FAST_FOLLOW_CELL_ID, scored)
-    logger.info("target_producer: cell=%s produced %d target.ready event(s) out of %d candidates", AUCTION_FAST_FOLLOW_CELL_ID, len(produced), len(scored))
+    logger.info(
+        "target_producer: cell=%s produced %d target.ready event(s) out of %d candidates",
+        AUCTION_FAST_FOLLOW_CELL_ID, len(produced), len(scored),
+    )
     return produced
 
 

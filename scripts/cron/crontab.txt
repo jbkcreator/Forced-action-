@@ -896,6 +896,23 @@ COUNTY_ID=hillsborough
 #   */30 * * * * $PROJECT/scripts/cron/run.sh src.services.relay --sweep --venture venture_two
 */30 * * * * $PROJECT/scripts/cron/run.sh src.services.relay --sweep
 
+# ── AGENT LANE: VENTURE LADDER (CLONE-v2.2 / CL4) ────────────────────────────
+# Venture ladder evaluator — daily 09:30 UTC. Walks every venture (active AND
+# inactive: a radar candidate is an inactive row), evaluates its rung's gates,
+# advances the ones that are all green, runs the auto-double rule, and posts a
+# digest to Slack. Thresholds: config/venture_ladder.py. Runbook:
+# docs/venture-ladder.md.
+#
+# Deliberately at 09:30, clear of the 04:00-08:00 scraper -> CDS -> skip-trace
+# -> GHL chain and after the 08:10 daily report, so the unit-economics rung
+# reads a settled day rather than one mid-ingest.
+#
+# cell -> spin_up is NOT advanced here even when every gate is green — spin-up
+# buys a domain, mailbox warmup, an Instantly seat and proxy capacity. The
+# presell gate authorises that spend; a human releases it by running the task
+# with --advance-spin-up.
+30 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.venture_ladder_evaluator
+
 # T-B12-07 — Deal-of-the-day daily pick (idempotent, one row per date).
 # Runs after CDS scoring so today's top-CDS undelivered lead is available.
 15 7 * * * $PROJECT/scripts/cron/run.sh src.services.deal_of_the_day
