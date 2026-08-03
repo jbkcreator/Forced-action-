@@ -114,7 +114,18 @@ what stops a Stripe webhook retry inflating a presell count; a NULL
 Real money (so it is real evidence), refundable (so people will agree to one — a
 gate nobody can pass is the same as no venture), a Stripe object (so a webhook
 verifies it with no human in the loop), and it carries an amount, so the
-threshold is "5 people **and** $2,500" rather than a bare count.
+threshold is "5 **distinct customers** and $2,500" rather than a bare count.
+
+Four rules, each closing a distinct way to pass the gate without real demand:
+`verified = true` set only by machine check; **distinct customers** deduped on
+`stripe_customer_id`; count *and* sum both required; and existing subscribers of
+*another* venture excluded.
+
+The dedupe is not redundant with the `source_ref` UNIQUE. That constraint stops a
+webhook retry re-inserting the same PaymentIntent; one buyer depositing five
+times produces five legitimately distinct PaymentIntents and would have sailed
+through a row count. Only the first commitment per customer contributes to the
+total as well, so repeat deposits cannot clear the money threshold either.
 
 `PRESELL_ACCEPTED_KINDS` is config, and each payload carries a `kind`
 (`deposit` / `first_month` / `saved_card` / `letter_of_intent`). Widening what

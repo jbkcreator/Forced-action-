@@ -104,17 +104,34 @@ mailbox warmup, an Instantly seat and proxy capacity. The presell gate
 
 ## The presell gate
 
-Blocks `probe → pilot` and again at `cell → spin_up`. Needs **5 verified
-commitments totalling ≥ $2,500**, none older than 120 days.
+Blocks `probe → pilot` and again at `cell → spin_up`. Needs **5 distinct Stripe
+customers AND ≥ $2,500 total**, none older than 90 days.
 
 A commitment is a **refundable Stripe deposit**. Real money, so real evidence;
 refundable, so people actually agree to one; a Stripe object, so a webhook
 verifies it with no human in the loop; and it carries an amount, so the gate can
 require money and not just headcount.
 
-Only `verified = true` rows count, and only a machine check sets that — the
-webhook that saw the deposit settle. A hand-entered row is a claim and is
-ignored. That is what makes this gate autonomous rather than a checklist.
+Four rules, each closing a way the gate could be passed without real demand:
+
+| Rule | Without it |
+|---|---|
+| `verified = true` only, set by machine check | a hand-entered claim passes |
+| **distinct customers**, deduped on `stripe_customer_id` | one enthusiast's five deposits pass |
+| count **and** sum both required | five $1 deposits pass, or a single whale does |
+| existing subscribers of **another** venture excluded | the existing book buying again reads as new demand |
+
+On the dedupe: `UNIQUE (venture_key, evidence_type, source_ref)` stops a webhook
+*retry* re-inserting the same PaymentIntent, but says nothing about one buyer
+depositing five times — those are five legitimately distinct PaymentIntents. The
+headcount is therefore computed over unique customers, and only the first
+commitment per customer contributes to the total, so repeat deposits cannot
+clear the money threshold either. A commitment with no `stripe_customer_id`
+falls back to `contact_ref` rather than collapsing every such row into one
+bucket.
+
+The exclusion is scoped to *other* ventures: someone who only ever subscribed to
+**this** venture is still valid demand for it.
 
 ```python
 from src.services import venture_ladder

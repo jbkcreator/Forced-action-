@@ -62,6 +62,7 @@ from config.venture_ladder import (
     METRIC_WINDOW_DAYS,
     MIN_COST_ATTRIBUTION_RATIO,
     PRESELL_ACCEPTED_KINDS,
+    PRESELL_EXCLUDE_EXISTING_SUBSCRIBERS,
     PRESELL_KNOWN_KINDS,
     PRESELL_MAX_AGE_DAYS,
     PRESELL_MIN_AMOUNT_CENTS,
@@ -575,23 +576,50 @@ def cell_reply_rates(
     }
 
 
+# `already_subscribed` is TRUE when this deposit's Stripe customer already pays
+# some OTHER venture on the fleet — the existing book buying again rather than
+# new demand. Matched on subscribers.stripe_customer_id, and scoped to a
+# different venture via subscribers.county_id -> counties.venture_key, so a
+# customer who only ever subscribed to THIS venture is not excluded.
+_PRESELL_EVIDENCE = """
+SELECT
+    e.payload->>'kind'               AS kind,
+    e.payload->>'amount_cents'       AS amount_cents,
+    e.payload->>'stripe_customer_id' AS stripe_customer_id,
+    e.payload->>'contact_ref'        AS contact_ref,
+    e.verified,
+    e.recorded_at >= now() - make_interval(days => :max_age) AS in_date,
+    EXISTS (
+        SELECT 1
+        FROM subscribers s
+        JOIN counties c ON c.county_id = s.county_id
+        WHERE s.stripe_customer_id = e.payload->>'stripe_customer_id'
+          AND c.venture_key <> :key
+          AND s.status IN ('active', 'grace')
+    ) AS already_subscribed
+FROM venture_ladder_evidence e
+WHERE e.venture_key = :key AND e.evidence_type = :presell_type
+ORDER BY e.recorded_at
+"""
+
+
 def presell_gate_status(db: Session, venture_key: str) -> PresellStatus:
-    """Count and sum this venture's verified, in-date, accepted-kind presell
-    commitments.
+    """Count DISTINCT customers and sum amounts across this venture's verified,
+    in-date, accepted-kind presell commitments.
 
     Only `verified` rows count — a row is verified by the machine check that
     confirmed the money moved (a Stripe webhook), never by hand. That is the
     property that makes this gate autonomous rather than a checklist.
+
+    Deduped per customer. The UNIQUE on (venture_key, evidence_type, source_ref)
+    stops a webhook retry re-inserting the same PaymentIntent, but says nothing
+    about one buyer depositing five times — and five deposits from one
+    enthusiastic customer is not evidence of a market. The first commitment per
+    customer counts toward both the headcount and the total; later ones from the
+    same customer are reported as duplicates.
     """
     rows = db.execute(
-        text("""
-            SELECT payload->>'kind' AS kind,
-                   payload->>'amount_cents' AS amount_cents,
-                   verified,
-                   recorded_at >= now() - make_interval(days => :max_age) AS in_date
-            FROM venture_ladder_evidence
-            WHERE venture_key = :key AND evidence_type = :presell_type
-        """),
+        text(_PRESELL_EVIDENCE),
         {
             "key": venture_key,
             "presell_type": EVIDENCE_PRESELL_COMMITMENT,
@@ -599,11 +627,14 @@ def presell_gate_status(db: Session, venture_key: str) -> PresellStatus:
         },
     ).fetchall()
 
-    count = 0
     total_cents = 0
     rejected: list[str] = []
+    # Identity for dedup: the Stripe customer if present, else the contact ref.
+    # Falling back matters — a commitment recorded without a customer id must not
+    # collapse every such row into one bucket keyed on None.
+    seen: set[str] = set()
 
-    for row in rows:
+    for index, row in enumerate(rows):
         if not row.verified:
             rejected.append("unverified commitment (no confirmed payment) ignored")
             continue
@@ -623,12 +654,28 @@ def presell_gate_status(db: Session, venture_key: str) -> PresellStatus:
         if amount <= 0:
             rejected.append(f"commitment with non-positive amount ignored ({kind})")
             continue
-        count += 1
+        if PRESELL_EXCLUDE_EXISTING_SUBSCRIBERS and row.already_subscribed:
+            rejected.append(
+                "commitment from a customer who already pays another venture "
+                "ignored — that is the existing book, not new demand"
+            )
+            continue
+
+        customer = (row.stripe_customer_id or "").strip()
+        identity = customer or f"contact:{(row.contact_ref or '').strip()}" or f"row:{index}"
+        if identity in seen:
+            rejected.append(
+                "second commitment from a customer already counted ignored — "
+                "the gate needs distinct buyers, not repeat deposits"
+            )
+            continue
+
+        seen.add(identity)
         total_cents += amount
 
     return PresellStatus(
         venture_key=venture_key,
-        verified_count=count,
+        verified_count=len(seen),
         verified_amount_cents=total_cents,
         rejected=tuple(rejected),
     )
@@ -641,7 +688,7 @@ def presell_gate_blocked(db: Session, venture_key: str) -> list[str]:
 
     if status.verified_count < PRESELL_MIN_COMMITMENTS:
         reasons.append(
-            f"presell gate: {status.verified_count} verified commitment(s), "
+            f"presell gate: {status.verified_count} distinct verified customer(s), "
             f"need {PRESELL_MIN_COMMITMENTS}"
         )
     if status.verified_amount_cents < PRESELL_MIN_AMOUNT_CENTS:

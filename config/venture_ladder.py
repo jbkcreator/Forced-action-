@@ -146,7 +146,15 @@ PRESELL_KNOWN_KINDS: frozenset[str] = frozenset({
     "letter_of_intent",  # needs a human to verify, which defeats the purpose
 })
 
+# DISTINCT PAYING CUSTOMERS, not commitment rows. Five deposits from one
+# enthusiastic buyer is not evidence of market demand, and the source_ref UNIQUE
+# only stops a webhook retry re-inserting the same PaymentIntent — it does
+# nothing about one customer depositing five times. Deduped on the payload's
+# stripe_customer_id.
 PRESELL_MIN_COMMITMENTS = 5
+
+# Both thresholds apply. Count alone would pass five $1 deposits; sum alone would
+# pass a single whale. Neither proves a market.
 PRESELL_MIN_AMOUNT_CENTS = 250_000  # $2,500 across all verified commitments
 
 # Transitions the presell gate applies to, as (from_stage, to_stage). Checked
@@ -159,8 +167,14 @@ PRESELL_GATED_TRANSITIONS: frozenset[tuple[str, str]] = frozenset({
 })
 
 # A commitment older than this stops counting toward the gate. Stale demand is
-# not demand.
-PRESELL_MAX_AGE_DAYS = 120
+# not demand — which is also why the gate is re-checked at cell->spin_up rather
+# than trusting the probe->pilot result from months earlier.
+PRESELL_MAX_AGE_DAYS = 90
+
+# A deposit from someone who already pays another venture on this fleet is not
+# evidence of NEW demand — it is the existing book buying again. Excluded from
+# the count, and reported as excluded rather than silently dropped.
+PRESELL_EXCLUDE_EXISTING_SUBSCRIBERS = True
 
 # ── Auto-double ──────────────────────────────────────────────────────────────
 # Reply rate above the threshold doubles sending volume. The 8% figure is the

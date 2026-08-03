@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 import pytest
 from sqlalchemy import text
@@ -203,13 +204,27 @@ def _seed_market_score(db, venture_key: str, score: float = 80.0) -> None:
     )
 
 
-def _seed_presell(db, venture_key: str, *, count: int, per_cents: int, verified: bool = True) -> None:
+def _seed_presell(
+    db,
+    venture_key: str,
+    *,
+    count: int,
+    per_cents: int,
+    verified: bool = True,
+    customer_id: Optional[str] = None,
+) -> None:
+    """Seed `count` deposits. Distinct customers unless `customer_id` pins them
+    all to one buyer, which is how the dedup rule is exercised."""
     for index in range(count):
         venture_ladder.record_evidence(
             db, venture_key,
             evidence_type=EVIDENCE_PRESELL_COMMITMENT,
             stage="probe",
-            payload={"kind": "deposit", "amount_cents": per_cents},
+            payload={
+                "kind": "deposit",
+                "amount_cents": per_cents,
+                "stripe_customer_id": customer_id or f"cus_test_{venture_key}_{index}",
+            },
             source_ref=f"pi_test_{index}",
             verified=verified,
             recorded_by="test",
@@ -414,7 +429,7 @@ def test_failed_presell_validation_blocks_probe_to_pilot(ladder_db, stub_venture
     _set_stage(ladder_db, stub_venture, "probe")
     reasons = venture_ladder.presell_gate_blocked(ladder_db, stub_venture)
     assert reasons
-    assert any("verified commitment" in reason for reason in reasons)
+    assert any("distinct verified customer" in reason for reason in reasons)
 
     evaluation = venture_ladder.evaluate(ladder_db, stub_venture)
     assert any("presell gate" in reason for reason in evaluation.blocked_reasons)
@@ -472,6 +487,144 @@ def test_presell_gate_passes_on_verified_deposits(ladder_db, stub_venture):
     assert status.verified_count == PRESELL_MIN_COMMITMENTS
     assert status.satisfied
     assert venture_ladder.presell_gate_blocked(ladder_db, stub_venture) == []
+
+
+def test_presell_gate_counts_distinct_customers_not_rows(ladder_db, stub_venture):
+    """Five deposits from ONE buyer is not evidence of a market.
+
+    The source_ref UNIQUE stops a webhook retry re-inserting the same
+    PaymentIntent; it says nothing about one customer depositing five times.
+    """
+    _seed_presell(
+        ladder_db, stub_venture,
+        count=PRESELL_MIN_COMMITMENTS + 3,
+        per_cents=PRESELL_MIN_AMOUNT_CENTS,
+        customer_id="cus_one_enthusiast",
+    )
+    status = venture_ladder.presell_gate_status(ladder_db, stub_venture)
+
+    assert status.verified_count == 1
+    # Only the first commitment's amount counts, so a single buyer cannot clear
+    # the money threshold by depositing repeatedly either.
+    assert status.verified_amount_cents == PRESELL_MIN_AMOUNT_CENTS
+    assert not status.satisfied
+    assert any("distinct buyers" in reason for reason in status.rejected)
+
+    reasons = venture_ladder.presell_gate_blocked(ladder_db, stub_venture)
+    assert any("distinct verified customer" in reason for reason in reasons)
+
+
+def test_presell_gate_excludes_another_ventures_existing_subscriber(
+    ladder_db, stub_venture
+):
+    """A deposit from someone who already pays another venture is the existing
+    book buying again, not new demand."""
+    rival = f"rival_{uuid.uuid4().hex[:8]}"
+    rival_county = f"{rival}_county"
+    ladder_db.execute(
+        text("""
+            INSERT INTO ventures (venture_key, display_name, brand_name, is_active)
+            VALUES (:key, 'Rival', 'Rival', true)
+        """),
+        {"key": rival},
+    )
+    ladder_db.execute(
+        text("""
+            INSERT INTO counties (
+                county_id, display_name, venture_key, zip_prefixes, is_active
+            ) VALUES (:cid, 'Rival County', :key, '[]'::jsonb, true)
+        """),
+        {"cid": rival_county, "key": rival},
+    )
+    from src.core.models import Subscriber
+
+    existing = Subscriber(
+        stripe_customer_id="cus_already_paying",
+        tier="pro", vertical="investor", county_id=rival_county,
+        status="active", email="existing@test.invalid",
+    )
+    ladder_db.add(existing)
+    ladder_db.flush()
+
+    # Four genuinely new buyers plus one who already pays the rival venture.
+    _seed_presell(
+        ladder_db, stub_venture,
+        count=PRESELL_MIN_COMMITMENTS - 1,
+        per_cents=PRESELL_MIN_AMOUNT_CENTS,
+    )
+    venture_ladder.record_evidence(
+        ladder_db, stub_venture,
+        evidence_type=EVIDENCE_PRESELL_COMMITMENT, stage="probe",
+        payload={
+            "kind": "deposit",
+            "amount_cents": PRESELL_MIN_AMOUNT_CENTS,
+            "stripe_customer_id": "cus_already_paying",
+        },
+        source_ref="pi_existing_subscriber", verified=True, recorded_by="test",
+    )
+    ladder_db.flush()
+
+    status = venture_ladder.presell_gate_status(ladder_db, stub_venture)
+    assert status.verified_count == PRESELL_MIN_COMMITMENTS - 1
+    assert not status.satisfied
+    assert any("existing book" in reason for reason in status.rejected)
+
+
+def test_presell_gate_does_not_exclude_this_ventures_own_subscriber(
+    ladder_db, stub_venture
+):
+    """The exclusion is scoped to OTHER ventures. Someone who only ever
+    subscribed to this venture is still valid demand for it."""
+    own_county = ladder_db.execute(
+        text("SELECT county_id FROM counties WHERE venture_key = :k"),
+        {"k": stub_venture},
+    ).scalar_one()
+    from src.core.models import Subscriber
+
+    ladder_db.add(Subscriber(
+        stripe_customer_id="cus_own_customer",
+        tier="pro", vertical="investor", county_id=own_county,
+        status="active", email="own@test.invalid",
+    ))
+    ladder_db.flush()
+
+    venture_ladder.record_evidence(
+        ladder_db, stub_venture,
+        evidence_type=EVIDENCE_PRESELL_COMMITMENT, stage="probe",
+        payload={
+            "kind": "deposit",
+            "amount_cents": PRESELL_MIN_AMOUNT_CENTS,
+            "stripe_customer_id": "cus_own_customer",
+        },
+        source_ref="pi_own", verified=True, recorded_by="test",
+    )
+    ladder_db.flush()
+
+    status = venture_ladder.presell_gate_status(ladder_db, stub_venture)
+    assert status.verified_count == 1
+
+
+def test_presell_commitments_without_a_customer_id_fall_back_to_contact_ref(
+    ladder_db, stub_venture
+):
+    """A missing stripe_customer_id must not collapse every such row into one
+    bucket keyed on None."""
+    for index in range(PRESELL_MIN_COMMITMENTS):
+        venture_ladder.record_evidence(
+            ladder_db, stub_venture,
+            evidence_type=EVIDENCE_PRESELL_COMMITMENT, stage="probe",
+            payload={
+                "kind": "deposit",
+                "amount_cents": (PRESELL_MIN_AMOUNT_CENTS // PRESELL_MIN_COMMITMENTS) + 1,
+                "contact_ref": f"contact-{index}",
+            },
+            source_ref=f"pi_no_customer_{index}", verified=True, recorded_by="test",
+        )
+    ladder_db.flush()
+
+    status = venture_ladder.presell_gate_status(ladder_db, stub_venture)
+    assert status.verified_count == PRESELL_MIN_COMMITMENTS
+    assert status.satisfied
 
 
 def test_evidence_source_ref_is_idempotent(ladder_db, stub_venture):
@@ -539,6 +692,61 @@ def test_auto_double_audits_the_decision(ladder_db, stub_venture):
     assert row.gate_results["scope"] == "venture"
     assert row.gate_results["previous_ceiling"] == 20
     assert row.gate_results["new_ceiling"] == 40
+
+
+def test_auto_double_flushes_the_venture_config_cache(ladder_db, stub_venture):
+    """A raised ceiling must take effect immediately.
+
+    ventures is read through a 5-minute cache; without the flush the new ceiling
+    silently does not apply for up to 5 minutes and the venture under-sends
+    exactly when it has earned the right to send more.
+    """
+    from src.utils import venture_config
+
+    # The resolver only reads ACTIVE rows — an inactive radar candidate
+    # deliberately falls through to env settings, so a ceiling change on one
+    # would be invisible to it by design. Only a live venture has a cache entry
+    # worth invalidating.
+    ladder_db.execute(
+        text("UPDATE ventures SET is_active = true WHERE venture_key = :k"),
+        {"k": stub_venture},
+    )
+    ladder_db.flush()
+    venture_config.invalidate_cache(stub_venture)
+
+    sends = AUTO_DOUBLE_MIN_SAMPLE
+    _seed_traffic(ladder_db, stub_venture, sends=sends, replies=int(sends * 0.15))
+
+    # Warm the cache with the pre-double ceiling.
+    before = venture_config.get_venture_config(stub_venture, session=ladder_db)
+    assert before.relay_daily_ceiling == 20
+
+    result = venture_ladder.maybe_auto_double(ladder_db, stub_venture)
+    assert result.fired
+
+    after = venture_config.get_venture_config(stub_venture, session=ladder_db)
+    assert after.relay_daily_ceiling == 20 * AUTO_DOUBLE_MULTIPLIER
+
+
+def test_auto_double_cache_flush_failure_does_not_lose_the_ceiling(
+    ladder_db, stub_venture, monkeypatch
+):
+    """A cache-flush problem must never roll back a ceiling change that already
+    succeeded — the write is the important half."""
+    sends = AUTO_DOUBLE_MIN_SAMPLE
+    _seed_traffic(ladder_db, stub_venture, sends=sends, replies=int(sends * 0.15))
+
+    def _boom(_key=None):
+        raise RuntimeError("cache backend unavailable")
+
+    monkeypatch.setattr("src.utils.venture_config.invalidate_cache", _boom)
+
+    result = venture_ladder.maybe_auto_double(ladder_db, stub_venture)
+    assert result.fired
+    assert ladder_db.execute(
+        text("SELECT relay_daily_ceiling FROM ventures WHERE venture_key = :k"),
+        {"k": stub_venture},
+    ).scalar_one() == 20 * AUTO_DOUBLE_MULTIPLIER
 
 
 def test_auto_double_does_not_fire_below_minimum_sample(ladder_db, stub_venture):

@@ -266,6 +266,9 @@ def _seed_presell(db, venture_key: str, *, count: int, per_cents: int) -> None:
             payload={
                 "kind": "deposit",
                 "amount_cents": per_cents,
+                # Distinct per commitment: the gate counts unique customers, so
+                # a seeder reusing one id would (correctly) satisfy nothing.
+                "stripe_customer_id": f"cus_harness_presell_{index}",
                 "contact_ref": f"harness-contact-{index}",
                 "refundable": True,
             },
@@ -682,8 +685,35 @@ def _run_checks(
     report.record(
         "presell gate satisfied by verified deposits",
         status.satisfied,
-        f"{status.verified_count} commitment(s), "
+        f"{status.verified_count} distinct customer(s), "
         f"${status.verified_amount_cents / 100:,.0f} total",
+    )
+
+    # The gate must count buyers, not receipts. A NEW PaymentIntent (so the
+    # source_ref UNIQUE does not stop the insert) from a customer already
+    # counted must add nothing — that UNIQUE only defends against webhook
+    # retries, never against one buyer depositing repeatedly.
+    inserted = venture_ladder.record_evidence(
+        db, venture_key,
+        evidence_type=EVIDENCE_PRESELL_COMMITMENT,
+        stage="probe",
+        payload={
+            "kind": "deposit",
+            "amount_cents": PRESELL_MIN_AMOUNT_CENTS,
+            "stripe_customer_id": "cus_harness_presell_0",
+        },
+        source_ref="pi_harness_repeat_deposit",
+        verified=True,
+        recorded_by="venture_spinup_acceptance",
+    )
+    repeat = venture_ladder.presell_gate_status(db, venture_key)
+    report.record(
+        "repeat deposit from a counted customer adds nothing",
+        inserted
+        and repeat.verified_count == status.verified_count
+        and repeat.verified_amount_cents == status.verified_amount_cents,
+        f"a 6th receipt landed but the gate still reads "
+        f"{repeat.verified_count} distinct customer(s)",
     )
 
     sends, replies = _seed_traffic(db, venture_key)
