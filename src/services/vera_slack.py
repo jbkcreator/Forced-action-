@@ -3,8 +3,11 @@ Slack output for Vera's daily standing jobs.
 
 Posts to the channel configured by VERA_SLACK_CHANNEL (client-supplied:
 #vera-verification, ID C0BMLTUTQTA) using the same WebClient pattern as
-lifecycle_slack.py. Falls back to send_alert email when Slack is unconfigured
-— an alert always goes somewhere.
+lifecycle_slack.py.
+
+Callers are responsible for emailing REPORT_RECIPIENTS before calling this.
+No email fallback here — the report email is always sent by the caller
+regardless of Slack availability.
 
 Usage:
     from src.services.vera_slack import post_vera_report
@@ -49,15 +52,12 @@ def post_vera_report(
     subject: str,
     body: str,
     blocks: Optional[list] = None,
-    fallback_to_email: bool = True,
 ) -> Optional[str]:
     """Post a Vera report to #vera-verification.
 
-    Returns the Slack message timestamp on success, "email" when the email
-    fallback fired, or None when nothing could be sent. Never raises.
-
-    Pass fallback_to_email=False when the caller has already emailed all
-    recipients — prevents a duplicate alert email when Slack is unconfigured.
+    Returns the Slack message timestamp on success, or None when Slack is
+    unconfigured or the post fails. Never raises. No email fallback — callers
+    send to REPORT_RECIPIENTS before calling this.
     """
     settings = get_settings()
     token = settings.slack_bot_token
@@ -66,41 +66,31 @@ def post_vera_report(
     if blocks is None:
         blocks = _default_blocks(subject, body)
 
-    if token and channel:
-        try:
-            from slack_sdk import WebClient
-            from slack_sdk.errors import SlackApiError
-        except ImportError:
-            logger.warning("[vera_slack] slack_sdk not installed — falling back to email")
-        else:
-            try:
-                client = WebClient(token=token.get_secret_value())
-                resp = client.chat_postMessage(
-                    channel=channel,
-                    text=subject,  # fallback plain text for notifications
-                    blocks=blocks,
-                )
-                return resp.get("ts")
-            except SlackApiError as exc:
-                logger.warning(
-                    "[vera_slack] Slack post failed (%s) — falling back to email",
-                    exc.response.get("error") if exc.response else exc,
-                )
-            except Exception:
-                logger.warning("[vera_slack] Slack post raised — falling back to email", exc_info=True)
-
-    if not fallback_to_email:
-        logger.debug("[vera_slack] Slack unavailable and fallback_to_email=False — skipping alert email")
+    if not token or not channel:
+        logger.debug("[vera_slack] Slack not configured (no token/channel) — skipping")
         return None
 
-    # Email fallback — same path as heartbeat_monitor / lifecycle_slack.
     try:
-        from src.services.email import send_alert
-        ok = send_alert(subject=subject[:80], body=body)
-        if not ok:
-            logger.warning("[vera_slack] email fallback returned falsy — no notification sent")
-            return None
-        return "email"
-    except Exception:
-        logger.warning("[vera_slack] email fallback raised — no notification sent", exc_info=True)
+        from slack_sdk import WebClient
+        from slack_sdk.errors import SlackApiError
+    except ImportError:
+        logger.warning("[vera_slack] slack_sdk not installed")
         return None
+
+    try:
+        client = WebClient(token=token.get_secret_value())
+        resp = client.chat_postMessage(
+            channel=channel,
+            text=subject,  # fallback plain text for notifications
+            blocks=blocks,
+        )
+        return resp.get("ts")
+    except SlackApiError as exc:
+        logger.warning(
+            "[vera_slack] Slack post failed: %s",
+            exc.response.get("error") if exc.response else exc,
+        )
+    except Exception:
+        logger.warning("[vera_slack] Slack post raised", exc_info=True)
+
+    return None

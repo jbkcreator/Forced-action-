@@ -716,7 +716,7 @@ def run_live_state() -> int:
         except Exception as exc:
             logger.warning("[Vera] failed to send live-state report to %s: %s", addr, exc)
 
-    post_vera_report(subject, body, fallback_to_email=False)
+    post_vera_report(subject, body)
 
     stale_count = sum(1 for b in cron_beats if b.is_stale)
     logger.info(

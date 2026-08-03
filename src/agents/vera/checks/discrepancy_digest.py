@@ -431,7 +431,7 @@ def run_discrepancy_digest() -> int:
         except Exception as exc:
             logger.warning("[Vera] failed to send promise digest to %s: %s", addr, exc)
 
-    post_vera_report(subject, body, fallback_to_email=False)
+    post_vera_report(subject, body)
 
     logger.info(
         "[Vera] promise digest complete: discrepancies=%d open_promises=%d overdue=%d",

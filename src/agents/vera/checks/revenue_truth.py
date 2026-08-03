@@ -934,7 +934,7 @@ def run_revenue_truth() -> int:
         except Exception as exc:
             logger.warning("[Vera] failed to send revenue-truth report to %s: %s", addr, exc)
 
-    post_vera_report(subject, body, fallback_to_email=False)
+    post_vera_report(subject, body)
 
     logger.info(
         "[Vera] revenue truth report complete: paying_no_access=%d access_not_paying=%d "
