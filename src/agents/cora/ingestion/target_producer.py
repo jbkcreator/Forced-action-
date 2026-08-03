@@ -127,13 +127,19 @@ def _produce_from_rows(db: Session, cell_id: str, scored: List[Dict[str, Any]]) 
             logger.warning("target_producer: thread_id=%s Hunter->Cora handoff rejected: %s", thread_id, errors)
             continue
         if not hunter_to_cora.is_handoff_citable(handoff):
-            hunter_to_cora.reject_handoff(
-                db, handoff_input,
-                [f"confidence_score: {handoff.confidence_score} < {UNVERIFIED_FLOOR} (UNVERIFIED_FLOOR)"],
-            )
+            # is_handoff_citable() fails on either a low confidence_score OR a
+            # stale freshness_class (spec §1.1.8) -- report whichever
+            # actually failed rather than always blaming confidence, so the
+            # handoff_rejections audit row reflects the real reason.
+            reasons = []
+            if handoff.confidence_score < UNVERIFIED_FLOOR:
+                reasons.append(f"confidence_score: {handoff.confidence_score} < {UNVERIFIED_FLOOR} (UNVERIFIED_FLOOR)")
+            if handoff.freshness_class == "stale":
+                reasons.append("freshness_class: 'stale' -- spec §1.1.8 (stale gold is barred)")
+            hunter_to_cora.reject_handoff(db, handoff_input, reasons)
             logger.warning(
-                "target_producer: thread_id=%s below UNVERIFIED_FLOOR (confidence=%d) — not surfaced to Cora",
-                thread_id, handoff.confidence_score,
+                "target_producer: thread_id=%s not citable (confidence=%d freshness=%s) — not surfaced to Cora",
+                thread_id, handoff.confidence_score, handoff.freshness_class,
             )
             continue
 

@@ -152,8 +152,13 @@ def validate_handoff(ranked_whale: dict[str, Any]) -> HunterToCoraHandoff:
 
 def is_handoff_citable(handoff: HunterToCoraHandoff) -> bool:
     """The formalized version of gating.is_citable() -- same threshold,
-    now checked against a full validated handoff rather than a bare int."""
-    return is_citable(handoff.confidence_score)
+    now checked against a full validated handoff rather than a bare int.
+
+    Also enforces spec §1.1.8 ("stale gold is barred"): a freshness_class of
+    'stale' (whale_flagged_at older than _STALE_AFTER_DAYS) is never citable,
+    regardless of confidence_score -- a previously-qualified whale must not
+    stay in the ranking indefinitely just because nothing re-checks its age."""
+    return is_citable(handoff.confidence_score) and handoff.freshness_class != "stale"
 
 
 def reject_handoff(session: Session, ranked_whale: dict[str, Any], errors: list[str]) -> HandoffRejected:
