@@ -209,6 +209,10 @@ def cmd_seed(args: argparse.Namespace) -> int:
         payload=payload,
         thread_id=args.thread_id,
         venture_key=args.venture,
+        # --seed is a founder/dev manual-testing tool, not real Cora/THROUGH
+        # traffic -- it has always allowed --thread-id to be omitted
+        # (QUALITY-v2.2 Q3's contract guard would otherwise reject that).
+        skip_contract_validation=True,
     )
     post_for_approval(item)
     _line(
