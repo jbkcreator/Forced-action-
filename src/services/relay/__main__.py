@@ -4,8 +4,14 @@ Relay — process entry point (RELAY-v2.2 sub-tasks R1 + R2).
 Usage:
     python -m src.services.relay --health
     python -m src.services.relay --sweep
+    python -m src.services.relay --sweep --venture venture_two
     python -m src.services.relay --seed --channel noop --recipient test@example.com --payload-json '{"subject": "Hi"}'
     python -m src.services.relay --setup-email-channel
+
+Every command takes --venture (default 'hillsborough_distress', CLONE-v2.2 /
+CL3). One --sweep run covers one venture, since the send window, daily
+ceiling, Slack channel and kill-switch key are all per-venture — a second
+venture means a second cron line, not a wider batch.
 
 --health is R1's scaffolding check. --sweep runs one approval-queue sweep
 (what cron calls every 30 minutes — see scripts/cron/crontab.txt).
@@ -29,6 +35,7 @@ import json
 import sys
 import uuid
 
+from config.venture_template import DEFAULT_VENTURE_KEY
 from src.utils.logger import setup_logging
 
 # Import for its registration side effect only — makes the real 'email'
@@ -49,17 +56,18 @@ def _line(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
-def cmd_health() -> int:
+def cmd_health(venture_key: str) -> int:
     from config.settings import get_settings
     from src.core.database import get_db_context
     from src.services.kill_switch_service import get_kill_switch_status
-    from src.services.relay.config import KILL_SWITCH_FEATURE
+    from src.utils.venture_config import get_venture_config
     from sqlalchemy import text
 
     settings = get_settings()
+    venture = get_venture_config(venture_key)
     all_ok = True
 
-    _line("\nRelay — health check")
+    _line(f"\nRelay — health check [venture={venture_key}]")
     _line("-" * 40)
 
     dsn_set = bool(settings.database_url)
@@ -78,14 +86,24 @@ def cmd_health() -> int:
             _line(f"  {_OK} relay_approval_queue table reachable")
     all_ok &= table_ok
 
-    status = get_kill_switch_status(KILL_SWITCH_FEATURE)
+    status = get_kill_switch_status(venture.kill_switch_feature)
     color = status.get("color", "unknown")
     icon = _OK if color in ("green", "unknown") else (_WARN if color == "yellow" else _FAIL)
-    _line(f"  {icon} kill switch [{KILL_SWITCH_FEATURE}] = {color}")
+    _line(f"  {icon} kill switch [{venture.kill_switch_feature}] = {color}")
 
-    slack_configured = bool(settings.slack_bot_token and settings.relay_slack_channel)
+    slack_configured = bool(settings.slack_bot_token and venture.relay_slack_channel)
     icon = _OK if slack_configured else _WARN
-    _line(f"  {icon} Slack configured (relay_slack_channel + slack_bot_token)")
+    _line(f"  {icon} Slack configured (channel={venture.relay_slack_channel or 'unset'} + bot token)")
+
+    email_configured = bool(venture.relay_instantly_campaign_id)
+    icon = _OK if email_configured else _WARN
+    _line(f"  {icon} email channel provisioned (Instantly campaign id set)")
+
+    _line(
+        f"  ·  send window {venture.relay_send_window_start:02d}:00-"
+        f"{venture.relay_send_window_end:02d}:00 {venture.relay_send_window_timezone}, "
+        f"ceiling {venture.relay_daily_ceiling}/channel/day, brand {venture.brand_name!r}"
+    )
 
     _line("-" * 40)
     if all_ok:
@@ -95,28 +113,42 @@ def cmd_health() -> int:
     return 0 if all_ok else 1
 
 
-def cmd_sweep() -> int:
+def cmd_sweep(venture_key: str) -> int:
     from src.services.relay.sweep import run_sweep
 
-    result = run_sweep()
+    result = run_sweep(venture_key=venture_key)
     _line(
-        f"sweep: sent={result.sent} skipped={result.skipped} "
+        f"sweep[{venture_key}]: sent={result.sent} skipped={result.skipped} "
         f"failed={result.failed} halted={result.halted} "
         f"processed={len(result.processed_ids)}"
     )
     return 0 if not result.halted else 1
 
 
-def cmd_setup_email_channel() -> int:
-    from config.settings import get_settings
+def cmd_setup_email_channel(venture_key: str) -> int:
+    from src.utils.venture_config import get_venture_config
     from src.services import instantly_service as instantly
     from src.services.relay.channels_email import PASSTHROUGH_CAMPAIGN_NAME
 
-    settings = get_settings()
+    venture = get_venture_config(venture_key)
+    # One campaign per venture — Instantly's duplicate-contact guard is
+    # per-campaign, so a shared campaign would make venture B's first email
+    # to a prospect look like a repeat of venture A's and fail the send.
+    # Venture #1 keeps the original unsuffixed name so re-running this
+    # command still FINDS its existing live campaign instead of creating a
+    # second one and orphaning the id already set in .env.
+    campaign_name = (
+        PASSTHROUGH_CAMPAIGN_NAME if venture_key == DEFAULT_VENTURE_KEY
+        else f"{PASSTHROUGH_CAMPAIGN_NAME} — {venture_key}"
+    )
+
+    if not venture.relay_instantly_sender_email:
+        _line(f"{_FAIL} venture {venture_key} has no relay_instantly_sender_email configured")
+        return 2
 
     existing = [
         c for c in instantly.list_campaigns()
-        if c.get("name") == PASSTHROUGH_CAMPAIGN_NAME
+        if c.get("name") == campaign_name
     ]
     if existing:
         campaign_id = existing[0].get("id")
@@ -136,10 +168,10 @@ def cmd_setup_email_channel() -> int:
             "variants": [{"subject": "{{ra_subject}}", "body": "{{ra_body}}"}],
         }]
         result = instantly.create_campaign(
-            name=PASSTHROUGH_CAMPAIGN_NAME,
+            name=campaign_name,
             schedule=schedule,
             sequence_steps=sequence_steps,
-            email_list=[settings.relay_instantly_sender_email],
+            email_list=[venture.relay_instantly_sender_email],
         )
         if not result or not result.get("id"):
             _line(f"{_FAIL} campaign creation failed — check INSTANTLY_API_KEY/INSTANTLY_ENABLED and logs")
@@ -148,7 +180,14 @@ def cmd_setup_email_channel() -> int:
         instantly.activate_campaign(campaign_id)
         _line(f"{_OK} created + activated passthrough campaign id={campaign_id}")
 
-    _line(f"\nSet this in .env, then restart Relay:\n  RELAY_INSTANTLY_CAMPAIGN_ID={campaign_id}\n")
+    if venture_key == DEFAULT_VENTURE_KEY:
+        _line(f"\nSet this in .env, then restart Relay:\n  RELAY_INSTANTLY_CAMPAIGN_ID={campaign_id}\n")
+    else:
+        _line(
+            f"\nSet this on the venture row, then restart Relay:\n"
+            f"  UPDATE ventures SET relay_instantly_campaign_id = '{campaign_id}' "
+            f"WHERE venture_key = '{venture_key}';\n"
+        )
     return 0
 
 
@@ -169,9 +208,13 @@ def cmd_seed(args: argparse.Namespace) -> int:
         recipient=args.recipient,
         payload=payload,
         thread_id=args.thread_id,
+        venture_key=args.venture,
     )
     post_for_approval(item)
-    _line(f"{_OK} seeded item id={item.id} idempotency_key={item.idempotency_key!r} status={item.status}")
+    _line(
+        f"{_OK} seeded item id={item.id} venture={item.venture_key} "
+        f"idempotency_key={item.idempotency_key!r} status={item.status}"
+    )
     return 0
 
 
@@ -193,6 +236,12 @@ def main(argv: list[str] | None = None) -> int:
         "--setup-email-channel", action="store_true",
         help="Find or create the Relay passthrough Instantly campaign and print its id (one-time setup) and exit",
     )
+    parser.add_argument(
+        "--venture", default=DEFAULT_VENTURE_KEY,
+        help=f"Venture key to operate on (default: {DEFAULT_VENTURE_KEY}). Scopes "
+             "--sweep's batch, --seed's new row, --health's report and "
+             "--setup-email-channel's campaign.",
+    )
     parser.add_argument("--channel", default="noop", help="Channel for --seed (default: noop)")
     parser.add_argument("--recipient", help="Recipient for --seed (email/phone)")
     parser.add_argument("--payload-json", help="JSON payload for --seed, e.g. '{\"subject\": \"Hi\"}'")
@@ -203,10 +252,10 @@ def main(argv: list[str] | None = None) -> int:
     setup_logging()
 
     if args.health:
-        return cmd_health()
+        return cmd_health(args.venture)
 
     if args.sweep:
-        return cmd_sweep()
+        return cmd_sweep(args.venture)
 
     if args.seed:
         if not args.recipient:
@@ -214,7 +263,7 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_seed(args)
 
     if args.setup_email_channel:
-        return cmd_setup_email_channel()
+        return cmd_setup_email_channel(args.venture)
 
     parser.print_help()
     return 2

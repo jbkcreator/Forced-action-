@@ -30,6 +30,7 @@ from sqlalchemy import and_, case, distinct, func, or_, select, text
 from sqlalchemy.orm import Session
 
 from config.settings import settings
+from config.venture_template import DEFAULT_VENTURE_KEY
 from src.api.deps import get_db
 from src.core.database import get_db_context
 from src.core.models import (
@@ -147,6 +148,42 @@ def _run_tax_enrichment(county_id: str, df: "pd.DataFrame") -> None:
         logger.info("[Admin] Tax enrichment (background) complete: %s", result)
     except Exception:
         logger.exception("[Admin] Tax enrichment (background) failed for county=%s", county_id)
+
+
+@router.post("/entitlements/resync")
+def resync_entitlements(
+    plan_id: Optional[str] = None,
+    dry_run: bool = False,
+    _admin: dict = Depends(get_current_admin),
+    db: Session = Depends(get_db),
+):
+    """Re-propagate `plans.entitlements` onto stale per-account snapshots.
+
+    The snapshot is only written at subscription-activation time, so a plan-catalog
+    edit leaves existing accounts stale and silently excluded from lead delivery.
+    Run this after any catalog change made outside the seed scripts. Scope with
+    `plan_id` to limit the blast radius; `dry_run` reports drift without writing.
+    Returns {drifted, updated, dry_run, plans[]}.
+    """
+    from src.services.entitlement_sync import resync_lead_entitlements
+
+    try:
+        result = resync_lead_entitlements(
+            db, plan_ids=[plan_id] if plan_id else None, dry_run=dry_run
+        )
+        if not dry_run:
+            db.commit()
+    except Exception:
+        db.rollback()
+        logger.error("[Admin] entitlement resync failed", exc_info=True)
+        raise HTTPException(status_code=500, detail="Entitlement resync failed")
+
+    return {
+        "drifted": len(result.drifted),
+        "updated": result.updated,
+        "dry_run": result.dry_run,
+        "plans": sorted(result.plan_ids),
+    }
 
 
 @router.post("/import/founder-portfolio")
@@ -1451,7 +1488,7 @@ def _update_slack_message(candidate: "ExpansionCandidate", reply_text: str) -> N
 # RELAY — APPROVAL QUEUE DECISION + KILL COMMAND (RELAY-v2.2 sub-task R1)
 # ===========================================================================
 
-def _relay_approver_authorized(user_id: str) -> bool:
+def _relay_approver_authorized(user_id: str, venture_key: Optional[str] = None) -> bool:
     """Fail CLOSED: an empty/unset RELAY_APPROVERS means NOBODY is
     authorized, not everybody (PR #179 review finding #3). The previous
     per-endpoint checks (`if approvers and user_id not in approvers`)
@@ -1460,16 +1497,59 @@ def _relay_approver_authorized(user_id: str) -> bool:
     (a valid Slack signature only proves the request came from Slack for
     this app -- it says nothing about which workspace member sent it).
     Shared by both /slack/relay-decision and /slack/kill so the fix lives
-    in one place rather than two easily-desynced copies."""
-    approvers = settings.relay_approvers
-    return bool(approvers) and user_id in approvers
+    in one place rather than two easily-desynced copies.
+
+    `venture_key` widens the list for one venture (CLONE-v2.2 / CL3):
+    RELAY_APPROVERS is the FLEET operator list and authorizes every venture,
+    while a venture's own ventures.relay_approvers adds approvers for just
+    that venture. Union of the two, so venture A's venture-specific approvers
+    still cannot decide venture B's items. Omitted for the fleet-wide
+    /slack/kill command, which has no item and therefore no venture.
+
+    The fleet list is checked FIRST, deliberately: it reads this module's own
+    `settings` binding, needs no DB, and cannot be skewed by
+    get_venture_config()'s 5-minute cache. Both empty still means NOBODY is
+    authorized. (A venture-specific approver removal takes up to that cache
+    TTL to take effect — remove them from the fleet list too if it must be
+    immediate.)
+    """
+    if not user_id:
+        return False
+
+    fleet_approvers = settings.relay_approvers or ()
+    if user_id in fleet_approvers:
+        return True
+
+    if venture_key is None:
+        return False
+
+    from src.utils.venture_config import get_venture_config
+
+    venture_approvers = get_venture_config(venture_key).relay_approvers or ()
+    return user_id in venture_approvers
 
 
-def _update_relay_slack_message(slack_message_ts: str, reply_text: str) -> None:
+def _update_relay_slack_message(
+    slack_message_ts: str, reply_text: str, venture_key: str = DEFAULT_VENTURE_KEY,
+) -> None:
     """Replace the Approve/Reject buttons with the decision outcome, in
-    place. Mirrors _update_slack_message's county-launch pattern."""
+    place. Mirrors _update_slack_message's county-launch pattern.
+
+    The channel must be the venture's own (CLONE-v2.2 / CL3) — a ts from one
+    channel cannot be edited in another, so using a single global channel here
+    would fail every edit for every venture but the first.
+    """
+    from src.utils.venture_config import get_venture_config
+
     token = settings.slack_bot_token
-    channel = settings.relay_slack_channel
+    # `or settings.relay_slack_channel` rather than relying on the resolver's
+    # own settings fallback: the resolver reads config.settings.get_settings(),
+    # which can be a different object from this module's `settings` binding
+    # (see the note in tests/test_relay_slack_endpoints.py's fixture).
+    channel = (
+        get_venture_config(venture_key).relay_slack_channel
+        or settings.relay_slack_channel
+    )
     if not token or not channel or not slack_message_ts:
         return
     try:
@@ -1501,8 +1581,6 @@ def _handle_relay_decision(payload: dict) -> dict:
     from src.services.relay import queue as relay_queue
 
     user_id = payload.get("user", {}).get("id", "")
-    if not _relay_approver_authorized(user_id):
-        return _slack_ephemeral("Not authorized to approve Relay sends.")
 
     actions = payload.get("actions", [])
     if not actions:
@@ -1518,6 +1596,16 @@ def _handle_relay_decision(payload: dict) -> dict:
     if not item_id or action not in ("approve", "reject"):
         raise HTTPException(status_code=400, detail="Invalid action data")
 
+    # Authorization is scoped to the item's own venture (CLONE-v2.2 / CL3), so
+    # the row has to be read before the check. An unknown id falls back to
+    # venture #1's approver list rather than skipping the check.
+    existing = relay_queue.get_item(item_id)
+    venture_key = existing.venture_key if existing is not None else DEFAULT_VENTURE_KEY
+    if not _relay_approver_authorized(user_id, venture_key):
+        return _slack_ephemeral("Not authorized to approve Relay sends.")
+    if existing is None:
+        return _slack_ephemeral(f"Item #{item_id} not found.")
+
     item = relay_queue.record_decision(item_id, approved=(action == "approve"), decided_by=user_id)
     if item is None:
         return _slack_ephemeral(f"Item #{item_id} was already decided (not still pending).")
@@ -1528,7 +1616,7 @@ def _handle_relay_decision(payload: dict) -> dict:
         else f":no_entry: Rejected by <@{user_id}>."
     )
     if item.slack_message_ts:
-        _update_relay_slack_message(item.slack_message_ts, reply_text)
+        _update_relay_slack_message(item.slack_message_ts, reply_text, item.venture_key)
 
     return {"ok": True}
 
@@ -2337,10 +2425,14 @@ def dev_ping(_admin: dict = Depends(get_current_admin)):
 class CountyCreateRequest(BaseModel):
     county_id: str
     display_name: str
+    # Which venture owns this county (CLONE-v2.2 / CL3). Defaults to venture
+    # #1 so existing callers are unaffected.
+    venture_key: str = DEFAULT_VENTURE_KEY
     fips: Optional[str] = None
     nws_zone: Optional[str] = None
     parcel_id_format: str = "folio"
     bankruptcy_division: Optional[str] = None
+    zip_prefixes: list[str] = []
     city_filer_keywords: list[str] = []
     code_lien_type_map: dict = {}
     landing_featured_testimonials: Optional[list[dict]] = None
@@ -2349,10 +2441,12 @@ class CountyCreateRequest(BaseModel):
 
 class CountyUpdateRequest(BaseModel):
     display_name: Optional[str] = None
+    venture_key: Optional[str] = None
     fips: Optional[str] = None
     nws_zone: Optional[str] = None
     parcel_id_format: Optional[str] = None
     bankruptcy_division: Optional[str] = None
+    zip_prefixes: Optional[list[str]] = None
     city_filer_keywords: Optional[list[str]] = None
     code_lien_type_map: Optional[dict] = None
     is_active: Optional[bool] = None
@@ -2401,14 +2495,34 @@ class CountySourceUpdateRequest(BaseModel):
     scrape_mode: Optional[ScrapeMode] = None
 
 
+def _require_venture(venture_key: str, db: Session) -> None:
+    """422 if venture_key names no active venture (CLONE-v2.2 / CL3).
+
+    counties.venture_key is a real foreign key, so without this check a typo'd
+    key surfaces as an IntegrityError and a 500 instead of a message the
+    admin can act on.
+    """
+    exists = db.execute(
+        text("SELECT 1 FROM ventures WHERE venture_key = :key AND is_active = true"),
+        {"key": venture_key},
+    ).first()
+    if not exists:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown or inactive venture '{venture_key}'",
+        )
+
+
 def _county_to_dict(county: County) -> dict:
     return {
         "county_id":           county.county_id,
         "display_name":        county.display_name,
+        "venture_key":         county.venture_key,
         "fips":                county.fips,
         "nws_zone":            county.nws_zone,
         "parcel_id_format":    county.parcel_id_format,
         "bankruptcy_division": county.bankruptcy_division,
+        "zip_prefixes":        county.zip_prefixes or [],
         "city_filer_keywords": county.city_filer_keywords or [],
         "code_lien_type_map":  county.code_lien_type_map or {},
         "landing_featured_testimonials": county.landing_featured_testimonials or [],
@@ -2463,14 +2577,17 @@ def create_county(
 ):
     if db.query(County).filter_by(county_id=body.county_id).first():
         raise HTTPException(status_code=409, detail=f"County '{body.county_id}' already exists")
+    _require_venture(body.venture_key, db)
 
     county = County(
         county_id=body.county_id,
         display_name=body.display_name,
+        venture_key=body.venture_key,
         fips=body.fips,
         nws_zone=body.nws_zone,
         parcel_id_format=body.parcel_id_format,
         bankruptcy_division=body.bankruptcy_division,
+        zip_prefixes=body.zip_prefixes,
         city_filer_keywords=body.city_filer_keywords,
         code_lien_type_map=body.code_lien_type_map,
         landing_featured_testimonials=body.landing_featured_testimonials,
@@ -2509,6 +2626,8 @@ def update_county(
         raise HTTPException(status_code=404, detail=f"County '{county_id}' not found")
 
     updates = body.model_dump(exclude_unset=True)
+    if "venture_key" in updates:
+        _require_venture(updates["venture_key"], db)
     for field, value in updates.items():
         setattr(county, field, value)
 

@@ -23,6 +23,10 @@ GRAPH_TO_PAUSE_TARGET: dict[str, str] = {
     "lifecycle_anomaly_check": "lifecycle_anomaly_check",
     "human_close_routing": "human_close_routing",
     "referral_milestone": "referral_milestone",
+    # Cora — cold-drafting and reply workflows (QUALITY-v2.2 Q2 fix)
+    "cora_outreach": "cora_outreach",
+    "cora_pre_call": "cora_pre_call",
+    "cora_reply":    "cora_reply",
 }
 
 # Maps task_type -> canonical pause_target (fallback for non-graph usage)

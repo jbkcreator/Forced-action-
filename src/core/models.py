@@ -28,6 +28,7 @@ from sqlalchemy import (
     Index,
     func,
     false as sa_false,
+    true as sa_true,
     text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID as PG_UUID
@@ -3999,10 +4000,12 @@ class EnrichmentUsageLog(Base):
     # a degraded-provider event, so a multi-day degradation never re-discounts
     # the same rows (idempotency guard for apply_degraded_discount).
     quality_discounted: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
+    caller: Mapped[Optional[str]] = mapped_column(String(40))   # QUALITY-v2.2 Q2: seat name for P&L attribution
 
     __table_args__ = (
         Index("idx_enrichment_purpose_created", "purpose", "created_at"),
         Index("idx_enrichment_vendor_created", "vendor", "created_at"),
+        Index("idx_enrichment_caller", "caller", postgresql_where=text("caller IS NOT NULL")),
     )
 
     def __repr__(self):
@@ -4068,9 +4071,11 @@ class PlatformRevenueLedger(Base):
     # when the caller doesn't know the actual refunded amount.
     refunded_amount_cents: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    opportunity_thread_id: Mapped[Optional[str]] = mapped_column(String(20))   # QUALITY-v2.2 Q2: links revenue to an agent-driven thread
 
     __table_args__ = (
         UniqueConstraint("source_table", "source_id", name="uq_revenue_ledger_source"),
+        Index("idx_revenue_ledger_thread", "opportunity_thread_id", postgresql_where=text("opportunity_thread_id IS NOT NULL")),
     )
 
     def __repr__(self):
@@ -4780,6 +4785,260 @@ class OwnerAlertDispatch(Base):
 
 
 # ============================================================================
+# VENTURE CONFIGURATION (CLONE-v2.2 / CL3)
+# ============================================================================
+
+class Venture(Base):
+    """
+    One row per business running on this agent fleet.
+
+    A venture owns a Relay sending identity (Slack approval channel,
+    Instantly campaign, sender address, send window, daily ceiling, kill
+    switch) and a geography (state, bankruptcy court, and the set of
+    `counties` rows pointing back here via counties.venture_key). Before
+    CL3 every one of these was a single-valued env global in
+    config/settings.py, which is what made a second venture impossible
+    without code changes.
+
+    Venture #1 is 'hillsborough_distress'. Every venture_key column added
+    by CL3 defaults to it and the CL3 migration seeds this row from the
+    current env values, so a deployment that never creates a second
+    venture behaves exactly as it did before.
+
+    Read at runtime through src/utils/venture_config.py:get_venture_config()
+    (5-minute cache, falls back to config/settings.py when no row exists),
+    never by querying this table directly. config/venture_template.py is
+    the copy-and-fill template; src/services/venture_provisioning.py turns
+    a filled-in copy into rows.
+    """
+    __tablename__ = "ventures"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    venture_key: Mapped[str] = mapped_column(String(60), unique=True, nullable=False)
+    display_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    # Name rendered in the CAN-SPAM footer of every Relay email this
+    # venture sends — replaces the hardcoded "Forced Action" literal that
+    # used to live in src/services/relay/channels_email.py.
+    brand_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    postal_address: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Geography. `state` is read by the flood/insurance/storm scrapers for
+    # NWS + FEMA lookups; the court fields by bankruptcy_engine. Both were
+    # hardcoded to Florida in county_config.py before CL3.
+    state: Mapped[str] = mapped_column(String(2), nullable=False, server_default="FL")
+    bankruptcy_court_code: Mapped[str] = mapped_column(
+        String(10), nullable=False, server_default="flmb"
+    )
+    default_bankruptcy_division: Mapped[str] = mapped_column(
+        String(10), nullable=False, server_default="8:"
+    )
+    # County whose county_sources rows new counties in this venture clone
+    # from (see src/services/venture_provisioning.clone_county_sources).
+    template_county_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+
+    # Relay approval surface.
+    relay_slack_channel: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    relay_approvers: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+
+    # Relay email channel. Each venture needs its own Instantly passthrough
+    # campaign — sharing one would cross-contaminate Instantly's
+    # duplicate-contact guard (docs/adr/0011).
+    relay_instantly_campaign_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    relay_instantly_sender_email: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+
+    # Relay execution guards.
+    relay_send_window_start: Mapped[int] = mapped_column(
+        SmallInteger, nullable=False, server_default=text("11")
+    )
+    relay_send_window_end: Mapped[int] = mapped_column(
+        SmallInteger, nullable=False, server_default=text("18")
+    )
+    relay_send_window_timezone: Mapped[str] = mapped_column(
+        String(60), nullable=False, server_default="America/New_York"
+    )
+    relay_daily_ceiling: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("20")
+    )
+    # Kill-switch feature key checked before every batch and every item.
+    # 'relay_global' shares the fleet-wide Relay stop; a venture-specific
+    # key stops just that venture. The fleet-wide 'global' override takes
+    # precedence over both.
+    kill_switch_feature: Mapped[str] = mapped_column(
+        String(60), nullable=False, server_default="relay_global"
+    )
+
+    # Autonomous venture ladder (CLONE-v2.2 / CL4). Which rung of
+    # radar -> probe -> pilot -> unit_economics -> cell -> spin_up -> portfolio
+    # this venture currently occupies. Advanced only by
+    # src/services/venture_ladder.py:advance(), which refuses on any red gate
+    # and writes a venture_ladder_events audit row for every decision.
+    #
+    # A radar-stage candidate is a real row here with is_active=false: the
+    # CL3 resolver falls back to env settings for an inactive venture, so an
+    # unproven candidate structurally cannot govern sends. That gives one
+    # identity and one join key from radar all the way to portfolio, with no
+    # separate candidate table and no promotion step.
+    ladder_stage: Mapped[str] = mapped_column(
+        String(30), nullable=False, server_default="radar"
+    )
+    ladder_entered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=sa_true()
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "relay_send_window_start >= 0 AND relay_send_window_start <= 24",
+            name="ck_ventures_send_window_start",
+        ),
+        CheckConstraint(
+            "relay_send_window_end >= 0 AND relay_send_window_end <= 24",
+            name="ck_ventures_send_window_end",
+        ),
+        CheckConstraint(
+            "relay_send_window_start < relay_send_window_end",
+            name="ck_ventures_send_window_order",
+        ),
+        CheckConstraint("relay_daily_ceiling > 0", name="ck_ventures_daily_ceiling"),
+        CheckConstraint(
+            "ladder_stage IN ('radar', 'probe', 'pilot', 'unit_economics', "
+            "'cell', 'spin_up', 'portfolio')",
+            name="ck_ventures_ladder_stage",
+        ),
+        Index("idx_ventures_is_active", "is_active"),
+        Index("idx_ventures_ladder_stage", "ladder_stage"),
+    )
+
+    def __repr__(self):
+        return f"<Venture(venture_key={self.venture_key!r}, display_name={self.display_name!r})>"
+
+
+class VentureLadderEvidence(Base):
+    """One recorded fact backing a venture's advance up the ladder (CL4).
+
+    Deliberately one table typed by `evidence_type` rather than a table per
+    kind: every rung needs to record something (a market score, a reachable
+    scrape sample, a presell commitment), the gates only ever count rows and
+    sum a JSONB field, and a new evidence kind must not need a migration.
+    Same idiom as src/connectors/outcomes.py's OutcomeCandidate payload.
+
+    Presell commitments are `evidence_type='presell_commitment'` with a
+    payload of {kind, amount_cents, stripe_payment_intent_id, contact_ref}.
+    `kind` distinguishes deposit/first_month/saved_card and the accepted set
+    lives in config/venture_ladder.py:PRESELL_ACCEPTED_KINDS, so changing
+    what counts as demand evidence is a config edit, not a schema change.
+
+    `verified` is what separates a claim from evidence. Only a row set true
+    by a machine check — a Stripe webhook confirming the deposit actually
+    settled — counts toward a gate; a hand-entered row stays false and is
+    ignored. That is what makes the presell gate autonomous.
+    """
+    __tablename__ = "venture_ladder_evidence"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    venture_key: Mapped[str] = mapped_column(
+        String(60), ForeignKey("ventures.venture_key"), nullable=False
+    )
+    # The rung this evidence was gathered for — kept so a later replay can
+    # tell "probe-stage scrape sample" from a re-sample taken at spin_up.
+    stage: Mapped[str] = mapped_column(String(30), nullable=False)
+    evidence_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    payload: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    # Idempotency handle for machine-recorded evidence: the Stripe
+    # PaymentIntent id for a deposit, the source URL for a scrape sample.
+    # UNIQUE per venture so a webhook retry cannot inflate a presell count.
+    source_ref: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    verified: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_false()
+    )
+    recorded_by: Mapped[str] = mapped_column(String(120), nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+
+    __table_args__ = (
+        Index("ix_venture_ladder_evidence_key_type", "venture_key", "evidence_type"),
+        UniqueConstraint(
+            "venture_key", "evidence_type", "source_ref",
+            name="uq_venture_ladder_evidence_source_ref",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<VentureLadderEvidence(venture_key={self.venture_key!r}, "
+            f"type={self.evidence_type!r}, verified={self.verified})>"
+        )
+
+
+class VentureLadderEvent(Base):
+    """Append-only audit of every ladder decision (CL4).
+
+    Written on advance, on a refused advance, and on an auto-double. Never
+    updated, never deleted.
+
+    `gate_results` stores the computed value, threshold and colour of every
+    gate at decision time, so a doubling or a promotion is reconstructable
+    months later without re-running the queries against data that has since
+    moved. It is also the idempotency source for auto-double: "has this
+    venture already doubled today / within the cooldown" is answered by
+    selecting the last `auto_double` row, not by a Redis flag that expires
+    independently of the ceiling it guards.
+    """
+    __tablename__ = "venture_ladder_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    venture_key: Mapped[str] = mapped_column(
+        String(60), ForeignKey("ventures.venture_key"), nullable=False
+    )
+    from_stage: Mapped[str] = mapped_column(String(30), nullable=False)
+    # Equal to from_stage on a 'blocked' decision and on 'auto_double' —
+    # neither moves the venture.
+    to_stage: Mapped[str] = mapped_column(String(30), nullable=False)
+    decision: Mapped[str] = mapped_column(String(20), nullable=False)
+    gate_results: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    blocked_reasons: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    actor: Mapped[str] = mapped_column(String(120), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc), server_default=func.now(),
+    )
+
+    __table_args__ = (
+        Index("ix_venture_ladder_events_key_created", "venture_key", "created_at"),
+        Index("ix_venture_ladder_events_key_decision", "venture_key", "decision"),
+        CheckConstraint(
+            "decision IN ('advanced', 'blocked', 'auto_double', 'demoted')",
+            name="ck_venture_ladder_events_decision",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<VentureLadderEvent(venture_key={self.venture_key!r}, "
+            f"{self.from_stage!r}->{self.to_stage!r}, decision={self.decision!r})>"
+        )
+
+
+# ============================================================================
 # COUNTY CONFIGURATION (Admin-managed, replaces counties.json)
 # ============================================================================
 
@@ -4793,10 +5052,24 @@ class County(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     county_id: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
     display_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    # Which venture this county belongs to (CLONE-v2.2 / CL3). Pre-CL3 rows
+    # are backfilled to venture #1 by the column default.
+    venture_key: Mapped[str] = mapped_column(
+        String(60),
+        ForeignKey("ventures.venture_key"),
+        nullable=False,
+        server_default="hillsborough_distress",
+    )
     fips: Mapped[Optional[str]] = mapped_column(String(10))
     nws_zone: Mapped[Optional[str]] = mapped_column(String(20))
     parcel_id_format: Mapped[Optional[str]] = mapped_column(String(20), default="folio")
     bankruptcy_division: Mapped[Optional[str]] = mapped_column(String(10))
+    # 3-digit ZIP prefixes belonging to this county, consumed by
+    # county_config.is_zip_in_county(). Empty means "not configured" — the
+    # one caller (src/api/main.py) then falls back to the properties table.
+    zip_prefixes: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
     city_filer_keywords: Mapped[Optional[dict]] = mapped_column(JSONB, default=list)
     code_lien_type_map: Mapped[Optional[dict]] = mapped_column(JSONB, default=dict)
     # Lowercase city/CDP tokens stripped from address suffixes during
@@ -4824,6 +5097,7 @@ class County(Base):
     __table_args__ = (
         Index("idx_counties_county_id", "county_id"),
         Index("idx_counties_is_active", "is_active"),
+        Index("idx_counties_venture_key", "venture_key"),
     )
 
     def __repr__(self):
@@ -4872,6 +5146,24 @@ class CountySource(Base):
         default=False,
         server_default=sa_false(),
     )
+    # QUALITY-v2.2 Q4 — named-alternate source failover plumbing (decision
+    # A2-revised / E3-revised). Both alternate_* columns start NULL and stay
+    # NULL until a real backup source is researched and named for this
+    # (county, signal_type) — out of scope for this build. active_source
+    # flips to 'alternate' only when heartbeat_monitor.py's SLA-breach hook
+    # (src/services/source_failover.py:maybe_failover) finds a non-NULL
+    # alternate_url at the moment of a genuinely new stale alert.
+    alternate_source_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    alternate_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    active_source: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="primary", server_default="primary",
+    )
+    failover_confidence_penalty: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=20, server_default="20",
+    )
+    switched_to_alternate_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -4892,6 +5184,10 @@ class CountySource(Base):
         CheckConstraint(
             "scrape_mode IN ('ai_only','playwright_only','playwright_then_ai','static_download','api')",
             name="ck_county_sources_scrape_mode",
+        ),
+        CheckConstraint(
+            "active_source IN ('primary','alternate')",
+            name="ck_county_sources_active_source",
         ),
     )
 
@@ -6069,13 +6365,23 @@ class GoldenCloseChain(Base):
     snapshot, same relationship LifecyclePlaybook has to the tables it
     summarizes.
 
-    schema_version + venture exist so this can later reconcile with
-    LEARN-v2.2 / L4's own golden-close data model without a breaking
-    migration: a second venture (or a schema revision from L4) adds a new
-    `venture` value / bumps `schema_version` rather than needing a new
-    table. NOT built against an agreed L4 schema yet — this is CL2's own
-    working shape, built in the absence of one, per CLONE-v2.2 lead
-    guidance.
+    schema_version + venture exist for THIS table's own future revisions
+    (a second venture, or a later CL2 schema change) — not for merging
+    with LEARN-v2.2 / L4's golden-close data model. Checked directly:
+    that reconciliation doesn't actually work. This table tracks a
+    subscriber's own real-estate deal, reported after they're already a
+    paying customer (deal_id is a required FK to deal_outcomes). LEARN's
+    L4 golden-close chains track the opposite: how a cold, not-yet-a-
+    customer prospect became one through Cora's outreach — there is no
+    deal_outcomes row for that yet, because the person isn't a customer
+    yet. Two different real-world events that happen to share a name.
+    L4 owns its own separate table, keyed on opportunity_thread_id, not
+    deal_id — do not add a nullable opportunity_thread_id + XOR
+    constraint here to force a merge; that recreates the exact coupling
+    problem AbTest/AbAssignment had before the Agent Lane / Lifecycle
+    schema split (see AgentLaneExperiment's docstring). If a Clone-Pack
+    needs both kinds of proven pattern, the packaging step reads from
+    both tables — the tables themselves stay separate.
     """
     __tablename__ = "golden_close_chains"
 
@@ -8623,6 +8929,16 @@ class RelayApprovalQueueItem(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     idempotency_key: Mapped[str] = mapped_column(String(120), nullable=False, unique=True)
+    # Which venture proposed this action (CLONE-v2.2 / CL3). Scopes the
+    # sweep's batch, the Slack channel it is posted to, the Instantly
+    # campaign it sends through, and the daily-ceiling counter — without it
+    # two ventures would share one send cap and one approval channel.
+    venture_key: Mapped[str] = mapped_column(
+        String(60),
+        ForeignKey("ventures.venture_key"),
+        nullable=False,
+        server_default="hillsborough_distress",
+    )
     batch_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     thread_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)  # OPP-YYYY-#####
     channel: Mapped[str] = mapped_column(String(30), nullable=False)  # noop (R1); email/sms (R2)
@@ -8648,6 +8964,12 @@ class RelayApprovalQueueItem(Base):
     __table_args__ = (
         Index("ix_relay_approval_queue_status", "status"),
         Index("ix_relay_approval_queue_batch_status", "batch_id", "status"),
+        Index("ix_relay_approval_queue_venture_status", "venture_key", "status"),
+        # CL4: venture_ladder.cell_reply_rates() joins outbound_drafts to this
+        # table on (thread_id, venture_key) to count only items that were
+        # really dispatched, so the reply rate the auto-double rule scales on
+        # is never inflated by approved-but-unsent drafts.
+        Index("ix_relay_approval_queue_thread_venture", "thread_id", "venture_key"),
         CheckConstraint(
             "status IN ('pending', 'approved', 'rejected', 'sent', 'failed', 'skipped')",
             name="ck_relay_approval_queue_status",
@@ -8948,6 +9270,16 @@ class OutboundDraft(Base):
     draft_id: Mapped[str] = mapped_column(String(36), primary_key=True)
     opportunity_thread_id: Mapped[str] = mapped_column(String(64), nullable=False)
     buyer_entity_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Which venture produced this draft (CL4). relay_approval_queue already
+    # carries venture_key, but a draft is created before a queue row exists
+    # and the per-cell reply rate must be attributable without depending on
+    # a downstream join that may never happen (rejected drafts never queue).
+    venture_key: Mapped[str] = mapped_column(
+        String(60),
+        ForeignKey("ventures.venture_key"),
+        nullable=False,
+        server_default="hillsborough_distress",
+    )
     cell_id: Mapped[str] = mapped_column(String(50), nullable=False)
     offer: Mapped[str] = mapped_column(String(50), nullable=False)
     avenue: Mapped[str] = mapped_column(String(50), nullable=False)
@@ -8972,10 +9304,23 @@ class OutboundDraft(Base):
     followup_sequence: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     contact_email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     contact_phone: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    # Reply timestamp (CL4). Cora's canonical opportunity state lives in the
+    # append-only file store (src/agents/cora/store.py); this is a dual-write
+    # from opportunity_state.mark_replied() so reply rate is answerable in
+    # SQL, per (venture_key, cell_id), from one indexed table.
+    #
+    # The file store cannot serve that query: it is gitignored, guarded by a
+    # single-process threading.Lock, and read by de-duplicating transitions
+    # at read time. Scaling send volume off a number derived that way is a
+    # correctness bug, so the auto-double rule reads this column instead.
+    replied_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     __table_args__ = (
         Index("ix_outbound_drafts_thread_cell_status", "opportunity_thread_id", "cell_id", "status"),
         Index("ix_outbound_drafts_contact_email", "contact_email"),
+        Index("ix_outbound_drafts_venture_cell_created", "venture_key", "cell_id", "created_at"),
         CheckConstraint(
             "status IN ('draft', 'rejected', 'expired', 'superseded', 'approved_pending_send')",
             name="ck_outbound_drafts_status",
@@ -8986,6 +9331,69 @@ class OutboundDraft(Base):
         return f"<OutboundDraft(draft_id={self.draft_id!r}, thread={self.opportunity_thread_id!r}, status={self.status!r})>"
 
 
+# ── QUALITY-v2.2 Q2 — Agent P&L Ledger ────────────────────────────────────────
+
+class AgentPnl(Base):
+    """Per-seat, per-month P&L ledger (QUALITY-v2.2 Q2).
+
+    One row per (seat, period_month), written by src/tasks/agent_pnl_monthly.py.
+    Never updated after close — a later refund posts in the month it occurs
+    (decision C4). Primary key is the natural key; no autoincrement id.
+    """
+    __tablename__ = "agent_pnl"
+
+    seat: Mapped[str] = mapped_column(String(20), primary_key=True)
+    period_month: Mapped[date] = mapped_column(Date, primary_key=True)
+    attributed_gp_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    compute_cost_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    data_cost_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    founder_minutes_cost_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    net_contribution_cents: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    binding_constraint: Mapped[Optional[str]] = mapped_column(String(40))
+    approval_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    queue_dwell_median_minutes: Mapped[Optional[float]] = mapped_column(Numeric(8, 2))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=text("NOW()"))
+
+    __table_args__ = (
+        CheckConstraint(
+            "seat IN ('vera','cora','hunter','relay','dev_shop','lifecycle')",
+            name="ck_agent_pnl_seat",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return f"<AgentPnl(seat={self.seat!r}, month={self.period_month!r}, net={self.net_contribution_cents})>"
+
+
+class AgentManualCostEntry(Base):
+    """Manually-entered costs with no automated source (QUALITY-v2.2 Q2).
+
+    Used for Dev Shop contractor invoices, Instantly flat-plan cost, Synthflow.
+    Distinct from marketing_spend — that table's channel must map to utm_source
+    for the CAC compiler; adding non-CAC entries there silently breaks it.
+    """
+    __tablename__ = "agent_manual_cost_entries"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    seat: Mapped[str] = mapped_column(String(20), nullable=False)
+    period_month: Mapped[date] = mapped_column(Date, nullable=False)
+    vendor: Mapped[str] = mapped_column(String(40), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text)
+    amount_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    entered_by: Mapped[str] = mapped_column(String(100), nullable=False, server_default=text("'admin'"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=text("NOW()"))
+
+    __table_args__ = (
+        CheckConstraint(
+            "seat IN ('vera','cora','hunter','relay','dev_shop','lifecycle')",
+            name="ck_agent_manual_seat",
+        ),
+        CheckConstraint("amount_cents >= 0", name="ck_agent_manual_amount_nonneg"),
+        Index("idx_agent_manual_seat_month", "seat", "period_month"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<AgentManualCostEntry(seat={self.seat!r}, vendor={self.vendor!r}, cents={self.amount_cents})>"
 # ============================================================================
 # REVINT-v2.2 — VERTICAL AUTOPILOT
 # ============================================================================
@@ -9384,3 +9792,136 @@ class CoraStandingOrder(Base):
 
     def __repr__(self) -> str:
         return f"<CoraStandingOrder(cell_id={self.cell_id!r}, active={self.active!r})>"
+
+# ---------------------------------------------------------------------------
+# QUALITY-v2.2 Q1 — Fleet event-trigger dispatcher
+# Deliberately separate from ProspectEvent/ProcessedEvent/EventFailure:
+# those tables require a NOT NULL prospect_id FK and enumerate a closed set
+# of prospect-lifecycle event types — neither fits a fleet-wide event (a
+# Stripe cancellation or a Dev-Shop finding has no prospect_id). These tables
+# also add a priority column for deadline-aware preemption (spec §9.5).
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# QUALITY-v2.2 Q1 — Fleet event-trigger dispatcher
+# Deliberately separate from ProspectEvent/ProcessedEvent/EventFailure:
+# those tables require a NOT NULL prospect_id FK and enumerate a closed set
+# of prospect-lifecycle event types — neither fits a fleet-wide event (a
+# Stripe cancellation or a Dev-Shop finding has no prospect_id). These tables
+# also add a priority column for deadline-aware preemption (spec §9.5).
+# ---------------------------------------------------------------------------
+
+class FleetEvent(Base):
+    __tablename__ = "fleet_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    event_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    priority: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=100)
+    source_component: Mapped[str] = mapped_column(String(60), nullable=False)
+    subscriber_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("subscribers.id"))
+    opportunity_thread_id: Mapped[Optional[str]] = mapped_column(String(20))
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("NOW()"),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("NOW()"),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "event_type IN ('filing.new','payment.received','reply.received',"
+            "'booking.created','subscription.cancelled','source.failure')",
+            name="ck_fleet_events_event_type",
+        ),
+        CheckConstraint("priority >= 0", name="ck_fleet_events_priority"),
+        Index("idx_fleet_events_type", "event_type"),
+        Index("idx_fleet_events_priority_occurred", "priority", "occurred_at"),
+        Index("idx_fleet_events_subscriber", "subscriber_id"),
+    )
+
+
+class FleetProcessedEvent(Base):
+    __tablename__ = "fleet_processed_events"
+
+    event_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("fleet_events.id", ondelete="CASCADE"), primary_key=True,
+    )
+    consumer: Mapped[str] = mapped_column(String(100), primary_key=True)
+    processed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("NOW()"),
+    )
+
+
+class FleetEventFailure(Base):
+    __tablename__ = "fleet_event_failures"
+
+    event_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("fleet_events.id", ondelete="CASCADE"), primary_key=True,
+    )
+    consumer: Mapped[str] = mapped_column(String(100), primary_key=True)
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[Optional[str]] = mapped_column(Text)
+    failed_permanently: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    last_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        Index("idx_fleet_event_failures_consumer_permanent", "consumer", "failed_permanently"),
+    )
+
+
+class RevenueCanaryAlertLog(Base):
+    """QUALITY-v2.2 Q4 — dedup log for the revenue canary sweep's alert
+    email. A distinct check_name re-alerts at most once per cooldown window
+    (src/tasks/revenue_canary_sweep.py's _ALERT_COOLDOWN_HOURS), same
+    pattern as RevenueHeartbeatAlertLog / ScraperAlertLog.
+    """
+    __tablename__ = "revenue_canary_alert_log"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    check_name: Mapped[str] = mapped_column(String(20), nullable=False)
+    alerted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+
+
+class RevenueCanaryProbeLog(Base):
+    """QUALITY-v2.2 Q4 — dedicated round-trip table for the entitlement/
+    delivery canary checks. One row per check_name ('entitlement',
+    'delivery'), upserted every 5 minutes. Deliberately NOT
+    platform_revenue_ledger or sent_leads — see
+    src/services/revenue_canary.py's module docstring for why.
+    """
+    __tablename__ = "revenue_canary_probe_log"
+
+    check_name: Mapped[str] = mapped_column(String(20), primary_key=True)
+    probe_value: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+
+
+class SourceFailoverLog(Base):
+    """QUALITY-v2.2 Q4 — event log for named-alternate source failover
+    (decision A2-revised). Every SLA-breach-driven switch attempt is
+    recorded here, whether it actually switched to an alternate or logged
+    'no alternate configured'.
+    """
+    __tablename__ = "source_failover_log"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    source_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "event_type IN ('switched_to_alternate','no_alternate_configured','switched_back_to_primary')",
+            name="ck_source_failover_log_event_type",
+        ),
+        Index("idx_source_failover_log_lookup", "source_type", "county_id", "occurred_at"),
+    )

@@ -16,6 +16,7 @@ import inspect
 from dataclasses import fields
 from datetime import datetime, timezone
 
+from config.venture_template import DEFAULT_VENTURE_KEY
 from src.services.relay import queue as relay_queue
 from src.services.relay.queue import QueueItem
 
@@ -28,11 +29,17 @@ def test_enqueue_signature_matches_documented_contract():
     sig = inspect.signature(relay_queue.enqueue)
     params = sig.parameters
 
-    assert set(params) == {"idempotency_key", "channel", "recipient", "payload", "thread_id"}
+    assert set(params) == {
+        "idempotency_key", "channel", "recipient", "payload", "thread_id",
+        # CLONE-v2.2 / CL3 — which venture proposed the action.
+        "venture_key",
+    }
 
     required = {name for name, p in params.items() if p.default is inspect.Parameter.empty}
     assert required == {"idempotency_key", "channel", "recipient", "payload"}
     assert params["thread_id"].default is None
+    # Defaulted, so every pre-CL3 call site keeps enqueueing to venture #1.
+    assert params["venture_key"].default == DEFAULT_VENTURE_KEY
 
     # All keyword-only (enqueue is called with kwargs everywhere -- __main__.py,
     # this contract doc, and Cora's future call site all rely on that).
@@ -65,6 +72,7 @@ def test_row_to_item_maps_all_columns():
         "error": None,
         "dispatched_at": now,
         "created_at": now,
+        "venture_key": "hillsborough_distress",
     }
 
     item = relay_queue._row_to_item(row)
@@ -74,3 +82,4 @@ def test_row_to_item_maps_all_columns():
     assert item.idempotency_key == "key-1"
     assert item.status == "sent"
     assert item.payload == {"subject": "hi"}
+    assert item.venture_key == "hillsborough_distress"
