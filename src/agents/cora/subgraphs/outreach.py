@@ -124,11 +124,24 @@ def _make_node_price_variant(db: Optional[Session]):
 
         thread_id = buyer_entity["opportunity_thread_id"]
         variant = get_price_variant(offer, experiment.id, thread_id, db)
+
+        # Counterfactual logging (§9.4): record the leading alternative NOT
+        # chosen so decision quality is analyzable later. The live A/B decision
+        # at this node is the price ARM (offer/angle are fixed upstream by the
+        # producer's cell pick), so the honest counterfactual here is the price
+        # arm we didn't assign — "we showed test $X; control $Y was the road not
+        # taken". Offer-level counterfactuals ("subscription over pack") need the
+        # producer to surface its runner-up cell and are out of scope here.
+        chose_test = variant.get("arm") == "test"
+        alt_arm = "control" if chose_test else "test"
+        alt_cents = experiment.control_price_cents if chose_test else experiment.test_price_cents
+        leading_alternative = f"{alt_arm}_price_{alt_cents}" if alt_cents is not None else None
         record_decision_snapshot(
             thread_id, experiment.test_name, db,
             message_angle=state.get("angle"),
             offer=offer,
             chosen_action=f"draft_{offer}_cell_{state['cell_id']}",
+            leading_alternative=leading_alternative,
         )
         return {
             "price_cents": variant["price_cents"],
