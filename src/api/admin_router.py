@@ -3569,6 +3569,52 @@ def reject_lifecycle_playbook(
         return {"ok": True, "id": playbook_id, "status": "rejected"}
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# T-LEARN-03 — win/loss reason-code tap (human-supplied loss codes)
+# ─────────────────────────────────────────────────────────────────────────
+
+class _OpportunityOutcomeBody(BaseModel):
+    opportunity_thread_id: str = Field(..., min_length=1, max_length=20,
+                                       description="OPP-YYYY-##### thread id")
+    reason_code: str = Field(..., description="One of the eight loss codes")
+
+
+@router.post("/opportunity-outcome")
+def record_opportunity_loss(
+    body: _OpportunityOutcomeBody,
+    _admin: dict = Depends(get_current_admin),
+):
+    """Record a human-supplied terminal LOSS on an Agent Lane opportunity.
+
+    Wins are auto-coded from payment.received; this tap is how Josh supplies
+    the loss reason. Idempotent — a thread already terminal is not overwritten.
+    """
+    from src.services.opportunity_outcome import LOSS_REASON_CODES, record_loss
+
+    if body.reason_code not in LOSS_REASON_CODES:
+        raise HTTPException(status_code=422, detail={
+            "error": "invalid_reason_code",
+            "message": f"reason_code must be one of {list(LOSS_REASON_CODES)}",
+        })
+
+    with get_db_context() as db:
+        inserted = record_loss(
+            db, body.opportunity_thread_id,
+            reason_code=body.reason_code,
+            coded_by="admin",
+        )
+        db.commit()
+
+    return {
+        "ok": True,
+        "opportunity_thread_id": body.opportunity_thread_id,
+        "outcome": "lost",
+        "reason_code": body.reason_code,
+        "inserted": inserted,
+        "note": None if inserted else "thread already had a terminal outcome",
+    }
+
+
 @router.post("/lifecycle-playbook/{playbook_id}/retire")
 def retire_lifecycle_playbook(
     playbook_id: int,

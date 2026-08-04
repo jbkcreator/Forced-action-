@@ -941,6 +941,12 @@ COUNTY_ID=hillsborough
 # overnight sends have been processed and fleet_events accumulated.
 0 7 * * * $PROJECT/scripts/cron/run.sh src.tasks.experiment_attribution_sweep
 
+# LEARN-v2.2 T-LEARN-03 — daily opportunity outcome sweep (08:00 UTC). Codes
+# wins from payment.received fleet events and no_response losses by 30-day
+# timeout (thread had >=1 draft, no reply.received, no outcome row). Other loss
+# reasons are human-supplied via POST /api/admin/opportunity-outcome.
+0 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.opportunity_timeout_sweep
+
 # T-B12-07 — Tier3 win-back reactivation sweep (lapsed <30d zip-held /
 # >=30d zip-released branches). Runs alongside the existing S0 cohorts.
 30 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.reactivation_scheduler --cohort tier3_winback

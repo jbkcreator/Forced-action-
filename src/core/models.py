@@ -9983,3 +9983,38 @@ class ExperimentAttribution(Base):
             name="ck_experiment_attribution_method",
         ),
     )
+
+
+class AgentLaneOpportunityOutcome(Base):
+    """LEARN-v2.2 T-LEARN-03 — the terminal outcome of one Agent Lane opportunity.
+
+    No pre-existing row owned "this opportunity is over, and here is why" —
+    opportunity_thread_id was a bare string across BuyerEntity/OpportunityScore/
+    OutboundDraft/PriceAssignment. This table is that missing home. One row per
+    thread (UNIQUE). outcome='won' needs no reason; outcome='lost' carries one of
+    the spec's eight loss codes. Win is auto-coded from payment.received; loss is
+    supplied by a human tap (Josh) except no_response, which a 30-day timeout
+    sweep auto-codes.
+    """
+    __tablename__ = "agent_lane_opportunity_outcomes"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    opportunity_thread_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    outcome: Mapped[str] = mapped_column(String(10), nullable=False)  # 'won' | 'lost'
+    reason_code: Mapped[Optional[str]] = mapped_column(String(20))    # one of 8 loss codes, NULL on won
+    coded_by: Mapped[str] = mapped_column(String(60), nullable=False) # actor: 'payment_webhook','opportunity_timeout_sweep','admin:<who>'
+    source_ref: Mapped[Optional[str]] = mapped_column(String(120))    # e.g. fleet_event id, or note
+    coded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("opportunity_thread_id", name="uq_agent_lane_opportunity_outcome"),
+        Index("idx_alo_outcome_reason", "outcome", "reason_code"),
+        CheckConstraint("outcome IN ('won','lost')", name="ck_alo_outcome"),
+        CheckConstraint(
+            "(outcome = 'won' AND reason_code IS NULL) OR "
+            "(outcome = 'lost' AND reason_code IN "
+            "('timing','price','trust','fit','no_urgency','wrong_contact','competitor','no_response'))",
+            name="ck_alo_reason_code",
+        ),
+    )
