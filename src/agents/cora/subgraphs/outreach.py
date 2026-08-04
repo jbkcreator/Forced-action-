@@ -35,6 +35,13 @@ class OutreachState(TypedDict, total=False):
     contact_phone: Optional[str]
     is_followup: bool                      # set by followup_scheduler.py; see validate_can_draft
     followup_sequence: Optional[int]       # 1 (day-2), 2 (day-5), ... — None for the original touch
+    # Which venture this target belongs to (CLONE-v2.2 / CL4). Producers set
+    # this from the target's county (see ingestion/target_producer.py); if a
+    # caller omits it, _node_persist derives it from buyer_entity["county_id"]
+    # rather than silently falling through to OutboundDraftRecord's default —
+    # see that field's docstring for why a wrong value here is a production bug,
+    # not a cosmetic one.
+    venture_key: str
 
     # ── Derived ──────────────────────────────────────────────────────────────
     offer: str
@@ -224,6 +231,9 @@ def _make_node_persist(db: Optional[Session]):
             return {"terminal_status": state.get("terminal_status", "rejected")}
 
         buyer_entity = state["buyer_entity"]
+        venture_key = state.get("venture_key") or store.venture_key_for_county(
+            db, buyer_entity.get("county_id")
+        )
         draft_id = store.new_draft_id()
         record = store.OutboundDraftRecord(
             draft_id=draft_id,
@@ -245,6 +255,7 @@ def _make_node_persist(db: Optional[Session]):
             followup_sequence=state.get("followup_sequence"),
             contact_email=state.get("contact_email"),
             contact_phone=state.get("contact_phone"),
+            venture_key=venture_key,
             price_cents=state.get("price_cents"),
             experiment_assignment_id=state.get("experiment_assignment_id"),
         )

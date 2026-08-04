@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
 
+from config.venture_template import DEFAULT_VENTURE_KEY
 from src.services.relay import guards
 from src.services.relay.queue import QueueItem
 
@@ -118,10 +119,15 @@ def test_noop_channel_allows_without_suppression_check(monkeypatch):
 # RELAY-v2.2 PR #179 review fix — atomic daily-ceiling reservation
 # ---------------------------------------------------------------------------
 
-def _fake_settings(ceiling: int = 20):
+def _fake_settings(ceiling: int = 20, venture_key: str = DEFAULT_VENTURE_KEY):
+    # venture_key must be set explicitly (CLONE-v2.2 / CL3): _daily_slot_key
+    # reads it with a getattr fallback, and a MagicMock answers every getattr
+    # with another Mock, which would silently produce a garbage Redis key
+    # rather than fall back to the default.
     return MagicMock(
         relay_send_window_timezone="America/New_York",
         relay_daily_ceiling=ceiling,
+        venture_key=venture_key,
     )
 
 
@@ -152,16 +158,46 @@ def test_reserve_fails_closed_when_redis_unavailable(monkeypatch):
     assert guards.reserve_daily_slot("email", _et(2026, 7, 27, 14), _fake_settings(20)) is False
 
 
-def test_reserve_key_is_scoped_by_channel_and_local_date(monkeypatch):
+def test_reserve_key_is_scoped_by_venture_channel_and_local_date(monkeypatch):
     seen_keys = []
     monkeypatch.setattr(guards, "rincr", lambda key, ttl_seconds=None: seen_keys.append(key) or 1)
     guards.reserve_daily_slot("email", _et(2026, 7, 27, 14), _fake_settings(20))
     guards.reserve_daily_slot("sms", _et(2026, 7, 27, 14), _fake_settings(20))
-    assert seen_keys == ["relay_daily_sent:email:2026-07-27", "relay_daily_sent:sms:2026-07-27"]
+    assert seen_keys == [
+        f"relay_daily_sent:{DEFAULT_VENTURE_KEY}:email:2026-07-27",
+        f"relay_daily_sent:{DEFAULT_VENTURE_KEY}:sms:2026-07-27",
+    ]
+
+
+def test_reserve_key_separates_two_ventures(monkeypatch):
+    """CLONE-v2.2 / CL3: the ceiling is a per-sender reputation limit, so two
+    ventures must not share one counter."""
+    seen_keys = []
+    monkeypatch.setattr(guards, "rincr", lambda key, ttl_seconds=None: seen_keys.append(key) or 1)
+    guards.reserve_daily_slot("email", _et(2026, 7, 27, 14), _fake_settings(20, "venture_one"))
+    guards.reserve_daily_slot("email", _et(2026, 7, 27, 14), _fake_settings(20, "venture_two"))
+    assert seen_keys == [
+        "relay_daily_sent:venture_one:email:2026-07-27",
+        "relay_daily_sent:venture_two:email:2026-07-27",
+    ]
+
+
+def test_reserve_key_falls_back_to_venture_one_without_a_venture_key(monkeypatch):
+    """A plain settings object has no venture_key and belongs to venture #1 by
+    definition — any pre-CL3 caller keeps counting against the same key."""
+    seen_keys = []
+    monkeypatch.setattr(guards, "rincr", lambda key, ttl_seconds=None: seen_keys.append(key) or 1)
+
+    class _SettingsWithoutVenture:
+        relay_send_window_timezone = "America/New_York"
+        relay_daily_ceiling = 20
+
+    guards.reserve_daily_slot("email", _et(2026, 7, 27, 14), _SettingsWithoutVenture())
+    assert seen_keys == [f"relay_daily_sent:{DEFAULT_VENTURE_KEY}:email:2026-07-27"]
 
 
 def test_release_decrements_the_same_key(monkeypatch):
     seen = {}
     monkeypatch.setattr(guards, "rdecr", lambda key: seen.setdefault("key", key))
     guards.release_daily_slot("email", _et(2026, 7, 27, 14), _fake_settings(20))
-    assert seen["key"] == "relay_daily_sent:email:2026-07-27"
+    assert seen["key"] == f"relay_daily_sent:{DEFAULT_VENTURE_KEY}:email:2026-07-27"

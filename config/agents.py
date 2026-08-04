@@ -50,6 +50,21 @@ class AgentsSettings(AppSettings):
 		description="Circuit breaker for a graph looping through nodes",
 	)
 
+	# ── Founder cost constants (QUALITY-v2.2 Q2 P&L rollup) ──────────────────
+	founder_minutes_per_approval: int = Field(
+		default=5,
+		env="FOUNDER_MINUTES_PER_APPROVAL",
+		description=(
+			"Minutes of founder attention per approval/rejection in relay_approval_queue. "
+			"Ratified by Josh; do not change without a new ratification."
+		),
+	)
+	founder_minute_rate_cents: int = Field(
+		default=417,
+		env="FOUNDER_MINUTE_RATE_CENTS",
+		description="Cents per founder-minute for the P&L formula. $4.17/min ($250/hr), ratified by Josh.",
+	)
+
 	# ── LangSmith tracing ─────────────────────────────────────────────────────
 	langsmith_api_key: Optional[SecretStr] = Field(
 		default=None,

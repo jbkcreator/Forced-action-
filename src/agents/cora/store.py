@@ -34,6 +34,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
+from config.venture_template import DEFAULT_VENTURE_KEY
+
 DATA_DIR = Path(__file__).resolve().parents[3] / "data" / "cora"
 
 DRAFT_MAX_AGE_HOURS = 72
@@ -175,6 +177,16 @@ class OutboundDraftRecord:
     followup_sequence: Optional[int] = None
     contact_email: Optional[str] = None
     contact_phone: Optional[str] = None
+    # Which venture produced this draft (CLONE-v2.2 / CL4). Defaults to venture
+    # #1, so nothing about the existing single-venture path changes.
+    #
+    # It has to be written here rather than inferred downstream: per-cell and
+    # per-venture reply rate is read off this column
+    # (src/services/venture_ladder.py:cell_reply_rates), and that number is what
+    # the auto-double rule scales real sending volume on. A second venture whose
+    # drafts all carried venture #1's key would have a permanently empty reply
+    # rate and could never scale.
+    venture_key: str = DEFAULT_VENTURE_KEY
     # LEARN-v2.2 Layer 1 — the price fact cited in this draft (if the offer
     # has a configured price band, price_assignment.is_respa_excluded() is
     # False, and PRICE_BAND_TESTING_ENABLED — currently False everywhere,
@@ -190,6 +202,27 @@ def new_draft_id() -> str:
     return str(uuid.uuid4())
 
 
+def venture_key_for_county(db: Any, county_id: Optional[str]) -> str:
+    """The venture `county_id` belongs to, or DEFAULT_VENTURE_KEY if unresolvable.
+
+    Draft-persistence call sites (outreach.py, post_call_recap.py) must call
+    this rather than trust OutboundDraftRecord.venture_key's default. Per-cell
+    and per-venture reply rate is read off the venture_key column
+    (src/services/venture_ladder.py:cell_reply_rates), and a second venture's
+    drafts that silently defaulted to venture #1 would have a permanently
+    empty reply rate — and could never advance the cell rung or auto-double.
+    """
+    if not county_id:
+        return DEFAULT_VENTURE_KEY
+    from sqlalchemy import text
+
+    row = db.execute(
+        text("SELECT venture_key FROM counties WHERE county_id = :county_id"),
+        {"county_id": county_id},
+    ).first()
+    return row.venture_key if row and row.venture_key else DEFAULT_VENTURE_KEY
+
+
 def _draft_row_to_dict(row: Any) -> Dict[str, Any]:
     d = dict(row)
     if d.get("created_at") is not None:
@@ -202,7 +235,7 @@ _DRAFT_COLUMNS = (
     "subject, body, facts_used, source_refs, recommended_channel, confidence_score, "
     "status, booking_link, payment_link, reject_reason, created_at, schema_version, "
     "published, is_followup, followup_sequence, contact_email, contact_phone, "
-    "price_cents, experiment_assignment_id"
+    "venture_key, price_cents, experiment_assignment_id"
 )
 
 
@@ -216,7 +249,7 @@ def append_draft(db: Any, record: OutboundDraftRecord) -> None:
                 :subject, :body, :facts_used, :source_refs, :recommended_channel, :confidence_score,
                 :status, :booking_link, :payment_link, :reject_reason, :created_at, :schema_version,
                 :published, :is_followup, :followup_sequence, :contact_email, :contact_phone,
-                :price_cents, :experiment_assignment_id
+                :venture_key, :price_cents, :experiment_assignment_id
             )
         """),
         {

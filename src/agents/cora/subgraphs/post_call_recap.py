@@ -44,6 +44,7 @@ class PostCallRecapState(TypedDict, total=False):
 
     # ── Derived ──────────────────────────────────────────────────────────────
     buyer_entity: Dict[str, Any]
+    venture_key: str  # derived in _node_gate from buyer_entity["county_id"]
     conversation: List[Dict[str, Any]]
     contact_email: Optional[str]
     contact_phone: Optional[str]
@@ -110,6 +111,7 @@ def _make_node_gate(db: Optional[Session]):
 
         return {
             "buyer_entity": buyer_entity,
+            "venture_key": store.venture_key_for_county(db, buyer_entity.get("county_id")),
             "conversation": store.read_conversation(db, state["opportunity_thread_id"]),
             "contact_email": contact.get("email"),
             "contact_phone": contact.get("phone"),
@@ -209,6 +211,9 @@ def _make_node_persist(db: Optional[Session]):
             payment_link=state.get("payment_link"),
             contact_email=state.get("contact_email"),
             contact_phone=state.get("contact_phone"),
+            venture_key=state.get("venture_key") or store.venture_key_for_county(
+                db, buyer_entity.get("county_id")
+            ),
         )
         store.append_draft(db, record)
         store.index_contact_email(state.get("contact_email"), state["opportunity_thread_id"])

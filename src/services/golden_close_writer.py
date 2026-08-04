@@ -4,11 +4,12 @@ Golden CLOSE library writer (CLONE-v2.2 CL2).
 Assembles and stores one golden_close_chains row per closed deal — the full
 winning chain (first signal -> enrichment -> first outreach -> objections
 handled -> call -> proposal -> payment -> account expansion) as a portable
-snapshot. See GoldenCloseChain in src/core/models.py for the schema
-rationale, including why this is CL2's own working shape rather than an
-agreed LEARN-v2.2 / L4 schema (L4 hadn't landed a golden-close data model in
-this repo at the time this was built; built ahead of it per lead guidance
-rather than blocking on coordination).
+snapshot, for a subscriber's own real-estate deal (requires an existing
+deal_outcomes row). See GoldenCloseChain in src/core/models.py: this is
+NOT the same thing as LEARN-v2.2 / L4's golden-close chains (Cora's
+pre-customer cold-outbound conversions, which have no deal_outcomes row
+to attach to) — the two were checked directly and don't reconcile into
+one schema. L4 owns a separate table for its own chains.
 
 All DB I/O is raw SQL via sa_text — repo convention.
 """

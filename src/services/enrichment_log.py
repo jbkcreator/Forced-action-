@@ -48,8 +48,12 @@ def log_usage(
     target_address: Optional[str] = None,
     error: Optional[str] = None,
     request_ref: Optional[str] = None,
+    caller: Optional[str] = None,
 ) -> Optional[EnrichmentUsageLog]:
-    """Insert one EnrichmentUsageLog row. Best-effort — swallows errors."""
+    """Insert one EnrichmentUsageLog row. Best-effort — swallows errors.
+
+    caller: seat name ('hunter', 'relay', etc.) for QUALITY-v2.2 Q2 P&L attribution.
+    """
     try:
         if cost_cents is None:
             cost_cents = DEFAULT_COST_CENTS.get((vendor, purpose), 0)
@@ -63,6 +67,7 @@ def log_usage(
             success=success,
             error=(error or "")[:255] if error else None,
             request_ref=request_ref,
+            caller=caller,
         )
         db.add(row)
         db.flush()
