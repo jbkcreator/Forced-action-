@@ -980,4 +980,29 @@ COUNTY_ID=hillsborough
 # Sign-off received — enabled 2026-07-28.
 0 2 1,15 * * $PROJECT/scripts/cron/run.sh src.tasks.dnc_refresh --targets subscribers
 
+# ── LESSON HYGIENE (LEARN-v2.2 Layer 4, Step 12) ─────────────
+# Flags outdated and disproven lifecycle_playbook lessons so nobody prunes the
+# fleet's learned memory by hand. Calls the existing
+# supersede_recommendation / mark_contradicted tools; decides nothing new
+# about what a lesson means.
+#
+# 10:15 UTC — after ab_rollback_check and lifecycle_holdout_check (09:00) have
+# authored the day's lessons, so a lesson written this morning is judged
+# against today's evidence rather than yesterday's.
+#
+# DELIBERATELY DRY-RUN. --apply is omitted, so this run only reports. Two
+# reasons it stays that way until someone decides otherwise:
+#   1. Neither tool has an inverse. mark_contradicted cannot be un-marked, so
+#      a false positive is only reversible by hand.
+#   2. The evidence feed (agent_decisions.playbook_id) currently carries zero
+#      rows, so no lesson can be measured yet. The digest reports that state
+#      explicitly rather than reading "no evidence" as "nothing is wrong".
+# Run dry for a week, read the digest, then add --apply.
+#
+# Requires migrations/apply_lifecycle_playbook_lessons_versioning.py to have
+# been applied. Without it the job reports schema_not_ready and exits 1
+# without touching anything — mark_contradicted would otherwise raise a CHECK
+# violation, since the live constraint permits only four status values.
+15 10 * * * $PROJECT/scripts/cron/run.sh src.tasks.learning_hygiene_sweep
+
 # === END FORCED-ACTION-PLATFORM ===
