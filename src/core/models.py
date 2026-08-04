@@ -6298,13 +6298,23 @@ class GoldenCloseChain(Base):
     snapshot, same relationship LifecyclePlaybook has to the tables it
     summarizes.
 
-    schema_version + venture exist so this can later reconcile with
-    LEARN-v2.2 / L4's own golden-close data model without a breaking
-    migration: a second venture (or a schema revision from L4) adds a new
-    `venture` value / bumps `schema_version` rather than needing a new
-    table. NOT built against an agreed L4 schema yet — this is CL2's own
-    working shape, built in the absence of one, per CLONE-v2.2 lead
-    guidance.
+    schema_version + venture exist for THIS table's own future revisions
+    (a second venture, or a later CL2 schema change) — not for merging
+    with LEARN-v2.2 / L4's golden-close data model. Checked directly:
+    that reconciliation doesn't actually work. This table tracks a
+    subscriber's own real-estate deal, reported after they're already a
+    paying customer (deal_id is a required FK to deal_outcomes). LEARN's
+    L4 golden-close chains track the opposite: how a cold, not-yet-a-
+    customer prospect became one through Cora's outreach — there is no
+    deal_outcomes row for that yet, because the person isn't a customer
+    yet. Two different real-world events that happen to share a name.
+    L4 owns its own separate table, keyed on opportunity_thread_id, not
+    deal_id — do not add a nullable opportunity_thread_id + XOR
+    constraint here to force a merge; that recreates the exact coupling
+    problem AbTest/AbAssignment had before the Agent Lane / Lifecycle
+    schema split (see AgentLaneExperiment's docstring). If a Clone-Pack
+    needs both kinds of proven pattern, the packaging step reads from
+    both tables — the tables themselves stay separate.
     """
     __tablename__ = "golden_close_chains"
 
