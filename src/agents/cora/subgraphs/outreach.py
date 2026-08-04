@@ -23,6 +23,7 @@ from src.agents.cora import contracts, offer_links, opportunity_state, store
 from src.agents.cora.validation import validate_can_draft
 from src.services.claude_router import call_claude_with_usage
 from src.services.playbook_retrieval import fetch_lessons, format_lessons_for_prompt
+from src.services.prompt_experiment_engine import get_prompt_system
 
 logger = logging.getLogger(__name__)
 
@@ -156,17 +157,12 @@ def _build_prompt(state: OutreachState, db=None) -> tuple[str, str]:
         lessons = fetch_lessons(db, agent_domain="cora", context=context)
         lesson_block = format_lessons_for_prompt(lessons)
 
-    system = (
-        "You are drafting a single cold outreach email for Forced Action, a distressed-property "
-        "intelligence platform, to a real-estate buyer entity. Ground every claim ONLY in the facts "
-        "listed below — never invent a number, date, name, or detail not present in the facts, "
-        "INCLUDING seat numbers, slot counts, deadlines, or any other specific not explicitly listed. "
-        "If the angle implies a specific (e.g. a numbered seat) and no fact supplies one, write the "
-        "framing generically (e.g. 'a founding seat') rather than inventing a number. If you cannot "
-        "support a sentence with a listed fact, do not write it. Keep the tone like one sharp Florida "
-        "investor talking to another: specific, respectful of time, one clear ask. Under 120 words unless "
-        "the angle genuinely needs more. Output exactly two lines: 'SUBJECT: <subject>' then "
-        "'BODY: <body>'."
+    system = get_prompt_system(
+        db,
+        buyer_entity["opportunity_thread_id"],
+        offer=state.get("offer", ""),
+        avenue=state.get("avenue", ""),
+        angle=state.get("angle", ""),
     )
     if lesson_block:
         system = system + "\n\n" + lesson_block
