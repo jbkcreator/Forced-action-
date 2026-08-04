@@ -197,6 +197,15 @@ COUNTY_ID=hillsborough
 #     in src/tasks/heartbeat_monitor.py — no false positives.
 */15 7-23 * * * $PROJECT/scripts/cron/run.sh src.tasks.heartbeat_monitor
 
+# QUALITY-v2.2 Q4 — Revenue-path canaries (checkout / payment_link /
+# entitlement / delivery / mail / model_api). Every 5 minutes, all day —
+# revenue can break at any hour, unlike scraper freshness which only
+# matters during scrape windows. Always Stripe TEST mode (decision E2);
+# see src/services/revenue_canary.py's module docstring. 1h alert cooldown
+# per check (revenue_canary_alert_log) — the first alert on a new break
+# still fires within 5 minutes.
+*/5 * * * * $PROJECT/scripts/cron/run.sh src.tasks.revenue_canary_sweep
+
 # 19. Anomaly Pager — 08:05 AM UTC Mon-Sat (after CDS rescore 07:00, skip-tracing
 #     07:30, lead_quality_monitor 07:35; avoids the 08:00 spike with ghl_sync).
 #     Daily volume/coverage rules against 7-day baseline. 12h dedup per rule.
@@ -256,6 +265,11 @@ COUNTY_ID=hillsborough
 # → outcome_snapshot + outcome_loss_autopsy (dead+lead-fault only). Both
 # idempotent. Decouples the buyer's one-tap outcome from score recalculation.
 1-59/2 * * * * $PROJECT/scripts/cron/run.sh src.tasks.outcome_dispatch_sweep
+
+# QUALITY-v2.2 Q1 — fleet event-trigger dispatcher. Every 2 minutes, staggered
+# 1 minute off outcome_dispatch_sweep/loan_lane_sweep so all three don't fire
+# in the same tick.
+0-59/2 * * * * $PROJECT/scripts/cron/run.sh src.tasks.fleet_event_sweep
 
 # Lifecycle anomaly check — volume + no-answer rate monitor — every 15 min
 */15 * * * * $PROJECT/scripts/cron/run.sh src.tasks.lifecycle_anomaly_check

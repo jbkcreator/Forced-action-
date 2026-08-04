@@ -5075,6 +5075,24 @@ class CountySource(Base):
         default=False,
         server_default=sa_false(),
     )
+    # QUALITY-v2.2 Q4 — named-alternate source failover plumbing (decision
+    # A2-revised / E3-revised). Both alternate_* columns start NULL and stay
+    # NULL until a real backup source is researched and named for this
+    # (county, signal_type) — out of scope for this build. active_source
+    # flips to 'alternate' only when heartbeat_monitor.py's SLA-breach hook
+    # (src/services/source_failover.py:maybe_failover) finds a non-NULL
+    # alternate_url at the moment of a genuinely new stale alert.
+    alternate_source_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    alternate_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    active_source: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="primary", server_default="primary",
+    )
+    failover_confidence_penalty: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=20, server_default="20",
+    )
+    switched_to_alternate_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -5095,6 +5113,10 @@ class CountySource(Base):
         CheckConstraint(
             "scrape_mode IN ('ai_only','playwright_only','playwright_then_ai','static_download','api')",
             name="ck_county_sources_scrape_mode",
+        ),
+        CheckConstraint(
+            "active_source IN ('primary','alternate')",
+            name="ck_county_sources_active_source",
         ),
     )
 
@@ -9626,3 +9648,136 @@ class CoraStandingOrder(Base):
 
     def __repr__(self) -> str:
         return f"<CoraStandingOrder(cell_id={self.cell_id!r}, active={self.active!r})>"
+
+# ---------------------------------------------------------------------------
+# QUALITY-v2.2 Q1 — Fleet event-trigger dispatcher
+# Deliberately separate from ProspectEvent/ProcessedEvent/EventFailure:
+# those tables require a NOT NULL prospect_id FK and enumerate a closed set
+# of prospect-lifecycle event types — neither fits a fleet-wide event (a
+# Stripe cancellation or a Dev-Shop finding has no prospect_id). These tables
+# also add a priority column for deadline-aware preemption (spec §9.5).
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# QUALITY-v2.2 Q1 — Fleet event-trigger dispatcher
+# Deliberately separate from ProspectEvent/ProcessedEvent/EventFailure:
+# those tables require a NOT NULL prospect_id FK and enumerate a closed set
+# of prospect-lifecycle event types — neither fits a fleet-wide event (a
+# Stripe cancellation or a Dev-Shop finding has no prospect_id). These tables
+# also add a priority column for deadline-aware preemption (spec §9.5).
+# ---------------------------------------------------------------------------
+
+class FleetEvent(Base):
+    __tablename__ = "fleet_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    event_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    priority: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=100)
+    source_component: Mapped[str] = mapped_column(String(60), nullable=False)
+    subscriber_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("subscribers.id"))
+    opportunity_thread_id: Mapped[Optional[str]] = mapped_column(String(20))
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default=text("'{}'::jsonb"))
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("NOW()"),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("NOW()"),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "event_type IN ('filing.new','payment.received','reply.received',"
+            "'booking.created','subscription.cancelled','source.failure')",
+            name="ck_fleet_events_event_type",
+        ),
+        CheckConstraint("priority >= 0", name="ck_fleet_events_priority"),
+        Index("idx_fleet_events_type", "event_type"),
+        Index("idx_fleet_events_priority_occurred", "priority", "occurred_at"),
+        Index("idx_fleet_events_subscriber", "subscriber_id"),
+    )
+
+
+class FleetProcessedEvent(Base):
+    __tablename__ = "fleet_processed_events"
+
+    event_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("fleet_events.id", ondelete="CASCADE"), primary_key=True,
+    )
+    consumer: Mapped[str] = mapped_column(String(100), primary_key=True)
+    processed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=text("NOW()"),
+    )
+
+
+class FleetEventFailure(Base):
+    __tablename__ = "fleet_event_failures"
+
+    event_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("fleet_events.id", ondelete="CASCADE"), primary_key=True,
+    )
+    consumer: Mapped[str] = mapped_column(String(100), primary_key=True)
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[Optional[str]] = mapped_column(Text)
+    failed_permanently: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    last_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        Index("idx_fleet_event_failures_consumer_permanent", "consumer", "failed_permanently"),
+    )
+
+
+class RevenueCanaryAlertLog(Base):
+    """QUALITY-v2.2 Q4 — dedup log for the revenue canary sweep's alert
+    email. A distinct check_name re-alerts at most once per cooldown window
+    (src/tasks/revenue_canary_sweep.py's _ALERT_COOLDOWN_HOURS), same
+    pattern as RevenueHeartbeatAlertLog / ScraperAlertLog.
+    """
+    __tablename__ = "revenue_canary_alert_log"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    check_name: Mapped[str] = mapped_column(String(20), nullable=False)
+    alerted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+
+
+class RevenueCanaryProbeLog(Base):
+    """QUALITY-v2.2 Q4 — dedicated round-trip table for the entitlement/
+    delivery canary checks. One row per check_name ('entitlement',
+    'delivery'), upserted every 5 minutes. Deliberately NOT
+    platform_revenue_ledger or sent_leads — see
+    src/services/revenue_canary.py's module docstring for why.
+    """
+    __tablename__ = "revenue_canary_probe_log"
+
+    check_name: Mapped[str] = mapped_column(String(20), primary_key=True)
+    probe_value: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+
+
+class SourceFailoverLog(Base):
+    """QUALITY-v2.2 Q4 — event log for named-alternate source failover
+    (decision A2-revised). Every SLA-breach-driven switch attempt is
+    recorded here, whether it actually switched to an alternate or logged
+    'no alternate configured'.
+    """
+    __tablename__ = "source_failover_log"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    source_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    county_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    detail: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "event_type IN ('switched_to_alternate','no_alternate_configured','switched_back_to_primary')",
+            name="ck_source_failover_log_event_type",
+        ),
+        Index("idx_source_failover_log_lookup", "source_type", "county_id", "occurred_at"),
+    )

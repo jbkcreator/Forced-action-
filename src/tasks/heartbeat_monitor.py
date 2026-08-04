@@ -39,6 +39,7 @@ from sqlalchemy import and_, func, or_
 from src.core.database import get_db_context
 from src.core.models import ScraperAlertLog, ScraperRunStats
 from src.services.email import send_alert
+from src.services.source_failover import maybe_failover, mark_recovered
 from src.utils.logger import setup_logging
 
 setup_logging()
@@ -374,6 +375,37 @@ def _clear_dedup_for_recovered_sources(beats: list["Heartbeat"]) -> None:
         logger.warning("[Heartbeat] dedup cleanup on recovery failed: %s", exc)
 
 
+def _trigger_failover_check(b: "Heartbeat") -> None:
+    """QUALITY-v2.2 Q4 — Hunter's automatic source-failover trigger
+    (decision A2-revised). Hooked in at the exact point a NEW
+    (not-cooldown-suppressed) stale alert is about to fire, so it runs once
+    per incident rather than every 15-minute tick. Does NOT rebuild
+    SLA-miss detection — that's this file's own compute_heartbeats()/
+    is_stale, already real and working; this only reacts to it."""
+    try:
+        with get_db_context() as session:
+            maybe_failover(session, b.source_type, b.alert_county())
+            session.commit()
+    except Exception as exc:
+        logger.warning("[Heartbeat] source failover check failed for %s: %s", b.label(), exc)
+
+
+def _mark_recovered_sources_for_failover(beats: list["Heartbeat"]) -> None:
+    """Switch any source that was running on its alternate back to primary
+    once its heartbeat recovers — same 'recovered' definition as
+    _clear_dedup_for_recovered_sources (not currently stale)."""
+    recovered = [b for b in beats if not b.is_stale]
+    if not recovered:
+        return
+    try:
+        with get_db_context() as session:
+            for b in recovered:
+                mark_recovered(session, b.source_type, b.alert_county())
+            session.commit()
+    except Exception as exc:
+        logger.warning("[Heartbeat] source failover recovery check failed: %s", exc)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main entry points
 # ─────────────────────────────────────────────────────────────────────────────
@@ -393,6 +425,8 @@ def run_once(dry_run: bool = False) -> list[Heartbeat]:
     # 24h cooldown left over from a previous incident.
     if not dry_run:
         _clear_dedup_for_recovered_sources(beats)
+        # QUALITY-v2.2 Q4 — switch any recovered source back off its alternate.
+        _mark_recovered_sources_for_failover(beats)
 
     for b in stale:
         if _recently_alerted(b.source_type, b.alert_county()):
@@ -401,6 +435,13 @@ def run_once(dry_run: bool = False) -> list[Heartbeat]:
                 b.label(), DEDUP_COOLDOWN_HOURS,
             )
             continue
+
+        # QUALITY-v2.2 Q4 — Hunter's automatic source-failover trigger
+        # (decision A2-revised). Rides on the dedup check above so it fires
+        # exactly once per incident, not every 15-minute tick.
+        if not dry_run:
+            _trigger_failover_check(b)
+
         subject = b.alert_subject()
         body    = b.alert_body()
         if dry_run:
