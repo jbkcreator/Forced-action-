@@ -9925,3 +9925,96 @@ class SourceFailoverLog(Base):
         ),
         Index("idx_source_failover_log_lookup", "source_type", "county_id", "occurred_at"),
     )
+
+
+class ExperimentAttribution(Base):
+    """LEARN-v2.2 Layer 2 — one attribution row per fleet event credited to
+    an experiment arm.
+
+    Written by the nightly experiment_attribution_sweep. Idempotent on
+    (fleet_event_id, assignment_id) — re-running the sweep never double-counts.
+
+    attribution_method: 'draft_match' when a draft on the same thread was
+    found within window_days; 'last_touch' when the assignment itself is
+    within window_days but no matching draft exists.
+
+    cell_id / venture_key are populated ONLY on draft_match — the cell and
+    venture of the specific draft that earned the reply. They are NULL on
+    last_touch (no producing draft found). This is what makes the two methods
+    genuinely distinct rather than a label, and is the join key T-LEARN-06
+    (feature -> revenue by cell) reads.
+    """
+    __tablename__ = "experiment_attributions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    fleet_event_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("fleet_events.id"), nullable=False
+    )
+    assignment_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("agent_lane_experiment_assignments.id"), nullable=False
+    )
+    test_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("agent_lane_experiments.id"), nullable=False, index=True
+    )
+    opportunity_thread_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    variant: Mapped[str] = mapped_column(String(10), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    attribution_method: Mapped[str] = mapped_column(String(20), nullable=False)
+    cell_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    venture_key: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
+    window_days: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    attributed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint("fleet_event_id", "assignment_id", name="uq_experiment_attribution"),
+        Index("idx_experiment_attribution_test", "test_id", "event_type", "attributed_at"),
+        Index("idx_experiment_attribution_thread", "opportunity_thread_id"),
+        Index(
+            "idx_experiment_attribution_cell", "cell_id",
+            postgresql_where=text("cell_id IS NOT NULL"),
+        ),
+        CheckConstraint(
+            "attribution_method IN ('draft_match','last_touch')",
+            name="ck_experiment_attribution_method",
+        ),
+    )
+
+
+class AgentLaneOpportunityOutcome(Base):
+    """LEARN-v2.2 T-LEARN-03 — the terminal outcome of one Agent Lane opportunity.
+
+    No pre-existing row owned "this opportunity is over, and here is why" —
+    opportunity_thread_id was a bare string across BuyerEntity/OpportunityScore/
+    OutboundDraft/PriceAssignment. This table is that missing home. One row per
+    thread (UNIQUE). outcome='won' needs no reason; outcome='lost' carries one of
+    the spec's eight loss codes. Win is auto-coded from payment.received; loss is
+    supplied by a human tap (Josh) except no_response, which a 30-day timeout
+    sweep auto-codes.
+    """
+    __tablename__ = "agent_lane_opportunity_outcomes"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    opportunity_thread_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    outcome: Mapped[str] = mapped_column(String(10), nullable=False)  # 'won' | 'lost'
+    reason_code: Mapped[Optional[str]] = mapped_column(String(20))    # one of 8 loss codes, NULL on won
+    coded_by: Mapped[str] = mapped_column(String(60), nullable=False) # actor: 'payment_fleet_event','opportunity_timeout_sweep','admin:<who>'
+    source_ref: Mapped[Optional[str]] = mapped_column(String(120))    # e.g. fleet_event id, or note
+    coded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("opportunity_thread_id", name="uq_agent_lane_opportunity_outcome"),
+        Index("idx_alo_outcome_reason", "outcome", "reason_code"),
+        CheckConstraint("outcome IN ('won','lost')", name="ck_alo_outcome"),
+        CheckConstraint(
+            "(outcome = 'won' AND reason_code IS NULL) OR "
+            "(outcome = 'lost' AND reason_code IN "
+            "('timing','price','trust','fit','no_urgency','wrong_contact','competitor','no_response'))",
+            name="ck_alo_reason_code",
+        ),
+    )
