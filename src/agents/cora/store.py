@@ -187,6 +187,15 @@ class OutboundDraftRecord:
     # drafts all carried venture #1's key would have a permanently empty reply
     # rate and could never scale.
     venture_key: str = DEFAULT_VENTURE_KEY
+    # LEARN-v2.2 Layer 1 — the price fact cited in this draft (if the offer
+    # has a configured price band, price_assignment.is_respa_excluded() is
+    # False, and PRICE_BAND_TESTING_ENABLED — currently False everywhere,
+    # so this is the floor price today) and the AgentLaneExperimentAssignment
+    # id it came from, if any. Layer 2's attribution join reads this to
+    # connect a later reply/booking/payment back to the arm that produced
+    # this draft.
+    price_cents: Optional[int] = None
+    experiment_assignment_id: Optional[int] = None
 
 
 def new_draft_id() -> str:
@@ -226,7 +235,7 @@ _DRAFT_COLUMNS = (
     "subject, body, facts_used, source_refs, recommended_channel, confidence_score, "
     "status, booking_link, payment_link, reject_reason, created_at, schema_version, "
     "published, is_followup, followup_sequence, contact_email, contact_phone, "
-    "venture_key"
+    "venture_key, price_cents, experiment_assignment_id"
 )
 
 
@@ -240,7 +249,7 @@ def append_draft(db: Any, record: OutboundDraftRecord) -> None:
                 :subject, :body, :facts_used, :source_refs, :recommended_channel, :confidence_score,
                 :status, :booking_link, :payment_link, :reject_reason, :created_at, :schema_version,
                 :published, :is_followup, :followup_sequence, :contact_email, :contact_phone,
-                :venture_key
+                :venture_key, :price_cents, :experiment_assignment_id
             )
         """),
         {

@@ -167,6 +167,122 @@ def test_invalid_cell_id_fails(not_suppressed_db, mock_claude):
     assert result["reject_reason"] == "invalid_cell_id"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# LEARN-v2.2 Layer 1 — price-variant wiring (ensure_price_band_experiment /
+# get_price_variant / record_decision_snapshot called from the new
+# price_variant node, gate -> price_variant -> compose -> resolve_links -> persist)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_founder_tier_draft_persists_floor_price_with_flag_off(not_suppressed_db, mock_claude):
+    """founder_tier has a real price band. PRICE_BAND_TESTING_ENABLED is
+    False by default, so the draft must persist the floor price and no
+    experiment_assignment_id (get_price_variant()'s documented flag-off
+    contract) — and the LLM prompt must carry that price as an explicit
+    fact, since its own system prompt forbids inventing numbers."""
+    from src.services.price_assignment import PRICE_BANDS
+
+    whale = WHALES[9]
+    result = _run(whale, not_suppressed_db, mock_claude)
+    assert result["terminal_status"] == "completed", result
+
+    draft = store.read_drafts(not_suppressed_db, opportunity_thread_id=whale["opportunity_thread_id"])[0]
+    assert draft["price_cents"] == PRICE_BANDS["founder_tier"]["floor"]
+    assert draft["experiment_assignment_id"] is None
+
+    prompt = mock_claude.call_args.kwargs["messages"][0]["content"]
+    expected_price = f"${PRICE_BANDS['founder_tier']['floor'] / 100:,.0f}/mo"
+    assert expected_price in prompt
+
+
+def test_respa_excluded_offer_has_no_price_fact(not_suppressed_db, mock_claude):
+    """hard_money_intro is RESPA-excluded (price_assignment.is_respa_excluded)
+    — no price band exists to test, so the draft must persist NULL for both
+    new columns and the prompt must carry no Price: line at all, exactly as
+    it did before this feature existed."""
+    whale = WHALES[9]
+    mock_claude.return_value = compose_result("subj", "body")
+    result = outreach.run_outreach(
+        {
+            "buyer_entity": whale, "cell_id": "hard_money_intro_lenders",
+            "facts_used": facts_for(whale), "contact_email": "x@example.com", "contact_phone": None,
+        },
+        db=not_suppressed_db,
+    )
+    assert result["terminal_status"] == "completed"
+
+    draft = store.read_drafts(not_suppressed_db, opportunity_thread_id=whale["opportunity_thread_id"])[0]
+    assert draft["price_cents"] is None
+    assert draft["experiment_assignment_id"] is None
+
+    prompt = mock_claude.call_args.kwargs["messages"][0]["content"]
+    assert "Price:" not in prompt
+
+
+def test_no_decision_snapshot_when_flag_off(not_suppressed_db, mock_claude):
+    """get_price_variant()'s flag-off path returns control without ever
+    calling assign_variant_by_thread() (price_assignment.assign_price()'s
+    own documented flag-off contract) — so no AgentLaneExperimentAssignment
+    row exists yet, and record_decision_snapshot() correctly finds nothing
+    to snapshot. No assignment happened; there's nothing real to capture."""
+    from sqlalchemy import select
+    from src.core.models import ExperimentDecisionSnapshot
+
+    whale = WHALES[9]
+    _run(whale, not_suppressed_db, mock_claude)
+
+    snapshot = not_suppressed_db.execute(
+        select(ExperimentDecisionSnapshot).where(
+            ExperimentDecisionSnapshot.opportunity_thread_id == whale["opportunity_thread_id"],
+        )
+    ).scalar_one_or_none()
+    assert snapshot is None
+
+
+def test_decision_snapshot_written_when_flag_on(not_suppressed_db, mock_claude, monkeypatch):
+    """The price-band experiment is capped at 10% traffic by
+    config/agent_lane_guardrails.py's agent_lane_experiment_traffic_cap
+    (get_or_create_experiment enforces it regardless of what's requested) —
+    so not every opportunity_thread_id lands in-test. OPP-TEST-PRICE-0005
+    is deterministically in-window for test_name="price_band_founder_tier"
+    (same md5 hash assign_variant_by_thread uses), confirmed directly
+    rather than picking an arbitrary whale and hoping."""
+    from sqlalchemy import select
+    import src.services.price_assignment as pa_mod
+    from src.core.models import ExperimentDecisionSnapshot
+
+    monkeypatch.setattr(pa_mod, "PRICE_BAND_TESTING_ENABLED", True)
+
+    whale = dict(WHALES[9], opportunity_thread_id="OPP-TEST-PRICE-0005")
+    _run(whale, not_suppressed_db, mock_claude)
+
+    snapshot = not_suppressed_db.execute(
+        select(ExperimentDecisionSnapshot).where(
+            ExperimentDecisionSnapshot.opportunity_thread_id == whale["opportunity_thread_id"],
+        )
+    ).scalar_one_or_none()
+    assert snapshot is not None
+    assert snapshot.offer == "founder_tier"
+    assert snapshot.message_angle == get_cell(CELL_ID)["angle"]
+    assert snapshot.chosen_action == f"draft_founder_tier_cell_{CELL_ID}"
+    assert snapshot.assigned_variant in ("a", "b")
+
+
+def test_price_variant_reuses_one_experiment_across_whales(not_suppressed_db, mock_claude):
+    """Two different whales through the same offer must share one
+    AgentLaneExperiment row (get_or_create_experiment's idempotency) — not
+    a new experiment per draft."""
+    from sqlalchemy import select
+    from src.core.models import AgentLaneExperiment
+
+    _run(WHALES[0], not_suppressed_db, mock_claude)
+    _run(WHALES[9], not_suppressed_db, mock_claude)
+
+    rows = not_suppressed_db.execute(
+        select(AgentLaneExperiment).where(AgentLaneExperiment.test_name == "price_band_founder_tier")
+    ).scalars().all()
+    assert len(rows) == 1
+
+
 # ── venture_key attribution (CLONE-v2.2 / CL4) ──────────────────────────────
 
 
