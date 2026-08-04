@@ -59,6 +59,7 @@ Usage:
     from config.cell_allocation import decide_thresholds, validate_allocation_config
 """
 
+from config.cora_cell_grid import get_cell
 from config.venture_ladder import (
     AUTO_DOUBLE_COOLDOWN_DAYS,
     AUTO_DOUBLE_ELIGIBLE_STAGES,
@@ -71,15 +72,66 @@ from config.venture_ladder import (
 # halves of the rule can never disagree about the same cell on the same day.
 WINDOW_DAYS = AUTO_DOUBLE_WINDOW_DAYS
 
-# Spec line 188's "<3% reply". A cell at or above this is not a kill candidate.
-KILL_REPLY_RATE_PCT = 3.0
+# 5. THE KILL BAR IS TEMPERATURE-AWARE, NOT A FLAT NUMBER.
+#    Spec line 148: "warm and cold judged on different bars"; line 264 pins the
+#    send-to-reply benchmarks at warm >=8%, cold >=1.5%. A single flat bar
+#    throttles a healthy cold cell (2% is fine cold, failing warm) and spares a
+#    failing warm one (4% is a disaster against an 8% benchmark). A cell's
+#    temperature is a property of the relationship, read here from its angle:
+#    win-back / auction-congrats / post-call imply a prior touch (warm);
+#    everything else is net-new cold outreach.
+KILL_REPLY_RATE_PCT_COLD = 1.5
+# Warm cells are held to a higher bar, but the bar must stay strictly below the
+# double's AUTO_DOUBLE_REPLY_RATE_PCT (8%) or a warm cell could qualify to be
+# throttled and doubled on the same run. 5% is a clear-failure line against the
+# 8% warm benchmark while preserving that gap.
+KILL_REPLY_RATE_PCT_WARM = 5.0
+
+# Retained as the cold default so config_snapshot / older callers still resolve
+# a scalar; the live decision uses kill_rate_for_cell().
+KILL_REPLY_RATE_PCT = KILL_REPLY_RATE_PCT_COLD
+
+# Angles that imply a prior relationship — everything else is cold. Kept as a
+# set over angle (not a per-cell flag) so a new cell inherits the right bar from
+# its angle without a second place to edit.
+WARM_ANGLES = frozenset({"win_back_offer", "auction_congrats", "post_call_recap"})
 
 # Fast path (decision 2 above): this many sends with ZERO replies throttles now.
 ZERO_REPLY_MIN_SENDS = 30
 
-# Slow path: some replies but under KILL_REPLY_RATE_PCT needs a real sample.
-# Deliberately identical to the double's sample floor (decision 3 above).
+# Spec line 148: "60 for high-stakes kills." A high-stakes cell needs more
+# evidence before even the unambiguous zero-reply path fires, because a wrong
+# throttle on a whale cell is the single most expensive false verdict in the
+# corpus. Founder-tier is the named whale offer (config/cora_cell_grid.py).
+HIGH_STAKES_MIN_SENDS = 60
+HIGH_STAKES_OFFERS = frozenset({"founder_tier"})
+
+# Slow path: some replies but under the kill bar needs a real sample.
+# Deliberately identical to the double's sample floor (decision 3 above). Note
+# 200 already exceeds HIGH_STAKES_MIN_SENDS, so the slow path needs no separate
+# high-stakes tier — only the fast zero-reply path does.
 AMBIGUOUS_MIN_SENDS = AUTO_DOUBLE_MIN_SAMPLE
+
+
+def kill_rate_for_cell(cell_id: str) -> float:
+    """The kill/revive reply-rate bar for a cell, by its temperature.
+
+    An unknown cell_id (not in the grid) is treated as cold — the conservative
+    choice, since a lower bar throttles fewer cells.
+    """
+    cell = get_cell(cell_id)
+    if cell is not None and cell.get("angle") in WARM_ANGLES:
+        return KILL_REPLY_RATE_PCT_WARM
+    return KILL_REPLY_RATE_PCT_COLD
+
+
+def zero_reply_min_sends_for_cell(cell_id: str) -> int:
+    """The zero-reply fast-path sample floor for a cell. High-stakes (whale)
+    cells demand the spec's 60 sends; everything else the default 30."""
+    cell = get_cell(cell_id)
+    if cell is not None and cell.get("offer") in HIGH_STAKES_OFFERS:
+        return HIGH_STAKES_MIN_SENDS
+    return ZERO_REPLY_MIN_SENDS
 
 # What a throttled cell produces, as a percentage of its normal target count.
 # 25%, not 10%: the fast trigger is only defensible because a wrong throttle
@@ -88,8 +140,9 @@ AMBIGUOUS_MIN_SENDS = AUTO_DOUBLE_MIN_SAMPLE
 # true in any useful sense.
 THROTTLE_FLOOR_PCT = 25
 
-# Revival threshold. Clearing the same rate the kill is measured against, on a
-# real (if small) sample of throttle-generated sends.
+# Revival threshold. Clearing the same rate the kill is measured against — so
+# revival is temperature-aware too, via kill_rate_for_cell(). REVIVE_REPLY_RATE_PCT
+# is the cold default retained for config_snapshot / older scalar callers.
 REVIVE_REPLY_RATE_PCT = KILL_REPLY_RATE_PCT
 REVIVE_MIN_SENDS = ZERO_REPLY_MIN_SENDS
 
@@ -147,23 +200,37 @@ def validate_allocation_config() -> list[str]:
             "(0 would make a throttle a permanent kill; >=100 would make it a no-op)"
         )
 
-    if KILL_REPLY_RATE_PCT >= AUTO_DOUBLE_REPLY_RATE_PCT:
+    # Both temperature bars must stay below the double, or a cell of that
+    # temperature could qualify to be throttled and doubled in the same run.
+    for name, bar in (
+        ("KILL_REPLY_RATE_PCT_COLD", KILL_REPLY_RATE_PCT_COLD),
+        ("KILL_REPLY_RATE_PCT_WARM", KILL_REPLY_RATE_PCT_WARM),
+    ):
+        if bar >= AUTO_DOUBLE_REPLY_RATE_PCT:
+            errors.append(
+                f"{name} ({bar}) must be below the double's AUTO_DOUBLE_REPLY_RATE_PCT "
+                f"({AUTO_DOUBLE_REPLY_RATE_PCT}) — otherwise a cell can qualify to be "
+                "throttled and doubled in the same run"
+            )
+
+    if KILL_REPLY_RATE_PCT_COLD > KILL_REPLY_RATE_PCT_WARM:
         errors.append(
-            f"KILL_REPLY_RATE_PCT ({KILL_REPLY_RATE_PCT}) must be below the double's "
-            f"AUTO_DOUBLE_REPLY_RATE_PCT ({AUTO_DOUBLE_REPLY_RATE_PCT}) — otherwise a cell "
-            "can qualify to be throttled and doubled in the same run"
+            f"KILL_REPLY_RATE_PCT_COLD ({KILL_REPLY_RATE_PCT_COLD}) above the warm bar "
+            f"({KILL_REPLY_RATE_PCT_WARM}) inverts the spec: cold cells are held to a "
+            "lower reply bar, not a higher one"
         )
 
-    if REVIVE_REPLY_RATE_PCT < KILL_REPLY_RATE_PCT:
+    if HIGH_STAKES_MIN_SENDS < ZERO_REPLY_MIN_SENDS:
         errors.append(
-            f"REVIVE_REPLY_RATE_PCT ({REVIVE_REPLY_RATE_PCT}) below KILL_REPLY_RATE_PCT "
-            f"({KILL_REPLY_RATE_PCT}) creates a band where a cell both revives and re-throttles"
+            f"HIGH_STAKES_MIN_SENDS ({HIGH_STAKES_MIN_SENDS}) below ZERO_REPLY_MIN_SENDS "
+            f"({ZERO_REPLY_MIN_SENDS}) would demand less evidence from the higher-stakes kill"
         )
 
-    if AMBIGUOUS_MIN_SENDS < ZERO_REPLY_MIN_SENDS:
+    if AMBIGUOUS_MIN_SENDS < HIGH_STAKES_MIN_SENDS:
         errors.append(
-            f"AMBIGUOUS_MIN_SENDS ({AMBIGUOUS_MIN_SENDS}) below ZERO_REPLY_MIN_SENDS "
-            f"({ZERO_REPLY_MIN_SENDS}) would demand less evidence from the harder call"
+            f"AMBIGUOUS_MIN_SENDS ({AMBIGUOUS_MIN_SENDS}) below HIGH_STAKES_MIN_SENDS "
+            f"({HIGH_STAKES_MIN_SENDS}) would let the slow path fire on less evidence than "
+            "the fast high-stakes path"
         )
 
     if VERDICT_COOLDOWN_DAYS <= 0:
@@ -188,11 +255,12 @@ def config_snapshot() -> dict[str, object]:
     """
     return {
         "window_days": WINDOW_DAYS,
-        "kill_reply_rate_pct": KILL_REPLY_RATE_PCT,
+        "kill_reply_rate_pct_cold": KILL_REPLY_RATE_PCT_COLD,
+        "kill_reply_rate_pct_warm": KILL_REPLY_RATE_PCT_WARM,
         "zero_reply_min_sends": ZERO_REPLY_MIN_SENDS,
+        "high_stakes_min_sends": HIGH_STAKES_MIN_SENDS,
         "ambiguous_min_sends": AMBIGUOUS_MIN_SENDS,
         "throttle_floor_pct": THROTTLE_FLOOR_PCT,
-        "revive_reply_rate_pct": REVIVE_REPLY_RATE_PCT,
         "revive_min_sends": REVIVE_MIN_SENDS,
         "verdict_cooldown_days": VERDICT_COOLDOWN_DAYS,
         "max_throttles_per_run": MAX_THROTTLES_PER_RUN,

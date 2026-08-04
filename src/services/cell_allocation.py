@@ -7,7 +7,8 @@ CLONE-v2.2 CL4 auto-double engine; it reuses CL4's helpers rather than
 re-implementing them.
 
 Public surface:
-    decide(sends, replies, is_throttled, days_since_last_verdict) -> Verdict
+    decide(sends, replies, *, is_throttled, days_since_last_verdict,
+           kill_rate_pct, zero_reply_min_sends) -> Verdict
     sweep(db, venture_key, *, now, dry_run) -> AllocationReport
     cell_is_throttled(db, venture_key, cell_id) -> bool
 
@@ -27,11 +28,8 @@ from config.cell_allocation import (
     AMBIGUOUS_MIN_SENDS,
     DECISION_REVIVE,
     DECISION_THROTTLE,
-    ELIGIBLE_STAGES,
-    KILL_REPLY_RATE_PCT,
     MAX_THROTTLES_PER_RUN,
     REVIVE_MIN_SENDS,
-    REVIVE_REPLY_RATE_PCT,
     THROTTLE_FLOOR_PCT,
     VERDICT_COOLDOWN_DAYS,
     VERDICT_HOLD,
@@ -41,11 +39,12 @@ from config.cell_allocation import (
     VERDICT_THROTTLE,
     WINDOW_DAYS,
     config_snapshot,
+    kill_rate_for_cell,
     validate_allocation_config,
+    zero_reply_min_sends_for_cell,
 )
 from src.services.venture_ladder import (
     CellStats,
-    _cooldown_remaining_days,
     _ineligible_for_auto_double,
     _json,
     _ladder_row,
@@ -53,8 +52,6 @@ from src.services.venture_ladder import (
 )
 
 logger = logging.getLogger(__name__)
-
-ZERO_REPLY_MIN_SENDS = 30  # imported separately from config for clarity in decide()
 
 
 # ── Verdict ───────────────────────────────────────────────────────────────────
@@ -93,17 +90,24 @@ def decide(
     *,
     is_throttled: bool,
     days_since_last_verdict: Optional[float],
+    kill_rate_pct: float,
+    zero_reply_min_sends: int,
 ) -> str:
     """Pure function — no DB, no clock.
 
-    Returns one of the VERDICT_* constants. Caller supplies context.
+    Returns one of the VERDICT_* constants. The caller resolves the two
+    per-cell thresholds and passes them in, so the temperature (warm/cold) and
+    stakes (whale/not) live at the call site, and this function stays a pure,
+    exhaustively-testable decision:
 
-    Two-path logic for throttle candidates (documented in config):
-      - Fast path: 0 replies after ZERO_REPLY_MIN_SENDS → throttle.
-      - Slow path: reply rate < KILL_REPLY_RATE_PCT after AMBIGUOUS_MIN_SENDS → throttle.
+      - `kill_rate_pct`: the reply-rate bar for THIS cell's temperature
+        (config.kill_rate_for_cell). Revival is symmetric on the same bar.
+      - `zero_reply_min_sends`: the fast-path sample floor for THIS cell's
+        stakes (config.zero_reply_min_sends_for_cell) — 60 for high-stakes.
 
-    Revival is symmetric: is_throttled AND rate >= REVIVE_REPLY_RATE_PCT AND
-    sends >= REVIVE_MIN_SENDS → revive.
+    Two-path throttle logic:
+      - Fast: 0 replies after `zero_reply_min_sends` → throttle.
+      - Slow: reply rate < `kill_rate_pct` after AMBIGUOUS_MIN_SENDS → throttle.
     """
     # Cooldown blocks any new verdict on this cell.
     if days_since_last_verdict is not None and days_since_last_verdict < VERDICT_COOLDOWN_DAYS:
@@ -113,38 +117,29 @@ def decide(
     if sends > 0:
         rate = round(100.0 * replies / sends, 2)
 
-    # Revival check comes first: a throttled cell's only exit is revival.
+    # Revival check comes first: a throttled cell's only exit is revival, on the
+    # same temperature-aware bar it was killed against.
     if is_throttled:
-        if sends >= REVIVE_MIN_SENDS and rate is not None and rate >= REVIVE_REPLY_RATE_PCT:
+        if sends >= REVIVE_MIN_SENDS and rate is not None and rate >= kill_rate_pct:
             return VERDICT_REVIVE
         # Throttled cells don't get re-throttled; hold silently.
         return VERDICT_HOLD
 
     # Fast kill: unambiguous zero evidence at minimum volume.
-    if replies == 0 and sends >= ZERO_REPLY_MIN_SENDS:
+    if replies == 0 and sends >= zero_reply_min_sends:
         return VERDICT_THROTTLE
 
-    # Slow kill: real signal but below the floor — demand a full sample.
+    # Slow kill: real signal but below the bar — demand a full sample.
     if sends < AMBIGUOUS_MIN_SENDS:
         return VERDICT_SKIP_INSUFFICIENT_SAMPLE
 
-    if rate is not None and rate < KILL_REPLY_RATE_PCT:
+    if rate is not None and rate < kill_rate_pct:
         return VERDICT_THROTTLE
 
     return VERDICT_HOLD
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
-
-_LAST_ALLOCATION_EVENT = """
-SELECT created_at
-FROM venture_ladder_events
-WHERE venture_key = :key
-  AND gate_results->>'cell_id' = :cell_id
-  AND decision IN ('auto_throttle', 'auto_revive')
-ORDER BY created_at DESC
-LIMIT 1
-"""
 
 _ACTIVE_THROTTLE = """
 SELECT COUNT(*) AS cnt
@@ -162,12 +157,41 @@ WHERE thr.venture_key = :key
   )
 """
 
+# Bulk forms of the two per-cell lookups above — one round trip each for the
+# whole venture, so sweep() does not fire a query per cell (see its docstring).
+_ACTIVE_THROTTLE_CELLS = """
+SELECT DISTINCT thr.gate_results->>'cell_id' AS cell_id
+FROM venture_ladder_events thr
+WHERE thr.venture_key = :key
+  AND thr.decision = 'auto_throttle'
+  AND thr.gate_results->>'cell_id' IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1
+      FROM venture_ladder_events rev
+      WHERE rev.venture_key = :key
+        AND rev.decision = 'auto_revive'
+        AND rev.gate_results->>'cell_id' = thr.gate_results->>'cell_id'
+        AND rev.created_at > thr.created_at
+  )
+"""
+
+_LAST_ALLOCATION_EVENT_ALL = """
+SELECT gate_results->>'cell_id' AS cell_id, MAX(created_at) AS last_at
+FROM venture_ladder_events
+WHERE venture_key = :key
+  AND decision IN ('auto_throttle', 'auto_revive')
+  AND gate_results->>'cell_id' IS NOT NULL
+GROUP BY gate_results->>'cell_id'
+"""
+
 
 def cell_is_throttled(db: Session, venture_key: str, cell_id: str) -> bool:
     """True when the most recent allocation verdict for this cell is a throttle
     that has not been followed by a revive.
 
-    Called by target_producer._cell_multiplier() to apply the floor.
+    Single-cell lookup, called by target_producer._cell_multiplier() to apply
+    the floor for one cell at a time. sweep() uses _active_throttle_cells()
+    instead to avoid a per-cell round trip.
     """
     row = db.execute(
         text(_ACTIVE_THROTTLE), {"key": venture_key, "cell_id": cell_id}
@@ -175,18 +199,25 @@ def cell_is_throttled(db: Session, venture_key: str, cell_id: str) -> bool:
     return bool(row and int(row.cnt) > 0)
 
 
-def _days_since_last_allocation_event(
-    db: Session, venture_key: str, cell_id: str, *, now: datetime
-) -> Optional[float]:
-    row = db.execute(
-        text(_LAST_ALLOCATION_EVENT), {"key": venture_key, "cell_id": cell_id}
-    ).first()
-    if row is None:
-        return None
-    last = row.created_at
-    if last.tzinfo is None:
-        last = last.replace(tzinfo=timezone.utc)
-    return (now - last).total_seconds() / 86400.0
+def _active_throttle_cells(db: Session, venture_key: str) -> set[str]:
+    """The set of cell_ids currently throttled (throttle with no later revive)
+    for a venture, in one query."""
+    rows = db.execute(text(_ACTIVE_THROTTLE_CELLS), {"key": venture_key}).fetchall()
+    return {r.cell_id for r in rows}
+
+
+def _days_since_last_event_by_cell(
+    db: Session, venture_key: str, *, now: datetime
+) -> dict[str, float]:
+    """Days since the last throttle/revive verdict, per cell_id, in one query."""
+    rows = db.execute(text(_LAST_ALLOCATION_EVENT_ALL), {"key": venture_key}).fetchall()
+    out: dict[str, float] = {}
+    for r in rows:
+        last = r.last_at
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        out[r.cell_id] = (now - last).total_seconds() / 86400.0
+    return out
 
 
 def _record_allocation_event(
@@ -254,20 +285,30 @@ def sweep(
     stats: dict[str, CellStats] = cell_reply_rates(db, venture_key, window_days=WINDOW_DAYS)
     report.cells_evaluated = len(stats)
 
+    # Two bulk reads, once, before the loop — never a query per cell (CLAUDE.md
+    # DB rule). A feed break that returns hundreds of cells must not become
+    # hundreds of round trips.
+    throttled_cells = _active_throttle_cells(db, venture_key)
+    days_since_by_cell = _days_since_last_event_by_cell(db, venture_key, now=now)
+
     throttles_this_run = 0
     snapshot = config_snapshot()
 
     for cell_id, cell in stats.items():
-        is_throttled = cell_is_throttled(db, venture_key, cell_id)
-        days_since = _days_since_last_allocation_event(
-            db, venture_key, cell_id, now=now
-        )
+        is_throttled = cell_id in throttled_cells
+        days_since = days_since_by_cell.get(cell_id)
+
+        # Per-cell thresholds resolved from the grid (temperature + stakes).
+        kill_rate_pct = kill_rate_for_cell(cell_id)
+        zero_reply_min_sends = zero_reply_min_sends_for_cell(cell_id)
 
         verdict = decide(
             cell.sends,
             cell.replies,
             is_throttled=is_throttled,
             days_since_last_verdict=days_since,
+            kill_rate_pct=kill_rate_pct,
+            zero_reply_min_sends=zero_reply_min_sends,
         )
 
         cv = CellVerdict(
@@ -276,7 +317,7 @@ def sweep(
             sends=cell.sends,
             replies=cell.replies,
             reply_rate_pct=cell.reply_rate_pct,
-            reason=_verdict_reason(verdict, cell),
+            reason=_verdict_reason(verdict, cell, kill_rate_pct, zero_reply_min_sends),
         )
 
         if verdict == VERDICT_THROTTLE:
@@ -309,13 +350,19 @@ def sweep(
                         "reply_rate_pct": cell.reply_rate_pct,
                         "window_days": WINDOW_DAYS,
                         "throttle_floor_pct": THROTTLE_FLOOR_PCT,
+                        # The exact bars this verdict was measured against, so it
+                        # is reconstructable even after the config changes.
+                        "kill_rate_pct_applied": kill_rate_pct,
+                        "zero_reply_min_sends_applied": zero_reply_min_sends,
                         **snapshot,
                     },
                     actor=actor,
                 )
                 logger.info(
-                    "[cell_allocation] throttled cell %s/%s: %d sends, %s%% reply",
+                    "[cell_allocation] throttled cell %s/%s: %d sends, %s%% reply "
+                    "(bar %s%%, zero-reply floor %d)",
                     venture_key, cell_id, cell.sends, cell.reply_rate_pct,
+                    kill_rate_pct, zero_reply_min_sends,
                 )
 
         elif verdict == VERDICT_REVIVE:
@@ -332,13 +379,14 @@ def sweep(
                         "replies": cell.replies,
                         "reply_rate_pct": cell.reply_rate_pct,
                         "window_days": WINDOW_DAYS,
+                        "kill_rate_pct_applied": kill_rate_pct,
                         **snapshot,
                     },
                     actor=actor,
                 )
                 logger.info(
-                    "[cell_allocation] revived cell %s/%s: %d sends, %s%% reply",
-                    venture_key, cell_id, cell.sends, cell.reply_rate_pct,
+                    "[cell_allocation] revived cell %s/%s: %d sends, %s%% reply (bar %s%%)",
+                    venture_key, cell_id, cell.sends, cell.reply_rate_pct, kill_rate_pct,
                 )
 
         elif verdict == VERDICT_HOLD:
@@ -349,13 +397,15 @@ def sweep(
     return report
 
 
-def _verdict_reason(verdict: str, cell: CellStats) -> str:
+def _verdict_reason(
+    verdict: str, cell: CellStats, kill_rate_pct: float, zero_reply_min_sends: int
+) -> str:
     if verdict == VERDICT_THROTTLE:
         if cell.replies == 0:
-            return f"0 replies in {cell.sends} sends (fast kill)"
-        return f"{cell.reply_rate_pct}% reply rate below {KILL_REPLY_RATE_PCT}% floor"
+            return f"0 replies in {cell.sends} sends (fast kill, floor {zero_reply_min_sends})"
+        return f"{cell.reply_rate_pct}% reply rate below {kill_rate_pct}% bar"
     if verdict == VERDICT_REVIVE:
-        return f"{cell.reply_rate_pct}% reply rate cleared {REVIVE_REPLY_RATE_PCT}% revival threshold"
+        return f"{cell.reply_rate_pct}% reply rate cleared {kill_rate_pct}% revival bar"
     if verdict == VERDICT_HOLD:
         return "within bounds"
     if verdict == VERDICT_SKIP_COOLDOWN:
