@@ -65,6 +65,18 @@ Central `properties` table (~522k parcels). 1:Many → foreclosures, tax_delinqu
 
 - **Agents** (`src/agents/`): LangGraph (Lifecycle) runtime. **Runs as a separate process/container from FastAPI.** Entry point: `python -m src.agents --serve`. API and Lifecycle communicate **exclusively** through Redis Queue (`lifecycle:queue` key, LPUSH/BRPOP) and Postgres NOTIFY (`lifecycle_events` channel). **Never call `dispatch_event()` directly from API/services/tasks** — use `publish_lifecycle_event()` from `src.agents.events.ingestion`. If Redis is unavailable, events fall back to `lifecycle_event_queue` Postgres table with 60s sweep. Supervisor routes events via dict lookup (`src/agents/router.py`). 10 graphs. Kill switch colors: green=send, yellow=fallback template, red=block. All decisions logged to `agent_decisions`. Guardrails in `config/lifecycle_guardrails.py`. `kill_switch_metric_ingest.get_cached_metric` re-exports from `kill_switch_service` — import from service layer, not tasks.
 
+- **Tasks** (`src/tasks/`): Scheduled jobs. `daily_report.py` — CSV ops report (runs 08:10 UTC for both Hillsborough and Pinellas). `daily_dashboard.py` — 10-section PDF (23:30 UTC Mon-Sat), separate from daily_report. `dnc_refresh` — monthly Tracerfy DNC re-scrub. `learning_hygiene_sweep.py` — daily 10:15 UTC lesson-hygiene sweep (LEARN Layer 4), **dry-run unless `--apply`**.
+
+### Lesson Hygiene (LEARN-v2.2 Layer 4)
+Garbage collection for `lifecycle_playbook`. `src/services/learning_hygiene.py` = pure `decide(LessonStats) -> Verdict` + `sweep(db, *, now, dry_run, limit)`; thresholds in `config/learning_hygiene.py`; cron driver `src/tasks/learning_hygiene_sweep.py`. Calls the existing `supersede_recommendation` / `mark_contradicted` from `playbook_writer.py` — it decides *when*, never what a lesson means.
+
+**Only two verdicts mutate.** Staleness is report-only: the two tools express "replaced" and "proven wrong", and old ≠ wrong. Other named, stored, digest-led states: `skip_unmeasurable` (agent_domain with no evidence feed), `skip_orphaned_source` (`source_id` resolves to nothing), `skip_excluded_kind`, `skip_untested`.
+
+- **Evidence feed is `agent_decisions.playbook_id`** — `terminal_status` / `autonomy_class` / `overridden_at`, bucketed by an exclusive `CASE` so each decision counts once. **Non-evidence outranks contradiction**: a `failed` decision produced no outcome and is excluded from both numerator and denominator, else one outage retires the corpus. The sweep's own audit rows carry `playbook_id`, so the evidence query **must** filter `graph_name <> 'learning_hygiene'` or each run manufactures support for the lesson it just judged.
+- **`CONTRADICTION_MIN_COUNT = 3` is constitutional**, not tunable (docs/constitutions/*.md, cited in `mark_contradicted`'s docstring). `CONTRADICTION_MIN_RATE_PCT` defaults to `0.0` (disabled) and can only ever spare a lesson.
+- **Supersession is successor-driven** because `supersede_recommendation(session, old_id, new_id)` requires a FK-enforced `new_id` — a timer cannot call it. Successor identity is non-NULL `scope` equality; NULL never matches.
+- **`anti_playbook` excluded, not inverted** — counter-evidence against a documented failure means the failure stopped, which is a different terminal state.
+- Rails: schema precondition (verifies `apply_lifecycle_playbook_lessons_versioning.py` ran; **never applies it**), global feed health, blast radius `max(3, 20%)` of the *measurable* population. Audit rows go to `agent_decisions` — no new migration. See ADR 0034 + `config/learning_hygiene.py:validate_hygiene_config()`.
 - **Tasks** (`src/tasks/`): Scheduled jobs. `daily_report.py` — CSV ops report (runs 08:10 UTC for both Hillsborough and Pinellas). `daily_dashboard.py` — 10-section PDF (23:30 UTC Mon-Sat), separate from daily_report. `dnc_refresh` — monthly Tracerfy DNC re-scrub. `venture_ladder_evaluator.py` — daily 09:30 UTC venture-ladder walk (CL4).
 
 ### County Config
@@ -89,6 +101,7 @@ Seven-rung state machine over `ventures.ladder_stage`: `radar → probe → pilo
 - `agents.py`: `AgentsSettings(AppSettings)` — LangGraph-specific keys. `AGENTS_EVENT_SOURCE_REDIS=true`, `AGENTS_EVENT_SOURCE_POSTGRES=true` required for full event routing.
 - `scoring.py`: CDS weights/thresholds — source of truth (not cds_engine.py docstring).
 - `matching.py`: match thresholds.
+- `learning_hygiene.py`: lesson-hygiene verdicts, evidence vocabularies (default-deny over the `agent_decisions` CHECK sets), `validate_hygiene_config()`, `config_snapshot()` frozen into every audit row.
 - `venture_template.py`: `DEFAULT_VENTURE_KEY`, the copy-and-fill `VENTURE_TEMPLATE`, and `validate_venture_config()`.
 - `venture_ladder.py`: `LADDER_STAGES`, per-stage `STAGE_GATES` (each with `direction` + `no_metric_behavior`), presell + auto-double constants, `validate_ladder_config()`.
 
