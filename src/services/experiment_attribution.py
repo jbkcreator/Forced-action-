@@ -146,9 +146,16 @@ def run_attribution(
             report.no_assignment += 1
             continue
 
-        # ── Draft-match: most recent draft in [window_start, occurred_at] ──
+        # The arm (test_id / variant) always comes from the assignment — it is
+        # the only place arm identity lives; a draft carries no assignment FK.
+        # What draft_match adds over last_touch is the *producing cell*: the
+        # specific draft (cell x venture) that earned this reply, recorded so
+        # the two methods are genuinely distinct and T-LEARN-06 can roll up by
+        # cell. last_touch leaves cell_id / venture_key NULL.
         matched_assignment: Optional[object] = None
         attribution_method: Optional[str] = None
+        matched_cell_id: Optional[str] = None
+        matched_venture_key: Optional[str] = None
 
         thread_drafts = drafts_by_thread.get(thread, [])
         for draft in thread_drafts:  # already DESC by created_at
@@ -156,13 +163,10 @@ def run_attribution(
             if draft_created.tzinfo is None:
                 draft_created = draft_created.replace(tzinfo=timezone.utc)
             if window_start <= draft_created <= occurred_at:
-                # Find the assignment most plausibly tied to this draft.
-                # The draft has no FK to an assignment; use last-created
-                # assignment on this thread as the link (same rationale as
-                # last_touch, but we log it as draft_match because a draft
-                # was present).
                 matched_assignment = thread_assignments[0]
                 attribution_method = "draft_match"
+                matched_cell_id = draft.cell_id
+                matched_venture_key = draft.venture_key
                 break
 
         # ── Last-touch fallback ──────────────────────────────────────────────
@@ -186,11 +190,13 @@ def run_attribution(
                 INSERT INTO experiment_attributions
                     (fleet_event_id, assignment_id, test_id,
                      opportunity_thread_id, variant, event_type,
-                     attribution_method, window_days, attributed_at, created_at)
+                     attribution_method, cell_id, venture_key,
+                     window_days, attributed_at, created_at)
                 VALUES
                     (:fleet_event_id, :assignment_id, :test_id,
                      :opportunity_thread_id, :variant, :event_type,
-                     :attribution_method, :window_days, NOW(), NOW())
+                     :attribution_method, :cell_id, :venture_key,
+                     :window_days, NOW(), NOW())
                 ON CONFLICT (fleet_event_id, assignment_id) DO NOTHING
             """), {
                 "fleet_event_id": evt.event_id,
@@ -200,6 +206,8 @@ def run_attribution(
                 "variant": matched_assignment.variant,
                 "event_type": _EVENT_TYPE,
                 "attribution_method": attribution_method,
+                "cell_id": matched_cell_id,
+                "venture_key": matched_venture_key,
                 "window_days": window_days,
             })
 

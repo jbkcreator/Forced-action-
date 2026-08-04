@@ -9937,6 +9937,12 @@ class ExperimentAttribution(Base):
     attribution_method: 'draft_match' when a draft on the same thread was
     found within window_days; 'last_touch' when the assignment itself is
     within window_days but no matching draft exists.
+
+    cell_id / venture_key are populated ONLY on draft_match — the cell and
+    venture of the specific draft that earned the reply. They are NULL on
+    last_touch (no producing draft found). This is what makes the two methods
+    genuinely distinct rather than a label, and is the join key T-LEARN-06
+    (feature -> revenue by cell) reads.
     """
     __tablename__ = "experiment_attributions"
 
@@ -9954,6 +9960,8 @@ class ExperimentAttribution(Base):
     variant: Mapped[str] = mapped_column(String(10), nullable=False)
     event_type: Mapped[str] = mapped_column(String(40), nullable=False)
     attribution_method: Mapped[str] = mapped_column(String(20), nullable=False)
+    cell_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    venture_key: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
     window_days: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     attributed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -9966,6 +9974,10 @@ class ExperimentAttribution(Base):
         UniqueConstraint("fleet_event_id", "assignment_id", name="uq_experiment_attribution"),
         Index("idx_experiment_attribution_test", "test_id", "event_type", "attributed_at"),
         Index("idx_experiment_attribution_thread", "opportunity_thread_id"),
+        Index(
+            "idx_experiment_attribution_cell", "cell_id",
+            postgresql_where=text("cell_id IS NOT NULL"),
+        ),
         CheckConstraint(
             "attribution_method IN ('draft_match','last_touch')",
             name="ck_experiment_attribution_method",
