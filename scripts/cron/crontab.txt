@@ -933,6 +933,12 @@ COUNTY_ID=hillsborough
 # with --advance-spin-up.
 30 9 * * * $PROJECT/scripts/cron/run.sh src.tasks.venture_ladder_evaluator
 
+# LEARN-v2.2 L3 — cell kill / throttle / revive sweep. Runs at 06:00 UTC so
+# overnight sends have accumulated before the verdict window is evaluated.
+# Blast-radius cap (MAX_THROTTLES_PER_RUN=3) prevents a feed break from
+# killing all cells in a single pass.
+0 6 * * * $PROJECT/scripts/cron/run.sh src.tasks.cell_allocation_sweep
+
 # T-B12-07 — Deal-of-the-day daily pick (idempotent, one row per date).
 # Runs after CDS scoring so today's top-CDS undelivered lead is available.
 15 7 * * * $PROJECT/scripts/cron/run.sh src.services.deal_of_the_day

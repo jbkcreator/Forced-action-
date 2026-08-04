@@ -48,6 +48,29 @@ WIN_BACK_CELL_ID = "win_back"
 CROSS_SYSTEM_SAFETY_WINDOW_DAYS = 14
 
 
+def _throttled_limit(db: Session, venture_key: str, limit: int) -> int:
+    """Scale `limit` down to the throttle floor when the win_back cell is
+    throttled. Fails open (returns the unscaled limit) on any error — a missing
+    cell_allocation table must never block win-back production."""
+    from config.cell_allocation import THROTTLE_FLOOR_PCT
+    from src.services.cell_allocation import cell_is_throttled
+
+    try:
+        if cell_is_throttled(db, venture_key, WIN_BACK_CELL_ID):
+            floored = max(int(limit * THROTTLE_FLOOR_PCT / 100.0), 1)
+            logger.info(
+                "win_back_producer: cell throttled for venture=%s — limit %d -> %d",
+                venture_key, limit, floored,
+            )
+            return floored
+    except Exception:
+        logger.warning(
+            "win_back_producer: throttle lookup failed for venture=%s — using unscaled limit",
+            venture_key, exc_info=True,
+        )
+    return limit
+
+
 def _subscriber_thread_id(subscriber_id: int) -> str:
     return f"SUB-{subscriber_id}"
 
@@ -90,6 +113,10 @@ def _idempotency_key(thread_id: str) -> str:
 def produce_win_back_targets(db: Session, limit: int = 25) -> List[str]:
     from src.services.reactivation_eligibility import check_tier3_winback_eligibility
     from src.tasks.reactivation_scheduler import _fetch_subscribers, _lapsed_subscriber_ids
+
+    from config.venture_template import DEFAULT_VENTURE_KEY
+
+    limit = _throttled_limit(db, DEFAULT_VENTURE_KEY, limit)
 
     sub_ids = _lapsed_subscriber_ids(db)
     subs = _fetch_subscribers(sub_ids, db)

@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 
 from src.agents.cora import contracts, opportunity_state, store
 from src.services.claude_router import call_claude_with_usage
+from src.services.playbook_retrieval import fetch_lessons, format_lessons_for_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +196,21 @@ def _make_node_compose_response(db: Optional[Session]):
             objection_hint = "\n\nKnown objection-response strategies for this avenue:\n" + "\n".join(
                 f"- {o['objection']}: {o['response_strategy']}" for o in objections
             )
+
+        lesson_block = ""
+        if db is not None:
+            context = {
+                k: v for k, v in {
+                    "offer": state.get("offer"),
+                    "avenue": state.get("avenue"),
+                }.items() if v is not None
+            }
+            lessons = fetch_lessons(db, agent_domain="cora", context=context)
+            lesson_block = format_lessons_for_prompt(lessons)
+
+        if lesson_block:
+            system = system + "\n\n" + lesson_block
+
         user = (
             f"Intent: {state.get('intent')} (subtype: {state.get('subtype')})\n"
             f"Their reply: {state.get('body_text', '')}\n"
@@ -349,6 +365,16 @@ def _make_node_persist(db: Optional[Session]):
 
         if state.get("status") == "pending_approval" and state.get("opportunity_thread_id"):
             opportunity_state.mark_replied(state["opportunity_thread_id"], reason="reply_received")
+            if db is not None:
+                try:
+                    from src.services.agent_lane_experiment_engine import record_outcome
+                    from config.prompt_variants import PROMPT_EXPERIMENT_NAME
+                    record_outcome(state["opportunity_thread_id"], PROMPT_EXPERIMENT_NAME, "reply", db)
+                except Exception:
+                    logger.warning(
+                        "reply: failed to record prompt-experiment outcome for thread=%s — continuing",
+                        state.get("opportunity_thread_id"), exc_info=True,
+                    )
             fleet_event = contracts.make_fleet_event(
                 "action.ready", state["opportunity_thread_id"], reply_id=state["reply_id"],
             )
