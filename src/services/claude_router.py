@@ -68,6 +68,12 @@ _TASK_ROUTING: dict[str, str] = {
     "referral_milestone_sms":   "haiku",
     "referral_milestone_email": "sonnet",
     "buyer_entity_match":       "haiku",   # HUNTER-01 (H2.4) — ambiguous-pair tie-break, single classification call
+    # Cora — cold-drafting and reply workflows (PR 180 / QUALITY-v2.2 Q2)
+    # cora_reply_classify is intentionally haiku: classification only, §1.1.5.
+    "cora_outreach_draft": "sonnet",
+    "cora_pre_call_brief": "sonnet",
+    "cora_reply_classify": "haiku",
+    "cora_reply_compose":  "sonnet",
     # Concierge Chat
     "chat_response":  "haiku",   # MD-grounded FAQ reply — Haiku is plenty
     # Opus — explicit override, edge cases only

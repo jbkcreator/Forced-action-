@@ -429,6 +429,16 @@ def send_sms(
     try:
         result = telnyx_send_message(to=to, body=body)
         vendor_message_id = result.get("message_id")
+        try:
+            from src.core.models import ApiUsageLog
+            db.add(ApiUsageLog(
+                service="telnyx",
+                task_type="telnyx_sms",
+                cost_usd=result.get("cost_cents", 0) / 100,
+                subscriber_id=subscriber_id,
+            ))
+        except Exception:
+            logger.warning("Telnyx cost log failed — send succeeded", exc_info=True)
         logger.info("SMS sent: id=%s to=%s status=%s", vendor_message_id, to, result.get("status"))
         _log("sent", vendor_message_id=vendor_message_id)
         return True
