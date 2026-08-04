@@ -163,20 +163,36 @@ def _produce_from_rows(db: Session, cell_id: str, scored: List[Dict[str, Any]]) 
     return produced
 
 
-def _cell_multiplier(db: Session, venture_key: str, cell_id: str) -> int:
+def _cell_multiplier(db: Session, venture_key: str, cell_id: str) -> float:
     """This venture's recorded cell-level auto-double multiplier for `cell_id`
     (src/services/venture_ladder.py:cell_production_multipliers), defaulting
     to 1x on any failure — e.g. the CL4 migration (venture_ladder_events) not
     yet applied in this environment.
+
+    If the cell is currently throttled (LEARN-v2.2 Layer 3), the base
+    multiplier is scaled down to THROTTLE_FLOOR_PCT % of normal so the cell
+    keeps a thin evidence stream rather than going dark entirely.
 
     Wrapped in a savepoint: a bare try/except without begin_nested() would
     leave the surrounding transaction aborted for every statement after it
     (the ranked-whales query included), so a missing CL4 table would silently
     stop target production rather than just skip the multiplier.
     """
+    from config.cell_allocation import THROTTLE_FLOOR_PCT
+    from src.services.cell_allocation import cell_is_throttled
+
     try:
         with db.begin_nested():
-            return venture_ladder.cell_production_multipliers(db, venture_key).get(cell_id, 1)
+            base: float = venture_ladder.cell_production_multipliers(db, venture_key).get(cell_id, 1)
+            if cell_is_throttled(db, venture_key, cell_id):
+                floor = THROTTLE_FLOOR_PCT / 100.0
+                throttled = max(base * floor, floor)
+                logger.info(
+                    "target_producer: cell %s/%s is throttled — multiplier %.2f → %.2f",
+                    venture_key, cell_id, base, throttled,
+                )
+                return throttled
+            return base
     except Exception:  # noqa: BLE001 — a missing multiplier must never block target production
         logger.warning(
             "target_producer: could not resolve the cell production multiplier for "
@@ -185,7 +201,7 @@ def _cell_multiplier(db: Session, venture_key: str, cell_id: str) -> int:
         return 1
 
 
-def _cell_production_limit(db: Session, county_id: Optional[str], cell_id: str, limit: int) -> tuple[int, int]:
+def _cell_production_limit(db: Session, county_id: Optional[str], cell_id: str, limit: int) -> tuple[float, float]:
     """`limit`, scaled by the ONE venture this call is scoped to.
 
     Only correct when `county_id` scopes the call to a single venture: the
