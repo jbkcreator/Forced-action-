@@ -947,6 +947,12 @@ COUNTY_ID=hillsborough
 # reasons are human-supplied via POST /api/admin/opportunity-outcome.
 0 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.opportunity_timeout_sweep
 
+# LEARN-v2.2 T-LEARN-06 — weekly feature-to-revenue report (Monday 09:00 UTC).
+# Correlates frozen target_characteristics with reply outcomes; reports top
+# sufficient (N>=30) correlations as PROPOSED NBRA targeting weights. Read-only —
+# never writes into any ranking.
+0 9 * * 1 $PROJECT/scripts/cron/run.sh src.tasks.feature_revenue_report
+
 # T-B12-07 — Tier3 win-back reactivation sweep (lapsed <30d zip-held /
 # >=30d zip-released branches). Runs alongside the existing S0 cohorts.
 30 8 * * * $PROJECT/scripts/cron/run.sh src.tasks.reactivation_scheduler --cohort tier3_winback
