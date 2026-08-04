@@ -10002,7 +10002,7 @@ class AgentLaneOpportunityOutcome(Base):
     opportunity_thread_id: Mapped[str] = mapped_column(String(20), nullable=False)
     outcome: Mapped[str] = mapped_column(String(10), nullable=False)  # 'won' | 'lost'
     reason_code: Mapped[Optional[str]] = mapped_column(String(20))    # one of 8 loss codes, NULL on won
-    coded_by: Mapped[str] = mapped_column(String(60), nullable=False) # actor: 'payment_webhook','opportunity_timeout_sweep','admin:<who>'
+    coded_by: Mapped[str] = mapped_column(String(60), nullable=False) # actor: 'payment_fleet_event','opportunity_timeout_sweep','admin:<who>'
     source_ref: Mapped[Optional[str]] = mapped_column(String(120))    # e.g. fleet_event id, or note
     coded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())

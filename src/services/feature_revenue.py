@@ -45,7 +45,7 @@ class FeatureCorrelation:
 
 @dataclass
 class FeatureRevenueReport:
-    snapshots_scanned: int = 0
+    snapshots_scanned: int = 0    # distinct threads considered (one snapshot per thread)
     features: list[FeatureCorrelation] = field(default_factory=list)      # sufficient (n >= MIN_N)
     insufficient: list[FeatureCorrelation] = field(default_factory=list)  # n < MIN_N
 
@@ -53,6 +53,11 @@ class FeatureRevenueReport:
 def _aggregate(observations: list[tuple[str, str, bool]]) -> list[FeatureCorrelation]:
     """Pure aggregation: (feature_key, feature_value, replied) tuples ->
     per-(key, value) FeatureCorrelation with the MIN_N floor applied.
+
+    The correlation unit is the opportunity/thread: each thread contributes at
+    most one observation per (feature_key, feature_value). Callers must collapse
+    multiple snapshots of a thread to one before flattening into observations,
+    so `n` counts threads, not snapshots.
 
     No DB access — unit-testable in isolation.
     """
@@ -86,9 +91,10 @@ def run_feature_revenue_analysis(db: Session) -> FeatureRevenueReport:
     """
     try:
         snapshot_rows = db.execute(text("""
-            SELECT opportunity_thread_id, target_characteristics
+            SELECT id, opportunity_thread_id, target_characteristics
             FROM experiment_decision_snapshots
             WHERE target_characteristics IS NOT NULL
+            ORDER BY opportunity_thread_id, id DESC
         """)).fetchall()
     except Exception as exc:
         logger.warning("feature_revenue: snapshot fetch failed: %s", exc)
@@ -99,7 +105,16 @@ def run_feature_revenue_analysis(db: Session) -> FeatureRevenueReport:
         # not populated target_characteristics yet.
         return FeatureRevenueReport(snapshots_scanned=0)
 
-    thread_ids = list({r.opportunity_thread_id for r in snapshot_rows})
+    # Collapse to one snapshot per thread (most recent by id) so a thread with
+    # multiple decision snapshots contributes exactly one observation per
+    # (feature_key, feature_value) — the correlation unit is the thread.
+    latest_by_thread: dict[str, object] = {}
+    for row in snapshot_rows:
+        if row.opportunity_thread_id not in latest_by_thread:
+            latest_by_thread[row.opportunity_thread_id] = row
+    thread_snapshots = list(latest_by_thread.values())
+
+    thread_ids = list(latest_by_thread.keys())
 
     try:
         replied_rows = db.execute(text("""
@@ -110,12 +125,12 @@ def run_feature_revenue_analysis(db: Session) -> FeatureRevenueReport:
         """), {"thread_ids": thread_ids}).fetchall()
     except Exception as exc:
         logger.warning("feature_revenue: reply fetch failed: %s", exc)
-        return FeatureRevenueReport(snapshots_scanned=len(snapshot_rows))
+        return FeatureRevenueReport(snapshots_scanned=len(thread_snapshots))
 
     replied_threads = {r.opportunity_thread_id for r in replied_rows}
 
     observations: list[tuple[str, str, bool]] = []
-    for row in snapshot_rows:
+    for row in thread_snapshots:
         characteristics = row.target_characteristics or {}
         if not isinstance(characteristics, dict):
             continue
@@ -125,7 +140,7 @@ def run_feature_revenue_analysis(db: Session) -> FeatureRevenueReport:
 
     correlations = _aggregate(observations)
 
-    report = FeatureRevenueReport(snapshots_scanned=len(snapshot_rows))
+    report = FeatureRevenueReport(snapshots_scanned=len(thread_snapshots))
     for corr in correlations:
         if corr.sufficient:
             report.features.append(corr)

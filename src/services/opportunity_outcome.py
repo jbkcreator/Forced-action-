@@ -37,6 +37,49 @@ LOSS_REASON_CODES = (
     "no_response",
 )
 
+# Single source of INSERT SQL, shared by the single-row and bulk paths. Passing
+# a list of param dicts to db.execute() runs it as an executemany.
+_INSERT_OUTCOME_SQL = """
+    INSERT INTO agent_lane_opportunity_outcomes
+        (opportunity_thread_id, outcome, reason_code, coded_by, source_ref)
+    VALUES
+        (:opportunity_thread_id, :outcome, :reason_code, :coded_by, :source_ref)
+    ON CONFLICT (opportunity_thread_id) DO NOTHING
+"""
+
+
+def _insert_outcome(
+    db: Session,
+    *,
+    opportunity_thread_id: str,
+    outcome: str,
+    reason_code: str | None,
+    coded_by: str,
+    source_ref: str | None,
+) -> bool:
+    """Single-row idempotent outcome insert. Returns True if a row was inserted."""
+    result = db.execute(text(_INSERT_OUTCOME_SQL), {
+        "opportunity_thread_id": opportunity_thread_id,
+        "outcome": outcome,
+        "reason_code": reason_code,
+        "coded_by": coded_by,
+        "source_ref": source_ref,
+    })
+    return result.rowcount > 0
+
+
+def insert_outcomes_bulk(db: Session, rows: list[dict]) -> int:
+    """Bulk-insert outcome rows in a single executemany. Idempotent
+    (ON CONFLICT DO NOTHING). Each dict must carry opportunity_thread_id,
+    outcome, reason_code, coded_by, source_ref.
+
+    Returns the number of rows inserted.
+    """
+    if not rows:
+        return 0
+    result = db.execute(text(_INSERT_OUTCOME_SQL), rows)
+    return result.rowcount if result.rowcount is not None and result.rowcount >= 0 else 0
+
 
 def has_outcome(db: Session, opportunity_thread_id: str) -> bool:
     """True if this thread already has a terminal outcome row."""
@@ -60,18 +103,14 @@ def record_win(
     Returns True if a new row was inserted, False if the thread was already
     terminal (ON CONFLICT DO NOTHING).
     """
-    result = db.execute(text("""
-        INSERT INTO agent_lane_opportunity_outcomes
-            (opportunity_thread_id, outcome, reason_code, coded_by, source_ref)
-        VALUES
-            (:thread, 'won', NULL, :coded_by, :source_ref)
-        ON CONFLICT (opportunity_thread_id) DO NOTHING
-    """), {
-        "thread": opportunity_thread_id,
-        "coded_by": coded_by,
-        "source_ref": source_ref,
-    })
-    return result.rowcount > 0
+    return _insert_outcome(
+        db,
+        opportunity_thread_id=opportunity_thread_id,
+        outcome="won",
+        reason_code=None,
+        coded_by=coded_by,
+        source_ref=source_ref,
+    )
 
 
 def record_loss(
@@ -99,19 +138,14 @@ def record_loss(
             f"must be one of {LOSS_REASON_CODES}"
         )
 
-    result = db.execute(text("""
-        INSERT INTO agent_lane_opportunity_outcomes
-            (opportunity_thread_id, outcome, reason_code, coded_by, source_ref)
-        VALUES
-            (:thread, 'lost', :reason_code, :coded_by, :source_ref)
-        ON CONFLICT (opportunity_thread_id) DO NOTHING
-    """), {
-        "thread": opportunity_thread_id,
-        "reason_code": reason_code,
-        "coded_by": coded_by,
-        "source_ref": source_ref,
-    })
-    return result.rowcount > 0
+    return _insert_outcome(
+        db,
+        opportunity_thread_id=opportunity_thread_id,
+        outcome="lost",
+        reason_code=reason_code,
+        coded_by=coded_by,
+        source_ref=source_ref,
+    )
 
 
 def sweep_payment_wins(db: Session) -> int:
@@ -137,19 +171,18 @@ def sweep_payment_wins(db: Session) -> int:
         ORDER BY fe.occurred_at
     """)).fetchall()
 
-    coded = 0
-    for row in rows:
-        try:
-            if record_win(
-                db,
-                row.opportunity_thread_id,
-                coded_by="payment_fleet_event",
-                source_ref=f"fleet_event:{row.event_id}",
-            ):
-                coded += 1
-        except Exception as exc:
-            logger.warning(
-                "sweep_payment_wins: failed to code thread=%s event_id=%s: %s",
-                row.opportunity_thread_id, row.event_id, exc,
-            )
-    return coded
+    outcome_rows = [
+        {
+            "opportunity_thread_id": row.opportunity_thread_id,
+            "outcome": "won",
+            "reason_code": None,
+            "coded_by": "payment_fleet_event",
+            "source_ref": f"fleet_event:{row.event_id}",
+        }
+        for row in rows
+    ]
+    try:
+        return insert_outcomes_bulk(db, outcome_rows)
+    except Exception as exc:
+        logger.warning("sweep_payment_wins: bulk insert failed: %s", exc)
+        return 0

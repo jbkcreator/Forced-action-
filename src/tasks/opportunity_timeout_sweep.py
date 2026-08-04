@@ -35,7 +35,7 @@ from sqlalchemy import text
 
 from config.settings import get_settings
 from src.core.database import get_db_context
-from src.services.opportunity_outcome import record_loss, sweep_payment_wins
+from src.services.opportunity_outcome import insert_outcomes_bulk, sweep_payment_wins
 from src.utils.logger import setup_logging
 
 setup_logging()
@@ -95,15 +95,17 @@ def _run(db, dry_run: bool) -> tuple[int, int]:
     wins = sweep_payment_wins(db)
 
     threads = _find_no_response_threads(db)
-    no_response = 0
-    for thread in threads:
-        if record_loss(
-            db, thread,
-            reason_code="no_response",
-            coded_by="opportunity_timeout_sweep",
-            source_ref="timeout_30d",
-        ):
-            no_response += 1
+    no_response_rows = [
+        {
+            "opportunity_thread_id": thread,
+            "outcome": "lost",
+            "reason_code": "no_response",
+            "coded_by": "opportunity_timeout_sweep",
+            "source_ref": "timeout_30d",
+        }
+        for thread in threads
+    ]
+    no_response = insert_outcomes_bulk(db, no_response_rows)
     if not dry_run:
         db.commit()
     return wins, no_response

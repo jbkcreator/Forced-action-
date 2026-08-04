@@ -3582,7 +3582,7 @@ class _OpportunityOutcomeBody(BaseModel):
 @router.post("/opportunity-outcome")
 def record_opportunity_loss(
     body: _OpportunityOutcomeBody,
-    _admin: dict = Depends(get_current_admin),
+    admin: dict = Depends(get_current_admin),
 ):
     """Record a human-supplied terminal LOSS on an Agent Lane opportunity.
 
@@ -3597,11 +3597,13 @@ def record_opportunity_loss(
             "message": f"reason_code must be one of {list(LOSS_REASON_CODES)}",
         })
 
+    admin_identity = admin.get("sub") or "admin"
+
     with get_db_context() as db:
         inserted = record_loss(
             db, body.opportunity_thread_id,
             reason_code=body.reason_code,
-            coded_by="admin",
+            coded_by=f"admin:{admin_identity}",
         )
         db.commit()
 

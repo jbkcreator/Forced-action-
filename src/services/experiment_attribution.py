@@ -34,6 +34,19 @@ logger = logging.getLogger(__name__)
 _EVENT_TYPE = "reply.received"
 
 
+def _first_in_window(assignments: list, window_start: datetime, occurred_at: datetime):
+    """Return the most recent assignment (list is DESC by created_at) whose
+    created_at falls within [window_start, occurred_at], or None. Shared by the
+    draft_match and last_touch paths so the arm is always window-checked."""
+    for asgn in assignments:
+        asgn_created = asgn.created_at
+        if asgn_created.tzinfo is None:
+            asgn_created = asgn_created.replace(tzinfo=timezone.utc)
+        if window_start <= asgn_created <= occurred_at:
+            return asgn
+    return None
+
+
 @dataclass
 class AttributionReport:
     events_scanned: int = 0
@@ -163,22 +176,25 @@ def run_attribution(
             if draft_created.tzinfo is None:
                 draft_created = draft_created.replace(tzinfo=timezone.utc)
             if window_start <= draft_created <= occurred_at:
-                matched_assignment = thread_assignments[0]
-                attribution_method = "draft_match"
-                matched_cell_id = draft.cell_id
-                matched_venture_key = draft.venture_key
+                # An in-window draft only produces a draft_match if there is
+                # also an in-window assignment to credit — a reply must never be
+                # credited to an arbitrarily-old arm. If no assignment is in
+                # window, fall through to last_touch (which will also find none
+                # and correctly count no_assignment).
+                candidate = _first_in_window(thread_assignments, window_start, occurred_at)
+                if candidate is not None:
+                    matched_assignment = candidate
+                    attribution_method = "draft_match"
+                    matched_cell_id = draft.cell_id
+                    matched_venture_key = draft.venture_key
                 break
 
         # ── Last-touch fallback ──────────────────────────────────────────────
         if matched_assignment is None:
-            for asgn in thread_assignments:  # DESC by created_at
-                asgn_created = asgn.created_at
-                if asgn_created.tzinfo is None:
-                    asgn_created = asgn_created.replace(tzinfo=timezone.utc)
-                if window_start <= asgn_created <= occurred_at:
-                    matched_assignment = asgn
-                    attribution_method = "last_touch"
-                    break
+            candidate = _first_in_window(thread_assignments, window_start, occurred_at)
+            if candidate is not None:
+                matched_assignment = candidate
+                attribution_method = "last_touch"
 
         if matched_assignment is None:
             report.no_assignment += 1
