@@ -132,7 +132,11 @@ def _post_slack_digest(
         f"Under floor: {totals['under_floor']}",
     ]
     for r in under_floor_reports:
-        cells = ", ".join(r.challenger_cells) or "(none)"
+        if not r.challenger_cells:
+            # Defensive: an under-floor report with no challenger cells has
+            # nothing to reserve for and must never render a "(none)" proposal.
+            continue
+        cells = ", ".join(r.challenger_cells)
         lines.append(
             f"• {r.venture_key}: challengers at {r.challenger_share_pct}% vs "
             f"{r.floor_pct}% — propose reserving +{r.shortfall_pct}% production "

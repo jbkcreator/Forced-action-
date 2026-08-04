@@ -8,7 +8,8 @@ the >=20% GP formal-challenge trigger, and the 20/10 winner split are deferred
 (no divisible production pool + no retained-GP/declared winner pre-launch). This
 respects spec line 259 ("never set").
 
-A2: a challenger is DERIVED — an eligible cell with no L3 verdict yet. A4: this
+A2: a challenger is DERIVED — a cell is a challenger iff it has no L3 verdict
+event yet, and an incumbent iff it has one; send count alone never judges it. A4: this
 is a COHORT reserve, not a per-cell guarantee — L3 kill/throttle (see
 src/services/cell_allocation.py) still governs each individual challenger cell;
 the floor protects the cohort as a whole, not any one cell.
@@ -38,7 +39,6 @@ from sqlalchemy.orm import Session
 from config.challenger_floor import (
     CHALLENGER_FLOOR_PCT,
     MIN_TOTAL_SENDS,
-    VERDICT_SAMPLE,
     WINDOW_DAYS,
 )
 from src.services.venture_ladder import (
@@ -113,10 +113,12 @@ def classify_cells(
 ) -> tuple[set[str], set[str]]:
     """Split the venture's active cells into (challengers, incumbents).
 
-    A cell is an INCUMBENT if it has an L3 verdict row OR has reached
-    VERDICT_SAMPLE sends (effectively judged even if no row was written yet);
-    otherwise it is a CHALLENGER (A2: no verdict yet). The verdict lookup is ONE
-    bulk query, not one per cell (CLAUDE.md: never query inside a loop).
+    A cell is a CHALLENGER iff it has NO L3 verdict row yet (A2: no verdict
+    yet); it is an INCUMBENT iff it HAS a verdict row. Send count alone never
+    reclassifies a cell — a well-sampled cell sitting in the dead zone between
+    the kill and double bars has accrued no verdict and stays a challenger. The
+    verdict lookup is ONE bulk query, not one per cell (CLAUDE.md: never query
+    inside a loop).
     """
     verdict_rows = db.execute(
         text(_VERDICT_CELL_IDS),
@@ -126,8 +128,8 @@ def classify_cells(
 
     challengers: set[str] = set()
     incumbents: set[str] = set()
-    for cell_id, cell_stats in stats.items():
-        if cell_id in verdict_cells or cell_stats.sends >= VERDICT_SAMPLE:
+    for cell_id in stats:
+        if cell_id in verdict_cells:
             incumbents.add(cell_id)
         else:
             challengers.add(cell_id)
@@ -173,6 +175,23 @@ def evaluate_floor(
 
         challenger_sends = sum(stats[c].sends for c in challengers)
         total_sends = sum(s.sends for s in stats.values())
+
+        if not challengers:
+            # Every active cell has an L3 verdict — the cohort is empty, so there
+            # is nothing to reserve for. A 0% share here is not an under-floor
+            # signal; proposing a reserve for "(none)" is an unactionable alert.
+            return ChallengerFloorReport(
+                venture_key=venture_key,
+                challenger_cells=[],
+                incumbent_cells=sorted(incumbents),
+                challenger_sends=0,
+                total_sends=total_sends,
+                challenger_share_pct=0.0,
+                floor_pct=CHALLENGER_FLOOR_PCT,
+                under_floor=False,
+                shortfall_pct=None,
+                note="no active challenger cells — nothing to reserve",
+            )
 
         share_pct, under_floor, shortfall_pct, note = compute_share(
             challenger_sends, total_sends, CHALLENGER_FLOOR_PCT, MIN_TOTAL_SENDS

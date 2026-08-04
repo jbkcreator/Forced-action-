@@ -40,7 +40,7 @@ LOCKED DECISIONS (grilled, spec-checked — do not re-open):
 
 Usage:
     from config.challenger_floor import (
-        CHALLENGER_FLOOR_PCT, WINDOW_DAYS, VERDICT_SAMPLE, ELIGIBLE_STAGES,
+        CHALLENGER_FLOOR_PCT, WINDOW_DAYS, ELIGIBLE_STAGES,
         MIN_TOTAL_SENDS, validate_challenger_config,
     )
 """
@@ -48,7 +48,6 @@ from __future__ import annotations
 
 from config.venture_ladder import (
     AUTO_DOUBLE_ELIGIBLE_STAGES,
-    AUTO_DOUBLE_MIN_SAMPLE,
     AUTO_DOUBLE_WINDOW_DAYS,
 )
 
@@ -59,11 +58,6 @@ CHALLENGER_FLOOR_PCT = 30
 # Reuse L3's 14-day trailing window so the two engines never disagree about the
 # same cell's volume on the same day.
 WINDOW_DAYS = AUTO_DOUBLE_WINDOW_DAYS
-
-# A cell that has accumulated at least this many sends has effectively been
-# judged by L3 (this is CL4/L3's decision sample), so it is no longer a
-# challenger even if no verdict row has been written yet.
-VERDICT_SAMPLE = AUTO_DOUBLE_MIN_SAMPLE
 
 # Venture stage/active gating is L3's, unchanged: a venture that may not
 # auto-double may not have its cohort share evaluated either.
@@ -93,11 +87,6 @@ def validate_challenger_config() -> list[str]:
         errors.append(
             f"MIN_TOTAL_SENDS must be at least 1, got {MIN_TOTAL_SENDS} — "
             "a zero floor would divide by zero on an empty venture"
-        )
-
-    if VERDICT_SAMPLE < 1:
-        errors.append(
-            f"VERDICT_SAMPLE must be positive, got {VERDICT_SAMPLE}"
         )
 
     if WINDOW_DAYS < 1:

@@ -11,10 +11,13 @@ from types import SimpleNamespace
 from config.challenger_floor import (
     CHALLENGER_FLOOR_PCT,
     MIN_TOTAL_SENDS,
-    VERDICT_SAMPLE,
     validate_challenger_config,
 )
-from src.services.challenger_floor import classify_cells, compute_share
+from src.services.challenger_floor import (
+    classify_cells,
+    compute_share,
+    evaluate_floor,
+)
 
 
 def test_config_valid():
@@ -84,12 +87,49 @@ def test_classify_verdict_row_is_incumbent(monkeypatch):
     assert incumbents == {"cell_a"}
 
 
-def test_classify_high_sends_is_incumbent():
+def test_classify_high_sends_no_verdict_is_challenger():
+    # A well-sampled cell with no verdict row (dead zone: not auto_double, not
+    # throttle) is still a CHALLENGER — send count alone never reclassifies it.
     stats = {
-        "cell_a": SimpleNamespace(sends=VERDICT_SAMPLE),   # judged by sample -> incumbent
-        "cell_b": SimpleNamespace(sends=VERDICT_SAMPLE - 1),  # under sample, no verdict -> challenger
+        "cell_a": SimpleNamespace(sends=1000),   # many sends, no verdict -> challenger
+        "cell_b": SimpleNamespace(sends=5),      # few sends, no verdict -> challenger
     }
     db = _FakeExec([])  # no verdict rows
     challengers, incumbents = classify_cells(db, "v1", stats)
-    assert challengers == {"cell_b"}
-    assert incumbents == {"cell_a"}
+    assert challengers == {"cell_a", "cell_b"}
+    assert incumbents == set()
+
+
+class _FakeEvalDb:
+    """db stub for evaluate_floor: verdict query returns preset cell_ids."""
+
+    def __init__(self, verdict_cell_ids):
+        self._rows = [SimpleNamespace(cell_id=c) for c in verdict_cell_ids]
+
+    def execute(self, *a, **k):
+        return self
+
+    def fetchall(self):
+        return self._rows
+
+
+def test_evaluate_floor_no_challengers_not_under_floor(monkeypatch):
+    import src.services.challenger_floor as svc
+
+    stats = {
+        "cell_a": SimpleNamespace(sends=500),
+        "cell_b": SimpleNamespace(sends=500),
+    }
+    monkeypatch.setattr(svc, "_ladder_row", lambda db, key: SimpleNamespace())
+    monkeypatch.setattr(svc, "_ineligible_for_auto_double", lambda row: None)
+    monkeypatch.setattr(svc, "cell_reply_rates", lambda db, key, window_days: stats)
+
+    # Every active cell has a verdict -> challenger cohort is empty.
+    db = _FakeEvalDb(["cell_a", "cell_b"])
+    report = evaluate_floor(db, "v1")
+
+    assert report.challenger_cells == []
+    assert report.under_floor is False
+    assert report.challenger_share_pct == 0.0
+    assert "challenger" in report.note.lower()
+    assert report.total_sends == 1000
